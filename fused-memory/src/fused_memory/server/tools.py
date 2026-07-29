@@ -56,6 +56,7 @@ from fused_memory.middleware.task_interceptor import (
     _is_ticket_id,
     _looks_like_task_id,
 )
+from fused_memory.middleware.toolcall_xml_guard import toolcall_xml_error
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.scope import resolve_main_checkout, resolve_project_id
 from fused_memory.reconciliation.task_filter import (
@@ -949,6 +950,14 @@ def create_mcp_server(
             return err
         if err := await _backlog_gate(project_id):
             return err
+        # Tool-call XML leak guard (task 3083) — see middleware/toolcall_xml_guard.py.
+        # Ahead of every content-derived branch below (is_batch_plan_framing,
+        # is_proposed_resolution_framing): an episode's content is fed to
+        # Graphiti's extractor, so a truncated body does not just sit in one
+        # payload — it seeds edges derived from text the harness already cut.
+        _xml_err = toolcall_xml_error(metadata=metadata, agent_id=agent_id, content=content)
+        if _xml_err is not None:
+            return _xml_err
         if temporal_context is not None and temporal_context not in _VALID_TEMPORAL_CONTEXTS:
             return {
                 'error': (
@@ -1109,6 +1118,14 @@ def create_mcp_server(
             return err
         if err := await _backlog_gate(project_id):
             return err
+        # Tool-call XML leak guard (task 3083) — see middleware/toolcall_xml_guard.py.
+        # Ahead of the content-derived classification and recon-framing guards
+        # below: truncated text must not be classified, embedded, or matched
+        # for near-duplicates. This is the write path that produced the recorded
+        # Mem0 specimens 9f2d2ae6 and c759c53b.
+        _xml_err = toolcall_xml_error(metadata=metadata, agent_id=agent_id, content=content)
+        if _xml_err is not None:
+            return _xml_err
         if category is not None and category not in _VALID_CATEGORIES:
             return {
                 'error': (
@@ -3842,6 +3859,24 @@ def create_mcp_server(
             return _normalized
         project_root = _normalized
 
+        # Tool-call XML leak guard (task 3083) — see middleware/toolcall_xml_guard.py.
+        # FIRST in the guard chain, deliberately: a leaked fragment means the
+        # harness terminated this call's argument list early, so every field
+        # below it is suspect. It must precede inject_execution_class and
+        # inject_operational_routing in particular, which DERIVE ROUTING FROM
+        # THE TEXT FIELDS — coercing routing out of an already-truncated
+        # description would layer a second wrong value on the first.
+        _xml_err = toolcall_xml_error(
+            metadata=metadata,
+            agent_id=agent_id,
+            title=title,
+            description=description,
+            prompt=prompt,
+            details=details,
+        )
+        if _xml_err is not None:
+            return _xml_err
+
         # Lock-charter guard γ: reject directory strings in metadata.files
         # before forwarding to the interceptor. Covers both the normal curator
         # path and planning_mode=True (same tool function), catching the #4552
@@ -4362,6 +4397,23 @@ def create_mcp_server(
         if isinstance(_normalized, dict):
             return _normalized
         project_root = _normalized
+
+        # Tool-call XML leak guard (task 3083) — see middleware/toolcall_xml_guard.py.
+        # Same first-in-the-chain placement as the submit_task call site above.
+        # It must also stay ahead of the json.dumps below: the
+        # allow_toolcall_xml opt-out is read off a dict, so running it after the
+        # encode would leave the documented escape hatch unreachable here.
+        _xml_err = toolcall_xml_error(
+            metadata=metadata,
+            agent_id=agent_id,
+            title=title,
+            description=description,
+            prompt=prompt,
+            details=details,
+        )
+        if _xml_err is not None:
+            return _xml_err
+
         _dirs = directory_locks(extract_files(metadata))
         if _dirs:
             return lock_charter_error(_dirs)
