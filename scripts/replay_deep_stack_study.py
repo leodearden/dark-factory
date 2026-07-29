@@ -67,7 +67,7 @@ VERIFY_TIMEOUT_S = 14400  # generous: SCHED_IDLE stretches wall time
 # depth signal; excluding it removes a constant false-fail floor from P(pass|d).
 VERIFY_CMD = ['./scripts/verify.sh', 'test', '--scope', 'all']
 VERIFY_ENV = {'DF_VERIFY_ROLE': 'merge'}
-SCRIPT_VERSION = 4
+SCRIPT_VERSION = 5
 # Files removed from the (disposable) study checkout after each stack build.
 # Dropping --include-infra was not enough: each tree runs ITS OWN era's
 # verify.sh, and some eras run tests/infra/run_all.sh unconditionally — then
@@ -76,6 +76,16 @@ SCRIPT_VERSION = 4
 # era guards the step with `test -f tests/infra/run_all.sh`, so removing the
 # file censors the infra suite structurally, era-proof.
 STRIP_TREE_FILES = ['tests/infra/run_all.sh']
+# Stale cross-era artifacts in the SHARED study target dir that production
+# per-tree worktrees never see. structure_instance_e2e prefers
+# target/release/reify when present (in production it never is — task 4390
+# scoped reify-cli out of the release pass — so the test falls back to the
+# debug binary the workspace pass just built fresh). An old-era tree's verify
+# built the release CLI here, and every later tree whose golden disagreed with
+# that binary's era failed the golden e2e — 54 v4 S/B/C runs censored,
+# including 23/25 same-content C-vs-A flips (the tell). Deleting it per-job
+# restores the production-identical fallback path.
+STRIP_TARGET_FILES = ['target/release/reify']
 NOOP_CPU_FLOOR_S = 60  # a "pass" burning less CPU than this is a suspect no-op
 SCRUB_ENV = [k for k in os.environ if k.startswith('CLAUDE')]
 
@@ -242,7 +252,7 @@ def build_stack(repo: Path, base: str, tips: list[list[str] | tuple[str, str]]) 
             git(repo, 'merge', '--abort', check=False)
             break
         merged += 1
-    for rel in STRIP_TREE_FILES:
+    for rel in STRIP_TREE_FILES + STRIP_TARGET_FILES:
         (repo / rel).unlink(missing_ok=True)
     return git(repo, 'rev-parse', 'HEAD').stdout.strip(), merged
 
