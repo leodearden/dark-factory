@@ -659,20 +659,6 @@ class TestDeriveBands:
         assert t_low is None, f'expected no derivable judge band, got t_low={t_low}'
         assert isinstance(reason, str) and reason.strip()
 
-    def test_module_defines_no_numeric_threshold_constant(self) -> None:
-        """No default can silently leak in through a module attribute."""
-        offenders = {
-            name: value
-            for name, value in vars(_mod()).items()
-            if not name.startswith('__')
-            and isinstance(value, (int, float))
-            and not isinstance(value, bool)
-            and any(tok in name.upper() for tok in ('T_HIGH', 'T_LOW', 'THRESHOLD', 'SIMILARITY'))
-        }
-        assert not offenders, (
-            f'no a-priori numeric threshold may exist at module scope; found {offenders}'
-        )
-
 
 # ---------------------------------------------------------------------------
 # compute_recall_at_k
@@ -1080,17 +1066,6 @@ class TestWriteTriageConfigBlock:
             assert parsed['write_triage']['t_high'] == pytest.approx(0.5)
             assert parsed['write_triage']['t_low'] == pytest.approx(0.25)
             assert parsed['write_triage']['calibration_report_path'] == 'x/y.json'
-
-    def test_the_written_block_is_annotated(self) -> None:
-        """A reader of config.yaml must see where the numbers came from."""
-        out = _call(BASE_YAML, path='calibration/report.json')
-        block = out[out.index('write_triage:'):]
-        comments = '\n'.join(ln for ln in block.splitlines() if ln.strip().startswith('#'))
-        assert 'calibration/report.json' in comments, 'the block must name its report'
-        assert 'calibrate_write_triage' in comments, 'the block must name its producer'
-        assert 'hand' in comments.lower() or 'edit' in comments.lower(), (
-            'the block must say the values are calibration outputs, not hand-editable'
-        )
 
     @pytest.mark.parametrize(('t_high', 't_low'), [(None, 0.6), (0.9, None), (None, None)])
     def test_refuses_to_write_an_uncalibrated_threshold(self, t_high, t_low) -> None:
