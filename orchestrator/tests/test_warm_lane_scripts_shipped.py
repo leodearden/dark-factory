@@ -21,6 +21,7 @@ directory is the executable proof that the two libs actually travelled along.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -144,4 +145,134 @@ class TestSiblingLibsTravelledWithTheScripts:
         assert proc.returncode != self.WIRING_EXIT, (
             f'{name} --help exited {self.WIRING_EXIT} (the wiring/usage sentinel) — '
             f'stderr={proc.stderr.strip()!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# provision-warm-lane-fs.sh: repo-root parity at the new nesting depth
+# ---------------------------------------------------------------------------
+
+#: The relocation moves provision-warm-lane-fs.sh two levels deeper: reify's
+#: ``<repo>/scripts/`` becomes ``<repo>/orchestrator/scripts/warm-lane/``.
+_NEW_NESTING = ('orchestrator', 'scripts', 'warm-lane')
+
+
+def _stage_provision_script(repo: Path, *, git_init: bool) -> Path:
+    """Build ``<repo>/orchestrator/scripts/warm-lane/provision-warm-lane-fs.sh``.
+
+    Copies the SHIPPED script (not a fixture of it) into a synthetic repo at
+    the real post-relocation depth, so what is under test is the file that
+    actually ships.  ``git_init`` selects which of the two repo-root resolution
+    strategies gets exercised: a real checkout, or a directory tree with no git
+    metadata at all.
+    """
+    script_dir = repo.joinpath(*_NEW_NESTING)
+    script_dir.mkdir(parents=True, exist_ok=True)
+    staged = script_dir / 'provision-warm-lane-fs.sh'
+    staged.write_bytes((WARM_LANE_SCRIPT_DIR / 'provision-warm-lane-fs.sh').read_bytes())
+    staged.chmod(0o755)
+    if git_init:
+        subprocess.run(
+            ['git', 'init', '-q', '-b', 'main'], cwd=repo, check=True, timeout=60,
+        )
+    return staged
+
+
+def _default_mount_in_usage(staged: Path) -> str:
+    """Run the staged script with ``--help`` and return its usage text.
+
+    ``REIFY_WARM_LANE_MOUNT`` is stripped from the environment so the printed
+    default is the script's own derivation rather than an inherited override —
+    the operator-facing value this test exists to protect.
+    """
+    env = {k: v for k, v in os.environ.items() if k != 'REIFY_WARM_LANE_MOUNT'}
+    proc = subprocess.run(
+        [str(staged), '--help'],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        cwd=staged.parent,
+    )
+    return proc.stdout + proc.stderr
+
+
+class TestProvisionRepoRootParity:
+    """The default ``--mount`` is derived from the REPO ROOT, not the script's parent.
+
+    ``provision-warm-lane-fs.sh`` computes ``REPO_ROOT`` from its own location
+    and ``_default_mount()`` hangs the operator-facing default mount off it.
+    In reify the script sits at ``<repo>/scripts/``, so one ``..`` reached the
+    repo root.  Here it sits two levels deeper, at
+    ``<repo>/orchestrator/scripts/warm-lane/``.
+
+    A LITERAL byte-copy therefore BREAKS parity rather than preserving it: the
+    inherited ``$_SCRIPT_DIR/..`` lands on ``<repo>/orchestrator/scripts`` and
+    the advertised default mount silently becomes
+    ``<repo>/orchestrator/warm-lanes`` instead of the repo's sibling
+    ``warm-lanes`` dir — a wrong path printed to an operator about to
+    provision a multi-terabyte volume.  Restoring repo-root resolution is a
+    requirement of behaviour parity, not an exception to it.
+
+    Hermetic: a synthetic repo under ``tmp_path``, and ``--help`` only — no
+    loopback image, no mount, nothing privileged.
+    """
+
+    def test_default_mount_is_derived_from_the_repo_root(self, tmp_path: Path) -> None:
+        """A checkout at ``<tmp>/repo`` → ``<tmp>/warm-lanes``."""
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        usage = _default_mount_in_usage(_stage_provision_script(repo, git_init=True))
+
+        assert str(tmp_path / 'warm-lanes') in usage, (
+            f'The advertised default mount must hang off the repo root '
+            f'({repo}), giving {tmp_path / "warm-lanes"}.\nusage:\n{usage}'
+        )
+        assert str(repo / 'orchestrator' / 'warm-lanes') not in usage, (
+            'The default mount was derived from the script\'s grandparent '
+            '(<repo>/orchestrator/scripts) rather than the repo root — the '
+            'inherited "$_SCRIPT_DIR/.." does not survive the two-levels-deeper '
+            f'relocation.\nusage:\n{usage}'
+        )
+
+    def test_repo_root_resolves_without_git_metadata(self, tmp_path: Path) -> None:
+        """No git metadata → path-arithmetic fallback still lands on the repo root.
+
+        The script must not depend on being inside a checkout: it is run on a
+        fresh host to provision the pool substrate, sometimes from an unpacked
+        tree, and ``git`` may be absent entirely.
+        """
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        usage = _default_mount_in_usage(_stage_provision_script(repo, git_init=False))
+
+        assert str(tmp_path / 'warm-lanes') in usage, (
+            f'With no git metadata the fallback must still resolve the repo root '
+            f'({repo}), giving {tmp_path / "warm-lanes"}.\nusage:\n{usage}'
+        )
+        assert str(repo / 'orchestrator' / 'warm-lanes') not in usage, (
+            f'Fallback resolution landed on the script\'s grandparent instead of '
+            f'the repo root.\nusage:\n{usage}'
+        )
+
+    def test_ascend_past_worktrees_is_preserved(self, tmp_path: Path) -> None:
+        """A checkout inside ``worktrees/`` still surfaces the mount one level higher.
+
+        Mirror case for the pre-existing ``_default_mount`` behaviour: the
+        warm-lanes dir must live BESIDE the worktrees tree, never inside a
+        worktree.  Pinned alongside the depth fix because both are consumers of
+        ``REPO_ROOT`` — a fix that got the root right but broke the ascend
+        would be just as much a parity break.
+        """
+        repo = tmp_path / 'worktrees' / 'repo'
+        repo.mkdir(parents=True)
+        usage = _default_mount_in_usage(_stage_provision_script(repo, git_init=True))
+
+        assert str(tmp_path / 'warm-lanes') in usage, (
+            f'A repo inside worktrees/ must surface the mount beside the '
+            f'worktrees tree ({tmp_path / "warm-lanes"}).\nusage:\n{usage}'
+        )
+        assert str(tmp_path / 'worktrees' / 'warm-lanes') not in usage, (
+            'The ascend-past-worktrees behaviour was lost — the warm-lanes dir '
+            f'would live inside the worktrees tree.\nusage:\n{usage}'
         )
