@@ -767,9 +767,9 @@ def _render_coverage(coverage: dict[str, Any]) -> list[str]:
     lines = ['## Coverage', '']
     complete = coverage.get('complete', False)
     if complete:
-        lines += ['Coverage is **complete**: every category scrolled exactly as many points '
-                  'as `count_by_metadata` expected, and the per-category counts account for '
-                  'every point in each collection.', '']
+        lines += ['Coverage is **complete**: every category scrolled as many points as '
+                  '`count_by_metadata` reported either side of the scan, and the '
+                  'per-category counts account for every point in each collection.', '']
     else:
         lines += [
             '> **WARNING — COVERAGE INCOMPLETE.** This census under-enumerates the corpus; '
