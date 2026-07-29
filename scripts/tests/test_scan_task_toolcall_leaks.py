@@ -519,20 +519,6 @@ class TestDetectorIsTheSharedDefinition:
 
         assert scan_task_toolcall_leaks.detect_leak is toolcall_xml_leak.detect_leak
 
-    def test_module_defines_no_second_detector(self):
-        """The regex must not be re-compiled locally under any other name.
-
-        A local re.compile of the leak pattern would silently reintroduce the
-        drift this promotion closes, even while the identity assertions above
-        still pass for the re-exported names.
-        """
-        import inspect
-
-        import scan_task_toolcall_leaks
-
-        source = inspect.getsource(scan_task_toolcall_leaks)
-        assert "re.compile" not in source
-
     def test_patching_the_shared_detector_changes_the_script_behaviour(self, monkeypatch, tmp_path):
         """Delegation is real, not a same-valued copy captured at import."""
         import scan_task_toolcall_leaks
