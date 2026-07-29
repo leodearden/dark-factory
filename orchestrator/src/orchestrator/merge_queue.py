@@ -7240,6 +7240,39 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # for fast, deterministic coverage.  Mirrors the MAX_*/
     # VERIFY_ABANDON_POLL_SECS monkeypatch convention above.
     RESOURCE_AUDIT_WORKTREE_GRACE_SECS: float = 9000.0
+    # task 3018: minimum age before the PERIODIC (steady-state) reap sweep
+    # DESTROYS an unregistered `_merge-*` worktree — deliberately larger than
+    # the RESOURCE_AUDIT_WORKTREE_GRACE_SECS DETECTION threshold above.
+    #
+    # Detection and destruction answer different questions and want different
+    # answers: "old enough to be worth REPORTING" is deliberately eager, while
+    # "old enough that destroying it cannot interrupt live work" must be
+    # conservative.  Promoting the reap from a startup-only sweep to a
+    # steady-state one would otherwise have silently re-purposed the detection
+    # grace as a destruction deadline.  A tree between the two thresholds is
+    # still flagged by worktree_ledger_violations on every heartbeat — it is
+    # simply not destroyed yet (detect-early / destroy-late).
+    #
+    # The value is DERIVED, not picked: merge_verify_cold_command_timeout_secs
+    # (7200 s, defaults.yaml) is a PER-COMMAND budget, and a cold merge verify
+    # runs >= 2 command phases (scoped verify + unscoped typechecks) plus
+    # worktree creation and venv/dep seeding — so the total-lifetime ceiling of
+    # a legitimately slow cold verify is >= 2 x 7200 = 14400 s.  21600 s clears
+    # that with headroom while staying below the 8h fleet-redeploy window, so
+    # an in-run leak is still reclaimed rather than deferred to the next
+    # restart (which was the whole point of the periodic sweep).  Note this is
+    # why INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS (10800 s) was NOT reused here:
+    # 10800 < 14400, so it would not actually clear the cold-verify ceiling.
+    #
+    # This is DEFENSE-IN-DEPTH, not the primary protection.  A live throwaway
+    # verify worktree now holds `merge_verify_lease(lane_dir=wt)` for the
+    # duration of its verify (merge_shadow._run_cold_shadow_verify /
+    # merge_drift._run_drift_check), so remove_merge_worktree_guarded returns
+    # 'skipped_lease_held' and skips it regardless of age.  This floor covers
+    # any live-but-unleased tree on a path not yet enumerated.  Kept as a class
+    # attribute so tests can monkeypatch it small, matching the
+    # RESOURCE_AUDIT_*/MAX_* convention above.
+    PERIODIC_REAP_MIN_AGE_SECS: float = 21600.0
     # MQ-invariants iota (task 1994): number of CONSECUTIVE
     # _check_resource_audit heartbeats a resource-conservation violation
     # (speculation_accounting_violations / worktree_ledger_violations) must
@@ -9621,6 +9654,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         *,
         recovered_branches: Collection[str] = (),
         now: float | None = None,
+        min_age_secs: float | None = None,
     ) -> dict[str, list[str]]:
         """Reap aged unregistered on-disk ``_merge-*`` worktrees (I6 leak
         closure, task 2060).
@@ -9649,10 +9683,31 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         (:data:`PERSISTENT_MERGE_WORKTREE_NAME`) and any path already present
         in :attr:`_owned_merge_worktrees`.  A candidate is only removed (via
         :meth:`GitOps.cleanup_merge_worktree`) once its mtime age exceeds
+        *min_age_secs*, which defaults to
         :attr:`RESOURCE_AUDIT_WORKTREE_GRACE_SECS` — the same grace window
         :meth:`worktree_ledger_violations` uses — so a worktree from a
         just-started concurrent merge (register-after-create race) is never
         touched.
+
+        DETECT-EARLY / DESTROY-LATE (task 3018).  *min_age_secs* exists so the
+        periodic steady-state caller can destroy at a STRICTLY LARGER floor
+        (:attr:`PERIODIC_REAP_MIN_AGE_SECS`) than the audit detects at.
+        Detection is deliberately unchanged: :meth:`worktree_ledger_violations`
+        and :meth:`_check_resource_audit` keep flagging at
+        :attr:`RESOURCE_AUDIT_WORKTREE_GRACE_SECS` and stay observation-only
+        (PRD design decision 4), so a tree between the two thresholds is still
+        reported on every heartbeat — it is simply not destroyed yet.  Only
+        this remediation pass destroys.  Leaving *min_age_secs* as ``None``
+        keeps the startup/recovery caller (``Harness._reap_orphaned_merge_worktrees``)
+        byte-identical to its pre-3018 behaviour.
+
+        Note the age gate is DEFENSE-IN-DEPTH, not the primary protection for
+        a live verify: throwaway verify worktrees hold
+        ``merge_verify_lease(lane_dir=wt)`` for the duration of their verify
+        (``merge_shadow._run_cold_shadow_verify`` /
+        ``merge_drift._run_drift_check``), so
+        :meth:`GitOps.remove_merge_worktree_guarded` refuses them with
+        ``'skipped_lease_held'`` regardless of age.
 
         Before the reap scan, *recovered_branches* (the branches of merge
         requests recovered from the durable journal — see
@@ -9665,7 +9720,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         (re-adoption bypasses the grace gate entirely).
 
         *now* is injectable for deterministic tests; defaults to
-        ``time.time()``.
+        ``time.time()``.  *min_age_secs* overrides the destruction floor;
+        defaults to :attr:`RESOURCE_AUDIT_WORKTREE_GRACE_SECS`.
 
         Returns ``{'readopted': [...], 'reaped': [...]}`` — string paths of
         every worktree re-adopted / removed this sweep.  Returns
@@ -9696,7 +9752,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 readopted.append(str(wt.resolve()))
 
         effective_now = now if now is not None else time.time()
-        grace = self.RESOURCE_AUDIT_WORKTREE_GRACE_SECS
+        grace = (
+            min_age_secs
+            if min_age_secs is not None
+            else self.RESOURCE_AUDIT_WORKTREE_GRACE_SECS
+        )
         # Computed AFTER re-adoption so the reap scan below skips paths just
         # re-adopted above (re-adoption is exempt from the grace gate).
         owned = {p.resolve() for p in self._owned_merge_worktrees}
@@ -9782,6 +9842,20 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         decision 4); this is a deliberately SEPARATE remediation pass, not a
         change to the audit's mutation-free contract.
 
+        DESTROYS AT A STRICTLY LARGER FLOOR THAN THE AUDIT DETECTS AT.  Passes
+        ``min_age_secs=`` :attr:`PERIODIC_REAP_MIN_AGE_SECS` rather than
+        inheriting :attr:`RESOURCE_AUDIT_WORKTREE_GRACE_SECS`, so promoting
+        this sweep to steady state does not silently re-purpose a *detection*
+        threshold as a *destruction* deadline.  The audit keeps flagging a
+        tree in the band on every heartbeat; only this pass destroys, and only
+        past the larger floor (see :attr:`PERIODIC_REAP_MIN_AGE_SECS` for the
+        derivation).  That floor is defense-in-depth behind the primary
+        protection: a live throwaway verify worktree holds
+        ``merge_verify_lease(lane_dir=wt)`` across its verify
+        (``merge_shadow._run_cold_shadow_verify`` /
+        ``merge_drift._run_drift_check``), so this sweep skips it via
+        ``'skipped_lease_held'`` regardless of age.
+
         Rate-limited by :attr:`_reap_interval_s` (default 300s), mirroring
         the :attr:`_last_heartbeat_at` / :attr:`_heartbeat_interval_s`
         clock-injected idiom, with one deliberate divergence (task 3018
@@ -9794,14 +9868,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         worktree backing a recovered in-flight merge before this sweep could
         otherwise reap it out from under recovery. Each subsequent call is a
         no-op until at least ``_reap_interval_s`` seconds have elapsed since
-        the last sweep. This bounds a past-grace leak's on-disk lifetime to
-        roughly ``RESOURCE_AUDIT_WORKTREE_GRACE_SECS + _reap_interval_s``
-        after startup settles, instead of up to the next restart.
+        the last sweep. This bounds a leak's on-disk lifetime to roughly
+        ``PERIODIC_REAP_MIN_AGE_SECS + _reap_interval_s`` after startup
+        settles, instead of up to the next restart.
         """
         if now - self._last_reap_at < self._reap_interval_s:
             return
         self._last_reap_at = now
-        await self.reap_orphaned_merge_worktrees(now=now)
+        await self.reap_orphaned_merge_worktrees(
+            now=now, min_age_secs=self.PERIODIC_REAP_MIN_AGE_SECS,
+        )
 
     def _warn_if_verify_base_not_frozen_tip(
         self,

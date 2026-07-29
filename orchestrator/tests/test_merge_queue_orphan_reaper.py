@@ -514,6 +514,13 @@ class TestPeriodicReapHelper:
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
         worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = _GRACE
+        # The periodic sweep destroys at PERIODIC_REAP_MIN_AGE_SECS, not at
+        # the detection grace (task 3018 step-14 — see
+        # TestPeriodicReapDestructiveFloor for that split's own coverage).
+        # Pinned to _GRACE here so this test keeps testing what it is ABOUT —
+        # first-call/owned-preservation semantics — rather than incidentally
+        # re-testing the age floor.
+        worker.PERIODIC_REAP_MIN_AGE_SECS = _GRACE
         # _last_reap_at is seeded to real construction time, not 0.0 (task
         # 3018 amendment — avoids racing the harness startup recovery
         # sequence; see test_last_reap_at_seeded_to_construction_time).
@@ -544,6 +551,10 @@ class TestPeriodicReapHelper:
 
         worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
         worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = _GRACE
+        # See test_first_call_reaps_orphan_preserves_owned: pin the task-3018
+        # destruction floor to _GRACE so this test stays about the INTERVAL
+        # rate-limit, not the age floor.
+        worker.PERIODIC_REAP_MIN_AGE_SECS = _GRACE
         worker._reap_interval_s = 50.0
         # See test_first_call_reaps_orphan_preserves_owned: reset the
         # construction-time seed to 0.0 so "no prior call" is deterministic
