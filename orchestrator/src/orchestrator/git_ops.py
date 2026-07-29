@@ -4143,6 +4143,26 @@ class GitOps:
         first, then dark-factory's own copy (PRD D3); see
         :meth:`_run_warm_lane_disk_guard`.
 
+        **Seed-primitive passthrough (task 3072).** Passes ``--seed-script
+        <project_root>/scripts/seed-warm-lane.sh`` when that file exists.
+        ``warm-lane-gc.sh`` otherwise defaults ``SEED_SCRIPT`` to its own
+        sibling ``$SCRIPT_DIR/seed-warm-lane.sh`` and invokes it
+        UNCONDITIONALLY on the Pass-1 lane-reset path — but PRD §5 keeps
+        ``seed-warm-lane.sh`` with the project as one of the two genuinely
+        toolchain-bound primitives, so it does not travel with the relocated
+        policy script.  Once dark-factory's copy is the one running (leaf
+        ζ/κ), that sibling default would point at a file that is not there and
+        fail EVERY lane reset — a silently-stopped GC accreting the pool to
+        ENOSPC.  Naming the project's primitive explicitly is resolution
+        wiring, not a policy change; ``gc.sh`` already exposes the flag.
+
+        Strictly no-op today: for a reify-shaped ``project_root`` the passed
+        path is byte-identical to the one gc.sh's own default computes, and a
+        project with no seed script gets no flag, so argv is unchanged.
+        Patching the relocated script's default instead would make
+        dark-factory guess at a project-owned path, violating PRD invariant
+        C-1.
+
         Fail-soft: absent script → 127 sentinel; any unexpected exception → 127;
         never raises.  A non-zero exit is logged at WARNING and treated as
         'nothing reclaimed' by the caller (``_warm_lane_disk_admission_blocked``).
@@ -4196,6 +4216,9 @@ class GitOps:
                 str(script), 'reclaim',
                 '--mount', str(self.worktree_base),
             ]
+            seed = self.project_root / 'scripts' / 'seed-warm-lane.sh'
+            if seed.exists():
+                cmd += ['--seed-script', str(seed)]
             rc, _, err = await _run(cmd, cwd=self.project_root)
             if rc != 0:
                 logger.warning(

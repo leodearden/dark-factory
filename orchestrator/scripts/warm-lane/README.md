@@ -87,3 +87,28 @@ work — leaves β/γ/δ/ε — not this leaf), and no provenance header is prep
 to any script.
 
 *(none yet — filled in by later steps of task 3072)*
+
+## Sibling-seed defaults, and who resolves them
+
+Two of the relocated scripts default their `--seed-script` to a **sibling**
+`seed-warm-lane.sh` — a file that, per §5 above, deliberately stayed in the
+project. At the new location that sibling does not exist, so anything relying
+on the default would fail. They are handled differently because their reach
+differs, and neither is a policy change:
+
+- **`warm-lane-gc.sh`** invokes `$SEED_SCRIPT` *unconditionally* on the Pass-1
+  lane-reset path, so its default is on the hot path. dark-factory's caller
+  (`GitOps._run_warm_lane_gc_reclaim`) therefore passes `--seed-script
+  <project_root>/scripts/seed-warm-lane.sh` explicitly whenever that file
+  exists. The script itself is left **verbatim**: the caller resolves the
+  project-owned primitive, rather than dark-factory patching a default to
+  guess at a project-owned path (PRD invariant C-1). Strictly no-op today —
+  for reify the passed path is byte-identical to what the sibling default
+  computes, and a project with no seed script gets no flag at all.
+
+- **`thin-warm-lane.sh`** has the same sibling default, but it is reachable
+  ONLY under `--reseed`, which dark-factory never passes (PRD D3): the caller
+  invokes it as `thin-warm-lane.sh <lane_dir>` and nothing else. It is
+  therefore left verbatim with no caller-side wiring. **Any future caller that
+  does pass `--reseed` must also pass `--seed-script`**, or it will resolve a
+  sibling that is not there.
