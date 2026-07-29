@@ -120,6 +120,18 @@ class TaskSteward:
         self._retry_counts: dict[str, int] = {}
         self._timeout_counts: dict[str, int] = {}
         self._empty_output_counts: dict[str, int] = {}
+        # Escalations this steward has permanently given up on — TERMINAL for
+        # THIS steward, never re-handled (task 3170, fix B).  Before this
+        # existed nothing recorded that a cap had already fired, so ANY early
+        # return from _handle_escalation left the record pending,
+        # _next_escalation re-returned it from a synchronous read, and
+        # _run_loop re-handled it at loop speed with no sleep and no state
+        # change (1,183,854 identical log lines in 20.5h on reify 5189, each
+        # iteration also awaiting a `git rev-list` subprocess via the wip
+        # probe).  Populated by _mark_capped at every cap-fire early return
+        # and honoured at three sites: _handle_escalation's early return,
+        # _next_escalation's filter, and the watcher's --exclude-id argv.
+        self._capped_escalations: set[str] = set()
         self.metrics = StewardMetrics()
 
         # Outcome channel (task 2248 / W9-delta): the workflow registers a
@@ -281,15 +293,28 @@ class TaskSteward:
 
         Checks for already-pending escalations before starting the watcher
         to avoid a race between escalation submission and watcher startup.
+
+        Escalations in ``_capped_escalations`` are filtered out of BOTH the
+        synchronous read and the watcher's return (task 3170, fix B): a record
+        this steward has already given up on is terminal, so re-picking it at
+        ANY rate is wasted work — and, worse, a capped record sitting at the
+        head of the pending list would keep blocking genuinely new escalations
+        behind it.  Returning ``None`` here routes ``_run_loop`` into its
+        existing 1s backoff instead.
         """
-        pending = self.escalation_queue.get_by_task(
-            self.task_id, status='pending', level=0,
-        )
+        pending = [
+            e for e in self.escalation_queue.get_by_task(
+                self.task_id, status='pending', level=0,
+            )
+            if e.id not in self._capped_escalations
+        ]
         if pending:
             return pending[0]
 
         esc = await self._watch_for_escalation()
         if esc is not None and esc.level != 0:
+            return None
+        if esc is not None and esc.id in self._capped_escalations:
             return None
         return esc
 
@@ -346,7 +371,23 @@ class TaskSteward:
     # ------------------------------------------------------------------
 
     async def _handle_escalation(self, escalation: Escalation) -> None:
-        """Handle a single escalation via the persistent session."""
+        """Handle a single escalation via the persistent session.
+
+        A capped escalation is TERMINAL for this steward (task 3170, fix B):
+        once any guard below has fired, ``_mark_capped`` records the id and
+        this method becomes a no-op for it.  The early return sits ABOVE the
+        "handling escalation" info log deliberately — a capped record must
+        produce no further log lines at all, which is the O(1)-not-O(10^6)
+        signal that distinguishes a healthy idle steward from the spin this
+        guard exists to prevent.
+        """
+        if escalation.id in self._capped_escalations:
+            logger.debug(
+                f'Steward for task {self.task_id}: {escalation.id} already '
+                f'capped — not re-handling (terminal for this steward)'
+            )
+            return
+
         logger.info(
             f'Steward for task {self.task_id}: handling escalation '
             f'{escalation.id} [{escalation.category}] — {escalation.summary}'
@@ -364,6 +405,7 @@ class TaskSteward:
                 escalation,
                 f'Worktree missing: {self.worktree} — task abandoned',
             )
+            self._mark_capped(escalation.id)
             self._stopped = True
             return
 
@@ -375,6 +417,7 @@ class TaskSteward:
                 f'${self.config.steward_lifetime_budget:.2f})',
                 outcome=StewardBudgetExhausted(),
             )
+            self._mark_capped(escalation.id)
             return
 
         # Guard: per-escalation retry limit
@@ -402,6 +445,9 @@ class TaskSteward:
                     f'Failed after {retry_count} attempt{"s" if retry_count != 1 else ""}: {escalation.summary}',
                     outcome=outcome,
                 )
+            # Marked for BOTH branches: the give-up is terminal for this
+            # steward regardless of whether it filed an L1.
+            self._mark_capped(escalation.id)
             return
 
         # Guard: per-escalation timeout-kill cap
@@ -421,6 +467,7 @@ class TaskSteward:
                     f'Invocation repeatedly timed out ({timeout_count}/{self.config.steward_max_timeouts_per_escalation})',
                     outcome=outcome,
                 )
+            self._mark_capped(escalation.id)
             return
 
         # Guard: per-escalation empty-output cap
@@ -431,6 +478,7 @@ class TaskSteward:
                 f'Invocation repeatedly produced no output '
                 f'({empty_output_count}/{self.config.steward_max_empty_outputs_per_escalation})',
             )
+            self._mark_capped(escalation.id)
             return
 
         cwd = self.worktree
@@ -874,6 +922,18 @@ class TaskSteward:
     # ------------------------------------------------------------------
     # Give-up without an L1 hand-off (task-2060 resume-plan branches)
     # ------------------------------------------------------------------
+
+    def _mark_capped(self, escalation_id: str) -> None:
+        """Record that this steward has permanently given up on *escalation_id*.
+
+        Called from EVERY cap-fire early return in :meth:`_handle_escalation`
+        — not just the two wip-gated branches — so the busy-loop shape is
+        unreachable from any future early return added there (task 3170,
+        fix B).  ``_capped_escalations`` is deliberately per-steward, not
+        persisted: it means "terminal for THIS steward", and a fresh steward
+        for the same task is entitled to try again.
+        """
+        self._capped_escalations.add(escalation_id)
 
     def _dismiss_capped_l0(self, escalation: Escalation, reason: str) -> None:
         """Dismiss *escalation* on a give-up that files no L1 (task 3170).
