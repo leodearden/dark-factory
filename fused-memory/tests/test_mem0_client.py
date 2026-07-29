@@ -816,7 +816,12 @@ class TestMem0BackendScanPayloadText:
 
         scroll_filter = mock_client.scroll.call_args.kwargs.get('scroll_filter')
         assert isinstance(scroll_filter, qmodels.Filter)
-        assert [c.match.text for c in scroll_filter.should] == list(PREFILTER_NEEDLES)
+        assert isinstance(scroll_filter.should, list)
+        assert len(scroll_filter.should) == len(PREFILTER_NEEDLES)
+        for cond, needle in zip(scroll_filter.should, PREFILTER_NEEDLES, strict=True):
+            assert isinstance(cond, qmodels.FieldCondition)
+            assert isinstance(cond.match, qmodels.MatchText)
+            assert cond.match.text == needle
 
     @pytest.mark.asyncio
     async def test_timeout_propagates_not_swallowed(self, backend):

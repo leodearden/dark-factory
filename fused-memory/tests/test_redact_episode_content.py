@@ -173,7 +173,7 @@ class TestRedactEpisodeContentPreservesCollateral:
     @pytest.mark.asyncio
     async def test_never_calls_any_removal_path(self, mock_config, make_backend):
         backend = make_backend(mock_config)
-        graph = _wire_graph(backend, rows=[[_DIRTY_CONTENT]])
+        _wire_graph(backend, rows=[[_DIRTY_CONTENT]])
         backend.remove_episode = AsyncMock()
         backend.remove_edge = AsyncMock()
         backend.bulk_remove_edges = AsyncMock()
