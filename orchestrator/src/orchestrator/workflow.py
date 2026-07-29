@@ -10675,6 +10675,34 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         an empty string immediately — the caller treats this as "no
         resolution" and the workflow proceeds to ESCALATED/BLOCKED
         via its normal path.
+
+        **Bounded (task 3170, fix C).** The level-0 wait honours
+        ``config.steward_completion_timeout`` as a single overall deadline —
+        the same knob, and the same monotonic-deadline shape, as this
+        method's sibling waiter :meth:`_await_steward_completion`.  It relies
+        on the same producer invariant that sibling does:
+
+            A steward give-up ALWAYS dismisses its own L0 before publishing
+            an outcome.  No pending L0 survives a steward give-up.
+
+        This path is woken ONLY by that dismissal (``EscalationQueue.resolve``
+        → ``_resolve_callback`` → ``harness._on_escalation_resolved`` →
+        ``_escalation_events[task_id].set()``); it never reads the steward
+        outcome channel.  The timeout therefore exists to make the wait
+        non-strandable if any FUTURE producer bug breaks that invariant — as
+        task 2248's wip-gated give-up branches did, parking the workflow
+        forever while the steward re-handled the capped escalation at loop
+        speed.
+
+        On expiry it logs loudly, emits an ``escalation_resolved`` event with
+        ``outcome='steward_wait_timeout'``, DISMISSES the orphan L0(s) — so
+        the next ESCALATED entry cannot re-strand on the same records — and
+        falls through to the unchanged tail below.  That yields exactly two
+        dispositions: ``_StewardReescalated`` (blocking, with the already-open
+        L1) when one is open, or the collected resolutions (resuming) when
+        none is.  It deliberately does NOT call :meth:`_mark_blocked`, which
+        would file a fresh L0 and could add a SECOND full grace window for
+        what is a pure wait-timeout.
         """
         if self.escalation_queue is None:
             logger.warning(
@@ -10700,7 +10728,13 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         if pending_high_sev:
             raise _StewardReescalated(pending_high_sev)
 
-        # Wait for level-0 pending escalations to clear
+        # Wait for level-0 pending escalations to clear, BOUNDED by
+        # steward_completion_timeout (task 3170, fix C).  See the method
+        # docstring for the disposition; the deadline shape mirrors
+        # _await_steward_completion so the two waiters bound themselves
+        # identically instead of inventing a second knob.
+        timeout = self.config.steward_completion_timeout
+        deadline = asyncio.get_event_loop().time() + timeout
         while True:
             pending_l0 = self.escalation_queue.get_by_task(
                 self.task_id, status='pending', level=0,
@@ -10708,7 +10742,42 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             if not pending_l0:
                 break
             self._escalation_event.clear()
-            await self._escalation_event.wait()
+            remaining = deadline - asyncio.get_event_loop().time()
+            try:
+                if remaining <= 0:
+                    raise TimeoutError  # noqa: TRY301 — uniform expiry handling
+                await asyncio.wait_for(self._escalation_event.wait(), remaining)
+            except (TimeoutError, asyncio.TimeoutError):
+                orphan_ids = [e.id for e in pending_l0]
+                logger.warning(
+                    'Task %s: steward did not resolve %d level-0 escalation(s) '
+                    'within steward_completion_timeout (%.0fs) — dismissing the '
+                    'orphan(s) and unblocking the ESCALATED wait: %s',
+                    self.task_id, len(orphan_ids), timeout, ', '.join(orphan_ids),
+                )
+                if self.event_store:
+                    self.event_store.emit(
+                        EventType.escalation_resolved,
+                        task_id=self.task_id, phase=self.state.value,
+                        data={
+                            'outcome': 'steward_wait_timeout',
+                            'escalation_ids': orphan_ids,
+                        },
+                    )
+                # Uphold the same "no pending L0 survives a give-up"
+                # invariant fix A establishes on the producer side.  Leaving
+                # them pending would re-strand the NEXT ESCALATED entry on
+                # the same records for another full window.
+                for esc in pending_l0:
+                    self.escalation_queue.resolve(
+                        esc.id,
+                        'Auto-dismissed: steward did not resolve within '
+                        'steward_completion_timeout — unblocking the '
+                        'ESCALATED wait',
+                        dismiss=True,
+                        resolved_by='auto-dismissed',
+                    )
+                break
 
         # Check for level-1 re-escalation (steward gave up)
         if self.escalation_queue.has_open_l1(self.task_id):
