@@ -68,6 +68,50 @@ def _degenerate_plan() -> dict:
     }
 
 
+def _create_plan_stub() -> dict:
+    """The header-only plan ``_create_plan`` writes on the architect's FIRST call.
+
+    Verbatim shape from ``orchestrator/src/orchestrator/mcp/plan_tools.py``
+    (``_create_plan``, lines 146-156): a TRUTHY dict carrying ZERO steps. This is
+    the artifact a session cap leaves behind when it lands mid-run right after
+    ``create_plan`` — the most common mid-run cap shape, since ``create_plan`` is
+    the only plan-tools call the architect can reach before the 429.
+    """
+    return {
+        'task_id': 't',
+        'title': 'x',
+        'analysis': 'a',
+        'files': [],
+        'prerequisites': [],
+        'steps': [],
+        'design_decisions': [],
+        'reuse': [],
+    }
+
+
+def _stub_with_steps(steps) -> dict:
+    """``_create_plan_stub`` with its ``steps`` replaced (``[]`` vs ``None``)."""
+    stub = _create_plan_stub()
+    stub['steps'] = steps
+    return stub
+
+
+# Every artifact shape that carries NO model content to derive a score from —
+# absent, empty, not-a-dict, or the header-only stub in either empty spelling.
+# Shared by the is_scorable_plan tests and the anti-drift parity assertion, so
+# the two can never be extended out of step with each other.
+_UNSCORABLE_PLAN_SHAPES = [
+    {},
+    None,
+    [],
+    'x',
+    {'steps': []},
+    {'steps': None},
+    _create_plan_stub(),
+    _stub_with_steps(None),
+]
+
+
 # ---------------------------------------------------------------------------
 # EvalMetrics.plan_quality / role_under_test fields (step-1/2)
 #
@@ -450,6 +494,53 @@ class TestScorePlanStructure:
         zero_weight_rubric = {'criteria': [{'name': 'has_steps', 'weight': 0.0}]}
         with pytest.raises(ValueError, match='total weight'):
             score_plan_structure(_well_formed_plan(), rubric=zero_weight_rubric)
+
+
+# ---------------------------------------------------------------------------
+# is_scorable_plan — THE single "does this artifact carry model content?" test
+# (3118 step-19/20)
+#
+# Extracted because the taint decision and the structural floor's 0.0
+# short-circuit were two INDEPENDENT tests that DISAGREED: run_architect_eval
+# used raw dict truthiness (`not plan`) while score_plan_structure used
+# `not plan.get('steps')`. `_create_plan` persists a TRUTHY header-only dict
+# with zero steps, so a cap landing right after the architect's first
+# plan-tools call fell straight into the gap — untainted, then floored to a
+# fabricated 0.0, the exact defect this task exists to remove.
+#
+# Both call sites now share this one function, so the parity below is
+# structural, not a convention someone has to remember.
+# ---------------------------------------------------------------------------
+
+class TestIsScorablePlan:
+    @pytest.mark.parametrize('plan', _UNSCORABLE_PLAN_SHAPES)
+    def test_shapes_without_steps_are_not_scorable(self, plan):
+        from orchestrator.evals.judge import is_scorable_plan
+
+        assert is_scorable_plan(plan) is False
+
+    def test_a_plan_with_steps_is_scorable(self):
+        from orchestrator.evals.judge import is_scorable_plan
+
+        assert is_scorable_plan(_well_formed_plan()) is True
+        # Even a poor plan is SCORABLE — the predicate asks "is there content to
+        # measure?", never "is the content good?". A bad plan must keep earning
+        # its low score rather than being laundered into an exclusion.
+        assert is_scorable_plan(_degenerate_plan()) is True
+
+    @pytest.mark.parametrize('plan', _UNSCORABLE_PLAN_SHAPES)
+    def test_rejected_shapes_are_exactly_the_structural_floor_zero(self, plan):
+        """ANTI-DRIFT: the predicate and the floor's short-circuit must agree.
+
+        The blocking defect was two "is this a real plan?" tests disagreeing.
+        Every shape the predicate rejects must be a shape the floor scores 0.0
+        by short-circuit — so a cell can never be left untainted while the floor
+        simultaneously refuses to derive a content score for it.
+        """
+        from orchestrator.evals.judge import is_scorable_plan, score_plan_structure
+
+        assert is_scorable_plan(plan) is False
+        assert score_plan_structure(plan) == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -916,6 +1007,47 @@ class TestRunArchitectEval:
         assert 'cap' in marker.lower()
         # ...and the judge is still skipped: in the same cap window it would 429
         # too, and the floor is the exact degradation a judge failure takes.
+        mocks['judge'].assert_not_called()
+
+    @pytest.mark.parametrize('empty_steps', [[], None])
+    async def test_cap_after_create_plan_stub_is_tainted_not_scored_zero(
+        self, empty_steps,
+    ):
+        """The middle case: a cap landing right after ``create_plan``.
+
+        The architect reached exactly ONE plan-tools call before the 429, so
+        ``plan.json`` holds the header-only stub ``_create_plan`` writes — a
+        TRUTHY dict with zero steps. That is NOT a content measurement: there
+        are no steps to score.
+
+        BEFORE this fix the runner's taint predicate was raw dict truthiness
+        (``not plan``), so this stub read as "a real plan landed" → the cell was
+        left ``cap_tainted=False`` and handed to ``score_plan_structure``, which
+        short-circuits to 0.0 for want of steps. Verified against the harness:
+        ``cap_tainted=False, plan_quality=0.0``. That fabricated zero is then
+        AVERAGED into ``mean_plan_quality`` with neither exclusion surface
+        counting it — precisely the defect this task exists to remove, reopened
+        by the one plan shape a mid-run cap most often produces.
+
+        Parameterised over both empty spellings (``[]`` and ``None``) so the
+        predicate is pinned to "has steps", not to the empty-list spelling.
+        """
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=_stub_with_steps(empty_steps),
+            arch_result=_cap_agent_result(),
+        )
+
+        assert result.metrics['cap_tainted'] is True
+        assert result.metrics['plan_quality'] is None
+        assert result.metrics['plan_quality'] != 0.0
+        assert result.metrics['plan_steps'] == 0
+
+        marker = result.metrics['invocation_error']
+        assert isinstance(marker, str) and marker.startswith('architect:')
+        assert 'cap' in marker.lower()
+
+        # Nothing to judge, and inside the cap window the judge would 429 too.
         mocks['judge'].assert_not_called()
 
     async def test_wedged_architect_invoke_is_marked_and_excluded(self):
