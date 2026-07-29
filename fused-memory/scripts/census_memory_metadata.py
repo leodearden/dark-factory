@@ -56,16 +56,31 @@ Usage
 
 from __future__ import annotations
 
+import argparse
+import asyncio
+import json
 import logging
 import re
+import sys
 from collections import Counter
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from fused_memory.models.enums import GRAPHITI_PRIMARY, MEM0_PRIMARY, MemoryCategory
 
 logger = logging.getLogger('census_memory_metadata')
+
+# Default artifact paths, relative to the repo root (this file lives at
+# <repo>/fused-memory/scripts/). Committed: leaf beta's grandfather list
+# cites them, and a report that exists only on an operator's disk cannot be
+# cited.
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+DEFAULT_JSON_OUT = str(_REPO_ROOT / 'plans' / 'memory-metadata-census-report.json')
+DEFAULT_MD_OUT = str(_REPO_ROOT / 'plans' / 'memory-metadata-census-report.md')
+
+DEFAULT_PROJECT_IDS = ['dark_factory', 'reify']
 
 # Page-budget backstop: 200 pages x the 1000-point default page size covers
 # 200k points, an order of magnitude above the largest measured collection
@@ -750,18 +765,161 @@ def _render_census_sections(census: dict[str, Any]) -> list[str]:
 
 
 def _render_table(title: str, table: dict[str, Any] | None, value_header: str) -> list[str]:
+    resolved = table or {}
     lines = [f'#### {title}', '']
-    entries = (table or {}).get('entries', [])
+    entries = resolved.get('entries', [])
     if not entries:
         lines += ['_(none)_', '']
         return lines
     lines += [f'| {value_header} | count |', '| --- | ---: |']
     lines += [f'| `{e["value"]}` | {e["count"]:,} |' for e in entries]
     lines.append('')
-    if (table or {}).get('truncated_values'):
+    if resolved.get('truncated_values'):
         lines += [
-            f'_Showing top {len(entries)} of {table.get("distinct_total", 0):,} distinct '
+            f'_Showing top {len(entries)} of {resolved.get("distinct_total", 0):,} distinct '
             f'values — **truncated**; raise `--top-n` for the full tail._',
             '',
         ]
     return lines
+
+
+# ---------------------------------------------------------------------------
+# CLI / main
+# ---------------------------------------------------------------------------
+
+def _build_backend(config: Any) -> Any:
+    """Construct the Mem0 backend.
+
+    Deliberately NOT ``MemoryService(config)`` + ``initialize()``:
+    ``Mem0Backend.__init__`` needs only config and creates its Qdrant client
+    lazily, so a read-only census needs neither FalkorDB/Graphiti nor an
+    embedder / ``OPENAI_API_KEY``. Fewer live dependencies means the census
+    still runs when the graph store or LLM credentials are unavailable.
+    Seam kept separate so the CLI band is testable without a live Qdrant.
+    """
+    from fused_memory.backends.mem0_client import Mem0Backend  # noqa: PLC0415
+
+    return Mem0Backend(config)
+
+
+async def _run(args: argparse.Namespace) -> int:
+    logging.basicConfig(
+        level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
+    )
+
+    import os  # noqa: PLC0415
+
+    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+
+    if args.config:
+        os.environ['CONFIG_PATH'] = str(args.config)
+
+    backend = _build_backend(FusedMemoryConfig())
+    try:
+        cells: dict[str, dict[str, CategoryCensus]] = {}
+        coverage: dict[str, dict[str, Any]] = {}
+        for project_id in args.project_id:
+            logger.info('censusing project=%s', project_id)
+            project_cells, project_coverage = await census_project(
+                backend,
+                project_id,
+                page_size=args.page_size,
+                max_pages=args.max_pages,
+            )
+            cells[project_id] = project_cells
+            coverage[project_id] = project_coverage
+
+        report = build_report(
+            cells, coverage, top_n=args.top_n, page_size=args.page_size,
+        )
+        _write_artifacts(report, args.json_out, args.md_out)
+
+        complete = report['coverage']['complete']
+        logger.info(
+            'census complete=%s records=%d json=%s md=%s',
+            complete, report['grand_total']['records'], args.json_out, args.md_out,
+        )
+        if not complete:
+            # The artifact still lands — the evidence of the shortfall is IN
+            # it — but the exit code refuses to call an under-enumerated
+            # census a successful one (INV-2).
+            for delta in report['coverage']['deltas']:
+                logger.error('COVERAGE SHORTFALL: %s', delta)
+            return 1
+        return 0
+    except CensusScanIncomplete:
+        logger.exception('ABORT: a scroll could not enumerate its full result set')
+        return 1
+    finally:
+        await backend.close()
+
+
+def _write_artifacts(report: dict[str, Any], json_out: str, md_out: str) -> None:
+    json_path = Path(json_out)
+    md_path = Path(md_out)
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    md_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.write_text(json.dumps(report, indent=2, sort_keys=False) + '\n')
+    md_path.write_text(render_markdown(report))
+
+
+class _AppendReplacingDefault(argparse.Action):
+    """``append`` that DISCARDS the default list on first use.
+
+    Plain ``action='append'`` with a list default extends it, so a single
+    ``--project-id reify`` would silently census dark_factory too. Replacing
+    on first use lets the parser carry the real default (visible in --help,
+    and returned by ``parse_args([])``) without that trap.
+    """
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        current = getattr(namespace, self.dest, None)
+        if current is self.default or current is None:
+            current = []
+            setattr(namespace, self.dest, current)
+        current.append(values)
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        '--project-id', dest='project_id', action=_AppendReplacingDefault,
+        default=list(DEFAULT_PROJECT_IDS),
+        help=(
+            'Project id to census; repeatable. '
+            f'Default: {" ".join(DEFAULT_PROJECT_IDS)}'
+        ),
+    )
+    parser.add_argument(
+        '--page-size', dest='page_size', type=int, default=1000,
+        help='Qdrant scroll page size (default: 1000)',
+    )
+    parser.add_argument(
+        '--top-n', dest='top_n', type=int, default=50,
+        help='Max entries per value/key table before truncation (default: 50)',
+    )
+    parser.add_argument(
+        '--max-pages', dest='max_pages', type=int, default=DEFAULT_MAX_PAGES,
+        help=f'Per-category scroll page budget (default: {DEFAULT_MAX_PAGES})',
+    )
+    parser.add_argument(
+        '--json-out', dest='json_out', default=DEFAULT_JSON_OUT,
+        help=f'JSON report path (default: {DEFAULT_JSON_OUT})',
+    )
+    parser.add_argument(
+        '--md-out', dest='md_out', default=DEFAULT_MD_OUT,
+        help=f'Markdown report path (default: {DEFAULT_MD_OUT})',
+    )
+    parser.add_argument(
+        '--config', default=None,
+        help='Path to fused-memory config file (sets CONFIG_PATH env var)',
+    )
+    return parser
+
+
+def main() -> int:
+    return asyncio.run(_run(_build_parser().parse_args()))
+
+
+if __name__ == '__main__':
+    sys.exit(main())
