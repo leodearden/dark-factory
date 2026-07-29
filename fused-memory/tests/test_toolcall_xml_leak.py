@@ -55,7 +55,7 @@ _CLOSE_INVOKE = '\x3c/invoke>'
 
 def _open_param(name: str) -> str:
     """Return a serialized opening parameter tag for *name*."""
-    return '\x3cparameter name="%s">' % name
+    return '\x3cparameter name="' + name + '">'
 
 
 # ---------------------------------------------------------------------------
