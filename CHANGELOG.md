@@ -48,6 +48,24 @@ Qdrant payload text — semantic `search` provably cannot find these),
 `fused-memory/scripts/sweep_toolcall_xml_leak.py` (the corpus sweep; dry-run by
 default).
 
+**What the sweep's repair preserves.** The memory **text** in full, plus the
+**payload metadata** that is the record's only metadata-scoped retrieval axis —
+carry-over rule `payload keys - _MEM0_OWNED_KEYS`, with the scope identities
+threaded back as `agent_id=` / `session_id=` arguments and anything carried
+nowhere *named* per-record in the report's `metadata_dropped`. Without that,
+a repaired record would silently vanish from `get_memories_by_metadata` /
+`count_memories_by_metadata`, which match payload keys by equality.
+
+**The sweep verifies the re-add persisted** rather than trusting a non-raising
+`add_memory`: the service swallows a Mem0 write failure into
+`AddMemoryResponse.message` as `[mem0_error: ...]` and returns normally, so a
+returned response is not evidence of a write. Two per-record outcomes exit
+non-zero and need a human — `content_lost_in_flight` (the delete landed, the
+re-add did not persist; the original text now exists only in the printed report,
+restore it from there before re-running) and `skipped_not_mem0_routed` (a
+repairable record whose category does not route to mem0, left entirely untouched
+because neither a plain re-add nor `dual_write=True` is safe).
+
 **Full root cause, evidence, and operator runbook:**
 [`docs/mcp-toolcall-xml-leak.md`](docs/mcp-toolcall-xml-leak.md). Run the sweep
 **before** any further large consolidation pass — consolidation deletes

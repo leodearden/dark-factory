@@ -190,16 +190,53 @@ python scripts/sweep_toolcall_xml_leak.py --apply --exhaustive
 ```
 
 `--apply` exits **non-zero** if it left any `manual_review` record behind, so
-a partial sweep can never be mistaken for a complete one. It also exits
-non-zero if a delete succeeded but its re-add then failed — that record is
-reported as content-lost-in-flight with both ids and the original text, loudly,
-rather than swallowed.
+a partial sweep can never be mistaken for a complete one, and likewise if the
+scan was truncated (`--limit` reached), since it then covered an unknown
+fraction of the corpus.
 
 Repair is **delete + re-add**, never an in-place Qdrant payload `SET`. The
 repaired text must be re-embedded; an in-place write would leave a stale vector
 pointing at the corrupted string. The report records old id, new id, and both
 before/after contents so every repair is auditable — the same mapping shape as
 Stage 1's `2c47b5cb` → `0a4f4848`.
+
+### What "content-preserving" means, precisely
+
+The repair preserves two things: the memory **text** in full, and the **payload
+metadata** that is the record's only metadata-scoped retrieval axis.
+
+That second half is not decoration. `get_memories_by_metadata` and
+`count_memories_by_metadata` match payload *keys* by equality via `MatchValue`,
+so a repaired record that lost its `task_id` / `kind` / `x_*` keys would become
+invisible to every metadata-scoped consumer that could previously find it — a
+second, undisclosed mutation of stored state layered on the harness's first.
+
+The carry-over rule is `payload keys - _MEM0_OWNED_KEYS`, where the owned set is
+what mem0/Qdrant assign or re-derive on write (`id`, `hash`, the content keys,
+`created_at`/`updated_at`, `user_id`/`agent_id`/`run_id`/`actor_id`/`role`, and
+`category`, which the service overwrites anyway). The scope identities go back
+in as **arguments** — `agent_id=` and `session_id=`, since mem0 writes its
+`run_id` payload key from `Scope.session_id` — rather than being forged as
+metadata. Every record in the report names its own `metadata_preserved` and
+`metadata_dropped` key lists, so anything that could not be carried is *named*
+rather than dropped silently.
+
+### The sweep verifies persistence; it does not trust a returned response
+
+`MemoryService.add_memory` **swallows a Mem0 write failure**: it catches
+`Exception`, logs it, folds the failure into `AddMemoryResponse.message` as
+`[mem0_error: ...]`, and returns *normally*. A returned response is therefore
+not by itself evidence that anything was written. The sweep checks three
+independent things before marking a record repaired — non-empty `memory_ids`,
+`mem0` present in `stores_written`, and no `mem0_error` in `message` — and a
+non-raising add that fails any of them is treated **identically to a throw**.
+
+### The two non-zero exit conditions that need a human
+
+| Record flag | What happened | What to do |
+| --- | --- | --- |
+| `content_lost_in_flight` | The delete landed but the re-add did **not** persist (raised, or returned without evidence of a mem0 write). The original text now exists **only in the printed JSON report**. | Restore it by hand from the report — it carries the old id, the original content, the repaired content, and `metadata_preserved` / `metadata_dropped` — **before** re-running the sweep. |
+| `skipped_not_mem0_routed` | A repairable record whose `category` does not route to mem0 (or is absent/unrecognised). Left **entirely untouched**: nothing deleted, nothing added. | Needs a human decision. Neither option is safe unattended — a plain re-add would route the repaired text to Graphiti only and the Qdrant copy the delete removed would be gone, while `dual_write=True` would duplicate the Graphiti copy that the mem0-scoped delete deliberately left alive. |
 
 ---
 
