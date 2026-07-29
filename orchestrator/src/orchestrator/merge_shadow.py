@@ -866,6 +866,11 @@ async def _run_cold_shadow_verify(
     — it has no retained ``target/`` warmth — ensuring a true from-scratch
     cold verify (PRD §10 invariant 6(b)).
 
+    The verify body runs under ``merge_verify_lease(lane_dir=wt)`` so a
+    concurrent periodic worktree reap (task 3018) cannot delete the checkout
+    mid-verify; the lease is released before the ``finally`` cleanup — see the
+    inline comment for why that scope is load-bearing.
+
     Args:
         git_ops: Live :class:`~orchestrator.git_ops.GitOps` instance.
         req: The :class:`MergeRequest` that just warm-landed (provides config,
@@ -894,27 +899,65 @@ async def _run_cold_shadow_verify(
 
     wt = await git_ops.create_throwaway_verify_worktree(merge_commit)
     try:
-        task_files_tuple = (
-            tuple(req.task_files) if req.task_files is not None else None
-        )
-        spec = _mq.build_merge_verify_spec(req.config, req.module_configs, task_files_tuple)
-        # LOCAL-ONLY by design: this is the from-scratch cold trust-anchor detective
-        # control (PRD §10 invariant 6(b)).  Adding remotes here would (a) defeat the
-        # from-scratch-cold guarantee (a remote may have a warm sccache/target) and
-        # (b) reintroduce remote scope-derivation concerns into the very control whose
-        # purpose is to BE the local ground truth.  See design decision in plan.json.
-        pool = _mq.VerifyRunnerPool(
-            [_mq.LocalRunner(
-                wt, req.config, req.module_configs, task_files_tuple,
-                run_scoped=_mq.run_scoped_verification,
-                run_unscoped=_mq._run_unscoped_typechecks,
+        # Hold THIS throwaway lane's flock for the duration of the verify
+        # (task 3018).  Three things to know:
+        #
+        # (i) WHY IT IS NEEDED.  Task 3018 promoted
+        #     `reap_orphaned_merge_worktrees` from a startup-only sweep to a
+        #     steady-state one fired from the merge worker's heartbeat, which
+        #     turned RESOURCE_AUDIT_WORKTREE_GRACE_SECS from a *detection*
+        #     threshold into a *destruction* deadline.  This throwaway tree is
+        #     neither registered in `_owned_merge_worktrees` (so the reap's
+        #     owned-ledger skip misses it) nor touched by
+        #     `_touch_owned_merge_worktrees` (so its measured age is real
+        #     elapsed time) — the lane flock consulted by
+        #     `remove_merge_worktree_guarded` is its ONLY liveness protection.
+        #     Holding it makes that protection independent of how long the
+        #     cold verify runs, rather than resting on an age heuristic: a
+        #     concurrent sweep gets 'skipped_lease_held' instead of deleting
+        #     the checkout out from under a running verify.
+        #
+        # (ii) PRECEDENT.  Passing `lane_dir=` an ephemeral `_merge-*`
+        #     worktree (rather than the persistent lane) is established — the
+        #     DF-2822 per-land REMOTE-green cross-check does exactly this
+        #     (merge_queue.py, `lane_dir=merge_wt`).
+        #
+        # (iii) CONTENTION IS NOT A PRACTICAL FAILURE MODE here, so no
+        #     MergeVerifyLeaseContended fail-safe branch is warranted: the
+        #     `_merge-<uuid>` path was just minted by
+        #     create_throwaway_verify_worktree and is uncontended by
+        #     construction — nobody else knows it.
+        #
+        # SCOPE IS LOAD-BEARING: the lease wraps ONLY the verify body and
+        # closes before the `finally` below.  If cleanup ran while we still
+        # held the lease, `remove_merge_worktree_guarded`'s NON-BLOCKING
+        # acquire would fail against OURSELVES, return 'skipped_lease_held',
+        # and leak the very tree the finally exists to remove.
+        async with git_ops.merge_verify_lease(lane_dir=wt):
+            task_files_tuple = (
+                tuple(req.task_files) if req.task_files is not None else None
+            )
+            spec = _mq.build_merge_verify_spec(
+                req.config, req.module_configs, task_files_tuple
+            )
+            # LOCAL-ONLY by design: this is the from-scratch cold trust-anchor
+            # detective control (PRD §10 invariant 6(b)).  Adding remotes here would
+            # (a) defeat the from-scratch-cold guarantee (a remote may have a warm
+            # sccache/target) and (b) reintroduce remote scope-derivation concerns
+            # into the very control whose purpose is to BE the local ground truth.
+            # See design decision in plan.json.
+            pool = _mq.VerifyRunnerPool(
+                [_mq.LocalRunner(
+                    wt, req.config, req.module_configs, task_files_tuple,
+                    run_scoped=_mq.run_scoped_verification,
+                    run_unscoped=_mq._run_unscoped_typechecks,
+                    task_id=req.task_id,
+                )],
+                event_store=event_store,
                 task_id=req.task_id,
-            )],
-            event_store=event_store,
-            task_id=req.task_id,
-        )
-        verify = await pool.dispatch(merge_commit, spec)
-        return parse_per_test_results(verify.test_output or '')
+            )
+            verify = await pool.dispatch(merge_commit, spec)
+            return parse_per_test_results(verify.test_output or '')
     finally:
         await git_ops.cleanup_merge_worktree(wt)
 
