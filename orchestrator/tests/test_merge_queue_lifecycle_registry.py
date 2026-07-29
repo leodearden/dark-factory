@@ -1375,6 +1375,205 @@ class TestFinalizeInflightRegistersFinalizingAndTerminal:
 
 
 # ---------------------------------------------------------------------------
+# task 3082 step-1 RED / step-2 GREEN: a DROPPED/REQUEUED sentinel entry must
+# never be recorded as FINALIZING.
+#
+# ``_finalize_inflight``'s VERIFYING -> FINALIZING hop is guarded ONLY against
+# ABANDONED_PREDISPATCH / REQUEUED_PREDISPATCH, and it sits BEFORE the
+# DROPPED/REQUEUED sentinel check — so a requeued item reaches it and BOTH
+# dispositions are wrong:
+#   (B) registry still at VERIFYING (a requeue site that skipped
+#       ``_note_requeue``): the hop fires SILENTLY, records the requeued item
+#       as FINALIZING and swaps ``_live_items[rid]`` to the InflightEntry, so
+#       ``_finalizing_head_entry()`` returns a phantom head forever.
+#   (A) registry already bounced to QUEUED (the shape all four working
+#       requeue siblings produce): ``_advance_if_at`` neither fires nor
+#       tolerates QUEUED, falls through to ``_note_transition`` and fires a
+#       dedup'd ``merge_lifecycle_transition_rejected`` L1 on EVERY dead-verify
+#       abort — a legitimate, expected, recurring event.
+# Moving the hop below the sentinel check makes a DROPPED/REQUEUED item never
+# reach it at all: correct by construction in both directions.
+# ---------------------------------------------------------------------------
+
+
+async def _make_verifying_entry_with_sentinel(
+    git_ops: GitOps,
+    config: OrchestratorConfig,
+    branch: str,
+    filename: str,
+    content: str,
+    *,
+    escalation_queue: Any,
+    status: Any,
+) -> tuple[Any, MergeRequest, Any]:
+    """Build ``(worker, req, entry)`` for a REAL merged item registered at
+    VERIFYING whose already-completed ``verify_task`` carries an
+    ``InflightVerifyResult`` with sentinel *status* (task 3082).
+
+    The shape mirrors
+    ``TestFinalizeInflightRegistersFinalizingAndTerminal::
+    test_live_items_holds_entry_during_finalizing_window`` (:1097) — a real
+    ``git_ops.merge_to_main`` + ``RealMergeItem`` + mocked host allocator —
+    differing only in that ``verify_task`` is a completed future carrying the
+    sentinel rather than ``None``.  Both task-3082 classes below need exactly
+    this fixture chain.
+
+    NOTE ``_register_item`` leaves ``_live_items[rid]`` holding the
+    ``RealMergeItem``, NOT the ``InflightEntry`` — production swaps it at
+    ``_inflight_append``.  That is deliberate here: it makes the ``live_obj``
+    swap performed by whichever registry hop actually runs directly
+    observable, which is the mechanism under test.
+    """
+    from orchestrator.merge_queue import (
+        InflightEntry,
+        InflightVerifyResult,
+        ItemLifecycleState,
+        RealMergeItem,
+        SpeculativeMergeWorker,
+    )
+    from orchestrator.verify_runner import HostLease
+
+    wt = await _make_branch_with_file(git_ops, branch, filename, content)
+    req = _make_request(branch, branch, wt, config)
+    merge_result = await git_ops.merge_to_main(wt, branch)
+    assert merge_result.success and merge_result.merge_commit, f'{merge_result!r}'
+    assert merge_result.merge_worktree is not None
+    base_sha = await git_ops.get_main_sha()
+    item = RealMergeItem(
+        request=req,
+        merge_result=merge_result,
+        merge_wt=merge_result.merge_worktree,
+        base_sha=base_sha,
+        speculative=False,
+    )
+
+    worker = SpeculativeMergeWorker(
+        git_ops, asyncio.Queue(), escalation_queue=escalation_queue,
+    )
+    mock_allocator = MagicMock()
+    mock_allocator.release = AsyncMock()
+    mock_allocator.cancel_and_release = AsyncMock()
+    worker._host_allocator = mock_allocator
+    worker._register_owned_merge_worktree(item.merge_wt)
+    worker._register_item(item, initial=ItemLifecycleState.VERIFYING)
+
+    async def _sentinel_result() -> InflightVerifyResult:
+        return InflightVerifyResult(outcome=None, merge_wt=None, status=status)
+
+    entry = InflightEntry(
+        item=item,
+        lease=HostLease(name='local', runner=MagicMock(), is_local=True),
+        verify_task=cast(Any, asyncio.ensure_future(_sentinel_result())),
+        merge_wt=item.merge_wt,
+        was_speculative=False,
+    )
+    return worker, req, entry
+
+
+def _rejected_transition_escalations(fake_eq: _FakeEscalationQueue) -> list:
+    """The ``merge_lifecycle_transition_rejected`` subset of *fake_eq*.
+
+    Category-specific assertion idiom, copied from
+    test_merge_queue_duplicate_submission.py:316/:341 (per-file duplication
+    convention).
+    """
+    return [e for e in fake_eq.submitted if e.category == 'merge_lifecycle_transition_rejected']
+
+
+@pytest.mark.asyncio
+class TestRequeuedSentinelNeverRecordedAsFinalizing:
+    """A ``_finalize_inflight`` drive whose verify returned the REQUEUED
+    sentinel must never leave the registry reading FINALIZING, and must never
+    fire a ``merge_lifecycle_transition_rejected`` escalation — regardless of
+    whether the requeue site already bounced the registry to QUEUED
+    (task 3082 step-1 RED / step-2 GREEN).
+
+    RED until step-2 relocates the VERIFYING -> FINALIZING hop below the
+    DROPPED/REQUEUED sentinel check.
+    """
+
+    async def test_requeued_sentinel_is_never_recorded_as_finalizing(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """Today's trigger-3 shape: the requeue site put the request back on
+        ``_queue`` but never called ``_note_requeue``, so the registry still
+        reads VERIFYING when finalize runs.  The hop must NOT fire — a
+        requeued item is not finalizing.
+        """
+        from orchestrator.merge_queue import InflightStatus, ItemLifecycleState
+
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        worker, req, entry = await _make_verifying_entry_with_sentinel(
+            git_ops, config, 'df3082-requeued-verifying', 'df3082_rv.py', 'x = 1\n',
+            escalation_queue=fake_eq, status=InflightStatus.REQUEUED,
+        )
+        rid = req.request_id
+
+        advanced = await worker._finalize_inflight(entry)
+
+        assert advanced is False, f'a REQUEUED sentinel must not advance main: {advanced!r}'
+        current = worker._lifecycle.current(rid)
+        assert current != ItemLifecycleState.FINALIZING, (
+            f'a requeued item was recorded as FINALIZING (phantom finalize head); '
+            f'registry reads {current!r}'
+        )
+        assert worker._finalizing_head_entry() is None, (
+            f'requeued entry left as the finalize head: '
+            f'{worker._finalizing_head_entry()!r} (registry={current!r})'
+        )
+        assert not req.result.done(), (
+            'a requeued request must be left PENDING for its re-dispatch, not resolved'
+        )
+        assert _rejected_transition_escalations(fake_eq) == [], (
+            f'a requeue must not escalate: {fake_eq.submitted!r}'
+        )
+
+    async def test_note_requeued_shaped_requeue_fires_no_rejected_transition_escalation(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """The shape all four working requeue siblings produce (and the one
+        trigger 3 acquires at step-6): the site already bounced the registry
+        to QUEUED via ``_note_requeue`` before finalize ran.  The hop must not
+        fire a rejected-transition L1 for that legitimate, recurring event.
+        """
+        from orchestrator.merge_queue import InflightStatus, ItemLifecycleState
+
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        worker, req, entry = await _make_verifying_entry_with_sentinel(
+            git_ops, config, 'df3082-requeued-queued', 'df3082_rq.py', 'y = 2\n',
+            escalation_queue=fake_eq, status=InflightStatus.REQUEUED,
+        )
+        rid = req.request_id
+
+        # What the requeue site itself does (merge_queue.py:13840 template).
+        worker._note_requeue(rid, live_obj=req)
+        assert worker._lifecycle.current(rid) == ItemLifecycleState.QUEUED
+
+        advanced = await worker._finalize_inflight(entry)
+
+        assert advanced is False, f'a REQUEUED sentinel must not advance main: {advanced!r}'
+        assert _rejected_transition_escalations(fake_eq) == [], (
+            f'a properly-requeued item must not fire a rejected-transition L1 on '
+            f'every dead-verify abort: {fake_eq.submitted!r}'
+        )
+        current = worker._lifecycle.current(rid)
+        assert current == ItemLifecycleState.QUEUED, (
+            f'finalize must leave an already-requeued item at QUEUED so it can '
+            f're-enter through the drain; registry reads {current!r}'
+        )
+        assert worker._live_items[rid] is req, (
+            f'_live_items must hold the MergeRequest (the object swap is what '
+            f'clears the finalize head): {worker._live_items.get(rid)!r}'
+        )
+        assert worker._finalizing_head_entry() is None, (
+            f'requeued entry left as the finalize head: {worker._finalizing_head_entry()!r}'
+        )
+        assert not req.result.done(), (
+            'a requeued request must be left PENDING for its re-dispatch, not resolved'
+        )
+
+
+# ---------------------------------------------------------------------------
 # step-11 RED / step-12 GREEN: wiring-completeness proof (BEFORE repoint) —
 # every dequeued request_id must reach TERMINAL with no leaks across the
 # stop() drains, the two abandon/detach-drop sites, coalesce-superseded, and
