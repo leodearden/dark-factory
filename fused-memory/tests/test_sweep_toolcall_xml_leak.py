@@ -46,6 +46,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from fused_memory.models import SourceStore
+
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'sweep_toolcall_xml_leak.py'
 
 
@@ -300,6 +302,26 @@ def _match(memory_id: str, content: str, **payload_extra) -> dict:
     }
 
 
+def _ok_response(**overrides) -> SimpleNamespace:
+    """A REALISTIC successful ``MemoryService.add_memory`` response.
+
+    ``stores_written`` is load-bearing, not decoration: ``add_memory`` returns
+    NORMALLY when the Mem0 write fails (memory_service.py:2316-2317 catches
+    ``Exception``, logs, and folds the failure into ``message`` as
+    ``[mem0_error: ...]``), so the only evidence a mem0 copy actually landed is
+    a non-empty ``memory_ids`` PLUS ``mem0`` in ``stores_written`` PLUS a
+    message with no ``mem0_error``.
+    """
+    fields = {
+        'memory_ids': ['new-id'],
+        'stores_written': [SourceStore.mem0],
+        'category': None,
+        'message': "Memory queued for ['mem0']",
+    }
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
 def _service(matches, *, scanned=None, truncated=False) -> AsyncMock:
     service = AsyncMock()
     service.scan_memory_content = AsyncMock(
@@ -310,9 +332,7 @@ def _service(matches, *, scanned=None, truncated=False) -> AsyncMock:
         }
     )
     service.delete_memory = AsyncMock(return_value={'deleted': True})
-    service.add_memory = AsyncMock(
-        return_value=SimpleNamespace(memory_ids=['new-id'], category=None, message='')
-    )
+    service.add_memory = AsyncMock(return_value=_ok_response())
     return service
 
 
@@ -420,8 +440,8 @@ class TestRunApply:
         service = _service([_match('b', _TAIL_LEAK)])
         calls = []
         service.delete_memory.side_effect = lambda *a, **k: calls.append('delete') or {}
-        service.add_memory.side_effect = lambda *a, **k: calls.append('add') or SimpleNamespace(
-            memory_ids=['new-id'], category=None, message=''
+        service.add_memory.side_effect = (
+            lambda *a, **k: calls.append('add') or _ok_response()
         )
 
         await _mod.run(_args(apply=True), service)
@@ -507,3 +527,190 @@ class TestRunApply:
 
         assert report['truncated'] is True
         assert _mod.resolve_exit_code(report) != 0
+
+
+class TestReaddPersistedPredicate:
+    """``readd_persisted(response) -> (bool, reason)`` — pure, no I/O.
+
+    A non-raising ``add_memory`` is NOT evidence of a write. The service
+    swallows a Mem0 failure (memory_service.py:2316-2317) and still returns a
+    normal ``AddMemoryResponse``, so persistence has to be VERIFIED from the
+    response rather than assumed from the absence of an exception.
+    """
+
+    def test_a_real_success_passes(self):
+        ok, reason = _mod.readd_persisted(_ok_response())
+        assert ok is True
+        assert reason == ''
+
+    def test_empty_memory_ids_fails(self):
+        ok, reason = _mod.readd_persisted(_ok_response(memory_ids=[]))
+        assert ok is False
+        assert 'memory_ids' in reason
+
+    def test_mem0_absent_from_stores_written_fails(self):
+        """The delete removed the mem0 copy; a re-add that landed only in
+        Graphiti has not restored it."""
+        ok, reason = _mod.readd_persisted(
+            _ok_response(stores_written=[SourceStore.graphiti])
+        )
+        assert ok is False
+        assert 'mem0' in reason
+
+    def test_mem0_error_in_the_message_fails(self):
+        ok, reason = _mod.readd_persisted(
+            _ok_response(message='Memory added [mem0_error: boom]')
+        )
+        assert ok is False
+        assert 'mem0_error' in reason
+
+    def test_a_plain_string_store_is_tolerated(self):
+        """The predicate is compared via ``getattr(s, 'value', s)`` so a mock or
+        a plain ``'mem0'`` str reads the same as the real StrEnum member."""
+        assert _mod.readd_persisted(_ok_response(stores_written=['mem0']))[0] is True
+
+
+class TestRunApplyVerifiesPersistence:
+    """The failure that ACTUALLY happens: a non-raising add that did not persist.
+
+    ``MemoryService.add_memory`` provably never raises on a Mem0 write failure —
+    it catches ``Exception``, sets ``_mem0_error``, and returns a normal
+    ``AddMemoryResponse`` whose ``message`` carries ``[mem0_error: ...]``. So the
+    exception branch alone can never fire for the real-world outage, and treating
+    "did not raise" as "persisted" reports permanent content loss as a clean,
+    complete sweep.
+    """
+
+    @pytest.mark.asyncio
+    async def test_mem0_error_in_message_is_content_lost_in_flight(self):
+        service = _service([_match('b', _TAIL_LEAK)])
+        service.add_memory = AsyncMock(
+            return_value=SimpleNamespace(
+                memory_ids=[],
+                stores_written=[],
+                category=None,
+                message='Memory added [mem0_error: boom]',
+            )
+        )
+
+        report = await _mod.run(_args(apply=True), service)
+
+        service.delete_memory.assert_awaited_once()
+        record = _record_for(report, 'b')
+        assert record['content_lost_in_flight'] is True
+        assert record['repaired'] is False
+        assert record['id'] == 'b'
+        assert record['content'] == _TAIL_LEAK
+        assert record['repaired_content'] == _BODY
+        assert 'mem0_error' in record['error']
+        assert 'boom' in record['error']
+        assert _mod.resolve_exit_code(report) != 0
+
+    @pytest.mark.asyncio
+    async def test_ids_returned_but_mem0_not_written_is_content_lost_in_flight(self):
+        """The mem0 copy the delete removed was never restored, even though the
+        response looks superficially successful."""
+        service = _service([_match('b', _TAIL_LEAK)])
+        service.add_memory = AsyncMock(
+            return_value=_ok_response(
+                memory_ids=['graphiti-only-id'],
+                stores_written=[SourceStore.graphiti],
+            )
+        )
+
+        report = await _mod.run(_args(apply=True), service)
+
+        record = _record_for(report, 'b')
+        assert record['content_lost_in_flight'] is True
+        assert record['repaired'] is False
+        assert record['content'] == _TAIL_LEAK
+        assert 'mem0' in record['error']
+        # Whatever ids DID come back are still recorded, so a human chasing the
+        # loss has every handle the run saw.
+        assert record['new_id'] == 'graphiti-only-id'
+        assert _mod.resolve_exit_code(report) != 0
+
+    @pytest.mark.asyncio
+    async def test_repaired_is_set_only_on_a_verified_persisted_readd(self):
+        service = _service([_match('b', _TAIL_LEAK)])
+
+        report = await _mod.run(_args(apply=True), service)
+
+        record = _record_for(report, 'b')
+        assert record['repaired'] is True
+        assert record['new_id'] == 'new-id'
+        assert 'content_lost_in_flight' not in record
+        assert _mod.resolve_exit_code(report) == 0
+
+
+class TestRunApplyPreflightCategoryGuard:
+    """A repairable record that does not route to mem0 is left ENTIRELY alone.
+
+    ``write_mem0 = resolved_category in MEM0_PRIMARY or dual_write``
+    (memory_service.py:2212-2214), so a plain re-add of a Graphiti-primary
+    category would send the repaired text to Graphiti only and the Qdrant copy
+    the delete removed would be gone. ``dual_write=True`` is no better: it would
+    duplicate the Graphiti copy that ``delete_memory(store='mem0')``
+    deliberately left alive. Unsafe both ways, so the sweep does not choose —
+    it refuses before deleting anything and hands the record to a human.
+    """
+
+    @pytest.mark.asyncio
+    async def test_graphiti_primary_category_is_never_deleted(self):
+        service = _service(
+            [_match('g', _TAIL_LEAK, category='decisions_and_rationale')]
+        )
+
+        report = await _mod.run(_args(apply=True), service)
+
+        service.delete_memory.assert_not_awaited()
+        service.add_memory.assert_not_awaited()
+        record = _record_for(report, 'g')
+        assert record['skipped_not_mem0_routed'] is True
+        assert record['repaired'] is False
+        assert record['classification'] == 'repairable_tail'
+        assert record['content'] == _TAIL_LEAK
+        assert 'decisions_and_rationale' in record['error']
+        assert _mod.resolve_exit_code(report) != 0
+
+    @pytest.mark.asyncio
+    async def test_missing_category_is_skipped_rather_than_guessed(self):
+        match = _match('h', _TAIL_LEAK)
+        match['metadata'].pop('category')
+        service = _service([match])
+
+        report = await _mod.run(_args(apply=True), service)
+
+        service.delete_memory.assert_not_awaited()
+        assert _record_for(report, 'h')['skipped_not_mem0_routed'] is True
+        assert _mod.resolve_exit_code(report) != 0
+
+    @pytest.mark.asyncio
+    async def test_unrecognised_category_is_skipped_not_raised(self):
+        """An unknown category string must not crash the sweep mid-corpus and
+        must not be optimistically treated as mem0-routed."""
+        service = _service([_match('i', _TAIL_LEAK, category='not_a_real_category')])
+
+        report = await _mod.run(_args(apply=True), service)
+
+        service.delete_memory.assert_not_awaited()
+        assert _record_for(report, 'i')['skipped_not_mem0_routed'] is True
+        assert _mod.resolve_exit_code(report) != 0
+
+    @pytest.mark.asyncio
+    async def test_a_mem0_primary_category_still_repairs(self):
+        """The guard must not become a blanket refusal — the whole corpus this
+        sweep targets is mem0-primary."""
+        for category in (
+            'observations_and_summaries',
+            'procedural_knowledge',
+            'preferences_and_norms',
+        ):
+            service = _service([_match('m', _TAIL_LEAK, category=category)])
+
+            report = await _mod.run(_args(apply=True), service)
+
+            service.delete_memory.assert_awaited_once()
+            record = _record_for(report, 'm')
+            assert record['repaired'] is True, category
+            assert 'skipped_not_mem0_routed' not in record, category
