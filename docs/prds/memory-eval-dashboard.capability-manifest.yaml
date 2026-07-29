@@ -1,0 +1,141 @@
+prd: docs/prds/memory-eval-dashboard.md
+schema_version: 1
+tasks:
+- label: alpha
+  task_id: null
+  title: 'Memory-eval dashboard backend: artifact reader, verdict/escalation join,
+    /api/v2/dashboard/memory-evals'
+  capabilities:
+  - name: m1-m2-exemplar-fixtures-upstream
+    binding: capability→producer — the M1 metric-series exemplars, limits artifact
+      and the dashboard-shaped reader boundary test are 3207's committed deliverables
+      (its task text pins shared/tests/fixtures/); 3207 is in-progress and wired
+      UPSTREAM of alpha (DAG-direction verified); the dep edge, not a grep, gates
+      dispatch
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the fixtures land with 3207, not this batch; binding is the wired
+        upstream dependency edge plus alpha's boundary test parsing the committed
+        exemplars once present
+  - name: escalation-reader-reused-not-forked
+    binding: INV-5 — the recon-queue read reuses load_queue_escalations (wired into
+      the production Escalations endpoint at dashboard/src/dashboard/data/escalations.py:207-215
+      via build_escalation_queues); alpha adds a call site, never a second reader
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: load_queue_escalations
+      paths:
+      - dashboard/src/dashboard/data/memory_evals.py
+      expect: present
+  - name: memory-evals-endpoint-and-shape
+    binding: capability→producer (this leaf) — new aggregator module, DashboardConfig.memory_evals_dir
+      property, /api/v2/dashboard/memory-evals route behind the ~60s single-flight
+      TTL cache (app.py:1356-1407 precedent verified), shape_memory_evals in redux_api.py
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: memory-evals
+      paths:
+      - dashboard/src/dashboard/app.py
+      expect: present
+  - name: no-dashboard-side-statistics
+    binding: G6/INV-5 rejection-style — the aggregator displays persisted verdicts
+      and never re-runs the exact tests; the evaluator's stdlib stats surface (math.comb/lgamma)
+      must never appear in the dashboard data layer
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: math\.(comb|lgamma)
+      paths:
+      - dashboard/src/dashboard/data/
+      expect: absent
+- label: beta
+  task_id: null
+  title: 'Memory-eval dashboard frontend: Memory-tab evals section with trends +
+    verdict badges'
+  capabilities:
+  - name: chart-primitives-wired
+    binding: capability→producer — Sparkline/StepSpark/LineChart/StatTile et al.
+      exist in charts.jsx and are loaded before the tab scripts by index.html (load
+      order verified); no new chart library (2659 precedent)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'function Sparkline'
+      paths:
+      - dashboard/src/dashboard/static/redux/charts.jsx
+      expect: present
+  - name: endpoint-registered-in-data-js
+    binding: capability→producer (this leaf) — the ENDPOINTS map in data.js gains
+      the /api/v2/dashboard/memory-evals → MEMORY_EVALS row so the poller actually
+      fetches the payload (anti-orphan — an unregistered endpoint renders nothing)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: memory-evals
+      paths:
+      - dashboard/src/dashboard/static/redux/data.js
+      expect: present
+  - name: script-tag-load-ordered
+    binding: capability→producer (this leaf) — tab_memory_evals.jsx gets an index.html
+      script tag before tabs.jsx (the scheduler_heatmap window-global pattern verified
+      at index.html:35-37), else MemoryTab references an undefined global
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: tab_memory_evals
+      paths:
+      - dashboard/src/dashboard/static/redux/index.html
+      expect: present
+  - name: memorytab-wiring-and-honest-empty-state
+    binding: capability→consumer — the section renders inside MemoryTab (tabs.jsx:555)
+      and shows the explicit no-artifacts placeholder with em-dash empties, never
+      synthetic data (feedback_redux_no_synthetic_data)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the section component identifier is tactical (PRD open question) so
+        a grep would pin a name the PRD deliberately leaves free; wiring + empty-state
+        are pinned by beta's structural-contract tests in the test_tab_* idiom
+- label: gamma
+  task_id: null
+  title: 'Memory-eval dashboard parity gate: verdict-escalation fingerprint-equality
+    integration tests'
+  capabilities:
+  - name: verdicts-artifact-and-fingerprint-upstream
+    binding: capability→producer — the verdicts artifact, its shared/tests/fixtures/
+      exemplar, and dedupe_fingerprint stamping are 3211's amended deliverables
+      (M2/M3 amendment 2026-07-29, commit 0ddaf23753, mirrored into 3211's description
+      + metadata.delivered_checks by verified readback); 3211 is pending and wired
+      UPSTREAM of gamma
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the artifact lands with 3211, not this batch; binding is the wired
+        upstream dependency edge plus gamma's re-verification against 3211's committed
+        exemplar fixture
+  - name: dedupe-fingerprint-field-exists
+    binding: capability→producer — the structured carrier the parity join keys on
+      exists on the Escalation model on main today (escalation/models.py, 'content
+      fingerprint' field); parity is string EQUALITY, never fingerprint-format parsing
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: dedupe_fingerprint
+      paths:
+      - escalation/src/escalation/models.py
+      expect: present
+  - name: three-state-parity-tested-both-directions
+    binding: G6 — the parity premise is honest by construction; alarmed+open, recovered-but-open,
+      and storm-collapsed are all modeled, so 'every pending eval_regression escalation
+      maps back to a metric row' is achievable (a naive alarmed-iff-open equivalence
+      would be a false premise the moment the watcher lags a recovery)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: eval_regression
+      paths:
+      - dashboard/tests/
+      expect: present
