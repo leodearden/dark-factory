@@ -14,6 +14,9 @@ import json
 import sys
 import types
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 from fused_memory.models.enums import GRAPHITI_PRIMARY, MEM0_PRIMARY, MemoryCategory
 
@@ -722,3 +725,142 @@ class TestRenderMarkdownDeterminism:
 
     def test_returns_a_string(self):
         assert isinstance(_mod.render_markdown(_rich_report()), str)
+
+
+# ===========================================================================
+# Tests: scroll_all_payloads
+# ===========================================================================
+
+def _record(payload: dict | None) -> MagicMock:
+    """A Qdrant scroll record stand-in (payload only -- id/vector unused)."""
+    record = MagicMock()
+    record.payload = payload
+    return record
+
+
+def _paging_client(pages: list[tuple[list, object]]) -> AsyncMock:
+    """AsyncMock Qdrant client whose scroll() replays a scripted sequence of
+    ``(records, next_offset)`` pairs."""
+    client = AsyncMock()
+    client.scroll = AsyncMock(side_effect=list(pages))
+    return client
+
+
+async def _drain(agen) -> list[dict]:
+    return [payload async for payload in agen]
+
+
+class TestScrollAllPayloads:
+    """Real pagination -- the whole point of this script.
+
+    ``Mem0Backend.scroll_by_metadata`` discards ``next_offset``
+    (mem0_client.py:395) and so re-reads the same head forever; these tests
+    fail any implementation that does the same.
+    """
+
+    @pytest.mark.asyncio
+    async def test_yields_every_payload_across_all_pages_in_order(self):
+        client = _paging_client([
+            ([_record({'n': 1}), _record({'n': 2})], 'off-1'),
+            ([_record({'n': 3})], 'off-2'),
+            ([_record({'n': 4})], None),
+        ])
+        got = await _drain(_mod.scroll_all_payloads(
+            client, 'fused_dark_factory', {'category': OBS}, page_size=2,
+        ))
+        assert got == [{'n': 1}, {'n': 2}, {'n': 3}, {'n': 4}]
+
+    @pytest.mark.asyncio
+    async def test_stops_when_next_offset_is_none(self):
+        client = _paging_client([([_record({'n': 1})], None)])
+        await _drain(_mod.scroll_all_payloads(client, 'c', {'category': OBS}, page_size=10))
+        assert client.scroll.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_passes_previous_next_offset_on_each_subsequent_call(self):
+        client = _paging_client([
+            ([_record({'n': 1})], 'off-1'),
+            ([_record({'n': 2})], 'off-2'),
+            ([_record({'n': 3})], None),
+        ])
+        await _drain(_mod.scroll_all_payloads(client, 'c', {'category': OBS}, page_size=1))
+        offsets = [call.kwargs.get('offset') for call in client.scroll.await_args_list]
+        # A non-paging implementation would send offset=None three times and
+        # re-read the same head.
+        assert offsets == [None, 'off-1', 'off-2']
+
+    @pytest.mark.asyncio
+    async def test_requests_payload_and_never_vectors(self):
+        client = _paging_client([([_record({'n': 1})], None)])
+        await _drain(_mod.scroll_all_payloads(client, 'c', {'category': OBS}, page_size=10))
+        kwargs = client.scroll.await_args_list[0].kwargs
+        assert kwargs['with_payload'] is True
+        assert kwargs.get('with_vectors', False) is False
+        assert kwargs['collection_name'] == 'c'
+        assert kwargs['limit'] == 10
+
+    @pytest.mark.asyncio
+    async def test_filter_is_built_from_the_filters_mapping(self):
+        client = _paging_client([([], None)])
+        await _drain(_mod.scroll_all_payloads(client, 'c', {'category': OBS}, page_size=10))
+        scroll_filter = client.scroll.await_args_list[0].kwargs['scroll_filter']
+        # Same Filter/FieldCondition/MatchValue construction count_by_metadata
+        # uses (mem0_client.py:386-394), so the cross-check count and the
+        # scroll select identically.
+        assert len(scroll_filter.must) == 1
+        assert scroll_filter.must[0].key == 'category'
+        assert scroll_filter.must[0].match.value == OBS
+
+    @pytest.mark.asyncio
+    async def test_none_payload_yields_an_empty_dict(self):
+        client = _paging_client([([_record(None), _record({'n': 1})], None)])
+        got = await _drain(_mod.scroll_all_payloads(client, 'c', {'category': OBS}, page_size=10))
+        assert got == [{}, {'n': 1}]
+
+    @pytest.mark.asyncio
+    async def test_empty_collection_yields_nothing(self):
+        client = _paging_client([([], None)])
+        got = await _drain(_mod.scroll_all_payloads(client, 'c', {'category': OBS}, page_size=10))
+        assert got == []
+
+    @pytest.mark.asyncio
+    async def test_payloads_are_copies_not_live_references(self):
+        payload = {'n': 1}
+        client = _paging_client([([_record(payload)], None)])
+        got = await _drain(_mod.scroll_all_payloads(client, 'c', {'category': OBS}, page_size=10))
+        got[0]['n'] = 999
+        assert payload == {'n': 1}
+
+
+class TestScrollAllPayloadsBudget:
+    """A truncated stream must raise, never return short (INV-2)."""
+
+    @pytest.mark.asyncio
+    async def test_raises_when_page_budget_exhausted_with_live_next_offset(self):
+        client = _paging_client([
+            ([_record({'n': 1})], 'off-1'),
+            ([_record({'n': 2})], 'off-2'),
+        ])
+        with pytest.raises(_mod.CensusScanIncomplete) as excinfo:
+            await _drain(_mod.scroll_all_payloads(
+                client, 'fused_reify', {'category': OBS}, page_size=1, max_pages=2,
+            ))
+        message = str(excinfo.value)
+        assert 'fused_reify' in message
+        assert 'category' in message
+        assert '2' in message
+
+    @pytest.mark.asyncio
+    async def test_does_not_raise_when_budget_is_exactly_enough(self):
+        client = _paging_client([
+            ([_record({'n': 1})], 'off-1'),
+            ([_record({'n': 2})], None),
+        ])
+        got = await _drain(_mod.scroll_all_payloads(
+            client, 'c', {'category': OBS}, page_size=1, max_pages=2,
+        ))
+        assert got == [{'n': 1}, {'n': 2}]
+
+    @pytest.mark.asyncio
+    async def test_census_scan_incomplete_is_an_exception(self):
+        assert issubclass(_mod.CensusScanIncomplete, Exception)
