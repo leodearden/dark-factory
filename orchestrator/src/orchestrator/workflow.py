@@ -10747,7 +10747,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 if remaining <= 0:
                     raise TimeoutError  # noqa: TRY301 — uniform expiry handling
                 await asyncio.wait_for(self._escalation_event.wait(), remaining)
-            except (TimeoutError, asyncio.TimeoutError):
+            except TimeoutError:  # asyncio.TimeoutError is an alias since 3.11
                 orphan_ids = [e.id for e in pending_l0]
                 logger.warning(
                     'Task %s: steward did not resolve %d level-0 escalation(s) '
