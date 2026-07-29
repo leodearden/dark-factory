@@ -288,6 +288,32 @@ tasks:
       reason: grandfather-set persistence is alpha's artifact contract; epsilon's
         first-run behaviour is pinned by the idempotence test (re-running on an unchanged
         series alarms nothing)
+  - name: verdicts-artifact-persisted
+    binding: capability→producer (M2 amendment 2026-07-29, commissioned by docs/prds/memory-eval-dashboard.md)
+      — the runner persists the evaluator's per-metric verdicts verbatim as verdicts-<STAMP>.json
+      + verdicts-current.json under fused-memory/data/memory-evals/, with an exemplar
+      fixture under shared/tests/fixtures/; the dashboard displays persisted verdicts
+      and never recomputes statistics (G6/INV-5)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: verdicts-current
+      paths:
+      - fused-memory/scripts/memory_eval_runner.py
+      expect: present
+  - name: escalation-carries-fingerprint
+    binding: capability→producer (M3 amendment 2026-07-29) — every filed eval_regression
+      escalation sets dedupe_fingerprint (field verified on the Escalation model,
+      escalation/models.py) to the verdict's exact fingerprint string; cross-artifact
+      parity is string EQUALITY, never fingerprint-format parsing, so composition
+      stays epsilon-internal
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: dedupe_fingerprint
+      paths:
+      - fused-memory/scripts/memory_eval_runner.py
+      expect: present
 - label: zeta
   task_id: 3212
   title: 'E7 search/write telemetry: result ids+scores in the journal, caller-identity

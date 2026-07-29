@@ -44,6 +44,27 @@ re-homed or relaxed.** Three bindings were investigated as candidate FAILs and c
   `tools.py:1257` — a *wired*, not merely declared, capability. This is what keeps η
   from growing a second similarity rule (INV-5).
 
+## Amendment 2026-07-29 (dashboard-PRD commission)
+
+The dashboard PRD's authoring session (`docs/prds/memory-eval-dashboard.md`) surfaced
+two seam gaps in ε and resolved them by amendment while 3211 was still
+pending/unclaimed (M2/M3 amendment bullets in the PRD; 3211's description + two new
+sidecar capability rows updated in the same commit):
+
+- **`verdicts-artifact-persisted`** — the evaluator's per-metric verdicts (alarm /
+  no_alarm / insufficient_data / grandfathered) were computed but never persisted
+  machine-readably, which would have forced the dashboard to re-run statistics
+  dashboard-side (a G6 failure) or scrape the human report (INV-2). ε's runner now
+  persists `verdicts-<STAMP>.json` + `verdicts-current.json` and commits an exemplar
+  under `shared/tests/fixtures/`.
+- **`escalation-carries-fingerprint`** — the M3 fingerprint had no pinned structured
+  carrier on the filed escalation. Now `dedupe_fingerprint` (existing model field)
+  carries the exact verdict fingerprint string; parity is string equality, never
+  format parsing.
+
+Both rows carry mechanical `delivered_check`s and were mirrored into 3211's
+`metadata.delivered_checks` via `update_task(metadata_mode='additive')`.
+
 ## Substrate drift found at the re-walk
 
 One §6 row is imprecise (conclusion unchanged, work strictly smaller than stated):
