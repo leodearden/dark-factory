@@ -31,9 +31,10 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _orch_helpers import pydantic_spec, stamp_stock_routing_config
 from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
@@ -43,6 +44,7 @@ from orchestrator.agents.roles import IMPLEMENTER
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.scheduler import TaskAssignment
+from orchestrator.steward import TaskSteward
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 from orchestrator.workflow_types import StewardInterrupted
 
@@ -559,4 +561,168 @@ class TestStaleOutcomeHygiene:
             f'already dispositioned — a stale wip-present interruption drives '
             f'_mark_blocked straight into a spurious resume-plan requeue; got '
             f'reason={outcome.reason!r}'
+        )
+
+
+def _make_steward_config() -> MagicMock:
+    """A MagicMock ``OrchestratorConfig`` for a REAL ``TaskSteward``.
+
+    Same stamping recipe as ``test_steward.py``'s ``mock_config`` fixture so
+    the integration test does not introduce a second config shape.  Only the
+    fields the attempt-cap path actually reads are load-bearing
+    (``steward_max_attempts``, ``steward_lifetime_budget``); the routing stamp
+    is kept because the class's other paths reach ``resolve_route``, and a
+    ``spec_set`` MagicMock must not be the reason a future assertion moves.
+
+    Deliberately SEPARATE from the workflow's own ``OrchestratorConfig``: the
+    steward-side cap and the workflow-side ``steward_completion_timeout`` are
+    independent knobs here, which is what lets the test set the latter high
+    enough that fix C cannot be what satisfies it.
+    """
+    cfg = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+    cfg.project_root = Path('/tmp/fake-project')
+    cfg.models.steward = 'opus'
+    cfg.budgets.steward = 5.0
+    cfg.max_turns.steward = 100
+    cfg.effort.steward = 'high'
+    cfg.backends.steward = 'claude'
+    stamp_stock_routing_config(cfg)
+    cfg.escalation.host = 'localhost'
+    cfg.escalation.port = 8102
+    cfg.fused_memory.url = 'http://localhost:8002'
+    cfg.fused_memory.project_id = 'dark_factory'
+    cfg.steward_lifetime_budget = 12.0
+    cfg.steward_max_attempts = 1
+    cfg.steward_completion_timeout = 300.0
+    cfg.steward_max_timeouts_per_escalation = 3
+    cfg.steward_max_empty_outputs_per_escalation = 2
+    cfg.timeouts.steward = 1800.0
+    return cfg
+
+
+def _make_real_steward_factory(
+    queue: EscalationQueue, esc: Escalation, task_id: str,
+):
+    """A ``_steward_factory`` that builds a GENUINE ``TaskSteward``.
+
+    Only ``start``/``stop`` are overridden, and only to replace ``_run_loop``
+    (which would spawn the inotify watcher subprocess and invoke a real agent)
+    with a single, deterministic ``_handle_escalation(esc)`` — seeded so the
+    per-escalation attempt cap fires on the first pass.  EVERYTHING the
+    contract depends on stays real: the cap guard, the wip gate, the
+    dismissal (``_dismiss_capped_l0`` → ``EscalationQueue.resolve`` → the
+    resolve callback), the publish, and the terminal-state memory.
+
+    That composition is the point.  A steward-only unit test passes with fix A
+    but never proves the workflow wakes; a workflow-only test with a fake
+    steward passes against a fake contract.  Task 2248 shipped the strand
+    precisely because only the ``_mark_blocked`` half was ever tested.
+    """
+    steward_config = _make_steward_config()
+
+    class _CapFiringSteward(TaskSteward):
+        async def start(self) -> None:
+            # Seed the retry counter so the FIRST _handle_escalation trips the
+            # per-escalation retry guard (steward_max_attempts=1) — exactly
+            # the state a steward is in after one failed resolution attempt.
+            self._retry_counts[esc.id] = steward_config.steward_max_attempts
+            self._give_up_task = asyncio.create_task(self._handle_escalation(esc))
+
+        async def stop(self) -> None:
+            give_up = getattr(self, '_give_up_task', None)
+            if give_up is not None:
+                await give_up
+            self._stopped = True
+
+    def _factory(wt_path: Path, cfg_dir):
+        return _CapFiringSteward(
+            task_id=task_id,
+            task={'id': task_id, 'title': 'X', 'description': 'Y'},
+            worktree=wt_path,
+            config=steward_config,
+            mcp=MagicMock(),
+            escalation_queue=queue,
+            briefing=AsyncMock(),
+            config_dir=cfg_dir,
+        )
+
+    return _factory
+
+
+@pytest.mark.asyncio
+class TestRealStewardGiveUpUnblocksEscalatedRun:
+    """The cross-component regression whose absence let task 2248 ship.
+
+    Composes the REAL ``TaskSteward`` attempt-cap + WIP give-up with the REAL
+    ``run()``-ESCALATED wait and the harness-shaped resolve callback.  The
+    steward publishes its typed outcome to a channel nobody on this path
+    reads, so the ONLY thing that can unblock the workflow is the producer-side
+    dismissal — the converged contract:
+
+        A steward give-up ALWAYS dismisses its own L0 before publishing an
+        outcome.  No pending L0 survives a steward give-up.
+    """
+
+    async def test_real_attempt_cap_give_up_wakes_the_escalated_waiter(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        wt = await _make_advanced_worktree(git_ops, task_assignment.task_id)
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _submit_l0(queue, task_assignment.task_id)
+        # LOAD-BEARING: a large completion timeout makes it impossible for fix
+        # C's bounded-wait disposition to be what satisfies this test.  With
+        # the fixture's 0.5s the assertions below would still pass with fix A
+        # fully reverted — the strand would just be auto-dismissed 0.5s later,
+        # and this regression would silently stop regressing.
+        long_wait = 60.0
+        workflow, _scheduler = _build_workflow(
+            config.model_copy(update={'steward_completion_timeout': long_wait}),
+            git_ops, task_assignment, queue, wt,
+        )
+        _wire_resolve_callback(queue, workflow)
+        workflow._steward_factory = _make_real_steward_factory(
+            queue, esc, task_assignment.task_id,
+        )
+        evrl_mock, _state = _make_evrl_returner(
+            [WorkflowOutcome.ESCALATED, WorkflowOutcome.DONE],
+        )
+        workflow._execute_verify_review_loop = evrl_mock  # type: ignore[method-assign]
+        invoke_mock = AsyncMock(return_value=AgentResult(success=True, output=''))
+        workflow._invoke = invoke_mock  # type: ignore[method-assign]
+
+        t0 = asyncio.get_running_loop().time()
+        await asyncio.wait_for(workflow.run(), 15)
+        elapsed = asyncio.get_running_loop().time() - t0
+
+        assert elapsed < long_wait / 2, (
+            f'the give-up dismissal must wake the waiter promptly; run() took '
+            f'{elapsed:.1f}s against a {long_wait:.0f}s completion timeout, so '
+            f'the timeout path — not the dismissal — is what unblocked it'
+        )
+        archived = queue.get(esc.id)
+        assert archived is not None, 'the record must still be readable'
+        assert archived.status == 'dismissed', (
+            f'the wip-gated give-up must dismiss its own L0 rather than leave '
+            f'it pending for a waiter that never reads the outcome channel; '
+            f'status={archived.status!r}'
+        )
+        assert archived.resolved_by == 'auto-dismissed', (
+            f'got resolved_by={archived.resolved_by!r}'
+        )
+        assert queue.get_by_task(
+            task_assignment.task_id, status='pending', level=1,
+        ) == [], (
+            'the task-2060 resume-plan semantics must be preserved: a wip-'
+            'present interruption is resumable, so no L1 may be filed'
+        )
+        roles = [c.args[0] for c in invoke_mock.await_args_list]
+        assert IMPLEMENTER in roles, (
+            f'the workflow must LEAVE phase escalated and resume the '
+            f'implementer; invoked roles: {[r.name for r in roles]}'
+        )
+        # The steward's typed outcome went to a channel this path never reads
+        # — the drain (step-14) must have consumed it on the way out.
+        channel = workflow._steward_outcome_channel
+        assert channel is not None and channel.empty(), (
+            'the unconsumed give-up outcome must not survive the wait'
         )
