@@ -41,6 +41,8 @@ import importlib.util
 import sys
 import types
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -271,3 +273,237 @@ class TestBuildParser:
         assert args.project_id == 'reify'
         assert args.limit == 50
         assert args.config == '/tmp/c.yaml'
+
+
+# ===========================================================================
+# Async orchestration — AsyncMock service, no live Qdrant (the repo-wide
+# cleanup-script test scope; the live --apply run is the operator close-out).
+# ===========================================================================
+
+def _match(memory_id: str, content: str, **payload_extra) -> dict:
+    """One scan_memory_content match. 'metadata' carries the RAW payload, which
+    is where the full content lives (the 'excerpt' field is display-only and is
+    deliberately never used for classification or repair)."""
+    payload = {
+        'data': content,
+        'category': 'observations_and_summaries',
+        'agent_id': 'claude-task-3083',
+        'run_id': 'r-1',
+        **payload_extra,
+    }
+    return {
+        'id': memory_id,
+        'created_at': '2026-07-27T00:00:00+00:00',
+        'matched_fragments': [],
+        'excerpt': content[:80],
+        'metadata': payload,
+    }
+
+
+def _service(matches, *, scanned=None, truncated=False) -> AsyncMock:
+    service = AsyncMock()
+    service.scan_memory_content = AsyncMock(
+        return_value={
+            'matches': matches,
+            'scanned': len(matches) if scanned is None else scanned,
+            'truncated': truncated,
+        }
+    )
+    service.delete_memory = AsyncMock(return_value={'deleted': True})
+    service.add_memory = AsyncMock(
+        return_value=SimpleNamespace(memory_ids=['new-id'], category=None, message='')
+    )
+    return service
+
+
+def _args(**overrides):
+    defaults = {
+        'project_id': 'dark_factory',
+        'apply': False,
+        'exhaustive': False,
+        'limit': None,
+        'config': None,
+    }
+    defaults.update(overrides)
+    return SimpleNamespace(**defaults)
+
+
+def _record_for(report: dict, memory_id: str) -> dict:
+    return next(r for r in report['records'] if r['id'] == memory_id)
+
+
+class TestRunDiscovery:
+    """Discovery goes through the literal text scan, never semantic search."""
+
+    @pytest.mark.asyncio
+    async def test_uses_scan_memory_content_and_never_search(self):
+        service = _service([_match('a', _BODY)])
+
+        await _mod.run(_args(), service)
+
+        service.scan_memory_content.assert_awaited_once()
+        service.search.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_exhaustive_and_limit_are_threaded_to_the_scan(self):
+        """--exhaustive is the mode whose answer depends on nothing but the
+        shared Python detector, so it must actually reach the backend."""
+        service = _service([])
+
+        await _mod.run(_args(exhaustive=True, limit=25), service)
+
+        kwargs = service.scan_memory_content.call_args[1]
+        assert kwargs['exhaustive'] is True
+        assert kwargs['limit'] == 25
+        assert kwargs['project_id'] == 'dark_factory'
+
+    @pytest.mark.asyncio
+    async def test_empty_corpus_is_a_clean_success(self):
+        """Distinguishable in the report from a failed scan: scanned is present
+        and the run exits 0 rather than raising."""
+        service = _service([], scanned=19321)
+
+        report = await _mod.run(_args(apply=True), service)
+
+        assert report['scanned'] == 19321
+        assert report['records'] == []
+        assert report['counts']['manual_review'] == 0
+        assert _mod.resolve_exit_code(report) == 0
+
+    @pytest.mark.asyncio
+    async def test_scan_timeout_propagates(self):
+        """A timed-out scan must never be reported as a clean corpus — that is
+        the silent-wrong-answer class this whole task exists to kill."""
+        service = _service([])
+        service.scan_memory_content = AsyncMock(side_effect=TimeoutError('qdrant read'))
+
+        with pytest.raises(TimeoutError):
+            await _mod.run(_args(), service)
+
+
+class TestRunDryRun:
+    """Dry run is the default and performs ZERO mutations."""
+
+    @pytest.mark.asyncio
+    async def test_dry_run_mutates_nothing_but_classifies_everything(self):
+        service = _service(
+            [
+                _match('a', _BODY),
+                _match('b', _TAIL_LEAK),
+                _match('c', _DUPLICATE_LEAK),
+                _match('d', _MANUAL_LEAK),
+            ]
+        )
+
+        report = await _mod.run(_args(), service)
+
+        service.delete_memory.assert_not_awaited()
+        service.add_memory.assert_not_awaited()
+        assert report['dry_run'] is True
+        assert _record_for(report, 'a')['classification'] == 'clean'
+        assert _record_for(report, 'b')['classification'] == 'repairable_tail'
+        assert _record_for(report, 'c')['classification'] == 'repairable_duplicate'
+        assert _record_for(report, 'd')['classification'] == 'manual_review'
+        assert report['repaired'] == 0
+
+
+class TestRunApply:
+    """--apply repairs only what can be repaired without losing content."""
+
+    @pytest.mark.asyncio
+    async def test_repair_is_delete_then_readd_in_that_order(self):
+        """Delete + re-add, never an in-place payload SET: the repaired text has
+        to be re-embedded, or the vector would still point at the corrupted
+        string. Order matters — a re-add before the delete would leave both
+        copies live if the delete then failed.
+        """
+        service = _service([_match('b', _TAIL_LEAK)])
+        calls = []
+        service.delete_memory.side_effect = lambda *a, **k: calls.append('delete') or {}
+        service.add_memory.side_effect = lambda *a, **k: calls.append('add') or SimpleNamespace(
+            memory_ids=['new-id'], category=None, message=''
+        )
+
+        await _mod.run(_args(apply=True), service)
+
+        assert calls == ['delete', 'add']
+
+    @pytest.mark.asyncio
+    async def test_readd_carries_repaired_content_and_original_attribution(self):
+        service = _service([_match('b', _TAIL_LEAK)])
+
+        await _mod.run(_args(apply=True), service)
+
+        kwargs = service.add_memory.call_args[1]
+        assert kwargs['content'] == _BODY
+        assert kwargs['category'] == 'observations_and_summaries'
+        assert kwargs['agent_id'] == 'claude-task-3083'
+        assert kwargs['project_id'] == 'dark_factory'
+
+    @pytest.mark.asyncio
+    async def test_report_makes_the_old_to_new_mapping_auditable(self):
+        """Exactly like Stage 1's 2c47b5cb->0a4f4848: both ids and both contents,
+        so a human can verify after the fact that nothing was lost."""
+        service = _service([_match('b', _TAIL_LEAK)])
+
+        report = await _mod.run(_args(apply=True), service)
+
+        record = _record_for(report, 'b')
+        assert record['repaired'] is True
+        assert record['new_id'] == 'new-id'
+        assert record['content'] == _TAIL_LEAK
+        assert record['repaired_content'] == _BODY
+        assert report['repaired'] == 1
+
+    @pytest.mark.asyncio
+    async def test_manual_review_is_never_mutated_but_is_reported(self):
+        service = _service([_match('d', _MANUAL_LEAK)])
+
+        report = await _mod.run(_args(apply=True), service)
+
+        service.delete_memory.assert_not_awaited()
+        service.add_memory.assert_not_awaited()
+        record = _record_for(report, 'd')
+        assert record['classification'] == 'manual_review'
+        assert record['repaired'] is False
+        assert record['content'] == _MANUAL_LEAK
+        assert _mod.resolve_exit_code(report) != 0
+
+    @pytest.mark.asyncio
+    async def test_clean_records_are_not_rewritten(self):
+        service = _service([_match('a', _BODY)])
+
+        await _mod.run(_args(apply=True), service)
+
+        service.delete_memory.assert_not_awaited()
+        service.add_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_delete_succeeded_then_readd_raised_is_reported_loudly(self):
+        """The one failure that actually destroys content. It must never be
+        swallowed: the report has to carry both ids and the ORIGINAL content so
+        the memory can be restored by hand, and the run must exit non-zero.
+        """
+        service = _service([_match('b', _TAIL_LEAK)])
+        service.add_memory = AsyncMock(side_effect=RuntimeError('embedding backend down'))
+
+        report = await _mod.run(_args(apply=True), service)
+
+        service.delete_memory.assert_awaited_once()
+        record = _record_for(report, 'b')
+        assert record['content_lost_in_flight'] is True
+        assert record['id'] == 'b'
+        assert record['content'] == _TAIL_LEAK
+        assert record['repaired_content'] == _BODY
+        assert record['repaired'] is False
+        assert 'embedding backend down' in record['error']
+        assert _mod.resolve_exit_code(report) != 0
+
+    @pytest.mark.asyncio
+    async def test_a_truncated_apply_exits_non_zero(self):
+        service = _service([_match('a', _BODY)], scanned=1000, truncated=True)
+
+        report = await _mod.run(_args(apply=True, limit=1000), service)
+
+        assert report['truncated'] is True
+        assert _mod.resolve_exit_code(report) != 0
