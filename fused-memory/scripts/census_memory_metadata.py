@@ -504,6 +504,83 @@ async def scroll_all_payloads(
         offset = next_offset
 
 
+async def census_project(
+    backend: Any,
+    project_id: str,
+    categories: list[str] | None = None,
+    page_size: int = 1000,
+    max_pages: int = DEFAULT_MAX_PAGES,
+) -> tuple[dict[str, CategoryCensus], dict[str, Any]]:
+    """Census one project's Mem0 collection, category by category.
+
+    For each category: COUNT first (``count_by_metadata``), then page-scroll
+    and fold every payload into a :class:`CategoryCensus`. Counting before
+    scrolling is what makes an under-enumerated scroll detectable at all
+    (INV-3 corroborate-before-acting) -- the two figures come from
+    independent Qdrant calls and must agree.
+
+    Returns:
+        ``(cells, coverage)`` where *cells* maps category value ->
+        CategoryCensus, and *coverage* is the per-project record consumed by
+        :func:`build_report`: collection name, collection point total, and
+        per-category expected/scrolled/delta/complete.
+    """
+    from fused_memory.models.scope import Scope  # noqa: PLC0415
+
+    category_values = list(categories) if categories is not None else [
+        c.value for c in CENSUS_CATEGORIES
+    ]
+    scope = Scope(project_id=project_id)
+    collection = scope.mem0_collection_name(backend.config.mem0.collection_prefix)
+    client = await backend._get_async_qdrant()
+
+    cells: dict[str, CategoryCensus] = {}
+    per_category: dict[str, Any] = {}
+
+    for category in category_values:
+        filters = {'category': category}
+        expected = await backend.count_by_metadata(scope, filters)
+
+        census = CategoryCensus()
+        async for payload in scroll_all_payloads(
+            client, collection, filters, page_size=page_size, max_pages=max_pages,
+        ):
+            census.add(payload)
+
+        scrolled = census.records
+        delta = scrolled - expected
+        cells[category] = census
+        per_category[category] = {
+            'expected': expected,
+            'scrolled': scrolled,
+            'delta': delta,
+            'complete': delta == 0,
+        }
+        logger.info(
+            'censused project=%s category=%s expected=%d scrolled=%d',
+            project_id, category, expected, scrolled,
+        )
+        if delta != 0:
+            logger.warning(
+                'UNDER-ENUMERATED project=%s category=%s: scrolled %d of %d expected '
+                '(delta %+d) — this census is a LOWER BOUND for that cell.',
+                project_id, category, scrolled, expected, delta,
+            )
+
+    collection_points = await backend.count(scope)
+    counted = sum(c['expected'] for c in per_category.values())
+    logger.info(
+        'project=%s collection=%s points=%d counted=%d uncovered=%d',
+        project_id, collection, collection_points, counted, collection_points - counted,
+    )
+
+    return cells, {
+        'collection': collection,
+        'collection_points': collection_points,
+        'categories': per_category,
+    }
+
+
 def render_markdown(report: dict[str, Any]) -> str:
     """Render the markdown twin of the JSON census report.
 
