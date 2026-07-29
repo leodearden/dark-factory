@@ -35,7 +35,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _orch_helpers import pydantic_spec, stamp_stock_routing_config
-from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler
+from _workflow_helpers import (
+    FakeBriefing,
+    FakeMcp,
+    FakeScheduler,
+    _make_resolving_steward,
+)
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
@@ -46,7 +51,7 @@ from orchestrator.git_ops import GitOps, _run
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.steward import TaskSteward
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
-from orchestrator.workflow_types import StewardInterrupted
+from orchestrator.workflow_types import StewardInterrupted, StewardReescalatedL1
 
 # ---------------------------------------------------------------------------
 # Fixtures (local — mirrors test_workflow_status_on_resume.py)
@@ -725,4 +730,140 @@ class TestRealStewardGiveUpUnblocksEscalatedRun:
         channel = workflow._steward_outcome_channel
         assert channel is not None and channel.empty(), (
             'the unconsumed give-up outcome must not survive the wait'
+        )
+
+
+def _make_reescalating_steward(queue: EscalationQueue, task_id: str) -> type:
+    """A steward that gives up to a human, exactly as ``_auto_escalate_to_human``.
+
+    Dismisses its own L0, files a level-1, and publishes ``StewardReescalatedL1``
+    — the in-cycle hand-off that ``_wait_for_resolution`` turns into
+    ``_StewardReescalated`` → ``run()`` → ``_mark_blocked(skip_escalation=True)``,
+    whose ``_await_steward_completion`` is the intended reader of that publish.
+    """
+
+    class _FakeSteward:
+        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+            self._outcome_channel = None
+            self._wip_probe = None
+
+        def set_outcome_channel(self, channel) -> None:
+            self._outcome_channel = channel
+
+        def set_wip_probe(self, probe) -> None:
+            self._wip_probe = probe
+
+        async def start(self) -> None:
+            l1 = _submit_l1(queue, task_id)
+            for esc in queue.get_by_task(task_id, status='pending', level=0):
+                queue.resolve(
+                    esc.id, 'Auto-dismissed: re-escalated to human',
+                    dismiss=True, resolved_by='auto-dismissed',
+                )
+            if self._outcome_channel is not None:
+                self._outcome_channel.put_nowait(StewardReescalatedL1(esc_id=l1.id))
+
+        async def stop(self) -> None:
+            pass
+
+    return _FakeSteward
+
+
+@pytest.mark.asyncio
+class TestEscalatedWaitDoesNotStallItsSuccessors:
+    """Neither continuation of the ESCALATED wait may burn a grace window.
+
+    Both call sites of ``_await_steward_completion`` sit DOWNSTREAM of
+    ``_wait_for_resolution`` and, before task 3170, returned instantly only
+    because a stale outcome was still sitting on the channel.  Draining that
+    channel (step-14) without accounting for them turns each into a full
+    ``steward_completion_timeout`` stall — 15 minutes on stock config, on the
+    two most common post-escalation routes there are.
+
+    Both tests use a LARGE completion timeout and assert on elapsed wall-clock:
+    a stall regression must show up as a bounded failure here, not as an
+    invisible slowdown that only the 900s production value makes painful.
+    """
+
+    async def test_resolved_escalation_reaches_done_without_a_grace_window(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """Success tail: steward resolved the L0, so nothing is outstanding."""
+        wt = await _make_advanced_worktree(git_ops, task_assignment.task_id)
+        queue = EscalationQueue(tmp_path / 'queue')
+        _submit_l0(queue, task_assignment.task_id)
+        long_wait = 60.0
+        workflow, _scheduler = _build_workflow(
+            config.model_copy(update={'steward_completion_timeout': long_wait}),
+            git_ops, task_assignment, queue, wt,
+        )
+        _wire_resolve_callback(queue, workflow)
+        workflow._steward_factory = _make_resolving_steward(
+            queue, task_assignment.task_id,
+        )
+        evrl_mock, _state = _make_evrl_returner(
+            [WorkflowOutcome.ESCALATED, WorkflowOutcome.DONE],
+        )
+        workflow._execute_verify_review_loop = evrl_mock  # type: ignore[method-assign]
+        workflow._invoke = AsyncMock(  # type: ignore[method-assign]
+            return_value=AgentResult(success=True, output=''),
+        )
+
+        t0 = asyncio.get_running_loop().time()
+        result = await asyncio.wait_for(workflow.run(), 30)
+        elapsed = asyncio.get_running_loop().time() - t0
+
+        assert result.outcome == WorkflowOutcome.DONE
+        assert elapsed < long_wait / 4, (
+            f'the post-merge success tail waits for the steward to finish any '
+            f'PENDING work; with the L0 already resolved there is none, so it '
+            f'must not burn the grace window. run() took {elapsed:.1f}s against '
+            f'a {long_wait:.0f}s steward_completion_timeout'
+        )
+
+    async def test_reescalated_l1_blocks_without_a_grace_window(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """_StewardReescalated hand-off: _mark_blocked must read that publish.
+
+        The steward's ``StewardReescalatedL1`` is an IN-CYCLE hand-off to
+        ``_mark_blocked(skip_escalation=True)``, not a stale leftover — draining
+        it in ``_wait_for_resolution`` would leave that consumer waiting a full
+        grace window for an outcome that was already published and thrown away.
+        """
+        wt = await _make_advanced_worktree(git_ops, task_assignment.task_id)
+        queue = EscalationQueue(tmp_path / 'queue')
+        _submit_l0(queue, task_assignment.task_id)
+        long_wait = 60.0
+        workflow, _scheduler = _build_workflow(
+            config.model_copy(update={'steward_completion_timeout': long_wait}),
+            git_ops, task_assignment, queue, wt,
+        )
+        _wire_resolve_callback(queue, workflow)
+        workflow._steward_factory = _make_reescalating_steward(
+            queue, task_assignment.task_id,
+        )
+        evrl_mock, _state = _make_evrl_returner(
+            [WorkflowOutcome.ESCALATED, WorkflowOutcome.DONE],
+        )
+        workflow._execute_verify_review_loop = evrl_mock  # type: ignore[method-assign]
+        invoke_mock = AsyncMock(return_value=AgentResult(success=True, output=''))
+        workflow._invoke = invoke_mock  # type: ignore[method-assign]
+
+        t0 = asyncio.get_running_loop().time()
+        result = await asyncio.wait_for(workflow.run(), 30)
+        elapsed = asyncio.get_running_loop().time() - t0
+
+        assert result.outcome == WorkflowOutcome.BLOCKED
+        assert elapsed < long_wait / 4, (
+            f'the steward already published StewardReescalatedL1 for this very '
+            f'cycle; _mark_blocked(skip_escalation=True) must read it rather '
+            f'than wait out the grace window. run() took {elapsed:.1f}s against '
+            f'a {long_wait:.0f}s steward_completion_timeout'
+        )
+        assert len(
+            queue.get_by_task(task_assignment.task_id, status='pending', level=1),
+        ) == 1, 'skip_escalation=True must not duplicate the L1'
+        assert IMPLEMENTER not in [c.args[0] for c in invoke_mock.await_args_list], (
+            'the implementer must NOT be resumed when the steward handed off to a human'
         )
