@@ -2493,6 +2493,35 @@ class TestHarnessUnhaltClosesEscalation:
         assert harness.take_resolved_halt_escalations('test-project') == []
 
     @pytest.mark.asyncio
+    async def test_unread_stash_accumulates_across_unhalts(
+        self, journal, event_buffer, mock_memory_service,
+    ):
+        """A second unhalt must not drop an earlier UNREAD close on the floor.
+
+        auto-unhalt-after-cooldown also stages ids and nothing pops them, so a
+        plain assignment silently loses whatever the previous unhalt closed.
+        The dedupe keeps a repeat close from being reported twice.
+        """
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        assert harness.judge is not None
+        harness._backlog_policy = MagicMock()
+        harness._backlog_policy.on_judge_unhalt = AsyncMock(
+            side_effect=[
+                ['esc-reconciliation-halt-A'],
+                ['esc-reconciliation-halt-B', 'esc-reconciliation-halt-A'],
+            ],
+        )
+
+        await harness._on_judge_unhalt('test-project')
+        await harness._on_judge_unhalt('test-project')
+
+        assert harness.take_resolved_halt_escalations('test-project') == [
+            'esc-reconciliation-halt-A',
+            'esc-reconciliation-halt-B',
+        ]
+        assert harness.take_resolved_halt_escalations('test-project') == []
+
+    @pytest.mark.asyncio
     async def test_unhalt_is_noop_without_backlog_policy(
         self, journal, event_buffer, mock_memory_service,
     ):
@@ -2712,6 +2741,57 @@ class TestNotifyJudgeHaltDedupeToken:
         )
         assert 'test-project' in text
         assert 'rejection' in text
+
+    @pytest.mark.asyncio
+    async def test_no_escalation_warning_is_throttled(
+        self, journal, event_buffer, mock_memory_service, caplog, monkeypatch,
+    ):
+        """The retry is unthrottled; the WARNING about it is not.
+
+        Not burning the dedupe token means a halted project with no live
+        orchestrator re-enters this path on EVERY ~5s halted tick. Unthrottled
+        that is ~17k WARNING lines/day/project, drowning the signal the line
+        exists to raise. First failure loud, repeats DEBUG, loud again a
+        window later.
+        """
+        from fused_memory.reconciliation import harness as harness_mod
+        from fused_memory.reconciliation.backlog_policy import BacklogVerdict
+
+        harness, on_judge_halt = self._harness(
+            journal, event_buffer, mock_memory_service,
+            BacklogVerdict(
+                outcome='rejection', project_id='test-project',
+                error_type='ReconciliationJudgeHalted',
+            ),
+        )
+        logger_name = 'fused_memory.reconciliation.harness'
+
+        def _counts():
+            warns = [
+                r for r in caplog.records
+                if r.name == logger_name and r.levelno == logging.WARNING
+                and 'escalated to nothing' in r.getMessage()
+            ]
+            debugs = [
+                r for r in caplog.records
+                if r.name == logger_name and r.levelno == logging.DEBUG
+                and 'escalated to nothing' in r.getMessage()
+            ]
+            return len(warns), len(debugs)
+
+        with caplog.at_level(logging.DEBUG, logger=logger_name):
+            for _ in range(4):
+                await harness._notify_judge_halt('test-project', reason='r')
+            assert _counts() == (1, 3)
+            # The RETRY itself is never throttled — that is GAP B's whole point.
+            assert on_judge_halt.call_count == 4
+
+            # Still failing a full window later → loud again.
+            monkeypatch.setattr(
+                harness_mod, '_HALT_ESCALATION_WARN_INTERVAL_SECONDS', 0.0,
+            )
+            await harness._notify_judge_halt('test-project', reason='r')
+            assert _counts() == (2, 3)
 
 
 @pytest.mark.asyncio

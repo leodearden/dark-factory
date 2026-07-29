@@ -3091,7 +3091,9 @@ def create_mcp_server(
         stayed pending forever, so the dashboard kept showing a halt that no
         longer existed. The ids closed are returned in
         ``escalations_resolved`` (empty when there was nothing pending) and
-        named in ``message``.
+        named in ``message``. The field reports THIS call's close only: when
+        the project was not halted, it is always empty — an auto-unhalt that
+        happened minutes earlier is not this call's result.
 
         Args:
             project_id: Project to unhalt
@@ -3120,6 +3122,19 @@ def create_mcp_server(
                     f"{', '.join(resolved)}."
                 )
         else:
+            # The stash is taken unconditionally so a stale entry is CLEARED
+            # rather than left to be misreported by some later call — but it is
+            # not reported here: auto-unhalt-after-cooldown also stages ids and
+            # nothing pops them, so a non-empty list on an already-running
+            # project would describe a close that happened minutes or hours ago.
+            if resolved:
+                logger.info(
+                    'unhalt_reconciliation: discarding %d stale auto-close id(s) '
+                    'staged for %s, which is not halted (closed by an earlier '
+                    'auto-unhalt): %s',
+                    len(resolved), project_id, ', '.join(resolved),
+                )
+                resolved = []
             message = f'Project {project_id} was not halted.'
         return {
             'status': 'unhalted' if was_halted else 'already_running',

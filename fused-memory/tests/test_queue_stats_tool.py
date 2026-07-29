@@ -300,6 +300,76 @@ class TestUnhaltReconciliationClosesEscalation:
             closed = fresh.get(esc_id)
             assert closed is not None
             assert closed.status == 'resolved'
+
+            # A second call on the now-running project reports NOTHING closed:
+            # the field describes THIS call's result, not an earlier one's.
+            again = await server._tool_manager.call_tool(
+                'unhalt_reconciliation', {'project_id': 'proj'},
+            )
+            assert again['status'] == 'already_running'
+            assert again['escalations_resolved'] == []
+            assert esc_id not in again['message']
+        finally:
+            await journal.close()
+            await buf.close()
+
+    @pytest.mark.asyncio
+    async def test_not_halted_discards_rather_than_reports_a_stale_stash(
+        self, tmp_path,
+    ):
+        """An earlier auto-unhalt's ids must not be replayed as this call's.
+
+        auto-unhalt-after-cooldown stages closed ids that nothing pops, so a
+        later ``unhalt_reconciliation`` on a project that is NOT halted would
+        answer ``status='already_running'``, ``'Project proj was not halted.'``
+        AND a non-empty ``escalations_resolved`` from a close that happened
+        minutes or hours ago. The stash is still TAKEN, so the stale entry is
+        cleared rather than left to mislead the next caller too.
+        """
+        from fused_memory.config.schema import (
+            FusedMemoryConfig,
+            ReconciliationConfig,
+        )
+        from fused_memory.reconciliation.harness import ReconciliationHarness
+        from fused_memory.reconciliation.journal import ReconciliationJournal
+
+        buf = EventBuffer(db_path=tmp_path / 'eb.db', buffer_size_threshold=100)
+        await buf.initialize()
+        journal = ReconciliationJournal(tmp_path / 'journal')
+        await journal.initialize()
+        try:
+            config = FusedMemoryConfig(
+                reconciliation=ReconciliationConfig(
+                    enabled=True,
+                    judge_enabled=True,
+                    explore_codebase_root='/tmp/test',
+                    agent_llm_provider='anthropic',
+                    agent_llm_model='claude-sonnet-4-20250514',
+                )
+            )
+            harness = ReconciliationHarness(
+                memory_service=AsyncMock(),
+                taskmaster=AsyncMock(),
+                journal=journal,
+                event_buffer=buf,
+                config=config,
+            )
+            assert harness.judge is not None
+            assert not harness.judge.is_halted('proj')
+            # Stage ids as an earlier auto-unhalt-after-cooldown would have.
+            harness._resolved_halt_escalations['proj'] = ['esc-reconciliation-halt-OLD']
+
+            svc = _make_mock_service()
+            server = create_mcp_server(svc, reconciliation_harness=harness)
+            result = await server._tool_manager.call_tool(
+                'unhalt_reconciliation', {'project_id': 'proj'},
+            )
+
+            assert result['status'] == 'already_running'
+            assert result['escalations_resolved'] == []
+            assert 'esc-reconciliation-halt-OLD' not in result['message']
+            # Taken, not merely hidden — the stale entry is gone.
+            assert harness.take_resolved_halt_escalations('proj') == []
         finally:
             await journal.close()
             await buf.close()

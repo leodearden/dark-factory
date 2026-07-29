@@ -213,6 +213,15 @@ _RESOLVED_RECURRENCE_WINDOW_SECONDS = 86400  # 24h
 _PLACEHOLDER_DROP_STORM_THRESHOLD = 5
 _PLACEHOLDER_DROP_STORM_WINDOW_SECONDS = 3600.0  # 1h
 
+# Throttle window for the '_notify_judge_halt escalated to nothing' WARNING.
+# Task 2998 deliberately stopped burning the per-process dedupe token on a
+# failed write, so a halted project with no live orchestrator re-enters that
+# path on EVERY halted tick (~5s) — unthrottled that is ~17k WARNING
+# lines/day/project, drowning the signal it exists to raise. Matches the
+# BacklogPolicy rejection-branch throttle and the default escalation
+# rate-limit window; the first failure per halt always warns.
+_HALT_ESCALATION_WARN_INTERVAL_SECONDS = 900.0  # 15m
+
 # Stable finding identity for the placeholder-drop storm alarm — same
 # fingerprint-stability rationale as _DEAD_OWNER_STORM_FINDING above.
 _PLACEHOLDER_DROP_STORM_FINDING: dict[str, Any] = {
@@ -475,8 +484,12 @@ class ReconciliationHarness:
         # WP-D: track which halted projects we've already escalated so we
         # don't re-fire every harness tick.
         self._halt_escalated: set[str] = set()
-        # Task 2998: escalation ids closed by the most recent unhalt, staged
-        # for the MCP tool layer. Pop-once — see take_resolved_halt_escalations.
+        # Throttle clock (monotonic) for the 'escalated to nothing' WARNING,
+        # per project. Cleared on a successful escalation and on unhalt, so the
+        # first failure of the NEXT halt is always loud.
+        self._halt_escalation_warn_ts: dict[str, float] = {}
+        # Task 2998: escalation ids closed by unhalts not yet reported to the
+        # MCP tool layer. Pop-once — see take_resolved_halt_escalations.
         self._resolved_halt_escalations: dict[str, list[str]] = {}
 
         # Task 1755 / PRD β, amended by task 2039: rolling-window counter of
@@ -612,10 +625,25 @@ class ReconciliationHarness:
             and verdict.escalation_path is not None
         ):
             self._halt_escalated.add(project_id)
+            self._halt_escalation_warn_ts.pop(project_id, None)
             return
 
+        # Throttled — see _HALT_ESCALATION_WARN_INTERVAL_SECONDS. The retry
+        # itself is NOT throttled (that is the whole point of GAP B); only the
+        # log line is, so a persistently-undeliverable halt stays visible
+        # without emitting one WARNING every 5 seconds forever.
         outcome = getattr(verdict, 'outcome', None)
-        logger.warning(
+        now = time.monotonic()
+        last_warned = self._halt_escalation_warn_ts.get(project_id)
+        if (
+            last_warned is None
+            or (now - last_warned) >= _HALT_ESCALATION_WARN_INTERVAL_SECONDS
+        ):
+            self._halt_escalation_warn_ts[project_id] = now
+            emit = logger.warning
+        else:
+            emit = logger.debug
+        emit(
             'harness: judge halt for %s escalated to nothing (outcome=%s) — '
             'will retry on next halted tick',
             project_id, outcome,
@@ -643,6 +671,7 @@ class ReconciliationHarness:
         and ``Judge.unhalt`` already awaits an awaitable callback result.
         """
         self._halt_escalated.discard(project_id)
+        self._halt_escalation_warn_ts.pop(project_id, None)
         if self._backlog_policy is None:
             return
         try:
@@ -653,7 +682,12 @@ class ReconciliationHarness:
             )
             return
         if resolved:
-            self._resolved_halt_escalations[project_id] = list(resolved)
+            # ACCUMULATE rather than overwrite: an auto-unhalt-after-cooldown
+            # stages ids that nothing pops, so a plain assignment would drop an
+            # earlier unread close on the floor. Order-preserving dedupe keeps
+            # a repeat close from being reported twice.
+            staged = self._resolved_halt_escalations.setdefault(project_id, [])
+            staged.extend(esc_id for esc_id in resolved if esc_id not in staged)
 
     def take_resolved_halt_escalations(self, project_id: str) -> list[str]:
         """Pop the escalation ids closed by the most recent unhalt.
