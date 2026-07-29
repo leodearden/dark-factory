@@ -15,7 +15,9 @@ the estimator cannot make the test agree with itself.
 
 from __future__ import annotations
 
+import json
 import math
+import os
 from pathlib import Path
 
 import pytest
@@ -30,7 +32,10 @@ from shared.memory_eval_limits import (
     evaluate_series,
     evaluate_tripwire,
     grandfather_set_hash,
+    limits_artifact_path,
+    load_limits_artifact,
     poisson_two_sided_p,
+    write_limits_artifact,
 )
 from shared.memory_eval_metrics import Metric, MetricSeries, TripwireItem, load_metric_series
 
@@ -753,6 +758,190 @@ class TestBudgetMovesTheVerdict:
         # Trailing two runs are 5 and 6 -> lam == 5.5, not the 5.0 of all three.
         assert verdict.baseline == pytest.approx(5.5)
         assert verdict.baseline_run_stamps == _BASELINE_STAMPS[1:]
+
+
+def _config(budget: float = 1.0, *, baseline_window: int = 3) -> LimitsConfig:
+    return LimitsConfig(
+        false_alarm_budget=budget,
+        runs_per_quarter=90,
+        min_samples=_MIN_SAMPLES,
+        baseline_window=baseline_window,
+    )
+
+
+class TestLimitsArtifact:
+    """``limits-current.json`` is ONE file doing two jobs.
+
+    It is the evaluator's persisted state (the grandfather set it resumes
+    from) AND the dashboard's alarm source. Deliberately not two files:
+    splitting them would let the published alarms drift from the limits that
+    actually produced them, which is precisely the INV-1/INV-5 re-implementation
+    hazard the PRD names. Making one file safe for both jobs is what
+    ``test_state_continuity_...`` below is for.
+    """
+
+    def test_path_is_the_documented_shape(self, tmp_path):
+        assert (
+            limits_artifact_path(tmp_path, 'e1-retrieval-health')
+            == tmp_path / 'e1-retrieval-health' / 'limits-current.json'
+        )
+
+    def _write(self, tmp_path, stamp=_QUIET_STAMP, budget=1.0, grandfather=None):
+        result = evaluate_series(_series(stamp), _baseline(), _config(budget), grandfather)
+        path = limits_artifact_path(tmp_path, result.eval_id)
+        write_limits_artifact(result, path)
+        return result, path
+
+    def test_artifact_records_the_alpha_derivation(self, tmp_path):
+        """Not just the derived alpha — the inputs it came from.
+
+        G6 asks for "a calibration output with recorded provenance". An alpha
+        alone is a magic number in a file; alpha alongside the budget, cadence
+        and metric count that produced it can be re-derived and argued with.
+        """
+        _, path = self._write(tmp_path)
+        data = json.loads(path.read_text())
+
+        assert data['alpha'] == pytest.approx(1 / 360)
+        assert data['false_alarm_budget'] == 1.0
+        assert data['runs_per_quarter'] == 90
+        assert data['alarmed_metric_count'] == _ALARMED_METRIC_COUNT
+        assert data['alpha'] == pytest.approx(
+            data['false_alarm_budget'] / (data['runs_per_quarter'] * data['alarmed_metric_count'])
+        )
+
+    def test_artifact_records_its_provenance(self, tmp_path):
+        _, path = self._write(tmp_path)
+        data = json.loads(path.read_text())
+
+        assert data['schema_version'] == 1
+        assert data['eval_id'] == 'e1-retrieval-health'
+        assert data['run_stamp'] == _QUIET_STAMP
+        assert data['generator']
+        assert data['baseline_run_stamps'] == list(_BASELINE_STAMPS)
+
+    def test_artifact_records_a_rule_kind_per_metric(self, tmp_path):
+        result, path = self._write(tmp_path)
+        data = json.loads(path.read_text())
+
+        by_id = {v['metric_id']: v for v in data['verdicts']}
+        assert by_id.keys() == {v.metric_id for v in result.verdicts}
+        assert by_id['canonical-in-top-5']['rule_kind'] == 'proportion'
+        assert by_id['dangling-pointers']['rule_kind'] == 'count'
+        assert by_id['topic-canonical-present']['rule_kind'] == 'tripwire'
+        assert by_id['search-latency-p50-ms']['rule_kind'] == 'scalar'
+
+    def test_artifact_records_the_grandfather_set_and_its_hash(self, tmp_path):
+        result, path = self._write(tmp_path)
+        data = json.loads(path.read_text())
+
+        assert data['grandfather_set'] == sorted(result.grandfather)
+        assert data['grandfather_set_hash'] == grandfather_set_hash(result.grandfather)
+
+    def test_artifact_records_the_current_alarms(self, tmp_path):
+        # The regression run, evaluated against a seeded grandfather set, so
+        # all three alarm kinds are present at once.
+        _, seeded = evaluate_tripwire(
+            _metric(_series(_BASELINE_STAMPS[-1]), 'topic-canonical-present'), None
+        )
+        result = evaluate_series(_series(_REGRESSION_STAMP), _baseline(), _config(), seeded)
+        path = limits_artifact_path(tmp_path, result.eval_id)
+        write_limits_artifact(result, path)
+        data = json.loads(path.read_text())
+
+        assert len(data['alarms']) == len(result.alarms)
+        assert {a['metric_id'] for a in data['alarms']} == {a.metric_id for a in result.alarms}
+        assert any(a['item_key'] == 't-worktree-lifecycle' for a in data['alarms'])
+        assert all('detail' in a for a in data['alarms'])
+
+    def test_round_trip_restores_the_grandfather_set_exactly(self, tmp_path):
+        result, path = self._write(tmp_path)
+        restored = load_limits_artifact(path)
+
+        assert restored.grandfather_set == sorted(result.grandfather)
+        assert restored.grandfather_set_hash == result.grandfather_hash
+        assert restored.alpha == result.alpha
+        assert restored.run_stamp == result.run_stamp
+
+    def test_state_continuity_a_rerun_from_the_reloaded_state_alarms_nothing(self, tmp_path):
+        """The property that makes one file safe to use as two things.
+
+        Evaluate, persist, reload, re-evaluate the SAME run from the reloaded
+        state: nothing may alarm and the known-bad list may not move. If a
+        round-trip through the artifact perturbed the state, the file would be
+        unusable as resumable state — and every restart would produce a burst
+        of phantom alarms.
+        """
+        first, path = self._write(tmp_path)
+        assert first.alarms == ()
+
+        restored = load_limits_artifact(path)
+        second = evaluate_series(
+            _series(_QUIET_STAMP), _baseline(), _config(), frozenset(restored.grandfather_set)
+        )
+
+        assert second.alarms == ()
+        assert second.grandfather == first.grandfather
+        assert second.grandfather_hash == first.grandfather_hash
+
+    def test_writer_creates_parent_directories(self, tmp_path):
+        result = evaluate_series(_series(_QUIET_STAMP), _baseline(), _config(), None)
+        path = limits_artifact_path(tmp_path / 'nested' / 'deeper', result.eval_id)
+        write_limits_artifact(result, path)
+        assert path.is_file()
+
+    def test_writer_leaves_no_temp_file(self, tmp_path):
+        _, path = self._write(tmp_path)
+        assert sorted(p.name for p in path.parent.iterdir()) == ['limits-current.json']
+
+    def test_bytes_are_stable_across_two_identical_writes(self, tmp_path):
+        result, path = self._write(tmp_path)
+        first = path.read_bytes()
+        write_limits_artifact(result, path)
+        assert path.read_bytes() == first
+
+    def test_a_failed_write_does_not_corrupt_the_previous_artifact(self, tmp_path, monkeypatch):
+        """A crashed run must not cost the operator their grandfather set.
+
+        The artifact is resumable state, so a torn write is worse than no
+        write: it would take the known-bad list with it. The mkstemp+replace
+        pattern means the old file is either wholly replaced or wholly intact.
+        """
+        first, path = self._write(tmp_path)
+        original = path.read_bytes()
+
+        def boom(*args, **kwargs):
+            raise OSError('disk full')
+
+        monkeypatch.setattr(os, 'replace', boom)
+        later = evaluate_series(_series(_REGRESSION_STAMP), _baseline(), _config(), None)
+        with pytest.raises(OSError):
+            write_limits_artifact(later, path)
+        monkeypatch.undo()
+
+        assert path.read_bytes() == original
+        assert load_limits_artifact(path).grandfather_set_hash == first.grandfather_hash
+        assert sorted(p.name for p in path.parent.iterdir()) == ['limits-current.json']
+
+    def test_a_wrong_schema_version_is_rejected(self, tmp_path):
+        # A pinned Literal, so a future version is a loud validation failure
+        # rather than a silent misread of fields that moved.
+        _, path = self._write(tmp_path)
+        data = json.loads(path.read_text())
+        data['schema_version'] = 2
+        path.write_text(json.dumps(data))
+        with pytest.raises(ValueError):
+            load_limits_artifact(path)
+
+    def test_an_unknown_field_is_rejected(self, tmp_path):
+        # extra='forbid': the evaluator's own state file gets the same strict
+        # treatment as the metric series it judges.
+        _, path = self._write(tmp_path)
+        data = json.loads(path.read_text())
+        data['grandfather_sett'] = []  # a typo an author would want caught
+        path.write_text(json.dumps(data))
+        with pytest.raises(ValueError):
+            load_limits_artifact(path)
 
     def test_config_defaults_to_one_false_alarm_per_quarter(self):
         # The PRD-sanctioned default (M2) — a budget DECLARATION, not a
