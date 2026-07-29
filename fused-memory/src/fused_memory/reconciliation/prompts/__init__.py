@@ -184,8 +184,8 @@ An empty result from ANY `mcp__escalation__*` query available to you is therefor
 UNINFORMATIVE about orchestrator gate records — not evidence of absence. Do not treat \
 it as such, and do not cite it as evidence in a finding, a memory, or a filed task. \
 (An archive-inclusive `get_task_escalations` lookup does exist on the ORCHESTRATOR-side \
-escalation server, port 8102, where architect / implementer / steward / watcher agents \
-reach it — but you are not connected to that server and must not claim its results.)
+escalation server, port 8102 — but you are not connected to that server and must not \
+claim its results.)
 
 **Establish closure from the TASK RECORD instead — this rule is primary and \
 sufficient.** Call `mcp__fused-memory__get_task(task_id)` (a READ; allowed in both \

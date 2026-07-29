@@ -117,9 +117,16 @@
     is pending in the queue root. The orchestrator side is already
     archive-inclusive (deterministic_runner.py calls get_by_task with no
     status filter — task 2954, commit 403c978) and is NOT the defect.
-    Task 3023 exposed get_task_escalations on the escalation MCP surface for
-    ORCHESTRATOR-side agents (architect / implementer / steward / watcher, port
-    8102). Recon stages CANNOT reach it: their `escalation` MCP server is backed
+    Task 3023 registered get_task_escalations on the ORCHESTRATOR-side
+    escalation server (port 8102). Reachability there is PARTIAL as shipped:
+    interactive and skill-driven callers (e.g. /unblock) can call it because no
+    AgentRole allowlist applies to them, but no orchestrator role's ENFORCED
+    allowed_tools names it yet — not the steward's (roles.py) and not
+    _WATCHER_ALLOWED_TOOLS (harness.py). Task 3176 owns that wiring and is
+    blocked on 3164; until it lands, orchestrator-spawned steward and
+    escalation-watcher rotations cannot call the tool. Recon stages CANNOT
+    reach it at all, for a different and permanent reason: their `escalation`
+    MCP server is backed
     by the RECONCILIATION queue (data/reconciliation/escalations, port 8103 —
     ReconciliationConfig.escalation_queue_dir), a different store from
     data/escalations (port 8102, dark-factory-orchestrator.yaml), so no
