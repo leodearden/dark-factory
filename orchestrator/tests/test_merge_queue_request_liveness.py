@@ -3282,8 +3282,12 @@ class TestDeadVerifyAbortRequeuesIntoTheLiveQueue:
             f'_live_items must hold the MergeRequest after the requeue: '
             f'{worker._live_items.get(rid)!r}'
         )
-        assert req in list(q._queue), (
-            f'the request must actually be on _queue: {list(q._queue)!r}'
+        # Drain the (inert — no worker loop is running here) queue rather than
+        # reaching into asyncio.Queue's undocumented `_queue` deque: this is the
+        # test's last use of `q`, and identity membership is the actual claim.
+        parked = [q.get_nowait() for _ in range(q.qsize())]
+        assert any(p is req for p in parked), (
+            f'the request must actually be parked on the live queue: {parked!r}'
         )
         assert not req.result.done(), (
             'a re-queued request must be left PENDING for its re-dispatch'
@@ -3482,21 +3486,23 @@ class TestDeadVerifyAbortSelfHealsEndToEnd:
         req = _make_request(branch, branch, wt, config)
         gate = _HangThenPassVerify()
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
-            with patch('orchestrator.merge_queue.run_scoped_verification', gate):
-                worker_task = asyncio.create_task(worker.run())
-                try:
-                    await q.put(req)
-                    # Wait for the DEAD first verify to be entered, so the
-                    # no-progress budget is genuinely armed before we wait on
-                    # the recovery.
-                    await asyncio.wait_for(gate.first_entered.wait(), timeout=20.0)
-                    outcome = await asyncio.wait_for(req.result, timeout=40.0)
-                finally:
-                    with contextlib.suppress(Exception):
-                        await asyncio.wait_for(worker.stop(), timeout=10.0)
-                    with contextlib.suppress(Exception):
-                        await asyncio.wait_for(worker_task, timeout=10.0)
+        with (
+            caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'),
+            patch('orchestrator.merge_queue.run_scoped_verification', gate),
+        ):
+            worker_task = asyncio.create_task(worker.run())
+            try:
+                await q.put(req)
+                # Wait for the DEAD first verify to be entered, so the
+                # no-progress budget is genuinely armed before we wait on
+                # the recovery.
+                await asyncio.wait_for(gate.first_entered.wait(), timeout=20.0)
+                outcome = await asyncio.wait_for(req.result, timeout=40.0)
+            finally:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(worker.stop(), timeout=10.0)
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(worker_task, timeout=10.0)
 
         main_sha = await git_ops.get_main_sha()
         return worker, req, outcome, gate, fake_eq, main_sha, worker.snapshot()
