@@ -2763,3 +2763,257 @@ class TestContendedLeaseDefers:
         assert task_id not in worker._contended_lease_requeues, (
             'a verify that actually ran must reset the contended-lease streak'
         )
+
+    async def test_streak_error_is_logged_once_at_the_crossing(
+        self,
+        warm_git_ops: GitOps,
+        warm_config: OrchestratorConfig,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """task 3003 review fix (3): the rising-severity ERROR fires ONCE, at
+        the crossing — not on every defer past it.
+
+        The branch tests ``streak >= CONTENDED_LEASE_REQUEUE_WARN_STREAK``, so
+        once the streak is crossed EVERY subsequent defer emits an identical
+        ERROR.  Against a wedged holder that is thousands of duplicate ERROR
+        lines saying nothing new.  The operator still wants a per-defer
+        heartbeat, so the WARNING stays on every defer; only the alarm is
+        de-duplicated (with step-10's terminal
+        ``MAX_CONTENDED_LEASE_DEFER_SECS`` cap closing the streak out loudly at
+        the other end).
+
+        RED on main: ``>=`` emits an ERROR on defers 2, 3 and 4.
+        """
+        from orchestrator.git_ops import MergeVerifyLeaseHeld  # noqa: PLC0415
+        from orchestrator.merge_queue import (  # noqa: PLC0415
+            InflightStatus,
+            SpeculativeMergeWorker,
+        )
+        from orchestrator.verify_runner import HostLease  # noqa: PLC0415
+
+        foreign_pgid = 2**31 - 1
+        warm_path = warm_git_ops.persistent_merge_worktree_path
+
+        async def _lease_held_reset(*_a: object, **_k: object) -> Path:
+            raise MergeVerifyLeaseHeld(warm_path, foreign_pgid)
+
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(warm_git_ops, q)
+        worker.CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS = 0.0
+        worker.CONTENDED_LEASE_REQUEUE_WARN_STREAK = 2
+        # Comfortably above the whole test's wall-clock, so the terminal cap
+        # cannot fire first and truncate the streak we are measuring.
+        worker.MAX_CONTENDED_LEASE_DEFER_SECS = 3600.0
+
+        fake_local = MagicMock()
+        fake_local.name = 'local'
+        fake_local.is_local = True
+        lease = HostLease(name='local', runner=fake_local, is_local=True)
+
+        task_id = 'streak-log-dedupe'
+
+        async def _drive_one(branch: str) -> InflightStatus | None:
+            req, item = await _make_merged_item(
+                warm_git_ops, warm_config, branch, f'{branch}.py', 'x=1\n',
+                task_id=task_id,
+            )
+            worker._register_owned_merge_worktree(item.merge_wt)
+            worker._request_ledger.on_dequeue(req, now=1_000_000.0)
+            with patch.object(
+                warm_git_ops, 'reset_persistent_merge_worktree', _lease_held_reset,
+            ):
+                result = await asyncio.wait_for(
+                    worker._run_inflight_verify(item, lease), timeout=15.0,
+                )
+            return result.status
+
+        # Four consecutive defers, NOT clearing caplog between them.
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            for i in range(4):
+                assert await _drive_one(f'sld-{i}') == InflightStatus.REQUEUED
+
+        lane_records = [
+            r for r in caplog.records if 'lane unavailable' in r.getMessage()
+        ]
+        errors = [r for r in lane_records if r.levelno >= logging.ERROR]
+        warnings = [r for r in lane_records if r.levelno == logging.WARNING]
+
+        assert len(errors) == 1, (
+            f'the streak ERROR must be emitted exactly ONCE, at the crossing — '
+            f'a `>=` test re-alarms on every defer past the threshold, which '
+            f'against a wedged holder is thousands of identical lines. Got '
+            f'{len(errors)}: {[r.getMessage() for r in errors]}'
+        )
+        assert str(worker.CONTENDED_LEASE_REQUEUE_WARN_STREAK) in (
+            errors[0].getMessage()
+        ), 'the crossing ERROR must still name the streak length'
+        assert len(warnings) == 3, (
+            f'defers below the threshold AND every defer past it must still '
+            f'emit a per-defer WARNING heartbeat (4 defers - 1 crossing ERROR '
+            f'= 3 WARNINGs); got {len(warnings)}'
+        )
+
+    async def test_deferred_attempt_does_not_advance_cold_verify_valve(
+        self,
+        warm_git_ops: GitOps,
+        warm_config: OrchestratorConfig,
+    ) -> None:
+        """task 3003, reviewer's secondary finding: a DEFERRED attempt must not
+        advance the periodic cold-verify safety valve.
+
+        ``self._verify_attempt_count += 1`` runs BEFORE
+        ``_acquire_warm_verify_worktree``, so an attempt that never reaches a
+        verify at all still counts toward
+        ``persistent_merge_worktree_safety_valve_every_n``.  A long wedge would
+        burn through the valve's period on pure defers and fire a from-scratch
+        cold verify for no reason.  The counter must measure attempts that
+        actually VERIFIED.
+
+        RED on main: two defers advance it by two.
+        """
+        from orchestrator.git_ops import MergeVerifyLeaseHeld  # noqa: PLC0415
+        from orchestrator.merge_queue import (  # noqa: PLC0415
+            InflightStatus,
+            SpeculativeMergeWorker,
+        )
+        from orchestrator.verify_runner import HostLease  # noqa: PLC0415
+
+        foreign_pgid = 2**31 - 1
+        warm_path = warm_git_ops.persistent_merge_worktree_path
+
+        async def _lease_held_reset(*_a: object, **_k: object) -> Path:
+            raise MergeVerifyLeaseHeld(warm_path, foreign_pgid)
+
+        async def _verify_returns_failure(*_a: object, **_k: object) -> object:
+            return MergeOutcome('blocked', reason='verify failed: 1 test')
+
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(warm_git_ops, q)
+        worker.CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS = 0.0
+
+        fake_local = MagicMock()
+        fake_local.name = 'local'
+        fake_local.is_local = True
+        lease = HostLease(name='local', runner=fake_local, is_local=True)
+
+        count_before = worker._verify_attempt_count
+
+        # ── Two defers: the warm acquire never succeeded, no verify ran ──
+        for i in range(2):
+            req, item = await _make_merged_item(
+                warm_git_ops, warm_config, f'valve-defer-{i}', f'vd{i}.py', 'x=1\n',
+                task_id='valve-defer',
+            )
+            worker._register_owned_merge_worktree(item.merge_wt)
+            worker._request_ledger.on_dequeue(req, now=1_000_000.0)
+            with patch.object(
+                warm_git_ops, 'reset_persistent_merge_worktree', _lease_held_reset,
+            ):
+                result = await asyncio.wait_for(
+                    worker._run_inflight_verify(item, lease), timeout=15.0,
+                )
+            assert result.status == InflightStatus.REQUEUED
+
+        assert worker._verify_attempt_count == count_before, (
+            f'a deferred attempt never ran a verify, so it must not advance '
+            f'the cold-verify safety-valve counter — a long wedge would '
+            f'otherwise fire a from-scratch cold verify purely from defers. '
+            f'Went {count_before} -> {worker._verify_attempt_count}'
+        )
+
+        # ── One attempt that really verifies: the counter must advance by 1 ──
+        # (the fix DEFERS the commit; it must not DROP the count.)
+        req, item = await _make_merged_item(
+            warm_git_ops, warm_config, 'valve-real', 'vr.py', 'x=1\n',
+            task_id='valve-real',
+        )
+        worker._register_owned_merge_worktree(item.merge_wt)
+        worker._request_ledger.on_dequeue(req, now=1_000_000.0)
+        with patch(
+            'orchestrator.merge_queue._run_post_merge_verify',
+            _verify_returns_failure,
+        ):
+            result = await asyncio.wait_for(
+                worker._run_inflight_verify(item, lease), timeout=60.0,
+            )
+        assert result.status != InflightStatus.REQUEUED
+
+        assert worker._verify_attempt_count == count_before + 1, (
+            f'an attempt whose warm acquire SUCCEEDED must still advance the '
+            f'counter exactly once — the fix defers the commit past the '
+            f'acquire, it does not drop it. Got '
+            f'{worker._verify_attempt_count}, expected {count_before + 1}'
+        )
+
+    async def test_safety_valve_still_fires_on_the_nth_real_attempt(
+        self,
+        warm_git_ops: GitOps,
+        warm_config: OrchestratorConfig,
+    ) -> None:
+        """SCOPE FENCE for the counter move: the valve must keep its documented
+        1-BASED contract and must not shift by one.
+
+        ``_safety_valve_due`` documents ``attempt_count`` as "the 1-based count
+        of verifying attempts ... incremented before calling this", so the Nth
+        real attempt — and only the Nth — must be handed
+        ``safety_valve_due=True``.  Moving the commit past the acquire must
+        preserve that exactly; an off-by-one here would either never fire the
+        valve or fire it a verify early.
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker  # noqa: PLC0415
+        from orchestrator.verify_runner import HostLease  # noqa: PLC0415
+
+        every_n = 2
+        valve_config = warm_config.model_copy(
+            update={
+                'git': warm_config.git.model_copy(
+                    update={
+                        'persistent_merge_worktree_safety_valve_every_n': every_n,
+                    },
+                ),
+            },
+        )
+
+        async def _verify_returns_failure(*_a: object, **_k: object) -> object:
+            return MergeOutcome('blocked', reason='verify failed: 1 test')
+
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(warm_git_ops, q)
+
+        fake_local = MagicMock()
+        fake_local.name = 'local'
+        fake_local.is_local = True
+        lease = HostLease(name='local', runner=fake_local, is_local=True)
+
+        import orchestrator.merge_queue as mq_mod  # noqa: PLC0415
+
+        real_acquire = mq_mod._acquire_warm_verify_worktree
+        seen_due: list[bool] = []
+
+        async def _spy_acquire(*a: object, **k: object) -> object:
+            seen_due.append(bool(k.get('safety_valve_due')))
+            return await real_acquire(*a, **k)
+
+        for i in range(every_n):
+            req, item = await _make_merged_item(
+                warm_git_ops, valve_config, f'valve-real-{i}', f'vrn{i}.py', 'x=1\n',
+                task_id=f'valve-nth-{i}',
+            )
+            worker._register_owned_merge_worktree(item.merge_wt)
+            worker._request_ledger.on_dequeue(req, now=1_000_000.0)
+            with (
+                patch.object(mq_mod, '_acquire_warm_verify_worktree', _spy_acquire),
+                patch(
+                    'orchestrator.merge_queue._run_post_merge_verify',
+                    _verify_returns_failure,
+                ),
+            ):
+                await asyncio.wait_for(
+                    worker._run_inflight_verify(item, lease), timeout=60.0,
+                )
+
+        assert seen_due == [False, True], (
+            f'with every_n={every_n} the valve must be due on the 2nd real '
+            f'attempt and only then (1-based contract); got {seen_due}'
+        )
