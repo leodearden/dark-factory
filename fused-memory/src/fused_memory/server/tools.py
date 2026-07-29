@@ -2159,6 +2159,73 @@ def create_mcp_server(
 
     @mcp.tool()
     @mcp_tool_errors()
+    async def redact_episode_content(
+        episode_uuid: str,
+        new_content: str,
+        project_id: str,
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        metadata: dict | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Replace one Graphiti episode's raw content in place. NON-destructive.
+
+        The counterpart to delete_episode for an episode whose stored text is
+        corrupted — most concretely, one carrying a leaked serialized
+        tool-call fragment (task 3083). Use this INSTEAD of
+        ``delete_episode(cascade=True)``, which would also destroy the
+        entities and edges exclusively sourced from that episode: those were
+        extracted from the CLEAN portion of the text and are usually valid,
+        so cascading deletes real knowledge to fix appearance.
+
+        Only the ``content`` property is written. EpisodicNodes carry no
+        embedding of their own, so nothing is left stale by an in-place set,
+        and the extracted edges are deliberately untouched.
+
+        Refuses LOUDLY rather than half-succeeding: a blank replacement, a
+        replacement that itself still carries a leaked fragment, or an
+        episode uuid absent from this project's graph all raise.
+
+        Args:
+            episode_uuid: Graphiti episode UUID (must already be identified —
+                this tool does not search for corrupted episodes)
+            new_content: Replacement text. Non-empty, leak-free.
+            project_id: Project scope (required)
+            agent_id: Which agent is redacting (optional, auto-derived from MCP context)
+            session_id: Session context (optional, auto-derived from MCP context)
+            metadata: Optional key-value pairs (may contain _causation_id for recon)
+        """
+        agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
+        if err := validate_project_id(project_id):
+            return err
+        if err := _known_project_gate(project_id):
+            return err
+        if not episode_uuid or not episode_uuid.strip():
+            return {'error': 'episode_uuid is required', 'error_type': 'ValidationError'}
+        if not new_content or not new_content.strip():
+            return {
+                'error': (
+                    'new_content must be non-empty — redaction is '
+                    'content-preserving, not content-erasing'
+                ),
+                'error_type': 'ValidationError',
+            }
+        causation_id, source, _ = _extract_causation(metadata, agent_id)
+        return await memory_service.redact_episode_content(
+            episode_uuid=episode_uuid,
+            new_content=new_content,
+            project_id=project_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            causation_id=causation_id,
+            _source=source,
+        )
+
+    @mcp.tool()
+    @mcp_tool_errors()
     async def update_edge(
         edge_uuid: str,
         project_id: str,

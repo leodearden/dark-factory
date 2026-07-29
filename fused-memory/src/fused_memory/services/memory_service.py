@@ -3863,6 +3863,70 @@ class MemoryService:
 
         return {'status': 'deleted', 'episode_id': episode_id, 'cascade': cascade}
 
+    async def redact_episode_content(
+        self,
+        episode_uuid: str,
+        new_content: str,
+        project_id: str = 'main',
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        causation_id: str | None = None,
+        _source: str = 'mcp_tool',
+    ) -> dict:
+        """Replace one Graphiti episode's raw content in place, preserving its edges.
+
+        The non-destructive counterpart to ``delete_episode`` for an episode
+        whose text carries a leaked serialized tool-call fragment (task 3083).
+        ``delete_episode(cascade=True)`` would destroy the entities and edges
+        exclusively sourced from that episode — which for the known residual
+        ``d12b0eb4`` includes demonstrably-valid collateral — so the leak is
+        neutralised in the raw text and the extracted knowledge is left alone.
+
+        See ``GraphitiBackend.redact_episode_content`` for the full rationale
+        and for the loud refusals (blank replacement, or a replacement that
+        still carries a leak, or an absent episode uuid).
+
+        Returns:
+            ``{status, store, uuid, old_content, new_content}``.
+        """
+        write_op_id = str(uuid_mod.uuid4())
+
+        result_data = await self._journaled_backend_call(
+            write_op_id=write_op_id,
+            causation_id=causation_id,
+            backend='graphiti',
+            operation='redact_episode_content',
+            payload={'episode_uuid': episode_uuid},
+            coro=self.graphiti.redact_episode_content(
+                episode_uuid, group_id=project_id, new_content=new_content,
+            ),
+        )
+
+        if self._write_journal:
+            await self._write_journal.log_write_op(
+                write_op_id=write_op_id,
+                causation_id=causation_id,
+                source=_source,
+                operation='redact_episode_content',
+                project_id=project_id,
+                agent_id=agent_id,
+                session_id=session_id,
+                # Truncated copies for the journal only — the full strings are
+                # returned to the caller for audit.
+                params={
+                    'episode_uuid': episode_uuid,
+                    'new_content': new_content[:200],
+                },
+                result_summary={'status': 'redacted'},
+                success=True,
+            )
+
+        return {
+            'status': 'redacted',
+            'store': 'graphiti',
+            **(result_data or {}),
+        }
+
     async def refresh_entity_summary(
         self,
         entity_uuid: str | None = None,
