@@ -1165,6 +1165,127 @@ class TestObservableProgressRefreshesTheWait:
         )
 
 
+def _make_silent_marking_steward(
+    markers: list[str], instances: list, *, stop_delay: float = 0.0,
+) -> type:
+    """The genuinely-SILENT producer, instrumented for ORDER assertions.
+
+    Publishes nothing, dismisses nothing, and never advances
+    ``metrics.invocations`` — so the idle window legitimately expires and the
+    give-up path fires.  Records every ``stop()`` await into the shared
+    *markers* list alongside :func:`_make_marking_invoke`'s implementer marker,
+    and every constructed instance into *instances* so the caller can still
+    inspect one after the workflow drops its reference.
+
+    *stop_delay* makes ``stop()`` genuinely await, so an implementation that
+    fired it as a background task (rather than awaiting it before resuming)
+    would lose the ordering race and be caught.
+    """
+
+    class _Metrics:
+        def __init__(self) -> None:
+            self.invocations = 0
+
+    class _FakeSteward:
+        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+            self._outcome_channel = None
+            self._wip_probe = None
+            self.metrics = _Metrics()
+            self.stop_count = 0
+            instances.append(self)
+
+        def set_outcome_channel(self, channel) -> None:
+            self._outcome_channel = channel
+
+        def set_wip_probe(self, probe) -> None:
+            self._wip_probe = probe
+
+        async def start(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            if stop_delay:
+                await asyncio.sleep(stop_delay)
+            self.stop_count += 1
+            markers.append('steward-stop')
+
+    return _FakeSteward
+
+
+@pytest.mark.asyncio
+class TestGiveUpStopsTheStewardBeforeResuming:
+    """Fix D3: the backstop must STOP the steward before it resumes anything.
+
+    ``TaskSteward`` invokes its agent with ``cwd = self.worktree``
+    (steward.py:542, 590) — the SAME worktree the resumed implementer edits and
+    commits in.  Before this fix the only ``_steward.stop()`` sites were the
+    terminal-exit teardown hook (workflow.py:2995) and the unrelated
+    unactionable/false-premise paths, so when the wait backstop fired the
+    workflow force-dismissed the L0 out from under a LIVE steward agent and
+    then resumed the implementer beside it: two agents committing in one git
+    worktree.  That is a corruption/lost-work hazard, not a benign slow path.
+    """
+
+    async def test_expiry_stops_the_steward_before_resuming_the_implementer(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        local_config = _short_window_config(config, completion=0.2, invocation=0.3)
+        wt = await _make_advanced_worktree(git_ops, task_assignment.task_id)
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _submit_l0(queue, task_assignment.task_id)
+        store = _RecordingEventStore()
+        workflow, _scheduler = _build_workflow(
+            local_config, git_ops, task_assignment, queue, wt, event_store=store,
+        )
+        _wire_resolve_callback(queue, workflow)
+        markers: list[str] = []
+        instances: list = []
+        workflow._steward_factory = _make_silent_marking_steward(
+            markers, instances, stop_delay=0.05,
+        )
+        evrl_mock, _state = _make_evrl_returner(
+            [WorkflowOutcome.ESCALATED, WorkflowOutcome.DONE],
+        )
+        workflow._execute_verify_review_loop = evrl_mock  # type: ignore[method-assign]
+        workflow._invoke = _make_marking_invoke(markers)  # type: ignore[method-assign]
+
+        await asyncio.wait_for(workflow.run(), 10)
+
+        assert len(instances) == 1, (
+            f'exactly one steward must have been constructed; got {len(instances)}'
+        )
+        assert markers.count('steward-stop') == 1, (
+            f'the give-up path must stop the steward exactly once — and having '
+            f'cleared the reference, run()\'s terminal-cleanup hook must then '
+            f'find nothing left to stop; markers={markers}'
+        )
+        assert 'implementer-resumed' in markers, (
+            f'the disposition is unchanged: the wait still unblocks and '
+            f'resumes; markers={markers}'
+        )
+        assert markers.index('steward-stop') < markers.index('implementer-resumed'), (
+            f'ORDER is the safety property, not mere occurrence: the steward '
+            f'runs its agent in the SAME worktree the resumed implementer '
+            f'commits in, so a stop that lands after the resume leaves two '
+            f'agents writing one worktree; markers={markers}'
+        )
+        assert workflow._steward is None, (
+            'the give-up must clear the reference too, so a later '
+            '_mark_blocked builds a FRESH steward via _ensure_steward_started '
+            'rather than awaiting a cancelled loop that can never publish'
+        )
+        # The step-12 disposition is preserved, not replaced.
+        archived = queue.get(esc.id)
+        assert archived is not None, 'the record must still be readable'
+        assert archived.resolved_by == 'auto-dismissed', (
+            f'the orphan L0 must still be dismissed on the way out; '
+            f'resolved_by={archived.resolved_by!r}'
+        )
+        assert [e['escalation_ids'] for e in _steward_wait_timeouts(store)] == [
+            [esc.id],
+        ], 'the steward_wait_timeout event must still be emitted'
+
+
 def _make_reescalating_steward(queue: EscalationQueue, task_id: str) -> type:
     """A steward that gives up to a human, exactly as ``_auto_escalate_to_human``.
 
