@@ -864,3 +864,174 @@ class TestScrollAllPayloadsBudget:
     @pytest.mark.asyncio
     async def test_census_scan_incomplete_is_an_exception(self):
         assert issubclass(_mod.CensusScanIncomplete, Exception)
+
+
+# ===========================================================================
+# Tests: census_project
+# ===========================================================================
+
+ALL_SIX = [c.value for c in _mod.CENSUS_CATEGORIES]
+
+
+def _backend(
+    payloads_by_category: dict[str, list[dict]],
+    *,
+    counts_by_category: dict[str, int] | None = None,
+    collection_points: int | None = None,
+    page_size_pages: bool = False,
+    call_log: list | None = None,
+) -> AsyncMock:
+    """Mem0Backend stand-in: count_by_metadata / count / _get_async_qdrant.
+
+    The fake Qdrant client dispatches on the scroll filter's ``category``
+    value, returning that category's payloads (one page, or one page per
+    payload when *page_size_pages* is set, to exercise the paging path).
+    """
+    log = call_log if call_log is not None else []
+    counts = counts_by_category or {c: len(p) for c, p in payloads_by_category.items()}
+
+    async def _scroll(**kwargs):
+        category = kwargs['scroll_filter'].must[0].match.value
+        log.append(('scroll', category))
+        payloads = payloads_by_category.get(category, [])
+        if not page_size_pages or len(payloads) <= 1:
+            return ([_record(p) for p in payloads], None)
+        offset = kwargs.get('offset') or 0
+        index = int(offset)
+        next_offset = index + 1 if index + 1 < len(payloads) else None
+        return ([_record(payloads[index])], next_offset)
+
+    client = AsyncMock()
+    client.scroll = AsyncMock(side_effect=_scroll)
+
+    async def _count_by_metadata(scope, filters):
+        category = filters['category']
+        log.append(('count', category))
+        return counts.get(category, 0)
+
+    total = (
+        collection_points if collection_points is not None
+        else sum(counts.get(c, 0) for c in payloads_by_category)
+    )
+
+    backend = AsyncMock()
+    backend.config = MagicMock()
+    backend.config.mem0.collection_prefix = 'fused'
+    backend.count_by_metadata = AsyncMock(side_effect=_count_by_metadata)
+    backend.count = AsyncMock(return_value=total)
+    backend._get_async_qdrant = AsyncMock(return_value=client)
+    backend._fake_client = client
+    return backend
+
+
+class TestCensusProjectCells:
+    @pytest.mark.asyncio
+    async def test_returns_one_cell_per_category_keyed_by_category_value(self):
+        backend = _backend({OBS: [{'kind': 'a'}], PROC: [{'kind': 'b'}, {}]})
+        cells, _ = await _mod.census_project(backend, 'dark_factory', [OBS, PROC])
+        assert set(cells) == {OBS, PROC}
+        assert cells[OBS].records == 1
+        assert cells[PROC].records == 2
+        assert cells[PROC].kind_counts['b'] == 1
+        assert cells[PROC].kind_missing == 1
+
+    @pytest.mark.asyncio
+    async def test_covers_all_six_categories_including_empty_dual_write_ones(self):
+        # A dual-write-only category must still produce a (zero) cell, not be
+        # dropped -- otherwise the residue it explains disappears silently.
+        backend = _backend({OBS: [{'kind': 'a'}]}, counts_by_category={OBS: 1})
+        cells, coverage = await _mod.census_project(backend, 'dark_factory', ALL_SIX)
+        assert set(cells) == set(ALL_SIX)
+        assert cells[DEC].records == 0
+        assert coverage['categories'][DEC]['expected'] == 0
+
+    @pytest.mark.asyncio
+    async def test_defaults_to_all_six_categories(self):
+        backend = _backend({OBS: [{'kind': 'a'}]}, counts_by_category={OBS: 1})
+        cells, _ = await _mod.census_project(backend, 'dark_factory')
+        assert set(cells) == set(ALL_SIX)
+
+    @pytest.mark.asyncio
+    async def test_payloads_stream_through_pagination(self):
+        backend = _backend(
+            {OBS: [{'kind': 'a'}, {'kind': 'b'}, {'kind': 'c'}]},
+            counts_by_category={OBS: 3},
+            page_size_pages=True,
+        )
+        cells, coverage = await _mod.census_project(backend, 'dark_factory', [OBS], page_size=1)
+        assert cells[OBS].records == 3
+        assert coverage['categories'][OBS]['scrolled'] == 3
+        assert backend._fake_client.scroll.await_count == 3
+
+
+class TestCensusProjectCorroboration:
+    """INV-3: count first, then scroll, then reconcile the two."""
+
+    @pytest.mark.asyncio
+    async def test_counts_each_category_before_scrolling_it(self):
+        log: list = []
+        backend = _backend({OBS: [{}], PROC: [{}]}, call_log=log)
+        await _mod.census_project(backend, 'dark_factory', [OBS, PROC])
+        assert ('count', OBS) in log
+        assert log.index(('count', OBS)) < log.index(('scroll', OBS))
+        assert log.index(('count', PROC)) < log.index(('scroll', PROC))
+
+    @pytest.mark.asyncio
+    async def test_count_by_metadata_called_once_per_category_with_the_category_filter(self):
+        backend = _backend({OBS: [{}], PROC: [{}]})
+        await _mod.census_project(backend, 'dark_factory', [OBS, PROC])
+        assert backend.count_by_metadata.await_count == 2
+        filters = [call.args[1] for call in backend.count_by_metadata.await_args_list]
+        assert filters == [{'category': OBS}, {'category': PROC}]
+
+    @pytest.mark.asyncio
+    async def test_expected_and_scrolled_recorded_per_category(self):
+        backend = _backend({OBS: [{}, {}]}, counts_by_category={OBS: 2})
+        _, coverage = await _mod.census_project(backend, 'dark_factory', [OBS])
+        assert coverage['categories'][OBS]['expected'] == 2
+        assert coverage['categories'][OBS]['scrolled'] == 2
+
+    @pytest.mark.asyncio
+    async def test_under_enumeration_marks_the_cell_incomplete_with_the_delta(self):
+        # count says 5, scroll yields 2 -- the shortfall must be named.
+        backend = _backend({OBS: [{}, {}]}, counts_by_category={OBS: 5})
+        _, coverage = await _mod.census_project(backend, 'dark_factory', [OBS])
+        cell = coverage['categories'][OBS]
+        assert cell['expected'] == 5
+        assert cell['scrolled'] == 2
+        assert cell['delta'] == -3
+        assert cell['complete'] is False
+
+
+class TestCensusProjectCoverage:
+    @pytest.mark.asyncio
+    async def test_resolves_collection_name_from_scope_and_config_prefix(self):
+        backend = _backend({OBS: [{}]}, counts_by_category={OBS: 1})
+        _, coverage = await _mod.census_project(backend, 'dark_factory', [OBS])
+        assert coverage['collection'] == 'fused_dark_factory'
+
+    @pytest.mark.asyncio
+    async def test_collection_points_come_from_backend_count(self):
+        backend = _backend({OBS: [{}]}, counts_by_category={OBS: 1}, collection_points=19464)
+        _, coverage = await _mod.census_project(backend, 'dark_factory', [OBS])
+        assert coverage['collection_points'] == 19464
+        assert backend.count.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_uncovered_points_is_collection_total_minus_summed_categories(self):
+        backend = _backend(
+            {OBS: [{}], PROC: [{}]},
+            counts_by_category={OBS: 24408, PROC: 3981},
+            collection_points=29951,
+        )
+        _, coverage = await _mod.census_project(backend, 'dark_factory', [OBS, PROC])
+        report = _mod.build_report({'dark_factory': {}}, {'dark_factory': coverage}, top_n=50)
+        assert report['coverage']['projects']['dark_factory']['uncovered_points'] == 1562
+
+    @pytest.mark.asyncio
+    async def test_coverage_feeds_build_report_unchanged(self):
+        backend = _backend({OBS: [{'kind': 'a'}]}, counts_by_category={OBS: 1})
+        cells, coverage = await _mod.census_project(backend, 'dark_factory', [OBS])
+        report = _mod.build_report({'dark_factory': cells}, {'dark_factory': coverage}, top_n=50)
+        assert report['coverage']['complete'] is True
+        assert report['projects']['dark_factory']['categories'][OBS]['records'] == 1
