@@ -201,15 +201,41 @@ def _reproject_str(cmd: str | None, project: str) -> str | None:
     lives in segment 0, appears in no later segment, and there is no ``cd``
     sequencing" is precisely the right admission test here too. When the gate
     rejects, ``head is cmd`` and ``tail == ''``, so the body below collapses
-    to its pre-gate form byte-for-byte. Both bail-outs return *cmd* — the
-    full original, never ``head`` — so a rejected command can never be
+    to its pre-gate form byte-for-byte. All three bail-outs return *cmd* —
+    the full original, never ``head`` — so a rejected command can never be
     silently truncated.
+
+    A tail is carried ONLY when the parsed head has no ``cwd_rel``, because
+    ``render()`` re-emits ``cwd_rel`` as a leading ``cd X &&`` — a cwd shift
+    the preserved tail was never written for. ``split_chain_tail``'s
+    ``cd``-TOKEN rejection cannot see it: that gate inspects the INPUT
+    string, where the shift is still spelled ``--directory X``. All seven
+    module ``lint_command``s are exactly that shape, and the introduced
+    ``cd fused-memory &&`` would make their tail's
+    ``fused-memory/scripts/check_*.py`` resolve as
+    ``fused-memory/fused-memory/scripts/...`` (exit 2) — a spurious RED
+    verify on a clean tree.
+
+    The bail forfeits nothing: ``reproject`` is a documented no-op when
+    ``cwd_rel is not None`` ("an explicit ``--directory`` is already set"),
+    so in exactly the bailed case the discarded expression was a pure
+    re-render with no ``--project`` injection to lose. Note this asymmetry
+    against the two scopers: they apply ``strip_cwd``, so their ``cwd_rel``
+    is always already ``None`` at render time and neither needs this guard.
+    ``strip_cwd`` is deliberately NOT used here — unlike the scopers, which
+    re-target to worktree-root-relative files, this helper acts on an
+    unscoped/bail-through command whose ``--directory`` is load-bearing (it
+    selects the directory ruff/pyright run in and find their config from).
+    Bail, do not rewrite. Guarding on *tail* first keeps the pre-existing
+    no-tail ``--directory`` -> ``cd`` renormalisation byte-identical.
     """
     if cmd is None:
         return None
     head, tail = split_chain_tail(cmd, 'uv run')
     parsed = parse_config_command(head)
     if parsed.tool is ToolKind.OPAQUE or parsed.raw is not None:
+        return cmd
+    if tail and parsed.cwd_rel is not None:
         return cmd
     rendered = render(reproject(parsed, project))
     return f'{rendered} {tail}' if tail else rendered

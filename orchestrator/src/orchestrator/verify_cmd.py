@@ -260,6 +260,14 @@ def split_chain_tail(raw: str, keyword: str) -> tuple[str, str]:
     once any segment shifts the shell's cwd, every later segment's relative
     paths depend on that sequencing, so a tail lifted out of it cannot be
     replayed after ``strip_cwd`` has flattened the head.
+
+    CAVEAT for callers: condition 3 sees only the INPUT SPELLING. A uv
+    ``--directory X`` head is not a ``cd`` token here, but ``render()``
+    re-emits it as a leading ``cd X &&``. A caller that re-renders a parsed
+    head WITHOUT ``strip_cwd`` must therefore additionally refuse to carry a
+    tail when ``parsed.cwd_rel is not None`` — see ``verify._reproject_str``,
+    the only such caller. The two scopers apply ``strip_cwd``, so their
+    ``cwd_rel`` is always ``None`` by render time.
     """
     try:
         tokens = shlex.split(raw)
