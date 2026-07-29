@@ -329,6 +329,18 @@ class TaskSteward:
             '--task-id', self.task_id,
             '--level', '0',
         ]
+        # Load-bearing (task 3170, fix B): without this, a capped-but-still-
+        # pending record turns every watcher call into "returns instantly, loop
+        # re-spins" — the watcher arms inotify then runs _initial_scan, which
+        # emits an already-pending match immediately and exits.  Excluding the
+        # capped ids makes the watcher BLOCK on inotify (zero CPU) until
+        # genuinely new work arrives, instead of respawning a subprocess per
+        # loop iteration.  `--exclude-id` is repeatable and already documented
+        # as excluding "from initial scan AND event loop"
+        # (escalation/watcher.py:199-201), so no change is needed there.
+        # Sorted for a deterministic argv.
+        for capped_id in sorted(self._capped_escalations):
+            cmd.extend(['--exclude-id', capped_id])
 
         proc = None
         pgid: int | None = None
