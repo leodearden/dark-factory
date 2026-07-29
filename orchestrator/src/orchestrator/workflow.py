@@ -3183,7 +3183,7 @@ class TaskWorkflow:
             )
         # Wait for steward to finish any pending work (suggestion triage, etc.)
         await self._ensure_steward_started()
-        await self._await_steward_completion()
+        await self._await_steward_completion(skip_if_idle=True)
         self._enter_phase(WorkflowState.DONE)
         return await self._finalise_merged_done()
 
@@ -13194,6 +13194,39 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             return True
         return isinstance(outcome, StewardInterrupted) and outcome.wip_commits_present
 
+    def _steward_work_outstanding(self) -> bool:
+        """Whether there is anything for :meth:`_await_steward_completion` to
+        wait ON — its ``skip_if_idle`` gate, used by the post-merge success
+        tail (task 3170).
+
+        Two things count as outstanding: a pending level-0 escalation (the
+        steward does not un-pend a record while it works on one, so "pending"
+        covers both queued and in-flight), or an unread outcome already sitting
+        on the channel (instantly consumable).
+
+        With neither, the success tail would otherwise block for the FULL
+        ``steward_completion_timeout`` — 900s on stock config — waiting for a
+        publish that is never coming, at the finish line of every task that had
+        an escalation.  That was previously masked: the outcome the steward
+        published during the ESCALATED cycle stayed on the channel and made the
+        call return instantly.  :meth:`_wait_for_resolution` now drains it (it
+        must — replaying it into a later ``_mark_blocked`` is a spurious
+        requeue), so the "nothing to wait for" case has to be stated
+        explicitly rather than ridden on a leftover.
+
+        The narrow window where the steward's AGENT has already resolved the
+        L0 via MCP but the invocation has not yet returned to publish is NOT
+        covered — and was not covered before either, since the stale outcome
+        short-circuited this same call.  The success tail's contract is
+        "give queued steward work a chance to finish", not "join the steward".
+        """
+        if self.escalation_queue is not None and self.escalation_queue.get_by_task(
+            self.task_id, status='pending', level=0,
+        ):
+            return True
+        channel = self._steward_outcome_channel
+        return channel is not None and not channel.empty()
+
     def _drain_steward_outcomes(self) -> StewardOutcome | None:
         """Non-blockingly empty the steward outcome channel and LOG what was
         there, returning the most severe drained outcome (task 3170).
@@ -13247,9 +13280,20 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         )
         return most_severe
 
-    async def _await_steward_completion(self) -> StewardOutcome:
+    async def _await_steward_completion(
+        self, *, skip_if_idle: bool = False,
+    ) -> StewardOutcome:
         """Wait for the steward to publish an outcome, with a grace period
         (task 2248 / W9-delta, SO-1).
+
+        *skip_if_idle* (task 3170) is passed by the post-merge success tail,
+        whose contract is "give queued steward work a chance to finish" rather
+        than "join the steward": with nothing outstanding
+        (:meth:`_steward_work_outstanding`) it returns the same synthesized
+        default as the no-channel case instead of burning the whole grace
+        window on a publish that is never coming.  ``_mark_blocked`` never
+        passes it — there the wait IS the point, and an L0 it just filed is
+        outstanding by construction.
 
         Races ``self._steward_outcome_channel.get()`` against the soft-cancel
         event and the configured grace deadline — replaces the old
@@ -13311,6 +13355,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         """
         channel = self._steward_outcome_channel
         if channel is None:
+            return StewardInterrupted('timeout', wip_commits_present=False)
+        if skip_if_idle and not self._steward_work_outstanding():
+            logger.info(
+                'Task %s: no outstanding steward work — skipping the '
+                'completion grace window', self.task_id,
+            )
             return StewardInterrupted('timeout', wip_commits_present=False)
 
         timeout = self.config.steward_completion_timeout
