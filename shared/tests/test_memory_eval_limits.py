@@ -23,8 +23,27 @@ from shared.memory_eval_limits import (
     LimitsConfig,
     binomial_two_sided_p,
     derive_alpha,
+    evaluate_tripwire,
+    grandfather_set_hash,
     poisson_two_sided_p,
 )
+from shared.memory_eval_metrics import Metric, TripwireItem
+
+
+def _tripwire(results: dict[str, bool], *, metric_id: str = 'topic-canonical-present') -> Metric:
+    """Build a tripwire metric from an item_key -> passed mapping.
+
+    A tripwire's ``value`` IS its failure count (M1), so it is derived here
+    rather than passed in — a builder that let a test state an inconsistent
+    count would just be testing the M1 validator by accident.
+    """
+    return Metric(
+        metric_id=metric_id,
+        kind='tripwire',
+        value=float(sum(1 for passed in results.values() if not passed)),
+        n=len(results),
+        items=[TripwireItem(item_key=key, passed=passed) for key, passed in results.items()],
+    )
 
 
 def _reference_binomial_two_sided_p(k: int, n: int, p0: float) -> float:
@@ -272,6 +291,157 @@ class TestDerivedAlpha:
         # finite alpha admits zero false alarms. Say so instead of returning 0.
         with pytest.raises(ValueError):
             derive_alpha(budget, 90, 4)
+
+
+class TestStructuralTripwireRatchet:
+    """Rule (a): pre-existing failures are grandfathered, regressions alarm (D1).
+
+    The whole lifecycle, because the interesting behaviour is not any single
+    verdict but the way the grandfather set MOVES between runs. Two properties
+    carry the design and each has a test that would catch its inversion:
+
+      * the set only ever SHRINKS — seeded once, and thereafter items leave it
+        by being fixed and never join it by failing;
+      * consequently a fixed item that regresses alarms again, and a newly
+        failing item cannot silence itself by being absorbed into the baseline.
+    """
+
+    def test_first_run_snapshots_failures_without_alarming(self):
+        # No prior state: today's failures are the starting line, not news.
+        # The fix lineage (3111/3112/3200) reads this set as its worklist —
+        # these are known-bad, deliberately NOT alarms.
+        verdict, grandfather = evaluate_tripwire(
+            _tripwire({'t-a': True, 't-b': False, 't-c': False}), None
+        )
+        assert verdict.status == 'baseline_snapshot'
+        assert verdict.alarms == ()
+        assert grandfather == frozenset({'t-b', 't-c'})
+
+    def test_first_run_still_reports_the_numbers(self):
+        # Canary precedent: the comparison is always computed and exposed, so
+        # a non-alarming status is still inspectable rather than opaque.
+        verdict, _ = evaluate_tripwire(_tripwire({'t-a': True, 't-b': False}), None)
+        assert verdict.metric_id == 'topic-canonical-present'
+        assert verdict.rule_kind == 'tripwire'
+        assert verdict.value == 1.0
+        assert verdict.n == 2
+
+    def test_rerunning_an_unchanged_series_alarms_nothing(self):
+        metric = _tripwire({'t-a': True, 't-b': False, 't-c': False})
+        _, first = evaluate_tripwire(metric, None)
+        verdict, second = evaluate_tripwire(metric, first)
+        assert verdict.status == 'ok'
+        assert verdict.alarms == ()
+        assert second == first
+        assert grandfather_set_hash(second) == grandfather_set_hash(first)
+
+    def test_a_grandfathered_failure_does_not_alarm(self):
+        verdict, _ = evaluate_tripwire(_tripwire({'t-a': True, 't-b': False}), frozenset({'t-b'}))
+        assert verdict.status == 'ok'
+        assert verdict.alarms == ()
+
+    def test_a_newly_failing_item_alarms_and_names_itself(self):
+        verdict, _ = evaluate_tripwire(
+            _tripwire({'t-a': False, 't-b': False, 't-c': True}), frozenset({'t-b'})
+        )
+        assert verdict.status == 'alarm'
+        assert len(verdict.alarms) == 1
+        alarm = verdict.alarms[0]
+        assert alarm.item_key == 't-a'
+        assert alarm.metric_id == 'topic-canonical-present'
+        assert 't-a' in alarm.detail
+
+    def test_a_structural_alarm_spends_no_alpha(self):
+        # Rule (a) is structural, not statistical: an item newly failing is a
+        # fact, not a surprise to be measured. No p-value, no alpha.
+        verdict, _ = evaluate_tripwire(_tripwire({'t-a': False}), frozenset())
+        assert verdict.status == 'alarm'
+        assert verdict.p_value is None
+        assert verdict.alpha is None
+
+    def test_multiple_new_failures_alarm_in_a_deterministic_order(self):
+        # The alarm list lands verbatim in a committed artifact, so its order
+        # must not depend on set iteration order.
+        verdict, _ = evaluate_tripwire(
+            _tripwire({'t-c': False, 't-a': False, 't-b': False}), frozenset({'t-b'})
+        )
+        assert [alarm.item_key for alarm in verdict.alarms] == ['t-a', 't-c']
+
+    def test_ratchet_drops_an_item_that_now_passes(self):
+        before = frozenset({'t-b', 't-c'})
+        verdict, after = evaluate_tripwire(
+            _tripwire({'t-a': True, 't-b': True, 't-c': False}), before
+        )
+        assert verdict.status == 'ok'
+        assert after == frozenset({'t-c'})
+        assert grandfather_set_hash(after) != grandfather_set_hash(before)
+
+    def test_a_fixed_item_that_regresses_alarms_again(self):
+        """The ratchet's entire purpose, asserted end to end."""
+        _, after_fix = evaluate_tripwire(
+            _tripwire({'t-a': True, 't-b': True, 't-c': False}), frozenset({'t-b', 't-c'})
+        )
+        assert 't-b' not in after_fix
+
+        verdict, _ = evaluate_tripwire(
+            _tripwire({'t-a': True, 't-b': False, 't-c': False}), after_fix
+        )
+        assert verdict.status == 'alarm'
+        assert [alarm.item_key for alarm in verdict.alarms] == ['t-b']
+
+    def test_a_newly_failing_item_is_never_grandfathered(self):
+        """The load-bearing negative: an alarm must not silence itself.
+
+        If a newly-failing item were folded into the grandfather set after
+        alarming, the very next run would reclassify the regression as
+        known-bad and go quiet — precisely the failure mode grandfathering
+        exists to avoid. So it alarms again, and again, until someone fixes it.
+        """
+        before = frozenset({'t-b'})
+        first, after = evaluate_tripwire(_tripwire({'t-a': False, 't-b': False}), before)
+        assert first.status == 'alarm'
+        assert 't-a' not in after
+        assert after == before
+
+        second, _ = evaluate_tripwire(_tripwire({'t-a': False, 't-b': False}), after)
+        assert second.status == 'alarm'
+        assert [alarm.item_key for alarm in second.alarms] == ['t-a']
+
+    def test_the_set_only_ever_shrinks(self):
+        # Walk a run sequence that both fixes and breaks items, and assert the
+        # set is a subset at every step. This is the invariant the two tests
+        # above are each half of.
+        runs = [
+            {'t-a': True, 't-b': False, 't-c': False},
+            {'t-a': False, 't-b': False, 't-c': False},
+            {'t-a': False, 't-b': True, 't-c': False},
+            {'t-a': False, 't-b': False, 't-c': True},
+        ]
+        _, grandfather = evaluate_tripwire(_tripwire(runs[0]), None)
+        for run in runs[1:]:
+            _, nxt = evaluate_tripwire(_tripwire(run), grandfather)
+            assert nxt <= grandfather
+            grandfather = nxt
+        assert grandfather == frozenset()
+
+    def test_hash_is_stable_under_reordering(self):
+        assert grandfather_set_hash(['t-b', 't-a', 't-c']) == grandfather_set_hash(
+            ['t-c', 't-b', 't-a']
+        )
+        assert grandfather_set_hash(frozenset({'t-a', 't-b'})) == grandfather_set_hash(
+            ['t-b', 't-a']
+        )
+
+    def test_hash_changes_when_membership_changes(self):
+        assert grandfather_set_hash(['t-a', 't-b']) != grandfather_set_hash(['t-a', 't-b', 't-c'])
+        assert grandfather_set_hash([]) != grandfather_set_hash(['t-a'])
+
+    def test_hash_is_hex_and_length_stable(self):
+        # It travels in a JSON artifact and gets eyeballed in diffs.
+        for keys in ([], ['t-a'], ['t-a', 't-b']):
+            digest = grandfather_set_hash(keys)
+            assert len(digest) == 64
+            assert set(digest) <= set('0123456789abcdef')
 
     def test_config_defaults_to_one_false_alarm_per_quarter(self):
         # The PRD-sanctioned default (M2) — a budget DECLARATION, not a
