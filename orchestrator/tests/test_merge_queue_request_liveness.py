@@ -1631,6 +1631,11 @@ class TestContendedLeaseDefers:
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(warm_git_ops, q)
         worker._register_owned_merge_worktree(item.merge_wt)
+        # This test's raiser waits only 1s (shrunk above), so the defer's
+        # minimum inter-attempt period would otherwise sleep the remaining 29s.
+        # The throttle itself is covered by test_zero_wait_defer_is_throttled /
+        # test_self_throttling_raiser_is_not_slept_again — opt out here.
+        worker.CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS = 0.0
 
         fake_local = MagicMock()
         fake_local.name = 'local'
@@ -1760,6 +1765,11 @@ class TestContendedLeaseDefers:
         # Small threshold so the SECOND attempt deterministically crosses it
         # (mirrors test_consecutive_contended_requeues_raise_log_severity).
         worker.CONTENDED_LEASE_REQUEUE_WARN_STREAK = 2
+        # MergeVerifyLeaseHeld carries no wait_secs, so the defer's minimum
+        # inter-attempt period would sleep its full 30s on EACH attempt here.
+        # The throttle is covered by test_zero_wait_defer_is_throttled — this
+        # test is about the defer contract and the streak log, so opt out.
+        worker.CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS = 0.0
 
         fake_local = MagicMock()
         fake_local.name = 'local'
@@ -2200,6 +2210,10 @@ class TestContendedLeaseDefers:
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(warm_git_ops, q)
+        # 1s bounded wait (shrunk above) → the defer's minimum inter-attempt
+        # period would sleep the remaining 29s on each of the two attempts.
+        # Covered separately by test_zero_wait_defer_is_throttled.
+        worker.CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS = 0.0
 
         fake_local = MagicMock()
         fake_local.name = 'local'

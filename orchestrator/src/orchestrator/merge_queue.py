@@ -7165,6 +7165,22 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # streak counts only UNBROKEN contention.  Kept as a class attribute so tests
     # can monkeypatch it small (mirrors MAX_INFLIGHT_DEAD_VERIFY_ABORTS).
     CONTENDED_LEASE_REQUEUE_WARN_STREAK: int = 5
+    # task 3003 (review fix 1): MINIMUM INTER-ATTEMPT PERIOD for a
+    # contended-lane DEFER — NOT an unconditional extra sleep.  The backoff
+    # actually slept is max(0, PERIOD - exc.wait_secs), so the two BOUNDED-WAIT
+    # raisers already self-throttle and sleep ZERO additional seconds
+    # (reset: 30 s via _RESET_WARM_LANE_LOCK_WAIT_SECS; lease: 300 s via
+    # _MERGE_VERIFY_LEASE_WAIT_SECS — both already ≥ this period).  It exists
+    # for MergeVerifyLeaseHeld, whose FOREIGN-holder pre-check
+    # (git_ops.reset_persistent_merge_worktree) refuses IMMEDIATELY and carries
+    # no wait at all: without a floor here a live foreign holder would make the
+    # merger spin dequeue → `git worktree add` + merge → instant refusal →
+    # cleanup → requeue at whatever rate git allows, for the entire 1–2 h holder
+    # window.  30 s matches the reset path's own bounded wait, so a
+    # zero-wait defer re-attempts at the same cadence a contended one does.
+    # Kept as a class attribute so tests can monkeypatch it small — or to 0.0
+    # to opt out (mirrors the MAX_*/WARN_STREAK monkeypatch convention above).
+    CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS: float = 30.0
     # MQ-invariants iota (task 1994): grace window (seconds, wall-clock mtime)
     # before an unregistered on-disk `_merge-*` worktree is flagged by
     # worktree_ledger_violations().  Tactical default sits strictly between
@@ -13883,10 +13899,41 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     '(consecutive contended-lane requeue #%d)',
                     req.task_id, exc, _contended_streak,
                 )
+            # The ephemeral worktree and its disk are freed BEFORE the backoff
+            # below, never held across it.
             await self._release_or_cleanup(merge_wt, spec_warm=_spec_warm)
-            self._queue.put_nowait(req)
-            self._request_ledger.on_requeued(req.request_id)
-            self._note_requeue(req.request_id, live_obj=req)
+            # task 3003 (review fix 1): throttle the re-attempt to a minimum
+            # INTER-ATTEMPT PERIOD.  The two bounded-wait raisers have already
+            # burned wait_secs inside the acquire, so they sleep 0 here and
+            # their cadence is byte-unchanged; MergeVerifyLeaseHeld's immediate
+            # pre-check carries no wait at all and would otherwise hot-spin the
+            # full dequeue → merge → refuse → cleanup → requeue cycle at git
+            # speed for the whole holder window.
+            #
+            # Accepted trade-off: _run_inflight_verify runs as a background
+            # asyncio.ensure_future task, so this sleep does NOT stall the
+            # merger's dequeue loop — but the HostLease is only released by
+            # _finalize_inflight once this coroutine returns, so the backoff
+            # holds the verify slot for ≤ the min period.  That is bounded,
+            # orders of magnitude shorter than the real verify the slot normally
+            # runs, and moot on the warm path anyway (any other local verify
+            # would contend on the same lane lock).
+            #
+            # The finally is LOAD-BEARING: put_nowait/on_requeued/_note_requeue
+            # are all synchronous, so a cancellation landing inside the backoff
+            # (shutdown mid-defer) still re-queues the request before
+            # CancelledError propagates.  Without it the request would be lost
+            # outright — worktree already cleaned above, req.result PENDING
+            # forever, nothing on _queue to re-dispatch.
+            _waited = float(getattr(exc, 'wait_secs', 0.0) or 0.0)
+            _backoff = max(0.0, self.CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS - _waited)
+            try:
+                if _backoff:
+                    await asyncio.sleep(_backoff)
+            finally:
+                self._queue.put_nowait(req)
+                self._request_ledger.on_requeued(req.request_id)
+                self._note_requeue(req.request_id, live_obj=req)
             return InflightVerifyResult(
                 outcome=None,
                 merge_wt=None,
