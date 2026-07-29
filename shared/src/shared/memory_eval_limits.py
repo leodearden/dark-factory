@@ -37,20 +37,24 @@ from __future__ import annotations
 
 import hashlib
 import math
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
-from shared.memory_eval_metrics import Metric
+from shared.memory_eval_metrics import Metric, MetricSeries
 
 __all__ = [
     'Alarm',
+    'EvaluationResult',
     'LimitsConfig',
     'MetricVerdict',
     'RuleKind',
     'VerdictStatus',
     'binomial_two_sided_p',
     'derive_alpha',
+    'evaluate_count',
+    'evaluate_proportion',
+    'evaluate_series',
     'evaluate_tripwire',
     'grandfather_set_hash',
     'poisson_two_sided_p',
@@ -419,4 +423,297 @@ def evaluate_tripwire(
             ),
         ),
         next_grandfather,
+    )
+
+
+def _window_contributions(
+    baseline_window: Sequence[MetricSeries], metric_id: str, kind: RuleKind
+) -> tuple[list[Metric], tuple[str, ...]]:
+    """The baseline runs that actually measured this metric, plus their stamps.
+
+    A metric added mid-programme simply has no history in the older runs, which
+    is an ``insufficient_data`` case rather than an error — so absence is
+    reported by returning an empty list, not by raising.
+    """
+    found: list[Metric] = []
+    stamps: list[str] = []
+    for series in baseline_window:
+        for metric in series.metrics:
+            if metric.metric_id == metric_id and metric.kind == kind:
+                found.append(metric)
+                stamps.append(series.run_stamp)
+                break
+    return found, tuple(stamps)
+
+
+def _insufficient(
+    metric: Metric,
+    *,
+    baseline: float | None,
+    p_value: float | None,
+    alpha: float,
+    stamps: tuple[str, ...],
+    detail: str,
+) -> MetricVerdict:
+    """A verdict that declines to judge — carrying whatever numbers it did compute.
+
+    ``insufficient_data`` is never an alarm, but it is also never a black box:
+    the point estimate and (where computable) the p-value ride along so a
+    reader can watch a trend build before it is actionable.
+    """
+    return MetricVerdict(
+        metric_id=metric.metric_id,
+        rule_kind=metric.kind,
+        status='insufficient_data',
+        value=metric.value,
+        n=metric.n,
+        baseline=baseline,
+        p_value=p_value,
+        alpha=alpha,
+        baseline_run_stamps=stamps,
+        detail=detail,
+    )
+
+
+def evaluate_proportion(
+    metric: Metric,
+    baseline_window: Sequence[MetricSeries],
+    alpha: float,
+    min_samples: int,
+) -> MetricVerdict:
+    """Rule (b): is this run's proportion surprising under the pooled baseline?
+
+    The window is POOLED — successes and trials summed across runs — rather
+    than averaged as ratios. Pooling gives the exact binomial test one honest
+    trial count, where averaging three ratios would discard how many trials
+    each rested on and quietly overweight a thin run.
+
+    Sufficiency is checked BEFORE significance, in both directions: too few
+    items in this run, or no baseline history for this metric, and the answer
+    is ``insufficient_data`` regardless of how alarming the point estimate
+    looks. Absence of evidence is not evidence of a regression.
+    """
+    if metric.kind != 'proportion':
+        raise ValueError(
+            f'evaluate_proportion: metric {metric.metric_id!r} has kind {metric.kind!r}, '
+            'not proportion.'
+        )
+    history, stamps = _window_contributions(baseline_window, metric.metric_id, 'proportion')
+    trials = sum(m.denominator or 0 for m in history)
+    if not history or trials <= 0:
+        return _insufficient(
+            metric,
+            baseline=None,
+            p_value=None,
+            alpha=alpha,
+            stamps=stamps,
+            detail='No baseline history for this metric — nothing to be surprised by yet.',
+        )
+
+    successes = sum(round(m.value * (m.denominator or 0)) for m in history)
+    p0 = successes / trials
+    observed = round(metric.value * metric.n)
+    p_value = binomial_two_sided_p(observed, metric.n, p0)
+
+    if metric.n < min_samples:
+        return _insufficient(
+            metric,
+            baseline=p0,
+            p_value=p_value,
+            alpha=alpha,
+            stamps=stamps,
+            detail=(
+                f'n={metric.n} is below min_samples={min_samples}: too few items to '
+                'distinguish a regression from noise.'
+            ),
+        )
+
+    return _verdict_from_p(
+        metric,
+        baseline=p0,
+        p_value=p_value,
+        alpha=alpha,
+        stamps=stamps,
+        detail=(
+            f'{observed}/{metric.n} against a pooled baseline of {successes}/{trials} '
+            f'over {len(history)} run(s).'
+        ),
+    )
+
+
+def evaluate_count(
+    metric: Metric,
+    baseline_window: Sequence[MetricSeries],
+    alpha: float,
+    min_samples: int,
+) -> MetricVerdict:
+    """Rule (c): is this run's event count surprising under the baseline rate?
+
+    The window's MEAN count is the Poisson rate. Same sufficiency-before-
+    significance ordering as rule (b).
+    """
+    if metric.kind != 'count':
+        raise ValueError(
+            f'evaluate_count: metric {metric.metric_id!r} has kind {metric.kind!r}, not count.'
+        )
+    history, stamps = _window_contributions(baseline_window, metric.metric_id, 'count')
+    if not history:
+        return _insufficient(
+            metric,
+            baseline=None,
+            p_value=None,
+            alpha=alpha,
+            stamps=stamps,
+            detail='No baseline history for this metric — nothing to be surprised by yet.',
+        )
+
+    lam = math.fsum(m.value for m in history) / len(history)
+    p_value = poisson_two_sided_p(round(metric.value), lam)
+
+    if metric.n < min_samples:
+        return _insufficient(
+            metric,
+            baseline=lam,
+            p_value=p_value,
+            alpha=alpha,
+            stamps=stamps,
+            detail=(
+                f'n={metric.n} is below min_samples={min_samples}: too few items to '
+                'distinguish a regression from noise.'
+            ),
+        )
+
+    return _verdict_from_p(
+        metric,
+        baseline=lam,
+        p_value=p_value,
+        alpha=alpha,
+        stamps=stamps,
+        detail=f'{metric.value:g} against a baseline rate of {lam:g} over {len(history)} run(s).',
+    )
+
+
+def _verdict_from_p(
+    metric: Metric,
+    *,
+    baseline: float,
+    p_value: float,
+    alpha: float,
+    stamps: tuple[str, ...],
+    detail: str,
+) -> MetricVerdict:
+    """Turn a computed p-value into a verdict. The ONLY place the bar is applied."""
+    alarmed = p_value < alpha
+    alarms = (
+        (
+            Alarm(
+                metric_id=metric.metric_id,
+                rule_kind=metric.kind,
+                detail=f'{detail} p={p_value:.3g} < alpha={alpha:.3g}.',
+                value=metric.value,
+                baseline=baseline,
+                p_value=p_value,
+                alpha=alpha,
+            ),
+        )
+        if alarmed
+        else ()
+    )
+    return MetricVerdict(
+        metric_id=metric.metric_id,
+        rule_kind=metric.kind,
+        status='alarm' if alarmed else 'ok',
+        value=metric.value,
+        n=metric.n,
+        alarms=alarms,
+        baseline=baseline,
+        p_value=p_value,
+        alpha=alpha,
+        baseline_run_stamps=stamps,
+        detail=detail,
+    )
+
+
+@dataclass(frozen=True)
+class EvaluationResult:
+    """Everything one run concluded, plus how it got there.
+
+    ``alpha`` and ``alarmed_metric_count`` are carried, not just used, because
+    a verdict is only re-derivable by hand if the bar it was judged against is
+    recorded alongside it (G6's "calibration output with recorded provenance").
+    """
+
+    eval_id: str
+    run_stamp: str
+    alpha: float
+    alarmed_metric_count: int
+    config: LimitsConfig
+    verdicts: tuple[MetricVerdict, ...]
+    alarms: tuple[Alarm, ...]
+    grandfather: frozenset[str]
+    grandfather_hash: str
+    baseline_run_stamps: tuple[str, ...]
+
+
+def evaluate_series(
+    current: MetricSeries,
+    baseline_window: Sequence[MetricSeries],
+    config: LimitsConfig,
+    grandfather: frozenset[str] | None,
+) -> EvaluationResult:
+    """Evaluate every metric in a run and return the verdicts, alarms and next state.
+
+    Alpha is derived ONCE here, from the metrics actually present in THIS run
+    (PRD M2: "recomputed as metrics are added"). Resolving it at authoring time
+    instead would mean a newly added metric silently raised the whole eval's
+    false-alarm rate — the budget is per quarter and per eval, so it has to be
+    split across whatever is currently spending it.
+
+    Scalar metrics are reported but never alarmed — no rule is attached to them
+    yet — so they are excluded from the alpha split rather than being handed a
+    share of a budget they cannot spend. Tripwires ARE counted, which is mildly
+    conservative (a structural rule has no false-alarm probability under the
+    null, so it strictly does not consume budget); the stricter bar is the safe
+    direction and keeps the count legible as "metrics that can alarm".
+
+    Only the trailing ``config.baseline_window`` runs are used. A baseline that
+    grew without bound would keep drifting further from current behaviour and
+    would eventually alarm on the system's own gradual, intended changes.
+    """
+    window = list(baseline_window)[-config.baseline_window :] if config.baseline_window > 0 else []
+    alarm_eligible = [m for m in current.metrics if m.kind != 'scalar']
+    alpha = derive_alpha(config.false_alarm_budget, config.runs_per_quarter, len(alarm_eligible))
+
+    verdicts: list[MetricVerdict] = []
+    next_grandfather = grandfather if grandfather is not None else frozenset()
+
+    for metric in current.metrics:
+        if metric.kind == 'tripwire':
+            verdict, next_grandfather = evaluate_tripwire(metric, grandfather)
+        elif metric.kind == 'proportion':
+            verdict = evaluate_proportion(metric, window, alpha, config.min_samples)
+        elif metric.kind == 'count':
+            verdict = evaluate_count(metric, window, alpha, config.min_samples)
+        else:
+            verdict = MetricVerdict(
+                metric_id=metric.metric_id,
+                rule_kind='scalar',
+                status='ok',
+                value=metric.value,
+                n=metric.n,
+                detail='Scalar: reported for trend, no alarm rule attached (M2).',
+            )
+        verdicts.append(verdict)
+
+    return EvaluationResult(
+        eval_id=current.eval_id,
+        run_stamp=current.run_stamp,
+        alpha=alpha,
+        alarmed_metric_count=len(alarm_eligible),
+        config=config,
+        verdicts=tuple(verdicts),
+        alarms=tuple(alarm for verdict in verdicts for alarm in verdict.alarms),
+        grandfather=next_grandfather,
+        grandfather_hash=grandfather_set_hash(next_grandfather),
+        baseline_run_stamps=tuple(series.run_stamp for series in window),
     )
