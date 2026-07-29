@@ -652,6 +652,58 @@ def format_markdown(report: dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Shared fixed-width table renderer
+#
+# The single home for the width-computed ljust idiom every deterministic table
+# below shares (recovery / plan-quality / per-config mean / price / composite).
+# It was copied five times before task 3118, which is exactly the drift this
+# invites: the '-'-not-'0.0000' fix had to be applied to two copies by hand and
+# the other three silently kept their trailing padding.
+# ---------------------------------------------------------------------------
+
+def _render_fixed_table(
+    columns: tuple[str, ...],
+    rendered: list[dict[str, str]],
+    *,
+    header: str | None = None,
+) -> list[str]:
+    """Render PRE-STRINGIFIED rows as a fixed-width, byte-deterministic block.
+
+    *rendered* is a list of ``{column: cell}`` dicts whose values are already
+    strings — every value/None/precision decision stays with the caller, which
+    is what keeps this generic. Column widths are the max of the header and all
+    cells, so the block is a function of its input alone: no wall-clock, no
+    dict-order dependence, and the same rows always render byte-identically.
+
+    Returns the block as LINES (optional *header* line, column headers, a dashes
+    rule, then the rows) rather than a joined string, so callers can append
+    further sections — several emit two or three blocks separated by blanks.
+
+    Lines are ``rstrip``ed: trailing padding on the last column is invisible
+    whitespace that makes an otherwise-identical table differ byte-for-byte,
+    and it lets a caller assert on a line's real ending (e.g. the per-config
+    mean block's ``-`` for "nothing scored", which must never read as
+    ``0.0000``).
+    """
+    widths = {
+        col: (
+            max(len(col), *(len(rr[col]) for rr in rendered))
+            if rendered else len(col)
+        )
+        for col in columns
+    }
+
+    def _fmt(cells: dict[str, str]) -> str:
+        return '  '.join(cells[col].ljust(widths[col]) for col in columns).rstrip()
+
+    lines = [header] if header is not None else []
+    lines.append(_fmt({col: col for col in columns}))
+    lines.append('  '.join('-' * widths[col] for col in columns))
+    lines.extend(_fmt(rr) for rr in rendered)
+    return lines
+
+
+# ---------------------------------------------------------------------------
 # recovery_score surface (eval-revival η)
 #
 # An ADDITIVE, interim per-(task_id, config_name) column distinct from the Elo
@@ -728,22 +780,9 @@ def format_recovery_table(report: dict[str, Any]) -> str:
         }
         for r in rows
     ]
-    widths = {
-        col: (
-            max(len(col), *(len(rr[col]) for rr in rendered))
-            if rendered else len(col)
-        )
-        for col in _RECOVERY_COLUMNS
-    }
-
-    def _fmt(cells: dict[str, str]) -> str:
-        return '  '.join(cells[col].ljust(widths[col]) for col in _RECOVERY_COLUMNS)
-
-    lines = ['recovery_score report:']
-    lines.append(_fmt({col: col for col in _RECOVERY_COLUMNS}))
-    lines.append('  '.join('-' * widths[col] for col in _RECOVERY_COLUMNS))
-    lines.extend(_fmt(rr) for rr in rendered)
-    return '\n'.join(lines)
+    return '\n'.join(_render_fixed_table(
+        _RECOVERY_COLUMNS, rendered, header='recovery_score report:',
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -915,24 +954,9 @@ def _format_plan_quality_mean_section(report: dict[str, Any]) -> list[str]:
         }
         for c in configs
     ]
-    widths = {
-        col: (
-            max(len(col), *(len(rr[col]) for rr in rendered))
-            if rendered else len(col)
-        )
-        for col in _PLAN_QUALITY_MEAN_COLUMNS
-    }
-
-    def _fmt(cells: dict[str, str]) -> str:
-        return '  '.join(
-            cells[col].ljust(widths[col]) for col in _PLAN_QUALITY_MEAN_COLUMNS
-        ).rstrip()
-
-    lines = [_PLAN_QUALITY_MEAN_HEADER]
-    lines.append(_fmt({col: col for col in _PLAN_QUALITY_MEAN_COLUMNS}))
-    lines.append('  '.join('-' * widths[col] for col in _PLAN_QUALITY_MEAN_COLUMNS))
-    lines.extend(_fmt(rr) for rr in rendered)
-    return lines
+    return _render_fixed_table(
+        _PLAN_QUALITY_MEAN_COLUMNS, rendered, header=_PLAN_QUALITY_MEAN_HEADER,
+    )
 
 
 def format_plan_quality_table(report: dict[str, Any]) -> str:
@@ -974,23 +998,9 @@ def format_plan_quality_table(report: dict[str, Any]) -> str:
         }
         for r in rows
     ]
-    widths = {
-        col: (
-            max(len(col), *(len(rr[col]) for rr in rendered))
-            if rendered else len(col)
-        )
-        for col in _PLAN_QUALITY_COLUMNS
-    }
-
-    def _fmt(cells: dict[str, str]) -> str:
-        return '  '.join(
-            cells[col].ljust(widths[col]) for col in _PLAN_QUALITY_COLUMNS
-        ).rstrip()
-
-    lines = ['plan_quality report:']
-    lines.append(_fmt({col: col for col in _PLAN_QUALITY_COLUMNS}))
-    lines.append('  '.join('-' * widths[col] for col in _PLAN_QUALITY_COLUMNS))
-    lines.extend(_fmt(rr) for rr in rendered)
+    lines = _render_fixed_table(
+        _PLAN_QUALITY_COLUMNS, rendered, header='plan_quality report:',
+    )
 
     architect_cells = sum(c['total'] for c in report.get('configs', []))
     # Broken out by CAUSE so a permanent config error (model_not_found /
@@ -1056,22 +1066,9 @@ def _format_price_table_section(price_table: dict[str, Any]) -> list[str]:
                 'input_per_1m': inp,
                 'output_per_1m': outp,
             })
-    widths = {
-        col: (
-            max(len(col), *(len(rr[col]) for rr in rendered))
-            if rendered else len(col)
-        )
-        for col in _PRICE_TABLE_COLUMNS
-    }
-
-    def _fmt(cells: dict[str, str]) -> str:
-        return '  '.join(cells[col].ljust(widths[col]) for col in _PRICE_TABLE_COLUMNS)
-
-    lines = ['price table:']
-    lines.append(_fmt({col: col for col in _PRICE_TABLE_COLUMNS}))
-    lines.append('  '.join('-' * widths[col] for col in _PRICE_TABLE_COLUMNS))
-    lines.extend(_fmt(rr) for rr in rendered)
-    return lines
+    return _render_fixed_table(
+        _PRICE_TABLE_COLUMNS, rendered, header='price table:',
+    )
 
 
 def format_composite_table(report: dict[str, Any]) -> str:
@@ -1101,21 +1098,9 @@ def format_composite_table(report: dict[str, Any]) -> str:
         }
         for r in configs
     ]
-    widths = {
-        col: (
-            max(len(col), *(len(rr[col]) for rr in rendered))
-            if rendered else len(col)
-        )
-        for col in _COMPOSITE_COLUMNS
-    }
-
-    def _fmt(cells: dict[str, str]) -> str:
-        return '  '.join(cells[col].ljust(widths[col]) for col in _COMPOSITE_COLUMNS)
-
-    lines = ['composite report:']
-    lines.append(_fmt({col: col for col in _COMPOSITE_COLUMNS}))
-    lines.append('  '.join('-' * widths[col] for col in _COMPOSITE_COLUMNS))
-    lines.extend(_fmt(rr) for rr in rendered)
+    lines = _render_fixed_table(
+        _COMPOSITE_COLUMNS, rendered, header='composite report:',
+    )
 
     # Distinct price-table section.
     lines.append('')

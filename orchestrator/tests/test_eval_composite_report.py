@@ -633,6 +633,64 @@ class TestFormatCompositeTable:
 
 
 # ---------------------------------------------------------------------------
+# _render_fixed_table — the ONE home for the width-computed ljust idiom every
+# deterministic table above shares (task 3118 amendment). It was copied five
+# times, and that duplication is what let the '-'-not-'0.0000' rstrip fix land
+# in only two of the copies. Pinned here so the shared contract can't drift.
+# ---------------------------------------------------------------------------
+
+class TestRenderFixedTable:
+    _COLUMNS = ('name', 'score')
+
+    def test_widths_are_max_of_header_and_cells(self):
+        from orchestrator.evals.report import _render_fixed_table
+
+        lines = _render_fixed_table(
+            self._COLUMNS,
+            [{'name': 'a-very-long-config', 'score': '1.0000'}],
+            header='demo:',
+        )
+        assert lines[0] == 'demo:'
+        # The header cell is padded out to the widest row cell, so the columns
+        # line up; the dashes rule matches those same widths.
+        assert lines[1].startswith('name'.ljust(len('a-very-long-config')))
+        assert len(lines[2].split('  ')[0]) == len('a-very-long-config')
+        assert lines[3].startswith('a-very-long-config')
+
+    def test_trailing_padding_is_stripped(self):
+        # Invisible trailing whitespace makes an otherwise-identical table
+        # differ byte-for-byte, and it hides a line's real ending — the
+        # per-config mean block asserts on a trailing '-' meaning "nothing
+        # scored", which must never read as 0.0000.
+        from orchestrator.evals.report import _render_fixed_table
+
+        lines = _render_fixed_table(
+            self._COLUMNS,
+            [{'name': 'a', 'score': 'a-long-score-cell'}, {'name': 'b', 'score': '-'}],
+            header='demo:',
+        )
+        assert all(ln == ln.rstrip() for ln in lines)
+        assert lines[-1].endswith('-')
+
+    def test_empty_rows_still_render_headers_and_rule(self):
+        # No rows must not mean no table: the header/rule still render at the
+        # header widths rather than raising on the max() of an empty sequence.
+        from orchestrator.evals.report import _render_fixed_table
+
+        lines = _render_fixed_table(self._COLUMNS, [], header='demo:')
+        assert lines[0] == 'demo:'
+        assert lines[1] == 'name  score'
+        assert lines[2] == '----  -----'
+        assert len(lines) == 3
+
+    def test_header_is_optional(self):
+        from orchestrator.evals.report import _render_fixed_table
+
+        lines = _render_fixed_table(self._COLUMNS, [])
+        assert lines[0] == 'name  score'
+
+
+# ---------------------------------------------------------------------------
 # Task 2477 step-13: compute_aggregate_ratings — UNION, not intersection.
 # ---------------------------------------------------------------------------
 
