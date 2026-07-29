@@ -13487,10 +13487,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         here; CAS advance_main and lease release are deferred to _finalize_inflight.
 
         LOCAL lease (lease.is_local=True):
-            Warm-swap runs: _verify_attempt_count incremented,
-            _acquire_warm_verify_worktree called, runner=None so the internal
-            LocalRunner sees the POST-swap merge_wt (byte-identical single-host
-            path).
+            Warm-swap runs: _acquire_warm_verify_worktree called, runner=None
+            so the internal LocalRunner sees the POST-swap merge_wt
+            (byte-identical single-host path).  _verify_attempt_count advances
+            only once that acquire has SUCCEEDED — i.e. only for attempts that
+            actually reach a verify; an attempt DEFERRED because the
+            merge-verify lane was unavailable leaves it untouched (task 3003),
+            so the periodic cold-verify safety valve it drives cannot be
+            advanced by attempts that never verified anything.
 
         REMOTE lease (lease.is_local=False):
             No warm-swap, no _verify_attempt_count increment.
@@ -13565,9 +13569,20 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # _verifier_loop finalize-head BaseException handler — which resolved
                 # the future as 'blocked' but did NOT clean the ephemeral merge
                 # worktree (a regression vs. the old _verifier_loop except clause).
-                self._verify_attempt_count += 1
+                #
+                # task 3003 (reviewer's secondary finding): the attempt counter
+                # is STAGED here and only committed once the warm acquire has
+                # SUCCEEDED. It drives the periodic cold-verify safety valve, so
+                # it must count attempts that actually reached a verify — a
+                # lane-unavailable DEFER (or any other acquire failure: no
+                # verify ran either way) would otherwise burn through the
+                # valve's period and fire a from-scratch cold verify for
+                # nothing. _safety_valve_due still receives the 1-BASED count it
+                # documents, so the valve fires on exactly the same Nth real
+                # attempt as before. This is the sole increment site.
+                _attempt_n = self._verify_attempt_count + 1
                 _due = _safety_valve_due(
-                    self._verify_attempt_count,
+                    _attempt_n,
                     req.config.git.persistent_merge_worktree_safety_valve_every_n,
                 )
                 merge_wt, _spec_warm = await _acquire_warm_verify_worktree(
@@ -13575,6 +13590,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     safety_valve_due=_due,
                     speculative=item.speculative,
                 )
+                self._verify_attempt_count = _attempt_n
                 assert merge_wt is not None
                 if merge_wt is not item.merge_wt:
                     self._deregister_owned_merge_worktree(item.merge_wt)
@@ -13879,6 +13895,22 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             #      workflow_types.py already declared this policy; before 3003
             #      only the merge worker disagreed.
             #
+            # The completed policy, as one story (task 3003 review fixes):
+            # a defer is TRANSIENT BUT BOUNDED, never an unbounded spin.
+            #   - it is THROTTLED to CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS
+            #     between attempts, which the two bounded-wait raisers have
+            #     already paid inside their acquire and the immediate
+            #     pre-check has not;
+            #   - the unbroken streak escalates to a single ERROR at the
+            #     CROSSING of CONTENDED_LEASE_REQUEUE_WARN_STREAK, with a
+            #     per-defer WARNING heartbeat either side of it;
+            #   - and continuous contention past MAX_CONTENDED_LEASE_DEFER_SECS
+            #     stops deferring and resolves terminally as 'blocked', with a
+            #     reason carrying the elapsed seconds and the streak count so
+            #     consecutive cap-outs stay signature-DISTINCT and cannot
+            #     re-feed the consecutive_merge_thrash ladder this whole task
+            #     was chartered to stop.
+            #
             # In BOTH reset cases (2 and 3) the exception fires before
             # verify_task exists at all, so merge_wt is still the ephemeral
             # item.merge_wt and _spec_warm is still False — precisely what
@@ -13946,7 +13978,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 if not req.result.done():
                     req.result.set_result(err_outcome)
                 return InflightVerifyResult(outcome=err_outcome, merge_wt=None)
-            if _contended_streak >= self.CONTENDED_LEASE_REQUEUE_WARN_STREAK:
+            if _contended_streak == self.CONTENDED_LEASE_REQUEUE_WARN_STREAK:
+                # task 3003 (review fix 3): `==`, not `>=` — this ERROR marks
+                # the CROSSING, once. A `>=` test re-alarms on every defer past
+                # the threshold, which against a genuinely wedged holder is
+                # thousands of identical lines telling the operator nothing
+                # new. Defers past the crossing fall to the `else` WARNING
+                # below (which carries the running streak count), so the
+                # per-defer heartbeat is preserved and only the alarm is
+                # de-duplicated. The streak is closed out loudly at the other
+                # end by the terminal MAX_CONTENDED_LEASE_DEFER_SECS cap above.
+                #
                 # task 3003: the "~N min of continuous contention" estimate is
                 # only meaningful for the two BOUNDED-WAIT raisers, which carry
                 # wait_secs. MergeVerifyLeaseHeld has no such attribute — its
