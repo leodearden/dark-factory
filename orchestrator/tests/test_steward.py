@@ -3506,3 +3506,73 @@ class TestCappedEscalationIsTerminal:
         assert '--task-id' in cmd and cmd[cmd.index('--task-id') + 1] == '42'
         assert '--level' in cmd and cmd[cmd.index('--level') + 1] == '0'
         assert '--queue-dir' in cmd
+
+    async def test_run_loop_does_not_respin_on_a_capped_escalation(
+        self, steward, mock_config,
+    ):
+        """The ~13/s incident signature, pinned against the REAL ``_run_loop``.
+
+        Fix A is deliberately NEUTRALISED here so fix B is tested in
+        isolation: ``escalation_queue.resolve`` is a no-op ``MagicMock`` and
+        the pending read keeps returning the SAME record forever — exactly
+        the state the queue would be in if the dismissal had never happened.
+        Fix B alone must still bound the loop.
+
+        Before fix B this loop re-handled the same escalation at loop speed
+        with no sleep and no state change: ``_dismiss_capped_l0`` pops
+        ``_retry_counts``, so ``retry_count`` fell back to 0, the cap guard
+        did not re-fire, and every subsequent iteration ran a FULL agent
+        invocation against a record nothing would ever clear (1,183,854 log
+        lines in 20.5h on reify 5189).
+        """
+        mock_config.steward_max_attempts = 1
+        esc = _make_escalation(id='esc-42-1')
+        steward._retry_counts['esc-42-1'] = 1
+        steward.set_outcome_channel(asyncio.Queue())
+        wip_probe = AsyncMock(return_value=True)
+        steward.set_wip_probe(wip_probe)
+        steward.escalation_queue.get_by_task.return_value = [esc]
+
+        handles = 0
+        real_handle = steward._handle_escalation
+
+        async def counting_handle(escalation):
+            nonlocal handles
+            handles += 1
+            await real_handle(escalation)
+
+        with (
+            patch.object(steward, '_handle_escalation', counting_handle),
+            patch.object(
+                steward, '_watch_for_escalation', new_callable=AsyncMock,
+            ) as mock_watch,
+            patch(
+                'orchestrator.steward.invoke_agent', new_callable=AsyncMock,
+            ) as mock_invoke,
+        ):
+            # A watcher that blocks is the healthy steady state: once the
+            # capped record is filtered out there is nothing else pending.
+            mock_watch.side_effect = lambda: asyncio.sleep(30)
+            mock_invoke.return_value = _make_result()
+
+            loop_task = asyncio.create_task(steward._run_loop())
+            with contextlib.suppress(asyncio.TimeoutError, TimeoutError):
+                await asyncio.wait_for(loop_task, 0.5)
+            loop_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await loop_task
+
+        assert handles <= 2, (
+            f'a capped escalation must be re-handled O(1) times, not at loop '
+            f'speed — {handles} handles in a 0.5s window'
+        )
+        assert wip_probe.await_count == 1, (
+            'exactly one handle may get past the capped-id early return; '
+            'the wip probe is a `git rev-list` subprocess, which is what '
+            'made the spin expensive as well as noisy'
+        )
+        assert mock_invoke.await_count == 0, (
+            'a capped escalation must never reach an agent invocation — '
+            'popping _retry_counts on the give-up is what let the next '
+            'iteration fall straight through the cap guard'
+        )
