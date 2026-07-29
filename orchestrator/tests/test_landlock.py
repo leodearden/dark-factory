@@ -151,6 +151,79 @@ class TestLandlockEnforcement:
 
 
 # ---------------------------------------------------------------------------
+# Test 3b: REFER (cross-directory rename) — fleet-outage regression guard
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(
+    landlock_mod._syscall_probe_abi() < 2,
+    reason='landlock ABI < 2 has no REFER; the wrapper correctly omits it there',
+)
+class TestLandlockRefer:
+    """Guard against re-omitting LANDLOCK_ACCESS_FS_REFER from the ruleset.
+
+    When ``handled_access_fs`` omits REFER, the kernel denies *every* rename
+    that reparents a file across directories — surfaced to userspace as EXDEV,
+    even within one granted tree on a single filesystem. rustc's
+    ``encode_and_write_metadata`` writes ``.rmeta`` into a temp subdirectory
+    and renames it up one level, so that omission broke every ``cargo
+    build/check/test`` under the sandbox, on untouched dependency crates as
+    much as on edited ones. It took the whole fleet down on 2026-07-29.
+
+    The second test is the other half of the contract: REFER must restore
+    rename *within* the writable set without widening that set.
+    """
+
+    def test_cross_directory_rename_inside_writable_tree_is_allowed(self):
+        base = Path(tempfile.mkdtemp(prefix='landlock-refer-', dir='/var/tmp'))
+        try:
+            worktree = base / 'wt'
+            worktree.mkdir()
+            mod = worktree / 'mod_a'
+            (mod / 'sub').mkdir(parents=True)
+            (mod / 'sub' / 'f').write_text('x')
+
+            inner = [
+                '/bin/sh', '-c',
+                f'mv {mod}/sub/f {mod}/f_moved && echo refer_ok',
+            ]
+            cmd = build_landlock_command(inner, worktree, ['mod_a'])
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+
+            assert result.returncode == 0, f'stderr={result.stderr}'
+            assert 'refer_ok' in result.stdout
+            assert (mod / 'f_moved').exists()
+            assert not (mod / 'sub' / 'f').exists()
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+    def test_refer_does_not_widen_the_write_boundary(self):
+        """Renaming OUT of the writable set stays denied even with REFER."""
+        base = Path(tempfile.mkdtemp(prefix='landlock-refer-esc-', dir='/var/tmp'))
+        try:
+            worktree = base / 'wt'
+            worktree.mkdir()
+            mod = worktree / 'mod_a'
+            mod.mkdir()
+            (mod / 'f').write_text('x')
+            outside = base / 'outside'
+            outside.mkdir()
+
+            inner = [
+                '/bin/sh', '-c',
+                f'(mv {mod}/f {outside}/escaped 2>/dev/null || echo escape_denied) && echo end',
+            ]
+            cmd = build_landlock_command(inner, worktree, ['mod_a'])
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+
+            assert result.returncode == 0, f'stderr={result.stderr}'
+            assert 'escape_denied' in result.stdout
+            assert not (outside / 'escaped').exists()
+            assert (mod / 'f').exists()
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
 # Test 4: invoke.py dispatches to the correct backend
 # ---------------------------------------------------------------------------
 
