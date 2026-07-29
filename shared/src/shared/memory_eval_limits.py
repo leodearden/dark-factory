@@ -39,15 +39,19 @@ import math
 
 __all__ = [
     'binomial_two_sided_p',
+    'poisson_two_sided_p',
 ]
 
 _PMF_TIE_SLACK = 1e-9
 """Relative slack when asking "is this outcome at most as probable as the observed one?".
 
-A float-representation allowance, not a calibrated threshold. The mirrored
-outcome of a symmetric case has the same pmf in exact arithmetic but can differ
-in the last ulp once computed; without the slack it would be dropped from the
-acceptance set and the p-value would silently lose a whole tail.
+A float-representation allowance, not a calibrated threshold. Exact ties are
+routine here and each one is a whole chunk of mass: the mirrored outcome of a
+symmetric binomial, and — for an integer ``lam`` — the Poisson pmf plateau
+where ``pmf(lam - 1) == pmf(lam)``. Both are equal in exact arithmetic but can
+differ in the last ulp once computed in floating point, and without the slack
+the tie would be dropped from the acceptance set and the p-value would silently
+lose a whole tail.
 """
 
 
@@ -94,3 +98,83 @@ def binomial_two_sided_p(k: int, n: int, p0: float) -> float:
     observed = pmf[k]
     total = math.fsum(p for p in pmf if p <= observed * (1.0 + _PMF_TIE_SLACK))
     return min(1.0, total)
+
+
+def _poisson_pmf(i: int, lam: float) -> float:
+    """P(X = i) for X ~ Poisson(lam), computed in log space.
+
+    ``lam**i / i!`` overflows both ways well inside the range of counts this
+    module sees, so the pmf is assembled as ``exp(i*log(lam) - lam -
+    lgamma(i+1))`` instead. ``math.exp`` underflows silently to 0.0 for a
+    sufficiently negative argument (it only raises on overflow), which is what
+    makes the far right tail terminate structurally rather than by a horizon
+    constant. Caller guarantees ``lam > 0``.
+    """
+    return math.exp(i * math.log(lam) - lam - math.lgamma(i + 1))
+
+
+def poisson_two_sided_p(k: int, lam: float) -> float:
+    """Exact two-sided Poisson p-value for *k* events under rate *lam*.
+
+    Rule (c)'s engine: how surprising is the current run's count, given the
+    mean rate over the trailing baseline window?
+
+    Same method of small p-values as :func:`binomial_two_sided_p` — the total
+    probability of every outcome no more probable than the observed one — so
+    the two rule kinds share one reviewed idea. Note this is emphatically NOT a
+    doubled one-tail: at ``k=0, lam=5`` the correct answer is 0.012191 because
+    the sum also sweeps the far right tail, whereas ``exp(-5)`` is 0.006738 and
+    twice it is 0.013476.
+
+    Termination is the one thing the Poisson support makes interesting: it is
+    unbounded on the right, so there is no support to enumerate. Rather than
+    invent a horizon constant — which would be exactly the a-priori numeric
+    threshold G6 forbids — the right tail is walked outward from the mode and
+    stopped on two structural conditions: the pmf underflowing float64 to
+    literal zero, or a term too small to change the running sum at double
+    precision. Terms past that point cannot alter the result.
+
+    A degenerate ``lam`` of 0 is answered rather than rejected (a baseline
+    window of all-zero counts is a real input — a probe that has never fired):
+    zero events is certain, any other count is impossible. Raises
+    ``ValueError`` for a negative *k* or *lam* — those are caller bugs, not
+    data.
+    """
+    if k < 0:
+        raise ValueError(f'poisson_two_sided_p: k={k} must be non-negative.')
+    if lam < 0:
+        raise ValueError(f'poisson_two_sided_p: lam={lam} must be non-negative.')
+    if lam == 0:
+        return 1.0 if k == 0 else 0.0
+
+    threshold = _poisson_pmf(k, lam) * (1.0 + _PMF_TIE_SLACK)
+    mode = int(lam)
+    terms: list[float] = []
+
+    # Left shoulder. The pmf is non-decreasing on [0, mode], so the qualifying
+    # outcomes form a contiguous prefix and the first failure ends it.
+    for i in range(mode + 1):
+        left = _poisson_pmf(i, lam)
+        if left > threshold:
+            break
+        terms.append(left)
+
+    # Right tail, walked outward from the mode. The pmf is non-increasing here,
+    # so once an outcome qualifies every later one does too; the skip phase
+    # ends and the accumulate phase begins at the same crossing. `running` is a
+    # plain sum used ONLY to detect negligibility — the returned total is an
+    # fsum over the collected terms, so the adaptive stop costs no accuracy.
+    running = 0.0
+    i = mode + 1
+    while True:
+        right = _poisson_pmf(i, lam)
+        if right == 0.0:
+            break  # the pmf has underflowed float64: nothing representable remains
+        if right <= threshold:
+            if running > 0.0 and running + right == running:
+                break  # and neither can any later term, since they only shrink
+            terms.append(right)
+            running += right
+        i += 1
+
+    return min(1.0, math.fsum(terms))
