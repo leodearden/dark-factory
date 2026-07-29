@@ -3508,7 +3508,7 @@ class TestCappedEscalationIsTerminal:
         assert '--queue-dir' in cmd
 
     async def test_run_loop_does_not_respin_on_a_capped_escalation(
-        self, steward, mock_config,
+        self, steward, mock_config, caplog,
     ):
         """The ~13/s incident signature, pinned against the REAL ``_run_loop``.
 
@@ -3552,15 +3552,23 @@ class TestCappedEscalationIsTerminal:
         ):
             # A watcher that blocks is the healthy steady state: once the
             # capped record is filtered out there is nothing else pending.
-            mock_watch.side_effect = lambda: asyncio.sleep(30)
+            # Must be an async def, not `lambda: asyncio.sleep(30)`: an
+            # AsyncMock with a SYNC side_effect returns whatever it returns
+            # verbatim, so the lambda hands back an un-awaited coroutine and
+            # the loop dies on `esc.level` instead of idling.
+            async def _blocking_watch():
+                await asyncio.sleep(30)
+
+            mock_watch.side_effect = _blocking_watch
             mock_invoke.return_value = _make_result()
 
             loop_task = asyncio.create_task(steward._run_loop())
-            with contextlib.suppress(asyncio.TimeoutError, TimeoutError):
-                await asyncio.wait_for(loop_task, 0.5)
-            loop_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await loop_task
+            with caplog.at_level(logging.WARNING, logger='orchestrator.steward'):
+                with contextlib.suppress(asyncio.TimeoutError, TimeoutError):
+                    await asyncio.wait_for(loop_task, 0.5)
+                loop_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await loop_task
 
         assert handles <= 2, (
             f'a capped escalation must be re-handled O(1) times, not at loop '
@@ -3576,3 +3584,16 @@ class TestCappedEscalationIsTerminal:
             'popping _retry_counts on the give-up is what let the next '
             'iteration fall straight through the cap guard'
         )
+
+        # The idle state must be diagnosable in journald, and loud EXACTLY
+        # once: silence is indistinguishable from a wedged steward, but a
+        # per-iteration line would just be a slower version of the incident.
+        idle_lines = [
+            r for r in caplog.records
+            if 'awaiting workflow disposition' in r.getMessage()
+        ]
+        assert len(idle_lines) == 1, (
+            f'the capped-only idle state must be announced exactly once per '
+            f'entry into it; got {len(idle_lines)} lines'
+        )
+        assert idle_lines[0].levelno == logging.WARNING

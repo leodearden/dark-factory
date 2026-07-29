@@ -132,6 +132,10 @@ class TaskSteward:
         # and honoured at three sites: _handle_escalation's early return,
         # _next_escalation's filter, and the watcher's --exclude-id argv.
         self._capped_escalations: set[str] = set()
+        # Loud-ONCE guard for the capped-only idle state (see
+        # _log_capped_idle_once).  Reset whenever a non-capped escalation is
+        # handled, so a later relapse into the idle state logs again.
+        self._capped_idle_logged = False
         self.metrics = StewardMetrics()
 
         # Outcome channel (task 2248 / W9-delta): the workflow registers a
@@ -216,6 +220,12 @@ class TaskSteward:
         - ``_loop_error_count``: an unconditional backstop on the generic
           ``except Exception`` path so any other persistent failure (MCP
           unreachable, etc.) is bounded.
+        - ``_capped_escalations`` (task 3170): an escalation this steward has
+          given up on is TERMINAL for it, so ``_next_escalation`` filters it
+          out and this loop falls into its 1s backoff instead of re-handling
+          it forever.  Entry into that idle state is announced once via
+          ``_log_capped_idle_once`` — the flag is cleared below whenever a
+          live escalation is handled.
         """
         from orchestrator.git_ops import WorktreeMissing
 
@@ -228,10 +238,13 @@ class TaskSteward:
                     break
                 if escalation is None:
                     # Transient failure (watcher crash, non-level-0 event,
-                    # parse error).  Brief backoff before retrying.
+                    # parse error) OR the capped-only idle state.  Brief
+                    # backoff before retrying either way.
+                    self._log_capped_idle_once()
                     await asyncio.sleep(1)
                     continue
                 await self._handle_escalation(escalation)
+                self._capped_idle_logged = False  # a live escalation ends the idle state
                 loop_error_count = 0  # reset on a clean iteration
             except asyncio.CancelledError:
                 raise
@@ -310,6 +323,13 @@ class TaskSteward:
         ]
         if pending:
             return pending[0]
+
+        # Everything pending was filtered out as capped: this steward is now
+        # idle holding escalations only the workflow can dispose of, and is
+        # about to BLOCK on the watcher.  Announce it here rather than only on
+        # `_run_loop`'s None path — in the steady state the watcher blocks on
+        # inotify and never returns, so the None path is not reached.
+        self._log_capped_idle_once()
 
         esc = await self._watch_for_escalation()
         if esc is not None and esc.level != 0:
@@ -934,6 +954,28 @@ class TaskSteward:
     # ------------------------------------------------------------------
     # Give-up without an L1 hand-off (task-2060 resume-plan branches)
     # ------------------------------------------------------------------
+
+    def _log_capped_idle_once(self) -> None:
+        """Announce the capped-only idle state, once per entry into it.
+
+        Making this state EXPLICIT is the point (task 3170, fix B): the
+        incident's tell was a million identical lines with no state change,
+        and the fix's success signal is the opposite — silence.  Silence is
+        indistinguishable from a wedged steward in journald, so the
+        transition into "idle, holding capped escalations the workflow has
+        not disposed of yet" is logged loudly exactly once.  ``_run_loop``
+        clears the flag whenever it handles a live escalation, so a later
+        relapse into this state is announced again rather than swallowed.
+        """
+        if not self._capped_escalations or self._capped_idle_logged:
+            return
+        self._capped_idle_logged = True
+        logger.warning(
+            f'Steward for task {self.task_id}: idle with '
+            f'{len(self._capped_escalations)} capped escalation(s) awaiting '
+            f'workflow disposition; not re-handling '
+            f'({", ".join(sorted(self._capped_escalations))})'
+        )
 
     def _mark_capped(self, escalation_id: str) -> None:
         """Record that this steward has permanently given up on *escalation_id*.
