@@ -3468,3 +3468,41 @@ class TestCappedEscalationIsTerminal:
             'the watcher must still be consulted so the loop blocks on '
             'inotify instead of hot-returning the capped record'
         )
+
+    async def test_watcher_argv_excludes_capped_ids(self, steward):
+        """Capped ids must be passed to the watcher as ``--exclude-id``.
+
+        This is the flag that stops the SUBPROCESS-spawn spin. Filtering in
+        ``_next_escalation`` alone is NOT sufficient: ``escalation/watcher.py``
+        arms inotify and then runs ``_initial_scan``, which emits an
+        already-pending match IMMEDIATELY and exits.  So a still-pending
+        capped record makes every watcher call return instantly, and the loop
+        re-spins at subprocess-spawn rate rather than blocking on inotify.
+        """
+        steward._capped_escalations = {'esc-42-1', 'esc-42-2'}
+
+        with patch(
+            'asyncio.create_subprocess_exec', new_callable=AsyncMock,
+        ) as mock_exec:
+            proc = AsyncMock()
+            proc.returncode = 0
+            proc.communicate.return_value = (b'', b'')
+            mock_exec.return_value = proc
+            await steward._watch_for_escalation()
+
+        cmd = list(mock_exec.call_args[0])
+        pairs = [
+            (cmd[i], cmd[i + 1]) for i in range(len(cmd) - 1)
+            if cmd[i] == '--exclude-id'
+        ]
+        assert pairs == [
+            ('--exclude-id', 'esc-42-1'), ('--exclude-id', 'esc-42-2'),
+        ], (
+            f'both capped ids must be excluded, in sorted order for a '
+            f'deterministic argv; got {cmd!r}'
+        )
+
+        # The pre-existing flags must survive alongside the new ones.
+        assert '--task-id' in cmd and cmd[cmd.index('--task-id') + 1] == '42'
+        assert '--level' in cmd and cmd[cmd.index('--level') + 1] == '0'
+        assert '--queue-dir' in cmd
