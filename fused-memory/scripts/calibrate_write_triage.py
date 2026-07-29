@@ -496,9 +496,8 @@ def write_triage_config_block(
         return yaml_text + separator + block
 
     # Scan to the next line that opens a new TOP-LEVEL key (column 0, not a
-    # comment and not blank). Anything indented, blank or commented belongs to
-    # this block. Bounding the span this way is what keeps a section declared
-    # after write_triage from being eaten.
+    # comment and not blank). Bounding the span this way is what keeps a
+    # section declared after write_triage from being eaten.
     end = len(lines)
     for i in range(start + 1, len(lines)):
         line = lines[i]
@@ -506,14 +505,19 @@ def write_triage_config_block(
             end = i
             break
 
-    # Trailing blank lines inside the span belong between the sections, not to
-    # the block — preserve them so spacing survives the replacement.
-    trailing = ''
-    while end > start + 1 and not lines[end - 1].strip():
-        trailing = lines[end - 1] + trailing
+    # Then walk `end` back: a run of COLUMN-0 comment lines, plus any blank
+    # lines before it, is the HEADER for the section that FOLLOWS — that is
+    # config.yaml's convention throughout (see the 6-line comment block before
+    # `summary_rebuild:`). It must survive the replacement rather than being
+    # consumed as block-internal. The column-0 test is deliberately
+    # `startswith('#')` and NOT `lstrip().startswith('#')`: an INDENTED comment
+    # belongs to the block it sits inside, so the walk stops at it.
+    while end > start + 1 and (not lines[end - 1].strip() or lines[end - 1].startswith('#')):
         end -= 1
 
-    return ''.join(lines[:start]) + block + trailing + ''.join(lines[end:])
+    # No trailing accumulator: `lines[end:]` already emits every reclaimed line
+    # verbatim, so collecting them separately would double-emit them.
+    return ''.join(lines[:start]) + block + ''.join(lines[end:])
 
 
 def render_markdown(report: dict[str, Any]) -> str:
