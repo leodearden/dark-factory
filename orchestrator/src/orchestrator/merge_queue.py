@@ -15611,8 +15611,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # Firing the FINALIZING hop here (before the await) would mislabel a
             # wedged verify as finalizing (regression caught by esc-2173-6:
             # test_wedged_verify_is_armed_and_alarmed_then_resolves_cleanly). The hop
-            # now fires just past the await, before any sentinel/RU/fail/pass handling
-            # (all of which already assume FINALIZING).
+            # now fires just past the await AND just past the DROPPED/REQUEUED
+            # sentinel check (task 3082 — a dropped/requeued item is not
+            # finalizing), before the RU/fail/pass handling (all of which already
+            # assume FINALIZING).
 
             # ── Pre-dispatch sentinels (abandon / operator-halt) ─────────────────────
             # Handled inline in _dispatch_item: merge_wt already cleaned, req already
@@ -15651,6 +15653,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             if entry.verify_task is not None:
                 vr = await entry.verify_task
 
+            # ── (c) DROPPED / REQUEUED sentinels ────────────────────────────
+            # Deliberately ABOVE the VERIFYING -> FINALIZING hop below (task
+            # 3082): a DROPPED or REQUEUED item is NOT finalizing and must
+            # never be recorded as such.
+            if vr is not None and vr.status in (InflightStatus.DROPPED, InflightStatus.REQUEUED):
+                _cancel_release = True
+                _n_failed_val = True  # abandon / operator-halt → chain stale
+                return False
+
             # MQ-reliability lambda (task 2173): the verify await has returned, so
             # the item is now genuinely finalizing — fire the VERIFYING -> FINALIZING
             # hop here (deferred from the _finalizing_head assignment above so a
@@ -15658,9 +15669,36 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # before: passthrough / pre-dispatch-sentinel entries already returned
             # above and never reach here, but keep the guard explicit so the legal
             # edge (VERIFYING -> FINALIZING) is never mis-applied to an entry sitting
-            # at DISPATCHING/QUEUED. Every path below (DROPPED/REQUEUED, RUNNER_
-            # UNAVAILABLE's FINALIZING -> MERGING, FAIL/skip, PASS) already assumes
-            # FINALIZING as its from-state.
+            # at DISPATCHING/QUEUED. Every path below (RUNNER_UNAVAILABLE's
+            # FINALIZING -> MERGING, FAIL/skip, PASS) already assumes FINALIZING as
+            # its from-state.
+            #
+            # task 3082 (INVARIANT, and the reason this hop sits HERE rather than
+            # immediately past the await): a DROPPED or REQUEUED item is not
+            # finalizing and must never be recorded as such. This hop therefore
+            # runs AFTER the DROPPED/REQUEUED sentinel check above, so a
+            # dropped/requeued entry never reaches it at all. That is what makes
+            # the requeue-site `_note_requeue` asymmetry harmless in BOTH
+            # directions — measured on the two shapes a requeue can present:
+            #   · registry left at VERIFYING (a requeue site that skipped
+            #     `_note_requeue`): the hop would fire SILENTLY, record the
+            #     requeued item as FINALIZING and swap `_live_items[rid]` to this
+            #     InflightEntry, so `_finalizing_head_entry()` returns a phantom
+            #     head for the rest of the process lifetime.
+            #   · registry already bounced to QUEUED (what every correctly-wired
+            #     requeue site produces): `_advance_if_at` neither fires nor
+            #     tolerates QUEUED, so it falls through to `_note_transition` and
+            #     fires a dedup'd `merge_lifecycle_transition_rejected` L1 on
+            #     EVERY dead-verify no-progress abort — a legitimate, expected,
+            #     recurring event.
+            # Both dispositions of the pre-3082 placement were wrong, so fixing
+            # only one produced the other; keeping the sentinel check above is
+            # correct by construction in both directions and retires the
+            # rejected-transition class here as a side effect.
+            #
+            # SUPERSEDES task 2444's placement, which moved this hop to just past
+            # the `await` — necessary but not sufficient: it must sit after the
+            # SENTINEL CHECK, not merely after the await.
             #
             # task 2852 (SHARPER RCA mr-99585bb8): routed through _advance_if_at
             # instead of a hardcoded-from_state _note_transition call — a
@@ -15717,12 +15755,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         ItemLifecycleState.TERMINAL,
                     }),
                 )
-
-            # ── (c) DROPPED / REQUEUED sentinels ────────────────────────────
-            if vr is not None and vr.status in (InflightStatus.DROPPED, InflightStatus.REQUEUED):
-                _cancel_release = True
-                _n_failed_val = True  # abandon / operator-halt → chain stale
-                return False
 
             # ── (d) RUNNER_UNAVAILABLE ───────────────────────────────────────
             # Remote runner died.  Quarantine the host (so acquire() skips it)
