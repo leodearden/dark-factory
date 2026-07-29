@@ -391,7 +391,7 @@ def _census(payloads: list[dict]) -> object:
 def _coverage(
     collection: str,
     collection_points: int,
-    categories: dict[str, tuple[int, ...]],
+    categories: dict[str, tuple[int, int] | tuple[int, int, int]],
 ) -> dict:
     """Build a per-project coverage record.
 
