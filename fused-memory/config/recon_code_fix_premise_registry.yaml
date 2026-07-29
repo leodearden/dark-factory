@@ -117,15 +117,31 @@
     is pending in the queue root. The orchestrator side is already
     archive-inclusive (deterministic_runner.py calls get_by_task with no
     status filter — task 2954, commit 403c978) and is NOT the defect.
-    Task 3023 additionally exposed get_task_escalations on the escalation MCP
-    surface and pointed both stages at it, so an auditor can now disconfirm
-    this hypothesis directly. Any recurrence should be dropped without an LLM
-    call while the archive-inclusive scan and that guidance remain in place.
-    Anchored on assertion-of-absence phrasings only (NOT a bare
-    "gate_escalated_at" token), so a legitimate proposal to improve this area
-    still reaches the architect — pinned by
+    Task 3023 exposed get_task_escalations on the escalation MCP surface for
+    ORCHESTRATOR-side agents (architect / implementer / steward / watcher, port
+    8102). Recon stages CANNOT reach it: their `escalation` MCP server is backed
+    by the RECONCILIATION queue (data/reconciliation/escalations, port 8103 —
+    ReconciliationConfig.escalation_queue_dir), a different store from
+    data/escalations (port 8102, dark-factory-orchestrator.yaml), so no
+    mcp__escalation__* result available to a stage can establish absence. Task
+    3023 therefore points Stage 1 / Stage 2 at that queue split and makes the
+    POSITIVE rule primary and sufficient: status='done' PLUS
+    metadata.gate_escalated_at PLUS a deterministic-gate done_provenance, read
+    via mcp__fused-memory__get_task, IS legitimate closure. Any recurrence
+    should be dropped without an LLM call while the archive-inclusive scan and
+    that guidance remain in place. Anchored on assertion-of-absence phrasings
+    only (NOT a bare "gate_escalated_at" token), so a legitimate proposal to
+    improve this area still reaches the architect — pinned by
     tests/test_recon_code_fix_premise_guard.py::TestSeedRegistryRealSource::
-    test_legitimate_archive_inclusive_lookup_proposal_is_not_dropped.
+    test_legitimate_archive_inclusive_lookup_proposal_is_not_dropped, whose
+    candidate title carries BOTH anchor tokens by construction so the
+    description anchor is genuinely exercised (match_candidate requires ALL
+    title_substrings). Two executable guards back that test: a
+    dataclasses.replace mutation control asserting the candidate DOES match
+    once description_substrings is widened to a bare "gate_escalated_at"
+    token, and the inverse control
+    test_absence_phrasing_with_same_title_does_match (same title, absence
+    phrasing, matches).
   title_substrings:
     - "deterministic"
     - "escalation"
@@ -143,12 +159,15 @@
       must_contain:
         - "def get_by_task"
         - "_iter_archive_paths"
-    # The disconfirming tool the Stage 1/2 guidance points auditors at. The
-    # guidance prose is a shared constant in prompts/__init__.py (it is
-    # interpolated into the stage f-strings, so the literal tool name appears
-    # HERE, not in stage1.py/stage2.py). If get_task_escalations is ever
-    # retired, this assertion stops holding and the guard self-corrects,
-    # letting the candidate through to a human.
+    # Pins that the Stage 1/2 guidance still NAMES the archive-inclusive lookup
+    # and explains the queue split — get_task_escalations is the ORCHESTRATOR-
+    # side (port 8102) probe that recon stages cannot reach, which is exactly
+    # why the guidance tells an auditor its own empty escalation result is
+    # uninformative. The guidance prose is a shared constant in
+    # prompts/__init__.py (it is interpolated into the stage f-strings, so the
+    # literal tool name appears HERE, not in stage1.py/stage2.py). If
+    # get_task_escalations is ever retired, this assertion stops holding and
+    # the guard self-corrects, letting the candidate through to a human.
     - file: src/fused_memory/reconciliation/prompts/__init__.py
       must_contain:
         - "_GATE_CLOSURE_ARCHIVE_GUIDANCE"
