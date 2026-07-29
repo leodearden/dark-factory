@@ -791,3 +791,208 @@ class TestHeartbeatLoopReapWiring:
             'heartbeat step raised — it is a SEPARATE try/except, not '
             'short-circuited by the touch/heartbeat guard'
         )
+
+
+# ---------------------------------------------------------------------------
+# task 3018 (steps 13-14): the periodic sweep must not reuse the audit's
+# DETECTION grace as its DESTRUCTION deadline.
+#
+# Promoting reap_orphaned_merge_worktrees from a startup-only sweep to a
+# steady-state one (steps 1-8 above) silently re-purposed
+# RESOURCE_AUDIT_WORKTREE_GRACE_SECS from a *detection* threshold into a
+# *destruction* deadline.  Those are different questions with different right
+# answers: "old enough to be worth REPORTING" is deliberately eager, while
+# "old enough that destroying it cannot interrupt live work" must be
+# conservative.  Splitting them keeps detection eager (a tree in the band is
+# still reported every heartbeat) while giving destruction a strictly larger,
+# derived floor.
+#
+# This is defense-in-depth BEHIND the primary protection (steps 10/12: live
+# throwaway verify worktrees now hold merge_verify_lease(lane_dir=wt), so the
+# reap skips them via 'skipped_lease_held' regardless of age).  It exists to
+# cover any live-but-unleased tree on a path not yet enumerated.
+# ---------------------------------------------------------------------------
+
+
+def _shipped_cold_command_timeout_secs() -> float:
+    """The shipped per-command cold merge-verify budget from defaults.yaml.
+
+    Read from the packaged defaults rather than hardcoded so a retune of the
+    shipped budget is caught by the derivation assertion below instead of
+    silently invalidating it.
+    """
+    from orchestrator.config import _load_defaults
+
+    value = _load_defaults().get('merge_verify_cold_command_timeout_secs')
+    assert value is not None, (
+        'defaults.yaml no longer ships merge_verify_cold_command_timeout_secs — '
+        'the destructive floor below is DERIVED from it, so this test must be '
+        'updated alongside that removal rather than silently losing its basis'
+    )
+    return float(value)
+
+
+@pytest.mark.asyncio
+class TestPeriodicReapDestructiveFloor:
+    """The periodic sweep destroys only past PERIODIC_REAP_MIN_AGE_SECS (3018).
+
+    RED until step-14 GREEN adds PERIODIC_REAP_MIN_AGE_SECS and the
+    ``min_age_secs`` parameter: today the periodic helper destroys at the
+    detection grace, so a tree in the detect-but-do-not-destroy band is
+    deleted.
+    """
+
+    async def test_periodic_floor_exceeds_detection_grace_and_cold_ceiling(
+        self,
+    ) -> None:
+        """The floor is DERIVED, not guessed — assert the relations it must hold.
+
+        Asserts relations rather than the literal 21600.0 so a future retune of
+        either constant stays free as long as the derivation still holds.
+
+        (a) strictly above the DETECTION grace — otherwise the two thresholds
+            are the same number wearing two hats, which is exactly the
+            conflation this split exists to undo; and
+        (b) at or above 2x the shipped per-command cold budget.  That budget is
+            PER-COMMAND and a cold merge verify runs >=2 command phases (scoped
+            verify + unscoped typechecks) before counting worktree creation and
+            venv/dep seeding, so 2x it is the floor under the total-lifetime
+            ceiling of a legitimately slow cold verify.
+
+        This is also why the reviewer-suggested
+        INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS (10800) was NOT reused: it is
+        below that 2x ceiling, so it would not actually clear a slow cold
+        verify.
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        floor = SpeculativeMergeWorker.PERIODIC_REAP_MIN_AGE_SECS
+        detection_grace = SpeculativeMergeWorker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS
+        cold_ceiling = 2 * _shipped_cold_command_timeout_secs()
+
+        assert floor > detection_grace, (
+            f'the periodic DESTRUCTION floor ({floor}) must be strictly larger '
+            f'than the audit DETECTION grace ({detection_grace}) — reusing one '
+            f'number for both is the conflation this split exists to undo'
+        )
+        assert floor >= cold_ceiling, (
+            f'the periodic DESTRUCTION floor ({floor}) must clear the derived '
+            f'cold-verify total-lifetime ceiling ({cold_ceiling} = 2 x the '
+            f'shipped per-command cold budget), else a legitimately slow cold '
+            f'verify can still have its checkout deleted mid-run'
+        )
+        assert floor < 8 * 3600, (
+            f'the periodic DESTRUCTION floor ({floor}) must stay below the 8h '
+            f'fleet-redeploy window, else the periodic sweep reclaims nothing '
+            f'the next restart would not have reclaimed anyway — defeating the '
+            f'whole point of task 3018'
+        )
+
+    async def test_tree_past_detection_grace_but_below_floor_survives_periodic_sweep(
+        self, git_ops: GitOps,
+    ) -> None:
+        """A tree in the detect-but-do-not-destroy band must NOT be reaped."""
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = _GRACE
+        worker.PERIODIC_REAP_MIN_AGE_SECS = _GRACE * 3
+        worker._last_reap_at = 0.0
+
+        # Past DETECTION (age > _GRACE) but below the DESTRUCTION floor.
+        in_band = await _create_backdated_merge_worktree(git_ops, age=_GRACE + 10)
+
+        await worker._maybe_reap_orphaned_merge_worktrees(now=_NOW)
+
+        assert in_band.exists(), (
+            f'a worktree aged past the DETECTION grace but below the periodic '
+            f'DESTRUCTION floor must survive the sweep — it may still be a live '
+            f'verify: {in_band}'
+        )
+        registered = await _registered_worktree_paths(git_ops)
+        assert str(in_band) in registered, (
+            f'the surviving worktree must also still be registered with git '
+            f'(not half-torn-down): {registered}'
+        )
+
+    async def test_detection_still_flags_tree_below_destructive_floor(
+        self, git_ops: GitOps,
+    ) -> None:
+        """Detection is deliberately UNCHANGED — it keeps observing in the band.
+
+        The audit stays observation-only (PRD design decision 4) and keeps
+        flagging at RESOURCE_AUDIT_WORKTREE_GRACE_SECS, so a tree in the
+        detect-but-do-not-destroy band is still reported on every heartbeat.
+        It is simply not destroyed yet.  Raising the destruction floor must
+        NOT have silently raised the detection threshold with it.
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = _GRACE
+        worker.PERIODIC_REAP_MIN_AGE_SECS = _GRACE * 3
+        worker._last_reap_at = 0.0
+
+        in_band = await _create_backdated_merge_worktree(git_ops, age=_GRACE + 10)
+
+        await worker._maybe_reap_orphaned_merge_worktrees(now=_NOW)
+
+        violations = worker.worktree_ledger_violations(now=_NOW)
+        assert any(str(in_band) in v for v in violations), (
+            f'the audit must STILL flag the un-destroyed in-band worktree '
+            f'{in_band} — detect-early/destroy-late means the operator keeps '
+            f'seeing it every heartbeat, got violations={violations!r}'
+        )
+
+    async def test_tree_past_periodic_floor_is_reaped(self, git_ops: GitOps) -> None:
+        """Past the destruction floor, the periodic sweep still reclaims."""
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = _GRACE
+        worker.PERIODIC_REAP_MIN_AGE_SECS = _GRACE * 3
+        worker._last_reap_at = 0.0
+
+        aged = await _create_backdated_merge_worktree(git_ops, age=_GRACE * 3 + 10)
+
+        await worker._maybe_reap_orphaned_merge_worktrees(now=_NOW)
+
+        assert not aged.exists(), (
+            f'a worktree aged past the periodic DESTRUCTION floor must still be '
+            f'reclaimed in-run — raising the floor must not disable the sweep: '
+            f'{aged}'
+        )
+        registered = await _registered_worktree_paths(git_ops)
+        assert str(aged) not in registered, (
+            f'the reaped worktree must be gone from git worktree list: {registered}'
+        )
+
+    async def test_startup_reap_still_uses_detection_grace(
+        self, git_ops: GitOps,
+    ) -> None:
+        """The startup/harness caller is byte-identical — no floor applied.
+
+        ``Harness._reap_orphaned_merge_worktrees`` calls
+        ``reap_orphaned_merge_worktrees`` with no ``min_age_secs``, and at
+        startup there is by construction no in-process live verify to protect
+        (the worker's own loops have not run a verify yet).  Pins that the new
+        parameter defaults back to RESOURCE_AUDIT_WORKTREE_GRACE_SECS so that
+        caller's behaviour is unchanged.
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker
+
+        worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
+        worker.RESOURCE_AUDIT_WORKTREE_GRACE_SECS = _GRACE
+        worker.PERIODIC_REAP_MIN_AGE_SECS = _GRACE * 3
+
+        orphan = await _create_backdated_merge_worktree(git_ops, age=_GRACE + 10)
+
+        report = await worker.reap_orphaned_merge_worktrees(now=_NOW)
+
+        assert not orphan.exists(), (
+            f'the direct (startup/harness) caller must keep reaping at the '
+            f'DETECTION grace, not the larger periodic floor: {orphan}'
+        )
+        assert report['reaped'] == [str(orphan)], (
+            f"the startup sweep's report must be unchanged, got {report!r}"
+        )
