@@ -82,20 +82,41 @@ def _build_pattern(prefixes: tuple[str, ...]) -> re.Pattern[str]:
     A bare trailing ``<prefix>/`` at end-of-token deliberately does NOT match,
     because that is the bare-MENTION class ("see ``fused-memory/``", "the
     'corpus/' dir") and admitting it would re-admit almost all of the noise
-    this assertion exists to remove.  No real protection is lost: the
-    FILES-certain check (:func:`check_files_for_scope` ->
-    ``registry.project_for_path``) still hard-rejects a genuinely DECLARED
-    foreign file, and that path is untouched.
+    this assertion exists to remove.  For the ``submit_task`` path this loses
+    no real protection: the interceptor classifies ``metadata.files`` through
+    the FILES-certain check (:func:`check_files_for_scope` ->
+    ``registry.project_for_path``), which still hard-rejects a genuinely
+    DECLARED foreign file and is untouched by this change.
+
+    That backstop is specific to that path, and the guarantee is NOT blanket:
+    :func:`check_candidate_for_scope` folds ``files_to_modify`` into this same
+    prose scan with no certain-check fallback, so a declared *directory* entry
+    (``files_to_modify=['fused-memory/src']``) now goes undetected there —
+    measured: that call returns ``ok`` where :func:`check_files_for_scope`
+    returns ``rejection``.  Harmless today because that function has no
+    production caller (the interceptor imports only ``check_files_for_scope``
+    and ``check_text_for_scope``), but any future caller must route concrete
+    file entries through :func:`check_files_for_scope` rather than rely on
+    this heuristic scan.
 
     KNOWN FAIL-OPEN residue, deliberately not closed (each is pinned by a
     test so the gap stays visible rather than implied covered):
 
-    - leading-dot files — ``docs/.gitignore`` has an empty stem plus a
-      >6-char extension, so it satisfies neither right-context alternative;
+    - extensionless right context — ``<prefix>/<dir>`` and extensionless
+      filenames (``fused-memory/src``, ``crates/reify-eval``,
+      ``crates/README``) satisfy neither alternative.  This is the LARGEST
+      miss class, since bare directory references are a common prose
+      spelling; it is accepted anyway because admitting it would mean
+      accepting any ``<word>/<word>``, which is exactly the English-
+      punctuation shape this assertion exists to reject;
+    - extensions longer than 6 chars (the ``{1,6}`` cap) — ``docs/.gitignore``,
+      ``crates/x.markdown``, ``crates/x.properties`` fail the extension
+      alternative.  The mechanism is the LENGTH cap, NOT the leading dot: a
+      short-extension dotfile such as ``docs/.env`` still matches;
     - glob spellings — the metacharacter in ``plans/*.md`` is in neither the
       segment class nor the extension class.
 
-    Both are MISSED detections, never false ones — the same conservative
+    All three are MISSED detections, never false ones — the same conservative
     direction ``project_prefix_registry`` already takes for
     ``../other-repo/x.py`` and ``~user/...``.  Widening the character classes
     to admit them would start re-admitting the punctuation shapes above.
@@ -272,6 +293,15 @@ def check_candidate_for_scope(
     Scans ``title``, ``description``, ``details``, and
     ``files_to_modify``.  Returns ``ok`` when the registry is empty, when
     no prefixes match, or when every match is owned by ``project_id``.
+
+    CAVEAT (task 3120): ``files_to_modify`` entries are folded into the same
+    heuristic prose scan as the free text, so they inherit :func:`find_paths`'
+    right-boundary requirement — a declared *directory* entry such as
+    ``['fused-memory/src']`` is NOT detected here, and unlike the
+    interceptor's ``submit_task`` path there is no FILES-certain backstop
+    behind this function.  A caller that needs concrete file entries
+    classified with certainty must call :func:`check_files_for_scope` on them
+    as well; this function alone is a heuristic.
     """
     if not registry:
         return PathGuardVerdict(outcome='ok', project_id=project_id)
