@@ -328,7 +328,7 @@ def _isolate_warm_lane_script_dir(monkeypatch, tmp_path):
 
 
 @pytest.fixture
-def df_warm_lane_script_dir(monkeypatch, tmp_path):
+def df_warm_lane_script_dir(monkeypatch, tmp_path: Path):
     """Opt-in: re-point the dark-factory warm-lane script root at a stub dir.
 
     Counterpart to the autouse ``_isolate_warm_lane_script_dir`` above, which
