@@ -15657,9 +15657,58 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # Deliberately ABOVE the VERIFYING -> FINALIZING hop below (task
             # 3082): a DROPPED or REQUEUED item is NOT finalizing and must
             # never be recorded as such.
+            #
+            # task 3082: each sentinel gets an EXPLICIT registry disposition
+            # here, because returning without one leaves this InflightEntry in
+            # `_live_items` at a non-terminal state — which is exactly what
+            # `_finalizing_head_entry()` reports as THE finalize head (it scans
+            # `_live_items` for a non-TERMINAL InflightEntry absent from
+            # `_inflight`, and the caller popped this entry off `_inflight`
+            # before calling us). A missing disposition therefore strands a
+            # phantom head for the rest of the process lifetime and accretes one
+            # 'extra InflightEntry object(s)' WARNING per occurrence.
+            #
+            # The two sentinels get DIFFERENT dispositions, deliberately — they
+            # are not the same exit:
+            #   · DROPPED — the sole waiter has gone, so nothing will ever
+            #     re-enter the pipeline for this request_id. TERMINAL + the
+            #     `_live_items` pop is the only correct end state.
+            #     `_retire_item` is already safe on an already-TERMINAL or
+            #     unregistered rid.
+            #   · REQUEUED — the request is sitting on `_queue` and MUST
+            #     re-enter through the drain, so retiring it would strand it in
+            #     the opposite direction: `_buffer_owned_request` re-registers
+            #     only when current is None, and a TERMINAL rid is neither None
+            #     nor QUEUED, so it would be coalesce-dropped on arrival.
+            #     Bounce it to QUEUED instead, passing `live_obj=req` — the
+            #     MergeRequest-for-InflightEntry object swap in `_live_items`,
+            #     not the state change, is what actually clears the phantom
+            #     head (`_finalizing_head_entry` only counts InflightEntry
+            #     values).
+            #
+            # The REQUEUED repair is IDEMPOTENT by guard, and the guard is
+            # load-bearing rather than cosmetic: in the normal case the requeue
+            # site already bounced the registry to QUEUED itself, and an
+            # unconditional call would attempt QUEUED -> QUEUED, which
+            # `_note_transition` rejects — re-firing the very
+            # merge_lifecycle_transition_rejected escalation this task removes.
+            #
+            # This chokepoint is DEFENCE IN DEPTH for a future fifth requeue
+            # branch that forgets the call, NOT a substitute for per-branch
+            # symmetry: every requeue site still owns its own `_note_requeue`
+            # (see `_run_inflight_verify`'s abort branches), and the pairing is
+            # pinned structurally by
+            # test_merge_queue_lifecycle_registry.py::
+            # TestOnRequeuedIsAlwaysPairedWithNoteRequeue.
             if vr is not None and vr.status in (InflightStatus.DROPPED, InflightStatus.REQUEUED):
                 _cancel_release = True
                 _n_failed_val = True  # abandon / operator-halt → chain stale
+                if vr.status == InflightStatus.DROPPED:
+                    self._retire_item(req.request_id)
+                elif self._lifecycle.current(req.request_id) not in (
+                    None, ItemLifecycleState.QUEUED,
+                ):
+                    self._note_requeue(req.request_id, live_obj=req)
                 return False
 
             # MQ-reliability lambda (task 2173): the verify await has returned, so
