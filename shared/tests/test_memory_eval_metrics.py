@@ -9,6 +9,9 @@ convention (see docs/prds/memory-eval-program.md §3 M1):
 
 from __future__ import annotations
 
+import json
+import re
+
 import pytest
 from pydantic import ValidationError
 
@@ -19,8 +22,14 @@ from shared.memory_eval_metrics import (
     MetricSchemaError,
     MetricSeries,
     TripwireItem,
+    load_metric_series,
+    load_series_window,
+    metrics_artifact_path,
     parse_metric_series,
+    report_artifact_path,
+    run_stamp,
     validate_metric_series,
+    write_metric_series,
 )
 
 
@@ -234,3 +243,130 @@ class TestMetricRejectedAtEmit:
     def test_series_level_shape_errors_are_also_rejected(self):
         with pytest.raises(MetricSchemaError):
             validate_metric_series({'schema_version': 1, 'eval_id': 'e1'})
+
+
+class TestArtifactWriter:
+    """The STAMP artifact idiom (`cgl_eta_auto_apply_impl.py:42-46`) applied to M1.
+
+    The stamp is in the filename precisely so a re-run never clobbers an earlier
+    run's output — the series on disk IS the baseline window the limits
+    evaluator reads, so a clobbered run is a silently shortened window.
+    """
+
+    def test_metrics_artifact_path_layout(self, tmp_path):
+        path = metrics_artifact_path(tmp_path, 'e1-retrieval-health', '20260701T031500Z')
+        assert path == tmp_path / 'e1-retrieval-health' / 'metrics-20260701T031500Z.json'
+
+    def test_report_artifact_path_sits_beside_the_json(self, tmp_path):
+        metrics = metrics_artifact_path(tmp_path, 'e1-retrieval-health', '20260701T031500Z')
+        report = report_artifact_path(tmp_path, 'e1-retrieval-health', '20260701T031500Z')
+        assert report.parent == metrics.parent
+        assert report.name == 'report-20260701T031500Z.txt'
+
+    def test_run_stamp_honours_env_override(self, monkeypatch):
+        monkeypatch.setenv('MEMORY_EVAL_RUN_STAMP', '20260704T031500Z')
+        assert run_stamp() == '20260704T031500Z'
+
+    def test_run_stamp_defaults_to_a_utc_stamp(self, monkeypatch):
+        monkeypatch.delenv('MEMORY_EVAL_RUN_STAMP', raising=False)
+        stamp = run_stamp()
+        # Zero-padded UTC so lexicographic order == chronological order, which
+        # is what lets the window loader sort by filename.
+        assert re.fullmatch(r'\d{8}T\d{6}Z', stamp), stamp
+
+    def test_write_creates_parents_and_returns_both_paths(self, tmp_path):
+        root = tmp_path / 'memory-evals'
+        metrics_path, report_path = write_metric_series(_make_series(), root)
+        assert metrics_path.is_file()
+        assert report_path.is_file()
+        assert metrics_path == metrics_artifact_path(root, 'e1-retrieval-health', '20260701T031500Z')
+        assert report_path == report_artifact_path(root, 'e1-retrieval-health', '20260701T031500Z')
+
+    def test_written_json_reloads_to_an_equal_model(self, tmp_path):
+        metrics_path, _ = write_metric_series(_make_series(), tmp_path)
+        assert load_metric_series(metrics_path) == parse_metric_series(_make_series())
+
+    def test_report_is_human_readable(self, tmp_path):
+        _, report_path = write_metric_series(_make_series(), tmp_path)
+        text = report_path.read_text(encoding='utf-8')
+        assert 'e1-retrieval-health' in text
+        assert '20260701T031500Z' in text
+        for metric in parse_metric_series(_make_series()).metrics:
+            assert metric.metric_id in text
+
+    def test_two_stamps_coexist_without_clobbering(self, tmp_path):
+        first, _ = write_metric_series(_make_series(), tmp_path)
+        second, _ = write_metric_series(_make_series(run_stamp='20260702T031500Z'), tmp_path)
+        assert first != second
+        assert first.is_file() and second.is_file()
+        assert load_metric_series(first).run_stamp == '20260701T031500Z'
+        assert load_metric_series(second).run_stamp == '20260702T031500Z'
+
+    def test_bytes_are_stable_across_identical_writes(self, tmp_path):
+        first, _ = write_metric_series(_make_series(), tmp_path)
+        original = first.read_bytes()
+        again, _ = write_metric_series(_make_series(), tmp_path)
+        assert again.read_bytes() == original
+        # sorted keys + trailing newline so the artifact diffs cleanly.
+        assert original.endswith(b'\n')
+
+    def test_explicit_stamp_overrides_the_series_stamp_in_the_filename(self, tmp_path):
+        path, _ = write_metric_series(_make_series(), tmp_path, stamp='20260709T000000Z')
+        assert path.name == 'metrics-20260709T000000Z.json'
+
+    def test_malformed_series_writes_nothing_at_all(self, tmp_path):
+        payload = _make_series(metrics=[_make_metric(value=1.4)])
+        with pytest.raises(MetricSchemaError):
+            write_metric_series(payload, tmp_path)
+        eval_dir = tmp_path / 'e1-retrieval-health'
+        # Not even a partial or temp file: validate-then-write ordering, and the
+        # atomic writer unlinks its mkstemp temp on any failure.
+        leftovers = list(eval_dir.rglob('*')) if eval_dir.exists() else []
+        assert leftovers == []
+
+    def test_malformed_series_does_not_corrupt_an_existing_artifact(self, tmp_path):
+        good, _ = write_metric_series(_make_series(), tmp_path)
+        original = good.read_bytes()
+        with pytest.raises(MetricSchemaError):
+            write_metric_series(_make_series(metrics=[_make_metric(value=1.4)]), tmp_path)
+        assert good.read_bytes() == original
+        assert not list(good.parent.glob('*.tmp'))
+
+    def test_load_rejects_a_malformed_artifact_on_disk(self, tmp_path):
+        path = tmp_path / 'e1' / 'metrics-20260701T031500Z.json'
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps(_make_series(metrics=[_make_metric(value=1.4)])), 'utf-8')
+        with pytest.raises(MetricSchemaError):
+            load_metric_series(path)
+
+
+class TestSeriesWindowLoader:
+    """The trailing baseline window the M2 rules (b)/(c) test the current run against."""
+
+    def _seed(self, root, stamps):
+        for stamp in stamps:
+            write_metric_series(_make_series(run_stamp=stamp), root)
+
+    def test_window_is_returned_in_chronological_order(self, tmp_path):
+        self._seed(tmp_path, ['20260703T031500Z', '20260701T031500Z', '20260702T031500Z'])
+        window = load_series_window(tmp_path, 'e1-retrieval-health', limit=3)
+        assert [s.run_stamp for s in window] == [
+            '20260701T031500Z',
+            '20260702T031500Z',
+            '20260703T031500Z',
+        ]
+
+    def test_limit_keeps_the_trailing_runs(self, tmp_path):
+        self._seed(tmp_path, ['20260701T031500Z', '20260702T031500Z', '20260703T031500Z'])
+        window = load_series_window(tmp_path, 'e1-retrieval-health', limit=2)
+        assert [s.run_stamp for s in window] == ['20260702T031500Z', '20260703T031500Z']
+
+    def test_missing_eval_dir_yields_an_empty_window(self, tmp_path):
+        assert load_series_window(tmp_path, 'never-ran', limit=3) == []
+
+    def test_window_excludes_non_metric_files(self, tmp_path):
+        self._seed(tmp_path, ['20260701T031500Z'])
+        eval_dir = tmp_path / 'e1-retrieval-health'
+        (eval_dir / 'limits-current.json').write_text('{}', encoding='utf-8')
+        window = load_series_window(tmp_path, 'e1-retrieval-health', limit=5)
+        assert [s.run_stamp for s in window] == ['20260701T031500Z']
