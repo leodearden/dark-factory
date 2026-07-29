@@ -3179,3 +3179,160 @@ class TestContendedLeaseDefers:
             f'exactly the non-valve attempts may swap to the warm tree; got '
             f'{len(reset_calls)} warm swaps across {every_n} attempts'
         )
+
+
+# ---------------------------------------------------------------------------
+# task 3082 step-5 RED / step-6 GREEN: the dead-verify abort must requeue into
+# the LIVE queue — registry included.
+#
+# Trigger 3 does `_release_or_cleanup + put_nowait + on_requeued` but NOT
+# `_note_requeue`, so the registry is left at VERIFYING while the request sits
+# on `_queue`. The existing TestDeadInflightVerifyAborts tests never registered
+# the request at all, which is exactly why they never exercised the registry
+# side of this branch. The one added `_register_item` line below is the whole
+# difference.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDeadVerifyAbortRequeuesIntoTheLiveQueue:
+    """A dead-verify no-progress abort must return the LIFECYCLE REGISTRY to
+    QUEUED at the requeue site, so the re-queued request re-enters through the
+    normal drain instead of being coalesce-dropped (task 3082 step-5 RED /
+    step-6 GREEN).
+
+    Extends TestDeadInflightVerifyAborts::
+    test_dead_local_verify_is_aborted_and_requeued_within_budget's driver
+    verbatim (real merged item, real wall clock, 0.2s no-progress budget, the
+    never-returning gate) rather than inventing a second one.
+
+    RED until step-6 adds the missing ``_note_requeue`` at the requeue site.
+    """
+
+    async def _drive_dead_abort(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+        branch: str,
+        filename: str,
+    ):
+        """Drive one trigger-3 dead-verify abort on a REGISTERED request.
+
+        Returns ``(worker, q, req, vr, spy_note)``.
+        """
+        from orchestrator.merge_queue import ItemLifecycleState, SpeculativeMergeWorker
+        from orchestrator.verify_runner import HostLease
+
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        req, item = await _make_merged_item(git_ops, config, branch, filename, 'x=1\n')
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q, escalation_queue=fake_eq)
+        worker._register_owned_merge_worktree(item.merge_wt)
+
+        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+        worker.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS = 0.02
+        worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 0.2
+
+        fake_local = MagicMock()
+        fake_local.name = 'local'
+        fake_local.is_local = True
+        lease = HostLease(name='local', runner=fake_local, is_local=True)
+
+        worker._request_ledger.on_dequeue(req, now=1_000_000.0)
+        # THE one addition vs the existing driver: production always arrives
+        # here registered at VERIFYING (via the dispatch chokepoint).
+        worker._register_item(req, initial=ItemLifecycleState.VERIFYING)
+
+        with (
+            patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                _dead_gate_never_returns,
+            ),
+            patch.object(worker, '_note_requeue', wraps=worker._note_requeue) as spy_note,
+        ):
+            vr = await asyncio.wait_for(
+                worker._run_inflight_verify(item, lease), timeout=15.0,
+            )
+        return worker, q, req, vr, spy_note, fake_eq
+
+    async def test_trigger3_abort_returns_the_registry_to_queued_at_the_requeue_site(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """The requeue SITE itself must bounce the registry to QUEUED — this
+        assertion is deliberately independent of ``_finalize_inflight``'s
+        chokepoint repair (never called here), so per-branch symmetry is
+        pinned on its own.
+        """
+        from orchestrator.merge_queue import InflightStatus, ItemLifecycleState
+
+        worker, q, req, vr, spy_note, _fake_eq = await self._drive_dead_abort(
+            git_ops, config, 'df3082-dead-verify-requeue', 'dvr.py',
+        )
+        rid = req.request_id
+
+        assert vr.status == InflightStatus.REQUEUED, (
+            f'a dead-verify abort must REQUEUE, got status={vr.status!r}'
+        )
+        current = worker._lifecycle.current(rid)
+        assert current == ItemLifecycleState.QUEUED, (
+            f'the requeue site must return the registry to QUEUED so the request '
+            f'can re-enter through the drain; registry reads {current!r}'
+        )
+        assert worker._live_items[rid] is req, (
+            f'_live_items must hold the MergeRequest after the requeue: '
+            f'{worker._live_items.get(rid)!r}'
+        )
+        assert req in list(q._queue), (
+            f'the request must actually be on _queue: {list(q._queue)!r}'
+        )
+        assert not req.result.done(), (
+            'a re-queued request must be left PENDING for its re-dispatch'
+        )
+        assert rid not in worker._request_ledger.open_request_ids(), (
+            'on_requeued must clear the ledger entry so the parked request never ages out'
+        )
+        spy_note.assert_called_once()
+
+    async def test_abort_requeue_is_rebuffered_not_coalesce_dropped(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The re-queued request must survive the very next drain: land in a
+        lane buffer, keep its future PENDING, and leave no finalize head.
+        """
+        from orchestrator.merge_queue import ItemLifecycleState
+
+        worker, _q, req, _vr, _spy, fake_eq = await self._drive_dead_abort(
+            git_ops, config, 'df3082-dead-verify-redrain', 'dvrd.py',
+        )
+        rid = req.request_id
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            worker._drain_queue_into_lanes()
+
+        buffered = [it for buf in worker._lane_buffers.values() for it in buf]
+        assert req in buffered, (
+            f'the re-queued request must be buffered by the next drain, not '
+            f'coalesce-dropped; lane buffers hold {buffered!r}'
+        )
+        current = worker._lifecycle.current(rid)
+        assert current == ItemLifecycleState.LANE_BUFFERED, (
+            f'the re-drained request must reach LANE_BUFFERED; registry reads {current!r}'
+        )
+        assert not req.result.done(), (
+            'the real waiter must NOT be handed a fabricated already_merged by the '
+            'coalesce path'
+        )
+        assert worker._finalizing_head_entry() is None, (
+            f'no finalize head may survive the abort: {worker._finalizing_head_entry()!r}'
+        )
+        drop_warnings = [
+            r.getMessage() for r in caplog.records
+            if 'dropping duplicate/re-entrant merge submission' in r.getMessage()
+        ]
+        assert drop_warnings == [], (
+            f'the re-drain must not be coalesce-dropped: {drop_warnings!r}'
+        )
+        assert fake_eq.submitted == [], (
+            f'a clean abort-and-re-drain must not escalate: {fake_eq.submitted!r}'
+        )

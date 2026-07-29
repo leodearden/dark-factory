@@ -23,8 +23,10 @@ convention.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import contextlib
+import inspect
 import logging
 from pathlib import Path
 from typing import Any, cast
@@ -676,6 +678,271 @@ class TestRequeueToQueuedSites:
         assert worker._lifecycle.current(req.request_id) is None
         assert len(fake_eq.submitted) == 0, (
             f'unregistered requeue must stay silent: {fake_eq.submitted!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 3082 step-5 PART 2 RED / step-6 GREEN: the on_requeued/_note_requeue
+# PAIRING INVARIANT.
+#
+# The canonical requeue recipe — named verbatim by the contended-lease
+# branch's own comment — is
+#   release_or_cleanup + put_nowait + on_requeued + _note_requeue + REQUEUED.
+# Four of the five requeue sites follow it; one (the dead-verify no-progress
+# abort) omits `_note_requeue`, and that omission is this task's defect. The
+# ledger half and the registry half must move together at EVERY site, so this
+# is pinned two ways: a RUNTIME spy-parity check over the drivable paths, and
+# an AST STRUCTURAL check over all five sites (including the two a unit test
+# cannot easily drive).
+#
+# Sibling task 3204 owns extracting the five-site recipe into one helper; this
+# task lands only the invariant.
+# ---------------------------------------------------------------------------
+
+
+async def _make_merged_item(
+    git_ops: GitOps,
+    config: OrchestratorConfig,
+    branch: str,
+    filename: str,
+    content: str,
+):
+    """Create a merged ``RealMergeItem`` on a fresh branch (real git, no mocks).
+
+    Duplicated from test_merge_queue_request_liveness.py:621 (per-file
+    duplication convention — see this file's module docstring).
+    """
+    from orchestrator.merge_queue import RealMergeItem
+
+    wt = await _make_branch_with_file(git_ops, branch, filename, content)
+    req = _make_request(branch, branch, wt, config)
+    merge_result = await git_ops.merge_to_main(wt, branch)
+    assert merge_result.success and merge_result.merge_commit, f'{merge_result!r}'
+    assert merge_result.merge_worktree is not None
+    base_sha = await git_ops.get_main_sha()
+    item = RealMergeItem(
+        request=req,
+        merge_result=merge_result,
+        merge_wt=merge_result.merge_worktree,
+        base_sha=base_sha,
+        speculative=False,
+    )
+    return req, item
+
+
+async def _dead_gate_never_returns(*args: object, **kwargs: object) -> MagicMock:
+    """Simulates a dead/hung LOCAL verify: never returns, never writes.
+
+    Duplicated from test_merge_queue_request_liveness.py:1090 (per-file
+    duplication convention).
+    """
+    await asyncio.Event().wait()
+    raise AssertionError('unreachable — this Event is never set')  # pragma: no cover
+
+
+def _attr_calls(node: ast.AST, attr: str) -> list[ast.Call]:
+    """Every ``<something>.attr(...)`` call in *node*'s subtree."""
+    return [
+        n for n in ast.walk(node)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == attr
+    ]
+
+
+def _first_arg_src(call: ast.Call) -> str:
+    """The source text of *call*'s first positional argument ('' if none)."""
+    return ast.unparse(call.args[0]) if call.args else ''
+
+
+@pytest.mark.asyncio
+class TestOnRequeuedIsAlwaysPairedWithNoteRequeue:
+    """Every requeue site must move the ledger AND the lifecycle registry
+    together: an ``on_requeued(rid)`` call is only correct when a
+    ``_note_requeue(rid)`` call sits beside it (task 3082 step-5 RED / step-6
+    GREEN, requirement 3).
+
+    RED until step-6 adds the missing ``_note_requeue`` to the dead-verify
+    no-progress abort. Both tests then read 5/5.
+    """
+
+    async def test_every_driven_requeue_moves_ledger_and_registry_together(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        """RUNTIME spy parity: drive three requeue paths on ONE worker and
+        assert the recorded request_id MULTISETS are equal.
+
+        Two are known-good controls (the contended-lease defer and the
+        pre-dispatch operator halt) and one is the defect (the dead-verify
+        no-progress abort). Asserting equality against controls in the SAME
+        test is what makes this a parity check rather than a restatement of the
+        site-level test in test_merge_queue_request_liveness.py.
+        """
+        from orchestrator.git_ops import MergeVerifyLeaseContended
+        from orchestrator.merge_queue import (
+            InflightStatus,
+            ItemLifecycleState,
+            RealMergeItem,
+            SpeculativeMergeWorker,
+        )
+        from orchestrator.verify_runner import HostLease
+
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, escalation_queue=fake_eq)
+        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+        worker.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS = 0.02
+        worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 0.2
+
+        ledger_rids: list[str] = []
+        registry_rids: list[str] = []
+        real_on_requeued = worker._request_ledger.on_requeued
+        real_note_requeue = worker._note_requeue
+
+        def _spy_on_requeued(rid: str, *a: Any, **k: Any) -> Any:
+            ledger_rids.append(rid)
+            return real_on_requeued(rid, *a, **k)
+
+        def _spy_note_requeue(rid: str, *a: Any, **k: Any) -> Any:
+            registry_rids.append(rid)
+            return real_note_requeue(rid, *a, **k)
+
+        worker._request_ledger.on_requeued = _spy_on_requeued  # type: ignore[method-assign]
+        worker._note_requeue = _spy_note_requeue  # type: ignore[method-assign]
+
+        fake_local = MagicMock()
+        fake_local.name = 'local'
+        fake_local.is_local = True
+        lease = HostLease(name='local', runner=fake_local, is_local=True)
+
+        async def _lease_contended(*_a: object, **_k: object) -> object:
+            raise MergeVerifyLeaseContended(Path('/x/_merge-verify.lock'), 300.0)
+
+        # ── CONTROL 1: contended-lease defer (merge_queue.py :13839/:13840) ──
+        req_cl, item_cl = await _make_merged_item(
+            git_ops, config, 'df3082-pair-contended', 'pc.py', 'c=1\n',
+        )
+        worker._register_owned_merge_worktree(item_cl.merge_wt)
+        worker._register_item(item_cl, initial=ItemLifecycleState.VERIFYING)
+        with patch('orchestrator.merge_queue._run_post_merge_verify', _lease_contended):
+            vr_cl = await asyncio.wait_for(
+                worker._run_inflight_verify(item_cl, lease), timeout=15.0,
+            )
+        assert vr_cl.status == InflightStatus.REQUEUED, f'{vr_cl!r}'
+
+        # ── THE DEFECT: dead-verify no-progress abort (:13775/:13776) ────────
+        req_dv, item_dv = await _make_merged_item(
+            git_ops, config, 'df3082-pair-deadverify', 'pd.py', 'd=1\n',
+        )
+        worker._register_owned_merge_worktree(item_dv.merge_wt)
+        worker._register_item(item_dv, initial=ItemLifecycleState.VERIFYING)
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification', _dead_gate_never_returns,
+        ):
+            vr_dv = await asyncio.wait_for(
+                worker._run_inflight_verify(item_dv, lease), timeout=15.0,
+            )
+        assert vr_dv.status == InflightStatus.REQUEUED, f'{vr_dv!r}'
+
+        # ── CONTROL 2: pre-dispatch operator halt (:14727/:14730) ────────────
+        # LAST, because setting _operator_halt would otherwise route the two
+        # _run_inflight_verify drives above into the operator-halt abort
+        # (trigger 2) instead of the branches under test.
+        req_ph = _make_request('df3082-pair-halt', 'df3082-pair-halt', tmp_path, config)
+        item_ph = RealMergeItem(
+            request=req_ph, merge_result=MagicMock(),
+            merge_wt=tmp_path / 'merge_wt_ph', base_sha='deadbeef', speculative=False,
+        )
+        worker._register_item(item_ph, initial=ItemLifecycleState.DISPATCHING)
+        worker._operator_halt.set()
+        entry_ph = await worker._dispatch_item(item_ph)
+        assert entry_ph is not None
+        assert entry_ph.status == InflightStatus.REQUEUED_PREDISPATCH, f'{entry_ph!r}'
+
+        expected = {req_cl.request_id, req_dv.request_id, req_ph.request_id}
+        assert set(ledger_rids) == expected, (
+            f'all three drives must have hit the ledger requeue: {ledger_rids!r}'
+        )
+        assert sorted(registry_rids) == sorted(ledger_rids), (
+            f'every on_requeued must be paired with a _note_requeue at the same '
+            f'site — ledger={sorted(ledger_rids)!r} registry={sorted(registry_rids)!r}; '
+            f'unpaired={sorted(set(ledger_rids) - set(registry_rids))!r}'
+        )
+        for rid in expected:
+            assert worker._lifecycle.current(rid) == ItemLifecycleState.QUEUED, (
+                f'{rid} must be left at QUEUED; reads {worker._lifecycle.current(rid)!r}'
+            )
+
+    async def test_every_on_requeued_call_site_has_a_sibling_note_requeue(self) -> None:
+        """STRUCTURAL parity over ALL FIVE sites, via ``ast``.
+
+        Covers the two sites a unit test cannot easily drive (the head-failure
+        cascade's downstream self-requeue and the pre-dispatch operator halt is
+        driven above, so specifically the cascade path) and fails loudly if a
+        future sixth requeue site forgets the call.
+
+        Keys on the enclosing function name and the argument EXPRESSION, never
+        on line numbers (they drift). The pairing must be a sibling in the same
+        statement block — function-level scoping would be too weak, since
+        ``_run_inflight_verify`` contains both a correctly-paired requeue
+        branch and (before step-6) an unpaired one, both using
+        ``req.request_id``.
+        """
+        import orchestrator.merge_queue as _mq  # module-local import convention
+
+        source = Path(inspect.getfile(_mq)).read_text()
+        tree = ast.parse(source)
+
+        # id(node) -> parent node, and id(stmt) -> the statement list holding it.
+        parent: dict[int, ast.AST] = {}
+        for node in ast.walk(tree):
+            for child in ast.iter_child_nodes(node):
+                parent[id(child)] = node
+        owner: dict[int, list] = {}
+        for node in ast.walk(tree):
+            for field in ('body', 'orelse', 'finalbody'):
+                block = getattr(node, field, None)
+                if isinstance(block, list):
+                    for st in block:
+                        if isinstance(st, ast.stmt):
+                            owner[id(st)] = block
+
+        def _enclosing(node: ast.AST, kinds: tuple[type, ...]) -> ast.AST | None:
+            cur: ast.AST | None = node
+            while cur is not None and not isinstance(cur, kinds):
+                cur = parent.get(id(cur))
+            return cur
+
+        sites = _attr_calls(tree, 'on_requeued')
+        assert len(sites) == 5, (
+            f'expected the 5 known on_requeued call sites in merge_queue.py; '
+            f'found {len(sites)} at lines {[c.lineno for c in sites]} — if a site was '
+            f'added or removed, pair it with _note_requeue and update this count'
+        )
+
+        unpaired: list[str] = []
+        for call in sites:
+            stmt = _enclosing(call, (ast.stmt,))
+            assert stmt is not None
+            block = owner.get(id(stmt))
+            assert block is not None, f'on_requeued at line {call.lineno} has no block'
+            arg = _first_arg_src(call)
+            siblings = {
+                _first_arg_src(c)
+                for sib in block for c in _attr_calls(sib, '_note_requeue')
+            }
+            if arg not in siblings:
+                fn = _enclosing(call, (ast.FunctionDef, ast.AsyncFunctionDef))
+                unpaired.append(
+                    f'{getattr(fn, "name", "<module>")}:{call.lineno} '
+                    f'on_requeued({arg}) has no sibling _note_requeue({arg})'
+                )
+
+        assert unpaired == [], (
+            'every on_requeued call site must carry a sibling _note_requeue with the '
+            'SAME request_id expression (the canonical requeue recipe: '
+            'release_or_cleanup + put_nowait + on_requeued + _note_requeue + '
+            f'InflightStatus.REQUEUED). Unpaired: {unpaired!r}'
         )
 
 
