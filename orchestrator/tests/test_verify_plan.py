@@ -866,11 +866,22 @@ _REAL_CONFIG_COMMANDS: list[tuple[str, str]] = [
     ('no-op-true', 'true'),
 ]
 
+# Synthetic hazards, not real configs: an `&&` nested inside a shell construct
+# that `_NON_AND_CHAIN_TOKENS`' token-equality check cannot see. Carried through
+# the same lockstep sweep as the real commands, and pinned individually by
+# `test_shell_construct_is_never_split_mid_construct` below.
+_SHELL_CONSTRUCT_HAZARDS: list[tuple[str, str]] = [
+    ('subst-dollar-paren', 'ruff check $(git ls-files && echo x) && python3 y.py'),
+    ('subst-backtick', 'ruff check `ls && echo x` && python3 y.py'),
+    ('unspaced-subshell', '(ruff check src/ && echo x) && python3 y.py'),
+    ('subst-in-double-quotes', 'ruff check "$(ls && echo x)" && python3 y.py'),
+]
+
 _LOCKSTEP_KEYWORDS = ('ruff check', 'pyright', 'pytest')
 
 _LOCKSTEP_CASES = [
     (raw, keyword, f'{name}::{keyword.replace(" ", "-")}')
-    for name, raw in _REAL_CONFIG_COMMANDS
+    for name, raw in (*_REAL_CONFIG_COMMANDS, *_SHELL_CONSTRUCT_HAZARDS)
     for keyword in _LOCKSTEP_KEYWORDS
 ]
 
@@ -962,6 +973,38 @@ class TestScoperTrailingClausePreservation:
         assert scoped == 'uv run pytest fused-memory/tests/test_harness.py'
         assert 'cd ../escalation' not in scoped
         assert 'cockpit' not in scoped
+
+    @pytest.mark.parametrize(
+        'raw',
+        [raw for _, raw in _SHELL_CONSTRUCT_HAZARDS],
+        ids=[name for name, _ in _SHELL_CONSTRUCT_HAZARDS],
+    )
+    def test_shell_construct_is_never_split_mid_construct(self, raw):
+        """HAZARD GUARD: an `&&` inside `$(...)`/backticks/`(...)` is not a chain op.
+
+        The tail gate's control-flow rejection is token-EQUALITY based, so it
+        sees `(` only when ``shlex`` isolates it as its own whitespace-
+        separated token. A command substitution or an unspaced subshell hides
+        its `&&` from that check while ``split_top_level_and`` — which tracks
+        quote state only — still splits there. Carrying a tail out of one
+        truncates the head mid-construct and emits an unbalanced shell string
+        (a stray `)`, an unpaired backtick), which bash rejects outright: a
+        spurious RED verify, strictly worse than the missed sibling checker
+        this feature exists to fix, and a NEW failure mode rather than a
+        pre-existing one. The character-level grouping check must reject
+        these, restoring the byte-identical pre-feature output.
+        """
+        scoped = verify._scope_to_keyword(raw, 'ruff check', self._FILES)
+        expected = (
+            raw
+            if raw.startswith('(')  # keyword not in segment 0 -> untouched
+            else f'ruff check {self._FILES[0]}'
+        )
+        assert scoped == expected
+        assert '&& python3 y.py' not in scoped or scoped == raw
+        # No dangling opener/closer survived into the emitted command.
+        assert scoped.count('(') == scoped.count(')')
+        assert scoped.count('`') % 2 == 0
 
     @pytest.mark.parametrize(
         ('raw', 'keyword'),

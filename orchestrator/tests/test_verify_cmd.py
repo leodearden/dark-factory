@@ -1094,6 +1094,10 @@ class TestSplitChainTail:
             ('ruff check "unterminated && python3 x.py', 'ruff check'),
             ('mypy src/', 'ruff check'),
             ('true', 'ruff check'),
+            ('ruff check $(git ls-files && echo x) && python3 y.py', 'ruff check'),
+            ('ruff check `ls && echo x` && python3 y.py', 'ruff check'),
+            ('(ruff check src/ && echo x) && python3 y.py', 'ruff check'),
+            ('ruff check "$(ls && echo x)" && python3 y.py', 'ruff check'),
         ],
         ids=[
             'no-and-at-all',
@@ -1104,11 +1108,56 @@ class TestSplitChainTail:
             'unbalanced-quote-shlex-raises',
             'keyword-absent-entirely',
             'no-op-command',
+            'command-substitution-dollar-paren',
+            'command-substitution-backtick',
+            'unspaced-subshell-parens',
+            'substitution-nested-in-double-quotes',
         ],
     )
     def test_rejects_return_whole_raw_and_empty_tail(self, raw, keyword):
         """Every reject disposition is ``(raw, '')`` — never a truncated prefix."""
         assert split_chain_tail(raw, keyword) == (raw, '')
+
+    @pytest.mark.parametrize(
+        'raw',
+        [
+            'ruff check $(git ls-files && echo x) && python3 y.py',
+            'ruff check `ls && echo x` && python3 y.py',
+            '(ruff check src/ && echo x) && python3 y.py',
+            'ruff check "$(ls && echo x)" && python3 y.py',
+        ],
+        ids=['dollar-paren', 'backtick', 'unspaced-subshell', 'dquoted-substitution'],
+    )
+    def test_nested_and_inside_a_shell_construct_is_never_a_split_point(self, raw):
+        """An `&&` hiding inside `$(...)`, backticks or `(...)` must not be lifted.
+
+        ``_NON_AND_CHAIN_TOKENS`` is token-EQUALITY based, so it only catches a
+        paren ``shlex`` isolated as its own whitespace-separated token. These
+        four inputs slip past it, yet ``split_top_level_and`` (quote state only)
+        happily splits at the nested `&&` — and the shlex cross-check agrees
+        with it on the count, so nothing downstream catches it either. Carrying
+        a tail out of one truncates the head mid-construct and emits an
+        unbalanced shell string (a stray `)` / an unpaired backtick), which is
+        a bash syntax error: a spurious RED verify, strictly worse than the
+        missed sibling checker this whole gate exists to fix. Reject is the
+        only safe disposition — it restores the exact pre-gate output.
+        """
+        assert split_chain_tail(raw, 'ruff check') == (raw, '')
+
+    def test_literal_paren_inside_double_quotes_is_not_a_shell_construct(self):
+        """A quoted paren is inert text, so it must NOT trip the grouping gate.
+
+        Guards the conservative character scan against over-rejection: only a
+        substitution (``$(`` / backtick) is active inside double quotes, and a
+        bare ``(`` there — a ``-k`` selector expression is the real case — is
+        literal. This chain is a legitimate sibling-checker chain and must
+        still ACCEPT.
+        """
+        raw = 'ruff check --config "lint(x)" src/ && python3 y.py'
+        prefix, tail = split_chain_tail(raw, 'ruff check')
+        assert prefix == 'ruff check --config "lint(x)" src/ '
+        assert tail == '&& python3 y.py'
+        assert prefix + tail == raw
 
     def test_quoted_and_in_segment_zero_is_never_corrupted(self):
         """A quoted `&&` inside the keyword segment must survive intact.
