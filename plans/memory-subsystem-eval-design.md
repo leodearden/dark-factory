@@ -582,7 +582,9 @@ bloat.
 ## 7. Pragmatic starting subset
 
 Three builds, ordered; total ≈ 4–7 focused days, most components riding on substrate
-that exists or is landing anyway.
+that exists or is landing anyway. (§10, judging this floor against explicit stopping
+criteria, promotes E6 to a fourth item — the write-side tripwire the first three
+lack; ≈ 5–9 days total.)
 
 **First: E2, the storage-shape bake-off** — because it is the only item that directly
 discharges the trigger for this brief. It arbitrates:
@@ -615,9 +617,11 @@ hadn't already flagged live?
 
 **Deliberately deferred:** E3 (start opportunistically — every postmortem donates a
 triple; formalize once E7 shows the real query distribution), E5 extensions (ride on
-3130/γ landing), E6 upgrades (ride on 3136), E8/E9 (after the leading indicators
-exist — behavioural measurement before retrieval measurement is building the roof
-first), E10 (declined at current scale), E11 (one-shot, when E3's fixture exists).
+3130/γ landing), E6 upgrades (nominally ride on 3136 — **but see §10: judged against
+the stopping criteria, criterion 2 requires promoting E6 to the floor as a fourth
+item**), E8/E9 (after the leading indicators exist — behavioural measurement before
+retrieval measurement is building the roof first), E10 (declined at current scale),
+E11 (one-shot, when E3's fixture exists).
 
 **On 3136 specifically:** none of the first three arbitrate *whether* to build it —
 it's detection, orthogonal to the retrieval fixes. E6/E7 instead measure whether it
@@ -684,3 +688,95 @@ time-series artifact per E6 so it doubles as measurement.
    delivered (and whether the four briefing queries are the right four — nothing has
    ever measured what they return) is a design question this eval program would
    inform (E1 includes those queries; E7 would log their yield) but cannot answer.
+
+---
+
+## 10. Stopping criteria — how we know when we've built enough
+
+"Enough" is not a property of the eval suite (coverage of dimensions, number of
+evals); it is a property of the decision-making and incident-handling the suite
+supports. Three observable tests:
+
+**Criterion 1 — decisions stop being settled by argument.** This brief exists
+because 3112-vs-3129 could only be argued. There are enough *decision-support*
+evals when the next design question of a recurring class is answered by running an
+existing harness and reading a table — and when a question arrives that can't be,
+that is not a general shortfall: it names exactly one missing eval, with a concrete
+requirement attached. The criterion is self-correcting; gaps announce themselves.
+
+**Criterion 2 — pathologies stop being discovered by humans first.** The retrieval
+inversion sat live for weeks until a person poked at search results; the
+accretion-rate doubling was computed by hand afterwards. There is enough
+*regression coverage* when every failure class that has actually occurred has a
+standing tripwire that fires before a curator finds the carnage. The measurable
+proxy: the rate of "incident occurred and no instrument should have caught it"
+events, trending to ~zero. Each exception converts into a fixture entry (E1
+registry topic, E3 triple, E6 lint) — a fixture addition, not a new eval system.
+This is test-suite economics: the suite is never finished; the escape→tripwire
+conversion loop runs and the suite self-sizes.
+
+**Criterion 3 — the marginal eval costs more than it decides.** Every eval carries
+maintenance: fixture rot (UUID churn kills golden fixtures in days here, §4), drift
+re-adjudication, attention. Over-investment signals are as concrete as
+under-investment ones: an eval whose output hasn't changed a decision in a quarter;
+metrics that always move together (redundant instruments — keep one); fixture
+repair costing more than the decisions it protects. This needs an explicit
+periodic review (quarterly) from day one — dead evals are worse than none, because
+they produce the *feeling* of coverage.
+
+Two asymmetries when applying the tests: leading instruments (D1/D2/D3/D6) are
+cheap and should saturate the known failure modes; lagging ones (D5) should
+deliberately stay under-built — sampled, diagnostic, never dashboards. And one
+question stays unanswerable forever by design (§8): "is memory net worth it" has no
+clean measurement, so "enough" can never mean that — anyone holding out for it will
+build evals indefinitely.
+
+### Current status, and the §7 floor judged against criterion 2
+
+Today the count of memory evals is zero, so all three criteria are unmet by
+inspection. Criterion 1: the §7 floor's E2 satisfies it for the one decision class
+currently live (storage shape / retrieval config); future classes are demand-driven
+by design. Criterion 3: moot until evals exist — institute the quarterly prune when
+they do. Criterion 2 is the interesting one. Ledger of *observed* failure classes
+(every row is an incident that actually happened) against the three-item floor:
+
+| Observed failure class (incident) | Tripwire under the §7 floor | Detection latency |
+|---|---|---|
+| Canonical unfindable; superseded outranks successor (3111, esc-5712-1) | E1 scheduled probe | same-day ✅ |
+| Declared-supersession surfacing + dangling refs (417d86d0) | E4 sweep | same-day ✅ |
+| Staleness vs machine-visible events (5 of 19 curator gates) | E4c joins | same-day ✅ |
+| Guard candidate-set miss at limit=5 (3111 consequence 2) | E1 top-5 metric; E2 guard replay | same-day ✅ |
+| N+1 write loop / re-accretion rate doubling | E7 write-after-miss | **weeks** (needs accumulation) ⚠️ |
+| Cluster accretion, 13×-rewritten gotcha class | E6 time series — **not in floor** | ❌ until E6/3136 |
+| Stage-1 consolidation ratchet (esc-5541: claimed closure, 8 survivors) | E6 net-delta — **not in floor**; θ's survivors-proof | ❌ until E6 or θ lands |
+| MCP-envelope leakage (9 instances, found by eye) | E6 lint — **not in floor**; ο's tripwire | ❌ until E6 or ο lands |
+| Fabricated completion claim (1 instance) | π's gate only | PRD-dependent |
+| Silent delete no-op on truncated UUIDs (stage1.py:110) | η's hard-error only | PRD-dependent |
+| Undeclared wrong entry surviving weeks (the wrong appendix rule) | none fast — curation + E5 label harvest | **permanent gap** (§8) |
+
+**Verdict: the three-item floor does *not* satisfy criterion 2 by itself.** It
+covers the retrieval-side classes promptly — which is the right bias given the
+current pain — but the write/consolidation-side classes (accretion, ratchet,
+envelope leakage) stay human-discovered until either E6 exists or the
+write-path-convergence PRD leaves (θ, ο, η, π, κ/3136) land, and those leaves are
+prevention mechanisms that double as tripwires only *once landed*. Three
+consequences:
+
+1. **Promote E6 to the floor** (fourth item, +1–2 days over 3136's planned work,
+   and not schedule-coupled to 3136's timer — the time-series + embedding-clustering
+   + all-category upgrades are the tripwire; the timer is just a scheduler). A
+   four-item floor covers every observed class except the three rows below the line.
+2. **Count the PRD leaves as tripwires and track them as such**: θ's survivors
+   return makes ratchet self-announcing, ο's storm counter makes leakage loud, η
+   hard-errors the silent delete, π tags fabricated claims. Criterion 2 is
+   satisfied by *floor + landed PRD batch*, not by the eval program alone — worth
+   stating so the eval program isn't blamed for, or duplicated onto, gaps those
+   leaves already own.
+3. **Two residuals stay open with eyes open**: undeclared wrongness remains
+   curation-latency (structural, §8), and E7's write-after-miss has an
+   accumulation window during which E6's accretion trend is the only
+   write-side signal — a second reason to promote E6. A third residual class has
+   *not yet* occurred but is predictable: retrieved-but-ignored (the agent is shown
+   the fact and re-derives anyway) is invisible to everything except E8/E9, which
+   stay deferred; the first such incident converts them from deferred to justified
+   under criterion 2's ratchet.
