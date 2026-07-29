@@ -10779,6 +10779,13 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     )
                 break
 
+        # Whatever the steward published while THIS waiter held the wait is
+        # never consumed by it (see _drain_steward_outcomes) — drain it here,
+        # covering both the normal-clear and the timeout exit above, so a
+        # later _mark_blocked in this same workflow cannot pop a stale
+        # outcome out of _await_steward_completion.
+        self._drain_steward_outcomes()
+
         # Check for level-1 re-escalation (steward gave up)
         if self.escalation_queue.has_open_l1(self.task_id):
             pending_l1 = self.escalation_queue.get_by_task(
@@ -13166,6 +13173,59 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         if isinstance(outcome, StewardResolved):
             return True
         return isinstance(outcome, StewardInterrupted) and outcome.wip_commits_present
+
+    def _drain_steward_outcomes(self) -> StewardOutcome | None:
+        """Non-blockingly empty the steward outcome channel and LOG what was
+        there, returning the most severe drained outcome (task 3170).
+
+        This exists for :meth:`_wait_for_resolution` — the run()-ESCALATED
+        waiter, which is escalation-queue-only and never consumes the channel.
+        Anything the steward published while that waiter held the wait would
+        otherwise sit on the channel indefinitely, and a LATER
+        ``_mark_blocked`` in the same workflow would pop it out of
+        :meth:`_await_steward_completion` as though it had just been
+        published.  A stale ``StewardInterrupted(wip_commits_present=True)`` is
+        exactly the task-2060 resume-plan outcome, so the consequence is a
+        spurious ``_requeue()`` driven by an already-dispositioned escalation
+        cycle.  (The hazard pre-dates task 3170 — ``StewardResolved`` is
+        published on every steward success — but fix A makes it reachable far
+        more often.)
+
+        **Drain-and-log ONLY — deliberately does NOT route on the drained
+        value.**  Every actionable variant is already fully determined by the
+        escalation-queue state ``_wait_for_resolution``'s tail reads:
+        ``StewardReescalatedL1``/``StewardBudgetExhausted`` ⇒ the L0 is
+        dismissed and an L1 is open ⇒ ``has_open_l1``; ``StewardResolved`` ⇒
+        the L0 is resolved; ``StewardInterrupted`` ⇒ the L0 is dismissed by the
+        producer-side give-up contract with no L1.  Routing here would add a
+        SECOND parallel outcome contract on a path that has none — precisely
+        the asymmetry this task exists to remove.  The return value is for
+        callers/tests that want to observe what was drained, not to branch on.
+
+        Reduction reuses :meth:`_outcome_severity` rather than adding a
+        parallel ranking.  A ``None`` channel (no steward was ever started for
+        this workflow) is a no-op returning ``None``.
+        """
+        channel = self._steward_outcome_channel
+        if channel is None:
+            return None
+        drained: list[StewardOutcome] = []
+        while True:
+            try:
+                drained.append(channel.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        if not drained:
+            return None
+        most_severe = max(drained, key=self._outcome_severity)
+        logger.info(
+            'Task %s: drained %d unconsumed steward outcome(s) after the '
+            'ESCALATED wait (most severe: %r) — the escalation-queue state '
+            'already determined this cycle\'s disposition; draining only '
+            'prevents a later _mark_blocked from replaying them',
+            self.task_id, len(drained), most_severe,
+        )
+        return most_severe
 
     async def _await_steward_completion(self) -> StewardOutcome:
         """Wait for the steward to publish an outcome, with a grace period
