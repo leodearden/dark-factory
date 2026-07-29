@@ -51,6 +51,18 @@ mistake a partial sweep for a complete one. A truncated ``--apply`` (``--limit``
 reached, or the scan otherwise capped) exits non-zero for the same reason: it
 covered an unknown fraction of the corpus.
 
+The delete/re-add is VERIFIED-PERSISTED, not assumed. ``MemoryService.add_memory``
+swallows a Mem0 write failure into ``AddMemoryResponse.message`` as
+``[mem0_error: ...]`` and returns NORMALLY, so a returned response is not by
+itself evidence of a write. A non-raising add that did not persist is therefore
+treated IDENTICALLY to a throw -- ``content_lost_in_flight``, a ``logger.error``,
+``repaired`` left False, and a non-zero exit. And because a repaired record has
+to land back in mem0 to replace what the delete removed, a record whose category
+is not ``MEM0_PRIMARY`` is refused BEFORE the delete (``skipped_not_mem0_routed``,
+also non-zero): a plain re-add would route it to Graphiti only, while
+``dual_write=True`` would duplicate the Graphiti copy the mem0-scoped delete
+deliberately left alive.
+
 Scope
 -----
 Mem0/Qdrant ONLY. Graphiti episodes are NOT covered -- Graphiti-side discovery
@@ -100,6 +112,7 @@ import logging
 import sys
 from typing import Any
 
+from fused_memory.models import MEM0_PRIMARY, MemoryCategory
 from fused_memory.utils.toolcall_xml_leak import LEAK_TAIL
 
 logger = logging.getLogger('sweep_toolcall_xml_leak')
@@ -219,6 +232,73 @@ def repair_content(text: str | None) -> str | None:
     return None
 
 
+def readd_persisted(response: Any) -> tuple[bool, str]:
+    """Return (True, '') only when *response* PROVES a mem0 copy was written.
+
+    Pure, no I/O. This exists because a non-raising ``add_memory`` is NOT
+    evidence of a write: ``MemoryService.add_memory`` catches ``Exception`` on
+    the Mem0 path, logs it, sets ``_mem0_error``, and then returns a perfectly
+    NORMAL ``AddMemoryResponse`` whose ``message`` carries
+    ``[mem0_error: ...]``. Trusting the absence of an exception would therefore
+    mark the record repaired AFTER the delete already removed the only copy --
+    permanent content loss reported as a clean sweep.
+
+    Three independent things must all hold, because each can fail alone:
+      * ``memory_ids`` is non-empty  -- an empty result is mem0's silent
+        dedup/infer no-op drop;
+      * ``mem0`` appears in ``stores_written`` -- a Graphiti-only write has not
+        restored the Qdrant copy the delete removed;
+      * ``message`` carries no ``mem0_error`` -- the swallowed-failure marker.
+
+    Stores are compared via ``getattr(s, 'value', s)`` so a real
+    ``SourceStore`` member, a plain ``'mem0'`` string, and a test double all
+    read identically.
+    """
+    memory_ids = getattr(response, 'memory_ids', None) or []
+    if not memory_ids:
+        return False, 'add_memory returned no memory_ids'
+
+    stores = getattr(response, 'stores_written', None) or []
+    if not any(getattr(store, 'value', store) == 'mem0' for store in stores):
+        return False, 'add_memory did not report a mem0 write in stores_written'
+
+    message = getattr(response, 'message', '') or ''
+    if 'mem0_error' in message:
+        return False, 'add_memory reported a swallowed mem0_error'
+
+    return True, ''
+
+
+def routes_to_mem0(payload: dict) -> tuple[bool, str]:
+    """Return (True, '') only when this payload's category writes to mem0.
+
+    Pure, no I/O. ``write_mem0 = resolved_category in MEM0_PRIMARY or
+    dual_write`` in ``MemoryService.add_memory``, so re-adding a
+    Graphiti-primary record after a mem0-scoped delete would put the repaired
+    text in Graphiti ONLY and the Qdrant copy would simply be gone.
+    ``dual_write=True`` is not a fix either: it would duplicate the Graphiti
+    copy that ``delete_memory(store='mem0')`` deliberately left alive. Unsafe in
+    both directions, so the sweep refuses to choose and leaves the record for a
+    human.
+
+    An absent or unrecognised category is refused rather than optimistically
+    assumed mem0-routed -- the fail-safe direction is always "do not delete".
+    """
+    raw = payload.get('category')
+    if not raw:
+        return False, 'payload carries no category, so its store routing is unknown'
+    try:
+        category = MemoryCategory(raw)
+    except ValueError:
+        return False, f'payload category {raw!r} is not a recognised MemoryCategory'
+    if category not in MEM0_PRIMARY:
+        return False, (
+            f'payload category {category.value!r} is not MEM0_PRIMARY, so a re-add '
+            'would not restore the mem0 copy'
+        )
+    return True, ''
+
+
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
@@ -276,12 +356,19 @@ async def run(args: Any, memory_service: Any) -> dict:
     never an in-place Qdrant payload SET, which would leave a stale vector
     pointing at the corrupted string.
 
-    If the delete SUCCEEDS and the re-add RAISES, the content is gone from the
-    store and lives only in this report. That case is recorded loudly
-    (``content_lost_in_flight`` with both ids, the original content, the
-    repaired content, and the error) and never swallowed -- a silent
-    half-completed repair would destroy the very text this sweep exists to
-    preserve.
+    Every repair is PRE-FLIGHT checked (:func:`routes_to_mem0` -- a record whose
+    category would not be re-written to mem0 is never deleted, and is flagged
+    ``skipped_not_mem0_routed``) and POSTCONDITION verified
+    (:func:`readd_persisted` -- ``repaired`` is set only on proof of a mem0
+    write).
+
+    If the delete SUCCEEDS and the re-add does not persist -- whether it RAISED
+    or merely returned a response that does not evidence a write -- the content
+    is gone from the store and lives only in this report. Both are recorded
+    identically and loudly (``content_lost_in_flight`` with both ids, the
+    original content, the repaired content, and the reason) and never
+    swallowed: a silent half-completed repair would destroy the very text this
+    sweep exists to preserve.
     """
     scan = await memory_service.scan_memory_content(
         project_id=args.project_id,
@@ -340,9 +427,35 @@ async def _repair_record(
     Mutates *record* in place with the outcome. The delete comes FIRST: a
     re-add first would leave both copies live if the delete then failed, which
     is a duplicate rather than a repair.
+
+    PRE-FLIGHT, before anything is deleted: :func:`routes_to_mem0` must vouch
+    for the payload's category. A record that would not be re-written to mem0
+    is skipped entirely -- no delete, no add -- and flagged
+    ``skipped_not_mem0_routed`` for a human.
+
+    POSTCONDITION, after the re-add: :func:`readd_persisted` must vouch for the
+    response. ``repaired=True`` is set ONLY then. A non-raising ``add_memory``
+    that did not actually persist is treated IDENTICALLY to a throw -- same
+    ``content_lost_in_flight`` flag, same ``logger.error`` -- because the
+    consequence is identical: the delete landed and the text now lives only in
+    this report.
     """
     memory_id = match.get('id')
     repaired = record.get('repaired_content')
+
+    routed, routing_reason = routes_to_mem0(payload)
+    if not routed:
+        record['skipped_not_mem0_routed'] = True
+        record['error'] = routing_reason
+        logger.warning(
+            'sweep_toolcall_xml_leak: refusing to repair memory_id=%s -- %s. '
+            'Neither a plain re-add (mem0 copy lost) nor dual_write=True '
+            '(duplicate Graphiti copy) is safe here, so the record is left '
+            'entirely untouched for human review.',
+            memory_id, routing_reason,
+        )
+        return
+
     await memory_service.delete_memory(
         memory_id=memory_id,
         store='mem0',
@@ -357,22 +470,40 @@ async def _repair_record(
             metadata={'x_repaired_from_memory_id': memory_id},
         )
     except Exception as exc:
-        # The point is already deleted, so the original text now exists ONLY in
-        # this report. Say so as loudly as possible.
-        record['content_lost_in_flight'] = True
-        record['error'] = str(exc)
-        logger.error(
-            'sweep_toolcall_xml_leak: CONTENT LOST IN FLIGHT for memory_id=%s -- '
-            'the corrupted point was deleted but the repaired re-add failed (%s). '
-            'The original and repaired text are in this run report; restore by '
-            'hand. No further records were harmed.',
-            memory_id, exc,
-        )
+        _report_content_lost(record, memory_id, str(exc))
         return
 
     new_ids = getattr(response, 'memory_ids', None) or []
-    record['repaired'] = True
+    # Record whatever ids came back BEFORE judging the response, so a human
+    # chasing a loss has every handle this run ever saw.
     record['new_id'] = new_ids[0] if new_ids else None
+
+    persisted, reason = readd_persisted(response)
+    if not persisted:
+        message = getattr(response, 'message', '') or ''
+        _report_content_lost(record, memory_id, f'{reason} (add_memory message: {message})')
+        return
+
+    record['repaired'] = True
+
+
+def _report_content_lost(record: dict, memory_id: Any, error: str) -> None:
+    """Flag *record* as content-lost-in-flight and say so as loudly as possible.
+
+    Shared by the raising and the non-raising-but-unpersisted branches of
+    :func:`_repair_record`, because the two are the SAME failure: the point is
+    already deleted, so the original text now exists only in this report.
+    ``repaired`` is deliberately left False.
+    """
+    record['content_lost_in_flight'] = True
+    record['error'] = error
+    logger.error(
+        'sweep_toolcall_xml_leak: CONTENT LOST IN FLIGHT for memory_id=%s -- '
+        'the corrupted point was deleted but the repaired re-add did not persist '
+        '(%s). The original and repaired text are in this run report; restore by '
+        'hand. No further records were harmed.',
+        memory_id, error,
+    )
 
 
 def resolve_exit_code(report: dict) -> int:
@@ -383,6 +514,12 @@ def resolve_exit_code(report: dict) -> int:
     or was truncated -- in both cases it covered less than the whole corpus,
     and a zero exit would let a partial sweep read as a complete one. Pure,
     sync, no I/O.
+
+    Two per-record outcomes also force non-zero, both needing a human:
+    ``content_lost_in_flight`` (the delete landed but the re-add did not
+    persist, so the text survives only in the printed report) and
+    ``skipped_not_mem0_routed`` (a repairable record whose category does not
+    route to mem0, left entirely untouched).
     """
     if report['dry_run']:
         return 0
@@ -390,8 +527,9 @@ def resolve_exit_code(report: dict) -> int:
         return 1
     if report.get('truncated'):
         return 1
-    if any(record.get('content_lost_in_flight') for record in report.get('records', [])):
-        return 1
+    for record in report.get('records', []):
+        if record.get('content_lost_in_flight') or record.get('skipped_not_mem0_routed'):
+            return 1
     return 0
 
 
