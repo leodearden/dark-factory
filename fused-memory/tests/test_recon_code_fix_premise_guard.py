@@ -7,6 +7,7 @@ live source/test re-verification (verify_premise_refuted).
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 from fused_memory.middleware.task_curator import CandidateTask
@@ -750,24 +751,39 @@ class TestSeedRegistryRealSource:
         assert verify_premise_refuted(entry, self.SOURCE_ROOT) is True
         assert premise_refuted_entry(candidate, entries, self.SOURCE_ROOT) is not None
 
+    # Candidate shared by the over-broad-anchoring guard and its inverse control.
+    # The title carries BOTH anchor tokens ("deterministic", "escalation") BY
+    # CONSTRUCTION — match_candidate requires ALL title_substrings, so without
+    # both tokens the candidate would die at the TITLE gate and the description
+    # anchor these tests exist to pin would never be exercised.
+    _LEGITIMATE_PROPOSAL_TITLE = (
+        "Expose an archive-inclusive escalation lookup for deterministic gate tasks"
+    )
+
     def test_legitimate_archive_inclusive_lookup_proposal_is_not_dropped(self):
         """Over-broad-anchoring guard: task 3023's OWN framing must still reach
         the architect.
 
-        Its title carries both "deterministic" and "escalation" and its
-        description mentions gate_escalated_at, so anchoring the entry on those
-        tokens alone would have dropped the very task that fixed the bug. The
-        description anchor is deliberately restricted to assertion-of-absence
-        phrasings; this test pins that separation as executable, not a comment.
+        The title carries both anchor tokens by construction (see
+        _LEGITIMATE_PROPOSAL_TITLE) — that is precisely what makes the
+        DESCRIPTION anchor reachable, so this test rejects on the anchor it
+        claims to pin rather than on the title gate. The description mentions
+        get_task_escalations and gate_escalated_at but asserts no absence.
+
+        The executable guards are (c) the dataclasses.replace mutation control
+        below and (d) test_absence_phrasing_with_same_title_does_match — not
+        this docstring. Widening description_substrings to a bare
+        "gate_escalated_at" token now FAILS (c) instead of sliding through
+        green, which is the regression that let the shipped bug through.
         """
-        from fused_memory.middleware.recon_code_fix_premise_guard import premise_refuted_entry
+        from fused_memory.middleware.recon_code_fix_premise_guard import (
+            match_candidate,
+            premise_refuted_entry,
+        )
 
         entries = self._load_entries()
         candidate = CandidateTask(
-            title=(
-                "Expose a task-scoped archive-inclusive escalation MCP lookup and "
-                "point recon stages at it"
-            ),
+            title=self._LEGITIMATE_PROPOSAL_TITLE,
             description=(
                 "Add get_task_escalations to the escalation MCP server so an auditor "
                 "of a deterministic gate task stamped metadata.gate_escalated_at can "
@@ -776,10 +792,58 @@ class TestSeedRegistryRealSource:
             ),
         )
 
+        # (b) match_candidate localises the rejection to the DESCRIPTION anchor;
+        # premise_refuted_entry alone would also be satisfied by a title-gate
+        # rejection, which is how the shipped version of this test passed
+        # vacuously.
+        assert match_candidate(candidate, entries) is None, (
+            "A legitimate proposal to ADD the archive-inclusive lookup must not "
+            "match any registry entry — only assertion-of-absence claims are refuted."
+        )
         assert premise_refuted_entry(candidate, entries, self.SOURCE_ROOT) is None, (
             "A legitimate proposal to ADD the archive-inclusive lookup must not be "
             "dropped by the guard — only assertion-of-absence claims are refuted."
         )
+
+        # (c) MUTATION CONTROL — the assertion whose absence let the shipped bug
+        # through. PremiseEntry is a frozen dataclass, so widen ONLY the
+        # description anchor in memory and prove the candidate then DOES match.
+        # That proves the title gate PASSES for this candidate, i.e. the narrow
+        # description anchor is the only thing protecting it.
+        entry = next(
+            e for e in entries
+            if e.name == "deterministic_gate_escalation_record_archived_not_missing"
+        )
+        widened = dataclasses.replace(entry, description_substrings=["gate_escalated_at"])
+        assert match_candidate(candidate, [widened]) is not None, (
+            "The candidate must pass the TITLE gate — otherwise this test rejects "
+            "on the title, not the description anchor, and the over-broad-anchoring "
+            "property it claims to guard is untested."
+        )
+
+    def test_absence_phrasing_with_same_title_does_match(self):
+        """INVERSE CONTROL — same title, only the absence phrasing flips the outcome.
+
+        Pins the description anchor from the other side: with an identical
+        title to the legitimate-proposal case above, adding
+        "no escalation record exists" is sufficient to match the entry. The
+        pair together CHARACTERISES the anchor instead of sampling one side.
+        """
+        from fused_memory.middleware.recon_code_fix_premise_guard import match_candidate
+
+        entries = self._load_entries()
+        candidate = CandidateTask(
+            title=self._LEGITIMATE_PROPOSAL_TITLE,
+            description="task stamped gate_escalated_at but no escalation record exists",
+        )
+
+        entry = match_candidate(candidate, entries)
+        assert entry is not None, (
+            "An assertion-of-absence claim must match even when the title is the "
+            "same as a legitimate proposal — the description anchor is what separates "
+            "them."
+        )
+        assert entry.name == "deterministic_gate_escalation_record_archived_not_missing"
 
     def test_all_four_incidents_via_premise_refuted_entry(self):
         """premise_refuted_entry composes match + verify for all four incidents
