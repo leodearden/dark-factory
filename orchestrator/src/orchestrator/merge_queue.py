@@ -14047,21 +14047,36 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # runs, and moot on the warm path anyway (any other local verify
             # would contend on the same lane lock).
             #
-            # The finally is LOAD-BEARING: put_nowait/on_requeued/_note_requeue
-            # are all synchronous, so a cancellation landing inside the backoff
-            # (shutdown mid-defer) still re-queues the request before
-            # CancelledError propagates.  Without it the request would be lost
-            # outright — worktree already cleaned above, req.result PENDING
-            # forever, nothing on _queue to re-dispatch.
+            # task 3003 (review fix 4): the requeue bookkeeping deliberately
+            # runs ONLY on the non-cancelled path — NOT from a `finally`.
+            # A CANCELLING CALLER OWNS THE REQUEST.  That is the pre-existing
+            # convention on this coroutine: the operator-halt and dead-verify
+            # defer branches above also await before their put_nowait, and a
+            # cancellation there simply skips the requeue.  All three
+            # production cancel sites already discharge the request
+            # themselves:
+            #   - stop()'s finalizing-head short-circuit (~10796) and its
+            #     _inflight drain (~10921) BOTH resolve req.result with the
+            #     shutdown outcome and _retire_item BEFORE cancelling
+            #     verify_task;
+            #   - _verifier_loop's head-failure cascade (~12631) either
+            #     re-queues the entry itself (the _head_was_requeued branch)
+            #     or re-dispatches it through _remerge.
+            # Re-queuing from a `finally` would DOUBLE-file the request at
+            # every one of them.  Worst case is the cascade: a task cancelled
+            # inside the sleep is `cancelled()`, so `_entry_status` stays None
+            # and the REQUEUED `continue` guard at ~12693 does not fire;
+            # control reaches the `_head_was_requeued and ...cancelled()`
+            # branch, whose only other guard is `not _entry_req.result.done()`
+            # — and a deferred request's future is deliberately left PENDING.
+            # The request would land on _queue TWICE and be merged twice.
             _waited = float(getattr(exc, 'wait_secs', 0.0) or 0.0)
             _backoff = max(0.0, self.CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS - _waited)
-            try:
-                if _backoff:
-                    await asyncio.sleep(_backoff)
-            finally:
-                self._queue.put_nowait(req)
-                self._request_ledger.on_requeued(req.request_id)
-                self._note_requeue(req.request_id, live_obj=req)
+            if _backoff:
+                await asyncio.sleep(_backoff)
+            self._queue.put_nowait(req)
+            self._request_ledger.on_requeued(req.request_id)
+            self._note_requeue(req.request_id, live_obj=req)
             return InflightVerifyResult(
                 outcome=None,
                 merge_wt=None,

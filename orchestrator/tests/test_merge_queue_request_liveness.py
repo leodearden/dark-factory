@@ -2004,22 +2004,27 @@ class TestContendedLeaseDefers:
         assert not req.result.done()
         assert not q.empty()
 
-    async def test_cancel_during_defer_backoff_still_requeues(
+    async def test_cancel_during_defer_backoff_leaves_requeue_to_canceller(
         self,
         warm_git_ops: GitOps,
         warm_config: OrchestratorConfig,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """task 3003 review fix (1), safety: the backoff must be
-        cancellation-safe.
+        """task 3003 review fix (4): A CANCELLING CALLER OWNS THE REQUEST.
 
         ``_run_inflight_verify`` runs as a background ``ensure_future`` task, so
-        a shutdown (or any cancellation) can land INSIDE the new backoff — a
-        window that sits between ``_release_or_cleanup`` (worktree already
-        gone) and ``put_nowait``.  If the requeue bookkeeping is not run on the
-        cancellation path the request is silently LOST: disk cleaned, future
-        still PENDING, nothing on the queue, nothing in the ledger.  The three
-        synchronous requeue calls must therefore run from a ``finally``.
+        a cancellation can land INSIDE the defer backoff.  It must NOT re-queue
+        from a ``finally`` there: every production cancel site already
+        discharges the request itself (``stop()`` resolves it with the shutdown
+        outcome and retires it BEFORE cancelling; ``_verifier_loop``'s
+        head-failure cascade either re-queues the entry or re-dispatches it via
+        ``_remerge``), so a ``finally`` would DOUBLE-file it.
+
+        This pins the convention already followed by the operator-halt and
+        dead-verify defer branches on this same coroutine: they await before
+        ``put_nowait`` too, and a cancellation there simply skips the requeue.
+        The sibling test below drives the cascade path that a ``finally`` would
+        actually corrupt.
         """
         from orchestrator.git_ops import MergeVerifyLeaseHeld  # noqa: PLC0415
         from orchestrator.merge_queue import SpeculativeMergeWorker  # noqa: PLC0415
@@ -2080,17 +2085,19 @@ class TestContendedLeaseDefers:
             with contextlib.suppress(asyncio.CancelledError):
                 await verify_fut
 
-        assert not q.empty(), (
-            'cancellation mid-backoff must NOT lose the request — the worktree '
-            'is already cleaned up, so a request that never reaches _queue is '
-            'gone for good (future PENDING forever, nothing to re-dispatch)'
+        assert q.empty(), (
+            'cancellation mid-backoff must NOT re-queue: the cancelling caller '
+            'owns the request. stop() has already resolved+retired it, and the '
+            'head-failure cascade re-queues or re-dispatches it itself — a '
+            'requeue from here would put it on _queue a SECOND time'
         )
-        assert req.request_id not in worker._request_ledger.open_request_ids(), (
-            'on_requeued must still clear the ledger entry on the cancellation '
-            'path, else the parked request ages out and false-alarms'
+        assert req.request_id in worker._request_ledger.open_request_ids(), (
+            'the ledger entry must survive too: on_requeued belongs to the '
+            'cancelling caller, which re-arms (or retires) the request itself'
         )
         assert not req.result.done(), (
-            'a cancelled defer must still leave req.result PENDING'
+            'a cancelled defer must still leave req.result PENDING — resolving '
+            'it is likewise the canceller\'s job'
         )
 
     async def test_defer_streak_caps_terminally_after_max_contention_secs(
