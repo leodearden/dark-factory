@@ -29,8 +29,9 @@
 #   --img       /media/leo/data_lv_1/leo/reify-warm-lanes.img
 #   --mount     ${REIFY_WARM_LANE_MOUNT:-<worktree_base>/warm-lanes}
 #               (<worktree_base> is derived from REPO_ROOT's parent, ascending
-#                past a `worktrees/` directory so that the default mount lives
-#                next to the worktrees tree, not inside one worktree.)
+#                past a worktrees directory — `worktrees` or `.worktrees` — so
+#                that the default mount lives next to the worktrees tree, not
+#                inside one worktree.)
 #
 # XFS inode geometry (-i maxpct=50 -i size=512):
 #   Reflink shares EXTENTS, not inodes — base + N CoW lanes are each a full
@@ -65,26 +66,44 @@ err()   { printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2; }
 # <repo>/orchestrator/warm-lanes. This RESTORES the pre-relocation semantics;
 # it is a requirement of behaviour parity, not a change to it.
 #
-# Prefer git: inside a worktree it yields that checkout's root, which is what
-# the ".." used to yield and what _default_mount()'s ascend-past-worktrees
-# logic expects. Fall back to path arithmetic when git is absent or this is
-# not a checkout (a fresh host provisioning the pool substrate from an
-# unpacked tree).
+# PURE PATH ARITHMETIC, deliberately: the depth below the repo root is fixed by
+# the repo layout, the file physically lives inside whichever checkout (or
+# linked worktree) is running it, so ascending three levels yields that
+# checkout's own root exactly as the old ".." did — and it reads NO environment.
+#
+# A `git -C "$_SCRIPT_DIR" rev-parse --show-toplevel` probe was tried first and
+# REJECTED, because all three of its failure modes are the very wrong-path class
+# this delta exists to prevent, and each is strictly worse than the arithmetic:
+#   - it honours an INHERITED GIT_DIR (the standard git-hook /
+#     `git rebase --exec` / filter-branch environment), where it returns
+#     $_SCRIPT_DIR itself and the advertised mount becomes
+#     <repo>/orchestrator/scripts/warm-lanes;
+#   - it ASCENDS INTO AN ENCLOSING repo, so an unpacked tree sitting anywhere
+#     inside e.g. a dotfiles checkout resolves to that outer root;
+#   - it returns the SYMLINK-RESOLVED path where both the old ".." and this
+#     arithmetic return the logical one, so the two disagree under a symlinked
+#     ancestor (reify's production .worktrees is exactly such a symlink).
+# An existence guard cannot catch any of them: the wrong paths all exist.
 _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(git -C "$_SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
-if [ -z "$REPO_ROOT" ] || [ ! -d "$REPO_ROOT" ]; then
-    REPO_ROOT="$(cd "$_SCRIPT_DIR/../../.." && pwd)"
-fi
+REPO_ROOT="$(cd "$_SCRIPT_DIR/../../.." && pwd)"
 
-# ── default mount dir: ascend past worktrees/ if present ──────────────────────
+# ── default mount dir: ascend past the worktrees dir if present ────────────────
 _default_mount() {
     local parent
     parent="$(dirname "$REPO_ROOT")"
-    # If the repo root is inside a worktrees/ directory, surface one level higher
+    # If the repo root is inside a worktrees directory, surface one level higher
     # so the warm-lanes dir lives beside the worktrees tree, not inside a worktree.
-    if [ "$(basename "$parent")" = "worktrees" ]; then
-        parent="$(dirname "$parent")"
-    fi
+    #
+    # RELOCATION DELTA (dark-factory task 3072) — see README.md. reify's copy
+    # matched only the literal `worktrees`; dark-factory's own worktree dir is
+    # `.worktrees` (GitConfig.worktree_dir default), a shape the relocation
+    # makes newly reachable — run from a task worktree the inherited test would
+    # fail to ascend and advertise <repo>/.worktrees/warm-lanes, i.e. INSIDE
+    # the worktrees tree, which is precisely what this ascend exists to
+    # prevent. Matching both spellings preserves the intent at the new home.
+    case "$(basename "$parent")" in
+        worktrees|.worktrees) parent="$(dirname "$parent")" ;;
+    esac
     echo "$parent/warm-lanes"
 }
 

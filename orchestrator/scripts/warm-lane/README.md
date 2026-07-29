@@ -88,7 +88,9 @@ to any script.
 
 ### Delta 1 — `provision-warm-lane-fs.sh`, `REPO_ROOT` resolution
 
-**The only file-content divergence from reify in this directory.**
+**The only file-content divergence from reify in this directory** (together
+with Delta 2 below, which is in the same file and the same concern:
+path resolution at the new home).
 
 The script derives `REPO_ROOT` from its own location, and `_default_mount()`
 hangs the operator-facing default `--mount` off it. In reify the script sat at
@@ -99,23 +101,54 @@ inherited `..` lands on `<repo>/orchestrator/scripts` — silently advertising
 dir, to an operator about to provision a multi-terabyte volume.
 
 So a literal byte-copy would BREAK parity here rather than preserve it. The
-relocated copy resolves the repo root by preferring
-`git -C "$_SCRIPT_DIR" rev-parse --show-toplevel` and falling back to path
-arithmetic at the new depth when git is absent or this is not a checkout (a
-fresh host provisioning the substrate from an unpacked tree). git is preferred
-because inside a worktree it yields that checkout's root — exactly what the
-old `..` yielded, and what `_default_mount()`'s ascend-past-`worktrees/` logic
-expects.
+relocated copy ascends three levels instead of one, by **pure path
+arithmetic**: `REPO_ROOT="$(cd "$_SCRIPT_DIR/../../.." && pwd)"`. The depth
+below the repo root is fixed by the repo layout, the file physically lives
+inside whichever checkout (or linked worktree) is running it, and the
+expression reads **no environment at all** — so it yields that checkout's own
+root, logically spelled, exactly as the old `..` did.
+
+A `git -C "$_SCRIPT_DIR" rev-parse --show-toplevel` probe was tried first and
+**rejected**. Each of its three failure modes lands in the same wrong-path
+class this delta exists to prevent, and an existence guard catches none of
+them because every wrong path exists:
+
+| Failure mode | Result |
+|---|---|
+| Inherited `GIT_DIR` (the standard git-hook / `git rebase --exec` / filter-branch environment) is not cleared | returns `$_SCRIPT_DIR` itself → mount `<repo>/orchestrator/scripts/warm-lanes` |
+| Ascends into any **enclosing** repo | an unpacked tree inside e.g. a dotfiles checkout resolves to that outer root, and the "fresh host" fallback never fires |
+| Returns the **symlink-resolved** path, where `..` and the arithmetic return the logical one | the two disagree under a symlinked ancestor — reify's production `.worktrees` is one |
 
 **This restores the pre-relocation semantics; it does not change behaviour.**
-Everything downstream — `_default_mount`, the usage text, `--img` / `--mount`
-/ `--grow` handling, and the XFS/loopback semantics PRD §10 puts out of scope
-— is untouched. Pinned by
+Everything downstream — the usage text, `--img` / `--mount` / `--grow`
+handling, and the XFS/loopback semantics PRD §10 puts out of scope — is
+untouched. Pinned by
 `orchestrator/tests/test_warm_lane_scripts_shipped.py::TestProvisionRepoRootParity`,
-which covers the checkout case, the no-git fallback, and the
-ascend-past-worktrees mirror case.
+which covers the checkout case, the no-git-metadata case, an inherited
+`GIT_DIR`, and the two ascend-past-worktrees spellings.
 
-### Delta 2 — `warm-lane-gc.sh` / `thin-warm-lane.sh` sibling-seed defaults
+### Delta 2 — `provision-warm-lane-fs.sh`, `_default_mount` worktrees spelling
+
+Same file, same concern as Delta 1: a path derivation whose inherited form
+does not survive the new home.
+
+`_default_mount()` ascends one level when the repo root's parent is a
+worktrees directory, so the warm-lanes dir lands BESIDE the worktrees tree
+rather than inside one worktree. reify's copy tested for the literal
+`worktrees`. dark-factory's own worktree directory is **`.worktrees`**
+(`GitConfig.worktree_dir` default, `orchestrator/src/orchestrator/config.py`),
+a shape the relocation makes newly reachable — run from a task worktree, which
+is the normal way an agent or operator in this repo would invoke it, the
+inherited test fails to match and the advertised default becomes
+`<repo>/.worktrees/warm-lanes`: inside the worktrees tree, the exact outcome
+the ascend exists to prevent.
+
+The relocated copy matches **both spellings** (`worktrees` and `.worktrees`).
+Like Delta 1 this preserves the ascend's intent at the new depth rather than
+changing it, and it is pinned by the `.worktrees` case in
+`TestProvisionRepoRootParity`.
+
+### Delta 3 — `warm-lane-gc.sh` / `thin-warm-lane.sh` sibling-seed defaults
 
 A **documented behavioural caveat, deliberately NOT patched** — no file
 content diverges. Both scripts default `--seed-script` to a sibling
