@@ -6855,18 +6855,6 @@ class TestProseRightBoundarySignal:
             ]
         )
 
-    def test_backend_is_not_a_generic_dir(self):
-        """Anti-vacuity precondition for the negative case below.
-
-        If 'backend' were ever added to ``_GENERIC_DIRS`` it would be dropped
-        from every registry, and ``test_english_slash_construction_...`` would
-        then pass for the wrong reason (prefix never registered) rather than
-        because the right-boundary assertion rejected it.
-        """
-        from fused_memory.middleware.project_prefix_registry import _GENERIC_DIRS
-
-        assert 'backend' not in _GENERIC_DIRS
-
     @pytest.mark.asyncio
     async def test_english_slash_construction_is_not_flagged(
         self,
@@ -6878,7 +6866,8 @@ class TestProseRightBoundarySignal:
         """NEGATIVE — the measured false positive this task exists to remove.
 
         'not a backend/timeout error' is English punctuation, not a path.
-        'backend/' IS a registered prefix owned by 'webapp' (asserted above),
+        'backend/' IS a registered prefix owned by 'webapp' (asserted inline
+        below against the built registry, which is the anti-vacuity guard),
         and metadata.files are all in-project, so before task 3120 this
         submission was stamped with possible_scope_mismatch and fired a
         scope_violation escalation. It must now do neither.

@@ -11,9 +11,11 @@ dark_factory constants coverage.)
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from fused_memory.middleware.path_scope_guard import (
+    _RIGHT_CONTEXT,
     PathGuardVerdict,
     check_candidate_for_scope,
     check_files_for_scope,
@@ -71,9 +73,14 @@ class TestFindPaths:
     def test_single_match(self):
         assert find_paths('see crates/x.rs', ('crates/',)) == ['crates/']
 
-    def test_dedup_and_order(self):
+    def test_bare_segment_shape_no_match(self):
         """RE-POINTED by task 3120: the single-bare-segment shape is now
         deliberately NOT a match.
+
+        RENAMED from ``test_dedup_and_order``: it no longer exercises dedup or
+        ordering at all (the result is empty), so the old name contradicted
+        the assertion.  The real dedup/order test is
+        ``TestFindPathsRightBoundary::test_dedup_and_order_retained``.
 
         ``crates/a`` has no right-context that looks like a path segment (no
         further '/', no file extension), so under the right-boundary contract
@@ -107,9 +114,12 @@ class TestFindPaths:
         """A multi-segment path that passes *through* the prefix must not match."""
         assert find_paths('repo/test/corpus/expr.txt', ('corpus/',)) == []
 
-    def test_leading_prefix_still_matches(self):
+    def test_leading_prefix_without_right_context_no_match(self):
         """RE-POINTED by task 3120: the single-bare-segment shape is now
         deliberately NOT a match.
+
+        RENAMED from ``test_leading_prefix_still_matches`` — under the new
+        contract it asserts the opposite of what that name said.
 
         The LEFT boundary is still satisfied here (start-of-string), but the
         RIGHT boundary is not: ``x`` is neither followed by another '/' nor
@@ -120,9 +130,12 @@ class TestFindPaths:
         """
         assert find_paths('corpus/x', ('corpus/',)) == []
 
-    def test_space_preceded_still_matches(self):
+    def test_space_preceded_without_right_context_no_match(self):
         """RE-POINTED by task 3120: the single-bare-segment shape is now
         deliberately NOT a match.
+
+        RENAMED from ``test_space_preceded_still_matches`` — under the new
+        contract it asserts the opposite of what that name said.
 
         A space is still a valid LEFT boundary; the failure is on the right —
         ``x`` does not look like a path segment.  A synthetic fixture with no
@@ -253,8 +266,9 @@ class TestFindPathsRightBoundary:
     def test_dedup_and_order_retained(self):
         """Dedup + first-seen ordering still hold over genuine path text.
 
-        Retains the coverage dropped when ``TestFindPaths::test_dedup_and_order``
-        was re-pointed to the new contract.
+        Retains the coverage dropped when the case now named
+        ``TestFindPaths::test_bare_segment_shape_no_match`` was re-pointed to
+        the new contract.  This is the only remaining dedup/order assertion.
         """
         result = find_paths(
             'crates/a.rs then gui/b.json then crates/c/d.rs',
@@ -287,14 +301,50 @@ class TestFindPathsRightBoundary:
     # KNOWN FAIL-OPEN residue, deliberately not closed
     # ------------------------------------------------------------------
 
-    def test_known_fail_open_residue_leading_dot_file(self):
+    def test_known_fail_open_residue_extensionless_right_context(self):
         """MISSED detection, never a false one — pinned so the gap stays visible.
 
-        'docs/.gitignore' has an empty stem plus a >6-char extension, so it
-        satisfies neither right-context alternative.  Widening the classes to
-        admit it would start re-admitting the punctuation shapes above.
+        This is the LARGEST miss class introduced by task 3120, and the one
+        most likely to surprise: a bare directory reference or an
+        extensionless filename satisfies neither right-context alternative
+        (no further '/', no extension).  "changes in fused-memory/src", "see
+        orchestrator/routing" and "crates/Makefile" are all common prose
+        spellings in this repo and all silently stop being detected.
+
+        Accepted deliberately: admitting ``<word>/<word>`` is exactly the
+        English-punctuation shape this assertion exists to reject
+        ('backend/timeout', 'tools/call'), so there is no way to catch this
+        class without re-admitting the false positives.
+        """
+        assert find_paths('changes in fused-memory/src', ('fused-memory/',)) == []
+        assert find_paths('crates/reify-eval', ('crates/',)) == []
+        assert find_paths('crates/README', ('crates/',)) == []
+        assert find_paths('crates/Makefile', ('crates/',)) == []
+
+    def test_known_fail_open_residue_long_extension(self):
+        """MISSED detection, never a false one — pinned so the gap stays visible.
+
+        The mechanism is the ``{1,6}`` extension-LENGTH cap, not the leading
+        dot: an extension of 7+ chars fails the extension alternative whether
+        or not the stem is empty.  ``test_extension_length_cap_boundary``
+        below pins the cap itself; the contrast assertion here exists so a
+        reader does not generalise 'docs/.gitignore misses' into the false
+        rule 'dotfiles are missed'.
         """
         assert find_paths('docs/.gitignore', ('docs/',)) == []
+        assert find_paths('crates/x.markdown', ('crates/',)) == []
+        assert find_paths('crates/x.properties', ('crates/',)) == []
+        # CONTRAST: a SHORT-extension dotfile is not residue — it matches.
+        assert find_paths('docs/.env', ('docs/',)) == ['docs/']
+
+    def test_extension_length_cap_boundary(self):
+        """Pin the ``{1,6}`` magic number itself, on both sides of the edge.
+
+        Without this, the cap could be changed to any other value and no test
+        would notice.
+        """
+        assert find_paths('crates/x.abcdef', ('crates/',)) == ['crates/']  # 6 — in
+        assert find_paths('crates/x.abcdefg', ('crates/',)) == []  # 7 — out
 
     def test_known_fail_open_residue_glob_spelling(self):
         """MISSED detection, never a false one — pinned so the gap stays visible.
@@ -310,37 +360,51 @@ class TestFindPathsRightBoundary:
     # RETENTION: the task-1494 LEFT boundary survives the right-boundary change
     # ------------------------------------------------------------------
 
-    def test_left_boundary_contract_survives(self):
-        """All six task-1494 left-boundary shapes still return [] (task 3120).
+    def test_left_lookbehind_is_load_bearing_for_every_retained_fixture(self):
+        """The lookahead must not have relaxed the lookbehind — EXECUTED, not described.
 
         The right-boundary assertion is an ADDITIONAL narrowing, not a
-        replacement: adding a lookahead must not accidentally relax the
-        lookbehind.  Each shape below is individually covered in
-        ``TestFindPaths`` (in its extensioned spelling — the same companion
-        assertions added there by task 3120 step-4); asserting them together
-        here pins that the LEFT contract is still enforced *after* the
-        right-context assertion was introduced.
+        replacement.  But under a two-sided matcher an assertion of the form
+        ``find_paths(...) == []`` no longer identifies WHICH boundary did the
+        rejecting, so a left-boundary fixture whose right context is a bare
+        token (``a/corpus/x``) passes even with the lookbehind deleted
+        entirely — it is masked by the lookahead (design decision 6).
 
-        NON-MASKING — every fixture below carries a genuine right context (a
-        further '/' or a file extension), so the right-boundary lookahead
-        cannot be what makes it return ``[]``; only the left lookbehind can.
-        This is not asserted, it was measured: recompile ``_build_pattern``'s
-        regex with the left lookbehind ``(?:^|(?<=[^A-Za-z0-9_\\-/.]))``
-        deleted and ``_RIGHT_CONTEXT`` left in place —
-        ``re.compile(rf'({alts}){_RIGHT_CONTEXT}')`` — and all six flip from
-        ``[]`` to a match, so all six assertions here fail.  That recompile is
-        the reproduction procedure for anyone re-checking this claim.
+        This test therefore runs the discriminator instead of documenting it:
+        for each fixture it recompiles the pattern with ONLY the left
+        lookbehind removed and asserts the text DOES match that mutant.  A
+        fixture that fails this half is not testing the left boundary at all.
+        The paired ``== []`` on the real two-sided pattern is the other half:
+        together they establish that the left lookbehind is what rejects each
+        fixture.
 
-        Three fixtures therefore differ from their ``TestFindPaths`` originals
-        by an added ``.py``: the originals' bare ``x`` tail has no right
-        context, which masked the left boundary entirely (task 3120 step-4).
+        Supersedes the earlier ``test_left_boundary_contract_survives``, whose
+        equivalent claim lived in prose as a manual "recompile and check"
+        procedure that nothing executed.
         """
-        assert find_paths('a/corpus/x.py', ('corpus/',)) == []
-        assert find_paths('repo/test/corpus/expr.txt', ('corpus/',)) == []
-        assert find_paths('a.corpus/x.py', ('corpus/',)) == []
-        assert find_paths('pkg.corpus/grammar.js', ('corpus/',)) == []
-        assert find_paths('./corpus/x.py', ('corpus/',)) == []
-        assert find_paths('supercrates/x.rs', ('crates/',)) == []
+        fixtures = [
+            ('a/corpus/x.py', 'corpus/'),
+            ('repo/test/corpus/expr.txt', 'corpus/'),
+            ('a.corpus/x.py', 'corpus/'),
+            ('pkg.corpus/grammar.js', 'corpus/'),
+            ('./corpus/x.py', 'corpus/'),
+            ('supercrates/x.rs', 'crates/'),
+        ]
+        for text, prefix in fixtures:
+            # The real two-sided pattern rejects it...
+            assert find_paths(text, (prefix,)) == [], (
+                f'{text!r} unexpectedly matched {prefix!r} — the left boundary '
+                f'contract from task 1494 has regressed'
+            )
+            # ...and the LEFT lookbehind is what does the rejecting: delete
+            # only the lookbehind, keep _RIGHT_CONTEXT, and the text matches.
+            mutant = re.compile(rf'({re.escape(prefix)}){_RIGHT_CONTEXT}')
+            assert mutant.search(text) is not None, (
+                f'{text!r} does not exercise the left lookbehind: it is rejected '
+                f'by the right-boundary lookahead alone, so this fixture would '
+                f'still pass with the lookbehind deleted entirely. Give it a '
+                f'genuine right context (a further "/" or a file extension).'
+            )
 
 
 # ---------------------------------------------------------------------------
