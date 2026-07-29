@@ -44,6 +44,7 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
+from orchestrator.workflow_types import StewardInterrupted
 
 # ---------------------------------------------------------------------------
 # Fixtures (local — mirrors test_workflow_status_on_resume.py)
@@ -268,6 +269,67 @@ def _make_silent_steward() -> type:
     return _FakeSteward
 
 
+def _make_dismiss_and_publish_steward(
+    queue: EscalationQueue, task_id: str, *, delay: float = 0.05,
+) -> type:
+    """A steward that behaves exactly like the post-fix-A producer.
+
+    It DISMISSES its own pending L0 — which fires the queue's resolve callback
+    and wakes ``_wait_for_resolution`` — and THEN publishes the typed
+    ``StewardInterrupted('attempt_cap', wip_commits_present=True)`` that its
+    OTHER consumer (``_await_steward_completion``, reached via
+    ``_mark_blocked``) would read.
+
+    Dismiss-then-publish with no await between the two mirrors
+    ``TaskSteward._dismiss_capped_l0`` → ``_publish_outcome`` exactly, so the
+    waiter cannot resume between them: by the time it runs again, both the
+    dismissal and the publish have landed.  That is precisely the situation
+    this hygiene step exists for — on the run()-ESCALATED path nobody consumes
+    that publish.
+
+    The give-up runs as a background task after a short delay so the waiter
+    genuinely blocks and is genuinely woken by the resolve callback, rather
+    than finding an already-empty pending list and never exercising the wake
+    path at all.
+    """
+
+    class _FakeSteward:
+        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+            self._outcome_channel = None
+            self._wip_probe = None
+            self.give_up_task: asyncio.Task | None = None
+
+        def set_outcome_channel(self, channel) -> None:
+            self._outcome_channel = channel
+
+        def set_wip_probe(self, probe) -> None:
+            self._wip_probe = probe
+
+        async def _give_up(self) -> None:
+            await asyncio.sleep(delay)
+            for esc in queue.get_by_task(task_id, status='pending', level=0):
+                queue.resolve(
+                    esc.id,
+                    'Auto-dismissed: steward interrupted (attempt_cap) with WIP '
+                    'present — resuming plan, not escalating',
+                    dismiss=True,
+                    resolved_by='auto-dismissed',
+                )
+            if self._outcome_channel is not None:
+                self._outcome_channel.put_nowait(
+                    StewardInterrupted('attempt_cap', wip_commits_present=True),
+                )
+
+        async def start(self) -> None:
+            self.give_up_task = asyncio.create_task(self._give_up())
+
+        async def stop(self) -> None:
+            if self.give_up_task is not None:
+                await self.give_up_task
+
+    return _FakeSteward
+
+
 def _submit_l1(queue: EscalationQueue, task_id: str) -> Escalation:
     """Submit a pending LEVEL-1 escalation (severity 'blocking', not born-at-L2).
 
@@ -402,4 +464,99 @@ class TestEscalatedWaitIsBounded:
         roles = [c.args[0] for c in invoke_mock.await_args_list]
         assert IMPLEMENTER not in roles, (
             'the implementer must NOT be resumed when an L1 is open'
+        )
+
+
+@pytest.mark.asyncio
+class TestStaleOutcomeHygiene:
+    """The ESCALATED wait must leave no unconsumed steward outcome behind.
+
+    Making the run()-ESCALATED path viable (fixes A + C) means outcomes
+    published while ``_wait_for_resolution`` is the active waiter are never
+    consumed — that waiter is escalation-queue-only by design.  The outcome
+    then sits on ``_steward_outcome_channel`` indefinitely, and a LATER
+    ``_mark_blocked`` in the same workflow pops it out of
+    ``_await_steward_completion`` as if the steward had just published it.
+
+    A stale ``StewardInterrupted(wip_commits_present=True)`` is exactly the
+    task-2060 resume-plan outcome, so the consequence is a spurious
+    ``_requeue()`` driven by an outcome from a completed, already-dispositioned
+    escalation cycle.  (The hazard pre-dates task 3170 — ``StewardResolved`` is
+    published on every steward success and the run() path never drained either
+    — but fix A makes it reachable far more often.)
+    """
+
+    async def test_escalated_wait_drains_the_steward_outcome_channel(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """Post-fix-A producer: dismiss + publish → the wait consumes both."""
+        wt = await _make_advanced_worktree(git_ops, task_assignment.task_id)
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _submit_l0(queue, task_assignment.task_id)
+        workflow, _scheduler = _build_workflow(
+            config, git_ops, task_assignment, queue, wt,
+        )
+        _wire_resolve_callback(queue, workflow)
+        workflow._steward_factory = _make_dismiss_and_publish_steward(
+            queue, task_assignment.task_id,
+        )
+
+        await workflow._ensure_steward_started()
+        await asyncio.wait_for(workflow._wait_for_resolution(), 10)
+
+        # Precondition: the producer really did run the post-fix-A sequence.
+        assert queue.get(esc.id).resolved_by == 'auto-dismissed', (
+            'the fake steward must have dismissed its own L0 — otherwise this '
+            'test is measuring fix C\'s timeout, not the drain'
+        )
+        channel = workflow._steward_outcome_channel
+        assert channel is not None, 'the steward wiring must have created a channel'
+        assert channel.empty(), (
+            'the ESCALATED wait must drain the outcome channel on the way out; '
+            f'{channel.qsize()} outcome(s) were left for a later _mark_blocked '
+            f'to pop as if freshly published'
+        )
+
+        await workflow._steward.stop()
+
+    async def test_later_mark_blocked_cannot_pop_the_stale_outcome(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """The consequence, asserted directly on the sibling waiter.
+
+        With the scheduler status non-terminal, a subsequent
+        ``_await_steward_completion`` must synthesize a fresh grace-timeout
+        outcome — NOT hand back the ``attempt_cap`` interruption the run()
+        path already implicitly consumed a full cycle earlier.
+        """
+        wt = await _make_advanced_worktree(git_ops, task_assignment.task_id)
+        queue = EscalationQueue(tmp_path / 'queue')
+        _submit_l0(queue, task_assignment.task_id)
+        workflow, scheduler = _build_workflow(
+            config, git_ops, task_assignment, queue, wt,
+        )
+        _wire_resolve_callback(queue, workflow)
+        workflow._steward_factory = _make_dismiss_and_publish_steward(
+            queue, task_assignment.task_id,
+        )
+
+        await workflow._ensure_steward_started()
+        await asyncio.wait_for(workflow._wait_for_resolution(), 10)
+        await workflow._steward.stop()
+
+        assert await scheduler.get_status(task_assignment.task_id) not in (
+            'done', 'cancelled', 'deferred',
+        ), 'a terminal status would short-circuit _await_steward_completion'
+        outcome = await asyncio.wait_for(workflow._await_steward_completion(), 10)
+
+        assert isinstance(outcome, StewardInterrupted), (
+            f'nothing is published in this second cycle, so the grace period '
+            f'must elapse into a synthesized StewardInterrupted; got {outcome!r}'
+        )
+        assert outcome.reason == 'timeout', (
+            f'the second cycle must synthesize its OWN grace-timeout outcome, '
+            f'not replay the stale attempt_cap give-up the run()-ESCALATED wait '
+            f'already dispositioned — a stale wip-present interruption drives '
+            f'_mark_blocked straight into a spurious resume-plan requeue; got '
+            f'reason={outcome.reason!r}'
         )
