@@ -31,8 +31,11 @@ the corrupted text.
 Safety
 ------
 Dry-run is the default: the printed JSON report IS the investigation. Only two
-shapes are ever auto-repaired, and both are recoverable WITHOUT losing a single
-character of real content:
+shapes are ever auto-repaired, and for both the repair preserves the memory TEXT
+in full plus the payload metadata that is the record's only metadata-scoped
+retrieval axis (carry-over rule: ``payload keys - _MEM0_OWNED_KEYS``, with the
+scope identities threaded back as ``agent_id=``/``session_id=`` arguments and
+anything carried nowhere NAMED per-record in ``metadata_dropped``):
 
   ``repairable_tail``       the fragment runs to end-of-content and carries
                             nothing after its own marker (the c759c53b shape);
@@ -135,6 +138,62 @@ CLASSIFICATIONS = (CLEAN, REPAIRABLE_TAIL, REPAIRABLE_DUPLICATE, MANUAL_REVIEW)
 # judged identically to the existing sweeps ('data' is the canonical Qdrant
 # scroll-payload content key for infer=False writes).
 _CONTENT_KEYS: tuple[str, ...] = ('data', 'memory', 'content')
+
+
+# Payload keys that mem0/Qdrant OWN or re-derive on write, and which must
+# therefore never be forged back into an ``add_memory(metadata=...)`` call:
+#   'id'                      the Qdrant point id, assigned by the new write;
+#   'hash'                    mem0's content hash, recomputed from the content;
+#   'data'/'memory'/'content' the memory text itself, passed as ``content=``;
+#   'created_at'/'updated_at' mem0 timestamps, stamped by the new write;
+#   'user_id'/'agent_id'/'run_id'/'actor_id'/'role'
+#                             written from ``Scope`` (mem0_client.py:124-126),
+#                             so they are threaded as ARGUMENTS instead;
+#   'category'                overwritten by the service anyway
+#                             (memory_service.py:2193 ``meta['category'] = ...``).
+# No such constant already exists in the repo to reuse -- verified:
+# ``_MEM0_CONTENT_KEYS`` (memory_service.py:96) covers only the three content
+# keys. This set is therefore defined here deliberately, and must be kept in
+# step with mem0's payload shape.
+_MEM0_OWNED_KEYS: frozenset[str] = frozenset({
+    'id', 'hash', 'data', 'memory', 'content', 'created_at', 'updated_at',
+    'user_id', 'agent_id', 'run_id', 'actor_id', 'role', 'category',
+})
+
+# The subset of the owned keys that the repair DOES carry, just not as metadata:
+# the content goes in as ``content=``, and these go in via ``Scope``. Reporting
+# them as "dropped" would be a false alarm that buries the genuinely-lost ones.
+_ARGUMENT_CARRIED_KEYS: frozenset[str] = frozenset({
+    'data', 'memory', 'content', 'category', 'agent_id', 'run_id',
+})
+
+
+def carried_metadata(payload: dict, memory_id: Any) -> tuple[dict, list[str]]:
+    """Return (metadata to re-add with, sorted keys carried nowhere). Pure.
+
+    The carry-over rule is ``payload keys - _MEM0_OWNED_KEYS``, plus an
+    ``x_repaired_from_memory_id`` provenance marker. It exists because the
+    repair rebuilds the Qdrant point from scratch: anything not handed back to
+    ``add_memory`` is gone. And the caller metadata is not decoration --
+    ``get_memories_by_metadata``/``count_memories_by_metadata`` match payload
+    KEYS by equality via ``MatchValue`` (mem0_client.py:315-359), so those keys
+    are the repaired record's only metadata-scoped retrieval axis. Dropping
+    them would make the memory invisible to every consumer that could
+    previously find it.
+
+    The second element names only what is carried NOWHERE -- the owned keys
+    minus :data:`_ARGUMENT_CARRIED_KEYS` -- so the report flags real losses
+    rather than burying them among keys that went back in as arguments.
+
+    The caller's *payload* is never mutated.
+    """
+    metadata = {key: value for key, value in payload.items() if key not in _MEM0_OWNED_KEYS}
+    metadata['x_repaired_from_memory_id'] = memory_id
+    dropped = sorted(
+        key for key in payload
+        if key in _MEM0_OWNED_KEYS and key not in _ARGUMENT_CARRIED_KEYS
+    )
+    return metadata, dropped
 
 
 def extract_content(payload: dict) -> str:
@@ -439,6 +498,15 @@ async def _repair_record(
     ``content_lost_in_flight`` flag, same ``logger.error`` -- because the
     consequence is identical: the delete landed and the text now lives only in
     this report.
+
+    The repair is content-preserving in a precise sense: it preserves the memory
+    TEXT, and it preserves the payload metadata that is the record's only
+    metadata-scoped retrieval axis (:func:`carried_metadata`). The scope-carried
+    identities go back in as ARGUMENTS -- ``agent_id=`` and ``session_id=``,
+    since mem0 writes its ``run_id`` payload key from ``Scope.session_id``
+    (mem0_client.py:124-126) -- rather than being forged as metadata. Any key it
+    cannot carry is NAMED in ``metadata_dropped`` on the report rather than
+    dropped silently.
     """
     memory_id = match.get('id')
     repaired = record.get('repaired_content')
@@ -456,6 +524,12 @@ async def _repair_record(
         )
         return
 
+    metadata, dropped = carried_metadata(payload, memory_id)
+    # Recorded BEFORE the delete, so the audit survives even a lost-in-flight
+    # repair -- that is precisely when a hand restore needs it.
+    record['metadata_preserved'] = sorted(set(payload) - _MEM0_OWNED_KEYS)
+    record['metadata_dropped'] = dropped
+
     await memory_service.delete_memory(
         memory_id=memory_id,
         store='mem0',
@@ -467,7 +541,8 @@ async def _repair_record(
             category=payload.get('category'),
             project_id=args.project_id,
             agent_id=payload.get('agent_id'),
-            metadata={'x_repaired_from_memory_id': memory_id},
+            session_id=payload.get('run_id'),
+            metadata=metadata,
         )
     except Exception as exc:
         _report_content_lost(record, memory_id, str(exc))
