@@ -56,8 +56,25 @@ warn()  { printf '\033[1;33m[warn]\033[0m  %s\n' "$*" >&2; }
 err()   { printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2; }
 
 # ── locate repo root ───────────────────────────────────────────────────────────
+# RELOCATION DELTA (dark-factory task 3072, PRD leaf α) — see README.md.
+# In reify this script sat at <repo>/scripts/, so a single ".." reached the
+# repo root. Here it sits two levels deeper, at
+# <repo>/orchestrator/scripts/warm-lane/, and the inherited ".." would land on
+# <repo>/orchestrator/scripts — silently changing the operator-facing default
+# --mount that _default_mount() derives below from <repo>/../warm-lanes to
+# <repo>/orchestrator/warm-lanes. This RESTORES the pre-relocation semantics;
+# it is a requirement of behaviour parity, not a change to it.
+#
+# Prefer git: inside a worktree it yields that checkout's root, which is what
+# the ".." used to yield and what _default_mount()'s ascend-past-worktrees
+# logic expects. Fall back to path arithmetic when git is absent or this is
+# not a checkout (a fresh host provisioning the pool substrate from an
+# unpacked tree).
 _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$_SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="$(git -C "$_SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
+if [ -z "$REPO_ROOT" ] || [ ! -d "$REPO_ROOT" ]; then
+    REPO_ROOT="$(cd "$_SCRIPT_DIR/../../.." && pwd)"
+fi
 
 # ── default mount dir: ascend past worktrees/ if present ──────────────────────
 _default_mount() {

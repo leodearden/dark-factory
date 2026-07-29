@@ -86,7 +86,44 @@ paths and exit-code taxonomies are verbatim (renaming them is downstream
 work — leaves β/γ/δ/ε — not this leaf), and no provenance header is prepended
 to any script.
 
-*(none yet — filled in by later steps of task 3072)*
+### Delta 1 — `provision-warm-lane-fs.sh`, `REPO_ROOT` resolution
+
+**The only file-content divergence from reify in this directory.**
+
+The script derives `REPO_ROOT` from its own location, and `_default_mount()`
+hangs the operator-facing default `--mount` off it. In reify the script sat at
+`<repo>/scripts/`, so a single `..` reached the repo root. Here it sits two
+levels deeper, at `<repo>/orchestrator/scripts/warm-lane/`, where the
+inherited `..` lands on `<repo>/orchestrator/scripts` — silently advertising
+`<repo>/orchestrator/warm-lanes` instead of the repo's sibling `warm-lanes`
+dir, to an operator about to provision a multi-terabyte volume.
+
+So a literal byte-copy would BREAK parity here rather than preserve it. The
+relocated copy resolves the repo root by preferring
+`git -C "$_SCRIPT_DIR" rev-parse --show-toplevel` and falling back to path
+arithmetic at the new depth when git is absent or this is not a checkout (a
+fresh host provisioning the substrate from an unpacked tree). git is preferred
+because inside a worktree it yields that checkout's root — exactly what the
+old `..` yielded, and what `_default_mount()`'s ascend-past-`worktrees/` logic
+expects.
+
+**This restores the pre-relocation semantics; it does not change behaviour.**
+Everything downstream — `_default_mount`, the usage text, `--img` / `--mount`
+/ `--grow` handling, and the XFS/loopback semantics PRD §10 puts out of scope
+— is untouched. Pinned by
+`orchestrator/tests/test_warm_lane_scripts_shipped.py::TestProvisionRepoRootParity`,
+which covers the checkout case, the no-git fallback, and the
+ascend-past-worktrees mirror case.
+
+### Delta 2 — `warm-lane-gc.sh` / `thin-warm-lane.sh` sibling-seed defaults
+
+A **documented behavioural caveat, deliberately NOT patched** — no file
+content diverges. Both scripts default `--seed-script` to a sibling
+`seed-warm-lane.sh` that PRD §5 keeps project-owned, so at the new location
+that default cannot resolve. Rather than patch the scripts to guess at a
+project-owned path (PRD invariant C-1), the caller resolves it: see
+"Sibling-seed defaults, and who resolves them" below for which script is
+wired by the caller, which is left alone, and why.
 
 ## Sibling-seed defaults, and who resolves them
 
