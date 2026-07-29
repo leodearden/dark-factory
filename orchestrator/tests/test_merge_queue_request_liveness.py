@@ -1983,21 +1983,37 @@ class TestContendedLeaseDefers:
 
         worker._request_ledger.on_dequeue(req, now=1_000_000.0)
 
-        loop = asyncio.get_running_loop()
-        with patch.object(
-            warm_git_ops, 'reset_persistent_merge_worktree', _lease_contended_reset,
+        # Asserted on the SLEEP, not on wall-clock elapsed.  The sibling test
+        # above states the rule — an upper bound is timing-fragile — and it
+        # binds here: the timed region also releases the merge worktree (real
+        # git work), so on a loaded box (this repo runs its own merge workers
+        # concurrently) that cost dwarfs the 0.25s signal and an `elapsed <`
+        # bound false-fails.  The backoff duration is load-independent and
+        # pins the contract directly.
+        _sleeps: list[float] = []
+        _real_sleep = asyncio.sleep
+
+        async def _recording_sleep(delay: float, *a: object, **k: object) -> object:
+            _sleeps.append(float(delay))
+            return await _real_sleep(delay, *a, **k)
+
+        with (
+            patch.object(
+                warm_git_ops,
+                'reset_persistent_merge_worktree',
+                _lease_contended_reset,
+            ),
+            patch.object(asyncio, 'sleep', _recording_sleep),
         ):
-            t0 = loop.time()
             result = await asyncio.wait_for(
                 worker._run_inflight_verify(item, lease), timeout=15.0,
             )
-            elapsed = loop.time() - t0
 
-        assert elapsed < 0.2, (
+        assert not [d for d in _sleeps if d >= 0.2], (
             f'wait_secs=300.0 already exceeds the 0.25s minimum inter-attempt '
             f'period, so the defer must sleep ZERO additional seconds — the '
             f'backoff is max(0, PERIOD - wait_secs), not an unconditional '
-            f'extra sleep; took {elapsed:.3f}s'
+            f'extra sleep; slept {_sleeps!r}'
         )
         assert result.status == InflightStatus.REQUEUED
         assert result.outcome is None
