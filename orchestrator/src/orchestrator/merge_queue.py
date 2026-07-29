@@ -9164,6 +9164,25 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         ``_live_items`` ``InflightEntry`` whose request_id is absent from the
         ``_inflight`` deque.
 
+        task 3082: that window is now bounded on EVERY exit, not just the
+        ones that finalize. ``_finalize_inflight``'s DROPPED and REQUEUED
+        sentinel exits dispose of the entry explicitly before returning —
+        DROPPED via :meth:`_retire_item` (TERMINAL + ``_live_items`` pop; the
+        sole waiter has gone, so nothing will ever re-enter), REQUEUED via an
+        idempotent :meth:`_note_requeue` bounce to QUEUED carrying
+        ``live_obj=req`` (which REPLACES ``_live_items[rid]`` with the
+        ``MergeRequest``, and this method only counts ``InflightEntry``
+        values, so that object swap is what clears the head). Neither relies
+        on a caller retiring the entry later. Before that fix both exits
+        returned with the ``InflightEntry`` still in ``_live_items``, so this
+        method returned a PHANTOM finalize head for the rest of the process
+        lifetime — mis-reporting ``head_of_line``/``verify_in_progress``,
+        injecting a stale lease into ``snapshot()``'s ``occupancy.by_host``
+        for an actually-free host, and (the latent wedge) keeping a DEAD
+        merge commit at the :meth:`frozen_prefix_tip`, since
+        :meth:`_frozen_inflight_entries` appends this head whenever its phase
+        is in {verifying, gate_reverify, finalizing}.
+
         *inflight_ids*, if given, is used verbatim instead of re-deriving
         ``{e.item.request.request_id for e in self._inflight}``. Callers
         that already materialized that set for their own purposes (e.g.
@@ -15302,11 +15321,23 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     #      None nor QUEUED) and hand it to
                     #      `_coalesce_reentrant_drain`, which SILENTLY drops it
                     #      — so the request never re-entered the pipeline at
-                    #      all. Latent since task 2420 landed this abort (a
-                    #      requeue arriving at FINALIZING was noisy but
-                    #      RECOVERED, because the drain still appended
-                    #      unconditionally); ARMED by task 2852, which replaced
-                    #      that fall-through with the silent coalesce drop.
+                    #      all.
+                    #
+                    # PROVENANCE (why this stayed latent, then bit):
+                    #  · task 2420 (2026-07-10) landed this abort WITHOUT the
+                    #    `_note_requeue`. Harmless then: `_buffer_owned_request`
+                    #    still appended to the lane buffer UNCONDITIONALLY, so a
+                    #    requeue arriving at FINALIZING produced a noisy
+                    #    rejected-transition escalation but RECOVERED.
+                    #  · task 2852 (2026-07-20, edcddc5d75) replaced that
+                    #    fall-through with `_coalesce_reentrant_drain`'s silent
+                    #    drop — ARMING the latent omission and converting a
+                    #    noisy-but-recoverable path into a zombie factory.
+                    #  · task 2609 (2026-07-14) does NOT cover this path: it
+                    #    retires the finalize head on TERMINAL advance-failure
+                    #    outcomes, whereas this path returns
+                    #    `InflightStatus.REQUEUED` with `outcome=None` and never
+                    #    reaches a terminal advance at all.
                     #
                     # ATOMICITY: no `await` between the put_nowait and this
                     # call, so the merger loop's drain can never observe the
