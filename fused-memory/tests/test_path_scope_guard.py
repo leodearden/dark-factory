@@ -96,6 +96,12 @@ class TestFindPaths:
     def test_slash_preceded_no_match(self):
         """A prefix immediately preceded by '/' must NOT match (task-1494)."""
         assert find_paths('a/corpus/x', ('corpus/',)) == []
+        # task 3120: the bare fixture above is MASKED by the right-boundary
+        # lookahead — 'x' has no further '/' and no extension, so it is
+        # rejected on the right regardless of the left lookbehind.  The
+        # extensioned companion below is what actually pins the LEFT boundary:
+        # it flips to ['corpus/'] if the lookbehind is removed.
+        assert find_paths('a/corpus/x.py', ('corpus/',)) == []
 
     def test_deep_nested_slash_no_match(self):
         """A multi-segment path that passes *through* the prefix must not match."""
@@ -137,6 +143,12 @@ class TestFindPaths:
         """
         # Contrived single-char prefix: a.corpus/x
         assert find_paths('a.corpus/x', ('corpus/',)) == []
+        # task 3120: the bare fixture above is MASKED by the right-boundary
+        # lookahead ('x' has no further '/' and no extension, so it is
+        # rejected on the right regardless of the left lookbehind).  The
+        # extensioned companion below is what actually pins the LEFT boundary:
+        # it flips to ['corpus/'] if the lookbehind is removed.
+        assert find_paths('a.corpus/x.py', ('corpus/',)) == []
         # More realistic: a package/namespace separator before the prefix
         assert find_paths('pkg.corpus/grammar.js', ('corpus/',)) == []
 
@@ -149,6 +161,12 @@ class TestFindPaths:
         don't accidentally re-introduce it.
         """
         assert find_paths('./corpus/x', ('corpus/',)) == []
+        # task 3120: the bare fixture above is MASKED by the right-boundary
+        # lookahead — 'x' has no further '/' and no extension, so it is
+        # rejected on the right regardless of the left lookbehind.  The
+        # extensioned companion below is what actually pins the LEFT boundary:
+        # it flips to ['corpus/'] if the lookbehind is removed.
+        assert find_paths('./corpus/x.py', ('corpus/',)) == []
 
 
 # ---------------------------------------------------------------------------
@@ -298,20 +316,30 @@ class TestFindPathsRightBoundary:
         The right-boundary assertion is an ADDITIONAL narrowing, not a
         replacement: adding a lookahead must not accidentally relax the
         lookbehind.  Each shape below is individually covered in
-        ``TestFindPaths``; asserting them together here pins that the LEFT
-        contract is still enforced *after* the right-context assertion was
-        introduced, in the same commit that introduced it.
+        ``TestFindPaths`` (in its extensioned spelling — the same companion
+        assertions added there by task 3120 step-4); asserting them together
+        here pins that the LEFT contract is still enforced *after* the
+        right-context assertion was introduced.
 
-        Note these fixtures deliberately carry a genuine right context (a
-        further '/' or a file extension) where the original does, so a
-        failure here can only mean the left boundary regressed — it cannot be
-        masked by the new right-boundary rejection.
+        NON-MASKING — every fixture below carries a genuine right context (a
+        further '/' or a file extension), so the right-boundary lookahead
+        cannot be what makes it return ``[]``; only the left lookbehind can.
+        This is not asserted, it was measured: recompile ``_build_pattern``'s
+        regex with the left lookbehind ``(?:^|(?<=[^A-Za-z0-9_\\-/.]))``
+        deleted and ``_RIGHT_CONTEXT`` left in place —
+        ``re.compile(rf'({alts}){_RIGHT_CONTEXT}')`` — and all six flip from
+        ``[]`` to a match, so all six assertions here fail.  That recompile is
+        the reproduction procedure for anyone re-checking this claim.
+
+        Three fixtures therefore differ from their ``TestFindPaths`` originals
+        by an added ``.py``: the originals' bare ``x`` tail has no right
+        context, which masked the left boundary entirely (task 3120 step-4).
         """
-        assert find_paths('a/corpus/x', ('corpus/',)) == []
+        assert find_paths('a/corpus/x.py', ('corpus/',)) == []
         assert find_paths('repo/test/corpus/expr.txt', ('corpus/',)) == []
-        assert find_paths('a.corpus/x', ('corpus/',)) == []
+        assert find_paths('a.corpus/x.py', ('corpus/',)) == []
         assert find_paths('pkg.corpus/grammar.js', ('corpus/',)) == []
-        assert find_paths('./corpus/x', ('corpus/',)) == []
+        assert find_paths('./corpus/x.py', ('corpus/',)) == []
         assert find_paths('supercrates/x.rs', ('crates/',)) == []
 
 
