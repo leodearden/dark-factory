@@ -30,11 +30,13 @@ that drives ``run()``'s ESCALATED branch deterministically.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from _orch_helpers import pydantic_spec, stamp_stock_routing_config
+from _recording_event_store import _RecordingEventStore
 from _workflow_helpers import (
     FakeBriefing,
     FakeMcp,
@@ -46,7 +48,7 @@ from escalation.queue import EscalationQueue
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import IMPLEMENTER
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, OrchestratorConfig, TimeoutsConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.steward import TaskSteward
@@ -166,6 +168,7 @@ def _build_workflow(
     assignment: TaskAssignment,
     queue: EscalationQueue,
     worktree: Path,
+    event_store: _RecordingEventStore | None = None,
 ) -> tuple[TaskWorkflow, FakeScheduler]:
     """Wire a TaskWorkflow with all fakes for these tests.
 
@@ -175,6 +178,11 @@ def _build_workflow(
 
     Worktree is pre-set (eval-mode external path) so run() skips
     create_worktree and the MERGE block.
+
+    *event_store* is optional because only the tests that assert on the
+    ``steward_wait_timeout`` emission need one; ``_wait_for_resolution``'s
+    emit is guarded by ``if self.event_store``, so ``None`` is the normal
+    no-telemetry shape rather than a degraded one.
     """
     scheduler = FakeScheduler()
     workflow = TaskWorkflow(
@@ -187,9 +195,27 @@ def _build_workflow(
         escalation_queue=queue,
         escalation_event=asyncio.Event(),
         initial_plan=dict(PLAN),
+        event_store=event_store,  # type: ignore[arg-type]
     )
     workflow.worktree = worktree
     return workflow, scheduler
+
+
+def _steward_wait_timeouts(store: _RecordingEventStore) -> list[dict]:
+    """Every ``escalation_resolved`` event carrying the give-up marker.
+
+    ``_wait_for_resolution``'s expiry handler is the ONLY emitter of
+    ``outcome='steward_wait_timeout'`` (it reuses the existing
+    ``escalation_resolved`` type rather than adding an EventType member), so
+    this list being empty is the precise, greppable signal that the backstop
+    did not fire.
+    """
+    return [
+        payload['data']
+        for name, payload in store.events
+        if name == 'escalation_resolved'
+        and payload['data'].get('outcome') == 'steward_wait_timeout'
+    ]
 
 
 def _wire_resolve_callback(queue: EscalationQueue, workflow: TaskWorkflow) -> None:
@@ -740,6 +766,199 @@ class TestRealStewardGiveUpUnblocksEscalatedRun:
         channel = workflow._steward_outcome_channel
         assert channel is not None and channel.empty(), (
             'the unconsumed give-up outcome must not survive the wait'
+        )
+
+
+def _short_window_config(
+    base: OrchestratorConfig, *, completion: float, invocation: float,
+) -> OrchestratorConfig:
+    """A freshly-VALIDATED config with both steward timeouts pinned.
+
+    Constructed rather than ``model_copy``d because the pair is exactly what
+    the ``timeouts.steward >= steward_completion_timeout`` validator
+    (config.py:4071-4081) guards, and these tests turn on that relationship —
+    a silently-invalid pair would make them meaningless.
+    """
+    return OrchestratorConfig(
+        project_root=base.project_root,
+        max_concurrent_tasks=1,
+        steward_completion_timeout=completion,
+        timeouts=TimeoutsConfig(steward=invocation),
+        git=base.git,
+    )
+
+
+def _make_slow_healthy_steward(
+    queue: EscalationQueue,
+    task_id: str,
+    *,
+    delay: float,
+    markers: list[str],
+    resolved_by: str = 'steward-auto-dismissed',
+) -> type:
+    """A HEALTHY steward that is merely SLOW: silent for *delay*, then gives up.
+
+    It upholds the fix-A producer contract exactly — dismiss its own L0 through
+    ``EscalationQueue.resolve`` (which fires the resolve callback and wakes
+    ``_wait_for_resolution``), then publish the typed outcome — but does so
+    only after *delay*, which the caller sets PAST
+    ``steward_completion_timeout`` and INSIDE the steward's own per-invocation
+    ceiling ``timeouts.steward``.  That is the normal-operation window at stock
+    config, not an exotic one: stock is 900s vs 1800s, and the validator at
+    config.py:4071-4081 GUARANTEES the ceiling exceeds the completion timeout.
+
+    ``resolved_by`` is deliberately NOT ``'auto-dismissed'``: that is the
+    workflow's own force-dismissal signature, so a distinct value is what lets
+    the test tell "the steward finished its work" apart from "the workflow gave
+    up on it and stamped the record on the way past".
+
+    Appends ``'steward-stop'`` to *markers* on every ``stop()`` await, so the
+    caller can assert on ORDER against the implementer-resume marker rather
+    than merely on occurrence.
+    """
+
+    class _FakeSteward:
+        def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
+            self._outcome_channel = None
+            self._wip_probe = None
+            self.give_up_task: asyncio.Task | None = None
+            self.stop_count = 0
+
+        def set_outcome_channel(self, channel) -> None:
+            self._outcome_channel = channel
+
+        def set_wip_probe(self, probe) -> None:
+            self._wip_probe = probe
+
+        async def _give_up(self) -> None:
+            await asyncio.sleep(delay)
+            for esc in queue.get_by_task(task_id, status='pending', level=0):
+                queue.resolve(
+                    esc.id,
+                    'Auto-dismissed: steward interrupted (attempt_cap) with WIP '
+                    'present — resuming plan, not escalating',
+                    dismiss=True,
+                    resolved_by=resolved_by,
+                )
+            if self._outcome_channel is not None:
+                self._outcome_channel.put_nowait(
+                    StewardInterrupted('attempt_cap', wip_commits_present=True),
+                )
+
+        async def start(self) -> None:
+            self.give_up_task = asyncio.create_task(self._give_up())
+
+        async def stop(self) -> None:
+            self.stop_count += 1
+            markers.append('steward-stop')
+            if self.give_up_task is not None:
+                self.give_up_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self.give_up_task
+
+    return _FakeSteward
+
+
+def _make_marking_invoke(markers: list[str]) -> AsyncMock:
+    """An ``_invoke`` double that records WHEN the implementer was resumed.
+
+    Ordering against ``'steward-stop'`` is the safety property under test:
+    the steward runs its agent with ``cwd = self.worktree`` (steward.py:542,
+    590) — the same worktree the resumed implementer edits and commits in — so
+    "both happened" is not enough, only "stopped BEFORE resumed" is.
+    """
+
+    async def _invoke(role, *_args, **_kwargs):
+        if role is IMPLEMENTER:
+            markers.append('implementer-resumed')
+        return AgentResult(success=True, output='')
+
+    return AsyncMock(side_effect=_invoke)
+
+
+@pytest.mark.asyncio
+class TestHealthyStewardIsNotForceDismissed:
+    """Fix D1: the ESCALATED-wait backstop must not fire on a HEALTHY steward.
+
+    Step-12 bounded the wait by ``config.steward_completion_timeout`` so the
+    two waiters would share one knob.  That symmetry was itself the defect:
+    a SINGLE steward ``invoke_agent`` call is budgeted
+    ``config.timeouts.steward`` (1800s stock) while the wait was bounded by
+    ``steward_completion_timeout`` (900s stock) — and the only validator
+    (config.py:4071-4081) enforces ``timeouts.steward >=
+    steward_completion_timeout``, i.e. it GUARANTEES the per-invocation
+    ceiling exceeds the wait bound.  ``TimeoutsConfig``'s own docstring
+    (config.py:211-222) calls ``steward_completion_timeout`` the
+    post-completion *drain grace window*, "intentionally decoupled" from
+    per-invocation work.
+
+    So at stock config the backstop is a NORMAL-operation trigger, not the
+    rare future-producer-bug backstop its docstring claims — and firing it
+    force-dismisses the L0 out from under a live steward and resumes the
+    implementer beside it in the same worktree.
+    """
+
+    async def test_slow_but_working_steward_keeps_ownership_of_its_l0(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """Silent past the completion timeout, inside the invocation ceiling."""
+        # 0.3s completion timeout + 1.0s per-invocation ceiling.  The steward
+        # gives up at 0.6s: past the OLD bound (0.3s) — so this fails today —
+        # and inside the derived window (1.0 + 0.3 = 1.3s).
+        local_config = _short_window_config(config, completion=0.3, invocation=1.0)
+        wt = await _make_advanced_worktree(git_ops, task_assignment.task_id)
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _submit_l0(queue, task_assignment.task_id)
+        store = _RecordingEventStore()
+        workflow, _scheduler = _build_workflow(
+            local_config, git_ops, task_assignment, queue, wt, event_store=store,
+        )
+        _wire_resolve_callback(queue, workflow)
+        markers: list[str] = []
+        workflow._steward_factory = _make_slow_healthy_steward(
+            queue, task_assignment.task_id, delay=0.6, markers=markers,
+        )
+        evrl_mock, _state = _make_evrl_returner(
+            [WorkflowOutcome.ESCALATED, WorkflowOutcome.DONE],
+        )
+        workflow._execute_verify_review_loop = evrl_mock  # type: ignore[method-assign]
+        invoke_mock = _make_marking_invoke(markers)
+        workflow._invoke = invoke_mock  # type: ignore[method-assign]
+
+        await asyncio.wait_for(workflow.run(), 10)
+
+        archived = queue.get(esc.id)
+        assert archived is not None, 'the record must still be readable'
+        assert archived.resolved_by == 'steward-auto-dismissed', (
+            f'the L0 must still carry the STEWARD\'s own attribution: this '
+            f'steward was merely slow — silent for 0.6s, well inside its '
+            f'{local_config.timeouts.steward}s per-invocation ceiling — and '
+            f'dismissed its own L0 exactly as the fix-A producer contract '
+            f'requires.  resolved_by={archived.resolved_by!r} means the '
+            f'workflow force-dismissed the record out from under a live '
+            f'steward after only {local_config.steward_completion_timeout}s'
+        )
+        assert _steward_wait_timeouts(store) == [], (
+            'the give-up backstop must not fire on a healthy steward; it '
+            'exists for a genuinely SILENT producer'
+        )
+        assert 'implementer-resumed' in markers, (
+            f'the steward\'s own dismissal must still unblock the wait and '
+            f'resume the implementer; markers={markers}'
+        )
+        # NOT "stop() was never awaited": run()'s terminal-cleanup hook
+        # (_on_terminal_cleanups → _stop_steward, workflow.py:2995-2997)
+        # legitimately stops the steward once on the way out of every run().
+        # The property under test is that the GIVE-UP path did not stop it —
+        # i.e. no stop precedes the resume.
+        assert markers.index('implementer-resumed') < markers.index('steward-stop'), (
+            f'the workflow must not have stopped the steward before resuming '
+            f'the implementer — that only happens on the give-up path, which '
+            f'must not have fired here; markers={markers}'
+        )
+        assert workflow._steward is not None, (
+            'the give-up path\'s stop-then-clear must not have run: a cleared '
+            '_steward is the tell that the workflow gave up on this steward'
         )
 
 
