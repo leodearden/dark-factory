@@ -1,0 +1,460 @@
+prd: docs/prds/memory-eval-program.md
+schema_version: 1
+tasks:
+- label: alpha
+  task_id: 3207
+  title: Memory-eval M1 metric-series schema + M2 limits evaluator (shared/, budget-derived
+    alpha, grandfather ratchet)
+  capabilities:
+  - name: metric-series-schema-single-home
+    binding: capability→producer (INV-5 / PRD D2) — one M1 schema module in shared/;
+      both fused-memory and orchestrator already depend on dark-factory-shared (fused-memory/pyproject.toml
+      lists only dark-factory-shared), and shared/ has no stats module today, so this
+      is a fresh single home
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: memory_eval_metrics
+      paths:
+      - shared/src/shared/
+      expect: present
+  - name: limits-evaluator-single-home
+    binding: capability→producer (PRD M2/D2) — evaluator implementing tripwire/proportion/count
+      rule kinds, budget-derived alpha, min_samples, grandfather-set persistence,
+      limits-artifact writer; stdlib-only (math.comb/lgamma), no scipy
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: memory_eval_limits
+      paths:
+      - shared/src/shared/
+      expect: present
+  - name: no-wrong-direction-orchestrator-dep
+    binding: rejection-mechanism (PRD D2, INV-5) — the canary limit pattern is COPIED,
+      never imported; fused-memory importing orchestrator.evals is a wrong-direction
+      package edge and is verified absent on main today
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: orchestrator\.evals
+      paths:
+      - fused-memory/src/
+      expect: absent
+  - name: budget-derived-significance
+    binding: 'G6 — no a-priori numeric threshold: alpha per test is derived from a
+      declared false-alarm budget divided by (runs-per-quarter x alarmed-metric count),
+      recomputed as metrics are added; min_samples yields the insufficient_data report
+      status, never an alarm'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a mechanical grep for a numeric constant would either encode an a-priori
+        bound (the exact thing G6 forbids) or match the budget config default; the
+        derivation is pinned by alpha's per-rule-kind verdict fixtures incl. insufficient_data
+        and grandfathered-no-alarm
+- label: beta
+  task_id: 3208
+  title: 'E1 retrieval-health probe: topic registry + canonical/superseded/claim-recall/contamination
+    runner'
+  capabilities:
+  - name: e1-probe-runner
+    binding: capability→producer — read-only runner over the live store via direct
+      MemoryService init (PRD D8; audit_duplicate_memories.py:364-378 `_run` pattern
+      verified on main), emitting the M1 artifact + human report under fused-memory/data/memory-evals/
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: memory_eval_retrieval_probe
+      paths:
+      - fused-memory/scripts/
+      expect: present
+  - name: topic-registry-committed-fixture
+    binding: capability→producer (PRD D5) — registry keyed on metadata.topic/kind/supersedes
+      + curator-gate enumerations with content-hash item keys; derives from the 3195/3201
+      vocabulary namespace but works before it, and takes NO dep on shape gate 3200
+      (the monitor is what verifies the post-gate world)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: memory_eval_topic_registry
+      paths:
+      - fused-memory/
+      expect: present
+  - name: goodhart-guard-held-out-phrasings
+    binding: 'G6 — the signal must keep discriminating after 3111''s pin saturates
+      canonical-presence: >=1 held-out phrasing per topic, plus claim-recall and contamination
+      metrics; k=5/k=10 are metric parameterisations, NOT pass thresholds'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: held-out-phrasing coverage is a registry-content judgment, not a pattern;
+        pinned by beta's seeded-collection test (deleting the canonical flips that
+        topic's tripwire item to fail in the artifact)
+  - name: seeded-ephemeral-fixture-not-live-store
+    binding: capability→producer (PRD D8) — induced-regression tests use the seeded-ephemeral-collection
+      pattern (tests/test_recon_dedup_premise.py:57-143 verified on main), never the
+      live corpus; runners stay read-only
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: read-only discipline is an absence-of-writes property across a whole
+        script; a grep for mutation calls would be brittle. Pinned by beta's tests
+        and the cleanup-prefix caveat in scripts/cleanup_test_collections.py
+- label: gamma
+  task_id: 3209
+  title: 'E4 superseded/stale/dangling sweep: supersedes surfacing, dangling-pointer
+    census, task-terminal staleness'
+  capabilities:
+  - name: normalize-supersedes-imported-not-reparsed
+    binding: capability→producer (PRD D7, INV-5) — producer task 3196 is UPSTREAM
+      (dep wired, DAG-direction verified; 3196 pending as of filing). The symbol exists
+      today only in PRD prose, never a second parser — gamma imports it
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: normalize_supersedes
+      paths:
+      - fused-memory/scripts/memory_eval_staleness_sweep.py
+      expect: present
+  - name: e4-sweep-runner
+    binding: capability→producer — emits the three metric families (superseded-surfacing,
+      dangling-pointer census, task-terminal staleness) as one M1 artifact
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: memory_eval_staleness_sweep
+      paths:
+      - fused-memory/scripts/
+      expect: present
+  - name: dangling-pointer-resolution-live
+    binding: capability→producer (INV-3) — supersedes/parent_id/corrects targets resolved
+      against the live store via get_memory_by_id, not against a cached index
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the resolution call site is implementation-chosen; pinned by gamma's
+        seeded fixture test (a superseded-outranking pair and a dangling pointer are
+        both reported)
+- label: delta
+  task_id: 3210
+  title: 'E6 corpus-health detector upgrade + series: ANN candidate generation, all
+    three Mem0 categories, cluster metrics'
+  capabilities:
+  - name: qdrant-vector-access-for-ann
+    binding: 'capability→producer — scroll_by_metadata today hardcodes with_vectors=False
+      (mem0_client.py:454 on main); delta widens it to a settable parameter. NOTE:
+      PRD §6 says "with_vectors not yet passed" — it IS passed, as a literal False,
+      so the change is strictly smaller than the substrate row implies'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'with_vectors: bool'
+      paths:
+      - fused-memory/src/fused_memory/backends/mem0_client.py
+      expect: present
+  - name: ann-candidate-generation
+    binding: capability→producer — query_points ANN retrieval feeding the EXISTING
+      union-find (audit_duplicate_memories.py:113-153), precedent task_curator.py:1890
+      verified on main
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: query_points
+      paths:
+      - fused-memory/scripts/audit_duplicate_memories.py
+      expect: present
+  - name: labeled-duplicate-pair-dataset
+    binding: capability→producer — task 3130's curator-ground-truth fixture is ALREADY
+      ON MAIN (fused-memory/tests/fixtures/write_triage_calibration.jsonl, 104 labeled
+      records + fixtures/README.md provenance), so delta needs no dependency edge
+      to 3130; PRD §8 seam honored (no new labeling here)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: write_triage_calibration
+      paths:
+      - fused-memory/tests/
+      expect: present
+  - name: measured-not-asserted-similarity
+    binding: G6 — the fixture pair's cosine AND lexical SequenceMatcher ratio are
+      both MEASURED at authoring and recorded; no a-priori similarity threshold is
+      asserted anywhere in the signal
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a mechanical floor grep would encode the uncalibrated bound G6 forbids;
+        the two measured numbers are recorded in the test and reported alongside the
+        ANN verdict
+  - name: detector-cli-path-stable-for-3136
+    binding: capability→consumer (PRD §8 seam) — delta EXTENDS audit_duplicate_memories.py
+      rather than forking it (D6, INV-5), so 3136 keeps scheduling + gate-filing ownership
+      and its topic carve-out is honored as input filtering, not reimplemented
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: audit_duplicate_memories
+      paths:
+      - fused-memory/scripts/
+      expect: present
+  - name: dropped-candidate-disclosure
+    binding: INV-2/INV-4 — ANN candidate caps are DISCLOSED as counts in the M1 artifact
+      (no silent truncation), so a cap firing is a countable metric the limits evaluator
+      can alarm on rather than invisible recall loss
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: disclosure field naming is implementation-chosen; pinned by delta's
+        disclosure-count test
+- label: epsilon
+  task_id: 3211
+  title: 'Scheduled memory-eval runner + M3 escalation wiring: systemd timer, fingerprint
+    dedup, storm escape, grandfather snapshot'
+  capabilities:
+  - name: systemd-timer-quadruple
+    binding: capability→producer — flag-marker idiom verified on main (scripts/fused-memory-flag-marker-sweep.{sh,service,timer}
+      + install-flag-marker-sweep-timer.sh + -check.sh); daily 03:xx window offset
+      from the 03:00 legibility-trickle and 03:30 flag-marker stagger (D10)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: memory-eval
+      paths:
+      - scripts/
+      expect: present
+  - name: direct-queue-api-filing
+    binding: capability→producer (PRD D4/M3) — EscalationQueue(Path(recon escalation_queue_dir)).submit(Escalation(...))
+      per fused-memory/scripts/backfill_recon_escalations.py:68-71 (verified on main);
+      recon queue dir + port 8103 verified at config/schema.py and config/config.yaml
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: EscalationQueue
+      paths:
+      - fused-memory/scripts/memory_eval_runner.py
+      expect: present
+  - name: fingerprint-dedup-reuses-queue-helper
+    binding: INV-5 — dedup REUSES EscalationQueue.has_open_l1 plus a fingerprint discipline
+      modelled on reconciliation/stage1_stall_detector.py:385,483 (verified on main);
+      it does not reimplement open-escalation lookup
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: has_open_l1
+      paths:
+      - fused-memory/scripts/memory_eval_runner.py
+      expect: present
+  - name: eval-regression-category-documented
+    binding: capability→producer — escalation category is a plain unvalidated str
+      (escalation/models.py:93; server.py validates severity only), so eval_regression
+      is filable today; the CATEGORIES doc list (escalation/src/escalation/server.py:194)
+      gains the inert-but-documented entry
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: eval_regression
+      paths:
+      - escalation/src/escalation/server.py
+      expect: present
+  - name: watcher-triage-row
+    binding: capability→consumer (wired) — the recon-escalation-watcher is the live
+      sole closer pinned to 8103 (recon-watch/run.sh + mcp.json verified); its SKILL.md
+      gains the eval_regression triage row so the contract lives where the consumer
+      reads it (INV-1)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: eval_regression
+      paths:
+      - skills/recon-escalation-watcher/SKILL.md
+      expect: present
+  - name: storm-escape-and-failure-self-escalation
+    binding: INV-4 + INV-2 — more than K alarms in one run collapses to ONE aggregate
+      escalation (K configurable, no a-priori value); runner crash / store-unreachable
+      files its own single eval_regression, because silence is never a healthy signal
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: K is deliberately a config value with no a-priori default asserted here
+        (G6); the behaviour is pinned by epsilon's K+1-alarms-collapse-to-one and
+        induced-regression integration tests against a temp queue dir
+  - name: grandfather-snapshot-first-run
+    binding: PRD D1 (INV-3) — the first run snapshots current failures as known-bad
+      into the initial-state report for the 3111/3112/3200 fix lineage rather than
+      alarming; the grandfather set is re-read from its persisted artifact each run,
+      and fixed items leave it (ratchet)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: grandfather-set persistence is alpha's artifact contract; epsilon's
+        first-run behaviour is pinned by the idempotence test (re-running on an unchanged
+        series alarms nothing)
+- label: zeta
+  task_id: 3212
+  title: 'E7 search/write telemetry: result ids+scores in the journal, caller-identity
+    params, hint-execution logging, write_ops retention'
+  capabilities:
+  - name: caller-identity-params-declared
+    binding: INV-1 — new caller_agent_id/caller_task_id params on the search tool,
+      explicitly DISTINCT from the existing agent_id FILTER param (the conflation
+      that left 99.7% of rows unattributed); declared where callers see them, not
+      discovered by failure
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: caller_agent_id
+      paths:
+      - fused-memory/src/fused_memory/server/tools.py
+      expect: present
+  - name: briefing-threads-caller-identity
+    binding: capability→consumer (wired) — the briefing assembler's mcp_call already
+      holds agent_id = claude-task-{id}-{role} (orchestrator/src/orchestrator/agents/briefing.py);
+      zeta's edit is purely additive per PRD §8's sequence note with 3131/iota-vocab
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: caller_(agent|task)_id
+      paths:
+      - orchestrator/src/orchestrator/agents/briefing.py
+      expect: present
+  - name: writer-instructions-name-caller-params
+    binding: INV-5 — _MEMORY_INSTRUCTIONS (orchestrator/src/orchestrator/agents/roles.py:218)
+      documents passing the caller params, and a pinning assertion ties that prose
+      to the real parameter names so the hand-transcribed text cannot drift from the
+      tool signature
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: caller_agent_id
+      paths:
+      - orchestrator/src/orchestrator/agents/roles.py
+      expect: present
+  - name: clientinfo-never-repurposed
+    binding: PRD M4 — identity must NOT come from clientInfo (hardcoded 'orchestrator'
+      at mcp_lifecycle.py:587; stateless HTTP drops it). tools.py:507-518 keeps its
+      existing _resolve_identity read of clientInfo untouched; the new caller params
+      are a separate channel
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: not expressible as absence — clientInfo legitimately remains in tools.py:507-518
+        as the pre-existing _resolve_identity path; "not repurposed" is a review property,
+        pinned by zeta's attribution test showing the row carries the THREADED caller,
+        not the client name
+  - name: hint-execution-journaled
+    binding: capability→producer — reconciliation/context_assembler.py hint-query
+      execution is entirely unlogged today (verified on main — it calls self.memory.search
+      directly with no journal write); zeta routes it through the same journal
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: log_write_op|_log_read
+      paths:
+      - fused-memory/src/fused_memory/reconciliation/context_assembler.py
+      expect: present
+  - name: write-ops-retention-prune
+    binding: capability→producer — age-bounded prune per the prune_mem0_intents shape
+      (services/write_journal.py:494, called at server/main.py:560), config-defaulted;
+      the table is 6.7 GB and never pruned, and the NEW search-row detail must not
+      make that worse silently
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: prune_write_ops
+      paths:
+      - fused-memory/src/fused_memory/services/write_journal.py
+      expect: present
+  - name: journal-drop-visibility
+    binding: INV-4 (resolution-by-redesign at G7) — _log_read's existing catch-and-warn
+      swallow (tools.py:711) becomes load-bearing once eta's metric is computed from
+      these rows, so dropped journal writes must be COUNTED and surfaced rather than
+      silently absorbed
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: counter/threshold naming is implementation-chosen; pinned by zeta's
+        test that a failing journal write increments a visible drop counter instead
+        of vanishing
+- label: eta
+  task_id: 3213
+  title: 'Write-after-miss metric: searched, wasn''t shown it, wrote a duplicate —
+    per-caller-window incident detection over the search journal'
+  capabilities:
+  - name: journal-rows-with-ids-and-caller
+    binding: capability→producer — producer task zeta is UPSTREAM (dep wired, DAG-direction
+      verified); the metric cannot be computed from today's count-only result_summary
+      (tools.py:1441-1447 on main)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: zeta's own delivered_checks (caller_agent_id greps) already mechanize
+        this; a duplicate grep here would drift (INV-5)
+  - name: reuses-pure-near-dup-guard
+    binding: INV-5 — near-duplicate adjudication REPLAYS the production guard's pure
+      predicate find_near_duplicate_memory (server/near_duplicate_guard.py:59, documented
+      pure and synchronous with no I/O, wired into the production add_memory path
+      at tools.py:1257) instead of re-implementing a second similarity rule
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: find_near_duplicate_memory
+      paths:
+      - fused-memory/scripts/memory_eval_write_after_miss.py
+      expect: present
+  - name: metric-wired-into-evaluation
+    binding: capability→consumer (wired) — the incident count is emitted as an M1
+      metric and evaluated by epsilon's runner under alpha's proportion rule against
+      the trailing baseline window; epsilon is upstream (dep wired)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: memory_eval_write_after_miss
+      paths:
+      - fused-memory/scripts/memory_eval_runner.py
+      expect: present
+  - name: incident-carries-structured-evidence
+    binding: INV-2 — each incident records the search row id, the write row id, the
+      caller window and the matched-absent candidate id, so a reader never re-derives
+      the story from prose
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: evidence field naming is implementation-chosen; pinned by eta's fixture
+        test (one searched-missed-wrote sequence and one searched-shown-wrote control
+        yield exactly one incident)
+- label: theta
+  task_id: 3214
+  title: 'Retro transcript replay corpus: one-shot extraction of searches + shown
+    results from the agent-transcript archive'
+  capabilities:
+  - name: retro-corpus-script
+    binding: capability→producer (PRD D9) — one-shot script over data/orchestrator/agent-transcripts/
+      (archive populated, verified on main; layout per shared/transcript_archive.py),
+      emitting a schema'd corpus + coverage report under fused-memory/data/memory-evals/
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: memory_eval_transcript_corpus
+      paths:
+      - fused-memory/scripts/
+      expect: present
+  - name: reuses-existing-transcript-readers
+    binding: INV-5 — reuses scripts/legibility/digest.py::load_transcript (:32) and
+      inventory.py::_iter_json_lines (:81) rather than adding a third transcript parser
+      to the repo
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: load_transcript
+      paths:
+      - fused-memory/scripts/memory_eval_transcript_corpus.py
+      expect: present
+  - name: coverage-report-discloses-failures
+    binding: INV-2/INV-4 (resolution-by-redesign at G7) — the coverage report states
+      tasks scanned, searches extracted and parse failures, and a wholesale-parse-failure
+      run is DISTINGUISHABLE from an empty archive rather than both reading as "0
+      searches"
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: disclosure field naming is implementation-chosen; pinned by theta's
+        committed mini-fixture round-trip plus an all-unparseable-input case
