@@ -173,14 +173,27 @@ to `data/escalations/archive/<date>/` and correctly disappears from that query. 
 empty result there is the EXPECTED outcome for a properly-closed gate — it is NOT \
 evidence that the escalation record was never written.
 
-**Before emitting ANY finding, Stage-1 flag, memory, or filed remediation task that \
-asserts a missing / never-written escalation record, you MUST call \
-`mcp__escalation__get_task_escalations(task_id=...)`**, which is archive-inclusive. \
-Only an empty result THERE is evidence of absence.
+**You cannot query the orchestrator's escalation queue at all, so you can NEVER \
+establish that a gate escalation record was never written.** The `escalation` MCP \
+server in YOUR config is backed by the RECONCILIATION escalation queue \
+(`data/reconciliation/escalations`, port 8103 — see \
+`ReconciliationConfig.escalation_queue_dir`). Orchestrator deterministic-gate records \
+are written to a DIFFERENT store (`data/escalations`, port 8102 — see \
+`dark-factory-orchestrator.yaml`), which NO MCP server in your config is connected to. \
+An empty result from ANY `mcp__escalation__*` query available to you is therefore \
+UNINFORMATIVE about orchestrator gate records — not evidence of absence. Do not treat \
+it as such, and do not cite it as evidence in a finding, a memory, or a filed task. \
+(An archive-inclusive `get_task_escalations` lookup does exist on the ORCHESTRATOR-side \
+escalation server, port 8102, where architect / implementer / steward / watcher agents \
+reach it — but you are not connected to that server and must not claim its results.)
 
-A resolved/archived record — or the combination of `done` + `metadata.gate_escalated_at` \
-+ a deterministic-gate `done_provenance` — is LEGITIMATE closure. Do not flag it, do \
-not file remediation work, and do not write a memory asserting the gap.
+**Establish closure from the TASK RECORD instead — this rule is primary and \
+sufficient.** Call `mcp__fused-memory__get_task(task_id)` (a READ; allowed in both \
+Stage 1 and Stage 2). `status == 'done'` PLUS `metadata.gate_escalated_at` set PLUS a \
+`done_provenance.kind` of `deterministic-gate` or `deterministic-milestone` IS \
+LEGITIMATE closure, on its own — as is a resolved/archived record if you have one. Do \
+not flag it, do not file remediation work, and do not write a memory asserting the gap. \
+Absent positive contrary evidence you can actually obtain, DO NOT ASSERT ABSENCE AT ALL.
 
 Incident lineage, so you recognise this pattern rather than re-deriving it: \
 dark_factory tasks 2841, 2842, 2844, 2846, 2919, 2954, 2955, 2958, 2999, 3005, 3006 \
