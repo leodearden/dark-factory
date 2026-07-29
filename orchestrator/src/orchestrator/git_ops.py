@@ -3814,11 +3814,37 @@ class GitOps:
 
     # warm-lane script resolution (task 3072, PRD leaf α) ----------------------
 
+    def _warm_lane_script_candidates(
+        self, name: str,
+    ) -> tuple[tuple[Path, str], ...]:
+        """Every candidate location for ``name``, in search order.
+
+        The SINGLE source of truth for both halves of resolution:
+        :meth:`_resolve_warm_lane_script` takes the first entry that exists,
+        and the not-found WARNING in
+        :meth:`_resolve_warm_lane_script_logged` names every entry.  Built once
+        rather than re-derived per consumer so the order an operator reads can
+        never disagree with the order actually searched, and so adding a third
+        location (or a subdirectory layout) is one edit instead of two that
+        must be kept in lockstep.
+
+        Args:
+            name: Bare script filename, e.g. ``'warm-lane-gc.sh'``.
+
+        Returns:
+            ``((path, origin), ...)`` in preference order.
+        """
+        return (
+            (self.project_root / 'scripts' / name, 'project'),
+            (_df_warm_lane_script_dir() / name, 'dark-factory'),
+        )
+
     def _resolve_warm_lane_script(self, name: str) -> tuple[Path, str] | None:
         """Locate warm-lane script ``name``, project override first.
 
-        Resolution order (PRD ``warm-lane-infra-repatriation-prd.md`` design
-        decision D3):
+        Walks :meth:`_warm_lane_script_candidates` and returns the first entry
+        that exists.  Resolution order (PRD
+        ``warm-lane-infra-repatriation-prd.md`` design decision D3):
 
         1. ``<project_root>/scripts/<name>`` — the PROJECT OVERRIDE. A project
            that has invested in its own warm-lane tooling keeps it;
@@ -3844,24 +3870,10 @@ class GitOps:
             ``(resolved_path, origin)`` where origin is ``'project'`` or
             ``'dark-factory'``, or ``None`` when neither location has it.
         """
-        project_path = self.project_root / 'scripts' / name
-        if project_path.exists():
-            return (project_path, 'project')
-        df_path = _df_warm_lane_script_dir() / name
-        if df_path.exists():
-            return (df_path, 'dark-factory')
+        for path, origin in self._warm_lane_script_candidates(name):
+            if path.exists():
+                return (path, origin)
         return None
-
-    def _warm_lane_script_paths_tried(self, name: str) -> tuple[Path, Path]:
-        """Both candidate paths for ``name``, for the not-found WARNING.
-
-        Kept beside :meth:`_resolve_warm_lane_script` so the message an
-        operator reads can never drift from the order actually searched.
-        """
-        return (
-            self.project_root / 'scripts' / name,
-            _df_warm_lane_script_dir() / name,
-        )
 
     def _resolve_warm_lane_script_logged(
         self, name: str, method: str,
@@ -3904,11 +3916,14 @@ class GitOps:
         """
         resolved = self._resolve_warm_lane_script(name)
         if resolved is None:
-            project_path, df_path = self._warm_lane_script_paths_tried(name)
+            tried = ' and '.join(
+                str(path)
+                for path, _origin in self._warm_lane_script_candidates(name)
+            )
             logger.warning(
                 '%s: no warm-lane script implementation found at either '
-                'location — tried %s and %s',
-                method, project_path, df_path,
+                'location — tried %s',
+                method, tried,
             )
             return None
         path, origin = resolved
@@ -4163,6 +4178,21 @@ class GitOps:
         dark-factory guess at a project-owned path, violating PRD invariant
         C-1.
 
+        **The degraded mode is announced, not inferred.**  A project that
+        carries no warm-lane tooling at all — the very case dark-factory ships
+        these copies for — has no ``seed-warm-lane.sh`` to name, so the flag is
+        omitted and the relocated script falls back to a sibling default that
+        PRD §5 guarantees will never exist beside it.  Every non-disk-pressure
+        Pass-1 lane reset then fails inside gc.sh, is warned about there, and
+        counts toward ``preserved`` while reclaiming nothing: the same
+        accrete-to-ENOSPC class this wrapper guards against, reached from the
+        opposite branch.  So when the resolved origin is ``'dark-factory'`` and
+        the project has no seed script, this logs a WARNING naming the missing
+        path and what stops working, making the degradation attributable from
+        dark-factory's own logs instead of only from gc.sh's stderr.  Not
+        raised and not a sentinel: orphan removal and disk-pressure target
+        removal still work, so reclaim is degraded rather than dead.
+
         Fail-soft: absent script → 127 sentinel; any unexpected exception → 127;
         never raises.  A non-zero exit is logged at WARNING and treated as
         'nothing reclaimed' by the caller (``_warm_lane_disk_admission_blocked``).
@@ -4211,7 +4241,7 @@ class GitOps:
             )
             if resolved is None:
                 return 127
-            script, _origin = resolved
+            script, origin = resolved
             cmd = [
                 str(script), 'reclaim',
                 '--mount', str(self.worktree_base),
@@ -4219,6 +4249,16 @@ class GitOps:
             seed = self.project_root / 'scripts' / 'seed-warm-lane.sh'
             if seed.exists():
                 cmd += ['--seed-script', str(seed)]
+            elif origin == 'dark-factory':
+                logger.warning(
+                    '_run_warm_lane_gc_reclaim: no project seed script at %s, '
+                    'and none ships beside %s (PRD §5 keeps seed-warm-lane.sh '
+                    'project-owned) — lane RESETS will fail inside the script '
+                    '(each logs "reset failed … (seed-script error)" and '
+                    'counts as preserved); reclaim degrades to orphan removal '
+                    'plus disk-pressure target rm',
+                    seed, script,
+                )
             rc, _, err = await _run(cmd, cwd=self.project_root)
             if rc != 0:
                 logger.warning(

@@ -290,8 +290,18 @@ def code_default_config(monkeypatch, tmp_path):
     monkeypatch.setenv("ORCH_CONFIG_PATH", str(tmp_path / "no-such-config.yaml"))
 
 
+#: Guaranteed-absent path for the autouse warm-lane script-dir pin below.
+#: A fixed literal rather than a ``tmp_path`` child ON PURPOSE: the directory is
+#: only ever required NOT to exist and is never written to, so requesting
+#: ``tmp_path`` would make pytest allocate a numbered temp dir for every test in
+#: the orchestrator suite (thousands, times every xdist worker) purely to have a
+#: name to point at.  The only consumer is
+#: :meth:`GitOps._resolve_warm_lane_script`, which just calls ``.exists()``.
+_ABSENT_WARM_LANE_SCRIPT_DIR = "/nonexistent/df-warm-lane-scripts"
+
+
 @pytest.fixture(autouse=True)
-def _isolate_warm_lane_script_dir(monkeypatch, tmp_path):
+def _isolate_warm_lane_script_dir(monkeypatch):
     """Pin dark-factory's warm-lane script directory ABSENT for every test.
 
     Task 3072 (PRD ``warm-lane-infra-repatriation-prd.md`` leaf α) gives
@@ -323,7 +333,7 @@ def _isolate_warm_lane_script_dir(monkeypatch, tmp_path):
     genuinely exercise resolution opt in via ``df_warm_lane_script_dir`` below.
     """
     monkeypatch.setenv(
-        "ORCH_WARM_LANE_SCRIPT_DIR", str(tmp_path / "no-such-warm-lane-scripts"),
+        "ORCH_WARM_LANE_SCRIPT_DIR", _ABSENT_WARM_LANE_SCRIPT_DIR,
     )
 
 

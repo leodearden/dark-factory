@@ -243,6 +243,39 @@ class TestResolveWarmLaneScript:
         )
         assert origin == 'dark-factory'
 
+    def test_candidates_are_the_single_searched_order(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``_warm_lane_script_candidates`` IS the search order, not a copy of it.
+
+        Both halves of resolution consume this one list: the resolver takes the
+        first entry that exists, and the not-found WARNING names every entry.
+        Pinned so the order an operator reads can never drift from the order
+        actually searched — the failure mode of two independently-constructed
+        candidate lists.
+        """
+        project_root = tmp_path / 'proj'
+        project_root.mkdir()
+        df_dir = _pin_df_dir(monkeypatch, tmp_path / 'df')
+        git_ops = _make_git_ops(project_root)
+
+        candidates = git_ops._warm_lane_script_candidates(self.NAME)
+
+        assert candidates == (
+            (project_root / 'scripts' / self.NAME, 'project'),
+            (df_dir / self.NAME, 'dark-factory'),
+        ), f'Search order must be project-then-dark-factory; got {candidates!r}'
+
+        # Each candidate, made to exist in isolation, is what the resolver
+        # returns — so the list is genuinely the thing being walked.
+        for index, (path, origin) in enumerate(candidates):
+            _write_stub(path)
+            assert git_ops._resolve_warm_lane_script(self.NAME) == (path, origin), (
+                f'Candidate {index} ({origin}) exists but the resolver did not '
+                f'return it — the resolver is not walking this list'
+            )
+            path.unlink()
+
     def test_env_seam_is_read_at_call_time(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -535,6 +568,86 @@ class TestGcReclaimPassesProjectSeedScript:
             f'to today — no invented --seed-script; got {_argv(call_log)!r}'
         )
 
+    async def test_missing_project_seed_script_is_warned_about(
+        self,
+        project_root: Path,
+        df_warm_lane_script_dir,
+        call_log: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """dark-factory's copy + no project seed script → a WARNING says so.
+
+        This is the fallback's OWN target case: a project carrying no warm-lane
+        tooling is exactly why dark-factory ships these copies.  With no
+        ``--seed-script`` to pass, the relocated ``warm-lane-gc.sh`` falls back
+        to a sibling default that PRD §5 guarantees will never exist beside it,
+        so every non-disk-pressure Pass-1 lane reset fails inside the script and
+        counts as *preserved* while reclaiming nothing — the accrete-to-ENOSPC
+        class the wrapper exists to prevent, reached from the opposite branch.
+        Degraded is acceptable (orphan removal and disk-pressure target rm still
+        work); degraded and SILENT is not, so the mode must be attributable from
+        dark-factory's own logs rather than inferred from gc.sh's stderr.
+        """
+        df_dir = df_warm_lane_script_dir()
+        df_script = _write_origin_stub(
+            df_dir / 'warm-lane-gc.sh', 'dark-factory', call_log,
+        )
+        git_ops = _make_git_ops(project_root)
+        missing_seed = project_root / 'scripts' / 'seed-warm-lane.sh'
+
+        with caplog.at_level(logging.DEBUG, logger=GIT_OPS_LOGGER):
+            await git_ops._run_warm_lane_gc_reclaim()
+
+        warnings = _records(caplog, logging.WARNING)
+        matching = [
+            m for m in warnings
+            if str(missing_seed) in m and str(df_script) in m
+        ]
+        assert matching, (
+            'A dark-factory gc copy running against a project with no seed '
+            'script must WARN naming the missing path and the script that '
+            'cannot reset lanes without it.\n'
+            f'  expected missing seed: {missing_seed}\n'
+            f'  expected script: {df_script}\n'
+            f'  captured WARNINGs: {warnings!r}'
+        )
+        assert _origins(call_log) == ['dark-factory'], (
+            'The warning must not suppress the reclaim — orphan removal and '
+            'disk-pressure target rm still work, so this is degraded, not dead; '
+            f'call log: {_origins(call_log)!r}'
+        )
+
+    async def test_project_origin_with_no_seed_script_is_not_warned_about(
+        self,
+        project_root: Path,
+        call_log: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A PROJECT gc copy with no sibling seed script is the project's business.
+
+        The warning is scoped to the ``'dark-factory'`` origin on purpose.  When
+        the project's own ``scripts/warm-lane-gc.sh`` is running, whatever it
+        defaults ``SEED_SCRIPT`` to is that project's arrangement — dark-factory
+        has no standing to call it broken, and warning on every reclaim of a
+        project that deliberately runs GC without lane reseeding would be pure
+        noise.  Pins that the new WARNING did not become unconditional.
+        """
+        _write_origin_stub(
+            project_root / 'scripts' / 'warm-lane-gc.sh', 'project', call_log,
+        )
+        git_ops = _make_git_ops(project_root)
+
+        with caplog.at_level(logging.DEBUG, logger=GIT_OPS_LOGGER):
+            await git_ops._run_warm_lane_gc_reclaim()
+
+        seed_warnings = [
+            m for m in _records(caplog, logging.WARNING) if 'seed script' in m
+        ]
+        assert not seed_warnings, (
+            'A project-origin gc copy must not be warned about its own '
+            f'seed-script arrangement; got {seed_warnings!r}'
+        )
+
 
 @pytest.mark.asyncio
 class TestNeitherLocationIsLoud:
@@ -550,24 +663,33 @@ class TestNeitherLocationIsLoud:
     noise, and therefore a WARNING.
     """
 
+    @pytest.mark.parametrize('wrapper', WRAPPER_PARAMS)
     async def test_sentinel_is_unchanged(
         self,
+        wrapper: Wrapper,
         project_root: Path,
         df_warm_lane_script_dir,
     ) -> None:
-        """Neither location → each wrapper returns its documented sentinel."""
+        """Neither location → each wrapper returns its documented sentinel.
+
+        Parametrized rather than looped: the fail-soft sentinel contract is
+        per-wrapper (127 / None / False, with the ``type(...) is type(...)``
+        check making ``False`` vs ``0`` load-bearing), so a break in one must
+        not stop the other five from being checked or hide them from the
+        failure report.
+        """
         df_warm_lane_script_dir(project_root.parent / 'absent-df-dir')
         git_ops = _make_git_ops(project_root)
 
-        for wrapper in WRAPPERS:
-            result = await wrapper.invoke(git_ops)
-            assert result == wrapper.sentinel and type(result) is type(
-                wrapper.sentinel,
-            ), (
-                f'{wrapper.method} must degrade to {wrapper.sentinel!r} when no '
-                f'implementation exists at either location (fail-soft contract '
-                f'preserved byte-for-byte); got {result!r}'
-            )
+        result = await wrapper.invoke(git_ops)
+
+        assert result == wrapper.sentinel and type(result) is type(
+            wrapper.sentinel,
+        ), (
+            f'{wrapper.method} must degrade to {wrapper.sentinel!r} when no '
+            f'implementation exists at either location (fail-soft contract '
+            f'preserved byte-for-byte); got {result!r}'
+        )
 
     @pytest.mark.parametrize('wrapper', WRAPPER_PARAMS)
     async def test_warning_names_both_tried_paths(
