@@ -242,3 +242,182 @@ class CategoryCensus:
         self.supersedes_shapes.update(other.supersedes_shapes)
         self.supersedes_member_shapes.update(other.supersedes_member_shapes)
         self.supersedes_list_lengths.update(other.supersedes_list_lengths)
+
+
+def _value_sort_key(value: Any) -> tuple[int, Any]:
+    """Total order over mixed value types so table ordering never depends on
+    dict insertion order (numbers before strings, each sorted naturally)."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return (0, value)
+    return (1, str(value))
+
+
+def _table(counter: Counter[Any], top_n: int) -> dict[str, Any]:
+    """Render a Counter as a capped, deterministically ordered table.
+
+    Sorted by count descending, then by value ascending -- so a re-run over
+    an unchanged corpus produces a byte-identical artifact. Truncation
+    discloses itself (``distinct_total`` + ``truncated_values``) so a capped
+    long tail is never mistaken for a complete one.
+    """
+    ordered = sorted(counter.items(), key=lambda kv: (-kv[1], _value_sort_key(kv[0])))
+    distinct_total = len(ordered)
+    return {
+        'entries': [{'value': v, 'count': c} for v, c in ordered[:top_n]],
+        'distinct_total': distinct_total,
+        'truncated_values': distinct_total > top_n,
+    }
+
+
+def _census_to_dict(census: CategoryCensus, top_n: int) -> dict[str, Any]:
+    """Render one CategoryCensus (cell or rollup) as a JSON-serialisable dict."""
+    return {
+        'records': census.records,
+        'keys': _table(census.key_counts, top_n),
+        'kind': _table(census.kind_counts, top_n),
+        'kind_missing': census.kind_missing,
+        'source': _table(census.source_counts, top_n),
+        'source_without_kind': _table(census.source_without_kind, top_n),
+        'topic_present': census.topic_present,
+        'topic': _table(census.topic_values, top_n),
+        'parent_id_present': census.parent_id_present,
+        'canonical_true': census.canonical_true,
+        'canonical_false': census.canonical_false,
+        'canonical_non_bool': census.canonical_non_bool,
+        'supersedes_shapes': _table(census.supersedes_shapes, top_n),
+        'supersedes_member_shapes': _table(census.supersedes_member_shapes, top_n),
+        'supersedes_list_lengths': _table(census.supersedes_list_lengths, top_n),
+    }
+
+
+def build_report(
+    cells: dict[str, dict[str, CategoryCensus]],
+    coverage: dict[str, dict[str, Any]],
+    top_n: int = 50,
+    page_size: int | None = None,
+) -> dict[str, Any]:
+    """Assemble the JSON census report from per-(project, category) cells.
+
+    Args:
+        cells: ``{project_id: {category_value: CategoryCensus}}``.
+        coverage: ``{project_id: {'collection', 'collection_points',
+            'categories': {category: {'expected', 'scrolled'}}}}`` as
+            returned by :func:`census_project`.
+        top_n: Cap on entries per value/key table.
+        page_size: Scroll page size, recorded in ``params`` so a future
+            re-run is comparable.
+
+    Returns:
+        A JSON-serialisable dict with per-cell counts, per-project and
+        grand-total rollups, and a coverage block. Any enumeration shortfall
+        -- a cell scrolling fewer points than ``count_by_metadata`` expected,
+        or per-category counts summing short of the collection's point total
+        -- sets ``coverage.complete=false`` and appears as a NAMED entry in
+        ``coverage.deltas`` (INV-2 no-silent-fail-soft). The caller exits
+        non-zero on that flag.
+    """
+    projects: dict[str, Any] = {}
+    grand_total = CategoryCensus()
+    category_order: list[str] = []
+
+    for project_id in sorted(cells):
+        project_cells = cells[project_id]
+        project_total = CategoryCensus()
+        rendered: dict[str, Any] = {}
+        for category in _ordered_categories(project_cells):
+            if category not in category_order:
+                category_order.append(category)
+            census = project_cells[category]
+            rendered[category] = _census_to_dict(census, top_n)
+            project_total.merge(census)
+        grand_total.merge(project_total)
+        projects[project_id] = {
+            'total': _census_to_dict(project_total, top_n),
+            'categories': rendered,
+        }
+
+    return {
+        'schema_version': 1,
+        'params': {
+            'projects': sorted(cells),
+            'categories': category_order,
+            'page_size': page_size,
+            'top_n': top_n,
+        },
+        'projects': projects,
+        'grand_total': _census_to_dict(grand_total, top_n),
+        'coverage': _build_coverage(coverage),
+    }
+
+
+def _ordered_categories(project_cells: dict[str, CategoryCensus]) -> list[str]:
+    """CENSUS_CATEGORIES order first, then any unexpected category, sorted."""
+    known = [c.value for c in CENSUS_CATEGORIES if c.value in project_cells]
+    extra = sorted(k for k in project_cells if k not in known)
+    return known + extra
+
+
+def _build_coverage(coverage: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Reconcile expected vs scrolled per cell and per-category sums vs the
+    collection point total, naming every shortfall."""
+    deltas: list[dict[str, Any]] = []
+    projects: dict[str, Any] = {}
+    overall_complete = True
+
+    for project_id in sorted(coverage):
+        record = coverage[project_id]
+        per_category: dict[str, Any] = {}
+        counted = 0
+        project_complete = True
+
+        for category, counts in record.get('categories', {}).items():
+            expected = int(counts.get('expected', 0))
+            scrolled = int(counts.get('scrolled', 0))
+            delta = scrolled - expected
+            counted += expected
+            cell_complete = delta == 0
+            per_category[category] = {
+                'expected': expected,
+                'scrolled': scrolled,
+                'delta': delta,
+                'complete': cell_complete,
+            }
+            if not cell_complete:
+                project_complete = False
+                deltas.append({
+                    'kind': 'category_shortfall',
+                    'project_id': project_id,
+                    'category': category,
+                    'expected': expected,
+                    'scrolled': scrolled,
+                    'delta': delta,
+                })
+
+        collection_points = int(record.get('collection_points', 0))
+        uncovered = collection_points - counted
+        if uncovered != 0:
+            project_complete = False
+            deltas.append({
+                'kind': 'uncovered_points',
+                'project_id': project_id,
+                'collection': record.get('collection'),
+                'collection_points': collection_points,
+                'counted': counted,
+                'delta': uncovered,
+            })
+
+        projects[project_id] = {
+            'collection': record.get('collection'),
+            'collection_points': collection_points,
+            'counted': counted,
+            'uncovered_points': uncovered,
+            'complete': project_complete,
+            'categories': per_category,
+        }
+        overall_complete = overall_complete and project_complete
+
+    return {
+        'complete': overall_complete,
+        'deltas': deltas,
+        'projects': projects,
+    }
