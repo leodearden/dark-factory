@@ -1,0 +1,167 @@
+prd: plans/deep-merge-ahead-prd.md
+schema_version: 1
+tasks:
+- label: α
+  task_id: 3183
+  title: 'config: merge_deep.chain_cap knob + kill-switch default'
+  capabilities:
+  - name: merge-deep-chain-cap-knob-present
+    binding: capability→producer — task-α adds merge_deep.chain_cap to config.py +
+      defaults.yaml (default 0)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: merge_deep
+      paths:
+      - orchestrator/src/
+      expect: present
+  - name: chain-cap-reloadable-and-cap0-byte-identity
+    binding: 'capability→producer — task-α: knob in RELOADABLE_FIELDS (green-tier);
+      cap=0 byte-identical (speculation_probe precedent)'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: kill-switch/hot-reload is a test property (byte-identity + reload dispositions),
+        not a grep
+- label: β
+  task_id: 3184
+  title: chain builder (build-on-dispatch)
+  capabilities:
+  - name: build-chain-returns-links-tip-truncated
+    binding: capability→producer — task-β build_chain(queue_snapshot,head_merge_commit,cap,target_depth)->ChainResult;
+      substrate acquire_spec_lane/_spec- pool wired on main (merge_liveness.py:690+)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: signal is an integration test (conflicting item yields clean prefix,
+        one worktree used), not a single grep literal
+- label: γ
+  task_id: 3185
+  title: deep-tip verify dispatch + halving state
+  capabilities:
+  - name: merge-verify-chain-items-field-present
+    binding: capability→producer — task-γ emits merge_verify.chain_items (1-indexed);
+      consumers δ/ε depend on γ (DAG-direction correct)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: chain_items
+      paths:
+      - orchestrator/src/
+      expect: present
+  - name: deep-tip-dispatch-and-halving-state-machine
+    binding: 'capability→producer — task-γ: verify dispatch onto chain tip (novel)
+      + halving/reset (d=1 floor byte-identical); dep task-3003 upstream (typed contended-DEFER,
+      exists in-progress)'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: signal is an integration test matching dispatch depths to the halving
+        policy, not a single grep literal
+- label: δ
+  task_id: 3186
+  title: prefix landing on tip pass
+  capabilities:
+  - name: merge-finalized-landed-via-chain-field-present
+    binding: capability→producer — task-δ emits merge_finalized.landed_via_chain=k;
+      consumers ι/ε/κ depend on δ (DAG-direction correct)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: landed_via_chain
+      paths:
+      - orchestrator/src/
+      expect: present
+  - name: in-order-cas-landing-with-stale-abort-and-clean-lease-release
+    binding: 'capability→producer — task-δ reuses advance_main/frozen-prefix CAS (on
+      main) + verify_cancel.py; stale-CAS abort (decision #9); inherits 3003 contended→DEFER'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: CAS in-order landing + stale abort + lease release are integration-test
+        properties, not a single grep literal
+- label: ι
+  task_id: 3187
+  title: two-way boundary/integration gate (B+H)
+  capabilities:
+  - name: boundary-sketch-green-e2e-both-sides
+    binding: DAG-direction — task-ι integration gate; all legs produced upstream (β
+      build, γ dispatch, δ landing); conservation audits (speculation_accounting_violations/PermitLedger,
+      on main) stay green
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the task IS the boundary-test suite; its signal is the CI-green two-way
+        boundary matrix
+- label: ε
+  task_id: 3188
+  title: telemetry + report
+  capabilities:
+  - name: merge-report-renders-chain-depth-histogram-and-deep-fail-rate
+    binding: capability→producer — task-ε report reader keys on chain_items (γ, upstream);
+      substrate analyze_speculation_depth.py on main
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: signal is 'report renders from live events; reader output matches git-derived
+        truth on fixtures', not a single grep literal
+- label: ζ
+  task_id: 3189
+  title: reify canary enable at cap=6 (deterministic deploy)
+  capabilities:
+  - name: canary-cap6-reload-applied-and-first-deep-verify
+    binding: capability→producer — task-ζ via committed scripts/merge-deep-set-cap.sh
+      (on main fbaf4dc526); chain machinery α–δ + gate ι + telemetry ε upstream
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: operator deploy signal (reload disposition shows knob live; first chain_items>=2
+        verify observed), not a grep
+- label: η1
+  task_id: 3190
+  title: 7-day canary predicate (deterministic, milestone delayed)
+  capabilities:
+  - name: canary-health-predicate-exit-code-gate
+    binding: capability→producer — task-η1 via committed scripts/merge-deep-canary-predicate.sh;
+      numeric bounds (deep-fail≤0.35/items≥1.3/p90≤5400s) backed by replay study (2/59≈0.034),
+      marked provisional
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: predicate exit-code contract (read-only runs.db check); thresholds provisional,
+        retuned by θ — a test/deploy property, not a grep
+- label: η2
+  task_id: 3191
+  title: promote cap 6 -> 32 (deterministic deploy)
+  capabilities:
+  - name: promote-cap32-reload-applied
+    binding: capability→producer — task-η2 via the SAME scripts/merge-deep-set-cap.sh
+      (no lock-step duplication); gated on η1 predicate pass
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: operator deploy signal (reload disposition shows cap=32), not a grep
+- label: θ
+  task_id: 3192
+  title: week-after aggressiveness assessment (normal, milestone delayed)
+  capabilities:
+  - name: assessment-committed-and-followups-filed-or-declined
+    binding: capability→producer — task-θ (leaf) commits an assessment to plans/ and
+      files/declines follow-ups
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: signal is a committed plans/ doc + filed-or-declined follow-up tasks,
+        observed via git + task tree
+- label: κ
+  task_id: 3193
+  title: docs correction pass (normal)
+  capabilities:
+  - name: docs-name-knob-and-halving-policy
+    binding: capability→producer — task-κ (leaf) updates skills/orchestrate/SKILL.md
+      + OPERATIONS.md; marks analysis §11.5 implemented
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: docs-diff signal (the merge_deep.chain_cap knob name + halving policy
+        appear in the docs)
