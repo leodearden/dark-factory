@@ -381,6 +381,43 @@ class TestBuildCompositeReport:
         assert rows['healthy']['plan_quality'] == pytest.approx(0.55)
         assert rows['healthy']['plan_quality_cap_excluded'] == 0
 
+    def test_cap_exclusion_counter_agrees_with_the_plan_quality_surface(self):
+        # The two exclusion counters describe the SAME cells, so they must not
+        # disagree: build_plan_quality_report counts ARCHITECT rows only, so a
+        # tainted non-architect trial (which has no plan_quality to exclude in
+        # the first place) must not inflate the composite counter either
+        # (reviewer: docs-accuracy).
+        from orchestrator.evals.report import (
+            build_composite_report,
+            build_plan_quality_report,
+        )
+
+        results = [
+            _mresult('f1', 'mixed', 1, quality=1.0, cost_usd=1.0,
+                     duration_ms=1000, role_under_test='architect',
+                     plan_quality=None, cap_tainted=True,
+                     invocation_error='architect:cap_hit: session limit'),
+            _mresult('f1', 'mixed', 2, quality=1.0, cost_usd=1.0,
+                     duration_ms=1000, role_under_test='implementer',
+                     plan_quality=None, cap_tainted=True,
+                     invocation_error='architect:cap_hit: session limit'),
+            _mresult('f1', 'mixed', 3, quality=1.0, cost_usd=1.0,
+                     duration_ms=1000, role_under_test='architect',
+                     plan_quality=0.6),
+        ]
+        rows = {r['config']: r for r in build_composite_report(results)['configs']}
+        plan_report = build_plan_quality_report(results)
+
+        assert rows['mixed']['plan_quality_cap_excluded'] == 1
+        assert plan_report['cap_excluded'] == 1
+        assert (
+            rows['mixed']['plan_quality_cap_excluded']
+            == plan_report['cap_excluded']
+        )
+        # The tainted trial is still skipped as a passthrough SOURCE regardless
+        # of role, so a healthy trial's measurement survives.
+        assert rows['mixed']['plan_quality'] == pytest.approx(0.6)
+
     def test_price_table_echo_and_sorted_rows(self):
         from orchestrator.evals.report import build_composite_report
 

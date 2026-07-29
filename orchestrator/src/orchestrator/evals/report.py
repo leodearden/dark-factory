@@ -213,7 +213,20 @@ def build_composite_report(
     passthroughs of any trial's metrics (η/θ surfaces) — except that
     ``plan_quality`` deliberately skips CAP-TAINTED trials (task 3118) so an
     infra refusal landing on the first trial cannot blank out a config that has
-    healthy trials; ``plan_quality_cap_excluded`` reports how many were skipped. ``cost_source`` (P5) is
+    healthy trials; ``plan_quality_cap_excluded`` reports how many were skipped,
+    counted over ARCHITECT trials only so it agrees exactly with
+    :func:`build_plan_quality_report`'s architect-scoped ``cap_excluded``
+    (reviewer: docs-accuracy — two exclusion surfaces that disagree are worse
+    than one).
+
+    SCOPE of the taint exclusion, stated explicitly because it is narrow: only
+    the ``plan_quality`` passthrough skips tainted trials. The composite /
+    quality / cost / latency pools and the ``trials`` + ``tests_pass_rate``
+    denominators still COUNT them, deliberately — those pools measure the
+    implementer-path gates, which a tainted architect cell reports as an honest
+    failure rather than a fabricated score, and silently dropping trials from
+    the denominator ``select_survivors`` ranks on would shrink the sample
+    without saying so. ``cost_source`` (P5) is
     the config's single distinct per-trial source, or ``'mixed'`` when its
     trials span more than one — since ``cost_usd`` is a cross-trial mean,
     labelling it with just the first trial's source would mislabel a blended
@@ -295,7 +308,14 @@ def build_composite_report(
         # an infra refusal that happened to land on the FIRST trial cannot blank
         # out a config that has healthy ones (task 3118).
         if m.get('cap_tainted'):
-            acc['plan_quality_cap_excluded'] += 1
+            # Counted over ARCHITECT trials only, matching
+            # build_plan_quality_report's architect-scoped cap_excluded — the two
+            # exclusion surfaces describe the same cells and must not disagree.
+            # (A tainted non-architect trial has no plan_quality to exclude in
+            # the first place, so it is skipped as a passthrough source here and
+            # counted by neither surface.)
+            if m.get('role_under_test') == 'architect':
+                acc['plan_quality_cap_excluded'] += 1
         elif acc['first_untainted_metrics'] is None:
             acc['first_untainted_metrics'] = m
 
@@ -752,8 +772,41 @@ _PLAN_QUALITY_MEAN_COLUMNS = (
 # the bare '-' null sentinel (which already means "not an architect run"): a
 # reader must be able to tell "this candidate scored nothing" from "we could not
 # measure this candidate" at a glance.
-_CAP_EXCLUDED_CELL = 'cap-excluded'
+#
+# Spelled 'excluded', not 'cap-excluded' (reviewer: design-coherence): the
+# ``cap_tainted`` flag covers every unmeasurable cause — cap hit, auth failure,
+# model-not-found, zero-output wedge, harness error — and a PERMANENT config
+# error ("this candidate can never run") must not render as a TRANSIENT one
+# ("rerun after the cap window"). The cause is always carried in the adjacent
+# ``invocation_error`` column and broken out by cause in the summary line, so
+# the marker itself stays cause-neutral rather than asserting a cap.
+_CAP_EXCLUDED_CELL = 'excluded'
 _PLAN_QUALITY_MEAN_HEADER = 'plan_quality by config:'
+
+
+def _taint_cause(marker: str | None) -> str:
+    """Reduce a stage-prefixed ``invocation_error`` to its bare CAUSE key.
+
+    ``"architect:cap_hit: You've hit your session limit · resets 8pm"`` →
+    ``"cap_hit"``; ``"architect:model_not_found: ..."`` → ``"model_not_found"``.
+    Pure string surgery on the marker ``run_architect_eval`` builds — the eval
+    layer deliberately does not re-derive the cause from the AgentResult, which
+    is long gone by report time.
+
+    Falls back to ``'unknown'`` for an absent or unparseable marker rather than
+    guessing, so a mis-shaped marker shows up as its own bucket instead of being
+    silently folded into a real cause.
+    """
+    if not marker:
+        return 'unknown'
+    # Only the FIRST stage marker is used: the join order is architect-then-
+    # judge, and a judge-only refusal never taints, so the leading marker is
+    # always the one that drove the exclusion.
+    first = marker.split(';')[0].strip()
+    _stage, sep, rest = first.partition(':')
+    if not sep:
+        return first or 'unknown'
+    return rest.strip().partition(':')[0].strip() or 'unknown'
 
 
 def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
@@ -773,13 +826,21 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
     metrics predating them), and the report gains a per-config aggregate over
     ARCHITECT rows plus a report-level ``cap_excluded`` total.
 
-    THE INVARIANT: a cap-tainted cell is a TRANSPORT-layer failure — we never
-    got to ask the model — so it is EXCLUDED from ``mean_plan_quality`` and
-    COUNTED as excluded, never averaged in as a zero. Averaging it in would
-    penalise whichever candidate happened to be scheduled inside a cap window,
-    which is a property of the schedule, not of the candidate. A config with no
-    scored cells reports ``mean_plan_quality=None`` rather than ``0.0``, so
-    "we measured nothing" can never read as "it scored nothing".
+    THE INVARIANT: a cap-tainted cell is an infra failure — we never got to ask
+    the model — so it is EXCLUDED from ``mean_plan_quality`` and COUNTED as
+    excluded, never averaged in as a zero. Averaging it in would penalise
+    whichever candidate happened to be scheduled inside a cap window, which is a
+    property of the schedule, not of the candidate. A config with no scored cells
+    reports ``mean_plan_quality=None`` rather than ``0.0``, so "we measured
+    nothing" can never read as "it scored nothing".
+
+    ``cap_excluded_by_cause`` breaks that total out by CAUSE
+    (``{'cap_hit': 2, 'model_not_found': 1}``, key-sorted for determinism)
+    because the causes are not interchangeable: a cap hit is transient and
+    schedule-attributable ("rerun after the window"), whereas a model-not-found
+    or auth failure is a PERMANENT, candidate-specific configuration error. A
+    single "cap-excluded" total would let the latter masquerade as the former
+    and hide a config that can never run behind ``n=0, mean=None``.
     """
     rows: list[dict[str, Any]] = []
     for result in results:
@@ -799,6 +860,7 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
     scored: dict[str, list[float]] = defaultdict(list)
     excluded: dict[str, int] = defaultdict(int)
     totals: dict[str, int] = defaultdict(int)
+    by_cause: dict[str, int] = defaultdict(int)
     for row in rows:
         if row['role_under_test'] != 'architect':
             continue
@@ -806,6 +868,7 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
         totals[cfg] += 1
         if row['cap_tainted']:
             excluded[cfg] += 1
+            by_cause[_taint_cause(row['invocation_error'])] += 1
         elif row['plan_quality'] is not None:
             scored[cfg].append(float(row['plan_quality']))
 
@@ -826,6 +889,7 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
         'rows': rows,
         'configs': configs,
         'cap_excluded': sum(excluded.values()),
+        'cap_excluded_by_cause': {c: by_cause[c] for c in sorted(by_cause)},
     }
 
 
@@ -877,16 +941,17 @@ def format_plan_quality_table(report: dict[str, Any]) -> str:
     A ``plan_quality`` column shows the populated float (4 dp) for architect rows
     and ``-`` (the null sentinel) for non-architect rows; ``role_under_test``
     and ``invocation_error`` render ``-`` when ``None``. A CAP-TAINTED row shows
-    the explicit ``cap-excluded`` marker in place of a score, alongside the
-    ``invocation_error`` that caused it — a transport refusal must never render
-    as ``0.0000``, and must stay distinguishable from the ``-`` a non-architect
-    row uses.
+    the explicit ``excluded`` marker in place of a score, alongside the
+    ``invocation_error`` that caused it — an infra failure must never render as
+    ``0.0000``, and must stay distinguishable from the ``-`` a non-architect row
+    uses.
 
-    Two sections follow the rows: the exclusion count (how many of the architect
-    cells were not measurable) and the per-config mean block. Both are computed
-    from the report, so the CLI caller picks the exclusion up with no change of
-    its own. The same report always renders byte-identically (no wall-clock or
-    dict-order dependence).
+    Two sections follow the rows: the exclusion count — how many architect cells
+    were not measurable, BROKEN OUT BY CAUSE so a permanent config error is not
+    read as a transient cap window — and the per-config mean block. Both are
+    computed from the report, so the CLI caller picks the exclusion up with no
+    change of its own. The same report always renders byte-identically (no
+    wall-clock or dict-order dependence).
     """
     rows = report.get('rows', [])
 
@@ -928,10 +993,16 @@ def format_plan_quality_table(report: dict[str, Any]) -> str:
     lines.extend(_fmt(rr) for rr in rendered)
 
     architect_cells = sum(c['total'] for c in report.get('configs', []))
+    # Broken out by CAUSE so a permanent config error (model_not_found /
+    # auth_failed — "this candidate can never run") cannot masquerade as a
+    # transient schedule artifact (cap_hit — "rerun after the window").
+    by_cause = report.get('cap_excluded_by_cause') or {}
+    causes = ', '.join(f'{cause}: {n}' for cause, n in sorted(by_cause.items()))
     lines.append('')
     lines.append(
-        f'excluded: {report.get("cap_excluded", 0)} cap-tainted cell(s) of '
+        f'excluded: {report.get("cap_excluded", 0)} unmeasurable cell(s) of '
         f'{architect_cells} architect cell(s)'
+        + (f' ({causes})' if causes else '')
     )
     lines.append('')
     lines.extend(_format_plan_quality_mean_section(report))

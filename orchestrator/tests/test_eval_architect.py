@@ -159,6 +159,55 @@ def _cap_agent_result():
     )
 
 
+def _codex_cap_agent_result():
+    """A CODEX cap body — matched only by CODEX_CAP_PATTERNS, never by claude's.
+
+    Deliberately carries no ``api_error_status`` and none of the claude
+    CAP_HIT_PREFIXES, so the ONLY route to a marker is the codex-backend table:
+    the payload is a live probe of whether ``backend=`` actually reached
+    ``classify_invocation``.
+    """
+    from shared.cli_invoke import AgentResult
+
+    return AgentResult(
+        success=False,
+        output='stream error: usage limit reached for this account',
+        cost_usd=0.0,
+        duration_ms=900,
+        turns=0,
+        subtype='error',
+    )
+
+
+def _wedged_agent_result():
+    """A zero-output CLI wedge: full timeout, zero transcript turns, zero cost."""
+    from shared.cli_invoke import AgentResult
+
+    return AgentResult(
+        success=False,
+        output='',
+        cost_usd=0.0,
+        duration_ms=600_000,
+        turns=0,
+        timed_out=True,
+        transcript_turns=0,
+    )
+
+
+def _cli_local_error_result(marker: str):
+    """A local CLI/usage fault — explicitly NOT a cap (the reify-3604 fix)."""
+    from shared.cli_invoke import AgentResult
+
+    return AgentResult(
+        success=False,
+        output=f'error: {marker}',
+        cost_usd=0.0,
+        duration_ms=300,
+        turns=0,
+        subtype='error',
+    )
+
+
 class TestDetectInvocationError:
     def test_none_result_is_not_an_invocation_error(self):
         from orchestrator.evals.metrics import detect_invocation_error
@@ -233,6 +282,87 @@ class TestDetectInvocationError:
             cost_usd=1.2, duration_ms=45000, turns=8, api_error_status=None,
         )
         assert detect_invocation_error(content_failure) is None
+
+    def test_zero_output_wedge_yields_wedge_marker(self):
+        # A full-timeout invocation with zero transcript turns produced NO model
+        # answer at all — unmeasurable for exactly the reason a 429 is, so it
+        # must be marked rather than scored 0.0 (reviewer: robustness).
+        from orchestrator.evals.metrics import detect_invocation_error
+
+        marker = detect_invocation_error(_wedged_agent_result())
+        assert isinstance(marker, str) and marker
+        assert 'wedge' in marker.lower()
+
+    def test_body_less_429_outranks_the_wedge_tier(self):
+        # A 429 that ALSO timed out with zero turns must report the 429 it is,
+        # not a generic wedge — the structured status is the more specific fact.
+        from shared.cli_invoke import AgentResult
+
+        from orchestrator.evals.metrics import detect_invocation_error
+
+        wedged_429 = AgentResult(
+            success=False, output='', cost_usd=0.0, duration_ms=600_000,
+            turns=0, timed_out=True, transcript_turns=0, api_error_status=429,
+        )
+        marker = detect_invocation_error(wedged_429)
+        assert marker is not None and '429' in marker
+        assert 'wedge' not in marker.lower()
+
+    def test_near_cap_warning_is_not_an_invocation_error(self):
+        # NearCap is a WARNING that a cap is imminent — this invocation was NOT
+        # refused, so whatever it produced is a real measurement. Pinned so the
+        # deliberate None can't silently become a marker (and an exclusion).
+        from shared.cli_invoke import AgentResult
+
+        from orchestrator.evals.metrics import detect_invocation_error
+
+        near = AgentResult(
+            success=False,
+            output="You're close to your usage limit for this session",
+            cost_usd=0.9, duration_ms=30_000, turns=6,
+        )
+        assert detect_invocation_error(near) is None
+
+    def test_cli_local_error_is_not_an_invocation_error(self):
+        # CliLocalError is explicitly NOT a cap (the reify-3604 precedence fix).
+        # It is a local harness/CLI fault whose classification the eval layer
+        # deliberately does not launder into a cap-shaped exclusion.
+        from shared.invocation_outcome import (
+            NON_CAP_CLI_ERROR_MARKERS,
+            CliLocalError,
+            classify_invocation,
+        )
+
+        from orchestrator.evals.metrics import detect_invocation_error
+
+        local = _cli_local_error_result(next(iter(NON_CAP_CLI_ERROR_MARKERS)))
+        # Guard the fixture: it really does reach the CliLocalError tier, so
+        # this stays a pin on the VARIANT rather than on an unclassified blob.
+        assert isinstance(
+            classify_invocation(local, strict_confirm=True), CliLocalError
+        )
+        assert detect_invocation_error(local) is None
+
+    # -- backend threading -------------------------------------------------
+    #
+    # classify_invocation's codex/gemini cap tables fire ONLY for their own
+    # backend, so the `backend=` argument is load-bearing: dropping or
+    # hard-coding it would silently un-mark every codex/gemini cap hit while
+    # every claude test still passed.
+
+    def test_codex_cap_pattern_fires_only_under_the_codex_backend(self):
+        from orchestrator.evals.metrics import detect_invocation_error
+
+        codex_capped = _codex_cap_agent_result()
+
+        marker = detect_invocation_error(codex_capped, backend='codex')
+        assert isinstance(marker, str) and marker
+        assert 'cap' in marker.lower()
+
+        # Same payload, DEFAULT (claude) backend: the codex table is not
+        # consulted and no claude cap prefix matches, so it is not an infra
+        # refusal at all.
+        assert detect_invocation_error(codex_capped) is None
 
 
 # ---------------------------------------------------------------------------
@@ -728,6 +858,129 @@ class TestRunArchitectEval:
         assert isinstance(result.metrics['plan_quality'], float)
         assert result.metrics['role_under_test'] == 'architect'
 
+    async def test_timeout_is_marked_but_keeps_scoring_on_content(self):
+        """A timeout is MARKED yet deliberately NOT tainted (asymmetry pinned).
+
+        Marked: without a marker the cell was byte-indistinguishable from a
+        genuinely terrible plan — the same defect the cap path removes.
+
+        Not tainted: unlike a cap hit (a property of the SCHEDULE), a timeout is
+        CANDIDATE-attributable — the model was asked and did not finish inside
+        the operator's budget. Excluding it would let a pathologically slow
+        candidate dodge the penalty its competitors paid, so the cell keeps
+        scoring on content and carries the reliability signal in BOTH
+        ``outcome='timeout'`` and ``invocation_error``.
+        """
+        result, _ = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=_well_formed_plan(),
+            invoke_side_effect=TimeoutError(),
+        )
+        assert result.outcome == 'timeout'
+        marker = result.metrics['invocation_error']
+        assert isinstance(marker, str) and marker.startswith('architect:')
+        assert 'timeout' in marker.lower()
+        assert result.metrics['cap_tainted'] is False
+        assert result.metrics['plan_quality'] is not None
+
+    async def test_cap_refusal_that_left_a_plan_keeps_the_structural_floor(self):
+        """A cap landing MID-run, after plan.json was already written.
+
+        The common shape of a session-limit hit during a long campaign: the
+        architect wrote its plan through plan-tools MCP, THEN the CLI 429'd. The
+        taint decision must consult the ARTIFACT, not just the refusal — a real
+        plan is a real content measurement, and nulling it would both throw that
+        measurement away and persist a self-contradictory cell (``plan_steps``
+        > 0 alongside "we never got to ask the model").
+        """
+        from orchestrator.evals.judge import score_plan_structure
+
+        plan = _well_formed_plan()
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=plan,
+            arch_result=_cap_agent_result(),
+        )
+
+        # The measurement SURVIVES: scored on the deterministic floor, kept in
+        # the aggregate — symmetric with the judge-only refusal.
+        assert result.metrics['plan_quality'] == score_plan_structure(plan)
+        assert result.metrics['cap_tainted'] is False
+        # ...and the cell is self-consistent: a plan with steps, not a null.
+        assert result.metrics['plan_steps'] == len(plan['steps'])
+
+        # The refusal is still RECORDED, so a reader knows the LLM judge never
+        # ran on this cell...
+        marker = result.metrics['invocation_error']
+        assert isinstance(marker, str) and marker.startswith('architect:')
+        assert 'cap' in marker.lower()
+        # ...and the judge is still skipped: in the same cap window it would 429
+        # too, and the floor is the exact degradation a judge failure takes.
+        mocks['judge'].assert_not_called()
+
+    async def test_wedged_architect_invoke_is_marked_and_excluded(self):
+        # A zero-output wedge (full timeout, zero transcript turns, zero cost)
+        # produced no model answer at all — unmeasurable for the same reason a
+        # 429 is, so it must not be scored 0.0 either (reviewer: robustness).
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan={},
+            arch_result=_wedged_agent_result(),
+        )
+        assert result.metrics['cap_tainted'] is True
+        assert result.metrics['plan_quality'] is None
+        marker = result.metrics['invocation_error']
+        assert isinstance(marker, str) and marker.startswith('architect:')
+        assert 'wedge' in marker.lower()
+        mocks['judge'].assert_not_called()
+
+    async def test_harness_exception_is_marked_and_excluded(self):
+        # OUR crash, not the candidate's: the architect was never even asked, so
+        # charging a fabricated 0.0 to the candidate would be plainly wrong.
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan={},
+            invoke_side_effect=RuntimeError('worktree exploded'),
+        )
+        assert result.outcome == 'blocked'
+        assert result.metrics['cap_tainted'] is True
+        assert result.metrics['plan_quality'] is None
+        marker = result.metrics['invocation_error']
+        assert isinstance(marker, str) and marker.startswith('architect:')
+        assert 'harness_error' in marker
+        assert 'RuntimeError' in marker
+        mocks['judge'].assert_not_called()
+
+    async def test_config_backend_reaches_the_invocation_classifier(self):
+        """The ``backend=`` argument is load-bearing, so pin it end-to-end.
+
+        ``classify_invocation``'s codex cap table fires ONLY for the codex
+        backend. Feeding a codex-shaped cap body through a codex candidate must
+        mark the cell; the SAME body through a claude candidate must not — a
+        regression that dropped or hard-coded ``backend=config.backend`` would
+        silently un-mark every codex/gemini cap hit while every claude test kept
+        passing.
+        """
+        from orchestrator.evals.configs import EvalConfig
+
+        codex_cfg = EvalConfig(
+            'architect-codex-high', 'codex', 'gpt-5', 'high', role='architect',
+        )
+        result, _ = await _run_architect_eval_hermetic(
+            codex_cfg, produced_plan={}, arch_result=_codex_cap_agent_result(),
+        )
+        marker = result.metrics['invocation_error']
+        assert isinstance(marker, str) and marker.startswith('architect:')
+        assert 'cap' in marker.lower()
+        assert result.metrics['cap_tainted'] is True
+
+        # Same payload, claude candidate: the codex table is never consulted.
+        claude_result, _ = await _run_architect_eval_hermetic(
+            self._cfg(), produced_plan={}, arch_result=_codex_cap_agent_result(),
+        )
+        assert claude_result.metrics['invocation_error'] is None
+        assert claude_result.metrics['cap_tainted'] is False
+
     async def test_cap_refused_architect_invoke_is_marked_not_scored_zero(self):
         """A CLI 429 must be MARKED as infra, never scored as a terrible plan.
 
@@ -897,8 +1150,14 @@ def _implementer_result(
 def _cap_tainted_result(
     task_id: str = 'df_task_3118',
     config_name: str = 'architect-sonnet-high',
+    invocation_error: str | None = None,
 ):
-    """An architect cell whose invocation was refused — NOT a measurement."""
+    """An architect cell whose invocation was refused — NOT a measurement.
+
+    ``invocation_error`` defaults to the campaign cap payload; pass a different
+    stage-prefixed marker (e.g. ``'architect:model_not_found: ...'``) to build a
+    cell excluded for a PERMANENT rather than a transient cause.
+    """
     from orchestrator.evals.runner import EvalResult
 
     return EvalResult(
@@ -909,7 +1168,9 @@ def _cap_tainted_result(
             'role_under_test': 'architect',
             'plan_quality': None,
             'cap_tainted': True,
-            'invocation_error': f'architect:cap_hit: {_CAP_TEXT}',
+            'invocation_error': (
+                invocation_error or f'architect:cap_hit: {_CAP_TEXT}'
+            ),
             'composite_score': 0.0,
         },
         worktree_path='/tmp/wt-arch-capped',
@@ -1038,6 +1299,41 @@ class TestPlanQualityReport:
         ])
         assert report['cap_excluded'] == 2
 
+    def test_exclusions_are_broken_out_by_cause(self):
+        # The causes are NOT interchangeable: a cap hit is transient and
+        # schedule-attributable ('rerun after the window'), a model-not-found is
+        # a PERMANENT candidate-config error ('this can never run'). A single
+        # total would let the latter masquerade as the former and hide a dead
+        # config behind n=0 / mean=None (reviewer: design-coherence).
+        from orchestrator.evals.report import build_plan_quality_report
+
+        report = build_plan_quality_report([
+            _cap_tainted_result(task_id='t1', config_name='a'),
+            _cap_tainted_result(task_id='t2', config_name='a'),
+            _cap_tainted_result(
+                task_id='t3', config_name='b',
+                invocation_error='architect:model_not_found: no such model',
+            ),
+        ])
+        assert report['cap_excluded'] == 3
+        assert report['cap_excluded_by_cause'] == {
+            'cap_hit': 2, 'model_not_found': 1,
+        }
+        # Key-sorted, so the dict renders byte-deterministically.
+        causes = list(report['cap_excluded_by_cause'])
+        assert causes == sorted(causes)
+
+    def test_unparseable_marker_buckets_as_unknown_not_a_real_cause(self):
+        # A mis-shaped marker must show up as its own bucket rather than being
+        # silently folded into a real cause.
+        from orchestrator.evals.report import build_plan_quality_report
+
+        report = build_plan_quality_report([
+            _cap_tainted_result(task_id='t1', config_name='a',
+                                invocation_error='architect:'),
+        ])
+        assert report['cap_excluded_by_cause'] == {'unknown': 1}
+
     def test_all_cells_tainted_yields_null_mean_never_zero(self):
         from orchestrator.evals.report import build_plan_quality_report
 
@@ -1103,14 +1399,14 @@ class TestPlanQualityReport:
             ln for ln in table.splitlines() if 'df_task_3118' in ln
         )
         # Explicit exclusion marker, WITH its reason — never a score...
-        assert 'cap-excluded' in capped_line
+        assert 'excluded' in capped_line
         assert '0.0000' not in capped_line
         assert 'cap_hit' in capped_line
         # ...and visibly distinct from the '-' null sentinel a non-architect row
         # uses, so "not an architect run" cannot be confused with "architect run
         # we could not measure".
         impl_line = next(ln for ln in table.splitlines() if 'df_task_1993' in ln)
-        assert 'cap-excluded' not in impl_line
+        assert 'excluded' not in impl_line
 
     def test_table_renders_exclusion_summary_and_per_config_means(self):
         from orchestrator.evals.report import (
@@ -1125,15 +1421,37 @@ class TestPlanQualityReport:
             _cap_tainted_result(task_id='t3', config_name=cfg),
         ]))
 
-        # The reader sees "n=2 of 3, 1 cap-excluded", not a silently shrunk mean.
+        # The reader sees "n=2 of 3, 1 excluded", not a silently shrunk mean.
         summary = next(
             ln for ln in table.splitlines() if ln.startswith('excluded:')
         )
         assert '1' in summary and '3' in summary
+        # ...with the CAUSE named, not a bare count.
+        assert 'cap_hit' in summary
 
         mean_line = _mean_section_line(table, cfg)
         assert '0.8000' in mean_line   # the EXCLUDING mean, not 0.5333
         assert '0.5333' not in table
+
+    def test_summary_names_a_permanent_cause_as_itself(self):
+        # A model-not-found exclusion must not render as a cap window: the
+        # operator's next action differs entirely ('fix the config' vs 'rerun').
+        from orchestrator.evals.report import (
+            build_plan_quality_report,
+            format_plan_quality_table,
+        )
+
+        table = format_plan_quality_table(build_plan_quality_report([
+            _cap_tainted_result(
+                task_id='t1', config_name='dead-cfg',
+                invocation_error='architect:model_not_found: no such model',
+            ),
+        ]))
+        summary = next(
+            ln for ln in table.splitlines() if ln.startswith('excluded:')
+        )
+        assert 'model_not_found: 1' in summary
+        assert 'cap' not in summary.lower()
 
     def test_config_with_no_scored_cells_renders_dash_not_zero(self):
         from orchestrator.evals.report import (
@@ -1270,8 +1588,30 @@ class TestCliArchitectDispatch:
         echo_line = next(
             ln for ln in out.splitlines() if 'plan_quality=' in ln
         )
-        assert 'cap-tainted' in echo_line
+        # Cause-neutral label + the marker naming the ACTUAL cause: a permanent
+        # config error must not read as a transient cap window.
+        assert 'unmeasurable' in echo_line
         assert marker in echo_line
+
+    def test_model_not_found_echo_does_not_read_as_a_cap_window(self, capsys):
+        # The same taint flag covers a PERMANENT candidate-configuration error.
+        # An operator must not be told to "rerun after the cap resets" for a
+        # model that does not exist (reviewer: design-coherence).
+        marker = 'architect:model_not_found: no such model gpt-9'
+        out, _, _ = _dispatch_single_eval(
+            self._arch_cfg(), capsys,
+            arch_metrics={
+                'role_under_test': 'architect',
+                'plan_quality': None,
+                'cap_tainted': True,
+                'invocation_error': marker,
+            },
+        )
+        echo_line = next(
+            ln for ln in out.splitlines() if 'plan_quality=' in ln
+        )
+        assert 'model_not_found' in echo_line
+        assert 'cap' not in echo_line.lower()
 
     def test_implementer_config_still_routes_to_run_eval(self, capsys):
         _, run_eval, run_arch = _dispatch_single_eval(self._impl_cfg(), capsys)

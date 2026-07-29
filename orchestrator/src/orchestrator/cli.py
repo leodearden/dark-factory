@@ -1174,12 +1174,18 @@ def _run_single_eval(
                 )
                 architect_results.append(result)
                 plan_quality = result.metrics.get('plan_quality')
-                # A cap-tainted cell names its infra refusal inline, so an
+                # A cap-tainted cell names its infra failure inline, so an
                 # operator watching the run sees it LIVE rather than a bare
                 # `plan_quality=None` that reads like a scoring quirk. Healthy
                 # cells echo exactly as before.
+                #
+                # 'unmeasurable', not 'cap-tainted': the flag covers every cause
+                # that left no model content (cap hit, auth failure,
+                # model-not-found, wedge, harness error), and a PERMANENT config
+                # error must not read to the operator as a transient cap window.
+                # The marker that follows always names the actual cause.
                 taint = (
-                    f' cap-tainted: {result.metrics.get("invocation_error")}'
+                    f' unmeasurable: {result.metrics.get("invocation_error")}'
                     if result.metrics.get('cap_tainted') else ''
                 )
                 click.echo(
