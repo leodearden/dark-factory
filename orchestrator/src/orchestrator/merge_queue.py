@@ -15109,8 +15109,51 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         if not req.result.done():
                             req.result.set_result(err_outcome)
                         return InflightVerifyResult(outcome=err_outcome, merge_wt=None)
+                    # MQ-invariants eta (task 1992): Future left deliberately
+                    # pending — this is a DEFER for re-verify, not a resolution;
+                    # the re-queued request re-enters through the normal drain
+                    # and its waiter receives the outcome of the RE-dispatch.
+                    # MQ-reliability kappa (task 2169): mirror the re-arm onto
+                    # the lifecycle registry.
+                    #
+                    # task 3082: `_note_requeue` was MISSING here, making this
+                    # the one requeue site out of five that moved the LEDGER
+                    # without moving the REGISTRY. Two facts kept that
+                    # invisible, both recorded here so the omission cannot
+                    # recur:
+                    #  (i) `live_obj=req` is LOAD-BEARING, not decoration —
+                    #      `_note_transition` REPLACES `_live_items[rid]` with
+                    #      the MergeRequest, and `_finalizing_head_entry()` only
+                    #      counts `isinstance(obj, InflightEntry)` values, so it
+                    #      is that OBJECT SWAP (not the state change) that
+                    #      actually prevents a phantom finalize head. Measured:
+                    #      it is exactly why the four sibling sites never
+                    #      stranded while this one did.
+                    # (ii) the registry left at VERIFYING makes
+                    #      `_buffer_owned_request` treat the re-queued original
+                    #      as a duplicate/re-entrant twin (current is neither
+                    #      None nor QUEUED) and hand it to
+                    #      `_coalesce_reentrant_drain`, which SILENTLY drops it
+                    #      — so the request never re-entered the pipeline at
+                    #      all. Latent since task 2420 landed this abort (a
+                    #      requeue arriving at FINALIZING was noisy but
+                    #      RECOVERED, because the drain still appended
+                    #      unconditionally); ARMED by task 2852, which replaced
+                    #      that fall-through with the silent coalesce drop.
+                    #
+                    # ATOMICITY: no `await` between the put_nowait and this
+                    # call, so the merger loop's drain can never observe the
+                    # request on `_queue` while the registry still reads
+                    # VERIFYING.
+                    #
+                    # Sibling sites carrying the identical recipe (see task 3204
+                    # for the pending helper extraction): the cascade downstream
+                    # self-requeue, the operator-halt abort above, the
+                    # MergeVerifyLeaseContended defer below, and the
+                    # pre-dispatch operator halt in `_dispatch_item`.
                     self._queue.put_nowait(req)
                     self._request_ledger.on_requeued(req.request_id)
+                    self._note_requeue(req.request_id, live_obj=req)
                     return InflightVerifyResult(
                         outcome=None,
                         merge_wt=None,
