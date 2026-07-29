@@ -3464,10 +3464,11 @@ class TestCappedEscalationIsTerminal:
             result = await steward._next_escalation()
 
         assert result is None, 'the capped escalation must be filtered out'
-        mock_watch.assert_awaited_once(), (
-            'the watcher must still be consulted so the loop blocks on '
-            'inotify instead of hot-returning the capped record'
-        )
+        # The watcher must still be consulted so the loop blocks on inotify
+        # instead of hot-returning the capped record.  (Mock assertion methods
+        # take no message argument — a trailing `, (...)` would just build a
+        # discarded tuple, not attach an explanation.)
+        mock_watch.assert_awaited_once()
 
     async def test_watcher_argv_excludes_capped_ids(self, steward):
         """Capped ids must be passed to the watcher as ``--exclude-id``.

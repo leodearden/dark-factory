@@ -464,7 +464,9 @@ class TestEscalatedWaitIsBounded:
         assert queue.get_by_task(
             task_assignment.task_id, status='pending', level=0,
         ) == [], 'the orphan L0 must be dismissed even on the blocking path'
-        assert queue.get(esc.id).resolved_by == 'auto-dismissed'
+        archived = queue.get(esc.id)
+        assert archived is not None, 'the record must still be readable'
+        assert archived.resolved_by == 'auto-dismissed'
         assert len(
             queue.get_by_task(task_assignment.task_id, status='pending', level=1),
         ) == 1, 'skip_escalation=True must not duplicate the existing L1'
@@ -512,7 +514,9 @@ class TestStaleOutcomeHygiene:
         await asyncio.wait_for(workflow._wait_for_resolution(), 10)
 
         # Precondition: the producer really did run the post-fix-A sequence.
-        assert queue.get(esc.id).resolved_by == 'auto-dismissed', (
+        archived = queue.get(esc.id)
+        assert archived is not None, 'the record must still be readable'
+        assert archived.resolved_by == 'auto-dismissed', (
             'the fake steward must have dismissed its own L0 — otherwise this '
             'test is measuring fix C\'s timeout, not the drain'
         )
@@ -524,6 +528,9 @@ class TestStaleOutcomeHygiene:
             f'to pop as if freshly published'
         )
 
+        assert workflow._steward is not None, (
+            '_ensure_steward_started() must have wired a steward to tear down'
+        )
         await workflow._steward.stop()
 
     async def test_later_mark_blocked_cannot_pop_the_stale_outcome(
@@ -549,6 +556,9 @@ class TestStaleOutcomeHygiene:
 
         await workflow._ensure_steward_started()
         await asyncio.wait_for(workflow._wait_for_resolution(), 10)
+        assert workflow._steward is not None, (
+            '_ensure_steward_started() must have wired a steward to tear down'
+        )
         await workflow._steward.stop()
 
         assert await scheduler.get_status(task_assignment.task_id) not in (
