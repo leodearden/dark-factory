@@ -823,6 +823,35 @@ def _find_pending_candidate_id(cb: dict, title: str | None) -> str | None:
     return None
 
 
+def _free_payloads_path(path: Path, *, limit: int = 1000) -> Path:
+    """Return *path* if it is free, else the first unused numbered sibling
+    (``{stem}-2{suffix}``, ``{stem}-3{suffix}``, ...).
+
+    A ``--dry-run-filing`` payload file is a human-review deliverable AND
+    the only remaining handle on that run's remediation work -- the run
+    already advanced the codebook and census-state, so nothing can
+    regenerate it (see the dry-run WARNING in ``run_census``). A second
+    dry run on the same date must therefore never overwrite the first.
+
+    The probe is bounded by *limit*; exhausting it raises ``RuntimeError``
+    naming the directory. Raising here is safe precisely because this
+    write precedes ``codebook.dump``/``advance_census_state`` -- the
+    module's ordering invariant means an abort at this point leaves
+    nothing persisted, so a re-run starts clean.
+    """
+    if not path.exists():
+        return path
+    for n in range(2, limit + 1):
+        candidate = path.with_name(f"{path.stem}-{n}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError(
+        f"census: could not find a free dry-run payload path near {path} -- "
+        f"{limit} numbered siblings already exist in {path.parent}; clear out "
+        "the reviewed ones before running another dry-run census"
+    )
+
+
 _VALID_ENTRY_SEVERITIES = ("high", "medium", "low")
 """codebook.py's own ``_ENTRY_SCHEMA["severity"]`` enum, duplicated here
 since codebook.py is NOT modified by this module (see the module
@@ -1077,7 +1106,16 @@ def run_census(
         # a collector) so a test can assert it was never reached, and so the
         # id-less-result WARNING below can never fire for an intentional
         # operator mode.
-        Path(dry_run_payloads_path).write_text(
+        requested_path = Path(dry_run_payloads_path)
+        resolved_path = _free_payloads_path(requested_path)
+        if resolved_path != requested_path:
+            logger.warning(
+                "census: dry-run payload path %s already exists and was left "
+                "UNTOUCHED (an earlier review artifact no re-run can "
+                "regenerate) -- this run's payloads were written to %s instead",
+                requested_path, resolved_path,
+            )
+        resolved_path.write_text(
             json.dumps(task_payloads, indent=2) + "\n", encoding="utf-8",
         )
         # The WARNING deliberately does NOT offer a repeat census as the
@@ -1096,10 +1134,13 @@ def run_census(
             "by hand is the only remaining way to land the work: a later "
             "census will NOT re-file them (these confusions now code as "
             "matches, not candidates, and the census window has re-anchored).",
-            len(task_payloads), dry_run_payloads_path,
+            len(task_payloads), resolved_path,
         )
+        # Every downstream consumer -- the report's Filed Tasks section, the
+        # commit paths and CensusOutcome -- reads the path off this one
+        # object, so they all name the file actually written.
         dry_run_filing = DryRunFiling(
-            path=str(dry_run_payloads_path), payload_count=len(task_payloads),
+            path=str(resolved_path), payload_count=len(task_payloads),
         )
     else:
         for payload in task_payloads:
