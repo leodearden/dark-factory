@@ -453,3 +453,156 @@ def load_task_records(tasks_db_path: str) -> dict[tuple[str, int], TaskRecord]:
     finally:
         conn.close()
     return records
+
+
+# ---------------------------------------------------------------------------
+# The audit itself.
+# ---------------------------------------------------------------------------
+
+
+class WipeCandidate(NamedTuple):
+    """One task whose plan declared a scope but whose metadata.files is empty.
+
+    ``plan_files_fidelity`` decides whether ``plan_files`` may be consumed
+    verbatim: only :data:`FIDELITY_FILE_LEVEL` entries are real plan.files.
+    A :data:`FIDELITY_LOCK_LEVEL` entry holds MODULE paths and must never be
+    written into metadata.files as-is.
+    """
+
+    tag: str
+    task_id: int
+    status: str
+    plan_files: tuple[str, ...]
+    plan_files_source: str
+    plan_files_fidelity: str
+    wipe_signature: str
+
+
+class AuditCoverage(NamedTuple):
+    """How much of the task population the audit could actually see.
+
+    ALWAYS reported, including when zero candidates are found. Most tasks
+    have no recoverable plan.files at all, so the candidate list is an
+    OBSERVABLE SUBSET, never the damaged population. Presenting it as
+    complete would be a no-silent-fail-soft violation
+    (docs/legibility/design-invariants.md).
+    """
+
+    project_root: str
+    total_tasks: int
+    tasks_with_file_level_signal: int
+    tasks_with_lock_level_signal_only: int
+    tasks_without_plan_signal: int
+    plan_records_without_task: int
+
+
+class ProjectAudit(NamedTuple):
+    """One project's audit result: what was found, and what could be seen."""
+
+    project_root: str
+    candidates: list[WipeCandidate]
+    coverage: AuditCoverage
+
+
+def tasks_db_path(project_root: str) -> Path:
+    """``<root>/.taskmaster/tasks/tasks.db`` — the live task store."""
+    return Path(project_root) / ".taskmaster" / "tasks" / "tasks.db"
+
+
+def runs_db_path(project_root: str) -> Path:
+    """``<root>/data/orchestrator/runs.db`` (harness.py:1877; no config key).
+
+    NOTE: runs.db lives in the MAIN checkout, not in a task worktree.
+    """
+    return Path(project_root) / "data" / "orchestrator" / "runs.db"
+
+
+def worktree_base_path(project_root: str) -> Path:
+    """``<root>/.worktrees`` — the worktree base (config.py:1410 worktree_dir)."""
+    return Path(project_root) / ".worktrees"
+
+
+def _candidate_sort_key(candidate: WipeCandidate) -> tuple[str, int, str]:
+    """Sort by (tag, NUMERIC task id) so 100 follows 20 rather than preceding it."""
+    try:
+        return (candidate.tag, int(candidate.task_id), "")
+    except (TypeError, ValueError):
+        return (candidate.tag, 0, str(candidate.task_id))
+
+
+def audit_project(project_root: str) -> ProjectAudit:
+    """Audit one project root for the DONE-path ``metadata.files`` wipe.
+
+    Reads the task store, both on-disk plan locations and the event log, all
+    READ-ONLY, merges the plan sources by precedence, joins on task id, and
+    reports every task that declared a non-empty plan scope but now has an
+    empty ``metadata.files`` — plus the coverage block naming how much of the
+    population was invisible.
+
+    A missing runs.db is tolerated: every signature degrades to
+    :data:`NO_MERGE_EVENT` rather than aborting the audit.
+    """
+    task_records = load_task_records(str(tasks_db_path(project_root)))
+
+    disk_records = load_plan_files_from_disk(str(worktree_base_path(project_root)))
+    runs_db = runs_db_path(project_root)
+    if runs_db.exists():
+        event_records = load_plan_files_from_events(str(runs_db))
+        merge_signatures = load_merge_signatures(str(runs_db))
+    else:
+        event_records = {}
+        merge_signatures = {}
+    plan_records = merge_plan_file_sources(disk_records, event_records)
+
+    # Plan records are keyed by bare task id; tasks are keyed by (tag, id).
+    # The live DB uses a single 'master' tag, so match by id across all tags.
+    tasks_by_id: dict[str, list[TaskRecord]] = {}
+    for record in task_records.values():
+        tasks_by_id.setdefault(str(record.task_id), []).append(record)
+
+    candidates: list[WipeCandidate] = []
+    file_level = 0
+    lock_level_only = 0
+    matched_plan_ids: set[str] = set()
+
+    for task_id, plan in plan_records.items():
+        matching = tasks_by_id.get(task_id)
+        if not matching:
+            # A plan/event signal whose task is absent from tasks.db (removed,
+            # or a different project's id). Counted, never silently dropped.
+            continue
+        matched_plan_ids.add(task_id)
+        if plan.fidelity == FIDELITY_FILE_LEVEL:
+            file_level += 1
+        else:
+            lock_level_only += 1
+
+        for record in matching:
+            if record.metadata_files:
+                continue  # files survived — nothing was wiped
+            candidates.append(
+                WipeCandidate(
+                    tag=record.tag,
+                    task_id=record.task_id,
+                    status=record.status,
+                    plan_files=plan.files,
+                    plan_files_source=plan.source,
+                    plan_files_fidelity=plan.fidelity,
+                    wipe_signature=classify_wipe_signature(
+                        merge_signatures.get(task_id, [])
+                    ),
+                )
+            )
+
+    candidates.sort(key=_candidate_sort_key)
+    coverage = AuditCoverage(
+        project_root=project_root,
+        total_tasks=len(task_records),
+        tasks_with_file_level_signal=file_level,
+        tasks_with_lock_level_signal_only=lock_level_only,
+        tasks_without_plan_signal=len(task_records) - file_level - lock_level_only,
+        plan_records_without_task=len(plan_records) - len(matched_plan_ids),
+    )
+    return ProjectAudit(
+        project_root=project_root, candidates=candidates, coverage=coverage
+    )
