@@ -1,0 +1,158 @@
+# Machine-readable twin of dashboard-availability-prd.capability-manifest.md
+# Path is strictly PRD-derived (decompose-mode.md Step 2.5) so a stamper can
+# locate it from metadata.prd_path alone.
+# task_id values are null until commit_planning stamps them.
+prd: plans/dashboard-availability-prd.md
+schema_version: 1
+tasks:
+  - label: "α"
+    task_id: null
+    title: "Index write_ops(created_at) — kill the 108s memory-graphs full scan"
+    capabilities:
+      - name: "schema-sql-runs-every-start"
+        binding: "capability→producer (wired) — grep:fused-memory/src/fused_memory/services/write_journal.py:104 initialize() executescript(SCHEMA_SQL) unconditionally"
+        verdict: PASS
+      - name: "create-index-if-not-exists-precedent"
+        binding: "capability→producer (wired) — grep:fused-memory/src/fused_memory/services/write_journal.py:52 idx_bo_created ON backend_ops(created_at), exact sibling shape"
+        verdict: PASS
+      - name: "dashboard-queries-filter-created-at"
+        binding: "capability→producer (wired) — grep:dashboard/src/dashboard/data/write_journal.py:56,90,118 WHERE created_at >= ?"
+        verdict: PASS
+      - name: "index-created-at-delivered"
+        binding: "numeric-floor — measured SEARCH 0.00s vs SCAN 20.94s; endpoint baseline 108.14s; bound 2s >> floor"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "idx_wo_created"
+          paths: ["fused-memory/src/fused_memory/"]
+          expect: present
+
+  - label: "β"
+    task_id: null
+    title: "Frontend poll flow control: in-flight guard + error backoff + jitter"
+    capabilities:
+      - name: "single-poll-loop-site"
+        binding: "capability→producer (wired) — grep:dashboard/src/dashboard/static/redux/data.js:165 setInterval(...,3000)"
+        verdict: PASS
+      - name: "fanout-is-promise-all"
+        binding: "capability→producer (wired) — grep:dashboard/src/dashboard/static/redux/data.js:157 Promise.all over 13 endpoints, no in-flight flag"
+        verdict: PASS
+      - name: "overlap-guard-semantics"
+        binding: "behavioural — regression test asserts at most one in-flight request per endpoint under a slow-endpoint stub"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "guard semantics are asserted by the regression test's behaviour, not by a stable source token"
+
+  - label: "γ"
+    task_id: null
+    title: "Hysteresis watchdog with storm escape → born-at-L2 + stop restarting"
+    capabilities:
+      - name: "shallow-liveness-endpoint"
+        binding: "capability→producer (wired) — grep:dashboard/src/dashboard/app.py:386 @app.get('/api/health') bare status ok, no DB access"
+        verdict: PASS
+      - name: "script-callable-born-at-L2-writer"
+        binding: "capability→producer (wired) — grep:escalation/pyproject.toml:21 console script escalation = escalation.submit:main; works without the MCP server"
+        verdict: PASS
+      - name: "born-at-L2-severity-vocabulary"
+        binding: "capability→producer (wired) — grep:escalation/src/escalation/models.py:65 BORN_AT_L2_SEVERITIES frozenset({'critical','urgent'})"
+        verdict: PASS
+      - name: "hysteresis-streak-gate-delivered"
+        binding: "contract constant FAIL_STREAK from the PRD §Contract actuation table"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "FAIL_STREAK"
+          paths: ["scripts/"]
+          expect: present
+      - name: "boundary-invariants-B1-B6"
+        binding: "behavioural — PRD boundary-test table is the signal"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "B1-B6 are live-unit behaviours (restart counts, escalation records); not greppable"
+
+  - label: "δ"
+    task_id: null
+    title: "Bound the shutdown drain so a restart cannot cost a SIGKILL"
+    capabilities:
+      - name: "uvicorn-graceful-shutdown-flag"
+        binding: "capability→producer (wired) — measured: uvicorn 0.44.0 --help lists --timeout-graceful-shutdown and --timeout-keep-alive"
+        verdict: PASS
+      - name: "graceful-shutdown-configured"
+        binding: "unit-file directive present on the dashboard service ExecStart"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "timeout-graceful-shutdown"
+          paths: ["dashboard/"]
+          expect: present
+
+  - label: "ε"
+    task_id: null
+    title: "/healthz: whole-handler deadline, structurally deliverable budget"
+    capabilities:
+      - name: "healthz-handler-wired"
+        binding: "capability→producer (wired) — grep:dashboard/src/dashboard/app.py:395 route registered on the live app"
+        verdict: PASS
+      - name: "uncovered-execute-is-real"
+        binding: "capability→producer (wired) — grep:dashboard/src/dashboard/app.py:421 conn.execute awaited with no deadline; wait_for wraps only fetchone on :422"
+        verdict: PASS
+      - name: "numeric-floor-503-within-budget"
+        binding: "numeric-floor — measured 503 at 50.6s today (3 DBs x 5.0s exceeds any 5s caller deadline); a whole-handler bound below 5s is achievable by bounding the sum, requiring no query to get faster"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "deadline semantics are asserted by the wedged-DB test's timing, not a stable source token"
+
+  - label: "ζ"
+    task_id: null
+    title: "write_journal growth alarm (loud counter; no pruning)"
+    capabilities:
+      - name: "journal-path-resolvable"
+        binding: "capability→producer (wired) — grep:dashboard/src/dashboard/config.py:191 write_journal_db property"
+        verdict: PASS
+      - name: "threshold-numeric-basis"
+        binding: "numeric-floor — measured 6.5GB / 16,311,786 rows over ~114 days (2026-04-07 to 2026-07-30) = ~57MB/day; thresholds anchored on measurement"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "alarm firing is a runtime behaviour; threshold constants are chosen in the task per open question 3"
+
+  - label: "η"
+    task_id: null
+    title: "Dashboard unit-file parity check (in-repo vs installed)"
+    capabilities:
+      - name: "unit-parity-precedent"
+        binding: "capability→producer (wired) — scripts/check_fused_memory_unit_parity.py, the directive-allowlist parity idiom"
+        verdict: PASS
+      - name: "drift-is-real"
+        binding: "measured: installed dark-factory-dashboard.service carries DASHBOARD_KNOWN_PROJECT_ROOTS with 9 roots; in-repo copy carries 1"
+        verdict: PASS
+      - name: "parity-script-delivered"
+        binding: "new script lands in scripts/ following the fused-memory parity precedent; the task mandates the dashboard_unit_parity token so this check is non-vacuous (a bare service-name grep already matches restart-dashboard.sh and setup-host.sh)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "dashboard_unit_parity|DASHBOARD_UNIT_PARITY"
+          paths: ["scripts/"]
+          expect: present
+
+  - label: "θ"
+    task_id: null
+    title: "Fix the 'No [object Object] tasks' orchestrator empty state"
+    capabilities:
+      - name: "garbled-site-located"
+        binding: "capability→producer (wired) — grep:dashboard/src/dashboard/static/redux/tabs.jsx:278 No {filter === 'all' ? '' : filter + ' '}tasks"
+        verdict: PASS
+      - name: "filter-is-an-object"
+        binding: "capability→producer (wired) — grep:dashboard/src/dashboard/static/redux/tabs.jsx:190,248-250 DEFAULT_FILTER {active,pending,complete} read as filter.active/.pending/.complete"
+        verdict: PASS
+      - name: "stringified-object-expression-removed"
+        binding: "rejection-mechanism — the pre-refactor string comparison must not survive the fix"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "filter === 'all'"
+          paths: ["dashboard/src/dashboard/static/redux/tabs.jsx"]
+          expect: absent
