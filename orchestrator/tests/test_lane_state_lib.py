@@ -28,6 +28,8 @@ import shlex
 import subprocess
 from pathlib import Path
 
+import pytest
+
 # Reused verbatim from the sibling shipped-script contract rather than
 # re-derived: WARM_LANE_SCRIPT_DIR is resolved from __file__ (not the process
 # CWD, which differs between the merge-verify harness and a plain
@@ -444,4 +446,63 @@ class TestLaneStateReadNeverInheritsAPredecessorsValues:
         assert published == {'RAW': 'assigned', 'TASK': '5551', 'CAUSE': ''}, (
             'a successful read must clear the previous lane\'s UNKNOWN cause, or '
             f'the audit would warn about a lane that resolved fine; {published!r}'
+        )
+
+
+class TestLaneStateClass:
+    """``lane_state_class`` is the ONE normative raw-state -> column mapping.
+
+    Before this leaf the table lived only inside ``warm-lane-audit.sh``'s
+    ``_read_lane_assignment``.  It is normative because downstream consumers
+    partition the whole pool on it: ASSIGNED means reserved for a task,
+    RELEASED means in the pool and not reserved, QUARANTINED means withheld,
+    and UNKNOWN is the fail-open bucket that is counted free (conservative).
+    """
+
+    @pytest.mark.parametrize(
+        ('raw', 'column'),
+        [
+            ('assigned', 'ASSIGNED'),
+            ('in_use', 'ASSIGNED'),
+            ('released', 'RELEASED'),
+            ('seed', 'RELEASED'),
+            ('registered', 'RELEASED'),
+            ('quarantined', 'QUARANTINED'),
+            ('', 'UNKNOWN'),
+            ('unknown', 'UNKNOWN'),
+            ('reticulating', 'UNKNOWN'),
+            ('ASSIGNED', 'UNKNOWN'),   # raw values are lowercase; no folding
+        ],
+    )
+    def test_mapping_table(self, raw: str, column: str) -> None:
+        proc = _run_sourced(f'lane_state_class {shlex.quote(raw)}')
+        assert proc.returncode == 0, f'stderr={proc.stderr!r}'
+        assert proc.stdout == f'{column}\n', (
+            f'lane_state_class {raw!r} must be {column}; got {proc.stdout!r}'
+        )
+
+    def test_every_lane_state_enum_member_maps_to_a_known_column(self) -> None:
+        """The drift gate: a new dark-factory ``LaneState`` fails LOUDLY here.
+
+        This is what makes the bash mapping a genuine consumer of the Python
+        enum rather than a hand-copy of it.  Without this guard, adding a
+        seventh ``LaneState`` member would silently degrade every lane carrying
+        it to ``assigned=UNKNOWN`` — and a pool-wide UNKNOWN spike is
+        indistinguishable from a real state-dir outage, which is a triage trap.
+        Green today (all six members are mapped); RED the moment one is added
+        without teaching the mapping about it.
+        """
+        from orchestrator.lane_lifecycle import LaneState
+
+        unmapped = []
+        for member in LaneState:
+            proc = _run_sourced(f'lane_state_class {shlex.quote(member.value)}')
+            column = proc.stdout.strip()
+            if column == 'UNKNOWN' or proc.returncode != 0:
+                unmapped.append((member.name, member.value, column))
+        assert not unmapped, (
+            'LaneState members that lane_state_class does not recognise: '
+            f'{unmapped!r}. Teach the `case` in '
+            'orchestrator/scripts/warm-lane/lib_lane_state.sh about them — '
+            'leaving them UNKNOWN silently degrades every lane in that state.'
         )
