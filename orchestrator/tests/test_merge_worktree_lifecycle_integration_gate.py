@@ -250,6 +250,21 @@ from orchestrator.verify_cancel import (
 _DEAD_PGID = 2**31 - 1
 
 
+def _git_ops_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """WARNING messages emitted by git_ops' OWN logger during the current capture.
+
+    Both legs of row 3 need the same filter, and `caplog.at_level(logger=...)`
+    does NOT filter `caplog.records` -- it only lowers the level for that logger,
+    so records from every other propagated logger still land in the list. Scoping
+    by `r.name` is what makes a count assertion a statement about the contract
+    under test rather than about global session log noise.
+    """
+    return [
+        r.getMessage() for r in caplog.records
+        if r.levelno == logging.WARNING and r.name == 'orchestrator.git_ops'
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Real-git fixtures (adapted from test_remove_merge_worktree_guarded.py /
 # test_crash_recovery.py's harness fixture, per-file duplication convention)
@@ -602,12 +617,10 @@ class TestDeleterFace:
 
         fd_live = _plant_leased_tree(base, live_wt)
         try:
-            # Scope the WARNING count to THIS call and to git_ops' own logger:
-            # `caplog.records` accumulates every propagated record for the whole
-            # call phase (including the dead-holder removal above, and any
-            # WARNING from an unrelated logger), so an unscoped
-            # `len(warnings) == 1` would be an assertion about global session
-            # log noise rather than about the live-lease skip.
+            # Clear first: `caplog.records` accumulates across the whole capture
+            # phase, so without this the dead-holder removal above would leak
+            # into this call's WARNING count. `_git_ops_warnings` (module-level,
+            # above) does the per-logger scoping.
             caplog.clear()
             with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
                 outcome_live = await git_ops.remove_merge_worktree_guarded(live_wt, reason='reaper')
@@ -617,17 +630,13 @@ class TestDeleterFace:
             )
             assert live_wt.exists(), 'a live lease holder must leave the tree intact'
 
-            warnings = [
-                r for r in caplog.records
-                if r.levelno == logging.WARNING and r.name == 'orchestrator.git_ops'
-            ]
+            warnings = _git_ops_warnings(caplog)
             assert len(warnings) == 1, (
                 f'expected exactly one orchestrator.git_ops WARNING, got '
-                f'{len(warnings)}: {[r.getMessage() for r in warnings]}'
+                f'{len(warnings)}: {warnings}'
             )
-            message = warnings[0].getMessage()
-            assert str(os.getpgrp()) in message, message
-            assert 'reaper' in message, message
+            assert str(os.getpgrp()) in warnings[0], warnings[0]
+            assert 'reaper' in warnings[0], warnings[0]
         finally:
             release_merge_verify_flock(fd_live)
             remove_lock_holder_pgid(base)
