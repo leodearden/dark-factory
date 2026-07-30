@@ -287,7 +287,9 @@ The merge procedure is iterative — don't assume one pass will be enough:
 
    **D2 — may I pass `verified_green=True` in step 7?** A completely different question, and **the D1 intersection is irrelevant to it** — never cite an empty intersection to justify `verified_green=True`. The governing rule is unchanged from below: `True` only if the full-scope verify ran against the exact commit being submitted, *this* iteration. **Satisfying D1 does not satisfy D2.**
 
-   *Why it's safe to shortcut D1 at all:* the merge worker always re-runs its own authoritative full gate against the merged result, regardless of what `verified_green` says. Skipping the local re-verify loop therefore cannot land a red `main` — the cost of being wrong is a wasted queue cycle, not a broken `main`. `verified_green` feeds failure **attribution** (`INTEGRATION_SKEW` vs `BRANCH_BUG`) downstream, never merge admission.
+   *Why it's safe to shortcut D1 at all:* for merges submitted through the merge queue (step 7), the merge worker always re-runs its own authoritative full gate against the merged result, regardless of what `verified_green` says. Skipping the local re-verify loop therefore cannot land a red `main` on that path — the cost of being wrong is a wasted queue cycle, not a broken `main`. `verified_green` feeds failure **attribution** (`INTEGRATION_SKEW` vs `BRANCH_BUG`) downstream, never merge admission.
+
+   **That safety net has exactly one hole:** the orchestrator-down direct-merge fallback (*Immediate-response failures* below — `{"error": "Merge queue not available — orchestrator not running"}` → `git merge --no-ff` + `git push origin main`) runs no worker gate at all; nothing downstream re-checks it. If you took D1's empty-intersection shortcut and then land on that fallback, you MUST rebase onto the current main tip and re-run the full verify before `git merge --no-ff` — on that path, skipping both the loop and a fresh check is how a red `main` actually happens.
 
    Do not adopt this D1 shortcut as a blanket replacement for looping 3-5: it applies only when D1's three preconditions hold, and D1 holding never implies D2 holds.
 7. **Invariant:** *Every `merge_request` call passes an explicit bounded `wait_secs`; completion is awaited only via `merge_status` polling.* `queued` or `attached` responses are successful submissions (durable intent), never failures.
@@ -353,7 +355,7 @@ The merge procedure is iterative — don't assume one pass will be enough:
   git merge --no-ff task/<TASK_ID>   # run from the main branch checkout
   git push origin main               # advance the remote ref so downstream dispatch sees it
   ```
-  Note: this fallback bypasses the merge worker's verification step — rely on the prior steps 3–6 verification to ensure correctness. Then proceed to step 8 with the resulting commit SHA.
+  **No downstream gate checks this path** — unlike the merge-queue path in step 7, nothing re-verifies after `git merge --no-ff` lands. Before running it, confirm you are on the current main tip and that a full verify passed against exactly that rebased tip, this iteration. If your last verify predates any main landing since — including because step 6's D1 empty-intersection terminator let you skip a re-verify loop — rebase onto the current tip and re-run the full suite first (see step 6's D1 carve-out above). Then proceed to step 8 with the resulting commit SHA.
 
 *Polled terminal failures (from `merge_status`):*
 
