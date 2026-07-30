@@ -12,15 +12,25 @@ classify_agent_class -> stratified_sample -> render_manifest`` into the
 CLI acceptance surface.
 
 Task β of the confusion-reduction PRD (plans/confusion-reduction-prd.md
-§5.2, contract §7.4). Self-contained — does not import task α's
-``digest.py``; owns its own signal-scoring primitives, reusing only the
-low-level JSONL-line iterator (:func:`legibility.inventory._iter_json_lines`)
-from its own sibling module rather than duplicating it.
+§5.2, contract §7.4). It owns its own signal-scoring primitives, reusing
+only the low-level JSONL-line iterator
+(:func:`legibility.inventory._iter_json_lines`) from its own sibling
+module rather than duplicating it.
+
+This module was originally "self-contained — does not import task α's
+``digest.py``". That is now deliberately relaxed for exactly one reason:
+``budgets.max_daily_digest_bytes`` is a DIGEST-OUTPUT budget, and charging
+a record's real cost against it means knowing how big its digest will be,
+which only the digest renderer can answer (:func:`digest_byte_cost_fn`).
+The signal-scoring primitives remain unshared; the dependency is on
+α's renderer alone, and it is one-directional (``digest.py`` imports
+nothing from ``legibility.*``, so there is no cycle).
 """
 from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 import re
 import sys
@@ -37,6 +47,7 @@ from collections.abc import Callable, Sequence
 if __name__ == '__main__':
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from legibility import digest  # noqa: E402
 from legibility.config import LegibilityConfig, load_config  # noqa: E402
 from legibility.inventory import (  # noqa: E402
     SessionRecord,
@@ -44,6 +55,8 @@ from legibility.inventory import (  # noqa: E402
     enumerate_sessions,
     resolve_agent_transcript_roots,
 )
+
+logger = logging.getLogger('legibility.sampling')
 
 # _iter_json_lines lives in legibility.inventory — this module reuses that
 # single fire-and-forget-transcript-read implementation rather than keeping
@@ -474,6 +487,69 @@ when no ``cost_fn`` is injected, and as :func:`digest_byte_cost_fn`'s default
 render cap. A digest can only ever be SMALLER than this, never larger, so
 charging it flat is always an over-estimate — never an over-run of the daily
 cap."""
+
+
+def digest_byte_cost_fn(
+    *, max_bytes: int = DEFAULT_DIGEST_MAX_BYTES, build=None,
+) -> Callable[[ScoredRecord], int]:
+    """Build the production ``cost_fn`` for :func:`stratified_sample`:
+    charge each record the REAL byte size of the digest it renders to.
+
+    This is what makes ``budgets.max_daily_digest_bytes`` mean what it says
+    (PRD §5.2 point 2 — "Budget cap, not count cap"): the charge is the
+    UTF-8 byte length of ``build(record.path,
+    agent_class_override=record.stratum, max_bytes=max_bytes)``. Passing
+    *max_bytes* straight through matters — a caller that renders with the
+    same constant it charges with (``nightly.DEFAULT_MAX_DIGEST_BYTES``)
+    gets a ``bytes_used`` that provably describes the digests actually
+    produced, not a parallel estimate free to drift from them. Beta's
+    ``record.stratum`` is already authoritative, so alpha never re-guesses
+    the agent class.
+
+    *build* defaults to :func:`legibility.digest.build_digest`, resolved at
+    CALL time so a test can monkeypatch the module attribute. The returned
+    closure memoizes on ``record.path``, so a session is rendered at most
+    once per sampler call — which, combined with
+    :func:`stratified_sample`'s own memo, means each candidate transcript is
+    read exactly once even though the reserve phase reads each group's total
+    twice.
+
+    A raising *build* does NOT propagate: the record is charged the flat
+    *max_bytes* conservative estimate and a warning is logged. This is a
+    deliberate degrade-to-loud, not a silent fail-soft — the record stays in
+    the running, reaches :func:`nightly.build_digests`, raises there again,
+    and is reported through the EXISTING structured ``extractor_failures``
+    -> escalation channel (PRD decision 8). Propagating here would instead
+    take down the entire night's run with a bare traceback from the sampler,
+    losing every other session's digest along with the failure's own
+    structured report.
+    """
+    memo: dict[Path, int] = {}
+
+    def cost(record: ScoredRecord) -> int:
+        cached = memo.get(record.path)
+        if cached is not None:
+            return cached
+
+        renderer = build if build is not None else digest.build_digest
+        try:
+            rendered = renderer(
+                record.path, agent_class_override=record.stratum, max_bytes=max_bytes,
+            )
+            charged = len(rendered.encode('utf-8'))
+        except Exception as exc:  # noqa: BLE001 - degrade loud, never propagate
+            logger.warning(
+                'digest costing failed for %s (%s: %s); charging the flat %d-byte '
+                'estimate — the record stays selected so build_digests reports the '
+                'failure through extractor_failures',
+                record.path.name, type(exc).__name__, exc, max_bytes,
+            )
+            charged = max_bytes
+
+        memo[record.path] = charged
+        return charged
+
+    return cost
 
 
 @dataclass(frozen=True)
