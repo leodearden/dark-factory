@@ -1086,3 +1086,231 @@ class TestClaimRecalled:
 
         assert not outcome.recalled
         assert outcome.missing_needles == ('strictly serial',)
+
+
+# ---------------------------------------------------------------------------
+# step-13: contamination, pure over synthetic result lists
+#
+# Contamination has to be WELL-POSED TODAY, before 3195/3201 widen
+# `metadata.topic` coverage: the census measured 491 of 49,628 entries carrying
+# a topic at all, so most results have none. A result is FOREIGN only when it
+# carries a topic that is IN the registry and is not the probed topic.
+# Everything else — no topic, or a topic the registry does not know — is
+# counted as UNTOPICED and disclosed, never folded into the numerator. When
+# 3201's retro stamping lands, the same code strictly widens the numerator's
+# reach with no rewrite: that is the forward-compat property D5 asks for, and
+# the test below asserts it by adding a topic to the registry rather than by
+# changing any code.
+# ---------------------------------------------------------------------------
+
+def _mini_registry(*topics):
+    """A TopicRegistry over bare topic slugs (only the slugs matter here)."""
+    m = _mod()
+    return m.TopicRegistry(
+        schema_version=1,
+        entries=tuple(_entry(topic=t, content=f'canonical for {t}') for t in topics),
+    )
+
+
+def _topiced(topic, content='some content', id='X'):
+    return _R(content=content, id=id, metadata={'topic': topic})
+
+
+class TestClassifyContamination:
+    """`classify_contamination(results, entry, registry, k)`."""
+
+    def test_a_different_registry_topic_is_foreign_and_named(self):
+        """(a) The record must name WHICH foreign topic bled in."""
+        m = _mod()
+        registry = _mini_registry('merge-lane', 'escalation-ladder')
+        outcome = m.classify_contamination(
+            [_topiced('escalation-ladder', id='F1')],
+            registry.by_topic['merge-lane'],
+            registry,
+            5,
+        )
+
+        assert outcome.foreign_count == 1
+        assert len(outcome.foreign_records) == 1
+        assert outcome.foreign_records[0].foreign_topic == 'escalation-ladder'
+        assert outcome.foreign_records[0].rank == 1
+
+    def test_the_probed_topic_itself_is_not_foreign(self):
+        m = _mod()
+        registry = _mini_registry('merge-lane', 'escalation-ladder')
+        outcome = m.classify_contamination(
+            [_topiced('merge-lane')], registry.by_topic['merge-lane'], registry, 5,
+        )
+
+        assert outcome.foreign_count == 0
+        assert outcome.foreign_records == ()
+
+    def test_a_result_with_no_topic_is_untopiced_not_foreign(self):
+        """(c) Pre-3201 well-posedness: absence of a stamp is not contamination."""
+        m = _mod()
+        registry = _mini_registry('merge-lane', 'escalation-ladder')
+        outcome = m.classify_contamination(
+            [_R(content='no topic key at all', id='U1')],
+            registry.by_topic['merge-lane'],
+            registry,
+            5,
+        )
+
+        assert outcome.foreign_count == 0
+        assert outcome.untopiced_count == 1
+
+    def test_an_unregistered_topic_is_untopiced_not_foreign(self):
+        """(c) 352 distinct topic values live; the registry knows ~32 of them."""
+        m = _mod()
+        registry = _mini_registry('merge-lane', 'escalation-ladder')
+        outcome = m.classify_contamination(
+            [_topiced('some-topic-the-registry-has-never-heard-of', id='U1')],
+            registry.by_topic['merge-lane'],
+            registry,
+            5,
+        )
+
+        assert outcome.foreign_count == 0
+        assert outcome.untopiced_count == 1
+
+    def test_the_untopiced_disclosure_is_non_zero_for_a_mostly_unstamped_list(self):
+        """(d) No silent caps: the narrowing must be visible in the artifact.
+
+        Most of the live corpus carries no topic, so if this count could
+        silently read zero the contamination share would look authoritative
+        while being computed over a handful of stamped results.
+        """
+        m = _mod()
+        registry = _mini_registry('merge-lane', 'escalation-ladder')
+        results = [*_filler(4), _topiced('escalation-ladder', id='F1')]
+        outcome = m.classify_contamination(
+            results, registry.by_topic['merge-lane'], registry, 5,
+        )
+
+        assert outcome.untopiced_count == 4
+        assert outcome.foreign_count == 1
+        assert outcome.scored_total == 5
+
+    def test_hyphen_and_underscore_spellings_are_the_same_topic(self):
+        """(e) The guard slug and the live metadata value differ by - vs _."""
+        m = _mod()
+        registry = _mini_registry(
+            'architect-report-task-already-done-main-reachability', 'merge-lane',
+        )
+        probed = registry.by_topic['architect-report-task-already-done-main-reachability']
+        outcome = m.classify_contamination(
+            [_topiced('architect_report_task_already_done_main_reachability')],
+            probed,
+            registry,
+            5,
+        )
+
+        assert outcome.foreign_count == 0, 'the same topic, spelled the live way'
+        assert outcome.untopiced_count == 0, 'it IS registered — just underscored'
+
+    def test_underscored_foreign_topic_is_still_foreign(self):
+        """(e) The same fold must not make a genuinely foreign topic vanish."""
+        m = _mod()
+        registry = _mini_registry(
+            'architect-report-task-already-done-main-reachability', 'merge-lane',
+        )
+        outcome = m.classify_contamination(
+            [_topiced('architect_report_task_already_done_main_reachability')],
+            registry.by_topic['merge-lane'],
+            registry,
+            5,
+        )
+
+        assert outcome.foreign_count == 1
+
+    def test_classification_is_confined_to_the_top_k_slice(self):
+        """(f) Same parameterised k as every other metric here."""
+        m = _mod()
+        registry = _mini_registry('merge-lane', 'escalation-ladder')
+        probed = registry.by_topic['merge-lane']
+        results = [*_filler(5), _topiced('escalation-ladder', id='F1')]
+
+        at_five = m.classify_contamination(results, probed, registry, 5)
+        at_ten = m.classify_contamination(results, probed, registry, 10)
+
+        assert at_five.foreign_count == 0
+        assert at_five.scored_total == 5
+        assert at_ten.foreign_count == 1
+        assert at_ten.scored_total == 6
+
+    def test_widening_the_registry_reclassifies_without_a_code_change(self):
+        """(g) The D5 forward-compat property, asserted as a flip.
+
+        The ONLY thing that changes between the two calls is the registry —
+        3201's retro stamping widens exactly this set, and the same code then
+        sees contamination it could not previously name.
+        """
+        m = _mod()
+        results = [_topiced('escalation-ladder', id='F1')]
+
+        narrow = _mini_registry('merge-lane')
+        before = m.classify_contamination(
+            results, narrow.by_topic['merge-lane'], narrow, 5,
+        )
+
+        wide = _mini_registry('merge-lane', 'escalation-ladder')
+        after = m.classify_contamination(results, wide.by_topic['merge-lane'], wide, 5)
+
+        assert before.foreign_count == 0
+        assert before.untopiced_count == 1
+        assert after.foreign_count == 1
+        assert after.untopiced_count == 0
+
+    def test_foreign_records_carry_the_probed_topic_for_the_report(self):
+        m = _mod()
+        registry = _mini_registry('merge-lane', 'escalation-ladder')
+        outcome = m.classify_contamination(
+            [_topiced('escalation-ladder', id='F1')],
+            registry.by_topic['merge-lane'],
+            registry,
+            5,
+        )
+
+        assert outcome.foreign_records[0].topic == 'merge-lane'
+
+    def test_an_empty_result_list_scores_nothing(self):
+        m = _mod()
+        registry = _mini_registry('merge-lane', 'escalation-ladder')
+        outcome = m.classify_contamination(
+            [], registry.by_topic['merge-lane'], registry, 5,
+        )
+
+        assert outcome.scored_total == 0
+        assert outcome.foreign_count == 0
+        assert outcome.untopiced_count == 0
+
+    def test_a_non_string_topic_value_is_untopiced_not_a_crash(self):
+        """Live metadata is not schema-enforced; a list-valued topic must not
+        take the run down, nor be silently read as the probed topic."""
+        m = _mod()
+        registry = _mini_registry('merge-lane', 'escalation-ladder')
+        outcome = m.classify_contamination(
+            [_R(content='x', id='B1', metadata={'topic': ['merge-lane']})],
+            registry.by_topic['merge-lane'],
+            registry,
+            5,
+        )
+
+        assert outcome.untopiced_count == 1
+        assert outcome.foreign_count == 0
+
+    def test_the_outcome_unpacks_as_the_documented_four_tuple(self):
+        m = _mod()
+        registry = _mini_registry('merge-lane', 'escalation-ladder')
+        foreign_records, foreign_count, untopiced_count, scored_total = (
+            m.classify_contamination(
+                [_topiced('escalation-ladder', id='F1'), *_filler(2)],
+                registry.by_topic['merge-lane'],
+                registry,
+                5,
+            )
+        )
+
+        assert len(foreign_records) == foreign_count == 1
+        assert untopiced_count == 2
+        assert scored_total == 3
