@@ -548,11 +548,12 @@ class TestResetHoldsLaneLock:
         longer exercise foreign contention at all, and this test would be
         quietly asserting something other than what it says.
         """
-        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
-        from orchestrator.git_ops import MergeVerifyLeaseContended  # noqa: PLC0415
         from test_lane_lock_leak_guard import (  # noqa: PLC0415
             foreign_lane_lock_holder,
         )
+
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+        from orchestrator.git_ops import MergeVerifyLeaseContended  # noqa: PLC0415
 
         # Small enough the test doesn't wait the real 30s default, but long
         # enough it can't be satisfied by anything other than a genuine

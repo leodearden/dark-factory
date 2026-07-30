@@ -42,17 +42,6 @@ from pathlib import Path
 
 import pytest
 
-from orchestrator.git_ops import GitOps, MergeVerifyLeaseContended, _run
-from orchestrator.verify_cancel import (
-    acquire_merge_verify_flock,
-    lane_lock_holder_pids,
-    lane_lock_path,
-    read_lock_holder_pgid,
-    release_merge_verify_flock,
-    remove_lock_holder_pgid,
-    write_lock_holder_pgid,
-)
-
 # Real-git fixtures + helpers reused from the sibling lease-guard module (the
 # suite's established cross-module-helper convention, cf.
 # test_verify_scope_kappa.py / test_coalesce_integration_gate.py).  `git_repo`
@@ -65,6 +54,17 @@ from test_merge_verify_lease_guard import (  # noqa: F401 -- fixtures used by na
     _setup_repo,
     git_repo,
     real_git_ops,
+)
+
+from orchestrator.git_ops import GitOps, MergeVerifyLeaseContended, _run
+from orchestrator.verify_cancel import (
+    acquire_merge_verify_flock,
+    lane_lock_holder_pids,
+    lane_lock_path,
+    read_lock_holder_pgid,
+    release_merge_verify_flock,
+    remove_lock_holder_pgid,
+    write_lock_holder_pgid,
 )
 
 __all__ = [
@@ -380,9 +380,8 @@ class TestSelfOwnedLaneLockLeak:
         warm_path = real_git_ops.persistent_merge_worktree_path
         lock_path = lane_lock_path(warm_path)
 
-        with leaked_lane_lock(lock_path):
-            with pytest.raises(LaneLockSelfOwnedLeak) as excinfo:
-                await real_git_ops.reset_persistent_merge_worktree(commit_b)
+        with leaked_lane_lock(lock_path), pytest.raises(LaneLockSelfOwnedLeak) as excinfo:
+            await real_git_ops.reset_persistent_merge_worktree(commit_b)
 
         exc = excinfo.value
         # The parent's full payload, forwarded — every existing assertion on a
@@ -422,14 +421,13 @@ class TestSelfOwnedLaneLockLeak:
 
         lock_path = lane_lock_path(real_git_ops.persistent_merge_worktree_path)
 
-        with leaked_lane_lock(lock_path):
-            with pytest.raises(LaneLockSelfOwnedLeak):
-                async with real_git_ops.merge_verify_lease():
-                    pytest.fail(
-                        'the lease body must never run while the lane lock is '
-                        'leaked — that is the unprotected 1-2h verify window '
-                        'task 2828 closed'
-                    )
+        with leaked_lane_lock(lock_path), pytest.raises(LaneLockSelfOwnedLeak):
+            async with real_git_ops.merge_verify_lease():
+                pytest.fail(
+                    'the lease body must never run while the lane lock is '
+                    'leaked — that is the unprotected 1-2h verify window '
+                    'task 2828 closed'
+                )
 
         assert read_lock_holder_pgid(real_git_ops.worktree_base) is None, (
             'a lease that never acquired must not record itself as the holder'

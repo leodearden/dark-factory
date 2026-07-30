@@ -9837,19 +9837,15 @@ class GitOps:
         acquire runs off the event loop (:func:`asyncio.to_thread`) so a
         contended wait never stalls other in-process coroutines.
 
-        Cancellation caveat: :func:`asyncio.to_thread` cannot stop the
-        worker thread mid-wait — if this coroutine is cancelled while the
-        thread is still polling for the flock, the ``await`` raises
-        ``CancelledError`` immediately, but the thread keeps running to
-        completion. If it goes on to acquire the flock, the returned fd is
-        never seen by this (already-cancelled) coroutine, so
-        :func:`release_merge_verify_flock` never runs for it and the lane
-        lock stays held until process exit. This window requires
-        cancellation to race the acquire and is bounded by
-        ``_RESET_WARM_LANE_LOCK_WAIT_SECS``, so it is treated as an accepted,
-        documented edge case here rather than guarded — a shielded-cleanup
-        fix would add async-ownership complexity out of proportion to this
-        task's scope.
+        Cancellation (task 3081, D8/B12): the acquire goes through the SHARED
+        cancellation-guarded seam :meth:`_acquire_lane_flock_off_thread`, so a
+        cancelled reset can never orphan the lane lock. The worker thread is
+        uninterruptible by design — cancelling this coroutine does not stop the
+        acquire — but ownership of any late-won fd transfers to that seam's
+        orphan-release callback instead of being discarded. This method
+        previously hand-rolled its own :func:`asyncio.to_thread` acquire and so
+        opted out of the guarantee: a cancellation racing the acquire left the
+        lane locked until process exit, which is reify ``esc-5548-5``.
         """
         warm_path = self.persistent_merge_worktree_path
 
@@ -9858,11 +9854,11 @@ class GitOps:
             raise MergeVerifyLeaseHeld(warm_path, holder_pgid)
 
         lock_path = lane_lock_path(warm_path)
-        # See the cancellation caveat in this method's docstring: cancelling
-        # this await cannot stop the to_thread worker, so a fd acquired
-        # after cancellation has already propagated is discarded unreleased.
-        fd = await asyncio.to_thread(
-            acquire_merge_verify_flock, lock_path, _RESET_WARM_LANE_LOCK_WAIT_SECS,
+        # The ONE cancellation-guarded acquire seam, shared with both leases
+        # (task 3081): a fd won after this await is cancelled is released by the
+        # seam's orphan callback rather than leaked until process exit.
+        fd = await self._acquire_lane_flock_off_thread(
+            lock_path, _RESET_WARM_LANE_LOCK_WAIT_SECS,
         )
         if fd is None:
             # Is this OUR OWN leaked lock rather than a live foreign hold?
@@ -9948,7 +9944,11 @@ class GitOps:
                     warm_path, merge_commit[:8],
                 )
         finally:
-            release_merge_verify_flock(fd)
+            # Paired with the guarded acquire above (task 3081) so the
+            # in-process held-fd registry stays symmetric — a hold this method
+            # forgot to deregister would look like a leaked lane lock forever
+            # after, and a leak report is a loud, human-escalating event.
+            self._release_lane_flock(fd)
 
         return warm_path
 
