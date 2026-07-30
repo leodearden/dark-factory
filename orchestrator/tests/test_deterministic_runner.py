@@ -7348,6 +7348,140 @@ class TestSummarizePredicateOutput:
 
         assert '_tariff_pence_per_kwh' not in result, result
 
+    # -- Tier 2: one clean final line survives -----------------------------
+    #
+    # Each shape below is a REAL in-repo predicate script's output, and each
+    # is load-bearing for a pre-existing green test.  A sanitizer that dropped
+    # them would be throwing away the verdict it exists to preserve.
+
+    @pytest.mark.parametrize(
+        ('out', 'expected'),
+        [
+            # test_deterministic_runner.py's own predicate-mode fixtures.
+            ('check ok: 0 flakes', 'check ok: 0 flakes'),
+            # scripts/check_merge_flakiness.sh — drives the REAL-subprocess
+            # test at test_milestone_integration_gate.py's exemplar-pass case.
+            (
+                'check_merge_flakiness: value=1 threshold=5 window_days=7 '
+                '-- invariant holds',
+                'invariant holds',
+            ),
+            # scripts/check_esc_analytics_perf.sh.
+            (
+                'measured_median_ms=12 attempts=5 threshold_ms=2000 '
+                'url=http://127.0.0.1:8080/api/escalations/analytics',
+                'measured_median_ms=12 attempts=5',
+            ),
+        ],
+    )
+    def test_clean_final_line_is_preserved(self, out: str, expected: str):
+        """A single clean verdict line is the payload — kept verbatim."""
+        from orchestrator.deterministic_runner import _summarize_predicate_output
+
+        result = _summarize_predicate_output(out, rc=0)
+
+        assert result.startswith('predicate check passed (rc=0)'), result
+        assert expected in result, result
+
+    def test_trailing_blank_lines_do_not_defeat_extraction(self):
+        """A script ending with a newline still yields its verdict line."""
+        from orchestrator.deterministic_runner import _summarize_predicate_output
+
+        result = _summarize_predicate_output('check ok: 0 flakes\n\n', rc=0)
+
+        assert 'check ok: 0 flakes' in result, result
+
+    # -- Log-shaped lines are rejected -------------------------------------
+
+    def test_pure_log_output_yields_bare_verdict(self):
+        """Nothing but logger lines -> no payload at all, not a log line."""
+        from orchestrator.deterministic_runner import _summarize_predicate_output
+
+        out = (
+            '2026-07-30 16:39:00,523 fused_memory.backends.graphiti_client '
+            'WARNING identity scan found 3 candidate nodes\n'
+            '2026-07-30 16:39:00,625 httpx INFO HTTP Request: GET '
+            'http://localhost:6333 "HTTP/1.1 200 OK"'
+        )
+
+        result = _summarize_predicate_output(out, rc=0)
+
+        assert result == 'predicate check passed (rc=0)', result
+
+    @pytest.mark.parametrize(
+        'out',
+        [
+            '2026-07-30 16:39:00,523 fused_memory.x INFO done',
+            # No timestamp — the standalone level token alone is enough.
+            'INFO: all checks passed',
+        ],
+    )
+    def test_level_token_final_line_is_rejected(self, out: str):
+        """Deliberately conservative: a level token forfeits the payload.
+
+        Losing a payload is the safe failure direction — the verdict prefix
+        always survives and the raw text is logged (step-6).
+        """
+        from orchestrator.deterministic_runner import _summarize_predicate_output
+
+        result = _summarize_predicate_output(out, rc=0)
+
+        assert result == 'predicate check passed (rc=0)', result
+
+    # -- Size bound: elide wholesale, never slice mid-structure -------------
+
+    def test_oversized_payload_is_elided_not_sliced(self):
+        """Task 2054's lesson: a mid-structure cut is worse than no payload.
+
+        A raw ``note[:N]`` slice there garbled ``8679,8680`` into
+        ``8679,868``.  A sliced JSON object is worse still — unparseable, yet
+        still structured-looking to a reader.
+        """
+        import json as _json
+
+        from orchestrator.deterministic_runner import (
+            _PREDICATE_NOTE_MAX_PAYLOAD_CHARS,
+            _summarize_predicate_output,
+        )
+
+        obj = {'ids': list(range(2000))}
+        compact = _json.dumps(obj, separators=(',', ':'))
+        assert len(compact) > _PREDICATE_NOTE_MAX_PAYLOAD_CHARS, 'fixture too small'
+
+        result = _summarize_predicate_output(_json.dumps(obj, indent=2), rc=0)
+
+        # Bounded: the cap plus the verdict prefix and the marker's own text.
+        assert len(result) <= _PREDICATE_NOTE_MAX_PAYLOAD_CHARS + 200, len(result)
+        # The marker names the dropped size and where the full text lives.
+        assert str(len(compact)) in result, result
+        assert 'elided' in result, result
+        # Critically: NOT a prefix-slice of the compact dump.
+        assert compact[:100] not in result, result
+
+    def test_payload_at_the_cap_is_kept(self):
+        """The bound elides only what exceeds it — it is not a blanket drop."""
+        from orchestrator.deterministic_runner import (
+            _PREDICATE_NOTE_MAX_PAYLOAD_CHARS,
+            _summarize_predicate_output,
+        )
+
+        out = 'ok ' + 'x' * (_PREDICATE_NOTE_MAX_PAYLOAD_CHARS - 10)
+        result = _summarize_predicate_output(out, rc=0)
+
+        assert out in result, result
+        assert 'elided' not in result, result
+
+    # -- Degenerate inputs -------------------------------------------------
+
+    @pytest.mark.parametrize('out', ['', None, 42, b'check ok', ['check ok']])
+    def test_degenerate_output_yields_bare_verdict(self, out: object):
+        """A falsy/non-str seam return never raises and never leaks a repr."""
+        from orchestrator.deterministic_runner import _summarize_predicate_output
+
+        result = _summarize_predicate_output(out, rc=0)
+
+        assert result == 'predicate check passed (rc=0)', result
+
 
 # ---------------------------------------------------------------------------
 # Task 2336 (γ-predicate): predicate deterministic mode — a read-only
