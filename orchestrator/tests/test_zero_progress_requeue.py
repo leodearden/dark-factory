@@ -179,8 +179,8 @@ class TestEmitZeroProgressRequeueAlert:
 
     def test_fires_at_threshold_with_monitor_alarm_shape(self, tmp_path):
         """streak >= threshold files exactly one L1 with the alarm shape."""
-        from escalation.queue import EscalationQueue
         from _recording_event_store import _RecordingEventStore
+        from escalation.queue import EscalationQueue
 
         queue = EscalationQueue(tmp_path)
         rec = _RecordingEventStore()
@@ -208,8 +208,8 @@ class TestEmitZeroProgressRequeueAlert:
 
     def test_below_threshold_files_nothing(self, tmp_path):
         """streak < threshold is a no-op returning False."""
-        from escalation.queue import EscalationQueue
         from _recording_event_store import _RecordingEventStore
+        from escalation.queue import EscalationQueue
 
         queue = EscalationQueue(tmp_path)
         rec = _RecordingEventStore()
@@ -225,8 +225,8 @@ class TestEmitZeroProgressRequeueAlert:
         re-files every N requeues — spamming the queue during exactly the 46h
         loop this exists to catch.
         """
-        from escalation.queue import EscalationQueue
         from _recording_event_store import _RecordingEventStore
+        from escalation.queue import EscalationQueue
 
         queue = EscalationQueue(tmp_path)
         rec = _RecordingEventStore()
@@ -239,8 +239,8 @@ class TestEmitZeroProgressRequeueAlert:
 
     def test_distinct_tasks_get_distinct_alerts(self, tmp_path):
         """Dedup is per-task — one looping task must not mask another."""
-        from escalation.queue import EscalationQueue
         from _recording_event_store import _RecordingEventStore
+        from escalation.queue import EscalationQueue
 
         queue = EscalationQueue(tmp_path)
         rec = _RecordingEventStore()
@@ -266,6 +266,7 @@ class TestEmitZeroProgressRequeueAlert:
         must never disturb requeue-cap accounting.
         """
         from unittest.mock import MagicMock
+
         from _recording_event_store import _RecordingEventStore
 
         queue = MagicMock()
@@ -282,8 +283,9 @@ class TestEmitZeroProgressRequeueAlert:
         They are submitted under INDIVIDUAL try/excepts so a failure of the
         second cannot cost us the first.
         """
-        from escalation.queue import EscalationQueue
         from unittest.mock import MagicMock
+
+        from escalation.queue import EscalationQueue
 
         queue = EscalationQueue(tmp_path)
         broken = MagicMock()
@@ -296,8 +298,8 @@ class TestEmitZeroProgressRequeueAlert:
 
     def test_emits_zero_progress_requeue_event(self, tmp_path):
         """A paired EventType.zero_progress_requeue carries the payload."""
-        from escalation.queue import EscalationQueue
         from _recording_event_store import _RecordingEventStore
+        from escalation.queue import EscalationQueue
 
         from orchestrator.event_store import EventType
 
@@ -424,8 +426,8 @@ def wired_harness(tmp_path, mock_orch_config):
     """
     from unittest.mock import AsyncMock, MagicMock, patch
 
-    from escalation.queue import EscalationQueue
     from _recording_event_store import _RecordingEventStore
+    from escalation.queue import EscalationQueue
 
     from orchestrator.harness import Harness
 

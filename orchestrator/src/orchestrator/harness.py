@@ -116,11 +116,11 @@ from orchestrator.task_status import (
 )
 from orchestrator.usage_gate import UsageGate
 from orchestrator.workflow import TerminalReport, WorkflowOutcome, build_workflow
+from orchestrator.worktree_identity import identities_match, read_worktree_title
 from orchestrator.zero_progress_requeue import (
     ZeroProgressRequeueTracker,
     emit_zero_progress_requeue_alert,
 )
-from orchestrator.worktree_identity import identities_match, read_worktree_title
 
 if TYPE_CHECKING:
     from escalation.models import Escalation

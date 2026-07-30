@@ -24,8 +24,6 @@ Scheduler/BriefingAssembler, then a MagicMock scheduler) plus the
 
 from __future__ import annotations
 
-import asyncio
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -184,7 +182,7 @@ class TestTaskCompletedBlockContext:
         await _drive_slot(harness, terminal)
 
         data = _task_completed_payloads(harness)[0]
-        assert _LEGACY_COUNTER_KEYS <= set(data), (
+        assert set(data) >= _LEGACY_COUNTER_KEYS, (
             f'missing pre-existing counter keys: {_LEGACY_COUNTER_KEYS - set(data)}'
         )
         assert data['outcome'] == WorkflowOutcome.REQUEUED.value
