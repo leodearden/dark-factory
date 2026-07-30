@@ -51,7 +51,13 @@ Full fresh-machine walkthrough: `SETUP.md`.
 - **Session start** — search for project context, recent decisions, active conventions
 - **Encountering unfamiliar entities** — `get_entity` to understand relationships
 - **Before architectural decisions** — search for prior decisions and rationale
-- **Tasks with memory_hints** — execute hint queries via `search`, look up hint entities via `get_entity`
+- **Tasks with memory_hints** — only if you can actually see them. `metadata.memory_hints`
+  is currently a **reconciliation-internal** channel: the sole consumer is recon Stage 1's
+  context assembler, and no orchestrator-dispatched task role holds `get_task`, so a
+  dispatched agent cannot read its own hints. An interactive session (which does hold
+  `get_task`) can read and execute them. Dispatched agents get their memory context from
+  the briefing's `# Context` block instead. Task **3254** decides whether to wire hints
+  through to agents or retire the channel; until it lands, don't plan around them.
 
 ### When to write memory
 - **Decisions made** — immediately, don't wait until session end
@@ -129,7 +135,10 @@ the task-author pin is in `docs/task-authoring.md`.
 ### Starting a session
 1. Search memory for project context: `search(query="project overview and current status", project_id="dark_factory")`
 2. Check task tree: `get_tasks(project_root="/home/leo/src/dark-factory")`
-3. If working on a specific task, check its `memory_hints` and execute the hint queries
+3. If working on a specific task, read it with `get_task` — and if it carries
+   `memory_hints`, execute the hint queries. This works in an **interactive** session;
+   an orchestrator-dispatched task agent holds no `get_task` and cannot do it (see
+   "When to read memory" above, and task 3254).
 
 ### During a session
 - Write decisions and discoveries immediately via `add_memory` — don't batch until the end
