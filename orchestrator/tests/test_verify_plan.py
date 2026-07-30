@@ -1548,6 +1548,87 @@ _UNCHAINED_LINT_COMMAND = 'uv run --project fused-memory --directory fused-memor
 
 _FM_TEST_FILE = 'fused-memory/tests/test_harness.py'
 
+# --- the invariant sweep's corpus (step-5c) --------------------------------
+#
+# Every case is re-homed under the ONE 'orchestrator/' prefix so a single set
+# of diffs matches every ModuleConfig — the sweep varies the COMMAND SHAPE
+# (which decides whether cmd ends up raw-retained, structurally scoped, or
+# unscoped) against the FILE SHAPE (which decides scope_kind), and asserts the
+# scoped_targets invariant survives every combination of the two.
+
+_SWEEP_TEST_FILE = 'orchestrator/tests/test_sweep.py'
+
+_SWEEP_MODULE_CONFIGS: list[tuple[str, ModuleConfig]] = [
+    # The live 2-segment chained lint + the root's cd-chained pyright/pytest.
+    ('real-chained', ModuleConfig(
+        prefix='orchestrator',
+        lint_command=_MODULE_LINT_COMMANDS['orchestrator'],
+        type_check_command=_ROOT_TYPE_CHECK_COMMAND,
+        test_command=_ROOT_TEST_COMMAND,
+    )),
+    # The only 3-segment chain in the live configs (two sibling checkers).
+    ('fm-three-segment-lint', ModuleConfig(
+        prefix='orchestrator',
+        lint_command=_FM_LINT_COMMAND,
+        type_check_command='npx pyright',
+        test_command='uv run pytest tests/ --timeout=300',
+    )),
+    # The root lint chain, plus bare unchained tool commands — the structured
+    # (cmd.targets-populated) control the pre-3219 fixtures were all built from.
+    ('root-lint-bare-tools', ModuleConfig(
+        prefix='orchestrator',
+        lint_command=_ROOT_LINT_COMMAND,
+        type_check_command='pyright',
+        test_command='pytest',
+    )),
+    # Commands the scoper cannot narrow at all: OPAQUE (mypy) and a keyword
+    # that never appears (`true`). _scope_prefix_to_keyword returns the
+    # command UNSCOPED here while _derive_module_runs still labels the slot
+    # FILE_SCOPED — a pre-existing property of scope_kind that scoped_targets
+    # must track consistently rather than contradict.
+    ('unscopable', ModuleConfig(
+        prefix='orchestrator',
+        lint_command='true',
+        type_check_command='mypy src/',
+        test_command='pytest',
+    )),
+    # Partially-configured: the SKIPPED "no X configured" slots must stay empty.
+    ('lint-only', ModuleConfig(prefix='orchestrator', lint_command=_UNCHAINED_LINT_COMMAND)),
+]
+
+_SWEEP_DIFFS: list[tuple[str, list[str]]] = [
+    ('collectable-test', [_SWEEP_TEST_FILE]),
+    ('conftest', ROOT_CONFTEST_DIFF),          # D1 -> FULL_SUITE pytest
+    ('test-data', ['orchestrator/tests/fixtures_data.py']),
+    ('source-only', SOURCE_ONLY_DIFF),         # task-role pytest floor (R3)
+    ('structural', STRUCTURAL_DIFF),           # D2 -> FULL_SUITE pyright
+    ('mixed', [_SWEEP_TEST_FILE, SOURCE_ONLY_DIFF[0]]),
+    ('all-inert', _ALL_INERT_DIFF),            # -> TRIVIAL short-circuit
+]
+
+_FULL_BREADTH_CONFIG = OrchestratorConfig(
+    project_root=Path('/fake'), merge_verify_breadth='full',
+)
+_BARE_FALLBACK_CONFIG = OrchestratorConfig(project_root=Path('/fake'), test_command='pytest')
+_REAL_SUITE_FALLBACK_CONFIG = OrchestratorConfig(
+    project_root=Path('/fake'),
+    lint_command=_ROOT_LINT_COMMAND,
+    type_check_command=_ROOT_TYPE_CHECK_COMMAND,
+    test_command=_ROOT_TEST_COMMAND,
+)
+
+# (name, uses_module_configs, config, role) — every branch derive_verify_plan
+# can take: the module path at both roles, the knob-gated full-breadth merge
+# gate (_derive_full_suite_runs, which must never file-scope), and the
+# fallback path at both the bare-pytest default and a real configured suite.
+_SWEEP_BRANCHES: list[tuple[str, bool, OrchestratorConfig | None, str]] = [
+    ('module/task', True, None, 'task'),
+    ('module/merge', True, None, 'merge'),
+    ('module/merge-full-breadth', True, _FULL_BREADTH_CONFIG, 'merge'),
+    ('fallback/bare-default', False, _BARE_FALLBACK_CONFIG, 'task'),
+    ('fallback/real-suite', False, _REAL_SUITE_FALLBACK_CONFIG, 'merge'),
+]
+
 
 class TestPlanRecordScopedTargets:
     """PlannedRun.scoped_targets records WHICH files a FILE_SCOPED slot narrowed to.
@@ -1657,3 +1738,119 @@ class TestPlanRecordScopedTargets:
         assert lint_run is not None
         assert lint_run.scope_kind is ScopeKind.SKIPPED
         assert lint_run.scoped_targets == ()
+
+    # -- the fallback branch (step-5) ---------------------------------------
+
+    def test_fallback_path_records_scoped_targets(self):
+        """The three FILE_SCOPED sites in _derive_fallback_runs.
+
+        lint and pyright record the whole touched-.py list (``py_files``);
+        pytest records only the collectable tests. The bare-``'pytest'``
+        default is deliberate — a non-default configured suite is never
+        file-scoped by this branch (it runs verbatim), so the bare default is
+        the only shape that reaches the FILE_SCOPED pytest site at all.
+        """
+        files = [_SWEEP_TEST_FILE, SOURCE_ONLY_DIFF[0]]
+        plan = derive_verify_plan(files, [], _BARE_FALLBACK_CONFIG, fake_worktree_reader)
+
+        lint_run = _run_for(plan, '__fallback__', 'lint:')
+        assert lint_run is not None
+        assert lint_run.scope_kind is ScopeKind.FILE_SCOPED
+        assert lint_run.scoped_targets == tuple(files)
+
+        pyright_run = _run_for(plan, '__fallback__', 'pyright:')
+        assert pyright_run is not None
+        assert pyright_run.scope_kind is ScopeKind.FILE_SCOPED
+        assert pyright_run.scoped_targets == tuple(files)
+
+        pytest_run = _run_for(plan, '__fallback__', 'pytest:')
+        assert pytest_run is not None
+        assert pytest_run.scope_kind is ScopeKind.FILE_SCOPED
+        assert pytest_run.scoped_targets == (_SWEEP_TEST_FILE,)
+
+        # The pytest slot legitimately narrows further than lint/pyright.
+        assert pytest_run.scoped_targets != lint_run.scoped_targets
+
+    def test_scoped_targets_survive_executed_fallback_reconciliation(self):
+        """The BROADER instance of the same bug — and why the field lives on PlannedRun.
+
+        ``verify._executed_fallback_plan`` rebuilds every reconciled run's
+        command as a fresh ``VerifyCmd(tool=..., raw=<executed string>)``, so
+        ``cmd.targets`` is empty for EVERY fallback run — chained or not,
+        FILE_SCOPED or not. A ``VerifyCmd``-hosted field would have been
+        discarded by that rebuild; a ``PlannedRun``-hosted one rides through
+        ``dataclasses.replace(run, module_prefix=..., cmd=...)`` untouched.
+        This pins that propagation so a future rewrite of that function
+        cannot silently drop it.
+        """
+        files = [_SWEEP_TEST_FILE, SOURCE_ONLY_DIFF[0]]
+        plan = derive_verify_plan(files, [], _BARE_FALLBACK_CONFIG, fake_worktree_reader)
+        before = {run.reason.split(':')[0]: run.scoped_targets for run in plan.runs}
+        assert set(before) == {'lint', 'pyright', 'pytest'}
+        assert all(before.values()), 'precondition: every decision run was FILE_SCOPED'
+
+        # What _build_fallback_config actually produced — subproject-rescoped,
+        # so module_prefix and every command differ from the flat decision.
+        executed = ModuleConfig(
+            prefix='orchestrator',
+            lint_command='cd orchestrator && uv run ruff check src/orchestrator/some_module.py',
+            type_check_command='cd orchestrator && npx pyright',
+            test_command='cd orchestrator && uv run pytest tests/test_sweep.py',
+        )
+        reconciled = verify._executed_fallback_plan(plan, executed)
+
+        for run in reconciled.runs:
+            tool = run.reason.split(':')[0]
+            # The reconciliation really ran — this is not a vacuous assertion.
+            assert run.module_prefix == 'orchestrator'
+            assert run.cmd is not None
+            # Rebuilt raw-retained: the structured targets are gone for EVERY run.
+            assert run.cmd.raw is not None
+            assert run.cmd.targets == ()
+            # ...but the plan-record answer survived the rebuild intact.
+            assert run.scoped_targets == before[tool]
+
+    # -- the cross-cutting invariant sweep (step-5) -------------------------
+
+    @pytest.mark.parametrize(
+        'branch_name, uses_module_configs, config, role',
+        _SWEEP_BRANCHES,
+        ids=[case[0] for case in _SWEEP_BRANCHES],
+    )
+    @pytest.mark.parametrize(
+        'mc_name, mc', _SWEEP_MODULE_CONFIGS, ids=[case[0] for case in _SWEEP_MODULE_CONFIGS],
+    )
+    @pytest.mark.parametrize(
+        'diff_name, files', _SWEEP_DIFFS, ids=[case[0] for case in _SWEEP_DIFFS],
+    )
+    def test_scoped_targets_is_nonempty_exactly_for_file_scoped_runs(
+        self, diff_name, files, mc_name, mc, branch_name, uses_module_configs, config, role,
+    ):
+        """The regression pin, generalised over every branch derive_verify_plan can take.
+
+        Three properties, asserted for every run of every plan:
+
+        1. **The invariant** — ``scoped_targets`` is non-empty EXACTLY when
+           ``scope_kind is FILE_SCOPED``. FULL_SUITE (D1/D2 widening, and the
+           whole ``merge_verify_breadth='full'`` gate) is deliberately
+           unscoped; SKIPPED/TRIVIAL never ran.
+        2. **No invented paths** — the record is always a subset of the diff
+           it was derived from, so it can never drift into naming a file the
+           plan never saw.
+        3. **D3 stays intact** — the key serialises JSON-natively and the
+           whole plan dict survives a JSON round-trip unchanged, which is
+           what actually reaches ``VerifyResult.plan``.
+        """
+        module_configs = [mc] if uses_module_configs else []
+        plan = derive_verify_plan(files, module_configs, config, fake_worktree_reader, role=role)
+
+        for run in plan.runs:
+            assert bool(run.scoped_targets) == (run.scope_kind is ScopeKind.FILE_SCOPED), (
+                f'{branch_name}/{mc_name}/{diff_name}: {run.reason!r} is '
+                f'{run.scope_kind} but scoped_targets={run.scoped_targets!r}'
+            )
+            assert set(run.scoped_targets) <= set(files)
+            assert run.to_dict()['scoped_targets'] == list(run.scoped_targets)
+
+        as_dict = plan.to_dict()
+        assert json.loads(json.dumps(as_dict)) == as_dict
