@@ -6205,6 +6205,91 @@ async def _run_isolated_confirm_group(
     return False
 
 
+def _group_node_ids_by_subproject(
+    worktree: Path,
+    module_configs: dict[str, ModuleConfig],
+    node_ids: list[str],
+    *,
+    log_label: str,
+) -> dict[str, list[str]] | None:
+    """Map each pytest node-id in *node_ids* to its owning subproject prefix.
+
+    PURE (no I/O beyond ``Path.exists`` probes against the on-disk
+    *worktree*), sync, never raises on ordinary input. Extracted from
+    ``confirm_main_tip_failure_is_real`` so the main-tip-sweep isolated
+    pre-filter reuses it rather than the tree gaining a THIRD copy of this
+    block (task 3095; the merge-path copy in
+    ``confirm_merge_verify_flake_suppressible`` takes list-shaped
+    module_configs and is deliberately left alone — filed as a follow-up).
+
+    For each node-id, the file component (``node_id.split('::', 1)[0]``) is
+    probed against EVERY discovered subproject — not just the first match —
+    so a bare relative path that happens to exist under more than one
+    subproject can be flagged rather than silently mis-attributed to
+    whichever prefix iterates first:
+
+    * ``<worktree>/<prefix>/<relpath>`` exists → subproject-relative node-id;
+      the qualified id ``<prefix>/<node_id>`` is recorded.
+    * ``<relpath>`` already starts with ``<prefix>/`` and
+      ``<worktree>/<relpath>`` exists → already worktree-root-relative; the
+      node-id is recorded verbatim.
+
+    Returns:
+        ``dict[prefix, list[qualified_node_id]]`` — node-ids owned by the same
+        subproject grouped together, INPUT ORDER preserved within each group,
+        so a caller can build one scoped re-run command per subproject.
+        An empty *node_ids* yields ``{}`` (NOT the None sentinel — "nothing to
+        map" is distinct from "unmappable"; callers early-out on empty input
+        themselves).
+
+        ``None`` when ANY node-id maps to no discovered subproject (logged at
+        INFO with *log_label*). This is the callers' fail-safe signal — one
+        unmappable node-id poisons the whole batch rather than the helper
+        guessing which subproject it belongs to, or silently running a
+        partial subset.
+
+    An ambiguous node-id (relpath present under >1 subproject) resolves
+    deterministically to the FIRST candidate by *module_configs* iteration
+    order and logs a WARNING naming every candidate prefix and *log_label* —
+    a low-likelihood, non-fatal ambiguity, not a fail-safe path.
+
+    Args:
+        worktree: Tree the existence probes run against.
+        module_configs: Prefix -> ModuleConfig, freshly discovered on
+            *worktree* by the caller (never a snapshot for a different tree).
+        node_ids: Extracted failing pytest node-ids, in output order.
+        log_label: Caller name, embedded in every log line so an operator can
+            attribute the message to the right call site.
+    """
+    groups: dict[str, list[str]] = {}
+    for node_id in node_ids:
+        file_part = node_id.split('::', 1)[0]
+        candidates: list[tuple[str, str]] = []
+        for prefix, _mc in module_configs.items():
+            if (worktree / prefix / file_part).exists():
+                candidates.append((prefix, f'{prefix}/{node_id}'))
+            elif file_part.startswith(f'{prefix}/') and (worktree / file_part).exists():
+                candidates.append((prefix, node_id))
+        if not candidates:
+            logger.info(
+                '%s: node-id %r did not map to any discovered subproject in '
+                '%s — unconfirmable',
+                log_label, node_id, worktree,
+            )
+            return None
+        if len(candidates) > 1:
+            logger.warning(
+                '%s: node-id %r matched %d discovered subprojects (%s) in %s '
+                '— using %r; a relative path shared across subprojects can '
+                'mis-attribute the isolated re-run to the wrong ModuleConfig',
+                log_label, node_id, len(candidates), [c[0] for c in candidates],
+                worktree, candidates[0][0],
+            )
+        matched_prefix, matched_node_id = candidates[0]
+        groups.setdefault(matched_prefix, []).append(matched_node_id)
+    return groups
+
+
 async def confirm_main_tip_failure_is_real(
     config: 'OrchestratorConfig',
     git_ops: object,
@@ -6321,42 +6406,22 @@ async def confirm_main_tip_failure_is_real(
             )
             return True
 
-        # Map each node-id to its owning subproject (see docstring). Any
-        # unmapped node-id fails safe to alarm — no guessing which subproject
+        # Map each node-id to its owning subproject via the shared helper
+        # (see its docstring for the probe rules). Any unmapped node-id
+        # returns None and fails safe to alarm — no guessing which subproject
         # a node-id belongs to.
-        groups: dict[str, list[str]] = {}
-        for node_id in node_ids:
-            file_part = node_id.split('::', 1)[0]
-            # Collect EVERY subproject the node-id could belong to (not just
-            # the first) so a bare relative path that happens to exist under
-            # more than one discovered subproject can be flagged rather than
-            # silently mis-attributed to whichever prefix iterates first —
-            # see the docstring's "Node-id -> subproject mapping" section.
-            candidates: list[tuple[str, str]] = []
-            for prefix, _mc in module_configs.items():
-                if (tmp_path / prefix / file_part).exists():
-                    candidates.append((prefix, f'{prefix}/{node_id}'))
-                elif file_part.startswith(f'{prefix}/') and (tmp_path / file_part).exists():
-                    candidates.append((prefix, node_id))
-            if not candidates:
-                logger.info(
-                    'confirm_main_tip_failure_is_real: node-id %r did not map '
-                    'to any discovered subproject at %s — unconfirmable, '
-                    'filing alarm',
-                    node_id, _sha_prefix,
-                )
-                return True
-            if len(candidates) > 1:
-                logger.warning(
-                    'confirm_main_tip_failure_is_real: node-id %r matched %d '
-                    'discovered subprojects (%s) at %s — using %r; a relative '
-                    'path shared across subprojects can mis-attribute the '
-                    'isolated re-run to the wrong ModuleConfig',
-                    node_id, len(candidates), [c[0] for c in candidates],
-                    _sha_prefix, candidates[0][0],
-                )
-            matched_prefix, matched_node_id = candidates[0]
-            groups.setdefault(matched_prefix, []).append(matched_node_id)
+        groups = _group_node_ids_by_subproject(
+            tmp_path, module_configs, node_ids,
+            log_label='confirm_main_tip_failure_is_real',
+        )
+        if groups is None:
+            logger.info(
+                'confirm_main_tip_failure_is_real: an extracted node-id did '
+                'not map to a discovered subproject at %s — unconfirmable, '
+                'filing alarm',
+                _sha_prefix,
+            )
+            return True
 
         # Each subproject group gets its own scoped + forced-serial isolated
         # re-run. ALL groups must confirm green to suppress.
