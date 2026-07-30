@@ -431,11 +431,11 @@ async def test_probe_nextest_planned_failure_modes_return_none(
         assert result is not None
         return result
 
-    with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
-        with patch.object(mq, '_run_probe_cmd', _fake):
-            planned = await mq._probe_nextest_planned(
-                tmp_path, 'release', timeout_secs=5.0
-            )
+    with (
+        caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'),
+        patch.object(mq, '_run_probe_cmd', _fake),
+    ):
+        planned = await mq._probe_nextest_planned(tmp_path, 'release', timeout_secs=5.0)
 
     assert planned is None, label
     warnings = _mq_warnings(caplog)

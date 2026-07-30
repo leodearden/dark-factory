@@ -1907,6 +1907,129 @@ def _load_reify_attempt_sidecar(merge_wt: Path) -> _ReifyAttemptSidecar | None:
     return _ReifyAttemptSidecar(tree_oid=tree_oid, profiles=profiles)
 
 
+# Bounds the planned-set probe so it can NEVER wedge the merge lane.  In a warm
+# merge lane the binaries are already built, so `nextest list` links and lists in
+# seconds; this ceiling only matters on a cold lane where the probe would have to
+# compile — and there, timing out into a full verify is the correct outcome.
+_NEXTEST_LIST_PROBE_TIMEOUT_SECS = 300
+
+
+async def _run_probe_cmd(
+    argv: list[str], *, cwd: Path, timeout_secs: float
+) -> tuple[int, str]:
+    """Run ``argv`` in ``cwd``, returning ``(returncode, stdout)``.
+
+    A thin, separately-patchable subprocess seam: it exists so
+    :func:`_probe_nextest_planned` can be unit-tested hermetically without
+    shelling out.  Raises :class:`TimeoutError` on timeout and :class:`OSError`
+    (incl. :class:`FileNotFoundError`) on spawn failure — the caller converts
+    both into a fail-safe ``None``.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        *argv,
+        cwd=str(cwd),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_secs)
+    except (TimeoutError, asyncio.CancelledError):
+        proc.kill()
+        await proc.wait()
+        raise
+    return proc.returncode or 0, stdout.decode('utf-8', errors='replace')
+
+
+# Planned-set source: DECISION (task 3059).
+#
+# Candidate (a) — THIS: a `cargo nextest list` probe run in the warm merge lane.
+# Chosen because the binaries are already built there, so it links and lists
+# WITHOUT compiling; it is DF-owned (no cross-repo obligation — which is the
+# whole point of this leaf); and it emits ids in exactly
+# `parse_per_test_results`' key space, so `build_fail_fast_map` composes with no
+# translation.
+#
+# Candidate (b) — the warm shadow baseline's prior full per-test map — is NOT
+# VIABLE: `data/orchestrator/warm_verify_shadow.json` persists only
+# `ShadowCompareState` cadence fields (merges_since_last_shadow,
+# last_shadow_run_at).  The full per-test map lives in-process only
+# (`_warm_capture` → `build_warm_shadow_results`) and is gone by the next merge.
+#
+# Candidate (c) — a reify-emitted planned list — is the phantom cross-repo
+# dependency this leaf exists to DELETE.  Re-introducing it would recreate the
+# exact "DONE producer ≠ wired at the seam" failure.
+#
+# KNOWN IMPRECISION, and why it is safe: DF cannot reproduce reify's per-pass
+# selector (`--workspace` vs `$AFFECTED_ALL_FLAGS` vs `$_RELEASE_ALL_FLAGS`) or
+# its heavy-exclude filterset, so this probe may return a SUPERSET of what
+# attempt-0 actually planned.  A superset only adds extra 'not-started' ids to
+# the retry subset — it runs MORE tests, never FEWER — and reify's
+# `REIFY_VERIFY_RETRY_MAX_SUBSET` ceiling (default 5000) is the storm escape if
+# it ever approaches the whole suite.
+#
+# THE INVARIANT: ``None`` is NEVER treated as an empty plan.  It routes to a
+# FULL verify.  Narrowing on a partial plan would silently skip every test the
+# probe failed to see.
+async def _probe_nextest_planned(
+    merge_wt: Path, profile: str, *, timeout_secs: float
+) -> list[str] | None:
+    """Probe the merge lane for the ``profile``'s planned nextest set.
+
+    Totally fail-safe: any non-zero exit, empty/unparseable stdout, timeout, or
+    spawn failure returns ``None`` (→ full verify), logging a WARNING that names
+    the profile and the reason.
+
+    Args:
+        merge_wt: the warm merge worktree to run the probe in.
+        profile: ``'debug'`` or ``'release'`` — selects the ``--release`` flag.
+        timeout_secs: hard ceiling on the probe.
+
+    Returns:
+        Planned test ids in :func:`parse_per_test_results`' key space, or None.
+    """
+    argv = ['cargo', 'nextest', 'list', '--workspace', '--message-format', 'json']
+    if profile == 'release':
+        argv.append('--release')
+
+    try:
+        rc, stdout = await _run_probe_cmd(
+            argv, cwd=Path(merge_wt), timeout_secs=timeout_secs
+        )
+    except TimeoutError:
+        logger.warning(
+            'nextest list probe for profile %r timed out after %ss — full verify',
+            profile, timeout_secs,
+        )
+        return None
+    except OSError as exc:
+        # FileNotFoundError (no cargo on PATH) is the common shape here.
+        logger.warning(
+            'nextest list probe for profile %r could not run (%s) — full verify',
+            profile, exc,
+        )
+        return None
+
+    if rc != 0:
+        logger.warning(
+            'nextest list probe for profile %r exited %s — full verify', profile, rc,
+        )
+        return None
+    if not stdout.strip():
+        logger.warning(
+            'nextest list probe for profile %r produced empty stdout — full verify',
+            profile,
+        )
+        return None
+
+    planned = parse_nextest_list_planned(stdout)
+    if planned is None:
+        logger.warning(
+            'nextest list probe for profile %r produced unparseable stdout '
+            '— full verify', profile,
+        )
+    return planned
+
+
 async def _run_post_merge_verify(
     git_ops: GitOps,
     req: MergeRequest,
