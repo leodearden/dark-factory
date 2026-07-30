@@ -616,9 +616,15 @@ Review this run and provide your verdict as JSON.
             # verdict, no halt, no signal — the claude_cli mirror of the
             # text-path hole closed in _parse_verdict's caught tuple).  Do NOT
             # "simplify" this probe down into _parse_verdict.
+            # TypeError is in the tuple so the probe stays TOTAL against
+            # _verdict_from_payload's full raise surface (it also rejects a
+            # non-mapping payload).  The non-dict guard above means it cannot
+            # fire today; keeping it here means a future reordering of the guards
+            # degrades into a coded infra failure rather than an escaping
+            # exception.
             try:
                 self._verdict_from_payload(structured, _VERDICT_PROBE_RUN_ID)
-            except ValidationError as e:
+            except (ValidationError, TypeError) as e:
                 self._raise_unusable_output(
                     result, 'cli_output_unparseable',
                     f'structured_output failed JudgeVerdict validation: {e}',
@@ -729,7 +735,21 @@ Review this run and provide your verdict as JSON.
         fallback, so the two cannot drift on field defaults.  Keys the model has
         no field for (e.g. ``summary``, which JUDGE_SYSTEM_PROMPT asks for) are
         dropped here, exactly as they always were.
+
+        Raises ``TypeError`` when *data* is not a mapping.  ``json.loads`` happily
+        returns a list / str / int / None for a top-level JSON value that is not
+        an object (``[{"severity": "ok"}]`` — list-wrapping is a routine LLM
+        habit — or a bare ``"ok"``), and ``.get`` on one of those raises
+        ``AttributeError``, which is not a shape the caller can distinguish from
+        a genuine bug.  Fail on the shape explicitly instead, so
+        ``_parse_verdict`` can give it the same loud fail-closed treatment as any
+        other malformed payload.
         """
+        if not isinstance(data, dict):
+            raise TypeError(
+                f'judge verdict payload must be a JSON object, got '
+                f'{type(data).__name__}: {data!r:.120}'
+            )
         return JudgeVerdict(
             run_id=run_id,
             reviewed_at=datetime.now(UTC),
@@ -789,7 +809,10 @@ Review this run and provide your verdict as JSON.
 
             data = json.loads(text)
             return self._verdict_from_payload(data, run_id)
-        except (json.JSONDecodeError, IndexError, KeyError, ValidationError) as e:
+        except (
+            json.JSONDecodeError, IndexError, KeyError, ValidationError,
+            TypeError, AttributeError,
+        ) as e:
             logger.error(f'Failed to parse judge response: {e}')
             # severity=serious is deliberate: it routes through the existing
             # halt path (review_run() halts on config.halt_on_judge_serious;
@@ -807,13 +830,25 @@ Review this run and provide your verdict as JSON.
             # ..._no_halt_when_disabled in test_judge.py for the covered
             # behavior at both settings of halt_on_judge_serious.
             #
-            # ValidationError is in the caught tuple so a SEMANTICALLY-invalid
-            # payload (severity outside VerdictSeverity, wrong-typed findings)
-            # cannot silently vanish: without it, JudgeVerdict's pydantic error
-            # escapes to review_run's broad `except Exception` and the run
-            # returns None with no verdict, no halt and no signal. The
-            # claude_cli provider never reaches here — its equivalent condition
-            # is classified as cli_output_unparseable infra in _call_judge_cli.
+            # The tuple is wide on purpose: EVERY way a syntactically-parseable
+            # response can still fail to become a verdict has to land here, or it
+            # escapes to review_run's broad `except Exception` and the run returns
+            # None with no verdict, no halt and no signal — the silent
+            # degradation this whole change set exists to remove. Specifically:
+            #   - ValidationError: semantically-invalid payload (severity outside
+            #     VerdictSeverity, wrong-typed findings).
+            #   - TypeError: top-level JSON value that is not an object — a list,
+            #     string, number or null (see _verdict_from_payload's shape
+            #     guard). List-wrapping is a routine LLM habit.
+            #   - AttributeError: belt-and-braces for any residual duck-typing
+            #     surprise in payload traversal, since json.loads' return type is
+            #     only as constrained as the model chose to be.
+            # None of this widens what the caller sees: the result is the same
+            # fail-closed severity=serious + unparseable_judge_response verdict as
+            # for malformed text, with the exception embedded in the finding.
+            # The claude_cli provider never reaches here — its equivalent
+            # conditions are classified as cli_output_unparseable infra in
+            # _call_judge_cli (which validates against JudgeVerdict itself).
             return JudgeVerdict(
                 run_id=run_id,
                 reviewed_at=datetime.now(UTC),
