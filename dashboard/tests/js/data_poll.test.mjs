@@ -499,3 +499,127 @@ test('error backoff: refreshDFData(win) (chip change) bypasses backoff, but is s
     await drain();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Jitter — spreads the 13 endpoint fetches across part of the 3s interval
+// instead of every tick firing all 13 at once (task 185's lesson: 13
+// simultaneous requests hammering a single aiosqlite worker thread). Driven
+// by a recording `sleep` dep (captures every requested delay, resolves
+// immediately unless a test deliberately holds it open) and a deterministic
+// per-call `random`, so none of this waits on the wall clock either.
+//
+// data.js does not export JITTER_MAX_MS/POLL_INTERVAL_MS, so — same as the
+// error-backoff tests above hardcoding the 3000/6000/.../60000 schedule
+// instead of importing BACKOFF_BASE_MS/BACKOFF_MAX_MS — these mirror the two
+// constants' documented values (step-8: JITTER_MAX_MS = 1500; step-2:
+// POLL_INTERVAL_MS = 3000) as local expectations.
+// ---------------------------------------------------------------------------
+
+const EXPECTED_JITTER_MAX_MS = 1500;
+const EXPECTED_POLL_INTERVAL_MS = 3000;
+
+test('jitter: every endpoint awaits a pre-fetch delay in [0, JITTER_MAX_MS), and the 13 delays are not all identical', async () => {
+  // Sanity check on the fixture itself: the jitter cap must stay below the
+  // poll interval, so a jittered start can never structurally slip past the
+  // next tick.
+  assert.ok(
+    EXPECTED_JITTER_MAX_MS < EXPECTED_POLL_INTERVAL_MS,
+    `jitter cap (${EXPECTED_JITTER_MAX_MS}) must stay below the poll interval (${EXPECTED_POLL_INTERVAL_MS})`,
+  );
+
+  const fetchImpl = () => Promise.resolve({ ok: true, json: async () => ({}) });
+  const { api } = loadDataJs({ fetchStub: fetchImpl });
+
+  const sleepCalls = [];
+  let callIndex = 0;
+  const deps = {
+    fetchImpl,
+    now: () => 0,
+    // 13 distinct fractions in [0, 1) — deterministic, and spread enough
+    // that flooring against JITTER_MAX_MS cannot coincidentally collapse
+    // them all to the same integer delay.
+    random: () => (callIndex++ % 13) / 13,
+    sleep: ms => { sleepCalls.push(ms); return Promise.resolve(); },
+  };
+
+  // jitterMaxMs is intentionally omitted from opts: production callers
+  // (pollTick / the setInterval loop) never pass it either, so this
+  // exercises data.js's own internal default rather than a test override.
+  await api.refreshDFData(undefined, { state: api.createPollState(), deps });
+
+  assert.equal(sleepCalls.length, 13, 'every one of the 13 endpoints must await a jitter sleep');
+  for (const ms of sleepCalls) {
+    assert.ok(
+      ms >= 0 && ms < EXPECTED_JITTER_MAX_MS,
+      `jitter delay ${ms} must be in [0, ${EXPECTED_JITTER_MAX_MS})`,
+    );
+  }
+  assert.ok(
+    new Set(sleepCalls).size > 1,
+    'the 13 jitter delays must not all be identical — the fan-out must be genuinely spread',
+  );
+});
+
+test('jitter: the sleep happens INSIDE the in-flight window — a second pollTick fired mid-jitter is skipped', async () => {
+  const callCount = new Map();
+  const fetchImpl = url => {
+    const path = url.split('?')[0];
+    callCount.set(path, (callCount.get(path) || 0) + 1);
+    return Promise.resolve({ ok: true, json: async () => ({}) });
+  };
+  const { api } = loadDataJs({ fetchStub: fetchImpl });
+
+  let releaseJitter;
+  const jitterGate = new Promise(resolve => { releaseJitter = resolve; });
+  const deps = {
+    fetchImpl,
+    now: () => 0,
+    random: () => 0.5,
+    // Held open (ignores `ms`) rather than resolving immediately — models
+    // "still inside its jitter delay" for every endpoint at once, so a
+    // second tick firing in that window has something real to be skipped by.
+    sleep: () => jitterGate,
+  };
+  const opts = { state: api.createPollState(), deps };
+
+  api.pollTick(opts); // tick 1: every endpoint enters its jitter delay, held open
+  await drain();
+  assert.equal(callCount.get(FLAKY_ENDPOINT_PATH), undefined, 'no fetch should have gone out yet — still jittering');
+
+  api.pollTick(opts); // tick 2: fired while tick 1's endpoints are still jittering
+  await drain();
+  assert.equal(
+    callCount.get(FLAKY_ENDPOINT_PATH),
+    undefined,
+    'a second pollTick fired mid-jitter must be skipped by the in-flight guard, not start a second fetch',
+  );
+
+  releaseJitter();
+  await drain();
+  assert.equal(
+    callCount.get(FLAKY_ENDPOINT_PATH),
+    1,
+    'once the jitter delay resolves, the fetch proceeds exactly once (tick 2 having been skipped, not queued)',
+  );
+});
+
+test('jitter: passing jitterMaxMs: 0 issues no sleep at all', async () => {
+  const fetchImpl = () => Promise.resolve({ ok: true, json: async () => ({}) });
+  const { api } = loadDataJs({ fetchStub: fetchImpl });
+
+  const sleepCalls = [];
+  const deps = {
+    fetchImpl,
+    now: () => 0,
+    random: () => 0.5,
+    sleep: ms => { sleepCalls.push(ms); return Promise.resolve(); },
+  };
+
+  await api.refreshDFData(undefined, { state: api.createPollState(), deps, jitterMaxMs: 0 });
+
+  assert.equal(
+    sleepCalls.length,
+    0,
+    'jitterMaxMs: 0 must skip the sleep entirely — this is what keeps the rest of this file deterministic',
+  );
+});
