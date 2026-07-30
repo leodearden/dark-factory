@@ -1774,3 +1774,115 @@ class TestInterpreterMisresolutionClassifiesEnvTransient:
         member is introduced; ENV_TRANSIENT already carries precisely this policy.
         """
         assert FailureCategory.ENV_TRANSIENT in INFRA_TRANSIENT_CATEGORIES
+
+
+# ---------------------------------------------------------------------------
+# task 3173: an EXTERNALLY killed process never produced an exit verdict
+#
+# ``_run_cmd`` returns ``proc.returncode`` verbatim, and asyncio sets that to
+# the NEGATIVE signal number when the child is killed externally. Today a -9
+# with an empty/1-line log matches no pattern and falls out the bottom of the
+# ladder as UNKNOWN_TEST_FAILURE — a blocking, branch-blaming verdict for a
+# process the branch never got to influence.
+#
+# RED today: ``is_external_kill_rc`` does not exist and no guard inspects
+# ``rc < 0`` anywhere in verify.py/verify_classify.py/verify_categories.py.
+# ---------------------------------------------------------------------------
+
+
+class TestExternalKillIsIndeterminate:
+    """rc < 0 for an EXTERNAL termination signal is INFRA_KILL, tool-blind."""
+
+    # -- (a) the predicate -------------------------------------------------
+
+    @pytest.mark.parametrize('rc', [-9, -15, -2, -1])
+    def test_external_termination_signals_are_kills(self, rc):
+        from orchestrator.verify_classify import is_external_kill_rc
+        assert is_external_kill_rc(rc) is True
+
+    @pytest.mark.parametrize('rc', [0, 1, 5, 137, -11, -6, -7, -4, -8])
+    def test_non_external_kill_rcs_are_not(self, rc):
+        # 137 is 128+9 as a SHELL-reported status, not a raw asyncio
+        # returncode — the predicate must not guess at shell conventions.
+        # -11/-6/-7/-4/-8 are CRASH signals (SEGV/ABRT/BUS/ILL/FPE): genuine
+        # faults of the code under test that must stay RED.
+        from orchestrator.verify_classify import is_external_kill_rc
+        assert is_external_kill_rc(rc) is False
+
+    # -- (b) the measured case --------------------------------------------
+
+    def test_measured_case_sigkill_with_one_line_header(self):
+        """The exact shape of the incident: the lint leg was SIGKILLed after
+        emitting only its role header, and classified UNKNOWN_TEST_FAILURE."""
+        from orchestrator.verify_classify import classify_failure
+        measured_output = 'DF_VERIFY_ROLE=merge — forcing --scope all\n'
+        assert classify_failure(
+            ToolKind.OPAQUE, -9, measured_output, False,
+        ) == FailureCategory.INFRA_KILL
+
+    def test_empty_output_sigkill(self):
+        from orchestrator.verify_classify import classify_failure
+        assert classify_failure(ToolKind.OPAQUE, -9, '', False) == FailureCategory.INFRA_KILL
+
+    # -- (c) the guard is tool-blind, above per-tool dispatch --------------
+
+    @pytest.mark.parametrize(
+        'tool', [ToolKind.OPAQUE, ToolKind.RUFF, ToolKind.PYTEST, ToolKind.CARGO_CLIPPY],
+    )
+    @pytest.mark.parametrize('rc', [-9, -15])
+    def test_kill_classification_is_tool_blind(self, tool, rc):
+        from orchestrator.verify_classify import classify_failure
+        assert classify_failure(tool, rc, '', False) == FailureCategory.INFRA_KILL
+
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_every_tool_kind_agrees(self, tool):
+        from orchestrator.verify_classify import classify_failure
+        assert classify_failure(tool, -9, '', False) == FailureCategory.INFRA_KILL
+
+    # -- (d) guard ORDER ---------------------------------------------------
+
+    def test_kill_wins_over_environmental_output_mining(self):
+        """A killed process's TRUNCATED output must not be mined for a root
+        cause: whatever it managed to flush before dying is not a diagnosis."""
+        from orchestrator.verify_classify import classify_failure
+        enospc_output = "error: failed to write: No space left on device (os error 28)\n"
+        # Sanity: without the kill this same output IS disk_full.
+        assert classify_failure(
+            ToolKind.OPAQUE, 1, enospc_output, False,
+        ) == FailureCategory.DISK_FULL
+        assert classify_failure(
+            ToolKind.OPAQUE, -9, enospc_output, False,
+        ) == FailureCategory.INFRA_KILL
+
+    def test_timeout_guard_still_wins_over_kill(self):
+        """The timeout guard stays FIRST: our own watchdog SIGKILLing a
+        command it timed out is a timeout, and must keep RetryKind.TIMEOUT."""
+        from orchestrator.verify_classify import classify_failure
+        assert classify_failure(
+            ToolKind.OPAQUE, -9, '', True,
+        ) == FailureCategory.INFRA_TIMEOUT
+
+    # -- (e) NEGATIVE CONTROLS: crash signals are untouched ----------------
+
+    @pytest.mark.parametrize('rc', [-11, -6])
+    def test_crash_signals_are_not_kills_and_keep_todays_category(self, rc):
+        """SIGSEGV/SIGABRT are faults of the code UNDER TEST. Reclassifying
+        them as retryable infra would be the false-GREEN inverse of this
+        defect — the exact class tasks 2822/1700 hardened against."""
+        from orchestrator.verify_classify import classify_failure
+        category = classify_failure(ToolKind.PYTEST, rc, '', False)
+        assert category != FailureCategory.INFRA_KILL
+        assert category == FailureCategory.UNKNOWN_TEST_FAILURE
+        assert category not in INFRA_TRANSIENT_CATEGORIES
+
+    def test_segv_with_a_real_test_verdict_still_reports_the_test_failure(self):
+        from orchestrator.verify_classify import classify_failure
+        assert classify_failure(
+            ToolKind.PYTEST, -11, 'FAILED tests/x.py::y\n', False,
+        ) == FailureCategory.TEST_FAILURE
+
+    # -- (f) rc == 0 is still PASSED --------------------------------------
+
+    def test_rc_zero_still_passes(self):
+        from orchestrator.verify_classify import classify_failure
+        assert classify_failure(ToolKind.OPAQUE, 0, '', False) == FailureCategory.PASSED
