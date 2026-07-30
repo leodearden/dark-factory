@@ -1832,6 +1832,103 @@ class TestUpdateMemoryMetadataArm:
         buffer.push.assert_awaited_once()
 
 
+class TestUpdateMemoryCombinedArms:
+    """content + metadata in ONE call — the one-write / one-row / one-event guarantee.
+
+    §3 deliberately allows both arms in one call precisely to avoid the torn
+    intermediate state a two-tool design would have: a record that briefly
+    carries the new content but the stale metadata (or vice versa). That
+    guarantee is only real if the metadata delta is FOLDED into the same
+    Mem0Backend.update call rather than routed through a second write.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('kwargs', [
+        {'metadata_patch': {'topic': 'cgl-eta'}},
+        {'metadata_delete_keys': ['src_project']},
+        {'metadata_patch': {'topic': 'cgl-eta'}, 'metadata_delete_keys': ['src_project']},
+        {'metadata_patch': {'topic': 'cgl-eta'}, 'metadata_mode': 'replace'},
+    ], ids=['patch', 'delete', 'patch_delete', 'replace'])
+    async def test_exactly_one_backend_write(self, service, kwargs):
+        """The metadata delta rides along on the content write, never beside it."""
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            content='amended text', reason='test amend', **kwargs,
+        )
+
+        service.mem0.update.assert_awaited_once()
+        service.mem0.set_payload.assert_not_called()
+        service.mem0.delete_payload.assert_not_called()
+        service.mem0.overwrite_payload.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_forwarded_metadata_reflects_merge_and_delete(self, service):
+        """Both the new content and the metadata delta land in one update call."""
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            content='amended text', reason='test amend',
+            metadata_patch={'topic': 'cgl-eta'},
+            metadata_delete_keys=['src_project'],
+        )
+
+        call = service.mem0.update.await_args
+        assert call.args[1] == 'amended text'
+        forwarded = call.kwargs['metadata']
+        assert forwarded['topic'] == 'cgl-eta', 'the merge must be applied'
+        assert 'src_project' not in forwarded, 'the deletion must be applied'
+        assert forwarded['kind'] == 'canonical', 'untouched custom keys survive'
+        # mem0 restores its own keys from the stored point; forwarding them
+        # would be fighting it for ownership of its own payload.
+        from fused_memory.backends.mem0_client import _MEM0_MANAGED_METADATA_KEYS
+        assert not (set(forwarded) & _MEM0_MANAGED_METADATA_KEYS)
+
+    @pytest.mark.asyncio
+    async def test_replace_mode_drops_unnamed_custom_keys(self, service):
+        """Combined replace uses the SAME delta semantics as the metadata-only path."""
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            content='amended text', reason='test amend',
+            metadata_patch={'topic': 'cgl-eta'}, metadata_mode='replace',
+        )
+
+        forwarded = service.mem0.update.await_args.kwargs['metadata']
+        assert forwarded == {'topic': 'cgl-eta'}
+
+    @pytest.mark.asyncio
+    async def test_one_journal_row_and_one_event(self, service):
+        """One call, one audit row, one announcement — content's event rule wins."""
+        from fused_memory.models.reconciliation import EventType
+
+        journal = _journal_mock()
+        service._write_journal = journal
+        buffer = MagicMock()
+        buffer.push = AsyncMock()
+        service._event_buffer = buffer
+
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            content='amended text', reason='test amend',
+            metadata_patch={'topic': 'cgl-eta'},
+        )
+
+        journal.log_write_op.assert_awaited_once()
+        buffer.push.assert_awaited_once()
+        assert buffer.push.await_args.args[0].type == EventType.memory_updated
+
+    @pytest.mark.asyncio
+    async def test_envelope_reports_both_arms(self, service):
+        """A caller can tell from the response that both arms actually ran."""
+        result = await service.update_memory(
+            memory_id='point-1', project_id='test',
+            content='amended text', reason='test amend',
+            metadata_patch={'topic': 'cgl-eta'},
+        )
+
+        assert result['id'] == 'point-1'
+        assert result['content_amended'] is True
+        assert result['metadata_patched'] is True
+
+
 class TestUpdateEdgeVerification:
     """Tests for the post-write persistence verification in update_edge (Guard 2)."""
 
