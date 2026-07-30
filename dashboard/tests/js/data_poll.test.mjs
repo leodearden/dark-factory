@@ -238,6 +238,13 @@ test('per-endpoint in-flight guard: a slow endpoint never exceeds concurrency 1,
     1,
     `a slow endpoint must never have more than 1 concurrent fetch in flight (observed ${maxConcurrent.get(SLOW_ENDPOINT_PATH)})`,
   );
+  // The guard should have actually SKIPPED ticks 2-4 for the slow endpoint
+  // (not queued them) — only tick 1's fetch ever went out.
+  assert.equal(
+    callCount.get(SLOW_ENDPOINT_PATH),
+    1,
+    'ticks 2-4 must skip the slow endpoint outright while it is still in flight, not queue a retry',
+  );
 
   for (const path of fastPaths) {
     assert.equal(
@@ -255,7 +262,7 @@ test('per-endpoint in-flight guard: a slow endpoint never exceeds concurrency 1,
   await drain();
   assert.equal(
     callCount.get(SLOW_ENDPOINT_PATH),
-    5,
+    2,
     'the slow endpoint should be re-fetched once its in-flight flag clears on settle',
   );
 });
