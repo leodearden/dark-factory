@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING
 from dotenv import load_dotenv
 
 from shared.cli_invoke import AgentResult
-from shared.config_dir import TaskConfigDir
+from shared.config_dir import CONFIG_DIR_PREFIX, TaskConfigDir, sweep_stale_pid_dirs
 from shared.config_models import UsageCapConfig
 from shared.invocation_outcome import (
     OK,
@@ -82,6 +82,54 @@ CREDENTIALS_PATH = Path.home() / '.claude' / '.credentials.json'
 # promptly (self-correcting). Deliberately a small internal responsiveness
 # constant, not an operator knob.
 _SCOPE_WAIT_REPOLL_CEIL_SECS = 5.0
+
+# Probe config-dir naming (task 3086). _PROBE_TASK_ID_PREFIX is the task_id
+# stem handed to TaskConfigDir; _PROBE_DIR_PREFIX is the resulting on-disk
+# prefix the sweep keys off. Both construction sites below build from the
+# same constant, so the swept prefix and the created names are provably the
+# same string.
+_PROBE_TASK_ID_PREFIX = 'usage-gate-probe-'
+_PROBE_DIR_PREFIX = CONFIG_DIR_PREFIX + _PROBE_TASK_ID_PREFIX
+
+# Set once the stale-probe-dir sweep has run in this process. The sweep
+# reclaims OTHER (dead) processes' leftovers, so it is a process-wide
+# one-shot: re-running it per gate would re-scan /tmp for no benefit, and the
+# pathological /tmp this bounds has a 40 MB directory inode.
+_probe_dir_sweep_done: bool = False
+
+
+def _sweep_stale_probe_dirs_once() -> int:
+    """Reclaim dead-PID probe config dirs left by earlier processes.
+
+    Runs at most once per process. Returns the number of dirs removed (0 when
+    already swept this process, or on failure).
+
+    UsageGate.shutdown() already removes this process's own probe dirs on a
+    clean exit, so teardown was never the missing piece. What leaks is (a)
+    hard kills — the fleet SIGKILLs and restarts every unit roughly 8-hourly
+    and no teardown hook survives that — and (b) constructors that never call
+    shutdown() at all (orchestrator/evals/runner.py,
+    fused_memory/reconciliation/harness.py). Only reclaiming other processes'
+    dead-PID leftovers bounds the population, at
+    (live processes x accounts).
+
+    Never raises: tmp hygiene must not be able to fail gate construction, and
+    therefore orchestrator startup.
+    """
+    global _probe_dir_sweep_done
+    if _probe_dir_sweep_done:
+        return 0
+    # Set BEFORE the call, not after, so a raising sweep still cannot re-run
+    # on every subsequent gate construction.
+    _probe_dir_sweep_done = True
+    try:
+        return sweep_stale_pid_dirs(_PROBE_DIR_PREFIX)
+    except OSError:
+        logger.warning(
+            'UsageGate: stale probe-dir sweep of %s failed — continuing without it '
+            '(the next process start retries)', _PROBE_DIR_PREFIX, exc_info=True,
+        )
+        return 0
 
 
 def _probe_hit_local_budget_cap(stdout_bytes: bytes) -> bool:
@@ -513,6 +561,10 @@ class UsageGate:
         self._shutting_down: bool = False
 
         self._accounts: list[AccountState] = self._init_accounts()
+        # Reclaim dead-PID probe dirs left behind by earlier processes BEFORE
+        # creating this process's own, so our fresh dirs are never sweep
+        # candidates (task 3086).
+        _sweep_stale_probe_dirs_once()
         # Per-(account, pid) probe config dirs (PRD §6 task θ, finding 5):
         # concurrent probes across the ~6-process fleet, and the SIGHUP
         # parallel all-account probe gather within one process, must not
@@ -520,7 +572,7 @@ class UsageGate:
         # same-account probes; acct.name disambiguates same-process
         # cross-account probes.
         self._probe_config_dirs: dict[str, TaskConfigDir] = {
-            acct.name: TaskConfigDir(f'usage-gate-probe-{acct.name}-{os.getpid()}')
+            acct.name: TaskConfigDir(f'{_PROBE_TASK_ID_PREFIX}{acct.name}-{os.getpid()}')
             for acct in self._accounts
         }
         # Back-compat alias: several sibling test suites (test_probe_loop.py,
@@ -530,7 +582,7 @@ class UsageGate:
         # dict entry, so those assertions keep holding.
         self._probe_config_dir = next(
             iter(self._probe_config_dirs.values()), None
-        ) or TaskConfigDir(f'usage-gate-probe-{os.getpid()}')
+        ) or TaskConfigDir(f'{_PROBE_TASK_ID_PREFIX}{os.getpid()}')
         self._sighup_handler_installed: bool = False
         self.register_signal_handlers()
 
