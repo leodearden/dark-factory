@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 WRAPPER = Path(__file__).parent.parent / 'reify-closure-staleness-sweep.sh'
@@ -52,11 +53,14 @@ def _harness(tmp_path, *, sweep_exit=0, consumer_exit=0, extra_env=None,
     state_path.write_text('[]')
 
     # One recorder binary per half, so `who` is unambiguous in the state file.
+    # The interpreter is spelled ABSOLUTELY (sys.executable), never `python3`:
+    # one test shims `python3` onto PATH to pin the wrapper's default consumer
+    # prefix, and a PATH-resolved shim here would re-enter that shim forever.
     for who in ('SWEEP', 'CONSUMER'):
         shim = bin_dir / f'fake-{who.lower()}'
         shim.write_text(
             '#!/usr/bin/env bash\n'
-            f'FAKE_WHO={who} exec python3 '
+            f'FAKE_WHO={who} exec {sys.executable} '
             f'{bin_dir / "recorder.py"} "$@"\n'
         )
         shim.chmod(0o755)
@@ -192,10 +196,18 @@ def test_requests_dir_is_overridable(tmp_path):
 def test_wrapper_needs_no_dotenv_or_config_path(tmp_path):
     """The stdlib-only posture: both halves run without .env sourcing or
     CONFIG_PATH/FALKORDB_URI exports, so a lockfile or venv-resolution problem
-    can never wedge the nightly job."""
-    assert 'CONFIG_PATH' not in WRAPPER.read_text()
-    assert 'FALKORDB_URI' not in WRAPPER.read_text()
-    assert '.env' not in WRAPPER.read_text()
+    can never wedge the nightly job.
+
+    Asserted on the wrapper's CODE (comments stripped) rather than its text, so
+    the header may keep explaining why those things are absent.
+    """
+    code = '\n'.join(
+        ln for ln in WRAPPER.read_text().splitlines()
+        if not ln.lstrip().startswith('#')
+    )
+    for forbidden in ('source ', 'set -a', 'CONFIG_PATH', 'FALKORDB_URI',
+                      'uv run', '.env'):
+        assert forbidden not in code, f'{forbidden!r} found in:\n{code}'
 
     env, state_path, _ = _harness(tmp_path)
     for var in ('CONFIG_PATH', 'FALKORDB_URI', 'PROJECT_ROOT'):
@@ -223,7 +235,7 @@ def test_default_consumer_prefix_is_a_bare_python3(tmp_path):
     bin_dir = Path(env['PATH'].split(os.pathsep)[0])
     (bin_dir / 'python3').write_text(
         '#!/usr/bin/env bash\n'
-        f'FAKE_WHO=CONSUMER exec /usr/bin/env python3 '
+        f'FAKE_WHO=CONSUMER exec {sys.executable} '
         f'{bin_dir / "recorder.py"} "$@"\n'
     )
     (bin_dir / 'python3').chmod(0o755)
