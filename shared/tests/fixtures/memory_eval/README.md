@@ -24,6 +24,8 @@ a dashboard-shaped `json.load`-only reader).
       "value": <float>,
       "n": <int >= 0>,
       "denominator": <int, REQUIRED for proportion, forbidden otherwise>,
+      "direction": "higher_is_worse" | "lower_is_worse",  // REQUIRED for
+                   // proportion/count, forbidden otherwise
       "items": [{"item_key": "<str>", "passed": <bool>}],   // REQUIRED for tripwire
       "details_path": "<optional relative path to a companion report>"
     }
@@ -40,6 +42,13 @@ Per-kind cross-field rules (enforced at emit time by
   and `value * denominator` a whole number (the binomial successes count).
 - **count** — `value` a non-negative whole number; no `denominator`/`items`.
 - **scalar** — free float; reported but never alarmed.
+- **direction** — required for `proportion` and `count`, rejected for `tripwire`
+  and `scalar`. The exact tests are two-sided, so without it a dramatic
+  IMPROVEMENT (`canonical-in-top-5` at 30/30, `dangling-pointers` at 0) is
+  indistinguishable from a regression and would alarm. It cannot be defaulted
+  per kind — higher is good for `canonical-in-top-5` and bad for
+  `dangling-pointers`. A surprising move the safe way reports as verdict status
+  `improved` and never enters the published `alarms` feed.
 
 ## Exemplars and their provenance
 

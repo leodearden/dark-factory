@@ -27,10 +27,10 @@ import logging
 from typing import Any
 
 __all__ = [
-    "parse_tool_result",
-    "resolver_failed",
-    "EnvelopeParseError",
-    "EnvelopeShape",
+    'parse_tool_result',
+    'resolver_failed',
+    'EnvelopeParseError',
+    'EnvelopeShape',
 ]
 
 logger = logging.getLogger(__name__)
@@ -46,22 +46,22 @@ class EnvelopeShape(enum.StrEnum):
     Mirrors the ``AgentFailureKind`` pattern in ``cli_invoke.py``.
     """
 
-    NO_TEXT_BLOCK = "NO_TEXT_BLOCK"
+    NO_TEXT_BLOCK = 'NO_TEXT_BLOCK'
     """No ``type=='text'`` block found in ``result.content``."""
 
-    JSON_DECODE_ERROR = "JSON_DECODE_ERROR"
+    JSON_DECODE_ERROR = 'JSON_DECODE_ERROR'
     """Text block found but ``json.loads`` raised ``ValueError``/``TypeError``."""
 
-    INNER_NOT_DICT = "INNER_NOT_DICT"
+    INNER_NOT_DICT = 'INNER_NOT_DICT'
     """Parsed payload (after ``{data:{…}}`` unwrap) is not a ``dict``."""
 
-    KEY_ABSENT = "KEY_ABSENT"
+    KEY_ABSENT = 'KEY_ABSENT'
     """Inner dict is a dict but the requested key is absent."""
 
-    WRONG_TYPE = "WRONG_TYPE"
+    WRONG_TYPE = 'WRONG_TYPE'
     """``inner[key]`` is present but not an instance of ``expected_type``."""
 
-    RAISED = "RAISED"
+    RAISED = 'RAISED'
     """An unexpected exception was raised during parsing."""
 
 
@@ -84,7 +84,7 @@ class EnvelopeParseError(Exception):
         self.shape = shape
         self.key = key
         self.payload_prefix = payload_prefix
-        super().__init__(f"MCP envelope parse error: shape={shape!r} key={key!r}")
+        super().__init__(f'MCP envelope parse error: shape={shape!r} key={key!r}')
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +100,7 @@ def _fail(
     """Emit ONE distinct WARNING and return ``(None, EnvelopeParseError(…))``."""
     prefix = repr(payload)[:200]
     logger.warning(
-        "MCP envelope parse failed (shape=%s, key=%r): %s",
+        'MCP envelope parse failed (shape=%s, key=%r): %s',
         shape,
         key,
         prefix,
@@ -155,21 +155,21 @@ def parse_tool_result(
         if not isinstance(result, dict):
             return _fail(EnvelopeShape.NO_TEXT_BLOCK, key, result)
 
-        inner_result = result.get("result")
-        content = inner_result.get("content", []) if isinstance(inner_result, dict) else None
+        inner_result = result.get('result')
+        content = inner_result.get('content', []) if isinstance(inner_result, dict) else None
         if not isinstance(content, list):
             return _fail(EnvelopeShape.NO_TEXT_BLOCK, key, result)
 
         text_block = None
         for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
+            if isinstance(block, dict) and block.get('type') == 'text':
                 text_block = block
                 break
 
         if text_block is None:
             return _fail(EnvelopeShape.NO_TEXT_BLOCK, key, result)
 
-        raw_text = text_block.get("text", "")
+        raw_text = text_block.get('text', '')
 
         # --- JSON decode -------------------------------------------------------
         try:
@@ -178,8 +178,8 @@ def parse_tool_result(
             return _fail(EnvelopeShape.JSON_DECODE_ERROR, key, raw_text)  # noqa: B904
 
         # --- {data:{…}} unwrap -------------------------------------------------
-        if isinstance(data, dict) and isinstance(data.get("data"), dict):
-            inner = data["data"]
+        if isinstance(data, dict) and isinstance(data.get('data'), dict):
+            inner = data['data']
         else:
             inner = data
 
@@ -211,7 +211,7 @@ def parse_tool_result(
     except Exception as exc:  # noqa: BLE001 — catch-all for unexpected exceptions
         prefix = repr(exc)[:200]
         logger.warning(
-            "MCP envelope parse raised unexpected exception (shape=%s, key=%r): %s",
+            'MCP envelope parse raised unexpected exception (shape=%s, key=%r): %s',
             EnvelopeShape.RAISED,
             key,
             prefix,

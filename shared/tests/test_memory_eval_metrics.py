@@ -41,6 +41,7 @@ def _make_metric(**overrides) -> dict:
         'value': 0.8,
         'n': 30,
         'denominator': 30,
+        'direction': 'lower_is_worse',
     }
     payload.update(overrides)
     return payload
@@ -62,7 +63,13 @@ def _make_tripwire(**overrides) -> dict:
 
 
 def _make_count(**overrides) -> dict:
-    payload = {'metric_id': 'dangling-pointers', 'kind': 'count', 'value': 5.0, 'n': 30}
+    payload = {
+        'metric_id': 'dangling-pointers',
+        'kind': 'count',
+        'value': 5.0,
+        'n': 30,
+        'direction': 'higher_is_worse',
+    }
     payload.update(overrides)
     return payload
 
@@ -159,7 +166,13 @@ _MALFORMED_METRICS = {
     'proportion-value-above-one': (_make_metric(value=1.4), 'canonical-in-top-5'),
     'proportion-value-negative': (_make_metric(value=-0.1), 'canonical-in-top-5'),
     'proportion-missing-denominator': (
-        {'metric_id': 'canonical-in-top-5', 'kind': 'proportion', 'value': 0.8, 'n': 30},
+        {
+            'metric_id': 'canonical-in-top-5',
+            'kind': 'proportion',
+            'value': 0.8,
+            'n': 30,
+            'direction': 'lower_is_worse',
+        },
         'canonical-in-top-5',
     ),
     # 0.815 * 30 == 24.45 successes — a proportion no binomial outcome produces.
@@ -179,6 +192,33 @@ _MALFORMED_METRICS = {
     'negative-n': (_make_count(n=-1), 'dangling-pointers'),
     'empty-metric-id': (_make_count(metric_id=''), ''),
     'unknown-extra-field': (_make_count(bogus_field=1), 'dangling-pointers'),
+    # M2 fires alarms on REGRESSIONS, and a two-sided exact test cannot tell a
+    # collapse from a repair without being told which side is which — so the two
+    # statistical kinds must declare it, and the two kinds with no two-sided test
+    # must not (one home for the fact, no second source of truth).
+    'proportion-missing-direction': (
+        {
+            'metric_id': 'canonical-in-top-5',
+            'kind': 'proportion',
+            'value': 0.8,
+            'n': 30,
+            'denominator': 30,
+        },
+        'canonical-in-top-5',
+    ),
+    'count-missing-direction': (
+        {'metric_id': 'dangling-pointers', 'kind': 'count', 'value': 5.0, 'n': 30},
+        'dangling-pointers',
+    ),
+    'direction-outside-the-vocabulary': (
+        _make_count(direction='higher_is_better'),
+        'dangling-pointers',
+    ),
+    'tripwire-with-direction': (
+        _make_tripwire(direction='higher_is_worse'),
+        'topic-canonical-present',
+    ),
+    'scalar-with-direction': (_make_scalar(direction='lower_is_worse'), 'search-latency-p50-ms'),
 }
 
 

@@ -14,12 +14,14 @@
   "metrics": [
     {
       "denominator": 6,
+      "direction": "lower_is_worse",
       "kind": "proportion",
       "metric_id": "canonical-in-top-5",
       "n": 6,
       "value": 0.6666666666666666
     },
     {
+      "direction": "higher_is_worse",
       "kind": "count",
       "metric_id": "dangling-pointers",
       "n": 6,

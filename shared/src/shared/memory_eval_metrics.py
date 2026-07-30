@@ -44,6 +44,7 @@ __all__ = [
     'SCHEMA_VERSION',
     'Corpus',
     'Metric',
+    'MetricDirection',
     'MetricKind',
     'MetricSchemaError',
     'MetricSeries',
@@ -112,6 +113,25 @@ sampling model for it, so no exact test applies).
 """
 
 
+MetricDirection = Literal['higher_is_worse', 'lower_is_worse']
+"""Which way a move in this metric is a REGRESSION. Required for proportion/count.
+
+M2 says alarms fire on regressions, and an exact two-sided test cannot know
+which side that is: 24/30 -> 30/30 on ``canonical-in-top-5`` and 8 -> 0 on
+``dangling-pointers`` are both wildly improbable under their baselines, and both
+are the fix lineage SUCCEEDING. Without a declared direction the alarm feed
+cannot tell "memory quality collapsed" from "memory quality was fixed", and a
+reader has to compare ``value`` to ``baseline`` by eye to find out.
+
+It cannot be defaulted per kind, which is why it is required rather than
+optional: higher is better for ``canonical-in-top-5`` and worse for
+``dangling-pointers``, and both are ordinary metrics of this programme. It is
+also not accepted for ``tripwire`` (rule (a) is already strictly directional — a
+new failure alarms, a fixed item is silently released) or for ``scalar`` (no rule
+is attached), so there is exactly one place the direction of a metric is stated.
+"""
+
+
 class TripwireItem(BaseModel):
     """One item of a structural tripwire's per-item binary predicate (M2 rule a).
 
@@ -160,6 +180,7 @@ class Metric(BaseModel):
     denominator: int | None = None
     items: list[TripwireItem] | None = None
     details_path: str | None = None
+    direction: MetricDirection | None = None
 
     @model_validator(mode='after')
     def _check_kind_fields(self) -> Metric:
@@ -168,6 +189,20 @@ class Metric(BaseModel):
             raise ValueError(f'{where}: items are only meaningful for a tripwire metric.')
         if self.kind != 'proportion' and self.denominator is not None:
             raise ValueError(f'{where}: denominator is only meaningful for a proportion metric.')
+        statistical = self.kind in ('proportion', 'count')
+        if statistical and self.direction is None:
+            raise ValueError(
+                f'{where}: a {self.kind} metric must declare a direction '
+                "('higher_is_worse' or 'lower_is_worse'). The exact test is two-sided, so "
+                'without it a dramatic IMPROVEMENT is indistinguishable from a regression '
+                'and would alarm (M2: alarms fire on regressions).'
+            )
+        if not statistical and self.direction is not None:
+            raise ValueError(
+                f'{where}: direction is only meaningful for a proportion or count metric. '
+                'Rule (a) is already directional (a new failure alarms, a fixed item is '
+                'released) and a scalar has no alarm rule at all.'
+            )
 
         if self.kind == 'tripwire':
             if not self.items:

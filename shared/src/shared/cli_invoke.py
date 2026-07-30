@@ -111,7 +111,7 @@ _WATCHDOG_WORKING_POLL_SECS = 60.0
 #                                         entry instead of raising.
 # ─────────────────────────────────────────────────────────────────────────────
 _DEFAULT_CAP_WAIT_SANITY_SECS = 14 * 86400  # 14 days: outer sanity bound for patient cap waits
-_CAP_WAIT_LOG_INTERVAL_SECS = 600.0        # emit at most one cap_wait log per ~10 min
+_CAP_WAIT_LOG_INTERVAL_SECS = 600.0  # emit at most one cap_wait log per ~10 min
 CAP_HIT_RESUME_PROMPT = (
     'Your previous run was interrupted by a usage limit. '
     'Continue where you left off and complete your task.'
@@ -175,8 +175,7 @@ class AllAccountsCappedException(Exception):
         self.elapsed_secs = elapsed_secs
         self.label = label
         super().__init__(
-            f'{label}: all accounts capped after {retries} retries '
-            f'({elapsed_secs:.1f}s elapsed)'
+            f'{label}: all accounts capped after {retries} retries ({elapsed_secs:.1f}s elapsed)'
         )
 
 
@@ -359,9 +358,7 @@ def read_transcript_records(
                     if isinstance(record, dict):
                         records.append(record)
                 except json.JSONDecodeError:
-                    logger.debug(
-                        f'read_transcript_records: skipping unparseable line in {path}'
-                    )
+                    logger.debug(f'read_transcript_records: skipping unparseable line in {path}')
         return records
     except Exception:
         logger.warning(
@@ -665,24 +662,19 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
         # distinction so a killed-but-productive run (reify-4827) is never
         # reported as indistinguishable from a genuine no-progress wedge.
         if result.transcript_turns:
-            progress_desc = (
-                f'{result.transcript_turns} transcript turns (productive; not a wedge)'
-            )
+            progress_desc = f'{result.transcript_turns} transcript turns (productive; not a wedge)'
         else:
             progress_desc = 'no transcript turns (wedge — no progress made)'
         return AgentFailureClass(
             kind=AgentFailureKind.TIMED_OUT,
-            summary=(
-                f'agent timed out after {result.duration_ms}ms with {progress_desc}'
-            ),
+            summary=(f'agent timed out after {result.duration_ms}ms with {progress_desc}'),
             diagnostic_detail=diagnostic_detail,
         )
     if result.subtype == 'error_max_turns':
         return AgentFailureClass(
             kind=AgentFailureKind.MAX_TURNS,
             summary=(
-                f'agent hit max_turns ({result.turns} turns, '
-                f'output_tokens={result.output_tokens})'
+                f'agent hit max_turns ({result.turns} turns, output_tokens={result.output_tokens})'
             ),
             diagnostic_detail=diagnostic_detail,
         )
@@ -715,10 +707,7 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
         )
     return AgentFailureClass(
         kind=AgentFailureKind.UNKNOWN,
-        summary=(
-            f'agent failed: subtype={result.subtype!r} '
-            f'(no specific failure signal)'
-        ),
+        summary=(f'agent failed: subtype={result.subtype!r} (no specific failure signal)'),
         diagnostic_detail=diagnostic_detail,
     )
 
@@ -862,13 +851,22 @@ async def invoke_claude_agent(
     *timeout_seconds* stays the hard wall (today's exact behavior).
     """
     return await _invoke_claude(
-        prompt=prompt, system_prompt=system_prompt, cwd=cwd, model=model,
-        max_turns=max_turns, max_budget_usd=max_budget_usd,
-        allowed_tools=allowed_tools, disallowed_tools=disallowed_tools,
-        mcp_config=mcp_config, output_schema=output_schema,
-        permission_mode=permission_mode, effort=effort,
-        oauth_token=oauth_token, timeout_seconds=timeout_seconds,
-        resume_session_id=resume_session_id, session_id=session_id,
+        prompt=prompt,
+        system_prompt=system_prompt,
+        cwd=cwd,
+        model=model,
+        max_turns=max_turns,
+        max_budget_usd=max_budget_usd,
+        allowed_tools=allowed_tools,
+        disallowed_tools=disallowed_tools,
+        mcp_config=mcp_config,
+        output_schema=output_schema,
+        permission_mode=permission_mode,
+        effort=effort,
+        oauth_token=oauth_token,
+        timeout_seconds=timeout_seconds,
+        resume_session_id=resume_session_id,
+        session_id=session_id,
         config_dir=config_dir,
         env_overrides=env_overrides,
         spawn_env=spawn_env,
@@ -982,8 +980,8 @@ async def invoke_with_cap_retry(
             raise TypeError(
                 "invoke_with_cap_retry: 'prompt' must be a non-empty string when "
                 "'resume_session_id' is set.  The prompt is the real task context used "
-                "for fresh-fallback recovery if the resume invocation fails; passing an "
-                "empty or missing prompt silently corrupts that fallback."
+                'for fresh-fallback recovery if the resume invocation fails; passing an '
+                'empty or missing prompt silently corrupts that fallback.'
             )
         if not resume_delivers_prompt:
             invoke_kwargs['prompt'] = CRASH_RECOVERY_RESUME_PROMPT
@@ -1021,17 +1019,26 @@ async def invoke_with_cap_retry(
                 elapsed_secs=elapsed,
                 label=label,
             )
-        if last_cap_wait_log_at is None or now - last_cap_wait_log_at >= _CAP_WAIT_LOG_INTERVAL_SECS:
-            logger.warning(json.dumps({
-                'event': 'cap_wait',
-                'label': label,
-                'elapsed_s': round(elapsed, 1),
-                'soonest_open_at': (
-                    usage_gate.soonest_resets_at.isoformat()
-                    if usage_gate and usage_gate.soonest_resets_at else None
-                ),
-                'next_probe_in_s': round(cooldown, 1),
-            }, default=str))
+        if (
+            last_cap_wait_log_at is None
+            or now - last_cap_wait_log_at >= _CAP_WAIT_LOG_INTERVAL_SECS
+        ):
+            logger.warning(
+                json.dumps(
+                    {
+                        'event': 'cap_wait',
+                        'label': label,
+                        'elapsed_s': round(elapsed, 1),
+                        'soonest_open_at': (
+                            usage_gate.soonest_resets_at.isoformat()
+                            if usage_gate and usage_gate.soonest_resets_at
+                            else None
+                        ),
+                        'next_probe_in_s': round(cooldown, 1),
+                    },
+                    default=str,
+                )
+            )
             last_cap_wait_log_at = now
 
     async def _rebuild_fresh_prompt() -> None:
@@ -1111,10 +1118,9 @@ async def invoke_with_cap_retry(
         # scope_for(m, <no config>) is None, so every existing mock-based suite
         # derives scope None → byte-equivalent.
         from shared.usage_gate import scope_for
+
         _cfg = getattr(usage_gate, '_config', None)
-        scope = (
-            scope_for(model, _cfg) if (backend == 'claude' and _cfg is not None) else None
-        )
+        scope = scope_for(model, _cfg) if (backend == 'claude' and _cfg is not None) else None
         while True:
             async with usage_gate.invoke_slot(scope=scope) as slot:
                 # slot.account_name is derived from slot.lease — the SAME
@@ -1151,6 +1157,7 @@ async def invoke_with_cap_retry(
                     ZeroOutputWedge,
                     classify_invocation,
                 )
+
                 outcome = classify_invocation(result, strict_confirm=True, backend=backend)
 
                 # Auth-failure routing (401/403): distinct from cap hits.
@@ -1230,10 +1237,7 @@ async def invoke_with_cap_retry(
                 # None): a live-continuation caller's original_prompt
                 # (resume_delivers_prompt=True) is only valid inside the
                 # wedged session, not the brand-new one this retry starts.
-                if (
-                    isinstance(outcome, ZeroOutputWedge)
-                    and invoke_kwargs.get('resume_session_id')
-                ):
+                if isinstance(outcome, ZeroOutputWedge) and invoke_kwargs.get('resume_session_id'):
                     logger.warning(
                         f'{label}: zero-output timed-out invocation '
                         f'(duration_ms={result.duration_ms}) — clearing wedged '
@@ -1248,7 +1252,7 @@ async def invoke_with_cap_retry(
                     consecutive_cap_hits += 1
                     full_cycles = (consecutive_cap_hits - 1) // num_accounts
                     cooldown = min(
-                        _CAP_HIT_COOLDOWN_SECS * (2 ** full_cycles),
+                        _CAP_HIT_COOLDOWN_SECS * (2**full_cycles),
                         _MAX_CAP_COOLDOWN_SECS,
                     )
 
@@ -1329,9 +1333,8 @@ async def invoke_with_cap_retry(
                         # account (mirrors InvokeSlot.report()'s own guard at the
                         # lease_is_current call site) — treat that as unattributed
                         # rather than passing None into lease_is_current.
-                        attributed = (
-                            slot.lease is not None
-                            and usage_gate.lease_is_current(slot.lease)
+                        attributed = slot.lease is not None and usage_gate.lease_is_current(
+                            slot.lease
                         )
                         synthetic = CapHit(
                             resets_at=None,
@@ -1348,7 +1351,7 @@ async def invoke_with_cap_retry(
                             consecutive_cap_hits += 1
                             full_cycles = (consecutive_cap_hits - 1) // num_accounts
                             cooldown = min(
-                                _CAP_HIT_COOLDOWN_SECS * (2 ** full_cycles),
+                                _CAP_HIT_COOLDOWN_SECS * (2**full_cycles),
                                 _MAX_CAP_COOLDOWN_SECS,
                             )
                             # Cannot resume a session that never ran
@@ -1379,10 +1382,7 @@ async def invoke_with_cap_retry(
                 # exclusive with the ZeroOutputWedge guard above
                 # (transcript_turns 0 vs >0), so zero-output wedges are
                 # unaffected and still take the existing fresh-fallback path.
-                if (
-                    invoke_kwargs.get('resume_session_id')
-                    and is_timed_out_with_progress(result)
-                ):
+                if invoke_kwargs.get('resume_session_id') and is_timed_out_with_progress(result):
                     logger.warning(
                         f'{label}: resumed invocation timed out WITH progress '
                         f'(transcript_turns={result.transcript_turns}, '
@@ -1685,7 +1685,12 @@ async def _invoke_claude(
             cmd = sandbox_wrap(cmd)
 
         result = await _run_subprocess(
-            cmd, cwd, env, model, timeout_seconds, stdin_data=stdin_data,
+            cmd,
+            cwd,
+            env,
+            model,
+            timeout_seconds,
+            stdin_data=stdin_data,
             session_id=(resume_session_id or session_id),
             config_dir=config_dir,
             startup_grace_secs=startup_grace_secs,
@@ -1807,8 +1812,7 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
     if not is_success and not isinstance(structured, dict):
         denials = data.get('permission_denials')
         if isinstance(denials, list) and any(
-            isinstance(d, dict) and d.get('tool_name') == _SCHEMA_OUTPUT_TOOL
-            for d in denials
+            isinstance(d, dict) and d.get('tool_name') == _SCHEMA_OUTPUT_TOOL for d in denials
         ):
             schema_tool_denied = True
 
@@ -1996,9 +2000,7 @@ async def _run_subprocess(
             last_progress_turns: int | None = None
             last_progress_monotonic: float | None = None
 
-            comm_task = asyncio.ensure_future(
-                proc.communicate(input=stdin_data)
-            )
+            comm_task = asyncio.ensure_future(proc.communicate(input=stdin_data))
 
             while True:
                 elapsed = time.monotonic() - watchdog_start
@@ -2006,9 +2008,7 @@ async def _run_subprocess(
                 # caller opted in (both params set).  Monotonic: seen_turn only
                 # ever goes False→True, so this can only turn on, never off.
                 extension_engaged = (
-                    seen_turn
-                    and working_idle_secs is not None
-                    and absolute_cap_secs is not None
+                    seen_turn and working_idle_secs is not None and absolute_cap_secs is not None
                 )
                 # How long until the next mandatory check-point?
                 #
@@ -2023,13 +2023,10 @@ async def _run_subprocess(
                 #     live_turns stays None → startup-kill requires live_turns==0 →
                 #     can never trigger
                 _grace_spent = (
-                    seen_turn
-                    or elapsed >= startup_grace_secs
-                    or not (config_dir and session_id)
+                    seen_turn or elapsed >= startup_grace_secs or not (config_dir and session_id)
                 )
                 time_to_grace = (
-                    float('inf') if _grace_spent
-                    else max(0.0, startup_grace_secs - elapsed)
+                    float('inf') if _grace_spent else max(0.0, startup_grace_secs - elapsed)
                 )
                 if extension_engaged:
                     # extension_engaged's own definition requires both params to
@@ -2106,18 +2103,12 @@ async def _run_subprocess(
                 # Re-derive fresh (not the top-of-loop value) so a seen_turn
                 # transition earlier in THIS iteration is reflected immediately.
                 extension_engaged = (
-                    seen_turn
-                    and working_idle_secs is not None
-                    and absolute_cap_secs is not None
+                    seen_turn and working_idle_secs is not None and absolute_cap_secs is not None
                 )
 
                 # Startup-regime kill: explicit 0-turn read AND grace expired.
                 # NEVER kill on None (unreadable transcript) — conservative degrade.
-                if (
-                    not seen_turn
-                    and live_turns == 0
-                    and elapsed >= startup_grace_secs
-                ):
+                if not seen_turn and live_turns == 0 and elapsed >= startup_grace_secs:
                     logger.warning(
                         f'Startup wedge detected after {elapsed:.1f}s '
                         f'(grace={startup_grace_secs}s, turns=0): '
@@ -2219,8 +2210,7 @@ async def _run_subprocess(
                         f'(first 500): {stdout_text[:500]}'
                     )
                 stderr_text = (
-                    f'Process terminated after {timeout_seconds}s timeout (SIGTERM); '
-                    + stderr_text
+                    f'Process terminated after {timeout_seconds}s timeout (SIGTERM); ' + stderr_text
                 )
             duration_ms = int(time.monotonic() * 1000) - start_ms
             tt = (
@@ -2267,7 +2257,9 @@ async def _run_subprocess(
             f'Agent stdout length: {len(stdout)} bytes (full, returncode={proc.returncode}):\n{stdout_text_for_log}'
         )
     else:
-        logger.info(f'Agent stdout length: {len(stdout)} bytes, first 500: {stdout_text_for_log[:500]}')
+        logger.info(
+            f'Agent stdout length: {len(stdout)} bytes, first 500: {stdout_text_for_log[:500]}'
+        )
 
     # Re-read the on-disk transcript ONCE on the normal-exit path and derive
     # BOTH signals from the same parsed records — no double file I/O (task 2761
@@ -2285,17 +2277,13 @@ async def _run_subprocess(
     # Both fail safe when the transcript can't be located (records None →
     # transcript_turns None, ended_awaiting_background False).
     transcript_records = (
-        read_transcript_records(config_dir, session_id)
-        if (config_dir and session_id)
-        else None
+        read_transcript_records(config_dir, session_id) if (config_dir and session_id) else None
     )
     if transcript_records is None:
         transcript_turns = None
         ended_awaiting_background = False
     else:
-        transcript_turns = sum(
-            1 for r in transcript_records if r.get('type') == 'assistant'
-        )
+        transcript_turns = sum(1 for r in transcript_records if r.get('type') == 'assistant')
         ended_awaiting_background = detect_ended_awaiting_background(transcript_records)
 
     return _SubprocessResult(

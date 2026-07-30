@@ -113,8 +113,18 @@ class Failure(InvocationOutcome):
 
 
 _MONTH_ABBR = {
-    'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
-    'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12,
+    'jan': 1,
+    'feb': 2,
+    'mar': 3,
+    'apr': 4,
+    'may': 5,
+    'jun': 6,
+    'jul': 7,
+    'aug': 8,
+    'sep': 9,
+    'oct': 10,
+    'nov': 11,
+    'dec': 12,
 }
 
 # NOTE — fork, not drift-guarded: _parse_resets_at and _extract_cap_message
@@ -181,11 +191,13 @@ def _parse_resets_at(text: str, *, now: datetime | None = None) -> datetime | No
     m = re.search(
         r'resets\s+(?:on\s+)?([A-Za-z]{3,9})\s+(\d{1,2}),?\s+'
         r'(\d{1,2}(?::\d{2})?\s*[ap]m)\s*\(([^)]+)\)',
-        text, re.IGNORECASE,
+        text,
+        re.IGNORECASE,
     )
     if m:
         try:
             import zoneinfo
+
             month_str = m.group(1).lower()[:3]
             day = int(m.group(2))
             time_str = m.group(3).strip()
@@ -205,9 +217,13 @@ def _parse_resets_at(text: str, *, now: datetime | None = None) -> datetime | No
             now_in_tz = now.astimezone(tz)
             year = now_in_tz.year
             target = now_in_tz.replace(
-                year=year, month=month, day=day,
-                hour=parsed_time.hour, minute=parsed_time.minute,
-                second=0, microsecond=0,
+                year=year,
+                month=month,
+                day=day,
+                hour=parsed_time.hour,
+                minute=parsed_time.minute,
+                second=0,
+                microsecond=0,
             )
             # If target is in the past, assume next year
             if target <= now_in_tz:
@@ -219,11 +235,13 @@ def _parse_resets_at(text: str, *, now: datetime | None = None) -> datetime | No
     # Absolute: "resets Xpm (TZ)" or "resets X:XX AM (TZ)"
     m = re.search(
         r'resets\s+(\d{1,2}(?::\d{2})?\s*[ap]m)\s*\(([^)]+)\)',
-        text, re.IGNORECASE,
+        text,
+        re.IGNORECASE,
     )
     if m:
         try:
             import zoneinfo
+
             time_str = m.group(1).strip()
             tz_str = m.group(2).strip()
             tz = zoneinfo.ZoneInfo(tz_str)
@@ -240,7 +258,8 @@ def _parse_resets_at(text: str, *, now: datetime | None = None) -> datetime | No
             target = now_in_tz.replace(
                 hour=parsed_time.hour,
                 minute=parsed_time.minute,
-                second=0, microsecond=0,
+                second=0,
+                microsecond=0,
             )
             if target <= now_in_tz:
                 target += timedelta(days=1)
@@ -260,7 +279,7 @@ def _parse_resets_at(text: str, *, now: datetime | None = None) -> datetime | No
 # module owns the classification decision now, but that module's copy stays
 # in place until the beta (consumer-rewire) task removes it.
 NON_CAP_CLI_ERROR_MARKERS = [
-    'is already in use',        # --session-id collision (reify-3604)
+    'is already in use',  # --session-id collision (reify-3604)
     'unrecognized arguments',
     'unknown option',
     'invalid value',
@@ -295,7 +314,7 @@ CAP_HIT_PREFIXES = [
 # cap-message phrases unlikely to appear in non-cap contexts.  The primary
 # defense remains the CAP_HIT_PREFIXES / NEAR_CAP_PREFIXES prefix match.
 # Copied from usage_gate.py:78 (CAP_CONFIRM_KEYWORDS).
-CAP_CONFIRM_KEYWORDS = ["resets", "usage limit", "upgrade your plan", "upgrade your subscription"]
+CAP_CONFIRM_KEYWORDS = ['resets', 'usage limit', 'upgrade your plan', 'upgrade your subscription']
 
 # Patterns for near-cap warnings (pause proactively). Copied from
 # usage_gate.py:81 (NEAR_CAP_PREFIXES).
@@ -304,12 +323,22 @@ NEAR_CAP_PREFIXES = [
 ]
 
 # Codex (OpenAI) cap-hit patterns. Copied from usage_gate.py:86 (CODEX_CAP_PATTERNS).
-CODEX_CAP_PATTERNS = ['usage limit reached', 'rate limit', 'quota exceeded',
-                      'insufficient_quota', 'rate_limit_exceeded']
+CODEX_CAP_PATTERNS = [
+    'usage limit reached',
+    'rate limit',
+    'quota exceeded',
+    'insufficient_quota',
+    'rate_limit_exceeded',
+]
 
 # Gemini (Google) cap-hit patterns. Copied from usage_gate.py:90 (GEMINI_CAP_PATTERNS).
-GEMINI_CAP_PATTERNS = ['quota exceeded', 'rate limit', 'resource exhausted',
-                       'RESOURCE_EXHAUSTED', 'quota_exceeded']
+GEMINI_CAP_PATTERNS = [
+    'quota exceeded',
+    'rate limit',
+    'resource exhausted',
+    'RESOURCE_EXHAUSTED',
+    'quota_exceeded',
+]
 
 
 def _extract_cap_message(text: str, prefix: str) -> str:

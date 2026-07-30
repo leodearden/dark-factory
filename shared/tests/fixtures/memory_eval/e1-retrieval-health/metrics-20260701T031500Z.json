@@ -14,18 +14,21 @@
   "metrics": [
     {
       "denominator": 30,
+      "direction": "lower_is_worse",
       "kind": "proportion",
       "metric_id": "canonical-in-top-5",
       "n": 30,
       "value": 0.8
     },
     {
+      "direction": "higher_is_worse",
       "kind": "count",
       "metric_id": "dangling-pointers",
       "n": 30,
       "value": 4.0
     },
     {
+      "direction": "higher_is_worse",
       "kind": "count",
       "metric_id": "superseded-above-successor",
       "n": 30,

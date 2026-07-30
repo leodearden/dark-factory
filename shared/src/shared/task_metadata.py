@@ -67,20 +67,22 @@ __all__ = [
 # never match at resolve time. Authors pinning a model override MUST use
 # the full role_name (see orchestrator.agents.roles.ROLES), not the
 # collapsed config key.
-KNOWN_ROLE_NAMES: frozenset[str] = frozenset({
-    'architect',
-    'implementer',
-    'debugger',
-    'reviewer',
-    'reviewer_comprehensive',
-    'merger',
-    'steward',
-    'triage',
-    'module_tagger',
-    'deep_reviewer',
-    'judge',
-    'simple_task',
-})
+KNOWN_ROLE_NAMES: frozenset[str] = frozenset(
+    {
+        'architect',
+        'implementer',
+        'debugger',
+        'reviewer',
+        'reviewer_comprehensive',
+        'merger',
+        'steward',
+        'triage',
+        'module_tagger',
+        'deep_reviewer',
+        'judge',
+        'simple_task',
+    }
+)
 
 
 def validate_model_overrides(value: object) -> None:
@@ -623,9 +625,7 @@ def _migrate_v1_to_v2(blob: dict) -> dict:
     :func:`_migrate_v0_to_v1`: ``blob`` itself is never modified in place.
     """
     upgraded = dict(blob)
-    present = {
-        key: upgraded[key] for key in _LEGACY_RETRY_LEDGER_COUNTER_KEYS if key in upgraded
-    }
+    present = {key: upgraded[key] for key in _LEGACY_RETRY_LEDGER_COUNTER_KEYS if key in upgraded}
 
     existing_ledger = upgraded.get('retry_ledger')
     if isinstance(existing_ledger, dict):
@@ -712,49 +712,51 @@ _WHOLE_METADATA_FIELD = '<metadata>'
 # — they keep emitting unknown_key as a greppable drift signal; see
 # CLAUDE.md "Task metadata vocabulary & census" for the documented
 # consolidation convention.
-_BLESSED_METADATA_KEYS: frozenset[str] = frozenset({
-    'source',
-    'modules',
-    'spawn_context',
-    'complexity',
-    'force_full_path',
-    'branch_base_sha',
-    '_causation_id',
-    'dry_run_proposals',
-    'reblock_guard',
-    'agent_id',
-    'escalation_id',
-    'suggestion_hash',
-    'prd_path',
-    'prd_task_label',
-    'user_observable_signal',
-    'consumer_ref',
-    'substrate_confirmed',
-    'human_decomposed',
-    'grammar_confirmed',
-    'invariants',
-    'optimistic_path',
-    'capability_manifest',
-    'curator_action',
-    'curator_justification',
-    'combined_at',
-    'gate_escalated_at',
-    'before_done_ran_at',
-    'before_done_verified_at',
-    'before_done_verified_pid',
-    'files_tagged_at',
-    'origin_finding_id',
-    'spawned_from',
-    'program',
-    'program_stream',
-    'stream',
-    # Cross-repo deliverable marker (task 3004): set by the fused-memory submit
-    # path when a task's metadata.files are ALL owned by one other registered
-    # project, read by the orchestrator pre-merge narrowing gate (routes to
-    # OutcomeKind.plan_files_cross_repo instead of flagging 'files not touched').
-    'cross_repo',
-    'cross_repo_project',
-})
+_BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
+    {
+        'source',
+        'modules',
+        'spawn_context',
+        'complexity',
+        'force_full_path',
+        'branch_base_sha',
+        '_causation_id',
+        'dry_run_proposals',
+        'reblock_guard',
+        'agent_id',
+        'escalation_id',
+        'suggestion_hash',
+        'prd_path',
+        'prd_task_label',
+        'user_observable_signal',
+        'consumer_ref',
+        'substrate_confirmed',
+        'human_decomposed',
+        'grammar_confirmed',
+        'invariants',
+        'optimistic_path',
+        'capability_manifest',
+        'curator_action',
+        'curator_justification',
+        'combined_at',
+        'gate_escalated_at',
+        'before_done_ran_at',
+        'before_done_verified_at',
+        'before_done_verified_pid',
+        'files_tagged_at',
+        'origin_finding_id',
+        'spawned_from',
+        'program',
+        'program_stream',
+        'stream',
+        # Cross-repo deliverable marker (task 3004): set by the fused-memory submit
+        # path when a task's metadata.files are ALL owned by one other registered
+        # project, read by the orchestrator pre-merge narrowing gate (routes to
+        # OutcomeKind.plan_files_cross_repo instead of flagging 'files not touched').
+        'cross_repo',
+        'cross_repo_project',
+    }
+)
 
 
 def parse_metadata(

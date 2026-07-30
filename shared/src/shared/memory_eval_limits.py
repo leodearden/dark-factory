@@ -65,7 +65,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from shared.memory_eval_metrics import Metric, MetricSeries
+from shared.memory_eval_metrics import Metric, MetricDirection, MetricSeries
 
 __all__ = [
     'Alarm',
@@ -106,12 +106,16 @@ be one more mapping for a reader of the artifact to hold, with no gain: the
 metric's kind fully determines its rule.
 """
 
-VerdictStatus = Literal['baseline_snapshot', 'ok', 'alarm', 'insufficient_data']
-"""The four things a run can say about a metric.
+VerdictStatus = Literal['baseline_snapshot', 'ok', 'alarm', 'improved', 'insufficient_data']
+"""The five things a run can say about a metric.
 
 Only ``alarm`` wakes anyone. ``insufficient_data`` in particular is a REPORT
 STATUS, never an alarm — a thin sample is not evidence of a regression, and
-saying so is the canary's ``min_samples`` precedent.
+saying so is the canary's ``min_samples`` precedent. ``improved`` is the other
+one: a move too improbable to be chance, in the direction the metric WANTS to
+move (:data:`shared.memory_eval_metrics.MetricDirection`). M2 fires alarms on
+regressions, so a dramatic improvement is news to report and not news to be
+woken for.
 """
 
 _PMF_TIE_SLACK = 1e-9
@@ -437,6 +441,14 @@ class Alarm:
     detail: str
     item_key: str | None = None
     """The specific probe that regressed, for rule (a). ``None`` for whole-metric rules."""
+    direction: MetricDirection | None = None
+    """Which way this metric regresses — so the feed says WHY the move is bad.
+
+    Structural rather than left for a reader to infer by comparing ``value`` to
+    ``baseline``: an alarm lands in an artifact somebody reads hours later, and
+    "20 events against an expected 5" only means "worse" if you already know
+    which direction is worse. ``None`` for rule (a), whose direction is fixed.
+    """
     value: float | None = None
     baseline: float | None = None
     p_value: float | None = None
@@ -471,6 +483,8 @@ class MetricVerdict:
     """``None`` for structural rules, which measure a fact rather than a surprise."""
     alpha: float | None = None
     """The derived bar this run's p-value was judged against. Provenance, not config."""
+    direction: MetricDirection | None = None
+    """The metric's declared regression direction; ``None`` for tripwire/scalar."""
     baseline_run_stamps: tuple[str, ...] = ()
     """Exactly which runs produced ``baseline`` — so a verdict can be re-derived by hand."""
     detail: str = ''
@@ -663,6 +677,7 @@ def _insufficient(
         baseline=baseline,
         p_value=p_value,
         alpha=alpha,
+        direction=metric.direction,
         baseline_run_stamps=stamps,
         detail=detail,
     )
@@ -846,14 +861,55 @@ def _verdict_from_p(
     stamps: tuple[str, ...],
     detail: str,
 ) -> MetricVerdict:
-    """Turn a computed p-value into a verdict. The ONLY place the bar is applied."""
-    alarmed = p_value < alpha
+    """Turn a computed p-value into a verdict. The ONLY place the bar is applied.
+
+    Surprise and harm are SEPARATE questions, and it takes both to alarm. The
+    exact tests are two-sided because that is the honest way to ask "how
+    improbable is this run under the baseline?" — but M2 says *alarms fire on
+    regressions*, and a two-sided test on its own alarms just as loudly when a
+    metric improves dramatically. Both halves of that are real here: at the
+    exemplar's own alpha of 1/360, ``canonical-in-top-5`` going 24/30 -> 30/30
+    has p = 0.0021, and a dangling-pointer count falling from a baseline of 8 to
+    0 has p = 0.00059. Those are the fix lineage (3111/3112/3200) SUCCEEDING, and
+    paging someone for it would be the fastest way to teach them to ignore the
+    feed. Rule (a) has always been directional in exactly this way — a new
+    failure alarms, a fixed item is silently released — so this makes rules (b)
+    and (c) agree with it rather than inventing a new policy.
+
+    An improvement is still REPORTED, with its p-value and the bar it cleared, as
+    status ``improved``: the numbers are the whole point of a two-sided test, and
+    a metric that improbably improved is worth seeing (it may be a probe that
+    broke rather than a bug that got fixed). It simply never enters
+    ``EvaluationResult.alarms``.
+    """
+    direction = metric.direction
+    if direction is None:
+        # Unreachable: the M1 schema requires a direction for exactly the two
+        # kinds that reach this function. Loud rather than silent if that ever
+        # drifts — the alternatives are alarming on improvements (the defect this
+        # branch exists to prevent) or muting regressions.
+        raise AssertionError(
+            f'_verdict_from_p: metric {metric.metric_id!r} of kind {metric.kind!r} has no '
+            'declared direction, so a surprise cannot be classified as regression or repair.'
+        )
+
+    if metric.value == baseline:
+        side, harmful = 'at', False
+    else:
+        above = metric.value > baseline
+        side = 'above' if above else 'below'
+        harmful = above if direction == 'higher_is_worse' else not above
+
+    surprising = p_value < alpha
+    alarmed = surprising and harmful
+    bar = f'p={p_value:.3g} < alpha={alpha:.3g}'
     alarms = (
         (
             Alarm(
                 metric_id=metric.metric_id,
                 rule_kind=metric.kind,
-                detail=f'{detail} p={p_value:.3g} < alpha={alpha:.3g}.',
+                detail=f'{detail} {bar}, {side} baseline ({direction}).',
+                direction=direction,
                 value=metric.value,
                 baseline=baseline,
                 p_value=p_value,
@@ -863,18 +919,31 @@ def _verdict_from_p(
         if alarmed
         else ()
     )
+    if alarmed:
+        status: VerdictStatus = 'alarm'
+        reported = detail
+    elif surprising:
+        status = 'improved'
+        reported = (
+            f'{detail} {bar}, but {side} baseline is the safe side for a '
+            f'{direction} metric — reported, not an alarm.'
+        )
+    else:
+        status = 'ok'
+        reported = detail
     return MetricVerdict(
         metric_id=metric.metric_id,
         rule_kind=metric.kind,
-        status='alarm' if alarmed else 'ok',
+        status=status,
         value=metric.value,
         n=metric.n,
         alarms=alarms,
         baseline=baseline,
         p_value=p_value,
         alpha=alpha,
+        direction=direction,
         baseline_run_stamps=stamps,
-        detail=detail,
+        detail=reported,
     )
 
 
@@ -1091,6 +1160,7 @@ class _AlarmRecord(BaseModel):
     rule_kind: RuleKind
     detail: str
     item_key: str | None = None
+    direction: MetricDirection | None = None
     value: float | None = None
     baseline: float | None = None
     p_value: float | None = None
@@ -1109,6 +1179,7 @@ class _VerdictRecord(BaseModel):
     baseline: float | None = None
     p_value: float | None = None
     alpha: float | None = None
+    direction: MetricDirection | None = None
     baseline_run_stamps: list[str] = Field(default_factory=list)
     detail: str = ''
 

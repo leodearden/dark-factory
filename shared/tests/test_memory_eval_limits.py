@@ -875,7 +875,12 @@ class TestProportionAndCountRules:
         # 24/30 IS the pooled baseline, so it sits at the mode: p == 1.0 by the
         # identity, not by luck.
         unchanged = Metric(
-            metric_id='canonical-in-top-5', kind='proportion', value=0.8, n=30, denominator=30
+            metric_id='canonical-in-top-5',
+            kind='proportion',
+            value=0.8,
+            n=30,
+            denominator=30,
+            direction='lower_is_worse',
         )
         verdict = evaluate_proportion(unchanged, _baseline(), self.ALPHA, _MIN_SAMPLES)
         assert verdict.status == 'ok'
@@ -965,7 +970,15 @@ def _count_run(value: float, n: int, stamp: str, *, metric_id: str = 'dangling-p
         eval_id='e1-exposure',
         run_stamp=stamp,
         corpus=Corpus(project_id='dark_factory'),
-        metrics=[Metric(metric_id=metric_id, kind='count', value=value, n=n)],
+        metrics=[
+            Metric(
+                metric_id=metric_id,
+                kind='count',
+                value=value,
+                n=n,
+                direction='higher_is_worse',
+            )
+        ],
     )
 
 
@@ -1046,7 +1059,13 @@ class TestCountExposureNormalisation:
         # lam would be 0, under which every non-zero count has p == 0.0 — a
         # guaranteed alarm on no evidence. min_samples is 0 here so the exposure
         # guard is what is actually being tested.
-        nothing = Metric(metric_id='dangling-pointers', kind='count', value=3.0, n=0)
+        nothing = Metric(
+            metric_id='dangling-pointers',
+            kind='count',
+            value=3.0,
+            n=0,
+            direction='higher_is_worse',
+        )
         verdict = evaluate_count(
             nothing, self._window((50.0, 30), (50.0, 30)), self.ALPHA, min_samples=0
         )
@@ -1075,6 +1094,90 @@ class TestCountExposureNormalisation:
         assert verdict.status == 'alarm'
         assert verdict.baseline == 0.0
         assert verdict.p_value == 0.0
+
+
+class TestImprovementIsNotAnAlarm:
+    """M2 fires alarms on REGRESSIONS, and a two-sided test alone cannot tell.
+
+    The exact tests are two-sided because that is the honest way to ask "how
+    improbable is this run under the baseline?" — but on its own that alarms just
+    as loudly when a metric improves dramatically. At the exemplar's own alpha of
+    1/360 both of these clear the bar, and both are the fix lineage (3111/3112/
+    3200) SUCCEEDING. So the alarm needs the metric's declared direction
+    (``Metric.direction``), which rule (a) has effectively always had: a new
+    failure alarms, a fixed item is silently released.
+
+    The move is still REPORTED, as status ``improved`` with its p-value and the
+    bar it cleared — an improbable improvement is worth seeing (it may be a probe
+    that broke rather than a bug that got fixed). It just never wakes anyone.
+    """
+
+    ALPHA = 1 / 360
+
+    def test_a_perfect_proportion_is_reported_not_alarmed(self):
+        # 24/30 -> 30/30 on canonical-in-top-5, where LOWER is worse.
+        assert binomial_two_sided_p(30, 30, 0.8) < self.ALPHA  # surprising...
+
+        perfect = Metric(
+            metric_id='canonical-in-top-5',
+            kind='proportion',
+            value=1.0,
+            n=30,
+            denominator=30,
+            direction='lower_is_worse',
+        )
+        verdict = evaluate_proportion(perfect, _baseline(), self.ALPHA, _MIN_SAMPLES)
+        assert verdict.status == 'improved'  # ...but not a regression
+        assert verdict.alarms == ()
+        # Reported, not swallowed: the numbers are the point of a two-sided test.
+        assert verdict.p_value is not None and verdict.p_value < self.ALPHA
+        assert verdict.direction == 'lower_is_worse'
+        assert 'not an alarm' in verdict.detail
+
+    def test_a_zeroed_count_is_reported_not_alarmed(self):
+        # A dangling-pointer count falling from a baseline of 8 to 0.
+        assert poisson_two_sided_p(0, 8.0) < self.ALPHA  # surprising...
+
+        window = [_count_run(8.0, 30, f'2026090{i + 1}T000000Z') for i in range(3)]
+        fixed = _count_run(0.0, 30, '20260905T000000Z')
+        verdict = evaluate_count(fixed.metrics[0], window, self.ALPHA, _MIN_SAMPLES)
+        assert verdict.status == 'improved'
+        assert verdict.alarms == ()
+        assert verdict.direction == 'higher_is_worse'
+
+    def test_an_improvement_never_reaches_the_published_alarm_feed(self):
+        # The published contract, not just the in-memory verdict: a dashboard
+        # reading `alarms` must not be able to see a repair as an incident.
+        window = [_count_run(8.0, 30, f'2026090{i + 1}T000000Z') for i in range(3)]
+        run = MetricSeries(
+            schema_version=1,
+            eval_id='e1-improved',
+            run_stamp='20260905T000000Z',
+            corpus=Corpus(project_id='dark_factory'),
+            metrics=[*_count_run(0.0, 30, '20260905T000000Z').metrics],
+        )
+        result = evaluate_series(run, window, _config(), None)
+        assert result.alarms == ()
+        assert _verdict_for(result, 'dangling-pointers').status == 'improved'
+
+    def test_the_same_magnitude_of_move_the_harmful_way_still_alarms(self):
+        # The control: direction gates the ALARM, it does not silence the rule.
+        window = [_count_run(8.0, 30, f'2026090{i + 1}T000000Z') for i in range(3)]
+        worse = _count_run(30.0, 30, '20260905T000000Z')
+        verdict = evaluate_count(worse.metrics[0], window, self.ALPHA, _MIN_SAMPLES)
+        assert verdict.status == 'alarm'
+        assert len(verdict.alarms) == 1
+        # The published alarm says WHY the move is bad, structurally and in prose.
+        assert verdict.alarms[0].direction == 'higher_is_worse'
+        assert 'above baseline' in verdict.alarms[0].detail
+
+    def test_a_lower_is_worse_metric_alarms_on_the_other_side(self):
+        # And the mirror: for canonical-in-top-5 the harmful side is DOWN.
+        collapsed = _metric(_series(_REGRESSION_STAMP), 'canonical-in-top-5')
+        verdict = evaluate_proportion(collapsed, _baseline(), self.ALPHA, _MIN_SAMPLES)
+        assert verdict.status == 'alarm'
+        assert verdict.alarms[0].direction == 'lower_is_worse'
+        assert 'below baseline' in verdict.alarms[0].detail
 
 
 class TestRuleKindGuards:
@@ -1148,7 +1251,12 @@ class TestMinSamplesGuard:
         crying wolf here is exactly how an eval gets ignored.
         """
         catastrophic = Metric(
-            metric_id='canonical-in-top-5', kind='proportion', value=0.0, n=6, denominator=6
+            metric_id='canonical-in-top-5',
+            kind='proportion',
+            value=0.0,
+            n=6,
+            denominator=6,
+            direction='lower_is_worse',
         )
         assert binomial_two_sided_p(0, 6, 0.8) < self.ALPHA  # it WOULD alarm
 
@@ -1160,7 +1268,12 @@ class TestMinSamplesGuard:
         # Inconclusive is not opaque: the numbers are computed anyway so a
         # reader can see the trend even though it is not actionable yet.
         catastrophic = Metric(
-            metric_id='canonical-in-top-5', kind='proportion', value=0.0, n=6, denominator=6
+            metric_id='canonical-in-top-5',
+            kind='proportion',
+            value=0.0,
+            n=6,
+            denominator=6,
+            direction='lower_is_worse',
         )
         verdict = evaluate_proportion(catastrophic, _baseline(), self.ALPHA, _MIN_SAMPLES)
         assert verdict.p_value == pytest.approx(6.4e-05, rel=1e-4)
@@ -1187,7 +1300,9 @@ class TestMinSamplesGuard:
 
     def test_a_baseline_missing_this_metric_is_insufficient(self):
         # A newly added metric: the window exists but has never measured it.
-        fresh = Metric(metric_id='brand-new-probe', kind='count', value=99.0, n=30)
+        fresh = Metric(
+            metric_id='brand-new-probe', kind='count', value=99.0, n=30, direction='higher_is_worse'
+        )
         verdict = evaluate_count(fresh, _baseline(), self.ALPHA, _MIN_SAMPLES)
         assert verdict.status == 'insufficient_data'
         assert verdict.alarms == ()
