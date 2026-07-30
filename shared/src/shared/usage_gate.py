@@ -571,8 +571,19 @@ class UsageGate:
         # share a single .credentials.json. pid disambiguates cross-process
         # same-account probes; acct.name disambiguates same-process
         # cross-account probes.
+        #
+        # That per-(account, pid) naming fixed the race but made the dirs
+        # unbounded in /tmp, since nothing reclaimed them once their owner
+        # died (task 3086). They are now covered from both ends:
+        # cleanup_at_exit handles clean exits — including the constructors
+        # that never call shutdown() (orchestrator/evals/runner.py,
+        # fused_memory/reconciliation/harness.py) — and the sweep above
+        # reclaims whatever a SIGKILL left behind, which no hook can.
         self._probe_config_dirs: dict[str, TaskConfigDir] = {
-            acct.name: TaskConfigDir(f'{_PROBE_TASK_ID_PREFIX}{acct.name}-{os.getpid()}')
+            acct.name: TaskConfigDir(
+                f'{_PROBE_TASK_ID_PREFIX}{acct.name}-{os.getpid()}',
+                cleanup_at_exit=True,
+            )
             for acct in self._accounts
         }
         # Back-compat alias: several sibling test suites (test_probe_loop.py,
@@ -582,7 +593,7 @@ class UsageGate:
         # dict entry, so those assertions keep holding.
         self._probe_config_dir = next(
             iter(self._probe_config_dirs.values()), None
-        ) or TaskConfigDir(f'{_PROBE_TASK_ID_PREFIX}{os.getpid()}')
+        ) or TaskConfigDir(f'{_PROBE_TASK_ID_PREFIX}{os.getpid()}', cleanup_at_exit=True)
         self._sighup_handler_installed: bool = False
         self.register_signal_handlers()
 
