@@ -493,6 +493,26 @@ def test_mine_to_saturation_records_max_batches_on_result():
     assert flagless.stop_reason == "exhausted"
 
 
+@pytest.mark.parametrize("bad_cap", [0, -1, -50])
+def test_mine_to_saturation_rejects_a_nonpositive_batch_cap(bad_cap):
+    # A cap of 0 or less cannot be honored: the cap is checked AFTER a batch
+    # is coded, so max_batches=0 would still spend one full coder.code_digests
+    # call and then render "mined 1 batch(es); operator batch cap = 0". For a
+    # flag whose whole contract is "no silent caps", a nonsense value must
+    # fail loud rather than half-apply.
+    live_codebook = _minimal_v2_codebook()
+    source, _ = _never_saturating_source(3)
+    saturation = config_mod.Saturation(dup_rate=0.9, consecutive_batches=2)
+
+    with pytest.raises(ValueError, match="max_batches"):
+        mod.mine_to_saturation(
+            source, live_codebook, project="dark_factory", model="sonnet",
+            config=saturation, invoke=_poison("invoke"), max_batches=bad_cap,
+        )
+
+    assert source.pulled == [], "the guard must fire before any batch is consumed"
+
+
 # ---------------------------------------------------------------------------
 # step-5: RED — compute_matrix() / render_matrix() origin x manifestation
 # ---------------------------------------------------------------------------
@@ -1083,11 +1103,49 @@ def test_render_report_capped_run_names_cap_and_partial_coverage():
     saturation_section = report.split("## Saturation", 1)[1].split("##", 1)[0]
     lowered = saturation_section.lower()
     assert "20" in saturation_section, "sessions actually mined (2 batches x 10) must be stated"
-    assert "2" in saturation_section, "batches mined and the cap value must be stated"
+    # Assert the substantive substring, not a bare "2": the section always
+    # carries "- batches: 2" and digit-bearing per-batch bullets, so a bare
+    # digit check passes even if the cap VALUE stopped being rendered --
+    # exactly the regression this line claims to guard.
+    assert "operator batch cap = 2" in saturation_section
     assert "cap" in lowered, "the operator cap must be named, never applied silently"
     # A capped report must be unreadable as full coverage.
     assert "partial" in lowered
     assert "not mined" in lowered
+
+
+def test_render_report_capped_run_says_the_skipped_sessions_are_not_re_mined():
+    # PARTIAL coverage must not read as "the rest gets picked up next time".
+    # run_census always advances last_census_at and _census_window_dates
+    # anchors the NEXT window there, so the capped-away sessions fall outside
+    # every future window -- the same dead-recovery-path hazard the dry-run
+    # WARNING is written to avoid.
+    report = _render(
+        mining_result=_capped_mining_result(stop_reason="capped", max_batches=2),
+    )
+
+    saturation_section = report.split("## Saturation", 1)[1].split("##", 1)[0]
+    lowered = saturation_section.lower()
+    assert "last_census_at" in lowered, "the re-anchoring mechanism must be named"
+    assert "next census window starts here" in lowered
+    assert "never re-enumerated" in lowered, (
+        "the report must say the capped-away sessions are not swept later"
+    )
+    # ...and must not leave a re-run reading as the recovery path.
+    assert "census-state.json" in lowered, "the one real recovery lever is named"
+
+
+def test_render_report_cap_not_reached_makes_no_re_anchor_claim():
+    # The re-anchor disclosure belongs to the CAPPED branch only: a cap that
+    # was set but never reached mined exactly what an uncapped run would.
+    report = _render(
+        mining_result=_capped_mining_result(stop_reason="saturated", max_batches=99),
+    )
+
+    saturation_section = report.split("## Saturation", 1)[1].split("##", 1)[0]
+    lowered = saturation_section.lower()
+    assert "last_census_at" not in lowered
+    assert "never re-enumerated" not in lowered
 
 
 def test_render_report_cap_set_but_not_reached_is_reported_distinctly():
@@ -1134,10 +1192,33 @@ def test_render_report_verify_cap_states_verified_of_novel_and_deferred():
     assert "pending candidate" in lowered
     assert "deferred" in lowered
     assert "dropped" not in lowered
+    # "a later census picks it up" is CONDITIONAL: this window's sightings are
+    # never re-mined, so a deferred cluster is re-adjudicated only on a
+    # recurrence. Say so, exactly as the batch-cap and dry-run paths do.
+    assert "recurs" in lowered, "the later-census pickup must be stated as conditional"
+    assert "not re-mined" in lowered or "never re-mined" in lowered
 
     # Placement: between Saturation and the matrix.
     assert report.index("## Saturation") < report.index("## Verification")
     assert report.index("## Verification") < report.index("## Origin x Manifestation Matrix")
+
+
+def test_render_report_verify_cap_set_but_not_reached_claims_no_deferral():
+    # Mirror of the batch cap's "not reached" branch. With novel == verified
+    # nothing was deferred and nothing went unverified, so the deferral clause
+    # would be a false statement about this run.
+    report = _render(verify_coverage=mod.VerifyCoverage(novel=3, verified=3, cap=5))
+
+    assert "## Verification" in report
+    section = report.split("## Verification", 1)[1].split("##", 1)[0]
+    lowered = section.lower()
+    assert "verified all 3 novel cluster" in lowered
+    assert "5" in section, "the cap is still named for the operator's record"
+    assert "not reached" in lowered
+    # Nothing was deferred -- the deferral wording must be absent entirely.
+    assert "deferred" not in lowered
+    assert "0 deferred" not in lowered
+    assert "pending candidate" not in lowered
 
 
 def test_render_report_without_verify_coverage_renders_no_verification_section():
@@ -1653,6 +1734,13 @@ def test_run_census_max_batches_caps_mining_and_reports_it(tmp_path):
     assert "operator batch cap = 1" in lowered
     assert "partial" in lowered, "a capped run must never read as full coverage"
     assert "not mined" in lowered
+    # ...and PARTIAL must not read as "the remainder comes next run": this
+    # very run advanced census-state, so the next window starts here.
+    assert "last_census_at" in lowered
+    assert "never re-enumerated" in lowered
+    assert kwargs["census_state_path"].exists(), (
+        "the report's re-anchor claim is only honest because state really advanced"
+    )
 
     # The rest of the pipeline still ran to completion on the mined batch.
     assert outcome.status == "done"
@@ -1767,6 +1855,14 @@ def test_run_census_max_verify_clusters_defers_the_rest_as_pending_candidates(tm
     assert "2 deferred" in lowered
     assert "pending candidate" in lowered
 
+    # (c2) the Cost section must agree with it. verify is ONE call PER CLUSTER
+    # (_build_default_verify_fn), so a hardcoded "verify=1" would render a
+    # report claiming 150 clusters verified at a cost of one call -- and this
+    # line is exactly what an operator reads to check the cap did anything.
+    cost_section = report_text.split("## Cost", 1)[1]
+    assert "verify=1" in cost_section, "one verify call per VERIFIED cluster, capped at 1"
+    assert "verify=3" not in cost_section, "the cap must be visible in the cost line"
+
     # loud, never silent
     assert any("defer" in r.message.lower() for r in caplog.records)
 
@@ -1794,6 +1890,41 @@ def test_run_census_without_verify_cap_passes_every_novel_cluster(tmp_path):
     assert len(fake_verify_fn.calls[0]["clusters"]) == 3, "flagless -> every novel cluster"
     report_text = kwargs["report_path"].read_text(encoding="utf-8")
     assert "## Verification" not in report_text
+    # An uncapped run pays one verify call per cluster; the cost line says 3,
+    # not a hardcoded 1.
+    assert "verify=3" in report_text.split("## Cost", 1)[1]
+
+
+@pytest.mark.parametrize(
+    "bad_kwargs",
+    [
+        {"max_batches": 0},
+        {"max_batches": -1},
+        {"max_verify_clusters": 0},
+        {"max_verify_clusters": -1},
+    ],
+)
+def test_run_census_rejects_a_nonpositive_cost_cap_before_spending_anything(tmp_path, bad_kwargs):
+    # Both caps are public seams (callable from tests and other scripts), so
+    # the guard lives here too, not only at the CLI boundary. It fires BEFORE
+    # preflight_headroom, so a nonsense cap costs zero invoke calls -- and
+    # max_verify_clusters=-1 in particular would otherwise slice
+    # novel_clusters[:-1], silently verifying all but the LAST cluster while
+    # reporting cap=-1 as if it had been honored.
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_poison("invoke"),
+        batch_source=_poison("batch_source"),
+        escalate_fn=_poison("escalate_fn"),
+        **bad_kwargs,
+    )
+
+    with pytest.raises(ValueError, match="max_batches|max_verify_clusters"):
+        mod.run_census(**kwargs)
+
+    assert not kwargs["report_path"].exists()
+    assert not kwargs["codebook_path"].exists()
+    assert not kwargs["census_state_path"].exists()
 
 
 # ---------------------------------------------------------------------------
@@ -2227,6 +2358,51 @@ def test_main_without_cost_control_flags_passes_defaults(tmp_path, monkeypatch):
     assert kwargs["max_batches"] is None
     assert kwargs["max_verify_clusters"] is None
     assert kwargs["dry_run_payloads_path"] is None
+
+
+@pytest.mark.parametrize(
+    "flag,value",
+    [
+        ("--max-batches", "0"),
+        ("--max-batches", "-1"),
+        ("--max-verify-clusters", "0"),
+        ("--max-verify-clusters", "-5"),
+    ],
+)
+def test_main_rejects_a_nonpositive_cost_cap_at_the_cli_boundary(
+    tmp_path, monkeypatch, capsys, flag, value,
+):
+    # A nonsense cap on a flag whose entire purpose is to be an explicit,
+    # legible bound must exit non-zero with a message, not degenerate into a
+    # half-applied cap. argparse raises SystemExit(2) for a type= rejection.
+    _write_legibility_yaml(_default_config_path(tmp_path))
+    monkeypatch.setattr(mod, "run_census", _poison("run_census"))
+    monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
+
+    with pytest.raises(SystemExit) as excinfo:
+        mod.main(["--project-root", str(tmp_path), "--force", flag, value])
+
+    assert excinfo.value.code != 0
+    err = capsys.readouterr().err.lower()
+    assert flag in err, "the rejected flag must be named"
+    assert "1 or greater" in err, "the message must say what a valid cap looks like"
+
+
+def test_main_accepts_a_cap_of_one(tmp_path, monkeypatch):
+    # The boundary itself is valid: 1 is the smallest cap that can be honored.
+    _write_legibility_yaml(_default_config_path(tmp_path))
+    fake_run_census = _make_fake_main_run_census()
+    monkeypatch.setattr(mod, "run_census", fake_run_census)
+    monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
+
+    exit_code = mod.main([
+        "--project-root", str(tmp_path), "--force",
+        "--max-batches", "1", "--max-verify-clusters", "1",
+    ])
+
+    assert exit_code == 0
+    assert fake_run_census.calls[0]["max_batches"] == 1
+    assert fake_run_census.calls[0]["max_verify_clusters"] == 1
 
 
 def test_main_dry_run_summary_line_names_payload_file(tmp_path, monkeypatch, capsys):

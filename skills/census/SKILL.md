@@ -46,8 +46,8 @@ The run mines, verifies, synthesizes, updates the codebook, and files remediatio
 
 Three composable flags bound what one run may spend. Each is optional and defaults to today's unbounded behavior, so omitting them all is exactly the command above.
 
-- **`--max-batches N`** — stop mining after N batches. The report states the cap and that coverage is **partial** (sessions beyond the cap were never mined), and `stop_reason` becomes `capped` rather than `exhausted`.
-- **`--max-verify-clusters N`** — hand the verifier at most N novel clusters, taken in mining order. Verification costs one Sonnet call per cluster, and that is the spend being bounded. The rest still merge into the codebook as `pending` candidates for a later census to adjudicate — **deferred, never dropped**.
+- **`--max-batches N`** — stop mining after N batches (N ≥ 1; omit the flag for no cap — `0` is rejected, not treated as "unbounded"). The report states the cap and that coverage is **partial** (sessions beyond the cap were never mined), and `stop_reason` becomes `capped` rather than `exhausted`. **Partial does not mean "the rest comes next run":** this run still advances `last_census_at`, and the next census window is anchored there, so the capped-away sessions fall outside every future window. Sweeping them means rolling `last_census_at` back in `docs/legibility/census-state.json` first.
+- **`--max-verify-clusters N`** — hand the verifier at most N novel clusters, taken in mining order (N ≥ 1; `0` is rejected). Verification costs one Sonnet call per cluster, and that is the spend being bounded. The rest still merge into the codebook as `pending` candidates — **deferred, never dropped** — but a later census re-adjudicates one only if that confusion **recurs** in a later window; this window's sightings are not re-mined. A one-off deferred by the cap stays `pending` until someone adjudicates it by hand.
 - **`--dry-run-filing`** — write every would-be `submit_task` payload to `plans/confusion-census-<date>-payloads.json` for human review and file **nothing**. Everything else — codebook update, promotions, report, census-state advance — proceeds normally, and *because* those do happen, hand-filing the payload JSON is the only way to land the tasks. An existing payload file is never overwritten: a second run's payloads go to `…-payloads-2.json`.
 
 For an attended **first** census, run with all three:
@@ -59,6 +59,8 @@ cd /home/leo/src/dark-factory && uv run --project shared python scripts/legibili
 ```
 
 Why: a first census cannot rely on saturation to bound spend — against an empty codebook, a batch's `dup_rate` only measures "the miner found nothing to match", so mining runs to source exhaustion, per-cluster verification scales with however many novel clusters that produces, and filing would bulk-load a live task tree in one shot.
+
+What you're trading for that: a bounded first census is a *sample*, not a sweep, and nothing re-sweeps the remainder automatically. If you want full coverage of the first window, either run uncapped, or plan on rolling `last_census_at` back (per the bullets above) and running again.
 
 ## Post-run checklist
 

@@ -196,7 +196,13 @@ def mine_to_saturation(
     ``"saturated"`` (novelty genuinely exhausted -- coverage was
     sufficient regardless of the cap) rather than under-claiming as
     partial. ``max_batches=None`` (the default) is exactly today's
-    behavior: no cap, no extra rendering, unbounded mining.
+    behavior: no cap, no extra rendering, unbounded mining. A cap below 1
+    raises ``ValueError`` rather than degrading silently: because the cap
+    is checked AFTER a batch is coded, ``max_batches=0`` would still spend
+    one full ``coder.code_digests`` call and then render a
+    self-contradictory "mined 1 batch(es); operator batch cap = 0" line --
+    a silently mis-honored cap on a parameter whose whole purpose is to be
+    an explicit, legible bound.
 
     *config* is a ``config.Saturation``-shaped object (``.dup_rate``,
     ``.consecutive_batches`` -- i.e. a project's
@@ -205,6 +211,15 @@ def mine_to_saturation(
     id (Sonnet miner routing per the ratified static policy -- this
     function does not read ``config.Models`` itself).
     """
+    if max_batches is not None and max_batches < 1:
+        raise ValueError(
+            f"max_batches must be >= 1 when set, got {max_batches!r} -- a cap of "
+            "0 or less cannot be honored (the cap is checked after a batch is "
+            "coded, so it would still spend one full coder.code_digests call) "
+            "and would render a self-contradictory coverage line; omit it "
+            "entirely for unbounded mining"
+        )
+
     result = MiningResult(max_batches=max_batches)
     consecutive_saturated = 0
 
@@ -608,9 +623,21 @@ class VerifyCoverage:
     remainder is DEFERRED, not dropped: those clusters still merge into
     the codebook as ``pending`` candidates via the untouched
     ``codebook.apply_coding_record`` path (which consumes raw mining
-    records, not verified clusters), so a later census picks them up
-    exactly as designed. ``None`` in place of this record means no verify
-    cap was used and no ``## Verification`` section is rendered."""
+    records, not verified clusters), so ``_find_pending_candidate_id`` can
+    still find them.
+
+    That pickup is CONDITIONAL, not automatic, and the report says so:
+    pending candidates are absent from ``coder.build_codebook_index``
+    (entries only), so a recurrence does re-emerge as a novel cluster and
+    gets promoted against the pending id -- but the sightings that produced
+    the deferred cluster in THIS window are never re-mined, because
+    ``advance_census_state`` re-anchors the next window at this run's
+    ``last_census_at``. A deferred cluster is therefore re-adjudicated only
+    if the same confusion RECURS; a one-off deferred by the cap sits pending
+    until a human adjudicates it.
+
+    ``None`` in place of this record means no verify cap was used and no
+    ``## Verification`` section is rendered."""
 
     novel: int
     verified: int
@@ -685,6 +712,17 @@ def render_report(
                 "not run to saturation: sessions beyond the cap were NOT mined, so this "
                 "census is PARTIAL coverage, not a full sweep."
             )
+            # PARTIAL is not the same as "the rest comes later" -- say which
+            # one this is. run_census always calls advance_census_state, and
+            # _census_window_dates anchors the NEXT window at last_census_at,
+            # so the capped-away sessions fall outside every future window.
+            lines.append(
+                "- NOT PICKED UP LATER: this run still advances last_census_at, so the "
+                "next census window starts here -- the capped-away sessions fall outside "
+                "it and are never re-enumerated. Sweeping them means rolling "
+                "last_census_at back in docs/legibility/census-state.json before the "
+                "next run; a plain re-run will not reach them."
+            )
         else:
             lines.append(
                 f"- operator batch cap: {mining_result.max_batches} batch(es) "
@@ -702,12 +740,30 @@ def render_report(
         lines.append("")
         lines.append("## Verification")
         lines.append("")
-        lines.append(
-            f"- verified {verify_coverage.verified} of {verify_coverage.novel} novel "
-            f"clusters (operator verify cap: {verify_coverage.cap}); {deferred} deferred "
-            "as pending candidates -- merged into the codebook by this run but NOT "
-            "verified; adjudication deferred to a later census."
-        )
+        if deferred > 0:
+            lines.append(
+                f"- verified {verify_coverage.verified} of {verify_coverage.novel} novel "
+                f"clusters (operator verify cap: {verify_coverage.cap}); {deferred} deferred "
+                "as pending candidates -- merged into the codebook by this run but NOT "
+                "verified; adjudication deferred to a later census."
+            )
+            # Mirrors the batch-cap disclosure above: "a later census" is
+            # conditional, not automatic. This window's sightings are not
+            # re-mined (last_census_at re-anchors), so a deferred cluster is
+            # re-adjudicated only when the same confusion shows up again.
+            lines.append(
+                "- a deferred candidate is re-adjudicated only if the same confusion "
+                "RECURS in a later window: this run advances last_census_at, so these "
+                "sightings are never re-mined. A one-off deferred by the cap stays "
+                "pending until it is adjudicated by hand."
+            )
+        else:
+            # A cap that was SET BUT NOT REACHED must not emit the deferral
+            # clause -- nothing was deferred and nothing went unverified.
+            lines.append(
+                f"- verified all {verify_coverage.novel} novel cluster(s); operator "
+                f"verify cap: {verify_coverage.cap} (not reached)."
+            )
 
     lines.append("")
     lines.append("## Origin x Manifestation Matrix")
@@ -962,7 +1018,16 @@ def run_census(
     PARTIAL coverage and never pretends otherwise: the report states the
     cap and says so in as many words, and ``CensusOutcome.stop_reason``
     is ``"capped"`` -- distinct from the ``"exhausted"`` a source that
-    genuinely ran dry produces.
+    genuinely ran dry produces. PARTIAL here does NOT mean "the rest is
+    picked up next time": this run still calls ``advance_census_state``,
+    and ``_census_window_dates`` anchors the next window at
+    ``last_census_at``, so the capped-away sessions fall outside every
+    future window and are never re-enumerated. Sweeping them means rolling
+    ``last_census_at`` back in ``docs/legibility/census-state.json`` first;
+    the report bullet says exactly that, so a bounded run cannot be read as
+    a deferred-but-recoverable one. A cap below 1 raises ``ValueError``
+    (see ``mine_to_saturation``) rather than degrading into a half-applied
+    cap.
 
     *max_verify_clusters* bounds the per-cluster verification spend
     (``--max-verify-clusters``) to the first N novel clusters in mining
@@ -972,12 +1037,22 @@ def run_census(
     would need a signal the census does not have pre-verification). The
     deferred remainder is NOT dropped: the codebook merge below consumes
     the raw ``mining_result.records``, not the verified clusters, so a
-    deferred cluster still lands as a ``pending`` candidate and
-    ``_find_pending_candidate_id`` will find it on a later census exactly
-    as designed. What a deferred cluster does forgo is this run's
-    adjudication: the matrix and the synthesis necessarily cover only the
-    VERIFIED subset, and the report's ``## Verification`` section states
-    that split rather than letting a bounded run read as a complete one.
+    deferred cluster still lands as a ``pending`` candidate that
+    ``_find_pending_candidate_id`` can resolve later. That later pickup is
+    CONDITIONAL, though, and the report says so: this run advances
+    ``last_census_at``, so this window's sightings are never re-mined, and
+    a deferred cluster is re-adjudicated only if the same confusion RECURS
+    in a later window (pending candidates are absent from
+    ``coder.build_codebook_index``, so a recurrence does re-emerge as novel
+    and promote against the pending id). A one-off deferred by the cap sits
+    pending until a human adjudicates it. What a deferred cluster
+    unconditionally forgoes is this run's adjudication: the matrix and the
+    synthesis necessarily cover only the VERIFIED subset, and the report's
+    ``## Verification`` section states that split rather than letting a
+    bounded run read as a complete one. A cap below 1 raises ``ValueError``
+    up front -- a negative cap would slice from the END of the cluster list
+    rather than bounding it, which is precisely the silently mis-honored cap
+    this flag exists to make impossible.
 
     *dry_run_payloads_path* switches filing to review mode
     (``--dry-run-filing``): every would-be ``submit_task`` payload is
@@ -1006,6 +1081,23 @@ def run_census(
     not the requested path -- is what the report, the commit paths and
     ``CensusOutcome`` name.
     """
+    # Validated BEFORE the headroom probe spends anything: a nonsense cap on a
+    # flag whose entire purpose is to be an explicit, legible bound must be
+    # rejected outright, never half-applied. Left unchecked,
+    # max_verify_clusters=-1 would slice novel_clusters[:-1] -- silently
+    # verifying all but the LAST cluster and reporting cap=-1 as if honored.
+    if max_batches is not None and max_batches < 1:
+        raise ValueError(
+            f"max_batches must be >= 1 when set, got {max_batches!r} -- omit it "
+            "entirely for unbounded mining"
+        )
+    if max_verify_clusters is not None and max_verify_clusters < 1:
+        raise ValueError(
+            f"max_verify_clusters must be >= 1 when set, got {max_verify_clusters!r} "
+            "-- a negative cap would slice novel_clusters[:N] from the END rather "
+            "than bounding it; omit it entirely to verify every novel cluster"
+        )
+
     headroom = preflight_headroom(invoke, model=config.models.trickle)
     if not headroom.ok:
         reason = headroom.reason or "headroom preflight failed"
@@ -1044,8 +1136,10 @@ def run_census(
             logger.warning(
                 "census: operator verify cap (--max-verify-clusters=%d) reached -- "
                 "%d of %d novel cluster(s) DEFERRED, not verified this run; they still "
-                "merge into the codebook as pending candidates for a later census "
-                "(deferred, never dropped)",
+                "merge into the codebook as pending candidates (deferred, never "
+                "dropped), but a later census re-adjudicates them only if the same "
+                "confusion RECURS -- this run advances last_census_at, so these "
+                "sightings are not re-mined",
                 max_verify_clusters, deferred_count, len(novel_clusters),
             )
 
@@ -1181,10 +1275,13 @@ def run_census(
             len(storm_batch_indices), storm_batch_indices,
         )
 
+    # verify is ONE call PER CLUSTER (_build_default_verify_fn), not one call
+    # total -- and the per-cluster count is precisely what an operator using
+    # --max-verify-clusters reads this line to check.
     cost_note = (
         f"invoke calls: {config.models.census_miner} miner="
         f"{sum(s.total for s in mining_result.batch_stats)}, "
-        f"{config.models.census_verify} verify=1, "
+        f"{config.models.census_verify} verify={len(clusters_to_verify)}, "
         f"{config.models.census_synthesis} synthesis=1, "
         f"{config.models.trickle} headroom-probe=1"
     )
@@ -1556,6 +1653,31 @@ def _parse_cli_date(value: str) -> date:
     return date.fromisoformat(value)
 
 
+def _positive_int(value: str) -> int:
+    """``argparse`` ``type=`` for the operator cost caps: an int >= 1.
+
+    A cap of 0 or a negative value is rejected at the CLI boundary (exit
+    2, with a message) rather than half-applied downstream: ``--max-batches
+    0`` would still code one full batch (the cap is checked after a batch
+    is coded) and then render a self-contradictory coverage line, and
+    ``--max-verify-clusters -1`` would slice ``novel_clusters[:-1]``,
+    verifying all but the LAST cluster while reporting ``cap=-1`` as if
+    honored. Both are exactly the silent, mis-honored cap these flags exist
+    to make impossible -- so a nonsense value fails loud. Omitting the flag,
+    not passing 0, is how you ask for no cap."""
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"expected an integer, got {value!r}"
+        ) from None
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(
+            f"must be 1 or greater, got {parsed} -- omit the flag entirely for no cap"
+        )
+    return parsed
+
+
 def _build_stage_invokes(cfg):
     """Build the three per-stage ``invoke(prompt, model)`` seams, each
     carrying its OWN claude-CLI subprocess timeout from ``cfg.timeouts``
@@ -1601,9 +1723,12 @@ def main(argv: list[str] | None = None) -> int:
     Three OPERATOR COST-CONTROL flags bound what a single run may spend,
     each defaulting to today's unbounded behavior so a flagless
     invocation -- notably the nightly trickle's, which passes no extra
-    argv -- is unchanged: ``--max-batches N`` bounds mining,
-    ``--max-verify-clusters N`` bounds per-cluster verification, and
-    ``--dry-run-filing`` writes every would-be task payload to
+    argv -- is unchanged: ``--max-batches N`` bounds mining (the
+    capped-away sessions are NOT re-mined by a later census -- this run
+    still advances ``last_census_at``, so the next window starts here),
+    ``--max-verify-clusters N`` bounds per-cluster verification (a deferred
+    cluster is re-adjudicated only if that confusion RECURS in a later
+    window), and ``--dry-run-filing`` writes every would-be task payload to
     ``plans/confusion-census-<date>-payloads.json`` (alongside the dated
     report) for human review instead of filing it -- those payloads must
     then be filed by hand, since this run still advances the codebook and
@@ -1611,8 +1736,11 @@ def main(argv: list[str] | None = None) -> int:
     and reusable, not first-census-only, though an attended FIRST census
     against an empty codebook is where all three matter most: saturation
     cannot bound that run, since every batch's dup_rate then only
-    measures "the miner found nothing to match". None of the three lets a
-    bounded run masquerade as a complete one -- see ``run_census`` and
+    measures "the miner found nothing to match". Both numeric caps take
+    ``type=_positive_int``, so a nonsense value (0 or negative) exits 2 at
+    the CLI boundary instead of being half-applied. None of the three lets
+    a bounded run masquerade as a complete one, or as one whose remainder
+    is automatically picked up later -- see ``run_census`` and
     ``render_report``.
 
     Returns non-zero only on a genuine fail-loud error (a config-load
@@ -1644,20 +1772,22 @@ def main(argv: list[str] | None = None) -> int:
         help="Census date YYYY-MM-DD (default: today UTC).",
     )
     parser.add_argument(
-        "--max-batches", type=int, default=None,
-        help="Operator cost control: stop mining after N batches. Omit for "
-        "today's behavior -- mine until novelty saturates or the source runs "
-        "out. A capped run is deliberately PARTIAL coverage (sessions beyond "
-        "the cap are never mined) and says so in the report; its stop_reason "
-        "is 'capped', not 'exhausted'.",
+        "--max-batches", type=_positive_int, default=None,
+        help="Operator cost control: stop mining after N batches (N >= 1; omit "
+        "for no cap). Omit for today's behavior -- mine until novelty saturates "
+        "or the source runs out. A capped run is deliberately PARTIAL coverage "
+        "and says so in the report; its stop_reason is 'capped', not "
+        "'exhausted'. The capped-away sessions are NOT re-mined later: this run "
+        "still advances last_census_at, so the next census window starts here.",
     )
     parser.add_argument(
-        "--max-verify-clusters", type=int, default=None,
+        "--max-verify-clusters", type=_positive_int, default=None,
         help="Operator cost control: verify at most N novel clusters (one "
-        "Sonnet call each), taken in mining order. Omit to verify every "
-        "novel cluster. The deferred remainder still merges into the "
-        "codebook as pending candidates for a later census -- deferred, "
-        "never dropped.",
+        "Sonnet call each), taken in mining order (N >= 1; omit for no cap). "
+        "Omit to verify every novel cluster. The deferred remainder still "
+        "merges into the codebook as pending candidates -- deferred, never "
+        "dropped -- but is re-adjudicated only if the same confusion RECURS in "
+        "a later window; this window's sightings are not re-mined.",
     )
     parser.add_argument(
         "--dry-run-filing", action="store_true",
