@@ -51,6 +51,7 @@ import difflib
 import json
 import logging
 import sys
+from collections.abc import Iterable, Iterator
 from datetime import datetime
 from typing import Any
 
@@ -73,6 +74,63 @@ def _sort_groups_deterministically(groups: list[list[dict]]) -> list[list[dict]]
     sorted_groups = [sorted(g, key=lambda m: str(m.get('id', ''))) for g in groups]
     sorted_groups.sort(key=lambda g: str(g[0].get('id', '')))
     return sorted_groups
+
+
+def cluster_memories_by_pairs(
+    memories: list[dict],
+    pairs: Iterable[tuple[int, int]],
+) -> list[list[dict]]:
+    """Transitive closure over candidate *pairs* → deterministic memory groups.
+
+    The shared clustering core. Candidate GENERATION is pluggable — the
+    lexical ``difflib`` scan in ``find_near_duplicate_memory_groups`` and the
+    ANN neighbour scan both emit ``(i, j)`` index pairs into this one
+    function — but the closure itself has a single implementation. Two
+    union-finds that must agree is a defect waiting to happen; this is the
+    one site.
+
+    Args:
+        memories: Memory dicts. Indices in *pairs* address this list.
+        pairs: Any iterable (list, generator, ...) of ``(i, j)`` index pairs
+            deemed near-duplicates by some candidate generator. Duplicated
+            and mirrored pairs are harmless — union is idempotent.
+
+    Returns:
+        List of groups (each a list of >= 2 memories) formed by transitive
+        closure of *pairs*; singletons are dropped. Groups are sorted by the
+        minimum id within the group so output is deterministic. Members are
+        the caller's own dict objects (passed through by identity, not
+        copied). Does not mutate *memories*.
+    """
+    n = len(memories)
+    if n < 2:
+        return []
+
+    # Union-find (path-compressed) over memory indices.
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(x: int, y: int) -> None:
+        rx, ry = find(x), find(y)
+        if rx != ry:
+            parent[rx] = ry
+
+    for i, j in pairs:
+        union(i, j)
+
+    # Materialise groups: collect memory lists per root, drop singletons.
+    groups: dict[int, list[dict]] = {}
+    for i in range(n):
+        root = find(i)
+        groups.setdefault(root, []).append(memories[i])
+
+    result = [g for g in groups.values() if len(g) >= 2]
+    return _sort_groups_deterministically(result)
 
 
 def find_near_duplicate_memory_groups(
@@ -106,21 +164,23 @@ def find_near_duplicate_memory_groups(
         return []
 
     normalized = [(m.get('content') or '').strip().lower() for m in memories]
+    return cluster_memories_by_pairs(
+        memories, _lexical_pairs(normalized, threshold),
+    )
 
-    # Union-find (path-compressed) over memory indices.
-    parent = list(range(n))
 
-    def find(x: int) -> int:
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
+def _lexical_pairs(
+    normalized: list[str],
+    threshold: float,
+) -> Iterator[tuple[int, int]]:
+    """Yield index pairs whose normalised contents are >= *threshold* similar.
 
-    def union(x: int, y: int) -> None:
-        rx, ry = find(x), find(y)
-        if rx != ry:
-            parent[rx] = ry
-
+    The lexical candidate GENERATOR, split out from the clustering core it
+    feeds (``cluster_memories_by_pairs``). Behaviour is unchanged from when
+    this loop was inline: same O(n^2) scan, same ``quick_ratio`` pre-filter,
+    same empty-content guard.
+    """
+    n = len(normalized)
     for i in range(n):
         # Empty/blank content never clusters and is never deleted (safe
         # degradation). Guard here because SequenceMatcher(None, '', '').ratio()
@@ -145,16 +205,7 @@ def find_near_duplicate_memory_groups(
             if matcher.real_quick_ratio() < threshold or matcher.quick_ratio() < threshold:
                 continue
             if matcher.ratio() >= threshold:
-                union(i, j)
-
-    # Materialise groups: collect memory lists per root, drop singletons.
-    groups: dict[int, list[dict]] = {}
-    for i in range(n):
-        root = find(i)
-        groups.setdefault(root, []).append(memories[i])
-
-    result = [g for g in groups.values() if len(g) >= 2]
-    return _sort_groups_deterministically(result)
+                yield (i, j)
 
 
 def _created_at_sort_key(created_at: Any) -> tuple[int, float]:
