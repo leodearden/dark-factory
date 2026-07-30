@@ -56,11 +56,11 @@ lockfile or venv-resolution problem is a job that silently stops running.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
 import sys
-import urllib.error
 import urllib.request
 import uuid
 from dataclasses import dataclass
@@ -76,6 +76,12 @@ AGENT_ID = 'reify-redispatch-consumer'
 
 DEFAULT_SERVER = 'http://127.0.0.1:8002/mcp'
 DEFAULT_TIMEOUT = 30.0
+
+# The requests this consumer exists to drain are reify's, emitted by reify's
+# sweep under reify's own data/ dir. Both are overridable on the CLI so the
+# wrapper (and an operator running a --dry-run by hand) can point elsewhere.
+DEFAULT_PROJECT_ROOT = '/home/leo/src/reify'
+DEFAULT_REQUESTS_DIR = '/home/leo/src/reify/data/redispatch-requests'
 
 # The FIXED class -> action mapping, from the reify sweep's three classifiers
 # (_classify_gate_closure, _classify_merge_verify_red,
@@ -611,3 +617,183 @@ def apply_request(client, req: Request, project_root: str) -> bool:
         log(f'task {req.task_id}: {req.action} FAILED: {type(exc).__name__}: {exc}')
         return False
     return True
+
+
+# ── the outer loop ──────────────────────────────────────────────────────────
+
+# Blast-radius cap. The measured hazard (reify, 2026-07-26) was ten live
+# `in-progress` rows with every dependency satisfied. Three independent guards
+# stand between that and a mass re-dispatch -- the sweep's own L1 heartbeat /
+# claimant check, L4 confining classes A and C to `blocked` rows, and this
+# consumer's compare-and-swap -- but a cap turns any residual gap from a
+# store-wide event into a handful of transitions an operator can read in the
+# journal and undo. The remainder is DEFERRED and reported, never silently
+# dropped: the files stay on disk and the next run picks them up.
+DEFAULT_MAX_WRITES = 5
+
+ARCHIVE_DIRNAME = 'consumed'
+
+
+@dataclass
+class Summary:
+    """What one run did. Every request lands in exactly one bucket."""
+
+    applied: int = 0
+    skipped: int = 0
+    failed: int = 0
+    deferred: int = 0
+    planned: int = 0     # --dry-run only: writes that WOULD have been made
+
+    def line(self) -> str:
+        return (f'SUMMARY applied={self.applied} skipped={self.skipped} '
+                f'failed={self.failed} deferred={self.deferred} '
+                f'planned={self.planned}')
+
+
+def archive_request(req: Request) -> bool:
+    """Move an APPLIED request into the ``consumed/`` subdirectory.
+
+    A subdirectory is retraction-safe by construction: the sweep's retraction
+    loop globs ``"$REQUESTS_DIR"/redispatch-*.json`` at the TOP LEVEL only, and
+    its contract states outright that "a consumer's own bookkeeping in the same
+    directory is left alone". Archiving rather than deleting keeps an audit
+    trail of what was actually actioned, which the snapshot directory itself
+    cannot provide.
+    """
+    dest_dir = os.path.join(os.path.dirname(req.path), ARCHIVE_DIRNAME)
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+        os.replace(req.path, os.path.join(dest_dir, os.path.basename(req.path)))
+    except OSError as exc:
+        # The write LANDED; only the bookkeeping failed. Say so loudly -- the
+        # next run will re-read this file, and its guard will then skip it as
+        # already-applied rather than transitioning the row twice.
+        log(f'task {req.task_id}: applied, but archiving failed: {exc} — the '
+            f'file stays put and next run will skip it as already-applied')
+        return False
+    return True
+
+
+def consume(requests_dir, client, *, project_root: str,
+            max_writes: int = DEFAULT_MAX_WRITES, dry_run: bool = False) -> Summary:
+    """Drain *requests_dir*. Never raises; every outcome is counted and reported.
+
+    A missing or empty directory is a clean zero-request report, not an error:
+    on a first run the sweep may not have created it yet, and "the sweep found
+    nothing to emit" is the normal steady state.
+    """
+    summary = Summary()
+    paths = discover_requests(requests_dir)
+    if not paths:
+        log(f'no requests in {requests_dir}')
+        log(summary.line())
+        return summary
+
+    for path in paths:
+        req = load_request(path)
+        if req.skip_reason is not None:
+            summary.skipped += 1
+            log(f'{os.path.basename(path)}: SKIP (invalid) — {req.skip_reason}')
+            continue
+
+        # The cap bounds WRITES, not requests looked at -- checked here, after
+        # validation but before the guard read, so a directory full of
+        # already-applied no-ops can never starve the requests that still need
+        # work.
+        if not dry_run and summary.applied >= max_writes:
+            summary.deferred += 1
+            log(f'task {req.task_id}: DEFERRED — --max-writes={max_writes} reached; '
+                f'the file stays put for the next run')
+            continue
+
+        _, skip = confirm_request(client, req, project_root)
+        if skip is not None:
+            summary.skipped += 1
+            log(f'task {req.task_id} ({req.cls}): SKIP — {skip}')
+            continue
+
+        if dry_run:
+            summary.planned += 1
+            log(f'task {req.task_id} ({req.cls}): WOULD {req.action} '
+                f'-> {ACTION_TARGET_STATUS[req.action]} [dry-run]')
+            continue
+
+        if apply_request(client, req, project_root):
+            summary.applied += 1
+            log(f'task {req.task_id} ({req.cls}): {req.action} applied '
+                f'-> {ACTION_TARGET_STATUS[req.action]}')
+            archive_request(req)
+        else:
+            summary.failed += 1
+            # Left in place deliberately: the retry is then immediate and local
+            # on the next run, rather than waiting on the next sweep to
+            # re-confirm and re-emit the same file.
+
+    log(summary.line())
+    return summary
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog='consume_redispatch_requests.py',
+        description=(
+            "Apply reify's closure-staleness re-dispatch requests through the "
+            'fused-memory MCP server. Consumes the files the sweep emitted; '
+            'never re-derives its predicates.'),
+    )
+    parser.add_argument(
+        '--requests-dir', default=DEFAULT_REQUESTS_DIR,
+        help=f'Directory the sweep emitted into (default: {DEFAULT_REQUESTS_DIR}).')
+    parser.add_argument(
+        '--project-root', default=DEFAULT_PROJECT_ROOT,
+        help=f'Project root the requests target (default: {DEFAULT_PROJECT_ROOT}).')
+    parser.add_argument(
+        '--server', default=DEFAULT_SERVER,
+        help=f'fused-memory MCP endpoint (default: {DEFAULT_SERVER}).')
+    parser.add_argument(
+        '--max-writes', type=int, default=DEFAULT_MAX_WRITES,
+        help=(f'Blast-radius cap: stop after this many APPLIED writes and defer '
+              f'the rest to the next run (default: {DEFAULT_MAX_WRITES}).'))
+    parser.add_argument(
+        '--dry-run', action='store_true',
+        help='Run the guard and report the planned writes; change nothing.')
+    return parser
+
+
+def main(argv=None, *, client_factory=None) -> int:
+    """Entry point. Exits 0 on every VALID invocation.
+
+    Only a usage error is non-zero. That mirrors the sweep's advisory posture
+    and, concretely, the lesson written into
+    ``scripts/fused-memory-flag-marker-sweep.sh``: a recurring `oneshot` that
+    can fail enters systemd `failed` state and STAYS there, so one unactionable
+    request would silently stop the whole nightly job. Per-request failures are
+    reported on stderr and counted in the summary line instead.
+    """
+    args = build_parser().parse_args(argv)
+    if args.max_writes < 1:
+        # Usage error, not a run outcome: a cap of 0 would do nothing every
+        # night while reporting a clean run.
+        build_parser().error('--max-writes must be >= 1')
+
+    factory = client_factory or (lambda server: McpClient(server))
+    try:
+        client = factory(args.server)
+        if hasattr(client, '__enter__'):
+            with client as connected:
+                consume(args.requests_dir, connected,
+                        project_root=args.project_root,
+                        max_writes=args.max_writes, dry_run=args.dry_run)
+        else:
+            consume(args.requests_dir, client, project_root=args.project_root,
+                    max_writes=args.max_writes, dry_run=args.dry_run)
+    except Exception as exc:
+        # An outage reaching the server is a failed NIGHT, not a failed job:
+        # the requests are still on disk and the next run retries them.
+        log(f'RUN FAILED to reach {args.server}: {type(exc).__name__}: {exc} — '
+            f'requests left in place for the next run')
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
