@@ -112,6 +112,29 @@ def _get_merge_worker(harness: Any | None) -> Any | None:
     return getattr(harness, '_merge_worker', None)
 
 
+def _get_terminal_retention(harness: Any | None) -> Any | None:
+    """Return the harness-mounted TerminalOutcomeRetention ring, or None.
+
+    Centralises the ``getattr(harness, '_terminal_retention', None)`` probe so
+    the private attribute name lives in exactly one place, shared by the
+    merge_request write side (records dispatch outcomes and coalesce
+    aliases) and the merge_status / merge_cancel read sides
+    (``_durable_terminal_state``'s Tier 2, ``retire_cancelled_merge_request``).
+    Returns None — rather than raising — when *harness* is None (standalone
+    mode / unit tests that wire no harness) or the attribute is absent, so a
+    future rename degrades gracefully.
+
+    No production code path currently constructs a TerminalOutcomeRetention
+    and assigns it to ``harness._terminal_retention`` (task 3149 tracks
+    deciding whether to wire it or delete the ring); until then this always
+    resolves to None outside tests, and every call site keeps behaving
+    exactly as it did before this accessor existed.
+    """
+    if harness is None:
+        return None
+    return getattr(harness, '_terminal_retention', None)
+
+
 def _require_matching_project_root(harness: Any, project_root: str) -> str | None:
     """Return an error message if *project_root* doesn't match this server's project.
 
@@ -1546,11 +1569,14 @@ def create_server(
         # between req.snapshot_tip and the in-flight entry's snapshot_tip.  When
         # git_ops_for_scan is None (standalone / tests without orchestrator) the
         # classifier is also None and the recency check is a no-op (back-compat).
-        # retention: write-side counterpart of the Tier-2 reads at :2215
-        # (merge_status) and :2555 (merge_cancel) — populates the ring via
-        # enqueue_merge_request's _on_finalized callback (dispatch arm) and
-        # registers a record_alias entry for coalesced ids.  None when no
-        # harness is wired (standalone escalation), preserving current behaviour.
+        # retention: write-side counterpart of the Tier-2 reads in
+        # _durable_terminal_state (merge_status) and the
+        # retire_cancelled_merge_request call in merge_cancel — populates the
+        # ring via enqueue_merge_request's _on_finalized callback (dispatch
+        # arm) and registers a record_alias entry for coalesced ids.  Always
+        # None today (no production path yet assigns
+        # harness._terminal_retention — see task 3149), so this call keeps
+        # behaving exactly as before until that ring is actually mounted.
         dispatch = await coalesce_or_enqueue_merge_request(
             merge_queue,
             merge_req,
@@ -1559,7 +1585,7 @@ def create_server(
             git_ops=git_ops_for_scan,
             live_snapshot=live_snapshot,
             classifier_git_ops=git_ops_for_scan,
-            retention=getattr(harness, '_terminal_retention', None),
+            retention=_get_terminal_retention(harness),
         )
 
         def _nonblocking_state_response(
@@ -2218,7 +2244,7 @@ def create_server(
         # (e.g. coalesced ids that never get their own terminal record).
         # finished_at is stored as epoch float; normalise to ISO-8601 so the
         # same logical merge returns the same type regardless of which tier serves it.
-        ring = getattr(harness, '_terminal_retention', None) if harness is not None else None
+        ring = _get_terminal_retention(harness)
         if ring is not None:
             if request_id is not None:
                 rec = ring.get(request_id)
@@ -2558,7 +2584,7 @@ def create_server(
             branch=rec.branch,
             task_id=rec.task_id,
             registry=_registry,
-            retention=getattr(harness, '_terminal_retention', None),
+            retention=_get_terminal_retention(harness),
             git_ops=getattr(harness, 'git_ops', None),
             event_store=event_store,
         )
