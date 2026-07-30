@@ -751,3 +751,169 @@ class TestAuditReadsThroughTheLib:
         assert 'lib_lane_state.sh not found next to warm-lane-audit.sh' in proc.stderr, (
             f'the fail-loud message must name the missing sibling; {proc.stderr!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# render_protect_glob: PROTECTED_PREFIXES, rendered for a bash consumer
+# ---------------------------------------------------------------------------
+
+class TestRenderProtectGlob:
+    """The pure renderer that turns the band registry into a sweep's glob.
+
+    ``PROTECTED_PREFIXES`` cannot be text-scraped from bash: five of its keys
+    are computed constants and one more is config-driven, so any sed/awk parse
+    would silently UNDER-render — and the failure mode of under-rendering is "a
+    live managed worktree is no longer protected from the reaper".  A real
+    import is the only faithful read, and this is what it renders.
+    """
+
+    def test_a_prefix_key_renders_as_a_glob_and_an_exact_name_verbatim(
+        self,
+    ) -> None:
+        """The two documented key semantics, and nothing invented on top.
+
+        ``git_ops.py``'s registry comment defines them: a key ending in ``-`` is
+        a PREFIX (matched with ``str.startswith``); a key NOT ending in ``-`` is
+        an EXACT worktree name (matched with ``==``).  Rendering an exact name
+        as ``<name>*`` would silently widen the protected set — and rendering a
+        prefix verbatim would silently narrow it, which is the direction that
+        gets a live worktree reclaimed.
+        """
+        from orchestrator.git_ops import render_protect_glob
+
+        rendered = render_protect_glob(
+            {'_merge-': 'merge-queue', '_merge-verify': 'persistent-merge-verify'},
+        )
+        assert rendered == '_merge-*,_merge-verify', rendered
+
+    def test_owned_bands_are_excluded(self) -> None:
+        from orchestrator.git_ops import render_protect_glob
+
+        rendered = render_protect_glob(
+            {'_lane-': 'warm-lane-pool', '_merge-': 'merge-queue'},
+            owned=('_lane-',),
+        )
+        assert rendered == '_merge-*', rendered
+
+    def test_the_pool_bands_are_excluded_under_the_owned_pool_constant(
+        self,
+    ) -> None:
+        """LOAD-BEARING, not cosmetic.
+
+        A naive render would hand ``warm-lane-gc.sh`` ``_lane-*,_spec-*`` as
+        PROTECTED.  gc would then skip every pool lane in both passes, reclaim
+        would stop entirely, and the pool would accrete straight back to the
+        2026-07-10 ENOSPC outage the sweep exists to prevent.
+        """
+        from orchestrator.git_ops import (
+            PROTECT_GLOB_OWNED_POOL_BANDS,
+            render_protect_glob,
+        )
+
+        rendered = render_protect_glob(owned=PROTECT_GLOB_OWNED_POOL_BANDS)
+        bands = rendered.split(',')
+        assert '_lane-*' not in bands, rendered
+        assert '_spec-*' not in bands, rendered
+        assert PROTECT_GLOB_OWNED_POOL_BANDS == frozenset({'_lane-', '_spec-'}), (
+            f'the owned-pool band set changed: {PROTECT_GLOB_OWNED_POOL_BANDS!r}'
+        )
+
+    def test_output_is_comma_joined_in_registry_order_and_stable(self) -> None:
+        from orchestrator.git_ops import PROTECTED_PREFIXES, render_protect_glob
+
+        first = render_protect_glob()
+        assert first == render_protect_glob(), 'render is not deterministic'
+        assert ' ' not in first, f'the glob must carry no spaces: {first!r}'
+
+        # Registry order, not sorted order — a bash consumer splits on comma and
+        # the order is what an operator diffs against the previous default.
+        registry_order = [
+            key if not key.endswith('-') else f'{key}*' for key in PROTECTED_PREFIXES
+        ]
+        rendered = first.split(',')
+        assert rendered[: len(registry_order)] == registry_order, (
+            f'rendered order {rendered!r} does not follow PROTECTED_PREFIXES '
+            f'order {registry_order!r}'
+        )
+
+    def test_no_mapping_renders_every_registry_key_plus_the_default_iact_band(
+        self,
+    ) -> None:
+        """``None`` means the DEFAULT band map, iact band included.
+
+        A module constant alone cannot capture the authoritative map — the iact
+        band is config-shaped — so the renderer's default has to come from
+        ``default_protected_prefixes()`` rather than ``PROTECTED_PREFIXES``.
+        """
+        from orchestrator.git_ops import (
+            PROTECTED_PREFIXES,
+            default_protected_prefixes,
+            render_protect_glob,
+        )
+
+        rendered = set(render_protect_glob().split(','))
+        for key in PROTECTED_PREFIXES:
+            expected = f'{key}*' if key.endswith('-') else key
+            assert expected in rendered, f'{key!r} is missing from {rendered!r}'
+        assert '_iact-*' in rendered, (
+            f'the default interactive band is missing from {rendered!r}'
+        )
+        assert default_protected_prefixes()['_iact-'] == 'interactive'
+        assert set(default_protected_prefixes()) == set(PROTECTED_PREFIXES) | {
+            '_iact-',
+        }
+
+    def test_default_protected_prefixes_does_not_mutate_the_registry(self) -> None:
+        from orchestrator.git_ops import PROTECTED_PREFIXES, default_protected_prefixes
+
+        before = dict(PROTECTED_PREFIXES)
+        merged = default_protected_prefixes()
+        merged['_scribble-'] = 'nope'
+        assert dict(PROTECTED_PREFIXES) == before, (
+            'default_protected_prefixes() returned a view of the module registry'
+        )
+
+
+@pytest.fixture
+def git_ops(tmp_path: Path):
+    """A bare ``GitOps`` — ``protected_prefixes()`` reads only ``self.config``.
+
+    Deliberately local rather than reusing ``test_git_ops.py``'s fixture, which
+    drags in a real initialized repo this contract does not need.
+    """
+    from orchestrator.config import GitConfig
+    from orchestrator.git_ops import GitOps
+
+    return GitOps(GitConfig(), tmp_path)
+
+
+class TestProtectedPrefixesInstanceViewIsUnchanged:
+    """``GitOps.protected_prefixes()`` keeps its per-instance contract.
+
+    It is refactored onto ``default_protected_prefixes()`` so the static-
+    registry + iact-band merge exists in ONE place, but the observable answer —
+    including a per-deployment ``iact_prefix`` override winning — must not move.
+    """
+
+    def test_returns_the_registry_merged_with_this_instances_iact_band(
+        self, git_ops,
+    ) -> None:
+        from orchestrator.git_ops import PROTECTED_PREFIXES
+
+        prefixes = git_ops.protected_prefixes()
+        for key, owner in PROTECTED_PREFIXES.items():
+            assert prefixes[key] == owner, key
+        assert prefixes[git_ops.config.iact_prefix] == 'interactive'
+
+    def test_an_overridden_iact_prefix_still_wins(self, git_ops) -> None:
+        from orchestrator.git_ops import default_protected_prefixes
+
+        git_ops.config.iact_prefix = '_custom-iact-'
+        prefixes = git_ops.protected_prefixes()
+        assert prefixes['_custom-iact-'] == 'interactive', prefixes
+        assert '_iact-' not in prefixes or prefixes.get('_iact-') != 'interactive', (
+            'the DEFAULT iact band leaked into an instance that overrode it — '
+            f'{prefixes!r}'
+        )
+        # The default map is unaffected by the instance override.
+        assert default_protected_prefixes()['_iact-'] == 'interactive'
