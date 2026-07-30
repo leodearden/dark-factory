@@ -57,6 +57,10 @@ build_metric_series = _mod.build_metric_series
 split_plan_by_category = _mod.split_plan_by_category
 _EVAL_ID = _mod._EVAL_ID
 _GLOBAL_SCOPE = _mod._GLOBAL_SCOPE
+emit_metrics_artifact = _mod.emit_metrics_artifact
+details_artifact_path = _mod.details_artifact_path
+_build_parser = _mod._build_parser
+_run = _mod._run
 
 
 # ---------------------------------------------------------------------------
@@ -2296,3 +2300,389 @@ class TestBuildMetricSeries:
         )
         reparsed = parse_metric_series(json.loads(serialize_metric_series(series)))
         assert reparsed == series
+
+
+# ===========================================================================
+# M1 artifact emission + CLI back-compat (task 3210)
+# ===========================================================================
+
+_STAMP = '20260730T112233Z'
+
+
+def _series(project_id: str = 'dark_factory', stamp: str = _STAMP):
+    records = {_PK: [_dated('a', 'x', None), _dated('b', 'y', None)]}
+    plans = {_PK: _plan_slice([{'member_ids': ['a', 'b'], 'category': _PK}])}
+    metrics, _details = compute_cluster_metrics(records, plans, {})
+    return build_metric_series(
+        project_id, metrics, corpus_counts={_PK: 2}, run_stamp=stamp,
+    )
+
+
+class TestEmitMetricsArtifact:
+    """The producer side of the M1 boundary: three files, one stamp."""
+
+    def test_writes_metrics_report_and_details(self, tmp_path):
+        metrics_path, report_path, det_path = emit_metrics_artifact(
+            _series(), {'categories': {}}, tmp_path, _STAMP,
+        )
+
+        assert metrics_path == tmp_path / _EVAL_ID / f'metrics-{_STAMP}.json'
+        assert report_path == tmp_path / _EVAL_ID / f'report-{_STAMP}.txt'
+        assert det_path == tmp_path / _EVAL_ID / f'details-{_STAMP}.json'
+        assert metrics_path.is_file()
+        assert report_path.is_file()
+        assert det_path.is_file()
+
+    def test_written_metrics_round_trip_through_the_shared_loader(self, tmp_path):
+        """The artifact is read by a process that never imports this script."""
+        from shared.memory_eval_metrics import load_metric_series  # noqa: PLC0415
+
+        series = _series()
+        metrics_path, _report, _details = emit_metrics_artifact(
+            series, {'categories': {}}, tmp_path, _STAMP,
+        )
+        assert load_metric_series(metrics_path) == series
+
+    def test_details_payload_round_trips_as_json(self, tmp_path):
+        details = {'categories': {_PK: {'cluster_size_histogram': {'2': 1}}}}
+        _m, _r, det_path = emit_metrics_artifact(_series(), details, tmp_path, _STAMP)
+        assert json.loads(det_path.read_text()) == details
+
+    def test_details_path_helper_matches_what_is_written(self, tmp_path):
+        """The name stamped onto a Metric.details_path must be the file's name."""
+        _m, _r, det_path = emit_metrics_artifact(
+            _series(), {'categories': {}}, tmp_path, _STAMP,
+        )
+        assert det_path.name == details_artifact_path(_STAMP)
+
+    def test_run_stamp_env_var_pins_the_filenames(self, tmp_path, monkeypatch):
+        from shared.memory_eval_metrics import RUN_STAMP_ENV_VAR, run_stamp  # noqa: PLC0415
+
+        monkeypatch.setenv(RUN_STAMP_ENV_VAR, '20260101T000000Z')
+        stamp = run_stamp()
+        metrics_path, _r, det_path = emit_metrics_artifact(
+            _series(stamp=stamp), {'categories': {}}, tmp_path, stamp,
+        )
+
+        assert metrics_path.name == 'metrics-20260101T000000Z.json'
+        assert det_path.name == 'details-20260101T000000Z.json'
+
+    def test_malformed_metric_leaves_no_directory_and_no_partial_artifact(self, tmp_path):
+        """Validate BEFORE mkdir: a bad run must not leave a half-artifact.
+
+        A stray directory containing only details-<STAMP>.json would look to
+        the limits evaluator like a run whose metrics file went missing —
+        strictly worse than the run never having written anything.
+        """
+        from shared.memory_eval_metrics import MetricSchemaError  # noqa: PLC0415
+
+        malformed = {
+            'schema_version': 1,
+            'eval_id': _EVAL_ID,
+            'run_stamp': _STAMP,
+            'corpus': {'project_id': 'dark_factory', 'counts': {}},
+            'metrics': [{'metric_id': 'x.all', 'kind': 'count', 'value': -1.0, 'n': 1,
+                         'direction': 'higher_is_worse'}],
+        }
+        with pytest.raises(MetricSchemaError):
+            emit_metrics_artifact(malformed, {'categories': {}}, tmp_path, _STAMP)
+
+        assert not (tmp_path / _EVAL_ID).exists(), 'no directory may survive a rejected series'
+        assert list(tmp_path.iterdir()) == []
+
+
+class TestCliBackCompat:
+    """Task 3136 schedules this script; today's invocation must keep working."""
+
+    def test_bare_project_id_still_parses_with_every_new_flag_defaulted(self):
+        args = _build_parser().parse_args(['--project-id', 'dark_factory'])
+
+        assert args.project_id == 'dark_factory'
+        assert args.apply is False, 'dry run is still the default'
+        assert args.threshold == 0.85
+        assert args.scan_limit == 5000
+        assert args.config is None
+        # Every flag added by this task is optional and defaulted.
+        assert list(args.categories) == list(_ALL_CATEGORIES)
+        assert args.ann_threshold is None, 'defaults to the CALIBRATED value, not a literal'
+        assert isinstance(args.ann_top_k, int) and args.ann_top_k > 0
+        assert args.eval_id == _EVAL_ID
+        assert args.no_metrics is False
+        assert args.metrics_root is not None
+
+    def test_apply_flag_still_parses(self):
+        args = _build_parser().parse_args(['--project-id', 'dark_factory', '--apply'])
+        assert args.apply is True
+
+    def test_metrics_root_defaults_under_the_scripts_package_not_the_cwd(self):
+        """A scheduled run's cwd is not guaranteed; the artifact root must be."""
+        args = _build_parser().parse_args(['--project-id', 'dark_factory'])
+        assert Path(args.metrics_root).is_absolute()
+        assert Path(args.metrics_root).parts[-2:] == ('data', 'memory-evals')
+
+    def test_new_flags_accept_overrides(self):
+        args = _build_parser().parse_args([
+            '--project-id', 'p', '--categories', _PK, _OS,
+            '--ann-top-k', '3', '--ann-threshold', '0.91',
+            '--metrics-root', '/tmp/x', '--eval-id', 'other', '--no-metrics',
+        ])
+        assert list(args.categories) == [_PK, _OS]
+        assert args.ann_top_k == 3
+        assert args.ann_threshold == 0.91
+        assert args.metrics_root == '/tmp/x'
+        assert args.eval_id == 'other'
+        assert args.no_metrics is True
+
+
+# --- _run wiring doubles -----------------------------------------------------
+
+def _fake_config(t_high: float | None = 0.9):
+    return types.SimpleNamespace(
+        write_triage=types.SimpleNamespace(t_high=t_high),
+        mem0=types.SimpleNamespace(collection_prefix='mem0'),
+    )
+
+
+class _FakeQdrant:
+    def __init__(self):
+        self.calls = []
+
+    async def query_points(self, **kwargs):
+        self.calls.append(kwargs)
+        return types.SimpleNamespace(points=[])
+
+
+class _FakeMem0:
+    def __init__(self, raw_by_category: dict[str, list[dict]], qdrant: _FakeQdrant):
+        self._raw = raw_by_category
+        self._qdrant = qdrant
+        self.scroll_calls = []
+
+    async def scroll_by_metadata(self, scope, filters, limit=1000, *, with_vectors=False):
+        self.scroll_calls.append({'filters': filters, 'limit': limit,
+                                  'with_vectors': with_vectors})
+        return list(self._raw.get(filters.get('category'), []))
+
+    async def _get_async_qdrant(self):
+        return self._qdrant
+
+
+class _FakeMemoryService:
+    """Stand-in for MemoryService with the surface _run actually touches."""
+
+    instances: list = []
+
+    def __init__(self, config):
+        self.config = config
+        self.mem0 = _FakeMem0(type(self).raw_by_category, _FakeQdrant())
+        self.deleted: list = []
+        self.closed = False
+        type(self).instances.append(self)
+
+    async def initialize(self):
+        return None
+
+    async def close(self):
+        self.closed = True
+
+    async def delete_memory(self, memory_id, store=None, project_id=None):
+        self.deleted.append(memory_id)
+
+
+def _install_run_doubles(monkeypatch, raw_by_category, *, t_high=0.9):
+    import fused_memory.config.schema as schema_mod  # noqa: PLC0415
+    import fused_memory.services.memory_service as service_mod  # noqa: PLC0415
+
+    _FakeMemoryService.instances = []
+    _FakeMemoryService.raw_by_category = raw_by_category
+    monkeypatch.setattr(schema_mod, 'FusedMemoryConfig', lambda: _fake_config(t_high))
+    monkeypatch.setattr(service_mod, 'MemoryService', _FakeMemoryService)
+    return _FakeMemoryService
+
+
+def _raw(id: str, content: str, created_at: str = '2026-01-01T00:00:00+00:00',
+         category: str = _PK, extra: dict | None = None) -> dict:
+    return {
+        'id': id,
+        'created_at': created_at,
+        'metadata': {'data': content, 'category': category, **(extra or {})},
+        'vector': [0.1, 0.2],
+    }
+
+
+@pytest.mark.asyncio
+class TestRunApplyGuards:
+    """--apply never fires against a scan that cannot be trusted."""
+
+    async def _invoke(self, monkeypatch, raw, argv, tmp_path):
+        _install_run_doubles(monkeypatch, raw)
+        args = _build_parser().parse_args(
+            [*argv, '--metrics-root', str(tmp_path)],
+        )
+        return await _run(args), _FakeMemoryService.instances[-1]
+
+    async def test_dry_run_is_the_default_and_deletes_nothing(self, monkeypatch, tmp_path):
+        raw = {_PK: [_raw('m1', _VENV_GOTCHA_A), _raw('m2', _VENV_GOTCHA_B)]}
+        rc, service = await self._invoke(
+            monkeypatch, raw, ['--project-id', 'p', '--threshold', '0.75'], tmp_path,
+        )
+        assert rc == 0
+        assert service.deleted == []
+
+    async def test_apply_refuses_on_an_empty_scan(self, monkeypatch, tmp_path):
+        rc, service = await self._invoke(
+            monkeypatch, {}, ['--project-id', 'p', '--apply'], tmp_path,
+        )
+        assert rc == 1, 'an empty scan must never reach deletions'
+        assert service.deleted == []
+
+    async def test_apply_refuses_on_a_truncated_category_scan(self, monkeypatch, tmp_path):
+        """Truncation on ONE category still refuses the whole apply.
+
+        A truncated scan means the survivor may be sitting outside the window,
+        so 'delete the losers' can delete the last copy.
+        """
+        raw = {_PK: [_raw('m1', _VENV_GOTCHA_A), _raw('m2', _VENV_GOTCHA_B)]}
+        rc, service = await self._invoke(
+            monkeypatch, raw,
+            ['--project-id', 'p', '--apply', '--scan-limit', '2', '--threshold', '0.75'],
+            tmp_path,
+        )
+        assert rc == 1
+        assert service.deleted == []
+
+    async def test_apply_deletes_the_losers_of_a_real_cluster(self, monkeypatch, tmp_path):
+        raw = {_PK: [
+            _raw('m1', _VENV_GOTCHA_A, '2026-01-01T00:00:00+00:00'),
+            _raw('m2', _VENV_GOTCHA_B, '2026-01-02T00:00:00+00:00'),
+        ]}
+        rc, service = await self._invoke(
+            monkeypatch, raw, ['--project-id', 'p', '--apply', '--threshold', '0.75'],
+            tmp_path,
+        )
+        assert rc == 0
+        assert service.deleted == ['m2'], 'the oldest survives'
+
+    async def test_topic_carved_out_cluster_is_never_deleted_under_apply(
+        self, monkeypatch, tmp_path,
+    ):
+        """3136's Option-C carve-out survives all the way to the delete call."""
+        raw = {_PK: [
+            _raw('m1', _VENV_GOTCHA_A, '2026-01-01T00:00:00+00:00',
+                 extra={'topic': 'venv'}),
+            _raw('m2', _VENV_GOTCHA_B, '2026-01-02T00:00:00+00:00',
+                 extra={'topic': 'venv'}),
+        ]}
+        rc, service = await self._invoke(
+            monkeypatch, raw, ['--project-id', 'p', '--apply', '--threshold', '0.75'],
+            tmp_path,
+        )
+        assert rc == 1, 'nothing actionable remains, so the empty-plan guard holds'
+        assert service.deleted == []
+
+
+@pytest.mark.asyncio
+class TestRunWiring:
+    """The wiring _run performs, asserted where a silent regression would hide."""
+
+    async def _parse(self, tmp_path, *argv):
+        return _build_parser().parse_args(
+            ['--project-id', 'p', '--metrics-root', str(tmp_path), *argv],
+        )
+
+    async def test_all_three_categories_are_scrolled_with_vectors(
+        self, monkeypatch, tmp_path,
+    ):
+        _install_run_doubles(monkeypatch, {_PK: [_raw('m1', 'x')]})
+        await _run(await self._parse(tmp_path))
+        calls = _FakeMemoryService.instances[-1].mem0.scroll_calls
+
+        assert [c['filters']['category'] for c in calls] == list(_ALL_CATEGORIES)
+        assert all(c['with_vectors'] is True for c in calls), (
+            'ANN candidate generation needs the stored vectors'
+        )
+
+    async def test_threshold_tunes_the_lexical_path_only(self, monkeypatch, tmp_path):
+        """--threshold and the ANN cutoff are separate knobs with separate homes."""
+        _install_run_doubles(monkeypatch, {_PK: [_raw('m1', 'x')]}, t_high=0.9)
+        captured = {}
+        real = _mod.build_sweep_plan
+
+        def _spy(memories, threshold=0.85, **kwargs):
+            captured.update({'threshold': threshold, **kwargs})
+            return real(memories, threshold, **kwargs)
+
+        monkeypatch.setattr(_mod, 'build_sweep_plan', _spy)
+        await _run(await self._parse(tmp_path, '--threshold', '0.99'))
+
+        assert captured['threshold'] == 0.99
+        assert captured['ann_threshold'] == 0.9, 'the ANN cutoff came from the calibration'
+
+    async def test_ann_threshold_override_reaches_the_query(self, monkeypatch, tmp_path):
+        _install_run_doubles(monkeypatch, {_PK: [_raw('m1', 'x')]}, t_high=0.9)
+        await _run(await self._parse(tmp_path, '--ann-threshold', '0.77'))
+        qdrant = _FakeMemoryService.instances[-1].mem0._qdrant
+
+        assert qdrant.calls, 'a record with a vector must be queried'
+        assert qdrant.calls[0]['score_threshold'] == 0.77
+
+    async def test_uncalibrated_config_disables_ann_but_still_sweeps(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        """No cutoff: skip the ANN queries, count it, and keep the lexical path."""
+        _install_run_doubles(
+            monkeypatch,
+            {_PK: [_raw('m1', _VENV_GOTCHA_A), _raw('m2', _VENV_GOTCHA_B)]},
+            t_high=None,
+        )
+        rc = await _run(await self._parse(tmp_path, '--threshold', '0.75'))
+        plan = json.loads(capsys.readouterr().out)
+
+        assert rc == 0
+        assert _FakeMemoryService.instances[-1].mem0._qdrant.calls == [], (
+            'no cutoff means no ANN query — never a guessed one'
+        )
+        assert plan['ann_threshold'] is None
+        assert plan['ann_disclosure']['ann_disabled_uncalibrated'] == 1
+        assert plan['clusters_total'] == 1, 'the lexical path still ran'
+
+    async def test_plan_json_is_printed_to_stdout(self, monkeypatch, tmp_path, capsys):
+        """3136 consumes stdout; the report contract is unchanged."""
+        _install_run_doubles(monkeypatch, {_PK: [_raw('m1', 'x')]})
+        await _run(await self._parse(tmp_path))
+        plan = json.loads(capsys.readouterr().out)
+
+        assert {'clusters_total', 'near_duplicate_groups', 'delete_candidates'} <= set(plan)
+
+    async def test_metrics_artifact_is_emitted_under_metrics_root(
+        self, monkeypatch, tmp_path,
+    ):
+        from shared.memory_eval_metrics import (  # noqa: PLC0415
+            RUN_STAMP_ENV_VAR,
+            load_metric_series,
+        )
+
+        monkeypatch.setenv(RUN_STAMP_ENV_VAR, _STAMP)
+        _install_run_doubles(monkeypatch, {_PK: [_raw('m1', 'x')]})
+        await _run(await self._parse(tmp_path))
+
+        series = load_metric_series(tmp_path / _EVAL_ID / f'metrics-{_STAMP}.json')
+        assert series.corpus.project_id == 'p'
+        assert series.corpus.counts == {_PK: 1, _PN: 0, _OS: 0}
+        assert (tmp_path / _EVAL_ID / f'details-{_STAMP}.json').is_file()
+
+        ids = {m.metric_id for m in series.metrics}
+        assert f'near_duplicate_clusters.{_PK}' in ids
+        for key in (*_ANN_DISCLOSURE_KEYS, 'ann_query_errors', 'ann_disabled_uncalibrated'):
+            assert f'{key}.{_GLOBAL_SCOPE}' in ids, f'{key} must be disclosed'
+        assert f'scan_truncated.{_PK}' in ids
+
+    async def test_no_metrics_writes_nothing(self, monkeypatch, tmp_path):
+        _install_run_doubles(monkeypatch, {_PK: [_raw('m1', 'x')]})
+        await _run(await self._parse(tmp_path, '--no-metrics'))
+        assert list(tmp_path.iterdir()) == []
+
+    async def test_memory_service_is_always_closed(self, monkeypatch, tmp_path):
+        _install_run_doubles(monkeypatch, {_PK: [_raw('m1', 'x')]})
+        await _run(await self._parse(tmp_path))
+        assert _FakeMemoryService.instances[-1].closed is True
