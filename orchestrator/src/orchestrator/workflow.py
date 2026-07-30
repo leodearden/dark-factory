@@ -6514,7 +6514,17 @@ class TaskWorkflow:
                 })
             return WorkflowOutcome.DONE
 
-        while self.artifacts.get_pending_steps():
+        # The `pending` probe above IS this loop's first "is there work?"
+        # check: nothing between it and here mutates the plan, so re-reading
+        # would be a redundant plan.json read that also DOUBLE-COUNTS the
+        # check for anything observing get_pending_steps() — which silently
+        # cost the first implementer iteration in the progress-resume
+        # accounting suite, whose stub answers a canned sequence one call at a
+        # time. Short-circuit the first evaluation onto the result already in
+        # hand; every loop-back after that re-reads exactly as before.
+        reuse_entry_probe = True
+        while reuse_entry_probe or self.artifacts.get_pending_steps():
+            reuse_entry_probe = False
             if (
                 self.metrics.execute_iterations - self.metrics.progress_resume_total
                 >= self.config.max_execute_iterations
