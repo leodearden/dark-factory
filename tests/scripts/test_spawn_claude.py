@@ -305,6 +305,97 @@ def _run_spawn(
 
 
 # ===========================================================================
+# task-3062: hermetic environment scrub for CLAUDE_SPAWN_* ambient leakage
+# ===========================================================================
+# Every test in this file that builds a child env from `dict(os.environ)`
+# inherits whatever CLAUDE_SPAWN_* vars happen to be set in the *runner's*
+# own environment -- real inside any spawned session (every L2
+# escalation-watcher /unblock session runs this suite before submitting a
+# merge) but invisible on the merge worker's systemd unit, which starts
+# clean. That asymmetry already produced two point-fixes in `_base_env`
+# (ESCALATION_TERMINAL_CMD, CLAUDE_CODE_FORCE_SESSION_PERSISTENCE) plus a
+# latent, still-passing false-negative below (test_no_emulator_found_yields_126
+# silently takes the tmux branch under an ambient CLAUDE_SPAWN_BACKEND=tmux).
+# The tests here pin the fix deterministically, by setting the leaking
+# variable themselves rather than depending on the runner's ambient state.
+
+
+def test_base_env_scrubs_every_claude_spawn_var(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`_base_env` must drop every CLAUDE_SPAWN_*-prefixed var from the
+    inherited environment -- not just the vars this file happens to name
+    today.
+
+    Sets the four vars spawn-claude.sh itself splices into a spawned
+    session (SESSION_ID, PARENT_ID, WM_TITLE, RESULT_FILE), the three the
+    orchestrator adds on top (ROLE, PROJECT, TASK_ID -- see task 2940's
+    extension to
+    orchestrator/tests/test_session_hooks.py::_clear_claude_spawn_env), and
+    a synthetic CLAUDE_SPAWN_FUTURE_KNOB that exists nowhere in the
+    codebase. The synthetic one is the whole point: it is the only
+    assertion that can distinguish a prefix-generic scrub from a fourth
+    named enumeration.
+    """
+    for var in (
+        "CLAUDE_SPAWN_SESSION_ID",
+        "CLAUDE_SPAWN_PARENT_ID",
+        "CLAUDE_SPAWN_WM_TITLE",
+        "CLAUDE_SPAWN_RESULT_FILE",
+        "CLAUDE_SPAWN_ROLE",
+        "CLAUDE_SPAWN_PROJECT",
+        "CLAUDE_SPAWN_TASK_ID",
+        "CLAUDE_SPAWN_FUTURE_KNOB",
+    ):
+        monkeypatch.setenv(var, "leak")
+    monkeypatch.setenv("ESCALATION_TERMINAL_CMD", "leak")
+    monkeypatch.setenv("CLAUDE_CODE_FORCE_SESSION_PERSISTENCE", "leak")
+
+    bin_dir = _make_bin_dir(tmp_path)
+    env = _base_env(bin_dir, "xterm")
+
+    leaked = [k for k in env if k.startswith("CLAUDE_SPAWN_")]
+    assert leaked == [], f"expected no CLAUDE_SPAWN_* vars to survive, found {leaked}"
+    assert "ESCALATION_TERMINAL_CMD" not in env
+    assert "CLAUDE_CODE_FORCE_SESSION_PERSISTENCE" not in env
+
+    # The scrub must not be over-broad: the positive setup still survives.
+    assert env["CLAUDE_TERMINAL_CMD"] == "xterm"
+    assert env["SPAWN_LAUNCH_GRACE_SECS"] == "2"
+    assert "CLAUDE_FLEET_ROOT" in env
+    assert "CLAUDE_PROJECTS_DIR" in env
+    assert env["PATH"].startswith(str(bin_dir) + ":")
+
+
+def test_spawn_omits_wm_title_export_when_ambient_wm_title_leaks(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end reproduction of the reported false-red, made deterministic.
+
+    The sibling test below (test_spawn_omits_wm_title_export_when_title_empty)
+    only fails when the *runner's* own environment happens to carry
+    CLAUDE_SPAWN_WM_TITLE -- true inside a spawned session but never true on
+    the merge worker's clean systemd unit. This test sets the leak itself
+    via monkeypatch, so it fails on the merge worker too.
+    """
+    monkeypatch.setenv("CLAUDE_SPAWN_WM_TITLE", "ambient-leak-sentinel")
+
+    bin_dir = _make_bin_dir(tmp_path)
+    capture_file = tmp_path / "captured_env.txt"
+    _write_fake_claude_capturing_env(bin_dir, capture_file)
+    _write_foreground_terminal(bin_dir, "xterm")
+    env = _base_env(bin_dir, "xterm")
+
+    result = _run_spawn(env, tmp_path, title="")
+    assert result.returncode == 0, f"stderr: {result.stderr.decode()}"
+
+    captured = _parse_captured_env(capture_file)
+    assert captured.get("CLAUDE_SPAWN_WM_TITLE", "") == "", (
+        f"expected no wm-title export for an empty title, got {captured!r}"
+    )
+
+
+# ===========================================================================
 # Step-1 tests: exit-code propagation
 # ===========================================================================
 # RED today for exit-3: gnome-terminal/xterm/kitty use ``|| exit 127``;
