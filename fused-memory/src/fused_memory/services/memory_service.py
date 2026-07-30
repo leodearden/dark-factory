@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any, cast
 from graphiti_core.nodes import EpisodeType
 
 from fused_memory.backends.graphiti_client import GraphitiBackend
-from fused_memory.backends.mem0_client import Mem0Backend
+from fused_memory.backends.mem0_client import Mem0Backend, split_managed_metadata
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.enums import (
     GRAPHITI_PRIMARY,
@@ -3626,17 +3626,77 @@ class MemoryService:
         # keys alike. Copied so the arms below can compute a delta against it
         # without mutating the value the read leg returned.
         existing_payload: dict[str, Any] = dict(existing.get('metadata') or {})
+        _managed, existing_custom = split_managed_metadata(existing_payload)
 
-        # Arm dispatch (steps 15-20): content amend, metadata-only fast paths,
-        # combined fold, and the post-write storm-counter observation.
-        raise NotImplementedError(
-            'update_memory arm dispatch is not implemented yet '
-            f'(memory_id={memory_id!r}, write_op_id={write_op_id}, '
-            f'params={sorted(params)}, existing_payload_keys='
-            f'{sorted(existing_payload)}, agent_id={agent_id!r}, '
-            f'session_id={session_id!r}, causation_id={causation_id!r}, '
-            f'source={_source!r})'
-        )
+        scope = Scope(project_id=project_id)
+
+        if content is not None:
+            # Content-amend arm. Forward ONLY the custom subset as metadata=:
+            # mem0's _update_memory starts a FRESH payload from
+            # deepcopy(metadata) and re-attaches just its own nine keys, so
+            # anything custom that is not forwarded here is destroyed. This is
+            # the read-modify-forward dance tag_cgl_eta_rehome_scope.apply_tags
+            # already had to solve; the mem0-owned keys are deliberately NOT
+            # forwarded because mem0 restores or recomputes each of them itself.
+            result_data = await self._journaled_backend_call(
+                write_op_id=write_op_id,
+                causation_id=causation_id,
+                backend='mem0',
+                operation='update_memory',
+                payload=params,
+                coro=self.mem0.update(
+                    memory_id, content, scope, metadata=existing_custom,
+                ),
+            )
+            result: dict[str, Any] = {
+                'status': 'updated',
+                'store': 'mem0',
+                'id': memory_id,
+                'content_amended': True,
+                'metadata_patched': False,
+            }
+            if isinstance(result_data, dict):
+                result.update(result_data)
+                # Re-stamp the envelope keys the backend response must not be
+                # able to overwrite — 'id' above all, since the whole contract
+                # is that the caller can read identity stability off it.
+                result['status'] = 'updated'
+                result['store'] = 'mem0'
+                result['id'] = memory_id
+        else:
+            # Metadata-only fast paths (steps 17-18) and the combined fold
+            # (steps 19-20).
+            raise NotImplementedError(
+                'update_memory metadata-only arm dispatch is not implemented yet '
+                f'(memory_id={memory_id!r}, metadata_patch={metadata_patch!r}, '
+                f'metadata_delete_keys={metadata_delete_keys!r}, '
+                f'existing_custom_keys={sorted(existing_custom)})'
+            )
+
+        if self._write_journal:
+            await self._write_journal.log_write_op(
+                write_op_id=write_op_id,
+                causation_id=causation_id,
+                source=_source,
+                operation='update_memory',
+                project_id=project_id,
+                agent_id=agent_id,
+                session_id=session_id,
+                params=params,
+                result_summary=result,
+                success=True,
+            )
+
+        await self._emit_event(ReconciliationEvent(
+            id=str(uuid_mod.uuid4()),
+            type=EventType.memory_updated,
+            source=EventSource.agent,
+            project_id=project_id,
+            timestamp=datetime.now(UTC),
+            payload={'memory_id': memory_id, 'store': 'mem0'},
+        ))
+
+        return result
 
     async def update_edge(
         self,
