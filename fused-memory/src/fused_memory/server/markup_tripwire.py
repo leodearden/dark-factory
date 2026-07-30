@@ -50,6 +50,9 @@ straight through.
 
 from __future__ import annotations
 
+import time
+from collections import deque
+from collections.abc import Callable
 from typing import Any
 
 # Raw MCP envelope fragments that must never appear inside a write payload.
@@ -81,6 +84,25 @@ _MARKUP_HINT = (
     '3083 owns the root cause and the retroactive corpus sweep, so report a '
     'recurrence there. If the markup is quoted deliberately (e.g. documenting '
     "the leak itself), override with metadata={'" + MARKUP_OVERRIDE_KEY + "': True}."
+)
+
+# Storm thresholds are plain module constants rather than FusedMemoryConfig
+# fields, following the _PLACEHOLDER_DROP_STORM_* precedent (harness.py:200-215):
+# this leaf owns both the predicate and its only consumer, so a config field
+# would add hot-reload tier surface and a schema migration for no operator gain.
+_MARKUP_STORM_THRESHOLD = 3
+_MARKUP_STORM_WINDOW_SECONDS = 3600.0
+
+# Fired only on a BURST. The wording matters: the alarm-worthy conclusion is
+# that the upstream serialization leak is ACTIVE, not that this tripwire has
+# started misfiring — an operator who reads it the second way would disable the
+# containment and let specimens back into the corpus.
+_MARKUP_STORM_HINT = (
+    'Multiple MCP-envelope-markup writes were rejected in a short window: the '
+    'upstream serialization leak is ACTIVE right now. This is not a sign the '
+    'tripwire is misfiring — do NOT disable it. DF task 3083 owns the root '
+    'cause and the retroactive corpus sweep; attach the offending agent_id, '
+    'field and matched_pattern there.'
 )
 
 
@@ -162,3 +184,75 @@ def build_markup_block(
     if storm is not None:
         block['storm'] = storm
     return block
+
+
+class MarkupStormCounter:
+    """Rolling-window burst detector over markup rejections (INV-4).
+
+    One bounced write is routine; a BURST means the upstream serialization leak
+    is actively running, which is the condition worth escalating rather than
+    merely logging. Reproduces the established storm-counter body from
+    ``reconciliation/harness.py::_record_resume_failure`` and
+    ``reconciliation/bulk_reset_guard.py`` — append, prune to the window, count,
+    compare to the threshold, then rate-limit to one fire per window — using
+    bulk_reset_guard's guard-side injectable-clock convention
+    (``time_provider`` stored as ``self._now``) so the 3600s window can be
+    tested by advancing a fake clock instead of sleeping.
+
+    State is PROCESS-LOCAL and resets on restart, like every other in-process
+    storm counter in this codebase: the counter exists to catch a live burst, not
+    to keep durable statistics. It is also per-instance, and ``server/tools.py``
+    instantiates one per ``create_mcp_server`` call rather than as a module
+    global, so no state bleeds between servers (or between tests).
+
+    Not thread-safe by construction; the MCP tool handlers that call it run on a
+    single event loop and ``record`` never awaits.
+    """
+
+    def __init__(
+        self,
+        threshold: int = _MARKUP_STORM_THRESHOLD,
+        window_seconds: float = _MARKUP_STORM_WINDOW_SECONDS,
+        time_provider: Callable[[], float] = time.time,
+    ) -> None:
+        self._threshold = threshold
+        self._window_seconds = window_seconds
+        self._now = time_provider
+        self._events: deque[float] = deque()
+        self._last_fire_ts: float | None = None
+
+    def record(self) -> dict[str, Any] | None:
+        """Record one rejection; return a storm summary iff a burst just fired.
+
+        Returns ``None`` when the count within the window is below the threshold,
+        AND when the threshold is met but a previous fire is still inside the
+        window (the rate limit — without it, a leak emitting hundreds of writes
+        would escalate hundreds of times for one incident).
+
+        Otherwise stamps the rate-limit timestamp and returns a JSON-serializable
+        summary with ``count``, ``threshold``, ``window_seconds`` and ``hint``.
+        """
+        now = self._now()
+
+        # Append, then prune. The window is half-open: an event aged exactly
+        # window_seconds is already out.
+        self._events.append(now)
+        cutoff = now - self._window_seconds
+        while self._events and self._events[0] <= cutoff:
+            self._events.popleft()
+
+        count = len(self._events)
+        if count < self._threshold:
+            return None
+
+        # Threshold crossed — apply the per-window rate limit.
+        if self._last_fire_ts is not None and (now - self._last_fire_ts) < self._window_seconds:
+            return None
+
+        self._last_fire_ts = now
+        return {
+            'count': count,
+            'threshold': self._threshold,
+            'window_seconds': self._window_seconds,
+            'hint': _MARKUP_STORM_HINT,
+        }
