@@ -331,6 +331,7 @@ def blend_composite(
     latency_score: float,
     *,
     tests_pass: bool | None,
+    plan_only: bool = False,
     weights: dict[str, float] = DEFAULT_COMPOSITE_WEIGHTS,
 ) -> float:
     """The C4 efficiency-adjusted ``composite``: *quality* blended with
@@ -346,8 +347,21 @@ def blend_composite(
     ``report._ratio_score``), supplied by the report layer where the
     cross-config context to normalize exists. PURE and additive: this does not
     touch ``compute_composite``.
+
+    **plan_only** (task 3099) — the cell under test is a PLAN-ONLY run (an
+    architect eval freezes implementer/debugger/reviewer/verify), so no test was
+    ever run and there is no test signal to gate on. The caller then supplies
+    *quality* as the θ-rubric ``plan_quality`` and the ``tests_pass`` hard gate
+    is deliberately bypassed: keeping it would read "no signal collected" as
+    "the answer was wrong" and zero the number that drives survivor selection.
+
+    Under *plan_only* the CALLER — not this function — owns the exclusion of an
+    UNMEASURABLE cell: a cap-tainted trial (no ``plan_quality`` at all) must be
+    dropped from the pool by the report layer, never passed here as a fabricated
+    ``0.0``, which would penalise whichever candidate happened to be scheduled
+    inside a cap window (the task-3118 invariant, one layer up).
     """
-    if not tests_pass:
+    if not plan_only and not tests_pass:
         return 0.0
     blended = (
         weights['quality'] * quality
