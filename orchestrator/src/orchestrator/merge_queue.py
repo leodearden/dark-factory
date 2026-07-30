@@ -1644,6 +1644,16 @@ _CROSS_CHECK_SENTINEL = '__verify_cross_check__'
 # consumes.  These REIFY_VERIFY_RETRY_* / REIFY_RUN_ALL_MEMBER_SUBSET /
 # REIFY_GUI_RETRY_SPECS env keys are BRAND NEW — this producer defines them:
 #
+# OWNERSHIP (task 3059).  DF owns the subset CONTENT end to end: it is derived
+# from attempt-0's OWN VerifyResult (per-test verdicts + failed run_all members)
+# unioned with a DF-run ``cargo nextest list`` planned probe — see
+# :func:`_build_attempt0_payload`.  The ONLY thing sourced from reify is the
+# attempt-0 pin: ``tree_oid`` and ``profiles``, read from the sidecar reify
+# actually writes at ``target/reify-verify-attempt.json`` (reify tasks
+# 5287/5548 — see :data:`_REIFY_ATTEMPT_SIDECAR_RELPATH`).  There is no
+# cross-repo obligation for the subset itself; a missing or stale sidecar
+# simply routes the retry to a FULL verify.
+#
 #   REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_DEBUG    absolute path to a newline
 #   REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_RELEASE  file of EXACT {did-not-pass}
 #                                                   nextest ids for that cargo
@@ -1665,9 +1675,12 @@ _CROSS_CHECK_SENTINEL = '__verify_cross_check__'
 #     An EMPTY value is the deliberate SAFE fallback meaning "run this suite in
 #     FULL", never "run nothing": verify.sh:2545 and :2127 both gate the subset
 #     on the value being non-empty.
-#   REIFY_VERIFY_RETRY_TREE_OID   the attempt-0-pinned content-tree OID; reify
-#                                 corroborates it (belt-and-suspenders with the
-#                                 orchestrator's own tree-OID gate, INV-3).
+#   REIFY_VERIFY_RETRY_TREE_OID   the attempt-0-pinned content-tree OID, taken
+#                                 from reify's own ``git rev-parse HEAD:`` stamp
+#                                 in target/reify-verify-attempt.json and
+#                                 corroborated against DF's independent
+#                                 get_head_tree_hash read (INV-3); reify then
+#                                 re-checks it a third time from its side.
 #   REIFY_VERIFY_RETRY_SCOPE      always 'failed_only' — the retry-scope marker.
 #
 # The whole dict is merged into MergeVerifySpec.verify_env (the channel already
@@ -7631,11 +7644,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # transient retry loop (task 2835) — decoupled from the ENOSPC budget
     # above so it is affordable to make larger: a narrowed retry re-runs only
     # the did-not-pass subset (cheap per retry), unlike the ENOSPC budget
-    # which bounds a full re-verify.  Inert in production until reify writes
-    # the attempt-0 sidecar the D2 producer (_run_post_merge_verify) needs to
-    # actually narrow a retry — until then every retry_failed_only=True
-    # request still falls back to the small MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES
-    # budget.  Kept as a class attribute so tests can monkeypatch it.
+    # which bounds a full re-verify.  LIVE in production (task 3059): the
+    # retry payload is built in-process from attempt-0's OWN VerifyResult
+    # (_build_attempt0_payload), so a retry_failed_only=True request that
+    # corroborates its tree OID gets this budget, not the small
+    # MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES one.  A request whose payload
+    # cannot be built or corroborated still falls back to the ENOSPC budget —
+    # the gate is ACTUAL narrowing, never the raw flag.
+    # Kept as a class attribute so tests can monkeypatch it.
     MAX_POST_MERGE_VERIFY_NARROWED_RETRIES: int = 2
     # Poll interval (seconds) used in the _verify_and_advance abort-loop that
     # checks whether a sole-waiter detach() cancelled req.result mid-verify.
