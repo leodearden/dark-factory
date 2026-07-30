@@ -63,6 +63,7 @@ from dashboard.data.escalation_analytics import build_escalation_analytics
 from dashboard.data.escalations import build_escalation_queues
 from dashboard.data.load import get_load_metrics
 from dashboard.data.mcp_fanout import TTLCache, first_success
+from dashboard.data.memory_evals import build_memory_evals
 from dashboard.data.merge_halt import get_merge_halt_status
 from dashboard.data.merge_queue import (
     build_per_project_merge_queue,
@@ -1407,6 +1408,48 @@ async def api_escalation_analytics(request: Request) -> JSONResponse:
     return JSONResponse({'ESCALATION_ANALYTICS': result})
 
 
+# ---------------------------------------------------------------------------
+# Memory-evals TTL cache (mirrors _analytics_cache above)
+# ---------------------------------------------------------------------------
+
+_MEMORY_EVALS_TTL_SECONDS = 60.0
+_memory_evals_cache: TTLCache[dict] = TTLCache(ttl_seconds=lambda: _MEMORY_EVALS_TTL_SECONDS)
+
+
+def _memory_evals_cache_clear() -> None:
+    """Clear the memory-evals TTL cache (test hook)."""
+    _memory_evals_cache.clear()
+
+
+@app.get('/api/v2/dashboard/memory-evals')
+async def api_memory_evals(request: Request) -> JSONResponse:
+    """MEMORY_EVALS — metric trends, verdicts, limits provenance and escalation parity.
+
+    The artifact scan (every metrics-*.json across every eval dir, plus the
+    limits/verdicts artifacts and the escalation queue) runs in a worker thread
+    via asyncio.to_thread behind a ~60s single-flight TTL cache, so a cold scan
+    never blocks the event loop and repeated polls within the window are free.
+    No clock read here — the aggregator resolves `now` once internally via
+    resolve_now (clock-discipline guard scans dashboard/data/*.py + app.py;
+    resolve_now is the sanctioned site).
+
+    The escalation source is config.reconciliation_escalations_dir: memory-eval
+    regressions are filed onto the 8103 recon queue (memory-eval-program.md
+    M3), which is the same queue the Escalations tab renders — so a linked
+    alarm and its escalation cannot disagree.
+    """
+    config: DashboardConfig = request.app.state.config
+    memory_evals_dir = config.memory_evals_dir
+    escalations_dir = config.reconciliation_escalations_dir
+    key = f'{memory_evals_dir}|{escalations_dir}'
+
+    async def _refresh() -> dict:
+        return await asyncio.to_thread(build_memory_evals, memory_evals_dir, escalations_dir)
+
+    result = await _memory_evals_cache.get_or_refresh(key, _refresh)
+    return JSONResponse(redux_api.shape_memory_evals(**result))
+
+
 # Tests import these helpers directly.
 __all__: Sequence[str] = (
     'app',
@@ -1419,4 +1462,5 @@ __all__: Sequence[str] = (
     '_task_cards_cache_clear',
     '_load_task_cards',
     '_analytics_cache_clear',
+    '_memory_evals_cache_clear',
 )
