@@ -787,8 +787,15 @@ def test_classify_treats_a_done_row_with_a_null_sha_as_confirmed():
 
 
 def test_classify_tolerates_junk_payload_entries():
-    """A non-dict payload entry is ignored rather than crashing the sweep."""
-    assert classify_wipe_signature(["not-a-dict", None]) == NO_SUCCESSFUL_MERGE_SHA
+    """A non-dict payload entry is ignored rather than crashing the sweep.
+
+    Junk-ONLY input degrades to NO_MERGE_EVENT (unknown), not to
+    NO_SUCCESSFUL_MERGE_SHA — the latter is a positive claim ("this task
+    attempted a merge and never obtained a sha") that undecodable rows do not
+    support. Manufacturing a finding out of junk is the failure mode this
+    audit exists to avoid.
+    """
+    assert classify_wipe_signature(["not-a-dict", None]) == NO_MERGE_EVENT
     assert classify_wipe_signature(
         ["junk", _finalized("done", "abc123")]
     ) == CONTRADICTED_REAL_MERGE_SHA

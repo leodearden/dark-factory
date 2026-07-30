@@ -132,6 +132,120 @@ _EVENT_PLAN_SOURCES = {
 _FIDELITY_RANK = {FIDELITY_LOCK_LEVEL: 0, FIDELITY_FILE_LEVEL: 1}
 
 
+# ---------------------------------------------------------------------------
+# Wipe signatures.
+#
+# WHY THIS IS STATE-AWARE AND PER-TASK rather than the naive per-EVENT
+# "merge_finalized with merge_sha=null". Measured read-only over all 1622
+# merge_finalized events in the live runs.db, grouped by (state, sha is null):
+#
+#     done            1159    0 null
+#     blocked          382  365 null
+#     already_merged    21   21 null
+#     superseded        19   19 null
+#     unknown_branch    17   17 null
+#     conflict          14   14 null
+#     abandoned          7    7 null
+#     wip_halted         3    3 null
+#
+# A null merge_sha is OVERWHELMINGLY a merge that FAILED (blocked/conflict)
+# and was later retried successfully — it never took the workflow to DONE, so
+# it never called _reconcile_metadata_files_for_done with _merge_sha=None and
+# never wiped anything. A bare merge_sha-is-null test therefore over-reports
+# by roughly 20x and would drown the real population.
+#
+# state='done' carries a non-null sha in 1159/1159 cases, so the "done + null
+# sha" event the task description posits does not occur in this DB; the actual
+# DONE-with-no-sha shortcut is state='already_merged' (21 events, all
+# null-sha). 'done' is nonetheless kept in the DONE-reaching set below: if the
+# shape ever does occur it IS the wipe, and excluding it would silently miss
+# the very case the audit exists to find.
+# ---------------------------------------------------------------------------
+
+# At least one merge_finalized reached a DONE state carrying no merge sha —
+# the wipe as such.
+CONFIRMED_NULL_SHA_DONE_PATH = "confirmed_null_sha_done_path"
+# merge_finalized events exist but NONE ever carried a non-null merge sha.
+NO_SUCCESSFUL_MERGE_SHA = "no_successful_merge_sha"
+# A null-sha row exists, but the task later obtained a REAL merge sha — a
+# retried failure that landed. NOT a wipe.
+CONTRADICTED_REAL_MERGE_SHA = "contradicted_real_merge_sha"
+# No merge_finalized at all. UNKNOWN, not clean: found_on_main recovery and
+# eval mode both reach DONE without emitting one.
+NO_MERGE_EVENT = "no_merge_event"
+
+# merge_finalized states that mean the workflow PROCEEDED TO DONE. A null sha
+# on one of these is the wipe; a null sha on any other state (blocked,
+# conflict, superseded, ...) is a failed attempt.
+_DONE_REACHING_STATES = frozenset({"done", "already_merged"})
+
+
+def classify_wipe_signature(merge_finalized_payloads: list) -> str:
+    """Classify one task's merge history into a wipe signature.
+
+    *merge_finalized_payloads* is that task's decoded ``merge_finalized``
+    payloads (merge_queue.py:3830-3844) in emission order. Non-dict entries
+    are ignored rather than raising, so one corrupt row cannot abort a sweep
+    over thousands of tasks.
+
+    Returns one of :data:`CONFIRMED_NULL_SHA_DONE_PATH`,
+    :data:`NO_SUCCESSFUL_MERGE_SHA`, :data:`CONTRADICTED_REAL_MERGE_SHA`, or
+    :data:`NO_MERGE_EVENT`. See the block comment above for the live-DB
+    measurement that justifies the state-aware rule.
+    """
+    saw_event = False
+    saw_real_sha = False
+    for payload in merge_finalized_payloads:
+        if not isinstance(payload, dict):
+            continue
+        saw_event = True
+        state = payload.get("state")
+        merge_sha = payload.get("merge_sha")
+        if not merge_sha:
+            # A DONE-reaching state with no sha IS the wipe, and outranks
+            # every other observation for this task.
+            if state in _DONE_REACHING_STATES:
+                return CONFIRMED_NULL_SHA_DONE_PATH
+            continue
+        saw_real_sha = True
+
+    if not saw_event:
+        return NO_MERGE_EVENT
+    if saw_real_sha:
+        return CONTRADICTED_REAL_MERGE_SHA
+    return NO_SUCCESSFUL_MERGE_SHA
+
+
+def load_merge_signatures(runs_db_path: str) -> dict[str, list[dict]]:
+    """Group every ``merge_finalized`` payload in *runs_db_path* by task id.
+
+    One read-only pass across ALL runs (no run_id filter — a task's merge
+    history spans retries in different runs), in ascending ``id`` order so
+    each task's list is in emission order. Rows with a NULL ``task_id`` or a
+    malformed/NULL/non-dict payload are skipped.
+    """
+    signatures: dict[str, list[dict]] = {}
+    conn = sqlite3.connect(f"file:{runs_db_path}?mode=ro", uri=True)
+    try:
+        cursor = conn.execute(
+            "SELECT id, task_id, data FROM events "
+            "WHERE event_type = 'merge_finalized' ORDER BY id"
+        )
+        for _event_id, task_id, data in cursor:
+            if not task_id or not data:
+                continue
+            try:
+                payload = json.loads(data)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            signatures.setdefault(str(task_id), []).append(payload)
+    finally:
+        conn.close()
+    return signatures
+
+
 # The ONE statement of source precedence, most authoritative first. Every
 # source label the loaders can emit appears here, so a merge is always total.
 #
