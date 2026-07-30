@@ -72,6 +72,13 @@ _ANCHOR_TASK_ID: str = 'task-path-guard'
 _AGENT_ROLE: str = 'fused-memory/path-guard'
 _CATEGORY: str = 'scope_violation'
 
+# ``suggested_action`` for the PROSE-only advisory.  Deliberately NOT
+# ``resubmit_to_<project>``: ``orchestrator/agents/briefing.py`` renders
+# suggested_action verbatim into an agent's briefing, so a resubmit
+# instruction on a submission that was never blocked reads as a directive to
+# redo work that already landed (task 3119).
+_ADVISORY_SUGGESTED_ACTION: str = 'no_action_advisory_only'
+
 # Budget-misconfig escalation constants — deliberately distinct from the
 # scope_violation family so operators can immediately tell these apart.
 _BUDGET_MISCONFIG_ANCHOR_TASK_ID: str = 'adjudicator-budget-defect'
@@ -147,14 +154,27 @@ class ScopeViolationEscalator:
         suggested_project: str | None,
         suggested_root: str | None = None,
         llm_reason: str | None = None,
+        advisory: bool = False,
     ) -> str | None:
-        """File a ``scope_violation`` escalation for a guard rejection.
+        """File a ``scope_violation`` escalation for EITHER guard outcome.
+
+        Despite the name (kept for call-site/test-double back-compat), this
+        method covers BOTH outcomes the path-scope guard produces since task
+        2206, selected by *advisory*:
+
+        * ``advisory=False`` (default) — a FILES-certain hard rejection.  No
+          task was created and the caller got a ``DarkFactoryPathScopeViolation``
+          error dict.  Wording tells the operator to resubmit to the owner.
+        * ``advisory=True`` — a PROSE-only advisory.  The submission was NOT
+          blocked: the task WAS created and stamped with
+          ``metadata.possible_scope_mismatch``.  Wording says so, and
+          ``suggested_action`` is ``no_action_advisory_only`` (task 3119).
 
         Returns the escalation id when one was filed, ``None`` otherwise
         (escalation package missing, queue write failed, etc.).  Never
-        raises — escalation is additive to the existing rejection error
-        dict, so a queue write failure must not turn a guard rejection
-        into a guard exception.
+        raises — escalation is additive to the guard's own outcome, so a
+        queue write failure must not turn a guard rejection into a guard
+        exception (nor break creation on the advisory path).
 
         Routes through :func:`escalation.dedupe.submit_or_dedupe` keyed on a
         content fingerprint over the misroute *shape* (rejecting project_id +
@@ -178,21 +198,28 @@ class ScopeViolationEscalator:
                 operator can see why the LLM judged this a genuine/uncertain
                 misroute.  None (default) preserves the existing detail format
                 for callers that don't use the Stage-2 adjudicator.
+            advisory: Select the PROSE-only advisory wording (see above).
+                Default ``False`` — the FILES-certain rejection wording,
+                byte-identical to the pre-task-3119 output.
         """
         queue = self._queue_for(project_root)
         if queue is None:
             logger.debug(
                 'scope_violation_escalator: escalation package unavailable; '
-                'rejection of %r in project %r will not be escalated',
+                '%s of %r in project %r will not be escalated',
+                'advisory' if advisory else 'rejection',
                 candidate_title[:80], project_id,
             )
             return None
 
         paths_str = ', '.join(matched_paths) or '<none>'
         target = suggested_project or '<unknown — multiple or no owner>'
-        suggested_action = (
-            f'resubmit_to_{suggested_project}' if suggested_project else 'manual_route'
-        )
+        if advisory:
+            suggested_action = _ADVISORY_SUGGESTED_ACTION
+        else:
+            suggested_action = (
+                f'resubmit_to_{suggested_project}' if suggested_project else 'manual_route'
+            )
 
         detail_lines = [
             f'candidate_title={candidate_title!r}',
@@ -205,13 +232,29 @@ class ScopeViolationEscalator:
             detail_lines.append(f'suggested_project_root={suggested_root!r}')
         if llm_reason is not None:
             detail_lines.append(f'llm_adjudicator_reason={llm_reason!r}')
+        # Only the CLOSING PROSE differs between the two modes — the
+        # structured routing context above is what the operator acts on and is
+        # identical either way.
         detail_lines.append('')
-        detail_lines.append(
-            'A task creation request was rejected because its text or files '
-            'reference paths owned by another project.  See suggested_project '
-            'above for the intended target; resubmit there or, if no clear '
-            'owner is known, route the task manually.',
-        )
+        if advisory:
+            detail_lines.append(
+                'A task creation request cited paths that look like they belong '
+                'to another project, based on a heuristic scan of its prose '
+                '(title/description/details) only.  The submission was NOT '
+                'blocked: the task WAS created, and the match is recorded on it '
+                'as metadata.possible_scope_mismatch so async triage can see it '
+                'too.  suggested_project above is a POSSIBLE owner, not a '
+                'verdict — no resubmission is needed and nothing was lost.  '
+                'Review and reroute the created task ONLY if the attribution '
+                'above is actually correct and the task is in the wrong place.',
+            )
+        else:
+            detail_lines.append(
+                'A task creation request was rejected because its text or files '
+                'reference paths owned by another project.  See suggested_project '
+                'above for the intended target; resubmit there or, if no clear '
+                'owner is known, route the task manually.',
+            )
         detail = '\n'.join(detail_lines)
 
         try:
@@ -219,9 +262,18 @@ class ScopeViolationEscalator:
                 id=queue.make_id(_ANCHOR_TASK_ID),
                 task_id=_ANCHOR_TASK_ID,
                 agent_role=_AGENT_ROLE,
+                # 'info' for BOTH modes by deliberate choice, not oversight:
+                # escalation.models defines the severity vocabulary as
+                # blocking|info|critical|urgent, so 'info' is already the
+                # FLOOR — an advisory cannot be filed any quieter.  The
+                # wording below is what distinguishes the two, not the
+                # severity (task 3119).
                 severity='info',
                 category=_CATEGORY,
                 summary=(
+                    f'Path-scope ADVISORY: task CREATED and stamped, '
+                    f'cites {paths_str} (possible owner: {target})'
+                    if advisory else
                     f'Misrouted task rejected: cites {paths_str} '
                     f'(suggested target: {target})'
                 ),
