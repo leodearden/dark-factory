@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import inspect
+import logging
 import subprocess
 from pathlib import Path
 
@@ -698,6 +699,18 @@ def _emit_workflow_verify(
         task_id=task_id,
         data={'passed': passed, 'base_sha': 'basesha', 'branch': branch},
     )
+
+
+def _degrade_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """Fully-formatted WARNING messages from the classifier's loud degrade
+    (task 3178). ``getMessage()`` substitutes the %-args, so the ``reasons``
+    list and the true counts are visible to assertions."""
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno >= logging.WARNING
+        and 'degrading implicated landings' in r.getMessage()
+    ]
 
 
 class TestBranchPreMergeVerifyGreen:
@@ -1456,6 +1469,7 @@ class TestShellGuardNameWithGenuineLandingIsIndeterminate:
     )
     def test_guard_name_over_genuine_landing_degrades_and_records_observed(
         self, tmp_path: Path, cause_hint: str, guard_filename: str, reify_task: str,
+        caplog: pytest.LogCaptureFixture,
     ):
         from orchestrator.merge_disposition import (
             MergeFailureDisposition,
@@ -1474,19 +1488,22 @@ class TestShellGuardNameWithGenuineLandingIsIndeterminate:
         _emit_workflow_verify(store, '2381', passed=True, branch='task/2381')
 
         guard_failure = _guard_failure(cause_hint)
-        disposition, evidence, observed = asyncio.run(
-            classify_merge_failure_disposition(
-                verify_result=guard_failure,
-                branch='task/2381',
-                merge_base_sha=merge_base,
-                main_sha=landing,
-                real_main_head_sha=real_main_head,
-                preexisting=False,
-                task_id='2381',
-                repo_root=repo,
-                event_store=store,
-            ),
-        )
+        with caplog.at_level(
+            logging.WARNING, logger='orchestrator.merge_disposition',
+        ):
+            disposition, evidence, observed = asyncio.run(
+                classify_merge_failure_disposition(
+                    verify_result=guard_failure,
+                    branch='task/2381',
+                    merge_base_sha=merge_base,
+                    main_sha=landing,
+                    real_main_head_sha=real_main_head,
+                    preexisting=False,
+                    task_id='2381',
+                    repo_root=repo,
+                    event_store=store,
+                ),
+            )
 
         # The honest degrade: a genuine landing IS implicated and the branch IS
         # green, so only I7 stands between this and a false skew.
@@ -1501,6 +1518,23 @@ class TestShellGuardNameWithGenuineLandingIsIndeterminate:
         assert landing in observed.implicated_commits
         assert observed.failing_tests == ()
         assert guard_filename in observed.overlap_files
+
+        # The greppable operator half of the loud degrade. Pinned because it is
+        # the ONLY surface an operator sees in real time — the runs.db row is
+        # queried after the fact — and because a refactor that dropped or
+        # mislabelled it would otherwise leave every other assertion green.
+        degrade = _degrade_warnings(caplog)
+        assert len(degrade) == 1, f'expected exactly one degrade WARNING, got {degrade}'
+        (msg,) = degrade
+        assert 'no node-shaped failing-test id' in msg, (
+            f'reify {reify_task}: the I7 reason must be named verbatim; got {msg!r}'
+        )
+        # I5 held (the branch IS green), so its reason must NOT be claimed.
+        assert 'branch pre-merge green not confirmed' not in msg
+        # Truncation is self-describing: every list logs its TRUE count.
+        assert 'failing_tests=0' in msg
+        assert f'implicated_commits={len(observed.implicated_commits)}' in msg
+        assert f'overlap_files={len(observed.overlap_files)}' in msg
 
         # Same test, opposite direction: pin that the evidence machinery is
         # still LIVE rather than accidentally starved. A future "fix" that
@@ -1518,6 +1552,70 @@ class TestShellGuardNameWithGenuineLandingIsIndeterminate:
             ),
         )
         assert landing in implicated_commits
+
+    def test_i5_only_degrade_names_the_green_reason_not_the_shape_reason(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        """The other degrade reason, in isolation: node-shaped failing-test ids
+        ARE present (I7 satisfied honestly) but the branch's pre-merge green is
+        NOT confirmed (no workflow_verify rows), so only I5 stands between this
+        and a skew.
+
+        Pinned as a distinct case because the two reasons share one WARNING and
+        one code path: a refactor that collapsed them — or emitted the I7 string
+        unconditionally — would leave the I7 test above green while making the
+        operator surface lie about why the gate bit."""
+        from orchestrator.merge_disposition import (
+            MergeFailureDisposition,
+            classify_merge_failure_disposition,
+        )
+
+        repo = tmp_path / 'repo'
+        repo.mkdir()
+        _init_git_repo(repo)
+        merge_base = _commit_file(repo, 'tests/test_foo.py', 'v1', 'init (merge-base)')
+        landing = _commit_file(repo, 'tests/test_foo.py', 'v2', 'landing on main')
+        real_main_head = _commit_file(repo, 'src/z.py', 'zzz', 'later main tip')
+
+        # Empty store: no workflow_verify rows -> green is None, not True.
+        store = _make_event_store(tmp_path)
+
+        node_shaped_failure = _guard_failure(
+            'FAILED tests/test_foo.py::test_bar - AssertionError',
+        )
+        with caplog.at_level(
+            logging.WARNING, logger='orchestrator.merge_disposition',
+        ):
+            disposition, evidence, observed = asyncio.run(
+                classify_merge_failure_disposition(
+                    verify_result=node_shaped_failure,
+                    branch='task/2381',
+                    merge_base_sha=merge_base,
+                    main_sha=landing,
+                    real_main_head_sha=real_main_head,
+                    preexisting=False,
+                    task_id='2381',
+                    repo_root=repo,
+                    event_store=store,
+                ),
+            )
+
+        assert disposition == MergeFailureDisposition.INDETERMINATE
+        assert evidence is None
+        assert observed is not None
+        assert observed.failing_tests == ('tests/test_foo.py::test_bar',)
+        assert landing in observed.implicated_commits
+
+        degrade = _degrade_warnings(caplog)
+        assert len(degrade) == 1, f'expected exactly one degrade WARNING, got {degrade}'
+        (msg,) = degrade
+        assert 'branch pre-merge green not confirmed' in msg
+        # I7 held (a node-shaped id WAS parsed), so its reason must not appear.
+        assert 'no node-shaped failing-test id' not in msg
+        # The ids that were on the table are named, not just counted — an
+        # I5-only degrade is the case where they are the useful detail.
+        assert 'failing_tests=1' in msg
+        assert 'tests/test_foo.py::test_bar' in msg
 
     def test_separation_control_rust_node_id_still_integration_skew(
         self, tmp_path: Path,

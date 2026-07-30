@@ -3281,6 +3281,12 @@ def _elapsed_ms(start: float | None) -> int | None:
 # 3178). Driver: reify 5566 attempt-2 cited 22 SHAs touching 7 files, and an
 # unbounded list would bloat runs.db rows. The TRUE count is persisted alongside
 # each truncated slice as ``<key>_total``, so the bounding is never silent.
+#
+# Deliberately LARGER than merge_disposition._MAX_LOGGED_EVIDENCE_ITEMS (5),
+# which bounds the same bundle on the degrade WARNING: that cap is tuned for
+# one-line log readability, this one for runs.db row size — a census querying
+# these rows wants more of the citation than a human grepping a log line does.
+# The two truncation points differ on purpose; neither is drift from the other.
 _MAX_EVENT_EVIDENCE_ITEMS = 10
 
 

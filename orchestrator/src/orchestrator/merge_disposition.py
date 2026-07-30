@@ -201,8 +201,15 @@ def _extract_failing_tests_and_candidate_files(
 
 # Bound on how many SHAs / paths the degrade WARNING spells out (task 3178).
 # reify 5566 attempt-2 cited 22 SHAs touching 7 files; an unbounded list would
-# make the log line unreadable. The true count is logged alongside the slice, so
-# the truncation is never silent.
+# make the log line unreadable. The true count is logged alongside EVERY slice,
+# so the truncation is never silent.
+#
+# Deliberately SMALLER than merge_queue._MAX_EVENT_EVIDENCE_ITEMS (10), which
+# bounds the same bundle on the runs.db merge_attempt row: this cap is tuned for
+# one-line log readability (a human greps it), that one for row size (a census
+# queries it, and wants more of the citation). A reader comparing a log line
+# against its row will therefore see two different truncation points — that is
+# intended, not drift.
 _MAX_LOGGED_EVIDENCE_ITEMS = 5
 
 # Full 40-hex-char commit SHA, as emitted by ``git log --format=%H``.
@@ -654,14 +661,22 @@ async def classify_merge_failure_disposition(
             reasons.append('no node-shaped failing-test id')
         if green is not True:
             reasons.append('branch pre-merge green not confirmed')
+        # Every list logs its TRUE length beside the slice (see
+        # _MAX_LOGGED_EVIDENCE_ITEMS): a truncation a reader cannot detect is
+        # the same silent-degrade failure mode this warning exists to end.
+        # failing_tests is logged too, so an I5-ONLY degrade (node-shaped ids
+        # present, green unconfirmed) names the ids that were on the table.
         logger.warning(
             'classify_merge_failure_disposition: task=%s degrading implicated '
-            'landings to INDETERMINATE (%s); implicated_commits=%d %s '
-            'overlap_files=%s',
+            'landings to INDETERMINATE (%s); failing_tests=%d %s '
+            'implicated_commits=%d %s overlap_files=%d %s',
             task_id,
             '; '.join(reasons),
+            len(failing_tests),
+            failing_tests[:_MAX_LOGGED_EVIDENCE_ITEMS],
             len(implicated_commits),
             implicated_commits[:_MAX_LOGGED_EVIDENCE_ITEMS],
+            len(overlap_files),
             overlap_files[:_MAX_LOGGED_EVIDENCE_ITEMS],
         )
         return (MergeFailureDisposition.INDETERMINATE, None, observed)
