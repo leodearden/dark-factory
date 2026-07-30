@@ -1314,3 +1314,364 @@ class TestClassifyContamination:
         assert len(foreign_records) == foreign_count == 1
         assert untopiced_count == 2
         assert scored_total == 3
+
+
+# ---------------------------------------------------------------------------
+# step-15: M1 series assembly
+#
+# The artifact is the ONLY surface leaf alpha's evaluator and the dashboard
+# read, and they join a run to its baseline window BY metric_id. A wrong
+# spelling here does not crash anything — it makes the metric invisible, which
+# is strictly worse. Hence the vocabulary is asserted exactly, including the
+# negative: gamma's E4 metrics must not appear.
+#
+# Still no rate assertions: every number below is a count, a denominator, or a
+# structural identity (value x denominator is a whole number of successes).
+# ---------------------------------------------------------------------------
+
+def _phrasing_obs(topic, phrasing='q', *, k=5, hit=True, held_out=False, degraded=False):
+    m = _mod()
+    return m.PhrasingObservation(
+        topic=topic,
+        phrasing=phrasing,
+        held_out=held_out,
+        k=k,
+        hit=hit,
+        rank=1 if hit else None,
+        matched_by='content_hash' if hit else None,
+        degraded=degraded,
+    )
+
+
+def _claim_obs(topic, query='c', *, k=5, recalled=True, scorable=True, degraded=False):
+    m = _mod()
+    return m.ClaimObservation(
+        topic=topic,
+        query=query,
+        k=k,
+        recalled=recalled,
+        missing_needles=() if recalled else ('a needle',),
+        scorable=scorable,
+        degraded=degraded,
+    )
+
+
+def _contam_obs(topic, *, foreign=0, untopiced=0, scored=5, degraded=False):
+    m = _mod()
+    return m.ContaminationObservation(
+        topic=topic,
+        phrasing='q',
+        k=5,
+        foreign_count=foreign,
+        untopiced_count=untopiced,
+        scored_total=scored,
+        foreign_records=(),
+        degraded=degraded,
+    )
+
+
+def _inversion_obs(topic, *, pairs=2, inversions=0, degraded=False):
+    m = _mod()
+    return m.InversionObservation(
+        topic=topic,
+        phrasing='q',
+        pairs_examined=pairs,
+        inversions=tuple(
+            m.InversionRecord(
+                topic=topic, phrasing='q',
+                superseded_hash='a' * 16, successor_hash='b' * 16,
+                superseded_rank=1, successor_rank=2,
+            )
+            for _ in range(inversions)
+        ),
+        degraded=degraded,
+    )
+
+
+def _observations(*, topics=('alpha-topic', 'beta-topic'), ks=(5, 10), miss_held_out=()):
+    """A complete, self-consistent observation set over *topics*.
+
+    Each topic gets two tuned phrasings and one held-out phrasing at every k,
+    one claim query, one contamination sample and one inversion opportunity.
+    Topics named in *miss_held_out* miss on their held-out phrasing only — the
+    Goodhart guard's failure mode, and the only way a topic in this fixture can
+    fail its tripwire.
+    """
+    m = _mod()
+    phrasings = []
+    for topic in topics:
+        for k in ks:
+            phrasings.append(_phrasing_obs(topic, 'tuned one', k=k))
+            phrasings.append(_phrasing_obs(topic, 'tuned two', k=k))
+            phrasings.append(_phrasing_obs(
+                topic, 'held out', k=k, held_out=True, hit=topic not in miss_held_out,
+            ))
+    return m.ProbeObservations(
+        phrasings=phrasings,
+        claims=[_claim_obs(t) for t in topics],
+        contamination=[_contam_obs(t, foreign=1, untopiced=3, scored=5) for t in topics],
+        inversions=[_inversion_obs(t) for t in topics],
+    )
+
+
+def _build(observations=None, *, counts=None, project_id='dark_factory', stamp='20260730T101500Z',
+           ks=(5, 10)):
+    return _mod().build_series(
+        observations if observations is not None else _observations(),
+        counts if counts is not None else {'topics': 2, 'phrasings': 6},
+        project_id,
+        stamp,
+        ks,
+    )
+
+
+class TestBuildSeries:
+    """`build_series(observations, corpus_counts, project_id, stamp, ks)`."""
+
+    def test_the_series_validates_unchanged(self):
+        """(a) The artifact must satisfy the shared schema as built."""
+        from shared.memory_eval_metrics import validate_metric_series  # noqa: PLC0415
+
+        validate_metric_series(_build())
+
+    def test_it_carries_exactly_the_seven_metric_ids_this_leaf_owns(self):
+        """(b) The join key. A wrong spelling is invisible, not loud."""
+        ids = {metric.metric_id for metric in _build().metrics}
+
+        assert ids == {
+            'topic-canonical-present',
+            'canonical-in-top-5',
+            'canonical-in-top-10',
+            'canonical-in-top-5-held-out',
+            'claim-recall',
+            'contamination-share',
+            'superseded-above-successor',
+        }
+
+    def test_it_does_not_carry_gammas_e4_metrics(self):
+        """(b) E4 is leaf gamma's, and it depends on 3196 — not this runner."""
+        ids = {metric.metric_id for metric in _build().metrics}
+
+        assert 'dangling-pointers' not in ids
+        assert 'successor-pointer-present' not in ids
+
+    def test_the_series_is_stamped_with_this_evals_id(self):
+        series = _build(stamp='20260730T101500Z')
+
+        assert series.eval_id == 'e1-retrieval-health'
+        assert series.run_stamp == '20260730T101500Z'
+        assert series.schema_version == 1
+
+    def test_kinds_and_directions(self):
+        """(c) The shared validator rejects a missing or misplaced direction."""
+        by_id = {m.metric_id: m for m in _build().metrics}
+
+        assert by_id['topic-canonical-present'].kind == 'tripwire'
+        assert by_id['topic-canonical-present'].direction is None
+        for metric_id in (
+            'canonical-in-top-5', 'canonical-in-top-10',
+            'canonical-in-top-5-held-out', 'claim-recall',
+        ):
+            assert by_id[metric_id].kind == 'proportion'
+            assert by_id[metric_id].direction == 'lower_is_worse'
+        assert by_id['contamination-share'].kind == 'proportion'
+        assert by_id['contamination-share'].direction == 'higher_is_worse'
+        assert by_id['superseded-above-successor'].kind == 'count'
+        assert by_id['superseded-above-successor'].direction == 'higher_is_worse'
+
+    def test_tripwire_items_are_one_per_topic_keyed_by_slug(self):
+        """(d) The item_key shape alpha's grandfather set persists."""
+        tripwire = {m.metric_id: m for m in _build().metrics}['topic-canonical-present']
+        keys = {item.item_key for item in tripwire.items}
+
+        assert keys == {'t-alpha-topic', 't-beta-topic'}
+        assert tripwire.n == len(tripwire.items) == 2
+
+    def test_a_topic_fails_its_tripwire_when_only_the_held_out_phrasing_misses(self):
+        """(d) Every phrasing INCLUDING the held-out one must find the canonical.
+
+        This is the Goodhart guard as a predicate: tuning the two known
+        phrasings until they pass cannot make the topic pass.
+        """
+        series = _build(_observations(miss_held_out=('beta-topic',)))
+        tripwire = {m.metric_id: m for m in series.metrics}['topic-canonical-present']
+        passed = {item.item_key: item.passed for item in tripwire.items}
+
+        assert passed['t-alpha-topic']
+        assert not passed['t-beta-topic']
+        assert tripwire.value == 1, 'a tripwire value IS its failure count'
+
+    def test_tripwire_is_evaluated_at_k_five(self):
+        """(d) Pinned at TRIPWIRE_K, matching alpha's committed exemplar."""
+        m = _mod()
+        observations = m.ProbeObservations(
+            phrasings=[
+                # Hits at k=10 only: rank 7 for every phrasing.
+                _phrasing_obs('alpha-topic', 'p', k=5, hit=False),
+                _phrasing_obs('alpha-topic', 'h', k=5, hit=False, held_out=True),
+                _phrasing_obs('alpha-topic', 'p', k=10, hit=True),
+                _phrasing_obs('alpha-topic', 'h', k=10, hit=True, held_out=True),
+            ],
+        )
+        tripwire = {
+            metric.metric_id: metric for metric in _build(observations).metrics
+        }['topic-canonical-present']
+
+        assert tripwire.value == 1, 'k=10 hits must not rescue a k=5 tripwire'
+
+    def test_proportion_denominators_are_their_pair_counts(self):
+        """(e) n == denominator == the number of trials that were scored."""
+        by_id = {m.metric_id: m for m in _build().metrics}
+
+        # 2 topics x 3 phrasings at each k.
+        assert by_id['canonical-in-top-5'].denominator == 6
+        assert by_id['canonical-in-top-5'].n == 6
+        assert by_id['canonical-in-top-10'].denominator == 6
+        # 2 topics x 1 held-out phrasing at k=5.
+        assert by_id['canonical-in-top-5-held-out'].denominator == 2
+        # 2 topics x 1 claim query.
+        assert by_id['claim-recall'].denominator == 2
+        # 2 contamination samples x 5 scored results each.
+        assert by_id['contamination-share'].denominator == 10
+
+    def test_every_proportion_is_a_whole_number_of_successes(self):
+        """(e) The shared validator's rule, asserted on the built artifact."""
+        for metric in _build().metrics:
+            if metric.kind != 'proportion':
+                continue
+            successes = metric.value * metric.denominator
+            assert abs(successes - round(successes)) < 1e-9, metric.metric_id
+
+    def test_the_count_metric_carries_its_exposure_as_n(self):
+        series = _build(_mod().ProbeObservations(
+            phrasings=[_phrasing_obs('alpha-topic', 'h', held_out=True)],
+            inversions=[
+                _inversion_obs('alpha-topic', pairs=3, inversions=2),
+                _inversion_obs('beta-topic', pairs=1, inversions=0),
+            ],
+        ))
+        count = {m.metric_id: m for m in series.metrics}['superseded-above-successor']
+
+        assert count.value == 2
+        assert count.n == 4, 'n is the pairs examined — the exposure the rate is per'
+
+    def test_corpus_carries_the_project_and_the_counts(self):
+        """(f) The per-category mapping, passed through."""
+        series = _build(counts={'topics': 32, 'entries_probed': 96}, project_id='reify')
+
+        assert series.corpus.project_id == 'reify'
+        assert series.corpus.counts['topics'] == 32
+        assert series.corpus.counts['entries_probed'] == 96
+
+    def test_the_untopiced_disclosure_reaches_the_artifact(self):
+        """The step-13 disclosure must survive into the machine-readable surface.
+
+        A contamination share whose unclassifiable remainder is only mentioned
+        in prose is a silent cap for every consumer that reads the JSON.
+        """
+        counts = _build().corpus.counts
+
+        assert counts['contamination_untopiced_results'] == 6
+        assert counts['contamination_scored_results'] == 10
+
+    def test_degraded_observations_are_excluded_from_denominators(self):
+        """A store outage must not be charged as a findability failure."""
+        m = _mod()
+        series = _build(m.ProbeObservations(
+            phrasings=[
+                _phrasing_obs('alpha-topic', 'ok', hit=True),
+                _phrasing_obs('alpha-topic', 'h', hit=True, held_out=True),
+                _phrasing_obs('alpha-topic', 'down', hit=False, degraded=True),
+            ],
+        ))
+        by_id = {metric.metric_id: metric for metric in series.metrics}
+
+        assert by_id['canonical-in-top-5'].denominator == 2
+        tripwire = by_id['topic-canonical-present']
+        assert [item.passed for item in tripwire.items] == [True]
+
+    def test_a_metric_with_no_scored_trials_is_absent_not_zero(self):
+        """An absent proportion is honest; a 0/0 one would be a fabricated trial."""
+        series = _build(_mod().ProbeObservations(
+            phrasings=[_phrasing_obs('alpha-topic', 'h', held_out=True)],
+        ))
+        ids = {metric.metric_id for metric in series.metrics}
+
+        assert 'claim-recall' not in ids
+        assert 'contamination-share' not in ids
+        assert 'canonical-in-top-5' in ids
+
+    def test_unscorable_claims_are_disclosed_and_excluded(self):
+        series = _build(_mod().ProbeObservations(
+            phrasings=[_phrasing_obs('alpha-topic', 'h', held_out=True)],
+            claims=[
+                _claim_obs('alpha-topic', 'scorable', recalled=True),
+                _claim_obs('alpha-topic', 'needle-less', recalled=False, scorable=False),
+            ],
+        ))
+        by_id = {metric.metric_id: metric for metric in series.metrics}
+
+        assert by_id['claim-recall'].denominator == 1
+        assert series.corpus.counts['claim_queries_unscorable'] == 1
+
+    def test_the_tripwire_points_at_the_report_beside_it(self):
+        """An operator following an artifact must reach the prose."""
+        from shared.memory_eval_metrics import report_artifact_path  # noqa: PLC0415
+
+        series = _build(stamp='20260730T101500Z')
+        tripwire = {m.metric_id: m for m in series.metrics}['topic-canonical-present']
+
+        assert tripwire.details_path == report_artifact_path(
+            '.', 'e1-retrieval-health', '20260730T101500Z',
+        ).name
+
+    def test_an_inconsistent_tripwire_is_rejected_at_emit_time(self, tmp_path):
+        """(g) M1: malformed metrics are rejected by the producer, not the reader.
+
+        By the time the dashboard reads the artifact there is nobody left to
+        tell, so the tamper below must not be writable to disk.
+        """
+        from shared.memory_eval_metrics import (  # noqa: PLC0415
+            MetricSchemaError,
+            serialize_metric_series,
+            write_metric_series,
+        )
+
+        payload = json.loads(serialize_metric_series(_build(
+            _observations(miss_held_out=('beta-topic',)),
+        )))
+        for metric in payload['metrics']:
+            if metric['metric_id'] == 'topic-canonical-present':
+                metric['value'] = 0  # it has one failing item
+
+        with pytest.raises(MetricSchemaError):
+            write_metric_series(payload, tmp_path)
+        assert not (tmp_path / 'e1-retrieval-health').exists(), 'no partial artifact'
+
+    def test_build_series_validates_its_own_output(self):
+        """A bug in aggregation must surface here, not in the evaluator."""
+        from shared.memory_eval_metrics import validate_metric_series  # noqa: PLC0415
+
+        for observations in (
+            _observations(),
+            _observations(miss_held_out=('alpha-topic', 'beta-topic')),
+            _mod().ProbeObservations(phrasings=[_phrasing_obs('a', 'h', held_out=True)]),
+        ):
+            validate_metric_series(_build(observations))
+
+    def test_round_trip_through_the_artifact_is_lossless(self, tmp_path):
+        """(h) Written where M1 says, and read back identical."""
+        from shared.memory_eval_metrics import (  # noqa: PLC0415
+            load_metric_series,
+            write_metric_series,
+        )
+
+        series = _build(stamp='20260730T101500Z')
+        metrics_path, report_path = write_metric_series(series, tmp_path)
+
+        assert metrics_path == (
+            tmp_path / 'e1-retrieval-health' / 'metrics-20260730T101500Z.json'
+        )
+        assert report_path.parent == metrics_path.parent
+        assert report_path.exists()
+        assert load_metric_series(metrics_path) == series
