@@ -514,3 +514,256 @@ def load_topic_registry(path: str | Path) -> TopicRegistry:
         )
 
     return TopicRegistry(schema_version=schema_version, entries=tuple(entries))
+
+
+# ---------------------------------------------------------------------------
+# Offline registry derivation
+#
+# Every source is COMMITTED, so this band needs no Qdrant, no embedder and no
+# OPENAI_API_KEY: the fixture is reproducible in CI and a reviewer can re-run
+# the derivation to audit any entry. Derivation lives here rather than in a
+# fourth script so the deriver writes exactly what the loader reads — a schema
+# drift between them is impossible by construction.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class DerivationResult:
+    """Candidate registry entries plus what derivation had to leave out.
+
+    ``disclosures`` is not decoration. Derivation narrows its inputs (the
+    count-1 census tail, rows the curator adjudicated as distinct), and a
+    narrowing nobody can see reads downstream as "there was nothing there" —
+    the silent cap this repo's norms forbid.
+    """
+
+    candidates: tuple[dict[str, Any], ...]
+    disclosures: dict[str, int] = field(default_factory=dict)
+
+    def as_registry_payload(self) -> dict[str, Any]:
+        """The candidates in the registry's OWN JSON shape.
+
+        Deliberately incomplete: phrasings carry no held-out entry and there
+        are no claim_queries, because those are the parts a machine cannot
+        regenerate. An operator hand-completes them and commits the result.
+        """
+        return {
+            'schema_version': REGISTRY_SCHEMA_VERSION,
+            'entries': [dict(c) for c in self.candidates],
+        }
+
+
+def _candidate(
+    topic: str,
+    *,
+    project_id: str,
+    derived_from: str,
+    content_hash: str,
+    content_prefix: str = '',
+    last_known_id: str | None = None,
+    phrasings: list[str],
+    members: list[str],
+    supersedes_pairs: list[dict[str, str]] | None = None,
+    provenance: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        'topic': topic,
+        'project_id': project_id,
+        'derived_from': derived_from,
+        'provenance': provenance or {},
+        'canonical': {
+            'content_hash': content_hash,
+            'content_prefix': content_prefix[:160],
+            'last_known_id': last_known_id,
+        },
+        # Never held_out: see DerivationResult.as_registry_payload.
+        'phrasings': [{'text': text, 'held_out': False} for text in phrasings],
+        'claim_queries': [],
+        'members': members,
+        'supersedes_pairs': supersedes_pairs or [],
+    }
+
+
+def _derive_curator_gate_candidates(rows: list[dict]) -> list[dict[str, Any]]:
+    groups: dict[str, list[dict]] = {}
+    for row in rows:
+        groups.setdefault(row['cluster_id'], []).append(row)
+
+    candidates: list[dict[str, Any]] = []
+    for cluster_id, group in sorted(groups.items()):
+        canonical_rows = [r for r in group if r.get('label') == 'canonical']
+        if not canonical_rows:
+            continue
+        canonical = canonical_rows[0]
+        # ONLY 'duplicate'. The curator adjudicated 'distinct' and
+        # 'pseudo_contradiction' rows as separate claims that merely READ as
+        # contradictory; treating them as members would tell the probe that a
+        # legitimately different answer is contamination.
+        duplicates = [r for r in group if r.get('label') == 'duplicate']
+        canonical_hash = content_key(canonical['content'])
+        member_hashes = sorted({content_key(r['content']) for r in duplicates})
+        gate_ids = sorted({
+            r.get('provenance', {}).get('gate_id')
+            for r in group
+            if isinstance(r.get('provenance'), dict) and r['provenance'].get('gate_id')
+        })
+        candidates.append(_candidate(
+            _slugify(canonical.get('topic') or cluster_id),
+            project_id=canonical.get('project_id', 'reify'),
+            derived_from='curator_gate',
+            content_hash=canonical_hash,
+            content_prefix=_WHITESPACE_RE.sub(' ', canonical['content']).strip(),
+            last_known_id=canonical.get('memory_id'),
+            phrasings=[],
+            members=member_hashes,
+            supersedes_pairs=[
+                {'superseded_hash': h, 'successor_hash': canonical_hash}
+                for h in member_hashes if h != canonical_hash
+            ],
+            provenance={
+                'cluster_id': cluster_id,
+                'gate_ids': gate_ids,
+                'labels': {
+                    'canonical': len(canonical_rows),
+                    'duplicate': len(duplicates),
+                    'other': len(group) - len(canonical_rows) - len(duplicates),
+                },
+            },
+        ))
+    return candidates
+
+
+def _derive_census_candidates(census: dict) -> tuple[list[dict[str, Any]], int]:
+    """Multi-entry census topics, plus the number of singletons skipped.
+
+    A count-1 topic has exactly one entry, so "is the canonical in the top k"
+    is answered by that entry's mere existence — it measures presence, not
+    retrieval. They are skipped, and the count is returned so the skip is
+    reported rather than silently applied.
+    """
+    table = ((census.get('grand_total') or {}).get('topic') or {}).get('entries') or []
+    candidates: list[dict[str, Any]] = []
+    skipped = 0
+    for item in table:
+        if not isinstance(item, dict):
+            continue
+        value, count = item.get('value'), item.get('count', 0)
+        if not isinstance(value, str) or not value:
+            continue
+        if not isinstance(count, int) or count <= 1:
+            skipped += 1
+            continue
+        candidates.append(_candidate(
+            _slugify(value),
+            project_id='dark_factory',
+            derived_from='census_topic',
+            # Unknown offline: the census records topic VALUES and counts, not
+            # content. The operator resolves it; until then the entry is
+            # incomplete and the loader will say so by name.
+            content_hash='',
+            phrasings=[value.replace('_', ' ').replace('-', ' ')],
+            members=[],
+            provenance={'census_topic_value': value, 'census_count': count},
+        ))
+    return candidates, skipped
+
+
+def _derive_guard_cluster_candidates(clusters) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for cluster in clusters:
+        candidates.append(_candidate(
+            _slugify(cluster.topic_id),
+            project_id='dark_factory',
+            derived_from='topic_guard_cluster',
+            content_hash='',
+            phrasings=list(cluster.phrases),
+            members=[],
+            provenance={'guard_topic_id': cluster.topic_id, 'hint': cluster.hint},
+        ))
+    return candidates
+
+
+def _slugify(value: str) -> str:
+    slug = re.sub(r'[^a-z0-9_-]+', '-', value.strip().lower()).strip('-_')
+    return re.sub(r'-{2,}', '-', slug) or 'unnamed-topic'
+
+
+def derive_registry_candidates(
+    calibration_rows: list[dict],
+    census_report: dict,
+    guard_clusters,
+) -> DerivationResult:
+    """Derive candidate registry entries from the three COMMITTED sources.
+
+    Pure: no network, no Qdrant, no ``MemoryService``, and deterministic — two
+    runs on the same inputs produce byte-identical output, so a reviewer can
+    re-derive and diff.
+
+    Returns candidates in the registry's own shape, minus the two things
+    derivation cannot invent: a freshly authored held-out phrasing, and the
+    per-facet claim needles. Those are hand-authored, which is exactly why the
+    CLI band prints rather than overwrites (see :func:`run_derive_registry`).
+    """
+    candidates = list(_derive_curator_gate_candidates(calibration_rows))
+    census_candidates, skipped = _derive_census_candidates(census_report)
+    candidates.extend(census_candidates)
+    candidates.extend(_derive_guard_cluster_candidates(guard_clusters))
+
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    collisions = 0
+    for candidate in candidates:
+        if candidate['topic'] in seen:
+            collisions += 1
+            continue
+        seen.add(candidate['topic'])
+        deduped.append(candidate)
+    deduped.sort(key=lambda c: c['topic'])
+
+    return DerivationResult(
+        candidates=tuple(deduped),
+        disclosures={
+            'curator_gate_clusters': sum(
+                1 for c in deduped if c['derived_from'] == 'curator_gate'
+            ),
+            'census_topics_emitted': sum(
+                1 for c in deduped if c['derived_from'] == 'census_topic'
+            ),
+            'census_topics_skipped_singleton': skipped,
+            'topic_guard_clusters': sum(
+                1 for c in deduped if c['derived_from'] == 'topic_guard_cluster'
+            ),
+            'slug_collisions_dropped': collisions,
+        },
+    )
+
+
+def run_derive_registry(
+    calibration_path: str | Path,
+    census_path: str | Path,
+    *,
+    guard_clusters=None,
+) -> str:
+    """Render derived candidates as registry-shaped JSON, for an operator to complete.
+
+    Deliberately does NOT overwrite the committed fixture. The hand-authored
+    phrasings — above all the held-out ones — are the part machines cannot
+    regenerate, so clobbering the file in place would destroy the very thing
+    the Goodhart guard depends on. Print, diff, merge by hand.
+    """
+    if guard_clusters is None:
+        from fused_memory.config.schema import (  # noqa: PLC0415
+            _default_topic_guard_clusters,
+        )
+
+        guard_clusters = _default_topic_guard_clusters()
+
+    rows = [
+        json.loads(line)
+        for line in Path(calibration_path).read_text(encoding='utf-8').splitlines()
+        if line.strip()
+    ]
+    census = json.loads(Path(census_path).read_text(encoding='utf-8'))
+    result = derive_registry_candidates(rows, census, guard_clusters)
+    payload = result.as_registry_payload()
+    payload['_disclosures'] = result.disclosures
+    return json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + '\n'

@@ -611,16 +611,31 @@ class TestDerivationIsPure:
         """The deriver writes what the loader reads — schema drift is impossible.
 
         Loaded through load_topic_registry after filling in only the parts a
-        machine cannot regenerate (a held-out phrasing and a claim query), so
-        the two halves are proven to agree rather than assumed to.
+        machine cannot regenerate, so the two halves are proven to agree rather
+        than assumed to. Three fields are completed here:
+
+        - a held-out phrasing and a claim query (hand-authored by design), and
+        - the canonical content_hash for census/guard candidates, which is NOT
+          offline-derivable: the census records topic VALUES and counts, and a
+          guard cluster records match phrases — neither carries the canonical's
+          content. Only the curator-gate 20 hash offline, and the assertion
+          below pins exactly that split so a future deriver silently emitting
+          an empty hash for a curator cluster fails here.
         """
         payload = derived.as_registry_payload()
+        hashless = set()
         for entry in payload['entries']:
             entry['phrasings'].append({'text': f'held out for {entry["topic"]}',
                                        'held_out': True})
             entry.setdefault('claim_queries', []).append(
                 {'query': f'{entry["topic"]} claim', 'needles': ['x']},
             )
+            if not entry['canonical']['content_hash']:
+                hashless.add(entry['derived_from'])
+                entry['canonical']['content_hash'] = _mod().content_key(entry['topic'])
+
+        assert 'curator_gate' not in hashless
+        assert hashless == {'census_topic', 'topic_guard_cluster'}
         path = tmp_path / 'derived.json'
         path.write_text(json.dumps(payload), encoding='utf-8')
 
