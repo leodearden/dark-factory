@@ -3,8 +3,8 @@
 from fused_memory.reconciliation.prompts import (
     _STAGE1_GRAPHITI_QUEUED_GUIDANCE,
     _STAGE1_PROJECT_ID_GUIDELINE,
-    ESCALATION_BOUNDARY_NOTE,
     get_recon_report_tool_guidance,
+    render_escalation_boundary_note,
 )
 from fused_memory.reconciliation.recon_self_model import (
     render_entity_standing_decision_schema_section,
@@ -52,7 +52,7 @@ You do not have access to task *write* tools — task reconciliation is Stage 2'
 `mcp__fused-memory__get_task` is permitted as a read-only verification call (see \
 ## Terminal-State Pre-Check Discipline below).
 
-{ESCALATION_BOUNDARY_NOTE}
+{render_escalation_boundary_note(can_escalate=False)}
 
 ## Your Consolidation Tasks
 1. **Within Mem0**: Identify duplicates, contradictions, and stale entries. Merge or delete.
