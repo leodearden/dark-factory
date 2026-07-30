@@ -392,6 +392,113 @@ class TestAdvisoryVsRejectionWording:
             assert payload['category'] == 'scope_violation', (root, payload)
             assert payload['agent_role'] == 'fused-memory/path-guard', (root, payload)
 
+    def test_advisory_and_rejection_do_not_cross_fold(self, tmp_path):
+        """The mode must be part of the dedup fingerprint.
+
+        report_rejection folds on a content fingerprint over the misroute
+        SHAPE (project_id + sorted matched_paths + suggested_project) with an
+        UNBOUNDED window.  Branching only the strings would leave the two modes
+        sharing a fingerprint, so an advisory and a FILES-certain rejection over
+        the same paths fold into ONE parent — whichever arrives first sets the
+        wording and the second event is then reported with the other's outcome.
+        That is this same mislabel bug in the opposite direction.
+        """
+        esc = ScopeViolationEscalator()
+        shape = {
+            'project_root': str(tmp_path),
+            'project_id': 'reify',
+            'candidate_title': 'Human gate: consolidate tree-sitter cluster',
+            'matched_paths': ('corpus/',),
+            'suggested_project': 'know_live',
+        }
+
+        rejection_id = esc.report_rejection(**shape)
+        advisory_id = esc.report_rejection(**shape, advisory=True)
+
+        assert rejection_id is not None
+        assert advisory_id is not None
+        assert advisory_id != rejection_id, (
+            'an advisory must not fold into a rejection parent (or vice versa) — '
+            'the surviving wording would mislabel the other outcome'
+        )
+
+        payloads = self._payloads(tmp_path)
+        assert len(payloads) == 2, f'expected two escalations, found: {payloads}'
+        # Assert on the PAIR, not just the count: a count-only assertion would
+        # also pass if both records carried rejection wording.
+        summaries = sorted(p['summary'] for p in payloads)
+        assert any(s.startswith('Misrouted task rejected: cites ') for s in summaries), (
+            summaries
+        )
+        assert any('ADVISORY' in s and 'CREATED' in s for s in summaries), summaries
+
+    def test_two_identical_advisories_still_fold(self, tmp_path):
+        """Advisories keep the anti-flood property that motivated task 2946.
+
+        Separating the modes must not separate advisories from each OTHER — a
+        recurring prose hit (e.g. the same reconciliation candidate re-proposed
+        every round) must still fold into one pending parent.
+        """
+        esc = ScopeViolationEscalator()
+        shape = {
+            'project_root': str(tmp_path),
+            'project_id': 'reify',
+            'candidate_title': 'Human gate: consolidate tree-sitter cluster',
+            'matched_paths': ('corpus/',),
+            'suggested_project': 'know_live',
+            'advisory': True,
+        }
+
+        first = esc.report_rejection(**shape)
+        second = esc.report_rejection(**shape)
+
+        assert first is not None
+        assert second == first, 'a repeated identical advisory must fold into the first'
+        payload = self._one_payload(tmp_path)
+        assert payload['id'] == first
+        assert payload['dedupe_count'] == 1
+        assert len(payload['dedupe_children']) == 1
+
+    def test_rejection_fingerprint_is_byte_identical_to_legacy(self, tmp_path):
+        """Load-bearing back-compat pin: the rejection digest must not change.
+
+        Any live PENDING rejection parent already on disk folds only if the new
+        code computes the SAME fingerprint.  Adding a mode token to BOTH
+        branches would change the rejection digest, orphan those parents, and
+        silently re-flood the operator queue that task 2946 quieted — so the
+        discriminator must be advisory-only.  Recomputed here from the
+        pre-change composition, independently of the production code path.
+        """
+        from escalation.dedupe import (  # type: ignore[import-untyped]
+            compute_content_fingerprint,
+        )
+
+        project_id = 'reify'
+        matched_paths = ('corpus/',)
+        suggested_project = 'know_live'
+        expected = compute_content_fingerprint(
+            'scope_violation',
+            'path_guard_misroute',
+            affected_ids=sorted([
+                *matched_paths,
+                f'suggested:{suggested_project}',
+                f'project:{project_id}',
+            ]),
+        )
+
+        esc = ScopeViolationEscalator()
+        esc.report_rejection(
+            project_root=str(tmp_path),
+            project_id=project_id,
+            candidate_title='Human gate: consolidate tree-sitter cluster',
+            matched_paths=matched_paths,
+            suggested_project=suggested_project,
+        )
+        payload = self._one_payload(tmp_path)
+        assert payload['dedupe_fingerprint'] == expected, (
+            'the non-advisory fingerprint composition must stay byte-identical'
+        )
+
 
 @pytest.mark.skipif(
     not sve_mod.HAS_ESCALATION,
