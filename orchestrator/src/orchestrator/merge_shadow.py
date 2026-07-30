@@ -340,6 +340,60 @@ def nextest_filter_ids(subset: Iterable[str]) -> list[str]:
     return out
 
 
+def parse_nextest_list_planned(stdout: str) -> list[str] | None:
+    """Parse ``cargo nextest list --message-format json`` into the planned set.
+
+    Pure — no I/O, no subprocess — so it is trivially unit-testable against
+    checked-in real producer bytes
+    (``tests/fixtures/reify_verify_retry/nextest-list.json``, unmodified
+    cargo-nextest 0.9.136 output) and reusable outside the probe.
+
+    **Key-space contract.** The returned ids are ``f"{binary-id} {test-name}"``
+    — exactly :func:`parse_per_test_results`' key space — so
+    ``build_fail_fast_map(planned, verdicts)`` composes directly with no
+    translation.  They are mapped through :func:`nextest_filter_ids` **only** at
+    the moment they are written to a nextest filter file.
+
+    **Fail-safe input path.** Every ``json.loads`` and field access is guarded:
+    any malformed shape returns ``None`` rather than raising.  ``None`` routes
+    the caller to a FULL verify — it is never treated as an empty plan.
+
+    Args:
+        stdout: Raw stdout of ``cargo nextest list --message-format json``.
+
+    Returns:
+        Sorted test ids on success.  ``[]`` for a well-formed document whose
+        suites carry no testcases (a genuinely test-free workspace).  ``None``
+        when the input is not a parseable nextest list document — the caller
+        MUST treat that as "do not narrow", not as an empty plan.
+    """
+    try:
+        doc = json.loads(stdout)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(doc, dict):
+        return None
+    suites = doc.get('rust-suites')
+    if not isinstance(suites, dict):
+        return None
+
+    planned: list[str] = []
+    try:
+        for suite_key, suite in suites.items():
+            if not isinstance(suite, dict):
+                return None
+            # nextest keys the rust-suites map BY the binary id, so the map key
+            # is the same value and is a sound fallback if the field is absent.
+            binary_id = suite.get('binary-id') or suite_key
+            testcases = suite.get('testcases')
+            if not isinstance(testcases, dict):
+                return None
+            planned.extend(f'{binary_id} {case}' for case in testcases)
+    except (AttributeError, TypeError):
+        return None
+    return sorted(planned)
+
+
 # ---------------------------------------------------------------------------
 # shadow-baseline map merge (PRD verify-retry-failed-only D4, §5.4).
 # ---------------------------------------------------------------------------
