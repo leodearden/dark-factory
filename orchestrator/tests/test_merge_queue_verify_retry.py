@@ -21,7 +21,7 @@ import logging
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -312,3 +312,140 @@ def test_load_reify_attempt_sidecar_malformed_returns_none(
 
     _place_real_sidecar(tmp_path, text=text)
     assert _load_reify_attempt_sidecar(tmp_path) is None, label
+
+
+# ---------------------------------------------------------------------------
+# _probe_nextest_planned — the DECIDED source of the attempt-0 planned set
+# (candidate (a): a `cargo nextest list` probe in the warm merge lane).
+#
+# Hermetic: never shells out.  The tests patch the module-level `_run_probe_cmd`
+# indirection, which exists for exactly this purpose.  The happy path is fed the
+# CHECKED-IN REAL cargo-nextest 0.9.136 bytes.
+# ---------------------------------------------------------------------------
+
+_NEXTEST_LIST_FIXTURE = _REIFY_FIXTURE_DIR / 'nextest-list.json'
+
+
+def _mq_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == 'orchestrator.merge_queue' and r.levelno >= logging.WARNING
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('profile', 'extra'),
+    [('debug', []), ('release', ['--release'])],
+)
+async def test_probe_nextest_planned_argv(
+    tmp_path: Path, profile: str, extra: list[str]
+) -> None:
+    """The probe lists the workspace as JSON, in the merge lane, per profile.
+
+    `--release` is the ONLY difference between the two profiles: nextest's
+    profile selection is a cargo flag, and the JSON message format is identical.
+    """
+    from orchestrator import merge_queue as mq
+
+    seen: dict[str, object] = {}
+
+    async def _fake(argv, *, cwd, timeout_secs):
+        seen['argv'] = list(argv)
+        seen['cwd'] = cwd
+        seen['timeout_secs'] = timeout_secs
+        return 0, _NEXTEST_LIST_FIXTURE.read_text()
+
+    with patch.object(mq, '_run_probe_cmd', _fake):
+        planned = await mq._probe_nextest_planned(
+            tmp_path, profile, timeout_secs=123.0
+        )
+
+    assert planned is not None
+    assert seen['argv'] == [
+        'cargo',
+        'nextest',
+        'list',
+        '--workspace',
+        '--message-format',
+        'json',
+        *extra,
+    ]
+    assert seen['cwd'] == tmp_path
+    assert seen['timeout_secs'] == 123.0
+
+
+@pytest.mark.asyncio
+async def test_probe_nextest_planned_parses_real_bytes(tmp_path: Path) -> None:
+    """rc=0 with real nextest JSON -> the parsed planned ids.
+
+    Delegates to parse_nextest_list_planned, so the ids land in
+    parse_per_test_results' key space with no translation.
+    """
+    from orchestrator import merge_queue as mq
+    from orchestrator.merge_shadow import parse_nextest_list_planned
+
+    raw = _NEXTEST_LIST_FIXTURE.read_text()
+
+    async def _fake(argv, *, cwd, timeout_secs):
+        return 0, raw
+
+    with patch.object(mq, '_run_probe_cmd', _fake):
+        planned = await mq._probe_nextest_planned(tmp_path, 'debug', timeout_secs=5.0)
+
+    assert planned == parse_nextest_list_planned(raw)
+    assert planned  # the fixture is non-empty, so this is a real assertion
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('label', 'result', 'exc'),
+    [
+        ('non-zero exit', (101, '{"rust-suites": {}}'), None),
+        ('empty stdout', (0, ''), None),
+        ('whitespace-only stdout', (0, '   \n'), None),
+        ('unparseable stdout', (0, 'error: could not compile'), None),
+        ('timeout', None, TimeoutError()),
+        ('cargo absent', None, FileNotFoundError('cargo')),
+        ('spawn OSError', None, OSError('fork failed')),
+    ],
+)
+async def test_probe_nextest_planned_failure_modes_return_none(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    label: str,
+    result: tuple[int, str] | None,
+    exc: BaseException | None,
+) -> None:
+    """Every failure mode returns None and WARNs, naming the profile and reason.
+
+    None is NEVER an empty plan — it routes the caller to a FULL verify.  A
+    silent empty plan would narrow the retry to nothing: a FALSE GREEN.
+    """
+    from orchestrator import merge_queue as mq
+
+    async def _fake(argv, *, cwd, timeout_secs):
+        if exc is not None:
+            raise exc
+        assert result is not None
+        return result
+
+    with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        with patch.object(mq, '_run_probe_cmd', _fake):
+            planned = await mq._probe_nextest_planned(
+                tmp_path, 'release', timeout_secs=5.0
+            )
+
+    assert planned is None, label
+    warnings = _mq_warnings(caplog)
+    assert any('release' in m for m in warnings), (label, warnings)
+
+
+@pytest.mark.asyncio
+async def test_probe_nextest_planned_timeout_is_bounded_by_a_named_constant() -> None:
+    """A module constant bounds the probe so it can never wedge the merge lane."""
+    from orchestrator.merge_queue import _NEXTEST_LIST_PROBE_TIMEOUT_SECS
+
+    assert isinstance(_NEXTEST_LIST_PROBE_TIMEOUT_SECS, (int, float))
+    assert 0 < _NEXTEST_LIST_PROBE_TIMEOUT_SECS <= 900
