@@ -28,6 +28,7 @@ from orchestrator.harness import Harness
 from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.lane_lifecycle import LaneRecord, LaneState
 from orchestrator.stranded_verified_green import VerifiedGreenMatch
+from orchestrator.task_ground_truth import EscalationRef
 
 
 @pytest.fixture(autouse=True)
@@ -857,6 +858,56 @@ def test_status_sets_exhaust_merge_outcome_vocabulary() -> None:
     assert not phantom, (
         f'classified status(es) {sorted(phantom)} are not in MergeOutcome.status'
     )
+
+
+def _ref(category: str, *, level: int = 1) -> EscalationRef:
+    """An open-escalation ref carrying *category* (δ predicate input)."""
+    return EscalationRef(id=f'esc-{category}', level=level, category=category)
+
+
+class TestOnlyMergeRemediable:
+    """Harness.MERGE_REMEDIABLE_ESC_CATEGORIES + _only_merge_remediable (δ).
+
+    The single predicate authority for the relaxed verified-green auto-merge
+    veto: an escalation that exists to REQUEST the merge must not itself veto
+    the merge, while every human-concern class still vetoes unchanged.
+    """
+
+    def test_set_contains_the_merge_request_class(self) -> None:
+        assert 'stranded_blocked' in Harness.MERGE_REMEDIABLE_ESC_CATEGORIES
+
+    @pytest.mark.parametrize('category', [
+        'design_concern',
+        'task_failure',
+        'review_issues',
+        'stranded_merge_failed',
+        'infra_issue',
+    ])
+    def test_set_excludes_human_concern_classes(self, category: str) -> None:
+        """A human-concern esc is NOT remediable by re-merging.
+
+        ``stranded_merge_failed`` in particular is the DURABLE
+        merge/verify-failure born-at-L2 signal — re-merging cannot remediate
+        it, so it MUST keep vetoing.
+        """
+        assert category not in Harness.MERGE_REMEDIABLE_ESC_CATEGORIES
+
+    def test_empty_is_vacuously_true(self) -> None:
+        """No open escalation → True, byte-identical to today's
+        ``not report.open_escalations``."""
+        assert Harness._only_merge_remediable([]) is True
+
+    def test_all_remediable_is_true(self) -> None:
+        assert Harness._only_merge_remediable([_ref('stranded_blocked')]) is True
+
+    def test_mixed_is_false(self) -> None:
+        """One non-remediable esc among remediable ones still vetoes."""
+        refs = [_ref('stranded_blocked'), _ref('design_concern')]
+        assert Harness._only_merge_remediable(refs) is False
+
+    @pytest.mark.parametrize('category', ['design_concern', 'stranded_merge_failed'])
+    def test_single_non_remediable_is_false(self, category: str) -> None:
+        assert Harness._only_merge_remediable([_ref(category)]) is False
 
 
 @pytest.mark.asyncio
