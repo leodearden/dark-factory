@@ -208,6 +208,17 @@ def _lexical_pairs(
                 yield (i, j)
 
 
+# The three Mem0-backed categories, enumerated ONCE. Graphiti-backed
+# categories (entities_and_relations, temporal_facts, decisions_and_rationale)
+# are deliberately absent: this detector reads the Mem0/Qdrant collection, and
+# a Graphiti edge has no vector here to cluster on.
+_ALL_CATEGORIES: tuple[str, ...] = (
+    'procedural_knowledge',
+    'preferences_and_norms',
+    'observations_and_summaries',
+)
+
+
 # Every way the ANN candidate path can lose a candidate, enumerated ONCE so
 # the zero-filled disclosure dict has a single definition. The metrics layer
 # emits one metric per key; an absent key downstream is indistinguishable
@@ -376,6 +387,7 @@ def build_sweep_plan(
     memories: list[dict],
     threshold: float = 0.85,
     *,
+    categories: Iterable[str] = _ALL_CATEGORIES,
     ann_pairs: Iterable[tuple[int, int]] | None = None,
     ann_scores: dict[tuple[int, int], float] | None = None,
     ann_disclosure: dict[str, int] | None = None,
@@ -396,6 +408,9 @@ def build_sweep_plan(
         threshold: Near-duplicate similarity threshold for the LEXICAL path
             only. The ANN cutoff is applied upstream, when the pairs are
             generated (see ``ann_pairs_from_neighbors``).
+        categories: Categories to sweep (default: all three Mem0 categories).
+            Clustering runs once PER category, so a cross-category union is
+            structurally impossible; records outside the set are ignored.
         ann_pairs: Optional ``(i, j)`` index pairs from the ANN path.
             Indices address *memories* as passed in — they are remapped
             across this function's category filter, and a pair whose
@@ -420,80 +435,95 @@ def build_sweep_plan(
         (``lexical_only_clusters`` / ``ann_only_clusters`` /
         ``both_paths_clusters``).
     """
-    candidate_indices = [
-        i for i, m in enumerate(memories) if m.get('category') == 'procedural_knowledge'
-    ]
-    candidates = [memories[i] for i in candidate_indices]
-    # Original index -> candidate index, so ANN pairs generated against the
-    # unfiltered scan still address the right records after filtering.
-    candidate_index = {orig: new for new, orig in enumerate(candidate_indices)}
-
-    normalized = [(m.get('content') or '').strip().lower() for m in candidates]
-    lexical_pairs = set(_lexical_pairs(normalized, threshold))
-
-    remapped_ann: set[tuple[int, int]] = set()
-    ann_score_by_pair: dict[tuple[int, int], float] = {}
-    for pair in ann_pairs or []:
-        left, right = candidate_index.get(pair[0]), candidate_index.get(pair[1])
-        if left is None or right is None:
-            continue  # endpoint excluded by the category filter
-        key = (left, right) if left < right else (right, left)
-        remapped_ann.add(key)
-        score = (ann_scores or {}).get(pair)
-        if score is not None:
-            ann_score_by_pair[key] = max(ann_score_by_pair.get(key, score), score)
-
-    groups = cluster_memories_by_pairs(candidates, lexical_pairs | remapped_ann)
-    # cluster_memories_by_pairs passes member dicts through by identity, so
-    # this recovers each cluster's indices for per-path attribution.
-    index_by_identity = {id(m): i for i, m in enumerate(candidates)}
-
     near_duplicate_groups: list[dict[str, Any]] = []
     # Mem0/Qdrant point ids can be int or str (ExtendedPointId), so this is
     # not narrowed to list[str].
     delete_candidates: list[Any] = []
     lexical_only = ann_only = both_paths = 0
+    clusters_total = 0
 
-    for group in groups:
-        member_indices = [index_by_identity[id(m)] for m in group]
-        member_set = set(member_indices)
-        in_group = [
-            (a, b)
-            for a in member_set
-            for b in member_set
-            if a < b
+    # Cluster PER CATEGORY. Widening the filter must not merge the corpus: a
+    # preference and a procedure that happen to read alike are different
+    # kinds of knowledge, and unioning them would be cross-store data loss
+    # rather than deduplication. Running the closure once per category makes
+    # a cross-category union structurally impossible instead of relying on a
+    # downstream check to catch it.
+    for category in categories:
+        candidate_indices = [
+            i for i, m in enumerate(memories) if m.get('category') == category
         ]
-        group_lexical = [p for p in in_group if p in lexical_pairs]
-        group_ann = [p for p in in_group if p in remapped_ann]
+        if not candidate_indices:
+            continue
+        candidates = [memories[i] for i in candidate_indices]
+        # Original index -> candidate index, so ANN pairs generated against
+        # the unfiltered scan still address the right records after filtering.
+        candidate_index = {orig: new for new, orig in enumerate(candidate_indices)}
 
-        found_by = []
-        if group_ann:
-            found_by.append('ann')
-        if group_lexical:
-            found_by.append('lexical')
-        if group_ann and group_lexical:
-            both_paths += 1
-        elif group_ann:
-            ann_only += 1
-        else:
-            lexical_only += 1
+        normalized = [(m.get('content') or '').strip().lower() for m in candidates]
+        lexical_pairs = set(_lexical_pairs(normalized, threshold))
 
-        scores = [ann_score_by_pair[p] for p in group_ann if p in ann_score_by_pair]
+        remapped_ann: set[tuple[int, int]] = set()
+        ann_score_by_pair: dict[tuple[int, int], float] = {}
+        for pair in ann_pairs or []:
+            left, right = candidate_index.get(pair[0]), candidate_index.get(pair[1])
+            if left is None or right is None:
+                # Endpoint outside this category — either filtered out
+                # entirely, or in a DIFFERENT category, in which case the
+                # pair is dropped here and cannot union across categories.
+                continue
+            key = (left, right) if left < right else (right, left)
+            remapped_ann.add(key)
+            score = (ann_scores or {}).get(pair)
+            if score is not None:
+                ann_score_by_pair[key] = max(ann_score_by_pair.get(key, score), score)
 
-        survivor, losers = pick_survivor(group)
-        near_duplicate_groups.append({
-            'survivor_id': survivor.get('id'),
-            'survivor_content': survivor.get('content'),
-            'member_ids': [m.get('id') for m in group],
-            'found_by': found_by,
-            'lexical_clustered': bool(group_lexical),
-            'ann_max_score': max(scores) if scores else None,
-            'lexical_max_ratio': _max_lexical_ratio(normalized, member_indices),
-        })
-        delete_candidates.extend(m.get('id') for m in losers)
+        groups = cluster_memories_by_pairs(candidates, lexical_pairs | remapped_ann)
+        clusters_total += len(groups)
+        # cluster_memories_by_pairs passes member dicts through by identity,
+        # so this recovers each cluster's indices for per-path attribution.
+        index_by_identity = {id(m): i for i, m in enumerate(candidates)}
+
+        for group in groups:
+            member_indices = [index_by_identity[id(m)] for m in group]
+            member_set = set(member_indices)
+            in_group = [
+                (a, b)
+                for a in member_set
+                for b in member_set
+                if a < b
+            ]
+            group_lexical = [p for p in in_group if p in lexical_pairs]
+            group_ann = [p for p in in_group if p in remapped_ann]
+
+            found_by = []
+            if group_ann:
+                found_by.append('ann')
+            if group_lexical:
+                found_by.append('lexical')
+            if group_ann and group_lexical:
+                both_paths += 1
+            elif group_ann:
+                ann_only += 1
+            else:
+                lexical_only += 1
+
+            scores = [ann_score_by_pair[p] for p in group_ann if p in ann_score_by_pair]
+
+            survivor, losers = pick_survivor(group)
+            near_duplicate_groups.append({
+                'survivor_id': survivor.get('id'),
+                'survivor_content': survivor.get('content'),
+                'member_ids': [m.get('id') for m in group],
+                'category': category,
+                'found_by': found_by,
+                'lexical_clustered': bool(group_lexical),
+                'ann_max_score': max(scores) if scores else None,
+                'lexical_max_ratio': _max_lexical_ratio(normalized, member_indices),
+            })
+            delete_candidates.extend(m.get('id') for m in losers)
 
     return {
-        'clusters_total': len(groups),
+        'clusters_total': clusters_total,
         'near_duplicate_groups': near_duplicate_groups,
         'delete_candidates': delete_candidates,
         'threshold': threshold,
@@ -521,65 +551,107 @@ def build_sweep_plan(
 _CONTENT_KEYS: tuple[str, ...] = ('data', 'memory', 'content')
 
 
+async def fetch_memories(
+    memory: Any,
+    project_id: str,
+    *,
+    categories: Iterable[str] = _ALL_CATEGORIES,
+    scan_limit: int = 5000,
+    with_vectors: bool = False,
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, int]]]:
+    """Enumerate a project's memories across *categories*, with scan stats.
+
+    Issues ONE ``scroll_by_metadata`` per category. That is not a missed
+    optimisation: the primitive builds an AND-equality filter and has no OR,
+    so a single widened call cannot express "any of these three categories".
+
+    Each raw record (``{'id', 'created_at', 'metadata'[, 'vector']}``) is
+    normalised to ``{'id', 'content', 'category', 'created_at', 'metadata'}``
+    (plus ``'vector'`` when *with_vectors*). The top-level ``'category'`` is
+    lifted out of the payload because ``build_sweep_plan`` filters on it —
+    without the lift every record would read as category ``None`` and the
+    sweep would be a silent no-op. Content is extracted by trying
+    ``_CONTENT_KEYS`` in order, falling back to ``''``; a record with no
+    extractable content never clusters and is never deleted.
+
+    Args:
+        memory: Live (or mock) MemoryService instance.
+        project_id: Project scope to scan.
+        categories: Categories to enumerate (default: all three Mem0 ones).
+        scan_limit: Max points PER CATEGORY.
+        with_vectors: Fetch each record's stored vector, for ANN candidate
+            generation. See ``Mem0Backend.scroll_by_metadata``.
+
+    Returns:
+        ``(records, scan_stats)``. *scan_stats* maps each requested category
+        to ``{'scanned': n, 'truncated': 0|1}``, counted PER CATEGORY so a cap
+        firing on one is never reported as a clean scan of the whole corpus.
+        ``truncated`` is an int rather than a bool so it can be summed and
+        emitted as a metric directly.
+
+    Raises:
+        TimeoutError: A Qdrant read timeout propagates rather than degrading
+            to an empty list (``scroll_by_metadata`` no longer swallows it),
+            so a timed-out scan is never mistaken for an empty corpus.
+    """
+    from fused_memory.models.scope import Scope  # noqa: PLC0415
+
+    scope = Scope(project_id=project_id)
+    records: list[dict[str, Any]] = []
+    scan_stats: dict[str, dict[str, int]] = {}
+
+    for category in categories:
+        raw_records = await memory.mem0.scroll_by_metadata(
+            scope, {'category': category}, limit=scan_limit, with_vectors=with_vectors,
+        ) or []
+        scan_stats[category] = {
+            'scanned': len(raw_records),
+            'truncated': int(len(raw_records) >= scan_limit),
+        }
+        for record in raw_records:
+            payload = record.get('metadata') or {}
+            content = ''
+            for key in _CONTENT_KEYS:
+                value = payload.get(key)
+                if isinstance(value, str) and value:
+                    content = value
+                    break
+            normalized: dict[str, Any] = {
+                'id': record.get('id'),
+                'content': content,
+                'category': payload.get('category'),
+                'created_at': record.get('created_at'),
+                'metadata': payload,
+            }
+            if with_vectors:
+                normalized['vector'] = record.get('vector')
+            records.append(normalized)
+
+    return records, scan_stats
+
+
 async def fetch_procedural_memories(
     memory: Any,
     project_id: str,
     scan_limit: int = 5000,
 ) -> list[dict[str, Any]]:
-    """Enumerate a project's ``procedural_knowledge`` memories from Mem0.
+    """Single-category ``procedural_knowledge`` fetch — retained for back-compat.
 
-    Calls ``memory.mem0.scroll_by_metadata(scope, {'category':
-    'procedural_knowledge'}, limit=scan_limit)`` and normalises each raw
-    record (``{'id', 'created_at', 'metadata'}``) into ``{'id', 'content',
-    'category', 'created_at', 'metadata'}``. The top-level ``'category'`` is
-    lifted out of the payload so ``build_sweep_plan`` (which filters on
-    ``m['category']``) sees the same shape the real fetch path produces —
-    without it, every fetched record's ``m.get('category')`` would be
-    ``None`` and the sweep would be a silent no-op. Content is extracted from
-    the payload by
-    trying ``_CONTENT_KEYS`` in order, falling back to ``''`` when no key
-    yields a usable value — a record with no extractable content therefore
-    normalises to ``content=''``, which never clusters and is never deleted
-    (safe degradation).
+    A thin alias over :func:`fetch_memories`, kept because task 3136 schedules
+    this detector and existing callers bind this name. It returns a BARE LIST
+    (not the ``(records, scan_stats)`` tuple) and defaults to payload-only, so
+    every pre-existing caller is unaffected by the widening to three
+    categories and to optional vectors.
 
-    Args:
-        memory: Live (or mock) MemoryService instance.
-        project_id: Project scope to scan.
-        scan_limit: Maximum number of points to enumerate (passed through to
-            ``scroll_by_metadata``).
-
-    Returns:
-        Normalised memory dicts; ``[]`` for an empty scan. A Qdrant
-        read-timeout now PROPAGATES as ``TimeoutError`` (``scroll_by_metadata``
-        no longer swallows it into an empty list), so this function raises
-        rather than silently returning ``[]`` on timeout.
+    New callers should use :func:`fetch_memories`, which reports per-category
+    scan stats the truncation guard and the metrics series both need.
     """
-    from fused_memory.models.scope import Scope  # noqa: PLC0415
-
-    scope = Scope(project_id=project_id)
-    raw_records = await memory.mem0.scroll_by_metadata(
-        scope, {'category': 'procedural_knowledge'}, limit=scan_limit,
+    records, _scan_stats = await fetch_memories(
+        memory, project_id,
+        categories=('procedural_knowledge',),
+        scan_limit=scan_limit,
     )
-    if not raw_records:
-        return []
-
-    normalized: list[dict[str, Any]] = []
-    for record in raw_records:
-        payload = record.get('metadata') or {}
-        content = ''
-        for key in _CONTENT_KEYS:
-            value = payload.get(key)
-            if isinstance(value, str) and value:
-                content = value
-                break
-        normalized.append({
-            'id': record.get('id'),
-            'content': content,
-            'category': payload.get('category'),
-            'created_at': record.get('created_at'),
-            'metadata': payload,
-        })
-    return normalized
+    return records
 
 
 # ---------------------------------------------------------------------------
