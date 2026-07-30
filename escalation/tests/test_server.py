@@ -2527,6 +2527,9 @@ class TestMergeRequestDedup:
             'a worktree attach carries no alias and no waiter, so its '
             f'request_id is not a poll handle: {result}'
         )
+        # NEITHER handle is present, so the remedy is named explicitly rather
+        # than left for the caller to infer: poll by branch / get_merge_queue.
+        assert result.get('poll_by') == 'branch', f'got: {result}'
 
     async def test_b_registry_attach_is_pollable(self, tmp_path: Path):
         """A registry attach DOES carry a pollable handle (alias + task_id)."""
@@ -2563,19 +2566,27 @@ class TestMergeRequestDedup:
             assert result.get('inflight_task_id') == '5566'
             assert result.get('inflight_request_id') == 'mr-primary'
             assert result.get('pollable') is True, f'got: {result}'
+            # The returned request_id IS the in-flight entry's id (D8 override),
+            # so it is the handle to poll.
+            assert result.get('poll_by') == 'request_id', f'got: {result}'
+            assert result.get('request_id') == 'mr-primary', f'got: {result}'
         finally:
             never_future.cancel()
 
-    async def test_c_legacy_registry_entry_without_request_id_is_unpollable(
+    async def test_c_legacy_registry_entry_polls_by_task_id(
         self, tmp_path: Path,
     ):
-        """A legacy entry (no request_id) is honestly reported as unpollable.
+        """A legacy entry (no request_id) is routed to the handle it DOES have.
 
         `_nonblocking_state_response` falls back to the SUBMITTING call's id when
         `req_id_override` is None, so the returned `request_id` is not a real
-        poll handle even though the attach came from the registry.  Deriving
-        `pollable` from `inflight_request_id is not None` rather than from
-        `source` is what makes this case come out right.
+        poll handle even though the attach came from the registry.  But the
+        entry still carries a task_id, and `merge_status` accepts task_id (D10),
+        so this attach IS pollable — just not by `request_id`.  Deriving the
+        verdict from the handles actually present (rather than from `source`, or
+        from `inflight_request_id` alone) is what makes this case come out
+        right: `poll_by='task_id'` names the usable handle instead of writing
+        the attach off as unpollable and sending the caller to the branch tier.
         """
         import asyncio
 
@@ -2605,7 +2616,14 @@ class TestMergeRequestDedup:
             assert result.get('status') == 'attached', f'got: {result}'
             assert result.get('source') == 'registry', f'got: {result}'
             assert result.get('inflight_request_id') is None
-            assert result.get('pollable') is False, f'got: {result}'
+            assert result.get('inflight_task_id') == 'existing-task'
+            assert result.get('poll_by') == 'task_id', f'got: {result}'
+            assert result.get('pollable') is True, (
+                'a task_id IS a merge_status handle (D10) — reporting this '
+                f'attach as unpollable would send the caller to git: {result}'
+            )
+            # ...and the returned request_id is explicitly NOT the handle here.
+            assert result.get('request_id') != result.get('inflight_request_id')
         finally:
             never_future.cancel()
 
