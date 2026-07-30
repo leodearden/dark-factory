@@ -1938,3 +1938,189 @@ class TestDegradedSearchDisclosure:
 
         assert [limit for _, limit in seen] == [10, 10, 10]
         assert len(seen) == 3, 'two phrasings + one claim query, once each'
+
+
+# ---------------------------------------------------------------------------
+# step-19: the D1 initial-state / known-bad report
+#
+# D1: the first run is a BASELINE SNAPSHOT, not a day-one alarm source. The
+# 3111/3112 fix lineage has been rewriting how the corpus is written for
+# months, so whatever this probe finds on run one is inherited state, not a
+# regression anybody introduced. The report says so in words and attributes it,
+# and it stops there: turning that list into a ratchet baseline is leaf
+# epsilon's job and every bound is leaf alpha's (G6). A runner that emitted
+# either would put the limits in two places.
+# ---------------------------------------------------------------------------
+
+FORBIDDEN_REPORT_WORDS = ('alarm', 'threshold', 'grandfather', 'verdict', 'tolerance')
+"""Words whose presence would mean this runner had started adjudicating.
+
+Not stylistic. The moment a report says a run "passed a threshold" there are
+two homes for that judgement — this script and leaf alpha's evaluator — and
+they will disagree the first time one of them changes.
+"""
+
+
+def _report_observations():
+    """Observations exercising every disclosure the report must carry."""
+    m = _mod()
+    return m.ProbeObservations(
+        phrasings=[
+            _phrasing_obs('alpha-topic', 'tuned', hit=True),
+            _phrasing_obs('alpha-topic', 'held out', hit=False, held_out=True),
+            m.PhrasingObservation(
+                topic='beta-topic', phrasing='reworded', held_out=False, k=5,
+                hit=True, rank=2, matched_by='last_known_id',
+            ),
+            m.PhrasingObservation(
+                topic='beta-topic', phrasing='held out', held_out=True, k=5,
+                hit=False, rank=None, matched_by=None,
+            ),
+        ],
+        claims=[_claim_obs('alpha-topic', 'a claim', recalled=False)],
+        contamination=[_contam_obs('alpha-topic', foreign=1, untopiced=3, scored=5)],
+        inversions=[m.InversionObservation(
+            topic='alpha-topic', phrasing='tuned', pairs_examined=1,
+            inversions=(m.InversionRecord(
+                topic='alpha-topic', phrasing='tuned',
+                superseded_hash='dead' * 4, successor_hash='beef' * 4,
+                superseded_rank=1, successor_rank=4,
+            ),),
+        )],
+    )
+
+
+def _report_series(observations=None):
+    return _build(observations if observations is not None else _report_observations())
+
+
+class TestInitialRunDetection:
+    """`is_initial_run(root)` — glob the eval dir through the shared helpers."""
+
+    def test_an_empty_root_is_the_initial_run(self, tmp_path):
+        assert _mod().is_initial_run(tmp_path)
+
+    def test_a_root_with_a_prior_artifact_is_not(self, tmp_path):
+        m = _mod()
+        m.emit_series(_report_series(), tmp_path)
+
+        assert not m.is_initial_run(tmp_path)
+
+    def test_another_evals_artifacts_do_not_count(self, tmp_path):
+        """Leaves beta/gamma/delta share one artifact root."""
+        other = tmp_path / 'e4-pointer-integrity'
+        other.mkdir(parents=True)
+        (other / 'metrics-20260101T000000Z.json').write_text('{}', encoding='utf-8')
+
+        assert _mod().is_initial_run(tmp_path)
+
+    def test_a_report_without_its_metrics_does_not_count(self, tmp_path):
+        """The metrics artifact is the series; the report is its companion."""
+        eval_dir = tmp_path / 'e1-retrieval-health'
+        eval_dir.mkdir(parents=True)
+        (eval_dir / 'report-20260101T000000Z.txt').write_text('x', encoding='utf-8')
+
+        assert _mod().is_initial_run(tmp_path)
+
+
+class TestProbeReport:
+    """`render_probe_report(series, observations, *, is_initial_run)`."""
+
+    def test_the_initial_run_enumerates_known_bad_items(self):
+        """(a) Attributed to the lineage, and labelled not-a-finding."""
+        report = _mod().render_probe_report(
+            _report_series(), _report_observations(), is_initial_run=True,
+        )
+
+        assert 'initial state' in report.lower()
+        assert 't-alpha-topic' in report
+        assert 't-beta-topic' in report
+        assert '3111' in report
+        assert '3112' in report
+        assert 'not a finding' in report.lower()
+
+    def test_a_later_run_has_no_initial_state_section(self):
+        """(b) Inherited state is only inherited once."""
+        report = _mod().render_probe_report(
+            _report_series(), _report_observations(), is_initial_run=False,
+        )
+
+        assert 'initial state' not in report.lower()
+        assert 'known-bad' not in report.lower()
+
+    def test_initial_state_defaults_off(self):
+        """A caller that forgot the flag must not fabricate a first run."""
+        report = _mod().render_probe_report(_report_series(), _report_observations())
+
+        assert 'initial state' not in report.lower()
+
+    @pytest.mark.parametrize('word', FORBIDDEN_REPORT_WORDS)
+    def test_the_report_adjudicates_nothing(self, word):
+        """(c) D1/G6: limits, ratchets and verdicts all live in other leaves."""
+        for initial in (True, False):
+            report = _mod().render_probe_report(
+                _report_series(), _report_observations(), is_initial_run=initial,
+            )
+            assert word not in report.lower()
+
+    def test_the_report_carries_the_matched_by_breakdown(self):
+        """(d) step-7's dual matcher, made visible."""
+        report = _mod().render_probe_report(_report_series(), _report_observations())
+
+        assert 'content_hash' in report
+        assert 'last_known_id' in report
+        assert 'unmatched' in report.lower()
+        assert 'beta-topic' in report
+
+    def test_the_report_carries_the_untopiced_disclosure(self):
+        """(d) step-13: the share's unclassifiable remainder, in prose too."""
+        report = _mod().render_probe_report(_report_series(), _report_observations())
+
+        assert 'untopiced' in report.lower()
+
+    def test_the_report_carries_the_registry_composition(self):
+        """(d) step-5: what derivation covered, and what it left out."""
+        m = _mod()
+        registry = m.TopicRegistry(
+            schema_version=1,
+            entries=(_entry(topic='alpha-topic'), _entry(topic='beta-topic')),
+            disclosures={'census_topics_skipped_singleton': 41},
+        )
+        report = m.render_probe_report(
+            _report_series(), _report_observations(), registry=registry,
+        )
+
+        assert 'census_topics_skipped_singleton' in report
+        assert '41' in report
+        assert 'hand' in report, 'the derived_from composition'
+
+    def test_the_report_names_each_inversion(self):
+        """(d) step-9: a bare count names no pair to go and look at."""
+        report = _mod().render_probe_report(_report_series(), _report_observations())
+
+        assert 'dead' * 4 in report
+        assert 'beef' * 4 in report
+
+    def test_the_shared_report_format_is_included_not_reimplemented(self):
+        """(e) The M1 companion stays the shared module's format."""
+        from shared.memory_eval_metrics import render_report  # noqa: PLC0415
+
+        series = _report_series()
+        shared_text = render_report(series)
+        report = _mod().render_probe_report(series, _report_observations())
+
+        assert report.startswith(shared_text.rstrip('\n'))
+
+    def test_the_report_still_names_degraded_queries(self):
+        """The step-17 section must survive the step-19 extension."""
+        m = _mod()
+        observations = _report_observations()
+        observations.degraded_queries.append(m.DegradedQuery(
+            topic='alpha-topic', query='tuned',
+            failed_stores=('qdrant',),
+            diagnostics=({'store': 'qdrant', 'error_type': 'ConnectionRefusedError'},),
+        ))
+        report = m.render_probe_report(_report_series(observations), observations)
+
+        assert 'qdrant' in report
+        assert 'ConnectionRefusedError' in report
