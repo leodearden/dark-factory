@@ -120,6 +120,21 @@ def _persisted_metadata(update_task: AsyncMock) -> dict:
     return kwargs.get('metadata') or args[1]
 
 
+def _persisted_mode(update_task: AsyncMock) -> str | None:
+    """Return the ``metadata_mode`` the persist call actually passed.
+
+    Asserting only that the payload OMITS a key is not sufficient to prove the
+    key was deleted: ``scheduler.update_task`` with no ``metadata_mode``
+    resolves to ``'merge'`` (scheduler.py), and the backend's merge mode is a
+    shallow ``{**existing, **incoming}`` that PRESERVES omitted keys
+    (sqlite_task_backend ``_merge_metadata``).  Only ``'replace'``
+    (whole-blob overwrite, delete-by-omission) removes anything, so the mode is
+    half of the persisted-clear contract and must be pinned alongside the payload.
+    """
+    assert update_task.await_args is not None
+    return update_task.await_args.kwargs.get('metadata_mode')
+
+
 def _fake_run(*, head: str = 'HEAD-SHA', rc: int = 0):
     """Return an async stand-in for orchestrator.workflow._run (git rev-parse)."""
 
@@ -181,6 +196,10 @@ class TestStampClearHelpers:
         # Clearing one key leaves siblings intact.
         assert meta['retry_ledger'] == {'x': 1}
         assert 'merge_retry_pending' not in f.wf.task['metadata']
+        # task 3024: the payload omitting the key is NOT enough — the default
+        # 'merge' mode preserves omitted keys, so a clear that ships no
+        # metadata_mode logs a removal it never performs.  Pin the mode.
+        assert _persisted_mode(f.update_task) == 'replace'
 
     @pytest.mark.asyncio
     async def test_clear_is_best_effort_and_does_not_raise_on_persist_failure(self):
@@ -530,6 +549,62 @@ class TestResumeGuard:
         assert outcome is None
         spies.merge_and_finalise.assert_not_awaited()
         spies.clear_merge_retry_pending.assert_not_awaited()
+
+    # -- task 3024 step-9: end-to-end — the REAL clear, at the scheduler boundary --
+
+    @pytest.mark.asyncio
+    async def test_conflict_arm_persists_a_replace_write_that_deletes_the_stamp(
+        self, monkeypatch,
+    ):
+        """The conflict arm's clear must actually DELETE the stamp server-side.
+
+        Deliberately does NOT spy ``_clear_merge_retry_pending``: the sibling
+        guard tests assert the arm CALLS the helper, which says nothing about
+        whether the helper achieves anything.  A ``metadata_mode``-less write
+        resolves to 'merge' on the backend, whose ``{**existing, **incoming}``
+        preserves omitted keys — so the stamp would survive, the guard would
+        re-fire on the next dispatch, and the wedge this task fixes would only
+        move one layer down.  Assert the real persisted call instead.
+        """
+        f = _make(metadata={'merge_retry_pending': dict(_STAMP), 'retry_ledger': {'x': 1}})
+        merge_and_finalise = AsyncMock(return_value=WorkflowOutcome.DONE)
+        f.wf._merge_and_finalise = merge_and_finalise  # type: ignore[method-assign]
+        monkeypatch.setattr('orchestrator.workflow._run', _fake_run(head='HEAD-SHA'))
+        f.git_ops.merge_tree_conflicts = AsyncMock(
+            return_value=ConflictProbe(clean=False, conflicted_paths=['x.py']),
+        )
+
+        outcome = await f.wf._resume_merge_retry_if_pending('task/77')
+
+        assert outcome is None
+        merge_and_finalise.assert_not_awaited()
+        # The write that lands must be able to remove a key, and must carry
+        # every sibling key through (whole-blob replace ⇒ omission = deletion).
+        assert _persisted_mode(f.update_task) == 'replace'
+        persisted = _persisted_metadata(f.update_task)
+        assert 'merge_retry_pending' not in persisted
+        assert persisted['retry_ledger'] == {'x': 1}
+
+    @pytest.mark.asyncio
+    async def test_probe_error_arm_persists_no_write_at_all(self, monkeypatch):
+        """Mirror: a transient probe failure must leave the backend untouched.
+
+        Also unspied, so this pins the composed behaviour rather than a mock:
+        the durable obligation survives a non-verdict, and no whole-blob
+        ``replace`` is issued on the strength of an error.
+        """
+        f = _make(metadata={'merge_retry_pending': dict(_STAMP), 'retry_ledger': {'x': 1}})
+        merge_and_finalise = AsyncMock(return_value=WorkflowOutcome.DONE)
+        f.wf._merge_and_finalise = merge_and_finalise  # type: ignore[method-assign]
+        monkeypatch.setattr('orchestrator.workflow._run', _fake_run(head='HEAD-SHA'))
+        f.git_ops.merge_tree_conflicts = AsyncMock(side_effect=RuntimeError('bad ref'))
+
+        outcome = await f.wf._resume_merge_retry_if_pending('task/77')
+
+        assert outcome is None
+        merge_and_finalise.assert_not_awaited()
+        f.update_task.assert_not_awaited()
+        assert f.wf.task['metadata']['merge_retry_pending'] == dict(_STAMP)
 
     @pytest.mark.asyncio
     async def test_main_sha_error_returns_none_without_clearing(self, monkeypatch):
