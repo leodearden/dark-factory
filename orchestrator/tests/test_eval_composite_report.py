@@ -471,6 +471,136 @@ class TestBuildCompositeReport:
         assert row['judge']['cost_usd'] == pytest.approx(0.03)
 
 
+# ---------------------------------------------------------------------------
+# Task 3099: the PLAN-ONLY composite path.
+#
+# An architect eval freezes every downstream role, so its cells carry no test
+# signal. Scored through the workflow path they ALL collapsed to composite
+# 0.0000 — which then made select_survivors' alphabetical tie-break the entire
+# architect selection mechanism (plans/eval-architect-effort-verdict-2026-07-27.md,
+# defects 1-2). A plan-only row is scored on its θ-rubric plan_quality instead.
+# ---------------------------------------------------------------------------
+
+def _arch(task_id, config_name, trial, *, plan_quality, cost_usd, duration_ms,
+          cap_tainted=False):
+    """A plan-only architect cell, shaped as run_architect_eval writes it:
+    tests_pass=None (no test signal) and quality carried by plan_quality."""
+    return _mresult(
+        task_id, config_name, trial,
+        quality=0.0,                 # composite_score is never set on this path
+        cost_usd=cost_usd, duration_ms=duration_ms,
+        tests_pass=None, role_under_test='architect',
+        plan_quality=plan_quality, cap_tainted=cap_tainted,
+        invocation_error='architect:cap_hit: session limit' if cap_tainted else None,
+    )
+
+
+class TestPlanOnlyComposite:
+    """A plan-only (architect) row scores on plan_quality, not on tests_pass."""
+
+    def test_plan_only_row_scores_its_plan_quality(self):
+        """The reported defect: this row used to report composite 0.0000."""
+        from orchestrator.evals.report import build_composite_report
+
+        # Sole config on the fixture → it IS its own cost/latency best → both
+        # efficiency axes 1.0. 0.6*0.9 + 0.2*1.0 + 0.2*1.0 == 0.94.
+        results = [
+            _arch('p1', 'arch-a', tr, plan_quality=0.9, cost_usd=0.3,
+                  duration_ms=60000)
+            for tr in (1, 2, 3)
+        ]
+        row = build_composite_report(results)['configs'][0]
+        assert row['composite'] == pytest.approx(0.94, abs=1e-4)
+        # …and `quality` is the axis that ACTUALLY fed the composite, so the
+        # table can never show quality=0.0000 beside a non-zero composite.
+        assert row['quality'] == pytest.approx(0.9, abs=1e-4)
+
+    def test_plan_only_rows_rank_by_plan_quality(self):
+        """Identical but for plan_quality → DIFFERENT, correctly-ordered
+        composites. Every architect row collapsing to 0.0000 is the defect."""
+        from orchestrator.evals.report import build_composite_report
+
+        results = [
+            _arch('p1', 'arch-good', tr, plan_quality=0.9, cost_usd=0.3,
+                  duration_ms=60000)
+            for tr in (1, 2, 3)
+        ] + [
+            _arch('p1', 'arch-weak', tr, plan_quality=0.4, cost_usd=0.3,
+                  duration_ms=60000)
+            for tr in (1, 2, 3)
+        ]
+        rows = {r['config']: r
+                for r in build_composite_report(results)['configs']}
+        # 0.6*0.9 + 0.4 == 0.94   vs   0.6*0.4 + 0.4 == 0.64
+        assert rows['arch-good']['composite'] == pytest.approx(0.94, abs=1e-4)
+        assert rows['arch-weak']['composite'] == pytest.approx(0.64, abs=1e-4)
+        assert rows['arch-good']['composite'] > rows['arch-weak']['composite']
+
+    def test_cap_tainted_trial_is_excluded_not_scored_zero(self):
+        """Task 3118's invariant, applied to the number that DRIVES selection.
+
+        A tainted cell measured NOTHING, so averaging it in as 0.0 would
+        penalise whichever candidate happened to be scheduled inside a cap
+        window. It is excluded from the composite/quality pools — but still
+        COUNTED, in `trials` and in `plan_quality_cap_excluded`, so nothing is
+        dropped silently.
+        """
+        from orchestrator.evals.report import build_composite_report
+
+        results = [
+            # One tainted (no plan_quality, zero cost — a 429 refusal) + one healthy.
+            _arch('p1', 'arch-mixed', 1, plan_quality=None, cost_usd=0.0,
+                  duration_ms=0, cap_tainted=True),
+            _arch('p1', 'arch-mixed', 2, plan_quality=0.8, cost_usd=0.3,
+                  duration_ms=60000),
+            # The control: the SAME healthy trial, with no tainted sibling.
+            _arch('p1', 'arch-clean', 1, plan_quality=0.8, cost_usd=0.3,
+                  duration_ms=60000),
+        ]
+        rows = {r['config']: r
+                for r in build_composite_report(results)['configs']}
+
+        assert rows['arch-mixed']['composite'] == pytest.approx(
+            rows['arch-clean']['composite'], abs=1e-9,
+        )
+        assert rows['arch-mixed']['composite'] == pytest.approx(0.88, abs=1e-4)
+        # Counted, not dropped.
+        assert rows['arch-mixed']['trials'] == 2
+        assert rows['arch-mixed']['plan_quality_cap_excluded'] == 1
+        assert rows['arch-clean']['plan_quality_cap_excluded'] == 0
+
+    def test_wholly_unmeasured_config_reports_none_not_zero(self):
+        """"We measured nothing" must never read as "it scored nothing"."""
+        from orchestrator.evals.report import build_composite_report
+
+        results = [
+            _arch('p1', 'arch-dark', tr, plan_quality=None, cost_usd=0.0,
+                  duration_ms=0, cap_tainted=True)
+            for tr in (1, 2, 3)
+        ]
+        row = build_composite_report(results)['configs'][0]
+        assert row['composite'] is None
+        assert row['quality'] is None
+        assert row['trials'] == 3
+        assert row['plan_quality_cap_excluded'] == 3
+
+    def test_plan_only_row_has_no_fabricated_tests_pass_rate(self):
+        """No test ran, so there is no pass RATE — not a 0% one."""
+        from orchestrator.evals.report import build_composite_report
+
+        results = [
+            _arch('p1', 'arch-a', 1, plan_quality=0.9, cost_usd=0.3,
+                  duration_ms=60000),
+            _mresult('p2', 'impl-a', 1, quality=1.0, cost_usd=5.0,
+                     duration_ms=900000, tests_pass=True),
+        ]
+        rows = {r['config']: r
+                for r in build_composite_report(results)['configs']}
+        assert rows['arch-a']['tests_pass_rate'] is None
+        # …while a workflow row keeps a real float.
+        assert rows['impl-a']['tests_pass_rate'] == pytest.approx(1.0)
+
+
 class TestEfficiencyBaselineIgnoresFailingTrials:
     """Amendment (reviewer: correctness): the per-fixture cost/latency floor is
     taken from PASSING trials only, so a cheap-but-WRONG run cannot deflate the
