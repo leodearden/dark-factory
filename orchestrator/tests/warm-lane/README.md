@@ -34,6 +34,23 @@ at that HEAD:
 | `test_warm_lane_gc.sh` | 1939 | `973fde7955` | 2026-07-28 |
 | `test_warm_lane_audit.sh` | 1999 | `973fde7955` | 2026-07-28 |
 
+`test_warm_lane_gc.sh` has since grown DARK-FACTORY-NATIVE coverage that has no
+reify counterpart, added by **task 3075** (PRD leaf γ) — the line count and SHA
+above still describe the ported baseline, not the current file:
+
+- **Block S** (23 asserts) — the durable lane record is Pass 1's reclaimability
+  gate. `S-basic` pins that an `assigned` lane survives with a FREE flock and no
+  `--extra-protect-glob` (the dark-factory ε shape); `S-reasons` pins the reason
+  vocabulary, the gate ORDER by attribution, and the appended
+  `preserved_assigned=` counter; `S-fallback` pins that the task-5572 `/proc`
+  scan is inherited as the recordless fallback and that
+  released/quarantined/corrupt all fall open; `S-toctou` pins PLACEMENT — a lane
+  assigned mid-pass is still preserved, so the read cannot be hoisted into an
+  up-front snapshot without going red.
+- **A10** (3 asserts) — the fail-loud guard for the new sibling
+  `lib_lane_state.sh`, with `lib_live_refs.sh` deliberately PRESENT in the
+  fixture so A9's guard cannot account for the result.
+
 ## Why these eight
 
 The port set was confirmed against **what α actually relocated**, not against a
@@ -246,13 +263,26 @@ Measured on an unloaded host, each `.sh` run directly and sequentially:
 | `test_provision_warm_lane_fs.sh` | 111 | 1.49s |
 | `test_warm_lane_gc_sweep.sh` | 86 | 6.73s |
 | `test_warm_lane_audit.sh` | 228 | 12.93s |
-| `test_warm_lane_gc.sh` | 170 | 16.95s |
-| **total** | **837** | **≈42s** |
+| `test_warm_lane_gc.sh` | 198 | 16.95s (stale — see below) |
+| **total** | **865** | **≈42s (stale)** |
 
 `test_warm_lane_gc.sh` dominates: 34 `git worktree add` calls, 33 `flock`
 acquisitions and `/proc/<pid>/{exe,cwd,fd,maps}` liveness walks. Under
 concurrent load these figures roughly double; the full driver module
 (12 pytest items, all co-located on one xdist worker) measured 47s.
+
+**The `test_warm_lane_gc.sh` wall-clock is OWED a re-measurement (task 3075).**
+Its assert count moved 170 → 198 when leaf γ added Block S and A10 (four new
+`run_helper reclaim` invocations, shaped to keep at most two `/proc`-walking
+lanes each). The only measurement taken on 2026-07-30 was **79.3s at loadavg
+109.67** — a heavily loaded host, not comparable to this table's unloaded
+baseline, so it is recorded here as an observation and deliberately NOT
+promoted into the table. Writing it in as the new unloaded figure, or writing
+in an estimate dressed as a measurement, would put a false number on main —
+which is what this table exists to prevent, since its stated purpose is that
+the *measured* cost is what justified answering PRD §11 q4 with "the default
+orchestrator suite". Re-measure on an unloaded host and replace both the row
+and the total.
 
 For reference, the whole orchestrator suite with these included is ~253s for
 ~13,100 tests.

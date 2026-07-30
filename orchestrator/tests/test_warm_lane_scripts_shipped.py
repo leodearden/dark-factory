@@ -18,6 +18,11 @@ ship three scripts that cannot execute:
   ``$SCRIPT_DIR/lib_live_refs.sh`` and deliberately ``exit 2`` when it is
   absent (reify task 5572 made that fail-loud precisely so a silently-missing
   liveness guard cannot recur).
+* ``warm-lane-gc.sh`` sources a SECOND lib since dark-factory task 3075 (leaf
+  γ): ``$SCRIPT_DIR/lib_lane_state.sh``, behind the same ``exit 2`` guard, so
+  it now needs BOTH libs to run at all.  Pass-1 reclaimability is decided from
+  the durable ``.lane-state`` record, and a silently-absent reader would
+  degrade reclaim back to the ``FREE ≈ flock-free`` approximation γ removed.
 * ``warm-lane-audit.sh`` sources TWO: ``$SCRIPT_DIR/lib_portable.sh``, and —
   since dark-factory task 3074 (leaf β) — ``$SCRIPT_DIR/lib_lane_state.sh``,
   behind a guard copied in shape from ``warm-lane-gc.sh``'s.  Unlike the other
@@ -124,8 +129,11 @@ class TestSiblingLibsTravelledWithTheScripts:
     FAIL_LOUD_FRAGMENTS = (
         'lib_live_refs.sh not found next to',
         'lib_portable.sh: No such file',
-        # warm-lane-audit.sh's guard for dark-factory's own lane-state lib
-        # (task 3074), copied in shape from warm-lane-gc.sh's.
+        # The guard for dark-factory's own lane-state lib, shared VERBATIM by
+        # warm-lane-audit.sh (task 3074, which established it) and
+        # warm-lane-gc.sh (task 3075, which reused the exact string so this
+        # tuple needed no amendment).  Both scripts are already in the
+        # parametrize list below, so both are covered by this one entry.
         'lib_lane_state.sh not found next to',
     )
 

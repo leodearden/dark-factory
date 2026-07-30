@@ -73,8 +73,9 @@ reify does not (the `.lane-state` record format, whose `state` values are the
 `LaneState` enum in `orchestrator/src/orchestrator/lane_lifecycle.py`; and
 `PROTECTED_PREFIXES` in `orchestrator/src/orchestrator/git_ops.py`). Its
 lane-state half was lifted out of `warm-lane-audit.sh`'s private reader — see
-Delta 4; its protected-prefix half has no in-tree consumer until leaf γ — see
-Delta 5.
+Delta 4; its protected-prefix half still has no in-tree consumer (leaf γ wired
+the lane-state half only — see Delta 5 for the measured reason and Delta 6 for
+what γ did land).
 
 ### Why these ten
 
@@ -255,8 +256,29 @@ picks up γ, neither of them validated in situ here:
 - Whatever names the deployment's interactive band must reach the bridge in
   `REIFY_WARM_LANE_IACT_PREFIX` (below). `warm-lane-gc.sh`'s current
   hand-maintained default hardcodes `_iact-*`, and also omits `.lane-state` and
-  `.task-meta` — the live INV-5 drift this leaf exists to make un-writable, and
-  which persists until γ deletes that default.
+  `.task-meta` — the live INV-5 drift this leaf exists to make un-writable.
+
+  **γ did NOT delete that default** (task 3075; this claim previously read
+  "persists until γ deletes that default" and is corrected here rather than
+  left false). It was deferred with the cost measured, not overlooked:
+
+  - The rendered glob
+    `_merge-*,_solo-*,_substrate-gate-*,_merge-verify,_offline-deep,.lane-state,.task-meta,_mainprobe-*,_mainsweep-*,_iact-*`
+    is behaviourally **indistinguishable** from gc.sh's current default under
+    any black-box test: `_merge-verify` is already covered by `_merge-*`, and
+    `.lane-state`/`.task-meta` are dot-prefixed while gc.sh's candidate loop is
+    `"$WORKTREES_DIR"/*/` with no `shopt -s dotglob` anywhere. The sole
+    observable payoff is honouring `REIFY_WARM_LANE_IACT_PREFIX`.
+  - Measured on this host 2026-07-30, the python bridge costs 1.05s / 4.45s /
+    3.48s across three consecutive runs. Negligible against a 25-40 minute
+    production reclaim pass, but it fires once per reclaim **invocation** and
+    the gc bash suite invokes reclaim roughly 30 times — it would materially
+    degrade the very suite γ's core change depends on for verification.
+
+  The wiring wants a memoization or an opt-out designed alongside it, so it is
+  filed as a follow-up rather than bundled onto the leaf that closes
+  esc-5334-6. Until it lands, `lane_protect_glob` remains a shipped function
+  with no in-tree consumer.
 
 ### Delta 5 — `lib_lane_state.sh` reads the deployment's interactive band
 
@@ -294,6 +316,48 @@ Two robustness properties of the same bridge, pinned by the same test class:
   attributable `[warn]` and returns non-zero. This narrows the wrong-root hazard
   to *another dark-factory checkout at the same depth*; it does not eliminate
   it, and that residue is the one case the fail-loud contract cannot detect.
+
+### Delta 6 — `warm-lane-gc.sh` decides Pass-1 reclaim from the lane record
+
+**`warm-lane-gc.sh` is no longer byte-identical to reify.** Added by **task
+3075** (PRD leaf γ), closing reify escalation `esc-5334-6`. Two changes, the
+same shape as Delta 4's:
+
+1. It now sources `$SCRIPT_DIR/lib_lane_state.sh`, behind a fail-loud guard
+   whose message reuses the *verbatim* fragment `lib_lane_state.sh not found
+   next to` that Delta 4's guard established — so
+   `orchestrator/tests/test_warm_lane_scripts_shipped.py`'s
+   `FAIL_LOUD_FRAGMENTS` covers both scripts with one entry. `exit 2` (the
+   wiring sentinel), not `1`, for the reason the exit-code table gives: a
+   silently-absent reader degrades reclaim back to the approximation this leaf
+   removes.
+
+2. Pass 1's reclaimability gate reads dark-factory's own durable record at
+   `<worktrees-dir>/.lane-state/<lane>.json`, per lane, under the flock the
+   loop already holds. `assigned`/`in_use` preserve; everything else — and
+   every unknown, unreadable or corrupt reading — falls through.
+
+   The rule this replaces was reify's, and it was **false in both halves**:
+   *"reclaimability is computed purely from filesystem + git + flock;
+   dark-factory FREE/ASSIGNED state is NOT consulted; FREE/idle ≈ no live
+   consumer holding the lane flock."* The inv.2 flock is held only across the
+   acquire reseed and across `run_scoped_verification`, never across the
+   implement phase, so an assigned lane looks FREE for most of its life and
+   task 5326's always-reclaim fired on it.
+
+   Pass 1 now has **three** gates in order — flock, record, `/proc`
+   live-reference. The record is between the other two because it is both
+   cheaper (~1ms vs a measured ~1.9s) and *authoritative*; an assigned lane
+   short-circuits before the walk, so a busy pool gets **cheaper**. The
+   task-5572 `/proc` scan is retained unconditionally as the recordless
+   fallback — gating it on "record absent" would let a `released` record reset
+   a lane whose straggler build is still live. **Pass 2 is deliberately
+   unchanged**: its candidates match neither `--lane-glob` nor
+   `--protect-glob`, so no lifecycle record is ever minted for them.
+
+   Fail-open is load-bearing in one direction only: preserving on an unknown
+   reading would freeze reclaim whenever `.lane-state/` is absent, re-creating
+   the 2026-07-10 ENOSPC accretion outage.
 
 ## Sibling-seed defaults, and who resolves them
 

@@ -107,14 +107,18 @@ SCRIPT_COVERAGE = {
 #: gated on ``REIFY_WARM_LANE_MOUNT``, which ``_sanitized_env`` always strips, so
 #: 45 is both its floor and its measured count under this driver.
 #:
-#: Any OTHER shortfall — a block short-circuited by a future edit, e.g. leaf γ's
-#: rewrite of ``warm-lane-gc.sh``'s reclaimability predicate — fails loudly here
-#: instead of passing as a green item that ran less than it claims.
+#: Any OTHER shortfall — a block short-circuited by a future edit — fails loudly
+#: here instead of passing as a green item that ran less than it claims.  Leaf γ
+#: (dark-factory task 3075) was the anticipated case and has now landed: it
+#: rewrote ``warm-lane-gc.sh``'s Pass-1 reclaimability predicate around the
+#: durable lane record and added 28 asserts (Block S + Block A's A10), so the
+#: floor moved 170 → 198.  It moved because the count was RE-MEASURED, not to
+#: make a red run green.
 ASSERT_FLOORS = {
     'test_warm_lane_disk_guard.sh': 62,
     'test_warm_lane_degenerate_ref.sh': 70,
     'test_thin_warm_lane.sh': 45,
-    'test_warm_lane_gc.sh': 170,
+    'test_warm_lane_gc.sh': 198,  # 170 + 28 (Block S 23 + A10 3 + S9b/S10b)
     'test_warm_lane_gc_sweep.sh': 86,
     'test_warm_lane_audit.sh': 225,  # 228 measured − 3 (L9, root-guarded)
     'test_warm_lane_sizing_lifecycle.sh': 65,
