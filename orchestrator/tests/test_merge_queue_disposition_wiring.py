@@ -39,7 +39,7 @@ from orchestrator.merge_queue import (
     _classify_main_health_red,
     _run_post_merge_verify,
 )
-from orchestrator.merge_types import QueuedBranch
+from orchestrator.merge_types import OutcomeKind, QueuedBranch
 from orchestrator.verify import VerifyResult
 
 MAIN_SHA = 'cafecafe1234567890deadbeef'
@@ -878,3 +878,115 @@ class TestRunPostMergeVerifyRealMainHeadFilter:
         disposition, _diag, _reason_suffix = asyncio.run(_run())
         assert captured.get('real_main_head_sha') == 'realmainheadsha', captured
         assert disposition == MergeFailureDisposition.BRANCH_BUG
+
+
+# ---------------------------------------------------------------------------
+# step-5 (task 3178) — bounded SkewEvidence on the merge_attempt payload
+# ---------------------------------------------------------------------------
+
+
+class TestEmitMergeAttemptSkewEvidence:
+    """``_emit_merge_attempt`` gains a keyword-only ``skew_evidence`` so a
+    merge_attempt row can persist the evidence bundle, not just
+    ``{disposition, outcome}``. That observability gap is why the false "shell
+    guards parse zero test ids" premise underpinning 2871/2918 survived two
+    task cycles: nobody could read the evidence back out of runs.db to check it.
+
+    The helper is deliberately DISPOSITION-AGNOSTIC about evidence — it writes
+    whatever bundle it is handed. Deciding *when* to emit at all is the caller's
+    guard (step-10), and that separation is what lets one code path serve both
+    the INTEGRATION_SKEW row and the adjudicated-INDETERMINATE row."""
+
+    @staticmethod
+    def _emit_and_read(tmp_path: Path, **kwargs) -> dict:
+        """Emit one merge_attempt against a REAL EventStore and read its data
+        back (the direct-emit unit-test convention named in
+        ``_emit_merge_attempt``'s docstring)."""
+        from orchestrator.merge_queue import _emit_merge_attempt
+
+        store = EventStore(tmp_path / 'runs.db', run_id='run-test')
+        _emit_merge_attempt(store, '3178', OutcomeKind.verify_failed, **kwargs)
+        rows = list(store.fetch_events_by_type(EventType.merge_attempt))
+        assert len(rows) == 1, f'expected exactly one merge_attempt row; got {rows}'
+        return rows[0]['data']
+
+    def test_evidence_keys_written_on_integration_skew_row(self, tmp_path: Path):
+        data = self._emit_and_read(
+            tmp_path,
+            disposition=MergeFailureDisposition.INTEGRATION_SKEW,
+            skew_evidence=SkewEvidence(
+                implicated_commits=('a' * 40,),
+                failing_tests=('src/x.py::test_bar',),
+                overlap_files=('src/x.py',),
+            ),
+        )
+        assert data['disposition'] == 'integration_skew'
+        # Stored as LISTS so the payload stays json-serialisable.
+        assert data['failing_tests'] == ['src/x.py::test_bar']
+        assert data['implicated_commits'] == ['a' * 40]
+        assert data['overlap_files'] == ['src/x.py']
+
+    def test_evidence_keys_written_on_adjudicated_indeterminate_row(
+        self, tmp_path: Path,
+    ):
+        """The payload half of task 3178's acceptance criterion (2): an I7
+        degrade persists the evidence the gate REFUSED to promote, and the row
+        is self-identifying as indeterminate so a census can compute a real
+        denominator for the adjudicated bucket."""
+        data = self._emit_and_read(
+            tmp_path,
+            disposition=MergeFailureDisposition.INDETERMINATE,
+            skew_evidence=SkewEvidence(
+                implicated_commits=('b' * 40,),
+                # The whole point: zero node-shaped ids DESPITE cited landings.
+                failing_tests=(),
+                overlap_files=('test_reify_audit_ptodo.sh',),
+            ),
+        )
+        assert data['disposition'] == 'indeterminate'
+        assert data['failing_tests'] == []
+        assert data['implicated_commits'] == ['b' * 40]
+        assert data['overlap_files'] == ['test_reify_audit_ptodo.sh']
+
+    def test_lists_are_bounded_and_truncation_records_the_true_total(
+        self, tmp_path: Path,
+    ):
+        """reify 5566 attempt-2 cited 22 SHAs touching 7 files. Bounding keeps a
+        row from bloating runs.db, but a SILENT cap would reproduce this task's
+        own failure mode — a reader inferring "3 commits were cited" from a
+        truncated row, exactly as "guards parse zero test ids" was inferred from
+        a row that never carried evidence. ``<key>_total`` makes the truncation
+        self-describing."""
+        from orchestrator.merge_queue import _MAX_EVENT_EVIDENCE_ITEMS
+
+        shas = tuple(f'{i:040x}' for i in range(22))
+        files = tuple(f'src/f{i}.py' for i in range(22))
+        tests = tuple(f'src/f{i}.py::test_x' for i in range(22))
+        data = self._emit_and_read(
+            tmp_path,
+            disposition=MergeFailureDisposition.INTEGRATION_SKEW,
+            skew_evidence=SkewEvidence(
+                implicated_commits=shas, failing_tests=tests, overlap_files=files,
+            ),
+        )
+        cap = _MAX_EVENT_EVIDENCE_ITEMS
+        assert cap < 22, 'fixture must exceed the cap for this test to mean anything'
+        assert data['implicated_commits'] == list(shas[:cap])
+        assert data['failing_tests'] == list(tests[:cap])
+        assert data['overlap_files'] == list(files[:cap])
+        # Truncation is never silent.
+        assert data['implicated_commits_total'] == 22
+        assert data['failing_tests_total'] == 22
+        assert data['overlap_files_total'] == 22
+
+    def test_omitting_skew_evidence_adds_no_keys(self, tmp_path: Path):
+        """The module's established "omitted optional kwarg adds no key"
+        convention (as for ``disposition``/``origin_host``/``probe_host``), so
+        none of the ~20 existing call sites' payloads shift and none need
+        auditing."""
+        data = self._emit_and_read(tmp_path)
+        assert data == {'outcome': OutcomeKind.verify_failed}
+
+    def test_explicit_none_behaves_identically_to_omitting(self, tmp_path: Path):
+        data = self._emit_and_read(tmp_path, skew_evidence=None)
+        assert data == {'outcome': OutcomeKind.verify_failed}
