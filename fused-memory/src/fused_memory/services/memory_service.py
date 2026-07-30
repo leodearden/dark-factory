@@ -3551,6 +3551,37 @@ class MemoryService:
 
         return result
 
+    @staticmethod
+    def _apply_metadata_delta(
+        existing_custom: dict[str, Any],
+        *,
+        metadata_patch: dict | None,
+        metadata_delete_keys: list[str] | None,
+        metadata_mode: str,
+    ) -> dict[str, Any]:
+        """Apply an ``update_memory`` metadata delta to a record's CUSTOM subset.
+
+        The single home for merge / replace / delete semantics (task 3088). Both
+        the metadata-only routes and the combined content+metadata fold call
+        this, so a caller gets the same resulting metadata whether or not it
+        also amended the content — semantics that drifted between the two arms
+        would be invisible to any test that exercised only one of them (INV-5).
+
+        *existing_custom* is the mem0-owned-key-stripped subset from
+        :func:`split_managed_metadata`; mem0-owned keys never reach here, which
+        is why nothing below has to defend against clobbering them.
+
+        ``metadata_mode='replace'`` replaces the whole custom subset with
+        exactly what *metadata_patch* supplies — never the whole Qdrant payload.
+        Deletions apply after the merge. Returns a fresh dict; the input is not
+        mutated.
+        """
+        new_custom = {} if metadata_mode == 'replace' else dict(existing_custom)
+        new_custom.update(metadata_patch or {})
+        for key in metadata_delete_keys or ():
+            new_custom.pop(key, None)
+        return new_custom
+
     async def update_memory(
         self,
         memory_id: str,
@@ -3634,18 +3665,33 @@ class MemoryService:
         # keys alike. Copied so the arms below can compute a delta against it
         # without mutating the value the read leg returned.
         existing_payload: dict[str, Any] = dict(existing.get('metadata') or {})
-        _managed, existing_custom = split_managed_metadata(existing_payload)
+        managed, existing_custom = split_managed_metadata(existing_payload)
+
+        # ONE delta computation for every arm. Sharing it is what keeps the
+        # merge/replace/delete semantics from drifting between the combined path
+        # and the metadata-only path (INV-5) — a caller must get the same
+        # resulting metadata whether or not it also amended the content.
+        new_custom = self._apply_metadata_delta(
+            existing_custom,
+            metadata_patch=metadata_patch,
+            metadata_delete_keys=metadata_delete_keys,
+            metadata_mode=metadata_mode,
+        )
 
         scope = Scope(project_id=project_id)
 
         if content is not None:
-            # Content-amend arm. Forward ONLY the custom subset as metadata=:
-            # mem0's _update_memory starts a FRESH payload from
-            # deepcopy(metadata) and re-attaches just its own nine keys, so
-            # anything custom that is not forwarded here is destroyed. This is
-            # the read-modify-forward dance tag_cgl_eta_rehome_scope.apply_tags
-            # already had to solve; the mem0-owned keys are deliberately NOT
-            # forwarded because mem0 restores or recomputes each of them itself.
+            # Content-amend arm, folding in any metadata delta rather than
+            # issuing a second write for it — a combined call must never leave
+            # the record carrying new content with stale metadata.
+            #
+            # Forward ONLY the custom subset as metadata=: mem0's
+            # _update_memory starts a FRESH payload from deepcopy(metadata) and
+            # re-attaches just its own nine keys, so anything custom that is not
+            # forwarded here is destroyed. This is the read-modify-forward dance
+            # tag_cgl_eta_rehome_scope.apply_tags already had to solve; the
+            # mem0-owned keys are deliberately NOT forwarded because mem0
+            # restores or recomputes each of them itself.
             result_data = await self._journaled_backend_call(
                 write_op_id=write_op_id,
                 causation_id=causation_id,
@@ -3653,7 +3699,7 @@ class MemoryService:
                 operation='update_memory',
                 payload=params,
                 coro=self.mem0.update(
-                    memory_id, content, scope, metadata=existing_custom,
+                    memory_id, content, scope, metadata=new_custom,
                 ),
             )
             result: dict[str, Any] = {
@@ -3661,7 +3707,7 @@ class MemoryService:
                 'store': 'mem0',
                 'id': memory_id,
                 'content_amended': True,
-                'metadata_patched': False,
+                'metadata_patched': bool(metadata_patch or metadata_delete_keys),
             }
             if isinstance(result_data, dict):
                 result.update(result_data)
@@ -3690,11 +3736,12 @@ class MemoryService:
                 # no ordering guarantee, no atomicity and no rollback: a failed
                 # second call leaves the record half-patched while the journal
                 # row claims the whole edit landed.
-                new_custom = {} if wants_replace else dict(existing_custom)
-                new_custom.update(metadata_patch or {})
-                for key in metadata_delete_keys or ():
-                    new_custom.pop(key, None)
-                new_payload = {**_managed, **new_custom}
+                #
+                # overwrite_payload replaces the ENTIRE point payload, so the
+                # mem0-owned subset rides along underneath — omit it and the
+                # point loses its own data/hash/created_at and stops being
+                # readable by mem0's own get/search.
+                new_payload = {**managed, **new_custom}
                 operation = 'update_memory_overwrite_payload'
                 coro = self.mem0.overwrite_payload(memory_id, new_payload, scope)
             elif metadata_patch:
