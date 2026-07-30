@@ -318,9 +318,8 @@ admission', NOT 'fable wins'."
 
 ### Each PRD-proposed reach, declined on its own terms
 
-The PRD names three ways fable could be admitted if ratified (Goal, §"admit fable as
-an architect option"). Each is declined here, for a distinct reason — none of them is
-"fable is bad":
+The PRD names three ways fable could be admitted if ratified (§Goal). Each is
+declined here, for a distinct reason — none of them is "fable is bad":
 
 - **`metadata.model_overrides` only** (opt-in per task) — declined. There is no
   measured advantage on this evidence to justify offering even an opt-in surface;
@@ -353,3 +352,96 @@ Not a confirm batch (§6) — it would inherit the same variance problem rather 
 resolving it. What would move the needle is more trials concentrated on the
 high-variance fixtures identified in §5, `reify_task_12` above all, or widening the
 hard-fixture set so a single coin-flip fixture cannot decide the aggregate result.
+
+---
+
+## 8. Appendix: reproduction recipe
+
+The tables in §2-§4 are checkable against the live artifacts without committing
+them. This is not a shipped script (out of scope — see below); it is the exact
+method used to produce every number above, so a reader with access to the main
+checkout can regenerate and verify it directly.
+
+```python
+import json
+from collections import defaultdict
+
+HARD_FIXTURES = {
+    'df_task_2284_adv_regression', 'df_task_2339_adv_verify', 'df_task_2430_adv_plan',
+    'reify_task_12', 'reify_task_27', 'df_task_18',
+}
+CANDIDATES = [
+    'architect-opus-max', 'architect-opus-high',
+    'architect-sonnet-high', 'architect-fable-high',
+]
+
+# supersede-by-rerun: later dumps override earlier ones on (task_id, config_name, trial)
+DUMPS_OLDEST_FIRST = [
+    '/home/leo/src/dark-factory/data/eval-campaign/fable-architect-only-results.json',
+    '/home/leo/src/dark-factory/data/eval-campaign/resume-20260729/reify/fable-architect-only-results.json',
+    '/home/leo/src/dark-factory/data/eval-campaign/resume-20260729/t2430/fable-architect-only-results.json',
+]
+
+merged = {}
+for path in DUMPS_OLDEST_FIRST:
+    for cell in json.load(open(path)):
+        key = (cell['task_id'], cell['config_name'], cell['trial'])
+        merged[key] = cell  # last write wins -> newest wave supersedes
+
+scored = [c for c in merged.values()
+          if c['task_id'] in HARD_FIXTURES and c['config_name'] in CANDIDATES]
+assert len(scored) == 72  # 18 per candidate, no gaps
+
+by_cfg = defaultdict(list)
+for c in scored:
+    by_cfg[c['config_name']].append(c)
+
+for cfg in CANDIDATES:
+    cells = by_cfg[cfg]
+    n = len(cells)
+    planned = [c for c in cells if c['plan_steps'] and c['plan_steps'] > 0]
+    done = [c for c in cells if c['outcome'] == 'done']
+    plan_rate = len(planned) / n
+    done_rate = len(done) / n
+    mean_pq_all = sum(c['plan_quality'] for c in cells) / n
+    mean_pq_planned = sum(c['plan_quality'] for c in planned) / len(planned)
+    total_cost = sum(c['cost_usd'] for c in cells)
+    cost_per_usable_plan = total_cost / len(planned)
+    print(cfg, f'{plan_rate:.1%}', f'{done_rate:.1%}',
+          round(mean_pq_all, 4), round(mean_pq_planned, 4),
+          round(total_cost, 2), round(cost_per_usable_plan, 3))
+```
+
+For the §4 per-fixture breakdown, group `scored` by `(task_id, config_name)` instead
+of just `config_name` and report `len(planned)/len(cells)` and `len(done)/len(cells)`
+per group.
+
+§5's figures (paired CI95, permutation p, Wilson intervals, leave-one-out) are **not**
+reproducible by this recipe — they are the campaign operator's own resampling output,
+transcribed with attribution from esc-2862-1's resolution (§5, above), not a
+recomputation from the raw cells.
+
+No aggregation script is checked in. Per the PRD's "Out of scope," eval-instrument
+work (scorers, aggregation helpers) belongs to eval-framework-revival's lane, and
+both artifact trees are gitignored, so a committed script would have no committed
+input to run against in CI. This snippet is documentation, meant to be pasted into a
+`python3 -c` invocation against the main checkout.
+
+### Cross-links
+
+- **Upstream PRD:** `plans/fable-architect-eval-admission-prd.md` §τ2, and its
+  capability manifest `plans/fable-architect-eval-admission-prd.capability-manifest.md`
+  §"τ2 — Committed decision record".
+- **Gate:** esc-2862-1 (task 2862), resolved 2026-07-30T15:30:58Z by
+  `eval-campaign-2026-07-27`.
+- **Precedents:** `plans/eval-architect-effort-verdict-2026-07-27.md` (campaign
+  verdict shape) and `plans/architect-effort-adoption-decision-2026-07-28.md`
+  (decision-record shape, the $/fixture-vs-$/usable-plan discipline).
+- **Consumers:** τ3 (admission ratification gate — deterministic pure gate naming
+  this record) and task 2544 (fable admission flip, `plans/adaptive-model-routing-prd.md`
+  ξ, amended; deps on both τ3 and the sibling `usage-gate-model-scoped-caps-prd.md`
+  integration gate ε, so a τ3 ratification alone cannot execute the flip).
+- **Raw dumps** (operator's own record, absolute paths, main checkout only):
+  - `/home/leo/src/dark-factory/data/eval-campaign/fable-architect-only-results.json`
+  - `/home/leo/src/dark-factory/data/eval-campaign/resume-20260729/reify/fable-architect-only-results.json`
+  - `/home/leo/src/dark-factory/data/eval-campaign/resume-20260729/t2430/fable-architect-only-results.json`
