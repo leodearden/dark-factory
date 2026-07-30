@@ -1,304 +1,367 @@
-# Machine-readable twin of server-side-api-error-handling-prd.capability-manifest.md
-# Path strictly derived from the PRD path (metadata.prd_path locates this file).
-# task_id values are null until commit_planning stamps them; mechanical
-# (grep/script) delivered_checks are copied into producer metadata.delivered_checks
-# at stamping; kind: manual entries stay sidecar-only (excluded from the gate).
 prd: plans/server-side-api-error-handling-prd.md
 schema_version: 1
 tasks:
-  - label: "α"
-    task_id: null
-    title: "shared: 5xx classification — is_server_error_status, ServerError outcome, classifier precedence, cap-net guard"
-    capabilities:
-      - name: "server-error-helper-single-source"
-        binding: "capability→producer (α itself) — INV-5 single source consumed by classifier/workflow/scheduler"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "def is_server_error_status"
-          paths: ["shared/src/shared/"]
-          expect: present
-      - name: "server-error-outcome-variant"
-        binding: "capability→producer (α itself) — tier set + precedence doc at invocation_outcome.py:36-47,372-373"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "class ServerError"
-          paths: ["shared/src/shared/"]
-          expect: present
-      - name: "classifier-5xx-above-timed-out"
-        binding: "capability→producer (α itself) — rule table exists cli_invoke.py:579-693; timed_out :657 currently shadows api_error :690"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "is_server_error_status"
-          paths: ["shared/src/shared/cli_invoke.py"]
-          expect: present
-      - name: "cap-net-suppressed-for-server-error"
-        binding: "rejection-mechanism — heuristic net exists cli_invoke.py:1303-1315; boundary row 9 asserts a fast 529 no longer marks the account CAPPED"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "behavioral property judged by α's boundary-row-9/10 tests, not a grep"
-  - label: "β"
-    task_id: null
-    title: "orchestrator: TerminalReport.api_error_status threaded to field-first record_requeue routing"
-    capabilities:
-      - name: "terminal-report-structured-field"
-        binding: "capability→producer (β itself) — TerminalReport workflow_types.py:92, TaskReport harness.py:870 verified"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "api_error_status"
-          paths: ["orchestrator/src/orchestrator/workflow_types.py"]
-          expect: present
-      - name: "field-first-transient-routing"
-        binding: "capability→producer (β itself) — record_requeue scheduler.py:7178, _transient_requeue_counts :1496/:7227, regex site :404-428 becomes fallback-only (INV-1)"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "api_error_status"
-          paths: ["orchestrator/src/orchestrator/scheduler.py"]
-          expect: present
-  - label: "γ"
-    task_id: null
-    title: "execute loop: first 5xx-attributed zero-output result → REQUEUED, no blocked write, counter untouched"
-    capabilities:
-      - name: "execute-requeue-not-block"
-        binding: "capability→producer — _requeue/REQUEUED machinery exists (harness.py:8410 → scheduler.py:7178); helper producer:α upstream; field producer:β upstream"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "is_server_error_status"
-          paths: ["orchestrator/src/orchestrator/workflow.py"]
-          expect: present
-      - name: "zero-output-counter-untouched-for-5xx"
-        binding: "rejection-mechanism — breaker exists (workflow.py:6573, config.py:2659); boundary rows 1-3 assert counter/wedge behavior preserved"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "counter-invariance across rows 1-3 is a test property, not mechanically greppable"
-  - label: "δ"
-    task_id: null
-    title: "scheduler: jittered exponential transient backoff + config knobs"
-    capabilities:
-      - name: "backoff-config-knobs"
-        binding: "capability→producer (δ itself) — arming site scheduler.py:7046, flat requeue_cooldown_secs config.py:2760 preserved for genuine requeues"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "transient_requeue_backoff_base_secs"
-          paths: ["orchestrator/src/orchestrator/"]
-          expect: present
-      - name: "backoff-cap-knob"
-        binding: "numeric-floor — min(30·2^(n-1), 900) with equal jitter; monotone, capped, jitter floor 15s; achievable by construction"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "transient_requeue_backoff_cap_secs"
-          paths: ["orchestrator/src/orchestrator/"]
-          expect: present
-      - name: "cooldown-visible-via-scheduler-state"
-        binding: "capability→producer — get_scheduler_state exists (fused-memory tools.py:5138); δ extends the snapshot if deadlines not yet exposed"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "signal is growing _requeue_until deltas via the product read path — judged by δ's test"
-  - label: "ε"
-    task_id: null
-    title: "observability: evidence JSON fields, steward-prompt fix, stale docstrings, OPERATIONS.md row"
-    capabilities:
-      - name: "evidence-json-carries-api-error-status"
-        binding: "capability→producer (ε itself) — _capture_zero_output_evidence workflow.py:6762"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "the field lands inside the evidence-JSON builder; a bare workflow.py grep for api_error_status is satisfied by γ/η/θ and proves nothing about ε"
-      - name: "steward-prompt-no-longer-recommends-failover-for-5xx"
-        binding: "rejection-mechanism — wrong guidance verified present at agents/roles.py:1167-1168; check passes when it is gone"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "failover often helps"
-          paths: ["orchestrator/src/orchestrator/agents/roles.py"]
-          expect: absent
-      - name: "evidence-path-docstrings-corrected"
-        binding: "rejection-mechanism — stale .task/ paths verified at workflow.py:6423,:6581; real dir is .task-meta/"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "\\.task/zero_output_evidence"
-          paths: ["orchestrator/src/orchestrator/workflow.py"]
-          expect: absent
-      - name: "operations-row-names-evidence-field"
-        binding: "capability→producer (ε itself) — the 529-burst troubleshooting row exists at OPERATIONS.md:~810 and today names no evidence artifact"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "zero_output_evidence"
-          paths: ["OPERATIONS.md"]
-          expect: present
-  - label: "ζ"
-    task_id: null
-    title: "Phase-1 integration gate: incident-burst harness simulation (boundary rows 1-5)"
-    capabilities:
-      - name: "phase1-boundary-rows-green-e2e"
-        binding: "DAG-direction — all legs upstream (α classifier, β routing, γ execute, δ backoff, ε evidence)"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "the task IS the check suite; its signal is boundary rows 1-5 green at harness level"
-  - label: "η"
-    task_id: null
-    title: "review phase: all-5xx REQUEUE, retry-burn skip, quality errors keep blocking"
-    capabilities:
-      - name: "review-5xx-attribution"
-        binding: "capability→producer — ERROR fold verified workflow.py:8140-8240; helper/field producer:α,β upstream; rows 7-8 discriminate transient vs quality"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "all-5xx-vs-mixed discrimination is a review-phase test property (rows 7-8)"
-  - label: "θ"
-    task_id: null
-    title: "planning + simple_task 5xx → real REQUEUED; cap-exhaust text names the outage"
-    capabilities:
-      - name: "planning-direct-requeue-no-steward"
-        binding: "capability→producer — planning classify sites workflow.py:3906/:4023; steward-conversion dependency removed by θ; helper/field producer:α,β upstream"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "no-steward-invocation is observed via product read paths in θ's test, not greppable"
-      - name: "simple-task-real-scheduler-requeued"
-        binding: "capability→producer — architect fall-through sentinel verified workflow.py:2455-2464; decision 9 replaces it with real REQUEUED for 5xx"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "routing change judged by θ's simple_task test (row 6 family)"
-      - name: "exhaust-text-names-http-status"
-        binding: "capability→producer — n_transient/n_genuine breakdown exists scheduler.py:7291-7306; θ adds status distribution + last error tail"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "report-text quality assertion (boundary row 6), not a stable grep"
-  - label: "κ"
-    task_id: null
-    title: "Phase-2 integration gate: cross-path 529 injection (boundary rows 6-8)"
-    capabilities:
-      - name: "phase2-boundary-rows-green-e2e"
-        binding: "DAG-direction — all legs upstream (η review, θ planning/simple, ζ phase-1 substrate)"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "the task IS the check suite; signal is boundary rows 6-8 green at harness level"
-  - label: "λ"
-    task_id: null
-    title: "substrate validation: startup-completion artifact matrix + fixtures"
-    capabilities:
-      - name: "startup-completion-artifact-matrix-committed"
-        binding: "G3 resolution (b) by construction — this task empirically characterizes the deliberately-unverified substrate the PRD scopes to ν; fixtures land under shared/tests/ with 'startup_completion' in their names (mandated)"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "startup_completion"
-          paths: ["shared/tests/"]
-          expect: present
-  - label: "μ"
-    task_id: null
-    title: "ApiHealthGate core: C4 state machine + api_error account-event rows"
-    capabilities:
-      - name: "api-health-gate-state-machine"
-        binding: "capability→producer (μ itself) — ServerError producer:α upstream; InvokeSlot.report choke point verified usage_gate.py:389"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "class ApiHealthGate"
-          paths: ["shared/src/shared/"]
-          expect: present
-      - name: "api-error-account-event-rows"
-        binding: "capability→producer (μ itself) — account_events store verified in shared/src/shared/cost_store.py; rows queryable via the existing cost-store read path"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "api_error"
-          paths: ["shared/src/shared/cost_store.py"]
-          expect: present
-  - label: "ν"
-    task_id: null
-    title: "watchdog two-regime startup grace (C5) using λ's predicate"
-    capabilities:
-      - name: "extended-grace-knob"
-        binding: "capability→producer (ν itself) — watchdog verified cli_invoke.py:797/:1613/:1929 (startup_grace_secs=120.0)"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "server_error_startup_grace_secs"
-          paths: ["shared/src/shared/", "orchestrator/src/orchestrator/"]
-          expect: present
-      - name: "startup-predicate-from-lambda"
-        binding: "DAG-direction — predicate basis producer:λ upstream (hard dep); conservative degrade to 120s when unreadable (B7 pattern)"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "predicate correctness is judged by ν's row-13 tests against λ's committed fixtures"
-  - label: "ξ"
-    task_id: null
-    title: "gate integration: invoke reporting, dispatch throttle, steward/watcher suppression"
-    capabilities:
-      - name: "orchestrator-wired-to-gate"
-        binding: "capability→producer — ApiHealthGate producer:μ upstream; reporting seam cli_invoke cap-retry loop; throttle seam scheduler.py:4478 region"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "ApiHealthGate"
-          paths: ["orchestrator/src/orchestrator/"]
-          expect: present
-      - name: "api-health-config-block"
-        binding: "capability→producer (ξ itself) — api_health.* knobs land in orchestrator config + defaults.yaml"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "api_health"
-          paths: ["orchestrator/src/orchestrator/config.py"]
-          expect: present
-      - name: "throttle-and-suppression-behavior"
-        binding: "rejection-mechanism — while open: dispatch ≤1 probe, steward spawns for 5xx L0s suppressed, watcher rotation deferred; all restored on close"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "open-state behavior is a harness-level test property (row 11 storm half)"
-  - label: "ο"
-    task_id: null
-    title: "operator surface: api_degraded lifecycle, evidence-gated park-stop auto-resume, dashboard strip"
-    capabilities:
-      - name: "api-degraded-escalation-lifecycle"
-        binding: "capability→producer (ο itself) — NEW category owned by this PRD (G4); file-on-open/auto-resolve-on-close/L2-promote per C4"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "api_degraded"
-          paths: ["orchestrator/src/orchestrator/"]
-          expect: present
-      - name: "park-stop-auto-resume-evidence-gated"
-        binding: "capability→producer — sentinel-L1 pause path verified harness.py:5983 (scheduler_paused), resolve→force_resume_scheduler :6538/:6655; decision 11 gates on ≥50% 5xx-attribution + gate-closed settle (INV-3)"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "evidence-gating is behavioral (row 12), incl. the negative half: non-5xx park-stops never auto-resume"
-      - name: "dashboard-provider-health-strip"
-        binding: "capability→producer — api_error rows producer:μ upstream; strip renders from seeded account_events fixture"
-        verdict: PASS
-        delivered_check:
-          kind: grep
-          pattern: "api_error"
-          paths: ["dashboard/"]
-          expect: present
-  - label: "π"
-    task_id: null
-    title: "Phase-3 integration gate: full-storm simulation (boundary rows 11-13)"
-    capabilities:
-      - name: "phase3-boundary-rows-green-e2e"
-        binding: "DAG-direction — all legs upstream (ν watchdog, ξ throttle/suppression, ο lifecycle)"
-        verdict: PASS
-        delivered_check:
-          kind: manual
-          reason: "the task IS the check suite; signal is rows 11-13 green in one harness run"
+- label: α
+  task_id: 3314
+  title: 'shared: 5xx classification — is_server_error_status, ServerError outcome,
+    classifier precedence, cap-net guard'
+  capabilities:
+  - name: server-error-helper-single-source
+    binding: capability→producer (α itself) — INV-5 single source consumed by classifier/workflow/scheduler
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def is_server_error_status
+      paths:
+      - shared/src/shared/
+      expect: present
+  - name: server-error-outcome-variant
+    binding: capability→producer (α itself) — tier set + precedence doc at invocation_outcome.py:36-47,372-373
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class ServerError
+      paths:
+      - shared/src/shared/
+      expect: present
+  - name: classifier-5xx-above-timed-out
+    binding: capability→producer (α itself) — rule table exists cli_invoke.py:579-693;
+      timed_out :657 currently shadows api_error :690
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: is_server_error_status
+      paths:
+      - shared/src/shared/cli_invoke.py
+      expect: present
+  - name: cap-net-suppressed-for-server-error
+    binding: rejection-mechanism — heuristic net exists cli_invoke.py:1303-1315; boundary
+      row 9 asserts a fast 529 no longer marks the account CAPPED
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: behavioral property judged by α's boundary-row-9/10 tests, not a grep
+- label: β
+  task_id: 3315
+  title: 'orchestrator: TerminalReport.api_error_status threaded to field-first record_requeue
+    routing'
+  capabilities:
+  - name: terminal-report-structured-field
+    binding: capability→producer (β itself) — TerminalReport workflow_types.py:92,
+      TaskReport harness.py:870 verified
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: api_error_status
+      paths:
+      - orchestrator/src/orchestrator/workflow_types.py
+      expect: present
+  - name: field-first-transient-routing
+    binding: capability→producer (β itself) — record_requeue scheduler.py:7178, _transient_requeue_counts
+      :1496/:7227, regex site :404-428 becomes fallback-only (INV-1)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: api_error_status
+      paths:
+      - orchestrator/src/orchestrator/scheduler.py
+      expect: present
+- label: γ
+  task_id: 3316
+  title: 'execute loop: first 5xx-attributed zero-output result → REQUEUED, no blocked
+    write, counter untouched'
+  capabilities:
+  - name: execute-requeue-not-block
+    binding: capability→producer — _requeue/REQUEUED machinery exists (harness.py:8410
+      → scheduler.py:7178); helper producer:α upstream; field producer:β upstream
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: is_server_error_status
+      paths:
+      - orchestrator/src/orchestrator/workflow.py
+      expect: present
+  - name: zero-output-counter-untouched-for-5xx
+    binding: rejection-mechanism — breaker exists (workflow.py:6573, config.py:2659);
+      boundary rows 1-3 assert counter/wedge behavior preserved
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: counter-invariance across rows 1-3 is a test property, not mechanically
+        greppable
+- label: δ
+  task_id: 3317
+  title: 'scheduler: jittered exponential transient backoff + config knobs'
+  capabilities:
+  - name: backoff-config-knobs
+    binding: capability→producer (δ itself) — arming site scheduler.py:7046, flat
+      requeue_cooldown_secs config.py:2760 preserved for genuine requeues
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: transient_requeue_backoff_base_secs
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: backoff-cap-knob
+    binding: numeric-floor — min(30·2^(n-1), 900) with equal jitter; monotone, capped,
+      jitter floor 15s; achievable by construction
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: transient_requeue_backoff_cap_secs
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: cooldown-visible-via-scheduler-state
+    binding: capability→producer — get_scheduler_state exists (fused-memory tools.py:5138);
+      δ extends the snapshot if deadlines not yet exposed
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: signal is growing _requeue_until deltas via the product read path —
+        judged by δ's test
+- label: ε
+  task_id: 3319
+  title: 'observability: evidence JSON fields, steward-prompt fix, stale docstrings,
+    OPERATIONS.md row'
+  capabilities:
+  - name: evidence-json-carries-api-error-status
+    binding: capability→producer (ε itself) — _capture_zero_output_evidence workflow.py:6762
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the field lands inside the evidence-JSON builder; a bare workflow.py
+        grep for api_error_status is satisfied by γ/η/θ and proves nothing about ε
+  - name: steward-prompt-no-longer-recommends-failover-for-5xx
+    binding: rejection-mechanism — wrong guidance verified present at agents/roles.py:1167-1168;
+      check passes when it is gone
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: failover often helps
+      paths:
+      - orchestrator/src/orchestrator/agents/roles.py
+      expect: absent
+  - name: evidence-path-docstrings-corrected
+    binding: rejection-mechanism — stale .task/ paths verified at workflow.py:6423,:6581;
+      real dir is .task-meta/
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: \.task/zero_output_evidence
+      paths:
+      - orchestrator/src/orchestrator/workflow.py
+      expect: absent
+  - name: operations-row-names-evidence-field
+    binding: capability→producer (ε itself) — the 529-burst troubleshooting row exists
+      at OPERATIONS.md:~810 and today names no evidence artifact
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: zero_output_evidence
+      paths:
+      - OPERATIONS.md
+      expect: present
+- label: ζ
+  task_id: 3320
+  title: 'Phase-1 integration gate: incident-burst harness simulation (boundary rows
+    1-5)'
+  capabilities:
+  - name: phase1-boundary-rows-green-e2e
+    binding: DAG-direction — all legs upstream (α classifier, β routing, γ execute,
+      δ backoff, ε evidence)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the task IS the check suite; its signal is boundary rows 1-5 green at
+        harness level
+- label: η
+  task_id: 3321
+  title: 'review phase: all-5xx REQUEUE, retry-burn skip, quality errors keep blocking'
+  capabilities:
+  - name: review-5xx-attribution
+    binding: capability→producer — ERROR fold verified workflow.py:8140-8240; helper/field
+      producer:α,β upstream; rows 7-8 discriminate transient vs quality
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: all-5xx-vs-mixed discrimination is a review-phase test property (rows
+        7-8)
+- label: θ
+  task_id: 3322
+  title: planning + simple_task 5xx → real REQUEUED; cap-exhaust text names the outage
+  capabilities:
+  - name: planning-direct-requeue-no-steward
+    binding: capability→producer — planning classify sites workflow.py:3906/:4023;
+      steward-conversion dependency removed by θ; helper/field producer:α,β upstream
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: no-steward-invocation is observed via product read paths in θ's test,
+        not greppable
+  - name: simple-task-real-scheduler-requeued
+    binding: capability→producer — architect fall-through sentinel verified workflow.py:2455-2464;
+      decision 9 replaces it with real REQUEUED for 5xx
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: routing change judged by θ's simple_task test (row 6 family)
+  - name: exhaust-text-names-http-status
+    binding: capability→producer — n_transient/n_genuine breakdown exists scheduler.py:7291-7306;
+      θ adds status distribution + last error tail
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: report-text quality assertion (boundary row 6), not a stable grep
+- label: κ
+  task_id: 3323
+  title: 'Phase-2 integration gate: cross-path 529 injection (boundary rows 6-8)'
+  capabilities:
+  - name: phase2-boundary-rows-green-e2e
+    binding: DAG-direction — all legs upstream (η review, θ planning/simple, ζ phase-1
+      substrate)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the task IS the check suite; signal is boundary rows 6-8 green at harness
+        level
+- label: λ
+  task_id: 3324
+  title: 'substrate validation: startup-completion artifact matrix + fixtures'
+  capabilities:
+  - name: startup-completion-artifact-matrix-committed
+    binding: G3 resolution (b) by construction — this task empirically characterizes
+      the deliberately-unverified substrate the PRD scopes to ν; fixtures land under
+      shared/tests/ with 'startup_completion' in their names (mandated)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: startup_completion
+      paths:
+      - shared/tests/
+      expect: present
+- label: μ
+  task_id: 3325
+  title: 'ApiHealthGate core: C4 state machine + api_error account-event rows'
+  capabilities:
+  - name: api-health-gate-state-machine
+    binding: capability→producer (μ itself) — ServerError producer:α upstream; InvokeSlot.report
+      choke point verified usage_gate.py:389
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class ApiHealthGate
+      paths:
+      - shared/src/shared/
+      expect: present
+  - name: api-error-account-event-rows
+    binding: capability→producer (μ itself) — account_events store verified in shared/src/shared/cost_store.py;
+      rows queryable via the existing cost-store read path
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: api_error
+      paths:
+      - shared/src/shared/cost_store.py
+      expect: present
+- label: ν
+  task_id: 3326
+  title: watchdog two-regime startup grace (C5) using λ's predicate
+  capabilities:
+  - name: extended-grace-knob
+    binding: capability→producer (ν itself) — watchdog verified cli_invoke.py:797/:1613/:1929
+      (startup_grace_secs=120.0)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: server_error_startup_grace_secs
+      paths:
+      - shared/src/shared/
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: startup-predicate-from-lambda
+    binding: DAG-direction — predicate basis producer:λ upstream (hard dep); conservative
+      degrade to 120s when unreadable (B7 pattern)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: predicate correctness is judged by ν's row-13 tests against λ's committed
+        fixtures
+- label: ξ
+  task_id: 3327
+  title: 'gate integration: invoke reporting, dispatch throttle, steward/watcher suppression'
+  capabilities:
+  - name: orchestrator-wired-to-gate
+    binding: capability→producer — ApiHealthGate producer:μ upstream; reporting seam
+      cli_invoke cap-retry loop; throttle seam scheduler.py:4478 region
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ApiHealthGate
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: api-health-config-block
+    binding: capability→producer (ξ itself) — api_health.* knobs land in orchestrator
+      config + defaults.yaml
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: api_health
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: present
+  - name: throttle-and-suppression-behavior
+    binding: 'rejection-mechanism — while open: dispatch ≤1 probe, steward spawns
+      for 5xx L0s suppressed, watcher rotation deferred; all restored on close'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: open-state behavior is a harness-level test property (row 11 storm half)
+- label: ο
+  task_id: 3328
+  title: 'operator surface: api_degraded lifecycle, evidence-gated park-stop auto-resume,
+    dashboard strip'
+  capabilities:
+  - name: api-degraded-escalation-lifecycle
+    binding: capability→producer (ο itself) — NEW category owned by this PRD (G4);
+      file-on-open/auto-resolve-on-close/L2-promote per C4
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: api_degraded
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: park-stop-auto-resume-evidence-gated
+    binding: capability→producer — sentinel-L1 pause path verified harness.py:5983
+      (scheduler_paused), resolve→force_resume_scheduler :6538/:6655; decision 11
+      gates on ≥50% 5xx-attribution + gate-closed settle (INV-3)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: 'evidence-gating is behavioral (row 12), incl. the negative half: non-5xx
+        park-stops never auto-resume'
+  - name: dashboard-provider-health-strip
+    binding: capability→producer — api_error rows producer:μ upstream; strip renders
+      from seeded account_events fixture
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: api_error
+      paths:
+      - dashboard/
+      expect: present
+- label: π
+  task_id: 3330
+  title: 'Phase-3 integration gate: full-storm simulation (boundary rows 11-13)'
+  capabilities:
+  - name: phase3-boundary-rows-green-e2e
+    binding: DAG-direction — all legs upstream (ν watchdog, ξ throttle/suppression,
+      ο lifecycle)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the task IS the check suite; signal is rows 11-13 green in one harness
+        run
