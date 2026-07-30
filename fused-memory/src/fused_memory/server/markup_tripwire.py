@@ -296,12 +296,19 @@ class MarkupStormCounter:
     One bounced write is routine; a BURST means the upstream serialization leak
     is actively running, which is the condition worth escalating rather than
     merely logging. Reproduces the established storm-counter body from
-    ``reconciliation/harness.py::_record_resume_failure`` and
-    ``reconciliation/bulk_reset_guard.py`` — append, prune to the window, count,
-    compare to the threshold, then rate-limit to one fire per window — using
-    bulk_reset_guard's guard-side injectable-clock convention
-    (``time_provider`` stored as ``self._now``) so the 3600s window can be
-    tested by advancing a fake clock instead of sleeping.
+    ``reconciliation/harness.py::_record_placeholder_finding_drop`` — append
+    ``(now, project)``, prune to the window, count, compare to the threshold,
+    then rate-limit to one fire per window, and report the DISTINCT project
+    labels seen in the window — using bulk_reset_guard's guard-side
+    injectable-clock convention (``time_provider`` stored as ``self._now``) so
+    the 3600s window can be tested by advancing a fake clock instead of
+    sleeping.
+
+    The per-project dimension is load-bearing, not decoration: one server
+    instance serves every known project, so a window that mixed two projects
+    into a bare count would let the caller attribute the whole burst to
+    whichever write happened to cross the threshold — and file the escalation
+    into that project's queue while the actually-leaking project got nothing.
 
     State is PROCESS-LOCAL and resets on restart, like every other in-process
     storm counter in this codebase: the counter exists to catch a live burst, not
@@ -322,11 +329,16 @@ class MarkupStormCounter:
         self._threshold = threshold
         self._window_seconds = window_seconds
         self._now = time_provider
-        self._events: deque[float] = deque()
+        self._events: deque[tuple[float, str | None]] = deque()
         self._last_fire_ts: float | None = None
 
-    def record(self) -> dict[str, Any] | None:
+    def record(self, project: str | None = None) -> dict[str, Any] | None:
         """Record one rejection; return a storm summary iff a burst just fired.
+
+        *project* is the label the rejection belongs to — the resolved
+        ``project_root``, or ``None`` when the boundary could not resolve one
+        (``add_memory``/``add_episode`` take a ``project_id``, which for a project
+        absent from the known-projects registry maps to no root at all).
 
         Returns ``None`` when the count within the window is below the threshold,
         AND when the threshold is met but a previous fire is still inside the
@@ -334,15 +346,18 @@ class MarkupStormCounter:
         would escalate hundreds of times for one incident).
 
         Otherwise stamps the rate-limit timestamp and returns a JSON-serializable
-        summary with ``count``, ``threshold``, ``window_seconds`` and ``hint``.
+        summary with ``count``, ``threshold``, ``window_seconds``, ``hint`` and
+        ``projects`` — the sorted DISTINCT non-``None`` labels seen in the window,
+        so the caller can attribute the burst (and escalate to every project it
+        touched) instead of blaming whichever write crossed the threshold.
         """
         now = self._now()
 
         # Append, then prune. The window is half-open: an event aged exactly
         # window_seconds is already out.
-        self._events.append(now)
+        self._events.append((now, project))
         cutoff = now - self._window_seconds
-        while self._events and self._events[0] <= cutoff:
+        while self._events and self._events[0][0] <= cutoff:
             self._events.popleft()
 
         count = len(self._events)
@@ -358,6 +373,9 @@ class MarkupStormCounter:
             'count': count,
             'threshold': self._threshold,
             'window_seconds': self._window_seconds,
+            # Unlabelled events still count toward the burst, but there is
+            # nothing to escalate them against, so they are simply not named.
+            'projects': sorted({p for _, p in self._events if p is not None}),
             'hint': _MARKUP_STORM_HINT,
         }
 
@@ -436,6 +454,10 @@ def emit_markup_storm_escalation(
         f'rejected_writes_in_window={count!r}',
         f'threshold={storm.get("threshold")!r}',
         f'window_seconds={window_seconds!r}',
+        # The window is shared across every project this server serves, so the
+        # count above may span more than this project_root. Naming them all
+        # keeps the record honest and points at the co-affected queues.
+        f'projects_in_window={storm.get("projects")!r}',
         '',
         'The fused-memory MCP write tripwire (task 3141) rejected multiple '
         'writes carrying raw MCP envelope markup within one rolling window. A '

@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from fused_memory.server import markup_tripwire
 from fused_memory.server.markup_tripwire import (
     MARKUP_OVERRIDE_KEY,
@@ -30,6 +32,7 @@ _STORM = {
     'count': 4,
     'threshold': 3,
     'window_seconds': 3600.0,
+    'projects': ['/project-a', '/project-b'],
     'hint': 'the leak is active; DF 3083 owns the root cause',
 }
 
@@ -322,6 +325,63 @@ class TestMarkupStormCounter:
         assert storm['hint']
         assert '3083' in storm['hint'], f"storm hint must name DF 3083: {storm['hint']!r}"
 
+    def test_reports_the_distinct_projects_seen_in_the_window(self):
+        """The burst is ATTRIBUTED, not pinned on whichever write crossed the line.
+
+        One server instance serves every known project, so a bare count would let
+        the caller escalate into the queue of the project that merely happened to
+        be last — naming it as the leaker while the project actually leaking got
+        nothing (and, because the rate limit is shared, no second chance until the
+        window rolled over). Mirrors the 'projects' key of
+        harness._record_placeholder_finding_drop.
+        """
+        clock = _FakeClock()
+        counter = MarkupStormCounter(threshold=3, window_seconds=100.0, time_provider=clock)
+        counter.record('/project-a')
+        counter.record('/project-a')
+        storm = counter.record('/project-b')
+        assert storm is not None
+        assert storm['count'] == 3
+        assert storm['projects'] == ['/project-a', '/project-b'], f'got: {storm!r}'
+
+    def test_projects_are_sorted_and_deduplicated(self):
+        """A repeated label appears once — this is a project SET, not a tally."""
+        clock = _FakeClock()
+        counter = MarkupStormCounter(threshold=4, window_seconds=100.0, time_provider=clock)
+        counter.record('/z')
+        counter.record('/a')
+        counter.record('/z')
+        storm = counter.record('/a')
+        assert storm is not None
+        assert storm['projects'] == ['/a', '/z'], f'got: {storm!r}'
+
+    def test_unlabelled_events_count_toward_the_burst_but_are_not_named(self):
+        """add_memory on an unknown project resolves no root; it is still a rejection.
+
+        Such an event must still push the counter toward the threshold — it is a
+        real leaked write — but there is no queue to escalate it into, so it must
+        not appear in `projects` (and must not crash `sorted` by mixing None in).
+        """
+        clock = _FakeClock()
+        counter = MarkupStormCounter(threshold=3, window_seconds=100.0, time_provider=clock)
+        counter.record(None)
+        counter.record(None)
+        storm = counter.record('/project-a')
+        assert storm is not None
+        assert storm['count'] == 3, f'unlabelled rejections must still count: {storm!r}'
+        assert storm['projects'] == ['/project-a'], f'got: {storm!r}'
+
+    def test_projects_reflects_only_the_unpruned_window(self):
+        """A project whose rejections aged out is no longer part of the burst."""
+        clock = _FakeClock()
+        counter = MarkupStormCounter(threshold=2, window_seconds=100.0, time_provider=clock)
+        counter.record('/stale')
+        clock.advance(150.0)
+        counter.record('/live')
+        storm = counter.record('/live')
+        assert storm is not None
+        assert storm['projects'] == ['/live'], f'stale project must be pruned: {storm!r}'
+
     def test_rate_limited_to_one_fire_per_window(self):
         """Further rejections inside the same window return None.
 
@@ -580,11 +640,18 @@ class TestEmitMarkupStormEscalation:
         assert payload['level'] == 1
 
         # The operator must be able to act without opening the code: the record
-        # names the owner of the root cause and the burst it observed.
-        text = f'{payload["summary"]}\n{payload["detail"]}'
-        assert '3083' in text, f'escalation must name DF 3083: {text!r}'
-        assert '4' in text, f'escalation must state the storm count: {text!r}'
-        assert '3600' in text, f'escalation must state the window: {text!r}'
+        # names the owner of the root cause and the burst it observed. The
+        # numbers are asserted as their EXACT labelled substrings — a bare
+        # `'4' in text` would also be satisfied by a digit in the interpolated
+        # tmp_path (`/tmp/pytest-of-leo/pytest-124/...`), i.e. it would pass with
+        # the count dropped entirely.
+        detail = payload['detail']
+        assert '3083' in f'{payload["summary"]}\n{detail}', f'must name DF 3083: {payload!r}'
+        assert 'rejected_writes_in_window=4' in detail, f'must state the count: {detail!r}'
+        assert 'window_seconds=3600.0' in detail, f'must state the window: {detail!r}'
+        assert "projects_in_window=['/project-a', '/project-b']" in detail, (
+            f'must name every project the burst spanned: {detail!r}'
+        )
 
     def test_escalation_id_is_greppable_via_the_stable_anchor(self, tmp_path):
         """The anchor is stable so ids form one greppable series per project."""
@@ -661,7 +728,24 @@ class TestEmitMarkupStormEscalation:
         assert not (tmp_path / 'data' / 'escalations').exists()
 
     def test_tolerates_a_storm_dict_missing_keys(self, tmp_path):
-        """Never raises on an unexpected storm shape — it is only a log payload."""
-        assert emit_markup_storm_escalation(str(tmp_path), {}) is not None or (
-            not markup_tripwire.HAS_ESCALATION
-        )
+        """A degenerate storm shape still files a well-formed, routable record.
+
+        "Never raises" is already established by the call returning at all; what
+        this pins is that the record stays USABLE — an escalation whose category
+        or anchor degraded along with its missing numbers could not be routed or
+        deduped, which is exactly when an operator needs it most.
+        """
+        if not markup_tripwire.HAS_ESCALATION:
+            pytest.skip('escalation package unavailable in this environment')
+
+        esc_id = emit_markup_storm_escalation(str(tmp_path), {})
+
+        assert esc_id is not None
+        files = list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+        assert len(files) == 1, f'expected exactly one escalation file, found: {files}'
+        payload = json.loads(files[0].read_text())
+        assert payload['id'] == esc_id
+        assert payload['category'] == 'mcp_markup_write_storm'
+        assert payload['task_id'] == 'markup-tripwire'
+        assert payload['detail'], f'a detail is still required: {payload!r}'
+        assert '3083' in payload['detail'], f'must still route to DF 3083: {payload!r}'

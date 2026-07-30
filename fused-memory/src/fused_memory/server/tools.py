@@ -729,7 +729,7 @@ def create_mcp_server(
             '(agent_id=%r field=%r matched_pattern=%r project_root=%r)',
             agent_id, field, pattern, project_root,
         )
-        storm = _markup_storm.record()
+        storm = _markup_storm.record(project_root)
         if storm is not None:
             # A burst, not an isolated slip: the upstream leak is live. Log it at
             # ERROR on one greppable line first — the block dict below only ever
@@ -743,23 +743,41 @@ def create_mcp_server(
                 storm.get('count', -1), storm.get('window_seconds', -1.0),
                 storm.get('threshold', -1), agent_id, field, pattern, project_root,
             )
-            # Escalation is purely additive — the rejection is already decided.
-            # emit_markup_storm_escalation is built never to raise, but a call
-            # site that relied on that promise would turn a future regression
-            # there into an outage here (same reasoning as task_interceptor's
-            # wrapping of scope_violation_escalator).
-            try:
-                esc_id = emit_markup_storm_escalation(project_root, storm)
-            except Exception:  # pragma: no cover — defensive only
-                logger.exception(
-                    'markup_tripwire: emit_markup_storm_escalation raised; '
-                    'continuing with the rejection',
-                )
-                esc_id = None
-            if esc_id is not None:
+            # File against EVERY project seen in the window, not just the one
+            # whose write happened to cross the threshold: the counter is shared
+            # across all projects this server serves, so escalating only the
+            # crossing write would name the wrong leaker AND leave the actually
+            # leaking project with nothing (the per-window rate limit means it
+            # gets no second chance until the window rolls over). The per-project
+            # anchor dedup collapses repeats inside each queue.
+            targets = storm.get('projects') or ([project_root] if project_root else [])
+            filed: dict[str, str] = {}
+            for target in targets:
+                # Escalation is purely additive — the rejection is already
+                # decided. emit_markup_storm_escalation is built never to raise,
+                # but a call site that relied on that promise would turn a future
+                # regression there into an outage here (same reasoning as
+                # task_interceptor's wrapping of scope_violation_escalator).
+                try:
+                    esc_id = emit_markup_storm_escalation(target, storm)
+                except Exception:  # pragma: no cover — defensive only
+                    logger.exception(
+                        'markup_tripwire: emit_markup_storm_escalation raised for '
+                        'project_root=%r; continuing with the rejection',
+                        target,
+                    )
+                    continue
+                if esc_id is not None:
+                    filed[target] = esc_id
+            if filed:
                 # Echoed back so the refused caller (or a reviewer reading the
-                # response) can find the filed escalation without grepping logs.
-                storm = {**storm, 'escalation_id': esc_id}
+                # response) can find the filed escalation without grepping logs —
+                # preferring THIS caller's project, falling back to any filed id
+                # when the caller's own project resolved to nothing.
+                storm = {
+                    **storm,
+                    'escalation_id': filed.get(project_root or '') or next(iter(filed.values())),
+                }
         return build_markup_block(agent_id, field, pattern, str(fields[field]), storm=storm)
 
     async def _log_read(

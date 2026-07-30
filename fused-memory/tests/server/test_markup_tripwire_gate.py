@@ -110,12 +110,14 @@ async def _reject_add_memory(server, agent_id: str = 'a') -> dict:
     ))
 
 
-async def _reject_submit_task(server, agent_id: str = 'a') -> dict:
+async def _reject_submit_task(
+    server, agent_id: str = 'a', project_root: str = '/project'
+) -> dict:
     """Drive one submit_task rejection and return the parsed block dict."""
     return _parse(await server._tool_manager.call_tool(
         'submit_task',
         {
-            'project_root': '/project',
+            'project_root': project_root,
             'prompt': 'a clean prompt',
             'description': f'dirty {_LEAKED_INVOKE}',
             'agent_id': agent_id,
@@ -133,9 +135,12 @@ def _assert_markup_block(result: object, *, field: str, pattern: str, agent_id: 
         f'expected matched_pattern={pattern!r}, got: {result!r}'
     )
     assert result.get('agent_id') == agent_id, f'expected agent_id echoed, got: {result!r}'
-    hint = result.get('hint')
-    assert hint, f'expected a non-empty hint, got: {result!r}'
-    assert '3083' in hint, f'expected the hint to name DF 3083, got: {hint!r}'
+    # Only that a hint reached the caller — the WORDING (that it names DF 3083
+    # and the override key) is pinned once, in
+    # test_markup_tripwire.py::test_hint_names_df_3083_and_the_override_key.
+    # Repeating the prose assertion through every gate test would red the whole
+    # suite for a legitimate rewrite once 3083 lands and the pointer changes.
+    assert result.get('hint'), f'expected a non-empty hint, got: {result!r}'
 
 
 class TestAddMemoryMarkupGate:
@@ -578,6 +583,36 @@ class TestUpdateTaskMarkupGate:
         assert result.get('error') != 'mcp_markup_write_blocked', f'got: {result!r}'
         interceptor.update_task.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_override_flag_is_not_persisted_into_task_metadata(self, task_server):
+        """The mirror of the submit_task assertion — stickier at THIS boundary.
+
+        update_task's metadata goes through a shallow last-write-wins merge into
+        the task's EXISTING blob (or an additive merge under
+        metadata_mode='additive'), so an unstripped flag would not merely be
+        minted on a fresh task: it would be grafted permanently onto a live one,
+        outliving the single write that set it.
+        """
+        server, interceptor = task_server
+
+        await server._tool_manager.call_tool(
+            'update_task',
+            {
+                'id': '3083',
+                'project_root': '/project',
+                'description': f'The leak emits {_LEAKED_CONTENT}',
+                'agent_id': 'a',
+                'metadata': {'allow_mcp_markup': True, 'execution_class': 'code_tdd'},
+            },
+        )
+        forwarded = interceptor.update_task.call_args.kwargs.get('metadata')
+        assert 'allow_mcp_markup' not in json.dumps(forwarded), (
+            f'the override flag must not reach the interceptor, got: {forwarded!r}'
+        )
+        assert 'code_tdd' in json.dumps(forwarded), (
+            f'other metadata must survive the strip, got: {forwarded!r}'
+        )
+
 
 class TestMarkupStormIntegration:
     """A BURST of rejections escalates instead of being absorbed silently (INV-4).
@@ -616,9 +651,9 @@ class TestMarkupStormIntegration:
         assert storm.get('count') == _MARKUP_STORM_THRESHOLD, f'got: {storm!r}'
         assert storm.get('threshold') == _MARKUP_STORM_THRESHOLD, f'got: {storm!r}'
         assert storm.get('window_seconds') == _MARKUP_STORM_WINDOW_SECONDS, f'got: {storm!r}'
-        hint = storm.get('hint')
-        assert hint, f'the storm needs a non-empty hint: {storm!r}'
-        assert '3083' in hint, f'the storm hint must name DF 3083: {hint!r}'
+        # Presence only; the storm hint's wording is pinned once, in
+        # test_markup_tripwire.py::test_storm_hint_names_df_3083.
+        assert storm.get('hint'), f'the storm needs a non-empty hint: {storm!r}'
 
     @pytest.mark.asyncio
     async def test_below_threshold_rejections_are_still_full_blocks(self, mixed_server):
@@ -703,6 +738,49 @@ class TestMarkupStormIntegration:
         assert storm_arg.get('count') == _MARKUP_STORM_THRESHOLD, f'got: {storm_arg!r}'
         assert crossing.get('storm', {}).get('escalation_id') == 'esc-markup-tripwire-1', (
             f'the filed escalation id must be echoed in the storm block: {crossing!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_every_project_in_the_window_is_escalated_not_only_the_crossing_one(
+        self, mixed_server, monkeypatch
+    ):
+        """Two rejections from project A plus one from B must escalate BOTH.
+
+        One counter serves every project on the server, so escalating only the
+        write that crossed the threshold would file the whole burst into B's
+        queue — naming B as the leaker on the strength of A's rejections — and
+        then, because the rate limit is shared too, A's next rejections inside
+        the same window would fire nothing at all. The actively-leaking project
+        would never get an escalation.
+        """
+        server, _mock_service, _interceptor = mixed_server
+        assert _MARKUP_STORM_THRESHOLD == 3, (
+            'this test drives exactly 3 rejections; update it alongside the constant'
+        )
+        calls: list[tuple] = []
+
+        def _fake_emit(project_root, storm):
+            calls.append((project_root, storm))
+            return f'esc-markup-tripwire-{len(calls)}'
+
+        monkeypatch.setattr(
+            'fused_memory.server.tools.emit_markup_storm_escalation', _fake_emit
+        )
+
+        await _reject_submit_task(server, project_root='/project-a')
+        await _reject_submit_task(server, project_root='/project-a')
+        crossing = await _reject_submit_task(server, project_root='/project-b')
+
+        assert [c[0] for c in calls] == ['/project-a', '/project-b'], (
+            f'each distinct project in the window gets its own escalation: {calls!r}'
+        )
+        storm = crossing.get('storm')
+        assert storm is not None, f'the crossing rejection must report a storm: {crossing!r}'
+        assert storm.get('projects') == ['/project-a', '/project-b'], (
+            f'the response must name every project the burst spanned: {storm!r}'
+        )
+        assert storm.get('escalation_id') == 'esc-markup-tripwire-2', (
+            f"the echoed id is the one filed for THIS caller's project: {storm!r}"
         )
 
     @pytest.mark.asyncio
