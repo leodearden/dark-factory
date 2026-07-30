@@ -86,6 +86,7 @@ from fused_memory.server.near_duplicate_guard import (
     resolve_near_dup_threshold,
     resolve_topic_guard_clusters,
 )
+from fused_memory.server.mem0_update_authz import resolve_mem0_update_authorization
 from fused_memory.server.tool_errors import mcp_tool_errors
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.utils.validation import (
@@ -2151,6 +2152,117 @@ def create_mcp_server(
             memory_id=resolved_id,
             store=store,
             project_id=project_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            causation_id=causation_id,
+            _source=source,
+        )
+
+    @mcp.tool()
+    @mcp_tool_errors()
+    async def update_memory(
+        memory_id: str,
+        store: str,
+        project_id: str,
+        content: str | None = None,
+        metadata_patch: dict | None = None,
+        metadata_delete_keys: list[str] | None = None,
+        metadata_mode: str = 'merge',
+        reason: str | None = None,
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        metadata: dict | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Amend a Mem0 memory's content and/or patch its metadata IN PLACE.
+
+        The Qdrant point id is preserved, so the record keeps its identity and
+        every reference to it stays valid. Use this to correct a record or tag
+        it for a deterministic (non-semantic) `get_memories_by_metadata` lookup,
+        instead of delete-then-re-add, which mints a new id.
+
+        Mem0 only. `store='graphiti'` is rejected — use `update_edge`.
+
+        NAMING (deliberate, do not "fix"): `metadata_patch` is the record
+        payload you are writing; `metadata` is the causation/envelope kwarg
+        every other tool takes and is NEVER stored on the record.
+
+        Args:
+            memory_id: The memory ID (from search results)
+            store: Must be "mem0"
+            project_id: Project scope (required)
+            content: New content text (the amend arm). Re-embeds the record.
+            metadata_patch: Metadata keys to write (the patch arm)
+            metadata_delete_keys: Metadata keys to remove. There is no magic
+                deletion sentinel: a key is deleted iff it is named here.
+            metadata_mode: "merge" (default) or "replace". Replace swaps the
+                custom-provenance subset only — mem0-owned keys survive.
+            reason: Why the record is being amended. Required with `content`.
+            agent_id: Which agent is updating (optional, auto-derived from MCP context)
+            session_id: Session context (optional, auto-derived from MCP context)
+            metadata: Optional key-value pairs (may contain _causation_id for recon)
+        """
+        # (1) Identity first — nothing downstream can gate an unresolved agent_id.
+        agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+
+        # (2) Authorization immediately next, BEFORE project canonicalization,
+        # store validation or arm validation. In-place amendment is a
+        # silent-rewrite primitive, so this gate is the whole point of the tool:
+        # an unauthorized caller is turned away before any work is done on its
+        # behalf, and learns nothing about the validity of its other arguments.
+        # Same ordering rationale add_system_record records for its own gate.
+        decision = resolve_mem0_update_authorization(
+            memory_service,
+            agent_id=agent_id,
+            content_amend=content is not None,
+            metadata_patch=bool(metadata_patch or metadata_delete_keys),
+        )
+        if not decision.allowed:
+            return {
+                'error': decision.error,
+                'error_type': decision.error_type,
+                'agent_id': agent_id,
+            }
+
+        # (3) delete_memory's prologue verbatim. NO _backlog_gate: that gate is
+        # for tools creating new backlog pressure (add_memory, add_system_record);
+        # this one mutates an existing record and creates none.
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
+        if err := validate_project_id(project_id):
+            return err
+        if err := _known_project_gate(project_id):
+            return err
+
+        # (4) Store validation. A valid-but-wrong 'graphiti' is named rather
+        # than silently fanned out — every search result carries a store field,
+        # so a caller updating a record it just found calls this the same way it
+        # calls delete_memory, and a wrong value is actionable.
+        if store not in _VALID_STORES:
+            return {
+                'error': (f'Invalid store {store!r}. Must be one of {sorted(_VALID_STORES)}.'),
+                'error_type': 'ValidationError',
+            }
+        if store != SourceStore.mem0.value:
+            return {
+                'error': (
+                    f'update_memory does not support store={store!r}. In-place '
+                    'amendment is Mem0-only; use update_edge to change a '
+                    'Graphiti edge fact.'
+                ),
+                'error_type': 'ValidationError',
+            }
+
+        causation_id, source, _ = _extract_causation(metadata, agent_id)
+        return await memory_service.update_memory(
+            memory_id=memory_id,
+            project_id=project_id,
+            content=content,
+            metadata_patch=metadata_patch,
+            metadata_delete_keys=metadata_delete_keys,
+            metadata_mode=metadata_mode,
+            reason=reason,
             agent_id=agent_id,
             session_id=session_id,
             causation_id=causation_id,
