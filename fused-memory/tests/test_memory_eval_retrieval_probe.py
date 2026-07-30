@@ -790,6 +790,119 @@ class TestObservationBuilder:
         assert not obs.degraded
 
 
+# ---------------------------------------------------------------------------
+# step-9: superseded-above-successor, pure over synthetic result lists
+# ---------------------------------------------------------------------------
+
+def _pair_entry(topic='sup', old='old text', new='new text'):
+    m = _mod()
+    base = _entry(topic=topic, content=new)
+    return m.RegistryEntry(
+        topic=base.topic,
+        project_id=base.project_id,
+        derived_from=base.derived_from,
+        canonical=base.canonical,
+        phrasings=base.phrasings,
+        supersedes_pairs=(
+            m.SupersedesPair(
+                superseded_hash=m.content_key(old),
+                successor_hash=m.content_key(new),
+            ),
+        ),
+    )
+
+
+class TestSupersededInversions:
+    def test_superseded_ranked_above_successor_is_one_inversion(self):
+        entry = _pair_entry()
+        results = [_R(content='old text', id='A'), _R(content='new text', id='B')]
+        inversions = _mod().superseded_inversions(results, entry)
+
+        assert len(inversions) == 1
+        record = inversions[0]
+        assert record.superseded_hash == _mod().content_key('old text')
+        assert record.successor_hash == _mod().content_key('new text')
+        assert record.superseded_rank == 1
+        assert record.successor_rank == 2
+        assert record.topic == 'sup'
+
+    def test_correct_order_is_no_inversion(self):
+        entry = _pair_entry()
+        results = [_R(content='new text', id='B'), _R(content='old text', id='A')]
+
+        assert _mod().superseded_inversions(results, entry) == []
+
+    @pytest.mark.parametrize('present', ['old text', 'new text'])
+    def test_only_one_member_present_is_no_inversion(self, present):
+        """An absent successor is a findability question, not an inversion.
+
+        canonical-in-top-k already measures it; counting it here too would
+        charge one defect against two metrics.
+        """
+        entry = _pair_entry()
+        results = [*_filler(2), _R(content=present, id='X')]
+
+        assert _mod().superseded_inversions(results, entry) == []
+
+    def test_neither_present_is_no_inversion(self):
+        assert _mod().superseded_inversions(_filler(3), _pair_entry()) == []
+
+    def test_several_pairs_are_counted_independently(self):
+        m = _mod()
+        base = _entry(topic='multi', content='c1')
+        entry = m.RegistryEntry(
+            topic=base.topic, project_id=base.project_id,
+            derived_from=base.derived_from, canonical=base.canonical,
+            phrasings=base.phrasings,
+            supersedes_pairs=(
+                m.SupersedesPair(m.content_key('o1'), m.content_key('c1')),
+                m.SupersedesPair(m.content_key('o2'), m.content_key('c2')),
+            ),
+        )
+        results = [
+            _R(content='o1'), _R(content='o2'), _R(content='c1'), _R(content='c2'),
+        ]
+
+        assert len(m.superseded_inversions(results, entry)) == 2
+
+    def test_ties_resolve_by_returned_list_order_deterministically(self):
+        """Equal relevance_score must not let the count flap between runs."""
+        entry = _pair_entry()
+        tied_old_first = [
+            _R(content='old text', relevance_score=0.5),
+            _R(content='new text', relevance_score=0.5),
+        ]
+        tied_new_first = [
+            _R(content='new text', relevance_score=0.5),
+            _R(content='old text', relevance_score=0.5),
+        ]
+        run = _mod().superseded_inversions
+
+        assert len(run(tied_old_first, entry)) == 1
+        assert run(tied_old_first, entry) == run(tied_old_first, entry)
+        assert run(tied_new_first, entry) == []
+
+    def test_malformed_supersedes_metadata_is_never_read(self):
+        """INV-5: the supersedes-pointer parser is task 3196's, not this one's.
+
+        A deliberately malformed metadata['supersedes'] must not change the
+        count — if it did, a second pointer parser would have grown here.
+        """
+        entry = _pair_entry()
+        run = _mod().superseded_inversions
+        clean = [_R(content='old text'), _R(content='new text')]
+        poisoned = [
+            _R(content='old text', metadata={'supersedes': {'nonsense': [1, 2, None]}}),
+            _R(content='new text', metadata={'supersedes': 'not-a-list-or-dict'}),
+        ]
+
+        assert run(poisoned, entry) == run(clean, entry)
+        assert len(run(poisoned, entry)) == 1
+
+    def test_entry_without_pairs_yields_nothing(self):
+        assert _mod().superseded_inversions(_filler(3), _entry()) == []
+
+
 class TestContentKey:
     """`content_key(text)` — whitespace-normalized sha256[:16]."""
 
