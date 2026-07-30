@@ -582,6 +582,93 @@ def test_parse_nextest_list_planned_missing_binary_id_falls_back_to_key() -> Non
     assert parse_nextest_list_planned(doc) == ['crate-z::lib m::t']
 
 
+# ---------------------------------------------------------------------------
+# run_all {failed}-member extraction (task 3059).
+#
+# Producer contract: reify tests/infra/run_all.sh:26-36 (documented) and
+# :1839-1841 (emitted).  Two lines follow the Summary line when anything failed:
+#
+#   "=== FAILED: <space-separated names> ==="   human-readable summary
+#   "FAILED <space-separated names>"            bare classifier marker
+#
+# The bare marker is the one DF's own verify.py already regexes as `^FAILED\\s`
+# (pattern #7b), so this parser consumes an established, source-verified line —
+# not an invented format.  Driven from the checked-in fixture; see PROVENANCE.md
+# (that fixture is contract-derived-from-source, weaker grounding than a
+# captured run).
+# ---------------------------------------------------------------------------
+
+
+def test_parse_failed_run_all_members_real_contract_bytes() -> None:
+    """The bare `FAILED <names>` marker yields exactly those names, in order.
+
+    Reads the checked-in fixture whole — including the verbatim contract
+    excerpt, whose lines are '#'-commented and so must NOT match.
+    """
+    from orchestrator.merge_shadow import parse_failed_run_all_members
+
+    text = (_FIXTURE_DIR / 'run_all-failed-marker.txt').read_text()
+    assert parse_failed_run_all_members(text) == [
+        'test_worktree_lifecycle.sh',
+        'test_skip_ledger.sh',
+    ]
+
+
+def test_parse_failed_run_all_members_human_summary_not_double_counted() -> None:
+    """The `=== FAILED: ... ===` human summary is not counted alongside the marker.
+
+    Both lines are emitted together by run_all.sh:1839-1841; counting both would
+    double every member and (with the '===' token) inject a bogus name.
+    """
+    from orchestrator.merge_shadow import parse_failed_run_all_members
+
+    log = (
+        '=== Summary: 2 discovered, 1 failed ===\n'
+        '=== FAILED: test_a.sh ===\n'
+        'FAILED test_a.sh\n'
+    )
+    assert parse_failed_run_all_members(log) == ['test_a.sh']
+
+
+def test_parse_failed_run_all_members_no_marker_is_empty() -> None:
+    """No marker line -> [] — NOT an error.
+
+    An empty subset means reify runs the FULL run_all suite
+    (verify.sh:2545 gates on `[ -n "${REIFY_RUN_ALL_MEMBER_SUBSET:-}" ]`), which
+    is the safe direction.
+    """
+    from orchestrator.merge_shadow import parse_failed_run_all_members
+
+    assert parse_failed_run_all_members('=== Summary: 3 discovered, 0 failed ===') == []
+    assert parse_failed_run_all_members('') == []
+
+
+def test_parse_failed_run_all_members_marker_without_names_is_empty() -> None:
+    """A marker with no names after it -> [] (full run_all, the safe direction)."""
+    from orchestrator.merge_shadow import parse_failed_run_all_members
+
+    assert parse_failed_run_all_members('FAILED \nnext line\n') == []
+
+
+def test_parse_failed_run_all_members_last_marker_wins() -> None:
+    """If the log somehow carries two markers, only the LAST one governs.
+
+    A merge-gate log can concatenate output from more than one run_all
+    invocation; the most recent marker is the one describing the final state.
+    """
+    from orchestrator.merge_shadow import parse_failed_run_all_members
+
+    log = 'FAILED test_old.sh\nmore output\nFAILED test_new_a.sh test_new_b.sh\n'
+    assert parse_failed_run_all_members(log) == ['test_new_a.sh', 'test_new_b.sh']
+
+
+def test_parse_failed_run_all_members_deduplicates_preserving_order() -> None:
+    """Repeated names within one marker collapse, first-seen order preserved."""
+    from orchestrator.merge_shadow import parse_failed_run_all_members
+
+    assert parse_failed_run_all_members('FAILED b.sh a.sh b.sh\n') == ['b.sh', 'a.sh']
+
+
 def test_build_fail_fast_map_marks_cancelled_tests_not_started() -> None:
     """build_fail_fast_map annotates the authoritative plan with attempt-0 verdicts.
 
