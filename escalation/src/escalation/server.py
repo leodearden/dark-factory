@@ -1015,6 +1015,7 @@ def create_server(
     @mcp.tool()
     def get_task_escalation_history(
         task_id: str,
+        level: int | None = None,
     ) -> dict[str, Any]:
         """Every escalation ever filed for a task, as a self-describing envelope.
 
@@ -1040,6 +1041,15 @@ def create_server(
         echoes what was asked so a ``count: 0`` is attributable rather than
         an anonymous ``[]``.
 
+        *level* — 0 = L0 (agent→steward), 1 = L1 (steward/workflow→
+        auto-watcher), 2 = L2 (auto-watcher→human). ``None`` = no filter.
+        Mirrors ``get_pending_escalations``'s ``level`` argument.
+
+        *level_filter* (in the response) echoes the ``level`` argument back
+        so a caller can never misread a filtered ``count == 0`` as "no
+        escalation was ever filed for this task" — that confusion is the
+        exact failure mode this tool exists to remove.
+
         Inherits ``queue.get_by_task``'s documented dedup and cross-tier
         pre-scan WARNING behaviour (queue.py:396-430) via the sibling.
 
@@ -1048,10 +1058,11 @@ def create_server(
         unlike the adjacent ``get_escalation``: this is a scan, not an id
         lookup, so zero matches is a valid answer rather than a failure.
         """
-        escalations = get_task_escalations(task_id)
+        escalations = get_task_escalations(task_id, level=level)
         return {
             'task_id': task_id,
             'count': len(escalations),
+            'level_filter': level,
             'escalations': escalations,
         }
 
