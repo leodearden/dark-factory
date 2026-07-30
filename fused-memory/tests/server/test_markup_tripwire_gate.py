@@ -14,6 +14,7 @@ tools) wired through create_mcp_server and invoked via
 
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -43,6 +44,34 @@ def _pass_through(mock_service: AsyncMock, method: str) -> None:
     result = MagicMock()
     result.model_dump.return_value = {'id': 'ok'}
     getattr(mock_service, method).return_value = result
+
+
+def _parse(result):
+    """Extract the dict from a FastMCP TextContent result or pass-through dict.
+
+    Mirrors test_tools_validation.py::_parse_tool_result — the task tools return
+    through a different FastMCP path than the memory tools.
+    """
+    if isinstance(result, list):
+        content = result[0].text if hasattr(result[0], 'text') else str(result[0])
+        return json.loads(content)
+    return result
+
+
+@pytest.fixture
+def task_server(monkeypatch):
+    """A server whose task tools accept a synthetic project_root.
+
+    '/project' is not a real git working tree, so resolve_main_checkout is
+    stubbed to pass it through — the same passthrough
+    TestSubmitTaskPremiseLintGuard uses.
+    """
+    monkeypatch.setattr('fused_memory.server.tools.resolve_main_checkout', lambda p: str(p))
+    interceptor = AsyncMock()
+    interceptor.submit_task.return_value = {'ticket': 'tkt_x'}
+    interceptor.update_task.return_value = {'ok': True}
+    server = create_mcp_server(AsyncMock(), task_interceptor=interceptor)
+    return server, interceptor
 
 
 def _assert_markup_block(result: object, *, field: str, pattern: str, agent_id: str) -> None:
@@ -303,3 +332,199 @@ class TestAddEpisodeMarkupGate:
             f'expected the markup tripwire to win the ordering, got: {result!r}'
         )
         mock_service.add_episode.assert_not_called()
+
+
+class TestSubmitTaskMarkupGate:
+    """submit_task rejects leaked envelope markup in any of its four text fields."""
+
+    @pytest.mark.asyncio
+    async def test_rejects_markup_in_description_before_the_interceptor(self, task_server):
+        """The DF 3083 vector-2 case, previously a SILENT mis-parse.
+
+        A '<parameter name="priority">' fragment in a description reached the
+        interceptor's description parser, which derived the wrong value from it
+        without complaint (reify task 3210 was filed priority=high and stored as
+        medium). Loud rejection ahead of that parser is the whole point.
+        """
+        server, interceptor = task_server
+
+        result = _parse(await server._tool_manager.call_tool(
+            'submit_task',
+            {
+                'project_root': '/project',
+                'prompt': 'Reconcile task 7',
+                'description': f'Reconcile task 7.\n{_LEAKED_PARAMETER}',
+                'agent_id': 'claude-task-3141',
+            },
+        ))
+
+        _assert_markup_block(
+            result, field='description', pattern='<parameter name=', agent_id='claude-task-3141'
+        )
+        interceptor.submit_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('field', ['title', 'description', 'details', 'prompt'])
+    async def test_rejects_markup_in_each_scanned_field(self, task_server, field):
+        """All four text fields are scanned, so no channel is left unchecked.
+
+        premise_lint_guard already lints exactly these four at this boundary for
+        the same reason: they all flow into the same description parser, so
+        checking description alone would leave three ways in.
+        """
+        server, interceptor = task_server
+        args = {
+            'project_root': '/project',
+            'prompt': 'a clean prompt',
+            'description': 'a clean description',
+            'agent_id': 'a',
+        }
+        args[field] = f'dirty {_LEAKED_INVOKE}'
+
+        result = _parse(await server._tool_manager.call_tool('submit_task', args))
+
+        _assert_markup_block(result, field=field, pattern='</invoke>', agent_id='a')
+        interceptor.submit_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_clean_submit_task_reaches_the_interceptor(self, task_server):
+        server, interceptor = task_server
+
+        result = _parse(await server._tool_manager.call_tool(
+            'submit_task',
+            {
+                'project_root': '/project',
+                'prompt': 'Reconcile task 7',
+                'description': 'Reconcile task 7 status against the knowledge graph.',
+                'agent_id': 'a',
+            },
+        ))
+        assert result.get('error') != 'mcp_markup_write_blocked', f'got: {result!r}'
+        interceptor.submit_task.assert_called_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('as_json', [False, True])
+    async def test_override_lets_deliberate_markup_through(self, task_server, as_json):
+        """Both metadata shapes honour the override.
+
+        submit_task accepts metadata as an object OR a JSON string; an author
+        documenting the leak (as DF 3083's own description does) must get through
+        whichever shape they used.
+        """
+        server, interceptor = task_server
+        metadata = {'allow_mcp_markup': True, 'execution_class': 'code_tdd'}
+
+        result = _parse(await server._tool_manager.call_tool(
+            'submit_task',
+            {
+                'project_root': '/project',
+                'prompt': 'Document the leak',
+                'description': f'The leak looks like {_LEAKED_INVOKE}',
+                'agent_id': 'a',
+                'metadata': json.dumps(metadata) if as_json else metadata,
+            },
+        ))
+        assert result.get('error') != 'mcp_markup_write_blocked', f'got: {result!r}'
+        interceptor.submit_task.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_override_flag_is_not_persisted_into_task_metadata(self, task_server):
+        """'allow_mcp_markup' is a write-time control, not task metadata.
+
+        It is deliberately absent from the task metadata vocabulary
+        (docs/task-authoring.md), so letting it through would mint an
+        unrecognised key on every task written with the override.
+        """
+        server, interceptor = task_server
+
+        await server._tool_manager.call_tool(
+            'submit_task',
+            {
+                'project_root': '/project',
+                'prompt': 'Document the leak',
+                'description': f'The leak looks like {_LEAKED_INVOKE}',
+                'agent_id': 'a',
+                'metadata': {'allow_mcp_markup': True, 'execution_class': 'code_tdd'},
+            },
+        )
+        forwarded = interceptor.submit_task.call_args.kwargs.get('metadata')
+        assert 'allow_mcp_markup' not in json.dumps(forwarded), (
+            f'the override flag must not reach the interceptor, got: {forwarded!r}'
+        )
+        assert 'code_tdd' in json.dumps(forwarded), (
+            f'other metadata must survive the strip, got: {forwarded!r}'
+        )
+
+
+class TestUpdateTaskMarkupGate:
+    """update_task rejects leaked envelope markup in any of its scanned fields."""
+
+    @pytest.mark.asyncio
+    async def test_rejects_markup_in_description_before_the_interceptor(self, task_server):
+        server, interceptor = task_server
+
+        result = _parse(await server._tool_manager.call_tool(
+            'update_task',
+            {
+                'id': '3141',
+                'project_root': '/project',
+                'description': f'updated.\n{_LEAKED_CONTENT}',
+                'agent_id': 'claude-task-3141',
+            },
+        ))
+
+        _assert_markup_block(
+            result, field='description', pattern='</content>', agent_id='claude-task-3141'
+        )
+        interceptor.update_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('field', ['title', 'description', 'details', 'prompt'])
+    async def test_rejects_markup_in_each_scanned_field(self, task_server, field):
+        server, interceptor = task_server
+        args = {'id': '3141', 'project_root': '/project', 'agent_id': 'a'}
+        args[field] = f'dirty {_LEAKED_INVOKE}'
+
+        result = _parse(await server._tool_manager.call_tool('update_task', args))
+
+        _assert_markup_block(result, field=field, pattern='</invoke>', agent_id='a')
+        interceptor.update_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_clean_update_task_reaches_the_interceptor(self, task_server):
+        server, interceptor = task_server
+
+        result = _parse(await server._tool_manager.call_tool(
+            'update_task',
+            {
+                'id': '3141',
+                'project_root': '/project',
+                'description': 'a clean updated description',
+                'agent_id': 'a',
+            },
+        ))
+        assert result.get('error') != 'mcp_markup_write_blocked', f'got: {result!r}'
+        interceptor.update_task.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_override_lets_deliberate_markup_through(self, task_server):
+        """The case that makes the hatch load-bearing: updating DF 3083 itself.
+
+        3083's description quotes all three literals, so without this an
+        update_task on the very sibling this leaf feeds would be permanently
+        blocked.
+        """
+        server, interceptor = task_server
+
+        result = _parse(await server._tool_manager.call_tool(
+            'update_task',
+            {
+                'id': '3083',
+                'project_root': '/project',
+                'description': f'The leak emits {_LEAKED_CONTENT}',
+                'agent_id': 'a',
+                'metadata': {'allow_mcp_markup': True},
+            },
+        ))
+        assert result.get('error') != 'mcp_markup_write_blocked', f'got: {result!r}'
+        interceptor.update_task.assert_called_once()
