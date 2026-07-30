@@ -477,23 +477,55 @@ def select_survivors(
     """The top-K config names per ``role_under_test`` — the μ OFAT survivor gate.
 
     Groups the λ :func:`build_composite_report` ``'configs'`` rows by
-    ``role_under_test``, ranks each requested role's group by DESCENDING
-    ``composite`` mean (ties broken deterministically by ascending ``config``
-    name, so the surface is byte-stable), and returns the top-``top_k`` config
-    names per role. A role with fewer than ``top_k`` rows returns all it has; a
-    requested role with no rows returns ``[]``. Pure over the report dict — the
-    OFAT screen feeds these survivors into :func:`run_matrix_stage`.
+    ``role_under_test``, ranks each requested role's group, and returns the
+    top-``top_k`` config names per role. A role with fewer than ``top_k`` rows
+    returns all it has; a requested role with no rows returns ``[]``. Pure over
+    the report dict — the OFAT screen feeds these survivors into
+    :func:`run_matrix_stage`.
+
+    RANKING (task 3099), in order:
+
+    1. rows with a measured ``composite`` before rows with ``composite is None``
+       — ``None`` means "we measured nothing", which must never outrank a config
+       that genuinely scored zero. A bare ``or 0.0`` coercion would silently tie
+       the two and then hand the win to whichever sorted first by name,
+       promoting the candidate we know LEAST about;
+    2. DESCENDING ``composite`` mean;
+    3. rows with a ``plan_quality`` before rows without (same ``None``-last
+       rule on the secondary axis);
+    4. DESCENDING ``plan_quality`` — the meaningful secondary signal for a
+       PLAN-ONLY architect row;
+    5. ASCENDING ``config`` name, surviving ONLY as the final byte-stability
+       guarantee.
+
+    Why 3-4 exist at all: with every architect composite hard-gated to 0.0 (the
+    bug this task fixes), step 5 had silently become the ENTIRE selection
+    mechanism for the architect role — ``architect-fable-high`` was "selected"
+    for sorting first, not for planning best (plans/eval-architect-effort-
+    verdict-2026-07-27.md, defect 2). Fixing the composite alone would leave the
+    same trap armed for the next pair of genuinely-tied real composites, so the
+    alphabet is demoted below every axis that carries signal. A workflow row
+    carries no ``plan_quality``, so steps 3-4 are inert for it and the existing
+    implementer ordering is unchanged.
     """
     by_role: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in composite_report.get('configs', []):
         by_role[row.get('role_under_test')].append(row)
 
+    def _rank_key(r: dict[str, Any]) -> tuple[bool, float, bool, float, str]:
+        composite = r.get('composite')
+        plan_quality = r.get('plan_quality')
+        return (
+            composite is None,
+            -float(composite or 0.0),
+            plan_quality is None,
+            -float(plan_quality or 0.0),
+            str(r.get('config', '')),
+        )
+
     survivors: dict[str, list[str]] = {}
     for role in roles:
-        ranked = sorted(
-            by_role.get(role, []),
-            key=lambda r: (-float(r.get('composite', 0.0) or 0.0), str(r.get('config', ''))),
-        )
+        ranked = sorted(by_role.get(role, []), key=_rank_key)
         survivors[role] = [str(r['config']) for r in ranked[:top_k]]
     return survivors
 
