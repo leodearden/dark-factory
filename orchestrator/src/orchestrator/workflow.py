@@ -5115,10 +5115,18 @@ class TaskWorkflow:
         (the stamp can never match again once the branch moved) — and by
         :meth:`_merge_and_finalise` on merge SUCCESS, so the happy-path
         stamp/clear lifecycle is symmetric (a merged/DONE task carries no stale
-        ``merge_retry_pending``). Uses the full-dict :meth:`_merge_fresh_metadata`
-        + ``scheduler.update_task(metadata=...)`` pattern because only a full-dict
-        write can REMOVE a key (an append-merge can add but not delete). A
-        persistence failure must never crash the resume path; a subsequent
+        ``merge_retry_pending``).
+
+        ``metadata_mode='replace'`` is REQUIRED, not incidental: the default
+        'merge' mode preserves keys omitted from the payload
+        (``{**existing, **incoming}``), so a mode-less write would log a removal
+        it never performs.  Only a whole-blob replace can actually DELETE a key
+        — which is why the payload is built as a full-dict
+        :meth:`_merge_fresh_metadata` read-modify-write that carries every other
+        key through.  (Same rule, same reason as the harness sibling
+        ``_clear_merge_retry_pending_for_restart``.)
+
+        A persistence failure must never crash the resume path; a subsequent
         re-block re-stamps a fresh obligation, so a lost clear is self-healing.
 
         Idempotent no-op when no stamp is present: returns immediately without a
@@ -5134,7 +5142,9 @@ class TaskWorkflow:
         fresh.pop('merge_retry_pending', None)
         self.task['metadata'] = fresh
         try:
-            await self.scheduler.update_task(self.task_id, metadata=fresh)
+            await self.scheduler.update_task(
+                self.task_id, metadata=fresh, metadata_mode='replace',
+            )
         except Exception as exc:  # noqa: BLE001 — best-effort, never fatal
             logger.warning(
                 'Task %s: failed to persist merge_retry_pending clear: %s',
