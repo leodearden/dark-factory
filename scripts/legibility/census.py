@@ -612,6 +612,14 @@ def render_report(
     pieces passed in -- no clock, no model call, no I/O. *date* and every
     piece of LLM-produced prose (*synthesis_md*, *matrix_md*) are inputs,
     so the same inputs always render byte-identical output.
+
+    NO SILENT CAPS: when the operator bounded this run, the report says
+    so in as many words. The batch-cap coverage lines in ``## Saturation``
+    are rendered ONLY when ``mining_result.max_batches`` is not None, so a
+    FLAGLESS run's output is byte-identical to what it was before the
+    operator cost-control flags existed (locked by
+    ``test_render_report_flagless_output_is_byte_identical_golden``). The
+    same gating applies to every other cost-control rendering here.
     """
     lines = [f"# confusion census {date}", "", f"Project: {project_id}"]
 
@@ -624,6 +632,25 @@ def render_report(
     lines.append("")
     lines.append(f"- batches: {len(mining_result.batch_stats)}")
     lines.append(f"- stop reason: {mining_result.stop_reason}")
+    if mining_result.max_batches is not None:
+        # Deliberately states only counts this function was actually handed:
+        # the total number of ENUMERATED sessions is not knowable here
+        # (batch_source is a generic injected iterable), and claiming
+        # "X of Y" would assert a number the code never measured.
+        sessions = sum(stats.total for stats in mining_result.batch_stats)
+        if mining_result.stop_reason == "capped":
+            lines.append(
+                f"- coverage: mined {sessions} session digest(s) across "
+                f"{len(mining_result.batch_stats)} batch(es); operator batch cap = "
+                f"{mining_result.max_batches} batch(es) -- mining was BOUNDED BY THE CAP, "
+                "not run to saturation: sessions beyond the cap were NOT mined, so this "
+                "census is PARTIAL coverage, not a full sweep."
+            )
+        else:
+            lines.append(
+                f"- operator batch cap: {mining_result.max_batches} batch(es) "
+                f"(not reached -- mining stopped by: {mining_result.stop_reason})"
+            )
     for stats in mining_result.batch_stats:
         lines.append(
             f"  - batch {stats.index}: dup_rate={stats.dup_rate:.2f} "
