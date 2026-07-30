@@ -460,3 +460,65 @@ class TestTrendsAndCurrentValues:
 
         assert payload['issues'] == []
         assert payload['issue_count'] == 0
+
+
+# ---------------------------------------------------------------------------
+# step-5 — the trend window cap (no silent caps)
+# ---------------------------------------------------------------------------
+
+
+def _n_run_tree(tmp_path: Path, count: int) -> tuple[Path, Path]:
+    """A single eval with *count* runs, stamped 2026-07-01 onwards."""
+    root = tmp_path / 'memory-evals'
+    esc_dir = tmp_path / 'escalations'
+    esc_dir.mkdir(parents=True, exist_ok=True)
+    for day in range(1, count + 1):
+        stamp = f'202607{day:02d}T031500Z'
+        _write_metrics(root, 'eval-a', stamp, [_metric('dangling-pointers', 'count', float(day), direction='higher_is_worse')])
+    return root, esc_dir
+
+
+class TestTrendCap:
+    """The trailing-window cap discloses what it dropped — it never truncates silently."""
+
+    def test_cap_keeps_the_most_recent_runs_and_says_so(self, tmp_path, monkeypatch) -> None:
+        import dashboard.data.memory_evals as memory_evals_module
+        from dashboard.data.memory_evals import build_memory_evals
+
+        monkeypatch.setattr(memory_evals_module, '_TREND_RUN_CAP', 3)
+        root, esc_dir = _n_run_tree(tmp_path, 5)
+
+        eval_a = build_memory_evals(root, esc_dir)['evals'][0]
+
+        assert eval_a['truncated'] is True
+        assert eval_a['runs_on_disk'] == 5
+        assert eval_a['run_count'] == 3
+        # The OLDEST two are dropped, not the newest — a trend that ends three
+        # runs ago would read as current.
+        assert eval_a['run_stamps'] == ['20260703T031500Z', '20260704T031500Z', '20260705T031500Z']
+        trend = eval_a['metrics'][0]['trend']
+        assert trend['labels'] == eval_a['run_stamps']
+        assert trend['values'] == [3.0, 4.0, 5.0]
+
+    def test_truncated_reports_the_actual_drop_not_a_constant(self, tmp_path, monkeypatch) -> None:
+        import dashboard.data.memory_evals as memory_evals_module
+        from dashboard.data.memory_evals import build_memory_evals
+
+        monkeypatch.setattr(memory_evals_module, '_TREND_RUN_CAP', 3)
+        root, esc_dir = _n_run_tree(tmp_path, 2)
+
+        eval_a = build_memory_evals(root, esc_dir)['evals'][0]
+
+        assert eval_a['truncated'] is False
+        assert eval_a['runs_on_disk'] == eval_a['run_count'] == 2
+
+    def test_cap_is_ninety_runs(self) -> None:
+        """One screen of trend == one alpha-derivation window.
+
+        90 is the PRD's declared lean for open question 2 and matches
+        ``runs_per_quarter=90`` in the committed limits artifact, so the
+        displayed window is exactly the window the limits govern.
+        """
+        import dashboard.data.memory_evals as memory_evals_module
+
+        assert memory_evals_module._TREND_RUN_CAP == 90
