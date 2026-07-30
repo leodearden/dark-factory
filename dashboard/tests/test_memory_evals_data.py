@@ -324,9 +324,13 @@ def _two_eval_tree(tmp_path: Path) -> tuple[Path, Path]:
     esc_dir.mkdir(parents=True, exist_ok=True)
 
     stamps = ['20260701T031500Z', '20260702T031500Z', '20260703T031500Z']
+    # Exactly-representable literals: the reader passes values through
+    # verbatim, so an expected value computed here would test float
+    # arithmetic rather than the passthrough.
+    proportions = [0.8, 0.75, 0.5]
     for i, stamp in enumerate(stamps):
         metrics = [
-            _metric('canonical-in-top-5', 'proportion', 0.8 + i / 100, denominator=30, direction='lower_is_worse'),
+            _metric('canonical-in-top-5', 'proportion', proportions[i], denominator=30, direction='lower_is_worse'),
             _metric('dangling-pointers', 'count', float(4 + i), direction='higher_is_worse'),
             _metric('search-latency-p50-ms', 'scalar', float(40 + i)),
             _metric(
@@ -422,7 +426,7 @@ class TestTrendsAndCurrentValues:
         by_id = {m['metric_id']: m for m in eval_a['metrics']}
 
         prop = by_id['canonical-in-top-5']
-        assert prop['current_value'] == 0.82  # the 20260703 run, not 0.80/0.81
+        assert prop['current_value'] == 0.5  # the 20260703 run, not 0.8/0.75
         assert prop['kind'] == 'proportion'
         assert prop['n'] == 30
         assert prop['denominator'] == 30
