@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import logging
 
 import yaml
 
@@ -914,6 +915,138 @@ def _split_frontmatter(digest):
     return '\n'.join(lines[1:end]), '\n'.join(lines[end + 1:])
 
 
+# ---------------------------------------------------------------------------
+# is_harness_injected_turn / iter_user_turns exclusion -- R1 (confusion
+# census 2026-07-24 Sec 4): a harness-injected briefing turn (the
+# orchestrator's '# Context' + '## Agent Identity' + '# Task' preamble, or
+# the trickle coder's system-prompt preamble) is typed into the transcript
+# as ordinary user-role text (isMeta=False -- it really is the first "user"
+# turn Claude Code sees), so it was previously indistinguishable from a
+# genuine human correction: it inflated both the gold user_corrections
+# section and score's n_user_turns component. Exclusion is by CONTENT (all
+# three headings must co-occur, line-anchored, mirroring
+# ORCHESTRATED_TASK_MARKERS' all() guard) so an ordinary human turn that
+# merely mentions one heading, or quotes one mid-sentence, is never
+# over-excluded.
+# ---------------------------------------------------------------------------
+
+def _briefing_text(body_filler='Project overview and recent decisions go here.'):
+    """Build the text of an orchestrator-briefing-shaped user turn -- the
+    literal shape ``BriefingAssembler`` injects as the harness preamble of
+    every dispatched-agent session
+    (orchestrator/src/orchestrator/agents/briefing.py): a '# Context'
+    heading (``_get_memory_context``, emits '# Context\\n\\n...'), a
+    '## Agent Identity' heading with an agent_id bullet
+    (``_agent_identity``), and a '# Task' heading with a task block (the
+    per-role prompt templates, e.g. ``build_architect_prompt``)."""
+    return (
+        f'# Context\n\n{body_filler}\n\n'
+        '## Agent Identity\n\n'
+        '- **agent_id:** `claude-task-3278-implementer`\n'
+        '- **project_id:** `dark_factory`\n\n'
+        '# Task\n\n'
+        '**Task:** Some task title\n'
+        '**Description:** Do the thing.\n'
+    )
+
+
+_TRICKLE_CODER_PREAMBLE = (
+    'You are the trickle coder for the dark-factory agent-confusion '
+    'codebook (plans/confusion-reduction-prd.md §7.3). Read the '
+    'session digest below and decide which existing codebook entries '
+    'it matches.'
+)
+"""Literal prefix of scripts/legibility/coder.py:174 build_prompt's
+harness-authored preamble."""
+
+
+class TestHarnessInjectedTurnFilter:
+    def test_briefing_shaped_turn_is_excluded_by_content(self):
+        records = [_user_text(_briefing_text())]
+
+        assert mod.iter_user_turns(records) == []
+
+    def test_trickle_coder_preamble_turn_is_excluded(self):
+        records = [_user_text(_TRICKLE_CODER_PREAMBLE)]
+
+        assert mod.iter_user_turns(records) == []
+
+    def test_ordinary_correction_retained_after_briefing_turn_index_preserved(self):
+        records = [
+            _user_text(_briefing_text()),
+            _user_text('This is wrong, please redo it.'),
+        ]
+
+        turns = mod.iter_user_turns(records)
+
+        assert [t['text'] for t in turns] == ['This is wrong, please redo it.']
+        assert [t['index'] for t in turns] == [1]
+
+    def test_single_heading_alone_is_not_excluded(self):
+        # Only ONE of the three co-occurring headings -- must not alone
+        # trigger exclusion (all()-not-any(), mirrors
+        # test_bare_worktree_mention_alone_is_not_orchestrated_task).
+        records = [_user_text('# Task\n\nplease do X')]
+
+        turns = mod.iter_user_turns(records)
+
+        assert len(turns) == 1
+        assert turns[0]['text'] == '# Task\n\nplease do X'
+
+    def test_context_heading_mentioned_mid_sentence_is_not_excluded(self):
+        # Line-anchored matching: '# Context' appearing mid-sentence (not
+        # as its own stripped line) never counts as the heading.
+        records = [_user_text(
+            'I read the # Context heading in the docs and want to update it.'
+        )]
+
+        turns = mod.iter_user_turns(records)
+
+        assert len(turns) == 1
+
+    def test_render_digest_excludes_briefing_turn_from_body_and_score(self):
+        records = [
+            _with_session_meta(_user_text(_briefing_text())),
+            _with_session_meta(_user_text('This is wrong, please redo it.')),
+        ]
+
+        digest = mod.render_digest(records, agent_class='interactive')
+
+        frontmatter_yaml, body = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        assert 'This is wrong, please redo it.' in body
+        assert '# Context' not in body
+        assert '## Agent Identity' not in body
+        # The excluded turn no longer counts toward n_user_turns (today: 2).
+        assert meta['score'] == mod.score_signals(meta['signal_counts'], 1)
+
+    def test_classify_agent_class_still_detects_markers_inside_excluded_turn(self):
+        # 'Task ID:'/'Worktree:' (a SEPARATE injected preamble --
+        # dry_run_unblock.py -- from the '# Context'/'## Agent
+        # Identity'/'# Task' briefing) live only inside this now-excluded
+        # turn; classify_agent_class reads a different carrier
+        # (_signal_text_sources, never filtered by iter_user_turns) so it
+        # must be unaffected by the exclusion.
+        text = (
+            _briefing_text()
+            + 'Task ID: 3278\nWorktree: /home/leo/src/dark-factory/.worktrees/3278\n'
+        )
+        records = [_user_text(text)]
+
+        assert mod.iter_user_turns(records) == []
+        assert mod.classify_agent_class(records) == 'orchestrated-task'
+
+    def test_signal_counts_unaffected_by_signal_free_briefing_turn(self):
+        # The filter must not leak into _signal_text_sources: adding a
+        # briefing turn with no NOT_FOUND/DF_GUARD/INTERRUPT pattern must
+        # not perturb any of the five signal_counts.
+        base = _all_signals_records()
+        with_briefing = [_user_text(_briefing_text())] + base
+
+        assert mod.signal_counts(with_briefing) == mod.signal_counts(base)
+
+
 class TestRenderDigest:
     def test_includes_heading_for_each_present_signal_class(self):
         digest = mod.render_digest(_all_signals_records(), agent_class='interactive')
@@ -1038,6 +1171,230 @@ class TestRenderDigestTruncation:
         # Lowest-priority retry_loops (60 groups) is what absorbed the
         # truncation: fewer than all 60 groups survive.
         assert digest.count('Bash x3:') < 60
+
+
+# ---------------------------------------------------------------------------
+# _cap_item / _item_byte_cap -- R2 part 1 (confusion census 2026-07-24 Sec
+# 4): a per-item byte cap applied at the single _build_sections choke
+# point, so ONE oversized item (an enormous pasted user turn, a huge
+# tool_result echo, ...) can never evict every sibling section before
+# being popped itself. Capping is byte-wise and UTF-8-safe: the whole
+# digest budget is measured in UTF-8 bytes (_resolve_size_bytes, the 15360
+# soft cap), so a naive character-wise slice would not actually bound it
+# for non-ASCII content, and a naive byte slice can split a multi-byte
+# codepoint mid-sequence.
+# ---------------------------------------------------------------------------
+
+def _oversized_user_correction_records():
+    """One ORDINARY (non-briefing-shaped) human user turn whose text alone
+    exceeds the default 15360-byte soft cap, plus a genuine is_error
+    tool_result error neighborhood and a 'command not found' not-found
+    hit. Deliberately NOT briefing-shaped: R2 (whole-item truncation
+    eviction) is a distinct pathology from R1 (harness-turn exclusion), so
+    step-2's is_harness_injected_turn filter is never why this fixture's
+    body would survive. Baseline today (pre per-item cap):
+    _truncate_sections pops the WHOLE oversized item, which along the way
+    empties every other section too -- the final digest is ~276 bytes of
+    frontmatter with an entirely empty body, despite every detector having
+    fired at least once."""
+    huge_text = 'This is wrong, please redo it properly. ' * 500  # 20000 bytes
+    return [
+        _with_session_meta(_user_text(huge_text)),
+        _with_session_meta(_assistant(_tool_use('Bash', {'command': 'false'}, id='tu-err'))),
+        _with_session_meta(_tool_result('tu-err', 'Exit code 1', is_error=True)),
+        _with_session_meta(_tool_result('tu-nf', 'bash: foo: command not found', is_error=False)),
+    ]
+
+
+class TestPerItemByteCap:
+    def test_cap_item_returns_short_line_byte_identical(self):
+        line = '- (turn 0) short line, well under any cap'
+
+        capped = mod._cap_item(line, cap=2048)
+
+        assert capped == line
+        assert mod.ITEM_TRUNCATION_MARKER not in capped
+
+    def test_cap_item_truncates_oversized_line_with_marker(self):
+        line = '- (turn 0) ' + ('x' * 5000)
+        cap = 2048
+
+        capped = mod._cap_item(line, cap)
+
+        assert len(capped.encode('utf-8')) <= cap
+        assert capped.endswith(mod.ITEM_TRUNCATION_MARKER)
+
+    def test_cap_item_truncates_multibyte_text_without_mojibake(self):
+        # The cap is a BYTE cap -- naive slicing on a multi-byte-character
+        # string must not split a codepoint into a replacement character.
+        line = '- (turn 0) ' + ('é→' * 2000)
+        cap = 500
+
+        capped = mod._cap_item(line, cap)  # must not raise
+
+        assert len(capped.encode('utf-8')) <= cap
+        assert '�' not in capped
+        capped.encode('utf-8')  # re-encodes cleanly
+
+    def test_item_byte_cap_respects_bounds_and_frontmatter_headroom(self):
+        for max_bytes in (0, 1, 100, 512, 1000, 2048, 4096, 15360, 100_000):
+            cap = mod._item_byte_cap(max_bytes)
+
+            assert cap <= mod.MAX_ITEM_BYTES
+            assert cap >= mod.MIN_ITEM_BYTES
+            reserved = max_bytes - mod.FRONTMATTER_RESERVE_BYTES
+            if reserved > mod.MIN_ITEM_BYTES:
+                assert cap <= reserved
+
+    def test_default_cap_retains_all_sections_with_oversized_user_turn(self):
+        digest = mod.render_digest(_oversized_user_correction_records(), agent_class='interactive')
+
+        _, body = _split_frontmatter(digest)
+        # Baseline today (pre-step-4): the whole-item eviction pathology
+        # empties the body entirely -- assert non-empty so this is
+        # unambiguously RED before the per-item cap exists.
+        assert body.strip() != ''
+
+        assert '## User Corrections' in digest
+        assert '## Error Neighborhoods' in digest
+        assert '## Not Found' in digest
+        assert len(digest.encode('utf-8')) <= 15360
+        assert mod.ITEM_TRUNCATION_MARKER in digest
+
+    def test_gold_section_still_precedes_error_neighborhoods_under_cap(self):
+        digest = mod.render_digest(_oversized_user_correction_records(), agent_class='interactive')
+
+        assert '## User Corrections' in digest
+        assert '## Error Neighborhoods' in digest
+        assert digest.index('## User Corrections') < digest.index('## Error Neighborhoods')
+
+
+# ---------------------------------------------------------------------------
+# _warn_if_body_evicted / render_digest emit-time guard -- R2 part 2
+# (confusion census 2026-07-24 Sec 4): belt-and-braces backstop for the
+# invariant step-4's per-item cap makes structurally unreachable at any
+# realistic max_bytes -- "nonzero signal_counts implies a non-empty body"
+# is checked at emit time, and a violation is logged LOUDLY (never silent,
+# never raised: census.py/nightly.py must keep receiving a plain string).
+# ---------------------------------------------------------------------------
+
+class TestEmitConsistencyGuard:
+    def test_warns_once_when_nonzero_counts_and_every_section_empty(self, caplog):
+        caplog.set_level(logging.WARNING, logger='legibility.digest')
+        meta = {
+            'session': 'sess-guard-1',
+            'signal_counts': {
+                'tool_error': 1, 'self_correct': 0, 'not_found': 0,
+                'df_guard': 0, 'interrupt': 0,
+            },
+        }
+        sections = {key: [] for key in mod.SECTION_PRIORITY}
+
+        mod._warn_if_body_evicted(meta, sections, max_bytes=15360)
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert 'sess-guard-1' in warnings[0]
+
+    def test_no_warning_when_all_signal_counts_zero(self, caplog):
+        caplog.set_level(logging.WARNING, logger='legibility.digest')
+        meta = {
+            'session': 'sess-guard-2',
+            'signal_counts': {
+                'tool_error': 0, 'self_correct': 0, 'not_found': 0,
+                'df_guard': 0, 'interrupt': 0,
+            },
+        }
+        sections = {key: [] for key in mod.SECTION_PRIORITY}
+
+        mod._warn_if_body_evicted(meta, sections, max_bytes=15360)
+
+        assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+    def test_no_warning_when_a_section_still_has_lines(self, caplog):
+        caplog.set_level(logging.WARNING, logger='legibility.digest')
+        meta = {
+            'session': 'sess-guard-3',
+            'signal_counts': {
+                'tool_error': 1, 'self_correct': 0, 'not_found': 0,
+                'df_guard': 0, 'interrupt': 0,
+            },
+        }
+        sections = {key: [] for key in mod.SECTION_PRIORITY}
+        sections['not_found'] = ['- (turn 0) command not found']
+
+        mod._warn_if_body_evicted(meta, sections, max_bytes=15360)
+
+        assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+    def test_render_digest_warns_and_still_returns_degenerate_digest_at_tiny_cap(self, caplog):
+        # max_bytes=1 makes the trim loop pop every item regardless of
+        # frontmatter length -- a deterministic violation path (not a
+        # guessed numeric tolerance): the body ends up empty while
+        # signal_counts stays nonzero.
+        caplog.set_level(logging.WARNING, logger='legibility.digest')
+        records = _all_signals_records()
+
+        digest = mod.render_digest(records, agent_class='interactive', max_bytes=1)
+
+        # Never silent, never raises: the degenerate digest is still
+        # returned (fail-soft for census.py/nightly.py callers).
+        _, body = _split_frontmatter(digest)
+        assert body.strip() == ''
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert _DIGEST_SESSION_ID in warnings[0]
+
+    def test_invariant_holds_at_real_cap_for_oversized_fixture(self, caplog):
+        # Already green off steps 2/4 -- serves as part of the end-to-end
+        # regression lock for the whole task.
+        caplog.set_level(logging.WARNING, logger='legibility.digest')
+
+        digest = mod.render_digest(_oversized_user_correction_records(), agent_class='interactive')
+
+        frontmatter_yaml, body = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        assert any(meta['signal_counts'].values())
+        assert body.strip() != ''
+        assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+    def test_build_digest_end_to_end_on_gz_orchestrated_session(self, tmp_path):
+        # Already green off steps 2/4 -- the end-to-end acceptance check:
+        # a real orchestrated-looking gz transcript (briefing turn +
+        # genuine human correction + tool_error + not_found) yields a
+        # non-empty, briefing-free digest with an intact frontmatter
+        # contract.
+        records = [
+            _with_session_meta(_user_text(_briefing_text('x' * 21000))),
+            _with_session_meta(_user_text('This is wrong, please redo it.')),
+            _with_session_meta(_assistant(_tool_use('Bash', {'command': 'false'}, id='tu-err'))),
+            _with_session_meta(_tool_result('tu-err', 'Exit code 1', is_error=True)),
+            _with_session_meta(_tool_result('tu-nf', 'bash: foo: command not found', is_error=False)),
+        ]
+        path = _write_jsonl_gz(tmp_path, records)
+
+        digest = mod.build_digest(path)
+
+        _, body = _split_frontmatter(digest)
+        assert body.strip() != ''
+        assert '## User Corrections' in digest
+        assert 'This is wrong, please redo it.' in digest
+        assert '## Error Neighborhoods' in digest
+        assert '## Not Found' in digest
+        assert '# Context' not in digest
+        assert '## Agent Identity' not in digest
+
+        frontmatter_yaml, _ = _split_frontmatter(digest)
+        parsed = yaml.safe_load(frontmatter_yaml)
+        assert set(parsed) == set(mod.FRONTMATTER_KEYS) | {'signal_counts'}
+        assert set(parsed['signal_counts']) == set(mod.SIGNAL_COUNT_KEYS)
+
+        lines = frontmatter_yaml.splitlines()
+        top_level_keys = [line.split(':', 1)[0] for line in lines if not line.startswith(' ')]
+        assert top_level_keys == list(mod.FRONTMATTER_KEYS) + ['signal_counts']
+        nested_keys = [line.strip().split(':', 1)[0] for line in lines if line.startswith(' ')]
+        assert nested_keys == list(mod.SIGNAL_COUNT_KEYS)
 
 
 # ---------------------------------------------------------------------------
