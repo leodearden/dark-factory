@@ -399,9 +399,14 @@ for fable *and* 2/4 for opus-max — high-variance for every candidate, not a
 fable-specific pattern.
 
 **Disposition for downstream readers.** The earlier reliability concern is
-**UNREPLICATED**, not settled in either direction. A future re-evaluation should
-neither treat it as reaffirmed nor as disproven by this campaign; the two fixtures
-that carry over and are worth watching are `df_task_18` and `reify_task_12`.
+**UNREPLICATED**, not settled in either direction. This deliberately states the
+earlier signal more weakly than esc-2862-1's resolution, which calls it REFUTED: this
+record cannot reach "refuted" without re-examining the 07-27 campaign's own cells
+against its cap-contamination timeline, which it does not do (above); "unreplicated"
+is what this campaign's evidence supports on its own. A future re-evaluation should
+neither treat the earlier concern as reaffirmed nor as disproven by this campaign; the
+two fixtures that carry over and are worth watching are `df_task_18` and
+`reify_task_12`.
 
 The reason to decline admission here remains **"no case on the merits,"** not
 **"fable is unreliable"** — that conclusion rests on this campaign's own 94.4% plan
