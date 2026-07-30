@@ -11477,10 +11477,14 @@ class Harness:
 
         Implements C3.1 (status-precedes-kill) ordering:
           1. Terminal recheck — skip if the task is already done/cancelled.
-          2. Stamp ``_action_teardown_tasks`` (suppression, C3.2 / D9).
-          3. Write ``target_status`` via scheduler.
-          4. Kill live workflow if active (soft → grace → hard).
-          5. Clear the stamp (in finally block) once the kill window closes.
+          2. restart only: clear ``metadata.merge_retry_pending`` (task 3024).
+          3. Stamp ``_action_teardown_tasks`` (suppression, C3.2 / D9).
+          4. Write ``target_status`` via scheduler.
+          5. Kill live workflow if active (soft → grace → hard).
+          6. In the finally block, once the kill window closes: clear the
+             suppression stamp, then (restart only) re-run step 2's clear so a
+             stamp resurrected by the dying workflow's own metadata write does
+             not survive the restart.
 
         Preconditions per action:
           - restart: task must be non-terminal (checked at step 1); target='pending'.
@@ -11537,7 +11541,11 @@ class Harness:
         #
         # Ordered BEFORE the status write: once the task reads 'pending' the
         # scheduler may re-dispatch it, and a clear landing after that loses the
-        # race to a workflow that has already read the stamp.
+        # race to a workflow that has already read the stamp.  That ordering
+        # leaves the opposite race open — the still-live workflow can resurrect
+        # the stamp with a metadata write of its own before the kill lands — so
+        # an idempotent second clear runs in the finally block once the kill
+        # window has closed (see there).
         if action == 'restart':
             await self._clear_merge_retry_pending_for_restart(task_id)
 
@@ -11629,9 +11637,22 @@ class Harness:
                 # Delete the key when it reaches zero so Counter.__contains__ returns False
                 # and a re-dispatched (restart→pending) workflow can write 'blocked'
                 # legitimately in its next incarnation.
+                # (Sync and first, so an await below can never skip it.)
                 self._action_teardown_tasks[task_id] -= 1
                 if self._action_teardown_tasks[task_id] <= 0:
                     del self._action_teardown_tasks[task_id]
+            # Second, idempotent stamp clear — closes the mirror race the
+            # pre-status ordering opens (task 3024 amendment).  Between the first
+            # clear and the kill, the still-live workflow can perform any metadata
+            # read-modify-write; every one of those goes through
+            # _merge_fresh_metadata's `{**in_memory, **backend}` union in merge
+            # mode, so a stamp still held in that workflow's in-memory copy is
+            # written straight back and the re-dispatch fast-paths to merge
+            # anyway.  Re-running the clear after the kill window has closed
+            # deletes any such resurrection.  Costs one get_task read and is a
+            # zero-write no-op when (normally) no stamp is present.
+            if action == 'restart':
+                await self._clear_merge_retry_pending_for_restart(task_id)
 
     async def _clear_merge_retry_pending_for_restart(self, task_id: str) -> None:
         """Drop ``metadata.merge_retry_pending`` so a restart re-plans from scratch.
@@ -11648,7 +11669,11 @@ class Harness:
         therefore has to carry every other key through — hence reading current
         metadata first rather than writing a hand-built dict.
 
-        No-op (zero MCP calls) unless the stamp is actually present.
+        No-op (one ``get_task`` read, zero writes) unless the stamp is actually
+        present — which is what makes it safe to call twice per restart teardown:
+        once before the status write (to beat a re-dispatch) and once in the
+        ``finally`` block after the kill window closes (to delete a stamp the
+        dying workflow's own metadata write resurrected in between).
 
         Best-effort by design: this runs BEFORE the status write, so a raised
         metadata read/write error would abort the whole teardown and leave the
@@ -11661,11 +11686,24 @@ class Harness:
         """
         try:
             task = await self.scheduler.get_task(task_id)
-            metadata = (task or {}).get('metadata')
+            if task is None:
+                # scheduler.get_task swallows every exception and returns None,
+                # so this — not the except arm — is the read failure that
+                # actually happens in production.  Returning quietly here would
+                # make 'this task had no obligation' indistinguishable from 'we
+                # could not tell' (no-silent-fail-soft).
+                logger.warning(
+                    'action-teardown restart: could not read task %s to clear '
+                    'merge_retry_pending — proceeding with the restart; the '
+                    're-dispatch may still fast-path to merge',
+                    task_id,
+                )
+                return
+            metadata = task.get('metadata')
             if not isinstance(metadata, dict) or 'merge_retry_pending' not in metadata:
                 return
             cleaned = {k: v for k, v in metadata.items() if k != 'merge_retry_pending'}
-            await self.scheduler.update_task(
+            ok = await self.scheduler.update_task(
                 task_id, metadata=cleaned, metadata_mode='replace',
             )
         except Exception as exc:  # noqa: BLE001 — best-effort: never block the restart
@@ -11674,6 +11712,19 @@ class Harness:
                 'task %s (%s) — proceeding with the restart; the re-dispatch may '
                 'still fast-path to merge',
                 task_id, exc,
+            )
+            return
+        if not ok:
+            # update_task reports MCP-level failures by returning False, not by
+            # raising.  Emitting the success line below regardless would actively
+            # mislead an operator debugging a restart that failed to break the
+            # fast-path: they would read 'cleared' and rule out the real cause.
+            logger.warning(
+                'action-teardown restart: the merge_retry_pending clearing write for '
+                'task %s was rejected (update_task returned False) — proceeding with '
+                'the restart; the stamp survives, so the re-dispatch may still '
+                'fast-path to merge',
+                task_id,
             )
             return
         logger.info(

@@ -23,6 +23,7 @@ module-level ``_run`` (git rev-parse) is controlled by monkeypatching
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -209,7 +210,35 @@ class TestStampClearHelpers:
         )
         # Must not propagate the update_task failure.
         await f.wf._clear_merge_retry_pending()
-        assert 'merge_retry_pending' not in f.wf.task['metadata']
+        # Amendment: the in-memory delete is withheld until the backend confirms
+        # the write, so a failed persist leaves memory and backend AGREEING that
+        # the stamp is still there.  Clearing memory anyway would make the
+        # merge-success clear early-return on the missing key and land a DONE
+        # task still carrying merge_retry_pending server-side.
+        assert f.wf.task['metadata']['merge_retry_pending'] == dict(_STAMP)
+
+    @pytest.mark.asyncio
+    async def test_clear_leaves_stamp_when_update_task_reports_failure(self, caplog):
+        """update_task reports MCP failures by RETURNING FALSE, not by raising.
+
+        ``Scheduler.update_task`` logs and returns ``False`` on an isError
+        response or a structured rejection (scheduler.py), so a clear that
+        ignored the boolean would treat a rejected write as a landed one: the
+        in-memory stamp would be dropped, the merge-success retry would be
+        skipped, and nothing in the log would say the obligation survived.
+        """
+        f = _make(metadata={'merge_retry_pending': dict(_STAMP)})
+        f.update_task.return_value = False
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.workflow'):
+            await f.wf._clear_merge_retry_pending()
+
+        f.update_task.assert_awaited_once()
+        assert f.wf.task['metadata']['merge_retry_pending'] == dict(_STAMP)
+        assert any(
+            'could not clear merge_retry_pending' in r.getMessage()
+            for r in caplog.records
+        ), f'a rejected write must be logged as a failure; records={caplog.records}'
 
     # -- task 3024 step-11: 'replace' makes a STALE payload destructive --
 
@@ -239,6 +268,24 @@ class TestStampClearHelpers:
         # No destructive whole-blob write on an unverified payload.
         f.update_task.assert_not_awaited()
         # The obligation survives intact, so a later dispatch can retry the clear.
+        assert f.wf.task['metadata']['merge_retry_pending'] == dict(_STAMP)
+
+    @pytest.mark.asyncio
+    async def test_clear_skips_replace_write_when_refresh_returns_none(self):
+        """Same contract as the raise case, via the path that actually occurs.
+
+        ``Scheduler.get_task`` catches every exception and returns ``None``
+        (scheduler.py), so in production a failed refresh reaches
+        ``_merge_fresh_metadata`` as a non-dict result — the ``require_fresh``
+        isinstance guard — not as a propagated error.  The destructive
+        whole-blob replace must be skipped on that path too.
+        """
+        f = _make(metadata={'merge_retry_pending': dict(_STAMP)})
+        f.scheduler.get_task = AsyncMock(return_value=None)
+
+        await f.wf._clear_merge_retry_pending()
+
+        f.update_task.assert_not_awaited()
         assert f.wf.task['metadata']['merge_retry_pending'] == dict(_STAMP)
 
     @pytest.mark.asyncio
@@ -458,6 +505,37 @@ class TestMergeAndFinalise:
         assert outcome == WorkflowOutcome.DONE
         spies.finalise_merged_done.assert_awaited_once()
         f.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_merge_success_clear_retries_a_persist_the_resume_clear_lost(
+        self, monkeypatch,
+    ):
+        """A clear that never landed is retried within the SAME dispatch.
+
+        End-to-end reason the in-memory delete waits for a confirmed persist: the
+        resume guard clears the stamp before delegating to _merge_and_finalise,
+        which clears again on merge SUCCESS.  Had the first (failed) clear dropped
+        the in-memory key anyway, the second clear's no-stamp fast-return would
+        fire and a DONE task would land still carrying merge_retry_pending
+        server-side (which the done-metadata reconcile then writes back, since
+        its `{**in_memory, **backend}` union lets the backend key win).
+        """
+        monkeypatch.setattr('orchestrator.workflow._run', _fake_run(head='HEAD-SHA'))
+        f = _make(metadata={'merge_retry_pending': dict(_STAMP), 'retry_ledger': {'x': 1}})
+        _wire_finalise_spies(f, merge_result=None)
+        # First persist (resume-guard clear) fails; second (merge-success) lands.
+        f.update_task.side_effect = [RuntimeError('mcp down'), True]
+
+        outcome = await f.wf._resume_merge_retry_if_pending('task/77')
+
+        assert outcome == WorkflowOutcome.DONE
+        assert f.update_task.await_count == 2, (
+            'the merge-success clear must retry the write the resume-guard clear lost'
+        )
+        assert _persisted_mode(f.update_task) == 'replace'
+        assert 'merge_retry_pending' not in _persisted_metadata(f.update_task)
+        assert 'merge_retry_pending' not in f.wf.task['metadata']
+        assert f.wf.task['metadata']['retry_ledger'] == {'x': 1}
 
 
 # ---------------------------------------------------------------------------

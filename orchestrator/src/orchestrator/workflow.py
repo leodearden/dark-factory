@@ -5168,6 +5168,21 @@ class TaskWorkflow:
         re-block also re-stamps a fresh obligation), so a lost clear is
         self-healing where clobbered metadata would not be.
 
+        Two failure-visibility rules make that "the stamp simply survives" claim
+        true of EVERY arm, not just the refresh one (amendment):
+
+        * ``scheduler.update_task`` does not raise on an MCP-level failure — it
+          logs and returns ``False``.  So the boolean is checked: an unlanded
+          write logs the same warning as an exception instead of falling through
+          to a success log an operator would read as proof the stamp is gone.
+        * ``self.task['metadata']`` is only overwritten AFTER a confirmed
+          persist.  Clearing it first would desynchronise memory from the backend
+          on a failed write, and the merge-success clear in
+          :meth:`_merge_and_finalise` would then early-return on the missing
+          in-memory key — landing a DONE task that still carries the stamp
+          server-side.  Keeping them in agreement means that same-dispatch clear
+          is a real retry.
+
         Idempotent no-op when no stamp is present: returns immediately without a
         fresh-metadata read or backend write, so it is cheap and safe to call
         unconditionally on every merge success (the common case never stamped).
@@ -5185,8 +5200,7 @@ class TaskWorkflow:
                 require_fresh=True,
             )
             fresh.pop('merge_retry_pending', None)
-            self.task['metadata'] = fresh
-            await self.scheduler.update_task(
+            ok = await self.scheduler.update_task(
                 self.task_id, metadata=fresh,
                 # SchedulerFacade's Protocol (scheduler.py:681) predates
                 # metadata_mode and only declares `append`; the concrete
@@ -5204,6 +5218,23 @@ class TaskWorkflow:
                 'restart clear are independent remedies: %s',
                 self.task_id, exc,
             )
+            return
+        if not ok:
+            # update_task swallows MCP-level failures and returns False, so
+            # without this branch a rejected write is indistinguishable from a
+            # landed one and the stamp's survival goes unlogged.
+            logger.warning(
+                'Task %s: could not clear merge_retry_pending (scheduler.update_task '
+                'reported failure) — leaving the stamp in place; a later dispatch '
+                'retries the clear, and the resume conflict probe and the harness '
+                'restart clear are independent remedies',
+                self.task_id,
+            )
+            return
+        # Backend confirmed: mirror the delete in memory. Doing this only after a
+        # landed write keeps memory and backend in agreement, so a failed clear
+        # leaves the in-memory stamp for the merge-success clear to retry.
+        self.task['metadata'] = fresh
 
     def _merge_outcome_signature(self) -> str:
         """Return a 16-hex-char signature for the current merge-block fingerprint.
