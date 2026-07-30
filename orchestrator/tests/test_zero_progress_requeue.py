@@ -141,3 +141,188 @@ class TestZeroProgressRequeueTracker:
         tracker.record('3068', outcome=WorkflowOutcome.REQUEUED, agent_invocations=0)
         assert tracker.record('3068', outcome=outcome, agent_invocations=0) == 0
         assert tracker.streak('3068') == 0
+
+
+# ---------------------------------------------------------------------------
+# Part C.2 — the fail-open alert emitter
+# ---------------------------------------------------------------------------
+
+
+def _emit(**kwargs):
+    """Call the alert emitter, importing at call time so a missing symbol
+    fails only these tests rather than breaking module collection."""
+    from orchestrator.zero_progress_requeue import emit_zero_progress_requeue_alert
+
+    return emit_zero_progress_requeue_alert(**kwargs)
+
+
+def _sentinel(task_id: str) -> str:
+    from orchestrator.zero_progress_requeue import ZERO_PROGRESS_SENTINEL_PREFIX
+
+    return f'{ZERO_PROGRESS_SENTINEL_PREFIX}{task_id}'
+
+
+def _default_kwargs(queue, rec, *, task_id='3068', streak=5, threshold=5):
+    return {
+        'escalation_queue': queue,
+        'event_store': rec,
+        'task_id': task_id,
+        'streak': streak,
+        'threshold': threshold,
+        'block_reason': 'warm_lane_pool_hard_down',
+        'block_phase': 'plan',
+    }
+
+
+class TestEmitZeroProgressRequeueAlert:
+    """One blocking L1 per unresolved incident; never raises."""
+
+    def test_fires_at_threshold_with_monitor_alarm_shape(self, tmp_path):
+        """streak >= threshold files exactly one L1 with the alarm shape."""
+        from escalation.queue import EscalationQueue
+        from _recording_event_store import _RecordingEventStore
+
+        queue = EscalationQueue(tmp_path)
+        rec = _RecordingEventStore()
+
+        assert _emit(**_default_kwargs(queue, rec)) is True
+
+        filed = queue.get_by_task(_sentinel('3068'), status='pending')
+        assert len(filed) == 1, f'expected exactly one escalation, got {filed}'
+        esc = filed[0]
+        assert esc.task_id == _sentinel('3068')
+        assert esc.agent_role == 'orchestrator-zero-progress-requeue'
+        # `blocking` is the ceiling an agent-authored filer may use, and level 1
+        # routes to the auto-watcher rather than a steward that has no real task
+        # to work (the sentinel id is synthetic).
+        assert esc.severity == 'blocking'
+        assert esc.level == 1
+        assert esc.category == 'risk_identified'
+        # The alert must name the REAL task and the streak, not just the sentinel.
+        assert '3068' in esc.summary
+        assert '5' in esc.summary
+        # ...and carry the WHY that parts A/B make durable, so the operator does
+        # not have to go digging in a rotated journald log.
+        assert 'warm_lane_pool_hard_down' in esc.detail
+        assert 'plan' in esc.detail
+
+    def test_below_threshold_files_nothing(self, tmp_path):
+        """streak < threshold is a no-op returning False."""
+        from escalation.queue import EscalationQueue
+        from _recording_event_store import _RecordingEventStore
+
+        queue = EscalationQueue(tmp_path)
+        rec = _RecordingEventStore()
+
+        assert _emit(**_default_kwargs(queue, rec, streak=4, threshold=5)) is False
+        assert queue.get_by_task(_sentinel('3068'), status='pending') == []
+        assert rec.events == []
+
+    def test_dedups_while_first_is_still_pending(self, tmp_path):
+        """A second call must not stack a duplicate.
+
+        Not clearing the streak on fire would otherwise produce a sawtooth that
+        re-files every N requeues — spamming the queue during exactly the 46h
+        loop this exists to catch.
+        """
+        from escalation.queue import EscalationQueue
+        from _recording_event_store import _RecordingEventStore
+
+        queue = EscalationQueue(tmp_path)
+        rec = _RecordingEventStore()
+
+        assert _emit(**_default_kwargs(queue, rec, streak=5)) is True
+        assert _emit(**_default_kwargs(queue, rec, streak=6)) is False
+        assert _emit(**_default_kwargs(queue, rec, streak=7)) is False
+
+        assert len(queue.get_by_task(_sentinel('3068'), status='pending')) == 1
+
+    def test_distinct_tasks_get_distinct_alerts(self, tmp_path):
+        """Dedup is per-task — one looping task must not mask another."""
+        from escalation.queue import EscalationQueue
+        from _recording_event_store import _RecordingEventStore
+
+        queue = EscalationQueue(tmp_path)
+        rec = _RecordingEventStore()
+
+        assert _emit(**_default_kwargs(queue, rec, task_id='3068')) is True
+        assert _emit(**_default_kwargs(queue, rec, task_id='4000')) is True
+
+        assert len(queue.get_by_task(_sentinel('3068'), status='pending')) == 1
+        assert len(queue.get_by_task(_sentinel('4000'), status='pending')) == 1
+
+    def test_no_queue_is_a_silent_no_op(self, tmp_path):
+        """escalation_queue=None returns False without raising."""
+        from _recording_event_store import _RecordingEventStore
+
+        rec = _RecordingEventStore()
+        assert _emit(**_default_kwargs(None, rec)) is False
+        assert rec.events == []
+
+    def test_raising_queue_does_not_propagate(self, tmp_path):
+        """A submit() that raises must not escape the emitter.
+
+        This module sits on the dispatch hot path; a bug or a full disk here
+        must never disturb requeue-cap accounting.
+        """
+        from unittest.mock import MagicMock
+        from _recording_event_store import _RecordingEventStore
+
+        queue = MagicMock()
+        queue.has_open_l1.return_value = False
+        queue.make_id.return_value = 'esc-x-1'
+        queue.submit.side_effect = RuntimeError('disk full')
+
+        assert _emit(**_default_kwargs(queue, _RecordingEventStore())) is False
+
+    def test_raising_event_store_does_not_unfile_the_escalation(self, tmp_path):
+        """An event-emit failure must not un-file the escalation.
+
+        The escalation is the load-bearing output; the event is telemetry.
+        They are submitted under INDIVIDUAL try/excepts so a failure of the
+        second cannot cost us the first.
+        """
+        from escalation.queue import EscalationQueue
+        from unittest.mock import MagicMock
+
+        queue = EscalationQueue(tmp_path)
+        broken = MagicMock()
+        broken.emit.side_effect = RuntimeError('event store wedged')
+
+        result = _emit(**_default_kwargs(queue, broken))
+
+        assert len(queue.get_by_task(_sentinel('3068'), status='pending')) == 1
+        assert result is True, 'the escalation WAS filed; a telemetry failure must not lie'
+
+    def test_emits_zero_progress_requeue_event(self, tmp_path):
+        """A paired EventType.zero_progress_requeue carries the payload."""
+        from escalation.queue import EscalationQueue
+        from _recording_event_store import _RecordingEventStore
+
+        from orchestrator.event_store import EventType
+
+        queue = EscalationQueue(tmp_path)
+        rec = _RecordingEventStore()
+
+        _emit(**_default_kwargs(queue, rec))
+
+        events = [
+            entry for (etype, entry) in rec.events
+            if etype == EventType.zero_progress_requeue
+        ]
+        assert len(events) == 1, f'expected one zero_progress_requeue event, got {rec.events}'
+        entry = events[0]
+        assert entry['task_id'] == '3068', 'the event must key on the REAL task id'
+        data = entry['data']
+        assert data['streak'] == 5
+        assert data['threshold'] == 5
+        assert data['reason'] == 'warm_lane_pool_hard_down'
+        assert data['block_phase'] == 'plan'
+
+    def test_no_event_store_still_files_the_escalation(self, tmp_path):
+        """event_store=None is fine — telemetry is optional, the alarm is not."""
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path)
+        assert _emit(**_default_kwargs(queue, None)) is True
+        assert len(queue.get_by_task(_sentinel('3068'), status='pending')) == 1
