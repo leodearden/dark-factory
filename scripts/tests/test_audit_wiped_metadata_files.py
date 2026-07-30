@@ -26,10 +26,16 @@ from pathlib import Path
 
 from audit_wiped_metadata_files import (
     _SOURCE_PRECEDENCE,
+    CONFIRMED_NULL_SHA_DONE_PATH,
+    CONTRADICTED_REAL_MERGE_SHA,
     FIDELITY_FILE_LEVEL,
     FIDELITY_LOCK_LEVEL,
+    NO_MERGE_EVENT,
+    NO_SUCCESSFUL_MERGE_SHA,
     PlanFilesRecord,
     TaskRecord,
+    classify_wipe_signature,
+    load_merge_signatures,
     load_plan_files_from_disk,
     load_plan_files_from_events,
     load_task_records,
@@ -700,3 +706,135 @@ def test_merge_plan_file_sources_precedence_is_stated_once_and_is_total():
         "phase_skipped_event",
         "set_to_plan_event",
     )
+
+
+# ---------------------------------------------------------------------------
+# classify_wipe_signature / load_merge_signatures — the REFINED, state-aware,
+# per-TASK discriminator.
+#
+# The naive per-EVENT signature ("a merge_finalized with merge_sha=null")
+# over-reports ~20x: measured over all 1622 merge_finalized events in the live
+# runs.db, 446 carry a null sha but 365 of those are state='blocked' and 14
+# are state='conflict' — FAILED merge attempts that were later retried and
+# landed with a real sha. Those never reached DONE and so wiped nothing.
+# Payload shape below mirrors the sole emit site, merge_queue.py:3830-3844.
+# ---------------------------------------------------------------------------
+
+
+def _finalized(state, merge_sha=None, **extra):
+    payload = {
+        "request_id": "req-1",
+        "branch": "task/7",
+        "state": state,
+        "snapshot_tip": "aaa111",
+        "merge_sha": merge_sha,
+        "superseded_by": None,
+        "generation": 0,
+        "reason": None,
+    }
+    payload.update(extra)
+    return payload
+
+
+def test_classify_already_merged_with_null_sha_is_confirmed():
+    """(a) the real DONE-with-no-sha shortcut (21 live events, all null-sha)."""
+    assert classify_wipe_signature([_finalized("already_merged")]) == (
+        CONFIRMED_NULL_SHA_DONE_PATH
+    )
+
+
+def test_classify_events_that_never_obtained_a_sha_are_no_successful_merge_sha():
+    """(b) events exist but NEVER include a non-null merge_sha."""
+    assert classify_wipe_signature(
+        [_finalized("conflict"), _finalized("abandoned")]
+    ) == NO_SUCCESSFUL_MERGE_SHA
+
+
+def test_classify_null_sha_failure_followed_by_a_real_merge_is_contradicted():
+    """(c) THE OVER-REPORT GUARD. A null-sha 'blocked' row followed by a
+    non-null-sha 'done' row is a FAILED ATTEMPT THAT WAS RETRIED AND LANDED —
+    it never took the workflow to DONE with _merge_sha=None, so it wiped
+    nothing and must NOT be reported as a confirmed wipe."""
+    assert classify_wipe_signature(
+        [_finalized("blocked"), _finalized("done", "abc123")]
+    ) == CONTRADICTED_REAL_MERGE_SHA
+
+
+def test_classify_no_events_is_unknown_not_clean():
+    """(d) other DONE paths (found_on_main recovery, eval mode) wipe without
+    ever emitting merge_finalized, so silence is UNKNOWN, not exoneration."""
+    assert classify_wipe_signature([]) == NO_MERGE_EVENT
+
+
+def test_classify_already_merged_wins_over_a_sibling_successful_row():
+    """(e) the already_merged shortcut IS the wipe, so it outranks a sibling
+    row that did carry a real sha — in either order."""
+    assert classify_wipe_signature(
+        [_finalized("already_merged"), _finalized("blocked", "xyz789")]
+    ) == CONFIRMED_NULL_SHA_DONE_PATH
+    assert classify_wipe_signature(
+        [_finalized("done", "xyz789"), _finalized("already_merged")]
+    ) == CONFIRMED_NULL_SHA_DONE_PATH
+
+
+def test_classify_treats_a_done_row_with_a_null_sha_as_confirmed():
+    """Defensive: state='done' carries a non-null sha in 1159/1159 live rows,
+    so this shape was not observed — but if it ever occurs it IS the wipe
+    (DONE reached with _merge_sha=None), not a retried failure."""
+    assert classify_wipe_signature([_finalized("done")]) == (
+        CONFIRMED_NULL_SHA_DONE_PATH
+    )
+
+
+def test_classify_tolerates_junk_payload_entries():
+    """A non-dict payload entry is ignored rather than crashing the sweep."""
+    assert classify_wipe_signature(["not-a-dict", None]) == NO_SUCCESSFUL_MERGE_SHA
+    assert classify_wipe_signature(
+        ["junk", _finalized("done", "abc123")]
+    ) == CONTRADICTED_REAL_MERGE_SHA
+
+
+def test_classify_treats_an_empty_string_sha_as_no_sha():
+    """An empty-string merge_sha is not a real merge sha."""
+    assert classify_wipe_signature([_finalized("blocked", "")]) == (
+        NO_SUCCESSFUL_MERGE_SHA
+    )
+
+
+def test_load_merge_signatures_groups_by_task_in_id_order(tmp_path):
+    db_path = _make_runs_db(
+        tmp_path,
+        [
+            {"event_type": "merge_finalized", "task_id": 7, "data": _finalized("blocked")},
+            {"event_type": "merge_finalized", "task_id": 8, "data": _finalized("already_merged")},
+            {"event_type": "merge_finalized", "task_id": 7, "data": _finalized("done", "abc123")},
+        ],
+    )
+    signatures = load_merge_signatures(str(db_path))
+
+    assert set(signatures) == {"7", "8"}
+    assert [p["state"] for p in signatures["7"]] == ["blocked", "done"]
+    assert signatures["7"][1]["merge_sha"] == "abc123"
+    assert [p["state"] for p in signatures["8"]] == ["already_merged"]
+
+
+def test_load_merge_signatures_skips_malformed_and_ignores_other_event_types(tmp_path):
+    db_path = _make_runs_db(
+        tmp_path,
+        [
+            {"event_type": "merge_finalized", "task_id": 7, "data": "{not json"},
+            {"event_type": "merge_finalized", "task_id": 7, "data": None},
+            {"event_type": "merge_finalized", "task_id": 7, "data": "[1,2,3]"},
+            {"event_type": "merge_finalized", "task_id": None, "data": _finalized("done", "a")},
+            {"event_type": "merge_attempt", "task_id": 9, "data": _finalized("done", "a")},
+            {"event_type": "merge_finalized", "task_id": 7, "data": _finalized("conflict")},
+        ],
+    )
+    signatures = load_merge_signatures(str(db_path))
+
+    assert set(signatures) == {"7"}
+    assert [p["state"] for p in signatures["7"]] == ["conflict"]
+
+
+def test_load_merge_signatures_on_empty_db_returns_empty(tmp_path):
+    assert load_merge_signatures(str(_make_runs_db(tmp_path, []))) == {}
