@@ -2013,7 +2013,9 @@ class TestUpdateMemoryStormCounter:
         service, _clock = stormy
         threshold = service.config.mem0_update.storm_threshold
 
-        for i in range(threshold * 2):
+        # Each agent gets threshold-1 calls: individually innocent, jointly
+        # well past the bar. A shared counter would page here.
+        for i in range((threshold - 1) * 2):
             await self._amend(service, agent_id=f'recon-stage-{i % 2}')
 
         service._mem0_update_storm_escalator.report_storm.assert_not_called()

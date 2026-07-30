@@ -11,7 +11,7 @@ import re
 import time
 import uuid as uuid_mod
 from dataclasses import dataclass, field
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
@@ -20,6 +20,7 @@ from graphiti_core.nodes import EpisodeType
 from fused_memory.backends.graphiti_client import GraphitiBackend
 from fused_memory.backends.mem0_client import Mem0Backend, split_managed_metadata
 from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.middleware.mem0_update_storm_escalator import Mem0UpdateStormEscalator
 from fused_memory.models.enums import (
     GRAPHITI_PRIMARY,
     MEM0_PRIMARY,
@@ -50,6 +51,7 @@ from fused_memory.reconciliation.standing_decision_writer import (
     expire_entity_standing_decision,
 )
 from fused_memory.routing.classifier import WriteClassifier
+from fused_memory.server.storm_counter import StormCounter
 from fused_memory.routing.router import ReadRouter
 from fused_memory.services.durable_queue import DurableWriteQueue
 from fused_memory.utils.async_utils import gather_collect, gather_or_raise
@@ -774,6 +776,18 @@ class MemoryService:
         # constructor. Used to resolve an escalation queue's filesystem root
         # from the project_id update_memory carries.
         self._known_projects: dict[str, str] = {}
+        # INV-4 storm escape for update_memory's silent-rewrite primitive (task
+        # 3088). Both are constructed UNCONDITIONALLY — never obtained from
+        # ReconciliationHarness (built behind `if config.reconciliation ...
+        # enabled:` in server/main.py) or curator_escalator (built after this
+        # service). An alarm bound to either would vanish in exactly the
+        # degraded configuration where an unattended rewrite loop is least
+        # likely to be noticed any other way.
+        self._mem0_update_storm_counters: dict[str, StormCounter] = {}
+        self._mem0_update_storm_escalator = Mem0UpdateStormEscalator()
+        # Test seam for the injectable-clock convention: a 3600s window has to
+        # be exercised by advancing a fake clock, not by sleeping.
+        self._mem0_update_storm_time_provider: Callable[[], float] = time.time
         # Process-start baselines for uptime reporting
         self._started_at: datetime = datetime.now(UTC)
         self._start_monotonic: float = time.monotonic()
@@ -809,6 +823,9 @@ class MemoryService:
         resolution out from under an in-flight escalation.
         """
         self._known_projects = dict(known_projects or {})
+        # Forward to the storm escalator, which is where project_id →
+        # project_root resolution actually happens.
+        self._mem0_update_storm_escalator.set_known_projects(self._known_projects)
 
     async def _emit_event(self, event: ReconciliationEvent) -> None:
         if self._event_buffer:
@@ -3551,6 +3568,62 @@ class MemoryService:
 
         return result
 
+    def _record_content_amend(self, project_id: str, agent_id: str | None) -> None:
+        """Count one in-place content amendment; escalate on a burst (INV-4).
+
+        Post-write and never blocking: this is a monitoring alarm, not a rate
+        limiter. Crossing the threshold must not reject the write that crossed
+        it, or a legitimate large consolidation cycle would fail mid-run over
+        its own success count.
+
+        Counts the CONTENT arm only. A metadata patch is cheap to notice and
+        cheap to correct; counting patches would drown the signal that a silent
+        content-rewrite loop is running.
+
+        One counter per ``agent_id``, so two independently-busy agents cannot
+        sum into a false alarm. The threshold and window are read LIVE off the
+        shared config and passed into ``record()`` per call — captured once,
+        they would make both green-tier leaves restart-only in disguise.
+        """
+        label = agent_id or '<unattributed>'
+        counter = self._mem0_update_storm_counters.get(label)
+        if counter is None:
+            counter = StormCounter(time_provider=self._mem0_update_storm_time_provider)
+            self._mem0_update_storm_counters[label] = counter
+
+        cfg = getattr(self.config, 'mem0_update', None)
+        threshold = getattr(cfg, 'storm_threshold', None)
+        window_seconds = getattr(cfg, 'storm_window_seconds', None)
+        if not isinstance(threshold, int) or not isinstance(window_seconds, int | float):
+            return
+
+        storm = counter.record(
+            threshold=threshold,
+            window_seconds=float(window_seconds),
+            label=label,
+        )
+        if storm is None:
+            return
+
+        # Never let the alarm's own failure reach the caller: the write already
+        # landed, and turning a completed amendment into an exception would be
+        # strictly worse than losing the signal. The escalator is itself
+        # never-raise; this is the belt to its braces.
+        try:
+            self._mem0_update_storm_escalator.report_storm(
+                project_id=project_id,
+                agent_id=label,
+                count=storm['count'],
+                threshold=storm['threshold'],
+                window_seconds=storm['window_seconds'],
+            )
+        except Exception:
+            logger.exception(
+                'update_memory storm escalation failed for agent %r in project %r '
+                '(count=%s); the amendment itself succeeded',
+                label, project_id, storm['count'],
+            )
+
     @staticmethod
     def _apply_metadata_delta(
         existing_custom: dict[str, Any],
@@ -3799,6 +3872,9 @@ class MemoryService:
                 timestamp=datetime.now(UTC),
                 payload={'memory_id': memory_id, 'store': 'mem0'},
             ))
+
+        if content is not None:
+            self._record_content_amend(project_id=project_id, agent_id=agent_id)
 
         return result
 
