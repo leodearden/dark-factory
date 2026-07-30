@@ -11,7 +11,7 @@ import logging
 import os
 import time
 from collections import Counter, deque
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -104,6 +104,7 @@ from orchestrator.systemd_inspect import (
 from orchestrator.task_ground_truth import (
     BranchStateKind,
     ClaimantSource,
+    EscalationRef,
     RecoveryAction,
     TaskGroundTruth,
 )
@@ -4488,7 +4489,12 @@ class Harness:
         # the exact Fix #1a re-pend we are replacing).  The dismissed record
         # still lands in the archive as an audit trail, and leaving NO pending
         # escalation keeps the later found_on_main MARK_DONE flip unblocked
-        # (its report.open_escalations guard).
+        # (its open-escalation guard).  Since PRD leaf δ that guard is
+        # _only_merge_remediable, so a pending stranded_blocked would no longer
+        # block the flip either — the dismiss is now belt-and-braces for THIS
+        # record rather than load-bearing, and is kept because the archive
+        # audit trail plus a zero-pending-escalation task is the honest state:
+        # nothing here awaits a human.
         if self._escalation_queue is not None:
             from escalation.models import Escalation  # noqa: PLC0415
 
@@ -4574,6 +4580,52 @@ class Harness:
         'done', 'already_merged', 'done_wip_recovery', 'superseded',
         'wip_halted',
     })
+
+    # Escalation categories a MERGE can itself remediate (PRD leaf δ §2.2).
+    #
+    # The stranded-blocked reaper's own `stranded_blocked` L1 is filed to
+    # REQUEST exactly the remediation the verified-green auto-merge performs —
+    # so letting it veto that merge is an anti-synergy: the escalation asking
+    # for the merge blocks the merge.  Membership here means "an open
+    # escalation of this class does NOT veto the sweep-side self-heal", and
+    # nothing more: the merge is still gated by detect_verified_green's 3-part
+    # shape check and the merge queue's own re-verify (§2.2 "never bypasses").
+    #
+    # Deliberately MINIMAL — widen only with evidence:
+    #   * `stranded_merge_failed` is EXCLUDED on purpose.  It is the DURABLE
+    #     merge/verify-failure born-at-L2 (see _file_stranded_merge_failed): a
+    #     re-merge cannot remediate a branch that already failed the queue's
+    #     verify, so a task carrying only that escalation must keep vetoing or
+    #     the reaper would re-submit into the same failure.
+    #   * every human-concern class (design_concern / task_failure /
+    #     review_issues / operator-action / infra_issue / ...) is excluded by
+    #     omission — it names a problem a merge does not fix, and must keep
+    #     holding the task for its handler.
+    MERGE_REMEDIABLE_ESC_CATEGORIES: frozenset[str] = frozenset({
+        'stranded_blocked',
+    })
+
+    @staticmethod
+    def _only_merge_remediable(
+        open_escalations: Sequence[EscalationRef],
+    ) -> bool:
+        """Are *open_escalations* ALL of a merge-remediable class?
+
+        The single category authority for the relaxed verified-green veto
+        (INV-5): called at both sweep-side upgrade clauses in
+        :meth:`_reconcile_one_stranded` in place of the former
+        ``not report.open_escalations``.
+
+        Vacuously ``True`` for an empty list — so a task with no open
+        escalation classifies exactly as it does today.  ``False`` as soon as
+        ONE escalation falls outside :attr:`MERGE_REMEDIABLE_ESC_CATEGORIES`,
+        preserving the safety invariant that a human-concern escalation still
+        vetoes the self-heal.
+        """
+        return all(
+            ref.category in Harness.MERGE_REMEDIABLE_ESC_CATEGORIES
+            for ref in open_escalations
+        )
 
     def _on_stranded_merge_done(
         self, fut: asyncio.Future, *, tid: str,
@@ -4823,11 +4875,20 @@ class Harness:
         # already-established degenerate-branch refinement pattern
         # (_branch_is_degenerate below) — rather than a change to θ1's
         # reviewed table (design decision, task 2243; esc-2243-4).
+        #
+        # The open-escalation clause is _only_merge_remediable, not the former
+        # `not report.open_escalations` (PRD leaf δ): a task whose branch landed
+        # while it was still blocked is often held by the reaper's OWN
+        # stranded_blocked — the escalation that ASKED for this landing — and
+        # letting it veto the self-heal pins the task blocked forever after its
+        # work is already on main.  Any non-remediable (human-concern)
+        # escalation still yields False and leaves the task alone, and an empty
+        # list is still True, so every other task classifies exactly as before.
         if (
             action == RecoveryAction.LEAVE
             and status == 'blocked'
             and report.live_claimant is None
-            and not report.open_escalations
+            and self._only_merge_remediable(report.open_escalations)
             and report.branch_state.kind in (
                 BranchStateKind.ON_MAIN, BranchStateKind.GONE_WITH_MERGE_MARKER,
             )
@@ -4843,11 +4904,21 @@ class Harness:
         # in. Second thin sweep-side upgrade — same pattern as the R4
         # MARK_DONE upgrade above — rather than a change to θ1's reviewed
         # table (design decision, task 2243; esc-2243-5).
+        #
+        # The open-escalation clause is _only_merge_remediable, not the former
+        # `not report.open_escalations` (PRD leaf δ): this is the branch shape a
+        # verified-green-but-never-merged task is in, and the escalation
+        # holding it is usually the reaper's OWN stranded_blocked — filed to
+        # REQUEST exactly the merge the verified-green gate below performs.
+        # Letting that request veto its own remediation was the anti-synergy δ
+        # closes.  Any non-remediable (human-concern) escalation still yields
+        # False here and leaves the task alone, and an empty list is still
+        # True, so every other task classifies exactly as before.
         if (
             action == RecoveryAction.LEAVE
             and status == 'blocked'
             and report.live_claimant is None
-            and not report.open_escalations
+            and self._only_merge_remediable(report.open_escalations)
             and report.branch_state.kind == BranchStateKind.EXISTS_OFF_MAIN
         ):
             action = RecoveryAction.RE_FILE_ESCALATION
@@ -5123,6 +5194,22 @@ class Harness:
                 # returns False and we fall through to the unchanged re-file
                 # path below — byte-identical for every non-matching task.
                 if await self._maybe_submit_stranded_verified_green(tid, metadata):
+                    return None
+
+                # Dedup guard (PRD leaf δ): reaching here with an escalation
+                # ALREADY open means the relaxed veto let us through on a
+                # merge-remediable one (the two clauses above are the only way
+                # in: θ1's resolver rows all require an empty list, and the
+                # EXISTS_OFF_MAIN upgrade now requires _only_merge_remediable)
+                # — and the verified-green submit just declined (non-match).
+                # Re-filing would stack a SECOND stranded_blocked L1 on a task
+                # that already has one pending, so leave the existing
+                # escalation for its handler.  A plain truthiness check
+                # suffices: merge-remediable-ness is already established
+                # upstream, keeping _only_merge_remediable the sole category
+                # authority (INV-5).  The empty case — every task that reached
+                # here before δ — falls through to the unchanged re-file.
+                if report.open_escalations:
                     return None
 
                 from escalation.models import Escalation

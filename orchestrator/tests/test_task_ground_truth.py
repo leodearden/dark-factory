@@ -908,8 +908,8 @@ class TestDeriveTruthRemainingFields:
         report = await resolver.derive_truth('20')
 
         assert report.open_escalations == [
-            EscalationRef(id='esc-20-1', level=1),
-            EscalationRef(id='esc-20-2', level=0),
+            EscalationRef(id='esc-20-1', level=1, category='scope_violation'),
+            EscalationRef(id='esc-20-2', level=0, category='cleanup_needed'),
         ]
         escalation_queue.get_by_task.assert_called_once_with('20', status='pending')
 
