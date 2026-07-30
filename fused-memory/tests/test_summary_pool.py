@@ -967,3 +967,126 @@ class TestEnforceSummaryPoolCapPrecision:
             for call in memory_service.delete_memory.call_args_list
         }
         assert deleted == {'no-metadata-1'}
+
+
+class TestEnforceSummaryPoolCapTombstones:
+    """Every trim eviction leaves a queryable tombstone (task 3041).
+
+    This is the path that consumed the run-84eae9bd anchors reported by recon
+    gate 165 / esc-165-1. The fix for its "no audit trail" signature is the
+    tombstone, not a retention change: an auditor holding only a memory uuid
+    can now find out which sweep took it and on whose run.
+    """
+
+    @staticmethod
+    def _over_cap_members():
+        return [
+            {'id': 'trimmed-ok', 'created_at': '2026-01-01T00:00:00+00:00',
+             'metadata': {'kind': 'cycle_summary', 'record_type': 'narrative',
+                          'recon_pool': 'stage1_cycle_summary', 'run_id': 'run-victim'}},
+            {'id': 'trim-fails', 'created_at': '2026-02-01T00:00:00+00:00',
+             'metadata': {'kind': 'cycle_summary', 'record_type': 'narrative',
+                          'recon_pool': 'stage1_cycle_summary', 'run_id': 'run-victim-2'}},
+            {'id': 'kept', 'created_at': '2026-03-01T00:00:00+00:00',
+             'metadata': {'kind': 'cycle_summary', 'record_type': 'ledger_stamp',
+                          'recon_pool': 'stage1_cycle_summary', 'run_id': 'run-kept'}},
+        ]
+
+    @staticmethod
+    def _service(members):
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+
+        async def _delete(**kwargs):
+            if kwargs.get('memory_id') == 'trim-fails':
+                raise RuntimeError('mem0 delete exploded')
+            return None
+
+        memory_service.delete_memory = AsyncMock(side_effect=_delete)
+        return memory_service
+
+    @pytest.mark.asyncio
+    async def test_tombstone_written_only_for_the_successful_trim(self):
+        import fused_memory.reconciliation.summary_pool as sp
+
+        members = self._over_cap_members()
+        memory_service = self._service(members)
+
+        with patch.object(
+            sp, 'record_mem0_deletion_tombstone', new=AsyncMock(return_value=True)
+        ) as tombstone:
+            result = await enforce_summary_pool_cap(
+                memory_service,
+                project_id='dark_factory',
+                run_id='run-deleter',
+                recon_pool='stage1_cycle_summary',
+                trim_source='stage1_cycle_summary_trim',
+                cap=1,
+            )
+
+        assert tombstone.await_count == 1
+        call = tombstone.await_args
+        assert call.args[1] == 'dark_factory'
+        assert call.args[2] == 'trimmed-ok'
+        assert call.kwargs['deleter'] == 'stage1_cycle_summary_trim'
+        # The DELETING run, explicitly distinct from the victim's own
+        # metadata['run_id'] — the precise ambiguity that made the original
+        # finding unreadable.
+        assert call.kwargs['deleting_run_id'] == 'run-deleter'
+        assert call.kwargs['victim_metadata']['run_id'] == 'run-victim'
+        assert call.kwargs['victim_metadata']['kind'] == 'cycle_summary'
+        assert call.kwargs['victim_metadata']['record_type'] == 'narrative'
+        assert call.kwargs['victim_metadata']['recon_pool'] == 'stage1_cycle_summary'
+        assert call.kwargs['victim_created_at'] == '2026-01-01T00:00:00+00:00'
+
+        # A tombstone must never claim a record that is still alive, and
+        # tombstone writing must not perturb the existing accounting.
+        assert result == 1
+
+    @pytest.mark.asyncio
+    async def test_a_raising_tombstone_helper_cannot_propagate_or_change_the_count(self):
+        import fused_memory.reconciliation.summary_pool as sp
+
+        memory_service = self._service(self._over_cap_members())
+
+        with patch.object(
+            sp,
+            'record_mem0_deletion_tombstone',
+            new=AsyncMock(side_effect=RuntimeError('ledger db locked')),
+        ):
+            result = await enforce_summary_pool_cap(
+                memory_service,
+                project_id='dark_factory',
+                run_id='run-deleter',
+                recon_pool='stage1_cycle_summary',
+                trim_source='stage1_cycle_summary_trim',
+                cap=1,
+            )
+
+        assert result == 1
+
+    @pytest.mark.asyncio
+    async def test_no_tombstone_when_pool_is_within_cap(self):
+        import fused_memory.reconciliation.summary_pool as sp
+
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[
+            {'id': 'only', 'created_at': '2026-01-01T00:00:00+00:00',
+             'metadata': {'kind': 'cycle_summary', 'record_type': 'ledger_stamp'}},
+        ])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with patch.object(
+            sp, 'record_mem0_deletion_tombstone', new=AsyncMock(return_value=True)
+        ) as tombstone:
+            result = await enforce_summary_pool_cap(
+                memory_service,
+                project_id='dark_factory',
+                run_id='run-deleter',
+                recon_pool='stage1_cycle_summary',
+                trim_source='stage1_cycle_summary_trim',
+                cap=2,
+            )
+
+        assert result == 0
+        tombstone.assert_not_awaited()
