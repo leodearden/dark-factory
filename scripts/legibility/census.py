@@ -846,6 +846,7 @@ class CensusOutcome:
     report_path: str | None = None
     filed_task_ids: list[str] = field(default_factory=list)
     stop_reason: str | None = None
+    dry_run: DryRunFiling | None = None
 
 
 def run_census(
@@ -869,6 +870,7 @@ def run_census(
     force: bool = False,
     max_batches: int | None = None,
     max_verify_clusters: int | None = None,
+    dry_run_payloads_path: str | Path | None = None,
 ) -> CensusOutcome:
     """Run one periodic legibility census end to end.
 
@@ -947,6 +949,21 @@ def run_census(
     adjudication: the matrix and the synthesis necessarily cover only the
     VERIFIED subset, and the report's ``## Verification`` section states
     that split rather than letting a bounded run read as a complete one.
+
+    *dry_run_payloads_path* switches filing to review mode
+    (``--dry-run-filing``): every would-be ``submit_task`` payload is
+    written there as JSON for a human to read, *submit_fn* is never
+    called, and ``filed_task_ids`` stays empty. ONLY the external filing
+    is stubbed -- mining, verification, synthesis, the matrix, the
+    codebook merge and promotions, the report write, ``codebook.dump``
+    and ``advance_census_state`` all proceed exactly as on a normal run,
+    so the payload file is a faithful preview of what a real run would
+    file rather than the output of a half-executed census. The write sits
+    at the same point in the sequence the filing loop occupies (after
+    ``build_task_payloads``, before ``codebook.dump``), preserving the
+    ordering invariant above, and the file is appended to the best-effort
+    *commit* paths -- a dry run's deliverable IS the payload file, so it
+    is versioned alongside the report and codebook it came from.
     """
     headroom = preflight_headroom(invoke, model=config.models.trickle)
     if not headroom.ok:
@@ -1053,22 +1070,42 @@ def run_census(
     # already-advanced codebook.
     task_payloads = build_task_payloads(verified, project_root=project_root, project_id=project_id)
     filed_task_ids = []
-    for payload in task_payloads:
-        try:
-            submit_result = submit_fn(**payload)
-        except Exception as exc:  # noqa: BLE001 - best-effort, see comment above
-            logger.warning(
-                "census: submit_fn failed for payload %r: %s", payload.get("title"), exc,
-            )
-            continue
-        task_id = submit_result.get("id") if isinstance(submit_result, dict) else None
-        if task_id is None:
-            logger.warning(
-                "census: submit_fn returned no usable id for payload %r (result=%r) "
-                "-- not counted as filed", payload.get("title"), submit_result,
-            )
-            continue
-        filed_task_ids.append(task_id)
+    dry_run_filing = None
+    if dry_run_payloads_path is not None:
+        # --dry-run-filing: write the payloads for human review and file
+        # NOTHING. submit_fn is deliberately left untouched (not swapped for
+        # a collector) so a test can assert it was never reached, and so the
+        # id-less-result WARNING below can never fire for an intentional
+        # operator mode.
+        Path(dry_run_payloads_path).write_text(
+            json.dumps(task_payloads, indent=2) + "\n", encoding="utf-8",
+        )
+        logger.warning(
+            "census: --dry-run-filing -- %d task payload(s) written to %s; "
+            "NOTHING was filed into a live task tree. Review the payloads and file "
+            "by hand, or re-run without --dry-run-filing.",
+            len(task_payloads), dry_run_payloads_path,
+        )
+        dry_run_filing = DryRunFiling(
+            path=str(dry_run_payloads_path), payload_count=len(task_payloads),
+        )
+    else:
+        for payload in task_payloads:
+            try:
+                submit_result = submit_fn(**payload)
+            except Exception as exc:  # noqa: BLE001 - best-effort, see comment above
+                logger.warning(
+                    "census: submit_fn failed for payload %r: %s", payload.get("title"), exc,
+                )
+                continue
+            task_id = submit_result.get("id") if isinstance(submit_result, dict) else None
+            if task_id is None:
+                logger.warning(
+                    "census: submit_fn returned no usable id for payload %r (result=%r) "
+                    "-- not counted as filed", payload.get("title"), submit_result,
+                )
+                continue
+            filed_task_ids.append(task_id)
 
     storm_batch_indices = [s.index for s in mining_result.batch_stats if s.status == "failure"]
     if storm_batch_indices:
@@ -1102,6 +1139,7 @@ def run_census(
         filed_task_ids=filed_task_ids,
         cost_note=cost_note,
         verify_coverage=verify_coverage,
+        dry_run=dry_run_filing,
     )
     # Written BEFORE codebook.dump()/advance_census_state() below -- a
     # failure here (e.g. a disk-full write_text) leaves nothing but this one
@@ -1124,11 +1162,11 @@ def run_census(
         census_state_path, now_iso=date, report_path=str(report_path), done_count=done_count,
     )
 
+    commit_paths = [str(report_path), str(codebook_path), str(census_state_path)]
+    if dry_run_filing is not None:
+        commit_paths.append(dry_run_filing.path)
     try:
-        commit(
-            paths=[str(report_path), str(codebook_path), str(census_state_path)],
-            message=f"legibility census {date}",
-        )
+        commit(paths=commit_paths, message=f"legibility census {date}")
     except Exception as exc:  # noqa: BLE001 - best-effort, never fails the census
         logger.warning("census: best-effort commit failed: %s", exc)
 
@@ -1137,6 +1175,7 @@ def run_census(
         report_path=str(report_path),
         filed_task_ids=filed_task_ids,
         stop_reason=mining_result.stop_reason,
+        dry_run=dry_run_filing,
     )
 
 
