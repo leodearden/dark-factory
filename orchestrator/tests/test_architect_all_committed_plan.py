@@ -388,3 +388,140 @@ class TestDetectCommittedBranchWork:
         workflow.git_ops.get_commit_subjects = _boom  # type: ignore[method-assign]
 
         assert await workflow._detect_committed_branch_work() == []
+
+
+# ---------------------------------------------------------------------------
+# step-5 RED: build_architect_prompt renders the already-committed-work section
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def briefing_assembler(tmp_path: Path):
+    """Real BriefingAssembler, mirroring test_briefing.py's construction."""
+    from orchestrator.agents.briefing import BriefingAssembler  # noqa: PLC0415
+
+    return BriefingAssembler(OrchestratorConfig(
+        project_root=tmp_path,
+        git=GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+        ),
+    ))
+
+
+@pytest.fixture
+def architect_task() -> dict:
+    return {
+        'id': '3033',
+        'title': 'Architect all-committed plan',
+        'description': 'Pre-satisfy steps already committed on the branch.',
+        'metadata': {'files': ['orchestrator']},
+    }
+
+
+_SHA_A = 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678'
+_SHA_B = '0f1e2d3c4b5a69788796a5b4c3d2e1f001234567'
+_COMMITTED_WORK = [
+    {'sha': _SHA_A, 'subject': 'feat: GREEN — the thing'},
+    {'sha': _SHA_B, 'subject': 'test: RED — the thing'},
+]
+
+
+@pytest.mark.asyncio
+class TestArchitectPromptCommittedWorkSection:
+    async def _prompt(self, briefing_assembler, architect_task, **kwargs) -> str:
+        return await briefing_assembler.build_architect_prompt(
+            architect_task, worktree=None, context='', **kwargs,
+        )
+
+    async def test_renders_each_commit_sha_and_subject(
+        self, briefing_assembler, architect_task,
+    ):
+        prompt = await self._prompt(
+            briefing_assembler, architect_task, committed_work=_COMMITTED_WORK,
+        )
+
+        for entry in _COMMITTED_WORK:
+            assert entry['sha'][:12] in prompt, (
+                f"Expected abbreviated sha {entry['sha'][:12]} in the prompt"
+            )
+            assert entry['subject'] in prompt
+
+    async def test_names_mark_step_committed_and_the_pre_satisfy_instruction(
+        self, briefing_assembler, architect_task,
+    ):
+        prompt = await self._prompt(
+            briefing_assembler, architect_task, committed_work=_COMMITTED_WORK,
+        )
+
+        assert 'mark_step_committed' in prompt
+        lowered = prompt.lower()
+        assert 'pending' in lowered, (
+            'The section must contrast pre-satisfying against leaving the step '
+            'pending'
+        )
+
+    async def test_states_verify_is_the_gate(self, briefing_assembler, architect_task):
+        """No-silent-green: the architect must be told VERIFY still runs."""
+        prompt = await self._prompt(
+            briefing_assembler, architect_task, committed_work=_COMMITTED_WORK,
+        )
+
+        assert 'VERIFY' in prompt
+        lowered = prompt.lower()
+        assert 'never pre-satisfy' in lowered or 'do not pre-satisfy' in lowered, (
+            'The section must explicitly forbid pre-satisfying a step whose '
+            'tests have not been seen to pass'
+        )
+
+    async def test_instructs_first_hand_corroboration(
+        self, briefing_assembler, architect_task,
+    ):
+        prompt = await self._prompt(
+            briefing_assembler, architect_task, committed_work=_COMMITTED_WORK,
+        )
+
+        assert 'git show' in prompt
+        assert "tests" in prompt.lower()
+
+    @pytest.mark.parametrize('committed_work', [None, []])
+    async def test_no_section_when_no_committed_work(
+        self, briefing_assembler, architect_task, committed_work,
+    ):
+        """A truly-fresh first dispatch stays byte-identical to today.
+
+        Preserves the C-A1 anti-anchoring posture documented at briefing.py:76-81
+        — no extra section, and no mention of the pre-satisfy tool at all.
+        """
+        prompt = await self._prompt(
+            briefing_assembler, architect_task, committed_work=committed_work,
+        )
+
+        assert 'mark_step_committed' not in prompt
+        assert 'Already-Committed' not in prompt
+
+    async def test_default_call_shape_still_works(
+        self, briefing_assembler, architect_task,
+    ):
+        """The new kwarg is keyword-only with a None default."""
+        prompt = await briefing_assembler.build_architect_prompt(
+            architect_task, None, '',
+        )
+
+        assert 'mark_step_committed' not in prompt
+        assert architect_task['title'] in prompt
+
+    async def test_rendering_is_identical_to_the_no_kwarg_baseline(
+        self, briefing_assembler, architect_task,
+    ):
+        """committed_work=[] must produce exactly the pre-γ prompt."""
+        baseline = await briefing_assembler.build_architect_prompt(
+            architect_task, None, '',
+        )
+        with_empty = await self._prompt(
+            briefing_assembler, architect_task, committed_work=[],
+        )
+
+        assert with_empty == baseline
