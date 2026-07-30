@@ -132,6 +132,56 @@ _EVENT_PLAN_SOURCES = {
 _FIDELITY_RANK = {FIDELITY_LOCK_LEVEL: 0, FIDELITY_FILE_LEVEL: 1}
 
 
+# The ONE statement of source precedence, most authoritative first. Every
+# source label the loaders can emit appears here, so a merge is always total.
+#
+#   meta_root_plan_json      — the canonical persisted plan artifact.
+#   legacy_worktree_plan_json — the same artifact at its pre-relocation path.
+#   phase_skipped_event      — a durable EVENT SNAPSHOT of plan.files; equally
+#                              file-level, but a snapshot taken at one moment
+#                              rather than the plan as finally persisted, so
+#                              it loses to either disk artifact.
+#   set_to_plan_event        — lock-level module projection; last resort.
+_SOURCE_PRECEDENCE = (
+    "meta_root_plan_json",
+    "legacy_worktree_plan_json",
+    "phase_skipped_event",
+    "set_to_plan_event",
+)
+
+
+def _source_rank(record: PlanFilesRecord) -> int:
+    """Rank *record* by source; lower is more authoritative.
+
+    An unrecognised source sorts last rather than raising, so adding a new
+    loader can never make the merge crash — it just ranks below every known
+    source until it is added to :data:`_SOURCE_PRECEDENCE`.
+    """
+    try:
+        return _SOURCE_PRECEDENCE.index(record.source)
+    except ValueError:
+        return len(_SOURCE_PRECEDENCE)
+
+
+def merge_plan_file_sources(
+    disk_records: dict[str, PlanFilesRecord],
+    event_records: dict[str, PlanFilesRecord],
+) -> dict[str, PlanFilesRecord]:
+    """Merge the disk-borne and event-borne plan scopes by source precedence.
+
+    Returns a FRESH dict covering the union of both inputs' task ids; neither
+    argument is mutated. Where both carry a record for one task, the one whose
+    source ranks higher in :data:`_SOURCE_PRECEDENCE` wins.
+    """
+    merged: dict[str, PlanFilesRecord] = {}
+    for records in (disk_records, event_records):
+        for task_id, record in records.items():
+            existing = merged.get(task_id)
+            if existing is None or _source_rank(record) < _source_rank(existing):
+                merged[task_id] = record
+    return merged
+
+
 def _read_plan_file(plan_path: Path) -> tuple[str, tuple[str, ...]] | None:
     """Read one plan.json, returning ``(task_id_key, files)`` or None.
 
