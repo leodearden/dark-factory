@@ -45,9 +45,17 @@ Invariants (see the task-2381 plan / merge-skew-attribution-prd.md):
        classification after a fleet redeploy. Reading across runs keeps the
        durable prior-run green visible (any-prior-green semantics unchanged;
        result set bounded by the task_id filter).
-  I7 — INTEGRATION_SKEW additionally requires evidence.failing_tests
-       non-empty; a guard/ratchet failure parsing zero failing-test ids
-       degrades to INDETERMINATE (task 2871).
+  I7 — INTEGRATION_SKEW additionally requires at least one failing-test id
+       carrying a real test-node SHAPE — ``path::test_name`` for pytest,
+       ``crate::mod::test`` for Rust (task 2871 introduced the non-empty
+       requirement; task 3178 added the shape floor). A guard/ratchet failure
+       whose only ``FAILED`` token is a bare filename parses zero node-shaped
+       ids and degrades to INDETERMINATE. Task 3178's correction: the original
+       2871 wording claimed guard output "matches neither
+       ``_PYTEST_FAILED_ID_RE`` nor ``_RUST_FAILED_ID_RE``", which was FALSE
+       in production — the unconstrained pytest regex matched ``FAILED
+       <guard>.sh`` and returned the guard's filename, satisfying I7
+       vacuously. See ``_extract_failing_tests_and_candidate_files``.
 
 This module is intentionally self-contained (task 2381 α scope): it defines
 the classifier, its data types, and private helpers only. Wiring into the
@@ -150,8 +158,32 @@ def _extract_failing_tests_and_candidate_files(
             failing_tests.append(test_id)
 
     for m in _PYTEST_FAILED_ID_RE.finditer(combined):
-        _add_test(m.group(1))
+        tid = m.group(1)
+        if '::' not in tid:
+            # Node-id SHAPE floor (task 3178). ``_PYTEST_FAILED_ID_RE`` is an
+            # unconstrained ``^FAILED\s+(\S+)``, so a bare filename or an
+            # English word after "FAILED" was captured as a "test id".
+            # Evidence: reify's verify summary renders a shell-guard trip as
+            # ``FAILED <guard>.sh``, so the guard's own FILENAME satisfied
+            # I7's failing_tests non-empty requirement vacuously — all 8
+            # INTEGRATION_SKEW dispositions between 07-24 and 07-28 (reify
+            # 5316/5373/5302, 5300 x3, 5566 x2, 5321) were shell/infra guards,
+            # and the same hole parsed the word "to" out of "FAILED to release
+            # semaphore slot". ``_RUST_FAILED_ID_RE`` has always required
+            # ``::`` by construction, so this only mirrors an invariant the
+            # sibling regex already had (which is why reify 5187's genuine
+            # Rust-shaped skew is provably unaffected).
+            #
+            # ACCEPTED edge case: a pytest COLLECTION-level ``FAILED
+            # tests/test_foo.py`` (no ``::``) now parses zero ids and degrades
+            # to INDETERMINATE rather than skew. pytest emits ``ERROR <path>``
+            # for collection errors, so this shape is rare, and the degrade
+            # errs toward the honest fallback rather than a fabricated skew.
+            continue
+        _add_test(tid)
     for m in _RUST_FAILED_ID_RE.finditer(combined):
+        # No shape floor needed: _RUST_FAILED_ID_RE requires a ``::``-separated
+        # path by construction (see its definition above).
         _add_test(m.group(1))
 
     candidate_files: set[str] = set(_FILE_TOKEN_RE.findall(combined))
@@ -442,9 +474,13 @@ async def classify_merge_failure_disposition(
            reference frame (see ``_implicated_landings``). *main_sha* stays the
            frozen dispatch-time input (2357 untouched); *real_main_head_sha* is
            a distinct, additional input used only for the ancestor filter.
-      I7 — INTEGRATION_SKEW additionally requires evidence.failing_tests
-           non-empty; a guard/ratchet failure parsing zero failing-test ids
-           degrades to INDETERMINATE (task 2871).
+      I7 — INTEGRATION_SKEW additionally requires at least one failing-test id
+           carrying a real test-node SHAPE (``path::test_name`` for pytest,
+           ``crate::mod::test`` for Rust): task 2871 required
+           ``evidence.failing_tests`` non-empty, task 3178 added the shape
+           floor after finding the requirement was being satisfied vacuously.
+           A guard/ratchet failure whose only ``FAILED`` token is a bare
+           filename parses zero node-shaped ids and degrades to INDETERMINATE.
 
     Args:
         verify_result: the failing VerifyResult from the branch's merge-time verify.
@@ -534,21 +570,36 @@ async def classify_merge_failure_disposition(
         # submit path) or a failed green (False) degrades to the honest
         # INDETERMINATE — never a fabricated skew.
         #
-        # I7 (task 2871, reify esc-5053-13 & esc-5056-11): additionally
-        # require a parsed failing-test id. A harness-ratchet / shell-guard
-        # failure (kLOC cap, baseline-manifest grandfathering, other
-        # tests/infra/*.sh guards) emits guard text that matches neither
-        # _PYTEST_FAILED_ID_RE nor _RUST_FAILED_ID_RE, so its only "evidence"
-        # is a spurious file-token overlap on the runner (run_all.sh /
-        # verify.sh) or the guard's own artifact — causally irrelevant even
-        # when the implicated landing is a genuine real-main ancestor (2869's
-        # I6 filter therefore cannot prune it). An empty failing_tests here
-        # degrades to the honest INDETERMINATE (never a fabricated skew
-        # steering the debugger off its own diff); NOT BRANCH_BUG, because
-        # the class's true cause is heterogeneous across the census (own-diff
-        # for 5053/5056 vs main-red for 5288/5266) and BRANCH_BUG would both
-        # mislabel the main-red instances and emit a misleading merge_attempt
-        # disposition row.
+        # I7 (task 2871, reify esc-5053-13 & esc-5056-11; SHAPE FLOOR added by
+        # task 3178): additionally require at least one failing-test id
+        # carrying a real test-node shape (path::test_name for pytest,
+        # crate::mod::test for Rust). A harness-ratchet / shell-guard failure
+        # (kLOC cap, baseline-manifest grandfathering, other tests/infra/*.sh
+        # guards) has as its only "evidence" a spurious file-token overlap on
+        # the runner (run_all.sh / verify.sh) or the guard's own artifact —
+        # causally irrelevant even when the implicated landing is a genuine
+        # real-main ancestor (2869's I6 filter therefore cannot prune it). An
+        # empty failing_tests here degrades to the honest INDETERMINATE (never
+        # a fabricated skew steering the debugger off its own diff); NOT
+        # BRANCH_BUG, because the class's true cause is heterogeneous across
+        # the census (own-diff for 5053/5056 vs main-red for 5288/5266) and
+        # BRANCH_BUG would both mislabel the main-red instances and emit a
+        # misleading merge_attempt disposition row.
+        #
+        # Task 3178's correction to 2871's premise: this comment previously
+        # asserted that guard text "matches neither _PYTEST_FAILED_ID_RE nor
+        # _RUST_FAILED_ID_RE". That was FALSE in production. The pytest regex
+        # was an unconstrained ^FAILED\s+(\S+), and reify renders a guard trip
+        # as `FAILED <guard>.sh` — so the guard's own filename WAS returned as
+        # a failing-test id and satisfied this gate vacuously, yielding 8 false
+        # INTEGRATION_SKEW dispositions between 07-24 and 07-28. The sibling
+        # test TestClassifyHarnessRatchetNotSkew passed pre-3178 only because
+        # its fixture was synthetic (`HARNESS_KLOC_CAP FAIL …`, which has no
+        # `^FAILED <token>` and so genuinely parsed zero ids); the live strings
+        # are now pinned alongside it in
+        # TestShellGuardFilenameIsNotATestId. The shape floor lives in
+        # _extract_failing_tests_and_candidate_files, so by the time control
+        # reaches here `failing_tests` contains only node-shaped ids.
         if failing_tests and _branch_pre_merge_verify_green(event_store, task_id) is True:
             return (
                 MergeFailureDisposition.INTEGRATION_SKEW,
