@@ -335,8 +335,12 @@ class TestBuildCompositeReport:
         assert b['fixtures'] == 2
 
         c = rows['C']
-        # C is cheapest+fastest+top-quality in its only fixture → blend 1.0.
-        assert c['composite'] == pytest.approx(1.0)
+        # C is an ARCHITECT row, so it scores through the plan-only path
+        # (task 3099): quality is its plan_quality 0.9, not its composite_score.
+        # Cheapest+fastest in f1 → both efficiency axes 1.0 →
+        # 0.6*0.9 + 0.2*1.0 + 0.2*1.0 == 0.94.
+        assert c['composite'] == pytest.approx(0.94)
+        assert c['quality'] == pytest.approx(0.9)
         assert c['cost_usd'] == pytest.approx(1.0)
         assert c['trials'] == 3
         assert c['fixtures'] == 1

@@ -177,6 +177,25 @@ def _summarize_cost_source(sources: set[str]) -> str:
     return 'mixed'
 
 
+def _is_plan_only(metrics: dict[str, Any]) -> bool:
+    """Is this trial a PLAN-ONLY cell (task 3099)?
+
+    ``run_architect_eval`` is the only producer of ``role_under_test ==
+    'architect'`` and is plan-only BY CONSTRUCTION — it freezes
+    implementer/debugger/reviewer/verify, so the cell never runs a test and
+    carries its quality in ``plan_quality`` rather than ``composite_score``.
+
+    Keyed on the EXISTING ``role_under_test`` stamp rather than a new persisted
+    ``plan_only`` field for two reasons: ``build_composite_report`` already keys
+    ``plan_quality_cap_excluded`` on exactly this test (a second field could
+    drift from the first), and a new field would read back as its default on
+    every result JSON written before this task — silently mis-classifying the
+    whole existing corpus, including the campaign this fix exists to make
+    readable.
+    """
+    return metrics.get('role_under_test') == 'architect'
+
+
 def build_composite_report(
     results: list[EvalResult],
     *,
@@ -219,14 +238,28 @@ def build_composite_report(
     (reviewer: docs-accuracy — two exclusion surfaces that disagree are worse
     than one).
 
-    SCOPE of the taint exclusion, stated explicitly because it is narrow: only
-    the ``plan_quality`` passthrough skips tainted trials. The composite /
-    quality / cost / latency pools and the ``trials`` + ``tests_pass_rate``
-    denominators still COUNT them, deliberately — those pools measure the
-    implementer-path gates, which a tainted architect cell reports as an honest
-    failure rather than a fabricated score, and silently dropping trials from
-    the denominator ``select_survivors`` ranks on would shrink the sample
-    without saying so. ``cost_source`` (P5) is
+    SCOPE of the taint exclusion (REVISED by task 3099): the ``plan_quality``
+    passthrough and — for a PLAN-ONLY trial — the ``composite`` / ``quality``
+    pools skip tainted trials. The earlier scope kept tainted trials in the
+    composite pool on the grounds that it measured the implementer-path gates,
+    which a tainted architect cell reports as an honest failure; once the
+    composite is DERIVED from ``plan_quality`` that justification no longer
+    holds, and a fabricated ``0.0`` there would penalise whichever candidate was
+    scheduled inside a cap window — the defect task 3118 removed from
+    ``mean_plan_quality``, reintroduced one layer up in the number
+    ``select_survivors`` actually ranks on. The ``cost`` / ``latency`` pools and
+    the ``trials`` denominator still COUNT every trial, so the sample
+    ``select_survivors`` ranks on is never silently shrunk, and
+    ``plan_quality_cap_excluded`` reports how many were skipped. A config with
+    NO scored trial reports ``composite=None`` / ``quality=None`` rather than
+    ``0.0`` — "we measured nothing" must never read as "it scored nothing".
+
+    PLAN-ONLY rows (task 3099, :func:`_is_plan_only`): a trial whose
+    ``role_under_test`` is ``'architect'`` ran no test at all, so it is blended
+    with ``quality=plan_quality, plan_only=True`` instead of being hard-gated to
+    ``0.0`` by its absent ``tests_pass``, and ``quality`` reports the axis that
+    actually fed the composite. Such a config's ``tests_pass_rate`` is ``None``:
+    no test ran, so there is no pass rate — not a 0% one. ``cost_source`` (P5) is
     the config's single distinct per-trial source, or ``'mixed'`` when its
     trials span more than one — since ``cost_usd`` is a cross-trial mean,
     labelling it with just the first trial's source would mislabel a blended
@@ -269,7 +302,7 @@ def build_composite_report(
     def _acc() -> dict[str, Any]:
         return {
             'composite': [], 'cost': [], 'latency': [], 'quality': [],
-            'passes': 0, 'trials': 0, 'fixtures': set(),
+            'passes': 0, 'trials': 0, 'plan_only_trials': 0, 'fixtures': set(),
             'judge_invocations': 0, 'judge_cost_usd': 0.0,
             'cost_sources': set(),
             'first_metrics': None,
@@ -281,22 +314,40 @@ def build_composite_report(
     for r in results:
         fixture = r.task_id
         m = r.metrics
-        quality = float(m.get('composite_score', 0.0) or 0.0)
         cost = float(m.get('cost_usd', 0.0) or 0.0)
         latency = float(m.get('workflow_duration_ms', 0) or 0) / 1000.0
         tests_pass = m.get('tests_pass')
-        composite_trial = blend_composite(
-            quality,
-            _ratio_score(cost, best_cost.get(fixture, 0.0)),
-            _ratio_score(latency, best_latency.get(fixture, 0.0)),
-            tests_pass=tests_pass,
-        )
+        plan_only = _is_plan_only(m)
         acc = by_config[r.config_name]
-        acc['composite'].append(composite_trial)
+        # A plan-only cell's quality axis is its θ-rubric plan_quality; a
+        # workflow cell's is the pure compute_composite score. Accumulating the
+        # axis that ACTUALLY fed the composite is what keeps the row internally
+        # consistent — otherwise every architect row renders quality=0.0000
+        # beside a non-zero composite (task 3099).
+        raw_pq = m.get('plan_quality')
+        quality = (
+            float(raw_pq) if plan_only and raw_pq is not None
+            else float(m.get('composite_score', 0.0) or 0.0)
+        )
+        # An UNMEASURABLE plan-only trial (no plan_quality at all ⟺ cap_tainted
+        # on the architect path; a legacy row missing the field takes the same
+        # safe branch) is EXCLUDED from the composite/quality pools rather than
+        # scored 0.0 — task 3118's invariant, now applied to the number that
+        # drives survivor selection. It is still counted in `trials` and in
+        # `plan_quality_cap_excluded` below, so nothing is dropped silently.
+        if not (plan_only and raw_pq is None):
+            acc['composite'].append(blend_composite(
+                quality,
+                _ratio_score(cost, best_cost.get(fixture, 0.0)),
+                _ratio_score(latency, best_latency.get(fixture, 0.0)),
+                tests_pass=tests_pass,
+                plan_only=plan_only,
+            ))
+            acc['quality'].append(quality)
         acc['cost'].append(cost)
         acc['latency'].append(latency)
-        acc['quality'].append(quality)
         acc['passes'] += 1 if tests_pass else 0
+        acc['plan_only_trials'] += 1 if plan_only else 0
         acc['trials'] += 1
         acc['fixtures'].add(fixture)
         acc['judge_invocations'] += int(m.get('judge_invocations', 0) or 0)
@@ -328,12 +379,22 @@ def build_composite_report(
         latency_ci = mean_ci95(acc['latency'])
         quality_ci = mean_ci95(acc['quality'])
         trials = acc['trials']
+        # An EMPTY pool means every trial was unmeasurable. mean_ci95([]) returns
+        # mean 0.0, which would read as "it scored nothing" — so the row reports
+        # None (rendered '-'), following the mean_plan_quality=None precedent.
+        scored = bool(acc['composite'])
+        # A plan-only config ran no test at all, so it has no pass RATE — not a
+        # 0% one. Fabricating 0% there would report a failure that never happened.
+        all_plan_only = acc['plan_only_trials'] == trials and trials > 0
         rows.append({
             'config': cfg,
             'role_under_test': fm.get('role_under_test'),
-            'composite': composite_ci['mean'],
-            'quality': quality_ci['mean'],
-            'tests_pass_rate': (acc['passes'] / trials) if trials else 0.0,
+            'composite': composite_ci['mean'] if scored else None,
+            'quality': quality_ci['mean'] if scored else None,
+            'tests_pass_rate': (
+                None if all_plan_only
+                else (acc['passes'] / trials) if trials else 0.0
+            ),
             'cost_usd': cost_ci['mean'],
             'cost_source': _summarize_cost_source(acc['cost_sources']),
             'latency_secs': latency_ci['mean'],
