@@ -690,3 +690,187 @@ class TestLimitsProvenance:
         assert issue['kind'] == 'missing_limits'
         assert issue['eval_id'] == 'eval-a'
         assert issue['path'] == str(root / 'eval-a' / 'limits-current.json')
+
+
+# ---------------------------------------------------------------------------
+# step-9 — verdicts (the sole verdict source), joined on (eval_id, metric_id)
+# ---------------------------------------------------------------------------
+
+_VERDICT_RUN = '20260705T031500Z'
+
+# The M2 verdict vocabulary in full.  All four must survive the read verbatim:
+# any dashboard-side mapping table would be a second vocabulary to keep in sync
+# with the evaluator's, and the first divergence would silently mislabel an
+# alarm.
+_VERDICT_VALUES = ('alarm', 'no_alarm', 'insufficient_data', 'grandfathered')
+
+
+def _good_verdict_entries() -> list[dict]:
+    """One entry per verdict value, all resolving onto real ``eval-a`` metrics."""
+    return [
+        _verdict(
+            'eval-a', 'canonical-in-top-5', 'alarm',
+            fingerprint='fp-canonical-alarm', value=0.4,
+            limit_ref='alpha=0.002777777777777778', run_stamp=_VERDICT_RUN,
+        ),
+        _verdict(
+            'eval-a', 'dangling-pointers', 'no_alarm',
+            fingerprint='fp-dangling-clear', value=4.0,
+            limit_ref='alpha=0.002777777777777778', run_stamp=_VERDICT_RUN,
+        ),
+        _verdict(
+            'eval-a', 'search-latency-p50-ms', 'insufficient_data',
+            fingerprint='fp-latency-thin', value=44.0,
+            limit_ref='min_samples=10', run_stamp=_VERDICT_RUN,
+        ),
+        _verdict(
+            'eval-a', 'topic-canonical-present', 'grandfathered',
+            fingerprint='fp-topic-grandfathered', value=2.0,
+            limit_ref='grandfather_set_hash=f8c46981', run_stamp=_VERDICT_RUN,
+            item='t-recon-watcher-triage',
+        ),
+    ]
+
+
+def _verdicts_tree(
+    tmp_path: Path,
+    *,
+    entries: list[dict] | None = None,
+    write_verdicts: bool = True,
+    per_eval_copy: bool = False,
+) -> tuple[Path, Path]:
+    """``eval-a`` with one run, limits, and a root verdicts artifact.
+
+    ``unjudged-metric`` has no verdict entry.  *per_eval_copy* writes the
+    verdicts artifact to the WRONG place (``<root>/eval-a/``) to prove the
+    reader names it rather than silently falling back to it.
+    """
+    root = tmp_path / 'memory-evals'
+    esc_dir = tmp_path / 'escalations'
+    esc_dir.mkdir(parents=True, exist_ok=True)
+
+    _write_metrics(root, 'eval-a', _VERDICT_RUN, [
+        # current_value 0.5 vs the verdict entry's value 0.4 — deliberately
+        # different, so the two sources cannot be confused for one another.
+        _metric('canonical-in-top-5', 'proportion', 0.5, denominator=30, direction='lower_is_worse'),
+        _metric('dangling-pointers', 'count', 4.0, direction='higher_is_worse'),
+        _metric('topic-canonical-present', 'tripwire', 2.0, n=8),
+        _metric('search-latency-p50-ms', 'scalar', 44.0),
+        _metric('unjudged-metric', 'scalar', 1.0),
+    ])
+    _write_limits(root, 'eval-a', run_stamp=_VERDICT_RUN)
+
+    resolved = _good_verdict_entries() if entries is None else entries
+    if write_verdicts:
+        _write_verdicts(root, resolved, run_stamp=_VERDICT_RUN)
+    if per_eval_copy:
+        _write_verdicts(root, resolved, run_stamp=_VERDICT_RUN, eval_id='eval-a')
+    return root, esc_dir
+
+
+class TestVerdicts:
+    """``verdicts-current.json`` at the ROOT is the sole verdict source.
+
+    Root-scoped, not per-eval: the PRD pins
+    ``fused-memory/data/memory-evals/verdicts-<STAMP>.json`` and the
+    ``storm_escape`` block is per-RUN across the whole program, which only
+    makes sense above the eval dirs.
+    """
+
+    def test_all_four_verdict_values_survive_verbatim(self, tmp_path: Path) -> None:
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _verdicts_tree(tmp_path)
+
+        rows = build_memory_evals(root, esc_dir)['evals'][0]['metrics']
+
+        assert _only(rows, 'canonical-in-top-5')['verdict'] == 'alarm'
+        assert _only(rows, 'dangling-pointers')['verdict'] == 'no_alarm'
+        assert _only(rows, 'search-latency-p50-ms')['verdict'] == 'insufficient_data'
+        assert _only(rows, 'topic-canonical-present')['verdict'] == 'grandfathered'
+        # Nothing was translated on the way through.
+        assert {row['verdict'] for row in rows if row['verdict']} == set(_VERDICT_VALUES)
+
+    def test_verdict_fields_land_on_the_matching_row(self, tmp_path: Path) -> None:
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _verdicts_tree(tmp_path)
+
+        rows = build_memory_evals(root, esc_dir)['evals'][0]['metrics']
+
+        alarmed = _only(rows, 'canonical-in-top-5')
+        assert alarmed['fingerprint'] == 'fp-canonical-alarm'
+        assert alarmed['limit_ref'] == 'alpha=0.002777777777777778'
+        assert alarmed['run_stamp'] == _VERDICT_RUN
+        # Two distinct sources, two distinct fields: `value` is what the
+        # evaluator judged, `current_value` is what the metrics artifact says.
+        assert alarmed['value'] == 0.4
+        assert alarmed['current_value'] == 0.5
+
+        grandfathered = _only(rows, 'topic-canonical-present')
+        assert grandfathered['item'] == 't-recon-watcher-triage'
+        # An entry with no `item` leaves the field empty rather than borrowing
+        # the previous entry's.
+        assert alarmed['item'] is None
+
+    def test_metric_with_no_entry_has_no_verdict(self, tmp_path: Path) -> None:
+        """Absent means absent — never defaulted to ``no_alarm``."""
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _verdicts_tree(tmp_path)
+
+        unjudged = _only(build_memory_evals(root, esc_dir)['evals'][0]['metrics'], 'unjudged-metric')
+
+        assert unjudged['verdict'] is None
+        assert unjudged['fingerprint'] is None
+        assert unjudged['limit_ref'] is None
+        assert unjudged['value'] is None
+
+    def test_orphan_verdict_is_named_not_dropped(self, tmp_path: Path) -> None:
+        """A verdict pointing at nothing is a contract drift, not a no-op."""
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _verdicts_tree(tmp_path, entries=[
+            _verdict('eval-a', 'no-such-metric', 'alarm', fingerprint='fp-orphan-metric'),
+            _verdict('no-such-eval', 'canonical-in-top-5', 'alarm', fingerprint='fp-orphan-eval'),
+        ])
+
+        payload = build_memory_evals(root, esc_dir)
+
+        assert payload['issue_count'] == len(payload['issues']) == 2
+        assert {issue['kind'] for issue in payload['issues']} == {'orphan_verdict'}
+        assert {issue['eval_id'] for issue in payload['issues']} == {'eval-a', 'no-such-eval'}
+        detail = ' '.join(issue['detail'] for issue in payload['issues'])
+        assert 'no-such-metric' in detail
+        assert 'canonical-in-top-5' in detail
+        for issue in payload['issues']:
+            assert issue['path'] == str(root / 'verdicts-current.json')
+
+    def test_missing_root_verdicts_is_named(self, tmp_path: Path) -> None:
+        """Trends with a blank verdict column would otherwise look healthy."""
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _verdicts_tree(tmp_path, write_verdicts=False)
+
+        payload = build_memory_evals(root, esc_dir)
+
+        assert payload['issue_count'] == len(payload['issues']) == 1
+        issue = payload['issues'][0]
+        assert issue['kind'] == 'missing_verdicts'
+        assert issue['path'] == str(root / 'verdicts-current.json')
+        assert all(row['verdict'] is None for row in payload['evals'][0]['metrics'])
+
+    def test_misplaced_per_eval_verdicts_is_named_never_used(self, tmp_path: Path) -> None:
+        """No silent fallback to the wrong location — drift stays visible."""
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _verdicts_tree(tmp_path, write_verdicts=False, per_eval_copy=True)
+
+        payload = build_memory_evals(root, esc_dir)
+
+        assert payload['issue_count'] == len(payload['issues']) == 1
+        issue = payload['issues'][0]
+        assert issue['kind'] == 'missing_verdicts'
+        assert str(root / 'eval-a' / 'verdicts-current.json') in issue['detail']
+        # Named, not read.
+        assert all(row['verdict'] is None for row in payload['evals'][0]['metrics'])
