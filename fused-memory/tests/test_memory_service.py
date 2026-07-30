@@ -9468,3 +9468,208 @@ class TestGetMemoryById:
 
         with pytest.raises(TimeoutError):
             await service.get_memory_by_id(project_id='dark_factory', memory_id='u')
+
+
+class TestKnownProjectsWiredAtServerStartup:
+    """The registry snapshot must actually REACH the service at startup (task 3088).
+
+    `set_known_projects` has a construction contract test above, and the
+    escalator has its own resolution tests. Neither can see the one thing that
+    matters operationally: whether `server/main.py` calls the setter at all, and
+    whether it does so UNCONDITIONALLY. If the call is dropped or drifts inside
+    the `if config.reconciliation ... enabled:` block, the storm escalator
+    silently resolves no project_root and files nothing — an INV-4 escape
+    vanishing in exactly the degraded configuration where an unattended rewrite
+    loop is least likely to be noticed any other way. No behavioural test can
+    reach that placement property; `run_server` is a ~600-line async startup
+    path with real I/O.
+
+    So this reads main.py's AST rather than its text. `tests/test_recon_ledger.py`
+    records why this repo removed grep-source meta-tests (commit da8e5a4c96:
+    they break on benign refactors with no real regression) and leaves an
+    equivalent one-line wiring to code review. This one differs in what it
+    asserts: not "a line exists" but an ORDERING relative to a named conditional
+    — the property that carries the risk. It is deliberately blind to
+    formatting, comments, local names and argument spelling; it breaks only if
+    the setter is renamed (a real contract change) or the call moves under the
+    reconciliation gate (the regression itself).
+    """
+
+    @staticmethod
+    def _run_server_node():
+        import ast
+        import pathlib
+
+        source_path = (
+            pathlib.Path(memory_service.__file__).parents[1] / 'server' / 'main.py'
+        )
+        tree = ast.parse(source_path.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef) and node.name == 'run_server':
+                return node
+        raise AssertionError('server/main.py no longer defines run_server')
+
+    def _setter_call_lines(self, node):
+        import ast
+
+        return [
+            call.lineno
+            for call in ast.walk(node)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == 'set_known_projects'
+        ]
+
+    def test_startup_wires_the_known_projects_map(self):
+        node = self._run_server_node()
+        assert self._setter_call_lines(node), (
+            'server/main.py::run_server never calls set_known_projects — the '
+            'update_memory storm escalator would resolve no project_root and '
+            'file nothing, with no other symptom'
+        )
+
+    def test_wiring_is_unconditional(self):
+        """The call must not sit inside the reconciliation-enabled block."""
+        import ast
+
+        node = self._run_server_node()
+        setter_lines = self._setter_call_lines(node)
+        assert setter_lines, 'no set_known_projects call to place'
+
+        recon_gate_lines = [
+            stmt.lineno
+            for stmt in ast.walk(node)
+            if isinstance(stmt, ast.If)
+            and 'config.reconciliation' in ast.unparse(stmt.test)
+            and 'enabled' in ast.unparse(stmt.test)
+        ]
+        assert recon_gate_lines, (
+            'the `if config.reconciliation ... enabled:` block this test anchors '
+            'to is gone; re-derive the placement assertion against whatever '
+            'replaced it rather than deleting this test'
+        )
+
+        assert min(setter_lines) < min(recon_gate_lines), (
+            f'set_known_projects is called at line {min(setter_lines)}, at or '
+            f'after the reconciliation-enabled gate at line {min(recon_gate_lines)}. '
+            'The map is built unconditionally and must be injected '
+            'unconditionally: the alarm has to survive reconciliation being off.'
+        )
+
+
+class _FakePointStore:
+    """A minimal in-memory stand-in for the Qdrant point behind Mem0Backend.
+
+    Real enough for the acceptance signal: payload merge/delete/overwrite with a
+    STABLE point id, plus the deterministic metadata scroll. Deliberately not an
+    AsyncMock — the whole claim under test is that a write on one side becomes
+    visible to a read on the other, which only a fake carrying real state can
+    demonstrate.
+    """
+
+    def __init__(self, memory_id: str, payload: dict):
+        self.memory_id = memory_id
+        self.payload = dict(payload)
+        self.update = AsyncMock(return_value={'message': 'Memory updated successfully!'})
+
+    async def get_point_by_id(self, memory_id, scope):
+        return dict(self.payload) if memory_id == self.memory_id else None
+
+    async def set_payload(self, memory_id, payload, scope):
+        assert memory_id == self.memory_id
+        self.payload.update(payload)
+
+    async def delete_payload(self, memory_id, keys, scope):
+        assert memory_id == self.memory_id
+        for key in keys:
+            self.payload.pop(key, None)
+
+    async def overwrite_payload(self, memory_id, payload, scope):
+        assert memory_id == self.memory_id
+        self.payload = dict(payload)
+
+    async def scroll_by_metadata(self, scope, filters, limit=1000):
+        if all(self.payload.get(k) == v for k, v in filters.items()):
+            return [{
+                'id': self.memory_id,
+                'created_at': self.payload.get('created_at'),
+                'metadata': dict(self.payload),
+            }]
+        return []
+
+
+class TestInPlaceTagAcceptanceSignal:
+    """The signal the whole task exists to produce (task 3088 acceptance).
+
+    Closes the loop from the write side added here to the deterministic read
+    side that already shipped (`get_memories_by_metadata` → Qdrant scroll,
+    `count_memories_by_metadata` → Qdrant count). That read side is what
+    replaces the semantic-search gamble whose top-N cutoff produced four
+    successive false closure claims on the reify docs-prd-landing cluster: a
+    scroll by payload equality either finds the record or does not.
+    """
+
+    CLUSTER = 'reify-docs-prd-landing'
+    MEMORY_ID = '9f2c1d40-0000-0000-0000-0000000000ac'
+
+    @pytest.fixture
+    def tagged_service(self, service):
+        """A real MemoryService whose mem0 backend is a stateful fake, holding
+        one UNTAGGED record (no `topic` key)."""
+        store = _FakePointStore(self.MEMORY_ID, {
+            'data': 'the original observation text',
+            'hash': 'h-abc',
+            'created_at': '2026-01-01T00:00:00+00:00',
+            'updated_at': '2026-01-02T00:00:00+00:00',
+            'user_id': 'dark_factory',
+            'kind': 'observation',
+            'src_project': 'dark_factory',
+        })
+        service.mem0 = store
+        return service
+
+    @pytest.mark.asyncio
+    async def test_one_tag_call_makes_the_record_deterministically_findable(
+        self, tagged_service,
+    ):
+        store = tagged_service.mem0
+
+        # Not findable before — the premise, so a passing assertion below cannot
+        # be an artefact of a fake that matches everything.
+        assert await tagged_service.get_memories_by_metadata(
+            project_id='dark_factory', filters={'topic': self.CLUSTER},
+        ) == []
+
+        result = await tagged_service.update_memory(
+            memory_id=self.MEMORY_ID,
+            project_id='dark_factory',
+            metadata_patch={'topic': self.CLUSTER},
+            agent_id='recon-stage-memory_consolidator',
+        )
+        assert result.get('error_type') is None, result
+        assert result['status'] == 'updated'
+
+        found = await tagged_service.get_memories_by_metadata(
+            project_id='dark_factory', filters={'topic': self.CLUSTER},
+        )
+        assert [row['id'] for row in found] == [self.MEMORY_ID], (
+            'the tagged record must be reachable by a deterministic metadata '
+            'scroll — the read path that replaces the top-N semantic gamble'
+        )
+
+        # Identity, content and siblings all intact: the point was amended in
+        # place, not deleted and re-added under a new id.
+        read_back = await tagged_service.get_memory_by_id(
+            project_id='dark_factory', memory_id=self.MEMORY_ID,
+        )
+        assert read_back is not None
+        assert read_back['id'] == self.MEMORY_ID
+        assert read_back['content'] == 'the original observation text'
+        assert read_back['metadata']['kind'] == 'observation'
+        assert read_back['metadata']['src_project'] == 'dark_factory'
+        assert read_back['metadata']['created_at'] == '2026-01-01T00:00:00+00:00'
+        assert read_back['metadata']['topic'] == self.CLUSTER
+
+        # A metadata-only tag must not re-embed: mem0's Memory.update is the
+        # expensive, history-appending path this arm exists to route around.
+        store.update.assert_not_called()
