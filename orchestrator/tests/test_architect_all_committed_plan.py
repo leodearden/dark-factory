@@ -642,3 +642,188 @@ class TestPlanThreadsCommittedWorkIntoBriefing:
         assert wf._invoke.await_count >= 1, (  # type: ignore[attr-defined]
             'A detector failure must not prevent the architect invocation'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-9 RED: boundary tests A1-1 / A1-2 on the EXECUTE no-op
+# ---------------------------------------------------------------------------
+#
+# Driving pattern from test_harness_wip_step_detection.py:576-623 — stub
+# _invoke with a side effect, _check_escalations → [], _get_head_commit → a sha.
+# Fixtures are produced by CALLING artifacts.mark_step_committed (α's landed
+# method) rather than hand-writing status='done' dicts, so they carry the
+# production shape (full sha in `commit`, `[COMMITTED <sha[:12]>]` description
+# tag) and break loudly if α's contract ever drifts.
+
+_PLAN_STEPS = [
+    {'id': 'step-1', 'type': 'test', 'description': 'RED — x',
+     'status': 'pending', 'commit': None},
+    {'id': 'step-2', 'type': 'impl', 'description': 'GREEN — x',
+     'status': 'pending', 'commit': None},
+]
+
+
+def _write_plan(artifacts: TaskArtifacts, workflow: TaskWorkflow) -> None:
+    artifacts.write_plan({
+        'task_id': '42',
+        'title': 'X',
+        'analysis': 'A',
+        'prerequisites': [
+            {'id': 'pre-1', 'description': 'setup', 'status': 'pending',
+             'commit': None},
+        ],
+        'steps': [dict(s) for s in _PLAN_STEPS],
+    })
+    artifacts.stamp_plan_provenance(workflow.session_id)
+    workflow.plan = artifacts.read_plan()
+
+
+def _stub_execute_collaborators(workflow: TaskWorkflow) -> AsyncMock:
+    workflow.briefing.build_implementer_prompt = AsyncMock(return_value='impl')
+    workflow._check_escalations = MagicMock(return_value=[])  # type: ignore[method-assign]
+    workflow._get_head_commit = AsyncMock(return_value='head-sha')  # type: ignore[method-assign]
+    invoke = AsyncMock()
+    workflow._invoke = invoke  # type: ignore[method-assign]
+    return invoke
+
+
+@pytest.mark.asyncio
+class TestA1AllCommittedPlanSkipsExecute:
+    """A1-1: an all-committed plan runs ZERO execute iterations."""
+
+    async def _setup(self, config, git_ops, task_assignment):
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        artifacts.update_base_commit(wt_info.base_commit)
+        _write_plan(artifacts, workflow)
+
+        # Two real branch commits, then pre-satisfy EVERY plan item against them.
+        (wt / 'red.py').write_text('def test_x(): assert True\n')
+        red_sha = await git_ops.commit(wt, 'test: RED — x')
+        (wt / 'impl.py').write_text('x = 1\n')
+        green_sha = await git_ops.commit(wt, 'feat: GREEN — x')
+        assert red_sha and green_sha, 'Setup: expected two real commits'
+
+        assert artifacts.mark_step_committed('pre-1', red_sha) is True
+        assert artifacts.mark_step_committed('step-1', red_sha) is True
+        assert artifacts.mark_step_committed('step-2', green_sha) is True
+        assert artifacts.get_pending_steps() == [], 'Setup: nothing may remain pending'
+        workflow.plan = artifacts.read_plan()
+
+        invoke = _stub_execute_collaborators(workflow)
+        return workflow, artifacts, invoke
+
+    async def test_zero_iterations_and_no_implementer_turn(
+        self, config, git_ops, task_assignment,
+    ):
+        workflow, _artifacts, invoke = await self._setup(
+            config, git_ops, task_assignment,
+        )
+
+        outcome = await workflow._execute_iterations()
+
+        assert outcome == WorkflowOutcome.DONE
+        assert workflow.metrics.execute_iterations == 0, (
+            'An all-committed plan must run ZERO execute iterations, got '
+            f'{workflow.metrics.execute_iterations}'
+        )
+        assert invoke.await_count == 0, 'No implementer LLM turn may happen'
+        assert workflow.briefing.build_implementer_prompt.await_count == 0
+
+    async def test_emits_phase_skipped_execute_event(
+        self, config, git_ops, task_assignment,
+    ):
+        """The zero-iteration skip must be POSITIVELY observable.
+
+        Without this event "0 iterations" is a pure absence, indistinguishable
+        from a lost event log — see the structured-facts-at-failure invariant.
+        """
+        workflow, artifacts, _invoke = await self._setup(
+            config, git_ops, task_assignment,
+        )
+
+        await workflow._execute_iterations()
+
+        skips = workflow.event_store.of_type(  # type: ignore[attr-defined]
+            EventType.phase_skipped, phase='execute',
+        )
+        assert len(skips) == 1, (
+            f'Expected exactly one phase_skipped(phase="execute") event, got {skips}'
+        )
+        event = skips[0]
+        assert event['task_id'] == workflow.task_id
+        data = event['data']
+        assert data['reason'] == 'no_pending_steps'
+        assert data['execute_iterations'] == 0
+        plan = artifacts.read_plan()
+        total = len(plan['steps']) + len(plan['prerequisites'])
+        assert data['step_count'] == total, (
+            f"Expected step_count={total}, got {data['step_count']}"
+        )
+        assert set(data['done_step_ids']) == {'pre-1', 'step-1', 'step-2'}, (
+            f"Expected every pre-satisfied id, got {data['done_step_ids']}"
+        )
+
+
+@pytest.mark.asyncio
+class TestA1PartiallyCommittedPlanStillRunsExecute:
+    """A1-2: a partially-committed plan still runs the loop for what's left."""
+
+    async def test_partial_plan_runs_loop_for_pending_step_only(
+        self, config, git_ops, task_assignment,
+    ):
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        artifacts.update_base_commit(wt_info.base_commit)
+        artifacts.write_plan({
+            'task_id': '42',
+            'title': 'X',
+            'analysis': 'A',
+            'prerequisites': [],
+            'steps': [dict(s) for s in _PLAN_STEPS],
+        })
+        artifacts.stamp_plan_provenance(workflow.session_id)
+
+        (wt / 'red.py').write_text('def test_x(): assert True\n')
+        red_sha = await git_ops.commit(wt, 'test: RED — x')
+        assert red_sha
+        assert artifacts.mark_step_committed('step-1', red_sha) is True
+        workflow.plan = artifacts.read_plan()
+
+        pending_ids = [s['id'] for s in artifacts.get_pending_steps()]
+        assert pending_ids == ['step-2'], f'Setup: expected only step-2, got {pending_ids}'
+
+        invoke = _stub_execute_collaborators(workflow)
+
+        def _mark_pending_done(*_args, **_kwargs):
+            from shared.cli_invoke import AgentResult  # noqa: PLC0415
+
+            artifacts.update_step_status('step-2', 'done', 'impl-commit-sha')
+            return AgentResult(success=True, output='')
+
+        invoke.side_effect = _mark_pending_done
+
+        outcome = await workflow._execute_iterations()
+
+        assert outcome == WorkflowOutcome.DONE
+        assert workflow.metrics.execute_iterations == 1, (
+            'A partially-committed plan must still run the loop for the '
+            f'remaining pending step, got {workflow.metrics.execute_iterations}'
+        )
+        assert workflow.event_store.of_type(  # type: ignore[attr-defined]
+            EventType.phase_skipped, phase='execute',
+        ) == [], 'No execute-skip event may be emitted when work remained'
+
+        # The pre-satisfied step is neither re-derived nor re-implemented.
+        handed_plan = workflow.briefing.build_implementer_prompt.call_args.args[0]
+        step_1 = next(
+            s for s in handed_plan['steps'] if s['id'] == 'step-1'
+        )
+        assert step_1['status'] == 'done'
+        assert step_1['commit'] == red_sha
+        assert step_1['description'].startswith(f'[COMMITTED {red_sha[:12]}]'), (
+            f"Expected the [COMMITTED …] provenance tag intact, got "
+            f"{step_1['description']!r}"
+        )
