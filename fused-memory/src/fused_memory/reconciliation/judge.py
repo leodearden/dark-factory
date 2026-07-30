@@ -5,7 +5,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 from shared.cli_invoke import (
     AgentFailureKind,
@@ -97,14 +97,27 @@ for a halt that no longer exists.
 
 
 class JudgeInfraError(Exception):
-    """Judge CLI transport/infra failure signal (task 2947 ask a).
+    """Judge invocation produced NO usable verdict (task 2947 ask a).
 
-    Raised by ``_call_judge_cli`` when the judge invocation fails for a
-    transport/infra reason — api_error, timeout, model-not-found, max-turns,
-    ended-awaiting-background, cap-wait exhaustion, or an otherwise-unknown
-    non-success — as opposed to a genuinely-malformed *reachable* judge
-    response (which stays fail-closed serious via ``_parse_verdict``) or a
-    benign exit-0/empty-stdout run (which stays the benign ``''`` contract).
+    Two distinct situations, one taxonomy — in both, nothing was reviewed, so
+    there is no verdict to act on:
+
+    1. **The CLI failed** (task 2947): api_error, timeout, model-not-found,
+       max-turns, ended-awaiting-background, cap-wait exhaustion, or an
+       otherwise-unknown non-success.
+    2. **The CLI SUCCEEDED but carried no verdict** (the 2947 residual this task
+       closes): exit 0, ``is_error=false``, non-zero output tokens, yet
+       ``structured_output`` was missing, empty, wrong-typed, unparseable, or
+       semantically invalid.  This is the 2026-07-25 cap-resume shape — the
+       resume dropped ``--system-prompt-file`` (cli_invoke.py:1501-1503) and the
+       model answered with conversational prose.  Codes:
+       ``cli_output_empty`` (missing/empty payload) and
+       ``cli_output_unparseable`` (wrong-typed, unparseable, or invalid payload).
+
+    Distinct from a genuinely-malformed *reachable* judge response on the
+    ``anthropic``/``openai`` text path (which stays fail-closed serious via
+    ``_parse_verdict``) and from a benign exit-0/empty-stdout run (which stays
+    the benign ``''`` contract).
 
     The distinction matters because an infra failure carries NO verdict: prior
     to this taxonomy a cap-storm CLI failure was fabricated into a phantom
@@ -112,8 +125,13 @@ class JudgeInfraError(Exception):
     about a review that never happened. ``review_run`` catches this exception,
     applies bounded backoff, and only halts (truthfully, "judge-unreachable")
     after ``judge_infra_max_consecutive_failures`` consecutive occurrences.
-    Carries a human-readable message (the ``build_failure_message`` dump).
+    Carries a human-readable message (e.g. the ``build_failure_message`` dump)
+    and, for case 2, a machine-readable ``code``.
     """
+
+    def __init__(self, message: str, *, code: str | None = None):
+        super().__init__(message)
+        self.code = code
 
 
 class Judge:
@@ -311,6 +329,13 @@ class Judge:
                     'consecutive_failures': count,
                     'threshold': threshold,
                     'error': str(err),
+                    # None for a CLI transport failure; 'cli_output_empty' /
+                    # 'cli_output_unparseable' for a success that carried no
+                    # usable verdict. Lets a cap-storm-with-no-content occurrence
+                    # be told apart from a CLI failure in the logs — the
+                    # distinction that took a hand-dug transcript to establish on
+                    # 2026-07-25.
+                    'code': getattr(err, 'code', None),
                 },
             )
             return None
@@ -506,7 +531,43 @@ Review this run and provide your verdict as JSON.
             if isinstance(structured, str):
                 # The CLI sometimes delivers the payload as a JSON string
                 # (agent_loop.py:388-392 handles the same shape).
-                structured = json.loads(structured)
+                try:
+                    structured = json.loads(structured)
+                except json.JSONDecodeError as e:
+                    self._raise_unusable_output(
+                        result, 'cli_output_unparseable',
+                        f'structured_output was an unparseable JSON string: {e}',
+                    )
+
+            # A success carrying no usable verdict is INFRA, not content: nothing
+            # was reviewed, so there is nothing to be fail-closed ABOUT.  Never
+            # guess a severity here — a fabricated verdict is what halts a project
+            # (cf. path_scope_adjudicator.py:415-441, same "not a dict → fail
+            # loudly, don't normalise silently" stance, different destination).
+            if not structured:
+                self._raise_unusable_output(
+                    result, 'cli_output_empty',
+                    'structured_output was empty/missing',
+                )
+            if not isinstance(structured, dict):
+                self._raise_unusable_output(
+                    result, 'cli_output_unparseable',
+                    f'structured_output was {type(structured).__name__}, not a dict',
+                )
+            severity = structured.get('severity')
+            if severity not in {s.value for s in VerdictSeverity}:
+                self._raise_unusable_output(
+                    result, 'cli_output_unparseable',
+                    f'structured_output severity {severity!r} is not a VerdictSeverity',
+                )
+            if not isinstance(structured.get('findings', []), list):
+                # JudgeVerdict construction would raise a pydantic
+                # ValidationError that review_run's broad except would swallow
+                # into a silent None — no verdict, no halt, no signal.
+                self._raise_unusable_output(
+                    result, 'cli_output_unparseable',
+                    'structured_output findings is not a list',
+                )
             return structured
 
         # Not successful: distinguish a genuine benign empty verdict from a
@@ -531,6 +592,37 @@ Review this run and provide your verdict as JSON.
             return ''
 
         raise JudgeInfraError(build_failure_message('Claude CLI judge', result))
+
+    def _raise_unusable_output(self, result, code: str, detail: str) -> NoReturn:
+        """Log the forensics for a no-verdict CLI success, then raise JudgeInfraError.
+
+        The structured warning is the record that made the 2026-07-25 RCA possible
+        (it took a hand-dug CLI transcript to establish that the halting run had
+        exited 0 with 727 output tokens and no payload).  ``schema_tool_denied``
+        is included deliberately: if a future CLI change starts blocking the
+        synthetic ``StructuredOutput`` tool that ``--json-schema`` rides on, that
+        deny-list regression becomes visible HERE instead of silently starving
+        every judge run of its verdict.  The message embeds the code and an output
+        prefix so ``_handle_infra_failure``'s ``str(err)`` stays diagnostic.
+        """
+        logger.warning(
+            'reconciliation.judge_cli_output_unusable',
+            extra={
+                'code': code,
+                'detail': detail,
+                'subtype': result.subtype,
+                'output_tokens': result.output_tokens,
+                'session_id': result.session_id,
+                'schema_salvaged': result.schema_salvaged,
+                'schema_tool_denied': result.schema_tool_denied,
+                'output_prefix': result.output[:200],
+            },
+        )
+        raise JudgeInfraError(
+            f'Claude CLI judge reported success but produced no usable verdict '
+            f'[{code}]: {detail}; output prefix: {result.output[:200]!r}',
+            code=code,
+        )
 
     def _verdict_from_payload(self, data: dict, run_id: str) -> JudgeVerdict:
         """Build a JudgeVerdict from an already-structured verdict payload.

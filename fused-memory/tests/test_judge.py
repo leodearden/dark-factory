@@ -1251,9 +1251,12 @@ async def test_call_judge_cli_forwards_cwd_to_invoke_claude_agent(mock_journal, 
         explore_codebase_root=explore_root,
     )
 
+    # A usable structured payload: a success carrying none is now classified as
+    # cli_output_empty infra, which would mask this test's kwargs assertion.
     fake_result = AgentResult(
         success=True,
-        output='{"severity": "ok"}',
+        output='',
+        structured_output={'severity': 'ok', 'findings': []},
         session_id='jsess-cwd',
     )
 
@@ -1358,8 +1361,12 @@ class TestJudgeCapWaitSanityBound:
         )
         mock_jrnl = MagicMock()
         judge = Judge(config=config, journal=mock_jrnl, usage_gate=make_gate_mock())
-        empty_result = AgentResult(success=True, output='')
-        mock = AsyncMock(return_value=empty_result)
+        # A usable structured payload: a success carrying none is now classified
+        # as cli_output_empty infra, which would mask this test's kwargs assertion.
+        ok_result = AgentResult(
+            success=True, output='', structured_output={'severity': 'ok', 'findings': []},
+        )
+        mock = AsyncMock(return_value=ok_result)
         with patch(
             'fused_memory.reconciliation.judge.invoke_with_cap_retry',
             new=mock,
