@@ -63,15 +63,12 @@ _XPY_FAILURE = VerifyResult(
     category='test_failure',
 )
 
-# Reify 5566's LIVE shell-guard failure shape, captured 2026-07-29 (task 3178).
-# reify's verify summary renders a tests/infra/*.sh guard trip as
-# ``FAILED <guard>.sh`` — there is no pytest node id anywhere in it. Pre-3178
-# the unconstrained ``^FAILED\s+(\S+)`` captured the guard's own FILENAME as a
-# "failing test id", which satisfied I7's non-empty-failing_tests requirement
-# vacuously and produced a fabricated INTEGRATION_SKEW whenever any main landing
-# happened to touch that file. Note the guard NAME is deliberately still a
-# candidate FILE (the file-token scan is untouched), so landings are still
-# cited — it is the I7 gate, not a starved extraction, that flips the verdict.
+# Reify 5566's LIVE shell-guard failure shape, captured 2026-07-29 (task 3178;
+# background in merge_disposition's module docstring, THE I7 INCIDENT). reify
+# renders a tests/infra/*.sh guard trip as ``FAILED <guard>.sh`` — no pytest
+# node id anywhere in it. Note the guard NAME is deliberately still a candidate
+# FILE (the file-token scan is untouched), so landings are still cited — it is
+# the I7 gate, not a starved extraction, that flips the verdict.
 _SHELL_GUARD_NAME = 'test_reify_audit_ptodo.sh'
 _SHELL_GUARD_FAILURE = VerifyResult(
     passed=False,
@@ -660,10 +657,9 @@ class TestAdjudicatedIndeterminateEmitsEvidenceRow:
     chain, over a topology where the guard file IS a genuine main landing and
     the I5 green fact IS positively satisfied.
 
-    Pre-3178 this exact shape produced a fabricated INTEGRATION_SKEW — the
-    unconstrained pytest regex captured the guard's own filename as a failing
-    test id, satisfying I7 vacuously (8 such dispositions between 07-24 and
-    07-28). Two halves are asserted here, and they are independent:
+    Pre-3178 this exact shape produced a fabricated INTEGRATION_SKEW (see
+    merge_disposition's module docstring, THE I7 INCIDENT). Two halves are
+    asserted here, and they are independent:
 
     * CORRECTNESS (already green after steps 2/4): the verdict degrades to the
       honest INDETERMINATE, ``failure_diagnostic`` is ``None``, and the blocked

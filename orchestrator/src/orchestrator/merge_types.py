@@ -949,20 +949,16 @@ class MergeOutcome:
     do not yet populate it (β routing/surfacing + γ runs.db event depend on
     this field, keying off α alone — no dependency inversion)."""
     skew_evidence: SkewEvidence | None = None
-    """The ``SkewEvidence`` bundle GATHERED by
-    ``classify_merge_failure_disposition``, carried so the step-18
+    """The bundle GATHERED by ``classify_merge_failure_disposition``
+    (``ClassificationResult.observed_evidence``), carried so the step-18
     ``merge_attempt`` emit can persist bounded evidence into runs.db (task 3178).
 
-    Non-None on BOTH the INTEGRATION_SKEW verdict and an I7/I5-DEGRADED
-    INDETERMINATE (classifier ran, cited landings, the gate refused to promote).
-    ``None`` when no landings were implicated, when classification was SKIPPED
-    (dispatch-time base facts absent), on the fail-open path, and for callers
-    that do not populate it.
-
-    A non-None value is NOT a skew verdict — read ``disposition`` for that. The
-    distinction is load-bearing: it is what lets the emit guard tell an
-    adjudicated INDETERMINATE (evidence exists; emit it) from a skipped or
-    fail-open one (nothing gathered; emit nothing, byte-identical to pre-3178)."""
+    A non-None value is NOT a skew verdict — read ``disposition`` for that; see
+    ``ClassificationResult`` for the full contract. The distinction is
+    load-bearing HERE because it is what the emit guard keys on: an adjudicated
+    INDETERMINATE (evidence exists) emits a row, a skipped or fail-open one
+    (nothing gathered) emits none. ``None`` for callers that do not populate
+    it."""
 
 
 @dataclass

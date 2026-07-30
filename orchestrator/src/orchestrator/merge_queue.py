@@ -957,13 +957,12 @@ async def _classify_disposition_for_outcome(
     so the caller's outcome is never left half-attached.
 
     The 4th element (task 3178) is the classifier's GATHERED bundle
-    (``observed_evidence``), not its adjudicated ``evidence``: it is the one the
-    step-18 ``merge_attempt`` emit needs, because that emit now persists evidence
-    on the ADJUDICATED-INDETERMINATE path too. ``_render_skew_surfaces`` keeps
-    receiving the ADJUDICATED bundle, so only INTEGRATION_SKEW ever renders the
-    "port the landed commit" directive — that contract is untouched. None when no
-    landings were implicated, when classification could not proceed, and on the
-    fail-open path (a fault gathered nothing and must not fabricate a bundle).
+    (``ClassificationResult.observed_evidence``), NOT its adjudicated
+    ``evidence``: it is the one the step-18 ``merge_attempt`` emit needs, because
+    that emit now persists evidence on the ADJUDICATED-INDETERMINATE path too.
+    ``_render_skew_surfaces`` keeps receiving the ADJUDICATED bundle, so only
+    INTEGRATION_SKEW ever renders the "port the landed commit" directive — that
+    contract is untouched.
     """
     try:
         result = await classify_merge_failure_disposition(
@@ -3351,7 +3350,8 @@ def _emit_merge_attempt(
     byte-identical.
 
     *skew_evidence* is the optional :class:`SkewEvidence` bundle GATHERED by
-    ``classify_merge_failure_disposition`` (task 3178). When supplied, its
+    ``classify_merge_failure_disposition`` (task 3178; motivation in
+    merge_disposition's module docstring, THE I7 INCIDENT). When supplied, its
     ``failing_tests`` / ``implicated_commits`` / ``overlap_files`` are written as
     json-serialisable lists, each BOUNDED at ``_MAX_EVENT_EVIDENCE_ITEMS`` with
     the true length recorded under ``<key>_total`` — a silent cap would let a
@@ -3359,15 +3359,10 @@ def _emit_merge_attempt(
     is made self-describing. When omitted or None (every pre-3178 call site), no
     key is added — existing callers' payloads stay byte-identical.
 
-    These keys appear on BOTH the ``integration_skew`` row and the ADJUDICATED
-    ``indeterminate`` row (classifier ran, cited landings, the I7/I5 gate refused
-    to promote). This helper is deliberately disposition-AGNOSTIC about evidence:
-    it writes whatever bundle it is handed, and deciding *when* to emit at all is
-    the caller's guard. That separation is what lets one code path serve both
-    rows. It closes the observability sub-gap where merge_attempt rows persisted
-    only ``{disposition, outcome}`` — which is why the false "shell guards parse
-    zero failing-test ids" premise underpinning tasks 2871 and 2918 survived two
-    task cycles unchecked: nobody could read the evidence back out of runs.db.
+    This helper is deliberately disposition-AGNOSTIC about evidence: it writes
+    whatever bundle it is handed, and deciding *when* to emit at all is the
+    caller's guard. That is what lets one code path serve both the
+    ``integration_skew`` row and the ADJUDICATED ``indeterminate`` row.
     """
     if event_store is not None:
         data: dict = {'outcome': outcome}
@@ -14942,50 +14937,32 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # already emitted 'main_health_red' when the outcome was built
                 # (see _classify_main_health_red, above).
                 #
-                # Amendment (task 3178): the round-2 amendment below used to
-                # state that widening this guard to INDETERMINATE would be a
-                # deliberate, separately-reviewed semantics change rather than a
-                # drive-by fix.  Task 3178 IS that separate review, and the
-                # widening landed HERE — keyed on GATHERED EVIDENCE
+                # Amendment (task 3178 — the separately-reviewed widening the
+                # round-2 note below deferred).  Keyed on GATHERED EVIDENCE
                 # (`skew_evidence is not None`), deliberately NOT by adding
-                # INDETERMINATE to the enum tuple.  That distinction is the crux:
-                # it splits two INDETERMINATEs the old blanket exclusion
-                # conflated.
+                # INDETERMINATE to the enum tuple, because that splits two
+                # INDETERMINATEs the old blanket exclusion conflated:
                 #
-                #   * ADJUDICATED — the classifier RAN, cited implicated main
-                #     landings, and the I7 shape floor (or I5's green fact)
-                #     refused to promote them to INTEGRATION_SKEW.  A bundle was
-                #     gathered, so a row IS now emitted carrying it.  This is the
-                #     class 3178 exists to measure: a census can read straight
-                #     out of runs.db that the gate bit, on which commits, and why
-                #     (zero node-shaped failing-test ids despite cited landings).
-                #   * SKIPPED / FAIL-OPEN — base facts were absent so
-                #     classification never ran, or the classifier raised (I3).
-                #     Nothing was gathered, `skew_evidence` is None, and NO row is
-                #     emitted — byte-identical to pre-3178.  That is exactly why
-                #     test_indeterminate_first_attempt_emits_no_disposition_key
-                #     (test_merge_skew_end_to_end.py) survives verbatim and I3's
-                #     fail-open guarantee is preserved.
+                #   * ADJUDICATED — the classifier RAN and cited implicated
+                #     landings, but I7/I5 refused to promote them.  A bundle
+                #     exists, so a row IS emitted carrying it.
+                #   * SKIPPED / FAIL-OPEN — base facts absent so classification
+                #     never ran, or the classifier raised (I3).  Nothing
+                #     gathered, so NO row — byte-identical to pre-3178, which is
+                #     why test_indeterminate_first_attempt_emits_no_disposition
+                #     _key survives verbatim and I3's guarantee holds.
                 #
-                # What 2384's digest.merge_disposition_counts can now do that it
-                # could not before: it gains a real DENOMINATOR for the
-                # adjudicated-INDETERMINATE bucket, alongside
-                # {integration_skew, branch_bug}.  It still has NO denominator
-                # for the skipped/fail-open bucket, so rates computed over these
-                # rows must not be read as covering ALL INDETERMINATE verify
-                # failures — only the adjudicated ones.  BRANCH_BUG implicates no
+                # (Why any of this exists: merge_disposition's module docstring,
+                # THE I7 INCIDENT.  Persisting the evidence is the half that
+                # makes the next false premise checkable.)
+                #
+                # Consumer caveat for 2384's digest.merge_disposition_counts: it
+                # gains a real DENOMINATOR for the adjudicated-INDETERMINATE
+                # bucket, but still has NONE for the skipped/fail-open bucket, so
+                # rates over these rows must not be read as covering ALL
+                # INDETERMINATE verify failures.  BRANCH_BUG implicates no
                 # landings, so its skew_evidence is None and its row's payload
                 # stays byte-identical too.
-                #
-                # Observability rationale (task 3178): merge_attempt rows
-                # previously persisted only {disposition, outcome}.  Nobody could
-                # read the underlying evidence back out, which is why the false
-                # "shell guards parse zero failing-test ids" premise underpinning
-                # tasks 2871 and 2918 survived two task cycles unchecked — 8
-                # fabricated INTEGRATION_SKEW dispositions between 07-24 and
-                # 07-28 were invisible in runs.db.  The bounded
-                # failing_tests/implicated_commits/overlap_files lists (plus their
-                # <key>_total true counts) close that sub-gap.
                 #
                 # Amendment (reviewer_comprehensive, round 3): BRANCH_BUG is
                 # the COMMON case whenever the caller supplies dispatch-time

@@ -50,12 +50,43 @@ Invariants (see the task-2381 plan / merge-skew-attribution-prd.md):
        ``crate::mod::test`` for Rust (task 2871 introduced the non-empty
        requirement; task 3178 added the shape floor). A guard/ratchet failure
        whose only ``FAILED`` token is a bare filename parses zero node-shaped
-       ids and degrades to INDETERMINATE. Task 3178's correction: the original
-       2871 wording claimed guard output "matches neither
-       ``_PYTEST_FAILED_ID_RE`` nor ``_RUST_FAILED_ID_RE``", which was FALSE
-       in production — the unconstrained pytest regex matched ``FAILED
-       <guard>.sh`` and returned the guard's filename, satisfying I7
-       vacuously. See ``_extract_failing_tests_and_candidate_files``.
+       ids and degrades to INDETERMINATE. See the I7 incident account below.
+
+THE I7 INCIDENT (task 3178) — this is the ONE authoritative account; every
+other site in the codebase that touches this behaviour points here rather than
+restating it, because six copies of an incident narrative is how the false
+premise below survived two task cycles in the first place.
+
+  What went wrong. ``_PYTEST_FAILED_ID_RE`` was an unconstrained
+  ``^FAILED\\s+(\\S+)``, and reify renders a shell-guard trip as ``FAILED
+  <guard>.sh``. The guard's own FILENAME was therefore returned as a
+  "failing-test id" and satisfied task 2871's non-empty I7 requirement
+  VACUOUSLY. The same hole parsed the English word "to" out of "FAILED to
+  release semaphore slot".
+
+  Blast radius. All 8 INTEGRATION_SKEW dispositions between 2026-07-24 and
+  2026-07-28 were shell/infra guards, not skews: reify 5316/5373/5302
+  (test_harness_kloc_cap.sh), 5300 x3 (test_verify_scope.sh), 5566 x2
+  (test_reify_audit_ptodo.sh), 5321
+  (test_deterministic_gate_closure_staleness_sweep.sh). Each told a debugger
+  to "port the landed commit — do not hunt your own diff" about a failure
+  that was not a skew. reify 5187 (a Rust-shaped id) was the ONE genuine skew
+  in that population and is provably unaffected: ``_RUST_FAILED_ID_RE`` has
+  always required ``::`` by construction, so the shape floor only mirrors an
+  invariant the sibling regex already had.
+
+  Why it survived. Task 2871's comment asserted guard output "matches neither
+  ``_PYTEST_FAILED_ID_RE`` nor ``_RUST_FAILED_ID_RE``" — FALSE in production.
+  Its test passed only because the fixture was invented (``HARNESS_KLOC_CAP
+  FAIL …``, which has no ``^FAILED <token>`` and so genuinely parses zero
+  ids), and ``merge_attempt`` rows persisted only ``{disposition, outcome}``,
+  so nobody could read the evidence back out of runs.db to check. Task 2918
+  then built on the same premise. The two fixes are therefore paired: the
+  shape floor in ``_extract_failing_tests_and_candidate_files``, and the
+  evidence now persisted on BOTH the promoted and the degraded path (the
+  ``observed_evidence`` slot of :class:`ClassificationResult`) so the next
+  false premise is checkable. Every regression fixture is now a VERBATIM
+  captured production string — see ``TestShellGuardFilenameIsNotATestId``.
 
 This module is intentionally self-contained (task 2381 α scope): it defines
 the classifier, its data types, and private helpers only. Wiring into the
@@ -193,25 +224,12 @@ def _extract_failing_tests_and_candidate_files(
     for m in _PYTEST_FAILED_ID_RE.finditer(combined):
         tid = m.group(1)
         if '::' not in tid:
-            # Node-id SHAPE floor (task 3178). ``_PYTEST_FAILED_ID_RE`` is an
-            # unconstrained ``^FAILED\s+(\S+)``, so a bare filename or an
-            # English word after "FAILED" was captured as a "test id".
-            # Evidence: reify's verify summary renders a shell-guard trip as
-            # ``FAILED <guard>.sh``, so the guard's own FILENAME satisfied
-            # I7's failing_tests non-empty requirement vacuously — all 8
-            # INTEGRATION_SKEW dispositions between 07-24 and 07-28 (reify
-            # 5316/5373/5302, 5300 x3, 5566 x2, 5321) were shell/infra guards,
-            # and the same hole parsed the word "to" out of "FAILED to release
-            # semaphore slot". ``_RUST_FAILED_ID_RE`` has always required
-            # ``::`` by construction, so this only mirrors an invariant the
-            # sibling regex already had (which is why reify 5187's genuine
-            # Rust-shaped skew is provably unaffected).
-            #
-            # ACCEPTED edge case: a pytest COLLECTION-level ``FAILED
-            # tests/test_foo.py`` (no ``::``) now parses zero ids and degrades
-            # to INDETERMINATE rather than skew. pytest emits ``ERROR <path>``
-            # for collection errors, so this shape is rare, and the degrade
-            # errs toward the honest fallback rather than a fabricated skew.
+            # Node-id SHAPE floor — see the module docstring's I7 incident
+            # account (task 3178). ACCEPTED edge case: a pytest COLLECTION-level
+            # ``FAILED tests/test_foo.py`` (no ``::``) now parses zero ids and
+            # degrades to INDETERMINATE rather than skew. pytest emits ``ERROR
+            # <path>`` for collection errors, so this shape is rare, and the
+            # degrade errs toward the honest fallback, not a fabricated skew.
             continue
         _add_test(tid)
     for m in _RUST_FAILED_ID_RE.finditer(combined):
@@ -522,11 +540,10 @@ async def classify_merge_failure_disposition(
            a distinct, additional input used only for the ancestor filter.
       I7 — INTEGRATION_SKEW additionally requires at least one failing-test id
            carrying a real test-node SHAPE (``path::test_name`` for pytest,
-           ``crate::mod::test`` for Rust): task 2871 required
-           ``evidence.failing_tests`` non-empty, task 3178 added the shape
-           floor after finding the requirement was being satisfied vacuously.
-           A guard/ratchet failure whose only ``FAILED`` token is a bare
-           filename parses zero node-shaped ids and degrades to INDETERMINATE.
+           ``crate::mod::test`` for Rust). A guard/ratchet failure whose only
+           ``FAILED`` token is a bare filename parses zero node-shaped ids and
+           degrades to INDETERMINATE. See the module docstring's I7 incident
+           account for why (task 2871 non-empty floor, task 3178 shape floor).
 
     Args:
         verify_result: the failing VerifyResult from the branch's merge-time verify.
@@ -621,40 +638,26 @@ async def classify_merge_failure_disposition(
         # INDETERMINATE — never a fabricated skew.
         #
         # I7 (task 2871, reify esc-5053-13 & esc-5056-11; SHAPE FLOOR added by
-        # task 3178): additionally require at least one failing-test id
-        # carrying a real test-node shape (path::test_name for pytest,
-        # crate::mod::test for Rust). A harness-ratchet / shell-guard failure
+        # task 3178 — see the module docstring's I7 incident account): require
+        # at least one NODE-SHAPED failing-test id. The floor itself lives in
+        # _extract_failing_tests_and_candidate_files, so by the time control
+        # reaches here `failing_tests` holds only node-shaped ids.
+        #
+        # Load-bearing local choice: an empty failing_tests degrades to
+        # INDETERMINATE, NOT BRANCH_BUG. A harness-ratchet / shell-guard failure
         # (kLOC cap, baseline-manifest grandfathering, other tests/infra/*.sh
         # guards) has as its only "evidence" a spurious file-token overlap on
         # the runner (run_all.sh / verify.sh) or the guard's own artifact —
         # causally irrelevant even when the implicated landing is a genuine
-        # real-main ancestor (2869's I6 filter therefore cannot prune it). An
-        # empty failing_tests here degrades to the honest INDETERMINATE (never
-        # a fabricated skew steering the debugger off its own diff); NOT
-        # BRANCH_BUG, because the class's true cause is heterogeneous across
-        # the census (own-diff for 5053/5056 vs main-red for 5288/5266) and
-        # BRANCH_BUG would both mislabel the main-red instances and emit a
-        # misleading merge_attempt disposition row.
+        # real-main ancestor (2869's I6 filter therefore cannot prune it). The
+        # class's true cause is heterogeneous across the census (own-diff for
+        # 5053/5056 vs main-red for 5288/5266), so BRANCH_BUG would both
+        # mislabel the main-red instances and emit a misleading merge_attempt
+        # disposition row. INDETERMINATE is the honest fallback.
         #
-        # Task 3178's correction to 2871's premise: this comment previously
-        # asserted that guard text "matches neither _PYTEST_FAILED_ID_RE nor
-        # _RUST_FAILED_ID_RE". That was FALSE in production. The pytest regex
-        # was an unconstrained ^FAILED\s+(\S+), and reify renders a guard trip
-        # as `FAILED <guard>.sh` — so the guard's own filename WAS returned as
-        # a failing-test id and satisfied this gate vacuously, yielding 8 false
-        # INTEGRATION_SKEW dispositions between 07-24 and 07-28. The sibling
-        # test TestClassifyHarnessRatchetNotSkew passed pre-3178 only because
-        # its fixture was synthetic (`HARNESS_KLOC_CAP FAIL …`, which has no
-        # `^FAILED <token>` and so genuinely parsed zero ids); the live strings
-        # are now pinned alongside it in
-        # TestShellGuardFilenameIsNotATestId. The shape floor lives in
-        # _extract_failing_tests_and_candidate_files, so by the time control
-        # reaches here `failing_tests` contains only node-shaped ids.
         # The bundle GATHERED — built exactly once, returned as
-        # observed_evidence on BOTH the promoted and the degraded path (task
-        # 3178). On promotion it doubles as the adjudicated `evidence`; on a
-        # degrade it is what the gate refused to promote, and persisting it is
-        # what makes the degrade measurable.
+        # observed_evidence on BOTH the promoted and the degraded path (see
+        # ClassificationResult).
         observed = SkewEvidence(
             implicated_commits=implicated_commits,
             failing_tests=failing_tests,
@@ -669,9 +672,9 @@ async def classify_merge_failure_disposition(
         # Loud degrade (task 3178). This complements — does not replace — the
         # merge_attempt row the caller now emits: the row is the machine-readable
         # census surface, this is the greppable operator surface. Both honour the
-        # repo's loud-over-silent / structured-facts-at-failure invariant. The
-        # old silent `return (INDETERMINATE, None)` is exactly why the false I7
-        # premise survived two task cycles unchecked.
+        # repo's loud-over-silent / structured-facts-at-failure invariant, and
+        # the silent return this replaced is half of why the false I7 premise
+        # went unchecked (module docstring, THE I7 INCIDENT).
         reasons: list[str] = []
         if not failing_tests:
             reasons.append('no node-shaped failing-test id')

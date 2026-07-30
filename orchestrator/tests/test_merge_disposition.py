@@ -359,13 +359,11 @@ def _guard_failure(cause_hint: str) -> VerifyResult:
     )
 
 
-# Verbatim ``cause_hint`` strings captured live from reify on 2026-07-29 —
-# every one of the 8 INTEGRATION_SKEW dispositions between 07-24 and 07-28
-# was a shell/infra guard emitting one of these shapes. Deliberately NOT
-# invented fixtures: task 2871's I7 shipped green against a synthetic
-# ``HARNESS_KLOC_CAP FAIL …`` string (no ``^FAILED <token>``, so it genuinely
-# parsed zero ids) while production emits ``FAILED test_harness_kloc_cap.sh``,
-# which parses one. That gap is why the false premise survived two cycles.
+# Verbatim ``cause_hint`` strings captured live from reify on 2026-07-29, one
+# per shape in the 8-disposition census (merge_disposition module docstring,
+# THE I7 INCIDENT). Deliberately NOT invented fixtures — task 2871's I7 shipped
+# green against a synthetic string that genuinely parsed zero ids while
+# production emitted one that parsed one, and that gap is the whole bug.
 _LIVE_SHELL_GUARD_CAUSE_HINTS = [
     ('FAILED test_reify_audit_ptodo.sh', 'test_reify_audit_ptodo.sh', '5566'),
     ('FAILED test_verify_scope.sh', 'test_verify_scope.sh', '5300'),
@@ -379,13 +377,9 @@ _LIVE_SHELL_GUARD_CAUSE_HINTS = [
 
 
 class TestShellGuardFilenameIsNotATestId:
-    """``_PYTEST_FAILED_ID_RE`` is an unconstrained ``^FAILED\\s+(\\S+)``, so a
-    shell-guard trip rendered as ``FAILED <guard>.sh`` yields the guard's own
-    FILENAME as a "failing test id" — vacuously satisfying task 2871's I7
-    ``failing_tests`` non-empty requirement and producing a false
-    INTEGRATION_SKEW. Task 3178 adds a node-id SHAPE floor (``'::' in tid``),
-    mirroring the invariant ``_RUST_FAILED_ID_RE`` has always had by
-    construction.
+    """The extraction-level regression for task 3178's node-id SHAPE floor
+    (``'::' in tid``) — see merge_disposition's module docstring, THE I7
+    INCIDENT, for what these strings did before it.
 
     Each case additionally pins that the filename REMAINS in
     ``candidate_files``: the fix must empty ``failing_tests`` only, so
@@ -1258,17 +1252,14 @@ class TestClassifyHarnessRatchetNotSkew:
     genuine-landing -> advanced-real-main shape, only the VerifyResult's
     parseability differs).
 
-    Task 3178 correction: this docstring previously justified the zero ids by
-    claiming guard output "matches neither ``_PYTEST_FAILED_ID_RE`` nor
-    ``_RUST_FAILED_ID_RE``". That was false in production. These fixtures
-    (``HARNESS_KLOC_CAP FAIL …`` / ``HARNESS_LAYOUT_BASELINE FAIL: …``) are
-    SYNTHETIC and happen to carry no ``^FAILED <token>``, so they genuinely
-    parsed zero ids and this class passed — but reify emits ``FAILED
-    <guard>.sh``, which the unconstrained pytest regex DID match, returning the
-    guard's filename and satisfying I7 vacuously. These cases are kept as-is
-    (valid shapes that must keep degrading); the live strings are pinned
-    alongside them in ``TestShellGuardFilenameIsNotATestId`` (extraction) and
-    ``TestShellGuardNameWithGenuineLandingIsIndeterminate`` (end to end)."""
+    Task 3178 correction: these fixtures (``HARNESS_KLOC_CAP FAIL …`` /
+    ``HARNESS_LAYOUT_BASELINE FAIL: …``) are SYNTHETIC and carry no ``^FAILED
+    <token>``, so this class passed pre-3178 against a premise that was false in
+    production (merge_disposition module docstring, THE I7 INCIDENT). They are
+    kept as-is — valid shapes that must keep degrading — and the LIVE strings
+    are now pinned alongside them in ``TestShellGuardFilenameIsNotATestId``
+    (extraction) and ``TestShellGuardNameWithGenuineLandingIsIndeterminate``
+    (end to end)."""
 
     def test_kloc_cap_guard_with_genuine_landing_is_indeterminate_not_skew(
         self, tmp_path: Path,
@@ -1421,20 +1412,15 @@ class TestClassifyHarnessRatchetNotSkew:
 
 class TestShellGuardNameWithGenuineLandingIsIndeterminate:
     """The production reproduction of the false-skew bug, built from reify's
-    VERBATIM cause_hints. A shell guard whose own file is a GENUINE main
-    landing, with the branch positively green pre-merge (I5 satisfied), was
-    classified INTEGRATION_SKEW because the guard's filename parsed as a
-    "failing test id" (I7 satisfied vacuously). After task 3178's shape floor
-    it degrades to the honest INDETERMINATE.
+    VERBATIM cause_hints: a shell guard whose own file is a GENUINE main
+    landing, with the branch positively green pre-merge, so I7 is the ONLY thing
+    standing between this and a fabricated skew. Post-3178 it degrades to the
+    honest INDETERMINATE.
 
-    Each degrade case also asserts the classifier's THIRD return element,
-    ``observed_evidence`` — the bundle GATHERED, non-None whenever implicated
-    landings were found regardless of verdict. That is the new observability
-    channel (step-10 persists it into runs.db) and it is deliberately distinct
-    from element 2 ``evidence``, which keeps its exact "non-None iff
-    INTEGRATION_SKEW" meaning. Overloading element 2 would destroy the
-    inference "a non-empty evidence field means this is a skew" — precisely the
-    inference class that produced this bug."""
+    Each degrade case also asserts ``ClassificationResult.observed_evidence`` —
+    the GATHERED bundle, non-None regardless of verdict — stays distinct from
+    the adjudicated ``evidence``, which keeps its "non-None iff
+    INTEGRATION_SKEW" meaning."""
 
     @staticmethod
     def _guard_landing_repo(repo: Path, guard_filename: str) -> tuple[str, str, str]:
