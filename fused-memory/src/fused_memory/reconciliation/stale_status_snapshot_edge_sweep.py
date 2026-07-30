@@ -134,6 +134,27 @@ INDIVIDUAL_SNAPSHOT_RE: re.Pattern[str] = re.compile(
     re.IGNORECASE,
 )
 
+# NOTE (new regex, task 3042): SNAPSHOT_STATUS_PHRASE_RE admits a second,
+# more permissive anchoring path that INDIVIDUAL_SNAPSHOT_RE deliberately
+# refuses: an open-class gap of up to 3 words between the task reference
+# and the preposition 'in' (e.g. 'is deliberately parked in ...', where
+# 'deliberately parked' is a verb phrase, not a closed-class connective).
+# This gap is admitted ONLY when the marker is immediately followed by the
+# literal noun 'status' — that noun is what turns the span into an
+# explicit status assertion about the referenced task rather than an
+# incidental mention, so the open-class gap costs no precision (preserves
+# the task-2613/3042 precision invariant documented on INDIVIDUAL_SNAPSHOT_RE
+# above). The gap is lazy (``{0,3}?``) and bounded, and — because '.', ',',
+# ';' are not ``\w`` and the gap's own leading ``\s+`` cannot absorb them —
+# it can never cross a clause boundary: 'Task 5 is done. Task 9 is in
+# blocked status' anchors only to task 9, never dragging in task 5.
+SNAPSHOT_STATUS_PHRASE_RE: re.Pattern[str] = re.compile(
+    TASK_REF_RE.pattern
+    + r'(?:\s+\w+){0,3}?\s+in\s+(?:an?\s+|the\s+)?'
+    + _STATUS_MARKER_ALT + r'\s+status\b',
+    re.IGNORECASE,
+)
+
 # Detects the start of an aggregate list segment: '...tasks [' or
 # '...tasks are [' or '...tasks:' or '...tasks are:'. The 'open' group
 # records which delimiter opened the segment ('[' vs ':') so
@@ -175,11 +196,11 @@ def _list_segment(text: str, start: int, open_char: str) -> str:
 
 
 def extract_snapshot_edge_task_ids(fact: str) -> set[int]:
-    """Return the task ids *fact* asserts as active/pending/in-progress.
+    """Return the task ids *fact* asserts as active/pending/blocked/in-progress.
 
     Returns the empty set (never a candidate for invalidation) when:
-    - *fact* contains no active/pending/in-progress status marker at all
-      (e.g. 'Task 5 is done', 'Task 7 landed as merge commit'); or
+    - *fact* contains no active/pending/blocked/in-progress status marker at
+      all (e.g. 'Task 5 is done', 'Task 7 landed as merge commit'); or
     - *fact* is a pure count-only snapshot with no specific task-id
       reference (e.g. 'There are 8 tasks in progress', '1505 done / 148
       cancelled') — out of scope per Snapshot Discipline; or
@@ -193,10 +214,16 @@ def extract_snapshot_edge_task_ids(fact: str) -> set[int]:
       2. Individual form: extract ids via INDIVIDUAL_SNAPSHOT_RE, which
          anchors 'task N' / '#N' / 'df N' (TASK_REF_RE's own grammar)
          directly to an adjacent status marker (only an optional copula/
-         article may sit in between) — so an incidental status word
-         elsewhere in the fact is never wrongly attributed to the
+         preposition/article may sit in between) — so an incidental status
+         word elsewhere in the fact is never wrongly attributed to the
          reference.
-      3. Aggregate form: for each detected list segment ('tasks are
+      3. Status-phrase form: extract ids via SNAPSHOT_STATUS_PHRASE_RE,
+         which additionally admits a bounded open-class gap (e.g. 'is
+         deliberately parked in ...') between the reference and the
+         marker, but only when the marker is immediately followed by the
+         literal noun 'status' — the token that makes the span an
+         explicit status assertion rather than an incidental mention.
+      4. Aggregate form: for each detected list segment ('tasks are
          [...]' / 'tasks: ...'), strip COUNT_QUANTITY_RE spans from that
          segment only (so an embedded count phrase doesn't contribute a
          spurious id) and collect its bare digit tokens.
@@ -208,6 +235,7 @@ def extract_snapshot_edge_task_ids(fact: str) -> set[int]:
         return set()
 
     ids: set[int] = {int(m.group(1)) for m in INDIVIDUAL_SNAPSHOT_RE.finditer(fact)}
+    ids |= {int(m.group(1)) for m in SNAPSHOT_STATUS_PHRASE_RE.finditer(fact)}
 
     for intro in LIST_INTRODUCER_RE.finditer(fact):
         segment = COUNT_QUANTITY_RE.sub(' ', _list_segment(fact, intro.end(), intro.group('open')))
@@ -322,7 +350,7 @@ async def sweep_stale_status_snapshot_edges(
     Enumerates ALL currently-valid Graphiti edges for *project_id* via
     ``memory_service.graphiti.get_all_valid_edges`` (a deterministic bulk
     query — never the LLM's semantic search), extracts the specific task ids
-    each edge asserts as active/pending/in-progress, cross-references those
+    each edge asserts as active/pending/blocked/in-progress, cross-references those
     ids' CURRENT status via ``taskmaster.get_statuses`` (a direct status
     lookup, not semantic search), and invalidates
     (``memory_service.update_edge(..., invalid_at=...)``) every edge whose
