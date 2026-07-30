@@ -296,3 +296,163 @@ class TestConfigProperty:
         assert decoy not in config.memory_evals_dir.parents
         # Control: an env-indirected sibling DOES move, proving the vars are live.
         assert config.reconciliation_escalations_dir == decoy / 'escalations'
+
+
+# ---------------------------------------------------------------------------
+# step-3 — trend assembly and latest-run scalars
+# ---------------------------------------------------------------------------
+
+_PAYLOAD_KEYS = {
+    'generated_at',
+    'root_present',
+    'evals',
+    'issues',
+    'issue_count',
+    'unmatched_escalations',
+}
+
+
+def _two_eval_tree(tmp_path: Path) -> tuple[Path, Path]:
+    """A root with ``eval-a`` (3 runs, all four M1 kinds) and ``eval-b`` (1 run).
+
+    ``eval-a``'s newest run introduces ``latecomer``, a metric absent from the
+    two older runs — the index-alignment case.  Both evals get limits and a
+    root verdicts artifact so the healthy tree reports zero issues.
+    """
+    root = tmp_path / 'memory-evals'
+    esc_dir = tmp_path / 'escalations'
+    esc_dir.mkdir(parents=True, exist_ok=True)
+
+    stamps = ['20260701T031500Z', '20260702T031500Z', '20260703T031500Z']
+    for i, stamp in enumerate(stamps):
+        metrics = [
+            _metric('canonical-in-top-5', 'proportion', 0.8 + i / 100, denominator=30, direction='lower_is_worse'),
+            _metric('dangling-pointers', 'count', float(4 + i), direction='higher_is_worse'),
+            _metric('search-latency-p50-ms', 'scalar', float(40 + i)),
+            _metric(
+                'topic-canonical-present',
+                'tripwire',
+                1.0,
+                n=2,
+                items=[{'item_key': 't-a', 'passed': True}, {'item_key': 't-b', 'passed': False}],
+            ),
+        ]
+        if stamp == stamps[-1]:
+            metrics.append(_metric('latecomer', 'count', 7.0, n=5, direction='higher_is_worse'))
+        _write_metrics(root, 'eval-a', stamp, metrics)
+
+    _write_metrics(
+        root,
+        'eval-b',
+        '20260801T031500Z',
+        [_metric('solo-metric', 'scalar', 3.5, n=1)],
+        corpus={'project_id': 'other_project', 'counts': {'temporal_facts': 7}},
+    )
+
+    _write_limits(root, 'eval-a', run_stamp=stamps[-1], baseline_run_stamps=stamps[:2])
+    _write_limits(root, 'eval-b', run_stamp='20260801T031500Z')
+    _write_verdicts(root, [])
+    return root, esc_dir
+
+
+class TestTrendsAndCurrentValues:
+    """Enumeration, trend assembly and latest-run scalars — the DD5 generic path."""
+
+    def test_payload_shape_and_generic_enumeration(self, tmp_path: Path) -> None:
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _two_eval_tree(tmp_path)
+        payload = build_memory_evals(root, esc_dir)
+
+        assert set(payload) == _PAYLOAD_KEYS
+        assert payload['root_present'] is True
+        assert isinstance(payload['generated_at'], str) and payload['generated_at']
+        # DD5: both eval dirs appear with zero per-eval code, sorted by eval_id.
+        assert [e['eval_id'] for e in payload['evals']] == ['eval-a', 'eval-b']
+
+    def test_run_stamps_are_oldest_first_and_counted(self, tmp_path: Path) -> None:
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _two_eval_tree(tmp_path)
+        eval_a = build_memory_evals(root, esc_dir)['evals'][0]
+
+        assert eval_a['run_stamps'] == ['20260701T031500Z', '20260702T031500Z', '20260703T031500Z']
+        assert eval_a['run_count'] == len(eval_a['run_stamps']) == 3
+        assert eval_a['runs_on_disk'] == 3
+        assert eval_a['truncated'] is False
+
+    def test_trend_is_chartdata_over_the_shared_run_axis(self, tmp_path: Path) -> None:
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _two_eval_tree(tmp_path)
+        eval_a = build_memory_evals(root, esc_dir)['evals'][0]
+        by_id = {m['metric_id']: m for m in eval_a['metrics']}
+
+        assert set(by_id) == {
+            'canonical-in-top-5',
+            'dangling-pointers',
+            'search-latency-p50-ms',
+            'topic-canonical-present',
+            'latecomer',
+        }
+        for metric in eval_a['metrics']:
+            trend = metric['trend']
+            assert set(trend) == {'labels', 'values'}
+            assert trend['labels'] == eval_a['run_stamps']
+            assert len(trend['values']) == len(trend['labels'])
+
+        assert by_id['dangling-pointers']['trend']['values'] == [4.0, 5.0, 6.0]
+
+    def test_metric_absent_from_older_runs_gets_none_holes(self, tmp_path: Path) -> None:
+        """Index alignment, not a shifted axis — a gap must read as a gap."""
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _two_eval_tree(tmp_path)
+        eval_a = build_memory_evals(root, esc_dir)['evals'][0]
+        latecomer = next(m for m in eval_a['metrics'] if m['metric_id'] == 'latecomer')
+
+        assert latecomer['trend']['labels'] == eval_a['run_stamps']
+        assert latecomer['trend']['values'] == [None, None, 7.0]
+
+    def test_scalars_come_from_the_latest_run(self, tmp_path: Path) -> None:
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _two_eval_tree(tmp_path)
+        eval_a = build_memory_evals(root, esc_dir)['evals'][0]
+        by_id = {m['metric_id']: m for m in eval_a['metrics']}
+
+        prop = by_id['canonical-in-top-5']
+        assert prop['current_value'] == 0.82  # the 20260703 run, not 0.80/0.81
+        assert prop['kind'] == 'proportion'
+        assert prop['n'] == 30
+        assert prop['denominator'] == 30
+        assert prop['direction'] == 'lower_is_worse'
+
+        # Fields the kind does not carry are present-and-None, never absent:
+        # beta reads a fixed column set (PRD open question 4).
+        scalar = by_id['search-latency-p50-ms']
+        assert scalar['kind'] == 'scalar'
+        assert scalar['denominator'] is None
+        assert scalar['direction'] is None
+        assert scalar['current_value'] == 42.0
+
+    def test_corpus_mirrors_the_latest_run(self, tmp_path: Path) -> None:
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _two_eval_tree(tmp_path)
+        evals = build_memory_evals(root, esc_dir)['evals']
+
+        assert evals[0]['corpus'] == {
+            'project_id': 'dark_factory',
+            'counts': {'entities_and_relations': 1204, 'temporal_facts': 588},
+        }
+        assert evals[1]['corpus'] == {'project_id': 'other_project', 'counts': {'temporal_facts': 7}}
+
+    def test_healthy_tree_reports_no_issues(self, tmp_path: Path) -> None:
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _two_eval_tree(tmp_path)
+        payload = build_memory_evals(root, esc_dir)
+
+        assert payload['issues'] == []
+        assert payload['issue_count'] == 0
