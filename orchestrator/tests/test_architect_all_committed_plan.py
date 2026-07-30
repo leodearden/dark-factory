@@ -185,3 +185,79 @@ def _make_workflow(
     workflow.plan = {'task_id': '42', 'steps': [], 'prerequisites': []}
     workflow.event_store = FakeEventStore()  # type: ignore[assignment]
     return workflow, artifacts
+
+
+# ---------------------------------------------------------------------------
+# step-1 RED: the architect's capability surface for α's mark_step_committed
+# ---------------------------------------------------------------------------
+#
+# allowed_tools is the ENFORCED tool surface — agents/invoke.py:979-985 builds
+# the backend `--tools` allowlist from it (and loudly drops specs it cannot
+# express), so a tool absent from allowed_tools is structurally unreachable no
+# matter what the prompt says.
+
+_MARK_COMMITTED = 'mcp__plan-tools__mark_step_committed'
+
+
+class TestArchitectCanReachMarkStepCommitted:
+    def test_architect_is_granted_mark_step_committed(self):
+        from orchestrator.agents.roles import ARCHITECT  # noqa: PLC0415
+
+        assert _MARK_COMMITTED in ARCHITECT.allowed_tools, (
+            f'ARCHITECT.allowed_tools omits {_MARK_COMMITTED!r} — the backend '
+            f'allowlist built at agents/invoke.py:979-985 would strip the call, '
+            f'making the γ signal structurally unreachable. Got: '
+            f'{ARCHITECT.allowed_tools!r}'
+        )
+
+    def test_implementer_is_not_granted_mark_step_committed(self):
+        """Pre-satisfying is an AUTHORING-time authority, not an execution one.
+
+        IMPLEMENTER/DEBUGGER keep only ``mark_step_done`` via
+        ``_PLAN_STATUS_TOOLS``: an implementer that could self-grant ``done``
+        with a description tag claiming committed provenance would defeat the
+        whole TDD bookkeeping.
+        """
+        from orchestrator.agents.roles import IMPLEMENTER  # noqa: PLC0415
+
+        assert _MARK_COMMITTED not in IMPLEMENTER.allowed_tools
+        assert 'mcp__plan-tools__mark_step_done' in IMPLEMENTER.allowed_tools
+
+    def test_debugger_is_not_granted_mark_step_committed(self):
+        from orchestrator.agents.roles import DEBUGGER  # noqa: PLC0415
+
+        assert _MARK_COMMITTED not in DEBUGGER.allowed_tools
+
+    def test_architect_declares_plan_tools_family(self):
+        """Keeps the inverse-capability invariant satisfied by the new grant.
+
+        test_agent_capability_wiring.py::TestInverseCapabilityInvariant asserts
+        every role allowing an ``mcp__plan-tools__`` prefix declares the
+        ``plan_tools`` family; asserted here too so a grant added without the
+        family declaration fails in this suite as well.
+        """
+        from orchestrator.agents.roles import ARCHITECT  # noqa: PLC0415
+
+        assert 'plan_tools' in ARCHITECT.mcp_families
+
+
+@pytest.mark.asyncio
+class TestGrantedToolActuallyExists:
+    async def test_granted_name_resolves_to_a_registered_tool(self, tmp_path):
+        """The grant must never name a tool the server does not register.
+
+        Mirrors the registration assertion at test_plan_tools_server.py:1089 —
+        an allowlist entry for a non-existent tool is a silent dead grant.
+        """
+        from orchestrator.mcp import plan_tools  # noqa: PLC0415
+
+        artifacts = TaskArtifacts(tmp_path)
+        artifacts.init('42', 'X', 'desc', base_commit='base')
+        server = plan_tools.create_server(artifacts)
+
+        tool = await server.get_tool('mark_step_committed')
+
+        assert tool is not None
+        # The granted allowlist name is the mcp__<server>__<tool> spelling of
+        # exactly this registered tool.
+        assert _MARK_COMMITTED.endswith('__mark_step_committed')
