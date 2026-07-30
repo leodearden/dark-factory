@@ -28,6 +28,13 @@ Extension allowlist rationale (reify PRD §11 Q2):
 - PRD-explicit: rs ri toml cpp c h hpp md json yaml yml lock py sh ts tsx js txt step stl
 - Corpus-evidenced: css mjs html jsonc gcode service
 - Common source siblings: cc cxx hh mts cts cjs jsx scss svg png
+- git-ls-files sweep 2026-07-28 (reify #5726 / dark_factory #3117) — 22
+  tracked-file extensions across reify + dark-factory that this list
+  misclassified as directories; supersedes #4676's "OQ#2 resolved" completeness
+  claim FOR THIS LIST, which was a 22-extension undercount:
+  conf diff envrc example example-systemd-config gitattributes gitignore gitkeep
+  gitmodules golden grammar icns ico jq jsonl log manifest npmrc python-version
+  template timer typed
 
 ## Predicate canonical location
 
@@ -71,6 +78,23 @@ _DISCARD_CODES = frozenset({'unparseable_json', 'not_an_object'})
 # ---------------------------------------------------------------------------
 # Canonical extension allowlist — kept in sync with shared.locking.CODE_EXTENSIONS.
 # Drift guard: tests/test_lock_charter_guard.py::test_extension_drift_guard
+#
+# NAMING — read the contract, not the name.  Despite being called CODE_EXTENSIONS
+# this is NOT a code-file allowlist.  It is the set of recognised FILE-EXTENSION
+# TOKENS whose presence after the last dot of a path's final segment is evidence
+# that the segment names a FILE rather than a DIRECTORY — which is all any caller
+# (is_file_path, directory_locks, strip_directory_locks,
+# module_charter.derive_modules) relies on.  Its non-code members are therefore
+# correct and load-bearing: png svg ico icns log lock diff golden manifest timer
+# typed service template example python-version gitignore gitkeep gitmodules
+# gitattributes npmrc envrc conf.
+# Judge a candidate addition by "does a real tracked file end in this?", NEVER by
+# "is this code?".  That misreading of the name is exactly what let the list sit
+# at a 22-extension undercount until #3117.  Renaming to FILE_EXTENSIONS is the
+# right long-term fix but spans shared/__init__.py, shared/tests/test_public_api.py,
+# orchestrator.module_charter, fused_memory server/tools.py + task_interceptor.py
+# and reify's own copy — all outside #3117's lock charter, so it is deferred to a
+# dedicated follow-up rather than done half-way here.
 # ---------------------------------------------------------------------------
 
 __all__ = [
@@ -82,12 +106,17 @@ __all__ = [
 ]
 
 CODE_EXTENSIONS: frozenset[str] = frozenset({
-    'c', 'cc', 'cjs', 'cpp', 'css', 'cts', 'cxx', 'gcode',
+    'c', 'cc', 'cjs', 'conf', 'cpp', 'css', 'cts', 'cxx',
+    'diff', 'envrc', 'example', 'example-systemd-config',
+    'gcode', 'gitattributes', 'gitignore', 'gitkeep', 'gitmodules', 'golden', 'grammar',
     'h', 'hh', 'hpp', 'html',
-    'js', 'json', 'jsonc', 'jsx',
-    'lock', 'md', 'mjs', 'mts', 'png', 'py',
+    'icns', 'ico',
+    'jq', 'js', 'json', 'jsonc', 'jsonl', 'jsx',
+    'lock', 'log',
+    'manifest', 'md', 'mjs', 'mts',
+    'npmrc', 'png', 'py', 'python-version',
     'ri', 'rs', 'scss', 'service', 'sh', 'step', 'stl', 'svg',
-    'toml', 'ts', 'tsx', 'txt',
+    'template', 'timer', 'toml', 'ts', 'tsx', 'txt', 'typed',
     'yaml', 'yml',
 })
 
@@ -126,8 +155,16 @@ def is_file_path(path: str) -> bool:
     # Extension = substring after the last dot.
     ext = seg.rsplit('.', 1)[1]
 
-    # Dotfiles: seg == '' after split when the dot is the first char.
-    # e.g. '.gitignore' → seg='.gitignore', ext='gitignore' — not in allowlist → False.
+    # A dotted segment is a FILE iff its post-last-dot substring is allowlisted.
+    # There is NO dotfile special case: a leading dot is just a dot, so a
+    # leading-dot segment reaches this lookup like any other and its "extension"
+    # is the whole name after that dot.  Both outcomes are load-bearing:
+    #   '.gitignore' → ext='gitignore' — in allowlist → True (a real file).
+    #   '.worktrees' → ext='worktrees' — NOT in allowlist → False (a real
+    #                  directory).  This is why the allowlist must stay
+    #                  ENUMERATED rather than growing a "leading dot ⇒ file"
+    #                  rule: that rule would make '.worktrees' (the whole
+    #                  worktree pool) declarable as a lock charter.
     # 'f.PY' → ext='PY' — not in (lowercase) allowlist → False.  Correct.
     return ext in CODE_EXTENSIONS
 

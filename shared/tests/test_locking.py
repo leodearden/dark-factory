@@ -3,6 +3,8 @@ orchestrator scheduler and the task curator."""
 
 from __future__ import annotations
 
+import pytest
+
 from shared.locking import (
     CODE_EXTENSIONS,
     directory_locks,
@@ -24,13 +26,139 @@ from shared.locking import (
 # ---------------------------------------------------------------------------
 
 _CANONICAL_EXTENSIONS = [
-    'c', 'cc', 'cjs', 'cpp', 'css', 'cts', 'cxx', 'gcode',
+    'c', 'cc', 'cjs', 'conf', 'cpp', 'css', 'cts', 'cxx',
+    'diff', 'envrc', 'example', 'example-systemd-config',
+    'gcode', 'gitattributes', 'gitignore', 'gitkeep', 'gitmodules', 'golden', 'grammar',
     'h', 'hh', 'hpp', 'html',
-    'js', 'json', 'jsonc', 'jsx',
-    'lock', 'md', 'mjs', 'mts', 'png', 'py',
+    'icns', 'ico',
+    'jq', 'js', 'json', 'jsonc', 'jsonl', 'jsx',
+    'lock', 'log',
+    'manifest', 'md', 'mjs', 'mts',
+    'npmrc', 'png', 'py', 'python-version',
     'ri', 'rs', 'scss', 'service', 'sh', 'step', 'stl', 'svg',
-    'toml', 'ts', 'tsx', 'txt',
+    'template', 'timer', 'toml', 'ts', 'tsx', 'txt', 'typed',
     'yaml', 'yml',
+]
+
+# ---------------------------------------------------------------------------
+# Classification corpora — deliberate verbatim duplicates of the corpora in
+# fused-memory/tests/test_lock_charter_guard.py, for the same reason the two
+# CODE_EXTENSIONS frozensets are duplicated (locking.py:16-25): the two copies
+# are NOT linked by a re-export, so each must be pinned INDEPENDENTLY — and
+# this is the copy the orchestrator scheduler (the α enforcement point) actually
+# imports.  Keeping the two lists byte-identical is what lets a reader diff them.
+#
+# Rejected alternative: factor the corpora into one fixture module both suites
+# import.  ``shared`` and ``fused-memory`` are separate packages with separate
+# virtual environments and no shared test-support package; a cross-package test
+# import would couple them exactly where the design deliberately does not, and
+# would defeat the point of independent pinning.  Duplication + the two drift
+# guards below is the cheaper and more faithful trade.
+#
+# One real tracked path per canonical extension (58 extensions / 61 paths) —
+# dark-factory unless the comment says reify.  Enforced by
+# TestIsFilePath::test_accept_corpus_covers_every_canonical_extension.
+# ---------------------------------------------------------------------------
+
+_ACCEPT_PATHS = [
+    # Standard rust file in a deep path
+    'crates/foo/src/bar.rs',
+    # C-P4: deep file whose parent dir name looks like an extension-less token
+    'a/b/compute_targets/foo.rs',
+    # C-P3: no-stat — ghost path (not on disk) must still be accepted
+    'no/such/path/ghost.rs',
+    # One path per canonical extension
+    'examples/foo.ri',
+    'crates/x/Cargo.toml',
+    'notes.md',
+    'logo.png',
+    'units/orchestrator.service',
+    'out/part.gcode',
+    'src/lib.c',
+    'src/lib.cc',
+    'src/lib.cxx',
+    'src/lib.cpp',
+    'include/lib.h',
+    'include/lib.hh',
+    'include/lib.hpp',
+    'src/index.html',
+    'src/main.js',
+    'src/data.json',
+    'src/data.jsonc',
+    'src/comp.jsx',
+    'yarn.lock',
+    'src/mod.mjs',
+    'src/mod.mts',
+    'src/mod.ts',
+    'src/mod.tsx',
+    'src/comp.cjs',
+    'src/mod.cts',
+    'src/styles.css',
+    'src/styles.scss',
+    'src/icon.svg',
+    'Cargo.toml',
+    'script.sh',
+    'model/part.step',
+    'model/object.stl',
+    'README.txt',
+    'config.yaml',
+    'config.yml',
+    'src/main.py',
+    # --- Extensions added by the git-ls-files sweep 2026-07-28 (#5726 / #3117).
+    # Real tracked paths (verified with `git ls-files`), dark-factory unless
+    # marked reify — the corpus records the evidence for each entry.
+    'orchestrator/src/orchestrator/evals/reviewer_trial/corpus/mined/mined_1030.diff',
+    'dashboard/dark-factory-dashboard-watchdog.timer',
+    '.gitignore',
+    '.gitattributes',
+    '.gitmodules',
+    '.python-version',
+    '.envrc',
+    'scripts/dashboard.service.template',
+    'scripts/verify-task-845-tty.log',
+    'cockpit/src/cockpit/py.typed',
+    '.env.example',
+    'fused-memory/fused-memory.service.example-systemd-config',
+    'fused-memory/tests/fixtures/write_triage_calibration.jsonl',
+    # The originating incident path: declaring this in metadata.files was
+    # rejected as a directory lock because 'manifest' was absent from the list.
+    'tests/infra/run-all-classification.manifest',  # reify
+    'deploy/systemd/orchestrator-reify.service.d/warm-lane.conf',  # reify
+    'crates/reify-doc/tests/snapshots/.gitkeep',  # reify
+    'crates/reify-fdm/tests/fixtures/toolpath_bracket.golden',  # reify
+    'gui/src/editor/reify.grammar',  # reify
+    'gui/src-tauri/icons/icon.icns',  # reify
+    'gui/src-tauri/icons/icon.ico',  # reify
+    'scripts/reify-audit-snapshot-filter.jq',  # reify
+    'tree-sitter-reify/.npmrc',  # reify
+]
+
+# REJECT corpus (α/γ shared vector — all must return False).  Verbatim duplicate
+# of _REJECT_PATHS in fused-memory/tests/test_lock_charter_guard.py.  '/' and
+# 'a/b/c/' cover the all-slashes → empty-segment branch of is_file_path, which
+# had no test in this copy before.
+_REJECT_PATHS = [
+    'crates/',
+    'crates/reify-eval/src',
+    'crates/reify-eval/tests',
+    'examples',
+    'compute_targets',
+    'modal',
+    'crates/reify-eval/src/',
+    'a/b/c/',
+    '/',
+]
+
+# Real directories whose final segment carries a leading dot and no further dot.
+# These MUST stay directory-shaped — see
+# TestIsFilePath::test_leading_dot_directories_stay_directories for the rejected
+# "leading-dot segment => FILE" alternative this corpus pins against.
+_DOTTED_DIRECTORY_PATHS = [
+    '.worktrees',
+    '.task',
+    '.claude',
+    '.cargo',
+    '.taskmaster',
 ]
 
 
@@ -160,6 +288,105 @@ class TestIsFilePath:
         assert 'rs' in CODE_EXTENSIONS
         assert 'ts' in CODE_EXTENSIONS
         assert 'md' in CODE_EXTENSIONS
+
+    @pytest.mark.parametrize('path', _ACCEPT_PATHS)
+    def test_accept_corpus_paths_are_files(self, path: str):
+        """Every canonical extension is run through the α copy of the predicate.
+
+        One representative path per canonical extension (all 58, not just the 22
+        added by the 2026-07-28 sweep).  Before this amendment only the 22 new
+        extensions had behavioural coverage here while the original 36 had nothing
+        but four spot-checks in ``test_code_extensions_is_frozenset`` — leaving
+        the copy the orchestrator scheduler actually imports pinned strictly
+        weaker than the fused-memory copy, which defeats the point of
+        independently pinning two deliberately-duplicated definitions.
+
+        Paths added by the sweep are genuinely tracked files in dark-factory or
+        reify (verified with ``git ls-files``) — not synthetic filenames — so the
+        corpus documents the actual evidence that motivated each entry rather than
+        restating the allowlist.  ``run-all-classification.manifest`` is the path
+        from the originating incident: declaring it in ``metadata.files`` was
+        rejected as a directory lock because ``manifest`` was absent.
+        """
+        assert is_file_path(path) is True, (
+            f'{path!r} must classify as a file — its extension is on the '
+            f'canonical allowlist (58 entries as of reify #5726 / #3117)'
+        )
+
+    @pytest.mark.parametrize('path', _REJECT_PATHS)
+    def test_reject_corpus_paths_are_directories(self, path: str):
+        """Directory-style paths must classify as directories (False)."""
+        assert is_file_path(path) is False, (
+            f'{path!r} is directory-shaped and must NOT classify as a file'
+        )
+
+    def test_accept_corpus_covers_every_canonical_extension(self):
+        """_ACCEPT_PATHS must exercise every entry in _CANONICAL_EXTENSIONS.
+
+        Turns the corpus comment's "one path per canonical extension" claim into
+        an enforced invariant, so an extension cannot be added to CODE_EXTENSIONS
+        and pinned in the drift guard while never being run through an actual
+        classification assertion.  Mirrors the assertion of the same name in
+        fused-memory/tests/test_lock_charter_guard.py, which also carries the
+        complementary corpus→allowlist sweep over both repos' tracked files.
+        That sweep is deliberately NOT duplicated here: it checks a repo-level
+        property of the tree (no tracked extension is missing), and this copy's
+        vector is already pinned identical to the γ copy's by the two drift
+        guards, so a second subprocess sweep would add cost without adding
+        detection power.
+
+        Coverage is derived from ``is_file_path`` itself rather than a
+        hand-written re-implementation of its segment parsing: a path counts for
+        ``ext`` only if the predicate ACCEPTS it and it ends in ``.<ext>``.
+        Because every canonical extension is dot-free (asserted first),
+        ``endswith('.' + ext)`` holds iff the substring after the LAST dot equals
+        ``ext`` — exactly the lookup ``is_file_path`` performs.
+        """
+        dotted = sorted(e for e in _CANONICAL_EXTENSIONS if '.' in e)
+        assert not dotted, (
+            f'canonical extensions must be dot-free for the endswith() '
+            f'equivalence this test relies on; got {dotted!r}'
+        )
+
+        accepted = [p for p in _ACCEPT_PATHS if is_file_path(p)]
+        uncovered = sorted(
+            ext
+            for ext in _CANONICAL_EXTENSIONS
+            if not any(p.endswith(f'.{ext}') for p in accepted)
+        )
+        assert not uncovered, (
+            f'{len(uncovered)} allowlisted extension(s) are pinned in '
+            f'_CANONICAL_EXTENSIONS but never classified by any _ACCEPT_PATHS '
+            f'entry: {uncovered!r}\n'
+            f'Add one real representative path per extension to _ACCEPT_PATHS.'
+        )
+
+    @pytest.mark.parametrize('path', _DOTTED_DIRECTORY_PATHS)
+    def test_leading_dot_directories_stay_directories(self, path: str):
+        """Rejected alternative: a blanket "leading-dot segment => FILE" rule.
+
+        Seven of the 22 extensions added by the 2026-07-28 sweep are dotfiles
+        (.gitignore .gitkeep .envrc .npmrc .gitattributes .gitmodules
+        .python-version), so a one-line predicate rule "a segment starting with
+        '.' is a file" looks like an attractive simplification of seven list
+        entries.  It was considered and REJECTED: these paths are real
+        DIRECTORIES, and such a rule would flip every one of them to FILE —
+        letting a task declare ``.worktrees`` (the orchestrator's entire
+        worktree pool) or ``.task`` as its lock charter.  That is precisely the
+        over-wide-charter failure this guard exists to prevent.
+
+        The allowlist must therefore stay ENUMERATED: that is the property
+        making an unknown dotted segment default to directory.  Verified against
+        reify's α implementation — ``lock-charter-guard.sh classify .worktrees``
+        (and .task/.claude/.cargo/.taskmaster) returns REJECT.
+
+        These assertions pass both before and after the widening; they are
+        regression pins for a rejected design, not a behaviour change.
+        """
+        assert not is_file_path(path), (
+            f'{path!r} is a real directory and must NOT classify as a file; a '
+            f'blanket leading-dot=>file rule was rejected for exactly this reason'
+        )
 
 
 class TestDirectoryLocks:
