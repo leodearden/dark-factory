@@ -370,6 +370,7 @@ def _derive_module_runs(
         lint_cmd = _scope_prefix_to_keyword(mc.lint_command, 'ruff check', scoped)
         runs.append(PlannedRun(
             mc.prefix, lint_cmd, ScopeKind.FILE_SCOPED, 'lint: file-scoped to touched file(s)',
+            scoped_targets=tuple(scoped),
         ))
     else:
         runs.append(PlannedRun(
@@ -391,6 +392,7 @@ def _derive_module_runs(
             runs.append(PlannedRun(
                 mc.prefix, type_cmd, ScopeKind.FILE_SCOPED,
                 'pyright: file-scoped to touched file(s)',
+                scoped_targets=tuple(scoped),
             ))
     else:
         runs.append(PlannedRun(
@@ -421,6 +423,7 @@ def _derive_module_runs(
             runs.append(PlannedRun(
                 mc.prefix, test_cmd, ScopeKind.FILE_SCOPED,
                 'pytest: file-scoped to touched test file(s)',
+                scoped_targets=tuple(collectable_tests),
             ))
         elif role == 'task':
             test_cmd = parse_config_command(mc.test_command)
