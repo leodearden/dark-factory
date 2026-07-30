@@ -352,33 +352,143 @@ def pick_survivor(group: list[dict]) -> tuple[dict, list[dict]]:
     return survivor, losers
 
 
-def build_sweep_plan(memories: list[dict], threshold: float = 0.85) -> dict[str, Any]:
-    """Orchestrate filtering -> clustering -> survivor selection -> report.
+def _max_lexical_ratio(normalized: list[str], member_indices: list[int]) -> float | None:
+    """Highest pairwise ``ratio()`` among a cluster's members, ignoring thresholds.
+
+    Reported even when the lexical path LOST (scored below threshold and
+    contributed no pair). An operator looking at an ANN-only cluster needs to
+    see how the other detector scored it — "ANN 0.905, lexical 0.095" is the
+    auditable form of a path disagreement; omitting the loser's score would
+    hide exactly the number that explains why the paths differed.
+    """
+    best: float | None = None
+    for a in range(len(member_indices)):
+        for b in range(a + 1, len(member_indices)):
+            left, right = normalized[member_indices[a]], normalized[member_indices[b]]
+            if not left or not right:
+                continue
+            ratio = difflib.SequenceMatcher(None, left, right).ratio()
+            best = ratio if best is None else max(best, ratio)
+    return best
+
+
+def build_sweep_plan(
+    memories: list[dict],
+    threshold: float = 0.85,
+    *,
+    ann_pairs: Iterable[tuple[int, int]] | None = None,
+    ann_scores: dict[tuple[int, int], float] | None = None,
+    ann_disclosure: dict[str, int] | None = None,
+    ann_threshold: float | None = None,
+) -> dict[str, Any]:
+    """Orchestrate filtering -> dual-path clustering -> survivor selection -> report.
+
+    Runs BOTH candidate generators and reports both verdicts. The lexical
+    ``difflib`` path is kept, not swapped out for ANN: it is high-precision
+    on the near-verbatim rewrites that dominate this corpus, while ANN
+    catches the paraphrase class lexical structurally cannot. Silently
+    replacing one with the other would lose signal, so the actioned plan
+    clusters over the UNION of both pair sets and each emitted cluster
+    records which path(s) found it.
 
     Args:
         memories: Raw memory list (any/all categories).
-        threshold: Near-duplicate similarity threshold.
+        threshold: Near-duplicate similarity threshold for the LEXICAL path
+            only. The ANN cutoff is applied upstream, when the pairs are
+            generated (see ``ann_pairs_from_neighbors``).
+        ann_pairs: Optional ``(i, j)`` index pairs from the ANN path.
+            Indices address *memories* as passed in — they are remapped
+            across this function's category filter, and a pair whose
+            endpoint was filtered out is dropped.
+        ann_scores: Optional ``{(i, j): score}`` for those pairs, in the same
+            index space, surfaced per cluster as ``ann_max_score``.
+        ann_disclosure: Optional counter dict from the ANN path, echoed into
+            the report so cap/loss counts travel with the plan they shaped.
+        ann_threshold: The ANN cutoff actually in effect, echoed so a reader
+            of the report never has to guess which number produced it.
 
     Returns:
-        JSON-serialisable plan dict with keys: ``clusters_total``,
-        ``near_duplicate_groups`` (each with the survivor's id/content and
-        the full member id list), ``delete_candidates`` (flattened loser ids
-        across all clusters). Mirrors ``audit_duplicate_tasks.build_audit_plan``.
+        JSON-serialisable plan dict. Pre-existing keys keep their exact
+        meaning and shape (``clusters_total``, ``near_duplicate_groups``
+        with the survivor's id/content and full member id list,
+        ``delete_candidates`` flattened across clusters), so existing
+        consumers are unaffected. Each group additionally carries
+        ``found_by`` (``['ann']``, ``['lexical']`` or both),
+        ``lexical_clustered``, ``ann_max_score`` and ``lexical_max_ratio``;
+        the plan additionally carries ``threshold``, ``ann_threshold``,
+        ``ann_disclosure`` and ``path_verdicts``
+        (``lexical_only_clusters`` / ``ann_only_clusters`` /
+        ``both_paths_clusters``).
     """
-    candidates = [m for m in memories if m.get('category') == 'procedural_knowledge']
-    groups = find_near_duplicate_memory_groups(candidates, threshold=threshold)
+    candidate_indices = [
+        i for i, m in enumerate(memories) if m.get('category') == 'procedural_knowledge'
+    ]
+    candidates = [memories[i] for i in candidate_indices]
+    # Original index -> candidate index, so ANN pairs generated against the
+    # unfiltered scan still address the right records after filtering.
+    candidate_index = {orig: new for new, orig in enumerate(candidate_indices)}
+
+    normalized = [(m.get('content') or '').strip().lower() for m in candidates]
+    lexical_pairs = set(_lexical_pairs(normalized, threshold))
+
+    remapped_ann: set[tuple[int, int]] = set()
+    ann_score_by_pair: dict[tuple[int, int], float] = {}
+    for pair in ann_pairs or []:
+        left, right = candidate_index.get(pair[0]), candidate_index.get(pair[1])
+        if left is None or right is None:
+            continue  # endpoint excluded by the category filter
+        key = (left, right) if left < right else (right, left)
+        remapped_ann.add(key)
+        score = (ann_scores or {}).get(pair)
+        if score is not None:
+            ann_score_by_pair[key] = max(ann_score_by_pair.get(key, score), score)
+
+    groups = cluster_memories_by_pairs(candidates, lexical_pairs | remapped_ann)
+    # cluster_memories_by_pairs passes member dicts through by identity, so
+    # this recovers each cluster's indices for per-path attribution.
+    index_by_identity = {id(m): i for i, m in enumerate(candidates)}
 
     near_duplicate_groups: list[dict[str, Any]] = []
     # Mem0/Qdrant point ids can be int or str (ExtendedPointId), so this is
     # not narrowed to list[str].
     delete_candidates: list[Any] = []
+    lexical_only = ann_only = both_paths = 0
 
     for group in groups:
+        member_indices = [index_by_identity[id(m)] for m in group]
+        member_set = set(member_indices)
+        in_group = [
+            (a, b)
+            for a in member_set
+            for b in member_set
+            if a < b
+        ]
+        group_lexical = [p for p in in_group if p in lexical_pairs]
+        group_ann = [p for p in in_group if p in remapped_ann]
+
+        found_by = []
+        if group_ann:
+            found_by.append('ann')
+        if group_lexical:
+            found_by.append('lexical')
+        if group_ann and group_lexical:
+            both_paths += 1
+        elif group_ann:
+            ann_only += 1
+        else:
+            lexical_only += 1
+
+        scores = [ann_score_by_pair[p] for p in group_ann if p in ann_score_by_pair]
+
         survivor, losers = pick_survivor(group)
         near_duplicate_groups.append({
             'survivor_id': survivor.get('id'),
             'survivor_content': survivor.get('content'),
             'member_ids': [m.get('id') for m in group],
+            'found_by': found_by,
+            'lexical_clustered': bool(group_lexical),
+            'ann_max_score': max(scores) if scores else None,
+            'lexical_max_ratio': _max_lexical_ratio(normalized, member_indices),
         })
         delete_candidates.extend(m.get('id') for m in losers)
 
@@ -386,6 +496,14 @@ def build_sweep_plan(memories: list[dict], threshold: float = 0.85) -> dict[str,
         'clusters_total': len(groups),
         'near_duplicate_groups': near_duplicate_groups,
         'delete_candidates': delete_candidates,
+        'threshold': threshold,
+        'ann_threshold': ann_threshold,
+        'ann_disclosure': dict(ann_disclosure) if ann_disclosure is not None else None,
+        'path_verdicts': {
+            'lexical_only_clusters': lexical_only,
+            'ann_only_clusters': ann_only,
+            'both_paths_clusters': both_paths,
+        },
     }
 
 

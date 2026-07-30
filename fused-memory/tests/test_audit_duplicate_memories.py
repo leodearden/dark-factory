@@ -1183,7 +1183,7 @@ class TestAnnPathCatchesParaphraseLexicalPathMisses:
         rather than somewhere confusing downstream.
         """
         cutoff = _calibrated_ann_threshold()
-        assert _MEASURED_COSINE >= cutoff, (
+        assert cutoff <= _MEASURED_COSINE, (
             f'the recorded pair no longer clears the calibrated cutoff '
             f'(cosine {_MEASURED_COSINE!r} < t_high {cutoff!r}) — re-run the '
             f'pre-2 measurement and select a new pair'
