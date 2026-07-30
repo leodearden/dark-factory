@@ -231,12 +231,29 @@ independent things before marking a record repaired — non-empty `memory_ids`,
 `mem0` present in `stores_written`, and no `mem0_error` in `message` — and a
 non-raising add that fails any of them is treated **identically to a throw**.
 
-### The two non-zero exit conditions that need a human
+### The three non-zero exit conditions that need a human
 
 | Record flag | What happened | What to do |
 | --- | --- | --- |
 | `content_lost_in_flight` | The delete landed but the re-add did **not** persist (raised, or returned without evidence of a mem0 write). The original text now exists **only in the printed JSON report**. | Restore it by hand from the report — it carries the old id, the original content, the repaired content, and `metadata_preserved` / `metadata_dropped` — **before** re-running the sweep. |
 | `skipped_not_mem0_routed` | A repairable record whose `category` does not route to mem0 (or is absent/unrecognised). Left **entirely untouched**: nothing deleted, nothing added. | Needs a human decision. Neither option is safe unattended — a plain re-add would route the repaired text to Graphiti only and the Qdrant copy the delete removed would be gone, while `dual_write=True` would duplicate the Graphiti copy that the mem0-scoped delete deliberately left alive. |
+| `record_error` | That record's repair aborted on an unexpected error (a `delete_memory` transport failure, a Qdrant outage). The sweep **continued** to the remaining records rather than unwinding. | Whether the delete landed is **unknown** — check the record's id in the store before re-running. The sweep deliberately does not guess. |
+
+### The report always survives, even a fatal abort
+
+Because the only copy of a `content_lost_in_flight` record's original text is
+the printed report, the report must never be discarded on the way out. Two
+redundant mechanisms guarantee that:
+
+- **Per-record isolation.** Each record is added to the report *before* any
+  store mutation is attempted, and its repair runs under its own `try`. One
+  record's transport error is recorded as `record_error` on that record and the
+  sweep carries on; it can no longer void every earlier record's entry.
+- **Caller-owned progress.** Should anything escape anyway, `main()` still holds
+  the accumulated records and **prints the partial report** (with
+  `"aborted": true`) before exiting `2`. The partial report uses exactly the
+  same shape as a complete one, so there is no second format to drift out of
+  step.
 
 ---
 

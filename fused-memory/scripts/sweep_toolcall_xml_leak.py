@@ -66,6 +66,15 @@ also non-zero): a plain re-add would route it to Graphiti only, while
 ``dual_write=True`` would duplicate the Graphiti copy the mem0-scoped delete
 deliberately left alive.
 
+The printed report ALWAYS survives, because for a ``content_lost_in_flight``
+record it is the only remaining copy of the original text. Each record is added
+to the report BEFORE any store mutation is attempted and its repair runs under
+its own ``try``, so one record's transport error is recorded as ``record_error``
+on that record (non-zero exit; whether its delete landed is unknown) and the
+sweep continues instead of unwinding. Should anything escape anyway, ``main``
+owns the progress container and prints the PARTIAL report -- same shape, plus
+``"aborted": true`` -- before exiting 2.
+
 Scope
 -----
 Mem0/Qdrant ONLY. Graphiti episodes are NOT covered -- Graphiti-side discovery
@@ -400,7 +409,39 @@ def build_report(
     }
 
 
-async def run(args: Any, memory_service: Any) -> dict:
+def new_progress() -> dict:
+    """Return a fresh caller-owned progress container for :func:`run`.
+
+    The container exists so the report can OUTLIVE an abort. ``records`` is the
+    live list :func:`run` appends to, so a caller holding this dict still has
+    every record processed so far even if ``run`` raises partway through -- and
+    for a ``content_lost_in_flight`` record, that in-memory text is the ONLY
+    surviving copy of the original content (the point is already deleted). A
+    report discarded on the way out would make that loss permanent.
+    """
+    return {'records': [], 'collection': '', 'scanned': 0, 'truncated': False}
+
+
+def report_from_progress(args: Any, progress: dict) -> dict:
+    """Build the report from whatever *progress* has accumulated so far.
+
+    Used both for the normal return from :func:`run` and by :func:`main` on an
+    abort, so a partial run is reported in EXACTLY the same shape as a complete
+    one -- there is no second, lossier "emergency" format to get out of step.
+    """
+    return build_report(
+        project_id=args.project_id,
+        collection=progress.get('collection', ''),
+        dry_run=not args.apply,
+        exhaustive=bool(args.exhaustive),
+        scanned=progress.get('scanned', 0),
+        truncated=bool(progress.get('truncated')),
+        limit=args.limit,
+        records=progress.get('records', []),
+    )
+
+
+async def run(args: Any, memory_service: Any, progress: dict | None = None) -> dict:
     """Scan, classify, and (under ``--apply``) repair the leaked records.
 
     Discovery is ``MemoryService.scan_memory_content`` -- a LITERAL payload-text
@@ -428,15 +469,34 @@ async def run(args: Any, memory_service: Any) -> dict:
     original content, the repaired content, and the reason) and never
     swallowed: a silent half-completed repair would destroy the very text this
     sweep exists to preserve.
+
+    Two mechanisms keep that promise honest, and they are deliberately
+    redundant:
+
+      * Each record is appended to ``progress['records']`` BEFORE any mutation
+        of the store is attempted, and its per-record body runs under its own
+        ``try``. One record's transport error (a ``delete_memory`` timeout, a
+        Qdrant outage) is recorded on THAT record as ``record_error`` and the
+        sweep continues, instead of unwinding the whole run and taking every
+        earlier record's report entry -- including any already-lost original
+        text -- with it.
+      * *progress* is caller-owned. Should anything escape anyway, the caller
+        still holds every record accumulated so far and can print the partial
+        report (see :func:`main`).
     """
+    progress = new_progress() if progress is None else progress
+    records: list[dict] = progress['records']
+    dry_run = not args.apply
+
     scan = await memory_service.scan_memory_content(
         project_id=args.project_id,
         exhaustive=bool(args.exhaustive),
         limit=args.limit,
     )
     matches = scan.get('matches', [])
-    dry_run = not args.apply
-    records: list[dict] = []
+    progress['collection'] = scan.get('collection', '')
+    progress['scanned'] = scan.get('scanned', len(matches))
+    progress['truncated'] = bool(scan.get('truncated'))
 
     for match in matches:
         payload = match.get('metadata') or {}
@@ -449,33 +509,36 @@ async def run(args: Any, memory_service: Any) -> dict:
             'content': content,
             'created_at': match.get('created_at'),
         }
+        # Appended BEFORE any store mutation, and mutated in place from here
+        # on, so this record is in the report no matter how its repair ends.
+        records.append(record)
 
         if classification in (REPAIRABLE_TAIL, REPAIRABLE_DUPLICATE):
             record['repaired_content'] = repair_content(content)
 
-        if not dry_run and classification in (REPAIRABLE_TAIL, REPAIRABLE_DUPLICATE):
-            await _repair_record(memory_service, args, match, payload, record)
-        elif not dry_run and classification == MANUAL_REVIEW:
-            logger.warning(
-                'sweep_toolcall_xml_leak: refusing to repair memory_id=%s -- the '
-                'text after the leak marker is neither absent nor a verbatim '
-                'duplicate, so no repair preserves content. Left untouched for '
-                'human review.',
-                match.get('id'),
+        try:
+            if not dry_run and classification in (REPAIRABLE_TAIL, REPAIRABLE_DUPLICATE):
+                await _repair_record(memory_service, args, match, payload, record)
+            elif not dry_run and classification == MANUAL_REVIEW:
+                logger.warning(
+                    'sweep_toolcall_xml_leak: refusing to repair memory_id=%s -- the '
+                    'text after the leak marker is neither absent nor a verbatim '
+                    'duplicate, so no repair preserves content. Left untouched for '
+                    'human review.',
+                    match.get('id'),
+                )
+        except Exception as exc:  # noqa: BLE001 - one bad record must not void the run
+            record['record_error'] = True
+            record['error'] = str(exc)
+            logger.exception(
+                'sweep_toolcall_xml_leak: memory_id=%s failed mid-repair (%s). '
+                'Recorded on this record and the sweep continues -- aborting here '
+                'would discard the report that is the only copy of any '
+                'already-lost content.',
+                match.get('id'), exc,
             )
 
-        records.append(record)
-
-    return build_report(
-        project_id=args.project_id,
-        collection=scan.get('collection', ''),
-        dry_run=dry_run,
-        exhaustive=bool(args.exhaustive),
-        scanned=scan.get('scanned', len(matches)),
-        truncated=bool(scan.get('truncated')),
-        limit=args.limit,
-        records=records,
-    )
+    return report_from_progress(args, progress)
 
 
 async def _repair_record(
@@ -590,11 +653,14 @@ def resolve_exit_code(report: dict) -> int:
     and a zero exit would let a partial sweep read as a complete one. Pure,
     sync, no I/O.
 
-    Two per-record outcomes also force non-zero, both needing a human:
+    Three per-record outcomes also force non-zero, all needing a human:
     ``content_lost_in_flight`` (the delete landed but the re-add did not
-    persist, so the text survives only in the printed report) and
+    persist, so the text survives only in the printed report),
     ``skipped_not_mem0_routed`` (a repairable record whose category does not
-    route to mem0, left entirely untouched).
+    route to mem0, left entirely untouched), and ``record_error`` (the record's
+    repair aborted on an unexpected error -- the sweep carried on, but whether
+    that record's delete landed is UNKNOWN, which is precisely the state a
+    human has to adjudicate).
     """
     if report['dry_run']:
         return 0
@@ -603,7 +669,11 @@ def resolve_exit_code(report: dict) -> int:
     if report.get('truncated'):
         return 1
     for record in report.get('records', []):
-        if record.get('content_lost_in_flight') or record.get('skipped_not_mem0_routed'):
+        if (
+            record.get('content_lost_in_flight')
+            or record.get('skipped_not_mem0_routed')
+            or record.get('record_error')
+        ):
             return 1
     return 0
 
@@ -673,6 +743,12 @@ def main() -> int:
         import os  # noqa: PLC0415
         os.environ['CONFIG_PATH'] = str(args.config)
 
+    # Owned HERE, not inside run(), so the report survives an abort. For any
+    # record already flagged content_lost_in_flight, the printed report is the
+    # ONLY surviving copy of the original text -- discarding it on the way out
+    # would turn a recoverable half-repair into permanent, silent data loss.
+    progress = new_progress()
+
     async def _run_live() -> dict:
         from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
         from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
@@ -681,18 +757,29 @@ def main() -> int:
         memory = MemoryService(config)
         try:
             await memory.initialize()
-            return await run(args, memory)
+            return await run(args, memory, progress)
         finally:
             if hasattr(memory, 'close'):
                 await memory.close()
 
+    exit_code = 0
     try:
         report = asyncio.run(_run_live())
     except Exception:
-        logger.exception('sweep_toolcall_xml_leak: fatal error during sweep')
-        return 2
+        report = report_from_progress(args, progress)
+        report['aborted'] = True
+        logger.exception(
+            'sweep_toolcall_xml_leak: fatal error during sweep -- emitting the '
+            'PARTIAL report for the %d record(s) already processed. Any record '
+            'flagged content_lost_in_flight has its original text here and '
+            'NOWHERE else; restore it from this output before re-running.',
+            len(report['records']),
+        )
+        exit_code = 2
 
     print(json.dumps(report, indent=2, default=str))
+    if exit_code:
+        return exit_code
     if not args.apply:
         logger.info('Dry run -- nothing was modified. Use --apply to commit the repairs.')
     return resolve_exit_code(report)

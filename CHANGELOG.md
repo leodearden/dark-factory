@@ -59,12 +59,22 @@ a repaired record would silently vanish from `get_memories_by_metadata` /
 **The sweep verifies the re-add persisted** rather than trusting a non-raising
 `add_memory`: the service swallows a Mem0 write failure into
 `AddMemoryResponse.message` as `[mem0_error: ...]` and returns normally, so a
-returned response is not evidence of a write. Two per-record outcomes exit
+returned response is not evidence of a write. Three per-record outcomes exit
 non-zero and need a human — `content_lost_in_flight` (the delete landed, the
 re-add did not persist; the original text now exists only in the printed report,
-restore it from there before re-running) and `skipped_not_mem0_routed` (a
+restore it from there before re-running), `skipped_not_mem0_routed` (a
 repairable record whose category does not route to mem0, left entirely untouched
-because neither a plain re-add nor `dual_write=True` is safe).
+because neither a plain re-add nor `dual_write=True` is safe), and
+`record_error` (that record's repair aborted on an unexpected error, so whether
+its delete landed is unknown).
+
+**The report always survives an abort**, since for a `content_lost_in_flight`
+record it is the only remaining copy of the original text. Each record enters
+the report *before* any store mutation is attempted and its repair runs under
+its own `try`, so one record's transport failure is recorded as `record_error`
+on that record and the sweep continues instead of unwinding and discarding every
+earlier entry. If anything escapes anyway, the CLI prints the **partial** report
+— same shape, plus `"aborted": true` — before exiting `2`.
 
 **Full root cause, evidence, and operator runbook:**
 [`docs/mcp-toolcall-xml-leak.md`](docs/mcp-toolcall-xml-leak.md). Run the sweep

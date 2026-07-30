@@ -38,6 +38,7 @@ escaped.
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import types
 from pathlib import Path
@@ -556,6 +557,140 @@ class TestRunApply:
 
         assert report['truncated'] is True
         assert _mod.resolve_exit_code(report) != 0
+
+
+class TestReportSurvivesAnAbort:
+    """The report is the sweep's central safety promise, so it must OUTLIVE any
+    failure.
+
+    For a record flagged ``content_lost_in_flight`` the point is already
+    deleted, so the printed report holds the only surviving copy of the original
+    text. A later record's transport error must therefore never take that report
+    down with it — the runbook's "restore it from there" instruction would
+    otherwise be pointing at output that was never emitted.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_later_delete_failure_still_yields_an_earlier_records_lost_content(self):
+        """The exact scenario the reviewer named: record 'b' loses its content
+        in flight, then record 'c' blows up in ``delete_memory``. 'b's original
+        text must still be in the returned report."""
+        service = _service([_match('b', _TAIL_LEAK), _match('c', _DUPLICATE_LEAK)])
+        service.add_memory = AsyncMock(side_effect=RuntimeError('embedding backend down'))
+        service.delete_memory = AsyncMock(
+            side_effect=[{'deleted': True}, TimeoutError('qdrant delete timed out')]
+        )
+
+        report = await _mod.run(_args(apply=True), service)
+
+        lost = _record_for(report, 'b')
+        assert lost['content_lost_in_flight'] is True
+        assert lost['content'] == _TAIL_LEAK
+        assert lost['repaired_content'] == _BODY
+
+        failed = _record_for(report, 'c')
+        assert failed['record_error'] is True
+        assert failed['repaired'] is False
+        assert 'qdrant delete timed out' in failed['error']
+        assert failed['content'] == _DUPLICATE_LEAK
+
+        assert _mod.resolve_exit_code(report) != 0
+
+    @pytest.mark.asyncio
+    async def test_one_bad_record_does_not_stop_later_records_being_repaired(self):
+        """Continue-on-error, not abort-on-error: a single transport blip must
+        not silently shrink the sweep's coverage."""
+        service = _service([_match('b', _TAIL_LEAK), _match('c', _DUPLICATE_LEAK)])
+        service.delete_memory = AsyncMock(
+            side_effect=[TimeoutError('transient'), {'deleted': True}]
+        )
+
+        report = await _mod.run(_args(apply=True), service)
+
+        assert _record_for(report, 'b')['record_error'] is True
+        assert _record_for(report, 'c')['repaired'] is True
+        assert report['repaired'] == 1
+
+    @pytest.mark.asyncio
+    async def test_progress_is_caller_owned_so_records_survive_an_escaping_error(self):
+        """Belt to the per-record braces: even if something escapes ``run``
+        entirely, the caller's container still holds every record processed so
+        far."""
+        progress = _mod.new_progress()
+        service = _service([_match('b', _TAIL_LEAK), _match('c', _DUPLICATE_LEAK)])
+        service.add_memory = AsyncMock(side_effect=RuntimeError('embedding backend down'))
+        # Not an Exception subclass — models a genuinely escaping abort.
+        service.delete_memory = AsyncMock(
+            side_effect=[{'deleted': True}, KeyboardInterrupt()]
+        )
+
+        with pytest.raises(KeyboardInterrupt):
+            await _mod.run(_args(apply=True), service, progress)
+
+        report = _mod.report_from_progress(_args(apply=True), progress)
+        lost = _record_for(report, 'b')
+        assert lost['content_lost_in_flight'] is True
+        assert lost['content'] == _TAIL_LEAK
+        assert _mod.resolve_exit_code(report) != 0
+
+
+class TestMainEmitsThePartialReport:
+    """``main()`` must print whatever the sweep accumulated before it died."""
+
+    def _run_main(self, monkeypatch, capsys, *, side_effect):
+        """Drive ``main()`` to an abort without touching a live backend.
+
+        ``main`` owns the progress container, so the test reaches it by pinning
+        ``new_progress``; ``asyncio.run`` is replaced so ``_run_live``'s
+        coroutine (which would construct a real MemoryService) never executes.
+        """
+        monkeypatch.setattr(sys, 'argv', ['sweep_toolcall_xml_leak.py', '--apply'])
+        progress = _mod.new_progress()
+        monkeypatch.setattr(_mod, 'new_progress', lambda: progress)
+
+        def _abort(coro):
+            coro.close()  # never construct the live MemoryService
+            progress['collection'] = 'mem0_dark_factory'
+            progress['scanned'] = 7
+            progress['records'].append({
+                'id': 'b',
+                'classification': 'repairable_tail',
+                'repaired': False,
+                'content': _TAIL_LEAK,
+                'repaired_content': _BODY,
+                'content_lost_in_flight': True,
+                'error': 'embedding backend down',
+            })
+            raise side_effect
+
+        monkeypatch.setattr(_mod.asyncio, 'run', _abort)
+        code = _mod.main()
+        return code, capsys.readouterr().out
+
+    def test_a_fatal_error_still_prints_the_lost_content(self, monkeypatch, capsys):
+        code, out = self._run_main(
+            monkeypatch, capsys, side_effect=RuntimeError('qdrant went away')
+        )
+
+        assert code == 2
+        report = json.loads(out)
+        assert report['aborted'] is True
+        record = report['records'][0]
+        assert record['content_lost_in_flight'] is True
+        assert record['content'] == _TAIL_LEAK
+        assert record['repaired_content'] == _BODY
+
+    def test_the_partial_report_uses_the_same_shape_as_a_complete_one(
+        self, monkeypatch, capsys
+    ):
+        """No second, lossier emergency format that could drift out of step."""
+        _, out = self._run_main(monkeypatch, capsys, side_effect=TimeoutError('scan'))
+
+        report = json.loads(out)
+        for key in ('project_id', 'collection', 'dry_run', 'exhaustive',
+                    'scanned', 'truncated', 'limit', 'counts', 'repaired', 'records'):
+            assert key in report
+        assert report['counts']['repairable_tail'] == 1
 
 
 class TestReaddPersistedPredicate:
