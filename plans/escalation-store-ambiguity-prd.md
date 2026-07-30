@@ -423,7 +423,12 @@ No waivers required.
 - Namespacing task ids across projects — the real cure for flavor 4, but a
   far larger change; the guard plus the description mitigate it.
 - Retiring `skills/recon-escalation-watcher/SKILL.md:295-297` once γ3 makes it
-  obsolete — a docs follow-up, not load-bearing.
+  obsolete — a docs follow-up, not load-bearing. **Owned by task 3266**, which
+  depends on γ3 and also carries the positive half (point the reader at the
+  rendered `THIS ENDPOINT SERVES` block rather than deleting the warning and
+  leaving nothing). Measured 2026-07-30: this is the *only* such bullet across
+  the five escalation-consuming skills — 3266 pins the two look-alikes that
+  must NOT be swept with it.
 - Adjudicating pump-web-ui `esc-18-1` or the reify gate tasks. They belong to
   other owners; this PRD only removes the mechanism that produced them.
 
