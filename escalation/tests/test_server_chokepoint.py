@@ -3636,25 +3636,24 @@ class TestMergeRequestDuplicateInVerify:
 
 @pytest.mark.asyncio
 class TestMergeRequestRetentionParity:
-    """RED until server.py:1549 threads retention= into
-    coalesce_or_enqueue_merge_request.
+    """The merge_request MCP path must populate the TerminalOutcomeRetention ring.
 
-    Today the merge_request tool's coalesce_or_enqueue_merge_request call
-    (server.py:1549) omits retention=, even though a harness-mounted
-    TerminalOutcomeRetention ring (harness._terminal_retention) is already
-    read on both merge_status's Tier-2 lookup (server.py:2215) and
-    merge_cancel's retire path (server.py:2555). Without the write side:
-      - enqueue_merge_request's _on_finalized callback never records a
-        TerminalOutcomeRecord for an MCP-dispatched merge;
-      - the coalesce arm never calls retention.record_alias for a coalesced
-        submission;
-      - merge_status's Tier-2 read therefore always misses for MCP-submitted
-        merges, falling through past Tier-3/3.5 to 'unknown'.
+    merge_request's coalesce_or_enqueue_merge_request call threads the
+    harness-mounted TerminalOutcomeRetention ring (harness._terminal_retention,
+    read via _get_terminal_retention) through to the dispatch and coalesce
+    arms, so:
+      - enqueue_merge_request's _on_finalized callback records a
+        TerminalOutcomeRecord for an MCP-dispatched merge once it finishes;
+      - the coalesce arm calls retention.record_alias for a coalesced
+        submission, so the coalesced request_id later resolves to the
+        primary's outcome;
+      - merge_status's Tier-2 read (_durable_terminal_state) can therefore
+        serve MCP-submitted merges even when every other tier misses.
 
-    All three tests below go GREEN from the same one-line fix (adding
-    retention=getattr(harness, '_terminal_retention', None) to the
-    server.py:1549 call) — there is no partial implementation that
-    satisfies one without the others.
+    All three tests below pin one invariant: there is no partial
+    implementation that satisfies one without the others, since a single
+    retention=... kwarg at the coalesce_or_enqueue_merge_request call site
+    is what makes all three true simultaneously.
     """
 
     async def test_dispatched_merge_records_terminal_outcome_in_ring(
@@ -3691,8 +3690,8 @@ class TestMergeRequestRetentionParity:
         assert rec is not None, (
             f'Expected the retention ring to hold a terminal record for '
             f'{rid!r} — the merge_request tool must thread retention=... '
-            'through to coalesce_or_enqueue_merge_request (server.py:1549) '
-            'so the enqueue_merge_request done-callback records it.'
+            'through to coalesce_or_enqueue_merge_request so the '
+            'enqueue_merge_request done-callback records it.'
         )
         assert rec.state == 'done', f'Expected state=done, got: {rec.state}'
         assert rec.merge_sha == 'ret-a-sha', (
@@ -3703,7 +3702,7 @@ class TestMergeRequestRetentionParity:
         self, tmp_path: Path,
     ) -> None:
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
-            TerminalOutcomeRecord,
+            MergeOutcome,
             TerminalOutcomeRetention,
         )
 
@@ -3762,9 +3761,10 @@ class TestMergeRequestRetentionParity:
 
         assert len(ring.alias_calls) == 1, (
             f'Expected exactly one record_alias call, got: {ring.alias_calls} — '
-            'the coalesce arm (merge_queue.py:4583) only calls '
+            'the coalesce arm in coalesce_or_enqueue_merge_request only calls '
             'retention.record_alias when retention is not None, which '
-            'requires server.py:1549 to pass retention=...'
+            "requires merge_request's coalesce_or_enqueue_merge_request call "
+            'to pass retention=...'
         )
         coalesced_id, alias_primary = ring.alias_calls[0]
         assert alias_primary == primary_rid, (
@@ -3772,18 +3772,27 @@ class TestMergeRequestRetentionParity:
             f'got: {alias_primary!r}'
         )
 
-        rec = TerminalOutcomeRecord(
-            request_id=primary_rid, task_id='ret-b', branch='ret-b', state='done',
-        )
-        ring.record(rec)
-        assert ring.get(coalesced_id) is rec, (
-            f'Expected the coalesced id {coalesced_id!r} to resolve (via '
-            'alias) to the primary record once recorded'
-        )
-
-        # Cleanup: only the first submission was ever enqueued.
+        # Resolve the PRIMARY's future for real, through the same production
+        # path as test_dispatched_merge_records_terminal_outcome_in_ring, so
+        # enqueue_merge_request's _on_finalized callback writes a genuine
+        # TerminalOutcomeRecord for primary_rid (only the first submission
+        # was ever enqueued — the coalesced one attached to it instead).
         req = mq.get_nowait()
-        req.result.cancel()
+        assert req.request_id == primary_rid
+        req.result.set_result(MergeOutcome('done', merge_sha='ret-b-sha'))
+        await asyncio.sleep(0)  # let the _on_finalized done-callback run
+
+        # The user-visible consequence: a caller polling merge_status with
+        # the COALESCED request_id (never itself enqueued) must resolve —
+        # via the record_alias entry asserted above — to the primary's real
+        # terminal outcome.
+        status = await asyncio.wait_for(
+            _call_merge_status(server, request_id=coalesced_id), timeout=2.0,
+        )
+        assert status.get('state') == 'done', (
+            f'Expected merge_status(request_id={coalesced_id!r}) to resolve '
+            f"'done' via the alias to primary {primary_rid!r}, got: {status}"
+        )
 
     async def test_merge_status_resolves_mcp_submitted_merge_from_retention_tier(
         self, tmp_path: Path,
