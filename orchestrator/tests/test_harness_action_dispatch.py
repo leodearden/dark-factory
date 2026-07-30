@@ -1170,3 +1170,61 @@ class TestRestartClearsMergeRetryPending:
         assert names.index('update_task') < names.index('set_task_status'), (
             f'stamp clear must precede the pending write; order was {names}'
         )
+
+    async def test_restart_without_stamp_makes_no_clearing_write(self, harness: Harness):
+        """No stamp → no metadata write at all (the common case stays free)."""
+        harness.scheduler.get_status = AsyncMock(return_value='blocked')
+        harness.scheduler.get_task = AsyncMock(
+            return_value={'id': 'task-1', 'metadata': {'sibling': 1}},
+        )
+        harness.is_workflow_active = MagicMock(return_value=False)
+
+        await harness._action_teardown_and_set_status('task-1', 'pending', 'restart')
+
+        harness.scheduler.update_task.assert_not_awaited()  # type: ignore[attr-defined]
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            'task-1', 'pending',
+        )
+
+    async def test_non_restart_teardown_preserves_stamp(self, harness: Harness):
+        """abandon must NOT clear the stamp — only restart re-plans from scratch.
+
+        park/abandon are not "run it again"; nothing about them invalidates a
+        merge-retry obligation, so the stamp is left for whoever picks the task
+        up next (matching how those actions already preserve gate stamps).
+        """
+        harness.scheduler.get_status = AsyncMock(return_value='blocked')
+        harness.scheduler.get_task = AsyncMock(
+            return_value={'id': 'task-1', 'metadata': dict(_MRP_METADATA)},
+        )
+        harness.is_workflow_active = MagicMock(return_value=False)
+
+        await harness._action_teardown_and_set_status('task-1', 'cancelled', 'abandon')
+
+        assert _replace_metadata_calls(harness.scheduler.update_task) == [], (  # type: ignore[arg-type]
+            'abandon must make no stamp-clearing write'
+        )
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            'task-1', 'cancelled',
+        )
+
+    async def test_clear_failure_does_not_block_the_restart(self, harness: Harness):
+        """A metadata write failure must not swallow the restart itself.
+
+        The clear is best-effort: it runs before the status write, so an
+        unguarded raise here would abort the teardown and leave the task stuck
+        in its pre-restart status with the kill sequence never run — strictly
+        worse than a surviving stamp.
+        """
+        harness.scheduler.get_status = AsyncMock(return_value='blocked')
+        harness.scheduler.get_task = AsyncMock(
+            return_value={'id': 'task-1', 'metadata': dict(_MRP_METADATA)},
+        )
+        harness.scheduler.update_task = AsyncMock(side_effect=RuntimeError('mcp down'))
+        harness.is_workflow_active = MagicMock(return_value=False)
+
+        await harness._action_teardown_and_set_status('task-1', 'pending', 'restart')
+
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            'task-1', 'pending',
+        )
