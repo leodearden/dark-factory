@@ -68,6 +68,25 @@ _lane_state_scalar() {
     return 0
 }
 
+# _lane_state_record <state-dir> <lane>
+# THE ONLY site that composes a state-record path. Prints
+# <state-dir>/<lane>.json when that record exists and is readable, and NOTHING
+# otherwise — so every caller's access is guarded by construction, and the
+# non-creating guarantee has exactly ONE place it could be broken rather than
+# one per caller. Purely existence/readability tests: no `>`-open, no touch, no
+# mkdir, on either the directory or the record. That matters more here than it
+# did in warm-lane-audit.sh, because a reclaim sweep is about to read through
+# this lib and a read that MINTED an empty record would manufacture the very
+# artifact the sweep consults to decide whether a lane is free.
+_lane_state_record() {
+    local state_dir="$1" lane="$2"
+    [ -n "$state_dir" ] && [ -d "$state_dir" ] || return 0
+    local record="$state_dir/$lane.json"
+    [ -f "$record" ] && [ -r "$record" ] || return 0
+    printf '%s' "$record"
+    return 0
+}
+
 # lane_state_read <lane-dir|lane-name> [<state-dir>]
 #
 # Resolves EVERYTHING a caller needs about <lane>'s assignment from a SINGLE
@@ -90,7 +109,31 @@ _lane_state_scalar() {
 # ONE record. The orchestrator rewrites these records on every acquire and
 # release, so a second read is a DIFFERENT INSTANT and can report a pair of
 # values that never coexisted.
+#
+# FAILS OPEN to 'unknown', always — callers include a systemd-timer audit and
+# the disk-pressure paths, which must never abort on one bad lane. The two
+# causes are kept DISTINCT because they send an operator to two different
+# places:
+#   no-readable-record   no state dir, or no readable <lane>.json there. The
+#                        only cause that is a filesystem/permissions question,
+#                        and the ordinary reading for every recordless _iact-*
+#                        and manual operator worktree (which leaf γ routes to
+#                        the /proc liveness fallback).
+#   unparseable-record   the record IS present and readable, but no `state`
+#                        string could be read out of it — a corrupt, truncated,
+#                        or reshaped write.
+# A third cause, `unrecognized-state:<raw>`, is NOT set here: it is derived by
+# the caller from lane_state_class returning UNKNOWN for a non-empty raw, so
+# there is no second copy of the recognized-state table to drift out of sync.
 lane_state_read() {
+    # Reset FIRST: every lane's triple is resolved from scratch, so a lane whose
+    # record cannot be read can never inherit its predecessor's values. Without
+    # this the audit's `pin` column would report "lane X is held by task N" —
+    # a claim about a lane that X's record never made.
+    LANE_STATE_RAW='unknown'
+    LANE_STATE_TASK_ID=''
+    LANE_STATE_CAUSE=''
+
     local raw_arg="${1:-}" explicit_dir="${2:-}"
 
     # dirname/basename by pure parameter expansion — no fork, because this is
@@ -105,14 +148,26 @@ lane_state_read() {
     local state_dir="$explicit_dir"
     [ -n "$state_dir" ] || state_dir="$parent/.lane-state"
 
-    local record="$state_dir/$lane.json"
-    local text=''
-    text="$(tr -d '\n' 2>/dev/null < "$record")" || text=''
+    local record text
+    record="$(_lane_state_record "$state_dir" "$lane")"
+    # `2>/dev/null` precedes the input redirection deliberately: bash applies
+    # redirections left to right, so the stderr redirect must already be in
+    # place to suppress the shell's own "No such file or directory" for a
+    # record that vanished between the guard and this read.
+    if [ -z "$record" ] || ! text="$(tr -d '\n' 2>/dev/null < "$record")"; then
+        LANE_STATE_CAUSE='no-readable-record'
+        printf '%s\n' "$LANE_STATE_RAW"
+        return 0
+    fi
 
     LANE_STATE_TASK_ID="$(_lane_state_scalar "$text" task_id)"
     local raw
     raw="$(_lane_state_scalar "$text" state)"
-    LANE_STATE_RAW="${raw:-unknown}"
+    if [ -n "$raw" ]; then
+        LANE_STATE_RAW="$raw"
+    else
+        LANE_STATE_CAUSE='unparseable-record'
+    fi
 
     if [ -n "$LANE_STATE_TASK_ID" ]; then
         printf '%s %s\n' "$LANE_STATE_RAW" "$LANE_STATE_TASK_ID"
