@@ -874,3 +874,171 @@ class TestVerdicts:
         assert str(root / 'eval-a' / 'verdicts-current.json') in issue['detail']
         # Named, not read.
         assert all(row['verdict'] is None for row in payload['evals'][0]['metrics'])
+
+
+# ---------------------------------------------------------------------------
+# step-11 — the escalation join, on the whole fingerprint string
+# ---------------------------------------------------------------------------
+
+_JOIN_RUN = '20260705T031500Z'
+
+# Flat hex, no delimiters: a reader that tried to derive an eval_id or
+# metric_id by SPLITTING the fingerprint would find nothing to split on.  The
+# join is `==` over the whole opaque string — the fingerprint is the producer's
+# private construction and the dashboard never parses its substructure.
+_FP_ALARMED_OPEN = 'a1b2c3d4e5f60718293a4b5c6d7e8f90'
+_FP_RECOVERED_OPEN = '0f9e8d7c6b5a49382716f5e4d3c2b1a0'
+_FP_ALARMED_UNLINKED = 'ffeeddccbbaa99887766554433221100'
+_FP_CLEAR = '00112233445566778899aabbccddeeff'
+_FP_WRONG_CATEGORY = 'deadbeefdeadbeefdeadbeefdeadbeef'
+_FP_UNMATCHED = 'cafebabecafebabecafebabecafebabe'
+
+# The escalation projection carried onto a metric row (and into
+# `unmatched_escalations`).  `created_at` is sourced from the queue record's
+# `timestamp` — that is the field `escalation.models.Escalation` serialises.
+_ESCALATION_KEYS = {'id', 'summary', 'severity', 'level', 'created_at', 'dedupe_fingerprint'}
+
+_JOIN_ESC_TIMESTAMP = '2026-07-30T03:15:00+00:00'
+
+
+def _join_tree(tmp_path: Path) -> tuple[Path, Path]:
+    """One eval whose five metrics span every parity state alpha owns."""
+    root = tmp_path / 'memory-evals'
+    esc_dir = tmp_path / 'escalations'
+    esc_dir.mkdir(parents=True, exist_ok=True)
+
+    _write_metrics(root, 'eval-a', _JOIN_RUN, [
+        _metric(name, 'count', 3.0, direction='higher_is_worse')
+        for name in (
+            'alarmed-open',
+            'recovered-open',
+            'alarmed-unlinked',
+            'clear-metric',
+            'wrong-category',
+            'unjudged-metric',
+        )
+    ])
+    _write_limits(root, 'eval-a', run_stamp=_JOIN_RUN)
+    _write_verdicts(root, [
+        _verdict('eval-a', 'alarmed-open', 'alarm', fingerprint=_FP_ALARMED_OPEN, run_stamp=_JOIN_RUN),
+        _verdict('eval-a', 'recovered-open', 'no_alarm', fingerprint=_FP_RECOVERED_OPEN, run_stamp=_JOIN_RUN),
+        _verdict('eval-a', 'alarmed-unlinked', 'alarm', fingerprint=_FP_ALARMED_UNLINKED, run_stamp=_JOIN_RUN),
+        _verdict('eval-a', 'clear-metric', 'no_alarm', fingerprint=_FP_CLEAR, run_stamp=_JOIN_RUN),
+        _verdict('eval-a', 'wrong-category', 'alarm', fingerprint=_FP_WRONG_CATEGORY, run_stamp=_JOIN_RUN),
+    ], run_stamp=_JOIN_RUN)
+
+    _write_escalation(
+        esc_dir, 'esc-alarmed-open',
+        dedupe_fingerprint=_FP_ALARMED_OPEN,
+        summary='canonical-in-top-5 regressed', severity='blocking', level=1,
+        timestamp=_JOIN_ESC_TIMESTAMP,
+    )
+    _write_escalation(
+        esc_dir, 'esc-recovered-open',
+        dedupe_fingerprint=_FP_RECOVERED_OPEN,
+        summary='dangling-pointers regressed', severity='blocking', level=0,
+        timestamp=_JOIN_ESC_TIMESTAMP,
+    )
+    # Same fingerprint value, different category — must NOT be joined.
+    _write_escalation(
+        esc_dir, 'esc-wrong-category',
+        category='schema_drift', dedupe_fingerprint=_FP_WRONG_CATEGORY,
+        timestamp=_JOIN_ESC_TIMESTAMP,
+    )
+    # An open eval_regression escalation no verdict claims — the reverse
+    # direction of the parity question.
+    _write_escalation(
+        esc_dir, 'esc-unmatched',
+        dedupe_fingerprint=_FP_UNMATCHED,
+        summary='an eval_regression nothing on disk explains',
+        timestamp=_JOIN_ESC_TIMESTAMP,
+    )
+    return root, esc_dir
+
+
+class TestEscalationJoin:
+    """Verdict/escalation parity, joined on the whole fingerprint string.
+
+    Alpha owns the two states it can produce from a single artifact tree:
+    alarmed+open and recovered+open.  The storm case and the full both-
+    directions matrix are gamma's gate and are deliberately not duplicated
+    here.
+    """
+
+    def test_alarmed_and_open_links_the_escalation(self, tmp_path: Path) -> None:
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _join_tree(tmp_path)
+
+        row = _only(build_memory_evals(root, esc_dir)['evals'][0]['metrics'], 'alarmed-open')
+
+        assert row['parity'] == 'alarmed_open'
+        assert set(row['escalation']) == _ESCALATION_KEYS
+        assert row['escalation']['id'] == 'esc-alarmed-open'
+        assert row['escalation']['summary'] == 'canonical-in-top-5 regressed'
+        assert row['escalation']['severity'] == 'blocking'
+        assert row['escalation']['level'] == 1
+        assert row['escalation']['created_at'] == _JOIN_ESC_TIMESTAMP
+        assert row['escalation']['dedupe_fingerprint'] == _FP_ALARMED_OPEN
+
+    def test_recovered_but_still_open_keeps_the_link(self, tmp_path: Path) -> None:
+        """The join is on fingerprint, never gated on the verdict.
+
+        A metric that has recovered while its escalation is still open is a
+        real, transient state — the watcher has not closed it yet.  Dropping
+        the link would make the escalation look orphaned in exactly the window
+        an operator is most likely to be looking at it.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _join_tree(tmp_path)
+
+        row = _only(build_memory_evals(root, esc_dir)['evals'][0]['metrics'], 'recovered-open')
+
+        assert row['verdict'] == 'no_alarm'
+        assert row['parity'] == 'recovered_open'
+        assert row['escalation']['id'] == 'esc-recovered-open'
+
+    def test_alarm_with_no_escalation_is_flagged_unlinked(self, tmp_path: Path) -> None:
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _join_tree(tmp_path)
+
+        row = _only(build_memory_evals(root, esc_dir)['evals'][0]['metrics'], 'alarmed-unlinked')
+
+        assert row['escalation'] is None
+        assert row['parity'] == 'alarmed_unlinked'
+
+    def test_quiet_metrics_are_clear(self, tmp_path: Path) -> None:
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _join_tree(tmp_path)
+        rows = build_memory_evals(root, esc_dir)['evals'][0]['metrics']
+
+        assert _only(rows, 'clear-metric')['parity'] == 'clear'
+        assert _only(rows, 'clear-metric')['escalation'] is None
+        # No verdict at all is also not an alarm.
+        assert _only(rows, 'unjudged-metric')['parity'] == 'clear'
+
+    def test_matching_fingerprint_in_another_category_is_not_joined(self, tmp_path: Path) -> None:
+        """Only ``eval_regression`` escalations participate in this join."""
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _join_tree(tmp_path)
+
+        row = _only(build_memory_evals(root, esc_dir)['evals'][0]['metrics'], 'wrong-category')
+
+        assert row['escalation'] is None
+        assert row['parity'] == 'alarmed_unlinked'
+
+    def test_escalation_claimed_by_no_verdict_is_surfaced(self, tmp_path: Path) -> None:
+        """The reverse direction: every open eval_regression must be explained."""
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _join_tree(tmp_path)
+
+        unmatched = build_memory_evals(root, esc_dir)['unmatched_escalations']
+
+        assert [entry['id'] for entry in unmatched] == ['esc-unmatched']
+        assert set(unmatched[0]) == _ESCALATION_KEYS
+        assert unmatched[0]['dedupe_fingerprint'] == _FP_UNMATCHED
