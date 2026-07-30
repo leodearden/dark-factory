@@ -120,6 +120,29 @@ def test_parse_verdict_unparseable_response_is_loud_not_fabricated(mock_journal)
     assert 'Judge response could not be parsed' in verdict.findings[0].get('issue', '')
 
 
+def test_parse_verdict_accepts_structured_payload_dict(mock_journal):
+    """_parse_verdict accepts an already-structured payload dict and skips text parsing.
+
+    The claude_cli provider now hands _parse_verdict the validated
+    ``structured_output`` payload instead of prose, so the fence-stripping +
+    json.loads text path must not be involved.  Proven by the ``findings`` value:
+    a list-of-dicts survives verbatim, which no text-parsing route could produce
+    from a dict input (it would raise AttributeError on ``.strip()``).  The
+    ``summary`` key is dropped on construction, exactly as on the text path.
+    """
+    judge = Judge(config=_make_judge_config(), journal=mock_journal)
+
+    verdict = judge._parse_verdict(
+        {'severity': 'moderate', 'findings': [{'issue': 'y'}], 'summary': 'ignored'},
+        'run-x',
+    )
+
+    assert verdict.severity == VerdictSeverity.moderate
+    assert verdict.findings == [{'issue': 'y'}]
+    assert verdict.action_taken == VerdictAction.none
+    assert verdict.run_id == 'run-x'
+
+
 @pytest.mark.parametrize('empty_text', ['', '   ', '\n\t '])
 def test_parse_verdict_empty_response_stays_benign_not_serious(mock_journal, empty_text):
     """Empty (or whitespace-only) judge output must NOT be treated as a loud
@@ -1018,7 +1041,8 @@ async def test_call_judge_cli_delegates_to_invoke_with_cap_retry(mock_journal):
     else:
         assert call_positional[0] is fake_gate
 
-    assert result == '{"severity": "ok", "findings": []}'
+    # The verdict comes from the structured payload, not the text channel.
+    assert result == {'severity': 'ok', 'findings': []}
 
 
 @pytest.mark.asyncio
@@ -1103,6 +1127,69 @@ def test_judge_verdict_schema_shape():
     # ...and the enum is exactly the four documented members today.
     assert {s.value for s in VerdictSeverity} == {'ok', 'minor', 'moderate', 'serious'}
     assert properties['findings']['type'] == 'array'
+
+
+@pytest.mark.asyncio
+async def test_call_judge_cli_returns_structured_payload_ignoring_prose(mock_journal):
+    """The verdict is read from structured_output — model prose is NOT the verdict.
+
+    ``output`` here is the literal 2026-07-25 transcript shape: conversational
+    prose with an italic stage-direction, produced after a cap-retry resume
+    dropped the system prompt.  Parsing THAT as the verdict is what fabricated a
+    ``severity=serious`` halt for a run nobody had reviewed.  The payload wins.
+    """
+    from unittest.mock import AsyncMock
+
+    from shared.cli_invoke import AgentResult
+
+    config = _make_judge_config(
+        judge_llm_provider='claude_cli',
+        judge_llm_model='claude-sonnet-4-5',
+    )
+    judge = Judge(config=config, journal=mock_journal, usage_gate=make_gate_mock())
+
+    payload = {'severity': 'moderate', 'findings': [{'issue': 'x', 'severity': 'moderate'}]}
+    result = AgentResult(
+        success=True,
+        output="I'll check the repo for context...\n\n*Searches project files*",
+        structured_output=payload,
+    )
+
+    with patch(
+        'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+        new=AsyncMock(return_value=result),
+    ):
+        assert await judge._call_judge_cli('p') == payload
+
+
+@pytest.mark.asyncio
+async def test_call_judge_cli_json_string_structured_output_is_loaded(mock_journal):
+    """A structured_output delivered as a JSON *string* is json.loads-ed to a dict.
+
+    Parity with agent_loop.py:388-392, the sibling that already consumes
+    ``structured_output`` from this same shared path.
+    """
+    from unittest.mock import AsyncMock
+
+    from shared.cli_invoke import AgentResult
+
+    config = _make_judge_config(
+        judge_llm_provider='claude_cli',
+        judge_llm_model='claude-sonnet-4-5',
+    )
+    judge = Judge(config=config, journal=mock_journal, usage_gate=make_gate_mock())
+
+    result = AgentResult(
+        success=True,
+        output='',
+        structured_output='{"severity": "ok", "findings": []}',
+    )
+
+    with patch(
+        'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+        new=AsyncMock(return_value=result),
+    ):
+        assert await judge._call_judge_cli('p') == {'severity': 'ok', 'findings': []}
 
 
 @pytest.mark.asyncio
@@ -1356,17 +1443,27 @@ class TestCallJudgeCliTaxonomy:
             assert await judge._call_judge_cli('prompt') == ''
 
     @pytest.mark.asyncio
-    async def test_success_returns_stripped_output(self):
-        """(d) A successful run returns result.output.strip()."""
+    async def test_success_returns_structured_payload(self):
+        """(d) A successful run returns the validated structured_output payload.
+
+        Replaces the retired ``result.output.strip()`` contract: the model's text
+        channel is no longer the verdict.  A success carrying NO usable payload is
+        a distinct case (infra, not content) — see
+        TestCallJudgeCliStructuredOutputTaxonomy.
+        """
         from shared.cli_invoke import AgentResult
 
         judge = self._judge()
-        result = AgentResult(success=True, output='  {"severity": "ok"}  \n')
+        result = AgentResult(
+            success=True,
+            output='  prose the CLI happened to print  \n',
+            structured_output={'severity': 'ok', 'findings': []},
+        )
         with patch(
             'fused_memory.reconciliation.judge.invoke_with_cap_retry',
             new=AsyncMock(return_value=result),
         ):
-            assert await judge._call_judge_cli('prompt') == '{"severity": "ok"}'
+            assert await judge._call_judge_cli('prompt') == {'severity': 'ok', 'findings': []}
 
     @pytest.mark.asyncio
     async def test_all_accounts_capped_raises_judge_infra_error(self):
