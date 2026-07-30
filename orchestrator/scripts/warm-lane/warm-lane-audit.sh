@@ -144,6 +144,25 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/lib_portable.sh
 source "$SCRIPT_DIR/lib_portable.sh"
 
+# dark-factory's lane-state reader (lane_state_read + lane_state_class), the
+# one definition of the record parse and of the raw-state -> column table this
+# script's `assigned` column reports. Fail LOUDLY if it is missing.
+#
+# Exit 2 (usage/WIRING), not a degrade-to-UNKNOWN, and not 1 (runtime): this
+# script's "never abort" rule is about lane-level DATA problems -- an unreadable
+# or corrupt record must degrade that lane to UNKNOWN and never kill the run --
+# not about deployment wiring. Nothing about the invocation could have avoided
+# an absent sibling and no retry fixes it, which is exactly the class
+# warm-lane-gc.sh already exits 2 for on a missing lib_live_refs.sh. Degrading
+# instead would silently report EVERY lane as UNKNOWN, indistinguishable from a
+# real pool-wide state-dir outage -- a triage trap.
+if [ ! -f "$SCRIPT_DIR/lib_lane_state.sh" ]; then
+    echo "warm-lane-audit.sh: ERROR — scripts/lib_lane_state.sh not found next to warm-lane-audit.sh" >&2
+    exit 2
+fi
+# shellcheck source=scripts/lib_lane_state.sh
+source "$SCRIPT_DIR/lib_lane_state.sh"
+
 # ── log helpers (all write to stderr) ─────────────────────────────────────────
 info()  { printf '\033[1;34m[info]\033[0m  %s\n' "$*" >&2; }
 ok()    { printf '\033[1;32m[ok]\033[0m    %s\n' "$*" >&2; }
@@ -341,68 +360,6 @@ _probe_live() {
 }
 
 # ── assignment state: read the orchestrator's own durable record (A5) ─────────
-# _record_text <file>
-# Slurps <file> with its newlines stripped, so indent=2 and compact records
-# parse identically downstream. Returns NON-ZERO (printing nothing) when the
-# file cannot be read at all -- the `no-readable-record` cause.
-#
-# The bytes are read ONCE and every scalar is then extracted from that in-memory
-# snapshot, never by re-opening the file: see _read_lane_assignment for why a
-# second read of these records is not merely wasteful but able to report a pair
-# of values that never coexisted.
-#
-# `2>/dev/null` precedes the input redirection deliberately: bash applies
-# redirections left to right, so the stderr redirect must already be in place to
-# suppress the shell's own "No such file or directory" for a record that
-# vanished after the guard.
-_record_text() {
-    local file="$1"
-    local text
-    text="$(tr -d '\n' 2>/dev/null < "$file")" || return 1
-    printf '%s' "$text"
-    return 0
-}
-
-# _record_scalar <record-text> <key>
-# Prints the value of a flat top-level STRING scalar in an already-slurped
-# record, or nothing on any miss (absent key, or a non-string value such as
-# `null`).
-#
-# No jq/python3 dependency by design: this script has none today (it even
-# hand-rolls _json_escape), runs from a systemd timer and from the disk-pressure
-# paths, and is forbidden from ever aborting -- a hard jq requirement would be a
-# new environmental failure mode for an advisory-only tool. Only two flat
-# top-level string scalars are ever needed (`state`, `task_id`).
-#
-# Two properties the regex depends on: the BARE double quote before <key> is
-# what makes it safe against a value CONTAINING the key text (json escapes any
-# inner quote as \", so `"state"` can only be a real key); and the required
-# quotes make a `null` value yield empty -- the desired reading for an
-# unassigned task_id.
-_record_scalar() {
-    local text="$1" key="$2"
-    printf '%s' "$text" \
-        | sed -n -E "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"([^\"]*)\".*/\1/p" \
-        || true
-    return 0
-}
-
-# _lane_record <lane>
-# The ONLY site in this script that composes a state-record path. Prints
-# <STATE_DIR>/<lane>.json when that record exists and is readable, and NOTHING
-# otherwise -- so every caller's access is guarded by construction, and A1's
-# non-creating guarantee has exactly one place it could be broken rather than
-# one per caller. Purely existence/readability tests: no `>`-open, no touch, no
-# mkdir, on either the directory or the record.
-_lane_record() {
-    local lane="$1"
-    [ -n "$STATE_DIR" ] && [ -d "$STATE_DIR" ] || return 0
-    local record="$STATE_DIR/$lane.json"
-    [ -f "$record" ] && [ -r "$record" ] || return 0
-    printf '%s' "$record"
-    return 0
-}
-
 # _read_lane_assignment <lane>
 # Resolves EVERYTHING this script needs from <lane>'s assignment record --
 # <STATE_DIR>/<lane>.json, the pool's RESERVATION truth, wholly independent of
@@ -412,24 +369,30 @@ _lane_record() {
 #   LANE_UNKNOWN_CAUSE   why the state is UNKNOWN; EMPTY when it is not
 #   LANE_RECORD_TASK_ID  the record's task_id ('' when absent, null, or unread)
 #
+# A THIN ADAPTER over lib_lane_state.sh since dark-factory task 3074 (PRD
+# warm-lane-infra-repatriation-prd.md §8, "extract and unify"). What MOVED into
+# the lib is everything that was never really this script's to own: the record
+# parse (_record_text/_record_scalar/_lane_record), the non-creating guarantee,
+# the single-slurp discipline, and the raw-state -> column table. Those describe
+# dark-factory's OWN durable format -- the `state` values ARE its LaneState enum
+# (orchestrator/src/orchestrator/lane_lifecycle.py) -- and holding a private
+# copy of them in a project-agnostic script is the lockstep duplication this
+# extraction removes. The lib's enum-exhaustiveness test is now the drift gate.
+# What stayed HERE is only this script's published vocabulary, unchanged at the
+# caller boundary; every downstream consumer below is untouched.
+#
 # Globals, and one slurp, because the three values must describe ONE observation
 # of ONE record. The orchestrator rewrites these records on every acquire and
 # release, so a second read is a DIFFERENT INSTANT: re-deriving the cause would
 # let a record that was absent during the first read and valid during the second
 # report `assigned=UNKNOWN` paired with `unrecognized-state:<raw>` -- a cause the
 # runbook tells operators to read as dark-factory LaneState schema drift, aiming
-# triage at a schema problem that does not exist. Deriving all three from one
-# in-memory snapshot makes the triple self-consistent by construction.
+# triage at a schema problem that does not exist. lane_state_read publishes all
+# three of ITS values from one in-memory snapshot, and the three republished
+# below are derived from those alone, so the triple is still self-consistent by
+# construction.
 #
-# The raw-state -> column mapping in the `case` below is the normative table (it
-# lives in the code, not only in a comment). Raw values are dark-factory's
-# LaneState enum (orchestrator/src/orchestrator/lane_lifecycle.py):
-#   assigned, in_use              -> ASSIGNED     (reserved for a task)
-#   released, seed, registered    -> RELEASED     (in the pool, not reserved)
-#   quarantined                   -> QUARANTINED  (withheld from the pool)
-#   anything else / unresolvable  -> UNKNOWN      (A5)
-#
-# A5 folds three DISTINCT causes into that one UNKNOWN column value, and they
+# A5 folds three DISTINCT causes into the one UNKNOWN column value, and they
 # send an operator to three different places, so the stderr warning names which
 # one fired rather than asserting a single guess:
 #   no-readable-record        no state dir, or no readable <lane>.json there --
@@ -439,46 +402,43 @@ _lane_record() {
 #   unparseable-record        the record IS present and readable, but no `state`
 #                             string could be read out of it -- a corrupt,
 #                             truncated, or reshaped write.
-#   unrecognized-state:<raw>  the record parsed and named a state this mapping
+#   unrecognized-state:<raw>  the record parsed and named a state the mapping
 #                             does not know. Reported VERBATIM, because a mass
 #                             state_unknown spike carrying one repeated raw
 #                             value is the SCHEMA-DRIFT signal (a new
 #                             dark-factory LaneState member), and no other cause
 #                             looks like that.
-# Each cause is set on the arm of the single `case` that produced it, so there
-# is no second copy of the recognized-state table to drift out of sync.
-#
-# The read is strictly NON-CREATING, exactly as the <dir>.lock probe never
-# creates a lock (A1) -- guaranteed by _lane_record, which yields a path only
-# for a record that already exists and is readable.
+# The first two come from the lib (which is where the record is actually read,
+# so it is the only layer that can tell them apart). The third is derived HERE,
+# from lane_state_class returning UNKNOWN for a NON-EMPTY raw -- deliberately
+# not duplicated into the lib, so there is still exactly one copy of the
+# recognized-state table anywhere.
 LANE_ASSIGNED_STATE='UNKNOWN'
 LANE_UNKNOWN_CAUSE=''
 LANE_RECORD_TASK_ID=''
 _read_lane_assignment() {
-    # Reset first: every lane's triple is resolved from scratch, so a lane whose
-    # record cannot be read can never inherit its predecessor's values.
-    LANE_ASSIGNED_STATE='UNKNOWN'
-    LANE_UNKNOWN_CAUSE=''
-    LANE_RECORD_TASK_ID=''
-
-    local record text
-    record="$(_lane_record "$1")"
-    if [ -z "$record" ] || ! text="$(_record_text "$record")"; then
+    # Preserves _lane_record's `[ -n "$STATE_DIR" ]` guard. Unreachable today
+    # (an empty STATE_DIR implies an empty --mount, which skips the resident
+    # walk entirely), but kept explicit: without it an empty STATE_DIR would
+    # fall through to lane_state_read's derived default, which for the bare
+    # lane NAME passed here resolves CWD-relative to ./.lane-state.
+    if [ -z "$STATE_DIR" ]; then
+        LANE_ASSIGNED_STATE='UNKNOWN'
         LANE_UNKNOWN_CAUSE='no-readable-record'
+        LANE_RECORD_TASK_ID=''
         return 0
     fi
 
-    LANE_RECORD_TASK_ID="$(_record_scalar "$text" task_id)"
+    # ONE read. lane_state_read resets its own three globals at entry, so a lane
+    # whose record cannot be read never inherits its predecessor's values.
+    lane_state_read "$1" "$STATE_DIR" >/dev/null
 
-    local raw
-    raw="$(_record_scalar "$text" state)"
-    case "$raw" in
-        assigned|in_use)          LANE_ASSIGNED_STATE='ASSIGNED' ;;
-        released|seed|registered) LANE_ASSIGNED_STATE='RELEASED' ;;
-        quarantined)              LANE_ASSIGNED_STATE='QUARANTINED' ;;
-        '')                       LANE_UNKNOWN_CAUSE='unparseable-record' ;;
-        *)                        LANE_UNKNOWN_CAUSE="unrecognized-state:$raw" ;;
-    esac
+    LANE_RECORD_TASK_ID="$LANE_STATE_TASK_ID"
+    LANE_ASSIGNED_STATE="$(lane_state_class "$LANE_STATE_RAW")"
+    LANE_UNKNOWN_CAUSE=''
+    if [ "$LANE_ASSIGNED_STATE" = 'UNKNOWN' ]; then
+        LANE_UNKNOWN_CAUSE="${LANE_STATE_CAUSE:-unrecognized-state:$LANE_STATE_RAW}"
+    fi
     return 0
 }
 
