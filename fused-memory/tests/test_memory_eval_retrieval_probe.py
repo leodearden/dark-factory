@@ -3066,3 +3066,231 @@ class TestCorpusCountScopeIsDisclosed:
 
         assert 'corpus counts' in report.lower()
         assert 'mem0' in report.lower()
+
+
+# ---------------------------------------------------------------------------
+# step-25: a non-default --k must never be able to DELETE a pinned metric
+#
+# `--k` is advertised as a repeatable parameterisation, so `--k 7` is a legal
+# operator request. Today it is also a silent amputation: `probe_topic(ks=(7,))`
+# + `build_series(ks=(7,))` emits only canonical-in-top-7 / claim-recall /
+# contamination-share / superseded-above-successor. The flagship
+# `topic-canonical-present` tripwire and `canonical-in-top-5-held-out` are
+# simply GONE, and nothing anywhere in the artifact or the report says so —
+# `not_measured_topics()` also defaults to k=5, so with no k=5 observation to
+# read it returns [] no matter how badly the run went.
+#
+# Since leaf alpha's evaluator joins a run to its baseline window BY metric_id,
+# a missing metric does not fail loudly — it just stops being trended. That is
+# the "worse than a crash" shape this module's own docstring warns about.
+#
+# Still no thresholds: every assertion below is on which metric_ids are
+# present and on which depth an observation recorded.
+# ---------------------------------------------------------------------------
+
+class TestNormaliseKs:
+    """(a)-(c) The contract-pinned depth is folded in, the caller's order kept."""
+
+    def test_a_k_that_omits_the_tripwire_depth_gains_it(self):
+        m = _mod()
+
+        assert m.TRIPWIRE_K in m.normalise_ks((7,))
+
+    def test_the_callers_order_is_preserved_and_the_pin_appended(self):
+        """Requested depths first: the operator asked for 7, and got 7 AND 5."""
+        m = _mod()
+
+        assert m.normalise_ks((7,)) == (7, m.TRIPWIRE_K)
+        assert m.normalise_ks((20, 7)) == (20, 7, m.TRIPWIRE_K)
+
+    def test_an_already_pinned_k_is_returned_unchanged(self):
+        """The default path's metric vocabulary must not churn."""
+        m = _mod()
+
+        assert m.normalise_ks((5, 10)) == (5, 10)
+        assert m.normalise_ks(m.DEFAULT_KS) == m.DEFAULT_KS
+
+    def test_duplicates_collapse(self):
+        """A doubled --k would otherwise emit the same metric_id twice."""
+        m = _mod()
+
+        assert m.normalise_ks((7, 7, 5)) == (7, 5)
+
+    def test_an_empty_k_yields_the_pin_alone(self):
+        m = _mod()
+
+        assert m.normalise_ks(()) == (m.TRIPWIRE_K,)
+
+
+class TestNonDefaultKKeepsThePinnedMetrics:
+    """(d) The review's exact repro, pinned end to end as a regression test."""
+
+    def _run(self, tmp_path, ks, *, double=None, registry=None):
+        m = _mod()
+        registry = registry if registry is not None else _probe_registry()
+        double = double if double is not None else _ServiceDouble(
+            by_query=_canned_hits(registry),
+        )
+
+        import asyncio  # noqa: PLC0415
+
+        return double, asyncio.run(m.run_probe(
+            double, registry,
+            project_ids=('dark_factory',),
+            ks=ks,
+            out_root=tmp_path,
+            stamp='20260731T100000Z',
+        ))
+
+    def test_k_seven_still_emits_the_flagship_tripwire(self, tmp_path):
+        m = _mod()
+        _, outcome = self._run(tmp_path, (7,))
+
+        ids = [metric.metric_id for metric in outcome.series.metrics]
+        assert m.METRIC_TOPIC_CANONICAL_PRESENT in ids
+
+    def test_k_seven_still_emits_the_held_out_proportion(self, tmp_path):
+        """The Goodhart guard cannot be switched off by a CLI flag."""
+        m = _mod()
+        _, outcome = self._run(tmp_path, (7,))
+
+        ids = [metric.metric_id for metric in outcome.series.metrics]
+        assert m.METRIC_CANONICAL_IN_TOP_K_HELD_OUT.format(k=m.TRIPWIRE_K) in ids
+
+    def test_the_requested_depth_is_still_measured(self, tmp_path):
+        """Normalising ADDS the pin; it never drops what the operator asked for."""
+        m = _mod()
+        _, outcome = self._run(tmp_path, (7,))
+
+        ids = [metric.metric_id for metric in outcome.series.metrics]
+        assert m.METRIC_CANONICAL_IN_TOP_K.format(k=7) in ids
+        assert m.METRIC_CANONICAL_IN_TOP_K.format(k=m.TRIPWIRE_K) in ids
+
+    def test_the_pinned_metric_set_is_a_superset_on_every_run(self, tmp_path):
+        """Whatever --k is passed, alpha's join keys are all still there."""
+        m = _mod()
+        pinned = {
+            m.METRIC_TOPIC_CANONICAL_PRESENT,
+            m.METRIC_CANONICAL_IN_TOP_K.format(k=m.TRIPWIRE_K),
+            m.METRIC_CANONICAL_IN_TOP_K_HELD_OUT.format(k=m.TRIPWIRE_K),
+            m.METRIC_CLAIM_RECALL,
+            m.METRIC_CONTAMINATION_SHARE,
+            m.METRIC_SUPERSEDED_ABOVE_SUCCESSOR,
+        }
+        for ks in ((7,), (3,), (20, 7), (5, 10)):
+            _, outcome = self._run(tmp_path, ks)
+            ids = {metric.metric_id for metric in outcome.series.metrics}
+            assert pinned <= ids, f'--k {ks} amputated {sorted(pinned - ids)}'
+
+    def test_the_not_measured_disclosure_is_no_longer_vacuous(self, tmp_path):
+        """not_measured_topics() reads k=5 observations; with --k 7 there were
+        none, so a fully-degraded topic was reported as [] — silence that reads
+        exactly like a healthy run."""
+        m = _mod()
+        registry = _probe_registry()
+        healthy = _canned_hits(registry)
+        for phrasing in registry.entries[1].phrasings:
+            healthy[phrasing.text] = _degraded()
+
+        _, outcome = self._run(tmp_path, (7,), double=_ServiceDouble(by_query=healthy))
+
+        assert m.not_measured_topics(outcome.observations) == ['beta-topic']
+
+    def test_the_operators_actual_path_through_the_cli(self, monkeypatch, tmp_path):
+        """(e) --k 7 is a supported flag, so the fix has to hold through main()."""
+        from shared.memory_eval_metrics import load_metric_series  # noqa: PLC0415
+
+        m = _mod()
+        registry = _probe_registry()
+        registry_path = tmp_path / 'registry.json'
+        registry_path.write_text(json.dumps(_as_payload(registry)), encoding='utf-8')
+        _install_double(monkeypatch, _ServiceDouble(by_query=_canned_hits(registry)))
+        monkeypatch.setenv('MEMORY_EVAL_RUN_STAMP', '20260731T101500Z')
+
+        code = m.main([
+            '--registry', str(registry_path),
+            '--out-root', str(tmp_path / 'out'),
+            '--project-id', 'dark_factory',
+            '--k', '7',
+        ])
+
+        assert code == 0
+        series = load_metric_series(
+            tmp_path / 'out' / 'e1-retrieval-health' / 'metrics-20260731T101500Z.json',
+        )
+        ids = {metric.metric_id for metric in series.metrics}
+        assert m.METRIC_TOPIC_CANONICAL_PRESENT in ids
+        assert m.METRIC_CANONICAL_IN_TOP_K_HELD_OUT.format(k=m.TRIPWIRE_K) in ids
+        assert m.METRIC_CANONICAL_IN_TOP_K.format(k=7) in ids
+
+    def test_the_added_depth_is_disclosed_rather_than_inferred(self, tmp_path):
+        """Measuring a depth the operator did not ask for is a narrowing like
+        any other: it gets said out loud, not left to be reverse-engineered
+        from the metric list."""
+        _, outcome = self._run(tmp_path, (7,))
+
+        assert 'measurement depth' in outcome.report.lower()
+        assert 'requested 7' in outcome.report
+        assert 'measured 7, 5' in outcome.report
+
+    def test_the_disclosure_says_why_the_pin_was_added(self, tmp_path):
+        """A depth appearing unbidden is only legible if the reason is beside
+        it: both pinned metrics are DEFINED at k=5."""
+        m = _mod()
+        _, outcome = self._run(tmp_path, (7,))
+        section = outcome.report.lower().split('measurement depth', 1)[1]
+
+        assert m.METRIC_TOPIC_CANONICAL_PRESENT in section
+        assert m.METRIC_CANONICAL_IN_TOP_K_HELD_OUT.format(k=m.TRIPWIRE_K) in section
+
+    def test_the_default_run_discloses_no_added_depth(self, tmp_path):
+        """Nothing was added, so there is nothing to disclose — a section that
+        fired every run would train an operator to skip it."""
+        _, outcome = self._run(tmp_path, (5, 10))
+
+        assert 'measurement depth' not in outcome.report.lower()
+
+
+class TestObservationDepthIsHonest:
+    """(f) An observation never claims a depth deeper than what was fetched."""
+
+    def _observe(self, ks):
+        m = _mod()
+        entry = _probe_entry()
+        registry = m.TopicRegistry(schema_version=1, entries=(entry,))
+        observations = m.ProbeObservations()
+        search = _search_returning(
+            {}, default_factory=lambda: _healthy(_filler(10)),
+        )
+
+        import asyncio  # noqa: PLC0415
+
+        asyncio.run(m.probe_topic(search, entry, registry, ks, observations))
+        return observations
+
+    def test_a_shallow_direct_call_records_the_depth_it_fetched(self):
+        """probe_topic is public and called directly by this file's own tests;
+        with ks=(3,) it searched at limit=3 but stamped k=5 on every claim and
+        contamination observation — an artifact mislabelling its own depth."""
+        m = _mod()
+        observations = self._observe((3,))
+        expected = min(m.TRIPWIRE_K, 3)
+
+        assert {o.k for o in observations.contamination} == {expected}
+        assert {o.k for o in observations.claims} == {expected}
+
+    def test_a_deep_call_still_scores_at_the_pinned_depth(self):
+        """min(), not max(): contamination and claim recall are DEFINED at the
+        tripwire's depth, so a deeper fetch must not silently widen them."""
+        m = _mod()
+        observations = self._observe((10,))
+
+        assert {o.k for o in observations.contamination} == {m.TRIPWIRE_K}
+        assert {o.k for o in observations.claims} == {m.TRIPWIRE_K}
+
+    def test_the_default_path_is_unchanged(self):
+        m = _mod()
+        observations = self._observe(m.DEFAULT_KS)
+
+        assert {o.k for o in observations.contamination} == {m.TRIPWIRE_K}
+        assert {o.k for o in observations.claims} == {m.TRIPWIRE_K}
