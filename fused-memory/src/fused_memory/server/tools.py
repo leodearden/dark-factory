@@ -69,6 +69,13 @@ from fused_memory.reconciliation.task_filter import (
     is_proposed_resolution_framing,
 )
 from fused_memory.server.manifest_stamping import stamp_capability_manifests
+from fused_memory.server.markup_tripwire import (
+    MarkupStormCounter,
+    build_markup_block,
+    find_markup_violation,
+    markup_override_requested,
+    strip_markup_override,
+)
 from fused_memory.server.near_duplicate_guard import (
     build_near_duplicate_block,
     build_topic_cluster_block,
@@ -681,6 +688,40 @@ def create_mcp_server(
         """Return an error dict if project_id is absent from the known_projects registry."""
         return validate_known_project_id(project_id, _kp)
 
+    # Task 3141 (PRD memory-write-path-convergence §9 leaf o): reject writes
+    # carrying raw MCP envelope markup at all four write boundaries. Per-server
+    # (not module-global) so no counter state bleeds between servers or tests.
+    # DF 3083 owns the root cause and the retroactive corpus sweep.
+    _markup_storm = MarkupStormCounter()
+
+    def _markup_gate(
+        fields: dict[str, object],
+        agent_id: str | None,
+        metadata: object,
+        project_root: str | None,
+    ) -> dict | None:
+        """Return the structured rejection dict if any of *fields* carries markup.
+
+        Returns ``None`` when the write is clean or the caller set the explicit
+        ``allow_mcp_markup`` override (see markup_tripwire's module docstring for
+        why that hatch exists). Every rejection feeds the storm counter, so a
+        burst — meaning the upstream serialization leak is actively running — is
+        surfaced rather than silently absorbed into a stream of bounced writes.
+        """
+        if markup_override_requested(metadata):
+            return None
+        violation = find_markup_violation(fields)
+        if violation is None:
+            return None
+        field, pattern = violation
+        logger.warning(
+            'markup_tripwire: rejected write with leaked MCP envelope markup '
+            '(agent_id=%r field=%r matched_pattern=%r project_root=%r)',
+            agent_id, field, pattern, project_root,
+        )
+        storm = _markup_storm.record()
+        return build_markup_block(agent_id, field, pattern, str(fields[field]), storm=storm)
+
     async def _log_read(
         operation: str,
         project_id: str | None = None,
@@ -948,6 +989,14 @@ def create_mcp_server(
             return err
         if err := await _backlog_gate(project_id):
             return err
+        # Task 3141 / PRD leaf o: reject leaked MCP envelope markup BEFORE the
+        # recon-stage content guards below, so a partly-serialized payload can
+        # never be run through is_mixed_temporal_framing / the batch-plan and
+        # proposed-resolution auto-taggers and come back as some other, more
+        # misleading verdict. DF 3083 owns the root cause + corpus sweep.
+        if block := _markup_gate({'content': content}, agent_id, metadata, _kp.get(project_id)):
+            return block
+        metadata = strip_markup_override(metadata)
         if temporal_context is not None and temporal_context not in _VALID_TEMPORAL_CONTEXTS:
             return {
                 'error': (
@@ -1116,6 +1165,14 @@ def create_mcp_server(
                 ),
                 'error_type': 'ValidationError',
             }
+        # Task 3141 / PRD leaf o: reject leaked MCP envelope markup BEFORE the
+        # recon-stage content guards below, so a partly-serialized payload can
+        # never be run through is_count_snapshot / is_mixed_temporal_framing and
+        # come back as some other, more misleading verdict. DF 3083 owns the root
+        # cause + corpus sweep.
+        if block := _markup_gate({'content': content}, agent_id, metadata, _kp.get(project_id)):
+            return block
+        metadata = strip_markup_override(metadata)
         if (
             category == 'temporal_facts'
             and isinstance(agent_id, str)
