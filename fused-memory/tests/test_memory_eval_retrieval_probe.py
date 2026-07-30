@@ -2660,3 +2660,259 @@ class TestRunStampOverride:
         monkeypatch.setenv('MEMORY_EVAL_RUN_STAMP', '20260101T010101Z')
 
         assert run_stamp() == '20260101T010101Z'
+
+
+# ---------------------------------------------------------------------------
+# step-23: the user-observable signal, on a seeded ephemeral collection
+#
+# The ONE integration test in this file. Everything above measures the probe's
+# arithmetic against synthetic lists; this measures the probe against a real
+# Qdrant, a real embedder and a real MemoryService, and asserts the single
+# thing a synthetic list can never prove: that removing a canonical from the
+# store actually flips its tripwire item.
+#
+# The assertion is a BOOLEAN FLIP on a named item_key — never a rate, never a
+# threshold. G6 keeps every limit in leaf alpha; all this test claims is that
+# the signal moves when the world moves.
+#
+# Marked per-test rather than via a module `pytestmark`, because fused-memory's
+# `addopts = -m 'not integration'` would otherwise deselect the ~170 pure tests
+# above from the merge lane along with this one.
+#
+# Isolation, in the order it matters:
+#   - collection_prefix is `_test_mem0_qdrant_integration`, the ONLY prefix
+#     scripts/cleanup_test_collections.py reaps. A collection under the default
+#     `fused` prefix would leak forever. Asserted against that script's own
+#     PREFIX constant rather than a restated string.
+#   - the collection is deleted BEFORE and AFTER, so a swallowed teardown
+#     self-heals on the next run instead of poisoning it.
+#   - project_id is per-xdist-worker, so concurrent workers cannot collide.
+#   - queue.data_dir comes from mock_config's tmp_path, so the durable queue
+#     never touches the live one.
+# ---------------------------------------------------------------------------
+
+import contextlib  # noqa: E402
+import os  # noqa: E402
+
+from _fm_helpers import QDRANT_URL, qdrant_skipif  # noqa: E402
+
+EPHEMERAL_COLLECTION_PREFIX = '_test_mem0_qdrant_integration'
+
+FLIP_TOPIC = 'e1-probe-flip-topic'
+FOREIGN_TOPIC = 'e1-probe-foreign-topic'
+
+FLIP_CANONICAL = (
+    'The E1 retrieval probe seeds this sentence as the canonical entry for the '
+    'ephemeral flip topic: canonical findability is measured by asking whether '
+    'this exact entry comes back in the top k results.'
+)
+FLIP_MEMBERS = (
+    'Canonical findability for the ephemeral flip topic is probed with several '
+    'query phrasings, at least one of them held out.',
+    'The ephemeral flip topic exists only inside a seeded test collection and '
+    'is never part of the live corpus.',
+)
+FOREIGN_CANONICAL = (
+    'Contamination distractor: this entry belongs to the foreign probe topic '
+    'about unrelated fleet redeploy watchdog staleness backstops.'
+)
+FOREIGN_MEMBER = (
+    'A second foreign-topic distractor about watchdog liveness probes reviving '
+    'a wedged orchestrator unit.'
+)
+
+
+def _flip_registry(project_id: str, *, last_known_id: str | None = None):
+    """A two-topic registry over the seeded content.
+
+    Both keys are populated on the flip canonical — content_hash (primary) and
+    last_known_id (the disclosed fallback) — so the run exercises the dual
+    matcher. The test then asserts the hash is what actually fired, because a
+    silent fall back to the id would mean search stopped returning content
+    verbatim and every content-keyed metric had quietly gone blind.
+    """
+    m = _mod()
+
+    def entry(topic, canonical, *, known_id=None):
+        return m.RegistryEntry(
+            topic=topic,
+            project_id=project_id,
+            derived_from='hand',
+            canonical=m.Canonical(
+                content_hash=m.content_key(canonical),
+                content_prefix=canonical[:80],
+                last_known_id=known_id,
+            ),
+            phrasings=(
+                m.Phrasing(f'what does the {topic} say', False),
+                m.Phrasing(f'summarise everything known about {topic}', True),
+            ),
+        )
+
+    return m.TopicRegistry(schema_version=1, entries=(
+        entry(FLIP_TOPIC, FLIP_CANONICAL, known_id=last_known_id),
+        entry(FOREIGN_TOPIC, FOREIGN_CANONICAL),
+    ))
+
+
+def _tripwire(series):
+    """The topic-canonical-present metric off an emitted series."""
+    m = _mod()
+    for metric in series.metrics:
+        if metric.metric_id == m.METRIC_TOPIC_CANONICAL_PRESENT:
+            return metric
+    raise AssertionError('the series carries no topic-canonical-present metric')
+
+
+def _item(series, item_key):
+    for item in _tripwire(series).items or []:
+        if item.item_key == item_key:
+            return item
+    raise AssertionError(f'no tripwire item {item_key!r} in {_tripwire(series).items!r}')
+
+
+@pytest.fixture
+def probe_project_id(worker_id):
+    """Per-xdist-worker so concurrent workers cannot share a collection."""
+    return f'probe_e1_{worker_id}'
+
+
+@pytest.fixture
+def probe_config(mock_config, probe_project_id):
+    """mock_config pointed at an ephemeral collection with a REAL embedder.
+
+    Clearing the fake api_key makes mem0's OpenAIEmbedding fall back to the
+    real OPENAI_API_KEY. A stub constant vector would make every ranking in
+    this test meaningless — the whole point is that real retrieval finds the
+    seeded canonical and stops finding it once it is gone.
+    """
+    config = mock_config.model_copy(deep=True)
+    config.mem0.collection_prefix = EPHEMERAL_COLLECTION_PREFIX
+    config.embedder.providers.openai.api_key = None
+    return config
+
+
+@pytest.fixture
+def clean_probe_collection(probe_config, probe_project_id):
+    """Delete the seeded collection before AND after the test."""
+    from qdrant_client import QdrantClient  # noqa: PLC0415
+
+    from fused_memory.models.scope import Scope  # noqa: PLC0415
+
+    collection = Scope(project_id=probe_project_id).mem0_collection_name(
+        probe_config.mem0.collection_prefix,
+    )
+    client = QdrantClient(url=QDRANT_URL, timeout=10)
+    with contextlib.suppress(Exception):
+        client.delete_collection(collection)
+    yield collection
+    with contextlib.suppress(Exception):
+        client.delete_collection(collection)
+    client.close()
+
+
+class TestSeededInducedRegression:
+    """Delete the canonical; the tripwire item must flip. That is the signal."""
+
+    def test_the_ephemeral_collection_is_one_the_reaper_can_reclaim(
+        self, clean_probe_collection,
+    ):
+        """A leaked collection under the default prefix would live forever."""
+        import importlib.util as _ilu  # noqa: PLC0415
+        import sys as _sys  # noqa: PLC0415
+
+        path = SCRIPT_PATH.parent / 'cleanup_test_collections.py'
+        spec = _ilu.spec_from_file_location('cleanup_test_collections', path)
+        assert spec is not None and spec.loader is not None
+        cleanup = _ilu.module_from_spec(spec)
+        _sys.modules['cleanup_test_collections'] = cleanup
+        spec.loader.exec_module(cleanup)
+
+        assert clean_probe_collection.startswith(cleanup.PREFIX)
+
+    @pytest.mark.integration
+    @pytest.mark.timeout(300)
+    @pytest.mark.asyncio
+    @qdrant_skipif()
+    @pytest.mark.skipif(
+        not os.environ.get('OPENAI_API_KEY'),
+        reason='the seeded probe needs a real embedder',
+    )
+    async def test_deleting_the_canonical_flips_its_tripwire_item(
+        self, probe_config, probe_project_id, clean_probe_collection, tmp_path,
+    ):
+        from fused_memory.models.scope import Scope  # noqa: PLC0415
+        from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+
+        m = _mod()
+        memory = MemoryService(probe_config)
+        await memory.initialize()
+        try:
+            # mem0's SQLite history writer is process-shared and xdist-contended
+            # (and read-only in the sandbox). Stubbed for the same reason
+            # test_recon_dedup_premise.py:135 stubs it: it is not the question
+            # under test, and its failure would mask the one that is.
+            instance = await memory.mem0._get_instance(Scope(project_id=probe_project_id))
+            instance.db.add_history = lambda *a, **kw: None
+
+            seeded = await memory.add_memory(
+                FLIP_CANONICAL, category='procedural_knowledge',
+                project_id=probe_project_id, agent_id='e1-probe-seed',
+                metadata={'topic': FLIP_TOPIC},
+            )
+            canonical_id = seeded.memory_ids[0]
+            for text in FLIP_MEMBERS:
+                await memory.add_memory(
+                    text, category='procedural_knowledge',
+                    project_id=probe_project_id, agent_id='e1-probe-seed',
+                    metadata={'topic': FLIP_TOPIC},
+                )
+            for text in (FOREIGN_CANONICAL, FOREIGN_MEMBER):
+                await memory.add_memory(
+                    text, category='procedural_knowledge',
+                    project_id=probe_project_id, agent_id='e1-probe-seed',
+                    metadata={'topic': FOREIGN_TOPIC},
+                )
+
+            registry = _flip_registry(probe_project_id, last_known_id=canonical_id)
+            item_key = registry.by_topic[FLIP_TOPIC].item_key
+
+            before = await m.run_probe(
+                memory, registry,
+                project_ids=(probe_project_id,), ks=(5,),
+                out_root=tmp_path, stamp='20260730T100000Z',
+            )
+
+            # The live corpus was never in scope: the artifact says so itself.
+            assert before.series.corpus.project_id == probe_project_id
+            assert _item(before.series, item_key).passed
+
+            # The hash, not the id. A silent fall back to last_known_id would
+            # mean search stopped returning content verbatim, which would blind
+            # every content-keyed metric while still reporting a pass.
+            assert all(
+                obs.matched_by == m.MATCHED_BY_CONTENT_HASH
+                for obs in before.observations.phrasings
+                if obs.topic == FLIP_TOPIC and obs.hit
+            )
+
+            await memory.delete_memory(
+                canonical_id, store='mem0', project_id=probe_project_id,
+            )
+
+            after = await m.run_probe(
+                memory, registry,
+                project_ids=(probe_project_id,), ks=(5,),
+                out_root=tmp_path, stamp='20260730T101000Z',
+            )
+
+            assert not _item(after.series, item_key).passed
+            assert _tripwire(after.series).value == _tripwire(before.series).value + 1
+
+            # Two runs, two artifacts: the second must not overwrite the first,
+            # or the baseline window leaf alpha reads would be one run short.
+            assert before.metrics_path != after.metrics_path
+            assert before.metrics_path.exists() and after.metrics_path.exists()
+            assert before.is_initial_run and not after.is_initial_run
+        finally:
+            await memory.close()
