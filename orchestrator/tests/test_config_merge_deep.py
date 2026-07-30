@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import pytest
 import yaml
+from pydantic import ValidationError
 
 from orchestrator.config import (
     MergeDeepConfig,
@@ -89,3 +90,35 @@ class TestMergeDeepKnobInProjectYaml:
         assert 'merge_deep.chain_capp' in paths, (
             f'expected the typo to be censused under the known merge_deep parent; got {paths!r}'
         )
+
+
+class TestChainCapBoundValidation:
+    """``chain_cap`` must be >= 0, with deliberately NO upper bound."""
+
+    @pytest.mark.parametrize('bad_value', [-1, -6, -32])
+    def test_negative_cap_rejected(self, bad_value):
+        """A negative cap is meaningless in
+        ``target_depth = min(len(queue), cap, halving_state)`` — it would silently
+        win that min() and disable or underflow the gate, so it must fail loudly
+        at construction (loud over silent degradation).
+        """
+        with pytest.raises(ValidationError):
+            MergeDeepConfig(chain_cap=bad_value)
+
+    def test_negative_cap_rejected_at_load(self, monkeypatch, tmp_path):
+        """Covers the 'rejected at load' signal: OrchestratorConfig builds the
+        merge_deep submodel from the nested dict shape YAML deserializes into, so
+        a bad project YAML fails at load rather than reaching dispatch.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(merge_deep={'chain_cap': -1})  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize('good_value', [0, 1, 6, 32])
+    def test_whole_staging_ladder_is_representable(self, good_value):
+        """0 = kill switch, 1 = the halving floor (d=1, byte-identical to today's
+        adjacent verify), 6 = the ζ canary depth, 32 = η2's "uncapped in
+        practice". No upper bound is imposed — θ owns the ceiling question.
+        """
+        assert MergeDeepConfig(chain_cap=good_value).chain_cap == good_value
