@@ -205,6 +205,13 @@ def _read_verdicts(
     passed through unmapped — a dashboard-side translation table would be a
     second vocabulary to keep in sync with the evaluator's, and the first
     divergence would silently mislabel an alarm.
+
+    All three disposal paths are NAMED: absent is ``missing_verdicts``, a parse
+    failure is ``unreadable_verdicts`` (recorded by the caller's handler), and
+    an artifact that parses but is not an object is ``malformed_verdicts``.
+    That third path matters most: a discarded verdicts body leaves every row's
+    verdict absent, which is indistinguishable from a healthy no-alarm tree
+    unless the discard is recorded.
     """
     path = root / 'verdicts-current.json'
     if not path.is_file():
@@ -227,6 +234,15 @@ def _read_verdicts(
 
     body = _load_json(path)
     if not isinstance(body, dict):
+        # Valid JSON of the wrong shape: `_load_json` does not raise, so the
+        # caller's `unreadable_verdicts` handler never fires.  Discarding it
+        # silently here would make a broken verdicts file read exactly like a
+        # healthy no-alarm tree.  `eval_id` is omitted because this artifact is
+        # root-scoped, matching `missing_verdicts` above.
+        _issue(
+            issues, 'malformed_verdicts', path=path,
+            detail=f'expected an object with an "entries" list, got {type(body).__name__}',
+        )
         return {}, None
 
     index: dict[tuple[str, str], dict[str, Any]] = {}
