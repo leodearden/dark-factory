@@ -288,7 +288,7 @@ class TestDisallowedToolLists:
         assert 'mcp__fused-memory__get_cycle_summary_presence' not in STAGE1_DISALLOWED
         assert 'mcp__fused-memory__get_cycle_summary_presence' not in STAGE2_DISALLOWED
 
-    def test_escalation_reads_constant_is_exactly_the_three_read_tools(self):
+    def test_escalation_reads_constant_is_exactly_the_per_task_read_tools(self):
         """DISALLOW_ESCALATION_READS names the escalation READ tools, nothing more.
 
         Scoped deliberately tight: the denial exists because a per-task read
@@ -301,13 +301,29 @@ class TestDisallowedToolLists:
         reconciliation queue as well as the orchestrator one, so leaving it out
         exposed an archive-inclusive per-task lookup — pointed at the wrong
         store — to all three stages.
+
+        ``get_task_escalation_history`` joined it in task 3164 — the same hazard
+        one degree worse.  It delegates to ``get_task_escalations``, so it is the
+        identical archive-inclusive cross-store read, but it wraps the result in
+        an envelope that echoes ``task_id`` and ``level_filter`` back.  Against
+        the reconciliation queue that makes a categorical ``count: 0`` read as an
+        attributable, query-specific answer — "no record was ever filed for this
+        task at this level" — when it is only the artefact of asking the wrong
+        store.  A bare ``[]`` at least looks anonymous; a self-describing zero
+        invites being believed.
+
+        The name is count-agnostic on purpose: it was renamed here from
+        ``..._the_three_read_tools`` when the fourth member landed, and a name
+        that promises a count forces a rename on every accession (and reads as a
+        lie in between — see the RETIRED ASSERTION note above).
         """
         assert set(DISALLOW_ESCALATION_READS) == {
             'mcp__escalation__get_pending_escalations',
             'mcp__escalation__get_escalation',
             'mcp__escalation__get_task_escalations',
+            'mcp__escalation__get_task_escalation_history',
         }
-        assert len(DISALLOW_ESCALATION_READS) == 3, 'no duplicate entries'
+        assert len(DISALLOW_ESCALATION_READS) == 4, 'no duplicate entries'
 
     def test_every_escalation_server_tool_is_classified(self):
         """Every tool the SHARED escalation server registers is denied or reviewed.
