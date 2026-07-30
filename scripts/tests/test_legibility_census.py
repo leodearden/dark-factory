@@ -1936,6 +1936,105 @@ def test_run_census_dry_run_warning_states_advanced_state_and_no_rerun_recovery(
         )
 
 
+# ---------------------------------------------------------------------------
+# task 3280 step-20: RED — the payload file is a human-review deliverable and
+# the ONLY handle on a dry run's remediation work (the codebook and
+# census-state have already advanced, so nothing can regenerate it). A second
+# dry run on the same date must therefore never overwrite the first: the
+# earlier artifact is left untouched and this run's payloads go to a numbered
+# sibling, loudly.
+# ---------------------------------------------------------------------------
+
+def _dry_run_kwargs(tmp_path, payloads_path, *, verify_fn, submit_fn, commit):
+    return _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_happy_invoke_response),
+        batch_source=[_happy_batch("b0")],
+        verify_fn=verify_fn,
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=submit_fn,
+        escalate_fn=_poison("escalate_fn"),
+        status_fetcher=_make_fake_status_fetcher(3),
+        commit=commit,
+        dry_run_payloads_path=payloads_path,
+    )
+
+
+def test_run_census_dry_run_does_not_clobber_an_existing_payload_file(tmp_path, caplog):
+    collide_path = tmp_path / "confusion-census-2026-07-14-payloads.json"
+    collide_path.write_text('["SENTINEL"]', encoding="utf-8")
+    sibling_path = tmp_path / "confusion-census-2026-07-14-payloads-2.json"
+
+    fake_verify_fn = _make_fake_verify_fn(
+        verified_titles={"Silent no-op subagent contract"},
+        rejected_titles={"Spurious pattern"},
+    )
+    fake_commit = _make_fake_commit()
+    kwargs = _dry_run_kwargs(
+        tmp_path, collide_path,
+        verify_fn=fake_verify_fn, submit_fn=_make_fake_submit_fn(), commit=fake_commit,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    # (a) the earlier review artifact survives verbatim -- overwriting it
+    # would destroy work that no re-run can reproduce
+    assert collide_path.read_text(encoding="utf-8") == '["SENTINEL"]'
+
+    # (b) this run's payloads landed on the numbered sibling, in
+    # build_task_payloads' own shape
+    assert sibling_path.exists()
+    verified = [
+        c for c in fake_verify_fn.calls[0]["clusters"]
+        if c.get("title") == "Silent no-op subagent contract"
+    ]
+    expected = mod.build_task_payloads(
+        verified, project_root=str(tmp_path), project_id="dark_factory",
+    )
+    assert expected, "guard: the scenario must actually produce a payload"
+    assert json.loads(sibling_path.read_text(encoding="utf-8")) == expected
+
+    # (c)/(d)/(e) every downstream consumer names the path actually written
+    assert outcome.dry_run is not None
+    assert outcome.dry_run.path == str(sibling_path)
+
+    report_text = kwargs["report_path"].read_text(encoding="utf-8")
+    section = report_text.split("## Filed Tasks", 1)[1].split("##", 1)[0]
+    assert str(sibling_path) in section
+    assert str(collide_path) not in section, "the report must not point at the file it did NOT write"
+
+    assert str(sibling_path) in fake_commit.calls[0]["paths"]
+    assert str(collide_path) not in fake_commit.calls[0]["paths"]
+
+    # (f) never silent -- one WARNING names BOTH paths
+    collision_records = [
+        r for r in caplog.records
+        if str(collide_path) in r.message and str(sibling_path) in r.message
+    ]
+    assert len(collision_records) == 1, "the collision must be reported, naming both paths"
+
+
+def test_run_census_dry_run_uses_the_given_path_when_free(tmp_path, caplog):
+    payloads_path = tmp_path / "confusion-census-2026-07-14-payloads.json"
+    fake_commit = _make_fake_commit()
+    kwargs = _dry_run_kwargs(
+        tmp_path, payloads_path,
+        verify_fn=_make_fake_verify_fn(verified_titles={"Silent no-op subagent contract"}),
+        submit_fn=_make_fake_submit_fn(),
+        commit=fake_commit,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    # no gratuitous renaming: the free path is used verbatim (step-13 contract)
+    assert payloads_path.exists()
+    assert outcome.dry_run.path == str(payloads_path)
+    assert list(tmp_path.glob("*-payloads-*.json")) == []
+    assert not any("already exists" in r.message for r in caplog.records)
+
+
 def test_run_census_without_dry_run_files_normally_and_writes_no_payload_file(tmp_path):
     fake_submit_fn = _make_fake_submit_fn()
     kwargs = _run_census_kwargs(
