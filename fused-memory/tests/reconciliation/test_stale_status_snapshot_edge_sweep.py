@@ -142,6 +142,52 @@ class TestExtractSnapshotEdgeTaskIds:
         result = extract_snapshot_edge_task_ids('Task 142 landed on the active branch')
         assert result == set()
 
+    def test_blocked_status_individual_form_task_2885_repro(self):
+        """'Task 2885 is in a blocked status due to merge_retry_pending.' -> {2885}.
+
+        Literal fact text from the task-2885 repro (run
+        063f3e99-27f5-4bad-b6e6-d4a6804af09c). TWO separate gaps caused this
+        fact to be invisible to the sweep before task 3042: 'blocked' was
+        absent from the status-marker alternation, AND the preposition +
+        article "in a" sitting between the copula and the marker was not a
+        permitted connective (INDIVIDUAL_SNAPSHOT_RE previously allowed only
+        an optional copula and/or a bare article). Both gaps had to close
+        for this fact to match.
+        """
+        result = extract_snapshot_edge_task_ids(
+            'Task 2885 is in a blocked status due to merge_retry_pending.'
+        )
+        assert result == {2885}
+
+    def test_blocked_bare_copula_form(self):
+        """'Task 2885 is blocked.' -> {2885}."""
+        assert extract_snapshot_edge_task_ids('Task 2885 is blocked.') == {2885}
+
+    def test_blocked_no_article_form(self):
+        """'Task 2885 is in blocked status.' -> {2885}."""
+        assert extract_snapshot_edge_task_ids('Task 2885 is in blocked status.') == {2885}
+
+    def test_aggregate_blocked_list_form(self):
+        """'Blocked tasks: 142, 148' -> {142, 148}.
+
+        Before task 3042, the gate short-circuit (SNAPSHOT_STATUS_RE not
+        matching 'blocked') suppressed the aggregate list-form path too, even
+        though the aggregate extraction logic itself has nothing to do with
+        the individual-form connective. Widening the gate to admit 'blocked'
+        unlocks this aggregate form for free.
+        """
+        result = extract_snapshot_edge_task_ids('Blocked tasks: 142, 148')
+        assert result == {142, 148}
+
+    def test_count_only_blocked_snapshot_returns_empty(self):
+        """'There are 3 blocked tasks' -> set().
+
+        Count-only snapshots stay out of scope per Snapshot Discipline even
+        with the widened gate — no list introducer, no specific task-id
+        reference. Guard: passes both before and after the task-3042 change.
+        """
+        assert extract_snapshot_edge_task_ids('There are 3 blocked tasks') == set()
+
 
 # --------------------------------------------------------------------------- #
 # flatten_dedup_edges
@@ -305,6 +351,48 @@ class TestSelectStaleStatusSnapshotEdges:
         result = select_stale_status_snapshot_edges([edge], {'142': 'done'})
 
         assert result == []
+
+    def test_blocked_snapshot_edge_selected_when_task_done(self):
+        """'Task 2885 is in a blocked status due to merge_retry_pending.' with
+        statuses={'2885': 'done'} -> selected."""
+        edge = {
+            'uuid': 'edge-1',
+            'fact': 'Task 2885 is in a blocked status due to merge_retry_pending.',
+            'name': '',
+        }
+
+        result = select_stale_status_snapshot_edges([edge], {'2885': 'done'})
+
+        assert result == [edge]
+
+    def test_blocked_snapshot_edge_not_selected_when_still_blocked(self):
+        """Same fact with statuses={'2885': 'blocked'} -> not selected.
+
+        Pins the invalidate-only-on-positively-terminal semantics: 'blocked'
+        is deliberately NOT a member of INACTIVE_TASK_STATUSES, so a
+        genuinely-still-blocked task can never be selected by this sweep.
+        """
+        edge = {
+            'uuid': 'edge-1',
+            'fact': 'Task 2885 is in a blocked status due to merge_retry_pending.',
+            'name': '',
+        }
+
+        result = select_stale_status_snapshot_edges([edge], {'2885': 'blocked'})
+
+        assert result == []
+
+    def test_blocked_snapshot_edge_selected_when_task_cancelled(self):
+        """Same fact with statuses={'2885': 'cancelled'} -> selected."""
+        edge = {
+            'uuid': 'edge-1',
+            'fact': 'Task 2885 is in a blocked status due to merge_retry_pending.',
+            'name': '',
+        }
+
+        result = select_stale_status_snapshot_edges([edge], {'2885': 'cancelled'})
+
+        assert result == [edge]
 
 
 # --------------------------------------------------------------------------- #
