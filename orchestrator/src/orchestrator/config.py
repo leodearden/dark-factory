@@ -3376,6 +3376,20 @@ class OrchestratorConfig(BaseSettings):
     # genuinely stranded task's stale decision still ages out and promotes.
     # Green-tier hot-reloadable (see RELOADABLE_FIELDS).
     orphan_l0_dispatch_freshness_secs: float = Field(default=300.0)
+    # Task 2991: freshness grace (seconds) for the merge-phase-liveness gate in
+    # the orphan-L0 divergence reaper. The divergence false positive recurred
+    # for MERGE-stage tasks (successor to task 2931): the pre-enqueue merge
+    # loop (rebase + scoped verify + queue submit) makes NO LLM calls, so it
+    # never refreshes ``metadata.routing.latest.decided_at`` — a legitimately
+    # live merge-stage task therefore fails the ``_has_fresh_dispatch`` gate
+    # and gets false-promoted. A durable ``metadata.merge_phase_liveness.
+    # entered_at`` stamp (restart-survivable, written at merge entry) is read
+    # by ``_has_fresh_merge_phase``; if within this grace of the sweep ``now``
+    # the divergence L0 is deferred (not promoted). Default 600.0 anchored to
+    # ``orchestrator_restart_merge_phase_grace_secs`` (the existing legitimate
+    # pre-enqueue merge-phase duration bound), not a guessed threshold.
+    # Green-tier hot-reloadable (see RELOADABLE_FIELDS).
+    orphan_l0_merge_phase_freshness_secs: float = Field(default=600.0)
 
     # Terminal-status watcher — periodically polls fused-memory for active
     # workflow tasks whose status has gone terminal out-of-band (typical
@@ -4853,6 +4867,11 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # the divergence-class routing.latest liveness gate; hot-reloadable so
         # the FP-suppression window can be tuned without a redeploy.
         'orphan_l0_dispatch_freshness_secs',
+        # Task 2991: sibling of orphan_l0_dispatch_freshness_secs — freshness
+        # grace for the merge-phase-liveness gate in the divergence reaper;
+        # hot-reloadable so the merge-phase FP-suppression window can be tuned
+        # without a redeploy.
+        'orphan_l0_merge_phase_freshness_secs',
         'watcher_rotation_escalations',
         'watcher_rotation_hours',
         'watcher_max_crashloop_restarts',

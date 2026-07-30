@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from legibility import census_trigger, codebook, nightly
+from legibility import census_trigger, codebook, digest, nightly
 from legibility.config import load_config
 
 
@@ -209,6 +209,168 @@ def test_select_scored_records_excludes_out_of_scope_sessions(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# task 3268: select_digest_sessions charges DIGEST bytes, not raw transcript size
+# ---------------------------------------------------------------------------
+
+def _write_multi_mb_transcript(
+    path: Path, *, cwd: str, timestamp: str, session_id: str = 'session-big',
+    error_lines: int = 3000,
+) -> None:
+    """A :func:`_write_transcript`-shaped session padded to a REAL on-disk
+    size larger than the stock 300_000-byte daily budget.
+
+    This is the shape reify sessions actually have — thousands of
+    ``is_error`` tool_results — at ~400-900KB, the low end of the measured
+    0.5-6.5MB range."""
+    lines = [
+        {
+            'type': 'user', 'cwd': cwd, 'timestamp': timestamp, 'sessionId': session_id,
+            'message': {'role': 'user', 'content': 'please fix this confusing bug'},
+        },
+    ]
+    for i in range(error_lines):
+        lines.append({
+            'type': 'user', 'cwd': cwd, 'timestamp': timestamp, 'sessionId': session_id,
+            'message': {
+                'role': 'user',
+                'content': [
+                    {'type': 'tool_result', 'tool_use_id': f'tool-{i}', 'is_error': True,
+                     'content': f'No such file or directory: /tmp/missing-{i} ' + 'x' * 180},
+                ],
+            },
+        })
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('\n'.join(json.dumps(line) for line in lines) + '\n', encoding='utf-8')
+
+
+def test_nightly_cap_is_an_alias_of_the_sampler_cap_not_a_second_literal():
+    """``DEFAULT_MAX_DIGEST_BYTES`` and ``sampling.DEFAULT_DIGEST_MAX_BYTES``
+    are a word-order swap apart. If they were independent literals, a drift
+    between the cost basis and the render basis would be invisible to every
+    test — so nightly's name BINDS to the sampler's rather than re-declaring
+    it (reviewer_comprehensive, task 3268 amendment pass)."""
+    assert nightly.DEFAULT_MAX_DIGEST_BYTES is nightly.sampling.DEFAULT_DIGEST_MAX_BYTES
+
+
+def test_select_digest_sessions_charges_real_digest_bytes(tmp_path, monkeypatch):
+    """The cost basis handed to the sampler must be the REAL rendered digest
+    size -- what makes ``max_daily_digest_bytes`` mean what it says.
+
+    This half only. The OTHER half of the guarantee -- that the charge uses
+    the same ``max_bytes`` ``build_digests`` renders with -- cannot be
+    detected here: ``_write_transcript``'s digest measures 446 bytes at both
+    ``max_bytes=15360`` and ``max_bytes=999999``, so the cap never binds and
+    any cap above ~446 (including ``build_digest``'s own
+    default, had ``select_digest_sessions`` omitted the kwarg entirely) would
+    satisfy this assertion (reviewer_comprehensive, task 3268 amendment
+    pass). ``test_select_digest_sessions_costs_at_the_max_bytes_build_digests
+    _renders_with`` asserts the cap DIRECTLY instead of inferring it from
+    output size.
+    """
+    work_cwd = str(tmp_path / 'work')
+    cfg = load_config(_write_config(tmp_path, project_id='proj_a', cwd_prefixes=[work_cwd]))
+    projects_root = tmp_path / 'projects'
+    session_path = projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl'
+    _write_transcript(session_path, cwd=work_cwd, timestamp='2026-07-13T10:00:00Z')
+
+    captured = {}
+
+    def spy_stratified_sample(records, config, *, cost_fn=None):
+        captured['cost_fn'] = cost_fn
+        captured['records'] = list(records)
+        return nightly.sampling.SampleResult(
+            selected=list(records), per_stratum_counts={}, zero_signal_dropped=0,
+            bytes_used=0,
+        )
+
+    monkeypatch.setattr(nightly.sampling, 'stratified_sample', spy_stratified_sample)
+
+    nightly.select_digest_sessions(cfg, projects_root, date(2026, 7, 13))
+
+    cost_fn = captured['cost_fn']
+    assert cost_fn is not None, 'select_digest_sessions passed no cost_fn'
+
+    record = captured['records'][0]
+    expected = len(
+        digest.build_digest(
+            record.path,
+            agent_class_override=record.stratum,
+            max_bytes=nightly.DEFAULT_MAX_DIGEST_BYTES,
+        ).encode('utf-8')
+    )
+    assert cost_fn(record) == expected
+    assert expected != record.size_bytes
+
+
+def test_select_digest_sessions_costs_at_the_max_bytes_build_digests_renders_with(
+    tmp_path, monkeypatch,
+):
+    """The cap the sampler CHARGES at and the cap ``build_digests`` RENDERS
+    at must be the same number, or ``bytes_used`` describes a digest nobody
+    produced.
+
+    Asserted DIRECTLY off the recorded ``max_bytes`` kwarg rather than
+    inferred from the rendered size -- the sibling test above cannot see this
+    at all, because its fixture's digest (446 bytes) is far under the cap, so
+    the cap never binds and a regression to any larger value would go
+    undetected (reviewer_comprehensive, task 3268 amendment pass).
+    """
+    work_cwd = str(tmp_path / 'work')
+    cfg = load_config(_write_config(tmp_path, project_id='proj_a', cwd_prefixes=[work_cwd]))
+    projects_root = tmp_path / 'projects'
+    session_path = projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl'
+    _write_transcript(session_path, cwd=work_cwd, timestamp='2026-07-13T10:00:00Z')
+
+    caps = []
+
+    def recording_build(path, **kwargs):
+        caps.append(kwargs.get('max_bytes'))
+        return 'a digest'
+
+    # COST side: select_digest_sessions -> digest_byte_cost_fn, which
+    # resolves digest.build_digest at call time.
+    monkeypatch.setattr(nightly.sampling.digest, 'build_digest', recording_build)
+    selected = nightly.select_digest_sessions(cfg, projects_root, date(2026, 7, 13))
+    assert caps == [nightly.DEFAULT_MAX_DIGEST_BYTES], (
+        'the sampler must charge at the nightly cap, not at build_digest\'s own default'
+    )
+
+    # RENDER side: build_digests, called by run_nightly with no max_bytes
+    # override, must reach the renderer with that SAME cap.
+    caps.clear()
+    nightly.build_digests(selected, build=recording_build)
+    assert caps == [nightly.DEFAULT_MAX_DIGEST_BYTES]
+
+
+def test_select_digest_sessions_selects_multi_mb_session_under_stock_budget(tmp_path):
+    """A session whose RAW transcript dwarfs the whole nightly budget must
+    still be selected — the live defect, end to end.
+
+    Measured basis: an 879,254-byte transcript of this shape renders to a
+    15,123-byte digest, so it costs ~5% of the 300_000-byte budget rather
+    than 293% of it. Charged at raw transcript size the single reserve
+    group here is skipped whole, the greedy leftover fill has nothing to
+    add, and select_digest_sessions returns [] — which is exactly what the
+    live nightly run did every night from 2026-07-16 to 2026-07-29.
+    """
+    work_cwd = str(tmp_path / 'work')
+    cfg = load_config(_write_config(tmp_path, project_id='proj_a', cwd_prefixes=[work_cwd]))
+    assert cfg.budgets.max_daily_digest_bytes == 300000, 'fixture must use the STOCK budget'
+
+    projects_root = tmp_path / 'projects'
+    session_path = projects_root / _encode_cwd(work_cwd) / 'session-big.jsonl'
+    _write_multi_mb_transcript(
+        session_path, cwd=work_cwd, timestamp='2026-07-13T10:00:00Z',
+    )
+    raw_size = session_path.stat().st_size
+    assert raw_size > 300000, f'fixture must exceed the whole budget; got {raw_size}'
+
+    selected = nightly.select_digest_sessions(cfg, projects_root, date(2026, 7, 13))
+
+    assert [r.path for r in selected] == [session_path]
+
+
+# ---------------------------------------------------------------------------
 # step-5/6: build_digests
 # ---------------------------------------------------------------------------
 
@@ -225,6 +387,117 @@ def test_build_digests_happy_path(tmp_path):
     assert extractor_failures == []
     assert len(digests) == 1
     assert digests[0].startswith('---\n')
+
+
+def test_build_digests_reuses_the_costing_render(tmp_path):
+    """A session rendered to CHARGE it against the byte budget must not be
+    rendered a second time to emit it.
+
+    Every selected session used to be rendered twice per nightly run, and
+    ``digest._truncate_sections`` is super-linear in signal-item count (it
+    pops ONE item and re-renders the whole digest per iteration): measured on
+    the ``_write_multi_mb_transcript`` shape at 0.80s / 2.57s / 14.96s per
+    render for 1000 / 2000 / 4000 error lines, i.e. roughly a 2x on the
+    dominant cost of the job (reviewer_comprehensive, task 3268 amendment
+    pass). Measured after the fix: 2 renders -> 1, 4.18s -> 2.23s, with a
+    byte-identical digest.
+    """
+    work_cwd = str(tmp_path / 'work')
+    cfg = load_config(_write_config(tmp_path, project_id='proj_a', cwd_prefixes=[work_cwd]))
+    projects_root = tmp_path / 'projects'
+    session_path = projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl'
+    _write_transcript(session_path, cwd=work_cwd, timestamp='2026-07-13T10:00:00Z')
+
+    renders = []
+    real_build = digest.build_digest
+
+    def counting_build(path, **kwargs):
+        renders.append(path)
+        return real_build(path, **kwargs)
+
+    # select_digest_sessions has no build seam of its own -- the costing
+    # renderer is digest.build_digest, resolved at call time.
+    digest.build_digest = counting_build
+    try:
+        rendered: dict = {}
+        selected = nightly.select_digest_sessions(
+            cfg, projects_root, date(2026, 7, 13), rendered=rendered,
+        )
+        assert renders == [session_path], 'costing must render exactly once'
+
+        digests, extractor_failures = nightly.build_digests(
+            selected, build=counting_build, rendered=rendered,
+        )
+    finally:
+        digest.build_digest = real_build
+
+    # Still exactly one render in total: build_digests served the cache.
+    assert renders == [session_path]
+    assert extractor_failures == []
+    assert digests == [
+        digest.build_digest(
+            session_path, agent_class_override=selected[0].stratum,
+            max_bytes=nightly.DEFAULT_MAX_DIGEST_BYTES,
+        )
+    ], 'the cached digest must be byte-identical to a fresh render'
+
+
+def test_build_digests_re_renders_when_no_cache_is_shared(tmp_path):
+    """The cache is opt-in: a caller that shares none still gets a correct
+    digest, just at the cost of a second render."""
+    work_cwd = str(tmp_path / 'work')
+    cfg = load_config(_write_config(tmp_path, project_id='proj_a', cwd_prefixes=[work_cwd]))
+    projects_root = tmp_path / 'projects'
+    session_path = projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl'
+    _write_transcript(session_path, cwd=work_cwd, timestamp='2026-07-13T10:00:00Z')
+
+    selected = nightly.select_digest_sessions(cfg, projects_root, date(2026, 7, 13))
+    digests, extractor_failures = nightly.build_digests(selected)
+
+    assert extractor_failures == []
+    assert len(digests) == 1
+    assert digests[0].startswith('---\n')
+
+
+def test_run_nightly_shares_one_render_cache_across_both_stages(tmp_path, monkeypatch):
+    """``run_nightly`` is the only production wiring of the two stages, so
+    the reuse only pays off if IT threads one dict through both."""
+    work_cwd = str(tmp_path / 'work')
+    repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+    projects_root = tmp_path / 'projects'
+    session_path = projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl'
+    _write_transcript(
+        session_path, cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id='session-1',
+    )
+
+    seen = {}
+    real_select = nightly.select_digest_sessions
+    real_build = nightly.build_digests
+
+    def spy_select(cfg, roots, target, *, rendered=None):
+        seen['select'] = rendered
+        return real_select(cfg, roots, target, rendered=rendered)
+
+    def spy_build(selected, **kwargs):
+        seen['build'] = kwargs.get('rendered')
+        return real_build(selected, **kwargs)
+
+    monkeypatch.setattr(nightly, 'select_digest_sessions', spy_select)
+    monkeypatch.setattr(nightly, 'build_digests', spy_build)
+
+    nightly.run_nightly(
+        config_path=config_path,
+        projects_root=projects_root,
+        target_date=date(2026, 7, 13),
+        now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc),
+        invoke=lambda prompt, model: '{"proposals": []}',
+        status_fetcher=None,
+        poster=lambda url, envelope: None,
+    )
+
+    assert seen['select'] is not None, 'run_nightly passed no render cache to costing'
+    assert seen['build'] is seen['select'], 'the two stages must share ONE dict'
+    assert seen['select'], 'the shared cache must actually hold the costing render'
 
 
 def test_build_digests_isolates_extractor_crash(tmp_path):

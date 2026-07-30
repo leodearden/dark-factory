@@ -12,15 +12,25 @@ classify_agent_class -> stratified_sample -> render_manifest`` into the
 CLI acceptance surface.
 
 Task β of the confusion-reduction PRD (plans/confusion-reduction-prd.md
-§5.2, contract §7.4). Self-contained — does not import task α's
-``digest.py``; owns its own signal-scoring primitives, reusing only the
-low-level JSONL-line iterator (:func:`legibility.inventory._iter_json_lines`)
-from its own sibling module rather than duplicating it.
+§5.2, contract §7.4). It owns its own signal-scoring primitives, reusing
+only the low-level JSONL-line iterator
+(:func:`legibility.inventory._iter_json_lines`) from its own sibling
+module rather than duplicating it.
+
+This module was originally "self-contained — does not import task α's
+``digest.py``". That is now deliberately relaxed for exactly one reason:
+``budgets.max_daily_digest_bytes`` is a DIGEST-OUTPUT budget, and charging
+a record's real cost against it means knowing how big its digest will be,
+which only the digest renderer can answer (:func:`digest_byte_cost_fn`).
+The signal-scoring primitives remain unshared; the dependency is on
+α's renderer alone, and it is one-directional (``digest.py`` imports
+nothing from ``legibility.*``, so there is no cycle).
 """
 from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 import re
 import sys
@@ -28,7 +38,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 # Self-bootstrap for standalone `python scripts/legibility/sampling.py` runs
 # — must run BEFORE the `legibility.*` imports below, since a direct script
@@ -37,6 +47,7 @@ from collections.abc import Sequence
 if __name__ == '__main__':
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from legibility import digest  # noqa: E402
 from legibility.config import LegibilityConfig, load_config  # noqa: E402
 from legibility.inventory import (  # noqa: E402
     SessionRecord,
@@ -44,6 +55,8 @@ from legibility.inventory import (  # noqa: E402
     enumerate_sessions,
     resolve_agent_transcript_roots,
 )
+
+logger = logging.getLogger('legibility.sampling')
 
 # _iter_json_lines lives in legibility.inventory — this module reuses that
 # single fire-and-forget-transcript-read implementation rather than keeping
@@ -464,6 +477,142 @@ def dedupe_shapes(records: Sequence[ScoredRecord]) -> list[ScoredRecord]:
 # stratified_sample — budget-after-stratification sampler (PRD §5.2 point 2, §8.4)
 # ---------------------------------------------------------------------------
 
+DEFAULT_DIGEST_MAX_BYTES = 15360
+"""The PRD §7.2 per-digest soft cap, in bytes.
+
+``nightly.DEFAULT_MAX_DIGEST_BYTES`` is an ALIAS of this name, not a second
+definition — the two spellings are one word-order swap apart, so independent
+literals would drift invisibly. :func:`legibility.digest.build_digest`'s own
+``max_bytes`` default is still a separate literal (``digest.py`` is outside
+task 3268's scope); ``TestDigestByteCostFn`` pins the two equal so drift
+fails a test.
+
+Used by :func:`stratified_sample` as its conservative flat per-record charge
+when no ``cost_fn`` is injected, and as :func:`digest_byte_cost_fn`'s default
+render cap. Charging it flat over-estimates any realistic digest — but do NOT
+build a hard-cap invariant on that. §7.2 is a SOFT cap:
+:func:`legibility.digest._truncate_sections` stops trimming once every section
+is empty "even if the (now section-free) digest is still over the cap — a soft
+cap can't shrink the frontmatter itself". A digest whose frontmatter alone
+exceeds *max_bytes* (a pathological ``cwd``/``session`` value, or a very small
+injected cap) therefore renders LARGER than this constant, and neither the flat
+fallback nor this value is a bound in that case."""
+
+
+def render_cache_key(path: Path, max_bytes: int, renderer) -> tuple:
+    """The shared key for a rendered-digest cache entry.
+
+    Defined ONCE, here, because two pipeline stages must agree on it exactly:
+    :func:`digest_byte_cost_fn` (which populates the cache while costing) and
+    ``nightly.build_digests`` (which reads it instead of re-rendering). The
+    key carries *max_bytes* AND the *renderer* itself alongside the path, so a
+    cache entry can never be served to a stage using a different soft cap or a
+    different (e.g. monkeypatched, or test-injected) builder — a mismatch is a
+    structural cache MISS and an honest re-render, not a silently wrong digest.
+    """
+    return (path, max_bytes, renderer)
+
+
+def digest_byte_cost_fn(
+    *, max_bytes: int = DEFAULT_DIGEST_MAX_BYTES, build=None,
+    rendered: dict[tuple, str] | None = None,
+) -> Callable[[ScoredRecord], int]:
+    """Build the production ``cost_fn`` for :func:`stratified_sample`:
+    charge each record the REAL byte size of the digest it renders to.
+
+    This is what makes ``budgets.max_daily_digest_bytes`` mean what it says
+    (PRD §5.2 point 2 — "Budget cap, not count cap"): the charge is the
+    UTF-8 byte length of ``build(record.path,
+    agent_class_override=record.stratum, max_bytes=max_bytes)``. Passing
+    *max_bytes* straight through matters — a caller that renders with the
+    same constant it charges with (``nightly.DEFAULT_MAX_DIGEST_BYTES``)
+    gets a ``bytes_used`` that provably describes the digests actually
+    produced, not a parallel estimate free to drift from them. Beta's
+    ``record.stratum`` is already authoritative, so alpha never re-guesses
+    the agent class.
+
+    *build* defaults to :func:`legibility.digest.build_digest`, resolved at
+    CALL time so a test can monkeypatch the module attribute.
+
+    *rendered* is a RENDER CACHE, keyed by :func:`render_cache_key`: every
+    successful render is stored in it as the digest TEXT, not just its byte
+    count. Its job is cross-STAGE, and it is the only reason this closure
+    holds a cache at all — ``stratified_sample`` already memoizes ``cost_fn``
+    per record, so a byte-count memo here would be dead weight in the only
+    path that uses it (reviewer_comprehensive, task 3268 amendment pass). The
+    two caches answer different questions: ``stratified_sample``'s prevents a
+    second CALL within one sampler run; this one prevents a second RENDER by
+    a later pipeline stage. ``nightly.run_nightly`` passes one dict through
+    both :func:`nightly.select_digest_sessions` and
+    :func:`nightly.build_digests`, so a candidate rendered to measure its cost
+    is not rendered again to emit it. That matters more than it looks:
+    :func:`legibility.digest._truncate_sections` is super-linear in signal-item
+    count (it pops ONE item and re-renders the whole digest per iteration), so
+    an unshared costing render roughly DOUBLED the dominant cost of the nightly
+    job — measured on the ``_write_multi_mb_transcript`` fixture shape at
+    0.80s / 2.57s / 14.96s per render for 1000 / 2000 / 4000 error lines.
+    Passing no *rendered* dict keeps a private one, so a standalone caller
+    (:func:`main`) still never renders the same session twice.
+
+    The cache holds digest TEXT (~15KB each, §7.2-capped) for post-dedupe,
+    post-``top_fraction`` candidates only — tens of entries, not one per
+    enumerated session.
+
+    A raising *build* does NOT propagate: the record is charged ZERO and a
+    warning is logged. Zero is the ACCURATE charge — a render that raises
+    produces no digest bytes, so it consumes none of the daily budget — and
+    it is also the charge that best preserves the loud path: the record
+    stays as affordable as possible, so it reaches
+    :func:`nightly.build_digests`, raises there again, and is reported
+    through the EXISTING structured ``extractor_failures`` -> escalation
+    channel (PRD decision 8). Propagating here would instead take down the
+    entire night's run with a bare traceback from the sampler, losing every
+    other session's digest along with the failure's own structured report.
+
+    This charge was previously the flat *max_bytes* — the most EXPENSIVE
+    charge available, which made a failed costing the candidate most likely
+    to be cut by the budget (a reserve group skipped whole, or the greedy
+    leftover fill halting on it). A cut record never reaches
+    ``build_digests``, so no ``extractor_failures`` entry and no escalation
+    were produced and the only trace was this warning: precisely the silent
+    fail-soft the degrade was written to avoid (reviewer_comprehensive,
+    task 3268 amendment pass). Charging zero removes the budget as a way to
+    lose the report — though note it is not an absolute guarantee: a
+    zero-cost record can still be skipped as part of an unaffordable reserve
+    GROUP, or sit behind the greedy fill's strict halt.
+    """
+    cache: dict[tuple, str] = {} if rendered is None else rendered
+
+    def cost(record: ScoredRecord) -> int:
+        renderer = build if build is not None else digest.build_digest
+        key = render_cache_key(record.path, max_bytes, renderer)
+
+        cached = cache.get(key)
+        if cached is not None:
+            return len(cached.encode('utf-8'))
+
+        try:
+            text = renderer(
+                record.path, agent_class_override=record.stratum, max_bytes=max_bytes,
+            )
+        except Exception as exc:  # noqa: BLE001 - degrade loud, never propagate
+            # Deliberately NOT cached: build_digests must re-attempt, raise
+            # again, and report the failure via extractor_failures.
+            logger.warning(
+                'digest costing failed for %s (%s: %s); charging 0 bytes — a render '
+                'that raises produces no digest, and the cheapest possible charge is '
+                'what keeps the record affordable enough to reach build_digests, '
+                'which reports the failure through extractor_failures',
+                record.path.name, type(exc).__name__, exc,
+            )
+            return 0
+
+        cache[key] = text
+        return len(text.encode('utf-8'))
+
+    return cost
+
+
 @dataclass(frozen=True)
 class SampleResult:
     """The result of :func:`stratified_sample`: the selection plus accounting.
@@ -484,15 +633,66 @@ class SampleResult:
     selected: list[ScoredRecord]
     per_stratum_counts: dict[str, int]
     zero_signal_dropped: int
+
     bytes_used: int
+    """Total DIGEST bytes charged for ``selected`` — never raw transcript
+    size. ``budgets.max_daily_digest_bytes`` is a digest-OUTPUT budget (PRD
+    §5.2 point 2: "fill the daily digest-byte budget in score order. Budget
+    cap, not count cap"), so this is the sum of what
+    :func:`stratified_sample`'s cost basis charged: the real rendered digest
+    size when a ``cost_fn`` is injected, and a conservative flat
+    :data:`DEFAULT_DIGEST_MAX_BYTES` per record otherwise. It is NEVER
+    ``inventory.SessionRecord.size_bytes`` — a 0.5-6.5MB transcript renders
+    to a §7.2-capped ~15KB digest, so charging raw size over-charged the
+    budget by 20x-500x and selected nothing at all."""
+
     dedupe_collapsed: int = 0
     budget_skipped: int = 0
 
 
-def stratified_sample(records: Sequence[ScoredRecord], config: LegibilityConfig) -> SampleResult:
+def stratified_sample(
+    records: Sequence[ScoredRecord],
+    config: LegibilityConfig,
+    *,
+    cost_fn: Callable[[ScoredRecord], int] | None = None,
+) -> SampleResult:
     """Pick a budget-bounded, stratified subset of *records* (PRD §5.2 point 2, §8.4).
 
-    Pure function — no I/O, no clock. Per stratum: (1) group; (2) drop
+    The budget is a DIGEST-OUTPUT budget, and so is everything charged
+    against it. ``budgets.max_daily_digest_bytes`` bounds the bytes of
+    digest this night will PRODUCE (PRD §5.2 point 2: "fill the daily
+    digest-byte budget in score order. Budget cap, not count cap"), and each
+    digest is itself soft-capped at §7.2's 15KB. The charged quantity — and
+    therefore ``SampleResult.bytes_used`` — is always digest bytes, never
+    ``inventory.SessionRecord.size_bytes``: a 0.5-6.5MB transcript renders
+    to a ~15KB digest, so charging raw transcript size over-charged the
+    budget by 20x-500x and made a single real session unaffordable against
+    the whole night's cap.
+
+    *cost_fn* is the per-record BYTE-COST seam every budget charge routes
+    through. Real callers inject :func:`digest_byte_cost_fn`, which charges
+    the ACTUAL rendered digest size. When *cost_fn* is None each record is
+    charged a flat :data:`DEFAULT_DIGEST_MAX_BYTES` — correct UNITS and an
+    over-estimate for any realistic digest, so the daily cap holds in
+    practice. It is NOT a hard bound: §7.2 is a soft cap and the frontmatter
+    is not trimmable, so see :data:`DEFAULT_DIGEST_MAX_BYTES` before relying
+    on it as one. That fallback is deliberately
+    conservative, NOT the intended production basis: the PRD rules out a
+    pure count cap, and a flat charge is exactly a count cap in disguise. It
+    exists so this function stays injection-free and pure for the §8.4
+    boundary test, and so a caller who forgets to inject degrades to a
+    coarse budget rather than back to raw transcript bytes.
+
+    This function stays pure with respect to its own inputs — no clock, and
+    all I/O confined to the injected *cost_fn* seam, so the PRD §8.4
+    boundary test can still drive it entirely in memory. Two guarantees the
+    seam makes to an I/O-backed *cost_fn*: each record is costed AT MOST
+    ONCE per call (memoized on ``record.path``, which matters because the
+    reserve phase reads each group's total twice — sort key, then charge),
+    and only CANDIDATES are ever costed (records dropped as zero-signal or
+    collapsed by :func:`dedupe_shapes` never reach the budget phase).
+
+    Per stratum: (1) group; (2) drop
     zero-signal records; (3) :func:`dedupe_shapes` the survivors; (4) rank
     by score desc and take ``candidates = top max(ceil(top_fraction *
     stratum_size), per_stratum_min)`` capped at the survivor count (the
@@ -523,6 +723,23 @@ def stratified_sample(records: Sequence[ScoredRecord], config: LegibilityConfig)
     top_fraction = config.sampling.top_fraction
     per_stratum_min = config.sampling.per_stratum_min
     max_bytes = config.budgets.max_daily_digest_bytes
+
+    cost_memo: dict[Path, int] = {}
+
+    def _cost(record: ScoredRecord) -> int:
+        """This call's single budget-charge basis, memoized per session path.
+
+        Two records sharing a path are the same session by construction, so
+        the path is a safe memo key — and memoizing is what lets an
+        I/O-backed *cost_fn* be invoked once per candidate rather than once
+        per budget reference.
+        """
+        cached = cost_memo.get(record.path)
+        if cached is not None:
+            return cached
+        charged = cost_fn(record) if cost_fn is not None else DEFAULT_DIGEST_MAX_BYTES
+        cost_memo[record.path] = charged
+        return charged
 
     by_stratum: dict[str, list[ScoredRecord]] = {}
     for record in records:
@@ -557,8 +774,8 @@ def stratified_sample(records: Sequence[ScoredRecord], config: LegibilityConfig)
     selected: list[ScoredRecord] = []
     bytes_used = 0
     budget_skipped = 0
-    for group in sorted(reserved_groups, key=lambda g: sum(r.size_bytes for r in g)):
-        group_bytes = sum(r.size_bytes for r in group)
+    for group in sorted(reserved_groups, key=lambda g: sum(_cost(r) for r in g)):
+        group_bytes = sum(_cost(r) for r in group)
         if bytes_used + group_bytes > max_bytes:
             budget_skipped += len(group)
             continue
@@ -567,11 +784,12 @@ def stratified_sample(records: Sequence[ScoredRecord], config: LegibilityConfig)
 
     sorted_leftover = sorted(leftover, key=lambda r: r.score, reverse=True)
     for index, record in enumerate(sorted_leftover):
-        if bytes_used + record.size_bytes > max_bytes:
+        record_bytes = _cost(record)
+        if bytes_used + record_bytes > max_bytes:
             budget_skipped += len(sorted_leftover) - index
             break
         selected.append(record)
-        bytes_used += record.size_bytes
+        bytes_used += record_bytes
 
     selected.sort(key=lambda r: r.score, reverse=True)
 
@@ -633,6 +851,17 @@ def main(argv: Sequence[str]) -> int:
     per-stratum-counts / zero-signal-drops / budget-accounting summary to
     stderr. This is the CLI acceptance surface — a manual run against live
     ``~/.claude/projects`` is the observable, not a pytest.
+
+    Samples with the same real-digest-byte cost basis
+    (:func:`digest_byte_cost_fn` at :data:`DEFAULT_DIGEST_MAX_BYTES`) that
+    ``nightly.select_digest_sessions`` uses, so this diagnostic and the
+    pipeline can never disagree about what the budget was spent on — the
+    whole point of reading this CLI is to find out whether the budget is
+    why a session was skipped. The summary's byte line is therefore
+    labelled "digest bytes used": it is digest OUTPUT, not raw transcript
+    size. Note that ``render_manifest``'s per-record ``size`` field is
+    deliberately still the raw transcript size — informational, and a
+    different question from what the record costs the budget.
     """
     default_config = Path(__file__).resolve().parent.parent.parent / 'docs' / 'legibility' / 'legibility.yaml'
     parser = argparse.ArgumentParser(
@@ -678,7 +907,9 @@ def main(argv: Sequence[str]) -> int:
             )
         )
 
-    result = stratified_sample(scored, cfg)
+    result = stratified_sample(
+        scored, cfg, cost_fn=digest_byte_cost_fn(max_bytes=DEFAULT_DIGEST_MAX_BYTES),
+    )
 
     print(render_manifest(result.selected))
 
@@ -689,7 +920,7 @@ def main(argv: Sequence[str]) -> int:
     for stratum in sorted(result.per_stratum_counts):
         summary.append(f'  {stratum}: {result.per_stratum_counts[stratum]} selected')
     summary.append(
-        f'bytes used: {result.bytes_used} / {cfg.budgets.max_daily_digest_bytes}'
+        f'digest bytes used: {result.bytes_used} / {cfg.budgets.max_daily_digest_bytes}'
     )
     summary.append(f'budget-skipped candidates (would exceed cap): {result.budget_skipped}')
     print('\n'.join(summary), file=sys.stderr)

@@ -3172,6 +3172,13 @@ class TaskWorkflow:
         # Clearing here keeps the stamp/clear lifecycle symmetric; it is an
         # idempotent no-op when nothing was ever stamped (the common case).
         await self._clear_merge_retry_pending()
+        # Task 2991: likewise discharge the durable merge-phase-liveness stamp.
+        # The enqueue-boundary clear in _submit_to_merge_queue covers the normal
+        # path, but ghost-loop / eval-mode successes reach DONE without passing
+        # through it — so clear here too, keeping a DONE task from carrying a
+        # fresh stamp that would briefly defer an unrelated stranded divergence
+        # orphan in the reaper. Idempotent no-op when unstamped.
+        await self._clear_merge_phase_entered()
 
         # SUCCESS — write completion knowledge (best-effort after merge)
         try:
@@ -3310,11 +3317,29 @@ class TaskWorkflow:
 
         self._enter_phase(WorkflowState.MERGE)
 
+        # task 2991: write the durable, restart-survivable merge-phase liveness
+        # stamp immediately on merge entry — BEFORE _check_scope_invariant files
+        # its plan.files/metadata.files divergence L0 and BEFORE the gating bail
+        # below. The orphan-L0 divergence reaper's _has_fresh_merge_phase gate
+        # reads it to DEFER (not promote) a live merge-stage task, which the
+        # pre-enqueue loop (no LLM calls) would otherwise fail the task-2931
+        # routing.latest freshness gate. Placed here so it is refreshed on every
+        # (re-)dispatch into merge phase, including passes that immediately bail
+        # to ESCALATED — exactly the passes a live-but-wedged task cycles
+        # through. (Distinct from the in-memory note_merge_phase_entered at the
+        # retry-loop top, which is the self-redeploy coordinator's signal.)
+        _entry_metadata = await self._stamp_merge_phase_entered()
+
         # Tripwire (task 2505): plan.files must equal metadata.files by
         # construction (the scope-reconciliation choke point keeps them in
         # lockstep) — a divergence here means some path bypassed it. Purely
         # observational: logs + escalates, never blocks the merge.
-        await self._check_scope_invariant()
+        # The stamp above already read this task's backend metadata blob;
+        # thread it in rather than issuing a second identical get_task on the
+        # merge hot path (review amendment). A None/unreadable prefetch falls
+        # back to _check_scope_invariant's own read, so its fail-safe is
+        # unchanged.
+        await self._check_scope_invariant(backend_metadata=_entry_metadata)
 
         # Defense-in-depth: any blocking L0 escalation, or any
         # born-at-L2 (critical/urgent), or any level≥2 escalation
@@ -3360,6 +3385,25 @@ class TaskWorkflow:
             # Cleared at the durable-enqueue boundary in _submit_to_merge_queue
             # and defensively in the harness _run_slot finally.
             self.scheduler.note_merge_phase_entered(self.task_id)
+            # task 2991 (review-fix R2-B): refresh the DURABLE liveness stamp
+            # alongside the in-memory one above, for the same reason. Each
+            # REQUEUED retry re-runs a full vulnerable pre-enqueue window
+            # (Phase-1 rebase + scoped re-verify, minutes, zero LLM calls)
+            # AFTER _submit_to_merge_queue discharged the stamp at the enqueue
+            # boundary. Without this re-stamp that window has neither a durable
+            # merge_phase_liveness nor a fresh routing.latest, so the task
+            # 2931/2991 divergence false positive recurs on every merge retry
+            # (a REQUEUED retry goes through a steward resolution first, so the
+            # merge-entry L0 is already older than orphan_l0_timeout_secs when
+            # attempt 2 begins). The merge-entry stamp above is KEPT — it must
+            # precede _check_scope_invariant and the gating bail, both of which
+            # sit above this loop — so attempt 1 writes twice: an accepted cost
+            # (two cheap best-effort metadata writes, bounded by
+            # max_merge_retries+1 per merge entry) for the simple invariant "a
+            # fresh durable stamp exists at the start of every pre-enqueue
+            # window", which an `if _merge_attempt > 0` would make dependent on
+            # loop-index reasoning.
+            await self._stamp_merge_phase_entered()
             # Phase 1: pre-merge rebase (no lock, no queue slot)
             # Rebase the task branch onto current main and re-verify
             # so the queued merge phase is fast/trivial.
@@ -4578,6 +4622,120 @@ class TaskWorkflow:
         )
         return False
 
+    async def _read_fresh_backend_metadata(
+        self,
+        *,
+        log_context: str,
+        require_fresh: bool = False,
+    ) -> dict | None:
+        """Read the backend's current task metadata blob, or ``None`` on failure.
+
+        Extracted from :meth:`_merge_fresh_metadata` (task 2991) so a caller can
+        distinguish "read OK" from "could not read".  That distinction matters
+        only for the delete-by-omission clears
+        (:meth:`_clear_merge_phase_entered`, :meth:`_clear_merge_retry_pending`):
+        they persist with ``metadata_mode='replace'``, a whole-blob overwrite,
+        so writing a payload built from in-memory-only metadata would DELETE
+        every backend-only key (``memory_hints`` re-attached by Stage-2
+        reconciliation, ``_causation_id``) — the #4271 sibling-clobber bug.
+
+        Such a caller has two equivalent ways to refuse an unverified write, and
+        both funnel through here (rebase reconciliation, task 2991 vs task 3024):
+
+        * ``require_fresh=False`` (default) — a failed read returns ``None`` and
+          the caller skips its durable write itself.  Used by
+          :meth:`_clear_merge_phase_entered`, which needs the read-failed signal
+          inline so it can still clear the in-memory copy.
+        * ``require_fresh=True`` — a failed read RAISES instead of returning
+          ``None``, so a caller already wrapping its read+write in one
+          best-effort ``try`` (:meth:`_clear_merge_retry_pending`, via
+          :meth:`_merge_fresh_metadata`) lands the refusal in the same handler
+          as a persist failure.
+
+        Args:
+            log_context: Short descriptor of the write site, used verbatim in
+                the warning (e.g. ``'merge_phase_liveness clear'``).
+            require_fresh: When True, raise rather than report a failed read.
+                Never returns ``None`` under this flag.
+
+        Returns:
+            ``{}`` — read OK, backend metadata is empty/absent.
+            ``dict`` — the backend's metadata blob.
+            ``None`` — could not read: ``get_task`` raised, returned a
+            non-dict (e.g. ``None`` for a vanished/unreadable task), or
+            returned a task whose persisted ``metadata`` is CORRUPT (a
+            non-dict — a state ``Scheduler.update_task``'s own docstring
+            acknowledges as the reason ``metadata_mode='replace'`` exists).
+            Not reachable when ``require_fresh`` is True.
+
+        Raises:
+            Exception: Only when ``require_fresh`` is True — the underlying
+                ``get_task`` error verbatim, or a :class:`RuntimeError` for
+                every other unreadable shape (non-task result, corrupt
+                non-dict ``metadata``).
+        """
+        try:
+            fresh_task = await self.scheduler.get_task(self.task_id)
+        except Exception as exc:  # noqa: BLE001 — best-effort unless require_fresh
+            if require_fresh:
+                logger.warning(
+                    'Task %s: failed to refresh metadata before %s write; '
+                    'refusing to build an unverified whole-blob payload '
+                    '(caller requires a backend-verified read): %s',
+                    self.task_id, log_context, exc,
+                )
+                raise
+            logger.warning(
+                'Task %s: failed to refresh metadata before %s write; '
+                'falling back to in-memory metadata '
+                '(memory_hints may be clobbered): %s',
+                self.task_id, log_context, exc,
+            )
+            return None
+        # Non-dict return (e.g. None for a vanished task) is the path production
+        # actually takes — Scheduler.get_task catches every exception and
+        # returns None.  Silent by design when require_fresh is False, which
+        # preserves the pre-extraction behaviour (it warned only on the
+        # exception branch).
+        if not isinstance(fresh_task, dict):
+            if require_fresh:
+                msg = (
+                    f'Task {self.task_id}: metadata refresh before {log_context} '
+                    f'write returned {type(fresh_task).__name__}, not a task dict '
+                    f'— refusing to build an unverified whole-blob payload'
+                )
+                logger.warning(msg)
+                raise RuntimeError(msg)
+            return None
+        meta = fresh_task.get('metadata')
+        if meta is None:
+            return {}
+        if not isinstance(meta, dict):
+            # A corrupt persisted blob must be reported as UNREADABLE, not
+            # returned raw: every caller immediately unpacks the result
+            # (``{**in_memory, **(backend or {})}`` / ``{**metadata,
+            # **backend}``) and a truthy non-dict raises `TypeError: 'X' object
+            # is not a mapping` from an unguarded line — on the merge critical
+            # path, since _clear_merge_phase_entered runs inside
+            # _submit_to_merge_queue. Reporting None also gives the two clears
+            # the right behaviour for free: skip the whole-blob 'replace' write
+            # rather than overwrite a blob nobody understands.
+            msg = (
+                f'Task {self.task_id}: backend metadata is non-dict '
+                f'({type(meta).__name__}) before {log_context} write; '
+                f'treating as unreadable'
+            )
+            logger.warning(msg)
+            if require_fresh:
+                # A require_fresh caller reads the RETURN value as proof the
+                # blob is backend-verified, so reporting None here would send it
+                # down _merge_fresh_metadata's in-memory-only fallback and
+                # straight into the 'replace' clobber this guard exists to
+                # prevent. Refuse the same way the other unreadable shapes do.
+                raise RuntimeError(msg)
+            return None
+        return meta
+
     async def _merge_fresh_metadata(
         self,
         in_memory_metadata: dict,
@@ -4596,7 +4754,10 @@ class TaskWorkflow:
 
         If ``get_task`` fails, logs a warning containing ``log_context`` and falls
         back to ``in_memory_metadata`` alone.  Mirrors the boundary-normalisation
-        pattern used in ``_handle_terminal_exit_on_block``.
+        pattern used in ``_handle_terminal_exit_on_block``.  The backend read
+        itself lives in :meth:`_read_fresh_backend_metadata`, which callers
+        needing the read-failed signal (the ``'replace'``-mode clears) use
+        directly.
 
         Args:
             in_memory_metadata: The in-memory metadata dict (from
@@ -4624,41 +4785,16 @@ class TaskWorkflow:
                 ``get_task`` error verbatim, or a :class:`RuntimeError` if the
                 read returned something other than a task dict.
         """
-        try:
-            fresh_task = await self.scheduler.get_task(self.task_id)
-        except Exception as exc:  # noqa: BLE001 — best-effort unless require_fresh
-            if require_fresh:
-                logger.warning(
-                    'Task %s: failed to refresh metadata before %s write; '
-                    'refusing to build an unverified whole-blob payload '
-                    '(caller requires a backend-verified read): %s',
-                    self.task_id, log_context, exc,
-                )
-                raise
-            logger.warning(
-                'Task %s: failed to refresh metadata before %s write; '
-                'falling back to in-memory metadata '
-                '(memory_hints may be clobbered): %s',
-                self.task_id, log_context, exc,
-            )
-            fresh_task = None
-        if require_fresh and not isinstance(fresh_task, dict):
-            msg = (
-                f'Task {self.task_id}: metadata refresh before {log_context} write '
-                f'returned {type(fresh_task).__name__}, not a task dict — refusing '
-                f'to build an unverified whole-blob payload'
-            )
-            logger.warning(msg)
-            raise RuntimeError(msg)
         # Merge: start from in-memory metadata so that locally-set keys not yet
         # persisted are preserved, then overlay fresh backend keys so that
         # backend-side additions (e.g. memory_hints from Stage-2 reconciliation)
-        # win on collision.  When get_task failed (fresh_task is None) the
-        # backend overlay is empty and we fall back to the in-memory copy only.
-        return {
-            **in_memory_metadata,
-            **((fresh_task.get('metadata') or {}) if isinstance(fresh_task, dict) else {}),
-        }
+        # win on collision.  When the read failed (None, only reachable with
+        # require_fresh=False) the backend overlay is empty and we fall back to
+        # the in-memory copy only.
+        backend = await self._read_fresh_backend_metadata(
+            log_context=log_context, require_fresh=require_fresh,
+        )
+        return {**in_memory_metadata, **(backend or {})}
 
     async def _handle_no_plan_failure(
         self, reason: str, *, detail: str,
@@ -5191,6 +5327,17 @@ class TaskWorkflow:
           server-side.  Keeping them in agreement means that same-dispatch clear
           is a real retry.
 
+        ACCEPTED residual race (review amendment): ``'replace'`` is not
+        unconditionally safe even when the read SUCCEEDED. Read and write
+        straddle an ``await`` boundary, so a whole-blob overwrite silently
+        drops any key another process wrote in between (``'merge'`` could not
+        lose an unsupplied key that way). See
+        :meth:`_clear_merge_phase_entered` for the full statement of the
+        window, its mitigations, and why it cannot be eliminated without a
+        targeted key-delete backend mode (the backend accepts only
+        ``{'merge', 'additive', 'replace'}``) — task 3151 above is that
+        vehicle for both clears.
+
         Idempotent no-op when no stamp is present: returns immediately without a
         fresh-metadata read or backend write, so it is cheap and safe to call
         unconditionally on every merge success (the common case never stamped).
@@ -5243,6 +5390,168 @@ class TaskWorkflow:
         # landed write keeps memory and backend in agreement, so a failed clear
         # leaves the in-memory stamp for the merge-success clear to retry.
         self.task['metadata'] = fresh
+
+    async def _stamp_merge_phase_entered(self) -> dict | None:
+        """Persist a durable merge-phase-liveness stamp into task metadata.
+
+        Task 2991: the restart-survivable analog of ``routing.latest`` for the
+        orphan-L0 divergence reaper. The pre-enqueue MERGE loop (rebase +
+        scoped verify + queue submit) makes NO LLM calls, so it never refreshes
+        ``metadata.routing.latest.decided_at`` — the reaper's task-2931
+        ``_has_fresh_dispatch`` gate cannot see a legitimately-live merge-stage
+        task and false-promotes its scope-invariant L0 to a human-facing L1
+        (cluster esc-2789-22). This stamp records ``{'entered_at': <iso>}``;
+        the reaper's ``_has_fresh_merge_phase`` gate defers a divergence L0
+        whose task carries a fresh stamp. Being durable task metadata it
+        survives an orchestrator restart (unlike the per-process
+        ``Scheduler._merge_phase_at``), covering the exact redispatch window in
+        which the false positive wedged 2789/2885.
+
+        Written at TWO points in :meth:`_run_merge_phase`, so a fresh stamp
+        exists at the start of every pre-enqueue window: (1) on merge entry,
+        before ``_check_scope_invariant`` files the divergence L0 and before
+        the gating bail — hence refreshed on every (re-)dispatch into merge
+        phase, including passes that immediately bail to ESCALATED; and (2) at
+        the top of each retry attempt, beside the in-memory
+        ``note_merge_phase_entered``, because ``_submit_to_merge_queue``
+        discharges the stamp at the enqueue boundary INSIDE that loop
+        (review-fix R2-B).
+
+        Mirrors :meth:`_stamp_merge_retry_pending`'s durability contract but
+        carries only a timestamp (no worktree HEAD / base SHA): read fresh
+        backend metadata (via :meth:`_read_fresh_backend_metadata`, the same
+        read :meth:`_merge_fresh_metadata` performs) so a concurrent write
+        (``retry_ledger``, ``memory_hints``) is not clobbered, update the
+        in-memory task, and persist via ``scheduler.update_task`` inside a
+        logged try/except. A persistence failure must never crash the merge
+        path — a lost stamp is self-healing (re-written on the next merge entry,
+        and at worst the reaper promotes rather than silently suppresses).
+
+        Returns:
+            The backend metadata blob this stamp just read (``{}`` when the
+            backend blob is empty), or ``None`` when it could not be read.
+            The merge-entry caller threads it straight into
+            :meth:`_check_scope_invariant`, which needs the SAME blob — that
+            saves a second ``get_task`` round-trip on the merge hot path and
+            makes the stamp and the scope check evaluate one snapshot rather
+            than two taken at different instants (review amendment).
+        """
+        metadata = self.task.get('metadata') or {}
+        backend = await self._read_fresh_backend_metadata(
+            log_context='merge_phase_liveness stamp',
+        )
+        # Same merge policy as _merge_fresh_metadata: in-memory first, backend
+        # overlaid (a backend-side addition is an external write that must not
+        # be discarded); an unreadable backend (None) falls back to in-memory.
+        fresh = {**metadata, **(backend or {})}
+        fresh['merge_phase_liveness'] = {
+            'entered_at': datetime.now(UTC).isoformat(),
+        }
+        self.task['metadata'] = fresh
+        try:
+            await self.scheduler.update_task(self.task_id, metadata=fresh)
+        except Exception as exc:  # noqa: BLE001 — durability best-effort, never fatal
+            logger.warning(
+                'Task %s: failed to persist merge_phase_liveness stamp '
+                '(merge-phase liveness not durable this cycle): %s',
+                self.task_id, exc,
+            )
+        return backend
+
+    async def _clear_merge_phase_entered(self) -> None:
+        """Remove the durable merge-phase-liveness stamp from task metadata.
+
+        Task 2991 symmetric clear (mirrors :meth:`_clear_merge_retry_pending`):
+        called at the durable-enqueue boundary in
+        :meth:`_submit_to_merge_queue` (alongside ``scheduler.clear_merge_phase``)
+        and on merge SUCCESS in :meth:`_merge_and_finalise`, so a just-enqueued
+        / just-merged task does not carry a fresh stamp that would briefly defer
+        an unrelated stranded divergence orphan.
+
+        Deletion requires ``metadata_mode='replace'`` (review-fix R2-A). A plain
+        ``scheduler.update_task(metadata=...)`` resolves to
+        ``metadata_mode='merge'`` (scheduler.py), which the backend implements
+        as a shallow last-write-wins ``{**old, **new}`` where omitted keys are
+        PRESERVED — so popping a key out of the payload is a backend NO-OP.
+        ``'replace'`` is the mode the scheduler docstring designates for
+        delete-by-omission; it is a whole-blob overwrite, safe here ONLY because
+        the payload is built from a backend blob that was just re-read into
+        ``fresh``. Hence the guard: when
+        :meth:`_read_fresh_backend_metadata` reports a failed read the durable
+        write is SKIPPED (in-memory clear only), because a ``'replace'`` built
+        from in-memory-only metadata would delete backend-only keys
+        (``memory_hints``, ``_causation_id``) — the #4271 sibling-clobber bug.
+        The bounded cost of skipping is that the reaper may keep deferring for
+        up to ``orphan_l0_merge_phase_freshness_secs`` before the stale stamp
+        ages out (deferral, never suppression).
+
+        ACCEPTED residual race (review amendment) — ``'replace'`` is NOT
+        unconditionally safe once the read succeeded. This is a
+        read-modify-write across an ``await`` boundary (two MCP round-trips),
+        and a whole-blob overwrite drops any key another process wrote in
+        between; ``'merge'`` mode could not lose an unsupplied key that way.
+        At risk in that window: ``memory_hints`` re-attached by Stage-2
+        reconciliation, ``_causation_id``, and ``routing.latest`` — the input
+        to the reaper's SIBLING ``_has_fresh_dispatch`` gate, so a clobber
+        there would re-open the task-2931 false positive. Mitigations, in
+        order: (1) read and write are back-to-back with no intervening awaits,
+        which is the narrowest this can be without a new backend primitive;
+        (2) this workflow issues no LLM call while the clear runs, so its own
+        routing mirror is not a competing writer (an external writer such as
+        reconciliation still can be); (3) the write is skipped entirely when
+        the read failed or returned a corrupt blob. It cannot be ELIMINATED
+        here: the backend accepts only ``{'merge', 'additive', 'replace'}``
+        (``sqlite_task_backend._METADATA_MODES``) and offers no targeted
+        key-delete. A ``delete_keys`` mode would make both clears atomic and
+        is filed as follow-up work (fused-memory backend + scheduler, outside
+        this task's module scope). Pinned by
+        ``test_clear_replace_loses_concurrent_backend_write_in_read_window``.
+
+        Deliberately NOT cleared defensively in the harness ``_run_slot``
+        finally (unlike the in-memory ``clear_merge_phase`` grace stamp): an
+        abnormal exit must LEAVE the durable stamp so the reaper keeps deferring
+        across the crash/restart/redispatch window (fix-direction b). A
+        persistence failure must never crash the merge path; a subsequent merge
+        (re-)entry re-stamps, so a lost clear is self-healing.
+
+        Idempotent no-op when no stamp is present: returns immediately without a
+        fresh-metadata read or backend write, so it is cheap and safe to call
+        unconditionally on every enqueue / merge success (the common case never
+        stamped — the stamp is written only at merge entry).
+        """
+        metadata = self.task.get('metadata') or {}
+        if 'merge_phase_liveness' not in metadata:
+            return
+        backend = await self._read_fresh_backend_metadata(
+            log_context='merge_phase_liveness clear',
+        )
+        if backend is None:
+            logger.warning(
+                'Task %s: skipping durable merge_phase_liveness clear — could '
+                'not re-read backend metadata, and a replace-mode write built '
+                'from in-memory metadata alone would clobber backend-only keys '
+                '(clearing in-memory only; the stale stamp ages out of the '
+                'reaper grace on its own)',
+                self.task_id,
+            )
+            self.task['metadata'] = {
+                k: v for k, v in metadata.items() if k != 'merge_phase_liveness'
+            }
+            return
+        fresh = {**metadata, **backend}
+        fresh.pop('merge_phase_liveness', None)
+        self.task['metadata'] = fresh
+        try:
+            await self.scheduler.update_task(
+                self.task_id,
+                metadata=fresh,
+                metadata_mode='replace',  # type: ignore[reportCallIssue]
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort, never fatal
+            logger.warning(
+                'Task %s: failed to persist merge_phase_liveness clear: %s',
+                self.task_id, exc,
+            )
 
     def _merge_outcome_signature(self) -> str:
         """Return a 16-hex-char signature for the current merge-block fingerprint.
@@ -8394,6 +8703,36 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # window. (A defensive clear in the harness _run_slot finally covers
         # abnormal exits before this point.)
         self.scheduler.clear_merge_phase(self.task_id)
+        # Task 2991: discharge the DURABLE merge-phase-liveness stamp at the same
+        # boundary — the pre-enqueue window the orphan reaper's
+        # _has_fresh_merge_phase gate protects is over, so a lingering fresh
+        # stamp would briefly defer an unrelated stranded divergence orphan.
+        # Unlike the in-memory grace stamp above, this one is deliberately NOT
+        # cleared defensively in the harness _run_slot finally: an abnormal exit
+        # before this point must LEAVE the stamp so the reaper keeps deferring
+        # across the crash/restart/redispatch window.
+        #
+        # KNOWN, ACCEPTED GAP (review amendment): discharging here leaves the
+        # POST-enqueue window (queue wait + worker rebase/verify/merge) with no
+        # durable liveness signal — the stamp is gone and routing.latest stays
+        # stale, since the merge worker makes no LLM calls either. In-process
+        # that window IS covered: the task is still in _dispatched, so
+        # is_actively_held short-circuits the reaper. After a restart it is
+        # NOT: Harness._recover_pending_merges rebuilds the request from the
+        # merge journal and hands it to the WORKER, which never re-enters
+        # _run_merge_phase (nothing re-stamps), and _reconcile_stranded_in_
+        # progress LEAVEs — does not re-dispatch — a task that has an open
+        # escalation, which the merge-entry divergence L0 is. So a restart
+        # while the merge is queued/in-flight still promotes that L0.
+        # Accepted here rather than fixed: closing it means moving the
+        # discharge to the merge terminal outcome, which changes the
+        # stamp/clear pairing this task deliberately co-located with task
+        # 2753's in-memory clear_merge_phase (pinned by TestEnqueueClearWiring)
+        # — filed as follow-up work. The gap is pinned meanwhile by
+        # test_orphan_l0_reaper.py::...::
+        # test_post_enqueue_restart_still_promotes_known_accepted_gap, so it is
+        # visible in the suite instead of silently absent from it.
+        await self._clear_merge_phase_entered()
 
         # Soft-cancel hook: detach the workflow waiter instead of cancelling
         # the future so the primary entry (and any remaining peers) stay alive.
@@ -11748,7 +12087,9 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 )
             raise
 
-    async def _check_scope_invariant(self) -> None:
+    async def _check_scope_invariant(
+        self, *, backend_metadata: dict | None = None,
+    ) -> None:
         """Tripwire (task 2505): warn + escalate if ``plan.files`` and
         ``metadata.files`` diverge at LOCK-MODULE granularity at MERGE entry.
 
@@ -11779,12 +12120,30 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         ``None`` — e.g. a transient backend hiccup) is treated as "cannot
         check" and skipped, not "divergent" — a read failure must not wedge
         an otherwise-valid merge or false-escalate.
+
+        Args:
+            backend_metadata: Optional pre-read backend metadata blob. The
+                merge-entry caller passes the blob
+                :meth:`_stamp_merge_phase_entered` just read (review
+                amendment), which is the SAME data this check would otherwise
+                fetch — two back-to-back ``get_task`` round-trips (15s timeout
+                each) for one blob, on the merge hot path. Threading it also
+                removes a small inconsistency: the two reads happened at
+                different instants, so the stamp and this check could see
+                different snapshots of the same task. Anything that is not a
+                dict (including ``None`` — the stamp could not read) falls
+                back to this method's own ``get_task``, preserving the
+                fail-safe above unchanged.
         """
-        fresh_task = await self.scheduler.get_task(self.task_id)
-        if fresh_task is None:
-            return
+        if isinstance(backend_metadata, dict):
+            metadata = backend_metadata
+        else:
+            fresh_task = await self.scheduler.get_task(self.task_id)
+            if fresh_task is None:
+                return
+            metadata = fresh_task.get('metadata') or {}
         plan_files = sanitize_files_for_persist(self.plan.get('files', []))
-        metadata_files = list((fresh_task.get('metadata') or {}).get('files') or [])
+        metadata_files = list(metadata.get('files') or [])
         plan_modules = set(files_to_modules(plan_files, self.config.lock_depth))
         metadata_modules = set(
             files_to_modules(metadata_files, self.config.lock_depth)
