@@ -29,6 +29,7 @@ from audit_wiped_metadata_files import (
     FIDELITY_LOCK_LEVEL,
     PlanFilesRecord,
     TaskRecord,
+    load_plan_files_from_disk,
     load_plan_files_from_events,
     load_task_records,
 )
@@ -445,3 +446,150 @@ def test_load_plan_files_from_events_does_not_let_an_empty_later_row_erase_a_hit
 
 def test_load_plan_files_from_events_on_empty_db_returns_empty_mapping(tmp_path):
     assert load_plan_files_from_events(str(_make_runs_db(tmp_path, []))) == {}
+
+
+# ---------------------------------------------------------------------------
+# load_plan_files_from_disk — recover plan scope from the two on-disk plan
+# locations, new-then-old, mirroring git_ops.py:6833-6835 and
+# harness.py:2721-2735.
+#
+#   canonical: <base>/.task-meta/<name>/plan.json   (config.py:1343
+#              TASK_META_DIRNAME, artifacts.py:287 meta_root_for)
+#   legacy:    <base>/<name>/.task/plan.json        (in the real layout this
+#              is only an ABSOLUTE SYMLINK to the canonical artifact,
+#              artifacts.py:354-386)
+# ---------------------------------------------------------------------------
+
+
+def _write_meta_root_plan(base: Path, name: str, plan: object) -> Path:
+    path = base / ".task-meta" / name / "plan.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(plan if isinstance(plan, str) else json.dumps(plan))
+    return path
+
+
+def _write_legacy_plan(base: Path, name: str, plan: object) -> Path:
+    path = base / name / ".task" / "plan.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(plan if isinstance(plan, str) else json.dumps(plan))
+    return path
+
+
+def test_load_plan_files_from_disk_reads_canonical_meta_root(tmp_path):
+    """(a) the canonical meta-root plan, keyed by its in-file task_id."""
+    _write_meta_root_plan(tmp_path, "2085", {"task_id": 2085, "files": ["x.py"]})
+
+    records = load_plan_files_from_disk(str(tmp_path))
+
+    assert list(records) == ["2085"]
+    record = records["2085"]
+    assert isinstance(record, PlanFilesRecord)
+    assert record.files == ("x.py",)
+    assert record.source == "meta_root_plan_json"
+    assert record.fidelity == FIDELITY_FILE_LEVEL
+
+
+def test_load_plan_files_from_disk_reads_legacy_worktree_plan(tmp_path):
+    """(b) the legacy in-worktree location is read too."""
+    _write_legacy_plan(tmp_path, "1074", {"task_id": 1074, "files": ["legacy.py"]})
+
+    record = load_plan_files_from_disk(str(tmp_path))["1074"]
+
+    assert record.files == ("legacy.py",)
+    assert record.source == "legacy_worktree_plan_json"
+    assert record.fidelity == FIDELITY_FILE_LEVEL
+
+
+def test_load_plan_files_from_disk_prefers_meta_root_over_legacy(tmp_path):
+    """(c) when both exist for one task the meta-root wins."""
+    _write_meta_root_plan(tmp_path, "500", {"task_id": 500, "files": ["new.py"]})
+    _write_legacy_plan(tmp_path, "500", {"task_id": 500, "files": ["stale.py"]})
+
+    record = load_plan_files_from_disk(str(tmp_path))["500"]
+
+    assert record.files == ("new.py",)
+    assert record.source == "meta_root_plan_json"
+
+
+def test_load_plan_files_from_disk_prefers_in_file_task_id_over_dir_name(tmp_path):
+    """(d) the plan self-identifies — a pooled lane directory name is not the
+    task id (the same self-identification _find_lane_by_plan_task_id relies
+    on, git_ops.py:6793-6845) — falling back to the dir name when absent."""
+    _write_meta_root_plan(tmp_path, "lane-3", {"task_id": 2222, "files": ["a.py"]})
+    _write_meta_root_plan(tmp_path, "3131", {"files": ["b.py"]})
+    # A numeric task_id must key as its string form, not as an int.
+    _write_legacy_plan(tmp_path, "lane-9", {"task_id": 4444, "files": ["c.py"]})
+
+    records = load_plan_files_from_disk(str(tmp_path))
+
+    assert set(records) == {"2222", "3131", "4444"}
+    assert records["2222"].files == ("a.py",)
+    assert records["3131"].files == ("b.py",)
+    assert records["4444"].files == ("c.py",)
+
+
+def test_load_plan_files_from_disk_resolves_legacy_symlink_without_duplicating(tmp_path):
+    """(e) the REAL layout: the legacy path is an absolute symlink into the
+    meta-root. Reading it must not crash and must not produce a second,
+    lower-precedence record for the same task."""
+    canonical = _write_meta_root_plan(
+        tmp_path, "2464", {"task_id": 2464, "files": ["real.py"]}
+    )
+    legacy_task_dir = tmp_path / "2464" / ".task"
+    legacy_task_dir.mkdir(parents=True)
+    (legacy_task_dir / "plan.json").symlink_to(canonical.resolve())
+
+    records = load_plan_files_from_disk(str(tmp_path))
+
+    assert list(records) == ["2464"]
+    assert records["2464"].source == "meta_root_plan_json"
+    assert records["2464"].files == ("real.py",)
+
+
+def test_load_plan_files_from_disk_skips_every_unusable_entry(tmp_path):
+    """(f) malformed JSON, missing/empty/non-list files, a dangling symlink,
+    a non-directory entry, and the .task-meta dir itself appearing in the
+    base listing are all skipped without raising."""
+    _write_meta_root_plan(tmp_path, "1", "{not json at all")
+    _write_meta_root_plan(tmp_path, "2", {"task_id": 2})
+    _write_meta_root_plan(tmp_path, "3", {"task_id": 3, "files": []})
+    _write_meta_root_plan(tmp_path, "4", {"task_id": 4, "files": "not-a-list"})
+    _write_meta_root_plan(tmp_path, "5", '["a list, not an object"]')
+    _write_legacy_plan(tmp_path, "6", "{also not json")
+
+    # A dangling symlink at the legacy path (its meta-root target was removed).
+    dangling_dir = tmp_path / "7" / ".task"
+    dangling_dir.mkdir(parents=True)
+    (dangling_dir / "plan.json").symlink_to(tmp_path / ".task-meta" / "7" / "plan.json")
+
+    # A plain FILE sitting directly in the worktree base (not a directory).
+    (tmp_path / "stray-file.txt").write_text("not a worktree")
+
+    # A worktree dir with no .task/ at all.
+    (tmp_path / "8").mkdir()
+
+    # plan.json is a DIRECTORY rather than a file.
+    (tmp_path / ".task-meta" / "9" / "plan.json").mkdir(parents=True)
+
+    assert load_plan_files_from_disk(str(tmp_path)) == {}
+
+
+def test_load_plan_files_from_disk_does_not_treat_task_meta_as_a_worktree(tmp_path):
+    """(f) .task-meta must be skipped when iterating the base dir, or a
+    <base>/.task-meta/.task/plan.json would be mis-scanned as a legacy lane."""
+    _write_meta_root_plan(tmp_path, "10", {"task_id": 10, "files": ["ok.py"]})
+    trap = tmp_path / ".task-meta" / ".task"
+    trap.mkdir(parents=True)
+    (trap / "plan.json").write_text(json.dumps({"task_id": 999, "files": ["trap.py"]}))
+
+    records = load_plan_files_from_disk(str(tmp_path))
+
+    assert "999" not in records
+    assert records["10"].files == ("ok.py",)
+
+
+def test_load_plan_files_from_disk_on_absent_base_returns_empty(tmp_path):
+    """(g) an absent worktree_base returns an empty dict rather than raising."""
+    assert load_plan_files_from_disk(str(tmp_path / "no-such-base")) == {}
+    # An existing but empty base is also fine.
+    assert load_plan_files_from_disk(str(tmp_path)) == {}
