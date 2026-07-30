@@ -5880,20 +5880,46 @@ class TaskWorkflow:
 
         self.artifacts.clear_ready_to_merge()
 
-        if not commit:
+        async def _reject(
+            predicate: str, summary: str, measured: dict,
+        ) -> WorkflowOutcome:
+            """Block on a failed desync predicate — no human escalation.
+
+            INV-2 structured-facts-at-failure: the failed *predicate* name and
+            the first-hand values it was judged against land on an
+            ``architect_desync_merge`` event AND on the blocked record, so
+            neither has to be reconstructed from log scraping.
+            """
+            if self.event_store:
+                self.event_store.emit(
+                    EventType.architect_desync_merge,
+                    task_id=self.task_id,
+                    phase='plan',
+                    data={
+                        'decision': 'rejected',
+                        'predicate': predicate,
+                        'measured': measured,
+                    },
+                )
+            detail = '\n'.join(f'{k}: {v}' for k, v in measured.items())
             return await self._mark_blocked(
-                'Architect wrote malformed ready_to_merge.json (missing commit)',
-                detail=json.dumps(report, indent=2)[:2000],
+                f'Architect ready_to_merge rejected ({predicate}): {summary}',
+                detail=f'{detail}\nevidence: {evidence}'[:2000],
+            )
+
+        if not commit:
+            return await _reject(
+                'cited_commit',
+                'malformed ready_to_merge.json — missing commit',
+                {'report': json.dumps(report)[:500]},
             )
 
         if self.merge_queue is None or self.worktree is None:
-            return await self._mark_blocked(
-                'Architect reported ready_to_merge but the merge queue is '
-                'unavailable — cannot enqueue',
-                detail=(
-                    f'merge_queue: {self.merge_queue!r}\n'
-                    f'worktree: {self.worktree!r}'
-                )[:2000],
+            return await _reject(
+                'merge_queue_available',
+                'merge queue or worktree unavailable — cannot enqueue',
+                {'merge_queue': repr(self.merge_queue),
+                 'worktree': repr(self.worktree)},
             )
 
         branch_name = self.task_id  # matches _submit_to_merge_queue convention
@@ -5902,39 +5928,35 @@ class TaskWorkflow:
             f'{self.config.git.branch_prefix}{branch_name}',
         )
         if not tip:
-            return await self._mark_blocked(
-                'Architect reported ready_to_merge but the task branch does '
-                'not resolve',
-                detail=f'branch: {branch_name}\nmain_sha: {main_sha}'[:2000],
+            return await _reject(
+                'branch_resolved',
+                'the task branch does not resolve',
+                {'branch': branch_name, 'main_sha': main_sha, 'cited': commit},
             )
         if commit != tip:
-            return await self._mark_blocked(
-                f'Architect reported ready_to_merge at {commit[:12]} but the '
-                f'branch tip is {tip[:12]}',
-                detail=f'cited: {commit}\ntip: {tip}'[:2000],
+            return await _reject(
+                'cited_commit',
+                f'cited {commit[:12]} but the branch tip is {tip[:12]}',
+                {'cited': commit, 'tip': tip},
             )
 
         main_on_branch = await self.git_ops.is_ancestor(main_sha, tip)
         branch_on_main = await self.git_ops.is_ancestor(tip, main_sha)
         if not main_on_branch or branch_on_main:
-            return await self._mark_blocked(
-                'Architect reported ready_to_merge but the branch is not a '
-                'clean fast-forward of main',
-                detail=(
-                    f'tip: {tip}\nmain_sha: {main_sha}\n'
-                    f'main_is_ancestor_of_tip: {main_on_branch}\n'
-                    f'tip_is_ancestor_of_main: {branch_on_main}'
-                )[:2000],
+            return await _reject(
+                'clean_ff',
+                'the branch is not a clean fast-forward of main',
+                {'tip': tip, 'main_sha': main_sha,
+                 'main_is_ancestor_of_tip': main_on_branch,
+                 'tip_is_ancestor_of_main': branch_on_main},
             )
 
         verified_tip = last_verified_green_tip(self.event_store, self.task_id)
         if verified_tip != tip:
-            return await self._mark_blocked(
-                'Architect reported ready_to_merge but verify has not passed '
-                'on the branch tip',
-                detail=(
-                    f'tip: {tip}\nlast_verified_green_tip: {verified_tip}'
-                )[:2000],
+            return await _reject(
+                'verify_passed',
+                'verify has not passed on the branch tip',
+                {'tip': tip, 'last_verified_green_tip': verified_tip},
             )
 
         tree_hash = await self.git_ops.get_head_tree_hash(self.worktree)
@@ -5942,13 +5964,11 @@ class TaskWorkflow:
             self.artifacts.get_cached_verdict(tree_hash) if tree_hash else None
         )
         if not cached:
-            return await self._mark_blocked(
-                'Architect reported ready_to_merge but review has not passed '
-                'on the branch tree',
-                detail=(
-                    f'tip: {tip}\ntree_hash: {tree_hash}\n'
-                    f'cached_verdict: {cached}'
-                )[:2000],
+            return await _reject(
+                'review_pass',
+                'review has not passed on the branch tree',
+                {'tip': tip, 'tree_hash': tree_hash,
+                 'cached_verdict': cached},
             )
 
         logger.info(
