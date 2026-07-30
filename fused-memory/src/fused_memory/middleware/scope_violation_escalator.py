@@ -72,6 +72,11 @@ _ANCHOR_TASK_ID: str = 'task-path-guard'
 _AGENT_ROLE: str = 'fused-memory/path-guard'
 _CATEGORY: str = 'scope_violation'
 
+# Dedup discriminator appended to the fingerprint's ``affected_ids`` on the
+# advisory branch ONLY (see report_rejection) so an advisory and a
+# FILES-certain rejection over the same paths never fold into one parent.
+_ADVISORY_FINGERPRINT_TOKEN: str = 'mode:advisory'
+
 # ``suggested_action`` for the PROSE-only advisory.  Deliberately NOT
 # ``resubmit_to_<project>``: ``orchestrator/agents/briefing.py`` renders
 # suggested_action verbatim into an agent's briefing, so a resubmit
@@ -177,13 +182,18 @@ class ScopeViolationEscalator:
         exception (nor break creation on the advisory path).
 
         Routes through :func:`escalation.dedupe.submit_or_dedupe` keyed on a
-        content fingerprint over the misroute *shape* (rejecting project_id +
-        sorted matched_paths + suggested_project), with an unbounded dedup
-        window.  A recurring identical misroute (e.g. the same reconciliation
-        consolidation candidate re-proposed every round) therefore folds into
-        the first pending escalation — this method then returns the EXISTING
-        parent id, not a freshly-minted one — until a human resolves it, at
-        which point a later recurrence re-escalates.
+        content fingerprint over the misroute *shape* (filing project_id +
+        sorted matched_paths + suggested_project + the *advisory* mode), with
+        an unbounded dedup window.  A recurring identical misroute (e.g. the
+        same reconciliation consolidation candidate re-proposed every round)
+        therefore folds into the first pending escalation — this method then
+        returns the EXISTING parent id, not a freshly-minted one — until a
+        human resolves it, at which point a later recurrence re-escalates.
+
+        Advisories and rejections fold INDEPENDENTLY: the two modes are
+        distinguished in the fingerprint, so a pending advisory can never
+        swallow a later genuine rejection over the same paths (or vice versa)
+        and report it with the wrong outcome.
 
         Sync because :meth:`escalation.queue.EscalationQueue.submit` is a
         synchronous filesystem write (atomic ``rename``); no await needed,
@@ -287,6 +297,17 @@ class ScopeViolationEscalator:
                         *matched_paths,
                         f'suggested:{suggested_project or "none"}',
                         f'project:{project_id}',
+                        # ASYMMETRY IS DELIBERATE (task 3119): the mode must be
+                        # in the fingerprint so an advisory and a FILES-certain
+                        # rejection over the same shape can't fold into one
+                        # parent whose wording then mislabels the other.  But
+                        # there is NO 'mode:rejection' counterpart, because
+                        # compute_content_fingerprint sorts and \x1f-joins
+                        # affected_ids before hashing — adding any token to the
+                        # rejection branch would change its digest, orphan every
+                        # pending rejection parent already on disk, and re-flood
+                        # the operator queue that task 2946 quieted.
+                        *([_ADVISORY_FINGERPRINT_TOKEN] if advisory else []),
                     ]),
                 ),
             )
