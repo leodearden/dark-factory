@@ -12,7 +12,6 @@ from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedR
 from fused_memory.backends.mem0_client import Mem0Backend
 from fused_memory.models.scope import Scope
 
-
 # Sentinel distinguishing "caller passed vector=None" (model a Qdrant point
 # that genuinely has no vector) from "caller passed nothing" (leave the
 # MagicMock attribute unset, so it auto-creates a truthy child mock).  A
