@@ -45,6 +45,7 @@ _ANN_DISCLOSURE_KEYS = _mod._ANN_DISCLOSURE_KEYS
 find_near_duplicate_memory_groups = _mod.find_near_duplicate_memory_groups
 pick_survivor = _mod.pick_survivor
 build_sweep_plan = _mod.build_sweep_plan
+partition_topic_carveout = _mod.partition_topic_carveout
 fetch_procedural_memories = _mod.fetch_procedural_memories
 fetch_memories = _mod.fetch_memories
 _ALL_CATEGORIES = _mod._ALL_CATEGORIES
@@ -1470,3 +1471,126 @@ class TestBuildSweepPlanAllCategories:
         )
         assert plan['clusters_total'] == 0
         assert plan['delete_candidates'] == []
+
+
+# ===========================================================================
+# Option-C topic carve-out (task 3136's rule, honored as input filtering)
+# ===========================================================================
+
+def _topic_memory(id: str, content: str, topic: str | None, category: str = _PK) -> dict:
+    metadata: dict = {} if topic is None else {'topic': topic}
+    return _memory(id, content, created_at='2026-07-12T00:00:00+00:00',
+                   category=category, metadata=metadata)
+
+
+class TestPartitionTopicCarveout:
+    """The pure partition: clusters sharing one non-empty topic are carved out."""
+
+    def test_shared_non_empty_topic_is_carved_out(self):
+        group = [_topic_memory('a', 'x', 'venv'), _topic_memory('b', 'y', 'venv')]
+        actionable, carved = partition_topic_carveout([group])
+        assert actionable == []
+        assert carved == [group]
+
+    def test_differing_topics_stay_actionable(self):
+        group = [_topic_memory('a', 'x', 'venv'), _topic_memory('b', 'y', 'rustfmt')]
+        actionable, carved = partition_topic_carveout([group])
+        assert actionable == [group]
+        assert carved == []
+
+    def test_partially_missing_topic_stays_actionable(self):
+        """Only a FULLY shared non-empty topic carves out."""
+        group = [_topic_memory('a', 'x', 'venv'), _topic_memory('b', 'y', None)]
+        actionable, carved = partition_topic_carveout([group])
+        assert actionable == [group]
+        assert carved == []
+
+    def test_shared_empty_topic_stays_actionable(self):
+        """An empty-string topic is absent, not a shared topic."""
+        group = [_topic_memory('a', 'x', ''), _topic_memory('b', 'y', '')]
+        actionable, carved = partition_topic_carveout([group])
+        assert actionable == [group]
+        assert carved == []
+
+    def test_no_topic_at_all_stays_actionable(self):
+        """Today's corpus: metadata.topic has zero footprint, so nothing carves out."""
+        group = [_topic_memory('a', 'x', None), _topic_memory('b', 'y', None)]
+        actionable, carved = partition_topic_carveout([group])
+        assert actionable == [group]
+        assert carved == []
+
+    def test_mixed_groups_partition_independently(self):
+        shared = [_topic_memory('a', 'x', 'venv'), _topic_memory('b', 'y', 'venv')]
+        mixed = [_topic_memory('c', 'x', 'venv'), _topic_memory('d', 'y', 'rustfmt')]
+        actionable, carved = partition_topic_carveout([shared, mixed])
+        assert actionable == [mixed]
+        assert carved == [shared]
+
+    def test_empty_input(self):
+        assert partition_topic_carveout([]) == ([], [])
+
+
+class TestBuildSweepPlanTopicCarveout:
+    """A carved-out cluster never reaches pick_survivor, so it is never deleted."""
+
+    def test_carved_out_cluster_yields_no_delete_candidates(self):
+        memories = [
+            _topic_memory('m1', _VENV_GOTCHA_A, 'venv'),
+            _topic_memory('m2', _VENV_GOTCHA_B, 'venv'),
+        ]
+        plan = build_sweep_plan(memories, threshold=_THRESHOLD)
+        assert plan['delete_candidates'] == []
+        assert plan['near_duplicate_groups'] == []
+        assert plan['topic_carveout_clusters'] == 1
+        assert len(plan['topic_carveout_groups']) == 1
+        carved = plan['topic_carveout_groups'][0]
+        assert set(carved['member_ids']) == {'m1', 'm2'}
+        assert carved['topic'] == 'venv'
+
+    def test_differing_topics_still_yield_delete_candidates(self):
+        memories = [
+            _topic_memory('m1', _VENV_GOTCHA_A, 'venv'),
+            _topic_memory('m2', _VENV_GOTCHA_B, 'rustfmt'),
+        ]
+        plan = build_sweep_plan(memories, threshold=_THRESHOLD)
+        assert plan['clusters_total'] == 1
+        assert len(plan['delete_candidates']) == 1
+        assert plan['topic_carveout_clusters'] == 0
+
+    def test_partially_missing_topic_still_yields_delete_candidates(self):
+        memories = [
+            _topic_memory('m1', _VENV_GOTCHA_A, 'venv'),
+            _topic_memory('m2', _VENV_GOTCHA_B, None),
+        ]
+        plan = build_sweep_plan(memories, threshold=_THRESHOLD)
+        assert len(plan['delete_candidates']) == 1
+        assert plan['topic_carveout_clusters'] == 0
+
+    def test_carveout_applies_to_all_three_categories(self):
+        memories = []
+        for cat in (_PK, _PN, _OS):
+            memories += [
+                _topic_memory(f'{cat}-1', _VENV_GOTCHA_A, 'venv', category=cat),
+                _topic_memory(f'{cat}-2', _VENV_GOTCHA_B, 'venv', category=cat),
+            ]
+        plan = build_sweep_plan(memories, threshold=_THRESHOLD)
+        assert plan['delete_candidates'] == []
+        assert plan['topic_carveout_clusters'] == 3
+
+    def test_carved_out_cluster_is_excluded_from_clusters_total(self):
+        """clusters_total counts ACTIONED clusters; carve-outs are reported separately."""
+        memories = [
+            _topic_memory('m1', _VENV_GOTCHA_A, 'venv'),
+            _topic_memory('m2', _VENV_GOTCHA_B, 'venv'),
+            _topic_memory('n1', _DISTRACTOR, 'other'),
+        ]
+        plan = build_sweep_plan(memories, threshold=_THRESHOLD)
+        assert plan['clusters_total'] == 0
+        assert plan['topic_carveout_clusters'] == 1
+
+    def test_plan_stays_json_serializable_with_carveouts(self):
+        memories = [
+            _topic_memory('m1', _VENV_GOTCHA_A, 'venv'),
+            _topic_memory('m2', _VENV_GOTCHA_B, 'venv'),
+        ]
+        json.dumps(build_sweep_plan(memories, threshold=_THRESHOLD), default=str)
