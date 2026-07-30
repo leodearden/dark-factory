@@ -1651,8 +1651,20 @@ _CROSS_CHECK_SENTINEL = '__verify_cross_check__'
 #                                                   Files (not env values) because
 #                                                   a subset can be thousands of
 #                                                   ids — too large for an env.
-#   REIFY_RUN_ALL_MEMBER_SUBSET   comma-delimited {failed run_all members}.
-#   REIFY_GUI_RETRY_SPECS         comma-delimited {failed gui spec files}.
+#   REIFY_RUN_ALL_MEMBER_SUBSET   SPACE-delimited {failed run_all members}.
+#   REIFY_GUI_RETRY_SPECS         SPACE-delimited {failed gui spec files}.
+#
+#     SPACE, not comma — reify WORD-SPLITS both values:
+#       verify.sh:2579  _mk_ra_toks=(${REIFY_RUN_ALL_MEMBER_SUBSET})
+#       verify.sh:2141  for _gui_retry_tok in $_gui_retry_specs
+#     and the gui shell-safety allowlist is [A-Za-z0-9._/ -], which EXCLUDES
+#     ','.  A comma-joined gui value is therefore rejected wholesale (loud full
+#     fallback, :2156) and a comma-joined run_all value collapses into one
+#     unmatchable token.
+#
+#     An EMPTY value is the deliberate SAFE fallback meaning "run this suite in
+#     FULL", never "run nothing": verify.sh:2545 and :2127 both gate the subset
+#     on the value being non-empty.
 #   REIFY_VERIFY_RETRY_TREE_OID   the attempt-0-pinned content-tree OID; reify
 #                                 corroborates it (belt-and-suspenders with the
 #                                 orchestrator's own tree-OID gate, INV-3).
@@ -1683,7 +1695,11 @@ def _build_retry_verify_env(
     exact test id per line, deterministic order preserved from the passed lists)
     into ``filter_dir/.reify-verify-retry`` and returns the env dict documented
     in the module comment above.  ``run_all_members`` and ``gui_specs`` ship as
-    comma-delimited env values; the nextest subsets ship as file paths.
+    SPACE-delimited env values (reify word-splits both, and the gui allowlist
+    excludes ','); the nextest subsets ship as file paths.
+
+    Callers must pass nextest ids already mapped through
+    :func:`nextest_filter_ids` — this function writes the lines verbatim.
 
     Args:
         nextest_subset_debug: {did-not-pass} nextest ids for the debug profile.
@@ -1707,8 +1723,10 @@ def _build_retry_verify_env(
     return {
         'REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_DEBUG': str(debug_file),
         'REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_RELEASE': str(release_file),
-        'REIFY_RUN_ALL_MEMBER_SUBSET': ','.join(run_all_members),
-        'REIFY_GUI_RETRY_SPECS': ','.join(gui_specs),
+        # SPACE-delimited: reify word-splits both, and the gui allowlist
+        # excludes ',' outright.  See the module comment above.
+        'REIFY_RUN_ALL_MEMBER_SUBSET': ' '.join(run_all_members),
+        'REIFY_GUI_RETRY_SPECS': ' '.join(gui_specs),
         'REIFY_VERIFY_RETRY_TREE_OID': tree_oid,
         'REIFY_VERIFY_RETRY_SCOPE': 'failed_only',
     }
