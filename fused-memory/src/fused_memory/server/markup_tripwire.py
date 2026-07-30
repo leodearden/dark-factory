@@ -50,6 +50,7 @@ straight through.
 
 from __future__ import annotations
 
+import json
 import time
 from collections import deque
 from collections.abc import Callable
@@ -150,6 +151,75 @@ def find_markup_violation(fields: dict[str, object]) -> tuple[str, str] | None:
         if pattern is not None:
             return field_name, pattern
     return None
+
+
+def _as_metadata_dict(metadata: object) -> dict[str, Any] | None:
+    """Best-effort read of *metadata* as a dict, else ``None``.
+
+    ``submit_task``/``update_task`` accept metadata as an object OR a JSON
+    string, so both shapes are understood. Anything unparseable — malformed
+    JSON, a non-dict JSON payload, a wrong type entirely — yields ``None``
+    without raising: validating metadata is not this module's job, and a write
+    must never fail because the override helper choked on a field it does not
+    own.
+    """
+    if isinstance(metadata, dict):
+        return metadata
+    if isinstance(metadata, str):
+        try:
+            parsed = json.loads(metadata)
+        except (ValueError, TypeError):
+            return None
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def markup_override_requested(metadata: object) -> bool:
+    """Return True iff *metadata* carries an explicit :data:`MARKUP_OVERRIDE_KEY` opt-in.
+
+    Fail-closed: ONLY a literal boolean ``True`` counts, mirroring add_memory's
+    ``metadata.get('allow_near_duplicate') is True`` check (``tools.py``:1199).
+    A truthy-but-not-``True`` value (``'yes'``, ``1``) is far more likely to be
+    unrelated data than a considered decision to write raw MCP envelope markup
+    into the corpus — and the failure mode being contained, an accidental
+    serialization leak, never sets an explicit flag at all.
+
+    Never raises, for any input.
+    """
+    parsed = _as_metadata_dict(metadata)
+    if parsed is None:
+        return False
+    return parsed.get(MARKUP_OVERRIDE_KEY) is True
+
+
+def strip_markup_override(metadata: Any) -> Any:
+    """Return *metadata* without :data:`MARKUP_OVERRIDE_KEY`, in the same shape.
+
+    The override is a write-time-only control flag: it must never be persisted
+    into stored memory metadata or the task metadata vocabulary. Returning the
+    shape it was given (dict in / dict out, JSON string in / JSON string out)
+    lets a call site substitute the result inline before forwarding downstream.
+
+    NON-mutating — the caller's own dict is left intact, since the handler may
+    still need the original and quietly mutating caller-owned metadata is
+    action-at-a-distance this guard should not introduce. (This is the one
+    deliberate divergence from ``allow_near_duplicate``'s in-place
+    ``cleaned_meta.pop`` at ``tools.py``:1266, which operates on a dict it has
+    already copied.)
+
+    Unparseable input passes straight through unchanged, never raising.
+    """
+    if isinstance(metadata, dict):
+        if MARKUP_OVERRIDE_KEY not in metadata:
+            return metadata
+        return {k: v for k, v in metadata.items() if k != MARKUP_OVERRIDE_KEY}
+    if isinstance(metadata, str):
+        parsed = _as_metadata_dict(metadata)
+        if parsed is None or MARKUP_OVERRIDE_KEY not in parsed:
+            return metadata
+        return json.dumps({k: v for k, v in parsed.items() if k != MARKUP_OVERRIDE_KEY})
+    return metadata
 
 
 def build_markup_block(
