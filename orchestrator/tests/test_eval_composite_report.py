@@ -256,15 +256,21 @@ def _mresult(
 def _union_dataset():
     """Configs A,B across fixtures f1,f2 (3 trials each); C in f1 ONLY (3 trials).
 
-    Per-fixture best cost/latency drives the normalization:
-      f1: cost A=2 B=4 C=1 → best 1 (C); latency A=2 B=4 C=1 → best 1 (C)
-      f2: cost A=2 B=4     → best 2 (A); latency A=2 B=4     → best 2 (A)
+    C is an ARCHITECT (plan-only) row, so the efficiency baselines are keyed on
+    ``(fixture, role_group)`` and C normalizes against its OWN group — a
+    plan-only cell's cost is one architect invocation, a workflow cell's is a
+    full run, so a shared floor would crush the workflow rows (task 3099).
 
-    Hand-computed per-trial blends (quality 1.0 everywhere, weights .6/.2/.2):
-      f1 A: blend(1.0, 2→0.5, 2→0.5) = 0.8   f2 A: blend(1.0, 1.0, 1.0) = 1.0
-      f1 B: blend(1.0, 4→0.25, 0.25) = 0.7   f2 B: blend(1.0, 0.5, 0.5) = 0.8
-      f1 C: blend(1.0, 1.0, 1.0)     = 1.0
-    Per-config composite means: A=0.9, B=0.75, C=1.0.
+    Per-(fixture, role_group) best cost/latency drives the normalization:
+      f1 workflow:  cost A=2 B=4 → best 2 (A); latency A=2 B=4 → best 2 (A)
+      f2 workflow:  cost A=2 B=4 → best 2 (A); latency A=2 B=4 → best 2 (A)
+      f1 plan_only: cost C=1     → best 1 (C); latency C=1     → best 1 (C)
+
+    Hand-computed per-trial blends (weights .6/.2/.2):
+      f1 A: blend(1.0, 2→1.0, 2→1.0)  = 1.0   f2 A: blend(1.0, 1.0, 1.0) = 1.0
+      f1 B: blend(1.0, 4→0.5, 4→0.5)  = 0.8   f2 B: blend(1.0, 0.5, 0.5) = 0.8
+      f1 C: blend(0.9, 1.0, 1.0, plan_only) = 0.94   ← quality is plan_quality
+    Per-config composite means: A=1.0, B=0.8, C=0.94.
 
     Results are inserted in scrambled config order (C, A, B) to prove the impl
     sorts rows by config name.
@@ -313,8 +319,10 @@ class TestBuildCompositeReport:
         rows = {row['config']: row for row in report['configs']}
 
         a = rows['A']
-        # composite = mean per-fixture-normalized blend = mean([0.8]*3+[1.0]*3)
-        assert a['composite'] == pytest.approx(0.9)
+        # composite = mean per-(fixture, role_group)-normalized blend. A is the
+        # cheapest+fastest WORKFLOW row on both fixtures → mean([1.0]*6). The
+        # architect row C no longer sets the workflow floor (task 3099).
+        assert a['composite'] == pytest.approx(1.0)
         assert a['quality'] == pytest.approx(1.0)     # mean pure composite_score
         assert a['cost_usd'] == pytest.approx(2.0)    # mean cost
         assert a['latency_secs'] == pytest.approx(2.0)  # mean duration_ms/1000
@@ -325,10 +333,10 @@ class TestBuildCompositeReport:
         # ci95 carries composite/cost/latency sub-dicts, sufficient at >=3 trials
         for axis in ('composite', 'cost', 'latency'):
             assert a['ci95'][axis]['sufficient'] is True
-        assert a['ci95']['composite']['mean'] == pytest.approx(0.9)
+        assert a['ci95']['composite']['mean'] == pytest.approx(1.0)
 
         b = rows['B']
-        assert b['composite'] == pytest.approx(0.75)  # mean([0.7]*3+[0.8]*3)
+        assert b['composite'] == pytest.approx(0.8)  # mean([0.8]*6)
         assert b['cost_usd'] == pytest.approx(4.0)
         assert b['latency_secs'] == pytest.approx(4.0)
         assert b['trials'] == 6
@@ -603,6 +611,79 @@ class TestPlanOnlyComposite:
         assert rows['arch-a']['tests_pass_rate'] is None
         # …while a workflow row keeps a real float.
         assert rows['impl-a']['tests_pass_rate'] == pytest.approx(1.0)
+
+
+class TestRoleScopedEfficiencyBaseline:
+    """The cost/latency floor is keyed on ``(fixture, role_group)``.
+
+    ``ofat_candidates()`` returns architect + implementer + judge candidates and
+    ``run_ofat_stage`` runs them over the SAME fixtures into ONE result list. A
+    plan-only cell's cost is a single architect invocation (~$0.30/60s); a
+    workflow cell's is a full run (~$5/900s). Sharing one floor per fixture
+    therefore both crushes the workflow rows and clamps every plan-only row's
+    efficiency axes to 1.0 — making an architect campaign's ranking depend on
+    whether unrelated implementer rows happened to be in the same result set.
+    """
+
+    def _mixed(self):
+        """The shape ofat_candidates() actually produces: one fixture carrying a
+        cheap plan-only architect cell alongside expensive workflow cells."""
+        return [
+            _mresult('m1', 'impl-a', tr, quality=1.0, cost_usd=5.0,
+                     duration_ms=900000, tests_pass=True)
+            for tr in (1, 2, 3)
+        ] + [
+            _mresult('m1', 'impl-b', tr, quality=1.0, cost_usd=10.0,
+                     duration_ms=1800000, tests_pass=True)
+            for tr in (1, 2, 3)
+        ]
+
+    def test_plan_only_cell_never_sets_the_workflow_floor(self):
+        """Adding an architect cell must not move ANY implementer composite."""
+        from orchestrator.evals.report import build_composite_report
+
+        without = {r['config']: r['composite']
+                   for r in build_composite_report(self._mixed())['configs']}
+        with_arch = {
+            r['config']: r['composite']
+            for r in build_composite_report(self._mixed() + [
+                _arch('m1', 'arch-a', tr, plan_quality=0.9, cost_usd=0.3,
+                      duration_ms=60000)
+                for tr in (1, 2, 3)
+            ])['configs']
+        }
+
+        assert without['impl-a'] == with_arch['impl-a']
+        assert without['impl-b'] == with_arch['impl-b']
+        # …and the workflow rows are still normalized against each other:
+        # impl-a is the cheapest+fastest workflow run → 1.0; impl-b is 2x on
+        # both axes → 0.6 + 0.2*0.5 + 0.2*0.5 == 0.8.
+        assert with_arch['impl-a'] == pytest.approx(1.0)
+        assert with_arch['impl-b'] == pytest.approx(0.8)
+
+    def test_plan_only_rows_normalize_against_each_other(self):
+        """Two architect configs differing only in cost must get DIFFERENT
+        cost-driven composites, not both clamp to 1.0 against implementer cost.
+        """
+        from orchestrator.evals.report import build_composite_report
+
+        rows = {
+            r['config']: r['composite']
+            for r in build_composite_report(self._mixed() + [
+                _arch('m1', 'arch-cheap', tr, plan_quality=0.8, cost_usd=0.3,
+                      duration_ms=60000)
+                for tr in (1, 2, 3)
+            ] + [
+                _arch('m1', 'arch-dear', tr, plan_quality=0.8, cost_usd=0.6,
+                      duration_ms=120000)
+                for tr in (1, 2, 3)
+            ])['configs']
+        }
+
+        # 0.6*0.8 + 0.2*1.0 + 0.2*1.0 == 0.88  vs  0.6*0.8 + 0.2*0.5 + 0.2*0.5 == 0.68
+        assert rows['arch-cheap'] == pytest.approx(0.88, abs=1e-4)
+        assert rows['arch-dear'] == pytest.approx(0.68, abs=1e-4)
+        assert rows['arch-cheap'] > rows['arch-dear']
 
 
 class TestEfficiencyBaselineIgnoresFailingTrials:
