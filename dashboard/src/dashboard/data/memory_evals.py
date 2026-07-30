@@ -175,7 +175,7 @@ def _read_verdicts(
     root: Path,
     eval_dirs: list[Path],
     issues: list[dict[str, Any]],
-) -> dict[tuple[str, str], dict[str, Any]]:
+) -> tuple[dict[tuple[str, str], dict[str, Any]], dict[str, Any] | None]:
     """Index the ROOT verdicts artifact by ``(eval_id, metric_id)``.
 
     Root-scoped, not per-eval: ``docs/prds/memory-eval-program.md`` pins
@@ -205,11 +205,11 @@ def _read_verdicts(
                     + ' but is NOT read from there'
                 )
             _issue(issues, 'missing_verdicts', path=path, detail=detail)
-        return {}
+        return {}, None
 
     body = _load_json(path)
     if not isinstance(body, dict):
-        return {}
+        return {}, None
 
     index: dict[tuple[str, str], dict[str, Any]] = {}
     for entry in body.get('entries') or []:
@@ -219,7 +219,14 @@ def _read_verdicts(
         metric_id = entry.get('metric_id')
         if isinstance(eval_id, str) and isinstance(metric_id, str):
             index[(eval_id, metric_id)] = entry
-    return index
+
+    # Run-scoped, which is why it lives beside the entries rather than inside
+    # them.  Surfaced only while TRIGGERED — an untriggered block is the
+    # ordinary case and would otherwise render as a permanent storm banner.
+    storm = body.get('storm_escape')
+    if not isinstance(storm, dict) or not storm.get('triggered'):
+        storm = None
+    return index, storm
 
 
 def _escalation_projection(record: dict[str, Any]) -> dict[str, Any]:
@@ -286,6 +293,7 @@ def _build_eval(
     consumed: set[tuple[str, str]],
     escalation_index: dict[str, dict[str, Any]],
     linked_fingerprints: set[str],
+    storm: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """Assemble one eval's trend payload from its ``metrics-*.json`` series.
 
@@ -358,8 +366,16 @@ def _build_eval(
         # not closed it yet), and hiding the link there would make the
         # escalation look orphaned in exactly the window an operator is most
         # likely to be looking at it.
+        #
+        # While a storm is triggered the runner files ONE aggregate escalation
+        # instead of N per-metric ones, so per-metric links are suppressed
+        # here.  Showing them would invent links that were never filed.
         fingerprint = judged.get('fingerprint')
-        matched = escalation_index.get(fingerprint) if isinstance(fingerprint, str) else None
+        matched = (
+            escalation_index.get(fingerprint)
+            if storm is None and isinstance(fingerprint, str)
+            else None
+        )
         if matched is not None:
             linked_fingerprints.add(fingerprint)
         escalation = _escalation_projection(matched) if matched is not None else None
@@ -387,13 +403,18 @@ def _build_eval(
             'fingerprint': judged.get('fingerprint'),
             'run_stamp': judged.get('run_stamp'),
             'escalation': escalation,
-            'parity': _parity(judged.get('verdict'), escalation),
+            'parity': (
+                'storm_collapsed'
+                if storm is not None and judged.get('verdict') == 'alarm'
+                else _parity(judged.get('verdict'), escalation)
+            ),
         })
 
     return {
         'eval_id': eval_id,
         'latest_run_stamp': latest_run_stamp,
         'limits': limits,
+        'storm_escape': storm,
         'run_stamps': run_stamps,
         'run_count': len(run_stamps),
         'runs_on_disk': runs_on_disk,
@@ -437,14 +458,38 @@ def build_memory_evals(
     }
 
     eval_dirs = sorted(p for p in memory_evals_dir.iterdir() if p.is_dir())
-    verdict_index = _read_verdicts(memory_evals_dir, eval_dirs, issues)
+    verdict_index, storm = _read_verdicts(memory_evals_dir, eval_dirs, issues)
 
     escalation_index = _index_escalations(escalations_dir)
 
     consumed: set[tuple[str, str]] = set()
     linked_fingerprints: set[str] = set()
+
+    # The storm block is run-scoped across the whole program; resolve its
+    # aggregate against the SAME escalation index the metric rows use, and
+    # mark that fingerprint consumed so the aggregate is not then reported as
+    # unexplained.  It IS explained — by the storm block, not by a row.
+    storm_block: dict[str, Any] | None = None
+    if storm is not None:
+        aggregate_fingerprint = storm.get('aggregate_fingerprint')
+        aggregate = (
+            escalation_index.get(aggregate_fingerprint)
+            if isinstance(aggregate_fingerprint, str)
+            else None
+        )
+        if aggregate is not None:
+            linked_fingerprints.add(aggregate_fingerprint)
+        storm_block = {
+            'triggered': storm.get('triggered'),
+            'alarm_count': storm.get('alarm_count'),
+            'aggregate_fingerprint': aggregate_fingerprint,
+            'escalation': _escalation_projection(aggregate) if aggregate is not None else None,
+        }
+
     payload['evals'] = [
-        _build_eval(d, issues, verdict_index, consumed, escalation_index, linked_fingerprints)
+        _build_eval(
+            d, issues, verdict_index, consumed, escalation_index, linked_fingerprints, storm_block,
+        )
         for d in eval_dirs
     ]
 
