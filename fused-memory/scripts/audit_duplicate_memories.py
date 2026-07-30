@@ -363,6 +363,45 @@ def pick_survivor(group: list[dict]) -> tuple[dict, list[dict]]:
     return survivor, losers
 
 
+def _shared_topic(group: list[dict]) -> str | None:
+    """The one non-empty ``metadata.topic`` every member shares, else None."""
+    topics = {str((m.get('metadata') or {}).get('topic') or '') for m in group}
+    if len(topics) != 1:
+        return None
+    topic = topics.pop()
+    return topic or None
+
+
+def partition_topic_carveout(
+    groups: list[list[dict]],
+) -> tuple[list[list[dict]], list[list[dict]]]:
+    """Split clusters into ``(actionable, carved_out)`` by shared topic.
+
+    OWNERSHIP SEAM — this rule belongs to task 3136, not to this detector.
+    3136's amended Option-C carve-out says a cluster whose members all share
+    the same non-empty ``metadata.topic`` is an EXPECTED shape: those records
+    are deliberately co-topic'd, so deleting the "losers" would destroy
+    intended structure rather than remove accidental duplication. It is
+    honored here as INPUT FILTERING only — applied between clustering and
+    survivor selection, so carved-out clusters never reach ``pick_survivor``,
+    whose contract is untouched. Do NOT re-derive this rule elsewhere.
+
+    The boundary is deliberately narrow: only a FULLY shared, non-empty topic
+    carves out. Differing topics, a partially-missing topic, or an
+    empty-string topic all stay actionable — a cluster is only exempt when
+    every member was deliberately tagged the same way.
+
+    Note ``metadata.topic`` has zero corpus footprint until 3195/3201 land,
+    so this is inert-but-correct today by design: implemented now so it is
+    not reinvented later, and load-bearing the moment topics appear.
+    """
+    actionable: list[list[dict]] = []
+    carved_out: list[list[dict]] = []
+    for group in groups:
+        (carved_out if _shared_topic(group) else actionable).append(group)
+    return actionable, carved_out
+
+
 def _max_lexical_ratio(normalized: list[str], member_indices: list[int]) -> float | None:
     """Highest pairwise ``ratio()`` among a cluster's members, ignoring thresholds.
 
@@ -431,7 +470,9 @@ def build_sweep_plan(
         ``found_by`` (``['ann']``, ``['lexical']`` or both),
         ``lexical_clustered``, ``ann_max_score`` and ``lexical_max_ratio``;
         the plan additionally carries ``threshold``, ``ann_threshold``,
-        ``ann_disclosure`` and ``path_verdicts``
+        ``ann_disclosure``, ``topic_carveout_clusters`` /
+        ``topic_carveout_groups`` (see ``partition_topic_carveout``) and
+        ``path_verdicts``
         (``lexical_only_clusters`` / ``ann_only_clusters`` /
         ``both_paths_clusters``).
     """
@@ -441,6 +482,7 @@ def build_sweep_plan(
     delete_candidates: list[Any] = []
     lexical_only = ann_only = both_paths = 0
     clusters_total = 0
+    topic_carveout_groups: list[dict[str, Any]] = []
 
     # Cluster PER CATEGORY. Widening the filter must not merge the corpus: a
     # preference and a procedure that happen to read alike are different
@@ -477,7 +519,17 @@ def build_sweep_plan(
             if score is not None:
                 ann_score_by_pair[key] = max(ann_score_by_pair.get(key, score), score)
 
-        groups = cluster_memories_by_pairs(candidates, lexical_pairs | remapped_ann)
+        clustered = cluster_memories_by_pairs(candidates, lexical_pairs | remapped_ann)
+        # Task 3136's Option-C carve-out, applied BEFORE survivor selection so
+        # a deliberately co-topic'd cluster can never reach pick_survivor and
+        # therefore can never produce a delete candidate.
+        groups, carved_out = partition_topic_carveout(clustered)
+        for carved in carved_out:
+            topic_carveout_groups.append({
+                'member_ids': [m.get('id') for m in carved],
+                'category': category,
+                'topic': _shared_topic(carved),
+            })
         clusters_total += len(groups)
         # cluster_memories_by_pairs passes member dicts through by identity,
         # so this recovers each cluster's indices for per-path attribution.
@@ -529,6 +581,8 @@ def build_sweep_plan(
         'threshold': threshold,
         'ann_threshold': ann_threshold,
         'ann_disclosure': dict(ann_disclosure) if ann_disclosure is not None else None,
+        'topic_carveout_clusters': len(topic_carveout_groups),
+        'topic_carveout_groups': topic_carveout_groups,
         'path_verdicts': {
             'lexical_only_clusters': lexical_only,
             'ann_only_clusters': ann_only,
