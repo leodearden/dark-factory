@@ -220,18 +220,26 @@ def test_build_retry_verify_env_writes_filter_files_and_env(tmp_path: Path) -> N
     """_build_retry_verify_env writes per-profile filter files + the REIFY_* env.
 
     The nextest subsets (potentially thousands of ids) ship as newline filter
-    FILES; the small run_all-member / gui-spec lists ship as comma-delimited
+    FILES; the small run_all-member / gui-spec lists ship as SPACE-delimited
     env VALUES; tree OID + scope ship as env values.
+
+    CONSUMER EVIDENCE for the space delimiter: reify word-splits both values
+    (``_mk_ra_toks=(${REIFY_RUN_ALL_MEMBER_SUBSET})`` verify.sh:2579, and
+    ``for _gui_retry_tok in $_gui_retry_specs`` :2141), and the gui
+    shell-safety allowlist is ``[A-Za-z0-9._/ -]`` — which EXCLUDES ','.  A
+    comma-joined multi-spec gui value is therefore rejected outright (loud full
+    fallback, :2156), and a comma-joined multi-member run_all value collapses
+    into one unmatchable token.
     """
     from orchestrator.merge_queue import _build_retry_verify_env
 
-    debug = ['c a::y', 'c a::z']
-    release = ['c b::q']
+    debug = ['beta::test_three', 'alpha::test_two']
+    release = ['gamma::test_one']
     env = _build_retry_verify_env(
         nextest_subset_debug=debug,
         nextest_subset_release=release,
-        run_all_members=['mem1', 'mem2'],
-        gui_specs=['ui/spec_a.ts'],
+        run_all_members=['a.sh', 'b.sh'],
+        gui_specs=['src/__tests__/x.test.ts', 'src/__tests__/y.test.ts'],
         tree_oid='deadbeef',
         filter_dir=tmp_path,
     )
@@ -245,12 +253,19 @@ def test_build_retry_verify_env_writes_filter_files_and_env(tmp_path: Path) -> N
     assert tmp_path in release_path.parents
 
     # (1) the two filter files exist with EXACTLY the newline-joined ids.
-    assert debug_path.read_text() == 'c a::y\nc a::z'
-    assert release_path.read_text() == 'c b::q'
+    assert debug_path.read_text() == 'beta::test_three\nalpha::test_two'
+    assert release_path.read_text() == 'gamma::test_one'
 
-    # (3) run_all members / gui specs ship comma-delimited.
-    assert env['REIFY_RUN_ALL_MEMBER_SUBSET'] == 'mem1,mem2'
-    assert env['REIFY_GUI_RETRY_SPECS'] == 'ui/spec_a.ts'
+    # (3) run_all members / gui specs ship SPACE-delimited.
+    assert env['REIFY_RUN_ALL_MEMBER_SUBSET'] == 'a.sh b.sh'
+    assert (
+        env['REIFY_GUI_RETRY_SPECS']
+        == 'src/__tests__/x.test.ts src/__tests__/y.test.ts'
+    )
+    # A comma is unusable on BOTH: reify word-splits, and the gui allowlist
+    # rejects ',' outright.
+    assert ',' not in env['REIFY_RUN_ALL_MEMBER_SUBSET']
+    assert ',' not in env['REIFY_GUI_RETRY_SPECS']
 
     # (4) tree OID + scope.
     assert env['REIFY_VERIFY_RETRY_TREE_OID'] == 'deadbeef'
@@ -262,6 +277,11 @@ def test_build_retry_verify_env_empty_subsets_still_write_files(tmp_path: Path) 
 
     The contract is deterministic: reify's verify.sh always finds the filter
     files at the advertised paths, even when a profile has nothing to retry.
+
+    An EMPTY env value is the deliberate SAFE fallback meaning "run this suite
+    in FULL", not "run nothing": verify.sh:2545 gates the run_all subset on
+    ``[ -n "${REIFY_RUN_ALL_MEMBER_SUBSET:-}" ]`` and :2127 does the same for
+    the gui specs.
     """
     from orchestrator.merge_queue import _build_retry_verify_env
 
