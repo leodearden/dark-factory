@@ -709,6 +709,129 @@ async def fetch_procedural_memories(
 
 
 # ---------------------------------------------------------------------------
+# I/O layer: ANN candidate generation (thin, mock-tested)
+# ---------------------------------------------------------------------------
+
+def resolve_ann_threshold(
+    memory_service: Any,
+    override: float | None = None,
+) -> tuple[float | None, dict[str, int]]:
+    """Resolve the ANN cosine cutoff. READ, never invented.
+
+    The cutoff comes from ``config.write_triage.t_high`` — a CALIBRATION
+    OUTPUT derived by ``scripts/calibrate_write_triage.py`` from measured
+    similarity distributions over the curator-labeled corpus, with
+    ``calibration_report_path`` recording its provenance. This detector reads
+    that single home; it never restates the number and never supplies a
+    fallback of its own.
+
+    Follows ``near_duplicate_guard.resolve_near_dup_threshold``'s defensive
+    getattr-at-every-hop shape and its ``isinstance(int | float) and not
+    bool`` leaf check (which also rejects the auto-generated attributes an
+    unspecced Mock would hand back) — but returns ``None`` instead of a
+    module default, because substituting an uncalibrated stand-in here is
+    precisely the invented threshold that is forbidden.
+
+    Args:
+        memory_service: Live (or mock) MemoryService.
+        override: Operator-supplied ``--ann-threshold``. Wins when given,
+            including over an uncalibrated config.
+
+    Returns:
+        ``(threshold, disclosure)``. *threshold* is ``None`` when the config
+        is uncalibrated and no override was given — the caller must then
+        DISABLE the ANN path rather than guess. *disclosure* carries
+        ``ann_disabled_uncalibrated`` (0 or 1) so a disabled path is a
+        counted, alarmable metric rather than a silently missing detector.
+    """
+    if isinstance(override, int | float) and not isinstance(override, bool):
+        return float(override), {'ann_disabled_uncalibrated': 0}
+
+    value = getattr(getattr(memory_service, 'config', None), 'write_triage', None)
+    t_high = getattr(value, 't_high', None)
+    if isinstance(t_high, int | float) and not isinstance(t_high, bool):
+        return float(t_high), {'ann_disabled_uncalibrated': 0}
+
+    logger.error(
+        'ANN path DISABLED: config.write_triage.t_high is not calibrated '
+        '(got %r) and no --ann-threshold override was given. Refusing to '
+        'invent a similarity cutoff — run scripts/calibrate_write_triage.py, '
+        'or pass --ann-threshold explicitly. The lexical path still runs.',
+        t_high,
+    )
+    return None, {'ann_disabled_uncalibrated': 1}
+
+
+async def fetch_ann_neighbors(
+    memory: Any,
+    project_id: str,
+    records: list[dict[str, Any]],
+    *,
+    top_k: int,
+    score_threshold: float,
+) -> tuple[dict[Any, list[dict[str, Any]]], dict[str, int]]:
+    """ANN neighbours for each record, queried with the record's OWN vector.
+
+    Mirrors ``task_curator.search_corpus``'s ``query_points`` call, retargeted
+    from the curator's own collection to the Mem0 collection. The query vector
+    is the embedding Mem0 already stored (fetched by
+    ``scroll_by_metadata(..., with_vectors=True)``), NOT a freshly-embedded
+    string: the detector therefore makes zero embedding API calls at runtime
+    and cannot drift into a second metric space.
+
+    Args:
+        memory: Live (or mock) MemoryService instance.
+        project_id: Project scope to query.
+        records: Normalised records, each optionally carrying ``'vector'``.
+        top_k: Neighbours wanted per record. The query asks for ``top_k + 1``
+            so the record's own guaranteed self-hit does not consume a slot.
+        score_threshold: Cutoff pushed down into Qdrant.
+
+    Returns:
+        ``({memory_id: [{'id', 'score'}, ...]}, disclosure)``. A record with
+        no vector is skipped (``ann_pairs_from_neighbors`` counts it as
+        ``missing_vector``). *disclosure* carries ``ann_query_errors``: a
+        failure on one record is logged and counted, and the sweep continues,
+        so one bad point never costs the whole scan.
+    """
+    from fused_memory.models.scope import Scope  # noqa: PLC0415
+
+    neighbors: dict[Any, list[dict[str, Any]]] = {}
+    disclosure = {'ann_query_errors': 0}
+    if not records:
+        return neighbors, disclosure
+
+    scope = Scope(project_id=project_id)
+    collection_name = scope.mem0_collection_name(memory.config.mem0.collection_prefix)
+    client = await memory.mem0._get_async_qdrant()  # noqa: SLF001
+
+    for record in records:
+        vector = record.get('vector')
+        if vector is None:
+            continue  # never queried; counted as missing_vector downstream
+        record_id = record.get('id')
+        try:
+            result = await client.query_points(
+                collection_name=collection_name,
+                query=vector,
+                limit=top_k + 1,  # +1 absorbs the guaranteed self-hit
+                score_threshold=score_threshold,
+                with_payload=False,
+            )
+        except Exception as exc:
+            logger.error('ANN query failed for memory %s: %s', record_id, exc)
+            disclosure['ann_query_errors'] += 1
+            continue
+        neighbors[record_id] = [
+            {'id': point.id, 'score': point.score}
+            for point in result.points
+            if point.id != record_id
+        ]
+
+    return neighbors, disclosure
+
+
+# ---------------------------------------------------------------------------
 # I/O layer: apply (thin, mock-tested)
 # ---------------------------------------------------------------------------
 
