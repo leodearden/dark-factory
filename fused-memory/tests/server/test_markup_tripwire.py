@@ -11,8 +11,12 @@ Boundary/wiring tests for the four MCP write tools live in the sibling
 
 from __future__ import annotations
 
+import json
+
 from fused_memory.server.markup_tripwire import (
+    MARKUP_OVERRIDE_KEY,
     MCP_MARKUP_PATTERNS,
+    build_markup_block,
     find_markup_pattern,
     find_markup_violation,
 )
@@ -166,3 +170,88 @@ class TestFindMarkupViolation:
         """A non-str value (e.g. a dict metadata blob) is skipped, not coerced."""
         fields = {'title': 12345, 'description': ['</invoke>'], 'details': 'clean'}
         assert find_markup_violation(fields) is None
+
+
+class TestBuildMarkupBlock:
+    """The structured rejection dict returned to the caller (INV-1).
+
+    The write has already been refused by the time this runs; this dict is the
+    ONLY machine-readable account of why, so it must name the matched pattern,
+    the field it was found in, and the remediation — an agent that only reads
+    the MCP response (never the logs) has to be able to fix its own write.
+    """
+
+    def test_carries_the_stable_error_identifiers(self):
+        block = build_markup_block('claude-task-1', 'content', '</invoke>', 'a </invoke> b')
+        assert block['error'] == 'mcp_markup_write_blocked'
+        assert block['error_type'] == 'McpEnvelopeMarkupWriteRejected'
+
+    def test_echoes_agent_id_field_and_matched_pattern(self):
+        """The caller is told WHICH pattern tripped and WHERE, not just that one did."""
+        block = build_markup_block(
+            'claude-task-3141', 'description', '<parameter name=', 'x <parameter name="p"> y'
+        )
+        assert block['agent_id'] == 'claude-task-3141'
+        assert block['field'] == 'description'
+        assert block['matched_pattern'] == '<parameter name='
+
+    def test_tolerates_a_none_agent_id(self):
+        """agent_id is optional at some boundaries — it is echoed as-is, not coerced."""
+        block = build_markup_block(None, 'content', '</content>', 'a </content> b')
+        assert block['agent_id'] is None
+
+    def test_content_excerpt_is_the_untruncated_text_when_short(self):
+        text = 'short leaked </invoke> body'
+        block = build_markup_block('a', 'content', '</invoke>', text)
+        assert block['content_excerpt'] == text
+
+    def test_content_excerpt_truncates_at_200_chars(self):
+        """A leaked envelope tail can drag a huge body along; the excerpt is bounded."""
+        text = 'x' * 500 + '</invoke>'
+        block = build_markup_block('a', 'content', '</invoke>', text)
+        assert block['content_excerpt'] == text[:200]
+        assert len(block['content_excerpt']) == 200
+
+    def test_hint_names_df_3083_and_the_override_key(self):
+        """Both the escalation pointer and the escape hatch are discoverable here.
+
+        DF 3083 owns the root cause and the corpus sweep, so the rejection points
+        at it; MARKUP_OVERRIDE_KEY is how a caller quoting the markup on purpose
+        (as 3083's own description does) gets its write through.
+        """
+        block = build_markup_block('a', 'content', '</invoke>', 'a </invoke> b')
+        hint = block['hint']
+        assert hint
+        assert '3083' in hint, f'hint must name DF 3083: {hint!r}'
+        assert MARKUP_OVERRIDE_KEY in hint, f'hint must name the override key: {hint!r}'
+
+    def test_storm_key_is_absent_when_no_storm_fired(self):
+        """Below threshold the dict carries no 'storm' key at all — not a None value.
+
+        A present-but-null key would read to a caller as "a storm was evaluated
+        and there was none", which is indistinguishable from the ordinary case
+        and invites `if 'storm' in block` bugs.
+        """
+        block = build_markup_block('a', 'content', '</invoke>', 'a </invoke> b')
+        assert 'storm' not in block
+
+    def test_storm_key_is_absent_when_storm_is_explicitly_none(self):
+        block = build_markup_block('a', 'content', '</invoke>', 'a </invoke> b', storm=None)
+        assert 'storm' not in block
+
+    def test_storm_block_is_echoed_verbatim_when_supplied(self):
+        """The storm summary reaches the caller, not only the logs (INV-4)."""
+        storm = {
+            'count': 3,
+            'threshold': 3,
+            'window_seconds': 3600.0,
+            'hint': 'the leak is active; see DF 3083',
+        }
+        block = build_markup_block('a', 'content', '</invoke>', 'a </invoke> b', storm=storm)
+        assert block['storm'] == storm
+
+    def test_block_is_a_flat_json_serializable_dict(self):
+        """Mirrors build_near_duplicate_block: a flat dict an MCP client can render."""
+        block = build_markup_block('a', 'content', '</invoke>', 'a </invoke> b')
+        assert isinstance(block, dict)
+        json.dumps(block)  # raises TypeError if a non-serializable value slipped in
