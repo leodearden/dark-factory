@@ -890,6 +890,55 @@ class SpeculationProbeConfig(BaseModel):
         return v
 
 
+class MergeDeepConfig(BaseModel):
+    """Deep merge-ahead chains (task 3183, plans/deep-merge-ahead-prd.md α).
+
+    Lets a single verify cover a CHAIN of k queued merge items (one scratch
+    worktree, sequential in-order merges, one verify on the tip) instead of one
+    item at a time, so a passing tip lands the whole clean prefix in one round.
+
+    ``chain_cap`` is the single gate for the entire feature. The dispatch
+    contract (PRD §Contract) is: a chain is built iff the second verify slot is
+    free AND ``chain_cap > 0`` AND the merge queue holds >= 2 mergeable items,
+    with ``target_depth = min(len(queue), chain_cap, halving_state)``. The
+    CONSUMERS of that contract are β (task 3184, the chain builder) and γ (task
+    3185, the dispatch gate) — this module only carries the knob, and nothing in
+    the orchestrator reads it yet.
+
+    ``chain_cap=0`` (the shipped default) is the KILL SWITCH: with the cap at
+    zero the gate above can never open, so no chain code runs on any dispatch
+    path and behaviour is byte-identical to pre-PRD merging. This mirrors
+    :class:`SpeculationProbeConfig`'s ``probe_fraction=0.0`` precedent, where a
+    zero-valued knob makes the whole mechanism fall through to the unchanged
+    path rather than being conditionally compiled out.
+
+    Cap STAGING is an operator/deploy decision, not a schema change: the PRD
+    stages 0 -> 6 (ζ canary, the study-validated depth) -> 32 (η2, ">= 2x the
+    max observed queue depth", i.e. uncapped in practice), each step applied by
+    ``scripts/merge-deep-set-cap.sh`` against the target project's
+    ``dark-factory-orchestrator.yaml``.
+
+    Plain BaseModel (no ``frozen``, no ``validate_assignment``) so ``_set_leaf``
+    can mutate it in place on hot-reload and held references observe the update
+    (invariant I3) — see :class:`RetentionConfig`'s docstring, below, for the
+    same requirement.
+
+    Every leaf is green-tier hot-reloadable via RELOADABLE_FIELDS (PRD decision
+    #7), so an operator can enable, retune, or KILL the feature (cap -> 0) via
+    ``mcp__escalation__reload_config`` without a process restart.
+    """
+
+    chain_cap: int = Field(
+        default=0,
+        description=(
+            'Maximum number of queued items a single deep merge-ahead chain may '
+            'contain. 0 (the default) disables the feature entirely -- the kill '
+            'switch: no chain is ever built, so merge behaviour is byte-identical '
+            'to pre-task-3183 behaviour.'
+        ),
+    )
+
+
 class RetentionConfig(BaseModel):
     """Retention bounds for the archived-transcript tree (task 2742, PRD α).
 
@@ -3747,6 +3796,12 @@ class OrchestratorConfig(BaseSettings):
     # 2340's depth telemetry). An absent stanza in orchestrator.yaml yields
     # the disabled-by-default instance (probe_fraction=0.0, byte-identical).
     speculation_probe: SpeculationProbeConfig = Field(default_factory=SpeculationProbeConfig)
+
+    # Deep merge-ahead chains (task 3183, plans/deep-merge-ahead-prd.md α).
+    # An absent stanza in orchestrator.yaml yields the kill-switch instance
+    # (chain_cap=0, byte-identical current merge behaviour); the shipped
+    # defaults.yaml declares the block explicitly so the knob is discoverable.
+    merge_deep: MergeDeepConfig = Field(default_factory=MergeDeepConfig)
 
     # Agent-transcript archival (task 2742, plans/agent-transcript-archival-prd.md
     # alpha). An absent stanza yields the enabled-by-default instance; the
