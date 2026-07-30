@@ -242,3 +242,47 @@ this record transcribes rather than silently re-presents them as its own computa
   `reify_task_12` is 2/4 for fable and 2/4 for opus-max — it is high-variance for
   *every* candidate, not a fable-specific weakness, and whichever candidate wins its
   coin flip in a given run wins the aggregate comparison.
+
+---
+
+## 6. End-to-end confirm stage: NOT RUN
+
+_RAW OBSERVATION._ The PRD's τ1 recipe conditionally calls for an `eval-confirm`
+stage (end-to-end, both architect and implementer live, ≥3 trials) whenever an
+architect other than production tops the screen. **This did not run.** That absence
+is recorded here as an absence, with its negative evidence, rather than by
+fabricating an end-to-end table.
+
+**The evidence.** `run_end_to_end` stamps every end-to-end cell's config name as the
+architect+implementer pair, joined with `+`:
+`config_name = f'{arch_config.name}+{impl_config.name}'`
+(`orchestrator/src/orchestrator/evals/runner.py:840`). `save_result` then writes each
+cell to `{result.task_id}__{result.config_name}__{result.run_id}.json`
+(`runner.py:1310`). A confirm cell would therefore necessarily appear as a
+`+`-containing filename under `evals/results/` — and **no such file exists**: a scan
+of the results directory finds zero filenames containing `+`.
+
+The only non-architect config names written to that directory since 2026-07-26 are
+`claude-sonnet-max`, `claude-opus-max`, `claude-opus-high`, `judge-sonnet` and
+`judge-haiku` (7 cells each) — the OFAT screen's own ride-along implementer/judge
+baseline cells (PRD decision 2), not a confirm batch.
+
+**The operator's stated reason (esc-2862-1).** The confirm stage reuses the same 6
+fixtures × 3 trials as the screen, so it would inherit the identical
+high-variance-fixture problem documented in §5 rather than resolving it; and it
+measures end-to-end $/done, not architect plan quality, so even a clean run would not
+directly settle the architect question this record answers. On that basis the
+operator judged it would not be a good use of spend and did not launch it.
+
+**The honest wrinkle.** The recipe's step-4 trigger condition *did* fire —
+`architect-fable-high` topped the screen on both `planRate` and `doneRate` (§3) — so
+the confirm was skipped by operator judgement, not because the gate's own trigger
+went unmet. The triage note explicitly surfaced this as a spend decision and asked
+Leo to authorise the confirm run; the resolution then closed the gate without
+launching it (see esc-2862-1's triage note, "WHY THE GATE STILL DOES NOT CLOSE" and
+its resolution's disposition).
+
+**Consequence for downstream consumers.** End-to-end composite, $/done, and their
+CI95 for the fable-vs-incumbent confirm pair are **unavailable**. The recommendation
+in §7 rests on the screen (§3-§5) alone — it does not, and cannot, cite an end-to-end
+number.
