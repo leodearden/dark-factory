@@ -617,6 +617,23 @@ class VerifyCoverage:
     cap: int | None = None
 
 
+@dataclass
+class DryRunFiling:
+    """Outcome record for ``--dry-run-filing``: every would-be
+    ``submit_task`` payload this run built was written to ``path`` as JSON
+    for human review, and NOTHING was filed into a live task tree.
+
+    ``payload_count`` is how many payloads the file holds. Reused by both
+    ``render_report`` (which must not let an empty ``filed_task_ids`` read
+    as a normal run that filed nothing) and ``CensusOutcome`` (so
+    ``main``'s summary line can name the review file instead of printing a
+    misleading ``filed_tasks=0``). ``None`` in place of this record means
+    the run filed normally."""
+
+    path: str
+    payload_count: int
+
+
 def render_report(
     *,
     date: str,
@@ -628,6 +645,7 @@ def render_report(
     filed_task_ids: list[str],
     cost_note: str,
     verify_coverage: VerifyCoverage | None = None,
+    dry_run: DryRunFiling | None = None,
 ) -> str:
     """Assemble the dated census report as markdown, purely from the
     pieces passed in -- no clock, no model call, no I/O. *date* and every
@@ -703,7 +721,15 @@ def render_report(
     lines.append("")
     lines.append("## Filed Tasks")
     lines.append("")
-    if filed_task_ids:
+    if dry_run is not None:
+        # Checked FIRST: under --dry-run-filing, filed_task_ids is empty by
+        # construction, and the plain "_none filed._" placeholder would read
+        # as a normal run that simply had nothing to file.
+        lines.append(
+            f"_dry-run: {dry_run.payload_count} payload(s) written to {dry_run.path} "
+            "-- NOTHING filed; review before filing._"
+        )
+    elif filed_task_ids:
         lines.extend(f"- {task_id}" for task_id in filed_task_ids)
     else:
         lines.append("_none filed._")
