@@ -1,0 +1,24 @@
+{
+  "corpus": {
+    "counts": {
+      "decisions_and_rationale": 812,
+      "entities_and_relations": 1204,
+      "observations_and_summaries": 946,
+      "preferences_and_norms": 233,
+      "procedural_knowledge": 407,
+      "temporal_facts": 588
+    },
+    "project_id": "dark_factory"
+  },
+  "eval_id": "malformed",
+  "metrics": [
+    {
+      "kind": "histogram",
+      "metric_id": "canonical-in-top-5",
+      "n": 30,
+      "value": 0.8
+    }
+  ],
+  "run_stamp": "20260704T031500Z",
+  "schema_version": 1
+}

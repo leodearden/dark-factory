@@ -50,8 +50,8 @@ class UsageCapConfig(BaseModel):
             raise ValueError(
                 "UsageCapConfig: 'pause_threshold' is no longer a valid field. "
                 "The proactive 'pause at N% of quota' path was removed when the "
-                "claude.ai usage API became unavailable; cap detection is now "
-                "reactive via stderr pattern matching (see UsageGate.check_at_startup). "
+                'claude.ai usage API became unavailable; cap detection is now '
+                'reactive via stderr pattern matching (see UsageGate.check_at_startup). '
                 "Remove 'usage_cap.pause_threshold' from your config — it would "
                 "otherwise be silently ignored (extra='ignore')."
             )
@@ -89,6 +89,7 @@ class UsageCapConfig(BaseModel):
             path = path.resolve()
         if not path.exists():
             import logging
+
             logging.getLogger(__name__).warning(
                 f'accounts_file not found: {path} — using inline accounts'
             )
