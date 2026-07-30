@@ -61,7 +61,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 # ---------------------------------------------------------------------------
 # Pinned M1 contract vocabulary
@@ -1065,4 +1065,131 @@ def claim_recalled(results: list, claim_query: ClaimQuery, k: int) -> ClaimOutco
 
     return ClaimOutcome(
         recalled=False, missing_needles=best_missing, matched_rank=None, scorable=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# contamination-share — how much of what came back belongs to another topic?
+#
+# This metric has to be WELL-POSED TODAY, before 3195/3201 widen the
+# `metadata.topic` vocabulary. The committed census measured 491 of 49,628
+# entries carrying a topic at all, so the overwhelming majority of results have
+# none, and any definition that treated "no topic" as evidence of anything
+# would be measuring stamping coverage while claiming to measure contamination.
+#
+# So: FOREIGN iff the result carries a topic that is IN the registry and is not
+# the probed one. Everything else is UNTOPICED and disclosed alongside the
+# count, never folded into the numerator. The definition is monotone in the
+# registry — widening it (which is exactly what 3201's retro stamping enables)
+# strictly widens the numerator's reach with no code change here.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ForeignRecord:
+    """One returned entry that belongs to a different registered topic."""
+
+    topic: str
+    """The topic being probed."""
+
+    foreign_topic: str
+    """The registered topic the returned entry actually carries.
+
+    Named, not counted: "3 foreign results" tells an operator that something
+    bled in, while "escalation-ladder bled into merge-lane" tells them where to
+    look. A bare count of a cross-topic leak is not actionable.
+    """
+
+    rank: int
+    result_id: str = ''
+
+
+class ContaminationOutcome(NamedTuple):
+    """``(foreign_records, foreign_count, untopiced_count, scored_total)``.
+
+    A NamedTuple so the four fields both unpack positionally (the shape the
+    caller's metric assembly wants) and read by name at the use site.
+
+    ``untopiced_count`` and ``scored_total`` are not diagnostics — they are the
+    honesty of the share. ``foreign_count / scored_total`` computed without
+    them looks authoritative while, on today's corpus, most of the denominator
+    is entries that could not have been classified either way.
+    """
+
+    foreign_records: tuple[ForeignRecord, ...]
+    foreign_count: int
+    untopiced_count: int
+    scored_total: int
+
+
+def _result_topic(result: Any) -> str | None:
+    """The result's ``metadata['topic']``, or None when it has no usable one.
+
+    Live metadata is not schema-enforced, so a topic that is missing, empty, or
+    not a string is treated identically: unusable. Coercing a list-valued topic
+    with ``str()`` would invent a topic value nobody wrote.
+    """
+    metadata = getattr(result, 'metadata', None)
+    if not isinstance(metadata, dict):
+        return None
+    topic = metadata.get('topic')
+    if not isinstance(topic, str) or not topic.strip():
+        return None
+    return topic
+
+
+def classify_contamination(
+    results: list,
+    entry: RegistryEntry,
+    registry: TopicRegistry,
+    k: int,
+) -> ContaminationOutcome:
+    """Classify the top-*k* of *results* against the topic being probed.
+
+    Foreignness is gated on registry membership in both directions: the
+    returned entry's topic must be one the registry knows, AND it must not fold
+    onto *entry*'s own slug. Comparison is via :func:`normalize_topic`, because
+    the corpus spells the same topic with ``-`` and ``_`` (the guard cluster's
+    ``architect-report-...`` against the census's
+    ``architect_report_...``) — an exact comparison would report a topic as
+    foreign to itself.
+
+    Returns the foreign records, their count, the untopiced count and the
+    scored total, so the share's denominator can never be reported without the
+    disclosure of how much of it was unclassifiable.
+    """
+    probed = normalize_topic(entry.topic)
+    known = registry.normalized_topics
+
+    foreign: list[ForeignRecord] = []
+    untopiced = 0
+    scored = 0
+
+    for rank, result in enumerate(results[:k], start=1):
+        scored += 1
+        raw_topic = _result_topic(result)
+        if raw_topic is None:
+            untopiced += 1
+            continue
+        folded = normalize_topic(raw_topic)
+        if folded == probed:
+            continue
+        if folded not in known:
+            # An unregistered topic is not evidence of contamination: the
+            # census counted 352 distinct live topic values against the ~32
+            # this registry adjudicates, so "unknown to us" is the common case
+            # and would swamp the numerator with entries nobody has judged.
+            untopiced += 1
+            continue
+        foreign.append(ForeignRecord(
+            topic=entry.topic,
+            foreign_topic=raw_topic,
+            rank=rank,
+            result_id=_result_id(result),
+        ))
+
+    return ContaminationOutcome(
+        foreign_records=tuple(foreign),
+        foreign_count=len(foreign),
+        untopiced_count=untopiced,
+        scored_total=scored,
     )
