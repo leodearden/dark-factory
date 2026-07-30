@@ -10219,6 +10219,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
           occupancy: {hosts_total, hosts_busy, by_host} — per-host in-flight count.
           is_wip_halted: bool.
           halt_owner_esc_id: str or None.
+          owned_merge_worktrees: sorted resolved absolute path strings for this
+            worker's merge-worktree liveness ledger (the paths
+            _touch_owned_merge_worktrees heartbeats).  Read by
+            _inflight_worktree_is_stale so the disk-scan coalesce arm can tell
+            a heartbeat-pinned corpse from a foreign merger's worktree.
 
         Each entry dict contains:
           task_id, branch, state, enqueued_at, age_secs, position,
@@ -10561,6 +10566,24 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 'speculation_accounting': self.speculation_accounting_violations(),
                 'worktree_ledger': self.worktree_ledger_violations(),
             },
+            # task 3148 additive key: this worker's merge-worktree liveness
+            # ledger.  Consumed by _inflight_worktree_is_stale so the disk-scan
+            # coalesce arm (coalesce_or_enqueue_merge_request §2) can tell a
+            # heartbeat-pinned corpse (owned here, but no live entry for its
+            # branch) from a foreign / pre-restart merger's worktree (not owned
+            # here), which must still coalesce for crash-safety.  Pure
+            # synchronous read — no await, no git, no stat.  Resolved absolute
+            # strings so the value survives the JSON hop through
+            # get_merge_queue; `sorted` makes snapshot-diffing deterministic.
+            # Same .resolve() normalisation as worktree_ledger_violations, so
+            # the two ownership tests can never disagree.  No collision with
+            # existing keys (entries/depth/head_of_line/verify_in_progress/
+            # occupancy/is_wip_halted/halt_owner_esc_id/suffix_conflict_graph/
+            # metrics/frozen_prefix/two_layer_invariants/speculation/
+            # resource_audit).
+            'owned_merge_worktrees': sorted(
+                str(p.resolve()) for p in self._owned_merge_worktrees
+            ),
         }
 
     def _check_request_liveness(self, now: float, *, threshold_s: float | None = None) -> None:
