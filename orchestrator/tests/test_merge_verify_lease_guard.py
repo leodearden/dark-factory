@@ -570,6 +570,30 @@ class TestResetHoldsLaneLock:
                 'wait (the monkeypatched _RESET_WARM_LANE_LOCK_WAIT_SECS), not '
                 'the seed constant or a hardcoded default'
             )
+            # task 3003 amend (reviewer_comprehensive, error_message_accuracy):
+            # the replaced bare RuntimeError named the tree it was protecting
+            # ('refusing to mutate {warm_path} unprotected'); the typed raise
+            # must keep that context rather than only the lock inode.
+            assert (
+                excinfo.value.protected_path
+                == real_git_ops.persistent_merge_worktree_path
+            ), (
+                'the typed exception must name the warm worktree the refusal '
+                'is protecting, which the lock path alone does not convey'
+            )
+            _msg = str(excinfo.value)
+            assert str(real_git_ops.persistent_merge_worktree_path) in _msg, (
+                f'the message must still name the protected tree; got {_msg!r}'
+            )
+            # …and it must state only what was OBSERVED, never the caller's
+            # disposition: this exact raise site is ALSO reached by cli.py's
+            # `verify-merge` (via acquire_host_verify_worktree), where it is a
+            # TERMINAL bail — telling that operator the dispatch is being
+            # 'deferred' and will be retried would be simply false.
+            assert 'deferring' not in _msg.lower(), (
+                f'the message must be caller-neutral — the merge worker defers '
+                f'and logs so itself, but verify-merge exits; got {_msg!r}'
+            )
 
             _, head_sha, _ = await _run(
                 ['git', 'rev-parse', 'HEAD'],

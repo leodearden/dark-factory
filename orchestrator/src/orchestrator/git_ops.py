@@ -1234,35 +1234,53 @@ class MergeVerifyLeaseContended(RuntimeError):
     ``counts_against_requeue_cap=False``) mirrors MergeVerifyLeaseHeld's — a
     contended lane is a transient "come back later," not a task failure.
 
+    The message states only what was OBSERVED — the lock, the wait, the
+    acquire, and the refusal to proceed — never what the caller will do next
+    (task 3003 amend, reviewer_comprehensive error_message_accuracy).  The
+    disposition is NOT a property of this exception: the merge worker defers and
+    re-queues (and logs so itself), while ``cli.py``'s ``verify-merge`` lets the
+    same raise propagate as a TERMINAL bail — "deferring this dispatch" would
+    tell that operator the exact opposite of what just happened.
+
     Args:
         lock_path: The contended ``<lane_dir>.lock``.
         wait_secs: The bounded wait that elapsed before giving up.
-        operation: Optional name of the acquire that contended, used ONLY to
-            shape the message so an operator log says WHICH acquire lost the
-            race.  ``None`` (the default) reproduces the task-2828 message
-            byte-for-byte, keeping every existing raiser and test unchanged.
-            The ``(lock_path, wait_secs)`` positional signature is likewise
-            unchanged.
+        operation: Name of the acquire that contended, so an operator log says
+            WHICH one lost the race.  Defaults to the task-2828 lease acquire
+            (the original raiser), so the ``(lock_path, wait_secs)`` positional
+            signature keeps working unchanged for every existing caller and
+            test.  ONE message template, not one per raiser: nothing matches on
+            the wording (only on ``lock_path``/``wait_secs``), so a second
+            f-string would be duplication whose only real effect is letting the
+            two variants drift (task 3003 amend, reviewer_comprehensive
+            simplification).
+        protected_path: Optional tree the refusal is protecting, named in the
+            message when given.  The reset's replaced bare ``RuntimeError`` said
+            "refusing to mutate {warm_path} unprotected"; this keeps that one
+            piece of context — WHICH tree was being guarded — which the lock
+            path alone does not convey.
     """
 
     def __init__(
-        self, lock_path: Path, wait_secs: float, *, operation: str | None = None,
+        self,
+        lock_path: Path,
+        wait_secs: float,
+        *,
+        operation: str = 'the merge-verify lease acquire',
+        protected_path: Path | None = None,
     ):
         self.lock_path = lock_path
         self.wait_secs = wait_secs
         self.operation = operation
-        if operation is None:
-            super().__init__(
-                f'merge-verify lane lock {lock_path} still contended after a '
-                f'{wait_secs}s bounded wait — deferring this dispatch rather than '
-                f'running the verify unprotected'
-            )
-        else:
-            super().__init__(
-                f'merge-verify lane lock {lock_path} still contended after a '
-                f'{wait_secs}s bounded wait during {operation} — deferring this '
-                f'dispatch rather than proceeding unprotected'
-            )
+        self.protected_path = protected_path
+        _protecting = (
+            f' (protecting {protected_path})' if protected_path is not None else ''
+        )
+        super().__init__(
+            f'merge-verify lane lock {lock_path} still contended after a '
+            f'{wait_secs}s bounded wait during {operation}{_protecting} — '
+            f'refusing to proceed unprotected'
+        )
 
 
 async def _run(
@@ -9108,7 +9126,11 @@ class GitOps:
             raise MergeVerifyLeaseContended(
                 lock_path,
                 _RESET_WARM_LANE_LOCK_WAIT_SECS,
-                operation='warm merge-worktree reset',
+                operation='the warm merge-worktree reset',
+                # Restores the one piece of context the replaced bare
+                # RuntimeError carried ('refusing to mutate {warm_path}
+                # unprotected'): WHICH tree this refusal is protecting.
+                protected_path=warm_path,
             )
         try:
             if not await self._is_registered_worktree(warm_path):
