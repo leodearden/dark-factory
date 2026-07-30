@@ -1052,3 +1052,358 @@ class TestA1VerifyRemainsTheGate:
         assert green_checkpoint_at_tip(
             workflow.event_store, EventType.workflow_verify, workflow.task_id, tip,
         ) is True
+
+
+# ---------------------------------------------------------------------------
+# step-13 RED: the execute_skipped work entry must fail CLOSED on provenance
+# ---------------------------------------------------------------------------
+#
+# Review blocker (robustness / false-DONE at workflow.py:6193): the entry's
+# steps_completed is derived purely from `status == 'done'` and ignores
+# `commit` entirely. α's authoring-time guard `_sha_exists_on_branch`
+# (mcp/plan_tools.py:514) is `git merge-base --is-ancestor <sha> HEAD`, which
+# is satisfied by `base_commit` ITSELF and by every main ancestor below base.
+# An architect can therefore pre-satisfy every step against base-reachable
+# shas on a branch carrying ZERO commits beyond base and still get a
+# `committed: True` work entry — which _iteration_entry_is_work classifies as
+# real work, which lets _recover_before_merge resolve has_work=True and
+# recovery-DONE a branch that implemented nothing.
+#
+# The fix belongs at the WRITER: only ids whose recorded commit is a genuine
+# member of `base_commit..HEAD` may be named. `phase_skipped` stays
+# unconditional (the skip really happened — honest observability), and now
+# also reports the divergence between what the plan claims and what the
+# branch can back.
+
+
+_ABSENT_SHA = 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef'
+"""Syntactically valid 40-hex sha that names no object in the test repo."""
+
+
+async def _advance_main(config: OrchestratorConfig, marker: str) -> None:
+    """Add one real commit to main so the worktree's base has an ancestor.
+
+    Needed to build case (d): a done step whose commit is a REAL main commit
+    that is nonetheless below base and therefore not beyond-base work.
+    """
+    root = config.project_root
+    (root / f'{marker}.py').write_text(f'{marker} = 1\n')
+    await _run(['git', 'add', '-A'], cwd=root)
+    await _run(['git', 'commit', '-m', f'chore: {marker}'], cwd=root)
+
+
+def _write_steps_plan(
+    artifacts: TaskArtifacts,
+    workflow: TaskWorkflow,
+    steps: list[dict],
+    prerequisites: list[dict] | None = None,
+) -> None:
+    """Write a plan with an arbitrary step/prerequisite shape."""
+    artifacts.write_plan({
+        'task_id': '42',
+        'title': 'X',
+        'analysis': 'A',
+        'prerequisites': [dict(p) for p in (prerequisites or [])],
+        'steps': [dict(s) for s in steps],
+    })
+    artifacts.stamp_plan_provenance(workflow.session_id)
+    workflow.plan = artifacts.read_plan()
+
+
+def _step(step_id: str) -> dict:
+    return {
+        'id': step_id, 'type': 'impl', 'description': f'do {step_id}',
+        'status': 'pending', 'commit': None,
+    }
+
+
+def _skip_event(workflow: TaskWorkflow) -> dict:
+    """The single phase_skipped(phase='execute') row, asserted to be unique."""
+    skips = workflow.event_store.of_type(  # type: ignore[attr-defined]
+        EventType.phase_skipped, phase='execute',
+    )
+    assert len(skips) == 1, (
+        f'phase_skipped(execute) must stay unconditional and unique, got {skips}'
+    )
+    return skips[0]
+
+
+def _skipped_entries(artifacts: TaskArtifacts) -> list[dict]:
+    entries, corrupted = artifacts.read_iteration_log()
+    assert corrupted == []
+    return [e for e in entries if e.get('event') == 'execute_skipped']
+
+
+@pytest.mark.asyncio
+class TestSkippedExecuteEntryRequiresBeyondBaseProvenance:
+    """The durable work entry must be backed by commits in ``base..HEAD``."""
+
+    async def _worktree(self, config, git_ops, task_assignment):
+        """Real worktree + workflow, base stamped, tip AT base."""
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        workflow, artifacts = _make_workflow(
+            config, git_ops, task_assignment, wt_info.path,
+        )
+        artifacts.update_base_commit(wt_info.base_commit)
+        _stub_execute_collaborators(workflow)
+        return workflow, artifacts, wt_info.path, wt_info.base_commit
+
+    # -- (a) PREMISE PIN ---------------------------------------------------
+
+    async def test_alpha_guard_admits_base_and_below_base_shas(
+        self, config, git_ops, task_assignment,
+    ):
+        """WHY status alone is insufficient: α's guard is reachability-only.
+
+        If α's ``_sha_exists_on_branch`` is ever tightened to REJECT
+        base-reachable shas, this assertion fails loudly and the writer-side
+        filter below can be revisited rather than silently kept forever.
+        """
+        from orchestrator.mcp import plan_tools  # noqa: PLC0415
+
+        await _advance_main(config, 'below_base')
+        _rc, below_base_sha, _err = await _run(
+            ['git', 'rev-parse', 'HEAD~1'], cwd=config.project_root,
+        )
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+
+        assert plan_tools._sha_exists_on_branch(
+            wt_info.path, wt_info.base_commit,
+        ) is True, 'PREMISE: the guard admits base_commit itself'
+        assert plan_tools._sha_exists_on_branch(
+            wt_info.path, below_base_sha,
+        ) is True, 'PREMISE: the guard admits arbitrary main ancestors below base'
+        assert plan_tools._sha_exists_on_branch(
+            wt_info.path, _ABSENT_SHA,
+        ) is False, 'PREMISE: the guard does reject a non-existent sha'
+
+    # -- (b) every step pre-satisfied against base, zero beyond-base work --
+
+    async def test_all_steps_against_base_sha_write_no_entry(
+        self, config, git_ops, task_assignment,
+    ):
+        workflow, artifacts, _wt, base_sha = await self._worktree(
+            config, git_ops, task_assignment,
+        )
+        _write_steps_plan(
+            artifacts, workflow,
+            steps=[_step('step-1'), _step('step-2')],
+            prerequisites=[_step('pre-1')],
+        )
+        for item_id in ('pre-1', 'step-1', 'step-2'):
+            assert artifacts.mark_step_committed(item_id, base_sha) is True
+        assert artifacts.get_pending_steps() == []
+        workflow.plan = artifacts.read_plan()
+
+        outcome = await workflow._execute_iterations()
+
+        assert outcome == WorkflowOutcome.DONE
+        # Honest observability is unconditional — the skip DID happen.
+        event = _skip_event(workflow)
+        assert set(event['data']['done_step_ids']) == {'pre-1', 'step-1', 'step-2'}
+        assert event['data']['committed_step_ids'] == [], (
+            'No step may claim provenance the branch cannot back, got '
+            f"{event['data']['committed_step_ids']}"
+        )
+        # …but no work entry, so the merge guard cannot recovery-DONE.
+        assert _skipped_entries(artifacts) == [], (
+            'A branch with zero commits beyond base must write no work entry'
+        )
+        assert workflow._has_prior_implementation(wt_head=None).has_work is False, (
+            '_recover_before_merge must keep the explicitly-handled spurious '
+            'merge-signal path, not recovery-DONE a branch with no work'
+        )
+
+    # -- (c) done with NO commit at all ------------------------------------
+
+    async def test_commit_less_done_step_is_excluded(
+        self, config, git_ops, task_assignment,
+    ):
+        """``update_step_status(id, 'done')`` permits ``commit=None``
+        (artifacts.py:708) — status alone must never count as provenance,
+        even on a branch that DOES carry real beyond-base commits."""
+        workflow, artifacts, wt, _base = await self._worktree(
+            config, git_ops, task_assignment,
+        )
+        _write_steps_plan(artifacts, workflow, steps=[_step('step-1')])
+        (wt / 'impl.py').write_text('x = 1\n')
+        real_sha = await git_ops.commit(wt, 'feat: real beyond-base work')
+        assert real_sha
+
+        artifacts.update_step_status('step-1', 'done')
+        assert artifacts.get_pending_steps() == []
+        assert artifacts.read_plan()['steps'][0]['commit'] is None
+        workflow.plan = artifacts.read_plan()
+
+        outcome = await workflow._execute_iterations()
+
+        assert outcome == WorkflowOutcome.DONE
+        event = _skip_event(workflow)
+        assert event['data']['done_step_ids'] == ['step-1']
+        assert event['data']['committed_step_ids'] == []
+        assert _skipped_entries(artifacts) == [], (
+            'A commit-less done step is not provenance for anything'
+        )
+
+    # -- (d) done with a commit OUTSIDE base..HEAD -------------------------
+
+    async def test_below_base_and_absent_shas_are_excluded(
+        self, config, git_ops, task_assignment,
+    ):
+        await _advance_main(config, 'below_base')
+        _rc, below_base_sha, _err = await _run(
+            ['git', 'rev-parse', 'HEAD~1'], cwd=config.project_root,
+        )
+        workflow, artifacts, wt, base_sha = await self._worktree(
+            config, git_ops, task_assignment,
+        )
+        assert below_base_sha != base_sha, 'Setup: need a real ancestor below base'
+        _write_steps_plan(
+            artifacts, workflow, steps=[_step('step-1'), _step('step-2')],
+        )
+        (wt / 'impl.py').write_text('x = 1\n')
+        assert await git_ops.commit(wt, 'feat: real beyond-base work')
+
+        assert artifacts.mark_step_committed('step-1', below_base_sha) is True
+        assert artifacts.mark_step_committed('step-2', _ABSENT_SHA) is True
+        assert artifacts.get_pending_steps() == []
+        workflow.plan = artifacts.read_plan()
+
+        outcome = await workflow._execute_iterations()
+
+        assert outcome == WorkflowOutcome.DONE
+        event = _skip_event(workflow)
+        assert set(event['data']['done_step_ids']) == {'step-1', 'step-2'}
+        assert event['data']['committed_step_ids'] == [], (
+            'Neither a below-base main commit nor an absent sha is beyond-base work'
+        )
+        assert _skipped_entries(artifacts) == []
+
+    # -- (e) MIXED plan ----------------------------------------------------
+
+    async def test_mixed_plan_names_only_the_beyond_base_step(
+        self, config, git_ops, task_assignment,
+    ):
+        workflow, artifacts, wt, base_sha = await self._worktree(
+            config, git_ops, task_assignment,
+        )
+        _write_steps_plan(
+            artifacts, workflow,
+            steps=[_step('step-good'), _step('step-base'), _step('step-bare')],
+        )
+        (wt / 'impl.py').write_text('x = 1\n')
+        good_sha = await git_ops.commit(wt, 'feat: real beyond-base work')
+        assert good_sha
+
+        assert artifacts.mark_step_committed('step-good', good_sha) is True
+        assert artifacts.mark_step_committed('step-base', base_sha) is True
+        artifacts.update_step_status('step-bare', 'done')
+        assert artifacts.get_pending_steps() == []
+        workflow.plan = artifacts.read_plan()
+
+        outcome = await workflow._execute_iterations()
+
+        assert outcome == WorkflowOutcome.DONE
+        event = _skip_event(workflow)
+        assert set(event['data']['done_step_ids']) == {
+            'step-good', 'step-base', 'step-bare',
+        }, 'The full claimed set stays visible in the event log'
+        assert event['data']['committed_step_ids'] == ['step-good'], (
+            'The divergence between claim and provenance must be visible, got '
+            f"{event['data']['committed_step_ids']}"
+        )
+
+        entries = _skipped_entries(artifacts)
+        assert len(entries) == 1, f'Expected exactly one entry, got {entries}'
+        entry = entries[0]
+        assert entry['agent'] == 'architect'
+        assert entry['steps_completed'] == ['step-good']
+        assert 'step-base' not in entry['steps_completed'], (
+            'A base-reachable sha is not beyond-base work'
+        )
+        assert 'step-bare' not in entry['steps_completed']
+        assert entry['committed'] is True
+
+    # -- (f) FAIL-CLOSED on a detector failure -----------------------------
+
+    async def _all_committed_for_real(self, config, git_ops, task_assignment):
+        """All steps pre-satisfied against genuine beyond-base shas."""
+        workflow, artifacts, wt, _base = await self._worktree(
+            config, git_ops, task_assignment,
+        )
+        _write_steps_plan(
+            artifacts, workflow,
+            steps=[_step('step-1'), _step('step-2')],
+            prerequisites=[_step('pre-1')],
+        )
+        (wt / 'red.py').write_text('def test_x(): assert True\n')
+        red_sha = await git_ops.commit(wt, 'test: RED — x')
+        (wt / 'impl.py').write_text('x = 1\n')
+        green_sha = await git_ops.commit(wt, 'feat: GREEN — x')
+        assert red_sha and green_sha
+        for item_id, sha in (
+            ('pre-1', red_sha), ('step-1', red_sha), ('step-2', green_sha),
+        ):
+            assert artifacts.mark_step_committed(item_id, sha) is True
+        assert artifacts.get_pending_steps() == []
+        workflow.plan = artifacts.read_plan()
+        return workflow, artifacts
+
+    async def test_detector_raising_writes_no_entry_and_does_not_raise(
+        self, config, git_ops, task_assignment,
+    ):
+        workflow, artifacts = await self._all_committed_for_real(
+            config, git_ops, task_assignment,
+        )
+        workflow._detect_committed_branch_work = AsyncMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError('git exploded'),
+        )
+
+        outcome = await workflow._execute_iterations()
+
+        assert outcome == WorkflowOutcome.DONE, 'A detector failure must not sink EXECUTE'
+        event = _skip_event(workflow)
+        assert event['data']['committed_step_ids'] == []
+        assert _skipped_entries(artifacts) == [], (
+            'No evidence ⇒ no work entry (fail closed)'
+        )
+
+    async def test_detector_returning_empty_writes_no_entry(
+        self, config, git_ops, task_assignment,
+    ):
+        workflow, artifacts = await self._all_committed_for_real(
+            config, git_ops, task_assignment,
+        )
+        workflow._detect_committed_branch_work = AsyncMock(  # type: ignore[method-assign]
+            return_value=[],
+        )
+
+        outcome = await workflow._execute_iterations()
+
+        assert outcome == WorkflowOutcome.DONE
+        event = _skip_event(workflow)
+        assert event['data']['committed_step_ids'] == []
+        assert _skipped_entries(artifacts) == []
+
+    # -- (g) REGRESSION ----------------------------------------------------
+
+    async def test_genuinely_all_committed_plan_still_writes_the_entry(
+        self, config, git_ops, task_assignment,
+    ):
+        """The tightening rejects ONLY unbacked provenance."""
+        workflow, artifacts = await self._all_committed_for_real(
+            config, git_ops, task_assignment,
+        )
+
+        outcome = await workflow._execute_iterations()
+
+        assert outcome == WorkflowOutcome.DONE
+        event = _skip_event(workflow)
+        assert set(event['data']['committed_step_ids']) == {
+            'pre-1', 'step-1', 'step-2',
+        }
+        entries = _skipped_entries(artifacts)
+        assert len(entries) == 1
+        assert set(entries[0]['steps_completed']) == {'pre-1', 'step-1', 'step-2'}
+        assert entries[0]['committed'] is True
+        assert workflow._has_prior_implementation(wt_head=None).has_work is True
