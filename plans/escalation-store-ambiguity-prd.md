@@ -315,6 +315,38 @@ No waivers required.
    during β — additive either way.
 3. **Whether γ3's identity block also lands on the merge/halt tools** served by
    the same server, or only the escalation-semantic ones. Decide during γ3.
+
+   *Widened during α (task 3163): decide the whole degraded-read surface, not only
+   the merge/halt identity block.* α denies just the two escalation READ tools
+   (`DISALLOW_ESCALATION_READS`) — the ones the three incidents actually misread.
+   But the recon-wired server is built by
+   `reconciliation/harness.py::_start_escalation_server` (`:2011-2016`) as
+   `create_escalation_server(self._escalation_queue)` — queue positional only, so
+   `harness`, `merge_queue`, `event_store`, `orch_config` and
+   `merge_inflight_registry` all stay `None`. Measured standalone behaviour of the
+   still-reachable non-escalation reads:
+
+   | tool | standalone return | shape |
+   |---|---|---|
+   | `get_task_runtime_state` | `{'offline': False, 'tasks': []}` — `escalation/server.py:1674-1675` returns `TaskRuntimeSnapshot()`, whose defaults are `offline=False`, `tasks=[]` | **silent false absence** — positively asserts "online, nothing running" |
+   | `get_merge_queue` | `{'error': 'Merge queue not available — orchestrator not running'}` (`server.py:1693-1694`) | loud, self-describing |
+   | `get_merge_halt_status` | `{'wired': False, 'error': 'escalation server running standalone'}` (`server.py:1648-1649`) | loud, self-describing |
+
+   The merge/halt pair therefore already fails loudly and needs nothing beyond the
+   identity block. `get_task_runtime_state` is the outlier: it reproduces the exact
+   categorical-empty failure mode this PRD exists to close, since a stage reading
+   `tasks: []` as "no task is running" is the same inference the three incidents
+   made from `[]` — and it is worse than `[]`, because `offline: False` asserts the
+   snapshot is live. That stages reach for this server unprompted is not
+   hypothetical: OQ4 below records a live Stage-2 transcript calling
+   `mcp__escalation__merge_status` on its own initiative. So γ3 should decide
+   `get_task_runtime_state` explicitly — either give it the same
+   never-silently-empty treatment as the escalation reads (deny it to stages, or
+   make the standalone envelope declare itself unwired the way
+   `get_merge_halt_status` does), or record why an unconditional empty-but-live
+   snapshot is safe here. α covers this case verbally only, via the
+   `ESCALATION_BOUNDARY_NOTE` "serves the RECONCILIATION store only" sentence;
+   nothing mechanical does.
 4. **Does `--disallowed-tools` reject a denied MCP tool on call, or omit it from
    the listing?** **RESOLVED during α (task 3163): OMISSION.** A denied tool is
    simply absent from the agent's visible tool set; there is no rejection event
