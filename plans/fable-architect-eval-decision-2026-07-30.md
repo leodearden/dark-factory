@@ -286,3 +286,70 @@ its resolution's disposition).
 CI95 for the fable-vs-incumbent confirm pair are **unavailable**. The recommendation
 in §7 rests on the screen (§3-§5) alone — it does not, and cannot, cite an end-to-end
 number.
+
+---
+
+## 7. Recommendation
+
+_INTERPRETATION — the only interpretive section in this record._ Everything above
+(§2-§6) is raw observation; this is where this record exercises judgment.
+
+### Recommend: DO NOT ADMIT
+
+Fable is not better, and not cheaper.
+
+**Not better.** The paired per-fixture CI95 on the mean `plan_quality` difference
+crosses zero ([-0.0433, +0.1633]); the permutation test gives p = 0.127, nowhere near
+conventional significance; the plan-rate Wilson CIs overlap almost completely;
+quality-when-planned is a tie (0.9188 vs 0.9087); and the entire nominal +0.060
+advantage collapses to +0.0073 the moment the single high-variance fixture
+(`reify_task_12`) is left out (§5). A result this fragile to one fixture is not a
+basis for a fleet-routing decision.
+
+**Not cheaper.** Fable is 1.20× the incumbent's cost per usable plan ($4.429 vs
+$3.693, §3), and it is the single most expensive candidate in the screen in absolute
+terms — $75.30 across its 18 cells, against the incumbent's $59.08 and opus-high's
+$42.66.
+
+**The verdict is INDISTINGUISHABLE-FROM-INCUMBENT** — not "fable loses," and
+explicitly not "fable wins." This matches esc-2862-1's resolution, which instructs
+this record directly: "Consumer task 2863 (τ2) should record 'indistinguishable / no
+admission', NOT 'fable wins'."
+
+### Each PRD-proposed reach, declined on its own terms
+
+The PRD names three ways fable could be admitted if ratified (Goal, §"admit fable as
+an architect option"). Each is declined here, for a distinct reason — none of them is
+"fable is bad":
+
+- **`metadata.model_overrides` only** (opt-in per task) — declined. There is no
+  measured advantage on this evidence to justify offering even an opt-in surface;
+  an override that never outperforms the default is a footgun, not a feature.
+- **Retry ladder's final rung** — declined. The ladder's final rung exists for the
+  case where cheaper/faster options have failed and reliability is what's needed
+  most; fable is statistically tied with the incumbent at a higher cost, which is
+  not a case for putting it at the top of a reliability ladder.
+- **Complexity/plan-shape architect rule** — declined. A routing rule needs a
+  demonstrated interaction between plan shape or task complexity and which candidate
+  performs better; this screen shows no such interaction — the one place fable
+  nominally leads (`reify_task_12`) is a coin-flip fixture, not a plan-shape pattern
+  (§5).
+
+### A positive finding, stated separately
+
+The earlier 22-fixture screen (`plans/eval-architect-effort-verdict-2026-07-27.md`)
+found fable the least reliable of four candidates (74% plan rate, worst of four) and
+flagged that as a preliminary signal against fable. **That signal is REFUTED by this
+campaign, not confirmed.** The 74% figure was cap contamination compounded by
+transient failures on high-variance fixtures, not a real reliability deficit — on
+clean, fully-scored cells fable's plan rate is the *highest* of the four candidates
+(94.4%, §3). The reason to decline admission here is **"no case on the merits,"** not
+**"fable is unreliable."** A future re-evaluation should not carry the old
+reliability concern forward as if this campaign had reaffirmed it.
+
+### What would change this answer
+
+Not a confirm batch (§6) — it would inherit the same variance problem rather than
+resolving it. What would move the needle is more trials concentrated on the
+high-variance fixtures identified in §5, `reify_task_12` above all, or widening the
+hard-fixture set so a single coin-flip fixture cannot decide the aggregate result.
