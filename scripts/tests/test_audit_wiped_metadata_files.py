@@ -32,10 +32,15 @@ from audit_wiped_metadata_files import (
     FIDELITY_LOCK_LEVEL,
     NO_MERGE_EVENT,
     NO_SUCCESSFUL_MERGE_SHA,
+    AuditCoverage,
     PlanFilesRecord,
+    ProjectAudit,
     TaskRecord,
+    WipeCandidate,
     audit_project,
     classify_wipe_signature,
+    format_json,
+    format_report,
     load_merge_signatures,
     load_plan_files_from_disk,
     load_plan_files_from_events,
@@ -1027,3 +1032,165 @@ def test_audit_project_on_an_empty_project_reports_zero_and_does_not_crash(tmp_p
     assert audit.candidates == []
     assert audit.coverage.total_tasks == 0
     assert audit.coverage.tasks_without_plan_signal == 0
+
+
+# ---------------------------------------------------------------------------
+# format_report / format_json.
+#
+# The COVERAGE block is LOAD-BEARING, not decoration: without it a reader sees
+# "N damaged tasks" and concludes that is the whole blast radius, when in fact
+# most tasks have no recoverable plan.files and are genuinely UNKNOWN.
+# ---------------------------------------------------------------------------
+
+
+def _candidate(task_id=1, **overrides):
+    fields = {
+        "tag": "master",
+        "task_id": task_id,
+        "status": "done",
+        "plan_files": ("a.py", "b.py"),
+        "plan_files_source": "meta_root_plan_json",
+        "plan_files_fidelity": FIDELITY_FILE_LEVEL,
+        "wipe_signature": CONFIRMED_NULL_SHA_DONE_PATH,
+    }
+    fields.update(overrides)
+    return WipeCandidate(**fields)
+
+
+def _coverage(root="/tmp/proj", **overrides):
+    fields = {
+        "project_root": root,
+        "total_tasks": 3264,
+        "tasks_with_file_level_signal": 815,
+        "tasks_with_lock_level_signal_only": 400,
+        "tasks_without_plan_signal": 2049,
+        "plan_records_without_task": 2,
+    }
+    fields.update(overrides)
+    return AuditCoverage(**fields)
+
+
+def _audit(candidates=(), root="/tmp/proj", **coverage_overrides):
+    return ProjectAudit(
+        project_root=root,
+        candidates=list(candidates),
+        coverage=_coverage(root, **coverage_overrides),
+    )
+
+
+def test_format_report_renders_every_field_a_repair_would_need(tmp_path):
+    """(a) each line carries task_id, tag, status, signature, source,
+    fidelity and the plan file count, grouped under the project root."""
+    report = format_report([_audit([_candidate(2464)])])
+
+    assert "/tmp/proj" in report
+    assert "2464" in report
+    assert "master" in report
+    assert "done" in report
+    assert CONFIRMED_NULL_SHA_DONE_PATH in report
+    assert "meta_root_plan_json" in report
+    assert FIDELITY_FILE_LEVEL in report
+    assert "2" in report  # the plan file count
+
+
+def test_format_report_always_prints_coverage_even_with_zero_candidates():
+    """(b) THE LOAD-BEARING ASSERTION. A zero-candidate audit must still state
+    how much of the population it could not see, instead of printing a bare
+    'no candidates' line that reads as 'nothing is damaged'."""
+    report = format_report([_audit([])])
+
+    assert "COVERAGE" in report
+    assert "3264" in report      # total tasks scanned
+    assert "2049" in report      # tasks with NO recoverable plan signal
+    lowered = report.lower()
+    assert "no plan signal" in lowered or "without plan signal" in lowered
+
+
+def test_format_report_marks_lock_level_candidates_with_an_explicit_caveat():
+    """(c) a LOCK_LEVEL candidate's paths are MODULE paths, and the report
+    must say so — a repair that backfilled them verbatim would corrupt
+    metadata.files."""
+    report = format_report(
+        [
+            _audit(
+                [
+                    _candidate(
+                        7,
+                        plan_files=("orchestrator",),
+                        plan_files_source="set_to_plan_event",
+                        plan_files_fidelity=FIDELITY_LOCK_LEVEL,
+                    )
+                ]
+            )
+        ]
+    )
+
+    lowered = report.lower()
+    assert "lock-level" in lowered or "lock_level" in lowered
+    assert "module" in lowered
+    assert "not" in lowered  # "not verbatim plan.files"
+
+
+def test_format_report_separates_contradicted_from_confirmed_candidates():
+    """(d) CONTRADICTED_REAL_MERGE_SHA candidates go in their own section so a
+    repair job cannot blindly consume them alongside confirmed ones."""
+    report = format_report(
+        [
+            _audit(
+                [
+                    _candidate(1, wipe_signature=CONFIRMED_NULL_SHA_DONE_PATH),
+                    _candidate(2, wipe_signature=CONTRADICTED_REAL_MERGE_SHA),
+                ]
+            )
+        ]
+    )
+
+    assert CONTRADICTED_REAL_MERGE_SHA in report
+    confirmed_at = report.index(CONFIRMED_NULL_SHA_DONE_PATH)
+    contradicted_at = report.index(CONTRADICTED_REAL_MERGE_SHA)
+    # Distinct sections, confirmed first.
+    assert confirmed_at < contradicted_at
+    lowered = report.lower()
+    assert "contradicted" in lowered
+
+
+def test_format_json_emits_an_object_with_untruncated_files_and_coverage():
+    """(e)(f) a JSON OBJECT (not a bare array), carrying full file lists plus
+    coverage, round-tripping through json.loads so a follow-up repair task can
+    consume it directly."""
+    long_files = tuple(f"pkg/module_{i}.py" for i in range(40))
+    payload = json.loads(
+        format_json([_audit([_candidate(2464, plan_files=long_files)])])
+    )
+
+    assert isinstance(payload, dict)
+    assert list(payload) == ["projects"]
+    project = payload["projects"][0]
+    assert project["project_root"] == "/tmp/proj"
+    assert project["coverage"]["total_tasks"] == 3264
+    assert project["coverage"]["tasks_without_plan_signal"] == 2049
+    candidate = project["candidates"][0]
+    assert candidate["task_id"] == 2464
+    assert candidate["plan_files"] == list(long_files)  # UNTRUNCATED
+    assert candidate["plan_files_fidelity"] == FIDELITY_FILE_LEVEL
+    assert candidate["wipe_signature"] == CONFIRMED_NULL_SHA_DONE_PATH
+
+
+def test_format_json_includes_zero_candidate_projects_with_their_coverage():
+    """A clean project still appears, with its coverage — the JSON consumer
+    needs the same honesty about invisibility the human report gives."""
+    payload = json.loads(format_json([_audit([])]))
+
+    project = payload["projects"][0]
+    assert project["candidates"] == []
+    assert project["coverage"]["total_tasks"] == 3264
+
+
+def test_format_report_and_json_handle_multiple_projects():
+    audits = [_audit([_candidate(1)], root="/tmp/a"), _audit([], root="/tmp/b")]
+
+    report = format_report(audits)
+    assert "/tmp/a" in report and "/tmp/b" in report
+
+    payload = json.loads(format_json(audits))
+    assert [p["project_root"] for p in payload["projects"]] == ["/tmp/a", "/tmp/b"]
