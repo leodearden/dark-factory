@@ -135,9 +135,29 @@
 #     that holds the lanes (so gc.sh's WORKTREES_DIR assignment is correct).
 #     Explicit --worktrees-dir / --base-target override the derived values, so the
 #     hermetic test harness continues to use arbitrary temp paths without change.
-#   - Reclaimability is computed purely from filesystem + git + flock; dark-factory
-#     FREE/ASSIGNED state is NOT consulted. "FREE/idle" ≈ no live consumer holding
-#     the lane flock (mirroring refresh-warm-base.sh reader-refcount GC).
+#   - Pass-1 reclaimability is decided by dark-factory's OWN durable lane record
+#     at <worktrees-dir>/.lane-state/<lane>.json, read PER LANE through
+#     scripts/lib_lane_state.sh (task 3075, reify esc-5334-6). `assigned` and
+#     `in_use` preserve the lane; `released`/`seed`/`registered`, `quarantined`,
+#     and every unknown, unreadable or corrupt reading fall through to the gates
+#     below and then to reclaim.
+#     This REPLACES the rule that stood here until task 3075 — "reclaimability is
+#     computed purely from filesystem + git + flock; dark-factory FREE/ASSIGNED
+#     state is NOT consulted; FREE/idle ≈ no live consumer holding the lane
+#     flock". That rule adopted the wrong repo boundary and was false in BOTH
+#     halves: the inv.2 flock is held only across the acquire reseed and across
+#     run_scoped_verification, never across the implement phase, so for most of
+#     an ASSIGNED lane's life the flock is free and task 5326's always-reclaim —
+#     written for "a FREE pool lane" — fired on lanes dark-factory had assigned
+#     to a live task. It is deleted rather than softened.
+#     FAIL-OPEN, and the direction is not negotiable: an unknown/unreadable/
+#     corrupt record reclaims. Preserving on unknown would freeze reclaim the
+#     moment .lane-state/ is absent or unreadable, re-creating the 2026-07-10
+#     ENOSPC accretion outage. A corrupt record additionally warns (see the
+#     record gate in Pass 1), because it means an assigned lane has silently
+#     degraded back to the pre-3075 regime; a merely ABSENT record does not,
+#     because that is the ordinary reading for every _iact-* and manual operator
+#     worktree and a per-entry warn would drown the signal.
 #   - inv.preserve shared predicate (_is_reclaimable): skip on dirty tracked changes
 #     (git status --porcelain), unlanded ahead-of-main (merge-base --is-ancestor),
 #     or live consumer (flock -n -x <dir>.lock fails).
@@ -155,13 +175,25 @@
 #     reused; committed work lives on refs/heads/task/NNNN and reset touches
 #     only target/, never the source tree or branch (sizing-lifecycle T1).
 #     Preserving a flock-free lane's target/ thus yields zero warm-cache value
-#     and only accretes disk. Pass 1 has exactly TWO preserve gates, checked in
-#     this order: (1) the live-consumer flock (inv.2), and (2) a live PROCESS
-#     REFERENCE at or under the lane dir (cwd / open fd / mmap — task 5572).
-#     This subsumes the former Tier-3 terminal-task reclaim
+#     and only accretes disk. Task 5326's rule survives VERBATIM for a lane that
+#     is genuinely FREE; what task 3075 changed is that FREE is now DETERMINED
+#     from dark-factory's record rather than APPROXIMATED from the flock.
+#     Pass 1 has THREE preserve gates, checked in this order: (1) the
+#     live-consumer flock (inv.2); (2) the durable LANE RECORD (task 3075);
+#     (3) a live PROCESS REFERENCE at or under the lane dir (cwd / open fd /
+#     mmap — task 5572). The record sits BETWEEN the other two because it is
+#     both the cheaper and the more decisive predicate — see the record gate's
+#     own note in Pass 1. This subsumes the former Tier-3 terminal-task reclaim
 #     (task 5167): the rebase-orphan ahead-of-main lane it targeted is now
 #     reclaimed by the general rule. Pass 2 keeps the clean+landed
 #     _is_reclaimable rule.
+#   - PASS 2 IS DELIBERATELY UNCHANGED — it does NOT read the lane record, and
+#     the scoping is substantive rather than an oversight. Pass 2's candidates
+#     are exactly the entries matching NEITHER --lane-glob NOR --protect-glob,
+#     i.e. not pool lanes, so the orchestrator mints no LaneLifecycle record for
+#     them by construction. A read there would be dead code that returns
+#     `unknown` for every candidate while implying a coverage that does not
+#     exist. live_ref_present remains their liveness guard (Block Q pins it).
 #   - Live-reference gate (task 5572, both passes): the inv.2 flock is held only
 #     across the ACQUIRE reseed, NOT across the consumer's long cargo verify
 #     build, so during that build the flock is FREE and always-reclaim would wipe
@@ -176,6 +208,18 @@
 #     snapshot, which would leave a lane that goes live mid-traversal
 #     unprotected across a 25-40 minute pass. Over-preserving is safe and
 #     TEMPORARY: a lingering reference costs one extra sweep.
+#     Since task 3075 it is Pass 1's LAST gate and the RECORDLESS FALLBACK
+#     (PRD warm-lane-infra-repatriation §D7): SUPERSEDED as the primary liveness
+#     oracle by the durable record, RETAINED because `_iact-*` and manual
+#     operator worktrees carry no record at all — and retained UNCONDITIONALLY
+#     for record-carrying lanes too. It is NOT gated on "record absent". Gating
+#     it that way would create a NEW under-preserving path: a lane whose record
+#     reads `released` while a straggler build process is still live would be
+#     reset — esc-5375-1 reopened, and precisely the failure class this work
+#     closes. Records are written at release time; processes can outlive the
+#     write. Running it for every lane the record did not already preserve costs
+#     nothing versus the pre-3075 behaviour, where it ran on every flock-free
+#     lane. (This answers PRD §11 open question 3, answered in place there too.)
 #   - COST REVERSAL, stated explicitly (task 5572 review). Moving from ONE batch
 #     /proc scan to a PER-ENTRY scan is O(entries × /proc), and the sweep comment
 #     this replaced called a per-entry scan "too costly for the hot path". That
@@ -197,6 +241,16 @@
 #       * awk's early exit only fires once EVERY candidate is found, so the
 #         common case (free entry, about to be reclaimed) always pays the full
 #         walk — and that is exactly the verdict that must be fresh.
+#     AMENDED by task 3075: every measurement above STANDS, but the per-lane
+#     budget changed and the reversal now runs the OTHER WAY. Pass 1 pays a ~1ms
+#     record read (one file read + a couple of seds) for EVERY lane, and the
+#     ~1.9s walk only for lanes the record did not already preserve — an
+#     ASSIGNED lane short-circuits before it. So the third bullet above ("in a
+#     pool at rest almost every lane is flock-free, budget for the full
+#     entries × 1.9s") is now the WORST case, reached when the pool is idle, and
+#     a BUSY pool gets cheaper the busier it is. That is the opposite direction
+#     to the reversal task 5572 had to accept, and it is bought with an
+#     AUTHORITATIVE predicate rather than a probe.
 #     What IS bought back, cheaply: live_ref_present short-circuits after the
 #     cwd/fd pass (~1.5s instead of ~1.9s for a live entry), and Pass 2 runs the
 #     ~18ms _is_reclaimable git pair BEFORE the walk so only an orphan that would

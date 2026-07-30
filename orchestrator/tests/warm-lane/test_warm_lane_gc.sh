@@ -28,8 +28,10 @@
 #   E — always-reclaim (task 5326): an AHEAD-OF-MAIN POOL LANE is now RECLAIMED
 #       (no --status-cmd wired — terminality- AND ahead-independent), while an
 #       AHEAD-OF-MAIN ORPHAN stays preserved by Pass-2 _is_reclaimable
-#   F — preserve a lane with a live-consumer lock — the SOLE remaining Pass-1
-#       preserve gate, holding even for a lane that is ALSO dirty+ahead (5326)
+#   F — preserve a lane with a live-consumer lock — ONE of Pass 1's preserve
+#       gates, holding even for a lane that is ALSO dirty+ahead (5326). It was
+#       the SOLE gate when 5326 collapsed the Tier-3 machinery; 5572 added the
+#       /proc live-reference gate and 3075 the durable-record gate (Block S)
 #   G — combined PRD δ signal: pool lanes (clean + dirty) reset, orphan removed,
 #       ahead orphan + live-consumer lane + protect-glob preserved + summary line
 #   K — disk-pressure fast-path: rm -rf target/ instead of an alpha reseed clone
@@ -618,15 +620,19 @@ assert "E5: stderr mentions unlanded/ahead-of-main preservation (orphan)" \
     bash -c 'printf "%s\n" "$1" | grep -qiE "unlanded|ahead|preserving"' _ "$ERR_OUT"
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Block F — live-consumer flock is the SOLE remaining Pass-1 preserve gate
+# Block F — the live-consumer flock is Pass 1's FIRST preserve gate
 # _lane-4: clean+landed, but a live consumer holds its flock — preserved.
 # _lane-5: dirty AND ahead-of-main AND a live consumer holds its flock — STILL
 # preserved. Under always-reclaim (task 5326) a dirty+ahead lane WOULD be
 # reclaimed if its flock were free (Blocks D/E); the flock alone keeps _lane-5,
-# isolating the live-consumer flock as the only Pass-1 preserve gate that survives.
+# isolating it from the dirty/ahead predicates this block's fixtures also carry.
+# It is no longer the SOLE Pass-1 gate — task 5572 added the /proc
+# live-reference gate (Block P) and task 3075 the durable lane-record gate
+# (Block S). Every lane here is recordless, so those two fall open and this
+# block still isolates the flock.
 # ──────────────────────────────────────────────────────────────────────────────
 echo ""
-echo "--- Block F: live-consumer flock is the sole Pass-1 preserve gate ---"
+echo "--- Block F: live-consumer flock is Pass 1's first preserve gate ---"
 
 F_ROOT="$(mktemp -d /tmp/test-gc-f-XXXXXX)"
 _TMPDIRS+=("$F_ROOT")
@@ -699,7 +705,8 @@ assert "F3: live-consumer lane _lane-4 divergent marker intact" \
     test -f "$F_WORKTREES/_lane-4/target/DIVERGENT_MARKER"
 assert "F4: stderr mentions live consumer preservation" \
     bash -c 'printf "%s\n" "$1" | grep -qiE "live.consumer|locked|preserving|consumer"' _ "$ERR_OUT"
-# _lane-5 (dirty+ahead, locked) STILL NOT reset — the flock is the sole gate.
+# _lane-5 (dirty+ahead, locked) STILL NOT reset — the flock alone accounts for
+# it (both other Pass-1 gates fall open: no record, no process reference).
 assert "F5: dirty+ahead live-consumer lane _lane-5 seed-script NOT invoked (flock wins)" \
     bash -c '[ ! -f "$1" ] || ! grep -q "_lane-5" "$1"' _ "$F_SEED_LOG"
 assert "F6: dirty+ahead live-consumer lane _lane-5 divergent marker intact" \
