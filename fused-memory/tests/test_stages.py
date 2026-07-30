@@ -17,6 +17,7 @@ from fused_memory.models.reconciliation import StageId, StageReport, Watermark
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.cli_stage_runner import (
     DISALLOW_BUILTIN,
+    DISALLOW_ESCALATION_READS,
     DISALLOW_MEMORY_WRITES,
     DISALLOW_TASK_WRITES,
     STAGE1_DISALLOWED,
@@ -76,6 +77,21 @@ def _scope(project_id: str, project_root: str) -> ProjectScope:
     return ProjectScope(ProjectId(project_id), ProjectRoot(project_root))
 
 
+def _mock_stage_deps() -> dict:
+    """Keyword deps for constructing any stage subclass in a unit test.
+
+    One construction shared by every caller, so a change to BaseStage's
+    constructor signature lands in exactly one place.
+    """
+    return {
+        'memory_service': AsyncMock(),
+        'taskmaster': AsyncMock(),
+        'journal': AsyncMock(),
+        'config': ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test'),
+        'scope': _scope('test_project', '/tmp/test'),
+    }
+
+
 def make_configured_task_knowledge_sync_stage(
     deps: dict, *, project_id: str, project_root: str, run_id: str = 'test-run'
 ) -> "TaskKnowledgeSync":
@@ -126,14 +142,23 @@ class TestDisallowedToolLists:
         for tool in DISALLOW_MEMORY_WRITES:
             assert tool not in STAGE1_DISALLOWED
 
-    def test_stage2_disallows_builtins_only(self):
-        """STAGE2_DISALLOWED must equal DISALLOW_BUILTIN.
+    def test_stage2_disallows_builtins_and_escalation_reads(self):
+        """Built-ins are blocked in Stage 2, and Stage 2 keeps memory + task writes.
 
-        Stage 2 has full memory + task access; only built-ins are blocked.
+        RETIRED ASSERTION: this test used to read ``STAGE2_DISALLOWED ==
+        DISALLOW_BUILTIN``.  That exact equality asserted the absence of EVERY
+        future denial class in Stage 2, and it is precisely the shape that kept
+        the ``mcp__escalation__*`` read gap invisible here — PRD §4 names
+        ``STAGE2_DISALLOWED = DISALLOW_BUILTIN`` as the mechanism of the bug
+        (task 3163).  The contract Stage 2 actually needs is now asserted
+        positively: built-ins denied, full memory + task access retained, so an
+        additive denial can land without failing the build for the right change.
         add_subtask was previously in a separate DISALLOW_SUBTASK_CREATE list,
         but the tool has been removed (DF-D).
         """
-        assert STAGE2_DISALLOWED == DISALLOW_BUILTIN
+        assert set(DISALLOW_BUILTIN).issubset(set(STAGE2_DISALLOWED))
+        for tool in DISALLOW_MEMORY_WRITES + DISALLOW_TASK_WRITES:
+            assert tool not in STAGE2_DISALLOWED, f'Stage 2 must retain write access to {tool}'
 
     def test_stage3_disallows_all_writes(self):
         assert set(DISALLOW_TASK_WRITES).issubset(set(STAGE3_DISALLOWED))
@@ -198,26 +223,81 @@ class TestDisallowedToolLists:
         assert 'mcp__fused-memory__get_cycle_summary_presence' not in STAGE1_DISALLOWED
         assert 'mcp__fused-memory__get_cycle_summary_presence' not in STAGE2_DISALLOWED
 
+    def test_escalation_reads_constant_is_exactly_the_two_read_tools(self):
+        """DISALLOW_ESCALATION_READS names the two escalation READ tools, nothing more.
+
+        Scoped deliberately tight: the denial exists because a per-task read
+        cannot be answered from a stage, not because the escalation surface is
+        off limits wholesale.  Anything broader would sweep up the sanctioned
+        write path (Stage 2 FIX D).
+        """
+        assert set(DISALLOW_ESCALATION_READS) == {
+            'mcp__escalation__get_pending_escalations',
+            'mcp__escalation__get_escalation',
+        }
+        assert len(DISALLOW_ESCALATION_READS) == 2, 'no duplicate entries'
+
+    def test_escalation_reads_denied_in_all_three_stages(self):
+        """Every stage must deny the escalation read tools (task 3163).
+
+        A recon stage's ``escalation`` MCP connection is wired to the
+        RECONCILIATION escalation queue, never to a project's queue, so a
+        per-task read from a stage returns ``[]`` CATEGORICALLY — not as a race.
+        Three incidents read that ``[]`` as proof that no escalation was ever
+        filed.  Stage 2 was the gap: ``STAGE2_DISALLOWED = DISALLOW_BUILTIN``
+        denied nothing else at all.
+        """
+        for stage_list, name in (
+            (STAGE1_DISALLOWED, 'STAGE1_DISALLOWED'),
+            (STAGE2_DISALLOWED, 'STAGE2_DISALLOWED'),
+            (STAGE3_DISALLOWED, 'STAGE3_DISALLOWED'),
+        ):
+            assert set(DISALLOW_ESCALATION_READS).issubset(set(stage_list)), (
+                f'{name} must deny the escalation read tools'
+            )
+
+    def test_escalate_blocker_stays_allowed_in_every_stage(self):
+        """The escalation WRITE path must never be swept up by the read denial.
+
+        ``escalate_blocker`` is the sole sanctioned recon escalation use — the
+        Stale Flag Escalation (FIX D) path in Stage 2 (prompts/stage2.py).
+        Over-denying breaks FIX D outright, so this is the anti-over-denial
+        guard, structurally identical to the read-tool carve-outs above.
+        """
+        for stage_list, name in (
+            (STAGE1_DISALLOWED, 'STAGE1_DISALLOWED'),
+            (STAGE2_DISALLOWED, 'STAGE2_DISALLOWED'),
+            (STAGE3_DISALLOWED, 'STAGE3_DISALLOWED'),
+        ):
+            assert 'mcp__escalation__escalate_blocker' not in stage_list, (
+                f'{name} must keep the sanctioned escalation write path'
+            )
+
+    def test_stage_hooks_return_lists_covering_escalation_reads(self):
+        """Pin the ``get_disallowed_tools()`` hook, not just the module constants.
+
+        The hook (stages/base.py) is what actually reaches ``--disallowed-tools``
+        on the spawned CLI, so a constant that no stage returns would deny
+        nothing in production.
+        """
+        deps = _mock_stage_deps()
+        for cls, stage_id in (
+            (MemoryConsolidator, StageId.memory_consolidator),
+            (TaskKnowledgeSync, StageId.task_knowledge_sync),
+            (IntegrityCheck, StageId.integrity_check),
+        ):
+            stage = cls(stage_id, **deps)
+            assert set(DISALLOW_ESCALATION_READS).issubset(set(stage.get_disallowed_tools())), (
+                f'{cls.__name__}.get_disallowed_tools() must cover the escalation reads'
+            )
+
 
 class TestStageSubclasses:
     """Each stage subclass returns the correct disallowed list."""
 
     @pytest.fixture
-    def config(self):
-        return ReconciliationConfig(
-            enabled=True,
-            explore_codebase_root='/tmp/test',
-        )
-
-    @pytest.fixture
-    def mock_deps(self, config):
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+    def mock_deps(self):
+        return _mock_stage_deps()
 
     def test_memory_consolidator_disallowed(self, mock_deps):
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
