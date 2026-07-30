@@ -209,6 +209,20 @@ _PLAN_CREATOR_TOOLS = [
     'mcp__plan-tools__report_task_already_done',
     'mcp__plan-tools__report_unactionable_task',
     'mcp__plan-tools__report_false_premise',
+    # Authoring-time pre-satisfy (task 3033 / PRD §A1, substrate from task 3030).
+    # mark_step_committed flips a step to `done` and tags its description
+    # `[COMMITTED <sha>]` WITHOUT an implementer turn — for the case where the
+    # branch being (re-)planned ALREADY carries that step's committed, green
+    # implementation. An all-pre-satisfied plan makes the EXECUTE loop a total
+    # no-op (0 iterations) and the branch flows PLAN → VERIFY → REVIEW → MERGE.
+    # Deliberately NOT added to _PLAN_STATUS_TOOLS (IMPLEMENTER/DEBUGGER): this
+    # is an AUTHORING-time authority. Those roles already hold mark_step_done,
+    # which suffices for attributing work they actually did; letting an
+    # implementer also assert committed provenance for work it did not do would
+    # defeat the TDD bookkeeping the iteration log and the phantom-done gate
+    # rely on. See tests/test_architect_all_committed_plan.py::
+    # TestArchitectCanReachMarkStepCommitted.
+    'mcp__plan-tools__mark_step_committed',
 ]
 
 _PLAN_STATUS_TOOLS = [
