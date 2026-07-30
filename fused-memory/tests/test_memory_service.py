@@ -1369,6 +1369,130 @@ class TestUpdateEdge:
         assert result['refreshed_nodes'] == ['n-src', 'n-tgt']
 
 
+# The three arm shapes update_memory accepts, as (label, kwargs). Every
+# assertion about the read leg must hold for ALL THREE: the two metadata-only
+# shapes are the §5(b) fast paths, where Qdrant answers acknowledged/completed
+# for an unknown point id — so they are precisely the arms an existence check
+# omission would turn into a silent false success.
+_UPDATE_MEMORY_ARMS = [
+    ('content_amend', {'content': 'amended text', 'reason': 'test amend'}),
+    ('metadata_patch', {'metadata_patch': {'topic': 'docs-prd-landing'}}),
+    ('metadata_delete_keys', {'metadata_delete_keys': ['topic']}),
+]
+
+
+def _journal_mock():
+    """A write journal double recording both journal layers update_memory writes."""
+    journal = MagicMock()
+    journal.log_write_op = AsyncMock()
+    journal.log_backend_op = AsyncMock()
+    return journal
+
+
+class TestUpdateMemoryExistenceCheck:
+    """MemoryService.update_memory §5(c) read leg — the anti-silent-success guard.
+
+    Task 3088. Qdrant's ``set_payload``/``delete_payload`` return
+    ``acknowledged``/``completed`` for an UNKNOWN point id rather than an error,
+    so without an explicit existence check the metadata-only fast paths would
+    manufacture a success envelope AND a journal row claiming a write that never
+    touched anything.
+    """
+
+    @pytest.mark.asyncio
+    async def test_set_known_projects_setter_exists(self, service):
+        """Follows the set_event_buffer / set_write_journal injection shape.
+
+        The {project_id: project_root} snapshot is built at server startup
+        AFTER MemoryService is constructed, so it must arrive by setter.
+        """
+        assert hasattr(service, 'set_known_projects')
+        mapping = {'dark_factory': '/home/leo/src/dark-factory'}
+        assert service.set_known_projects(mapping) is None
+        assert service._known_projects == mapping
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('arm,kwargs', _UPDATE_MEMORY_ARMS, ids=[a for a, _ in _UPDATE_MEMORY_ARMS])
+    async def test_missing_memory_id_is_structured_rejection(self, service, arm, kwargs):
+        """A confirmed-absent point is MemoryNotFound in EVERY arm, never a success."""
+        service.mem0.get_point_by_id = AsyncMock(return_value=None)
+
+        result = await service.update_memory(
+            memory_id='missing-point-id', project_id='test', **kwargs,
+        )
+
+        assert result['error_type'] == 'MemoryNotFound', (
+            f'{arm} arm returned {result!r} for an absent memory_id'
+        )
+        assert result.get('status') != 'updated'
+        assert 'missing-point-id' in str(result.get('error', ''))
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('arm,kwargs', _UPDATE_MEMORY_ARMS, ids=[a for a, _ in _UPDATE_MEMORY_ARMS])
+    async def test_missing_memory_id_writes_nothing(self, service, arm, kwargs):
+        """No backend write and no journal row for a rejection.
+
+        A journal row claiming a write that never landed is worse than no row:
+        it converts an absent record into durable evidence of an edit.
+        """
+        service.mem0.get_point_by_id = AsyncMock(return_value=None)
+        journal = _journal_mock()
+        service._write_journal = journal
+
+        await service.update_memory(
+            memory_id='missing-point-id', project_id='test', **kwargs,
+        )
+
+        service.mem0.update.assert_not_called()
+        service.mem0.set_payload.assert_not_called()
+        service.mem0.delete_payload.assert_not_called()
+        service.mem0.overwrite_payload.assert_not_called()
+        journal.log_write_op.assert_not_called()
+        journal.log_backend_op.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('arm,kwargs', _UPDATE_MEMORY_ARMS, ids=[a for a, _ in _UPDATE_MEMORY_ARMS])
+    async def test_read_timeout_is_not_memory_not_found(self, service, arm, kwargs):
+        """A read TIMEOUT is a distinct transient failure, never a confirmed absence.
+
+        ``Mem0Backend.get_point_by_id`` deliberately propagates TimeoutError
+        instead of swallowing it into None (unlike ``get()``); this pins that the
+        service does not erase that distinction by catch-and-flattening the two
+        into one outcome.
+        """
+        service.mem0.get_point_by_id = AsyncMock(side_effect=TimeoutError('qdrant read timed out'))
+        journal = _journal_mock()
+        service._write_journal = journal
+
+        with pytest.raises(TimeoutError):
+            await service.update_memory(
+                memory_id='some-point-id', project_id='test', **kwargs,
+            )
+
+        service.mem0.update.assert_not_called()
+        service.mem0.set_payload.assert_not_called()
+        service.mem0.delete_payload.assert_not_called()
+        service.mem0.overwrite_payload.assert_not_called()
+        journal.log_write_op.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_existence_check_reads_before_any_write(self, service):
+        """The read leg runs first — one read against the right point id and scope."""
+        service.mem0.get_point_by_id = AsyncMock(return_value=None)
+
+        await service.update_memory(
+            memory_id='point-1', project_id='dark_factory',
+            metadata_patch={'topic': 'x'},
+        )
+
+        service.mem0.get_point_by_id.assert_called_once()
+        call_args = service.mem0.get_point_by_id.call_args
+        assert call_args.args[0] == 'point-1'
+        scope = call_args.args[1]
+        assert isinstance(scope, Scope)
+        assert scope.project_id == 'dark_factory'
+
+
 class TestUpdateEdgeVerification:
     """Tests for the post-write persistence verification in update_edge (Guard 2)."""
 
