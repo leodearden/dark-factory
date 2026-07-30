@@ -99,6 +99,10 @@ from orchestrator.scheduler import (
     normalize_lock,
 )
 from orchestrator.session_registry import build_session_slug
+from orchestrator.stranded_verified_green import (
+    last_verified_green_tip,
+    submit_verified_green_merge_request,
+)
 from orchestrator.task_status import (
     ACTIVE_TASK_STATUSES,
     TERMINAL_STATUSES,
@@ -5831,6 +5835,165 @@ class TaskWorkflow:
                 escalate_to_human=True,
             )
         return WorkflowOutcome.DONE
+
+    async def _handle_ready_to_merge_report(self) -> WorkflowOutcome:
+        """Process a ``.task/ready_to_merge.json`` report from the architect.
+
+        Caller has already verified the artifact exists.
+
+        The architect's *merge-landing desync* exit (PRD ``plans/architect-
+        already-complete-exits.md`` §β): the work is complete on THIS BRANCH
+        and only the physical merge to main is missing.  The advised exit
+        before this one — ``report_unactionable_task`` — opened an L1 that
+        cost a human ~100k tokens AND vetoed the verified-green auto-merge
+        reaper, so a branch that was already green sat stranded.
+
+        The report is NEVER trusted.  Every predicate is re-derived FIRST-HAND
+        here (INV-3 corroborate-before-acting):
+
+        1. the cited ``commit`` equals the branch tip we resolve ourselves;
+        2. clean fast-forward — main is an ancestor of the tip, and the tip is
+           NOT already contained in main (that would be ``already_done``);
+        3. verify PASSED on this exact tip
+           (:func:`last_verified_green_tip`, read cross-run);
+        4. review returned a non-blocking verdict on this exact committed tree
+           (``record_review_verdict`` only ever caches PASS / suggestions_only,
+           so a cache hit on the current tree hash is proof).
+
+        On a match: enqueue a ``MergeRequest`` tagged ``source=
+        'architect-desync'`` and leave the task BLOCKED with NO open human
+        escalation — the merge worker's own scoped re-verify is the sole gate
+        that advances main, and the done flip arrives via the merge callback
+        (with the existing found_on_main reconciler as the restart-safe
+        backstop).  This handler never lands main itself.
+
+        On any miss: ``_mark_blocked`` WITHOUT escalating to a human — a false
+        ready-to-merge claim is an architect mistake, not an unworkable spec
+        (mirrors the already_done reject path).
+        """
+        assert self.artifacts is not None
+        report = self.artifacts.read_ready_to_merge()
+        assert report is not None  # caller must have verified
+
+        commit = str(report.get('commit') or '').strip()
+        evidence = str(report.get('evidence') or '')
+
+        self.artifacts.clear_ready_to_merge()
+
+        if not commit:
+            return await self._mark_blocked(
+                'Architect wrote malformed ready_to_merge.json (missing commit)',
+                detail=json.dumps(report, indent=2)[:2000],
+            )
+
+        if self.merge_queue is None or self.worktree is None:
+            return await self._mark_blocked(
+                'Architect reported ready_to_merge but the merge queue is '
+                'unavailable — cannot enqueue',
+                detail=(
+                    f'merge_queue: {self.merge_queue!r}\n'
+                    f'worktree: {self.worktree!r}'
+                )[:2000],
+            )
+
+        branch_name = self.task_id  # matches _submit_to_merge_queue convention
+        main_sha = await self.git_ops.get_main_sha()
+        tip = await self.git_ops.resolve_branch_sha(
+            f'{self.config.git.branch_prefix}{branch_name}',
+        )
+        if not tip:
+            return await self._mark_blocked(
+                'Architect reported ready_to_merge but the task branch does '
+                'not resolve',
+                detail=f'branch: {branch_name}\nmain_sha: {main_sha}'[:2000],
+            )
+        if commit != tip:
+            return await self._mark_blocked(
+                f'Architect reported ready_to_merge at {commit[:12]} but the '
+                f'branch tip is {tip[:12]}',
+                detail=f'cited: {commit}\ntip: {tip}'[:2000],
+            )
+
+        main_on_branch = await self.git_ops.is_ancestor(main_sha, tip)
+        branch_on_main = await self.git_ops.is_ancestor(tip, main_sha)
+        if not main_on_branch or branch_on_main:
+            return await self._mark_blocked(
+                'Architect reported ready_to_merge but the branch is not a '
+                'clean fast-forward of main',
+                detail=(
+                    f'tip: {tip}\nmain_sha: {main_sha}\n'
+                    f'main_is_ancestor_of_tip: {main_on_branch}\n'
+                    f'tip_is_ancestor_of_main: {branch_on_main}'
+                )[:2000],
+            )
+
+        verified_tip = last_verified_green_tip(self.event_store, self.task_id)
+        if verified_tip != tip:
+            return await self._mark_blocked(
+                'Architect reported ready_to_merge but verify has not passed '
+                'on the branch tip',
+                detail=(
+                    f'tip: {tip}\nlast_verified_green_tip: {verified_tip}'
+                )[:2000],
+            )
+
+        tree_hash = await self.git_ops.get_head_tree_hash(self.worktree)
+        cached = (
+            self.artifacts.get_cached_verdict(tree_hash) if tree_hash else None
+        )
+        if not cached:
+            return await self._mark_blocked(
+                'Architect reported ready_to_merge but review has not passed '
+                'on the branch tree',
+                detail=(
+                    f'tip: {tip}\ntree_hash: {tree_hash}\n'
+                    f'cached_verdict: {cached}'
+                )[:2000],
+            )
+
+        logger.info(
+            'Task %s: architect reported merge-landing desync at %s — '
+            'enqueuing deterministic merge (no escalation; merge-queue '
+            'verify is the gate)',
+            self.task_id, tip[:12],
+        )
+        from orchestrator.merge_types import QueuedBranch  # noqa: PLC0415
+
+        req = await submit_verified_green_merge_request(
+            task_id=self.task_id,
+            branch=QueuedBranch.parse(
+                branch_name, self.config.git.branch_prefix,
+            ),
+            worktree=self.worktree,
+            tip_sha=tip,
+            config=self.config,
+            module_configs=list(self.config.module_configs_or_empty.values()),
+            merge_queue=self.merge_queue,
+            event_store=self.event_store,
+            source='architect-desync',
+            marker_key='architect_merge_request',
+            done_callback=lambda fut: None,
+            update_task=self.scheduler.update_task,
+        )
+        if self.event_store:
+            self.event_store.emit(
+                EventType.architect_desync_merge,
+                task_id=self.task_id,
+                phase='plan',
+                data={
+                    'decision': 'enqueued',
+                    'tip': tip,
+                    'main_sha': main_sha,
+                    'request_id': req.request_id,
+                    'evidence': evidence[:400],
+                },
+            )
+        # Terminal BLOCKED with NO open human escalation: nothing here awaits a
+        # human, and an empty escalation set keeps the found_on_main MARK_DONE
+        # backstop unvetoed if the in-memory merge callback is lost to a
+        # restart.
+        self._enter_phase(WorkflowState.BLOCKED)
+        return WorkflowOutcome.BLOCKED
 
     async def _handle_unactionable_task_report(self) -> WorkflowOutcome:
         """Process a ``.task/unactionable_task.json`` report from the architect.
