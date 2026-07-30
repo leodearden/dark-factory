@@ -788,6 +788,17 @@ def main(argv: Sequence[str]) -> int:
     per-stratum-counts / zero-signal-drops / budget-accounting summary to
     stderr. This is the CLI acceptance surface — a manual run against live
     ``~/.claude/projects`` is the observable, not a pytest.
+
+    Samples with the same real-digest-byte cost basis
+    (:func:`digest_byte_cost_fn` at :data:`DEFAULT_DIGEST_MAX_BYTES`) that
+    ``nightly.select_digest_sessions`` uses, so this diagnostic and the
+    pipeline can never disagree about what the budget was spent on — the
+    whole point of reading this CLI is to find out whether the budget is
+    why a session was skipped. The summary's byte line is therefore
+    labelled "digest bytes used": it is digest OUTPUT, not raw transcript
+    size. Note that ``render_manifest``'s per-record ``size`` field is
+    deliberately still the raw transcript size — informational, and a
+    different question from what the record costs the budget.
     """
     default_config = Path(__file__).resolve().parent.parent.parent / 'docs' / 'legibility' / 'legibility.yaml'
     parser = argparse.ArgumentParser(
@@ -833,7 +844,9 @@ def main(argv: Sequence[str]) -> int:
             )
         )
 
-    result = stratified_sample(scored, cfg)
+    result = stratified_sample(
+        scored, cfg, cost_fn=digest_byte_cost_fn(max_bytes=DEFAULT_DIGEST_MAX_BYTES),
+    )
 
     print(render_manifest(result.selected))
 
@@ -844,7 +857,7 @@ def main(argv: Sequence[str]) -> int:
     for stratum in sorted(result.per_stratum_counts):
         summary.append(f'  {stratum}: {result.per_stratum_counts[stratum]} selected')
     summary.append(
-        f'bytes used: {result.bytes_used} / {cfg.budgets.max_daily_digest_bytes}'
+        f'digest bytes used: {result.bytes_used} / {cfg.budgets.max_daily_digest_bytes}'
     )
     summary.append(f'budget-skipped candidates (would exceed cap): {result.budget_skipped}')
     print('\n'.join(summary), file=sys.stderr)
