@@ -11,6 +11,7 @@ import re
 import time
 import uuid as uuid_mod
 from dataclasses import dataclass, field
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
@@ -767,6 +768,12 @@ class MemoryService:
         self.taskmaster: TaskBackendProtocol | None = None
         self.planned_episode_registry: PlannedEpisodeRegistry | None = None
         self.recon_ledger: ReconLedgerStore | None = None
+        # {project_id: project_root} registry snapshot (task 3088). Injected by
+        # set_known_projects at server startup — MemoryService is constructed
+        # before build_known_projects_map runs, so it cannot arrive by
+        # constructor. Used to resolve an escalation queue's filesystem root
+        # from the project_id update_memory carries.
+        self._known_projects: dict[str, str] = {}
         # Process-start baselines for uptime reporting
         self._started_at: datetime = datetime.now(UTC)
         self._start_monotonic: float = time.monotonic()
@@ -786,6 +793,22 @@ class MemoryService:
     def set_recon_ledger(self, store: ReconLedgerStore) -> None:
         """Wire the recon ledger store into the service."""
         self.recon_ledger = store
+
+    def set_known_projects(self, known_projects: Mapping[str, str] | None) -> None:
+        """Wire the ``{project_id: project_root}`` registry snapshot (task 3088).
+
+        The same snapshot ``server/main.py`` builds with
+        ``build_known_projects_map`` and already hands to ``ReconciliationHarness``
+        and ``TicketJanitor``. Injected rather than derived so this stays pure
+        data with no lifetime coupling to any conditionally-constructed
+        component — the ``update_memory`` storm alarm must keep working with
+        reconciliation disabled, which is exactly the degraded configuration
+        where an unattended rewrite loop is least likely to be noticed.
+
+        Copied on entry so a later mutation of the caller's map cannot change
+        resolution out from under an in-flight escalation.
+        """
+        self._known_projects = dict(known_projects or {})
 
     async def _emit_event(self, event: ReconciliationEvent) -> None:
         if self._event_buffer:
@@ -3527,6 +3550,93 @@ class MemoryService:
         ))
 
         return result
+
+    async def update_memory(
+        self,
+        memory_id: str,
+        project_id: str = 'main',
+        content: str | None = None,
+        metadata_patch: dict | None = None,
+        metadata_delete_keys: list[str] | None = None,
+        metadata_mode: str = 'merge',
+        reason: str | None = None,
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        causation_id: str | None = None,
+        _source: str = 'mcp_tool',
+    ) -> dict:
+        """Amend a Mem0 record's content and/or patch its metadata IN PLACE.
+
+        Task 3088; contract in ``plans/mem0-in-place-update-decision.md`` §3.
+        The Qdrant point id is preserved, so the record keeps its identity and
+        every reference to it stays valid — which is the whole point, and also
+        why the tool sits behind an authorization gate and a storm alarm: an
+        in-place amendment is invisible to every downstream reader.
+
+        Argument validation (arm presence, reserved-key rejection, contradictory
+        key lists, ``metadata_mode`` values) belongs to the MCP tool layer, which
+        fails those loud before dispatching here — mirroring how ``update_edge``
+        splits its boundary checks from its write path.
+
+        Returns the ``{'status': 'updated', 'store': 'mem0', 'id': memory_id,
+        ...}`` envelope on success, or a structured ``{'error_type': ...}``
+        rejection. The id is echoed so a caller can assert identity stability
+        straight from the response instead of re-fetching.
+        """
+        write_op_id = str(uuid_mod.uuid4())
+
+        # Journal params: truncated copies for the audit row only. The full
+        # values go to the backend — same convention as update_edge's fact.
+        params: dict[str, Any] = {'memory_id': memory_id, 'metadata_mode': metadata_mode}
+        if content is not None:
+            params['content'] = content[:200]
+        if metadata_patch:
+            params['metadata_patch'] = metadata_patch
+        if metadata_delete_keys:
+            params['metadata_delete_keys'] = list(metadata_delete_keys)
+        if reason:
+            params['reason'] = reason[:200]
+
+        # §5(c) read leg — runs FIRST, in EVERY arm, before any write.
+        #
+        # Not merely a convenience read for the metadata-reforwarding dance: it
+        # is the existence check. Qdrant's set_payload/delete_payload return
+        # acknowledged/completed for an UNKNOWN point id rather than an error,
+        # so the metadata-only fast paths would otherwise emit a success
+        # envelope AND a journal row for a write that touched nothing.
+        #
+        # A TimeoutError from here PROPAGATES untouched. Mem0Backend.
+        # get_point_by_id deliberately does not swallow it (unlike get()), which
+        # is what keeps "genuinely absent" distinguishable from "backend timed
+        # out"; catching both into one MemoryNotFound outcome would throw that
+        # distinction away at the one layer that still has it.
+        existing = await self.get_memory_by_id(project_id=project_id, memory_id=memory_id)
+        if existing is None:
+            return {
+                'error': (
+                    f'Memory {memory_id!r} does not exist in mem0 for project '
+                    f'{project_id!r}; nothing was updated.'
+                ),
+                'error_type': 'MemoryNotFound',
+                'store': 'mem0',
+                'id': memory_id,
+            }
+
+        # The FULL raw Qdrant payload — mem0-owned keys and custom provenance
+        # keys alike. Copied so the arms below can compute a delta against it
+        # without mutating the value the read leg returned.
+        existing_payload: dict[str, Any] = dict(existing.get('metadata') or {})
+
+        # Arm dispatch (steps 15-20): content amend, metadata-only fast paths,
+        # combined fold, and the post-write storm-counter observation.
+        raise NotImplementedError(
+            'update_memory arm dispatch is not implemented yet '
+            f'(memory_id={memory_id!r}, write_op_id={write_op_id}, '
+            f'params={sorted(params)}, existing_payload_keys='
+            f'{sorted(existing_payload)}, agent_id={agent_id!r}, '
+            f'session_id={session_id!r}, causation_id={causation_id!r}, '
+            f'source={_source!r})'
+        )
 
     async def update_edge(
         self,
