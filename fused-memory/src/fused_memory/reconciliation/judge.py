@@ -85,6 +85,13 @@ JUDGE_VERDICT_SCHEMA: dict[str, Any] = {
 # cli_invoke's ``max_budget_usd`` default.
 _JUDGE_CLI_MAX_TURNS = 3
 
+# run_id for the throwaway JudgeVerdict built by _call_judge_cli's validation
+# probe.  The probe verdict is discarded — the real one is constructed later with
+# the real run_id — but JudgeVerdict requires the field, and a recognisable
+# sentinel keeps it obvious in a traceback that the failure came from the probe
+# rather than from a real verdict construction.
+_VERDICT_PROBE_RUN_ID = '__verdict_schema_probe__'
+
 
 UnhaltCallback = Callable[[str], Awaitable[None] | None]
 """Fired by :meth:`Judge.unhalt` after the halt state is cleared.
@@ -581,6 +588,36 @@ Review this run and provide your verdict as JSON.
                 self._raise_unusable_output(
                     result, 'cli_output_unparseable',
                     'structured_output findings is not a list',
+                )
+
+            # Final catch-all: run the payload through the SAME constructor the
+            # real path will use, so every current AND future JudgeVerdict field
+            # constraint is enforced without hand-mirroring it here.  The guards
+            # above fire first (they give precise, individually-pinned
+            # diagnostics); this probe catches what they structurally cannot —
+            # e.g. findings is a list, but of bare strings, which JudgeVerdict's
+            # ``list[dict]`` rejects.
+            #
+            # Why this is not trusted to the schema: the payload is
+            # model-produced across a cap-retry resume, the same reason
+            # ``severity`` is re-validated just above.
+            #
+            # Why the raise lives HERE and not in _parse_verdict's dict branch:
+            # review_run's ``except JudgeInfraError`` -> _handle_infra_failure
+            # diversion wraps ONLY the ``await self._call_llm(prompt)`` call.
+            # _parse_verdict runs OUTSIDE that inner try, and AFTER the infra
+            # streak has already been popped — so a JudgeInfraError raised from
+            # there would fall through to the broad ``except Exception`` and
+            # vanish as a silent None with no infra accounting at all (no
+            # verdict, no halt, no signal — the claude_cli mirror of the
+            # text-path hole closed in _parse_verdict's caught tuple).  Do NOT
+            # "simplify" this probe down into _parse_verdict.
+            try:
+                self._verdict_from_payload(structured, _VERDICT_PROBE_RUN_ID)
+            except ValidationError as e:
+                self._raise_unusable_output(
+                    result, 'cli_output_unparseable',
+                    f'structured_output failed JudgeVerdict validation: {e}',
                 )
             return structured
 
