@@ -2715,13 +2715,86 @@ class GitOps:
         is returned, so :meth:`GitOps._lane_lock_self_owned_leak` can tell this
         legitimate hold from a leaked one — at kernel level the two are
         identical, both being flocks attributed to our pid.
+
+        CANCELLATION (task 3081, D8/B12) — a cancelled acquire can NEVER orphan
+        the fd. The worker thread is uninterruptible BY DESIGN: cancelling the
+        awaiter does not stop the acquire, it only stops anyone from seeing what
+        the acquire wins. So the contract cannot be "don't win"; it must be
+        "ownership of a late win TRANSFERS to the canceller's cleanup path",
+        which is what :meth:`_release_orphaned_lane_flock` implements.
+
+        The :func:`asyncio.shield` is LOAD-BEARING, not defensive styling —
+        verified empirically. Under a plain ``await``, cancelling the awaiter
+        cancels the inner future too; ``asyncio.futures._copy_future_state``
+        then bails on ``dest.cancelled()`` and DISCARDS the thread's return
+        value, so the fd is unreachable and no code path can ever release it —
+        the lane stays locked until process exit (reify ``esc-5548-5``: three
+        tasks blocked behind one lane, diagnosed only by hand from
+        ``/proc/locks``). Shielded, the inner future stays uncancelled and still
+        delivers the fd to the done-callback, which releases it.
+
+        The module-global :func:`acquire_merge_verify_flock` is deliberately
+        resolved at CALL time (inside the :func:`asyncio.to_thread` argument
+        list) rather than bound earlier, keeping the suite's
+        ``monkeypatch.setattr('orchestrator.git_ops.acquire_merge_verify_flock',
+        ...)`` seam — and its off-the-event-loop-thread pin — intact.
         """
-        fd = await asyncio.to_thread(
-            acquire_merge_verify_flock, lock_path, wait_secs,
+        inner = asyncio.ensure_future(
+            asyncio.to_thread(acquire_merge_verify_flock, lock_path, wait_secs)
         )
+        try:
+            fd = await asyncio.shield(inner)
+        except asyncio.CancelledError:
+            # We are gone, but the acquire is not: hand whatever it wins to the
+            # orphan-release callback rather than dropping it on the floor.
+            inner.add_done_callback(
+                functools.partial(GitOps._release_orphaned_lane_flock, lock_path)
+            )
+            raise
         if fd is not None:
             _register_held_lane_lock(fd, lock_path)
         return fd
+
+    @staticmethod
+    def _release_orphaned_lane_flock(lock_path: Path, fut: asyncio.Future) -> None:
+        """Release a lane flock won by an acquire whose awaiter was CANCELLED
+        (task 3081, D8/B12).
+
+        Runs as the shielded acquire's done-callback, i.e. on the event loop
+        AFTER the cancelling coroutine has already resumed — the only place that
+        can still see the late-won fd.
+
+        Three outcomes, all handled: the acquire itself was cancelled or raised
+        (nothing was won — return, and note that calling ``fut.exception()``
+        also marks it retrieved so asyncio does not log it as unhandled); it
+        timed out and returned ``None`` (nothing is held —
+        :meth:`_release_lane_flock`'s existing ``None`` guard makes this a
+        silent no-op rather than a ``TypeError`` from ``fcntl.flock(None, ...)``
+        surfacing through the loop exception handler); or it won an fd, which is
+        released here.
+
+        Logged at WARNING because a lane lock won by nobody is worth seeing in
+        the record even though it is now handled: it means a verify/reset was
+        cancelled mid-acquire, and the frequency of that is a real signal.
+        Released through :meth:`_release_lane_flock` so the in-process held-fd
+        registry stays consistent — the fd was never registered (registration
+        happens only on the success path above), and its ``_forget`` is a
+        harmless no-op that keeps the one release path single.
+        """
+        if fut.cancelled():
+            return
+        if fut.exception() is not None:
+            return
+        fd = fut.result()
+        if fd is None:
+            return
+        logger.warning(
+            'lane flock for %s was won AFTER its acquire was cancelled; '
+            'releasing the orphaned fd rather than leaking the lane '
+            '(task 3081, D8/B12)',
+            lock_path,
+        )
+        GitOps._release_lane_flock(fd)
 
     @staticmethod
     def _release_lane_flock(fd: int | None) -> None:
