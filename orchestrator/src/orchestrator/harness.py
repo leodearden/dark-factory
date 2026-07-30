@@ -117,6 +117,11 @@ from orchestrator.task_status import (
 from orchestrator.usage_gate import UsageGate
 from orchestrator.workflow import TerminalReport, WorkflowOutcome, build_workflow
 from orchestrator.worktree_identity import identities_match, read_worktree_title
+from orchestrator.zero_progress_requeue import (
+    ZeroProgressRequeueTracker,
+    emit_zero_progress_requeue_alert,
+    resolve_zero_progress_requeue_alert,
+)
 
 if TYPE_CHECKING:
     from escalation.models import Escalation
@@ -809,9 +814,13 @@ class TaskReport:
     completed_at: str = ''
     # Block-context surfacing for the per-task retry cap.  Populated by
     # _run_slot from the TerminalReport returned by workflow.run() (TR-1)
-    # when the outcome is REQUEUED (harmless/empty on DONE paths).  Not
-    # persisted to runs.db — purely in-memory for the cap check + cap-exhaust
-    # report.
+    # when the outcome is REQUEUED (harmless/empty on DONE paths).
+    #
+    # Task 3068 made block_reason/block_phase DURABLE: both are now emitted on
+    # the EventType.task_completed payload AND persisted to runs.db's
+    # task_results (via both save_task_result and save_run).  block_detail
+    # remains purely in-memory — it carries unbounded raw agent/verify output,
+    # so it stays out of the two operationally-queried, rotated stores.
     block_reason: str = ''
     block_detail: str = ''
     block_phase: str = ''
@@ -1406,6 +1415,21 @@ class Harness:
         # See task 1491, ITEM 2 (hard-cancel fallback).
         self._workflow_slot_tasks: dict[str, asyncio.Task] = {}
 
+        # Per-task CONSECUTIVE streak of requeues that invoked no agent at all
+        # (task 3068).  Fed from _apply_retry_cap — the single per-report
+        # chokepoint that sees every outcome — and read by
+        # _maybe_zero_progress_requeue_alert.  Pure in-memory; entries are
+        # popped on any progress, so this stays proportional to the number of
+        # tasks CURRENTLY looping rather than growing over a weeks-long run.
+        self._zero_progress_tracker = ZeroProgressRequeueTracker()
+        # task_id -> streak at the last time we asked the escalation queue
+        # whether an alert was already open.  Keeps has_open_l1's full
+        # pending-queue glob+parse off the dispatch hot path: without it, every
+        # completed dispatch of every looping task would scan the queue —
+        # hardest during exactly the many-tasks-looping incident this detects.
+        # Popped on recovery so a later recurrence re-files.
+        self._zero_progress_filed_at: dict[str, int] = {}
+
         # Consecutive terminal-status poll counts per task.  Incremented each
         # poll a workflow is terminal but still active; reset when it is no
         # longer terminal or drops out of the active set.  Controls the
@@ -1800,7 +1824,16 @@ class Harness:
                 str(prd_path) if prd_path else '',
             )
         except Exception:
-            logger.warning('Failed to create run store', exc_info=True)
+            # Non-fatal, but loud: swallowing this at warning level understated
+            # the blast radius. A RunStore that fails to construct (bad schema
+            # migration, unusable DB) leaves _run_store unset, which silently
+            # drops EVERY task_results row for the whole run — the post-hoc
+            # forensics substrate is simply absent, with no other signal.
+            logger.error(
+                'Failed to create run store at %s — task_results persistence '
+                'is DISABLED for run %s',
+                db_path, run_id, exc_info=True,
+            )
 
         # 0a-post. Restore scheduler pause state from prior run (if any).
         await self._load_persisted_scheduler_pause()
@@ -7520,6 +7553,29 @@ class Harness:
                         'review_cycles': report.review_cycles,
                         'steward_cost_usd': report.steward_cost_usd,
                         'steward_invocations': report.steward_invocations,
+                        # Task 3068 (origin incident: reify esc-5556-1) — the
+                        # WHY, not just the counters.  A 46h warm-lane requeue
+                        # loop was forensically unqueryable because this payload
+                        # recorded THAT ~349 dispatches requeued but never why;
+                        # both fields were already in scope ~15 lines above and
+                        # simply not passed through.
+                        #
+                        # These two keys are ALWAYS present — empty string on a
+                        # clean/DONE exit, never omitted — so that
+                        # `json_extract(data,'$.reason')` is uniform across every
+                        # row: NULL means "event predates task 3068", '' means
+                        # "clean exit, no block".  Conditional omission would make
+                        # those two cases indistinguishable, which is exactly the
+                        # ambiguity that made the origin incident unqueryable.
+                        #
+                        # `block_detail` is deliberately NOT emitted: it carries
+                        # raw agent/verify output (full test logs, tracebacks) and
+                        # is effectively unbounded, while events.db is queried
+                        # operationally and rotated.  `block_reason` is the
+                        # classified, low-cardinality, GROUP-BY-able field the
+                        # requeue-cap path itself already uses.
+                        'reason': report.block_reason,
+                        'block_phase': report.block_phase,
                     },
                 )
 
@@ -8268,6 +8324,19 @@ class Harness:
         """
         if self._run_id is None:
             return requeued
+
+        # Task 3068 — zero-progress backstop.  Placed here, after the _run_id
+        # guard (whose established role as a test no-op hook is preserved) and
+        # BEFORE the outcome branch below, so EVERY outcome flows through the
+        # tracker: requeues accumulate, DONE/BLOCKED reset.
+        #
+        # Deliberately independent of report.counts_against_requeue_cap: if you
+        # are editing the cap logic below, see
+        # orchestrator/src/orchestrator/zero_progress_requeue.py (module
+        # docstring) for why neither ceiling in this method can see the class of
+        # failure that detector catches.
+        self._maybe_zero_progress_requeue_alert(task_id, report)
+
         if report.outcome == WorkflowOutcome.REQUEUED:
             attempt_cost = report.cost_usd + report.steward_cost_usd
             count = self.scheduler.record_requeue(
@@ -8312,6 +8381,76 @@ class Harness:
         elif report.outcome == WorkflowOutcome.DONE:
             self.scheduler.clear_requeue_count(task_id)
         return requeued
+
+    def _maybe_zero_progress_requeue_alert(
+        self, task_id: str, report: TaskReport,
+    ) -> None:
+        """Fold one dispatch into the zero-progress streak; alarm at threshold.
+
+        Thin config-reading adapter over ``orchestrator.zero_progress_requeue``
+        (the ``_maybe_pipeline_landing_tripwire`` / ``merge_skew_tripwire``
+        shape): the module stays pure and injectable, this method supplies
+        ``self._escalation_queue`` / ``self.event_store`` / the config.
+
+        Wholly wrapped in try/except by design.  This detector exists to
+        backstop the requeue cap; a bug in it must never be able to disturb the
+        cap accounting it sits beside.
+        """
+        try:
+            cfg = self.config.zero_progress_requeue
+            # The tracker is ALWAYS fed, even while the detector is disabled.
+            # Both leaves are green-tier hot-reloadable, so skipping record()
+            # under the kill switch would freeze streaks instead of resetting
+            # them: a task at streak 4 when an operator silences the detector,
+            # which then makes real progress and is re-enabled, would alarm on
+            # its very NEXT zero-progress requeue — the kill switch would
+            # manufacture the exact false positive it was reached for.
+            # record() is pure and does no I/O, so feeding it is free.
+            streak_before = self._zero_progress_tracker.streak(task_id)
+            streak = self._zero_progress_tracker.record(
+                task_id,
+                outcome=report.outcome,
+                agent_invocations=report.agent_invocations,
+            )
+
+            if streak == 0:
+                # Progress. Resolve any alarm we filed, so an operator is not
+                # left holding a blocking L1 for a cleared condition and — more
+                # importantly — so the emitter's has_open_l1 dedup cannot let a
+                # stale pending alert suppress a genuine LATER recurrence.
+                # Ungated by `enabled`: disabling the detector must not strand
+                # an already-filed alarm.
+                if streak_before:
+                    resolve_zero_progress_requeue_alert(
+                        escalation_queue=self._escalation_queue,
+                        event_store=self.event_store,
+                        task_id=task_id,
+                        recovered_streak=streak_before,
+                        threshold=cfg.threshold,
+                        filed_at=self._zero_progress_filed_at,
+                    )
+                return
+
+            if not cfg.enabled:
+                return
+
+            emit_zero_progress_requeue_alert(
+                escalation_queue=self._escalation_queue,
+                event_store=self.event_store,
+                task_id=task_id,
+                streak=streak,
+                threshold=cfg.threshold,
+                span_seconds=self._zero_progress_tracker.span(task_id),
+                min_span_seconds=cfg.min_span_seconds,
+                block_reason=report.block_reason,
+                block_phase=report.block_phase,
+                filed_at=self._zero_progress_filed_at,
+            )
+        except Exception as exc:  # noqa: BLE001 — never disturb cap accounting
+            logger.warning(
+                'Task %s: zero-progress requeue check failed (non-fatal): %s',
+                task_id, exc,
+            )
 
     def _collect_done_reports(
         self, done: set[asyncio.Task], task_reports: list[TaskReport]

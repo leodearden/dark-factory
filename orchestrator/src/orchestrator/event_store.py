@@ -210,6 +210,19 @@ class EventType(StrEnum):
     task_started = 'task_started'
     task_completed = 'task_completed'
 
+    # Zero-progress requeue backstop (task 3068, origin incident reify
+    # esc-5556-1).  Emitted when a task has been burning dispatch slots with
+    # nothing to show for it — a class the requeue cap cannot see by design;
+    # see orchestrator/src/orchestrator/zero_progress_requeue.py (module
+    # docstring) for why.  This event is its only telemetry.  Both are keyed on
+    # the REAL task_id (the escalation uses a synthetic sentinel id, but the
+    # events must stay joinable against task_completed).
+    # data: {streak, threshold, span_seconds, reason, block_phase}
+    zero_progress_requeue = 'zero_progress_requeue'
+    # ...and its recovery half, emitted when the streak breaks and the filed
+    # blocking L1 is auto-resolved.  data: {streak, resolved}
+    zero_progress_requeue_recovered = 'zero_progress_requeue_recovered'
+
     # Warm-lane session resume (task γ, plans/warm-lane-session-resume-prd.md).
     # Emitted by the _run_slot eligibility guard, only when a recovered agent
     # session was present for the dispatched task:

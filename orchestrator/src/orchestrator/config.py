@@ -2192,6 +2192,73 @@ class ChronicFlakeConfig(BaseModel):
     )
 
 
+class ZeroProgressRequeueConfig(BaseModel):
+    """Zero-progress requeue backstop configuration (task 3068).
+
+    Backstops a blind spot the per-task requeue cap structurally cannot see:
+    a task that requeues forever without ever invoking an agent. The full
+    causal chain — why ``_disposition_table``'s non-counting warm-lane
+    dispositions make this invisible to both ceilings in
+    ``Harness._apply_retry_cap`` — is documented once, canonically, in
+    ``orchestrator.zero_progress_requeue``'s module docstring. Read that
+    before retuning anything here.
+
+    The alarm predicate is deliberately two-dimensional: ``threshold``
+    consecutive zero-agent-invocation requeues AND ``min_span_seconds`` of
+    wall clock. Requiring both is what separates a stuck task from ordinary
+    busy-fleet contention, which is why those dispositions are non-counting
+    in the first place.
+
+    Unlike ``chronic_flake`` (shipped ``enabled: false``, gated on an
+    un-landed reify substrate) this ships ENABLED: it reads only
+    ``TaskReport`` fields that already exist, so shipping it off would leave
+    the gap open indefinitely.  All fields are green-tier hot-tunable via
+    RELOADABLE_FIELDS, so a noisy detector can be retuned or silenced live.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description=(
+            'Set to false to disable the zero-progress requeue detector. '
+            'Shipped enabled — this is the ONLY backstop for requeue loops '
+            'that the per-task requeue cap cannot see by design. Disabling '
+            'suppresses new alerts only; an already-filed alert still '
+            'auto-resolves when its task resumes progress.'
+        ),
+    )
+    threshold: int = Field(
+        default=5,
+        ge=1,
+        description=(
+            'Consecutive requeues-with-zero-agent-invocations for a single '
+            'task before a blocking L1 is filed (both this AND '
+            'min_span_seconds must be satisfied). Must be >= 1. Grounded in '
+            'the origin incident (reify esc-5556-1): ~349 requeues across '
+            '~24 tasks is ~14.5 consecutive zero-progress requeues per task, '
+            'so 5 fires at roughly a third of the observed loop — hours into '
+            'a 46h incident rather than at its end.'
+        ),
+    )
+    min_span_seconds: float = Field(
+        default=900.0,
+        ge=0.0,
+        description=(
+            'Wall-clock seconds the streak must ALSO span before a blocking '
+            'L1 is filed. Set to 0 to alarm on streak count alone. Exists '
+            'because the dispositions this watches are non-counting '
+            'precisely because they represent NORMAL busy-fleet backpressure '
+            '(task 2988 flipped warm_lane_pool_exhausted to non-counting for '
+            'exactly that reason): where max_concurrent_tasks exceeds the '
+            'warm-lane pool size, a low-priority task can lose the pool race '
+            'several dispatches in a row within seconds, and paging a human '
+            'at the loudest severity tier for that would be a false '
+            'positive. 900s (15 min) of CONTINUOUS zero progress is well '
+            'past any contention blip but still hours short of the 46h '
+            'origin incident.'
+        ),
+    )
+
+
 class VerifyRunnerConfig(BaseModel):
     """Configuration for a single remote verify runner (Lever C).
 
@@ -3832,6 +3899,13 @@ class OrchestratorConfig(BaseSettings):
     # (gated until reify:5142's ledger/marker substrate is confirmed).
     chronic_flake: ChronicFlakeConfig = Field(default_factory=ChronicFlakeConfig)
 
+    # Zero-progress requeue backstop (task 3068). An absent stanza in
+    # orchestrator.yaml yields the ENABLED-by-default instance — this is the
+    # only detector for requeue loops the per-task requeue cap cannot see.
+    zero_progress_requeue: ZeroProgressRequeueConfig = Field(
+        default_factory=ZeroProgressRequeueConfig
+    )
+
     # κ: shared sccache backend (the laptop warm multiplier)
     # An absent stanza in orchestrator.yaml yields the disabled default;
     # no defaults.yaml edit is required.
@@ -4719,6 +4793,12 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # dedicated submodel, so its whole-submodel group auto-covers every
     # leaf (idiom shared with psi_admission/routing above).
     _submodel_leaf_paths('chronic_flake', ChronicFlakeConfig),
+    # Zero-progress requeue backstop (task 3068) — same whole-submodel-group
+    # idiom.  Green-tier deliberately: an operator must be able to retune the
+    # threshold or silence a noisy detector WITHOUT a fleet restart, because a
+    # detector you can only silence by restarting is one that gets silenced by
+    # ignoring it instead.
+    _submodel_leaf_paths('zero_progress_requeue', ZeroProgressRequeueConfig),
     # Variable-depth speculative verify placement (task 2359) — a new
     # dedicated submodel, same whole-submodel-group idiom: every probe knob
     # (probe_fraction/probe_depths/suppress_flake_rate) is green-tier
