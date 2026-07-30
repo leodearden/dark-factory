@@ -4583,6 +4583,7 @@ class TaskWorkflow:
         in_memory_metadata: dict,
         *,
         log_context: str,
+        require_fresh: bool = False,
     ) -> dict:
         """Read-modify-write helper: merge in-memory metadata with the backend's.
 
@@ -4603,13 +4604,37 @@ class TaskWorkflow:
             log_context: Short descriptor of the write site, used verbatim in the
                 fallback warning (e.g. ``'no-plan counter'``,
                 ``'infra-resume thrash counter'``).
+            require_fresh: When True, a failed (or non-dict) backend read RAISES
+                instead of silently falling back to ``in_memory_metadata`` alone.
+                Callers that persist with ``metadata_mode='replace'`` MUST pass
+                True: under replace, every key omitted from the payload is
+                DELETED, so the fallback payload would destroy backend-only keys
+                (e.g. ``memory_hints`` re-attached by Stage-2 reconciliation)
+                rather than merely failing to update them.  Such a caller is
+                expected to catch and skip its write — no write is strictly safer
+                than an unverified whole-blob one.  Defaults to False, which
+                keeps the additive/merge-mode callers' best-effort behaviour
+                (their fallback is bounded to the keys actually supplied).
 
         Returns:
             A new dict ready for counter-field assignment and persist.
+
+        Raises:
+            Exception: Only when ``require_fresh`` is True — the underlying
+                ``get_task`` error verbatim, or a :class:`RuntimeError` if the
+                read returned something other than a task dict.
         """
         try:
             fresh_task = await self.scheduler.get_task(self.task_id)
-        except Exception as exc:  # noqa: BLE001 — best-effort, fall back to in-memory
+        except Exception as exc:  # noqa: BLE001 — best-effort unless require_fresh
+            if require_fresh:
+                logger.warning(
+                    'Task %s: failed to refresh metadata before %s write; '
+                    'refusing to build an unverified whole-blob payload '
+                    '(caller requires a backend-verified read): %s',
+                    self.task_id, log_context, exc,
+                )
+                raise
             logger.warning(
                 'Task %s: failed to refresh metadata before %s write; '
                 'falling back to in-memory metadata '
@@ -4617,6 +4642,14 @@ class TaskWorkflow:
                 self.task_id, log_context, exc,
             )
             fresh_task = None
+        if require_fresh and not isinstance(fresh_task, dict):
+            msg = (
+                f'Task {self.task_id}: metadata refresh before {log_context} write '
+                f'returned {type(fresh_task).__name__}, not a task dict — refusing '
+                f'to build an unverified whole-blob payload'
+            )
+            logger.warning(msg)
+            raise RuntimeError(msg)
         # Merge: start from in-memory metadata so that locally-set keys not yet
         # persisted are preserved, then overlay fresh backend keys so that
         # backend-side additions (e.g. memory_hints from Stage-2 reconciliation)
@@ -5126,8 +5159,14 @@ class TaskWorkflow:
         key through.  (Same rule, same reason as the harness sibling
         ``_clear_merge_retry_pending_for_restart``.)
 
-        A persistence failure must never crash the resume path; a subsequent
-        re-block re-stamps a fresh obligation, so a lost clear is self-healing.
+        Because replace DELETES every omitted key, the read is made with
+        ``require_fresh=True``: a failed backend refresh skips the write entirely
+        instead of replacing the blob with an in-memory-only payload that would
+        destroy backend-only keys.  Neither a refresh nor a persist failure may
+        crash the resume path, and neither loses anything permanently — the stamp
+        simply survives, and a later dispatch retries the clear (a subsequent
+        re-block also re-stamps a fresh obligation), so a lost clear is
+        self-healing where clobbered metadata would not be.
 
         Idempotent no-op when no stamp is present: returns immediately without a
         fresh-metadata read or backend write, so it is cheap and safe to call
@@ -5136,18 +5175,33 @@ class TaskWorkflow:
         metadata = self.task.get('metadata') or {}
         if 'merge_retry_pending' not in metadata:
             return
-        fresh = await self._merge_fresh_metadata(
-            metadata, log_context='merge_retry_pending clear',
-        )
-        fresh.pop('merge_retry_pending', None)
-        self.task['metadata'] = fresh
         try:
+            # require_fresh: a 'replace' write deletes every omitted key, so an
+            # unverified (in-memory-only) payload would clobber backend-only keys.
+            # A refusal lands in the same best-effort handler as a persist failure,
+            # skipping the write entirely rather than replacing on a guess.
+            fresh = await self._merge_fresh_metadata(
+                metadata, log_context='merge_retry_pending clear',
+                require_fresh=True,
+            )
+            fresh.pop('merge_retry_pending', None)
+            self.task['metadata'] = fresh
             await self.scheduler.update_task(
-                self.task_id, metadata=fresh, metadata_mode='replace',
+                self.task_id, metadata=fresh,
+                # SchedulerFacade's Protocol (scheduler.py:681) predates
+                # metadata_mode and only declares `append`; the concrete
+                # Scheduler.update_task (scheduler.py:3757) and the harness
+                # sibling clear already pass it. Same ignore + rationale as the
+                # task-2533 sites above (workflow.py:4464, :10598); widening the
+                # Protocol is outside task 3024's scope — see escalate_info.
+                metadata_mode='replace',  # type: ignore[reportCallIssue]
             )
         except Exception as exc:  # noqa: BLE001 — best-effort, never fatal
             logger.warning(
-                'Task %s: failed to persist merge_retry_pending clear: %s',
+                'Task %s: could not clear merge_retry_pending (metadata refresh or '
+                'persist failed) — leaving the stamp in place; a later dispatch '
+                'retries the clear, and the resume conflict probe and the harness '
+                'restart clear are independent remedies: %s',
                 self.task_id, exc,
             )
 
