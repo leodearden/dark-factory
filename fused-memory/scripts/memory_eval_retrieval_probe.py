@@ -975,3 +975,94 @@ def superseded_inversions(
                 successor_rank=successor_rank,
             ))
     return inversions
+
+
+# ---------------------------------------------------------------------------
+# claim-recall — did the claim come back at all?
+#
+# Deliberately WEAKER than canonical identity. ``canonical-in-top-k`` asks
+# whether one specific entry is findable; this asks whether the KNOWLEDGE is,
+# from any entry. The distinction is the whole point: consolidation (3111/3112)
+# rewrites and merges entries by design, so a metric that demanded the claim
+# come back from the same entry would score the fix lineage this eval exists to
+# measure as a regression, and the obvious way to make that metric go green
+# would be to stop consolidating.
+# ---------------------------------------------------------------------------
+
+def _normalize_for_needles(text: str) -> str:
+    """Fold *text* for needle matching: whitespace collapsed, then lowercased.
+
+    The whitespace half is exactly :func:`content_key`'s normalisation, so a
+    re-wrapped or re-indented stored line does not read as knowledge loss.
+
+    Case folding is the one deliberate DIVERGENCE from ``content_key``. There,
+    case is content — two claims differing only in case are two claims, and
+    folding them would collide distinct entries under one hash. Here the needle
+    is a substring probe against prose, where casing is presentation churn:
+    the committed registry carries needles like ``WRITE-SET`` that the corpus
+    spells ``write-set``, and a case-sensitive miss would report a knowledge
+    loss that did not happen.
+    """
+    return _WHITESPACE_RE.sub(' ', text).strip().lower()
+
+
+@dataclass(frozen=True)
+class ClaimOutcome:
+    """Whether one claim came back, and — when it did not — what was missing."""
+
+    recalled: bool
+    missing_needles: tuple[str, ...]
+    matched_rank: int | None
+    scorable: bool = True
+    """False when the claim query carries no needles.
+
+    ``all(needle in text for needle in ())`` is vacuously True, so a needle-less
+    claim query would silently score as recalled and inflate the rate for a
+    malformed registry entry. Unscorable claims are excluded from the
+    denominator and DISCLOSED instead — an unmeasurable claim must not be able
+    to masquerade as a healthy one.
+    """
+
+
+def claim_recalled(results: list, claim_query: ClaimQuery, k: int) -> ClaimOutcome:
+    """Did *claim_query*'s needles come back in the top-*k* of *results*?
+
+    All needles are required, and they must all come from a SINGLE returned
+    entry. Pooling needles across the result set would let an entry saying
+    "the merge lane is strictly serial" and an unrelated entry saying "never
+    rolls back" jointly satisfy a claim that neither one makes — recall of a
+    sentence the corpus never stated.
+
+    When no entry carries every needle, ``missing_needles`` is reported against
+    the CLOSEST entry (most needles matched, ties broken by better rank), since
+    diffing against the near-miss is what tells an operator which half of the
+    claim was lost. With nothing matched at all the full needle list is
+    returned, which is the honest answer rather than an empty one.
+    """
+    needles = tuple(claim_query.needles)
+    if not needles:
+        return ClaimOutcome(
+            recalled=False, missing_needles=(), matched_rank=None, scorable=False,
+        )
+
+    normalized_needles = [(needle, _normalize_for_needles(needle)) for needle in needles]
+
+    best_missing: tuple[str, ...] = needles
+    best_found = -1
+    for rank, result in enumerate(results[:k], start=1):
+        haystack = _normalize_for_needles(_result_content(result))
+        missing = tuple(
+            original for original, folded in normalized_needles if folded not in haystack
+        )
+        if not missing:
+            return ClaimOutcome(
+                recalled=True, missing_needles=(), matched_rank=rank, scorable=True,
+            )
+        found = len(needles) - len(missing)
+        if found > best_found:  # strict >: ties keep the better (earlier) rank
+            best_found = found
+            best_missing = missing
+
+    return ClaimOutcome(
+        recalled=False, missing_needles=best_missing, matched_rank=None, scorable=True,
+    )
