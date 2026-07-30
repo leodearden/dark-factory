@@ -2028,3 +2028,116 @@ class TestRunMainTipSweepIsolatedPrefilter:
         assert pf_result is FAILING_RESULT, (
             f'Expected the FIRST-PASS result, got {pf_result!r}'
         )
+
+    # -- step-9: ordering / fail-safe guards -------------------------------
+
+    def test_infra_sentinel_short_circuits_before_prefilter(
+        self, tmp_path: Path
+    ) -> None:
+        """(a) A first-pass INFRA_TRANSIENT_CATEGORIES result still returns the
+        None sentinel WITHOUT invoking the pre-filter — the infra-sentinel
+        branch keeps precedence, so an infra crash never buys a subprocess
+        trying to reproduce test failures that were never really observed."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        rfv = AsyncMock(return_value=INTERNALERROR_RESULT)
+        prefilter = AsyncMock(return_value=True)
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=self._fake_git_run()),
+            patch.object(verify_module, 'run_full_verification', rfv),
+            patch.object(
+                verify_module, '_sweep_failure_reproduces_in_isolation', prefilter
+            ),
+        ):
+            result = asyncio.run(verify_module.run_main_tip_sweep(config, git_ops))
+
+        assert result is None, f'Expected the None infra sentinel, got {result!r}'
+        assert prefilter.call_count == 0, (
+            f'Expected the infra branch to short-circuit BEFORE the pre-filter, '
+            f'got {prefilter.call_count} call(s)'
+        )
+        assert rfv.call_count == 1, rfv.call_count
+
+    def test_enoent_on_self_short_circuits_before_prefilter(
+        self, tmp_path: Path
+    ) -> None:
+        """(b) A first-pass result whose cause_hint names THIS sweep's own
+        tmp_path with an ENOENT returns None without invoking the pre-filter —
+        the task-2507 _enoent_on_self backstop keeps precedence (the worktree
+        is gone, so an isolated re-run in it is meaningless)."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        captured_worktrees: list = []
+
+        async def _rfv(worktree, *args, **kwargs):
+            captured_worktrees.append(worktree)
+            return VerifyResult(
+                passed=False,
+                test_output='',
+                lint_output='',
+                type_output='',
+                summary='unknown_test_failure',
+                cause_hint=(
+                    f'[Errno 2] No such file or directory: {worktree}/pyproject.toml'
+                ),
+                category='unknown_test_failure',
+            )
+
+        rfv = AsyncMock(side_effect=_rfv)
+        prefilter = AsyncMock(return_value=True)
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=self._fake_git_run()),
+            patch.object(verify_module, 'run_full_verification', rfv),
+            patch.object(
+                verify_module, '_sweep_failure_reproduces_in_isolation', prefilter
+            ),
+        ):
+            result = asyncio.run(verify_module.run_main_tip_sweep(config, git_ops))
+
+        assert captured_worktrees, 'fixture precondition: the sweep ran a verification'
+        assert result is None, (
+            f'Expected the None sentinel for a vanished sweep worktree, got {result!r}'
+        )
+        assert prefilter.call_count == 0, (
+            f'Expected the _enoent_on_self backstop to short-circuit BEFORE the '
+            f'pre-filter, got {prefilter.call_count} call(s)'
+        )
+
+    def test_prefilter_raise_does_not_abort_the_sweep(self, tmp_path: Path) -> None:
+        """(c) A pre-filter that RAISES must not propagate into
+        run_main_tip_sweep's outer `except Exception`, which would silently
+        turn a real sweep signal into the None sentinel. The sweep falls
+        through to the full retry instead."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        rfv = AsyncMock(side_effect=[FAILING_RESULT, FAILING_RESULT])
+        prefilter = AsyncMock(side_effect=RuntimeError('boom'))
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=self._fake_git_run()),
+            patch.object(verify_module, 'run_full_verification', rfv),
+            patch.object(
+                verify_module, '_sweep_failure_reproduces_in_isolation', prefilter
+            ),
+        ):
+            result = asyncio.run(verify_module.run_main_tip_sweep(config, git_ops))
+
+        assert result is not None, (
+            'A raising pre-filter must not collapse the sweep into the None '
+            'sentinel — the real failing signal has to survive'
+        )
+        assert rfv.call_count == 2, (
+            f'Expected fall-through to the full retry (2 calls), got {rfv.call_count}'
+        )
+        assert result[1].passed is False
