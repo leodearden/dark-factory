@@ -7282,6 +7282,74 @@ class TestSharedDoneProvenance:
 
 
 # ---------------------------------------------------------------------------
+# Task 3286: `_summarize_predicate_output` — the ALLOWLIST sanitizer standing
+# between a predicate script's raw stdout tail and `done_provenance.note`.
+#
+# The note is not a private field: fused-memory's `_format_outcome_echo` reads
+# it and appends it to a Mem0 completion-summary write, so anything that lands
+# here is ingested into the knowledge graph.  Task 2902 is the specimen that
+# proved raw forwarding corrupts it.
+# ---------------------------------------------------------------------------
+
+class TestSummarizePredicateOutput:
+    """The sanitizer keeps the structured verdict and drops the log noise."""
+
+    def test_specimen_starts_with_deterministic_verdict_prefix(self):
+        """The verdict prefix is unconditional — a note is never empty."""
+        from orchestrator.deterministic_runner import _summarize_predicate_output
+
+        result = _summarize_predicate_output(POLLUTED_PREDICATE_OUTPUT, rc=0)
+
+        assert result.startswith('predicate check passed (rc=0)'), result
+
+    @pytest.mark.parametrize(
+        'marker',
+        [
+            'fused_memory.backends.graphiti_client',
+            'httpx',
+            'my_solar_challenge',
+            'HTTP/1.1 200 OK',
+            'WARNING',
+        ],
+    )
+    def test_specimen_server_log_markers_are_dropped(self, marker: str):
+        """No server-log noise survives into the note (the task-2902 leak)."""
+        from orchestrator.deterministic_runner import _summarize_predicate_output
+
+        result = _summarize_predicate_output(POLLUTED_PREDICATE_OUTPUT, rc=0)
+
+        assert marker not in result, (
+            f'{marker!r} leaked into the provenance note: {result!r}'
+        )
+
+    def test_specimen_trailing_json_verdict_survives_compacted(self):
+        """The script's OWN structured verdict is the part worth keeping."""
+        from orchestrator.deterministic_runner import _summarize_predicate_output
+
+        result = _summarize_predicate_output(POLLUTED_PREDICATE_OUTPUT, rc=0)
+
+        # Compact json.dumps separators — no space after ':' or ','.
+        assert '"orphan_count":0' in result, result
+        assert '"verdict":"clean"' in result, result
+
+    def test_specimen_result_is_single_line(self):
+        """A note flowing into a Mem0 summary must not carry newlines."""
+        from orchestrator.deterministic_runner import _summarize_predicate_output
+
+        result = _summarize_predicate_output(POLLUTED_PREDICATE_OUTPUT, rc=0)
+
+        assert '\n' not in result, result
+
+    def test_specimen_mid_token_first_line_is_dropped(self):
+        """The 2000-char tail cut starts mid-word — that fragment is noise."""
+        from orchestrator.deterministic_runner import _summarize_predicate_output
+
+        result = _summarize_predicate_output(POLLUTED_PREDICATE_OUTPUT, rc=0)
+
+        assert '_tariff_pence_per_kwh' not in result, result
+
+
+# ---------------------------------------------------------------------------
 # Task 2336 (γ-predicate): predicate deterministic mode — a read-only
 # exit-code verdict check (before_done.kind == 'predicate'), NOT a systemd
 # deploy.  Boundary tests B7 (pass), B8 (fail), B9 (timeout/infra), B10
