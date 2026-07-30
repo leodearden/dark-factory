@@ -63,6 +63,7 @@ import urllib.error
 import urllib.request
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 # Identify ourselves explicitly on `initialize`. The TaskInterceptor derives an
 # actor class from the MCP client identity, so a nightly automated mutator of
@@ -366,3 +367,132 @@ class McpClient:
             'id': str(task_id), 'project_root': project_root,
             'claimant_run_id': claimant_run_id, 'heartbeat_at': heartbeat_at,
         })
+
+
+# ── the confirm-before-write guard ──────────────────────────────────────────
+#
+# THIS IS A STALE-READ GUARD ON THE ADJUDICATED ROW, NOT A RE-EVALUATION OF
+# THE SWEEP'S PREDICATES. It asks exactly two questions -- "is this still the
+# row the sweep looked at?" and "is it still in a state where this action means
+# anything?" -- and never re-derives escalation state, dependency roll-ups,
+# merge-verify ancestry, or liveness. Re-deriving any of those here would put a
+# second, drifting implementation of the adjudication on this side of the seam.
+#
+# The fail-safe direction throughout is DO NOTHING: every uncertainty (an
+# unreadable row, an un-comparable timestamp, a status we cannot place) skips.
+# A skipped request stays on disk, and the next sweep either re-confirms it or
+# retracts it -- so a false skip costs one night, while a false write costs a
+# wrongly-cancelled or wrongly-re-dispatched task.
+
+# The status each action drives the row TO. Used for the idempotent-no-op
+# check: a row already there has had this request applied.
+ACTION_TARGET_STATUS = {
+    'close': 'cancelled',
+    'reverify': 'pending',
+    'redispatch': 'pending',
+}
+
+# The sweep's invariant L4, transcribed: classes A (gate_closure) and C
+# (unmet_dependency) are `blocked`-ONLY; only class B (merge_verify_red) spans
+# `in-progress`. A row outside its class's scope is one the sweep would not
+# have adjudicated this way today, so acting on it would be acting on an
+# observation that no longer applies.
+LEGAL_STATUSES = {
+    'gate_closure': frozenset({'blocked'}),
+    'merge_verify_red': frozenset({'blocked', 'in-progress'}),
+    'unmet_dependency': frozenset({'blocked'}),
+}
+
+# The two row timestamps that say "this row moved". `updatedAt` is written by
+# sqlite_task_backend._now() as `...THH:MM:SS.mmmZ`; `heartbeat_at` is stamped
+# by the orchestrator as `datetime.now(UTC).isoformat()` (`...+00:00`). Both
+# spellings must parse or the guard fails open on one of them.
+_FRESHNESS_FIELDS = ('updatedAt', 'heartbeat_at')
+
+
+def _parse_timestamp(value):
+    """Epoch seconds for an ISO-8601 timestamp, or None if it cannot be read.
+
+    Tolerant of both the `Z` suffix and an explicit `+00:00` offset. A naive
+    timestamp (no zone) is read as UTC, which is what every writer in this
+    system actually means. None is returned rather than raising so the caller
+    can make the fail-safe decision explicitly.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith('Z'):
+        text = text[:-1] + '+00:00'
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def guard_row(req: Request, row: dict) -> str | None:
+    """Return a skip reason for *row*, or None if the write may proceed.
+
+    Pure: no I/O, no clock. Everything it compares against is either in the
+    request file or in the row the caller just read.
+    """
+    status = row.get('status')
+    if not isinstance(status, str) or not status:
+        return f'row carries no readable status ({status!r})'
+
+    target = ACTION_TARGET_STATUS.get(req.action)
+    if target is None:
+        # Unreachable via load_request (which validates the action against
+        # CLASS_ACTION), but a missing entry here must never mean "no target,
+        # so nothing to compare, so proceed".
+        return f'no target status known for action {req.action!r}'
+    if status == target:
+        # Idempotent no-op: this request was already applied. The sweep re-emits
+        # byte-identical files, so seeing one twice is expected, not an error.
+        return f'row is already {target!r} — request already applied'
+
+    legal = LEGAL_STATUSES.get(req.cls)
+    if legal is None:
+        return f'no legal-status scope known for class {req.cls!r}'
+    if status not in legal:
+        return (f'row status {status!r} is outside the legal scope for class '
+                f'{req.cls!r} ({"/".join(sorted(legal))}) — out of scope')
+
+    # Freshness: the request body deliberately carries no wall-clock field, so
+    # the file's MTIME is the documented recency signal. A row timestamp that
+    # post-dates it means the row moved after the sweep observed it -- most
+    # sharply when a `heartbeat_at` landed, i.e. a runner came alive after the
+    # sweep's own L1 liveness check. Let the next sweep re-adjudicate.
+    for field in _FRESHNESS_FIELDS:
+        raw = row.get(field)
+        if raw is None and field == 'heartbeat_at':
+            # A `blocked` row normally carries no heartbeat at all. Absence is
+            # not staleness -- only an unreadable PRESENT value is.
+            continue
+        when = _parse_timestamp(raw)
+        if when is None:
+            return (f'row {field} {raw!r} could not be read as a timestamp — '
+                    f'cannot show the row is unchanged')
+        if when > req.mtime:
+            return (f'row {field} {raw!r} post-dates the request file — the row '
+                    f'moved after the sweep observed it')
+    return None
+
+
+def confirm_request(client, req: Request, project_root: str):
+    """Re-read the row and decide whether *req*'s write may proceed.
+
+    Returns ``(row, skip_reason)``; ``skip_reason is None`` means proceed.
+    Issues exactly one read and never a write -- whatever it decides, it
+    decides before any mutation.
+    """
+    try:
+        row = client.get_task(req.task_id, project_root)
+    except Exception as exc:
+        return None, f'get_task failed: {type(exc).__name__}: {exc}'
+    if not isinstance(row, dict) or row.get('error'):
+        detail = row.get('error') if isinstance(row, dict) else row
+        return None, f'get_task returned no usable row: {detail!r}'
+    return row, guard_row(req, row)
