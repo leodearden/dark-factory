@@ -930,11 +930,19 @@ class MergeDeepConfig(BaseModel):
 
     chain_cap: int = Field(
         default=0,
+        ge=0,
         description=(
             'Maximum number of queued items a single deep merge-ahead chain may '
             'contain. 0 (the default) disables the feature entirely -- the kill '
             'switch: no chain is ever built, so merge behaviour is byte-identical '
-            'to pre-task-3183 behaviour.'
+            'to pre-task-3183 behaviour. Must be >= 0: a negative cap would '
+            'silently win target_depth = min(len(queue), chain_cap, '
+            'halving_state) and disable or underflow the dispatch gate, so it is '
+            'rejected at load rather than reaching dispatch. No upper bound: the '
+            'PRD stages 6 (ζ canary) -> 32 (η2, ~2x the max observed queue '
+            'depth) and leaves the ceiling to θ\'s week-after assessment; '
+            'wall-clock safety is bounded by '
+            'merge_verify_cold_command_timeout_secs (7200 s), not by the schema.'
         ),
     )
 
