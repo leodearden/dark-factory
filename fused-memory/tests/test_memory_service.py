@@ -21,12 +21,19 @@ from fused_memory.services.memory_service import (
 # A realistic stored Qdrant point payload: the mem0-owned keys mem0's own
 # _update_memory recomputes-or-restores, plus this record's CUSTOM provenance
 # keys (the ones a naive content amend silently destroys).
+#
+# 'category' is deliberately present: EVERY mem0 record carries it (both
+# add_memory and add_system_record stamp it from the resolved MemoryCategory),
+# and Mem0Backend.search pushes it down to Qdrant as a payload filter. A
+# fixture that omitted it would model an unreal record and leave every
+# replace-mode test blind to a delta that drops the key.
 DEFAULT_POINT_PAYLOAD = {
     'data': 'original content',
     'hash': 'abc123hash',
     'created_at': '2026-01-01T00:00:00+00:00',
     'updated_at': '2026-01-02T00:00:00+00:00',
     'user_id': 'testproject',
+    'category': 'observations_and_summaries',
     'kind': 'canonical',
     'src_project': 'dark_factory',
     'topic': 'docs-prd-landing',
@@ -1563,6 +1570,7 @@ class TestUpdateMemoryContentArm:
             'metadata=None wipes every custom payload key — the exact bug'
         )
         assert forwarded == {
+            'category': 'observations_and_summaries',
             'kind': 'canonical',
             'src_project': 'dark_factory',
             'topic': 'docs-prd-landing',
@@ -1735,7 +1743,10 @@ class TestUpdateMemoryMetadataArm:
         # The rest of the custom subset is GONE — that is what replace means.
         assert 'kind' not in payload
         assert 'src_project' not in payload
-        # ...but the mem0-owned subset survives underneath.
+        # ...but 'category' is carried through: losing it would make the record
+        # permanently invisible to every category-scoped search, silently.
+        assert payload['category'] == 'observations_and_summaries'
+        # ...and the mem0-owned subset survives underneath.
         assert payload['data'] == 'original content'
         assert payload['hash'] == 'abc123hash'
         assert payload['created_at'] == '2026-01-01T00:00:00+00:00'
@@ -1891,7 +1902,10 @@ class TestUpdateMemoryCombinedArms:
         )
 
         forwarded = service.mem0.update.await_args.kwargs['metadata']
-        assert forwarded == {'topic': 'cgl-eta'}
+        assert forwarded == {
+            'topic': 'cgl-eta',
+            'category': 'observations_and_summaries',
+        }
 
     @pytest.mark.asyncio
     async def test_one_journal_row_and_one_event(self, service):
@@ -1926,6 +1940,152 @@ class TestUpdateMemoryCombinedArms:
         assert result['id'] == 'point-1'
         assert result['content_amended'] is True
         assert result['metadata_patched'] is True
+
+
+class TestUpdateMemoryReplacePreservesCategory:
+    """`category` survives a replace that never named it — on BOTH replace routes.
+
+    `metadata_mode='replace'` decides the whole custom subset, so a caller that
+    re-tags a record with ``metadata_patch={'topic': ...}`` drops every custom
+    key it did not restate. For an ordinary provenance key that is exactly the
+    documented contract. For `category` it is silent data loss: every mem0
+    record carries the key (add_memory and add_system_record both stamp it from
+    the resolved MemoryCategory), and ``Mem0Backend.search`` pushes it down to
+    Qdrant as a payload filter — so a record that loses it drops out of every
+    category-scoped search permanently, while ``update_memory`` returns
+    ``{'status': 'updated'}``. No error, no other symptom.
+
+    The key is therefore carried across a replace, in the same posture the
+    boundary already takes for mem0-owned keys and for an empty replace: a
+    caller cannot destroy it by omission. It stays freely PATCHABLE, so a
+    deliberate re-categorization still works — that is the difference between
+    protecting a key and freezing it.
+    """
+
+    CARRIED = 'observations_and_summaries'
+
+    @staticmethod
+    def _metadata_only_replace(service):
+        """The custom subset a metadata-only replace actually wrote."""
+        service.mem0.overwrite_payload.assert_awaited_once()
+        return service.mem0.overwrite_payload.await_args.args[1]
+
+    @staticmethod
+    def _combined_replace(service):
+        """The custom subset a combined content+metadata replace forwarded."""
+        service.mem0.update.assert_awaited_once()
+        return service.mem0.update.await_args.kwargs['metadata']
+
+    async def _run(self, service, route, *, metadata_patch):
+        """Drive one of the two replace routes and return what it wrote."""
+        if route == 'metadata_only':
+            await service.update_memory(
+                memory_id='point-1', project_id='test',
+                metadata_patch=metadata_patch, metadata_mode='replace',
+            )
+            return self._metadata_only_replace(service)
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            content='amended text', reason='test amend',
+            metadata_patch=metadata_patch, metadata_mode='replace',
+        )
+        return self._combined_replace(service)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('route', ['metadata_only', 'combined'])
+    async def test_category_survives_a_replace_that_omits_it(self, service, route):
+        """The bug: a routine tag edit must not evict the record from search."""
+        written = await self._run(
+            service, route, metadata_patch={'topic': 'cgl-eta'},
+        )
+
+        assert written.get('category') == self.CARRIED, (
+            'a replace that never mentioned `category` must not drop it — the '
+            'record would become permanently unreachable by every '
+            f'category-scoped search; got {written!r}'
+        )
+        assert written['topic'] == 'cgl-eta', 'the replace itself must still apply'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('route', ['metadata_only', 'combined'])
+    async def test_ordinary_custom_keys_still_do_not_survive(self, service, route):
+        """Replace still means replace — the fix must not become a merge.
+
+        Carrying `category` through is a narrow exception justified by that one
+        key being a search filter. If the seed were widened to the whole
+        existing subset, `metadata_mode='replace'` would silently degrade into
+        `'merge'` and its own tests would be the only thing left saying so.
+        """
+        written = await self._run(
+            service, route, metadata_patch={'topic': 'cgl-eta'},
+        )
+
+        assert 'kind' not in written, 'replace must still drop unnamed custom keys'
+        assert 'src_project' not in written
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('route', ['metadata_only', 'combined'])
+    async def test_an_explicit_category_in_the_patch_wins(self, service, route):
+        """Protected, not frozen: a deliberate re-categorization still lands."""
+        written = await self._run(
+            service, route,
+            metadata_patch={'topic': 'cgl-eta', 'category': 'procedural_knowledge'},
+        )
+
+        assert written['category'] == 'procedural_knowledge', (
+            'an explicit `category` in `metadata_patch` must override the '
+            f'carried-through value, got {written!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_metadata_only_replace_still_reattaches_mem0_owned_keys(self, service):
+        """The carry-through rides on the CUSTOM subset, not on the mem0-owned one.
+
+        overwrite_payload replaces the entire point payload, so this pins that
+        the new seed did not displace the mem0-owned keys that must ride along
+        underneath.
+        """
+        written = await self._run(
+            service, 'metadata_only', metadata_patch={'topic': 'cgl-eta'},
+        )
+
+        assert written['data'] == 'original content'
+        assert written['hash'] == 'abc123hash'
+        assert written['created_at'] == '2026-01-01T00:00:00+00:00'
+        assert written['user_id'] == 'testproject'
+
+    @pytest.mark.asyncio
+    async def test_combined_replace_forwards_no_mem0_owned_keys(self, service):
+        """The combined route's forwarded dict stays the stripped custom subset."""
+        from fused_memory.backends.mem0_client import _MEM0_MANAGED_METADATA_KEYS
+
+        written = await self._run(
+            service, 'combined', metadata_patch={'topic': 'cgl-eta'},
+        )
+
+        assert not (set(written) & _MEM0_MANAGED_METADATA_KEYS), (
+            f'mem0 restores its own keys; forwarding them fights it, got {written!r}'
+        )
+        assert written == {'topic': 'cgl-eta', 'category': self.CARRIED}
+
+    @pytest.mark.asyncio
+    async def test_a_record_without_a_category_is_unaffected(self, service):
+        """Nothing is invented: the carry-through copies, it does not default.
+
+        A legacy point with no `category` key must come out of a replace with
+        no `category` key — manufacturing one here would stamp a guessed value
+        onto a record whose real category nobody knows.
+        """
+        payload = {k: v for k, v in DEFAULT_POINT_PAYLOAD.items() if k != 'category'}
+        service.mem0.get_point_by_id = AsyncMock(return_value=payload)
+
+        written = await self._run(
+            service, 'metadata_only', metadata_patch={'topic': 'cgl-eta'},
+        )
+
+        assert 'category' not in written, (
+            f'a missing category must not be invented, got {written!r}'
+        )
 
 
 class _FakeClock:
