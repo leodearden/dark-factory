@@ -4890,11 +4890,21 @@ class Harness:
         # in. Second thin sweep-side upgrade — same pattern as the R4
         # MARK_DONE upgrade above — rather than a change to θ1's reviewed
         # table (design decision, task 2243; esc-2243-5).
+        #
+        # The open-escalation clause is _only_merge_remediable, not the former
+        # `not report.open_escalations` (PRD leaf δ): this is the branch shape a
+        # verified-green-but-never-merged task is in, and the escalation
+        # holding it is usually the reaper's OWN stranded_blocked — filed to
+        # REQUEST exactly the merge the verified-green gate below performs.
+        # Letting that request veto its own remediation was the anti-synergy δ
+        # closes.  Any non-remediable (human-concern) escalation still yields
+        # False here and leaves the task alone, and an empty list is still
+        # True, so every other task classifies exactly as before.
         if (
             action == RecoveryAction.LEAVE
             and status == 'blocked'
             and report.live_claimant is None
-            and not report.open_escalations
+            and self._only_merge_remediable(report.open_escalations)
             and report.branch_state.kind == BranchStateKind.EXISTS_OFF_MAIN
         ):
             action = RecoveryAction.RE_FILE_ESCALATION
