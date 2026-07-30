@@ -19,6 +19,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from fused_memory.server.markup_tripwire import (
+    _MARKUP_STORM_THRESHOLD,
+    _MARKUP_STORM_WINDOW_SECONDS,
+)
 from fused_memory.server.tools import create_mcp_server
 
 _PROJECT_ID = 'dark_factory'
@@ -72,6 +76,51 @@ def task_server(monkeypatch):
     interceptor.update_task.return_value = {'ok': True}
     server = create_mcp_server(AsyncMock(), task_interceptor=interceptor)
     return server, interceptor
+
+
+@pytest.fixture
+def mixed_server(monkeypatch):
+    """One server exposing BOTH the memory tools and the task tools.
+
+    Needed for the storm tests specifically: the counter is meant to be shared
+    across all four write boundaries, which can only be observed if rejections
+    from different tools land on the same server instance.
+    """
+    monkeypatch.setattr('fused_memory.server.tools.resolve_main_checkout', lambda p: str(p))
+    mock_service = AsyncMock()
+    _pass_through(mock_service, 'add_memory')
+    _pass_through(mock_service, 'add_episode')
+    interceptor = AsyncMock()
+    interceptor.submit_task.return_value = {'ticket': 'tkt_x'}
+    interceptor.update_task.return_value = {'ok': True}
+    server = create_mcp_server(mock_service, task_interceptor=interceptor)
+    return server, mock_service, interceptor
+
+
+async def _reject_add_memory(server, agent_id: str = 'a') -> dict:
+    """Drive one add_memory rejection and return the parsed block dict."""
+    return _parse(await server._tool_manager.call_tool(
+        'add_memory',
+        {
+            'content': _LEAKED_INVOKE,
+            'category': 'observations_and_summaries',
+            'agent_id': agent_id,
+            'project_id': _PROJECT_ID,
+        },
+    ))
+
+
+async def _reject_submit_task(server, agent_id: str = 'a') -> dict:
+    """Drive one submit_task rejection and return the parsed block dict."""
+    return _parse(await server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': '/project',
+            'prompt': 'a clean prompt',
+            'description': f'dirty {_LEAKED_INVOKE}',
+            'agent_id': agent_id,
+        },
+    ))
 
 
 def _assert_markup_block(result: object, *, field: str, pattern: str, agent_id: str) -> None:
@@ -528,3 +577,193 @@ class TestUpdateTaskMarkupGate:
         ))
         assert result.get('error') != 'mcp_markup_write_blocked', f'got: {result!r}'
         interceptor.update_task.assert_called_once()
+
+
+class TestMarkupStormIntegration:
+    """A BURST of rejections escalates instead of being absorbed silently (INV-4).
+
+    One bounced write is routine — an agent retries and moves on. What must not
+    be swallowed is a *stream* of them, because that means the upstream harness
+    serialization leak is running right now and every write it touches is a
+    would-be corpus specimen. These tests pin the wiring: rejections from any of
+    the four boundaries feed ONE per-server counter, the crossing response
+    carries the machine-readable storm block, and the best-effort escalation is
+    attempted exactly once without ever changing the rejection outcome.
+    """
+
+    @pytest.mark.asyncio
+    async def test_counter_is_shared_across_the_write_boundaries(self, mixed_server):
+        """Two add_memory rejections plus one submit_task rejection trip the threshold.
+
+        The mixed tool sequence is the point: a leak does not politely confine
+        itself to one tool, so a per-tool counter would need `threshold` hits on
+        the *same* boundary before anyone heard about it.
+        """
+        server, _mock_service, _interceptor = mixed_server
+        assert _MARKUP_STORM_THRESHOLD == 3, (
+            'this test drives exactly 3 rejections; update it alongside the constant'
+        )
+
+        first = await _reject_add_memory(server)
+        second = await _reject_add_memory(server)
+        third = await _reject_submit_task(server)
+
+        assert 'storm' not in first, f'below threshold must carry no storm key: {first!r}'
+        assert 'storm' not in second, f'below threshold must carry no storm key: {second!r}'
+
+        storm = third.get('storm')
+        assert storm is not None, f'threshold-crossing rejection must report a storm: {third!r}'
+        assert storm.get('count') == _MARKUP_STORM_THRESHOLD, f'got: {storm!r}'
+        assert storm.get('threshold') == _MARKUP_STORM_THRESHOLD, f'got: {storm!r}'
+        assert storm.get('window_seconds') == _MARKUP_STORM_WINDOW_SECONDS, f'got: {storm!r}'
+        hint = storm.get('hint')
+        assert hint, f'the storm needs a non-empty hint: {storm!r}'
+        assert '3083' in hint, f'the storm hint must name DF 3083: {hint!r}'
+
+    @pytest.mark.asyncio
+    async def test_below_threshold_rejections_are_still_full_blocks(self, mixed_server):
+        """The write is bounced either way — the storm is additive, not a gate.
+
+        A first-offence rejection that returned a thinner dict would make the
+        caller's remediation depend on how many *other* agents happened to leak
+        recently.
+        """
+        server, mock_service, _interceptor = mixed_server
+
+        result = await _reject_add_memory(server, agent_id='claude-task-3141')
+
+        _assert_markup_block(
+            result, field='content', pattern='</invoke>', agent_id='claude-task-3141'
+        )
+        assert 'storm' not in result, f'got: {result!r}'
+        mock_service.add_memory.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_each_server_starts_with_a_fresh_counter(self, monkeypatch):
+        """Per-server state, so no counter bleeds between servers (or tests).
+
+        Asserting the SECOND server also fires on its own third rejection is the
+        discriminator: with a module-global counter the first server's fire would
+        still be inside the rate-limit window, so the second server's burst would
+        be suppressed entirely.
+        """
+        monkeypatch.setattr('fused_memory.server.tools.resolve_main_checkout', lambda p: str(p))
+
+        def _build():
+            interceptor = AsyncMock()
+            interceptor.submit_task.return_value = {'ticket': 'tkt_x'}
+            return create_mcp_server(AsyncMock(), task_interceptor=interceptor)
+
+        first_server = _build()
+        for _ in range(_MARKUP_STORM_THRESHOLD - 1):
+            assert 'storm' not in await _reject_submit_task(first_server)
+        assert 'storm' in await _reject_submit_task(first_server), 'server A should have fired'
+
+        second_server = _build()
+        for i in range(_MARKUP_STORM_THRESHOLD - 1):
+            below = await _reject_submit_task(second_server)
+            assert 'storm' not in below, f'server B rejection {i + 1} fired early: {below!r}'
+        crossing = await _reject_submit_task(second_server)
+        assert 'storm' in crossing, (
+            f'server B must fire on its OWN third rejection, not inherit A: {crossing!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_escalation_is_emitted_once_when_the_storm_fires(
+        self, mixed_server, monkeypatch
+    ):
+        """The queue write happens on the burst only, and its id is echoed back.
+
+        Folding the escalation id into the storm block is what lets the rejected
+        caller (or a reviewer reading the response) find the filed escalation
+        without grepping logs.
+        """
+        server, _mock_service, _interceptor = mixed_server
+        calls: list[tuple] = []
+
+        def _fake_emit(project_root, storm):
+            calls.append((project_root, storm))
+            return 'esc-markup-tripwire-1'
+
+        monkeypatch.setattr(
+            'fused_memory.server.tools.emit_markup_storm_escalation', _fake_emit
+        )
+
+        for _ in range(_MARKUP_STORM_THRESHOLD - 1):
+            await _reject_add_memory(server)
+        assert calls == [], f'no escalation may be filed below threshold: {calls!r}'
+
+        crossing = await _reject_submit_task(server)
+
+        assert len(calls) == 1, f'expected exactly one escalation attempt, got: {calls!r}'
+        project_root, storm_arg = calls[0]
+        assert project_root == '/project', (
+            f'the storm must be escalated against the project_root, got: {project_root!r}'
+        )
+        assert storm_arg.get('count') == _MARKUP_STORM_THRESHOLD, f'got: {storm_arg!r}'
+        assert crossing.get('storm', {}).get('escalation_id') == 'esc-markup-tripwire-1', (
+            f'the filed escalation id must be echoed in the storm block: {crossing!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_escalation_failure_does_not_break_the_rejection(
+        self, mixed_server, monkeypatch
+    ):
+        """Escalation is purely additive: the write was already refused.
+
+        emit_markup_storm_escalation is documented never to raise, but the call
+        site must not depend on that promise — a queue failure that turned a
+        rejection into a 500 would trade containment for an outage.
+        """
+        server, _mock_service, _interceptor = mixed_server
+
+        def _boom(project_root, storm):
+            raise RuntimeError('escalation queue is on fire')
+
+        monkeypatch.setattr('fused_memory.server.tools.emit_markup_storm_escalation', _boom)
+
+        for _ in range(_MARKUP_STORM_THRESHOLD - 1):
+            await _reject_add_memory(server)
+        crossing = await _reject_submit_task(server, agent_id='claude-task-3141')
+
+        _assert_markup_block(
+            crossing, field='description', pattern='</invoke>', agent_id='claude-task-3141'
+        )
+        assert 'storm' in crossing, (
+            f'the burst is still reported even when escalation fails: {crossing!r}'
+        )
+        assert 'escalation_id' not in crossing['storm'], (
+            f'no id to echo when filing failed: {crossing["storm"]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_storm_is_logged_at_error_with_a_greppable_prefix(
+        self, mixed_server, monkeypatch, caplog
+    ):
+        """The burst must be visible to an operator who never reads MCP responses.
+
+        The MCP response goes to the leaking agent, which is precisely the party
+        least likely to act on it, so the ERROR log line is the operator-facing
+        half of INV-4 — and the escalation detail tells a reader to grep for
+        exactly this prefix.
+        """
+        server, _mock_service, _interceptor = mixed_server
+        monkeypatch.setattr(
+            'fused_memory.server.tools.emit_markup_storm_escalation', lambda *_: None
+        )
+
+        with caplog.at_level('ERROR'):
+            for _ in range(_MARKUP_STORM_THRESHOLD - 1):
+                await _reject_add_memory(server)
+            errors_below = [r for r in caplog.records if r.levelname == 'ERROR']
+            assert errors_below == [], f'no ERROR below threshold, got: {errors_below!r}'
+
+            await _reject_submit_task(server)
+
+        storm_errors = [
+            r for r in caplog.records
+            if r.levelname == 'ERROR' and 'markup_tripwire_storm' in r.getMessage()
+        ]
+        assert len(storm_errors) == 1, (
+            f'expected one greppable markup_tripwire_storm ERROR line, got: {caplog.text!r}'
+        )
