@@ -40,6 +40,8 @@ def _load_module() -> types.ModuleType:
 
 _mod = _load_module()
 cluster_memories_by_pairs = _mod.cluster_memories_by_pairs
+ann_pairs_from_neighbors = _mod.ann_pairs_from_neighbors
+_ANN_DISCLOSURE_KEYS = _mod._ANN_DISCLOSURE_KEYS
 find_near_duplicate_memory_groups = _mod.find_near_duplicate_memory_groups
 pick_survivor = _mod.pick_survivor
 build_sweep_plan = _mod.build_sweep_plan
@@ -859,3 +861,189 @@ class TestApplyDeletionsPartialFailure:
 
         assert memory.delete_memory.await_count == 3
         assert result == {'deleted': 2, 'delete_errors': 1}
+
+
+# ===========================================================================
+# ann_pairs_from_neighbors — ANN candidate generation + cap disclosure (3210)
+# ===========================================================================
+
+def _hit(memory_id: str, score: float) -> dict:
+    """A single Qdrant neighbour hit, as fetch_ann_neighbors hands it over."""
+    return {'id': memory_id, 'score': score}
+
+
+class TestAnnPairsFromNeighbors:
+    """Turn per-record ANN neighbour lists into index pairs, counting every loss.
+
+    The ANN path exists to catch the paraphrase class the lexical difflib scan
+    structurally cannot: same meaning, almost no shared wording. But an ANN
+    scan loses recall in ways a full O(n^2) scan does not — a top_k cap, a
+    score cutoff, a record that has no stored vector to query with. Every one
+    of those losses is COUNTED and returned, so a cap firing is a metric an
+    operator can alarm on rather than invisible recall loss.
+    """
+
+    def _memories(self, n: int, *, vectors: bool = True) -> list[dict]:
+        out = []
+        for i in range(n):
+            m = _memory(f'm{i}', f'content {i}')
+            m['vector'] = [0.1 * i, 0.2] if vectors else None
+            out.append(m)
+        return out
+
+    def test_hits_at_or_above_threshold_become_pairs(self):
+        memories = self._memories(3)
+        neighbors = {'m0': [_hit('m1', 0.95)], 'm1': [], 'm2': []}
+        pairs, _disclosure = ann_pairs_from_neighbors(memories, neighbors, threshold=0.9)
+        assert pairs == [(0, 1)]
+
+    def test_score_exactly_at_threshold_is_kept(self):
+        """>= threshold, not > threshold — the cutoff is inclusive."""
+        memories = self._memories(2)
+        neighbors = {'m0': [_hit('m1', 0.9)], 'm1': []}
+        pairs, disclosure = ann_pairs_from_neighbors(memories, neighbors, threshold=0.9)
+        assert pairs == [(0, 1)]
+        assert disclosure['below_threshold_dropped'] == 0
+
+    def test_self_hit_is_dropped_and_not_counted_as_a_loss(self):
+        """A record is always its own nearest neighbour; that is not a duplicate."""
+        memories = self._memories(2)
+        neighbors = {'m0': [_hit('m0', 1.0), _hit('m1', 0.95)], 'm1': []}
+        pairs, disclosure = ann_pairs_from_neighbors(memories, neighbors, threshold=0.9)
+        assert pairs == [(0, 1)], 'self-hit must not produce a (0,0) pair'
+        assert disclosure['unknown_neighbor_dropped'] == 0, (
+            'a self-hit is expected, not an unknown neighbour'
+        )
+
+    def test_mirrored_hits_dedupe_to_one_pair(self):
+        """m0->m1 and m1->m0 are the same candidate pair, emitted once."""
+        memories = self._memories(2)
+        neighbors = {'m0': [_hit('m1', 0.95)], 'm1': [_hit('m0', 0.95)]}
+        pairs, _disclosure = ann_pairs_from_neighbors(memories, neighbors, threshold=0.9)
+        assert pairs == [(0, 1)]
+
+    def test_pairs_are_normalised_low_index_first(self):
+        """Ordering is canonical so the closure and any dedupe see one form."""
+        memories = self._memories(2)
+        neighbors = {'m1': [_hit('m0', 0.95)]}
+        pairs, _disclosure = ann_pairs_from_neighbors(memories, neighbors, threshold=0.9)
+        assert pairs == [(0, 1)], f'expected (0,1) normalised form, got {pairs}'
+
+    def test_below_threshold_hits_are_dropped_and_counted(self):
+        memories = self._memories(3)
+        neighbors = {'m0': [_hit('m1', 0.5), _hit('m2', 0.2)], 'm1': [], 'm2': []}
+        pairs, disclosure = ann_pairs_from_neighbors(memories, neighbors, threshold=0.9)
+        assert pairs == []
+        assert disclosure['below_threshold_dropped'] == 2
+
+    def test_unknown_neighbor_id_is_dropped_and_counted(self):
+        """A neighbour outside the scanned set cannot be clustered — count it.
+
+        Happens when the ANN query returns a record the category filter
+        excluded, or one written between the scroll and the query.
+        """
+        memories = self._memories(2)
+        neighbors = {'m0': [_hit('not-in-scan', 0.99), _hit('m1', 0.95)], 'm1': []}
+        pairs, disclosure = ann_pairs_from_neighbors(memories, neighbors, threshold=0.9)
+        assert pairs == [(0, 1)]
+        assert disclosure['unknown_neighbor_dropped'] == 1
+
+    def test_top_k_saturation_is_counted(self):
+        """A neighbour list filled to top_k may have dropped further matches."""
+        memories = self._memories(4)
+        neighbors = {
+            'm0': [_hit('m1', 0.95), _hit('m2', 0.94)],  # exactly top_k=2 -> saturated
+            'm1': [_hit('m0', 0.95)],                    # under cap -> not saturated
+            'm2': [],
+            'm3': [],
+        }
+        _pairs, disclosure = ann_pairs_from_neighbors(
+            memories, neighbors, threshold=0.9, top_k=2,
+        )
+        assert disclosure['top_k_saturated'] == 1
+
+    def test_top_k_saturation_counted_even_when_hits_are_below_threshold(self):
+        """Saturation is a property of the QUERY cap, not of what survived it."""
+        memories = self._memories(3)
+        neighbors = {'m0': [_hit('m1', 0.1), _hit('m2', 0.1)], 'm1': [], 'm2': []}
+        _pairs, disclosure = ann_pairs_from_neighbors(
+            memories, neighbors, threshold=0.9, top_k=2,
+        )
+        assert disclosure['top_k_saturated'] == 1
+        assert disclosure['below_threshold_dropped'] == 2
+
+    def test_missing_vector_record_is_counted_and_contributes_no_pairs(self):
+        """No stored vector means the record was never queried — disclose it."""
+        memories = self._memories(3)
+        memories[2]['vector'] = None
+        neighbors = {'m0': [_hit('m1', 0.95)], 'm1': [], 'm2': []}
+        pairs, disclosure = ann_pairs_from_neighbors(memories, neighbors, threshold=0.9)
+        assert disclosure['missing_vector'] == 1
+        assert all(2 not in p for p in pairs), (
+            f'a vector-less record must contribute no pairs from its own query, got {pairs}'
+        )
+
+    def test_absent_vector_key_counts_as_missing_vector(self):
+        """A record scrolled without with_vectors=True has no 'vector' key at all."""
+        memories = [_memory('m0', 'a'), _memory('m1', 'b')]  # no 'vector' key
+        pairs, disclosure = ann_pairs_from_neighbors(memories, {}, threshold=0.9)
+        assert disclosure['missing_vector'] == 2
+        assert pairs == []
+
+    def test_disclosure_keys_always_present_and_integer_even_when_zero(self):
+        """INV-2/INV-4: a cap that never fired still reports 0, never an absent key.
+
+        An absent key is indistinguishable from 'not measured' downstream; the
+        metrics layer emits one metric per counter and must never silently skip
+        one because this run happened to be clean.
+        """
+        memories = self._memories(2)
+        neighbors = {'m0': [_hit('m1', 0.95)], 'm1': []}
+        _pairs, disclosure = ann_pairs_from_neighbors(
+            memories, neighbors, threshold=0.9, top_k=10,
+        )
+        assert set(disclosure) == set(_ANN_DISCLOSURE_KEYS), (
+            f'disclosure keys {sorted(disclosure)} != {sorted(_ANN_DISCLOSURE_KEYS)}'
+        )
+        for key, value in disclosure.items():
+            assert isinstance(value, int) and not isinstance(value, bool), (
+                f'disclosure[{key!r}] must be an int, got {value!r}'
+            )
+        assert all(v == 0 for v in disclosure.values()), (
+            f'clean run must report all-zero counters, got {disclosure}'
+        )
+
+    def test_empty_inputs_produce_no_pairs_and_zeroed_disclosure(self):
+        pairs, disclosure = ann_pairs_from_neighbors([], {}, threshold=0.9)
+        assert pairs == []
+        assert set(disclosure) == set(_ANN_DISCLOSURE_KEYS)
+        assert all(v == 0 for v in disclosure.values())
+
+    def test_transitive_closure_via_the_shared_core(self):
+        """ANN pairs feed cluster_memories_by_pairs — the SAME closure the lexical path uses."""
+        memories = self._memories(3)
+        neighbors = {'m0': [_hit('m1', 0.95)], 'm1': [_hit('m2', 0.93)], 'm2': []}
+        pairs, _disclosure = ann_pairs_from_neighbors(memories, neighbors, threshold=0.9)
+        groups = cluster_memories_by_pairs(memories, pairs)
+        assert len(groups) == 1
+        assert [m['id'] for m in groups[0]] == ['m0', 'm1', 'm2']
+
+    def test_pairs_are_deterministic_and_sorted(self):
+        """Two runs over the same input emit the same pair list in the same order."""
+        memories = self._memories(4)
+        neighbors = {
+            'm3': [_hit('m1', 0.95)],
+            'm0': [_hit('m2', 0.95)],
+            'm1': [_hit('m3', 0.95)],
+            'm2': [],
+        }
+        first, _ = ann_pairs_from_neighbors(memories, neighbors, threshold=0.9)
+        second, _ = ann_pairs_from_neighbors(memories, neighbors, threshold=0.9)
+        assert first == second
+        assert first == sorted(first), f'pairs must be emitted in sorted order, got {first}'
+
+    def test_input_memories_not_mutated(self):
+        memories = self._memories(2)
+        snapshot = [dict(m) for m in memories]
+        ann_pairs_from_neighbors(memories, {'m0': [_hit('m1', 0.95)]}, threshold=0.9)
+        assert memories == snapshot
