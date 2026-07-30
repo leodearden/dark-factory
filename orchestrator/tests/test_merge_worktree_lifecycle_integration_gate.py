@@ -198,7 +198,81 @@ accepted on purpose -- the PRD's done gate is defined as a single readable
 Sec.9 row matrix -- but if you are here because a change made two files
 red, the right-hand column is where the ORIGINAL unit-level contract
 lives; treat this file as the composition/traceability layer over it, and
-do not deepen a port here that would be better expressed upstream.
+do not deepen a port here that would be better expressed upstream. The
+MEASURED split below tells you which assertions in each port are safe to
+re-sync mechanically from that column versus which are original
+contracts you must re-derive by hand. This acceptance is a recorded
+DECISION, not an assumption: see D9 and the `G7 waiver:
+no-lockstep-duplication` in docs/prds/merge-worktree-lifecycle-integrity.md
+Sec.5.
+
+MEASURED duplicate-vs-unique split (per row) -- vs upstream, vs capstone
+----------------------------------------------------------------------------
+The PROVENANCE table above says WHERE each row was ported from; it does
+not say WHICH assertions duplicate that origin (safe to drop) versus the
+gate's own capstone (:class:`TestFiveThreeTwoSixReplayGate`, load-bearing
+HERE). Conflating the two is how row 3's port silently DROPPED an
+upstream assertion (repaired 2026-07-30, task 3153) while row 9's port
+silently GAINED unique coverage -- neither fact was written down until
+now. Measured by a full assertion-level diff, not estimated:
+
+  rows 1,2,4 | vs upstream: FULLY SUBSUMED -- same assertions, same
+             |   failure-message strings, same mocking depth
+             |   (cleanup_worktree / quarantine_worktree /
+             |   _is_registered_worktree are AsyncMocks in BOTH; the
+             |   gate's real-git repo is inert on the C2 arm, which is
+             |   pure in-process classification).
+             | vs capstone: NOT subsumed -- the capstone asserts survival,
+             |   cleaned_paths.isdisjoint(protected) and the upper-bound
+             |   pin, but NEVER the INFO skip-REPORTING (no info_messages
+             |   name loop). LOAD-BEARING HERE.
+  3          | vs upstream: PARTIAL -- the gate ADDS a stale-.lock file
+             |   plus a guaranteed-dead pgid setup (upstream's dead tree
+             |   has no lock file at all) and a logger-scoped WARNING
+             |   count; it had DROPPED upstream's no-skip-WARNING-on-
+             |   fail-open assertion, restored 2026-07-30 (task 3153).
+             |   Upstream's 8 sibling outcome tests (skipped_persistent
+             |   x2, not_present, failed, lock-unlink/preserve, the
+             |   CleanupMergeWorktreeRouting pair) are deliberately NOT
+             |   ported.
+             | vs capstone: PARTIAL -- the capstone re-covers only the
+             |   skipped_lease_held / removed OUTCOMES via the reaper
+             |   spy, never the dead-holder fail-open and never the
+             |   WARNING count/pgid/reason. LOAD-BEARING HERE.
+  6,7        | vs upstream: FULLY SUBSUMED -- verbatim, down to the
+             |   'order-independent: the descendant wins regardless of
+             |   journal order' message; git_ops is a MagicMock in BOTH,
+             |   so the gate is not "more real" than its origin.
+             | vs capstone: NOT subsumed -- the capstone asserts
+             |   recovered/coalesced/len(requests)/winner-is-descendant/
+             |   qsize but NEVER the peer-future MIRROR (no waiters
+             |   assertion, no peer .result()) and drives only ONE
+             |   journal order. LOAD-BEARING HERE.
+  8          | vs upstream: FULLY SUBSUMED -- 11 of 11 assertions
+             |   identical, in order. NOTE: the gate passes
+             |   event_store=None where upstream passes a real
+             |   EventStore; this is DELIBERATE and INERT --
+             |   coalesce_or_enqueue_merge_request's duplicate_in_verify
+             |   reject returns BEFORE the function's only
+             |   event_store.emit call, on a different branch, so a real
+             |   EventStore is never touched on this path. Do not "fix" it.
+             | vs capstone: not covered at all. SOLE COVERAGE IN THIS FILE.
+  9          | vs upstream: PARTIAL, and the ONE port with genuinely NEW
+             |   detection -- the retirement -> IMMEDIATE-resubmit
+             |   composition driven through the production entry point
+             |   coalesce_or_enqueue_merge_request WITH the retention ring
+             |   is absent upstream, which never composes the two and
+             |   never passes retention= to a submit call. Segments A
+             |   (full retirement) and C (late stale retirement /
+             |   identity guard) ARE verbatim ports.
+             | vs capstone: not covered at all. SOLE COVERAGE IN THIS FILE.
+
+Practical upshot for the next production change that turns two files red:
+rows 1,2,4,6,7,8's "FULLY SUBSUMED" halves can be re-synced MECHANICALLY
+from the upstream node id named in the PROVENANCE table above. Row 3's
+capstone-delta and row 9's retention-composition are ORIGINAL contracts
+with no upstream analogue -- re-derive them by hand; do not assume
+re-copying the upstream diff covers them.
 """
 
 from __future__ import annotations
