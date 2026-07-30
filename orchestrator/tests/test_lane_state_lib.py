@@ -23,6 +23,7 @@ as ``test_warm_lane_scripts_shipped.py`` — never a fixture copy of it.
 """
 from __future__ import annotations
 
+import fnmatch
 import json
 import shlex
 import shutil
@@ -1050,3 +1051,135 @@ class TestLaneProtectGlobBridge:
         warns = _warn_lines(proc.stderr)
         assert len(warns) == 1, f'{label}: expected exactly one [warn], got {warns!r}'
         assert 'python3' in warns[0], f'{label}: warning does not name the stage: {warns[0]!r}'
+
+
+# ---------------------------------------------------------------------------
+# THE DRIFT TEST — the INV-5 gate
+# ---------------------------------------------------------------------------
+
+#: Stands in for "any name in this band".  A literal no real worktree would
+#: carry, so a fallback pattern matching it can only be matching the BAND.
+_BAND_SENTINEL = 'zzrepresentativezz'
+
+
+def _representative(band: str) -> str:
+    """A concrete directory name that *band* — a RENDERED glob — matches.
+
+    ``_merge-*`` -> ``_merge-<sentinel>``; an exact-name band such as
+    ``_merge-verify`` is already concrete and stands for itself.
+    """
+    return band[:-1] + _BAND_SENTINEL if band.endswith('*') else band
+
+
+def _uncovered_bands(rendered: str, fallback: str) -> list[str]:
+    """Which of *rendered*'s bands NO pattern in *fallback* protects.
+
+    Coverage is by glob match against a representative name rather than string
+    equality, because the fallback is allowed to be BROADER than the render:
+    ``_merge-verify`` is genuinely covered by ``_merge-*``.  Only a band nothing
+    matches is drift, and drift in this direction is the dangerous one — an
+    unprotected band means the reaper may remove a live managed worktree.
+    """
+    patterns = [p for p in fallback.split(',') if p]
+    return [
+        band
+        for band in (b for b in rendered.split(',') if b)
+        if not any(
+            fnmatch.fnmatchcase(_representative(band), pattern) for pattern in patterns
+        )
+    ]
+
+
+@pytest.fixture
+def fallback() -> str:
+    """``LANE_PROTECT_GLOB_FALLBACK``, read out of the SHIPPED lib."""
+    proc = _run_sourced('printf \'%s\\n\' "${LANE_PROTECT_GLOB_FALLBACK:-}"')
+    assert proc.returncode == 0, proc.stderr
+    value = proc.stdout.strip()
+    assert value, (
+        'LANE_PROTECT_GLOB_FALLBACK is unset or empty in the shipped lib — the '
+        'python3-outage backstop does not exist, so a bridge failure would '
+        'leave a reclaim sweep with nothing to fall back to'
+    )
+    return value
+
+
+class TestProtectGlobFallbackDrift:
+    """``LANE_PROTECT_GLOB_FALLBACK`` may not drift from ``PROTECTED_PREFIXES``.
+
+    This is the INV-5 gate leaf β exists to ship.  Note WHAT it pins and why
+    that is the only useful subject: a glob rendered at runtime from
+    ``PROTECTED_PREFIXES`` cannot drift from ``PROTECTED_PREFIXES`` — asserting
+    that would be a tautology that passes forever and catches nothing.  The one
+    artifact that CAN drift is the static fallback the bash side needs when the
+    python bridge fails, so that is what is checked.
+
+    The fallback is retained deliberately rather than deleted to remove the
+    drift risk: ``_merge-*`` is ``_merge-verify``'s ONLY gc protection, so a
+    systemd-timer sweep must not lose it to a python3 hiccup.  What changes
+    versus the hand-copied glob in warm-lane-gc.sh is that the backstop now
+    lives in ONE place and is MACHINE-CHECKED, instead of being maintained by a
+    comment across a repo boundary.
+    """
+
+    def test_every_rendered_band_is_covered_by_the_fallback(self, fallback) -> None:
+        from orchestrator.git_ops import (
+            PROTECT_GLOB_OWNED_POOL_BANDS,
+            render_protect_glob,
+        )
+
+        rendered = render_protect_glob(owned=PROTECT_GLOB_OWNED_POOL_BANDS)
+        uncovered = _uncovered_bands(rendered, fallback)
+        assert uncovered == [], (
+            f'PROTECTED_PREFIXES has bands the python3-outage fallback does not '
+            f'protect: {uncovered}. Add them to LANE_PROTECT_GLOB_FALLBACK in '
+            f'orchestrator/scripts/warm-lane/lib_lane_state.sh — until you do, a '
+            f'bridge failure leaves those worktrees reclaimable.\n'
+            f'  rendered: {rendered}\n  fallback: {fallback}'
+        )
+
+    def test_the_drift_guard_actually_fires(self, fallback, monkeypatch) -> None:
+        """The gate must go RED on a new band, not pass vacuously.
+
+        Without this, the coverage assertion above could be green because the
+        check is broken rather than because the fallback is complete — and a
+        drift gate that cannot fail is worse than none, since it advertises a
+        guarantee it is not providing.
+        """
+        from orchestrator import git_ops
+
+        monkeypatch.setitem(git_ops.PROTECTED_PREFIXES, '_newband-', 'test-only')
+        rendered = git_ops.render_protect_glob(
+            owned=git_ops.PROTECT_GLOB_OWNED_POOL_BANDS,
+        )
+        assert '_newband-*' in rendered.split(','), rendered
+        uncovered = _uncovered_bands(rendered, fallback)
+        assert uncovered == ['_newband-*'], (
+            'the coverage check did not flag an unmirrored band — the INV-5 gate '
+            f'is not actually gating anything (uncovered={uncovered!r})'
+        )
+
+    def test_the_fallback_never_protects_a_band_the_sweep_owns(
+        self, fallback,
+    ) -> None:
+        """A python3 outage must not FREEZE reclaim either.
+
+        Fail-open is a two-sided obligation: the fallback must not lose
+        ``_merge-*``, and it must not gain ``_lane-*``/``_spec-*``.  Protecting
+        the pool bands would make warm-lane-gc.sh skip every lane in both
+        passes, stopping reclaim outright — which is how the pool accreted to
+        the 2026-07-10 ENOSPC outage in the first place.
+        """
+        from orchestrator.git_ops import PROTECT_GLOB_OWNED_POOL_BANDS
+
+        patterns = [p for p in fallback.split(',') if p]
+        for band in PROTECT_GLOB_OWNED_POOL_BANDS:
+            offenders = [
+                p
+                for p in patterns
+                if fnmatch.fnmatchcase(band + _BAND_SENTINEL, p)
+            ]
+            assert offenders == [], (
+                f'the fallback protects pool band {band!r} via {offenders!r} — a '
+                f'python3 outage would freeze reclaim instead of degrading it'
+            )
