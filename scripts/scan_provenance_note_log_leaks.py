@@ -42,10 +42,12 @@ tasks 2938/2939 and solves it by requiring structural evidence.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
 import sqlite3
+import sys
 from pathlib import Path
 from typing import NamedTuple
 
@@ -206,3 +208,87 @@ def format_report(
 def format_json(matches: list[NoteLeakMatch]) -> str:
     """Render *matches* as a JSON array, carrying the FULL untruncated line."""
     return json.dumps([m._asdict() for m in matches])
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            'READ-ONLY sweep for leaked server-log lines in a task\'s '
+            'metadata.done_provenance.note (e.g. a timestamped '
+            'fused_memory/httpx logger line stamped there by a predicate '
+            "check's raw stdout tail). Detection/reporting only -- never "
+            'mutates task data.'
+        ),
+    )
+    parser.add_argument(
+        '--db', dest='dbs', action='append',
+        help='Explicit tasks.db path to scan. May be repeated.',
+    )
+    parser.add_argument(
+        '--project-root', dest='project_roots', action='append',
+        help=(
+            'Project root to scan (maps to <root>/.taskmaster/tasks/tasks.db). '
+            'May be repeated.'
+        ),
+    )
+    parser.add_argument(
+        '--json', action='store_true',
+        help='Emit a JSON array (full untruncated leak lines) instead of a report.',
+    )
+    parser.add_argument(
+        '--max-line-len', type=int, default=_DEFAULT_MAX_LINE_LEN,
+        help='Truncate leak lines in the human-readable report to this length '
+        '(default: %(default)s). Ignored with --json.',
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point.
+
+    Exit codes: 0 = clean, 1 = at least one leak found, 2 = no tasks.db could
+    be resolved from --db / --project-root / DASHBOARD_KNOWN_PROJECT_ROOTS /
+    the dark-factory default.
+
+    A single unreadable database (e.g. a stale/corrupt file, or a transient
+    "database is locked"/"file is not a database" condition) does not abort
+    the sweep: it is logged to stderr and skipped so every other resolvable
+    database is still scanned and reported.
+    """
+    args = _build_parser().parse_args(argv)
+
+    db_paths = discover_db_paths(explicit_dbs=args.dbs, project_roots=args.project_roots)
+    if not db_paths:
+        print(
+            'no tasks.db resolvable (checked --db / --project-root / '
+            'DASHBOARD_KNOWN_PROJECT_ROOTS / the dark-factory default)',
+            file=sys.stderr,
+        )
+        return 2
+
+    matches: list[NoteLeakMatch] = []
+    unreadable: list[str] = []
+    for db_path in db_paths:
+        try:
+            matches.extend(scan_db(db_path))
+        except sqlite3.Error as exc:
+            print(f'warning: skipping unreadable database {db_path}: {exc}', file=sys.stderr)
+            unreadable.append(db_path)
+
+    if unreadable:
+        print(
+            f'warning: {len(unreadable)} database(s) skipped due to read errors '
+            '(see warnings above); results below are incomplete',
+            file=sys.stderr,
+        )
+
+    if args.json:
+        print(format_json(matches))
+    else:
+        print(format_report(matches, max_line_len=args.max_line_len))
+
+    return 1 if matches else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
