@@ -79,7 +79,19 @@ def _build_eval(eval_dir: Path) -> dict[str, Any]:
     artifact's in-body ``run_stamp``.
     """
     eval_id = eval_dir.name
-    paths = sorted(eval_dir.glob('metrics-*.json'))
+    all_paths = sorted(eval_dir.glob('metrics-*.json'))
+
+    # Trailing window: keep the MOST RECENT runs, drop the oldest.  Dropping
+    # the newest instead would leave a trend that ends N runs ago reading as
+    # current.  ``_TREND_RUN_CAP`` is looked up in the module namespace here
+    # (not captured at import) so it stays one adjustable knob.
+    #
+    # No silent caps: whenever this window drops anything, the count dropped
+    # is disclosed IN THE PAYLOAD (``truncated`` + ``runs_on_disk`` beside
+    # ``run_count``), never only in a log the operator will not read.
+    runs_on_disk = len(all_paths)
+    paths = all_paths[-_TREND_RUN_CAP:] if _TREND_RUN_CAP else all_paths
+    truncated = len(paths) < runs_on_disk
 
     runs: list[tuple[str, dict[str, dict]]] = []
     corpus: dict | None = None
@@ -124,8 +136,8 @@ def _build_eval(eval_dir: Path) -> dict[str, Any]:
         'eval_id': eval_id,
         'run_stamps': run_stamps,
         'run_count': len(run_stamps),
-        'runs_on_disk': len(paths),
-        'truncated': False,
+        'runs_on_disk': runs_on_disk,
+        'truncated': truncated,
         'corpus': corpus,
         'metrics': metrics,
     }
