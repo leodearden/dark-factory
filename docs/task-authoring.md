@@ -501,9 +501,30 @@ script and decides by **exit code only** — it parses no output:
 
 | Exit code | Outcome |
 |---|---|
-| `0` | task `done`, `done_provenance.kind='deterministic-milestone'` (the script's stdout tail carried as `note`) |
+| `0` | task `done`, `done_provenance.kind='deterministic-milestone'` (a **bounded structured verdict** carried as `note` — see below) |
 | non-`0` | born-at-L2 `milestone_check_failed` escalation (detail carries the exit code + stdout tail) + task `blocked` |
 | timeout | born-at-L2 `infra_issue` escalation (existing timeout path) + task `blocked`, **no** `gate_escalated_at` stamp |
+
+**What the `rc == 0` `note` carries (task 3286):** `predicate check passed
+(rc=0)`, plus — when the script emitted one — a single extracted payload:
+either a **trailing JSON block** (re-dumped compactly) or the **last output
+line if it is clean**, capped at 400 chars. Log-shaped lines (a leading
+timestamp, or a standalone `DEBUG`/`INFO`/`WARNING`/`ERROR`/`CRITICAL`
+token) are dropped, and an over-cap payload is replaced wholesale by an
+elision marker rather than sliced mid-structure. This is an **allowlist**:
+an unrecognized shape yields the verdict prefix alone.
+
+**If you want your predicate's verdict preserved, emit it as a trailing
+JSON object or as one clean final line.** The reason for the bound is that
+`note` is not a private field — fused-memory's reconciliation
+`_format_outcome_echo` appends it to a Mem0 completion-summary write, so
+whatever lands there is ingested into memory. Task 2902 is the specimen: a
+chatty script's server-log noise reached the knowledge graph this way.
+Nothing is lost to debugging — the orchestrator logs the raw output in full
+at INFO before summarizing, and the non-`0` row below still carries it
+verbatim in the escalation detail (an escalation is read by a human, never
+memory-ingested). `scripts/scan_provenance_note_log_leaks.py` is the
+read-only recurrence guard.
 
 A predicate is **read-only**, so resolving the escalation (`resume`)
 safely **re-runs** the check rather than trusting the resolution blindly —

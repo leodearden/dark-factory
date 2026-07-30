@@ -202,7 +202,12 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
      ``asyncio.wait_for(timeout_secs + run_timeout_grace_secs)``).
    - ``rc == 0`` (invariant holds): set task ``done`` with
      ``done_provenance.kind='deterministic-milestone'`` (never
-     ``'deterministic-deploy'`` — no deploy happened).
+     ``'deterministic-deploy'`` — no deploy happened).  The ``note`` carries
+     a BOUNDED STRUCTURED VERDICT from ``_summarize_predicate_output``, not
+     the raw stdout tail (task 3286): the note is appended to a Mem0
+     completion summary downstream, so raw subprocess output landing there is
+     ingested into memory (task 2902's specimen).  The raw output is logged
+     at INFO first, so nothing is silently discarded.
    - ``rc != 0`` (invariant violated — a VERDICT, not an infra fault): file a
      born-at-L2 ``milestone_check_failed`` escalation, stamp
      ``gate_escalated_at`` (reusing the gate resume machinery so a human
