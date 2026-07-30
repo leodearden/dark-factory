@@ -136,15 +136,39 @@ function applyKey(key, value) {
   }
 }
 
-async function refreshOne(url, keys) {
+// Flow-control state is keyed by endpoint PATH (query string stripped): four
+// of the 13 endpoints carry ?window=<chip>, whose URL changes on every chip
+// click (app.jsx:71 -> DF_REFRESH(win)). URL-keyed state would create a
+// fresh entry on every chip change, silently resetting the in-flight flag
+// (and, once backoff lands, its deadline) for those four endpoints.
+function pollKey(url) {
+  return url.split('?')[0];
+}
+
+function stateFor(state, url) {
+  const key = pollKey(url);
+  let st = state.get(key);
+  if (!st) {
+    st = { inFlight: false, failures: 0, nextAllowedAt: 0 };
+    state.set(key, st);
+  }
+  return st;
+}
+
+async function refreshOne(url, keys, state, deps) {
+  const st = stateFor(state, url);
+  if (st.inFlight) return; // already in flight for this endpoint — skip this tick, do not queue
+  st.inFlight = true;
   try {
-    const resp = await fetch(url, { credentials: 'same-origin' });
+    const resp = await deps.fetchImpl(url, { credentials: 'same-origin' });
     if (!resp.ok) return;
     const body = await resp.json();
     keys.forEach(k => applyKey(k, body[k]));
   } catch (err) {
     // Network blip — keep the prior values so the UI does not blank out.
     console.warn('DF_DATA fetch failed', url, err);
+  } finally {
+    st.inFlight = false;
   }
 }
 
@@ -152,13 +176,24 @@ async function refreshOne(url, keys) {
 // so chip changes take effect on the next tick without restarting the loop.
 let currentWin = '24h';
 
-// `opts` is accepted (and, for now, ignored) so callers can already pass a
-// flow-control {state, deps} bag ahead of the guard/backoff/jitter (steps
-// 3-8) actually reading it — kept as its own step so the guard's regression
-// test fails on real concurrency behaviour, not a missing parameter.
+// Real (browser) deps; opts.deps overrides individual entries (tests inject
+// a controllable clock/RNG/fetch instead of these).
+const DEFAULT_POLL_DEPS = {
+  now: () => Date.now(),
+  random: () => Math.random(),
+  sleep: ms => new Promise(r => setTimeout(r, ms)),
+  fetchImpl: (u, i) => fetch(u, i),
+};
+
+// `opts.state`/`opts.deps` let callers supply isolated flow-control state
+// and a controllable clock/RNG/fetch; production callers fall back to the
+// shared DF_POLL_STATE singleton and the real fetch/timers.
 async function refreshDFData(win, opts) {
+  const o = opts || {};
   if (typeof win === 'string' && win) currentWin = win;
-  await Promise.all(Object.entries(endpointsFor(currentWin)).map(([url, keys]) => refreshOne(url, keys)));
+  const state = o.state || DF_POLL_STATE;
+  const deps = { ...DEFAULT_POLL_DEPS, ...o.deps };
+  await Promise.all(Object.entries(endpointsFor(currentWin)).map(([url, keys]) => refreshOne(url, keys, state, deps)));
   window.dispatchEvent(new CustomEvent('df-data-refresh'));
 }
 
