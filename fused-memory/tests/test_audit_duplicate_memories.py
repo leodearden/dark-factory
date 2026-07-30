@@ -52,6 +52,11 @@ _ALL_CATEGORIES = _mod._ALL_CATEGORIES
 apply_deletions = _mod.apply_deletions
 resolve_ann_threshold = _mod.resolve_ann_threshold
 fetch_ann_neighbors = _mod.fetch_ann_neighbors
+compute_cluster_metrics = _mod.compute_cluster_metrics
+build_metric_series = _mod.build_metric_series
+split_plan_by_category = _mod.split_plan_by_category
+_EVAL_ID = _mod._EVAL_ID
+_GLOBAL_SCOPE = _mod._GLOBAL_SCOPE
 
 
 # ---------------------------------------------------------------------------
@@ -1781,3 +1786,513 @@ class TestFetchAnnNeighbors:
         assert query_points.await_count == 0
         assert neighbors == {}
         assert disclosure['ann_query_errors'] == 0
+
+
+# ===========================================================================
+# Cluster metrics + the M1 metric series (task 3210)
+# ===========================================================================
+
+def _dated(id: str, content: str, created_at: str | None, *,
+           category: str = _PK, metadata: dict | None = None) -> dict:
+    return _memory(id, content, created_at=created_at, category=category,
+                   metadata=metadata or {})
+
+
+def _plan_slice(groups: list[dict] | None = None,
+                carveouts: list[dict] | None = None) -> dict:
+    """A per-category plan slice, as produced by split_plan_by_category."""
+    return {
+        'near_duplicate_groups': groups or [],
+        'topic_carveout_groups': carveouts or [],
+    }
+
+
+def _by_id(metrics) -> dict:
+    return {m.metric_id: m for m in metrics}
+
+
+class TestSplitPlanByCategory:
+    """The plan carries `category` per group; the split just reads it.
+
+    build_sweep_plan already clusters per category and tags every emitted
+    group, so deriving the per-category slices is a projection of data the
+    plan states — not a second, re-derived categorisation that could drift
+    from the one the plan actually used.
+    """
+
+    def test_groups_and_carveouts_route_to_their_category(self):
+        plan = {
+            'near_duplicate_groups': [
+                {'member_ids': ['a', 'b'], 'category': _PK},
+                {'member_ids': ['c', 'd'], 'category': _PN},
+            ],
+            'topic_carveout_groups': [
+                {'member_ids': ['e', 'f'], 'category': _PN, 'topic': 'venv'},
+            ],
+        }
+        by_cat = split_plan_by_category(plan, (_PK, _PN, _OS))
+
+        assert [g['member_ids'] for g in by_cat[_PK]['near_duplicate_groups']] == [['a', 'b']]
+        assert by_cat[_PK]['topic_carveout_groups'] == []
+        assert [g['member_ids'] for g in by_cat[_PN]['near_duplicate_groups']] == [['c', 'd']]
+        assert [g['member_ids'] for g in by_cat[_PN]['topic_carveout_groups']] == [['e', 'f']]
+
+    def test_requested_category_with_nothing_still_gets_a_slice(self):
+        """An empty slice, not a missing key — every requested category reports."""
+        by_cat = split_plan_by_category({'near_duplicate_groups': []}, (_PK, _OS))
+        assert set(by_cat) == {_PK, _OS}
+        assert by_cat[_OS] == {'near_duplicate_groups': [], 'topic_carveout_groups': []}
+
+
+class TestComputeClusterMetricsPerCategory:
+    """Per category: cluster count, size distribution, clustered-member share."""
+
+    def _fixture(self):
+        records = {
+            _PK: [
+                _dated('m1', _VENV_GOTCHA_A, '2026-01-01T00:00:00+00:00'),
+                _dated('m2', _VENV_GOTCHA_B, '2026-01-02T00:00:00+00:00'),
+                _dated('m3', _VENV_GOTCHA_C, '2026-01-03T00:00:00+00:00'),
+                _dated('m4', _DISTRACTOR, '2026-01-04T00:00:00+00:00'),
+            ],
+        }
+        plans = {
+            _PK: _plan_slice([{'member_ids': ['m1', 'm2', 'm3'], 'category': _PK}]),
+        }
+        return records, plans
+
+    def test_cluster_count_is_a_directional_count(self):
+        records, plans = self._fixture()
+        metrics, _details = compute_cluster_metrics(records, plans, {})
+        metric = _by_id(metrics)[f'near_duplicate_clusters.{_PK}']
+
+        assert metric.kind == 'count'
+        assert metric.value == 1
+        assert metric.n == 4, 'n is the exposure: the category corpus size'
+        assert metric.direction == 'higher_is_worse'
+
+    def test_size_max_and_mean_are_scalars_with_a_histogram_in_details(self):
+        records = {
+            _PK: [_dated(f'm{i}', f'body {i}', '2026-01-01T00:00:00+00:00') for i in range(7)],
+        }
+        plans = {
+            _PK: _plan_slice([
+                {'member_ids': ['m0', 'm1', 'm2'], 'category': _PK},
+                {'member_ids': ['m3', 'm4'], 'category': _PK},
+            ]),
+        }
+        metrics, details = compute_cluster_metrics(records, plans, {})
+        by_id = _by_id(metrics)
+
+        assert by_id[f'cluster_size_max.{_PK}'].kind == 'scalar'
+        assert by_id[f'cluster_size_max.{_PK}'].value == 3
+        assert by_id[f'cluster_size_max.{_PK}'].n == 2, 'n is the number of clusters'
+        assert by_id[f'cluster_size_mean.{_PK}'].kind == 'scalar'
+        assert by_id[f'cluster_size_mean.{_PK}'].value == pytest.approx(2.5)
+        # A max/mean pair cannot show a bimodal distribution; the histogram can.
+        assert details['categories'][_PK]['cluster_size_histogram'] == {'2': 1, '3': 1}
+
+    def test_clustered_member_share_is_a_proportion_over_the_corpus(self):
+        records, plans = self._fixture()
+        metrics, _details = compute_cluster_metrics(records, plans, {})
+        metric = _by_id(metrics)[f'clustered_member_share.{_PK}']
+
+        assert metric.kind == 'proportion'
+        assert metric.denominator == 4, 'denominator is the category corpus size'
+        assert metric.n == 4
+        assert metric.value == pytest.approx(0.75)
+        assert metric.direction == 'higher_is_worse'
+        # M1 cross-field rule: successes must be a whole number of records.
+        assert metric.value * metric.denominator == pytest.approx(3.0)
+
+    def test_topic_carveout_count_is_a_scalar_never_alarmed(self):
+        """More carve-outs is an EXPECTED Option-C shape, not a regression.
+
+        Emitting it as a `count` would attach M2's Poisson tail test and alarm
+        the moment topics start landing (3195/3201) — i.e. alarm on the
+        feature working. Scalar reports it without arming a rule.
+        """
+        records = {_PK: [_dated('a', 'x', None), _dated('b', 'y', None)]}
+        plans = {_PK: _plan_slice(carveouts=[
+            {'member_ids': ['a', 'b'], 'category': _PK, 'topic': 'venv'},
+        ])}
+        metric = _by_id(compute_cluster_metrics(records, plans, {})[0])[
+            f'topic_carveout_clusters.{_PK}'
+        ]
+
+        assert metric.kind == 'scalar'
+        assert metric.direction is None
+        assert metric.value == 1
+
+    def test_each_category_reports_independently(self):
+        records = {
+            _PK: [_dated('a', 'x', None), _dated('b', 'y', None)],
+            _PN: [_dated('c', 'x', None, category=_PN)],
+            _OS: [],
+        }
+        plans = {
+            _PK: _plan_slice([{'member_ids': ['a', 'b'], 'category': _PK}]),
+            _PN: _plan_slice(),
+            _OS: _plan_slice(),
+        }
+        by_id = _by_id(compute_cluster_metrics(records, plans, {})[0])
+
+        assert by_id[f'near_duplicate_clusters.{_PK}'].value == 1
+        assert by_id[f'near_duplicate_clusters.{_PN}'].value == 0
+        assert by_id[f'near_duplicate_clusters.{_OS}'].value == 0
+
+
+class TestComputeClusterMetricsTopicAccretion:
+    """Per-topic accretion: members per day across that topic's created_at span."""
+
+    def test_rate_is_members_over_the_span_in_days(self):
+        records = {
+            _PK: [
+                _dated('a', 'x', '2026-01-01T00:00:00+00:00', metadata={'topic': 'venv'}),
+                _dated('b', 'y', '2026-01-03T00:00:00+00:00', metadata={'topic': 'venv'}),
+                _dated('c', 'z', '2026-01-05T00:00:00+00:00', metadata={'topic': 'venv'}),
+            ],
+        }
+        metrics, details = compute_cluster_metrics(records, {_PK: _plan_slice()}, {})
+        table = details['categories'][_PK]['topic_accretion']
+
+        assert [row['topic'] for row in table] == ['venv']
+        assert table[0]['members'] == 3
+        assert table[0]['span_days'] == pytest.approx(4.0)
+        assert table[0]['rate_per_day'] == pytest.approx(0.75)
+
+        metric = _by_id(metrics)[f'topic_accretion_rate_mean.{_PK}']
+        assert metric.kind == 'scalar'
+        assert metric.value == pytest.approx(0.75)
+        assert metric.n == 1, 'n is the number of topics with a measurable rate'
+
+    def test_zero_span_topic_has_no_defined_rate(self):
+        """A rate needs elapsed time. One instant is not a rate — it is null.
+
+        Dividing by a fudged epsilon would manufacture an enormous rate out of
+        a single-record topic, so the row reports rate_per_day=None and is
+        excluded from the mean's n.
+        """
+        records = {
+            _PK: [_dated('a', 'x', '2026-01-01T00:00:00+00:00', metadata={'topic': 'venv'})],
+        }
+        metrics, details = compute_cluster_metrics(records, {_PK: _plan_slice()}, {})
+
+        assert details['categories'][_PK]['topic_accretion'][0]['rate_per_day'] is None
+        metric = _by_id(metrics)[f'topic_accretion_rate_mean.{_PK}']
+        assert metric.n == 0
+        assert metric.value == 0.0
+
+    def test_no_topics_still_emits_a_well_formed_metric(self):
+        """Today's corpus has zero topics — n=0 is a reported state, not an error."""
+        records = {_PK: [_dated('a', 'x', '2026-01-01T00:00:00+00:00')]}
+        metrics, details = compute_cluster_metrics(records, {_PK: _plan_slice()}, {})
+
+        assert details['categories'][_PK]['topic_accretion'] == []
+        metric = _by_id(metrics)[f'topic_accretion_rate_mean.{_PK}']
+        assert metric.n == 0
+        assert metric.value == 0.0
+
+    def test_unparseable_created_at_never_crashes_a_rate_and_is_counted(self):
+        records = {
+            _PK: [
+                _dated('a', 'x', 'not-a-timestamp', metadata={'topic': 'venv'}),
+                _dated('b', 'y', None, metadata={'topic': 'venv'}),
+                _dated('c', 'z', '2026-01-01T00:00:00+00:00', metadata={'topic': 'venv'}),
+                _dated('d', 'w', '2026-01-03T00:00:00+00:00', metadata={'topic': 'venv'}),
+            ],
+        }
+        metrics, details = compute_cluster_metrics(records, {_PK: _plan_slice()}, {})
+        row = details['categories'][_PK]['topic_accretion'][0]
+
+        assert row['span_days'] == pytest.approx(2.0), 'span uses only parseable stamps'
+        assert row['members'] == 2, 'only records the span can actually place'
+        assert row['rate_per_day'] == pytest.approx(1.0)
+
+        counted = _by_id(metrics)[f'unparseable_created_at.{_PK}']
+        assert counted.kind == 'count'
+        assert counted.value == 2
+        assert counted.direction == 'higher_is_worse'
+
+
+class TestComputeClusterMetricsConsolidationNetDelta:
+    """Net delta: what accreted after a consolidation minus what it absorbed."""
+
+    def test_net_delta_is_accretion_after_minus_absorbed(self):
+        records = {
+            _PK: [
+                _dated('old', 'x', '2026-01-01T00:00:00+00:00', metadata={'topic': 'venv'}),
+                _dated('canon', 'merged', '2026-01-03T00:00:00+00:00',
+                       metadata={'topic': 'venv', 'canonical': True,
+                                 'supersedes': ['gone-1', 'gone-2']}),
+                _dated('after', 'z', '2026-01-05T00:00:00+00:00', metadata={'topic': 'venv'}),
+            ],
+        }
+        metrics, details = compute_cluster_metrics(records, {_PK: _plan_slice()}, {})
+        events = details['categories'][_PK]['consolidation_events']
+
+        assert len(events) == 1
+        assert events[0]['memory_id'] == 'canon'
+        assert events[0]['absorbed'] == 2
+        assert events[0]['accreted_after'] == 1, 'only records created AFTER the event'
+        assert events[0]['net_delta'] == -1
+
+        metric = _by_id(metrics)[f'consolidation_net_delta.{_PK}']
+        assert metric.kind == 'scalar', 'a signed delta has no count/proportion rule'
+        assert metric.value == -1
+        assert metric.n == 1, 'n is the number of consolidation events'
+
+    def test_supersedes_alone_is_a_consolidation_event(self):
+        records = {
+            _PK: [
+                _dated('s', 'x', '2026-01-01T00:00:00+00:00',
+                       metadata={'topic': 'venv', 'supersedes': 'gone-1'}),
+                _dated('after', 'y', '2026-01-02T00:00:00+00:00', metadata={'topic': 'venv'}),
+            ],
+        }
+        _metrics, details = compute_cluster_metrics(records, {_PK: _plan_slice()}, {})
+        events = details['categories'][_PK]['consolidation_events']
+
+        assert [e['memory_id'] for e in events] == ['s']
+        assert events[0]['absorbed'] == 1, 'a scalar supersedes absorbed one predecessor'
+        assert events[0]['net_delta'] == 0
+
+    def test_canonical_without_supersedes_absorbed_nothing_recorded(self):
+        """`canonical: true` names no predecessors, so absorbed is 0, not a guess."""
+        records = {
+            _PK: [
+                _dated('c', 'x', '2026-01-01T00:00:00+00:00',
+                       metadata={'topic': 'venv', 'canonical': True}),
+            ],
+        }
+        _metrics, details = compute_cluster_metrics(records, {_PK: _plan_slice()}, {})
+        assert details['categories'][_PK]['consolidation_events'][0]['absorbed'] == 0
+
+    def test_untopiced_event_uses_its_cluster_as_the_peer_set(self):
+        records = {
+            _PK: [
+                _dated('c', 'x', '2026-01-01T00:00:00+00:00', metadata={'canonical': True}),
+                _dated('sib', 'y', '2026-01-02T00:00:00+00:00'),
+                _dated('far', 'z', '2026-01-03T00:00:00+00:00'),
+            ],
+        }
+        plans = {_PK: _plan_slice([{'member_ids': ['c', 'sib'], 'category': _PK}])}
+        _metrics, details = compute_cluster_metrics(records, plans, {})
+        event = details['categories'][_PK]['consolidation_events'][0]
+
+        assert event['accreted_after'] == 1, "'far' is outside the event's cluster"
+
+    def test_no_consolidation_events_still_emits_a_well_formed_metric(self):
+        records = {_PK: [_dated('a', 'x', '2026-01-01T00:00:00+00:00')]}
+        metrics, details = compute_cluster_metrics(records, {_PK: _plan_slice()}, {})
+
+        assert details['categories'][_PK]['consolidation_events'] == []
+        metric = _by_id(metrics)[f'consolidation_net_delta.{_PK}']
+        assert metric.n == 0
+        assert metric.value == 0.0
+
+
+class TestComputeClusterMetricsDisclosures:
+    """Every cap and every loss is its own emitted metric. No cap is silent."""
+
+    def test_global_ann_disclosures_each_become_a_metric(self):
+        disclosures = {
+            'top_k_saturated': 3,
+            'below_threshold_dropped': 41,
+            'unknown_neighbor_dropped': 2,
+            'missing_vector': 1,
+            'ann_disabled_uncalibrated': 0,
+            'ann_query_errors': 0,
+        }
+        records = {_PK: [_dated('a', 'x', None), _dated('b', 'y', None)]}
+        metrics, _details = compute_cluster_metrics(
+            records, {_PK: _plan_slice()}, disclosures,
+        )
+        by_id = _by_id(metrics)
+
+        for key, expected in disclosures.items():
+            metric = by_id[f'{key}.{_GLOBAL_SCOPE}']
+            assert metric.kind == 'count', key
+            assert metric.value == expected, key
+            assert metric.direction == 'higher_is_worse', key
+            assert metric.n == 2, f'{key}: n is the total corpus exposure'
+
+    def test_zero_valued_disclosures_are_still_emitted(self):
+        """A clean run must publish the zero.
+
+        An absent metric is indistinguishable from "not measured" — the M2
+        evaluator would read a suppressed zero as a gap in the series rather
+        than as evidence the cap did not fire.
+        """
+        records = {_PK: [_dated('a', 'x', None)]}
+        metrics, _details = compute_cluster_metrics(
+            records, {_PK: _plan_slice()}, dict.fromkeys(_ANN_DISCLOSURE_KEYS, 0),
+        )
+        by_id = _by_id(metrics)
+
+        for key in _ANN_DISCLOSURE_KEYS:
+            assert by_id[f'{key}.{_GLOBAL_SCOPE}'].value == 0
+
+    def test_per_category_disclosure_emits_one_metric_per_category(self):
+        """scan_truncated is per category: a cap on one is not a clean whole."""
+        records = {
+            _PK: [_dated('a', 'x', None)],
+            _PN: [_dated('b', 'y', None, category=_PN), _dated('c', 'z', None, category=_PN)],
+        }
+        metrics, _details = compute_cluster_metrics(
+            records,
+            {_PK: _plan_slice(), _PN: _plan_slice()},
+            {'scan_truncated': {_PK: 1, _PN: 0}},
+        )
+        by_id = _by_id(metrics)
+
+        assert by_id[f'scan_truncated.{_PK}'].value == 1
+        assert by_id[f'scan_truncated.{_PK}'].n == 1
+        assert by_id[f'scan_truncated.{_PN}'].value == 0
+        assert by_id[f'scan_truncated.{_PN}'].n == 2
+        assert f'scan_truncated.{_GLOBAL_SCOPE}' not in by_id
+
+
+class TestComputeClusterMetricsEmptyCorpus:
+    """An empty corpus reports; it does not raise and it does not lie."""
+
+    def test_empty_category_emits_well_formed_zero_metrics(self):
+        metrics, details = compute_cluster_metrics(
+            {_PK: []}, {_PK: _plan_slice()}, {},
+        )
+        by_id = _by_id(metrics)
+
+        assert by_id[f'near_duplicate_clusters.{_PK}'].value == 0
+        assert by_id[f'near_duplicate_clusters.{_PK}'].n == 0
+        assert by_id[f'cluster_size_max.{_PK}'].value == 0.0
+        assert by_id[f'cluster_size_mean.{_PK}'].value == 0.0
+        assert details['categories'][_PK]['corpus_size'] == 0
+
+    def test_share_over_an_empty_corpus_is_disclosed_not_faked(self):
+        """0/0 is undefined, and M1 forbids a zero-trial proportion.
+
+        Emitting value=0.0 would assert "0% of this corpus is duplicated",
+        which is a claim about a corpus that was not measured. The metric is
+        withheld and the withholding is named in details — loud, not silent.
+        """
+        metrics, details = compute_cluster_metrics({_PK: []}, {_PK: _plan_slice()}, {})
+
+        assert f'clustered_member_share.{_PK}' not in _by_id(metrics)
+        assert f'clustered_member_share.{_PK}' in (
+            details['categories'][_PK]['undefined_metrics']
+        )
+
+    def test_no_categories_at_all_yields_an_empty_but_valid_result(self):
+        metrics, details = compute_cluster_metrics({}, {}, {})
+        assert metrics == []
+        assert details['categories'] == {}
+
+
+class TestComputeClusterMetricsDetailsPath:
+    """Metrics whose full shape lives in the companion file point at it."""
+
+    def test_details_path_is_stamped_onto_the_distribution_metrics(self):
+        records = {_PK: [_dated('a', 'x', None), _dated('b', 'y', None)]}
+        plans = {_PK: _plan_slice([{'member_ids': ['a', 'b'], 'category': _PK}])}
+        metrics, _details = compute_cluster_metrics(
+            records, plans, {}, details_path='details-20260730T000000Z.json',
+        )
+        by_id = _by_id(metrics)
+
+        for name in ('cluster_size_max', 'cluster_size_mean',
+                     'topic_accretion_rate_mean', 'consolidation_net_delta'):
+            assert by_id[f'{name}.{_PK}'].details_path == 'details-20260730T000000Z.json', name
+
+    def test_details_path_defaults_to_absent(self):
+        records = {_PK: [_dated('a', 'x', None)]}
+        metrics, _details = compute_cluster_metrics(records, {_PK: _plan_slice()}, {})
+        assert _by_id(metrics)[f'cluster_size_max.{_PK}'].details_path is None
+
+
+class TestBuildMetricSeries:
+    """The assembled series is the M1 artifact — validated before it is written."""
+
+    def _metrics(self):
+        records = {_PK: [_dated('a', 'x', None), _dated('b', 'y', None)]}
+        plans = {_PK: _plan_slice([{'member_ids': ['a', 'b'], 'category': _PK}])}
+        return compute_cluster_metrics(records, plans, {})[0]
+
+    def test_series_shape_and_corpus_counts(self):
+        from shared.memory_eval_metrics import validate_metric_series  # noqa: PLC0415
+
+        series = build_metric_series(
+            'dark_factory', self._metrics(),
+            corpus_counts={_PK: 2, _PN: 0, _OS: 5},
+            run_stamp='20260730T000000Z',
+        )
+
+        assert series.schema_version == 1
+        assert series.eval_id == _EVAL_ID == 'e6-corpus-health'
+        assert series.run_stamp == '20260730T000000Z'
+        assert series.corpus.project_id == 'dark_factory'
+        assert series.corpus.counts == {_PK: 2, _PN: 0, _OS: 5}
+        validate_metric_series(series)
+
+    def test_metric_ids_are_unique_and_category_suffixed(self):
+        series = build_metric_series(
+            'dark_factory', self._metrics(), corpus_counts={_PK: 2},
+            run_stamp='20260730T000000Z',
+        )
+        ids = [m.metric_id for m in series.metrics]
+
+        assert len(ids) == len(set(ids))
+        assert all(i.rsplit('.', 1)[-1] in (*_ALL_CATEGORIES, _GLOBAL_SCOPE) for i in ids)
+
+    def test_run_stamp_defaults_to_the_shared_helper(self, monkeypatch):
+        from shared.memory_eval_metrics import RUN_STAMP_ENV_VAR  # noqa: PLC0415
+
+        monkeypatch.setenv(RUN_STAMP_ENV_VAR, '20260101T010101Z')
+        series = build_metric_series('dark_factory', self._metrics(), corpus_counts={_PK: 2})
+        assert series.run_stamp == '20260101T010101Z'
+
+    def test_malformed_metric_raises_metric_schema_error_at_build_time(self):
+        """M1: rejected in the runner that computed it, not by the reader."""
+        from shared.memory_eval_metrics import MetricSchemaError  # noqa: PLC0415
+
+        malformed = {
+            'metric_id': f'clustered_member_share.{_PK}',
+            'kind': 'proportion',
+            'value': 0.5,
+            'n': 0,
+            'denominator': 0,  # a proportion over zero trials
+            'direction': 'higher_is_worse',
+        }
+        with pytest.raises(MetricSchemaError):
+            build_metric_series('dark_factory', [malformed], corpus_counts={_PK: 0})
+
+    def test_duplicate_metric_id_raises_metric_schema_error(self):
+        """A duplicate would make one of the two invisible to the baseline join."""
+        from shared.memory_eval_metrics import MetricSchemaError  # noqa: PLC0415
+
+        one = {'metric_id': 'dup.all', 'kind': 'scalar', 'value': 1.0, 'n': 1}
+        with pytest.raises(MetricSchemaError):
+            build_metric_series('dark_factory', [one, dict(one)], corpus_counts={})
+
+    def test_missing_direction_on_a_count_raises(self):
+        """The exact test is two-sided; without a direction an improvement alarms."""
+        from shared.memory_eval_metrics import MetricSchemaError  # noqa: PLC0415
+
+        with pytest.raises(MetricSchemaError):
+            build_metric_series(
+                'dark_factory',
+                [{'metric_id': 'x.all', 'kind': 'count', 'value': 3.0, 'n': 10}],
+                corpus_counts={},
+            )
+
+    def test_computed_metrics_round_trip_through_the_schema(self):
+        from shared.memory_eval_metrics import (  # noqa: PLC0415
+            parse_metric_series,
+            serialize_metric_series,
+        )
+
+        series = build_metric_series(
+            'dark_factory', self._metrics(), corpus_counts={_PK: 2},
+            run_stamp='20260730T000000Z',
+        )
+        reparsed = parse_metric_series(json.loads(serialize_metric_series(series)))
+        assert reparsed == series
