@@ -17636,6 +17636,116 @@ class TestSnapshotEntryRequestId:
 
 
 # ---------------------------------------------------------------------------
+# TestSnapshotOwnedMergeWorktrees — additive liveness-ledger key (task 3148)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSnapshotOwnedMergeWorktrees:
+    """`snapshot()` must expose this worker's merge-worktree liveness ledger.
+
+    `live_snapshot` is the established, deliberately-narrow channel by which
+    the module-level `coalesce_or_enqueue_merge_request` gate learns about
+    worker state, so `_inflight_worktree_is_stale` reads ownership from an
+    additive snapshot key rather than a second worker-coupling parameter.
+
+    Values are RESOLVED absolute path STRINGS: the snapshot crosses the MCP
+    boundary via `get_merge_queue`, so it must stay JSON-serialisable, and
+    `.resolve()` matches how `worktree_ledger_violations` already normalises
+    the same ledger (merge_queue.py:9556 / 9569).
+    """
+
+    def _make_worker(self, tmp_path: Path) -> SpeculativeMergeWorker:
+        import types
+
+        mq: asyncio.Queue = asyncio.Queue()
+        return SpeculativeMergeWorker(
+            git_ops=types.SimpleNamespace(),  # type: ignore[reportArgumentType]
+            queue=mq,
+        )
+
+    async def test_a_fresh_worker_exposes_empty_ledger(self, tmp_path: Path) -> None:
+        """(a) A freshly constructed worker's snapshot carries the key, empty."""
+        worker = self._make_worker(tmp_path)
+        snap = worker.snapshot()
+
+        assert 'owned_merge_worktrees' in snap, (
+            f"'owned_merge_worktrees' key missing from snapshot: {sorted(snap)}"
+        )
+        assert snap['owned_merge_worktrees'] == []
+
+    async def test_b_registered_worktrees_are_resolved_strings(self, tmp_path: Path) -> None:
+        """(b) Registered paths appear as resolved absolute strings.
+
+        NB: p1/p2 must NOT be named '_merge-verify' —
+        `_register_owned_merge_worktree` deliberately no-ops for
+        PERSISTENT_MERGE_WORKTREE_NAME.
+        """
+        worker = self._make_worker(tmp_path)
+        p1 = tmp_path / '_merge-owned-1'
+        p2 = tmp_path / '_merge-owned-2'
+        p1.mkdir()
+        p2.mkdir()
+
+        worker._register_owned_merge_worktree(p1)
+        worker._register_owned_merge_worktree(p2)
+
+        owned = worker.snapshot()['owned_merge_worktrees']
+        assert set(owned) == {str(p1.resolve()), str(p2.resolve())}
+        assert all(isinstance(v, str) for v in owned), (
+            f'values must be JSON-serialisable strings (MCP hop), got: {owned}'
+        )
+
+    async def test_c_deregister_removes_only_that_path(self, tmp_path: Path) -> None:
+        """(c) After deregistering p1, only p2's resolved string remains."""
+        worker = self._make_worker(tmp_path)
+        p1 = tmp_path / '_merge-owned-1'
+        p2 = tmp_path / '_merge-owned-2'
+        p1.mkdir()
+        p2.mkdir()
+        worker._register_owned_merge_worktree(p1)
+        worker._register_owned_merge_worktree(p2)
+
+        worker._deregister_owned_merge_worktree(p1)
+
+        assert worker.snapshot()['owned_merge_worktrees'] == [str(p2.resolve())]
+
+    async def test_d_no_collision_with_existing_keys(self, tmp_path: Path) -> None:
+        """(d) The new key does not displace any pre-existing snapshot key.
+
+        Asserted as a SUPERSET, deliberately not an equality on the key set:
+        this snapshot follows an additive-key convention and keeps growing, so
+        an exact key list here would turn every future additive key into a
+        spurious failure in an unrelated test.
+        """
+        worker = self._make_worker(tmp_path)
+        snap = worker.snapshot()
+
+        assert set(snap) >= {
+            'entries', 'depth', 'head_of_line', 'verify_in_progress',
+            'is_wip_halted', 'halt_owner_esc_id', 'occupancy',
+            'suffix_conflict_graph', 'metrics', 'frozen_prefix',
+            'two_layer_invariants', 'speculation', 'resource_audit',
+            'owned_merge_worktrees',
+        }
+
+    async def test_e_key_is_a_pure_synchronous_read(self, tmp_path: Path) -> None:
+        """(e) Producing the key performs no I/O and is stable across calls.
+
+        Honors snapshot()'s documented contract: "Safe to call from any context
+        (no await, no lock)" — no git, no stat.
+        """
+        worker = self._make_worker(tmp_path)
+        p1 = tmp_path / '_merge-owned-1'
+        p1.mkdir()
+        worker._register_owned_merge_worktree(p1)
+
+        first = worker.snapshot()['owned_merge_worktrees']
+        second = worker.snapshot()['owned_merge_worktrees']
+        assert first == second == [str(p1.resolve())]
+
+
+# ---------------------------------------------------------------------------
 # β1 Step-1 RED: _InFlightEntry.request_id + MergeDispatchResult.inflight_request_id
 # ---------------------------------------------------------------------------
 
