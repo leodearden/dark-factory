@@ -958,6 +958,125 @@ class TestProportionAndCountRules:
         assert verdict.value == metric.value
 
 
+def _count_run(value: float, n: int, stamp: str, *, metric_id: str = 'dangling-pointers'):
+    """A one-count-metric series, so a window's EXPOSURE can be varied per run."""
+    return MetricSeries(
+        schema_version=1,
+        eval_id='e1-exposure',
+        run_stamp=stamp,
+        corpus=Corpus(project_id='dark_factory'),
+        metrics=[Metric(metric_id=metric_id, kind='count', value=value, n=n)],
+    )
+
+
+class TestCountExposureNormalisation:
+    """Rule (c) compares RATES, not raw counts, because ``n`` is free to vary.
+
+    ``Metric.n`` is the exposure a count was measured over, and nothing pins it
+    across a window (the schema asks only for ``n >= 0``, and the committed
+    fixtures already carry ``dangling-pointers`` at ``n=30`` in
+    ``e1-retrieval-health`` and ``n=6`` in ``e1-thin``). Rule (b) next door
+    already pools successes AND trials for exactly this reason; a plain mean of
+    raw counts silently assumed every run measured the same exposure.
+
+    The assertions below are the false alarms that assumption produces on
+    behaviour that did not change at all — in both directions, since a probe set
+    or corpus can grow as easily as it can shrink, and neither is accounted for in
+    a false-alarm budget that assumes a stationary process.
+    """
+
+    ALPHA = 1 / 360
+    MIN_SAMPLES = 10
+
+    def _window(self, *pairs: tuple[float, int]) -> list[MetricSeries]:
+        return [
+            _count_run(value, n, f'2026090{i + 1}T000000Z') for i, (value, n) in enumerate(pairs)
+        ]
+
+    def test_a_halved_probe_set_at_the_same_rate_is_not_a_regression(self):
+        # Three runs of 50 events over 30 probes, then a run where the probe set
+        # halves to 15 and returns 25. Identical per-probe rate, nothing changed.
+        assert poisson_two_sided_p(25, 50.0) < self.ALPHA  # what the raw comparison said
+
+        current = _count_run(25.0, 15, '20260905T000000Z')
+        verdict = evaluate_count(
+            current.metrics[0], self._window((50.0, 30), (50.0, 30), (50.0, 30)), self.ALPHA, 10
+        )
+        assert verdict.status == 'ok'
+        assert verdict.baseline == pytest.approx(25.0)  # rate 5/3 scaled to n=15
+        assert verdict.p_value == 1.0  # 25 IS the expectation: the mode identity
+
+    def test_a_grown_probe_set_at_the_same_rate_is_not_a_regression(self):
+        # The same defect in the other direction, which is the one a growing
+        # corpus reaches: more exposure, proportionally more events, no change.
+        assert poisson_two_sided_p(100, 50.0) < self.ALPHA  # what the raw comparison said
+
+        current = _count_run(100.0, 60, '20260905T000000Z')
+        verdict = evaluate_count(
+            current.metrics[0], self._window((50.0, 30), (50.0, 30), (50.0, 30)), self.ALPHA, 10
+        )
+        assert verdict.status == 'ok'
+        assert verdict.baseline == pytest.approx(100.0)
+        assert verdict.p_value == 1.0
+
+    def test_a_real_regression_at_a_changed_exposure_still_alarms(self):
+        # Normalising must not make the rule deaf: at n=15 the expectation is 25,
+        # and 60 events against it is a genuine rate regression.
+        current = _count_run(60.0, 15, '20260905T000000Z')
+        verdict = evaluate_count(
+            current.metrics[0], self._window((50.0, 30), (50.0, 30), (50.0, 30)), self.ALPHA, 10
+        )
+        assert verdict.status == 'alarm'
+        assert verdict.p_value is not None and verdict.p_value < self.ALPHA
+
+    def test_the_verdict_publishes_both_the_rate_and_the_scaled_expectation(self):
+        # `baseline` is in `value`'s own units (an expected COUNT) so the two are
+        # directly comparable; the per-unit rate and the exposure it was pooled
+        # over ride along in the detail, which is what makes the call re-derivable.
+        current = _count_run(25.0, 15, '20260905T000000Z')
+        verdict = evaluate_count(
+            current.metrics[0], self._window((50.0, 30), (50.0, 30), (50.0, 30)), self.ALPHA, 10
+        )
+        assert verdict.baseline == pytest.approx(25.0)
+        assert 'n=15' in verdict.detail
+        assert 'exposure 90' in verdict.detail
+        assert f'{5 / 3:g}/unit' in verdict.detail
+
+    def test_a_current_run_with_no_exposure_is_insufficient_not_a_certain_alarm(self):
+        # lam would be 0, under which every non-zero count has p == 0.0 — a
+        # guaranteed alarm on no evidence. min_samples is 0 here so the exposure
+        # guard is what is actually being tested.
+        nothing = Metric(metric_id='dangling-pointers', kind='count', value=3.0, n=0)
+        verdict = evaluate_count(
+            nothing, self._window((50.0, 30), (50.0, 30)), self.ALPHA, min_samples=0
+        )
+        assert verdict.status == 'insufficient_data'
+        assert verdict.alarms == ()
+        assert 'no exposure' in verdict.detail
+
+    def test_a_baseline_window_with_no_exposure_is_insufficient(self):
+        # A window that measured nothing yields no rate — and would divide by zero.
+        current = _count_run(3.0, 30, '20260905T000000Z')
+        verdict = evaluate_count(
+            current.metrics[0], self._window((0.0, 0), (0.0, 0)), self.ALPHA, min_samples=0
+        )
+        assert verdict.status == 'insufficient_data'
+        assert verdict.alarms == ()
+        assert verdict.p_value is None
+
+    def test_a_never_firing_probe_still_compares_at_a_zero_rate(self):
+        # Zero EVENTS over real exposure is a legitimate baseline (a probe that
+        # has never fired) and must not be confused with zero exposure: the rate
+        # is 0.0, so the first event is maximally surprising rather than unjudged.
+        current = _count_run(4.0, 30, '20260905T000000Z')
+        verdict = evaluate_count(
+            current.metrics[0], self._window((0.0, 30), (0.0, 30)), self.ALPHA, min_samples=0
+        )
+        assert verdict.status == 'alarm'
+        assert verdict.baseline == 0.0
+        assert verdict.p_value == 0.0
+
+
 class TestRuleKindGuards:
     """Each rule refuses a metric of another kind, and says which.
 

@@ -68,8 +68,14 @@ the derived α exactly `1/360`.
 | `e1-retrieval-health/limits-current.json` | M2 limits artifact | **generated**, see below |
 
 The baseline window pools to exactly the anchors the tests use: proportion
-`72/90 = 0.8`, dangling-pointer mean `(4+5+6)/3 = 5.0`, superseded-above-successor
-mean `2.0`. The two topics failing throughout the window
+`72/90 = 0.8`, dangling-pointer rate `(4+5+6)/90 = 1/6` per unit of exposure —
+an expected `5.0` at the current run's `n = 30` — and superseded-above-successor
+rate `6/90`, an expected `2.0`. Rule (c) pools events over `Metric.n` (the
+exposure a count was measured over) rather than averaging raw counts, the same
+way rule (b) pools successes over trials; these anchors are unchanged either way
+only because every `e1-retrieval-health` run measures `n = 30`. `e1-thin`
+deliberately does not (`n = 6`), which is what makes the exposure explicit
+rather than incidental. The two topics failing throughout the window
 (`t-recon-watcher-triage`, `t-routing-ladder`) are the grandfather snapshot —
 they stand in for the known-bad findings the 3111/3112 fix lineage already owns,
 which D1 says must be reported in the initial-state report and never alarmed on.

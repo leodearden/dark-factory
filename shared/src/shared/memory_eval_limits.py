@@ -461,7 +461,12 @@ class MetricVerdict:
     n: int
     alarms: tuple[Alarm, ...] = ()
     baseline: float | None = None
-    """The comparison point: pooled baseline rate/proportion, or grandfathered failure count."""
+    """The comparison point ``value`` was judged against, in ``value``'s own units.
+
+    Per rule kind: the pooled baseline proportion (b), the baseline rate scaled to
+    THIS run's exposure — i.e. the expected count, not the per-unit rate (c), or
+    the grandfathered failure count (a).
+    """
     p_value: float | None = None
     """``None`` for structural rules, which measure a fact rather than a surprise."""
     alpha: float | None = None
@@ -737,14 +742,37 @@ def evaluate_count(
 ) -> MetricVerdict:
     """Rule (c): is this run's event count surprising under the baseline rate?
 
-    The window's MEAN count is the Poisson rate. Same sufficiency-before-
-    significance ordering as rule (b).
+    The baseline is a PER-UNIT-OF-EXPOSURE rate — events pooled over the window
+    divided by the ``n`` those events were counted over — and the expectation the
+    current run is judged against is that rate scaled back up by the current run's
+    own ``n``. This is the same pooling rule (b) applies to successes and trials,
+    for the same reason: ``Metric.n`` is the exposure a count was measured over,
+    it is free to vary run to run (the schema asks only for ``n >= 0``, and the
+    committed fixtures already carry the same metric_id at ``n=30`` and ``n=6``),
+    and a plain mean of raw counts silently assumes it never does.
+
+    Assuming it away produces false alarms in BOTH directions on unchanged
+    behaviour. Three runs of 50 events over 30 probes, then a run where the probe
+    set halves to 15 and returns 25: identical per-probe rate, nothing regressed,
+    yet the raw comparison is ``poisson_two_sided_p(25, 50) = 1.6e-04`` — an alarm
+    at any sane budget. Growing the probe set or the corpus does the same in
+    reverse, and both are expected events here rather than edge cases (adding
+    metrics and growing corpora is why alpha is recomputed per run at all). Worse,
+    those alarms are not accounted for in the false-alarm budget, which assumes a
+    stationary process; they would spend it on arithmetic.
+
+    Sufficiency is checked before significance, as in rule (b), and now includes
+    exposure on both sides: a window that measured nothing, and a current run that
+    measured nothing, are both ``insufficient_data``. Judging a rate against zero
+    exposure is not strictness — with ``lam == 0`` every non-zero count has
+    ``p == 0.0``, so it would be a guaranteed alarm on no evidence at all.
     """
     if metric.kind != 'count':
         raise ValueError(
             f'evaluate_count: metric {metric.metric_id!r} has kind {metric.kind!r}, not count.'
         )
     history, stamps = _window_contributions(baseline_window, metric.metric_id, 'count')
+    exposure = sum(m.n for m in history)
     if not history:
         return _insufficient(
             metric,
@@ -754,8 +782,33 @@ def evaluate_count(
             stamps=stamps,
             detail='No baseline history for this metric — nothing to be surprised by yet.',
         )
+    if exposure <= 0:
+        return _insufficient(
+            metric,
+            baseline=None,
+            p_value=None,
+            alpha=alpha,
+            stamps=stamps,
+            detail=(
+                f'The baseline window measured no exposure (n sums to {exposure} over '
+                f'{len(history)} run(s)): there is no rate to derive.'
+            ),
+        )
+    if metric.n <= 0:
+        return _insufficient(
+            metric,
+            baseline=None,
+            p_value=None,
+            alpha=alpha,
+            stamps=stamps,
+            detail=(
+                f'This run measured no exposure (n={metric.n}): a count cannot be judged '
+                'against a rate over nothing.'
+            ),
+        )
 
-    lam = math.fsum(m.value for m in history) / len(history)
+    rate = math.fsum(m.value for m in history) / exposure
+    lam = rate * metric.n
     p_value = poisson_two_sided_p(round(metric.value), lam)
 
     if metric.n < min_samples:
@@ -777,7 +830,10 @@ def evaluate_count(
         p_value=p_value,
         alpha=alpha,
         stamps=stamps,
-        detail=f'{metric.value:g} against a baseline rate of {lam:g} over {len(history)} run(s).',
+        detail=(
+            f'{metric.value:g} event(s) over n={metric.n} against an expected {lam:g} '
+            f'({rate:g}/unit pooled over {len(history)} run(s), exposure {exposure}).'
+        ),
     )
 
 
