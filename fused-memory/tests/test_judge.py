@@ -120,6 +120,31 @@ def test_parse_verdict_unparseable_response_is_loud_not_fabricated(mock_journal)
     assert 'Judge response could not be parsed' in verdict.findings[0].get('issue', '')
 
 
+def test_parse_verdict_text_path_invalid_severity_is_loud_not_silent(mock_journal):
+    """A semantically-invalid text payload must fail LOUD, not vanish silently.
+
+    Valid JSON, invalid enum member.  JudgeVerdict construction raises
+    pydantic.ValidationError, which is NOT in _parse_verdict's caught tuple, so
+    today it escapes to review_run's broad `except Exception` and the run silently
+    returns None — no verdict, no halt, no signal.  That violates the repo's
+    loud-over-silent-degradation norm.  It must instead get the same fail-closed
+    treatment as malformed text: severity=serious with the
+    code='unparseable_judge_response' marker (which review_run turns into the
+    truthful 'Unparseable judge response' halt reason).
+
+    Scoped to the RETAINED anthropic/openai text fallback — the claude_cli
+    provider classifies this same condition as cli_output_unparseable infra in
+    _call_judge_cli and never reaches here.
+    """
+    judge = Judge(config=_make_judge_config(), journal=mock_journal)
+
+    verdict = judge._parse_verdict('{"severity": "catastrophic", "findings": []}', 'run-z')
+
+    assert verdict.severity == VerdictSeverity.serious
+    assert len(verdict.findings) == 1
+    assert verdict.findings[0].get('code') == 'unparseable_judge_response'
+
+
 def test_parse_verdict_accepts_structured_payload_dict(mock_journal):
     """_parse_verdict accepts an already-structured payload dict and skips text parsing.
 
@@ -1717,6 +1742,64 @@ class TestReviewRunNoStructuredVerdict:
         assert 'Serious verdict' not in reason
         assert 'Unparseable judge response' not in reason
         mock_journal.add_verdict.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_genuine_serious_structured_verdict_still_halts(self, mock_journal):
+        """PRESERVE task 2947's intent: a REAL severity=serious payload still halts.
+
+        If this fails, the no-verdict classification over-reached and started
+        treating genuine content verdicts as infra — do NOT 'fix' this test.
+        """
+        from shared.cli_invoke import AgentResult
+
+        judge = self._setup(
+            mock_journal, 'proj-genuine-struct', halt_on_judge_serious=True,
+        )
+        payload = {
+            'severity': 'serious',
+            'findings': [{'issue': 'mass incorrect deletions', 'severity': 'serious'}],
+        }
+        with patch(
+            'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+            new=AsyncMock(return_value=AgentResult(
+                success=True, output='', structured_output=payload,
+            )),
+        ):
+            verdict = await judge.review_run('run-nostruct')
+
+        assert verdict is not None
+        assert verdict.severity == VerdictSeverity.serious
+        assert verdict.action_taken == VerdictAction.halt
+        mock_journal.add_verdict.assert_called_once()
+        assert judge.is_halted('proj-genuine-struct')
+        reason = judge.halt_reason('proj-genuine-struct')
+        assert reason == 'Serious verdict in run run-nostruct'
+        assert 'judge-unreachable' not in reason
+        assert 'Unparseable judge response' not in reason
+
+    @pytest.mark.asyncio
+    async def test_moderate_structured_verdict_still_recommends_rollback(self, mock_journal):
+        """PRESERVE: a REAL severity=moderate payload still recommends rollback,
+        and does not halt."""
+        from shared.cli_invoke import AgentResult
+
+        judge = self._setup(
+            mock_journal, 'proj-moderate-struct', halt_on_judge_serious=True,
+        )
+        payload = {'severity': 'moderate', 'findings': [{'issue': 'drifted entry'}]}
+        with patch(
+            'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+            new=AsyncMock(return_value=AgentResult(
+                success=True, output='', structured_output=payload,
+            )),
+        ):
+            verdict = await judge.review_run('run-nostruct')
+
+        assert verdict is not None
+        assert verdict.severity == VerdictSeverity.moderate
+        assert verdict.action_taken == VerdictAction.rollback
+        assert judge.is_halted('proj-moderate-struct') is False
+        mock_journal.set_halt.assert_not_called()
 
 
 # ─────────────────────────────────────────────────────────────────────
