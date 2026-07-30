@@ -399,6 +399,71 @@ class TestBD2Completeness:
         assert disp.escalate_to_human is False
         assert disp.category is FailureCategory.NONE
 
+    def test_lane_lock_self_owned_leak_requeues_loudly_without_counting_against_cap(
+        self,
+    ):
+        """LaneLockSelfOwnedLeak (task 3081, D8/B13) needs its OWN row, and that
+        row must diverge from the parent it inherits from on exactly one axis:
+        ``escalate_to_human``.
+
+        Same REQUEUE / no-cap-burn treatment as the parent, because a leaked
+        lane lock is an infra fault the task must not be charged for.  But
+        unlike ordinary contention it must be LOUD: nothing will release the fd
+        before process exit, so deferring can never succeed.  In reify
+        esc-5548-5 three tasks blocked behind one identical
+        ``merge_outcome_signature 3173b64436423738`` and nothing surfaced until
+        an unattended restart roughly three hours later.
+
+        The OWN-KEY assertion is the substance.  ``_lookup_disposition`` walks
+        the MRO, so a subclass with no row of its own silently resolves to the
+        parent's — inheriting ``escalate_to_human=False`` and staying exactly as
+        quiet as the case it exists to distinguish.  The table's convention is
+        an explicit row per subclass (cf. MergeParkContentionError IS-A
+        MergeParkError), and this pins that rather than relying on BD-2
+        completeness, which the MRO fallback already satisfies.
+        """
+        from orchestrator.git_ops import (
+            LaneLockSelfOwnedLeak,
+            MergeVerifyLeaseContended,
+        )
+        from orchestrator.verify_categories import FailureCategory
+        from orchestrator.workflow_types import (
+            RequeueKind,
+            _disposition_table,
+            _lookup_disposition,
+        )
+
+        disp = _lookup_disposition(LaneLockSelfOwnedLeak)
+        assert disp is not None, (
+            'LaneLockSelfOwnedLeak must have a disposition row'
+        )
+        assert LaneLockSelfOwnedLeak in _disposition_table(), (
+            'the row must be keyed on LaneLockSelfOwnedLeak ITSELF — resolving '
+            'through the MRO to MergeVerifyLeaseContended would inherit '
+            'escalate_to_human=False, leaving the leak exactly as quiet as the '
+            'ordinary contention it exists to be distinguished from'
+        )
+
+        assert disp.requeue_kind is RequeueKind.REQUEUE
+        assert disp.counts_against_requeue_cap is False, (
+            'a leaked lane lock is an infra fault — the task must not be '
+            'charged for it'
+        )
+        assert disp.category is FailureCategory.NONE
+        assert disp.escalate_to_human is True, (
+            'the one axis on which this MUST diverge from its parent: a '
+            'permanent-until-process-exit hold can never be resolved by '
+            'waiting, so it has to reach a human'
+        )
+
+        parent = _lookup_disposition(MergeVerifyLeaseContended)
+        assert parent is not None
+        assert disp.reason_prefix != parent.reason_prefix, (
+            'a distinct reason_prefix is what makes the leak legible in a '
+            'block reason and in merge_outcome_signature — sharing the '
+            "parent's would erase the distinction downstream"
+        )
+
     def test_a_brand_new_exception_type_has_no_row_but_still_classifies(self):
         # A synthetic type with no table row proves the completeness check
         # above is meaningful: it FAILS for an unrecognized type rather than
