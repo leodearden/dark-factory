@@ -50,10 +50,105 @@ _TREND_RUN_CAP = 90
 # reject at emit time and are passed through verbatim here.
 _KNOWN_KINDS = frozenset({'tripwire', 'proportion', 'count', 'scalar'})
 
+# The limits artifact carries a great deal more than this — ``alarms``,
+# ``alarmed_metric_count``, ``grandfather_set``, ``snapshotted_metric_ids`` and
+# its own embedded ``verdicts[]``.  Only this whitelist is surfaced, and it is
+# PROVENANCE: what alpha the program derived, over which baseline runs, against
+# which grandfather set.  See ``_read_limits`` for why the rest is ignored.
+_LIMITS_PROVENANCE_KEYS = (
+    'alpha',
+    'false_alarm_budget',
+    'runs_per_quarter',
+    'min_samples',
+    'baseline_window',
+    'baseline_run_stamps',
+    'grandfather_set_hash',
+    'run_stamp',
+    'generator',
+)
+
 
 def _load_json(path: Path) -> Any:
     """Parse *path*, or raise for the caller's narrow handler to record."""
     return json.loads(path.read_text())
+
+
+def _issue(
+    issues: list[dict[str, Any]],
+    kind: str,
+    *,
+    eval_id: str | None = None,
+    path: Path | str | None = None,
+    detail: str = '',
+) -> None:
+    """Record one degraded artifact — named, located, and counted (DD6/INV-2)."""
+    issues.append({
+        'kind': kind,
+        'eval_id': eval_id,
+        'path': str(path) if path is not None else None,
+        'detail': detail,
+    })
+
+
+def _read_limits(
+    eval_dir: Path,
+    latest_run_stamp: str | None,
+    issues: list[dict[str, Any]],
+    *,
+    has_runs: bool,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Return ``(provenance_block, metric_id -> limits record)`` for one eval.
+
+    Per-eval, NOT at the root: ``shared.memory_eval_limits.limits_artifact_path``
+    returns ``<root>/<eval_id>/limits-current.json`` and the committed exemplar
+    sits at ``e1-retrieval-health/limits-current.json``.  The committed
+    fixtures are the contract.
+
+    The artifact's embedded ``verdicts[]`` supplies ONE dashboard input —
+    ``rule_kind``, the rule that governs each metric.  Its ``status`` /
+    ``p_value`` / ``baseline`` / ``alarms`` are deliberately NOT read as verdict
+    state: that vocabulary (``baseline_snapshot|ok|alarm|improved|
+    insufficient_data``) is not the M2 verdict vocabulary the dashboard
+    displays, and these records carry no ``fingerprint``, so they cannot
+    participate in the escalation join at all.  Reading both sources would hand
+    the UI two disagreeing alarm truths and force a dashboard-side mapping
+    between the vocabularies — exactly the re-derivation G6/INV-5 forbids.
+    ``verdicts-current.json`` is the sole verdict source.
+    """
+    path = eval_dir / 'limits-current.json'
+    if not path.is_file():
+        if has_runs:
+            # Metrics on disk with no limits beside them means the evaluator is
+            # not completing — a real silent-failure mode, since the UI would
+            # otherwise show trends with a blank provenance block and look fine.
+            _issue(
+                issues,
+                'missing_limits',
+                eval_id=eval_dir.name,
+                path=path,
+                detail=f'{eval_dir.name} has metrics runs but no limits artifact',
+            )
+        return None, {}
+
+    body = _load_json(path)
+    if not isinstance(body, dict):
+        return None, {}
+
+    # ``.get()`` throughout: a schema addition upstream is inert here, never
+    # fatal, and an omitted field reads as absent rather than crashing.
+    block = {key: body.get(key) for key in _LIMITS_PROVENANCE_KEYS}
+    # One string comparison, not a re-derivation.  The committed exemplar
+    # exhibits this skew itself (limits stamped 20260704, newest metrics
+    # 20260705); displaying the alpha/baseline provenance beside a newer
+    # current value without disclosing it would present stale provenance as
+    # though it governed the displayed run.
+    block['stale_for_latest_run'] = body.get('run_stamp') != latest_run_stamp
+
+    by_metric: dict[str, Any] = {}
+    for record in body.get('verdicts') or []:
+        if isinstance(record, dict) and isinstance(record.get('metric_id'), str):
+            by_metric[record['metric_id']] = record
+    return block, by_metric
 
 
 def _metric_rows(body: Any) -> list[dict]:
@@ -69,7 +164,7 @@ def _metric_rows(body: Any) -> list[dict]:
     ]
 
 
-def _build_eval(eval_dir: Path) -> dict[str, Any]:
+def _build_eval(eval_dir: Path, issues: list[dict[str, Any]]) -> dict[str, Any]:
     """Assemble one eval's trend payload from its ``metrics-*.json`` series.
 
     Runs are ordered by FILENAME — the producer's own contract
@@ -114,6 +209,11 @@ def _build_eval(eval_dir: Path) -> dict[str, Any]:
             if metric_id not in metric_ids:
                 metric_ids.append(metric_id)
 
+    latest_run_stamp = run_stamps[-1] if run_stamps else None
+    limits, limits_by_metric = _read_limits(
+        eval_dir, latest_run_stamp, issues, has_runs=bool(all_paths),
+    )
+
     latest = runs[-1][1] if runs else {}
     metrics: list[dict[str, Any]] = []
     for metric_id in sorted(metric_ids):
@@ -125,15 +225,23 @@ def _build_eval(eval_dir: Path) -> dict[str, Any]:
         metrics.append({
             'metric_id': metric_id,
             'kind': current.get('kind'),
+            # Looked up by metric_id, never zipped positionally: the two lists
+            # are ordered independently and a metric may be absent from either.
+            'rule_kind': limits_by_metric.get(metric_id, {}).get('rule_kind'),
             'current_value': current.get('value'),
             'n': current.get('n'),
             'denominator': current.get('denominator'),
             'direction': current.get('direction'),
             'trend': {'labels': list(run_stamps), 'values': values},
+            # The verdict column exists even when empty — absent verdict state
+            # renders as an explicit gap, never as an implied "no alarm".
+            'verdict': None,
         })
 
     return {
         'eval_id': eval_id,
+        'latest_run_stamp': latest_run_stamp,
+        'limits': limits,
         'run_stamps': run_stamps,
         'run_count': len(run_stamps),
         'runs_on_disk': runs_on_disk,
@@ -166,15 +274,17 @@ def build_memory_evals(
     """
     resolved_now = resolve_now(now)
 
+    issues: list[dict[str, Any]] = []
     payload: dict[str, Any] = {
         'generated_at': resolved_now.isoformat(),
         'root_present': True,
         'evals': [],
-        'issues': [],
+        'issues': issues,
         'issue_count': 0,
         'unmatched_escalations': [],
     }
 
     eval_dirs = sorted(p for p in memory_evals_dir.iterdir() if p.is_dir())
-    payload['evals'] = [_build_eval(d) for d in eval_dirs]
+    payload['evals'] = [_build_eval(d, issues) for d in eval_dirs]
+    payload['issue_count'] = len(issues)
     return payload
