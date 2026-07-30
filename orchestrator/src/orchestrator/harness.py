@@ -5182,6 +5182,22 @@ class Harness:
                 if await self._maybe_submit_stranded_verified_green(tid, metadata):
                     return None
 
+                # Dedup guard (PRD leaf δ): reaching here with an escalation
+                # ALREADY open means the relaxed veto let us through on a
+                # merge-remediable one (the two clauses above are the only way
+                # in: θ1's resolver rows all require an empty list, and the
+                # EXISTS_OFF_MAIN upgrade now requires _only_merge_remediable)
+                # — and the verified-green submit just declined (non-match).
+                # Re-filing would stack a SECOND stranded_blocked L1 on a task
+                # that already has one pending, so leave the existing
+                # escalation for its handler.  A plain truthiness check
+                # suffices: merge-remediable-ness is already established
+                # upstream, keeping _only_merge_remediable the sole category
+                # authority (INV-5).  The empty case — every task that reached
+                # here before δ — falls through to the unchanged re-file.
+                if report.open_escalations:
+                    return None
+
                 from escalation.models import Escalation
 
                 esc = Escalation(
