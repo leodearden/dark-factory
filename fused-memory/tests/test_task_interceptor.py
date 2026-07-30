@@ -14,6 +14,7 @@ from _fm_helpers import _init_git_repo, make_8df8_scenario
 from _fm_helpers import submit_and_resolve as _submit_and_resolve
 
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
+from fused_memory.middleware import scope_violation_escalator as sve_mod
 from fused_memory.middleware.task_curator import CandidateTask, CuratorDecision, RewrittenTask
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.models.scope import resolve_project_id
@@ -7513,6 +7514,46 @@ class TestPathGuardOrSkipProseAdvisory:
 
         fake_adjudicator.adjudicate.assert_not_called()
 
+    async def test_prose_advisory_passes_advisory_true(self, interceptor, tmp_path):
+        """The PROSE branch must tell the escalator this is an advisory.
+
+        Task 3119: without this flag the escalation the operator reads says
+        'Misrouted task rejected' about a task that was in fact created — the
+        record contradicts what the guard actually did.
+        """
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        (tmp_path / 'dark-factory').mkdir()
+        (tmp_path / 'dark-factory' / 'fused-memory').mkdir()
+        interceptor._prefix_registry = ProjectPrefixRegistry.from_roots(
+            [str(tmp_path / 'reify'), str(tmp_path / 'dark-factory')]
+        )
+
+        escalator_calls: list = []
+
+        class SpyEscalator:
+            def report_rejection(self, **kwargs):
+                escalator_calls.append(kwargs)
+
+        interceptor._scope_violation_escalator = SpyEscalator()
+
+        result = await interceptor._path_guard_or_skip(
+            {
+                'title': 'Investigate fused-memory/harness deadlock',
+                'description': 'See fused-memory/ for context',
+            },
+            str(tmp_path / 'reify'),
+            'reify',
+        )
+
+        assert result is None, f'prose hit must stay advisory, got: {result!r}'
+        assert len(escalator_calls) == 1
+        assert escalator_calls[0]['advisory'] is True
+
 
 # ---------------------------------------------------------------------------
 # Multi-project routing — registry + escalator wiring
@@ -7640,6 +7681,54 @@ class TestMultiProjectRoutingWiring:
         assert call['suggested_project'] == 'dark_factory'
         # suggested_root resolved from registry.
         assert call['suggested_root'] == str((tmp_path / 'dark-factory').resolve())
+
+    async def test_files_certain_rejection_passes_advisory_false(
+        self,
+        interceptor,
+        tmp_path,
+    ):
+        """The FILES-certain branch must NOT claim to be an advisory.
+
+        The other half of the task-3119 pair: together with
+        test_prose_advisory_passes_advisory_true this catches a flag wired to
+        only one branch, or wired inverted.  Here a task really WAS rejected,
+        so the rejection wording is correct and must be preserved.
+        """
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        (tmp_path / 'dark-factory').mkdir()
+        (tmp_path / 'dark-factory' / 'fused-memory').mkdir()
+        interceptor._prefix_registry = ProjectPrefixRegistry.from_roots(
+            [str(tmp_path / 'reify'), str(tmp_path / 'dark-factory')]
+        )
+
+        escalator_calls: list = []
+
+        class FakeEscalator:
+            def report_rejection(self, **kwargs):
+                escalator_calls.append(kwargs)
+                return 'esc-task-path-guard-1'
+
+        interceptor._scope_violation_escalator = FakeEscalator()
+
+        result = await interceptor._path_guard_or_skip(
+            {
+                'title': 'Generic title, no prose hit',
+                'metadata': {'files': ['crates/widget.rs', 'fused-memory/x.py']},
+            },
+            str(tmp_path / 'reify'),
+            'reify',
+        )
+
+        assert result is not None
+        assert result['error_type'] == 'DarkFactoryPathScopeViolation'
+        assert len(escalator_calls) == 1
+        # Either omitted (inheriting the default) or explicitly False.
+        assert escalator_calls[0].get('advisory', False) is False
 
     async def test_escalator_failure_swallowed(
         self,
@@ -7866,6 +7955,121 @@ class TestMultiProjectRoutingWiring:
         marker = kwargs['metadata']['possible_scope_mismatch']
         assert marker['matched_paths'] == ['fused-memory/']
         assert marker['suggested_project'] == 'dark_factory'
+
+
+# ---------------------------------------------------------------------------
+# Task 3119 — end-to-end: what the OPERATOR actually reads off disk
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not sve_mod.HAS_ESCALATION,
+    reason='escalation package not installed in this environment',
+)
+class TestPathGuardEscalationWordingEndToEnd:
+    """Drive a REAL ScopeViolationEscalator through ``_path_guard_or_skip``.
+
+    Every other path-guard test here uses a ``**kwargs``-absorbing double, so it
+    can only assert "the flag was passed" — never "the resulting record says the
+    right thing".  A doubles-only suite would go green even if the escalator
+    ignored the flag entirely.  Since the user-observable signal for task 3119 is
+    specifically the wording of the record an operator reads, these tests cross
+    the seam: real escalator, real tmp_path queue, and the persisted wording
+    asserted TOGETHER with what the guard actually did — which is the invariant
+    that broke.
+    """
+
+    @staticmethod
+    def _registry(tmp_path):
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        (tmp_path / 'dark-factory').mkdir()
+        (tmp_path / 'dark-factory' / 'fused-memory').mkdir()
+        return ProjectPrefixRegistry.from_roots(
+            [str(tmp_path / 'reify'), str(tmp_path / 'dark-factory')]
+        )
+
+    @staticmethod
+    def _written_payload(tmp_path):
+        """Read the single escalation the guard wrote into the filer's queue."""
+        files = sorted((tmp_path / 'reify' / 'data' / 'escalations').glob('esc-*.json'))
+        assert len(files) == 1, f'expected exactly one escalation, found: {files}'
+        return json.loads(files[0].read_text())
+
+    async def test_prose_only_submission_writes_advisory_wording(
+        self,
+        interceptor,
+        tmp_path,
+    ):
+        """A prose-only hit: task created AND the record says so."""
+        from fused_memory.middleware.scope_violation_escalator import (
+            ScopeViolationEscalator,
+        )
+
+        interceptor._prefix_registry = self._registry(tmp_path)
+        interceptor._scope_violation_escalator = ScopeViolationEscalator()
+
+        kwargs: dict[str, Any] = {
+            'title': 'Investigate fused-memory/harness deadlock',
+            'description': 'See fused-memory/ for context',
+        }
+        result = await interceptor._path_guard_or_skip(
+            kwargs,
+            str(tmp_path / 'reify'),
+            'reify',
+        )
+
+        # What actually happened: the submission was ALLOWED and stamped.
+        assert result is None, f'prose hit must not block creation, got: {result!r}'
+        marker = (kwargs.get('metadata') or {}).get('possible_scope_mismatch')
+        assert marker is not None, f'expected the advisory stamp: {kwargs!r}'
+
+        # What the operator reads must agree with it.
+        payload = self._written_payload(tmp_path)
+        summary = payload['summary']
+        assert 'ADVISORY' in summary, summary
+        assert 'CREATED' in summary, summary
+        assert 'reject' not in summary.lower(), (
+            f'record claims a rejection but the task was created: {summary!r}'
+        )
+        assert 'possible_scope_mismatch' in payload['detail'], payload['detail']
+        assert payload['suggested_action'] == 'no_action_advisory_only', payload
+
+    async def test_files_certain_submission_writes_rejection_wording(
+        self,
+        interceptor,
+        tmp_path,
+    ):
+        """A FILES-certain mismatch: task rejected AND the record says so."""
+        from fused_memory.middleware.scope_violation_escalator import (
+            ScopeViolationEscalator,
+        )
+
+        interceptor._prefix_registry = self._registry(tmp_path)
+        interceptor._scope_violation_escalator = ScopeViolationEscalator()
+
+        result = await interceptor._path_guard_or_skip(
+            {
+                'title': 'Generic title, no prose hit',
+                'metadata': {'files': ['crates/widget.rs', 'fused-memory/x.py']},
+            },
+            str(tmp_path / 'reify'),
+            'reify',
+        )
+
+        # What actually happened: the submission WAS rejected.
+        assert result is not None
+        assert result['error_type'] == 'DarkFactoryPathScopeViolation'
+
+        # The rejection wording is correct here and must be preserved verbatim.
+        payload = self._written_payload(tmp_path)
+        assert payload['summary'].startswith('Misrouted task rejected: cites '), payload
+        assert payload['suggested_action'] == 'resubmit_to_dark_factory', payload
 
 
 # ─────────────────────────────────────────────────────────────────────
