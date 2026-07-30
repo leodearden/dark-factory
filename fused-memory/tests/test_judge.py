@@ -2098,3 +2098,124 @@ async def test_halt_reason_cleared_on_unhalt(mock_journal):
 
     await judge.unhalt('proj-unhalt-reason')
     assert judge.halt_reason('proj-unhalt-reason') is None
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Acceptance regression: the 2026-07-25 cap-retry resume (task 3067)
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestJudgeCapRetryResumeKeepsVerdictContract:
+    """Replays the 2026-07-25 429-then-succeed sequence end to end.
+
+    Nothing inside judge.py is patched — the REAL _call_judge_cli drives the REAL
+    invoke_with_cap_retry, with only shared.cli_invoke.invoke_claude_agent (and the
+    cap cooldown sleep) mocked. That is the point: the resume branch at
+    cli_invoke.py:1270-1272 must be exercised for real.
+
+    The load-bearing assertion is that the RESUMED invocation still carries
+    output_schema. build_claude_argv drops --system-prompt-file on the resume path
+    (cli_invoke.py:1501-1503) but emits --json-schema unconditionally (:1552-1553),
+    so a prose-only verdict contract evaporates on resume while a schema-carried
+    one survives. On 2026-07-25 the resumed judge answered in prose and
+    _parse_verdict fabricated it into a severity=serious halt of a project nobody
+    had reviewed.
+
+    MUTATION CHECK (verified locally before committing): deleting
+    ``output_schema=JUDGE_VERDICT_SCHEMA`` from _call_judge_cli must make
+    assertion 1 fail. If it does not, this test is not pinning what it claims.
+    """
+
+    def _judge(self, mock_journal, project_id):
+        from fused_memory.models.reconciliation import (
+            ReconciliationRun,
+            RunStatus,
+            RunType,
+        )
+
+        config = _make_judge_config(
+            judge_llm_provider='claude_cli',
+            judge_llm_model='claude-sonnet-4-5',
+            halt_on_judge_serious=True,
+        )
+        gate = make_gate_mock(
+            account_count=2,
+            before_invoke=AsyncMock(side_effect=['tok-a', 'tok-b']),
+            detect_cap_hit=MagicMock(side_effect=[True, False]),
+            active_account_name='acct-b',
+        )
+        judge = Judge(config=config, journal=mock_journal, usage_gate=gate)
+        run = ReconciliationRun(
+            id='run-cap-resume',
+            project_id=project_id,
+            run_type=RunType.full,
+            trigger_reason='buffer_size:3',
+            started_at=datetime.now(UTC),
+            events_processed=3,
+            status=RunStatus.completed,
+            stage_reports={},
+        )
+        mock_journal.get_run = AsyncMock(return_value=run)
+        mock_journal.get_run_actions_combined = AsyncMock(return_value=[])
+        return judge
+
+    @pytest.mark.asyncio
+    async def test_429_then_succeed_yields_a_real_verdict_and_no_halt(self, mock_journal):
+        from shared.cli_invoke import CAP_HIT_RESUME_PROMPT, AgentResult
+
+        from fused_memory.reconciliation.judge import JUDGE_VERDICT_SCHEMA
+
+        judge = self._judge(mock_journal, 'proj-cap-resume')
+
+        # First attempt: capped (429) but carrying a session id, so the loop takes
+        # the RESUME branch rather than restarting fresh.
+        capped = AgentResult(
+            success=False, output='', cost_usd=0.0,
+            api_error_status=429, session_id='jsess-cap',
+        )
+        # The resumed attempt succeeds with a real payload — and, exactly as on
+        # 2026-07-25, an empty text channel is no obstacle because the verdict no
+        # longer lives there.
+        ok = AgentResult(
+            success=True, output='',
+            structured_output={'severity': 'ok', 'findings': []},
+            session_id='jsess-cap', output_tokens=727,
+        )
+
+        with (
+            patch(
+                'shared.cli_invoke.invoke_claude_agent',
+                new_callable=AsyncMock, side_effect=[capped, ok],
+            ) as mock_agent,
+            patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock),
+        ):
+            verdict = await judge.review_run('run-cap-resume')
+
+        # 1. The resume happened, and the verdict contract survived it.
+        assert mock_agent.call_count == 2
+        second = mock_agent.call_args_list[1].kwargs
+        assert second['resume_session_id'] == 'jsess-cap'
+        assert second['prompt'] == CAP_HIT_RESUME_PROMPT
+        assert second['output_schema'] is JUDGE_VERDICT_SCHEMA, (
+            'the resumed invocation must still carry the verdict schema — the '
+            'system prompt is dropped on resume, the schema is not'
+        )
+
+        # 2. A real, parseable verdict came back.
+        assert verdict is not None
+        assert verdict.severity == VerdictSeverity.ok
+        assert verdict.action_taken == VerdictAction.none
+
+        # 3. No halt_state row, project not halted.
+        mock_journal.set_halt.assert_not_called()
+        assert judge.is_halted('proj-cap-resume') is False
+
+        # 4. The judge_verdicts row is a real verdict, not a fabricated one.
+        mock_journal.add_verdict.assert_called_once()
+        stamped = mock_journal.add_verdict.call_args.args[0]
+        assert all(
+            'could not be parsed' not in f.get('issue', '') for f in stamped.findings
+        )
+        assert all(
+            f.get('code') != 'unparseable_judge_response' for f in stamped.findings
+        )
