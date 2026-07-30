@@ -1755,23 +1755,32 @@ async def _assemble_retry_verify_env(
 ) -> dict[str, str] | None:
     """INV-3 tree-OID corroboration gate → the retry env, or None for full verify.
 
-    Corroborates the CURRENT merge-tree OID (``git_ops.get_head_tree_hash``)
-    against the attempt-0-pinned OID before trusting the cached did-not-pass set.
-    A rebased tree (mismatch) or an unreadable OID (None) fails safe: log a
-    WARNING and return None so the caller leaves the spec untouched and the
-    existing ``_reverify_rebased_tree`` (M4) route runs a FULL re-verify.
+    **Two INDEPENDENT reads of the same fact** (belt-and-suspenders):
+
+    1. DF's own ground truth — ``git_ops.get_head_tree_hash(merge_wt)``;
+    2. reify's own ``git rev-parse HEAD:`` stamp, carried in
+       ``attempt0.tree_oid`` from its ``target/reify-verify-attempt.json``
+       sidecar (:func:`_load_reify_attempt_sidecar`).
+
+    A disagreement (rebased tree) or an unreadable OID (None — an ABSENCE of
+    corroboration, not a match) fails safe: log a WARNING and return None so the
+    caller leaves the spec untouched and the existing ``_reverify_rebased_tree``
+    (M4) route runs a FULL re-verify.  reify then independently re-checks the
+    same pin from its own side (verify.sh's ``_RETRY_SUBSET_ELIGIBLE`` guard), so
+    the tree is corroborated on both sides of the seam.
 
     On a match, builds the per-profile {did-not-pass} nextest subsets via
-    :func:`build_fail_fast_map` → :func:`did_not_pass_subset`, passes the failed
-    run_all members / gui specs through unchanged, and delegates to
-    :func:`_build_retry_verify_env` to write the filter files and env dict.
+    :func:`build_fail_fast_map` → :func:`did_not_pass_subset`, then maps them
+    through :func:`nextest_filter_ids` at the write boundary so the filter files
+    carry nextest's ``test(=...)`` domain while the internal plan/verdict space
+    stays uniform.  Failed run_all members / gui specs pass through unchanged.
 
     Args:
-        git_ops: GitOps for the current-tree-OID probe.
+        git_ops: GitOps for DF's own tree-OID read.
         req: the merge request (for ``task_id`` in log lines).
         merge_wt: the merge worktree — both the tree-OID probe target and the
             filter-file directory.
-        attempt0: the injected attempt-0 payload.
+        attempt0: the DF-constructed attempt-0 payload.
 
     Returns:
         The REIFY_VERIFY_RETRY_* env dict on a corroborated tree, else None.
@@ -1792,9 +1801,13 @@ async def _assemble_retry_verify_env(
     release_subset = did_not_pass_subset(
         build_fail_fast_map(attempt0.release_planned, attempt0.release_verdicts)
     )
+    # Map into nextest's matcher domain ONLY here, at the single write boundary:
+    # a filter file of full "<binary-id> <test-name>" parse keys is non-empty
+    # (so reify's "retry refused: no subset" fallback never fires) yet matches
+    # ZERO tests — a FALSE-GREEN retry.  See :func:`nextest_filter_ids`.
     return _build_retry_verify_env(
-        nextest_subset_debug=debug_subset,
-        nextest_subset_release=release_subset,
+        nextest_subset_debug=nextest_filter_ids(debug_subset),
+        nextest_subset_release=nextest_filter_ids(release_subset),
         run_all_members=list(attempt0.run_all_members),
         gui_specs=list(attempt0.gui_specs),
         tree_oid=current,
