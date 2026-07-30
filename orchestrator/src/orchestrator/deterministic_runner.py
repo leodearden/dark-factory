@@ -243,6 +243,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import signal
 from datetime import UTC, datetime
 from pathlib import Path
@@ -389,6 +390,19 @@ def _build_done_provenance(kind: str, **fields: object) -> dict:
     return DoneProvenance(kind=kind, **fields).model_dump(exclude_none=True)  # type: ignore[arg-type]
 
 
+# The payload budget.  Sits safely inside the 500-char `max_note_chars` cap
+# that fused-memory's `_format_outcome_echo` applies downstream (tasks
+# 2049/2054/2080), so a surviving note is not re-truncated there.
+_PREDICATE_NOTE_MAX_PAYLOAD_CHARS = 400
+
+# Log shape: a leading ISO/logging timestamp, OR a standalone level token
+# anywhere in the line.  Used only to REJECT a tier-2 candidate line.
+_LOG_LINE_RE = re.compile(
+    r'^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}'
+    r'|\b(?:DEBUG|INFO|WARNING|ERROR|CRITICAL)\b'
+)
+
+
 def _summarize_predicate_output(out: object, *, rc: int) -> str:
     """Summarize a predicate check's raw output into a bounded provenance note.
 
@@ -412,14 +426,34 @@ def _summarize_predicate_output(out: object, *, rc: int) -> str:
     Raw subprocess output is dropped at this seam for that reason alone; it
     stays recoverable in the orchestrator log, which is not memory-ingested.
 
-    Extraction: the script's own trailing JSON block (the last line opening a
-    ``{``/``[`` structure, through end of output) is re-dumped compactly and
-    appended to the verdict.  This structurally excludes every preceding log
-    line rather than pattern-matching them.
+    Extraction runs two tiers: the script's own trailing JSON block, else a
+    single clean final line.  Tier 1 structurally excludes every preceding log
+    line rather than pattern-matching them; tier 2 rejects a final line
+    carrying log shape.
+
+    That rejection is deliberately CONSERVATIVE and will drop an otherwise
+    clean final line that merely contains a standalone ``INFO``/``ERROR``
+    token.  Losing a payload is the safe failure direction: the verdict prefix
+    always survives, and ``_run_predicate`` logs the raw output before calling
+    this, so nothing is silently discarded.
+
+    An oversized payload is replaced WHOLESALE with a marker naming the
+    dropped size — never sliced.  Task 2054 found a raw ``note[:N]`` slice
+    downstream cutting mid-token (garbling ``8679,8680`` into ``8679,868``);
+    a sliced JSON object is worse still, unparseable yet still
+    structured-looking to a reader.
     """
     verdict = f'predicate check passed (rc={rc})'
     payload = _extract_predicate_payload(out)
-    return f'{verdict}: {payload}' if payload else verdict
+    if payload is None:
+        return verdict
+    if len(payload) > _PREDICATE_NOTE_MAX_PAYLOAD_CHARS:
+        payload = (
+            f'<verdict payload elided: {len(payload)} chars exceeds '
+            f'{_PREDICATE_NOTE_MAX_PAYLOAD_CHARS}-char cap '
+            f'— see the orchestrator log>'
+        )
+    return f'{verdict}: {payload}'
 
 
 def _extract_predicate_payload(out: object) -> str | None:
@@ -428,6 +462,13 @@ def _extract_predicate_payload(out: object) -> str | None:
     Tier 1 — a trailing JSON block: walk backwards to the last line whose
     strip opens a ``{``/``[``, and try to parse from there to end of output.
     Re-dumped with compact separators so the note stays a single line.
+
+    Tier 2 — the last non-blank line, iff it carries no log shape
+    (``_LOG_LINE_RE``).  This is what preserves the real in-repo predicate
+    verdicts (``check ok: 0 flakes``, ``-- invariant holds``,
+    ``measured_median_ms=…``).
+
+    Otherwise None: an unrecognized shape yields no payload at all.
     """
     lines = out.splitlines() if isinstance(out, str) else []
     for index in range(len(lines) - 1, -1, -1):
@@ -438,6 +479,12 @@ def _extract_predicate_payload(out: object) -> str | None:
         except ValueError:
             continue
         return json.dumps(parsed, separators=(',', ':'))
+
+    for line in reversed(lines):
+        candidate = line.strip()
+        if not candidate:
+            continue
+        return None if _LOG_LINE_RE.search(candidate) else candidate
     return None
 
 
