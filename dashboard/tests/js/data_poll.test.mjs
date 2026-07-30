@@ -165,6 +165,17 @@ function makeConcurrencyFetch(slowPath) {
   return { fetchImpl, maxConcurrent, callCount, releaseSlow, rejectSlow };
 }
 
+// A plain, unwindowed endpoint used as the "flaky" one in the error-backoff
+// tests below — distinct from SLOW_ENDPOINT_PATH so those two concerns
+// (in-flight concurrency vs. failure backoff) stay independently testable.
+const FLAKY_ENDPOINT_PATH = '/api/v2/dashboard/curator';
+
+// Every endpoint PATH from endpointsFor(win) except `excludePath` — used to
+// assert that a failure/backoff on one endpoint never affects the other 12.
+function otherPaths(api, win, excludePath) {
+  return Object.keys(api.endpointsFor(win)).map(url => url.split('?')[0]).filter(p => p !== excludePath);
+}
+
 test('default-imported module exposes the poll-loader functions', () => {
   const { api } = loadDataJs();
   for (const name of EXPECTED_FUNCTION_NAMES) {
@@ -294,4 +305,188 @@ test('per-endpoint in-flight guard: a rejected fetch also clears the in-flight f
     2,
     'a rejected fetch must clear the in-flight flag so the next tick retries rather than skipping forever',
   );
+});
+
+// ---------------------------------------------------------------------------
+// Error backoff — driven entirely by an injected, manually-advanced `now()`
+// so none of this waits on the wall clock.
+// ---------------------------------------------------------------------------
+
+test('error backoff: a thrown fetch error backs the endpoint off — skipped on the immediately following tick, other 12 unaffected', async () => {
+  const callCount = new Map();
+  const fetchImpl = url => {
+    const path = url.split('?')[0];
+    callCount.set(path, (callCount.get(path) || 0) + 1);
+    if (path === FLAKY_ENDPOINT_PATH) return Promise.reject(new Error('simulated failure'));
+    return Promise.resolve({ ok: true, json: async () => ({}) });
+  };
+  const { api } = loadDataJs({ fetchStub: fetchImpl });
+  const others = otherPaths(api, '24h', FLAKY_ENDPOINT_PATH);
+
+  const state = api.createPollState();
+  const deps = { fetchImpl, now: () => 0, random: () => 0, sleep: () => Promise.resolve() };
+  const opts = { state, deps, jitterMaxMs: 0 };
+
+  api.pollTick(opts); // tick 1: flaky endpoint throws, backs off
+  await drain();
+  assert.equal(callCount.get(FLAKY_ENDPOINT_PATH), 1);
+
+  api.pollTick(opts); // tick 2: immediately following — now() hasn't advanced, still backed off
+  await drain();
+  assert.equal(
+    callCount.get(FLAKY_ENDPOINT_PATH),
+    1,
+    'a failing endpoint must be skipped (not re-fetched) on the tick immediately after it failed',
+  );
+
+  for (const path of others) {
+    assert.equal(callCount.get(path), 2, `${path} must not be affected by a different endpoint's failure`);
+  }
+});
+
+test('error backoff: a non-ok (503) response backs the endpoint off too, not just a thrown error', async () => {
+  const callCount = new Map();
+  const fetchImpl = url => {
+    const path = url.split('?')[0];
+    callCount.set(path, (callCount.get(path) || 0) + 1);
+    if (path === FLAKY_ENDPOINT_PATH) return Promise.resolve({ ok: false, status: 503, json: async () => ({}) });
+    return Promise.resolve({ ok: true, json: async () => ({}) });
+  };
+  const { api } = loadDataJs({ fetchStub: fetchImpl });
+  const others = otherPaths(api, '24h', FLAKY_ENDPOINT_PATH);
+
+  const state = api.createPollState();
+  const deps = { fetchImpl, now: () => 0, random: () => 0, sleep: () => Promise.resolve() };
+  const opts = { state, deps, jitterMaxMs: 0 };
+
+  api.pollTick(opts); // tick 1: 503, backs off
+  await drain();
+  assert.equal(callCount.get(FLAKY_ENDPOINT_PATH), 1);
+
+  api.pollTick(opts); // tick 2: still within the backoff window
+  await drain();
+  assert.equal(
+    callCount.get(FLAKY_ENDPOINT_PATH),
+    1,
+    'a 503 must back the endpoint off exactly like a thrown error, not just be silently retried at full rate',
+  );
+
+  for (const path of others) {
+    assert.equal(callCount.get(path), 2, `${path} must not be affected by a different endpoint's 503`);
+  }
+});
+
+test('error backoff: delay schedule is 3000 -> 6000 -> 12000 -> 24000 -> 48000 -> 60000 -> 60000 (3000 * 2^(n-1), capped at 60000)', async () => {
+  const fetchImpl = url => {
+    const path = url.split('?')[0];
+    if (path === FLAKY_ENDPOINT_PATH) return Promise.reject(new Error('always fails'));
+    return Promise.resolve({ ok: true, json: async () => ({}) });
+  };
+  const { api } = loadDataJs({ fetchStub: fetchImpl });
+
+  const state = api.createPollState();
+  let t = 0;
+  const deps = { fetchImpl, now: () => t, random: () => 0, sleep: () => Promise.resolve() };
+  const opts = { state, deps, jitterMaxMs: 0 };
+
+  const expectedDelays = [3000, 6000, 12000, 24000, 48000, 60000, 60000];
+  for (let i = 0; i < expectedDelays.length; i++) {
+    api.pollTick(opts); // now() is exactly at (or past) nextAllowedAt, so this attempt is not itself skipped
+    await drain();
+    const st = state.get(FLAKY_ENDPOINT_PATH);
+    assert.equal(st.failures, i + 1, `failures should be ${i + 1} after consecutive failure #${i + 1}`);
+    assert.equal(
+      st.nextAllowedAt,
+      t + expectedDelays[i],
+      `nextAllowedAt after failure #${i + 1} should be now (${t}) + ${expectedDelays[i]}`,
+    );
+    t = st.nextAllowedAt; // advance the clock to exactly when the endpoint is allowed again
+  }
+});
+
+test('error backoff: once retried past the backoff window, a SUCCESSFUL fetch resets failures/nextAllowedAt to 0', async () => {
+  let shouldFail = true;
+  const fetchImpl = url => {
+    const path = url.split('?')[0];
+    if (path === FLAKY_ENDPOINT_PATH && shouldFail) return Promise.reject(new Error('boom'));
+    return Promise.resolve({ ok: true, json: async () => ({}) });
+  };
+  const { api } = loadDataJs({ fetchStub: fetchImpl });
+
+  const state = api.createPollState();
+  let t = 0;
+  const deps = { fetchImpl, now: () => t, random: () => 0, sleep: () => Promise.resolve() };
+  const opts = { state, deps, jitterMaxMs: 0 };
+
+  api.pollTick(opts); // failure #1
+  await drain();
+  let st = state.get(FLAKY_ENDPOINT_PATH);
+  assert.equal(st.failures, 1);
+  assert.equal(st.nextAllowedAt, 3000);
+
+  shouldFail = false;
+  t = 3000; // advance the clock to exactly nextAllowedAt — the retry must not itself be skipped
+  api.pollTick(opts); // retried, succeeds this time
+  await drain();
+  st = state.get(FLAKY_ENDPOINT_PATH);
+  assert.equal(st.failures, 0, 'a successful retry should reset failures to 0');
+  assert.equal(st.nextAllowedAt, 0, 'a successful retry should reset nextAllowedAt to 0, i.e. full 3s rate resumes');
+});
+
+test('error backoff: refreshDFData(win) (chip change) bypasses backoff, but is still refused by the in-flight guard', async () => {
+  // Part 1: a chip change fetches a currently-backed-off endpoint immediately.
+  {
+    const callCount = new Map();
+    const fetchImpl = url => {
+      const path = url.split('?')[0];
+      callCount.set(path, (callCount.get(path) || 0) + 1);
+      if (path === FLAKY_ENDPOINT_PATH) return Promise.reject(new Error('boom'));
+      return Promise.resolve({ ok: true, json: async () => ({}) });
+    };
+    const { api } = loadDataJs({ fetchStub: fetchImpl });
+    const state = api.createPollState();
+    const deps = { fetchImpl, now: () => 0, random: () => 0, sleep: () => Promise.resolve() };
+
+    // Timer path (no win) — fails, backs off. now() stays 0 for the rest of
+    // this block, well inside the resulting backoff window.
+    await api.refreshDFData(undefined, { state, deps, jitterMaxMs: 0 });
+    assert.equal(callCount.get(FLAKY_ENDPOINT_PATH), 1);
+
+    api.pollTick({ state, deps, jitterMaxMs: 0 }); // sanity: timer path stays backed off
+    await drain();
+    assert.equal(callCount.get(FLAKY_ENDPOINT_PATH), 1, 'sanity check: timer path must still be backed off here');
+
+    // Chip change (explicit non-empty win) — must bypass backoff.
+    await api.refreshDFData('7d', { state, deps, jitterMaxMs: 0 });
+    assert.equal(
+      callCount.get(FLAKY_ENDPOINT_PATH),
+      2,
+      'refreshDFData(win) must bypass backoff for a currently-backed-off endpoint',
+    );
+  }
+
+  // Part 2: a chip change does NOT stack a second concurrent request for an
+  // endpoint that is already in flight — the in-flight guard still applies.
+  {
+    const { fetchImpl, maxConcurrent, callCount, releaseSlow } = makeConcurrencyFetch(FLAKY_ENDPOINT_PATH);
+    const { api } = loadDataJs({ fetchStub: fetchImpl });
+    const state = api.createPollState();
+    const deps = { fetchImpl, now: () => 0, random: () => 0, sleep: () => Promise.resolve() };
+    const opts = { state, deps, jitterMaxMs: 0 };
+
+    api.pollTick(opts); // starts an in-flight fetch for the flaky endpoint, held open
+    await drain();
+    assert.equal(callCount.get(FLAKY_ENDPOINT_PATH), 1);
+
+    await api.refreshDFData('7d', opts); // chip change while still in flight
+    assert.equal(
+      callCount.get(FLAKY_ENDPOINT_PATH),
+      1,
+      'a chip change must not stack a second concurrent request for an endpoint already in flight',
+    );
+    assert.equal(maxConcurrent.get(FLAKY_ENDPOINT_PATH), 1);
+
+    releaseSlow();
+    await drain();
+  }
 });
