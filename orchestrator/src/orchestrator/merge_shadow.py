@@ -132,6 +132,20 @@ _LIBTEST_TEST_LINE_RE = re.compile(
 )
 
 
+# Matches reify run_all.sh's BARE {failed}-member classifier marker line.
+# Capture group: (1) the space-separated member names.
+#
+# Producer: reify tests/infra/run_all.sh:26-36 (documented contract) and
+# :1839-1841 (the emitting `printf 'FAILED %s\n' "${failed_names[*]}"`).  This
+# is the same line DF's own verify.py already classifies via `^FAILED\s`
+# (pattern #7b), so the format is established and source-verified.
+#
+# Anchored at line start with a REQUIRED space, so the sibling human-readable
+# summary `=== FAILED: <names> ===` (run_all.sh:1840) cannot also match and
+# double-count the members.
+_RUN_ALL_FAILED_MARKER_RE = re.compile(r'^FAILED[ \t]+(.*)$', re.MULTILINE)
+
+
 def _classify_test_status(raw_status: str) -> str:
     """Map a raw nextest or libtest status token to a 3-valued verdict string.
 
@@ -392,6 +406,56 @@ def parse_nextest_list_planned(stdout: str) -> list[str] | None:
     except (AttributeError, TypeError):
         return None
     return sorted(planned)
+
+
+def parse_failed_run_all_members(test_output: str) -> list[str]:
+    """Extract the {failed} run_all member names from attempt-0's own log.
+
+    Consumes reify's **bare classifier marker** line, ``FAILED <space-separated
+    names>``, documented at ``reify tests/infra/run_all.sh:26-36`` and emitted
+    at ``:1839-1841``.  DF's own ``verify.py`` already classifies that same line
+    via its ``^FAILED\\s`` regex (pattern #7b), so this parser reuses an
+    established, source-verified format rather than inventing one.
+
+    The sibling human-readable summary ``=== FAILED: <names> ===`` is emitted on
+    the immediately preceding line; the anchored regex deliberately does not
+    match it, so members are never double-counted.
+
+    **[] is the SAFE degradation, not a silent narrowing.** An empty result
+    means DF sets ``REIFY_RUN_ALL_MEMBER_SUBSET`` to the empty string, and
+    ``verify.sh:2545`` gates the subset on ``[ -n "${REIFY_RUN_ALL_MEMBER_SUBSET:-}" ]``
+    — so empty runs the **FULL** run_all suite.  A no-marker log therefore
+    widens the retry, never skips a member.
+
+    .. note::
+
+       The **gui counterpart is deliberately NOT implemented here.** No real
+       reify gui/vitest failure log was available to pin a fixture to, and
+       authoring one from prose is the exact drift class this leaf corrects
+       (PRD §12 root cause (a)) — so ``REIFY_GUI_RETRY_SPECS`` ships empty,
+       which ``verify.sh:2127-2158`` treats as "run the full gui suite".  A
+       follow-up captures real gui bytes and adds the parser.
+
+    Args:
+        test_output: Attempt-0's captured verify output (stdout+stderr blob).
+
+    Returns:
+        Member names from the LAST marker in the log, in emission order, exact
+        duplicates collapsed.  ``[]`` when no marker is present or the marker
+        carries no names.
+    """
+    matches = _RUN_ALL_FAILED_MARKER_RE.findall(test_output)
+    if not matches:
+        return []
+    # A merge-gate log can concatenate more than one run_all invocation; the
+    # LAST marker describes the final state.
+    seen: set[str] = set()
+    out: list[str] = []
+    for name in matches[-1].split():
+        if name not in seen:
+            seen.add(name)
+            out.append(name)
+    return out
 
 
 # ---------------------------------------------------------------------------

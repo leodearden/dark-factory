@@ -129,6 +129,7 @@ from orchestrator.merge_shadow import (  # noqa: F401  re-export shim
     diff_per_test_results,
     merge_retry_shadow_baseline,
     nextest_filter_ids,
+    parse_failed_run_all_members,
     parse_nextest_list_planned,
     parse_per_test_results,
 )
