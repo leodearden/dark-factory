@@ -613,17 +613,16 @@ chronic_flake:
 
 # Zero-progress requeue backstop (task 3068, origin incident reify
 # esc-5556-1).  Files a blocking L1 when one task requeues `threshold` times
-# CONSECUTIVELY without invoking a single agent — a class the per-task requeue
-# cap cannot see, because the warm-lane dispositions set
-# counts_against_requeue_cap=false and record_requeue then takes its
-# history-only route.  Shipped ENABLED (unlike chronic_flake): it reads only
-# TaskReport fields that already exist, so no substrate gating is needed.
-# threshold=5 is ~a third of the origin incident's ~14.5 consecutive
-# zero-progress requeues per task, so it fires hours into such a loop rather
-# than at its end, while tolerating a 1-2 dispatch backpressure blip.
+# CONSECUTIVELY without invoking a single agent AND that streak spans at least
+# `min_span_seconds` — a class the per-task requeue cap cannot see by design.
+# See orchestrator/src/orchestrator/zero_progress_requeue.py (module docstring)
+# for the full causal chain and why both halves of the predicate are needed.
+# Shipped ENABLED (unlike chronic_flake): it reads only TaskReport fields that
+# already exist, so no substrate gating is needed.
 zero_progress_requeue:
   enabled: true
   threshold: 5
+  min_span_seconds: 900.0
 
 # Autonomous dry-run unblock hook
 unblock_auto:

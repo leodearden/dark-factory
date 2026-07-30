@@ -134,18 +134,39 @@ class RunStore:
         means "row predates task 3068", while ``''`` (what both writers now
         always store) means "clean exit, no block".
 
-        Exceptions are deliberately NOT swallowed.  A failed schema migration
-        must surface loudly at construction rather than degrade into silently
-        writing NULLs for the very field this task exists to make durable
-        (repo no-silent-fail-soft invariant).
+        FAILURE BEHAVIOUR — note what this actually is, not what would be
+        tidy.  A genuinely unrecoverable ``ALTER`` propagates out of
+        ``__init__``, but the sole production caller (``Harness.run``) wraps
+        ``RunStore(db_path)`` in ``except Exception: logger.error(...)`` and
+        continues, so a raise here does NOT halt the run — it drops
+        ``task_results`` persistence for the whole run.  That is strictly worse
+        than writing NULLs, so we do NOT raise on the one failure mode that is
+        both plausible and benign: a concurrent construction that already added
+        the column.  ``duplicate column name`` means the migration's goal is
+        met, and is swallowed per-column.  Everything else (a corrupt DB, a
+        lock we could not take inside the busy_timeout) still surfaces, because
+        those are real and a silent half-migrated schema would be worse.
         """
         existing = {row[1] for row in conn.execute('PRAGMA table_info(task_results)')}
         added = []
         for column in ('block_reason', 'block_phase'):
-            if column not in existing:
+            if column in existing:
+                continue
+            try:
                 # Column name is a hard-coded literal, never caller input.
                 conn.execute(f'ALTER TABLE task_results ADD COLUMN {column} TEXT')
-                added.append(column)
+            except sqlite3.OperationalError as exc:
+                # Another RunStore construction won the race between our
+                # table_info read and this ALTER.  The column exists, which is
+                # all we wanted; raising would cost the caller task_results
+                # persistence for an entire run over a no-op.
+                if 'duplicate column name' not in str(exc).lower():
+                    raise
+                logger.debug(
+                    'RunStore: task_results.%s already added concurrently', column,
+                )
+                continue
+            added.append(column)
         if added:
             conn.commit()
             logger.info(

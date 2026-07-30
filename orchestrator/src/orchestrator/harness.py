@@ -120,6 +120,7 @@ from orchestrator.worktree_identity import identities_match, read_worktree_title
 from orchestrator.zero_progress_requeue import (
     ZeroProgressRequeueTracker,
     emit_zero_progress_requeue_alert,
+    resolve_zero_progress_requeue_alert,
 )
 
 if TYPE_CHECKING:
@@ -1421,6 +1422,13 @@ class Harness:
         # popped on any progress, so this stays proportional to the number of
         # tasks CURRENTLY looping rather than growing over a weeks-long run.
         self._zero_progress_tracker = ZeroProgressRequeueTracker()
+        # task_id -> streak at the last time we asked the escalation queue
+        # whether an alert was already open.  Keeps has_open_l1's full
+        # pending-queue glob+parse off the dispatch hot path: without it, every
+        # completed dispatch of every looping task would scan the queue —
+        # hardest during exactly the many-tasks-looping incident this detects.
+        # Popped on recovery so a later recurrence re-files.
+        self._zero_progress_filed_at: dict[str, int] = {}
 
         # Consecutive terminal-status poll counts per task.  Incremented each
         # poll a workflow is terminal but still active; reset when it is no
@@ -1816,7 +1824,16 @@ class Harness:
                 str(prd_path) if prd_path else '',
             )
         except Exception:
-            logger.warning('Failed to create run store', exc_info=True)
+            # Non-fatal, but loud: swallowing this at warning level understated
+            # the blast radius. A RunStore that fails to construct (bad schema
+            # migration, unusable DB) leaves _run_store unset, which silently
+            # drops EVERY task_results row for the whole run — the post-hoc
+            # forensics substrate is simply absent, with no other signal.
+            logger.error(
+                'Failed to create run store at %s — task_results persistence '
+                'is DISABLED for run %s',
+                db_path, run_id, exc_info=True,
+            )
 
         # 0a-post. Restore scheduler pause state from prior run (if any).
         await self._load_persisted_scheduler_pause()
@@ -8313,13 +8330,11 @@ class Harness:
         # BEFORE the outcome branch below, so EVERY outcome flows through the
         # tracker: requeues accumulate, DONE/BLOCKED reset.
         #
-        # This is deliberately independent of report.counts_against_requeue_cap.
-        # workflow_types._disposition_table() sets that False for the warm-lane
-        # dispositions, which routes record_requeue below to its history-only
-        # path — so NEITHER ceiling in this method can trip for them, and a hard
-        # fault masquerading as transient backpressure would otherwise requeue
-        # forever, invisibly.  If you are editing the cap logic below, this is
-        # why a second, independent detector exists.
+        # Deliberately independent of report.counts_against_requeue_cap: if you
+        # are editing the cap logic below, see
+        # orchestrator/src/orchestrator/zero_progress_requeue.py (module
+        # docstring) for why neither ceiling in this method can see the class of
+        # failure that detector catches.
         self._maybe_zero_progress_requeue_alert(task_id, report)
 
         if report.outcome == WorkflowOutcome.REQUEUED:
@@ -8382,21 +8397,54 @@ class Harness:
         cap accounting it sits beside.
         """
         try:
-            if not self.config.zero_progress_requeue.enabled:
-                return
+            cfg = self.config.zero_progress_requeue
+            # The tracker is ALWAYS fed, even while the detector is disabled.
+            # Both leaves are green-tier hot-reloadable, so skipping record()
+            # under the kill switch would freeze streaks instead of resetting
+            # them: a task at streak 4 when an operator silences the detector,
+            # which then makes real progress and is re-enabled, would alarm on
+            # its very NEXT zero-progress requeue — the kill switch would
+            # manufacture the exact false positive it was reached for.
+            # record() is pure and does no I/O, so feeding it is free.
+            streak_before = self._zero_progress_tracker.streak(task_id)
             streak = self._zero_progress_tracker.record(
                 task_id,
                 outcome=report.outcome,
                 agent_invocations=report.agent_invocations,
             )
+
+            if streak == 0:
+                # Progress. Resolve any alarm we filed, so an operator is not
+                # left holding a blocking L1 for a cleared condition and — more
+                # importantly — so the emitter's has_open_l1 dedup cannot let a
+                # stale pending alert suppress a genuine LATER recurrence.
+                # Ungated by `enabled`: disabling the detector must not strand
+                # an already-filed alarm.
+                if streak_before:
+                    resolve_zero_progress_requeue_alert(
+                        escalation_queue=self._escalation_queue,
+                        event_store=self.event_store,
+                        task_id=task_id,
+                        recovered_streak=streak_before,
+                        threshold=cfg.threshold,
+                        filed_at=self._zero_progress_filed_at,
+                    )
+                return
+
+            if not cfg.enabled:
+                return
+
             emit_zero_progress_requeue_alert(
                 escalation_queue=self._escalation_queue,
                 event_store=self.event_store,
                 task_id=task_id,
                 streak=streak,
-                threshold=self.config.zero_progress_requeue.threshold,
+                threshold=cfg.threshold,
+                span_seconds=self._zero_progress_tracker.span(task_id),
+                min_span_seconds=cfg.min_span_seconds,
                 block_reason=report.block_reason,
                 block_phase=report.block_phase,
+                filed_at=self._zero_progress_filed_at,
             )
         except Exception as exc:  # noqa: BLE001 — never disturb cap accounting
             logger.warning(

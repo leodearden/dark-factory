@@ -690,3 +690,63 @@ class TestBlockContextPersistence:
         RunStore(db_path)
 
         assert _task_results_columns(db_path) == cols_after_first
+
+    def test_concurrent_alter_race_is_survivable(self, tmp_path):
+        """Losing the table_info->ALTER race must not cost a run its results.
+
+        Two RunStore constructions can interleave between the PRAGMA read and
+        the ALTER (the dashboard and a digest reader both open runs.db). The
+        loser sees a real sqlite3 "duplicate column name" — which means the
+        migration's GOAL is already met. Propagating it would reach
+        Harness.run's `except Exception`, leave `_run_store` unset, and drop
+        EVERY task_results row for the whole run over a no-op.
+        """
+        db_path = tmp_path / 'runs.db'
+        _build_legacy_db(db_path)
+        store = RunStore(db_path)  # migrates for real
+
+        class _StaleReadConn:
+            """Reports the PRE-migration column set, ALTERs the migrated DB."""
+
+            def __init__(self, real):
+                self._real = real
+
+            def execute(self, sql, *args):
+                if sql.startswith('PRAGMA table_info'):
+                    # (cid, name, ...) shape, minus the 3068 columns.
+                    return iter([(0, 'task_id'), (1, 'completed_at')])
+                return self._real.execute(sql, *args)
+
+            def commit(self):
+                self._real.commit()
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            # Would raise sqlite3.OperationalError without the guard.
+            store._migrate_task_results_block_context(_StaleReadConn(conn))
+        finally:
+            conn.close()
+
+        assert set(_task_results_columns(db_path)) >= {'block_reason', 'block_phase'}
+
+    def test_non_duplicate_alter_failure_still_surfaces(self, tmp_path):
+        """Only the benign race is swallowed — a real fault must not be.
+
+        A corrupt DB or an un-takeable lock is exactly the case where a silent
+        half-migrated schema would be worse than a loud failure.
+        """
+        db_path = tmp_path / 'runs.db'
+        _build_legacy_db(db_path)
+        store = RunStore(db_path)
+
+        class _BrokenConn:
+            def execute(self, sql, *args):
+                if sql.startswith('PRAGMA table_info'):
+                    return iter([(0, 'task_id')])
+                raise sqlite3.OperationalError('database is locked')
+
+            def commit(self):  # pragma: no cover - never reached
+                raise AssertionError('commit must not be reached')
+
+        with pytest.raises(sqlite3.OperationalError, match='database is locked'):
+            store._migrate_task_results_block_context(_BrokenConn())
