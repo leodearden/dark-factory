@@ -12,6 +12,57 @@ from fused_memory.models.scope import Scope
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# mem0-owned metadata keys
+# ---------------------------------------------------------------------------
+
+# Keys mem0's AsyncMemory._update_memory (site-packages/mem0/memory/main.py,
+# ~line 2449) never trusts from a forwarded metadata dict: 'data'/'hash'/
+# 'created_at'/'updated_at' are unconditionally recomputed from the update
+# call's own arguments and the existing stored point, and 'user_id'/
+# 'agent_id'/'run_id'/'actor_id'/'role' are restored from the *currently
+# stored* payload (unconditionally for 'actor_id'; whenever absent from what
+# was forwarded for the rest). Forwarding stale copies of these currently
+# works only because mem0 keeps overwriting/re-deriving them -- an implicit
+# coupling to mem0 internals. Stripping them makes the intent explicit:
+# preserve only a record's CUSTOM provenance keys (kind/src_project/
+# dst_project/src_entity/dst_entity/source_migration/topic/...).
+#
+# This is the SINGLE home for the key set (INV-5). It lives here, beside
+# Mem0Backend.update whose docstring documents the very constraint it
+# encodes, per plans/mem0-in-place-update-decision.md §6. Consumers:
+# scripts/tag_cgl_eta_rehome_scope.py (which defined it first) and the
+# in-place update_memory tool (task 3088).
+_MEM0_MANAGED_METADATA_KEYS = frozenset({
+    'data', 'hash', 'created_at', 'updated_at',
+    'user_id', 'agent_id', 'run_id', 'actor_id', 'role',
+})
+
+
+def split_managed_metadata(
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Partition a stored Qdrant payload into (mem0-owned, custom) subsets.
+
+    Unknown keys land in the CUSTOM subset: anything mem0 does not
+    recompute-or-restore is provenance the caller is responsible for
+    preserving, so the fail-safe direction for an unrecognised key is
+    "preserve it", not "drop it".
+
+    Both returned dicts are fresh shallow copies -- callers mutate the custom
+    subset in place (the metadata merge/delete arms) and must not disturb the
+    payload they read.
+    """
+    managed: dict[str, Any] = {}
+    custom: dict[str, Any] = {}
+    for key, value in payload.items():
+        if key in _MEM0_MANAGED_METADATA_KEYS:
+            managed[key] = value
+        else:
+            custom[key] = value
+    return managed, custom
+
+
 class Mem0Backend:
     """Lazily creates AsyncMemory instances keyed by project_id."""
 

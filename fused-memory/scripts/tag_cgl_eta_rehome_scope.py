@@ -76,6 +76,7 @@ import sys
 from datetime import UTC, datetime
 from typing import Any
 
+from fused_memory.backends.mem0_client import _MEM0_MANAGED_METADATA_KEYS
 from fused_memory.maintenance.project_selection import select_projects
 from fused_memory.maintenance.rehome_scope_tag import (
     CGL_ETA_REHOME_KIND,
@@ -220,22 +221,14 @@ def build_tag_report(
 # ---------------------------------------------------------------------------
 # mem0-owned metadata keys
 # ---------------------------------------------------------------------------
-
-# Keys mem0's AsyncMemory._update_memory (site-packages/mem0/memory/main.py,
-# ~line 2449) never trusts from a forwarded metadata dict: 'data'/'hash'/
-# 'created_at'/'updated_at' are unconditionally recomputed from the update
-# call's own arguments and the existing stored point, and 'user_id'/
-# 'agent_id'/'run_id'/'actor_id'/'role' are restored from the *currently
-# stored* payload (unconditionally for 'actor_id'; whenever absent from what
-# was forwarded for the rest). Forwarding stale copies of these currently
-# works only because mem0 keeps overwriting/re-deriving them -- an implicit
-# coupling to mem0 internals. Stripping them here makes the intent explicit:
-# preserve only this record's CUSTOM provenance keys (kind/src_project/
-# dst_project/src_entity/dst_entity/source_migration/...).
-_MEM0_MANAGED_METADATA_KEYS = frozenset({
-    'data', 'hash', 'created_at', 'updated_at',
-    'user_id', 'agent_id', 'run_id', 'actor_id', 'role',
-})
+#
+# _MEM0_MANAGED_METADATA_KEYS is IMPORTED from its single home in
+# fused_memory.backends.mem0_client (see the module-level import above), where
+# the full rationale for the key set lives beside Mem0Backend.update. This
+# script defined it first; task 3088 moved it out when the in-place
+# update_memory tool became a second consumer, so there is exactly one copy
+# repo-wide (INV-5). The imported name is still an attribute of this module,
+# so `_mod._MEM0_MANAGED_METADATA_KEYS` in the tests keeps resolving.
 
 
 # ---------------------------------------------------------------------------
