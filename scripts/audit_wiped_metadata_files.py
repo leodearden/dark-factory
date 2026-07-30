@@ -606,3 +606,123 @@ def audit_project(project_root: str) -> ProjectAudit:
     return ProjectAudit(
         project_root=project_root, candidates=candidates, coverage=coverage
     )
+
+
+# ---------------------------------------------------------------------------
+# Reporting.
+# ---------------------------------------------------------------------------
+
+_LOCK_LEVEL_CAVEAT = (
+    "    CAVEAT: the paths above are LOCK-LEVEL module paths (from "
+    "set_to_plan.files), NOT verbatim plan.files entries. They evidence that "
+    "a non-empty scope was declared; they must not be backfilled into "
+    "metadata.files as-is."
+)
+
+
+def _format_candidate_line(candidate: WipeCandidate) -> str:
+    return (
+        f"  task_id={candidate.task_id} tag={candidate.tag} "
+        f"status={candidate.status} signature={candidate.wipe_signature} "
+        f"source={candidate.plan_files_source} "
+        f"fidelity={candidate.plan_files_fidelity} "
+        f"plan_files={len(candidate.plan_files)}"
+    )
+
+
+def _format_coverage(coverage: AuditCoverage) -> list[str]:
+    """Render the always-printed coverage block.
+
+    Never omitted, never abbreviated when there are no candidates: the whole
+    point is that the candidate list is an observable subset, and a reader
+    must be told the size of the unobservable remainder.
+    """
+    return [
+        "  COVERAGE (the candidate list above is an OBSERVABLE SUBSET, not the",
+        "  full damaged population — tasks with no recoverable plan scope are",
+        "  UNKNOWN, neither clean nor damaged):",
+        f"    total tasks scanned:                {coverage.total_tasks}",
+        f"    with a file-level plan signal:      {coverage.tasks_with_file_level_signal}",
+        f"    with only a lock-level signal:      {coverage.tasks_with_lock_level_signal_only}",
+        f"    with NO plan signal at all:         {coverage.tasks_without_plan_signal}",
+        f"    plan records with no such task:     {coverage.plan_records_without_task}",
+    ]
+
+
+def format_report(audits: list[ProjectAudit]) -> str:
+    """Render *audits* as a grouped, human-readable report.
+
+    Confirmed candidates and CONTRADICTED ones are printed in SEPARATE
+    sections: a contradicted candidate obtained a real merge sha later, so it
+    is a retried failure rather than a wipe and must not be consumed by a
+    repair job alongside the confirmed ones.
+
+    The coverage block is emitted for every project, INCLUDING projects with
+    zero candidates.
+    """
+    lines: list[str] = []
+    total_confirmed = 0
+    for audit in audits:
+        lines.append(f"{audit.project_root}:")
+
+        contradicted = [
+            c for c in audit.candidates
+            if c.wipe_signature == CONTRADICTED_REAL_MERGE_SHA
+        ]
+        confirmed = [
+            c for c in audit.candidates
+            if c.wipe_signature != CONTRADICTED_REAL_MERGE_SHA
+        ]
+        total_confirmed += len(confirmed)
+
+        if confirmed:
+            lines.append(f"  -- candidates ({len(confirmed)}) --")
+            for candidate in confirmed:
+                lines.append(_format_candidate_line(candidate))
+                if candidate.plan_files_fidelity == FIDELITY_LOCK_LEVEL:
+                    lines.append(_LOCK_LEVEL_CAVEAT)
+        else:
+            lines.append("  -- candidates (0) --")
+
+        if contradicted:
+            lines.append(
+                f"  -- contradicted ({len(contradicted)}): a null-sha row exists "
+                "but the task later obtained a REAL merge sha (a retried "
+                "failure that landed). NOT confirmed wipes — do not repair. --"
+            )
+            for candidate in contradicted:
+                lines.append(_format_candidate_line(candidate))
+                if candidate.plan_files_fidelity == FIDELITY_LOCK_LEVEL:
+                    lines.append(_LOCK_LEVEL_CAVEAT)
+
+        lines.extend(_format_coverage(audit.coverage))
+
+    lines.append(
+        f"{total_confirmed} candidate(s) across {len(audits)} project(s)"
+    )
+    return "\n".join(lines)
+
+
+def format_json(audits: list[ProjectAudit]) -> str:
+    """Render *audits* as a JSON OBJECT carrying full file lists and coverage.
+
+    An object rather than a bare array so the coverage counts travel with the
+    candidates — a consumer that received only an array could not tell a clean
+    project from an unobservable one. File lists are never truncated, so the
+    output can be fed directly to a follow-up repair task.
+    """
+    return json.dumps(
+        {
+            "projects": [
+                {
+                    "project_root": audit.project_root,
+                    "coverage": audit.coverage._asdict(),
+                    "candidates": [
+                        {**c._asdict(), "plan_files": list(c.plan_files)}
+                        for c in audit.candidates
+                    ],
+                }
+                for audit in audits
+            ]
+        }
+    )
