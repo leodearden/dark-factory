@@ -868,6 +868,7 @@ def run_census(
     date: str,
     force: bool = False,
     max_batches: int | None = None,
+    max_verify_clusters: int | None = None,
 ) -> CensusOutcome:
     """Run one periodic legibility census end to end.
 
@@ -931,6 +932,21 @@ def run_census(
     cap and says so in as many words, and ``CensusOutcome.stop_reason``
     is ``"capped"`` -- distinct from the ``"exhausted"`` a source that
     genuinely ran dry produces.
+
+    *max_verify_clusters* bounds the per-cluster verification spend
+    (``--max-verify-clusters``) to the first N novel clusters in mining
+    order. Selection is a plain ``[:N]`` slice of ``_novel_clusters``'s
+    own first-occurrence-wins ordering -- deterministic given the run,
+    with no invented "most important first" heuristic (any such ranking
+    would need a signal the census does not have pre-verification). The
+    deferred remainder is NOT dropped: the codebook merge below consumes
+    the raw ``mining_result.records``, not the verified clusters, so a
+    deferred cluster still lands as a ``pending`` candidate and
+    ``_find_pending_candidate_id`` will find it on a later census exactly
+    as designed. What a deferred cluster does forgo is this run's
+    adjudication: the matrix and the synthesis necessarily cover only the
+    VERIFIED subset, and the report's ``## Verification`` section states
+    that split rather than letting a bounded run read as a complete one.
     """
     headroom = preflight_headroom(invoke, model=config.models.trickle)
     if not headroom.ok:
@@ -955,7 +971,27 @@ def run_census(
     )
 
     novel_clusters = _novel_clusters(mining_result.records)
-    verify_result = verify_fn(novel_clusters, model=config.models.census_verify) or {}
+    if max_verify_clusters is None:
+        clusters_to_verify = novel_clusters
+        verify_coverage = None
+    else:
+        clusters_to_verify = novel_clusters[:max_verify_clusters]
+        verify_coverage = VerifyCoverage(
+            novel=len(novel_clusters),
+            verified=len(clusters_to_verify),
+            cap=max_verify_clusters,
+        )
+        deferred_count = len(novel_clusters) - len(clusters_to_verify)
+        if deferred_count:
+            logger.warning(
+                "census: operator verify cap (--max-verify-clusters=%d) reached -- "
+                "%d of %d novel cluster(s) DEFERRED, not verified this run; they still "
+                "merge into the codebook as pending candidates for a later census "
+                "(deferred, never dropped)",
+                max_verify_clusters, deferred_count, len(novel_clusters),
+            )
+
+    verify_result = verify_fn(clusters_to_verify, model=config.models.census_verify) or {}
     verified = verify_result.get("verified") or []
     rejected = verify_result.get("rejected") or []
     fixed_entry_ids = verify_result.get("fixed") or []
@@ -1065,6 +1101,7 @@ def run_census(
         synthesis_md=synthesis_md,
         filed_task_ids=filed_task_ids,
         cost_note=cost_note,
+        verify_coverage=verify_coverage,
     )
     # Written BEFORE codebook.dump()/advance_census_state() below -- a
     # failure here (e.g. a disk-full write_text) leaves nothing but this one
