@@ -40,6 +40,8 @@ cd /home/leo/src/dark-factory && uv run --project shared python scripts/legibili
 - `--force` is what makes this an *operator*-initiated run: it bypasses the `census_trigger.decide_for_project` gate entirely (the same gate the nightly trickle checks before launching), so it works identically whether the trigger would have said NO-FIRE (first-census case — it always would, per above) or you simply don't want to wait for the next scheduled fire (ad-hoc case). Without `--force`, the CLI prints the NO-FIRE reasons and exits 0 without mining anything — expected behavior for a first census, not an error.
 - Optional flags: `--config <path>` to point at a non-default `legibility.yaml`, `--date YYYY-MM-DD` to stamp the report with a date other than today (rare — mainly for backfilling a report for a run that started the previous day).
 
+The run mines, verifies, synthesizes, updates the codebook, and files remediation tasks unattended — it can take a while (saturation mining runs until novelty drops below the configured duplicate-rate threshold for several consecutive batches). Watch the terminal for the final `census: done -- report=... filed_tasks=N stop_reason=...` line, or `census: deferred -- <reason>` if the headroom preflight declined to start.
+
 ### Operator cost-control flags
 
 Three composable flags bound what one run may spend. Each is optional and defaults to today's unbounded behavior, so omitting them all is exactly the command above.
@@ -57,8 +59,6 @@ cd /home/leo/src/dark-factory && uv run --project shared python scripts/legibili
 ```
 
 Why: a first census cannot rely on saturation to bound spend — against an empty codebook, a batch's `dup_rate` only measures "the miner found nothing to match", so mining runs to source exhaustion, per-cluster verification scales with however many novel clusters that produces, and filing would bulk-load a live task tree in one shot.
-
-The run mines, verifies, synthesizes, updates the codebook, and files remediation tasks unattended — it can take a while (saturation mining runs until novelty drops below the configured duplicate-rate threshold for several consecutive batches). Watch the terminal for the final `census: done -- report=... filed_tasks=N stop_reason=...` line, or `census: deferred -- <reason>` if the headroom preflight declined to start.
 
 ## Post-run checklist
 
