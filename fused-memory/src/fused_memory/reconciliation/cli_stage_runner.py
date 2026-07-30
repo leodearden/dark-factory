@@ -116,10 +116,22 @@ DISALLOW_RECON_REPORT_LEDGER_WRITES = [
 # read tool on the shared server is exposed to every stage until it is named
 # here — see test_stages.py::test_every_escalation_server_tool_is_classified,
 # which fails on any unclassified addition.
+#
+# `get_task_escalation_history` (task 3164) is the first tool that guard
+# actually caught, and it is the same hazard intensified. It DELEGATES to
+# `get_task_escalations`, so it inherits the identical archive-inclusive
+# cross-store read — but it wraps the result in an envelope that echoes
+# `task_id` and `level_filter` back to the caller. Against the reconciliation
+# queue that turns a categorical `count: 0` into what reads as an attributable,
+# query-specific answer ("no record was ever filed for this task at this
+# level"), when it is only the artefact of asking the wrong store. A bare []
+# at least looks anonymous; a self-describing zero invites being believed. Both
+# per-task archive-inclusive reads therefore sit adjacent below, as one class.
 DISALLOW_ESCALATION_READS = [
     'mcp__escalation__get_pending_escalations',
     'mcp__escalation__get_escalation',
     'mcp__escalation__get_task_escalations',
+    'mcp__escalation__get_task_escalation_history',
 ]
 
 # Per-stage disallowed lists
