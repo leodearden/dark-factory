@@ -51,10 +51,29 @@ straight through.
 from __future__ import annotations
 
 import json
+import logging
 import time
 from collections import deque
 from collections.abc import Callable
-from typing import Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+# Defensive import of the optional ``escalation`` workspace package, mirroring
+# middleware/candidate_key_escalation.py: when it is missing (minimal CI envs,
+# deployments that have not installed it) the storm escalation becomes a logged
+# no-op. This module sits on the MCP write path, so it must never make a write
+# fail — the rejection is already decided by the time escalation is attempted.
+try:
+    from escalation.models import Escalation  # type: ignore[import-untyped]
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped,no-redef]
+    HAS_ESCALATION = True
+except ImportError:  # pragma: no cover — exercised only in minimal envs
+    HAS_ESCALATION = False
+
+logger = logging.getLogger(__name__)
 
 # Raw MCP envelope fragments that must never appear inside a write payload.
 #
@@ -105,6 +124,15 @@ _MARKUP_STORM_HINT = (
     'cause and the retroactive corpus sweep; attach the offending agent_id, '
     'field and matched_pattern there.'
 )
+
+# Escalation wiring, copied shape-for-shape from
+# middleware/candidate_key_escalation.py. _ANCHOR_TASK_ID is a stable per-project
+# anchor (not a real task id) so the resulting ids form one greppable
+# ``esc-markup-tripwire-N`` series and the dedup check has something to key on.
+_QUEUE_DIRNAME: str = 'data/escalations'
+_ANCHOR_TASK_ID: str = 'markup-tripwire'
+_AGENT_ROLE: str = 'fused-memory/markup-tripwire'
+_CATEGORY: str = 'mcp_markup_write_storm'
 
 
 def find_markup_pattern(text: object) -> str | None:
@@ -326,3 +354,127 @@ class MarkupStormCounter:
             'window_seconds': self._window_seconds,
             'hint': _MARKUP_STORM_HINT,
         }
+
+
+def emit_markup_storm_escalation(
+    project_root: str | None,
+    storm: dict[str, Any],
+) -> str | None:
+    """File an ``mcp_markup_write_storm`` escalation for a rejection burst (INV-4).
+
+    Returns the escalation id — freshly filed, or the id of an already-open
+    escalation for this project (dedup) — or ``None`` when filing is impossible
+    or fails.
+
+    NEVER raises. This is called from an MCP write path whose rejection has
+    already been decided, so escalation is purely additive: every failure mode
+    degrades to ``None`` plus a log line rather than changing the write's
+    outcome. Copied shape-for-shape from
+    :func:`middleware.candidate_key_escalation.emit_residual_candidate_key_escalation`,
+    adding an early return for a ``None`` *project_root* — ``add_memory`` /
+    ``add_episode`` take a ``project_id``, which for an unknown project resolves
+    to no root at all, and that must be a quiet no-op rather than a crash.
+
+    The anchor dedup matters beyond the counter's own per-window rate limit: a
+    leak running for hours would otherwise file one escalation per window, so
+    those collapse into the single open record until an operator resolves it.
+    """
+    if project_root is None:
+        logger.debug(
+            'markup_tripwire: no project_root resolved; storm %r will not be escalated',
+            storm,
+        )
+        return None
+    if not HAS_ESCALATION:
+        logger.debug(
+            'markup_tripwire: escalation package unavailable; storm %r in '
+            'project_root=%r will not be escalated',
+            storm, project_root,
+        )
+        return None
+
+    try:
+        queue = EscalationQueue(Path(project_root) / _QUEUE_DIRNAME)
+    except Exception:
+        logger.exception(
+            'markup_tripwire: failed to open the escalation queue for '
+            'project_root=%r; storm %r not escalated',
+            project_root, storm,
+        )
+        return None
+
+    # Best-effort dedup: a read failure falls THROUGH to filing rather than
+    # bailing out — losing duplicate-suppression is strictly better than losing
+    # the alarm for an actively running leak.
+    try:
+        existing = queue.get_by_task(_ANCHOR_TASK_ID, status='pending')
+    except Exception:
+        logger.exception(
+            'markup_tripwire: failed to check for an existing open escalation '
+            'for project_root=%r; proceeding to file a new one',
+            project_root,
+        )
+        existing = []
+    if existing:
+        logger.info(
+            'markup_tripwire: %s already open for project_root=%r (storm %r now); '
+            'not filing a duplicate',
+            existing[0].id, project_root, storm,
+        )
+        return existing[0].id
+
+    count = storm.get('count')
+    window_seconds = storm.get('window_seconds')
+    detail = '\n'.join([
+        f'project_root={project_root!r}',
+        f'rejected_writes_in_window={count!r}',
+        f'threshold={storm.get("threshold")!r}',
+        f'window_seconds={window_seconds!r}',
+        '',
+        'The fused-memory MCP write tripwire (task 3141) rejected multiple '
+        'writes carrying raw MCP envelope markup within one rolling window. A '
+        'burst means the upstream harness serialization leak is ACTIVE right '
+        'now, not that the tripwire is misfiring — do NOT disable it, or '
+        'further specimens will land permanently in the corpus.',
+        '',
+        'DF task 3083 owns the root cause, the Qdrant payload text-match read '
+        'tool and the retroactive corpus sweep. Attach the agent_id, field and '
+        'matched_pattern from the rejection responses (grep the server logs for '
+        "'markup_tripwire_storm') to 3083.",
+    ])
+
+    try:
+        esc = Escalation(  # type: ignore[possibly-unbound]
+            id=queue.make_id(_ANCHOR_TASK_ID),
+            task_id=_ANCHOR_TASK_ID,
+            agent_role=_AGENT_ROLE,
+            severity='blocking',
+            category=_CATEGORY,
+            summary=(
+                f'{count} MCP write(s) rejected for leaked envelope markup in '
+                f'{window_seconds}s — serialization leak active (see DF 3083)'
+            ),
+            detail=detail,
+            suggested_action=(
+                'identify the leaking caller from the rejection logs and report '
+                'it on DF task 3083'
+            ),
+            level=1,
+        )
+        esc_id = queue.submit(esc)
+    except Exception:
+        # A queue I/O failure must not propagate: the write has already been
+        # rejected, and the ERROR log at the call site has already recorded the
+        # burst. The operator simply loses the queued heads-up.
+        logger.exception(
+            'markup_tripwire: failed to submit storm escalation for '
+            'project_root=%r (storm %r)',
+            project_root, storm,
+        )
+        return None
+
+    logger.warning(
+        'markup_tripwire: queued %s for project_root=%r (storm %r)',
+        esc_id, project_root, storm,
+    )
+    return esc_id
