@@ -164,7 +164,63 @@ def _metric_rows(body: Any) -> list[dict]:
     ]
 
 
-def _build_eval(eval_dir: Path, issues: list[dict[str, Any]]) -> dict[str, Any]:
+def _read_verdicts(
+    root: Path,
+    eval_dirs: list[Path],
+    issues: list[dict[str, Any]],
+) -> dict[tuple[str, str], dict[str, Any]]:
+    """Index the ROOT verdicts artifact by ``(eval_id, metric_id)``.
+
+    Root-scoped, not per-eval: ``docs/prds/memory-eval-program.md`` pins
+    ``fused-memory/data/memory-evals/verdicts-<STAMP>.json``, and the
+    ``storm_escape`` block is per-RUN across the whole program, which only
+    makes sense above the eval dirs.
+
+    This artifact is the SOLE verdict source.  Its ``verdict`` strings are
+    passed through unmapped — a dashboard-side translation table would be a
+    second vocabulary to keep in sync with the evaluator's, and the first
+    divergence would silently mislabel an alarm.
+    """
+    path = root / 'verdicts-current.json'
+    if not path.is_file():
+        if eval_dirs:
+            # Metrics on disk with nothing judging them: the UI would show
+            # trends beside a blank verdict column and look healthy.
+            misplaced = [d / 'verdicts-current.json' for d in eval_dirs if (d / 'verdicts-current.json').is_file()]
+            detail = 'no verdicts artifact at the memory-evals root'
+            if misplaced:
+                # Named, never silently fallen back to: if the producer's
+                # location drifts, that drift stays visible as an issue rather
+                # than being papered over by a reader that guesses.
+                detail += (
+                    '; a verdicts artifact exists at '
+                    + ', '.join(str(p) for p in misplaced)
+                    + ' but is NOT read from there'
+                )
+            _issue(issues, 'missing_verdicts', path=path, detail=detail)
+        return {}
+
+    body = _load_json(path)
+    if not isinstance(body, dict):
+        return {}
+
+    index: dict[tuple[str, str], dict[str, Any]] = {}
+    for entry in body.get('entries') or []:
+        if not isinstance(entry, dict):
+            continue
+        eval_id = entry.get('eval_id')
+        metric_id = entry.get('metric_id')
+        if isinstance(eval_id, str) and isinstance(metric_id, str):
+            index[(eval_id, metric_id)] = entry
+    return index
+
+
+def _build_eval(
+    eval_dir: Path,
+    issues: list[dict[str, Any]],
+    verdict_index: dict[tuple[str, str], dict[str, Any]],
+    consumed: set[tuple[str, str]],
+) -> dict[str, Any]:
     """Assemble one eval's trend payload from its ``metrics-*.json`` series.
 
     Runs are ordered by FILENAME — the producer's own contract
@@ -222,6 +278,13 @@ def _build_eval(eval_dir: Path, issues: list[dict[str, Any]]) -> dict[str, Any]:
         # metric's points against its neighbours'.
         values = [by_id.get(metric_id, {}).get('value') for _, by_id in runs]
         current = latest.get(metric_id, {})
+        # Absent verdict == absent, never defaulted to 'no_alarm'.  The empty
+        # dict makes every verdict field read as None below without a second
+        # code path.
+        entry = verdict_index.get((eval_id, metric_id))
+        if entry is not None:
+            consumed.add((eval_id, metric_id))
+        judged: dict[str, Any] = entry or {}
         metrics.append({
             'metric_id': metric_id,
             'kind': current.get('kind'),
@@ -233,9 +296,17 @@ def _build_eval(eval_dir: Path, issues: list[dict[str, Any]]) -> dict[str, Any]:
             'denominator': current.get('denominator'),
             'direction': current.get('direction'),
             'trend': {'labels': list(run_stamps), 'values': values},
-            # The verdict column exists even when empty — absent verdict state
-            # renders as an explicit gap, never as an implied "no alarm".
-            'verdict': None,
+            # Verdict fields, passed through UNMAPPED from the sole verdict
+            # source.  `value` is what the evaluator judged; `current_value`
+            # above is what the metrics artifact says — two sources, two
+            # fields, never conflated.
+            'verdict': judged.get('verdict'),
+            'verdict_detail': judged.get('detail'),
+            'value': judged.get('value'),
+            'item': judged.get('item'),
+            'limit_ref': judged.get('limit_ref'),
+            'fingerprint': judged.get('fingerprint'),
+            'run_stamp': judged.get('run_stamp'),
         })
 
     return {
@@ -285,6 +356,23 @@ def build_memory_evals(
     }
 
     eval_dirs = sorted(p for p in memory_evals_dir.iterdir() if p.is_dir())
-    payload['evals'] = [_build_eval(d, issues) for d in eval_dirs]
+    verdict_index = _read_verdicts(memory_evals_dir, eval_dirs, issues)
+
+    consumed: set[tuple[str, str]] = set()
+    payload['evals'] = [_build_eval(d, issues, verdict_index, consumed) for d in eval_dirs]
+
+    # A verdict resolving onto nothing is contract drift between the evaluator
+    # and the artifact tree — surfaced, not dropped.
+    for eval_id, metric_id in verdict_index:
+        if (eval_id, metric_id) in consumed:
+            continue
+        _issue(
+            issues,
+            'orphan_verdict',
+            eval_id=eval_id,
+            path=memory_evals_dir / 'verdicts-current.json',
+            detail=f'verdict for metric {metric_id!r} matches no metric row in eval {eval_id!r}',
+        )
+
     payload['issue_count'] = len(issues)
     return payload
