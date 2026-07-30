@@ -7881,10 +7881,9 @@ def _alarm_coalesce_live_original(
         'slower backstop if it is never re-dispatched.\n'
         '\n'
         'This condition is unreachable in normal operation: every requeue site '
-        'pairs on_requeued with _note_requeue (pinned structurally by '
-        'test_merge_queue_lifecycle_registry.py::'
-        'TestOnRequeuedIsAlwaysPairedWithNoteRequeue), so it fires only if a '
-        'requeue site has regressed.'
+        'pairs on_requeued with _note_requeue, so it fires only if a requeue '
+        'site has regressed. Start there: find the on_requeued call that put '
+        'this request_id back on _queue and check it also called _note_requeue.'
     )
 
     esc = Escalation(
@@ -9164,22 +9163,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         ``_live_items`` ``InflightEntry`` whose request_id is absent from the
         ``_inflight`` deque.
 
-        task 3082: that window is now bounded on EVERY exit, not just the
-        ones that finalize. ``_finalize_inflight``'s DROPPED and REQUEUED
-        sentinel exits dispose of the entry explicitly before returning —
-        DROPPED via :meth:`_retire_item` (TERMINAL + ``_live_items`` pop; the
-        sole waiter has gone, so nothing will ever re-enter), REQUEUED via an
-        idempotent :meth:`_note_requeue` bounce to QUEUED carrying
-        ``live_obj=req`` (which REPLACES ``_live_items[rid]`` with the
-        ``MergeRequest``, and this method only counts ``InflightEntry``
-        values, so that object swap is what clears the head). Neither relies
-        on a caller retiring the entry later. Before that fix both exits
-        returned with the ``InflightEntry`` still in ``_live_items``, so this
-        method returned a PHANTOM finalize head for the rest of the process
-        lifetime — mis-reporting ``head_of_line``/``verify_in_progress``,
-        injecting a stale lease into ``snapshot()``'s ``occupancy.by_host``
-        for an actually-free host, and (the latent wedge) keeping a DEAD
-        merge commit at the :meth:`frozen_prefix_tip`, since
+        task 3082: that window is now bounded on EVERY exit, not just the ones
+        that finalize — ``_finalize_inflight``'s DROPPED and REQUEUED sentinel
+        exits dispose of the entry explicitly rather than relying on a caller
+        to retire it later (see that method's docstring, SENTINEL
+        DISPOSITION). Before that fix both exits returned with the
+        ``InflightEntry`` still in ``_live_items``, so this method returned a
+        PHANTOM finalize head for the rest of the process lifetime —
+        mis-reporting ``head_of_line``/``verify_in_progress``, injecting a
+        stale lease into ``snapshot()``'s ``occupancy.by_host`` for an
+        actually-free host, and (the latent wedge) keeping a DEAD merge commit
+        at the :meth:`frozen_prefix_tip`, since
         :meth:`_frozen_inflight_entries` appends this head whenever its phase
         is in {verifying, gate_reverify, finalizing}.
 
@@ -9830,22 +9824,26 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         operation: every requeue site pairs ``on_requeued`` with
         ``_note_requeue``, so it fires only if a requeue site regresses.
 
-        In BOTH cases a ``merge_coalesced`` observability event
-        (``source='duplicate_submission'``) is emitted via the shared
-        :func:`_emit_merge_coalesced` helper (None-safe when this worker has
-        no ``_event_store`` wired) — observability must not depend on which
-        branch was taken.
+        In BOTH cases a ``merge_coalesced`` observability event is emitted via
+        the shared :func:`_emit_merge_coalesced` helper (None-safe when this
+        worker has no ``_event_store`` wired) — observability must not depend
+        on which branch was taken. The ``source`` DISCRIMINATES them, because
+        the two conditions are not the same event: ``'duplicate_submission'``
+        for a twin, which carries the established meaning at every other
+        emission site (attached to an in-flight merge, will receive that
+        merge's outcome), versus ``'live_original_redrain'`` for the live
+        original, where nothing is coalesced at all — the request is dropped,
+        its future stays PENDING and no outcome will ever arrive. Consumers
+        aggregating coalesces must exclude the latter rather than count a
+        wedge as a benign attach.
         """
         # task 3082: is the arriving item the LIVE ORIGINAL, or a genuine twin?
-        #
         # Discriminated by FUTURE identity, deliberately NOT by object identity
         # of the item: `_live_items[rid]` legitimately changes SHAPE across the
         # pipeline (MergeRequest -> SpeculativeItem -> InflightEntry) while
         # carrying the SAME `request.result`, so an `is`-on-the-item check would
-        # silently fail open exactly when the entry is deepest in the pipeline —
-        # which is when this bug bites. The future is invariant across every
-        # shape, and it is precisely the thing that must never be falsely
-        # resolved.
+        # fail open exactly when the entry is deepest in the pipeline — which is
+        # when this bug bites.
         _live_obj = self._live_items.get(item.request_id)
         _live_req = _request_of(_live_obj) if _live_obj is not None else None
         _is_live_original = _live_req is not None and _live_req.result is item.result
@@ -9881,8 +9879,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     ),
                 )
         # Emitted UNCONDITIONALLY in both branches: observability must not depend
-        # on which one was taken.
-        _emit_merge_coalesced(self._event_store, item, source='duplicate_submission', eta=None)
+        # on which one was taken — but with a DISCRIMINATING source, since only
+        # the twin was actually coalesced onto a merge that will deliver it an
+        # outcome (see the docstring).
+        _emit_merge_coalesced(
+            self._event_store, item,
+            source='live_original_redrain' if _is_live_original else 'duplicate_submission',
+            eta=None,
+        )
 
     def _drain_queue_into_lanes(self) -> None:
         """Non-blocking drain of _queue into per-lane buffers.
@@ -15161,6 +15165,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # its start stamp behind would let a much later, unrelated
                     # contention cap out terminally on its first defer.
                     self._clear_contended_lease_streak(req.task_id)
+                    # task 3082: dispose of the registry entry AT THE SITE, the
+                    # same per-site ownership every requeue branch has. Nothing
+                    # will ever re-enter for a DROPPED request_id (the sole
+                    # waiter's future is already cancelled), so TERMINAL + the
+                    # `_live_items` pop is the only correct end state — and
+                    # leaving it to `_finalize_inflight`'s sentinel chokepoint
+                    # alone would make that chokepoint the SOLE owner, so any
+                    # future path consuming this result without finalizing would
+                    # silently strand a phantom finalize head. `_retire_item` is
+                    # idempotent, so the chokepoint call stays valid as defence
+                    # in depth (symmetric with the REQUEUED branches below).
+                    self._retire_item(req.request_id)
                     return InflightVerifyResult(
                         outcome=None,
                         merge_wt=None,
@@ -15302,42 +15318,20 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # MQ-reliability kappa (task 2169): mirror the re-arm onto
                     # the lifecycle registry.
                     #
-                    # task 3082: `_note_requeue` was MISSING here, making this
-                    # the one requeue site out of five that moved the LEDGER
-                    # without moving the REGISTRY. Two facts kept that
-                    # invisible, both recorded here so the omission cannot
-                    # recur:
-                    #  (i) `live_obj=req` is LOAD-BEARING, not decoration —
+                    # task 3082: `_note_requeue` was MISSING here — the one
+                    # requeue site of five that moved the LEDGER without moving
+                    # the REGISTRY. Two facts that make the line load-bearing:
+                    #  (i) `live_obj=req` is not decoration —
                     #      `_note_transition` REPLACES `_live_items[rid]` with
                     #      the MergeRequest, and `_finalizing_head_entry()` only
                     #      counts `isinstance(obj, InflightEntry)` values, so it
                     #      is that OBJECT SWAP (not the state change) that
-                    #      actually prevents a phantom finalize head. Measured:
-                    #      it is exactly why the four sibling sites never
-                    #      stranded while this one did.
-                    # (ii) the registry left at VERIFYING makes
+                    #      prevents a phantom finalize head.
+                    # (ii) a registry left at VERIFYING makes
                     #      `_buffer_owned_request` treat the re-queued original
-                    #      as a duplicate/re-entrant twin (current is neither
-                    #      None nor QUEUED) and hand it to
-                    #      `_coalesce_reentrant_drain`, which SILENTLY drops it
-                    #      — so the request never re-entered the pipeline at
-                    #      all.
-                    #
-                    # PROVENANCE (why this stayed latent, then bit):
-                    #  · task 2420 (2026-07-10) landed this abort WITHOUT the
-                    #    `_note_requeue`. Harmless then: `_buffer_owned_request`
-                    #    still appended to the lane buffer UNCONDITIONALLY, so a
-                    #    requeue arriving at FINALIZING produced a noisy
-                    #    rejected-transition escalation but RECOVERED.
-                    #  · task 2852 (2026-07-20, edcddc5d75) replaced that
-                    #    fall-through with `_coalesce_reentrant_drain`'s silent
-                    #    drop — ARMING the latent omission and converting a
-                    #    noisy-but-recoverable path into a zombie factory.
-                    #  · task 2609 (2026-07-14) does NOT cover this path: it
-                    #    retires the finalize head on TERMINAL advance-failure
-                    #    outcomes, whereas this path returns
-                    #    `InflightStatus.REQUEUED` with `outcome=None` and never
-                    #    reaches a terminal advance at all.
+                    #      as a duplicate/re-entrant twin and hand it to
+                    #      `_coalesce_reentrant_drain`, which drops it — so the
+                    #      request never re-enters the pipeline at all.
                     #
                     # ATOMICITY: no `await` between the put_nowait and this
                     # call, so the merger loop's drain can never observe the
@@ -15805,6 +15799,56 @@ class SpeculativeMergeWorker(_WipHaltMixin):
           DROPPED       — sole-waiter abandoned: cancel_and_release, _n_failed=True.
           REQUEUED      — operator halt (item already back on _queue):
                           cancel_and_release, _n_failed=True.
+
+        SENTINEL DISPOSITION (task 3082) — canonical statement; the sentinel
+        branch below carries only a pointer back here.
+
+        INVARIANT: a DROPPED or REQUEUED item is NOT finalizing and must never
+        be recorded as such. That is why the VERIFYING -> FINALIZING hop sits
+        AFTER the sentinel check rather than immediately past the ``await``
+        (superseding task 2444's placement, which was necessary but not
+        sufficient), and it is what makes the requeue-site ``_note_requeue``
+        asymmetry harmless in BOTH directions: a registry left at VERIFYING
+        would have the hop record a requeued item as FINALIZING and strand a
+        phantom head (see :meth:`_finalizing_head_entry`), while a registry
+        already bounced to QUEUED is neither fired-on nor tolerated by
+        :meth:`_advance_if_at` and would escalate a rejected transition on
+        every dead-verify abort. Below the sentinel check, neither shape
+        reaches the hop at all.
+
+        Both sentinel exits also dispose of the entry EXPLICITLY, because
+        returning without a disposition leaves this ``InflightEntry`` in
+        ``_live_items`` at a non-terminal state — a phantom finalize head for
+        the rest of the process lifetime. The two exits get DIFFERENT
+        dispositions deliberately:
+
+          · DROPPED  — the sole waiter has gone, so nothing will ever re-enter
+            for this request_id: :meth:`_retire_item` (TERMINAL + the
+            ``_live_items`` pop) is the only correct end state. The abandon
+            site in :meth:`_run_inflight_verify` owns this too, so the call
+            here is idempotent defence in depth, symmetric with REQUEUED.
+          · REQUEUED — the request is on ``_queue`` and MUST re-enter through
+            the drain, so retiring it would strand it in the opposite
+            direction (:meth:`_buffer_owned_request` re-registers only when
+            current is None, and TERMINAL is neither None nor QUEUED, so it
+            would be coalesce-dropped on arrival). Bounce it to QUEUED
+            instead, passing ``live_obj=req``.
+
+        The REQUEUED repair is guarded on current == VERIFYING, the ONLY state
+        a stranded in-flight requeue can present that also has a legal QUEUED
+        edge. The guard is load-bearing, not cosmetic, in two directions: an
+        unconditional call would attempt QUEUED -> QUEUED for the normal case
+        (requeue site already bounced it), and a merely-not-QUEUED guard would
+        fire on a legitimately RACED requeue — the merger loop's speculative
+        look-ahead drains and buffers ``_queue`` while this method is suspended
+        at ``await entry.verify_task``, so a correctly-wired requeue can already
+        read LANE_BUFFERED/MERGING/AWAITING_VERIFY by the time we resume. Both
+        would route an illegal edge into :meth:`_note_transition` and re-fire
+        the very ``merge_lifecycle_transition_rejected`` escalation this fix
+        retires. Defence in depth for a future requeue site that forgets the
+        call — NOT a substitute for per-branch symmetry, which every requeue
+        site still owns and which is pinned by the on_requeued/_note_requeue
+        pairing tests in test_merge_queue_lifecycle_registry.py.
           PASS          — vr.outcome is None (or verify_task=None for compat shim):
                           CAS advance_main loop.
 
@@ -15895,60 +15939,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 vr = await entry.verify_task
 
             # ── (c) DROPPED / REQUEUED sentinels ────────────────────────────
-            # Deliberately ABOVE the VERIFYING -> FINALIZING hop below (task
-            # 3082): a DROPPED or REQUEUED item is NOT finalizing and must
-            # never be recorded as such.
-            #
-            # task 3082: each sentinel gets an EXPLICIT registry disposition
-            # here, because returning without one leaves this InflightEntry in
-            # `_live_items` at a non-terminal state — which is exactly what
-            # `_finalizing_head_entry()` reports as THE finalize head (it scans
-            # `_live_items` for a non-TERMINAL InflightEntry absent from
-            # `_inflight`, and the caller popped this entry off `_inflight`
-            # before calling us). A missing disposition therefore strands a
-            # phantom head for the rest of the process lifetime and accretes one
-            # 'extra InflightEntry object(s)' WARNING per occurrence.
-            #
-            # The two sentinels get DIFFERENT dispositions, deliberately — they
-            # are not the same exit:
-            #   · DROPPED — the sole waiter has gone, so nothing will ever
-            #     re-enter the pipeline for this request_id. TERMINAL + the
-            #     `_live_items` pop is the only correct end state.
-            #     `_retire_item` is already safe on an already-TERMINAL or
-            #     unregistered rid.
-            #   · REQUEUED — the request is sitting on `_queue` and MUST
-            #     re-enter through the drain, so retiring it would strand it in
-            #     the opposite direction: `_buffer_owned_request` re-registers
-            #     only when current is None, and a TERMINAL rid is neither None
-            #     nor QUEUED, so it would be coalesce-dropped on arrival.
-            #     Bounce it to QUEUED instead, passing `live_obj=req` — the
-            #     MergeRequest-for-InflightEntry object swap in `_live_items`,
-            #     not the state change, is what actually clears the phantom
-            #     head (`_finalizing_head_entry` only counts InflightEntry
-            #     values).
-            #
-            # The REQUEUED repair is IDEMPOTENT by guard, and the guard is
-            # load-bearing rather than cosmetic: in the normal case the requeue
-            # site already bounced the registry to QUEUED itself, and an
-            # unconditional call would attempt QUEUED -> QUEUED, which
-            # `_note_transition` rejects — re-firing the very
-            # merge_lifecycle_transition_rejected escalation this task removes.
-            #
-            # This chokepoint is DEFENCE IN DEPTH for a future fifth requeue
-            # branch that forgets the call, NOT a substitute for per-branch
-            # symmetry: every requeue site still owns its own `_note_requeue`
-            # (see `_run_inflight_verify`'s abort branches), and the pairing is
-            # pinned structurally by
-            # test_merge_queue_lifecycle_registry.py::
-            # TestOnRequeuedIsAlwaysPairedWithNoteRequeue.
+            # See this method's docstring, SENTINEL DISPOSITION (task 3082):
+            # deliberately ABOVE the VERIFYING -> FINALIZING hop below, because
+            # a dropped/requeued item is not finalizing; DROPPED -> retire,
+            # REQUEUED -> idempotent bounce to QUEUED, guarded on VERIFYING so a
+            # merger-loop-raced requeue already past QUEUED is left alone.
             if vr is not None and vr.status in (InflightStatus.DROPPED, InflightStatus.REQUEUED):
                 _cancel_release = True
                 _n_failed_val = True  # abandon / operator-halt → chain stale
                 if vr.status == InflightStatus.DROPPED:
                     self._retire_item(req.request_id)
-                elif self._lifecycle.current(req.request_id) not in (
-                    None, ItemLifecycleState.QUEUED,
-                ):
+                elif self._lifecycle.current(req.request_id) == ItemLifecycleState.VERIFYING:
                     self._note_requeue(req.request_id, live_obj=req)
                 return False
 
@@ -15963,32 +15964,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # FINALIZING -> MERGING, FAIL/skip, PASS) already assumes FINALIZING as
             # its from-state.
             #
-            # task 3082 (INVARIANT, and the reason this hop sits HERE rather than
-            # immediately past the await): a DROPPED or REQUEUED item is not
-            # finalizing and must never be recorded as such. This hop therefore
-            # runs AFTER the DROPPED/REQUEUED sentinel check above, so a
-            # dropped/requeued entry never reaches it at all. That is what makes
-            # the requeue-site `_note_requeue` asymmetry harmless in BOTH
-            # directions — measured on the two shapes a requeue can present:
-            #   · registry left at VERIFYING (a requeue site that skipped
-            #     `_note_requeue`): the hop would fire SILENTLY, record the
-            #     requeued item as FINALIZING and swap `_live_items[rid]` to this
-            #     InflightEntry, so `_finalizing_head_entry()` returns a phantom
-            #     head for the rest of the process lifetime.
-            #   · registry already bounced to QUEUED (what every correctly-wired
-            #     requeue site produces): `_advance_if_at` neither fires nor
-            #     tolerates QUEUED, so it falls through to `_note_transition` and
-            #     fires a dedup'd `merge_lifecycle_transition_rejected` L1 on
-            #     EVERY dead-verify no-progress abort — a legitimate, expected,
-            #     recurring event.
-            # Both dispositions of the pre-3082 placement were wrong, so fixing
-            # only one produced the other; keeping the sentinel check above is
-            # correct by construction in both directions and retires the
-            # rejected-transition class here as a side effect.
-            #
-            # SUPERSEDES task 2444's placement, which moved this hop to just past
-            # the `await` — necessary but not sufficient: it must sit after the
-            # SENTINEL CHECK, not merely after the await.
+            # task 3082: this hop sits below the DROPPED/REQUEUED sentinel check
+            # above, not merely past the `await` — see this method's docstring,
+            # SENTINEL DISPOSITION, for why both dispositions of the earlier
+            # placement were wrong.
             #
             # task 2852 (SHARPER RCA mr-99585bb8): routed through _advance_if_at
             # instead of a hardcoded-from_state _note_transition call — a

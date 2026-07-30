@@ -52,6 +52,7 @@ import asyncio
 import logging
 from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -638,11 +639,54 @@ class TestCoalesceNeverResolvesALiveRequestsFuture:
     """
 
     @staticmethod
-    def _drive_live_original(worker: Any, req: MergeRequest) -> None:
-        """Re-drain the SAME object that is already live in the registry."""
+    def _make_real_item(req: MergeRequest, tmp_path: Path) -> Any:
+        """A ``RealMergeItem`` (the ``SpeculativeItem`` shape) wrapping *req*.
+
+        ``merge_result`` is a MagicMock — nothing on this path reads it; only
+        ``item.request`` matters, which is ``_request_of``'s third branch.
+        Mirrors the operator-halt item built in
+        test_merge_queue_lifecycle_registry.py's requeue-pairing test.
+        """
+        from orchestrator.merge_queue import RealMergeItem
+
+        return RealMergeItem(
+            request=req, merge_result=MagicMock(),
+            merge_wt=tmp_path / 'merge_wt', base_sha='deadbeef', speculative=False,
+        )
+
+    @classmethod
+    def _make_inflight_entry(cls, req: MergeRequest, tmp_path: Path) -> Any:
+        """An ``InflightEntry`` wrapping *req* — ``_request_of``'s FIRST branch,
+        and the shape ``_live_items`` actually holds once the item is deepest in
+        the pipeline (post ``_inflight_append``).
+        """
+        from orchestrator.merge_queue import InflightEntry
+        from orchestrator.verify_runner import HostLease
+
+        return InflightEntry(
+            item=cls._make_real_item(req, tmp_path),
+            lease=HostLease(name='local', runner=MagicMock(), is_local=True),
+            verify_task=None,
+            merge_wt=tmp_path / 'merge_wt',
+            was_speculative=False,
+        )
+
+    @staticmethod
+    def _drive_live_original(
+        worker: Any, req: MergeRequest, *, live_obj: Any = None,
+    ) -> None:
+        """Re-drain *req* while it is already live in the registry.
+
+        *live_obj* defaults to *req* itself (the bare ``MergeRequest`` shape).
+        Pass a ``SpeculativeItem``/``InflightEntry`` wrapping the SAME
+        ``MergeRequest`` to exercise the deeper-in-pipeline shapes — the cases
+        an object-identity check would fail open on (amendment review,
+        task 3082).
+        """
         from orchestrator.merge_queue import ItemLifecycleState
 
-        worker._register_item(req, initial=ItemLifecycleState.VERIFYING)
+        worker._register_item(live_obj if live_obj is not None else req,
+                              initial=ItemLifecycleState.VERIFYING)
         worker._buffer_owned_request(req)
 
     async def test_live_original_redrain_does_not_resolve_its_future(
@@ -706,7 +750,10 @@ class TestCoalesceNeverResolvesALiveRequestsFuture:
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ) -> None:
         """Observability must not regress just because the future resolution is
-        suppressed.
+        suppressed — but the ``source`` must DISCRIMINATE this from a benign
+        twin attach, since nothing is actually coalesced here: the request is
+        dropped, its future stays pending, and no outcome will ever arrive
+        (amendment review, task 3082).
         """
         from orchestrator.event_store import EventType
 
@@ -721,7 +768,65 @@ class TestCoalesceNeverResolvesALiveRequestsFuture:
         assert len(coalesced) == 1, (
             f'expected exactly one merge_coalesced event, got: {fake_es.emitted!r}'
         )
-        assert coalesced[0]['data']['source'] == 'duplicate_submission'
+        assert coalesced[0]['data']['source'] == 'live_original_redrain', (
+            f'a wedge must not be countable as a benign duplicate_submission '
+            f'attach: {coalesced[0]["data"]!r}'
+        )
+
+    @pytest.mark.parametrize('shape', ['speculative_item', 'inflight_entry'])
+    async def test_live_original_is_detected_through_every_live_items_shape(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path, shape: str,
+    ) -> None:
+        """The discriminator must hold when ``_live_items`` holds a
+        ``SpeculativeItem`` or an ``InflightEntry`` WRAPPING the same
+        ``MergeRequest`` — not just the bare ``MergeRequest``.
+
+        This is the deepest-in-pipeline case that motivated matching on FUTURE
+        identity rather than object identity: a regression to
+        ``_live_obj is item`` passes every bare-MergeRequest test and fails
+        open exactly here, where the bug actually bites (amendment review,
+        task 3082).  Exercises ``_request_of``'s ``InflightEntry`` and
+        ``obj.request`` branches, which no other test reaches.
+        """
+        from orchestrator.event_store import EventType
+        from orchestrator.merge_queue import ItemLifecycleState
+
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        fake_es = _FakeEventStore()
+        worker = _make_worker(git_ops, escalation_queue=fake_eq, event_store=fake_es)
+        req = _make_request(f'df3082-{shape}', f'df3082-{shape}', tmp_path, config)
+        rid = req.request_id
+        live_obj = (
+            self._make_real_item(req, tmp_path) if shape == 'speculative_item'
+            else self._make_inflight_entry(req, tmp_path)
+        )
+
+        self._drive_live_original(worker, req, live_obj=live_obj)
+
+        assert worker._live_items[rid] is live_obj, (
+            f'precondition: _live_items must hold the wrapping {shape}, not the '
+            f'MergeRequest: {worker._live_items.get(rid)!r}'
+        )
+        assert not req.result.done(), (
+            f'the LIVE original\'s real waiter must not be handed a fabricated '
+            f'outcome when _live_items holds a {shape}: '
+            f'{req.result.result() if req.result.done() else None!r}'
+        )
+        assert not any(req in buf for buf in worker._lane_buffers.values()), (
+            'a re-entrant drain must still not be buffered as a divergent second item'
+        )
+        assert worker._lifecycle.current(rid) == ItemLifecycleState.VERIFYING, (
+            f'the live original\'s registry state must be untouched; reads '
+            f'{worker._lifecycle.current(rid)!r}'
+        )
+        assert [e.category for e in fake_eq.submitted] == ['merge_coalesce_live_original'], (
+            f'the live-original branch must escalate for a wrapping {shape} too: '
+            f'{fake_eq.submitted!r}'
+        )
+        coalesced = [e for e in fake_es.emitted if e['event_type'] == EventType.merge_coalesced]
+        assert [e['data']['source'] for e in coalesced] == ['live_original_redrain'], (
+            f'unexpected merge_coalesced events: {coalesced!r}'
+        )
 
     async def test_coalesced_live_request_still_trips_merge_request_stuck(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,

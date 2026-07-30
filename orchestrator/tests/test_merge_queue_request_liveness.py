@@ -3343,6 +3343,82 @@ class TestDeadVerifyAbortRequeuesIntoTheLiveQueue:
 
 
 # ---------------------------------------------------------------------------
+# Amendment (reviewer_comprehensive, task 3082): the DROPPED sentinel gets the
+# same PER-SITE registry ownership every requeue branch has, so
+# `_finalize_inflight`'s chokepoint disposition is genuine defence in depth for
+# BOTH sentinels rather than the sole owner for one of them.  Without this, any
+# future path consuming a DROPPED result without finalizing would silently
+# re-introduce the `_live_items` residue / phantom-head leak this task fixes.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSoleWaiterAbandonRetiresAtTheSite:
+    """The sole-waiter-gave-up abort (abort trigger 1) must retire the registry
+    entry AT THE SITE — TERMINAL plus the ``_live_items`` pop — not leave the
+    disposition to ``_finalize_inflight``.
+
+    Deliberately independent of ``_finalize_inflight`` (never called here), so
+    per-branch symmetry is pinned on its own — mirroring
+    TestDeadVerifyAbortRequeuesIntoTheLiveQueue::
+    test_trigger3_abort_returns_the_registry_to_queued_at_the_requeue_site.
+    """
+
+    async def test_abandon_abort_retires_the_registry_at_the_requeue_site(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        from orchestrator.merge_queue import (
+            InflightStatus,
+            ItemLifecycleState,
+            SpeculativeMergeWorker,
+        )
+        from orchestrator.verify_runner import HostLease
+
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        req, item = await _make_merged_item(
+            git_ops, config, 'df3082-abandon-retire', 'dar.py', 'a=1\n',
+        )
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q, escalation_queue=fake_eq)
+        worker._register_owned_merge_worktree(item.merge_wt)
+        worker.VERIFY_ABANDON_POLL_SECS = 0.02
+
+        fake_local = MagicMock()
+        fake_local.name = 'local'
+        fake_local.is_local = True
+        lease = HostLease(name='local', runner=fake_local, is_local=True)
+        worker._register_item(req, initial=ItemLifecycleState.VERIFYING)
+        rid = req.request_id
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification', _dead_gate_never_returns,
+        ):
+            verify = asyncio.ensure_future(worker._run_inflight_verify(item, lease))
+            await asyncio.sleep(0.1)  # let the abandon poll loop spin
+            req.result.cancel()       # sole waiter gives up -> _request_abandoned
+            vr = await asyncio.wait_for(verify, timeout=15.0)
+
+        assert vr.status == InflightStatus.DROPPED, (
+            f'a cancelled sole waiter must DROP, got status={vr.status!r}'
+        )
+        current = worker._lifecycle.current(rid)
+        assert current == ItemLifecycleState.TERMINAL, (
+            f'the abandon site must retire the registry entry itself; reads {current!r}'
+        )
+        assert rid not in worker._live_items, (
+            f'dropped entry left in _live_items: {worker._live_items.get(rid)!r}'
+        )
+        assert worker._finalizing_head_entry() is None, (
+            f'a dropped request must never be a finalize head: '
+            f'{worker._finalizing_head_entry()!r}'
+        )
+        assert q.empty(), 'a DROPPED request must NOT be re-queued'
+        assert fake_eq.submitted == [], (
+            f'retiring a dropped request must not escalate: {fake_eq.submitted!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # task 3082 step-9: end-to-end — a dead-verify abort SELF-HEALS, and every
 # user-observable surface tells the truth while it does.
 #

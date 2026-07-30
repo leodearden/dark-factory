@@ -750,9 +750,21 @@ def _attr_calls(node: ast.AST, attr: str) -> list[ast.Call]:
     ]
 
 
-def _first_arg_src(call: ast.Call) -> str:
-    """The source text of *call*'s first positional argument ('' if none)."""
-    return ast.unparse(call.args[0]) if call.args else ''
+def _first_arg_src(call: ast.Call, aliases: dict[str, str] | None = None) -> str:
+    """The source text of *call*'s first positional argument ('' if none).
+
+    A bare ``Name`` argument is resolved through *aliases* (local
+    ``name = <expr>`` bindings) so a cosmetic ``rid = req.request_id`` beside
+    ``self._note_requeue(req.request_id, ...)`` still reads as the same
+    request_id rather than a spurious pairing failure (amendment review,
+    task 3082).
+    """
+    if not call.args:
+        return ''
+    src = ast.unparse(call.args[0])
+    if aliases and isinstance(call.args[0], ast.Name):
+        return aliases.get(src, src)
+    return src
 
 
 @pytest.mark.asyncio
@@ -763,7 +775,7 @@ class TestOnRequeuedIsAlwaysPairedWithNoteRequeue:
     GREEN, requirement 3).
 
     RED until step-6 adds the missing ``_note_requeue`` to the dead-verify
-    no-progress abort. Both tests then read 5/5.
+    no-progress abort.
     """
 
     async def test_every_driven_requeue_moves_ledger_and_registry_together(
@@ -874,16 +886,20 @@ class TestOnRequeuedIsAlwaysPairedWithNoteRequeue:
             )
 
     async def test_every_on_requeued_call_site_has_a_sibling_note_requeue(self) -> None:
-        """STRUCTURAL parity over ALL FIVE sites, via ``ast``.
+        """STRUCTURAL parity over EVERY ``on_requeued`` site, via ``ast``.
 
-        Covers the two sites a unit test cannot easily drive (the head-failure
-        cascade's downstream self-requeue and the pre-dispatch operator halt is
-        driven above, so specifically the cascade path) and fails loudly if a
-        future sixth requeue site forgets the call.
+        Covers the site a unit test cannot easily drive (the head-failure
+        cascade's downstream self-requeue) and fails loudly if a future requeue
+        site forgets the call.
 
         Keys on the enclosing function name and the argument EXPRESSION, never
-        on line numbers (they drift). The pairing must be a sibling in the same
-        statement block — function-level scoping would be too weak, since
+        on line numbers (they drift) and deliberately NOT on the site COUNT
+        (amendment review, task 3082: a count is a number, not an invariant —
+        task 3204's pending extraction of the recipe into one helper will
+        legitimately collapse it). Bare ``Name`` arguments are resolved through
+        their local binding so a cosmetic ``rid = req.request_id`` is not a
+        spurious failure. The pairing must be a sibling in the same statement
+        block — function-level scoping would be too weak, since
         ``_run_inflight_verify`` contains both a correctly-paired requeue
         branch and (before step-6) an unpaired one, both using
         ``req.request_id``.
@@ -913,12 +929,17 @@ class TestOnRequeuedIsAlwaysPairedWithNoteRequeue:
                 cur = parent.get(id(cur))
             return cur
 
+        # Local `name = <expr>` bindings, so a bare Name argument at either call
+        # resolves to the same expression text (amendment review, task 3082).
+        aliases: dict[str, str] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and len(node.targets) == 1:
+                target = node.targets[0]
+                if isinstance(target, ast.Name):
+                    aliases[target.id] = ast.unparse(node.value)
+
         sites = _attr_calls(tree, 'on_requeued')
-        assert len(sites) == 5, (
-            f'expected the 5 known on_requeued call sites in merge_queue.py; '
-            f'found {len(sites)} at lines {[c.lineno for c in sites]} — if a site was '
-            f'added or removed, pair it with _note_requeue and update this count'
-        )
+        assert sites, 'no on_requeued call sites found — the AST walk is mis-wired'
 
         unpaired: list[str] = []
         for call in sites:
@@ -926,9 +947,9 @@ class TestOnRequeuedIsAlwaysPairedWithNoteRequeue:
             assert stmt is not None
             block = owner.get(id(stmt))
             assert block is not None, f'on_requeued at line {call.lineno} has no block'
-            arg = _first_arg_src(call)
+            arg = _first_arg_src(call, aliases)
             siblings = {
-                _first_arg_src(c)
+                _first_arg_src(c, aliases)
                 for sib in block for c in _attr_calls(sib, '_note_requeue')
             }
             if arg not in siblings:
@@ -1959,6 +1980,71 @@ class TestSentinelExitLeavesNoLiveItemsResidue:
         )
         assert not req.result.done(), (
             'a requeued request must be left PENDING for its re-dispatch, not resolved'
+        )
+
+    async def test_correctly_wired_requeue_raced_by_the_drain_is_left_alone(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The chokepoint repair must NOT fire for a requeue that was already
+        wired correctly and then legitimately advanced past QUEUED while
+        ``_finalize_inflight`` was suspended at ``await entry.verify_task``.
+
+        ``_merger_loop``'s speculative look-ahead calls
+        ``_buffer_owned_request`` + ``_drain_queue_into_lanes`` while a
+        predecessor verify is in flight, so the requeued request can already
+        read LANE_BUFFERED by the time finalize resumes.  A merely-not-QUEUED
+        guard would then attempt LANE_BUFFERED -> QUEUED — not a legal edge —
+        and fire the exact ``merge_lifecycle_transition_rejected`` L1 this task
+        retires, on a legitimate, successful re-drain (amendment review,
+        task 3082).
+        """
+        from orchestrator.merge_queue import InflightStatus, ItemLifecycleState
+
+        fake_eq = _FakeEscalationQueue(open_l1=False)
+        worker, req, entry = await _make_verifying_entry_with_sentinel(
+            git_ops, config, 'df3082-requeue-raced', 'df3082_rq.py', 'q = 1\n',
+            escalation_queue=fake_eq, status=InflightStatus.REQUEUED,
+        )
+        rid = req.request_id
+
+        # What the requeue SITE does (correctly wired, post step-6), then what
+        # the merger loop's look-ahead drain does before finalize resumes.
+        worker._queue.put_nowait(req)
+        worker._note_requeue(rid, live_obj=req)
+        assert worker._lifecycle.current(rid) == ItemLifecycleState.QUEUED
+        worker._drain_queue_into_lanes()
+        assert worker._lifecycle.current(rid) == ItemLifecycleState.LANE_BUFFERED, (
+            f'the drain must have buffered the requeued request; registry reads '
+            f'{worker._lifecycle.current(rid)!r}'
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            advanced = await worker._finalize_inflight(entry)
+
+        assert advanced is False, f'a REQUEUED sentinel must not advance main: {advanced!r}'
+        assert _rejected_transition_escalations(fake_eq) == [], (
+            f'a correctly-wired requeue raced past QUEUED by the drain must not '
+            f'fire a rejected-transition escalation: {fake_eq.submitted!r}'
+        )
+        current = worker._lifecycle.current(rid)
+        assert current == ItemLifecycleState.LANE_BUFFERED, (
+            f'the drain\'s legitimate progress must be left untouched; registry '
+            f'reads {current!r}'
+        )
+        assert worker._live_items[rid] is req, (
+            f'_live_items must still hold the MergeRequest the drain buffered: '
+            f'{worker._live_items.get(rid)!r}'
+        )
+        assert worker._finalizing_head_entry() is None, (
+            f'no phantom finalize head may survive: {worker._finalizing_head_entry()!r}'
+        )
+        assert _accretion_warnings(caplog) == [], (
+            f'the at-most-one-mid-finalize accretion WARNING must stay silent: '
+            f'{_accretion_warnings(caplog)!r}'
+        )
+        assert not req.result.done(), (
+            'the buffered request must stay PENDING for its re-dispatch'
         )
 
 
