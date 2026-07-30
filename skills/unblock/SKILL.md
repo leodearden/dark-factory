@@ -271,7 +271,25 @@ The merge procedure is iterative — don't assume one pass will be enough:
 3. Run the project's full verification suite (tests, lint, type-check).
 4. Fix any failures.
 5. On green: rebase on main again — other tasks may have merged while you were fixing.
-6. Repeat steps 3-5 until stable (rebase is clean AND verification passes with no new changes needed).
+6. **Decide whether you must loop back to step 3, or may proceed to step 7.** "Repeat steps 3-5 until rebase is clean AND verify passes" has no termination condition and does not converge on a busy fleet — main can land a commit every few minutes while a full branch verify takes much longer, so "rebase is clean" is rarely durably true. Steps 3-6 actually fuse **two separate decisions** with two separate tests; keep them separate, because step 7's `verified_green` sits downstream of only one of them:
+
+   **D1 — must I rebase and re-verify again?** A file-set intersection is a legitimate terminator:
+   ```
+   git diff <old-main-tip>..<new-main-tip> --name-only   # what landed on main since your last verify
+   git diff main...HEAD --name-only                       # what your branch touches
+   ```
+   **Empty intersection** → you may proceed to step 7 without another loop. **Non-empty** → rebase on the new tip and loop back to step 3.
+
+   Treating an empty intersection as a terminator requires ALL three preconditions to hold:
+   1. You are **re-landing** a branch that already carries a complete, end-to-end-verified implementation. Mid-fix (still iterating on step 4's failures), re-verification is the whole point — this precondition does not hold and D1 is not in play yet.
+   2. The verify you're relying on ran against **the exact tip you're about to submit**, unchanged since.
+   3. The intersection is taken over the **effective gate surface**, not literal path names — a name-only diff is blind to cross-file gate coupling (shared lockfiles, test-selection config, ratcheting baseline manifests). If this project ships a "does this changed-file set require the full gate" oracle, consult it instead of raw name matching (e.g. reify's `scripts/verify-pipeline-guard.sh requires-full-gate`).
+
+   **D2 — may I pass `verified_green=True` in step 7?** A completely different question, and **the D1 intersection is irrelevant to it** — never cite an empty intersection to justify `verified_green=True`. The governing rule is unchanged from below: `True` only if the full-scope verify ran against the exact commit being submitted, *this* iteration. **Satisfying D1 does not satisfy D2.**
+
+   *Why it's safe to shortcut D1 at all:* the merge worker always re-runs its own authoritative full gate against the merged result, regardless of what `verified_green` says. Skipping the local re-verify loop therefore cannot land a red `main` — the cost of being wrong is a wasted queue cycle, not a broken `main`. `verified_green` feeds failure **attribution** (`INTEGRATION_SKEW` vs `BRANCH_BUG`) downstream, never merge admission.
+
+   Do not adopt this D1 shortcut as a blanket replacement for looping 3-5: it applies only when D1's three preconditions hold, and D1 holding never implies D2 holds.
 7. **Invariant:** *Every `merge_request` call passes an explicit bounded `wait_secs`; completion is awaited only via `merge_status` polling.* `queued` or `attached` responses are successful submissions (durable intent), never failures.
 
    Submit to the merge queue with an explicit bounded wait:
@@ -285,9 +303,9 @@ The merge procedure is iterative — don't assume one pass will be enough:
        verified_green=True,
    )
    ```
-   `wait_secs=100` equals the server's `_MAX_WAIT_SECS` clamp ceiling. A fast merge can resolve terminally inside this single bounded call; a backlogged queue returns `queued` or `attached` within ≤100 s. `verified_green=True` vouches that this branch just passed the full verification suite (steps 3–6 above looped until green) — it emits a `workflow_verify` event so a later merge failure caused by an unrelated main landing can be attributed as `INTEGRATION_SKEW` instead of degrading to `INDETERMINATE`.
+   `wait_secs=100` equals the server's `_MAX_WAIT_SECS` clamp ceiling. A fast merge can resolve terminally inside this single bounded call; a backlogged queue returns `queued` or `attached` within ≤100 s. `verified_green=True` is the **D2** vouch from step 6 — it asserts that the full verification suite just passed against the exact commit being submitted, this iteration — it emits a `workflow_verify` event so a later merge failure caused by an unrelated main landing can be attributed as `INTEGRATION_SKEW` instead of degrading to `INDETERMINATE`.
 
-   **Caution — not retractable:** the classifier's green fact is *any-prior-green, keyed by task ID*, not scoped to the specific commit that was verified. Once `verified_green=True` has been emitted once for this task ID, a **later** resubmission for the same task (e.g. another `/unblock` pass after a conflict fix-up you didn't loop steps 3–6 on again) can still inherit that earlier green even though this round wasn't re-verified — a genuine `BRANCH_BUG` could then be misattributed to `INTEGRATION_SKEW`. Only pass `True` when steps 3–6 just passed, in this iteration, on the branch you're submitting now.
+   **Caution — not retractable:** the classifier's green fact is *any-prior-green, keyed by task ID*, not scoped to the specific commit that was verified. Once `verified_green=True` has been emitted once for this task ID, a **later** resubmission for the same task (e.g. another `/unblock` pass after a conflict fix-up you re-verified via step 6's D1 path instead of a fresh full verify) can still inherit that earlier green even though this round wasn't re-verified — a genuine `BRANCH_BUG` could then be misattributed to `INTEGRATION_SKEW`. Only pass `True` when the full verify just passed, in this iteration, on the branch you're submitting now — **D1's empty-intersection terminator never satisfies D2**; they are checked independently every time you reach this step.
 
    **Classify the immediate response** (`merge_request` discriminates on `status`):
 
