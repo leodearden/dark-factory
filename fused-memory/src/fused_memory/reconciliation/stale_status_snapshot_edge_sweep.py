@@ -59,12 +59,21 @@ logger = logging.getLogger(__name__)
 # extract_snapshot_edge_task_ids — pure lexical extraction
 # --------------------------------------------------------------------------- #
 
+# Status markers this sweep treats as non-terminal snapshot assertions.
+# Hoisted into a single constant so the gate (SNAPSHOT_STATUS_RE) and the
+# anchored individual-form regex (INDIVIDUAL_SNAPSHOT_RE) can never drift
+# apart again — before task 3042 they were hand-copied duplicates, and a
+# marker present in one but not the other silently suppressed a whole class
+# of edges (the gate short-circuits below, before the INACTIVE_TASK_STATUSES
+# cross-reference in select_stale_status_snapshot_edges ever runs).
+_STATUS_MARKER_ALT = r'(?:active|pending|blocked|in[-\s]?progress)'
+
 # Gate: a status-snapshot edge must assert one of these non-terminal
 # statuses somewhere in its fact text, else it is not a status-snapshot edge
 # this sweep concerns itself with at all (e.g. 'Task 5 is done' — already
 # terminal at write time, not what this sweep targets).
 SNAPSHOT_STATUS_RE: re.Pattern[str] = re.compile(
-    r'\b(?:active|pending|in[-\s]?progress)\b',
+    r'\b' + _STATUS_MARKER_ALT + r'\b',
     re.IGNORECASE,
 )
 
@@ -100,9 +109,28 @@ COUNT_QUANTITY_RE: re.Pattern[str] = re.compile(
 # an intervening verb like 'landed') allowed in between. Built directly from
 # TASK_REF_RE.pattern (not a hand-copied duplicate) so the two stay in sync
 # if the shared task-reference grammar ever changes.
+#
+# NOTE (amendment, task 3042): two further changes on top of the above.
+# (a) 'blocked' is a non-terminal snapshot status (a blocked task has not
+#     reached a terminal outcome), and its prior absence from
+#     _STATUS_MARKER_ALT made every blocked-worded edge invisible to this
+#     sweep regardless of the referenced task's real status: the gate
+#     (SNAPSHOT_STATUS_RE) short-circuits before the INACTIVE_TASK_STATUSES
+#     cross-reference in select_stale_status_snapshot_edges ever runs.
+# (b) The connective between the task reference and the marker now also
+#     admits the preposition 'in' and the article 'the', in addition to the
+#     existing copula and 'a'/'an' — because the real repro fact 'Task N is
+#     in a blocked status ...' places "in a" between the copula and the
+#     marker. A marker-only fix (just adding 'blocked' to the alternation)
+#     does NOT match that fact: 'in' was not a permitted connective.
+# (c) The precision invariant task 2613 established is unchanged: ONLY
+#     closed-class function words (copula / 'in' / article) may sit between
+#     the reference and the marker — never an open-class verb or noun. So
+#     'Task 142 landed on the blocked branch' still yields set().
 INDIVIDUAL_SNAPSHOT_RE: re.Pattern[str] = re.compile(
     TASK_REF_RE.pattern
-    + r'\s*(?:is|are|was|were)?\s*(?:an?\s+)?(?:active|pending|in[-\s]?progress)\b',
+    + r'\s*(?:is|are|was|were)?\s*(?:in\s+)?(?:an?\s+|the\s+)?'
+    + _STATUS_MARKER_ALT + r'\b',
     re.IGNORECASE,
 )
 
