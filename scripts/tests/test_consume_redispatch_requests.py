@@ -748,3 +748,112 @@ def test_guard_never_issues_a_write(requests_dir):
         client = RecordingClient({5321: _row(status)})
         _confirm(client, req)
         assert client.tools_called == ['get_task'], status
+
+
+# ── step-7: action -> MCP-call mapping ───────────────────────────────────────
+#
+# Asserted on the recorded call SEQUENCE, not on call presence. The
+# clear-claimant-then-flip-to-pending ordering is load-bearing (see
+# orchestrator/src/orchestrator/scheduler.py:5726-5736), and a test that only
+# checked "both calls happened" would pass on the reversed, wrong code.
+
+
+def _apply(client, req, **kw):
+    return crr.apply_request(client, req, REIFY, **kw)
+
+
+def test_close_issues_exactly_one_status_write_and_no_claimant_call(requests_dir):
+    req = _req(requests_dir, 5321, 'gate_closure')
+    client = RecordingClient({5321: _row('blocked')})
+    assert _apply(client, req) is True
+    assert client.calls == [
+        ('set_task_status', {'id': 5321, 'status': 'cancelled',
+                             'project_root': REIFY}),
+    ]
+
+
+@pytest.mark.parametrize('cls', ['unmet_dependency', 'merge_verify_red'])
+def test_redispatch_and_reverify_clear_the_claimant_before_flipping_to_pending(
+        requests_dir, cls):
+    """Ordering is the assertion. Once the row reads `pending` a competing
+    dispatcher may stamp a fresh claimant that a late-landing clear would
+    clobber -- so the clear goes FIRST, while the row is still uncontestable."""
+    req = _req(requests_dir, 5321, cls)
+    client = RecordingClient({5321: _row('blocked')})
+    assert _apply(client, req) is True
+    assert client.tools_called == ['set_task_claimant', 'set_task_status']
+    assert client.calls[0] == ('set_task_claimant', {
+        'id': 5321, 'project_root': REIFY,
+        'claimant_run_id': None, 'heartbeat_at': None})
+    assert client.calls[1] == ('set_task_status', {
+        'id': 5321, 'status': 'pending', 'project_root': REIFY})
+
+
+def test_every_call_targets_reifys_project_root(requests_dir):
+    for cls in CLASS_ACTION:
+        req = _req(requests_dir, 5321, cls)
+        client = RecordingClient({5321: _row('blocked')})
+        _apply(client, req)
+        assert client.calls, cls
+        for _, args in client.calls:
+            assert args['project_root'] == REIFY
+
+
+def test_no_done_provenance_is_ever_sent(requests_dir):
+    """No action targets `done`, so the evidence field that only a done
+    transition needs must never appear on the wire."""
+    for cls in CLASS_ACTION:
+        req = _req(requests_dir, 5321, cls)
+        client = RecordingClient({5321: _row('blocked')})
+        _apply(client, req)
+        for _, args in client.calls:
+            assert 'done_provenance' not in args
+            assert args.get('status') != 'done'
+
+
+def test_a_failed_claimant_clear_aborts_before_the_status_flip(requests_dir):
+    """Flipping to `pending` with a stale claimant still stamped would hand the
+    row to a dispatcher that then reads a live-looking claimant. Abort instead."""
+    req = _req(requests_dir, 5321, 'unmet_dependency')
+    client = RecordingClient({5321: _row('blocked')}, raises_on={'set_task_claimant'})
+    assert _apply(client, req) is False
+    assert client.tools_called == ['set_task_claimant']
+
+
+def test_an_embedded_rejection_on_the_claimant_clear_also_aborts(requests_dir):
+    """fused-memory answers its gates with a 200 carrying success=False rather
+    than raising, so the absence of an exception is not evidence of a write."""
+    req = _req(requests_dir, 5321, 'unmet_dependency')
+    client = RecordingClient({5321: _row('blocked')}, rejects_on={'set_task_claimant'})
+    assert _apply(client, req) is False
+    assert client.tools_called == ['set_task_claimant']
+
+
+@pytest.mark.parametrize('cls', sorted(CLASS_ACTION))
+def test_a_raised_status_write_is_reported_as_failed(requests_dir, cls):
+    req = _req(requests_dir, 5321, cls)
+    client = RecordingClient({5321: _row('blocked')}, raises_on={'set_task_status'})
+    assert _apply(client, req) is False
+
+
+@pytest.mark.parametrize('cls', sorted(CLASS_ACTION))
+def test_an_embedded_rejection_on_the_status_write_is_reported_as_failed(
+        requests_dir, cls):
+    """The definite applied/failed outcome is checked against the RESPONSE, not
+    inferred from the absence of an exception."""
+    req = _req(requests_dir, 5321, cls)
+    client = RecordingClient({5321: _row('blocked')}, rejects_on={'set_task_status'})
+    assert _apply(client, req) is False
+
+
+def test_a_no_op_success_payload_counts_as_applied(requests_dir):
+    """fused-memory returns success=True, no_op=True for a same-status write.
+    That is a success, not a rejection."""
+    req = _req(requests_dir, 5321, 'gate_closure')
+
+    class _NoOpClient(RecordingClient):
+        def _maybe_fail(self, tool):
+            return {'success': True, 'no_op': True, 'task_id': 5321}
+
+    client = _NoOpClient({5321: _row('blocked')})
+    assert _apply(client, req) is True
