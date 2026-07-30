@@ -1,37 +1,62 @@
-"""Route path-scope-guard rejections to the project's escalation queue.
+"""Route path-scope-guard outcomes to the project's escalation queue.
 
-When :mod:`fused_memory.middleware.path_scope_guard` rejects a candidate
-task because it cites paths owned by another project, the structured
-``DarkFactoryPathScopeViolation`` error dict is returned to the caller —
-but historically that's the end of the line.  An MCP caller may or may
-not surface the rejection; an LLM agent may not retry; and the operator
-never sees that a misroute was attempted.
+When :mod:`fused_memory.middleware.path_scope_guard` finds that a candidate
+task cites paths owned by another project, whatever happens next is easy for
+everyone to miss: an MCP caller may or may not surface it; an LLM agent may
+not retry; and the operator never sees that a misroute was attempted.  This
+escalator writes a parallel ``scope_violation`` escalation so the operator's
+queue surfaces the misroute even when the calling agent never reports it.
 
-This escalator writes a parallel ``scope_violation`` escalation alongside
-the rejection so the operator's queue surfaces the misroute even when
-the calling agent never reports it.
+Since task 2206 (commit 0204e25fa5) the guard produces TWO outcomes, and
+:meth:`ScopeViolationEscalator.report_rejection` files an escalation for both
+— the ``advisory=`` keyword selects which one the record describes:
+
+* **FILES-certain rejection** (``advisory=False``) — an exact
+  ``metadata.files`` owner mismatch.  Hard reject: NO task is created and the
+  structured ``DarkFactoryPathScopeViolation`` error dict is returned to the
+  caller.
+* **PROSE-only advisory** (``advisory=True``) — a regex-over-prose heuristic
+  hit with no files-level mismatch.  Nothing is blocked: the task IS created
+  and stamped with ``metadata.possible_scope_mismatch``.
+
+The distinction is load-bearing rather than cosmetic (task 3119): this
+escalation is read by operators and rendered into agent briefings, so an
+advisory described in rejection wording reports that a task was rejected when
+it in fact exists — and tells the reader to resubmit work that already
+landed.  Both outcomes are severity ``info``.
 
 Design mirrors :class:`fused_memory.middleware.curator_escalator.CuratorEscalator`:
 
 * Defensive import of the optional ``escalation`` workspace package.  When
   the package is missing (minimal envs, tests without escalation infra),
-  ``report_rejection`` becomes a logged no-op — the rejection error dict
-  is still returned by the guard, escalation is purely additive.
+  ``report_rejection`` becomes a logged no-op — the guard's own outcome is
+  unaffected (on the FILES-certain path the error dict is still returned;
+  on the advisory path the task is still created and stamped), so
+  escalation is purely additive.
 * Per-project ``EscalationQueue`` cache keyed by ``project_root``.
-* Escalations land in ``{project_root}/data/escalations`` — the *rejecting*
-  project's queue (the place the agent was operating against).  This
-  matches the existing esc-2240-series scope_violation pattern referenced
-  in task 1088.
+* Escalations land in ``{project_root}/data/escalations`` — the *filing*
+  project's queue (the place the agent was operating against), regardless
+  of outcome.  This matches the existing esc-2240-series scope_violation
+  pattern referenced in task 1088.
 
 Burst control: :meth:`report_budget_misconfig` applies a per-project dedup
 window (``_BUDGET_MISCONFIG_DEDUP_WINDOW_SECS``) so a sustained per-call
 budget exhaustion files ONE escalation per window rather than flooding the
-operator queue.  :meth:`report_rejection` folds repeated identical misroutes
-(same rejecting project + matched paths + suggested owner) into a single
-on-disk pending parent via ``escalation.dedupe.submit_or_dedupe`` — the
+operator queue.  :meth:`report_rejection` folds recurring identical events
+(same filing project + matched paths + suggested owner + outcome mode) into a
+single on-disk pending parent via ``escalation.dedupe.submit_or_dedupe`` — the
 first occurrence still escalates, but re-proposals of the same misroute
 (e.g. a daily reconciliation consolidation round) increment the parent's
-``dedupe_count`` instead of filing a fresh escalation (task 2946).
+``dedupe_count`` instead of filing a fresh escalation (task 2946).  The two
+outcome modes fold INDEPENDENTLY so a pending record of one can never absorb
+the other and report it with the wrong outcome.
+
+Note on history: the ~40 pre-existing on-disk ``esc-task-path-guard-*``
+records were all terminal (``dismissed``) when the advisory wording landed,
+and folding only ever targets PENDING parents, so no stale-worded parent can
+capture a future advisory.  They are deliberately NOT rewritten — this
+correction is forward-looking only, and a backfill would rewrite closed
+history in the live escalation store for no operational gain.
 """
 
 from __future__ import annotations
@@ -102,12 +127,17 @@ class ScopeViolationEscalator:
 
     Handles two distinct categories:
 
-    * **scope_violation** (:meth:`report_rejection`) — filed for every rejected
-      task-creation misroute detected by the path-scope guard.  Repeated
-      identical misroutes fold into one pending parent (content-fingerprint
-      dedup, unbounded window); the first occurrence always escalates.
-      Disable via the ``scope_violation_dedupe_enabled=False`` constructor
-      escape hatch to restore legacy one-escalation-per-call behavior.
+    * **scope_violation** (:meth:`report_rejection`) — filed for BOTH
+      task-creation outcomes the path-scope guard produces: a FILES-certain
+      rejection (no task created) and a PROSE-only advisory (task created and
+      stamped with ``metadata.possible_scope_mismatch``).  The ``advisory=``
+      keyword selects which outcome the escalation's wording and
+      ``suggested_action`` describe — see :meth:`report_rejection`.  Recurring
+      identical events fold into one pending parent (content-fingerprint dedup,
+      unbounded window) and the first occurrence always escalates; the two
+      outcome modes fold INDEPENDENTLY of each other.  Disable via the
+      ``scope_violation_dedupe_enabled=False`` constructor escape hatch to
+      restore legacy one-escalation-per-call behavior.
     * **adjudicator_config_defect** (:meth:`report_budget_misconfig`) — filed
       when the path-scope adjudicator's LLM call returns ``error_max_budget_usd``
       with ``cost_usd > 0``, indicating the per-call budget is too low for the
@@ -319,10 +349,12 @@ class ScopeViolationEscalator:
             )
             esc_id = submit_or_dedupe(queue, esc, config)['id']  # type: ignore[possibly-unbound]
         except Exception:
-            # Queue I/O failure must not propagate — the rejection error
-            # dict is still returned by the guard, the operator just
-            # doesn't get the heads-up.  Mirror curator_escalator's
-            # tolerance so a broken filesystem can't break task creation.
+            # Queue I/O failure must not propagate — the guard's own outcome
+            # stands either way (the error dict is still returned on the
+            # FILES-certain path; the task is still created and stamped on the
+            # advisory path), the operator just doesn't get the heads-up.
+            # Mirror curator_escalator's tolerance so a broken filesystem
+            # can't break task creation.
             logger.exception(
                 'scope_violation_escalator: failed to submit escalation '
                 'for project %s (candidate=%r)',
