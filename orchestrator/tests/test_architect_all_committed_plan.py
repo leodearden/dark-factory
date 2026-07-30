@@ -261,3 +261,130 @@ class TestGrantedToolActuallyExists:
         # The granted allowlist name is the mcp__<server>__<tool> spelling of
         # exactly this registered tool.
         assert _MARK_COMMITTED.endswith('__mark_step_committed')
+
+
+# ---------------------------------------------------------------------------
+# step-3 RED: TaskWorkflow._detect_committed_branch_work
+# ---------------------------------------------------------------------------
+#
+# The ARCHITECT-facing counterpart of the implementer-facing
+# _detect_tip_wip_commits (workflow.py:6884). Two filters are deliberately
+# absent, and this class machine-checks that divergence:
+#   - no is_wip_safety_commit filter — an already-committed-green branch is
+#     made of ordinary feat(...)/test(...) commits, which the WIP detector
+#     cannot see at all;
+#   - no dedup against already-`done` steps' recorded commits — an architect
+#     re-authoring the plan needs every branch commit as candidate provenance.
+
+
+@pytest.mark.asyncio
+class TestDetectCommittedBranchWork:
+    async def test_ordinary_commits_are_surfaced_head_first(
+        self, config, git_ops, task_assignment,
+    ):
+        """Two ordinary (non-WIP) commits: both surfaced, HEAD-first."""
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        artifacts.update_base_commit(wt_info.base_commit)
+
+        (wt / 'red.py').write_text('def test_x(): assert False\n')
+        red_sha = await git_ops.commit(wt, 'test: RED — x')
+        (wt / 'impl.py').write_text('x = 1\n')
+        green_sha = await git_ops.commit(wt, 'feat: GREEN — x')
+        assert red_sha and green_sha, 'Setup: expected two real commits'
+
+        result = await workflow._detect_committed_branch_work()
+
+        assert result == [
+            {'sha': green_sha, 'subject': 'feat: GREEN — x'},
+            {'sha': red_sha, 'subject': 'test: RED — x'},
+        ], (
+            'Expected BOTH ordinary commits HEAD-first — unlike '
+            '_detect_tip_wip_commits this detector must not filter on '
+            f'is_wip_safety_commit. Got {result}'
+        )
+
+    async def test_commit_recorded_on_a_done_step_is_still_surfaced(
+        self, config, git_ops, task_assignment,
+    ):
+        """No done-step dedup: the architect needs every branch commit.
+
+        _detect_tip_wip_commits drops a commit already recorded as a done
+        step's ``commit`` (correct for the implementer's attribution loop);
+        the architect is RE-AUTHORING the plan, so the same commit is
+        candidate provenance for a freshly-added step and must still appear.
+        """
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        artifacts.update_base_commit(wt_info.base_commit)
+
+        (wt / 'impl.py').write_text('x = 1\n')
+        sha = await git_ops.commit(wt, 'feat: GREEN — x')
+        assert sha
+
+        workflow.plan = {
+            'task_id': '42',
+            'prerequisites': [],
+            'steps': [{'id': 'step-1', 'status': 'done', 'commit': sha}],
+        }
+
+        result = await workflow._detect_committed_branch_work()
+
+        assert result == [{'sha': sha, 'subject': 'feat: GREEN — x'}]
+
+    async def test_head_at_base_returns_empty(self, config, git_ops, task_assignment):
+        """A truly-fresh first dispatch (HEAD == base_commit) surfaces nothing."""
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        artifacts.update_base_commit(wt_info.base_commit)
+
+        assert await workflow._detect_committed_branch_work() == []
+
+    async def test_unset_base_commit_returns_empty(
+        self, config, git_ops, task_assignment,
+    ):
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        artifacts.update_base_commit('')
+
+        (wt / 'impl.py').write_text('x = 1\n')
+        await git_ops.commit(wt, 'feat: GREEN — x')
+
+        assert await workflow._detect_committed_branch_work() == []
+
+    @pytest.mark.parametrize('missing', ['worktree', 'git_ops', 'artifacts'])
+    async def test_missing_collaborator_returns_empty(
+        self, config, git_ops, task_assignment, missing,
+    ):
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        artifacts.update_base_commit(wt_info.base_commit)
+        (wt / 'impl.py').write_text('x = 1\n')
+        await git_ops.commit(wt, 'feat: GREEN — x')
+
+        setattr(workflow, missing, None)
+
+        assert await workflow._detect_committed_branch_work() == []
+
+    async def test_git_error_returns_empty_and_does_not_raise(
+        self, config, git_ops, task_assignment,
+    ):
+        """Best-effort posture: a false negative must never sink PLAN."""
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        artifacts.update_base_commit(wt_info.base_commit)
+        (wt / 'impl.py').write_text('x = 1\n')
+        await git_ops.commit(wt, 'feat: GREEN — x')
+
+        async def _boom(*_args, **_kwargs):
+            raise RuntimeError('git exploded')
+
+        workflow.git_ops.get_commit_subjects = _boom  # type: ignore[method-assign]
+
+        assert await workflow._detect_committed_branch_work() == []
