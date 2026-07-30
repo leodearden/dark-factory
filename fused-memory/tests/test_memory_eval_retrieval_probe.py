@@ -126,9 +126,11 @@ class TestLoadTopicRegistry:
         assert [p.text for p in entry.phrasings][-1].startswith('freshly authored')
         assert [p.held_out for p in entry.phrasings] == [False, False, True]
         assert entry.claim_queries[0].query == 'sample topic claim'
-        assert entry.claim_queries[0].needles == ['something']
-        assert entry.members == ['b' * 16]
-        assert entry.supersedes_pairs == []
+        # Tuples, not lists: the registry models are frozen dataclasses, so a
+        # loaded entry cannot be mutated out from under a probe mid-run.
+        assert entry.claim_queries[0].needles == ('something',)
+        assert entry.members == ('b' * 16,)
+        assert entry.supersedes_pairs == ()
 
     def test_registry_exposes_topic_lookup(self, tmp_path):
         path = _write_registry(tmp_path, _registry_payload(
