@@ -25,7 +25,11 @@ import sqlite3
 from pathlib import Path
 
 from audit_wiped_metadata_files import (
+    FIDELITY_FILE_LEVEL,
+    FIDELITY_LOCK_LEVEL,
+    PlanFilesRecord,
     TaskRecord,
+    load_plan_files_from_events,
     load_task_records,
 )
 
@@ -284,3 +288,160 @@ def test_load_task_records_coerces_non_string_file_entries(tmp_path):
 def test_load_task_records_on_empty_db_returns_empty_mapping(tmp_path):
     db_path = _make_tasks_db(tmp_path, [])
     assert load_task_records(str(db_path)) == {}
+
+
+# ---------------------------------------------------------------------------
+# load_plan_files_from_events — recover plan scope from durable event payloads.
+#
+# Two event-borne sources, deliberately NOT of equal fidelity:
+#   - phase_skipped.plan_files (workflow.py:4275, :4447) — TRUE file-level
+#     plan.files.
+#   - set_to_plan.files (scheduler.py:6987-6994) — the LOCK-level `needed`
+#     (module) set, explicitly not the file-level persist set
+#     (event_store.py:77-82, scheduler.py:6982-6984).
+# ---------------------------------------------------------------------------
+
+
+def test_load_plan_files_from_events_reads_phase_skipped_as_file_level(tmp_path):
+    """(a) phase_skipped.plan_files is FILE_LEVEL."""
+    db_path = _make_runs_db(
+        tmp_path,
+        [
+            {
+                "event_type": "phase_skipped",
+                "task_id": 2085,
+                "phase": "plan",
+                "data": {
+                    "reason": "revalidation_skipped_no_overlap",
+                    "plan_session_id": "2085-abc",
+                    "plan_files": ["orchestrator/src/orchestrator/workflow.py"],
+                    "main_sha": "deadbeef",
+                },
+            }
+        ],
+    )
+    records = load_plan_files_from_events(str(db_path))
+
+    assert list(records) == ["2085"]
+    record = records["2085"]
+    assert isinstance(record, PlanFilesRecord)
+    assert record.files == ("orchestrator/src/orchestrator/workflow.py",)
+    assert record.source == "phase_skipped_event"
+    assert record.fidelity == FIDELITY_FILE_LEVEL
+
+
+def test_load_plan_files_from_events_reads_set_to_plan_as_lock_level(tmp_path):
+    """(b) set_to_plan.files carries the lock-level `needed` set, so it is
+    tagged LOCK_LEVEL and must never be presented as verbatim plan.files."""
+    db_path = _make_runs_db(
+        tmp_path,
+        [
+            {
+                "event_type": "set_to_plan",
+                "task_id": 2085,
+                "data": {
+                    "files": ["orchestrator", "shared"],
+                    "released": [],
+                    "acquired": ["shared"],
+                    "persisted": True,
+                },
+            }
+        ],
+    )
+    record = load_plan_files_from_events(str(db_path))["2085"]
+
+    assert record.files == ("orchestrator", "shared")
+    assert record.source == "set_to_plan_event"
+    assert record.fidelity == FIDELITY_LOCK_LEVEL
+
+
+def test_load_plan_files_from_events_file_level_beats_lock_level_either_order(tmp_path):
+    """(c) FILE_LEVEL wins regardless of which row has the higher id."""
+    phase_skipped = {
+        "event_type": "phase_skipped",
+        "task_id": 7,
+        "data": {"plan_files": ["a.py"]},
+    }
+    set_to_plan = {
+        "event_type": "set_to_plan",
+        "task_id": 7,
+        "data": {"files": ["orchestrator"]},
+    }
+
+    lock_last = load_plan_files_from_events(
+        str(_make_runs_db(tmp_path, [phase_skipped, set_to_plan], name="a.db"))
+    )
+    file_last = load_plan_files_from_events(
+        str(_make_runs_db(tmp_path, [set_to_plan, phase_skipped], name="b.db"))
+    )
+
+    for records in (lock_last, file_last):
+        assert records["7"].fidelity == FIDELITY_FILE_LEVEL
+        assert records["7"].files == ("a.py",)
+
+
+def test_load_plan_files_from_events_latest_wins_within_one_fidelity_tier(tmp_path):
+    """(d) within one tier the later row (higher id) wins."""
+    db_path = _make_runs_db(
+        tmp_path,
+        [
+            {"event_type": "phase_skipped", "task_id": 7, "data": {"plan_files": ["old.py"]}},
+            {"event_type": "phase_skipped", "task_id": 7, "data": {"plan_files": ["new.py"]}},
+        ],
+    )
+    assert load_plan_files_from_events(str(db_path))["7"].files == ("new.py",)
+
+    lock_db = _make_runs_db(
+        tmp_path,
+        [
+            {"event_type": "set_to_plan", "task_id": 8, "data": {"files": ["old_mod"]}},
+            {"event_type": "set_to_plan", "task_id": 8, "data": {"files": ["new_mod"]}},
+        ],
+        name="lock.db",
+    )
+    assert load_plan_files_from_events(str(lock_db))["8"].files == ("new_mod",)
+
+
+def test_load_plan_files_from_events_skips_every_unusable_row(tmp_path):
+    """(e)(f)(g): missing key, empty list, malformed/NULL data, NULL task_id,
+    and unrelated event types are all skipped without raising."""
+    db_path = _make_runs_db(
+        tmp_path,
+        [
+            # (e) phase_skipped with no plan_files key at all.
+            {"event_type": "phase_skipped", "task_id": 1, "data": {"reason": "x"}},
+            # (e) plan_files present but empty.
+            {"event_type": "phase_skipped", "task_id": 2, "data": {"plan_files": []}},
+            # (e) malformed JSON payload.
+            {"event_type": "phase_skipped", "task_id": 3, "data": "{not json"},
+            # (e) NULL payload.
+            {"event_type": "phase_skipped", "task_id": 4, "data": None},
+            # (e) payload decodes to a non-dict.
+            {"event_type": "set_to_plan", "task_id": 5, "data": "[1,2,3]"},
+            # (e) files is a wrong-typed bare string.
+            {"event_type": "set_to_plan", "task_id": 6, "data": {"files": "orchestrator"}},
+            # (f) NULL task_id.
+            {"event_type": "phase_skipped", "task_id": None, "data": {"plan_files": ["z.py"]}},
+            # (g) an unrelated event type carrying a files key.
+            {"event_type": "merge_finalized", "task_id": 9, "data": {"files": ["q.py"]}},
+            {"event_type": "lock_acquired", "task_id": 10, "data": {"plan_files": ["q.py"]}},
+        ],
+    )
+    assert load_plan_files_from_events(str(db_path)) == {}
+
+
+def test_load_plan_files_from_events_does_not_let_an_empty_later_row_erase_a_hit(tmp_path):
+    """A later row whose list is empty is skipped, not treated as an update
+    that blanks the earlier real signal."""
+    db_path = _make_runs_db(
+        tmp_path,
+        [
+            {"event_type": "phase_skipped", "task_id": 7, "data": {"plan_files": ["real.py"]}},
+            {"event_type": "phase_skipped", "task_id": 7, "data": {"plan_files": []}},
+        ],
+    )
+    assert load_plan_files_from_events(str(db_path))["7"].files == ("real.py",)
+
+
+def test_load_plan_files_from_events_on_empty_db_returns_empty_mapping(tmp_path):
+    assert load_plan_files_from_events(str(_make_runs_db(tmp_path, []))) == {}
