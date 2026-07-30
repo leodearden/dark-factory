@@ -50,6 +50,8 @@ fetch_procedural_memories = _mod.fetch_procedural_memories
 fetch_memories = _mod.fetch_memories
 _ALL_CATEGORIES = _mod._ALL_CATEGORIES
 apply_deletions = _mod.apply_deletions
+resolve_ann_threshold = _mod.resolve_ann_threshold
+fetch_ann_neighbors = _mod.fetch_ann_neighbors
 
 
 # ---------------------------------------------------------------------------
@@ -1594,3 +1596,188 @@ class TestBuildSweepPlanTopicCarveout:
             _topic_memory('m2', _VENV_GOTCHA_B, 'venv'),
         ]
         json.dumps(build_sweep_plan(memories, threshold=_THRESHOLD), default=str)
+
+
+# ===========================================================================
+# Calibrated ANN threshold resolution + the Qdrant query shape (task 3210)
+# ===========================================================================
+
+def _config_double(t_high):
+    """MemoryService double whose config carries a write_triage.t_high."""
+    from unittest.mock import MagicMock  # noqa: PLC0415
+
+    service = MagicMock()
+    service.config.write_triage.t_high = t_high
+    return service
+
+
+class TestResolveAnnThreshold:
+    """The cutoff is READ from the committed calibration output, never invented.
+
+    config.write_triage.t_high is a derived order statistic of a measured
+    similarity distribution (provenance: the calibration report). This script
+    must not carry its own copy or its own fallback — an uncalibrated
+    stand-in would be exactly the invented threshold G6 forbids.
+    """
+
+    def test_reads_t_high_from_config(self):
+        """Point the config at a distinctive value and get that value back.
+
+        Asserting a DISTINCT value (not the real 0.8868...) is the point: it
+        proves the number came from config rather than from a literal that
+        happens to match.
+        """
+        resolved, disclosure = resolve_ann_threshold(_config_double(0.4242424242))
+        assert resolved == 0.4242424242
+        assert disclosure['ann_disabled_uncalibrated'] == 0
+
+    def test_explicit_override_wins(self):
+        resolved, _ = resolve_ann_threshold(_config_double(0.4242424242), override=0.77)
+        assert resolved == 0.77
+
+    def test_override_wins_even_when_uncalibrated(self):
+        """An operator override rescues an uncalibrated deployment."""
+        resolved, disclosure = resolve_ann_threshold(_config_double(None), override=0.77)
+        assert resolved == 0.77
+        assert disclosure['ann_disabled_uncalibrated'] == 0
+
+    def test_uncalibrated_disables_ann_and_counts_it(self, caplog):
+        """No t_high and no override: DISABLE the path, log ERROR, count it.
+
+        Never substitute a plausible-looking number — a wrong cutoff would
+        silently mis-cluster the corpus, and under --apply that means wrong
+        deletions. Disabled-and-counted is the loud degradation.
+        """
+        import logging  # noqa: PLC0415
+
+        with caplog.at_level(logging.ERROR, logger='audit_duplicate_memories'):
+            resolved, disclosure = resolve_ann_threshold(_config_double(None))
+
+        assert resolved is None, 'must not fabricate a threshold'
+        assert disclosure['ann_disabled_uncalibrated'] == 1
+        assert any(r.levelno >= logging.ERROR for r in caplog.records), (
+            'an uncalibrated ANN path must be loud, not silent'
+        )
+
+    def test_non_numeric_t_high_is_treated_as_uncalibrated(self):
+        """A Mock/str/bool leaf must not be accepted as a threshold."""
+        for bad in ('0.9', True, object()):
+            resolved, disclosure = resolve_ann_threshold(_config_double(bad))
+            assert resolved is None, f'{bad!r} must not resolve as a threshold'
+            assert disclosure['ann_disabled_uncalibrated'] == 1
+
+    def test_missing_config_hops_are_survived(self):
+        """A config without write_triage at all degrades, it does not raise."""
+        resolved, disclosure = resolve_ann_threshold(object())
+        assert resolved is None
+        assert disclosure['ann_disabled_uncalibrated'] == 1
+
+
+@pytest.mark.asyncio
+class TestFetchAnnNeighbors:
+    """query_points once per record, using the record's OWN stored vector."""
+
+    def _memory_service(self, query_points):
+        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+
+        client = MagicMock()
+        client.query_points = query_points
+        service = MagicMock()
+        service.config.mem0.collection_prefix = 'mem0'
+        service.mem0._get_async_qdrant = AsyncMock(return_value=client)
+        return service, client
+
+    def _points(self, hits):
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        result = MagicMock()
+        result.points = [
+            MagicMock(id=i, score=s) for i, s in hits
+        ]
+        return result
+
+    async def test_queries_once_per_record_with_its_own_vector(self):
+        from unittest.mock import AsyncMock  # noqa: PLC0415
+
+        query_points = AsyncMock(return_value=self._points([]))
+        service, _client = self._memory_service(query_points)
+        records = [
+            {'id': 'a', 'vector': [0.1, 0.2]},
+            {'id': 'b', 'vector': [0.3, 0.4]},
+        ]
+
+        await fetch_ann_neighbors(
+            service, 'dark_factory', records, top_k=5, score_threshold=0.88,
+        )
+
+        assert query_points.await_count == 2
+        first = query_points.await_args_list[0].kwargs
+        assert first['collection_name'] == 'mem0_dark_factory'
+        assert first['query'] == [0.1, 0.2], (
+            "the query vector must be the record's OWN stored vector — "
+            'no embedding API call at detector runtime'
+        )
+        assert first['limit'] == 6, 'limit is top_k+1 to absorb the self-hit'
+        assert first['score_threshold'] == 0.88
+        assert first['with_payload'] is False
+
+    async def test_self_hit_is_dropped(self):
+        from unittest.mock import AsyncMock  # noqa: PLC0415
+
+        query_points = AsyncMock(return_value=self._points([('a', 1.0), ('b', 0.93)]))
+        service, _client = self._memory_service(query_points)
+        records = [{'id': 'a', 'vector': [0.1]}]
+
+        neighbors, _disclosure = await fetch_ann_neighbors(
+            service, 'dark_factory', records, top_k=5, score_threshold=0.88,
+        )
+
+        assert neighbors['a'] == [{'id': 'b', 'score': 0.93}]
+
+    async def test_vectorless_record_is_not_queried(self):
+        from unittest.mock import AsyncMock  # noqa: PLC0415
+
+        query_points = AsyncMock(return_value=self._points([]))
+        service, _client = self._memory_service(query_points)
+        records = [{'id': 'a', 'vector': None}, {'id': 'b', 'vector': [0.1]}]
+
+        await fetch_ann_neighbors(
+            service, 'dark_factory', records, top_k=5, score_threshold=0.88,
+        )
+
+        assert query_points.await_count == 1, 'a record with no vector cannot be a query point'
+
+    async def test_per_record_failure_is_counted_and_does_not_abort(self):
+        """One bad record must not lose the whole sweep."""
+        from unittest.mock import AsyncMock  # noqa: PLC0415
+
+        async def _side_effect(**kwargs):
+            if kwargs['query'] == [0.1]:
+                raise RuntimeError('Qdrant blew up')
+            return self._points([('c', 0.95)])
+
+        query_points = AsyncMock(side_effect=_side_effect)
+        service, _client = self._memory_service(query_points)
+        records = [{'id': 'a', 'vector': [0.1]}, {'id': 'b', 'vector': [0.2]}]
+
+        neighbors, disclosure = await fetch_ann_neighbors(
+            service, 'dark_factory', records, top_k=5, score_threshold=0.88,
+        )
+
+        assert disclosure['ann_query_errors'] == 1
+        assert 'a' not in neighbors
+        assert neighbors['b'] == [{'id': 'c', 'score': 0.95}], 'the sweep continued'
+
+    async def test_empty_records_makes_no_queries(self):
+        from unittest.mock import AsyncMock  # noqa: PLC0415
+
+        query_points = AsyncMock(return_value=self._points([]))
+        service, _client = self._memory_service(query_points)
+
+        neighbors, disclosure = await fetch_ann_neighbors(
+            service, 'dark_factory', [], top_k=5, score_threshold=0.88,
+        )
+
+        assert query_points.await_count == 0
+        assert neighbors == {}
+        assert disclosure['ann_query_errors'] == 0
