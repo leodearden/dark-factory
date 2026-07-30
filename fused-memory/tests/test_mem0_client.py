@@ -500,7 +500,7 @@ class TestMem0ManagedMetadataKeys:
         assert isinstance(_MEM0_MANAGED_METADATA_KEYS, frozenset), (
             f'expected a frozenset, got {type(_MEM0_MANAGED_METADATA_KEYS).__name__}'
         )
-        assert _MEM0_MANAGED_METADATA_KEYS == {
+        assert set(_MEM0_MANAGED_METADATA_KEYS) == {
             'data', 'hash', 'created_at', 'updated_at',
             'user_id', 'agent_id', 'run_id', 'actor_id', 'role',
         }, f'unexpected membership: {sorted(_MEM0_MANAGED_METADATA_KEYS)}'

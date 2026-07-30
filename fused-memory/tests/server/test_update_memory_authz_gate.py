@@ -238,7 +238,7 @@ class TestDecisionShape:
         decision = resolve_mem0_update_authorization(
             svc, agent_id='rando', content_amend=True, metadata_patch=False,
         )
-        assert 'rando' in decision.error, (
+        assert isinstance(decision.error, str) and 'rando' in decision.error, (
             f'the message must name the rejected agent_id, got {decision.error!r}'
         )
 

@@ -10,8 +10,8 @@ import logging
 import re
 import time
 import uuid as uuid_mod
-from dataclasses import dataclass, field
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
@@ -51,8 +51,8 @@ from fused_memory.reconciliation.standing_decision_writer import (
     expire_entity_standing_decision,
 )
 from fused_memory.routing.classifier import WriteClassifier
-from fused_memory.server.storm_counter import StormCounter
 from fused_memory.routing.router import ReadRouter
+from fused_memory.server.storm_counter import StormCounter
 from fused_memory.services.durable_queue import DurableWriteQueue
 from fused_memory.utils.async_utils import gather_collect, gather_or_raise
 from fused_memory.utils.task_naming import canonicalize_task_node_name

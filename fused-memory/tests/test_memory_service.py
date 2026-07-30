@@ -18,7 +18,6 @@ from fused_memory.services.memory_service import (
     _serialize_temporal,
 )
 
-
 # A realistic stored Qdrant point payload: the mem0-owned keys mem0's own
 # _update_memory recomputes-or-restores, plus this record's CUSTOM provenance
 # keys (the ones a naive content amend silently destroys).
