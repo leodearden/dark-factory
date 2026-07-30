@@ -497,6 +497,91 @@ def test_nextest_filter_ids_empty_input_is_empty_list() -> None:
     assert nextest_filter_ids([]) == []
 
 
+# ---------------------------------------------------------------------------
+# `cargo nextest list --message-format json` planned-set parsing (task 3059).
+#
+# The happy path is driven from CHECKED-IN REAL BYTES
+# (fixtures/reify_verify_retry/nextest-list.json — unmodified cargo-nextest
+# 0.9.136 output), never a hand-written inline copy.  If one of these fails the
+# producer's JSON shape has drifted: RE-CAPTURE the fixture and fix the parser.
+# Do NOT edit the fixture to make the test pass.  See the fixture dir's
+# PROVENANCE.md.
+# ---------------------------------------------------------------------------
+
+_FIXTURE_DIR = Path(__file__).parent / 'fixtures' / 'reify_verify_retry'
+
+
+def test_parse_nextest_list_planned_real_bytes() -> None:
+    """Real cargo-nextest 0.9.136 JSON parses to "<binary-id> <test-name>" ids.
+
+    Asserts against the fixture's OWN self-declared totals rather than a
+    transcribed constant, so a re-capture with a different crate still holds.
+    """
+    import json
+
+    from orchestrator.merge_shadow import parse_nextest_list_planned
+
+    raw = (_FIXTURE_DIR / 'nextest-list.json').read_text()
+    doc = json.loads(raw)
+
+    planned = parse_nextest_list_planned(raw)
+    assert planned is not None
+
+    expected = sorted(
+        f'{suite.get("binary-id")} {case}'
+        for suite in doc['rust-suites'].values()
+        for case in suite['testcases']
+    )
+    assert planned == expected
+    # The document's own test-count corroborates that nothing was dropped.
+    assert len(planned) == doc['test-count']
+    # Ids are in parse_per_test_results' key space: "<binary-id> <test-name>".
+    assert all(' ' in test_id for test_id in planned)
+
+
+def test_parse_nextest_list_planned_unparseable_stdout_is_none() -> None:
+    """Non-JSON stdout -> None (a probe FAILURE, routing to a full verify)."""
+    from orchestrator.merge_shadow import parse_nextest_list_planned
+
+    assert parse_nextest_list_planned('error: no such command: `nextest`') is None
+    assert parse_nextest_list_planned('') is None
+
+
+def test_parse_nextest_list_planned_wrong_shape_is_none() -> None:
+    """Well-formed JSON of the wrong shape -> None, never a silent empty plan."""
+    from orchestrator.merge_shadow import parse_nextest_list_planned
+
+    assert parse_nextest_list_planned('[]') is None  # not an object
+    assert parse_nextest_list_planned('"a string"') is None
+    assert parse_nextest_list_planned('{"test-count": 0}') is None  # no rust-suites
+    assert parse_nextest_list_planned('{"rust-suites": []}') is None  # not an object
+
+
+def test_parse_nextest_list_planned_zero_testcases_is_empty_list() -> None:
+    """A well-formed doc whose suites carry zero testcases -> [], NOT None.
+
+    The None-vs-[] distinction is load-bearing: [] is a genuinely test-free
+    workspace (a real, if unusual, answer), whereas None means "the probe
+    failed, do not narrow anything".
+    """
+    from orchestrator.merge_shadow import parse_nextest_list_planned
+
+    doc = '{"rust-suites": {"crate-a": {"binary-id": "crate-a", "testcases": {}}}}'
+    assert parse_nextest_list_planned(doc) == []
+
+
+def test_parse_nextest_list_planned_missing_binary_id_falls_back_to_key() -> None:
+    """A suite entry missing `binary-id` falls back to the rust-suites map key.
+
+    nextest keys the rust-suites map by the binary id, so the key is the same
+    value and a schema change that drops the field stays parseable.
+    """
+    from orchestrator.merge_shadow import parse_nextest_list_planned
+
+    doc = '{"rust-suites": {"crate-z::lib": {"testcases": {"m::t": {}}}}}'
+    assert parse_nextest_list_planned(doc) == ['crate-z::lib m::t']
+
+
 def test_build_fail_fast_map_marks_cancelled_tests_not_started() -> None:
     """build_fail_fast_map annotates the authoritative plan with attempt-0 verdicts.
 
