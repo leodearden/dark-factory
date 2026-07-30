@@ -392,6 +392,108 @@ def test_mine_to_saturation_storm_batch_never_counts_as_saturated():
 
 
 # ---------------------------------------------------------------------------
+# task 3280 step-1: RED — mine_to_saturation(max_batches=) bounds mining with
+# a DISTINGUISHABLE stop reason. The operator batch cap is enforced inside the
+# mining loop (not by islicing the source) precisely so "capped" can never be
+# confused with "exhausted" — a source that genuinely ran dry and a run the
+# operator bounded are different coverage claims, and conflating them is the
+# silent-cap failure this flag exists to avoid.
+# ---------------------------------------------------------------------------
+
+def _never_saturating_source(n_batches, *, size=4):
+    """A `_TrackingBatchSource` of *n_batches* all-novel batches (dup_rate
+    0.0 every batch, so saturation is never reached) plus the matching
+    `novel_sessions` set — the fixture for testing a stop that can only
+    come from the cap or from exhaustion, never from saturation."""
+    batches = [_batch_digests(size, f"c{i}") for i in range(n_batches)]
+    novel_sessions = {f"c{i}-{j}" for i in range(n_batches) for j in range(size)}
+    return _TrackingBatchSource(batches), novel_sessions
+
+
+def test_mine_to_saturation_stops_at_operator_batch_cap():
+    live_codebook = _minimal_v2_codebook()
+    source, novel_sessions = _never_saturating_source(6)
+    saturation = config_mod.Saturation(dup_rate=0.9, consecutive_batches=2)
+    fake_invoke = _make_fake_invoke(_mining_response_fn(novel_sessions))
+
+    result = mod.mine_to_saturation(
+        source, live_codebook, project="dark_factory", model="sonnet",
+        config=saturation, invoke=fake_invoke, max_batches=2,
+    )
+
+    assert result.stop_reason == "capped", "the cap must be distinguishable from exhaustion"
+    assert len(result.batch_stats) == 2
+    # The whole point of enforcing the cap INSIDE the loop: batches 2..5 were
+    # never even pulled from the source, so no digest was rendered and no
+    # coder.code_digests/LLM call was spent on them.
+    assert source.pulled == [0, 1], "capped-away batches must never be consumed"
+    assert len(result.records) == 8, "records from both mined batches accumulate"
+    assert [s.index for s in result.batch_stats] == [0, 1]
+
+
+def test_mine_to_saturation_cap_not_reached_leaves_stop_reason_unchanged():
+    live_codebook = _minimal_v2_codebook()
+    source, novel_sessions = _never_saturating_source(6)
+    saturation = config_mod.Saturation(dup_rate=0.9, consecutive_batches=2)
+    fake_invoke = _make_fake_invoke(_mining_response_fn(novel_sessions))
+
+    result = mod.mine_to_saturation(
+        source, live_codebook, project="dark_factory", model="sonnet",
+        config=saturation, invoke=fake_invoke, max_batches=99,
+    )
+
+    assert result.stop_reason == "exhausted", "a cap never reached must not relabel the stop"
+    assert source.pulled == [0, 1, 2, 3, 4, 5]
+    assert len(result.batch_stats) == 6
+
+
+def test_mine_to_saturation_saturation_at_the_cap_reports_saturated_not_capped():
+    live_codebook = _minimal_v2_codebook()
+    # batch0 saturates (#1), batch1 saturates (#2 -> stop) AND is exactly the
+    # capped batch. Saturation is the stronger claim (novelty genuinely
+    # exhausted, so coverage was sufficient regardless of the cap), so it is
+    # checked first and must win.
+    batch0 = _batch_digests(10, "b0")  # 1/10 novel -> dup_rate 0.9
+    batch1 = _batch_digests(10, "b1")  # 1/10 novel -> dup_rate 0.9
+    batch2 = _batch_digests(10, "b2")  # must never be pulled
+    source = _TrackingBatchSource([batch0, batch1, batch2])
+    saturation = config_mod.Saturation(dup_rate=0.9, consecutive_batches=2)
+    fake_invoke = _make_fake_invoke(_mining_response_fn({"b0-0", "b1-0"}))
+
+    result = mod.mine_to_saturation(
+        source, live_codebook, project="dark_factory", model="sonnet",
+        config=saturation, invoke=fake_invoke, max_batches=2,
+    )
+
+    assert result.stop_reason == "saturated", (
+        "saturation on exactly the capped batch must report the stronger reason"
+    )
+    assert source.pulled == [0, 1]
+    assert len(result.batch_stats) == 2
+
+
+def test_mine_to_saturation_records_max_batches_on_result():
+    live_codebook = _minimal_v2_codebook()
+    saturation = config_mod.Saturation(dup_rate=0.9, consecutive_batches=2)
+
+    source, novel_sessions = _never_saturating_source(3)
+    capped = mod.mine_to_saturation(
+        source, live_codebook, project="dark_factory", model="sonnet",
+        config=saturation, invoke=_make_fake_invoke(_mining_response_fn(novel_sessions)),
+        max_batches=2,
+    )
+    assert capped.max_batches == 2, "the cap must travel on the result for the report"
+
+    source2, novel_sessions2 = _never_saturating_source(3)
+    flagless = mod.mine_to_saturation(
+        source2, live_codebook, project="dark_factory", model="sonnet",
+        config=saturation, invoke=_make_fake_invoke(_mining_response_fn(novel_sessions2)),
+    )
+    assert flagless.max_batches is None, "no cap passed -> nothing to report"
+    assert flagless.stop_reason == "exhausted"
+
+
+# ---------------------------------------------------------------------------
 # step-5: RED — compute_matrix() / render_matrix() origin x manifestation
 # ---------------------------------------------------------------------------
 
