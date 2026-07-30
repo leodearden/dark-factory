@@ -241,3 +241,165 @@ class TestDecisionShape:
         assert 'rando' in decision.error, (
             f'the message must name the rejected agent_id, got {decision.error!r}'
         )
+
+
+_PROJECT_ID = 'dark_factory'
+_MEMORY_ID = '77a3f6bc-0000-0000-0000-000000000000'
+
+
+def _mock_service(**mem0_update_kwargs):
+    """A mock MemoryService whose mem0_update leaves are REAL config values.
+
+    A bare AsyncMock would make every leaf a Mock, which the fail-closed
+    resolvers reject — so every gate test would pass for the wrong reason.
+    """
+    from unittest.mock import AsyncMock
+
+    mock_service = AsyncMock()
+    mock_service.config.mem0_update = Mem0UpdateConfig(**mem0_update_kwargs)
+    mock_service.update_memory = AsyncMock(return_value={'status': 'updated'})
+    return mock_service
+
+
+async def _call_tool(mock_service, **args):
+    from fused_memory.server.tools import create_mcp_server
+
+    server = create_mcp_server(mock_service)
+    return await server._tool_manager.call_tool('update_memory', {
+        'memory_id': _MEMORY_ID,
+        'store': 'mem0',
+        'project_id': _PROJECT_ID,
+        **args,
+    })
+
+
+class TestUpdateMemoryToolGate:
+    """The gate as wired into the MCP tool — modelled on test_add_system_record_gate.
+
+    Same harness and the same ordering rule: an unauthorized caller is rejected
+    before any other validation work happens on its behalf, and long before any
+    write.
+    """
+
+    @pytest.mark.asyncio
+    async def test_rejects_unlisted_agent_before_any_write(self):
+        mock_service = _mock_service()
+
+        result = await _call_tool(
+            mock_service,
+            content='rewritten', reason='because', agent_id='claude-interactive',
+        )
+
+        assert isinstance(result, dict), f'expected dict, got {type(result)}: {result!r}'
+        assert result.get('error_type') == 'Mem0UpdateNotAuthorized', result
+        assert isinstance(result.get('error'), str) and result['error']
+        mock_service.update_memory.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_arms_are_gated_independently(self):
+        """A wider metadata bar must not become a back door to content amendment."""
+        mock_service = _mock_service(
+            content_amend_allowed_agent_prefixes=['recon-stage-'],
+            metadata_patch_allowed_agent_prefixes=['recon-stage-', 'curator-'],
+        )
+
+        ok = await _call_tool(
+            mock_service, metadata_patch={'topic': 'x'}, agent_id='curator-gate',
+        )
+        assert ok.get('error_type') is None, ok
+        mock_service.update_memory.assert_called_once()
+
+        mock_service.update_memory.reset_mock()
+        denied = await _call_tool(
+            mock_service, content='rewritten', reason='because', agent_id='curator-gate',
+        )
+        assert denied.get('error_type') == 'Mem0UpdateNotAuthorized', denied
+        mock_service.update_memory.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_both_arms_in_one_call_must_clear_both_bars(self):
+        mock_service = _mock_service(
+            content_amend_allowed_agent_prefixes=['recon-stage-'],
+            metadata_patch_allowed_agent_prefixes=['recon-stage-', 'curator-'],
+        )
+
+        result = await _call_tool(
+            mock_service,
+            content='rewritten', reason='because',
+            metadata_patch={'topic': 'x'}, agent_id='curator-gate',
+        )
+
+        assert result.get('error_type') == 'Mem0UpdateNotAuthorized', result
+        mock_service.update_memory.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_gate_fires_before_project_and_store_validation(self):
+        """An unauthorized caller learns nothing about argument validity.
+
+        Mirrors add_system_record's documented ordering rationale: the gate is
+        the whole point of the tool, so rejection precedes any work done on the
+        caller's behalf.
+        """
+        from fused_memory.server.tools import create_mcp_server
+
+        mock_service = _mock_service()
+        server = create_mcp_server(mock_service)
+
+        result = await server._tool_manager.call_tool('update_memory', {
+            'memory_id': _MEMORY_ID,
+            'store': 'not-a-real-store',
+            'project_id': 'no such project!!',
+            'content': 'rewritten',
+            'reason': 'because',
+            'agent_id': 'claude-interactive',
+        })
+
+        assert result.get('error_type') == 'Mem0UpdateNotAuthorized', (
+            f'authz must outrank project/store validation, got: {result!r}'
+        )
+        mock_service.update_memory.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_kill_switch_denies_even_an_allowlisted_agent(self):
+        """One operator knob that reliably stops an in-flight incident."""
+        mock_service = _mock_service(enabled=False)
+
+        result = await _call_tool(
+            mock_service,
+            content='rewritten', reason='because',
+            agent_id='recon-stage-memory_consolidator',
+        )
+
+        assert result.get('error_type') == 'Mem0UpdateToolDisabled', result
+        mock_service.update_memory.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('args', [
+        {'content': 'rewritten', 'reason': 'consolidation'},
+        {'metadata_patch': {'topic': 'docs-prd-landing'}},
+    ], ids=['content_arm', 'metadata_arm'])
+    async def test_recon_stage_agent_passes_out_of_the_box(self, args):
+        """The task's stated minimum bar: no operator config required."""
+        mock_service = _mock_service()
+
+        result = await _call_tool(
+            mock_service, agent_id='recon-stage-memory_consolidator', **args,
+        )
+
+        assert result.get('error_type') is None, result
+        mock_service.update_memory.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_graphiti_store_is_rejected_naming_update_edge(self):
+        """No silent fan-out: a wrong store is an actionable error, not a guess."""
+        mock_service = _mock_service()
+
+        result = await _call_tool(
+            mock_service, store='graphiti',
+            content='rewritten', reason='because',
+            agent_id='recon-stage-memory_consolidator',
+        )
+
+        assert result.get('error_type') == 'ValidationError', result
+        assert 'update_edge' in result.get('error', ''), result
+        mock_service.update_memory.assert_not_called()
