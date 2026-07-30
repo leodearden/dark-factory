@@ -3563,6 +3563,7 @@ class MemoryService:
         agent_id: str | None = None,
         session_id: str | None = None,
         causation_id: str | None = None,
+        emit_event: bool = False,
         _source: str = 'mcp_tool',
     ) -> dict:
         """Amend a Mem0 record's content and/or patch its metadata IN PLACE.
@@ -3582,6 +3583,13 @@ class MemoryService:
         ...}`` envelope on success, or a structured ``{'error_type': ...}``
         rejection. The id is echoed so a caller can assert identity stability
         straight from the response instead of re-fetching.
+
+        *emit_event* forces a ``memory_updated`` event on a metadata-only route,
+        which is otherwise silent (a patch leaves the record saying the same
+        thing). It is deliberately INTERNAL: no MCP-level argument surfaces it
+        in this ship, because no concrete consumer needs it yet and an
+        unexercised knob on the event channel is one more thing to get wrong.
+        A content amend always emits, flag or not.
         """
         write_op_id = str(uuid_mod.uuid4())
 
@@ -3664,14 +3672,57 @@ class MemoryService:
                 result['store'] = 'mem0'
                 result['id'] = memory_id
         else:
-            # Metadata-only fast paths (steps 17-18) and the combined fold
-            # (steps 19-20).
-            raise NotImplementedError(
-                'update_memory metadata-only arm dispatch is not implemented yet '
-                f'(memory_id={memory_id!r}, metadata_patch={metadata_patch!r}, '
-                f'metadata_delete_keys={metadata_delete_keys!r}, '
-                f'existing_custom_keys={sorted(existing_custom)})'
+            # Metadata-only arm — §5(b)'s decision table. Deliberately routes
+            # AROUND mem0's Memory.update, which would re-embed the content,
+            # rewrite updated_at and append a history row for what may be a
+            # purely cosmetic tag.
+            #
+            # The three primitives are not interchangeable: set_payload and
+            # delete_payload are native PARTIAL operations, so the new payload
+            # need not be computed from the old one; overwrite_payload replaces
+            # the ENTIRE point payload and therefore requires the mem0-owned
+            # subset re-attached underneath, or the point loses its own
+            # data/hash/created_at and becomes unreadable by mem0's get/search.
+            wants_replace = metadata_mode == 'replace'
+            if (metadata_patch and metadata_delete_keys) or wants_replace:
+                # One read-modify-overwrite_payload write. Chosen over
+                # set_payload-then-delete_payload because two round-trips have
+                # no ordering guarantee, no atomicity and no rollback: a failed
+                # second call leaves the record half-patched while the journal
+                # row claims the whole edit landed.
+                new_custom = {} if wants_replace else dict(existing_custom)
+                new_custom.update(metadata_patch or {})
+                for key in metadata_delete_keys or ():
+                    new_custom.pop(key, None)
+                new_payload = {**_managed, **new_custom}
+                operation = 'update_memory_overwrite_payload'
+                coro = self.mem0.overwrite_payload(memory_id, new_payload, scope)
+            elif metadata_patch:
+                # Qdrant merges server-side, so unlisted pre-existing keys
+                # survive without this layer reconstructing the whole payload.
+                operation = 'update_memory_set_payload'
+                coro = self.mem0.set_payload(memory_id, dict(metadata_patch), scope)
+            else:
+                operation = 'update_memory_delete_payload'
+                coro = self.mem0.delete_payload(
+                    memory_id, list(metadata_delete_keys or ()), scope,
+                )
+
+            await self._journaled_backend_call(
+                write_op_id=write_op_id,
+                causation_id=causation_id,
+                backend='mem0',
+                operation=operation,
+                payload=params,
+                coro=coro,
             )
+            result = {
+                'status': 'updated',
+                'store': 'mem0',
+                'id': memory_id,
+                'content_amended': False,
+                'metadata_patched': True,
+            }
 
         if self._write_journal:
             await self._write_journal.log_write_op(
@@ -3687,14 +3738,20 @@ class MemoryService:
                 success=True,
             )
 
-        await self._emit_event(ReconciliationEvent(
-            id=str(uuid_mod.uuid4()),
-            type=EventType.memory_updated,
-            source=EventSource.agent,
-            project_id=project_id,
-            timestamp=datetime.now(UTC),
-            payload={'memory_id': memory_id, 'store': 'mem0'},
-        ))
+        # Event on the content arm always; on a metadata-only route only when a
+        # caller explicitly opts in. A metadata patch leaves the record saying
+        # exactly what it said before, so there is nothing for a downstream
+        # consolidator to re-read — announcing it would be noise on a channel
+        # whose consumers act on changed CONTENT.
+        if content is not None or emit_event:
+            await self._emit_event(ReconciliationEvent(
+                id=str(uuid_mod.uuid4()),
+                type=EventType.memory_updated,
+                source=EventSource.agent,
+                project_id=project_id,
+                timestamp=datetime.now(UTC),
+                payload={'memory_id': memory_id, 'store': 'mem0'},
+            ))
 
         return result
 
