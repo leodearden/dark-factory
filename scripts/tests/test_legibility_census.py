@@ -1117,6 +1117,34 @@ def test_render_report_no_cap_renders_no_coverage_line():
     assert "partial" not in lowered
 
 
+def test_render_report_verify_cap_states_verified_of_novel_and_deferred():
+    report = _render(
+        verify_coverage=mod.VerifyCoverage(novel=812, verified=150, cap=150),
+    )
+
+    assert "## Verification" in report
+    section = report.split("## Verification", 1)[1].split("##", 1)[0]
+    assert "150" in section
+    assert "812" in section
+    assert "662" in section, "the deferred remainder must be stated, not left to arithmetic"
+    lowered = section.lower()
+    assert "verified 150 of 812" in lowered
+    # Deferred means "not yet adjudicated", never "dropped": the deferred
+    # clusters still merged into the codebook as pending candidates.
+    assert "pending candidate" in lowered
+    assert "deferred" in lowered
+    assert "dropped" not in lowered
+
+    # Placement: between Saturation and the matrix.
+    assert report.index("## Saturation") < report.index("## Verification")
+    assert report.index("## Verification") < report.index("## Origin x Manifestation Matrix")
+
+
+def test_render_report_without_verify_coverage_renders_no_verification_section():
+    assert "## Verification" not in _render()
+    assert "## Verification" not in _render(verify_coverage=None)
+
+
 def test_render_report_flagless_output_is_byte_identical_golden():
     report = mod.render_report(
         date="2026-07-14",
