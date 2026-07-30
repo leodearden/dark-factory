@@ -10682,17 +10682,24 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             timeouts.steward + steward_completion_timeout
 
         refreshed for as long as the steward is observably working (its
-        ``metrics.invocations`` advancing — see
-        :meth:`_steward_progress_counter`), so it trips ONLY on a genuinely
-        SILENT producer.  Both terms are what they are for a reason, and the
-        refresh is what makes the "future producer bug" framing below true
-        rather than aspirational:
+        progress counter advancing — see :meth:`_steward_progress_counter`), so
+        it trips ONLY on a genuinely SILENT producer.  Both terms are what they
+        are for a reason, and the refresh is what makes the "future producer
+        bug" framing below true rather than aspirational:
 
-        - ``timeouts.steward`` is the ENFORCED per-invocation ceiling — the
-          longest a healthy steward can legitimately be silent, since past it
-          ``invoke_agent`` itself SIGTERM/SIGKILLs the process group
-          (cli_invoke.py:2184-2206).  Any window shorter than it is guaranteed
-          to fire on healthy stewards.
+        - ``timeouts.steward`` is the ENFORCED per-SUBPROCESS ceiling — the
+          longest a healthy steward can be silent WITHIN one agent subprocess,
+          since past it ``invoke_agent`` itself SIGTERM/SIGKILLs the process
+          group (cli_invoke.py:2184-2206).  Any window shorter than it is
+          guaranteed to fire on healthy stewards.  It is emphatically NOT a
+          bound on one ``_invoke_with_session`` call: that delegates to
+          ``invoke_with_cap_retry``, which may run up to 16 subprocesses with
+          cap cooldowns between them behind a single return, so the progress
+          signal MUST tick per subprocess attempt rather than per completed
+          invocation — which is exactly what ``metrics.subprocess_attempts``
+          does (review fix D4).  Without that tick, an all-accounts-capped
+          steward reads as silent for hours and this backstop kills a working
+          producer.
         - ``steward_completion_timeout`` is kept in its DOCUMENTED role
           (config.py:211-222 — the post-invocation drain grace) as the slack
           for the steward to publish/dismiss after its invocation returns or
@@ -10777,14 +10784,18 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # for the disposition.  Both terms are load-bearing, neither is
         # arbitrary:
         #
-        #   timeouts.steward             the ENFORCED per-invocation ceiling —
-        #                                the longest a HEALTHY steward can
-        #                                legitimately be silent, since past it
-        #                                invoke_agent itself SIGTERM/SIGKILLs
-        #                                the process group (cli_invoke.py:
-        #                                2184-2206).  Any window shorter than
-        #                                this is guaranteed to fire on healthy
-        #                                stewards.
+        #   timeouts.steward             the ENFORCED per-SUBPROCESS ceiling —
+        #                                the longest a HEALTHY steward can be
+        #                                silent within ONE agent subprocess,
+        #                                since past it invoke_agent itself
+        #                                SIGTERM/SIGKILLs the process group
+        #                                (cli_invoke.py:2184-2206).  Any window
+        #                                shorter than this is guaranteed to fire
+        #                                on healthy stewards.  Cap-retry
+        #                                cooldowns stack MORE subprocesses
+        #                                behind one _invoke_with_session call;
+        #                                the per-attempt progress tick (review
+        #                                fix D4) is what keeps them visible.
         #   steward_completion_timeout   kept in its DOCUMENTED role
         #                                (config.py:211-222, the post-invocation
         #                                drain grace) as the slack for the
@@ -10806,6 +10817,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # record (steward.py:399-412) — and refreshing on the counter bounds
         # each legitimate retry by its own window without hard-coding the
         # steward_max_attempts + steward_max_timeouts_per_escalation multiplier.
+        # The same argument covers the cap-retry tail (review fix D4): the
+        # counter ticks per SUBPROCESS attempt, so an all-accounts-capped
+        # steward waiting out cooldowns keeps refreshing instead of being
+        # mistaken for a dead producer and killed mid-work.
         window = self.config.timeouts.steward + self.config.steward_completion_timeout
         deadline = asyncio.get_event_loop().time() + window
         last_progress = self._steward_progress_counter()
@@ -13351,21 +13366,43 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         """Monotonic "the steward is still working" signal, or ``None`` when no
         signal is available (task 3170, review fix D2).
 
-        Reads the public ``TaskSteward.metrics.invocations`` counter, which
-        increments after EVERY invocation returns (steward.py:597, and :948 on
-        the auto-escalate path) — so it advances once per completed invocation
-        including each timeout-kill retry.  That is exactly the "one more
-        invocation ceiling legitimately consumed" event
-        :meth:`_wait_for_resolution` needs in order to extend its idle window
-        without hard-coding the ``steward_max_attempts +
-        steward_max_timeouts_per_escalation`` multiplier.
+        Sums two public ``TaskSteward.metrics`` counters, because neither alone
+        covers the whole of "the steward is alive":
+
+        - ``invocations`` increments after EVERY invocation returns
+          (steward.py:597, and on the pre-triage path) — one tick per completed
+          invocation, including each timeout-kill retry.  That is the "one more
+          invocation ceiling legitimately consumed" event
+          :meth:`_wait_for_resolution` needs in order to extend its idle window
+          without hard-coding the ``steward_max_attempts +
+          steward_max_timeouts_per_escalation`` multiplier.
+        - ``subprocess_attempts`` increments at the START of every agent
+          subprocess attempt (``TaskSteward._invoke_agent_counted``, task 3170
+          review fix D4).  This is load-bearing, not redundant:
+          ``_invoke_with_session`` delegates to ``invoke_with_cap_retry``, which
+          runs up to ``_MAX_CAP_RETRIES`` (16) subprocess attempts behind ONE
+          return, sleeping a cap cooldown (<= 300s, cli_invoke.py:1295/1367)
+          between them while it waits for a usage-cap reset.  ``invocations``
+          cannot move during that window, so an all-accounts-capped steward — a
+          routine, designed-for condition — would read as SILENT for as long as
+          the retry loop is patient, and the waiter would kill a healthy steward
+          mid-work.  Ticking per ATTEMPT caps the longest legitimate silence at
+          one cooldown plus one enforced ``timeouts.steward`` ceiling, which
+          fits inside the waiter's window.
+
+        Both counters are monotonically non-decreasing, so their sum is too —
+        which is all the caller's ``progress > last_progress`` comparison
+        requires.  The absolute value is meaningless; only its movement is read.
 
         Read through a defensive ``getattr`` chain: no steward, no ``metrics``,
-        or a non-``int`` all mean "no progress signal available" and return
-        ``None``, which degrades the caller to a plain fixed deadline rather
-        than breaking it.  ``bool`` is excluded explicitly — it is an ``int``
-        subclass, and a truthy flag masquerading as a counter would read as
-        progress exactly once and never again.
+        or NEITHER counter present as an ``int`` all mean "no progress signal
+        available" and return ``None``, which degrades the caller to a plain
+        fixed deadline rather than breaking it.  A counter that is present but
+        not a usable ``int`` contributes 0 rather than poisoning the other
+        (older fakes and hand-rolled test doubles expose only ``invocations``,
+        and must keep working).  ``bool`` is excluded explicitly — it is an
+        ``int`` subclass, and a truthy flag masquerading as a counter would read
+        as progress exactly once and never again.
         """
         steward = self._steward
         if steward is None:
@@ -13373,10 +13410,13 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         metrics = getattr(steward, 'metrics', None)
         if metrics is None:
             return None
-        value = getattr(metrics, 'invocations', None)
-        if isinstance(value, bool) or not isinstance(value, int):
-            return None
-        return value
+        total: int | None = None
+        for name in ('invocations', 'subprocess_attempts'):
+            value = getattr(metrics, name, None)
+            if isinstance(value, bool) or not isinstance(value, int):
+                continue
+            total = value if total is None else total + value
+        return total
 
     def _drain_steward_outcomes(self) -> StewardOutcome | None:
         """Non-blockingly empty the steward outcome channel and LOG what was

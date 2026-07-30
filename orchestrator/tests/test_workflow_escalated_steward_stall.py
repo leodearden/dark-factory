@@ -1028,6 +1028,7 @@ def _make_progressing_steward(
     ticks: int,
     markers: list[str],
     advance: bool = True,
+    counter: str = 'invocations',
     resolved_by: str = 'steward-auto-dismissed',
 ) -> type:
     """A steward that publishes an observable liveness signal while it works.
@@ -1049,11 +1050,19 @@ def _make_progressing_steward(
     producer the backstop exists for, and it must still be given up on —
     otherwise "refresh on progress" would be trivially satisfiable by never
     expiring at all.
+
+    *counter* selects WHICH of the real ``StewardMetrics`` liveness fields
+    advances.  ``'subprocess_attempts'`` models the all-accounts-capped steward
+    (task 3170, review fix D4): ``invocations`` stays frozen for the whole
+    cap-retry loop — potentially hours — while each subprocess attempt still
+    ticks.  Both fields are always exposed, matching the real dataclass, so the
+    two variants differ only in which one moves.
     """
 
     class _Metrics:
         def __init__(self) -> None:
             self.invocations = 0
+            self.subprocess_attempts = 0
 
     class _FakeSteward:
         def __init__(self, wt_path, cfg_dir):  # noqa: ARG002
@@ -1073,7 +1082,10 @@ def _make_progressing_steward(
             for _ in range(ticks):
                 await asyncio.sleep(tick)
                 if advance:
-                    self.metrics.invocations += 1
+                    setattr(
+                        self.metrics, counter,
+                        getattr(self.metrics, counter) + 1,
+                    )
             for esc in queue.get_by_task(task_id, status='pending', level=0):
                 queue.resolve(
                     esc.id,
@@ -1161,6 +1173,68 @@ class TestObservableProgressRefreshesTheWait:
         # stops the steward once on the way out, so ORDER is the property.
         assert markers.index('implementer-resumed') < markers.index('steward-stop'), (
             f'the give-up path must not have stopped the steward; markers={markers}'
+        )
+
+    async def test_a_cap_waiting_steward_is_not_mistaken_for_a_silent_one(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """Fix D4: ``invocations`` frozen + ``subprocess_attempts`` advancing.
+
+        This is the all-accounts-capped window, which is a routine designed-for
+        condition in this system, not an exotic one.  ``_invoke_with_session``
+        delegates to ``invoke_with_cap_retry``, which runs up to 16 subprocess
+        attempts with cooldowns between them behind ONE return — and
+        ``metrics.invocations`` is bumped only after that return (steward.py:597).
+        So a perfectly healthy steward patiently waiting out a cap shows a FROZEN
+        ``invocations`` for the whole wait.
+
+        If the waiter's progress signal reads ``invocations`` alone, it fires on
+        that steward: ``stop()`` cancels the loop and kills the in-flight agent's
+        process group, the L0 is dismissed, and the implementer resumes into the
+        same cap.  That is exactly the outcome fix D2 says must happen ONLY on a
+        genuinely SILENT producer, so the per-attempt counter has to count.
+        """
+        local_config = _short_window_config(config, completion=0.2, invocation=0.3)
+        wt = await _make_advanced_worktree(git_ops, task_assignment.task_id)
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _submit_l0(queue, task_assignment.task_id)
+        store = _RecordingEventStore()
+        workflow, _scheduler = _build_workflow(
+            local_config, git_ops, task_assignment, queue, wt, event_store=store,
+        )
+        _wire_resolve_callback(queue, workflow)
+        markers: list[str] = []
+        workflow._steward_factory = _make_progressing_steward(
+            queue, task_assignment.task_id, tick=0.3, ticks=4, markers=markers,
+            counter='subprocess_attempts',
+        )
+        evrl_mock, _state = _make_evrl_returner(
+            [WorkflowOutcome.ESCALATED, WorkflowOutcome.DONE],
+        )
+        workflow._execute_verify_review_loop = evrl_mock  # type: ignore[method-assign]
+        workflow._invoke = _make_marking_invoke(markers)  # type: ignore[method-assign]
+
+        await asyncio.wait_for(workflow.run(), 10)
+
+        window = (
+            local_config.timeouts.steward + local_config.steward_completion_timeout
+        )
+        archived = queue.get(esc.id)
+        assert archived is not None, 'the record must still be readable'
+        assert archived.resolved_by == 'steward-auto-dismissed', (
+            f'the steward ticked metrics.subprocess_attempts every 0.3s for '
+            f'~1.2s — more than two full {window:.1f}s windows of visible '
+            f'cap-retry progress — with metrics.invocations frozen throughout, '
+            f'exactly as an all-accounts-capped steward looks.  '
+            f'resolved_by={archived.resolved_by!r} means the backstop fired on '
+            f'a working producer'
+        )
+        assert _steward_wait_timeouts(store) == [], (
+            'a steward waiting out a usage cap is not a silent producer'
+        )
+        assert 'steward-stop' not in markers[:markers.index('implementer-resumed')], (
+            f'the give-up path must not have killed the cap-waiting steward '
+            f'mid-work; markers={markers}'
         )
 
     async def test_a_never_advancing_counter_is_still_given_up_on(

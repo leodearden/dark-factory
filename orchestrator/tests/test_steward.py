@@ -419,7 +419,6 @@ class TestStewardInvokeWithCapRetryWiring:
         self, steward, worktree, mock_mcp, mock_config,
     ):
         """No prior session: resume_session_id must be absent from the call."""
-        from orchestrator.agents.invoke import invoke_agent
         from orchestrator.agents.roles import STEWARD
         from orchestrator.steward import _MAX_CAP_RETRIES
 
@@ -440,7 +439,12 @@ class TestStewardInvokeWithCapRetryWiring:
 
         mock_iwcr.assert_awaited_once()
         kwargs = mock_iwcr.call_args.kwargs
-        assert kwargs['invoke_fn'] is invoke_agent
+        # The counting shim, not invoke_agent directly (task 3170 fix D4): it
+        # ticks metrics.subprocess_attempts per subprocess attempt so cap-retry
+        # cooldowns stay visible to the ESCALATED waiter, then forwards verbatim
+        # to invoke_agent.  The forwarding + per-attempt tick are covered by
+        # TestStewardCapHitBackoff against the real cap-retry loop.
+        assert kwargs['invoke_fn'] == steward._invoke_agent_counted
         assert kwargs['max_cap_retries'] == _MAX_CAP_RETRIES
         assert kwargs['backend'] == 'claude'
         assert kwargs['config_dir'] == steward._config_dir
@@ -701,6 +705,52 @@ class TestStewardCapHitBackoff:
             mock_sleep.assert_awaited_once_with(_CAP_HIT_COOLDOWN_SECS)
             assert mock_invoke.call_count == 2
             assert steward._session_id == 'sess-new'
+
+    async def test_cap_retries_tick_the_subprocess_liveness_counter(
+        self, steward, mock_briefing,
+    ):
+        """Task 3170 review fix D4: cap-retry attempts must be OBSERVABLE.
+
+        ``metrics.invocations`` is bumped once per ``_invoke_with_session``
+        return — i.e. once for the WHOLE ``invoke_with_cap_retry`` loop, however
+        many subprocesses and cap cooldowns that loop consumed.  A steward
+        waiting out an all-accounts-capped window is therefore invisible on that
+        counter alone, and ``TaskWorkflow._wait_for_resolution``'s idle window
+        would expire on a HEALTHY producer and kill its agent mid-work.
+
+        ``metrics.subprocess_attempts`` is the per-attempt tick that closes it:
+        with two cap hits before success, it must read 3 while ``invocations``
+        reads 1.  Asserting BOTH is the point — an implementation that merely
+        bumped ``invocations`` more often would break every consumer that reads
+        it as an invocation count.
+        """
+        esc = _make_escalation()
+        steward.escalation_queue.get.return_value = _make_escalation(
+            status='resolved', resolution='fixed',
+        )
+        steward.usage_gate = _make_pre_triage_gate(cap_effects=[True, True, False])
+
+        with (
+            patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke,
+            patch('asyncio.sleep', new_callable=AsyncMock),
+        ):
+            mock_invoke.return_value = _make_result(session_id='sess-new')
+            await steward._handle_escalation(esc)
+
+        assert mock_invoke.call_count == 3, (
+            'precondition: two cap hits then success = three subprocess attempts'
+        )
+        assert steward.metrics.subprocess_attempts == 3, (
+            f'every subprocess attempt inside the cap-retry loop must tick the '
+            f'liveness counter, otherwise a capped-but-healthy steward reads as '
+            f'silent to the ESCALATED waiter; '
+            f'got {steward.metrics.subprocess_attempts}'
+        )
+        assert steward.metrics.invocations == 1, (
+            f'invocations must keep meaning "completed invocations" — the new '
+            f'signal is a separate counter, not a redefinition; '
+            f'got {steward.metrics.invocations}'
+        )
 
     async def test_preserves_session_on_cap_hit(self, steward, mock_briefing):
         """Cap hit with session_id → session preserved, resume on next account."""

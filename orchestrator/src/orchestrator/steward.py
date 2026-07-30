@@ -100,6 +100,16 @@ class StewardMetrics:
     escalations_reescalated: int = 0
     timeouts_recovered: int = 0
     empty_outputs_recovered: int = 0
+    # Subprocess-level liveness counter (task 3170, review fix D4).  Bumped at
+    # the START of every agent subprocess attempt — including each cap-hit
+    # failover retry INSIDE one `invoke_with_cap_retry` call, which `invocations`
+    # cannot see because that counter is bumped only after the whole retry loop
+    # returns (:597).  Under an all-accounts-capped window the retry loop sleeps
+    # a cooldown (<= _MAX_CAP_COOLDOWN_SECS, 300s) between attempts and can span
+    # hours, so `invocations` alone reads a perfectly HEALTHY steward as silent.
+    # See TaskWorkflow._steward_progress_counter, whose idle-window refresh
+    # consumes this.
+    subprocess_attempts: int = 0
 
 
 class TaskSteward:
@@ -690,6 +700,35 @@ class TaskSteward:
     # Session-aware invocation with cap-hit recovery
     # ------------------------------------------------------------------
 
+    async def _invoke_agent_counted(self, **kwargs):
+        """``invoke_fn`` shim that records a subprocess-level liveness tick.
+
+        Task 3170, review fix D4.  ``metrics.invocations`` is bumped only after
+        :meth:`_invoke_with_session` returns (:597), i.e. after the WHOLE
+        ``invoke_with_cap_retry`` loop finishes.  That loop legitimately runs up
+        to ``_MAX_CAP_RETRIES`` (16) subprocess attempts behind that single
+        return, sleeping an exponential cooldown (capped at 300s) between them
+        while it waits for a usage-cap reset — a routine, designed-for condition
+        here.  A steward parked in that wait is HEALTHY but invisible to
+        ``invocations``, and
+        :meth:`TaskWorkflow._wait_for_resolution`'s idle window would expire on
+        it and kill the agent mid-work.
+
+        Bumping at the START of each attempt (before awaiting the subprocess)
+        is what makes the signal sound: the longest gap between two ticks is one
+        cap cooldown plus one enforced invocation ceiling
+        (``timeouts.steward``), which stays inside the waiter's
+        ``timeouts.steward + steward_completion_timeout`` window rather than
+        exceeding it by an unbounded multiple of the cap-retry count.
+
+        Kwargs are forwarded verbatim to :func:`invoke_agent` — including the
+        ``backend`` kwarg ``invoke_with_cap_retry`` injects for custom
+        ``invoke_fn`` callers (cli_invoke.py:1079-1086), whose disposition is
+        unchanged by this shim.
+        """
+        self.metrics.subprocess_attempts += 1
+        return await invoke_agent(**kwargs)
+
     async def _invoke_with_session(
         self,
         prompt: str,
@@ -790,7 +829,11 @@ class TaskSteward:
         result = await invoke_with_cap_retry(
             self.usage_gate,
             f'Steward for task {self.task_id}',
-            invoke_fn=invoke_agent,
+            # _invoke_agent_counted, not invoke_agent directly: the shim ticks
+            # metrics.subprocess_attempts once per subprocess attempt so a
+            # steward parked in this loop's cap-retry cooldowns stays visibly
+            # ALIVE to the ESCALATED waiter's idle window (task 3170, fix D4).
+            invoke_fn=self._invoke_agent_counted,
             config_dir=self._config_dir,
             backend=self.config.backends.steward,
             max_cap_retries=_MAX_CAP_RETRIES,
@@ -908,7 +951,10 @@ class TaskSteward:
             result = await invoke_with_cap_retry(
                 self.usage_gate,
                 f'Steward for task {self.task_id} [pre-triage]',
-                invoke_fn=invoke_agent,
+                # Counted for the same reason as _invoke_with_session's call
+                # (task 3170, fix D4): pre-triage runs inside the ESCALATED
+                # wait and can itself sit in cap-retry cooldowns.
+                invoke_fn=self._invoke_agent_counted,
                 prompt=prompt,
                 system_prompt=TRIAGE.system_prompt,
                 cwd=self.config.project_root,
