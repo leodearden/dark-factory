@@ -464,6 +464,18 @@ def dedupe_shapes(records: Sequence[ScoredRecord]) -> list[ScoredRecord]:
 # stratified_sample — budget-after-stratification sampler (PRD §5.2 point 2, §8.4)
 # ---------------------------------------------------------------------------
 
+DEFAULT_DIGEST_MAX_BYTES = 15360
+"""The PRD §7.2 per-digest soft cap, in bytes — the same value as
+``nightly.DEFAULT_MAX_DIGEST_BYTES`` and :func:`legibility.digest.build_digest`'s
+own ``max_bytes`` default.
+
+Used by :func:`stratified_sample` as its conservative flat per-record charge
+when no ``cost_fn`` is injected, and as :func:`digest_byte_cost_fn`'s default
+render cap. A digest can only ever be SMALLER than this, never larger, so
+charging it flat is always an over-estimate — never an over-run of the daily
+cap."""
+
+
 @dataclass(frozen=True)
 class SampleResult:
     """The result of :func:`stratified_sample`: the selection plus accounting.
@@ -484,7 +496,19 @@ class SampleResult:
     selected: list[ScoredRecord]
     per_stratum_counts: dict[str, int]
     zero_signal_dropped: int
+
     bytes_used: int
+    """Total DIGEST bytes charged for ``selected`` — never raw transcript
+    size. ``budgets.max_daily_digest_bytes`` is a digest-OUTPUT budget (PRD
+    §5.2 point 2: "fill the daily digest-byte budget in score order. Budget
+    cap, not count cap"), so this is the sum of what
+    :func:`stratified_sample`'s cost basis charged: the real rendered digest
+    size when a ``cost_fn`` is injected, and a conservative flat
+    :data:`DEFAULT_DIGEST_MAX_BYTES` per record otherwise. It is NEVER
+    ``inventory.SessionRecord.size_bytes`` — a 0.5-6.5MB transcript renders
+    to a §7.2-capped ~15KB digest, so charging raw size over-charged the
+    budget by 20x-500x and selected nothing at all."""
+
     dedupe_collapsed: int = 0
     budget_skipped: int = 0
 
@@ -497,13 +521,28 @@ def stratified_sample(
 ) -> SampleResult:
     """Pick a budget-bounded, stratified subset of *records* (PRD §5.2 point 2, §8.4).
 
-    *cost_fn* is the per-record BYTE-COST seam: every budget charge in this
-    function routes through it. It exists because
-    ``budgets.max_daily_digest_bytes`` is a DIGEST-OUTPUT budget, so what
-    must be charged is the size of the digest a record will render to, not
-    the size of its raw transcript. Callers that can afford the render
-    inject :func:`digest_byte_cost_fn` for the real digest bytes; when
-    *cost_fn* is None the legacy ``record.size_bytes`` basis is used.
+    The budget is a DIGEST-OUTPUT budget, and so is everything charged
+    against it. ``budgets.max_daily_digest_bytes`` bounds the bytes of
+    digest this night will PRODUCE (PRD §5.2 point 2: "fill the daily
+    digest-byte budget in score order. Budget cap, not count cap"), and each
+    digest is itself soft-capped at §7.2's 15KB. The charged quantity — and
+    therefore ``SampleResult.bytes_used`` — is always digest bytes, never
+    ``inventory.SessionRecord.size_bytes``: a 0.5-6.5MB transcript renders
+    to a ~15KB digest, so charging raw transcript size over-charged the
+    budget by 20x-500x and made a single real session unaffordable against
+    the whole night's cap.
+
+    *cost_fn* is the per-record BYTE-COST seam every budget charge routes
+    through. Real callers inject :func:`digest_byte_cost_fn`, which charges
+    the ACTUAL rendered digest size. When *cost_fn* is None each record is
+    charged a flat :data:`DEFAULT_DIGEST_MAX_BYTES` — correct UNITS and a
+    guaranteed over-estimate (a digest can only come in under the soft cap),
+    so the daily cap still holds. That fallback is deliberately
+    conservative, NOT the intended production basis: the PRD rules out a
+    pure count cap, and a flat charge is exactly a count cap in disguise. It
+    exists so this function stays injection-free and pure for the §8.4
+    boundary test, and so a caller who forgets to inject degrades to a
+    coarse budget rather than back to raw transcript bytes.
 
     This function stays pure with respect to its own inputs — no clock, and
     all I/O confined to the injected *cost_fn* seam, so the PRD §8.4
@@ -559,7 +598,7 @@ def stratified_sample(
         cached = cost_memo.get(record.path)
         if cached is not None:
             return cached
-        charged = cost_fn(record) if cost_fn is not None else record.size_bytes
+        charged = cost_fn(record) if cost_fn is not None else DEFAULT_DIGEST_MAX_BYTES
         cost_memo[record.path] = charged
         return charged
 

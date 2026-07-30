@@ -327,7 +327,19 @@ class TestStratifiedSampleBoundary:
     405_000, leaving only 1_300 for the greedy-fill phase — not enough for
     recon's leftover 29-scorer (5_000 bytes), so it is excluded and the
     final selection is exactly the 5 reserved records.
+
+    These tests are about the sampler's budget ALGEBRA — cheapest-floor-
+    first, the overall cap holding, big sessions being unable to evict a
+    whole stratum, per-stratum-min floors — which is exactly what task
+    3268's units fix does NOT change. So they inject
+    ``cost_fn=lambda r: r.size_bytes``: the fixture's ``size_bytes`` numbers
+    now stand in as an explicit SYNTHETIC per-record cost rather than
+    riding on the production default, and every hand-derived number above
+    survives verbatim. (The production default is now a digest-byte basis;
+    :class:`TestStratifiedSampleRealWorldSizes` covers that.)
     """
+
+    _COST = staticmethod(lambda r: r.size_bytes)
 
     def _build_records(self):
         records = [
@@ -366,26 +378,26 @@ class TestStratifiedSampleBoundary:
         return {r.path.stem for r in result.selected}
 
     def test_zero_signal_dropped(self):
-        result = mod.stratified_sample(self._build_records(), self._config())
+        result = mod.stratified_sample(self._build_records(), self._config(), cost_fn=self._COST)
         assert not any(sid.startswith('recon-zero-') for sid in self._selected_ids(result))
 
     def test_zero_signal_drop_count(self):
-        result = mod.stratified_sample(self._build_records(), self._config())
+        result = mod.stratified_sample(self._build_records(), self._config(), cost_fn=self._COST)
         assert result.zero_signal_dropped == 12
 
     def test_clones_deduped_to_single_highest_scorer(self):
-        result = mod.stratified_sample(self._build_records(), self._config())
+        result = mod.stratified_sample(self._build_records(), self._config(), cost_fn=self._COST)
         watcher_selected = [r for r in result.selected if r.stratum == 'watcher']
         assert len(watcher_selected) == 1
         assert watcher_selected[0].path.stem == 'watcher-clone-3'
 
     def test_no_duplicate_fingerprints_in_selection(self):
-        result = mod.stratified_sample(self._build_records(), self._config())
+        result = mod.stratified_sample(self._build_records(), self._config(), cost_fn=self._COST)
         fingerprints = [mod.shape_fingerprint(r) for r in result.selected]
         assert len(fingerprints) == len(set(fingerprints))
 
     def test_each_nonempty_stratum_retains_per_stratum_min_or_all_survivors(self):
-        result = mod.stratified_sample(self._build_records(), self._config())
+        result = mod.stratified_sample(self._build_records(), self._config(), cost_fn=self._COST)
         per_stratum = {}
         for r in result.selected:
             per_stratum.setdefault(r.stratum, []).append(r)
@@ -394,12 +406,12 @@ class TestStratifiedSampleBoundary:
         assert len(per_stratum['interactive']) >= 2
 
     def test_total_bytes_within_budget(self):
-        result = mod.stratified_sample(self._build_records(), self._config())
+        result = mod.stratified_sample(self._build_records(), self._config(), cost_fn=self._COST)
         assert sum(r.size_bytes for r in result.selected) <= 405_000
         assert result.bytes_used == sum(r.size_bytes for r in result.selected)
 
     def test_tiny_stratum_survives_despite_huge_high_score_sessions_elsewhere(self):
-        result = mod.stratified_sample(self._build_records(), self._config())
+        result = mod.stratified_sample(self._build_records(), self._config(), cost_fn=self._COST)
         selected_ids = self._selected_ids(result)
         assert 'interactive-1' in selected_ids
         assert 'interactive-2' in selected_ids
@@ -413,16 +425,16 @@ class TestStratifiedSampleBoundary:
         # Without per-stratum reserve, recon's mid-tier candidate (score 29)
         # would consume the leftover budget ahead of lower-scoring strata;
         # the tight budget here must exclude it.
-        result = mod.stratified_sample(self._build_records(), self._config())
+        result = mod.stratified_sample(self._build_records(), self._config(), cost_fn=self._COST)
         assert 'recon-mid-3' not in self._selected_ids(result)
 
     def test_selected_ordered_by_score_desc(self):
-        result = mod.stratified_sample(self._build_records(), self._config())
+        result = mod.stratified_sample(self._build_records(), self._config(), cost_fn=self._COST)
         scores = [r.score for r in result.selected]
         assert scores == sorted(scores, reverse=True)
 
     def test_per_stratum_counts_accounting(self):
-        result = mod.stratified_sample(self._build_records(), self._config())
+        result = mod.stratified_sample(self._build_records(), self._config(), cost_fn=self._COST)
         assert result.per_stratum_counts == {'recon': 2, 'watcher': 1, 'interactive': 2}
 
 
@@ -432,7 +444,15 @@ class TestStratifiedSampleReserveExceedsBudget:
     testing: session sizes can dwarf a conservative daily budget), the
     OVERALL cap must still hold — cheapest stratum floor first, so budget
     pressure falls on the priciest stratum rather than the cap being
-    silently blown."""
+    silently blown.
+
+    Like :class:`TestStratifiedSampleBoundary`, this tests the sampler's
+    budget ALGEBRA, which task 3268's units fix does not change, so it
+    injects ``cost_fn=lambda r: r.size_bytes`` to keep the fixture's
+    ``size_bytes`` numbers as an explicit synthetic per-record cost and its
+    hand-derived expectations verbatim."""
+
+    _COST = staticmethod(lambda r: r.size_bytes)
 
     def _config(self, max_bytes):
         return config_mod.LegibilityConfig(
@@ -456,12 +476,12 @@ class TestStratifiedSampleReserveExceedsBudget:
 
     def test_total_never_exceeds_budget_even_when_floors_alone_would(self):
         # Both floors together (402_000) exceed a 3_000-byte budget.
-        result = mod.stratified_sample(self._build_records(), self._config(3_000))
+        result = mod.stratified_sample(self._build_records(), self._config(3_000), cost_fn=self._COST)
         assert sum(r.size_bytes for r in result.selected) <= 3_000
         assert result.bytes_used <= 3_000
 
     def test_cheap_stratum_preferred_when_budget_cannot_fit_both(self):
-        result = mod.stratified_sample(self._build_records(), self._config(3_000))
+        result = mod.stratified_sample(self._build_records(), self._config(3_000), cost_fn=self._COST)
         selected_ids = {r.path.stem for r in result.selected}
         assert {'interactive-1', 'interactive-2'} <= selected_ids
         assert 'recon-1' not in selected_ids
