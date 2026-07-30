@@ -33,6 +33,7 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
     _sweep_stale_mem0_flag_markers,
 )
 from fused_memory.reconciliation.summary_pool import (
+    SUMMARY_POOL_SCROLL_LIMIT,
     enforce_summary_pool_cap,
     write_cycle_summary,
 )
@@ -1098,6 +1099,89 @@ class TestEnforceSummaryPoolCapTombstones:
 
         assert result == 0
         tombstone.assert_not_awaited()
+
+
+class TestEnforceSummaryPoolCapEnumerationBound:
+    """The enumeration's scroll bound is explicit and loud, not implicit.
+
+    enforce_summary_pool_cap previously relied on get_memories_by_metadata's
+    default limit=1000. With cap=2 that is safe — this trim is what keeps the
+    pool at 2 every cycle — but it is a silent bound: if the pool ever DID
+    reach the limit (a mis-tagged flood, or a trim disabled for a long while),
+    the enumeration would return a partial view, Qdrant scroll order is not
+    guaranteed oldest-first, and the trim would then keep the wrong members
+    while reporting success. Loud beats silent (task 3041).
+    """
+
+    @pytest.mark.asyncio
+    async def test_enumeration_passes_an_explicit_limit(self):
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+
+        await enforce_summary_pool_cap(
+            memory_service,
+            project_id='dark_factory',
+            run_id='run-1',
+            recon_pool='stage1_cycle_summary',
+            trim_source='stage1_cycle_summary_trim',
+            cap=2,
+        )
+
+        kwargs = memory_service.get_memories_by_metadata.call_args.kwargs
+        assert kwargs.get('limit') == SUMMARY_POOL_SCROLL_LIMIT
+
+    @pytest.mark.asyncio
+    async def test_enumeration_at_the_limit_warns_about_a_partial_view(self, caplog):
+        members = [
+            {
+                'id': f'm{n}',
+                'created_at': f'2026-01-{n % 28 + 1:02d}T00:00:00+00:00',
+                'metadata': {'record_type': 'ledger_stamp'},
+            }
+            for n in range(SUMMARY_POOL_SCROLL_LIMIT)
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER):
+            await enforce_summary_pool_cap(
+                memory_service,
+                project_id='dark_factory',
+                run_id='run-1',
+                recon_pool='stage1_cycle_summary',
+                trim_source='stage1_cycle_summary_trim',
+                cap=2,
+            )
+
+        assert any(
+            'partial' in r.message.lower() or 'limit' in r.message.lower()
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+        ), f'expected a partial-view WARNING, got {[r.message for r in caplog.records]!r}'
+
+    @pytest.mark.asyncio
+    async def test_ordinary_pool_size_does_not_warn(self, caplog):
+        members = [
+            {'id': 'a', 'created_at': '2026-01-01T00:00:00+00:00', 'metadata': {}},
+            {'id': 'b', 'created_at': '2026-02-01T00:00:00+00:00', 'metadata': {}},
+            {'id': 'c', 'created_at': '2026-03-01T00:00:00+00:00', 'metadata': {}},
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER):
+            await enforce_summary_pool_cap(
+                memory_service,
+                project_id='dark_factory',
+                run_id='run-1',
+                recon_pool='stage1_cycle_summary',
+                trim_source='stage1_cycle_summary_trim',
+                cap=2,
+            )
+
+        assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
 
 
 class _StatefulMem0Pool:

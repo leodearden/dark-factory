@@ -89,6 +89,17 @@ CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE: str = 'narrative'
 # the enumeration constraint for enforce_summary_pool_cap (task 3041).
 _KIND_CYCLE_SUMMARY: str = 'cycle_summary'
 
+# Explicit scroll bound for the pool enumeration below (task 3041). Same value
+# as get_memories_by_metadata's own default, which this previously relied on
+# implicitly. Named and passed explicitly because it is a CORRECTNESS bound,
+# not a performance knob: a pool that reached this size would enumerate as a
+# partial view, and Qdrant scroll order is not guaranteed oldest-first, so the
+# trim would then keep an arbitrary subset while still reporting success.
+# Reaching it is not expected — this trim is what holds the pool at `cap`
+# every cycle — so hitting it means something upstream is already wrong, and
+# enforce_summary_pool_cap says so out loud rather than degrading silently.
+SUMMARY_POOL_SCROLL_LIMIT: int = 1000
+
 
 def _assume_utc(dt: datetime) -> datetime:
     """Return *dt* with UTC timezone attached if it is naive; return *dt* unchanged otherwise.
@@ -150,6 +161,16 @@ async def enforce_summary_pool_cap(
     ``record_type`` is read defensively from ``item.get('metadata', {})`` — a
     member dict with no metadata must not raise.
 
+    Enumeration is bounded by :data:`SUMMARY_POOL_SCROLL_LIMIT`, passed
+    explicitly rather than inherited from ``get_memories_by_metadata``'s
+    default. With a cap of 2 the bound is unreachable in normal operation —
+    this trim is what holds the pool at ``cap`` every cycle — but it is a
+    correctness bound rather than a performance knob: at the limit the view is
+    potentially PARTIAL, Qdrant scroll order is not guaranteed oldest-first,
+    and the survivors would then be an arbitrary subset rather than the newest
+    ``cap``. Reaching it therefore logs a WARNING and still trims, instead of
+    silently returning a count that reads as "pool trimmed to cap".
+
     The ``kind`` filter constraint is load-bearing, not decorative:
     ``_apply_cycle_summary_metadata_tagging`` is additive-only and never
     strips a caller-supplied ``recon_pool``, so filtering on ``recon_pool``
@@ -192,6 +213,7 @@ async def enforce_summary_pool_cap(
             # alone would let a mis-tagged non-summary record join this cap-2
             # pool — and then either be trimmed by it or evict a real mirror.
             filters={'recon_pool': recon_pool, 'kind': _KIND_CYCLE_SUMMARY},
+            limit=SUMMARY_POOL_SCROLL_LIMIT,
         )
     except Exception:
         logger.warning(
@@ -202,6 +224,30 @@ async def enforce_summary_pool_cap(
             extra={'project_id': project_id, 'run_id': run_id, 'recon_pool': recon_pool},
         )
         return 0
+
+    if len(members) >= SUMMARY_POOL_SCROLL_LIMIT:
+        # The enumeration may be a PARTIAL view of the pool, so the members
+        # this trim is about to sort are not necessarily the whole set and the
+        # survivors are not necessarily the newest `cap`. The trim still runs
+        # (bounding a runaway pool beats doing nothing), but a pool this size
+        # means something upstream is already broken — say so rather than
+        # returning a success count that reads as "pool trimmed to cap".
+        logger.warning(
+            'reconciliation.enforce_summary_pool_cap: '
+            'enumeration returned %d members at the scroll limit for '
+            'project_id=%s recon_pool=%s — the pool view may be PARTIAL and '
+            'the retained members may not be the newest %d; trimming anyway',
+            len(members),
+            project_id,
+            recon_pool,
+            cap,
+            extra={
+                'project_id': project_id,
+                'run_id': run_id,
+                'recon_pool': recon_pool,
+                'member_count': len(members),
+            },
+        )
 
     if len(members) <= cap:
         return 0
