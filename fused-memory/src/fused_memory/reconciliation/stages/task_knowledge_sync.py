@@ -41,7 +41,10 @@ from fused_memory.reconciliation.flag_dedup import (
     filter_contamination_ceiling_findings,
     filter_false_phantom_task_creation_flags,
 )
-from fused_memory.reconciliation.mem0_tombstone import is_protected_mirror_record
+from fused_memory.reconciliation.mem0_tombstone import (
+    is_protected_mirror_record,
+    record_mem0_deletion_tombstone,
+)
 from fused_memory.reconciliation.policies import is_snapshot_write_blocked
 from fused_memory.reconciliation.prompts import (
     _STAGE2_PROJECT_ID_GUIDELINE,
@@ -995,6 +998,13 @@ async def _sweep_stale_mem0_pool(
     individual failures log WARNING and are excluded from the returned
     count.
 
+    Every CONFIRMED-successful delete leaves a queryable tombstone via
+    :func:`~fused_memory.reconciliation.mem0_tombstone.record_mem0_deletion_tombstone`
+    (task 3041), naming *gc_sweep_source* as the deleter and *run_id* as the
+    deleting run — so an auditor holding only the memory uuid can find out who
+    reaped it and why. Written from the success branch ONLY: a tombstone must
+    never claim a record that is still alive.
+
     Args:
         memory_service: Service with ``get_memories_by_metadata`` and
             ``delete_memory`` (and, when ``count_short_circuit`` is set,
@@ -1080,7 +1090,11 @@ async def _sweep_stale_mem0_pool(
 
     cutoff = _assume_utc(now or datetime.now(UTC)) - timedelta(days=max_age_days)
 
-    stale_ids: list[str] = []
+    # Full member dicts, not bare ids: the tombstone write below needs the
+    # victim's metadata/created_at at classification time (task 3041). Kept
+    # as one list so the zip(..., strict=True) delete/result pairing below is
+    # structurally unchanged.
+    stale_members: list[dict] = []
     for member in members:
         mid = member.get('id')
         if not mid:
@@ -1117,9 +1131,9 @@ async def _sweep_stale_mem0_pool(
             continue
 
         if created_at < cutoff:
-            stale_ids.append(mid)
+            stale_members.append(member)
 
-    if not stale_ids:
+    if not stale_members:
         return 0
 
     # Two-tier check via gather_collect (fused_memory.utils.async_utils).
@@ -1130,17 +1144,19 @@ async def _sweep_stale_mem0_pool(
     # Pass 2 (below): per-item degrade-to-warning on ordinary Exceptions.
     results = await gather_collect(
         memory_service.delete_memory(
-            memory_id=mid,
+            memory_id=member['id'],
             store='mem0',
             project_id=project_id,
             causation_id=run_id,
             _source=gc_sweep_source,
         )
-        for mid in stale_ids
+        for member in stale_members
     )
 
     success_count = 0
-    for mid, result in zip(stale_ids, results, strict=True):
+    tombstone_writes = []
+    for member, result in zip(stale_members, results, strict=True):
+        mid = member['id']
         if isinstance(result, Exception):
             logger.warning(
                 'reconciliation.%s: delete failed for memory_id=%s; not counted',
@@ -1149,6 +1165,28 @@ async def _sweep_stale_mem0_pool(
             )
         else:
             success_count += 1
+            # Success branch ONLY (task 3041): a tombstone must never claim a
+            # record that is still alive, so the failed-delete branch above is
+            # deliberately left untouched. record_mem0_deletion_tombstone is
+            # internally fail-safe (returns False, never raises), and the
+            # gather_collect below is a second belt so even a helper that is
+            # patched/broken cannot raise out of, or alter the count of, this
+            # sweep.
+            tombstone_writes.append(
+                record_mem0_deletion_tombstone(
+                    memory_service,
+                    project_id,
+                    mid,
+                    victim_metadata=member.get('metadata'),
+                    victim_created_at=member.get('created_at'),
+                    deleter=gc_sweep_source,
+                    deleting_run_id=run_id,
+                )
+            )
+
+    if tombstone_writes:
+        await gather_collect(tombstone_writes)
+
     return success_count
 
 
