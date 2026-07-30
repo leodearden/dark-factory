@@ -492,3 +492,259 @@ def test_client_identifies_itself_explicitly():
     _, init_payload = srv.received[0]
     assert init_payload['params']['clientInfo']['name'] == crr.CLIENT_NAME
     assert crr.CLIENT_NAME
+
+
+# ── step-5: the confirm-before-write compare-and-swap guard ──────────────────
+#
+# The guard is a STALE-READ check on the adjudicated row, NOT a re-evaluation
+# of the sweep's predicates. It asks only "is this still the row the sweep
+# looked at, and is it still in a state where this action means anything?" --
+# never "was the sweep right?". The fail-safe direction is always "do nothing".
+
+REIFY = '/home/leo/src/reify'
+
+# A fixed epoch for the request-file mtime, so every timestamp in these tests
+# is stated relative to the moment the sweep is pretended to have emitted.
+SWEEP_MTIME = 1_760_000_000.0
+
+
+def _iso(offset_seconds, style='Z'):
+    """An ISO-8601 UTC timestamp *offset_seconds* from SWEEP_MTIME.
+
+    Two styles, because the store really does write both: `updatedAt` comes
+    from sqlite_task_backend._now() (`...THH:MM:SS.mmmZ`) while `heartbeat_at`
+    is stamped by the orchestrator as `datetime.now(UTC).isoformat()`
+    (`...+00:00`). A guard that parses only one of them would silently fail
+    open on the other.
+    """
+    import datetime as _dt
+    ts = _dt.datetime.fromtimestamp(SWEEP_MTIME + offset_seconds, _dt.timezone.utc)
+    if style == 'Z':
+        return ts.strftime('%Y-%m-%dT%H:%M:%S.') + f'{ts.microsecond // 1000:03d}Z'
+    return ts.isoformat()
+
+
+def _row(status='blocked', *, task_id=5321, updated_at=None, heartbeat_at=None,
+         claimant_run_id=None):
+    """A get_task wire row, in fused-memory's _row_to_task shape."""
+    return {
+        'id': task_id,
+        'status': status,
+        'updatedAt': _iso(-3600) if updated_at is None else updated_at,
+        'heartbeat_at': heartbeat_at,
+        'claimant_run_id': claimant_run_id,
+        'dependencies': [],
+    }
+
+
+class RecordingClient:
+    """An McpClient stand-in that records the exact call sequence.
+
+    Assertions are made on `.calls` -- an ORDERED list of (tool, arguments) --
+    because the ordering of the two re-dispatch writes is load-bearing, so a
+    test that only checked both calls happened would pass on the wrong code.
+    """
+
+    def __init__(self, rows=None, *, get_task_raises=None, raises_on=(),
+                 rejects_on=()):
+        self.rows = dict(rows or {})
+        self.calls = []
+        self._get_task_raises = get_task_raises
+        self._raises_on = set(raises_on)
+        self._rejects_on = set(rejects_on)
+
+    @property
+    def tools_called(self):
+        return [name for name, _ in self.calls]
+
+    def _maybe_fail(self, tool):
+        if tool in self._raises_on:
+            raise RuntimeError(f'{tool} exploded')
+        if tool in self._rejects_on:
+            # A rejection EMBEDDED in a 200 response -- fused-memory's
+            # terminal-exit / phantom-done gates answer this way without
+            # raising, which is why the apply path checks the payload.
+            return {'success': False, 'error': f'{tool} refused'}
+        return {'success': True}
+
+    def get_task(self, task_id, project_root):
+        self.calls.append(('get_task', {'id': task_id, 'project_root': project_root}))
+        if self._get_task_raises:
+            raise RuntimeError(self._get_task_raises)
+        row = self.rows.get(task_id)
+        if row is None:
+            return {'error': f'No tasks found for ID(s): {task_id}'}
+        return row
+
+    def set_task_status(self, task_id, status, project_root):
+        self.calls.append(('set_task_status', {
+            'id': task_id, 'status': status, 'project_root': project_root}))
+        return self._maybe_fail('set_task_status')
+
+    def set_task_claimant(self, task_id, project_root, *, claimant_run_id=None,
+                          heartbeat_at=None):
+        self.calls.append(('set_task_claimant', {
+            'id': task_id, 'project_root': project_root,
+            'claimant_run_id': claimant_run_id, 'heartbeat_at': heartbeat_at}))
+        return self._maybe_fail('set_task_claimant')
+
+
+def _req(requests_dir, task_id, cls, **kw):
+    kw.setdefault('mtime', SWEEP_MTIME)
+    return crr.load_request(write_request(requests_dir, task_id, cls, **kw))
+
+
+def _confirm(client, req):
+    return crr.confirm_request(client, req, REIFY)
+
+
+def test_guard_proceeds_on_an_unchanged_in_scope_row(requests_dir):
+    req = _req(requests_dir, 5321, 'unmet_dependency')
+    client = RecordingClient({5321: _row('blocked')})
+    row, skip = _confirm(client, req)
+    assert skip is None
+    assert row['status'] == 'blocked'
+    assert client.tools_called == ['get_task']
+
+
+def test_guard_skips_when_the_row_is_already_at_the_target_status(requests_dir):
+    """Consuming an already-applied request is a NO-OP, not a second transition.
+
+    This is the idempotency the brief requires: the sweep re-emits byte-identical
+    files, and a re-run must not re-transition a row that already moved.
+    """
+    for cls, already in (('gate_closure', 'cancelled'),
+                         ('unmet_dependency', 'pending'),
+                         ('merge_verify_red', 'pending')):
+        req = _req(requests_dir, 5321, cls)
+        client = RecordingClient({5321: _row(already)})
+        _, skip = _confirm(client, req)
+        assert skip is not None, cls
+        assert 'already' in skip
+
+
+@pytest.mark.parametrize('cls,status', [
+    # Classes A and C are `blocked`-ONLY (the sweep's invariant L4).
+    ('gate_closure', 'in-progress'),
+    ('gate_closure', 'review'),
+    ('gate_closure', 'done'),
+    ('gate_closure', 'deferred'),
+    ('unmet_dependency', 'in-progress'),
+    ('unmet_dependency', 'done'),
+    # Class B spans blocked + in-progress and nothing else.
+    ('merge_verify_red', 'review'),
+    ('merge_verify_red', 'done'),
+    ('merge_verify_red', 'deferred'),
+])
+def test_guard_skips_a_row_outside_its_class_legal_scope(requests_dir, cls, status):
+    req = _req(requests_dir, 5321, cls)
+    client = RecordingClient({5321: _row(status)})
+    _, skip = _confirm(client, req)
+    assert skip is not None and 'scope' in skip
+
+
+@pytest.mark.parametrize('cls,status', [
+    ('gate_closure', 'blocked'),
+    ('unmet_dependency', 'blocked'),
+    ('merge_verify_red', 'blocked'),
+    ('merge_verify_red', 'in-progress'),
+])
+def test_guard_accepts_every_in_scope_class_status_pair(requests_dir, cls, status):
+    req = _req(requests_dir, 5321, cls)
+    client = RecordingClient({5321: _row(status)})
+    _, skip = _confirm(client, req)
+    assert skip is None
+
+
+@pytest.mark.parametrize('style', ['Z', 'offset'])
+def test_guard_skips_when_updated_at_post_dates_the_request(requests_dir, style):
+    """The row moved AFTER the sweep observed it -- let the next sweep re-adjudicate.
+
+    The request body deliberately carries no wall-clock field, so the file's
+    mtime is the documented recency signal to compare against.
+    """
+    req = _req(requests_dir, 5321, 'unmet_dependency')
+    client = RecordingClient({5321: _row('blocked', updated_at=_iso(+60, style))})
+    _, skip = _confirm(client, req)
+    assert skip is not None and 'updatedAt' in skip
+
+
+@pytest.mark.parametrize('style', ['Z', 'offset'])
+def test_guard_skips_when_a_heartbeat_landed_after_the_sweep(requests_dir, style):
+    """The live-agent case: a runner came alive after the sweep's L1 check.
+
+    This is the 2026-07-26 ten-live-in-progress-rows hazard caught a second
+    time, at the last possible moment before the write.
+    """
+    req = _req(requests_dir, 5321, 'merge_verify_red')
+    client = RecordingClient({5321: _row(
+        'in-progress', heartbeat_at=_iso(+30, style), claimant_run_id='run-abc')})
+    _, skip = _confirm(client, req)
+    assert skip is not None and 'heartbeat_at' in skip
+
+
+def test_guard_proceeds_when_both_timestamps_pre_date_the_request(requests_dir):
+    req = _req(requests_dir, 5321, 'merge_verify_red')
+    client = RecordingClient({5321: _row(
+        'in-progress', updated_at=_iso(-600), heartbeat_at=_iso(-300))})
+    _, skip = _confirm(client, req)
+    assert skip is None
+
+
+@pytest.mark.parametrize('bad', ['', 'not-a-date', '2026-13-45T99:99:99Z', 12345, {}])
+def test_guard_skips_on_an_unparseable_timestamp(requests_dir, bad):
+    """Fail-safe: an un-comparable timestamp means we cannot show the row is
+    unchanged, and the safe direction for a re-dispatch decision is do-nothing."""
+    req = _req(requests_dir, 5321, 'unmet_dependency')
+    client = RecordingClient({5321: _row('blocked', updated_at=bad)})
+    _, skip = _confirm(client, req)
+    assert skip is not None
+
+
+def test_guard_skips_when_updated_at_is_missing(requests_dir):
+    req = _req(requests_dir, 5321, 'unmet_dependency')
+    row = _row('blocked')
+    del row['updatedAt']
+    client = RecordingClient({5321: row})
+    _, skip = _confirm(client, req)
+    assert skip is not None
+
+
+def test_guard_tolerates_an_absent_heartbeat(requests_dir):
+    """No heartbeat at all is the normal shape for a `blocked` row -- absence is
+    not staleness, so it must not be treated as an unparseable timestamp."""
+    req = _req(requests_dir, 5321, 'unmet_dependency')
+    client = RecordingClient({5321: _row('blocked', heartbeat_at=None)})
+    _, skip = _confirm(client, req)
+    assert skip is None
+
+
+def test_guard_skips_when_get_task_raises(requests_dir):
+    req = _req(requests_dir, 5321, 'unmet_dependency')
+    client = RecordingClient({5321: _row('blocked')}, get_task_raises='server down')
+    row, skip = _confirm(client, req)
+    assert row is None and skip is not None and 'server down' in skip
+    assert client.tools_called == ['get_task']
+
+
+def test_guard_skips_when_the_row_does_not_exist(requests_dir):
+    req = _req(requests_dir, 9999, 'unmet_dependency')
+    client = RecordingClient({})
+    row, skip = _confirm(client, req)
+    assert row is None and skip is not None
+
+
+def test_guard_skips_when_the_row_has_no_status(requests_dir):
+    req = _req(requests_dir, 5321, 'unmet_dependency')
+    client = RecordingClient({5321: {'id': 5321, 'updatedAt': _iso(-60)}})
+    _, skip = _confirm(client, req)
+    assert skip is not None
+
+
+def test_guard_never_issues_a_write(requests_dir):
+    """The guard is a READ. Whatever it decides, it decides before any mutation."""
+    for status in ('blocked', 'done', 'cancelled', 'in-progress'):
+        req = _req(requests_dir, 5321, 'gate_closure')
+        client = RecordingClient({5321: _row(status)})
+        _confirm(client, req)
+        assert client.tools_called == ['get_task'], status
