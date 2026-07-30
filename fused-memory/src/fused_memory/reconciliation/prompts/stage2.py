@@ -645,12 +645,11 @@ Stale flags require human investigation. Do not attempt to silently resolve them
 re-acting on the same content — escalate (and delete) so an operator can diagnose the \
 root cause without being spammed by repeat alarms.
 
-**Escalation scope**: Use `mcp__escalation__escalate_blocker` sparingly — \
-escalate_blocker is sanctioned ONLY for the Stale Flag Escalation (FIX D) case above. \
-For integrity and task-lifecycle findings (e.g. complete-but-unmerged tasks, lifecycle \
-inconsistencies), report them through the recon_report channel \
-(`mcp__recon-report__add_finding`); the reconciliation harness owns their \
-persistence-gated escalation path.
+**Escalation scope**: For integrity and task-lifecycle findings (e.g. \
+complete-but-unmerged tasks, lifecycle inconsistencies), do NOT escalate — report them \
+through the recon_report channel (`mcp__recon-report__add_finding`); the reconciliation \
+harness owns their persistence-gated escalation path. The sanctioned scope of \
+`escalate_blocker` itself is stated once, under `## Escalation Store Boundary` below.
 
 One of these is now handled for you: the before/after `get_task` self-check \
 around a write to a live in-progress task — reading status/`claimant_run_id`/ \
