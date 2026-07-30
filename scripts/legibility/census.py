@@ -1533,6 +1533,21 @@ def main(argv: list[str] | None = None) -> int:
     scoped git-commit helper) and runs the full pipeline via
     ``run_census``.
 
+    Three OPERATOR COST-CONTROL flags bound what a single run may spend,
+    each defaulting to today's unbounded behavior so a flagless
+    invocation -- notably the nightly trickle's, which passes no extra
+    argv -- is unchanged: ``--max-batches N`` bounds mining,
+    ``--max-verify-clusters N`` bounds per-cluster verification, and
+    ``--dry-run-filing`` writes every would-be task payload to
+    ``plans/confusion-census-<date>-payloads.json`` (alongside the dated
+    report) for human review instead of filing it. They are composable
+    and reusable, not first-census-only, though an attended FIRST census
+    against an empty codebook is where all three matter most: saturation
+    cannot bound that run, since every batch's dup_rate then only
+    measures "the miner found nothing to match". None of the three lets a
+    bounded run masquerade as a complete one -- see ``run_census`` and
+    ``render_report``.
+
     Returns non-zero only on a genuine fail-loud error (a config-load
     failure, or an uncaught exception from ``run_census``) -- a deferred
     (headroom-preflight) outcome still exits 0, mirroring
@@ -1560,6 +1575,29 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--date", default=None, type=_parse_cli_date,
         help="Census date YYYY-MM-DD (default: today UTC).",
+    )
+    parser.add_argument(
+        "--max-batches", type=int, default=None,
+        help="Operator cost control: stop mining after N batches. Omit for "
+        "today's behavior -- mine until novelty saturates or the source runs "
+        "out. A capped run is deliberately PARTIAL coverage (sessions beyond "
+        "the cap are never mined) and says so in the report; its stop_reason "
+        "is 'capped', not 'exhausted'.",
+    )
+    parser.add_argument(
+        "--max-verify-clusters", type=int, default=None,
+        help="Operator cost control: verify at most N novel clusters (one "
+        "Sonnet call each), taken in mining order. Omit to verify every "
+        "novel cluster. The deferred remainder still merges into the "
+        "codebook as pending candidates for a later census -- deferred, "
+        "never dropped.",
+    )
+    parser.add_argument(
+        "--dry-run-filing", action="store_true",
+        help="Operator cost control: write every would-be task payload to "
+        "plans/confusion-census-<date>-payloads.json for human review and "
+        "file NOTHING. Everything else (codebook update, promotions, report, "
+        "census-state advance) proceeds normally.",
     )
     args = parser.parse_args(argv)
 
@@ -1592,6 +1630,12 @@ def main(argv: list[str] | None = None) -> int:
     codebook_path = project_root / "docs" / "legibility" / "confusion-codebook.yaml"
     census_state_path = project_root / "docs" / "legibility" / "census-state.json"
     report_path = project_root / "plans" / f"confusion-census-{date_str}.md"
+    # Derived from report_path.parent so the human-review payload file stays
+    # co-located with the dated report even if the report location moves.
+    dry_run_payloads_path = (
+        report_path.parent / f"confusion-census-{date_str}-payloads.json"
+        if args.dry_run_filing else None
+    )
 
     try:
         codebook_dict = codebook.load(codebook_path)
@@ -1632,6 +1676,9 @@ def main(argv: list[str] | None = None) -> int:
             report_path=report_path,
             date=date_str,
             force=args.force,
+            max_batches=args.max_batches,
+            max_verify_clusters=args.max_verify_clusters,
+            dry_run_payloads_path=dry_run_payloads_path,
         )
     except Exception as exc:  # noqa: BLE001 - fail loud: escalate (PRD decision 8) AND exit non-zero, never a silent crash
         print(f"census: FAILED -- {exc}", file=sys.stderr)
@@ -1650,6 +1697,17 @@ def main(argv: list[str] | None = None) -> int:
 
     if outcome.status == "deferred":
         print(f"census: deferred -- {outcome.reason}")
+        return 0
+
+    if outcome.dry_run is not None:
+        # A bare filed_tasks=0 here would read as "a normal run that had
+        # nothing to file" -- name the review file and the count instead.
+        print(
+            f"census: done -- report={outcome.report_path} "
+            f"dry-run-filing: {outcome.dry_run.payload_count} payload(s) -> "
+            f"{outcome.dry_run.path} (nothing filed) "
+            f"stop_reason={outcome.stop_reason}"
+        )
         return 0
 
     print(
