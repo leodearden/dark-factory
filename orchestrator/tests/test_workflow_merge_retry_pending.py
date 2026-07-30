@@ -448,6 +448,9 @@ class TestResumeGuard:
         assert outcome == WorkflowOutcome.DONE
         spies.clear_merge_retry_pending.assert_awaited_once()
         spies.merge_and_finalise.assert_awaited_once_with('task/77')
+        # task 3024: the clean-merge probe must run on this path too — a clean
+        # ConflictProbe is what licenses the fast-path, so it is never skipped.
+        f.git_ops.merge_tree_conflicts.assert_awaited_once_with('BASE-SHA', 'HEAD-SHA')
 
     @pytest.mark.asyncio
     async def test_head_mismatch_clears_stale_stamp_and_returns_none(self, monkeypatch):
@@ -505,6 +508,42 @@ class TestResumeGuard:
         # ...and never hand an empty-plan workflow to the merge phase.
         spies.merge_and_finalise.assert_not_awaited()
         f.git_ops.merge_tree_conflicts.assert_awaited_once_with('BASE-SHA', 'HEAD-SHA')
+
+    # -- task 3024 step-3: the probe itself failing is transient, not a verdict --
+
+    @pytest.mark.asyncio
+    async def test_probe_error_returns_none_without_clearing(self, monkeypatch):
+        """A merge_tree_conflicts failure is uncertain — preserve the obligation.
+
+        Unlike a confirmed conflict (which voids the stamp), a probe error says
+        nothing about whether the branch still merges.  Fall back to the full
+        pipeline for THIS dispatch, but leave the durable stamp in place so a
+        later dispatch can still honour it (mirrors the rev-parse fail-safe).
+        """
+        f = _make(metadata={'merge_retry_pending': {**_STAMP, 'branch_head': 'HEAD-SHA'}})
+        spies = _wire_resume_guard_spies(f)
+        monkeypatch.setattr('orchestrator.workflow._run', _fake_run(head='HEAD-SHA'))
+        f.git_ops.merge_tree_conflicts = AsyncMock(side_effect=RuntimeError('bad ref'))
+
+        outcome = await f.wf._resume_merge_retry_if_pending('task/77')
+
+        assert outcome is None
+        spies.merge_and_finalise.assert_not_awaited()
+        spies.clear_merge_retry_pending.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_main_sha_error_returns_none_without_clearing(self, monkeypatch):
+        """Same fail-safe when the probe's BASE (current main tip) can't be read."""
+        f = _make(metadata={'merge_retry_pending': {**_STAMP, 'branch_head': 'HEAD-SHA'}})
+        spies = _wire_resume_guard_spies(f)
+        monkeypatch.setattr('orchestrator.workflow._run', _fake_run(head='HEAD-SHA'))
+        f.git_ops.get_main_sha = AsyncMock(side_effect=RuntimeError('main read failed'))
+
+        outcome = await f.wf._resume_merge_retry_if_pending('task/77')
+
+        assert outcome is None
+        spies.merge_and_finalise.assert_not_awaited()
+        spies.clear_merge_retry_pending.assert_not_awaited()
 
 
 class TestDrivePlacement:
