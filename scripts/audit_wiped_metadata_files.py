@@ -26,7 +26,13 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from pathlib import Path
 from typing import NamedTuple
+
+# The canonical meta-root directory name, per config.py:1343 TASK_META_DIRNAME
+# and artifacts.py:287 meta_root_for. It is a SIBLING of the worktrees inside
+# the worktree base, not a child of any worktree.
+TASK_META_DIRNAME = ".task-meta"
 
 
 class TaskRecord(NamedTuple):
@@ -124,6 +130,96 @@ _EVENT_PLAN_SOURCES = {
 # Higher rank wins. Compared before recency, so a file-level record beats a
 # lock-level one regardless of which event row is newer.
 _FIDELITY_RANK = {FIDELITY_LOCK_LEVEL: 0, FIDELITY_FILE_LEVEL: 1}
+
+
+def _read_plan_file(plan_path: Path) -> tuple[str, tuple[str, ...]] | None:
+    """Read one plan.json, returning ``(task_id_key, files)`` or None.
+
+    The key is the plan's OWN ``task_id`` field when present, falling back to
+    the caller-supplied directory name — the same self-identification
+    ``_find_lane_by_plan_task_id`` relies on (git_ops.py:6793-6845), which is
+    robust to a plan sitting in a pooled lane directory whose name is not the
+    task id.
+
+    Returns None for anything unusable: a malformed/unreadable file, a
+    dangling symlink, a plan.json that is a directory, a payload that is not
+    a dict, or a missing/empty/wrong-typed ``files`` list. Every failure is
+    a skip, never an exception — one corrupt plan among hundreds must not
+    abort the sweep.
+    """
+    try:
+        payload = json.loads(plan_path.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    files = _coerce_file_list(payload.get("files"))
+    if not files:
+        return None
+    raw_task_id = payload.get("task_id")
+    if raw_task_id is None or raw_task_id == "":
+        key = plan_path.parent.name
+    else:
+        key = str(raw_task_id)
+    return key, files
+
+
+def load_plan_files_from_disk(worktree_base: str) -> dict[str, PlanFilesRecord]:
+    """Recover plan scope from BOTH on-disk plan locations under *worktree_base*.
+
+    New-then-old, the same precedence git_ops.py:6833-6835 and
+    harness.py:2721-2735 already use:
+
+      1. ``<base>/.task-meta/<name>/plan.json`` — the CANONICAL artifact
+         (config.py:1343, artifacts.py:287). ``cleanup_worktree``
+         (git_ops.py:11216-11310) removes the worktree but never the
+         meta-root, and crash recovery explicitly skips ``.task-meta``
+         (harness.py:2958-2975), so these plans outlive their worktrees.
+      2. ``<base>/<name>/plan.json`` under ``.task/`` — the LEGACY location.
+         In the current layout this path is only an absolute SYMLINK to (1)
+         (artifacts.py:354-386), so it usually resolves to a task already
+         recorded from the meta-root and is dropped as a lower-precedence
+         duplicate. Pre-relocation plans, however, exist ONLY here, so it
+         cannot be skipped.
+
+    A missing *worktree_base* returns an empty dict.
+    """
+    records: dict[str, PlanFilesRecord] = {}
+    base = Path(worktree_base)
+
+    def _ingest(plan_path: Path, source: str) -> None:
+        read = _read_plan_file(plan_path)
+        if read is None:
+            return
+        key, files = read
+        # New-then-old: a meta-root hit is never overwritten by the legacy
+        # scan (which, in the symlink layout, is the very same artifact).
+        if key in records:
+            return
+        records[key] = PlanFilesRecord(
+            files=files, source=source, fidelity=FIDELITY_FILE_LEVEL
+        )
+
+    meta_root = base / TASK_META_DIRNAME
+    try:
+        meta_entries = sorted(meta_root.iterdir())
+    except OSError:
+        meta_entries = []
+    for entry in meta_entries:
+        _ingest(entry / "plan.json", "meta_root_plan_json")
+
+    try:
+        base_entries = sorted(base.iterdir())
+    except OSError:
+        base_entries = []
+    for entry in base_entries:
+        # The meta-root is a sibling of the worktrees, not a worktree — a
+        # <base>/.task-meta/.task/plan.json must not be mis-scanned as a lane.
+        if entry.name == TASK_META_DIRNAME:
+            continue
+        _ingest(entry / ".task" / "plan.json", "legacy_worktree_plan_json")
+
+    return records
 
 
 def load_plan_files_from_events(runs_db_path: str) -> dict[str, PlanFilesRecord]:

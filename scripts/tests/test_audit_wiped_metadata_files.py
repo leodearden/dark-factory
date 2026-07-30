@@ -575,8 +575,17 @@ def test_load_plan_files_from_disk_skips_every_unusable_entry(tmp_path):
 
 
 def test_load_plan_files_from_disk_does_not_treat_task_meta_as_a_worktree(tmp_path):
-    """(f) .task-meta must be skipped when iterating the base dir, or a
-    <base>/.task-meta/.task/plan.json would be mis-scanned as a legacy lane."""
+    """(f) .task-meta is a SIBLING of the worktrees, not one of them, and must
+    be skipped when iterating the base dir — otherwise
+    ``<base>/.task-meta/.task/plan.json`` is ingested as a legacy LANE record.
+
+    That trap path is reachable by BOTH scans (the meta-root scan sees a
+    ``.task`` entry; a non-skipping base scan sees a ``.task-meta`` lane), so
+    mere absence of the trap task id cannot discriminate between them. The
+    real observable is the SOURCE LABEL: nothing found under the meta-root may
+    ever be attributed to ``legacy_worktree_plan_json``, since a mislabelled
+    provenance is exactly what would mislead a downstream repair.
+    """
     _write_meta_root_plan(tmp_path, "10", {"task_id": 10, "files": ["ok.py"]})
     trap = tmp_path / ".task-meta" / ".task"
     trap.mkdir(parents=True)
@@ -584,8 +593,8 @@ def test_load_plan_files_from_disk_does_not_treat_task_meta_as_a_worktree(tmp_pa
 
     records = load_plan_files_from_disk(str(tmp_path))
 
-    assert "999" not in records
     assert records["10"].files == ("ok.py",)
+    assert [r.source for r in records.values()] == ["meta_root_plan_json"] * len(records)
 
 
 def test_load_plan_files_from_disk_on_absent_base_returns_empty(tmp_path):
