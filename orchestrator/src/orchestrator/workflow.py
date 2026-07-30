@@ -3211,16 +3211,23 @@ class TaskWorkflow:
         object-store-only via :meth:`GitOps.merge_tree_conflicts`.
 
         Fail-safe fall-through to the full pipeline (returns ``None``) on a
-        missing/non-dict stamp, a rev-parse failure, a HEAD mismatch, or a
-        confirmed conflict. On a mismatch it additionally clears the now-stale
-        stamp — main advanced and the branch was rebased to new SHAs, so it can
-        never match again, and resubmitting possibly-divergent code is exactly
-        what we must avoid. A confirmed conflict likewise clears: that
-        obligation can never be satisfied as stamped, and the full pipeline
-        gives an agent the chance to rebase and resolve (or fail as an ordinary
-        task_failure). Clear-on-consume is idempotent and loop-safe: if the
-        resumed merge re-blocks and the steward resolves again, ``_requeue``
-        re-stamps a fresh obligation.
+        missing/non-dict stamp, a rev-parse failure, a HEAD mismatch, a
+        confirmed conflict, or a failed conflict probe. Whether it also CLEARS
+        the stamp turns on whether the obligation is provably void:
+
+        * A HEAD mismatch clears — main advanced and the branch was rebased to
+          new SHAs, so it can never match again, and resubmitting
+          possibly-divergent code is exactly what we must avoid.
+        * A confirmed conflict clears — that obligation can never be satisfied
+          as stamped, and the full pipeline gives an agent the chance to rebase
+          and resolve (or fail as an ordinary task_failure).
+        * A rev-parse or probe FAILURE does NOT clear — an error is a
+          non-verdict, so the durable obligation is preserved for a later
+          dispatch rather than silently discarded on a transient fault.
+
+        Clear-on-consume is idempotent and loop-safe: if the resumed merge
+        re-blocks and the steward resolves again, ``_requeue`` re-stamps a fresh
+        obligation.
         """
         stamp = (self.task.get('metadata') or {}).get('merge_retry_pending')
         if not isinstance(stamp, dict):
@@ -3256,8 +3263,20 @@ class TaskWorkflow:
         # rebase conflict.  Resuming straight to merge with an empty plan.files
         # would then trip the merge-entry scope invariant on every dispatch
         # (task 3024), so probe the merge before honouring the fast-path.
-        main_sha = await self.git_ops.get_main_sha()
-        probe = await self.git_ops.merge_tree_conflicts(main_sha, current_head)
+        try:
+            main_sha = await self.git_ops.get_main_sha()
+            probe = await self.git_ops.merge_tree_conflicts(main_sha, current_head)
+        except Exception as exc:  # noqa: BLE001 — fail-safe: fall through to full pipeline
+            # A probe FAILURE is not a conflict VERDICT: it says nothing about
+            # whether the branch still merges.  So fall back to the full
+            # pipeline for this dispatch but leave the durable stamp intact for
+            # a later one — the opposite of the confirmed-conflict arm below.
+            logger.warning(
+                'Task %s: could not verify branch still cleanly merges resolving '
+                'merge_retry_pending (%s) — running full pipeline',
+                self.task_id, exc,
+            )
+            return None
         if not probe.clean:
             logger.warning(
                 'Task %s: merge_retry_pending branch %s no longer merges cleanly '
