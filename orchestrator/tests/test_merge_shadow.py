@@ -669,6 +669,134 @@ def test_parse_failed_run_all_members_deduplicates_preserving_order() -> None:
     assert parse_failed_run_all_members('FAILED b.sh a.sh b.sh\n') == ['b.sh', 'a.sh']
 
 
+# ---------------------------------------------------------------------------
+# The SECOND marker producer: `_ra_on_term`'s `(partial)` outer-timeout line
+# (reify tests/infra/run_all.sh:683-685).
+#
+# Both forms below are matched by the same `^FAILED\s` marker regex as the
+# clean producer, so the parser sees them whether or not it was written with
+# them in mind.  Every line fed to the parser here is READ OUT OF THE CHECKED-IN
+# FIXTURE, where it was recorded by executing the producer statements (see
+# PROVENANCE.md) — never hand-authored from prose, which is the drift class this
+# leaf exists to correct (PRD §12 root cause (a)).
+# ---------------------------------------------------------------------------
+
+
+def _run_all_fixture_line(exact: str) -> str:
+    """Return `exact` as a one-line log, sourced from the checked-in fixture.
+
+    Asserts the fixture carries the line EXACTLY once, so a future fixture edit
+    that drops or reworders these producer bytes fails loudly here instead of
+    silently turning the assertions below into no-ops against a literal that
+    nothing grounds.
+    """
+    lines = (_FIXTURE_DIR / 'run_all-failed-marker.txt').read_text().splitlines()
+    hits = [ln for ln in lines if ln == exact]
+    assert len(hits) == 1, (
+        f'fixture run_all-failed-marker.txt must carry exactly one {exact!r} '
+        f'line (producer bytes); found {len(hits)}'
+    )
+    return hits[0] + '\n'
+
+
+def test_parse_failed_run_all_members_partial_marker_without_names_refuses() -> None:
+    """`FAILED (partial)` -> [] — the empty-`_names` outer-timeout marker.
+
+    This is the FALSE-GREEN case, and the whole chain runs on a non-empty result:
+
+    1. `_ra_on_term` (run_all.sh:683-685) fires on an outer-timeout SIGTERM
+       before any member recorded a nonzero exit, so `${_names:+$_names }`
+       expands to nothing and the bare line is `FAILED (partial)`.
+    2. A parser that returns the sentinel as a member name yields
+       `['(partial)']` — NON-EMPTY.
+    3. DF then sets `REIFY_RUN_ALL_MEMBER_SUBSET='(partial)'`, so verify.sh's
+       `[ -n "${REIFY_RUN_ALL_MEMBER_SUBSET:-}" ]` gate PASSES and the safe
+       full-suite fallback never fires.
+    4. run_all.sh:1327 warns `REIFY_RUN_ALL_MEMBER_SUBSET member '(partial)' not
+       found in $INFRA_DIR (ignored)` and runs ZERO members — reporting green
+       with no coverage at all.
+
+    So `[]` here is not a nicety: it is the difference between a full retry and
+    a green that tested nothing.
+    """
+    from orchestrator.merge_shadow import parse_failed_run_all_members
+
+    log = _run_all_fixture_line('FAILED (partial)')
+    got = parse_failed_run_all_members(log)
+    assert got != ['(partial)'], (
+        'the (partial) sentinel must never be emitted as a member name — '
+        'a non-empty subset suppresses the full-suite fallback and runs zero members'
+    )
+    assert got == []
+
+
+def test_parse_failed_run_all_members_partial_marker_with_names_refuses() -> None:
+    """`FAILED a.sh b.sh (partial)` -> [] as well.
+
+    An INTERRUPTED run's failed-set is not a complete failed-set: members that
+    had not yet executed when the SIGTERM landed are neither passed nor failed,
+    so narrowing to the named failures would silently SKIP them on the retry —
+    the same coverage hole as the empty-names case, merely smaller.  Never
+    narrow on an incomplete plan.
+    """
+    from orchestrator.merge_shadow import parse_failed_run_all_members
+
+    log = _run_all_fixture_line('FAILED a.sh b.sh (partial)')
+    assert parse_failed_run_all_members(log) == []
+
+
+def test_parse_failed_run_all_members_clean_marker_unaffected_by_partial_rule() -> None:
+    """No regression: a clean marker still narrows to exactly its names."""
+    from orchestrator.merge_shadow import parse_failed_run_all_members
+
+    log = _run_all_fixture_line('FAILED test_worktree_lifecycle.sh test_skip_ledger.sh')
+    assert parse_failed_run_all_members(log) == [
+        'test_worktree_lifecycle.sh',
+        'test_skip_ledger.sh',
+    ]
+
+
+def test_parse_failed_run_all_members_last_marker_wins_across_producers() -> None:
+    """Last-marker-wins is unchanged when the two producers are interleaved.
+
+    A merge-gate log can concatenate more than one run_all invocation, and the
+    two producers can therefore appear in either order.  The refusal is a
+    property of the LAST marker only — it neither poisons an earlier clean
+    marker's result nor rescues a later partial one.
+    """
+    from orchestrator.merge_shadow import parse_failed_run_all_members
+
+    clean = _run_all_fixture_line('FAILED test_worktree_lifecycle.sh test_skip_ledger.sh')
+    partial = _run_all_fixture_line('FAILED a.sh b.sh (partial)')
+
+    # clean -> partial: the interrupted run is the final state, so refuse.
+    assert parse_failed_run_all_members(clean + 'more output\n' + partial) == []
+    # partial -> clean: a completed run superseded it, so its names govern.
+    assert parse_failed_run_all_members(partial + 'more output\n' + clean) == [
+        'test_worktree_lifecycle.sh',
+        'test_skip_ledger.sh',
+    ]
+
+
+def test_parse_failed_run_all_members_human_partial_summary_alone_is_empty() -> None:
+    """The `=== FAILED: ... (partial) ===` human summary alone still yields [].
+
+    `_ra_on_term` emits it on the line before the bare marker.  The `^FAILED`
+    anchor excludes it, so it is neither matched on its own nor double-counted
+    beside the bare marker.  Both rendered forms are covered — note the empty-
+    `_names` one carries the producer's DOUBLE space after the colon.
+    """
+    from orchestrator.merge_shadow import parse_failed_run_all_members
+
+    assert parse_failed_run_all_members(_run_all_fixture_line('=== FAILED:  (partial) ===')) == []
+    assert (
+        parse_failed_run_all_members(
+            _run_all_fixture_line('=== FAILED: a.sh b.sh (partial) ===')
+        )
+        == []
+    )
+
+
 def test_build_fail_fast_map_marks_cancelled_tests_not_started() -> None:
     """build_fail_fast_map annotates the authoritative plan with attempt-0 verdicts.
 

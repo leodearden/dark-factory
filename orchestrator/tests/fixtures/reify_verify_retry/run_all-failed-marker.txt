@@ -19,8 +19,31 @@ if [ "${#failed_names[@]}" -gt 0 ]; then
     echo "=== FAILED: ${failed_names[*]} ==="
     printf 'FAILED %s\n' "${failed_names[*]}"
 
+SECOND PRODUCER — the outer-timeout SIGTERM handler `_ra_on_term`
+(run_all.sh:683-685), also verbatim. The `${_names:+...}` guard exists precisely
+because `_names` can be EMPTY (the timeout fires before any member has recorded
+a nonzero exit); run_all.sh's own "DELIBERATE" comment block (:652-663) says the
+marker is emitted unconditionally in that case:
+
+    # Unconditional even when $_names is empty -- see "DELIBERATE" above.
+    echo "=== FAILED: ${_names} (partial) ==="
+    printf 'FAILED %s(partial)\n' "${_names:+$_names }"
+
+RENDERED PARTIAL MARKERS — NOT synthetic. The four lines below are the exact
+bytes those two statements emit, reproduced by running them in a shell on
+2026-07-31 (empty `_names` first, then `_names="a.sh b.sh"`). Note the DOUBLE
+space in the empty-names human summary — that is the producer's output, not a
+typo; do not "fix" it.
+
+=== FAILED:  (partial) ===
+FAILED (partial)
+=== FAILED: a.sh b.sh (partial) ===
+FAILED a.sh b.sh (partial)
+
 SYNTHETIC TAIL — below this line the bytes are NOT captured from a run. They use
-the exact line format the two source sites above emit, and nothing else.
+the exact line format the two source sites above emit, and nothing else. It is
+kept LAST on purpose: `parse_failed_run_all_members` is last-marker-wins, so the
+clean marker below is the one a whole-file read resolves to.
 
 --- Running: test_worktree_lifecycle.sh ---
   RESULT: FAIL (test_worktree_lifecycle.sh)

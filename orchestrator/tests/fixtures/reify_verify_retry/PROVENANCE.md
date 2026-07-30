@@ -91,9 +91,9 @@ mapping at the single write boundary.
 
 | | |
 |---|---|
-| **Grounding** | **Contract-derived from source** — *weaker* than the two above. Read this before trusting it. |
-| **Source** | `/home/leo/src/reify/tests/infra/run_all.sh:26-36` (documented contract) and `:1839-1841` (the emitting `echo`/`printf`) |
-| **Read** | 2026-07-30 |
+| **Grounding** | **Mixed.** The clean-marker tail is **contract-derived from source** — *weaker* than the two above; read this before trusting it. The partial-marker block is **producer-executed** (see below). |
+| **Source** | `/home/leo/src/reify/tests/infra/run_all.sh:26-36` (documented contract), `:1839-1841` (the emitting `echo`/`printf`), and `:683-685` (`_ra_on_term`, the partial-marker producer) |
+| **Read** | 2026-07-30; partial-marker block added 2026-07-31 |
 
 This is **not a captured run**. The header block and the emission site are
 copied verbatim from run_all.sh; the tail below the marked divider is synthetic
@@ -106,15 +106,33 @@ Corroboration that the bare `FAILED <names>` line is real and already consumed:
 DF's own `verify.py` classifies it today via the `^FAILED\s` regex (pattern
 \#7b), which run_all.sh cites by name.
 
-### Known producer variant NOT handled by the current parser
+### Second producer: the `(partial)` outer-timeout marker
 
-`run_all.sh:684-685` emits a **partial** marker when an outer timeout SIGTERMs
-the run mid-flight:
+`run_all.sh:684-685` (inside `_ra_on_term`) emits a **partial** marker when an
+outer timeout SIGTERMs the run mid-flight:
 
 ```
     echo "=== FAILED: ${_names} (partial) ==="
     printf 'FAILED %s(partial)\n' "${_names:+$_names }"
 ```
+
+Those two statements were **executed in a shell on 2026-07-31** with `_names=""`
+and with `_names="a.sh b.sh"`, and their exact stdout is checked into the
+fixture under its `RENDERED PARTIAL MARKERS` heading — so this variant is
+grounded in producer *output*, not producer *source*:
+
+```
+=== FAILED:  (partial) ===
+FAILED (partial)
+=== FAILED: a.sh b.sh (partial) ===
+FAILED a.sh b.sh (partial)
+```
+
+The `${_names:+...}` guard is what makes the empty-`_names` form possible, and
+run_all.sh's own `DELIBERATE` comment (:652-663) confirms the marker is emitted
+unconditionally in that case rather than carrying a distinct interrupted token.
+The rendered block sits ABOVE the synthetic tail so that a whole-file read still
+resolves (last-marker-wins) to the clean marker.
 
 `parse_failed_run_all_members` implements the documented
 `FAILED <space-separated names>` contract only, so against a partial marker it
