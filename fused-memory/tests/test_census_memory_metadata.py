@@ -699,10 +699,13 @@ class TestBuildReportChurn:
         cells = {'dark_factory': {OBS: _census([])}}
         cov = {'dark_factory': _coverage('fused_dark_factory', 101, {OBS: (100, 101, 101)})}
         churn = _mod.build_report(cells, cov, top_n=50)['coverage']['churn']
-        assert len(churn) == 1
-        assert churn[0]['category'] == OBS
-        assert (churn[0]['expected'], churn[0]['recount'], churn[0]['scrolled']) == (
-            100, 101, 101)
+        # The same write also moves the COLLECTION total, which is recorded as
+        # its own churn entry -- so select the per-cell one rather than
+        # pinning the list length.
+        cell_churn = [c for c in churn if c.get('category') == OBS]
+        assert len(cell_churn) == 1
+        assert (cell_churn[0]['expected'], cell_churn[0]['recount'],
+                cell_churn[0]['scrolled']) == (100, 101, 101)
 
     def test_scroll_matching_the_pre_scan_count_is_also_complete(self):
         # The write landed after the scroll passed that page: scrolled agrees

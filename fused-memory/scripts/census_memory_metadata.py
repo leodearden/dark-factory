@@ -35,13 +35,32 @@ Measured corpus facts that shape this script (live Qdrant, 2026-07-29):
 
 Any enumeration shortfall -- scrolled matching neither the pre- nor the
 post-scroll ``count_by_metadata``, page budget exhausted with a live
-``next_offset``, or sum(per-category) < collection total -- sets
-``coverage.complete=false``, names the deltas in both artifacts and exits
-non-zero. A census that under-reports is indistinguishable from a census of
-a smaller corpus, and its consumer cannot tell the difference (INV-2
-structured-facts-at-failure / no-silent-fail-soft). Each category is counted
-BEFORE and AFTER its scroll so that corpus churn on a live store (a write
-landing mid-census) is reported as churn rather than as a fake shortfall.
+``next_offset``, or a per-category sum that cannot be reconciled with the
+collection total -- sets ``coverage.complete=false``, names the deltas in
+both artifacts and exits non-zero. A census that under-reports is
+indistinguishable from a census of a smaller corpus, and its consumer
+cannot tell the difference (INV-2 structured-facts-at-failure /
+no-silent-fail-soft).
+
+Because the corpus is LIVE, every read is bracketed so ordinary drift is
+never charged as missing data -- at BOTH levels:
+
+  - Per CATEGORY: counted BEFORE and AFTER its scroll. A scroll matching
+    either count saw churn, not truncation.
+  - Per COLLECTION: ``count(scope)`` is read before the category loop and
+    again after it, giving a collection-points INTERVAL; the counted total
+    is likewise the interval (sum expected .. sum recount). The project is
+    covered when the two intervals intersect, and the reported residue is
+    the signed GAP between them -- the minimum number of points churn
+    cannot explain. Movement inside that window lands in ``coverage.churn``
+    (kind ``collection_total_moved``), never in ``coverage.deltas``.
+
+A residue that survives is still named: positive (``uncovered_points`` --
+points carrying a category outside the censused set, e.g. the measured
+79-point dual-write remainder) and negative (``surplus_counted`` --
+the collection holds fewer points than the categories counted) get
+separate diagnoses, because sending a reader hunting for an unenumerated
+category is the wrong answer to a mid-census deletion.
 
 The JSON artifact's value tables are never capped: ``--top-n`` cuts the
 MARKDOWN view only. A capped JSON table would hide in-use ``kind`` values in
@@ -405,7 +424,16 @@ def build_report(
         # top_n, which could truncate the JSON while coverage read complete);
         # top_n is now the markdown render cap only. Coverage cells gained
         # 'recount'/'churn'.
-        'schema_version': 2,
+        # v3: churn tolerance extended from the cell to the COLLECTION level.
+        # The per-project residue is now the gap between the counted interval
+        # (sum expected .. sum recount) and the collection-points interval
+        # (the bracketing count(scope) pair), not a pre-scroll sum compared
+        # against a post-scroll total. New: per-project
+        # 'collection_points_before'/'collection_points_interval'/
+        # 'counted_recount'/'counted_interval'; 'uncovered_points' is the
+        # SURVIVING residue; new delta kind 'surplus_counted' and churn kinds
+        # 'collection_total_moved'/'category_count_moved'.
+        'schema_version': 3,
         'params': {
             'projects': sorted(cells),
             'categories': category_order,
@@ -431,13 +459,33 @@ def _build_coverage(coverage: dict[str, dict[str, Any]]) -> dict[str, Any]:
     collection point total, naming every shortfall.
 
     The corpus is LIVE -- orchestrators write to it while the census runs --
-    so ``count_by_metadata`` and the page-scroll are two unsynchronised reads.
-    A cell is therefore complete when the scroll agrees with EITHER the
-    pre-scroll count (``expected``) or the post-scroll re-count (``recount``):
-    a memory landing between the two reads is corpus churn, not a truncated
-    scan, and the two must not be reported alike. Churn is still recorded
-    (``churn`` per cell, ``coverage.churn`` overall) so a reader can see the
-    corpus moved rather than infer it from a silent discrepancy.
+    so every count and the page-scroll are unsynchronised reads. Churn is
+    therefore tolerated at BOTH levels, and recorded either way (``churn``
+    per cell, ``coverage.churn`` overall) so a reader can see the corpus
+    moved rather than infer it from a silent discrepancy:
+
+    * Per CELL: complete when the scroll agrees with EITHER the pre-scroll
+      count (``expected``) or the post-scroll re-count (``recount``). A
+      memory landing between the two reads is drift, not a truncated scan.
+
+    * Per COLLECTION: the counted total is the interval
+      ``[min, max]`` over ``(sum expected, sum recount)`` and the collection
+      total is the interval over its bracketing ``count(scope)`` pair
+      (``collection_points_before`` / ``collection_points``). The project is
+      covered when the two intervals INTERSECT -- the exact statement of
+      "these unsynchronised reads are consistent with one another". The
+      reported ``uncovered_points`` is the signed GAP between the intervals,
+      i.e. the MINIMUM residue that churn cannot explain, not the raw
+      ``collection_points - sum(expected)`` difference (which compares a
+      pre-scroll sum against a post-scroll total and so charges ordinary
+      drift as missing data).
+
+    A record predating the bracket -- no ``collection_points_before`` --
+    collapses the points interval to the single post-scroll value, so an
+    older caller or fixture still reconciles exactly as before. On a stable
+    corpus both intervals collapse to points, intersection reduces to
+    equality and the gap to the raw difference, which is what keeps a real
+    residue (the measured 79-point dual-write remainder) named.
     """
     deltas: list[dict[str, Any]] = []
     churn: list[dict[str, Any]] = []
@@ -447,7 +495,8 @@ def _build_coverage(coverage: dict[str, dict[str, Any]]) -> dict[str, Any]:
     for project_id in sorted(coverage):
         record = coverage[project_id]
         per_category: dict[str, Any] = {}
-        counted = 0
+        sum_expected = 0
+        sum_recount = 0
         project_complete = True
 
         for category, counts in record.get('categories', {}).items():
@@ -456,7 +505,10 @@ def _build_coverage(coverage: dict[str, dict[str, Any]]) -> dict[str, Any]:
             raw_recount = counts.get('recount')
             recount = None if raw_recount is None else int(raw_recount)
             delta = scrolled - expected
-            counted += expected
+            sum_expected += expected
+            # A cell without a recount contributes its pre-scroll count to
+            # both bounds: absent evidence of movement, assume none.
+            sum_recount += expected if recount is None else recount
             cell_complete = delta == 0 or (recount is not None and scrolled == recount)
             cell_churn = recount is not None and recount != expected
             per_category[category] = {
@@ -469,6 +521,7 @@ def _build_coverage(coverage: dict[str, dict[str, Any]]) -> dict[str, Any]:
             }
             if cell_churn:
                 churn.append({
+                    'kind': 'category_count_moved',
                     'project_id': project_id,
                     'category': category,
                     'expected': expected,
@@ -491,22 +544,71 @@ def _build_coverage(coverage: dict[str, dict[str, Any]]) -> dict[str, Any]:
                 })
 
         collection_points = int(record.get('collection_points', 0))
-        uncovered = collection_points - counted
-        if uncovered != 0:
+        raw_before = record.get('collection_points_before')
+        # No bracket (older caller / fixture): the interval collapses to the
+        # single post-scroll read, reconciling exactly as it did before.
+        points_before = collection_points if raw_before is None else int(raw_before)
+
+        counted_lo, counted_hi = min(sum_expected, sum_recount), max(sum_expected, sum_recount)
+        points_lo, points_hi = min(points_before, collection_points), max(
+            points_before, collection_points)
+
+        # Signed gap between the two intervals; 0 when they intersect.
+        if points_lo > counted_hi:
+            uncovered = points_lo - counted_hi        # points the census never saw
+        elif points_hi < counted_lo:
+            uncovered = points_hi - counted_lo        # negative: counted more than exist
+        else:
+            uncovered = 0
+
+        if uncovered > 0:
             project_complete = False
             deltas.append({
                 'kind': 'uncovered_points',
                 'project_id': project_id,
                 'collection': record.get('collection'),
                 'collection_points': collection_points,
-                'counted': counted,
+                'collection_points_interval': [points_lo, points_hi],
+                'counted': sum_expected,
+                'counted_interval': [counted_lo, counted_hi],
                 'delta': uncovered,
+            })
+        elif uncovered < 0:
+            # The collection holds FEWER points than the categories counted:
+            # deletions landed mid-census or a category double-counted.
+            # Nothing is unenumerated, so this is NOT an uncovered residue.
+            project_complete = False
+            deltas.append({
+                'kind': 'surplus_counted',
+                'project_id': project_id,
+                'collection': record.get('collection'),
+                'collection_points': collection_points,
+                'collection_points_interval': [points_lo, points_hi],
+                'counted': sum_expected,
+                'counted_interval': [counted_lo, counted_hi],
+                'delta': uncovered,
+            })
+        elif (counted_lo, counted_hi) != (points_lo, points_hi):
+            # Absorbed by the churn window: the corpus moved under the scan.
+            # Recorded, but not a delta -- it drives neither the exit code
+            # nor the COVERAGE INCOMPLETE banner.
+            churn.append({
+                'kind': 'collection_total_moved',
+                'project_id': project_id,
+                'collection': record.get('collection'),
+                'counted_interval': [counted_lo, counted_hi],
+                'collection_points_interval': [points_lo, points_hi],
             })
 
         projects[project_id] = {
             'collection': record.get('collection'),
             'collection_points': collection_points,
-            'counted': counted,
+            'collection_points_before': points_before,
+            'collection_points_interval': [points_lo, points_hi],
+            'counted': sum_expected,
+            'counted_recount': sum_recount,
+            'counted_interval': [counted_lo, counted_hi],
+            # The SURVIVING residue -- the number that drove `complete`.
             'uncovered_points': uncovered,
             'complete': project_complete,
             'categories': per_category,
