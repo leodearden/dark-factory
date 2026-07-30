@@ -86,8 +86,18 @@ def _scope(project_id: str, project_root: str) -> ProjectScope:
 def _mock_stage_deps() -> dict:
     """Keyword deps for constructing any stage subclass in a unit test.
 
-    One construction shared by every caller, so a change to BaseStage's
-    constructor signature lands in exactly one place.
+    THE construction for the plain default case — no pre-configured mock returns,
+    no ``tmp_path`` root, the ``test_project`` / ``/tmp/test`` scope.  Every
+    ``mock_deps`` fixture in this module that wanted exactly that dict now returns
+    this helper, so a change to BaseStage's constructor signature lands in one
+    place for all of them.
+
+    Fixtures that legitimately differ still build their own dict and are NOT
+    covered by that claim: the ones that stub ``memory_service`` return values
+    (``count_memories_by_metadata``, ``delete_memory``, ``search``), the ones that
+    root ``explore_codebase_root`` at a ``tmp_path``, and the ones that need a
+    non-default scope (``reify``, ``origin``).  Reach for this helper when the
+    plain construction is what you want; don't bend a variant fixture into it.
     """
     return {
         'memory_service': AsyncMock(),
@@ -148,8 +158,15 @@ class TestDisallowedToolLists:
         for tool in DISALLOW_MEMORY_WRITES:
             assert tool not in STAGE1_DISALLOWED
 
-    def test_stage2_disallows_builtins_and_escalation_reads(self):
+    def test_stage2_disallows_builtins_and_retains_write_access(self):
         """Built-ins are blocked in Stage 2, and Stage 2 keeps memory + task writes.
+
+        Named for what it asserts and nothing more: the Stage-2 half of the
+        escalation-read denial is pinned by
+        ``test_escalation_reads_denied_in_all_three_stages`` below, which is where
+        that property belongs (all three stages, one loop).  This test does not
+        restate it — a name promising coverage its body does not carry is how a
+        deleted guard goes unnoticed.
 
         RETIRED ASSERTION: this test used to read ``STAGE2_DISALLOWED ==
         DISALLOW_BUILTIN``.  That exact equality asserted the absence of EVERY
@@ -319,16 +336,16 @@ class TestEscalationBoundaryNote:
     not a prose pin.
     """
 
-    def test_boundary_note_is_a_single_nonempty_constant(self):
-        assert isinstance(ESCALATION_BOUNDARY_NOTE, str)
-        assert ESCALATION_BOUNDARY_NOTE.strip(), 'boundary note must not be empty'
-
     def test_boundary_note_rendered_verbatim_into_all_three_stage_prompts(self):
         """One constant, three consumers, no per-stage paste (INV-5).
 
         Exactly-once, not merely present: a second copy would mean a stage
         interpolated it twice or someone pasted the prose alongside the
         constant, which is the drift this shared-constant shape exists to stop.
+
+        Also subsumes the type/non-emptiness of the constant, so no separate
+        tautology test guards that: ``str.count('')`` is ``len(s) + 1``, so an
+        empty or non-string ``ESCALATION_BOUNDARY_NOTE`` fails right here.
         """
         for prompt, name in (
             (STAGE1_SYSTEM_PROMPT, 'STAGE1_SYSTEM_PROMPT'),
@@ -605,14 +622,7 @@ class TestPerStageReportSchema:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     def test_integrity_check_returns_stage3_schema(self, mock_deps):
         stage = IntegrityCheck(StageId.integrity_check, **mock_deps)
@@ -874,14 +884,7 @@ class TestTaskKnowledgeSyncPayload:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.fixture
     def watermark(self):
@@ -1092,14 +1095,7 @@ class TestTaskKnowledgeSyncKnownProjectsSection:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.fixture
     def watermark(self):
@@ -1331,14 +1327,7 @@ class BaseStageValidationTest:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     def _patch_stage(self, stage, cli_side_effect=None):
         """Return a context manager that patches assemble_payload and run_stage_via_cli.
@@ -1675,14 +1664,7 @@ class TestProactiveSampling:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.fixture
     def watermark(self):
@@ -2235,14 +2217,7 @@ class TestStage2NoTaskIdCeiling:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.mark.asyncio
     async def test_high_task_ids_do_not_block_task_writes(self, mock_deps):
@@ -2596,14 +2571,7 @@ class TestTaskKnowledgeSyncUsesFilterTaskTree:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.fixture
     def watermark(self):
@@ -2949,14 +2917,7 @@ class TestTaskKnowledgeSyncFilteredTaskTree:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.fixture
     def watermark(self):
@@ -3265,14 +3226,7 @@ class TestInvariantAfterTask643:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.fixture
     def watermark(self):
@@ -3971,14 +3925,7 @@ class TestStage2HandoffShortfallWarning:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.fixture
     def watermark(self):
@@ -4779,14 +4726,7 @@ class TestMemoryConsolidatorFlagDedup:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.mark.asyncio
     async def test_normal_cycle_invokes_dedup_flags(self, mock_deps):
@@ -4892,14 +4832,7 @@ class TestMemoryConsolidatorTerminalMetadataFilter:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.mark.asyncio
     async def test_cancelled_task_stale_metadata_absent_from_flagged_items(self, mock_deps):
@@ -5005,14 +4938,7 @@ class TestMemoryConsolidatorStaleBulkGetStatusesFilter:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.mark.asyncio
     async def test_agreeing_flag_dropped_stat_set_and_reclaimed(self, mock_deps):
@@ -5133,14 +5059,7 @@ class TestMemoryConsolidatorFlagAcknowledgment:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.mark.asyncio
     async def test_dropped_flag_acknowledged_and_stat_set(self, mock_deps):
@@ -5474,14 +5393,7 @@ class TestMemoryConsolidatorStaleOperatorDetector:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     def _make_base_report(self, items_flagged=None):
         return StageReport(
@@ -9461,14 +9373,7 @@ class TestStage3PayloadIncludesProjectRoot:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.mark.asyncio
     async def test_integrity_check_payload_emits_use_project_root_directive(self, mock_deps):
@@ -9696,14 +9601,7 @@ class TestTaskKnowledgeSyncSuppressesStage1HumanOperatorDups:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     def _make_cli_result(self, flagged_items: list[dict]) -> MagicMock:
         """Return a fake StageResult-like object for patching run_stage_via_cli."""
@@ -10355,14 +10253,7 @@ class TestBaseStageEscalationQueueAttribute:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     def test_escalation_queue_initialised_to_none(self, mock_deps):
         """(a) Fresh MemoryConsolidator has _escalation_queue == None."""
@@ -10540,14 +10431,7 @@ class TestStage2HintConversionDetection:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.fixture
     def watermark(self):
@@ -11061,14 +10945,7 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.fixture
     def watermark(self):
@@ -11734,14 +11611,7 @@ class TestMaybeQueueBriefingRefreshTasksNoTaskmasterNoOp:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.mark.asyncio
     async def test_no_taskmaster_no_ops_without_invoking_briefing_script(self, mock_deps):
