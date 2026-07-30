@@ -338,13 +338,37 @@ declined here, for a distinct reason — none of them is "fable is bad":
 
 The earlier 22-fixture screen (`plans/eval-architect-effort-verdict-2026-07-27.md`)
 found fable the least reliable of four candidates (74% plan rate, worst of four) and
-flagged that as a preliminary signal against fable. **That signal is REFUTED by this
-campaign, not confirmed.** The 74% figure was cap contamination compounded by
-transient failures on high-variance fixtures, not a real reliability deficit — on
-clean, fully-scored cells fable's plan rate is the *highest* of the four candidates
-(94.4%, §3). The reason to decline admission here is **"no case on the merits,"** not
-**"fable is unreliable."** A future re-evaluation should not carry the old
-reliability concern forward as if this campaign had reaffirmed it.
+flagged that as a preliminary signal against fable. **That 74% plan rate does not
+reproduce here: on this campaign's clean, fully-scored cells fable's plan rate is
+94.4% — the highest of the four candidates (§3).** Call this non-replication, not
+refutation — the two campaigns overlap on too little shared ground to say the
+earlier finding was wrong.
+
+Of the five fixtures where the 07-27 run recorded a genuine fable no-plan
+(`df_task_18`, `reify_task_12`, `reify_task_3981`, `reify_task_5021`,
+`reify_task_5221`), exactly two are in this hard subset: `df_task_18` and
+`reify_task_12`. Neither reproduced fable's earlier no-plan outcome at 3 trials
+here — fable planned 3/3 on `df_task_18` and 2/3 on `reify_task_12` (§4). The other
+three (`reify_task_3981`, `reify_task_5021`, `reify_task_5221`) are outside this
+hard subset and were not re-tested by this campaign at all.
+
+This record does not re-examine the 07-27 campaign's cells, and therefore does not
+overturn that record's classification of its own no-plan cells as "genuine, outside
+cap windows." The two findings are a non-replication across different fixture sets
+(2 of the earlier 5 vs. all 6 of this hard subset) and different trial counts (n=1
+vs. n=3 per fixture) — not a correction of the earlier record. The neighbouring §5
+observation cuts the same way: pooled across both campaigns, `reify_task_12` is 2/4
+for fable *and* 2/4 for opus-max — high-variance for every candidate, not a
+fable-specific pattern.
+
+**Disposition for downstream readers.** The earlier reliability concern is
+**UNREPLICATED**, not settled in either direction. A future re-evaluation should
+neither treat it as reaffirmed nor as disproven by this campaign; the two fixtures
+that carry over and are worth watching are `df_task_18` and `reify_task_12`.
+
+The reason to decline admission here remains **"no case on the merits,"** not
+**"fable is unreliable"** — that conclusion rests on this campaign's own 94.4% plan
+rate (§3) alone and does not depend on any claim about the 07-27 campaign.
 
 ### What would change this answer
 
