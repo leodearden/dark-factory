@@ -928,3 +928,161 @@ class TestContentKey:
     def test_empty_and_whitespace_only_agree(self):
         content_key = _mod().content_key
         assert content_key('') == content_key('   \n\t ')
+
+
+# ---------------------------------------------------------------------------
+# step-11: claim recall, pure over synthetic result lists
+#
+# Claim recall is deliberately WEAKER than canonical identity: it asks whether
+# the claim comes back AT ALL, from any returned entry. That is the
+# Goodhart-resistant question — a consolidation that moved a claim into a
+# different (or merged) entry has not lost the knowledge, and a metric that
+# insisted on canonical identity would score exactly the 3111/3112
+# consolidation work this eval exists to measure as a regression.
+#
+# As everywhere else in this file: no assertion below is on a rate.
+# ---------------------------------------------------------------------------
+
+def _claim(query, *needles):
+    return _mod().ClaimQuery(query=query, needles=tuple(needles))
+
+
+CLAIM_TEXT = (
+    'The merge lane is strictly serial: one task lands at a time, and '
+    'the queue advances only after the previous merge commit is reachable.'
+)
+
+
+class TestClaimRecalled:
+    """`claim_recalled(results, claim_query, k)` — all needles, normalized, top-k."""
+
+    def test_needles_in_a_non_canonical_entry_still_count(self):
+        """(a) Recall asks 'did the claim come back', never 'from which entry'."""
+        results = [
+            _R(content='an unrelated preamble', id='X'),
+            _R(content=CLAIM_TEXT, id='SOME-OTHER-ENTRY'),
+        ]
+        outcome = _mod().claim_recalled(
+            results, _claim('how does the merge lane advance', 'strictly serial'), 5,
+        )
+
+        assert outcome.recalled
+        assert outcome.missing_needles == ()
+        assert outcome.matched_rank == 2
+
+    def test_needles_absent_from_every_entry_is_not_recalled(self):
+        outcome = _mod().claim_recalled(
+            _filler(5), _claim('how does the merge lane advance', 'strictly serial'), 5,
+        )
+
+        assert not outcome.recalled
+        assert outcome.missing_needles == ('strictly serial',)
+        assert outcome.matched_rank is None
+
+    def test_matching_is_whitespace_normalized_like_content_key(self):
+        """(c) Re-wrapping a stored line must not read as knowledge loss."""
+        results = [_R(content='the merge   lane is\n\tstrictly    serial', id='X')]
+        outcome = _mod().claim_recalled(
+            results, _claim('merge lane', 'merge lane is strictly serial'), 5,
+        )
+
+        assert outcome.recalled
+
+    def test_matching_is_case_insensitive(self):
+        """(c) Casing is presentation churn in prose — 'WRITE-SET' vs 'write-set'."""
+        results = [_R(content='the plan files list is a WRITE-SET, not a read-set', id='X')]
+        outcome = _mod().claim_recalled(
+            results, _claim('what does the plan files list mean', 'write-set'), 5,
+        )
+
+        assert outcome.recalled
+
+    def test_all_needles_are_required(self):
+        """(d) A partial match is not recall."""
+        results = [_R(content=CLAIM_TEXT, id='X')]
+        outcome = _mod().claim_recalled(
+            results,
+            _claim('merge lane', 'strictly serial', 'never rolls back a landed merge'),
+            5,
+        )
+
+        assert not outcome.recalled
+
+    def test_missing_needles_name_what_did_not_come_back(self):
+        """(d) The report must say WHAT was missing, not merely that something was."""
+        results = [_R(content=CLAIM_TEXT, id='X')]
+        outcome = _mod().claim_recalled(
+            results,
+            _claim('merge lane', 'strictly serial', 'never rolls back a landed merge'),
+            5,
+        )
+
+        assert outcome.missing_needles == ('never rolls back a landed merge',)
+        assert 'strictly serial' not in outcome.missing_needles
+
+    def test_all_needles_must_come_from_one_entry(self):
+        """Two entries jointly satisfying a claim neither one makes is not recall.
+
+        Pooling needles across the result set would let an entry mentioning
+        'strictly serial' and an unrelated entry mentioning 'rolls back'
+        manufacture a claim the corpus never stated.
+        """
+        split = [
+            _R(content='the merge lane is strictly serial', id='A'),
+            _R(content='the queue never rolls back a landed merge', id='B'),
+        ]
+        outcome = _mod().claim_recalled(
+            split,
+            _claim('merge lane', 'strictly serial', 'never rolls back a landed merge'),
+            5,
+        )
+
+        assert not outcome.recalled
+
+    def test_missing_needles_come_from_the_closest_entry(self):
+        """The best partial match is the informative one to diff against."""
+        results = [
+            _R(content='wholly unrelated filler', id='A'),
+            _R(content='the merge lane is strictly serial', id='B'),
+        ]
+        outcome = _mod().claim_recalled(
+            results,
+            _claim('merge lane', 'strictly serial', 'never rolls back a landed merge'),
+            5,
+        )
+
+        assert outcome.missing_needles == ('never rolls back a landed merge',)
+
+    def test_recall_is_confined_to_the_top_k_slice(self):
+        """(e) Same parameterised k as canonical-in-top-k."""
+        results = [*_filler(5), _R(content=CLAIM_TEXT, id='X')]
+        run = _mod().claim_recalled
+        claim = _claim('merge lane', 'strictly serial')
+
+        assert not run(results, claim, 5).recalled
+        assert run(results, claim, 10).recalled
+
+    def test_a_claim_query_with_no_needles_is_unscorable_not_recalled(self):
+        """Vacuous truth over an empty needle set would be a silent free pass.
+
+        'all of zero needles were found' is True, which would quietly inflate
+        recall for a malformed registry entry. It is disclosed as unscorable
+        instead, so leaf alpha's denominator can exclude it visibly.
+        """
+        outcome = _mod().claim_recalled(_filler(3), _claim('a claim with no needles'), 5)
+
+        assert not outcome.scorable
+        assert not outcome.recalled
+
+    def test_a_needled_claim_is_scorable(self):
+        outcome = _mod().claim_recalled(
+            [_R(content=CLAIM_TEXT, id='X')], _claim('merge lane', 'strictly serial'), 5,
+        )
+
+        assert outcome.scorable
+
+    def test_empty_results_are_not_recalled(self):
+        outcome = _mod().claim_recalled([], _claim('merge lane', 'strictly serial'), 5)
+
+        assert not outcome.recalled
+        assert outcome.missing_needles == ('strictly serial',)
