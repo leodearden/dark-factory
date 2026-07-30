@@ -427,3 +427,144 @@ class TestReadyToMergeIdempotency:
         f = await self._run(tmp_path, 'not-a-dict')
 
         assert f.merge_queue.qsize() == 1
+
+
+# ---------------------------------------------------------------------------
+# C-3 — the merge queue's re-verify is the SOLE gate on main
+# ---------------------------------------------------------------------------
+
+_LANDED = '1234abcd5678ef901234abcd5678ef901234abcd'
+
+
+@pytest.mark.asyncio
+class TestOnArchitectMergeDone:
+    """``_on_architect_merge_done`` — the FAST done flip.
+
+    The handler itself never advances main; it only enqueues.  Whether main
+    moves is decided entirely by the merge worker, and this callback merely
+    reports that decision back onto the task row.  The existing found_on_main
+    reconciler is the restart-safe DURABLE backstop for a lost callback.
+    """
+
+    async def _fire(self, tmp_path: Path, outcome) -> _Fixture:
+        from orchestrator.merge_types import MergeOutcome  # noqa: F401
+
+        f = _make(tmp_path=tmp_path)
+        await f.wf._on_architect_merge_done(outcome, tip=_TIP, evidence='ev')
+        return f
+
+    async def test_success_marks_done_via_found_on_main(self, tmp_path: Path):
+        from orchestrator.merge_types import MergeOutcome
+
+        f = await self._fire(
+            tmp_path, MergeOutcome(status='done', merge_sha=_LANDED),
+        )
+
+        f.scheduler.mark_done.assert_awaited_once()
+        call = f.scheduler.mark_done.await_args
+        assert call.args[0] == _TASK_ID
+        assert call.kwargs['kind'] == 'found_on_main'
+        assert call.kwargs['sha'] == _LANDED
+        assert 'architect' in call.kwargs['note']
+
+    @pytest.mark.parametrize('status', ['conflict', 'error', 'unmerged_state'])
+    async def test_durable_failure_leaves_task_blocked(
+        self, tmp_path: Path, status: str,
+    ):
+        from orchestrator.merge_types import MergeOutcome
+
+        f = await self._fire(tmp_path, MergeOutcome(status=status))
+
+        f.scheduler.mark_done.assert_not_awaited()
+        rows = f.event_store.fetch_events_by_type_all_runs(
+            EventType.architect_desync_merge, task_id=_TASK_ID,
+        )
+        assert len(rows) == 1
+        data = rows[0].get('data') or {}
+        assert data['decision'] == 'merge_failed'
+        assert data['status'] == status
+
+    @pytest.mark.parametrize('status', ['already_merged', 'superseded'])
+    async def test_transient_success_status_is_a_no_op_for_failure(
+        self, tmp_path: Path, status: str,
+    ):
+        """A superseded/already-merged outcome is not a failure — no L2, no
+        failure event; the branch and lane are preserved by omission."""
+        from orchestrator.merge_types import MergeOutcome
+
+        f = await self._fire(tmp_path, MergeOutcome(status=status))
+
+        rows = f.event_store.fetch_events_by_type_all_runs(
+            EventType.architect_desync_merge, task_id=_TASK_ID,
+        )
+        assert [
+            r for r in rows
+            if (r.get('data') or {}).get('decision') == 'merge_failed'
+        ] == []
+
+    async def test_unclassified_status_is_treated_as_a_durable_failure(
+        self, tmp_path: Path,
+    ):
+        """Loud over silent: a status in neither classification set must not
+        silently no-op into a stranded task with no operator signal."""
+        from orchestrator.merge_types import MergeOutcome
+
+        f = await self._fire(
+            tmp_path, MergeOutcome(status='brand_new_status'),  # type: ignore[arg-type]
+        )
+
+        f.scheduler.mark_done.assert_not_awaited()
+        rows = f.event_store.fetch_events_by_type_all_runs(
+            EventType.architect_desync_merge, task_id=_TASK_ID,
+        )
+        assert (rows[0].get('data') or {})['decision'] == 'merge_failed'
+
+    async def test_success_without_a_merge_sha_does_not_mark_done(
+        self, tmp_path: Path,
+    ):
+        """found_on_main provenance needs a landed SHA — a 'done' with none is
+        an unusable signal, so degrade to the reconciler backstop rather than
+        writing bogus provenance."""
+        from orchestrator.merge_types import MergeOutcome
+
+        f = await self._fire(tmp_path, MergeOutcome(status='done'))
+
+        f.scheduler.mark_done.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+class TestHandlerNeverAdvancesMain:
+    """C-3 boundary: the handler enqueues and nothing more."""
+
+    async def test_handler_calls_no_land_main_primitive(self, tmp_path: Path):
+        f = _make(tmp_path=tmp_path)
+        f.artifacts.write_ready_to_merge(commit=_TIP, evidence='ev')
+
+        await f.wf._handle_ready_to_merge_report()
+
+        for primitive in ('advance_main', 'merge_to_main', 'push_main'):
+            assert not getattr(f.git_ops, primitive).called, primitive
+        # A queued request whose future is still pending is the whole point:
+        # main moves only if the merge worker's own re-verify says so.
+        assert f.merge_queue.qsize() == 1
+        assert not f.merge_queue.get_nowait().result.done()
+
+    async def test_registered_callback_routes_to_on_architect_merge_done(
+        self, tmp_path: Path,
+    ):
+        """The submitted request's future is wired to the terminal callback —
+        without this the FAST done flip would never fire."""
+        from orchestrator.merge_types import MergeOutcome
+
+        f = _make(tmp_path=tmp_path)
+        f.artifacts.write_ready_to_merge(commit=_TIP, evidence='ev')
+        await f.wf._handle_ready_to_merge_report()
+        req = f.merge_queue.get_nowait()
+
+        req.result.set_result(MergeOutcome(status='done', merge_sha=_LANDED))
+        # The sync callback schedules the async body; drain it.
+        await asyncio.sleep(0)
+        await asyncio.gather(*list(f.wf._background_tasks))
+
+        f.scheduler.mark_done.assert_awaited_once()
+        assert f.scheduler.mark_done.await_args.kwargs['sha'] == _LANDED
