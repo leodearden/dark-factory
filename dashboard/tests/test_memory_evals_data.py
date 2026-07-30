@@ -1042,3 +1042,149 @@ class TestEscalationJoin:
         assert [entry['id'] for entry in unmatched] == ['esc-unmatched']
         assert set(unmatched[0]) == _ESCALATION_KEYS
         assert unmatched[0]['dedupe_fingerprint'] == _FP_UNMATCHED
+
+
+# ---------------------------------------------------------------------------
+# step-13 — storm collapse, modelled (gamma's gate owns the full matrix)
+# ---------------------------------------------------------------------------
+
+_STORM_RUN = '20260706T031500Z'
+_FP_AGGREGATE = '77665544332211009988aabbccddeeff'
+_FP_STORM_A = '11223344556677889900112233445566'
+_FP_STORM_B = '66554433221100998877665544332211'
+
+_STORM_KEYS = {'triggered', 'alarm_count', 'aggregate_fingerprint', 'escalation'}
+
+
+def _storm_tree(
+    tmp_path: Path,
+    *,
+    storm: dict | None,
+    aggregate_escalation: bool = True,
+    per_metric_escalation: bool = False,
+) -> tuple[Path, Path]:
+    """Two alarming metrics and one quiet one, under an optional storm block."""
+    root = tmp_path / 'memory-evals'
+    esc_dir = tmp_path / 'escalations'
+    esc_dir.mkdir(parents=True, exist_ok=True)
+
+    _write_metrics(root, 'eval-a', _STORM_RUN, [
+        _metric('storm-a', 'count', 9.0, direction='higher_is_worse'),
+        _metric('storm-b', 'count', 8.0, direction='higher_is_worse'),
+        _metric('quiet-metric', 'scalar', 44.0),
+    ])
+    _write_limits(root, 'eval-a', run_stamp=_STORM_RUN)
+    _write_verdicts(
+        root,
+        [
+            _verdict('eval-a', 'storm-a', 'alarm', fingerprint=_FP_STORM_A, run_stamp=_STORM_RUN),
+            _verdict('eval-a', 'storm-b', 'alarm', fingerprint=_FP_STORM_B, run_stamp=_STORM_RUN),
+            _verdict('eval-a', 'quiet-metric', 'no_alarm', fingerprint='quietfingerprint0000000000000000', run_stamp=_STORM_RUN),
+        ],
+        storm_escape=storm,
+        run_stamp=_STORM_RUN,
+    )
+
+    if aggregate_escalation:
+        _write_escalation(
+            esc_dir, 'esc-storm-aggregate',
+            dedupe_fingerprint=_FP_AGGREGATE,
+            summary='memory-eval storm: 2 metrics alarmed in one run',
+            severity='blocking', level=1,
+            timestamp=_JOIN_ESC_TIMESTAMP,
+        )
+    if per_metric_escalation:
+        _write_escalation(
+            esc_dir, 'esc-storm-a',
+            dedupe_fingerprint=_FP_STORM_A,
+            summary='storm-a regressed', severity='blocking', level=1,
+            timestamp=_JOIN_ESC_TIMESTAMP,
+        )
+    return root, esc_dir
+
+
+class TestStormCollapseModelled:
+    """The storm-escape state is MODELLED here; gamma's gate owns the matrix.
+
+    Scope note: alpha proves the payload can represent a storm honestly — the
+    aggregate resolves, per-metric links collapse, and the aggregate is not
+    double-counted as unexplained.  The full both-directions parity matrix and
+    the re-verification against the committed verdicts exemplar are gamma's
+    gate and are deliberately not duplicated here.
+    """
+
+    def test_storm_block_is_surfaced_and_its_aggregate_resolved(self, tmp_path: Path) -> None:
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _storm_tree(tmp_path, storm={
+            'triggered': True, 'alarm_count': 2, 'aggregate_fingerprint': _FP_AGGREGATE,
+        })
+
+        storm = build_memory_evals(root, esc_dir)['evals'][0]['storm_escape']
+
+        assert set(storm) == _STORM_KEYS
+        assert storm['triggered'] is True
+        assert storm['alarm_count'] == 2
+        assert storm['aggregate_fingerprint'] == _FP_AGGREGATE
+        assert storm['escalation']['id'] == 'esc-storm-aggregate'
+        assert set(storm['escalation']) == _ESCALATION_KEYS
+
+    def test_per_metric_links_collapse_into_the_aggregate(self, tmp_path: Path) -> None:
+        """No per-metric links during a storm — the aggregate is the one alert."""
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _storm_tree(
+            tmp_path,
+            storm={'triggered': True, 'alarm_count': 2, 'aggregate_fingerprint': _FP_AGGREGATE},
+            per_metric_escalation=True,
+        )
+
+        rows = build_memory_evals(root, esc_dir)['evals'][0]['metrics']
+
+        for metric_id in ('storm-a', 'storm-b'):
+            row = _only(rows, metric_id)
+            assert row['verdict'] == 'alarm'
+            assert row['escalation'] is None
+            assert row['parity'] == 'storm_collapsed'
+        # A quiet metric is still quiet during a storm.
+        assert _only(rows, 'quiet-metric')['parity'] == 'clear'
+
+    def test_aggregate_is_not_also_reported_unexplained(self, tmp_path: Path) -> None:
+        """It IS explained — by the storm block, not by a metric row."""
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _storm_tree(tmp_path, storm={
+            'triggered': True, 'alarm_count': 2, 'aggregate_fingerprint': _FP_AGGREGATE,
+        })
+
+        payload = build_memory_evals(root, esc_dir)
+
+        assert [entry['id'] for entry in payload['unmatched_escalations']] == []
+
+    def test_untriggered_storm_leaves_normal_parity(self, tmp_path: Path) -> None:
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _storm_tree(
+            tmp_path,
+            storm={'triggered': False, 'alarm_count': 0, 'aggregate_fingerprint': None},
+            aggregate_escalation=False,
+            per_metric_escalation=True,
+        )
+
+        payload = build_memory_evals(root, esc_dir)
+
+        assert payload['evals'][0]['storm_escape'] is None
+        rows = payload['evals'][0]['metrics']
+        assert _only(rows, 'storm-a')['parity'] == 'alarmed_open'
+        assert _only(rows, 'storm-a')['escalation']['id'] == 'esc-storm-a'
+        assert _only(rows, 'storm-b')['parity'] == 'alarmed_unlinked'
+
+    def test_absent_storm_block_is_none(self, tmp_path: Path) -> None:
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _storm_tree(tmp_path, storm=None, aggregate_escalation=False)
+
+        payload = build_memory_evals(root, esc_dir)
+
+        assert payload['evals'][0]['storm_escape'] is None
+        assert _only(payload['evals'][0]['metrics'], 'storm-a')['parity'] == 'alarmed_unlinked'
