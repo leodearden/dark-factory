@@ -23,6 +23,7 @@ import pytest
 
 from fused_memory.backends.mem0_client import _MEM0_MANAGED_METADATA_KEYS
 from fused_memory.config.schema import Mem0UpdateConfig
+from fused_memory.models.enums import MemoryCategory
 
 _PROJECT_ID = 'dark_factory'
 _MEMORY_ID = '77a3f6bc-0000-0000-0000-000000000000'
@@ -186,6 +187,112 @@ class TestReservedKeys:
         )
         _assert_rejected(result, mock_service, 'created_at')
         assert result.get('status') != 'updated', result
+
+
+class TestCategoryIsProtectedAtTheBoundary:
+    """`category` cannot be deleted, and cannot be patched to a bogus value.
+
+    The service layer already stops `category` being lost SILENTLY: a
+    `metadata_mode='replace'` that never named the key carries it through
+    (`_apply_metadata_delta`). This closes the EXPLICIT half of the same hole —
+    a caller-supplied delta that names the key destructively — which that
+    carry-through deliberately leaves reachable.
+
+    Both rules exist for the same reason the carry-through does:
+    ``Mem0Backend.search`` pushes `category` down to Qdrant as a payload
+    filter, so a record with the key missing — or holding a string no
+    ``MemoryCategory`` filter can ever match — is permanently unreachable by
+    every category-scoped search. A value that is wrong is exactly as invisible
+    as a value that is absent, so validating one without the other would leave
+    the hole open.
+
+    Same posture as the mem0-owned reserved-key rejections, but a DIFFERENT
+    rule, and the difference is the point: mem0-owned keys are refused from
+    BOTH arms because mem0 recomputes them, whereas `category` is refused only
+    from the delete arm and stays freely patchable. There is no coherent caller
+    intent behind removing it — a caller who wants a different category patches
+    it — so the delete arm is where the line goes.
+    """
+
+    @pytest.mark.asyncio
+    async def test_deleting_category_is_rejected_naming_it(self):
+        mock_service = _mock_service()
+        result = await _call_tool(mock_service, metadata_delete_keys=['category'])
+        _assert_rejected(result, mock_service, 'category')
+
+    @pytest.mark.asyncio
+    async def test_deleting_category_alongside_an_ordinary_key_is_still_rejected(self):
+        """The rule is per-key, not "the list is entirely ordinary keys"."""
+        mock_service = _mock_service()
+        result = await _call_tool(
+            mock_service, metadata_delete_keys=['topic', 'category'],
+        )
+        _assert_rejected(result, mock_service, 'category')
+
+    @pytest.mark.asyncio
+    async def test_bogus_category_value_is_rejected_naming_value_and_valid_ones(self):
+        """A category no filter can match leaves the record as unreachable as a
+        missing one, so the boundary that already validates reserved KEYS must
+        not wave through an unmatchable VALUE."""
+        mock_service = _mock_service()
+        result = await _call_tool(
+            mock_service, metadata_patch={'category': 'not_a_real_category'},
+        )
+        _assert_rejected(
+            result, mock_service, 'not_a_real_category', 'observations_and_summaries',
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('bad', [
+        '', 'OBSERVATIONS_AND_SUMMARIES', 'observations and summaries', 12,
+    ], ids=['empty', 'wrong_case', 'spaces', 'non_string'])
+    async def test_every_unmatchable_category_value_is_rejected(self, bad):
+        """Including the near-misses: Qdrant payload equality is exact, so a
+        case- or separator-variant is just as invisible as a typo."""
+        mock_service = _mock_service()
+        result = await _call_tool(mock_service, metadata_patch={'category': bad})
+        assert result.get('error_type') == 'ValidationError', result
+        mock_service.update_memory.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('value', [c.value for c in MemoryCategory])
+    async def test_every_valid_category_is_accepted(self, value):
+        """Protected, not frozen — a deliberate re-categorization must reach the
+        service, validated against the same enum add_memory resolves through."""
+        mock_service = _mock_service()
+        result = await _call_tool(mock_service, metadata_patch={'category': value})
+        assert result.get('error_type') is None, result
+        mock_service.update_memory.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_deleting_an_ordinary_custom_key_still_succeeds(self):
+        """The delete arm is narrowed by exactly one key, not closed."""
+        mock_service = _mock_service()
+        result = await _call_tool(mock_service, metadata_delete_keys=['topic'])
+        assert result.get('error_type') is None, result
+        mock_service.update_memory.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_a_replace_that_omits_category_is_not_an_error(self):
+        """The explicit record of which of the review's two fixes shipped.
+
+        Rejecting any replace whose patch omits `category` would force every
+        replace caller to restate the key and turn a routine tag edit into an
+        error. What protects the key here is the service-layer carry-through,
+        not a boundary rejection — so this call must sail straight through.
+        """
+        mock_service = _mock_service()
+        result = await _call_tool(
+            mock_service, metadata_patch={'topic': 'cgl-eta'}, metadata_mode='replace',
+        )
+        assert result.get('error_type') is None, result
+        mock_service.update_memory.assert_called_once()
+        kwargs = mock_service.update_memory.call_args.kwargs
+        assert 'category' not in (kwargs.get('metadata_patch') or {}), (
+            'the boundary must not silently inject a category the caller never '
+            'named — carrying it through is the service layer\'s job, where the '
+            'record\'s ACTUAL existing value is known'
+        )
 
 
 class TestContradictoryArms:
