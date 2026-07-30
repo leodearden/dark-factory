@@ -10,14 +10,24 @@ are syntactically valid — independently of the *resolution* half
 (``test_warm_lane_script_resolution.py``), which pins how ``GitOps`` chooses
 between a project override and these copies.
 
-The sibling-wiring class is the load-bearing one.  ``warm-lane-gc.sh`` and
-``warm-lane-gc-sweep.sh`` ``source "$SCRIPT_DIR/lib_live_refs.sh"`` and
-deliberately ``exit 2`` when it is absent (reify task 5572 made that fail-loud
-precisely so a silently-missing liveness guard cannot recur);
-``warm-lane-audit.sh`` sources ``$SCRIPT_DIR/lib_portable.sh``.  Neither lib is
-one of the seven named scripts, so a seven-file-only relocation would ship
-three scripts that cannot execute.  Running each with ``--help`` from the new
-directory is the executable proof that the two libs actually travelled along.
+The sibling-wiring class is the load-bearing one.  Three of the seven source a
+lib that is not itself one of the seven, so a seven-file-only relocation would
+ship three scripts that cannot execute:
+
+* ``warm-lane-gc.sh`` and ``warm-lane-gc-sweep.sh`` source
+  ``$SCRIPT_DIR/lib_live_refs.sh`` and deliberately ``exit 2`` when it is
+  absent (reify task 5572 made that fail-loud precisely so a silently-missing
+  liveness guard cannot recur).
+* ``warm-lane-audit.sh`` sources TWO: ``$SCRIPT_DIR/lib_portable.sh``, and —
+  since dark-factory task 3074 (leaf β) — ``$SCRIPT_DIR/lib_lane_state.sh``,
+  behind a guard copied in shape from ``warm-lane-gc.sh``'s.  Unlike the other
+  two libs ``lib_lane_state.sh`` is dark-factory-NATIVE rather than a reify
+  relocation: it holds the facts only dark-factory owns (the ``.lane-state``
+  record format and ``PROTECTED_PREFIXES``), which is why the audit's
+  ``assigned`` column can no longer be produced without it.
+
+Running each with ``--help`` from the new directory is the executable proof
+that all three libs actually travelled along.
 """
 from __future__ import annotations
 
@@ -100,9 +110,10 @@ class TestSiblingLibsTravelledWithTheScripts:
 
     Each is invoked with ``--help`` (read-only, no mount, no subprocess side
     effects) from ``orchestrator/scripts/warm-lane/``.  A missing sibling lib
-    surfaces either as the script's own fail-loud wiring message + ``exit 2``
-    (``lib_live_refs.sh``) or as bash's ``source`` failure (``lib_portable.sh``),
-    so both shapes are asserted against.
+    surfaces in one of two shapes, and both are asserted against: the script's
+    own fail-loud wiring message + ``exit 2`` (``lib_live_refs.sh`` in the gc
+    scripts, ``lib_lane_state.sh`` in the audit), or bash's bare ``source``
+    failure (``lib_portable.sh``, which has no explicit guard).
     """
 
     #: Exit 2 is the wiring/usage sentinel both gc scripts use for
