@@ -410,6 +410,15 @@ Conventions:
   high similarity (error_type=ProceduralKnowledgeNearDuplicateWriteRejected). For either, override with
   metadata={'allow_near_duplicate': True} only when the content is genuinely distinct; recon-stage-*
   agents are exempt from both.
+- Never write raw MCP envelope markup into a payload. add_memory/add_episode content and
+  submit_task/update_task title/description/details/prompt are REJECTED
+  (error_type=McpEnvelopeMarkupWriteRejected) when they carry a leaked tool-call envelope
+  fragment; the response names the matched pattern and the offending field. This catches a
+  harness serialization bug whose specimens are permanent once stored (and which made a task
+  parser derive a wrong priority silently), so strip the fragment and resubmit rather than
+  rewording around it. Override with metadata={'allow_mcp_markup': True} only when the markup
+  is quoted deliberately (e.g. documenting the leak). The authoritative pattern list and
+  rationale live in fused_memory/server/markup_tripwire.py.
 - Tasks may carry memory_hints in metadata — structured pointers (search queries + entity names)
   that help future agents prefetch relevant context. Execute hint queries via search, look up
   hint entities via get_entity.
@@ -990,6 +999,17 @@ def create_mcp_server(
         through Graphiti's extraction pipeline, then classified facts are dual-written
         to Mem0 as appropriate. Returns immediately; processing happens in background.
 
+        Content carrying raw MCP envelope markup is REJECTED outright
+        (error_type=McpEnvelopeMarkupWriteRejected) — a harness serialization
+        bug has been leaking fragments such as ``</content>``,
+        ``<parameter name=`` and ``</invoke>`` into write payloads, and each one
+        that lands is a permanent corpus specimen (worse here than for
+        add_memory: extraction would fan the fragment out across derived facts).
+        Strip the fragment and resubmit, or set
+        metadata={'allow_mcp_markup': True} if you are quoting the markup
+        deliberately. See :mod:`fused_memory.server.markup_tripwire` for the
+        authoritative pattern list and rationale.
+
         Args:
             content: Raw text, conversation, or JSON to ingest
             project_id: Project scope (required)
@@ -997,7 +1017,10 @@ def create_mcp_server(
             agent_id: Which agent is writing (optional, auto-derived from MCP context)
             session_id: Session context (optional, auto-derived from MCP context)
             source_description: E.g. "pair programming session"
-            metadata: Optional key-value pairs (may contain _causation_id for recon)
+            metadata: Optional key-value pairs (may contain _causation_id for recon).
+                Set {'allow_mcp_markup': True} to bypass the MCP-markup tripwire
+                when the content quotes envelope markup deliberately; the flag is
+                write-time-only and is stripped before persistence.
             temporal_context: Optional temporal framing — one of "retrospective",
                 "planning", or "current". When set, the value is prepended to
                 source_description as '[temporal:X] ' so downstream readers can
@@ -1163,6 +1186,16 @@ def create_mcp_server(
         replaces, with no ordering guarantee that those duplicates are
         deleted first).
 
+        Content carrying raw MCP envelope markup is REJECTED outright
+        (error_type=McpEnvelopeMarkupWriteRejected) — a harness serialization
+        bug has been leaking fragments such as ``</content>``,
+        ``<parameter name=`` and ``</invoke>`` into write payloads, and each one
+        that lands is a permanent corpus specimen. Strip the fragment and
+        resubmit. If you are quoting such markup DELIBERATELY (documenting the
+        leak itself), set metadata={'allow_mcp_markup': True}. See
+        :mod:`fused_memory.server.markup_tripwire` for the authoritative pattern
+        list and rationale.
+
         Args:
             content: The memory itself (a fact, preference, procedure, etc.)
             project_id: Project scope (required)
@@ -1174,8 +1207,10 @@ def create_mcp_server(
             metadata: Arbitrary key-value pairs (optional). For procedural_knowledge,
                       set {'allow_near_duplicate': True} to bypass both the topic-cluster
                       and near-duplicate write guards when the content is genuinely
-                      distinct. This flag is write-time-only and is stripped before
-                      persistence — it is never stored on the resulting memory.
+                      distinct. Set {'allow_mcp_markup': True} to bypass the MCP-markup
+                      tripwire when the content quotes envelope markup deliberately.
+                      Both flags are write-time-only and are stripped before
+                      persistence — neither is ever stored on the resulting memory.
             dual_write: Force write to both stores (default: false)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
@@ -3790,6 +3825,18 @@ def create_mcp_server(
         "planning_mode": True}`` synchronously — no ticket, no
         ``resolve_ticket`` follow-up needed.
 
+        ``title``/``description``/``details``/``prompt`` carrying raw MCP
+        envelope markup are REJECTED outright
+        (error_type=McpEnvelopeMarkupWriteRejected) before the description
+        parser sees them. A harness serialization bug has been leaking fragments
+        such as ``</content>``, ``<parameter name=`` and ``</invoke>`` into task
+        text, where the parser then derived WRONG values from them silently
+        (one reify task was filed priority=high and stored as medium). Strip the
+        fragment and resubmit, or set metadata={'allow_mcp_markup': True} if you
+        are quoting the markup deliberately (e.g. filing a task ABOUT the leak).
+        See :mod:`fused_memory.server.markup_tripwire` for the authoritative
+        pattern list and rationale.
+
         Args:
             project_root: Absolute path to project root
             prompt: Task description for AI generation (forwarded to Taskmaster)
@@ -3802,6 +3849,11 @@ def create_mcp_server(
                 tasks may supply ``before_done`` (required: ``script`` path
                 under project_root that exists and is executable, ``timeout_secs``
                 positive int) and/or ``always_escalates`` (bool) in metadata.
+
+                allow_mcp_markup (optional): set to ``True`` to bypass the
+                MCP-markup tripwire when the task text quotes envelope markup
+                deliberately. Write-time-only — it is stripped before
+                persistence, so it never enters the task metadata vocabulary.
 
                 complexity (optional): set to "simple" to route this task to
                 the single-agent fast path (one Sonnet agent explores, plans,
@@ -4323,6 +4375,16 @@ def create_mcp_server(
         path which can drift on re-rewrite. It will be removed once the
         sqlite cutover is complete.
 
+        ``title``/``description``/``details``/``prompt`` carrying raw MCP
+        envelope markup are REJECTED outright
+        (error_type=McpEnvelopeMarkupWriteRejected) before the description parser
+        sees them — same guard, same reasoning as ``submit_task``. Strip the
+        leaked fragment and resubmit, or set metadata={'allow_mcp_markup': True}
+        if you are quoting the markup deliberately (which is the case when
+        updating a task ABOUT the leak). See
+        :mod:`fused_memory.server.markup_tripwire` for the authoritative pattern
+        list and rationale.
+
         Args:
             id: Task ID to update
             project_root: Absolute path to project root
@@ -4331,7 +4393,10 @@ def create_mcp_server(
                 is a shallow last-write-wins merge: ``{**existing, **incoming}``.
                 Omitted keys from ``metadata`` are preserved; every supplied key
                 (scalar or list) overwrites wholesale. Use ``metadata_mode`` to
-                change this behavior.
+                change this behavior.  ``allow_mcp_markup=True`` bypasses the
+                MCP-markup tripwire for deliberately quoted markup; it is
+                write-time-only and stripped before the merge, so it is never
+                persisted.
             metadata_mode: Controls how ``metadata`` is merged with the existing
                 blob. One of:
                 - ``'merge'`` (default when omitted) — shallow last-write-wins.
