@@ -804,6 +804,13 @@ def evaluate_series(
     ``snapshotted_metric_ids``). Metrics not in the current run stay in the
     ledger — a probe that skipped a run has not become new again.
 
+    The grandfather set handed in must be the PERSISTED, metric-scoped form.
+    An unscoped entry is rejected outright rather than quietly ignored: it
+    matches no metric's prefix, so every one of that metric's known-bad items
+    would alarm and the artifact would then publish the unscoped junk as state.
+    :func:`evaluate_tripwire`'s return value is the obvious wrong seed — it
+    speaks bare item_keys for a single metric — so the guard names it.
+
     Passing ``snapshotted_metrics=None`` alongside a non-``None`` grandfather
     means the ledger was not carried, which is a caller bug rather than a
     supported mode (``load_limits_artifact`` always supplies it). It is read
@@ -816,6 +823,18 @@ def evaluate_series(
     window = list(baseline_window)[-config.baseline_window :] if config.baseline_window > 0 else []
     alarm_eligible = [m for m in current.metrics if m.kind != 'scalar']
     alpha = derive_alpha(config.false_alarm_budget, config.runs_per_quarter, len(alarm_eligible))
+
+    if grandfather is not None:
+        unscoped = sorted(k for k in grandfather if GRANDFATHER_KEY_SEPARATOR not in k)
+        if unscoped:
+            raise ValueError(
+                f'evaluate_series: grandfather entries {unscoped} are not metric-scoped. '
+                'This function takes the PERSISTED set, whose entries are '
+                f'"<metric_id>{GRANDFATHER_KEY_SEPARATOR}<item_key>" — chain a previous '
+                "EvaluationResult.grandfather (or a loaded artifact's grandfather_set), or "
+                'compose keys with scoped_grandfather_key(). Note evaluate_tripwire returns '
+                'BARE item_keys for one metric and its output is not a valid seed on its own.'
+            )
 
     verdicts: list[MetricVerdict] = []
     # The persisted set is SCOPED BY METRIC (see GRANDFATHER_KEY_SEPARATOR).

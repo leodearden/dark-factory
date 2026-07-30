@@ -23,6 +23,7 @@ from pathlib import Path
 import pytest
 
 from shared.memory_eval_limits import (
+    GRANDFATHER_KEY_SEPARATOR,
     LimitsConfig,
     MetricVerdict,
     binomial_two_sided_p,
@@ -724,6 +725,42 @@ class TestGrandfatherScopingAcrossMetrics:
         keys = {scoped_grandfather_key('probe-a', 'ns::item')}
         assert grandfather_slice(keys, 'probe-a') == frozenset({'ns::item'})
 
+    def test_an_unscoped_grandfather_seed_is_refused(self):
+        """The bare-item_key seed is rejected, not silently ignored.
+
+        evaluate_tripwire returns bare item_keys for ONE metric; evaluate_series
+        consumes the persisted, metric-scoped set. Feeding the former to the
+        latter is the natural mistake — it type-checks, and both are
+        frozenset[str] — and it fails silently in the worst way: the seed
+        matches no prefix, so every known-bad item alarms and the artifact then
+        publishes the unscoped keys as state. Refuse it at the door instead,
+        naming the trap, since a downstream runner leaf will be copying this
+        seeding recipe.
+        """
+        run = self._run({'a1': False})
+        _, bare = evaluate_tripwire(run.metrics[0], None)
+        assert bare == frozenset({'a1'})  # bare, by evaluate_tripwire's contract
+
+        with pytest.raises(ValueError, match='not metric-scoped'):
+            evaluate_series(run, [], self.CONFIG, bare)
+
+    def test_a_partly_unscoped_seed_is_refused_too(self):
+        # One bad key is enough: a set that is mostly scoped is not a set that
+        # can be trusted, and the message names the offenders.
+        with pytest.raises(ValueError, match="\\['a1'\\]"):
+            evaluate_series(
+                self._run({'a1': False}),
+                [],
+                self.CONFIG,
+                frozenset({'probe-a::a1', 'a1'}),
+            )
+
+    def test_an_empty_seed_is_not_mistaken_for_an_unscoped_one(self):
+        # Nothing to scope is not the same as wrongly scoped: an eval whose
+        # every known-bad item has been fixed resumes from an empty set.
+        result = evaluate_series(self._run({'a1': True}), [], self.CONFIG, frozenset())
+        assert result.alarms == ()
+
     def test_a_metric_id_containing_the_separator_is_refused(self):
         # Ambiguous by construction: 'probe::a' + '::' + 'x' is also
         # 'probe' + '::' + 'a::x'. Refuse loudly rather than mis-scope quietly.
@@ -1010,6 +1047,21 @@ class TestBudgetMovesTheVerdict:
         assert verdict.baseline_run_stamps == _BASELINE_STAMPS[1:]
 
 
+def _seeded_state() -> tuple[frozenset[str], frozenset[str]]:
+    """Resumable state as a runner actually holds it: an earlier run's output.
+
+    Seeding by calling ``evaluate_tripwire`` directly is a trap worth naming,
+    because it looks right: that function speaks BARE item_keys for one metric,
+    while the persisted set ``evaluate_series`` consumes is metric-scoped. A
+    hand-built bare seed matches no prefix, so every known-bad item alarms and
+    the artifact publishes the unscoped keys as state. ``evaluate_series``
+    rejects such a seed now, and chaining a previous ``EvaluationResult`` — the
+    recipe the downstream runner leaves should copy — cannot get it wrong.
+    """
+    seed = evaluate_series(_series(_BASELINE_STAMPS[-1]), [], _config(), None)
+    return seed.grandfather, seed.snapshotted_metrics
+
+
 def _config(budget: float = 1.0, *, baseline_window: int = 3) -> LimitsConfig:
     return LimitsConfig(
         false_alarm_budget=budget,
@@ -1100,18 +1152,28 @@ class TestLimitsArtifact:
     def test_artifact_records_the_current_alarms(self, tmp_path):
         # The regression run, evaluated against a seeded grandfather set, so
         # all three alarm kinds are present at once.
-        _, seeded = evaluate_tripwire(
-            _metric(_series(_BASELINE_STAMPS[-1]), 'topic-canonical-present'), None
+        grandfather, snapshotted = _seeded_state()
+        result = evaluate_series(
+            _series(_REGRESSION_STAMP), _baseline(), _config(), grandfather, snapshotted
         )
-        result = evaluate_series(_series(_REGRESSION_STAMP), _baseline(), _config(), seeded)
         path = limits_artifact_path(tmp_path, result.eval_id)
         write_limits_artifact(result, path)
         data = json.loads(path.read_text())
 
+        # An equality, not an `any`: a membership check would still pass with
+        # the per-metric scoping deleted, because the extra alarms a mis-seeded
+        # run produces are additions rather than removals.
+        assert {(a['metric_id'], a['item_key']) for a in data['alarms']} == {
+            ('canonical-in-top-5', None),
+            ('dangling-pointers', None),
+            ('topic-canonical-present', 't-worktree-lifecycle'),
+        }
         assert len(data['alarms']) == len(result.alarms)
-        assert {a['metric_id'] for a in data['alarms']} == {a.metric_id for a in result.alarms}
-        assert any(a['item_key'] == 't-worktree-lifecycle' for a in data['alarms'])
         assert all('detail' in a for a in data['alarms'])
+        # t-recon-watcher-triage fails in every run and is grandfathered, so its
+        # ABSENCE above is the seed actually taking effect.
+        assert 'topic-canonical-present::t-recon-watcher-triage' in data['grandfather_set']
+        assert all(GRANDFATHER_KEY_SEPARATOR in key for key in data['grandfather_set'])
 
     def test_round_trip_restores_the_grandfather_set_exactly(self, tmp_path):
         result, path = self._write(tmp_path)
