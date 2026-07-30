@@ -3122,29 +3122,25 @@ class TestContendedLeaseDefers:
 
         lease = _local_lease()
 
-        import orchestrator.merge_queue as mq_mod  # noqa: PLC0415
+        # Observed at the BEHAVIOURAL seam rather than by spying the
+        # safety_valve_due flag: _acquire_warm_verify_worktree's serial-head
+        # branch returns the ephemeral merge_wt untouched when the valve is due
+        # (`if not persistent_merge_worktree or safety_valve_due: return
+        # merge_wt, False`), so it calls reset_persistent_merge_worktree on a
+        # NOT-due attempt and skips it on a due one.  Spying that PUBLIC GitOps
+        # method pins the same 1-based contract through its observable effect —
+        # a cold from-scratch verify on the Nth attempt — and keeps this file
+        # clear of a new orchestrator.merge_queue.<private> reach-back patch,
+        # which test_merge_queue_reachback_patch_guard.py freezes by name (the
+        # private is imported into merge_queue at module load, so patching the
+        # defining merge_liveness module would not take effect and an
+        # ALLOWLIST entry in the guard is the only alternative).
+        reset_calls: list[str] = []
+        _real_reset = warm_git_ops.reset_persistent_merge_worktree
 
-        real_acquire = mq_mod._acquire_warm_verify_worktree
-        seen_due: list[bool] = []
-
-        async def _spy_acquire(
-            git_ops: GitOps,
-            req: MergeRequest,
-            merge_wt: Path | None,
-            merge_commit: str,
-            *,
-            safety_valve_due: bool,
-            speculative: bool = False,
-        ) -> tuple[Path | None, bool]:
-            seen_due.append(safety_valve_due)
-            return await real_acquire(
-                git_ops,
-                req,
-                merge_wt,
-                merge_commit,
-                safety_valve_due=safety_valve_due,
-                speculative=speculative,
-            )
+        async def _spy_reset(merge_commit: str, *a: object, **k: object) -> Path:
+            reset_calls.append(merge_commit)
+            return await _real_reset(merge_commit, *a, **k)
 
         for i in range(every_n):
             req, item = await _make_merged_item(
@@ -3153,8 +3149,11 @@ class TestContendedLeaseDefers:
             )
             worker._register_owned_merge_worktree(item.merge_wt)
             worker._request_ledger.on_dequeue(req, now=1_000_000.0)
+            _before = len(reset_calls)
             with (
-                patch.object(mq_mod, '_acquire_warm_verify_worktree', _spy_acquire),
+                patch.object(
+                    warm_git_ops, 'reset_persistent_merge_worktree', _spy_reset,
+                ),
                 patch(
                     'orchestrator.merge_queue._run_post_merge_verify',
                     _verify_returns_failure,
@@ -3163,8 +3162,20 @@ class TestContendedLeaseDefers:
                 await asyncio.wait_for(
                     worker._run_inflight_verify(item, lease), timeout=60.0,
                 )
+            _warm_swapped = len(reset_calls) > _before
+            # 1-based: attempts 1..N-1 swap to the warm tree; the Nth is the
+            # valve's cold from-scratch attempt and must NOT swap.
+            _expected_warm = (i + 1) % every_n != 0
+            assert _warm_swapped is _expected_warm, (
+                f'with every_n={every_n} the valve must be due on the '
+                f'{every_n}th real attempt and only then (1-based contract), so '
+                f'attempt #{i + 1} must '
+                f'{"swap to the warm tree" if _expected_warm else "run cold"}; '
+                f'reset_persistent_merge_worktree '
+                f'{"was" if _warm_swapped else "was not"} called'
+            )
 
-        assert seen_due == [False, True], (
-            f'with every_n={every_n} the valve must be due on the 2nd real '
-            f'attempt and only then (1-based contract); got {seen_due}'
+        assert len(reset_calls) == every_n - 1, (
+            f'exactly the non-valve attempts may swap to the warm tree; got '
+            f'{len(reset_calls)} warm swaps across {every_n} attempts'
         )
