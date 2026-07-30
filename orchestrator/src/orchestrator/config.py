@@ -4737,6 +4737,13 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # (probe_fraction/probe_depths/suppress_flake_rate) is green-tier
     # hot-reloadable with no separate RELOADABLE_FIELDS edit.
     _submodel_leaf_paths('speculation_probe', SpeculationProbeConfig),
+    # Deep merge-ahead chains (task 3183, PRD alpha, decision #7) — a new
+    # dedicated submodel, same whole-submodel-group idiom: chain_cap (and any
+    # knob beta/gamma add later) is green-tier hot-reloadable with no separate
+    # RELOADABLE_FIELDS edit, so an operator can enable, retune, or KILL the
+    # feature (cap -> 0) without a restart. _set_leaf mutates the submodel in
+    # place, so a consumer holding a merge_deep reference sees the new cap (I3).
+    _submodel_leaf_paths('merge_deep', MergeDeepConfig),
     # Agent-transcript archival (task 2742, PRD alpha) — a new dedicated
     # submodel, same whole-submodel-group idiom: enabled/root and the atomic
     # .retention leaf are all green-tier hot-reloadable with no separate
