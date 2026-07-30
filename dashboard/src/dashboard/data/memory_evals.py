@@ -33,9 +33,16 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from dashboard.data.escalations import load_queue_escalations
 from dashboard.data.utils import resolve_now
 
 logger = logging.getLogger(__name__)
+
+# The only escalation category that participates in the fingerprint join.  An
+# escalation from any other producer may legitimately carry a colliding
+# dedupe_fingerprint; joining it would attribute someone else's alert to a
+# memory-eval metric.
+_EVAL_REGRESSION_CATEGORY = 'eval_regression'
 
 # One screen of trend == one alpha-derivation window.  Matches
 # ``runs_per_quarter=90`` in the committed limits artifact, which is what the
@@ -215,11 +222,70 @@ def _read_verdicts(
     return index
 
 
+def _escalation_projection(record: dict[str, Any]) -> dict[str, Any]:
+    """The fields a metric row (or ``unmatched_escalations``) carries.
+
+    ``created_at`` is sourced from the queue record's ``timestamp`` — that is
+    the field ``escalation.models.Escalation`` serialises.  The fingerprint is
+    echoed so an operator can see WHY a row linked, without the UI having to
+    cross-reference two fields.
+    """
+    return {
+        'id': record.get('id'),
+        'summary': record.get('summary'),
+        'severity': record.get('severity'),
+        'level': record.get('level'),
+        'created_at': record.get('timestamp'),
+        'dedupe_fingerprint': record.get('dedupe_fingerprint'),
+    }
+
+
+def _index_escalations(escalations_dir: Path) -> dict[str, dict[str, Any]]:
+    """Index open ``eval_regression`` escalations by ``dedupe_fingerprint``.
+
+    Reuses :func:`dashboard.data.escalations.load_queue_escalations` (INV-5 —
+    a call site, never a second reader).  Its existing contracts carry this
+    join: a missing dir returns ``[]`` so the no-queue case needs no guard,
+    unparseable files are skipped and logged so a corrupt escalation cannot
+    crash the join, and the archive subtree is NOT walked — so only PENDING
+    escalations are joined, which is exactly what the "still-open" parity
+    states mean.
+
+    Matching is ``==`` over the WHOLE fingerprint string.  The fingerprint is
+    the producer's private construction; nothing here parses its substructure,
+    so the producer can change how it is built without breaking the dashboard.
+    """
+    index: dict[str, dict[str, Any]] = {}
+    for record in load_queue_escalations(escalations_dir):
+        if not isinstance(record, dict):
+            continue
+        if record.get('category') != _EVAL_REGRESSION_CATEGORY:
+            continue
+        fingerprint = record.get('dedupe_fingerprint')
+        if isinstance(fingerprint, str) and fingerprint:
+            index[fingerprint] = record
+    return index
+
+
+def _parity(verdict: Any, escalation: dict[str, Any] | None) -> str:
+    """The derived display state for one metric row.
+
+    A pure ``(verdict, linked?)`` lookup — not a statistic.  Deriving it once
+    here keeps the UI from re-deriving badge state out of three separate
+    fields, which is where the two sides would drift apart.
+    """
+    if verdict == 'alarm':
+        return 'alarmed_open' if escalation else 'alarmed_unlinked'
+    return 'recovered_open' if escalation else 'clear'
+
+
 def _build_eval(
     eval_dir: Path,
     issues: list[dict[str, Any]],
     verdict_index: dict[tuple[str, str], dict[str, Any]],
     consumed: set[tuple[str, str]],
+    escalation_index: dict[str, dict[str, Any]],
+    linked_fingerprints: set[str],
 ) -> dict[str, Any]:
     """Assemble one eval's trend payload from its ``metrics-*.json`` series.
 
@@ -285,6 +351,19 @@ def _build_eval(
         if entry is not None:
             consumed.add((eval_id, metric_id))
         judged: dict[str, Any] = entry or {}
+
+        # The join, in full: whole-string equality on the fingerprint.  It is
+        # NOT gated on the verdict — a metric that has recovered while its
+        # escalation is still open is a real transient state (the watcher has
+        # not closed it yet), and hiding the link there would make the
+        # escalation look orphaned in exactly the window an operator is most
+        # likely to be looking at it.
+        fingerprint = judged.get('fingerprint')
+        matched = escalation_index.get(fingerprint) if isinstance(fingerprint, str) else None
+        if matched is not None:
+            linked_fingerprints.add(fingerprint)
+        escalation = _escalation_projection(matched) if matched is not None else None
+
         metrics.append({
             'metric_id': metric_id,
             'kind': current.get('kind'),
@@ -307,6 +386,8 @@ def _build_eval(
             'limit_ref': judged.get('limit_ref'),
             'fingerprint': judged.get('fingerprint'),
             'run_stamp': judged.get('run_stamp'),
+            'escalation': escalation,
+            'parity': _parity(judged.get('verdict'), escalation),
         })
 
     return {
@@ -358,8 +439,23 @@ def build_memory_evals(
     eval_dirs = sorted(p for p in memory_evals_dir.iterdir() if p.is_dir())
     verdict_index = _read_verdicts(memory_evals_dir, eval_dirs, issues)
 
+    escalation_index = _index_escalations(escalations_dir)
+
     consumed: set[tuple[str, str]] = set()
-    payload['evals'] = [_build_eval(d, issues, verdict_index, consumed) for d in eval_dirs]
+    linked_fingerprints: set[str] = set()
+    payload['evals'] = [
+        _build_eval(d, issues, verdict_index, consumed, escalation_index, linked_fingerprints)
+        for d in eval_dirs
+    ]
+
+    # The reverse direction: an open eval_regression escalation that no metric
+    # row explains.  Surfaced rather than dropped, so parity can be checked
+    # both ways.
+    payload['unmatched_escalations'] = [
+        _escalation_projection(record)
+        for fingerprint, record in escalation_index.items()
+        if fingerprint not in linked_fingerprints
+    ]
 
     # A verdict resolving onto nothing is contract drift between the evaluator
     # and the artifact tree — surfaced, not dropped.
