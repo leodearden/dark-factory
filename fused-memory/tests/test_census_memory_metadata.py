@@ -987,6 +987,56 @@ class TestRenderMarkdownDisclosure:
         md = _mod.render_markdown(_mod.build_report(cells, cov, top_n=50))
         assert 'uncovered' in md.lower()
         assert '80' in md
+        assert 'carry a category outside the censused set' in md
+
+    def test_surplus_counted_residue_is_not_rendered_as_uncovered_points(self):
+        # The collection holds FEWER points than the categories counted:
+        # deletions or double-counting. Rendering that through the
+        # uncovered-points sentence produced "-10 of 90 points carry a
+        # category outside the censused set", which describes nothing and
+        # sends a reader hunting for data that is not missing.
+        cells = {'fused_p1': {OBS: _census([])}}
+        cov = {'fused_p1': _coverage('fused_p1', 90, {OBS: (100, 100, 100)})}
+        md = _mod.render_markdown(_mod.build_report(cells, cov, top_n=50))
+        assert 'surplus_counted' in md
+        assert 'carry a category outside the censused set' not in md
+        assert 'deletion' in md.lower() or 'double-count' in md.lower()
+        # Not a trace of the uncovered-points diagnosis anywhere -- including
+        # the coverage table's column heading, which labels the same signed
+        # residue and so mislabels a negative one exactly as the sentence did.
+        assert 'uncovered' not in md.lower()
+
+    def test_churn_only_report_renders_no_incomplete_banner(self):
+        # The collection total moved under the scan but the intervals
+        # intersect: nothing is missing, so none of the alarm machinery fires.
+        cells = {'dark_factory': {OBS: _census([])}}
+        cov = {'dark_factory': _coverage('fused_dark_factory', 101, {OBS: (100, 101, 101)})}
+        md = _mod.render_markdown(_mod.build_report(cells, cov, top_n=50))
+        assert '**WARNING — COVERAGE INCOMPLETE**' not in md
+        assert 'Named shortfalls' not in md
+        assert 'carry a category outside the censused set' not in md
+        # ...but the movement is still visible, with both intervals named.
+        assert '### Corpus churn during the scan' in md
+        assert 'collection total' in md.lower()
+        assert '100' in md and '101' in md
+
+    def test_churn_render_tolerates_a_collection_level_entry(self):
+        # A 'collection_total_moved' entry has no 'category'/'expected'/
+        # 'recount' keys; a loop that formats those unconditionally renders
+        # a line of Nones for it.
+        cells = {'dark_factory': {OBS: _census([])}}
+        cov = {'dark_factory': _coverage('fused_dark_factory', 101, {OBS: (100, 101, 101)})}
+        md = _mod.render_markdown(_mod.build_report(cells, cov, top_n=50, page_size=1000))
+        section = md.split('### Corpus churn during the scan')[1].split('\n#')[0]
+        assert 'None' not in section
+        # Both the per-cell and the collection-level entry render.
+        assert len([ln for ln in section.splitlines() if ln.startswith('- ')]) == 2
+
+    def test_churn_only_report_renders_identically_twice(self):
+        cells = {'dark_factory': {OBS: _census([])}}
+        cov = {'dark_factory': _coverage('fused_dark_factory', 101, {OBS: (100, 101, 101)})}
+        report = _mod.build_report(cells, cov, top_n=50)
+        assert _mod.render_markdown(report) == _mod.render_markdown(report)
 
 
 class TestRenderMarkdownDeterminism:
