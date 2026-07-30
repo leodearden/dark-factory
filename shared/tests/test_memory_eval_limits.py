@@ -1288,3 +1288,89 @@ class TestLimitsArtifact:
             false_alarm_budget=2.0, runs_per_quarter=90, min_samples=10, baseline_window=3
         )
         assert derive_alpha(config.false_alarm_budget, config.runs_per_quarter, 4) == 2 / 360
+
+
+class TestARunWithNothingAlarmEligible:
+    """A run that cannot alarm must still REPORT, not crash.
+
+    ``derive_alpha`` rightly rejects a zero metric count — no finite alpha
+    splits a budget zero ways — but ``evaluate_series`` used to hand it
+    ``len(alarm_eligible)`` unconditionally, so two series that are perfectly
+    valid under the M1 schema blew up instead of producing verdicts: one whose
+    metrics are all ``kind='scalar'`` (the module's own contract says scalars
+    are "reported but never alarmed" — unreportable is not that), and one whose
+    ``metrics`` list is empty (M1 sets no ``min_length``, so a probe set on its
+    first run before any metric is wired is a legal series).
+
+    ``result.alpha`` is ``None`` in this state rather than a stand-in number:
+    any fabricated bar would be exactly the a-priori threshold G6 forbids.
+    """
+
+    CONFIG = LimitsConfig(
+        false_alarm_budget=1.0, runs_per_quarter=90, min_samples=1, baseline_window=3
+    )
+
+    def _series(self, metrics: list[Metric]) -> MetricSeries:
+        return MetricSeries(
+            schema_version=1,
+            eval_id='e1-scalar-only',
+            run_stamp='20260801T000000Z',
+            corpus=Corpus(project_id='dark_factory'),
+            metrics=metrics,
+        )
+
+    def _scalars(self) -> list[Metric]:
+        return [
+            Metric(metric_id='mean-latency-ms', kind='scalar', value=42.5, n=30),
+            Metric(metric_id='index-size-mb', kind='scalar', value=17.0, n=1),
+        ]
+
+    def test_a_scalar_only_series_reports_verdicts_and_never_alarms(self):
+        result = evaluate_series(self._series(self._scalars()), [], self.CONFIG, None)
+        assert result.alarms == ()
+        assert result.alpha is None
+        assert result.alarmed_metric_count == 0
+        assert [v.metric_id for v in result.verdicts] == ['mean-latency-ms', 'index-size-mb']
+        assert {v.rule_kind for v in result.verdicts} == {'scalar'}
+        assert {v.status for v in result.verdicts} == {'ok'}
+        # The reported values survive — the point of a scalar is the trend.
+        assert [v.value for v in result.verdicts] == [42.5, 17.0]
+
+    def test_an_empty_series_evaluates_to_no_verdicts_and_no_alarms(self):
+        result = evaluate_series(self._series([]), [], self.CONFIG, None)
+        assert result.verdicts == ()
+        assert result.alarms == ()
+        assert result.alpha is None
+        assert result.alarmed_metric_count == 0
+
+    def test_derive_alpha_itself_still_rejects_a_zero_count(self):
+        # The short-circuit belongs to the caller, which knows an empty split is
+        # a legitimate state; the pure function keeps failing loudly.
+        with pytest.raises(ValueError, match='alarmed_metric_count'):
+            derive_alpha(1.0, 90, 0)
+
+    def test_a_scalar_only_run_round_trips_through_the_artifact_with_a_null_alpha(self, tmp_path):
+        result = evaluate_series(self._series(self._scalars()), [], self.CONFIG, None)
+        path = write_limits_artifact(result, limits_artifact_path(tmp_path, result.eval_id))
+
+        # `null`, not an omitted key and not a substituted default: a dashboard
+        # reading this must render "no alarm rules in this run".
+        raw = json.loads(path.read_text(encoding='utf-8'))
+        assert 'alpha' in raw
+        assert raw['alpha'] is None
+        assert raw['alarmed_metric_count'] == 0
+        assert raw['alarms'] == []
+
+        loaded = load_limits_artifact(path)
+        assert loaded.alpha is None
+        assert loaded.alarmed_metric_count == 0
+        assert [v.metric_id for v in loaded.verdicts] == ['mean-latency-ms', 'index-size-mb']
+
+    def test_adding_a_first_alarming_metric_starts_deriving_an_alpha(self):
+        # The state is transitional, not terminal: alpha appears as soon as
+        # anything can spend the budget, at the full undivided share.
+        metrics = [*self._scalars(), _tripwire({'t1': True}, metric_id='probe-a')]
+        result = evaluate_series(self._series(metrics), [], self.CONFIG, None)
+        assert result.alarmed_metric_count == 1
+        assert result.alpha == derive_alpha(1.0, 90, 1)
+        assert result.alarms == ()

@@ -742,11 +742,16 @@ class EvaluationResult:
     ``alpha`` and ``alarmed_metric_count`` are carried, not just used, because
     a verdict is only re-derivable by hand if the bar it was judged against is
     recorded alongside it (G6's "calibration output with recorded provenance").
+
+    ``alpha`` is ``None`` exactly when ``alarmed_metric_count == 0`` — a run
+    carrying only scalar metrics (or no metrics at all) still reports, but
+    nothing in it can spend the false-alarm budget, so there is no bar and
+    recording a fabricated one would misrepresent the provenance.
     """
 
     eval_id: str
     run_stamp: str
-    alpha: float
+    alpha: float | None
     alarmed_metric_count: int
     config: LimitsConfig
     verdicts: tuple[MetricVerdict, ...]
@@ -786,6 +791,15 @@ def evaluate_series(
     null, so it strictly does not consume budget); the stricter bar is the safe
     direction and keeps the count legible as "metrics that can alarm".
 
+    When NOTHING is alarm-eligible — a run of only scalar metrics, or one with
+    no metrics yet — there is no alpha to derive and ``result.alpha`` is
+    ``None``. Such a run still reports: the scalar verdicts are emitted and the
+    artifact is written, it simply cannot alarm. :func:`derive_alpha` keeps
+    rejecting a zero count, which is right for the pure function (no finite
+    alpha splits a budget zero ways); the caller is the one that knows an empty
+    split is a legitimate state rather than a mis-configuration, so the
+    short-circuit lives here.
+
     Only the trailing ``config.baseline_window`` runs are used. A baseline that
     grew without bound would keep drifting further from current behaviour and
     would eventually alarm on the system's own gradual, intended changes.
@@ -822,7 +836,11 @@ def evaluate_series(
     """
     window = list(baseline_window)[-config.baseline_window :] if config.baseline_window > 0 else []
     alarm_eligible = [m for m in current.metrics if m.kind != 'scalar']
-    alpha = derive_alpha(config.false_alarm_budget, config.runs_per_quarter, len(alarm_eligible))
+    alpha = (
+        derive_alpha(config.false_alarm_budget, config.runs_per_quarter, len(alarm_eligible))
+        if alarm_eligible
+        else None
+    )
 
     if grandfather is not None:
         unscoped = sorted(k for k in grandfather if GRANDFATHER_KEY_SEPARATOR not in k)
@@ -867,10 +885,22 @@ def evaluate_series(
             prefix = scoped_grandfather_key(metric.metric_id, '')
             carried = {key for key in carried if not key.startswith(prefix)}
             carried |= {scoped_grandfather_key(metric.metric_id, item) for item in next_own}
-        elif metric.kind == 'proportion':
-            verdict = evaluate_proportion(metric, window, alpha, config.min_samples)
-        elif metric.kind == 'count':
-            verdict = evaluate_count(metric, window, alpha, config.min_samples)
+        elif metric.kind in ('proportion', 'count'):
+            if alpha is None:
+                # Unreachable: `alarm_eligible` above is every non-scalar metric,
+                # so reaching a statistical rule guarantees a derived alpha. Loud
+                # rather than silent if that filter ever drifts out of step with
+                # this branch set — a fabricated stand-in alpha would be exactly
+                # the a-priori threshold G6 forbids.
+                raise AssertionError(
+                    f'evaluate_series: no alpha was derived, yet metric '
+                    f'{metric.metric_id!r} has alarm-eligible kind {metric.kind!r}.'
+                )
+            verdict = (
+                evaluate_proportion(metric, window, alpha, config.min_samples)
+                if metric.kind == 'proportion'
+                else evaluate_count(metric, window, alpha, config.min_samples)
+            )
         else:
             verdict = MetricVerdict(
                 metric_id=metric.metric_id,
@@ -961,7 +991,15 @@ class LimitsArtifact(BaseModel):
     run_stamp: str = Field(min_length=1)
     generator: str = Field(min_length=1)
 
-    alpha: float
+    alpha: float | None
+    """The derived per-metric bar, or ``null`` when ``alarmed_metric_count`` is 0.
+
+    Required but nullable, not optional: a producer that forgets the field is a
+    bug worth catching at emit, while a run of only scalar metrics genuinely has
+    no bar. A consumer reading ``null`` should render "no alarm rules in this
+    run", not substitute a default — there is no defensible default (G6).
+    """
+
     false_alarm_budget: float
     runs_per_quarter: int
     alarmed_metric_count: int
