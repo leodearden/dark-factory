@@ -42,6 +42,24 @@ __all__ = [
 
 # ---------------------------------------------------------------------------
 # Canonical extension allowlist — authoritative Python copy for the α enforcement point.
+#
+# NAMING — read the contract, not the name.  Despite being called CODE_EXTENSIONS
+# this is NOT a code-file allowlist.  It is the set of recognised FILE-EXTENSION
+# TOKENS whose presence after the last dot of a path's final segment is evidence
+# that the segment names a FILE rather than a DIRECTORY — which is all any caller
+# (is_file_path, directory_locks, strip_directory_locks,
+# module_charter.derive_modules) relies on.  Its non-code members are therefore
+# correct and load-bearing: png svg ico icns log lock diff golden manifest timer
+# typed service template example python-version gitignore gitkeep gitmodules
+# gitattributes npmrc envrc conf.
+# Judge a candidate addition by "does a real tracked file end in this?", NEVER by
+# "is this code?".  That misreading of the name is exactly what let the list sit
+# at a 22-extension undercount until #3117.  Renaming to FILE_EXTENSIONS is the
+# right long-term fix but spans shared/__init__.py, shared/tests/test_public_api.py,
+# orchestrator.module_charter, fused_memory server/tools.py + task_interceptor.py
+# and reify's own copy — all outside #3117's lock charter, so it is deferred to a
+# dedicated follow-up rather than done half-way here.
+#
 # Copied verbatim from reify's scripts/lock-charter-guard.sh _EXTS (reify:4676).
 # git-ls-files sweep 2026-07-28 (reify #5726 / dark_factory #3117) — 22 tracked-file
 # extensions across reify + dark-factory that this list misclassified as directories;
