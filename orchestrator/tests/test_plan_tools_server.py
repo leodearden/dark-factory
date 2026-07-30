@@ -27,6 +27,7 @@ from orchestrator.mcp.plan_tools import (
     _replace_plan_step,
     _report_blocking_dependency,
     _report_false_premise,
+    _report_ready_to_merge,
     _report_task_already_done,
     _report_unactionable_task,
     _update_plan_metadata,
@@ -627,6 +628,49 @@ class TestReportTaskAlreadyDone:
         plan = artifacts.read_plan()
         assert plan['task_id'] == 'test-1'
         assert len(plan['steps']) == 1
+
+
+class TestReportReadyToMerge:
+    """Architect's escape hatch when the work is complete on the branch and
+    only the physical merge to main is missing (merge-landing desync)."""
+
+    def test_writes_artifact(self, artifacts):
+        result = _report_ready_to_merge(
+            artifacts,
+            commit='abc123def456',
+            evidence='clean FF of main; verify PASSED; review PASS',
+        )
+        assert result['status'] == 'ok'
+        assert result['commit'] == 'abc123def456'
+
+        data = artifacts.read_ready_to_merge()
+        assert data is not None
+        assert data['commit'] == 'abc123def456'
+        assert data['evidence'] == 'clean FF of main; verify PASSED; review PASS'
+        assert 'reported_at' in data
+
+    def test_overwrites_prior_report(self, artifacts):
+        _report_ready_to_merge(artifacts, 'sha1', 'first')
+        _report_ready_to_merge(artifacts, 'sha2', 'second')
+        data = artifacts.read_ready_to_merge()
+        assert data is not None
+        assert data['commit'] == 'sha2'
+        assert data['evidence'] == 'second'
+
+    def test_does_not_mutate_plan_json(self, artifacts):
+        _create_plan(artifacts, 'test-1', 'T', 'A', ['m/x.py'])
+        _add_plan_step(artifacts, 'step-1', 'test', 'Write test')
+        _report_ready_to_merge(artifacts, 'sha', 'e')
+
+        plan = artifacts.read_plan()
+        assert plan['task_id'] == 'test-1'
+        assert len(plan['steps']) == 1
+
+    def test_does_not_write_already_done_artifact(self, artifacts):
+        """The two exits are distinct — ready_to_merge must not be mistaken
+        for already_done (which would mark the task done without merging)."""
+        _report_ready_to_merge(artifacts, 'sha', 'e')
+        assert artifacts.read_already_done() is None
 
 
 class TestReportUnactionableTask:
