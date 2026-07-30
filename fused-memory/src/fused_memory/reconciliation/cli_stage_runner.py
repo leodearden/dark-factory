@@ -101,9 +101,25 @@ DISALLOW_RECON_REPORT_LEDGER_WRITES = [
 # it is omission and not rejection, the agent gets no explanation for the missing
 # tool — which is what makes ESCALATION_BOUNDARY_NOTE load-bearing rather than
 # decorative.
+# `get_task_escalations` (task 3023) is denied for the SAME reason and is the
+# sharpest case of it: `escalation.server.create_server` backs BOTH escalation
+# servers — the orchestrator queue (port 8102) and the reconciliation queue
+# (port 8103, started by reconciliation/harness.py `_start_escalation_server`)
+# — so registering an archive-inclusive per-task lookup there exposes it to
+# recon stages pointed at the WRONG store. Its own docstring says an empty
+# result IS evidence of absence (true for the queue that server is backed by),
+# so a stage calling it against the reconciliation queue would read a
+# categorical [] as proof that an orchestrator gate record was never written —
+# re-arming the 16-instance false positive this task exists to kill, with more
+# authority than the pending-only probe had. The gating here is a DENY list
+# only (there is no allow-list; `_run_stage(disallowed_tools=...)`), so a new
+# read tool on the shared server is exposed to every stage until it is named
+# here — see test_stages.py::test_every_escalation_server_tool_is_classified,
+# which fails on any unclassified addition.
 DISALLOW_ESCALATION_READS = [
     'mcp__escalation__get_pending_escalations',
     'mcp__escalation__get_escalation',
+    'mcp__escalation__get_task_escalations',
 ]
 
 # Per-stage disallowed lists

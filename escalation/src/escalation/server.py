@@ -967,12 +967,21 @@ def create_server(
         **Evidence-of-absence contract (read this before asserting a gap).**
         An empty ``get_pending_escalations(task_id=...)`` result is NOT
         evidence that an escalation record never existed — it is the EXPECTED
-        result once a human has resolved the record.  Only an empty
-        ``get_task_escalations(task_id=...)`` result is evidence of absence.
-        Auditing a ``done`` ``task_kind='deterministic'`` gate task that has
-        ``metadata.gate_escalated_at`` set?  Call this tool before emitting
+        result once a human has resolved the record.  An empty
+        ``get_task_escalations(task_id=...)`` result is evidence of absence
+        **for the queue THIS server is backed by, and for nothing else.**
+        ``create_server`` backs more than one queue (the orchestrator queue and
+        the reconciliation queue are separate stores), so a caller connected to
+        one of them learns nothing about records in the other: confirm which
+        queue you are talking to before reading any [] as a gap.  Auditing a
+        ``done`` ``task_kind='deterministic'`` gate task that has
+        ``metadata.gate_escalated_at`` set?  Those records live in the
+        ORCHESTRATOR queue — call this tool against THAT server before emitting
         any finding, flag, memory or remediation task claiming the escalation
-        record was never written.
+        record was never written.  (Reconciliation stages are denied this tool
+        outright — see DISALLOW_ESCALATION_READS in fused-memory's
+        reconciliation/cli_stage_runner.py — precisely because their connection
+        is to the other store.)
 
         *status* — ``None`` (default) returns records in every state,
         scanning root + archive.  ``'pending'`` short-circuits to the

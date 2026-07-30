@@ -4,6 +4,7 @@ import json
 import logging
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
@@ -147,6 +148,47 @@ class TestMockTypesConstant:
         assert MagicMock in _MOCK_TYPES
 
 
+# Tools registered by the SHARED escalation.server.create_server that a recon
+# stage may hold. Reviewed for task 3023: none of them READS per-task escalation
+# state, so none can hand a stage a categorical [] to misread as proof that an
+# orchestrator record was never written.
+#
+#   - escalate_blocker / escalate_info — WRITES to the reconciliation store,
+#     which is the correct destination. escalate_blocker is Stage 2's sanctioned
+#     FIX D path; denying it would break FIX D (see render_escalation_boundary_note).
+#   - resolve_issue / stamp_triage / promote_to_l2 — act on an escalation the
+#     caller already has an id for; they answer no existence question.
+#   - merge_* / *_scheduler / *_merge_queue / *_warm_worktree / release_workflow /
+#     reload_config / get_task_runtime_state — orchestrator control-plane and
+#     merge-lane surface, unrelated to the escalation-record question.
+#
+# This is the reviewed-safe half of the classification asserted by
+# test_every_escalation_server_tool_is_classified; the denied half is
+# DISALLOW_ESCALATION_READS. Adding a name here is a decision that the tool
+# cannot mislead a stage about the reconciliation queue — not a formality.
+_REVIEWED_STAGE_SAFE = {
+    'mcp__escalation__claim_warm_worktree',
+    'mcp__escalation__escalate_blocker',
+    'mcp__escalation__escalate_info',
+    'mcp__escalation__get_merge_halt_status',
+    'mcp__escalation__get_merge_queue',
+    'mcp__escalation__get_task_runtime_state',
+    'mcp__escalation__halt_merge_queue',
+    'mcp__escalation__halt_scheduler',
+    'mcp__escalation__merge_cancel',
+    'mcp__escalation__merge_request',
+    'mcp__escalation__merge_status',
+    'mcp__escalation__promote_to_l2',
+    'mcp__escalation__release_warm_worktree',
+    'mcp__escalation__release_workflow',
+    'mcp__escalation__reload_config',
+    'mcp__escalation__resolve_issue',
+    'mcp__escalation__resume_scheduler',
+    'mcp__escalation__stamp_triage',
+    'mcp__escalation__unhalt_merge_queue',
+}
+
+
 class TestDisallowedToolLists:
     """Verify per-stage disallowed tool lists are correct."""
 
@@ -246,19 +288,79 @@ class TestDisallowedToolLists:
         assert 'mcp__fused-memory__get_cycle_summary_presence' not in STAGE1_DISALLOWED
         assert 'mcp__fused-memory__get_cycle_summary_presence' not in STAGE2_DISALLOWED
 
-    def test_escalation_reads_constant_is_exactly_the_two_read_tools(self):
-        """DISALLOW_ESCALATION_READS names the two escalation READ tools, nothing more.
+    def test_escalation_reads_constant_is_exactly_the_three_read_tools(self):
+        """DISALLOW_ESCALATION_READS names the escalation READ tools, nothing more.
 
         Scoped deliberately tight: the denial exists because a per-task read
         cannot be answered from a stage, not because the escalation surface is
         off limits wholesale.  Anything broader would sweep up the sanctioned
         write path (Stage 2 FIX D).
+
+        ``get_task_escalations`` joined the set in task 3023: it is registered
+        on the SHARED ``escalation.server.create_server``, which backs the
+        reconciliation queue as well as the orchestrator one, so leaving it out
+        exposed an archive-inclusive per-task lookup — pointed at the wrong
+        store — to all three stages.
         """
         assert set(DISALLOW_ESCALATION_READS) == {
             'mcp__escalation__get_pending_escalations',
             'mcp__escalation__get_escalation',
+            'mcp__escalation__get_task_escalations',
         }
-        assert len(DISALLOW_ESCALATION_READS) == 2, 'no duplicate entries'
+        assert len(DISALLOW_ESCALATION_READS) == 3, 'no duplicate entries'
+
+    def test_every_escalation_server_tool_is_classified(self):
+        """Every tool the SHARED escalation server registers is denied or reviewed.
+
+        The stage gating is a DENY list only — there is no allow-list — so any
+        tool added to ``escalation.server.create_server`` becomes visible and
+        callable from Stage 1/2/3 the moment it is registered, against the
+        RECONCILIATION queue.  That is how ``get_task_escalations`` shipped
+        reachable from exactly the three agents that must not have it (task
+        3023 review).  A constant-only test cannot catch that: it pins what the
+        list says, not what the server exposes.
+
+        So enumerate the live tool surface and require every name to be
+        classified — either denied in every stage, or explicitly listed below
+        as reviewed-and-safe.  A new tool fails here until a human decides
+        which bucket it belongs in.  Adding a name to ``_REVIEWED_STAGE_SAFE``
+        is that decision; it is not a formality.
+        """
+        pytest.importorskip(
+            'escalation.server',
+            reason='sibling escalation package not installed (standalone checkout)',
+        )
+        import asyncio
+        import tempfile
+
+        from escalation.queue import EscalationQueue
+        from escalation.server import create_server
+
+        server = create_server(
+            EscalationQueue(Path(tempfile.mkdtemp())), startup_sweep=False
+        )
+        registered = {
+            f'mcp__escalation__{tool.name}'
+            for tool in asyncio.run(server.list_tools())
+        }
+
+        unclassified = registered - set(DISALLOW_ESCALATION_READS) - _REVIEWED_STAGE_SAFE
+        assert not unclassified, (
+            'These escalation-server tools are reachable from every recon stage '
+            f'and have not been classified: {sorted(unclassified)}. Either add each '
+            'to DISALLOW_ESCALATION_READS (cli_stage_runner.py) if a stage must not '
+            'call it — the default for anything that READS per-task escalation state, '
+            'since a stage is wired to the reconciliation queue and would read a '
+            'categorical [] as proof of absence — or add it to _REVIEWED_STAGE_SAFE '
+            'here once you have confirmed it is harmless against that store.'
+        )
+
+        # The denial must name tools that actually exist, or it is decoration.
+        stale = set(DISALLOW_ESCALATION_READS) - registered
+        assert not stale, (
+            f'DISALLOW_ESCALATION_READS names tools the server no longer registers: '
+            f'{sorted(stale)}. Remove them, or fix the rename.'
+        )
 
     def test_escalation_reads_denied_in_all_three_stages(self):
         """Every stage must deny the escalation read tools (task 3163).

@@ -183,19 +183,17 @@ class TestGateClosureRidesTheBoundaryNote:
             'as part of the boundary note (INV-5: one source for the shared core).'
         )
 
-    def test_does_not_present_a_denied_escalation_read_as_a_probe(self):
-        """No stage holds `get_pending_escalations` — never describe it as usable.
-
-        ``DISALLOW_ESCALATION_READS`` (cli_stage_runner.py) denies the
-        escalation read tools in every stage and the denial OMITS them from the
-        agent's tool listing, so prose presenting one as the probe the auditor
-        ran contradicts the agent's own tool surface.
-        """
-        assert 'get_pending_escalations' not in _GATE_CLOSURE_ARCHIVE_GUIDANCE, (
-            'The gate-closure guidance must not name get_pending_escalations: no '
-            'recon stage holds it, and the shared boundary note already covers '
-            'why an empty escalation result proves nothing.'
-        )
+    # No substring pin on the guidance prose lives here — see the comment under
+    # TestReconStageEscalationServerIdentity (c) for why one was tried and
+    # removed. A `'get_pending_escalations' not in ...` assertion has that exact
+    # defect in both directions: any reword of the same mis-instruction that
+    # avoids the literal token ("the pending-only probe", "the root-only
+    # lookup") passes green, while a correct negative sentence naming the tool
+    # fails red. The prose correctness concern is handled in the prose, in
+    # prompts/__init__.py, which carries an explanatory comment. The BEHAVIOURAL
+    # guard for the same risk is test_stages.py's
+    # test_every_escalation_server_tool_is_classified, which enumerates the live
+    # escalation-server tool surface instead of scanning prompt text.
 
 
 class TestReconStageEscalationServerIdentity:
