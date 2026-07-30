@@ -2484,7 +2484,21 @@ class TestCorpusCounting:
         counts = {c: i + 1 for i, c in enumerate(categories)}
         _, outcome = self._run_counts(tmp_path, counts)
 
-        assert outcome.series.corpus.counts == counts
+        assert counts.items() <= outcome.series.corpus.counts.items()
+
+    def test_the_step_16_disclosures_still_ride_alongside(self, tmp_path):
+        """A superset, deliberately: corpus.counts is free-form by design.
+
+        step-16 folds this run's narrowings (untopiced results, unscorable
+        claims, degraded observations) into the same mapping so they reach
+        every consumer that reads the JSON rather than only the one who reads
+        the prose. Asserting equality here would force that disclosure back
+        out into prose-only — a silent cap dressed as a tidy test.
+        """
+        _, outcome = self._run_counts(tmp_path, {})
+
+        assert 'contamination_untopiced_results' in outcome.series.corpus.counts
+        assert 'degraded_observations' in outcome.series.corpus.counts
 
     def test_no_category_name_is_restated_as_a_literal_in_the_script(self):
         """A second home for someone else's vocabulary silently goes stale."""

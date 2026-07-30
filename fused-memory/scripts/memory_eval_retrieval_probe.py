@@ -56,13 +56,19 @@ sources, so it works today — before the ``metadata.topic`` vocabulary of
 """
 from __future__ import annotations
 
+import argparse
+import asyncio
 import hashlib
 import json
+import logging
 import re
+import sys
 import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
+
+logger = logging.getLogger('memory_eval_retrieval_probe')
 
 # ---------------------------------------------------------------------------
 # Pinned M1 contract vocabulary
@@ -1302,7 +1308,7 @@ def _proportion(
     metric_id: str,
     successes: int,
     trials: int,
-    direction: str,
+    direction: Literal['higher_is_worse', 'lower_is_worse'],
     *,
     details_path: str | None = None,
 ):
@@ -1699,6 +1705,7 @@ def render_probe_report(
     *,
     is_initial_run: bool = False,
     registry: TopicRegistry | None = None,
+    skipped_topics: tuple[str, ...] = (),
 ) -> str:
     """The prose companion: the shared metric table plus this run's caveats.
 
@@ -1845,6 +1852,19 @@ def render_probe_report(
         ):
             lines.append(f'  {chunk}')
 
+    if skipped_topics:
+        lines.append('')
+        lines.append(f'topics NOT PROBED this run ({len(skipped_topics)}):')
+        for chunk in _wrap(
+            'These registry entries belong to a project this run did not '
+            'select with --project-id. They are absent from every metric '
+            'above. Said out loud because a narrowed run and a shrunken '
+            'registry produce the same numbers, and only one of them is a '
+            'measurement problem.'
+        ):
+            lines.append(f'  {chunk}')
+        lines.extend(f'  - {topic}' for topic in skipped_topics)
+
     if registry is not None:
         composition: dict[str, int] = {}
         for entry in registry.entries:
@@ -1887,3 +1907,310 @@ def emit_series(series, root: str | Path, *, stamp: str | None = None) -> tuple[
     from shared.memory_eval_metrics import write_metric_series  # noqa: PLC0415
 
     return write_metric_series(series, root, stamp=stamp)
+
+
+# ---------------------------------------------------------------------------
+# The read-only run band
+#
+# D8's runner pattern (audit_duplicate_memories.py:364-378) minus every
+# mutation: CONFIG_PATH from --config, FusedMemoryConfig(), MemoryService(),
+# initialize(), try/finally close(). MemoryService rather than Mem0Backend
+# because a retrieval probe MUST embed its queries — unlike the census, which
+# skips the embedder deliberately, this one cannot.
+#
+# There is no --apply band and no write call. The guarantee is asserted as
+# behaviour: the tests drive this band against a service double whose every
+# write method raises, and a run that completes is a run that never wrote.
+# ---------------------------------------------------------------------------
+
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_PACKAGE_ROOT = _SCRIPT_DIR.parent
+_REPO_ROOT = _PACKAGE_ROOT.parent
+
+DEFAULT_PROJECT_IDS: tuple[str, ...] = ('dark_factory', 'reify')
+"""The two projects the metadata census enumerated; the same pair by default here.
+
+Following the census's precedent matters beyond convenience: the registry's
+topics were derived from that census, so probing a different set of projects
+would measure a corpus the fixture was never built against.
+"""
+
+DEFAULT_REGISTRY_PATH = _PACKAGE_ROOT / 'tests' / 'fixtures' / 'memory_eval_topic_registry.json'
+"""The committed registry. It lives under tests/fixtures because it IS a fixture —
+hand-completed, reviewed, and version-controlled so a run is reproducible."""
+
+DEFAULT_OUT_ROOT = _PACKAGE_ROOT / 'data' / 'memory-evals'
+"""Artifact root. ``data/`` is gitignored (fused-memory/.gitignore:9), so a run's
+output never lands in a diff by accident."""
+
+DEFAULT_CALIBRATION_PATH = _PACKAGE_ROOT / 'tests' / 'fixtures' / 'write_triage_calibration.jsonl'
+DEFAULT_CENSUS_PATH = _REPO_ROOT / 'plans' / 'memory-metadata-census-report.json'
+
+
+def corpus_categories() -> tuple[str, ...]:
+    """The category vocabulary, taken from the store's own enums.
+
+    Derived rather than restated. The bucket vocabulary belongs to the
+    memory-metadata PRD, and a copy of it here would keep reporting six
+    categories on the day a seventh is added — the artifact would look
+    complete while silently under-counting the corpus it claims to describe.
+    A test asserts no category name appears as a literal in this file.
+    """
+    from fused_memory.models.enums import (  # noqa: PLC0415
+        GRAPHITI_PRIMARY,
+        MEM0_PRIMARY,
+    )
+
+    return tuple(sorted(c.value for c in (GRAPHITI_PRIMARY | MEM0_PRIMARY)))
+
+
+def corpus_project_id(project_ids: tuple[str, ...]) -> str:
+    """The single ``Corpus.project_id`` for a run covering *project_ids*.
+
+    M1's Corpus carries one project id and this runner emits one artifact per
+    stamp, so a multi-project run needs a stable joined identifier. Single
+    project in, that project out — which is the exemplar's shape and the shape
+    an ephemeral (test-collection) run produces, so a seeded run is never
+    mistakable for a live one.
+    """
+    return '+'.join(project_ids)
+
+
+async def count_corpus(memory, project_ids: tuple[str, ...]) -> dict[str, int]:
+    """Corpus size per category, summed over *project_ids*.
+
+    One ``count_memories_by_metadata`` call per (project, category): an exact
+    Qdrant count rather than a top-N-bounded search, because this is the
+    denominator behind the denominators and a sampled one would quietly
+    rescale every proportion in the artifact.
+    """
+    counts: dict[str, int] = {}
+    for project_id in project_ids:
+        for category in corpus_categories():
+            counts[category] = counts.get(category, 0) + await memory.count_memories_by_metadata(
+                project_id, {'category': category},
+            )
+    return counts
+
+
+@dataclass(frozen=True)
+class ProbeOutcome:
+    """Everything one run produced, for a caller that wants more than an exit code."""
+
+    series: Any
+    observations: ProbeObservations
+    metrics_path: Path
+    report_path: Path
+    report: str
+    is_initial_run: bool
+    skipped_topics: tuple[str, ...]
+    corpus_counts: dict[str, int]
+
+
+async def run_probe(
+    memory,
+    registry: TopicRegistry,
+    *,
+    project_ids: tuple[str, ...],
+    ks: tuple[int, ...],
+    out_root: str | Path,
+    stamp: str | None = None,
+) -> ProbeOutcome:
+    """Measure *registry* against *memory* and emit the run's artifacts.
+
+    *memory* is injected rather than constructed here, which is what lets the
+    read-only guarantee be tested: the whole band runs against a double whose
+    write methods raise.
+
+    Reads only. ``search`` and ``count_memories_by_metadata`` are the only two
+    methods touched.
+    """
+    selected = tuple(dict.fromkeys(project_ids))
+    wanted = set(selected)
+    probed = tuple(e for e in registry.entries if e.project_id in wanted)
+    skipped = tuple(e.topic for e in registry.entries if e.project_id not in wanted)
+
+    observations = ProbeObservations()
+    for entry in probed:
+        async def search(query: str, limit: int, _project_id: str = entry.project_id):
+            return await memory.search(query, project_id=_project_id, limit=limit)
+
+        # The FULL registry, not the probed subset: contamination asks whether
+        # a result belongs to a different KNOWN topic, so the widest topic
+        # vocabulary available gives the truest answer. Narrowing it here would
+        # silently reclassify foreign results as untopiced.
+        await probe_topic(search, entry, registry, ks, observations)
+
+    counts = await count_corpus(memory, selected)
+
+    if stamp is None:
+        from shared.memory_eval_metrics import run_stamp  # noqa: PLC0415
+
+        stamp = run_stamp()
+
+    # BEFORE emitting: this run's own artifact would otherwise make its first
+    # run look like its second and suppress the D1 initial-state snapshot.
+    initial = is_initial_run(out_root)
+
+    series = build_series(
+        observations, counts, corpus_project_id(selected), stamp, tuple(ks),
+    )
+    metrics_path, report_path = emit_series(series, out_root, stamp=stamp)
+
+    # emit_series wrote the shared render_report as the companion; replace it
+    # with the extended one. The shared write still happens first, so emit-time
+    # validation continues to gate whether any artifact is created at all — the
+    # report is only ever widened over a series that already validated.
+    report = render_probe_report(
+        series,
+        observations,
+        is_initial_run=initial,
+        # The PROBED subset here, so "registry composition (N topics)" counts
+        # what this run actually measured; the rest is named by skipped_topics.
+        registry=TopicRegistry(
+            schema_version=registry.schema_version,
+            entries=probed,
+            disclosures=registry.disclosures,
+        ),
+        skipped_topics=skipped,
+    )
+    report_path.write_text(report, encoding='utf-8')
+
+    return ProbeOutcome(
+        series=series,
+        observations=observations,
+        metrics_path=metrics_path,
+        report_path=report_path,
+        report=report,
+        is_initial_run=initial,
+        skipped_topics=skipped,
+        corpus_counts=counts,
+    )
+
+
+class _ReplacingAppend(argparse.Action):
+    """``append``, except the first explicit value REPLACES the default.
+
+    Plain ``action='append'`` with a default appends to it, so
+    ``--project-id reify`` would probe dark_factory AND reify — two extra
+    projects nobody asked for, and on a seeded ephemeral run that would mean
+    reaching into the live corpus. The identity check against ``self.default``
+    is what makes the swap exact and stateless across repeated parses.
+    """
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        current = getattr(namespace, self.dest, None)
+        if current is self.default or current is None:
+            current = ()
+        setattr(namespace, self.dest, (*current, values))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """The CLI. Every flag here is a read parameter; none of them mutate anything.
+
+    There is deliberately no ``--apply``, ``--fix``, ``--prune`` or any other
+    mutating band, and a test asserts this flag set by EQUALITY so one cannot
+    be added without a test saying so out loud.
+    """
+    # The module docstring carries an RST table that argparse's default
+    # formatter reflows into rubble; the first line plus the guarantee is what
+    # an operator at the terminal actually needs.
+    parser = argparse.ArgumentParser(
+        description=(
+            f'{(__doc__ or EVAL_ID).splitlines()[0]}\n\n'
+            'This script never writes to the live corpus and never evaluates a\n'
+            'limit — it emits measurements for the limits evaluator to judge.'
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        '--project-id', dest='project_id', action=_ReplacingAppend,
+        default=DEFAULT_PROJECT_IDS, metavar='PROJECT_ID',
+        help=(
+            'Project to probe; repeatable. Selects which registry entries run. '
+            f'Default: {" ".join(DEFAULT_PROJECT_IDS)}'
+        ),
+    )
+    parser.add_argument(
+        '--registry', default=str(DEFAULT_REGISTRY_PATH),
+        help=f'Topic registry JSON (default: {DEFAULT_REGISTRY_PATH})',
+    )
+    parser.add_argument(
+        '--out-root', dest='out_root', default=str(DEFAULT_OUT_ROOT),
+        help=f'Artifact root (default: {DEFAULT_OUT_ROOT})',
+    )
+    parser.add_argument(
+        '--k', dest='k', action=_ReplacingAppend, type=int, default=DEFAULT_KS,
+        metavar='K',
+        help=(
+            'Depth to score canonical-in-top-k at; repeatable. A metric '
+            f'parameterisation, not a threshold. Default: {" ".join(str(k) for k in DEFAULT_KS)}'
+        ),
+    )
+    parser.add_argument(
+        '--config', default=None,
+        help='Path to fused-memory config file (sets CONFIG_PATH env var)',
+    )
+    parser.add_argument(
+        '--derive-registry', dest='derive_registry', action='store_true',
+        help=(
+            'Print registry candidates derived from the committed offline '
+            'sources and exit. Never overwrites the committed fixture — the '
+            'hand-authored held-out phrasings cannot be regenerated.'
+        ),
+    )
+    return parser
+
+
+async def _run(args: argparse.Namespace) -> int:
+    logging.basicConfig(
+        level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
+    )
+
+    if args.derive_registry:
+        print(run_derive_registry(DEFAULT_CALIBRATION_PATH, DEFAULT_CENSUS_PATH), end='')
+        return 0
+
+    # Before the store, deliberately. A fixture typo must not cost an embedder
+    # spin-up to discover, and — the load-bearing half — a registry that failed
+    # to load must never reach emission: an artifact reporting zero topics is
+    # indistinguishable, downstream, from a healthy corpus that found nothing.
+    try:
+        registry = load_topic_registry(args.registry)
+    except RegistryError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    import os  # noqa: PLC0415
+
+    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+    from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+
+    if args.config:
+        os.environ['CONFIG_PATH'] = str(args.config)
+
+    config = FusedMemoryConfig()
+    memory = MemoryService(config)
+    await memory.initialize()
+    try:
+        outcome = await run_probe(
+            memory, registry,
+            project_ids=tuple(args.project_id),
+            ks=tuple(args.k),
+            out_root=args.out_root,
+        )
+    finally:
+        await memory.close()
+
+    print(outcome.report, end='')
+    logger.info('metrics: %s', outcome.metrics_path)
+    logger.info('report:  %s', outcome.report_path)
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    return asyncio.run(_run(build_parser().parse_args(argv)))
+
+
+if __name__ == '__main__':
+    sys.exit(main())
