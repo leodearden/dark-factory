@@ -168,3 +168,48 @@ whenever `tests_pass` is unset. This was first documented in
 filed as **task 3099**. Every number in the table above was therefore recomputed from
 the per-cell JSONs' `plan_quality` / `plan_steps` / `cost_usd` / `outcome` fields, not
 read off a composite column.
+
+---
+
+## 4. Per-fixture breakdown and the metric-definition reconciliation
+
+_RAW OBSERVATION._
+
+**Planned/3 per fixture × candidate** (`plan_steps > 0`, the `planRate` numerator):
+
+| fixture | opus-max | opus-high | sonnet-high | fable-high |
+|---|---|---|---|---|
+| `df_task_2284_adv_regression` | 3/3 | 3/3 | 2/3 | 3/3 |
+| `df_task_2339_adv_verify` | 3/3 | 3/3 | 3/3 | 3/3 |
+| `df_task_18` | 3/3 | 3/3 | 3/3 | 3/3 |
+| `reify_task_12` | 1/3 | 0/3 | 1/3 | 2/3 |
+| `reify_task_27` | 3/3 | 3/3 | 3/3 | 3/3 |
+| `df_task_2430_adv_plan` | 3/3 | 3/3 | 3/3 | 3/3 |
+
+**Done/3 per fixture × candidate** (`outcome == 'done'`, the `doneRate` numerator):
+
+| fixture | opus-max | opus-high | sonnet-high | fable-high |
+|---|---|---|---|---|
+| `df_task_2284_adv_regression` | 3/3 | 3/3 | 3/3 | 3/3 |
+| `df_task_2339_adv_verify` | 3/3 | 3/3 | 3/3 | 3/3 |
+| `df_task_18` | 3/3 | 1/3 | 0/3 | 2/3 |
+| `reify_task_12` | 3/3 | 3/3 | 2/3 | 3/3 |
+| `reify_task_27` | 1/3 | 3/3 | 3/3 | 3/3 |
+| `df_task_2430_adv_plan` | 3/3 | 3/3 | 3/3 | 3/3 |
+
+**The metric-definition reconciliation — load-bearing.** esc-2862-1's resolution and
+its own triage note name *different* discriminating fixtures, which reads as a
+self-contradiction unless the metric each is using is made explicit. It is not a
+contradiction: both are correct, under different metrics.
+
+- Under **planRate**, the discriminator is `reify_task_12` — fable 2/3, opus-max 1/3,
+  opus-high 0/3, sonnet 1/3 — and every other fixture is 3/3 for both fable and
+  opus-max. This is the metric behind the resolution's leave-one-fixture-out
+  argument (§5).
+- Under **doneRate**, the discriminators are `df_task_18` (fable 2/3, opus-max 3/3,
+  opus-high 1/3, sonnet 0/3) and `reify_task_27` (opus-max 1/3, everyone else 3/3).
+  This is the metric behind the triage note's per-candidate `done` table.
+
+Neither account is wrong. This record reports both tables above for exactly that
+reason, so a downstream reader does not have to reconcile the resolution against its
+own triage note unassisted.
