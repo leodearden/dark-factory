@@ -771,3 +771,199 @@ class TestWriteCycleSummaryMirrorAndTrim:
         assert 'run-no-ledger' in kwargs.get('content', '')
 
         mock_trim.assert_awaited_once()
+
+
+class TestEnforceSummaryPoolCapPrecision:
+    """The trim must match only real cycle_summary records, and must evict the
+    disposable narratives before the ledger_stamp mirrors (task 3041).
+
+    This is the path that consumed the run-84eae9bd anchors reported by recon
+    gate 165 / esc-165-1. Two latent precision defects made it worse than the
+    designed cap-2 bound alone:
+
+    (a) the enumeration filtered ONLY on recon_pool, with no kind constraint —
+        and _apply_cycle_summary_metadata_tagging is additive-only, never
+        stripping a caller-supplied recon_pool, so a mis-tagged non-summary
+        record could join the pool and be trimmed (or evict a real mirror);
+    (b) the sort was record_type-blind, so an LLM-authored 'narrative' copy
+        could evict the deterministic 'ledger_stamp' mirror that
+        get_cycle_summary_presence parity and any run-scoped audit depend on.
+    """
+
+    @pytest.mark.asyncio
+    async def test_enumeration_is_constrained_to_kind_cycle_summary(self):
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        await enforce_summary_pool_cap(
+            memory_service,
+            project_id='dark_factory',
+            run_id='run-deleter',
+            recon_pool='stage1_cycle_summary',
+            trim_source='stage1_cycle_summary_trim',
+            cap=2,
+        )
+
+        assert memory_service.get_memories_by_metadata.await_args.kwargs['filters'] == {
+            'recon_pool': 'stage1_cycle_summary',
+            'kind': 'cycle_summary',
+        }
+
+    @pytest.mark.asyncio
+    async def test_newest_narrative_is_evicted_before_an_older_ledger_stamp(self):
+        """The exact shape that made all three run-84eae9bd anchors vanish."""
+        members = [
+            {'id': 'stamp-oldest', 'created_at': '2026-01-01T00:00:00+00:00',
+             'metadata': {'kind': 'cycle_summary', 'record_type': 'ledger_stamp'}},
+            {'id': 'stamp-middle', 'created_at': '2026-02-01T00:00:00+00:00',
+             'metadata': {'kind': 'cycle_summary', 'record_type': 'ledger_stamp'}},
+            {'id': 'narrative-newest', 'created_at': '2026-03-01T00:00:00+00:00',
+             'metadata': {'kind': 'cycle_summary', 'record_type': 'narrative'}},
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await enforce_summary_pool_cap(
+            memory_service,
+            project_id='dark_factory',
+            run_id='run-deleter',
+            recon_pool='stage1_cycle_summary',
+            trim_source='stage1_cycle_summary_trim',
+            cap=2,
+        )
+
+        assert result == 1
+        deleted = {
+            call.kwargs.get('memory_id')
+            for call in memory_service.delete_memory.call_args_list
+        }
+        # The disposable LLM-authored copy goes; both ledger_stamp mirrors —
+        # the records get_cycle_summary_presence parity depends on — survive.
+        assert deleted == {'narrative-newest'}
+
+    @pytest.mark.asyncio
+    async def test_older_narrative_evicted_first_when_narratives_are_over_cap(self):
+        members = [
+            {'id': 'narrative-older', 'created_at': '2026-01-01T00:00:00+00:00',
+             'metadata': {'kind': 'cycle_summary', 'record_type': 'narrative'}},
+            {'id': 'narrative-newer', 'created_at': '2026-02-01T00:00:00+00:00',
+             'metadata': {'kind': 'cycle_summary', 'record_type': 'narrative'}},
+            {'id': 'stamp', 'created_at': '2026-03-01T00:00:00+00:00',
+             'metadata': {'kind': 'cycle_summary', 'record_type': 'ledger_stamp'}},
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await enforce_summary_pool_cap(
+            memory_service,
+            project_id='dark_factory',
+            run_id='run-deleter',
+            recon_pool='stage1_cycle_summary',
+            trim_source='stage1_cycle_summary_trim',
+            cap=2,
+        )
+
+        assert result == 1
+        deleted = {
+            call.kwargs.get('memory_id')
+            for call in memory_service.delete_memory.call_args_list
+        }
+        assert deleted == {'narrative-older'}
+
+    @pytest.mark.asyncio
+    async def test_ledger_stamps_still_evict_oldest_first_among_themselves(self):
+        members = [
+            {'id': 'stamp-oldest', 'created_at': '2026-01-01T00:00:00+00:00',
+             'metadata': {'kind': 'cycle_summary', 'record_type': 'ledger_stamp'}},
+            {'id': 'stamp-middle', 'created_at': '2026-02-01T00:00:00+00:00',
+             'metadata': {'kind': 'cycle_summary', 'record_type': 'ledger_stamp'}},
+            {'id': 'stamp-newest', 'created_at': '2026-03-01T00:00:00+00:00',
+             'metadata': {'kind': 'cycle_summary', 'record_type': 'ledger_stamp'}},
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await enforce_summary_pool_cap(
+            memory_service,
+            project_id='dark_factory',
+            run_id='run-deleter',
+            recon_pool='stage1_cycle_summary',
+            trim_source='stage1_cycle_summary_trim',
+            cap=2,
+        )
+
+        assert result == 1
+        deleted = {
+            call.kwargs.get('memory_id')
+            for call in memory_service.delete_memory.call_args_list
+        }
+        assert deleted == {'stamp-oldest'}
+
+    @pytest.mark.asyncio
+    async def test_undatable_member_sorts_last_within_its_own_class(self):
+        """Pre-existing invariant: an undatable member is never preferentially
+        deleted — now scoped WITHIN its record_type class."""
+        members = [
+            {'id': 'narrative-dated', 'created_at': '2026-01-01T00:00:00+00:00',
+             'metadata': {'kind': 'cycle_summary', 'record_type': 'narrative'}},
+            {'id': 'narrative-undatable', 'created_at': None,
+             'metadata': {'kind': 'cycle_summary', 'record_type': 'narrative'}},
+            {'id': 'narrative-unparseable', 'created_at': 'not-a-timestamp',
+             'metadata': {'kind': 'cycle_summary', 'record_type': 'narrative'}},
+            {'id': 'stamp', 'created_at': '2026-03-01T00:00:00+00:00',
+             'metadata': {'kind': 'cycle_summary', 'record_type': 'ledger_stamp'}},
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await enforce_summary_pool_cap(
+            memory_service,
+            project_id='dark_factory',
+            run_id='run-deleter',
+            recon_pool='stage1_cycle_summary',
+            trim_source='stage1_cycle_summary_trim',
+            cap=2,
+        )
+
+        assert result == 2
+        deleted = {
+            call.kwargs.get('memory_id')
+            for call in memory_service.delete_memory.call_args_list
+        }
+        # The dated narrative goes first; one undatable narrative follows only
+        # because the pool is still over cap. The ledger_stamp survives.
+        assert 'narrative-dated' in deleted
+        assert 'stamp' not in deleted
+
+    @pytest.mark.asyncio
+    async def test_member_with_no_metadata_key_does_not_raise(self):
+        members = [
+            {'id': 'no-metadata-1', 'created_at': '2026-01-01T00:00:00+00:00'},
+            {'id': 'no-metadata-2', 'created_at': '2026-02-01T00:00:00+00:00'},
+            {'id': 'stamp', 'created_at': '2026-03-01T00:00:00+00:00',
+             'metadata': {'kind': 'cycle_summary', 'record_type': 'ledger_stamp'}},
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await enforce_summary_pool_cap(
+            memory_service,
+            project_id='dark_factory',
+            run_id='run-deleter',
+            recon_pool='stage1_cycle_summary',
+            trim_source='stage1_cycle_summary_trim',
+            cap=2,
+        )
+
+        assert result == 1
+        deleted = {
+            call.kwargs.get('memory_id')
+            for call in memory_service.delete_memory.call_args_list
+        }
+        assert deleted == {'no-metadata-1'}
