@@ -1716,27 +1716,29 @@ def _build_retry_verify_env(
 
 @dataclasses.dataclass(frozen=True)
 class _Attempt0Payload:
-    """Injected attempt-0 result the failed-only retry is constructed from.
+    """The attempt-0 result the failed-only retry is constructed from.
 
-    Read at the ``_run_post_merge_verify`` wiring boundary from the reify-written
-    attempt-0 sidecar under ``merge_wt`` (the sidecar SCHEMA is owned by the
-    cross-project reify α/β/γ tasks; the DF reader degrades tolerantly when it is
-    absent/malformed — the whole retry path stays a no-op until reify lands).
-    Passing it as an explicit parameter keeps the subset/env/gate logic pure and
-    fully unit-testable with fixtures, independent of the sidecar.
+    **DF CONSTRUCTS this** (see :func:`_build_attempt0_payload`) from attempt-0's
+    own ``VerifyResult.test_output`` plus a ``cargo nextest list`` planned probe.
+    Only the tree-OID pin and the profile list come from reify's sidecar
+    (:data:`_REIFY_ATTEMPT_SIDECAR_RELPATH`); the subset CONTENT is DF-owned end
+    to end.  Passing it as an explicit parameter keeps the subset/env/gate logic
+    pure and fully unit-testable.
 
     Fields:
-        tree_oid: attempt-0-pinned content-tree OID (``git rev-parse HEAD^{tree}``)
-            the retry is corroborated against (INV-3).
-        debug_planned / debug_verdicts: the debug-profile nextest plan/list
-            (authoritative full set) and the parsed attempt-0 verdicts
-            (RUN tests only) — combined via :func:`build_fail_fast_map`.
+        tree_oid: attempt-0-pinned content-tree OID the retry is corroborated
+            against (INV-3) — reify's ``git rev-parse HEAD:`` stamp.
+        profiles: the cargo profiles attempt-0 PLANNED to run, in reify's order.
+        debug_planned / debug_verdicts: the debug-profile nextest plan
+            (authoritative full set) and the parsed attempt-0 verdicts (RUN tests
+            only) — combined via :func:`build_fail_fast_map`.
         release_planned / release_verdicts: same, for the release profile.
         run_all_members: {failed} run_all member ids (pass-through).
         gui_specs: {failed} gui spec files (pass-through).
     """
 
     tree_oid: str
+    profiles: tuple[str, ...]
     debug_planned: list[str]
     debug_verdicts: dict[str, str]
     release_planned: list[str]
@@ -2028,6 +2030,78 @@ async def _probe_nextest_planned(
             '— full verify', profile,
         )
     return planned
+
+
+async def _build_attempt0_payload(
+    merge_wt: Path, verify: VerifyResult
+) -> _Attempt0Payload | None:
+    """Build the retry payload from attempt-0's OWN result — no cross-repo handoff.
+
+    Sources, all DF-owned except the two pins:
+
+    * ``verify.test_output`` → per-test verdicts (:func:`parse_per_test_results`)
+      and the {failed} run_all members (:func:`parse_failed_run_all_members`);
+    * a ``cargo nextest list`` probe → the authoritative planned set;
+    * reify's sidecar → ONLY ``tree_oid`` (the INV-3 pin) and ``profiles``.
+
+    **Profile attribution — the load-bearing rule.** ``verify.test_output`` is a
+    single blended blob across BOTH nextest passes, and the verdict key
+    (``"<binary-id> <test-name>"``) does not carry the profile.  So a ``pass``
+    observed in profile 1 is INDISTINGUISHABLE from a test that never ran in
+    profile 2.  ``verify.sh:219-230`` makes "never narrow a profile that never
+    ran" DF's seam obligation.  Therefore **only the FIRST profile named in the
+    sidecar is narrowed**; every later profile gets an empty subset, which reify
+    turns into its loud per-profile "retry refused: no subset" FULL fallback.
+
+    Under fail-fast the red lands in the first (debug) pass, which is where the
+    savings are, so the capability still fires meaningfully.
+
+    Fail-safe throughout: a None from the sidecar loader or from the first
+    profile's probe returns None, routing the caller to a FULL verify.
+
+    Args:
+        merge_wt: the merge worktree (sidecar location and probe cwd).
+        verify: attempt-0's own failing :class:`VerifyResult`.
+
+    Returns:
+        The constructed :class:`_Attempt0Payload`, or None for a full verify.
+    """
+    sidecar = _load_reify_attempt_sidecar(merge_wt)
+    if sidecar is None:
+        return None
+
+    # Only the FIRST profile can be narrowed — see the rule above.
+    first = sidecar.profiles[0]
+    planned = await _probe_nextest_planned(
+        merge_wt, first, timeout_secs=_NEXTEST_LIST_PROBE_TIMEOUT_SECS
+    )
+    if planned is None:
+        # Never narrow on a partial plan: an unknown plan cannot distinguish
+        # "this test passed" from "this test was never listed".
+        return None
+
+    verdicts = parse_per_test_results(verify.test_output)
+    # A later profile's planned set is never even requested — it could not be
+    # used, and probing it would cost a `nextest list` for nothing.
+    per_profile: dict[str, tuple[list[str], dict[str, str]]] = {
+        p: ([], {}) for p in _KNOWN_REIFY_PROFILES
+    }
+    per_profile[first] = (planned, verdicts)
+
+    return _Attempt0Payload(
+        tree_oid=sidecar.tree_oid,
+        profiles=sidecar.profiles,
+        debug_planned=per_profile['debug'][0],
+        debug_verdicts=per_profile['debug'][1],
+        release_planned=per_profile['release'][0],
+        release_verdicts=per_profile['release'][1],
+        run_all_members=parse_failed_run_all_members(verify.test_output),
+        # Deliberately empty (task 3059): no real reify gui failure log was
+        # available to pin a fixture to, and authoring one from prose is the
+        # drift class this leaf corrects.  verify.sh:2127-2158 treats an empty
+        # value as "run the FULL gui suite" — unambiguously safe.
+        gui_specs=[],
+    )
 
 
 async def _run_post_merge_verify(

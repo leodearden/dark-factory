@@ -35,6 +35,7 @@ def _attempt0(tree_oid: str):
 
     return _Attempt0Payload(
         tree_oid=tree_oid,
+        profiles=('debug', 'release'),
         # debug: 'c a::z' cancelled by fail-fast (absent from verdicts) → not-started
         debug_planned=['c a::x', 'c a::y', 'c a::z'],
         debug_verdicts={'c a::x': 'pass', 'c a::y': 'fail'},
