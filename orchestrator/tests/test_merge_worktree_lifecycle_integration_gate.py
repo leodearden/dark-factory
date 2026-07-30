@@ -588,11 +588,17 @@ class TestDeleterFace:
 
         _plant_dead_holder_tree(base, dead_wt)
 
-        outcome_dead = await git_ops.remove_merge_worktree_guarded(dead_wt, reason='reaper')
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            outcome_dead = await git_ops.remove_merge_worktree_guarded(dead_wt, reason='reaper')
         assert outcome_dead == 'removed', (
             'a stale holder-pgid record with no live flock must fail OPEN'
         )
         assert not dead_wt.exists()
+        assert _git_ops_warnings(caplog) == [], (
+            'fail-open must not emit a skip WARNING: a stale holder-pgid record is not '
+            'contention. Restored from test_remove_merge_worktree_guarded.py::'
+            'test_dead_holder_pgid_fails_open_and_removes, which the row-3 port dropped.'
+        )
 
         fd_live = _plant_leased_tree(base, live_wt)
         try:
