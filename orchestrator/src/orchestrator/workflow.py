@@ -4058,7 +4058,10 @@ class TaskWorkflow:
             # none interacts with the consecutive_no_plan_failures cycle
             # counter.  Order matters: unactionable_task and false_premise are
             # the most decisive (jump straight to L1, bypass steward);
-            # already_done is a clean DONE; blocking_dependency may re-loop
+            # already_done is a clean DONE; ready_to_merge is a deterministic
+            # merge submit (less decisive than already_done's clean DONE — the
+            # work is on the BRANCH, not main — but more decisive than a
+            # re-looping blocking_dependency); blocking_dependency may re-loop
             # the architect.
             if self.artifacts.read_unactionable_task() is not None:
                 return await self._handle_unactionable_task_report()
@@ -4066,6 +4069,8 @@ class TaskWorkflow:
                 return await self._handle_false_premise_report()
             if self.artifacts.read_already_done() is not None:
                 return await self._handle_already_done_report()
+            if self.artifacts.read_ready_to_merge() is not None:
+                return await self._handle_ready_to_merge_report()
             # Fix B: the architect may have written a blocking_dependency
             # report instead of a plan.
             if self.artifacts.read_blocking_dependency() is not None:
@@ -4457,6 +4462,8 @@ class TaskWorkflow:
             return await self._handle_false_premise_report()
         if self.artifacts.read_already_done() is not None:
             return await self._handle_already_done_report()
+        if self.artifacts.read_ready_to_merge() is not None:
+            return await self._handle_ready_to_merge_report()
         if self.artifacts.read_blocking_dependency() is not None:
             # Falling through — the architect path's
             # _handle_blocking_dep_report logic re-acquires base_commit
