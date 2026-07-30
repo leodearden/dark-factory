@@ -5,6 +5,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from shared.cli_invoke import (
     AgentFailureKind,
@@ -26,6 +27,62 @@ from fused_memory.reconciliation.journal import ReconciliationJournal
 from fused_memory.reconciliation.prompts.judge import JUDGE_SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
+
+
+# The judge's verdict contract, carried as ``--json-schema`` rather than as prose
+# in JUDGE_SYSTEM_PROMPT.  This placement is load-bearing, not cosmetic:
+# ``build_claude_argv`` emits ``--json-schema`` UNCONDITIONALLY
+# (cli_invoke.py:1552-1553) but DROPS ``--system-prompt-file`` on the resume path
+# (:1501-1503).  A cap-retry resume (:1270-1272) therefore re-invokes the CLI
+# with the schema still attached but the system prompt gone — so a prose-only
+# output contract silently evaporates exactly when the run is already degraded,
+# which is how a 2026-07-25 cap-storm resume produced conversational prose that
+# _parse_verdict fabricated into a phantom severity=serious project halt.
+#
+# Both severity enums are DERIVED from VerdictSeverity so the schema and the
+# pydantic field that validates the payload cannot drift.  ``summary`` is
+# included because JUDGE_SYSTEM_PROMPT asks for it (JudgeVerdict has no such
+# field and drops it, exactly as today) — omitting it here while still requesting
+# it in prose would make prompt and schema contradict each other.
+# ``additionalProperties: false`` is deliberately NOT set (no sibling schema sets
+# it): rejecting a usable verdict over one extra key is strictly worse than
+# accepting it.  Sibling convention — the schema lives in the module that invokes
+# the CLI (task_curator.py:139, cli_stage_runner.py:95, agent_loop.py:27).
+_VERDICT_SEVERITY_VALUES = [s.value for s in VerdictSeverity]
+
+JUDGE_VERDICT_SCHEMA: dict[str, Any] = {
+    'type': 'object',
+    'required': ['severity', 'findings'],
+    'properties': {
+        'severity': {'type': 'string', 'enum': _VERDICT_SEVERITY_VALUES},
+        'findings': {
+            'type': 'array',
+            'items': {
+                'type': 'object',
+                'properties': {
+                    'entry_id': {'type': ['string', 'null']},
+                    'issue': {'type': 'string'},
+                    'severity': {'type': 'string', 'enum': _VERDICT_SEVERITY_VALUES},
+                    'recommendation': {'type': 'string'},
+                },
+            },
+        },
+        'summary': {'type': 'string'},
+    },
+}
+
+# max_turns for the judge CLI invocation.  NOT 1: ``max_turns=1`` is incompatible
+# with ``--json-schema`` because the schema mechanism burns a tool-use turn, so
+# the CLI returns ``error_max_turns`` even when the structured payload is already
+# attached (task_curator.py:2366-2372).  3 is the floor both migrated siblings
+# use (curator ``ge=3``, path_scope_adjudicator ``ge=3``): schema tool-use +
+# optional reasoning + final response.  We deliberately do NOT rely on
+# cli_invoke's ``schema_salvaged`` boundary fallback (:1794-1797), which would
+# make every judge run report an internal ``is_error`` and spend its turn on an
+# error path.  Cost/duration exposure stays bounded by
+# ``judge_cli_timeout_seconds`` (validated ≤ stage_timeout_seconds) and
+# cli_invoke's ``max_budget_usd`` default.
+_JUDGE_CLI_MAX_TURNS = 3
 
 
 UnhaltCallback = Callable[[str], Awaitable[None] | None]
@@ -378,7 +435,21 @@ Review this run and provide your verdict as JSON.
     async def _call_judge_cli(self, prompt: str) -> str:
         """Delegate to shared.cli_invoke.invoke_with_cap_retry for judge evaluation.
 
-        Judge output is free-form text — no output_schema is passed.
+        The verdict contract rides ``output_schema=JUDGE_VERDICT_SCHEMA`` rather
+        than prose in the system prompt, so it survives every cap-retry resume:
+        ``build_claude_argv`` emits ``--json-schema`` unconditionally
+        (cli_invoke.py:1552-1553) while it drops ``--system-prompt-file`` on the
+        resume path (:1501-1503).
+
+        ``disallowed_tools=['*']`` is still passed VERBATIM.  cli_invoke expands
+        the wildcard into ``_REAL_BUILTIN_TOOLS_DENYLIST`` when a schema is
+        present (:1533-1536) — a list that omits the synthetic
+        ``StructuredOutput`` tool the schema is delivered through — so "no real
+        file/bash/web/MCP tool access" is preserved while the schema tool gets
+        through.  Pre-expanding here would duplicate a list documented as needing
+        to stay in sync with the CLI's built-ins and would skip future central
+        fixes.
+
         InvokeSlot owns probe-slot release and terminate_process_group on timeout.
         """
         try:
@@ -389,10 +460,11 @@ Review this run and provide your verdict as JSON.
                 system_prompt=JUDGE_SYSTEM_PROMPT,
                 model=self.config.judge_llm_model,
                 disallowed_tools=['*'],
-                # max_turns=1: the judge is deliberately single-shot.  One turn is
-                # sufficient to produce a free-form verdict; allowing more would
-                # widen cost/duration exposure with no benefit.
-                max_turns=1,
+                output_schema=JUDGE_VERDICT_SCHEMA,
+                # See _JUDGE_CLI_MAX_TURNS: 1 is incompatible with --json-schema
+                # (the schema mechanism burns a tool-use turn — see
+                # task_curator.py:2366-2372).
+                max_turns=_JUDGE_CLI_MAX_TURNS,
                 permission_mode='bypassPermissions',
                 timeout_seconds=float(self.config.judge_cli_timeout_seconds),
                 # Task 1989 (sweep verdict): kept at explore_codebase_root, NOT
