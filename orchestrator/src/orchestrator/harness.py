@@ -11527,6 +11527,20 @@ class Harness:
             )
             return
 
+        # restart means "run this task again from scratch", so void any durable
+        # merge-retry obligation first (task 3024).  A surviving
+        # metadata.merge_retry_pending stamp makes the re-dispatched workflow
+        # fast-path straight to the merge phase (_resume_merge_retry_if_pending),
+        # skipping plan/execute/verify/review entirely — so without this clear a
+        # restart re-enters exactly the state it was invoked to escape, and an
+        # operator has no reliable way to force a fresh plan.
+        #
+        # Ordered BEFORE the status write: once the task reads 'pending' the
+        # scheduler may re-dispatch it, and a clear landing after that loses the
+        # race to a workflow that has already read the stamp.
+        if action == 'restart':
+            await self._clear_merge_retry_pending_for_restart(task_id)
+
         logger.info(
             'action-teardown %s: writing task %s → %s',
             action, task_id, target_status,
@@ -11618,6 +11632,38 @@ class Harness:
                 self._action_teardown_tasks[task_id] -= 1
                 if self._action_teardown_tasks[task_id] <= 0:
                     del self._action_teardown_tasks[task_id]
+
+    async def _clear_merge_retry_pending_for_restart(self, task_id: str) -> None:
+        """Drop ``metadata.merge_retry_pending`` so a restart re-plans from scratch.
+
+        The stamp is a durable obligation to resume straight into the merge
+        phase (workflow ``_resume_merge_retry_if_pending``), which skips
+        plan/execute/verify/review.  That is the opposite of what restart means,
+        and leaving it in place is what makes restart unable to free a task
+        wedged in that fast-path (task 3024).
+
+        ``metadata_mode='replace'`` is required, not incidental: the default
+        'merge' mode preserves keys omitted from the payload, so only a
+        whole-blob replace can actually DELETE a key.  The read-modify-write
+        therefore has to carry every other key through — hence reading current
+        metadata first rather than writing a hand-built dict.
+
+        No-op (zero MCP calls) unless the stamp is actually present.
+        """
+        task = await self.scheduler.get_task(task_id)
+        metadata = (task or {}).get('metadata')
+        if not isinstance(metadata, dict) or 'merge_retry_pending' not in metadata:
+            return
+        cleaned = {k: v for k, v in metadata.items() if k != 'merge_retry_pending'}
+        await self.scheduler.update_task(
+            task_id, metadata=cleaned, metadata_mode='replace',
+        )
+        logger.info(
+            'action-teardown restart: cleared merge_retry_pending stamp for task '
+            '%s so the re-dispatch runs the full plan/execute/verify/review '
+            'pipeline instead of fast-pathing to merge',
+            task_id,
+        )
 
     def _resolve_escalation_action(self, escalation) -> str:
         """Resolve the canonical action for a resolved/dismissed escalation.
