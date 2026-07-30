@@ -24,6 +24,11 @@ import json
 import sqlite3
 from pathlib import Path
 
+from audit_wiped_metadata_files import (
+    TaskRecord,
+    load_task_records,
+)
+
 # ---------------------------------------------------------------------------
 # Temp-DB fixture builders.
 #
@@ -199,3 +204,83 @@ def test_make_runs_db_assigns_ascending_ids_in_list_order(tmp_path):
         (2, "7", "phase_skipped", None),
         (3, None, "merge_finalized", "{bad"),
     ]
+
+
+# ---------------------------------------------------------------------------
+# load_task_records — read tasks.db into TaskRecords keyed by (tag, id).
+# ---------------------------------------------------------------------------
+
+
+def test_load_task_records_carries_tag_id_status_and_files(tmp_path):
+    db_path = _make_tasks_db(
+        tmp_path,
+        [{"id": 42, "status": "done", "metadata": {"files": ["a.py", "b.py"]}}],
+    )
+    records = load_task_records(str(db_path))
+
+    assert list(records) == [("master", 42)]
+    record = records[("master", 42)]
+    assert isinstance(record, TaskRecord)
+    assert record.tag == "master"
+    assert record.task_id == 42
+    assert record.status == "done"
+    # (b) a well-formed files list yields exactly those entries.
+    assert record.metadata_files == ("a.py", "b.py")
+
+
+def test_load_task_records_degrades_every_unusable_metadata_shape_to_empty(tmp_path):
+    """(c) + (d): empty list, absent key, NULL, malformed JSON, and a
+    wrong-typed `files` all yield an empty tuple WITHOUT raising."""
+    db_path = _make_tasks_db(
+        tmp_path,
+        [
+            {"id": 1, "metadata": {"files": []}},
+            {"id": 2, "metadata": {}},
+            {"id": 3, "metadata": None},
+            {"id": 4, "metadata": "{not valid json at all"},
+            # (d) `files` is a bare string, not a list.
+            {"id": 5, "metadata": {"files": "scripts/thing.py"}},
+            # metadata decodes to a non-dict entirely.
+            {"id": 6, "metadata": "[1, 2, 3]"},
+            {"id": 7, "metadata": '"just a string"'},
+            {"id": 8, "metadata": {"files": None}},
+        ],
+    )
+    records = load_task_records(str(db_path))
+
+    assert len(records) == 8
+    for task_id in range(1, 9):
+        assert records[("master", task_id)].metadata_files == (), f"task {task_id}"
+
+
+def test_load_task_records_keys_by_tag_and_id_so_tags_do_not_collide(tmp_path):
+    """(e) the same numeric id under two tags must not collide."""
+    db_path = _make_tasks_db(
+        tmp_path,
+        [
+            {"id": 9, "tag": "master", "status": "done", "metadata": {"files": []}},
+            {"id": 9, "tag": "feature", "status": "pending", "metadata": {"files": ["x.py"]}},
+        ],
+    )
+    records = load_task_records(str(db_path))
+
+    assert set(records) == {("master", 9), ("feature", 9)}
+    assert records[("master", 9)].metadata_files == ()
+    assert records[("master", 9)].status == "done"
+    assert records[("feature", 9)].metadata_files == ("x.py",)
+    assert records[("feature", 9)].status == "pending"
+
+
+def test_load_task_records_coerces_non_string_file_entries(tmp_path):
+    """A files list carrying non-string junk is coerced/filtered rather than
+    crashing a downstream str-formatting consumer."""
+    db_path = _make_tasks_db(
+        tmp_path, [{"id": 1, "metadata": {"files": ["a.py", None, 3, ""]}}]
+    )
+    records = load_task_records(str(db_path))
+    assert records[("master", 1)].metadata_files == ("a.py",)
+
+
+def test_load_task_records_on_empty_db_returns_empty_mapping(tmp_path):
+    db_path = _make_tasks_db(tmp_path, [])
+    assert load_task_records(str(db_path)) == {}
