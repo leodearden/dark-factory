@@ -1820,6 +1820,28 @@ def create_mcp_server(
         absent/already-folded" apart from "backend timed out" — the exact
         distinction semantic search's silent low-similarity drop could not make.
 
+        A miss now carries an optional ``tombstone`` key (task 3041) when the
+        record was DELIBERATELY reaped by a named reconciliation sweep. Its
+        presence proves the record is gone on purpose — naming the sweep
+        (``deleter``), the run that performed the deletion
+        (``deleting_run_id``, distinct from the victim's own ``run_id``), when,
+        and the victim's identifying metadata — rather than lost. This closes
+        the recon-gate-165 / esc-165-1 audit dead-end, where this exact query
+        answered ``{'found': False}`` for three cycle_summary anchors with no
+        reachable path to who deleted them, making a designed cap-2 mirror
+        eviction indistinguishable from fleet-wide silent data loss.
+
+        The key is OMITTED (not ``None``) when no tombstone exists, so its
+        presence is itself the signal and the ordinary never-existed miss keeps
+        its original shape. Absence is NOT proof of the converse: tombstones
+        are TTL-bounded, so one older than
+        ``mem0_tombstone.MEM0_TOMBSTONE_TTL_DAYS`` has itself expired. The
+        lookup is guarded and never runs on the hit branch, so it can only add
+        information to an already-correct answer — a tombstone failure can
+        never convert a correct ``found: False`` into an error, and a backend
+        failure never gains a ``tombstone`` (it says why a record is gone,
+        never whether it is).
+
         This tool is intentionally read-only and is NOT included in any
         DISALLOW_* list, so it is auto-allowed in Stage 1 (memory_consolidator)
         and Stage 3's read-only integrity-check mode.
@@ -1831,8 +1853,12 @@ def create_mcp_server(
         Returns:
             ``{'found': True, 'memory_id', 'project_id', 'content', 'metadata'}``
             on a hit (``metadata`` is the full raw Qdrant payload); ``{'found':
-            False, 'memory_id', 'project_id'}`` on a genuine miss; or ``{'error',
-            'error_type'}`` on a backend failure.
+            False, 'memory_id', 'project_id'}`` on a genuine miss — plus
+            ``'tombstone': {'deleter', 'deleting_run_id', 'deleted_at', victim
+            'kind'/'record_type'/'source'/'recon_pool'/'run_id'/'created_at',
+            'tombstone_created_at', 'tombstone_expires_at'}`` when the record
+            was deliberately reaped; or ``{'error', 'error_type'}`` on a
+            backend failure.
         """
         project_id, err = _canonicalize_project_id_arg(project_id)
         if err:
@@ -1844,7 +1870,25 @@ def create_mcp_server(
             memory_id=memory_id,
         )
         if record is None:
-            return {'found': False, 'memory_id': memory_id, 'project_id': project_id}
+            miss: dict[str, Any] = {
+                'found': False,
+                'memory_id': memory_id,
+                'project_id': project_id,
+            }
+            # A miss may be a DELIBERATE reap rather than a never-existed. The
+            # lookup is guarded and the key omitted when empty, so this can
+            # only ever add information to an answer that is already correct —
+            # a tombstone failure must never turn a correct found:False into
+            # an {'error'} and break the contract above (task 3041).
+            try:
+                tombstone = await memory_service.get_mem0_deletion_tombstone(
+                    project_id, memory_id
+                )
+            except Exception:
+                tombstone = None
+            if tombstone:
+                miss['tombstone'] = tombstone
+            return miss
         return {
             'found': True,
             'memory_id': memory_id,
