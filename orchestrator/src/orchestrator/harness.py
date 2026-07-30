@@ -809,9 +809,13 @@ class TaskReport:
     completed_at: str = ''
     # Block-context surfacing for the per-task retry cap.  Populated by
     # _run_slot from the TerminalReport returned by workflow.run() (TR-1)
-    # when the outcome is REQUEUED (harmless/empty on DONE paths).  Not
-    # persisted to runs.db — purely in-memory for the cap check + cap-exhaust
-    # report.
+    # when the outcome is REQUEUED (harmless/empty on DONE paths).
+    #
+    # Task 3068 made block_reason/block_phase DURABLE: both are now emitted on
+    # the EventType.task_completed payload AND persisted to runs.db's
+    # task_results (via both save_task_result and save_run).  block_detail
+    # remains purely in-memory — it carries unbounded raw agent/verify output,
+    # so it stays out of the two operationally-queried, rotated stores.
     block_reason: str = ''
     block_detail: str = ''
     block_phase: str = ''

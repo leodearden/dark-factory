@@ -46,6 +46,21 @@ CREATE TABLE IF NOT EXISTS task_results (
     steward_cost_usd    REAL DEFAULT 0.0,
     steward_invocations INTEGER DEFAULT 0,
     completed_at        TEXT,
+    -- Task 3068 (origin incident: reify esc-5556-1).  The classified block
+    -- reason + PRE-block working phase, so a requeue loop leaves a durable,
+    -- GROUP-BY-able WHY here and not only in a rotated journald log.
+    --
+    -- These MUST stay LAST, after completed_at: SQLite's ALTER TABLE ADD
+    -- COLUMN can only append, so declaring them anywhere else would give a
+    -- freshly-created runs.db a different physical column ORDER than one
+    -- migrated by _migrate_task_results_block_context.  Both writers name
+    -- their columns explicitly, but an operator forensic `SELECT *` — exactly
+    -- the use case this task exists to serve — is positional.
+    --
+    -- block_detail is deliberately NOT persisted: unbounded raw agent/verify
+    -- output in an operationally-queried store (see task 3068 decisions).
+    block_reason        TEXT,
+    block_phase         TEXT,
     PRIMARY KEY (run_id, task_id)
 );
 
@@ -136,8 +151,9 @@ class RunStore:
                 '(run_id, task_id, project_id, title, outcome, '
                 ' cost_usd, duration_ms, agent_invocations, '
                 ' execute_iterations, verify_attempts, review_cycles, '
-                ' steward_cost_usd, steward_invocations, completed_at) '
-                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                ' steward_cost_usd, steward_invocations, completed_at, '
+                ' block_reason, block_phase) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
                 (
                     run_id,
                     task_report.task_id,
@@ -153,6 +169,10 @@ class RunStore:
                     task_report.steward_cost_usd,
                     task_report.steward_invocations,
                     task_report.completed_at,
+                    # Task 3068 — '' on clean exits, never NULL, so a NULL here
+                    # unambiguously means "row predates 3068".
+                    task_report.block_reason,
+                    task_report.block_phase,
                 ),
             )
             conn.commit()
@@ -258,8 +278,9 @@ class RunStore:
                     '(run_id, task_id, project_id, title, outcome, '
                     ' cost_usd, duration_ms, agent_invocations, '
                     ' execute_iterations, verify_attempts, review_cycles, '
-                    ' steward_cost_usd, steward_invocations, completed_at) '
-                    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                    ' steward_cost_usd, steward_invocations, completed_at, '
+                    ' block_reason, block_phase) '
+                    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
                     (
                         run_id,
                         tr.task_id,
@@ -275,6 +296,10 @@ class RunStore:
                         tr.steward_cost_usd,
                         tr.steward_invocations,
                         tr.completed_at,
+                        # Task 3068 — the batch path must stay in lockstep with
+                        # save_task_result above, or it silently writes NULLs.
+                        tr.block_reason,
+                        tr.block_phase,
                     ),
                 )
             conn.commit()
