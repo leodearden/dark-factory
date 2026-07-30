@@ -96,7 +96,9 @@ from orchestrator.service_restart import (
     schedule_detached_systemd_restart,
 )
 from orchestrator.stranded_verified_green import (
+    DURABLE_MERGE_FAILURE_STATUSES,
     MERGE_REQUEST_RESUBMIT_GRACE_S,
+    SUCCESS_TRANSIENT_MERGE_STATUSES,
     detect_verified_green,
     merge_request_marker_is_fresh,
     submit_verified_green_merge_request,
@@ -4637,21 +4639,20 @@ class Harness:
     # new/unclassified outcome can never silently no-op into a stranded task
     # with no operator signal (the exact silent-strand class PRD leaf α fixes).
     #
+    # Both sets are ALIASES of the shared vocabulary in
+    # stranded_verified_green — the architect-desync exit (task 3031 β)
+    # classifies its own merge outcome against the same partition, and two
+    # copies would drift.
+    #
     # Durable merge/verify failure outcomes for a stranded-reaper submission —
     # a stale-green branch failing the merge queue's own verify lands here and
     # warrants a born-at-L2 (PRD leaf α §2.2).
-    _DURABLE_MERGE_FAILURE_STATUSES: frozenset[str] = frozenset({
-        'conflict', 'blocked', 'error', 'unknown_branch',
-        'unmerged_state', 'stash_failed', 'wip_recovery_no_advance',
-    })
+    _DURABLE_MERGE_FAILURE_STATUSES: frozenset[str] = DURABLE_MERGE_FAILURE_STATUSES
     # Success / transient outcomes — a strict no-op: the happy 'done' is
     # delivered by the existing found_on_main path, and a transient/superseded
     # outcome is re-driven by a later sweep.  The branch + lane are preserved
     # by omission (the callback never touches them).
-    _SUCCESS_TRANSIENT_MERGE_STATUSES: frozenset[str] = frozenset({
-        'done', 'already_merged', 'done_wip_recovery', 'superseded',
-        'wip_halted',
-    })
+    _SUCCESS_TRANSIENT_MERGE_STATUSES: frozenset[str] = SUCCESS_TRANSIENT_MERGE_STATUSES
 
     # Escalation categories a MERGE can itself remediate (PRD leaf δ §2.2).
     #

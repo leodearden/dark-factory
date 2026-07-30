@@ -44,13 +44,42 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    'DURABLE_MERGE_FAILURE_STATUSES',
     'MERGE_REQUEST_RESUBMIT_GRACE_S',
+    'SUCCESS_TRANSIENT_MERGE_STATUSES',
     'VerifiedGreenMatch',
     'detect_verified_green',
     'last_verified_green_tip',
     'merge_request_marker_is_fresh',
     'submit_verified_green_merge_request',
 ]
+
+DURABLE_MERGE_FAILURE_STATUSES: frozenset[str] = frozenset({
+    'conflict', 'blocked', 'error', 'unknown_branch',
+    'unmerged_state', 'stash_failed', 'wip_recovery_no_advance',
+})
+"""``MergeOutcome.status`` values that are a DURABLE merge/verify failure.
+
+Together with :data:`SUCCESS_TRANSIENT_MERGE_STATUSES` this MUST exhaust
+``MergeOutcome``'s status Literal — enforced at CI time by
+``test_stranded_verified_green.test_status_sets_exhaust_merge_outcome_
+vocabulary``.  Both auto-merge submit paths (the stranded reaper and the
+architect-desync exit) classify their terminal outcome against these sets, and
+BOTH treat a status found in NEITHER set LOUDLY as a durable failure, so a
+new/unclassified outcome can never silently no-op into a stranded task with no
+operator signal.
+"""
+
+SUCCESS_TRANSIENT_MERGE_STATUSES: frozenset[str] = frozenset({
+    'done', 'already_merged', 'done_wip_recovery', 'superseded',
+    'wip_halted',
+})
+"""``MergeOutcome.status`` values that are a success or a transient outcome.
+
+Neither warrants a failure record: the happy landing is reported by the
+caller's own success branch, and a transient/superseded outcome is re-driven
+by a later sweep.  The branch + lane are preserved by omission.
+"""
 
 MERGE_REQUEST_RESUBMIT_GRACE_S: float = 30 * 60.0  # 30 minutes
 """How long a submit marker suppresses a re-submit of the same tip.

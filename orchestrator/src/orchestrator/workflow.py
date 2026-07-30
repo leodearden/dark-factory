@@ -100,6 +100,8 @@ from orchestrator.scheduler import (
 )
 from orchestrator.session_registry import build_session_slug
 from orchestrator.stranded_verified_green import (
+    DURABLE_MERGE_FAILURE_STATUSES,
+    SUCCESS_TRANSIENT_MERGE_STATUSES,
     last_verified_green_tip,
     merge_request_marker_is_fresh,
     submit_verified_green_merge_request,
@@ -6023,7 +6025,9 @@ class TaskWorkflow:
             event_store=self.event_store,
             source='architect-desync',
             marker_key='architect_merge_request',
-            done_callback=lambda fut: None,
+            done_callback=lambda fut: self._schedule_architect_merge_done(
+                fut, tip=tip, evidence=evidence,
+            ),
             update_task=self.scheduler.update_task,
         )
         if self.event_store:
@@ -6045,6 +6049,130 @@ class TaskWorkflow:
         # restart.
         self._enter_phase(WorkflowState.BLOCKED)
         return WorkflowOutcome.BLOCKED
+
+    def _schedule_architect_merge_done(
+        self, fut: asyncio.Future, *, tip: str, evidence: str,
+    ) -> None:
+        """Sync done-callback for an architect-desync MergeRequest.
+
+        Fires on the loop when the MergeRequest future resolves.  Derives the
+        terminal :class:`MergeOutcome` — a cancelled or raising future is
+        treated as a durable failure, never as a silent success — and schedules
+        :meth:`_on_architect_merge_done` as a tracked background task.
+
+        Wrapped fail-safe: any error is logged and never propagated (mirrors
+        ``enqueue_merge_request._on_finalized`` and the reaper's
+        ``_on_stranded_merge_done``).  Losing this callback is survivable: the
+        task is left blocked with no open escalation, so the found_on_main
+        reconciler still marks it done on the next sweep.
+        """
+        try:
+            from orchestrator.merge_types import MergeOutcome  # noqa: PLC0415
+
+            if fut.cancelled():
+                outcome = MergeOutcome(
+                    status='error', reason='merge future cancelled',
+                )
+            elif (exc := fut.exception()) is not None:
+                outcome = MergeOutcome(
+                    status='error', reason=f'merge future raised: {exc}',
+                )
+            else:
+                outcome = fut.result()
+            _task = asyncio.create_task(
+                self._on_architect_merge_done(
+                    outcome, tip=tip, evidence=evidence,
+                ),
+                name=f'architect_merge_done_{self.task_id}',
+            )
+            self._background_tasks.add(_task)
+            _task.add_done_callback(self._background_tasks.discard)
+        except Exception:
+            logger.warning(
+                'Task %s: architect-desync merge done-callback failed '
+                '(found_on_main reconciler remains the backstop)',
+                self.task_id, exc_info=True,
+            )
+
+    async def _on_architect_merge_done(
+        self, outcome: MergeOutcome, *, tip: str, evidence: str,
+    ) -> None:
+        """Report an architect-desync merge's terminal outcome onto the task.
+
+        The FAST path of the done flip (the restart-safe DURABLE backstop is
+        the existing found_on_main reconciler, which can act because this exit
+        leaves the task blocked with NO open escalation):
+
+        - success WITH a landed sha → ``mark_done(kind='found_on_main')``;
+        - success without a sha → no provenance to write, so degrade to the
+          reconciler rather than stamping a bogus one;
+        - transient / superseded → a strict no-op, re-driven by a later sweep;
+        - durable failure, or any status in NEITHER classification set →
+          leave the task blocked and emit a structured failure event.  Loud
+          over silent: an unclassified outcome must not no-op into a stranded
+          task with no operator signal.
+        """
+        status = outcome.status
+        landed = outcome.merge_sha
+        if status in SUCCESS_TRANSIENT_MERGE_STATUSES:
+            if status == 'done' and landed:
+                logger.info(
+                    'Task %s: architect-desync merge landed at %s — marking '
+                    'done (found_on_main)',
+                    self.task_id, landed[:12],
+                )
+                try:
+                    await self.scheduler.mark_done(
+                        self.task_id,
+                        kind='found_on_main',
+                        sha=landed,
+                        note=(
+                            f'architect-desync merge landed; '
+                            f'evidence: {evidence[:400]}'
+                        ),
+                    )
+                except Exception:
+                    logger.warning(
+                        'Task %s: mark_done after architect-desync merge '
+                        'failed — leaving blocked for the found_on_main '
+                        'reconciler',
+                        self.task_id, exc_info=True,
+                    )
+                return
+            logger.info(
+                'Task %s: architect-desync merge outcome %r — no-op (task '
+                'stays blocked; a later sweep re-drives)',
+                self.task_id, status,
+            )
+            return
+
+        if status not in DURABLE_MERGE_FAILURE_STATUSES:
+            logger.error(
+                'Task %s: architect-desync merge returned UNCLASSIFIED status '
+                '%r — treating as a durable failure (classify it into '
+                'DURABLE_MERGE_FAILURE_STATUSES or '
+                'SUCCESS_TRANSIENT_MERGE_STATUSES)',
+                self.task_id, status,
+            )
+        else:
+            logger.warning(
+                'Task %s: architect-desync merge failed durably (%s) — task '
+                'stays blocked',
+                self.task_id, status,
+            )
+        if self.event_store:
+            self.event_store.emit(
+                EventType.architect_desync_merge,
+                task_id=self.task_id,
+                phase='merge',
+                data={
+                    'decision': 'merge_failed',
+                    'status': status,
+                    'tip': tip,
+                    'reason': outcome.reason,
+                    'classified': status in DURABLE_MERGE_FAILURE_STATUSES,
+                },
+            )
 
     async def _handle_unactionable_task_report(self) -> WorkflowOutcome:
         """Process a ``.task/unactionable_task.json`` report from the architect.
