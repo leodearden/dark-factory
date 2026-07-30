@@ -12,9 +12,12 @@ touches the real /tmp.
 
 from __future__ import annotations
 
+import logging
 import os
+import shutil
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 from shared.config_dir import CONFIG_DIR_PREFIX, sweep_stale_pid_dirs
 
@@ -145,3 +148,132 @@ class TestSweepStalePidDirsSelection:
         plant(tmp_path, f'{CONFIG_DIR_PREFIX}3086')
 
         assert sweep_stale_pid_dirs(PROBE_PREFIX, base_dir=tmp_path) == 0
+
+
+# ---------------------------------------------------------------------------
+# Robustness and bounding — the sweep runs on the event-loop thread during
+# harness startup, so it must never raise and never block unboundedly.
+# ---------------------------------------------------------------------------
+
+
+class TestSweepStalePidDirsBounding:
+    """min-age floor, entry-type guards, containment, deadline (step 3)."""
+
+    def test_min_age_floor_keeps_a_freshly_created_dead_pid_dir(self, tmp_path):
+        """Covers a dir created microseconds before its owner died.
+
+        Also gives partial cover against clock skew and any future
+        PID-namespace mismatch, where a "dead" PID may not mean a dead owner.
+        """
+        dead = find_dead_pid()
+        fresh = plant(tmp_path, f'{PROBE_PREFIX}work-{dead}', aged=False)
+
+        removed = sweep_stale_pid_dirs(PROBE_PREFIX, base_dir=tmp_path, min_age_secs=300.0)
+
+        assert fresh.exists()
+        assert removed == 0
+
+    def test_min_age_floor_removes_the_same_dir_once_aged(self, tmp_path):
+        dead = find_dead_pid()
+        stale = plant(tmp_path, f'{PROBE_PREFIX}work-{dead}', aged=False)
+        age(stale, secs=600.0)
+
+        removed = sweep_stale_pid_dirs(PROBE_PREFIX, base_dir=tmp_path, min_age_secs=300.0)
+
+        assert not stale.exists()
+        assert removed == 1
+
+    def test_plain_file_matching_the_prefix_is_untouched(self, tmp_path):
+        dead = find_dead_pid()
+        stray = tmp_path / f'{PROBE_PREFIX}work-{dead}'
+        stray.write_text('not a directory')
+        age(stray)
+
+        removed = sweep_stale_pid_dirs(PROBE_PREFIX, base_dir=tmp_path)
+
+        assert stray.exists()
+        assert removed == 0
+
+    def test_symlink_matching_the_prefix_is_untouched(self, tmp_path):
+        """Never follow a symlink out of the swept prefix."""
+        dead = find_dead_pid()
+        target = tmp_path / 'real-target-dir'
+        target.mkdir()
+        (target / 'payload.txt').write_text('precious')
+        link = tmp_path / f'{PROBE_PREFIX}work-{dead}'
+        link.symlink_to(target)
+
+        removed = sweep_stale_pid_dirs(PROBE_PREFIX, base_dir=tmp_path)
+
+        assert link.is_symlink()
+        assert (target / 'payload.txt').exists()
+        assert removed == 0
+
+    def test_missing_base_dir_returns_zero_and_does_not_raise(self, tmp_path):
+        missing = tmp_path / 'does-not-exist'
+
+        assert sweep_stale_pid_dirs(PROBE_PREFIX, base_dir=missing) == 0
+
+    def test_rmtree_failure_is_contained_and_logged(self, tmp_path, caplog):
+        """One unremovable entry must not abort the sweep.
+
+        The next entry is still reclaimed, the failure is visible at WARNING
+        (never silently swallowed), and the returned count reflects only
+        actual removals.
+        """
+        dead = find_dead_pid()
+        doomed = plant(tmp_path, f'{PROBE_PREFIX}doomed-{dead}')
+        survivor_candidate = plant(tmp_path, f'{PROBE_PREFIX}other-{dead}')
+        real_rmtree = shutil.rmtree
+
+        def flaky_rmtree(path, *args, **kwargs):
+            if Path(path).name == doomed.name:
+                raise OSError('simulated EACCES')
+            return real_rmtree(path, *args, **kwargs)
+
+        with caplog.at_level(logging.WARNING, logger='shared.config_dir'), \
+                patch('shared.config_dir.shutil.rmtree', side_effect=flaky_rmtree):
+            removed = sweep_stale_pid_dirs(PROBE_PREFIX, base_dir=tmp_path)
+
+        assert doomed.exists()
+        assert not survivor_candidate.exists()
+        assert removed == 1
+        assert any(r.levelno >= logging.WARNING for r in caplog.records)
+
+    def test_deadline_stops_early_without_removing_everything(self, tmp_path, caplog):
+        """A wall-clock bound must never read as 'swept everything'.
+
+        UsageGate.__init__ is synchronous and runs on the event-loop thread
+        during harness startup; the pathological /tmp this task addresses has
+        a 40 MB directory inode. Blocking time is the risk, so the bound is a
+        deadline, not a removal cap — the population still drains fully across
+        successive process starts.
+        """
+        dead = find_dead_pid()
+        planted = [plant(tmp_path, f'{PROBE_PREFIX}n{i}-{dead}') for i in range(4)]
+
+        with caplog.at_level(logging.WARNING, logger='shared.config_dir'):
+            removed = sweep_stale_pid_dirs(PROBE_PREFIX, base_dir=tmp_path, deadline_secs=0.0)
+
+        assert removed < len(planted)
+        assert any(p.exists() for p in planted)
+
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warnings, 'a bounded stop must be loud, not silent'
+        message = ' '.join(r.getMessage().lower() for r in warnings)
+        assert 'deadline' in message
+        assert 'incomplete' in message
+        assert 'examined' in message
+        assert 'removed' in message
+
+    def test_generous_deadline_sweeps_everything_and_stays_quiet(self, tmp_path, caplog):
+        """The bounded-stop WARNING must not fire on the normal path."""
+        dead = find_dead_pid()
+        planted = [plant(tmp_path, f'{PROBE_PREFIX}n{i}-{dead}') for i in range(4)]
+
+        with caplog.at_level(logging.WARNING, logger='shared.config_dir'):
+            removed = sweep_stale_pid_dirs(PROBE_PREFIX, base_dir=tmp_path, deadline_secs=30.0)
+
+        assert removed == len(planted)
+        assert not any(p.exists() for p in planted)
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
