@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, NoReturn
 
+from pydantic import ValidationError
 from shared.cli_invoke import (
     AgentFailureKind,
     AllAccountsCappedException,
@@ -692,7 +693,7 @@ Review this run and provide your verdict as JSON.
 
             data = json.loads(text)
             return self._verdict_from_payload(data, run_id)
-        except (json.JSONDecodeError, IndexError, KeyError) as e:
+        except (json.JSONDecodeError, IndexError, KeyError, ValidationError) as e:
             logger.error(f'Failed to parse judge response: {e}')
             # severity=serious is deliberate: it routes through the existing
             # halt path (review_run() halts on config.halt_on_judge_serious;
@@ -709,6 +710,14 @@ Review this run and provide your verdict as JSON.
             # see test_review_run_unparseable_response_halts_when_enabled /
             # ..._no_halt_when_disabled in test_judge.py for the covered
             # behavior at both settings of halt_on_judge_serious.
+            #
+            # ValidationError is in the caught tuple so a SEMANTICALLY-invalid
+            # payload (severity outside VerdictSeverity, wrong-typed findings)
+            # cannot silently vanish: without it, JudgeVerdict's pydantic error
+            # escapes to review_run's broad `except Exception` and the run
+            # returns None with no verdict, no halt and no signal. The
+            # claude_cli provider never reaches here — its equivalent condition
+            # is classified as cli_output_unparseable infra in _call_judge_cli.
             return JudgeVerdict(
                 run_id=run_id,
                 reviewed_at=datetime.now(UTC),
