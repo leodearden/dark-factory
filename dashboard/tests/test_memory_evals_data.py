@@ -25,6 +25,7 @@ Record shapes:
 
 from __future__ import annotations
 
+import builtins
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1395,3 +1396,143 @@ class TestStalenessAndDegradedStates:
         # No eval dirs means nothing is waiting on a verdict.
         assert payload['issues'] == []
         assert payload['issue_count'] == 0
+
+
+# ---------------------------------------------------------------------------
+# step-17 — the redux shape fn
+# ---------------------------------------------------------------------------
+
+
+class TestShapeMemoryEvals:
+    """``shape_memory_evals`` — one Redux key, pure, and never sharing state.
+
+    The shape layer is the seam beta (the React section) consumes: these field
+    names ARE the contract (PRD open question 4 — alpha's shape fn plus these
+    tests pin them, beta consumes them).  Everything asserted here is about the
+    seam itself; the payload's *content* is pinned by the builder tests above.
+    """
+
+    def test_returns_exactly_one_redux_key(self, tmp_path: Path) -> None:
+        from dashboard.data import redux_api
+        from dashboard.data.memory_evals import build_memory_evals
+
+        payload = build_memory_evals(*_two_eval_tree(tmp_path))
+
+        shaped = redux_api.shape_memory_evals(**payload)
+
+        # One top-level key, exactly like shape_curator/shape_scheduler — the
+        # route returns this dict verbatim, so an extra key here would land in
+        # the Redux store as an unowned slice.
+        assert set(shaped) == {'MEMORY_EVALS'}
+
+    def test_every_top_level_payload_key_survives(self, tmp_path: Path) -> None:
+        """The builder's whole payload reaches the UI — nothing is dropped in transit.
+
+        A shape fn that silently omits a key would leave the section rendering
+        a blank column with no error anywhere, which is exactly the silent
+        degradation DD6 forbids.
+        """
+        from dashboard.data import redux_api
+        from dashboard.data.memory_evals import build_memory_evals
+
+        payload = build_memory_evals(*_two_eval_tree(tmp_path))
+
+        body = redux_api.shape_memory_evals(**payload)['MEMORY_EVALS']
+
+        assert set(body) == _PAYLOAD_KEYS
+        # Value-for-value, not merely key-for-key: the shape layer reshapes
+        # nothing, it only names the slice.
+        for key in _PAYLOAD_KEYS:
+            assert body[key] == payload[key], key
+
+    def test_top_level_containers_are_shallow_copied(self) -> None:
+        """The ``shape_curator`` shallow-copy contract, pinned.
+
+        The route hands the builder's payload straight in; if the shape fn
+        aliased the caller's lists, a later mutation of the cached builder
+        result would retroactively rewrite an already-returned response.
+        """
+        from dashboard.data import redux_api
+
+        evals: list[dict] = [{'eval_id': 'eval-a'}]
+        issues: list[dict] = [{'kind': 'missing_limits'}]
+        unmatched: list[dict] = [{'id': 'esc-1'}]
+
+        body = redux_api.shape_memory_evals(
+            generated_at='2026-07-30T03:15:00+00:00',
+            root_present=True,
+            evals=evals,
+            issues=issues,
+            issue_count=1,
+            unmatched_escalations=unmatched,
+        )['MEMORY_EVALS']
+
+        evals.append({'eval_id': 'eval-b'})
+        issues.append({'kind': 'orphan_verdict'})
+        unmatched.append({'id': 'esc-2'})
+
+        assert body['evals'] == [{'eval_id': 'eval-a'}]
+        assert body['issues'] == [{'kind': 'missing_limits'}]
+        assert body['unmatched_escalations'] == [{'id': 'esc-1'}]
+
+    def test_defaults_are_fresh_literals_not_a_shared_constant(self) -> None:
+        """Two default calls must not hand out the same mutable containers.
+
+        A module-level empty-payload constant would let one request's response
+        object be mutated by another's — the bug ``shape_curator``'s
+        "fresh literal each call" comment already records.
+        """
+        from dashboard.data import redux_api
+
+        first = redux_api.shape_memory_evals()['MEMORY_EVALS']
+        second = redux_api.shape_memory_evals()['MEMORY_EVALS']
+
+        assert first == second
+        assert first is not second
+        for key in ('evals', 'issues', 'unmatched_escalations'):
+            assert first[key] == []
+            assert first[key] is not second[key], key
+
+        first['evals'].append({'eval_id': 'leaked'})
+        assert second['evals'] == []
+
+    def test_empty_default_payload_is_the_missing_root_shape(self) -> None:
+        """Called with nothing, the shape fn agrees with the builder's empty payload.
+
+        Same keys, same "nothing has run yet" semantics — so a default-shaped
+        response and a real one are never structurally different to the UI.
+        """
+        from dashboard.data import redux_api
+
+        body = redux_api.shape_memory_evals()['MEMORY_EVALS']
+
+        assert set(body) == _PAYLOAD_KEYS
+        assert body['root_present'] is False
+        assert body['evals'] == []
+        assert body['issues'] == []
+        assert body['issue_count'] == 0
+        assert body['unmatched_escalations'] == []
+        assert body['generated_at'] is None
+
+    def test_shape_is_io_free(self, tmp_path: Path, monkeypatch) -> None:
+        """No filesystem read in the shape layer — all I/O belongs to the builder.
+
+        The route runs the builder in a worker thread precisely because it
+        touches disk; a shape fn that also read would do that I/O back on the
+        event loop.
+        """
+        from dashboard.data import redux_api
+        from dashboard.data.memory_evals import build_memory_evals
+
+        payload = build_memory_evals(*_two_eval_tree(tmp_path))
+
+        def _no_io(*args: Any, **kwargs: Any) -> Any:
+            raise AssertionError('shape_memory_evals must not touch the filesystem')
+
+        monkeypatch.setattr(builtins, 'open', _no_io)
+        monkeypatch.setattr(Path, 'open', _no_io)
+        monkeypatch.setattr(Path, 'read_text', _no_io)
+
+        shaped = redux_api.shape_memory_evals(**payload)
+
+        assert set(shaped) == {'MEMORY_EVALS'}
