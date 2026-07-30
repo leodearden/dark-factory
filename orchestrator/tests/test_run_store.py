@@ -723,7 +723,9 @@ class TestBlockContextPersistence:
         conn = sqlite3.connect(str(db_path))
         try:
             # Would raise sqlite3.OperationalError without the guard.
-            store._migrate_task_results_block_context(_StaleReadConn(conn))
+            store._migrate_task_results_block_context(
+                _StaleReadConn(conn),  # type: ignore[arg-type]
+            )
         finally:
             conn.close()
 
@@ -749,4 +751,6 @@ class TestBlockContextPersistence:
                 raise AssertionError('commit must not be reached')
 
         with pytest.raises(sqlite3.OperationalError, match='database is locked'):
-            store._migrate_task_results_block_context(_BrokenConn())
+            store._migrate_task_results_block_context(
+                _BrokenConn(),  # type: ignore[arg-type]
+            )
