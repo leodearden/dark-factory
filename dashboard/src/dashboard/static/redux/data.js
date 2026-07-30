@@ -165,12 +165,25 @@ function backoffDelay(failures) {
   return Math.min(BACKOFF_BASE_MS * Math.pow(2, failures - 1), BACKOFF_MAX_MS);
 }
 
+// Jitter: spreads the 13 endpoint fetches across part of the 3s interval
+// instead of every tick firing all 13 at once (task 185's lesson — 13
+// simultaneous requests hammering a single aiosqlite worker thread). Capped
+// at half the poll interval so a jittered start can never structurally slip
+// past the next tick.
+const JITTER_MAX_MS = 1500;
+
 async function refreshOne(url, keys, state, deps) {
   const st = stateFor(state, url);
   if (st.inFlight) return; // already in flight for this endpoint — skip this tick, do not queue
   if (deps.now() < st.nextAllowedAt && !deps.ignoreBackoff) return; // still backed off
   st.inFlight = true;
   try {
+    // Awaited INSIDE the in-flight window (st.inFlight is already true) so a
+    // second tick firing while this endpoint is still jittering is skipped
+    // by the check above, not free to sneak in a duplicate request.
+    if (deps.jitterMaxMs > 0) {
+      await deps.sleep(Math.floor(deps.random() * deps.jitterMaxMs));
+    }
     const resp = await deps.fetchImpl(url, { credentials: 'same-origin' });
     if (!resp.ok) {
       st.failures += 1;
@@ -220,7 +233,12 @@ async function refreshDFData(win, opts) {
   const isChipChange = typeof win === 'string' && win;
   if (isChipChange) currentWin = win;
   const state = o.state || DF_POLL_STATE;
-  const deps = { ...DEFAULT_POLL_DEPS, ...o.deps, ignoreBackoff: !!isChipChange };
+  const deps = {
+    ...DEFAULT_POLL_DEPS,
+    ...o.deps,
+    ignoreBackoff: !!isChipChange,
+    jitterMaxMs: o.jitterMaxMs ?? JITTER_MAX_MS,
+  };
   await Promise.all(Object.entries(endpointsFor(currentWin)).map(([url, keys]) => refreshOne(url, keys, state, deps)));
   window.dispatchEvent(new CustomEvent('df-data-refresh'));
 }
