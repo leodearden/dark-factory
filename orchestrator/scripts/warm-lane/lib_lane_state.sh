@@ -177,6 +177,41 @@ lane_state_read() {
     return 0
 }
 
+# lane_state_class <raw>
+# The ONE normative raw-state -> column mapping. Prints exactly one of
+# ASSIGNED | RELEASED | QUARANTINED | UNKNOWN.
+#
+# The table lives HERE, in the code — not only in a comment — and this is its
+# single definition site across the shipped warm-lane scripts
+# (warm-lane-audit.sh's copy was folded in, PRD §8 extract-and-unify):
+#
+#   assigned, in_use              -> ASSIGNED     (reserved for a task)
+#   released, seed, registered    -> RELEASED     (in the pool, not reserved)
+#   quarantined                   -> QUARANTINED  (withheld from the pool)
+#   anything else, including ''   -> UNKNOWN      (fail open)
+#
+# The raw values are dark-factory's LaneState enum,
+# orchestrator/src/orchestrator/lane_lifecycle.py. That coupling is MACHINE
+# CHECKED, not documented-and-hoped: the drift gate in
+# orchestrator/tests/test_lane_state_lib.py
+# (TestLaneStateClass::test_every_lane_state_enum_member_maps_to_a_known_column)
+# imports LaneState and fails the build if any member falls through to UNKNOWN.
+# It has to, because the silent failure is severe — a new member would degrade
+# every lane carrying it to UNKNOWN, and a pool-wide UNKNOWN spike is
+# indistinguishable from a real state-dir outage.
+#
+# No case folding: the raw values are the enum's lowercase strings, so an
+# uppercase spelling is a genuinely unrecognized state and must read that way.
+lane_state_class() {
+    case "${1:-}" in
+        assigned|in_use)          printf 'ASSIGNED\n' ;;
+        released|seed|registered) printf 'RELEASED\n' ;;
+        quarantined)              printf 'QUARANTINED\n' ;;
+        *)                        printf 'UNKNOWN\n' ;;
+    esac
+    return 0
+}
+
 # Published defaults, so a caller that sources this lib and inspects the
 # globals before any read sees the same fail-open shape a failed read yields.
 LANE_STATE_RAW='unknown'
