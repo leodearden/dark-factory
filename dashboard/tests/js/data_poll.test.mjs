@@ -623,3 +623,172 @@ test('jitter: passing jitterMaxMs: 0 issues no sleep at all', async () => {
     'jitterMaxMs: 0 must skip the sleep entirely — this is what keeps the rest of this file deterministic',
   );
 });
+
+// ---------------------------------------------------------------------------
+// Preserved-behaviour contract — pins the things the task explicitly says
+// NOT to break: __DF_PAUSE, keep-prior-values-on-failure, applyKey
+// reference stability, the per-cycle df-data-refresh dispatch (including a
+// cycle where every endpoint got skipped), and the ?window= URL shape with
+// its path-keyed flow-control state. A later refactor cannot quietly drop
+// any of these without one of the tests below going red.
+// ---------------------------------------------------------------------------
+
+test('preserved behaviour: window.__DF_PAUSE = true stops pollTick from fetching; false resumes on the next tick', async () => {
+  const callCount = new Map();
+  const fetchImpl = url => {
+    const path = url.split('?')[0];
+    callCount.set(path, (callCount.get(path) || 0) + 1);
+    return Promise.resolve({ ok: true, json: async () => ({}) });
+  };
+  const { api, window: win } = loadDataJs({ fetchStub: fetchImpl });
+  const opts = { state: api.createPollState(), deps: { fetchImpl }, jitterMaxMs: 0 };
+
+  win.__DF_PAUSE = true;
+  api.pollTick(opts);
+  await drain();
+  assert.equal(callCount.size, 0, 'pollTick must issue zero fetches while __DF_PAUSE is true');
+
+  win.__DF_PAUSE = false;
+  api.pollTick(opts);
+  await drain();
+  assert.equal(
+    callCount.get(FLAKY_ENDPOINT_PATH),
+    1,
+    'pollTick must resume fetching once __DF_PAUSE is set back to false, on the very next tick',
+  );
+});
+
+test('preserved behaviour: a thrown fetch error keeps the prior DF_DATA value and still warns', async () => {
+  const { api, window: win } = loadDataJs();
+  win.DF_DATA.CURATOR_STATE = { marker: 'prior-throw' };
+
+  const originalWarn = console.warn;
+  const warnCalls = [];
+  console.warn = (...args) => warnCalls.push(args);
+  try {
+    const state = api.createPollState();
+    const deps = { fetchImpl: () => Promise.reject(new Error('boom')), now: () => 0 };
+    await api.refreshOne(FLAKY_ENDPOINT_PATH, ['CURATOR_STATE'], state, deps);
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  assert.deepEqual(
+    win.DF_DATA.CURATOR_STATE,
+    { marker: 'prior-throw' },
+    'a thrown fetch error must leave the prior DF_DATA value untouched rather than blanking it',
+  );
+  assert.ok(
+    warnCalls.some(args => args[0] === 'DF_DATA fetch failed'),
+    'a thrown fetch error must still emit the console.warn',
+  );
+});
+
+test('preserved behaviour: a non-ok (503) response also keeps the prior DF_DATA value intact', async () => {
+  const { api, window: win } = loadDataJs();
+  win.DF_DATA.CURATOR_STATE = { marker: 'prior-503' };
+
+  const state = api.createPollState();
+  const deps = { fetchImpl: () => Promise.resolve({ ok: false, status: 503, json: async () => ({}) }), now: () => 0 };
+  await api.refreshOne(FLAKY_ENDPOINT_PATH, ['CURATOR_STATE'], state, deps);
+
+  assert.deepEqual(
+    win.DF_DATA.CURATOR_STATE,
+    { marker: 'prior-503' },
+    'a non-ok response must leave the prior DF_DATA value untouched rather than blanking it',
+  );
+});
+
+test('preserved behaviour: applyKey mutates PROJECTS/AGENTS in place, replaces other keys by reference, and ignores undefined/null', () => {
+  const { api, window: win } = loadDataJs();
+
+  const projectsRef = win.DF_DATA.PROJECTS;
+  const agentsRef = win.DF_DATA.AGENTS;
+  api.applyKey('PROJECTS', [{ id: 'p1' }]);
+  api.applyKey('AGENTS', [{ id: 'a1' }]);
+  assert.equal(
+    win.DF_DATA.PROJECTS,
+    projectsRef,
+    'PROJECTS must stay the same array reference — shell.jsx captures it at module load',
+  );
+  assert.equal(win.DF_DATA.AGENTS, agentsRef, 'AGENTS must stay the same array reference');
+  assert.deepEqual(win.DF_DATA.PROJECTS, [{ id: 'p1' }], 'PROJECTS content must still be updated (in place)');
+  assert.deepEqual(win.DF_DATA.AGENTS, [{ id: 'a1' }], 'AGENTS content must still be updated (in place)');
+
+  const newCosts = { summary: { total: 42 } };
+  api.applyKey('COSTS', newCosts);
+  assert.equal(win.DF_DATA.COSTS, newCosts, 'non-stable keys must be replaced by reference');
+
+  const priorScheduler = win.DF_DATA.SCHEDULER;
+  api.applyKey('SCHEDULER', undefined);
+  assert.equal(win.DF_DATA.SCHEDULER, priorScheduler, 'undefined values must be ignored');
+  api.applyKey('SCHEDULER', null);
+  assert.equal(win.DF_DATA.SCHEDULER, priorScheduler, 'null values must be ignored');
+});
+
+test('preserved behaviour: df-data-refresh dispatches exactly once per cycle, including a cycle where every endpoint is skipped', async () => {
+  const alwaysFail = () => Promise.reject(new Error('boom'));
+  const { api, events } = loadDataJs({ fetchStub: alwaysFail });
+  const countDfEvents = () => events.filter(e => e.type === 'df-data-refresh').length;
+
+  const state = api.createPollState();
+  const t = 0; // fixed clock — cycle 2 lands inside cycle 1's backoff window
+  const deps = { fetchImpl: alwaysFail, now: () => t, random: () => 0, sleep: () => Promise.resolve() };
+  const opts = { state, deps, jitterMaxMs: 0 };
+
+  // Cycle 1: every one of the 13 endpoints fails and backs off.
+  await api.refreshDFData(undefined, opts);
+  assert.equal(countDfEvents(), 1, 'cycle 1 (all endpoints failing) must still dispatch exactly one df-data-refresh event');
+
+  // Cycle 2: same clock, so every endpoint is now backed off and skipped
+  // outright — zero fetches this cycle, and yet the event must still fire.
+  await api.refreshDFData(undefined, opts);
+  assert.equal(
+    countDfEvents(),
+    2,
+    'a cycle in which every endpoint was skipped by backoff must still dispatch df-data-refresh exactly once',
+  );
+});
+
+test("preserved behaviour: refreshDFData(win) updates the ?window= param on the 4 windowed endpoints, and flow-control state stays keyed by path across a chip change", async () => {
+  const seenUrls = [];
+  const fetchImpl = url => {
+    seenUrls.push(url);
+    return Promise.resolve({ ok: true, json: async () => ({}) });
+  };
+  const { api } = loadDataJs({ fetchStub: fetchImpl });
+
+  const state = api.createPollState();
+  const deps = { fetchImpl, now: () => 0, random: () => 0, sleep: () => Promise.resolve() };
+
+  await api.refreshDFData('7d', { state, deps, jitterMaxMs: 0 });
+
+  const windowedPaths = [
+    '/api/v2/dashboard/merge-queue',
+    '/api/v2/dashboard/costs',
+    '/api/v2/dashboard/performance',
+    '/api/v2/dashboard/burndown',
+  ];
+  for (const path of windowedPaths) {
+    assert.ok(
+      seenUrls.includes(`${path}?window=7d`),
+      `expected a request to ${path}?window=7d after refreshDFData('7d')`,
+    );
+    assert.ok(
+      state.has(path),
+      `flow-control state must be keyed by PATH (${path}), not the full ?window= URL`,
+    );
+  }
+
+  // Switch chips again — the state entries (keyed by path) must be the SAME
+  // objects, not fresh ones a chip change silently reset.
+  const priorEntries = windowedPaths.map(p => state.get(p));
+  await api.refreshDFData('30d', { state, deps, jitterMaxMs: 0 });
+  for (const [i, path] of windowedPaths.entries()) {
+    assert.equal(
+      state.get(path),
+      priorEntries[i],
+      `the flow-control state for ${path} must be the SAME object across a chip change (path-keyed, not reset)`,
+    );
+  }
+});
