@@ -243,6 +243,15 @@ def _write_multi_mb_transcript(
     path.write_text('\n'.join(json.dumps(line) for line in lines) + '\n', encoding='utf-8')
 
 
+def test_nightly_cap_is_an_alias_of_the_sampler_cap_not_a_second_literal():
+    """``DEFAULT_MAX_DIGEST_BYTES`` and ``sampling.DEFAULT_DIGEST_MAX_BYTES``
+    are a word-order swap apart. If they were independent literals, a drift
+    between the cost basis and the render basis would be invisible to every
+    test — so nightly's name BINDS to the sampler's rather than re-declaring
+    it (reviewer_comprehensive, task 3268 amendment pass)."""
+    assert nightly.DEFAULT_MAX_DIGEST_BYTES is nightly.sampling.DEFAULT_DIGEST_MAX_BYTES
+
+
 def test_select_digest_sessions_charges_real_digest_bytes(tmp_path, monkeypatch):
     """The cost basis handed to the sampler must be the REAL rendered digest
     size, computed at exactly the ``max_bytes`` ``build_digests`` will later

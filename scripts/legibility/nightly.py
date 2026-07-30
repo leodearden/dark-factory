@@ -143,11 +143,26 @@ def select_scored_records(
     return scored
 
 
-DEFAULT_MAX_DIGEST_BYTES = 15360
-"""Per-digest soft byte cap (PRD §7.2). Deliberately defined ABOVE
-:func:`select_digest_sessions` as well as :func:`build_digests`: both the
-COST basis and the RENDER basis read this one constant, so what the sampler
-charged is provably the digest that later gets produced."""
+DEFAULT_MAX_DIGEST_BYTES = sampling.DEFAULT_DIGEST_MAX_BYTES
+"""Per-digest soft byte cap (PRD §7.2) — an ALIAS, not a second definition.
+
+Both the COST basis (:func:`select_digest_sessions`) and the RENDER basis
+(:func:`build_digests`) read this one name, so what the sampler charged is
+provably the digest that later gets produced. It binds to
+:data:`sampling.DEFAULT_DIGEST_MAX_BYTES` rather than re-declaring ``15360``
+because ``DEFAULT_MAX_DIGEST_BYTES`` and ``DEFAULT_DIGEST_MAX_BYTES`` are one
+word-order swap apart — trivially confusable at a call site, and if they were
+independent literals a drift between them would be invisible to every test
+(reviewer_comprehensive, task 3268 amendment pass). The alias is kept because
+this is the established public name for the nightly cap.
+
+The remaining independent literal is :func:`legibility.digest.build_digest`'s
+own ``max_bytes=15360`` default. ``digest.py`` is outside task 3268's locked
+scope, so collapsing all three into a single ``digest.DEFAULT_MAX_BYTES``
+(the reviewer's preferred shape, and where the §7.2 cap naturally belongs) is
+left to a follow-up; ``TestDigestByteCostFn.test_module_constant_matches_the_
+renderers_own_default`` pins the two against each other in the meantime so
+drift fails a test instead of silently mis-charging the budget."""
 
 
 def select_digest_sessions(

@@ -478,9 +478,14 @@ def dedupe_shapes(records: Sequence[ScoredRecord]) -> list[ScoredRecord]:
 # ---------------------------------------------------------------------------
 
 DEFAULT_DIGEST_MAX_BYTES = 15360
-"""The PRD §7.2 per-digest soft cap, in bytes — the same value as
-``nightly.DEFAULT_MAX_DIGEST_BYTES`` and :func:`legibility.digest.build_digest`'s
-own ``max_bytes`` default.
+"""The PRD §7.2 per-digest soft cap, in bytes.
+
+``nightly.DEFAULT_MAX_DIGEST_BYTES`` is an ALIAS of this name, not a second
+definition — the two spellings are one word-order swap apart, so independent
+literals would drift invisibly. :func:`legibility.digest.build_digest`'s own
+``max_bytes`` default is still a separate literal (``digest.py`` is outside
+task 3268's scope); ``TestDigestByteCostFn`` pins the two equal so drift
+fails a test.
 
 Used by :func:`stratified_sample` as its conservative flat per-record charge
 when no ``cost_fn`` is injected, and as :func:`digest_byte_cost_fn`'s default
