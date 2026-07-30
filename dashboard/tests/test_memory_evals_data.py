@@ -26,6 +26,7 @@ Record shapes:
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -1188,3 +1189,209 @@ class TestStormCollapseModelled:
 
         assert payload['evals'][0]['storm_escape'] is None
         assert _only(payload['evals'][0]['metrics'], 'storm-a')['parity'] == 'alarmed_unlinked'
+
+
+# ---------------------------------------------------------------------------
+# step-15 — staleness (displayed, never alarmed on) and every degraded state
+# ---------------------------------------------------------------------------
+
+_AGE_RUN = '20260705T031500Z'
+_AGE_RUN_AT = datetime(2026, 7, 5, 3, 15, 0, tzinfo=UTC)
+
+
+def _healthy_tree(tmp_path: Path, *, metrics: list[dict] | None = None, **kwargs: Any) -> tuple[Path, Path]:
+    """One eval, one run, limits AND verdicts present — zero issues by default.
+
+    Every degraded-state test starts from this and breaks exactly one thing, so
+    ``issue_count == 1`` is an assertion about the break rather than about the
+    surrounding fixture.
+    """
+    root = tmp_path / 'memory-evals'
+    esc_dir = tmp_path / 'escalations'
+    esc_dir.mkdir(parents=True, exist_ok=True)
+    rows = metrics if metrics is not None else [_metric('dangling-pointers', 'count', 4.0)]
+    _write_metrics(root, 'eval-a', _AGE_RUN, rows, **kwargs)
+    _write_limits(root, 'eval-a', run_stamp=_AGE_RUN)
+    _write_verdicts(root, [], run_stamp=_AGE_RUN)
+    return root, esc_dir
+
+
+def _corrupt(path: Path) -> Path:
+    """Make *path* syntactically unparseable (it is still a file that exists)."""
+    path.write_text('{"metrics": [ this is not json')
+    return path
+
+
+class TestStalenessAndDegradedStates:
+    """A degraded tree yields a degraded payload — never an exception, never a lie.
+
+    Staleness here is DISPLAYED, never alarmed on: the runner-failure tripwire
+    belongs to the eval program, and this module files nothing.
+    """
+
+    def test_age_is_measured_against_the_injected_now(self, tmp_path: Path) -> None:
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _healthy_tree(tmp_path)
+
+        eval_a = build_memory_evals(root, esc_dir, now=_AGE_RUN_AT + timedelta(hours=1))['evals'][0]
+
+        assert eval_a['latest_run_stamp'] == _AGE_RUN
+        assert eval_a['latest_run_age_seconds'] == 3600.0
+
+    def test_stale_flips_at_the_threshold(self, tmp_path: Path, monkeypatch) -> None:
+        import dashboard.data.memory_evals as memory_evals_module
+        from dashboard.data.memory_evals import build_memory_evals
+
+        monkeypatch.setattr(memory_evals_module, '_STALE_AFTER_SECONDS', 3600.0)
+        root, esc_dir = _healthy_tree(tmp_path)
+
+        fresh = build_memory_evals(root, esc_dir, now=_AGE_RUN_AT + timedelta(seconds=3599))
+        stale = build_memory_evals(root, esc_dir, now=_AGE_RUN_AT + timedelta(seconds=3601))
+
+        assert fresh['evals'][0]['stale'] is False
+        assert stale['evals'][0]['stale'] is True
+
+    def test_unreadable_metrics_run_is_named(self, tmp_path: Path) -> None:
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _healthy_tree(tmp_path)
+        bad = _corrupt(root / 'eval-a' / 'metrics-20260706T031500Z.json')
+
+        payload = build_memory_evals(root, esc_dir)
+
+        assert payload['issue_count'] == len(payload['issues']) == 1
+        assert payload['issues'][0]['kind'] == 'unreadable_metrics'
+        assert payload['issues'][0]['path'] == str(bad)
+        assert payload['issues'][0]['eval_id'] == 'eval-a'
+        # The readable run still renders.
+        assert payload['evals'][0]['run_stamps'] == [_AGE_RUN]
+
+    def test_unreadable_limits_is_named(self, tmp_path: Path) -> None:
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _healthy_tree(tmp_path)
+        bad = _corrupt(root / 'eval-a' / 'limits-current.json')
+
+        payload = build_memory_evals(root, esc_dir)
+
+        assert payload['issue_count'] == len(payload['issues']) == 1
+        assert payload['issues'][0]['kind'] == 'unreadable_limits'
+        assert payload['issues'][0]['path'] == str(bad)
+        assert payload['evals'][0]['limits'] is None
+
+    def test_unreadable_verdicts_never_defaults_the_column(self, tmp_path: Path) -> None:
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _healthy_tree(tmp_path)
+        bad = _corrupt(root / 'verdicts-current.json')
+
+        payload = build_memory_evals(root, esc_dir)
+
+        assert payload['issue_count'] == len(payload['issues']) == 1
+        assert payload['issues'][0]['kind'] == 'unreadable_verdicts'
+        assert payload['issues'][0]['path'] == str(bad)
+        # An unreadable verdict artifact must not read as "nothing alarmed".
+        assert all(row['verdict'] is None for row in payload['evals'][0]['metrics'])
+
+    def test_top_level_list_is_malformed_metrics(self, tmp_path: Path) -> None:
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _healthy_tree(tmp_path)
+        bad = _dump(root / 'eval-a' / 'metrics-20260706T031500Z.json', [{'metric_id': 'x'}])
+
+        payload = build_memory_evals(root, esc_dir)
+
+        assert payload['issue_count'] == len(payload['issues']) == 1
+        assert payload['issues'][0]['kind'] == 'malformed_metrics'
+        assert payload['issues'][0]['path'] == str(bad)
+
+    def test_non_list_metrics_field_is_malformed_metrics(self, tmp_path: Path) -> None:
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _healthy_tree(tmp_path)
+        bad = _dump(
+            root / 'eval-a' / 'metrics-20260706T031500Z.json',
+            {'schema_version': 1, 'run_stamp': '20260706T031500Z', 'metrics': {'oops': 'a dict'}},
+        )
+
+        payload = build_memory_evals(root, esc_dir)
+
+        assert payload['issue_count'] == len(payload['issues']) == 1
+        assert payload['issues'][0]['kind'] == 'malformed_metrics'
+        assert payload['issues'][0]['path'] == str(bad)
+
+    def test_unknown_kind_is_flagged_but_the_value_still_shows(self, tmp_path: Path) -> None:
+        """A kind outside the closed vocabulary is a RENDERING failure.
+
+        There is no chart primitive for it, so the dashboard genuinely cannot
+        resolve it and says so.  The number itself is still real, so it is
+        still displayed rather than blanked.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _healthy_tree(tmp_path, metrics=[_metric('odd-one', 'histogram', 1.4)])
+
+        payload = build_memory_evals(root, esc_dir)
+
+        assert payload['issue_count'] == len(payload['issues']) == 1
+        issue = payload['issues'][0]
+        assert issue['kind'] == 'unknown_kind'
+        assert issue['eval_id'] == 'eval-a'
+        assert 'histogram' in issue['detail']
+        row = _only(payload['evals'][0]['metrics'], 'odd-one')
+        assert row['kind'] == 'histogram'
+        assert row['current_value'] == 1.4
+
+    def test_missing_run_stamp_is_named(self, tmp_path: Path) -> None:
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _healthy_tree(tmp_path, run_stamp=None)
+
+        payload = build_memory_evals(root, esc_dir, now=_AGE_RUN_AT)
+
+        assert payload['issue_count'] == len(payload['issues']) == 1
+        assert payload['issues'][0]['kind'] == 'missing_run_stamp'
+        assert payload['evals'][0]['latest_run_age_seconds'] is None
+        assert payload['evals'][0]['stale'] is False
+
+    def test_unparseable_run_stamp_degrades_the_age_not_the_payload(self, tmp_path: Path) -> None:
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _healthy_tree(tmp_path, run_stamp='not-a-stamp')
+
+        payload = build_memory_evals(root, esc_dir, now=_AGE_RUN_AT)
+
+        assert payload['issue_count'] == len(payload['issues']) == 1
+        assert payload['issues'][0]['kind'] == 'unparseable_run_stamp'
+        assert payload['evals'][0]['latest_run_stamp'] == 'not-a-stamp'
+        assert payload['evals'][0]['latest_run_age_seconds'] is None
+        assert payload['evals'][0]['stale'] is False
+
+    def test_missing_root_is_empty_but_healthy(self, tmp_path: Path) -> None:
+        """"No eval has ever run" is a legitimate state, not a degradation.
+
+        Flagging it would train operators to ignore the issues list.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        payload = build_memory_evals(tmp_path / 'never-created', tmp_path / 'escalations')
+
+        assert payload['root_present'] is False
+        assert payload['evals'] == []
+        assert payload['issues'] == []
+        assert payload['issue_count'] == 0
+
+    def test_empty_root_is_present_with_no_evals(self, tmp_path: Path) -> None:
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root = tmp_path / 'memory-evals'
+        root.mkdir(parents=True)
+
+        payload = build_memory_evals(root, tmp_path / 'escalations')
+
+        assert payload['root_present'] is True
+        assert payload['evals'] == []
+        # No eval dirs means nothing is waiting on a verdict.
+        assert payload['issues'] == []
+        assert payload['issue_count'] == 0
