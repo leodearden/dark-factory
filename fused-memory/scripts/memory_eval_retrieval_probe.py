@@ -845,6 +845,22 @@ class PhrasingObservation:
     hit: bool
     rank: int | None
     matched_by: str | None
+    stores_served: tuple[str, ...] = ()
+    """The distinct stores that answered, read off the scored top-k slice.
+
+    ``MemoryService.search`` ROUTES: the read router picks a store set per
+    query, and the lists come back homogeneous. A phrasing served entirely by
+    Graphiti cannot contain a Mem0 entry's raw content — Graphiti returns
+    LLM-extracted edge facts — so its canonical is unfindable there however
+    healthy retrieval is.
+
+    The probe deliberately does not pin stores: an agent's search is routed
+    too, so "the router sent this query somewhere the canonical does not live"
+    is a real fact about what an agent experiences. But a rate dominated by
+    routing that does not SAY so is a silent fail-soft — the limits evaluator
+    would compute bounds over router coin-flips — so the served set rides
+    along with every observation, into the report AND into the artifact.
+    """
     degraded: bool = False
     """True when the search that produced this list reported a failed store.
 
@@ -868,6 +884,27 @@ def _result_content(result: Any) -> str:
 
 def _result_id(result: Any) -> str:
     return getattr(result, 'id', '') or ''
+
+
+UNKNOWN_STORE = 'unknown'
+"""Recorded for a result carrying no ``source_store``.
+
+Dropping it would understate the served set for exactly the shapes this probe
+does not recognise — the ones most worth knowing about.
+"""
+
+
+def stores_served(results: list, k: int) -> tuple[str, ...]:
+    """The distinct stores that answered, over the top-*k* slice only.
+
+    Sorted so the value is stable across runs: it is compared between runs and
+    an incidental ordering change would read as a routing change.
+    """
+    seen = {
+        str(getattr(result, 'source_store', '') or UNKNOWN_STORE)
+        for result in results[:k]
+    }
+    return tuple(sorted(seen))
 
 
 def canonical_hit(results: list, entry: RegistryEntry, k: int) -> MatchOutcome:
@@ -928,6 +965,7 @@ def observe_phrasing(
         hit=outcome.hit,
         rank=outcome.rank,
         matched_by=outcome.matched_by,
+        stores_served=stores_served(results, k),
         degraded=degraded,
     )
 
@@ -1365,7 +1403,7 @@ def _disclosure_counts(observations: ProbeObservations) -> dict[str, int]:
     category -> size by design (its docstring: the bucket vocabulary is not
     this schema's to own), so it is where a per-run disclosure belongs.
     """
-    return {
+    counts = {
         'contamination_scored_results': sum(
             c.scored_total for c in observations.contamination if not c.degraded
         ),
@@ -1379,6 +1417,17 @@ def _disclosure_counts(observations: ProbeObservations) -> dict[str, int]:
             1 for o in observations.phrasings if o.degraded
         ),
     }
+    # Which store answered, per observation. An observation served by a store
+    # the canonical does not live in cannot hit however healthy retrieval is,
+    # so a canonical-in-top-k rate is uninterpretable without this — and a
+    # consumer reading only the JSON would never see it said in prose.
+    for observation in observations.phrasings:
+        if observation.degraded:
+            continue
+        for store in observation.stores_served:
+            key = f'observations_served_by_{store}'
+            counts[key] = counts.get(key, 0) + 1
+    return counts
 
 
 def build_series(
@@ -1771,20 +1820,27 @@ def render_probe_report(
         )
         lines.extend(f'  - {topic}' for topic in unmeasured)
 
-    unmatched = sorted({
-        obs.topic for obs in observations.phrasings
-        if not obs.degraded and obs.unmatched
-    })
+    unmatched_stores: dict[str, set[str]] = {}
+    for obs in observations.phrasings:
+        if obs.degraded or not obs.unmatched:
+            continue
+        unmatched_stores.setdefault(obs.topic, set()).update(obs.stores_served)
+    unmatched = sorted(unmatched_stores)
     if unmatched:
         lines.append('')
         lines.append(f'canonicals matched by NEITHER key ({len(unmatched)}):')
         lines.append(
             '  Neither the content hash nor last_known_id matched anything '
-            'returned. Either the entry is genuinely unfindable, or the '
-            'registry fixture has decayed past both keys — the report says '
-            'which topics to go and check rather than guessing between them.'
+            'returned. Either the entry is genuinely unfindable, the query '
+            'was routed to a store the entry does not live in, or the '
+            'registry fixture has decayed past both keys — the serving store '
+            'is named per topic so an operator can tell those apart rather '
+            'than guessing between them.'
         )
-        lines.extend(f'  - {topic}' for topic in unmatched)
+        lines.extend(
+            f'  - {topic} (served by: {", ".join(sorted(unmatched_stores[topic])) or "nothing"})'
+            for topic in unmatched
+        )
 
     repairs = sorted({
         obs.topic for obs in observations.phrasings
@@ -1832,6 +1888,26 @@ def render_probe_report(
         for matcher, count in by_matcher.items():
             lines.append(f'  {matcher}: {count}')
 
+        by_store: dict[str, int] = {}
+        for obs in scored:
+            for store in obs.stores_served:
+                by_store[store] = by_store.get(store, 0) + 1
+        lines.append('')
+        lines.append('which store served the query (observations):')
+        for chunk in _wrap(
+            'MemoryService.search routes: the read router picks a store set '
+            'per query, and the lists come back homogeneous. A phrasing served '
+            'entirely by Graphiti cannot contain a Mem0 entry\'s raw content — '
+            'Graphiti returns LLM-extracted edge facts — so its canonical is '
+            'unfindable there however healthy retrieval is. The probe does not '
+            'pin stores, because an agent\'s search is routed too; it reports '
+            'the routing instead, so a rate is never read as a corpus finding '
+            'when it is a routing one.'
+        ):
+            lines.append(f'  {chunk}')
+        for store, count in sorted(by_store.items()):
+            lines.append(f'  {store}: {count}')
+
     contamination = [c for c in observations.contamination if not c.degraded]
     if contamination:
         untopiced = sum(c.untopiced_count for c in contamination)
@@ -1851,6 +1927,20 @@ def render_probe_report(
             'further, with no change to how it is computed.'
         ):
             lines.append(f'  {chunk}')
+
+    graphiti_primary = ', '.join(graphiti_primary_categories())
+    lines.append('')
+    lines.append('what the corpus counts cover:')
+    for chunk in _wrap(
+        'The per-category sizes above come from count_memories_by_metadata, '
+        'which is an exact Qdrant payload count — a MEM0-SIDE count. The '
+        f'Graphiti-primary categories ({graphiti_primary}) therefore read near '
+        'zero here even when the graph holds thousands: the number is honest '
+        'about what was counted and would be misleading about what exists, so '
+        'it says which it is. The metrics above are unaffected — they are '
+        'computed over what search returned, not over these counts.'
+    ):
+        lines.append(f'  {chunk}')
 
     if skipped_topics:
         lines.append('')
@@ -1962,6 +2052,18 @@ def corpus_categories() -> tuple[str, ...]:
     )
 
     return tuple(sorted(c.value for c in (GRAPHITI_PRIMARY | MEM0_PRIMARY)))
+
+
+def graphiti_primary_categories() -> tuple[str, ...]:
+    """The categories the Mem0-side corpus count under-reports.
+
+    Named in the report so an operator reading a near-zero count knows it is a
+    counting scope, not an empty graph. Derived for the same reason
+    :func:`corpus_categories` is.
+    """
+    from fused_memory.models.enums import GRAPHITI_PRIMARY  # noqa: PLC0415
+
+    return tuple(sorted(c.value for c in GRAPHITI_PRIMARY))
 
 
 def corpus_project_id(project_ids: tuple[str, ...]) -> str:
