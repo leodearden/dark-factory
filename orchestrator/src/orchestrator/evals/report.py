@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from itertools import combinations
 from math import sqrt
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeAlias
 
 from .elo import (
     INDISTINGUISHABLE_THRESHOLD,
@@ -196,6 +196,12 @@ def _is_plan_only(metrics: dict[str, Any]) -> bool:
     return metrics.get('role_under_test') == 'architect'
 
 
+# ``(fixture, role_group)`` — the key of every efficiency baseline map in
+# :func:`build_composite_report` (task 3099). Module-level, not function-local:
+# a name bound inside a function body is not usable in a type expression.
+_BaselineKey: TypeAlias = tuple[str, str]
+
+
 def build_composite_report(
     results: list[EvalResult],
     *,
@@ -287,13 +293,12 @@ def build_composite_report(
     #    differently depending on whether unrelated implementer rows happened to
     #    be present. Scoping makes the plan-only composite a well-defined
     #    quantity rather than an artifact of who else was in the run.
-    BaselineKey = tuple[str, str]
-    best_cost: dict[BaselineKey, float] = {}
-    best_latency: dict[BaselineKey, float] = {}
-    best_cost_all: dict[BaselineKey, float] = {}
-    best_latency_all: dict[BaselineKey, float] = {}
+    best_cost: dict[_BaselineKey, float] = {}
+    best_latency: dict[_BaselineKey, float] = {}
+    best_cost_all: dict[_BaselineKey, float] = {}
+    best_latency_all: dict[_BaselineKey, float] = {}
 
-    def _baseline_key(result: EvalResult) -> BaselineKey:
+    def _baseline_key(result: EvalResult) -> _BaselineKey:
         return (
             result.task_id,
             'plan_only' if _is_plan_only(result.metrics) else 'workflow',
