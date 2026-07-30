@@ -155,16 +155,35 @@ function stateFor(state, url) {
   return st;
 }
 
+// Error backoff: 3000ms * 2^(failures-1), capped at 60s. A non-ok HTTP
+// status counts as a failure alongside a thrown error — the motivating
+// incident is an overloaded server (503), not just network blips, and a
+// !resp.ok today is silently retried at the full 3s rate forever.
+const BACKOFF_BASE_MS = 3000;
+const BACKOFF_MAX_MS = 60000;
+function backoffDelay(failures) {
+  return Math.min(BACKOFF_BASE_MS * Math.pow(2, failures - 1), BACKOFF_MAX_MS);
+}
+
 async function refreshOne(url, keys, state, deps) {
   const st = stateFor(state, url);
   if (st.inFlight) return; // already in flight for this endpoint — skip this tick, do not queue
+  if (deps.now() < st.nextAllowedAt && !deps.ignoreBackoff) return; // still backed off
   st.inFlight = true;
   try {
     const resp = await deps.fetchImpl(url, { credentials: 'same-origin' });
-    if (!resp.ok) return;
+    if (!resp.ok) {
+      st.failures += 1;
+      st.nextAllowedAt = deps.now() + backoffDelay(st.failures);
+      return;
+    }
     const body = await resp.json();
     keys.forEach(k => applyKey(k, body[k]));
+    st.failures = 0;
+    st.nextAllowedAt = 0;
   } catch (err) {
+    st.failures += 1;
+    st.nextAllowedAt = deps.now() + backoffDelay(st.failures);
     // Network blip — keep the prior values so the UI does not blank out.
     console.warn('DF_DATA fetch failed', url, err);
   } finally {
@@ -188,11 +207,20 @@ const DEFAULT_POLL_DEPS = {
 // `opts.state`/`opts.deps` let callers supply isolated flow-control state
 // and a controllable clock/RNG/fetch; production callers fall back to the
 // shared DF_POLL_STATE singleton and the real fetch/timers.
+//
+// A chip change (explicit non-empty `win`, app.jsx:71) sets deps.ignoreBackoff
+// so the user sees fresh data immediately instead of a chip click doing
+// nothing for up to 60s; the setInterval-driven pollTick always calls this
+// with no `win`, so the timer path never bypasses backoff. ignoreBackoff
+// only skips the backoff check in refreshOne — the in-flight check above it
+// is unconditional, so a chip change still cannot stack a second concurrent
+// request for an endpoint that's already running.
 async function refreshDFData(win, opts) {
   const o = opts || {};
-  if (typeof win === 'string' && win) currentWin = win;
+  const isChipChange = typeof win === 'string' && win;
+  if (isChipChange) currentWin = win;
   const state = o.state || DF_POLL_STATE;
-  const deps = { ...DEFAULT_POLL_DEPS, ...o.deps };
+  const deps = { ...DEFAULT_POLL_DEPS, ...o.deps, ignoreBackoff: !!isChipChange };
   await Promise.all(Object.entries(endpointsFor(currentWin)).map(([url, keys]) => refreshOne(url, keys, state, deps)));
   window.dispatchEvent(new CustomEvent('df-data-refresh'));
 }
