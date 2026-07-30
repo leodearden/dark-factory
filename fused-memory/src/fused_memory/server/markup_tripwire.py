@@ -50,6 +50,8 @@ straight through.
 
 from __future__ import annotations
 
+from typing import Any
+
 # Raw MCP envelope fragments that must never appear inside a write payload.
 #
 # Matched as bare, CASE-SENSITIVE substrings (see the module docstring for why
@@ -57,6 +59,29 @@ from __future__ import annotations
 # This is the single write-time source of truth (INV-5); the same-file drift
 # guard in tests/server/test_markup_tripwire.py must be updated alongside it.
 MCP_MARKUP_PATTERNS: tuple[str, ...] = ('</content>', '<parameter name=', '</invoke>')
+
+# Write-time-only control flag that bypasses the tripwire for markup a caller is
+# quoting DELIBERATELY (DF 3083's own task description quotes all three literals
+# in prose, so without this the very sibling this leaf exists to feed could not
+# be updated). Only a literal boolean ``True`` enables it, and it is stripped
+# from metadata before persistence at every boundary — mirroring the established
+# ``allow_near_duplicate`` lifecycle in ``server/tools.py``. An accidental
+# harness serialization leak never sets an explicit flag; an author can.
+MARKUP_OVERRIDE_KEY = 'allow_mcp_markup'
+
+# Surfaced in the rejection dict, the four tool docstrings and
+# FUSED_MEMORY_INSTRUCTIONS so the remediation and the escalation pointer are
+# discoverable at the point of rejection, not just in documentation the writer
+# may never have read (mirrors near_duplicate_guard._NEAR_DUPLICATE_HINT).
+_MARKUP_HINT = (
+    'This write carries raw MCP envelope markup (see matched_pattern/field), '
+    'which indicates the caller serialized part of its own tool-call envelope '
+    'into the payload. Strip the leaked envelope fragment and resubmit. Do NOT '
+    'work around this by rewording the payload around the fragment: DF task '
+    '3083 owns the root cause and the retroactive corpus sweep, so report a '
+    'recurrence there. If the markup is quoted deliberately (e.g. documenting '
+    "the leak itself), override with metadata={'" + MARKUP_OVERRIDE_KEY + "': True}."
+)
 
 
 def find_markup_pattern(text: object) -> str | None:
@@ -103,3 +128,37 @@ def find_markup_violation(fields: dict[str, object]) -> tuple[str, str] | None:
         if pattern is not None:
             return field_name, pattern
     return None
+
+
+def build_markup_block(
+    agent_id: str | None,
+    field: str,
+    pattern: str,
+    text: str,
+    *,
+    storm: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the structured rejection dict returned by the four write tools.
+
+    Mirrors :func:`near_duplicate_guard.build_near_duplicate_block`'s flat
+    ``error``/``error_type``/``agent_id``/``content_excerpt``/``hint`` shape so
+    both guards' agent-facing diagnostics stay uniform, and adds *field* and
+    *matched_pattern* — the write has already been refused, so this dict is the
+    only machine-readable account of WHICH pattern tripped and WHERE (INV-1).
+
+    *storm* is folded in only when a rejection burst actually fired: the
+    ``'storm'`` key is OMITTED entirely otherwise, rather than set to ``None``, so
+    its presence is an unambiguous signal (INV-4).
+    """
+    block: dict[str, Any] = {
+        'error': 'mcp_markup_write_blocked',
+        'error_type': 'McpEnvelopeMarkupWriteRejected',
+        'agent_id': agent_id,
+        'field': field,
+        'matched_pattern': pattern,
+        'content_excerpt': text[:200],
+        'hint': _MARKUP_HINT,
+    }
+    if storm is not None:
+        block['storm'] = storm
+    return block
