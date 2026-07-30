@@ -193,6 +193,20 @@ class PlannedRun:
     degrade an invariant violation into losing the ENTIRE plan record —
     silently destroying the very observability this field exists to supply.)
 
+    FIDELITY: it records the scoping INTENT the decision layer computed, NOT
+    a guarantee about what the command actually ran on — the executed command
+    may be BROADER, never narrower. Two reachable divergences: (i) when
+    :func:`_scope_prefix_to_keyword` cannot narrow (the keyword is absent, or
+    the prefix parses OPAQUE) it returns the command UNSCOPED while the slot
+    is still labelled FILE_SCOPED, so a ``type_check_command='mypy src/'``
+    slot records the touched files but type-checks the whole tree; (ii) after
+    ``verify._executed_fallback_plan`` reconciliation this field still holds
+    the DECISION-layer flat list while ``cmd`` is the executed, possibly
+    subproject-rescoped or unscoped command — the same intent-vs-execution
+    gap :func:`_derive_fallback_runs`' own "Fidelity caveat" paragraph
+    documents for ``module_prefix``/``cmd``. Read it as "what the planner
+    decided to narrow to", and ``cmd`` as "what ran".
+
     It exists (task 3219) because ``cmd.targets`` CANNOT answer "which files
     was this scoped to?" whenever ``cmd`` is raw-retained, and two paths
     routinely produce exactly that: the tail-preserving chained-lint accept
@@ -209,12 +223,18 @@ class PlannedRun:
     execution model, whose P3 invariant (``verify_cmd.render``) exists to
     guarantee that no field it carries is silently dropped by ``render()`` —
     a deliberately-non-rendering field there would be precisely the class of
-    field P3 forbids, and would make P3 self-contradictory. Scoping
-    provenance is a PLAN fact, and ``PlannedRun`` is the plan record: sibling
-    to ``scope_kind``/``reason``, which already record the WHY of a narrowing
-    to this field's WHAT. It also rides untouched through
-    ``verify._executed_fallback_plan``'s ``dataclasses.replace``-based
-    reconciliation, which a ``VerifyCmd``-hosted field would not.
+    field P3 forbids, and would make P3 self-contradictory. Relaxing P3 to
+    let a raw-retained command carry these targets instead was considered
+    and rejected: P3 is a general guard, not a lint on one call site, so
+    admitting one caller's provenance need would also free ``cargo_scope``
+    and ``serial_pytest`` — which mutate raw-retained commands by rewriting
+    ``raw`` — to leave stale structured ``targets`` behind with nothing left
+    to catch it. Scoping provenance is a PLAN fact, and ``PlannedRun`` is
+    the plan record: sibling to ``scope_kind``/``reason``, which already
+    record the WHY of a narrowing to this field's WHAT. It also rides
+    untouched through ``verify._executed_fallback_plan``'s
+    ``dataclasses.replace``-based reconciliation, which a ``VerifyCmd``-hosted
+    field would not.
     """
 
     module_prefix: str
@@ -286,15 +306,10 @@ def _scope_prefix_to_keyword(raw: str, keyword: str, files: list[str]) -> Verify
     ``render`` reproduces byte-for-byte. The real ``ToolKind`` is kept rather
     than OPAQUE so ``run.cmd.tool`` stays meaningful downstream.
 
-    That raw-retained return DELIBERATELY drops the structured
-    ``targets``/``uv_project``/``base_flags`` the scoping produced: carrying
-    them alongside ``raw`` is exactly what ``render``'s P3 invariant forbids
-    (a field ``render()`` would silently ignore). The narrowed file list is
-    therefore not recoverable from the returned ``cmd`` — since every
-    subproject's ``lint_command`` chains a sibling checker, that is the
-    NORMAL shape here, not an edge case. Callers record it separately on
-    ``PlannedRun.scoped_targets`` (task 3219), which is why they pass the
-    same *files* list to both this function and that field.
+    That raw-retained return drops the structured ``targets`` by design (P3),
+    so the narrowed file list is not recoverable from the returned ``cmd``;
+    scoping provenance is recorded by the caller on
+    :class:`PlannedRun`'s ``scoped_targets`` — see that field's docstring.
 
     *keyword* absent from *raw*, or the prefix not parsing into one
     recognised structured invocation (P1), leaves *raw* untouched: the

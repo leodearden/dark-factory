@@ -555,18 +555,11 @@ def render(cmd: VerifyCmd) -> str:
     too — a raw-retained command legitimately carries a ``govern_cpu``
     wrapper (the "legitimate wrapper context").
 
-    P3 was considered for relaxation in task 3219 — to let a raw-retained
-    command keep the ``targets`` its scoping produced, as plan provenance —
-    and deliberately KEPT. P3 is a general guard, not a lint on one call
-    site: what it buys is the guarantee that no mutator ever leaves a field
-    set that ``render()`` silently ignores. Admitting one caller's
-    provenance need would drop that guarantee for ``cargo_scope`` and
-    ``serial_pytest`` too — both operate on raw-retained commands by
-    rewriting ``raw``, and both would then be free to leave stale structured
-    ``targets`` behind with nothing left to catch it. Scoping provenance is
-    a PLAN fact, not a command fact, so it lives on
+    A raw-retained return therefore drops the structured ``targets`` a
+    scoper produced; scoping provenance is recorded on
     ``verify_plan.PlannedRun.scoped_targets`` instead — see that field's
-    docstring for the full rationale.
+    docstring for why P3 was kept rather than relaxed to carry it (task
+    3219).
     """
     if cmd.raw is not None:
         assert cmd.cwd_rel is None and not cmd.targets, (
