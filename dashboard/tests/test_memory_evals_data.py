@@ -1536,3 +1536,185 @@ class TestShapeMemoryEvals:
         shaped = redux_api.shape_memory_evals(**payload)
 
         assert set(shaped) == {'MEMORY_EVALS'}
+
+
+# ---------------------------------------------------------------------------
+# step-19 — GET /api/v2/dashboard/memory-evals
+# ---------------------------------------------------------------------------
+
+_ROUTE_URL = '/api/v2/dashboard/memory-evals'
+_ROUTE_RUNS = ('20260703T031500Z', '20260704T031500Z', '20260705T031500Z')
+_ROUTE_FINGERPRINT = 'eval:e1-retrieval-health|metric:dangling-pointers|item:node-7'
+
+
+def _route_tree(tmp_path: Path) -> DashboardConfig:
+    """A full artifact tree at the paths the ROUTE resolves from config.
+
+    Built through ``config.memory_evals_dir`` / ``config.reconciliation_escalations_dir``
+    rather than hand-spelled paths, so the test exercises the route's own
+    resolution instead of agreeing with a second copy of it.
+    """
+    config = _make_config(tmp_path)
+    root = config.memory_evals_dir
+    esc_dir = config.reconciliation_escalations_dir
+    esc_dir.mkdir(parents=True, exist_ok=True)
+
+    for stamp in _ROUTE_RUNS:
+        _write_metrics(root, 'e1-retrieval-health', stamp, [
+            _metric('canonical-in-top-5', 'proportion', 0.94, n=50, denominator=50),
+            _metric('dangling-pointers', 'count', 4.0, n=4),
+        ])
+    _write_limits(
+        root, 'e1-retrieval-health',
+        run_stamp=_ROUTE_RUNS[-1],
+        baseline_run_stamps=list(_ROUTE_RUNS[:2]),
+        verdicts=[
+            _limits_verdict('canonical-in-top-5', 'proportion'),
+            _limits_verdict('dangling-pointers', 'count'),
+        ],
+    )
+    _write_verdicts(root, [
+        _verdict(
+            'e1-retrieval-health', 'dangling-pointers', 'alarm',
+            fingerprint=_ROUTE_FINGERPRINT, value=4.0,
+            limit_ref='count>=3', run_stamp=_ROUTE_RUNS[-1], item='node-7',
+        ),
+        _verdict(
+            'e1-retrieval-health', 'canonical-in-top-5', 'no_alarm',
+            fingerprint='eval:e1-retrieval-health|metric:canonical-in-top-5',
+            value=0.94, run_stamp=_ROUTE_RUNS[-1],
+        ),
+    ], run_stamp=_ROUTE_RUNS[-1])
+    _write_escalation(esc_dir, 'esc-eval-1', dedupe_fingerprint=_ROUTE_FINGERPRINT)
+    return config
+
+
+class TestMemoryEvalsEndpoint:
+    """``GET /api/v2/dashboard/memory-evals`` end-to-end through the real route.
+
+    Sync tests driven by the starlette ``TestClient`` (``client`` conftest
+    fixture), mirroring the escalation-analytics route suite: the config is
+    swapped onto ``app.state`` and the TTL cache is cleared before each GET so
+    one test's payload can never be served to the next.
+    """
+
+    def test_full_payload_reaches_the_client(self, client, tmp_path: Path) -> None:
+        from dashboard.app import _memory_evals_cache_clear
+
+        config = _route_tree(tmp_path)
+        client.app.state.config = config
+        _memory_evals_cache_clear()
+
+        resp = client.get(_ROUTE_URL)
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert set(body) == {'MEMORY_EVALS'}
+        payload = body['MEMORY_EVALS']
+        assert set(payload) == _PAYLOAD_KEYS
+        assert payload['root_present'] is True
+        assert payload['issue_count'] == len(payload['issues']) == 0
+
+        (row,) = payload['evals']
+        assert row['eval_id'] == 'e1-retrieval-health'
+        assert row['run_stamps'] == list(_ROUTE_RUNS)
+        assert row['latest_run_stamp'] == _ROUTE_RUNS[-1]
+
+        # Limits provenance survived the JSON round trip.
+        assert row['limits']['alpha'] == 0.002777777777777778
+        assert row['limits']['baseline_run_stamps'] == list(_ROUTE_RUNS[:2])
+        assert row['limits']['stale_for_latest_run'] is False
+
+        by_id = {m['metric_id']: m for m in row['metrics']}
+        assert set(by_id) == {'canonical-in-top-5', 'dangling-pointers'}
+
+        # Trends: a full-width series over the shared run axis.
+        trend = by_id['canonical-in-top-5']['trend']
+        assert trend['labels'] == list(_ROUTE_RUNS)
+        assert trend['values'] == [0.94, 0.94, 0.94]
+        assert by_id['canonical-in-top-5']['current_value'] == 0.94
+        assert by_id['canonical-in-top-5']['rule_kind'] == 'proportion'
+
+        # Verdict + the fingerprint-matched escalation, all the way to the UI.
+        alarmed = by_id['dangling-pointers']
+        assert alarmed['verdict'] == 'alarm'
+        assert alarmed['fingerprint'] == _ROUTE_FINGERPRINT
+        assert alarmed['escalation']['id'] == 'esc-eval-1'
+        assert alarmed['parity'] == 'alarmed_open'
+        assert by_id['canonical-in-top-5']['parity'] == 'clear'
+        assert payload['unmatched_escalations'] == []
+
+    def test_malformed_artifact_never_500s_and_is_counted(self, client, tmp_path: Path) -> None:
+        """The row-9 contract, for this route: degrade loudly, never crash.
+
+        Mirrors ``test_row9_malformed_regime_markers_never_500s`` — a corrupt
+        artifact must raise ``issue_count``, not the status code.
+        """
+        from dashboard.app import _memory_evals_cache_clear
+
+        config = _route_tree(tmp_path)
+        client.app.state.config = config
+        _memory_evals_cache_clear()
+
+        pre = client.get(_ROUTE_URL).json()['MEMORY_EVALS']['issue_count']
+        assert pre == 0
+
+        _corrupt(config.memory_evals_dir / 'e1-retrieval-health' / f'metrics-{_ROUTE_RUNS[0]}.json')
+        _memory_evals_cache_clear()
+        resp = client.get(_ROUTE_URL)
+
+        assert resp.status_code == 200
+        payload = resp.json()['MEMORY_EVALS']
+        assert payload['issue_count'] > pre
+        assert 'unreadable_metrics' in {i['kind'] for i in payload['issues']}
+        # Still serving: the other two runs render.
+        assert payload['evals'][0]['run_stamps'] == list(_ROUTE_RUNS[1:])
+
+    def test_ttl_cache_single_flights_the_scan(self, client, tmp_path: Path) -> None:
+        """Within the TTL window the disk is not re-scanned.
+
+        Asserted by mutating the tree and getting the OLD payload back — the
+        only observable proof that the ~60s single-flight cache is actually in
+        the path, and the reason a cold artifact scan cannot be re-run per poll.
+        """
+        from dashboard.app import _memory_evals_cache_clear
+
+        config = _route_tree(tmp_path)
+        client.app.state.config = config
+        _memory_evals_cache_clear()
+
+        first = client.get(_ROUTE_URL).json()
+
+        _write_metrics(
+            config.memory_evals_dir, 'e1-retrieval-health', '20260706T031500Z',
+            [_metric('dangling-pointers', 'count', 9.0, n=9)],
+        )
+
+        assert client.get(_ROUTE_URL).json() == first
+
+        _memory_evals_cache_clear()
+        after = client.get(_ROUTE_URL).json()['MEMORY_EVALS']
+
+        assert after['evals'][0]['run_stamps'][-1] == '20260706T031500Z'
+
+    def test_cache_clear_hook_is_exported(self) -> None:
+        """The test hook is part of the module's published surface, like the analytics one."""
+        import dashboard.app as app_module
+
+        assert callable(app_module._memory_evals_cache_clear)
+        assert '_memory_evals_cache_clear' in app_module.__all__
+
+    def test_missing_root_is_a_200_not_a_500(self, client, tmp_path: Path) -> None:
+        """A project that has never run an eval renders an empty section, not an error."""
+        from dashboard.app import _memory_evals_cache_clear
+
+        client.app.state.config = _make_config(tmp_path)
+        _memory_evals_cache_clear()
+
+        resp = client.get(_ROUTE_URL)
+
+        assert resp.status_code == 200
+        payload = resp.json()['MEMORY_EVALS']
+        assert payload['root_present'] is False
+        assert payload['evals'] == []
+        assert payload['issues'] == []
