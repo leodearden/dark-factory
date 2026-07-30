@@ -8679,9 +8679,30 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         disk.  Cold/ephemeral fallback paths (``spec_warm=False``) delegate to
         ``_cleanup_owned_merge_worktree`` which deregisters the ledger entry
         and calls ``git worktree remove``.
+
+        INVARIANT (task 3148): *neither* branch may return with ``merge_wt``
+        still in ``_owned_merge_worktrees``.
         """
         if spec_warm and merge_wt is not None:
             await self._git_ops.release_spec_lane(merge_wt, warm=True)
+            # task 3148: the lane goes back to the pool on disk, but this worker
+            # no longer owns it — drop it from the liveness ledger
+            # unconditionally so _touch_owned_merge_worktrees can never keep
+            # pinning its root mtime.  A retained entry is doubly immortal: the
+            # heartbeat refreshes the ROOT-inode mtime that the disk-scan
+            # coalesce arm reads for liveness, and
+            # keep_worktrees=set(self._owned_merge_worktrees) exempts it from
+            # reaping — together wedging the branch out of the merge queue until
+            # process restart.  And it is invisible to the I6 audit, which flags
+            # only worktrees ABSENT from the ledger.  Idempotent .discard(), so
+            # this is a no-op on the common path where the lane is a pool-owned
+            # _spec- lane that was never registered; it exists to make the
+            # invariant unconditional rather than to fix a demonstrated leak.
+            # Ordered AFTER the release_spec_lane await so the ledger mutation
+            # follows the pool hand-off, matching _cleanup_owned_merge_worktree's
+            # single-owner discipline (release_spec_lane is documented
+            # never-raise, so this is not an error-path question).
+            self._deregister_owned_merge_worktree(merge_wt)
         else:
             await self._cleanup_owned_merge_worktree(merge_wt)
 
