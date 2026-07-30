@@ -539,9 +539,20 @@ class TestResetHoldsLaneLock:
         ``MergeVerifyLeaseContended`` IS-A ``RuntimeError``, so the old
         ``pytest.raises(RuntimeError, match='Timed out')`` would keep passing
         after the fix while pinning nothing about the new contract.
+
+        The holder is a genuine ``flock(1)`` SUBPROCESS (task 3081): this test
+        has always claimed "a foreign holder", but it used to stage one as a
+        second fd in this same process — which at kernel level is precisely the
+        B13 SELF-OWNED case, since ``/proc/locks`` reports our own pid.  Once
+        that case is detected and typed separately, a same-process fd would no
+        longer exercise foreign contention at all, and this test would be
+        quietly asserting something other than what it says.
         """
         from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
         from orchestrator.git_ops import MergeVerifyLeaseContended  # noqa: PLC0415
+        from test_lane_lock_leak_guard import (  # noqa: PLC0415
+            foreign_lane_lock_holder,
+        )
 
         # Small enough the test doesn't wait the real 30s default, but long
         # enough it can't be satisfied by anything other than a genuine
@@ -554,10 +565,7 @@ class TestResetHoldsLaneLock:
         merge_commit_b = await _get_merge_commit(real_git_ops, 'reset-lock-b2', 'rlb2.py')
 
         lock_path = lane_lock_path(real_git_ops.persistent_merge_worktree_path)
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT)
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        try:
+        with foreign_lane_lock_holder(lock_path):
             with pytest.raises(MergeVerifyLeaseContended) as excinfo:
                 await real_git_ops.reset_persistent_merge_worktree(merge_commit_b)
 
@@ -604,9 +612,6 @@ class TestResetHoldsLaneLock:
                 'block the reset entirely — the tree must be left '
                 'untouched, never mutated unprotected'
             )
-        finally:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            os.close(lock_fd)
 
 
 # ---------------------------------------------------------------------------

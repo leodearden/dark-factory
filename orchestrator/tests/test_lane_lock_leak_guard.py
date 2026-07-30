@@ -40,10 +40,15 @@ from pathlib import Path
 
 import pytest
 
+from orchestrator.git_ops import GitOps, MergeVerifyLeaseContended, _run
 from orchestrator.verify_cancel import (
     acquire_merge_verify_flock,
+    lane_lock_holder_pids,
     lane_lock_path,
+    read_lock_holder_pgid,
     release_merge_verify_flock,
+    remove_lock_holder_pgid,
+    write_lock_holder_pgid,
 )
 
 # Real-git fixtures + helpers reused from the sibling lease-guard module (the
@@ -68,6 +73,7 @@ __all__ = [
     'foreign_lane_lock_holder',
     'git_repo',
     'lane_lock_path',
+    'leaked_lane_lock',
     'real_git_ops',
     'wait_until',
 ]
@@ -130,6 +136,32 @@ def foreign_lane_lock_holder(lock_path: Path) -> Iterator[subprocess.Popen]:
             child.wait(timeout=5)
 
 
+@contextlib.contextmanager
+def leaked_lane_lock(lock_path: Path) -> Iterator[int]:
+    """Stage the B13 fault: hold *lock_path* from an fd nothing will release.
+
+    Acquires through :func:`acquire_merge_verify_flock` DIRECTLY rather than
+    through ``GitOps._acquire_lane_flock_off_thread``, which is what makes this
+    the leak shape rather than a legitimate hold: the fd never enters the
+    in-process held-fd registry, and no holder-pgid rendezvous is written —
+    exactly the state an orphaned ``asyncio.to_thread`` acquire leaves behind.
+
+    The real orphan's fd is unreachable and stays held until process exit; this
+    helper keeps a handle purely so the test process does not accumulate held
+    locks.  Nothing the detector can observe differs.
+    """
+    fd = acquire_merge_verify_flock(lock_path, 0.0)
+    if fd is None:
+        pytest.fail(
+            f'could not take {lock_path} to stage the leak — something else '
+            f'already holds it, so the assertion below would test the wrong fault'
+        )
+    try:
+        yield fd
+    finally:
+        release_merge_verify_flock(fd)
+
+
 async def wait_until(
     predicate: Callable[[], bool],
     timeout: float = 5.0,
@@ -175,3 +207,265 @@ async def test_scaffold_real_git_fixtures_available(real_git_ops):
     """
     commit = await _get_merge_commit(real_git_ops, 'scaffold-lane', 'scaffold.py')
     assert commit
+
+
+# ---------------------------------------------------------------------------
+# Step-3 (B13): a lane lock held by an fd in THIS process, with no live
+# in-process span and no live verify, is a SELF-OWNED LEAK — not the foreign
+# contention the fail-closed timeout path exists for.
+#
+# The three layers of the predicate are pinned independently below, because
+# each one alone would produce a false positive:
+#   (1) kernel — our pid among the FLOCK holders of the lock's inode;
+#   (2) registry — no fd registered for that path by an in-process acquire;
+#   (3) liveness — _merge_verify_lease_active() False.
+# Layer (3) alone cannot carry it: task_verify_lease deliberately never writes
+# the rendezvous, so a legitimate live consumer-hold would be libelled a leak —
+# and a leak report is a LOUD, human-escalating event.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSelfOwnedLaneLockLeak:
+    """B13 — self-owned lane-lock leaks are detected and reported as such."""
+
+    async def test_reset_raises_self_owned_leak_naming_pid_pgid_and_lock(
+        self, real_git_ops, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """CANONICAL B13: the incident's own path, reproduced end to end.
+
+        A leaked lane lock makes the reset's bounded wait time out exactly as
+        foreign contention would.  Today that is indistinguishable from "some
+        other actor is busy" — which is why reify esc-5548-5 took roughly three
+        hours and manual ``/proc/locks`` + ``stat -c %i`` forensics to
+        attribute.  The fault must name the culprit itself: our pid, our pgid,
+        and the lock inode.
+
+        The tree must still be left untouched — detection changes the
+        DIAGNOSIS, never the fail-closed refusal to mutate unprotected.
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+        from orchestrator.git_ops import LaneLockSelfOwnedLeak  # noqa: PLC0415
+
+        monkeypatch.setattr(git_ops_mod, '_RESET_WARM_LANE_LOCK_WAIT_SECS', 1)
+
+        commit_a = await _get_merge_commit(real_git_ops, 'leak-a', 'leak_a.py')
+        await real_git_ops.reset_persistent_merge_worktree(commit_a)  # create-once
+        commit_b = await _get_merge_commit(real_git_ops, 'leak-b', 'leak_b.py')
+
+        warm_path = real_git_ops.persistent_merge_worktree_path
+        lock_path = lane_lock_path(warm_path)
+
+        with leaked_lane_lock(lock_path):
+            with pytest.raises(LaneLockSelfOwnedLeak) as excinfo:
+                await real_git_ops.reset_persistent_merge_worktree(commit_b)
+
+            msg = str(excinfo.value)
+            assert str(os.getpid()) in msg, (
+                f'the fault must name the leaking pid — OUR pid — so an '
+                f'operator is not left doing the incident\'s manual '
+                f'/proc/locks forensics again; got {msg!r}'
+            )
+            assert str(os.getpgrp()) in msg, (
+                f'the fault must name our pgid, the corroborating fact the '
+                f'holder-pgid rendezvous would have carried had the acquire '
+                f'ever completed; got {msg!r}'
+            )
+            assert str(lock_path) in msg, (
+                f'the fault must name the leaked lock inode; got {msg!r}'
+            )
+
+            _, head_sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=warm_path)
+            assert head_sha.strip() == commit_a.strip(), (
+                'detecting the leak must not weaken the fail-closed refusal: '
+                'the tree is still never mutated unprotected'
+            )
+
+    async def test_leak_type_and_payload_stay_contended_compatible(
+        self, real_git_ops, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """The leak IS-A MergeVerifyLeaseContended, payload and message included.
+
+        Load-bearing, not taxonomy.  Both merge-worker consumers
+        (merge_queue.py's cross-check fail-safe and its bounded contended-defer
+        arm) are isinstance-based on the parent, so a standalone type would fall
+        through to the generic ``except Exception`` → ``MergeOutcome('blocked')``
+        with a deterministic reason string — an identical
+        ``merge_outcome_signature`` every attempt, tripping the
+        ``consecutive_merge_thrash`` ladder into precisely the false-positive
+        escalation DF 3003 was chartered to stop.
+
+        The parent's message contract is asserted verbatim (names the protected
+        tree, never says "deferring") because DF 3003's own guard test pins
+        exactly those two properties — a subclass that broke either would break
+        that test from a distance.
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+        from orchestrator.git_ops import LaneLockSelfOwnedLeak  # noqa: PLC0415
+
+        assert issubclass(LaneLockSelfOwnedLeak, MergeVerifyLeaseContended), (
+            'a standalone type would miss both isinstance-based merge-worker '
+            'handlers and be mapped to a deterministic-reason blocked outcome'
+        )
+
+        monkeypatch.setattr(git_ops_mod, '_RESET_WARM_LANE_LOCK_WAIT_SECS', 1)
+
+        commit_a = await _get_merge_commit(real_git_ops, 'leak-p1', 'leak_p1.py')
+        await real_git_ops.reset_persistent_merge_worktree(commit_a)
+        commit_b = await _get_merge_commit(real_git_ops, 'leak-p2', 'leak_p2.py')
+
+        warm_path = real_git_ops.persistent_merge_worktree_path
+        lock_path = lane_lock_path(warm_path)
+
+        with leaked_lane_lock(lock_path):
+            with pytest.raises(LaneLockSelfOwnedLeak) as excinfo:
+                await real_git_ops.reset_persistent_merge_worktree(commit_b)
+
+        exc = excinfo.value
+        # The parent's full payload, forwarded — every existing assertion on a
+        # MergeVerifyLeaseContended keeps holding for this subclass.
+        assert exc.lock_path == lock_path
+        assert exc.wait_secs == 1
+        assert exc.operation == 'the warm merge-worktree reset'
+        assert exc.protected_path == warm_path
+        # …plus the leak facts the parent has no room for.
+        assert os.getpid() in exc.holder_pids
+        assert exc.self_pid == os.getpid()
+        assert exc.self_pgid == os.getpgrp()
+        # …and the parent's message contract, verbatim (cf. DF 3003's guard).
+        _msg = str(exc)
+        assert str(exc.protected_path) in _msg, (
+            f'the subclass must keep naming the protected tree; got {_msg!r}'
+        )
+        assert 'deferring' not in _msg.lower(), (
+            f'caller-neutrality is inherited: this raise also reaches cli.py '
+            f'verify-merge, where it is a TERMINAL bail; got {_msg!r}'
+        )
+
+    async def test_merge_verify_lease_reports_leak_and_records_no_holder_pgid(
+        self, real_git_ops, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """The lease acquire detects the same fault on the same inode.
+
+        Both leases and the reset contend for ONE lock; a leak is a property of
+        that inode, not of whichever caller happened to notice.  The rendezvous
+        must stay unwritten: the lease never took the lock, so claiming holder
+        status would corrupt the very liveness signal layer (3) reads.
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+        from orchestrator.git_ops import LaneLockSelfOwnedLeak  # noqa: PLC0415
+
+        monkeypatch.setattr(git_ops_mod, '_MERGE_VERIFY_LEASE_WAIT_SECS', 1)
+
+        lock_path = lane_lock_path(real_git_ops.persistent_merge_worktree_path)
+
+        with leaked_lane_lock(lock_path):
+            with pytest.raises(LaneLockSelfOwnedLeak):
+                async with real_git_ops.merge_verify_lease():
+                    pytest.fail(
+                        'the lease body must never run while the lane lock is '
+                        'leaked — that is the unprotected 1-2h verify window '
+                        'task 2828 closed'
+                    )
+
+        assert read_lock_holder_pgid(real_git_ops.worktree_base) is None, (
+            'a lease that never acquired must not record itself as the holder'
+        )
+
+    async def test_foreign_holder_is_contention_not_a_leak(
+        self, real_git_ops, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """NEGATIVE (1): another process holding the lane is not our leak.
+
+        The discriminator is WHOSE pid the kernel reports.  A reify
+        ``flock(1)``, a ``verify-merge`` CLI subprocess, or another orchestrator
+        must all stay on today's fail-closed contention path — that is DF 3003's
+        territory, and misrouting it into a loud leak escalation would be a
+        false alarm on entirely healthy contention.
+
+        ``type(...) is`` and not ``isinstance``: the subclass IS-A the parent, so
+        an isinstance check here would pass even if every foreign contention
+        were misreported as a leak.
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+        from orchestrator.git_ops import LaneLockSelfOwnedLeak  # noqa: PLC0415
+
+        monkeypatch.setattr(git_ops_mod, '_RESET_WARM_LANE_LOCK_WAIT_SECS', 1)
+
+        commit_a = await _get_merge_commit(real_git_ops, 'leak-f1', 'leak_f1.py')
+        await real_git_ops.reset_persistent_merge_worktree(commit_a)
+        commit_b = await _get_merge_commit(real_git_ops, 'leak-f2', 'leak_f2.py')
+
+        lock_path = lane_lock_path(real_git_ops.persistent_merge_worktree_path)
+
+        with foreign_lane_lock_holder(lock_path) as child:
+            holders = lane_lock_holder_pids(lock_path)
+            assert os.getpid() not in holders, (
+                'staging error: this process must NOT hold the lock, or the '
+                'negative below would be vacuous'
+            )
+            assert child.pid in holders
+
+            with pytest.raises(MergeVerifyLeaseContended) as excinfo:
+                await real_git_ops.reset_persistent_merge_worktree(commit_b)
+
+            assert type(excinfo.value) is not LaneLockSelfOwnedLeak
+            assert type(excinfo.value) is MergeVerifyLeaseContended
+            assert str(child.pid) in str(excinfo.value), (
+                f'the timeout must name the kernel-reported holder — the '
+                f'incident needed manual /proc/locks + stat forensics to learn '
+                f'exactly this; got {str(excinfo.value)!r}'
+            )
+
+    async def test_live_in_process_span_is_not_a_leak(self, real_git_ops):
+        """NEGATIVE (2): a registered in-process hold is a live span, not a leak.
+
+        Layer (2) of the predicate.  Without it, every legitimate concurrent
+        holder in this process — most sharply ``task_verify_lease``, which by
+        design never writes the rendezvous layer (3) reads — would be reported
+        as a leak.  The A/B is the point: the SAME kernel state, differing only
+        in whether the acquire went through the registered seam.
+        """
+        lock_path = lane_lock_path(real_git_ops.persistent_merge_worktree_path)
+
+        fd = await GitOps._acquire_lane_flock_off_thread(lock_path, 1.0)
+        assert fd is not None
+        try:
+            assert os.getpid() in lane_lock_holder_pids(lock_path), (
+                'staging error: the kernel must see us as a holder, or layer '
+                '(1) would be what returns None here'
+            )
+            assert real_git_ops._lane_lock_self_owned_leak(lock_path, 1.0) is None, (
+                'an fd taken through the registered acquire seam is a LIVE '
+                'span — reporting it as leaked would escalate a healthy hold'
+            )
+        finally:
+            GitOps._release_lane_flock(fd)
+
+        with leaked_lane_lock(lock_path):
+            assert real_git_ops._lane_lock_self_owned_leak(lock_path, 1.0) is not None, (
+                'identical kernel state, unregistered fd: the registry must be '
+                'what discriminates, not something incidental to the A case'
+            )
+
+    async def test_live_verify_lease_is_not_a_leak(self, real_git_ops):
+        """NEGATIVE (3): a live recorded verify is contention, not a leak.
+
+        Layer (3), and DF 3003's own case: a genuine long verify holding the
+        lane past the bounded wait must keep deferring quietly rather than
+        raising a human-escalating fault every attempt.
+        """
+        lock_path = lane_lock_path(real_git_ops.persistent_merge_worktree_path)
+
+        with leaked_lane_lock(lock_path):
+            assert real_git_ops._lane_lock_self_owned_leak(lock_path, 1.0) is not None
+
+            write_lock_holder_pgid(real_git_ops.worktree_base, os.getpgrp())
+            try:
+                assert real_git_ops._merge_verify_lease_active() is True, (
+                    'staging error: our own pgid is live, so the rendezvous '
+                    'must read as an active lease'
+                )
+                assert real_git_ops._lane_lock_self_owned_leak(lock_path, 1.0) is None
+            finally:
+                remove_lock_holder_pgid(real_git_ops.worktree_base)
