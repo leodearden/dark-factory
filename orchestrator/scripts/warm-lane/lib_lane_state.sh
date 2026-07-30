@@ -214,6 +214,37 @@ lane_state_class() {
 
 # ── protected prefixes: read dark-factory's own band registry ────────────────
 
+# LANE_PROTECT_GLOB_FALLBACK — the ONE static backstop, for when the python
+# bridge below cannot run at all.
+#
+# READ THIS BEFORE EDITING. This is NOT a mirror to be hand-maintained, and it
+# is NOT the answer callers should normally use — `lane_protect_glob` is. It
+# exists because the alternative is worse: `_merge-*` is `_merge-verify`'s ONLY
+# gc protection, and a systemd-timer sweep must not lose it because a python3
+# import hiccuped on a loaded host. So the sweep degrades to this list rather
+# than to nothing.
+#
+# The difference from the hand-copied glob this lib replaced (warm-lane-gc.sh's
+# old PROTECT_GLOB default, whose comment admitted the coupling and asked future
+# editors to keep it in sync across a repo boundary) is that this backstop is
+# MACHINE CHECKED. The drift gate is
+# orchestrator/tests/test_lane_state_lib.py::TestProtectGlobFallbackDrift: it
+# fails the build if PROTECTED_PREFIXES gains a band no pattern here covers, and
+# it proves it can fail by re-running itself against a monkeypatched registry.
+# So do not sync this by hand — add the band to PROTECTED_PREFIXES in
+# orchestrator/src/orchestrator/git_ops.py and let the gate tell you.
+#
+# Authored complete against the current registry MINUS the owned pool bands.
+# `_lane-*` and `_spec-*` must NEVER appear here: protecting them would make
+# warm-lane-gc.sh skip every lane in both passes, so a python3 outage would
+# FREEZE reclaim instead of degrading it — and a frozen reclaim is what accreted
+# the pool to the 2026-07-10 ENOSPC outage. That direction is pinned too.
+#
+# `_merge-verify` is redundant against `_merge-*` and kept anyway: this string is
+# a verbatim render of the registry, so an operator can diff it against
+# `lane_protect_glob` output directly.
+LANE_PROTECT_GLOB_FALLBACK='_merge-*,_solo-*,_substrate-gate-*,_merge-verify,_offline-deep,.lane-state,.task-meta,_mainprobe-*,_mainsweep-*,_iact-*'
+
 # _LANE_STATE_LIB_DIR / _LANE_STATE_REPO_ROOT — resolved ONCE, at source time,
 # by pure path arithmetic: no git invocation, no environment read. The lib ships
 # at <repo>/orchestrator/scripts/warm-lane/, so the repo root is three levels up.
