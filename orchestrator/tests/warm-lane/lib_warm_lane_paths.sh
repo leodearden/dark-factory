@@ -36,6 +36,13 @@
 _WARM_LANE_PATHS_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # orchestrator/tests/warm-lane -> orchestrator/tests -> orchestrator -> <repo>
+#
+# DF_REPO_ROOT is deliberately NOT re-exposed under reify's `REPO_ROOT` spelling
+# by the ported suites.  After the enumerated deltas removed every reify-repo
+# structural assertion (gc-sweep Blocks D/F + V4, provision Block F), no ported
+# file references a repo-root-relative path at all, and a dead `REPO_ROOT` alias
+# would read as if such paths were still in play.  It stays here — the one place
+# a future consumer can pick it up — rather than in eight files that ignore it.
 DF_REPO_ROOT="$(cd "$_WARM_LANE_PATHS_LIB_DIR/../../.." && pwd)"
 WARM_LANE_SCRIPTS_DIR="$DF_REPO_ROOT/orchestrator/scripts/warm-lane"
 

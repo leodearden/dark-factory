@@ -50,7 +50,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=orchestrator/tests/warm-lane/lib_warm_lane_paths.sh
 source "$SCRIPT_DIR/lib_warm_lane_paths.sh"
-REPO_ROOT="$DF_REPO_ROOT"
 SCRIPT="$WARM_LANE_SCRIPTS_DIR/provision-warm-lane-fs.sh"
 
 [ -f "$SCRIPT_DIR/test_helpers.sh" ] || {
