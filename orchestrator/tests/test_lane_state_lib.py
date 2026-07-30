@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import shlex
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -44,6 +45,11 @@ from test_warm_lane_scripts_shipped import (  # noqa: E402
 
 LIB = WARM_LANE_SCRIPT_DIR / 'lib_lane_state.sh'
 
+#: Resolved ONCE, absolutely, so a case may replace ``PATH`` wholesale to hide
+#: ``python3`` from the library without also hiding the interpreter this harness
+#: needs to launch it.
+_BASH = shutil.which('bash') or '/bin/bash'
+
 
 # ---------------------------------------------------------------------------
 # harness
@@ -54,14 +60,22 @@ def _run_sourced(
     *,
     cwd: Path | None = None,
     env: dict[str, str] | None = None,
+    timeout: int = 60,
 ) -> subprocess.CompletedProcess[str]:
-    """Source the SHIPPED lib in a fresh bash and run *snippet* against it."""
+    """Source the SHIPPED lib in a fresh bash and run *snippet* against it.
+
+    *timeout* is generous by default and raised further by the
+    ``lane_protect_glob`` cases: unlike the pure-bash lane-state half, those
+    pay a real ``python3`` interpreter start plus the ``orchestrator.git_ops``
+    import chain, which on a loaded host (this repo's own fleet saturates it)
+    measures single-digit seconds cold.
+    """
     script = f'source {shlex.quote(str(LIB))}\n{snippet}\n'
     return subprocess.run(
-        ['bash', '-c', script],
+        [_BASH, '-c', script],
         capture_output=True,
         text=True,
-        timeout=60,
+        timeout=timeout,
         cwd=str(cwd if cwd is not None else WARM_LANE_SCRIPT_DIR),
         env=_sanitized_env() if env is None else env,
     )
@@ -917,3 +931,122 @@ class TestProtectedPrefixesInstanceViewIsUnchanged:
         )
         # The default map is unaffected by the instance override.
         assert default_protected_prefixes()['_iact-'] == 'interactive'
+
+
+# ---------------------------------------------------------------------------
+# lane_protect_glob — the bash -> python bridge
+# ---------------------------------------------------------------------------
+
+#: `lane_protect_glob` pays a python3 start plus the `orchestrator.git_ops`
+#: import chain.  Measured on this host under fleet load: ~2.4s warm, ~10s cold.
+#: The ceiling is deliberately far above both — a timeout here would be a flaky
+#: failure indistinguishable from the real bridge break the test exists to catch.
+_BRIDGE_TIMEOUT = 120
+
+
+def _stub_path_dir(tmp_path: Path, name: str, *, body: str | None = None) -> Path:
+    """A directory fit to be the WHOLE ``PATH``, holding at most one executable.
+
+    With *body* ``None`` the directory is EMPTY, which is how "``python3`` is
+    absent" is expressed — the systemd-timer reading of this failure, where the
+    unit's ``PATH`` need not carry the interpreter the interactive shell has.
+    """
+    stub = tmp_path / f'stub-bin-{name}'
+    stub.mkdir(parents=True, exist_ok=True)
+    if body is not None:
+        exe = stub / name
+        exe.write_text(body)
+        exe.chmod(0o755)
+    return stub
+
+
+def _warn_lines(stderr: str) -> list[str]:
+    """The ``[warn]``-prefixed lines, ignoring any other stderr noise.
+
+    Bash's own ``python3: command not found`` is not part of the contract — the
+    library's ONE attributable warning is.
+    """
+    return [line for line in stderr.splitlines() if line.lstrip().startswith('[warn]')]
+
+
+class TestLaneProtectGlobBridge:
+    """``lane_protect_glob`` is the "readable from bash" half of this leaf.
+
+    ``PROTECTED_PREFIXES`` cannot be faithfully text-scraped — five of its keys
+    are computed constants and the ``_iact-`` band is config-driven — so the
+    bridge shells a real import.  These cases run it end to end against the real
+    shipped repo layout, from a HOSTILE cwd and with the resolution-hostile env
+    keys stripped, so a pass cannot be an artifact of the ambient checkout.
+    """
+
+    def test_owned_pool_bands_render_exactly_as_python_computes_them(
+        self, tmp_path: Path,
+    ) -> None:
+        """The contract the whole leaf exists for: bash sees what python sees."""
+        from orchestrator.git_ops import (
+            PROTECT_GLOB_OWNED_POOL_BANDS,
+            render_protect_glob,
+        )
+
+        expected = render_protect_glob(owned=PROTECT_GLOB_OWNED_POOL_BANDS)
+        proc = _run_sourced(
+            'lane_protect_glob _lane- _spec-', cwd=tmp_path, timeout=_BRIDGE_TIMEOUT,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == expected, (
+            f'bash rendered {proc.stdout.strip()!r}, python renders {expected!r}'
+        )
+        assert _warn_lines(proc.stderr) == [], proc.stderr
+        # The load-bearing exclusion: handing a pool sweep its own bands as
+        # PROTECTED would stop reclaim outright (2026-07-10 ENOSPC).
+        rendered = set(proc.stdout.strip().split(','))
+        assert '_lane-*' not in rendered and '_spec-*' not in rendered, rendered
+
+    def test_with_no_arguments_it_renders_the_full_set(self, tmp_path: Path) -> None:
+        """No ``owned`` means nothing is excluded — including the pool bands."""
+        from orchestrator.git_ops import render_protect_glob
+
+        proc = _run_sourced(
+            'lane_protect_glob', cwd=tmp_path, timeout=_BRIDGE_TIMEOUT,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == render_protect_glob()
+        rendered = set(proc.stdout.strip().split(','))
+        assert {'_lane-*', '_spec-*'} <= rendered, rendered
+
+    @pytest.mark.parametrize(
+        ('label', 'body'),
+        [
+            ('python3-absent', None),
+            ('python3-exits-nonzero', '#!/bin/sh\nexit 1\n'),
+            ('python3-prints-nothing', '#!/bin/sh\nexit 0\n'),
+        ],
+    )
+    def test_a_broken_bridge_fails_loud_and_never_answers_empty(
+        self, tmp_path: Path, label: str, body: str | None,
+    ) -> None:
+        """Fail-open, but NEVER silently.
+
+        An empty stdout with a zero exit would read downstream as "nothing is
+        protected" — the exact silent widening of a reclaim sweep this leaf
+        exists to close.  So a broken bridge prints nothing, returns non-zero
+        (which aborts the ``set -euo pipefail`` callers rather than letting them
+        proceed unprotected) and leaves exactly ONE attributable ``[warn]``
+        line, the same warn-loud/fail-open stance ``_live_refs_env_probe``
+        already established in this directory.
+        """
+        stub = _stub_path_dir(tmp_path, 'python3', body=body)
+        proc = _run_sourced(
+            'lane_protect_glob _lane- _spec-',
+            cwd=tmp_path,
+            env=_sanitized_env(extra={'PATH': str(stub)}),
+            timeout=_BRIDGE_TIMEOUT,
+        )
+        assert proc.returncode != 0, (
+            f'{label}: a broken bridge returned 0 — a caller checking only the '
+            f'exit status would treat {proc.stdout!r} as authoritative'
+        )
+        assert proc.stdout.strip() == '', f'{label}: {proc.stdout!r}'
+        warns = _warn_lines(proc.stderr)
+        assert len(warns) == 1, f'{label}: expected exactly one [warn], got {warns!r}'
+        assert 'python3' in warns[0], f'{label}: warning does not name the stage: {warns[0]!r}'
