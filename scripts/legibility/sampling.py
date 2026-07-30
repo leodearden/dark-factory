@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 # Self-bootstrap for standalone `python scripts/legibility/sampling.py` runs
 # — must run BEFORE the `legibility.*` imports below, since a direct script
@@ -489,10 +489,32 @@ class SampleResult:
     budget_skipped: int = 0
 
 
-def stratified_sample(records: Sequence[ScoredRecord], config: LegibilityConfig) -> SampleResult:
+def stratified_sample(
+    records: Sequence[ScoredRecord],
+    config: LegibilityConfig,
+    *,
+    cost_fn: Callable[[ScoredRecord], int] | None = None,
+) -> SampleResult:
     """Pick a budget-bounded, stratified subset of *records* (PRD §5.2 point 2, §8.4).
 
-    Pure function — no I/O, no clock. Per stratum: (1) group; (2) drop
+    *cost_fn* is the per-record BYTE-COST seam: every budget charge in this
+    function routes through it. It exists because
+    ``budgets.max_daily_digest_bytes`` is a DIGEST-OUTPUT budget, so what
+    must be charged is the size of the digest a record will render to, not
+    the size of its raw transcript. Callers that can afford the render
+    inject :func:`digest_byte_cost_fn` for the real digest bytes; when
+    *cost_fn* is None the legacy ``record.size_bytes`` basis is used.
+
+    This function stays pure with respect to its own inputs — no clock, and
+    all I/O confined to the injected *cost_fn* seam, so the PRD §8.4
+    boundary test can still drive it entirely in memory. Two guarantees the
+    seam makes to an I/O-backed *cost_fn*: each record is costed AT MOST
+    ONCE per call (memoized on ``record.path``, which matters because the
+    reserve phase reads each group's total twice — sort key, then charge),
+    and only CANDIDATES are ever costed (records dropped as zero-signal or
+    collapsed by :func:`dedupe_shapes` never reach the budget phase).
+
+    Per stratum: (1) group; (2) drop
     zero-signal records; (3) :func:`dedupe_shapes` the survivors; (4) rank
     by score desc and take ``candidates = top max(ceil(top_fraction *
     stratum_size), per_stratum_min)`` capped at the survivor count (the
@@ -523,6 +545,23 @@ def stratified_sample(records: Sequence[ScoredRecord], config: LegibilityConfig)
     top_fraction = config.sampling.top_fraction
     per_stratum_min = config.sampling.per_stratum_min
     max_bytes = config.budgets.max_daily_digest_bytes
+
+    cost_memo: dict[Path, int] = {}
+
+    def _cost(record: ScoredRecord) -> int:
+        """This call's single budget-charge basis, memoized per session path.
+
+        Two records sharing a path are the same session by construction, so
+        the path is a safe memo key — and memoizing is what lets an
+        I/O-backed *cost_fn* be invoked once per candidate rather than once
+        per budget reference.
+        """
+        cached = cost_memo.get(record.path)
+        if cached is not None:
+            return cached
+        charged = cost_fn(record) if cost_fn is not None else record.size_bytes
+        cost_memo[record.path] = charged
+        return charged
 
     by_stratum: dict[str, list[ScoredRecord]] = {}
     for record in records:
@@ -557,8 +596,8 @@ def stratified_sample(records: Sequence[ScoredRecord], config: LegibilityConfig)
     selected: list[ScoredRecord] = []
     bytes_used = 0
     budget_skipped = 0
-    for group in sorted(reserved_groups, key=lambda g: sum(r.size_bytes for r in g)):
-        group_bytes = sum(r.size_bytes for r in group)
+    for group in sorted(reserved_groups, key=lambda g: sum(_cost(r) for r in g)):
+        group_bytes = sum(_cost(r) for r in group)
         if bytes_used + group_bytes > max_bytes:
             budget_skipped += len(group)
             continue
@@ -567,11 +606,12 @@ def stratified_sample(records: Sequence[ScoredRecord], config: LegibilityConfig)
 
     sorted_leftover = sorted(leftover, key=lambda r: r.score, reverse=True)
     for index, record in enumerate(sorted_leftover):
-        if bytes_used + record.size_bytes > max_bytes:
+        record_bytes = _cost(record)
+        if bytes_used + record_bytes > max_bytes:
             budget_skipped += len(sorted_leftover) - index
             break
         selected.append(record)
-        bytes_used += record.size_bytes
+        bytes_used += record_bytes
 
     selected.sort(key=lambda r: r.score, reverse=True)
 
