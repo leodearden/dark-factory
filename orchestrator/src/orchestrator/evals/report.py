@@ -210,12 +210,17 @@ def build_composite_report(
     Aggregation (Open-Q3 / decision 10) is per-fixture NORMALIZED composite →
     mean with a small-sample CI:
 
-    1. For each fixture, ``best_cost`` / ``best_latency`` = the minimum POSITIVE
-       cost / latency across the PASSING (``tests_pass`` truthy) trials of all
-       configs on that fixture. A cheap-but-WRONG run (which itself hard-gates
-       to 0) must not set the efficiency floor and deflate the correct configs'
-       cost/latency scores (reviewer: correctness); a fixture with NO passing
-       trial falls back to all trials so its baseline stays defined.
+    1. For each ``(fixture, role_group)`` — ``role_group`` being ``'plan_only'``
+       for an architect trial and ``'workflow'`` otherwise (task 3099) —
+       ``best_cost`` / ``best_latency`` = the minimum POSITIVE cost / latency
+       across that group's MEASURED trials: ``tests_pass`` truthy for a workflow
+       trial, a non-null ``plan_quality`` for a plan-only one. A cheap-but-WRONG
+       (or cheap-but-UNMEASURABLE) run must not set the efficiency floor and
+       deflate the runs that were actually measured (reviewer: correctness); a
+       group with NO such trial falls back to all its trials so its baseline
+       stays defined. Scoping by role is what keeps a ~$0.30/60s plan-only cell
+       from becoming the floor for the ~$5/900s full-workflow cells that
+       ``ofat_candidates()`` puts over the same fixtures.
     2. For each trial, the efficiency-adjusted composite is
        ``blend_composite(quality=composite_score,
        cost_score=_ratio_score(cost, best_cost),
@@ -273,30 +278,54 @@ def build_composite_report(
     #    floor and deflate the correct configs (reviewer: correctness). The
     #    ``*_all`` maps mirror the same minima over ALL trials and seed the
     #    fallback for a fixture where nothing passed.
-    best_cost: dict[str, float] = {}
-    best_latency: dict[str, float] = {}
-    best_cost_all: dict[str, float] = {}
-    best_latency_all: dict[str, float] = {}
+    #    Keyed on ``(fixture, role_group)`` — NOT on fixture alone (task 3099).
+    #    A plan-only cell's cost is ONE architect invocation (~$0.30/60s); a
+    #    workflow cell's is a full run (~$5/900s), and ``ofat_candidates()`` puts
+    #    both over the SAME fixtures in one result set. A shared floor would
+    #    therefore deflate every workflow row by ~16x AND clamp every plan-only
+    #    row's efficiency axes to 1.0, so the same architect campaign would rank
+    #    differently depending on whether unrelated implementer rows happened to
+    #    be present. Scoping makes the plan-only composite a well-defined
+    #    quantity rather than an artifact of who else was in the run.
+    BaselineKey = tuple[str, str]
+    best_cost: dict[BaselineKey, float] = {}
+    best_latency: dict[BaselineKey, float] = {}
+    best_cost_all: dict[BaselineKey, float] = {}
+    best_latency_all: dict[BaselineKey, float] = {}
+
+    def _baseline_key(result: EvalResult) -> BaselineKey:
+        return (
+            result.task_id,
+            'plan_only' if _is_plan_only(result.metrics) else 'workflow',
+        )
+
     for r in results:
-        fixture = r.task_id
+        key = _baseline_key(r)
         cost = float(r.metrics.get('cost_usd', 0.0) or 0.0)
         latency = float(r.metrics.get('workflow_duration_ms', 0) or 0) / 1000.0
-        passed = bool(r.metrics.get('tests_pass'))
+        # A plan-only trial has no tests_pass to consult, so its admission test
+        # is "did we get a scorable plan at all" — preserving the same rule the
+        # workflow group applies: a cheap-but-UNMEASURABLE run cannot set the
+        # floor and deflate the runs that were actually measured.
+        passed = (
+            r.metrics.get('plan_quality') is not None if _is_plan_only(r.metrics)
+            else bool(r.metrics.get('tests_pass'))
+        )
         if cost > 0:
-            best_cost_all[fixture] = min(best_cost_all.get(fixture, cost), cost)
+            best_cost_all[key] = min(best_cost_all.get(key, cost), cost)
             if passed:
-                best_cost[fixture] = min(best_cost.get(fixture, cost), cost)
+                best_cost[key] = min(best_cost.get(key, cost), cost)
         if latency > 0:
-            best_latency_all[fixture] = min(best_latency_all.get(fixture, latency), latency)
+            best_latency_all[key] = min(best_latency_all.get(key, latency), latency)
             if passed:
-                best_latency[fixture] = min(best_latency.get(fixture, latency), latency)
-    # Fixtures with no passing trial fall back to the all-trials baseline so the
-    # normalization denominator stays defined (every such trial hard-gates to 0
-    # regardless, so this only keeps the baseline non-empty).
-    for fixture, v in best_cost_all.items():
-        best_cost.setdefault(fixture, v)
-    for fixture, v in best_latency_all.items():
-        best_latency.setdefault(fixture, v)
+                best_latency[key] = min(best_latency.get(key, latency), latency)
+    # Groups with no passing trial fall back to the all-trials baseline so the
+    # normalization denominator stays defined (every such workflow trial
+    # hard-gates to 0 regardless, so this only keeps the baseline non-empty).
+    for key, v in best_cost_all.items():
+        best_cost.setdefault(key, v)
+    for key, v in best_latency_all.items():
+        best_latency.setdefault(key, v)
 
     # 2/3. Accumulate per-trial normalized composites, pooled per config.
     def _acc() -> dict[str, Any]:
@@ -336,10 +365,12 @@ def build_composite_report(
         # drives survivor selection. It is still counted in `trials` and in
         # `plan_quality_cap_excluded` below, so nothing is dropped silently.
         if not (plan_only and raw_pq is None):
+            # Each trial normalizes against its OWN (fixture, role_group) floor.
+            bkey = _baseline_key(r)
             acc['composite'].append(blend_composite(
                 quality,
-                _ratio_score(cost, best_cost.get(fixture, 0.0)),
-                _ratio_score(latency, best_latency.get(fixture, 0.0)),
+                _ratio_score(cost, best_cost.get(bkey, 0.0)),
+                _ratio_score(latency, best_latency.get(bkey, 0.0)),
                 tests_pass=tests_pass,
                 plan_only=plan_only,
             ))
