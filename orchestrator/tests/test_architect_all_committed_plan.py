@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -50,7 +50,7 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.scheduler import TaskAssignment
-from orchestrator.workflow import TaskWorkflow
+from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 # ---------------------------------------------------------------------------
 # Shared real-git scaffolding (pre-1)
@@ -525,3 +525,120 @@ class TestArchitectPromptCommittedWorkSection:
         )
 
         assert with_empty == baseline
+
+
+# ---------------------------------------------------------------------------
+# step-7 RED: _plan() threads the detector into the architect briefing
+# ---------------------------------------------------------------------------
+#
+# A wiring test only: the assertions stop at the briefing boundary rather than
+# driving _plan's outcome. Harness modelled on
+# test_workflow_architect_l0_promotion.py::_make — the architect _invoke is
+# stubbed to succeed without writing a plan, and _handle_no_plan_failure is
+# stubbed so _plan returns immediately after the (observed) briefing call.
+
+
+def _make_plan_workflow(tmp_path: Path) -> tuple[TaskWorkflow, AsyncMock]:
+    from unittest.mock import AsyncMock as _AsyncMock  # noqa: PLC0415
+
+    from _orch_helpers import pydantic_spec  # noqa: PLC0415
+    from shared.cli_invoke import AgentResult  # noqa: PLC0415
+
+    assignment = MagicMock()
+    assignment.task_id = '3033'
+    assignment.task = {
+        'id': '3033', 'title': 'T', 'description': 'd', 'metadata': {},
+    }
+    assignment.modules = ['mod_a']
+
+    cfg = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
+    cfg.fused_memory.project_id = 'dark_factory'
+    cfg.fused_memory.url = 'http://localhost:8002'
+    cfg.lock_depth = 2
+    cfg.steward_completion_timeout = 300.0
+    cfg.project_root = tmp_path / 'proj'
+    cfg.max_review_cycles = 2
+    cfg.max_amendment_rounds = 1
+
+    scheduler = MagicMock()
+    scheduler.set_task_status = _AsyncMock()
+    scheduler.update_task = _AsyncMock(return_value=True)
+    scheduler.get_status = _AsyncMock(return_value='in-progress')
+
+    fake_git = MagicMock()
+    fake_git.get_main_sha = _AsyncMock(return_value='currentmain')
+
+    escalation_queue = MagicMock()
+    escalation_queue.get_by_task = MagicMock(return_value=[])
+
+    wf = TaskWorkflow(
+        assignment=assignment,
+        config=cfg,  # type: ignore[arg-type]
+        git_ops=fake_git,  # type: ignore[arg-type]
+        scheduler=scheduler,  # type: ignore[arg-type]
+        briefing=MagicMock(),  # type: ignore[arg-type]
+        mcp=MagicMock(),  # type: ignore[arg-type]
+        escalation_queue=escalation_queue,
+    )
+    worktree = tmp_path / 'wt'
+    worktree.mkdir(parents=True, exist_ok=True)
+    artifacts = TaskArtifacts(worktree)
+    artifacts.init('3033', 'T', 'd', base_commit='oldbase')
+    wf.artifacts = artifacts
+    wf.worktree = worktree
+
+    # Architect succeeds but writes no plan.json → _plan falls to the stubbed
+    # no-plan handler, which is enough to observe the briefing call.
+    wf._invoke = _AsyncMock(  # type: ignore[method-assign]
+        return_value=AgentResult(success=True, output='ok'),
+    )
+    wf._mark_blocked = _AsyncMock(return_value=WorkflowOutcome.BLOCKED)  # type: ignore[method-assign]
+    wf._handle_no_plan_failure = _AsyncMock(  # type: ignore[method-assign]
+        return_value=WorkflowOutcome.BLOCKED,
+    )
+    build = _AsyncMock(return_value='architect-prompt')
+    wf.briefing.build_architect_prompt = build
+    return wf, build
+
+
+@pytest.mark.asyncio
+class TestPlanThreadsCommittedWorkIntoBriefing:
+    async def test_detector_awaited_once_and_result_forwarded(self, tmp_path):
+        wf, build = _make_plan_workflow(tmp_path)
+        detected = [{'sha': _SHA_A, 'subject': 'feat: GREEN — the thing'}]
+        detector = AsyncMock(return_value=detected)
+        wf._detect_committed_branch_work = detector  # type: ignore[method-assign]
+
+        await wf._plan()
+
+        assert detector.await_count == 1, (
+            f'Expected exactly one detector await, got {detector.await_count}'
+        )
+        build.assert_awaited()
+        kwargs = build.call_args.kwargs
+        assert kwargs.get('committed_work') == detected, (
+            f'Expected the detector list forwarded as committed_work, got {kwargs}'
+        )
+
+    async def test_empty_detection_is_forwarded_without_crashing(self, tmp_path):
+        wf, build = _make_plan_workflow(tmp_path)
+        wf._detect_committed_branch_work = AsyncMock(return_value=[])  # type: ignore[method-assign]
+
+        await wf._plan()
+
+        build.assert_awaited()
+        assert build.call_args.kwargs.get('committed_work') == []
+
+    async def test_detector_failure_does_not_sink_plan(self, tmp_path):
+        """Best-effort: a raising detector must still leave PLAN running."""
+        wf, build = _make_plan_workflow(tmp_path)
+        wf._detect_committed_branch_work = AsyncMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError('detector exploded'),
+        )
+
+        await wf._plan()
+
+        build.assert_awaited()
+        assert wf._invoke.await_count >= 1, (  # type: ignore[attr-defined]
+            'A detector failure must not prevent the architect invocation'
+        )
