@@ -27,8 +27,50 @@ from orchestrator.verify_cmd import (
     reproject,
     scope_to,
     serial_pytest,
+    split_chain_tail,
+    split_top_level_and,
     strip_cwd,
     with_junitxml,
+)
+
+# ---------------------------------------------------------------------------
+# Real config command strings, verbatim from the repo's orchestrator configs.
+# These are the corpus `split_chain_tail`'s gate must classify correctly: the
+# lint chains are SIBLING-CHECKER chains (accept, preserve the tail); the root
+# type/test chains are cwd-sequenced same-tool fan-outs (reject, keep today's
+# truncation).
+# ---------------------------------------------------------------------------
+
+# fused-memory/orchestrator.yaml:11
+_FM_LINT_COMMAND = (
+    'uv run --project fused-memory --directory fused-memory ruff check src/ tests/'
+    ' && python3 fused-memory/scripts/check_bare_magicmock_config.py fused-memory/tests'
+    ' && python3 fused-memory/scripts/check_asyncmock_assertion_style.py fused-memory/tests'
+)
+
+# dark-factory-orchestrator.yaml:50
+_ROOT_LINT_COMMAND = (
+    'uv run ruff check shared escalation fused-memory orchestrator dashboard'
+    ' && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests'
+    ' escalation/tests fused-memory/tests orchestrator/tests dashboard/tests'
+)
+
+# dark-factory-orchestrator.yaml:51
+_ROOT_TYPE_CHECK_COMMAND = (
+    'cd fused-memory && npx pyright && cd ../orchestrator && npx pyright'
+    ' && cd ../dashboard && npx pyright'
+)
+
+# dark-factory-orchestrator.yaml:41
+_ROOT_TEST_COMMAND = (
+    'cd shared && uv run pytest tests/ --timeout=300'
+    ' && cd ../escalation && uv run pytest tests/ --timeout=300'
+    ' && cd ../orchestrator && uv run pytest tests/ --timeout=300'
+    ' && cd ../fused-memory && uv run pytest tests/ --timeout=300'
+    ' && cd ../dashboard && uv run pytest tests/ --timeout=300'
+    ' && cd ../sampler && uv run pytest tests/ --timeout=300'
+    ' && cd .. && ( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/ --timeout=300 )'
+    ' && uv run --project shared pytest tests/scripts/ --timeout=300'
 )
 
 
@@ -891,3 +933,244 @@ class TestRenderInvariantAsserts:
         assert cmd.cwd_rel is None
         assert cmd.targets == ()
         render(cmd)  # must not raise
+
+
+class TestSplitTopLevelAnd:
+    """split_top_level_and(raw) splits on `&&` only at shell quote depth 0.
+
+    Segments are returned VERBATIM — interior and boundary whitespace is
+    untouched — so a caller can re-emit the tail byte-for-byte rather than
+    re-rendering it. A quoted `&&` (single or double) is NOT a split point:
+    it is an argument value (e.g. pytest's `-k 'a && b'`), not a shell chain
+    operator, and splitting there would corrupt the expression.
+    """
+
+    @pytest.mark.parametrize(
+        ('raw', 'expected'),
+        [
+            ('a && b && c', ['a ', ' b ', ' c']),
+            ("pytest -k 'a && b' tests/", ["pytest -k 'a && b' tests/"]),
+            ('ruff check "x && y"', ['ruff check "x && y"']),
+            ('ruff check src/ --select E', ['ruff check src/ --select E']),
+            ('', ['']),
+            (
+                'uv run ruff check f.py && python3 check.py',
+                ['uv run ruff check f.py ', ' python3 check.py'],
+            ),
+        ],
+        ids=[
+            'three-segments-verbatim-whitespace',
+            'single-quoted-and-is-not-a-split-point',
+            'double-quoted-and-is-not-a-split-point',
+            'no-and-single-segment',
+            'empty-string',
+            'two-segments',
+        ],
+    )
+    def test_segments(self, raw, expected):
+        assert split_top_level_and(raw) == expected
+
+    @pytest.mark.parametrize(
+        'raw',
+        [
+            'a && b && c',
+            "pytest -k 'a && b' tests/",
+            'ruff check "x && y"',
+            'ruff check src/ --select E',
+            '',
+            _FM_LINT_COMMAND,
+            _ROOT_LINT_COMMAND,
+            _ROOT_TYPE_CHECK_COMMAND,
+            _ROOT_TEST_COMMAND,
+        ],
+        ids=[
+            'three-segments',
+            'single-quoted-and',
+            'double-quoted-and',
+            'no-and',
+            'empty-string',
+            'fm-lint',
+            'root-lint',
+            'root-type-check',
+            'root-test',
+        ],
+    )
+    def test_round_trip_reconstructs_input(self, raw):
+        """The segments are a lossless decomposition: re-joining on `&&` is exact.
+
+        Equivalently, ``''.join(segments)`` is the input minus exactly its
+        top-level `&&` separators — no other byte is consumed or rewritten,
+        which is what lets a caller re-emit the tail verbatim.
+        """
+        segments = split_top_level_and(raw)
+        assert '&&'.join(segments) == raw
+        assert len(''.join(segments)) == len(raw) - 2 * (len(segments) - 1)
+
+
+class TestSplitChainTail:
+    """split_chain_tail(raw, keyword) -> (prefix, tail): the tail-preservation gate.
+
+    ACCEPT (a sibling-checker chain) returns ``(segments[0], tail)`` where
+    ``tail`` is every byte of *raw* after segment 0 — so it carries its own
+    leading `&&` and ``prefix + tail == raw`` exactly.
+
+    REJECT returns ``(raw, '')`` — deliberately the WHOLE original string, so
+    the caller's existing truncate-at-keyword algorithm runs on an untouched
+    input and its output stays byte-identical to today's by construction.
+    Rejecting to ``(segments[0], '')`` would silently truncate, which is the
+    very class of bug this gate exists to fix.
+    """
+
+    @pytest.mark.parametrize(
+        ('raw', 'keyword'),
+        [
+            (_FM_LINT_COMMAND, 'ruff check'),
+            (_ROOT_LINT_COMMAND, 'ruff check'),
+            ('ruff check src/ --select E', 'ruff check'),
+            (_ROOT_TYPE_CHECK_COMMAND, 'pyright'),
+            (
+                'uv run --project a ruff check src/ && uv run --project b ruff check src/',
+                'ruff check',
+            ),
+            ('echo hi && ruff check src/ && python3 x.py', 'ruff check'),
+            (_ROOT_TEST_COMMAND, 'pytest'),
+            ('ruff check "unterminated && python3 x.py', 'ruff check'),
+            ("ruff check -k 'a && b' src/ && python3 x.py", 'ruff check'),
+        ],
+        ids=[
+            'accept-fm-lint',
+            'accept-root-lint',
+            'reject-no-and',
+            'reject-cd-token',
+            'reject-keyword-in-two-segments',
+            'reject-keyword-absent-from-segment-0',
+            'reject-non-and-chain-operator',
+            'reject-unbalanced-quote',
+            'quoted-and-inside-segment-0',
+        ],
+    )
+    def test_prefix_plus_tail_is_always_the_original(self, raw, keyword):
+        """Invariant holding on BOTH dispositions — the gate never loses a byte."""
+        prefix, tail = split_chain_tail(raw, keyword)
+        assert prefix + tail == raw
+
+    def test_accepts_fused_memory_lint_chain_and_preserves_both_checkers(self):
+        """The task's headline case: fused-memory/orchestrator.yaml:11.
+
+        The ruff clause is segment 0 (the caller will scope it); both
+        `python3 .../check_*.py` sibling clauses live in the preserved tail,
+        byte-identical to their slice of the config string.
+        """
+        prefix, tail = split_chain_tail(_FM_LINT_COMMAND, 'ruff check')
+        assert prefix == (
+            'uv run --project fused-memory --directory fused-memory ruff check src/ tests/ '
+        )
+        assert tail == (
+            '&& python3 fused-memory/scripts/check_bare_magicmock_config.py fused-memory/tests'
+            ' && python3 fused-memory/scripts/check_asyncmock_assertion_style.py fused-memory/tests'
+        )
+        assert tail == _FM_LINT_COMMAND[len(prefix):]
+
+    def test_accepts_root_lint_chain(self):
+        """dark-factory-orchestrator.yaml:50 — one sibling checker clause."""
+        prefix, tail = split_chain_tail(_ROOT_LINT_COMMAND, 'ruff check')
+        assert prefix == 'uv run ruff check shared escalation fused-memory orchestrator dashboard '
+        assert tail == (
+            '&& python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests'
+            ' escalation/tests fused-memory/tests orchestrator/tests dashboard/tests'
+        )
+
+    @pytest.mark.parametrize(
+        ('raw', 'keyword'),
+        [
+            ('ruff check src/ --select E', 'ruff check'),
+            (_ROOT_TYPE_CHECK_COMMAND, 'pyright'),
+            (
+                'uv run --project a ruff check src/ && uv run --project b ruff check src/',
+                'ruff check',
+            ),
+            ('echo hi && ruff check src/ && python3 x.py', 'ruff check'),
+            (_ROOT_TEST_COMMAND, 'pytest'),
+            ('ruff check "unterminated && python3 x.py', 'ruff check'),
+            ('mypy src/', 'ruff check'),
+            ('true', 'ruff check'),
+            ('ruff check $(git ls-files && echo x) && python3 y.py', 'ruff check'),
+            ('ruff check `ls && echo x` && python3 y.py', 'ruff check'),
+            ('(ruff check src/ && echo x) && python3 y.py', 'ruff check'),
+            ('ruff check "$(ls && echo x)" && python3 y.py', 'ruff check'),
+        ],
+        ids=[
+            'no-and-at-all',
+            'cd-token-shell-cwd-sequencing',
+            'keyword-in-more-than-one-segment',
+            'keyword-absent-from-segment-0',
+            'non-and-chain-operator',
+            'unbalanced-quote-shlex-raises',
+            'keyword-absent-entirely',
+            'no-op-command',
+            'command-substitution-dollar-paren',
+            'command-substitution-backtick',
+            'unspaced-subshell-parens',
+            'substitution-nested-in-double-quotes',
+        ],
+    )
+    def test_rejects_return_whole_raw_and_empty_tail(self, raw, keyword):
+        """Every reject disposition is ``(raw, '')`` — never a truncated prefix."""
+        assert split_chain_tail(raw, keyword) == (raw, '')
+
+    @pytest.mark.parametrize(
+        'raw',
+        [
+            'ruff check $(git ls-files && echo x) && python3 y.py',
+            'ruff check `ls && echo x` && python3 y.py',
+            '(ruff check src/ && echo x) && python3 y.py',
+            'ruff check "$(ls && echo x)" && python3 y.py',
+        ],
+        ids=['dollar-paren', 'backtick', 'unspaced-subshell', 'dquoted-substitution'],
+    )
+    def test_nested_and_inside_a_shell_construct_is_never_a_split_point(self, raw):
+        """An `&&` hiding inside `$(...)`, backticks or `(...)` must not be lifted.
+
+        ``_NON_AND_CHAIN_TOKENS`` is token-EQUALITY based, so it only catches a
+        paren ``shlex`` isolated as its own whitespace-separated token. These
+        four inputs slip past it, yet ``split_top_level_and`` (quote state only)
+        happily splits at the nested `&&` — and the shlex cross-check agrees
+        with it on the count, so nothing downstream catches it either. Carrying
+        a tail out of one truncates the head mid-construct and emits an
+        unbalanced shell string (a stray `)` / an unpaired backtick), which is
+        a bash syntax error: a spurious RED verify, strictly worse than the
+        missed sibling checker this whole gate exists to fix. Reject is the
+        only safe disposition — it restores the exact pre-gate output.
+        """
+        assert split_chain_tail(raw, 'ruff check') == (raw, '')
+
+    def test_literal_paren_inside_double_quotes_is_not_a_shell_construct(self):
+        """A quoted paren is inert text, so it must NOT trip the grouping gate.
+
+        Guards the conservative character scan against over-rejection: only a
+        substitution (``$(`` / backtick) is active inside double quotes, and a
+        bare ``(`` there — a ``-k`` selector expression is the real case — is
+        literal. This chain is a legitimate sibling-checker chain and must
+        still ACCEPT.
+        """
+        raw = 'ruff check --config "lint(x)" src/ && python3 y.py'
+        prefix, tail = split_chain_tail(raw, 'ruff check')
+        assert prefix == 'ruff check --config "lint(x)" src/ '
+        assert tail == '&& python3 y.py'
+        assert prefix + tail == raw
+
+    def test_quoted_and_in_segment_zero_is_never_corrupted(self):
+        """A quoted `&&` inside the keyword segment must survive intact.
+
+        The gate cross-checks the quote-aware splitter against
+        ``shlex.split``'s `&&` token count precisely so a quoted `&&` can
+        never be mistaken for a split point. Whatever disposition is taken,
+        segment 0's quoted expression must come back byte-identical.
+        """
+        raw = "ruff check -k 'a && b' src/ && python3 x.py"
+        prefix, tail = split_chain_tail(raw, 'ruff check')
+        assert "-k 'a && b'" in prefix
+        assert prefix + tail == raw
+        # ACCEPT: only the unquoted `&&` is a split point.
+        assert prefix == "ruff check -k 'a && b' src/ "
+        assert tail == '&& python3 x.py'

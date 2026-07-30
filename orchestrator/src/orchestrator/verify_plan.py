@@ -16,7 +16,15 @@ from enum import Enum, StrEnum
 from typing import Literal
 
 from orchestrator.config import ModuleConfig, OrchestratorConfig
-from orchestrator.verify_cmd import ToolKind, VerifyCmd, parse_config_command, scope_to, strip_cwd
+from orchestrator.verify_cmd import (
+    ToolKind,
+    VerifyCmd,
+    parse_config_command,
+    render,
+    scope_to,
+    split_chain_tail,
+    strip_cwd,
+)
 
 
 class FileKind(Enum):
@@ -212,41 +220,60 @@ def _scope_prefix_to_keyword(raw: str, keyword: str, files: list[str]) -> Verify
     The ``VerifyCmd``-layer counterpart of ``verify._scope_to_keyword`` (which
     operates on — and returns — a shell string): this returns a ``VerifyCmd``
     instead, since ``PlannedRun.cmd`` stores structured commands, not strings.
-    The two scopers run the IDENTICAL algorithm (true algorithmic lockstep —
-    a future change to one's scoping rule must update the other): *raw* is
-    ALWAYS truncated to everything up to and including the first occurrence
-    of *keyword* before being (re-)parsed, regardless of whether the
-    untruncated *raw* would itself have parsed as one structured command or a
-    raw-retained chain. This means content positioned after the matched
-    *keyword* occurrence — including any flags trailing the target on an
-    otherwise single-clause command, or any further ``&&``-chained clause —
-    is intentionally dropped, exactly as ``_scope_to_keyword`` drops it: a
-    value-taking flag after the target (e.g. ``'ruff check src/ --select
-    E'``) would otherwise have its value misread as an extra target by
-    ``scope_to``, so truncating first — not scoping the whole parsed command
-    — is what keeps this safe as well as byte-identical.
+    Lockstep between the two is now STRUCTURAL rather than a convention kept
+    by hand — both route through the single shared
+    ``verify_cmd.split_chain_tail`` gate, so neither can drift from the
+    other's tail-preservation rule.
+
+    Within the matched segment, *raw* is ALWAYS truncated to everything up to
+    and including the first occurrence of *keyword* before being (re-)parsed,
+    regardless of whether the untruncated segment would itself have parsed as
+    one structured command. Any flags trailing the target are therefore
+    dropped: a value-taking flag after the target (e.g. ``'ruff check src/
+    --select E'``) would otherwise have its value misread as an extra target
+    by ``scope_to``, so truncating first — not scoping the whole parsed
+    command — is what keeps this safe as well as byte-identical.
+
+    A trailing ``&&``-chained clause is decided by the gate, not by that
+    truncation. A SIBLING CHECKER (a different tool, no ``cd`` sequencing —
+    every subproject's ``lint_command`` chains a ``python3 .../check_*.py
+    <dir>`` gate after ``ruff check``) is PRESERVED unscoped and verbatim,
+    because it asserts a whole-directory invariant that narrowing would
+    break. A SAME-TOOL FAN-OUT (the root config's ``cd X && npx pyright``
+    chain) is still dropped: preserving it would run two more subprojects
+    unscoped AND leave a ``cd ../orchestrator`` that misresolves once
+    ``strip_cwd`` has removed the leading ``cd``.
 
     If the *keyword*-prefix parses into a structured, non-OPAQUE command, it
-    is scoped to *files* (first-clause scoped, every trailing ``&&``-chained
-    clause dropped). *keyword* absent from *raw*, or the prefix not parsing
-    into one recognised structured invocation (P1), leaves *raw* untouched:
-    the returned ``VerifyCmd`` is forced raw-retained (``raw=raw``) so
-    rendering it reproduces *raw* byte-for-byte even when *raw* itself would
-    otherwise have parsed into a structured command — a from-scratch render
-    of which is only argv-equivalent, not guaranteed byte-identical, to the
-    original string (e.g. a ``--directory`` flag renders back as a leading
-    ``cd``).
+    is scoped to *files*. When a tail was preserved the result is returned
+    raw-retained — ``VerifyCmd(tool=<scoped tool>, raw=render(scoped) +
+    tail)`` — the same shape both bail-outs below already produce, which
+    ``render`` reproduces byte-for-byte. The real ``ToolKind`` is kept rather
+    than OPAQUE so ``run.cmd.tool`` stays meaningful downstream.
+
+    *keyword* absent from *raw*, or the prefix not parsing into one
+    recognised structured invocation (P1), leaves *raw* untouched: the
+    returned ``VerifyCmd`` is forced raw-retained (``raw=raw`` — the full
+    original, never the gate's head) so rendering it reproduces *raw*
+    byte-for-byte even when *raw* itself would otherwise have parsed into a
+    structured command — a from-scratch render of which is only
+    argv-equivalent, not guaranteed byte-identical, to the original string
+    (e.g. a ``--directory`` flag renders back as a leading ``cd``).
     """
     parsed = parse_config_command(raw)
     unscoped = parsed if parsed.raw is not None else VerifyCmd(tool=parsed.tool, raw=raw)
 
-    idx = raw.find(keyword)
+    head, tail = split_chain_tail(raw, keyword)
+    idx = head.find(keyword)
     if idx == -1:
         return unscoped
-    prefix_parsed = parse_config_command(raw[: idx + len(keyword)])
+    prefix_parsed = parse_config_command(head[: idx + len(keyword)])
     if prefix_parsed.tool is ToolKind.OPAQUE or prefix_parsed.raw is not None:
         return unscoped
-    return strip_cwd(scope_to(prefix_parsed, files))
+    scoped = strip_cwd(scope_to(prefix_parsed, files))
+    if not tail:
+        return scoped
+    return VerifyCmd(tool=scoped.tool, raw=f'{render(scoped)} {tail}')
 
 
 def _derive_module_runs(

@@ -54,6 +54,7 @@ from orchestrator.verify_cmd import (
     reproject,
     scope_to,
     serial_pytest,
+    split_chain_tail,
     strip_cwd,
     with_junitxml,
     with_pytest_timeout,
@@ -141,22 +142,41 @@ def _scope_to_keyword(cmd: str | None, keyword: str, files: list[str]) -> str | 
     (P1 — an OPAQUE or raw-retained/unparseable prefix is left untouched
     rather than truncated into a possibly-broken argv).
 
-    Content after the matched *keyword* occurrence — including any further
-    ``&&``-chained clause — is intentionally dropped: scoping to specific
-    files means running the tool once against them, not once per chained
-    segment (dark_factory's real per-subproject ``type_check_command`` /
-    ``lint_command`` chain multiple ``cd X && TOOL`` segments; scoping runs
-    only the first, matching the historical behaviour).
+    Content after the matched *keyword* occurrence is truncated WITHIN the
+    matched segment: a value-taking flag positioned after the target (e.g.
+    ``'ruff check src/ --select E'``) would otherwise have its value misread
+    as an extra target by ``scope_to``, so truncating first is what keeps
+    this safe.
+
+    A trailing ``&&``-chained clause is a separate question, decided by
+    ``verify_cmd.split_chain_tail``: a SIBLING CHECKER (a different tool, no
+    ``cd`` sequencing — every subproject's ``lint_command`` chains a
+    ``python3 .../check_*.py <dir>`` gate after ``ruff check``) is PRESERVED
+    unscoped and verbatim, because it asserts a whole-directory invariant
+    that narrowing would break; a SAME-TOOL FAN-OUT (the root config's ``cd X
+    && npx pyright`` chain) is still dropped, since preserving it would run
+    two more subprojects unscoped AND leave a ``cd ../orchestrator`` that
+    misresolves once ``strip_cwd`` has removed the leading ``cd``.
+
+    Lockstep with ``verify_plan._scope_prefix_to_keyword`` (the ``VerifyCmd``-
+    layer counterpart) is now STRUCTURAL rather than a convention: both route
+    through that one shared ``split_chain_tail`` gate. When the gate rejects,
+    ``head is cmd`` and ``tail == ''``, so the body below collapses to its
+    pre-gate form byte-for-byte. Both bail-outs return *cmd* — the full
+    original, never ``head`` — so a gate-accepted command can never be
+    silently truncated on the unparseable path.
     """
     if cmd is None:
         return None
-    idx = cmd.find(keyword)
+    head, tail = split_chain_tail(cmd, keyword)
+    idx = head.find(keyword)
     if idx == -1:
         return cmd
-    parsed = parse_config_command(cmd[: idx + len(keyword)])
+    parsed = parse_config_command(head[: idx + len(keyword)])
     if parsed.tool is ToolKind.OPAQUE or parsed.raw is not None:
         return cmd
-    return render(strip_cwd(scope_to(parsed, files)))
+    rendered = render(strip_cwd(scope_to(parsed, files)))
+    return f'{rendered} {tail}' if tail else rendered
 
 
 def _reproject_str(cmd: str | None, project: str) -> str | None:
@@ -167,13 +187,58 @@ def _reproject_str(cmd: str | None, project: str) -> str | None:
     no-op when *cmd* is ``None`` or does not parse into a structured,
     non-OPAQUE VerifyCmd (covers ``'true'``/``mypy``-based commands, which
     ``reproject`` would never touch anyway).
+
+    A gated trailing ``&&``-chained clause is carried through VERBATIM and is
+    NOT itself reprojected — it is a sibling checker, not a uv invocation
+    (see ``split_chain_tail``). Without this, a chain reaching here would
+    re-parse as OPAQUE and the ``--project`` injection would be SILENTLY
+    dropped; per the fallback path's own comment (and task 2036) the depless
+    workspace-root project cannot spawn ruff/pyright, so that is an exit-127
+    breakage rather than a cosmetic diff.
+
+    The gate is driven with the keyword ``'uv run'`` because that is exactly
+    the head phrase ``reproject`` rewrites: "the thing I am about to rewrite
+    lives in segment 0, appears in no later segment, and there is no ``cd``
+    sequencing" is precisely the right admission test here too. When the gate
+    rejects, ``head is cmd`` and ``tail == ''``, so the body below collapses
+    to its pre-gate form byte-for-byte. All three bail-outs return *cmd* —
+    the full original, never ``head`` — so a rejected command can never be
+    silently truncated.
+
+    A tail is carried ONLY when the parsed head has no ``cwd_rel``, because
+    ``render()`` re-emits ``cwd_rel`` as a leading ``cd X &&`` — a cwd shift
+    the preserved tail was never written for. ``split_chain_tail``'s
+    ``cd``-TOKEN rejection cannot see it: that gate inspects the INPUT
+    string, where the shift is still spelled ``--directory X``. All seven
+    module ``lint_command``s are exactly that shape, and the introduced
+    ``cd fused-memory &&`` would make their tail's
+    ``fused-memory/scripts/check_*.py`` resolve as
+    ``fused-memory/fused-memory/scripts/...`` (exit 2) — a spurious RED
+    verify on a clean tree.
+
+    The bail forfeits nothing: ``reproject`` is a documented no-op when
+    ``cwd_rel is not None`` ("an explicit ``--directory`` is already set"),
+    so in exactly the bailed case the discarded expression was a pure
+    re-render with no ``--project`` injection to lose. Note this asymmetry
+    against the two scopers: they apply ``strip_cwd``, so their ``cwd_rel``
+    is always already ``None`` at render time and neither needs this guard.
+    ``strip_cwd`` is deliberately NOT used here — unlike the scopers, which
+    re-target to worktree-root-relative files, this helper acts on an
+    unscoped/bail-through command whose ``--directory`` is load-bearing (it
+    selects the directory ruff/pyright run in and find their config from).
+    Bail, do not rewrite. Guarding on *tail* first keeps the pre-existing
+    no-tail ``--directory`` -> ``cd`` renormalisation byte-identical.
     """
     if cmd is None:
         return None
-    parsed = parse_config_command(cmd)
+    head, tail = split_chain_tail(cmd, 'uv run')
+    parsed = parse_config_command(head)
     if parsed.tool is ToolKind.OPAQUE or parsed.raw is not None:
         return cmd
-    return render(reproject(parsed, project))
+    if tail and parsed.cwd_rel is not None:
+        return cmd
+    rendered = render(reproject(parsed, project))
+    return f'{rendered} {tail}' if tail else rendered
 
 
 def _cargo_scope_str(cmd: str | None, crates: list[str]) -> str | None:

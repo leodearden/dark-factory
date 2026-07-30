@@ -4826,6 +4826,17 @@ class TestBuildFallbackConfigWithNonDefaultCommands:
         this test appended a synthetic ``--config <path>`` the real config
         does not have, which ``_scope_command`` harvested as a dangling flag
         with its value dropped — masked by the startswith/contains asserts).
+
+        Task 3061: the trailing ``check_bare_magicmock_config.py`` clause is
+        now PRESERVED unscoped and verbatim — it is a sibling checker
+        asserting a whole-directory invariant, and dropping it made that gate
+        invisible to scoped pre-merge verify. The full-string assert still
+        does its original job: the tail survives as one intact clause, so a
+        flag harvested out of it into ruff's own argv would still fail here.
+        The reprojection assert is now doubly load-bearing — ``_reproject_str``
+        must inject ``--project shared`` into the head DESPITE the appended
+        tail, or the depless-workspace-root breakage this test guards would
+        return by a different route.
         """
         cfg = self._make_config(
             tmp_path,
@@ -4839,9 +4850,11 @@ class TestBuildFallbackConfigWithNonDefaultCommands:
         )
         result = _build_fallback_config(['tests/scripts/test_orchestrator_watchdog.py'], cfg)
         assert result is not None
-        assert (
-            result.lint_command
-            == 'uv run --project shared ruff check tests/scripts/test_orchestrator_watchdog.py'
+        assert result.lint_command == (
+            'uv run --project shared ruff check tests/scripts/test_orchestrator_watchdog.py'
+            ' && python3 fused-memory/scripts/check_bare_magicmock_config.py '
+            'shared/tests escalation/tests fused-memory/tests orchestrator/tests '
+            'dashboard/tests'
         )
 
 
