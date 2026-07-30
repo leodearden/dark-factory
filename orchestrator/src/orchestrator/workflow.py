@@ -3201,14 +3201,26 @@ class TaskWorkflow:
         plan/execute/verify/review (zero reviewer_comprehensive; ``merge_queued``
         is the next pipeline event, matching the observable signal).
 
+        A HEAD match alone is NOT sufficient (task 3024): it proves only that
+        the branch has not MOVED, not that it still MERGES. Main advancing
+        underneath an unchanged branch can introduce a rebase conflict, and the
+        fast-path would then hand an empty ``plan.files`` workflow to the merge
+        phase — tripping the merge-entry scope invariant on every dispatch, in a
+        loop no escalation action could break. So the resume preconditions also
+        require that the branch STILL cleanly merges onto current main, probed
+        object-store-only via :meth:`GitOps.merge_tree_conflicts`.
+
         Fail-safe fall-through to the full pipeline (returns ``None``) on a
-        missing/non-dict stamp, a rev-parse failure, or a HEAD mismatch. On a
-        mismatch it additionally clears the now-stale stamp — main advanced and
-        the branch was rebased to new SHAs, so it can never match again, and
-        resubmitting possibly-divergent code is exactly what we must avoid.
-        Clear-on-consume is idempotent and loop-safe: if the resumed merge
-        re-blocks and the steward resolves again, ``_requeue`` re-stamps a fresh
-        obligation.
+        missing/non-dict stamp, a rev-parse failure, a HEAD mismatch, or a
+        confirmed conflict. On a mismatch it additionally clears the now-stale
+        stamp — main advanced and the branch was rebased to new SHAs, so it can
+        never match again, and resubmitting possibly-divergent code is exactly
+        what we must avoid. A confirmed conflict likewise clears: that
+        obligation can never be satisfied as stamped, and the full pipeline
+        gives an agent the chance to rebase and resolve (or fail as an ordinary
+        task_failure). Clear-on-consume is idempotent and loop-safe: if the
+        resumed merge re-blocks and the steward resolves again, ``_requeue``
+        re-stamps a fresh obligation.
         """
         stamp = (self.task.get('metadata') or {}).get('merge_retry_pending')
         if not isinstance(stamp, dict):
@@ -3236,6 +3248,22 @@ class TaskWorkflow:
                 'Task %s: merge_retry_pending branch_head %s != current HEAD %s '
                 '(main advanced / branch rebased) — clearing stale stamp, '
                 'running full pipeline', self.task_id, stamped_head, current_head,
+            )
+            await self._clear_merge_retry_pending()
+            return None
+        # The branch has not MOVED — but has it stopped MERGING?  Main may have
+        # advanced underneath it since the steward resolved, introducing a
+        # rebase conflict.  Resuming straight to merge with an empty plan.files
+        # would then trip the merge-entry scope invariant on every dispatch
+        # (task 3024), so probe the merge before honouring the fast-path.
+        main_sha = await self.git_ops.get_main_sha()
+        probe = await self.git_ops.merge_tree_conflicts(main_sha, current_head)
+        if not probe.clean:
+            logger.warning(
+                'Task %s: merge_retry_pending branch %s no longer merges cleanly '
+                'onto current main %s (conflicts: %s) — resume preconditions '
+                'void, clearing stamp and running full pipeline',
+                self.task_id, current_head, main_sha, probe.conflicted_paths,
             )
             await self._clear_merge_retry_pending()
             return None
