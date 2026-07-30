@@ -9,12 +9,12 @@ import logging
 import os
 import random
 import shutil
-import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from test_config_dir import PROBE_PREFIX, find_dead_pid, plant
 
 from shared.cli_invoke import AgentResult
 from shared.config_dir import CONFIG_DIR_PREFIX, TaskConfigDir
@@ -72,6 +72,36 @@ def make_mock_cost_store() -> AsyncMock:
     store = AsyncMock()
     store.save_account_event = AsyncMock(return_value=None)
     return store
+
+
+@pytest.fixture
+def real_probe_dir_sweep():
+    """Opt out of the module-wide sweep neutralizer below (task 3086).
+
+    Request this from any test that must exercise the real sweep. Such a test
+    is responsible for redirecting the sweep away from the real /tmp — e.g.
+    ``patch('shared.config_dir.tempfile.gettempdir', return_value=str(tmp_path))``.
+    """
+    return True
+
+
+@pytest.fixture(autouse=True)
+def _keep_gates_off_the_real_tmp(request):
+    """Neutralize the probe-dir sweep for every gate built in this module.
+
+    ``UsageGate.__init__`` sweeps ``tempfile.gettempdir()`` (task 3086), so
+    the first real gate constructed in a pytest process would scandir the
+    developer's actual /tmp and delete real dead-PID probe dirs — a
+    multi-second stall inside a unit test, and a mutation no test asked for.
+    Defaulting it off also removes the ordering coupling that the process-wide
+    ``_probe_dir_sweep_done`` guard would otherwise create between test
+    classes. Tests that want the real thing request ``real_probe_dir_sweep``.
+    """
+    if 'real_probe_dir_sweep' in request.fixturenames:
+        yield
+        return
+    with patch('shared.usage_gate.sweep_stale_pid_dirs', return_value=0):
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -801,33 +831,12 @@ class TestProbeConfigDirIsolation:
 # construction is the bound that survives SIGKILL.
 # ---------------------------------------------------------------------------
 
-PROBE_DIR_PREFIX = CONFIG_DIR_PREFIX + 'usage-gate-probe-'
-
-
-def _find_dead_pid() -> int:
-    """Return a PID that is definitively not alive right now.
-
-    Scanned rather than hard-coded: a recycled literal would silently turn a
-    "dead PID" case into a live one and flip the assertion.
-    """
-    for candidate in range(999_000, 999_000 + 5000):
-        try:
-            os.kill(candidate, 0)
-        except ProcessLookupError:
-            return candidate
-        except OSError:  # PermissionError -> visible, i.e. alive
-            continue
-    raise RuntimeError('could not find a dead PID to test against')
-
-
-def _plant_probe_dir(base: Path, name: str) -> Path:
-    """Create a credential-bearing dir aged past the sweep's min-age floor."""
-    path = base / name
-    path.mkdir(parents=True, exist_ok=True)
-    (path / '.credentials.json').write_text('{}')
-    old = time.time() - 3600.0
-    os.utime(path, (old, old))
-    return path
+# The prefix and the dead-PID / dir-planting helpers are defined once, in the
+# suite that owns the sweep primitive itself. Two copies would let the two
+# suites drift apart about what "stale" means — e.g. one picking up an aging
+# tweak when min_age_secs changes and the other not. Cross-test-module imports
+# are the established pattern here (shared/tests is on sys.path via conftest).
+PROBE_DIR_PREFIX = PROBE_PREFIX
 
 
 class TestProbeConfigDirLeakSweep:
@@ -878,6 +887,24 @@ class TestProbeConfigDirLeakSweep:
         """Tmp hygiene must never be able to fail orchestrator startup."""
         with caplog.at_level(logging.WARNING, logger='shared.usage_gate'), \
                 patch('shared.usage_gate.sweep_stale_pid_dirs', side_effect=OSError('boom')):
+            gate = make_gate(['work'])
+
+        assert gate._accounts
+        assert gate._probe_config_dirs['work'].path.exists()
+        assert any(r.levelno >= logging.WARNING for r in caplog.records)
+
+    def test_non_oserror_sweep_failure_cannot_break_gate_construction(self, caplog):
+        """The realistic escapee is NOT an OSError.
+
+        sweep_stale_pid_dirs already contains OSError internally, so anything
+        that actually reaches UsageGate's guard is an unforeseen failure — a
+        future bug, a pathological tree, a mocked side effect in a sibling
+        suite. Letting one escape would fail orchestrator and recon-harness
+        startup, which is strictly worse than a leaked /tmp dir.
+        """
+        with caplog.at_level(logging.WARNING, logger='shared.usage_gate'), \
+                patch('shared.usage_gate.sweep_stale_pid_dirs',
+                      side_effect=RuntimeError('unforeseen')):
             gate = make_gate(['work'])
 
         assert gate._accounts
@@ -942,20 +969,23 @@ class TestProbeConfigDirLeakSweep:
 
     # -- end to end: the plateau cannot rebuild --
 
-    def test_gate_construction_reclaims_real_ghost_dirs(self, tmp_path, caplog):
+    def test_gate_construction_reclaims_real_ghost_dirs(
+        self, tmp_path, caplog, real_probe_dir_sweep,
+    ):
         """The whole fix, exercised against a real (redirected) tmp dir.
 
-        Patching shared.config_dir.tempfile.gettempdir redirects BOTH
-        TaskConfigDir and the sweep's default base to tmp_path, so this never
-        touches the real /tmp.
+        Requests `real_probe_dir_sweep` to opt out of the module-wide
+        neutralizer. Patching shared.config_dir.tempfile.gettempdir then
+        redirects BOTH TaskConfigDir and the sweep's default base to tmp_path,
+        so this never touches the real /tmp.
         """
-        dead = _find_dead_pid()
+        dead = find_dead_pid()
         ghosts = [
-            _plant_probe_dir(tmp_path, f'{PROBE_DIR_PREFIX}ghost-{dead}'),
-            _plant_probe_dir(tmp_path, f'{PROBE_DIR_PREFIX}{dead}'),
+            plant(tmp_path, f'{PROBE_DIR_PREFIX}ghost-{dead}'),
+            plant(tmp_path, f'{PROBE_DIR_PREFIX}{dead}'),
         ]
-        live_sibling = _plant_probe_dir(tmp_path, f'{PROBE_DIR_PREFIX}alive-{os.getpid()}')
-        unrelated = _plant_probe_dir(tmp_path, f'{CONFIG_DIR_PREFIX}3086')
+        live_sibling = plant(tmp_path, f'{PROBE_DIR_PREFIX}alive-{os.getpid()}')
+        unrelated = plant(tmp_path, f'{CONFIG_DIR_PREFIX}3086')
 
         with caplog.at_level(logging.INFO, logger='shared.usage_gate'), \
                 patch('shared.config_dir.tempfile.gettempdir', return_value=str(tmp_path)):
@@ -979,7 +1009,9 @@ class TestProbeConfigDirLeakSweep:
             if r.levelno == logging.INFO and 'reclaim' in r.getMessage().lower()
         ]
         assert reclaim_logs, 'reclamation must be observable at INFO'
-        assert any('2' in msg for msg in reclaim_logs)
+        # Exact count, not a bare '2' substring — a loose match would pass on
+        # any unrelated digit a future message happens to carry.
+        assert any('reclaimed 2 stale probe config dir(s)' in msg for msg in reclaim_logs)
 
 
 # ---------------------------------------------------------------------------

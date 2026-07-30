@@ -113,8 +113,8 @@ def _sweep_stale_probe_dirs_once() -> int:
     dead-PID leftovers bounds the population, at
     (live processes x accounts).
 
-    Never raises: tmp hygiene must not be able to fail gate construction, and
-    therefore orchestrator startup.
+    Never raises — for ANY exception class, not just OSError: tmp hygiene must
+    not be able to fail gate construction, and therefore orchestrator startup.
     """
     global _probe_dir_sweep_done
     if _probe_dir_sweep_done:
@@ -133,7 +133,13 @@ def _sweep_stale_probe_dirs_once() -> int:
                 '(dead-PID sweep, task 3086)', reclaimed, _PROBE_DIR_PREFIX,
             )
         return reclaimed
-    except OSError:
+    except Exception:
+        # Deliberately broad. sweep_stale_pid_dirs already contains OSError
+        # internally, so anything that reaches here is an UNFORESEEN failure —
+        # a future bug, a pathological tree, a mocked side effect in a sibling
+        # suite. Letting it escape would fail UsageGate.__init__ and therefore
+        # orchestrator startup, which is strictly worse than leaving a stale
+        # /tmp dir behind. Logged at WARNING with a traceback, never silent.
         logger.warning(
             'UsageGate: stale probe-dir sweep of %s failed — continuing without it '
             '(the next process start retries)', _PROBE_DIR_PREFIX, exc_info=True,
