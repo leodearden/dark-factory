@@ -315,10 +315,67 @@ No waivers required.
    during β — additive either way.
 3. **Whether γ3's identity block also lands on the merge/halt tools** served by
    the same server, or only the escalation-semantic ones. Decide during γ3.
+
+   *Widened during α (task 3163): decide the whole degraded-read surface, not only
+   the merge/halt identity block.* α denies just the two escalation READ tools
+   (`DISALLOW_ESCALATION_READS`) — the ones the three incidents actually misread.
+   But the recon-wired server is built by
+   `reconciliation/harness.py::_start_escalation_server` (`:2011-2016`) as
+   `create_escalation_server(self._escalation_queue)` — queue positional only, so
+   `harness`, `merge_queue`, `event_store`, `orch_config` and
+   `merge_inflight_registry` all stay `None`. Measured standalone behaviour of the
+   still-reachable non-escalation reads:
+
+   | tool | standalone return | shape |
+   |---|---|---|
+   | `get_task_runtime_state` | `{'offline': False, 'tasks': []}` — `escalation/server.py:1674-1675` returns `TaskRuntimeSnapshot()`, whose defaults are `offline=False`, `tasks=[]` | **silent false absence** — positively asserts "online, nothing running" |
+   | `get_merge_queue` | `{'error': 'Merge queue not available — orchestrator not running'}` (`server.py:1693-1694`) | loud, self-describing |
+   | `get_merge_halt_status` | `{'wired': False, 'error': 'escalation server running standalone'}` (`server.py:1648-1649`) | loud, self-describing |
+
+   The merge/halt pair therefore already fails loudly and needs nothing beyond the
+   identity block. `get_task_runtime_state` is the outlier: it reproduces the exact
+   categorical-empty failure mode this PRD exists to close, since a stage reading
+   `tasks: []` as "no task is running" is the same inference the three incidents
+   made from `[]` — and it is worse than `[]`, because `offline: False` asserts the
+   snapshot is live. That stages reach for this server unprompted is not
+   hypothetical: OQ4 below records a live Stage-2 transcript calling
+   `mcp__escalation__merge_status` on its own initiative. So γ3 should decide
+   `get_task_runtime_state` explicitly — either give it the same
+   never-silently-empty treatment as the escalation reads (deny it to stages, or
+   make the standalone envelope declare itself unwired the way
+   `get_merge_halt_status` does), or record why an unconditional empty-but-live
+   snapshot is safe here. α covers this case verbally only, via the
+   `ESCALATION_BOUNDARY_NOTE` "serves the RECONCILIATION store only" sentence;
+   nothing mechanical does.
 4. **Does `--disallowed-tools` reject a denied MCP tool on call, or omit it from
-   the listing?** Not verified; `cli_invoke.py:1537` passes the list straight to
-   the CLI, and MCP tool names in these lists are production-proven
-   (`mcp__fused-memory__delete_entity`). α's signal and B8 are worded to hold
-   under either. If it turns out to be *omission*, α should additionally keep the
-   prompt paragraph so the agent understands the boundary rather than merely
-   finding the tool missing. Decide during α by inspecting one live stage spawn.
+   the listing?** **RESOLVED during α (task 3163): OMISSION.** A denied tool is
+   simply absent from the agent's visible tool set; there is no rejection event
+   and no error message.
+
+   *Method (reproducible).* Recon stages run in deferred-tools mode, so a stage
+   transcript carries the agent's visible tool set in its
+   `attachment.type == 'deferred_tools_delta'` → `addedNames` payload. Across
+   five live recon-stage transcripts under
+   `~/.claude/projects/-home-leo-src-dark-factory/`, the denied names are absent
+   from that listing and track each stage's disallow list exactly:
+
+   | transcript | stage | tools listed | absent from listing |
+   |---|---|---|---|
+   | `e8e4fe99`, `aaeeb70c` | 3 | 80 | builtins, `…__delete_entity`, `…__submit_task`, `…__add_memory`, `…__write_entity_standing_decision` |
+   | `e22890a3` | 1 | 93 | builtins, `…__submit_task` (memory writes present — matches STAGE1) |
+   | `ec23af49`, `43f8155c` | 2 | 100 | builtins, `…__write_entity_standing_decision` only |
+
+   *Consequence.* Because it is omission rather than rejection, the agent gets no
+   explanation for the missing tool — it would find the escalation surface simply
+   gone and could conclude it does not exist, or route around it. This is exactly
+   the branch anticipated above: α's prompt paragraph is therefore **load-bearing
+   and ships** (`ESCALATION_BOUNDARY_NOTE`, rendered into all three stage
+   prompts). Per G6 branch 4, α's user-observable signal and boundary test B8 are
+   NOT reworded into a rejection claim — they were written to hold under either
+   outcome, and this verdict is recorded as an annotation, not a rewrite.
+
+   *Two corroborating observations.* Both escalation read tools were PRESENT in
+   all five listings pre-change — direct evidence of the live bug α closes. And
+   one Stage-2 transcript (`ec23af49`) called `mcp__escalation__merge_status`
+   unprompted, evidencing that stages do reach for escalation-server tools on
+   their own initiative rather than only when instructed.

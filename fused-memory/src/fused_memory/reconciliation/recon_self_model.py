@@ -531,8 +531,13 @@ def render_source_completion_section(*, can_file_tasks: bool) -> str:
     The tool-holding recon stage ALREADY holds the memory-mutation tools
     (add_memory / delete_memory / merge_entities): per
     reconciliation/cli_stage_runner.py, DISALLOW_MEMORY_WRITES is folded into
-    STAGE3_DISALLOWED ONLY (STAGE1_DISALLOWED = DISALLOW_TASK_WRITES +
-    DISALLOW_BUILTIN; STAGE2_DISALLOWED = DISALLOW_BUILTIN). So both Stage 1 and
+    STAGE3_DISALLOWED ONLY — neither Stage 1 nor Stage 2 denies it.  That is the
+    only per-stage fact this section needs, so the composition of the three
+    STAGE*_DISALLOWED lists is deliberately NOT restated here: cli_stage_runner.py
+    owns them, they grow additively, and a mirrored inventory in a docstring goes
+    stale silently.  (Exactly that failure mode is what hid the Stage-2
+    escalation-read gap until task 3163 — read the lists at their source.)
+    So both Stage 1 and
     Stage 2 can COMPLETE safe memory merges inline instead of filing a task to
     ask someone else to do work they can already do — cutting the redundant
     relay-then-bounce class off at its origin — and file ONLY the residual

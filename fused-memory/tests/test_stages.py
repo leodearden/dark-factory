@@ -17,6 +17,7 @@ from fused_memory.models.reconciliation import StageId, StageReport, Watermark
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.cli_stage_runner import (
     DISALLOW_BUILTIN,
+    DISALLOW_ESCALATION_READS,
     DISALLOW_MEMORY_WRITES,
     DISALLOW_TASK_WRITES,
     STAGE1_DISALLOWED,
@@ -29,6 +30,12 @@ from fused_memory.reconciliation.cli_stage_runner import (
     _normalize_report,
     run_stage_via_cli,
 )
+from fused_memory.reconciliation.prompts import (
+    ESCALATION_BOUNDARY_NOTE,
+    render_escalation_boundary_note,
+)
+from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
 from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
 from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
@@ -74,6 +81,31 @@ def _extract_section(payload: str, header: str) -> str:
 def _scope(project_id: str, project_root: str) -> ProjectScope:
     """Build a ProjectScope from raw strings — DRYs the many test call sites."""
     return ProjectScope(ProjectId(project_id), ProjectRoot(project_root))
+
+
+def _mock_stage_deps() -> dict:
+    """Keyword deps for constructing any stage subclass in a unit test.
+
+    THE construction for the plain default case — no pre-configured mock returns,
+    no ``tmp_path`` root, the ``test_project`` / ``/tmp/test`` scope.  Every
+    ``mock_deps`` fixture in this module that wanted exactly that dict now returns
+    this helper, so a change to BaseStage's constructor signature lands in one
+    place for all of them.
+
+    Fixtures that legitimately differ still build their own dict and are NOT
+    covered by that claim: the ones that stub ``memory_service`` return values
+    (``count_memories_by_metadata``, ``delete_memory``, ``search``), the ones that
+    root ``explore_codebase_root`` at a ``tmp_path``, and the ones that need a
+    non-default scope (``reify``, ``origin``).  Reach for this helper when the
+    plain construction is what you want; don't bend a variant fixture into it.
+    """
+    return {
+        'memory_service': AsyncMock(),
+        'taskmaster': AsyncMock(),
+        'journal': AsyncMock(),
+        'config': ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test'),
+        'scope': _scope('test_project', '/tmp/test'),
+    }
 
 
 def make_configured_task_knowledge_sync_stage(
@@ -126,14 +158,30 @@ class TestDisallowedToolLists:
         for tool in DISALLOW_MEMORY_WRITES:
             assert tool not in STAGE1_DISALLOWED
 
-    def test_stage2_disallows_builtins_only(self):
-        """STAGE2_DISALLOWED must equal DISALLOW_BUILTIN.
+    def test_stage2_disallows_builtins_and_retains_write_access(self):
+        """Built-ins are blocked in Stage 2, and Stage 2 keeps memory + task writes.
 
-        Stage 2 has full memory + task access; only built-ins are blocked.
+        Named for what it asserts and nothing more: the Stage-2 half of the
+        escalation-read denial is pinned by
+        ``test_escalation_reads_denied_in_all_three_stages`` below, which is where
+        that property belongs (all three stages, one loop).  This test does not
+        restate it — a name promising coverage its body does not carry is how a
+        deleted guard goes unnoticed.
+
+        RETIRED ASSERTION: this test used to read ``STAGE2_DISALLOWED ==
+        DISALLOW_BUILTIN``.  That exact equality asserted the absence of EVERY
+        future denial class in Stage 2, and it is precisely the shape that kept
+        the ``mcp__escalation__*`` read gap invisible here — PRD §4 names
+        ``STAGE2_DISALLOWED = DISALLOW_BUILTIN`` as the mechanism of the bug
+        (task 3163).  The contract Stage 2 actually needs is now asserted
+        positively: built-ins denied, full memory + task access retained, so an
+        additive denial can land without failing the build for the right change.
         add_subtask was previously in a separate DISALLOW_SUBTASK_CREATE list,
         but the tool has been removed (DF-D).
         """
-        assert STAGE2_DISALLOWED == DISALLOW_BUILTIN
+        assert set(DISALLOW_BUILTIN).issubset(set(STAGE2_DISALLOWED))
+        for tool in DISALLOW_MEMORY_WRITES + DISALLOW_TASK_WRITES:
+            assert tool not in STAGE2_DISALLOWED, f'Stage 2 must retain write access to {tool}'
 
     def test_stage3_disallows_all_writes(self):
         assert set(DISALLOW_TASK_WRITES).issubset(set(STAGE3_DISALLOWED))
@@ -198,26 +246,217 @@ class TestDisallowedToolLists:
         assert 'mcp__fused-memory__get_cycle_summary_presence' not in STAGE1_DISALLOWED
         assert 'mcp__fused-memory__get_cycle_summary_presence' not in STAGE2_DISALLOWED
 
+    def test_escalation_reads_constant_is_exactly_the_two_read_tools(self):
+        """DISALLOW_ESCALATION_READS names the two escalation READ tools, nothing more.
+
+        Scoped deliberately tight: the denial exists because a per-task read
+        cannot be answered from a stage, not because the escalation surface is
+        off limits wholesale.  Anything broader would sweep up the sanctioned
+        write path (Stage 2 FIX D).
+        """
+        assert set(DISALLOW_ESCALATION_READS) == {
+            'mcp__escalation__get_pending_escalations',
+            'mcp__escalation__get_escalation',
+        }
+        assert len(DISALLOW_ESCALATION_READS) == 2, 'no duplicate entries'
+
+    def test_escalation_reads_denied_in_all_three_stages(self):
+        """Every stage must deny the escalation read tools (task 3163).
+
+        A recon stage's ``escalation`` MCP connection is wired to the
+        RECONCILIATION escalation queue, never to a project's queue, so a
+        per-task read from a stage returns ``[]`` CATEGORICALLY — not as a race.
+        Three incidents read that ``[]`` as proof that no escalation was ever
+        filed.  Stage 2 was the gap: ``STAGE2_DISALLOWED = DISALLOW_BUILTIN``
+        denied nothing else at all.
+        """
+        for stage_list, name in (
+            (STAGE1_DISALLOWED, 'STAGE1_DISALLOWED'),
+            (STAGE2_DISALLOWED, 'STAGE2_DISALLOWED'),
+            (STAGE3_DISALLOWED, 'STAGE3_DISALLOWED'),
+        ):
+            assert set(DISALLOW_ESCALATION_READS).issubset(set(stage_list)), (
+                f'{name} must deny the escalation read tools'
+            )
+
+    def test_escalate_blocker_stays_allowed_in_every_stage(self):
+        """The escalation WRITE path must never be swept up by the read denial.
+
+        ``escalate_blocker`` is the sole sanctioned recon escalation use — the
+        Stale Flag Escalation (FIX D) path in Stage 2 (prompts/stage2.py).
+        Over-denying breaks FIX D outright, so this is the anti-over-denial
+        guard, structurally identical to the read-tool carve-outs above.
+        """
+        for stage_list, name in (
+            (STAGE1_DISALLOWED, 'STAGE1_DISALLOWED'),
+            (STAGE2_DISALLOWED, 'STAGE2_DISALLOWED'),
+            (STAGE3_DISALLOWED, 'STAGE3_DISALLOWED'),
+        ):
+            assert 'mcp__escalation__escalate_blocker' not in stage_list, (
+                f'{name} must keep the sanctioned escalation write path'
+            )
+
+    def test_stage_hooks_return_lists_covering_escalation_reads(self):
+        """Pin the ``get_disallowed_tools()`` hook, not just the module constants.
+
+        The hook (stages/base.py) is what actually reaches ``--disallowed-tools``
+        on the spawned CLI, so a constant that no stage returns would deny
+        nothing in production.
+        """
+        deps = _mock_stage_deps()
+        for cls, stage_id in (
+            (MemoryConsolidator, StageId.memory_consolidator),
+            (TaskKnowledgeSync, StageId.task_knowledge_sync),
+            (IntegrityCheck, StageId.integrity_check),
+        ):
+            stage = cls(stage_id, **deps)
+            assert set(DISALLOW_ESCALATION_READS).issubset(set(stage.get_disallowed_tools())), (
+                f'{cls.__name__}.get_disallowed_tools() must cover the escalation reads'
+            )
+
+
+class TestEscalationBoundaryNote:
+    """The escalation-store boundary note: one shared core, three consumers.
+
+    Companion to the DISALLOW_ESCALATION_READS denial (task 3163).  Denying the
+    read tools removes the false ``[]`` answer, but ``--disallowed-tools`` OMITS
+    a denied tool from the agent's listing rather than rejecting the call — so
+    without this paragraph the agent simply finds the tool gone, with no
+    explanation, and may conclude the escalation surface does not exist or route
+    around it.  The note is what converts a silent absence into an understood
+    boundary, which makes it load-bearing rather than decorative.
+
+    The note is a stage-agnostic core (``ESCALATION_BOUNDARY_NOTE``) plus a
+    per-stage *sanctioned-action* clause selected by
+    ``render_escalation_boundary_note(can_escalate=...)``: Stage 2 holds the
+    FIX D escalate_blocker path, Stage 1 and Stage 3 hold no sanctioned
+    escalation action at all.
+
+    These are wiring/invariant and tool-name-capability assertions, deliberately
+    not a prose pin.
+    """
+
+    def test_boundary_note_rendered_verbatim_into_all_three_stage_prompts(self):
+        """One constant, three consumers, no per-stage paste (INV-5).
+
+        Exactly-once, not merely present: a second copy would mean a stage
+        interpolated it twice or someone pasted the prose alongside the
+        constant, which is the drift this shared-constant shape exists to stop.
+
+        Also subsumes the type/non-emptiness of the constant, so no separate
+        tautology test guards that: ``str.count('')`` is ``len(s) + 1``, so an
+        empty or non-string ``ESCALATION_BOUNDARY_NOTE`` fails right here.
+        """
+        for prompt, name in (
+            (STAGE1_SYSTEM_PROMPT, 'STAGE1_SYSTEM_PROMPT'),
+            (build_stage2_system_prompt('dark_factory'), 'STAGE2_SYSTEM_PROMPT'),
+            (STAGE3_SYSTEM_PROMPT, 'STAGE3_SYSTEM_PROMPT'),
+        ):
+            assert ESCALATION_BOUNDARY_NOTE in prompt, f'{name} must render the boundary note'
+            assert prompt.count(ESCALATION_BOUNDARY_NOTE) == 1, (
+                f'{name} must render the boundary note exactly once'
+            )
+
+    def test_boundary_note_present_on_the_autopilot_video_stage2_path(self):
+        """The conditional guardrail-injection branch must not drop or duplicate it.
+
+        build_stage2_system_prompt takes a different code path for
+        autopilot_video (it splices the contamination guardrail in at the
+        '## Available Tools' sentinel), so the note is pinned on that branch too.
+        """
+        prompt = build_stage2_system_prompt('autopilot_video')
+        assert prompt.count(ESCALATION_BOUNDARY_NOTE) == 1
+
+    def test_boundary_note_does_not_contain_the_stage2_injection_sentinel(self):
+        """The note must not carry the '## Available Tools' heading.
+
+        Load-bearing: build_stage2_system_prompt raises RuntimeError unless that
+        sentinel appears EXACTLY once in STAGE2_SYSTEM_PROMPT.  A note carrying
+        the heading would make it appear twice and hard-fail Stage 2 prompt
+        construction for autopilot_video.
+        """
+        assert '## Available Tools' not in ESCALATION_BOUNDARY_NOTE
+
+    def test_boundary_note_core_is_stage_agnostic(self):
+        """The shared core must not name a write path only one stage may use.
+
+        A TOOL-NAME capability assertion, not a wording pin: this constant is
+        rendered into ALL THREE stage prompts, so anything it names is named to
+        every stage.  ``escalate_blocker`` is a Stage-2-only mechanism (FIX D),
+        so it belongs in the per-stage clause, never in the shared core.
+
+        The constant's own comment used to claim it was "Identical for all three
+        stages — no per-stage parameters", which is exactly what hid the
+        mismatch: its final sentence licensed an escalation write in Stage 1 and
+        Stage 3 too.
+        """
+        assert 'escalate_blocker' not in ESCALATION_BOUNDARY_NOTE
+
+    def test_render_escalation_boundary_note_varies_the_sanctioned_action(self):
+        """The renderer swaps only the sanctioned-action clause, never the core.
+
+        Mirrors the ``render_source_completion_section(*, can_file_tasks=...)``
+        precedent (recon_self_model.py): one shared body, one capability-gated
+        clause, keyword-only flag.  INV-5 is preserved — the shared core still
+        appears exactly once in either rendering.
+        """
+        allowed = render_escalation_boundary_note(can_escalate=True)
+        denied = render_escalation_boundary_note(can_escalate=False)
+
+        assert 'mcp__escalation__escalate_blocker' in allowed, (
+            'can_escalate=True must name the sanctioned FIX D write path'
+        )
+        assert 'escalate_blocker' not in denied, (
+            'can_escalate=False must not name a tool the stage is not sanctioned to use'
+        )
+        for rendered, label in ((allowed, 'can_escalate=True'), (denied, 'can_escalate=False')):
+            assert rendered.count(ESCALATION_BOUNDARY_NOTE) == 1, (
+                f'{label} must carry the shared core exactly once'
+            )
+            assert '## Available Tools' not in rendered, (
+                f'{label} must not carry the build_stage2_system_prompt sentinel'
+            )
+
+    def test_stage1_and_stage3_prompts_never_name_the_escalation_write_tool(self):
+        """A stage with no sanctioned escalation action must not be told about one.
+
+        The durable end-state assertion: it pins the property at the CONSUMER,
+        independent of how the note is assembled.  Stage 3 declares "You do NOT
+        have write or mutation tools" (prompts/stage3.py) — and because
+        ``escalate_blocker`` is deliberately absent from every disallow list
+        (see TestDisallowedToolLists above), the tool really is callable, so a
+        licensing sentence there points at a real durable write to the
+        reconciliation escalation queue.  Stage 1 has no FIX D mechanism either
+        (FIX D lives in TaskKnowledgeSync, not IntegrityCheck).
+        """
+        for prompt, name in (
+            (STAGE1_SYSTEM_PROMPT, 'STAGE1_SYSTEM_PROMPT'),
+            (STAGE3_SYSTEM_PROMPT, 'STAGE3_SYSTEM_PROMPT'),
+        ):
+            assert 'escalate_blocker' not in prompt, (
+                f'{name} must not name the escalation write tool — that stage has no '
+                'sanctioned escalation action'
+            )
+
+    def test_stage2_prompt_still_names_the_escalation_write_tool(self):
+        """Anti-over-correction guard: FIX D must survive the fix.
+
+        Stage 2 IS sanctioned to call escalate_blocker for the Stale Flag
+        Escalation (FIX D) case, on both the plain and the autopilot_video
+        guardrail-injection branches of build_stage2_system_prompt.
+        """
+        for project_id in ('dark_factory', 'autopilot_video'):
+            assert 'mcp__escalation__escalate_blocker' in build_stage2_system_prompt(project_id), (
+                f'Stage 2 prompt for {project_id} must keep the FIX D escalation write path'
+            )
+
 
 class TestStageSubclasses:
     """Each stage subclass returns the correct disallowed list."""
 
     @pytest.fixture
-    def config(self):
-        return ReconciliationConfig(
-            enabled=True,
-            explore_codebase_root='/tmp/test',
-        )
-
-    @pytest.fixture
-    def mock_deps(self, config):
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+    def mock_deps(self):
+        return _mock_stage_deps()
 
     def test_memory_consolidator_disallowed(self, mock_deps):
         stage = MemoryConsolidator(StageId.memory_consolidator, **mock_deps)
@@ -383,14 +622,7 @@ class TestPerStageReportSchema:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     def test_integrity_check_returns_stage3_schema(self, mock_deps):
         stage = IntegrityCheck(StageId.integrity_check, **mock_deps)
@@ -652,14 +884,7 @@ class TestTaskKnowledgeSyncPayload:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.fixture
     def watermark(self):
@@ -870,14 +1095,7 @@ class TestTaskKnowledgeSyncKnownProjectsSection:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.fixture
     def watermark(self):
@@ -1109,14 +1327,7 @@ class BaseStageValidationTest:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     def _patch_stage(self, stage, cli_side_effect=None):
         """Return a context manager that patches assemble_payload and run_stage_via_cli.
@@ -1453,14 +1664,7 @@ class TestProactiveSampling:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.fixture
     def watermark(self):
@@ -2013,14 +2217,7 @@ class TestStage2NoTaskIdCeiling:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.mark.asyncio
     async def test_high_task_ids_do_not_block_task_writes(self, mock_deps):
@@ -2374,14 +2571,7 @@ class TestTaskKnowledgeSyncUsesFilterTaskTree:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.fixture
     def watermark(self):
@@ -2727,14 +2917,7 @@ class TestTaskKnowledgeSyncFilteredTaskTree:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.fixture
     def watermark(self):
@@ -3043,14 +3226,7 @@ class TestInvariantAfterTask643:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.fixture
     def watermark(self):
@@ -3749,14 +3925,7 @@ class TestStage2HandoffShortfallWarning:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.fixture
     def watermark(self):
@@ -4557,14 +4726,7 @@ class TestMemoryConsolidatorFlagDedup:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.mark.asyncio
     async def test_normal_cycle_invokes_dedup_flags(self, mock_deps):
@@ -4670,14 +4832,7 @@ class TestMemoryConsolidatorTerminalMetadataFilter:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.mark.asyncio
     async def test_cancelled_task_stale_metadata_absent_from_flagged_items(self, mock_deps):
@@ -4783,14 +4938,7 @@ class TestMemoryConsolidatorStaleBulkGetStatusesFilter:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.mark.asyncio
     async def test_agreeing_flag_dropped_stat_set_and_reclaimed(self, mock_deps):
@@ -4911,14 +5059,7 @@ class TestMemoryConsolidatorFlagAcknowledgment:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.mark.asyncio
     async def test_dropped_flag_acknowledged_and_stat_set(self, mock_deps):
@@ -5252,14 +5393,7 @@ class TestMemoryConsolidatorStaleOperatorDetector:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     def _make_base_report(self, items_flagged=None):
         return StageReport(
@@ -9239,14 +9373,7 @@ class TestStage3PayloadIncludesProjectRoot:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.mark.asyncio
     async def test_integrity_check_payload_emits_use_project_root_directive(self, mock_deps):
@@ -9474,14 +9601,7 @@ class TestTaskKnowledgeSyncSuppressesStage1HumanOperatorDups:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     def _make_cli_result(self, flagged_items: list[dict]) -> MagicMock:
         """Return a fake StageResult-like object for patching run_stage_via_cli."""
@@ -10133,14 +10253,7 @@ class TestBaseStageEscalationQueueAttribute:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     def test_escalation_queue_initialised_to_none(self, mock_deps):
         """(a) Fresh MemoryConsolidator has _escalation_queue == None."""
@@ -10318,14 +10431,7 @@ class TestStage2HintConversionDetection:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.fixture
     def watermark(self):
@@ -10839,14 +10945,7 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.fixture
     def watermark(self):
@@ -11512,14 +11611,7 @@ class TestMaybeQueueBriefingRefreshTasksNoTaskmasterNoOp:
 
     @pytest.fixture
     def mock_deps(self):
-        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
-        return {
-            'memory_service': AsyncMock(),
-            'taskmaster': AsyncMock(),
-            'journal': AsyncMock(),
-            'config': config,
-            'scope': _scope('test_project', '/tmp/test'),
-        }
+        return _mock_stage_deps()
 
     @pytest.mark.asyncio
     async def test_no_taskmaster_no_ops_without_invoking_briefing_script(self, mock_deps):
