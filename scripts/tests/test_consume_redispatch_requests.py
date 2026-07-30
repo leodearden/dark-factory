@@ -11,6 +11,8 @@ so ``import consume_redispatch_requests`` resolves with no packaging work.
 """
 import json
 import os
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
@@ -307,9 +309,6 @@ def test_non_stale_verdict_is_a_hard_skip(requests_dir, verdict):
 # re-implementing four behaviours the httpx McpClient in
 # fused-memory/scripts/cgl_eta_scheduler_gate.py already handles, so each one
 # gets a test here against a real socket rather than a mock.
-
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
 
 
 class _FakeMcpServer:

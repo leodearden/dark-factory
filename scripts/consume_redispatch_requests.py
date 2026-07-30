@@ -59,7 +59,21 @@ from __future__ import annotations
 import json
 import os
 import re
+import urllib.error
+import urllib.request
+import uuid
 from dataclasses import dataclass
+
+# Identify ourselves explicitly on `initialize`. The TaskInterceptor derives an
+# actor class from the MCP client identity, so a nightly automated mutator of
+# the task store should be namable in that record rather than showing up as
+# whatever default the transport happened to send.
+CLIENT_NAME = 'reify-redispatch-consumer'
+CLIENT_VERSION = '1.0'
+AGENT_ID = 'reify-redispatch-consumer'
+
+DEFAULT_SERVER = 'http://127.0.0.1:8002/mcp'
+DEFAULT_TIMEOUT = 30.0
 
 # The FIXED class -> action mapping, from the reify sweep's three classifiers
 # (_classify_gate_closure, _classify_merge_verify_red,
@@ -227,3 +241,122 @@ def load_request(path) -> Request:
         verdict=verdict,
         evidence=evidence if isinstance(evidence, str) else '',
     )
+
+
+class McpClient:
+    """Minimal streamable-HTTP JSON-RPC MCP client on ``urllib.request``.
+
+    A stdlib port of ``fused-memory/scripts/cgl_eta_scheduler_gate.py``'s httpx
+    ``McpClient`` -- see the module docstring for why this consumer does not
+    take the httpx/uv dependency. Four behaviours are ported deliberately, each
+    with the hard-won rationale that motivated it, and each covered by a test
+    against a real socket in
+    ``scripts/tests/test_consume_redispatch_requests.py``:
+
+      1. `initialize` is sent SESSION-LESS.
+      2. The server-assigned `mcp-session-id` is captured BEFORE any early
+         return, then echoed on every later request.
+      3. A `text/event-stream` response is read by extracting its first
+         `data:` line.
+      4. `result.structuredContent` is unwrapped, with a text-content JSON
+         fallback, and a JSON-RPC `error` envelope RAISES.
+    """
+
+    def __init__(self, url: str = DEFAULT_SERVER, timeout: float = DEFAULT_TIMEOUT):
+        self._url = url
+        self._timeout = timeout
+        self._session_id: str | None = None
+
+    def __enter__(self) -> 'McpClient':
+        # No session id on the FIRST request: the MCP streamable-HTTP contract
+        # requires `initialize` to be sent session-less. A STATEFUL server 404s
+        # "Session not found" if a client invents its own id here. The
+        # server-assigned id is captured from the initialize response in
+        # `_post` below and reused from then on.
+        self._post({
+            'jsonrpc': '2.0', 'id': 1, 'method': 'initialize',
+            'params': {'protocolVersion': '2024-11-05',
+                       'clientInfo': {'name': CLIENT_NAME,
+                                      'version': CLIENT_VERSION},
+                       'capabilities': {}},
+        })
+        self._post({'jsonrpc': '2.0', 'method': 'notifications/initialized',
+                    'params': {}})
+        return self
+
+    def __exit__(self, *exc) -> None:
+        return None
+
+    def _post(self, payload: dict) -> dict:
+        headers = {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json, text/event-stream',
+        }
+        if self._session_id is not None:
+            headers['mcp-session-id'] = self._session_id
+        req = urllib.request.Request(
+            self._url, data=json.dumps(payload).encode(), headers=headers,
+            method='POST',
+        )
+        with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+            status = resp.status
+            # Capture the server-assigned session id (returned on `initialize`)
+            # so it can be reused on every subsequent request. Must happen
+            # BEFORE the 202/empty-content early return below, since
+            # `initialize` responses carry a JSON body but
+            # `notifications/initialized` may not -- and a server may answer
+            # `initialize` itself with a bodiless 202.
+            sid = resp.headers.get('mcp-session-id')
+            if sid:
+                self._session_id = sid
+            content_type = resp.headers.get('content-type', '') or ''
+            raw = resp.read()
+        if status == 202 or not raw:
+            return {}
+        text = raw.decode()
+        if 'text/event-stream' in content_type:
+            for line in text.splitlines():
+                if line.startswith('data:'):
+                    return json.loads(line[5:].strip())
+            raise RuntimeError(f'no SSE data line: {text[:200]}')
+        return json.loads(text)
+
+    def call_tool(self, name: str, arguments: dict) -> dict:
+        result = self._post({
+            'jsonrpc': '2.0', 'id': uuid.uuid4().hex, 'method': 'tools/call',
+            'params': {'name': name, 'arguments': arguments},
+        })
+        # An {"error": ...} envelope carries no result. Raising rather than
+        # returning it is what keeps a failed write from being counted as an
+        # applied one further up.
+        if 'error' in result:
+            raise RuntimeError(f'{name} failed: {result["error"]}')
+        content = result.get('result', {})
+        if 'structuredContent' in content:
+            return content['structuredContent']
+        for entry in content.get('content', []) or []:
+            if entry.get('type') == 'text':
+                try:
+                    return json.loads(entry['text'])
+                except json.JSONDecodeError:
+                    return {'_raw': entry['text']}
+        return content
+
+    # ── the three tools this consumer needs, and no others ──────────────────
+
+    def get_task(self, task_id: int, project_root: str) -> dict:
+        return self.call_tool('get_task', {
+            'id': str(task_id), 'project_root': project_root,
+        })
+
+    def set_task_status(self, task_id: int, status: str, project_root: str) -> dict:
+        return self.call_tool('set_task_status', {
+            'id': str(task_id), 'status': status, 'project_root': project_root,
+        })
+
+    def set_task_claimant(self, task_id: int, project_root: str, *,
+                          claimant_run_id=None, heartbeat_at=None) -> dict:
+        return self.call_tool('set_task_claimant', {
+            'task_id': str(task_id), 'project_root': project_root,
+            'claimant_run_id': claimant_run_id, 'heartbeat_at': heartbeat_at,
+        })
