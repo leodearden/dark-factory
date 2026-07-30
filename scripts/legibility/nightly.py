@@ -143,21 +143,49 @@ def select_scored_records(
     return scored
 
 
+DEFAULT_MAX_DIGEST_BYTES = 15360
+"""Per-digest soft byte cap (PRD §7.2). Deliberately defined ABOVE
+:func:`select_digest_sessions` as well as :func:`build_digests`: both the
+COST basis and the RENDER basis read this one constant, so what the sampler
+charged is provably the digest that later gets produced."""
+
+
 def select_digest_sessions(
     cfg: LegibilityConfig, projects_root: Path | str, target_date: date,
 ) -> list[sampling.ScoredRecord]:
     """The budget-bounded, stratified subset of *target_date*'s sessions to
     digest -- :func:`select_scored_records` narrowed by
-    ``sampling.stratified_sample``."""
+    ``sampling.stratified_sample``.
+
+    The byte budget (``cfg.budgets.max_daily_digest_bytes``) is charged
+    against each candidate's ACTUAL rendered digest size, at exactly the
+    :data:`DEFAULT_MAX_DIGEST_BYTES` cap :func:`build_digests` will render
+    with -- the same constant on both sides, so ``bytes_used`` describes the
+    digests this night actually produces. Charging the RAW transcript size
+    instead over-charged the budget by 20x-500x (a 0.5-6.5MB session renders
+    to a ~15KB digest), which made a single real session unaffordable
+    against the entire nightly cap and selected NOTHING at all, every night,
+    from 2026-07-16 to 2026-07-29.
+
+    Costing renders transcripts, but only POST-dedupe, POST-``top_fraction``
+    candidates -- a small number of extra renders, not one per enumerated
+    session -- and each at most once (both :func:`sampling.digest_byte_cost_fn`
+    and ``stratified_sample`` memoize on the session path). A costing render
+    that FAILS degrades to the conservative flat estimate rather than
+    propagating, so the record stays selected, reaches :func:`build_digests`,
+    and has its failure reported through the structured ``extractor_failures``
+    channel (PRD decision 8) instead of aborting the night from the sampler.
+    """
     scored = select_scored_records(cfg, projects_root, target_date)
-    return sampling.stratified_sample(scored, cfg).selected
+    return sampling.stratified_sample(
+        scored, cfg,
+        cost_fn=sampling.digest_byte_cost_fn(max_bytes=DEFAULT_MAX_DIGEST_BYTES),
+    ).selected
 
 
 # ---------------------------------------------------------------------------
 # build_digests — render one digest per selected session, isolating crashes
 # ---------------------------------------------------------------------------
-
-DEFAULT_MAX_DIGEST_BYTES = 15360
 
 
 def build_digests(
