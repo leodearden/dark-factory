@@ -1038,8 +1038,25 @@ def create_server(
         pending (no ``status`` parameter exists — that is deliberate, not
         an oversight, so a caller can never silently recreate the
         false-absence trap this tool exists to remove), and the envelope
-        echoes what was asked so a ``count: 0`` is attributable rather than
-        an anonymous ``[]``.
+        echoes what was asked so a ``count: 0`` is attributable to the query
+        that produced it rather than an anonymous ``[]`` — attributable, but
+        only within one store: see the evidence-of-absence contract below.
+
+        **Evidence-of-absence contract (read this before asserting a gap).**
+        That attribution holds **for the queue THIS server is backed by, and
+        for nothing else.** ``create_server`` backs more than one queue (the
+        orchestrator queue and the reconciliation queue are separate stores),
+        so a caller connected to one of them learns nothing about records in
+        the other: confirm which queue you are talking to before treating
+        ``count: 0`` as proof that no record was ever filed. Auditing a
+        ``done`` ``task_kind='deterministic'`` gate task that has
+        ``metadata.gate_escalated_at`` set? Those records live in the
+        ORCHESTRATOR queue — query THAT server before emitting any finding,
+        flag, memory or remediation task claiming the escalation record was
+        never written. (Reconciliation stages are denied this tool outright
+        — see DISALLOW_ESCALATION_READS in fused-memory's
+        reconciliation/cli_stage_runner.py — precisely because their
+        connection is to the other store.)
 
         *level* — 0 = L0 (agent→steward), 1 = L1 (steward/workflow→
         auto-watcher), 2 = L2 (auto-watcher→human). ``None`` = no filter.
