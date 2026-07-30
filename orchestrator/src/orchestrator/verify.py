@@ -6127,13 +6127,28 @@ async def run_main_tip_sweep(
                 # during a red-main investigation.  Only True short-circuits;
                 # False/None both fall through to the unchanged full retry, so
                 # a passing sweep result still requires a genuine FULL green.
-                # The helper never raises (its own WARNING-logged handler).
-                if (
-                    config.main_tip_sweep_isolated_prefilter_enabled
-                    and await _sweep_failure_reproduces_in_isolation(
-                        tmp_path, config, result,
-                    ) is True
-                ):
+                #
+                # Defense-in-depth: the helper already wraps its own body, so
+                # in practice it cannot raise — but a raise escaping HERE would
+                # hit run_main_tip_sweep's outer `except Exception` and
+                # silently collapse a REAL red-main signal into the None
+                # "no signal" sentinel, dropping the drift on the floor. That
+                # failure mode is severe and silent enough to be worth pinning
+                # against a future edit to the helper, so the call is caught
+                # locally and degraded to "did not short-circuit".
+                _reproduced: bool | None = None
+                if config.main_tip_sweep_isolated_prefilter_enabled:
+                    try:
+                        _reproduced = await _sweep_failure_reproduces_in_isolation(
+                            tmp_path, config, result,
+                        )
+                    except Exception:
+                        logger.warning(
+                            'run_main_tip_sweep: isolated pre-filter raised at '
+                            '%s — falling through to the full-suite retry',
+                            _sha_prefix, exc_info=True,
+                        )
+                if _reproduced is True:
                     logger.warning(
                         'run_main_tip_sweep: first-pass failure at %s '
                         'reproduced deterministically in isolation '
