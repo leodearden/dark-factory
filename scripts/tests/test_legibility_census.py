@@ -1797,6 +1797,103 @@ def test_run_census_without_verify_cap_passes_every_novel_cluster(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# task 3280 step-13: RED — run_census(dry_run_payloads_path=) stubs ONLY the
+# external task filing. Every other side effect (codebook dump, promotions,
+# report, census-state advance, best-effort commit) proceeds normally, so a
+# dry run is a faithful preview of what a real run would file, not a
+# half-executed census.
+# ---------------------------------------------------------------------------
+
+def test_run_census_dry_run_filing_writes_payloads_and_files_nothing(tmp_path, caplog):
+    payloads_path = tmp_path / "confusion-census-2026-07-14-payloads.json"
+    fake_submit_fn = _make_fake_submit_fn()
+    fake_commit = _make_fake_commit()
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_happy_invoke_response),
+        batch_source=[_happy_batch("b0")],
+        verify_fn=_make_fake_verify_fn(
+            verified_titles={"Silent no-op subagent contract"},
+            rejected_titles={"Spurious pattern"},
+        ),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=fake_submit_fn,
+        escalate_fn=_poison("escalate_fn"),
+        status_fetcher=_make_fake_status_fetcher(3),
+        commit=fake_commit,
+        dry_run_payloads_path=payloads_path,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    # (a) NOTHING filed -- the real submit_fn was never reached
+    assert fake_submit_fn.calls == []
+
+    # (b) every would-be payload written, in build_task_payloads' own shape
+    assert payloads_path.exists()
+    payloads = json.loads(payloads_path.read_text(encoding="utf-8"))
+    assert isinstance(payloads, list) and len(payloads) == 1
+    payload = payloads[0]
+    assert payload["project_root"] == str(tmp_path)
+    assert payload["title"].startswith("[legibility census]")
+    assert "Silent no-op subagent contract" in payload["title"]
+    assert payload["description"]
+    assert payload["task_kind"] == "normal"
+    assert payload["priority"]
+    assert payload["metadata"]["source"] == "legibility_census"
+
+    # (c) the report says a dry run happened, naming count and path
+    report_text = kwargs["report_path"].read_text(encoding="utf-8")
+    section = report_text.split("## Filed Tasks", 1)[1].split("##", 1)[0]
+    assert "dry-run: 1 payload" in section
+    assert str(payloads_path) in section
+    assert "_none filed._" not in section
+
+    # (d) everything else still happened, and the payload file is committed
+    # alongside the artifacts it was produced from
+    assert kwargs["codebook_path"].exists()
+    assert kwargs["census_state_path"].exists()
+    assert len(fake_commit.calls) == 1
+    committed = fake_commit.calls[0]["paths"]
+    assert str(payloads_path) in committed
+    assert str(kwargs["report_path"]) in committed
+    assert str(kwargs["codebook_path"]) in committed
+    assert str(kwargs["census_state_path"]) in committed
+
+    # (e) the outcome names the review file instead of a bare filed_tasks=0
+    assert outcome.status == "done"
+    assert outcome.filed_task_ids == []
+    assert outcome.dry_run is not None
+    assert outcome.dry_run.path == str(payloads_path)
+    assert outcome.dry_run.payload_count == 1
+
+    assert any("dry" in r.message.lower() for r in caplog.records), "loud, never silent"
+
+
+def test_run_census_without_dry_run_files_normally_and_writes_no_payload_file(tmp_path):
+    fake_submit_fn = _make_fake_submit_fn()
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_happy_invoke_response),
+        batch_source=[_happy_batch("b0")],
+        verify_fn=_make_fake_verify_fn(verified_titles={"Silent no-op subagent contract"}),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=fake_submit_fn,
+        escalate_fn=_poison("escalate_fn"),
+        status_fetcher=_make_fake_status_fetcher(0),
+        commit=_make_fake_commit(),
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert len(fake_submit_fn.calls) == 1, "the flagless path still files per payload"
+    assert outcome.filed_task_ids == ["task-1"]
+    assert outcome.dry_run is None
+    assert list(tmp_path.glob("*-payloads.json")) == []
+
+
+# ---------------------------------------------------------------------------
 # step-21: RED — main(argv) CLI
 # ---------------------------------------------------------------------------
 
