@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -63,7 +64,13 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
-def sweep_stale_pid_dirs(prefix: str, *, base_dir: Path | None = None) -> int:
+def sweep_stale_pid_dirs(
+    prefix: str,
+    *,
+    base_dir: Path | None = None,
+    min_age_secs: float = 300.0,
+    deadline_secs: float = 5.0,
+) -> int:
     """Remove ``{prefix}*`` directories whose embedded trailing PID is dead.
 
     Bounds the population of per-PID scratch config dirs at
@@ -89,6 +96,19 @@ def sweep_stale_pid_dirs(prefix: str, *, base_dir: Path | None = None) -> int:
     3. **Unattributable dirs are never touched.** No parseable trailing
        ``-<digits>`` means we cannot attribute the dir to a process, so we
        leave it alone.
+    4. **An mtime floor** (``min_age_secs``) covers the residual window where
+       a dir was created microseconds before its owner died, plus any clock
+       skew.
+
+    ``deadline_secs`` bounds *blocking time*, not removals. Callers run this
+    synchronously on the event-loop thread at startup, and the pathological
+    /tmp this guards against has a 40 MB directory inode — a full readdir plus
+    hundreds of thousands of ``rmtree`` calls could stall startup for minutes.
+    A wall-clock deadline is the right bound because the population still
+    drains fully across successive process starts, whereas a hard removal cap
+    would leave a permanent residue. A bounded stop is logged at WARNING with
+    examined/removed counts and says so explicitly — it must never read as
+    "swept everything".
 
     Blast radius is *prefix-scoped* — the caller passes the full prefix (e.g.
     ``CONFIG_DIR_PREFIX + 'usage-gate-probe-'``), never the bare
@@ -105,17 +125,44 @@ def sweep_stale_pid_dirs(prefix: str, *, base_dir: Path | None = None) -> int:
     is documented here rather than defended in code.
     """
     base = base_dir or Path(tempfile.gettempdir())
+    deadline = time.monotonic() + deadline_secs
+    now = time.time()
     removed = 0
-    for path in base.glob(f'{prefix}*'):
-        if path.is_symlink() or not path.is_dir():
-            continue
-        match = _PID_SUFFIX_RE.search(path.name)
-        if match is None:
-            continue
-        if _pid_alive(int(match.group(1))):
-            continue
-        shutil.rmtree(path, ignore_errors=True)
-        removed += 1
+    examined = 0
+    try:
+        for path in base.glob(f'{prefix}*'):
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    'sweep_stale_pid_dirs(%s): stopped on the %.1fs deadline — this sweep '
+                    'is INCOMPLETE (examined %d, removed %d). Remaining stale dirs are '
+                    'reclaimed by subsequent sweeps.',
+                    prefix, deadline_secs, examined, removed,
+                )
+                break
+            examined += 1
+            if path.is_symlink() or not path.is_dir():
+                continue
+            match = _PID_SUFFIX_RE.search(path.name)
+            if match is None:
+                continue
+            if _pid_alive(int(match.group(1))):
+                continue
+            try:
+                if now - path.stat().st_mtime < min_age_secs:
+                    continue
+                shutil.rmtree(path, ignore_errors=True)
+            except OSError:
+                logger.warning(
+                    'sweep_stale_pid_dirs(%s): failed to reclaim %s — skipping it and '
+                    'continuing the sweep', prefix, path, exc_info=True,
+                )
+                continue
+            removed += 1
+    except OSError:
+        logger.warning(
+            'sweep_stale_pid_dirs(%s): could not scan %s — skipping the sweep',
+            prefix, base, exc_info=True,
+        )
     return removed
 
 
