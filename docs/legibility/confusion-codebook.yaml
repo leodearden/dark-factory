@@ -1119,6 +1119,19 @@ entries:
     manifested_phase: recon
     invariant_violated: Cost telemetry (tokens_used) always zero despite nonzero llm_calls
     note: 'memory_consolidator: llm_calls=27, tokens_used=0; task_knowledge_sync: llm_calls=15, tokens_used=0; integrity_check: llm_calls=32, tokens_used=0'
+  - date: '2026-07-29'
+    project: dark_factory
+    session: 73793f97-7f2a-482f-af08-74f1214c77e9
+    origin_phase: recon
+    manifested_phase: recon
+    invariant_violated: cost_telemetry
+    note: memory_consolidator (llm_calls=34, tokens_used=0) and task_knowledge_sync (llm_calls=49, tokens_used=0) both report zero token cost despite significant LLM activity
+  - date: '2026-07-29'
+    project: dark_factory
+    session: bef6ea6b-f564-4416-a3d8-c5920c5f051f
+    origin_phase: recon
+    manifested_phase: recon
+    note: All three stage reports show llm_calls > 0 (28, 14, 21) but tokens_used=0 across memory_consolidator, task_knowledge_sync, and integrity_check
 - id: entry-cand-20260722-3
   title: watcher-rearm.sh requires undocumented DARK_FACTORY_ROOT env var not set by rotation launch context
   severity: medium
@@ -1210,6 +1223,19 @@ entries:
     manifested_phase: recon
     invariant_violated: Recon action-provenance logger records target='?' for write_journal add/delete ops
     note: MCP actions 1, 3, 5, 7, 9 all have target='?' with operations 'add' and 'delete' sourced from write_journal
+  - date: '2026-07-29'
+    project: dark_factory
+    session: 73793f97-7f2a-482f-af08-74f1214c77e9
+    origin_phase: recon
+    manifested_phase: recon
+    invariant_violated: audit_provenance
+    note: MCP action journal records 4 write_journal operations with unresolved target='?' (indices 0, 2, 4, 8 in the action list), preventing audit trail reconstruction of what was modified
+  - date: '2026-07-29'
+    project: dark_factory
+    session: bef6ea6b-f564-4416-a3d8-c5920c5f051f
+    origin_phase: recon
+    manifested_phase: recon
+    note: Recon stage write_journal reports target='?' for multiple operations (update_edge, add, delete) instead of structured identifiers
 - id: entry-cand-20260722-10
   title: Trickle-coder digest pipeline recursively re-ingests its own prompts as session content, mislabeled as User Corrections
   severity: medium
@@ -1301,6 +1327,12 @@ entries:
     origin_phase: architect
     manifested_phase: architect
     evidence_quote: '{"content": "The steward''s decisions for ''cancelled'', ''deferred'', and ''blocked'' are intentional terminal decisions.", "relevance_score": 0.8}'
+  - date: '2026-07-29'
+    project: dark_factory
+    session: 0c493e66-ff2c-432d-8855-f17a953ca5ee
+    origin_phase: unknown
+    manifested_phase: architect
+    note: Memory search at session start returns high-scored (1.0, 0.95, 0.9) but generic/task-irrelevant context (Task 1470 audit wiring, Task 2531 plan.json precedent, etc.) for markup-validation implementation task
 - id: entry-cand-20260717-2
   title: Rotation-hour budget invisible during long blocking re-arm waits
   severity: medium
@@ -1520,6 +1552,12 @@ entries:
     manifested_phase: recon
     invariant_violated: Stage report carries a nested '_reported' stats dict that disagrees with its own top-level actual stats
     note: memory_consolidator._reported.memories_written=1.0 vs missing top-level equivalent; task_knowledge_sync._reported differs from top-level
+  - date: '2026-07-29'
+    project: dark_factory
+    session: bef6ea6b-f564-4416-a3d8-c5920c5f051f
+    origin_phase: recon
+    manifested_phase: recon
+    note: 'memory_consolidator: top-level items_flagged=1 with edges_updated=1 at top level but nested ''_reported'' shows edges_updated=1.0; asymmetry in how counts are reported'
 - id: entry-cand-20260722-23
   title: Recon stage report's top-level items_flagged contradicts its own nested stats.items_flagged
   severity: medium
@@ -1632,6 +1670,18 @@ entries:
     origin_phase: recon
     manifested_phase: recon
     note: Nested '_reported' subtotal dict duplicating top-level stats in memory_consolidator and task_knowledge_sync stages
+  - date: '2026-07-29'
+    project: dark_factory
+    session: 73793f97-7f2a-482f-af08-74f1214c77e9
+    origin_phase: recon
+    manifested_phase: recon
+    note: Both memory_consolidator and task_knowledge_sync nest a redundant '_reported' stats dict; task_knowledge_sync's _reported only captures 2/8 fields from top-level, creating duplication/omission asymmetry
+  - date: '2026-07-29'
+    project: dark_factory
+    session: bef6ea6b-f564-4416-a3d8-c5920c5f051f
+    origin_phase: recon
+    manifested_phase: recon
+    note: memory_consolidator stats nest a redundant '_reported' dict (memories_written, entity_summaries_refreshed, memories_added, edges_updated) duplicating overlapping top-level counters
 - id: entry-cand-20260722-27
   title: Trickle-coder digest pipeline ingests its own prior invocations as session digests
   severity: medium
@@ -1684,6 +1734,12 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     evidence_quote: (turn 3) You are the trickle coder for the dark-factory agent-confusion codebook (plans/confusion-reduction-prd.md §7.3). Read the session digest below and decide which existing codebook entries it matches...
+  - date: '2026-07-29'
+    project: dark_factory
+    session: 0c493e66-ff2c-432d-8855-f17a953ca5ee
+    origin_phase: unknown
+    manifested_phase: architect
+    note: '## User Corrections section shows ''(turn 3) # Context'' — trickle-coder''s own task-framing prompt injected as session content and mislabeled as user correction'
 - id: entry-cand-20260713-3
   title: Recon category labels applied by surface keyword match, not guard definition
   severity: medium
@@ -2992,3 +3048,16 @@ candidates:
     origin_phase: recon
     manifested_phase: recon
     evidence_quote: 'memory_consolidator._reported has ''memories_written'': 1.0 with no top-level field by that name; top-level uses ''memories_added'' instead'
+- id: cand-20260729-1
+  title: Guard trip density anomaly in small architect session
+  cause: 4 df_guard trips in 14KB session (unusually high concentration) during implementation planning; trips span recon-premise violations and path-scope, suggesting either guard over-sensitivity on this task or unvalidated preconditions
+  area: guard logic, invariant enforcement
+  first_seen: '2026-07-29'
+  disposition: pending
+  sightings:
+  - date: '2026-07-29'
+    project: dark_factory
+    session: 0c493e66-ff2c-432d-8855-f17a953ca5ee
+    origin_phase: architect
+    manifested_phase: architect
+    evidence_quote: 'Turn 38: blocked, Turns 74/83: known-false premise about recon internals, Turn 109: darkfactorypathscopeviolation — 4 guard trips total'
