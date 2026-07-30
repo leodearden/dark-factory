@@ -414,6 +414,220 @@ class TestCommittedRegistryFixture:
                 seen[key] = entry.topic
 
 
+# ---------------------------------------------------------------------------
+# step-5: offline registry derivation
+#
+# Every source here is COMMITTED, so derivation needs no Qdrant, no embedder
+# and no OPENAI_API_KEY — a reviewer can re-run it to audit any fixture entry.
+# ---------------------------------------------------------------------------
+
+CALIBRATION_PATH = Path(__file__).parent / 'fixtures' / 'write_triage_calibration.jsonl'
+CENSUS_PATH = Path(__file__).parents[2] / 'plans' / 'memory-metadata-census-report.json'
+
+
+@pytest.fixture(scope='module')
+def calibration_rows() -> list[dict]:
+    return [
+        json.loads(line)
+        for line in CALIBRATION_PATH.read_text(encoding='utf-8').splitlines()
+        if line.strip()
+    ]
+
+
+@pytest.fixture(scope='module')
+def census_report() -> dict:
+    return json.loads(CENSUS_PATH.read_text(encoding='utf-8'))
+
+
+@pytest.fixture(scope='module')
+def guard_clusters():
+    from fused_memory.config.schema import _default_topic_guard_clusters  # noqa: PLC0415
+
+    return _default_topic_guard_clusters()
+
+
+@pytest.fixture(scope='module')
+def derived(calibration_rows, census_report, guard_clusters):
+    return _mod().derive_registry_candidates(calibration_rows, census_report, guard_clusters)
+
+
+def _of(result, source: str) -> list[dict]:
+    return [c for c in result.candidates if c['derived_from'] == source]
+
+
+class TestDeriveFromCuratorGates:
+    """The curator-gate census — 'each gate is a free labeled cluster'."""
+
+    def test_one_candidate_per_cluster(self, derived, calibration_rows):
+        clusters = {r['cluster_id'] for r in calibration_rows}
+        assert len(_of(derived, 'curator_gate')) == len(clusters)
+
+    def test_canonical_hash_is_content_key_of_the_canonical_row(
+        self, derived, calibration_rows,
+    ):
+        content_key = _mod().content_key
+        canonical_by_cluster = {
+            r['cluster_id']: r for r in calibration_rows if r['label'] == 'canonical'
+        }
+        for candidate in _of(derived, 'curator_gate'):
+            row = canonical_by_cluster[candidate['provenance']['cluster_id']]
+            assert candidate['canonical']['content_hash'] == content_key(row['content'])
+            assert candidate['canonical']['last_known_id'] == row['memory_id']
+
+    def test_members_are_the_duplicate_rows(self, derived, calibration_rows):
+        content_key = _mod().content_key
+        dups = {}
+        for row in calibration_rows:
+            if row['label'] == 'duplicate':
+                dups.setdefault(row['cluster_id'], set()).add(content_key(row['content']))
+        for candidate in _of(derived, 'curator_gate'):
+            expected = dups.get(candidate['provenance']['cluster_id'], set())
+            assert set(candidate['members']) == expected
+
+    def test_distinct_and_pseudo_contradiction_are_not_members(
+        self, derived, calibration_rows,
+    ):
+        """The curator adjudicated these as SEPARATE claims.
+
+        Folding them in would poison the contamination metric with entries that
+        legitimately answer a different question.
+        """
+        content_key = _mod().content_key
+        excluded = {
+            content_key(r['content']) for r in calibration_rows
+            if r['label'] in ('distinct', 'pseudo_contradiction')
+        }
+        assert excluded, 'fixture no longer carries the adjudicated non-duplicates'
+        all_members = {m for c in _of(derived, 'curator_gate') for m in c['members']}
+        assert not (all_members & excluded)
+
+    def test_gate_id_is_carried_as_provenance(self, derived):
+        for candidate in _of(derived, 'curator_gate'):
+            assert candidate['provenance']['gate_ids']
+            for gate in candidate['provenance']['gate_ids']:
+                assert gate.startswith('esc-')
+
+    def test_supersedes_pairs_point_duplicates_at_the_canonical(self, derived):
+        for candidate in _of(derived, 'curator_gate'):
+            members = set(candidate['members'])
+            for pair in candidate['supersedes_pairs']:
+                assert pair['superseded_hash'] in members
+                assert pair['successor_hash'] == candidate['canonical']['content_hash']
+
+
+class TestDeriveFromCensus:
+    """Multi-entry census topics, with the skipped long tail DISCLOSED."""
+
+    def test_emits_multi_entry_topics_only(self, derived, census_report):
+        multi = {
+            e['value'] for e in census_report['grand_total']['topic']['entries']
+            if e['count'] > 1
+        }
+        emitted = {c['topic'] for c in _of(derived, 'census_topic')}
+        assert emitted
+        assert emitted <= multi
+
+    def test_skipped_singletons_are_disclosed_not_silently_dropped(
+        self, derived, census_report,
+    ):
+        singletons = [
+            e for e in census_report['grand_total']['topic']['entries'] if e['count'] <= 1
+        ]
+        assert singletons, 'census no longer has a count-1 tail'
+        assert derived.disclosures['census_topics_skipped_singleton'] == len(singletons)
+
+    def test_census_forward_compat_extra_key(self, calibration_rows, guard_clusters):
+        payload = {
+            'grand_total': {
+                'topic': {
+                    'distinct_total': 2,
+                    'entries': [{'value': 'multi-topic', 'count': 3}],
+                },
+                'unrecognised_key_from_3201': {'anything': True},
+            },
+            'another_new_top_level_key': 1,
+        }
+        result = _mod().derive_registry_candidates(
+            calibration_rows, payload, guard_clusters,
+        )
+        assert {c['topic'] for c in _of(result, 'census_topic')} == {'multi-topic'}
+
+
+class TestDeriveFromGuardClusters:
+    """Guard phrases seed ORDINARY phrasings only — never the held-out one."""
+
+    def test_emits_one_candidate_per_guard_slug(self, derived, guard_clusters):
+        emitted = {c['topic'] for c in _of(derived, 'topic_guard_cluster')}
+        assert emitted == {c.topic_id for c in guard_clusters}
+
+    def test_guard_phrases_seed_phrasings(self, derived, guard_clusters):
+        by_slug = {c.topic_id: c for c in guard_clusters}
+        for candidate in _of(derived, 'topic_guard_cluster'):
+            texts = {p['text'] for p in candidate['phrasings']}
+            assert texts & set(by_slug[candidate['topic']].phrases)
+
+    def test_no_derived_phrasing_is_marked_held_out(self, derived):
+        """Held-out phrasings are the part machines cannot regenerate.
+
+        A guard phrase was used to BUILD the entries it would retrieve, so
+        marking one held out would defeat the guard it exists to be.
+        """
+        for candidate in derived.candidates:
+            assert not any(p['held_out'] for p in candidate['phrasings']), candidate['topic']
+
+
+class TestDerivationIsPure:
+    def test_running_twice_is_byte_identical(
+        self, calibration_rows, census_report, guard_clusters,
+    ):
+        first = _mod().derive_registry_candidates(
+            calibration_rows, census_report, guard_clusters,
+        )
+        second = _mod().derive_registry_candidates(
+            calibration_rows, census_report, guard_clusters,
+        )
+        assert json.dumps(first.as_registry_payload(), sort_keys=True) == json.dumps(
+            second.as_registry_payload(), sort_keys=True,
+        )
+
+    def test_no_live_store_is_constructed(self, monkeypatch, calibration_rows,
+                                          census_report, guard_clusters):
+        """Derivation must not reach for Qdrant, an embedder or MemoryService."""
+        import socket  # noqa: PLC0415
+
+        def _boom(*a, **kw):
+            raise AssertionError('derivation opened a socket')
+
+        monkeypatch.setattr(socket.socket, 'connect', _boom)
+        monkeypatch.setattr(socket.socket, 'connect_ex', _boom)
+        result = _mod().derive_registry_candidates(
+            calibration_rows, census_report, guard_clusters,
+        )
+        assert result.candidates
+
+    def test_payload_is_shaped_like_the_registry(
+        self, derived, tmp_path,
+    ):
+        """The deriver writes what the loader reads — schema drift is impossible.
+
+        Loaded through load_topic_registry after filling in only the parts a
+        machine cannot regenerate (a held-out phrasing and a claim query), so
+        the two halves are proven to agree rather than assumed to.
+        """
+        payload = derived.as_registry_payload()
+        for entry in payload['entries']:
+            entry['phrasings'].append({'text': f'held out for {entry["topic"]}',
+                                       'held_out': True})
+            entry.setdefault('claim_queries', []).append(
+                {'query': f'{entry["topic"]} claim', 'needles': ['x']},
+            )
+        path = tmp_path / 'derived.json'
+        path.write_text(json.dumps(payload), encoding='utf-8')
+
+        registry = _mod().load_topic_registry(path)
+        assert len(registry.entries) == len(payload['entries'])
+
+
 class TestContentKey:
     """`content_key(text)` — whitespace-normalized sha256[:16]."""
 
