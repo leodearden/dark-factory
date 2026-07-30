@@ -31,6 +31,7 @@ from shared.memory_eval_limits import (
     evaluate_series,
     evaluate_tripwire,
     limits_artifact_path,
+    scoped_grandfather_key,
     write_limits_artifact,
 )
 from shared.memory_eval_metrics import (
@@ -45,6 +46,8 @@ _FIXTURES = Path(__file__).parent / 'fixtures' / 'memory_eval'
 _BASELINE_STAMPS = ('20260701T031500Z', '20260702T031500Z', '20260703T031500Z')
 _REGRESSION_STAMP = '20260704T031500Z'
 _QUIET_STAMP = '20260705T031500Z'
+_DUAL_EVAL_ID = 'e1-dual-tripwire'
+_DUAL_STAMPS = ('20260801T031500Z', '20260802T031500Z')
 
 _SERIES_FILES = sorted(_FIXTURES.glob('e1-*/metrics-*.json'))
 _MALFORMED_FILES = sorted(_FIXTURES.glob('malformed/*.json'))
@@ -72,11 +75,16 @@ def _baseline():
 
 
 def _seeded_grandfather() -> frozenset[str]:
-    """The first baseline run's failures, snapshotted as known-bad."""
+    """The first baseline run's failures, snapshotted as known-bad.
+
+    Scoped by metric_id, because that is the shape the persisted state carries —
+    ``evaluate_tripwire`` speaks in bare item_keys for one metric, while
+    ``evaluate_series`` persists ``"<metric_id>::<item_key>"``.
+    """
     first = _series(_BASELINE_STAMPS[0])
     tripwire = next(m for m in first.metrics if m.kind == 'tripwire')
-    _, grandfather = evaluate_tripwire(tripwire, None)
-    return grandfather
+    _, snapshot = evaluate_tripwire(tripwire, None)
+    return frozenset(scoped_grandfather_key(tripwire.metric_id, key) for key in snapshot)
 
 
 def evaluate_exemplar():
@@ -96,7 +104,7 @@ class TestCommittedExemplarsAreProducible:
     def test_the_corpus_is_actually_present(self):
         # A glob that silently matched nothing would make every parametrized
         # test below vacuously pass.
-        assert len(_SERIES_FILES) == 6
+        assert len(_SERIES_FILES) == 8
         assert len(_MALFORMED_FILES) == 2
 
     @pytest.mark.parametrize('path', _SERIES_FILES, ids=_ids(_SERIES_FILES))
@@ -158,14 +166,15 @@ class TestEvaluatorOverTheCommittedCorpus:
         result = evaluate_exemplar()
         alarmed = {a.item_key for a in result.alarms}
         assert 't-recon-watcher-triage' not in alarmed
-        assert 't-recon-watcher-triage' in result.grandfather
+        assert 'topic-canonical-present::t-recon-watcher-triage' in result.grandfather
 
     def test_the_ratchet_releases_an_item_fixed_in_the_regression_run(self):
         # t-routing-ladder was grandfathered and passes in run 04, so it leaves
         # the set — even though that same run is alarming elsewhere.
         result = evaluate_exemplar()
-        assert 't-routing-ladder' in _seeded_grandfather()
-        assert 't-routing-ladder' not in result.grandfather
+        released = 'topic-canonical-present::t-routing-ladder'
+        assert released in _seeded_grandfather()
+        assert released not in result.grandfather
 
     def test_the_quiet_run_alarms_nothing(self):
         result = evaluate_series(
@@ -191,6 +200,60 @@ class TestEvaluatorOverTheCommittedCorpus:
         result = evaluate_series(thin, _baseline(), _EXEMPLAR_CONFIG, None)
         assert result.alarms == ()
         assert {v.status for v in result.verdicts} == {'insufficient_data'}
+
+
+class TestTwoTripwireSeriesOverTheCommittedCorpus:
+    """A committed series carrying TWO tripwire metrics, with a colliding item_key.
+
+    ``e1-dual-tripwire`` exists because a single-tripwire corpus cannot see the
+    per-metric scoping of the grandfather state at all: with one tripwire, a
+    flat set and a scoped set behave identically. Both runs are the same data,
+    so the whole class asserts one thing — evaluating unchanged data twice stays
+    silent — which is the observable symptom of every way the scoping can break.
+
+    ``t-shared`` appears in BOTH metrics, failing under
+    ``topic-canonical-present`` and passing under ``successor-pointer-present``.
+    That is the collision case: in a flat namespace the pass releases the
+    failure's known-bad entry, and the next run alarms on data nobody touched.
+    """
+
+    CONFIG = LimitsConfig(
+        false_alarm_budget=1.0, runs_per_quarter=90, min_samples=1, baseline_window=3
+    )
+
+    def _dual(self, stamp: str):
+        return _series(stamp, eval_id=_DUAL_EVAL_ID)
+
+    def test_the_first_run_snapshots_both_metrics_without_alarming(self):
+        result = evaluate_series(self._dual(_DUAL_STAMPS[0]), [], self.CONFIG, None)
+        assert result.alarms == ()
+        assert {v.status for v in result.verdicts} == {'baseline_snapshot'}
+        assert sorted(result.grandfather) == [
+            'successor-pointer-present::t-beta',
+            'topic-canonical-present::t-recon-watcher-triage',
+            'topic-canonical-present::t-shared',
+        ]
+
+    def test_the_unchanged_second_run_alarms_nothing(self):
+        first = evaluate_series(self._dual(_DUAL_STAMPS[0]), [], self.CONFIG, None)
+        second = evaluate_series(self._dual(_DUAL_STAMPS[1]), [], self.CONFIG, first.grandfather)
+        assert second.alarms == ()
+        assert second.grandfather_hash == first.grandfather_hash
+
+    def test_the_shared_item_key_stays_scoped_to_its_own_metric(self):
+        first = evaluate_series(self._dual(_DUAL_STAMPS[0]), [], self.CONFIG, None)
+        assert 'topic-canonical-present::t-shared' in first.grandfather
+        assert 'successor-pointer-present::t-shared' not in first.grandfather
+
+    def test_the_dual_artifact_publishes_scoped_known_bad_keys(self, tmp_path):
+        # The dashboard reads these strings, so the scoping has to be visible in
+        # the published artifact rather than living only in memory.
+        result = evaluate_series(self._dual(_DUAL_STAMPS[0]), [], self.CONFIG, None)
+        path = limits_artifact_path(tmp_path, result.eval_id)
+        write_limits_artifact(result, path)
+        published = json.loads(path.read_text())['grandfather_set']
+        assert all('::' in key for key in published)
+        assert published == sorted(result.grandfather)
 
 
 class TestDashboardShapedReader:
@@ -247,7 +310,7 @@ class TestDashboardShapedReader:
 
     def test_a_plain_reader_gets_the_known_bad_list(self):
         data = self._read()
-        assert data['grandfather_set'] == ['t-recon-watcher-triage']
+        assert data['grandfather_set'] == ['topic-canonical-present::t-recon-watcher-triage']
         assert len(data['grandfather_set_hash']) == 64
 
     def test_the_plain_reader_and_the_evaluator_agree(self):

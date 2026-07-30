@@ -28,7 +28,11 @@ the far right tail. The method also makes the two rule kinds structurally
 identical (one summation over a pmf), so binomial and Poisson share a single
 reviewed idea rather than two.
 
-Stdlib only — ``math.comb``/``math.lgamma``, no scipy or numpy (neither is a
+Both pmfs are assembled in log space via ``math.lgamma`` rather than from exact
+``math.comb`` coefficients: a bignum binomial coefficient overflows float64
+around ``n = 1030``, and nothing in the M1 schema bounds a proportion's ``n``.
+
+Stdlib only — ``math.lgamma``/``math.exp``, no scipy or numpy (neither is a
 dependency of ``dark-factory-shared``, following the stdlib-only precedent of
 ``orchestrator/src/orchestrator/evals/report.py``).
 """
@@ -67,10 +71,13 @@ __all__ = [
     'evaluate_proportion',
     'evaluate_series',
     'evaluate_tripwire',
+    'GRANDFATHER_KEY_SEPARATOR',
     'grandfather_set_hash',
+    'grandfather_slice',
     'limits_artifact_path',
     'load_limits_artifact',
     'poisson_two_sided_p',
+    'scoped_grandfather_key',
     'write_limits_artifact',
 ]
 
@@ -108,19 +115,40 @@ lose a whole tail.
 
 
 def _binomial_pmf(i: int, n: int, p0: float) -> float:
-    """P(X = i) for X ~ Binomial(n, p0), with the degenerate p0 handled first.
+    """P(X = i) for X ~ Binomial(n, p0), computed in log space.
 
-    ``0.0 ** 0`` is 1.0 in Python, so the general expression is already safe at
-    ``p0 in {0.0, 1.0}``; it is spelled out anyway because a degenerate H0 is a
-    real input here (a tripwire-adjacent proportion can legitimately have a
-    baseline of all-pass or all-fail) and silently relying on that corner of the
-    float spec would be a trap for the next reader.
+    The degenerate ``p0`` cases are handled first, both because a degenerate H0
+    is a real input here (a tripwire-adjacent proportion can legitimately have a
+    baseline of all-pass or all-fail) and because they are the only inputs for
+    which the log-space form would take ``log(0)``.
+
+    The general case is assembled as ``exp(lgamma(n+1) - lgamma(i+1) -
+    lgamma(n-i+1) + i*log(p0) + (n-i)*log1p(-p0))`` rather than the
+    textbook-looking ``math.comb(n, i) * p0**i * (1-p0)**(n-i)``. ``math.comb``
+    returns an exact arbitrary-precision int, and multiplying it by a float
+    forces a conversion that raises ``OverflowError`` once the coefficient
+    exceeds float64 — around ``n = 1030`` at ``p0 = 0.5``, which is well inside
+    this programme's range (a corpus-scale proportion over ~1.2k entities is an
+    ordinary M1 metric, and nothing in the M1 schema bounds ``n``). Building
+    ``n+1`` exact bignum coefficients is also O(n^2) in digit work long before
+    it crashes. ``_poisson_pmf`` next door already works in log space for
+    exactly this reason; this is the same idea, applied to the same problem.
+
+    ``math.exp`` underflows silently to 0.0 for a sufficiently negative
+    argument (it only raises on overflow), so a far-tail term that is not
+    representable becomes a structural zero rather than an error.
     """
     if p0 == 0.0:
         return 1.0 if i == 0 else 0.0
     if p0 == 1.0:
         return 1.0 if i == n else 0.0
-    return math.comb(n, i) * (p0**i) * ((1.0 - p0) ** (n - i))
+    return math.exp(
+        math.lgamma(n + 1)
+        - math.lgamma(i + 1)
+        - math.lgamma(n - i + 1)
+        + i * math.log(p0)
+        + (n - i) * math.log1p(-p0)
+    )
 
 
 def binomial_two_sided_p(k: int, n: int, p0: float) -> float:
@@ -148,8 +176,15 @@ def binomial_two_sided_p(k: int, n: int, p0: float) -> float:
 
     pmf = [_binomial_pmf(i, n, p0) for i in range(n + 1)]
     observed = pmf[k]
-    total = math.fsum(p for p in pmf if p <= observed * (1.0 + _PMF_TIE_SLACK))
-    return min(1.0, total)
+    qualifying = [p for p in pmf if p <= observed * (1.0 + _PMF_TIE_SLACK)]
+    if len(qualifying) == len(pmf):
+        # The acceptance set is the ENTIRE support, so the answer is 1.0 by
+        # definition — stated structurally rather than hoped for from the
+        # summation. This is the mode identity documented above, and asserting
+        # it here is what keeps it exact independently of how the pmf terms are
+        # computed (a log-space term is accurate to ~1e-15, not to the ulp).
+        return 1.0
+    return min(1.0, math.fsum(qualifying))
 
 
 def _poisson_pmf(i: int, lam: float) -> float:
@@ -349,6 +384,49 @@ class MetricVerdict:
     detail: str = ''
 
 
+GRANDFATHER_KEY_SEPARATOR = '::'
+"""What separates a metric_id from an item_key in a persisted grandfather entry.
+
+The grandfather set is stored — and published in ``limits-current.json`` — as a
+flat list of ``"<metric_id>::<item_key>"`` strings rather than bare item_keys,
+because item_keys are only unique WITHIN a metric. Two structural probes may
+legitimately key on the same topic id, and a flat namespace would let one
+metric's pass release the other metric's known-bad entry (and, worse, let an
+unrelated metric's evaluation drop it entirely).
+
+A flat scoped list rather than a nested mapping so the artifact field stays one
+JSON array of strings for the dashboard, and so ``grandfather_set_hash``
+remains a digest of one comparable set.
+"""
+
+
+def scoped_grandfather_key(metric_id: str, item_key: str) -> str:
+    """Compose the persisted grandfather entry for *item_key* under *metric_id*.
+
+    Rejects a ``metric_id`` containing the separator: prefix matching is how the
+    slice is recovered, so a metric_id of ``'a::b'`` could shadow item ``'b/...'``
+    of metric ``'a'``. Loudly refusing the ambiguous name costs nothing (no
+    metric_id in this programme contains a colon) and beats a silent mis-scope.
+    """
+    if GRANDFATHER_KEY_SEPARATOR in metric_id:
+        raise ValueError(
+            f'scoped_grandfather_key: metric_id {metric_id!r} may not contain '
+            f'{GRANDFATHER_KEY_SEPARATOR!r} — it is the grandfather-key scope separator.'
+        )
+    return f'{metric_id}{GRANDFATHER_KEY_SEPARATOR}{item_key}'
+
+
+def grandfather_slice(grandfather: Iterable[str], metric_id: str) -> frozenset[str]:
+    """The bare item_keys grandfathered under *metric_id*, from a persisted set.
+
+    The inverse of :func:`scoped_grandfather_key`. Entries belonging to other
+    metrics are simply not this metric's business and are dropped from the
+    slice — the caller is responsible for carrying them forward untouched.
+    """
+    prefix = scoped_grandfather_key(metric_id, '')
+    return frozenset(key[len(prefix) :] for key in grandfather if key.startswith(prefix))
+
+
 def grandfather_set_hash(keys: Iterable[str]) -> str:
     """Stable digest of a grandfather set: sha256 over the sorted, newline-joined keys.
 
@@ -366,7 +444,12 @@ def evaluate_tripwire(
 ) -> tuple[MetricVerdict, frozenset[str]]:
     """Rule (a): grandfather pre-existing failures, alarm on regressions (D1).
 
-    Returns the verdict and the NEXT grandfather set, which the caller persists.
+    Operates on THIS METRIC'S SLICE of the grandfather state — bare item_keys,
+    with no metric scoping — and returns the next such slice. Composing the
+    slices back into the persisted, metric-scoped set is
+    :func:`evaluate_series`'s job (see :data:`GRANDFATHER_KEY_SEPARATOR`); this
+    function must never see another metric's entries, because item_keys are
+    only unique within a metric.
 
     The rule is two lines, and both are load-bearing:
 
@@ -703,11 +786,22 @@ def evaluate_series(
     alpha = derive_alpha(config.false_alarm_budget, config.runs_per_quarter, len(alarm_eligible))
 
     verdicts: list[MetricVerdict] = []
-    next_grandfather = grandfather if grandfather is not None else frozenset()
+    # The persisted set is SCOPED BY METRIC (see GRANDFATHER_KEY_SEPARATOR).
+    # Start from what was handed in and replace one metric's slice at a time, so
+    # a second tripwire never clobbers the first one's known-bad list and a
+    # metric absent from this run keeps its entries rather than losing them.
+    # Neither a union nor an intersection across tripwires would do: a union
+    # re-adds items another metric just released, an intersection breaks the
+    # first-run snapshot.
+    carried: set[str] = set(grandfather) if grandfather is not None else set()
 
     for metric in current.metrics:
         if metric.kind == 'tripwire':
-            verdict, next_grandfather = evaluate_tripwire(metric, grandfather)
+            own = None if grandfather is None else grandfather_slice(grandfather, metric.metric_id)
+            verdict, next_own = evaluate_tripwire(metric, own)
+            prefix = scoped_grandfather_key(metric.metric_id, '')
+            carried = {key for key in carried if not key.startswith(prefix)}
+            carried |= {scoped_grandfather_key(metric.metric_id, item) for item in next_own}
         elif metric.kind == 'proportion':
             verdict = evaluate_proportion(metric, window, alpha, config.min_samples)
         elif metric.kind == 'count':
@@ -731,8 +825,8 @@ def evaluate_series(
         config=config,
         verdicts=tuple(verdicts),
         alarms=tuple(alarm for verdict in verdicts for alarm in verdict.alarms),
-        grandfather=next_grandfather,
-        grandfather_hash=grandfather_set_hash(next_grandfather),
+        grandfather=frozenset(carried),
+        grandfather_hash=grandfather_set_hash(carried),
         baseline_run_stamps=tuple(series.run_stamp for series in window),
     )
 

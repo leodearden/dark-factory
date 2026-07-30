@@ -7,7 +7,7 @@
       "detail": "12/30 against a pooled baseline of 72/90 over 3 run(s). p=1.84e-06 < alpha=0.00278.",
       "item_key": null,
       "metric_id": "canonical-in-top-5",
-      "p_value": 1.8424481488582408e-06,
+      "p_value": 1.8424481488582588e-06,
       "rule_kind": "proportion",
       "value": 0.4
     },
@@ -43,9 +43,9 @@
   "false_alarm_budget": 1.0,
   "generator": "shared.memory_eval_limits",
   "grandfather_set": [
-    "t-recon-watcher-triage"
+    "topic-canonical-present::t-recon-watcher-triage"
   ],
-  "grandfather_set_hash": "cc6c9e1dd1f3cef2d90009d3a28e068277b6e4dbeaf2e8e675403f410bbbd997",
+  "grandfather_set_hash": "f8c46981970a2cc2265806d08e9705ecceb66889e30476dcba0921a45a05dec5",
   "min_samples": 10,
   "run_stamp": "20260704T031500Z",
   "runs_per_quarter": 90,
@@ -59,7 +59,7 @@
           "detail": "12/30 against a pooled baseline of 72/90 over 3 run(s). p=1.84e-06 < alpha=0.00278.",
           "item_key": null,
           "metric_id": "canonical-in-top-5",
-          "p_value": 1.8424481488582408e-06,
+          "p_value": 1.8424481488582588e-06,
           "rule_kind": "proportion",
           "value": 0.4
         }
@@ -74,7 +74,7 @@
       "detail": "12/30 against a pooled baseline of 72/90 over 3 run(s).",
       "metric_id": "canonical-in-top-5",
       "n": 30,
-      "p_value": 1.8424481488582408e-06,
+      "p_value": 1.8424481488582588e-06,
       "rule_kind": "proportion",
       "status": "alarm",
       "value": 0.4

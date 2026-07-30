@@ -32,12 +32,20 @@ from shared.memory_eval_limits import (
     evaluate_series,
     evaluate_tripwire,
     grandfather_set_hash,
+    grandfather_slice,
     limits_artifact_path,
     load_limits_artifact,
     poisson_two_sided_p,
+    scoped_grandfather_key,
     write_limits_artifact,
 )
-from shared.memory_eval_metrics import Metric, MetricSeries, TripwireItem, load_metric_series
+from shared.memory_eval_metrics import (
+    Corpus,
+    Metric,
+    MetricSeries,
+    TripwireItem,
+    load_metric_series,
+)
 
 _FIXTURES = Path(__file__).parent / 'fixtures' / 'memory_eval'
 _BASELINE_STAMPS = ('20260701T031500Z', '20260702T031500Z', '20260703T031500Z')
@@ -92,6 +100,22 @@ def _reference_binomial_two_sided_p(k: int, n: int, p0: float) -> float:
     """
     pmf = [math.comb(n, i) * (p0**i) * ((1 - p0) ** (n - i)) for i in range(n + 1)]
     return min(1.0, sum(p for p in pmf if p <= pmf[k] * (1 + 1e-9)))
+
+
+def _exact_rational_binomial_two_sided_p(k: int, n: int, a: int, b: int) -> float:
+    """The same small-p sum for ``p0 == a/b``, in EXACT integer arithmetic.
+
+    Every pmf term shares the denominator ``b**n``, so the whole comparison and
+    the whole sum can be done on integer numerators — no floats, and therefore
+    no tie slack and no rounding, at any n. That is what makes it a usable
+    cross-check where ``_reference_binomial_two_sided_p`` cannot go: THAT
+    reference enumerates the full support in floats, so it raises
+    ``OverflowError`` on the central coefficients for any n past ~1030,
+    whatever k is.
+    """
+    numerators = [math.comb(n, i) * a**i * (b - a) ** (n - i) for i in range(n + 1)]
+    observed = numerators[k]
+    return sum(x for x in numerators if x <= observed) / b**n
 
 
 def _reference_poisson_two_sided_p(k: int, lam: float) -> float:
@@ -192,6 +216,36 @@ class TestBinomialExactTest:
     def test_out_of_range_p0_raises(self, p0):
         with pytest.raises(ValueError):
             binomial_two_sided_p(5, 10, p0)
+
+    @pytest.mark.parametrize(('k', 'n'), [(515, 1030), (550, 1100), (900, 2000)])
+    def test_a_corpus_scale_n_yields_a_probability_rather_than_raising(self, k, n):
+        """Regression: the pmf must not be assembled from exact bignum coefficients.
+
+        ``math.comb(1030, 515)`` exceeds float64, so a ``comb(n, i) * float``
+        pmf raises ``OverflowError`` from here up — taking the whole run, and
+        its grandfather-set update, with it. Nothing in the M1 schema bounds a
+        proportion's ``n`` (``Metric`` asks only for ``n >= 0`` and
+        ``n == denominator``), and a corpus-scale proportion is an ordinary
+        metric for this programme: the committed exemplar's own corpus counts
+        1204 ``entities_and_relations``.
+        """
+        p = binomial_two_sided_p(k, n, 0.5)
+        assert 0.0 <= p <= 1.0
+
+    def test_a_corpus_scale_n_still_matches_exact_arithmetic(self):
+        # Not merely finite — right. Cross-checked against the exact-integer
+        # reference, which is the only one that survives this n.
+        assert binomial_two_sided_p(900, 1204, 0.8) == pytest.approx(
+            _exact_rational_binomial_two_sided_p(900, 1204, 4, 5), rel=1e-9
+        )
+        assert binomial_two_sided_p(1000, 1204, 0.8) == pytest.approx(
+            _exact_rational_binomial_two_sided_p(1000, 1204, 4, 5), rel=1e-9
+        )
+
+    def test_the_mode_identity_survives_a_corpus_scale_n(self):
+        # 1204 * 0.8 == 963.2, so 963 is the mode: every outcome qualifies and
+        # the answer is 1.0 by definition, not by float luck.
+        assert binomial_two_sided_p(963, 1204, 0.8) == 1.0
 
 
 class TestPoissonExactTest:
@@ -479,6 +533,109 @@ class TestStructuralTripwireRatchet:
             digest = grandfather_set_hash(keys)
             assert len(digest) == 64
             assert set(digest) <= set('0123456789abcdef')
+
+
+class TestGrandfatherScopingAcrossMetrics:
+    """The grandfather set is PER-METRIC state, not one flat namespace.
+
+    ``MetricSeries`` explicitly permits several tripwires in one run
+    (``test_memory_eval_metrics.py::test_distinct_metric_ids_of_the_same_kind_are_fine``),
+    and E1 gains a second structural probe the moment another invariant is
+    wired up. Two things break if the state is kept flat, and both are silent:
+
+    * evaluating metric B would REPLACE the persisted set with B's slice,
+      dropping A's known-bad items — so the next run alarms on items that never
+      changed, the exact phantom alarm the ratchet exists to prevent;
+    * item_keys are unique only WITHIN a metric, so a key passing under B would
+      release the same key grandfathered under A.
+
+    Every test here evaluates the SAME run twice and asserts the second pass is
+    silent, because unchanged data producing an alarm is the observable symptom
+    of both defects.
+    """
+
+    CONFIG = LimitsConfig(
+        false_alarm_budget=1.0, runs_per_quarter=90, min_samples=1, baseline_window=3
+    )
+
+    def _run(self, a: dict[str, bool], b: dict[str, bool] | None = None) -> MetricSeries:
+        metrics = [_tripwire(a, metric_id='probe-a')]
+        if b is not None:
+            metrics.append(_tripwire(b, metric_id='probe-b'))
+        return MetricSeries(
+            schema_version=1,
+            eval_id='e1-dual-tripwire',
+            run_stamp='20260801T000000Z',
+            corpus=Corpus(project_id='dark_factory'),
+            metrics=metrics,
+        )
+
+    def test_the_first_run_snapshots_every_tripwire_not_just_the_last(self):
+        result = evaluate_series(
+            self._run({'a1': False, 'a2': True}, {'b1': False}), [], self.CONFIG, None
+        )
+        assert result.alarms == ()
+        assert sorted(result.grandfather) == ['probe-a::a1', 'probe-b::b1']
+
+    def test_an_unchanged_rerun_of_a_two_tripwire_series_alarms_nothing(self):
+        run = self._run({'a1': False, 'a2': True}, {'b1': False})
+        first = evaluate_series(run, [], self.CONFIG, None)
+        second = evaluate_series(run, [], self.CONFIG, first.grandfather)
+        assert second.alarms == ()
+        assert second.grandfather_hash == first.grandfather_hash
+
+    def test_fixing_one_metric_leaves_the_others_known_bad_alone(self):
+        first = evaluate_series(self._run({'a1': False}, {'b1': False}), [], self.CONFIG, None)
+        healed = evaluate_series(
+            self._run({'a1': True}, {'b1': False}), [], self.CONFIG, first.grandfather
+        )
+        assert healed.alarms == ()  # a1 fixed (ratchet), b1 still grandfathered
+        assert sorted(healed.grandfather) == ['probe-b::b1']
+
+    def test_a_regression_names_only_the_metric_it_happened_in(self):
+        first = evaluate_series(self._run({'a1': False}, {'b1': False}), [], self.CONFIG, None)
+        regressed = evaluate_series(
+            self._run({'a1': False, 'a2': False}, {'b1': False}),
+            [],
+            self.CONFIG,
+            first.grandfather,
+        )
+        assert [(a.metric_id, a.item_key) for a in regressed.alarms] == [('probe-a', 'a2')]
+
+    def test_colliding_item_keys_stay_independent(self):
+        # 'x' fails under probe-a and passes under probe-b. Under a flat
+        # namespace probe-b's pass releases probe-a's known-bad 'x', and the
+        # very next pass over the SAME data alarms.
+        run = self._run({'x': False}, {'x': True})
+        first = evaluate_series(run, [], self.CONFIG, None)
+        assert sorted(first.grandfather) == ['probe-a::x']
+        second = evaluate_series(run, [], self.CONFIG, first.grandfather)
+        assert second.alarms == ()
+
+    def test_a_metric_absent_from_a_run_keeps_its_known_bad(self):
+        # A probe that did not run this time has not been fixed. Dropping its
+        # entries would silently re-arm it, and it would alarm on its way back.
+        both = evaluate_series(self._run({'a1': False}, {'b1': False}), [], self.CONFIG, None)
+        without_b = evaluate_series(self._run({'a1': False}), [], self.CONFIG, both.grandfather)
+        assert without_b.alarms == ()
+        assert sorted(without_b.grandfather) == ['probe-a::a1', 'probe-b::b1']
+
+    def test_the_scoped_key_helpers_round_trip(self):
+        keys = {scoped_grandfather_key('probe-a', 'x'), scoped_grandfather_key('probe-b', 'x')}
+        assert grandfather_slice(keys, 'probe-a') == frozenset({'x'})
+        assert grandfather_slice(keys, 'probe-b') == frozenset({'x'})
+        assert grandfather_slice(keys, 'probe-c') == frozenset()
+
+    def test_an_item_key_may_itself_contain_the_separator(self):
+        # Only the FIRST separator is structural; the rest belongs to the item.
+        keys = {scoped_grandfather_key('probe-a', 'ns::item')}
+        assert grandfather_slice(keys, 'probe-a') == frozenset({'ns::item'})
+
+    def test_a_metric_id_containing_the_separator_is_refused(self):
+        # Ambiguous by construction: 'probe::a' + '::' + 'x' is also
+        # 'probe' + '::' + 'a::x'. Refuse loudly rather than mis-scope quietly.
+        with pytest.raises(ValueError):
+            scoped_grandfather_key('probe::a', 'x')
 
 
 class TestProportionAndCountRules:

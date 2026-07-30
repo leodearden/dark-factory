@@ -60,6 +60,8 @@ the derived α exactly `1/360`.
 | `e1-retrieval-health/metrics-20260703T031500Z.json` | trailing baseline window | proportion 24/30, dangling 6, superseded 2, same 2 failing topics |
 | `e1-retrieval-health/metrics-20260704T031500Z.json` | current run, **regression** variant | proportion 12/30 (p≈1.84e-06 → alarm), dangling 20 vs λ=5 (p≈3.45e-07 → alarm), `t-worktree-lifecycle` **newly** fails (→ alarm), `t-routing-ladder` now passes (→ ratchet) |
 | `e1-retrieval-health/metrics-20260705T031500Z.json` | current run, **quiet** variant | proportion 20/30 (p≈0.105 → ok), dangling 8 vs λ=5 (p≈0.174 → ok), failing topics identical to the grandfather snapshot (→ no alarm, idempotent re-run) |
+| `e1-dual-tripwire/metrics-20260801T031500Z.json` | two-tripwire snapshot | `topic-canonical-present` + `successor-pointer-present`; `t-shared` fails in the first and passes in the second |
+| `e1-dual-tripwire/metrics-20260802T031500Z.json` | unchanged re-run of the above | identical items → no alarm, grandfather hash unmoved |
 | `e1-thin/metrics-20260704T031500Z.json` | `insufficient_data` path | `n = 6` below `LimitsConfig.min_samples`, and a single run so the baseline window is empty |
 | `malformed/metrics-bad-kind.json` | negative | `kind: "histogram"` is outside the closed vocabulary |
 | `malformed/metrics-proportion-out-of-range.json` | negative | proportion `value: 1.4` outside `[0, 1]` |
@@ -71,6 +73,23 @@ mean `2.0`. The two topics failing throughout the window
 (`t-recon-watcher-triage`, `t-routing-ladder`) are the grandfather snapshot —
 they stand in for the known-bad findings the 3111/3112 fix lineage already owns,
 which D1 says must be reported in the initial-state report and never alarmed on.
+
+## Grandfather keys are scoped by metric
+
+The persisted known-bad set — `grandfather_set` in `limits-current.json`, and
+`EvaluationResult.grandfather` — carries `"<metric_id>::<item_key>"` strings,
+not bare item_keys. item_keys are unique only WITHIN a metric, and a series may
+carry several tripwires, so a flat namespace would let one metric's pass
+release another's known-bad entry (and let evaluating the second tripwire drop
+the first one's entries entirely). Either way the next run alarms on data
+nobody changed — the phantom alarm the ratchet exists to prevent.
+
+`shared.memory_eval_limits.scoped_grandfather_key` / `grandfather_slice`
+compose and recover the scope; `evaluate_tripwire` itself still speaks bare
+item_keys for one metric, and `evaluate_series` does the composition. A
+metric_id containing `::` is refused at key-composition time. `e1-dual-tripwire`
+is the committed corpus for all of this — including the colliding `t-shared`
+key — because a single-tripwire corpus cannot distinguish the two designs.
 
 ## Regenerating — do not hand-edit
 
