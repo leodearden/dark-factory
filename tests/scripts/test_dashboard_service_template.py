@@ -298,6 +298,13 @@ def test_template_renders_to_hardcoded_file() -> None:
 # interpreter's exit, and the intermediate `uv run` parent's own teardown.
 MIN_SHUTDOWN_MARGIN_SECONDS = 5
 
+# The browser's measured poll interval: plans/dashboard-availability-prd.md
+# records that dashboard/static/redux/data.js:165 polls every 3 seconds, and
+# that the resulting keep-alive connections "never idle out under a 3s poll" —
+# which is exactly why the drain never completed before the graceful-shutdown
+# bound was added.
+CLIENT_POLL_INTERVAL_SECONDS = 3
+
 
 def _logical_exec_start(path: pathlib.Path) -> str:
     """Return the ExecStart= command in *path* as a single logical line.
@@ -464,3 +471,47 @@ def test_shutdown_drain_is_bounded_in_both_unit_files() -> None:
     """
     for path in (TEMPLATE, HARDCODED):
         _assert_drain_bounded(path)
+
+
+def test_keep_alive_timeout_is_pinned_above_poll_interval() -> None:
+    """--timeout-keep-alive must be pinned explicitly, and pinned ABOVE the poll interval.
+
+    The lower bound is the non-obvious half of this test.  The tempting move —
+    dropping keep-alive below the client's 3s poll so idle connections close on
+    their own — is wrong here: it would make the server close the polling socket
+    in the gap between polls, exposing the classic
+    server-closes-while-client-writes race, i.e. trading a shutdown-time stall
+    for request-time failures on a change whose whole purpose is availability.
+    The hard drain guarantee already comes from --timeout-graceful-shutdown, so
+    keep-alive is not being asked to do that job.
+
+    Pinning it explicitly (at uvicorn's own default) is still worth doing: it
+    surfaces the interaction that caused the incident — the 5s default exceeds
+    the 3s poll, which is precisely why the connection never idles out — makes
+    it greppable, and gives the unit-file parity check a concrete directive to
+    diff.
+    """
+    for path in (TEMPLATE, HARDCODED):
+        keep_alive = _uvicorn_int_flag(path, "timeout-keep-alive")
+        assert keep_alive is not None, (
+            f"No --timeout-keep-alive flag in the ExecStart of {path}. "
+            "Leaving it implicit hides the interaction that caused the incident: "
+            "uvicorn's 5s default exceeds the client's "
+            f"{CLIENT_POLL_INTERVAL_SECONDS}s poll, which is why the polling "
+            "connection never idles out."
+        )
+        assert keep_alive > CLIENT_POLL_INTERVAL_SECONDS, (
+            f"--timeout-keep-alive {keep_alive} is not above the client's "
+            f"{CLIENT_POLL_INTERVAL_SECONDS}s poll interval in {path}. "
+            "Below the poll interval the server closes the polling socket in the "
+            "gap between polls, exposing the server-closes-while-client-writes "
+            "race and turning a shutdown fix into a source of failed polls. The "
+            "drain is already bounded by --timeout-graceful-shutdown; do not "
+            "retune keep-alive to compensate for it."
+        )
+        stop = _timeout_stop_sec(path)
+        assert keep_alive < stop, (
+            f"--timeout-keep-alive {keep_alive} is not below TimeoutStopSec={stop} "
+            f"in {path}. A keep-alive idle window longer than the stop timeout "
+            "would be incoherent with the drain bound."
+        )
