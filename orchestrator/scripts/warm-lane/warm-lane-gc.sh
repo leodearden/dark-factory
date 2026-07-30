@@ -226,6 +226,12 @@ fi
 # shellcheck source=scripts/lib_live_refs.sh
 source "$SCRIPT_DIR/lib_live_refs.sh"
 
+# Shared durable-lane-record reader (lane_state_read / lane_state_class), task
+# 3074. Pass 1's reclaimability gate consults dark-factory's own lane record
+# through it — see the Pass-1 record gate below.
+# shellcheck source=scripts/lib_lane_state.sh
+source "$SCRIPT_DIR/lib_lane_state.sh"
+
 # ── log helpers (all write to stderr) ─────────────────────────────────────────
 info()  { printf '\033[1;34m[info]\033[0m  %s\n' "$*" >&2; }
 ok()    { printf '\033[1;32m[ok]\033[0m    %s\n' "$*" >&2; }
@@ -542,6 +548,42 @@ _do_reclaim() {
         if ! flock -n 8; then
             exec 8>&-
             warn "preserving $name: live consumer (flock held)"
+            preserved_count=$((preserved_count + 1))
+            continue
+        fi
+
+        # ── Pass-1 record gate (task 3075, reify esc-5334-6) ─────────────────
+        # Pass 1 has THREE preserve gates, checked in this order:
+        #   (1) the live-consumer flock (inv.2) — acquired above;
+        #   (2) THIS gate: dark-factory's own durable lane record at
+        #       <worktrees-dir>/.lane-state/<lane>.json;
+        #   (3) a live PROCESS REFERENCE at or under the lane dir (task 5572).
+        #
+        # The record is read BEFORE the /proc walk because it is BOTH the
+        # cheaper and the more decisive predicate — cheapest-decisive-first, the
+        # same rationale already documented for Pass 2's ordering. One file read
+        # + a couple of seds is ~1ms against the walk's measured ~1.9s, and its
+        # verdict is AUTHORITATIVE (dark-factory wrote it) rather than a probe.
+        # So an assigned lane short-circuits before the walk and a BUSY pool
+        # gets cheaper, not more expensive.
+        #
+        # Single-argument form deliberately: lane_state_read derives
+        # `<dirname of lane-dir>/.lane-state`, which for a lane at
+        # $WORKTREES_DIR/<name> is exactly $WORKTREES_DIR/.lane-state — the same
+        # path warm-lane-audit.sh computes as $MOUNT/.lane-state. No flag, no
+        # precomputed map, nothing marshalled in from a caller.
+        #
+        # FAIL-OPEN is load-bearing. lane_state_read reports `unknown` for a
+        # missing/unreadable/corrupt record, and UNKNOWN and QUARANTINED both
+        # fall through to the gates below and then to reclaim. Preserving on
+        # UNKNOWN would freeze reclaim the moment .lane-state/ is absent — the
+        # 2026-07-10 ENOSPC accretion outage, re-created.
+        lane_state_read "$lane" >/dev/null
+        local lane_class
+        lane_class="$(lane_state_class "$LANE_STATE_RAW")"
+        if [ "$lane_class" = "ASSIGNED" ]; then
+            exec 8>&-
+            warn "preserving $name: assigned to task $LANE_STATE_TASK_ID"
             preserved_count=$((preserved_count + 1))
             continue
         fi
