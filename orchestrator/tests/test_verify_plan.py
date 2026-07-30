@@ -1617,17 +1617,51 @@ _REAL_SUITE_FALLBACK_CONFIG = OrchestratorConfig(
     test_command=_ROOT_TEST_COMMAND,
 )
 
-# (name, uses_module_configs, config, role) — every branch derive_verify_plan
-# can take: the module path at both roles, the knob-gated full-breadth merge
-# gate (_derive_full_suite_runs, which must never file-scope), and the
-# fallback path at both the bare-pytest default and a real configured suite.
-_SWEEP_BRANCHES: list[tuple[str, bool, OrchestratorConfig | None, str]] = [
-    ('module/task', True, None, 'task'),
-    ('module/merge', True, None, 'merge'),
-    ('module/merge-full-breadth', True, _FULL_BREADTH_CONFIG, 'merge'),
-    ('fallback/bare-default', False, _BARE_FALLBACK_CONFIG, 'task'),
-    ('fallback/real-suite', False, _REAL_SUITE_FALLBACK_CONFIG, 'merge'),
+# The branches derive_verify_plan can take, split by whether a ModuleConfig is
+# consulted at all — the two sweeps below parametrise over different axes, so
+# keeping one combined list would multiply the fallback cases by an inert
+# module-config dimension and advertise coverage that does not exist.
+#
+# (name, config, role) — the module path at both roles, plus the knob-gated
+# full-breadth merge gate (_derive_full_suite_runs, which must never file-scope).
+_SWEEP_MODULE_BRANCHES: list[tuple[str, OrchestratorConfig | None, str]] = [
+    ('module/task', None, 'task'),
+    ('module/merge', None, 'merge'),
+    ('module/merge-full-breadth', _FULL_BREADTH_CONFIG, 'merge'),
 ]
+
+# (name, config, role) — the fallback path at both the bare-pytest default and
+# a real configured suite. module_configs is [] here by definition.
+_SWEEP_FALLBACK_BRANCHES: list[tuple[str, OrchestratorConfig, str]] = [
+    ('fallback/bare-default', _BARE_FALLBACK_CONFIG, 'task'),
+    ('fallback/real-suite', _REAL_SUITE_FALLBACK_CONFIG, 'merge'),
+]
+
+
+def _assert_scoped_targets_invariant(plan, files: list[str], label: str) -> None:
+    """Shared body of the two invariant sweeps — three properties per plan.
+
+    1. **The invariant** — ``scoped_targets`` is non-empty EXACTLY when
+       ``scope_kind is FILE_SCOPED``. FULL_SUITE (D1/D2 widening, and the
+       whole ``merge_verify_breadth='full'`` gate) is deliberately unscoped;
+       SKIPPED/TRIVIAL never ran.
+    2. **No invented paths** — the record is always a subset of the diff it
+       was derived from, so it can never drift into naming a file the plan
+       never saw.
+    3. **D3 stays intact** — the key serialises JSON-natively and the whole
+       plan dict survives a JSON round-trip unchanged, which is what actually
+       reaches ``VerifyResult.plan``.
+    """
+    for run in plan.runs:
+        assert bool(run.scoped_targets) == (run.scope_kind is ScopeKind.FILE_SCOPED), (
+            f'{label}: {run.reason!r} is '
+            f'{run.scope_kind} but scoped_targets={run.scoped_targets!r}'
+        )
+        assert set(run.scoped_targets) <= set(files), label
+        assert run.to_dict()['scoped_targets'] == list(run.scoped_targets), label
+
+    as_dict = plan.to_dict()
+    assert json.loads(json.dumps(as_dict)) == as_dict, label
 
 
 class TestPlanRecordScopedTargets:
@@ -1813,9 +1847,9 @@ class TestPlanRecordScopedTargets:
     # -- the cross-cutting invariant sweep (step-5) -------------------------
 
     @pytest.mark.parametrize(
-        'branch_name, uses_module_configs, config, role',
-        _SWEEP_BRANCHES,
-        ids=[case[0] for case in _SWEEP_BRANCHES],
+        'branch_name, config, role',
+        _SWEEP_MODULE_BRANCHES,
+        ids=[case[0] for case in _SWEEP_MODULE_BRANCHES],
     )
     @pytest.mark.parametrize(
         'mc_name, mc', _SWEEP_MODULE_CONFIGS, ids=[case[0] for case in _SWEEP_MODULE_CONFIGS],
@@ -1823,34 +1857,36 @@ class TestPlanRecordScopedTargets:
     @pytest.mark.parametrize(
         'diff_name, files', _SWEEP_DIFFS, ids=[case[0] for case in _SWEEP_DIFFS],
     )
-    def test_scoped_targets_is_nonempty_exactly_for_file_scoped_runs(
-        self, diff_name, files, mc_name, mc, branch_name, uses_module_configs, config, role,
+    def test_module_path_scoped_targets_nonempty_exactly_for_file_scoped_runs(
+        self, diff_name, files, mc_name, mc, branch_name, config, role,
     ):
-        """The regression pin, generalised over every branch derive_verify_plan can take.
+        """The regression pin over the MODULE path: command shape x file shape x branch.
 
-        Three properties, asserted for every run of every plan:
-
-        1. **The invariant** — ``scoped_targets`` is non-empty EXACTLY when
-           ``scope_kind is FILE_SCOPED``. FULL_SUITE (D1/D2 widening, and the
-           whole ``merge_verify_breadth='full'`` gate) is deliberately
-           unscoped; SKIPPED/TRIVIAL never ran.
-        2. **No invented paths** — the record is always a subset of the diff
-           it was derived from, so it can never drift into naming a file the
-           plan never saw.
-        3. **D3 stays intact** — the key serialises JSON-natively and the
-           whole plan dict survives a JSON round-trip unchanged, which is
-           what actually reaches ``VerifyResult.plan``.
+        The command-shape axis is what matters here — it decides whether
+        ``cmd`` ends up raw-retained, structurally scoped, or unscoped, and
+        the invariant must hold across all three. See
+        :func:`_assert_scoped_targets_invariant` for the properties asserted.
         """
-        module_configs = [mc] if uses_module_configs else []
-        plan = derive_verify_plan(files, module_configs, config, fake_worktree_reader, role=role)
+        plan = derive_verify_plan(files, [mc], config, fake_worktree_reader, role=role)
+        _assert_scoped_targets_invariant(plan, files, f'{branch_name}/{mc_name}/{diff_name}')
 
-        for run in plan.runs:
-            assert bool(run.scoped_targets) == (run.scope_kind is ScopeKind.FILE_SCOPED), (
-                f'{branch_name}/{mc_name}/{diff_name}: {run.reason!r} is '
-                f'{run.scope_kind} but scoped_targets={run.scoped_targets!r}'
-            )
-            assert set(run.scoped_targets) <= set(files)
-            assert run.to_dict()['scoped_targets'] == list(run.scoped_targets)
+    @pytest.mark.parametrize(
+        'branch_name, config, role',
+        _SWEEP_FALLBACK_BRANCHES,
+        ids=[case[0] for case in _SWEEP_FALLBACK_BRANCHES],
+    )
+    @pytest.mark.parametrize(
+        'diff_name, files', _SWEEP_DIFFS, ids=[case[0] for case in _SWEEP_DIFFS],
+    )
+    def test_fallback_path_scoped_targets_nonempty_exactly_for_file_scoped_runs(
+        self, diff_name, files, branch_name, config, role,
+    ):
+        """The same pin over the FALLBACK path — no module-config axis to vary.
 
-        as_dict = plan.to_dict()
-        assert json.loads(json.dumps(as_dict)) == as_dict
+        ``_derive_fallback_runs`` consults ``config``'s global commands only,
+        never a ModuleConfig, so the module-config axis is deliberately
+        absent rather than inert: crossing it in would re-run each case five
+        times under ids naming a dimension nothing reads.
+        """
+        plan = derive_verify_plan(files, [], config, fake_worktree_reader, role=role)
+        _assert_scoped_targets_invariant(plan, files, f'{branch_name}/{diff_name}')
