@@ -54,7 +54,7 @@ import json
 import logging
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -164,13 +164,19 @@ def find_markup_pattern(text: object) -> str | None:
     return best_pattern
 
 
-def find_markup_violation(fields: dict[str, object]) -> tuple[str, str] | None:
+def find_markup_violation(fields: Mapping[str, object]) -> tuple[str, str] | None:
     """Return ``(field_name, matched_pattern)`` for the first violating field.
 
     *fields* maps a caller-facing field name (``'content'``, ``'description'``,
     …) to its raw value. Fields are checked in dict INSERTION ORDER, so a call
     site controls which field is named when several are dirty. Returns ``None``
     when every field is clean, empty, ``None`` or non-``str``.
+
+    Typed ``Mapping[str, object]`` rather than ``dict[str, object]``: this
+    function only READS the map, and ``dict`` is invariant in its value type, so
+    a ``dict`` annotation would reject an ordinary homogeneous call site such as
+    ``{'title': a, 'description': b}`` (inferred ``dict[str, str]``). ``Mapping``
+    is covariant in the value type and accepts every dict a caller can build.
 
     Pure and synchronous; never raises (an empty map is simply not a violation).
     """
