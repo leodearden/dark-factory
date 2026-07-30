@@ -568,3 +568,66 @@ class TestHandlerNeverAdvancesMain:
 
         f.scheduler.mark_done.assert_awaited_once()
         assert f.scheduler.mark_done.await_args.kwargs['sha'] == _LANDED
+
+
+# ---------------------------------------------------------------------------
+# Dispatch wiring — both _plan sites route the artifact to the handler
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestReadyToMergeDispatch:
+    """The exit chain at both sites is unactionable_task → false_premise →
+    already_done → ready_to_merge → blocking_dependency.
+
+    ready_to_merge sits AFTER already_done (a clean DONE is more decisive than
+    a merge submit) and BEFORE blocking_dependency (a deterministic merge
+    submit beats a re-looping dependency report).
+    """
+
+    async def test_both_sites_have_the_same_exit_chain(self):
+        """The SIMPLE_TASK escape hatch reuses the same artifacts, so its exit
+        chain must stay in lockstep with the architect path's — including
+        ready_to_merge's slot between already_done and blocking_dependency.
+
+        Structural at BOTH sites: each dispatch sits behind a live agent
+        invocation, so the cheap, non-flaky check is that the artifact reads
+        appear in the same order in both — the handler's own behaviour is
+        covered exhaustively above, and run()'s honouring of its terminal
+        outcome below.
+        """
+        import inspect
+
+        from orchestrator import workflow as wf_mod
+
+        for fn in (wf_mod.TaskWorkflow._plan, wf_mod.TaskWorkflow._run_simple_task):
+            src = inspect.getsource(fn)
+            order = [
+                src.index(f'read_{name}()')
+                for name in (
+                    'unactionable_task', 'false_premise', 'already_done',
+                    'ready_to_merge', 'blocking_dependency',
+                )
+            ]
+            assert order == sorted(order), f'{fn.__name__} exit chain out of order'
+
+    async def test_run_does_not_enter_execute_or_double_enqueue(
+        self, tmp_path: Path,
+    ):
+        """``run()`` honours the handler's terminal BLOCKED — no EXECUTE, and
+        no SECOND merge request on top of the one the handler enqueued."""
+        f = _make(tmp_path=tmp_path)
+        f.wf._plan = AsyncMock(return_value=WorkflowOutcome.BLOCKED)  # type: ignore[method-assign]
+        f.wf._execute_iterations = AsyncMock(  # type: ignore[method-assign]
+            side_effect=AssertionError(
+                'EXECUTE must not run when _plan returns BLOCKED',
+            ),
+        )
+        f.wf._recover_if_already_merged = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        f.wf._check_branch_on_main = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+        outcome = (await f.wf.run()).outcome
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        f.wf._execute_iterations.assert_not_called()
+        assert f.merge_queue.empty()
