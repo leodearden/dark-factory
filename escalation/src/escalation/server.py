@@ -1546,6 +1546,11 @@ def create_server(
         # between req.snapshot_tip and the in-flight entry's snapshot_tip.  When
         # git_ops_for_scan is None (standalone / tests without orchestrator) the
         # classifier is also None and the recency check is a no-op (back-compat).
+        # retention: write-side counterpart of the Tier-2 reads at :2215
+        # (merge_status) and :2555 (merge_cancel) — populates the ring via
+        # enqueue_merge_request's _on_finalized callback (dispatch arm) and
+        # registers a record_alias entry for coalesced ids.  None when no
+        # harness is wired (standalone escalation), preserving current behaviour.
         dispatch = await coalesce_or_enqueue_merge_request(
             merge_queue,
             merge_req,
@@ -1554,6 +1559,7 @@ def create_server(
             git_ops=git_ops_for_scan,
             live_snapshot=live_snapshot,
             classifier_git_ops=git_ops_for_scan,
+            retention=getattr(harness, '_terminal_retention', None),
         )
 
         def _nonblocking_state_response(
