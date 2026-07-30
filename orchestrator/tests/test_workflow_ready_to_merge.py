@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -357,3 +358,72 @@ class TestReadyToMergeMalformedArtifact:
         assert outcome == WorkflowOutcome.BLOCKED
         f.mark_blocked.assert_awaited_once()
         assert f.mark_blocked.await_args.kwargs.get('escalate_to_human') is not True
+
+
+# ---------------------------------------------------------------------------
+# C-4 — idempotency: a re-invoked architect must not double-enqueue
+# ---------------------------------------------------------------------------
+
+
+def _marker(*, tip: str = _TIP, age_s: float = 0.0) -> dict:
+    """An ``architect_merge_request`` metadata marker *age_s* seconds old."""
+    return {
+        'tip_sha': tip,
+        'request_id': 'mr-prev1234',
+        'submitted_at': (
+            datetime.now(UTC) - timedelta(seconds=age_s)
+        ).isoformat(),
+    }
+
+
+@pytest.mark.asyncio
+class TestReadyToMergeIdempotency:
+    """INV-4 storm-escape.  The marker key is deliberately distinct from the
+    stranded reaper's ``stranded_merge_request`` so the two submit paths never
+    clobber each other."""
+
+    async def _run(self, tmp_path: Path, marker: object) -> _Fixture:
+        f = _make(
+            tmp_path=tmp_path,
+            metadata={'architect_merge_request': marker},
+        )
+        f.artifacts.write_ready_to_merge(commit=_TIP, evidence='ev')
+        f.outcome = await f.wf._handle_ready_to_merge_report()
+        return f
+
+    async def test_fresh_marker_same_tip_skips_resubmit(self, tmp_path: Path):
+        f = await self._run(tmp_path, _marker(tip=_TIP))
+
+        assert f.merge_queue.qsize() == 0  # NO second MergeRequest
+        assert f.marker_stamps() == []  # and no re-stamp
+        assert f.outcome == WorkflowOutcome.BLOCKED
+        f.mark_blocked.assert_not_awaited()  # still no human escalation
+
+    async def test_duplicate_skip_is_recorded_structurally(self, tmp_path: Path):
+        """The skip is a decision, not a silence — it lands on the event."""
+        f = await self._run(tmp_path, _marker(tip=_TIP))
+
+        rows = f.event_store.fetch_events_by_type_all_runs(
+            EventType.architect_desync_merge, task_id=_TASK_ID,
+        )
+        assert len(rows) == 1
+        assert (rows[0].get('data') or {})['decision'] == 'duplicate'
+
+    async def test_stale_marker_resubmits(self, tmp_path: Path):
+        """Fail-safe: a stale marker must self-heal into a fresh submit, never
+        a wedged skip."""
+        f = await self._run(tmp_path, _marker(tip=_TIP, age_s=7200.0))
+
+        assert f.merge_queue.qsize() == 1
+        assert len(f.marker_stamps()) == 1
+
+    async def test_mismatched_tip_marker_resubmits(self, tmp_path: Path):
+        f = await self._run(tmp_path, _marker(tip='f' * 40))
+
+        assert f.merge_queue.qsize() == 1
+        assert f.merge_queue.get_nowait().snapshot_tip == _TIP
+
+    async def test_malformed_marker_resubmits(self, tmp_path: Path):
+        f = await self._run(tmp_path, 'not-a-dict')
+
+        assert f.merge_queue.qsize() == 1
