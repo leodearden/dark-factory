@@ -46,6 +46,8 @@ find_near_duplicate_memory_groups = _mod.find_near_duplicate_memory_groups
 pick_survivor = _mod.pick_survivor
 build_sweep_plan = _mod.build_sweep_plan
 fetch_procedural_memories = _mod.fetch_procedural_memories
+fetch_memories = _mod.fetch_memories
+_ALL_CATEGORIES = _mod._ALL_CATEGORIES
 apply_deletions = _mod.apply_deletions
 
 
@@ -1254,5 +1256,217 @@ class TestAnnPathCatchesParaphraseLexicalPathMisses:
         """
         memories = _load_fixture_pair()
         plan = build_sweep_plan(memories)
+        assert plan['clusters_total'] == 0
+        assert plan['delete_candidates'] == []
+
+
+# ===========================================================================
+# All three Mem0 categories, both filter sites (task 3210)
+# ===========================================================================
+
+_PK = 'procedural_knowledge'
+_PN = 'preferences_and_norms'
+_OS = 'observations_and_summaries'
+
+
+def _scroll_mock(by_category: dict[str, list[dict]]):
+    """AsyncMock scroll_by_metadata dispatching on the filter's category."""
+    from unittest.mock import AsyncMock  # noqa: PLC0415
+
+    async def _scroll(scope, filters, limit=1000, **kwargs):
+        return list(by_category.get(filters.get('category'), []))
+
+    return AsyncMock(side_effect=_scroll)
+
+
+@pytest.mark.asyncio
+class TestFetchMemoriesAllCategories:
+    """One scroll per category — scroll_by_metadata is AND-equality only.
+
+    There is no OR filter available, so a single widened call cannot express
+    "any of these three categories". Three scrolls is the shape the primitive
+    actually supports, not a missed optimisation.
+    """
+
+    async def test_one_scroll_per_category_with_vectors_forwarded(self):
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        memory = MagicMock()
+        memory.mem0 = MagicMock()
+        memory.mem0.scroll_by_metadata = _scroll_mock({})
+
+        await fetch_memories(
+            memory, 'dark_factory', categories=(_PK, _PN, _OS),
+            scan_limit=99, with_vectors=True,
+        )
+
+        assert memory.mem0.scroll_by_metadata.await_count == 3
+        seen = []
+        for call in memory.mem0.scroll_by_metadata.await_args_list:
+            assert call.args[0].project_id == 'dark_factory'
+            seen.append(call.args[1]['category'])
+            assert call.kwargs.get('limit') == 99
+            assert call.kwargs.get('with_vectors') is True
+        assert seen == [_PK, _PN, _OS]
+
+    async def test_default_categories_are_the_three_mem0_categories(self):
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        memory = MagicMock()
+        memory.mem0 = MagicMock()
+        memory.mem0.scroll_by_metadata = _scroll_mock({})
+
+        await fetch_memories(memory, 'dark_factory')
+
+        requested = [
+            c.args[1]['category'] for c in memory.mem0.scroll_by_metadata.await_args_list
+        ]
+        assert set(requested) == {_PK, _PN, _OS}
+        assert set(_ALL_CATEGORIES) == {_PK, _PN, _OS}
+
+    async def test_merges_records_and_lifts_category_and_vector(self):
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        memory = MagicMock()
+        memory.mem0 = MagicMock()
+        memory.mem0.scroll_by_metadata = _scroll_mock({
+            _PK: [{'id': 'a', 'created_at': None,
+                   'metadata': {'data': 'pk text', 'category': _PK}, 'vector': [0.1]}],
+            _PN: [{'id': 'b', 'created_at': None,
+                   'metadata': {'data': 'pn text', 'category': _PN}, 'vector': [0.2]}],
+            _OS: [{'id': 'c', 'created_at': None,
+                   'metadata': {'data': 'os text', 'category': _OS}, 'vector': None}],
+        })
+
+        records, _stats = await fetch_memories(
+            memory, 'dark_factory', with_vectors=True,
+        )
+
+        by_id = {r['id']: r for r in records}
+        assert set(by_id) == {'a', 'b', 'c'}
+        assert by_id['a']['category'] == _PK
+        assert by_id['b']['category'] == _PN
+        assert by_id['c']['category'] == _OS
+        assert by_id['a']['content'] == 'pk text'
+        assert by_id['a']['vector'] == [0.1]
+        assert by_id['c']['vector'] is None, 'a vector-less record survives, degraded not dropped'
+
+    async def test_per_category_truncation_is_counted_separately(self):
+        """A cap firing on ONE category must not be reported as a clean scan."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        memory = MagicMock()
+        memory.mem0 = MagicMock()
+        memory.mem0.scroll_by_metadata = _scroll_mock({
+            _PK: [{'id': f'p{i}', 'created_at': None,
+                   'metadata': {'data': f't{i}', 'category': _PK}} for i in range(3)],
+            _PN: [{'id': 'q', 'created_at': None, 'metadata': {'data': 'x', 'category': _PN}}],
+        })
+
+        _records, stats = await fetch_memories(memory, 'dark_factory', scan_limit=3)
+
+        assert stats[_PK]['scanned'] == 3
+        assert stats[_PK]['truncated'] == 1, 'len(records) >= scan_limit must count as truncated'
+        assert stats[_PN]['scanned'] == 1
+        assert stats[_PN]['truncated'] == 0
+        assert stats[_OS]['scanned'] == 0
+        assert stats[_OS]['truncated'] == 0
+
+    async def test_fetch_procedural_memories_alias_still_single_category(self):
+        """The 3136-scheduled path keeps working byte-for-byte."""
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        memory = MagicMock()
+        memory.mem0 = MagicMock()
+        memory.mem0.scroll_by_metadata = _scroll_mock({
+            _PK: [{'id': 'a', 'created_at': None,
+                   'metadata': {'data': 'pk text', 'category': _PK}}],
+            _PN: [{'id': 'b', 'created_at': None,
+                   'metadata': {'data': 'pn text', 'category': _PN}}],
+        })
+
+        result = await fetch_procedural_memories(memory, 'dark_factory', scan_limit=100)
+
+        assert memory.mem0.scroll_by_metadata.await_count == 1
+        assert [r['id'] for r in result] == ['a']
+        assert isinstance(result, list), 'alias returns a bare list, not a (records, stats) tuple'
+        assert 'vector' not in result[0], 'alias defaults to payload-only'
+
+
+class TestBuildSweepPlanAllCategories:
+    """The Python-side filter widens to all three categories, but never merges them."""
+
+    def test_preferences_and_observations_are_no_longer_dropped(self):
+        memories = [
+            _memory('p1', _VENV_GOTCHA_A, category=_PN),
+            _memory('p2', _VENV_GOTCHA_B, category=_PN),
+            _memory('o1', _VENV_GOTCHA_A, category=_OS),
+            _memory('o2', _VENV_GOTCHA_B, category=_OS),
+        ]
+        plan = build_sweep_plan(memories, threshold=_THRESHOLD)
+        assert plan['clusters_total'] == 2, (
+            'preferences_and_norms and observations_and_summaries must each cluster'
+        )
+        assert len(plan['delete_candidates']) == 2
+
+    def test_other_categories_still_excluded(self):
+        memories = [
+            _memory('e1', _VENV_GOTCHA_A, category='entities_and_relations'),
+            _memory('e2', _VENV_GOTCHA_B, category='entities_and_relations'),
+        ]
+        plan = build_sweep_plan(memories, threshold=_THRESHOLD)
+        assert plan['clusters_total'] == 0
+        assert plan['delete_candidates'] == []
+
+    def test_cross_category_near_duplicates_never_union(self):
+        """Identical text in two categories is two records, not one duplicate.
+
+        A preference and a procedure that happen to read alike are different
+        kinds of knowledge; deleting one because the other exists would be a
+        cross-store data loss, not a deduplication.
+        """
+        memories = [
+            _memory('a', _VENV_GOTCHA_A, category=_PK),
+            _memory('b', _VENV_GOTCHA_A, category=_PN),
+        ]
+        plan = build_sweep_plan(memories, threshold=_THRESHOLD)
+        assert plan['clusters_total'] == 0
+        assert plan['delete_candidates'] == []
+
+    def test_each_category_clusters_independently_in_one_run(self):
+        memories = [
+            _memory('k1', _VENV_GOTCHA_A, category=_PK),
+            _memory('k2', _VENV_GOTCHA_B, category=_PK),
+            _memory('k3', _VENV_GOTCHA_C, category=_PK),
+            _memory('n1', _VENV_GOTCHA_A, category=_PN),
+            _memory('n2', _VENV_GOTCHA_B, category=_PN),
+            _memory('d1', _DISTRACTOR, category=_OS),
+        ]
+        plan = build_sweep_plan(memories, threshold=_THRESHOLD)
+        assert plan['clusters_total'] == 2
+        members = [set(g['member_ids']) for g in plan['near_duplicate_groups']]
+        assert {'k1', 'k2', 'k3'} in members
+        assert {'n1', 'n2'} in members
+
+    def test_explicit_categories_argument_narrows_the_sweep(self):
+        memories = [
+            _memory('k1', _VENV_GOTCHA_A, category=_PK),
+            _memory('k2', _VENV_GOTCHA_B, category=_PK),
+            _memory('n1', _VENV_GOTCHA_A, category=_PN),
+            _memory('n2', _VENV_GOTCHA_B, category=_PN),
+        ]
+        plan = build_sweep_plan(memories, threshold=_THRESHOLD, categories=(_PK,))
+        assert plan['clusters_total'] == 1
+        assert set(plan['near_duplicate_groups'][0]['member_ids']) == {'k1', 'k2'}
+
+    def test_ann_pairs_spanning_categories_are_dropped(self):
+        """Even if ANN proposes a cross-category pair, it must not cluster."""
+        memories = [
+            _memory('a', 'alpha text', category=_PK),
+            _memory('b', 'beta text', category=_PN),
+        ]
+        plan = build_sweep_plan(
+            memories, threshold=_THRESHOLD, ann_pairs=[(0, 1)], ann_threshold=0.9,
+        )
         assert plan['clusters_total'] == 0
         assert plan['delete_candidates'] == []
