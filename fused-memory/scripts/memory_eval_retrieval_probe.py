@@ -906,3 +906,72 @@ def observe_phrasing(
         matched_by=outcome.matched_by,
         degraded=degraded,
     )
+
+
+# ---------------------------------------------------------------------------
+# superseded-above-successor — a pure ranking comparison
+#
+# Reads ONLY registry-recorded hash pairs. metadata['supersedes'] is never
+# touched: that shape zoo is normalize_supersedes()' problem (task 3196, leaf
+# gamma's hard dependency), and a second parser here would be exactly the
+# lockstep duplication INV-5 forbids. Because the relation was recorded offline
+# at derivation time, this function needs no pointer knowledge at all.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class InversionRecord:
+    """A superseded entry that outranked the entry which replaced it."""
+
+    topic: str
+    phrasing: str
+    superseded_hash: str
+    successor_hash: str
+    superseded_rank: int
+    successor_rank: int
+
+
+def superseded_inversions(
+    results: list,
+    entry: RegistryEntry,
+    *,
+    phrasing: str = '',
+) -> list[InversionRecord]:
+    """Registry-recorded pairs where the superseded entry outranks its successor.
+
+    Both-present-only: a pair with just one member in *results* yields nothing.
+    An absent successor is a findability question ``canonical-in-top-k`` already
+    measures, and counting it here as well would charge one defect against two
+    metrics — inflating any downstream trend by double-weighting a single fix.
+
+    Rank is the position in the list the store returned, so equal
+    ``relevance_score`` values resolve by that order rather than by an unstable
+    re-sort. Two runs over the same list therefore produce the same count; a
+    tie that flapped would look to the evaluator like a real regression.
+
+    Records name both hashes and both ranks: a bare count tells an operator
+    that something inverted but not which pair to go and look at.
+    """
+    if not entry.supersedes_pairs:
+        return []
+
+    first_rank: dict[str, int] = {}
+    for index, result in enumerate(results, start=1):
+        key = content_key(_result_content(result))
+        first_rank.setdefault(key, index)
+
+    inversions: list[InversionRecord] = []
+    for pair in entry.supersedes_pairs:
+        superseded_rank = first_rank.get(pair.superseded_hash)
+        successor_rank = first_rank.get(pair.successor_hash)
+        if superseded_rank is None or successor_rank is None:
+            continue
+        if superseded_rank < successor_rank:
+            inversions.append(InversionRecord(
+                topic=entry.topic,
+                phrasing=phrasing,
+                superseded_hash=pair.superseded_hash,
+                successor_hash=pair.successor_hash,
+                superseded_rank=superseded_rank,
+                successor_rank=successor_rank,
+            ))
+    return inversions
