@@ -4193,13 +4193,26 @@ def _inflight_worktree_is_stale(
        where the escalation server sees an older worker).  Distinguished from
        an *empty* ledger, which is a live worker's honest answer and still
        permits the decisive check below.
-    5. *wt* is unresolvable (OSError) — cannot establish ownership.
+    5. The ownership comparison cannot be computed — *wt* is unresolvable
+       (OSError), or ``owned_merge_worktrees`` is not an iterable of
+       path-likes (TypeError/ValueError, e.g. an int, or a list holding a
+       non-path element).  A malformed snapshot must degrade to "coalesce",
+       never fail the caller's submission: this predicate is reached from the
+       ``merge_request`` MCP tool, so an exception here would reject the
+       submission outright instead of falling back to today's behaviour.
     6. *wt* is not in this worker's ledger — foreign / pre-restart merger; its
        mtime is real evidence, so the crash-safety property is preserved.
+
+    The final branch scan is guarded the same way: a snapshot whose
+    ``entries`` is not a list of dicts yields False rather than raising.
 
     Ownership is compared on ``Path.resolve()``, matching how
     :meth:`SpeculativeMergeWorker.worktree_ledger_violations` already
     normalises the same ledger, so the two ownership tests can never disagree.
+    The real producer (:meth:`SpeculativeMergeWorker.snapshot`) already emits
+    resolved strings, so re-normalising here is redundant for it — but it is
+    what lets a hand-built ledger (a test double, or any caller assembling the
+    dict itself) spell a path unnormalised and still be recognised as owned.
     """
     if live_snapshot is None:
         return False
@@ -4218,13 +4231,21 @@ def _inflight_worktree_is_stale(
     try:
         wt_key = str(Path(wt).resolve())
         owned_keys = {str(Path(p).resolve()) for p in owned}
-    except OSError:
-        return False  # unresolvable path → fail-safe: not stale → coalesce
+    except (OSError, TypeError, ValueError):
+        # Unresolvable path, or a ledger that is not an iterable of
+        # path-likes.  Fail-safe: not stale → coalesce.  Broader than OSError
+        # alone because the realistically-malformed input is a wrong-typed
+        # ledger (TypeError), not an unresolvable path — `Path.resolve()` is
+        # non-strict and practically never raises.
+        return False
     if wt_key not in owned_keys:
         return False  # not ours → mtime is real evidence → keep coalescing
     # Owned by this worker: mtime is heartbeat-pinned, so the ONLY liveness
     # signal is whether the live pipeline still carries this branch.
-    return not any(e.get('branch') == branch for e in snap['entries'])
+    try:
+        return not any(e.get('branch') == branch for e in snap['entries'])
+    except (TypeError, AttributeError):
+        return False  # malformed 'entries' → fail-safe: not stale → coalesce
 
 
 def _snapshot_verify_state(
@@ -4576,73 +4597,108 @@ async def coalesce_or_enqueue_merge_request(
     if git_ops is not None:
         wt = await git_ops.find_inflight_merge_worktree(branch)
         if wt is not None:
+            # Two independent corpse tests, evaluated as ALTERNATIVES (not
+            # nested cases) and collapsed to a single reap below.
+            #   'finalized_owner' — owned by THIS worker (so its root mtime is
+            #     heartbeat-pinned by _touch_owned_merge_worktrees and carries
+            #     no information about merge liveness) while the live pipeline
+            #     holds no entry for the branch: the owning request already
+            #     finalized.  Without this test the mtime test below coalesces
+            #     onto the corpse forever and the branch can never re-enter the
+            #     merge queue until the process restarts.
+            #   'stale_inflight' — the pre-existing age test: an owner that
+            #     died long enough ago that even an unpinned mtime went cold.
+            #   None — alive: coalesce.
             if _inflight_worktree_is_stale(wt, branch, live_snapshot):
-                # FINALIZED-OWNER CORPSE: this worker owns the worktree (so its
-                # root mtime is heartbeat-pinned and carries no information about
-                # merge liveness) but the live pipeline holds no entry for the
-                # branch, i.e. the owning request already finalized.  Reap it so
-                # a fresh merger can be dispatched — otherwise the mtime check
-                # below coalesces onto the corpse forever and the branch can
-                # never re-enter the merge queue until the process restarts.
-                logger.warning(
-                    'coalesce_or_enqueue_merge_request: reaping FINALIZED-OWNER '
-                    '_merge-* worktree %s for branch %r (owned by this worker but no '
-                    'live entry for the branch — its request already finalized; root '
-                    'mtime is heartbeat-pinned and cannot be trusted). Dispatching fresh.',
-                    wt, branch,
+                reap_reason: str | None = 'finalized_owner'
+                reap_detail = (
+                    'owned by this worker but no live entry for the branch — its '
+                    'request already finalized; root mtime is heartbeat-pinned and '
+                    'cannot be trusted'
                 )
-                await git_ops.cleanup_merge_worktree(wt)
-                if event_store is not None:
-                    event_store.emit(
-                        EventType.worktree_reaped,
-                        task_id=req.task_id,
-                        phase='merge',
-                        data={'branch': branch, 'path': str(wt), 'reason': 'finalized_owner'},
-                    )
-                # Fall through to acquire-and-enqueue below
             else:
                 try:
                     age = time.time() - wt.stat().st_mtime
                 except OSError:
                     age = 0.0  # stat failed — treat as alive to be safe
-                if age <= liveness_secs:
-                    # ALIVE: coalesce without enqueuing or reaping.
-                    # No alias is registered here: the primary request_id belongs to
-                    # a different process, so there is no in-process registry entry
-                    # to alias onto.  Callers polling the coalesced id fall through
-                    # to the event-store / git-authority tiers on a ring miss.
-                    _emit_merge_coalesced(event_store, req, source='worktree', eta=None)
-                    return MergeDispatchResult(
-                        dispatched=False,
-                        in_flight=True,
-                        branch=branch,
-                        source='worktree',
-                    )
+                if age > liveness_secs:
+                    reap_reason = 'stale_inflight'
+                    reap_detail = f'age={age:.0f}s > liveness={liveness_secs}s'
                 else:
-                    # STALE/ABANDONED: reap the abandoned worktree so a fresh merger
-                    # can be dispatched.  Foreign-process killing is deliberately out
-                    # of scope — there is no cwd-based kill utility in the repo
-                    # (terminate_process_group only handles procs the orchestrator
-                    # spawned), and git worktree remove --force removes the tree so
-                    # any orphaned build procs fail when their cwd vanishes.
-                    logger.warning(
-                        'coalesce_or_enqueue_merge_request: reaping stale '
-                        '_merge-* worktree %s for branch %r (age=%.0fs > liveness=%ss)',
-                        wt, branch, age, liveness_secs,
-                    )
-                    await git_ops.cleanup_merge_worktree(wt)
-                    if event_store is not None:
-                        event_store.emit(
-                            EventType.worktree_reaped,
-                            task_id=req.task_id,
-                            phase='merge',
-                            data={
-                                'branch': branch,
-                                'path': str(wt),
-                                'reason': 'stale_inflight',
-                            },
-                        )
-                    # Fall through to acquire-and-enqueue below
+                    reap_reason = None
+                    reap_detail = ''
+
+            if reap_reason is None:
+                # ALIVE: coalesce without enqueuing or reaping.
+                # No alias is registered here: the primary request_id belongs to
+                # a different process, so there is no in-process registry entry
+                # to alias onto.  Callers polling the coalesced id fall through
+                # to the event-store / git-authority tiers on a ring miss.
+                _emit_merge_coalesced(event_store, req, source='worktree', eta=None)
+                return MergeDispatchResult(
+                    dispatched=False,
+                    in_flight=True,
+                    branch=branch,
+                    source='worktree',
+                )
+
+            # REAP, then fall through to acquire-and-enqueue below.
+            # `cleanup_merge_worktree` IS the lease-guarded path: it routes
+            # through `remove_merge_worktree_guarded` (git_ops.py:8875-8878), so
+            # a tree whose merge-verify flock is held by a LIVE holder is
+            # SKIPPED, not yanked — the same C1 protection the C3 REPLACE reap
+            # above relies on.  It adds only a crash-safe filesystem fallback on
+            # the primitive's ``'failed'`` outcome, which by construction means
+            # the lease acquire already confirmed no live holder.  That matters
+            # most for 'finalized_owner', which (unlike the 10800 s mtime arm)
+            # can fire milliseconds after the owner retired its item.
+            # Foreign-process killing is deliberately out of scope — there is no
+            # cwd-based kill utility in the repo (terminate_process_group only
+            # handles procs the orchestrator spawned), and `git worktree remove
+            # --force` removes the tree so any orphaned build procs fail when
+            # their cwd vanishes.
+            logger.warning(
+                'coalesce_or_enqueue_merge_request: reaping %s _merge-* worktree '
+                '%s for branch %r (%s). Dispatching fresh.',
+                reap_reason, wt, branch, reap_detail,
+            )
+            await git_ops.cleanup_merge_worktree(wt)
+            # Observed post-condition, not the primitive's return value:
+            # cleanup_merge_worktree returns None and may apply its own fallback
+            # after the primitive returns, so "is the tree actually gone?" is the
+            # only honest outcome to record.  False means the removal was skipped
+            # (a live holder still owns the lane's flock) or failed — the reap is
+            # then a no-op and this call dispatches alongside a surviving tree,
+            # which the I6 audit/orphan reaper collect later.  Recorded rather
+            # than silently dropped (no-silent-fail-soft).
+            reap_removed = not wt.exists()
+            if not reap_removed:
+                logger.warning(
+                    'coalesce_or_enqueue_merge_request: %s reap did NOT remove %s '
+                    '(lease held by a live verify, or removal failed) — dispatching '
+                    'fresh alongside the surviving tree; the orphan reaper collects it',
+                    reap_reason, wt,
+                )
+            if event_store is not None:
+                event_store.emit(
+                    EventType.worktree_reaped,
+                    task_id=req.task_id,
+                    phase='merge',
+                    data={
+                        'branch': branch,
+                        'path': str(wt),
+                        'reason': reap_reason,
+                        'removed': reap_removed,
+                    },
+                )
+            # NB: this gate holds no worker handle, so it cannot drop the reaped
+            # path from `_owned_merge_worktrees` directly.  A 'finalized_owner'
+            # reap therefore leaves a phantom ledger entry for at most one
+            # heartbeat tick (~30 s), after which `_touch_owned_merge_worktrees`
+            # hits ENOENT and deregisters it.  Harmless in the interim: the
+            # exemption it grants (`keep_worktrees`) names a path that no longer
+            # exists, and the fresh merger gets a new `_merge-<uuid>` path, so
+            # the phantom can neither shadow it nor re-wedge the branch.
 
     # ── 3. Atomic acquire-and-enqueue ─────────────────────────────────
     if registry.acquire(branch, req.task_id, req.result, request_id=req.request_id):
@@ -7988,6 +8044,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         #   (e) Coalesced GroupMergeRequest merge worktrees ARE in scope;
         #       registered automatically at _merger_loop handoff (:5703).
         self._owned_merge_worktrees: set[Path] = set()
+        # task 3148: resolved-string memo for the ledger above, maintained by
+        # _register/_deregister_owned_merge_worktree so snapshot()'s
+        # 'owned_merge_worktrees' key stays a PURE IN-MEMORY read.  The
+        # resolve() (lstat/readlink per path component) happens once, at
+        # registration, instead of once per entry on every snapshot() — and
+        # snapshot() is called on every heartbeat tick before the interval
+        # gate, from _check_request_liveness, and from the get_merge_queue MCP
+        # tool, i.e. on the event loop.  Paths added to the set directly
+        # (tests, legacy call sites) are simply absent here and fall back to
+        # str(path); the consumer (_inflight_worktree_is_stale) re-normalises,
+        # so an unresolved fallback still matches.
+        self._owned_merge_wt_keys: dict[Path, str] = {}
         # One-warning-per-path set: added when a non-ENOENT OSError is logged
         # for a path; cleared on next successful touch or on ENOENT-drop so
         # each new failure episode emits exactly one WARNING.
@@ -8643,16 +8711,33 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         worktree is reset-in-place and already exempt from reaper scans
         (git_ops.py:2075), so touching it would be meaningless.
         The guard is also defence-in-depth against accidental registration.
+
+        Also memoises *wt*'s resolved string (task 3148) so
+        :meth:`snapshot`'s ``owned_merge_worktrees`` key needs no filesystem
+        I/O.  This is the right place to pay for it: registration happens once
+        per merge worktree, on a path that has just been created on disk,
+        while snapshot() runs on every heartbeat tick.  An unresolvable path
+        falls back to its literal string rather than being dropped — the
+        ledger must never silently lose an entry it is heartbeating.
         """
         if wt is None or wt.name == PERSISTENT_MERGE_WORKTREE_NAME:
             return
         self._owned_merge_worktrees.add(wt)
+        try:
+            self._owned_merge_wt_keys[wt] = str(wt.resolve())
+        except OSError:
+            self._owned_merge_wt_keys[wt] = str(wt)
 
     def _deregister_owned_merge_worktree(self, wt: Path | None) -> None:
-        """Remove *wt* from both ledger sets (idempotent)."""
+        """Remove *wt* from both ledger sets (idempotent).
+
+        Also drops its memoised resolved key (task 3148) so the memo can never
+        outlive the ledger entry it describes.
+        """
         if wt is None:
             return
         self._owned_merge_worktrees.discard(wt)
+        self._owned_merge_wt_keys.pop(wt, None)
         self._merge_wt_touch_warned.discard(wt)
 
     async def _cleanup_owned_merge_worktree(self, wt: Path | None) -> None:
@@ -10639,8 +10724,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # coalesce arm (coalesce_or_enqueue_merge_request §2) can tell a
             # heartbeat-pinned corpse (owned here, but no live entry for its
             # branch) from a foreign / pre-restart merger's worktree (not owned
-            # here), which must still coalesce for crash-safety.  Pure
-            # synchronous read — no await, no git, no stat.  Resolved absolute
+            # here), which must still coalesce for crash-safety.  PURE
+            # IN-MEMORY read — no await, no git, and no filesystem I/O: the
+            # .resolve() is paid once at _register_owned_merge_worktree time
+            # and memoised in _owned_merge_wt_keys, so this key never puts a
+            # blocking lstat/readlink chain on the event loop (snapshot() runs
+            # on every heartbeat tick before the interval gate, from
+            # _check_request_liveness, and from the get_merge_queue MCP tool).
+            # A path added to the set directly, bypassing the registrar, has no
+            # memo entry and falls back to str(p) — still I/O-free, and the
+            # consumer re-normalises, so it still matches.  Resolved absolute
             # strings so the value survives the JSON hop through
             # get_merge_queue; `sorted` makes snapshot-diffing deterministic.
             # Same .resolve() normalisation as worktree_ledger_violations, so
@@ -10650,7 +10743,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # metrics/frozen_prefix/two_layer_invariants/speculation/
             # resource_audit).
             'owned_merge_worktrees': sorted(
-                str(p.resolve()) for p in self._owned_merge_worktrees
+                self._owned_merge_wt_keys.get(p) or str(p)
+                for p in self._owned_merge_worktrees
             ),
         }
 

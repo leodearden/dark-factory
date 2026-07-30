@@ -12836,6 +12836,40 @@ class TestInflightWorktreeIsStale:
 
         assert _inflight_worktree_is_stale(real, 'br-h', _snap_odd_ledger) is True
 
+    def test_i_wrong_typed_snapshot_members_are_not_stale(self, tmp_path: Path):
+        """(i) A wrong-TYPED ledger/entries degrades to False, never raises.
+
+        The predicate is reached from the `merge_request` MCP tool, so an
+        exception escaping it fails the caller's SUBMISSION outright rather than
+        falling back to today's coalesce behaviour.  Case (c) covers a
+        wrong-shaped snapshot (not a dict / no 'entries'); this covers the
+        wrong-TYPED members that survive that shape check:
+
+          - `owned_merge_worktrees` not iterable (an int) → TypeError
+          - `owned_merge_worktrees` holding a non-path element → TypeError
+          - `entries` not iterable, or holding non-dicts → TypeError/AttributeError
+
+        These are the realistically-triggerable malformed inputs; the enumerated
+        OSError case is near-unreachable because `Path.resolve()` is non-strict.
+        """
+        from orchestrator.merge_queue import _inflight_worktree_is_stale
+
+        wt = tmp_path / '_merge-i'
+        wt.mkdir()
+        owned_ok = [str(wt.resolve())]
+
+        cases: list[dict] = [
+            {'entries': [], 'owned_merge_worktrees': 7},            # not iterable
+            {'entries': [], 'owned_merge_worktrees': [123]},        # non-path element
+            {'entries': [], 'owned_merge_worktrees': [None]},       # non-path element
+            {'entries': 7, 'owned_merge_worktrees': owned_ok},      # entries not iterable
+            {'entries': ['nope'], 'owned_merge_worktrees': owned_ok},   # non-dict entry
+        ]
+        for snap in cases:
+            assert _inflight_worktree_is_stale(wt, 'br-i', lambda s=snap: s) is False, (
+                f'malformed snapshot must degrade to coalesce, not raise: {snap}'
+            )
+
 
 # ---------------------------------------------------------------------------
 # TestCoalesceOrEnqueueWorktreePath — disk-scan coalesces alive worktrees
@@ -13001,8 +13035,8 @@ class TestCoalesceWorktreeCorpseReconcile:
         return EventStore(db_path=db, run_id='corpse-reconcile-test')
 
     @staticmethod
-    def _reap_reasons(db_path) -> list[str]:
-        """Return the `reason` of every worktree_reaped event, in insert order."""
+    def _reap_events(db_path) -> list[dict]:
+        """Return the `data` dict of every worktree_reaped event, in insert order."""
         import json
         import sqlite3
 
@@ -13014,7 +13048,17 @@ class TestCoalesceWorktreeCorpseReconcile:
             ).fetchall()
         finally:
             conn.close()
-        return [json.loads(r[0]).get('reason') for r in rows]
+        return [json.loads(r[0]) for r in rows]
+
+    @classmethod
+    def _reap_reasons(cls, db_path) -> list[str | None]:
+        """Return the `reason` of every worktree_reaped event, in insert order.
+
+        `str | None`, not `str`: an event whose data carries no `reason` must
+        surface as None here rather than be silently coerced to a reason-shaped
+        string.
+        """
+        return [d.get('reason') for d in cls._reap_events(db_path)]
 
     async def test_a_owned_corpse_is_reaped_and_dispatched(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
@@ -13079,6 +13123,16 @@ class TestCoalesceWorktreeCorpseReconcile:
             # when it is happening.
             assert _count_events(event_store.db_path, 'worktree_reaped') == 1
             assert self._reap_reasons(event_store.db_path) == ['finalized_owner']
+
+            # The reap records its OBSERVED outcome, so a removal that was
+            # skipped (a live verify still holding the lane's flock — the reap
+            # routes through the lease-guarded primitive) or that failed is
+            # visible in the event stream rather than silently indistinguishable
+            # from a successful reap.
+            assert self._reap_events(event_store.db_path)[0].get('removed') is True, (
+                f'reap event must record the observed removal: '
+                f'{self._reap_events(event_store.db_path)}'
+            )
 
         finally:
             if merge_wt is not None and merge_wt.exists():
@@ -17973,20 +18027,74 @@ class TestSnapshotOwnedMergeWorktrees:
             'owned_merge_worktrees',
         }
 
-    async def test_e_key_is_a_pure_synchronous_read(self, tmp_path: Path) -> None:
-        """(e) Producing the key performs no I/O and is stable across calls.
+    async def test_e_key_is_a_pure_synchronous_read(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """(e) Producing the key performs NO filesystem I/O, and is stable.
 
         Honors snapshot()'s documented contract: "Safe to call from any context
-        (no await, no lock)" — no git, no stat.
+        (no await, no lock)" — snapshot() is called on every heartbeat tick
+        (before the interval gate), from `_check_request_liveness`, and from the
+        `get_merge_queue` MCP tool, so a per-entry `Path.resolve()` would put a
+        blocking lstat/readlink chain on the event loop.
+
+        The assertion is REAL, not a stability characterization: `Path.resolve`
+        is monkeypatched to raise for the duration of the snapshot() calls, so
+        the test fails if the key is ever computed by resolving at read time.
+        Registration (which legitimately resolves, once) happens BEFORE the
+        patch is installed.
+
+        NB the worker is not running, so `worktree_ledger_violations` — the one
+        other ledger consumer inside snapshot() — short-circuits to [] before
+        its own scandir/resolve, keeping this patch scoped to the key under test.
         """
         worker = self._make_worker(tmp_path)
         p1 = tmp_path / '_merge-owned-1'
         p1.mkdir()
-        worker._register_owned_merge_worktree(p1)
+        worker._register_owned_merge_worktree(p1)  # resolve happens HERE, once
+
+        def _explode(self, *a, **kw):  # noqa: ANN001, ANN002, ANN003, ARG001
+            raise AssertionError(
+                'snapshot() resolved a ledger path at read time — the resolve '
+                'must be memoised at _register_owned_merge_worktree time'
+            )
+
+        monkeypatch.setattr(Path, 'resolve', _explode)
 
         first = worker.snapshot()['owned_merge_worktrees']
         second = worker.snapshot()['owned_merge_worktrees']
+
+        monkeypatch.undo()
         assert first == second == [str(p1.resolve())]
+
+    async def test_f_unregistered_path_falls_back_to_its_literal_string(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """(f) A path added to the ledger set directly still appears, I/O-free.
+
+        Several call sites and tests manipulate `_owned_merge_worktrees`
+        directly (e.g. `worker._owned_merge_worktrees = {p1, p2}` at
+        test_merge_queue.py:9792), bypassing the registrar that memoises the
+        resolved key.  Such a path must still be reported — dropping it would
+        make the ledger silently under-report exactly what the coalesce gate
+        reads for ownership — and must still cost no I/O.  The consumer
+        (`_inflight_worktree_is_stale`) re-normalises, so the unresolved
+        fallback spelling still matches (pinned by
+        TestInflightWorktreeIsStale.test_h).
+        """
+        worker = self._make_worker(tmp_path)
+        direct = tmp_path / '_merge-direct'
+        direct.mkdir()
+        worker._owned_merge_worktrees.add(direct)  # NO memo entry
+
+        def _explode(self, *a, **kw):  # noqa: ANN001, ANN002, ANN003, ARG001
+            raise AssertionError('fallback path must not resolve at read time')
+
+        monkeypatch.setattr(Path, 'resolve', _explode)
+        owned = worker.snapshot()['owned_merge_worktrees']
+        monkeypatch.undo()
+
+        assert owned == [str(direct)]
 
 
 # ---------------------------------------------------------------------------
