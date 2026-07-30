@@ -251,6 +251,169 @@ class TestLoadTopicRegistry:
         assert len(_mod().load_topic_registry(path).entries) == 1
 
 
+# ---------------------------------------------------------------------------
+# step-3: the committed registry fixture's data contract
+#
+# Loaded through load_topic_registry, so the fixture is validated by the
+# PRODUCTION loader rather than a test-local parser — a fixture that only a
+# bespoke test parser accepts is not a fixture the runner can read.
+# ---------------------------------------------------------------------------
+
+BRIEFING_QUERIES = (
+    'project overview architecture goals',
+    'coding conventions and project norms',
+    'recent decisions and rationale',
+)
+"""The three literal briefing-assembler queries (briefing.py:978-1013).
+
+The fourth is templated — ``f'task {task_id} context and related decisions'``
+— so it is asserted separately: a literal ``{id}`` is never a real query.
+"""
+
+BRIEFING_TASK_QUERY_PREFIX = 'task '
+BRIEFING_TASK_QUERY_SUFFIX = ' context and related decisions'
+
+MIN_TOPICS = 20
+"""A structural floor on fixture BREADTH, not a metric threshold.
+
+eval-design:296 targets ~20-40 topics. Nothing about a probe RESULT is
+compared to this number; it exists so a fixture silently shrinking to three
+topics — which would report a clean run because there was almost nothing to
+probe — fails the suite instead.
+"""
+
+MIN_PHRASINGS_PER_TOPIC = 3
+"""Also structural: one held-out plus at least two ordinary phrasings, so a
+topic's pooled rate is never a single coin flip."""
+
+
+@pytest.fixture(scope='module')
+def registry():
+    return _mod().load_topic_registry(REGISTRY_PATH)
+
+
+def _guard_cluster_phrases() -> set[str]:
+    from fused_memory.config.schema import _default_topic_guard_clusters  # noqa: PLC0415
+
+    return {
+        phrase.strip().lower()
+        for cluster in _default_topic_guard_clusters()
+        for phrase in cluster.phrases
+    }
+
+
+class TestCommittedRegistryFixture:
+    """The committed registry is the probe's input — its shape is a contract."""
+
+    def test_fixture_exists_and_parses(self, registry):
+        assert REGISTRY_PATH.is_file()
+        assert registry.schema_version == _mod().REGISTRY_SCHEMA_VERSION
+        assert registry.entries
+
+    def test_topic_slugs_are_unique_and_slug_shaped(self, registry):
+        topics = [e.topic for e in registry.entries]
+        assert len(topics) == len(set(topics))
+        for topic in topics:
+            assert _mod()._SLUG_RE.match(topic), f'{topic!r} is not slug-shaped'
+
+    def test_breadth_floor(self, registry):
+        assert len(registry.entries) >= MIN_TOPICS
+
+    def test_every_entry_has_enough_phrasings_including_a_held_out_one(self, registry):
+        for entry in registry.entries:
+            assert len(entry.phrasings) >= MIN_PHRASINGS_PER_TOPIC, entry.topic
+            assert entry.held_out_phrasings, entry.topic
+
+    def test_every_entry_has_a_claim_query_with_needles(self, registry):
+        for entry in registry.entries:
+            assert entry.claim_queries, entry.topic
+            for claim in entry.claim_queries:
+                assert claim.needles, f'{entry.topic}: {claim.query!r} has no needles'
+
+    def test_canonical_hashes_match_content_key_shape(self, registry):
+        for entry in registry.entries:
+            digest = entry.canonical.content_hash
+            assert len(digest) == 16, entry.topic
+            assert all(c in '0123456789abcdef' for c in digest), entry.topic
+
+    def test_member_hashes_match_content_key_shape(self, registry):
+        for entry in registry.entries:
+            for member in entry.members:
+                assert len(member) == 16, f'{entry.topic}: {member!r}'
+                assert all(c in '0123456789abcdef' for c in member), entry.topic
+
+    def test_project_ids_are_known(self, registry):
+        for entry in registry.entries:
+            assert entry.project_id in {'dark_factory', 'reify'}, entry.topic
+
+    def test_derived_from_is_in_the_closed_set(self, registry):
+        for entry in registry.entries:
+            assert entry.derived_from in _mod().DERIVED_FROM_VALUES, entry.topic
+
+    def test_supersedes_pairs_reference_distinct_hashes(self, registry):
+        for entry in registry.entries:
+            for pair in entry.supersedes_pairs:
+                assert pair.superseded_hash != pair.successor_hash, entry.topic
+
+    # -- the briefing-assembler query surface (eval-design:297) --
+
+    def test_literal_briefing_queries_appear_verbatim(self, registry):
+        all_phrasings = {p.text for e in registry.entries for p in e.phrasings}
+        for query in BRIEFING_QUERIES:
+            assert query in all_phrasings, f'briefing query {query!r} is not probed'
+
+    def test_templated_briefing_query_is_instantiated_not_literal(self, registry):
+        all_phrasings = {p.text for e in registry.entries for p in e.phrasings}
+        matches = [
+            text for text in all_phrasings
+            if text.startswith(BRIEFING_TASK_QUERY_PREFIX)
+            and text.endswith(BRIEFING_TASK_QUERY_SUFFIX)
+        ]
+        assert matches, 'the templated briefing query is not probed'
+        for text in matches:
+            middle = text[len(BRIEFING_TASK_QUERY_PREFIX):-len(BRIEFING_TASK_QUERY_SUFFIX)]
+            assert '{' not in middle and '}' not in middle, (
+                f'{text!r} carries a literal template placeholder; a probe must issue '
+                'the query a caller would actually issue, with a concrete task id.'
+            )
+            assert middle.strip(), text
+
+    # -- the Goodhart guard, made checkable --
+
+    def test_no_held_out_phrasing_duplicates_a_tuned_phrasing(self, registry):
+        tuned = {
+            p.text.strip().lower()
+            for e in registry.entries for p in e.phrasings if not p.held_out
+        }
+        for entry in registry.entries:
+            for phrasing in entry.held_out_phrasings:
+                assert phrasing.text.strip().lower() not in tuned, (
+                    f'{entry.topic}: held-out phrasing {phrasing.text!r} is also used as '
+                    'a tuned phrasing somewhere in the registry, so it is not held out.'
+                )
+
+    def test_no_held_out_phrasing_reuses_a_topic_guard_phrase(self, registry):
+        guard_phrases = _guard_cluster_phrases()
+        for entry in registry.entries:
+            for phrasing in entry.held_out_phrasings:
+                assert phrasing.text.strip().lower() not in guard_phrases, (
+                    f'{entry.topic}: held-out phrasing {phrasing.text!r} is one of the '
+                    'topic-guard phrases those entries were BUILT from — reusing it '
+                    'defeats the guard it exists to be.'
+                )
+
+    def test_held_out_phrasings_are_unique_across_the_registry(self, registry):
+        seen: dict[str, str] = {}
+        for entry in registry.entries:
+            for phrasing in entry.held_out_phrasings:
+                key = phrasing.text.strip().lower()
+                assert key not in seen, (
+                    f'held-out phrasing {phrasing.text!r} is shared by '
+                    f'{seen.get(key)!r} and {entry.topic!r}'
+                )
+                seen[key] = entry.topic
+
+
 class TestContentKey:
     """`content_key(text)` — whitespace-normalized sha256[:16]."""
 
