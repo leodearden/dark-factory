@@ -50,6 +50,10 @@ logger = logging.getLogger(__name__)
 # accepting it.  Sibling convention — the schema lives in the module that invokes
 # the CLI (task_curator.py:139, cli_stage_runner.py:95, agent_loop.py:27).
 _VERDICT_SEVERITY_VALUES = [s.value for s in VerdictSeverity]
+# Membership form of the same fact, for _call_judge_cli's severity guard. One
+# spelling, built once at import, so the schema's enum and the guard that
+# re-checks the model's answer against it cannot drift apart.
+_VERDICT_SEVERITY_SET = frozenset(_VERDICT_SEVERITY_VALUES)
 
 JUDGE_VERDICT_SCHEMA: dict[str, Any] = {
     'type': 'object',
@@ -579,28 +583,30 @@ Review this run and provide your verdict as JSON.
                     result, 'cli_output_unparseable',
                     f'structured_output was {type(structured).__name__}, not a dict',
                 )
+            # The severity guard is NOT redundant with the probe below, despite
+            # looking like it: _verdict_from_payload reads severity as
+            # ``data.get('severity', VerdictSeverity.ok)``, so a payload that
+            # OMITS severity entirely is silently normalised to a passing "ok"
+            # verdict and sails through JudgeVerdict validation.  A judge that
+            # never said "ok" must not be recorded as having said it.  (An
+            # out-of-enum severity would be caught either way; a missing one only
+            # here.)
             severity = structured.get('severity')
-            if severity not in {s.value for s in VerdictSeverity}:
+            if severity not in _VERDICT_SEVERITY_SET:
                 self._raise_unusable_output(
                     result, 'cli_output_unparseable',
                     f'structured_output severity {severity!r} is not a VerdictSeverity',
                 )
-            if not isinstance(structured.get('findings', []), list):
-                # JudgeVerdict construction would raise a pydantic
-                # ValidationError that review_run's broad except would swallow
-                # into a silent None — no verdict, no halt, no signal.
-                self._raise_unusable_output(
-                    result, 'cli_output_unparseable',
-                    'structured_output findings is not a list',
-                )
 
-            # Final catch-all: run the payload through the SAME constructor the
-            # real path will use, so every current AND future JudgeVerdict field
-            # constraint is enforced without hand-mirroring it here.  The guards
-            # above fire first (they give precise, individually-pinned
-            # diagnostics); this probe catches what they structurally cannot —
-            # e.g. findings is a list, but of bare strings, which JudgeVerdict's
-            # ``list[dict]`` rejects.
+            # Catch-all: run the payload through the SAME constructor the real
+            # path will use, so every current AND future JudgeVerdict field
+            # constraint is enforced without hand-mirroring it here.  This
+            # deliberately covers what a hand-written check would have to
+            # duplicate — a non-list ``findings``, or a list of bare strings that
+            # JudgeVerdict's ``list[dict]`` rejects — so the only bespoke guards
+            # left above are the ones the probe structurally CANNOT make
+            # (empty/non-dict payloads, which have no verdict to validate at all,
+            # and the missing-severity default described just above).
             #
             # Why this is not trusted to the schema: the payload is
             # model-produced across a cap-retry resume, the same reason

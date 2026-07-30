@@ -1165,11 +1165,12 @@ async def test_call_judge_cli_passes_judge_verdict_schema(mock_journal):
 def test_judge_verdict_schema_shape():
     """JUDGE_VERDICT_SCHEMA matches the verdict the judge is asked to produce.
 
-    The severity enum is asserted against ``VerdictSeverity`` itself (not a
-    hand-typed literal list) so schema and enum cannot drift — the enum is what
-    both ``_call_judge_cli``'s validation and ``JudgeVerdict``'s pydantic field
-    check.  The literal membership is pinned separately so a silent enum
-    widening still shows up here.
+    The severity enum is pinned against a LITERAL set, not against
+    ``VerdictSeverity``: the schema builds its enum from that very enum
+    (``_VERDICT_SEVERITY_VALUES``), so asserting the two agree can never fail and
+    is not coverage.  Pinning the literal is what actually catches something —
+    either a silent widening of VerdictSeverity or the schema quietly ceasing to
+    derive from it.
     """
     from fused_memory.reconciliation.judge import JUDGE_VERDICT_SCHEMA
 
@@ -1178,10 +1179,7 @@ def test_judge_verdict_schema_shape():
     assert 'findings' in JUDGE_VERDICT_SCHEMA['required']
 
     properties = JUDGE_VERDICT_SCHEMA['properties']
-    # Derived from the enum — drift is structurally impossible.
-    assert set(properties['severity']['enum']) == {s.value for s in VerdictSeverity}
-    # ...and the enum is exactly the four documented members today.
-    assert {s.value for s in VerdictSeverity} == {'ok', 'minor', 'moderate', 'serious'}
+    assert set(properties['severity']['enum']) == {'ok', 'minor', 'moderate', 'serious'}
     assert properties['findings']['type'] == 'array'
 
 
