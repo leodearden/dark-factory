@@ -1116,15 +1116,24 @@ def format_plan_quality_table(report: dict[str, Any]) -> str:
 #
 # The deterministic table surface for :func:`build_composite_report`, mirroring
 # the width-computed ljust idiom of format_recovery_table / format_plan_quality_
-# table above. Emits a per-config table (composite / quality / cost / cost_source
-# / latency / CI95 / trials / fixtures) followed by a DISTINCT price-table
-# section (config → role → input/output per-1M). Byte-stable: rows and sections
-# are sorted, floats fixed-precision, and no wall-clock is rendered.
+# table above. Emits a per-config table (composite / quality / plan_quality /
+# pq_excluded / cost / cost_source / latency / CI95 / trials / fixtures) followed
+# by a DISTINCT price-table section (config → role → input/output per-1M).
+# Byte-stable: rows and sections are sorted, floats fixed-precision, and no
+# wall-clock is rendered.
+#
+# ``plan_quality`` / ``pq_excluded`` (task 3099) make an architect campaign
+# rankable from the table alone. ``pq_excluded`` is a COUNT of that config's
+# unmeasurable (cap-tainted) architect cells; the per-CAUSE breakdown — which is
+# what separates a transient cap window from a permanent model-not-found — lives
+# only in :func:`format_plan_quality_table`, so the CLI emits both for an
+# architect result set.
 # ---------------------------------------------------------------------------
 
 _COMPOSITE_COLUMNS = (
-    'config', 'composite', 'quality', 'cost_usd', 'cost_source',
-    'latency_secs', 'ci95_composite', 'trials', 'fixtures',
+    'config', 'composite', 'quality', 'plan_quality', 'pq_excluded',
+    'cost_usd', 'cost_source', 'latency_secs', 'ci95_composite',
+    'trials', 'fixtures',
 )
 _PRICE_TABLE_COLUMNS = ('config', 'role', 'input_per_1m', 'output_per_1m')
 
@@ -1134,6 +1143,18 @@ def _ci_cell(ci: dict[str, Any] | None) -> str:
     if not ci:
         return '-'
     return f'[{float(ci.get("lo", 0.0)):.4f}, {float(ci.get("hi", 0.0)):.4f}]'
+
+
+def _optional_float_cell(value: Any, *, precision: int = 4) -> str:
+    """Render an OPTIONAL float cell: fixed precision, or ``-`` when unmeasured.
+
+    The same `-`-not-``0.0000`` idiom as ``_ci_cell`` above and
+    :func:`format_plan_quality_table`'s ``_score_cell``: a cell that measured
+    NOTHING (``None``) must never render as one that scored zero. Task 3099
+    extends the idiom to ``composite`` / ``quality``, which now report ``None``
+    for a config whose every trial was unmeasurable.
+    """
+    return '-' if value is None else f'{float(value):.{precision}f}'
 
 
 def _format_price_table_section(price_table: dict[str, Any]) -> list[str]:
@@ -1166,24 +1187,42 @@ def _format_price_table_section(price_table: dict[str, Any]) -> list[str]:
 def format_composite_table(report: dict[str, Any]) -> str:
     """Render :func:`build_composite_report` output as a deterministic table.
 
-    A per-config table carries composite / quality / cost_usd / cost_source /
-    latency_secs, a ``[lo, hi]`` CI95 rendering of the composite, and trial /
-    fixture counts, followed by a distinct ``price table`` section. The same
-    report always renders byte-identically (rows sorted by config, price-table
-    sections sorted, fixed float precision, no wall-clock/dict-order dependence).
-    An unpriced config's ``cost_source`` shows the explicit marker (e.g.
-    ``unpriced_proxy``), never a blank.
+    A per-config table carries composite / quality / plan_quality / pq_excluded /
+    cost_usd / cost_source / latency_secs, a ``[lo, hi]`` CI95 rendering of the
+    composite, and trial / fixture counts, followed by a distinct ``price table``
+    section. The same report always renders byte-identically (rows sorted by
+    config, price-table sections sorted, fixed float precision, no
+    wall-clock/dict-order dependence). An unpriced config's ``cost_source`` shows
+    the explicit marker (e.g. ``unpriced_proxy``), never a blank.
+
+    ``plan_quality`` (task 3099) is the θ-rubric score of a PLAN-ONLY architect
+    config and ``-`` for a workflow row that never invoked the plan judge — so an
+    operator can rank an architect campaign from this table alone instead of
+    recomputing from the per-cell result JSONs. ``pq_excluded`` is that config's
+    COUNT of unmeasurable (cap-tainted) architect cells; the per-CAUSE breakdown
+    that distinguishes a transient cap window from a permanent model-not-found is
+    deliberately NOT duplicated here — it lives in
+    :func:`format_plan_quality_table`, which the CLI emits alongside this table
+    for an architect result set.
+
+    ``composite`` / ``quality`` / ``plan_quality`` all render ``-`` when the row
+    measured nothing (:func:`_optional_float_cell`): "we measured nothing" must
+    never read as "it scored nothing".
     """
     configs = sorted(report.get('configs', []), key=lambda r: str(r.get('config', '')))
 
     rendered = [
         {
             'config': str(r.get('config', '')),
-            'composite': f'{float(r.get("composite", 0.0)):.4f}',
-            'quality': f'{float(r.get("quality", 0.0)):.4f}',
-            'cost_usd': f'{float(r.get("cost_usd", 0.0)):.4f}',
+            'composite': _optional_float_cell(r.get('composite')),
+            'quality': _optional_float_cell(r.get('quality')),
+            'plan_quality': _optional_float_cell(r.get('plan_quality')),
+            'pq_excluded': str(int(r.get('plan_quality_cap_excluded', 0) or 0)),
+            'cost_usd': _optional_float_cell(r.get('cost_usd', 0.0)),
             'cost_source': str(r.get('cost_source', '')),
-            'latency_secs': f'{float(r.get("latency_secs", 0.0)):.2f}',
+            'latency_secs': _optional_float_cell(
+                r.get('latency_secs', 0.0), precision=2,
+            ),
             'ci95_composite': _ci_cell((r.get('ci95') or {}).get('composite')),
             'trials': str(r.get('trials', 0)),
             'fixtures': str(r.get('fixtures', 0)),
