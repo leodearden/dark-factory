@@ -1145,6 +1145,48 @@ def test_render_report_without_verify_coverage_renders_no_verification_section()
     assert "## Verification" not in _render(verify_coverage=None)
 
 
+_PAYLOADS_PATH = "/p/plans/confusion-census-2026-07-30-payloads.json"
+
+
+def test_render_report_dry_run_filing_section_names_count_and_path():
+    report = _render(
+        filed_task_ids=[],
+        dry_run=mod.DryRunFiling(path=_PAYLOADS_PATH, payload_count=12),
+    )
+
+    section = report.split("## Filed Tasks", 1)[1].split("##", 1)[0]
+    assert "dry-run: 12 payload" in section
+    assert _PAYLOADS_PATH in section
+    assert "_none filed._" not in section
+
+
+def test_render_report_dry_run_takes_precedence_over_empty_filed_ids():
+    # An empty filed list plus a dry run must never read as "a normal run
+    # that happened to file nothing" -- the dry-run wording wins.
+    report = _render(
+        filed_task_ids=[],
+        dry_run=mod.DryRunFiling(path=_PAYLOADS_PATH, payload_count=3),
+    )
+
+    section = report.split("## Filed Tasks", 1)[1].split("##", 1)[0]
+    assert "_none filed._" not in section
+    assert "dry-run" in section.lower()
+    assert "nothing filed" in section.lower()
+
+
+def test_render_report_without_dry_run_filed_tasks_section_unchanged():
+    filed = _render(filed_task_ids=["1234", "1235"])
+    filed_section = filed.split("## Filed Tasks", 1)[1].split("##", 1)[0]
+    assert "- 1234" in filed_section
+    assert "- 1235" in filed_section
+    assert "dry-run" not in filed_section.lower()
+
+    none_filed = _render(filed_task_ids=[])
+    none_section = none_filed.split("## Filed Tasks", 1)[1].split("##", 1)[0]
+    assert "_none filed._" in none_section
+    assert "dry-run" not in none_section.lower()
+
+
 def test_render_report_flagless_output_is_byte_identical_golden():
     report = mod.render_report(
         date="2026-07-14",
