@@ -1929,6 +1929,190 @@ class TestUpdateMemoryCombinedArms:
         assert result['metadata_patched'] is True
 
 
+class _FakeClock:
+    """Advanceable monotonic-ish clock — the 3600s window without sleeping."""
+
+    def __init__(self, now: float = 1_000_000.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class TestUpdateMemoryStormCounter:
+    """INV-4 storm-escape for the silent-rewrite primitive (§4).
+
+    An agent stuck in a rewrite loop leaves no new records, no id churn and no
+    failed calls, so this alarm is the ONLY signal it produces. It is a
+    monitoring alarm, not a rate limiter: it never blocks the write.
+    """
+
+    @pytest.fixture
+    def stormy(self, service):
+        """A service with a fake clock and a stubbed escalator."""
+        clock = _FakeClock()
+        service._mem0_update_storm_time_provider = clock
+        service._mem0_update_storm_escalator = MagicMock()
+        service._mem0_update_storm_escalator.report_storm = MagicMock(return_value='esc-1')
+        return service, clock
+
+    async def _amend(self, service, agent_id='recon-stage-1', **kwargs):
+        return await service.update_memory(
+            memory_id='point-1', project_id='test',
+            content='amended text', reason='consolidation',
+            agent_id=agent_id, **kwargs,
+        )
+
+    @pytest.mark.asyncio
+    async def test_burst_reports_exactly_once(self, stormy):
+        """threshold calls in-window → one report, carrying the offending agent."""
+        service, _clock = stormy
+        threshold = service.config.mem0_update.storm_threshold
+
+        for _ in range(threshold):
+            await self._amend(service)
+
+        service._mem0_update_storm_escalator.report_storm.assert_called_once()
+        kwargs = service._mem0_update_storm_escalator.report_storm.call_args.kwargs
+        assert kwargs['agent_id'] == 'recon-stage-1'
+        assert kwargs['project_id'] == 'test'
+        assert kwargs['count'] == threshold
+        assert kwargs['threshold'] == threshold
+        assert kwargs['window_seconds'] == service.config.mem0_update.storm_window_seconds
+
+        # A sustained storm keeps writing but does not keep paging.
+        for _ in range(threshold):
+            await self._amend(service)
+        service._mem0_update_storm_escalator.report_storm.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_metadata_only_calls_never_count(self, stormy):
+        """§4's differential bar, made mechanical.
+
+        A mistagged patch is cheap to notice and cheap to correct; a runaway
+        silent content rewrite is neither. Counting patches would drown the
+        signal the counter exists to raise.
+        """
+        service, _clock = stormy
+        threshold = service.config.mem0_update.storm_threshold
+
+        for _ in range(threshold * 2):
+            await service.update_memory(
+                memory_id='point-1', project_id='test',
+                metadata_patch={'topic': 'x'}, agent_id='recon-stage-1',
+            )
+
+        service._mem0_update_storm_escalator.report_storm.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_counter_is_keyed_per_agent(self, stormy):
+        """Two busy-but-innocent agents must not sum into a false alarm."""
+        service, _clock = stormy
+        threshold = service.config.mem0_update.storm_threshold
+
+        for i in range(threshold * 2):
+            await self._amend(service, agent_id=f'recon-stage-{i % 2}')
+
+        service._mem0_update_storm_escalator.report_storm.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_breaching_call_still_succeeds_and_is_journaled(self, stormy):
+        """Alarm, not rate limiter.
+
+        Blocking would fail a legitimate large consolidation cycle mid-run over
+        its own success count — and would do it precisely when the run is going
+        well.
+        """
+        service, _clock = stormy
+        journal = _journal_mock()
+        service._write_journal = journal
+        threshold = service.config.mem0_update.storm_threshold
+
+        result = None
+        for _ in range(threshold):
+            result = await self._amend(service)
+
+        assert result is not None
+        assert result['status'] == 'updated'
+        assert result['content_amended'] is True
+        assert service.mem0.update.await_count == threshold
+        assert journal.log_write_op.await_count == threshold
+
+    @pytest.mark.asyncio
+    async def test_calls_outside_the_window_are_evicted(self, stormy):
+        """A slow steady rate never trips it."""
+        service, clock = stormy
+        threshold = service.config.mem0_update.storm_threshold
+        window = service.config.mem0_update.storm_window_seconds
+
+        for _ in range(threshold * 3):
+            await self._amend(service)
+            clock.advance(window)
+
+        service._mem0_update_storm_escalator.report_storm.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_threshold_change_takes_effect_on_the_next_call(self, stormy):
+        """The green-tier leaf is only honest if it is read live per call.
+
+        A threshold captured once at construction would leave
+        mem0_update.storm_threshold registered as hot-reloadable while silently
+        ignoring reloads — restart-only in disguise.
+        """
+        service, _clock = stormy
+        service.config.mem0_update.storm_threshold = 3
+
+        await self._amend(service)
+        await self._amend(service)
+        service._mem0_update_storm_escalator.report_storm.assert_not_called()
+
+        service.config.mem0_update.storm_threshold = 2
+        await self._amend(service)
+        service._mem0_update_storm_escalator.report_storm.assert_called_once()
+        assert service._mem0_update_storm_escalator.report_storm.call_args.kwargs[
+            'threshold'
+        ] == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('recon', ['absent', 'disabled'])
+    async def test_alarm_survives_reconciliation_being_off(self, stormy, recon):
+        """The escape hatch must exist unconditionally.
+
+        Reconciliation-disabled is exactly the degraded configuration where an
+        unattended rewrite loop is least likely to be noticed any other way, so
+        an alarm that vanished with it would be missing when it matters most.
+        """
+        service, _clock = stormy
+        if recon == 'absent':
+            service.config.reconciliation = None
+        else:
+            service.config.reconciliation.enabled = False
+        threshold = service.config.mem0_update.storm_threshold
+
+        for _ in range(threshold):
+            await self._amend(service)
+
+        service._mem0_update_storm_escalator.report_storm.assert_called_once()
+
+    def test_escalator_is_constructed_unconditionally(self, service):
+        """Owned by MemoryService — never borrowed from a conditional component."""
+        from fused_memory.middleware.mem0_update_storm_escalator import (
+            Mem0UpdateStormEscalator,
+        )
+
+        assert isinstance(service._mem0_update_storm_escalator, Mem0UpdateStormEscalator)
+
+    def test_set_known_projects_reaches_the_escalator(self, service):
+        """The registry snapshot must arrive where project_root resolution happens."""
+        service.set_known_projects({'dark_factory': '/home/leo/src/dark-factory'})
+        assert service._mem0_update_storm_escalator._known_projects == {
+            'dark_factory': '/home/leo/src/dark-factory',
+        }
+
+
 class TestUpdateEdgeVerification:
     """Tests for the post-write persistence verification in update_edge (Guard 2)."""
 
