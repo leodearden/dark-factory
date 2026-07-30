@@ -17,16 +17,58 @@ are likewise replicated rather than imported (test_harness_config_reload.py:31-3
 
 from __future__ import annotations
 
+import json
+import sqlite3
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
 import pytest
 import yaml
 from pydantic import ValidationError
 
 from orchestrator.config import (
+    RELOADABLE_FIELDS,
     MergeDeepConfig,
     OrchestratorConfig,
+    apply_reload,
     census_config_keys,
+    diff_config,
     load_config,
 )
+from orchestrator.event_store import EventStore
+from orchestrator.harness import Harness
+from orchestrator.run_store import RunStore
+
+# ---------------------------------------------------------------------------
+# Harness helpers replicated (not imported) from test_harness_config_reload.py:37-71
+# — the established pattern for these harness test helpers.
+# ---------------------------------------------------------------------------
+
+
+def _make_harness(tmp_path: Path) -> tuple[Harness, EventStore]:
+    """Build a Harness with a MagicMock RunStore and a real EventStore.
+
+    ``Harness(config)``'s ``__init__`` only wires up in-process collaborators, so
+    it is safe to call from a test — no MCP server, no full-startup side effects.
+    """
+    harness = Harness(OrchestratorConfig(project_root=tmp_path))
+    harness._run_store = MagicMock(spec=RunStore)
+    harness._run_id = 'run-test-0001'
+    event_store = EventStore(tmp_path / 'events.db', 'run-test-0001')
+    harness.event_store = event_store
+    return harness, event_store
+
+
+def _query_events(event_store: EventStore, event_type_str: str) -> list[dict]:
+    """Query all rows matching event_type_str from the EventStore's DB."""
+    conn = sqlite3.connect(str(event_store.db_path))
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        'SELECT * FROM events WHERE event_type = ? ORDER BY id',
+        (event_type_str,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
 class TestMergeDeepConfigDefaults:
@@ -122,3 +164,96 @@ class TestChainCapBoundValidation:
         practice". No upper bound is imposed — θ owns the ceiling question.
         """
         assert MergeDeepConfig(chain_cap=good_value).chain_cap == good_value
+
+
+class TestMergeDeepReloadDisposition:
+    """PRD decision #7: the knob is green-tier, so enable/retune/kill never needs
+    a process restart. Mirrors TestPsiAdmissionReloadDisposition
+    (test_config_psi_admission_reload.py:74).
+    """
+
+    @pytest.mark.parametrize('leaf', list(MergeDeepConfig.model_fields))
+    def test_every_leaf_is_reloadable(self, leaf):
+        """Parametrized over model_fields, not the literal name, so any knob
+        β/γ/θ add to the submodel later is covered by this same test with no edit.
+        """
+        assert f'merge_deep.{leaf}' in RELOADABLE_FIELDS, (
+            f'merge_deep.{leaf!r} is expected to be green-tier reloadable '
+            f'but is missing from RELOADABLE_FIELDS'
+        )
+
+    def test_cap_edit_lands_in_applied_candidates_not_restart_required(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig(merge_deep=MergeDeepConfig(chain_cap=0))
+        fresh = OrchestratorConfig(merge_deep=MergeDeepConfig(chain_cap=6))
+        diff = diff_config(live, fresh)
+        assert 'merge_deep.chain_cap' in diff.applied_candidates
+        assert 'merge_deep.chain_cap' not in diff.restart_required
+
+    def test_apply_reload_applies_in_place(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig(merge_deep=MergeDeepConfig(chain_cap=0))
+        fresh = OrchestratorConfig(merge_deep=MergeDeepConfig(chain_cap=6))
+        report = apply_reload(live, fresh)
+        assert report['reloaded'] is True
+        assert report['applied']['merge_deep.chain_cap'] == {'old': 0, 'new': 6}
+        assert 'merge_deep.chain_cap' not in report['restart_required']
+        assert live.merge_deep.chain_cap == 6
+
+    def test_reload_preserves_submodel_identity(self, monkeypatch, tmp_path):
+        """Invariant I3: β's chain builder and γ's dispatch gate may hold a
+        reference to the submodel, so a hot-reload must MUTATE it in place rather
+        than rebind the field — otherwise a held reference keeps reading a stale
+        cap and an operator's kill (cap -> 0) would not take effect.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig(merge_deep=MergeDeepConfig(chain_cap=0))
+        fresh = OrchestratorConfig(merge_deep=MergeDeepConfig(chain_cap=6))
+        submodel = live.merge_deep
+        apply_reload(live, fresh)
+        assert live.merge_deep is submodel, (
+            'apply_reload must mutate the merge_deep submodel in place (I3), not rebind it'
+        )
+        assert submodel.chain_cap == 6
+
+
+class TestHarnessReloadAppliesChainCap:
+    """The user-observable signal named in the task description: an operator
+    hot-reload reports the knob under the ``applied`` disposition.
+
+    This is exactly the assertion ``scripts/merge-deep-set-cap.sh`` (already on
+    main) makes over the MCP wire after upserting the cap, expressed here at
+    unit level.
+    """
+
+    @pytest.mark.asyncio
+    async def test_reload_config_reports_chain_cap_as_applied(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        harness, event_store = _make_harness(tmp_path)
+        assert harness.config.merge_deep.chain_cap == 0
+
+        fresh = OrchestratorConfig(project_root=tmp_path)
+        fresh.merge_deep.chain_cap = 6
+
+        config_path = tmp_path / 'orchestrator.yaml'
+        monkeypatch.setenv('ORCH_CONFIG_PATH', str(config_path))
+
+        with patch('orchestrator.harness.load_config', return_value=fresh):
+            report = await harness.reload_config()
+
+        assert report['reloaded'] is True
+        assert report['applied']['merge_deep.chain_cap'] == {'old': 0, 'new': 6}
+        assert 'merge_deep.chain_cap' not in report['restart_required']
+        assert harness.config.merge_deep.chain_cap == 6
+
+        rows = _query_events(event_store, 'config_reload')
+        assert len(rows) == 1, f'Expected exactly one config_reload event row; got {rows!r}'
+        data = json.loads(rows[0]['data'])
+        assert data['applied']['merge_deep.chain_cap'] == {'old': 0, 'new': 6}
