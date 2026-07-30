@@ -356,7 +356,13 @@ class McpClient:
 
     def set_task_claimant(self, task_id: int, project_root: str, *,
                           claimant_run_id=None, heartbeat_at=None) -> dict:
+        # The wire parameter is `id`, not `task_id` (fused-memory tools.py
+        # `set_task_claimant(id, project_root, tag, ...)`) -- matching the
+        # orchestrator's own call at scheduler.py:2409. Both claimant kwargs
+        # are tri-state server-side against a '__unset__' STRING sentinel, so
+        # an explicit JSON null is the CLEAR value; sending them is exactly
+        # what this consumer wants.
         return self.call_tool('set_task_claimant', {
-            'task_id': str(task_id), 'project_root': project_root,
+            'id': str(task_id), 'project_root': project_root,
             'claimant_run_id': claimant_run_id, 'heartbeat_at': heartbeat_at,
         })
