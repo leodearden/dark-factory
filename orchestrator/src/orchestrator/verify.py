@@ -5964,22 +5964,51 @@ async def run_main_tip_sweep(
         The harness treats ``None`` as "no signal — retry next tick" and does
         NOT mark the SHA as swept, so the same tip is retried on the next interval.
 
+    Isolated PRE-FILTER (task 3095, gated by
+    ``config.main_tip_sweep_isolated_prefilter_enabled``, default on): when the
+    first pass fails, ``_sweep_failure_reproduces_in_isolation`` re-runs JUST
+    the named failing node-ids — scoped, forced-serial, generous-timeout — in
+    this same pinned worktree BEFORE the full retry is paid for.  Only a
+    deterministic reproduction (``True``) short-circuits: the full retry is
+    skipped and the FIRST-PASS failing result is returned.  ``False``
+    (did-not-reproduce) and ``None`` (unconfirmable) both fall through to the
+    unchanged full retry below.  Setting the flag False restores
+    byte-identical pre-3095 behavior.
+
+    This is a COST gate, never a verdict.  The pre-filter can shorten the path
+    to a failing return but can never produce a passing one, so the sweep
+    NEVER returns a ``passed=True`` result derived from subset-only evidence —
+    which is what keeps the harness's self-heal precondition intact
+    (``_close_superseded_main_sweep_escalations`` fires on a passing sweep
+    result, and that must mean a genuine full-verify PASS; an isolated subset
+    re-run is weaker evidence than that).  Both error directions are safe:
+    a residue-induced false ``True`` only hands a FAILING result to the
+    harness, which still re-runs the node-ids in a FRESH worktree via
+    ``confirm_main_tip_failure_is_real`` — the sole suppression authority —
+    before filing anything; a false ``False`` merely pays for the retry as
+    before.
+
     Retry-on-flake: when the first ``run_full_verification`` call fails (and its
-    category is NOT one of the infra sentinels above), the function re-runs it
-    ONCE in the same pinned worktree (idempotent; no second ``git worktree
-    add``).  **The retry reuses first-pass worktree state by design** — no
-    cleanup of temp files, partially-written DBs, or caches is performed before
-    the re-run.  This is intentional: the purpose is a fast flake-vs-drift
-    heuristic, not a hermetic isolation guarantee.  A first run that fails
-    partway may leave residue that makes the retry non-representative in either
-    direction; the single-retry bound and the two-failure-escalates rule limit
-    the blast radius.
+    category is NOT one of the infra sentinels above, and the pre-filter did not
+    short-circuit), the function re-runs it ONCE in the same pinned worktree
+    (idempotent; no second ``git worktree add``).  **The retry reuses first-pass
+    worktree state by design** — no cleanup of temp files, partially-written
+    DBs, or caches is performed before the re-run.  This is intentional: the
+    purpose is a fast flake-vs-drift heuristic, not a hermetic isolation
+    guarantee.  A first run that fails partway may leave residue that makes the
+    retry non-representative in either direction; the single-retry bound and the
+    two-failure-escalates rule limit the blast radius.
 
     - Retry PASSES → emit a WARNING, append a record to
       ``verify._suppressed_flake_records`` (durable in-process audit trail), and
       return ``(main_sha, retry_result)`` so the harness files no drift
       escalation.  NOTE: this suppresses the flake but **MAY MASK a real
-      intermittent regression** introduced by a merge.
+      intermittent regression** introduced by a merge.  Since task 3095 that
+      masking window is NARROWER but not closed: it is now reachable only when
+      the pre-filter did NOT see the named tests reproduce, i.e. the failure
+      already looks load-induced — and a genuine FULL green is still required
+      to reach it.  A deterministic failure no longer gets a second lottery
+      ticket at being masked.
     - Retry FAILS → return ``(main_sha, retry_result)`` so deterministic drift
       still escalates.
     - Retry hits pytest INTERNALERROR or env_transient → return ``None``
@@ -6089,6 +6118,33 @@ async def run_main_tip_sweep(
                     'worktree to distinguish transient flake from deterministic drift',
                     _sha_prefix, result.category, result.cause_hint,
                 )
+
+                # COST pre-filter (task 3095): before paying for a whole
+                # second full-suite run, re-run just the named failing
+                # node-ids in isolation.  A deterministic reproduction means
+                # the full retry is near-certainly wasted work AND that the
+                # sweep would otherwise keep adding minutes of background load
+                # during a red-main investigation.  Only True short-circuits;
+                # False/None both fall through to the unchanged full retry, so
+                # a passing sweep result still requires a genuine FULL green.
+                # The helper never raises (its own WARNING-logged handler).
+                if (
+                    config.main_tip_sweep_isolated_prefilter_enabled
+                    and await _sweep_failure_reproduces_in_isolation(
+                        tmp_path, config, result,
+                    ) is True
+                ):
+                    logger.warning(
+                        'run_main_tip_sweep: first-pass failure at %s '
+                        'reproduced deterministically in isolation '
+                        '(category=%r, cause_hint=%r) — skipping the '
+                        'full-suite retry and returning the first-pass '
+                        'failure; the harness confirm gate still adjudicates '
+                        'before any escalation is filed',
+                        _sha_prefix, result.category, result.cause_hint,
+                    )
+                    return (main_sha, result)
+
                 retry = await run_full_verification(tmp_path, config, role='background')  # type: ignore[arg-type]
 
                 if retry.category in INFRA_TRANSIENT_CATEGORIES:
