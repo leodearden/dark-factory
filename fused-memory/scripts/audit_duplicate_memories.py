@@ -1,16 +1,75 @@
 #!/usr/bin/env python3
-"""One-shot + periodic sweep: find near-duplicate ``procedural_knowledge``
-Mem0 memories for a project and report (or delete) the losers.
+"""Corpus-health sweep: find near-duplicate Mem0 memories for a project,
+report (or delete) the losers, and emit a metric series for the eval program.
 
 Motivation: Stage-1 reconciliation (finding 2cf1b99f) observed the
 worktree-local-venv-vs-shared-checkout-venv gotcha rewritten as a
 near-duplicate ``procedural_knowledge`` memory >=13 times -- task-worker
 agents write the gotcha ad hoc without first ``search()``-ing Mem0 for
 existing coverage, so it recurs faster than any single consolidation pass
-absorbs it. This script is the automated backstop: it enumerates a project's
-``procedural_knowledge`` memories, clusters near-duplicates by CONTENT
-similarity (``difflib.SequenceMatcher.ratio()`` + union-find transitive
-closure), picks a survivor per cluster, and reports (or deletes) the rest.
+absorbs it. This script is the automated backstop.
+
+Two detectors, both reported
+----------------------------
+Candidate generation is dual-path; the transitive closure
+(``cluster_memories_by_pairs``) is shared, so the two can never disagree
+about what a cluster IS -- only about which pairs are candidates.
+
+  - LEXICAL: an O(n^2) ``difflib.SequenceMatcher.ratio()`` scan, tuned by
+    ``--threshold``. High precision on the near-verbatim rewrites that
+    dominate this corpus, structurally blind to paraphrase.
+  - ANN: each record's OWN stored Qdrant vector (fetched by
+    ``scroll_by_metadata(..., with_vectors=True)``) used as the query vector
+    for ``query_points``. Catches same-meaning/different-wording pairs the
+    lexical scan cannot, at zero embedding API calls and with no second
+    metric space.
+
+The ANN path is NOT a replacement -- swapping one detector for the other
+would lose signal, so the actioned plan clusters over the UNION and every
+emitted cluster records which path(s) found it (``found_by``,
+``lexical_clustered``, ``ann_max_score``, ``lexical_max_ratio``).
+
+The ANN cutoff is READ, never invented
+--------------------------------------
+It comes from ``config.write_triage.t_high`` -- a calibration OUTPUT derived
+by ``scripts/calibrate_write_triage.py`` from measured similarity
+distributions, with ``calibration_report_path`` recording its provenance.
+``--ann-threshold`` overrides it for an operator run, and the value actually
+in effect is echoed into the report. When the config is uncalibrated and no
+override is given the ANN path is DISABLED, logged at ERROR and counted as
+``ann_disabled_uncalibrated``; the lexical path still runs. A plausible
+stand-in cutoff would silently mis-cluster the corpus -- and under
+``--apply`` that means wrong deletions.
+
+Every cap is counted
+--------------------
+The ANN path can lose candidates where a full scan cannot, so each loss is a
+metric rather than invisible recall: ``top_k_saturated``,
+``below_threshold_dropped``, ``unknown_neighbor_dropped``, ``missing_vector``,
+``ann_query_errors``, per-category ``scan_truncated``, and
+``ann_disabled_uncalibrated``.
+
+Scope: all three Mem0 categories (``procedural_knowledge``,
+``preferences_and_norms``, ``observations_and_summaries``). Clustering runs
+once PER category, so a cross-category union is structurally impossible
+rather than merely unlikely. Graphiti-backed categories are out of scope:
+this detector reads the Qdrant collection and a Graphiti edge has no vector
+here to cluster on.
+
+Artifacts: one M1 metric series per run at
+``<--metrics-root>/<eval_id>/metrics-<STAMP>.json`` (default root
+``fused-memory/data/memory-evals/``, eval_id ``e6-corpus-health``), with a
+human-readable ``report-<STAMP>.txt`` and a ``details-<STAMP>.json`` carrying
+the cluster-size histogram, per-topic accretion table and per-event
+consolidation table. Schema lives in ``shared.memory_eval_metrics`` and is
+never restated here. Suppress with ``--no-metrics``.
+
+ORDERING NOTE -- scheduling and gate-filing belong to task 3136, not here.
+This script is a detector with a stable CLI and a stable stdout contract;
+3136 owns when it runs and what is done with the report. 3136's timer may
+subsume the eval program's leaf-epsilon invocation, so NEITHER owns the only
+schedule: adding a second trigger here would create a duplicate, and
+assuming 3136 always fires would leave the eval series with holes.
 
 Structural parallel to ``scripts/audit_duplicate_tasks.py`` (union-find
 near-duplicate clustering + pick_survivor + dry-run/apply split) and the Mem0
@@ -19,26 +78,32 @@ sweep-script family (``scripts/prune_recon_cycle_summaries.py``,
 ``memory.mem0.scroll_by_metadata``, delete losers via
 ``memory.delete_memory`` best-effort.
 
+Read-only against the live corpus except for ``--apply`` deletions and the
+artifact directory (memory-eval PRD §7).
+
 Safety carve-outs:
   - Dry-run report is the default; deletion only under explicit ``--apply``.
   - Only near-duplicate CLUSTERS above a high similarity threshold are
     actioned; a survivor (canonical-flagged, else oldest) is always retained
     per cluster.
-  - ``--apply`` refuses to run when the scan looks truncated
-    (``len(records) >= scan_limit``) so a truncated scan never silently
-    reaches deletions.
+  - ``--apply`` refuses on an empty scan, on a plan with nothing to delete,
+    and when ANY category's scan looks truncated -- a capped window may have
+    the survivor just outside it, so "delete the losers" could delete the
+    last copy.
+  - A cluster whose members all share one ``metadata.topic`` is task 3136's
+    Option-C carve-out: an expected shape, never a delete candidate.
   - Missing/unextractable content degrades to ``''``, which never clusters
     and is never deleted.
 
 Usage
 -----
-  # Dry run (default): print JSON report, change nothing.
+  # Dry run (default): print JSON report + write metrics, delete nothing.
   python scripts/audit_duplicate_memories.py --project-id dark_factory
 
   # Commit the deletions.
   python scripts/audit_duplicate_memories.py --project-id dark_factory --apply
 
-  # Tune near-duplicate threshold (default 0.85).
+  # Tune the LEXICAL threshold (default 0.85); the ANN cutoff is calibrated.
   python scripts/audit_duplicate_memories.py --project-id dark_factory \\
       --threshold 0.80
 """
@@ -53,6 +118,7 @@ import logging
 import sys
 from collections.abc import Iterable, Iterator
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger('audit_duplicate_memories')
@@ -921,6 +987,47 @@ def compute_cluster_metrics(
     return metrics, details
 
 
+def details_artifact_path(stamp: str) -> str:
+    """``details-<STAMP>.json`` — the companion payload's FILENAME.
+
+    A bare filename, not a path: it is both the name written beside
+    ``metrics-<STAMP>.json`` and the value stamped onto ``Metric.details_path``,
+    and a reader resolves it relative to the metrics file it came from. Naming
+    it once keeps those two uses from drifting apart.
+    """
+    return f'details-{stamp}.json'
+
+
+def emit_metrics_artifact(
+    series: Any,
+    details: dict[str, Any],
+    root: str | Any,
+    stamp: str,
+) -> tuple[Any, Any, Any]:
+    """Write the run's three artifacts, returning their paths.
+
+    Delegates the metrics + report write to
+    ``shared.memory_eval_metrics.write_metric_series``, which VALIDATES BEFORE
+    creating anything. The details file is written only afterwards, so a
+    rejected series leaves no directory and no partial artifact — a directory
+    holding only ``details-<STAMP>.json`` would read to the limits evaluator as
+    a run whose metrics file went missing, which is strictly worse than the run
+    never having written at all.
+
+    Returns:
+        ``(metrics_path, report_path, details_path)``.
+    """
+    from shared.memory_eval_metrics import write_metric_series  # noqa: PLC0415
+
+    metrics_path, report_path = write_metric_series(series, root, stamp=stamp)
+    details_path = metrics_path.parent / details_artifact_path(stamp)
+    details_path.write_text(
+        json.dumps(details, indent=2, sort_keys=True, default=str) + '\n',
+        encoding='utf-8',
+    )
+    return metrics_path, report_path, details_path
+
+
 def build_metric_series(
     project_id: str,
     metrics: Iterable[Any],
@@ -1260,6 +1367,30 @@ async def apply_deletions(
 # CLI / main
 # ---------------------------------------------------------------------------
 
+def _apply_refusal_reason(
+    records: list[dict],
+    scan_stats: dict[str, dict[str, int]],
+    scan_limit: int,
+) -> str | None:
+    """Why ``--apply`` must not run, or None if it may.
+
+    Irreversible-deletion guards (mirrors ``prune_recon_cycle_summaries.py``'s
+    scan-completeness guard). Truncation is judged PER CATEGORY: one capped
+    category is enough to refuse the whole apply, because a cluster's survivor
+    may be sitting just outside that window and "delete the losers" would then
+    delete the last copy.
+    """
+    if not records:
+        return 'scan returned 0 records — refusing to apply on an empty scan'
+    truncated = sorted(c for c, s in scan_stats.items() if s.get('truncated'))
+    if truncated:
+        return (
+            f'scan looks truncated for {truncated} (>= --scan-limit={scan_limit}) — '
+            'refusing to apply. Re-run with a higher --scan-limit'
+        )
+    return None
+
+
 async def _run(args: argparse.Namespace) -> int:
     logging.basicConfig(
         level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
@@ -1267,40 +1398,102 @@ async def _run(args: argparse.Namespace) -> int:
 
     import os  # noqa: PLC0415
 
-    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
-    from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+    from shared.memory_eval_metrics import run_stamp  # noqa: PLC0415
+
+    import fused_memory.config.schema as _schema  # noqa: PLC0415
+    import fused_memory.services.memory_service as _service  # noqa: PLC0415
 
     if args.config:
         os.environ['CONFIG_PATH'] = str(args.config)
 
-    config = FusedMemoryConfig()
-    memory = MemoryService(config)
+    categories = tuple(args.categories)
+    stamp = run_stamp()
+
+    config = _schema.FusedMemoryConfig()
+    memory = _service.MemoryService(config)
     await memory.initialize()
     try:
-        records = await fetch_procedural_memories(
-            memory, args.project_id, scan_limit=args.scan_limit,
-        )
-        logger.info('Fetched %d procedural_knowledge memory/memories', len(records))
+        # The ANN cutoff is READ from the calibration (or an explicit
+        # override). None means uncalibrated: the ANN path is disabled and
+        # counted, never run against a guessed threshold.
+        ann_threshold, disclosures = resolve_ann_threshold(memory, args.ann_threshold)
 
-        plan = build_sweep_plan(records, threshold=args.threshold)
+        records, scan_stats = await fetch_memories(
+            memory, args.project_id, categories=categories,
+            scan_limit=args.scan_limit, with_vectors=ann_threshold is not None,
+        )
+        logger.info(
+            'Fetched %d memory/memories across %s', len(records), list(categories),
+        )
+
+        ann_pairs: list[tuple[int, int]] = []
+        ann_scores: dict[tuple[int, int], float] = {}
+        if ann_threshold is not None:
+            neighbors, query_disclosure = await fetch_ann_neighbors(
+                memory, args.project_id, records,
+                top_k=args.ann_top_k, score_threshold=ann_threshold,
+            )
+            disclosures.update(query_disclosure)
+            ann_pairs, pair_disclosure = ann_pairs_from_neighbors(
+                records, neighbors, ann_threshold, top_k=args.ann_top_k,
+            )
+            disclosures.update(pair_disclosure)
+            index_by_id = {m.get('id'): i for i, m in enumerate(records)}
+            for left, right in ann_pairs:
+                best = 0.0
+                for hit in neighbors.get(records[left].get('id')) or []:
+                    if index_by_id.get(hit.get('id')) == right:
+                        best = max(best, hit.get('score') or 0.0)
+                ann_scores[(left, right)] = best
+        else:
+            disclosures.update(dict.fromkeys(_ANN_DISCLOSURE_KEYS, 0))
+            disclosures['ann_query_errors'] = 0
+
+        plan = build_sweep_plan(
+            records, threshold=args.threshold, categories=categories,
+            ann_pairs=ann_pairs, ann_scores=ann_scores,
+            ann_disclosure=disclosures, ann_threshold=ann_threshold,
+        )
+        # stdout is task 3136's report contract — unchanged shape, one JSON doc.
         print(json.dumps(plan, indent=2, default=str))
+
+        if not args.no_metrics:
+            records_by_category = {
+                category: [m for m in records if m.get('category') == category]
+                for category in categories
+            }
+            metrics, details = compute_cluster_metrics(
+                records_by_category,
+                split_plan_by_category(plan, categories),
+                {
+                    **disclosures,
+                    'scan_truncated': {
+                        c: int(scan_stats.get(c, {}).get('truncated', 0))
+                        for c in categories
+                    },
+                },
+                details_path=details_artifact_path(stamp),
+            )
+            series = build_metric_series(
+                args.project_id, metrics,
+                corpus_counts={c: len(v) for c, v in records_by_category.items()},
+                eval_id=args.eval_id, run_stamp=stamp,
+            )
+            metrics_path, _report, _details = emit_metrics_artifact(
+                series, details, args.metrics_root, stamp,
+            )
+            logger.info('Wrote metrics artifact %s', metrics_path)
 
         if not args.apply:
             logger.info('Dry run — nothing was modified. Use --apply to commit.')
             return 0
 
-        # Irreversible-deletion guards: never apply against an empty or
-        # suspected-truncated scan (mirrors prune_recon_cycle_summaries.py's
-        # scan-completeness guard).
-        if not records:
-            logger.error('ABORT: scan returned 0 records — refusing to apply on an empty scan.')
+        refusal = _apply_refusal_reason(records, scan_stats, args.scan_limit)
+        if refusal:
+            logger.error('ABORT: %s.', refusal)
             return 1
-        if len(records) >= args.scan_limit:
-            logger.error(
-                'ABORT: scan returned %d records >= --scan-limit=%d — scan looks '
-                'truncated; refusing to apply. Re-run with a higher --scan-limit.',
-                len(records), args.scan_limit,
-            )
+        if not plan['delete_candidates']:
+            logger.error('ABORT: plan has 0 delete candidates — nothing to apply.')
             return 1
 
         result = await apply_deletions(memory, args.project_id, plan, dry_run=False)
@@ -1313,19 +1506,44 @@ async def _run(args: argparse.Namespace) -> int:
         await memory.close()
 
 
-def main() -> int:
+_DEFAULT_METRICS_ROOT = str(Path(__file__).resolve().parent.parent / 'data' / 'memory-evals')
+"""``fused-memory/data/memory-evals`` (M1 §3), resolved off THIS file.
+
+Not off the cwd: a scheduled run's working directory is not guaranteed, and a
+relative default would scatter artifacts wherever the scheduler happened to
+start — invisible to the limits evaluator, which scans one root.
+"""
+
+_DEFAULT_ANN_TOP_K = 10
+"""Neighbours requested per record.
+
+A resource knob, not a similarity threshold: it trades query cost against
+recall, and when it binds the run says so (``top_k_saturated``) rather than
+quietly losing candidates. The cutoff that decides what IS a duplicate is
+never set here — see :func:`resolve_ann_threshold`.
+"""
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    """The CLI surface. Every flag added after the first release is optional.
+
+    ``--project-id X`` and ``--project-id X --apply`` — the invocation task
+    3136 schedules — must keep parsing byte-for-byte, so all of this task's
+    flags carry defaults.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         '--project-id', dest='project_id', required=True,
-        help='Project id to scan for near-duplicate procedural_knowledge memories',
+        help='Project id to scan for near-duplicate memories',
     )
     parser.add_argument(
         '--threshold', type=float, default=0.85,
-        help='Near-duplicate similarity threshold (default: 0.85)',
+        help='LEXICAL near-duplicate similarity threshold (default: 0.85). '
+             'Does not affect the ANN path, whose cutoff is calibrated.',
     )
     parser.add_argument(
         '--scan-limit', dest='scan_limit', type=int, default=5000,
-        help='Maximum number of procedural_knowledge memories to scan (default: 5000)',
+        help='Maximum number of memories to scan PER CATEGORY (default: 5000)',
     )
     parser.add_argument(
         '--apply', action='store_true',
@@ -1335,7 +1553,37 @@ def main() -> int:
         '--config', default=None,
         help='Path to fused-memory config file (sets CONFIG_PATH env var)',
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        '--categories', nargs='+', default=list(_ALL_CATEGORIES),
+        help=f'Mem0 categories to sweep (default: {" ".join(_ALL_CATEGORIES)})',
+    )
+    parser.add_argument(
+        '--ann-top-k', dest='ann_top_k', type=int, default=_DEFAULT_ANN_TOP_K,
+        help=f'ANN neighbours per record (default: {_DEFAULT_ANN_TOP_K}). '
+             'Saturation is reported as top_k_saturated.',
+    )
+    parser.add_argument(
+        '--ann-threshold', dest='ann_threshold', type=float, default=None,
+        help='Override the ANN cosine cutoff. Default: config.write_triage.t_high, '
+             'a calibration output. With neither, the ANN path is DISABLED.',
+    )
+    parser.add_argument(
+        '--metrics-root', dest='metrics_root', default=_DEFAULT_METRICS_ROOT,
+        help=f'Root for M1 metric artifacts (default: {_DEFAULT_METRICS_ROOT})',
+    )
+    parser.add_argument(
+        '--eval-id', dest='eval_id', default=_EVAL_ID,
+        help=f'Artifact directory name under --metrics-root (default: {_EVAL_ID})',
+    )
+    parser.add_argument(
+        '--no-metrics', dest='no_metrics', action='store_true',
+        help='Skip the metrics artifact (report to stdout only)',
+    )
+    return parser
+
+
+def main() -> int:
+    args = _build_parser().parse_args()
     return asyncio.run(_run(args))
 
 
