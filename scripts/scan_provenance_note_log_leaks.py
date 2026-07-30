@@ -42,7 +42,11 @@ tasks 2938/2939 and solves it by requiring structural evidence.
 """
 from __future__ import annotations
 
+import json
+import os
 import re
+import sqlite3
+from pathlib import Path
 from typing import NamedTuple
 
 # A real log line: ISO date+time (with optional ,milliseconds), then a
@@ -81,3 +85,124 @@ class NoteLeakMatch(NamedTuple):
     task_id: int
     provenance_kind: str
     leak_line: str
+
+
+def scan_db(db_path: str) -> list[NoteLeakMatch]:
+    """Scan *db_path* read-only for leaked log lines in done_provenance notes.
+
+    Opens the database via a read-only SQLite URI (``mode=ro``) so the scan is
+    structurally incapable of mutating live task data — even while the
+    fused-memory server holds the same file open in WAL mode for concurrent
+    writers. This matters concretely here: task 2902's note is a preserved
+    forensic specimen, and this tool must be unable to touch it.
+
+    Every row shape is tolerated: metadata that is NULL, undecodable, or a
+    JSON scalar/array rather than an object, and a ``done_provenance`` that is
+    absent or not a dict, are all skipped without raising. A single bad blob
+    among thousands of rows must never abort a sweep.
+    """
+    matches: list[NoteLeakMatch] = []
+    conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+    try:
+        for tag, task_id, metadata in conn.execute(
+            'SELECT tag, id, metadata FROM tasks'
+        ):
+            try:
+                meta = json.loads(metadata)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(meta, dict):
+                continue
+            provenance = meta.get('done_provenance')
+            if not isinstance(provenance, dict):
+                continue
+            leak_line = detect_log_leak(provenance.get('note'))
+            if leak_line is not None:
+                matches.append(NoteLeakMatch(
+                    db_path, tag, task_id,
+                    str(provenance.get('kind', '<unknown>')), leak_line,
+                ))
+    finally:
+        conn.close()
+    return matches
+
+
+# Multi-project discovery fallback, mirroring scan_task_toolcall_leaks.py's.
+_DEFAULT_PROJECT_ROOTS = ('/home/leo/src/dark-factory',)
+
+
+def _tasks_db_path(project_root: str) -> str:
+    return str(Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db')
+
+
+def discover_db_paths(
+    explicit_dbs: list[str] | None = None,
+    project_roots: list[str] | None = None,
+    env: dict[str, str] | None = None,
+) -> list[str]:
+    """Resolve the list of tasks.db paths to scan.
+
+    Precedence (first supplied wins): *explicit_dbs* > *project_roots* >
+    ``DASHBOARD_KNOWN_PROJECT_ROOTS`` (read from *env*, defaulting to the real
+    ``os.environ`` when *env* is None) > the dark-factory default root.
+
+    A resolved db path that does not exist on disk is silently skipped — this
+    never raises on a missing/not-yet-set-up project.
+    """
+    if explicit_dbs is not None:
+        candidates = list(explicit_dbs)
+    else:
+        if project_roots is not None:
+            roots = list(project_roots)
+        else:
+            environ = env if env is not None else os.environ
+            roots_env = (environ.get('DASHBOARD_KNOWN_PROJECT_ROOTS') or '').strip()
+            if roots_env:
+                roots = [r.strip() for r in roots_env.split(',') if r.strip()]
+            else:
+                roots = list(_DEFAULT_PROJECT_ROOTS)
+        candidates = [_tasks_db_path(root) for root in roots]
+
+    return [path for path in candidates if os.path.exists(path)]
+
+
+_DEFAULT_MAX_LINE_LEN = 100
+
+
+def format_report(
+    matches: list[NoteLeakMatch], max_line_len: int = _DEFAULT_MAX_LINE_LEN,
+) -> str:
+    """Render *matches* as a grouped, human-readable report.
+
+    Groups lines by ``db_path``; each line shows task_id/tag/provenance kind
+    and the leak line truncated to *max_line_len* characters (the full line is
+    only ever emitted by :func:`format_json`). An empty *matches* list yields
+    an explicit no-leaks message instead of a blank report.
+    """
+    if not matches:
+        return 'no leaked log lines found in done_provenance notes'
+
+    by_db: dict[str, list[NoteLeakMatch]] = {}
+    for m in matches:
+        by_db.setdefault(m.db_path, []).append(m)
+
+    lines: list[str] = []
+    for db_path in sorted(by_db):
+        lines.append(f'{db_path}:')
+        for m in by_db[db_path]:
+            leak_line = m.leak_line
+            if len(leak_line) > max_line_len:
+                leak_line = leak_line[:max_line_len] + '...'
+            lines.append(
+                f'  task_id={m.task_id} tag={m.tag} '
+                f'provenance_kind={m.provenance_kind} leak_line={leak_line!r}'
+            )
+
+    distinct_tasks = {(m.db_path, m.tag, m.task_id) for m in matches}
+    lines.append(f'{len(matches)} leaked notes across {len(distinct_tasks)} tasks')
+    return '\n'.join(lines)
+
+
+def format_json(matches: list[NoteLeakMatch]) -> str:
+    """Render *matches* as a JSON array, carrying the FULL untruncated line."""
+    return json.dumps([m._asdict() for m in matches])
