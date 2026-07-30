@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import string
 import sys
 import time
 import uuid
@@ -964,6 +965,34 @@ class _PriorImplStatus(NamedTuple):
 
     base_commit: str | None
     """SHA read from metadata.json, or None if the file is absent."""
+
+
+_MIN_ABBREV_SHA_LEN = 7
+"""Shortest recorded ``commit`` value accepted as provenance — git's own
+default abbreviation length."""
+
+
+def _is_plausible_sha(value: object) -> bool:
+    """True iff ``value`` looks like a git SHA (or an abbreviation git emits).
+
+    Gate for the bidirectional prefix match that credits a plan step's recorded
+    ``commit`` with beyond-base provenance (task 3033 amendment). Without it,
+    ``recorded.startswith(sha) or sha.startswith(recorded)`` admits arbitrarily
+    short values: an LLM-recorded ``'a'`` or ``'ab'`` prefixes SOME beyond-base
+    SHA on any branch of a few commits, and a value LONGER than 40 hex chars
+    (a full SHA plus trailing junk) passes the first arm outright. Either would
+    re-open the fail-closed hole the provenance filter exists to close, letting
+    ``_recover_before_merge`` resolve ``has_work=True`` on unbacked provenance.
+
+    The sibling idiom in ``_detect_tip_wip_commits`` needs no such gate: there
+    the match only DEDUPs, where a false positive is benign (a commit merely
+    isn't re-surfaced in the next briefing).
+    """
+    text = str(value or '')
+    return (
+        _MIN_ABBREV_SHA_LEN <= len(text) <= 40
+        and all(ch in string.hexdigits for ch in text)
+    )
 
 
 def _iteration_entry_is_work(entry: dict) -> bool:
@@ -6498,11 +6527,15 @@ class TaskWorkflow:
             # Bidirectional prefix match, the established idiom at
             # _detect_tip_wip_commits (~:7062): an abbreviated sha recorded by
             # mark_step_done still matches a full beyond-base sha, while a
-            # base-reachable or absent sha never does.
+            # base-reachable or absent sha never does. Gated on
+            # _is_plausible_sha first — unlike the dedup site that idiom comes
+            # from, a false positive HERE credits unbacked provenance, and a
+            # too-short recorded value (e.g. 'a') prefixes some beyond-base sha
+            # on almost any branch.
             committed_step_ids = [
                 str(s.get('id'))
                 for s in items
-                if s.get('status') == 'done' and s.get('commit')
+                if s.get('status') == 'done' and _is_plausible_sha(s.get('commit'))
                 and any(
                     str(s['commit']).startswith(sha) or sha.startswith(str(s['commit']))
                     for sha in beyond_base
@@ -6571,7 +6604,37 @@ class TaskWorkflow:
                     self.task_id, len(done_step_ids), len(committed_step_ids),
                     unbacked,
                 )
-            if committed_step_ids:
+            #
+            # ATTRIBUTION MUST MATCH WHAT HAPPENED. This branch is ALSO reached
+            # on a review/amendment RE-ENTRY (execute_iterations > 0), where the
+            # steps were completed by an IMPLEMENTER in an earlier EXECUTE pass
+            # — not pre-satisfied by an architect at authoring time. Writing the
+            # authoring-time claim there would put a false statement in the
+            # durable record the reconciler and future architects read (exactly
+            # the harm the honest 'architect' label avoids on the authoring
+            # path), re-list step ids the implementer entries already attribute,
+            # and repeat once per review cycle. On re-entry the merge-recovery
+            # motivation is already satisfied by those earlier work entries, so
+            # write nothing — unless the log carries no work entry at all, in
+            # which case fall through to an entry whose summary says only what
+            # is true of the re-entry rather than dropping the has_work signal.
+            # That fallback keeps agent='architect' deliberately: it is the only
+            # agent value _iteration_entry_is_work's execute_skipped clause
+            # recognises, so any other label would write an entry that cannot
+            # restore the very has_work signal it exists for.
+            reentry = self.metrics.execute_iterations > 0
+            prior_work = False
+            if reentry:
+                prior_entries, _corrupted = self.artifacts.read_iteration_log()
+                prior_work = any(_iteration_entry_is_work(e) for e in prior_entries)
+                if prior_work:
+                    logger.info(
+                        'Task %s: EXECUTE skip at re-entry (iteration %s) — '
+                        'earlier work entries already establish has_work; no '
+                        'execute_skipped entry written (task 3033)',
+                        self.task_id, self.metrics.execute_iterations,
+                    )
+            if committed_step_ids and not prior_work:
                 self.artifacts.append_iteration_log({
                     'iteration': self.metrics.execute_iterations,
                     'agent': 'architect',
@@ -6579,6 +6642,9 @@ class TaskWorkflow:
                     'steps_completed': committed_step_ids,
                     'committed': True,
                     'summary': (
+                        'EXECUTE skipped — no pending steps at re-entry; the '
+                        'named steps carry commits on this branch'
+                        if reentry else
                         'EXECUTE skipped — every plan step pre-satisfied at '
                         'authoring time via mark_step_committed'
                     ),

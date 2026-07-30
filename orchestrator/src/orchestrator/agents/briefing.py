@@ -14,6 +14,44 @@ from orchestrator.mcp_lifecycle import mcp_call
 
 logger = logging.getLogger(__name__)
 
+COMMIT_BULLET_LIMIT = 40
+"""Max commit bullets rendered in one briefing section (task 3033 amendment).
+
+Bounds the architect's already-committed-work section, whose source
+(``TaskWorkflow._detect_committed_branch_work``) returns ALL of
+``base_commit..HEAD`` — unbounded on a long-lived branch that accumulated WIP
+safety-commits across many requeues/rebases plus normal step commits. Without a
+cap the section grows with branch length and its ``git show <sha>`` protocol
+drives one architect tool call per commit. Its sibling
+``_detect_tip_wip_commits`` needs no cap: it is naturally bounded by the
+contiguous WIP run at HEAD.
+"""
+
+
+def _format_commit_bullets(commits: list[dict], limit: int | None = None) -> str:
+    """Render ``[{'sha': ..., 'subject': ...}]`` as HEAD-first markdown bullets.
+
+    Single source of the 12-char abbreviation convention, shared by
+    :meth:`BriefingAssembler.build_architect_prompt`'s committed-work section
+    and :meth:`BriefingAssembler.build_implementer_prompt`'s WIP section — both
+    consume the same shape from the two sibling detectors, so the format must
+    not drift between them.
+
+    ``limit`` caps the rendered bullets (HEAD-first, i.e. most recent) and
+    appends an explicit "…and N more" line: a truncation must be VISIBLE in the
+    prompt, never silent, so the agent knows the list is partial and can widen
+    it itself. ``None`` (the default) renders everything.
+    """
+    shown = commits if limit is None else commits[:limit]
+    lines = [f"- `{c['sha'][:12]}` — {c['subject']}" for c in shown]
+    hidden = len(commits) - len(shown)
+    if hidden > 0:
+        lines.append(
+            f'- …and {hidden} more commit(s) on this branch (not shown — run '
+            f'`git log --oneline` to see the rest)'
+        )
+    return '\n'.join(lines)
+
 
 @dataclass
 class CompletionJudgeVerdict:
@@ -108,8 +146,8 @@ class BriefingAssembler:
         # vs mark_step_done) and the explicit VERIFY-is-the-gate warning.
         committed_section = ''
         if committed_work:
-            commits_list = '\n'.join(
-                f"- `{c['sha'][:12]}` — {c['subject']}" for c in committed_work
+            commits_list = _format_commit_bullets(
+                committed_work, limit=COMMIT_BULLET_LIMIT,
             )
             committed_section = f"""
 ## Already-Committed Work On This Branch — Pre-Satisfy, Don't Re-Plan-As-Pending
@@ -533,9 +571,9 @@ Review any overlap with your plan steps before continuing — file contents may 
 
         wip_section = ''
         if wip_notice:
-            commits_list = '\n'.join(
-                f"- `{n['sha'][:12]}` — {n['subject']}" for n in wip_notice
-            )
+            # No limit: _detect_tip_wip_commits is bounded by the contiguous
+            # WIP run at HEAD, unlike the architect's whole-branch detector.
+            commits_list = _format_commit_bullets(wip_notice)
             wip_section = f"""
 ## Already-Committed WIP — Verify Before Re-Implementing
 

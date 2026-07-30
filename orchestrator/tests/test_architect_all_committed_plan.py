@@ -526,6 +526,91 @@ class TestArchitectPromptCommittedWorkSection:
 
         assert with_empty == baseline
 
+    async def test_long_commit_list_is_capped_and_says_so(
+        self, briefing_assembler, architect_task,
+    ):
+        """Unlike its WIP sibling (bounded by the contiguous run at HEAD), the
+        architect detector returns ALL of ``base..HEAD`` — unbounded on a
+        long-lived branch, and the section's protocol asks for one
+        ``git show`` per bullet. Cap it, and make the truncation VISIBLE
+        (no-silent-caps norm)."""
+        from orchestrator.agents.briefing import COMMIT_BULLET_LIMIT  # noqa: PLC0415
+
+        overflow = 7
+        commits = [
+            {'sha': f'{i:02d}' + 'a' * 38, 'subject': f'feat: commit {i}'}
+            for i in range(COMMIT_BULLET_LIMIT + overflow)
+        ]
+
+        prompt = await self._prompt(
+            briefing_assembler, architect_task, committed_work=commits,
+        )
+
+        rendered = [c for c in commits if c['sha'][:12] in prompt]
+        assert len(rendered) == COMMIT_BULLET_LIMIT, (
+            f'Expected exactly {COMMIT_BULLET_LIMIT} bullets, got {len(rendered)}'
+        )
+        # HEAD-first: the kept bullets are the most recent ones.
+        assert rendered == commits[:COMMIT_BULLET_LIMIT]
+        assert commits[COMMIT_BULLET_LIMIT]['sha'][:12] not in prompt
+        assert f'{overflow} more commit(s)' in prompt, (
+            'The truncation must be visible in the prompt, not silent'
+        )
+
+    async def test_short_list_renders_every_commit_with_no_truncation_line(
+        self, briefing_assembler, architect_task,
+    ):
+        prompt = await self._prompt(
+            briefing_assembler, architect_task, committed_work=_COMMITTED_WORK,
+        )
+
+        assert 'more commit(s)' not in prompt
+
+
+class TestCommitBulletHelper:
+    """The 12-char abbreviation convention is pinned in exactly ONE place.
+
+    ``build_architect_prompt``'s committed-work section and
+    ``build_implementer_prompt``'s WIP section consume the same
+    ``[{'sha', 'subject'}]`` shape from the two sibling detectors; rendering it
+    twice let the format drift independently.
+    """
+
+    def test_renders_abbreviated_sha_and_subject(self):
+        from orchestrator.agents.briefing import _format_commit_bullets  # noqa: PLC0415
+
+        assert _format_commit_bullets(_COMMITTED_WORK) == (
+            f"- `{_SHA_A[:12]}` — feat: GREEN — the thing\n"
+            f"- `{_SHA_B[:12]}` — test: RED — the thing"
+        )
+
+    def test_unlimited_by_default(self):
+        from orchestrator.agents.briefing import _format_commit_bullets  # noqa: PLC0415
+
+        commits = [{'sha': f'{i:040x}', 'subject': f's{i}'} for i in range(200)]
+
+        assert _format_commit_bullets(commits).count('\n- ') == 199
+        assert 'more commit(s)' not in _format_commit_bullets(commits)
+
+    def test_limit_truncates_head_first_and_names_the_remainder(self):
+        from orchestrator.agents.briefing import _format_commit_bullets  # noqa: PLC0415
+
+        rendered = _format_commit_bullets(_COMMITTED_WORK, limit=1)
+
+        assert _SHA_A[:12] in rendered, 'HEAD-first: the newest bullet is kept'
+        assert _SHA_B[:12] not in rendered
+        assert '1 more commit(s)' in rendered
+
+    def test_bullet_format_literal_appears_once_in_the_module(self):
+        """Structural pin against re-duplicating the format at a third site."""
+        from orchestrator.agents import briefing as briefing_module  # noqa: PLC0415
+
+        source = Path(str(briefing_module.__file__)).read_text()
+
+        assert source.count("[:12]}` — ") == 1, (
+            'The commit-bullet format must live only in _format_commit_bullets'
+        )
+
 
 # ---------------------------------------------------------------------------
 # step-7 RED: _plan() threads the detector into the architect briefing
@@ -1279,6 +1364,75 @@ class TestSkippedExecuteEntryRequiresBeyondBaseProvenance:
         )
         assert _skipped_entries(artifacts) == []
 
+    # -- (d2) done with an IMPLAUSIBLE commit value ------------------------
+
+    async def test_short_junk_and_overlong_commit_values_are_excluded(
+        self, config, git_ops, task_assignment,
+    ):
+        """The bidirectional prefix match must not credit arbitrary values.
+
+        ``recorded.startswith(sha) or sha.startswith(recorded)`` on its own
+        admits a one-char ``commit`` (it prefixes SOME beyond-base sha on
+        almost any branch) and a full-sha-plus-junk value (it passes the first
+        arm outright) — both re-opening the fail-closed hole.
+        """
+        workflow, artifacts, wt, _base = await self._worktree(
+            config, git_ops, task_assignment,
+        )
+        _write_steps_plan(
+            artifacts, workflow,
+            steps=[_step('step-short'), _step('step-junk'), _step('step-overlong')],
+        )
+        (wt / 'impl.py').write_text('x = 1\n')
+        good_sha = await git_ops.commit(wt, 'feat: real beyond-base work')
+        assert good_sha and len(good_sha) == 40, 'Setup: expected a full sha'
+
+        assert artifacts.mark_step_committed('step-short', good_sha[:1]) is True
+        assert artifacts.mark_step_committed('step-junk', 'not-a-sha') is True
+        assert artifacts.mark_step_committed('step-overlong', good_sha + 'ff') is True
+        assert artifacts.get_pending_steps() == []
+        workflow.plan = artifacts.read_plan()
+
+        outcome = await workflow._execute_iterations()
+
+        assert outcome == WorkflowOutcome.DONE
+        event = _skip_event(workflow)
+        assert set(event['data']['done_step_ids']) == {
+            'step-short', 'step-junk', 'step-overlong',
+        }
+        assert event['data']['committed_step_ids'] == [], (
+            'An implausible commit value is not provenance, got '
+            f"{event['data']['committed_step_ids']}"
+        )
+        assert _skipped_entries(artifacts) == []
+        assert workflow._has_prior_implementation(wt_head=None).has_work is False
+
+    async def test_abbreviated_but_plausible_sha_is_still_credited(
+        self, config, git_ops, task_assignment,
+    ):
+        """The whole point of the bidirectional match: a short-but-real sha
+        (what ``mark_step_done`` records from an abbreviated prompt) still
+        resolves to its beyond-base commit."""
+        workflow, artifacts, wt, _base = await self._worktree(
+            config, git_ops, task_assignment,
+        )
+        _write_steps_plan(artifacts, workflow, steps=[_step('step-1')])
+        (wt / 'impl.py').write_text('x = 1\n')
+        good_sha = await git_ops.commit(wt, 'feat: real beyond-base work')
+        assert good_sha
+
+        assert artifacts.mark_step_committed('step-1', good_sha[:12]) is True
+        assert artifacts.get_pending_steps() == []
+        workflow.plan = artifacts.read_plan()
+
+        outcome = await workflow._execute_iterations()
+
+        assert outcome == WorkflowOutcome.DONE
+        assert _skip_event(workflow)['data']['committed_step_ids'] == ['step-1']
+        entries = _skipped_entries(artifacts)
+        assert len(entries) == 1
+        assert entries[0]['steps_completed'] == ['step-1']
+
     # -- (e) MIXED plan ----------------------------------------------------
 
     async def test_mixed_plan_names_only_the_beyond_base_step(
@@ -1407,3 +1561,132 @@ class TestSkippedExecuteEntryRequiresBeyondBaseProvenance:
         assert set(entries[0]['steps_completed']) == {'pre-1', 'step-1', 'step-2'}
         assert entries[0]['committed'] is True
         assert workflow._has_prior_implementation(wt_head=None).has_work is True
+
+
+# ---------------------------------------------------------------------------
+# Amendment: the nothing-pending branch is ALSO the review/amendment RE-ENTRY
+# ---------------------------------------------------------------------------
+#
+# Review finding (robustness at workflow.py:6262 + the test-coverage gap): every
+# other test here enters _execute_iterations fresh, with
+# metrics.execute_iterations == 0. _execute_verify_review_loop RE-ENTERS it
+# after a review cycle (_replan) or amendment round (_amend), and if the earlier
+# EXECUTE pass finished the plan, that re-entry lands in the very same
+# nothing-pending branch — with a NON-ZERO metric (the stated reason the emitted
+# execute_iterations is read from the metric rather than hard-coded to 0).
+#
+# On that path the steps were completed by an IMPLEMENTER, so the authoring-time
+# 'pre-satisfied via mark_step_committed' summary would be a false statement in
+# the durable record the reconciler and future architects read — the same harm
+# the honest 'architect' (not forged 'implementer') label avoids — and would
+# re-list step ids the implementer entries already attribute, once per review
+# cycle. The merge-recovery motivation is already satisfied there by those
+# earlier work entries, so nothing is written; the fallback (a log with no work
+# entry at all) still writes one, with a summary that claims only the re-entry.
+
+
+async def _all_committed_workflow(config, git_ops, task_assignment):
+    """Real worktree whose two beyond-base commits pre-satisfy every plan step."""
+    wt_info = await git_ops.create_worktree(task_assignment.task_id)
+    wt = wt_info.path
+    workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+    artifacts.update_base_commit(wt_info.base_commit)
+    _write_steps_plan(
+        artifacts, workflow, steps=[_step('step-1'), _step('step-2')],
+    )
+    (wt / 'red.py').write_text('def test_x(): assert True\n')
+    red_sha = await git_ops.commit(wt, 'test: RED — x')
+    (wt / 'impl.py').write_text('x = 1\n')
+    green_sha = await git_ops.commit(wt, 'feat: GREEN — x')
+    assert red_sha and green_sha, 'Setup: expected two real beyond-base commits'
+    assert artifacts.mark_step_committed('step-1', red_sha) is True
+    assert artifacts.mark_step_committed('step-2', green_sha) is True
+    assert artifacts.get_pending_steps() == [], 'Setup: nothing may remain pending'
+    workflow.plan = artifacts.read_plan()
+    _stub_execute_collaborators(workflow)
+    return workflow, artifacts
+
+
+@pytest.mark.asyncio
+class TestSkippedExecuteAtReEntry:
+    """Nothing pending AND a non-zero execute_iterations metric."""
+
+    async def test_reentry_reports_the_metric_and_writes_no_duplicate_entry(
+        self, config, git_ops, task_assignment,
+    ):
+        workflow, artifacts = await _all_committed_workflow(
+            config, git_ops, task_assignment,
+        )
+        # An earlier EXECUTE pass that really did the work.
+        artifacts.append_iteration_log({
+            'iteration': 1, 'agent': 'implementer',
+            'steps_completed': ['step-1', 'step-2'], 'committed': True,
+            'summary': 'implemented both steps', 'source': 'orchestrator',
+        })
+        workflow.metrics.execute_iterations = 2
+
+        outcome = await workflow._execute_iterations()
+
+        assert outcome == WorkflowOutcome.DONE
+        event = _skip_event(workflow)
+        assert event['data']['execute_iterations'] == 2, (
+            'The metric is reported, not a hard-coded 0 — this is the path that '
+            'proves it'
+        )
+        assert set(event['data']['committed_step_ids']) == {'step-1', 'step-2'}
+        assert _skipped_entries(artifacts) == [], (
+            'No architect entry may claim authoring-time pre-satisfaction for '
+            'work an implementer did in an earlier pass'
+        )
+        # …and the merge-recovery motivation is already covered.
+        assert workflow._has_prior_implementation(wt_head=None).has_work is True
+
+    async def test_reentry_without_a_prior_work_entry_keeps_the_has_work_signal(
+        self, config, git_ops, task_assignment,
+    ):
+        """Fallback: never drop has_work just because the metric is non-zero."""
+        workflow, artifacts = await _all_committed_workflow(
+            config, git_ops, task_assignment,
+        )
+        # Non-empty log, but the zero-work implementer shape — not work.
+        artifacts.append_iteration_log({
+            'iteration': 1, 'agent': 'implementer',
+            'steps_completed': [], 'committed': True,
+            'summary': 'no steps completed', 'source': 'orchestrator',
+        })
+        workflow.metrics.execute_iterations = 3
+
+        outcome = await workflow._execute_iterations()
+
+        assert outcome == WorkflowOutcome.DONE
+        assert _skip_event(workflow)['data']['execute_iterations'] == 3
+        entries = _skipped_entries(artifacts)
+        assert len(entries) == 1, f'Expected the fallback entry, got {entries}'
+        entry = entries[0]
+        assert entry['iteration'] == 3
+        assert set(entry['steps_completed']) == {'step-1', 'step-2'}
+        assert 'authoring time' not in entry['summary'], (
+            'The re-entry path must not claim authoring-time pre-satisfaction'
+        )
+        assert 'mark_step_committed' not in entry['summary']
+        assert 're-entry' in entry['summary']
+        assert workflow._has_prior_implementation(wt_head=None).has_work is True
+
+    async def test_authoring_path_keeps_the_pre_satisfied_summary(
+        self, config, git_ops, task_assignment,
+    ):
+        """REGRESSION: the fresh (metric == 0) path is unchanged."""
+        workflow, artifacts = await _all_committed_workflow(
+            config, git_ops, task_assignment,
+        )
+
+        outcome = await workflow._execute_iterations()
+
+        assert outcome == WorkflowOutcome.DONE
+        assert _skip_event(workflow)['data']['execute_iterations'] == 0
+        entries = _skipped_entries(artifacts)
+        assert len(entries) == 1
+        assert entries[0]['summary'] == (
+            'EXECUTE skipped — every plan step pre-satisfied at authoring time '
+            'via mark_step_committed'
+        )
