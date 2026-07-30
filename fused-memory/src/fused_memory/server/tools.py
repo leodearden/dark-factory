@@ -3814,6 +3814,19 @@ def create_mcp_server(
             return _normalized
         project_root = _normalized
 
+        # MCP-markup tripwire (task 3141 / PRD memory-write-path-convergence §9
+        # leaf o): reject leaked envelope markup FIRST, ahead of every guard
+        # below and well before the interceptor's description parser — DF 3083
+        # showed that parser mis-parses such a fragment SILENTLY (reify task 3210
+        # filed priority=high, stored as medium). All four text fields are
+        # scanned, matching premise_lint_guard's field set at this same boundary.
+        if block := _markup_gate(
+            {'title': title, 'description': description, 'details': details, 'prompt': prompt},
+            agent_id, metadata, project_root,
+        ):
+            return block
+        metadata = strip_markup_override(metadata)
+
         # Lock-charter guard γ: reject directory strings in metadata.files
         # before forwarding to the interceptor. Covers both the normal curator
         # path and planning_mode=True (same tool function), catching the #4552
@@ -4334,6 +4347,17 @@ def create_mcp_server(
         if isinstance(_normalized, dict):
             return _normalized
         project_root = _normalized
+
+        # MCP-markup tripwire (task 3141 / PRD leaf o): see the matching
+        # submit_task call site above. Same four fields, same reason — they all
+        # reach the description parser DF 3083 proved mis-parses silently.
+        if block := _markup_gate(
+            {'title': title, 'description': description, 'details': details, 'prompt': prompt},
+            agent_id, metadata, project_root,
+        ):
+            return block
+        metadata = strip_markup_override(metadata)
+
         _dirs = directory_locks(extract_files(metadata))
         if _dirs:
             return lock_charter_error(_dirs)
