@@ -37,6 +37,40 @@ _STAGE3_PROJECT_ID_GUIDELINE = _PROJECT_ID_GUIDELINE.format(
     tools='search, get_entity, get_episodes, get_status, get_tasks, get_task'
 )
 
+# ---------------------------------------------------------------------------
+# Shared escalation-store boundary (task 3163, plans/escalation-store-ambiguity-prd.md)
+# ---------------------------------------------------------------------------
+# Identical for all three stages — no per-stage parameters — so it lives here as
+# one constant interpolated into each stage's system-prompt f-string, rather
+# than as a recon_self_model render_*_section() helper (those exist for sections
+# that vary by stage capability).
+#
+# The companion mechanism is DISALLOW_ESCALATION_READS in cli_stage_runner.py,
+# which denies the escalation READ tools in every stage. This paragraph is not
+# decorative: `--disallowed-tools` OMITS a denied tool from the agent's listing
+# rather than rejecting the call, so without it the agent gets no explanation
+# for the missing tool and can conclude the escalation surface does not exist.
+#
+# MUST NOT contain the string '## Available Tools' — build_stage2_system_prompt
+# raises RuntimeError unless that sentinel appears exactly once in
+# STAGE2_SYSTEM_PROMPT. Not an f-string: it is interpolated INTO f-strings, and
+# braces inside an interpolated value are not re-parsed by the enclosing
+# f-string, so its own text needs no {{/}} escaping.
+ESCALATION_BOUNDARY_NOTE = """\
+## Escalation Store Boundary
+Your `mcp__escalation__*` connection serves the RECONCILIATION escalation store \
+only — never a project's escalation queue. A question of the form "was an \
+escalation ever filed for task X?" CANNOT be answered from this stage: the \
+escalation READ tools are not available to you here, and any empty or missing \
+escalation result you encounter is NOT evidence that no escalation exists. It \
+means only that you are looking in the wrong store. Never report, infer, or \
+flag "no escalation was filed for task X" on the strength of this connection; \
+if a finding depends on that question, record what you actually observed and \
+hand the question on rather than asserting an absence. The one sanctioned \
+escalation action in this stage is the write path \
+(`mcp__escalation__escalate_blocker`) for the Stale Flag Escalation (FIX D) case.\
+"""
+
 # Shared guidance about the memory_ids=[] + stores=['graphiti'] → graphiti_writes_queued
 # invariant.  Both stages need to teach the LLM not to count async-enqueued Graphiti
 # writes under their `memories_*` stats; only the stat-key tokens differ between stages.

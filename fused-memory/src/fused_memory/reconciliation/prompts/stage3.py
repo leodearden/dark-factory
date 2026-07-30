@@ -6,6 +6,7 @@ from fused_memory.reconciliation.policies import (
 )
 from fused_memory.reconciliation.prompts import (
     _STAGE3_PROJECT_ID_GUIDELINE,
+    ESCALATION_BOUNDARY_NOTE,
     get_recon_report_tool_guidance,
 )
 
@@ -49,6 +50,8 @@ Your findings will be addressed in the next reconciliation cycle's Stage 1 and S
   cycle-summary presence check (see Cycle-Summary Verification below).
 
 You do NOT have write or mutation tools.
+
+{ESCALATION_BOUNDARY_NOTE}
 
 ## Your Verification Tasks
 1. **Spot-check tasks vs memory**: Do recently modified tasks align with current memory state? \

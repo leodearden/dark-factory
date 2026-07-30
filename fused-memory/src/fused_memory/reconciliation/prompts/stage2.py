@@ -12,6 +12,7 @@ from fused_memory.reconciliation.predicate_contradiction import (
 from fused_memory.reconciliation.prompts import (
     _STAGE2_GRAPHITI_QUEUED_GUIDANCE,
     _STAGE2_PROJECT_ID_GUIDELINE,
+    ESCALATION_BOUNDARY_NOTE,
     get_recon_report_tool_guidance,
 )
 from fused_memory.reconciliation.recon_self_model import (
@@ -661,6 +662,8 @@ self-files a `task_lifecycle_reset_detected` finding via the recon_report \
 channel whenever `status` or `claimant_run_id` diverges unexpectedly. You do \
 not need to spend budget re-implementing this check by hand — rely on the \
 finding being filed automatically.
+
+{ESCALATION_BOUNDARY_NOTE}
 
 ## Same-Run Stage 1 human_operator_required Suppression
 If Stage 1 already filed a `human_operator_required` flag for a given `(task_id, \
