@@ -9,6 +9,7 @@ import logging
 import os
 import random
 import shutil
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -803,6 +804,32 @@ class TestProbeConfigDirIsolation:
 PROBE_DIR_PREFIX = CONFIG_DIR_PREFIX + 'usage-gate-probe-'
 
 
+def _find_dead_pid() -> int:
+    """Return a PID that is definitively not alive right now.
+
+    Scanned rather than hard-coded: a recycled literal would silently turn a
+    "dead PID" case into a live one and flip the assertion.
+    """
+    for candidate in range(999_000, 999_000 + 5000):
+        try:
+            os.kill(candidate, 0)
+        except ProcessLookupError:
+            return candidate
+        except OSError:  # PermissionError -> visible, i.e. alive
+            continue
+    raise RuntimeError('could not find a dead PID to test against')
+
+
+def _plant_probe_dir(base: Path, name: str) -> Path:
+    """Create a credential-bearing dir aged past the sweep's min-age floor."""
+    path = base / name
+    path.mkdir(parents=True, exist_ok=True)
+    (path / '.credentials.json').write_text('{}')
+    old = time.time() - 3600.0
+    os.utime(path, (old, old))
+    return path
+
+
 class TestProbeConfigDirLeakSweep:
     """Stale probe-dir reclamation wired into UsageGate (task 3086)."""
 
@@ -912,6 +939,47 @@ class TestProbeConfigDirLeakSweep:
             config_dir = gate._config_dir_for(acct)
             assert config_dir.path.name == f'{PROBE_DIR_PREFIX}{acct.name}-{pid}'
             assert config_dir.path.exists()
+
+    # -- end to end: the plateau cannot rebuild --
+
+    def test_gate_construction_reclaims_real_ghost_dirs(self, tmp_path, caplog):
+        """The whole fix, exercised against a real (redirected) tmp dir.
+
+        Patching shared.config_dir.tempfile.gettempdir redirects BOTH
+        TaskConfigDir and the sweep's default base to tmp_path, so this never
+        touches the real /tmp.
+        """
+        dead = _find_dead_pid()
+        ghosts = [
+            _plant_probe_dir(tmp_path, f'{PROBE_DIR_PREFIX}ghost-{dead}'),
+            _plant_probe_dir(tmp_path, f'{PROBE_DIR_PREFIX}{dead}'),
+        ]
+        live_sibling = _plant_probe_dir(tmp_path, f'{PROBE_DIR_PREFIX}alive-{os.getpid()}')
+        unrelated = _plant_probe_dir(tmp_path, f'{CONFIG_DIR_PREFIX}3086')
+
+        with caplog.at_level(logging.INFO, logger='shared.usage_gate'), \
+                patch('shared.config_dir.tempfile.gettempdir', return_value=str(tmp_path)):
+            gate = make_gate(['work', 'personal'])
+
+        # Dead-PID leftovers reclaimed.
+        for ghost in ghosts:
+            assert not ghost.exists(), f'{ghost.name} should have been reclaimed'
+        # A live peer's dir and anything outside the probe prefix survive.
+        assert live_sibling.exists()
+        assert (live_sibling / '.credentials.json').exists()
+        assert unrelated.exists()
+        # This process's own fresh dirs are never sweep candidates.
+        for acct in gate._accounts:
+            assert gate._config_dir_for(acct).path.exists()
+
+        # Operator-visible: the drain must show up in fleet logs rather than
+        # being silent housekeeping.
+        reclaim_logs = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.INFO and 'reclaim' in r.getMessage().lower()
+        ]
+        assert reclaim_logs, 'reclamation must be observable at INFO'
+        assert any('2' in msg for msg in reclaim_logs)
 
 
 # ---------------------------------------------------------------------------
