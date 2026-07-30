@@ -4389,6 +4389,44 @@ async def test_update_task_accepts_file_level_files(taskmaster, reconciler, even
     taskmaster.update_task.assert_called_once()
 
 
+@pytest.mark.asyncio
+async def test_update_task_accepts_manifest_file(taskmaster, reconciler, event_buffer):
+    """A '.manifest' file must not be rejected as a directory lock (#3117).
+
+    Regression for the 2026-07-28 incident that motivated widening the
+    lock-charter extension allowlist from 36 to 58 entries (reify #5726 /
+    dark_factory #3117).  This exact call previously returned:
+
+        LockCharterViolation: metadata.files contains directory declarations:
+        'tests/infra/run-all-classification.manifest'
+
+    because 'manifest' was absent from the allowlist, so the pure-string
+    predicate classified a real tracked FILE as a directory.  Nine of the 22
+    added extensions had evidence only in reify; 'manifest' is precisely the one
+    this incident needed, which is why the fix mirrors α's whole vector rather
+    than the dark-factory-evidenced subset.
+
+    Drives the real interceptor path (update_task ->
+    _reject_directory_locks_in_update_metadata) rather than calling the predicate
+    directly, so it reproduces the incident at the layer that actually rejected
+    the write.
+    """
+    taskmaster.update_task.return_value = {'success': True}
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.update_task(
+        '1',
+        '/project',
+        metadata=json.dumps({'files': ['tests/infra/run-all-classification.manifest']}),
+    )
+
+    assert 'error' not in result, (
+        f'.manifest is a file-level declaration and must be forwarded, not '
+        f'rejected as a directory lock; got {result}'
+    )
+    taskmaster.update_task.assert_called_once()
+
+
 # ── Tests for background task retention (step-3) ───────────────────────────
 
 

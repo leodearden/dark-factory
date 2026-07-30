@@ -39,13 +39,20 @@ _LCG_LOGGER = 'fused_memory.middleware.lock_charter_guard'
 # ---------------------------------------------------------------------------
 
 # The canonical α/γ vector — update this list AND CODE_EXTENSIONS together.
+# Widened 36 -> 58 by the git-ls-files sweep 2026-07-28
+# (reify #5726 / dark_factory #3117); generated from α's --list-extensions.
 _CANONICAL_EXTENSIONS = [
-    'c', 'cc', 'cjs', 'cpp', 'css', 'cts', 'cxx', 'gcode',
+    'c', 'cc', 'cjs', 'conf', 'cpp', 'css', 'cts', 'cxx',
+    'diff', 'envrc', 'example', 'example-systemd-config',
+    'gcode', 'gitattributes', 'gitignore', 'gitkeep', 'gitmodules', 'golden', 'grammar',
     'h', 'hh', 'hpp', 'html',
-    'js', 'json', 'jsonc', 'jsx',
-    'lock', 'md', 'mjs', 'mts', 'png', 'py',
+    'icns', 'ico',
+    'jq', 'js', 'json', 'jsonc', 'jsonl', 'jsx',
+    'lock', 'log',
+    'manifest', 'md', 'mjs', 'mts',
+    'npmrc', 'png', 'py', 'python-version',
     'ri', 'rs', 'scss', 'service', 'sh', 'step', 'stl', 'svg',
-    'toml', 'ts', 'tsx', 'txt',
+    'template', 'timer', 'toml', 'ts', 'tsx', 'txt', 'typed',
     'yaml', 'yml',
 ]
 
@@ -166,6 +173,33 @@ _ACCEPT_PATHS = [
     'config.yaml',
     'config.yml',
     'src/main.py',
+    # --- Extensions added by the git-ls-files sweep 2026-07-28 (#5726 / #3117).
+    # Real tracked paths (verified with `git ls-files`), dark-factory unless
+    # marked reify — the corpus records the evidence for each entry.
+    'orchestrator/src/orchestrator/evals/reviewer_trial/corpus/mined/mined_1030.diff',
+    'dashboard/dark-factory-dashboard-watchdog.timer',
+    '.gitignore',
+    '.gitattributes',
+    '.gitmodules',
+    '.python-version',
+    '.envrc',
+    'scripts/dashboard.service.template',
+    'scripts/verify-task-845-tty.log',
+    'cockpit/src/cockpit/py.typed',
+    '.env.example',
+    'fused-memory/fused-memory.service.example-systemd-config',
+    'fused-memory/tests/fixtures/write_triage_calibration.jsonl',
+    # The originating incident path: declaring this in metadata.files was
+    # rejected as a directory lock because 'manifest' was absent from the list.
+    'tests/infra/run-all-classification.manifest',  # reify
+    'deploy/systemd/orchestrator-reify.service.d/warm-lane.conf',  # reify
+    'crates/reify-doc/tests/snapshots/.gitkeep',  # reify
+    'crates/reify-fdm/tests/fixtures/toolpath_bracket.golden',  # reify
+    'gui/src/editor/reify.grammar',  # reify
+    'gui/src-tauri/icons/icon.icns',  # reify
+    'gui/src-tauri/icons/icon.ico',  # reify
+    'scripts/reify-audit-snapshot-filter.jq',  # reify
+    'tree-sitter-reify/.npmrc',  # reify
 ]
 
 
@@ -179,10 +213,95 @@ def test_is_file_path_accepts_files(path):
 # Conservative-reject edge cases matching α's case-sensitive bash
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize('path', ['f.PY', '.gitignore'])
+@pytest.mark.parametrize('path', ['f.PY'])
 def test_is_file_path_conservative_rejects(path):
-    """Upper-case extensions and dotfiles without extension are rejected (C-P3)."""
+    """Upper-case extensions are rejected — the allowlist is lowercase (C-P3).
+
+    '.gitignore' used to be pinned here too, under the generalisation "dotfiles
+    without extension are rejected".  That generalisation was never the rule and
+    is now visibly false: the predicate looks up the substring after the LAST
+    dot, and for '.gitignore' that substring is 'gitignore' — allowlisted since
+    the 2026-07-28 sweep (#5726 / #3117), so it correctly classifies as a file
+    and is covered in _ACCEPT_PATHS.  Verified against α: `classify .gitignore`
+    returns ACCEPT, so the flip is convergence with the source of truth rather
+    than a regression, and special-casing it back to False would reintroduce the
+    exact α/γ divergence this task closes.
+
+    'f.PY' stays: case sensitivity is genuinely unchanged.
+    """
     assert is_file_path(path) is False
+
+
+# ---------------------------------------------------------------------------
+# Rejected alternative: a blanket "leading-dot segment => FILE" predicate rule
+# ---------------------------------------------------------------------------
+
+# Real directories whose final segment carries a leading dot and no further dot.
+_DOTTED_DIRECTORY_PATHS = [
+    '.worktrees',
+    '.task',
+    '.claude',
+    '.cargo',
+    '.taskmaster',
+]
+
+
+@pytest.mark.parametrize('path', _DOTTED_DIRECTORY_PATHS)
+def test_leading_dot_directories_stay_directories(path):
+    """Seven of the 22 additions are dotfiles — a dotfile RULE was rejected.
+
+    .gitignore .gitkeep .envrc .npmrc .gitattributes .gitmodules .python-version
+    could all be covered by one predicate line ("a segment starting with '.' is a
+    file") instead of seven list entries.  That simplification was considered and
+    REJECTED: the paths below are real DIRECTORIES which correctly reject today
+    (verified against α — `lock-charter-guard.sh classify .worktrees` returns
+    REJECT), and the rule would flip every one to FILE, letting a task declare
+    '.worktrees' — the orchestrator's entire worktree pool — as its lock charter.
+    That is precisely the over-wide-charter failure this guard exists to prevent.
+
+    Keeping the allowlist ENUMERATED is what makes an unknown dotted segment
+    default to directory.  These assertions pass both before and after the
+    widening: they are regression pins for a rejected design, not a behaviour
+    change, and they live here so the reasoning travels with the code.
+    """
+    assert is_file_path(path) is False, (
+        f'{path!r} is a real directory and must NOT classify as a file; a blanket '
+        f'leading-dot=>file rule was rejected for exactly this reason'
+    )
+
+
+# ---------------------------------------------------------------------------
+# Corpus completeness — every allowlisted extension must be exercised
+# ---------------------------------------------------------------------------
+
+
+def test_accept_corpus_covers_every_canonical_extension():
+    """_ACCEPT_PATHS must exercise every entry in _CANONICAL_EXTENSIONS.
+
+    The corpus comment above claims "one path per canonical extension"; this
+    turns that claim into an enforced invariant.  Without it an extension can be
+    added to the allowlist and pinned in the drift guards while never being run
+    through an actual classification assertion — which is the failure mode this
+    whole task is a 22-entry instance of: a list treated as complete with no
+    check that each entry was ever tested.
+
+    Measured precondition at the time this was added: the pre-existing 39
+    _ACCEPT_PATHS covered exactly all 36 then-canonical extensions — no gaps and
+    no extras — so this assertion carries zero pre-existing debt.
+    """
+
+    def _ext(path: str) -> str | None:
+        seg = path.rstrip('/').rsplit('/', 1)[-1]
+        return seg.rsplit('.', 1)[1] if '.' in seg else None
+
+    covered = {e for e in (_ext(p) for p in _ACCEPT_PATHS) if e is not None}
+    uncovered = sorted(set(_CANONICAL_EXTENSIONS) - covered)
+    assert not uncovered, (
+        f'{len(uncovered)} allowlisted extension(s) are pinned in '
+        f'_CANONICAL_EXTENSIONS but never classified by any _ACCEPT_PATHS entry: '
+        f'{uncovered!r}\n'
+        f'Add one real representative path per extension to _ACCEPT_PATHS.'
+    )
 
 
 # ---------------------------------------------------------------------------
