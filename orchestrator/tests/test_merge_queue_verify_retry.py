@@ -449,3 +449,214 @@ async def test_probe_nextest_planned_timeout_is_bounded_by_a_named_constant() ->
 
     assert isinstance(_NEXTEST_LIST_PROBE_TIMEOUT_SECS, (int, float))
     assert 0 < _NEXTEST_LIST_PROBE_TIMEOUT_SECS <= 900
+
+
+# ---------------------------------------------------------------------------
+# _build_attempt0_payload — the payload is built from DF-OWNED attempt-0 data
+# (task 3059, WORK item 1), not from a phantom reify sidecar.
+#
+# PROFILE ATTRIBUTION is the subtle part.  VerifyResult.test_output is ONE
+# blended blob across both nextest passes and the verdict key
+# ("<binary-id> <test-name>") carries no profile, so a `pass` observed in
+# profile 1 is indistinguishable from a test that never ran in profile 2.
+# verify.sh:219-230 makes "never narrow a profile that never ran" DF's seam
+# obligation.  Hence: only the FIRST profile named in the sidecar is narrowed;
+# every later profile gets an EMPTY subset, which reify turns into its loud
+# per-profile "retry refused: no subset" FULL fallback.
+# ---------------------------------------------------------------------------
+
+# A recorded-shape nextest fail-fast blob: PASS lines, one FAIL, and tests that
+# never appear at all because fail-fast cancelled them.  The '(  N/M)' progress
+# counter is the real cargo-nextest 0.9.136 human-output shape that
+# _NEXTEST_TEST_LINE_RE consumes and discards.
+_FAIL_FAST_OUTPUT = """\
+    Starting 5 tests across 3 binaries
+        PASS [   0.130s] (  1/  5) crate-a alpha::test_one
+        PASS [   0.021s] (  2/  5) crate-a alpha::test_two
+        FAIL [   0.044s] (  3/  5) crate-a beta::test_three
+Canceling due to test failure
+=== Summary: 3 discovered, 1 failed ===
+=== FAILED: test_skip_ledger.sh ===
+FAILED test_skip_ledger.sh
+"""
+
+# Everything cargo-nextest planned, per the probe (a superset is sound).
+_PROBED_PLANNED = [
+    'crate-a alpha::test_one',
+    'crate-a alpha::test_two',
+    'crate-a beta::test_three',
+    'crate-a::integration test_end_to_end',
+    'crate-b gamma::test_one',
+]
+
+
+def _verify_result(test_output: str):
+    from orchestrator.verify import VerifyResult
+
+    return VerifyResult(
+        passed=False,
+        test_output=test_output,
+        lint_output='',
+        type_output='',
+        summary='attempt-0 red',
+        category='disk_pressure',
+    )
+
+
+@pytest.mark.asyncio
+async def test_build_attempt0_payload_narrows_only_the_first_profile(
+    tmp_path: Path,
+) -> None:
+    """The FIRST sidecar profile is narrowed; every LATER profile gets an empty set.
+
+    A `pass` seen in the debug pass is NOT evidence the same test ran in the
+    release pass, so release must not be narrowed on debug-profile evidence.
+    """
+    from orchestrator import merge_queue as mq
+    from orchestrator.merge_shadow import parse_per_test_results
+
+    _place_real_sidecar(tmp_path)
+    calls: list[str] = []
+
+    async def _fake_probe(merge_wt, profile, *, timeout_secs):
+        calls.append(profile)
+        return list(_PROBED_PLANNED)
+
+    with patch.object(mq, '_probe_nextest_planned', _fake_probe):
+        payload = await mq._build_attempt0_payload(
+            tmp_path, _verify_result(_FAIL_FAST_OUTPUT)
+        )
+
+    assert payload is not None
+    assert payload.profiles == ('debug', 'release')
+
+    # debug — the FIRST profile — carries the probe's plan and attempt-0 verdicts.
+    assert payload.debug_planned == _PROBED_PLANNED
+    assert payload.debug_verdicts == parse_per_test_results(_FAIL_FAST_OUTPUT)
+    assert payload.debug_verdicts['crate-a alpha::test_one'] == 'pass'
+    assert payload.debug_verdicts['crate-a beta::test_three'] == 'fail'
+
+    # release — a LATER profile — is never narrowed on profile-1 evidence.
+    assert payload.release_planned == []
+    assert payload.release_verdicts == {}
+
+    # The probe is asked ONCE, only for the first profile: a later profile's
+    # planned set is never even requested (it could not be used).
+    assert calls == ['debug']
+
+
+@pytest.mark.asyncio
+async def test_build_attempt0_payload_fields_come_from_df_owned_sources(
+    tmp_path: Path,
+) -> None:
+    """tree_oid from reify's sidecar; run_all members parsed; gui_specs empty."""
+    from orchestrator import merge_queue as mq
+
+    _place_real_sidecar(tmp_path)
+
+    async def _fake_probe(merge_wt, profile, *, timeout_secs):
+        return list(_PROBED_PLANNED)
+
+    with patch.object(mq, '_probe_nextest_planned', _fake_probe):
+        payload = await mq._build_attempt0_payload(
+            tmp_path, _verify_result(_FAIL_FAST_OUTPUT)
+        )
+
+    assert payload is not None
+    expected_oid = json.loads(_REIFY_SIDECAR_FIXTURE.read_text())['tree_oid']
+    assert payload.tree_oid == expected_oid
+    assert payload.run_all_members == ['test_skip_ledger.sh']
+    # Deliberately empty: no real reify gui failure log was available to pin a
+    # fixture to, and an empty value makes verify.sh run the FULL gui suite.
+    assert payload.gui_specs == []
+
+
+@pytest.mark.asyncio
+async def test_build_attempt0_payload_empty_verdicts_still_yields_a_payload(
+    tmp_path: Path,
+) -> None:
+    """An empty verdict map is a sound (if wide) subset: everything not-started.
+
+    attempt-0 can die before any test line is emitted (a compile-gate red).
+    planned − {} = every test 'not-started', which re-runs everything in the
+    plan — wide, but never skipping.  reify's REIFY_VERIFY_RETRY_MAX_SUBSET
+    ceiling is what rejects a runaway subset, not a silent DF narrowing.
+    """
+    from orchestrator import merge_queue as mq
+
+    _place_real_sidecar(tmp_path)
+
+    async def _fake_probe(merge_wt, profile, *, timeout_secs):
+        return list(_PROBED_PLANNED)
+
+    with patch.object(mq, '_probe_nextest_planned', _fake_probe):
+        payload = await mq._build_attempt0_payload(
+            tmp_path, _verify_result('error: could not compile `crate-a`\n')
+        )
+
+    assert payload is not None
+    assert payload.debug_verdicts == {}
+    assert payload.debug_planned == _PROBED_PLANNED
+
+
+@pytest.mark.asyncio
+async def test_build_attempt0_payload_none_when_sidecar_absent(tmp_path: Path) -> None:
+    """No sidecar -> None -> full verify. The probe is never even run."""
+    from orchestrator import merge_queue as mq
+
+    called = False
+
+    async def _fake_probe(merge_wt, profile, *, timeout_secs):
+        nonlocal called
+        called = True
+        return list(_PROBED_PLANNED)
+
+    with patch.object(mq, '_probe_nextest_planned', _fake_probe):
+        payload = await mq._build_attempt0_payload(
+            tmp_path, _verify_result(_FAIL_FAST_OUTPUT)
+        )
+
+    assert payload is None
+    assert not called
+
+
+@pytest.mark.asyncio
+async def test_build_attempt0_payload_none_when_sidecar_malformed(
+    tmp_path: Path,
+) -> None:
+    """A malformed sidecar (loader returned None) -> None -> full verify."""
+    from orchestrator import merge_queue as mq
+
+    _place_real_sidecar(tmp_path, text='{"tree_oid": "abc", "profiles": "bench"}')
+
+    async def _fake_probe(merge_wt, profile, *, timeout_secs):
+        return list(_PROBED_PLANNED)
+
+    with patch.object(mq, '_probe_nextest_planned', _fake_probe):
+        payload = await mq._build_attempt0_payload(
+            tmp_path, _verify_result(_FAIL_FAST_OUTPUT)
+        )
+
+    assert payload is None
+
+
+@pytest.mark.asyncio
+async def test_build_attempt0_payload_none_when_probe_fails(tmp_path: Path) -> None:
+    """The first profile's probe returning None -> None -> full verify.
+
+    Never narrow on a partial plan: an unknown plan cannot distinguish
+    'this test passed' from 'this test was never listed'.
+    """
+    from orchestrator import merge_queue as mq
+
+    _place_real_sidecar(tmp_path)
+
+    async def _fake_probe(merge_wt, profile, *, timeout_secs):
+        return None
+
+    with patch.object(mq, '_probe_nextest_planned', _fake_probe):
+        payload = await mq._build_attempt0_payload(
+            tmp_path, _verify_result(_FAIL_FAST_OUTPUT)
+        )
+
+    assert payload is None
