@@ -897,35 +897,26 @@ class MergeDeepConfig(BaseModel):
     worktree, sequential in-order merges, one verify on the tip) instead of one
     item at a time, so a passing tip lands the whole clean prefix in one round.
 
-    ``chain_cap`` is the single gate for the entire feature. The dispatch
-    contract (PRD §Contract) is: a chain is built iff the second verify slot is
-    free AND ``chain_cap > 0`` AND the merge queue holds >= 2 mergeable items,
-    with ``target_depth = min(len(queue), chain_cap, halving_state)``. The
-    CONSUMERS of that contract are β (task 3184, the chain builder) and γ (task
-    3185, the dispatch gate) — this module only carries the knob, and nothing in
-    the orchestrator reads it yet.
+    ``chain_cap`` is the single gate for the whole feature. The dispatch contract
+    it feeds (when a chain is built, and how ``target_depth`` is derived) and the
+    cap-staging plan live in the PRD, which is the ONE canonical narrative for
+    both — deliberately not restated here, because β (task 3184, the chain
+    builder) and γ (task 3185, the dispatch gate) are the consumers that
+    implement that contract and may change it. Nothing in the orchestrator reads
+    the knob yet.
 
-    ``chain_cap=0`` (the shipped default) is the KILL SWITCH: with the cap at
-    zero the gate above can never open, so no chain code runs on any dispatch
-    path and behaviour is byte-identical to pre-PRD merging. This mirrors
-    :class:`SpeculationProbeConfig`'s ``probe_fraction=0.0`` precedent, where a
-    zero-valued knob makes the whole mechanism fall through to the unchanged
-    path rather than being conditionally compiled out.
-
-    Cap STAGING is an operator/deploy decision, not a schema change: the PRD
-    stages 0 -> 6 (ζ canary, the study-validated depth) -> 32 (η2, ">= 2x the
-    max observed queue depth", i.e. uncapped in practice), each step applied by
-    ``scripts/merge-deep-set-cap.sh`` against the target project's
-    ``dark-factory-orchestrator.yaml``.
+    ``chain_cap=0`` (the shipped default) is the KILL SWITCH: the gate can never
+    open, so no chain code runs on any dispatch path and behaviour is
+    byte-identical to pre-PRD merging — the ``probe_fraction=0.0`` precedent in
+    :class:`SpeculationProbeConfig`.
 
     Plain BaseModel (no ``frozen``, no ``validate_assignment``) so ``_set_leaf``
     can mutate it in place on hot-reload and held references observe the update
     (invariant I3) — see :class:`RetentionConfig`'s docstring, below, for the
-    same requirement.
-
-    Every leaf is green-tier hot-reloadable via RELOADABLE_FIELDS (PRD decision
-    #7), so an operator can enable, retune, or KILL the feature (cap -> 0) via
-    ``mcp__escalation__reload_config`` without a process restart.
+    same requirement. Every leaf is green-tier hot-reloadable via
+    RELOADABLE_FIELDS (PRD decision #7), so an operator can enable, retune, or
+    KILL the feature (cap -> 0) via ``mcp__escalation__reload_config`` without a
+    process restart.
     """
 
     chain_cap: int = Field(
@@ -935,14 +926,10 @@ class MergeDeepConfig(BaseModel):
             'Maximum number of queued items a single deep merge-ahead chain may '
             'contain. 0 (the default) disables the feature entirely -- the kill '
             'switch: no chain is ever built, so merge behaviour is byte-identical '
-            'to pre-task-3183 behaviour. Must be >= 0: a negative cap would '
-            'silently win target_depth = min(len(queue), chain_cap, '
-            'halving_state) and disable or underflow the dispatch gate, so it is '
-            'rejected at load rather than reaching dispatch. No upper bound: the '
-            'PRD stages 6 (ζ canary) -> 32 (η2, ~2x the max observed queue '
-            'depth) and leaves the ceiling to θ\'s week-after assessment; '
-            'wall-clock safety is bounded by '
-            'merge_verify_cold_command_timeout_secs (7200 s), not by the schema.'
+            'to pre-task-3183 behaviour. Must be >= 0; a negative cap is rejected '
+            'at load rather than reaching dispatch. No upper bound is imposed. '
+            'See plans/deep-merge-ahead-prd.md for the dispatch contract this '
+            'gates and for the cap-staging plan.'
         ),
     )
 
@@ -4740,9 +4727,8 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
     # Deep merge-ahead chains (task 3183, PRD alpha, decision #7) — a new
     # dedicated submodel, same whole-submodel-group idiom: chain_cap (and any
     # knob beta/gamma add later) is green-tier hot-reloadable with no separate
-    # RELOADABLE_FIELDS edit, so an operator can enable, retune, or KILL the
-    # feature (cap -> 0) without a restart. _set_leaf mutates the submodel in
-    # place, so a consumer holding a merge_deep reference sees the new cap (I3).
+    # RELOADABLE_FIELDS edit, so the cap can be raised, retuned, or killed
+    # (-> 0) without a restart. See MergeDeepConfig for the rest.
     _submodel_leaf_paths('merge_deep', MergeDeepConfig),
     # Agent-transcript archival (task 2742, PRD alpha) — a new dedicated
     # submodel, same whole-submodel-group idiom: enabled/root and the atomic

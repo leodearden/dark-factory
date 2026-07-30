@@ -592,14 +592,12 @@ git:
   # _lane- (warm-lane pool) or _spec- (merge-speculation pool).
   iact_prefix: "_iact-"
 
-# Deep merge-ahead chains (task 3183, plans/deep-merge-ahead-prd.md α).
-# chain_cap is the single gate for the whole feature: a chain is built iff the
-# second verify slot is free AND chain_cap > 0 AND the merge queue holds >= 2
-# mergeable items.  0 (shipped default) is the KILL SWITCH — byte-identical to
-# pre-PRD merge behaviour, no chain code on any dispatch path (probe_fraction=0
-# precedent).  Staged 0 -> 6 (ζ canary, study-validated depth) -> 32 (η2,
-# "uncapped in practice") via scripts/merge-deep-set-cap.sh; green-tier
-# hot-reloadable (decision #7), so enable/retune/kill never needs a restart.
+# Deep merge-ahead chains (task 3183).  chain_cap is the single gate for the
+# whole feature: the maximum number of queued items one verify may cover as a
+# chain.  0 (shipped default) is the KILL SWITCH — byte-identical to pre-PRD
+# merge behaviour.  Green-tier hot-reloadable, so enable/retune/kill never needs
+# a restart; set it with scripts/merge-deep-set-cap.sh.  Dispatch contract and
+# cap-staging plan: plans/deep-merge-ahead-prd.md.
 merge_deep:
   chain_cap: 0
 
