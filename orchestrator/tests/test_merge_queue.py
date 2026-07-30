@@ -12646,6 +12646,198 @@ class TestCoalesceSnapshotReconcile:
 
 
 # ---------------------------------------------------------------------------
+# TestInflightWorktreeIsStale — the disk-scan arm's staleness predicate (3148)
+# ---------------------------------------------------------------------------
+
+
+class TestInflightWorktreeIsStale:
+    """Contract for `_inflight_worktree_is_stale`, the §2 disk-scan companion
+    to `_inflight_entry_is_stale` (merge_queue.py:4043-4080).
+
+    Polarity matches the sibling predicate: **True = corpse (reap)**,
+    **False = keep coalescing**.
+
+    Why the predicate exists at all: §2's liveness test reads the merge
+    worktree's ROOT inode mtime, but `_touch_owned_merge_worktrees` os.utime's
+    the root inode of every OWNED `_merge-*` worktree on every heartbeat tick
+    (~30 s).  So for an owned worktree, root mtime measures OWNER-process
+    liveness, not MERGE liveness — the same hazard `merge_liveness.
+    newest_content_mtime` documents for the in-flight verify budget.
+
+    Why OWNERSHIP gates the verdict: §2 exists for cross-process /
+    post-restart crash-safety (merge_queue.py:4146-4150), so a foreign or
+    pre-restart merger's worktree — which is BY CONSTRUCTION absent from this
+    worker's snapshot entries — must still coalesce.  Ownership is the precise
+    discriminator: only for a worktree in `_owned_merge_worktrees` is the
+    mtime known-contaminated, and only there does "no live entry for the
+    branch" prove the owning request already finalized.
+
+    Pure-function tests: no event loop, no git, no worker construction.
+    """
+
+    def test_a_no_snapshot_provider_is_not_stale(self, tmp_path: Path):
+        """(a) live_snapshot is None → False (back-compat default)."""
+        from orchestrator.merge_queue import _inflight_worktree_is_stale
+
+        wt = tmp_path / '_merge-a'
+        wt.mkdir()
+        assert _inflight_worktree_is_stale(wt, 'br-a', None) is False
+
+    def test_b_snapshot_raises_is_not_stale(self, tmp_path: Path):
+        """(b) live_snapshot() raises → fail-safe False.
+
+        Mirrors test_snapshot_provider_raises_trusts_registry's `_raising_snap`.
+        """
+        from orchestrator.merge_queue import _inflight_worktree_is_stale
+
+        wt = tmp_path / '_merge-b'
+        wt.mkdir()
+
+        def _raising_snap():
+            raise RuntimeError('worker unavailable')
+
+        assert _inflight_worktree_is_stale(wt, 'br-b', _raising_snap) is False
+
+    def test_c_malformed_snapshot_is_not_stale(self, tmp_path: Path):
+        """(c) non-dict snapshot, and dict lacking 'entries' → fail-safe False.
+
+        Mirrors test_snapshot_malformed_trusts_registry: a snapshot that cannot
+        be trusted must never be read as "empty queue" (which would reap a live
+        merge and double-dispatch onto the branch).
+        """
+        from orchestrator.merge_queue import _inflight_worktree_is_stale
+
+        wt = tmp_path / '_merge-c'
+        wt.mkdir()
+
+        def _non_dict_snap():
+            return ['not', 'a', 'dict']  # type: ignore[return-value]
+
+        def _no_entries_key() -> dict:
+            return {'depth': 0, 'owned_merge_worktrees': [str(wt.resolve())]}
+
+        assert _inflight_worktree_is_stale(wt, 'br-c', _non_dict_snap) is False  # type: ignore[arg-type]
+        assert _inflight_worktree_is_stale(wt, 'br-c', _no_entries_key) is False
+
+    def test_d_missing_owned_key_is_not_stale(self, tmp_path: Path):
+        """(d) snapshot has 'entries' but NO 'owned_merge_worktrees' key → False.
+
+        Back-compat with any snapshot producer that predates the additive key
+        (a test double, or a rolling deploy where the escalation server sees an
+        older worker).  Wiring order can never turn the gate destructive.
+        """
+        from orchestrator.merge_queue import _inflight_worktree_is_stale
+
+        wt = tmp_path / '_merge-d'
+        wt.mkdir()
+        assert _inflight_worktree_is_stale(wt, 'br-d', lambda: {'entries': []}) is False
+
+    def test_e_unowned_worktree_is_not_stale(self, tmp_path: Path):
+        """(e) 'owned_merge_worktrees' present but does NOT contain wt → False.
+
+        THE CROSS-PROCESS CRASH-SAFETY CASE (merge_queue.py:4146-4150): "even
+        if the in-memory registry was cleared by a process restart, an
+        in-progress merger's `_merge-*` worktree persists on disk and is
+        correctly detected here."  A foreign / pre-restart merger's worktree is
+        by construction absent from THIS worker's `entries`, so a bare
+        branch-absence test would reap a genuinely live foreign merge and
+        double-dispatch onto main.  Not-owned ⇒ mtime is real evidence ⇒ keep
+        today's behaviour.
+        """
+        from orchestrator.merge_queue import _inflight_worktree_is_stale
+
+        wt = tmp_path / '_merge-e'
+        wt.mkdir()
+        other = tmp_path / '_merge-e-other'
+        other.mkdir()
+
+        def _snap() -> dict:
+            return {'entries': [], 'owned_merge_worktrees': [str(other.resolve())]}
+
+        assert _inflight_worktree_is_stale(wt, 'br-e', _snap) is False
+
+    def test_f_owned_with_live_branch_entry_is_not_stale(self, tmp_path: Path):
+        """(f) owned AND some entry carries this branch → False (genuinely in flight)."""
+        from orchestrator.merge_queue import _inflight_worktree_is_stale
+
+        wt = tmp_path / '_merge-f'
+        wt.mkdir()
+
+        def _snap() -> dict:
+            return {
+                'entries': [
+                    {'branch': 'other-branch', 'request_id': 'mr-other'},
+                    {'branch': 'br-f', 'request_id': 'mr-live'},
+                ],
+                'owned_merge_worktrees': [str(wt.resolve())],
+            }
+
+        assert _inflight_worktree_is_stale(wt, 'br-f', _snap) is False
+
+    def test_g_owned_without_branch_entry_is_stale(self, tmp_path: Path):
+        """(g) owned AND no entry carries the branch → **True** — THE INCIDENT.
+
+        The owning request already finalized (e.g. as `blocked`) but its
+        `_merge-*` worktree is still in this worker's liveness ledger, so
+        `_touch_owned_merge_worktrees` pins its root mtime fresh forever and
+        §2's `age <= liveness_secs` test is permanently true.  Only the live
+        snapshot can tell that the corpse's owner is gone.
+        """
+        from orchestrator.merge_queue import _inflight_worktree_is_stale
+
+        wt = tmp_path / '_merge-g'
+        wt.mkdir()
+
+        def _snap() -> dict:
+            return {
+                'entries': [{'branch': 'unrelated', 'request_id': 'mr-unrelated'}],
+                'owned_merge_worktrees': [str(wt.resolve())],
+            }
+
+        assert _inflight_worktree_is_stale(wt, 'br-g', _snap) is True
+
+        # An EMPTY owned list from a live worker is NOT the same as a missing
+        # key: empty ledger + on-disk worktree is the unowned case (e), while a
+        # present-but-empty ledger must still permit the decisive check for any
+        # path it does list.  Guard the "owned is None, not falsy" distinction.
+        def _empty_owned() -> dict:
+            return {'entries': [], 'owned_merge_worktrees': []}
+
+        assert _inflight_worktree_is_stale(wt, 'br-g', _empty_owned) is False
+
+    def test_h_ownership_is_compared_on_resolved_paths(self, tmp_path: Path):
+        """(h) Membership is compared on `Path.resolve()`, so an equivalent but
+        non-normalised spelling of an owned path is still recognised as owned.
+
+        Matches how `worktree_ledger_violations` already normalises ownership
+        (merge_queue.py:9556 `owned = {p.resolve() for p in ...}` and 9569
+        `path = Path(entry.path).resolve()`), so the two ownership tests can
+        never disagree about the same worktree.
+        """
+        from orchestrator.merge_queue import _inflight_worktree_is_stale
+
+        real = tmp_path / '_merge-h'
+        real.mkdir()
+        # Same directory, spelled with a '..' round-trip through a sibling.
+        sibling = tmp_path / 'sib'
+        sibling.mkdir()
+        unnormalised = sibling / '..' / '_merge-h'
+        assert unnormalised.resolve() == real.resolve()
+
+        def _snap() -> dict:
+            return {'entries': [], 'owned_merge_worktrees': [str(real.resolve())]}
+
+        # (g)'s verdict must be unchanged by the spelling of the path.
+        assert _inflight_worktree_is_stale(unnormalised, 'br-h', _snap) is True
+
+        # And symmetrically when the LEDGER holds the odd spelling.
+        def _snap_odd_ledger() -> dict:
+            return {'entries': [], 'owned_merge_worktrees': [str(unnormalised)]}
+
+        assert _inflight_worktree_is_stale(real, 'br-h', _snap_odd_ledger) is True
+
+
+# ---------------------------------------------------------------------------
 # TestCoalesceOrEnqueueWorktreePath — disk-scan coalesces alive worktrees
 # ---------------------------------------------------------------------------
 
