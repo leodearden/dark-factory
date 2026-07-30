@@ -19,11 +19,19 @@ from fused_memory.server.markup_tripwire import (
     MCP_MARKUP_PATTERNS,
     MarkupStormCounter,
     build_markup_block,
+    emit_markup_storm_escalation,
     find_markup_pattern,
     find_markup_violation,
     markup_override_requested,
     strip_markup_override,
 )
+
+_STORM = {
+    'count': 4,
+    'threshold': 3,
+    'window_seconds': 3600.0,
+    'hint': 'the leak is active; DF 3083 owns the root cause',
+}
 
 
 class _FakeClock:
@@ -534,3 +542,126 @@ class TestStripMarkupOverride:
     def test_unexpected_types_pass_through_unchanged(self):
         for value in (123, 4.5, []):
             assert strip_markup_override(value) == value
+
+
+class TestEmitMarkupStormEscalation:
+    """The best-effort queue write on a burst (INV-4).
+
+    Purely ADDITIVE: the rejection has already been decided by the time this
+    runs, so every failure mode here must degrade to None rather than change the
+    write's outcome. Exercised against a real EscalationQueue in tmp_path (the
+    escalation package is a fused-memory workspace dep) — mirrors
+    tests/test_candidate_key_escalation.py.
+    """
+
+    def test_returns_none_for_a_none_project_root(self):
+        """add_memory/add_episode may not resolve a project_root at all.
+
+        Those boundaries take project_id, not project_root, and an unknown
+        project maps to nothing — so this must be a quiet no-op, not a crash on
+        Path(None).
+        """
+        assert emit_markup_storm_escalation(None, _STORM) is None
+
+    def test_files_one_escalation_naming_3083_and_the_storm_numbers(self, tmp_path):
+        esc_id = emit_markup_storm_escalation(str(tmp_path), _STORM)
+        if not markup_tripwire.HAS_ESCALATION:
+            assert esc_id is None
+            return
+
+        assert isinstance(esc_id, str)
+        queue_dir = tmp_path / 'data' / 'escalations'
+        files = list(queue_dir.glob('esc-*.json'))
+        assert len(files) == 1, f'expected exactly one escalation file, found: {files}'
+        payload = json.loads(files[0].read_text())
+        assert payload['id'] == esc_id
+        assert payload['category'] == 'mcp_markup_write_storm'
+        assert payload['task_id'] == 'markup-tripwire'
+        assert payload['level'] == 1
+
+        # The operator must be able to act without opening the code: the record
+        # names the owner of the root cause and the burst it observed.
+        text = f'{payload["summary"]}\n{payload["detail"]}'
+        assert '3083' in text, f'escalation must name DF 3083: {text!r}'
+        assert '4' in text, f'escalation must state the storm count: {text!r}'
+        assert '3600' in text, f'escalation must state the window: {text!r}'
+
+    def test_escalation_id_is_greppable_via_the_stable_anchor(self, tmp_path):
+        """The anchor is stable so ids form one greppable series per project."""
+        esc_id = emit_markup_storm_escalation(str(tmp_path), _STORM)
+        if not markup_tripwire.HAS_ESCALATION:
+            return
+        assert esc_id is not None
+        assert 'markup-tripwire' in esc_id, f'unexpected id shape: {esc_id!r}'
+
+    def test_dedupes_against_an_already_pending_escalation(self, tmp_path):
+        """A sustained leak must not mint one escalation per window forever.
+
+        The storm counter is already rate-limited per window, but a leak running
+        for hours would still file an escalation every hour; the anchor dedup
+        collapses those into the one open record until it is resolved.
+        """
+        first = emit_markup_storm_escalation(str(tmp_path), _STORM)
+        second = emit_markup_storm_escalation(str(tmp_path), _STORM)
+        if not markup_tripwire.HAS_ESCALATION:
+            assert first is None and second is None
+            return
+
+        assert first is not None
+        assert second == first, f'expected dedup; got first={first!r} second={second!r}'
+        queue_dir = tmp_path / 'data' / 'escalations'
+        assert len(list(queue_dir.glob('esc-*.json'))) == 1
+
+    def test_files_afresh_once_the_prior_escalation_is_resolved(self, tmp_path):
+        """Dedup must not silence a NEW incident after the old one was cleared."""
+        if not markup_tripwire.HAS_ESCALATION:
+            return
+        from escalation.queue import EscalationQueue
+
+        first = emit_markup_storm_escalation(str(tmp_path), _STORM)
+        assert first is not None
+        EscalationQueue(tmp_path / 'data' / 'escalations').resolve(first, 'leak fixed')
+
+        second = emit_markup_storm_escalation(str(tmp_path), _STORM)
+        assert second is not None
+        assert second != first
+
+    def test_a_submit_failure_is_swallowed(self, tmp_path, monkeypatch):
+        """A broken queue must never turn a decided rejection into an exception."""
+        if not markup_tripwire.HAS_ESCALATION:
+            return
+
+        def _boom(self, esc):
+            raise OSError('disk on fire')
+
+        monkeypatch.setattr(markup_tripwire.EscalationQueue, 'submit', _boom)
+        assert emit_markup_storm_escalation(str(tmp_path), _STORM) is None
+
+    def test_a_dedup_read_failure_still_files(self, tmp_path, monkeypatch):
+        """If the dedup check itself fails, fall through and FILE.
+
+        Best-effort dedup: losing a duplicate-suppression is strictly better than
+        losing the alarm for an active leak.
+        """
+        if not markup_tripwire.HAS_ESCALATION:
+            return
+
+        def _boom(self, task_id, status=None):
+            raise OSError('cannot read queue')
+
+        monkeypatch.setattr(markup_tripwire.EscalationQueue, 'get_by_task', _boom)
+        assert emit_markup_storm_escalation(str(tmp_path), _STORM) is not None
+
+    def test_returns_none_when_the_escalation_package_is_unavailable(
+        self, tmp_path, monkeypatch
+    ):
+        """The defensive-import no-op path (minimal envs without escalation)."""
+        monkeypatch.setattr(markup_tripwire, 'HAS_ESCALATION', False)
+        assert emit_markup_storm_escalation(str(tmp_path), _STORM) is None
+        assert not (tmp_path / 'data' / 'escalations').exists()
+
+    def test_tolerates_a_storm_dict_missing_keys(self, tmp_path):
+        """Never raises on an unexpected storm shape — it is only a log payload."""
+        assert emit_markup_storm_escalation(str(tmp_path), {}) is not None or (
+            not markup_tripwire.HAS_ESCALATION
+        )
