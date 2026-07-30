@@ -75,6 +75,99 @@ def _decode_files(raw: object, key: str = "files") -> tuple[str, ...]:
     return _coerce_file_list(payload.get(key))
 
 
+# ---------------------------------------------------------------------------
+# Recovered plan scope.
+#
+# FIDELITY IS LOAD-BEARING, NOT DECORATION. A FILE_LEVEL record is a faithful
+# plan.files list and could in principle be backfilled verbatim. A LOCK_LEVEL
+# record is the lock-level MODULE set and must NEVER be presented as if it
+# were plan.files — writing a module path into metadata.files would corrupt
+# any downstream repair. The label makes that distinction machine-checkable
+# instead of relying on a reader knowing the emit-site history.
+# ---------------------------------------------------------------------------
+
+FIDELITY_FILE_LEVEL = "file_level"
+FIDELITY_LOCK_LEVEL = "lock_level"
+
+
+class PlanFilesRecord(NamedTuple):
+    """A task's recovered plan scope, with where it came from and how faithful.
+
+    ``fidelity`` is one of :data:`FIDELITY_FILE_LEVEL` (a real plan.files
+    list) or :data:`FIDELITY_LOCK_LEVEL` (a lock-level module projection).
+    """
+
+    files: tuple[str, ...]
+    source: str
+    fidelity: str
+
+
+# Event types carrying a recoverable plan scope, mapped to
+# (payload key, source label, fidelity).
+#
+#   phase_skipped.plan_files  (workflow.py:4275, :4447) — TRUE file-level
+#       plan.files, snapshotted at the moment revalidation/SIMPLE_TASK
+#       planning skipped a phase.
+#   set_to_plan.files  (scheduler.py:6987-6994) — DELIBERATELY LOCK-LEVEL.
+#       event_store.py:77-82 and scheduler.py:6982-6984 both state that this
+#       payload carries `needed`, the lock-level module set, and NOT the
+#       file-level persist set — the emit site keeps it that way on purpose
+#       to preserve the reify zeta-gate contract. It therefore reaches more
+#       tasks than any file-level source but its paths are MODULE paths.
+#       Tagged LOCK_LEVEL so it can only ever be used as a "this task
+#       declared a non-empty scope" presence signal.
+_EVENT_PLAN_SOURCES = {
+    "phase_skipped": ("plan_files", "phase_skipped_event", FIDELITY_FILE_LEVEL),
+    "set_to_plan": ("files", "set_to_plan_event", FIDELITY_LOCK_LEVEL),
+}
+
+# Higher rank wins. Compared before recency, so a file-level record beats a
+# lock-level one regardless of which event row is newer.
+_FIDELITY_RANK = {FIDELITY_LOCK_LEVEL: 0, FIDELITY_FILE_LEVEL: 1}
+
+
+def load_plan_files_from_events(runs_db_path: str) -> dict[str, PlanFilesRecord]:
+    """Recover plan scope per task from durable event payloads in *runs_db_path*.
+
+    One read-only pass in ascending ``id`` order. Per task, keeps the
+    highest-FIDELITY record, breaking ties by recency (later row wins) — so a
+    file-level ``phase_skipped`` snapshot always beats a lock-level
+    ``set_to_plan`` one no matter which was emitted last.
+
+    Rows with a NULL ``task_id``, malformed/NULL ``data``, a missing key, or
+    an empty/wrong-typed file list are SKIPPED — never allowed to overwrite an
+    earlier real signal with an empty one. Keys are event ``task_id`` values,
+    which are TEXT in the live schema.
+    """
+    records: dict[str, PlanFilesRecord] = {}
+    placeholders = ", ".join("?" for _ in _EVENT_PLAN_SOURCES)
+    conn = sqlite3.connect(f"file:{runs_db_path}?mode=ro", uri=True)
+    try:
+        cursor = conn.execute(
+            "SELECT id, task_id, event_type, data FROM events "
+            f"WHERE event_type IN ({placeholders}) ORDER BY id",
+            tuple(_EVENT_PLAN_SOURCES),
+        )
+        for _event_id, task_id, event_type, data in cursor:
+            if not task_id:
+                continue
+            key, source, fidelity = _EVENT_PLAN_SOURCES[event_type]
+            files = _decode_files(data, key)
+            if not files:
+                continue
+            existing = records.get(str(task_id))
+            if existing is not None and (
+                _FIDELITY_RANK[existing.fidelity] > _FIDELITY_RANK[fidelity]
+            ):
+                continue
+            records[str(task_id)] = PlanFilesRecord(
+                files=files, source=source, fidelity=fidelity
+            )
+    finally:
+        conn.close()
+    return records
+
+
 def load_task_records(tasks_db_path: str) -> dict[tuple[str, int], TaskRecord]:
     """Load every task from *tasks_db_path*, keyed by ``(tag, id)``.
 
