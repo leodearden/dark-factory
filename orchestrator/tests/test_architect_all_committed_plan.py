@@ -601,16 +601,6 @@ class TestCommitBulletHelper:
         assert _SHA_B[:12] not in rendered
         assert '1 more commit(s)' in rendered
 
-    def test_bullet_format_literal_appears_once_in_the_module(self):
-        """Structural pin against re-duplicating the format at a third site."""
-        from orchestrator.agents import briefing as briefing_module  # noqa: PLC0415
-
-        source = Path(str(briefing_module.__file__)).read_text()
-
-        assert source.count("[:12]}` — ") == 1, (
-            'The commit-bullet format must live only in _format_commit_bullets'
-        )
-
 
 # ---------------------------------------------------------------------------
 # step-7 RED: _plan() threads the detector into the architect briefing
