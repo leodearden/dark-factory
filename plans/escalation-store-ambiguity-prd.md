@@ -316,9 +316,34 @@ No waivers required.
 3. **Whether γ3's identity block also lands on the merge/halt tools** served by
    the same server, or only the escalation-semantic ones. Decide during γ3.
 4. **Does `--disallowed-tools` reject a denied MCP tool on call, or omit it from
-   the listing?** Not verified; `cli_invoke.py:1537` passes the list straight to
-   the CLI, and MCP tool names in these lists are production-proven
-   (`mcp__fused-memory__delete_entity`). α's signal and B8 are worded to hold
-   under either. If it turns out to be *omission*, α should additionally keep the
-   prompt paragraph so the agent understands the boundary rather than merely
-   finding the tool missing. Decide during α by inspecting one live stage spawn.
+   the listing?** **RESOLVED during α (task 3163): OMISSION.** A denied tool is
+   simply absent from the agent's visible tool set; there is no rejection event
+   and no error message.
+
+   *Method (reproducible).* Recon stages run in deferred-tools mode, so a stage
+   transcript carries the agent's visible tool set in its
+   `attachment.type == 'deferred_tools_delta'` → `addedNames` payload. Across
+   five live recon-stage transcripts under
+   `~/.claude/projects/-home-leo-src-dark-factory/`, the denied names are absent
+   from that listing and track each stage's disallow list exactly:
+
+   | transcript | stage | tools listed | absent from listing |
+   |---|---|---|---|
+   | `e8e4fe99`, `aaeeb70c` | 3 | 80 | builtins, `…__delete_entity`, `…__submit_task`, `…__add_memory`, `…__write_entity_standing_decision` |
+   | `e22890a3` | 1 | 93 | builtins, `…__submit_task` (memory writes present — matches STAGE1) |
+   | `ec23af49`, `43f8155c` | 2 | 100 | builtins, `…__write_entity_standing_decision` only |
+
+   *Consequence.* Because it is omission rather than rejection, the agent gets no
+   explanation for the missing tool — it would find the escalation surface simply
+   gone and could conclude it does not exist, or route around it. This is exactly
+   the branch anticipated above: α's prompt paragraph is therefore **load-bearing
+   and ships** (`ESCALATION_BOUNDARY_NOTE`, rendered into all three stage
+   prompts). Per G6 branch 4, α's user-observable signal and boundary test B8 are
+   NOT reworded into a rejection claim — they were written to hold under either
+   outcome, and this verdict is recorded as an annotation, not a rewrite.
+
+   *Two corroborating observations.* Both escalation read tools were PRESENT in
+   all five listings pre-change — direct evidence of the live bug α closes. And
+   one Stage-2 transcript (`ec23af49`) called `mcp__escalation__merge_status`
+   unprompted, evidencing that stages do reach for escalation-server tools on
+   their own initiative rather than only when instructed.
