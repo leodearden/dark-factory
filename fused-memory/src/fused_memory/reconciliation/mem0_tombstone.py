@@ -157,3 +157,124 @@ def is_protected_mirror_record(metadata) -> bool:
         metadata.get('kind') == _KIND_CYCLE_SUMMARY
         or metadata.get('record_type') == _RECORD_TYPE_LEDGER_STAMP
     )
+
+
+async def record_mem0_deletion_tombstone(
+    memory_service,
+    project_id: str,
+    memory_id: str,
+    *,
+    victim_metadata: dict | None,
+    victim_created_at: str | None,
+    deleter: str,
+    deleting_run_id: str,
+    now: datetime | None = None,
+) -> bool:
+    """Record that a recon sweep deleted the Mem0 record *memory_id*.
+
+    Writes ONE :class:`~fused_memory.reconciliation.recon_ledger.ReconLedgerRecord`
+    with ``record_kind='mem0_tombstone'`` and ``task_id=memory_id``, leaving
+    ``flag_type``/``run_id`` at their ``''`` defaults — so a later lookup needs
+    only the one thing an auditor actually knows (the memory uuid) to satisfy
+    the store's existing five-part ``get_by_identity``. The primary key's
+    ``ON CONFLICT`` makes a repeat write for the same victim idempotent (row
+    count stays 1), and ``expires_at`` hands retention to the ``gc()`` pass
+    ``_gc_recon_markers`` already runs every cycle, so tombstones cannot grow
+    unbounded without any new cleanup code.
+
+    **Ordering contract — call this only AFTER the delete is confirmed
+    successful.** Both delete paths (``_sweep_stale_mem0_pool`` and
+    ``enforce_summary_pool_cap``) already degrade an individual delete failure
+    to a WARNING and exclude it from their success count; writing the tombstone
+    from the success branch only means a tombstone always means "really gone".
+    A pre-delete write would instead false-positive on every failed delete,
+    producing an audit trail that claims records are gone while they are alive
+    — strictly worse than the status quo this is fixing. The residual window
+    (process dies between a successful delete and this write) is ACCEPTED and
+    documented: it is still covered by the pre-existing
+    ``WriteJournal.log_write_op`` row that ``delete_memory`` emits.
+
+    Fail-safe throughout, because this runs inside a delete sweep: the whole
+    body is wrapped so a missing/None ``recon_ledger`` or a raising ``upsert``
+    degrades to one WARNING and a ``False`` return. It can never raise into a
+    sweep and never alters a sweep's returned count.
+
+    Args:
+        memory_service: Service that may expose a ``recon_ledger``
+            (:class:`~fused_memory.reconciliation.recon_ledger.ReconLedgerStore`)
+            attribute. Missing/``None`` => no tombstone, returns ``False``.
+            Same ``getattr`` optional-store precedent as
+            ``summary_pool.write_cycle_summary`` and
+            ``stages.task_knowledge_sync._gc_recon_markers``, so a deployment
+            running ``recon_ledger_enabled=False`` degrades identically.
+        project_id: Project scope for the tombstone row.
+        memory_id: The deleted Mem0 record's uuid — stored as ``task_id``.
+        victim_metadata: The deleted record's ``metadata`` mapping, or
+            ``None``. Only :data:`_VICTIM_IDENTITY_KEYS` are copied — never the
+            record's content — so the tombstone stays an accounting row rather
+            than a second copy of the payload.
+        victim_created_at: The deleted record's ``created_at``, or ``None``.
+            Carried verbatim so an auditor can tell how old the evicted record
+            was without reconstructing the pool's history.
+        deleter: The delete's ``_source`` audit tag, i.e. WHICH sweep took it
+            (e.g. ``'stage1_cycle_summary_trim'``,
+            ``'stage1_flag_marker_gc_sweep'``).
+        deleting_run_id: The run that performed the deletion. Deliberately
+            distinct from the victim's own ``metadata['run_id']`` (also stored,
+            via ``victim_metadata``) — conflating the two is precisely what
+            made the original recon-gate-165 finding unreadable.
+        now: Reference "current time". Defaults to ``datetime.now(UTC)``;
+            tests inject a fixed value. Normalized via :func:`_assume_utc` and
+            rendered with ``.isoformat()`` so ``expires_at`` stays correct
+            under the ledger's lexicographic TEXT ``gc()`` comparison.
+
+    Returns:
+        ``True`` when the tombstone row was written, ``False`` otherwise (no
+        ledger wired, or the upsert failed).
+    """
+    try:
+        ledger = getattr(memory_service, 'recon_ledger', None)
+        if ledger is None:
+            return False
+
+        now_dt = _assume_utc(now or datetime.now(UTC))
+        metadata = victim_metadata if isinstance(victim_metadata, dict) else {}
+        payload = {
+            'deleter': deleter,
+            'deleting_run_id': deleting_run_id,
+            'deleted_at': now_dt.isoformat(),
+            'created_at': victim_created_at,
+            **{key: metadata.get(key) for key in _VICTIM_IDENTITY_KEYS},
+        }
+        await ledger.upsert(
+            ReconLedgerRecord(
+                project_id=project_id,
+                record_kind=RECORD_KIND_MEM0_TOMBSTONE,
+                task_id=memory_id,
+                flag_type='',
+                run_id='',
+                payload_json=json.dumps(payload, default=str),
+                state='deleted',
+                created_at=now_dt.isoformat(),
+                expires_at=(
+                    now_dt + timedelta(days=MEM0_TOMBSTONE_TTL_DAYS)
+                ).isoformat(),
+            )
+        )
+        return True
+    except Exception:
+        logger.warning(
+            'reconciliation.record_mem0_deletion_tombstone: '
+            'tombstone write failed for memory_id=%s deleter=%s; '
+            'the delete itself still succeeded and remains journaled',
+            memory_id,
+            deleter,
+            exc_info=True,
+            extra={
+                'project_id': project_id,
+                'memory_id': memory_id,
+                'deleter': deleter,
+                'run_id': deleting_run_id,
+            },
+        )
+        return False
