@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +57,21 @@ _TREND_RUN_CAP = 90
 # issue.  Other semantic violations of the M1 schema are the producer's to
 # reject at emit time and are passed through verbatim here.
 _KNOWN_KINDS = frozenset({'tripwire', 'proportion', 'count', 'scalar'})
+
+# An eval whose newest run is older than this is DISPLAYED as stale.  It is
+# never alarmed on: the runner-failure tripwire belongs to the eval program,
+# and this module files nothing.  36h gives a nightly cadence one full missed
+# run plus slack before the badge appears.
+_STALE_AFTER_SECONDS = 36 * 3600.0
+
+# The producer's run-stamp format (zero-padded UTC, which is why filename order
+# is chronological order).
+_RUN_STAMP_FORMAT = '%Y%m%dT%H%M%SZ'
+
+# Everything a malformed artifact can plausibly raise on the way through
+# ``json.loads`` + dict access.  Caught narrowly at each artifact boundary so
+# one bad file degrades one row, never the whole payload.
+_ARTIFACT_ERRORS = (OSError, json.JSONDecodeError, TypeError, ValueError, AttributeError)
 
 # The limits artifact carries a great deal more than this — ``alarms``,
 # ``alarmed_metric_count``, ``grandfather_set``, ``snapshotted_metric_ids`` and
@@ -294,6 +310,7 @@ def _build_eval(
     escalation_index: dict[str, dict[str, Any]],
     linked_fingerprints: set[str],
     storm: dict[str, Any] | None,
+    now: datetime,
 ) -> dict[str, Any]:
     """Assemble one eval's trend payload from its ``metrics-*.json`` series.
 
@@ -318,15 +335,37 @@ def _build_eval(
     paths = all_paths[-_TREND_RUN_CAP:] if _TREND_RUN_CAP else all_paths
     truncated = len(paths) < runs_on_disk
 
-    runs: list[tuple[str, dict[str, dict]]] = []
+    runs: list[tuple[Any, dict[str, dict]]] = []
     corpus: dict | None = None
     for path in paths:
-        body = _load_json(path)
-        rows = _metric_rows(body)
-        stamp = body.get('run_stamp') if isinstance(body, dict) else None
-        if isinstance(body, dict) and isinstance(body.get('corpus'), dict):
+        try:
+            body = _load_json(path)
+        except _ARTIFACT_ERRORS as exc:
+            # One unreadable run degrades one run, not the whole eval.
+            _issue(issues, 'unreadable_metrics', eval_id=eval_id, path=path, detail=str(exc))
+            continue
+
+        # The reader validates only what it needs to READ and RENDER.  The M1
+        # schema's cross-field rules (a proportion inside [0,1], a required
+        # denominator) are the producer's to reject at emit time — restating
+        # them here would be a second implementation of what the producer has
+        # already decided.
+        if not isinstance(body, dict) or not isinstance(body.get('metrics'), list):
+            _issue(
+                issues, 'malformed_metrics', eval_id=eval_id, path=path,
+                detail=f'expected an object with a list "metrics" field, got {type(body).__name__}',
+            )
+            continue
+
+        stamp = body.get('run_stamp')
+        if stamp is None:
+            _issue(
+                issues, 'missing_run_stamp', eval_id=eval_id, path=path,
+                detail='run artifact carries no in-body run_stamp',
+            )
+        if isinstance(body.get('corpus'), dict):
             corpus = dict(body['corpus'])
-        runs.append((stamp, {row['metric_id']: row for row in rows}))
+        runs.append((stamp, {row['metric_id']: row for row in _metric_rows(body)}))
 
     run_stamps = [stamp for stamp, _ in runs]
 
@@ -340,9 +379,30 @@ def _build_eval(
                 metric_ids.append(metric_id)
 
     latest_run_stamp = run_stamps[-1] if run_stamps else None
-    limits, limits_by_metric = _read_limits(
-        eval_dir, latest_run_stamp, issues, has_runs=bool(all_paths),
-    )
+    try:
+        limits, limits_by_metric = _read_limits(
+            eval_dir, latest_run_stamp, issues, has_runs=bool(all_paths),
+        )
+    except _ARTIFACT_ERRORS as exc:
+        _issue(
+            issues, 'unreadable_limits', eval_id=eval_id,
+            path=eval_dir / 'limits-current.json', detail=str(exc),
+        )
+        limits, limits_by_metric = None, {}
+
+    # Staleness is DISPLAYED, never alarmed on.  An unparseable stamp degrades
+    # the age to None (and says so) rather than raising or guessing a date.
+    age_seconds: float | None = None
+    if isinstance(latest_run_stamp, str):
+        try:
+            run_at = datetime.strptime(latest_run_stamp, _RUN_STAMP_FORMAT).replace(tzinfo=UTC)
+        except ValueError:
+            _issue(
+                issues, 'unparseable_run_stamp', eval_id=eval_id, path=eval_dir,
+                detail=f'run_stamp {latest_run_stamp!r} is not in {_RUN_STAMP_FORMAT}',
+            )
+        else:
+            age_seconds = (now - run_at).total_seconds()
 
     latest = runs[-1][1] if runs else {}
     metrics: list[dict[str, Any]] = []
@@ -352,6 +412,17 @@ def _build_eval(
         # metric's points against its neighbours'.
         values = [by_id.get(metric_id, {}).get('value') for _, by_id in runs]
         current = latest.get(metric_id, {})
+
+        # A kind outside the closed vocabulary is a RENDERING failure: there is
+        # no chart primitive for it, so the dashboard genuinely cannot resolve
+        # it and says so.  The value itself is still real and is still shown.
+        kind = current.get('kind')
+        if kind is not None and kind not in _KNOWN_KINDS:
+            _issue(
+                issues, 'unknown_kind', eval_id=eval_id, path=eval_dir,
+                detail=f'metric {metric_id!r} has kind {kind!r}, which has no chart primitive',
+            )
+
         # Absent verdict == absent, never defaulted to 'no_alarm'.  The empty
         # dict makes every verdict field read as None below without a second
         # code path.
@@ -382,7 +453,7 @@ def _build_eval(
 
         metrics.append({
             'metric_id': metric_id,
-            'kind': current.get('kind'),
+            'kind': kind,
             # Looked up by metric_id, never zipped positionally: the two lists
             # are ordered independently and a metric may be absent from either.
             'rule_kind': limits_by_metric.get(metric_id, {}).get('rule_kind'),
@@ -413,6 +484,8 @@ def _build_eval(
     return {
         'eval_id': eval_id,
         'latest_run_stamp': latest_run_stamp,
+        'latest_run_age_seconds': age_seconds,
+        'stale': age_seconds is not None and age_seconds > _STALE_AFTER_SECONDS,
         'limits': limits,
         'storm_escape': storm,
         'run_stamps': run_stamps,
@@ -428,7 +501,7 @@ def build_memory_evals(
     memory_evals_dir: Path,
     escalations_dir: Path,
     *,
-    now: Any = None,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     """Aggregate the memory-eval artifact tree into one dashboard payload.
 
@@ -457,8 +530,25 @@ def build_memory_evals(
         'unmatched_escalations': [],
     }
 
+    # "No eval has ever run" is a legitimate pre-deployment state, not a
+    # degradation — an explicit empty-but-healthy payload with NO issue.
+    # Flagging it would train operators to ignore the issues list.
+    if not memory_evals_dir.is_dir():
+        payload['root_present'] = False
+        return payload
+
     eval_dirs = sorted(p for p in memory_evals_dir.iterdir() if p.is_dir())
-    verdict_index, storm = _read_verdicts(memory_evals_dir, eval_dirs, issues)
+
+    try:
+        verdict_index, storm = _read_verdicts(memory_evals_dir, eval_dirs, issues)
+    except _ARTIFACT_ERRORS as exc:
+        # An unreadable verdicts artifact must never read as "nothing
+        # alarmed" — every verdict stays absent and the failure is named.
+        _issue(
+            issues, 'unreadable_verdicts',
+            path=memory_evals_dir / 'verdicts-current.json', detail=str(exc),
+        )
+        verdict_index, storm = {}, None
 
     escalation_index = _index_escalations(escalations_dir)
 
@@ -488,7 +578,8 @@ def build_memory_evals(
 
     payload['evals'] = [
         _build_eval(
-            d, issues, verdict_index, consumed, escalation_index, linked_fingerprints, storm_block,
+            d, issues, verdict_index, consumed, escalation_index,
+            linked_fingerprints, storm_block, resolved_now,
         )
         for d in eval_dirs
     ]
