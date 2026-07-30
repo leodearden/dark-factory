@@ -28,7 +28,11 @@ from orchestrator.git_ops import GitOps
 from orchestrator.harness import Harness
 from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.lane_lifecycle import LaneRecord, LaneState
-from orchestrator.stranded_verified_green import VerifiedGreenMatch
+from orchestrator.stranded_verified_green import (
+    VerifiedGreenMatch,
+    merge_request_marker_is_fresh,
+    submit_verified_green_merge_request,
+)
 from orchestrator.task_ground_truth import EscalationRef
 
 
@@ -1386,3 +1390,196 @@ class TestStrandedVerifiedGreenHappyPathIntegration:
             if e.category == 'stranded_merge_failed'
         ]
         assert l2s == []
+
+
+# ---------------------------------------------------------------------------
+# Shared merge-submit primitives (task 3031 β, INV-5 extraction).
+#
+# The stranded reaper and the architect's `report_ready_to_merge` desync exit
+# both need the same build→register-callback→enqueue→stamp-marker plumbing.
+# It lives here as two free functions so neither caller copies it and
+# workflow.py needn't import harness.py (circular).  The two callers differ
+# ONLY in `source=` tag, marker key, and terminal done-callback.
+# ---------------------------------------------------------------------------
+
+
+class TestMergeRequestMarkerIsFresh:
+    """The shared freshness predicate behind BOTH submit-dedup guards."""
+
+    def test_fresh_matching_marker_is_fresh(self) -> None:
+        assert merge_request_marker_is_fresh(_marker(tip=_TIP), _TIP) is True
+
+    def test_non_dict_marker_is_not_fresh(self) -> None:
+        """Fail-safe: a malformed marker must never wedge a submit."""
+        assert merge_request_marker_is_fresh('not-a-dict', _TIP) is False
+        assert merge_request_marker_is_fresh(None, _TIP) is False
+        assert merge_request_marker_is_fresh(['a'], _TIP) is False
+
+    def test_mismatched_tip_is_not_fresh(self) -> None:
+        assert merge_request_marker_is_fresh(_marker(tip='f' * 40), _TIP) is False
+
+    def test_missing_or_unparseable_timestamp_is_not_fresh(self) -> None:
+        assert merge_request_marker_is_fresh({'tip_sha': _TIP}, _TIP) is False
+        assert merge_request_marker_is_fresh(
+            {'tip_sha': _TIP, 'submitted_at': ''}, _TIP,
+        ) is False
+        assert merge_request_marker_is_fresh(
+            {'tip_sha': _TIP, 'submitted_at': 'not-a-timestamp'}, _TIP,
+        ) is False
+        assert merge_request_marker_is_fresh(
+            {'tip_sha': _TIP, 'submitted_at': 12345}, _TIP,
+        ) is False
+
+    def test_stale_timestamp_is_not_fresh(self) -> None:
+        assert merge_request_marker_is_fresh(
+            _marker(tip=_TIP, age_s=7200.0), _TIP,
+        ) is False
+
+    def test_grace_is_configurable(self) -> None:
+        """The recency window is a parameter, not a hard-coded constant — the
+        reaper passes its own grace; the default is the shared window."""
+        marker = _marker(tip=_TIP, age_s=120.0)
+        assert merge_request_marker_is_fresh(marker, _TIP, grace_s=60.0) is False
+        assert merge_request_marker_is_fresh(marker, _TIP, grace_s=600.0) is True
+
+    def test_naive_timestamp_is_read_as_utc(self) -> None:
+        """A tz-naive submitted_at is interpreted as UTC (not local), so a
+        just-stamped naive marker still reads fresh."""
+        naive = datetime.now(UTC).replace(tzinfo=None).isoformat()
+        assert merge_request_marker_is_fresh(
+            {'tip_sha': _TIP, 'submitted_at': naive}, _TIP,
+        ) is True
+
+    def test_future_timestamp_is_fresh(self) -> None:
+        """Clock skew lands on the safe side: a future stamp reads fresh
+        (skip) rather than triggering a duplicate submit."""
+        assert merge_request_marker_is_fresh(
+            _marker(tip=_TIP, age_s=-300.0), _TIP,
+        ) is True
+
+
+@pytest.mark.asyncio
+class TestSubmitVerifiedGreenMergeRequest:
+    """The shared build→callback→enqueue→stamp submit helper."""
+
+    async def _submit(
+        self,
+        tmp_path: Path,
+        *,
+        source: str = 'architect-desync',
+        marker_key: str = 'architect_merge_request',
+        done_callback: Callable[[asyncio.Future], None] | None = None,
+        update_task: Any = None,
+        event_store: EventStore | None = None,
+        merge_queue: asyncio.Queue | None = None,
+        config: Any = None,
+    ):
+        from orchestrator.merge_types import QueuedBranch
+
+        queue = merge_queue if merge_queue is not None else asyncio.Queue()
+        cfg = config
+        if cfg is None:
+            cfg = MagicMock()
+            cfg.module_configs_or_empty = {}
+        req = await submit_verified_green_merge_request(
+            task_id=_TID,
+            branch=QueuedBranch.parse(_TID, 'task/'),
+            worktree=tmp_path / 'wt',
+            tip_sha=_TIP,
+            config=cfg,
+            module_configs=[],
+            merge_queue=queue,
+            event_store=event_store,
+            source=source,
+            marker_key=marker_key,
+            done_callback=done_callback or (lambda fut: None),
+            update_task=update_task or AsyncMock(return_value=True),
+        )
+        return req, queue
+
+    async def test_builds_and_enqueues_one_merge_request(
+        self, tmp_path: Path,
+    ) -> None:
+        req, queue = await self._submit(tmp_path)
+
+        assert queue.qsize() == 1
+        queued = queue.get_nowait()
+        assert queued is req
+        assert queued.task_id == _TID
+        assert queued.branch.bare_id == _TID
+        assert queued.snapshot_tip == _TIP
+        assert queued.pre_rebased is False
+        assert queued.task_files is None
+        assert queued.worktree == tmp_path / 'wt'
+
+    async def test_registers_done_callback_on_the_future(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator.merge_types import MergeOutcome
+
+        seen: list[Any] = []
+        req, _queue = await self._submit(
+            tmp_path, done_callback=lambda fut: seen.append(fut),
+        )
+        req.result.set_result(MergeOutcome(status='done', merge_sha='abc'))
+        await asyncio.sleep(0)
+
+        assert len(seen) == 1
+        assert seen[0] is req.result
+
+    async def test_threads_source_to_merge_queued_event(
+        self, tmp_path: Path,
+    ) -> None:
+        """The submission's merge_queued event carries data.source=<source>,
+        so the two callers stay distinguishable in the event stream."""
+        store = EventStore(tmp_path / 'submit-runs.db', 'run-1')
+        await self._submit(tmp_path, source='architect-desync', event_store=store)
+
+        rows = store.fetch_events_by_type_all_runs(
+            EventType.merge_queued, task_id=_TID,
+        )
+        assert len(rows) == 1
+        assert (rows[0].get('data') or {}).get('source') == 'architect-desync'
+
+    async def test_stamps_marker_under_the_given_key(
+        self, tmp_path: Path,
+    ) -> None:
+        update_task = AsyncMock(return_value=True)
+        req, _queue = await self._submit(
+            tmp_path, marker_key='architect_merge_request', update_task=update_task,
+        )
+
+        update_task.assert_awaited_once()
+        call = update_task.await_args
+        assert call.args[0] == _TID
+        payload = call.args[1]
+        # A single key keeps merge-mode writes from clobbering siblings — and
+        # keeps the two submit paths' markers from clobbering each other.
+        assert list(payload.keys()) == ['architect_merge_request']
+        marker = payload['architect_merge_request']
+        assert marker['tip_sha'] == _TIP
+        assert marker['request_id'] == req.request_id
+        datetime.fromisoformat(marker['submitted_at'])
+
+    async def test_stamped_marker_reads_back_as_fresh(
+        self, tmp_path: Path,
+    ) -> None:
+        """The stamp and the freshness predicate agree — a just-stamped marker
+        suppresses an immediate re-submit by the same caller."""
+        update_task = AsyncMock(return_value=True)
+        await self._submit(tmp_path, update_task=update_task)
+        marker = update_task.await_args.args[1]['architect_merge_request']
+
+        assert merge_request_marker_is_fresh(marker, _TIP) is True
+
+    async def test_failing_update_task_is_swallowed(
+        self, tmp_path: Path,
+    ) -> None:
+        """Best-effort marker stamp: a lost marker only risks a benign
+        re-submit, so a write failure must never abort the remediation (the
+        request is already enqueued)."""
+        update_task = AsyncMock(side_effect=RuntimeError('scheduler down'))
+        req, queue = await self._submit(tmp_path, update_task=update_task)
+
+        assert queue.qsize() == 1
+        assert req.request_id.startswith('mr-')
