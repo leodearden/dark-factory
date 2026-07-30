@@ -1630,6 +1630,208 @@ class TestUpdateMemoryContentArm:
         assert event.payload['store'] == 'mem0'
 
 
+class TestUpdateMemoryMetadataArm:
+    """§5(b)'s routing decision table — which primitive each argument shape maps to.
+
+    The three Qdrant primitives are not interchangeable: set_payload and
+    delete_payload are native partial operations (no read-modify-write needed to
+    COMPUTE the new payload), while overwrite_payload replaces the whole point
+    payload and therefore needs the mem0-owned subset re-attached underneath.
+    Every route is exactly ONE backend write.
+    """
+
+    @staticmethod
+    def _assert_no_reembed(service):
+        """The metadata-only arm must never route through mem0's Memory.update."""
+        service.mem0.update.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_patch_alone_is_one_set_payload(self, service):
+        """merge mode, no deletes → Qdrant's native partial merge, nothing else."""
+        result = await service.update_memory(
+            memory_id='point-1', project_id='test',
+            metadata_patch={'topic': 'cgl-eta'},
+        )
+
+        service.mem0.set_payload.assert_awaited_once()
+        call = service.mem0.set_payload.await_args
+        assert call.args[0] == 'point-1'
+        assert call.args[1] == {'topic': 'cgl-eta'}
+        assert isinstance(call.args[2], Scope)
+        # Unlisted pre-existing custom keys survive because Qdrant merges
+        # server-side — the service must NOT hand-roll a full payload here.
+        assert 'kind' not in call.args[1]
+        assert 'src_project' not in call.args[1]
+        service.mem0.delete_payload.assert_not_called()
+        service.mem0.overwrite_payload.assert_not_called()
+        self._assert_no_reembed(service)
+        assert result['status'] == 'updated'
+        assert result['id'] == 'point-1'
+        assert result['content_amended'] is False
+        assert result['metadata_patched'] is True
+
+    @pytest.mark.asyncio
+    async def test_delete_keys_alone_is_one_delete_payload(self, service):
+        """Exactly the named keys are removed, and nothing else is touched."""
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            metadata_delete_keys=['topic'],
+        )
+
+        service.mem0.delete_payload.assert_awaited_once()
+        call = service.mem0.delete_payload.await_args
+        assert call.args[0] == 'point-1'
+        assert call.args[1] == ['topic']
+        service.mem0.set_payload.assert_not_called()
+        service.mem0.overwrite_payload.assert_not_called()
+        self._assert_no_reembed(service)
+
+    @pytest.mark.asyncio
+    async def test_patch_and_delete_together_is_one_overwrite_payload(self, service):
+        """NEVER set_payload-then-delete_payload: two round-trips can tear.
+
+        A failed second call would leave the record half-patched while the
+        journal row claims the whole edit landed — the torn-intermediate-state
+        problem the unified tool exists to avoid, reintroduced inside it.
+        """
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            metadata_patch={'topic': 'cgl-eta'},
+            metadata_delete_keys=['src_project'],
+        )
+
+        service.mem0.overwrite_payload.assert_awaited_once()
+        service.mem0.set_payload.assert_not_called()
+        service.mem0.delete_payload.assert_not_called()
+        self._assert_no_reembed(service)
+
+        payload = service.mem0.overwrite_payload.await_args.args[1]
+        assert payload['topic'] == 'cgl-eta', 'the merge must be applied'
+        assert 'src_project' not in payload, 'the deletion must be applied'
+        assert payload['kind'] == 'canonical', 'untouched custom keys survive'
+        # overwrite_payload replaces the WHOLE point payload, so the mem0-owned
+        # subset must ride along or the point becomes unreadable by mem0's own
+        # get/search.
+        assert payload['data'] == 'original content'
+        assert payload['hash'] == 'abc123hash'
+        assert payload['created_at'] == '2026-01-01T00:00:00+00:00'
+        assert payload['user_id'] == 'testproject'
+
+    @pytest.mark.asyncio
+    async def test_replace_mode_replaces_custom_subset_only(self, service):
+        """replace never means "replace the whole Qdrant payload"."""
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            metadata_patch={'topic': 'cgl-eta'},
+            metadata_mode='replace',
+        )
+
+        service.mem0.overwrite_payload.assert_awaited_once()
+        service.mem0.set_payload.assert_not_called()
+        service.mem0.delete_payload.assert_not_called()
+        self._assert_no_reembed(service)
+
+        payload = service.mem0.overwrite_payload.await_args.args[1]
+        assert payload['topic'] == 'cgl-eta'
+        # The rest of the custom subset is GONE — that is what replace means.
+        assert 'kind' not in payload
+        assert 'src_project' not in payload
+        # ...but the mem0-owned subset survives underneath.
+        assert payload['data'] == 'original content'
+        assert payload['hash'] == 'abc123hash'
+        assert payload['created_at'] == '2026-01-01T00:00:00+00:00'
+        assert payload['updated_at'] == '2026-01-02T00:00:00+00:00'
+        assert payload['user_id'] == 'testproject'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('kwargs', [
+        {'metadata_patch': {'topic': 'x'}},
+        {'metadata_delete_keys': ['topic']},
+        {'metadata_patch': {'topic': 'x'}, 'metadata_delete_keys': ['kind']},
+        {'metadata_patch': {'topic': 'x'}, 'metadata_mode': 'replace'},
+    ], ids=['patch', 'delete', 'patch_delete', 'replace'])
+    async def test_no_reembed_and_updated_at_untouched(self, service, kwargs):
+        """A cosmetic tag must not perturb ranking or rewrite updated_at.
+
+        Routing through mem0's Memory.update would re-embed the content, stamp
+        a fresh updated_at and append a history row — for a metadata edit that
+        changed no text at all.
+        """
+        await service.update_memory(memory_id='point-1', project_id='test', **kwargs)
+
+        self._assert_no_reembed(service)
+        for mock in (service.mem0.overwrite_payload, service.mem0.set_payload):
+            if mock.await_args is not None:
+                payload = mock.await_args.args[1]
+                assert payload.get('updated_at', '2026-01-02T00:00:00+00:00') == (
+                    '2026-01-02T00:00:00+00:00'
+                ), 'updated_at must be byte-identical across a metadata-only edit'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('kwargs', [
+        {'metadata_patch': {'topic': 'x'}},
+        {'metadata_delete_keys': ['topic']},
+        {'metadata_patch': {'topic': 'x'}, 'metadata_delete_keys': ['kind']},
+        {'metadata_patch': {'topic': 'x'}, 'metadata_mode': 'replace'},
+    ], ids=['patch', 'delete', 'patch_delete', 'replace'])
+    async def test_no_event_emitted_by_default(self, service, kwargs):
+        """No memory_updated event on a metadata-only route.
+
+        The record still says the same thing, so there is nothing for a
+        downstream consolidator to re-read. The service-layer emit_event flag
+        exists for a future concrete consumer; no MCP argument surfaces it yet.
+        """
+        buffer = MagicMock()
+        buffer.push = AsyncMock()
+        service._event_buffer = buffer
+
+        await service.update_memory(memory_id='point-1', project_id='test', **kwargs)
+
+        buffer.push.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('kwargs', [
+        {'metadata_patch': {'topic': 'x'}},
+        {'metadata_delete_keys': ['topic']},
+        {'metadata_patch': {'topic': 'x'}, 'metadata_delete_keys': ['kind']},
+        {'metadata_patch': {'topic': 'x'}, 'metadata_mode': 'replace'},
+    ], ids=['patch', 'delete', 'patch_delete', 'replace'])
+    async def test_journal_row_written_on_every_route(self, service, kwargs):
+        """Attribution is never optional at the journal layer.
+
+        The lighter authorization bar for metadata patches is an
+        argument-validation decision; it buys no exemption from the audit trail.
+        """
+        journal = _journal_mock()
+        service._write_journal = journal
+
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            agent_id='recon-stage-1', **kwargs,
+        )
+
+        journal.log_write_op.assert_awaited_once()
+        row = journal.log_write_op.await_args.kwargs
+        assert row['operation'] == 'update_memory'
+        assert row['agent_id'] == 'recon-stage-1'
+        assert row['params']['memory_id'] == 'point-1'
+        assert row['success'] is True
+
+    @pytest.mark.asyncio
+    async def test_emit_event_flag_opts_a_metadata_route_in(self, service):
+        """The internal service-layer flag exists, defaulting off (no MCP surface)."""
+        buffer = MagicMock()
+        buffer.push = AsyncMock()
+        service._event_buffer = buffer
+
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            metadata_patch={'topic': 'x'}, emit_event=True,
+        )
+
+        buffer.push.assert_awaited_once()
+
+
 class TestUpdateEdgeVerification:
     """Tests for the post-write persistence verification in update_edge (Guard 2)."""
 
