@@ -634,9 +634,17 @@ def default_protected_prefixes(iact_prefix: str | None = None) -> dict[str, str]
 
     Returns a fresh dict; mutating it cannot affect the module registry.
     """
-    if iact_prefix is None:
-        iact_prefix = GitConfig.model_fields['iact_prefix'].default
-    return {**PROTECTED_PREFIXES, iact_prefix: 'interactive'}
+    # Declared str, not a rebind of the str|None parameter: FieldInfo.default is
+    # typed Any, so assigning it back into `iact_prefix` widens the rendered key
+    # type to `str | None` and the return type stops matching dict[str, str].
+    # GitConfig.iact_prefix is a required-typed `str` field, so its field default
+    # is always a str.
+    band: str = (
+        iact_prefix
+        if iact_prefix is not None
+        else GitConfig.model_fields['iact_prefix'].default
+    )
+    return {**PROTECTED_PREFIXES, band: 'interactive'}
 
 
 def render_protect_glob(

@@ -829,7 +829,7 @@ class TestRenderProtectGlob:
         bands = rendered.split(',')
         assert '_lane-*' not in bands, rendered
         assert '_spec-*' not in bands, rendered
-        assert PROTECT_GLOB_OWNED_POOL_BANDS == frozenset({'_lane-', '_spec-'}), (
+        assert set(PROTECT_GLOB_OWNED_POOL_BANDS) == {'_lane-', '_spec-'}, (
             f'the owned-pool band set changed: {PROTECT_GLOB_OWNED_POOL_BANDS!r}'
         )
 
