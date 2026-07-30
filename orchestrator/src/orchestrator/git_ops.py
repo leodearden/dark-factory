@@ -614,24 +614,29 @@ PROTECTED_PREFIXES: dict[str, str] = {
 PROTECT_GLOB_OWNED_POOL_BANDS: frozenset[str] = frozenset({'_lane-', '_spec-'})
 
 
-def default_protected_prefixes() -> dict[str, str]:
-    """The static band registry merged with the DEFAULT interactive band.
+def default_protected_prefixes(iact_prefix: str | None = None) -> dict[str, str]:
+    """The static band registry merged with ONE interactive band.
 
     :data:`PROTECTED_PREFIXES` alone is not the authoritative band map: the
     ``_iact-*`` band is config-shaped (:attr:`GitConfig.iact_prefix`), so it
-    lives outside the constant.  This is the process-wide default view, for
-    callers with no :class:`GitOps` instance to ask —
-    :meth:`GitOps.protected_prefixes` is the per-instance one and is built on
-    top of this, so the merge exists in exactly one place.
+    lives outside the constant.  Called with no argument this is the
+    process-wide DEFAULT view, for callers with no :class:`GitOps` instance to
+    ask; :meth:`GitOps.protected_prefixes` passes its own instance's prefix, so
+    the registry + iact-band merge exists in exactly one place.
+
+    Args:
+        iact_prefix: The interactive band token to merge in.  ``None`` means
+            :attr:`GitConfig.iact_prefix`'s field default.  Note this REPLACES
+            the band rather than adding to it: a deployment that renamed its
+            interactive band must not also get the default ``_iact-`` treated
+            as protected, or :meth:`GitOps._refuse_foreign_band` would guard a
+            band that deployment never mints.
 
     Returns a fresh dict; mutating it cannot affect the module registry.
     """
-    from orchestrator.config import GitConfig
-
-    return {
-        **PROTECTED_PREFIXES,
-        GitConfig.model_fields['iact_prefix'].default: 'interactive',
-    }
+    if iact_prefix is None:
+        iact_prefix = GitConfig.model_fields['iact_prefix'].default
+    return {**PROTECTED_PREFIXES, iact_prefix: 'interactive'}
 
 
 def render_protect_glob(
@@ -1862,14 +1867,12 @@ class GitOps:
         for callers to consult, including :meth:`_refuse_foreign_band`.
 
         Built on :func:`default_protected_prefixes` so the registry +
-        iact-band merge exists in exactly one place; this instance's
-        ``iact_prefix`` is applied last and therefore still wins over the
-        default band.
+        iact-band merge exists in exactly one place.  This instance's
+        ``iact_prefix`` is passed in rather than layered on top, so an
+        override REPLACES the default band instead of widening the map with
+        an ``_iact-`` this deployment never mints.
         """
-        return {
-            **default_protected_prefixes(),
-            self.config.iact_prefix: 'interactive',
-        }
+        return default_protected_prefixes(self.config.iact_prefix)
 
     def _refuse_foreign_band(
         self, path: Path, owned: frozenset[str], context: str,
