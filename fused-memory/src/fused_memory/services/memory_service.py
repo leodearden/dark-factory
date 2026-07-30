@@ -18,7 +18,11 @@ from typing import TYPE_CHECKING, Any, cast
 from graphiti_core.nodes import EpisodeType
 
 from fused_memory.backends.graphiti_client import GraphitiBackend
-from fused_memory.backends.mem0_client import Mem0Backend, split_managed_metadata
+from fused_memory.backends.mem0_client import (
+    _FUSED_MEMORY_OWNED_METADATA_KEYS,
+    Mem0Backend,
+    split_managed_metadata,
+)
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.middleware.mem0_update_storm_escalator import Mem0UpdateStormEscalator
 from fused_memory.models.enums import (
@@ -3644,12 +3648,26 @@ class MemoryService:
         :func:`split_managed_metadata`; mem0-owned keys never reach here, which
         is why nothing below has to defend against clobbering them.
 
-        ``metadata_mode='replace'`` replaces the whole custom subset with
-        exactly what *metadata_patch* supplies — never the whole Qdrant payload.
-        Deletions apply after the merge. Returns a fresh dict; the input is not
-        mutated.
+        ``metadata_mode='replace'`` replaces the custom subset with exactly what
+        *metadata_patch* supplies, PLUS any ``_FUSED_MEMORY_OWNED_METADATA_KEYS``
+        carried over from *existing_custom* — never the whole Qdrant payload.
+        The carry-through is what stops a routine re-tag from silently evicting
+        the record from every category-scoped search (``category`` is a Qdrant
+        payload filter, so losing it has no symptom at all); a *metadata_patch*
+        that names the key explicitly still wins, so deliberate
+        re-categorization needs no special case. Deletions apply after the
+        merge. Returns a fresh dict; the input is not mutated.
         """
-        new_custom = {} if metadata_mode == 'replace' else dict(existing_custom)
+        if metadata_mode == 'replace':
+            # Seed with the protected subset rather than {}: replace still means
+            # replace for ordinary custom keys, but a key nothing restores must
+            # not be destroyable by omission.
+            new_custom = {
+                k: v for k, v in existing_custom.items()
+                if k in _FUSED_MEMORY_OWNED_METADATA_KEYS
+            }
+        else:
+            new_custom = dict(existing_custom)
         new_custom.update(metadata_patch or {})
         for key in metadata_delete_keys or ():
             new_custom.pop(key, None)

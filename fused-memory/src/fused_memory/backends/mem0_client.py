@@ -39,6 +39,29 @@ _MEM0_MANAGED_METADATA_KEYS = frozenset({
 })
 
 
+# Payload keys FUSED-MEMORY owns, which a caller-supplied metadata delta must
+# not be able to destroy by omission. Distinct from the mem0-owned set above:
+# mem0 recomputes-or-restores its own keys, so losing one of those is
+# self-healing, whereas nothing restores these.
+#
+# 'category': Mem0Backend.search pushes it down to Qdrant as a payload filter
+# (`filters = {'category': categories[0]}`), and every record carries it —
+# MemoryService.add_memory and add_system_record both stamp
+# meta['category'] = resolved_category.value before the write. A record that
+# loses the key is therefore permanently invisible to every category-scoped
+# search, with no error and no other symptom: the point still exists, still
+# has its content, and still answers a direct get. That silence is what makes
+# the key worth protecting rather than merely documenting.
+#
+# Protected is not frozen: an explicit metadata_patch={'category': ...} still
+# overrides the carried-through value, so deliberate re-categorization works.
+# Registering a new key here makes update_memory's replace mode carry it
+# through; it lives beside the mem0-owned set so a reader asking "which
+# payload keys are protected from a caller-supplied delta?" finds both answers
+# in one place (INV-5).
+_FUSED_MEMORY_OWNED_METADATA_KEYS = frozenset({'category'})
+
+
 def split_managed_metadata(
     payload: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
