@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import logging
 
 import yaml
 
@@ -1266,6 +1267,134 @@ class TestPerItemByteCap:
         assert '## User Corrections' in digest
         assert '## Error Neighborhoods' in digest
         assert digest.index('## User Corrections') < digest.index('## Error Neighborhoods')
+
+
+# ---------------------------------------------------------------------------
+# _warn_if_body_evicted / render_digest emit-time guard -- R2 part 2
+# (confusion census 2026-07-24 Sec 4): belt-and-braces backstop for the
+# invariant step-4's per-item cap makes structurally unreachable at any
+# realistic max_bytes -- "nonzero signal_counts implies a non-empty body"
+# is checked at emit time, and a violation is logged LOUDLY (never silent,
+# never raised: census.py/nightly.py must keep receiving a plain string).
+# ---------------------------------------------------------------------------
+
+class TestEmitConsistencyGuard:
+    def test_warns_once_when_nonzero_counts_and_every_section_empty(self, caplog):
+        caplog.set_level(logging.WARNING, logger='legibility.digest')
+        meta = {
+            'session': 'sess-guard-1',
+            'signal_counts': {
+                'tool_error': 1, 'self_correct': 0, 'not_found': 0,
+                'df_guard': 0, 'interrupt': 0,
+            },
+        }
+        sections = {key: [] for key in mod.SECTION_PRIORITY}
+
+        mod._warn_if_body_evicted(meta, sections, max_bytes=15360)
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert 'sess-guard-1' in warnings[0]
+
+    def test_no_warning_when_all_signal_counts_zero(self, caplog):
+        caplog.set_level(logging.WARNING, logger='legibility.digest')
+        meta = {
+            'session': 'sess-guard-2',
+            'signal_counts': {
+                'tool_error': 0, 'self_correct': 0, 'not_found': 0,
+                'df_guard': 0, 'interrupt': 0,
+            },
+        }
+        sections = {key: [] for key in mod.SECTION_PRIORITY}
+
+        mod._warn_if_body_evicted(meta, sections, max_bytes=15360)
+
+        assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+    def test_no_warning_when_a_section_still_has_lines(self, caplog):
+        caplog.set_level(logging.WARNING, logger='legibility.digest')
+        meta = {
+            'session': 'sess-guard-3',
+            'signal_counts': {
+                'tool_error': 1, 'self_correct': 0, 'not_found': 0,
+                'df_guard': 0, 'interrupt': 0,
+            },
+        }
+        sections = {key: [] for key in mod.SECTION_PRIORITY}
+        sections['not_found'] = ['- (turn 0) command not found']
+
+        mod._warn_if_body_evicted(meta, sections, max_bytes=15360)
+
+        assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+    def test_render_digest_warns_and_still_returns_degenerate_digest_at_tiny_cap(self, caplog):
+        # max_bytes=1 makes the trim loop pop every item regardless of
+        # frontmatter length -- a deterministic violation path (not a
+        # guessed numeric tolerance): the body ends up empty while
+        # signal_counts stays nonzero.
+        caplog.set_level(logging.WARNING, logger='legibility.digest')
+        records = _all_signals_records()
+
+        digest = mod.render_digest(records, agent_class='interactive', max_bytes=1)
+
+        # Never silent, never raises: the degenerate digest is still
+        # returned (fail-soft for census.py/nightly.py callers).
+        _, body = _split_frontmatter(digest)
+        assert body.strip() == ''
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert _DIGEST_SESSION_ID in warnings[0]
+
+    def test_invariant_holds_at_real_cap_for_oversized_fixture(self, caplog):
+        # Already green off steps 2/4 -- serves as part of the end-to-end
+        # regression lock for the whole task.
+        caplog.set_level(logging.WARNING, logger='legibility.digest')
+
+        digest = mod.render_digest(_oversized_user_correction_records(), agent_class='interactive')
+
+        frontmatter_yaml, body = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        assert any(meta['signal_counts'].values())
+        assert body.strip() != ''
+        assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+    def test_build_digest_end_to_end_on_gz_orchestrated_session(self, tmp_path):
+        # Already green off steps 2/4 -- the end-to-end acceptance check:
+        # a real orchestrated-looking gz transcript (briefing turn +
+        # genuine human correction + tool_error + not_found) yields a
+        # non-empty, briefing-free digest with an intact frontmatter
+        # contract.
+        records = [
+            _with_session_meta(_user_text(_briefing_text('x' * 21000))),
+            _with_session_meta(_user_text('This is wrong, please redo it.')),
+            _with_session_meta(_assistant(_tool_use('Bash', {'command': 'false'}, id='tu-err'))),
+            _with_session_meta(_tool_result('tu-err', 'Exit code 1', is_error=True)),
+            _with_session_meta(_tool_result('tu-nf', 'bash: foo: command not found', is_error=False)),
+        ]
+        path = _write_jsonl_gz(tmp_path, records)
+
+        digest = mod.build_digest(path)
+
+        _, body = _split_frontmatter(digest)
+        assert body.strip() != ''
+        assert '## User Corrections' in digest
+        assert 'This is wrong, please redo it.' in digest
+        assert '## Error Neighborhoods' in digest
+        assert '## Not Found' in digest
+        assert '# Context' not in digest
+        assert '## Agent Identity' not in digest
+
+        frontmatter_yaml, _ = _split_frontmatter(digest)
+        parsed = yaml.safe_load(frontmatter_yaml)
+        assert set(parsed) == set(mod.FRONTMATTER_KEYS) | {'signal_counts'}
+        assert set(parsed['signal_counts']) == set(mod.SIGNAL_COUNT_KEYS)
+
+        lines = frontmatter_yaml.splitlines()
+        top_level_keys = [line.split(':', 1)[0] for line in lines if not line.startswith(' ')]
+        assert top_level_keys == list(mod.FRONTMATTER_KEYS) + ['signal_counts']
+        nested_keys = [line.strip().split(':', 1)[0] for line in lines if line.startswith(' ')]
+        assert nested_keys == list(mod.SIGNAL_COUNT_KEYS)
 
 
 # ---------------------------------------------------------------------------
