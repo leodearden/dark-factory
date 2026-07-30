@@ -1826,3 +1826,205 @@ class TestSweepFailureReproducesInIsolation:
         assert f'alpha/{PREFILTER_ALPHA_NODE_ID}' in cmd, cmd
         assert called_mc.lint_command is None, called_mc.lint_command
         assert called_mc.type_check_command is None, called_mc.type_check_command
+
+
+# ---------------------------------------------------------------------------
+# task-3095 step-7: run_main_tip_sweep <-> pre-filter wiring
+#
+# The pre-filter gates the expensive full-suite retry. It NEVER becomes the
+# sweep's verdict: on the reproduces path the sweep returns the FIRST-PASS
+# FAILING result, so the harness's "full-verify PASS required to self-heal"
+# precondition (harness.py's _close_superseded_main_sweep_escalations) can
+# never be satisfied by subset-only evidence.
+# ---------------------------------------------------------------------------
+
+
+class TestRunMainTipSweepIsolatedPrefilter:
+    """task-3095 step-7: the pre-filter's effect on run_main_tip_sweep.
+
+    RED today: the pre-filter is not wired in, so (a) and (d) see 2 calls /
+    a non-zero pre-filter call count.
+    """
+
+    @staticmethod
+    def _fake_git_run():
+        async def _fake_run(cmd, **kwargs):
+            return (0, '', '')
+
+        return _fake_run
+
+    def test_reproduces_skips_full_retry_and_returns_first_pass(
+        self, tmp_path: Path
+    ) -> None:
+        """(a) Pre-filter True -> the full retry is SKIPPED and the sweep
+        returns the FIRST-PASS failing object itself (identity), with no
+        suppression record. The harness then adjudicates via its unchanged
+        fresh-worktree confirm gate."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        rfv = AsyncMock(side_effect=[FAILING_RESULT, PASSING_RESULT])
+        prefilter = AsyncMock(return_value=True)
+        pre_run_registry_len = len(verify_module._suppressed_flake_records)
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=self._fake_git_run()),
+            patch.object(verify_module, 'run_full_verification', rfv),
+            patch.object(
+                verify_module, '_sweep_failure_reproduces_in_isolation', prefilter
+            ),
+        ):
+            result = asyncio.run(verify_module.run_main_tip_sweep(config, git_ops))
+
+        assert rfv.call_count == 1, (
+            f'Expected the full-suite retry to be SKIPPED (1 call), got {rfv.call_count}'
+        )
+        assert result is not None, 'Expected (sha, VerifyResult), got None'
+        swept_sha, vr = result
+        assert swept_sha == MAIN_SHA
+        assert vr is FAILING_RESULT, (
+            f'Expected the FIRST-PASS result object itself, got {vr!r}'
+        )
+        # Self-heal invariant guard: the sweep must never hand back a passing
+        # result derived from subset-only evidence.
+        assert vr.passed is False, f'Expected passed=False, got {vr.passed!r}'
+        new_records = verify_module._suppressed_flake_records[pre_run_registry_len:]
+        assert new_records == [], (
+            f'Expected NO suppression record on the reproduces path, got {new_records!r}'
+        )
+
+    def test_does_not_reproduce_runs_full_retry_unchanged(
+        self, tmp_path: Path
+    ) -> None:
+        """(b) Pre-filter False -> the legacy flake-suppression path is
+        byte-identical: full retry runs, a retry PASS is returned, and exactly
+        one audit record carries the FIRST-PASS sha/category/cause_hint."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        rfv = AsyncMock(side_effect=[FAILING_RESULT, PASSING_RESULT])
+        prefilter = AsyncMock(return_value=False)
+        pre_run_registry_len = len(verify_module._suppressed_flake_records)
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=self._fake_git_run()),
+            patch.object(verify_module, 'run_full_verification', rfv),
+            patch.object(
+                verify_module, '_sweep_failure_reproduces_in_isolation', prefilter
+            ),
+        ):
+            result = asyncio.run(verify_module.run_main_tip_sweep(config, git_ops))
+
+        assert rfv.call_count == 2, (
+            f'Expected the full retry to still run (2 calls), got {rfv.call_count}'
+        )
+        assert result is not None
+        _swept_sha, vr = result
+        assert vr is PASSING_RESULT, f'Expected the retry result, got {vr!r}'
+        new_records = verify_module._suppressed_flake_records[pre_run_registry_len:]
+        assert len(new_records) == 1, f'Expected 1 record, got {new_records!r}'
+        rec = new_records[0]
+        assert rec['sha'] == MAIN_SHA, rec
+        assert rec['first_pass_category'] == FAILING_RESULT.category, rec
+        assert rec['first_pass_cause_hint'] == FAILING_RESULT.cause_hint, rec
+
+    def test_unconfirmable_falls_through_to_legacy_full_retry(
+        self, tmp_path: Path
+    ) -> None:
+        """(c) Pre-filter None (UNCONFIRMABLE) -> byte-identical pre-3095
+        behavior: the full retry runs."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        rfv = AsyncMock(side_effect=[FAILING_RESULT, FAILING_RESULT])
+        prefilter = AsyncMock(return_value=None)
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=self._fake_git_run()),
+            patch.object(verify_module, 'run_full_verification', rfv),
+            patch.object(
+                verify_module, '_sweep_failure_reproduces_in_isolation', prefilter
+            ),
+        ):
+            result = asyncio.run(verify_module.run_main_tip_sweep(config, git_ops))
+
+        assert rfv.call_count == 2, (
+            f'Expected legacy fall-through (2 calls), got {rfv.call_count}'
+        )
+        assert result is not None
+        assert result[1].passed is False
+
+    def test_kill_switch_off_never_invokes_prefilter(self, tmp_path: Path) -> None:
+        """(d) main_tip_sweep_isolated_prefilter_enabled=False -> the
+        pre-filter is never invoked at all and the full retry runs, i.e. the
+        operator revert path is byte-identical pre-3095 behavior."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        config = config.model_copy(
+            update={'main_tip_sweep_isolated_prefilter_enabled': False}
+        )
+        git_ops = _make_git_ops(tmp_path)
+
+        rfv = AsyncMock(side_effect=[FAILING_RESULT, PASSING_RESULT])
+        prefilter = AsyncMock(return_value=True)
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=self._fake_git_run()),
+            patch.object(verify_module, 'run_full_verification', rfv),
+            patch.object(
+                verify_module, '_sweep_failure_reproduces_in_isolation', prefilter
+            ),
+        ):
+            result = asyncio.run(verify_module.run_main_tip_sweep(config, git_ops))
+
+        assert prefilter.call_count == 0, (
+            f'Expected the pre-filter to be gated off entirely, got '
+            f'{prefilter.call_count} call(s)'
+        )
+        assert rfv.call_count == 2, (
+            f'Expected the legacy full retry (2 calls), got {rfv.call_count}'
+        )
+        assert result is not None
+        assert result[1] is PASSING_RESULT
+
+    def test_prefilter_receives_sweep_worktree_and_first_pass_result(
+        self, tmp_path: Path
+    ) -> None:
+        """(e) The pre-filter is handed the sweep's OWN pinned worktree (no
+        second worktree add) and the FIRST-PASS result — not the retry's."""
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        rfv = AsyncMock(side_effect=[FAILING_RESULT, PASSING_RESULT])
+        prefilter = AsyncMock(return_value=False)
+
+        with (
+            patch('orchestrator.git_ops._run', side_effect=self._fake_git_run()),
+            patch.object(verify_module, 'run_full_verification', rfv),
+            patch.object(
+                verify_module, '_sweep_failure_reproduces_in_isolation', prefilter
+            ),
+        ):
+            asyncio.run(verify_module.run_main_tip_sweep(config, git_ops))
+
+        prefilter.assert_awaited_once()
+        pf_worktree, pf_config, pf_result = prefilter.call_args.args
+        # Same worktree the full verification ran in — the sweep's own pin.
+        sweep_worktree = rfv.call_args_list[0].args[0]
+        assert pf_worktree == sweep_worktree, (
+            f'Expected the sweep worktree {sweep_worktree!r}, got {pf_worktree!r}'
+        )
+        assert str(pf_worktree).startswith(str(git_ops.worktree_base)), pf_worktree
+        assert pf_config is config
+        assert pf_result is FAILING_RESULT, (
+            f'Expected the FIRST-PASS result, got {pf_result!r}'
+        )
