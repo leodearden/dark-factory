@@ -3183,7 +3183,7 @@ class TaskWorkflow:
             )
         # Wait for steward to finish any pending work (suggestion triage, etc.)
         await self._ensure_steward_started()
-        await self._await_steward_completion()
+        await self._await_steward_completion(skip_if_idle=True)
         self._enter_phase(WorkflowState.DONE)
         return await self._finalise_merged_done()
 
@@ -10675,6 +10675,85 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         an empty string immediately — the caller treats this as "no
         resolution" and the workflow proceeds to ESCALATED/BLOCKED
         via its normal path.
+
+        **Bounded (task 3170, fix C + review fixes D1/D2/D3).** The level-0
+        wait is bounded by an IDLE window
+
+            timeouts.steward + steward_completion_timeout
+
+        refreshed for as long as the steward is observably working (its
+        progress counter advancing — see :meth:`_steward_progress_counter`), so
+        it trips ONLY on a genuinely SILENT producer.  Both terms are what they
+        are for a reason, and the refresh is what makes the "future producer
+        bug" framing below true rather than aspirational:
+
+        - ``timeouts.steward`` is the ENFORCED per-SUBPROCESS ceiling — the
+          longest a healthy steward can be silent WITHIN one agent subprocess,
+          since past it ``invoke_agent`` itself SIGTERM/SIGKILLs the process
+          group (cli_invoke.py:2184-2206).  Any window shorter than it is
+          guaranteed to fire on healthy stewards.  It is emphatically NOT a
+          bound on one ``_invoke_with_session`` call: that delegates to
+          ``invoke_with_cap_retry``, which may run up to 16 subprocesses with
+          cap cooldowns between them behind a single return, so the progress
+          signal MUST tick per subprocess attempt rather than per completed
+          invocation — which is exactly what ``metrics.subprocess_attempts``
+          does (review fix D4).  Without that tick, an all-accounts-capped
+          steward reads as silent for hours and this backstop kills a working
+          producer.
+        - ``steward_completion_timeout`` is kept in its DOCUMENTED role
+          (config.py:211-222 — the post-invocation drain grace) as the slack
+          for the steward to publish/dismiss after its invocation returns or
+          is killed, rather than misused as the whole bound.
+        - The refresh covers the retry tail: a healthy steward can occupy
+          several full invocation ceilings on ONE escalation, because the
+          timeout-kill path re-handles the still-pending record
+          (steward.py:399-412).  Refreshing bounds each legitimate retry by
+          its own window without hard-coding the ``steward_max_attempts +
+          steward_max_timeouts_per_escalation`` multiplier, so the bound
+          self-maintains if either knob changes.
+
+        No new config knob and no new validator were added: the existing
+        ``timeouts.steward >= steward_completion_timeout`` invariant
+        (config.py:4071-4081) already forces this window above ``2x
+        steward_completion_timeout`` for every config that constructs at all,
+        and an operator who raises ``timeouts.steward`` widens the wait bound
+        in lockstep for free.
+
+        The wait relies on the same PRODUCER invariant its sibling waiter
+        :meth:`_await_steward_completion` does:
+
+            A steward give-up ALWAYS dismisses its own L0 before publishing
+            an outcome.  No pending L0 survives a steward give-up.
+
+        This path is woken ONLY by that dismissal (``EscalationQueue.resolve``
+        → ``_resolve_callback`` → ``harness._on_escalation_resolved`` →
+        ``_escalation_events[task_id].set()``); it never reads the steward
+        outcome channel.  The idle window therefore exists to make the wait
+        non-strandable if any FUTURE producer bug breaks that invariant — as
+        task 2248's wip-gated give-up branches did, parking the workflow
+        forever while the steward re-handled the capped escalation at loop
+        speed.
+
+        On expiry it FIRST stops the steward and clears the reference, and
+        only then logs loudly, emits an ``escalation_resolved`` event with
+        ``outcome='steward_wait_timeout'``, DISMISSES the orphan L0(s) — so
+        the next ESCALATED entry cannot re-strand on the same records — and
+        falls through to the unchanged tail below.  Stopping first is a safety
+        requirement, not tidiness: the steward runs its agent in the SAME
+        worktree (``cwd = self.worktree``, steward.py:542, 590) that the
+        resumed implementer edits and commits in, so dismissing or resuming
+        beside a live steward agent means two agents committing in one git
+        worktree.  The tail then yields exactly two dispositions:
+        ``_StewardReescalated`` (blocking, with the already-open L1) when one
+        is open, or the collected resolutions (resuming) when none is.  It
+        deliberately does NOT call :meth:`_mark_blocked`, which would file a
+        fresh L0 and could add a SECOND full grace window for what is a pure
+        wait-timeout.
+
+        On BOTH exits it then calls :meth:`_drain_steward_outcomes`: whatever
+        the steward published while this waiter held the wait is never consumed
+        here, and would otherwise be replayed to a later ``_mark_blocked`` in
+        this same workflow as if freshly published.
         """
         if self.escalation_queue is None:
             logger.warning(
@@ -10700,7 +10779,51 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         if pending_high_sev:
             raise _StewardReescalated(pending_high_sev)
 
-        # Wait for level-0 pending escalations to clear
+        # Wait for level-0 pending escalations to clear, BOUNDED by a derived
+        # window (task 3170, fix C + review fix D1).  See the method docstring
+        # for the disposition.  Both terms are load-bearing, neither is
+        # arbitrary:
+        #
+        #   timeouts.steward             the ENFORCED per-SUBPROCESS ceiling —
+        #                                the longest a HEALTHY steward can be
+        #                                silent within ONE agent subprocess,
+        #                                since past it invoke_agent itself
+        #                                SIGTERM/SIGKILLs the process group
+        #                                (cli_invoke.py:2184-2206).  Any window
+        #                                shorter than this is guaranteed to fire
+        #                                on healthy stewards.  Cap-retry
+        #                                cooldowns stack MORE subprocesses
+        #                                behind one _invoke_with_session call;
+        #                                the per-attempt progress tick (review
+        #                                fix D4) is what keeps them visible.
+        #   steward_completion_timeout   kept in its DOCUMENTED role
+        #                                (config.py:211-222, the post-invocation
+        #                                drain grace) as the slack for the
+        #                                steward to publish/dismiss after its
+        #                                invocation returns or is killed.
+        #
+        # Deliberately NO new config knob and NO new validator: the existing
+        # `timeouts.steward >= steward_completion_timeout` invariant
+        # (config.py:4071-4081) already forces this window to >= 2x
+        # steward_completion_timeout for every config that constructs at all,
+        # and an operator who raises timeouts.steward widens the wait bound in
+        # lockstep for free.
+        #
+        # The window is an IDLE deadline, not an overall one (review fix D2):
+        # it is refreshed whenever the steward is observably still working, so
+        # only a GENUINELY SILENT producer trips the give-up path.  A healthy
+        # steward can legitimately occupy several full invocation ceilings on
+        # ONE escalation — the timeout-kill path re-handles the still-pending
+        # record (steward.py:399-412) — and refreshing on the counter bounds
+        # each legitimate retry by its own window without hard-coding the
+        # steward_max_attempts + steward_max_timeouts_per_escalation multiplier.
+        # The same argument covers the cap-retry tail (review fix D4): the
+        # counter ticks per SUBPROCESS attempt, so an all-accounts-capped
+        # steward waiting out cooldowns keeps refreshing instead of being
+        # mistaken for a dead producer and killed mid-work.
+        window = self.config.timeouts.steward + self.config.steward_completion_timeout
+        deadline = asyncio.get_event_loop().time() + window
+        last_progress = self._steward_progress_counter()
         while True:
             pending_l0 = self.escalation_queue.get_by_task(
                 self.task_id, status='pending', level=0,
@@ -10708,7 +10831,100 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             if not pending_l0:
                 break
             self._escalation_event.clear()
-            await self._escalation_event.wait()
+            remaining = deadline - asyncio.get_event_loop().time()
+            try:
+                if remaining <= 0:
+                    raise TimeoutError  # noqa: TRY301 — uniform expiry handling
+                await asyncio.wait_for(self._escalation_event.wait(), remaining)
+            except TimeoutError:  # asyncio.TimeoutError is an alias since 3.11
+                # Before giving up: is the steward observably still working?
+                # A counter that ADVANCED means one more invocation legitimately
+                # completed inside this window, so extend rather than fire.  A
+                # None counter (no steward, or a fake without metrics) means no
+                # signal is available and degrades to a plain fixed deadline; a
+                # counter that went backwards or non-monotonic is treated as no
+                # progress, never as an extension.
+                progress = self._steward_progress_counter()
+                if (
+                    progress is not None
+                    and last_progress is not None
+                    and progress > last_progress
+                ):
+                    logger.info(
+                        'Task %s: steward still working (invocations %d → %d) '
+                        '— extending the ESCALATED wait by another %.0fs idle '
+                        'window rather than giving up',
+                        self.task_id, last_progress, progress, window,
+                    )
+                    last_progress = progress
+                    deadline = asyncio.get_event_loop().time() + window
+                    continue
+                # Give-up decided.  STOP THE STEWARD FIRST — before the event
+                # emit, before the orphan dismissal, before the break (review
+                # fix D3).  Ordering is load-bearing, not stylistic:
+                # TaskSteward invokes its agent with cwd = self.worktree
+                # (steward.py:542, 590), the SAME worktree the resumed
+                # implementer edits and commits in, so stopping first closes
+                # the two-agents-one-worktree window entirely rather than
+                # narrowing it.  stop() cancels the loop task (steward.py:
+                # 209-217) and on the stock `steward: "claude"` backend the
+                # resulting CancelledError propagates into
+                # cli_invoke.py:_run_subprocess, whose handler (:2240-2252)
+                # terminates the agent's whole process group — so the in-flight
+                # agent genuinely stops writing rather than merely being
+                # detached from.  Clearing the reference (the existing
+                # stop-then-clear idiom, cf. :5319-5320 / :5363-5364) makes a
+                # later _mark_blocked build a FRESH steward through
+                # _ensure_steward_started instead of awaiting a cancelled loop
+                # that can never publish.  Suppressed because this is cleanup on
+                # an already-degraded path: a failing stop() must not convert a
+                # wait-timeout into a workflow crash.
+                if self._steward is not None:
+                    with contextlib.suppress(Exception):
+                        await self._steward.stop()
+                    self._steward = None
+                orphan_ids = [e.id for e in pending_l0]
+                logger.warning(
+                    'Task %s: steward did not resolve %d level-0 escalation(s) '
+                    'within the ESCALATED wait window (%.0fs = timeouts.steward '
+                    '%.0fs + steward_completion_timeout %.0fs) — dismissing the '
+                    'orphan(s) and unblocking the ESCALATED wait: %s',
+                    self.task_id, len(orphan_ids), window,
+                    self.config.timeouts.steward,
+                    self.config.steward_completion_timeout,
+                    ', '.join(orphan_ids),
+                )
+                if self.event_store:
+                    self.event_store.emit(
+                        EventType.escalation_resolved,
+                        task_id=self.task_id, phase=self.state.value,
+                        data={
+                            'outcome': 'steward_wait_timeout',
+                            'escalation_ids': orphan_ids,
+                        },
+                    )
+                # Uphold the same "no pending L0 survives a give-up"
+                # invariant fix A establishes on the producer side.  Leaving
+                # them pending would re-strand the NEXT ESCALATED entry on
+                # the same records for another full window.
+                for esc in pending_l0:
+                    self.escalation_queue.resolve(
+                        esc.id,
+                        'Auto-dismissed: steward did not resolve within the '
+                        'ESCALATED wait window (timeouts.steward + '
+                        'steward_completion_timeout) — unblocking the '
+                        'ESCALATED wait',
+                        dismiss=True,
+                        resolved_by='auto-dismissed',
+                    )
+                break
+
+        # Whatever the steward published while THIS waiter held the wait is
+        # never consumed by it (see _drain_steward_outcomes) — drain it here,
+        # covering both the normal-clear and the timeout exit above, so a
+        # later _mark_blocked in this same workflow cannot pop a stale
+        # outcome out of _await_steward_completion.
+        self._drain_steward_outcomes()
 
         # Check for level-1 re-escalation (steward gave up)
         if self.escalation_queue.has_open_l1(self.task_id):
@@ -12938,7 +13154,22 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         return await self.git_ops.worktree_has_unsaved_work(self.worktree, self.task_id)
 
     async def _ensure_steward_started(self) -> None:
-        """Start the steward lazily on first call, if factory was provided."""
+        """Start the steward lazily on first call, if factory was provided.
+
+        The channel wired below is read by ONE of this workflow's two steward
+        waiters.  :meth:`_await_steward_completion` (reached via
+        ``_mark_blocked``) consumes it; :meth:`_wait_for_resolution` (reached
+        via ``run()``'s ESCALATED branch) does not — it is escalation-queue-only
+        and is woken solely by the steward dismissing its L0.  Both therefore
+        depend on the SAME producer invariant (task 3170):
+
+            A steward give-up ALWAYS dismisses its own L0 before publishing an
+            outcome.  No pending L0 survives a steward give-up.
+
+        A new steward early return that publishes without dismissing is
+        invisible to the ESCALATED waiter and parks the workflow forever — see
+        ``TaskSteward._handle_escalation``, which owns that obligation.
+        """
         if self._steward is not None:
             return
         if not self._steward_factory or not self.worktree:
@@ -13098,14 +13329,191 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             return True
         return isinstance(outcome, StewardInterrupted) and outcome.wip_commits_present
 
-    async def _await_steward_completion(self) -> StewardOutcome:
+    def _steward_work_outstanding(self) -> bool:
+        """Whether there is anything for :meth:`_await_steward_completion` to
+        wait ON — its ``skip_if_idle`` gate, used by the post-merge success
+        tail (task 3170).
+
+        Two things count as outstanding: a pending level-0 escalation (the
+        steward does not un-pend a record while it works on one, so "pending"
+        covers both queued and in-flight), or an unread outcome already sitting
+        on the channel (instantly consumable).
+
+        With neither, the success tail would otherwise block for the FULL
+        ``steward_completion_timeout`` — 900s on stock config — waiting for a
+        publish that is never coming, at the finish line of every task that had
+        an escalation.  That was previously masked: the outcome the steward
+        published during the ESCALATED cycle stayed on the channel and made the
+        call return instantly.  :meth:`_wait_for_resolution` now drains it (it
+        must — replaying it into a later ``_mark_blocked`` is a spurious
+        requeue), so the "nothing to wait for" case has to be stated
+        explicitly rather than ridden on a leftover.
+
+        The narrow window where the steward's AGENT has already resolved the
+        L0 via MCP but the invocation has not yet returned to publish is NOT
+        covered — and was not covered before either, since the stale outcome
+        short-circuited this same call.  The success tail's contract is
+        "give queued steward work a chance to finish", not "join the steward".
+        """
+        if self.escalation_queue is not None and self.escalation_queue.get_by_task(
+            self.task_id, status='pending', level=0,
+        ):
+            return True
+        channel = self._steward_outcome_channel
+        return channel is not None and not channel.empty()
+
+    def _steward_progress_counter(self) -> int | None:
+        """Monotonic "the steward is still working" signal, or ``None`` when no
+        signal is available (task 3170, review fix D2).
+
+        Sums two public ``TaskSteward.metrics`` counters, because neither alone
+        covers the whole of "the steward is alive":
+
+        - ``invocations`` increments after EVERY invocation returns
+          (steward.py:597, and on the pre-triage path) — one tick per completed
+          invocation, including each timeout-kill retry.  That is the "one more
+          invocation ceiling legitimately consumed" event
+          :meth:`_wait_for_resolution` needs in order to extend its idle window
+          without hard-coding the ``steward_max_attempts +
+          steward_max_timeouts_per_escalation`` multiplier.
+        - ``subprocess_attempts`` increments at the START of every agent
+          subprocess attempt (``TaskSteward._invoke_agent_counted``, task 3170
+          review fix D4).  This is load-bearing, not redundant:
+          ``_invoke_with_session`` delegates to ``invoke_with_cap_retry``, which
+          runs up to ``_MAX_CAP_RETRIES`` (16) subprocess attempts behind ONE
+          return, sleeping a cap cooldown (<= 300s, cli_invoke.py:1295/1367)
+          between them while it waits for a usage-cap reset.  ``invocations``
+          cannot move during that window, so an all-accounts-capped steward — a
+          routine, designed-for condition — would read as SILENT for as long as
+          the retry loop is patient, and the waiter would kill a healthy steward
+          mid-work.  Ticking per ATTEMPT caps the longest legitimate silence at
+          one cooldown plus one enforced ``timeouts.steward`` ceiling, which
+          fits inside the waiter's window.
+
+        Both counters are monotonically non-decreasing, so their sum is too —
+        which is all the caller's ``progress > last_progress`` comparison
+        requires.  The absolute value is meaningless; only its movement is read.
+
+        Read through a defensive ``getattr`` chain: no steward, no ``metrics``,
+        or NEITHER counter present as an ``int`` all mean "no progress signal
+        available" and return ``None``, which degrades the caller to a plain
+        fixed deadline rather than breaking it.  A counter that is present but
+        not a usable ``int`` contributes 0 rather than poisoning the other
+        (older fakes and hand-rolled test doubles expose only ``invocations``,
+        and must keep working).  ``bool`` is excluded explicitly — it is an
+        ``int`` subclass, and a truthy flag masquerading as a counter would read
+        as progress exactly once and never again.
+        """
+        steward = self._steward
+        if steward is None:
+            return None
+        metrics = getattr(steward, 'metrics', None)
+        if metrics is None:
+            return None
+        total: int | None = None
+        for name in ('invocations', 'subprocess_attempts'):
+            value = getattr(metrics, name, None)
+            if isinstance(value, bool) or not isinstance(value, int):
+                continue
+            total = value if total is None else total + value
+        return total
+
+    def _drain_steward_outcomes(self) -> StewardOutcome | None:
+        """Non-blockingly empty the steward outcome channel and LOG what was
+        there, returning the most severe drained outcome (task 3170).
+
+        This exists for :meth:`_wait_for_resolution` — the run()-ESCALATED
+        waiter, which is escalation-queue-only and never consumes the channel.
+        Anything the steward published while that waiter held the wait would
+        otherwise sit on the channel indefinitely, and a LATER
+        ``_mark_blocked`` in the same workflow would pop it out of
+        :meth:`_await_steward_completion` as though it had just been
+        published.  A stale ``StewardInterrupted(wip_commits_present=True)`` is
+        exactly the task-2060 resume-plan outcome, so the consequence is a
+        spurious ``_requeue()`` driven by an already-dispositioned escalation
+        cycle.  (The hazard pre-dates task 3170 — ``StewardResolved`` is
+        published on every steward success — but fix A makes it reachable far
+        more often.)
+
+        **Drain-and-log ONLY — deliberately does NOT route on the drained
+        value.**  Every actionable variant is already fully determined by the
+        escalation-queue state ``_wait_for_resolution``'s tail reads:
+        ``StewardReescalatedL1``/``StewardBudgetExhausted`` ⇒ the L0 is
+        dismissed and an L1 is open ⇒ ``has_open_l1``; ``StewardResolved`` ⇒
+        the L0 is resolved; ``StewardInterrupted`` ⇒ the L0 is dismissed by the
+        producer-side give-up contract with no L1.  Routing here would add a
+        SECOND parallel outcome contract on a path that has none — precisely
+        the asymmetry this task exists to remove.  The return value is for
+        callers/tests that want to observe what was drained, not to branch on.
+
+        Reduction reuses :meth:`_outcome_severity` rather than adding a
+        parallel ranking.  A ``None`` channel (no steward was ever started for
+        this workflow) is a no-op returning ``None``.
+        """
+        channel = self._steward_outcome_channel
+        if channel is None:
+            return None
+        drained: list[StewardOutcome] = []
+        while True:
+            try:
+                drained.append(channel.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        if not drained:
+            return None
+        most_severe = max(drained, key=self._outcome_severity)
+        logger.info(
+            'Task %s: drained %d unconsumed steward outcome(s) after the '
+            'ESCALATED wait (most severe: %r) — the escalation-queue state '
+            'already determined this cycle\'s disposition; draining only '
+            'prevents a later _mark_blocked from replaying them',
+            self.task_id, len(drained), most_severe,
+        )
+        return most_severe
+
+    async def _await_steward_completion(
+        self, *, skip_if_idle: bool = False,
+    ) -> StewardOutcome:
         """Wait for the steward to publish an outcome, with a grace period
         (task 2248 / W9-delta, SO-1).
+
+        *skip_if_idle* (task 3170) is passed by the post-merge success tail,
+        whose contract is "give queued steward work a chance to finish" rather
+        than "join the steward": with nothing outstanding
+        (:meth:`_steward_work_outstanding`) it returns the same synthesized
+        default as the no-channel case instead of burning the whole grace
+        window on a publish that is never coming.  ``_mark_blocked`` never
+        passes it — there the wait IS the point, and an L0 it just filed is
+        outstanding by construction.
 
         Races ``self._steward_outcome_channel.get()`` against the soft-cancel
         event and the configured grace deadline — replaces the old
         escalation-queue file-polling loop entirely (no more re-reading
         ``_pending_l0()``; the channel is the sole synchronization signal).
+
+        This is ONE of the workflow's two steward waiters, and both rest on the
+        same producer invariant (task 3170): *a steward give-up ALWAYS dismisses
+        its own L0 before publishing an outcome*.  Its sibling
+        :meth:`_wait_for_resolution` (``run()``'s ESCALATED branch) never reads
+        this channel — the dismissal is the only thing that wakes it — so a new
+        steward early return that publishes without dismissing would satisfy
+        this waiter while stranding that one.  The dismissal loops on this path
+        (``_mark_blocked``'s, and the ``has_open_l1`` override's below) are
+        idempotent backstops over an already-dismissed record, not the primary
+        mechanism.
+
+        The two waiters share that PRODUCER invariant but deliberately DIVERGE
+        on their bound — do not "re-converge" them onto one knob, which is
+        exactly the defect review fix D1 removed.  This one is a
+        post-completion drain grace (``steward_completion_timeout`` alone,
+        which is precisely what config.py:211-222 defines that knob as, and
+        the right scale for "the task is finished, let the steward drain").
+        :meth:`_wait_for_resolution` instead waits on a steward that is
+        actively working an escalation, where the relevant scale is the
+        per-invocation ceiling — so it uses an idle window of
+        ``timeouts.steward + steward_completion_timeout``, refreshed on
+        observable progress.  Sharing a knob gave that backstop a value a
+        healthy steward routinely exceeds.
 
         A steward is only ever started (and the channel only ever created)
         by :meth:`_ensure_steward_started` when there is real pending work
@@ -13151,6 +13559,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         """
         channel = self._steward_outcome_channel
         if channel is None:
+            return StewardInterrupted('timeout', wip_commits_present=False)
+        if skip_if_idle and not self._steward_work_outstanding():
+            logger.info(
+                'Task %s: no outstanding steward work — skipping the '
+                'completion grace window', self.task_id,
+            )
             return StewardInterrupted('timeout', wip_commits_present=False)
 
         timeout = self.config.steward_completion_timeout

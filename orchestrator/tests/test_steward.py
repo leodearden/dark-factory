@@ -419,7 +419,6 @@ class TestStewardInvokeWithCapRetryWiring:
         self, steward, worktree, mock_mcp, mock_config,
     ):
         """No prior session: resume_session_id must be absent from the call."""
-        from orchestrator.agents.invoke import invoke_agent
         from orchestrator.agents.roles import STEWARD
         from orchestrator.steward import _MAX_CAP_RETRIES
 
@@ -440,7 +439,12 @@ class TestStewardInvokeWithCapRetryWiring:
 
         mock_iwcr.assert_awaited_once()
         kwargs = mock_iwcr.call_args.kwargs
-        assert kwargs['invoke_fn'] is invoke_agent
+        # The counting shim, not invoke_agent directly (task 3170 fix D4): it
+        # ticks metrics.subprocess_attempts per subprocess attempt so cap-retry
+        # cooldowns stay visible to the ESCALATED waiter, then forwards verbatim
+        # to invoke_agent.  The forwarding + per-attempt tick are covered by
+        # TestStewardCapHitBackoff against the real cap-retry loop.
+        assert kwargs['invoke_fn'] == steward._invoke_agent_counted
         assert kwargs['max_cap_retries'] == _MAX_CAP_RETRIES
         assert kwargs['backend'] == 'claude'
         assert kwargs['config_dir'] == steward._config_dir
@@ -701,6 +705,52 @@ class TestStewardCapHitBackoff:
             mock_sleep.assert_awaited_once_with(_CAP_HIT_COOLDOWN_SECS)
             assert mock_invoke.call_count == 2
             assert steward._session_id == 'sess-new'
+
+    async def test_cap_retries_tick_the_subprocess_liveness_counter(
+        self, steward, mock_briefing,
+    ):
+        """Task 3170 review fix D4: cap-retry attempts must be OBSERVABLE.
+
+        ``metrics.invocations`` is bumped once per ``_invoke_with_session``
+        return — i.e. once for the WHOLE ``invoke_with_cap_retry`` loop, however
+        many subprocesses and cap cooldowns that loop consumed.  A steward
+        waiting out an all-accounts-capped window is therefore invisible on that
+        counter alone, and ``TaskWorkflow._wait_for_resolution``'s idle window
+        would expire on a HEALTHY producer and kill its agent mid-work.
+
+        ``metrics.subprocess_attempts`` is the per-attempt tick that closes it:
+        with two cap hits before success, it must read 3 while ``invocations``
+        reads 1.  Asserting BOTH is the point — an implementation that merely
+        bumped ``invocations`` more often would break every consumer that reads
+        it as an invocation count.
+        """
+        esc = _make_escalation()
+        steward.escalation_queue.get.return_value = _make_escalation(
+            status='resolved', resolution='fixed',
+        )
+        steward.usage_gate = _make_pre_triage_gate(cap_effects=[True, True, False])
+
+        with (
+            patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke,
+            patch('asyncio.sleep', new_callable=AsyncMock),
+        ):
+            mock_invoke.return_value = _make_result(session_id='sess-new')
+            await steward._handle_escalation(esc)
+
+        assert mock_invoke.call_count == 3, (
+            'precondition: two cap hits then success = three subprocess attempts'
+        )
+        assert steward.metrics.subprocess_attempts == 3, (
+            f'every subprocess attempt inside the cap-retry loop must tick the '
+            f'liveness counter, otherwise a capped-but-healthy steward reads as '
+            f'silent to the ESCALATED waiter; '
+            f'got {steward.metrics.subprocess_attempts}'
+        )
+        assert steward.metrics.invocations == 1, (
+            f'invocations must keep meaning "completed invocations" — the new '
+            f'signal is a separate counter, not a redefinition; '
+            f'got {steward.metrics.invocations}'
+        )
 
     async def test_preserves_session_on_cap_hit(self, steward, mock_briefing):
         """Cap hit with session_id → session preserved, resume on next account."""
@@ -3279,3 +3329,322 @@ class TestStewardOutcomeChannelGiveUpGuards:
         submitted = steward.escalation_queue.submit.call_args[0][0]
         assert submitted.level == 1
         assert channel.get_nowait() == StewardReescalatedL1(esc_id=submitted.id)
+
+
+# ---------------------------------------------------------------------------
+# Converged give-up contract: every give-up dismisses its own L0 (task 3170)
+# ---------------------------------------------------------------------------
+
+
+def _assert_dismissed_own_l0(steward, esc_id: str) -> None:
+    """Assert the converged give-up contract for *esc_id*.
+
+    THE contract (task 3170): a steward give-up ALWAYS dismisses its own L0
+    before publishing an outcome — no pending L0 survives a steward give-up.
+
+    This is what both workflow waiters rely on.  ``_await_steward_completion``
+    (reached via ``_mark_blocked``) reads the typed outcome off the channel,
+    but ``_wait_for_resolution`` (reached via ``run()``'s ESCALATED branch) is
+    escalation-queue-only: its ONLY wake signal is
+    ``EscalationQueue.resolve`` → ``_resolve_callback`` →
+    ``harness._on_escalation_resolved`` → ``_escalation_events[task_id].set()``.
+    A give-up that publishes without dismissing strands that waiter forever.
+    """
+    steward.escalation_queue.resolve.assert_called_once()
+    call_args = steward.escalation_queue.resolve.call_args
+    assert call_args[0][0] == esc_id, (
+        f'give-up must dismiss its OWN L0 ({esc_id}); '
+        f'resolved {call_args[0][0]!r} instead'
+    )
+    assert call_args[1].get('dismiss') is True, (
+        'the L0 must be DISMISSED (not resolved) — the steward gave up on it'
+    )
+    assert call_args[1].get('resolved_by') == 'auto-dismissed', (
+        "resolved_by must be 'auto-dismissed' so archived records stay "
+        "greppable by the same signature as _mark_blocked's dismissal loop"
+    )
+    assert esc_id not in steward._retry_counts
+    assert esc_id not in steward._timeout_counts
+    assert esc_id not in steward._empty_output_counts
+
+
+@pytest.mark.asyncio
+class TestGiveUpAlwaysDismissesOwnL0:
+    """The two wip-gated give-up branches (task 2248) must dismiss their L0.
+
+    Every OTHER give-up path already does, via ``_auto_escalate_to_human``.
+    These two skipped it on the theory that ``_mark_blocked`` would dismiss
+    the still-pending L0 — true only on that one path.  On the
+    ``run()``-ESCALATED path nothing dismisses it and nothing reads the
+    channel, so the workflow waits forever on a record only the steward can
+    clear (reify 5189: 20.5h stall, 1,183,854 log lines).
+    """
+
+    async def test_attempt_cap_wip_present_dismisses_own_l0(
+        self, steward, mock_config,
+    ):
+        mock_config.steward_max_attempts = 1
+        channel = asyncio.Queue()
+        steward.set_outcome_channel(channel)
+        steward.set_wip_probe(AsyncMock(return_value=True))
+        esc = _make_escalation(id='esc-42-1')
+        steward._retry_counts['esc-42-1'] = 1  # at cap
+        steward._timeout_counts['esc-42-1'] = 1  # stale sibling counter
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            await steward._handle_escalation(esc)
+
+        mock_invoke.assert_not_called()
+        _assert_dismissed_own_l0(steward, 'esc-42-1')
+        # Task-2060 resume-plan semantics are preserved: dismissal is NOT an
+        # L1 hand-off.  The workflow resumes the plan; it does not triage.
+        steward.escalation_queue.submit.assert_not_called()
+        assert channel.get_nowait() == StewardInterrupted(
+            reason='attempt_cap', wip_commits_present=True,
+        )
+        assert channel.empty(), 'exactly one outcome must be published'
+
+    async def test_timeout_cap_wip_present_dismisses_own_l0(
+        self, steward, mock_config,
+    ):
+        """The timeout-kill cap's wip branch is the SECOND instance of the
+        same 2248 bug — identical shape, identical strand.  Fixing only the
+        attempt-cap branch would leave the ESCALATED path strandable via a
+        different door, so both are pinned here.
+        """
+        mock_config.steward_max_timeouts_per_escalation = 3
+        # Raised above the seeded _retry_counts entry so the ATTEMPT cap (which
+        # is checked first, and whose fixture default is 1) does not fire —
+        # this test must exercise the timeout guard specifically.
+        mock_config.steward_max_attempts = 5
+        channel = asyncio.Queue()
+        steward.set_outcome_channel(channel)
+        steward.set_wip_probe(AsyncMock(return_value=True))
+        esc = _make_escalation(id='esc-42-1')
+        steward._timeout_counts['esc-42-1'] = 3  # at cap
+        steward._retry_counts['esc-42-1'] = 1  # stale sibling counter, below cap
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            await steward._handle_escalation(esc)
+
+        mock_invoke.assert_not_called()
+        _assert_dismissed_own_l0(steward, 'esc-42-1')
+        steward.escalation_queue.submit.assert_not_called()
+        assert channel.get_nowait() == StewardInterrupted(
+            reason='timeout', wip_commits_present=True,
+        )
+        assert channel.empty(), 'exactly one outcome must be published'
+
+
+# ---------------------------------------------------------------------------
+# Capped escalations are terminal for this steward (task 3170, fix B)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCappedEscalationIsTerminal:
+    """A capped escalation must never be re-handled by THIS steward.
+
+    Independent of fix A (which dismisses the L0 so it stops being returned
+    at all), this is the structural guarantee: nothing recorded that an
+    escalation had already been given up on, so ANY early return from
+    _handle_escalation left the record pending, _next_escalation re-returned
+    it from a synchronous read, and _run_loop re-handled it at loop speed
+    with no sleep and no state change — 1,183,854 log lines in 20.5h on
+    reify 5189, each iteration also awaiting a `git rev-list` subprocess via
+    the wip probe.
+    """
+
+    async def test_second_handle_of_capped_escalation_is_a_no_op(
+        self, steward, mock_config,
+    ):
+        mock_config.steward_max_attempts = 1
+        channel = asyncio.Queue()
+        steward.set_outcome_channel(channel)
+        wip_probe = AsyncMock(return_value=True)
+        steward.set_wip_probe(wip_probe)
+        esc = _make_escalation(id='esc-42-1')
+        steward._retry_counts['esc-42-1'] = 1
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock):
+            await steward._handle_escalation(esc)
+
+        # First handle did the give-up work.
+        assert wip_probe.await_count == 1
+        assert channel.qsize() == 1
+        steward.escalation_queue.resolve.assert_called_once()
+
+        # Re-arm every observable so the second call's effects are unambiguous.
+        wip_probe.reset_mock()
+        steward.escalation_queue.reset_mock()
+        while not channel.empty():
+            channel.get_nowait()
+
+        with patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke:
+            # A realistic result so that a regression surfaces as the
+            # assertions below (the second handle DID work) rather than as a
+            # TypeError deep inside the invocation path.
+            mock_invoke.return_value = _make_result()
+            await steward._handle_escalation(esc)
+
+        assert wip_probe.await_count == 0, (
+            'a capped escalation must not re-run the wip probe — that is the '
+            'git rev-list subprocess the incident spun on'
+        )
+        steward.escalation_queue.resolve.assert_not_called()
+        steward.escalation_queue.submit.assert_not_called()
+        mock_invoke.assert_not_called()
+        assert channel.empty(), 'no duplicate outcome may be published'
+
+    async def test_next_escalation_skips_capped_ids(self, steward):
+        """A capped-but-still-pending record must not short-circuit the
+        synchronous pending read into a hot return.
+
+        The watcher must still be consulted — that is what makes the loop
+        BLOCK on inotify rather than spin.
+        """
+        capped = _make_escalation(id='esc-42-1')
+        steward._capped_escalations = {'esc-42-1'}
+        steward.escalation_queue.get_by_task.return_value = [capped]
+
+        with patch.object(
+            steward, '_watch_for_escalation', new_callable=AsyncMock,
+        ) as mock_watch:
+            mock_watch.return_value = None
+            result = await steward._next_escalation()
+
+        assert result is None, 'the capped escalation must be filtered out'
+        # The watcher must still be consulted so the loop blocks on inotify
+        # instead of hot-returning the capped record.  (Mock assertion methods
+        # take no message argument — a trailing `, (...)` would just build a
+        # discarded tuple, not attach an explanation.)
+        mock_watch.assert_awaited_once()
+
+    async def test_watcher_argv_excludes_capped_ids(self, steward):
+        """Capped ids must be passed to the watcher as ``--exclude-id``.
+
+        This is the flag that stops the SUBPROCESS-spawn spin. Filtering in
+        ``_next_escalation`` alone is NOT sufficient: ``escalation/watcher.py``
+        arms inotify and then runs ``_initial_scan``, which emits an
+        already-pending match IMMEDIATELY and exits.  So a still-pending
+        capped record makes every watcher call return instantly, and the loop
+        re-spins at subprocess-spawn rate rather than blocking on inotify.
+        """
+        steward._capped_escalations = {'esc-42-1', 'esc-42-2'}
+
+        with patch(
+            'asyncio.create_subprocess_exec', new_callable=AsyncMock,
+        ) as mock_exec:
+            proc = AsyncMock()
+            proc.returncode = 0
+            proc.communicate.return_value = (b'', b'')
+            mock_exec.return_value = proc
+            await steward._watch_for_escalation()
+
+        cmd = list(mock_exec.call_args[0])
+        pairs = [
+            (cmd[i], cmd[i + 1]) for i in range(len(cmd) - 1)
+            if cmd[i] == '--exclude-id'
+        ]
+        assert pairs == [
+            ('--exclude-id', 'esc-42-1'), ('--exclude-id', 'esc-42-2'),
+        ], (
+            f'both capped ids must be excluded, in sorted order for a '
+            f'deterministic argv; got {cmd!r}'
+        )
+
+        # The pre-existing flags must survive alongside the new ones.
+        assert '--task-id' in cmd and cmd[cmd.index('--task-id') + 1] == '42'
+        assert '--level' in cmd and cmd[cmd.index('--level') + 1] == '0'
+        assert '--queue-dir' in cmd
+
+    async def test_run_loop_does_not_respin_on_a_capped_escalation(
+        self, steward, mock_config, caplog,
+    ):
+        """The ~13/s incident signature, pinned against the REAL ``_run_loop``.
+
+        Fix A is deliberately NEUTRALISED here so fix B is tested in
+        isolation: ``escalation_queue.resolve`` is a no-op ``MagicMock`` and
+        the pending read keeps returning the SAME record forever — exactly
+        the state the queue would be in if the dismissal had never happened.
+        Fix B alone must still bound the loop.
+
+        Before fix B this loop re-handled the same escalation at loop speed
+        with no sleep and no state change: ``_dismiss_capped_l0`` pops
+        ``_retry_counts``, so ``retry_count`` fell back to 0, the cap guard
+        did not re-fire, and every subsequent iteration ran a FULL agent
+        invocation against a record nothing would ever clear (1,183,854 log
+        lines in 20.5h on reify 5189).
+        """
+        mock_config.steward_max_attempts = 1
+        esc = _make_escalation(id='esc-42-1')
+        steward._retry_counts['esc-42-1'] = 1
+        steward.set_outcome_channel(asyncio.Queue())
+        wip_probe = AsyncMock(return_value=True)
+        steward.set_wip_probe(wip_probe)
+        steward.escalation_queue.get_by_task.return_value = [esc]
+
+        handles = 0
+        real_handle = steward._handle_escalation
+
+        async def counting_handle(escalation):
+            nonlocal handles
+            handles += 1
+            await real_handle(escalation)
+
+        with (
+            patch.object(steward, '_handle_escalation', counting_handle),
+            patch.object(
+                steward, '_watch_for_escalation', new_callable=AsyncMock,
+            ) as mock_watch,
+            patch(
+                'orchestrator.steward.invoke_agent', new_callable=AsyncMock,
+            ) as mock_invoke,
+        ):
+            # A watcher that blocks is the healthy steady state: once the
+            # capped record is filtered out there is nothing else pending.
+            # Must be an async def, not `lambda: asyncio.sleep(30)`: an
+            # AsyncMock with a SYNC side_effect returns whatever it returns
+            # verbatim, so the lambda hands back an un-awaited coroutine and
+            # the loop dies on `esc.level` instead of idling.
+            async def _blocking_watch():
+                await asyncio.sleep(30)
+
+            mock_watch.side_effect = _blocking_watch
+            mock_invoke.return_value = _make_result()
+
+            loop_task = asyncio.create_task(steward._run_loop())
+            with caplog.at_level(logging.WARNING, logger='orchestrator.steward'):
+                with contextlib.suppress(asyncio.TimeoutError, TimeoutError):
+                    await asyncio.wait_for(loop_task, 0.5)
+                loop_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await loop_task
+
+        assert handles <= 2, (
+            f'a capped escalation must be re-handled O(1) times, not at loop '
+            f'speed — {handles} handles in a 0.5s window'
+        )
+        assert wip_probe.await_count == 1, (
+            'exactly one handle may get past the capped-id early return; '
+            'the wip probe is a `git rev-list` subprocess, which is what '
+            'made the spin expensive as well as noisy'
+        )
+        assert mock_invoke.await_count == 0, (
+            'a capped escalation must never reach an agent invocation — '
+            'popping _retry_counts on the give-up is what let the next '
+            'iteration fall straight through the cap guard'
+        )
+
+        # The idle state must be diagnosable in journald, and loud EXACTLY
+        # once: silence is indistinguishable from a wedged steward, but a
+        # per-iteration line would just be a slower version of the incident.
+        idle_lines = [
+            r for r in caplog.records
+            if 'awaiting workflow disposition' in r.getMessage()
+        ]
+        assert len(idle_lines) == 1, (
+            f'the capped-only idle state must be announced exactly once per '
+            f'entry into it; got {len(idle_lines)} lines'
+        )
+        assert idle_lines[0].levelno == logging.WARNING
