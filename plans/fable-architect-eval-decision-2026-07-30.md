@@ -60,3 +60,61 @@ confined to one clearly marked place.
 6. End-to-end confirm stage: NOT RUN — RAW OBSERVATION
 7. Recommendation — INTERPRETATION
 8. Appendix: reproduction recipe
+
+---
+
+## 2. Cell inventory and data hygiene
+
+_RAW OBSERVATION._
+
+The campaign ran in phases, spread over five distinct waves (grouped by result-file
+modification date):
+
+| wave | cells (hard-fixture × architect) | description |
+|---|---|---|
+| 2026-07-20 | 9 | pre-fable, killed campaign (cap contamination; superseded) |
+| 2026-07-27 | 24 | 1-trial pilot |
+| 2026-07-28 | 72 | full 3-trial screen, all 6 hard fixtures |
+| 2026-07-29 | 24 | phase-1 re-run of `reify_task_12` + `reify_task_27` |
+| 2026-07-30 | 12 | phase-2 re-run of `df_task_2430_adv_plan` |
+
+**Selection rule: supersede-by-rerun.** Per fixture, take the newest wave carrying a
+complete 3-trial cell set for all four architect candidates:
+
+| fixture | scored from wave |
+|---|---|
+| `df_task_2284_adv_regression` | 2026-07-28 |
+| `df_task_2339_adv_verify` | 2026-07-28 |
+| `df_task_18` | 2026-07-28 |
+| `reify_task_12` | 2026-07-29 |
+| `reify_task_27` | 2026-07-29 |
+| `df_task_2430_adv_plan` | 2026-07-30 |
+
+This yields **72 unique cells, 18 per candidate, no gaps** — equivalent to the
+campaign operator's own de-dup on `(task_id, config_name, trial)` preferring the
+latest phase (esc-2862-1 triage note, "PHASE 2 COMPLETE" section). Independently
+re-merging the three raw dumps on that same key — later-wave entries overriding
+earlier ones — collapses 108 raw entries (72 + 24 + 12) to exactly 72 unique
+`(task_id, config_name, trial)` keys, 18 per candidate, confirming the rule reduces to
+precisely the intended de-dup with no leftover collisions or gaps (§8 carries the
+merge recipe).
+
+**Why the re-runs exist.** The 2026-07-28 wave was ~40% cap-starved: the operator's
+triage note reports 37 `blocked` cells in that wave, of which 29 carry `cost_usd ==
+0`. Phases 1 and 2 (07-29, 07-30) re-ran exactly the starved fixtures
+(`reify_task_12`, `reify_task_27`, `df_task_2430_adv_plan`).
+
+**The one fixture never re-run: `df_task_18`.** All 12 of its 07-28 cells (4
+candidates × 3 trials) were inspected individually. Every one carries real cost
+($2.42-$7.08), real `plan_steps` (10-28) and a real, non-zero `plan_quality`
+(0.65-0.97) — none read as cap-kills. Its 6 `blocked` outcomes of 12
+(`architect-opus-max` 0/3 blocked, `architect-fable-high` 1/3, `architect-opus-high`
+2/3, `architect-sonnet-high` 3/3) are therefore genuine downstream blocks, not cap
+kills, and the fixture did not need re-running.
+
+**`cap_tainted` / `invocation_error` fields (task 3118).** These per-cell fields
+exist only on the 2026-07-30 wave, where inspected cells read `cap_tainted: false` /
+`invocation_error: null` — the task-3118 fix landed between the 07-28/07-29 waves and
+the 07-30 wave. They are absent entirely from cells minted on or before 07-29. Cap
+identification for the older waves therefore relies on the cost /  `plan_steps` /
+timestamp correlation above, not a structural marker.
