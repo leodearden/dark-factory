@@ -41,6 +41,7 @@ from fused_memory.reconciliation.flag_dedup import (
     filter_contamination_ceiling_findings,
     filter_false_phantom_task_creation_flags,
 )
+from fused_memory.reconciliation.mem0_tombstone import is_protected_mirror_record
 from fused_memory.reconciliation.policies import is_snapshot_write_blocked
 from fused_memory.reconciliation.prompts import (
     _STAGE2_PROJECT_ID_GUIDELINE,
@@ -970,6 +971,26 @@ async def _sweep_stale_mem0_pool(
     a fail-safe KEEP-on-uncertainty posture shared with every other marker
     sweep in this module.
 
+    **Protected-mirror invariant (task 3041): this skeleton NEVER deletes a
+    ``kind='cycle_summary'`` / ``record_type='ledger_stamp'`` record**, no
+    matter which pool filter selected it. Every enumerated member is tested
+    against
+    :func:`~fused_memory.reconciliation.mem0_tombstone.is_protected_mirror_record`
+    BEFORE the age check; a match is skipped with a WARNING naming the
+    memory_id, its kind/record_type and *log_name*, and is excluded from the
+    returned count. An over-broad payload filter therefore degrades to a LOUD
+    skip rather than collateral mirror loss.
+
+    The guard lives HERE rather than in each caller's payload filter because
+    filter-tightening cannot guarantee precision:
+    :data:`_FLAG_FOR_STAGE2_ENUM_FILTERS` is ``{'flag_for_stage2': True}``
+    with no ``kind``/``source``/``record_type`` discriminator at all, and
+    ``flag_for_stage2`` is an LLM-supplied metadata key that nothing at the
+    ``add_memory`` boundary stops a cycle_summary write from also carrying.
+    Enforcing at this single choke point also means every future caller
+    inherits the guard for free — the same reuse the task-2853 reviewer
+    created this factoring for.
+
     Deletes are issued best-effort in parallel via ``gather_collect``:
     individual failures log WARNING and are excluded from the returned
     count.
@@ -1064,6 +1085,29 @@ async def _sweep_stale_mem0_pool(
         mid = member.get('id')
         if not mid:
             continue
+
+        # Protected-mirror exclusion (task 3041), checked BEFORE the age test
+        # so an over-broad payload filter degrades to a loud skip rather than
+        # collateral mirror loss. See this function's docstring for why the
+        # guard lives here instead of in each caller's filter.
+        member_metadata = member.get('metadata')
+        if is_protected_mirror_record(member_metadata):
+            metadata = member_metadata if isinstance(member_metadata, dict) else {}
+            logger.warning(
+                'reconciliation.%s: SKIPPING protected cycle_summary mirror '
+                'memory_id=%s (kind=%s record_type=%s) — this pool filter matched a '
+                'record it must never delete; the enumeration filter is over-broad '
+                'for this pool and should be tightened (task 3041).',
+                log_name, mid, metadata.get('kind'), metadata.get('record_type'),
+                extra={
+                    'project_id': project_id,
+                    'memory_id': mid,
+                    'run_id': run_id,
+                    'log_name': log_name,
+                },
+            )
+            continue
+
         raw = member.get('created_at')
         if raw is None:
             continue
@@ -1135,7 +1179,10 @@ async def _sweep_stale_persistence_markers(
 
     Delegates to :func:`_sweep_stale_mem0_pool` (task 2853 amendment) for the
     shared enumerate -> age-filter -> gather_collect-delete -> count
-    skeleton — see that function's docstring for the fail-safe posture.
+    skeleton — see that function's docstring for the fail-safe posture and
+    for its protected-mirror invariant (task 3041): a ``kind='cycle_summary'``
+    / ``record_type='ledger_stamp'`` record is never deleted by this sweep,
+    whatever this pool's filter matches.
     ``count_short_circuit`` is deliberately left off here: unlike
     ``stage1_flag_marker`` (below), this pool's writer
     (:func:`_track_flag_persistence`) is still active, so a zero count would
@@ -1199,7 +1246,10 @@ async def _sweep_stale_mem0_flag_markers(
     shared enumerate -> age-filter -> gather_collect-delete -> count
     skeleton, with a distinct source filter, delete ``_source`` tag, and
     max-age constant from :func:`_sweep_stale_persistence_markers` — see
-    that function's docstring for the fail-safe posture.
+    that function's docstring for the fail-safe posture and for its
+    protected-mirror invariant (task 3041): a ``kind='cycle_summary'`` /
+    ``record_type='ledger_stamp'`` record is never deleted by this sweep,
+    whatever this pool's filter matches.
 
     Passes ``count_short_circuit=True`` (task 2853 review, efficiency
     finding): this pool's write path is fully retired, so once the legacy
@@ -1330,6 +1380,13 @@ async def _sweep_stale_mem0_flag_for_stage2_markers(
     (Qdrant payload filters are type-sensitive; live verification against
     dark_factory Mem0 confirmed this shape). See
     :func:`_sweep_stale_mem0_pool`'s docstring for the fail-safe posture.
+
+    That boolean-only filter has NO ``kind``/``source``/``record_type``
+    discriminator, so on its own it matches any record an LLM writer happened
+    to stamp ``flag_for_stage2=True`` on — including a cycle_summary mirror.
+    This sweep is therefore the concrete motivating case for the skeleton's
+    protected-mirror invariant (task 3041), which makes that over-breadth
+    degrade to a loud skip instead of collateral mirror loss.
 
     Passes ``count_short_circuit=True``: unlike ``stage2_persistence_marker``
     (written nearly every cycle that has surviving flags), Stage-1 writes a
