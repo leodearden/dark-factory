@@ -44,6 +44,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 #: one entry per port; asserted set-equal to the on-disk glob below.
 PORTED_TESTS = (
     'test_warm_lane_disk_guard.sh',
+    'test_warm_lane_degenerate_ref.sh',
 )
 
 #: Kept strictly BELOW the ``timeout(360)`` marker so a hung bash test fails as
