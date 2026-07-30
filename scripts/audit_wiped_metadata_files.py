@@ -24,8 +24,11 @@ no-silent-fail-soft violation in docs/legibility/design-invariants.md.
 """
 from __future__ import annotations
 
+import argparse
 import json
+import os
 import sqlite3
+import sys
 from pathlib import Path
 from typing import NamedTuple
 
@@ -726,3 +729,140 @@ def format_json(audits: list[ProjectAudit]) -> str:
             ]
         }
     )
+
+
+# ---------------------------------------------------------------------------
+# CLI.
+# ---------------------------------------------------------------------------
+
+# Multi-project discovery fallback, mirroring scan_task_toolcall_leaks.py's
+# _DEFAULT_PROJECT_ROOTS.
+_DEFAULT_PROJECT_ROOTS = ("/home/leo/src/dark-factory",)
+
+# --min-fidelity values, loosest last.
+_MIN_FIDELITY_CHOICES = {
+    "file-level": FIDELITY_FILE_LEVEL,
+    "lock-level": FIDELITY_LOCK_LEVEL,
+}
+
+
+def discover_project_roots(
+    project_roots: list[str] | None = None,
+    env: dict[str, str] | None = None,
+) -> list[str]:
+    """Resolve the list of project roots to audit.
+
+    Precedence (first supplied wins): *project_roots* >
+    ``DASHBOARD_KNOWN_PROJECT_ROOTS`` (comma-separated, read from *env*,
+    defaulting to the real ``os.environ``) > the dark-factory default root.
+
+    A root whose ``tasks.db`` does not exist is silently dropped — this never
+    raises on a missing or not-yet-set-up project.
+    """
+    if project_roots is not None:
+        roots = list(project_roots)
+    else:
+        environ = env if env is not None else os.environ
+        roots_env = (environ.get("DASHBOARD_KNOWN_PROJECT_ROOTS") or "").strip()
+        if roots_env:
+            roots = [r.strip() for r in roots_env.split(",") if r.strip()]
+        else:
+            roots = list(_DEFAULT_PROJECT_ROOTS)
+
+    return [root for root in roots if tasks_db_path(root).exists()]
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "READ-ONLY audit of the DONE-path metadata.files wipe: reports "
+            "every task whose plan declared a non-empty file scope but whose "
+            "metadata.files is now empty. Reporting only -- never mutates a "
+            "task, event, or plan record. Remediation is a separate, "
+            "individually-reviewed follow-up."
+        ),
+    )
+    parser.add_argument(
+        "--project-root", dest="project_roots", action="append",
+        help=(
+            "Project root to audit (resolves <root>/.taskmaster/tasks/tasks.db, "
+            "<root>/data/orchestrator/runs.db and <root>/.worktrees). "
+            "May be repeated."
+        ),
+    )
+    parser.add_argument(
+        "--json", action="store_true",
+        help="Emit a JSON object (full untruncated file lists) instead of a report.",
+    )
+    parser.add_argument(
+        "--min-fidelity", choices=sorted(_MIN_FIDELITY_CHOICES), default="file-level",
+        help=(
+            "Lowest plan-scope fidelity to report (default: %(default)s). "
+            "Lock-level candidates are OPT-IN because their paths are module "
+            "paths, not plan.files entries, and must never silently enter a "
+            "repair feed."
+        ),
+    )
+    return parser
+
+
+def _passes_min_fidelity(candidate: WipeCandidate, min_fidelity: str) -> bool:
+    if min_fidelity == "lock-level":
+        return True
+    return candidate.plan_files_fidelity == FIDELITY_FILE_LEVEL
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point.
+
+    Exit codes: 0 = no candidates, 1 = at least one candidate found, 2 = no
+    project root resolved to a readable tasks.db.
+
+    A single unreadable project (a corrupt/locked tasks.db) does NOT abort the
+    sweep: it is logged to stderr and skipped so every other project is still
+    audited, and a trailing warning states that the results are incomplete.
+    """
+    args = _build_parser().parse_args(argv)
+
+    roots = discover_project_roots(project_roots=args.project_roots)
+    if not roots:
+        print(
+            "no project root resolvable with a readable tasks.db (checked "
+            "--project-root / DASHBOARD_KNOWN_PROJECT_ROOTS / the "
+            "dark-factory default)",
+            file=sys.stderr,
+        )
+        return 2
+
+    audits: list[ProjectAudit] = []
+    unreadable: list[str] = []
+    for root in roots:
+        try:
+            audit = audit_project(root)
+        except sqlite3.Error as exc:
+            print(f"warning: skipping unreadable project {root}: {exc}", file=sys.stderr)
+            unreadable.append(root)
+            continue
+        filtered = [
+            c for c in audit.candidates
+            if _passes_min_fidelity(c, args.min_fidelity)
+        ]
+        audits.append(audit._replace(candidates=filtered))
+
+    if unreadable:
+        print(
+            f"warning: {len(unreadable)} project(s) skipped due to read errors "
+            "(see warnings above); results below are incomplete",
+            file=sys.stderr,
+        )
+
+    if args.json:
+        print(format_json(audits))
+    else:
+        print(format_report(audits))
+
+    return 1 if any(a.candidates for a in audits) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
