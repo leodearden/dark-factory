@@ -678,13 +678,24 @@ def _write_plan(artifacts: TaskArtifacts, workflow: TaskWorkflow) -> None:
     workflow.plan = artifacts.read_plan()
 
 
-def _stub_execute_collaborators(workflow: TaskWorkflow) -> AsyncMock:
-    workflow.briefing.build_implementer_prompt = AsyncMock(return_value='impl')
+def _stub_execute_collaborators(
+    workflow: TaskWorkflow,
+) -> tuple[AsyncMock, AsyncMock]:
+    """Stub the heavy EXECUTE collaborators.
+
+    Returns ``(invoke, build_implementer_prompt)``. Both mocks are handed back
+    rather than read off ``workflow`` at the assertion site: a member-access
+    assignment only narrows within its own scope, so outside this helper
+    ``workflow.briefing.build_implementer_prompt`` resolves to its declared
+    bound-method type and ``.await_count``/``.call_args`` are unexpressible.
+    """
+    build_implementer_prompt = AsyncMock(return_value='impl')
+    workflow.briefing.build_implementer_prompt = build_implementer_prompt
     workflow._check_escalations = MagicMock(return_value=[])  # type: ignore[method-assign]
     workflow._get_head_commit = AsyncMock(return_value='head-sha')  # type: ignore[method-assign]
     invoke = AsyncMock()
     workflow._invoke = invoke  # type: ignore[method-assign]
-    return invoke
+    return invoke, build_implementer_prompt
 
 
 @pytest.mark.asyncio
@@ -711,13 +722,13 @@ class TestA1AllCommittedPlanSkipsExecute:
         assert artifacts.get_pending_steps() == [], 'Setup: nothing may remain pending'
         workflow.plan = artifacts.read_plan()
 
-        invoke = _stub_execute_collaborators(workflow)
-        return workflow, artifacts, invoke
+        invoke, build_implementer_prompt = _stub_execute_collaborators(workflow)
+        return workflow, artifacts, invoke, build_implementer_prompt
 
     async def test_zero_iterations_and_no_implementer_turn(
         self, config, git_ops, task_assignment,
     ):
-        workflow, _artifacts, invoke = await self._setup(
+        workflow, _artifacts, invoke, build_implementer_prompt = await self._setup(
             config, git_ops, task_assignment,
         )
 
@@ -729,7 +740,7 @@ class TestA1AllCommittedPlanSkipsExecute:
             f'{workflow.metrics.execute_iterations}'
         )
         assert invoke.await_count == 0, 'No implementer LLM turn may happen'
-        assert workflow.briefing.build_implementer_prompt.await_count == 0
+        assert build_implementer_prompt.await_count == 0
 
     async def test_emits_phase_skipped_execute_event(
         self, config, git_ops, task_assignment,
@@ -739,7 +750,7 @@ class TestA1AllCommittedPlanSkipsExecute:
         Without this event "0 iterations" is a pure absence, indistinguishable
         from a lost event log — see the structured-facts-at-failure invariant.
         """
-        workflow, artifacts, _invoke = await self._setup(
+        workflow, artifacts, _invoke, _build_prompt = await self._setup(
             config, git_ops, task_assignment,
         )
 
@@ -795,7 +806,7 @@ class TestA1PartiallyCommittedPlanStillRunsExecute:
         pending_ids = [s['id'] for s in artifacts.get_pending_steps()]
         assert pending_ids == ['step-2'], f'Setup: expected only step-2, got {pending_ids}'
 
-        invoke = _stub_execute_collaborators(workflow)
+        invoke, build_implementer_prompt = _stub_execute_collaborators(workflow)
 
         def _mark_pending_done(*_args, **_kwargs):
             from shared.cli_invoke import AgentResult  # noqa: PLC0415
@@ -817,7 +828,7 @@ class TestA1PartiallyCommittedPlanStillRunsExecute:
         ) == [], 'No execute-skip event may be emitted when work remained'
 
         # The pre-satisfied step is neither re-derived nor re-implemented.
-        handed_plan = workflow.briefing.build_implementer_prompt.call_args.args[0]
+        handed_plan = build_implementer_prompt.call_args.args[0]
         step_1 = next(
             s for s in handed_plan['steps'] if s['id'] == 'step-1'
         )
