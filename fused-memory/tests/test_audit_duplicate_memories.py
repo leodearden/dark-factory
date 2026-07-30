@@ -39,6 +39,7 @@ def _load_module() -> types.ModuleType:
 
 
 _mod = _load_module()
+cluster_memories_by_pairs = _mod.cluster_memories_by_pairs
 find_near_duplicate_memory_groups = _mod.find_near_duplicate_memory_groups
 pick_survivor = _mod.pick_survivor
 build_sweep_plan = _mod.build_sweep_plan
@@ -243,6 +244,152 @@ class TestFindNearDuplicateMemoryGroupsEdgeCases:
 
     def test_no_pair_above_threshold_returns_empty(self):
         memories = [_memory('m1', _VENV_GOTCHA_A), _memory('m4', _DISTRACTOR)]
+        assert find_near_duplicate_memory_groups(memories, threshold=_THRESHOLD) == []
+
+
+# ===========================================================================
+# cluster_memories_by_pairs — the shared transitive-closure core (task 3210)
+# ===========================================================================
+
+class TestClusterMemoriesByPairs:
+    """The union-find closure, exercised directly on explicit index pairs.
+
+    Task 3210 adds a SECOND candidate generator (ANN neighbours from Qdrant)
+    alongside the existing O(n^2) lexical difflib scan.  Rather than let each
+    generator carry its own clustering, the transitive-closure core is
+    extracted here so both feed the SAME closure — one implementation, two
+    producers.  Two closures that must agree is exactly the failure mode this
+    avoids.
+
+    These tests pin the closure independently of ANY similarity metric: they
+    hand it index pairs directly, so a change to lexical thresholds or ANN
+    cutoffs can never mask a clustering regression.
+    """
+
+    def test_transitive_closure_across_pairs(self):
+        """(0,1) and (1,2) must collapse into ONE group of three, not two pairs."""
+        memories = [_memory(f'm{i}', f'content {i}') for i in range(3)]
+        result = cluster_memories_by_pairs(memories, [(0, 1), (1, 2)])
+        assert len(result) == 1
+        assert [m['id'] for m in result[0]] == ['m0', 'm1', 'm2']
+
+    def test_disjoint_pairs_stay_separate_groups(self):
+        memories = [_memory(f'm{i}', f'content {i}') for i in range(4)]
+        result = cluster_memories_by_pairs(memories, [(0, 1), (2, 3)])
+        assert len(result) == 2
+        assert [[m['id'] for m in g] for g in result] == [['m0', 'm1'], ['m2', 'm3']]
+
+    def test_singletons_are_dropped(self):
+        """A memory in no pair is not a cluster and must not appear in the output."""
+        memories = [_memory(f'm{i}', f'content {i}') for i in range(3)]
+        result = cluster_memories_by_pairs(memories, [(0, 1)])
+        assert len(result) == 1
+        assert [m['id'] for m in result[0]] == ['m0', 'm1']
+        assert 'm2' not in {m['id'] for g in result for m in g}
+
+    def test_deterministic_ordering_groups_by_min_id_members_by_id(self):
+        """Members sorted by str(id); groups sorted by their minimum str(id).
+
+        Same contract as _sort_groups_deterministically, asserted through the
+        public function so the ordering cannot silently change.
+        """
+        memories = [
+            _memory('m9', 'nine'), _memory('m3', 'three'),
+            _memory('m1', 'one'), _memory('m5', 'five'),
+        ]
+        # Pair the out-of-order indices: (m9,m3) and (m1,m5).
+        result = cluster_memories_by_pairs(memories, [(0, 1), (2, 3)])
+        assert [[m['id'] for m in g] for g in result] == [['m1', 'm5'], ['m3', 'm9']]
+
+    def test_duplicate_and_mirrored_pairs_are_idempotent(self):
+        """Repeating a pair, or supplying both (i,j) and (j,i), changes nothing."""
+        memories = [_memory(f'm{i}', f'content {i}') for i in range(3)]
+        once = cluster_memories_by_pairs(memories, [(0, 1), (1, 2)])
+        twice = cluster_memories_by_pairs(memories, [(0, 1), (1, 0), (1, 2), (0, 1), (2, 1)])
+        assert [[m['id'] for m in g] for g in twice] == [[m['id'] for m in g] for g in once]
+
+    def test_input_list_not_mutated(self):
+        memories = [_memory(f'm{i}', f'content {i}') for i in range(3)]
+        snapshot = [dict(m) for m in memories]
+        order_before = [id(m) for m in memories]
+        cluster_memories_by_pairs(memories, [(0, 1), (1, 2)])
+        assert memories == snapshot
+        assert [id(m) for m in memories] == order_before, 'input list order was mutated'
+
+    def test_empty_memories_returns_empty(self):
+        assert cluster_memories_by_pairs([], []) == []
+
+    def test_empty_pairs_returns_empty(self):
+        """No pairs means no clusters — every record is a singleton."""
+        memories = [_memory(f'm{i}', f'content {i}') for i in range(3)]
+        assert cluster_memories_by_pairs(memories, []) == []
+
+    def test_accepts_any_iterable_of_pairs(self):
+        """Pairs arrive from a generator in the ANN path, not only from a list."""
+        memories = [_memory(f'm{i}', f'content {i}') for i in range(3)]
+        result = cluster_memories_by_pairs(memories, ((i, i + 1) for i in range(2)))
+        assert len(result) == 1
+        assert [m['id'] for m in result[0]] == ['m0', 'm1', 'm2']
+
+    def test_returned_members_are_the_original_dict_objects(self):
+        """Groups carry the caller's dicts through by identity, not copies.
+
+        build_sweep_plan hands these straight to pick_survivor, which reads
+        metadata.canonical and created_at off them — a copy would still work
+        but would quietly double memory on a 5000-record scan.
+        """
+        memories = [_memory(f'm{i}', f'content {i}') for i in range(2)]
+        result = cluster_memories_by_pairs(memories, [(0, 1)])
+        assert result[0][0] is memories[0]
+        assert result[0][1] is memories[1]
+
+
+class TestFindNearDuplicateMemoryGroupsBehaviourPreserved:
+    """The lexical path must be byte-identical after delegating to the shared core.
+
+    Task 3210 refactors find_near_duplicate_memory_groups to yield index pairs
+    into cluster_memories_by_pairs instead of running its own inline union-find.
+    That is a pure refactor: the clustering it produces on the real venv-gotcha
+    fixtures must not move.  (The pre-existing clustering/determinism/empty-content
+    classes above are the primary guard and stay untouched; this class states the
+    equivalence explicitly so the intent survives a future reading.)
+    """
+
+    def test_lexical_path_matches_manual_closure_over_the_same_pairs(self):
+        """Running the closure manually over the lexical pairs reproduces the result."""
+        import difflib
+
+        memories = [
+            _memory('m1', _VENV_GOTCHA_A, created_at='2026-07-12T00:00:00+00:00'),
+            _memory('m2', _VENV_GOTCHA_B, created_at='2026-07-13T00:00:00+00:00'),
+            _memory('m3', _VENV_GOTCHA_C, created_at='2026-07-13T01:00:00+00:00'),
+            _memory('m4', _DISTRACTOR, created_at='2026-07-13T02:00:00+00:00'),
+        ]
+        # Independently recompute which pairs clear the threshold, using the
+        # same normalisation the production path applies.
+        normalized = [(m.get('content') or '').strip().lower() for m in memories]
+        expected_pairs = [
+            (i, j)
+            for i in range(len(memories))
+            for j in range(i + 1, len(memories))
+            if normalized[i] and normalized[j]
+            and difflib.SequenceMatcher(None, normalized[i], normalized[j]).ratio() >= _THRESHOLD
+        ]
+        expected = cluster_memories_by_pairs(memories, expected_pairs)
+        actual = find_near_duplicate_memory_groups(memories, threshold=_THRESHOLD)
+        assert [[m['id'] for m in g] for g in actual] == [[m['id'] for m in g] for g in expected]
+        # And concretely: the three rewrites cluster, the distractor does not.
+        assert [[m['id'] for m in g] for g in actual] == [['m1', 'm2', 'm3']]
+
+    def test_empty_content_guard_survives_the_extraction(self):
+        """Two blank-content records must still not cluster.
+
+        SequenceMatcher(None, '', '').ratio() is 1.0, so without the guard the
+        lexical path would union two records whose content merely failed to
+        extract and mark one for deletion.  The guard lives in the pair
+        GENERATOR, so moving the closure out must not lose it.
+        """
+        memories = [_memory('m1', ''), _memory('m2', '   '), _memory('m3', _VENV_GOTCHA_A)]
         assert find_near_duplicate_memory_groups(memories, threshold=_THRESHOLD) == []
 
 
