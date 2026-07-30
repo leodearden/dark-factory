@@ -13632,3 +13632,138 @@ class TestSweepStaleMem0PoolProtectsMirrorRecords:
         }
         assert deleted_ids == {'ordinary-relay-marker'}
         assert result == 1
+
+
+class TestSweepStaleMem0PoolTombstones:
+    """Every recon-initiated Mem0 delete leaves a queryable tombstone (task 3041).
+
+    The defining signature of the recon-gate-165 / esc-165-1 finding was "no
+    audit trail": an auditor holding a memory uuid had no reachable path to
+    "who deleted it and why", so a designed eviction was indistinguishable
+    from silent data loss. The tombstone is written from the SUCCESS branch
+    only, so a tombstone always means "really gone".
+    """
+
+    @staticmethod
+    def _stale_members(fixed_now):
+        stale = (fixed_now - timedelta(days=20)).isoformat()
+        return [
+            {
+                'id': 'deleted-ok',
+                'created_at': stale,
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': 't1',
+                             'run_id': 'run-victim'},
+            },
+            {
+                'id': 'delete-fails',
+                'created_at': stale,
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': 't2',
+                             'run_id': 'run-victim'},
+            },
+        ]
+
+    @staticmethod
+    def _service(members):
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+
+        async def _delete(**kwargs):
+            if kwargs.get('memory_id') == 'delete-fails':
+                raise RuntimeError('mem0 delete exploded')
+            return None
+
+        memory_service.delete_memory = AsyncMock(side_effect=_delete)
+        return memory_service
+
+    @pytest.mark.asyncio
+    async def test_tombstone_written_only_for_the_successful_delete(self):
+        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = self._stale_members(fixed_now)
+        memory_service = self._service(members)
+
+        with patch.object(
+            tks, 'record_mem0_deletion_tombstone', new=AsyncMock(return_value=True)
+        ) as tombstone:
+            result = await tks._sweep_stale_mem0_pool(
+                memory_service,
+                'dark_factory',
+                'run-deleter',
+                source='stage1_flag_marker',
+                gc_sweep_source='stage1_flag_marker_gc_sweep',
+                max_age_days=14,
+                log_name='_sweep_stale_mem0_flag_markers',
+                now=fixed_now,
+            )
+
+        # A tombstone must never claim a record that is still alive.
+        assert tombstone.await_count == 1
+        call = tombstone.await_args
+        assert call.args[1] == 'dark_factory'
+        assert call.args[2] == 'deleted-ok'
+        assert call.kwargs['deleter'] == 'stage1_flag_marker_gc_sweep'
+        assert call.kwargs['deleting_run_id'] == 'run-deleter'
+        assert call.kwargs['victim_metadata'] == members[0]['metadata']
+        assert call.kwargs['victim_created_at'] == members[0]['created_at']
+
+        # Tombstone writing does not perturb the existing accounting.
+        assert result == 1
+
+    @pytest.mark.asyncio
+    async def test_a_raising_tombstone_helper_cannot_propagate_or_change_the_count(self):
+        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        memory_service = self._service(self._stale_members(fixed_now))
+
+        with patch.object(
+            tks,
+            'record_mem0_deletion_tombstone',
+            new=AsyncMock(side_effect=RuntimeError('ledger db locked')),
+        ):
+            result = await tks._sweep_stale_mem0_pool(
+                memory_service,
+                'dark_factory',
+                'run-deleter',
+                source='stage1_flag_marker',
+                gc_sweep_source='stage1_flag_marker_gc_sweep',
+                max_age_days=14,
+                log_name='_sweep_stale_mem0_flag_markers',
+                now=fixed_now,
+            )
+
+        assert result == 1
+
+    @pytest.mark.asyncio
+    async def test_no_tombstone_when_nothing_was_deleted(self):
+        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {
+                'id': 'fresh',
+                'created_at': (fixed_now - timedelta(days=1)).isoformat(),
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': 't1'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with patch.object(
+            tks, 'record_mem0_deletion_tombstone', new=AsyncMock(return_value=True)
+        ) as tombstone:
+            result = await tks._sweep_stale_mem0_pool(
+                memory_service,
+                'dark_factory',
+                'run-deleter',
+                source='stage1_flag_marker',
+                gc_sweep_source='stage1_flag_marker_gc_sweep',
+                max_age_days=14,
+                log_name='_sweep_stale_mem0_flag_markers',
+                now=fixed_now,
+            )
+
+        assert result == 0
+        tombstone.assert_not_awaited()
