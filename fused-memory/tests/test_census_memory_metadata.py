@@ -1349,11 +1349,42 @@ class TestCensusProjectCoverage:
         assert coverage['collection'] == 'fused_dark_factory'
 
     @pytest.mark.asyncio
-    async def test_collection_points_come_from_backend_count(self):
+    async def test_backend_count_brackets_the_whole_category_loop(self):
+        # The collection total is read BEFORE and AFTER the scan, exactly as
+        # each category's count is. A single read cannot be reconciled with a
+        # counted total gathered over a ~1-minute scan of a live corpus:
+        # _build_coverage would charge ordinary drift as missing data.
         backend = _backend({OBS: [{}]}, counts_by_category={OBS: 1}, collection_points=19464)
         _, coverage = await _mod.census_project(backend, 'dark_factory', [OBS])
         assert coverage['collection_points'] == 19464
-        assert backend.count.await_count == 1
+        assert coverage['collection_points_before'] == 19464
+        assert backend.count.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_both_bracket_reads_are_recorded_when_they_disagree(self):
+        # A single-read implementation cannot record two different values.
+        backend = _backend({OBS: [{}]}, counts_by_category={OBS: 1})
+        backend.count = AsyncMock(side_effect=[100, 101])
+        _, coverage = await _mod.census_project(backend, 'dark_factory', [OBS])
+        assert coverage['collection_points_before'] == 100
+        assert coverage['collection_points'] == 101
+
+    @pytest.mark.asyncio
+    async def test_the_pre_loop_count_happens_before_the_first_category_count(self):
+        # Order matters: a bracket read taken after the category counts
+        # brackets nothing.
+        log: list = []
+        backend = _backend({OBS: [{}], PROC: [{}]}, call_log=log)
+
+        async def _count(scope):
+            log.append(('collection_count', None))
+            return 2
+
+        backend.count = AsyncMock(side_effect=_count)
+        await _mod.census_project(backend, 'dark_factory', [OBS, PROC])
+        assert log[0] == ('collection_count', None)
+        assert log[-1] == ('collection_count', None)
+        assert log.index(('count', OBS)) > 0
 
     @pytest.mark.asyncio
     async def test_uncovered_points_is_collection_total_minus_summed_categories(self):
