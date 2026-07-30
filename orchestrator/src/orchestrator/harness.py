@@ -11669,6 +11669,14 @@ class Harness:
         therefore has to carry every other key through — hence reading current
         metadata first rather than writing a hand-built dict.
 
+        This is the second implementation of that rule (the first is
+        ``TaskWorkflow._clear_merge_retry_pending``), which is deliberate but not
+        desirable: the subtlety belongs in one place next to ``metadata_mode``,
+        and that place — ``Scheduler`` / the fused-memory metadata contract — is
+        outside this task's lock scope.  Pending task 3151 (targeted
+        ``delete_keys`` mode, scheduler.py in scope) is the vehicle for
+        collapsing both call sites onto one helper.
+
         No-op (one ``get_task`` read, zero writes) unless the stamp is actually
         present — which is what makes it safe to call twice per restart teardown:
         once before the status write (to beat a re-dispatch) and once in the

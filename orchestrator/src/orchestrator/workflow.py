@@ -5159,6 +5159,14 @@ class TaskWorkflow:
         key through.  (Same rule, same reason as the harness sibling
         ``_clear_merge_retry_pending_for_restart``.)
 
+        That duplication is knowingly left in place: the delete-by-omission
+        subtlety belongs in ONE place next to ``metadata_mode``, but the single
+        home for it is ``Scheduler``/the fused-memory metadata contract, which is
+        outside this task's lock scope.  Pending task 3151 (targeted
+        ``delete_keys`` mode, filed with scheduler.py in scope) is the vehicle;
+        when it lands, both clears should delegate to it and this whole-blob
+        dance — plus the ``type: ignore`` below — goes away.
+
         Because replace DELETES every omitted key, the read is made with
         ``require_fresh=True``: a failed backend refresh skips the write entirely
         instead of replacing the blob with an in-memory-only payload that would
