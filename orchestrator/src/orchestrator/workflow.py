@@ -367,6 +367,7 @@ class _BriefingLike(Protocol):
     async def build_architect_prompt(
         self, task: dict, worktree: Path | None = ..., context: str | None = ...,
         *, include_prior_proposals: bool = ...,
+        committed_work: list[dict] | None = ...,
     ) -> str: ...
     async def build_resume_prompt(
         self,
@@ -6424,6 +6425,51 @@ class TaskWorkflow:
         self._progress_resume_churn_info = None
         self._preserve_config_dir = False
         self._preserve_config_dir_reason = None
+
+        # Zero-iteration EXECUTE (task 3033 / PRD §A1): nothing is pending, so
+        # the loop below would fall straight through to `return DONE` and emit
+        # NOTHING — making "0 EXECUTE iterations" a pure absence, which a
+        # consumer cannot distinguish from a lost event log. Emit the skip
+        # explicitly instead. Reached when an architect pre-satisfied every step
+        # via mark_step_committed against an already-green branch, and ALSO on a
+        # re-entry after a review cycle with nothing left pending — which is why
+        # execute_iterations is reported FROM THE METRIC rather than hard-coded
+        # to 0. Purely additive: the non-empty path below is byte-for-byte
+        # unchanged.
+        pending = self.artifacts.get_pending_steps()
+        if not pending:
+            plan = self.artifacts.read_plan()
+            items = [
+                s
+                for col in ('prerequisites', 'steps')
+                for s in plan.get(col, [])
+                if isinstance(s, dict)
+            ]
+            done_step_ids = [
+                str(s.get('id')) for s in items if s.get('status') == 'done'
+            ]
+            if self.event_store:
+                self.event_store.emit(
+                    EventType.phase_skipped,
+                    task_id=self.task_id,
+                    phase='execute',
+                    data={
+                        'reason': 'no_pending_steps',
+                        'execute_iterations': self.metrics.execute_iterations,
+                        'step_count': len(items),
+                        'done_step_ids': done_step_ids,
+                    },
+                )
+            logger.info(
+                'Task %s: EXECUTE skipped — no pending steps at entry '
+                '(execute_iterations=%s, %s/%s items already done) — every step '
+                'was pre-satisfied at authoring time, or a review re-entry left '
+                'nothing to do (task 3033 / PRD A1)',
+                self.task_id, self.metrics.execute_iterations,
+                len(done_step_ids), len(items),
+            )
+            return WorkflowOutcome.DONE
+
         while self.artifacts.get_pending_steps():
             if (
                 self.metrics.execute_iterations - self.metrics.progress_resume_total
