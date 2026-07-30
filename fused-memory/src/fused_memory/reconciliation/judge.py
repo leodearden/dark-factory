@@ -112,7 +112,11 @@ class JudgeInfraError(Exception):
 
     1. **The CLI failed** (task 2947): api_error, timeout, model-not-found,
        max-turns, ended-awaiting-background, cap-wait exhaustion, or an
-       otherwise-unknown non-success.
+       otherwise-unknown non-success.  These are uncoded, with one exception:
+       a denied synthetic ``StructuredOutput`` tool — i.e. the ``--json-schema``
+       mechanism itself blocked — carries ``cli_schema_tool_denied``, because
+       the remedy is specific (fix cli_invoke's deny-list) and it would
+       otherwise starve every judge run of its verdict.
     2. **The CLI SUCCEEDED but carried no verdict** (the 2947 residual this task
        closes): exit 0, ``is_error=false``, non-zero output tokens, yet
        ``structured_output`` was missing, empty, wrong-typed, unparseable, or
@@ -639,6 +643,45 @@ Review this run and provide your verdict as JSON.
         # MAX_TURNS / ENDED_AWAITING_BACKGROUND / UNKNOWN) is a transport/infra
         # failure: raise JudgeInfraError (replacing the previous generic
         # RuntimeError) so review_run can branch on it explicitly.
+        #
+        # Schema-tool denial first (CLI 2.1.168 regression guard). The verdict
+        # contract now rides --json-schema, which is delivered through the
+        # synthetic ``StructuredOutput`` tool that cli_invoke's wildcard expansion
+        # deliberately omits from _REAL_BUILTIN_TOOLS_DENYLIST (:207-226). If a
+        # future CLI change starts denying that tool, EVERY judge run is starved
+        # of its verdict, and the remedy is specific (fix the cli_invoke
+        # deny-list) — so it gets its own machine-readable code rather than being
+        # folded into the anonymous UNKNOWN dump below.
+        #
+        # This is the ONLY branch where the check can fire: cli_invoke sets
+        # schema_tool_denied under ``not is_success and not isinstance(structured,
+        # dict)`` (:1807), so on the success path above it is a hard-coded False.
+        #
+        # And it is checked BEFORE the EMPTY_OUTPUT short-circuit deliberately: a
+        # denial whose stdout is empty classifies as EMPTY_OUTPUT, so without this
+        # ordering a total schema outage would return the benign '' contract and
+        # surface as a quiet severity=minor "Judge returned empty output" verdict
+        # on every single run — silent degradation of exactly the kind this module
+        # exists to prevent. Nothing was reviewed, so it is infra.
+        if result.schema_tool_denied:
+            logger.error(
+                'reconciliation.judge_cli_schema_tool_denied',
+                extra={
+                    'code': 'cli_schema_tool_denied',
+                    'subtype': result.subtype,
+                    'session_id': result.session_id,
+                    'output_prefix': result.output[:200],
+                },
+            )
+            raise JudgeInfraError(
+                f'Claude CLI judge was denied the StructuredOutput tool that '
+                f'--json-schema rides on [cli_schema_tool_denied] — the '
+                f'cli_invoke deny-list no longer permits it, so no judge run can '
+                f'produce a verdict: '
+                f'{build_failure_message("Claude CLI judge", result)}',
+                code='cli_schema_tool_denied',
+            )
+
         if classify_agent_failure(result).kind == AgentFailureKind.EMPTY_OUTPUT:
             return ''
 
@@ -649,12 +692,16 @@ Review this run and provide your verdict as JSON.
 
         The structured warning is the record that made the 2026-07-25 RCA possible
         (it took a hand-dug CLI transcript to establish that the halting run had
-        exited 0 with 727 output tokens and no payload).  ``schema_tool_denied``
-        is included deliberately: if a future CLI change starts blocking the
-        synthetic ``StructuredOutput`` tool that ``--json-schema`` rides on, that
-        deny-list regression becomes visible HERE instead of silently starving
-        every judge run of its verdict.  The message embeds the code and an output
-        prefix so ``_handle_infra_failure``'s ``str(err)`` stays diagnostic.
+        exited 0 with 727 output tokens and no payload).  The message embeds the
+        code and an output prefix so ``_handle_infra_failure``'s ``str(err)``
+        stays diagnostic.
+
+        ``schema_tool_denied`` is deliberately NOT logged here: cli_invoke can only
+        set it on a NON-success result (:1807 guards on ``not is_success``) and
+        this helper is reachable only from inside ``if result.success:``, so it
+        would be a hard-coded ``False`` — a safety net that reads as present but
+        cannot fire.  The real detection lives on the non-success branch of
+        ``_call_judge_cli``, with its own ``cli_schema_tool_denied`` code.
         """
         logger.warning(
             'reconciliation.judge_cli_output_unusable',
@@ -665,7 +712,6 @@ Review this run and provide your verdict as JSON.
                 'output_tokens': result.output_tokens,
                 'session_id': result.session_id,
                 'schema_salvaged': result.schema_salvaged,
-                'schema_tool_denied': result.schema_tool_denied,
                 'output_prefix': result.output[:200],
             },
         )

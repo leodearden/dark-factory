@@ -145,6 +145,37 @@ def test_parse_verdict_text_path_invalid_severity_is_loud_not_silent(mock_journa
     assert verdict.findings[0].get('code') == 'unparseable_judge_response'
 
 
+@pytest.mark.parametrize('response', [
+    '[{"severity": "ok", "findings": []}]',   # verdict wrapped in a list
+    '"ok"',                                   # bare JSON string
+    '5',                                      # bare JSON number
+    'null',                                   # JSON null
+])
+def test_parse_verdict_text_path_non_object_json_is_loud_not_silent(mock_journal, response):
+    """A top-level JSON value that is not an OBJECT must fail loud, not vanish.
+
+    Same silent-degradation class as the invalid-severity case above, reached via
+    a different exception type: these all parse cleanly at ``json.loads``, then
+    die on ``data.get(...)`` with an ``AttributeError`` — which was NOT in
+    _parse_verdict's caught tuple, so it escaped to review_run's broad
+    ``except Exception`` and the run returned None with no verdict, no halt and
+    no signal.
+
+    Every shape here is plausible output from a schema-less SDK provider asked
+    for JSON (list-wrapping is a routine LLM habit), and the ``anthropic`` /
+    ``openai`` branches have no ``--json-schema`` mechanism to prevent it.  The
+    ``claude_cli`` provider classifies the same condition as
+    cli_output_unparseable infra in _call_judge_cli and never reaches here.
+    """
+    judge = Judge(config=_make_judge_config(), journal=mock_journal)
+
+    verdict = judge._parse_verdict(response, 'run-nonobj')
+
+    assert verdict.severity == VerdictSeverity.serious
+    assert len(verdict.findings) == 1
+    assert verdict.findings[0].get('code') == 'unparseable_judge_response'
+
+
 def test_parse_verdict_accepts_structured_payload_dict(mock_journal):
     """_parse_verdict accepts an already-structured payload dict and skips text parsing.
 
@@ -1513,6 +1544,65 @@ class TestCallJudgeCliTaxonomy:
             new=AsyncMock(side_effect=AllAccountsCappedException(3, 1800.0, 'judge')),
         ), pytest.raises(JudgeInfraError):
             await judge._call_judge_cli('prompt')
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('subtype', ['error_max_turns', 'error_empty_output'])
+    async def test_schema_tool_denied_gets_its_own_code(self, subtype):
+        """(f) A blocked ``StructuredOutput`` tool is a systemic config break with
+        its own machine-readable code, not an anonymous UNKNOWN failure.
+
+        ``--json-schema`` rides the synthetic ``StructuredOutput`` tool, which
+        cli_invoke's wildcard expansion deliberately omits from
+        ``_REAL_BUILTIN_TOOLS_DENYLIST``.  If a future CLI change starts denying
+        it, EVERY judge run is starved of its verdict — the deny-list needs
+        fixing, and the log has to say so.  cli_invoke can only ever set
+        ``schema_tool_denied`` on a NON-success result (cli_invoke.py:1807 guards
+        on ``not is_success``), so the detection has to live on this branch;
+        checking it on the success branch is dead code.
+
+        The ``error_empty_output`` case is the ordering pin: a denial whose stdout
+        happens to be empty must NOT fall through to the benign ''
+        legacy contract.  Nothing was reviewed.
+        """
+        from shared.cli_invoke import AgentResult
+
+        from fused_memory.reconciliation.judge import JudgeInfraError
+
+        judge = self._judge()
+        result = AgentResult(
+            success=False,
+            output='',
+            subtype=subtype,
+            api_error_status=None,
+            timed_out=False,
+            schema_tool_denied=True,
+        )
+        with patch(
+            'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+            new=AsyncMock(return_value=result),
+        ), pytest.raises(JudgeInfraError) as exc_info:
+            await judge._call_judge_cli('prompt')
+        assert exc_info.value.code == 'cli_schema_tool_denied'
+        assert 'cli_schema_tool_denied' in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_ordinary_transport_failure_carries_no_code(self):
+        """(g) The new code is SPECIFIC: an ordinary transport failure keeps the
+        generic build_failure_message dump and a ``code`` of None, so
+        _handle_infra_failure's log can tell a deny-list break apart from a
+        run-of-the-mill api_error."""
+        from shared.cli_invoke import AgentResult
+
+        from fused_memory.reconciliation.judge import JudgeInfraError
+
+        judge = self._judge()
+        result = AgentResult(success=False, output='', api_error_status=429)
+        with patch(
+            'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+            new=AsyncMock(return_value=result),
+        ), pytest.raises(JudgeInfraError) as exc_info:
+            await judge._call_judge_cli('prompt')
+        assert exc_info.value.code is None
 
 
 # ─────────────────────────────────────────────────────────────────────
