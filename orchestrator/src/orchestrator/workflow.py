@@ -101,6 +101,7 @@ from orchestrator.scheduler import (
 from orchestrator.session_registry import build_session_slug
 from orchestrator.stranded_verified_green import (
     last_verified_green_tip,
+    merge_request_marker_is_fresh,
     submit_verified_green_merge_request,
 )
 from orchestrator.task_status import (
@@ -5970,6 +5971,36 @@ class TaskWorkflow:
                 {'tip': tip, 'tree_hash': tree_hash,
                  'cached_verdict': cached},
             )
+
+        # INV-4 storm-escape: a re-invoked architect on the SAME tip must not
+        # pile a second request onto the branch.  The durable marker key is
+        # deliberately distinct from the stranded reaper's
+        # `stranded_merge_request` so the two submit paths never clobber each
+        # other.  Fail-safe, mirroring the reaper: a malformed / stale /
+        # tip-mismatched marker falls through to a fresh submit rather than a
+        # wedged skip — a lost marker must never permanently strand the task.
+        marker = (self.task.get('metadata') or {}).get('architect_merge_request')
+        if merge_request_marker_is_fresh(marker, tip):
+            logger.info(
+                'Task %s: architect-desync merge already submitted for tip %s '
+                '— skipping re-submit (merge presumed in-flight; task stays '
+                'blocked)',
+                self.task_id, tip[:12],
+            )
+            if self.event_store:
+                self.event_store.emit(
+                    EventType.architect_desync_merge,
+                    task_id=self.task_id,
+                    phase='plan',
+                    data={
+                        'decision': 'duplicate',
+                        'tip': tip,
+                        'main_sha': main_sha,
+                        'marker': marker,
+                    },
+                )
+            self._enter_phase(WorkflowState.BLOCKED)
+            return WorkflowOutcome.BLOCKED
 
         logger.info(
             'Task %s: architect reported merge-landing desync at %s — '
