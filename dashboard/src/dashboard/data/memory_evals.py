@@ -12,9 +12,11 @@ M3 escalation contract) and ``docs/prds/memory-eval-dashboard.md``.
 reader.  The artifact series on disk is the published contract; importing the
 producer would couple the dashboard to the producer's in-memory objects and
 invite a second implementation of what the producer already decided.  For the
-same reason there is **no statistics of any kind** here: no ``math.comb``, no
-``math.lgamma``, no p-value, no threshold.  Verdicts are *read*, never
-re-derived (INV-1: same file the evaluator read).
+same reason there is **no statistics of any kind** here: the evaluator's
+stdlib stats surface is not imported, and neither p-values nor thresholds are
+computed.  Verdicts are *read*, never re-derived (INV-1: same file the
+evaluator read).  ``TestCommittedExemplarBoundary`` enforces this over the
+AST — the module imports no ``statistics`` and no stats surface at all.
 
 **Loud, never silent (DD6/INV-2).**  Every artifact this reader cannot use is
 recorded in the payload's structured ``issues`` list — named, with its
