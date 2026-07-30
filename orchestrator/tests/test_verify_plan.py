@@ -1533,3 +1533,127 @@ class TestReverseDependentTestTargets:
         )
 
         assert result == [('escalation', ['escalation/tests/test_server.py'])]
+
+
+# ---------------------------------------------------------------------------
+# PlannedRun.scoped_targets: the D3 plan record's scoping provenance (task 3219)
+# ---------------------------------------------------------------------------
+
+# The single-clause counterpart of _MODULE_LINT_COMMANDS' chained shape — the
+# UNIFORMITY control for test_unchained_lint_records_the_same_scoped_targets.
+# Nothing in the live configs looks like this today (every subproject chains a
+# sibling checker), which is exactly why the chained path's record loss went
+# unnoticed: the pre-3219 fixtures were all single-clause.
+_UNCHAINED_LINT_COMMAND = 'uv run --project fused-memory --directory fused-memory ruff check src/ tests/'
+
+_FM_TEST_FILE = 'fused-memory/tests/test_harness.py'
+
+
+class TestPlanRecordScopedTargets:
+    """PlannedRun.scoped_targets records WHICH files a FILE_SCOPED slot narrowed to.
+
+    Task 3219. ``cmd.targets`` cannot answer that question once ``cmd`` is
+    raw-retained, which is the shape the tail-preserving chained-lint accept
+    path (_scope_prefix_to_keyword) produces for EVERY subproject — each
+    one's lint_command chains a sibling checker. The scoping itself was and
+    remains correct; only the machine-readable record was lost.
+    """
+
+    def test_chained_lint_records_scoped_targets(self):
+        """HEADLINE: the chained shape is preserved verbatim AND now records its targets.
+
+        The first three assertions pin that this fix changes NOTHING about
+        what executes — the raw-retained tail-preserving shape, P3, and the
+        task-3061 sibling-checker preservation are all untouched. The last
+        two are the actual deliverable: the D3 record can now answer "which
+        files was this scoped to?".
+        """
+        mc = ModuleConfig(prefix='fused-memory', lint_command=_FM_LINT_COMMAND)
+        plan = derive_verify_plan([_FM_TEST_FILE], [mc], None, fake_worktree_reader)
+        run = _run_for(plan, 'fused-memory', 'lint:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FILE_SCOPED
+
+        # Execution shape UNCHANGED: raw-retained, structured targets empty (P3).
+        assert run.cmd is not None
+        assert run.cmd.raw is not None
+        assert run.cmd.targets == ()
+        # task-3061 regression guard: the sibling checker survives unscoped.
+        assert 'check_bare_magicmock_config.py fused-memory/tests' in run.cmd.raw
+        # ...and the narrowed list is still in the rendered string, as before.
+        assert _FM_TEST_FILE in run.cmd.raw
+
+        # The record that was previously lost.
+        assert run.scoped_targets == (_FM_TEST_FILE,)
+        assert run.to_dict()['scoped_targets'] == [_FM_TEST_FILE]
+
+    def test_unchained_lint_records_the_same_scoped_targets(self):
+        """UNIFORMITY: the record reads identically whether or not the config chained.
+
+        Populating only the lossy path would leave consumers with a
+        conditional contract ("read cmd.targets, unless cmd.raw is set") —
+        the same implicit coupling that produced this bug. Here cmd.targets
+        IS populated, and the two must agree: redundancy as a consistency
+        check, not a second source of truth.
+        """
+        mc = ModuleConfig(prefix='fused-memory', lint_command=_UNCHAINED_LINT_COMMAND)
+        plan = derive_verify_plan([_FM_TEST_FILE], [mc], None, fake_worktree_reader)
+        run = _run_for(plan, 'fused-memory', 'lint:')
+        assert run is not None
+        assert run.scope_kind is ScopeKind.FILE_SCOPED
+        assert run.cmd is not None
+        assert run.cmd.raw is None  # structured path — the control
+        assert run.cmd.targets  # non-empty
+        assert run.scoped_targets == tuple(run.cmd.targets)
+
+    def test_file_scoped_pyright_and_pytest_slots_record_scoped_targets(self):
+        """The other two FILE_SCOPED sites in _derive_module_runs.
+
+        pyright records the full touched-.py list (``scoped``); pytest
+        records only the collectable tests — the two legitimately DIFFER, so
+        one shared field per run, not one per plan, is the right shape.
+        """
+        source_file = 'orchestrator/src/orchestrator/some_module.py'
+        test_file = 'orchestrator/tests/test_x.py'
+        mc = ModuleConfig(
+            prefix='orchestrator',
+            type_check_command=_MODULE_LINT_COMMANDS['orchestrator'].replace(
+                'ruff check', 'npx pyright',
+            ),
+            test_command='uv run pytest tests/ --timeout=300',
+        )
+        plan = derive_verify_plan(
+            [source_file, test_file], [mc], None, fake_worktree_reader,
+        )
+
+        pyright_run = _run_for(plan, 'orchestrator', 'pyright:')
+        assert pyright_run is not None
+        assert pyright_run.scope_kind is ScopeKind.FILE_SCOPED
+        assert set(pyright_run.scoped_targets) == {source_file, test_file}
+
+        pytest_run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert pytest_run is not None
+        assert pytest_run.scope_kind is ScopeKind.FILE_SCOPED
+        assert pytest_run.scoped_targets == (test_file,)
+
+        # The two slots' records legitimately differ — the point of the assertion.
+        assert set(pyright_run.scoped_targets) != set(pytest_run.scoped_targets)
+
+    def test_full_suite_and_skipped_runs_record_no_scoped_targets(self):
+        """The negative half of the invariant: empty is CORRECT, and meaningful.
+
+        FULL_SUITE was deliberately not narrowed (D1: a conftest widens
+        pytest to the whole suite); a SKIPPED slot never ran at all.
+        """
+        mc = ModuleConfig(prefix='orchestrator', test_command='uv run pytest tests/ --timeout=300')
+        plan = derive_verify_plan(ROOT_CONFTEST_DIFF, [mc], None, fake_worktree_reader)
+
+        pytest_run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert pytest_run is not None
+        assert pytest_run.scope_kind is ScopeKind.FULL_SUITE
+        assert pytest_run.scoped_targets == ()
+
+        lint_run = _run_for(plan, 'orchestrator', 'lint:')
+        assert lint_run is not None
+        assert lint_run.scope_kind is ScopeKind.SKIPPED
+        assert lint_run.scoped_targets == ()
