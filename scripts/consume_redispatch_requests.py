@@ -59,6 +59,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import urllib.error
 import urllib.request
 import uuid
@@ -102,6 +103,17 @@ _REQUEST_NAME_RE = re.compile(
 )
 
 _REQUIRED_FIELDS = ('schema_version', 'task_id', 'class', 'verdict', 'action')
+
+
+def log(message: str) -> None:
+    """Emit one greppable line to stderr.
+
+    Everything this consumer decides -- every skip, every apply, every failure
+    -- is REPORTED. A request that is silently dropped is indistinguishable
+    from one that was never emitted, which is exactly the confusion the
+    loud-over-silent-degradation invariant exists to prevent.
+    """
+    print(f'consume_redispatch_requests: {message}', file=sys.stderr, flush=True)
 
 
 @dataclass
@@ -496,3 +508,106 @@ def confirm_request(client, req: Request, project_root: str):
         detail = row.get('error') if isinstance(row, dict) else row
         return None, f'get_task returned no usable row: {detail!r}'
     return row, guard_row(req, row)
+
+
+# ── applying a confirmed request ────────────────────────────────────────────
+
+
+def rejection_reason(response) -> str | None:
+    """Return a rejection description embedded in *response*, or None.
+
+    fused-memory answers its gates (terminal-exit, phantom-done,
+    done_provenance validation) with a 200 carrying a structured error rather
+    than raising -- so the absence of an exception is NOT evidence that a write
+    landed. Mirrors ``orchestrator.scheduler.extract_rejection``, minus the
+    envelope-unwrapping it does, since :meth:`McpClient.call_tool` has already
+    unwrapped ``result.structuredContent`` by the time we see the payload.
+
+    A no-op (``success: True, no_op: True``, returned for a same-status write)
+    is a SUCCESS, not a rejection.
+    """
+    if not isinstance(response, dict):
+        return None
+    if response.get('error'):
+        hint = response.get('hint') or response.get('error_type') or ''
+        return f'{response["error"]}{" — " + hint if hint else ""}'
+    if response.get('success') is False:
+        return f'success=False payload={response!r}'
+    return None
+
+
+def _checked(response, what: str) -> None:
+    """Raise unless *response* shows the write actually landed."""
+    reason = rejection_reason(response)
+    if reason is not None:
+        raise RuntimeError(f'{what} rejected: {reason}')
+
+
+def _apply_close(client, req: Request, project_root: str) -> None:
+    """class A / gate_closure: the gate is already satisfied, so retire the row."""
+    _checked(
+        client.set_task_status(req.task_id, 'cancelled', project_root),
+        f'set_task_status({req.task_id}, cancelled)',
+    )
+
+
+def _apply_repend(client, req: Request, project_root: str) -> None:
+    """classes B and C: return the row to the dispatchable pool.
+
+    ORDERING IS LOAD-BEARING, and is carried verbatim from the orchestrator's
+    own stranded-blocked re-dispatch path
+    (orchestrator/src/orchestrator/scheduler.py:5726-5736): clear the stale
+    claimant BEFORE the status flip. The row is still `blocked`/`in-progress`
+    here -- not yet dispatch-contestable -- so nothing should be racing a fresh
+    claimant stamp. Clearing first means a concurrent orchestrator that
+    dispatches into this task right after it goes `pending` can never have its
+    fresh stamp clobbered by a late-landing clear.
+
+    Unlike the scheduler's best-effort call, a rejected clear ABORTS here: this
+    consumer's whole warrant is that the row is quiescent, and flipping to
+    `pending` while a stale claimant is still stamped would hand a dispatcher a
+    row that reads as live.
+    """
+    _checked(
+        client.set_task_claimant(req.task_id, project_root,
+                                 claimant_run_id=None, heartbeat_at=None),
+        f'set_task_claimant({req.task_id}, clear)',
+    )
+    _checked(
+        client.set_task_status(req.task_id, 'pending', project_root),
+        f'set_task_status({req.task_id}, pending)',
+    )
+
+
+# The dispatch table. `reverify` and `redispatch` differ in WHY the sweep
+# emitted them (a merge-verify red that main has since moved past, vs a
+# dependency roll-up that is now satisfied), not in what the write must do:
+# both return the row to the dispatchable pool. Keeping them as separate keys
+# rather than collapsing them preserves the distinction the request carries,
+# so the journal line names the class that was actually adjudicated.
+ACTION_APPLIERS = {
+    'close': _apply_close,
+    'reverify': _apply_repend,
+    'redispatch': _apply_repend,
+}
+
+
+def apply_request(client, req: Request, project_root: str) -> bool:
+    """Perform *req*'s writes. Returns True only if every write LANDED.
+
+    Never raises: a per-request failure is contained and reported so its
+    siblings still get their chance. The outcome is definite -- checked against
+    each tool response, not assumed from the absence of an exception -- because
+    a request counted as applied is a request that gets archived and never
+    retried.
+    """
+    applier = ACTION_APPLIERS.get(req.action)
+    if applier is None:
+        log(f'task {req.task_id}: no applier for action {req.action!r} — not applied')
+        return False
+    try:
+        applier(client, req, project_root)
+    except Exception as exc:
+        log(f'task {req.task_id}: {req.action} FAILED: {type(exc).__name__}: {exc}')
+        return False
+    return True
