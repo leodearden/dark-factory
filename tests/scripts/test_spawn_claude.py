@@ -434,11 +434,12 @@ def test_no_emulator_found_yields_126_ignores_ambient_spawn_backend(
     passes today despite taking the wrong branch. This test asserts on
     stderr content instead.
 
-    RED today: this test's own `dict(os.environ)` -- mirroring
-    test_no_emulator_found_yields_126's current construction below -- passes
-    the ambient CLAUDE_SPAWN_BACKEND straight through, so the run takes the
-    tmux branch and stderr says "tmux not found" instead of "no terminal
-    emulator found".
+    RED before this file's own _hermetic_environ() fix: a raw
+    `dict(os.environ)` (this test's own construction, mirroring
+    test_no_emulator_found_yields_126 and test_tmux_backend_missing_tmux_
+    yields_126 below) passes the ambient CLAUDE_SPAWN_BACKEND straight
+    through, so the run takes the tmux branch and stderr says "tmux not
+    found" instead of "no terminal emulator found".
     """
     import shutil as _shutil
 
@@ -457,10 +458,9 @@ def test_no_emulator_found_yields_126_ignores_ambient_spawn_backend(
         if src:
             (sys_bin / util).symlink_to(src)
 
-    env = dict(os.environ)
+    env = _hermetic_environ()
     env["PATH"] = str(bin_dir) + ":" + str(sys_bin)
     env.pop("CLAUDE_TERMINAL_CMD", None)
-    env.pop("ESCALATION_TERMINAL_CMD", None)
 
     result = _run_spawn(env, tmp_path, timeout=10)
     stderr = result.stderr.decode()
@@ -672,10 +672,9 @@ def test_no_emulator_found_yields_126(tmp_path: pathlib.Path) -> None:
         if src:
             (sys_bin / util).symlink_to(src)
 
-    env = dict(os.environ)
+    env = _hermetic_environ()
     env["PATH"] = str(bin_dir) + ":" + str(sys_bin)
     env.pop("CLAUDE_TERMINAL_CMD", None)
-    env.pop("ESCALATION_TERMINAL_CMD", None)
 
     result = _run_spawn(env, tmp_path, timeout=10)
     assert result.returncode == 126, (
@@ -2095,12 +2094,11 @@ def test_tmux_backend_missing_tmux_yields_126(tmp_path: pathlib.Path) -> None:
         if src:
             (sys_bin / util).symlink_to(src)
 
-    env = dict(os.environ)
+    env = _hermetic_environ()
     env["PATH"] = str(bin_dir) + ":" + str(sys_bin)
     env["CLAUDE_SPAWN_BACKEND"] = "tmux"
     env["SPAWN_LAUNCH_GRACE_SECS"] = "2"
     env.pop("CLAUDE_TERMINAL_CMD", None)
-    env.pop("ESCALATION_TERMINAL_CMD", None)
 
     result = _run_spawn(env, tmp_path, timeout=10)
     assert result.returncode == 126, (
