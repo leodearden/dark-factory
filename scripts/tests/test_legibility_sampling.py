@@ -703,6 +703,122 @@ class TestStratifiedSampleCostSeam:
         assert set(costed) == set(self._COSTS)
 
 
+class TestDigestByteCostFn:
+    """``digest_byte_cost_fn`` is the production cost basis: what a record
+    will ACTUALLY cost the daily budget is the size of the digest it renders
+    to, so the factory renders it and charges the real bytes.
+
+    The charge must be computed with the same ``max_bytes`` the nightly
+    pipeline will later render with, so ``SampleResult.bytes_used``
+    describes the digests that get produced rather than a parallel estimate
+    that can drift from them.
+    """
+
+    def _record(self, size_bytes=6_000_000):
+        return _scored(
+            'cost-sess', 'orchestrated-task', mod.SignalCounts(tool_error=7),
+            'orchestrated task session alpha', size_bytes,
+        )
+
+    def test_charges_utf8_byte_length_not_character_count(self):
+        # 'é' is one character but two UTF-8 bytes — the budget is a BYTE
+        # budget, so len(str) would silently under-charge every digest that
+        # quotes a non-ASCII transcript.
+        rendered = 'digest with a multibyte char: é'
+        assert len(rendered.encode('utf-8')) != len(rendered)
+
+        cost = mod.digest_byte_cost_fn(max_bytes=15360, build=lambda *a, **k: rendered)
+        assert cost(self._record()) == len(rendered.encode('utf-8'))
+
+    def test_build_is_called_with_the_records_stratum_and_the_factorys_max_bytes(self):
+        calls = []
+
+        def fake_build(path, **kwargs):
+            calls.append((path, kwargs))
+            return 'x' * 100
+
+        record = self._record()
+        mod.digest_byte_cost_fn(max_bytes=9_999, build=fake_build)(record)
+
+        assert calls == [(
+            record.path,
+            {'agent_class_override': 'orchestrated-task', 'max_bytes': 9_999},
+        )]
+
+    def test_memoizes_by_path(self):
+        calls = []
+
+        def fake_build(path, **kwargs):
+            calls.append(path)
+            return 'y' * 50
+
+        cost = mod.digest_byte_cost_fn(max_bytes=15360, build=fake_build)
+        record = self._record()
+        assert cost(record) == 50
+        assert cost(record) == 50
+        assert len(calls) == 1
+
+    def test_build_failure_degrades_to_the_flat_estimate_and_warns(self, caplog):
+        def exploding_build(path, **kwargs):
+            raise RuntimeError('transcript unreadable')
+
+        cost = mod.digest_byte_cost_fn(max_bytes=15360, build=exploding_build)
+        record = self._record()
+
+        with caplog.at_level('WARNING'):
+            charged = cost(record)
+
+        # Degrades to the conservative flat estimate rather than propagating:
+        # the record still reaches nightly.build_digests, which raises again
+        # and routes the failure through the EXISTING structured
+        # extractor_failures -> escalation channel (PRD decision 8). A bare
+        # traceback out of the sampler would kill the whole night's run.
+        assert charged == 15360
+        assert 'cost-sess' in caplog.text
+        assert 'transcript unreadable' in caplog.text
+
+    def test_default_build_renders_a_real_transcript(self, tmp_path):
+        from legibility import digest as digest_mod
+
+        path = _write_transcript(
+            tmp_path / 'real-sess.jsonl',
+            [
+                {
+                    'type': 'user', 'isSidechain': False, 'isMeta': False,
+                    'cwd': MAIN_CWD, 'timestamp': '2026-07-13T09:00:00.000Z',
+                    'message': {'content': 'Please help with the thing'},
+                },
+                _tool_error_record(),
+            ],
+        )
+        session = inventory.SessionRecord(
+            path=path, encoded_dir='-home-leo-src-dark-factory', cwd=MAIN_CWD,
+            date=dt_date(2026, 7, 13), size_bytes=path.stat().st_size,
+        )
+        record = mod.ScoredRecord(
+            session=session, stratum='interactive',
+            counts=mod.SignalCounts(tool_error=1), first_turn_text='Please help with the thing',
+        )
+
+        expected = len(
+            digest_mod.build_digest(
+                path, agent_class_override='interactive', max_bytes=15360,
+            ).encode('utf-8')
+        )
+        assert mod.digest_byte_cost_fn(max_bytes=15360)(record) == expected
+        assert expected > 0
+
+    def test_max_bytes_defaults_to_the_module_constant(self):
+        calls = []
+
+        def fake_build(path, **kwargs):
+            calls.append(kwargs['max_bytes'])
+            return 'z'
+
+        mod.digest_byte_cost_fn(build=fake_build)(self._record())
+        assert calls == [mod.DEFAULT_DIGEST_MAX_BYTES]
+
+
 class TestRenderManifest:
     def test_emits_one_json_object_per_line(self):
         records = [
