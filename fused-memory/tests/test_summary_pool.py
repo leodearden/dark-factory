@@ -15,7 +15,7 @@ core is generic and not accidentally hardcoded to the Stage 2 pool.
 
 import json
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -25,10 +25,18 @@ import pytest_asyncio
 
 from fused_memory.models.reconciliation import StageId, StageReport
 from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
+from fused_memory.reconciliation.recon_pool_map import STAGE1_CYCLE_SUMMARY_RECON_POOL
+from fused_memory.reconciliation.stages.memory_consolidator import (
+    STAGE1_CYCLE_SUMMARY_POOL_CAP,
+)
+from fused_memory.reconciliation.stages.task_knowledge_sync import (
+    _sweep_stale_mem0_flag_markers,
+)
 from fused_memory.reconciliation.summary_pool import (
     enforce_summary_pool_cap,
     write_cycle_summary,
 )
+from fused_memory.services.memory_service import _apply_cycle_summary_metadata_tagging
 
 _LOGGER = 'fused_memory.reconciliation.summary_pool'
 
@@ -1090,3 +1098,313 @@ class TestEnforceSummaryPoolCapTombstones:
 
         assert result == 0
         tombstone.assert_not_awaited()
+
+
+class _StatefulMem0Pool:
+    """A dict-backed stand-in for the Mem0 half of MemoryService.
+
+    Stateful where the per-test AsyncMock fakes above are not: writes land,
+    deletes actually remove, and enumeration answers from live state. That is
+    what makes a multi-CYCLE assertion possible at all — the interesting
+    failure (a fresh mirror evicting an older one, cycle after cycle) only
+    exists across successive calls, so a fake that returns a fixed member list
+    cannot express it.
+
+    Fidelity choices that matter:
+
+    * ``add_system_record``/``add_memory`` both run the REAL
+      ``_apply_cycle_summary_metadata_tagging``, so the recon_pool auto-tag
+      from ``metadata.stage`` is production behaviour rather than a guess.
+      This is exactly how an LLM-authored narrative ends up competing for the
+      same cap-2 pool slots as the deterministic ledger_stamp mirror.
+    * ``created_at`` is injected monotonically (one minute apart) so eviction
+      order is deterministic without wall-clock sleeps.
+    * ``get_memories_by_metadata`` matches ALL filter keys, mirroring Qdrant
+      payload-filter AND semantics — a member missing a filtered key does not
+      match.
+    """
+
+    def __init__(self, recon_ledger):
+        self.recon_ledger = recon_ledger
+        self.records: dict[str, dict[str, Any]] = {}
+        self.deletions: list[tuple[str, str]] = [] # (memory_id, _source)
+        self._seq = 0
+
+    # -- writes ----------------------------------------------------------
+    def plant(self, memory_id: str, metadata: dict, created_at: str) -> None:
+        """Insert a record directly, bypassing the tagging path.
+
+        Used for decoys and for aged members whose created_at must predate the
+        soak (the write path stamps a fresh monotonic timestamp).
+        """
+        self.records[memory_id] = {
+            'id': memory_id,
+            'created_at': created_at,
+            'metadata': dict(metadata),
+        }
+
+    def _insert(self, metadata: dict, causation_id, project_id: str) -> str:
+        meta = dict(metadata or {})
+        _apply_cycle_summary_metadata_tagging(meta, causation_id, project_id=project_id)
+        self._seq += 1
+        memory_id = f'mem-{self._seq:03d}'
+        self.records[memory_id] = {
+            'id': memory_id,
+            'created_at': datetime(2026, 7, 20, 0, self._seq, tzinfo=UTC).isoformat(),
+            'metadata': meta,
+        }
+        return memory_id
+
+    async def add_system_record(self, *, metadata=None, project_id, causation_id=None, **_):
+        return SimpleNamespace(
+            memory_ids=[self._insert(metadata or {}, causation_id, project_id)]
+        )
+
+    async def add_memory(self, *, metadata=None, project_id, causation_id=None, **_):
+        return SimpleNamespace(
+            memory_ids=[self._insert(metadata or {}, causation_id, project_id)]
+        )
+
+    # -- reads/deletes ---------------------------------------------------
+    async def get_memories_by_metadata(self, *, project_id, filters, **_):
+        return [
+            dict(record)
+            for record in self.records.values()
+            if all(record['metadata'].get(key) == value for key, value in filters.items())
+        ]
+
+    async def delete_memory(self, *, memory_id, store=None, project_id=None, causation_id=None, _source=''):
+        self.records.pop(memory_id, None)
+        self.deletions.append((memory_id, _source))
+
+    # -- assertions helpers ----------------------------------------------
+    def ids_in_pool(self, recon_pool: str, record_type: str | None = None) -> set[str]:
+        return {
+            mid
+            for mid, record in self.records.items()
+            if record['metadata'].get('recon_pool') == recon_pool
+            and (record_type is None or record['metadata'].get('record_type') == record_type)
+        }
+
+
+class TestMultiCycleSummaryPoolSoak:
+    """ACCEPTANCE CRITERION (3): drive the real write path for many cycles and
+    prove the two properties the recon-gate-165 finding actually needed.
+
+    The finding reported three cycle_summary anchors for run 84eae9bd as
+    silently lost. They were evicted by the cap-2 mirror trim, working as
+    designed — the authoritative ledger rows survived. What was broken was
+    that a designed eviction was indistinguishable from data loss. So this
+    soak asserts, cycle after cycle:
+
+    * ZERO untombstoned deletions — every deletion that happens is queryable
+      afterwards by the victim's memory uuid, the only key an auditor has;
+    * the newest `cap` ledger_stamp mirrors survive, because a narrative must
+      never evict a ledger_stamp (that co-eviction is why all three of run
+      84eae9bd's anchors vanished together);
+    * planted decoys from adjacent pools are never touched;
+    * the authoritative ledger row for EVERY run stays readable — the loss is
+      mirror-only, exactly as the finding observed.
+    """
+
+    @pytest_asyncio.fixture
+    async def ledger_store(self, tmp_path):
+        s = ReconLedgerStore(tmp_path / 'reconciliation.db')
+        await s.initialize()
+        yield s
+        await s.close()
+
+    def _report(self) -> StageReport:
+        return StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime(2026, 7, 10, 11, 0, 0, tzinfo=UTC),
+            completed_at=datetime(2026, 7, 10, 11, 5, 0, tzinfo=UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=1,
+            tokens_used=10,
+        )
+
+    def _plant_decoys(self, pool: _StatefulMem0Pool) -> dict[str, dict]:
+        """Records from adjacent pools that no summary trim may ever touch."""
+        decoys = {
+            'decoy-flag-marker': {'source': 'stage1_flag_marker'},
+            'decoy-flag-for-stage2': {'flag_for_stage2': True},
+            'decoy-other-stage': {
+                'kind': 'cycle_summary',
+                'recon_pool': 'stage2_cycle_summary',
+                'record_type': 'ledger_stamp',
+            },
+            # Mis-tagged with THIS pool's name but not a cycle_summary.
+            # Reachable because _apply_cycle_summary_metadata_tagging is
+            # additive-only and never strips a caller-supplied recon_pool, so
+            # only the enumeration's `kind` constraint keeps this out of the
+            # cap-2 pool — where it would otherwise be trimmed, or evict a
+            # real mirror.
+            'decoy-mistagged-pool': {
+                'kind': 'task_count_snapshot',
+                'recon_pool': STAGE1_CYCLE_SUMMARY_RECON_POOL,
+            },
+        }
+        for memory_id, metadata in decoys.items():
+            pool.plant(memory_id, metadata, '2026-01-01T00:00:00+00:00')
+        return decoys
+
+    @pytest.mark.asyncio
+    async def test_six_cycles_leave_no_untombstoned_deletion(self, ledger_store):
+        """Six real write_cycle_summary cycles with narratives interleaved."""
+        pool = _StatefulMem0Pool(ledger_store)
+        decoys = self._plant_decoys(pool)
+        run_ids = [f'run-{n}' for n in range(1, 7)]
+        seen_deletions = 0
+
+        for cycle, run_id in enumerate(run_ids, start=1):
+            await write_cycle_summary(
+                pool,
+                'dark_factory',
+                self._report(),
+                run_id,
+                stage='memory_consolidator',
+                recon_pool=STAGE1_CYCLE_SUMMARY_RECON_POOL,
+                trim_source='stage1_cycle_summary_trim',
+                cap=STAGE1_CYCLE_SUMMARY_POOL_CAP,
+            )
+            if cycle in (2, 4):
+                # An LLM-style narrative write (prompts/stage2.py's shape).
+                # _apply_cycle_summary_metadata_tagging stamps it into the SAME
+                # cap-2 pool from metadata.stage, so it competes for the same
+                # two slots as the deterministic mirrors.
+                await pool.add_memory(
+                    project_id='dark_factory',
+                    causation_id=run_id,
+                    metadata={
+                        'kind': 'cycle_summary',
+                        'stage': 'memory_consolidator',
+                        'record_type': 'narrative',
+                    },
+                )
+
+            # (a) the newest `cap` ledger_stamp mirrors are present.
+            stamps = pool.ids_in_pool(STAGE1_CYCLE_SUMMARY_RECON_POOL, 'ledger_stamp')
+            assert len(stamps) == min(cycle, STAGE1_CYCLE_SUMMARY_POOL_CAP), (
+                f'cycle {cycle}: expected the newest {STAGE1_CYCLE_SUMMARY_POOL_CAP} '
+                f'ledger_stamp mirrors, got {stamps!r}'
+            )
+
+            # (b) EVERY deletion so far has a tombstone naming the trim source
+            # and the DELETING run. Zero untombstoned deletions, ever.
+            assert len(pool.deletions) >= seen_deletions
+            seen_deletions = len(pool.deletions)
+            for memory_id, source in pool.deletions:
+                row = await ledger_store.get_mem0_tombstone('dark_factory', memory_id)
+                assert row is not None, (
+                    f'cycle {cycle}: deletion of {memory_id} by {source} left NO tombstone — '
+                    'this is the exact undiscoverability the task exists to fix'
+                )
+                payload = json.loads(row.payload_json)
+                assert payload['deleter'] == source
+                assert payload['deleting_run_id'] in run_ids
+
+            # (c) no decoy was ever touched.
+            for decoy_id in decoys:
+                assert decoy_id in pool.records, (
+                    f'cycle {cycle}: decoy {decoy_id} was deleted by a summary trim'
+                )
+
+        # The trim must actually have fired — otherwise (b) is vacuous.
+        assert pool.deletions, 'no eviction occurred across six cycles; soak is vacuous'
+
+        # (d) the AUTHORITATIVE ledger row for every run survives. The loss is
+        # mirror-only, exactly as recon gate 165 observed via
+        # get_cycle_summary_presence(present=true) on already-evicted mirrors.
+        for run_id in run_ids:
+            row = await ledger_store.get_by_identity(
+                'dark_factory',
+                'cycle_summary',
+                task_id='',
+                flag_type='memory_consolidator',
+                run_id=run_id,
+            )
+            assert row is not None, f'authoritative cycle_summary row for {run_id} is gone'
+
+    @pytest.mark.asyncio
+    async def test_narratives_are_evicted_before_ledger_stamps(self, ledger_store):
+        """Across the soak, every narrative goes before any ledger_stamp does.
+
+        Run 84eae9bd lost its Stage 1 narrative, Stage 1 ledger_stamp and
+        Stage 2 ledger_stamp together. Record_type-aware eviction is what stops
+        the disposable LLM copy from taking the auditable one with it.
+        """
+        pool = _StatefulMem0Pool(ledger_store)
+        for cycle, run_id in enumerate([f'run-{n}' for n in range(1, 7)], start=1):
+            await write_cycle_summary(
+                pool,
+                'dark_factory',
+                self._report(),
+                run_id,
+                stage='memory_consolidator',
+                recon_pool=STAGE1_CYCLE_SUMMARY_RECON_POOL,
+                trim_source='stage1_cycle_summary_trim',
+                cap=STAGE1_CYCLE_SUMMARY_POOL_CAP,
+            )
+            if cycle in (2, 4):
+                await pool.add_memory(
+                    project_id='dark_factory',
+                    causation_id=run_id,
+                    metadata={
+                        'kind': 'cycle_summary',
+                        'stage': 'memory_consolidator',
+                        'record_type': 'narrative',
+                    },
+                )
+
+        # No narrative survives a cap-2 pool that keeps being fed ledger_stamps,
+        # and the surviving members are exactly the newest ledger_stamps.
+        assert pool.ids_in_pool(STAGE1_CYCLE_SUMMARY_RECON_POOL, 'narrative') == set()
+        survivors = pool.ids_in_pool(STAGE1_CYCLE_SUMMARY_RECON_POOL)
+        assert survivors == pool.ids_in_pool(STAGE1_CYCLE_SUMMARY_RECON_POOL, 'ledger_stamp')
+        assert len(survivors) == STAGE1_CYCLE_SUMMARY_POOL_CAP
+
+    @pytest.mark.asyncio
+    async def test_marker_sweep_reaps_markers_with_tombstones_and_spares_mirrors(
+        self, ledger_store
+    ):
+        """The other implicated path: the 14-day stage1_flag_marker age GC.
+
+        A planted 20-day-old marker is reaped WITH a tombstone; a planted
+        20-day-old ledger_stamp mirror carrying the same source tag is never
+        touched, no matter how loose the sweep's payload filter is.
+        """
+        pool = _StatefulMem0Pool(ledger_store)
+        now = datetime(2026, 7, 30, tzinfo=UTC)
+        aged = (now - timedelta(days=20)).isoformat()
+        pool.plant('marker-old', {'source': 'stage1_flag_marker'}, aged)
+        pool.plant(
+            'mirror-old',
+            {
+                'source': 'stage1_flag_marker', # matches the sweep's filter...
+                'kind': 'cycle_summary', # ...but is a protected mirror
+                'record_type': 'ledger_stamp',
+                'run_id': '84eae9bd',
+            },
+            aged,
+        )
+
+        for run_id in ('sweep-1', 'sweep-2', 'sweep-3'):
+            await _sweep_stale_mem0_flag_markers(
+                pool, 'dark_factory', run_id, max_age_days=14, now=now
+            )
+
+        assert 'marker-old' not in pool.records, 'the aged marker should have been reaped'
+        assert 'mirror-old' in pool.records, (
+            'an over-broad marker filter must degrade to a loud skip, never take a mirror'
+        )
+
+        row = await ledger_store.get_mem0_tombstone('dark_factory', 'marker-old')
+        assert row is not None, 'the reaped marker left no tombstone'
+        payload = json.loads(row.payload_json)
+        assert payload['deleter'] == 'stage1_flag_marker_gc_sweep'
+        assert payload['deleting_run_id'] == 'sweep-1' # the run that took it
+        assert await ledger_store.get_mem0_tombstone('dark_factory', 'mirror-old') is None, (
+            'a surviving record must not be tombstoned — a tombstone means really gone'
+        )
