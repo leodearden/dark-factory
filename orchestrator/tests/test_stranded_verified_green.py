@@ -794,6 +794,109 @@ class TestVerifiedGreenVetoRelaxExistsOffMain:
         )
 
 
+_ADVANCED_SHA = 'ad' * 20  # 40-hex on-main landing SHA
+
+
+def _wire_on_main_mark_done(harness: Harness, tid: str, tmp_path: Path) -> None:
+    """Wire *harness* so *tid*'s blocked branch resolves ON_MAIN and the
+    found_on_main mark-done collaborators are satisfied.
+
+    Mirrors ``test_submit_then_land_marks_done_via_found_on_main``'s sweep-2
+    wiring: a bound MergeProvenance journal row is the authoritative ON_MAIN
+    signal, and mark_done forwards to set_task_status so the provenance is
+    assertable.
+    """
+    _bind_landed_row(tmp_path, task_id=tid, advanced_sha=_ADVANCED_SHA)
+
+    async def _fake_mark_done(t, *, kind, sha, note=None):
+        prov = {'kind': kind, 'commit': sha}
+        if note is not None:
+            prov['note'] = note
+        await harness.scheduler.set_task_status(t, 'done', done_provenance=prov)
+
+    harness.scheduler.mark_done = AsyncMock(side_effect=_fake_mark_done)  # type: ignore[attr-defined]
+    harness.git_ops.is_ancestor = AsyncMock(return_value=False)
+    harness.git_ops.find_merge_marker = AsyncMock(return_value=None)
+    harness.git_ops.cleanup_worktree = AsyncMock()
+    harness.git_ops.release_lane_for_terminal_task = AsyncMock()
+    harness.git_ops.commit_effect_present_in_main = AsyncMock(return_value=True)
+    harness.git_ops.warm_lane_ref_is_degenerate = AsyncMock(return_value=False)
+    harness.scheduler.get_statuses = AsyncMock(  # type: ignore[attr-defined]
+        return_value=({tid: 'blocked'}, None),
+    )
+
+
+def _done_provenance(harness: Harness, tid: str) -> dict | None:
+    """The done_provenance the task was marked done with, or None if it wasn't."""
+    for call in harness.scheduler.set_task_status.await_args_list:  # type: ignore[attr-defined]
+        if tuple(call.args[:2]) == (tid, 'done'):
+            return call.kwargs.get('done_provenance')
+    return None
+
+
+@pytest.mark.asyncio
+class TestVerifiedGreenVetoRelaxOnMain:
+    """δ: a merge-remediable open escalation no longer vetoes the self-heal.
+
+    Boundary pair on the ON_MAIN sweep-side MARK_DONE_WITH_PROVENANCE upgrade —
+    the shape of a task whose branch LANDED while it was still blocked.  Case A:
+    the reaper's own ``stranded_blocked`` no longer holds the task blocked
+    forever after its branch landed.  Case B: a human-concern escalation still
+    vetoes, unchanged.
+    """
+
+    async def test_case_a_merge_remediable_esc_no_longer_vetoes_mark_done(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        tid = _TID
+        queue = EscalationQueue(tmp_path / 'esc_ma')
+        harness._escalation_queue = queue
+        harness._loop = asyncio.get_running_loop()
+        queue.set_resolve_callback(harness._on_escalation_resolved)
+        harness._escalation_events.clear()
+        harness._workflow_cancel_at.clear()
+        _wire_on_main_mark_done(harness, tid, tmp_path)
+        _seed_pending(queue, tid, 'stranded_blocked')
+
+        with patch(
+            'orchestrator.harness.detect_verified_green',
+            AsyncMock(return_value=None),
+        ):
+            await harness._reconcile_stranded_in_progress()
+        await asyncio.gather(*list(harness._background_tasks))
+
+        prov = _done_provenance(harness, tid)
+        assert prov is not None, 'landed branch must self-heal to done'
+        assert prov['kind'] == 'found_on_main'
+
+    async def test_case_b_human_concern_esc_still_vetoes_mark_done(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        """A design_concern is NOT merge-remediable → the task stays blocked."""
+        tid = _TID
+        queue = EscalationQueue(tmp_path / 'esc_mb')
+        harness._escalation_queue = queue
+        harness._loop = asyncio.get_running_loop()
+        queue.set_resolve_callback(harness._on_escalation_resolved)
+        harness._escalation_events.clear()
+        harness._workflow_cancel_at.clear()
+        _wire_on_main_mark_done(harness, tid, tmp_path)
+        seeded = _seed_pending(queue, tid, 'design_concern')
+
+        with patch(
+            'orchestrator.harness.detect_verified_green',
+            AsyncMock(return_value=None),
+        ):
+            await harness._reconcile_stranded_in_progress()
+        await asyncio.gather(*list(harness._background_tasks))
+
+        assert _done_provenance(harness, tid) is None, (
+            'a human-concern escalation must still hold the task'
+        )
+        pending = queue.get_by_task(tid, status='pending')
+        assert [e.id for e in pending] == [seeded]
+
+
 def _marker(*, tip: str = _TIP, request_id: str = 'mr-prev1234', age_s: float = 0.0) -> dict:
     """A ``stranded_merge_request`` metadata marker (step-16 race-guard).
 
