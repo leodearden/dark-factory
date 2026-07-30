@@ -987,15 +987,21 @@ def _iteration_entry_is_work(entry: dict) -> bool:
       ``steps_completed`` is non-empty (task 3033 / PRD §A1) — the entry
       ``_execute_iterations`` writes when every plan step was pre-satisfied at
       authoring time via ``mark_step_committed`` and EXECUTE ran zero
-      iterations. It IS real work: the branch genuinely carries the committed
-      implementation of every named step, and each pre-satisfied sha was
-      corroborated on-branch at authoring time by ``plan_tools``'
-      ``_sha_exists_on_branch`` reachability guard. Deliberately narrow — BOTH
-      the exact ``event`` name AND a non-empty ``steps_completed`` are required,
-      so a zero-work architect entry (or an architect entry with any other
-      event) can never resolve ``has_work=True``. The ``judge`` clause is the
-      direct precedent: an agent legitimately declaring the plan satisfied
-      without an implementer turn.
+      iterations. It IS real work, but NOT because of the authoring-time
+      guard: ``plan_tools._sha_exists_on_branch`` is ``git merge-base
+      --is-ancestor <sha> HEAD``, which accepts ``base_commit`` ITSELF and
+      arbitrary main ancestors below base, so it does NOT establish
+      beyond-base work (and ``update_step_status`` permits ``commit=None``
+      outright). The real basis is at the WRITER: ``_execute_iterations``
+      only ever emits this entry after confirming that every id it names
+      carries a commit that is a member of ``base_commit..HEAD`` at write
+      time, so a non-empty ``steps_completed`` is itself the evidence.
+      Deliberately narrow — BOTH the exact ``event`` name AND a non-empty
+      ``steps_completed`` are required, so a zero-work architect entry (or an
+      architect entry with any other event) can never resolve
+      ``has_work=True``. The ``judge`` clause is the direct precedent: an
+      agent legitimately declaring the plan satisfied without an implementer
+      turn.
 
     An entry that explicitly recorded no durable commit (``committed is False``,
     task 2759) is not prior-implementation work regardless of agent type — the
@@ -6466,6 +6472,42 @@ class TaskWorkflow:
             done_step_ids = [
                 str(s.get('id')) for s in items if s.get('status') == 'done'
             ]
+            # Provenance evidence for the durable work entry below. `status ==
+            # 'done'` alone is NOT evidence: mark_step_committed's authoring
+            # guard (plan_tools._sha_exists_on_branch) is `git merge-base
+            # --is-ancestor <sha> HEAD`, which is satisfied by base_commit
+            # ITSELF and by every main ancestor below base — and
+            # update_step_status permits commit=None outright. Reuse the
+            # step-4 detector rather than reimplementing the git call: it
+            # returns exactly `base_commit..HEAD` and already collapses every
+            # missing-collaborator / unset-base / git-error case to [], which
+            # is precisely the fail-closed posture wanted here (no evidence ⇒
+            # no work entry). Belt-and-braces try/except: a detector failure
+            # must degrade to "no evidence", never sink EXECUTE.
+            try:
+                beyond_base = {
+                    str(c['sha']) for c in await self._detect_committed_branch_work()
+                }
+            except Exception:
+                logger.warning(
+                    'Task %s: beyond-base provenance detection failed; treating '
+                    'as no committed work (task 3033)',
+                    self.task_id, exc_info=True,
+                )
+                beyond_base = set()
+            # Bidirectional prefix match, the established idiom at
+            # _detect_tip_wip_commits (~:7062): an abbreviated sha recorded by
+            # mark_step_done still matches a full beyond-base sha, while a
+            # base-reachable or absent sha never does.
+            committed_step_ids = [
+                str(s.get('id'))
+                for s in items
+                if s.get('status') == 'done' and s.get('commit')
+                and any(
+                    str(s['commit']).startswith(sha) or sha.startswith(str(s['commit']))
+                    for sha in beyond_base
+                )
+            ]
             if self.event_store:
                 self.event_store.emit(
                     EventType.phase_skipped,
@@ -6476,6 +6518,10 @@ class TaskWorkflow:
                         'execute_iterations': self.metrics.execute_iterations,
                         'step_count': len(items),
                         'done_step_ids': done_step_ids,
+                        # Both sets, deliberately: a plan claiming N done steps
+                        # while the branch carries provenance for only M is a
+                        # real anomaly that must be visible in the event log.
+                        'committed_step_ids': committed_step_ids,
                     },
                 )
             logger.info(
@@ -6496,15 +6542,41 @@ class TaskWorkflow:
             # REFUSE to recover-DONE — re-planning merged work. The label is
             # honest ('architect', not a forged 'implementer') so the log the
             # reconciler and future architects read never claims an implementer
-            # turn that did not happen. Guarded on a non-empty done set so the
-            # entry can never claim work that does not exist (an all-empty plan
-            # cannot pass PLAN validation, but fail closed anyway).
-            if done_step_ids:
+            # turn that did not happen.
+            #
+            # FAILS CLOSED ON PROVENANCE, not on `status`: the entry is written
+            # only when at least one done item's recorded commit is a genuine
+            # member of `base_commit..HEAD`, and it names ONLY those ids.
+            # Status alone is insufficient because a done step can carry no
+            # commit at all, or a commit that is base_commit itself / an
+            # arbitrary main ancestor below base — all of which pass the
+            # authoring-time reachability guard while representing zero work on
+            # this branch. Without this filter an architect who pre-satisfied
+            # every step against base-reachable shas would produce a
+            # `committed: True` entry that _iteration_entry_is_work classifies
+            # as work, letting _recover_before_merge recovery-DONE a branch
+            # that implemented nothing. `committed: True` is therefore
+            # evidence-backed by the non-empty committed_step_ids set below
+            # rather than asserted.
+            if done_step_ids and len(committed_step_ids) < len(done_step_ids):
+                unbacked = sorted(set(done_step_ids) - set(committed_step_ids))
+                # Loud over silent: a plan asserting done steps the branch does
+                # not carry is a real anomaly (falsely pre-satisfied steps, or a
+                # rebase that orphaned the recorded shas). VERIFY remains the
+                # semantic gate for it, but it must never vanish from the log.
+                logger.warning(
+                    'Task %s: EXECUTE skip — %s plan item(s) claim status=done '
+                    'but only %s carry a commit in base..HEAD; unbacked ids: %s '
+                    '(task 3033 — no work entry is written for these)',
+                    self.task_id, len(done_step_ids), len(committed_step_ids),
+                    unbacked,
+                )
+            if committed_step_ids:
                 self.artifacts.append_iteration_log({
                     'iteration': self.metrics.execute_iterations,
                     'agent': 'architect',
                     'event': 'execute_skipped',
-                    'steps_completed': done_step_ids,
+                    'steps_completed': committed_step_ids,
                     'committed': True,
                     'summary': (
                         'EXECUTE skipped — every plan step pre-satisfied at '
