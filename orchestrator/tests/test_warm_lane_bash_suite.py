@@ -42,7 +42,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 #: Explicit manifest of the ported bash tests — the non-vacuity guard.  Grown
 #: one entry per port; asserted set-equal to the on-disk glob below.
-PORTED_TESTS = (
+PORTED_TESTS: tuple[str, ...] = (
     'test_warm_lane_disk_guard.sh',
     'test_warm_lane_degenerate_ref.sh',
     'test_thin_warm_lane.sh',
@@ -52,6 +52,26 @@ PORTED_TESTS = (
     'test_warm_lane_sizing_lifecycle.sh',
     'test_provision_warm_lane_fs.sh',
 )
+
+#: Every invocable script α relocated, mapped to the ported bash test that owns
+#: its coverage.  The parenthesised notes record *additional* real exercise, so a
+#: future reader can see which tests break if a script changes; the mapping
+#: itself is one-test-per-script so the drift guard stays unambiguous.
+#: ``lib_live_refs.sh`` / ``lib_portable.sh`` are deliberately absent — see
+#: ``test_every_invocable_script_has_ported_coverage``.
+SCRIPT_COVERAGE = {
+    # also exercised for real by test_warm_lane_gc_sweep.sh blocks G4/G5/U/W
+    'warm-lane-gc.sh': 'test_warm_lane_gc.sh',
+    'warm-lane-gc-sweep.sh': 'test_warm_lane_gc_sweep.sh',
+    # also test_warm_lane_sizing_lifecycle.sh
+    'thin-warm-lane.sh': 'test_thin_warm_lane.sh',
+    # also test_warm_lane_sizing_lifecycle.sh and test_warm_lane_gc_sweep.sh V1-V3
+    'warm-lane-disk-guard.sh': 'test_warm_lane_disk_guard.sh',
+    # also test_warm_lane_sizing_lifecycle.sh
+    'warm-lane-audit.sh': 'test_warm_lane_audit.sh',
+    'warm-lane-degenerate-ref-check.sh': 'test_warm_lane_degenerate_ref.sh',
+    'provision-warm-lane-fs.sh': 'test_provision_warm_lane_fs.sh',
+}
 
 #: Kept strictly BELOW the ``timeout(360)`` marker so a hung bash test fails as
 #: one clean pytest failure with its stdout/stderr captured, instead of
