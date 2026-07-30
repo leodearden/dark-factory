@@ -512,6 +512,37 @@ CURATOR_CLASSIFIER_MARKERS: tuple[str, ...] = (
 (fused_memory/src/fused_memory/middleware/task_curator.py) and the
 code-module classifier (orchestrator/src/orchestrator/harness.py)."""
 
+HARNESS_BRIEFING_HEADINGS: tuple[str, ...] = ('# context', '## agent identity', '# task')
+"""Injected orchestrator-briefing heading literals
+(orchestrator/src/orchestrator/agents/briefing.py: ``_get_memory_context``
+emits '# Context'; ``_agent_identity`` emits '## Agent Identity'; the role
+prompt templates emit '# Task'). All three must co-occur as line-anchored
+headings (matched via all(), not any() -- the same false-positive guard as
+ORCHESTRATED_TASK_MARKERS) so a genuine human turn that happens to open
+with '# Task', or that quotes '# Context' mid-prose, is never excluded
+from the gold user_corrections section."""
+
+HARNESS_PROMPT_MARKERS: tuple[str, ...] = (
+    'you are the trickle coder for the dark-factory agent-confusion codebook',
+)
+"""Harness-authored PROSE preamble literals, matched as plain
+case-insensitive substrings (unlike the line-anchored heading markers
+above): the trickle coder's system prompt
+(scripts/legibility/coder.py:174 ``build_prompt``). Extend with future
+harness prompt literals as one-line additions."""
+
+
+def is_harness_injected_turn(text: str) -> bool:
+    """True when *text* is harness-injected rather than genuine human-typed
+    input: either the orchestrator's briefing preamble (all
+    HARNESS_BRIEFING_HEADINGS co-occur, each as its own stripped line) or a
+    harness prose preamble (any HARNESS_PROMPT_MARKERS substring)."""
+    lowered = text.lower()
+    lines = {line.strip() for line in lowered.splitlines()}
+    if all(heading in lines for heading in HARNESS_BRIEFING_HEADINGS):
+        return True
+    return any(marker in lowered for marker in HARNESS_PROMPT_MARKERS)
+
 
 def classify_agent_class(
     records: list[dict[str, Any]], override: str | None = None,
@@ -550,9 +581,15 @@ def iter_user_turns(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Return genuine non-sidechain, non-meta human user turns.
 
     Excludes: non-'user' records, isSidechain=True (subagent) turns,
-    isMeta=True (system-injected) turns, and user records whose content is
-    entirely tool_result blocks. User corrections are gold (PRD Sec 5) --
-    this is the highest-priority digest section.
+    isMeta=True (system-injected) turns, user records whose content is
+    entirely tool_result blocks, and harness-injected briefing/prompt turns
+    (see :func:`is_harness_injected_turn`) -- these are typed into the
+    transcript as ordinary user-role text (isMeta=False), so isMeta alone
+    cannot exclude them. This function is the SINGLE source for both the
+    gold user_corrections section and render_digest's n_user_turns score
+    component, so this one filter excludes a harness-injected turn from
+    both. User corrections are gold (PRD Sec 5) -- this is the
+    highest-priority digest section.
     """
     turns = []
     for index, record in enumerate(records):
@@ -564,6 +601,8 @@ def iter_user_turns(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         text = _user_turn_text(_message_content(record))
         if text is None:
+            continue
+        if is_harness_injected_turn(text):
             continue
         turns.append({'index': index, 'text': text})
     return turns
