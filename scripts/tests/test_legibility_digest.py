@@ -914,6 +914,138 @@ def _split_frontmatter(digest):
     return '\n'.join(lines[1:end]), '\n'.join(lines[end + 1:])
 
 
+# ---------------------------------------------------------------------------
+# is_harness_injected_turn / iter_user_turns exclusion -- R1 (confusion
+# census 2026-07-24 Sec 4): a harness-injected briefing turn (the
+# orchestrator's '# Context' + '## Agent Identity' + '# Task' preamble, or
+# the trickle coder's system-prompt preamble) is typed into the transcript
+# as ordinary user-role text (isMeta=False -- it really is the first "user"
+# turn Claude Code sees), so it was previously indistinguishable from a
+# genuine human correction: it inflated both the gold user_corrections
+# section and score's n_user_turns component. Exclusion is by CONTENT (all
+# three headings must co-occur, line-anchored, mirroring
+# ORCHESTRATED_TASK_MARKERS' all() guard) so an ordinary human turn that
+# merely mentions one heading, or quotes one mid-sentence, is never
+# over-excluded.
+# ---------------------------------------------------------------------------
+
+def _briefing_text(body_filler='Project overview and recent decisions go here.'):
+    """Build the text of an orchestrator-briefing-shaped user turn -- the
+    literal shape ``BriefingAssembler`` injects as the harness preamble of
+    every dispatched-agent session
+    (orchestrator/src/orchestrator/agents/briefing.py): a '# Context'
+    heading (``_get_memory_context``, emits '# Context\\n\\n...'), a
+    '## Agent Identity' heading with an agent_id bullet
+    (``_agent_identity``), and a '# Task' heading with a task block (the
+    per-role prompt templates, e.g. ``build_architect_prompt``)."""
+    return (
+        f'# Context\n\n{body_filler}\n\n'
+        '## Agent Identity\n\n'
+        '- **agent_id:** `claude-task-3278-implementer`\n'
+        '- **project_id:** `dark_factory`\n\n'
+        '# Task\n\n'
+        '**Task:** Some task title\n'
+        '**Description:** Do the thing.\n'
+    )
+
+
+_TRICKLE_CODER_PREAMBLE = (
+    'You are the trickle coder for the dark-factory agent-confusion '
+    'codebook (plans/confusion-reduction-prd.md §7.3). Read the '
+    'session digest below and decide which existing codebook entries '
+    'it matches.'
+)
+"""Literal prefix of scripts/legibility/coder.py:174 build_prompt's
+harness-authored preamble."""
+
+
+class TestHarnessInjectedTurnFilter:
+    def test_briefing_shaped_turn_is_excluded_by_content(self):
+        records = [_user_text(_briefing_text())]
+
+        assert mod.iter_user_turns(records) == []
+
+    def test_trickle_coder_preamble_turn_is_excluded(self):
+        records = [_user_text(_TRICKLE_CODER_PREAMBLE)]
+
+        assert mod.iter_user_turns(records) == []
+
+    def test_ordinary_correction_retained_after_briefing_turn_index_preserved(self):
+        records = [
+            _user_text(_briefing_text()),
+            _user_text('This is wrong, please redo it.'),
+        ]
+
+        turns = mod.iter_user_turns(records)
+
+        assert [t['text'] for t in turns] == ['This is wrong, please redo it.']
+        assert [t['index'] for t in turns] == [1]
+
+    def test_single_heading_alone_is_not_excluded(self):
+        # Only ONE of the three co-occurring headings -- must not alone
+        # trigger exclusion (all()-not-any(), mirrors
+        # test_bare_worktree_mention_alone_is_not_orchestrated_task).
+        records = [_user_text('# Task\n\nplease do X')]
+
+        turns = mod.iter_user_turns(records)
+
+        assert len(turns) == 1
+        assert turns[0]['text'] == '# Task\n\nplease do X'
+
+    def test_context_heading_mentioned_mid_sentence_is_not_excluded(self):
+        # Line-anchored matching: '# Context' appearing mid-sentence (not
+        # as its own stripped line) never counts as the heading.
+        records = [_user_text(
+            'I read the # Context heading in the docs and want to update it.'
+        )]
+
+        turns = mod.iter_user_turns(records)
+
+        assert len(turns) == 1
+
+    def test_render_digest_excludes_briefing_turn_from_body_and_score(self):
+        records = [
+            _with_session_meta(_user_text(_briefing_text())),
+            _with_session_meta(_user_text('This is wrong, please redo it.')),
+        ]
+
+        digest = mod.render_digest(records, agent_class='interactive')
+
+        frontmatter_yaml, body = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        assert 'This is wrong, please redo it.' in body
+        assert '# Context' not in body
+        assert '## Agent Identity' not in body
+        # The excluded turn no longer counts toward n_user_turns (today: 2).
+        assert meta['score'] == mod.score_signals(meta['signal_counts'], 1)
+
+    def test_classify_agent_class_still_detects_markers_inside_excluded_turn(self):
+        # 'Task ID:'/'Worktree:' (a SEPARATE injected preamble --
+        # dry_run_unblock.py -- from the '# Context'/'## Agent
+        # Identity'/'# Task' briefing) live only inside this now-excluded
+        # turn; classify_agent_class reads a different carrier
+        # (_signal_text_sources, never filtered by iter_user_turns) so it
+        # must be unaffected by the exclusion.
+        text = (
+            _briefing_text()
+            + 'Task ID: 3278\nWorktree: /home/leo/src/dark-factory/.worktrees/3278\n'
+        )
+        records = [_user_text(text)]
+
+        assert mod.iter_user_turns(records) == []
+        assert mod.classify_agent_class(records) == 'orchestrated-task'
+
+    def test_signal_counts_unaffected_by_signal_free_briefing_turn(self):
+        # The filter must not leak into _signal_text_sources: adding a
+        # briefing turn with no NOT_FOUND/DF_GUARD/INTERRUPT pattern must
+        # not perturb any of the five signal_counts.
+        base = _all_signals_records()
+        with_briefing = [_user_text(_briefing_text())] + base
+
+        assert mod.signal_counts(with_briefing) == mod.signal_counts(base)
+
+
 class TestRenderDigest:
     def test_includes_heading_for_each_present_signal_class(self):
         digest = mod.render_digest(_all_signals_records(), agent_class='interactive')
