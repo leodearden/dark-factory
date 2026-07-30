@@ -30,7 +30,10 @@ from fused_memory.reconciliation.cli_stage_runner import (
     _normalize_report,
     run_stage_via_cli,
 )
-from fused_memory.reconciliation.prompts import ESCALATION_BOUNDARY_NOTE
+from fused_memory.reconciliation.prompts import (
+    ESCALATION_BOUNDARY_NOTE,
+    render_escalation_boundary_note,
+)
 from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
 from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
@@ -296,7 +299,7 @@ class TestDisallowedToolLists:
 
 
 class TestEscalationBoundaryNote:
-    """The escalation-store boundary paragraph is one constant with three consumers.
+    """The escalation-store boundary note: one shared core, three consumers.
 
     Companion to the DISALLOW_ESCALATION_READS denial (task 3163).  Denying the
     read tools removes the false ``[]`` answer, but ``--disallowed-tools`` OMITS
@@ -306,7 +309,14 @@ class TestEscalationBoundaryNote:
     around it.  The note is what converts a silent absence into an understood
     boundary, which makes it load-bearing rather than decorative.
 
-    These are wiring/invariant assertions, deliberately not a prose pin.
+    The note is a stage-agnostic core (``ESCALATION_BOUNDARY_NOTE``) plus a
+    per-stage *sanctioned-action* clause selected by
+    ``render_escalation_boundary_note(can_escalate=...)``: Stage 2 holds the
+    FIX D escalate_blocker path, Stage 1 and Stage 3 hold no sanctioned
+    escalation action at all.
+
+    These are wiring/invariant and tool-name-capability assertions, deliberately
+    not a prose pin.
     """
 
     def test_boundary_note_is_a_single_nonempty_constant(self):
@@ -350,17 +360,78 @@ class TestEscalationBoundaryNote:
         """
         assert '## Available Tools' not in ESCALATION_BOUNDARY_NOTE
 
-    def test_boundary_note_states_the_absence_semantics(self):
-        """The two tokens the agent must actually act on.
+    def test_boundary_note_core_is_stage_agnostic(self):
+        """The shared core must not name a write path only one stage may use.
 
-        Naming the reconciliation store tells the agent WHICH store it is
-        connected to; 'not evidence' tells it what it may not conclude from an
-        empty result.  Without the second, the note explains the boundary but
-        leaves the original incident (reading [] as proof of absence) available.
+        A TOOL-NAME capability assertion, not a wording pin: this constant is
+        rendered into ALL THREE stage prompts, so anything it names is named to
+        every stage.  ``escalate_blocker`` is a Stage-2-only mechanism (FIX D),
+        so it belongs in the per-stage clause, never in the shared core.
+
+        The constant's own comment used to claim it was "Identical for all three
+        stages — no per-stage parameters", which is exactly what hid the
+        mismatch: its final sentence licensed an escalation write in Stage 1 and
+        Stage 3 too.
         """
-        lowered = ESCALATION_BOUNDARY_NOTE.lower()
-        assert 'reconciliation' in lowered
-        assert 'not evidence' in lowered
+        assert 'escalate_blocker' not in ESCALATION_BOUNDARY_NOTE
+
+    def test_render_escalation_boundary_note_varies_the_sanctioned_action(self):
+        """The renderer swaps only the sanctioned-action clause, never the core.
+
+        Mirrors the ``render_source_completion_section(*, can_file_tasks=...)``
+        precedent (recon_self_model.py): one shared body, one capability-gated
+        clause, keyword-only flag.  INV-5 is preserved — the shared core still
+        appears exactly once in either rendering.
+        """
+        allowed = render_escalation_boundary_note(can_escalate=True)
+        denied = render_escalation_boundary_note(can_escalate=False)
+
+        assert 'mcp__escalation__escalate_blocker' in allowed, (
+            'can_escalate=True must name the sanctioned FIX D write path'
+        )
+        assert 'escalate_blocker' not in denied, (
+            'can_escalate=False must not name a tool the stage is not sanctioned to use'
+        )
+        for rendered, label in ((allowed, 'can_escalate=True'), (denied, 'can_escalate=False')):
+            assert rendered.count(ESCALATION_BOUNDARY_NOTE) == 1, (
+                f'{label} must carry the shared core exactly once'
+            )
+            assert '## Available Tools' not in rendered, (
+                f'{label} must not carry the build_stage2_system_prompt sentinel'
+            )
+
+    def test_stage1_and_stage3_prompts_never_name_the_escalation_write_tool(self):
+        """A stage with no sanctioned escalation action must not be told about one.
+
+        The durable end-state assertion: it pins the property at the CONSUMER,
+        independent of how the note is assembled.  Stage 3 declares "You do NOT
+        have write or mutation tools" (prompts/stage3.py) — and because
+        ``escalate_blocker`` is deliberately absent from every disallow list
+        (see TestDisallowedToolLists above), the tool really is callable, so a
+        licensing sentence there points at a real durable write to the
+        reconciliation escalation queue.  Stage 1 has no FIX D mechanism either
+        (FIX D lives in TaskKnowledgeSync, not IntegrityCheck).
+        """
+        for prompt, name in (
+            (STAGE1_SYSTEM_PROMPT, 'STAGE1_SYSTEM_PROMPT'),
+            (STAGE3_SYSTEM_PROMPT, 'STAGE3_SYSTEM_PROMPT'),
+        ):
+            assert 'escalate_blocker' not in prompt, (
+                f'{name} must not name the escalation write tool — that stage has no '
+                'sanctioned escalation action'
+            )
+
+    def test_stage2_prompt_still_names_the_escalation_write_tool(self):
+        """Anti-over-correction guard: FIX D must survive the fix.
+
+        Stage 2 IS sanctioned to call escalate_blocker for the Stale Flag
+        Escalation (FIX D) case, on both the plain and the autopilot_video
+        guardrail-injection branches of build_stage2_system_prompt.
+        """
+        for project_id in ('dark_factory', 'autopilot_video'):
+            assert 'mcp__escalation__escalate_blocker' in build_stage2_system_prompt(project_id), (
+                f'Stage 2 prompt for {project_id} must keep the FIX D escalation write path'
+            )
 
 
 class TestStageSubclasses:
