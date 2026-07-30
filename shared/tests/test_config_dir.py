@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
-from shared.config_dir import CONFIG_DIR_PREFIX, sweep_stale_pid_dirs
+from shared.config_dir import CONFIG_DIR_PREFIX, TaskConfigDir, sweep_stale_pid_dirs
 
 # The prefix the UsageGate probe dirs actually use. Built from the module
 # constant rather than hard-coded so the test cannot drift from the
@@ -277,3 +277,78 @@ class TestSweepStalePidDirsBounding:
         assert removed == len(planted)
         assert not any(p.exists() for p in planted)
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+# ---------------------------------------------------------------------------
+# Opt-in atexit teardown — the CLEAN-EXIT half. The PID-liveness sweep above
+# is what actually bounds the population under SIGKILL.
+# ---------------------------------------------------------------------------
+
+
+def invoke_registered_hook(mock_register) -> None:
+    """Call whatever was handed to ``atexit.register``, as atexit would."""
+    (func, *bound), kwargs = mock_register.call_args
+    func(*bound, **kwargs)
+
+
+class TestTaskConfigDirCleanupAtExit:
+    """`cleanup_at_exit=True` registers a best-effort teardown (step 5)."""
+
+    def test_opt_in_registers_one_hook_that_removes_the_dir(self, tmp_path):
+        with patch('shared.config_dir.atexit.register') as register:
+            cfg = TaskConfigDir('x', base_dir=tmp_path, cleanup_at_exit=True)
+
+        assert register.call_count == 1
+        assert cfg.path.exists()
+
+        invoke_registered_hook(register)
+
+        assert not cfg.path.exists()
+
+    def test_default_registers_nothing(self, tmp_path):
+        """Teardown MUST stay opt-in.
+
+        Per-task and per-investigation config dirs live under a worktree's
+        `.task/` and are deliberately preserved — the session JSONL inside
+        them backs transcript archival and `--resume`, and
+        orchestrator/tests/test_dry_run_unblock.py asserts the
+        per-investigation dir survives. A future change that makes teardown
+        unconditional would silently eat those; it fails here instead.
+        """
+        with patch('shared.config_dir.atexit.register') as register:
+            cfg = TaskConfigDir('x', base_dir=tmp_path)
+
+        register.assert_not_called()
+        assert cfg.path.exists()
+
+    def test_hook_binds_only_the_path_not_the_instance(self, tmp_path):
+        """The atexit table must not pin the TaskConfigDir alive.
+
+        Binding `self` (or a bound method) would keep the owning UsageGate —
+        and its account OAuth tokens — reachable for the life of the process.
+        """
+        with patch('shared.config_dir.atexit.register') as register:
+            cfg = TaskConfigDir('x', base_dir=tmp_path, cleanup_at_exit=True)
+
+        (func, *bound), kwargs = register.call_args
+        assert func is shutil.rmtree
+        assert cfg.path in bound
+        assert not any(arg is cfg for arg in bound)
+        assert not any(arg is cfg for arg in kwargs.values())
+
+    def test_hook_is_idempotent_after_explicit_cleanup(self, tmp_path):
+        """UsageGate.shutdown() already calls cleanup() on the clean path.
+
+        The later atexit hook must be a harmless no-op after it, and must not
+        raise out of interpreter shutdown.
+        """
+        with patch('shared.config_dir.atexit.register') as register:
+            cfg = TaskConfigDir('x', base_dir=tmp_path, cleanup_at_exit=True)
+
+        cfg.cleanup()
+        assert not cfg.path.exists()
+
+        invoke_registered_hook(register)
+        invoke_registered_hook(register)
+
+        assert not cfg.path.exists()
