@@ -910,7 +910,9 @@ def _render_coverage(coverage: dict[str, Any]) -> list[str]:
     if complete:
         lines += ['Coverage is **complete**: every category scrolled as many points as '
                   '`count_by_metadata` reported either side of the scan, and the '
-                  'per-category counts account for every point in each collection.', '']
+                  'per-category counts account for every point in each collection — up to '
+                  'corpus churn, which is listed below rather than charged as missing '
+                  'data.', '']
     else:
         lines += [
             '> **WARNING — COVERAGE INCOMPLETE.** This census under-enumerates the corpus; '
@@ -920,14 +922,16 @@ def _render_coverage(coverage: dict[str, Any]) -> list[str]:
         ]
 
     lines += [
-        '| project | collection | collection points | counted | uncovered | complete |',
+        '| project | collection | collection points | counted | residue | complete |',
         '| --- | --- | ---: | ---: | ---: | --- |',
     ]
     for project_id in sorted(coverage.get('projects', {})):
         p = coverage['projects'][project_id]
         lines.append(
-            f'| `{project_id}` | `{p.get("collection")}` | {p.get("collection_points", 0):,} | '
-            f'{p.get("counted", 0):,} | {p.get("uncovered_points", 0):,} | '
+            f'| `{project_id}` | `{p.get("collection")}` | '
+            f'{_interval(p.get("collection_points_interval"), p.get("collection_points", 0))} | '
+            f'{_interval(p.get("counted_interval"), p.get("counted", 0))} | '
+            f'{p.get("uncovered_points", 0):+,} | '
             f'{"yes" if p.get("complete") else "**NO**"} |',
         )
     lines.append('')
@@ -946,10 +950,17 @@ def _render_coverage(coverage: dict[str, Any]) -> list[str]:
             )
     lines += [
         '',
-        'The corpus is LIVE: `expected` is counted before the scroll and `recount` after '
-        'it, so a small non-zero `delta` on a cell whose `scrolled` matches `recount` is '
-        'corpus churn (a write landed mid-census), NOT a truncated scan — such a cell is '
-        'still complete. Only a `scrolled` that matches neither count is a shortfall.',
+        'The corpus is LIVE, so every figure above is a pair of unsynchronised reads, and '
+        'drift between them is not a defect. Per CELL: `expected` is counted before the '
+        'scroll and `recount` after it, so a non-zero `delta` on a cell whose `scrolled` '
+        'matches `recount` is churn (a write landed mid-census), NOT a truncated scan — '
+        'such a cell is still complete, and only a `scrolled` matching neither count is a '
+        'shortfall. Per COLLECTION: the total is bracketed by a `count` before the scan '
+        'and another after it, and the counted total spans `sum(expected)`..`sum(recount)`; '
+        'the project is covered when those two intervals OVERLAP. The `residue` column is '
+        'the surviving GAP between them — the minimum number of points churn cannot '
+        'explain, `+0` whenever they overlap. Movement inside that window is listed as '
+        'churn below, never as a shortfall.',
         '',
     ]
 
@@ -962,17 +973,30 @@ def _render_coverage(coverage: dict[str, Any]) -> list[str]:
             '',
         ]
         for entry in churn:
-            lines.append(
-                f'- `{entry.get("project_id")}` / `{entry.get("category")}`: count moved '
-                f'{entry.get("expected", 0):,} → {entry.get("recount", 0):,} while '
-                f'scrolling; scrolled {entry.get("scrolled", 0):,}.',
-            )
+            if entry.get('kind') == 'collection_total_moved':
+                lines.append(
+                    f'- `{entry.get("project_id")}` / `{entry.get("collection")}`: the '
+                    f'collection total moved to '
+                    f'{_interval(entry.get("collection_points_interval"), 0)} points while '
+                    f'the categories counted '
+                    f'{_interval(entry.get("counted_interval"), 0)}; the intervals overlap, '
+                    f'so every point is accounted for.',
+                )
+            else:
+                lines.append(
+                    f'- `{entry.get("project_id")}` / `{entry.get("category")}`: count moved '
+                    f'{entry.get("expected", 0):,} → {entry.get("recount", 0):,} while '
+                    f'scrolling; scrolled {entry.get("scrolled", 0):,}.',
+                )
         lines.append('')
 
     deltas = coverage.get('deltas', [])
     if deltas:
         lines += ['### Named shortfalls', '']
         for d in deltas:
+            # Dispatch on kind EXPLICITLY. An unconditional fallthrough gave
+            # every unrecognised kind the uncovered-points sentence, which is
+            # a wrong diagnosis rather than a missing one.
             kind = d.get('kind')
             if kind == 'category_shortfall':
                 lines.append(
@@ -990,15 +1014,40 @@ def _render_coverage(coverage: dict[str, Any]) -> list[str]:
                     f'({d.get("expected", 0):,} before, {d.get("recount", 0)} after) — '
                     f'concurrent writes or duplicate pages, not missing data.',
                 )
-            else:
+            elif kind == 'uncovered_points':
                 lines.append(
                     f'- `uncovered_points` — `{d.get("project_id")}` / '
                     f'`{d.get("collection")}`: {d.get("delta", 0):,} of '
                     f'{d.get("collection_points", 0):,} points carry a category outside '
                     f'the censused set (counted {d.get("counted", 0):,}).',
                 )
+            elif kind == 'surplus_counted':
+                # The mirror image: the collection holds FEWER points than the
+                # categories counted. Nothing is unenumerated, so the
+                # uncovered-points sentence would be an outright wrong answer.
+                lines.append(
+                    f'- `surplus_counted` — `{d.get("project_id")}` / '
+                    f'`{d.get("collection")}`: the categories counted '
+                    f'{_interval(d.get("counted_interval"), d.get("counted", 0))}, '
+                    f'{abs(d.get("delta", 0)):,} MORE than the '
+                    f'{_interval(d.get("collection_points_interval"), 0)} points the '
+                    f'collection holds — deletions landed mid-scan beyond the bracket, or '
+                    f'a category double-counted. Nothing is missing.',
+                )
+            else:
+                # Neutral and labelled: better an unstyled fact than a
+                # confident wrong diagnosis.
+                lines.append(f'- `{kind}` — {json.dumps(d, sort_keys=True)}')
         lines.append('')
     return lines
+
+
+def _interval(bounds: Any, fallback: int) -> str:
+    """Render an ``[lo, hi]`` interval, collapsing lo == hi to one figure."""
+    if not isinstance(bounds, (list, tuple)) or len(bounds) != 2:
+        return f'{fallback:,}'
+    lo, hi = bounds
+    return f'{lo:,}' if lo == hi else f'{lo:,}–{hi:,}'
 
 
 def _render_record_counts(report: dict[str, Any]) -> list[str]:
