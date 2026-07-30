@@ -40,6 +40,24 @@ cd /home/leo/src/dark-factory && uv run --project shared python scripts/legibili
 - `--force` is what makes this an *operator*-initiated run: it bypasses the `census_trigger.decide_for_project` gate entirely (the same gate the nightly trickle checks before launching), so it works identically whether the trigger would have said NO-FIRE (first-census case — it always would, per above) or you simply don't want to wait for the next scheduled fire (ad-hoc case). Without `--force`, the CLI prints the NO-FIRE reasons and exits 0 without mining anything — expected behavior for a first census, not an error.
 - Optional flags: `--config <path>` to point at a non-default `legibility.yaml`, `--date YYYY-MM-DD` to stamp the report with a date other than today (rare — mainly for backfilling a report for a run that started the previous day).
 
+### Operator cost-control flags
+
+Three composable flags bound what one run may spend. Each is optional and defaults to today's unbounded behavior, so omitting them all is exactly the command above.
+
+- **`--max-batches N`** — stop mining after N batches. The report states the cap and that coverage is **partial** (sessions beyond the cap were never mined), and `stop_reason` becomes `capped` rather than `exhausted`.
+- **`--max-verify-clusters N`** — hand the verifier at most N novel clusters, taken in mining order. Verification costs one Sonnet call per cluster, and that is the spend being bounded. The rest still merge into the codebook as `pending` candidates for a later census to adjudicate — **deferred, never dropped**.
+- **`--dry-run-filing`** — write every would-be `submit_task` payload to `plans/confusion-census-<date>-payloads.json` for human review and file **nothing**. Everything else — codebook update, promotions, report, census-state advance — proceeds normally.
+
+For an attended **first** census, run with all three:
+
+```bash
+cd /home/leo/src/dark-factory && uv run --project shared python scripts/legibility/census.py \
+  --project-root <target-root> --force \
+  --max-batches 50 --max-verify-clusters 150 --dry-run-filing
+```
+
+Why: a first census cannot rely on saturation to bound spend — against an empty codebook, a batch's `dup_rate` only measures "the miner found nothing to match", so mining runs to source exhaustion, per-cluster verification scales with however many novel clusters that produces, and filing would bulk-load a live task tree in one shot.
+
 The run mines, verifies, synthesizes, updates the codebook, and files remediation tasks unattended — it can take a while (saturation mining runs until novelty drops below the configured duplicate-rate threshold for several consecutive batches). Watch the terminal for the final `census: done -- report=... filed_tasks=N stop_reason=...` line, or `census: deferred -- <reason>` if the headroom preflight declined to start.
 
 ## Post-run checklist
@@ -48,6 +66,7 @@ The run mines, verifies, synthesizes, updates the codebook, and files remediatio
 2. **Sanity-check per-stratum coverage counts.** The report should show mining coverage across the strata the sampler drew from — if one stratum has near-zero sightings while others are dense, that's worth a second look (could be a genuinely clean area, could be a sampling gap).
 3. **Confirm `census-state.json` advanced.** Check `docs/legibility/census-state.json` in the censused project — `last_census_at` should now be this run's timestamp and `last_census_report` should point at the new report. This is what makes the *next* census automatic: with a real anchor in place, `census_trigger` can now compute `days_since` and the interval/tasks-landed/novelty-spike conditions become live instead of perpetually "N/A".
 4. **Review the filed remediation tasks.** The run submits tasks through the normal curator path (`submit_fn`) — check the project's task tree for what landed and whether it needs triage/re-prioritization.
+5. **If you ran `--dry-run-filing`: review the payload JSON and file by hand** (or re-run without the flag) before treating the census as complete. Nothing was filed, so the remediation half of the census is still outstanding — `plans/confusion-census-<date>-payloads.json` is the deliverable to work through.
 
 ## Anchor-seeding alternative — when a manual survey already happened
 
