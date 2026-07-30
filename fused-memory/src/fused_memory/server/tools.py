@@ -72,6 +72,7 @@ from fused_memory.server.manifest_stamping import stamp_capability_manifests
 from fused_memory.server.markup_tripwire import (
     MarkupStormCounter,
     build_markup_block,
+    emit_markup_storm_escalation,
     find_markup_violation,
     markup_override_requested,
     strip_markup_override,
@@ -720,6 +721,36 @@ def create_mcp_server(
             agent_id, field, pattern, project_root,
         )
         storm = _markup_storm.record()
+        if storm is not None:
+            # A burst, not an isolated slip: the upstream leak is live. Log it at
+            # ERROR on one greppable line first — the block dict below only ever
+            # reaches the leaking caller, which is the party least likely to act
+            # on it, so this line is the operator-facing half of INV-4.
+            logger.error(
+                'markup_tripwire_storm: %d markup writes rejected in %.0fs '
+                '(threshold=%d agent_id=%r field=%r matched_pattern=%r '
+                'project_root=%r) — the upstream serialization leak is ACTIVE; '
+                'DF 3083 owns the root cause',
+                storm.get('count', -1), storm.get('window_seconds', -1.0),
+                storm.get('threshold', -1), agent_id, field, pattern, project_root,
+            )
+            # Escalation is purely additive — the rejection is already decided.
+            # emit_markup_storm_escalation is built never to raise, but a call
+            # site that relied on that promise would turn a future regression
+            # there into an outage here (same reasoning as task_interceptor's
+            # wrapping of scope_violation_escalator).
+            try:
+                esc_id = emit_markup_storm_escalation(project_root, storm)
+            except Exception:  # pragma: no cover — defensive only
+                logger.exception(
+                    'markup_tripwire: emit_markup_storm_escalation raised; '
+                    'continuing with the rejection',
+                )
+                esc_id = None
+            if esc_id is not None:
+                # Echoed back so the refused caller (or a reviewer reading the
+                # response) can find the filed escalation without grepping logs.
+                storm = {**storm, 'escalation_id': esc_id}
         return build_markup_block(agent_id, field, pattern, str(fields[field]), storm=storm)
 
     async def _log_read(
