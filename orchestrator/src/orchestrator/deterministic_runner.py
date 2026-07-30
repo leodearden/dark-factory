@@ -240,6 +240,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import signal
@@ -386,6 +387,58 @@ def _build_done_provenance(kind: str, **fields: object) -> dict:
     validation happens at runtime, in the model itself.
     """
     return DoneProvenance(kind=kind, **fields).model_dump(exclude_none=True)  # type: ignore[arg-type]
+
+
+def _summarize_predicate_output(out: object, *, rc: int) -> str:
+    """Summarize a predicate check's raw output into a bounded provenance note.
+
+    An **ALLOWLIST**, not a denylist: only recognized *structured* shapes
+    survive.  Anything the extractor does not recognize is dropped, leaving
+    the bare verdict prefix — an unrecognized shape therefore yields a less
+    informative note, never a corrupted one.  A denylist that stripped known
+    log formats would leak on the first format nobody anticipated, which is
+    exactly how the motivating specimen arose.
+
+    Motivating specimen — task 2902.  ``_default_run_script`` merges stderr
+    into stdout and returns ``decode()[-2000:]``, so a chatty predicate
+    script's server-log noise reached ``done_provenance.note`` verbatim: a
+    1999-char blob starting mid-token, carrying FalkorDB identity-scan
+    WARNINGs for an unrelated project and ``httpx`` request lines.
+
+    Why this matters beyond tidiness: ``note`` is not a private field.
+    fused-memory's reconciliation ``_format_outcome_echo`` reads
+    ``done_provenance['note']`` and appends it to the ``"Task '<title>'
+    completed."`` Mem0 write, so whatever lands here is INGESTED INTO MEMORY.
+    Raw subprocess output is dropped at this seam for that reason alone; it
+    stays recoverable in the orchestrator log, which is not memory-ingested.
+
+    Extraction: the script's own trailing JSON block (the last line opening a
+    ``{``/``[`` structure, through end of output) is re-dumped compactly and
+    appended to the verdict.  This structurally excludes every preceding log
+    line rather than pattern-matching them.
+    """
+    verdict = f'predicate check passed (rc={rc})'
+    payload = _extract_predicate_payload(out)
+    return f'{verdict}: {payload}' if payload else verdict
+
+
+def _extract_predicate_payload(out: object) -> str | None:
+    """Return the recognized structured payload in *out*, or None.
+
+    Tier 1 — a trailing JSON block: walk backwards to the last line whose
+    strip opens a ``{``/``[``, and try to parse from there to end of output.
+    Re-dumped with compact separators so the note stays a single line.
+    """
+    lines = out.splitlines() if isinstance(out, str) else []
+    for index in range(len(lines) - 1, -1, -1):
+        if not lines[index].strip().startswith(('{', '[')):
+            continue
+        try:
+            parsed = json.loads('\n'.join(lines[index:]))
+        except ValueError:
+            continue
+        return json.dumps(parsed, separators=(',', ':'))
+    return None
 
 
 def _is_operational_llm_gate(metadata: dict) -> bool:
