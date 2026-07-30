@@ -494,6 +494,108 @@ def test_client_identifies_itself_explicitly():
     assert crr.CLIENT_NAME
 
 
+def _is_error_result(payload, message):
+    """A FastMCP tool-level error: a 200 whose result carries isError."""
+    return (200, {'Content-Type': 'application/json'},
+            _json_rpc_ok(payload, {
+                'content': [{'type': 'text', 'text': message}],
+                'isError': True}))
+
+
+def test_a_tool_level_is_error_result_raises():
+    """A tool-level failure arrives INSIDE a 200 as `isError`, not as a
+    JSON-RPC error envelope.
+
+    fused-memory's `@mcp_tool_errors()` turns in-tool exceptions into an
+    `{'error': ...}` payload, but a FastMCP-level failure -- argument
+    validation, an unknown or RENAMED tool -- bypasses that decorator and
+    surfaces only this way. A client that returned it would hand the apply
+    path a payload carrying neither `error` nor `success: False`, i.e. a
+    failed write indistinguishable from a landed one.
+    """
+    def responder(payload, n):
+        if payload.get('method') == 'initialize':
+            return (200, {'Content-Type': 'application/json', 'mcp-session-id': 's'},
+                    _json_rpc_ok(payload, {}))
+        if payload.get('method') == 'notifications/initialized':
+            return (202, {}, '')
+        return _is_error_result(
+            payload, "Input validation error: unexpected keyword 'task_id'")
+
+    with _FakeMcpServer(responder) as srv:
+        with crr.McpClient(srv.url) as client:
+            with pytest.raises(RuntimeError, match='Input validation error'):
+                client.call_tool('set_task_status', {'id': '1', 'status': 'pending'})
+
+
+def test_an_unparsed_text_payload_is_read_as_a_rejection_not_a_success():
+    """`call_tool` returns {'_raw': text} when a text content block is not JSON.
+
+    That shape is what a bare error string looks like coming back, so treating
+    it as a success (no `error` key, no `success: False`) would count a failed
+    write as applied and archive the request."""
+    assert crr.rejection_reason({'_raw': 'Input validation error: nope'}) is not None
+    assert 'Input validation error' in crr.rejection_reason(
+        {'_raw': 'Input validation error: nope'})
+    # The shapes that really are successes stay successes.
+    assert crr.rejection_reason({'success': True}) is None
+    assert crr.rejection_reason({'success': True, 'no_op': True}) is None
+
+
+# ── the wire arguments the three tool wrappers actually send ─────────────────
+#
+# Every other test in this module either hand-writes an arguments dict or
+# substitutes RecordingClient, whose signatures mirror the CONSUMER's rather
+# than the SERVER's. These three drive the real McpClient against a socket and
+# assert on `params.arguments` as received, so a regression in the wire names
+# (the seam the source comment flags as historically error-prone -- the param
+# is `id`, not `task_id`) cannot pass the suite.
+
+
+def _tool_call_params(srv):
+    return [p['params'] for _, p in srv.received if p.get('method') == 'tools/call']
+
+
+def test_get_task_sends_the_servers_wire_parameter_names():
+    with _FakeMcpServer(_default_responder()) as srv:
+        with crr.McpClient(srv.url) as client:
+            client.get_task(5321, REIFY)
+    params = _tool_call_params(srv)[-1]
+    assert params['name'] == 'get_task'
+    assert params['arguments'] == {'id': '5321', 'project_root': REIFY}
+
+
+def test_set_task_status_sends_the_servers_wire_parameter_names():
+    with _FakeMcpServer(_default_responder()) as srv:
+        with crr.McpClient(srv.url) as client:
+            client.set_task_status(5321, 'cancelled', REIFY)
+    params = _tool_call_params(srv)[-1]
+    assert params['name'] == 'set_task_status'
+    assert params['arguments'] == {
+        'id': '5321', 'status': 'cancelled', 'project_root': REIFY}
+
+
+def test_set_task_claimant_sends_both_clear_kwargs_as_explicit_json_null():
+    """PRESENT-with-null is the clear; OMITTED means "leave untouched".
+
+    Both claimant kwargs are tri-state server-side against a '__unset__'
+    STRING sentinel, so a dropped key does not clear the field -- it silently
+    preserves the stale claimant this consumer exists to remove, and the row
+    would then go `pending` still reading as live to a dispatcher."""
+    with _FakeMcpServer(_default_responder()) as srv:
+        with crr.McpClient(srv.url) as client:
+            client.set_task_claimant(5321, REIFY,
+                                     claimant_run_id=None, heartbeat_at=None)
+    params = _tool_call_params(srv)[-1]
+    assert params['name'] == 'set_task_claimant'
+    assert params['arguments'] == {
+        'id': '5321', 'project_root': REIFY,
+        'claimant_run_id': None, 'heartbeat_at': None}
+    # Stated separately from the == above: presence is the load-bearing half.
+    assert 'claimant_run_id' in params['arguments']
+    assert 'heartbeat_at' in params['arguments']
+
+
 # ── step-5: the confirm-before-write compare-and-swap guard ──────────────────
 #
 # The guard is a STALE-READ check on the adjudicated row, NOT a re-evaluation
@@ -930,6 +1032,39 @@ def test_the_archive_destination_is_retraction_safe(requests_dir):
     assert glob.glob(str(requests_dir / 'redispatch-*.json')) == []
 
 
+def test_an_archive_failure_still_counts_the_write_as_applied(requests_dir, capsys):
+    """The write LANDED; only the bookkeeping failed. Saying otherwise would
+    invite a retry of a transition that already happened."""
+    _req(requests_dir, 5321, 'gate_closure')
+    # A regular FILE where the archive directory needs to be: os.makedirs()
+    # raises FileExistsError even with exist_ok=True, since the path is not a
+    # directory.
+    (requests_dir / 'consumed').write_text('not a directory\n')
+
+    client = RecordingClient({5321: _row('blocked')})
+    summary = _run(requests_dir, client)
+    assert summary.applied == 1 and summary.failed == 0
+    err = capsys.readouterr().err
+    assert 'archiving failed' in err          # loud, never silent
+    # Left at the top level, so the next run will see it again.
+    assert 'redispatch-5321-gate_closure.json' in _top_level(requests_dir)
+
+
+def test_a_request_left_behind_by_a_failed_archive_is_a_no_op_next_run(requests_dir):
+    """The load-bearing claim in archive_request's failure branch: the next
+    run's guard skips the file as already-applied rather than re-transitioning
+    the row. Pinned here so the branch's comment cannot quietly become false."""
+    _req(requests_dir, 5321, 'gate_closure')
+    (requests_dir / 'consumed').write_text('not a directory\n')
+    _run(requests_dir, RecordingClient({5321: _row('blocked')}))
+
+    # Second run, with the row now where the first run put it.
+    client = RecordingClient({5321: _row('cancelled')})
+    summary = _run(requests_dir, client)
+    assert summary.skipped == 1 and summary.applied == 0
+    assert client.tools_called == ['get_task']     # the guard read, no write
+
+
 def test_max_writes_stops_after_n_applied_and_defers_the_rest(requests_dir):
     rows = {}
     for tid in range(1, 6):
@@ -950,6 +1085,31 @@ def test_deferred_requests_are_reported_not_silently_truncated(requests_dir, cap
     _run(requests_dir, RecordingClient(rows), max_writes=1)
     err = capsys.readouterr().err
     assert 'deferred' in err
+
+
+def test_max_writes_counts_attempts_so_a_systematically_failing_run_stops(
+        requests_dir):
+    """The cap must engage on the run it exists for.
+
+    `_apply_repend` clears the claimant BEFORE flipping the status, so a run
+    whose flips are all rejected still lands a real mutation on every row while
+    counting each as `failed`. A cap keyed on `applied` alone would sit at zero
+    and clear the claimant on the WHOLE directory -- the store-wide event the
+    cap's own docstring says it exists to prevent.
+    """
+    rows = {}
+    for tid in range(1, 6):
+        _req(requests_dir, tid, 'unmet_dependency')
+        rows[tid] = _row('blocked', task_id=tid)
+    client = RecordingClient(rows, rejects_on={'set_task_status'})
+
+    summary = _run(requests_dir, client, max_writes=2)
+    assert summary.applied == 0
+    assert summary.failed == 2
+    assert summary.deferred == 3
+    # The blast radius that actually reached the store: two claimant clears,
+    # not five.
+    assert client.tools_called.count('set_task_claimant') == 2
 
 
 def test_a_skip_does_not_consume_the_max_writes_budget(requests_dir):
@@ -1018,6 +1178,98 @@ def test_summary_line_reports_every_bucket(requests_dir, capsys):
         assert token in line[0]
 
 
+def test_the_applied_line_carries_the_sweeps_evidence(requests_dir, capsys):
+    """`evidence` is the only operator-facing statement of WHY a row was
+    cancelled, and an applied request is archived out of the top level
+    immediately -- so a journal line without it forces whoever reads it later
+    to go cross-reference the sweep's own stdout."""
+    _req(requests_dir, 5321, 'gate_closure',
+         evidence='escalation 3102-1 resolved at 2026-07-29T04:11Z')
+    _run(requests_dir, RecordingClient({5321: _row('blocked')}))
+    line = [ln for ln in capsys.readouterr().err.splitlines() if 'applied' in ln
+            and 'SUMMARY' not in ln]
+    assert len(line) == 1
+    assert 'escalation 3102-1 resolved at 2026-07-29T04:11Z' in line[0]
+
+
+def test_the_dry_run_line_carries_the_sweeps_evidence(requests_dir, capsys):
+    _req(requests_dir, 5321, 'unmet_dependency', evidence='all deps terminal')
+    _run(requests_dir, RecordingClient({5321: _row('blocked')}), dry_run=True)
+    line = [ln for ln in capsys.readouterr().err.splitlines() if 'WOULD' in ln]
+    assert len(line) == 1 and 'all deps terminal' in line[0]
+
+
+def test_evidence_is_truncated_and_flattened_to_one_line(requests_dir, capsys):
+    """One line per decision is the log format's whole shape; a multi-line or
+    unbounded evidence string would break it."""
+    _req(requests_dir, 5321, 'gate_closure',
+         evidence='dep 1 done\ndep 2 done\n' + 'x' * 500)
+    _run(requests_dir, RecordingClient({5321: _row('blocked')}))
+    lines = [ln for ln in capsys.readouterr().err.splitlines()
+             if 'applied' in ln and 'SUMMARY' not in ln]
+    assert len(lines) == 1
+    assert 'dep 1 done dep 2 done' in lines[0]      # newlines collapsed
+    assert lines[0].endswith('...]')                # truncated, visibly
+    assert len(lines[0]) < 300
+
+
+def test_an_absent_evidence_string_adds_nothing_to_the_line(requests_dir, capsys):
+    _req(requests_dir, 5321, 'gate_closure', evidence='')
+    _run(requests_dir, RecordingClient({5321: _row('blocked')}))
+    line = [ln for ln in capsys.readouterr().err.splitlines() if 'applied' in ln
+            and 'SUMMARY' not in ln][0]
+    assert line.endswith('close applied -> cancelled')
+
+
+def _tool_responder(rows, *, is_error_on=()):
+    """A fake fused-memory: real rows for get_task, isError for named tools."""
+    def responder(payload, n):
+        method = payload.get('method')
+        if method == 'initialize':
+            return (200, {'Content-Type': 'application/json', 'mcp-session-id': 's'},
+                    _json_rpc_ok(payload, {}))
+        if method == 'notifications/initialized':
+            return (202, {}, '')
+        name = payload['params']['name']
+        if name in is_error_on:
+            return _is_error_result(payload, f'Input validation error: {name}')
+        if name == 'get_task':
+            row = rows[int(payload['params']['arguments']['id'])]
+            return (200, {'Content-Type': 'application/json'},
+                    _json_rpc_ok(payload, {'structuredContent': row}))
+        return (200, {'Content-Type': 'application/json'},
+                _json_rpc_ok(payload, {'structuredContent': {'success': True}}))
+
+    return responder
+
+
+def test_a_tool_level_is_error_is_counted_as_failed_not_applied(requests_dir):
+    """End-to-end over a real socket: a FastMCP-level rejection (a renamed tool
+    or a bad wire param) must show up as `failed`, with the request left on
+    disk. Counting it as applied would archive the file and report a green
+    `applied=N` every night while nothing actually transitioned."""
+    _req(requests_dir, 5321, 'gate_closure')
+    responder = _tool_responder({5321: _row('blocked')},
+                                is_error_on={'set_task_status'})
+    with _FakeMcpServer(responder) as srv:
+        with crr.McpClient(srv.url) as client:
+            summary = _run(requests_dir, client)
+    assert summary.failed == 1 and summary.applied == 0
+    assert _top_level(requests_dir) == ['redispatch-5321-gate_closure.json']
+    assert _archived(requests_dir) == []
+
+
+def test_a_tool_level_is_error_on_the_guard_read_is_a_skip(requests_dir):
+    """Fail-safe: an unreadable row cannot show the row is unchanged, so the
+    guard declines rather than writing on an unconfirmed observation."""
+    _req(requests_dir, 5321, 'gate_closure')
+    responder = _tool_responder({5321: _row('blocked')}, is_error_on={'get_task'})
+    with _FakeMcpServer(responder) as srv:
+        with crr.McpClient(srv.url) as client:
+            summary = _run(requests_dir, client)
+    assert summary.skipped == 1 and summary.applied == 0 and summary.failed == 0
+
+
 def test_an_empty_requests_dir_is_a_clean_zero_report(requests_dir):
     summary = _run(requests_dir, RecordingClient({}))
     assert (summary.applied, summary.skipped, summary.failed) == (0, 0, 0)
@@ -1066,6 +1318,54 @@ def test_main_rejects_a_non_positive_max_writes(requests_dir):
         _main(['--requests-dir', str(requests_dir), '--max-writes', '0'],
               RecordingClient({}))
     assert exc.value.code != 0
+
+
+def _summary_lines(capsys):
+    return [ln for ln in capsys.readouterr().err.splitlines() if 'SUMMARY' in ln]
+
+
+def test_a_clean_run_through_main_emits_exactly_one_summary_line(
+        requests_dir, capsys):
+    _req(requests_dir, 5321, 'gate_closure')
+    _main(['--requests-dir', str(requests_dir), '--project-root', REIFY],
+          RecordingClient({5321: _row('blocked')}))
+    assert len(_summary_lines(capsys)) == 1
+
+
+def test_an_unreachable_server_still_emits_a_summary_line(requests_dir, capsys):
+    """OPERATIONS.md tells operators "a red run is found by reading the summary
+    line, not the unit state". A night that died before consume() could report
+    must therefore still emit one -- otherwise a green unit plus a silent
+    journal is indistinguishable from a clean no-op run."""
+    _req(requests_dir, 5321, 'gate_closure')
+
+    def refuse(server):
+        raise ConnectionRefusedError('[Errno 111] Connection refused')
+
+    rc = crr.main(['--requests-dir', str(requests_dir)], client_factory=refuse)
+    assert rc == 0                                   # a failed night, not a failed job
+    err = capsys.readouterr().err
+    assert len([ln for ln in err.splitlines() if 'SUMMARY' in ln]) == 1
+    assert 'RUN FAILED' in err
+    assert 'could not reach the MCP server' in err
+    assert _top_level(requests_dir) == ['redispatch-5321-gate_closure.json']
+
+
+def test_an_unexpected_error_is_not_mislabelled_as_an_unreachable_server(
+        requests_dir, capsys):
+    """`consume` is written never to raise, so anything escaping it is a bug in
+    THIS consumer. Reporting that as "could not reach <server>" sends an
+    operator to check a healthy server instead of reading the traceback."""
+    def explode(server):
+        raise ValueError('bug in the consumer')
+
+    assert crr.main(['--requests-dir', str(requests_dir)],
+                    client_factory=explode) == 0
+    err = capsys.readouterr().err
+    assert 'RUN FAILED' in err
+    assert 'could not reach the MCP server' not in err
+    assert 'unexpected error' in err and 'ValueError' in err
+    assert len([ln for ln in err.splitlines() if 'SUMMARY' in ln]) == 1
 
 
 def test_main_default_max_writes_is_the_blast_radius_cap(requests_dir):

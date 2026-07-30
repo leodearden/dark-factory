@@ -936,11 +936,20 @@ wall-clock field (re-emission is byte-idempotent), which is why mtime is the
 recency signal. Every uncertainty skips: the fail-safe direction is always
 do-nothing.
 
-`--max-writes` (default 5) caps the blast radius; the remainder is reported
-as deferred and picked up next run. Applied requests are archived into a
-`consumed/` subdirectory — retraction-safe, since the sweep's retraction
-globs `redispatch-*.json` at the top level only. A failed apply leaves its
-file in place so the retry is immediate rather than waiting on re-emission.
+`--max-writes` (default 5) caps the blast radius. It counts write-bearing
+**attempts** — applied *plus* failed — not successes: the re-dispatch path
+clears the claimant before it flips the status, so a run whose flips are all
+being rejected still mutates every row it touches, and a cap keyed on
+successes alone would never engage on exactly that run. The remainder is
+reported as deferred and picked up next run.
+
+Applied requests are archived into a `consumed/` subdirectory —
+retraction-safe, since the sweep's retraction globs `redispatch-*.json` at
+the top level only. A failed apply leaves its file in place so the retry is
+immediate rather than waiting on re-emission. If the archive move itself
+fails the write still counts as applied and says so loudly; the next run's
+guard then skips the file as already-applied rather than re-transitioning
+the row.
 
 **Two things the consumer deliberately will not do.**
 
@@ -974,14 +983,24 @@ No `dark-factory-orchestrator.yaml` change and no orchestrator redeploy is
 involved in either step.
 
 **Reading the output.** Every line is prefixed
-`consume_redispatch_requests:` and the run ends with one summary line:
+`consume_redispatch_requests:` and the run ends with exactly one summary
+line — on **every** exit path, including a night that could not reach the
+server at all:
 
 ```
+consume_redispatch_requests: task 5321 (gate_closure): close applied -> cancelled [escalation esc-5321-1 resolved 2026-07-29T04:11Z]
 consume_redispatch_requests: SUMMARY applied=2 skipped=7 failed=0 deferred=0 planned=0
 ```
 
+The bracketed tail on an applied (or `--dry-run` `WOULD`) line is the
+sweep's own `evidence` string — the only statement of *why* that travels
+with a request, and worth reading before undoing anything, since the file
+itself is archived out of the way the moment the write lands.
+
 - `applied` — writes that landed (checked against the tool response, not
-  assumed from the absence of an exception)
+  assumed from the absence of an exception: a JSON-RPC `error` envelope, a
+  FastMCP `isError` result, and an embedded `success: False` all count as
+  failures)
 - `skipped` — a guard declined, or the file failed validation; the reason is
   on its own line above
 - `failed` — a write was attempted and did not land; the file stays put
@@ -998,6 +1017,12 @@ can fail enters systemd `failed` state and stays there, silently stopping
 the whole nightly job. Per-request failures are reported and counted
 instead, so a red run is found by reading the summary line, not the unit
 state.
+
+A night that could not run at all logs a `RUN FAILED` line ahead of its
+(zeroed) summary, and distinguishes the two cases it could be — `could not
+reach the MCP server` (a transport problem: check the fused-memory unit) vs
+`aborted on an unexpected error` (a bug in the consumer: read the exception
+type on that line). Requests are left in place either way.
 
 ---
 

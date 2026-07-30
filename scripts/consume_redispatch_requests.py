@@ -72,7 +72,6 @@ from datetime import datetime, timezone
 # whatever default the transport happened to send.
 CLIENT_NAME = 'reify-redispatch-consumer'
 CLIENT_VERSION = '1.0'
-AGENT_ID = 'reify-redispatch-consumer'
 
 DEFAULT_SERVER = 'http://127.0.0.1:8002/mcp'
 DEFAULT_TIMEOUT = 30.0
@@ -262,6 +261,19 @@ def load_request(path) -> Request:
     )
 
 
+def _tool_error_text(content: dict) -> str:
+    """The human-readable message out of an ``isError`` tool result.
+
+    FastMCP puts it in a text content block; fall back to the raw payload so a
+    shape we did not anticipate is still reported rather than reduced to a bare
+    "it failed".
+    """
+    for entry in content.get('content', []) or []:
+        if isinstance(entry, dict) and entry.get('type') == 'text':
+            return str(entry.get('text', ''))[:400]
+    return repr(content)[:400]
+
+
 class McpClient:
     """Minimal streamable-HTTP JSON-RPC MCP client on ``urllib.request``.
 
@@ -278,7 +290,8 @@ class McpClient:
       3. A `text/event-stream` response is read by extracting its first
          `data:` line.
       4. `result.structuredContent` is unwrapped, with a text-content JSON
-         fallback, and a JSON-RPC `error` envelope RAISES.
+         fallback, and a JSON-RPC `error` envelope RAISES -- as does a
+         tool-level `isError` result, which arrives inside a 200.
     """
 
     def __init__(self, url: str = DEFAULT_SERVER, timeout: float = DEFAULT_TIMEOUT):
@@ -351,6 +364,16 @@ class McpClient:
         if 'error' in result:
             raise RuntimeError(f'{name} failed: {result["error"]}')
         content = result.get('result', {})
+        # A TOOL-level error arrives INSIDE a 200 as `isError: true`, not as a
+        # JSON-RPC error envelope. fused-memory's own `@mcp_tool_errors()`
+        # converts in-tool exceptions to an `{'error': ...}` payload that
+        # `rejection_reason` reads, but FastMCP-level failures -- argument
+        # validation, an unknown or renamed tool -- bypass that decorator
+        # entirely and surface only this way. Without the check, exactly those
+        # failure modes would read as landed writes forever. The orchestrator
+        # makes the same check for the same reason (scheduler.py:3817).
+        if isinstance(content, dict) and content.get('isError'):
+            raise RuntimeError(f'{name} failed (isError): {_tool_error_text(content)}')
         if 'structuredContent' in content:
             return content['structuredContent']
         for entry in content.get('content', []) or []:
@@ -534,6 +557,13 @@ def rejection_reason(response) -> str | None:
     """
     if not isinstance(response, dict):
         return None
+    if '_raw' in response:
+        # :meth:`McpClient.call_tool` could not read the tool's text block as
+        # JSON. An UNPARSED payload is not evidence that a write landed, and
+        # the shape it actually turns up in is a bare error string
+        # ("Input validation error: ..."), so read it as a rejection rather
+        # than as a success carrying no `error` key for the checks below.
+        return f'unparsed tool response: {str(response["_raw"])[:200]}'
     if response.get('error'):
         hint = response.get('hint') or response.get('error_type') or ''
         return f'{response["error"]}{" — " + hint if hint else ""}'
@@ -627,8 +657,10 @@ def apply_request(client, req: Request, project_root: str) -> bool:
 # claimant check, L4 confining classes A and C to `blocked` rows, and this
 # consumer's compare-and-swap -- but a cap turns any residual gap from a
 # store-wide event into a handful of transitions an operator can read in the
-# journal and undo. The remainder is DEFERRED and reported, never silently
-# dropped: the files stay on disk and the next run picks them up.
+# journal and undo. It counts write-bearing ATTEMPTS (applied + failed), so a
+# run that is failing systematically stops just as promptly as one that is
+# succeeding. The remainder is DEFERRED and reported, never silently dropped:
+# the files stay on disk and the next run picks them up.
 DEFAULT_MAX_WRITES = 5
 
 ARCHIVE_DIRNAME = 'consumed'
@@ -648,6 +680,31 @@ class Summary:
         return (f'SUMMARY applied={self.applied} skipped={self.skipped} '
                 f'failed={self.failed} deferred={self.deferred} '
                 f'planned={self.planned}')
+
+
+# How much of the sweep's `evidence` string a journal line carries. Long enough
+# for the one-line rationales the three classifiers actually emit, short enough
+# that a capped run stays readable in `journalctl`.
+_EVIDENCE_MAX = 160
+
+
+def _evidence(req: Request) -> str:
+    """The sweep's own statement of WHY, formatted for a journal line.
+
+    ``evidence`` is the only operator-facing rationale that travels with a
+    request, and an applied request is archived out of the top level the moment
+    the write lands -- so a line that drops it forces whoever reads
+    "task 5321 (gate_closure): close applied -> cancelled" six weeks later to
+    go cross-reference the sweep's own stdout to learn why. Whitespace is
+    collapsed so a multi-line evidence string cannot break the one-line-per-
+    decision property the log format rests on.
+    """
+    text = ' '.join((req.evidence or '').split())
+    if not text:
+        return ''
+    if len(text) > _EVIDENCE_MAX:
+        text = text[:_EVIDENCE_MAX - 3] + '...'
+    return f' [{text}]'
 
 
 def archive_request(req: Request) -> bool:
@@ -675,14 +732,19 @@ def archive_request(req: Request) -> bool:
 
 
 def consume(requests_dir, client, *, project_root: str,
-            max_writes: int = DEFAULT_MAX_WRITES, dry_run: bool = False) -> Summary:
+            max_writes: int = DEFAULT_MAX_WRITES, dry_run: bool = False,
+            summary: Summary | None = None) -> Summary:
     """Drain *requests_dir*. Never raises; every outcome is counted and reported.
 
     A missing or empty directory is a clean zero-request report, not an error:
     on a first run the sweep may not have created it yet, and "the sweep found
     nothing to emit" is the normal steady state.
+
+    *summary* lets a caller OWN the tally rather than receive it at the end, so
+    that :func:`main` can still report what was done if this function dies
+    part-way through. The line is logged here on the normal path, exactly once.
     """
-    summary = Summary()
+    summary = Summary() if summary is None else summary
     paths = discover_requests(requests_dir)
     if not paths:
         log(f'no requests in {requests_dir}')
@@ -696,11 +758,19 @@ def consume(requests_dir, client, *, project_root: str,
             log(f'{os.path.basename(path)}: SKIP (invalid) — {req.skip_reason}')
             continue
 
-        # The cap bounds WRITES, not requests looked at -- checked here, after
-        # validation but before the guard read, so a directory full of
-        # already-applied no-ops can never starve the requests that still need
-        # work.
-        if not dry_run and summary.applied >= max_writes:
+        # The cap bounds WRITE-BEARING ATTEMPTS, not requests looked at --
+        # checked here, after validation but before the guard read, so a
+        # directory full of already-applied no-ops can never starve the
+        # requests that still need work.
+        #
+        # ATTEMPTS, not successes, and that distinction is the whole point:
+        # `_apply_repend` clears the claimant BEFORE the status flip, so a run
+        # whose flips are systematically rejected (a gate that starts
+        # enforcing, a `success: False` on blocked->pending) still lands a real
+        # mutation on every row it touches while counting each one as `failed`.
+        # A cap keyed on `applied` alone would sit at zero and never engage on
+        # exactly the run it exists for -- a store-wide claimant clear.
+        if not dry_run and summary.applied + summary.failed >= max_writes:
             summary.deferred += 1
             log(f'task {req.task_id}: DEFERRED — --max-writes={max_writes} reached; '
                 f'the file stays put for the next run')
@@ -715,13 +785,14 @@ def consume(requests_dir, client, *, project_root: str,
         if dry_run:
             summary.planned += 1
             log(f'task {req.task_id} ({req.cls}): WOULD {req.action} '
-                f'-> {ACTION_TARGET_STATUS[req.action]} [dry-run]')
+                f'-> {ACTION_TARGET_STATUS[req.action]} [dry-run]'
+                f'{_evidence(req)}')
             continue
 
         if apply_request(client, req, project_root):
             summary.applied += 1
             log(f'task {req.task_id} ({req.cls}): {req.action} applied '
-                f'-> {ACTION_TARGET_STATUS[req.action]}')
+                f'-> {ACTION_TARGET_STATUS[req.action]}{_evidence(req)}')
             archive_request(req)
         else:
             summary.failed += 1
@@ -777,21 +848,45 @@ def main(argv=None, *, client_factory=None) -> int:
         build_parser().error('--max-writes must be >= 1')
 
     factory = client_factory or (lambda server: McpClient(server))
+    summary = Summary()
+    reported = False
     try:
         client = factory(args.server)
         if hasattr(client, '__enter__'):
             with client as connected:
                 consume(args.requests_dir, connected,
                         project_root=args.project_root,
-                        max_writes=args.max_writes, dry_run=args.dry_run)
+                        max_writes=args.max_writes, dry_run=args.dry_run,
+                        summary=summary)
+                reported = True
         else:
             consume(args.requests_dir, client, project_root=args.project_root,
-                    max_writes=args.max_writes, dry_run=args.dry_run)
+                    max_writes=args.max_writes, dry_run=args.dry_run,
+                    summary=summary)
+            reported = True
     except Exception as exc:
-        # An outage reaching the server is a failed NIGHT, not a failed job:
-        # the requests are still on disk and the next run retries them.
-        log(f'RUN FAILED to reach {args.server}: {type(exc).__name__}: {exc} — '
-            f'requests left in place for the next run')
+        # A night that could not run at all is a failed NIGHT, not a failed
+        # job: the requests are still on disk and the next run retries them.
+        #
+        # Say WHICH kind of failure it was rather than asserting the one that
+        # is merely likeliest. An OSError (urllib.error.URLError included) here
+        # really is a transport problem; anything else escaping `consume` --
+        # which is written never to raise -- is a bug in this consumer, and
+        # labelling that "failed to reach <server>" sends an operator to check
+        # a healthy server instead of reading the traceback.
+        what = ('could not reach the MCP server' if isinstance(exc, OSError)
+                else 'aborted on an unexpected error')
+        log(f'RUN FAILED — {what} ({args.server}): {type(exc).__name__}: {exc} '
+            f'— requests left in place for the next run')
+    finally:
+        # ONE summary line on EVERY exit path. OPERATIONS.md tells operators
+        # that "a red run is found by reading the summary line, not the unit
+        # state" -- so a night that died before `consume` could report its own
+        # must still emit one here, or a green unit plus a silent journal is
+        # indistinguishable from a clean no-op run. `summary` is owned by this
+        # function precisely so a part-way death still reports what it did.
+        if not reported:
+            log(summary.line())
     return 0
 
 
