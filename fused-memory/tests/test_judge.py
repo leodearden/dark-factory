@@ -1626,6 +1626,72 @@ class TestCallJudgeCliStructuredOutputTaxonomy:
         assert err.code == 'cli_output_unparseable'
 
     @pytest.mark.asyncio
+    async def test_non_dict_findings_items_is_cli_output_unparseable(self):
+        """A findings LIST whose ITEMS are not dicts is still not a usable verdict.
+
+        ``JudgeVerdict.findings`` is ``list[dict]``
+        (models/reconciliation.py:241), so a list of bare strings passes the
+        findings-is-a-list guard and then dies as a pydantic ValidationError
+        inside _verdict_from_payload — uncaught on the dict branch of
+        _parse_verdict, hence swallowed by review_run's broad except into a
+        silent None with NO infra accounting (the streak is popped one line
+        before _parse_verdict runs).
+
+        severity='serious' is deliberate: this is the exact payload shape that
+        would otherwise produce the phantom halt this whole task exists to
+        prevent.
+        """
+        from shared.cli_invoke import AgentResult
+
+        err = await self._raises(AgentResult(
+            success=True,
+            output='prose',
+            structured_output={'severity': 'serious', 'findings': ['a bare string finding']},
+            output_tokens=727,
+        ))
+        assert err.code == 'cli_output_unparseable'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('payload', [
+        {'severity': 'ok', 'findings': [{'issue': 'x'}]},
+        {'severity': 'ok', 'findings': []},
+    ])
+    async def test_findings_dict_items_are_accepted(self, payload):
+        """The guard must not be over-broad: a well-formed findings list is
+        RETURNED, not raised.  Without this pin, the fix above could be
+        'satisfied' by rejecting every payload that has findings at all."""
+        from shared.cli_invoke import AgentResult
+
+        judge = self._judge()
+        with patch(
+            'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+            new=AsyncMock(return_value=AgentResult(
+                success=True, output='', structured_output=payload,
+            )),
+        ):
+            assert await judge._call_judge_cli('prompt') == payload
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('payload', [
+        {'severity': 'ok', 'findings': [['nested', 'list']]},
+        {'severity': 'ok', 'findings': [None]},
+    ])
+    async def test_every_judge_verdict_field_constraint_is_enforced(self, payload):
+        """GENERALISATION GUARD — structurally plausible payloads that violate a
+        JudgeVerdict field constraint no hand-written guard above checks.
+
+        This is what forces validation to run CENTRALLY against the real model
+        rather than accreting one more hand-mirrored isinstance() check that the
+        next field added to JudgeVerdict would slip straight past.
+        """
+        from shared.cli_invoke import AgentResult
+
+        err = await self._raises(
+            AgentResult(success=True, output='prose', structured_output=payload)
+        )
+        assert err.code == 'cli_output_unparseable'
+
+    @pytest.mark.asyncio
     async def test_genuine_empty_output_is_not_conflated_with_infra(self):
         """(g) REGRESSION GUARD — the benign exit-0/empty-stdout legacy contract
         ('empty stdout = valid empty verdict') still returns '' and must NOT be
@@ -1697,6 +1763,59 @@ class TestReviewRunNoStructuredVerdict:
             session_id='jsess-cap',
             output_tokens=727,
         )
+
+    @staticmethod
+    def _non_dict_findings_success():
+        """A success whose payload passes every hand-written guard but violates
+        ``JudgeVerdict.findings: list[dict]`` — the reviewer-confirmed hole."""
+        from shared.cli_invoke import AgentResult
+
+        return AgentResult(
+            success=True,
+            output='prose',
+            structured_output={'severity': 'serious', 'findings': ['a bare string finding']},
+            session_id='jsess-cap',
+            output_tokens=727,
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_dict_findings_success_is_counted_as_infra(self, mock_journal):
+        """A model-invalid structured payload must be COUNTED, not vanish.
+
+        Before the central validation probe, this payload produced "no verdict,
+        no halt, AND no signal": the ValidationError escaped _parse_verdict's
+        dict branch into review_run's broad except, and the infra streak had
+        already been popped one line earlier — so the occurrence never counted
+        toward judge_infra_max_consecutive_failures and no halt could EVER fire.
+        """
+        judge = self._setup(
+            mock_journal, 'proj-nostruct-findings',
+            halt_on_judge_serious=True, judge_infra_max_consecutive_failures=3,
+        )
+        with patch(
+            'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+            new=AsyncMock(return_value=self._non_dict_findings_success()),
+        ):
+            first = await judge.review_run('run-nostruct')
+
+            # First occurrence: still no fabricated severity=serious row.
+            assert first is None
+            mock_journal.add_verdict.assert_not_called()
+            mock_journal.set_halt.assert_not_called()
+            assert judge.is_halted('proj-nostruct-findings') is False
+
+            for _ in range(2):
+                await judge.review_run('run-nostruct')
+
+        # The assertion the reviewer's finding turns on: the occurrences are
+        # COUNTED, so the third consecutive one halts — truthfully.
+        assert judge.is_halted('proj-nostruct-findings')
+        reason = judge.halt_reason('proj-nostruct-findings')
+        assert reason is not None
+        assert reason.startswith('judge-unreachable halt')
+        assert 'Serious verdict' not in reason
+        assert 'Unparseable judge response' not in reason
+        mock_journal.add_verdict.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_first_occurrence_stamps_no_verdict_and_does_not_halt(self, mock_journal):
