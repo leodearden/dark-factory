@@ -919,7 +919,10 @@ def create_server(
         When omitted, all pending escalations are returned regardless of level.
 
         *task_id* — when set, restricts the search to escalations for that task.
-        Both filters can be combined.
+        Both filters can be combined.  NOTE: this lookup is PENDING-ONLY by
+        design (it never scans the resolved/dismissed archive).  To ask "did
+        ANY escalation ever exist for this task", use ``get_task_escalations``
+        instead — an empty result here is not evidence of absence.
 
         *compact* — when True, each returned dict is projected to only the
         triage-relevant fields (``id``, ``task_id``, ``category``, ``severity``,
@@ -937,6 +940,71 @@ def create_server(
             escalations = queue.get_pending()
             if level is not None:
                 escalations = [e for e in escalations if e.level == level]
+        if compact:
+            return [
+                {k: d[k] for k in _COMPACT_ESCALATION_FIELDS}
+                for d in (e.to_dict() for e in escalations)
+            ]
+        return [e.to_dict() for e in escalations]
+
+    @mcp.tool()
+    def get_task_escalations(
+        task_id: str,
+        status: str | None = None,
+        level: int | None = None,
+        agent_role: str | None = None,
+        compact: bool = False,
+    ) -> list[dict[str, Any]]:
+        """List EVERY escalation ever filed for a task — ARCHIVE-INCLUSIVE by default.
+
+        This is the archive-inclusive counterpart to
+        ``get_pending_escalations(task_id=...)``.  When an escalation is
+        resolved or dismissed its file is MOVED out of the queue root into
+        ``data/escalations/archive/<date>/``, where the pending-only lookup
+        cannot see it — by design.  This tool scans the queue root PLUS that
+        archive, so a human-resolved record still shows up here.
+
+        **Evidence-of-absence contract (read this before asserting a gap).**
+        An empty ``get_pending_escalations(task_id=...)`` result is NOT
+        evidence that an escalation record never existed — it is the EXPECTED
+        result once a human has resolved the record.  An empty
+        ``get_task_escalations(task_id=...)`` result is evidence of absence
+        **for the queue THIS server is backed by, and for nothing else.**
+        ``create_server`` backs more than one queue (the orchestrator queue and
+        the reconciliation queue are separate stores), so a caller connected to
+        one of them learns nothing about records in the other: confirm which
+        queue you are talking to before reading any [] as a gap.  Auditing a
+        ``done`` ``task_kind='deterministic'`` gate task that has
+        ``metadata.gate_escalated_at`` set?  Those records live in the
+        ORCHESTRATOR queue — call this tool against THAT server before emitting
+        any finding, flag, memory or remediation task claiming the escalation
+        record was never written.  (Reconciliation stages are denied this tool
+        outright — see DISALLOW_ESCALATION_READS in fused-memory's
+        reconciliation/cli_stage_runner.py — precisely because their connection
+        is to the other store.)
+
+        *status* — ``None`` (default) returns records in every state,
+        scanning root + archive.  ``'pending'`` short-circuits to the
+        root-only fast path.  Any other value (``'resolved'``,
+        ``'dismissed'``, …) filters across both tiers.
+
+        *level* — 0 = L0 (agent→steward), 1 = L1 (steward/workflow→
+        auto-watcher), 2 = L2 (auto-watcher→human).  ``None`` = no filter.
+
+        *agent_role* — restricts to escalations filed by that exact role
+        (e.g. ``'deterministic'`` for deterministic-gate records).
+        ``None`` = no filter.
+
+        *compact* — when True, each dict is projected to the same
+        triage-relevant field subset ``get_pending_escalations(compact=True)``
+        returns, so the two task-scoped lookups are shape-compatible.
+
+        No connection-capability gate applies: this is a read-only lookup,
+        mirroring ``get_escalation``.
+        """
+        escalations = queue.get_by_task(
+            task_id, status=status, level=level, agent_role=agent_role,
+        )
         if compact:
             return [
                 {k: d[k] for k in _COMPACT_ESCALATION_FIELDS}

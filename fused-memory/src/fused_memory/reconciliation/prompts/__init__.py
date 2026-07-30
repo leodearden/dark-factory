@@ -86,6 +86,51 @@ _ESCALATION_BOUNDARY_NO_ACTION = (
     'it from there.'
 )
 
+# The one concrete case the boundary note above exists for (task 3023), rendered
+# as a SUBSECTION of it rather than as a second top-level block elsewhere in the
+# prompt. Everything general — store identity, the missing escalation read tools,
+# "an empty result is not evidence of absence", "never flag 'no escalation was
+# filed for task X'" — is stated ONCE, in ESCALATION_BOUNDARY_NOTE (INV-5); this
+# constant adds only what is NOT already there: the POSITIVE closure rule read
+# off the task record, and the incident lineage.
+#
+# Do NOT restate the pending-only semantics of `get_pending_escalations` here, or
+# present any `mcp__escalation__*` read as a probe the stage ran or could run: the
+# escalation READ tools are denied to every stage (DISALLOW_ESCALATION_READS in
+# cli_stage_runner.py) and the denial OMITS them from the tool listing, so
+# describing them as available contradicts both the note above and the stage's
+# actual tool surface. The bare token `get_task_escalations` is retained
+# deliberately — registry source_assertion #2 of
+# `deterministic_gate_escalation_record_archived_not_missing`
+# (config/recon_code_fix_premise_registry.yaml) reads this file's text — and is
+# described accurately, as an ORCHESTRATOR-side lookup no stage can reach.
+#
+# NOTE: a PLAIN (non-f) string interpolated into the stage f-strings, so its
+# literal braces need no doubling. Keep it free of bare recon-report tool call
+# examples (see test_recon_report_guidance_drift.py, which scans the assembled
+# stage prompts and requires every such example to carry `run_id=`).
+_GATE_CLOSURE_ARCHIVE_GUIDANCE = """\
+### Deterministic-gate closure is established from the TASK RECORD
+Scope: a `done` task with `task_kind='deterministic'`, `metadata.gate_escalated_at` \
+set, and a `done_provenance.kind` of `deterministic-gate` or `deterministic-milestone`.
+
+Call `mcp__fused-memory__get_task(task_id)` — a READ you do hold. `status == 'done'` \
+PLUS `metadata.gate_escalated_at` set PLUS one of those `done_provenance.kind` values \
+IS LEGITIMATE CLOSURE on its own; this rule is primary and sufficient. Do not flag such \
+a task, do not file remediation work against it, and do not write a memory asserting a \
+missing escalation record. An archive-inclusive `get_task_escalations` lookup that would \
+confirm the record directly does exist, but only on the ORCHESTRATOR-side escalation \
+server, which is not part of your tool surface — that changes nothing about the rule \
+here, which needs no escalation lookup at all.
+
+Incident lineage, so you recognise this pattern rather than re-deriving it: dark_factory \
+tasks 2841, 2842, 2844, 2846, 2919, 2954, 2955, 2958, 2999, 3005, 3006 and reify tasks \
+5330, 5341, 5349, 5352, 5353 were all filed on the false premise that these gates closed \
+without an escalation record. The orchestrator side (`deterministic_runner.py` / \
+`harness.py`) already queries the archive inclusively and is NOT the defect — do not file \
+work against it.\
+"""
+
 
 def render_escalation_boundary_note(*, can_escalate: bool) -> str:
     """Render the escalation-store boundary note for one stage.
@@ -117,15 +162,18 @@ def render_escalation_boundary_note(*, can_escalate: bool) -> str:
             escalation action.
 
     Returns:
-        ESCALATION_BOUNDARY_NOTE followed by the matching sanctioned-action
-        clause. The shared core appears exactly once either way (INV-5).
+        ESCALATION_BOUNDARY_NOTE, the matching sanctioned-action clause, and the
+        deterministic-gate closure subsection (:data:`_GATE_CLOSURE_ARCHIVE_GUIDANCE`,
+        task 3023) — the one concrete case this boundary exists for, rendered here
+        so the shared core still appears exactly once (INV-5) instead of being
+        restated by a second block elsewhere in the prompt.
     """
     clause = (
         _ESCALATION_BOUNDARY_SANCTIONED_WRITE
         if can_escalate
         else _ESCALATION_BOUNDARY_NO_ACTION
     )
-    return f'{ESCALATION_BOUNDARY_NOTE} {clause}'
+    return f'{ESCALATION_BOUNDARY_NOTE} {clause}\n\n{_GATE_CLOSURE_ARCHIVE_GUIDANCE}'
 
 # Shared guidance about the memory_ids=[] + stores=['graphiti'] → graphiti_writes_queued
 # invariant.  Both stages need to teach the LLM not to count async-enqueued Graphiti
