@@ -8,6 +8,7 @@ Each task gets its own ``CLAUDE_CONFIG_DIR`` so that:
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import os
@@ -173,10 +174,38 @@ class TaskConfigDir:
     a ``write_credentials()`` method to set per-invocation OAuth tokens.
     """
 
-    def __init__(self, task_id: str, base_dir: Path | None = None):
+    def __init__(
+        self,
+        task_id: str,
+        base_dir: Path | None = None,
+        *,
+        cleanup_at_exit: bool = False,
+    ):
+        """Create (or adopt) the config dir for *task_id*.
+
+        ``cleanup_at_exit`` registers a best-effort ``atexit`` teardown,
+        mirroring ``neutral_cwd.py``: it binds the resolved ``Path`` only —
+        never ``self`` — so the atexit table cannot keep this object (and
+        transitively an owning ``UsageGate`` and its account tokens) alive
+        for the life of the process. ``ignore_errors=True`` makes it a
+        harmless no-op after an explicit ``cleanup()``.
+
+        This is the CLEAN-EXIT half only. No atexit hook survives SIGKILL,
+        and the fleet SIGKILLs and restarts its units routinely — what
+        actually bounds the on-disk population is ``sweep_stale_pid_dirs``,
+        run by the next process to start.
+
+        Defaults to False, and that default is load-bearing: per-task and
+        per-investigation config dirs (created under a worktree's ``.task/``)
+        are deliberately preserved so the session JSONL inside them survives
+        for transcript archival and ``--resume``. Only ephemeral scratch dirs
+        under /tmp — the ``UsageGate`` probe dirs — opt in.
+        """
         base = base_dir or Path(tempfile.gettempdir())
         self._dir = base / f'{CONFIG_DIR_PREFIX}{task_id}'
         self._dir.mkdir(parents=True, exist_ok=True)
+        if cleanup_at_exit:
+            atexit.register(shutil.rmtree, self._dir, ignore_errors=True)
         self._setup_symlinks()
 
     def _setup_symlinks(self) -> None:
