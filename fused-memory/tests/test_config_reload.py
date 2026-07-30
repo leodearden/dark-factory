@@ -479,7 +479,8 @@ class TestMem0UpdateLeavesAreGreenTier:
         object.__setattr__(fresh.mem0_update, 'enabled', False)
         result = apply_reload(live, fresh)
 
-        assert 'mem0_update.enabled' in result.applied
+        assert result['reloaded'] is True, f'reload failed: {result.get("error")!r}'
+        assert 'mem0_update.enabled' in result['applied']
         assert resolve_mem0_update_authorization(
             svc, agent_id='recon-stage-1', content_amend=True, metadata_patch=False,
         ).allowed is False, (
