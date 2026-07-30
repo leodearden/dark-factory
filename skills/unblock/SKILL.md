@@ -302,10 +302,12 @@ The merge procedure is iterative — don't assume one pass will be enough:
        worktree="<WORKTREE>",
        description="<brief description of what landed>",
        wait_secs=100,
-       verified_green=True,
+       verified_green=<decide per step 6's D2 — see the note below; do not default this to True>,
    )
    ```
-   `wait_secs=100` equals the server's `_MAX_WAIT_SECS` clamp ceiling. A fast merge can resolve terminally inside this single bounded call; a backlogged queue returns `queued` or `attached` within ≤100 s. `verified_green=True` is the **D2** vouch from step 6 — it asserts that the full verification suite just passed against the exact commit being submitted, this iteration — it emits a `workflow_verify` event so a later merge failure caused by an unrelated main landing can be attributed as `INTEGRATION_SKEW` instead of degrading to `INDETERMINATE`.
+   `wait_secs=100` equals the server's `_MAX_WAIT_SECS` clamp ceiling. A fast merge can resolve terminally inside this single bounded call; a backlogged queue returns `queued` or `attached` within ≤100 s.
+
+   **`verified_green` is the D2 vouch from step 6 — decide it, don't assume it.** Pass `True` only if the full-scope verification suite ran and passed against the exact commit you are submitting, *this* iteration; otherwise pass `False` (or omit it). In particular: **if you reached step 7 via step 6's D1 empty-intersection terminator, pass `verified_green=False`** — D1 lets you skip the re-verify loop, which is precisely the case where no fresh verify backs this tip. Same for a resubmission after a conflict fix-up you didn't re-verify. When `True` is warranted it emits a `workflow_verify` event so a later merge failure caused by an unrelated main landing can be attributed as `INTEGRATION_SKEW` instead of degrading to `INDETERMINATE`; passing it unearned buys nothing and corrupts that attribution.
 
    **Caution — not retractable:** the classifier's green fact is *any-prior-green, keyed by task ID*, not scoped to the specific commit that was verified. Once `verified_green=True` has been emitted once for this task ID, a **later** resubmission for the same task (e.g. another `/unblock` pass after a conflict fix-up you re-verified via step 6's D1 path instead of a fresh full verify) can still inherit that earlier green even though this round wasn't re-verified — a genuine `BRANCH_BUG` could then be misattributed to `INTEGRATION_SKEW`. Only pass `True` when the full verify just passed, in this iteration, on the branch you're submitting now — **D1's empty-intersection terminator never satisfies D2**; they are checked independently every time you reach this step.
 
