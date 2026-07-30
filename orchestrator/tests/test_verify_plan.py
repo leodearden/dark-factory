@@ -333,6 +333,7 @@ class TestPlannedRun:
             cmd=cmd,
             scope_kind=ScopeKind.FILE_SCOPED,
             reason='file-scoped collectable test',
+            scoped_targets=('a/test_x.py',),
         )
         d = run.to_dict()
         assert d == {
@@ -349,7 +350,31 @@ class TestPlannedRun:
             },
             'scope_kind': 'file_scoped',
             'reason': 'file-scoped collectable test',
+            'scoped_targets': ['a/test_x.py'],
         }
+        json.dumps(d)  # D3: must not raise.
+
+    def test_scoped_targets_defaults_to_empty_tuple(self):
+        """The field is defaulted, so every existing 4-arg construction stays valid.
+
+        Empty is the CORRECT value for a SKIPPED slot — nothing ran, so
+        nothing was narrowed (task 3219's "non-empty iff FILE_SCOPED").
+        """
+        run = PlannedRun('m', None, ScopeKind.SKIPPED, 'x')
+        assert run.scoped_targets == ()
+
+    def test_to_dict_records_scoped_targets_as_json_native_list(self):
+        """D3: the tuple serialises as a plain list, per _verify_cmd_to_dict's convention."""
+        run = PlannedRun(
+            module_prefix='orchestrator',
+            cmd=parse_config_command('pytest -q'),
+            scope_kind=ScopeKind.FILE_SCOPED,
+            reason='pytest: file-scoped to touched test file(s)',
+            scoped_targets=('a/test_x.py', 'a/test_y.py'),
+        )
+        d = run.to_dict()
+        assert d['scoped_targets'] == ['a/test_x.py', 'a/test_y.py']
+        assert isinstance(d['scoped_targets'], list)
         json.dumps(d)  # D3: must not raise.
 
     def test_skipped_run_serialises_cmd_null_with_nonempty_reason(self):
@@ -393,7 +418,7 @@ class TestVerifyPlan:
         assert d['runs'][0]['scope_kind'] == 'full_suite'
         assert d['runs'][1] == {
             'module_prefix': 'shared', 'cmd': None, 'scope_kind': 'skipped',
-            'reason': 'no files under prefix',
+            'reason': 'no files under prefix', 'scoped_targets': [],
         }
         # D3: round-trips through the real json module byte-for-byte as data.
         assert json.loads(json.dumps(d)) == d
