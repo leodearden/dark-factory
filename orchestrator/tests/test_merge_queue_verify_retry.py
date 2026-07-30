@@ -441,6 +441,123 @@ async def test_run_post_merge_verify_leaves_sink_empty_when_not_narrowed(
 
 
 # ---------------------------------------------------------------------------
+# _load_reify_attempt_sidecar — the DRIFT TRIPWIRE (task 3059, WORK item 5).
+#
+# READ THIS BEFORE "FIXING" A FAILURE HERE.  These tests are pinned to the
+# CHECKED-IN REAL BYTES of the sidecar reify actually writes
+# (tests/fixtures/reify_verify_retry/reify-verify-attempt.json, captured from a
+# live warm lane on 2026-07-30).  A failure in this class means the DF/reify
+# seam has DRIFTED.  The correct response is to RE-CAPTURE the fixture from a
+# live lane and fix this consumer.  Do NOT edit the fixture to make a test pass
+# — the shipped D2 producer was authored from its own docstring rather than the
+# producer's bytes, and that is exactly the failure this task exists to undo.
+#
+# The prior D2 loader read a DF-invented `.reify-verify-retry/attempt0.json`
+# that nothing in reify or DF has ever written.
+# ---------------------------------------------------------------------------
+
+_REIFY_FIXTURE_DIR = Path(__file__).parent / 'fixtures' / 'reify_verify_retry'
+_REIFY_SIDECAR_FIXTURE = _REIFY_FIXTURE_DIR / 'reify-verify-attempt.json'
+
+
+def _place_real_sidecar(merge_wt: Path, text: str | None = None) -> Path:
+    """Copy the fixture bytes VERBATIM to the path reify writes under merge_wt."""
+    from orchestrator.merge_queue import _REIFY_ATTEMPT_SIDECAR_RELPATH
+
+    path = merge_wt / _REIFY_ATTEMPT_SIDECAR_RELPATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        _REIFY_SIDECAR_FIXTURE.read_text() if text is None else text
+    )
+    return path
+
+
+def test_reify_attempt_sidecar_relpath_is_reifys_default() -> None:
+    """The sidecar path constant equals reify's REIFY_VERIFY_ATTEMPT_SIDECAR default.
+
+    A bare string equality on purpose: reify's verify.sh:738 defines
+    ``_ATTEMPT_SIDECAR_PATH="${REIFY_VERIFY_ATTEMPT_SIDECAR:-target/reify-verify-attempt.json}"``,
+    so if that default moves this fails LOUDLY at the constant rather than
+    silently degrading every retry to a full verify.
+    """
+    from orchestrator.merge_queue import _REIFY_ATTEMPT_SIDECAR_RELPATH
+
+    assert _REIFY_ATTEMPT_SIDECAR_RELPATH == 'target/reify-verify-attempt.json'
+
+
+def test_reify_attempt_sidecar_fixture_schema_is_exactly_three_keys() -> None:
+    """The real sidecar carries EXACTLY {tree_oid, profiles, timestamp}.
+
+    Drift in EITHER direction fails: a missing key breaks the loader's
+    assumptions, an extra key means reify started publishing something DF may
+    need to consume.
+    """
+    assert json.loads(_REIFY_SIDECAR_FIXTURE.read_text()).keys() == {
+        'tree_oid',
+        'profiles',
+        'timestamp',
+    }
+
+
+def test_load_reify_attempt_sidecar_parses_real_bytes(tmp_path: Path) -> None:
+    """The loader parses reify's verbatim bytes; `profiles` is a SPACE-DELIMITED STRING.
+
+    Not a JSON list — a reader who assumed a list would get a per-character
+    iteration and silently build a nonsense profile set.
+    """
+    from orchestrator.merge_queue import _load_reify_attempt_sidecar
+
+    _place_real_sidecar(tmp_path)
+    sidecar = _load_reify_attempt_sidecar(tmp_path)
+
+    assert sidecar is not None
+    expected_oid = json.loads(_REIFY_SIDECAR_FIXTURE.read_text())['tree_oid']
+    assert sidecar.tree_oid == expected_oid
+    assert sidecar.profiles == ('debug', 'release')
+
+
+def test_load_reify_attempt_sidecar_absent_file_returns_none(tmp_path: Path) -> None:
+    """No sidecar (reify never stamped one) -> None -> full verify."""
+    from orchestrator.merge_queue import _load_reify_attempt_sidecar
+
+    assert _load_reify_attempt_sidecar(tmp_path) is None
+
+
+@pytest.mark.parametrize(
+    ('label', 'text'),
+    [
+        ('non-JSON bytes', 'not json at all'),
+        ('a JSON array', '["tree_oid", "profiles"]'),
+        ('missing tree_oid', '{"profiles": "debug", "timestamp": "t"}'),
+        ('empty profiles', '{"tree_oid": "abc", "profiles": "", "timestamp": "t"}'),
+        (
+            'whitespace-only profiles',
+            '{"tree_oid": "abc", "profiles": "   ", "timestamp": "t"}',
+        ),
+        (
+            'unknown profile name',
+            '{"tree_oid": "abc", "profiles": "debug bench", "timestamp": "t"}',
+        ),
+    ],
+)
+def test_load_reify_attempt_sidecar_malformed_returns_none(
+    tmp_path: Path, label: str, text: str
+) -> None:
+    """Every malformed/unusable shape returns None WITHOUT raising -> full verify.
+
+    The unknown-profile case is not paranoia: DF has no
+    REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_<X> env key for a third profile, so
+    it cannot satisfy reify's "set a filter file for EVERY profile named in
+    `profiles`, or fall back to a full verify" obligation (verify.sh:219-230).
+    Silently ignoring the unknown profile would narrow a profile that never ran.
+    """
+    from orchestrator.merge_queue import _load_reify_attempt_sidecar
+
+    _place_real_sidecar(tmp_path, text=text)
+    assert _load_reify_attempt_sidecar(tmp_path) is None, label
+
+
+# ---------------------------------------------------------------------------
 # _load_attempt0_sidecar tolerant degradation (the robustness core that keeps
 # the retry path a strict no-op until reify writes a well-formed sidecar).
 # Every branch must return None WITHOUT raising — a regression that let the
