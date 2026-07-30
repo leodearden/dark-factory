@@ -905,6 +905,59 @@ def test_render_report_is_deterministic_no_clock():
     assert mod.render_report(**kwargs) == mod.render_report(**kwargs)
 
 
+_GOLDEN_FLAGLESS_REPORT = """\
+# confusion census 2026-07-14
+
+Project: dark_factory
+
+## Saturation
+
+- batches: 2
+- stop reason: saturated
+  - batch 0: dup_rate=0.50 (total=10, succeeded=10, failed=0, saturated=False)
+  - batch 1: dup_rate=0.90 (total=10, succeeded=10, failed=0, saturated=True)
+
+## Origin x Manifestation Matrix
+
+matrix
+## Synthesis
+
+prose
+
+## Filed Tasks
+
+- 1
+
+## Cost
+
+cost
+"""
+"""Byte-for-byte `render_report` output for a FLAGLESS run, captured
+verbatim from the module BEFORE task 3280 added the operator cost-control
+flags (`--max-batches`, `--max-verify-clusters`, `--dry-run-filing`).
+
+This is a LOCK, not a spec under development: every new report line those
+flags introduce must be gated on a non-None flag value, so a run that
+passes none of them renders exactly this. Do NOT regenerate this constant
+to make a failing run pass -- a diff here means a cost-control rendering
+leaked into the unflagged path (and therefore into the nightly trickle,
+which launches census.py with no extra argv)."""
+
+
+def test_render_report_flagless_output_is_byte_identical_golden():
+    report = mod.render_report(
+        date="2026-07-14",
+        project_id="dark_factory",
+        force=False,
+        matrix_md="matrix",
+        mining_result=_sample_mining_result(),
+        synthesis_md="prose",
+        filed_task_ids=["1"],
+        cost_note="cost",
+    )
+    assert report == _GOLDEN_FLAGLESS_REPORT
+
+
 # ---------------------------------------------------------------------------
 # step-17: RED — run_census() DEFER path (headroom banner)
 # ---------------------------------------------------------------------------
