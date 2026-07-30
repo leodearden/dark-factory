@@ -335,6 +335,163 @@ class TestExtractFailingTestsAndCandidateFiles:
 
 
 # ---------------------------------------------------------------------------
+# step-1 (task 3178) — a bare filename / prose word is NOT a pytest node id
+# ---------------------------------------------------------------------------
+
+
+def _guard_failure(cause_hint: str) -> VerifyResult:
+    """The VerifyResult shape reify's verify summary actually renders for a
+    shell-guard trip: the guard's own name arrives in ``cause_hint``, and
+    ``test_output`` is empty (the guard is not a pytest/nextest runner)."""
+    return VerifyResult(
+        passed=False,
+        cause_hint=cause_hint,
+        test_output='',
+        lint_output='',
+        type_output='',
+        summary='1 failed',
+        category='test_failure',
+    )
+
+
+# Verbatim ``cause_hint`` strings captured live from reify on 2026-07-29 —
+# every one of the 8 INTEGRATION_SKEW dispositions between 07-24 and 07-28
+# was a shell/infra guard emitting one of these shapes. Deliberately NOT
+# invented fixtures: task 2871's I7 shipped green against a synthetic
+# ``HARNESS_KLOC_CAP FAIL …`` string (no ``^FAILED <token>``, so it genuinely
+# parsed zero ids) while production emits ``FAILED test_harness_kloc_cap.sh``,
+# which parses one. That gap is why the false premise survived two cycles.
+_LIVE_SHELL_GUARD_CAUSE_HINTS = [
+    ('FAILED test_reify_audit_ptodo.sh', 'test_reify_audit_ptodo.sh', '5566'),
+    ('FAILED test_verify_scope.sh', 'test_verify_scope.sh', '5300'),
+    (
+        'FAILED test_deterministic_gate_closure_staleness_sweep.sh',
+        'test_deterministic_gate_closure_staleness_sweep.sh',
+        '5321',
+    ),
+    ('FAILED test_harness_kloc_cap.sh', 'test_harness_kloc_cap.sh', '5316/5373/5302'),
+]
+
+
+class TestShellGuardFilenameIsNotATestId:
+    """``_PYTEST_FAILED_ID_RE`` is an unconstrained ``^FAILED\\s+(\\S+)``, so a
+    shell-guard trip rendered as ``FAILED <guard>.sh`` yields the guard's own
+    FILENAME as a "failing test id" — vacuously satisfying task 2871's I7
+    ``failing_tests`` non-empty requirement and producing a false
+    INTEGRATION_SKEW. Task 3178 adds a node-id SHAPE floor (``'::' in tid``),
+    mirroring the invariant ``_RUST_FAILED_ID_RE`` has always had by
+    construction.
+
+    Each case additionally pins that the filename REMAINS in
+    ``candidate_files``: the fix must empty ``failing_tests`` only, so
+    ``_implicated_landings`` still walks main and the classifier degrades for
+    the honest reason (the I7 gate bites) rather than because its evidence was
+    starved."""
+
+    @pytest.mark.parametrize(
+        ('cause_hint', 'guard_filename', 'reify_task'),
+        _LIVE_SHELL_GUARD_CAUSE_HINTS,
+        ids=[c[1] for c in _LIVE_SHELL_GUARD_CAUSE_HINTS],
+    )
+    def test_live_shell_guard_filename_is_not_a_failing_test_id(
+        self, cause_hint: str, guard_filename: str, reify_task: str,
+    ):
+        from orchestrator.merge_disposition import (
+            _extract_failing_tests_and_candidate_files,
+        )
+
+        failing_tests, candidate_files = _extract_failing_tests_and_candidate_files(
+            _guard_failure(cause_hint),
+        )
+        # RED before the fix: today this is ``(guard_filename,)``.
+        assert failing_tests == (), (
+            f'reify {reify_task}: guard filename parsed as a test id'
+        )
+        # GREEN both before and after: candidate-file extraction is untouched,
+        # so the landings walk still has something to search for.
+        assert guard_filename in candidate_files
+
+    def test_prose_word_after_failed_is_not_a_failing_test_id(self):
+        """The real shape at test_verify_classify.py:1117 — the unconstrained
+        regex parses the English word "to" as a test id. RED before the fix;
+        the shape floor closes this hole too."""
+        from orchestrator.merge_disposition import (
+            _extract_failing_tests_and_candidate_files,
+        )
+
+        failing_tests, _candidate_files = _extract_failing_tests_and_candidate_files(
+            _guard_failure('FAILED to release semaphore slot before it timed out'),
+        )
+        assert failing_tests == ()
+
+    def test_mid_line_failed_token_never_anchored(self):
+        """reify 5370's shape: ``FAILED`` appears mid-line, so ``^FAILED`` does
+        not anchor and zero ids parse. GREEN today — pinned so a future
+        regex-relaxation (dropping the ``^`` anchor or adding ``re.search``)
+        cannot silently reopen this shape."""
+        from orchestrator.merge_disposition import (
+            _extract_failing_tests_and_candidate_files,
+        )
+
+        failing_tests, candidate_files = _extract_failing_tests_and_candidate_files(
+            _guard_failure(
+                'verify.sh: FAILED (exit 1): timeout --kill-after=60 60m nice -n 5 '
+                'cargo nextest run --workspace',
+            ),
+        )
+        assert failing_tests == ()
+        assert 'verify.sh' in candidate_files
+
+    def test_positive_control_pytest_node_id_survives(self):
+        """A genuine pytest node id carries ``::`` and must be unaffected —
+        including the test-id -> path heuristic (merge_disposition.py:162-165)
+        that feeds its path segment into candidate_files."""
+        from orchestrator.merge_disposition import (
+            _extract_failing_tests_and_candidate_files,
+        )
+
+        verify_result = VerifyResult(
+            passed=False,
+            test_output='FAILED tests/test_foo.py::test_bar - AssertionError',
+            lint_output='',
+            type_output='',
+            summary='1 failed',
+            cause_hint='',
+            category='test_failure',
+        )
+
+        failing_tests, candidate_files = _extract_failing_tests_and_candidate_files(
+            verify_result,
+        )
+        assert 'tests/test_foo.py::test_bar' in failing_tests
+        assert 'tests/test_foo.py' in candidate_files
+
+    def test_positive_control_rust_node_id_survives(self):
+        """reify 5187's shape — the ONE genuine skew in the 07-24..07-28
+        population. ``_RUST_FAILED_ID_RE`` already requires ``::`` by
+        construction, so the Rust branch needs no guard and this true skew is
+        provably unaffected by the fix."""
+        from orchestrator.merge_disposition import (
+            _extract_failing_tests_and_candidate_files,
+        )
+
+        verify_result = VerifyResult(
+            passed=False,
+            test_output='test objective_inheritance_e2e::inherits_from_parent ... FAILED',
+            lint_output='',
+            type_output='',
+            summary='1 failed',
+            cause_hint='',
+            category='test_failure',
+        )
+
+        failing_tests, _candidate_files = _extract_failing_tests_and_candidate_files(
+            verify_result,
+        )
+        assert 'objective_inheritance_e2e::inherits_from_parent' in failing_tests
+
+
+# ---------------------------------------------------------------------------
 # step-7 — _implicated_landings against a real git repo
 # ---------------------------------------------------------------------------
 
