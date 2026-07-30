@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from importlib import resources as pkg_resources
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -57,6 +58,15 @@ def _make_harness(tmp_path: Path) -> tuple[Harness, EventStore]:
     event_store = EventStore(tmp_path / 'events.db', 'run-test-0001')
     harness.event_store = event_store
     return harness, event_store
+
+
+def _load_package_defaults() -> dict:
+    """Read the shipped defaults.yaml so tests stay in sync automatically.
+
+    Copied from test_chronic_flake.py:35-38.
+    """
+    defaults_file = pkg_resources.files('orchestrator') / 'defaults.yaml'
+    return yaml.safe_load(defaults_file.read_text())
 
 
 def _query_events(event_store: EventStore, event_type_str: str) -> list[dict]:
@@ -257,3 +267,71 @@ class TestHarnessReloadAppliesChainCap:
         assert len(rows) == 1, f'Expected exactly one config_reload event row; got {rows!r}'
         data = json.loads(rows[0]['data'])
         assert data['applied']['merge_deep.chain_cap'] == {'old': 0, 'new': 6}
+
+
+class TestDefaultsYamlMergeDeepBlock:
+    """The shipped defaults.yaml declares the ``merge_deep:`` block explicitly so
+    the knob is discoverable and retunable in a project's
+    dark-factory-orchestrator.yaml without guessing at pydantic defaults
+    (the git:/chronic_flake:/psi_admission: precedent).
+    """
+
+    def test_defaults_yaml_declares_the_kill_switch(self):
+        defaults = _load_package_defaults()
+        assert 'merge_deep' in defaults, (
+            'the shipped defaults.yaml must declare the merge_deep: block so the '
+            'knob is discoverable by an operator reading it'
+        )
+        assert defaults['merge_deep']['chain_cap'] == 0
+
+    def test_defaults_yaml_does_not_drift_from_the_field_default(self, monkeypatch, tmp_path):
+        """Drift guard. ``YamlSettingsSource`` layers defaults.yaml UNDER the
+        project YAML (config.py:132), so the STANZA — not the pydantic
+        ``Field(default=...)`` — is the value that actually applies. A stanza that
+        drifted from the Field default would silently win, and the shipped kill
+        switch would be off on paper only. Pinning all three together makes such
+        an edit fail loudly instead.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        defaults = _load_package_defaults()
+        assert (
+            OrchestratorConfig().merge_deep.chain_cap
+            == defaults['merge_deep']['chain_cap']
+            == MergeDeepConfig.model_fields['chain_cap'].default
+        )
+
+
+class TestChainCapZeroIsANoOp:
+    """The α-scoped byte-identity leg of the PRD's kill-switch contract.
+
+    SCOPING (deliberate): the PRD's stronger wording — "cap=0 ⇒ no chain code
+    executes on any dispatch path" — belongs to γ (3185) and the ι gate (3187),
+    which own the dispatch code. α ships NO dispatch code, so there is no chain
+    code path to assert against here; a test asserting the dispatch-level
+    property at this scope could not be turned green by this task. At α's scope
+    byte-identity means (a) zero config-diff leaves at cap=0, below, and (b) the
+    existing merge suites re-run unchanged (step-8).
+    """
+
+    def test_explicit_zero_stanza_moves_no_leaf(self, monkeypatch, tmp_path):
+        """An explicit kill-switch stanza must be indistinguishable from an absent
+        one, so shipping the defaults.yaml block cannot move any config leaf.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig()
+        fresh = OrchestratorConfig(merge_deep={'chain_cap': 0})  # type: ignore[arg-type]
+        diff = diff_config(live, fresh)
+        assert diff.applied_candidates == {}
+        assert diff.restart_required == {}
+
+    def test_whole_config_surface_is_unperturbed(self, monkeypatch, tmp_path):
+        """Whole-config equality: adding the stanza at 0 perturbs nothing else in
+        the config surface — the only way α could have changed merge behaviour.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        live = OrchestratorConfig()
+        fresh = OrchestratorConfig(merge_deep={'chain_cap': 0})  # type: ignore[arg-type]
+        assert live.model_dump() == fresh.model_dump()
