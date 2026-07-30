@@ -29,6 +29,7 @@ matching rationale at its ``TestLandlockEnforcement`` docstring).
 """
 from __future__ import annotations
 
+import functools
 import json
 import os
 import shutil
@@ -76,18 +77,51 @@ def _reset_landlock_probe():
     _landlock_reset_probe()
 
 
-def _var_tmp_writable() -> bool:
-    """Probe whether /var/tmp is actually writable in this process.
+_VAR_TMP_SKIP_REASON = '/var/tmp not writable in this sandbox'
 
-    Some agent sandboxes deny writes to /var/tmp (e.g. via Landlock) even
-    though the directory's own mode (1777) permits it, so this must be an
-    actual write attempt rather than an os.access/stat-mode check.
+
+@functools.cache
+def _var_tmp_writable() -> bool:
+    """Probe whether /var/tmp is actually usable for scratch dirs in this process.
+
+    Catches ANY OS-level refusal, not just permission denial: agent sandboxes
+    deny the write via a syscall filter (EACCES) even though the directory's
+    own mode (1777) permits it, minimal containers may not ship /var/tmp at all
+    (ENOENT), and a read-only bind mount surfaces as EROFS. All three must
+    degrade to a skip — an escaping OSError here would abort collection of the
+    whole module, the exact failure mode these guards exist to prevent. Must be
+    an actual write attempt rather than an os.access/stat-mode check.
+
+    NOTE: duplicated verbatim in test_landlock.py and in
+    fused-memory/tests/reconciliation/test_recon_sandbox_guard.py — no shared
+    test-helper module spans both packages, so keep the three copies in sync.
     """
     try:
         probe = tempfile.mkdtemp(dir='/var/tmp')
-    except PermissionError:
+    except OSError:
         return False
     shutil.rmtree(probe, ignore_errors=True)
+    return True
+
+
+def _skip_var_tmp() -> bool:
+    """Whether /var/tmp-dependent tests should be skipped in this environment.
+
+    Under ``DF_REQUIRE_SANDBOX_TESTS=1`` — set by CI jobs known to have a
+    writable /var/tmp and a landlock-capable kernel — an unwritable /var/tmp is
+    an environment regression, not a reason to skip: quietly dropping all 12
+    enforcement-matrix rows would leave the suite green while every denial
+    assertion stopped running. Fail loudly there instead (mirrors
+    test_landlock.py's copy).
+    """
+    if _var_tmp_writable():
+        return False
+    if os.environ.get('DF_REQUIRE_SANDBOX_TESTS') == '1':
+        pytest.fail(
+            f'DF_REQUIRE_SANDBOX_TESTS=1 but {_VAR_TMP_SKIP_REASON}: refusing to '
+            'silently skip the real-kernel sandbox enforcement matrix.',
+            pytrace=False,
+        )
     return True
 
 
@@ -214,14 +248,14 @@ def landlock_matrix_scaffold():
     ``tempfile.mkdtemp``, torn down with ``shutil.rmtree`` regardless of
     test outcome.
     """
-    if not _var_tmp_writable():
+    if _skip_var_tmp():
         # A skipif *decorator* can't live on a fixture (pytest treats marks
         # on fixture functions as inert — PytestRemovedIn9Warning, hard
         # error under pytest 9), so the equivalent guard has to run inside
         # the fixture body. This single check covers all 12
         # TestSandboxEnforcementMatrix rows, since every row depends on
         # this fixture.
-        pytest.skip('/var/tmp not writable in this sandbox')
+        pytest.skip(_VAR_TMP_SKIP_REASON)
     base = Path(tempfile.mkdtemp(prefix='landlock-matrix-', dir='/var/tmp'))
     try:
         main = base / 'main'

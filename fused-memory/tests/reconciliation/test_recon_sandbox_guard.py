@@ -8,6 +8,8 @@ Covers:
 
 from __future__ import annotations
 
+import functools
+import os
 import shutil
 import socket
 import subprocess
@@ -42,18 +44,50 @@ except ImportError:
         return False
 
 
-def _var_tmp_writable() -> bool:
-    """Probe whether /var/tmp is actually writable in this process.
+_VAR_TMP_SKIP_REASON = '/var/tmp not writable in this sandbox'
 
-    Some agent sandboxes deny writes to /var/tmp (e.g. via Landlock) even
-    though the directory's own mode (1777) permits it, so this must be an
-    actual write attempt rather than an os.access/stat-mode check.
+
+@functools.cache
+def _var_tmp_writable() -> bool:
+    """Probe whether /var/tmp is actually usable for scratch dirs in this process.
+
+    Catches ANY OS-level refusal, not just permission denial: agent sandboxes
+    deny the write via a syscall filter (EACCES) even though the directory's
+    own mode (1777) permits it, minimal containers may not ship /var/tmp at all
+    (ENOENT), and a read-only bind mount surfaces as EROFS. All three must
+    degrade to a skip — an escaping OSError here would abort collection of the
+    whole module, the exact failure mode these guards exist to prevent. Must be
+    an actual write attempt rather than an os.access/stat-mode check.
+
+    NOTE: duplicated verbatim in orchestrator/tests/test_landlock.py and
+    orchestrator/tests/test_sandbox_enforcement_matrix.py — no shared
+    test-helper module spans both packages, so keep the three copies in sync.
     """
     try:
         probe = tempfile.mkdtemp(dir='/var/tmp')
-    except PermissionError:
+    except OSError:
         return False
     shutil.rmtree(probe, ignore_errors=True)
+    return True
+
+
+def _skip_var_tmp() -> bool:
+    """Whether /var/tmp-dependent tests should be skipped in this environment.
+
+    Under ``DF_REQUIRE_SANDBOX_TESTS=1`` — set by CI jobs known to have a
+    writable /var/tmp and a landlock-capable kernel — an unwritable /var/tmp is
+    an environment regression, not a reason to skip: quietly dropping the
+    real-kernel enforcement assertions would leave the suite green while they
+    stopped running. Fail loudly there instead (mirrors test_landlock.py's copy).
+    """
+    if _var_tmp_writable():
+        return False
+    if os.environ.get('DF_REQUIRE_SANDBOX_TESTS') == '1':
+        pytest.fail(
+            f'DF_REQUIRE_SANDBOX_TESTS=1 but {_VAR_TMP_SKIP_REASON}: refusing to '
+            'silently skip the real-kernel sandbox enforcement tests.',
+            pytrace=False,
+        )
     return True
 
 
@@ -135,10 +169,7 @@ class TestSandboxGuardLandlockBranch:
         not is_landlock_available(),
         reason='landlock not supported on this kernel',
     )
-    @pytest.mark.skipif(
-        not _var_tmp_writable(),
-        reason='/var/tmp not writable in this sandbox',
-    )
+    @pytest.mark.skipif(_skip_var_tmp(), reason=_VAR_TMP_SKIP_REASON)
     def test_enforcement_repo_write_denied_tmp_allowed(self, tmp_path: Path) -> None:
         """Landlock denies writes to a /var/tmp 'repo' dir but allows writes to /tmp.
 
