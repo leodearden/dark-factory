@@ -7252,6 +7252,58 @@ class TaskWorkflow:
             )
             return []
 
+    async def _detect_committed_branch_work(self) -> list[dict]:
+        """Detect EVERY commit this branch carries beyond its base (task 3033).
+
+        The ARCHITECT-facing counterpart of the implementer-facing
+        :meth:`_detect_tip_wip_commits` above. Both share the one git
+        primitive (``git_ops.get_commit_subjects``) and the same best-effort
+        posture; only the filter policy differs, and it differs deliberately
+        in two ways:
+
+        - **No ``is_wip_safety_commit`` filter.** ``_detect_tip_wip_commits``
+          stops at the first non-WIP subject, so it cannot see the ordinary
+          ``feat(...)``/``test(...)`` commits an already-committed-green branch
+          is actually made of — precisely the scenario this detector exists to
+          surface (the architect is re-invoked against a branch whose work has
+          already landed, e.g. the canonical ``complete_not_on_main_replan`` /
+          ``lost_plan_reconstruction`` cases).
+        - **No dedup against already-``done`` plan steps.** That dedup is
+          correct for the implementer's attribution loop (don't re-surface an
+          already-attributed commit every iteration — task 2386), but wrong
+          here: the architect is RE-AUTHORING the plan from scratch, so every
+          branch commit is candidate provenance for a step that does not exist
+          yet.
+
+        Proves ONLY that commits exist on this branch — never that they
+        satisfy any plan step. VERIFY remains the semantic gate: a step
+        pre-satisfied against a commit that does not actually implement it
+        surfaces as a VERIFY failure, never a silent green.
+
+        Best-effort and defensive, mirroring its sibling: returns ``[]`` on any
+        missing collaborator (``worktree``/``git_ops``/``artifacts``), an unset
+        ``base_commit``, or any git error — a false negative here just reverts
+        to today's baseline briefing and must never sink PLAN.
+
+        Returns HEAD-first ``[{'sha': ..., 'subject': ...}]`` for
+        ``base_commit..HEAD``.
+        """
+        if self.worktree is None or self.git_ops is None or self.artifacts is None:
+            return []
+        base = self.artifacts.read_base_commit()
+        if not base:
+            return []
+        try:
+            commits = await self.git_ops.get_commit_subjects(self.worktree, base)
+            return [{'sha': sha, 'subject': subject} for sha, subject in commits]
+        except Exception:
+            logger.warning(
+                'Committed-branch-work detection failed; treating as no '
+                'committed work (task 3033)',
+                exc_info=True,
+            )
+            return []
+
     async def _rederive_step_status_from_branch_state(self) -> list[str]:
         """Re-derive stale-``pending`` plan steps to ``done`` from the
         durable iteration log's ``steps_completed`` records (task 2387).
