@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -140,6 +141,28 @@ def _HORIZON(lam: float, k: int) -> int:
     return max(k, int(lam)) + int(60 * math.sqrt(lam)) + 200
 
 
+def _normal_two_sided_p(deviation: float, sd: float) -> float:
+    """Two-sided normal tail beyond *deviation*, with a continuity correction.
+
+    The third independent cross-check, and the only one usable where enumerating
+    the support is not: at ``n = 1e7`` or ``lam = 1e8`` neither in-test reference
+    above can run at all, but both distributions are extremely close to normal
+    there — which is exactly why they are the sizes at which the production
+    implementation must NOT be enumerating anything.
+    """
+    return math.erfc((abs(deviation) - 0.5) / sd / math.sqrt(2))
+
+
+_HUGE_INPUT_SECONDS = 5.0
+"""Wall-clock ceiling for the two huge-input tests below.
+
+Not a performance target — a shape discriminator, sized so it cannot flake. The
+implementations it rejects are ~100x over it (an O(n) binomial support at
+``n = 1e7``, an O(lam) Poisson left shoulder at ``lam = 1e8``); the walk that
+replaced them lands ~50x under it.
+"""
+
+
 class TestBinomialExactTest:
     """Rule (b)'s engine: an exact two-sided binomial test, stdlib only.
 
@@ -248,6 +271,28 @@ class TestBinomialExactTest:
         # the answer is 1.0 by definition, not by float luck.
         assert binomial_two_sided_p(963, 1204, 0.8) == 1.0
 
+    def test_a_huge_n_costs_the_mass_not_the_support(self):
+        """Regression: the pmf must not be materialised over the whole support.
+
+        Enumerating ``n + 1`` outcomes is O(n) in time AND memory for an answer
+        that depends only on the O(sqrt(n p (1-p)))-wide region carrying mass. At
+        ``n = 1e7`` that is an 80 MB list and seconds of work — and ``n`` is a
+        metric's probe/corpus size, which the M1 schema does not bound at all.
+        The walk-from-the-mode implementation answers this in ~40 ms.
+        """
+        start = time.perf_counter()
+        p = binomial_two_sided_p(5_010_000, 10_000_000, 0.5)
+        elapsed = time.perf_counter() - start
+
+        # Cross-checked against the normal approximation, the only independent
+        # reference that survives this n (both in-test enumerations above need
+        # the full support). Agreement is to ~1e-5 relative; the tolerance is
+        # loose only because the approximation itself is.
+        assert p == pytest.approx(
+            _normal_two_sided_p(10_000, math.sqrt(10_000_000 * 0.25)), rel=0.01
+        )
+        assert elapsed < _HUGE_INPUT_SECONDS, elapsed
+
 
 class TestPoissonExactTest:
     """Rule (c)'s engine: an exact two-sided Poisson test, stdlib only.
@@ -257,14 +302,19 @@ class TestPoissonExactTest:
     every anchor below earns its keep.
     """
 
-    def test_observed_mode_is_effectively_one(self):
-        # lam=5 is an integer, so pmf(4) == pmf(5) and both are the mode: every
-        # outcome is at most as probable as the observed one, and the small-p
-        # sum sweeps the whole distribution. Asserted as ~1.0 rather than
-        # exactly 1.0 because the log-space pmf loses the last few ulps.
-        p = poisson_two_sided_p(5, 5.0)
-        assert p > 0.99
-        assert p <= 1.0
+    def test_observed_mode_is_exactly_one(self):
+        # lam=5 is an integer, so pmf(4) == pmf(5) and BOTH are the mode: every
+        # outcome is at most as probable as the observed one, and the answer is
+        # 1.0 by definition. Exact for either of the tied modes because the
+        # identity is stated structurally rather than summed — a log-space pmf
+        # summed over the support returns 0.9999999999999996 instead.
+        assert poisson_two_sided_p(5, 5.0) == 1.0
+        assert poisson_two_sided_p(4, 5.0) == 1.0
+
+    def test_the_mode_identity_holds_for_a_non_integer_rate(self):
+        # floor(5.5) == 5 is the single mode of Poisson(5.5); 4 and 6 are not.
+        assert poisson_two_sided_p(5, 5.5) == 1.0
+        assert poisson_two_sided_p(6, 5.5) < 1.0
 
     def test_no_alarm_side_anchor(self):
         assert poisson_two_sided_p(8, 5.0) == pytest.approx(0.17380, rel=1e-4)
@@ -323,6 +373,24 @@ class TestPoissonExactTest:
     def test_out_of_range_arguments_raise(self, k, lam):
         with pytest.raises(ValueError):
             poisson_two_sided_p(k, lam)
+
+    def test_a_huge_baseline_rate_costs_sqrt_lam_not_lam(self):
+        """Regression: the LEFT shoulder must be walked, not enumerated.
+
+        The right tail has always terminated adaptively, but a left shoulder
+        swept from ``i = 0`` up to ``int(lam)`` is O(lam) — 34 s at ``lam = 1e8``,
+        and hours one decade further out, which would wedge the daily eval run
+        and take the grandfather-set update with it. Nothing bounds a count
+        metric's value, so nothing bounds the rate a window of them derives.
+        """
+        start = time.perf_counter()
+        p = poisson_two_sided_p(100_050_000, 1e8)
+        elapsed = time.perf_counter() - start
+
+        # 5 sd above a rate of 1e8 (sd = sqrt(lam) = 1e4). Cross-checked against
+        # the normal approximation, which agrees to ~2e-3 relative here.
+        assert p == pytest.approx(_normal_two_sided_p(50_000, 1e4), rel=0.01)
+        assert elapsed < _HUGE_INPUT_SECONDS, elapsed
 
 
 class TestDerivedAlpha:

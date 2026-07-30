@@ -26,7 +26,20 @@ correct two-sided p is 0.012191, while ``exp(-5)`` is 0.006738 and
 ``2*exp(-5)`` is 0.013476. None agree, because the correct method also sweeps
 the far right tail. The method also makes the two rule kinds structurally
 identical (one summation over a pmf), so binomial and Poisson share a single
-reviewed idea rather than two.
+reviewed idea rather than two — literally one function, :func:`_small_p_sum`,
+handed a different pmf and a different support bound.
+
+That shared summation walks OUTWARD FROM THE MODE in both directions, which is
+what keeps the cost proportional to the sqrt-wide region that actually carries
+mass rather than to the size of the support. Enumerating the support instead is
+the obvious implementation and it does not scale: nothing in the M1 schema
+bounds a proportion's ``n`` or a count metric's ``value``, so a corpus-scale
+baseline rate would make the daily eval run take minutes-to-hours and drag the
+grandfather-set update down with it. Both shoulders stop on the same two
+STRUCTURAL conditions — the pmf underflowing float64 to literal zero, or a term
+too small to change the running sum at double precision — so there is no
+horizon constant anywhere, which matters because a tuned horizon would be
+exactly the a-priori numeric threshold G6 forbids.
 
 Both pmfs are assembled in log space via ``math.lgamma`` rather than from exact
 ``math.comb`` coefficients: a bignum binomial coefficient overflows float64
@@ -45,7 +58,7 @@ import json
 import math
 import os
 import tempfile
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal
@@ -114,6 +127,74 @@ lose a whole tail.
 """
 
 
+def _small_p_sum(pmf: Callable[[int], float], mode: int, k: int, upper: int | None) -> float:
+    """Total probability of every outcome no more probable than *k*'s, walked from *mode*.
+
+    The one summation both rule kinds share: hand it a binomial pmf and
+    ``upper=n``, or a Poisson pmf and ``upper=None`` for the unbounded support.
+
+    **Why walk rather than enumerate.** The qualifying outcomes are exactly the
+    complement of a contiguous interval around the mode (the pmf is unimodal, so
+    it is monotone on each side), which means each shoulder can start AT the peak
+    and walk outward: skip while outcomes are still more probable than the
+    observed one, then accumulate every remaining one. Both phases end on the
+    same two structural conditions — the pmf underflowing float64 to literal
+    zero, or a term too small to shift the running sum at double precision — so
+    the walk visits O(sqrt(variance)) outcomes instead of the whole support, and
+    it does so without a horizon constant (G6: a tuned horizon would be an
+    a-priori numeric threshold). Terms past either stop cannot alter the result.
+
+    **The peak short-circuit is an identity, not an optimisation.** If the
+    observed outcome IS a mode then every outcome qualifies and the answer is
+    exactly 1.0 by definition. Stating that structurally is what keeps it exact
+    independently of how the pmf terms are computed — a log-space term is
+    accurate to ~1e-15, not to the ulp, so summing the whole support instead
+    returns 0.9999999999999996 and an equality test on it would be a lie. The
+    comparison uses :data:`_PMF_TIE_SLACK` so the peak's TWIN also short-circuits:
+    both ``pmf(lam-1) == pmf(lam)`` for an integer Poisson rate and
+    ``pmf(m-1) == pmf(m)`` for an integer ``(n+1) p0`` are exact ties in real
+    arithmetic that float can miss by an ulp.
+
+    ``running`` is a plain sum used ONLY to detect negligibility; the returned
+    total is an ``fsum`` over the collected terms, so the adaptive stop costs no
+    accuracy. It is per-shoulder rather than shared so each side's stop depends
+    only on the mass that side has actually collected.
+    """
+    peak = pmf(mode)
+    observed = pmf(k)
+    if observed >= peak * (1.0 - _PMF_TIE_SLACK):
+        return 1.0
+    threshold = observed * (1.0 + _PMF_TIE_SLACK)
+
+    terms: list[float] = []
+    for step in (-1, 1):
+        running = 0.0
+        i = mode
+        while i >= 0 and (upper is None or i <= upper):
+            term = pmf(i)
+            if term == 0.0:
+                break  # the pmf underflowed float64: nothing representable remains
+            if term <= threshold:
+                if running > 0.0 and running + term == running:
+                    break  # and neither can any later term, since they only shrink
+                terms.append(term)
+                running += term
+            i += step
+    return min(1.0, math.fsum(terms))
+
+
+def _binomial_mode(n: int, p0: float) -> int:
+    """The most probable outcome of Binomial(n, p0): ``floor((n + 1) p0)``, clamped to n.
+
+    Where the two-sided walk starts. Clamped because ``(n + 1) p0`` reaches
+    ``n + 1`` at ``p0 == 1`` while the support ends at ``n``. When ``(n + 1) p0``
+    is an integer ``m`` there are two modes, ``m`` and ``m - 1``, with equal pmf;
+    the floor picks one and :func:`_small_p_sum`'s tie-aware peak comparison
+    covers the other.
+    """
+    return min(n, int((n + 1) * p0))
+
+
 def _binomial_pmf(i: int, n: int, p0: float) -> float:
     """P(X = i) for X ~ Binomial(n, p0), computed in log space.
 
@@ -157,10 +238,17 @@ def binomial_two_sided_p(k: int, n: int, p0: float) -> float:
     Rule (b)'s engine: how surprising is the current run's proportion, given the
     proportion pooled over the trailing baseline window?
 
-    Computed by the method of small p-values — the total probability of every
-    outcome no more probable than the observed one. For an observation AT the
-    mode this is exactly 1.0 (every outcome qualifies), which is the identity
-    the tests anchor on.
+    Computed by :func:`_small_p_sum` — the total probability of every outcome no
+    more probable than the observed one, walked outward from the mode. For an
+    observation AT the mode this is exactly 1.0 (every outcome qualifies), which
+    is the identity the tests anchor on.
+
+    The walk is what keeps this affordable at scale. Materialising the whole
+    ``n + 1`` support is the obvious implementation and it is O(n) in both time
+    and memory for an answer that only depends on the O(sqrt(n p (1-p)))-wide
+    region carrying mass: at ``n = 1e7`` that is ~80 MB of pmf terms and seconds
+    of work, on a metric the M1 schema permits (it bounds ``n`` not at all, and a
+    corpus-scale proportion is an ordinary metric here).
 
     A degenerate ``p0`` of 0 or 1 is answered rather than rejected: the outcome
     H0 makes certain has p == 1.0, and one H0 calls impossible has p == 0.0.
@@ -174,17 +262,7 @@ def binomial_two_sided_p(k: int, n: int, p0: float) -> float:
     if not 0.0 <= p0 <= 1.0:
         raise ValueError(f'binomial_two_sided_p: p0={p0} must lie in [0, 1].')
 
-    pmf = [_binomial_pmf(i, n, p0) for i in range(n + 1)]
-    observed = pmf[k]
-    qualifying = [p for p in pmf if p <= observed * (1.0 + _PMF_TIE_SLACK)]
-    if len(qualifying) == len(pmf):
-        # The acceptance set is the ENTIRE support, so the answer is 1.0 by
-        # definition — stated structurally rather than hoped for from the
-        # summation. This is the mode identity documented above, and asserting
-        # it here is what keeps it exact independently of how the pmf terms are
-        # computed (a log-space term is accurate to ~1e-15, not to the ulp).
-        return 1.0
-    return min(1.0, math.fsum(qualifying))
+    return _small_p_sum(lambda i: _binomial_pmf(i, n, p0), _binomial_mode(n, p0), k, n)
 
 
 def _poisson_pmf(i: int, lam: float) -> float:
@@ -214,12 +292,13 @@ def poisson_two_sided_p(k: int, lam: float) -> float:
     twice it is 0.013476.
 
     Termination is the one thing the Poisson support makes interesting: it is
-    unbounded on the right, so there is no support to enumerate. Rather than
-    invent a horizon constant — which would be exactly the a-priori numeric
-    threshold G6 forbids — the right tail is walked outward from the mode and
-    stopped on two structural conditions: the pmf underflowing float64 to
-    literal zero, or a term too small to change the running sum at double
-    precision. Terms past that point cannot alter the result.
+    unbounded on the right, so there is no support to enumerate at all — and the
+    left shoulder, though finite, is ``lam`` wide, which is just as unaffordable
+    once a baseline rate gets large (nothing bounds a count metric's ``value``,
+    so nothing bounds the rate derived from a window of them). BOTH shoulders are
+    therefore walked outward from the mode by :func:`_small_p_sum`, on structural
+    stop conditions rather than a horizon constant — which would be exactly the
+    a-priori numeric threshold G6 forbids.
 
     A degenerate ``lam`` of 0 is answered rather than rejected (a baseline
     window of all-zero counts is a real input — a probe that has never fired):
@@ -234,37 +313,10 @@ def poisson_two_sided_p(k: int, lam: float) -> float:
     if lam == 0:
         return 1.0 if k == 0 else 0.0
 
-    threshold = _poisson_pmf(k, lam) * (1.0 + _PMF_TIE_SLACK)
-    mode = int(lam)
-    terms: list[float] = []
-
-    # Left shoulder. The pmf is non-decreasing on [0, mode], so the qualifying
-    # outcomes form a contiguous prefix and the first failure ends it.
-    for i in range(mode + 1):
-        left = _poisson_pmf(i, lam)
-        if left > threshold:
-            break
-        terms.append(left)
-
-    # Right tail, walked outward from the mode. The pmf is non-increasing here,
-    # so once an outcome qualifies every later one does too; the skip phase
-    # ends and the accumulate phase begins at the same crossing. `running` is a
-    # plain sum used ONLY to detect negligibility — the returned total is an
-    # fsum over the collected terms, so the adaptive stop costs no accuracy.
-    running = 0.0
-    i = mode + 1
-    while True:
-        right = _poisson_pmf(i, lam)
-        if right == 0.0:
-            break  # the pmf has underflowed float64: nothing representable remains
-        if right <= threshold:
-            if running > 0.0 and running + right == running:
-                break  # and neither can any later term, since they only shrink
-            terms.append(right)
-            running += right
-        i += 1
-
-    return min(1.0, math.fsum(terms))
+    # int(lam) is floor(lam), which IS the Poisson mode; for an integer lam it
+    # picks the upper of the two tied modes and _small_p_sum's tie-aware peak
+    # comparison covers the lower one.
+    return _small_p_sum(lambda i: _poisson_pmf(i, lam), int(lam), k, None)
 
 
 @dataclass(frozen=True, kw_only=True)
