@@ -2468,6 +2468,180 @@ class TestMergeRequestDedup:
         # Clean up the never-resolving future to avoid ResourceWarning
         never_future.cancel()
 
+    async def test_a_worktree_attach_marks_itself_unpollable(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """task 3148: a disk-scan attach must disclose that it is NOT pollable.
+
+        The incident's misleading shape: merge_request returned a
+        documented-durable `attached` whose `request_id` was the SUBMITTING
+        request's own never-enqueued id, because the disk-scan arm registers no
+        retention alias, and the `_waiters` registration sits AFTER the
+        `if dispatch.in_flight: return base` early-return — so no waiter either.
+        Every merge_status resolution tier misses and the id resolves 'unknown';
+        /unblock and unblock-low-risk submit-then-poll on it and hang.
+        """
+        import asyncio
+
+        from orchestrator import merge_queue as _mq_mod  # type: ignore[reportMissingImports]
+        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+            MergeDispatchResult,
+        )
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = self._make_orch_config(tmp_path / 'repo')
+        registry = self._make_registry()
+
+        # The disk-scan arm needs a real git repo + worktree to reach, so return
+        # its exact result shape directly: no inflight_task_id, no
+        # inflight_request_id, source='worktree'.
+        async def _fake_coalesce(*args, **kwargs):
+            return MergeDispatchResult(
+                dispatched=False, in_flight=True, branch='X', source='worktree',
+            )
+
+        monkeypatch.setattr(
+            _mq_mod, 'coalesce_or_enqueue_merge_request', _fake_coalesce,
+        )
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+        )
+        result = await asyncio.wait_for(
+            _call_merge_request(
+                server, task_id='X', branch='X',
+                worktree=str(tmp_path / 'wt'), description='',
+            ),
+            timeout=2.0,
+        )
+
+        assert result.get('status') == 'attached', f'got: {result}'
+        assert result.get('source') == 'worktree', f'got: {result}'
+        assert result.get('inflight_request_id') is None
+        assert result.get('inflight_task_id') is None
+        assert result.get('pollable') is False, (
+            'a worktree attach carries no alias and no waiter, so its '
+            f'request_id is not a poll handle: {result}'
+        )
+
+    async def test_b_registry_attach_is_pollable(self, tmp_path: Path):
+        """A registry attach DOES carry a pollable handle (alias + task_id)."""
+        import asyncio
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = self._make_orch_config(tmp_path / 'repo')
+        registry = self._make_registry()
+
+        never_future: asyncio.Future = asyncio.get_running_loop().create_future()
+        # NB: request_id must be passed EXPLICITLY — the sibling
+        # test_in_flight_branch_returns_immediately omits it (the legacy case,
+        # covered by test_c below).
+        assert registry.acquire('X', '5566', never_future, request_id='mr-primary')
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+        )
+        try:
+            result = await asyncio.wait_for(
+                _call_merge_request(
+                    server, task_id='X', branch='X',
+                    worktree=str(tmp_path / 'wt'), description='',
+                ),
+                timeout=2.0,
+            )
+
+            assert result.get('status') == 'attached', f'got: {result}'
+            assert result.get('source') == 'registry', f'got: {result}'
+            assert result.get('inflight_task_id') == '5566'
+            assert result.get('inflight_request_id') == 'mr-primary'
+            assert result.get('pollable') is True, f'got: {result}'
+        finally:
+            never_future.cancel()
+
+    async def test_c_legacy_registry_entry_without_request_id_is_unpollable(
+        self, tmp_path: Path,
+    ):
+        """A legacy entry (no request_id) is honestly reported as unpollable.
+
+        `_nonblocking_state_response` falls back to the SUBMITTING call's id when
+        `req_id_override` is None, so the returned `request_id` is not a real
+        poll handle even though the attach came from the registry.  Deriving
+        `pollable` from `inflight_request_id is not None` rather than from
+        `source` is what makes this case come out right.
+        """
+        import asyncio
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = self._make_orch_config(tmp_path / 'repo')
+        registry = self._make_registry()
+
+        never_future: asyncio.Future = asyncio.get_running_loop().create_future()
+        assert registry.acquire('X', 'existing-task', never_future)  # NO request_id
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+        )
+        try:
+            result = await asyncio.wait_for(
+                _call_merge_request(
+                    server, task_id='X', branch='X',
+                    worktree=str(tmp_path / 'wt'), description='',
+                ),
+                timeout=2.0,
+            )
+
+            assert result.get('status') == 'attached', f'got: {result}'
+            assert result.get('source') == 'registry', f'got: {result}'
+            assert result.get('inflight_request_id') is None
+            assert result.get('pollable') is False, f'got: {result}'
+        finally:
+            never_future.cancel()
+
+    async def test_d_dispatched_unaffected(self, tmp_path: Path):
+        """A freshly-dispatched submission still returns the `queued` shape.
+
+        Pre-existing keys asserted as a SUBSET, not an exact-dict equality, so
+        this does not become brittle against the very additive convention the
+        three new `attached` keys follow.
+        """
+        import asyncio
+
+        esc_queue = EscalationQueue(tmp_path / 'esc')
+        mq: asyncio.Queue = asyncio.Queue()
+        orch_config = self._make_orch_config(tmp_path / 'repo')
+        registry = self._make_registry()
+
+        server = create_server(
+            esc_queue,
+            merge_queue=mq,
+            orch_config=orch_config,
+            merge_inflight_registry=registry,
+        )
+        result = await asyncio.wait_for(
+            _call_merge_request(
+                server, task_id='D', branch='D',
+                worktree=str(tmp_path / 'wt'), description='',
+            ),
+            timeout=2.0,
+        )
+
+        assert result.get('status') == 'queued', f'got: {result}'
+        assert set(result) >= {
+            'request_id', 'generation', 'position', 'queue_depth', 'snapshot_tip',
+        }, f'pre-existing queued keys must be unchanged: {sorted(result)}'
+
     async def test_dispatch_resolves_and_releases_registry(self, tmp_path: Path):
         """merge_request with empty registry enqueues, awaits outcome, and releases the slot.
 
