@@ -6,9 +6,18 @@ After=network.target fused-memory.service
 [Service]
 Type=simple
 WorkingDirectory=__REPO_ROOT__
+# Bounded shutdown drain. uvicorn hard-bounds the connection drain: it wraps
+# _wait_tasks_to_complete() in asyncio.wait_for(timeout=8) (uvicorn/server.py) and then
+# force-cancels whatever is still running, so the process reaches lifespan shutdown by
+# ~T+8s -- comfortably inside TimeoutStopSec=15, leaving ~7s for lifespan shutdown,
+# interpreter exit and the `uv run` parent's own teardown. Without this flag the drain
+# was unbounded: a browser polling every 3s never let its keep-alive connections idle
+# out, so the drain never completed and every restart ended in
+# "State 'stop-sigterm' timed out. Killing." -> SIGKILL -> a ~16s dead window.
 ExecStart=__UV_PATH__ run --project dashboard \
   python -m uvicorn dashboard.app:app \
-  --host 127.0.0.1 --port 8080
+  --host 127.0.0.1 --port 8080 \
+  --timeout-graceful-shutdown 8
 
 # Cost/burndown aggregation roots (comma-separated). Standalone default: this repo only — additional project roots are LOCAL settings, added to the installed unit, not committed here. Keep spaces out of the value; systemd treats unquoted spaces as assignment separators.
 Environment=DASHBOARD_KNOWN_PROJECT_ROOTS=__REPO_ROOT__
