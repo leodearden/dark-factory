@@ -210,6 +210,19 @@ class EventType(StrEnum):
     task_started = 'task_started'
     task_completed = 'task_completed'
 
+    # Zero-progress requeue backstop (task 3068, origin incident reify
+    # esc-5556-1).  Emitted by zero_progress_requeue.emit_zero_progress_requeue_alert
+    # when a task's CONSECUTIVE streak of requeues-that-invoked-no-agent reaches
+    # config.zero_progress_requeue.threshold — i.e. the task has been burning
+    # dispatch slots with nothing to show for it.  This class is invisible to
+    # the requeue cap by design (workflow_types._disposition_table sets
+    # counts_against_requeue_cap=False for the warm-lane dispositions), so this
+    # event is the only telemetry for it.  Keyed on the REAL task_id (the
+    # escalation uses a synthetic sentinel id, but the event must stay joinable
+    # against task_completed).
+    # data: {streak, threshold, reason, block_phase}
+    zero_progress_requeue = 'zero_progress_requeue'
+
     # Warm-lane session resume (task γ, plans/warm-lane-session-resume-prd.md).
     # Emitted by the _run_slot eligibility guard, only when a recovered agent
     # session was present for the dispatched task:
