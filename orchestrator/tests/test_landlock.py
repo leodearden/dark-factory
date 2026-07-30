@@ -34,6 +34,21 @@ def _reset_landlock_probe():
     _landlock_reset_probe()
 
 
+def _var_tmp_writable() -> bool:
+    """Probe whether /var/tmp is actually writable in this process.
+
+    Some agent sandboxes deny writes to /var/tmp (e.g. via Landlock) even
+    though the directory's own mode (1777) permits it, so this must be an
+    actual write attempt rather than an os.access/stat-mode check.
+    """
+    try:
+        probe = tempfile.mkdtemp(dir='/var/tmp')
+    except PermissionError:
+        return False
+    shutil.rmtree(probe, ignore_errors=True)
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Test 1: is_landlock_available probe semantics
 # ---------------------------------------------------------------------------
@@ -109,6 +124,10 @@ class TestBuildLandlockCommand:
     not is_landlock_available(),
     reason='landlock not supported on this kernel',
 )
+@pytest.mark.skipif(
+    not _var_tmp_writable(),
+    reason='/var/tmp not writable in this sandbox',
+)
 class TestLandlockEnforcement:
     def test_allowed_and_denied_writes(self):
         # /var/tmp — outside the wrapper's default writable /tmp. pytest's
@@ -157,6 +176,10 @@ class TestLandlockEnforcement:
 @pytest.mark.skipif(
     landlock_mod._syscall_probe_abi() < 2,
     reason='landlock ABI < 2 has no REFER; the wrapper correctly omits it there',
+)
+@pytest.mark.skipif(
+    not _var_tmp_writable(),
+    reason='/var/tmp not writable in this sandbox',
 )
 class TestLandlockRefer:
     """Guard against re-omitting LANDLOCK_ACCESS_FS_REFER from the ruleset.
@@ -309,6 +332,10 @@ class TestSandboxConfigBackendField:
 @pytest.mark.skipif(
     not is_landlock_available(),
     reason='landlock not supported on this kernel',
+)
+@pytest.mark.skipif(
+    not _var_tmp_writable(),
+    reason='/var/tmp not writable in this sandbox',
 )
 class TestLandlockClaudeHomeNarrowing:
     def test_denies_settings_but_allows_fleet_and_transcript(self):

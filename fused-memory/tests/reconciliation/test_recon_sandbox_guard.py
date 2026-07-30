@@ -42,6 +42,21 @@ except ImportError:
         return False
 
 
+def _var_tmp_writable() -> bool:
+    """Probe whether /var/tmp is actually writable in this process.
+
+    Some agent sandboxes deny writes to /var/tmp (e.g. via Landlock) even
+    though the directory's own mode (1777) permits it, so this must be an
+    actual write attempt rather than an os.access/stat-mode check.
+    """
+    try:
+        probe = tempfile.mkdtemp(dir='/var/tmp')
+    except PermissionError:
+        return False
+    shutil.rmtree(probe, ignore_errors=True)
+    return True
+
+
 # ── Config defaults (S3 / S4) ─────────────────────────────────────────────────
 
 
@@ -119,6 +134,10 @@ class TestSandboxGuardLandlockBranch:
     @pytest.mark.skipif(
         not is_landlock_available(),
         reason='landlock not supported on this kernel',
+    )
+    @pytest.mark.skipif(
+        not _var_tmp_writable(),
+        reason='/var/tmp not writable in this sandbox',
     )
     def test_enforcement_repo_write_denied_tmp_allowed(self, tmp_path: Path) -> None:
         """Landlock denies writes to a /var/tmp 'repo' dir but allows writes to /tmp.

@@ -76,6 +76,21 @@ def _reset_landlock_probe():
     _landlock_reset_probe()
 
 
+def _var_tmp_writable() -> bool:
+    """Probe whether /var/tmp is actually writable in this process.
+
+    Some agent sandboxes deny writes to /var/tmp (e.g. via Landlock) even
+    though the directory's own mode (1777) permits it, so this must be an
+    actual write attempt rather than an os.access/stat-mode check.
+    """
+    try:
+        probe = tempfile.mkdtemp(dir='/var/tmp')
+    except PermissionError:
+        return False
+    shutil.rmtree(probe, ignore_errors=True)
+    return True
+
+
 def _git(args: list[str], cwd: Path) -> str:
     """Run a git command in ``cwd``, returning stripped stdout.
 
@@ -199,6 +214,14 @@ def landlock_matrix_scaffold():
     ``tempfile.mkdtemp``, torn down with ``shutil.rmtree`` regardless of
     test outcome.
     """
+    if not _var_tmp_writable():
+        # A skipif *decorator* can't live on a fixture (pytest treats marks
+        # on fixture functions as inert — PytestRemovedIn9Warning, hard
+        # error under pytest 9), so the equivalent guard has to run inside
+        # the fixture body. This single check covers all 12
+        # TestSandboxEnforcementMatrix rows, since every row depends on
+        # this fixture.
+        pytest.skip('/var/tmp not writable in this sandbox')
     base = Path(tempfile.mkdtemp(prefix='landlock-matrix-', dir='/var/tmp'))
     try:
         main = base / 'main'
