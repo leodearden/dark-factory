@@ -73,13 +73,54 @@ DISALLOW_RECON_REPORT_LEDGER_WRITES = [
     'mcp__recon-report__write_entity_standing_decision',
 ]
 
+# Escalation READ tools (disallowed in every stage — task 3163,
+# plans/escalation-store-ambiguity-prd.md task α).
+#
+# A stage's `escalation` MCP server is wired to the RECONCILIATION escalation
+# queue, never to a project's queue: harness.py `_start_escalation_server`
+# builds it over `config.escalation_queue_dir` and publishes the resulting URL,
+# which stages/base.py injects as the stage's `escalation` server. So a stage
+# asking "was an escalation ever filed for task X?" gets [] CATEGORICALLY — the
+# per-task record it is looking for lives in a different store and was never in
+# this one. That is not a race, and three incidents read the empty result as
+# positive proof of absence. Denying the read tools removes the false answer at
+# the source; the boundary paragraph in the stage prompts
+# (prompts/__init__.py ESCALATION_BOUNDARY_NOTE) explains the absence.
+#
+# The escalation WRITE tool (escalate_blocker) is deliberately NOT denied: it is
+# the sole sanctioned recon escalation use — Stage 2's Stale Flag Escalation
+# (FIX D) — and it writes to the reconciliation store, which is the correct
+# destination for it. Over-denying here breaks FIX D.
+#
+# PRD open question 4 (reject-vs-omit) resolved during α: `--disallowed-tools`
+# OMITS a denied MCP tool from the agent's tool listing rather than surfacing it
+# and rejecting the call. Verified against five live recon-stage transcripts
+# whose `deferred_tools_delta` → `addedNames` payload excludes exactly each
+# stage's denied names (Stage 3: 80 tools, no builtins / delete_entity /
+# submit_task; Stage 1: 93, no submit_task; Stage 2: 100, builtins only). Because
+# it is omission and not rejection, the agent gets no explanation for the missing
+# tool — which is what makes ESCALATION_BOUNDARY_NOTE load-bearing rather than
+# decorative.
+DISALLOW_ESCALATION_READS = [
+    'mcp__escalation__get_pending_escalations',
+    'mcp__escalation__get_escalation',
+]
+
 # Per-stage disallowed lists
-STAGE1_DISALLOWED = DISALLOW_TASK_WRITES + DISALLOW_RECON_REPORT_LEDGER_WRITES + DISALLOW_BUILTIN
-STAGE2_DISALLOWED = DISALLOW_BUILTIN  # Memory + task writes are allowed; only built-ins are blocked
+STAGE1_DISALLOWED = (
+    DISALLOW_TASK_WRITES
+    + DISALLOW_RECON_REPORT_LEDGER_WRITES
+    + DISALLOW_ESCALATION_READS
+    + DISALLOW_BUILTIN
+)
+# Stage 2 keeps full memory + task write access; only built-ins and the
+# escalation reads are blocked.
+STAGE2_DISALLOWED = DISALLOW_ESCALATION_READS + DISALLOW_BUILTIN
 STAGE3_DISALLOWED = (
     DISALLOW_TASK_WRITES
     + DISALLOW_MEMORY_WRITES
     + DISALLOW_RECON_REPORT_LEDGER_WRITES
+    + DISALLOW_ESCALATION_READS
     + DISALLOW_BUILTIN
 )
 # NOTE: the IN-PROCESS-STATE `mcp__recon-report__*` tools (start_report, add_finding,
