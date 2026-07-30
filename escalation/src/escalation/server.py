@@ -1342,10 +1342,18 @@ def create_server(
           position, queue_depth, eta_seconds}``.  Branch was freshly dispatched
           (or wait_secs timeout expired).
         - Attached: ``{status='attached', request_id, snapshot_tip, generation,
-          position, queue_depth, eta_seconds, inflight_task_id}``.  Branch is
+          position, queue_depth, eta_seconds, inflight_task_id, source,
+          inflight_request_id, pollable}``.  Branch is
           already in-flight; request_id is the *existing* entry's id (D8), not
           the submitting call's id.  ``inflight_task_id`` is the authoritative
           poll handle (merge_status accepts task_id per D10).
+          ``source`` names which coalesce arm attached (``'registry'`` /
+          ``'worktree'``).  ``inflight_request_id`` is the in-flight entry's id
+          when one is known, else None.  ``pollable`` (task 3148) is
+          ``inflight_request_id is not None``: when it is **False**,
+          ``request_id`` is the *submitting* call's own never-enqueued id, so
+          ``merge_status(request_id)`` will resolve ``'unknown'`` — the caller
+          must poll by ``branch``/``task_id`` instead of submit-then-poll.
         - Duplicate-in-verify reject (C3/D3): ``{error, code='duplicate_in_verify',
           existing_mr, existing_sha, verify_age_secs, hint='merge_cancel then
           resubmit'}``.  Returned when a *newer* SHA for the branch is submitted
@@ -1607,6 +1615,17 @@ def create_server(
                 req_id_override=dispatch.inflight_request_id,
             )
             base['inflight_task_id'] = dispatch.inflight_task_id
+            # task 3148: disclose whether this attach carries a pollable handle.
+            # The disk-scan (source='worktree') arm registers no retention alias
+            # and no waiter — the _waiters registration below is AFTER this early
+            # return — so `request_id` here is the submitting request's own
+            # never-enqueued id and merge_status on it resolves 'unknown'.
+            # Callers must not submit-then-poll on an unpollable attach.
+            # Derived from inflight_request_id rather than from `source`, so it
+            # stays correct if a future arm gains or loses alias registration.
+            base['source'] = dispatch.source
+            base['inflight_request_id'] = dispatch.inflight_request_id
+            base['pollable'] = dispatch.inflight_request_id is not None
             return base
 
         # Register durable-intent waiter record (β1 D2/I5).
