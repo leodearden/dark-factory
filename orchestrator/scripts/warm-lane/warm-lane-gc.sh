@@ -586,6 +586,35 @@ _do_reclaim() {
         # path warm-lane-audit.sh computes as $MOUNT/.lane-state. No flag, no
         # precomputed map, nothing marshalled in from a caller.
         #
+        # PLACEMENT is load-bearing on four axes — the same shape as the
+        # live-reference gate note below:
+        #   - INSIDE the loop, immediately before the reset, resolved from THIS
+        #     lane's own path. Hoisting it above the loop — or precomputing a
+        #     state map, or accepting an `--assigned-lanes CSV` — reintroduces
+        #     exactly the up-front-snapshot TOCTOU this gate removes: one verdict
+        #     computed once, then consumed across a 25-40 minute lane-by-lane
+        #     traversal. That is not theoretical. warm-lane-gc-sweep.sh computed
+        #     its protect CSV once and consumed it across a sweep that ran
+        #     06:32-06:59 BST while _lane-5 dropped OUT of the protect set at
+        #     06:32; and that same sweep reset _lane-5 at 20:55Z while a task-5334
+        #     agent session started 20:36Z was live (PRD §2). Block S-toctou goes
+        #     RED against any such hoist.
+        #   - UNDER the flock this loop already holds, so the read and the reset
+        #     share one critical section and nothing can reassign the lane
+        #     between verdict and action.
+        #   - BEFORE both reset branches below (the --disk-pressure rm and the α
+        #     reseed), so neither path can bypass it — the same "before BOTH
+        #     branches" property Block K5 pins for the live-reference gate.
+        #   - AFTER the flock acquire, so a flock-held lane keeps its own
+        #     distinct diagnostic and all three preserve reasons stay
+        #     distinguishable in dark-factory's logs.
+        #
+        # This is a COST REVERSAL of the direction the header's existing COST
+        # REVERSAL note describes, and is stated rather than left to be inferred:
+        # an ASSIGNED lane now short-circuits BEFORE the ~1.9s walk, so the
+        # busier the pool the cheaper the pass — the opposite of what task 5572
+        # had to accept.
+        #
         # FAIL-OPEN is load-bearing. lane_state_read reports `unknown` for a
         # missing/unreadable/corrupt record, and UNKNOWN and QUARANTINED both
         # fall through to the gates below and then to reclaim. Preserving on
