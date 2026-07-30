@@ -74,6 +74,7 @@ __all__ = [
     '_setup_repo',
     'foreign_lane_lock_holder',
     'git_repo',
+    'lane_is_free',
     'lane_lock_path',
     'leaked_lane_lock',
     'real_git_ops',
@@ -223,6 +224,27 @@ async def wait_until(
         if time.monotonic() >= deadline:
             return False
         await asyncio.sleep(interval)
+
+
+def lane_is_free(lock_path: Path) -> bool:
+    """Whether *lock_path* is unheld AND unattributed to this process.
+
+    The PRD's B12 signal verbatim, and BOTH halves are load-bearing: a
+    successful fresh acquire alone could be succeeding against a different
+    inode than the one we leaked, and ``/proc/locks`` alone is precisely the
+    manual forensics reify ``esc-5548-5`` had to do by hand.
+
+    Note the ordering — the kernel attribution is checked BEFORE the probe
+    acquire, because the probe itself briefly becomes a holder and would
+    otherwise report on itself.
+    """
+    if os.getpid() in lane_lock_holder_pids(lock_path):
+        return False
+    probe = acquire_merge_verify_flock(lock_path, 0.0)
+    if probe is None:
+        return False
+    release_merge_verify_flock(probe)
+    return True
 
 
 def test_scaffold_helpers_are_importable(tmp_path: Path):
@@ -819,16 +841,7 @@ class TestCancelledAcquireNeverOrphansTheLaneLock:
             'freed lock: nothing was ever held, so there is no orphan to detect'
         )
 
-        def _lane_is_free() -> bool:
-            if os.getpid() in lane_lock_holder_pids(lock_path):
-                return False
-            probe = acquire_merge_verify_flock(lock_path, 0.0)
-            if probe is None:
-                return False
-            release_merge_verify_flock(probe)
-            return True
-
-        assert await wait_until(_lane_is_free, timeout=10.0), (
+        assert await wait_until(lambda: lane_is_free(lock_path), timeout=10.0), (
             f'the cancelled lease left the lane lock HELD by this process — '
             f'the exact esc-5548-5 state: every later merge-verify on this lane '
             f'blocks behind an fd no code path can reach, until process exit. '
@@ -836,4 +849,179 @@ class TestCancelledAcquireNeverOrphansTheLaneLock:
         )
         assert read_lock_holder_pgid(git_ops.worktree_base) is None, (
             'a lease cancelled before it acquired must record no holder-pgid'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Step-9 (B12): the RESET path — the incident's own caller.
+#
+# `reset_persistent_merge_worktree` owns a SECOND, duplicated bare
+# `asyncio.to_thread(acquire_merge_verify_flock, ...)`, so the guarantee proved
+# on the shared seam above simply does not reach it.  This class asserts the
+# behaviour end to end AND pins the structure that makes it hold — a duplicate
+# acquire site is exactly how the fix silently regresses, so "the reset acquires
+# through the one guarded seam" is itself the invariant worth a test.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCancelledResetNeverOrphansTheLaneLock:
+    """B12 on `reset_persistent_merge_worktree` — reify esc-5548-5's own path."""
+
+    @staticmethod
+    def _watch_acquire(
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> tuple[threading.Event, dict[str, object]]:
+        """Observe the REAL bounded-wait acquire without replacing it.
+
+        Returns ``(polling, outcome)``: *polling* is set the moment the acquire
+        begins on its worker thread, and *outcome* collects ``fd`` (its return
+        value) and ``thread_id``.  Pass-through, not a stub — the lock handover
+        below has to be a genuine kernel acquisition or it proves nothing.
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+
+        polling = threading.Event()
+        outcome: dict[str, object] = {}
+        real_acquire = git_ops_mod.acquire_merge_verify_flock
+
+        def _watched(*args, **kwargs):
+            outcome['thread_id'] = threading.get_ident()
+            polling.set()
+            fd = real_acquire(*args, **kwargs)
+            outcome['fd'] = fd
+            return fd
+
+        monkeypatch.setattr(
+            git_ops_mod, 'acquire_merge_verify_flock', _watched,
+        )
+        return polling, outcome
+
+    async def test_cancelled_reset_leaves_the_lane_free_and_the_tree_untouched(
+        self, real_git_ops, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """CANONICAL B12 on the reset: cancel mid-acquire, lane still released.
+
+        This is the incident verbatim.  A merge dispatch is cancelled (task
+        timeout, shutdown, requeue) while the reset is polling for a lane lock
+        reify's own tooling holds; the poll wins moments later, and the fd goes
+        nowhere.  In esc-5548-5 the lane then stayed locked for roughly three
+        hours, blocking three tasks behind one `merge_outcome_signature`, until
+        an unattended restart cleared it.
+
+        The tree assertion is the other half: a cancelled reset must not have
+        mutated the worktree on its way out.
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+
+        # Long enough that the acquire is provably STILL POLLING when the
+        # cancellation lands — the whole point is a win that arrives after its
+        # awaiter is gone, not a wait that expires first.
+        monkeypatch.setattr(git_ops_mod, '_RESET_WARM_LANE_LOCK_WAIT_SECS', 10)
+
+        commit_a = await _get_merge_commit(real_git_ops, 'b12-a', 'b12_a.py')
+        await real_git_ops.reset_persistent_merge_worktree(commit_a)  # create-once
+        commit_b = await _get_merge_commit(real_git_ops, 'b12-b', 'b12_b.py')
+
+        warm_path = real_git_ops.persistent_merge_worktree_path
+        lock_path = lane_lock_path(warm_path)
+        polling, outcome = self._watch_acquire(monkeypatch)
+
+        with foreign_lane_lock_holder(lock_path):
+            task = asyncio.create_task(
+                real_git_ops.reset_persistent_merge_worktree(commit_b)
+            )
+            assert await wait_until(polling.is_set), (
+                'the reset never entered its bounded-wait acquire — cancelling '
+                'now would prove nothing about a late win'
+            )
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        # The foreign holder is gone; the orphaned worker thread now wins.
+
+        # Ordered before any probe of ours, which would otherwise take the freed
+        # lock itself and report "free" without the orphan ever winning.
+        assert await wait_until(lambda: 'fd' in outcome, timeout=10.0), (
+            'the orphaned acquire never returned — no handover happened'
+        )
+        assert outcome['fd'] is not None, (
+            'the acquire hit its deadline instead of winning the freed lock: '
+            'nothing was held, so there is no orphan to detect here'
+        )
+
+        assert await wait_until(lambda: lane_is_free(lock_path), timeout=10.0), (
+            f'the cancelled reset left the lane lock HELD by this process — '
+            f'esc-5548-5 exactly: every later merge-verify and reset on this '
+            f'lane blocks behind an fd no code path can reach, until process '
+            f'exit. holders={lane_lock_holder_pids(lock_path)!r}, '
+            f'ours={os.getpid()}'
+        )
+
+        _, head_sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=warm_path)
+        assert head_sha.strip() == commit_a.strip(), (
+            'a reset cancelled during its acquire never held the lane, so it '
+            'must not have touched the tree'
+        )
+
+    async def test_reset_acquires_through_the_shared_guarded_seam(
+        self, real_git_ops, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """STRUCTURAL: the reset must not own a second acquire site.
+
+        Behavioural coverage alone cannot hold this line.  The cancellation
+        guarantee lives in `GitOps._acquire_lane_flock_off_thread`; a caller
+        that hand-rolls its own `asyncio.to_thread(acquire_merge_verify_flock,
+        ...)` silently opts out of it, which is precisely the state this task
+        found the reset in.  Pinning the seam makes that regression loud instead
+        of invisible.
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+
+        calls: list[tuple[Path, float]] = []
+        real_seam = GitOps._acquire_lane_flock_off_thread
+
+        async def _spy(lock_path: Path, wait_secs: float):
+            calls.append((lock_path, wait_secs))
+            return await real_seam(lock_path, wait_secs)
+
+        monkeypatch.setattr(
+            GitOps, '_acquire_lane_flock_off_thread', staticmethod(_spy),
+        )
+
+        commit_a = await _get_merge_commit(real_git_ops, 'seam-a', 'seam_a.py')
+        await real_git_ops.reset_persistent_merge_worktree(commit_a)
+        commit_b = await _get_merge_commit(real_git_ops, 'seam-b', 'seam_b.py')
+
+        lock_path = lane_lock_path(real_git_ops.persistent_merge_worktree_path)
+        calls.clear()  # measure the reset-in-place, not the create-once above
+        await real_git_ops.reset_persistent_merge_worktree(commit_b)
+
+        assert calls == [(lock_path, git_ops_mod._RESET_WARM_LANE_LOCK_WAIT_SECS)], (
+            f'the reset must acquire the lane lock through the ONE guarded '
+            f'seam, with its own timeout constant — a duplicate bare '
+            f'asyncio.to_thread here silently loses the cancellation '
+            f'guarantee; got {calls!r}'
+        )
+
+    async def test_reset_acquire_runs_off_the_event_loop_thread(
+        self, real_git_ops, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """The reset's acquire must stay OFF the event loop.
+
+        `test_merge_verify_lease_guard.py:135` pins this for the LEASE acquire
+        only; no equivalent existed for the reset.  Converging the two onto one
+        seam would otherwise leave the reset's copy of the property untested at
+        exactly the moment it is being restructured — and a minutes-long
+        synchronous poll on the loop freezes the whole orchestrator.
+        """
+        polling, outcome = self._watch_acquire(monkeypatch)
+
+        commit = await _get_merge_commit(real_git_ops, 'off-loop', 'off_loop.py')
+        await real_git_ops.reset_persistent_merge_worktree(commit)
+
+        assert polling.is_set(), 'the reset never invoked the acquire'
+        assert outcome['thread_id'] != threading.get_ident(), (
+            'the reset acquired the lane lock ON the event-loop thread — a '
+            'bounded wait of minutes there stalls every other coroutine'
         )
