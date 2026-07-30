@@ -33,7 +33,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import signal
 import subprocess
+import threading
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -88,6 +90,10 @@ _FOREIGN_HOLDER_HOLD_SECS = 120
 #: actually own the lock before failing the test.
 _FOREIGN_HOLDER_STARTUP_SECS = 5.0
 
+#: Bound on how long :func:`foreign_lane_lock_holder` waits, on exit, for the
+#: kernel to stop attributing the lock to the child.
+_FOREIGN_HOLDER_TEARDOWN_SECS = 5.0
+
 
 @contextlib.contextmanager
 def foreign_lane_lock_holder(lock_path: Path) -> Iterator[subprocess.Popen]:
@@ -105,13 +111,33 @@ def foreign_lane_lock_holder(lock_path: Path) -> Iterator[subprocess.Popen]:
 
     Blocks until the child provably owns the lock (a zero-timeout probe
     acquire returns ``None``), failing the test if that has not happened
-    within :data:`_FOREIGN_HOLDER_STARTUP_SECS`.  Terminates and reaps the
-    child on exit.
+    within :data:`_FOREIGN_HOLDER_STARTUP_SECS`.
+
+    Teardown kills the child's whole PROCESS GROUP, not just the child.
+    Verified empirically: util-linux ``flock(1)`` FORKS the command rather than
+    exec'ing it, so ``sleep`` inherits the locked fd; ``child.terminate()``
+    alone reaps only the ``flock`` parent and the grandchild keeps the open file
+    description — and therefore the flock — alive, with ``/proc/locks`` still
+    naming the now-dead ``flock`` pid.  Hence ``start_new_session=True`` (the
+    child leads its own group, which also makes it foreign in the strongest
+    sense) plus :func:`os.killpg`, and a bounded poll proving the kernel has
+    actually dropped the attribution.  Without this, every test that RELEASES
+    the foreign holder to hand the lane over would silently be testing a lane
+    that is still locked.
     """
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     child = subprocess.Popen(
         ['flock', '-x', str(lock_path), 'sleep', str(_FOREIGN_HOLDER_HOLD_SECS)],
+        start_new_session=True,
     )
+
+    def _kill_group() -> None:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(child.pid, signal.SIGKILL)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            child.wait(timeout=5)
+
+    clean_exit = False
     try:
         deadline = time.monotonic() + _FOREIGN_HOLDER_STARTUP_SECS
         while True:
@@ -120,8 +146,7 @@ def foreign_lane_lock_holder(lock_path: Path) -> Iterator[subprocess.Popen]:
                 break  # the child owns it — contention is observable
             release_merge_verify_flock(probe)
             if time.monotonic() >= deadline:
-                child.terminate()
-                child.wait(timeout=5)
+                _kill_group()
                 pytest.fail(
                     f'flock(1) child never took {lock_path} within '
                     f'{_FOREIGN_HOLDER_STARTUP_SECS}s — the foreign-holder '
@@ -130,10 +155,26 @@ def foreign_lane_lock_holder(lock_path: Path) -> Iterator[subprocess.Popen]:
                 )
             time.sleep(0.02)
         yield child
+        clean_exit = True
     finally:
-        child.terminate()
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            child.wait(timeout=5)
+        _kill_group()
+        released = False
+        teardown_deadline = time.monotonic() + _FOREIGN_HOLDER_TEARDOWN_SECS
+        while True:
+            if child.pid not in lane_lock_holder_pids(lock_path):
+                released = True
+                break
+            if time.monotonic() >= teardown_deadline:
+                break
+            time.sleep(0.02)
+        # Only report this when the body itself succeeded, so a genuine test
+        # failure is never masked by its own cleanup.
+        if clean_exit and not released:
+            pytest.fail(
+                f'the foreign holder still owns {lock_path} after killing its '
+                f'process group — a test that hands the lane over by releasing '
+                f'it would be asserting against a still-locked lane'
+            )
 
 
 @contextlib.contextmanager
@@ -469,3 +510,330 @@ class TestSelfOwnedLaneLockLeak:
                 assert real_git_ops._lane_lock_self_owned_leak(lock_path, 1.0) is None
             finally:
                 remove_lock_holder_pgid(real_git_ops.worktree_base)
+
+
+# ---------------------------------------------------------------------------
+# Step-7 (B12): a CANCELLED acquire must never orphan the lane lock.
+#
+# The fault is structural, not incidental: `asyncio.to_thread` cannot interrupt
+# its worker thread, so cancelling the outer await does NOT stop the acquire —
+# it only stops anyone from ever seeing the fd it wins.  Concretely,
+# `asyncio.futures._copy_future_state` bails when `dest.cancelled()`, so the
+# thread's return value is dropped on the floor and `release_merge_verify_flock`
+# is never called for it.  The lane then stays locked until process exit, which
+# is exactly the state reify esc-5548-5 found by hand in `/proc/locks`.
+#
+# The fix (step-8) must therefore not "avoid" the late win but TAKE OWNERSHIP of
+# it: the acquire's inner future is shielded so it survives the cancellation,
+# and a done-callback releases whatever it eventually returns.
+# ---------------------------------------------------------------------------
+
+
+#: Sentinel fd for the deterministic unit cases.  Deliberately NOT a real fd:
+#: these cases stub both flock primitives, so nothing may actually touch it, and
+#: an accidental real syscall on it would fail loudly rather than silently
+#: operating on some unrelated open file.
+_SENTINEL_FD = 4242
+
+
+@pytest.mark.asyncio
+class TestCancelledAcquireNeverOrphansTheLaneLock:
+    """B12 — the shared acquire seam (`GitOps._acquire_lane_flock_off_thread`).
+
+    Pinned on the SHARED seam rather than on either lease, because that is what
+    makes the guarantee indivisible: `merge_verify_lease`, `task_verify_lease`
+    and (from step-10) `reset_persistent_merge_worktree` all acquire through
+    this one method, so a fix proven here cannot be true of one caller and false
+    of another.
+    """
+
+    @staticmethod
+    def _stub_acquire(
+        monkeypatch: pytest.MonkeyPatch,
+        gate: threading.Event,
+        result: int | None,
+    ) -> dict[str, object]:
+        """Replace the flock primitives with a gated stub + release recorder.
+
+        Returns a dict of observations: ``running`` (set once the stub is
+        executing off-thread), ``returned`` (set once it has produced *result*),
+        ``thread_id`` (the thread it ran on) and ``released`` (every fd passed
+        to :func:`release_merge_verify_flock`).
+
+        Stubbing is what makes these cases DETERMINISTIC: the cancellation lands
+        while the acquire is provably mid-flight, with no dependence on kernel
+        lock timing, and the late win happens exactly when the test says so.
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+
+        obs: dict[str, object] = {
+            'running': threading.Event(),
+            'returned': threading.Event(),
+            'thread_id': None,
+            'released': [],
+        }
+
+        def _gated_acquire(*_a, **_k):
+            obs['thread_id'] = threading.get_ident()
+            obs['running'].set()  # type: ignore[union-attr]
+            gate.wait(timeout=10)
+            obs['returned'].set()  # type: ignore[union-attr]
+            return result
+
+        def _record_release(fd) -> None:
+            obs['released'].append(fd)  # type: ignore[union-attr]
+
+        monkeypatch.setattr(
+            git_ops_mod, 'acquire_merge_verify_flock', _gated_acquire,
+        )
+        monkeypatch.setattr(
+            git_ops_mod, 'release_merge_verify_flock', _record_release,
+        )
+        return obs
+
+    async def test_late_won_fd_is_released_after_cancellation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """CANONICAL B12: an fd won AFTER cancellation is still released.
+
+        The worker thread is uninterruptible by design, so the only sound
+        contract is that ownership of a late win TRANSFERS to the canceller's
+        cleanup path.  Today there is no such path: the fd is won, dropped, and
+        the lane stays locked for the life of the process.
+
+        The gate is released only AFTER the cancellation has been observed, so
+        this is unambiguously the post-cancellation win and not a race the test
+        happened to lose.
+        """
+        gate = threading.Event()
+        obs = self._stub_acquire(monkeypatch, gate, _SENTINEL_FD)
+        lock_path = lane_lock_path(tmp_path / 'lane')
+
+        task = asyncio.create_task(
+            GitOps._acquire_lane_flock_off_thread(lock_path, 5.0)
+        )
+        assert await wait_until(obs['running'].is_set), (  # type: ignore[union-attr]
+            'the acquire never reached the worker thread — cancelling now '
+            'would prove nothing about a late win'
+        )
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not obs['released'], (
+            'nothing may be released before the acquire has produced anything'
+        )
+
+        gate.set()  # the acquire wins the lock AFTER its awaiter is gone
+        assert await wait_until(lambda: _SENTINEL_FD in obs['released']), (
+            f'the late-won fd was ORPHANED: a cancelled acquire dropped a held '
+            f'lane lock (reify esc-5548-5 — held until process exit, found only '
+            f'by hand in /proc/locks); released={obs["released"]!r}'
+        )
+
+    async def test_cancelled_acquire_that_times_out_releases_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """The genuine-timeout-after-cancellation case is a silent no-op.
+
+        A ``None`` return means the bounded wait expired with NOTHING held, so
+        the orphan path must neither release nor raise.  Unguarded, it would
+        call ``fcntl.flock(None, ...)`` and surface a ``TypeError`` through the
+        loop's exception handler — noise attached to a cancellation that is
+        entirely normal (`_release_lane_flock`'s existing ``None`` guard is what
+        this reuses).
+        """
+        loop = asyncio.get_running_loop()
+        caught: list[dict] = []
+        previous = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, ctx: caught.append(ctx))
+        try:
+            gate = threading.Event()
+            obs = self._stub_acquire(monkeypatch, gate, None)
+            lock_path = lane_lock_path(tmp_path / 'lane')
+
+            task = asyncio.create_task(
+                GitOps._acquire_lane_flock_off_thread(lock_path, 5.0)
+            )
+            assert await wait_until(obs['running'].is_set)  # type: ignore[union-attr]
+
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            gate.set()
+            assert await wait_until(obs['returned'].is_set)  # type: ignore[union-attr]
+            # Let the done-callback run to completion on the loop.
+            for _ in range(20):
+                await asyncio.sleep(0.01)
+
+            assert obs['released'] == [], (
+                f'a timed-out acquire holds nothing — releasing anything here '
+                f'would be releasing somebody else\'s fd number; '
+                f'released={obs["released"]!r}'
+            )
+            assert caught == [], (
+                f'the orphan path must stay silent on a plain timeout, not '
+                f'raise through the loop exception handler; got {caught!r}'
+            )
+        finally:
+            loop.set_exception_handler(previous)
+
+    async def test_uncancelled_acquire_keeps_its_fd_and_registers_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """NON-REGRESSION: the normal path is untouched by the orphan guard.
+
+        The failure mode being excluded is a fix that releases the fd on EVERY
+        completion rather than only the cancelled one — which would hand the
+        caller an fd whose lock had already been dropped, silently reopening the
+        unprotected-verify window task 2828 closed.  The registry entry is
+        asserted in the same breath because B13's layer (2) reads it: an
+        unregistered legitimate hold is libelled a leak.
+        """
+        from orchestrator.git_ops import (  # noqa: PLC0415
+            _lane_lock_held_in_process,
+        )
+
+        gate = threading.Event()
+        gate.set()  # no cancellation here: let the acquire return immediately
+        obs = self._stub_acquire(monkeypatch, gate, _SENTINEL_FD)
+        lock_path = lane_lock_path(tmp_path / 'lane')
+
+        fd = await GitOps._acquire_lane_flock_off_thread(lock_path, 5.0)
+        try:
+            assert fd == _SENTINEL_FD, 'the won fd must reach its caller'
+            assert _lane_lock_held_in_process(lock_path) is True, (
+                'a legitimate hold must be registered, or B13 layer (2) will '
+                'report this very fd as a leak'
+            )
+            for _ in range(10):
+                await asyncio.sleep(0.01)
+            assert obs['released'] == [], (
+                f'the acquire released the fd behind its caller\'s back — the '
+                f'caller would then run its span unprotected; '
+                f'released={obs["released"]!r}'
+            )
+        finally:
+            GitOps._release_lane_flock(fd)
+
+        assert obs['released'] == [_SENTINEL_FD]
+        assert _lane_lock_held_in_process(lock_path) is False, (
+            'the registry must be symmetric — a stale entry would mask a real '
+            'leak on this inode forever after'
+        )
+
+    async def test_acquire_still_runs_off_the_event_loop_thread(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """The cancellation guard must not drag the acquire back on-loop.
+
+        `acquire_merge_verify_flock` is a synchronous ``time.sleep`` poll whose
+        bounded wait is minutes; running it inline would freeze the entire
+        orchestrator.  Pinned HERE as well as at
+        ``test_merge_verify_lease_guard.py:135`` because step-8 restructures the
+        very statement that property depends on, and step-10 routes a third
+        caller through it.
+        """
+        gate = threading.Event()
+        gate.set()
+        obs = self._stub_acquire(monkeypatch, gate, _SENTINEL_FD)
+        lock_path = lane_lock_path(tmp_path / 'lane')
+
+        fd = await GitOps._acquire_lane_flock_off_thread(lock_path, 5.0)
+        try:
+            assert obs['thread_id'] is not None, 'acquire was never invoked'
+            assert obs['thread_id'] != threading.get_ident(), (
+                'the bounded-wait acquire ran ON the event-loop thread — a '
+                'minutes-long synchronous poll there freezes the orchestrator'
+            )
+        finally:
+            GitOps._release_lane_flock(fd)
+
+    async def test_cancelled_merge_verify_lease_leaves_the_lane_free(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """END-TO-END with REAL flocks, through `merge_verify_lease`.
+
+        The PRD's B12 signal verbatim: after a cancelled lease whose acquire won
+        the lock late, the lane must be re-acquirable AND the kernel must no
+        longer attribute the lock to this process.  Both halves matter — a fresh
+        acquire alone could succeed against a stale fd on a *different* inode,
+        and `/proc/locks` alone is exactly the manual forensics the incident had
+        to do by hand.
+
+        No stubs on the flock primitives: the win is a genuine kernel
+        acquisition, handed over by releasing a genuinely foreign holder after
+        the cancellation.
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+
+        # Bounded well above the ~0.1s poll that actually elapses, so the
+        # acquire cannot reach its deadline and return None — which would make
+        # the assertions below vacuously true.
+        monkeypatch.setattr(git_ops_mod, '_MERGE_VERIFY_LEASE_WAIT_SECS', 30.0)
+
+        git_ops = _git_ops(tmp_path)
+        lock_path = lane_lock_path(git_ops.persistent_merge_worktree_path)
+
+        polling = threading.Event()
+        outcome: dict[str, int | None] = {}
+        real_acquire = git_ops_mod.acquire_merge_verify_flock
+
+        def _watched_acquire(*args, **kwargs):
+            polling.set()
+            fd = real_acquire(*args, **kwargs)
+            outcome['fd'] = fd
+            return fd
+
+        monkeypatch.setattr(
+            git_ops_mod, 'acquire_merge_verify_flock', _watched_acquire,
+        )
+
+        async def _lease() -> None:
+            async with git_ops.merge_verify_lease():
+                pytest.fail('the lease body must never run: the lane is held')
+
+        with foreign_lane_lock_holder(lock_path):
+            task = asyncio.create_task(_lease())
+            assert await wait_until(polling.is_set), (
+                'the lease never entered its bounded-wait acquire'
+            )
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        # The foreign holder is gone: the orphaned worker thread now wins.
+
+        # Ordered BEFORE any probe of our own: a probe fired while the worker is
+        # still polling would take the freed lock itself, report "free", and
+        # pass this test without the orphan ever having won anything.  Waiting
+        # for the worker's own return value removes that race AND proves the
+        # premise — a timed-out (`None`) acquire holds nothing, so everything
+        # below it would be vacuously true.
+        assert await wait_until(lambda: 'fd' in outcome, timeout=10.0), (
+            'the orphaned acquire never returned — the lane handover never '
+            'happened, so this test would prove nothing about a late win'
+        )
+        assert outcome['fd'] is not None, (
+            'the acquire hit its bounded-wait deadline instead of winning the '
+            'freed lock: nothing was ever held, so there is no orphan to detect'
+        )
+
+        def _lane_is_free() -> bool:
+            if os.getpid() in lane_lock_holder_pids(lock_path):
+                return False
+            probe = acquire_merge_verify_flock(lock_path, 0.0)
+            if probe is None:
+                return False
+            release_merge_verify_flock(probe)
+            return True
+
+        assert await wait_until(_lane_is_free, timeout=10.0), (
+            f'the cancelled lease left the lane lock HELD by this process — '
+            f'the exact esc-5548-5 state: every later merge-verify on this lane '
+            f'blocks behind an fd no code path can reach, until process exit. '
+            f'holders={lane_lock_holder_pids(lock_path)!r}, ours={os.getpid()}'
+        )
+        assert read_lock_holder_pgid(git_ops.worktree_base) is None, (
+            'a lease cancelled before it acquired must record no holder-pgid'
+        )
