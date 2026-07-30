@@ -499,8 +499,23 @@ injected cap) therefore renders LARGER than this constant, and neither the flat
 fallback nor this value is a bound in that case."""
 
 
+def render_cache_key(path: Path, max_bytes: int, renderer) -> tuple:
+    """The shared key for a rendered-digest cache entry.
+
+    Defined ONCE, here, because two pipeline stages must agree on it exactly:
+    :func:`digest_byte_cost_fn` (which populates the cache while costing) and
+    ``nightly.build_digests`` (which reads it instead of re-rendering). The
+    key carries *max_bytes* AND the *renderer* itself alongside the path, so a
+    cache entry can never be served to a stage using a different soft cap or a
+    different (e.g. monkeypatched, or test-injected) builder — a mismatch is a
+    structural cache MISS and an honest re-render, not a silently wrong digest.
+    """
+    return (path, max_bytes, renderer)
+
+
 def digest_byte_cost_fn(
     *, max_bytes: int = DEFAULT_DIGEST_MAX_BYTES, build=None,
+    rendered: dict[tuple, str] | None = None,
 ) -> Callable[[ScoredRecord], int]:
     """Build the production ``cost_fn`` for :func:`stratified_sample`:
     charge each record the REAL byte size of the digest it renders to.
@@ -517,12 +532,31 @@ def digest_byte_cost_fn(
     the agent class.
 
     *build* defaults to :func:`legibility.digest.build_digest`, resolved at
-    CALL time so a test can monkeypatch the module attribute. The returned
-    closure memoizes on ``record.path``, so a session is rendered at most
-    once per sampler call — which, combined with
-    :func:`stratified_sample`'s own memo, means each candidate transcript is
-    read exactly once even though the reserve phase reads each group's total
-    twice.
+    CALL time so a test can monkeypatch the module attribute.
+
+    *rendered* is a RENDER CACHE, keyed by :func:`render_cache_key`: every
+    successful render is stored in it as the digest TEXT, not just its byte
+    count. Its job is cross-STAGE, and it is the only reason this closure
+    holds a cache at all — ``stratified_sample`` already memoizes ``cost_fn``
+    per record, so a byte-count memo here would be dead weight in the only
+    path that uses it (reviewer_comprehensive, task 3268 amendment pass). The
+    two caches answer different questions: ``stratified_sample``'s prevents a
+    second CALL within one sampler run; this one prevents a second RENDER by
+    a later pipeline stage. ``nightly.run_nightly`` passes one dict through
+    both :func:`nightly.select_digest_sessions` and
+    :func:`nightly.build_digests`, so a candidate rendered to measure its cost
+    is not rendered again to emit it. That matters more than it looks:
+    :func:`legibility.digest._truncate_sections` is super-linear in signal-item
+    count (it pops ONE item and re-renders the whole digest per iteration), so
+    an unshared costing render roughly DOUBLED the dominant cost of the nightly
+    job — measured on the ``_write_multi_mb_transcript`` fixture shape at
+    0.80s / 2.57s / 14.96s per render for 1000 / 2000 / 4000 error lines.
+    Passing no *rendered* dict keeps a private one, so a standalone caller
+    (:func:`main`) still never renders the same session twice.
+
+    The cache holds digest TEXT (~15KB each, §7.2-capped) for post-dedupe,
+    post-``top_fraction`` candidates only — tens of entries, not one per
+    enumerated session.
 
     A raising *build* does NOT propagate: the record is charged ZERO and a
     warning is logged. Zero is the ACCURATE charge — a render that raises
@@ -547,20 +581,23 @@ def digest_byte_cost_fn(
     zero-cost record can still be skipped as part of an unaffordable reserve
     GROUP, or sit behind the greedy fill's strict halt.
     """
-    memo: dict[Path, int] = {}
+    cache: dict[tuple, str] = {} if rendered is None else rendered
 
     def cost(record: ScoredRecord) -> int:
-        cached = memo.get(record.path)
-        if cached is not None:
-            return cached
-
         renderer = build if build is not None else digest.build_digest
+        key = render_cache_key(record.path, max_bytes, renderer)
+
+        cached = cache.get(key)
+        if cached is not None:
+            return len(cached.encode('utf-8'))
+
         try:
-            rendered = renderer(
+            text = renderer(
                 record.path, agent_class_override=record.stratum, max_bytes=max_bytes,
             )
-            charged = len(rendered.encode('utf-8'))
         except Exception as exc:  # noqa: BLE001 - degrade loud, never propagate
+            # Deliberately NOT cached: build_digests must re-attempt, raise
+            # again, and report the failure via extractor_failures.
             logger.warning(
                 'digest costing failed for %s (%s: %s); charging 0 bytes — a render '
                 'that raises produces no digest, and the cheapest possible charge is '
@@ -568,10 +605,10 @@ def digest_byte_cost_fn(
                 'which reports the failure through extractor_failures',
                 record.path.name, type(exc).__name__, exc,
             )
-            charged = 0
+            return 0
 
-        memo[record.path] = charged
-        return charged
+        cache[key] = text
+        return len(text.encode('utf-8'))
 
     return cost
 

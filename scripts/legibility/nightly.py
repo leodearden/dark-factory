@@ -167,6 +167,7 @@ drift fails a test instead of silently mis-charging the budget."""
 
 def select_digest_sessions(
     cfg: LegibilityConfig, projects_root: Path | str, target_date: date,
+    *, rendered: dict[tuple, str] | None = None,
 ) -> list[sampling.ScoredRecord]:
     """The budget-bounded, stratified subset of *target_date*'s sessions to
     digest -- :func:`select_scored_records` narrowed by
@@ -184,8 +185,19 @@ def select_digest_sessions(
 
     Costing renders transcripts, but only POST-dedupe, POST-``top_fraction``
     candidates -- a small number of extra renders, not one per enumerated
-    session -- and each at most once (both :func:`sampling.digest_byte_cost_fn`
-    and ``stratified_sample`` memoize on the session path). A costing render
+    session -- and each at most once (``stratified_sample`` memoizes
+    ``cost_fn`` per session path). Pass *rendered* -- a caller-owned dict --
+    to also carry those renders FORWARD to :func:`build_digests`, which then
+    emits the already-rendered digest instead of building it a second time;
+    :func:`run_nightly` does exactly that. Without it each selected session is
+    rendered twice per night, and rendering is super-linear in signal-item
+    count (:func:`legibility.digest._truncate_sections` re-renders the whole
+    digest per trimmed item), so the sharing is worth roughly a 2x on the
+    dominant cost of the job. What sharing does NOT recover: a candidate the
+    budget ends up SKIPPING was still rendered once to find out what it would
+    have cost. That is the irreducible price of a real byte budget rather than
+    an estimate -- bounded by the candidate count, and the alternative (a
+    count cap) is what PRD §5.2 point 2 rules out. A costing render
     that FAILS is charged ZERO rather than propagating — the accurate charge
     (no digest was produced) and the one that keeps the record cheap enough
     to reach :func:`build_digests`, where the same failure is reported
@@ -198,7 +210,9 @@ def select_digest_sessions(
     scored = select_scored_records(cfg, projects_root, target_date)
     return sampling.stratified_sample(
         scored, cfg,
-        cost_fn=sampling.digest_byte_cost_fn(max_bytes=DEFAULT_MAX_DIGEST_BYTES),
+        cost_fn=sampling.digest_byte_cost_fn(
+            max_bytes=DEFAULT_MAX_DIGEST_BYTES, rendered=rendered,
+        ),
     ).selected
 
 
@@ -212,11 +226,28 @@ def build_digests(
     *,
     max_bytes: int = DEFAULT_MAX_DIGEST_BYTES,
     build=digest.build_digest,
+    rendered: dict[tuple, str] | None = None,
 ) -> tuple[list[str], list[tuple[str, str]]]:
     """Render one confusion digest per *selected* record via *build*
     (default :func:`legibility.digest.build_digest`), passing beta's already
     -authoritative ``rec.stratum`` as ``agent_class_override`` -- alpha never
     re-guesses when the caller already knows.
+
+    *rendered* is the render cache :func:`select_digest_sessions` populated
+    while COSTING these same records against the byte budget. A record whose
+    digest is already in it is emitted from the cache rather than rendered a
+    second time -- the cost basis and the render basis are the same constant
+    by construction (:data:`DEFAULT_MAX_DIGEST_BYTES`), so the cached text is
+    byte-identical to what a re-render would produce, and
+    :func:`sampling.render_cache_key` makes a mismatched cap or builder a
+    structural MISS rather than a wrong digest. Skipping the re-render matters
+    because :func:`legibility.digest._truncate_sections` is super-linear in
+    signal-item count (one item popped and the whole digest re-rendered per
+    iteration): seconds to minutes per multi-MB session.
+
+    A costing render that FAILED is deliberately absent from the cache, so it
+    is re-attempted here and raises again -- which is how it reaches the
+    structured report below.
 
     Any exception raised by *build* for a given record is isolated: it is
     captured as ``(session_basename, reason)`` in the returned
@@ -227,16 +258,24 @@ def build_digests(
     """
     digests: list[str] = []
     extractor_failures: list[tuple[str, str]] = []
+    cache: dict[tuple, str] = {} if rendered is None else rendered
 
     for record in selected:
+        key = sampling.render_cache_key(record.path, max_bytes, build)
+        cached = cache.get(key)
+        if cached is not None:
+            digests.append(cached)
+            continue
+
         try:
-            rendered = build(
+            text = build(
                 record.path, agent_class_override=record.stratum, max_bytes=max_bytes,
             )
         except Exception as exc:  # noqa: BLE001 - isolate, never propagate/fabricate
             extractor_failures.append((record.path.name, str(exc)))
             continue
-        digests.append(rendered)
+        cache[key] = text
+        digests.append(text)
 
     return digests, extractor_failures
 
@@ -610,8 +649,13 @@ def run_nightly(
         projects_root = DEFAULT_PROJECTS_ROOT
     commit_fn = committer if committer is not None else _git_commit_docs_only
 
-    selected = select_digest_sessions(cfg, projects_root, target_date)
-    digests, extractor_failures = build_digests(selected)
+    # One render cache for the whole run: select_digest_sessions renders each
+    # candidate to CHARGE it against the byte budget, and build_digests reuses
+    # that render instead of paying for it twice. Rendering is super-linear in
+    # signal-item count, so this is roughly a 2x on the job's dominant cost.
+    rendered: dict[tuple, str] = {}
+    selected = select_digest_sessions(cfg, projects_root, target_date, rendered=rendered)
+    digests, extractor_failures = build_digests(selected, rendered=rendered)
 
     if extractor_failures:
         # A digest builder raise is exceptional (build_digests already

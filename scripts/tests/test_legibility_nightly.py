@@ -344,6 +344,117 @@ def test_build_digests_happy_path(tmp_path):
     assert digests[0].startswith('---\n')
 
 
+def test_build_digests_reuses_the_costing_render(tmp_path):
+    """A session rendered to CHARGE it against the byte budget must not be
+    rendered a second time to emit it.
+
+    Every selected session used to be rendered twice per nightly run, and
+    ``digest._truncate_sections`` is super-linear in signal-item count (it
+    pops ONE item and re-renders the whole digest per iteration): measured on
+    the ``_write_multi_mb_transcript`` shape at 0.80s / 2.57s / 14.96s per
+    render for 1000 / 2000 / 4000 error lines, i.e. roughly a 2x on the
+    dominant cost of the job (reviewer_comprehensive, task 3268 amendment
+    pass). Measured after the fix: 2 renders -> 1, 4.18s -> 2.23s, with a
+    byte-identical digest.
+    """
+    work_cwd = str(tmp_path / 'work')
+    cfg = load_config(_write_config(tmp_path, project_id='proj_a', cwd_prefixes=[work_cwd]))
+    projects_root = tmp_path / 'projects'
+    session_path = projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl'
+    _write_transcript(session_path, cwd=work_cwd, timestamp='2026-07-13T10:00:00Z')
+
+    renders = []
+    real_build = digest.build_digest
+
+    def counting_build(path, **kwargs):
+        renders.append(path)
+        return real_build(path, **kwargs)
+
+    # select_digest_sessions has no build seam of its own -- the costing
+    # renderer is digest.build_digest, resolved at call time.
+    digest.build_digest = counting_build
+    try:
+        rendered: dict = {}
+        selected = nightly.select_digest_sessions(
+            cfg, projects_root, date(2026, 7, 13), rendered=rendered,
+        )
+        assert renders == [session_path], 'costing must render exactly once'
+
+        digests, extractor_failures = nightly.build_digests(
+            selected, build=counting_build, rendered=rendered,
+        )
+    finally:
+        digest.build_digest = real_build
+
+    # Still exactly one render in total: build_digests served the cache.
+    assert renders == [session_path]
+    assert extractor_failures == []
+    assert digests == [
+        digest.build_digest(
+            session_path, agent_class_override=selected[0].stratum,
+            max_bytes=nightly.DEFAULT_MAX_DIGEST_BYTES,
+        )
+    ], 'the cached digest must be byte-identical to a fresh render'
+
+
+def test_build_digests_re_renders_when_no_cache_is_shared(tmp_path):
+    """The cache is opt-in: a caller that shares none still gets a correct
+    digest, just at the cost of a second render."""
+    work_cwd = str(tmp_path / 'work')
+    cfg = load_config(_write_config(tmp_path, project_id='proj_a', cwd_prefixes=[work_cwd]))
+    projects_root = tmp_path / 'projects'
+    session_path = projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl'
+    _write_transcript(session_path, cwd=work_cwd, timestamp='2026-07-13T10:00:00Z')
+
+    selected = nightly.select_digest_sessions(cfg, projects_root, date(2026, 7, 13))
+    digests, extractor_failures = nightly.build_digests(selected)
+
+    assert extractor_failures == []
+    assert len(digests) == 1
+    assert digests[0].startswith('---\n')
+
+
+def test_run_nightly_shares_one_render_cache_across_both_stages(tmp_path, monkeypatch):
+    """``run_nightly`` is the only production wiring of the two stages, so
+    the reuse only pays off if IT threads one dict through both."""
+    work_cwd = str(tmp_path / 'work')
+    repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+    projects_root = tmp_path / 'projects'
+    session_path = projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl'
+    _write_transcript(
+        session_path, cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id='session-1',
+    )
+
+    seen = {}
+    real_select = nightly.select_digest_sessions
+    real_build = nightly.build_digests
+
+    def spy_select(cfg, roots, target, *, rendered=None):
+        seen['select'] = rendered
+        return real_select(cfg, roots, target, rendered=rendered)
+
+    def spy_build(selected, **kwargs):
+        seen['build'] = kwargs.get('rendered')
+        return real_build(selected, **kwargs)
+
+    monkeypatch.setattr(nightly, 'select_digest_sessions', spy_select)
+    monkeypatch.setattr(nightly, 'build_digests', spy_build)
+
+    nightly.run_nightly(
+        config_path=config_path,
+        projects_root=projects_root,
+        target_date=date(2026, 7, 13),
+        now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc),
+        invoke=lambda prompt, model: '{"proposals": []}',
+        status_fetcher=None,
+        poster=lambda url, envelope: None,
+    )
+
+    assert seen['select'] is not None, 'run_nightly passed no render cache to costing'
+    assert seen['build'] is seen['select'], 'the two stages must share ONE dict'
+    assert seen['select'], 'the shared cache must actually hold the costing render'
+
+
 def test_build_digests_isolates_extractor_crash(tmp_path):
     work_cwd = str(tmp_path / 'work')
     cfg = load_config(_write_config(tmp_path, project_id='proj_a', cwd_prefixes=[work_cwd]))

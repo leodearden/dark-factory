@@ -745,7 +745,12 @@ class TestDigestByteCostFn:
             {'agent_class_override': 'orchestrated-task', 'max_bytes': 9_999},
         )]
 
-    def test_memoizes_by_path(self):
+    def test_reuses_a_cached_render_rather_than_rendering_twice(self):
+        """The closure's cache exists to avoid a second RENDER, which is the
+        expensive half — ``stratified_sample`` already memoizes ``cost_fn``
+        per record, so a bare byte-count memo here would be dead weight in
+        the path that uses it (reviewer_comprehensive, task 3268 amendment
+        pass)."""
         calls = []
 
         def fake_build(path, **kwargs):
@@ -757,6 +762,61 @@ class TestDigestByteCostFn:
         assert cost(record) == 50
         assert cost(record) == 50
         assert len(calls) == 1
+
+    def test_populates_a_callers_render_cache_with_the_digest_text(self):
+        """The cache holds the rendered TEXT, not just its byte count, so a
+        later pipeline stage (``nightly.build_digests``) can EMIT the digest
+        instead of paying to render it again."""
+        cache: dict = {}
+
+        def fake_build(path, **kwargs):
+            return 'the rendered digest'
+
+        record = self._record()
+        cost = mod.digest_byte_cost_fn(max_bytes=15360, build=fake_build, rendered=cache)
+        assert cost(record) == len('the rendered digest')
+
+        key = mod.render_cache_key(record.path, 15360, fake_build)
+        assert cache == {key: 'the rendered digest'}
+
+    def test_a_failed_render_is_never_cached(self):
+        """A failure must NOT be memoized as an entry: ``build_digests``
+        has to re-attempt it, raise again, and report it through
+        ``extractor_failures``. A cached failure would silently swallow the
+        only structured signal the operator gets."""
+        cache: dict = {}
+
+        def exploding_build(path, **kwargs):
+            raise RuntimeError('transcript unreadable')
+
+        cost = mod.digest_byte_cost_fn(
+            max_bytes=15360, build=exploding_build, rendered=cache,
+        )
+        assert cost(self._record()) == 0
+        assert cache == {}
+
+    def test_cache_key_isolates_a_different_cap_or_builder(self):
+        """A cache entry must never be served to a stage rendering with a
+        different soft cap or a different builder — a mismatch is a
+        structural MISS and an honest re-render, not a wrong digest."""
+        record = self._record()
+
+        def build_a(path, **kwargs):
+            return 'aaa'
+
+        def build_b(path, **kwargs):
+            return 'bbbbbb'
+
+        cache: dict = {}
+        assert mod.digest_byte_cost_fn(
+            max_bytes=15360, build=build_a, rendered=cache)(record) == 3
+        # Same path + same builder, different cap -> miss.
+        assert mod.digest_byte_cost_fn(
+            max_bytes=2048, build=build_a, rendered=cache)(record) == 3
+        # Same path + same cap, different builder -> miss.
+        assert mod.digest_byte_cost_fn(
+            max_bytes=15360, build=build_b, rendered=cache)(record) == 6
+        assert len(cache) == 3
 
     def test_build_failure_charges_zero_and_warns(self, caplog):
         def exploding_build(path, **kwargs):
