@@ -1099,3 +1099,74 @@ class TestActionEffectsTableCoupling:
         harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
             task_id, '__RESUME_SENTINEL__',
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 3024 (Part 2) — restart clears metadata.merge_retry_pending
+#
+# A task carrying a merge_retry_pending stamp fast-paths straight to the merge
+# phase on dispatch (workflow._resume_merge_retry_if_pending), skipping
+# plan/execute/verify/review.  restart's whole purpose is to force a FRESH run,
+# so the stamp must not survive it — otherwise the re-dispatch re-enters the
+# same fast-path and an operator restart cannot break a wedged task out of it.
+# ---------------------------------------------------------------------------
+
+
+def _replace_metadata_calls(update_task: AsyncMock) -> list[dict]:
+    """Return the metadata blob of every update_task call made with mode='replace'.
+
+    Isolates the stamp-clearing write from the restart path's OTHER metadata
+    write (the deterministic gate-stamp clear, which uses mode='merge').
+    """
+    out: list[dict] = []
+    for args, kwargs in update_task.await_args_list:
+        if kwargs.get('metadata_mode') != 'replace':
+            continue
+        metadata = kwargs.get('metadata') if 'metadata' in kwargs else args[1]
+        out.append(metadata)
+    return out
+
+
+_MRP_METADATA = {
+    'merge_retry_pending': {'branch_head': 'X'},
+    'sibling': 1,
+}
+
+
+@pytest.mark.asyncio
+class TestRestartClearsMergeRetryPending:
+    """Part 2: restart teardown voids the durable merge-retry stamp."""
+
+    async def test_restart_clears_stamp_before_pending_write(self, harness: Harness):
+        """The stamp is dropped by a replace-mode write, other keys preserved."""
+        harness.scheduler.get_status = AsyncMock(return_value='blocked')
+        harness.scheduler.get_task = AsyncMock(
+            return_value={'id': 'task-1', 'metadata': dict(_MRP_METADATA)},
+        )
+        harness.is_workflow_active = MagicMock(return_value=False)
+
+        # Order matters: the clear must land BEFORE the task goes 'pending', or
+        # the scheduler can re-dispatch it while the stamp is still readable.
+        manager = MagicMock()
+        manager.attach_mock(harness.scheduler.update_task, 'update_task')
+        manager.attach_mock(harness.scheduler.set_task_status, 'set_task_status')
+
+        await harness._action_teardown_and_set_status('task-1', 'pending', 'restart')
+
+        replaced = _replace_metadata_calls(harness.scheduler.update_task)  # type: ignore[arg-type]
+        assert len(replaced) == 1, (
+            f'expected exactly one replace-mode clearing write, got {replaced}'
+        )
+        assert 'merge_retry_pending' not in replaced[0], (
+            "replace-mode write must omit 'merge_retry_pending' (delete-by-omission)"
+        )
+        # Delete-by-omission means every OTHER key must be carried through.
+        assert replaced[0].get('sibling') == 1
+
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            'task-1', 'pending',
+        )
+        names = [c[0] for c in manager.mock_calls]
+        assert names.index('update_task') < names.index('set_task_status'), (
+            f'stamp clear must precede the pending write; order was {names}'
+        )
