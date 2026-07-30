@@ -1080,10 +1080,22 @@ def run_census(
         Path(dry_run_payloads_path).write_text(
             json.dumps(task_payloads, indent=2) + "\n", encoding="utf-8",
         )
+        # The WARNING deliberately does NOT offer a repeat census as the
+        # recovery path, because that path is dead: this run merges the
+        # candidates into the codebook and dumps it, so the same confusions
+        # code as `matches` next time, _novel_clusters() comes back empty and
+        # build_task_payloads() returns [] -- and advance_census_state() moves
+        # last_census_at, which _census_window_dates() anchors on, so the
+        # window these payloads came from is never enumerated again. Hand
+        # filing is the only remaining handle on the work; do not reintroduce
+        # the "just run it again without the flag" guidance.
         logger.warning(
             "census: --dry-run-filing -- %d task payload(s) written to %s; "
-            "NOTHING was filed into a live task tree. Review the payloads and file "
-            "by hand, or re-run without --dry-run-filing.",
+            "NOTHING was filed into a live task tree. This run HAS ALREADY "
+            "advanced the codebook and census-state, so filing those payloads "
+            "by hand is the only remaining way to land the work: a later "
+            "census will NOT re-file them (these confusions now code as "
+            "matches, not candidates, and the census window has re-anchored).",
             len(task_payloads), dry_run_payloads_path,
         )
         dry_run_filing = DryRunFiling(
