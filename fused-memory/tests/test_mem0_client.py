@@ -376,6 +376,112 @@ class TestMem0BackendAddSystemRecord:
         )
 
 
+class TestMem0BackendPayloadPrimitives:
+    """Payload-only writes that never re-embed (task 3088).
+
+    ``Mem0Backend.update`` goes through mem0's ``AsyncMemory.update``, which
+    re-embeds the content, rewrites ``updated_at`` and appends a mem0 history
+    row. For a purely-cosmetic metadata patch (e.g. tagging a survivor with
+    ``topic=``) all three are waste, so the metadata-only arms of
+    ``update_memory`` route straight to Qdrant's payload APIs instead. Named
+    1:1 after the Qdrant primitives they wrap so the decision doc's §5(b)
+    routing table reads directly against the code.
+    """
+
+    UUID = '77a3f6bc-0000-0000-0000-000000000000'
+
+    def _mocks(self, backend):
+        mock_client = AsyncMock()
+        mock_instance = MagicMock()
+        mock_instance.update = AsyncMock()
+        return mock_client, mock_instance
+
+    @pytest.mark.asyncio
+    async def test_set_payload_merges_via_qdrant(self, backend):
+        mock_client, mock_instance = self._mocks(backend)
+        get_instance = AsyncMock(return_value=mock_instance)
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)), \
+                patch.object(backend, '_get_instance', get_instance):
+            await backend.set_payload(
+                self.UUID, {'topic': 'docs-prd-landing'}, Scope(project_id='dark_factory'),
+            )
+
+        assert mock_client.set_payload.await_count == 1
+        kwargs = mock_client.set_payload.call_args.kwargs
+        prefix = backend.config.mem0.collection_prefix
+        assert kwargs.get('collection_name') == f'{prefix}_dark_factory'
+        assert kwargs.get('payload') == {'topic': 'docs-prd-landing'}
+        assert kwargs.get('points') == [self.UUID], (
+            f'the point id must pass through unchanged, got {kwargs.get("points")!r}'
+        )
+        get_instance.assert_not_called()
+        mock_instance.update.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_delete_payload_removes_named_keys(self, backend):
+        mock_client, mock_instance = self._mocks(backend)
+        get_instance = AsyncMock(return_value=mock_instance)
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)), \
+                patch.object(backend, '_get_instance', get_instance):
+            await backend.delete_payload(
+                self.UUID, ['topic', 'kind'], Scope(project_id='dark_factory'),
+            )
+
+        assert mock_client.delete_payload.await_count == 1
+        kwargs = mock_client.delete_payload.call_args.kwargs
+        prefix = backend.config.mem0.collection_prefix
+        assert kwargs.get('collection_name') == f'{prefix}_dark_factory'
+        assert kwargs.get('keys') == ['topic', 'kind']
+        assert kwargs.get('points') == [self.UUID]
+        get_instance.assert_not_called()
+        mock_instance.update.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_overwrite_payload_replaces_whole_payload(self, backend):
+        mock_client, mock_instance = self._mocks(backend)
+        get_instance = AsyncMock(return_value=mock_instance)
+        full = {'data': 'txt', 'created_at': 'c', 'topic': 'new'}
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)), \
+                patch.object(backend, '_get_instance', get_instance):
+            await backend.overwrite_payload(
+                self.UUID, full, Scope(project_id='dark_factory'),
+            )
+
+        assert mock_client.overwrite_payload.await_count == 1
+        kwargs = mock_client.overwrite_payload.call_args.kwargs
+        prefix = backend.config.mem0.collection_prefix
+        assert kwargs.get('collection_name') == f'{prefix}_dark_factory'
+        assert kwargs.get('payload') == full
+        assert kwargs.get('points') == [self.UUID]
+        get_instance.assert_not_called()
+        mock_instance.update.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('method', 'args'),
+        [
+            ('set_payload', ({'topic': 't'},)),
+            ('delete_payload', (['topic'],)),
+            ('overwrite_payload', ({'topic': 't'},)),
+        ],
+    )
+    async def test_timeout_propagates(self, backend, method, args):
+        """A write timeout must PROPAGATE, never be swallowed into a falsy return
+        — the house posture on this file (get_point_by_id), in deliberate
+        contrast to get() which does swallow."""
+        mock_client = AsyncMock()
+        setattr(mock_client, method, AsyncMock(side_effect=TimeoutError))
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)), \
+                pytest.raises(TimeoutError):
+            await getattr(backend, method)(
+                self.UUID, *args, Scope(project_id='dark_factory'),
+            )
+
+
 class TestMem0ManagedMetadataKeys:
     """The mem0-owned payload-key set, extracted to its single home (task 3088).
 
