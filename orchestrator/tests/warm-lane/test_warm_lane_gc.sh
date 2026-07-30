@@ -71,6 +71,11 @@
 #       basename is merely a name-prefix of it. Lives here now because the
 #       boundary matcher is called by gc.sh directly; GREEN on arrival — its
 #       job is to keep the regression pinned at the right layer, not to go red
+#   S — the DURABLE LANE RECORD is Pass 1's reclaimability gate (task 3075,
+#       reify esc-5334-6): a lane whose <worktrees-dir>/.lane-state/<lane>.json
+#       reads `assigned`/`in_use` is preserved, with a FREE flock and NO
+#       --extra-protect-glob — the dark-factory ε shape. S-basic pins the
+#       preserve and that a `released` lane still reclaims
 #
 # The former Tier-3 blocks I/J/L (terminal-task reclaim + Pass-2 boundary,
 # task 5167) were deleted when task 5326 collapsed the Pass-1 gate to the
@@ -1923,6 +1928,86 @@ assert "R6: stderr does NOT claim a process reference for _lane-1" \
 kill "$R_HELPER_PID" 2>/dev/null || true
 wait "$R_HELPER_PID" 2>/dev/null || true
 _BGPIDS=()  # clear so EXIT cleanup does not re-kill a possibly-reused PID
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Block S — the durable lane record is the Pass-1 reclaimability gate (task 3075)
+# ──────────────────────────────────────────────────────────────────────────────
+# ROOT CAUSE (reify esc-5334-6): gc.sh's header claimed "FREE/idle ≈ no live
+# consumer holding the lane flock". That approximation is FALSE for most of an
+# ASSIGNED lane's life — the inv.2 flock is held only across the acquire reseed
+# and across run_scoped_verification, never across the implement phase — so task
+# 5326's always-reclaim, written for "a FREE pool lane", fires on lanes that
+# dark-factory has assigned to a live task.
+#
+# FIX: consult dark-factory's OWN durable lane record —
+# <worktrees-dir>/.lane-state/<lane>.json, read per lane through
+# lib_lane_state.sh — inside the Pass-1 loop, under the flock the loop already
+# holds. Every sub-case below is invoked DF-FAITHFULLY: no --extra-protect-glob,
+# and every <lane>.lock FREE, so neither the wrapper CSV nor the flock gate can
+# account for any preservation observed.
+#
+# The state dir is DOT-PREFIXED and gc.sh's candidate loop is
+# `"$WORKTREES_DIR"/*/` with no `shopt -s dotglob` anywhere, so `.lane-state/`
+# is never enumerated as a candidate and cannot inflate `preserved=`.
+echo ""
+echo "--- Block S: the durable lane record gates Pass-1 reclaim (task 3075) ---"
+
+# ── S-basic: an ASSIGNED lane is preserved from the dark-factory entry point ──
+# _lane-5 carries an `assigned` record naming task 5334 (the esc-5334-6 lane);
+# _lane-1 carries a `released` record. Both are clean+landed with a FREE flock,
+# so under the pre-γ rule BOTH would be reset. Discrimination, not blanket
+# over-preserve.
+S_ROOT="$(mktemp -d /tmp/test-gc-s-XXXXXX)"
+_TMPDIRS+=("$S_ROOT")
+
+S_REPO="$S_ROOT/repo"
+S_WORKTREES="$S_ROOT/worktrees"
+S_BASE="$S_ROOT/base"
+mkdir -p "$S_WORKTREES" "$S_BASE"
+
+make_repo "$S_REPO"
+
+mkdir -p "$S_BASE/target.gen.1"
+touch "$S_BASE/target.gen.1.lock"
+ln -sfn "$S_BASE/target.gen.1" "$S_BASE/target"
+
+for _s_name in _lane-1 _lane-5; do
+    git -C "$S_REPO" worktree add -q "$S_WORKTREES/$_s_name"
+    mkdir -p "$S_WORKTREES/$_s_name/target"
+    touch "$S_WORKTREES/$_s_name/target/DIVERGENT_MARKER"
+done
+
+# Records built through the SHARED factory (tests/warm-lane/test_helpers.sh),
+# the same one warm-lane-audit.sh's suite uses — no third hand-copied mirror.
+make_lane_state "$S_WORKTREES" _lane-5 assigned 5334
+make_lane_state "$S_WORKTREES" _lane-1 released
+
+S_SEED_LOG="$S_ROOT/seed_calls.log"
+S_SEED_STUB="$S_ROOT/seed_stub.sh"
+_seed_stub_body > "$S_SEED_STUB"
+chmod +x "$S_SEED_STUB"
+export SEED_LOG="$S_SEED_LOG"
+
+run_helper reclaim \
+    --worktrees-dir "$S_WORKTREES" \
+    --base-target "$S_BASE/target" \
+    --seed-script "$S_SEED_STUB" \
+    --main-ref main
+
+assert "S1: exit 0" test "$RC" -eq 0
+assert "S2: assigned _lane-5 seed-script NOT invoked (preserved, not reset)" \
+    bash -c '[ ! -f "$1" ] || ! grep -q "_lane-5" "$1"' _ "$S_SEED_LOG"
+assert "S3: assigned _lane-5 divergent marker INTACT (FREE flock, no --extra-protect-glob)" \
+    test -f "$S_WORKTREES/_lane-5/target/DIVERGENT_MARKER"
+# The PRD/task-pinned reason string. Asserted with grep -F on the exact prefix so
+# a later suffix (the raw state, step-3) keeps this substring match green.
+assert "S4: stderr names the record-driven preserve reason for _lane-5" \
+    bash -c 'printf "%s\n" "$1" | grep -qF "preserving _lane-5: assigned to task 5334"' _ "$ERR_OUT"
+assert "S5: released _lane-1 still reset (fail-open on a non-assigned record)" \
+    bash -c 'test -f "$1" && grep -q "_lane-1" "$1" && [ ! -f "$2" ]' _ \
+    "$S_SEED_LOG" "$S_WORKTREES/_lane-1/target/DIVERGENT_MARKER"
+assert "S6: summary reports reset=1 (only the released lane was reclaimed)" \
+    bash -c 'printf "%s\n" "$1" | grep -qE "reset=1"' _ "$OUT"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Block TRASH: shared-trash litter guard (task 5612). Two asserts, deliberately
