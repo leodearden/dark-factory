@@ -3877,9 +3877,34 @@ class TaskWorkflow:
             # entirely. A present-but-empty {} plan carries no steps/session
             # data to re-plan from either, so it is semantically equivalent
             # to "no plan" and correctly falls to fresh-dispatch here too.
+            #
+            # committed_work (task 3033 / PRD §A1): surface every commit this
+            # branch already carries so a re-invoked architect can pre-satisfy
+            # already-implemented steps via mark_step_committed instead of
+            # re-planning them as pending.  Scoped to THIS branch of _plan by
+            # design decision — the completion-pass and revalidation branches
+            # above are deliberately left unchanged (both already carry
+            # done-step semantics and explicit "do NOT remove or replace steps
+            # with status done" instructions).  Inert on the common path: on a
+            # truly-fresh first dispatch HEAD == base_commit, so the detector
+            # returns [] and the briefing is byte-identical to today's.
+            #
+            # Belt-and-braces best-effort: the detector already swallows its own
+            # exceptions and returns [], but a failure here must NEVER sink
+            # PLAN, so the call site falls back to [] too.
+            try:
+                committed_work = await self._detect_committed_branch_work()
+            except Exception:
+                logger.warning(
+                    'Task %s: committed-branch-work detection raised at the '
+                    '_plan call site; briefing without it (task 3033)',
+                    self.task_id, exc_info=True,
+                )
+                committed_work = []
             prompt = await self.briefing.build_architect_prompt(
                 self.task, worktree=self.worktree,
                 include_prior_proposals=bool(existing_plan),
+                committed_work=committed_work,
             )
 
         # Snapshot pre-architect open L0 ids so the post-loop check can
