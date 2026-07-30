@@ -22,11 +22,15 @@ Two defects live here:
 
 This module owns the new coverage for both.  It reuses the real-git fixtures of
 :mod:`test_merge_verify_lease_guard` wholesale (the suite's cross-module-helper
-convention) and adds two shared helpers used by every class below:
-:func:`foreign_lane_lock_holder` (a GENUINELY foreign holder — same-process fds
-are indistinguishable from the leak at kernel level) and :func:`wait_until` (a
-bounded async poll, so orphan-release callbacks settle deterministically
-instead of behind a fixed sleep).
+convention) and adds four shared helpers used by the classes below:
+
+* :func:`foreign_lane_lock_holder` — a GENUINELY foreign holder, since
+  same-process fds are indistinguishable from the leak at kernel level;
+* :func:`leaked_lane_lock` — the B13 fault staged as an unregistered fd with no
+  holder-pgid rendezvous, exactly what an orphaned acquire leaves behind;
+* :func:`wait_until` — a bounded async poll, so orphan-release callbacks settle
+  deterministically instead of behind a fixed sleep;
+* :func:`lane_is_free` — the PRD's B12 signal: unheld AND unattributed to us.
 """
 from __future__ import annotations
 
