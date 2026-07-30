@@ -63,6 +63,29 @@ def _rehome_record(
 
 
 # ===========================================================================
+# Tests: _MEM0_MANAGED_METADATA_KEYS resolves to its single home
+# ===========================================================================
+
+class TestMem0ManagedKeysImported:
+    """The script must IMPORT the mem0-owned key set, not define its own copy.
+
+    Task 3088 gave the constant a single home next to ``Mem0Backend.update``
+    (decision doc ``plans/mem0-in-place-update-decision.md`` §6) because the
+    in-place ``update_memory`` tool is a second consumer. An imported name is
+    still a module attribute, so the ``_mod._MEM0_MANAGED_METADATA_KEYS``
+    references elsewhere in this file keep resolving.
+    """
+
+    def test_is_the_same_object_as_the_backend_constant(self):
+        from fused_memory.backends import mem0_client
+
+        assert _mod._MEM0_MANAGED_METADATA_KEYS is mem0_client._MEM0_MANAGED_METADATA_KEYS, (
+            'the script must import the constant from its single home in '
+            'backends/mem0_client.py, not re-define it (INV-5)'
+        )
+
+
+# ===========================================================================
 # Tests: classify_rehome_record (pure core)
 # ===========================================================================
 

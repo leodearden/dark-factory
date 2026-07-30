@@ -376,6 +376,74 @@ class TestMem0BackendAddSystemRecord:
         )
 
 
+class TestMem0ManagedMetadataKeys:
+    """The mem0-owned payload-key set, extracted to its single home (task 3088).
+
+    Value-pins the key set mem0's ``AsyncMemory._update_memory`` recomputes or
+    restores (mem0ai 1.0.11, ``mem0/memory/main.py:2461-2481``). Previously this
+    lived privately in ``scripts/tag_cgl_eta_rehome_scope.py``; the in-place
+    ``update_memory`` tool is a second consumer, so per decision doc
+    ``plans/mem0-in-place-update-decision.md`` §6 it moves next to
+    ``Mem0Backend.update``, whose docstring already documents the very
+    constraint it encodes. One definition repo-wide (INV-5).
+    """
+
+    def test_is_frozenset_with_exact_membership(self):
+        from fused_memory.backends.mem0_client import _MEM0_MANAGED_METADATA_KEYS
+
+        assert isinstance(_MEM0_MANAGED_METADATA_KEYS, frozenset), (
+            f'expected a frozenset, got {type(_MEM0_MANAGED_METADATA_KEYS).__name__}'
+        )
+        assert _MEM0_MANAGED_METADATA_KEYS == {
+            'data', 'hash', 'created_at', 'updated_at',
+            'user_id', 'agent_id', 'run_id', 'actor_id', 'role',
+        }, f'unexpected membership: {sorted(_MEM0_MANAGED_METADATA_KEYS)}'
+
+    def test_split_partitions_managed_from_custom(self):
+        from fused_memory.backends.mem0_client import split_managed_metadata
+
+        payload = {
+            'data': 'content', 'hash': 'h', 'created_at': 'c', 'updated_at': 'u',
+            'user_id': 'p', 'kind': 'canonical', 'src_project': 'reify', 'topic': 't',
+        }
+        managed, custom = split_managed_metadata(payload)
+        assert managed == {
+            'data': 'content', 'hash': 'h', 'created_at': 'c',
+            'updated_at': 'u', 'user_id': 'p',
+        }, f'unexpected managed subset: {managed!r}'
+        assert custom == {
+            'kind': 'canonical', 'src_project': 'reify', 'topic': 't',
+        }, f'unexpected custom subset: {custom!r}'
+
+    def test_unknown_keys_land_in_custom(self):
+        from fused_memory.backends.mem0_client import split_managed_metadata
+
+        managed, custom = split_managed_metadata({'wholly_novel_key': 1})
+        assert managed == {}, f'expected no managed keys, got {managed!r}'
+        assert custom == {'wholly_novel_key': 1}, (
+            f'an unknown key must be treated as custom (preserved), got {custom!r}'
+        )
+
+    def test_empty_payload_yields_two_empty_dicts(self):
+        from fused_memory.backends.mem0_client import split_managed_metadata
+
+        assert split_managed_metadata({}) == ({}, {})
+
+    def test_neither_result_aliases_the_input(self):
+        """Callers mutate the custom subset in place (the merge/delete arms), so
+        neither returned dict may alias the caller's payload."""
+        from fused_memory.backends.mem0_client import split_managed_metadata
+
+        payload = {'data': 'content', 'kind': 'canonical'}
+        managed, custom = split_managed_metadata(payload)
+        assert managed is not payload and custom is not payload
+        custom['kind'] = 'mutated'
+        managed['data'] = 'mutated'
+        assert payload == {'data': 'content', 'kind': 'canonical'}, (
+            f'mutating a returned subset must not touch the input, got {payload!r}'
+        )
+
+
 class TestMem0BackendUpdate:
     """Unit tests for Mem0Backend.update's metadata-forwarding (task 2452).
 
