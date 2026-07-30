@@ -1047,3 +1047,212 @@ class TestAnnPairsFromNeighbors:
         snapshot = [dict(m) for m in memories]
         ann_pairs_from_neighbors(memories, {'m0': [_hit('m1', 0.95)]}, threshold=0.9)
         assert memories == snapshot
+
+
+# ===========================================================================
+# The user-observable signal: the ANN path catches a paraphrase the lexical
+# path structurally cannot (task 3210)
+# ===========================================================================
+#
+# PROVENANCE OF THE CONSTANTS BELOW — all MEASURED at authoring time
+# (2026-07-30), never chosen. No new labeling was done: the pair comes from
+# task 3130's curator-ground-truth dataset,
+# tests/fixtures/write_triage_calibration.jsonl (104 records / 20 clusters),
+# and both members carry the curator label 'duplicate' in the same cluster
+# e0a41fcd-0745-426b-bf71-45466e6d34e0.
+#
+# Measurement method (throwaway script, not committed): reused
+# scripts/calibrate_write_triage.py's load_fixture / build_pair_sets /
+# build_embed_fn / cosine_similarity to score all 301 true-duplicate pairs,
+# then selected the qualifying pair with the LOWEST lexical ratio — i.e. the
+# hardest paraphrase, the class this program exists to detect.
+#
+#   embedder:    text-embedding-3-small, no `dimensions` override (1536)
+#                — the same embedder and metric space as the committed
+#                calibration report, so the cosine is comparable to t_high.
+#   cosine:      calibrate_write_triage.cosine_similarity
+#   lexical:     stdlib difflib.SequenceMatcher(None, a, b).ratio()
+#
+# Cross-check against the committed report
+# (calibration/write_triage_calibration_report.json), same fixture and
+# embedder: true_dup n measured 301 vs report 301 (exact); true_dup max
+# cosine measured 0.9657190014923018 vs report 0.9657105894445585 (agree to
+# ~8.4e-6, the endpoint's run-to-run drift). The report records
+# per_band.true_dup.deterministic = 7 pairs at/above t_high; this measurement
+# found 6 — see escalation esc-3210-3. Immaterial here: the selected pair
+# clears t_high by 0.0185, roughly 2200x that drift.
+#
+# GOTCHA: SequenceMatcher.ratio() is ORDER-SENSITIVE — ratio(b,a) is
+# 0.09662716499544212, a different number. The ids below are in the sorted
+# order build_pair_sets itself produces, and the recompute assertion uses
+# that same order. Once the order is fixed the value is bit-reproducible.
+_FIXTURE_PAIR_IDS = (
+    '243b6dec-f0ce-4123-bb09-16d834b7e9c8',
+    'c315352b-6d4e-467d-9a3f-360bc2d53229',
+)
+# Cosine between the two stored embeddings. Fed to the ANN path through an
+# injected neighbour provider, so this test makes NO network call.
+_MEASURED_COSINE = 0.9053783099307539
+# Raw difflib ratio on the fixture contents, argument order as above. Pins
+# the fixture text against drift: it is recomputed live and compared.
+_MEASURED_LEXICAL_RATIO = 0.10209662716499544
+# The ratio the detector's lexical path actually sees, after its
+# (content or '').strip().lower() normalisation. Both numbers are far below
+# the 0.85 lexical threshold — reported as measured, never asserted.
+_MEASURED_LEXICAL_RATIO_NORMALIZED = 0.09480401093892434
+
+_FIXTURE_PATH = Path(__file__).parent / 'fixtures' / 'write_triage_calibration.jsonl'
+
+
+def _load_fixture_pair() -> list[dict]:
+    """Load the two selected fixture records, in _FIXTURE_PAIR_IDS order."""
+    by_id: dict[str, dict] = {}
+    with _FIXTURE_PATH.open() as fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            by_id[str(record['memory_id'])] = record
+    missing = [i for i in _FIXTURE_PAIR_IDS if i not in by_id]
+    assert not missing, f'fixture no longer contains {missing} — re-run the pre-2 measurement'
+    return [
+        _memory(
+            id=str(by_id[i]['memory_id']),
+            content=by_id[i]['content'],
+            created_at=by_id[i].get('created_at'),
+            category='procedural_knowledge',
+        )
+        for i in _FIXTURE_PAIR_IDS
+    ]
+
+
+def _calibrated_ann_threshold() -> float:
+    """Read the ANN cutoff from the committed calibration OUTPUT.
+
+    Deliberately NOT a literal in this test. config.yaml's
+    write_triage.t_high is a derived order statistic of a measured
+    distribution (provenance: calibration/write_triage_calibration_report.json),
+    and it is the single home for that number — the detector reads the same
+    one. Re-deriving or hardcoding it here would let the two drift apart.
+    """
+    import yaml  # noqa: PLC0415
+
+    config_path = Path(__file__).parent.parent / 'config' / 'config.yaml'
+    data = yaml.safe_load(config_path.read_text())
+    t_high = data['write_triage']['t_high']
+    assert isinstance(t_high, float), (
+        f'config.write_triage.t_high must be a calibrated float, got {t_high!r}'
+    )
+    return t_high
+
+
+class TestAnnPathCatchesParaphraseLexicalPathMisses:
+    """The signal this whole task exists to produce, on curator-labeled data.
+
+    Two records the curator labeled as duplicates of each other, stating the
+    identical reify-debug-MCP fact in almost entirely disjoint wording. The
+    lexical difflib scan cannot see them as related at any usable threshold;
+    the ANN path clusters them comfortably. Both verdicts are REPORTED, so an
+    operator can audit the disagreement rather than trust one detector.
+    """
+
+    def test_live_recomputed_lexical_ratio_matches_the_measurement(self):
+        """Pins the fixture text against drift — deterministic stdlib, no network.
+
+        If someone edits either fixture record, this fails loudly instead of
+        letting the recorded cosine silently describe different text.
+        """
+        import difflib  # noqa: PLC0415
+
+        a, b = _load_fixture_pair()
+        live_raw = difflib.SequenceMatcher(None, a['content'], b['content']).ratio()
+        assert live_raw == pytest.approx(_MEASURED_LEXICAL_RATIO, abs=1e-9), (
+            f'fixture content drifted: recomputed {live_raw!r}, '
+            f'recorded {_MEASURED_LEXICAL_RATIO!r}'
+        )
+        live_norm = difflib.SequenceMatcher(
+            None, a['content'].strip().lower(), b['content'].strip().lower(),
+        ).ratio()
+        assert live_norm == pytest.approx(_MEASURED_LEXICAL_RATIO_NORMALIZED, abs=1e-9)
+
+    def test_measured_cosine_clears_the_calibrated_cutoff(self):
+        """The premise the ANN assertion rests on, checked against the live config.
+
+        A recalibration that moved t_high above this pair's measured cosine
+        would invalidate the fixture choice — fail here, with instructions,
+        rather than somewhere confusing downstream.
+        """
+        cutoff = _calibrated_ann_threshold()
+        assert _MEASURED_COSINE >= cutoff, (
+            f'the recorded pair no longer clears the calibrated cutoff '
+            f'(cosine {_MEASURED_COSINE!r} < t_high {cutoff!r}) — re-run the '
+            f'pre-2 measurement and select a new pair'
+        )
+
+    def test_ann_path_clusters_the_pair_that_lexical_cannot(self):
+        """THE signal: ANN clusters it, lexical does not, and both are reported."""
+        memories = _load_fixture_pair()
+        cutoff = _calibrated_ann_threshold()
+
+        # Injected neighbour provider — the measured cosine, no network call.
+        neighbors = {
+            memories[0]['id']: [{'id': memories[1]['id'], 'score': _MEASURED_COSINE}],
+            memories[1]['id']: [{'id': memories[0]['id'], 'score': _MEASURED_COSINE}],
+        }
+        for m in memories:
+            m['vector'] = [0.0, 1.0]  # presence only; scores come from `neighbors`
+
+        ann_pairs, ann_disclosure = ann_pairs_from_neighbors(
+            memories, neighbors, threshold=cutoff, top_k=10,
+        )
+        assert ann_pairs == [(0, 1)], 'ANN must propose the pair at the calibrated cutoff'
+
+        plan = build_sweep_plan(
+            memories,
+            ann_pairs=ann_pairs,
+            ann_scores={(0, 1): _MEASURED_COSINE},
+            ann_disclosure=ann_disclosure,
+            ann_threshold=cutoff,
+        )
+
+        # (1) The pair is clustered, and it got there via the ANN path.
+        assert plan['clusters_total'] == 1, (
+            f'expected the ANN path to cluster the pair, got {plan["clusters_total"]} cluster(s)'
+        )
+        group = plan['near_duplicate_groups'][0]
+        assert set(group['member_ids']) == set(_FIXTURE_PAIR_IDS)
+        assert group['found_by'] == ['ann'], (
+            f'expected ann-only attribution, got {group["found_by"]}'
+        )
+
+        # (2) The lexical verdict is REPORTED alongside — as measured, not
+        # asserted to be negative. It happens to be negative here, and the
+        # report says so rather than staying silent about the disagreement.
+        assert 'lexical_clustered' in group
+        assert group['lexical_clustered'] is (group['found_by'] != ['ann'])
+        verdicts = plan['path_verdicts']
+        assert verdicts['ann_only_clusters'] == 1
+        assert verdicts['lexical_only_clusters'] == 0
+        assert verdicts['both_paths_clusters'] == 0
+
+        # (3) BOTH measured numbers are in the operator-visible output.
+        assert group['ann_max_score'] == pytest.approx(_MEASURED_COSINE, abs=1e-12)
+        assert group['lexical_max_ratio'] == pytest.approx(
+            _MEASURED_LEXICAL_RATIO_NORMALIZED, abs=1e-9,
+        ), 'the lexical score must be reported even when it lost, so the disagreement is auditable'
+        assert plan['ann_threshold'] == cutoff
+        assert plan['threshold'] == 0.85
+
+        # (4) The whole report stays JSON-serialisable (stdout contract).
+        json.dumps(plan, default=str)
+
+    def test_lexical_path_alone_does_not_cluster_the_pair(self):
+        """Measured, not assumed: with no ANN pairs the plan is empty.
+
+        This is the recall gap the ANN path closes. Stated as its own test so
+        the signal test above cannot pass for the wrong reason.
+        """
+        memories = _load_fixture_pair()
+        plan = build_sweep_plan(memories)
+        assert plan['clusters_total'] == 0
+        assert plan['delete_candidates'] == []
