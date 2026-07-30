@@ -19,7 +19,15 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
-from shared.config_dir import CONFIG_DIR_PREFIX, TaskConfigDir, sweep_stale_pid_dirs
+import pytest
+
+from shared import config_dir as config_dir_module
+from shared.config_dir import (
+    CONFIG_DIR_PREFIX,
+    TaskConfigDir,
+    _pid_alive,
+    sweep_stale_pid_dirs,
+)
 
 # The prefix the UsageGate probe dirs actually use. Built from the module
 # constant rather than hard-coded so the test cannot drift from the
@@ -65,6 +73,53 @@ def plant(base: Path, name: str, *, aged: bool = True) -> Path:
     if aged:
         age(path)
     return path
+
+
+# ---------------------------------------------------------------------------
+# PID liveness — the predicate every deletion is gated on
+# ---------------------------------------------------------------------------
+
+
+class TestPidAlive:
+    """`_pid_alive`'s conservative branches (task 3086).
+
+    ``find_dead_pid`` deliberately skips unsignalable candidates, so nothing
+    else in this file reaches the ``PermissionError`` handler. It is the one
+    branch whose loss is genuinely dangerous, so it is pinned directly.
+    """
+
+    def test_non_positive_pids_are_not_alive(self):
+        assert _pid_alive(0) is False
+        assert _pid_alive(-1) is False
+
+    def test_this_process_is_alive(self):
+        assert _pid_alive(os.getpid()) is True
+
+    def test_permission_error_means_alive(self):
+        """Visible but unsignalable — another user's live process."""
+        with patch('shared.config_dir.os.kill', side_effect=PermissionError):
+            assert _pid_alive(4242) is True
+
+    def test_other_oserror_means_dead(self):
+        with patch('shared.config_dir.os.kill', side_effect=OSError('EINVAL')):
+            assert _pid_alive(4242) is False
+
+    def test_another_users_live_process_dir_survives_the_sweep(self, tmp_path):
+        """The dangerous failure mode, end to end.
+
+        A future simplification collapsing the PermissionError handler into
+        the generic ``except OSError: return False`` would flip an
+        unsignalable-but-LIVE process to "dead" and delete a live peer's
+        credential dir. It fails here instead of in production.
+        """
+        foreign = plant(tmp_path, f'{PROBE_PREFIX}work-4242')
+
+        with patch('shared.config_dir.os.kill', side_effect=PermissionError):
+            removed = sweep_stale_pid_dirs(PROBE_PREFIX, base_dir=tmp_path)
+
+        assert foreign.exists()
+        assert (foreign / '.credentials.json').exists()
+        assert removed == 0
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +295,61 @@ class TestSweepStalePidDirsBounding:
         assert removed == 1
         assert any(r.levelno >= logging.WARNING for r in caplog.records)
 
+    @pytest.mark.skipif(os.geteuid() == 0, reason='root bypasses directory write permissions')
+    def test_genuinely_unremovable_dir_is_loud_and_uncounted(self, tmp_path, caplog):
+        """The same containment, without mocking rmtree.
+
+        The stubbed test above can only prove the handler works if the real
+        call can reach it — with ``ignore_errors=True`` it never could, and
+        `removed` would have counted a drain that never happened. A read-only
+        parent makes the child un-unlinkable, so this exercises the real
+        failure path and pins the count to genuine removals only.
+        """
+        dead = find_dead_pid()
+        stuck = plant(tmp_path, f'{PROBE_PREFIX}stuck-{dead}')
+        removable = plant(tmp_path, f'{PROBE_PREFIX}ok-{dead}')
+        os.chmod(stuck, 0o500)  # r-x: .credentials.json can no longer be unlinked
+        try:
+            with caplog.at_level(logging.WARNING, logger='shared.config_dir'):
+                removed = sweep_stale_pid_dirs(PROBE_PREFIX, base_dir=tmp_path)
+        finally:
+            os.chmod(stuck, 0o700)  # so tmp_path teardown can clean up
+
+        assert stuck.exists()
+        assert not removable.exists()
+        assert removed == 1, 'an unremovable dir must never be counted as reclaimed'
+        assert any(
+            'failed to reclaim' in r.getMessage()
+            for r in caplog.records
+            if r.levelno >= logging.WARNING
+        )
+
+    def test_dir_reclaimed_by_a_concurrent_sweeper_is_quietly_skipped(self, tmp_path, caplog):
+        """Peers race this sweep — the fleet restarts its units together.
+
+        A dir another sweeper already removed is neither ours to count nor a
+        failure worth a WARNING, so it must not add noise to the fleet log.
+        """
+        dead = find_dead_pid()
+        raced = plant(tmp_path, f'{PROBE_PREFIX}raced-{dead}')
+        ours = plant(tmp_path, f'{PROBE_PREFIX}ours-{dead}')
+        real_rmtree = shutil.rmtree
+
+        def racing_rmtree(path, *args, **kwargs):
+            if Path(path).name == raced.name:
+                real_rmtree(path)  # the peer sweeper wins
+                raise FileNotFoundError(path)
+            return real_rmtree(path, *args, **kwargs)
+
+        with caplog.at_level(logging.WARNING, logger='shared.config_dir'), \
+                patch('shared.config_dir.shutil.rmtree', side_effect=racing_rmtree):
+            removed = sweep_stale_pid_dirs(PROBE_PREFIX, base_dir=tmp_path)
+
+        assert not raced.exists()
+        assert not ours.exists()
+        assert removed == 1
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
     def test_deadline_stops_early_without_removing_everything(self, tmp_path, caplog):
         """A wall-clock bound must never read as 'swept everything'.
 
@@ -248,6 +358,10 @@ class TestSweepStalePidDirsBounding:
         a 40 MB directory inode. Blocking time is the risk, so the bound is a
         deadline, not a removal cap — the population still drains fully across
         successive process starts.
+
+        Degenerate case: `deadline_secs=0.0` trips on the very first
+        iteration, so nothing at all is removed. The partial-progress case
+        that actually matters is the test below.
         """
         dead = find_dead_pid()
         planted = [plant(tmp_path, f'{PROBE_PREFIX}n{i}-{dead}') for i in range(4)]
@@ -255,8 +369,8 @@ class TestSweepStalePidDirsBounding:
         with caplog.at_level(logging.WARNING, logger='shared.config_dir'):
             removed = sweep_stale_pid_dirs(PROBE_PREFIX, base_dir=tmp_path, deadline_secs=0.0)
 
-        assert removed < len(planted)
-        assert any(p.exists() for p in planted)
+        assert removed == 0
+        assert all(p.exists() for p in planted)
 
         warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert warnings, 'a bounded stop must be loud, not silent'
@@ -265,6 +379,48 @@ class TestSweepStalePidDirsBounding:
         assert 'incomplete' in message
         assert 'examined' in message
         assert 'removed' in message
+
+    def test_deadline_tripped_mid_sweep_makes_partial_progress_and_resumes(
+        self, tmp_path, caplog,
+    ):
+        """The behaviour that actually matters: stop mid-sweep, resume later.
+
+        The degenerate `deadline_secs=0.0` case above reports "examined 0,
+        removed 0", which any regression that reset `removed` on the bounded
+        path or mis-ordered the `examined` increment would still satisfy. Here
+        a stepping clock trips the deadline part-way through, so the counts
+        are non-zero and the remainder must survive for the NEXT process to
+        reclaim — that resumption is what makes a deadline (rather than a
+        removal cap) safe.
+        """
+        dead = find_dead_pid()
+        planted = [plant(tmp_path, f'{PROBE_PREFIX}n{i}-{dead}') for i in range(4)]
+        # Call 1 captures the deadline (0.0 + 1.0); calls 2-3 are the first two
+        # per-iteration checks; everything after is past it.
+        ticks = iter([0.0, 0.0, 0.0])
+
+        def stepping_monotonic() -> float:
+            return next(ticks, 99.0)
+
+        with caplog.at_level(logging.WARNING, logger='shared.config_dir'), \
+                patch('shared.config_dir.time.monotonic', side_effect=stepping_monotonic):
+            removed = sweep_stale_pid_dirs(PROBE_PREFIX, base_dir=tmp_path, deadline_secs=1.0)
+
+        assert 0 < removed < len(planted)
+        survivors = [p for p in planted if p.exists()]
+        assert len(survivors) == len(planted) - removed
+
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        message = ' '.join(r.getMessage().lower() for r in warnings)
+        assert 'incomplete' in message
+        assert f'removed {removed}' in message
+        assert 'examined 0' not in message, 'a partial sweep must report real counts'
+
+        # The next process start reclaims the remainder — no permanent residue.
+        caplog.clear()
+        assert sweep_stale_pid_dirs(PROBE_PREFIX, base_dir=tmp_path) == len(survivors)
+        assert not any(p.exists() for p in planted)
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
     def test_generous_deadline_sweeps_everything_and_stays_quiet(self, tmp_path, caplog):
         """The bounded-stop WARNING must not fire on the normal path."""
@@ -293,6 +449,16 @@ def invoke_registered_hook(mock_register) -> None:
 
 class TestTaskConfigDirCleanupAtExit:
     """`cleanup_at_exit=True` registers a best-effort teardown (step 5)."""
+
+    @pytest.fixture(autouse=True)
+    def _isolate_registration_ledger(self, monkeypatch):
+        """Start every case with an empty dedup ledger.
+
+        The ledger is process-global by design, so without this a case would
+        inherit whatever earlier cases (or an imported sibling suite)
+        registered.
+        """
+        monkeypatch.setattr(config_dir_module, '_atexit_registered_dirs', set())
 
     def test_opt_in_registers_one_hook_that_removes_the_dir(self, tmp_path):
         with patch('shared.config_dir.atexit.register') as register:
@@ -352,3 +518,34 @@ class TestTaskConfigDirCleanupAtExit:
         invoke_registered_hook(register)
 
         assert not cfg.path.exists()
+
+    def test_registration_is_deduped_by_path(self, tmp_path):
+        """One hook per path, however many TaskConfigDirs claim that path.
+
+        A probe dir is named `usage-gate-probe-<account>-<pid>`, so every gate
+        built in one process resolves to the SAME paths — and
+        orchestrator/evals/runner.py builds a fresh gate per eval run. Without
+        dedup the atexit table grows one Path-pinning entry per (gate x
+        account) and re-runs rmtree on the same path once per entry at
+        shutdown.
+        """
+        with patch('shared.config_dir.atexit.register') as register:
+            first = TaskConfigDir('dup', base_dir=tmp_path, cleanup_at_exit=True)
+            second = TaskConfigDir('dup', base_dir=tmp_path, cleanup_at_exit=True)
+            third = TaskConfigDir('dup', base_dir=tmp_path, cleanup_at_exit=True)
+
+        assert first.path == second.path == third.path
+        assert register.call_count == 1
+
+        # The single surviving hook still tears the path down.
+        invoke_registered_hook(register)
+        assert not third.path.exists()
+
+    def test_dedup_is_per_path_not_global(self, tmp_path):
+        """Distinct paths must each get their own hook — the per-account
+        probe dirs of one gate differ only by account name."""
+        with patch('shared.config_dir.atexit.register') as register:
+            TaskConfigDir('probe-work', base_dir=tmp_path, cleanup_at_exit=True)
+            TaskConfigDir('probe-personal', base_dir=tmp_path, cleanup_at_exit=True)
+
+        assert register.call_count == 2

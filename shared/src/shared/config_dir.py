@@ -37,6 +37,16 @@ CONFIG_DIR_PREFIX = 'claude-config-'
 # that embed one (e.g. UsageGate's `usage-gate-probe-<account>-<pid>`).
 _PID_SUFFIX_RE = re.compile(r'-(\d+)$')
 
+# Paths already registered for atexit teardown in this process. The same path
+# is constructed repeatedly within one process — a probe dir is named
+# `usage-gate-probe-<account>-<pid>`, and orchestrator/evals/runner.py builds a
+# fresh UsageGate per eval run — so without this ledger the atexit table would
+# accumulate one duplicate entry (each pinning a Path) per gate x account, and
+# every duplicate would re-run rmtree on the same path at shutdown. One hook
+# per path is sufficient because the hook targets the resolved Path, not the
+# instance: a later TaskConfigDir at the same path is already covered by it.
+_atexit_registered_dirs: set[Path] = set()
+
 
 def _pid_alive(pid: int) -> bool:
     """Return True if the process identified by *pid* is alive.
@@ -79,7 +89,10 @@ def sweep_stale_pid_dirs(
     context managers, an explicit ``shutdown()`` — cover only clean exits;
     nothing survives SIGKILL, and the fleet SIGKILLs and restarts its units
     routinely. Reclaiming *other* processes' dead-PID leftovers at startup is
-    the only self-healing half. Returns the number of directories removed.
+    the only self-healing half. Returns the number of directories this call
+    genuinely removed — an entry that could not be reclaimed is logged at
+    WARNING and excluded from the count, so the operator-visible tally can
+    never overstate the drain.
 
     Best-effort by contract: a glob matching nothing is a silent no-op and the
     function never raises.
@@ -151,7 +164,19 @@ def sweep_stale_pid_dirs(
             try:
                 if now - path.stat().st_mtime < min_age_secs:
                     continue
-                shutil.rmtree(path, ignore_errors=True)
+                # Deliberately NOT ignore_errors=True. A genuinely unremovable
+                # dir (EACCES, EBUSY, an immutable inode, a partially-removed
+                # tree) must raise so the handler below is live: with errors
+                # ignored, `removed` would count a removal that never happened
+                # and the operator-visible "reclaimed N" INFO would report a
+                # drain that did not occur.
+                shutil.rmtree(path)
+            except FileNotFoundError:
+                # Raced by a concurrent sweeper — the fleet restarts its units
+                # together, so several gates can sweep at once — or by the OS
+                # tmp reaper. Already reclaimed: not ours to count, and not a
+                # failure worth a WARNING either.
+                continue
             except OSError:
                 logger.warning(
                     'sweep_stale_pid_dirs(%s): failed to reclaim %s — skipping it and '
@@ -188,7 +213,9 @@ class TaskConfigDir:
         never ``self`` — so the atexit table cannot keep this object (and
         transitively an owning ``UsageGate`` and its account tokens) alive
         for the life of the process. ``ignore_errors=True`` makes it a
-        harmless no-op after an explicit ``cleanup()``.
+        harmless no-op after an explicit ``cleanup()``. Registration is
+        deduped by resolved path (``_atexit_registered_dirs``), so repeatedly
+        constructing the same path in one process adds exactly one hook.
 
         This is the CLEAN-EXIT half only. No atexit hook survives SIGKILL,
         and the fleet SIGKILLs and restarts its units routinely — what
@@ -204,7 +231,8 @@ class TaskConfigDir:
         base = base_dir or Path(tempfile.gettempdir())
         self._dir = base / f'{CONFIG_DIR_PREFIX}{task_id}'
         self._dir.mkdir(parents=True, exist_ok=True)
-        if cleanup_at_exit:
+        if cleanup_at_exit and self._dir not in _atexit_registered_dirs:
+            _atexit_registered_dirs.add(self._dir)
             atexit.register(shutil.rmtree, self._dir, ignore_errors=True)
         self._setup_symlinks()
 
