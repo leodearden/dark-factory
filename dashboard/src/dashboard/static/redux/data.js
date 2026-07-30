@@ -152,7 +152,11 @@ async function refreshOne(url, keys) {
 // so chip changes take effect on the next tick without restarting the loop.
 let currentWin = '24h';
 
-async function refreshDFData(win) {
+// `opts` is accepted (and, for now, ignored) so callers can already pass a
+// flow-control {state, deps} bag ahead of the guard/backoff/jitter (steps
+// 3-8) actually reading it — kept as its own step so the guard's regression
+// test fails on real concurrency behaviour, not a missing parameter.
+async function refreshDFData(win, opts) {
   if (typeof win === 'string' && win) currentWin = win;
   await Promise.all(Object.entries(endpointsFor(currentWin)).map(([url, keys]) => refreshOne(url, keys)));
   window.dispatchEvent(new CustomEvent('df-data-refresh'));
@@ -161,5 +165,61 @@ async function refreshDFData(win) {
 window.DF_REFRESH = refreshDFData;
 window.__DF_PAUSE = false;
 
-refreshDFData();
-setInterval(() => { if (!window.__DF_PAUSE) refreshDFData(); }, 3000);
+// Isolated per-endpoint flow-control state (steps 3-8 give this Map real
+// entries keyed by endpoint path). createPollState() also lets tests hand
+// pollTick/refreshDFData a fresh Map instead of sharing this singleton.
+function createPollState() {
+  return new Map();
+}
+const DF_POLL_STATE = createPollState();
+
+const POLL_INTERVAL_MS = 3000;
+
+function pollTick(opts) {
+  if (!window.__DF_PAUSE) refreshDFData(undefined, opts);
+}
+
+function startPolling(opts) {
+  refreshDFData(undefined, opts);
+  const handle = setInterval(() => pollTick(opts), POLL_INTERVAL_MS);
+  return {
+    stop() {
+      clearInterval(handle);
+    },
+  };
+}
+
+// Auto-start only in a real browser document context. index.html loads this
+// file as a classic <script> where `document` always exists, so the browser
+// path above is unchanged; requiring this module under `node --test` (no
+// `document` shim) leaves it inert instead of firing real fetches and
+// leaving a live timer that would hang the test runner — see
+// dashboard/tests/js/data_poll.test.mjs.
+if (typeof window !== 'undefined' && typeof document !== 'undefined') {
+  startPolling();
+}
+
+// Named DF_DATA_LOADER_API (not the graph_layout.js boilerplate's plain
+// `API`): every redux/*.js file is loaded as a separate classic
+// (non-module) <script> tag on the same page (index.html), and top-level
+// `const` bindings in classic scripts share one global lexical scope across
+// ALL of them — a second top-level `const API` here would collide with
+// graph_layout.js's, throwing "Identifier 'API' has already been declared"
+// and aborting this entire script (see runtime_format.js:44-51's identical
+// note/precedent).
+const DF_DATA_LOADER_API = {
+  endpointsFor,
+  applyKey,
+  refreshOne,
+  refreshDFData,
+  pollTick,
+  startPolling,
+  createPollState,
+};
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = DF_DATA_LOADER_API;
+}
+if (typeof window !== 'undefined') {
+  window.DF_DATA_LOADER = DF_DATA_LOADER_API;
+}
