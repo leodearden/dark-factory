@@ -767,3 +767,142 @@ def run_derive_registry(
     payload = result.as_registry_payload()
     payload['_disclosures'] = result.disclosures
     return json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + '\n'
+
+
+# ---------------------------------------------------------------------------
+# Canonical-in-top-k — pure over an already-fetched result list
+#
+# Every function below takes a list of results and returns a record. Nothing
+# here touches a store, which is what lets the merge lane test the whole metric
+# family with no Qdrant, no embedder and no OPENAI_API_KEY.
+# ---------------------------------------------------------------------------
+
+MATCHED_BY_CONTENT_HASH = 'content_hash'
+MATCHED_BY_LAST_KNOWN_ID = 'last_known_id'
+
+
+@dataclass(frozen=True)
+class MatchOutcome:
+    """Where (and how) a topic's canonical was found in one result list."""
+
+    hit: bool
+    rank: int | None
+    matched_by: str | None
+
+    @property
+    def unmatched(self) -> bool:
+        """Neither matcher fired — the entry was not in the list at all.
+
+        Distinct from ``not hit``: an entry found at rank k+1 is present but
+        ranked too low, which is a ranking problem. An unmatched entry is
+        either absent from the corpus or the fixture has decayed past both
+        keys. The report separates the two rather than reporting one number.
+        """
+        return self.matched_by is None
+
+    @property
+    def needs_hash_repair(self) -> bool:
+        """The id matched but the hash did not — the fixture needs re-hashing.
+
+        Reported rather than repaired: a probe that silently rewrote its own
+        expectations to match what it found could never fail.
+        """
+        return self.matched_by == MATCHED_BY_LAST_KNOWN_ID
+
+
+@dataclass(frozen=True)
+class PhrasingObservation:
+    """One (topic, phrasing, k) probe result."""
+
+    topic: str
+    phrasing: str
+    held_out: bool
+    k: int
+    hit: bool
+    rank: int | None
+    matched_by: str | None
+    degraded: bool = False
+    """True when the search that produced this list reported a failed store.
+
+    A degraded observation is EXCLUDED from every metric denominator: charging
+    a store outage as a canonical-absent failure would manufacture a
+    corpus-wide findability collapse out of an infrastructure blip.
+    """
+
+    @property
+    def unmatched(self) -> bool:
+        return self.matched_by is None
+
+    @property
+    def needs_hash_repair(self) -> bool:
+        return self.matched_by == MATCHED_BY_LAST_KNOWN_ID
+
+
+def _result_content(result: Any) -> str:
+    return getattr(result, 'content', '') or ''
+
+
+def _result_id(result: Any) -> str:
+    return getattr(result, 'id', '') or ''
+
+
+def canonical_hit(results: list, entry: RegistryEntry, k: int) -> MatchOutcome:
+    """Find *entry*'s canonical in *results*, honouring the top-*k* cut.
+
+    Content hash first, ``last_known_id`` second (D5): memory UUIDs rot on
+    re-consolidation, so hashing the returned content is the durable key, while
+    the id fallback keeps a benignly-reworded canonical from reading as a
+    findability regression. Which matcher fired is recorded either way, because
+    both divergences are a fixture-repair signal an operator needs to see.
+
+    The whole list is scanned, not just its first *k*, so a canonical that came
+    back at rank k+3 is reported at its true rank instead of as "absent" — a
+    ranking problem and an absence problem need different fixes.
+    """
+    canonical = entry.canonical
+    hash_rank: int | None = None
+    id_rank: int | None = None
+
+    for index, result in enumerate(results, start=1):
+        if hash_rank is None and content_key(_result_content(result)) == canonical.content_hash:
+            hash_rank = index
+        if (
+            id_rank is None
+            and canonical.last_known_id
+            and _result_id(result) == canonical.last_known_id
+        ):
+            id_rank = index
+        if hash_rank is not None and id_rank is not None:
+            break
+
+    if hash_rank is not None:
+        return MatchOutcome(
+            hit=hash_rank <= k, rank=hash_rank, matched_by=MATCHED_BY_CONTENT_HASH,
+        )
+    if id_rank is not None:
+        return MatchOutcome(
+            hit=id_rank <= k, rank=id_rank, matched_by=MATCHED_BY_LAST_KNOWN_ID,
+        )
+    return MatchOutcome(hit=False, rank=None, matched_by=None)
+
+
+def observe_phrasing(
+    results: list,
+    entry: RegistryEntry,
+    phrasing: Phrasing,
+    k: int,
+    *,
+    degraded: bool = False,
+) -> PhrasingObservation:
+    """Build the (topic, phrasing, k) observation the metrics aggregate over."""
+    outcome = canonical_hit(results, entry, k)
+    return PhrasingObservation(
+        topic=entry.topic,
+        phrasing=phrasing.text,
+        held_out=phrasing.held_out,
+        k=k,
+        hit=outcome.hit,
+        rank=outcome.rank,
+        matched_by=outcome.matched_by,
+        degraded=degraded,
+    )
