@@ -1173,6 +1173,102 @@ class TestRenderDigestTruncation:
 
 
 # ---------------------------------------------------------------------------
+# _cap_item / _item_byte_cap -- R2 part 1 (confusion census 2026-07-24 Sec
+# 4): a per-item byte cap applied at the single _build_sections choke
+# point, so ONE oversized item (an enormous pasted user turn, a huge
+# tool_result echo, ...) can never evict every sibling section before
+# being popped itself. Capping is byte-wise and UTF-8-safe: the whole
+# digest budget is measured in UTF-8 bytes (_resolve_size_bytes, the 15360
+# soft cap), so a naive character-wise slice would not actually bound it
+# for non-ASCII content, and a naive byte slice can split a multi-byte
+# codepoint mid-sequence.
+# ---------------------------------------------------------------------------
+
+def _oversized_user_correction_records():
+    """One ORDINARY (non-briefing-shaped) human user turn whose text alone
+    exceeds the default 15360-byte soft cap, plus a genuine is_error
+    tool_result error neighborhood and a 'command not found' not-found
+    hit. Deliberately NOT briefing-shaped: R2 (whole-item truncation
+    eviction) is a distinct pathology from R1 (harness-turn exclusion), so
+    step-2's is_harness_injected_turn filter is never why this fixture's
+    body would survive. Baseline today (pre per-item cap):
+    _truncate_sections pops the WHOLE oversized item, which along the way
+    empties every other section too -- the final digest is ~276 bytes of
+    frontmatter with an entirely empty body, despite every detector having
+    fired at least once."""
+    huge_text = 'This is wrong, please redo it properly. ' * 500  # 20000 bytes
+    return [
+        _with_session_meta(_user_text(huge_text)),
+        _with_session_meta(_assistant(_tool_use('Bash', {'command': 'false'}, id='tu-err'))),
+        _with_session_meta(_tool_result('tu-err', 'Exit code 1', is_error=True)),
+        _with_session_meta(_tool_result('tu-nf', 'bash: foo: command not found', is_error=False)),
+    ]
+
+
+class TestPerItemByteCap:
+    def test_cap_item_returns_short_line_byte_identical(self):
+        line = '- (turn 0) short line, well under any cap'
+
+        capped = mod._cap_item(line, cap=2048)
+
+        assert capped == line
+        assert mod.ITEM_TRUNCATION_MARKER not in capped
+
+    def test_cap_item_truncates_oversized_line_with_marker(self):
+        line = '- (turn 0) ' + ('x' * 5000)
+        cap = 2048
+
+        capped = mod._cap_item(line, cap)
+
+        assert len(capped.encode('utf-8')) <= cap
+        assert capped.endswith(mod.ITEM_TRUNCATION_MARKER)
+
+    def test_cap_item_truncates_multibyte_text_without_mojibake(self):
+        # The cap is a BYTE cap -- naive slicing on a multi-byte-character
+        # string must not split a codepoint into a replacement character.
+        line = '- (turn 0) ' + ('é→' * 2000)
+        cap = 500
+
+        capped = mod._cap_item(line, cap)  # must not raise
+
+        assert len(capped.encode('utf-8')) <= cap
+        assert '�' not in capped
+        capped.encode('utf-8')  # re-encodes cleanly
+
+    def test_item_byte_cap_respects_bounds_and_frontmatter_headroom(self):
+        for max_bytes in (0, 1, 100, 512, 1000, 2048, 4096, 15360, 100_000):
+            cap = mod._item_byte_cap(max_bytes)
+
+            assert cap <= mod.MAX_ITEM_BYTES
+            assert cap >= mod.MIN_ITEM_BYTES
+            reserved = max_bytes - mod.FRONTMATTER_RESERVE_BYTES
+            if reserved > mod.MIN_ITEM_BYTES:
+                assert cap <= reserved
+
+    def test_default_cap_retains_all_sections_with_oversized_user_turn(self):
+        digest = mod.render_digest(_oversized_user_correction_records(), agent_class='interactive')
+
+        _, body = _split_frontmatter(digest)
+        # Baseline today (pre-step-4): the whole-item eviction pathology
+        # empties the body entirely -- assert non-empty so this is
+        # unambiguously RED before the per-item cap exists.
+        assert body.strip() != ''
+
+        assert '## User Corrections' in digest
+        assert '## Error Neighborhoods' in digest
+        assert '## Not Found' in digest
+        assert len(digest.encode('utf-8')) <= 15360
+        assert mod.ITEM_TRUNCATION_MARKER in digest
+
+    def test_gold_section_still_precedes_error_neighborhoods_under_cap(self):
+        digest = mod.render_digest(_oversized_user_correction_records(), agent_class='interactive')
+
+        assert '## User Corrections' in digest
+        assert '## Error Neighborhoods' in digest
+        assert digest.index('## User Corrections') < digest.index('## Error Neighborhoods')
+
+
+# ---------------------------------------------------------------------------
 # build_digest — PRD Sec 8.1 boundary test, row 1, producer side. The
 # headline acceptance test: load_transcript -> detectors -> classify ->
 # render_digest, end to end from a real JSONL file on disk, with a decoy
