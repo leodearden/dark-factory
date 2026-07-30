@@ -506,3 +506,248 @@ class TestLaneStateClass:
             'orchestrator/scripts/warm-lane/lib_lane_state.sh about them — '
             'leaving them UNKNOWN silently degrades every lane in that state.'
         )
+
+
+# ---------------------------------------------------------------------------
+# warm-lane-audit.sh: the extract-and-unify contract (PRD §8)
+# ---------------------------------------------------------------------------
+
+AUDIT = WARM_LANE_SCRIPT_DIR / 'warm-lane-audit.sh'
+
+#: A stub task-status oracle: echoes back the id it was asked about.  That is
+#: what makes the record's task_id OBSERVABLE in the audit's `pin` column,
+#: which otherwise reports the pinning task's STATUS rather than its id.
+_STATUS_STUB = '#!/usr/bin/env bash\nprintf \'status-%s\\n\' "$1"\n'
+
+
+def _git_worktree(path: Path) -> None:
+    """Make *path* pass the audit's ``_is_git_worktree`` gate."""
+    subprocess.run(
+        ['git', 'init', '-q', '-b', 'main'],
+        cwd=str(path),
+        check=True,
+        timeout=60,
+        env=_sanitized_env(),
+    )
+
+
+def _audit_json(
+    base: Path, *, status_cmd: Path, state_dir: Path | None = None,
+) -> tuple[dict, str]:
+    """Run the SHIPPED warm-lane-audit.sh over *base* and parse its JSON."""
+    extra = {'REIFY_LANE_LEAK_STATUS_CMD': str(status_cmd)}
+    if state_dir is not None:
+        extra['REIFY_WARM_LANE_AUDIT_STATE_DIR'] = str(state_dir)
+    proc = subprocess.run(
+        [str(AUDIT), '--mount', str(base), '--format', 'json'],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        cwd=str(WARM_LANE_SCRIPT_DIR),
+        env=_sanitized_env(extra=extra),
+    )
+    assert proc.returncode == 0, (
+        f'warm-lane-audit.sh must never abort (advisory-only); '
+        f'rc={proc.returncode} stderr={proc.stderr!r}'
+    )
+    return json.loads(proc.stdout), proc.stderr
+
+
+#: One mount covering every branch of the reader: each column, both task-id
+#: shapes, and all three UNKNOWN causes.
+_AUDIT_LANES: dict[str, dict | str | None] = {
+    '_lane-1': {'state': 'assigned', 'task_id': '5551'},
+    '_lane-2': {'state': 'in_use', 'task_id': '42'},
+    '_lane-3': {'state': 'released', 'task_id': None},
+    '_lane-4': {'state': 'quarantined', 'task_id': None},
+    '_lane-5': '{"state": "assig',                         # unparseable-record
+    '_lane-6': None,                                       # no-readable-record
+    '_lane-7': {'state': 'reticulating', 'task_id': '9'},  # unrecognized-state
+    '_lane-8': {'state': 'assigned', 'task_id': None},     # null id -> fallback
+}
+
+
+@pytest.fixture
+def audit_mount(tmp_path: Path) -> tuple[Path, Path]:
+    """A synthetic mount whose lanes are real git worktrees, plus the stub."""
+    base = _mount(tmp_path / 'mount', _AUDIT_LANES)
+    for lane in _AUDIT_LANES:
+        _git_worktree(base / lane)
+    status_cmd = tmp_path / 'status-stub.sh'
+    status_cmd.write_text(_STATUS_STUB)
+    status_cmd.chmod(0o755)
+    return base, status_cmd
+
+
+class TestAuditLaneStateBehaviourIsUnchanged:
+    """The audit's observable per-lane verdict survives the extraction.
+
+    Characterization test, written against the PRE-refactor script and required
+    to keep passing after it: an "extraction" that changed what an operator
+    reads off the audit would not be an extraction.  Every expected value here
+    was captured from the reader as it shipped in warm-lane-audit.sh.
+    """
+
+    @pytest.mark.parametrize(
+        ('lane', 'assigned', 'pin'),
+        [
+            ('_lane-1', 'ASSIGNED', 'status-5551'),
+            ('_lane-2', 'ASSIGNED', 'status-42'),
+            ('_lane-3', 'RELEASED', '-'),
+            ('_lane-4', 'QUARANTINED', '-'),
+            ('_lane-5', 'UNKNOWN', '-'),
+            ('_lane-6', 'UNKNOWN', '-'),
+            ('_lane-7', 'UNKNOWN', '-'),
+            # `"task_id": null` on an ASSIGNED lane: the pin falls back to the
+            # branch-derived id, which is absent here, so the column reports
+            # `unknown` rather than inventing a holder.
+            ('_lane-8', 'ASSIGNED', 'unknown'),
+        ],
+    )
+    def test_assigned_column_and_pin(
+        self,
+        audit_mount: tuple[Path, Path],
+        lane: str,
+        assigned: str,
+        pin: str,
+    ) -> None:
+        base, status_cmd = audit_mount
+        report, _ = _audit_json(base, status_cmd=status_cmd)
+        rows = {row['lane']: row for row in report['lanes']}
+        assert lane in rows, f'{lane} missing from the report: {sorted(rows)}'
+        assert rows[lane]['assigned'] == assigned, rows[lane]
+        assert rows[lane]['pin'] == pin, rows[lane]
+
+    @pytest.mark.parametrize(
+        ('lane', 'cause'),
+        [
+            ('_lane-5', 'unparseable-record'),
+            ('_lane-6', 'no-readable-record'),
+            ('_lane-7', 'unrecognized-state:reticulating'),
+        ],
+    )
+    def test_the_three_unknown_causes_are_still_named_on_stderr(
+        self, audit_mount: tuple[Path, Path], lane: str, cause: str,
+    ) -> None:
+        """All three causes survive, including the one the lib does NOT set.
+
+        ``unrecognized-state:<raw>`` is derived by the audit from a UNKNOWN
+        class with a non-empty raw, not published by ``lane_state_read`` — and
+        it is the load-bearing one: a mass state_unknown spike carrying one
+        repeated raw value is the SCHEMA-DRIFT signal, and no other cause looks
+        like that.
+        """
+        base, status_cmd = audit_mount
+        _, stderr = _audit_json(base, status_cmd=status_cmd)
+        assert f'lane={lane}: assignment state unknown ({cause})' in stderr, (
+            f'the {cause!r} warning for {lane} is gone from stderr:\n{stderr}'
+        )
+
+    def test_headroom_counters_still_partition_the_pool(
+        self, audit_mount: tuple[Path, Path],
+    ) -> None:
+        base, status_cmd = audit_mount
+        report, _ = _audit_json(base, status_cmd=status_cmd)
+        headroom = report['headroom']
+        assert headroom['resident'] == len(_AUDIT_LANES), headroom
+        assert headroom['assigned'] == 3, headroom       # _lane-1, -2, -8
+        assert headroom['quarantined'] == 1, headroom    # _lane-4
+        assert headroom['state_unknown'] == 3, headroom  # _lane-5, -6, -7
+        assert headroom['pinned'] == 3, headroom
+
+    def test_the_state_dir_override_still_wins(
+        self, audit_mount: tuple[Path, Path], tmp_path: Path,
+    ) -> None:
+        """``REIFY_WARM_LANE_AUDIT_STATE_DIR`` may point outside the mount.
+
+        Documented behaviour the extraction must not silently drop — which is
+        exactly what deriving the state dir solely from the lane dir would do.
+        """
+        base, status_cmd = audit_mount
+        elsewhere = tmp_path / 'state-elsewhere'
+        elsewhere.mkdir()
+        (elsewhere / '_lane-1.json').write_text(
+            json.dumps({'state': 'quarantined', 'task_id': '777'}),
+        )
+        report, _ = _audit_json(base, status_cmd=status_cmd, state_dir=elsewhere)
+        rows = {row['lane']: row for row in report['lanes']}
+        assert rows['_lane-1']['assigned'] == 'QUARANTINED', (
+            f'the override was ignored in favour of the derived default: '
+            f'{rows["_lane-1"]}'
+        )
+        # Every other lane's record lives in the mount's own .lane-state, which
+        # the override displaces — so they all go no-readable-record.
+        assert rows['_lane-2']['assigned'] == 'UNKNOWN', rows['_lane-2']
+
+
+class TestAuditReadsThroughTheLib:
+    """The INV-5 guard: ONE definition site, and the audit is wired to it.
+
+    The behavioural class above would pass just as well against a second copy
+    of the reader living inside the audit — which is precisely the duplication
+    this leaf exists to close.  These assertions are what make it an extraction
+    rather than an addition.
+    """
+
+    #: The distinctive tail of the sed scalar-extraction idiom.  Matching on the
+    #: idiom rather than the function NAME is deliberate: a copy that renamed
+    #: the function would still be a copy.
+    _SCALAR_IDIOM = '[[:space:]]*:[[:space:]]*\\"([^\\"]*)\\".*'
+
+    def test_the_scalar_extraction_idiom_has_exactly_one_definition_site(
+        self,
+    ) -> None:
+        hits = {
+            path.name: path.read_text().count(self._SCALAR_IDIOM)
+            for path in sorted(WARM_LANE_SCRIPT_DIR.glob('*.sh'))
+            if self._SCALAR_IDIOM in path.read_text()
+        }
+        assert hits == {'lib_lane_state.sh': 1}, (
+            'the lane-state record parser must have exactly ONE definition site '
+            f'across the shipped warm-lane scripts; found {hits!r}'
+        )
+
+    def test_warm_lane_audit_sources_the_lib(self) -> None:
+        text = AUDIT.read_text()
+        assert 'source "$SCRIPT_DIR/lib_lane_state.sh"' in text, (
+            'warm-lane-audit.sh does not source lib_lane_state.sh — its reader '
+            'is still its own copy'
+        )
+
+    def test_warm_lane_audit_fails_loud_when_the_lib_is_missing(
+        self, tmp_path: Path,
+    ) -> None:
+        """A missing lib is a DEPLOYMENT fault: exit 2, not a degraded run.
+
+        The audit's "never abort" rule is about lane-level data problems (an
+        unreadable record degrades that lane to UNKNOWN).  It is not about
+        wiring: nothing about the invocation could have avoided an absent
+        sibling and no retry fixes it, so this takes warm-lane-gc.sh's
+        established exit-2 shape.  Degrading instead would report every lane as
+        UNKNOWN — indistinguishable from a real pool-wide state-dir outage.
+        """
+        staged_dir = tmp_path / 'incomplete-deploy'
+        staged_dir.mkdir()
+        staged = staged_dir / 'warm-lane-audit.sh'
+        staged.write_bytes(AUDIT.read_bytes())
+        staged.chmod(0o755)
+        # lib_portable.sh travels (it is a different guard's subject); the
+        # lane-state lib deliberately does not.
+        (staged_dir / 'lib_portable.sh').write_bytes(
+            (WARM_LANE_SCRIPT_DIR / 'lib_portable.sh').read_bytes(),
+        )
+        proc = subprocess.run(
+            [str(staged), '--help'],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            cwd=str(staged_dir),
+            env=_sanitized_env(),
+        )
+        assert proc.returncode == 2, (
+            'an absent lib_lane_state.sh must be the wiring sentinel exit 2, '
+            f'not a degraded run; rc={proc.returncode} stderr={proc.stderr!r}'
+        )
+        assert 'lib_lane_state.sh not found next to warm-lane-audit.sh' in proc.stderr, (
+            f'the fail-loud message must name the missing sibling; {proc.stderr!r}'
+        )
