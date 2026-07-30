@@ -758,6 +758,41 @@ class TestVerifiedGreenVetoRelaxExistsOffMain:
         assert [e.id for e in pending] == [seeded]
         assert pending[0].category == 'design_concern'
 
+    async def test_non_match_with_open_remediable_esc_files_no_duplicate(
+        self, harness: Harness, tmp_path: Path,
+    ) -> None:
+        """Relaxing the veto must not turn the re-file path into a duplicator.
+
+        The relax means RE_FILE_ESCALATION is now reachable with a
+        stranded_blocked ALREADY pending.  On a verified-green NON-match the
+        submit declines, and the fallback re-file would stack a SECOND
+        stranded_blocked L1 for the same task — so the call-site must leave the
+        already-open escalation for its handler instead.
+        """
+        tid = _TID
+        queue = EscalationQueue(tmp_path / 'esc_dedup')
+        harness._escalation_queue = queue
+        harness._loop = asyncio.get_running_loop()
+        queue.set_resolve_callback(harness._on_escalation_resolved)
+        harness._escalation_events.clear()
+        harness._workflow_cancel_at.clear()
+        _wire_exists_off_main(harness, tid)
+        seeded = _seed_pending(queue, tid, 'stranded_blocked')
+
+        with patch(
+            'orchestrator.harness.detect_verified_green',
+            AsyncMock(return_value=None),
+        ):
+            await harness._reconcile_stranded_in_progress()
+        await asyncio.gather(*list(harness._background_tasks))
+
+        assert harness._merge_queue.qsize() == 0
+        _asserted_no_repend(harness, tid)
+        pending = queue.get_by_task(tid, status='pending')
+        assert [e.id for e in pending] == [seeded], (
+            'must not stack a second stranded_blocked L1'
+        )
+
 
 def _marker(*, tip: str = _TIP, request_id: str = 'mr-prev1234', age_s: float = 0.0) -> dict:
     """A ``stranded_merge_request`` metadata marker (step-16 race-guard).
