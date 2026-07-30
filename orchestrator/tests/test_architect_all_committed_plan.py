@@ -827,3 +827,217 @@ class TestA1PartiallyCommittedPlanStillRunsExecute:
             f"Expected the [COMMITTED …] provenance tag intact, got "
             f"{step_1['description']!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# step-11 RED: durable honest signal for the skipped EXECUTE + boundary A1-3
+# ---------------------------------------------------------------------------
+#
+# Why an iteration-log entry is REQUIRED, not cosmetic: _has_prior_implementation
+# (workflow.py:11156) requires BOTH SHA divergence AND at least one
+# _iteration_entry_is_work entry, and the merge-phase guard _recover_before_merge
+# uses the iteration-log-only fallback (wt_head=None). An all-committed plan
+# writes zero implementer/debugger/judge entries, so without an entry of its own
+# γ would make an already-landed branch resolve has_work=False and REFUSE to
+# recover-DONE — re-planning merged work.
+
+
+@pytest.mark.asyncio
+class TestSkippedExecuteWritesDurableLogEntry:
+    async def _run_all_committed(self, config, git_ops, task_assignment):
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        artifacts.update_base_commit(wt_info.base_commit)
+        _write_plan(artifacts, workflow)
+
+        (wt / 'red.py').write_text('def test_x(): assert True\n')
+        red_sha = await git_ops.commit(wt, 'test: RED — x')
+        (wt / 'impl.py').write_text('x = 1\n')
+        green_sha = await git_ops.commit(wt, 'feat: GREEN — x')
+        for step_id, sha in (
+            ('pre-1', red_sha), ('step-1', red_sha), ('step-2', green_sha),
+        ):
+            assert artifacts.mark_step_committed(step_id, sha) is True
+        workflow.plan = artifacts.read_plan()
+        _stub_execute_collaborators(workflow)
+
+        outcome = await workflow._execute_iterations()
+        assert outcome == WorkflowOutcome.DONE
+        return workflow, artifacts, green_sha
+
+    async def test_writes_one_honest_architect_execute_skipped_entry(
+        self, config, git_ops, task_assignment,
+    ):
+        """An HONEST label, not a forged implementer entry.
+
+        Forging ``agent='implementer'`` would pass the existing classifier with
+        zero code change but would assert in the durable record that an
+        implementer ran when none did — corrupting the very log the reconciler
+        and future architects read.
+        """
+        _workflow, artifacts, _sha = await self._run_all_committed(
+            config, git_ops, task_assignment,
+        )
+
+        entries, corrupted = artifacts.read_iteration_log()
+
+        assert corrupted == []
+        assert len(entries) == 1, (
+            f'Expected exactly one iteration-log entry, got {entries}'
+        )
+        entry = entries[0]
+        assert entry['agent'] == 'architect'
+        assert entry['event'] == 'execute_skipped'
+        assert set(entry['steps_completed']) == {'pre-1', 'step-1', 'step-2'}
+        assert entry['committed'] is True
+        assert entry['source'] == 'orchestrator'
+
+    async def test_entry_counts_as_work_so_merge_recovery_still_fires(
+        self, config, git_ops, task_assignment,
+    ):
+        """The entry must satisfy _iteration_entry_is_work AND, with a real
+        diverged HEAD, _has_prior_implementation."""
+        from orchestrator.workflow import _iteration_entry_is_work  # noqa: PLC0415
+
+        workflow, artifacts, head_sha = await self._run_all_committed(
+            config, git_ops, task_assignment,
+        )
+        entries, _ = artifacts.read_iteration_log()
+
+        assert _iteration_entry_is_work(entries[0]) is True
+
+        # SHA-primary path: real diverged HEAD + the log entry ⇒ has_work.
+        assert head_sha != artifacts.read_base_commit(), 'Setup: HEAD must diverge'
+        assert workflow._has_prior_implementation(wt_head=head_sha).has_work is True
+        # Iteration-log-only fallback (the shape _recover_before_merge uses).
+        assert workflow._has_prior_implementation().has_work is True
+
+
+class TestClassifierExtensionOpensNoFalseDoneHole:
+    """The new architect clause must be narrow: BOTH the event name AND a
+    non-empty steps_completed are required, and the pre-existing
+    ``committed is False`` early-return still applies."""
+
+    @staticmethod
+    def _is_work(entry: dict) -> bool:
+        from orchestrator.workflow import _iteration_entry_is_work  # noqa: PLC0415
+
+        return _iteration_entry_is_work(entry)
+
+    def test_architect_execute_skipped_with_no_steps_is_not_work(self):
+        assert self._is_work({
+            'agent': 'architect', 'event': 'execute_skipped',
+            'steps_completed': [], 'committed': True,
+        }) is False
+
+    def test_architect_execute_skipped_uncommitted_is_not_work(self):
+        assert self._is_work({
+            'agent': 'architect', 'event': 'execute_skipped',
+            'steps_completed': ['step-1'], 'committed': False,
+        }) is False
+
+    def test_architect_entry_with_other_event_is_not_work(self):
+        assert self._is_work({
+            'agent': 'architect', 'event': 'plan_written',
+            'steps_completed': ['step-1'], 'committed': True,
+        }) is False
+
+    def test_zero_work_implementer_entry_stays_not_work(self):
+        assert self._is_work({
+            'agent': 'implementer', 'steps_completed': [],
+        }) is False
+
+    def test_debugger_entry_stays_work(self):
+        assert self._is_work({
+            'agent': 'debugger', 'steps_completed': [],
+        }) is True
+
+
+@pytest.mark.asyncio
+class TestA1VerifyRemainsTheGate:
+    """A1-3: a falsely pre-satisfied step cannot reach MERGE without VERIFY.
+
+    Pinning test only — no new gate is implemented. It exists so a future change
+    that lets an all-``done`` plan short-circuit VERIFY fails here instead of
+    shipping a silent green.
+    """
+
+    async def test_zero_iteration_execute_does_not_satisfy_verify(
+        self, config, git_ops, task_assignment,
+    ):
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        artifacts.update_base_commit(wt_info.base_commit)
+        _write_plan(artifacts, workflow)
+        (wt / 'impl.py').write_text('x = 1\n')
+        sha = await git_ops.commit(wt, 'feat: GREEN — x')
+        for step_id in ('pre-1', 'step-1', 'step-2'):
+            assert artifacts.mark_step_committed(step_id, sha) is True
+        workflow.plan = artifacts.read_plan()
+        _stub_execute_collaborators(workflow)
+
+        await workflow._execute_iterations()
+
+        assert not workflow._verify_checkpoint_hit, (
+            'A zero-iteration EXECUTE must not mark the VERIFY checkpoint hit'
+        )
+        assert workflow.event_store.of_type(  # type: ignore[attr-defined]
+            EventType.workflow_verify,
+        ) == [], 'No workflow_verify event may be manufactured by the skip'
+        assert workflow.event_store.of_type(  # type: ignore[attr-defined]
+            EventType.phase_skipped, phase='verify',
+        ) == [], 'The skip must not also skip VERIFY'
+
+    async def test_durable_green_skip_still_requires_a_prior_green_at_tip(
+        self, config, git_ops, task_assignment,
+    ):
+        """green_checkpoint_at_tip is not satisfied by an all-done plan.
+
+        The only VERIFY skip is the durable verified-green checkpoint, which
+        requires a PRIOR passing workflow_verify recorded at the EXACT tip — a
+        condition a falsely pre-satisfied branch cannot meet.
+        """
+        from orchestrator.verify_checkpoint import (  # noqa: PLC0415
+            green_checkpoint_at_tip,
+        )
+
+        wt_info = await git_ops.create_worktree(task_assignment.task_id)
+        wt = wt_info.path
+        workflow, artifacts = _make_workflow(config, git_ops, task_assignment, wt)
+        artifacts.update_base_commit(wt_info.base_commit)
+        _write_plan(artifacts, workflow)
+        (wt / 'impl.py').write_text('x = 1\n')
+        tip = await git_ops.commit(wt, 'feat: GREEN — x')
+        for step_id in ('pre-1', 'step-1', 'step-2'):
+            assert artifacts.mark_step_committed(step_id, sha=tip) is True
+        workflow.plan = artifacts.read_plan()
+        _stub_execute_collaborators(workflow)
+
+        await workflow._execute_iterations()
+
+        # An all-done plan plus the skip event is NOT a green checkpoint.
+        assert green_checkpoint_at_tip(
+            workflow.event_store, EventType.workflow_verify, workflow.task_id, tip,
+        ) is False
+
+        # A passing workflow_verify recorded at a DIFFERENT tip is still no skip.
+        workflow.event_store.emit(  # type: ignore[attr-defined]
+            EventType.workflow_verify,
+            task_id=workflow.task_id,
+            data={'passed': True, 'tip_sha': 'some-other-tip'},
+        )
+        assert green_checkpoint_at_tip(
+            workflow.event_store, EventType.workflow_verify, workflow.task_id, tip,
+        ) is False
+
+        # Only a passing verify at THIS exact tip satisfies it.
+        workflow.event_store.emit(  # type: ignore[attr-defined]
+            EventType.workflow_verify,
+            task_id=workflow.task_id,
+            data={'passed': True, 'tip_sha': tip},
+        )
+        assert green_checkpoint_at_tip(
+            workflow.event_store, EventType.workflow_verify, workflow.task_id, tip,
+        ) is True
