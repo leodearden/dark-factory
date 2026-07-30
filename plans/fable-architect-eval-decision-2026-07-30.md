@@ -118,3 +118,53 @@ exist only on the 2026-07-30 wave, where inspected cells read `cap_tainted: fals
 the 07-30 wave. They are absent entirely from cells minted on or before 07-29. Cap
 identification for the older waves therefore relies on the cost /  `plan_steps` /
 timestamp correlation above, not a structural marker.
+
+---
+
+## 3. Hard-subset OFAT screen — per-architect plan quality and $/plan
+
+_RAW OBSERVATION._
+
+Headline table over the 72 scored cells (§2), recomputed independently from the
+per-cell result JSONs:
+
+| architect | planRate | doneRate | meanPQ_all | meanPQ_planned | $total (18 cells) | $/usable-plan |
+|---|---|---|---|---|---|---|
+| `architect-opus-max` *(incumbent)* | 88.9% | 88.9% | 0.8078 | 0.9087 | $59.08 | $3.693 |
+| `architect-opus-high` | 83.3% | 88.9% | 0.7761 | 0.9107 | $42.66 | $2.844 |
+| `architect-sonnet-high` | 83.3% | 77.8% | 0.7072 | 0.8487 | $26.26 | $1.750 |
+| `architect-fable-high` | 94.4% | 94.4% | 0.8678 | 0.9188 | $75.30 | $4.429 |
+
+This recomputation is independent corroboration, not a transcription: it reproduces
+esc-2862-1's resolution table exactly (same wave selection, same 72-cell set), which
+is the intended INV-2 cross-check — an independently-arrived-at number that matches
+the gate record it consumes rather than an unverified copy of it.
+
+**Metric definitions:**
+
+- `planRate` = fraction of the 18 cells with `plan_steps > 0`.
+- `doneRate` = fraction of the 18 cells with `outcome == 'done'`.
+- `meanPQ_all` = mean `plan_quality` over all 18 cells; a no-plan cell (`plan_steps ==
+  0`) scores 0 in this average.
+- `meanPQ_planned` = mean `plan_quality` over only the cells that produced a plan
+  (the `planRate` numerator).
+- `$total` = sum of `cost_usd` over all 18 cells for that candidate.
+- `$/usable-plan` = `$total` divided by the count of *planned* cells only (the
+  `planRate` numerator), not by 18. This carries forward the ι precedent's finding
+  that `$/fixture` (i.e. dividing by all scored cells) and `$/usable-plan` are **not
+  interchangeable** — a candidate that fails to plan on some cells still spends money
+  on them, so per-fixture cost understates the real price of a plan you can actually
+  use (`plans/architect-effort-adoption-decision-2026-07-28.md` §"Methodological
+  finding for future campaigns").
+
+**Why `plan_quality`, not the artifacts' `composite_score` field, is the quality
+axis.** Every architect cell inspected — across all three raw dumps and the per-cell
+result JSONs — carries `composite_score: 0.0`, regardless of its `plan_quality`. This
+is a known reporting defect, not a real 0.0: `run_architect_eval` never sets
+`tests_pass` on an `EvalMetrics`, and both `compute_composite` and `blend_composite`
+(`orchestrator/src/orchestrator/evals/metrics.py`) hard-gate their return to `0.0`
+whenever `tests_pass` is unset. This was first documented in
+`plans/eval-architect-effort-verdict-2026-07-27.md` §"Reporting defects found" #1 and
+filed as **task 3099**. Every number in the table above was therefore recomputed from
+the per-cell JSONs' `plan_quality` / `plan_steps` / `cost_usd` / `outcome` fields, not
+read off a composite column.
