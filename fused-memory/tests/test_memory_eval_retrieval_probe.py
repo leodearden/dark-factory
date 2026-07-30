@@ -2124,3 +2124,525 @@ class TestProbeReport:
 
         assert 'qdrant' in report
         assert 'ConnectionRefusedError' in report
+
+
+# ---------------------------------------------------------------------------
+# step-21: the read-only guarantee and the CLI band
+#
+# The read-only claim is the load-bearing one in this whole leaf: an eval that
+# writes to the corpus it measures is not an eval. Asserting it in a docstring
+# proves nothing, so it is asserted as BEHAVIOUR — the probe is driven, end to
+# end through argparse and _run, against a MemoryService double whose every
+# write method raises. A run that completes is a run that never wrote.
+#
+# Still no thresholds: every assertion below is on a call, a flag, an exit
+# code or a filename.
+# ---------------------------------------------------------------------------
+
+def _canned(*results):
+    """A healthy SearchResults carrying *results*."""
+    return SearchResults(list(results))
+
+
+class _ReadOnlyViolation(AssertionError):
+    """Raised by the double when the probe touches a write path."""
+
+
+class _ServiceDouble:
+    """A MemoryService stand-in that cannot be written to.
+
+    Every mutating method raises. ``search`` replays canned results and
+    ``count_memories_by_metadata`` records its calls so the corpus-counting
+    band can be asserted on rather than guessed at.
+    """
+
+    def __init__(self, by_query=None, counts=None, default=None):
+        self._by_query = dict(by_query or {})
+        self._counts = dict(counts or {})
+        self._default = default
+        self.searches: list[tuple[str, str, int]] = []
+        self.count_calls: list[tuple[str, dict]] = []
+        self.initialized = False
+        self.closed = False
+
+    # -- the two read paths the probe is allowed to use --------------------
+    async def search(self, query, project_id='main', limit=10, **kwargs):
+        self.searches.append((query, project_id, limit))
+        if query in self._by_query:
+            return self._by_query[query]
+        return self._default() if self._default else _canned()
+
+    async def count_memories_by_metadata(self, project_id, filters):
+        self.count_calls.append((project_id, dict(filters)))
+        return self._counts.get(filters.get('category'), 0)
+
+    # -- lifecycle ---------------------------------------------------------
+    async def initialize(self):
+        self.initialized = True
+
+    async def close(self):
+        self.closed = True
+
+    # -- every write path is a tripwire ------------------------------------
+    async def add_memory(self, *a, **kw):
+        raise _ReadOnlyViolation('the probe called add_memory')
+
+    async def add_episode(self, *a, **kw):
+        raise _ReadOnlyViolation('the probe called add_episode')
+
+    async def add_system_record(self, *a, **kw):
+        raise _ReadOnlyViolation('the probe called add_system_record')
+
+    async def delete_memory(self, *a, **kw):
+        raise _ReadOnlyViolation('the probe called delete_memory')
+
+    async def delete_episode(self, *a, **kw):
+        raise _ReadOnlyViolation('the probe called delete_episode')
+
+    async def update_edge(self, *a, **kw):
+        raise _ReadOnlyViolation('the probe called update_edge')
+
+    async def merge_entities(self, *a, **kw):
+        raise _ReadOnlyViolation('the probe called merge_entities')
+
+    async def delete_entity(self, *a, **kw):
+        raise _ReadOnlyViolation('the probe called delete_entity')
+
+
+def _as_payload(registry) -> dict:
+    """Serialize a TopicRegistry back to its on-disk shape.
+
+    Round-tripping through the real loader is what makes the CLI tests
+    end-to-end: a registry built in memory and one read off disk must be the
+    same object, or `main()` is being tested against a shape `--registry`
+    can never actually produce.
+    """
+    return {
+        'schema_version': registry.schema_version,
+        'entries': [
+            {
+                'topic': e.topic,
+                'project_id': e.project_id,
+                'derived_from': e.derived_from,
+                'canonical': {
+                    'content_hash': e.canonical.content_hash,
+                    'content_prefix': e.canonical.content_prefix,
+                    'last_known_id': e.canonical.last_known_id,
+                },
+                'phrasings': [
+                    {'text': p.text, 'held_out': p.held_out} for p in e.phrasings
+                ],
+                'claim_queries': [
+                    {'query': c.query, 'needles': list(c.needles)}
+                    for c in e.claim_queries
+                ],
+                'members': list(e.members),
+                'supersedes_pairs': [
+                    {'superseded_hash': s.superseded_hash,
+                     'successor_hash': s.successor_hash}
+                    for s in e.supersedes_pairs
+                ],
+            }
+            for e in registry.entries
+        ],
+    }
+
+
+def _scoped_entry(topic, *, project_id='dark_factory'):
+    """A registry entry whose query texts are unique to its topic.
+
+    The step-17 helpers deliberately share query strings across topics; here
+    they must not, because these tests assert WHICH project each individual
+    query was scoped to.
+    """
+    m = _mod()
+    content = f'the {topic} canonical text'
+    return m.RegistryEntry(
+        topic=topic,
+        project_id=project_id,
+        derived_from='hand',
+        canonical=m.Canonical(
+            content_hash=m.content_key(content),
+            content_prefix=content,
+            last_known_id=f'ID-{topic}',
+        ),
+        phrasings=(
+            m.Phrasing(f'{topic} tuned', False),
+            m.Phrasing(f'{topic} held out', True),
+        ),
+        claim_queries=(m.ClaimQuery(query=f'{topic} claim', needles=('canonical text',)),),
+    )
+
+
+def _probe_registry(*, project_id='dark_factory'):
+    """A two-topic registry whose canonicals are findable in the canned results."""
+    m = _mod()
+    return m.TopicRegistry(schema_version=1, entries=(
+        _scoped_entry('alpha-topic', project_id=project_id),
+        _scoped_entry('beta-topic', project_id=project_id),
+    ))
+
+
+def _canned_hits(registry):
+    """Canned SearchResults returning each topic's canonical for every query."""
+    by_query = {}
+    for entry in registry.entries:
+        hit = _R(content=entry.canonical.content_prefix, id=entry.canonical.last_known_id)
+        for phrasing in entry.phrasings:
+            by_query[phrasing.text] = _canned(hit, *_filler(4))
+        for claim in entry.claim_queries:
+            by_query[claim.query] = _canned(hit, *_filler(4))
+    return by_query
+
+
+def _install_double(monkeypatch, double):
+    """Point the lazily-imported MemoryService at *double*.
+
+    No test-only seam in the script: `_run` imports MemoryService inside the
+    function (the D8 pattern), so patching the module attribute is enough to
+    drive the real argparse/_run/emit path end to end.
+    """
+    import fused_memory.services.memory_service as ms  # noqa: PLC0415
+
+    monkeypatch.setattr(ms, 'MemoryService', lambda config: double)
+
+
+class TestReadOnlyGuarantee:
+    """(a) The probe completes against a service that cannot be written to."""
+
+    def test_a_full_run_never_touches_a_write_path(self, monkeypatch, tmp_path):
+        m = _mod()
+        registry = _probe_registry()
+        registry_path = tmp_path / 'registry.json'
+        registry_path.write_text(json.dumps(_as_payload(registry)), encoding='utf-8')
+        double = _ServiceDouble(by_query=_canned_hits(registry))
+        _install_double(monkeypatch, double)
+        monkeypatch.setenv('MEMORY_EVAL_RUN_STAMP', '20260730T090000Z')
+
+        code = m.main([
+            '--registry', str(registry_path),
+            '--out-root', str(tmp_path / 'out'),
+            '--project-id', 'dark_factory',
+        ])
+
+        assert code == 0
+        assert double.initialized and double.closed
+        artifact = tmp_path / 'out' / 'e1-retrieval-health' / 'metrics-20260730T090000Z.json'
+        assert artifact.exists()
+
+    def test_the_double_would_have_caught_a_write(self, monkeypatch, tmp_path):
+        """The guarantee is only worth what the double's tripwires are worth."""
+        double = _ServiceDouble()
+
+        import asyncio  # noqa: PLC0415
+
+        for name in (
+            'add_memory', 'add_episode', 'add_system_record', 'delete_memory',
+            'delete_episode', 'update_edge', 'merge_entities', 'delete_entity',
+        ):
+            with pytest.raises(_ReadOnlyViolation):
+                asyncio.run(getattr(double, name)())
+
+    def test_the_emitted_artifact_validates_and_the_report_lands(
+        self, monkeypatch, tmp_path,
+    ):
+        from shared.memory_eval_metrics import (  # noqa: PLC0415
+            load_metric_series,
+        )
+
+        m = _mod()
+        registry = _probe_registry()
+        double = _ServiceDouble(by_query=_canned_hits(registry))
+
+        import asyncio  # noqa: PLC0415
+
+        outcome = asyncio.run(m.run_probe(
+            double, registry,
+            project_ids=('dark_factory',),
+            ks=(5, 10),
+            out_root=tmp_path,
+            stamp='20260730T091500Z',
+        ))
+
+        series = load_metric_series(outcome.metrics_path)
+        assert series.eval_id == m.EVAL_ID
+        assert outcome.report_path.exists()
+        assert outcome.report_path.read_text(encoding='utf-8').strip()
+
+    def test_the_probed_project_id_is_recorded_on_the_corpus(self, tmp_path):
+        """An ephemeral run must never be mistakable for a live one."""
+        m = _mod()
+        registry = _probe_registry(project_id='_test_mem0_qdrant_integration_gw0')
+        double = _ServiceDouble(by_query=_canned_hits(registry))
+
+        import asyncio  # noqa: PLC0415
+
+        outcome = asyncio.run(m.run_probe(
+            double, registry,
+            project_ids=('_test_mem0_qdrant_integration_gw0',),
+            ks=(5,),
+            out_root=tmp_path,
+            stamp='20260730T092000Z',
+        ))
+
+        assert outcome.series.corpus.project_id == '_test_mem0_qdrant_integration_gw0'
+
+    def test_the_search_is_scoped_to_each_entrys_project(self, tmp_path):
+        m = _mod()
+        registry = m.TopicRegistry(schema_version=1, entries=(
+            _scoped_entry('alpha-topic', project_id='dark_factory'),
+            _scoped_entry('beta-topic', project_id='reify'),
+        ))
+        double = _ServiceDouble(by_query=_canned_hits(registry))
+
+        import asyncio  # noqa: PLC0415
+
+        asyncio.run(m.run_probe(
+            double, registry,
+            project_ids=('dark_factory', 'reify'),
+            ks=(5,),
+            out_root=tmp_path,
+            stamp='20260730T092500Z',
+        ))
+
+        scoped = {q: pid for q, pid, _ in double.searches}
+        assert scoped['alpha-topic tuned'] == 'dark_factory'
+        assert scoped['alpha-topic held out'] == 'dark_factory'
+        assert scoped['alpha-topic claim'] == 'dark_factory'
+        assert scoped['beta-topic tuned'] == 'reify'
+        assert set(pid for _, pid, _ in double.searches) == {'dark_factory', 'reify'}
+
+    def test_entries_outside_the_selected_projects_are_skipped_and_disclosed(
+        self, tmp_path,
+    ):
+        """No silent caps: a narrowed run must say what it did not probe."""
+        m = _mod()
+        registry = m.TopicRegistry(schema_version=1, entries=(
+            _scoped_entry('alpha-topic', project_id='dark_factory'),
+            _scoped_entry('beta-topic', project_id='reify'),
+        ))
+        double = _ServiceDouble(by_query=_canned_hits(registry))
+
+        import asyncio  # noqa: PLC0415
+
+        outcome = asyncio.run(m.run_probe(
+            double, registry,
+            project_ids=('dark_factory',),
+            ks=(5,),
+            out_root=tmp_path,
+            stamp='20260730T093000Z',
+        ))
+
+        assert outcome.skipped_topics == ('beta-topic',)
+        assert 'beta-topic' in outcome.report
+        assert set(pid for _, pid, _ in double.searches) == {'dark_factory'}
+
+
+class TestCorpusCounting:
+    """(b) One count per category, with the category list derived not restated."""
+
+    def _run_counts(self, tmp_path, counts):
+        m = _mod()
+        registry = _probe_registry()
+        double = _ServiceDouble(by_query=_canned_hits(registry), counts=counts)
+
+        import asyncio  # noqa: PLC0415
+
+        outcome = asyncio.run(m.run_probe(
+            double, registry,
+            project_ids=('dark_factory',),
+            ks=(5,),
+            out_root=tmp_path,
+            stamp='20260730T094000Z',
+        ))
+        return double, outcome
+
+    def test_the_category_list_is_the_stores_own(self):
+        from fused_memory.models.enums import (  # noqa: PLC0415
+            GRAPHITI_PRIMARY,
+            MEM0_PRIMARY,
+        )
+
+        expected = {c.value for c in (GRAPHITI_PRIMARY | MEM0_PRIMARY)}
+
+        assert set(_mod().corpus_categories()) == expected
+
+    def test_one_count_call_per_category_keyed_by_category_only(self, tmp_path):
+        double, _ = self._run_counts(tmp_path, {})
+
+        assert [pid for pid, _ in double.count_calls] == (
+            ['dark_factory'] * len(_mod().corpus_categories())
+        )
+        assert all(set(f) == {'category'} for _, f in double.count_calls)
+        assert (
+            sorted(f['category'] for _, f in double.count_calls)
+            == sorted(_mod().corpus_categories())
+        )
+
+    def test_the_counts_reach_the_corpus(self, tmp_path):
+        categories = _mod().corpus_categories()
+        counts = {c: i + 1 for i, c in enumerate(categories)}
+        _, outcome = self._run_counts(tmp_path, counts)
+
+        assert outcome.series.corpus.counts == counts
+
+    def test_no_category_name_is_restated_as_a_literal_in_the_script(self):
+        """A second home for someone else's vocabulary silently goes stale."""
+        from fused_memory.models.enums import (  # noqa: PLC0415
+            GRAPHITI_PRIMARY,
+            MEM0_PRIMARY,
+        )
+
+        source = SCRIPT_PATH.read_text(encoding='utf-8')
+        for category in (GRAPHITI_PRIMARY | MEM0_PRIMARY):
+            assert category.value not in source, (
+                f'{category.value!r} is restated in the probe; derive it from '
+                'MEM0_PRIMARY/GRAPHITI_PRIMARY instead'
+            )
+
+
+class TestArgparseBand:
+    """(c) The flags this runner exposes — and the ones it must never expose."""
+
+    def test_the_defaults_are_the_census_precedent(self):
+        args = _mod().build_parser().parse_args([])
+
+        assert tuple(args.project_id) == ('dark_factory', 'reify')
+        assert tuple(args.k) == (5, 10)
+        assert args.config is None
+        assert args.derive_registry is False
+
+    def test_the_default_registry_is_the_committed_fixture(self):
+        args = _mod().build_parser().parse_args([])
+
+        assert Path(args.registry).resolve() == REGISTRY_PATH.resolve()
+
+    def test_the_default_out_root_is_the_gitignored_data_dir(self):
+        args = _mod().build_parser().parse_args([])
+        out_root = Path(args.out_root).resolve()
+
+        assert out_root.name == 'memory-evals'
+        assert out_root.parent.name == 'data'
+        assert out_root.parent.parent.name == 'fused-memory'
+
+    def test_an_explicit_project_id_replaces_the_default(self):
+        """append+default is the classic argparse footgun; it must not bite."""
+        args = _mod().build_parser().parse_args(['--project-id', 'reify'])
+
+        assert tuple(args.project_id) == ('reify',)
+
+    def test_an_explicit_k_replaces_the_default(self):
+        args = _mod().build_parser().parse_args(['--k', '7'])
+
+        assert tuple(args.k) == (7,)
+
+    def test_project_id_and_k_are_repeatable(self):
+        args = _mod().build_parser().parse_args(
+            ['--project-id', 'a', '--project-id', 'b', '--k', '3', '--k', '20'],
+        )
+
+        assert tuple(args.project_id) == ('a', 'b')
+        assert tuple(args.k) == (3, 20)
+
+    def test_there_is_no_apply_band(self):
+        with pytest.raises(SystemExit):
+            _mod().build_parser().parse_args(['--apply'])
+
+    def test_no_mutating_flag_exists_at_all(self):
+        """The read-only guarantee has to be unreachable from the CLI too."""
+        parser = _mod().build_parser()
+        flags = {opt for action in parser._actions for opt in action.option_strings}
+
+        assert flags == {
+            '-h', '--help',
+            '--project-id', '--registry', '--out-root', '--k', '--config',
+            '--derive-registry',
+        }
+
+
+class TestRegistryLoadFailureIsFatal:
+    """(d) An unloadable registry exits non-zero — never an empty artifact."""
+
+    def test_a_broken_registry_exits_non_zero(self, monkeypatch, tmp_path, capsys):
+        m = _mod()
+        bad = tmp_path / 'bad.json'
+        bad.write_text(json.dumps({'schema_version': 1, 'entries': [
+            {'topic': 'no-canonical', 'project_id': 'dark_factory',
+             'derived_from': 'hand', 'phrasings': [{'text': 'q'}]},
+        ]}), encoding='utf-8')
+        _install_double(monkeypatch, _ServiceDouble())
+
+        code = m.main([
+            '--registry', str(bad), '--out-root', str(tmp_path / 'out'),
+        ])
+
+        assert code != 0
+        assert 'no-canonical' in capsys.readouterr().err
+
+    def test_a_broken_registry_emits_no_artifact(self, monkeypatch, tmp_path):
+        """Zero topics is indistinguishable from a healthy corpus."""
+        m = _mod()
+        bad = tmp_path / 'bad.json'
+        bad.write_text('{"schema_version": 1, "entries": "not a list"}', encoding='utf-8')
+        _install_double(monkeypatch, _ServiceDouble())
+        out_root = tmp_path / 'out'
+
+        code = m.main(['--registry', str(bad), '--out-root', str(out_root)])
+
+        assert code != 0
+        assert not list(out_root.rglob('metrics-*.json'))
+
+    def test_a_missing_registry_exits_non_zero(self, monkeypatch, tmp_path):
+        m = _mod()
+        _install_double(monkeypatch, _ServiceDouble())
+
+        code = m.main([
+            '--registry', str(tmp_path / 'absent.json'),
+            '--out-root', str(tmp_path / 'out'),
+        ])
+
+        assert code != 0
+
+    def test_the_store_is_never_reached_for_a_broken_registry(
+        self, monkeypatch, tmp_path,
+    ):
+        """Fail fast: no embedder spin-up to discover a fixture typo."""
+        m = _mod()
+        double = _ServiceDouble()
+        _install_double(monkeypatch, double)
+        bad = tmp_path / 'bad.json'
+        bad.write_text('not json at all', encoding='utf-8')
+
+        m.main(['--registry', str(bad), '--out-root', str(tmp_path / 'out')])
+
+        assert not double.initialized
+
+
+class TestRunStampOverride:
+    """(e) MEMORY_EVAL_RUN_STAMP gives deterministic filenames, no frozen clock."""
+
+    def test_the_env_stamp_names_the_artifact(self, monkeypatch, tmp_path):
+        m = _mod()
+        registry = _probe_registry()
+        registry_path = tmp_path / 'registry.json'
+        registry_path.write_text(json.dumps(_as_payload(registry)), encoding='utf-8')
+        _install_double(monkeypatch, _ServiceDouble(by_query=_canned_hits(registry)))
+        monkeypatch.setenv('MEMORY_EVAL_RUN_STAMP', '20260731T000000Z')
+
+        code = m.main([
+            '--registry', str(registry_path),
+            '--out-root', str(tmp_path / 'out'),
+            '--project-id', 'dark_factory',
+        ])
+
+        assert code == 0
+        eval_dir = tmp_path / 'out' / 'e1-retrieval-health'
+        assert (eval_dir / 'metrics-20260731T000000Z.json').exists()
+        assert (eval_dir / 'report-20260731T000000Z.txt').exists()
+
+    def test_the_stamp_is_the_shared_modules_not_a_local_one(self, monkeypatch):
+        from shared.memory_eval_metrics import run_stamp  # noqa: PLC0415
+
+        monkeypatch.setenv('MEMORY_EVAL_RUN_STAMP', '20260101T010101Z')
+
+        assert run_stamp() == '20260101T010101Z'
