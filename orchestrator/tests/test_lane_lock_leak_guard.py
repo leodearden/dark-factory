@@ -649,7 +649,7 @@ class TestCancelledAcquireNeverOrphansTheLaneLock:
         )
 
         gate.set()  # the acquire wins the lock AFTER its awaiter is gone
-        assert await wait_until(lambda: _SENTINEL_FD in obs['released']), (
+        assert await wait_until(lambda: _SENTINEL_FD in obs['released']), (  # type: ignore[operator]
             f'the late-won fd was ORPHANED: a cancelled acquire dropped a held '
             f'lane lock (reify esc-5548-5 — held until process exit, found only '
             f'by hand in /proc/locks); released={obs["released"]!r}'
