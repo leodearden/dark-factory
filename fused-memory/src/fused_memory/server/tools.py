@@ -17,7 +17,10 @@ from mcp.server.fastmcp import Context, FastMCP
 from shared.async_sqlite_base import CheckpointResult, apply_full_durability_pragmas, connect_daemon
 
 from fused_memory.backends.graphiti_client import NodeNotFoundError
-from fused_memory.backends.mem0_client import _MEM0_MANAGED_METADATA_KEYS
+from fused_memory.backends.mem0_client import (
+    _FUSED_MEMORY_OWNED_METADATA_KEYS,
+    _MEM0_MANAGED_METADATA_KEYS,
+)
 from fused_memory.config.reload import apply_reload
 from fused_memory.config.schema import DEFAULT_CONFIG_PATH, FusedMemoryConfig
 from fused_memory.mcp_tools.scheduler_state import (
@@ -583,6 +586,17 @@ def _validate_update_memory_arms(
     ``invalid_at``/``clear_invalid_at`` mutual-exclusivity check; nothing here
     is silently dropped, coerced, or half-applied.
 
+    The two ``category`` rules below live at this boundary ONLY, deliberately.
+    ``MemoryService.update_memory`` stays permissive for a direct in-process
+    caller (recon Stage 1 dispatches it with ``_source`` set): the service
+    layer's job is preventing SILENT loss, which
+    ``_apply_metadata_delta``'s protected-key carry-through does structurally
+    for every caller, while this boundary is where a self-reported EXTERNAL
+    caller's explicit destructive intent is refused. Do not "helpfully"
+    duplicate these checks down into the service — two copies of a rule this
+    narrow will drift, and the service-side copy would also have to re-decide
+    what an in-process migration script is allowed to do.
+
     Task 3195's metadata-vocabulary validators are NOT routed through here:
     re-verified at implementation time that the module has not landed (no
     shape validators for topic/canonical/kind/parent_id/supersedes exist in
@@ -653,6 +667,44 @@ def _validate_update_memory_arms(
                 f'{key!r}, which this tool will not remove. mem0 reads '
                 f'{sorted(_MEM0_MANAGED_METADATA_KEYS)} to serve get/search, so '
                 'deleting one would make the record unreadable by its own store.'
+            )
+
+    # Fused-memory-owned keys are protected only from the DELETE arm — a
+    # deliberately narrower rule than the mem0-owned one above, and the
+    # asymmetry is load-bearing. mem0 recomputes its own keys, so writing one
+    # is futile in both directions; `category` by contrast is freely patchable
+    # (that is how a record gets re-categorized) but has no coherent removal
+    # intent behind it: Mem0Backend.search pushes it down as a Qdrant payload
+    # filter, so a record without it is unreachable by every category-scoped
+    # search, forever, with no other symptom.
+    for key in metadata_delete_keys or []:
+        if key in _FUSED_MEMORY_OWNED_METADATA_KEYS:
+            return _err(
+                f'update_memory: `metadata_delete_keys` names {key!r}, which '
+                'this tool will not remove. It is a Qdrant payload filter — '
+                'search pushes it down as an equality match — so a record '
+                'without it is permanently unreachable by every '
+                'category-scoped search, with no error and no other symptom. '
+                f'To change it, pass {key!r} in `metadata_patch` instead.'
+            )
+
+    # A category no filter can ever match leaves the record exactly as
+    # unreachable as a missing one, so validating the KEY without validating
+    # the VALUE would leave the same hole open. Resolved through the same
+    # MemoryCategory enum add_memory and add_system_record stamp records with;
+    # the ValueError becomes a structured rejection rather than an exception
+    # escaping the tool (INV-1: fail loud, but in the response envelope).
+    if metadata_patch and 'category' in metadata_patch:
+        try:
+            MemoryCategory(metadata_patch['category'])
+        except ValueError:
+            return _err(
+                f'update_memory: `metadata_patch` sets `category` to '
+                f'{metadata_patch["category"]!r}, which is not a valid memory '
+                f'category. Qdrant matches the payload filter exactly, so an '
+                f'unrecognised value makes the record unreachable by every '
+                f'category-scoped search. Must be one of '
+                f'{sorted(c.value for c in MemoryCategory)}.'
             )
 
     # Write it and remove it cannot both be honoured; picking one silently
