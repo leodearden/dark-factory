@@ -416,6 +416,87 @@ def test_did_not_pass_subset_all_pass_is_empty() -> None:
     assert did_not_pass_subset({'a::x': 'pass', 'a::y': 'pass'}) == []
 
 
+# ---------------------------------------------------------------------------
+# nextest filter-id mapping (task 3059).
+#
+# DF's internal key space ("<binary-id> <test-name>", the parse_per_test_results
+# key) is NOT the domain cargo-nextest's `test(=...)` matcher accepts.  Resolved
+# EMPIRICALLY against cargo-nextest 0.9.136 — the exact version reify's merge
+# gate runs — not from documentation:
+#
+#     cargo nextest list -E 'test(=mymod::mytest)'          -> MATCHES
+#     cargo nextest list -E 'test(=nxprobe mymod::mytest)'  -> MATCHES NOTHING
+#
+# reify wraps each filter-file line as `test(=<line>)` (verify.sh
+# emit_nextest_pass), so shipping full parse keys yields a file that is
+# non-empty — reify's "retry refused: no subset" loud fallback therefore never
+# fires — and that matches ZERO tests: a narrowed retry that runs nothing and
+# reports PASS.  A latent FALSE GREEN, not mere inertness.
+# ---------------------------------------------------------------------------
+
+
+def test_nextest_filter_ids_strips_binary_id_prefix() -> None:
+    """A "<binary-id> <test-name>" parse key maps to the bare test name.
+
+    Empirical basis (cargo-nextest 0.9.136): `test(=some::mod::test_a)` matches,
+    `test(=reify-core::lib some::mod::test_a)` matches nothing.
+    """
+    from orchestrator.merge_shadow import nextest_filter_ids
+
+    assert nextest_filter_ids(['reify-core::lib some::mod::test_a']) == [
+        'some::mod::test_a'
+    ]
+
+
+def test_nextest_filter_ids_passes_through_unqualified_keys() -> None:
+    """A key with NO space (parse_per_test_results' libtest branch) is unchanged.
+
+    The libtest branch of parse_per_test_results keys on the bare test path
+    already, so there is no binary-id prefix to strip.
+    """
+    from orchestrator.merge_shadow import nextest_filter_ids
+
+    assert nextest_filter_ids(['some::mod::test_b']) == ['some::mod::test_b']
+
+
+def test_nextest_filter_ids_splits_on_first_space_only() -> None:
+    """The split is on the FIRST space, so a spaced test name keeps its remainder.
+
+    nextest permits spaces in test names for some harnesses; splitting on every
+    space would truncate such a name and silently drop it from the retry subset.
+    """
+    from orchestrator.merge_shadow import nextest_filter_ids
+
+    assert nextest_filter_ids(['pkg::bin my test with spaces']) == [
+        'my test with spaces'
+    ]
+
+
+def test_nextest_filter_ids_preserves_order_and_collapses_duplicates() -> None:
+    """Input order is preserved; exact duplicates collapse to one entry.
+
+    Two binaries running the same test name yield ONE `test(=name)` term — the
+    unqualified term already matches the name in every binary.
+    """
+    from orchestrator.merge_shadow import nextest_filter_ids
+
+    assert nextest_filter_ids(
+        [
+            'crate-b::lib zeta::test_last',
+            'crate-a::lib alpha::test_first',
+            'crate-c::lib alpha::test_first',  # same bare name, different binary
+            'crate-b::lib zeta::test_last',  # exact duplicate key
+        ]
+    ) == ['zeta::test_last', 'alpha::test_first']
+
+
+def test_nextest_filter_ids_empty_input_is_empty_list() -> None:
+    """Empty input yields [] — the caller decides what an empty subset means."""
+    from orchestrator.merge_shadow import nextest_filter_ids
+
+    assert nextest_filter_ids([]) == []
+
+
 def test_build_fail_fast_map_marks_cancelled_tests_not_started() -> None:
     """build_fail_fast_map annotates the authoritative plan with attempt-0 verdicts.
 
