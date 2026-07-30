@@ -207,8 +207,9 @@
 #     (D8 reader-refcount seam; same contract as the acquire path).
 #   - Safety-ranked order: reset lanes first (cheap), then remove orphans (destructive).
 #   - Stdout: machine-readable summary line only —
-#     `reclaim: reset=N removed=N preserved=N preserved_live_ref=N`. New fields
-#     are APPENDED so prefix-matching consumers keep working.
+#     `reclaim: reset=N removed=N preserved=N preserved_live_ref=N
+#     preserved_assigned=N`. New fields are APPENDED so prefix-matching
+#     consumers keep working.
 #     Stderr: all diagnostics (info/ok/warn/err).
 
 set -euo pipefail
@@ -286,9 +287,13 @@ Usage: $(basename "$0") reclaim --mount WORKTREE_BASE [OPTIONS]
 
   Output:
     stdout: machine-readable summary:
-            reclaim: reset=N removed=M preserved=K preserved_live_ref=L
+            reclaim: reset=N removed=M preserved=K preserved_live_ref=L preserved_assigned=A
             (L is the share of K held back by a live process reference — the
              only preserve reason that can shield an entry indefinitely)
+            (A is the share of K held back by dark-factory's own durable lane
+             record reading assigned/in_use — the only preserve reason that is
+             AUTHORITATIVE rather than a probe, and one that self-clears when
+             the lane is released)
     stderr: all diagnostics.
 EOF
 }
@@ -484,6 +489,14 @@ _do_reclaim() {
     # per-entry `preserving <name>: live consumer (process reference)` warn on
     # stderr names WHICH entries, so an operator can find and clear the holder.
     local preserved_live_ref_count=0
+    # Sub-count of preserved_count attributable to the Pass-1 lane-record gate
+    # (task 3075). Reported SEPARATELY from preserved_live_ref_count, not folded
+    # into it, because the two shares mean opposite things about pool health: a
+    # rising preserved_assigned is a BUSY pool and self-clears the moment
+    # dark-factory releases the lane, whereas a rising preserved_live_ref can
+    # shield a lane INDEFINITELY. One combined number would hide a permanently
+    # shielded pool behind ordinary business.
+    local preserved_assigned_count=0
 
     info "warm-lane-gc.sh reclaim: worktrees_dir=$WORKTREES_DIR  base_target=$BASE_TARGET  main_ref=$MAIN_REF"
 
@@ -583,8 +596,19 @@ _do_reclaim() {
         lane_class="$(lane_state_class "$LANE_STATE_RAW")"
         if [ "$lane_class" = "ASSIGNED" ]; then
             exec 8>&-
-            warn "preserving $name: assigned to task $LANE_STATE_TASK_ID"
+            # The `(state=<raw>)` suffix keeps the PRD-pinned prefix
+            # `preserving _lane-5: assigned to task 5334` matching as a
+            # substring while surfacing `in_use` vs `assigned` — the distinction
+            # leaf δ will begin writing and leaf ε depends on. A record with no
+            # task_id gets its OWN wording: `assigned to task ` with an empty id
+            # would be a dangling fact.
+            if [ -n "$LANE_STATE_TASK_ID" ]; then
+                warn "preserving $name: assigned to task $LANE_STATE_TASK_ID (state=$LANE_STATE_RAW)"
+            else
+                warn "preserving $name: assigned, no task id in record (state=$LANE_STATE_RAW)"
+            fi
             preserved_count=$((preserved_count + 1))
+            preserved_assigned_count=$((preserved_assigned_count + 1))
             continue
         fi
 
@@ -760,12 +784,14 @@ _do_reclaim() {
     done
 
     # ── Summary ───────────────────────────────────────────────────────────────
-    # preserved_live_ref is APPENDED, never interposed: existing consumers match
-    # the reset=/removed=/preserved= prefix, so a trailing field extends the line
-    # without breaking them.
-    printf 'reclaim: reset=%d removed=%d preserved=%d preserved_live_ref=%d\n' \
-        "$reset_count" "$removed_count" "$preserved_count" "$preserved_live_ref_count"
-    ok "reclaim complete: reset=$reset_count removed=$removed_count preserved=$preserved_count preserved_live_ref=$preserved_live_ref_count"
+    # preserved_live_ref and preserved_assigned are APPENDED, never interposed:
+    # existing consumers match the reset=/removed=/preserved= prefix (and the
+    # `preserved=N preserved_live_ref=M` adjacency), so a trailing field extends
+    # the line without breaking them.
+    printf 'reclaim: reset=%d removed=%d preserved=%d preserved_live_ref=%d preserved_assigned=%d\n' \
+        "$reset_count" "$removed_count" "$preserved_count" "$preserved_live_ref_count" \
+        "$preserved_assigned_count"
+    ok "reclaim complete: reset=$reset_count removed=$removed_count preserved=$preserved_count preserved_live_ref=$preserved_live_ref_count preserved_assigned=$preserved_assigned_count"
 }
 
 # ── dispatch ───────────────────────────────────────────────────────────────────
