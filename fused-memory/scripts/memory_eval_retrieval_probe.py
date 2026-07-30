@@ -1193,3 +1193,291 @@ def classify_contamination(
         untopiced_count=untopiced,
         scored_total=scored,
     )
+
+
+# ---------------------------------------------------------------------------
+# M1 series assembly
+#
+# Everything above produces per-probe records; this band turns them into the
+# ONE artifact leaf alpha's evaluator and the dashboard read. Every model, path
+# helper and validator comes from shared.memory_eval_metrics (D2) — none of
+# that shape is re-declared here.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ClaimObservation:
+    """One (topic, claim-query, k) probe result."""
+
+    topic: str
+    query: str
+    k: int
+    recalled: bool
+    missing_needles: tuple[str, ...] = ()
+    scorable: bool = True
+    degraded: bool = False
+
+
+@dataclass(frozen=True)
+class ContaminationObservation:
+    """One (topic, phrasing, k) contamination sample, disclosures included."""
+
+    topic: str
+    phrasing: str
+    k: int
+    foreign_count: int
+    untopiced_count: int
+    scored_total: int
+    foreign_records: tuple[ForeignRecord, ...] = ()
+    degraded: bool = False
+
+
+@dataclass(frozen=True)
+class InversionObservation:
+    """The inversions found in one (topic, phrasing) probe, plus its exposure.
+
+    ``pairs_examined`` is the count metric's ``n``. A Poisson tail test needs
+    the exposure the rate is per: 2 inversions out of 4 registry pairs probed
+    and 2 out of 400 are not the same observation, and a bare event count would
+    make a run that probed more pairs look like a regression.
+    """
+
+    topic: str
+    phrasing: str
+    pairs_examined: int
+    inversions: tuple[InversionRecord, ...] = ()
+    degraded: bool = False
+
+
+@dataclass
+class ProbeObservations:
+    """Everything one probe run measured, before aggregation.
+
+    Mutable and append-only during a run; :func:`build_series` reads it without
+    modifying it. Keeping the raw records around (rather than accumulating
+    counters) is what lets the report name WHICH topic, phrasing and hash
+    failed instead of only how many did.
+    """
+
+    phrasings: list[PhrasingObservation] = field(default_factory=list)
+    claims: list[ClaimObservation] = field(default_factory=list)
+    contamination: list[ContaminationObservation] = field(default_factory=list)
+    inversions: list[InversionObservation] = field(default_factory=list)
+
+
+def _proportion(
+    metric_id: str,
+    successes: int,
+    trials: int,
+    direction: str,
+    *,
+    details_path: str | None = None,
+):
+    """A proportion Metric, or None when nothing was scored.
+
+    ``None`` rather than a 0/0 metric: the shared validator rejects a
+    non-positive denominator, and rightly — a proportion over zero trials is
+    not a measurement of anything, and emitting one would put a fabricated
+    trial into the baseline window the evaluator computes limits from. An
+    absent metric is the honest signal, and the report says which family went
+    unmeasured (a metric that vanishes without explanation reads as healthy).
+    """
+    from shared.memory_eval_metrics import Metric  # noqa: PLC0415
+
+    if trials <= 0:
+        return None
+    return Metric(
+        metric_id=metric_id,
+        kind='proportion',
+        value=successes / trials,
+        n=trials,
+        denominator=trials,
+        direction=direction,
+        details_path=details_path,
+    )
+
+
+def _tripwire_items(observations: ProbeObservations, k: int) -> list[tuple[str, bool]]:
+    """(item_key, passed) per topic measured at *k*, in stable slug order.
+
+    A topic passes only when EVERY non-degraded phrasing at *k* — including the
+    held-out one — found its canonical. That conjunction is the Goodhart guard
+    expressed as a predicate: tuning the known phrasings until they pass cannot
+    make the topic pass while the freshly authored phrasing still misses.
+
+    A topic whose every phrasing degraded contributes NO item at all rather
+    than a failing one. A store outage must not be able to manufacture a
+    corpus-wide canonical-findability collapse for leaf epsilon to file against
+    the 3111 lineage.
+    """
+    passed: dict[str, bool] = {}
+    for obs in observations.phrasings:
+        if obs.degraded or obs.k != k:
+            continue
+        passed[obs.topic] = passed.get(obs.topic, True) and obs.hit
+    return [(f'{TRIPWIRE_ITEM_PREFIX}{topic}', ok) for topic, ok in sorted(passed.items())]
+
+
+def _disclosure_counts(observations: ProbeObservations) -> dict[str, int]:
+    """The narrowings that must ride along INSIDE the machine-readable artifact.
+
+    Reporting them only in prose would be a silent cap for every consumer that
+    reads the JSON — which is all of them. ``corpus.counts`` is free-form
+    category -> size by design (its docstring: the bucket vocabulary is not
+    this schema's to own), so it is where a per-run disclosure belongs.
+    """
+    return {
+        'contamination_scored_results': sum(
+            c.scored_total for c in observations.contamination if not c.degraded
+        ),
+        'contamination_untopiced_results': sum(
+            c.untopiced_count for c in observations.contamination if not c.degraded
+        ),
+        'claim_queries_unscorable': sum(
+            1 for c in observations.claims if not c.degraded and not c.scorable
+        ),
+        'degraded_observations': sum(
+            1 for o in observations.phrasings if o.degraded
+        ),
+    }
+
+
+def build_series(
+    observations: ProbeObservations,
+    corpus_counts: dict[str, int],
+    project_id: str,
+    stamp: str,
+    ks: tuple[int, ...] = DEFAULT_KS,
+):
+    """Assemble the M1 metric series for one probe run.
+
+    Emits at most the seven metrics this leaf owns, in the pinned vocabulary.
+    ``dangling-pointers`` / ``successor-pointer-present`` are leaf γ's (E4) and
+    never appear here.
+
+    The result is validated before it is returned, so an aggregation bug
+    surfaces in this runner rather than in leaf α's evaluator — the M1
+    "rejected at emit time, not read time" guarantee applied to the producer's
+    own arithmetic.
+    """
+    from shared.memory_eval_metrics import (  # noqa: PLC0415
+        SCHEMA_VERSION,
+        Corpus,
+        Metric,
+        MetricSeries,
+        TripwireItem,
+        report_artifact_path,
+        validate_metric_series,
+    )
+
+    # The report filename, not its absolute path: the artifact directory gets
+    # copied and served (the dashboard reads it as plain files), and an
+    # absolute path from this machine would be a dangling pointer there.
+    details_path = report_artifact_path('.', EVAL_ID, stamp).name
+
+    metrics: list[Any] = []
+
+    items = _tripwire_items(observations, TRIPWIRE_K)
+    if items:
+        metrics.append(Metric(
+            metric_id=METRIC_TOPIC_CANONICAL_PRESENT,
+            kind='tripwire',
+            value=float(sum(1 for _, ok in items if not ok)),
+            n=len(items),
+            items=[TripwireItem(item_key=key, passed=ok) for key, ok in items],
+            details_path=details_path,
+        ))
+
+    scored_phrasings = [o for o in observations.phrasings if not o.degraded]
+    for k in ks:
+        at_k = [o for o in scored_phrasings if o.k == k]
+        metric = _proportion(
+            METRIC_CANONICAL_IN_TOP_K.format(k=k),
+            sum(1 for o in at_k if o.hit),
+            len(at_k),
+            'lower_is_worse',
+            details_path=details_path,
+        )
+        if metric is not None:
+            metrics.append(metric)
+
+    # Held-out only at the tripwire's k, deliberately: the two answer the same
+    # question (is the canonical in this list of five) over different phrasing
+    # populations, so trending them at one k keeps them comparable. Emitting a
+    # held-out variant per k would also grow the metric vocabulary every time
+    # someone passed another --k.
+    held_out = [o for o in scored_phrasings if o.k == TRIPWIRE_K and o.held_out]
+    metric = _proportion(
+        METRIC_CANONICAL_IN_TOP_K_HELD_OUT.format(k=TRIPWIRE_K),
+        sum(1 for o in held_out if o.hit),
+        len(held_out),
+        'lower_is_worse',
+        details_path=details_path,
+    )
+    if metric is not None:
+        metrics.append(metric)
+
+    claims = [c for c in observations.claims if not c.degraded and c.scorable]
+    metric = _proportion(
+        METRIC_CLAIM_RECALL,
+        sum(1 for c in claims if c.recalled),
+        len(claims),
+        'lower_is_worse',
+        details_path=details_path,
+    )
+    if metric is not None:
+        metrics.append(metric)
+
+    contamination = [c for c in observations.contamination if not c.degraded]
+    metric = _proportion(
+        METRIC_CONTAMINATION_SHARE,
+        sum(c.foreign_count for c in contamination),
+        sum(c.scored_total for c in contamination),
+        'higher_is_worse',
+        details_path=details_path,
+    )
+    if metric is not None:
+        metrics.append(metric)
+
+    inversions = [i for i in observations.inversions if not i.degraded]
+    if inversions:
+        metrics.append(Metric(
+            metric_id=METRIC_SUPERSEDED_ABOVE_SUCCESSOR,
+            kind='count',
+            value=float(sum(len(i.inversions) for i in inversions)),
+            n=sum(i.pairs_examined for i in inversions),
+            direction='higher_is_worse',
+            details_path=details_path,
+        ))
+
+    counts = dict(corpus_counts)
+    for key, value in _disclosure_counts(observations).items():
+        if key in counts:
+            raise ValueError(
+                f'corpus_counts key {key!r} collides with a run disclosure this '
+                'runner computes. Rename the caller-supplied key: silently '
+                'overwriting either one would hide a narrowing.'
+            )
+        counts[key] = value
+
+    series = MetricSeries(
+        schema_version=SCHEMA_VERSION,
+        eval_id=EVAL_ID,
+        run_stamp=stamp,
+        corpus=Corpus(project_id=project_id, counts=counts),
+        metrics=metrics,
+    )
+    validate_metric_series(series)
+    return series
+
+
+def emit_series(series, root: str | Path, *, stamp: str | None = None) -> tuple[Path, Path]:
+    """Write *series* under *root*, returning ``(metrics_path, report_path)``.
+
+    A thin pass-through to :func:`shared.memory_eval_metrics.write_metric_series`
+    — the layout, the atomic write and the emit-time validation are all the
+    shared module's, and re-implementing any of them here would be a second
+    home for the artifact contract.
+    """
+    from shared.memory_eval_metrics import write_metric_series  # noqa: PLC0415
+
+    return write_metric_series(series, root, stamp=stamp)
