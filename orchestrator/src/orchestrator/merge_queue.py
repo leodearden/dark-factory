@@ -14926,30 +14926,54 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # I4 runs.db surface (task 2383 β, step 18): thread the skew
                 # attribution verdict into a merge_attempt event so gamma's
                 # digest.merge_disposition_counts (task 2384) is non-sentinel
-                # on the production path.  Guarded to INTEGRATION_SKEW/BRANCH_BUG
-                # only — MAIN_RED already emitted 'main_health_red' when the
-                # outcome was built (see _classify_main_health_red, above), and
-                # INDETERMINATE (fail-open default, I3) stays byte-identical
-                # with no emit at all.
+                # on the production path.  MAIN_RED is excluded because it
+                # already emitted 'main_health_red' when the outcome was built
+                # (see _classify_main_health_red, above).
                 #
-                # Amendment (reviewer_comprehensive, round 2): this is a
-                # deliberate choice, not an oversight — INDETERMINATE verify
-                # failures (the common fail-open default on non-orchestrator
-                # submit paths and on any classifier degradation) are
-                # intentionally UNCOUNTED here rather than emitted as a
-                # 'verify_failed' row with disposition=indeterminate. 2384's
-                # digest.merge_disposition_counts therefore has no
-                # denominator signal for that bucket and must compute rates
-                # only over {integration_skew, branch_bug}; it cannot
-                # distinguish "zero INDETERMINATE failures" from
-                # "INDETERMINATE failures not recorded" from this event
-                # alone. I3 requires the fail-open default to stay
-                # byte-identical (no emit) rather than manufacture a new kind
-                # of row, and
-                # test_indeterminate_first_attempt_emits_no_disposition_key
-                # (test_merge_skew_end_to_end.py) pins that contract — widening
-                # this guard to include INDETERMINATE is a deliberate,
-                # separately-reviewed semantics change, not a drive-by fix.
+                # Amendment (task 3178): the round-2 amendment below used to
+                # state that widening this guard to INDETERMINATE would be a
+                # deliberate, separately-reviewed semantics change rather than a
+                # drive-by fix.  Task 3178 IS that separate review, and the
+                # widening landed HERE — keyed on GATHERED EVIDENCE
+                # (`skew_evidence is not None`), deliberately NOT by adding
+                # INDETERMINATE to the enum tuple.  That distinction is the crux:
+                # it splits two INDETERMINATEs the old blanket exclusion
+                # conflated.
+                #
+                #   * ADJUDICATED — the classifier RAN, cited implicated main
+                #     landings, and the I7 shape floor (or I5's green fact)
+                #     refused to promote them to INTEGRATION_SKEW.  A bundle was
+                #     gathered, so a row IS now emitted carrying it.  This is the
+                #     class 3178 exists to measure: a census can read straight
+                #     out of runs.db that the gate bit, on which commits, and why
+                #     (zero node-shaped failing-test ids despite cited landings).
+                #   * SKIPPED / FAIL-OPEN — base facts were absent so
+                #     classification never ran, or the classifier raised (I3).
+                #     Nothing was gathered, `skew_evidence` is None, and NO row is
+                #     emitted — byte-identical to pre-3178.  That is exactly why
+                #     test_indeterminate_first_attempt_emits_no_disposition_key
+                #     (test_merge_skew_end_to_end.py) survives verbatim and I3's
+                #     fail-open guarantee is preserved.
+                #
+                # What 2384's digest.merge_disposition_counts can now do that it
+                # could not before: it gains a real DENOMINATOR for the
+                # adjudicated-INDETERMINATE bucket, alongside
+                # {integration_skew, branch_bug}.  It still has NO denominator
+                # for the skipped/fail-open bucket, so rates computed over these
+                # rows must not be read as covering ALL INDETERMINATE verify
+                # failures — only the adjudicated ones.  BRANCH_BUG implicates no
+                # landings, so its skew_evidence is None and its row's payload
+                # stays byte-identical too.
+                #
+                # Observability rationale (task 3178): merge_attempt rows
+                # previously persisted only {disposition, outcome}.  Nobody could
+                # read the underlying evidence back out, which is why the false
+                # "shell guards parse zero failing-test ids" premise underpinning
+                # tasks 2871 and 2918 survived two task cycles unchecked — 8
+                # fabricated INTEGRATION_SKEW dispositions between 07-24 and
+                # 07-28 were invisible in runs.db.  The bounded
+                # failing_tests/implicated_commits/overlap_files lists (plus their
+                # <key>_total true counts) close that sub-gap.
                 #
                 # Amendment (reviewer_comprehensive, round 3): BRANCH_BUG is
                 # the COMMON case whenever the caller supplies dispatch-time
@@ -14965,14 +14989,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # (duration_ms is stamped here) over this event kind will see
                 # new volume/outliers starting with this task — future
                 # readers should not assume the speculative verify-fail path
-                # was already emitting these rows pre-β.
+                # was already emitting these rows pre-β.  Task 3178's widening
+                # adds FURTHER volume on the adjudicated-INDETERMINATE path,
+                # for the same reason and with the same caveat.
                 if vr.outcome.disposition in (
                     MergeFailureDisposition.INTEGRATION_SKEW,
                     MergeFailureDisposition.BRANCH_BUG,
-                ):
+                ) or vr.outcome.skew_evidence is not None:
                     _emit_merge_attempt(
                         self._event_store, req.task_id, OutcomeKind.verify_failed,
                         disposition=vr.outcome.disposition,
+                        skew_evidence=vr.outcome.skew_evidence,
                         duration_ms=_elapsed_ms(item.started_monotonic),
                     )
                 self._resolve_or_drop_abandoned(req, vr.outcome)

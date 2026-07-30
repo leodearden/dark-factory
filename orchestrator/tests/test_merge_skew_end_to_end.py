@@ -35,13 +35,13 @@ from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps, MergeResult
 from orchestrator.merge_disposition import MergeFailureDisposition
 from orchestrator.merge_queue import (
+    _MAX_EVENT_EVIDENCE_ITEMS,
     InflightEntry,
     MergeOutcome,
     MergeRequest,
     QueuedBranch,
     RealMergeItem,
     SpeculativeMergeWorker,
-    _MAX_EVENT_EVIDENCE_ITEMS,
 )
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.verify import VerifyResult
