@@ -719,10 +719,18 @@ async def census_project(
     must be able to tell those apart instead of calling a healthy census
     broken.
 
+    The collection total is bracketed the same way, by a ``count(scope)``
+    read before the category loop and another after it. The per-category
+    pair cannot stand in for it: a write landing after the last recount but
+    before the closing read moves ONLY the collection total, so without its
+    own bracket that drift is indistinguishable from a slice of the corpus
+    carrying a category outside the censused set.
+
     Returns:
         ``(cells, coverage)`` where *cells* maps category value ->
         CategoryCensus, and *coverage* is the per-project record consumed by
-        :func:`build_report`: collection name, collection point total, and
+        :func:`build_report`: collection name, the bracketing
+        ``collection_points_before``/``collection_points`` pair, and
         per-category expected/recount/scrolled/delta/complete.
     """
     from fused_memory.models.scope import Scope  # noqa: PLC0415
@@ -743,6 +751,13 @@ async def census_project(
         if isinstance(raw_timeout, (int, float)) and not isinstance(raw_timeout, bool)
         else None
     )
+
+    # Bracket the WHOLE scan, the same way each category brackets its own
+    # scroll. A write landing after the last per-category recount but before
+    # the closing read moves only the collection total, which no pair of
+    # category sums can bracket -- so the collection total needs its own two
+    # reads for _build_coverage to tell that drift from an unenumerated slice.
+    collection_points_before = await backend.count(scope)
 
     cells: dict[str, CategoryCensus] = {}
     per_category: dict[str, Any] = {}
@@ -791,14 +806,38 @@ async def census_project(
             )
 
     collection_points = await backend.count(scope)
-    counted = sum(c['expected'] for c in per_category.values())
-    logger.info(
-        'project=%s collection=%s points=%d counted=%d uncovered=%d',
-        project_id, collection, collection_points, counted, collection_points - counted,
+    sum_expected = sum(c['expected'] for c in per_category.values())
+    sum_recount = sum(
+        c['expected'] if c.get('recount') is None else c['recount']
+        for c in per_category.values()
     )
+    counted_lo, counted_hi = min(sum_expected, sum_recount), max(sum_expected, sum_recount)
+    points_lo, points_hi = min(collection_points_before, collection_points), max(
+        collection_points_before, collection_points)
+    # The SURVIVING residue -- the gap between the two intervals, 0 when they
+    # intersect. Logging the raw `collection_points - sum_expected` here would
+    # print ordinary churn as an uncovered slice, which is the report-level
+    # defect this bracket exists to fix.
+    if points_lo > counted_hi:
+        residue = points_lo - counted_hi
+    elif points_hi < counted_lo:
+        residue = points_hi - counted_lo
+    else:
+        residue = 0
+    logger.info(
+        'project=%s collection=%s points=%d..%d counted=%d..%d residue=%+d',
+        project_id, collection, points_lo, points_hi, counted_lo, counted_hi, residue,
+    )
+    if residue == 0 and (counted_lo, counted_hi) != (points_lo, points_hi):
+        logger.info(
+            'CORPUS CHURN project=%s collection=%s: counted %d..%d vs %d..%d points; the '
+            'intervals overlap, so every point is accounted for.',
+            project_id, collection, counted_lo, counted_hi, points_lo, points_hi,
+        )
 
     return cells, {
         'collection': collection,
+        'collection_points_before': collection_points_before,
         'collection_points': collection_points,
         'categories': per_category,
     }
