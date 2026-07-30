@@ -211,6 +211,56 @@ class TestStampClearHelpers:
         await f.wf._clear_merge_retry_pending()
         assert 'merge_retry_pending' not in f.wf.task['metadata']
 
+    # -- task 3024 step-11: 'replace' makes a STALE payload destructive --
+
+    @pytest.mark.asyncio
+    async def test_clear_skips_replace_write_when_refresh_fails(self):
+        """A failed backend refresh must skip the write, not replace with a guess.
+
+        ``metadata_mode='replace'`` changes the blast radius of a stale payload.
+        ``_merge_fresh_metadata`` deliberately swallows a ``get_task`` failure and
+        returns the in-memory metadata ALONE (its own docstring warns
+        'memory_hints may be clobbered').  Under the old 'merge' mode that only
+        risked the keys actually supplied; under 'replace' the same fallback
+        DELETES every backend-only key — so the fix for a stamp that will not
+        clear could destroy ``memory_hints`` re-attached by Stage-2 reconciliation.
+
+        Skipping the write is strictly the safer failure: a surviving stamp is
+        self-healing (a later dispatch retries the clear, and the conflict probe
+        and the harness restart clear are two independent remedies for the same
+        wedge), whereas clobbered metadata is unrecoverable.
+        """
+        f = _make(metadata={'merge_retry_pending': dict(_STAMP)})
+        f.scheduler.get_task = AsyncMock(side_effect=RuntimeError('mcp down'))
+
+        # Best-effort contract holds: the refresh failure is swallowed.
+        await f.wf._clear_merge_retry_pending()
+
+        # No destructive whole-blob write on an unverified payload.
+        f.update_task.assert_not_awaited()
+        # The obligation survives intact, so a later dispatch can retry the clear.
+        assert f.wf.task['metadata']['merge_retry_pending'] == dict(_STAMP)
+
+    @pytest.mark.asyncio
+    async def test_clear_preserves_backend_only_keys_on_successful_refresh(self):
+        """The replace only ever ships a backend-VERIFIED blob.
+
+        Mirror of the skip case: when the refresh succeeds, backend-only keys the
+        live workflow object never saw must ride along in the whole-blob write,
+        because under 'replace' every omitted key is deleted.
+        """
+        f = _make(
+            metadata={'merge_retry_pending': dict(_STAMP)},
+            backend_metadata={'memory_hints': ['h1']},
+        )
+
+        await f.wf._clear_merge_retry_pending()
+
+        assert _persisted_mode(f.update_task) == 'replace'
+        persisted = _persisted_metadata(f.update_task)
+        assert 'merge_retry_pending' not in persisted
+        assert persisted['memory_hints'] == ['h1']
+
     @pytest.mark.asyncio
     async def test_clear_is_noop_when_no_stamp_present(self):
         # Amendment (reviewer robustness): the clear helper must be a cheap
