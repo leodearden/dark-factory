@@ -254,13 +254,18 @@ def test_nightly_cap_is_an_alias_of_the_sampler_cap_not_a_second_literal():
 
 def test_select_digest_sessions_charges_real_digest_bytes(tmp_path, monkeypatch):
     """The cost basis handed to the sampler must be the REAL rendered digest
-    size, computed at exactly the ``max_bytes`` ``build_digests`` will later
-    render with.
+    size -- what makes ``max_daily_digest_bytes`` mean what it says.
 
-    Both halves matter. Real digest bytes make ``max_daily_digest_bytes``
-    mean what it says; the SAME max_bytes constant makes ``bytes_used``
-    describe the digests that actually get produced rather than a parallel
-    estimate free to drift from them.
+    This half only. The OTHER half of the guarantee -- that the charge uses
+    the same ``max_bytes`` ``build_digests`` renders with -- cannot be
+    detected here: ``_write_transcript``'s digest measures 446 bytes at both
+    ``max_bytes=15360`` and ``max_bytes=999999``, so the cap never binds and
+    any cap above ~446 (including ``build_digest``'s own
+    default, had ``select_digest_sessions`` omitted the kwarg entirely) would
+    satisfy this assertion (reviewer_comprehensive, task 3268 amendment
+    pass). ``test_select_digest_sessions_costs_at_the_max_bytes_build_digests
+    _renders_with`` asserts the cap DIRECTLY instead of inferring it from
+    output size.
     """
     work_cwd = str(tmp_path / 'work')
     cfg = load_config(_write_config(tmp_path, project_id='proj_a', cwd_prefixes=[work_cwd]))
@@ -295,6 +300,46 @@ def test_select_digest_sessions_charges_real_digest_bytes(tmp_path, monkeypatch)
     )
     assert cost_fn(record) == expected
     assert expected != record.size_bytes
+
+
+def test_select_digest_sessions_costs_at_the_max_bytes_build_digests_renders_with(
+    tmp_path, monkeypatch,
+):
+    """The cap the sampler CHARGES at and the cap ``build_digests`` RENDERS
+    at must be the same number, or ``bytes_used`` describes a digest nobody
+    produced.
+
+    Asserted DIRECTLY off the recorded ``max_bytes`` kwarg rather than
+    inferred from the rendered size -- the sibling test above cannot see this
+    at all, because its fixture's digest (446 bytes) is far under the cap, so
+    the cap never binds and a regression to any larger value would go
+    undetected (reviewer_comprehensive, task 3268 amendment pass).
+    """
+    work_cwd = str(tmp_path / 'work')
+    cfg = load_config(_write_config(tmp_path, project_id='proj_a', cwd_prefixes=[work_cwd]))
+    projects_root = tmp_path / 'projects'
+    session_path = projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl'
+    _write_transcript(session_path, cwd=work_cwd, timestamp='2026-07-13T10:00:00Z')
+
+    caps = []
+
+    def recording_build(path, **kwargs):
+        caps.append(kwargs.get('max_bytes'))
+        return 'a digest'
+
+    # COST side: select_digest_sessions -> digest_byte_cost_fn, which
+    # resolves digest.build_digest at call time.
+    monkeypatch.setattr(nightly.sampling.digest, 'build_digest', recording_build)
+    selected = nightly.select_digest_sessions(cfg, projects_root, date(2026, 7, 13))
+    assert caps == [nightly.DEFAULT_MAX_DIGEST_BYTES], (
+        'the sampler must charge at the nightly cap, not at build_digest\'s own default'
+    )
+
+    # RENDER side: build_digests, called by run_nightly with no max_bytes
+    # override, must reach the renderer with that SAME cap.
+    caps.clear()
+    nightly.build_digests(selected, build=recording_build)
+    assert caps == [nightly.DEFAULT_MAX_DIGEST_BYTES]
 
 
 def test_select_digest_sessions_selects_multi_mb_session_under_stock_budget(tmp_path):
