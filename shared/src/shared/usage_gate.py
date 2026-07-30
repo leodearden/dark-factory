@@ -123,7 +123,16 @@ def _sweep_stale_probe_dirs_once() -> int:
     # on every subsequent gate construction.
     _probe_dir_sweep_done = True
     try:
-        return sweep_stale_pid_dirs(_PROBE_DIR_PREFIX)
+        reclaimed = sweep_stale_pid_dirs(_PROBE_DIR_PREFIX)
+        if reclaimed:
+            # Silent on the zero case so the steady state stays quiet; loud
+            # when there is something to say, so an operator can see the /tmp
+            # population draining rather than rebuilding.
+            logger.info(
+                'UsageGate: reclaimed %d stale probe config dir(s) under %s '
+                '(dead-PID sweep, task 3086)', reclaimed, _PROBE_DIR_PREFIX,
+            )
+        return reclaimed
     except OSError:
         logger.warning(
             'UsageGate: stale probe-dir sweep of %s failed — continuing without it '
