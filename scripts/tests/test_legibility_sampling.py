@@ -904,6 +904,83 @@ class TestMainCLI:
         assert 'zero-signal' in captured.err.lower()
         assert 'bytes used' in captured.err.lower()
 
+    def test_main_reports_real_digest_bytes_not_raw_transcript_bytes(self, tmp_path, capsys):
+        """The CLI acceptance surface and the nightly pipeline must never
+        disagree about what the budget was spent on.
+
+        ``main`` is the diagnostic an operator reads to decide whether the
+        budget is the reason a session was skipped, so its ``bytes used``
+        line has to be the same quantity ``nightly`` charges: the real
+        rendered digest bytes at ``DEFAULT_DIGEST_MAX_BYTES``.
+        """
+        from legibility import digest as digest_mod
+
+        projects_root = tmp_path / 'projects'
+        main_dir = projects_root / '-home-leo-src-dark-factory'
+        for session_id, first_turn in (
+            ('sess-1', 'Please help with X'), ('sess-2', 'Please help with Y'),
+        ):
+            _write_full_session(
+                main_dir, session_id, MAIN_CWD, '2026-07-13T09:00:00.000Z',
+                first_turn, include_tool_error=True,
+            )
+
+        config_path = tmp_path / 'legibility.yaml'
+        config_path.write_text(textwrap.dedent(f"""\
+            project_id: dark_factory
+            project_root: /home/leo/src/dark-factory
+            escalation_port: 8103
+            cwd_prefixes: [{MAIN_CWD}]
+            budgets: {{max_daily_digest_bytes: 300000}}
+            sampling: {{top_fraction: 0.12, per_stratum_min: 2}}
+            """))
+
+        ret = mod.main([
+            '--config', str(config_path),
+            '--projects-root', str(projects_root),
+            '--date', '2026-07-13',
+        ])
+        assert ret == 0
+
+        captured = capsys.readouterr()
+        selected = [
+            json.loads(line) for line in captured.out.splitlines() if line.strip()
+        ]
+        assert {Path(p['session']).stem for p in selected} == {'sess-1', 'sess-2'}
+
+        reported = next(
+            int(line.rsplit(':', 1)[1].split('/')[0].strip())
+            for line in captured.err.splitlines()
+            if 'bytes used' in line.lower()
+        )
+
+        expected = sum(
+            len(
+                digest_mod.build_digest(
+                    Path(entry['session']),
+                    agent_class_override=entry['stratum'],
+                    max_bytes=mod.DEFAULT_DIGEST_MAX_BYTES,
+                ).encode('utf-8')
+            )
+            for entry in selected
+        )
+        assert reported == expected
+
+        # The two WRONG bases really are distinguishable on this fixture, so
+        # the assertion above cannot pass by coincidence:
+        #   - raw transcript size (the original defect): 768 bytes measured
+        #   - the flat DEFAULT_DIGEST_MAX_BYTES estimate (the step-4
+        #     fallback, and what main reported before this wiring): 30_720
+        # against 744 real digest bytes. The flat-estimate margin is 41x;
+        # the raw-size margin on a 2-line fixture is only ~24 bytes (the
+        # digest's fixed frontmatter nearly equals the whole transcript at
+        # this size), so this asserts inequality rather than a fragile
+        # ordering — padding the fixture to widen that margin would instead
+        # saturate the 15KB cap and collapse the flat-estimate margin.
+        raw_total = sum(entry['size'] for entry in selected)
+        assert reported != raw_total
+        assert reported != len(selected) * mod.DEFAULT_DIGEST_MAX_BYTES
+
     def test_main_threads_resolved_archive_roots_into_enumerate(self, tmp_path, monkeypatch):
         # Wiring proof (no operator flip): main() resolves the config's
         # agent_transcript_roots against cfg.project_root and passes them to
