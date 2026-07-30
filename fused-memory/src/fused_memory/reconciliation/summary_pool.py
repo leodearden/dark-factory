@@ -27,6 +27,7 @@ import json
 import logging
 from datetime import UTC, datetime, timedelta
 
+from fused_memory.reconciliation.mem0_tombstone import record_mem0_deletion_tombstone
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord
 from fused_memory.utils.async_utils import gather_collect
 
@@ -122,6 +123,13 @@ async def enforce_summary_pool_cap(
     ``_enforce_stage2_summary_pool_cap``):
     - Enumeration failure → logs WARNING, returns 0, does NOT raise.
     - Individual delete failure → logs WARNING, excluded from count.
+
+    Every CONFIRMED-successful eviction leaves a queryable tombstone via
+    :func:`~fused_memory.reconciliation.mem0_tombstone.record_mem0_deletion_tombstone`
+    (task 3041), naming *trim_source* as the deleter and *run_id* as the
+    deleting run — deliberately distinct from the victim's own
+    ``metadata['run_id']``, which is also recorded. Written from the success
+    branch ONLY: a tombstone must never claim a record that is still alive.
 
     **Retention contract (task 3041).** Eviction order is
     ``(is_ledger_stamp, has_parseable_created_at, created_at)``:
@@ -241,6 +249,7 @@ async def enforce_summary_pool_cap(
     )
 
     success_count = 0
+    tombstone_writes = []
     for m, result in zip(to_delete, results, strict=True):
         if isinstance(result, Exception):
             logger.warning(
@@ -257,6 +266,33 @@ async def enforce_summary_pool_cap(
             )
         else:
             success_count += 1
+            # THIS is the path that consumed the three run-84eae9bd
+            # cycle_summary anchors reported by recon gate 165 / esc-165-1 —
+            # a designed cap-2 eviction that left no trace linking the
+            # deletion to its victim. The tombstone, NOT a retention change,
+            # is the fix for that finding's "no audit trail" signature: the
+            # eviction itself was correct and stays.
+            #
+            # Success branch ONLY: a tombstone must never claim a record that
+            # is still alive. record_mem0_deletion_tombstone is internally
+            # fail-safe (returns False, never raises); gathering the writes
+            # through gather_collect is a second belt so nothing here can
+            # raise out of, or alter the count of, this trim.
+            tombstone_writes.append(
+                record_mem0_deletion_tombstone(
+                    memory_service,
+                    project_id,
+                    m['id'],
+                    victim_metadata=m.get('metadata'),
+                    victim_created_at=m.get('created_at'),
+                    deleter=trim_source,
+                    deleting_run_id=run_id,
+                )
+            )
+
+    if tombstone_writes:
+        await gather_collect(tombstone_writes)
+
     return success_count
 
 
