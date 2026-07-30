@@ -633,6 +633,13 @@ def default_protected_prefixes(iact_prefix: str | None = None) -> dict[str, str]
             band that deployment never mints.
 
     Returns a fresh dict; mutating it cannot affect the module registry.
+
+    The bash bridge (``lane_protect_glob`` in
+    ``orchestrator/scripts/warm-lane/lib_lane_state.sh``) has no
+    :class:`GitOps` instance to ask, so it passes the deployment's band through
+    the ``REIFY_WARM_LANE_IACT_PREFIX`` environment variable.  Leaving it unset
+    there means the same thing as ``None`` here — the field default — which is
+    correct only for a deployment that did not rename its band.
     """
     # Declared str, not a rebind of the str|None parameter: FieldInfo.default is
     # typed Any, so assigning it back into `iact_prefix` widens the rendered key

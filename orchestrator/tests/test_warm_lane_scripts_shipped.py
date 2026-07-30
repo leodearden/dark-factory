@@ -209,7 +209,20 @@ def _stage_provision_script(repo: Path, *, git_init: bool) -> Path:
 #: that consulted git would then silently answer from the AMBIENT repo instead
 #: of the synthetic one, and the test would report coverage it does not have.
 #: Stripping them makes the synthetic repo the only repo in scope.
-_HOSTILE_ENV_KEYS = ('REIFY_WARM_LANE_MOUNT', 'GIT_DIR', 'GIT_WORK_TREE')
+#:
+#: ``REIFY_WARM_LANE_IACT_PREFIX`` joined the list with task 3074's amendment
+#: pass: it renames the interactive band ``lane_protect_glob`` renders, so an
+#: ambient value would silently change the glob that
+#: ``test_lane_state_lib.py``'s bridge cases compare against the value python
+#: computes in-process — a green result that only means both sides read the same
+#: stray environment.  Stripped here, in the ONE sanitizer both files share,
+#: rather than per-case.
+_HOSTILE_ENV_KEYS = (
+    'REIFY_WARM_LANE_MOUNT',
+    'REIFY_WARM_LANE_IACT_PREFIX',
+    'GIT_DIR',
+    'GIT_WORK_TREE',
+)
 
 
 def _sanitized_env(

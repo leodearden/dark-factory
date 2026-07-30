@@ -255,17 +255,80 @@ LANE_PROTECT_GLOB_FALLBACK='_merge-*,_solo-*,_substrate-gate-*,_merge-verify,_of
 # inside a worktrees dir — are exactly the failure modes a git-probing or
 # env-reading resolution hits. Resolved at SOURCE time, not per call, because
 # BASH_SOURCE is only reliable while this file is being sourced.
-_LANE_STATE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || \
+#
+# dirname by PARAMETER EXPANSION, not a `dirname` fork (same idiom and same
+# `*/*` guard as lane_state_read's). An external binary would make this
+# resolution silently depend on PATH, and a PATH without it does not error:
+# `$(dirname ...)` yields empty, `cd ""` SUCCEEDS as a no-op, and the lib dir
+# resolves to the CALLER'S CWD. `cd` and `pwd` are builtins, so this arithmetic
+# now needs nothing on PATH at all.
+_lane_state_src="${BASH_SOURCE[0]}"
+_lane_state_dir='.'
+case "$_lane_state_src" in
+    */*) _lane_state_dir="${_lane_state_src%/*}"
+         [ -n "$_lane_state_dir" ] || _lane_state_dir='/' ;;
+esac
+_LANE_STATE_LIB_DIR="$(cd "$_lane_state_dir" 2>/dev/null && pwd)" || \
     _LANE_STATE_LIB_DIR=''
-_LANE_STATE_REPO_ROOT="$(cd "${_LANE_STATE_LIB_DIR:-.}/../../.." 2>/dev/null && pwd)" || \
+unset _lane_state_src _lane_state_dir
+
+# No `:-.` fallback: an unresolved lib dir must yield an unresolved repo root,
+# NOT an ascent from whatever the caller's CWD happens to be. Ascending from the
+# CWD is how the "could not resolve" branch below became unreachable — it always
+# resolved to *something* — and how a wrong root got to look like a right one.
+if [ -n "$_LANE_STATE_LIB_DIR" ]; then
+    _LANE_STATE_REPO_ROOT="$(cd "$_LANE_STATE_LIB_DIR/../../.." 2>/dev/null && pwd)" || \
+        _LANE_STATE_REPO_ROOT=''
+else
     _LANE_STATE_REPO_ROOT=''
+fi
+
+# _LANE_STATE_ROOT_WITNESS — the file whose presence tells "this really is a
+# dark-factory checkout root" apart from "three levels above wherever this ran".
+#
+# The arithmetic above is PROBED, not trusted, because success is not evidence:
+# `cd ../../..` from a resolved lib dir essentially always succeeds whatever it
+# lands on. An empty _LANE_STATE_REPO_ROOT therefore catches only the narrow case
+# where the lib dir itself was unresolvable, and without this probe every OTHER
+# mis-resolution would surface as an opaque ImportError-driven degrade with no
+# hint of the real cause.
+#
+# It has to be probed rather than assumed because these scripts are explicitly
+# RELOCATABLE — GitOps `_project_script` prefers a project-local override copy —
+# so a copy deployed at a different depth points PYTHONPATH at an unrelated
+# directory.
+#
+# WHAT THIS DOES AND DOES NOT CATCH, precisely: it catches a resolved root that
+# is not a dark-factory checkout at all, and converts it into the one
+# attributable warning below. It does NOT catch a root that is a DIFFERENT
+# dark-factory checkout sitting at exactly this depth — that render would be
+# wrong-but-plausible with exit 0, the one outcome this lib's fail-loud contract
+# cannot detect. The probe narrows that hazard from "any directory three levels
+# up" to "another checkout at the same depth"; it does not eliminate it.
+_LANE_STATE_ROOT_WITNESS='orchestrator/src/orchestrator/git_ops.py'
 
 # The one-liner the bridge runs. ALL rendering policy lives in git_ops.py — the
-# bash side embeds only import-and-print, so there is nothing here that could
-# drift from the registry.
-_LANE_STATE_RENDER_PY='import sys
-from orchestrator.git_ops import render_protect_glob
-print(render_protect_glob(owned=sys.argv[1:]))'
+# bash side embeds only read-config, import and print, so there is nothing here
+# that could drift from the registry.
+#
+# THE INTERACTIVE BAND IS THE ONE REGISTRY KEY THAT IS NOT A CONSTANT. It is
+# `git.iact_prefix`, a per-deployment config value, so
+# `default_protected_prefixes()` with no argument renders that field's DEFAULT
+# `_iact-`. For a deployment that renamed its interactive band the default is
+# wrong in the dangerous direction — the glob would protect a band that
+# deployment never mints and OMIT the band it does, so a wired sweep could
+# reclaim live interactive worktrees. The caller therefore names it, in
+# REIFY_WARM_LANE_IACT_PREFIX: the sibling warm-lane scripts' one env namespace
+# (renaming that namespace wholesale is downstream leaf work, not this file's).
+#
+# `or None` is load-bearing rather than defensive: unset and EMPTY must both mean
+# "use the field default". An empty band token would otherwise render as an empty
+# element in the comma list, which a consumer splitting on `,` reads as a pattern
+# rather than as an absent one.
+_LANE_STATE_RENDER_PY='import os, sys
+from orchestrator.git_ops import default_protected_prefixes, render_protect_glob
+band = os.environ.get("REIFY_WARM_LANE_IACT_PREFIX") or None
+print(render_protect_glob(default_protected_prefixes(band), owned=sys.argv[1:]))'
 
 # lane_protect_glob [<owned>...]
 #
@@ -274,6 +337,10 @@ print(render_protect_glob(owned=sys.argv[1:]))'
 # sweep owns (a pool sweep passes `_lane- _spec-`; see
 # PROTECT_GLOB_OWNED_POOL_BANDS in git_ops.py for why omitting them is
 # load-bearing rather than cosmetic).
+#
+# The deployment's own interactive band is honoured via
+# REIFY_WARM_LANE_IACT_PREFIX (see _LANE_STATE_RENDER_PY above); unset means
+# dark-factory's `git.iact_prefix` field default.
 #
 # WHY THIS SHELLS OUT instead of scraping git_ops.py: five of the eleven
 # registry keys are computed constants (PERSISTENT_MERGE_WORKTREE_NAME,
@@ -284,6 +351,20 @@ print(render_protect_glob(owned=sys.argv[1:]))'
 # the only faithful read. It costs one interpreter start per INVOCATION (not per
 # lane), against the ~1.9s per lane warm-lane-gc.sh already pays for its /proc
 # liveness scan.
+#
+# WHICH INTERPRETER, and why the checkout's own venv is preferred over PATH: the
+# bridge imports orchestrator.git_ops, which transitively imports
+# orchestrator.config and hence pydantic, so a dependency-less system
+# interpreter CANNOT run it. Under `PATH=/usr/bin:/bin` — the shape a systemd
+# unit's PATH actually has, and this lib's stated invocation path — that import
+# raises ModuleNotFoundError and the bridge would warn and degrade on EVERY
+# sweep: permanently reduced to the static fallback while training operators to
+# ignore `[warn]`, which is the worst of both halves of the contract.
+# <root>/.venv is not merely an available interpreter, it is the RIGHT one — the
+# venv of the same checkout whose orchestrator/src the bridge puts on PYTHONPATH,
+# and the one the orchestrator process itself runs from. PATH `python3` remains
+# the fallback for a checkout with no in-tree venv (a fresh clone before
+# `uv sync`), where a capable PATH interpreter is the only candidate left.
 #
 # FAILS LOUD, AND NEVER ANSWERS EMPTY. On a missing/broken python3, a non-zero
 # exit, or an empty render, this prints NOTHING on stdout, emits exactly ONE
@@ -296,12 +377,23 @@ print(render_protect_glob(owned=sys.argv[1:]))'
 #
 #     glob="$(lane_protect_glob _lane- _spec-)" || glob="$LANE_PROTECT_GLOB_FALLBACK"
 #
-# Both shipped callers run `set -euo pipefail`, so a caller that FORGETS the
-# `||` aborts on the non-zero return rather than sweeping with an empty glob.
+# NOTE: as of leaf β there is NO in-tree consumer — this function and
+# LANE_PROTECT_GLOB_FALLBACK ship ahead of the caller that uses them. The
+# intended callers (warm-lane-gc.sh / warm-lane-gc-sweep.sh, wired by leaf γ,
+# which owns those files) run `set -euo pipefail`, so a caller that FORGETS the
+# `||` will abort on the non-zero return rather than sweep with an empty glob.
+# That is a property of γ's wiring, not something validated in situ here.
 lane_protect_glob() {
-    if [ -z "$_LANE_STATE_REPO_ROOT" ]; then
-        printf '[warn]  lane_protect_glob DEGRADED: could not resolve the repo root from %s — python3 cannot be pointed at orchestrator/src, so no protect glob was rendered. Callers must fall back to LANE_PROTECT_GLOB_FALLBACK.\n' \
-            "${_LANE_STATE_LIB_DIR:-<unresolved lib dir>}" >&2
+    # One guard for both root failures — an unresolvable root and a resolved root
+    # that is not a dark-factory checkout are the same thing to a caller
+    # (PYTHONPATH cannot be aimed at orchestrator/src), and naming both the
+    # witness and the resolved path makes either diagnosable from the one line.
+    if [ -z "$_LANE_STATE_REPO_ROOT" ] \
+        || [ ! -f "$_LANE_STATE_REPO_ROOT/$_LANE_STATE_ROOT_WITNESS" ]; then
+        printf '[warn]  lane_protect_glob DEGRADED: no dark-factory checkout at the repo root resolved from %s (resolved %s, which has no %s) — python3 cannot be pointed at orchestrator/src, so no protect glob was rendered. Callers must fall back to LANE_PROTECT_GLOB_FALLBACK.\n' \
+            "${_LANE_STATE_LIB_DIR:-<unresolved lib dir>}" \
+            "${_LANE_STATE_REPO_ROOT:-<unresolved repo root>}" \
+            "$_LANE_STATE_ROOT_WITNESS" >&2
         return 1
     fi
 
@@ -311,15 +403,22 @@ lane_protect_glob() {
     local pypath="$_LANE_STATE_REPO_ROOT/orchestrator/src:$_LANE_STATE_REPO_ROOT/shared/src:$_LANE_STATE_REPO_ROOT/escalation/src"
     [ -z "${PYTHONPATH:-}" ] || pypath="$pypath:$PYTHONPATH"
 
+    # This checkout's own venv first, PATH second — see the header above for why
+    # a bare system interpreter cannot run the import at all. `-x`, not `-f`: a
+    # present-but-unexecutable venv interpreter is not a candidate.
+    local py="$_LANE_STATE_REPO_ROOT/.venv/bin/python3"
+    [ -x "$py" ] || py='python3'
+
     local rendered='' rc=0
     # `|| rc=$?` rather than an unguarded call: this function must not abort a
     # `set -e` caller from INSIDE the bridge — the caller decides what a failed
     # render means, and it can only decide if it gets the return value.
-    rendered="$(PYTHONPATH="$pypath" python3 -c "$_LANE_STATE_RENDER_PY" "$@" 2>/dev/null)" \
+    rendered="$(PYTHONPATH="$pypath" "$py" -c "$_LANE_STATE_RENDER_PY" "$@" 2>/dev/null)" \
         || rc=$?
 
     if [ "$rc" -ne 0 ] || [ -z "$rendered" ]; then
-        printf '[warn]  lane_protect_glob DEGRADED: python3 -c "from orchestrator.git_ops import render_protect_glob" %s (PYTHONPATH rooted at %s) — no protect glob was rendered, so callers must fall back to LANE_PROTECT_GLOB_FALLBACK. Check that python3 is on PATH for this unit and that the checkout is intact.\n' \
+        printf '[warn]  lane_protect_glob DEGRADED: %s -c "from orchestrator.git_ops import render_protect_glob" %s (PYTHONPATH rooted at %s) — no protect glob was rendered, so callers must fall back to LANE_PROTECT_GLOB_FALLBACK. Check that this interpreter exists and can import the orchestrator package, and that the checkout is intact.\n' \
+            "$py" \
             "$([ "$rc" -ne 0 ] && printf 'exited %s' "$rc" || printf 'printed nothing')" \
             "$_LANE_STATE_REPO_ROOT" >&2
         return 1

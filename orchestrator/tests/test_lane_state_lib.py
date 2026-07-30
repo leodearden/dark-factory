@@ -970,6 +970,75 @@ def _warn_lines(stderr: str) -> list[str]:
     return [line for line in stderr.splitlines() if line.lstrip().startswith('[warn]')]
 
 
+#: The lib's own in-tree interpreter preference, resolved the same way it does.
+#: ``WARM_LANE_SCRIPT_DIR`` is ``<root>/orchestrator/scripts/warm-lane``.
+_REPO_ROOT = WARM_LANE_SCRIPT_DIR.parent.parent.parent
+_IN_TREE_PYTHON = _REPO_ROOT / '.venv' / 'bin' / 'python3'
+
+#: A checkout with no ``.venv`` is a real configuration (a fresh clone before
+#: ``uv sync``), but this one is NOT guaranteed to have one, so the cases that
+#: turn on its presence skip rather than assert a host property.
+_needs_in_tree_venv = pytest.mark.skipif(
+    not _IN_TREE_PYTHON.is_file(),
+    reason='no in-tree .venv/bin/python3 in this checkout',
+)
+
+
+def _system_python_lacks_deps() -> bool:
+    """Is ``/usr/bin/python3`` a REAL interpreter that cannot import pydantic?
+
+    The middle case between the two shapes the other bridge cases cover — the
+    fully-capable venv interpreter, and a stub that is not an interpreter at
+    all.  It is the shape a ``systemd`` unit with a bare ``PATH=/usr/bin:/bin``
+    actually gets, and the one that used to reduce the bridge to its static
+    fallback on every sweep.
+    """
+    system = Path('/usr/bin/python3')
+    if not system.is_file():
+        return False
+    probe = subprocess.run(
+        [str(system), '-c', 'import pydantic'],
+        capture_output=True, text=True, timeout=60,
+    )
+    return probe.returncode != 0
+
+
+def _rootless_checkout(tmp_path: Path, *, witness: bool = True) -> Path:
+    """A synthetic repo root: real ``src`` trees, and deliberately NO ``.venv``.
+
+    The three ``src`` roots are SYMLINKED to this checkout's own rather than
+    copied, so the only thing that differs from the real root is the absence of
+    an in-tree interpreter — which is what makes a stubbed ``PATH`` govern the
+    bridge again.  Without this the venv preference (rightly) wins and the stub
+    is never consulted, so the fail-loud cases would pass vacuously.
+
+    Cases point the SHIPPED lib at this root by assigning
+    ``_LANE_STATE_REPO_ROOT`` after sourcing.  That is the one white-box reach
+    in this file, and it is deliberate: the alternative is a fixture COPY of the
+    library, and every case here exists to exercise the bytes that ship.
+
+    With *witness* false the root carries no ``orchestrator/src`` at all — "the
+    path arithmetic landed somewhere that is not a dark-factory checkout".
+    """
+    root = tmp_path / 'synthetic-checkout'
+    root.mkdir(parents=True, exist_ok=True)
+    if witness:
+        for package in ('orchestrator', 'shared', 'escalation'):
+            (root / package).mkdir(exist_ok=True)
+            (root / package / 'src').symlink_to(_REPO_ROOT / package / 'src')
+    assert not (root / '.venv').exists()
+    return root
+
+
+def _at_root(root: Path | str, snippet: str) -> str:
+    """*snippet*, run against a lib whose repo root has been repointed.
+
+    *root* is taken as a raw string, so ``''`` expresses "the resolution
+    produced nothing" — ``Path('')`` would quietly become ``'.'``.
+    """
+    return f'_LANE_STATE_REPO_ROOT={shlex.quote(str(root))}\n{snippet}'
+
+
 class TestLaneProtectGlobBridge:
     """``lane_protect_glob`` is the "readable from bash" half of this leaf.
 
@@ -1035,10 +1104,15 @@ class TestLaneProtectGlobBridge:
         proceed unprotected) and leaves exactly ONE attributable ``[warn]``
         line, the same warn-loud/fail-open stance ``_live_refs_env_probe``
         already established in this directory.
+
+        Run against a venv-less synthetic root, because a stubbed ``PATH`` alone
+        no longer breaks the bridge: the in-tree interpreter is preferred and
+        would (correctly) render right past the stub, so these cases would pass
+        while exercising nothing.
         """
         stub = _stub_path_dir(tmp_path, 'python3', body=body)
         proc = _run_sourced(
-            'lane_protect_glob _lane- _spec-',
+            _at_root(_rootless_checkout(tmp_path), 'lane_protect_glob _lane- _spec-'),
             cwd=tmp_path,
             env=_sanitized_env(extra={'PATH': str(stub)}),
             timeout=_BRIDGE_TIMEOUT,
@@ -1051,6 +1125,221 @@ class TestLaneProtectGlobBridge:
         warns = _warn_lines(proc.stderr)
         assert len(warns) == 1, f'{label}: expected exactly one [warn], got {warns!r}'
         assert 'python3' in warns[0], f'{label}: warning does not name the stage: {warns[0]!r}'
+
+    def test_without_an_in_tree_venv_it_falls_back_to_path_python3(
+        self, tmp_path: Path,
+    ) -> None:
+        """The venv is a PREFERENCE, not a requirement.
+
+        A checkout that has not been ``uv sync``'d has no in-tree interpreter,
+        and a capable ``PATH`` ``python3`` is then the only candidate left.  This
+        also pins that the synthetic root the fail-loud cases above run against
+        is faithful: the bridge works there whenever an interpreter does, so
+        those cases fail for the reason they name and not because the root is
+        broken.
+        """
+        from orchestrator.git_ops import (
+            PROTECT_GLOB_OWNED_POOL_BANDS,
+            render_protect_glob,
+        )
+
+        proc = _run_sourced(
+            _at_root(_rootless_checkout(tmp_path), 'lane_protect_glob _lane- _spec-'),
+            cwd=tmp_path,
+            timeout=_BRIDGE_TIMEOUT,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == render_protect_glob(
+            owned=PROTECT_GLOB_OWNED_POOL_BANDS,
+        )
+        assert _warn_lines(proc.stderr) == [], proc.stderr
+
+    @_needs_in_tree_venv
+    def test_the_in_tree_venv_is_preferred_over_a_hostile_path_python3(
+        self, tmp_path: Path,
+    ) -> None:
+        """A ``PATH`` interpreter that cannot do the job must not win.
+
+        The preference is stated as "prefer the venv", so the pin has to be a
+        ``PATH`` ``python3`` that WOULD fail if it were consulted — a mere
+        absent one would also pass under a "PATH first, venv second" order and
+        prove nothing about which came first.
+        """
+        from orchestrator.git_ops import (
+            PROTECT_GLOB_OWNED_POOL_BANDS,
+            render_protect_glob,
+        )
+
+        stub = _stub_path_dir(tmp_path, 'python3', body='#!/bin/sh\nexit 1\n')
+        proc = _run_sourced(
+            'lane_protect_glob _lane- _spec-',
+            cwd=tmp_path,
+            env=_sanitized_env(extra={'PATH': str(stub)}),
+            timeout=_BRIDGE_TIMEOUT,
+        )
+        assert proc.returncode == 0, (
+            'the bridge consulted the hostile PATH python3 instead of the '
+            f'in-tree venv: {proc.stderr}'
+        )
+        assert proc.stdout.strip() == render_protect_glob(
+            owned=PROTECT_GLOB_OWNED_POOL_BANDS,
+        )
+        assert _warn_lines(proc.stderr) == [], proc.stderr
+
+    @_needs_in_tree_venv
+    @pytest.mark.skipif(
+        not _system_python_lacks_deps(),
+        reason='/usr/bin/python3 is absent or can already import pydantic',
+    )
+    def test_a_dependency_less_system_interpreter_does_not_degrade_the_sweep(
+        self, tmp_path: Path,
+    ) -> None:
+        """The realistic middle case: a REAL interpreter without the deps.
+
+        ``PATH=/usr/bin:/bin`` is the shape a ``systemd`` unit's environment
+        actually has, and this lib's stated invocation paths (the audit timer,
+        the disk-pressure sweep) run there.  ``orchestrator.git_ops``
+        transitively imports pydantic, so that interpreter raises
+        ``ModuleNotFoundError`` — which used to warn and degrade to the static
+        fallback on EVERY sweep: permanently reduced while teaching operators
+        that ``[warn]`` is noise.  Preferring the in-tree venv makes the same
+        environment render authoritatively.
+        """
+        from orchestrator.git_ops import (
+            PROTECT_GLOB_OWNED_POOL_BANDS,
+            render_protect_glob,
+        )
+
+        proc = _run_sourced(
+            'lane_protect_glob _lane- _spec-',
+            cwd=tmp_path,
+            env=_sanitized_env(extra={'PATH': '/usr/bin:/bin'}),
+            timeout=_BRIDGE_TIMEOUT,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == render_protect_glob(
+            owned=PROTECT_GLOB_OWNED_POOL_BANDS,
+        )
+        assert _warn_lines(proc.stderr) == [], proc.stderr
+
+    def test_a_root_that_is_not_a_dark_factory_checkout_degrades_loudly(
+        self, tmp_path: Path,
+    ) -> None:
+        """Wrong root -> ONE attributable warning, never a plausible answer.
+
+        These scripts are relocatable (``GitOps._project_script`` prefers a
+        project-local override copy), so a copy deployed at a different depth
+        aims the three-levels-up arithmetic at an unrelated directory.  ``cd``
+        succeeds on almost anything, so the resolution cannot self-report — it
+        has to be probed against a witness file.  Degrading here is the whole
+        point: a glob rendered from SOMEONE ELSE'S registry, returned with exit
+        0, is authoritative-looking wrong data.
+        """
+        root = _rootless_checkout(tmp_path, witness=False)
+        proc = _run_sourced(
+            _at_root(root, 'lane_protect_glob _lane- _spec-'),
+            cwd=tmp_path,
+            timeout=_BRIDGE_TIMEOUT,
+        )
+        assert proc.returncode != 0, proc.stdout
+        assert proc.stdout.strip() == ''
+        warns = _warn_lines(proc.stderr)
+        assert len(warns) == 1, warns
+        assert 'orchestrator/src/orchestrator/git_ops.py' in warns[0], warns[0]
+        assert str(root) in warns[0], warns[0]
+
+    def test_an_unresolvable_repo_root_degrades_loudly(self, tmp_path: Path) -> None:
+        """The empty-root branch is REACHABLE, and says which resolution failed.
+
+        It only became reachable once the resolution stopped falling back to an
+        ascent from the caller's CWD: that fallback answered *something* for
+        every input, so a genuinely unresolvable lib dir used to surface as a
+        wrong root rather than as no root.
+        """
+        proc = _run_sourced(
+            _at_root('', 'lane_protect_glob'),
+            cwd=tmp_path,
+            timeout=_BRIDGE_TIMEOUT,
+        )
+        assert proc.returncode != 0, proc.stdout
+        assert proc.stdout.strip() == ''
+        warns = _warn_lines(proc.stderr)
+        assert len(warns) == 1, warns
+        assert '<unresolved repo root>' in warns[0], warns[0]
+
+    def test_a_path_without_dirname_still_resolves_the_repo_root(
+        self, tmp_path: Path,
+    ) -> None:
+        """Source-time resolution must not depend on anything being on ``PATH``.
+
+        ``$(dirname ...)`` would be an external binary, and a ``PATH`` without it
+        does NOT error: the substitution yields empty, ``cd ""`` succeeds as a
+        no-op, and the lib dir silently becomes the CALLER'S CWD — a wrong root
+        that ``cd`` and the witness probe may both accept when the caller happens
+        to be sitting in another checkout.  ``cd``/``pwd`` are builtins, so the
+        arithmetic needs nothing external.
+        """
+        empty = _stub_path_dir(tmp_path, 'nothing-here')
+        proc = _run_sourced(
+            'printf \'%s\\n\' "$_LANE_STATE_LIB_DIR" "$_LANE_STATE_REPO_ROOT"',
+            cwd=tmp_path,
+            env=_sanitized_env(extra={'PATH': str(empty)}),
+        )
+        assert proc.returncode == 0, proc.stderr
+        lib_dir, repo_root = proc.stdout.split()
+        assert Path(lib_dir) == WARM_LANE_SCRIPT_DIR, proc.stdout
+        assert Path(repo_root) == _REPO_ROOT, proc.stdout
+
+
+class TestLaneProtectGlobHonoursTheConfiguredIactBand:
+    """The ``_iact-`` band is CONFIG, and the bridge must read the config one.
+
+    Every other registry key is a constant, so rendering them from
+    ``PROTECTED_PREFIXES`` cannot be wrong.  ``git.iact_prefix`` can: a
+    deployment that renames its interactive band and gets the FIELD DEFAULT
+    rendered instead receives a glob that protects a band it never mints and
+    omits the band it does — so once leaf γ wires the sweep, the reaper could
+    reclaim live interactive worktrees.  ``REIFY_WARM_LANE_IACT_PREFIX`` is how
+    the caller names it (the sibling scripts' one env namespace).
+    """
+
+    def test_an_overridden_band_reaches_the_bash_render(self, tmp_path: Path) -> None:
+        proc = _run_sourced(
+            'lane_protect_glob _lane- _spec-',
+            cwd=tmp_path,
+            env=_sanitized_env(extra={'REIFY_WARM_LANE_IACT_PREFIX': '_int-'}),
+            timeout=_BRIDGE_TIMEOUT,
+        )
+        assert proc.returncode == 0, proc.stderr
+        rendered = proc.stdout.strip().split(',')
+        assert '_int-*' in rendered, rendered
+        # REPLACES rather than adds: protecting a band this deployment never
+        # mints is the other half of the same mistake.
+        assert '_iact-*' not in rendered, rendered
+
+    def test_an_empty_override_falls_back_to_the_field_default(
+        self, tmp_path: Path,
+    ) -> None:
+        """Empty means "unset", not "a band whose name is empty".
+
+        An empty token would render as an empty element in the comma list, which
+        a consumer splitting on ``,`` reads as a pattern rather than as an absent
+        one — and an empty pattern is not a harmless no-op to every glob
+        implementation.  An exported-but-empty variable is the ordinary shape of
+        an unset one in a systemd unit or a wrapper script, so this is the
+        default path, not an edge case.
+        """
+        from orchestrator.git_ops import render_protect_glob
+
+        proc = _run_sourced(
+            'lane_protect_glob',
+            cwd=tmp_path,
+            env=_sanitized_env(extra={'REIFY_WARM_LANE_IACT_PREFIX': ''}),
+            timeout=_BRIDGE_TIMEOUT,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == render_protect_glob()
+        assert '' not in proc.stdout.strip().split(','), proc.stdout
 
 
 # ---------------------------------------------------------------------------
