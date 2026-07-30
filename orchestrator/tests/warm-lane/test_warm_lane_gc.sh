@@ -81,7 +81,10 @@
 #       and the appended preserved_assigned= counter; S-fallback pins that the
 #       task-5572 /proc scan is INHERITED as the recordless fallback (PRD D7),
 #       that released/quarantined/corrupt all fall OPEN, and that a corrupt
-#       record is loud while the ordinary recordless case stays quiet
+#       record is loud while the ordinary recordless case stays quiet;
+#       S-toctou pins PLACEMENT — a lane assigned MID-PASS is still preserved,
+#       so the read cannot be hoisted into an up-front classification pass
+#       without going RED (GREEN on arrival, like Block R)
 #
 # The former Tier-3 blocks I/J/L (terminal-task reclaim + Pass-2 boundary,
 # task 5167) were deleted when task 5326 collapsed the Pass-1 gate to the
@@ -2189,6 +2192,99 @@ assert "S19: summary reset=3 with the preserve attributed to the /proc gate, not
 kill "$SF_HELPER_PID" 2>/dev/null || true
 wait "$SF_HELPER_PID" 2>/dev/null || true
 _BGPIDS=()  # clear so EXIT cleanup does not re-kill a possibly-reused PID
+
+# ── S-toctou: the up-front-snapshot TOCTOU (B2, INV-3) ───────────────────────
+# PLACEMENT test, not a record-reading test. BOTH lanes read `released` when the
+# pass starts, so ANY implementation that snapshots the state dir up front — a
+# precomputed map, an `--assigned-lanes CSV`, a hoisted read — classifies both
+# as reclaimable and resets both. It goes GREEN only when the read runs per
+# lane, from THIS lane's own path, immediately before that lane's reset.
+#
+# That is not a theoretical failure mode: it is exactly what
+# warm-lane-gc-sweep.sh's protect CSV did. It was computed once and consumed
+# across a sweep that ran 06:32-06:59 BST while _lane-5 dropped out of the
+# protect set at 06:32 (PRD §2).
+#
+# Mechanism, mirroring P-toctou: gc.sh invokes --seed-script SYNCHRONOUSLY
+# inside the Pass-1 loop, and bash `*/` glob expansion is LC_COLLATE-sorted, so
+# _lane-1 is ALWAYS visited before _lane-2. The ordering is RELIED UPON, not
+# incidental. _lane-1's stub therefore overwrites _lane-2's record — the only
+# place in a hermetic bash test that provably runs between one lane's reset and
+# the next lane's gate.
+#
+# Expected disposition: GREEN ON ARRIVAL, because step-2 already placed the read
+# inside the loop — recorded here the way Block R records its own. Its job is to
+# go RED against any LATER optimisation that hoists the read into an up-front
+# classification pass, which is precisely what PRD D5 forbids.
+ST_ROOT="$(mktemp -d /tmp/test-gc-st-XXXXXX)"
+_TMPDIRS+=("$ST_ROOT")
+
+ST_REPO="$ST_ROOT/repo"
+ST_WORKTREES="$ST_ROOT/worktrees"
+ST_BASE="$ST_ROOT/base"
+mkdir -p "$ST_WORKTREES" "$ST_BASE"
+
+make_repo "$ST_REPO"
+
+mkdir -p "$ST_BASE/target.gen.1"
+touch "$ST_BASE/target.gen.1.lock"
+ln -sfn "$ST_BASE/target.gen.1" "$ST_BASE/target"
+
+for _st_name in _lane-1 _lane-2; do
+    git -C "$ST_REPO" worktree add -q "$ST_WORKTREES/$_st_name"
+    mkdir -p "$ST_WORKTREES/$_st_name/target"
+    touch "$ST_WORKTREES/$_st_name/target/DIVERGENT_MARKER"
+done
+
+# Both FREE at pass start.
+make_lane_state "$ST_WORKTREES" _lane-1 released
+make_lane_state "$ST_WORKTREES" _lane-2 released
+
+ST_SEED_LOG="$ST_ROOT/seed_calls.log"
+ST_SEED_STUB="$ST_ROOT/seed_stub.sh"
+
+# The trigger stub: behaves like _seed_stub_body for every lane, and
+# ADDITIONALLY, when invoked for _lane-1, reassigns _lane-2 before returning.
+# The record is written in the SAME byte shape make_lane_state emits, so the
+# fixture and the mid-pass mutation cannot disagree about the record format.
+cat > "$ST_SEED_STUB" << 'STUB_EOF'
+#!/usr/bin/env bash
+echo "$*" >> "$SEED_LOG"
+LANE_DIR="$2"
+rm -rf "$LANE_DIR/target/DIVERGENT_MARKER" 2>/dev/null || true
+if [ "${LANE_DIR##*/}" = "_lane-1" ]; then
+    printf '{\n  "state": "assigned",\n  "task_id": "%s",\n  "title": "lane fixture task %s",\n  "branch": null,\n  "seeded_from_sha": null,\n  "updated_at": "2026-07-26T12:43:10.704531+00:00"\n}' \
+        "$TOCTOU_TASK_ID" "$TOCTOU_TASK_ID" \
+        > "$TOCTOU_STATE_DIR/_lane-2.json"
+fi
+exit 0
+STUB_EOF
+chmod +x "$ST_SEED_STUB"
+
+export SEED_LOG="$ST_SEED_LOG"
+export TOCTOU_STATE_DIR="$ST_WORKTREES/.lane-state"
+export TOCTOU_TASK_ID="5334"
+
+run_helper reclaim \
+    --worktrees-dir "$ST_WORKTREES" \
+    --base-target "$ST_BASE/target" \
+    --seed-script "$ST_SEED_STUB" \
+    --main-ref main
+
+unset TOCTOU_STATE_DIR TOCTOU_TASK_ID
+
+# Non-vacuity: without S20 the whole sub-case could pass because the stub never
+# ran and the mutation never fired.
+assert "S20: trigger lane _lane-1 WAS reset (the stub ran, so the mutation fired)" \
+    bash -c 'grep -q "_lane-1" "$1" && [ ! -f "$2" ]' _ \
+    "$ST_SEED_LOG" "$ST_WORKTREES/_lane-1/target/DIVERGENT_MARKER"
+assert "S21: _lane-2 assigned MID-PASS is still preserved (no up-front snapshot)" \
+    bash -c '[ -f "$1" ] && ([ ! -f "$2" ] || ! grep -q "_lane-2" "$2")' _ \
+    "$ST_WORKTREES/_lane-2/target/DIVERGENT_MARKER" "$ST_SEED_LOG"
+assert "S22: ...and preserved for the RIGHT reason (the record, read at gate time)" \
+    bash -c 'printf "%s\n" "$1" | grep -qF "preserving _lane-2: assigned to task 5334"' _ "$ERR_OUT"
+assert "S23: summary reset=1 with the preserve attributed to the record gate" \
+    bash -c 'printf "%s\n" "$1" | grep -qE "reset=1 .*preserved_assigned=1"' _ "$OUT"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Block TRASH: shared-trash litter guard (task 5612). Two asserts, deliberately
