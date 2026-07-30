@@ -597,6 +597,26 @@ def advance_census_state(
 # render_report — dated plans/confusion-census-<date>.md markdown assembly
 # ---------------------------------------------------------------------------
 
+@dataclass
+class VerifyCoverage:
+    """Coverage record for the operator verify cap (``--max-verify-clusters``).
+
+    ``novel`` is how many novel clusters this run's mining actually
+    produced; ``verified`` is how many of them were handed to ``verify_fn``
+    (one Sonnet call each -- the cost being bounded); ``cap`` is the
+    operator cap that produced the split. The ``novel - verified``
+    remainder is DEFERRED, not dropped: those clusters still merge into
+    the codebook as ``pending`` candidates via the untouched
+    ``codebook.apply_coding_record`` path (which consumes raw mining
+    records, not verified clusters), so a later census picks them up
+    exactly as designed. ``None`` in place of this record means no verify
+    cap was used and no ``## Verification`` section is rendered."""
+
+    novel: int
+    verified: int
+    cap: int | None = None
+
+
 def render_report(
     *,
     date: str,
@@ -607,6 +627,7 @@ def render_report(
     synthesis_md: str,
     filed_task_ids: list[str],
     cost_note: str,
+    verify_coverage: VerifyCoverage | None = None,
 ) -> str:
     """Assemble the dated census report as markdown, purely from the
     pieces passed in -- no clock, no model call, no I/O. *date* and every
@@ -656,6 +677,18 @@ def render_report(
             f"  - batch {stats.index}: dup_rate={stats.dup_rate:.2f} "
             f"(total={stats.total}, succeeded={stats.succeeded}, failed={stats.failed}, "
             f"saturated={stats.saturated})"
+        )
+
+    if verify_coverage is not None:
+        deferred = verify_coverage.novel - verify_coverage.verified
+        lines.append("")
+        lines.append("## Verification")
+        lines.append("")
+        lines.append(
+            f"- verified {verify_coverage.verified} of {verify_coverage.novel} novel "
+            f"clusters (operator verify cap: {verify_coverage.cap}); {deferred} deferred "
+            "as pending candidates -- merged into the codebook by this run but NOT "
+            "verified; adjudication deferred to a later census."
         )
 
     lines.append("")
