@@ -961,16 +961,20 @@ class TestJudgeCooldownExpired:
 
 @pytest.mark.asyncio
 async def test_call_judge_cli_delegates_to_invoke_with_cap_retry(mock_journal):
-    """_call_judge_cli delegates to invoke_with_cap_retry (no output_schema — free-form text).
+    """_call_judge_cli delegates to invoke_with_cap_retry, carrying the verdict schema.
 
     Verifies the essential delegation contract: prompt, system_prompt, model,
-    usage_gate, and timeout are wired through correctly.  Fine-grained knobs
-    (max_turns, permission_mode, disallowed_tools) are implementation details
-    covered by shared/tests/test_cli_invoke.py.
+    usage_gate, output_schema, and timeout are wired through correctly.
+    Fine-grained knobs (max_turns, permission_mode, disallowed_tools) are
+    implementation details covered by shared/tests/test_cli_invoke.py and, for
+    the schema-carrying invariants specifically, by
+    test_call_judge_cli_passes_judge_verdict_schema below.
     """
     from unittest.mock import AsyncMock
 
     from shared.cli_invoke import AgentResult
+
+    from fused_memory.reconciliation.judge import JUDGE_VERDICT_SCHEMA
 
     fake_gate = make_gate_mock()
     config = _make_judge_config(
@@ -982,6 +986,7 @@ async def test_call_judge_cli_delegates_to_invoke_with_cap_retry(mock_journal):
     fake_result = AgentResult(
         success=True,
         output='{"severity": "ok", "findings": []}',
+        structured_output={'severity': 'ok', 'findings': []},
         session_id='jsess-1',
     )
 
@@ -1004,7 +1009,7 @@ async def test_call_judge_cli_delegates_to_invoke_with_cap_retry(mock_journal):
     assert call_kwargs['system_prompt'] == JUDGE_SYSTEM_PROMPT
     assert call_kwargs['model'] == config.judge_llm_model
     assert call_kwargs['timeout_seconds'] == float(config.judge_cli_timeout_seconds)
-    assert 'output_schema' not in call_kwargs  # judge output is free-form, no schema
+    assert call_kwargs['output_schema'] is JUDGE_VERDICT_SCHEMA
     assert call_kwargs['cwd'] == Path(config.explore_codebase_root)
 
     # usage_gate may be positional or keyword — accept either
@@ -1014,6 +1019,90 @@ async def test_call_judge_cli_delegates_to_invoke_with_cap_retry(mock_journal):
         assert call_positional[0] is fake_gate
 
     assert result == '{"severity": "ok", "findings": []}'
+
+
+@pytest.mark.asyncio
+async def test_call_judge_cli_passes_judge_verdict_schema(mock_journal):
+    """The judge's verdict contract rides ``output_schema``, not the system prompt.
+
+    This is the whole point of the migration: ``build_claude_argv`` emits
+    ``--json-schema`` UNCONDITIONALLY (cli_invoke.py:1552-1553) while it drops
+    ``--system-prompt-file`` on the resume path (:1501-1503).  A prose-only
+    contract is therefore droppable across a cap-retry resume; a schema-carried
+    one is not.  Pinned here at the invocation boundary:
+
+    - ``output_schema is JUDGE_VERDICT_SCHEMA`` — the contract is attached.
+    - ``disallowed_tools == ['*']`` — the judge keeps passing the wildcard
+      VERBATIM.  Expanding it into the ``StructuredOutput``-preserving
+      real-builtins deny-list is cli_invoke's job (:1533-1536), not the
+      caller's, so the judge inherits future central fixes instead of pinning a
+      stale copy of the CLI's built-in list.
+    - ``max_turns >= 3`` — the schema mechanism burns a tool-use turn, so
+      ``max_turns=1`` is incompatible with ``--json-schema``
+      (task_curator.py:2366-2372); 3 is the floor both migrated siblings use.
+    - ``system_prompt`` is unchanged — JUDGE_SYSTEM_PROMPT's "## Output Format"
+      block stays because it is the ONLY output contract the anthropic/openai
+      provider branches have (they never see ``--json-schema``).
+    """
+    from unittest.mock import AsyncMock
+
+    from shared.cli_invoke import AgentResult
+
+    from fused_memory.reconciliation.judge import JUDGE_VERDICT_SCHEMA
+
+    fake_gate = make_gate_mock()
+    config = _make_judge_config(
+        judge_llm_provider='claude_cli',
+        judge_llm_model='claude-sonnet-4-5',
+    )
+    judge = Judge(config=config, journal=mock_journal, usage_gate=fake_gate)
+
+    fake_result = AgentResult(
+        success=True,
+        output='',
+        structured_output={'severity': 'ok', 'findings': []},
+        session_id='jsess-1',
+    )
+
+    with patch(
+        'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+        new_callable=AsyncMock,
+        return_value=fake_result,
+    ) as mock_invoke:
+        await judge._call_judge_cli('Evaluate this run.')
+
+    call_kwargs = mock_invoke.call_args.kwargs
+    assert call_kwargs['output_schema'] is JUDGE_VERDICT_SCHEMA
+    assert call_kwargs['disallowed_tools'] == ['*']
+    assert call_kwargs['max_turns'] >= 3, (
+        'max_turns=1 is incompatible with --json-schema: the schema mechanism '
+        'burns a tool-use turn and the CLI returns error_max_turns even when '
+        'the payload is attached (task_curator.py:2366-2372)'
+    )
+    assert call_kwargs['system_prompt'] == JUDGE_SYSTEM_PROMPT
+
+
+def test_judge_verdict_schema_shape():
+    """JUDGE_VERDICT_SCHEMA matches the verdict the judge is asked to produce.
+
+    The severity enum is asserted against ``VerdictSeverity`` itself (not a
+    hand-typed literal list) so schema and enum cannot drift — the enum is what
+    both ``_call_judge_cli``'s validation and ``JudgeVerdict``'s pydantic field
+    check.  The literal membership is pinned separately so a silent enum
+    widening still shows up here.
+    """
+    from fused_memory.reconciliation.judge import JUDGE_VERDICT_SCHEMA
+
+    assert JUDGE_VERDICT_SCHEMA['type'] == 'object'
+    assert 'severity' in JUDGE_VERDICT_SCHEMA['required']
+    assert 'findings' in JUDGE_VERDICT_SCHEMA['required']
+
+    properties = JUDGE_VERDICT_SCHEMA['properties']
+    # Derived from the enum — drift is structurally impossible.
+    assert set(properties['severity']['enum']) == {s.value for s in VerdictSeverity}
+    # ...and the enum is exactly the four documented members today.
+    assert {s.value for s in VerdictSeverity} == {'ok', 'minor', 'moderate', 'serious'}
+    assert properties['findings']['type'] == 'array'
 
 
 @pytest.mark.asyncio
