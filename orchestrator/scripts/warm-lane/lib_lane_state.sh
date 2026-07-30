@@ -212,6 +212,92 @@ lane_state_class() {
     return 0
 }
 
+# ── protected prefixes: read dark-factory's own band registry ────────────────
+
+# _LANE_STATE_LIB_DIR / _LANE_STATE_REPO_ROOT — resolved ONCE, at source time,
+# by pure path arithmetic: no git invocation, no environment read. The lib ships
+# at <repo>/orchestrator/scripts/warm-lane/, so the repo root is three levels up.
+#
+# Deliberately the same environment-free resolution α established for
+# provision-warm-lane-fs.sh (README.md "Delta 1"), whose four pinned cases — no
+# git metadata, an inherited GIT_DIR, an enclosing outer checkout, a checkout
+# inside a worktrees dir — are exactly the failure modes a git-probing or
+# env-reading resolution hits. Resolved at SOURCE time, not per call, because
+# BASH_SOURCE is only reliable while this file is being sourced.
+_LANE_STATE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || \
+    _LANE_STATE_LIB_DIR=''
+_LANE_STATE_REPO_ROOT="$(cd "${_LANE_STATE_LIB_DIR:-.}/../../.." 2>/dev/null && pwd)" || \
+    _LANE_STATE_REPO_ROOT=''
+
+# The one-liner the bridge runs. ALL rendering policy lives in git_ops.py — the
+# bash side embeds only import-and-print, so there is nothing here that could
+# drift from the registry.
+_LANE_STATE_RENDER_PY='import sys
+from orchestrator.git_ops import render_protect_glob
+print(render_protect_glob(owned=sys.argv[1:]))'
+
+# lane_protect_glob [<owned>...]
+#
+# Prints dark-factory's PROTECTED_PREFIXES rendered as the comma-separated
+# protect glob a reclaim sweep consumes, EXCLUDING any <owned> bands the calling
+# sweep owns (a pool sweep passes `_lane- _spec-`; see
+# PROTECT_GLOB_OWNED_POOL_BANDS in git_ops.py for why omitting them is
+# load-bearing rather than cosmetic).
+#
+# WHY THIS SHELLS OUT instead of scraping git_ops.py: five of the eleven
+# registry keys are computed constants (PERSISTENT_MERGE_WORKTREE_NAME,
+# PERSISTENT_OFFLINE_DEEP_WORKTREE_NAME, LANE_STATE_DIRNAME, TASK_META_DIRNAME,
+# WorktreeKind.*.value) and the _iact- band is config-driven, so any sed/awk
+# parse would silently UNDER-render — and an under-rendered protect glob means a
+# live managed worktree is no longer protected from the reaper. A real import is
+# the only faithful read. It costs one interpreter start per INVOCATION (not per
+# lane), against the ~1.9s per lane warm-lane-gc.sh already pays for its /proc
+# liveness scan.
+#
+# FAILS LOUD, AND NEVER ANSWERS EMPTY. On a missing/broken python3, a non-zero
+# exit, or an empty render, this prints NOTHING on stdout, emits exactly ONE
+# `[warn]` line naming the failing stage, and returns non-zero. The stance is
+# _live_refs_env_probe's — a visible warning plus a degradation the caller
+# chooses — and the empty-stdout rule is the load-bearing half: an empty glob
+# returned with a ZERO exit would read downstream as "nothing is protected",
+# which is precisely the silent widening of a reclaim sweep this lib exists to
+# prevent. Callers substitute LANE_PROTECT_GLOB_FALLBACK on a non-zero return:
+#
+#     glob="$(lane_protect_glob _lane- _spec-)" || glob="$LANE_PROTECT_GLOB_FALLBACK"
+#
+# Both shipped callers run `set -euo pipefail`, so a caller that FORGETS the
+# `||` aborts on the non-zero return rather than sweeping with an empty glob.
+lane_protect_glob() {
+    if [ -z "$_LANE_STATE_REPO_ROOT" ]; then
+        printf '[warn]  lane_protect_glob DEGRADED: could not resolve the repo root from %s — python3 cannot be pointed at orchestrator/src, so no protect glob was rendered. Callers must fall back to LANE_PROTECT_GLOB_FALLBACK.\n' \
+            "${_LANE_STATE_LIB_DIR:-<unresolved lib dir>}" >&2
+        return 1
+    fi
+
+    # The three src roots orchestrator/tests/conftest.py seeds, ahead of any
+    # inherited PYTHONPATH so an ambient value cannot shadow this checkout's
+    # orchestrator package with a different one.
+    local pypath="$_LANE_STATE_REPO_ROOT/orchestrator/src:$_LANE_STATE_REPO_ROOT/shared/src:$_LANE_STATE_REPO_ROOT/escalation/src"
+    [ -z "${PYTHONPATH:-}" ] || pypath="$pypath:$PYTHONPATH"
+
+    local rendered='' rc=0
+    # `|| rc=$?` rather than an unguarded call: this function must not abort a
+    # `set -e` caller from INSIDE the bridge — the caller decides what a failed
+    # render means, and it can only decide if it gets the return value.
+    rendered="$(PYTHONPATH="$pypath" python3 -c "$_LANE_STATE_RENDER_PY" "$@" 2>/dev/null)" \
+        || rc=$?
+
+    if [ "$rc" -ne 0 ] || [ -z "$rendered" ]; then
+        printf '[warn]  lane_protect_glob DEGRADED: python3 -c "from orchestrator.git_ops import render_protect_glob" %s (PYTHONPATH rooted at %s) — no protect glob was rendered, so callers must fall back to LANE_PROTECT_GLOB_FALLBACK. Check that python3 is on PATH for this unit and that the checkout is intact.\n' \
+            "$([ "$rc" -ne 0 ] && printf 'exited %s' "$rc" || printf 'printed nothing')" \
+            "$_LANE_STATE_REPO_ROOT" >&2
+        return 1
+    fi
+
+    printf '%s\n' "$rendered"
+    return 0
+}
+
 # Published defaults, so a caller that sources this lib and inspects the
 # globals before any read sees the same fail-open shape a failed read yields.
 LANE_STATE_RAW='unknown'
