@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 
 from audit_wiped_metadata_files import (
@@ -39,6 +41,7 @@ from audit_wiped_metadata_files import (
     WipeCandidate,
     audit_project,
     classify_wipe_signature,
+    discover_project_roots,
     format_json,
     format_report,
     load_merge_signatures,
@@ -1194,3 +1197,160 @@ def test_format_report_and_json_handle_multiple_projects():
 
     payload = json.loads(format_json(audits))
     assert [p["project_root"] for p in payload["projects"]] == ["/tmp/a", "/tmp/b"]
+
+
+# ---------------------------------------------------------------------------
+# discover_project_roots + main() — CLI contract.
+#   exit 0 = no candidates, 1 = at least one, 2 = no readable tasks.db.
+# ---------------------------------------------------------------------------
+
+_SCRIPT = str(Path(__file__).parent.parent / "audit_wiped_metadata_files.py")
+
+
+def _run_cli(*args):
+    return subprocess.run(
+        [sys.executable, _SCRIPT, *args], capture_output=True, text=True
+    )
+
+
+def test_discover_project_roots_precedence_and_missing_db_drop(tmp_path):
+    """(a) explicit --project-root > DASHBOARD_KNOWN_PROJECT_ROOTS > the
+    dark-factory default; a root with no tasks.db is silently dropped."""
+    real = _make_project(tmp_path, name="real")
+    other = _make_project(tmp_path, name="other")
+    env = {"DASHBOARD_KNOWN_PROJECT_ROOTS": f"{other},{tmp_path / 'nonexistent'}"}
+
+    # Explicit wins outright.
+    assert discover_project_roots([str(real)], env=env) == [str(real)]
+    # Env is consulted when no explicit root is given, comma-separated, and
+    # the nonexistent root is dropped rather than raising.
+    assert discover_project_roots(None, env=env) == [str(other)]
+    # A root without a tasks.db is dropped even when named explicitly.
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    assert discover_project_roots([str(bare)], env=env) == []
+    # Empty env falls back to the dark-factory default (not asserted by path
+    # contents — only that the default is consulted rather than erroring).
+    assert isinstance(discover_project_roots(None, env={}), list)
+
+
+def test_main_exit_0_when_no_candidates(tmp_path):
+    """(b) clean project -> exit 0, and the coverage block still prints."""
+    root = _make_project(tmp_path, tasks=[{"id": 1, "metadata": {"files": ["a.py"]}}])
+    result = _run_cli("--project-root", str(root))
+
+    assert result.returncode == 0
+    assert "COVERAGE" in result.stdout
+
+
+def test_main_exit_1_when_a_candidate_is_found(tmp_path):
+    """(b) at least one candidate -> exit 1."""
+    root = _make_project(
+        tmp_path,
+        tasks=[{"id": 2464, "metadata": {"files": []}}],
+        plans=[("2464", {"task_id": 2464, "files": ["a.py"]})],
+    )
+    result = _run_cli("--project-root", str(root))
+
+    assert result.returncode == 1
+    assert "2464" in result.stdout
+
+
+def test_main_exit_2_when_no_project_root_resolves(tmp_path):
+    """(b) nothing resolvable -> exit 2, with the reason on stderr."""
+    result = _run_cli("--project-root", str(tmp_path / "no-such-project"))
+
+    assert result.returncode == 2
+    assert result.stdout.strip() == ""
+    assert "no project root" in result.stderr.lower()
+
+
+def test_main_json_flag_emits_parseable_json(tmp_path):
+    """(c) --json emits parseable JSON on stdout."""
+    root = _make_project(
+        tmp_path,
+        tasks=[{"id": 7, "metadata": {"files": []}}],
+        plans=[("7", {"task_id": 7, "files": ["a.py"]})],
+    )
+    result = _run_cli("--project-root", str(root), "--json")
+
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    assert payload["projects"][0]["candidates"][0]["task_id"] == 7
+
+
+def test_main_project_root_is_repeatable(tmp_path):
+    """(d) --project-root repeats; both projects appear in the output."""
+    a = _make_project(
+        tmp_path,
+        tasks=[{"id": 1, "metadata": {"files": []}}],
+        plans=[("1", {"task_id": 1, "files": ["a.py"]})],
+        name="a",
+    )
+    b = _make_project(tmp_path, tasks=[{"id": 2, "metadata": {"files": ["k.py"]}}], name="b")
+
+    result = _run_cli("--project-root", str(a), "--project-root", str(b), "--json")
+
+    payload = json.loads(result.stdout)
+    assert [p["project_root"] for p in payload["projects"]] == [str(a), str(b)]
+
+
+def test_main_skips_a_corrupt_project_and_warns_that_results_are_incomplete(tmp_path):
+    """(e) a corrupt tasks.db is warned about on stderr and SKIPPED without
+    aborting the sweep; the other project's results still print, together
+    with an explicit incompleteness warning."""
+    good = _make_project(
+        tmp_path,
+        tasks=[{"id": 5, "metadata": {"files": []}}],
+        plans=[("5", {"task_id": 5, "files": ["a.py"]})],
+        name="good",
+    )
+    bad = _make_project(tmp_path, name="bad")
+    (bad / ".taskmaster" / "tasks" / "tasks.db").write_text("this is not a database")
+
+    result = _run_cli("--project-root", str(bad), "--project-root", str(good))
+
+    # The good project's candidate is still reported.
+    assert "5" in result.stdout
+    assert result.returncode == 1
+    stderr = result.stderr.lower()
+    assert str(bad) in result.stderr
+    assert "skipping" in stderr or "skipped" in stderr
+    assert "incomplete" in stderr
+
+
+def test_main_audits_a_project_whose_runs_db_is_missing(tmp_path):
+    """(f) a readable tasks.db with no runs.db still audits, degrading every
+    signature to NO_MERGE_EVENT rather than crashing."""
+    root = _make_project(
+        tmp_path,
+        tasks=[{"id": 3, "metadata": {"files": []}}],
+        plans=[("3", {"task_id": 3, "files": ["a.py"]})],
+    )
+    (root / "data" / "orchestrator" / "runs.db").unlink()
+
+    result = _run_cli("--project-root", str(root), "--json")
+
+    assert result.returncode == 1
+    payload = json.loads(result.stdout)
+    assert payload["projects"][0]["candidates"][0]["wipe_signature"] == NO_MERGE_EVENT
+
+
+def test_main_min_fidelity_defaults_to_file_level(tmp_path):
+    """--min-fidelity defaults to file-level, so lock-level-only candidates
+    are OPT-IN — a module path must not silently enter a repair feed."""
+    root = _make_project(
+        tmp_path,
+        tasks=[{"id": 4, "metadata": {"files": []}}],
+        events=[{"event_type": "set_to_plan", "task_id": 4, "data": {"files": ["orchestrator"]}}],
+    )
+
+    default_run = _run_cli("--project-root", str(root), "--json")
+    assert default_run.returncode == 0
+    assert json.loads(default_run.stdout)["projects"][0]["candidates"] == []
+
+    opted_in = _run_cli("--project-root", str(root), "--json", "--min-fidelity", "lock-level")
+    assert opted_in.returncode == 1
+    candidate = json.loads(opted_in.stdout)["projects"][0]["candidates"][0]
+    assert candidate["task_id"] == 4
+    assert candidate["plan_files_fidelity"] == FIDELITY_LOCK_LEVEL
