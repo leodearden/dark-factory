@@ -155,12 +155,18 @@ the gate record it consumes rather than an unverified copy of it.
   is_scorable_plan(plan): return 0.0` — and `is_scorable_plan` (`judge.py:320-345`) is
   exactly `isinstance(plan, dict) and bool(plan.get('steps'))`, so a stepless plan
   scores 0.0 outright with no partial credit, and the pre-refactor inline guard (`not
-  plan.get('steps')`) behaved identically for the 2026-07-28 wave this cell comes from;
-  (b) granularity — `PLAN_QUALITY_RUBRIC`'s weights sum to 8.0 and the floor returns
+  plan.get('steps')`) behaved identically for the 2026-07-29 wave this cell actually
+  comes from — its scored `run_id` matches an entry in the 07-29 resume dump
+  (`data/eval-campaign/resume-20260729/reify/fable-architect-only-results.json`) with
+  `plan_steps: 0`, `plan_quality: 0.31`, `cost_usd: 4.72`; the 07-28 wave's entry for
+  this same `(task_id, config_name, trial)` key is `blocked` with `cost_usd: 0`, i.e.
+  superseded per §2's supersede-by-rerun rule; (b) granularity —
+  `PLAN_QUALITY_RUBRIC`'s weights sum to 8.0 and the floor returns
   `round(satisfied_weight / 8, 4)`, so its only possible outputs are multiples of 0.125,
   and 0.31 is not one of them. The per-cell artifact
-  (`reify_task_12__architect-opus-high__52c66767.json`) carries `invocation_error: null`,
-  no `cap_tainted`, and $4.72 of real spend, i.e. the normal path of `run_architect_eval`
+  (`reify_task_12__architect-opus-high__52c66767.json`) carries neither `cap_tainted`
+  nor `invocation_error` — both fields post-date this wave (§2) — but records $4.72 of
+  real spend, i.e. the normal path of `run_architect_eval`
   (`runner.py:748-761`), where the judge's value is used verbatim and the floor is
   consulted only if the judge returns `None`. Coercing no-plan cells to 0 instead would
   move `architect-opus-high` to 0.7589 and leave the other three candidates unchanged;
@@ -169,10 +175,14 @@ the gate record it consumes rather than an unverified copy of it.
     defect this record fixes): on this stepless artifact the judge and the floor
     *disagree* — 0.31 versus 0.0. The floor's short-circuit is the deliberate
     anti-fabrication guard from task 3118; the judge is under no such constraint and
-    will score a stepless plan on content. Worth filing alongside **task 3099** as a
-    plan-quality-instrument coherence question. It does not perturb this campaign: the
-    cell is one of 18 for a candidate that is not the recommendation subject, and the
-    sensitivity is bounded at 0.7761 → 0.7589 above.
+    will score a stepless plan on content. Filed as follow-up ticket
+    `tkt_0RRWM6P4MT95PWDG4N5E9F27KG` (queued for curator triage into a task), cited
+    here rather than left as unlinked prose — cross-referenced against **task 3099**
+    (same plan-quality-instrument family, different root cause: 3099 is
+    `composite_score` always reading 0.0, this is the judge-vs-floor disagreement on
+    stepless plans specifically). It does not perturb this campaign: the cell is one
+    of 18 for a candidate that is not the recommendation subject, and the sensitivity
+    is bounded at 0.7761 → 0.7589 above.
 - `meanPQ_planned` = mean `plan_quality` over only the cells that produced a plan
   (the `planRate` numerator).
 - `$total` = sum of `cost_usd` over all 18 cells for that candidate.
