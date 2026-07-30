@@ -1362,6 +1362,37 @@ class TestStalenessAndDegradedStates:
         assert healthy['issue_count'] == 0
         assert payload['issue_count'] > healthy['issue_count']
 
+    def test_wrong_type_limits_is_malformed_limits(self, tmp_path: Path) -> None:
+        """The limits reader carries the identical defect, and the same fix.
+
+        Found while verifying the verdicts finding: a limits artifact that
+        parses but is a bare list falls through with no issue, and because
+        ``missing_limits`` is only recorded when the file is ABSENT, a
+        present-but-wrong-type artifact produced NO signal at all — losing the
+        alpha/baseline/grandfather-hash provenance silently.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _healthy_tree(tmp_path)
+        bad = _dump(root / 'eval-a' / 'limits-current.json', ['not', 'an', 'object'])
+
+        payload = build_memory_evals(root, esc_dir)
+
+        assert payload['issue_count'] == len(payload['issues'])
+        malformed = [i for i in payload['issues'] if i['kind'] == 'malformed_limits']
+        assert len(malformed) == 1
+        # Per-eval, so it carries an eval_id — unlike the root-scoped verdicts issue.
+        assert malformed[0]['eval_id'] == 'eval-a'
+        assert malformed[0]['path'] == str(bad)
+        assert 'list' in malformed[0]['detail']
+
+        # Provenance stays absent rather than half-populated.
+        assert payload['evals'][0]['limits'] is None
+
+        # Malformed, not missing: reporting both would misdirect the operator
+        # toward an evaluator that never ran, when the file is right there.
+        assert [i for i in payload['issues'] if i['kind'] == 'missing_limits'] == []
+
     def test_unknown_kind_is_flagged_but_the_value_still_shows(self, tmp_path: Path) -> None:
         """A kind outside the closed vocabulary is a RENDERING failure.
 
