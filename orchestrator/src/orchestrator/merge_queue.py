@@ -4140,6 +4140,93 @@ def _inflight_entry_is_stale(
         return not any(e.get('branch') == branch for e in entries)
 
 
+def _inflight_worktree_is_stale(
+    wt: Path,
+    branch: str,
+    live_snapshot: Callable[[], dict] | None,
+) -> bool:
+    """Return True when the on-disk ``_merge-*`` worktree *wt* is a CORPSE.
+
+    The disk-scan companion to :func:`_inflight_entry_is_stale`, with the same
+    polarity: **True = corpse → reap and dispatch fresh**, **False = keep
+    coalescing**.
+
+    Why a snapshot signal is needed at all.  The disk-scan coalesce arm decides
+    liveness from *wt*'s ROOT inode mtime.  But
+    :meth:`SpeculativeMergeWorker._touch_owned_merge_worktrees` ``os.utime``s
+    the root inode of every path in ``_owned_merge_worktrees`` on every
+    heartbeat tick (~30 s, i.e. ~360x inside the 10800 s liveness window).  So
+    for an OWNED worktree root mtime measures *owner-process* liveness, not
+    *merge* liveness: once such a worktree outlives its request's terminal
+    finalization while still in the ledger, the heartbeat pins its mtime fresh
+    forever, ``age <= liveness_secs`` is permanently true, and every resubmit
+    for that branch coalesces onto a corpse until the process restarts.
+    :func:`orchestrator.merge_liveness.newest_content_mtime` states the same
+    hazard for the in-flight verify no-progress budget ("the #1728 alpha
+    owner-heartbeat ... can never mask a dead/hung verify subprocess"); this
+    predicate is that treatment for the coalesce arm.
+
+    Why OWNERSHIP gates the verdict.  The disk-scan arm exists for
+    cross-process / post-restart crash-safety: an in-progress merger's
+    ``_merge-*`` worktree persists on disk even when the in-memory registry was
+    cleared by a restart, and it must still coalesce or two mergers race onto
+    one branch.  A foreign or pre-restart merger's worktree is BY CONSTRUCTION
+    absent from *this* worker's snapshot entries, so a bare branch-absence test
+    would reap genuinely live foreign merges.  Ownership is the precise
+    discriminator: for a worktree this worker is heartbeating, mtime is
+    known-contaminated and cannot be evidence of life, so "no live entry for
+    the branch" proves the owning request already finalized.  Everything else
+    keeps the pre-existing behaviour.
+
+    Returns **False** (not stale → keep coalescing) in six cases:
+
+    1. *live_snapshot* is None — no provider wired (back-compat default; all
+       existing callers without a worker).
+    2. ``live_snapshot()`` raises — transient error (fail-safe to coalesce).
+    3. The snapshot is not a dict or lacks the ``'entries'`` key — malformed
+       response.  Same philosophy as the sibling predicate: when the snapshot
+       cannot be trusted, assume live rather than risk a double-dispatch, which
+       is strictly worse because a delayed coalesce is self-healing while a
+       double-dispatch corrupts main.
+    4. The snapshot lacks the ``'owned_merge_worktrees'`` key entirely — a
+       producer predating that additive key (a test double, or a rolling deploy
+       where the escalation server sees an older worker).  Distinguished from
+       an *empty* ledger, which is a live worker's honest answer and still
+       permits the decisive check below.
+    5. *wt* is unresolvable (OSError) — cannot establish ownership.
+    6. *wt* is not in this worker's ledger — foreign / pre-restart merger; its
+       mtime is real evidence, so the crash-safety property is preserved.
+
+    Ownership is compared on ``Path.resolve()``, matching how
+    :meth:`SpeculativeMergeWorker.worktree_ledger_violations` already
+    normalises the same ledger, so the two ownership tests can never disagree.
+    """
+    if live_snapshot is None:
+        return False
+    try:
+        snap = live_snapshot()
+    except Exception:
+        return False  # fail-safe: transient error → not stale → coalesce
+    if not isinstance(snap, dict) or 'entries' not in snap:
+        return False  # malformed snapshot → fail-safe: not stale → coalesce
+    owned = snap.get('owned_merge_worktrees')
+    if owned is None:
+        # Key absent (not merely empty) → producer predates the additive key.
+        # Note the `is None` test: an EMPTY list from a live worker is a
+        # trustworthy answer and must not short-circuit the decisive check.
+        return False
+    try:
+        wt_key = str(Path(wt).resolve())
+        owned_keys = {str(Path(p).resolve()) for p in owned}
+    except OSError:
+        return False  # unresolvable path → fail-safe: not stale → coalesce
+    if wt_key not in owned_keys:
+        return False  # not ours → mtime is real evidence → keep coalescing
+    # Owned by this worker: mtime is heartbeat-pinned, so the ONLY liveness
+    # signal is whether the live pipeline still carries this branch.
+    return not any(e.get('branch') == branch for e in snap['entries'])
+
+
 def _snapshot_verify_state(
     live_snapshot: Callable[[], dict] | None,
     request_id: str | None,
