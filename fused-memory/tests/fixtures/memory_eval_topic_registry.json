@@ -1,0 +1,1961 @@
+{
+  "entries": [
+    {
+      "canonical": {
+        "content_hash": "6e39479e17209e07",
+        "content_prefix": "Architect plan `files` list = the WRITE-SET. CANONICAL (merges 7d0eec99 + bbd7cac3 + b54c5f0d + 5d7c4909 + 978b4167 + 59390607 + b81895b0; consolidated 2026-07-",
+        "last_known_id": "68f19644-c3f3-49d5-af61-c983de358358"
+      },
+      "claim_queries": [
+        {
+          "needles": [
+            "WRITE-SET",
+            "CREATE or MODIFY"
+          ],
+          "query": "what does the plan files list mean"
+        }
+      ],
+      "derived_from": "curator_gate",
+      "members": [
+        "1c955a701d408d43",
+        "2530d93bd11b3dc9",
+        "5be1cfd904c83dbc",
+        "5e2e93c53bd1c4f8",
+        "657d6c2ebc777b5e",
+        "7586cb11fd81679d",
+        "fd97ae6573826be4"
+      ],
+      "phrasings": [
+        {
+          "held_out": false,
+          "text": "what belongs in an architect plan files list"
+        },
+        {
+          "held_out": false,
+          "text": "is a file I only read part of the write set"
+        },
+        {
+          "held_out": true,
+          "text": "do I have to declare a module the task merely imports"
+        }
+      ],
+      "project_id": "reify",
+      "provenance": {
+        "cluster_id": "68f19644-c3f3-49d5-af61-c983de358358",
+        "gate_ids": [
+          "esc-5560"
+        ],
+        "labels": {
+          "canonical": 1,
+          "duplicate": 7,
+          "other": 0
+        }
+      },
+      "supersedes_pairs": [
+        {
+          "successor_hash": "6e39479e17209e07",
+          "superseded_hash": "7586cb11fd81679d"
+        },
+        {
+          "successor_hash": "6e39479e17209e07",
+          "superseded_hash": "fd97ae6573826be4"
+        },
+        {
+          "successor_hash": "6e39479e17209e07",
+          "superseded_hash": "5e2e93c53bd1c4f8"
+        },
+        {
+          "successor_hash": "6e39479e17209e07",
+          "superseded_hash": "657d6c2ebc777b5e"
+        },
+        {
+          "successor_hash": "6e39479e17209e07",
+          "superseded_hash": "5be1cfd904c83dbc"
+        },
+        {
+          "successor_hash": "6e39479e17209e07",
+          "superseded_hash": "1c955a701d408d43"
+        },
+        {
+          "successor_hash": "6e39479e17209e07",
+          "superseded_hash": "2530d93bd11b3dc9"
+        }
+      ],
+      "topic": "architect-plan-files-write-set"
+    },
+    {
+      "canonical": {
+        "content_hash": "ebb9d194e83d8039",
+        "content_prefix": "PREPARED CONSOLIDATION PLAN for the 12-entry \"architect report_task_already_done requires main-reachable commi",
+        "last_known_id": "56b12a6a-d03e-4ca2-9f0f-c45e8bca7385"
+      },
+      "claim_queries": [
+        {
+          "needles": [
+            "report_task_already_done",
+            "main-reachable"
+          ],
+          "query": "what does report_task_already_done require"
+        }
+      ],
+      "derived_from": "topic_guard_cluster",
+      "members": [
+        "07ab1f9900fb0f84",
+        "22a7312df44a74f9",
+        "46a6b874eb0e4928",
+        "4e3951d481a33ac3",
+        "8532bdc3340c2022",
+        "89cfb7e3d7591d3a"
+      ],
+      "phrasings": [
+        {
+          "held_out": false,
+          "text": "report_task_already_done needs a main-reachable commit"
+        },
+        {
+          "held_out": false,
+          "text": "architect already-done report main reachability"
+        },
+        {
+          "held_out": true,
+          "text": "the planner claimed the work existed but the commit was never merged"
+        }
+      ],
+      "project_id": "dark_factory",
+      "provenance": {
+        "source": "qdrant payload scroll, read-only, 2026-07-30"
+      },
+      "supersedes_pairs": [
+        {
+          "successor_hash": "ebb9d194e83d8039",
+          "superseded_hash": "07ab1f9900fb0f84"
+        },
+        {
+          "successor_hash": "ebb9d194e83d8039",
+          "superseded_hash": "22a7312df44a74f9"
+        },
+        {
+          "successor_hash": "ebb9d194e83d8039",
+          "superseded_hash": "46a6b874eb0e4928"
+        },
+        {
+          "successor_hash": "ebb9d194e83d8039",
+          "superseded_hash": "4e3951d481a33ac3"
+        },
+        {
+          "successor_hash": "ebb9d194e83d8039",
+          "superseded_hash": "8532bdc3340c2022"
+        },
+        {
+          "successor_hash": "ebb9d194e83d8039",
+          "superseded_hash": "89cfb7e3d7591d3a"
+        }
+      ],
+      "topic": "architect-report-task-already-done-main-reachability"
+    },
+    {
+      "canonical": {
+        "content_hash": "b90ca0e5b1843ad7",
+        "content_prefix": "Background-task reaping on this host, and which wake mechanism survives it. (Supersedes cb02ce75; folds in the Monitor-vs-watch-loop measurement extracted from ",
+        "last_known_id": "a063640d-70ad-45a1-9ec6-d87e3d92716a"
+      },
+      "claim_queries": [
+        {
+          "needles": [
+            "THE REAPING",
+            "HOURLY"
+          ],
+          "query": "how often are background tasks swept"
+        }
+      ],
+      "derived_from": "curator_gate",
+      "members": [
+        "e9be82212603cbf5"
+      ],
+      "phrasings": [
+        {
+          "held_out": false,
+          "text": "does this host reap background tasks"
+        },
+        {
+          "held_out": false,
+          "text": "which wake mechanism survives background reaping"
+        },
+        {
+          "held_out": true,
+          "text": "my detached watcher stopped firing after about an hour"
+        }
+      ],
+      "project_id": "reify",
+      "provenance": {
+        "cluster_id": "a063640d-70ad-45a1-9ec6-d87e3d92716a",
+        "gate_ids": [
+          "esc-5547"
+        ],
+        "labels": {
+          "canonical": 1,
+          "duplicate": 1,
+          "other": 0
+        }
+      },
+      "supersedes_pairs": [
+        {
+          "successor_hash": "b90ca0e5b1843ad7",
+          "superseded_hash": "e9be82212603cbf5"
+        }
+      ],
+      "topic": "background-task-reaping-and-wake-mechanisms"
+    },
+    {
+      "canonical": {
+        "content_hash": "c44794bca0a75f63",
+        "content_prefix": "Reify compiler — do `Boolean{left,right}` operands carry `GeomRef::Sub` consumption edges? BOTH answers are right; the discriminator is the OPERAND'S SHAPE. CAN",
+        "last_known_id": "df6ff45d-69df-47f7-8e60-60b4f9ced397"
+      },
+      "claim_queries": [
+        {
+          "needles": [
+            "DISCRIMINATOR",
+            "resolve_boolean_arg"
+          ],
+          "query": "what discriminates the two boolean-operand answers"
+        }
+      ],
+      "derived_from": "curator_gate",
+      "members": [],
+      "phrasings": [
+        {
+          "held_out": false,
+          "text": "do Boolean left and right operands carry GeomRef::Sub consumption edges"
+        },
+        {
+          "held_out": false,
+          "text": "boolean operand consumption edge discriminator"
+        },
+        {
+          "held_out": true,
+          "text": "two entries disagreed about consumption edges, which one applies to my case"
+        }
+      ],
+      "project_id": "reify",
+      "provenance": {
+        "cluster_id": "df6ff45d-69df-47f7-8e60-60b4f9ced397",
+        "gate_ids": [
+          "esc-5557"
+        ],
+        "labels": {
+          "canonical": 1,
+          "duplicate": 0,
+          "other": 3
+        }
+      },
+      "supersedes_pairs": [],
+      "topic": "boolean-operand-consumption-edges"
+    },
+    {
+      "canonical": {
+        "content_hash": "e00ace75f9301bf8",
+        "content_prefix": "Reify has NO rustfmt gate: no rustfmt.toml exists, `git grep 'cargo fmt'` returns nothing tracked, and NEITHER `scripts/verify.sh` NOR `hooks/pre-commit` invoke",
+        "last_known_id": "0b746438-6ce8-435c-885c-b3ac82666764"
+      },
+      "claim_queries": [
+        {
+          "needles": [
+            "cargo clippy",
+            "rustfmt.toml"
+          ],
+          "query": "what does reify lint with instead of rustfmt"
+        }
+      ],
+      "derived_from": "curator_gate",
+      "members": [
+        "3368a08a8890bcc1",
+        "86e3eeb4eecb778e",
+        "d51e54f87dc7467d",
+        "deace1115fef6ce9",
+        "fa3d70317e1727cc"
+      ],
+      "phrasings": [
+        {
+          "held_out": false,
+          "text": "does reify enforce rustfmt"
+        },
+        {
+          "held_out": false,
+          "text": "is there a cargo fmt gate in verify.sh"
+        },
+        {
+          "held_out": true,
+          "text": "why did my unformatted rust file still pass the lint step"
+        }
+      ],
+      "project_id": "reify",
+      "provenance": {
+        "cluster_id": "0b746438-6ce8-435c-885c-b3ac82666764",
+        "gate_ids": [
+          "esc-5631"
+        ],
+        "labels": {
+          "canonical": 1,
+          "duplicate": 5,
+          "other": 0
+        }
+      },
+      "supersedes_pairs": [
+        {
+          "successor_hash": "e00ace75f9301bf8",
+          "superseded_hash": "deace1115fef6ce9"
+        },
+        {
+          "successor_hash": "e00ace75f9301bf8",
+          "superseded_hash": "3368a08a8890bcc1"
+        },
+        {
+          "successor_hash": "e00ace75f9301bf8",
+          "superseded_hash": "fa3d70317e1727cc"
+        },
+        {
+          "successor_hash": "e00ace75f9301bf8",
+          "superseded_hash": "86e3eeb4eecb778e"
+        },
+        {
+          "successor_hash": "e00ace75f9301bf8",
+          "superseded_hash": "d51e54f87dc7467d"
+        }
+      ],
+      "topic": "cargo-fmt-no-gate"
+    },
+    {
+      "canonical": {
+        "content_hash": "9c1a7cc308a0b40c",
+        "content_prefix": "Cargo build-script freshness vs warm-lane mtime normalization. CANONICAL (merges 8b1f6943 + f2583656, with the relocation-sweep clause CORRECTED — that half was",
+        "last_known_id": "618c4e80-c1bc-434a-b870-82756437909a"
+      },
+      "claim_queries": [
+        {
+          "needles": [
+            "CARGO MECHANISM",
+            "seed-warm-lane.sh"
+          ],
+          "query": "what interacts with warm-lane mtime normalisation"
+        }
+      ],
+      "derived_from": "curator_gate",
+      "members": [
+        "1ed2fa8faee13ef2",
+        "a5ff3d5251b9026d"
+      ],
+      "phrasings": [
+        {
+          "held_out": false,
+          "text": "cargo build script freshness in a warm lane"
+        },
+        {
+          "held_out": false,
+          "text": "why does the build script rerun every time"
+        },
+        {
+          "held_out": true,
+          "text": "mtime normalisation is making cargo think my inputs changed"
+        }
+      ],
+      "project_id": "reify",
+      "provenance": {
+        "cluster_id": "618c4e80-c1bc-434a-b870-82756437909a",
+        "gate_ids": [
+          "esc-5634"
+        ],
+        "labels": {
+          "canonical": 1,
+          "duplicate": 2,
+          "other": 0
+        }
+      },
+      "supersedes_pairs": [
+        {
+          "successor_hash": "9c1a7cc308a0b40c",
+          "superseded_hash": "a5ff3d5251b9026d"
+        },
+        {
+          "successor_hash": "9c1a7cc308a0b40c",
+          "superseded_hash": "1ed2fa8faee13ef2"
+        }
+      ],
+      "topic": "cargo-rerun-if-changed-warm-lane-mtime"
+    },
+    {
+      "canonical": {
+        "content_hash": "7d53b83331371e25",
+        "content_prefix": "reify: `CompiledModule.functions` is USER-SOURCE-ONLY — the test-harness trap it creates. CANONICAL (merges 3bd4fc1e + 2180e5df + 9d229441; verified against the",
+        "last_known_id": "1c2a0424-9e79-47f4-97f9-331160f5849a"
+      },
+      "claim_queries": [
+        {
+          "needles": [
+            "USER-SOURCE-ONLY",
+            "compile_source_with_stdlib"
+          ],
+          "query": "what does compile_source_with_stdlib omit"
+        }
+      ],
+      "derived_from": "curator_gate",
+      "members": [
+        "0f03eb4a8b87db02",
+        "98f3f5c3c901eab7",
+        "9f13cc773b3b9666"
+      ],
+      "phrasings": [
+        {
+          "held_out": false,
+          "text": "does CompiledModule.functions include stdlib bodies"
+        },
+        {
+          "held_out": false,
+          "text": "why is my prelude function missing from CompiledModule"
+        },
+        {
+          "held_out": true,
+          "text": "a harness assertion counted fewer functions than the source declares"
+        }
+      ],
+      "project_id": "reify",
+      "provenance": {
+        "cluster_id": "1c2a0424-9e79-47f4-97f9-331160f5849a",
+        "gate_ids": [
+          "esc-5622"
+        ],
+        "labels": {
+          "canonical": 1,
+          "duplicate": 3,
+          "other": 0
+        }
+      },
+      "supersedes_pairs": [
+        {
+          "successor_hash": "7d53b83331371e25",
+          "superseded_hash": "0f03eb4a8b87db02"
+        },
+        {
+          "successor_hash": "7d53b83331371e25",
+          "superseded_hash": "9f13cc773b3b9666"
+        },
+        {
+          "successor_hash": "7d53b83331371e25",
+          "superseded_hash": "98f3f5c3c901eab7"
+        }
+      ],
+      "topic": "compiled-module-functions-user-source-only"
+    },
+    {
+      "canonical": {
+        "content_hash": "fb93b6b1f41d10cd",
+        "content_prefix": "CANONICAL SOP (reify) — LANDING DOCS / PRD ARTIFACTS. Round-2 consolidation, 2026-07-27 (curator gate esc-5541-1). Supersedes canonical 166f5106 and closes out ",
+        "last_known_id": "0e954870-bba1-44a7-81e9-5be94d5f6255"
+      },
+      "claim_queries": [
+        {
+          "needles": [
+            "DIRECTLY ON main",
+            "project_root"
+          ],
+          "query": "where do PRD artifacts get committed"
+        }
+      ],
+      "derived_from": "curator_gate",
+      "members": [
+        "06265d32e047651f",
+        "17799174a8b670cb",
+        "3054a829765a0562",
+        "30790ef196d6c3df",
+        "35c7e00b9277e9c0",
+        "51669448d58a7b9a",
+        "5c6f4ded4036fac7",
+        "966f3eaf6f793c0a",
+        "9768ba72b7338f5f",
+        "a054210ee9c8f574",
+        "ae718e614edf0ded",
+        "bdf4fa056f6331f4",
+        "e8c51fb7fc8bbb3b"
+      ],
+      "phrasings": [
+        {
+          "held_out": false,
+          "text": "how do I land a PRD or docs artifact"
+        },
+        {
+          "held_out": false,
+          "text": "SOP for committing docs directly on main"
+        },
+        {
+          "held_out": true,
+          "text": "where should a design write-up be committed so it is not stuck in a lane"
+        }
+      ],
+      "project_id": "reify",
+      "provenance": {
+        "cluster_id": "0e954870-bba1-44a7-81e9-5be94d5f6255",
+        "gate_ids": [
+          "esc-5541"
+        ],
+        "labels": {
+          "canonical": 1,
+          "duplicate": 13,
+          "other": 0
+        }
+      },
+      "supersedes_pairs": [
+        {
+          "successor_hash": "fb93b6b1f41d10cd",
+          "superseded_hash": "ae718e614edf0ded"
+        },
+        {
+          "successor_hash": "fb93b6b1f41d10cd",
+          "superseded_hash": "9768ba72b7338f5f"
+        },
+        {
+          "successor_hash": "fb93b6b1f41d10cd",
+          "superseded_hash": "17799174a8b670cb"
+        },
+        {
+          "successor_hash": "fb93b6b1f41d10cd",
+          "superseded_hash": "a054210ee9c8f574"
+        },
+        {
+          "successor_hash": "fb93b6b1f41d10cd",
+          "superseded_hash": "e8c51fb7fc8bbb3b"
+        },
+        {
+          "successor_hash": "fb93b6b1f41d10cd",
+          "superseded_hash": "5c6f4ded4036fac7"
+        },
+        {
+          "successor_hash": "fb93b6b1f41d10cd",
+          "superseded_hash": "06265d32e047651f"
+        },
+        {
+          "successor_hash": "fb93b6b1f41d10cd",
+          "superseded_hash": "966f3eaf6f793c0a"
+        },
+        {
+          "successor_hash": "fb93b6b1f41d10cd",
+          "superseded_hash": "bdf4fa056f6331f4"
+        },
+        {
+          "successor_hash": "fb93b6b1f41d10cd",
+          "superseded_hash": "35c7e00b9277e9c0"
+        },
+        {
+          "successor_hash": "fb93b6b1f41d10cd",
+          "superseded_hash": "3054a829765a0562"
+        },
+        {
+          "successor_hash": "fb93b6b1f41d10cd",
+          "superseded_hash": "51669448d58a7b9a"
+        },
+        {
+          "successor_hash": "fb93b6b1f41d10cd",
+          "superseded_hash": "30790ef196d6c3df"
+        }
+      ],
+      "topic": "docs-prd-landing"
+    },
+    {
+      "canonical": {
+        "content_hash": "51a9d5ec99157944",
+        "content_prefix": "Blast-radius finding for dark-factory's escalation read API (verified 2026-07-28)",
+        "last_known_id": "3db6b426-d90d-45af-af9a-1757bdf5d86c"
+      },
+      "claim_queries": [
+        {
+          "needles": [
+            "escalation",
+            "in-process"
+          ],
+          "query": "how many in-process callers does the escalation read API have"
+        }
+      ],
+      "derived_from": "census_topic",
+      "members": [
+        "0775d79dbca42f9d",
+        "07f6d28d47df0d8f",
+        "1786c7a53c2c6209",
+        "4d03bcff6ee18470",
+        "66096a00935d8d8e",
+        "68c6e97ffd58ce78"
+      ],
+      "phrasings": [
+        {
+          "held_out": false,
+          "text": "escalation read API blast radius"
+        },
+        {
+          "held_out": false,
+          "text": "which escalation store does a read hit"
+        },
+        {
+          "held_out": true,
+          "text": "two callers disagree about where an escalation record actually lives"
+        }
+      ],
+      "project_id": "dark_factory",
+      "provenance": {
+        "source": "qdrant payload scroll, read-only, 2026-07-30"
+      },
+      "supersedes_pairs": [
+        {
+          "successor_hash": "51a9d5ec99157944",
+          "superseded_hash": "0775d79dbca42f9d"
+        },
+        {
+          "successor_hash": "51a9d5ec99157944",
+          "superseded_hash": "07f6d28d47df0d8f"
+        },
+        {
+          "successor_hash": "51a9d5ec99157944",
+          "superseded_hash": "1786c7a53c2c6209"
+        },
+        {
+          "successor_hash": "51a9d5ec99157944",
+          "superseded_hash": "4d03bcff6ee18470"
+        },
+        {
+          "successor_hash": "51a9d5ec99157944",
+          "superseded_hash": "66096a00935d8d8e"
+        },
+        {
+          "successor_hash": "51a9d5ec99157944",
+          "superseded_hash": "68c6e97ffd58ce78"
+        }
+      ],
+      "topic": "escalation-store-ambiguity"
+    },
+    {
+      "canonical": {
+        "content_hash": "d150f6f19a6163fd",
+        "content_prefix": "CANONICAL (topic: eval_worktree_plan_tools_missing; Leo-ratified 2026-07-22, recorded 2026-07-23 per esc-2960-",
+        "last_known_id": "0929cff6-8efc-4a49-a672-e83f0a41bbfb"
+      },
+      "claim_queries": [
+        {
+          "needles": [
+            "CANONICAL",
+            "eval_worktree_plan_tools_missing"
+          ],
+          "query": "what was ratified about plan-tools in the eval worktree"
+        }
+      ],
+      "derived_from": "topic_guard_cluster",
+      "members": [],
+      "phrasings": [
+        {
+          "held_out": false,
+          "text": "plan-tools MCP server missing in the eval worktree"
+        },
+        {
+          "held_out": false,
+          "text": "why is create_plan unavailable when running in an eval worktree"
+        },
+        {
+          "held_out": true,
+          "text": "the planning tools are absent from this checkout, what is the ruling"
+        }
+      ],
+      "project_id": "dark_factory",
+      "provenance": {
+        "source": "qdrant payload scroll, read-only, 2026-07-30"
+      },
+      "supersedes_pairs": [],
+      "topic": "eval-worktree-plan-tools-missing"
+    },
+    {
+      "canonical": {
+        "content_hash": "6ba084f680c41b09",
+        "content_prefix": "CANONICAL (eval-worktree orchestrator/conftest shadowing; consolidates 6 near-duplicates retired 2026-07-22 vi",
+        "last_known_id": "382c0499-75ab-4d4e-a089-1fce525de317"
+      },
+      "claim_queries": [
+        {
+          "needles": [
+            "CANONICAL",
+            "shadowing"
+          ],
+          "query": "what shadows what in the eval worktree"
+        }
+      ],
+      "derived_from": "topic_guard_cluster",
+      "members": [
+        "51583131ac37adc3",
+        "586639f9308983c8",
+        "6eb7847a05b8a34b",
+        "bba514b07eb958cc",
+        "e0bf912d5f03f880"
+      ],
+      "phrasings": [
+        {
+          "held_out": false,
+          "text": "eval worktree conftest shadowing"
+        },
+        {
+          "held_out": false,
+          "text": "editable install shadows the worktree package"
+        },
+        {
+          "held_out": true,
+          "text": "imports resolve to the wrong checkout when both trees are installed"
+        }
+      ],
+      "project_id": "dark_factory",
+      "provenance": {
+        "source": "qdrant payload scroll, read-only, 2026-07-30"
+      },
+      "supersedes_pairs": [
+        {
+          "successor_hash": "6ba084f680c41b09",
+          "superseded_hash": "51583131ac37adc3"
+        },
+        {
+          "successor_hash": "6ba084f680c41b09",
+          "superseded_hash": "586639f9308983c8"
+        },
+        {
+          "successor_hash": "6ba084f680c41b09",
+          "superseded_hash": "6eb7847a05b8a34b"
+        },
+        {
+          "successor_hash": "6ba084f680c41b09",
+          "superseded_hash": "bba514b07eb958cc"
+        },
+        {
+          "successor_hash": "6ba084f680c41b09",
+          "superseded_hash": "e0bf912d5f03f880"
+        }
+      ],
+      "topic": "eval-worktree-venv-shadowing"
+    },
+    {
+      "canonical": {
+        "content_hash": "d51e363e79ff2b8e",
+        "content_prefix": "NORM (documented in `skills/prd/references/gates.md` as of commit 703e0a95ea, 2026-07-25): the /prd G7 de",
+        "last_known_id": "4060dbdc-2896-4cac-aa8c-ebaa4b68d146"
+      },
+      "claim_queries": [
+        {
+          "needles": [
+            "NORM",
+            "G7"
+          ],
+          "query": "what is the /prd G7 design-invariant gate"
+        }
+      ],
+      "derived_from": "briefing_query",
+      "members": [],
+      "phrasings": [
+        {
+          "held_out": false,
+          "text": "project overview architecture goals"
+        },
+        {
+          "held_out": false,
+          "text": "coding conventions and project norms"
+        },
+        {
+          "held_out": false,
+          "text": "recent decisions and rationale"
+        },
+        {
+          "held_out": false,
+          "text": "task 3111 context and related decisions"
+        },
+        {
+          "held_out": true,
+          "text": "what rules govern how a design is signed off here"
+        }
+      ],
+      "project_id": "dark_factory",
+      "provenance": {
+        "source": "qdrant payload scroll, read-only, 2026-07-30"
+      },
+      "supersedes_pairs": [],
+      "topic": "g7-design-invariants"
+    },
+    {
+      "canonical": {
+        "content_hash": "1b569e4d8388549d",
+        "content_prefix": "`git commit --only <path>` FAILS with \"error: pathspec '<path>' did not match any file(s) known to git\"",
+        "last_known_id": "8b4af703-ece4-4439-8bcd-316e256522a4"
+      },
+      "claim_queries": [
+        {
+          "needles": [
+            "git commit --only",
+            "pathspec"
+          ],
+          "query": "what fails with git commit --only"
+        }
+      ],
+      "derived_from": "hand",
+      "members": [],
+      "phrasings": [
+        {
+          "held_out": false,
+          "text": "git commit --only pathspec error"
+        },
+        {
+          "held_out": false,
+          "text": "committing a single path under contention"
+        },
+        {
+          "held_out": true,
+          "text": "staging one file while another process is writing the index"
+        }
+      ],
+      "project_id": "dark_factory",
+      "provenance": {
+        "source": "qdrant payload scroll, read-only, 2026-07-30"
+      },
+      "supersedes_pairs": [],
+      "topic": "git-conventions"
+    },
+    {
+      "canonical": {
+        "content_hash": "7ded508506c1bd65",
+        "content_prefix": "reify HARNESS-LAYOUT GATE — the decision rule. CANONICAL (consolidation round-2, 2026-07-27, curator gate esc-5534-1; supersedes 1a265e20 and folds in ad415479 ",
+        "last_known_id": "168c3a6b-55dd-4f53-88e4-3a829ea210fc"
+      },
+      "claim_queries": [
+        {
+          "needles": [
+            "WHEN THIS FIRES",
+            "harness-layout-gate-move-gotchas"
+          ],
+          "query": "what triggers the harness-layout gate"
+        }
+      ],
+      "derived_from": "curator_gate",
+      "members": [
+        "400bccbae8191294",
+        "9d3b8eb0ae17cb4f",
+        "a077f897f4db5661",
+        "aebb8e9f87504821",
+        "ba09646ea3c31de2"
+      ],
+      "phrasings": [
+        {
+          "held_out": false,
+          "text": "when does the reify harness-layout gate fire"
+        },
+        {
+          "held_out": false,
+          "text": "harness layout gate decision rule"
+        },
+        {
+          "held_out": true,
+          "text": "my diff adds a new top-level directory, do I need to move anything"
+        }
+      ],
+      "project_id": "reify",
+      "provenance": {
+        "cluster_id": "168c3a6b-55dd-4f53-88e4-3a829ea210fc",
+        "gate_ids": [
+          "esc-5534"
+        ],
+        "labels": {
+          "canonical": 1,
+          "duplicate": 5,
+          "other": 0
+        }
+      },
+      "supersedes_pairs": [
+        {
+          "successor_hash": "7ded508506c1bd65",
+          "superseded_hash": "400bccbae8191294"
+        },
+        {
+          "successor_hash": "7ded508506c1bd65",
+          "superseded_hash": "9d3b8eb0ae17cb4f"
+        },
+        {
+          "successor_hash": "7ded508506c1bd65",
+          "superseded_hash": "aebb8e9f87504821"
+        },
+        {
+          "successor_hash": "7ded508506c1bd65",
+          "superseded_hash": "ba09646ea3c31de2"
+        },
+        {
+          "successor_hash": "7ded508506c1bd65",
+          "superseded_hash": "a077f897f4db5661"
+        }
+      ],
+      "topic": "harness-layout-gate-decision-rule"
+    },
+    {
+      "canonical": {
+        "content_hash": "bab640fca7d3490c",
+        "content_prefix": "reify HARNESS-LAYOUT GATE — MECHANICAL APPENDIX: the C1 harness-move how-to and every gotcha that has bitten. Companion to the canonical decision rule (topic=ha",
+        "last_known_id": "417d86d0-36fe-42c8-851a-9ed0a18c64bb"
+      },
+      "claim_queries": [
+        {
+          "needles": [
+            "MECHANICAL APPENDIX",
+            "harness-layout-gate-decision-rule"
+          ],
+          "query": "which entry covers the harness move mechanics"
+        }
+      ],
+      "derived_from": "curator_gate",
+      "members": [
+        "510976bebdbc7b70",
+        "ee919611b86f9183",
+        "eeaf65c5ecd14564"
+      ],
+      "phrasings": [
+        {
+          "held_out": false,
+          "text": "how do I actually perform the C1 harness move"
+        },
+        {
+          "held_out": false,
+          "text": "harness layout move gotchas"
+        },
+        {
+          "held_out": true,
+          "text": "the mechanical steps for relocating a test harness directory"
+        }
+      ],
+      "project_id": "reify",
+      "provenance": {
+        "cluster_id": "417d86d0-36fe-42c8-851a-9ed0a18c64bb",
+        "gate_ids": [
+          "esc-5534"
+        ],
+        "labels": {
+          "canonical": 1,
+          "duplicate": 3,
+          "other": 0
+        }
+      },
+      "supersedes_pairs": [
+        {
+          "successor_hash": "bab640fca7d3490c",
+          "superseded_hash": "510976bebdbc7b70"
+        },
+        {
+          "successor_hash": "bab640fca7d3490c",
+          "superseded_hash": "eeaf65c5ecd14564"
+        },
+        {
+          "successor_hash": "bab640fca7d3490c",
+          "superseded_hash": "ee919611b86f9183"
+        }
+      ],
+      "topic": "harness-layout-gate-move-gotchas"
+    },
+    {
+      "canonical": {
+        "content_hash": "0f507c0c1b374613",
+        "content_prefix": "INV-GEO-1 mesh-contract mock gotcha — CANONICAL (merges de782198 + 76f848f3). Status: the trap itself was FIXED 2026-07-26 by commit ef4187454d (task #5105 δ, \"",
+        "last_known_id": "74802855-ba70-4cf6-8c3e-4c1c9a6a8afd"
+      },
+      "claim_queries": [
+        {
+          "needles": [
+            "MockGeometryKernel",
+            "THE TRAP"
+          ],
+          "query": "what did the mesh-contract mock get wrong"
+        }
+      ],
+      "derived_from": "curator_gate",
+      "members": [
+        "7a6ecd32ddaea7b2",
+        "f8e1005e94b44f16"
+      ],
+      "phrasings": [
+        {
+          "held_out": false,
+          "text": "INV-GEO-1 mesh contract mock gotcha"
+        },
+        {
+          "held_out": false,
+          "text": "MockGeometryKernel tessellate trap"
+        },
+        {
+          "held_out": true,
+          "text": "a geometry stub silently satisfied a contract it should have failed"
+        }
+      ],
+      "project_id": "reify",
+      "provenance": {
+        "cluster_id": "74802855-ba70-4cf6-8c3e-4c1c9a6a8afd",
+        "gate_ids": [
+          "esc-5552"
+        ],
+        "labels": {
+          "canonical": 1,
+          "duplicate": 2,
+          "other": 0
+        }
+      },
+      "supersedes_pairs": [
+        {
+          "successor_hash": "0f507c0c1b374613",
+          "superseded_hash": "f8e1005e94b44f16"
+        },
+        {
+          "successor_hash": "0f507c0c1b374613",
+          "superseded_hash": "7a6ecd32ddaea7b2"
+        }
+      ],
+      "topic": "inv-geo-1-mesh-contract-mock"
+    },
+    {
+      "canonical": {
+        "content_hash": "8f6a0c77220163bd",
+        "content_prefix": "NORM (learned the hard way 2026-07-25): a procedural memory that justifies a choice with a PERFORMANCE or",
+        "last_known_id": "fea3f9ad-7826-44b5-b26f-83f43a0641a5"
+      },
+      "claim_queries": [
+        {
+          "needles": [
+            "NORM",
+            "PERFORMANCE"
+          ],
+          "query": "what does the memory-hygiene norm say about performance claims"
+        }
+      ],
+      "derived_from": "hand",
+      "members": [],
+      "phrasings": [
+        {
+          "held_out": false,
+          "text": "how should a procedural memory justify its guidance"
+        },
+        {
+          "held_out": false,
+          "text": "memory hygiene norm for performance claims"
+        },
+        {
+          "held_out": true,
+          "text": "an entry argued from a benchmark that nobody can reproduce"
+        }
+      ],
+      "project_id": "dark_factory",
+      "provenance": {
+        "source": "qdrant payload scroll, read-only, 2026-07-30"
+      },
+      "supersedes_pairs": [],
+      "topic": "memory-hygiene"
+    },
+    {
+      "canonical": {
+        "content_hash": "cc142f3f1556397c",
+        "content_prefix": "reify: simulating a NEXTEST-LESS HOST for tests/infra/test_verify_*.sh suites — one canonical decision rule covering all three known techniques. CANONICAL (merg",
+        "last_known_id": "af367f55-72e5-4fb8-baba-3de219125612"
+      },
+      "claim_queries": [
+        {
+          "needles": [
+            "NEXTEST-LESS HOST",
+            "test_verify_"
+          ],
+          "query": "which techniques simulate a missing nextest"
+        }
+      ],
+      "derived_from": "curator_gate",
+      "members": [],
+      "phrasings": [
+        {
+          "held_out": false,
+          "text": "how do I simulate a nextest-less host"
+        },
+        {
+          "held_out": false,
+          "text": "testing verify.sh without cargo-nextest"
+        },
+        {
+          "held_out": true,
+          "text": "making the verify suite behave as if the test runner were absent"
+        }
+      ],
+      "project_id": "reify",
+      "provenance": {
+        "cluster_id": "af367f55-72e5-4fb8-baba-3de219125612",
+        "gate_ids": [
+          "esc-5606"
+        ],
+        "labels": {
+          "canonical": 1,
+          "duplicate": 0,
+          "other": 3
+        }
+      },
+      "supersedes_pairs": [],
+      "topic": "nextest-less-host-simulation"
+    },
+    {
+      "canonical": {
+        "content_hash": "a87fa4f3b2ec59ce",
+        "content_prefix": "Existing tests that patched invoke_with_cap_retry started silently no-oping after moving to shared/cli_invoke.",
+        "last_known_id": "b7c59390-0c58-4e4d-8961-8fc0dc6a2dde"
+      },
+      "claim_queries": [
+        {
+          "needles": [
+            "invoke_with_cap_retry",
+            "silently"
+          ],
+          "query": "what happened to tests patching invoke_with_cap_retry"
+        }
+      ],
+      "derived_from": "census_topic",
+      "members": [
+        "0e3e3622aaeafc73",
+        "2ffcd66e2c6a6290",
+        "47a254243ef01b80",
+        "49c22e08a1b43c5c",
+        "c0166164938cdd6f"
+      ],
+      "phrasings": [
+        {
+          "held_out": false,
+          "text": "patch the import site not the definition site"
+        },
+        {
+          "held_out": false,
+          "text": "why did my monkeypatch silently stop taking effect"
+        },
+        {
+          "held_out": true,
+          "text": "the stub was installed but the code under test still called the real thing"
+        }
+      ],
+      "project_id": "dark_factory",
+      "provenance": {
+        "source": "qdrant payload scroll, read-only, 2026-07-30"
+      },
+      "supersedes_pairs": [
+        {
+          "successor_hash": "a87fa4f3b2ec59ce",
+          "superseded_hash": "0e3e3622aaeafc73"
+        },
+        {
+          "successor_hash": "a87fa4f3b2ec59ce",
+          "superseded_hash": "2ffcd66e2c6a6290"
+        },
+        {
+          "successor_hash": "a87fa4f3b2ec59ce",
+          "superseded_hash": "47a254243ef01b80"
+        },
+        {
+          "successor_hash": "a87fa4f3b2ec59ce",
+          "superseded_hash": "49c22e08a1b43c5c"
+        },
+        {
+          "successor_hash": "a87fa4f3b2ec59ce",
+          "superseded_hash": "c0166164938cdd6f"
+        }
+      ],
+      "topic": "patch_import_site_testing"
+    },
+    {
+      "canonical": {
+        "content_hash": "0c2d92cc2b8d19da",
+        "content_prefix": "NEVER match processes by a pattern your own command line contains — `pkill -f` / `pgrep -f` SELF-MATCH. CANONICAL (merges 86187cbc + 052bf682 + 90a10d71 + the p",
+        "last_known_id": "d4b39613-bd62-4ad6-98e1-105cfcca254b"
+      },
+      "claim_queries": [
+        {
+          "needles": [
+            "SELF-MATCH",
+            "FULL command line"
+          ],
+          "query": "what is the pkill -f self-match mechanism"
+        }
+      ],
+      "derived_from": "curator_gate",
+      "members": [
+        "053504cc8bce5036",
+        "838647fa957b4bad",
+        "d2666d3d7a8d8de7"
+      ],
+      "phrasings": [
+        {
+          "held_out": false,
+          "text": "pkill -f self match"
+        },
+        {
+          "held_out": false,
+          "text": "why did pgrep match my own command line"
+        },
+        {
+          "held_out": true,
+          "text": "a cleanup command killed the shell that issued it"
+        }
+      ],
+      "project_id": "reify",
+      "provenance": {
+        "cluster_id": "d4b39613-bd62-4ad6-98e1-105cfcca254b",
+        "gate_ids": [
+          "esc-5547"
+        ],
+        "labels": {
+          "canonical": 1,
+          "duplicate": 3,
+          "other": 0
+        }
+      },
+      "supersedes_pairs": [
+        {
+          "successor_hash": "0c2d92cc2b8d19da",
+          "superseded_hash": "838647fa957b4bad"
+        },
+        {
+          "successor_hash": "0c2d92cc2b8d19da",
+          "superseded_hash": "d2666d3d7a8d8de7"
+        },
+        {
+          "successor_hash": "0c2d92cc2b8d19da",
+          "superseded_hash": "053504cc8bce5036"
+        }
+      ],
+      "topic": "pkill-pgrep-self-match"
+    },
+    {
+      "canonical": {
+        "content_hash": "beff63cfad8bac7b",
+        "content_prefix": "Worked example of the /prd G7 design-invariant walk and G6 premise check materially CHANGING a design rat",
+        "last_known_id": "34bc000d-6a0b-4177-b817-a75919c7fc30"
+      },
+      "claim_queries": [
+        {
+          "needles": [
+            "Worked example",
+            "G6"
+          ],
+          "query": "did the G7 walk change a design"
+        }
+      ],
+      "derived_from": "hand",
+      "members": [],
+      "phrasings": [
+        {
+          "held_out": false,
+          "text": "worked example of the prd G6 premise check"
+        },
+        {
+          "held_out": false,
+          "text": "has a design-invariant walk ever changed a design"
+        },
+        {
+          "held_out": true,
+          "text": "a gate that actually altered the outcome rather than rubber-stamping it"
+        }
+      ],
+      "project_id": "dark_factory",
+      "provenance": {
+        "source": "qdrant payload scroll, read-only, 2026-07-30"
+      },
+      "supersedes_pairs": [],
+      "topic": "prd-gates"
+    },
+    {
+      "canonical": {
+        "content_hash": "0788efd4a9fca4a1",
+        "content_prefix": "Orchestrator/fused-memory pytest-xdist gotcha (canonical, merges bbe45a4f's 6 prior entries + 6d203bd5)",
+        "last_known_id": "8bb3eb15-1133-4e7b-ac1f-5bac10329b51"
+      },
+      "claim_queries": [
+        {
+          "needles": [
+            "pytest-xdist",
+            "canonical"
+          ],
+          "query": "which entry is the xdist canonical"
+        }
+      ],
+      "derived_from": "topic_guard_cluster",
+      "members": [],
+      "phrasings": [
+        {
+          "held_out": false,
+          "text": "how do I force a test to run serially under xdist"
+        },
+        {
+          "held_out": false,
+          "text": "orchestrator pytest-xdist gotcha"
+        },
+        {
+          "held_out": true,
+          "text": "one test must not share a worker with the rest of its file"
+        }
+      ],
+      "project_id": "dark_factory",
+      "provenance": {
+        "source": "qdrant payload scroll, read-only, 2026-07-30"
+      },
+      "supersedes_pairs": [],
+      "topic": "pytest-xdist-serial-override"
+    },
+    {
+      "canonical": {
+        "content_hash": "2f558d78052d67d1",
+        "content_prefix": "Relevant context includes dark-factory conftest collision fix (task 977) which chose uniquely-named sibling mo",
+        "last_known_id": "c64c22ca-2610-4122-b61b-c6eb3c661a6e"
+      },
+      "claim_queries": [
+        {
+          "needles": [
+            "conftest",
+            "task 977"
+          ],
+          "query": "how was the conftest collision fixed"
+        }
+      ],
+      "derived_from": "census_topic",
+      "members": [
+        "08eabb522fe9b194",
+        "8f3ac5f8036fa885",
+        "bb49842018f70df6"
+      ],
+      "phrasings": [
+        {
+          "held_out": false,
+          "text": "pytest conftest module name collision"
+        },
+        {
+          "held_out": false,
+          "text": "importlib relative import gotcha in tests"
+        },
+        {
+          "held_out": true,
+          "text": "two test packages with the same basename collided at collection time"
+        }
+      ],
+      "project_id": "dark_factory",
+      "provenance": {
+        "source": "qdrant payload scroll, read-only, 2026-07-30"
+      },
+      "supersedes_pairs": [
+        {
+          "successor_hash": "2f558d78052d67d1",
+          "superseded_hash": "08eabb522fe9b194"
+        },
+        {
+          "successor_hash": "2f558d78052d67d1",
+          "superseded_hash": "8f3ac5f8036fa885"
+        },
+        {
+          "successor_hash": "2f558d78052d67d1",
+          "superseded_hash": "bb49842018f70df6"
+        }
+      ],
+      "topic": "pytest_importlib_relative_import_gotcha"
+    },
+    {
+      "canonical": {
+        "content_hash": "4551deee1a80a029",
+        "content_prefix": "RETIRED HISTORICAL BUG + a negative design lesson worth keeping: \"the reconciliation harness misroutes project_id='reify' to project_root='/home/leo/src/dark-fa",
+        "last_known_id": "6d0bd22b-c132-427c-8cc3-bb3657bd7525"
+      },
+      "claim_queries": [
+        {
+          "needles": [
+            "RETIRED",
+            "curator gate esc-5564-1"
+          ],
+          "query": "what is the status of the recon misroute bug"
+        }
+      ],
+      "derived_from": "curator_gate",
+      "members": [
+        "ca65c825a7f79226",
+        "ee0912f34dbe0cb6",
+        "fb754775dc965437"
+      ],
+      "phrasings": [
+        {
+          "held_out": false,
+          "text": "did reconciliation misroute reify to the dark-factory project root"
+        },
+        {
+          "held_out": false,
+          "text": "recon project_id project_root misroute"
+        },
+        {
+          "held_out": true,
+          "text": "is the cross-repo routing incident from april still live"
+        }
+      ],
+      "project_id": "reify",
+      "provenance": {
+        "cluster_id": "6d0bd22b-c132-427c-8cc3-bb3657bd7525",
+        "gate_ids": [
+          "esc-5564"
+        ],
+        "labels": {
+          "canonical": 1,
+          "duplicate": 3,
+          "other": 0
+        }
+      },
+      "supersedes_pairs": [
+        {
+          "successor_hash": "4551deee1a80a029",
+          "superseded_hash": "ee0912f34dbe0cb6"
+        },
+        {
+          "successor_hash": "4551deee1a80a029",
+          "superseded_hash": "fb754775dc965437"
+        },
+        {
+          "successor_hash": "4551deee1a80a029",
+          "superseded_hash": "ca65c825a7f79226"
+        }
+      ],
+      "topic": "recon-project-root-misroute-retired"
+    },
+    {
+      "canonical": {
+        "content_hash": "e4064af2d35b0d83",
+        "content_prefix": "Reconciliation cost model includes a fixed cost per run of ~40-60K Sonnet tokens",
+        "last_known_id": "696e1816-f681-400a-9e3e-3686da53c8f6"
+      },
+      "claim_queries": [
+        {
+          "needles": [
+            "Reconciliation cost model",
+            "per run"
+          ],
+          "query": "what is the fixed per-run reconciliation cost"
+        }
+      ],
+      "derived_from": "census_topic",
+      "members": [
+        "26f4e1bfd6bd366a",
+        "5096ef27f2ecdc6d",
+        "5dca5bef1c4e9dfd",
+        "611e30119a64afed",
+        "c34595748e62d442",
+        "d2f9375f8abee7a2"
+      ],
+      "phrasings": [
+        {
+          "held_out": false,
+          "text": "what does a reconciliation run cost"
+        },
+        {
+          "held_out": false,
+          "text": "reconciliation token cost model"
+        },
+        {
+          "held_out": true,
+          "text": "budgeting for the memory-sync pass on a quiet day"
+        }
+      ],
+      "project_id": "dark_factory",
+      "provenance": {
+        "source": "qdrant payload scroll, read-only, 2026-07-30"
+      },
+      "supersedes_pairs": [
+        {
+          "successor_hash": "e4064af2d35b0d83",
+          "superseded_hash": "26f4e1bfd6bd366a"
+        },
+        {
+          "successor_hash": "e4064af2d35b0d83",
+          "superseded_hash": "5096ef27f2ecdc6d"
+        },
+        {
+          "successor_hash": "e4064af2d35b0d83",
+          "superseded_hash": "5dca5bef1c4e9dfd"
+        },
+        {
+          "successor_hash": "e4064af2d35b0d83",
+          "superseded_hash": "611e30119a64afed"
+        },
+        {
+          "successor_hash": "e4064af2d35b0d83",
+          "superseded_hash": "c34595748e62d442"
+        },
+        {
+          "successor_hash": "e4064af2d35b0d83",
+          "superseded_hash": "d2f9375f8abee7a2"
+        }
+      ],
+      "topic": "reconciliation_cost_model"
+    },
+    {
+      "canonical": {
+        "content_hash": "f27e74233a9059d3",
+        "content_prefix": "reify-audit PTODO detector: running it from a task WORKTREE, and the two distinct invocation contexts. CANONICAL (merges d6cd4626 + 9f2d2ae6 + 676a4c57 + b65510",
+        "last_known_id": "77dbec57-9b91-47dc-9a43-90dd0da1cb26"
+      },
+      "claim_queries": [
+        {
+          "needles": [
+            "reify-audit-ptodo-detector.md",
+            "invocation contexts"
+          ],
+          "query": "what are the PTODO detector authorities"
+        }
+      ],
+      "derived_from": "curator_gate",
+      "members": [
+        "32a1968f2d69a35c",
+        "5692e608b1d8eabb",
+        "b0bd82fb4e74a089",
+        "b55df2d5b0741404"
+      ],
+      "phrasings": [
+        {
+          "held_out": false,
+          "text": "running the reify-audit PTODO detector from a worktree"
+        },
+        {
+          "held_out": false,
+          "text": "PTODO detector invocation contexts"
+        },
+        {
+          "held_out": true,
+          "text": "the audit tool reports nothing when I run it from a task branch checkout"
+        }
+      ],
+      "project_id": "reify",
+      "provenance": {
+        "cluster_id": "77dbec57-9b91-47dc-9a43-90dd0da1cb26",
+        "gate_ids": [
+          "esc-5567"
+        ],
+        "labels": {
+          "canonical": 1,
+          "duplicate": 4,
+          "other": 0
+        }
+      },
+      "supersedes_pairs": [
+        {
+          "successor_hash": "f27e74233a9059d3",
+          "superseded_hash": "b0bd82fb4e74a089"
+        },
+        {
+          "successor_hash": "f27e74233a9059d3",
+          "superseded_hash": "5692e608b1d8eabb"
+        },
+        {
+          "successor_hash": "f27e74233a9059d3",
+          "superseded_hash": "b55df2d5b0741404"
+        },
+        {
+          "successor_hash": "f27e74233a9059d3",
+          "superseded_hash": "32a1968f2d69a35c"
+        }
+      ],
+      "topic": "reify-audit-ptodo-from-worktree"
+    },
+    {
+      "canonical": {
+        "content_hash": "b8f643656c7748c3",
+        "content_prefix": "DRIVING THE reify-gui DEBUG MCP — CANONICAL (consolidates 9 entries, 2026-05-09..2026-07-26, under curator gate esc-5561-1). Companion: the gotcha appendix, top",
+        "last_known_id": "0e81aa96-a9f2-447e-a7e0-9095bbb1519c"
+      },
+      "claim_queries": [
+        {
+          "needles": [
+            "PORT CONTRACT",
+            "reify-debug-mcp-gotchas"
+          ],
+          "query": "what is the reify debug MCP port contract"
+        }
+      ],
+      "derived_from": "curator_gate",
+      "members": [
+        "23ce2c2ce21305c5",
+        "43a5c1ff78b0da05",
+        "4e4dc3745ae406da",
+        "5cde95301738c04d",
+        "7a7b06e1792dce5d",
+        "83751e18542da1ae",
+        "8747e9a280be5af5",
+        "8adb5fde9f10fbcb",
+        "9b7a9d5109701b7d"
+      ],
+      "phrasings": [
+        {
+          "held_out": false,
+          "text": "how do I drive the reify-gui debug MCP"
+        },
+        {
+          "held_out": false,
+          "text": "reify debug MCP port contract"
+        },
+        {
+          "held_out": true,
+          "text": "connecting a client to the gui debugging server end to end"
+        }
+      ],
+      "project_id": "reify",
+      "provenance": {
+        "cluster_id": "0e81aa96-a9f2-447e-a7e0-9095bbb1519c",
+        "gate_ids": [
+          "esc-5561"
+        ],
+        "labels": {
+          "canonical": 1,
+          "duplicate": 9,
+          "other": 0
+        }
+      },
+      "supersedes_pairs": [
+        {
+          "successor_hash": "b8f643656c7748c3",
+          "superseded_hash": "5cde95301738c04d"
+        },
+        {
+          "successor_hash": "b8f643656c7748c3",
+          "superseded_hash": "7a7b06e1792dce5d"
+        },
+        {
+          "successor_hash": "b8f643656c7748c3",
+          "superseded_hash": "8747e9a280be5af5"
+        },
+        {
+          "successor_hash": "b8f643656c7748c3",
+          "superseded_hash": "83751e18542da1ae"
+        },
+        {
+          "successor_hash": "b8f643656c7748c3",
+          "superseded_hash": "8adb5fde9f10fbcb"
+        },
+        {
+          "successor_hash": "b8f643656c7748c3",
+          "superseded_hash": "4e4dc3745ae406da"
+        },
+        {
+          "successor_hash": "b8f643656c7748c3",
+          "superseded_hash": "43a5c1ff78b0da05"
+        },
+        {
+          "successor_hash": "b8f643656c7748c3",
+          "superseded_hash": "23ce2c2ce21305c5"
+        },
+        {
+          "successor_hash": "b8f643656c7748c3",
+          "superseded_hash": "9b7a9d5109701b7d"
+        }
+      ],
+      "topic": "reify-debug-mcp-driving"
+    },
+    {
+      "canonical": {
+        "content_hash": "da33d5bba50329c9",
+        "content_prefix": "reify-gui DEBUG MCP — GOTCHA APPENDIX: the ways it lies to you, and how to tell. Companion to topic=reify-debug-mcp-driving (read that for the port contract, tr",
+        "last_known_id": "c8ca5f55-cb9a-4e11-9d9c-db37b89ad921"
+      },
+      "claim_queries": [
+        {
+          "needles": [
+            "GOTCHA APPENDIX",
+            "reify-debug-mcp-driving"
+          ],
+          "query": "what is the theme of the debug MCP gotchas"
+        }
+      ],
+      "derived_from": "curator_gate",
+      "members": [],
+      "phrasings": [
+        {
+          "held_out": false,
+          "text": "ways the reify-gui debug MCP lies to you"
+        },
+        {
+          "held_out": false,
+          "text": "debug MCP gotcha appendix"
+        },
+        {
+          "held_out": true,
+          "text": "the debugger answered confidently and was wrong, how do I tell"
+        }
+      ],
+      "project_id": "reify",
+      "provenance": {
+        "cluster_id": "c8ca5f55-cb9a-4e11-9d9c-db37b89ad921",
+        "gate_ids": [
+          "esc-5561"
+        ],
+        "labels": {
+          "canonical": 1,
+          "duplicate": 0,
+          "other": 0
+        }
+      },
+      "supersedes_pairs": [],
+      "topic": "reify-debug-mcp-gotchas"
+    },
+    {
+      "canonical": {
+        "content_hash": "0cb14865572918d0",
+        "content_prefix": "ADDING A TOOL TO THE reify-debug MCP — CANONICAL (consolidates 9 entries, 2026-05-05..2026-06-09, under curator gate esc-5563-1). Verified against the tree 2026",
+        "last_known_id": "e0a41fcd-0745-426b-bf71-45466e6d34e0"
+      },
+      "claim_queries": [
+        {
+          "needles": [
+            "ADDING A TOOL",
+            "reify-debug-mcp-driving"
+          ],
+          "query": "what is the authority for adding a debug MCP tool"
+        }
+      ],
+      "derived_from": "curator_gate",
+      "members": [
+        "387b6b012d88d2f5",
+        "38dbdfd4dd38562b",
+        "4bc889996ef68818",
+        "4c6f05544c724489",
+        "4e4ff9195a0e6ad9",
+        "731353c98fc7194e",
+        "971967c05b31b363",
+        "9f94cf70e21a2ea9",
+        "d15018c0a0f991f8"
+      ],
+      "phrasings": [
+        {
+          "held_out": false,
+          "text": "how do I add a tool to the reify-debug MCP"
+        },
+        {
+          "held_out": false,
+          "text": "registering a new debug MCP tool"
+        },
+        {
+          "held_out": true,
+          "text": "extending the debugging server with an extra command"
+        }
+      ],
+      "project_id": "reify",
+      "provenance": {
+        "cluster_id": "e0a41fcd-0745-426b-bf71-45466e6d34e0",
+        "gate_ids": [
+          "esc-5563"
+        ],
+        "labels": {
+          "canonical": 1,
+          "duplicate": 9,
+          "other": 0
+        }
+      },
+      "supersedes_pairs": [
+        {
+          "successor_hash": "0cb14865572918d0",
+          "superseded_hash": "387b6b012d88d2f5"
+        },
+        {
+          "successor_hash": "0cb14865572918d0",
+          "superseded_hash": "d15018c0a0f991f8"
+        },
+        {
+          "successor_hash": "0cb14865572918d0",
+          "superseded_hash": "4bc889996ef68818"
+        },
+        {
+          "successor_hash": "0cb14865572918d0",
+          "superseded_hash": "971967c05b31b363"
+        },
+        {
+          "successor_hash": "0cb14865572918d0",
+          "superseded_hash": "9f94cf70e21a2ea9"
+        },
+        {
+          "successor_hash": "0cb14865572918d0",
+          "superseded_hash": "731353c98fc7194e"
+        },
+        {
+          "successor_hash": "0cb14865572918d0",
+          "superseded_hash": "38dbdfd4dd38562b"
+        },
+        {
+          "successor_hash": "0cb14865572918d0",
+          "superseded_hash": "4c6f05544c724489"
+        },
+        {
+          "successor_hash": "0cb14865572918d0",
+          "superseded_hash": "4e4ff9195a0e6ad9"
+        }
+      ],
+      "topic": "reify-debug-mcp-tool-addition"
+    },
+    {
+      "canonical": {
+        "content_hash": "d01fe3ae0b42a0a3",
+        "content_prefix": "DELIBERATE PROVENANCE ORPHANING — read this before \"repairing\" Graphiti edges 3ef4c09f or 912e58e8. Recorded 2026-07-27 under curator gate esc-5603-1. WHAT HAPP",
+        "last_known_id": "a36eb715-a898-4eb8-80cb-d71d045b34f1"
+      },
+      "claim_queries": [
+        {
+          "needles": [
+            "DELIBERATE PROVENANCE ORPHANING",
+            "fabrication"
+          ],
+          "query": "what happened to the task-5422 episodes"
+        }
+      ],
+      "derived_from": "curator_gate",
+      "members": [],
+      "phrasings": [
+        {
+          "held_out": false,
+          "text": "why are graphiti edges 3ef4c09f and 912e58e8 orphaned"
+        },
+        {
+          "held_out": false,
+          "text": "deliberate provenance orphaning"
+        },
+        {
+          "held_out": true,
+          "text": "should I repair these two dangling edges or leave them alone"
+        }
+      ],
+      "project_id": "reify",
+      "provenance": {
+        "cluster_id": "a36eb715-a898-4eb8-80cb-d71d045b34f1",
+        "gate_ids": [
+          "esc-5603"
+        ],
+        "labels": {
+          "canonical": 1,
+          "duplicate": 0,
+          "other": 0
+        }
+      },
+      "supersedes_pairs": [],
+      "topic": "task-5422-fabrication-episode-disposition"
+    },
+    {
+      "canonical": {
+        "content_hash": "6c6d4a4ad7a0bbce",
+        "content_prefix": "reify: the `tracing` callsite-Interest cache-poisoning gotcha, and the TWO legitimate remedies. CANONICAL (merges 2200d20e + 524933e4 + 2eda458f; verified again",
+        "last_known_id": "70fd0700-9007-4ac0-9559-8616900715bc"
+      },
+      "claim_queries": [
+        {
+          "needles": [
+            "Interest",
+            "ROOT CAUSE"
+          ],
+          "query": "what are the remedies for Interest cache poisoning"
+        }
+      ],
+      "derived_from": "curator_gate",
+      "members": [],
+      "phrasings": [
+        {
+          "held_out": false,
+          "text": "tracing callsite Interest cache poisoning"
+        },
+        {
+          "held_out": false,
+          "text": "why does my tracing subscriber miss events"
+        },
+        {
+          "held_out": true,
+          "text": "log lines vanish after an earlier test installed its own collector"
+        }
+      ],
+      "project_id": "reify",
+      "provenance": {
+        "cluster_id": "70fd0700-9007-4ac0-9559-8616900715bc",
+        "gate_ids": [
+          "esc-5626"
+        ],
+        "labels": {
+          "canonical": 1,
+          "duplicate": 0,
+          "other": 3
+        }
+      },
+      "supersedes_pairs": [],
+      "topic": "tracing-interest-cache-poisoning"
+    },
+    {
+      "canonical": {
+        "content_hash": "0878002b4fb0163a",
+        "content_prefix": "CONSOLIDATED round-2b, 2026-07-27 (curator gate esc-5610-1; supersedes canonical 64564dd5 — itself a merge of 11 entries per task 5022 on 2026-07-05 — plus 5 re",
+        "last_known_id": "bf91bc5c-727c-48d8-a3cc-66e6938201ac"
+      },
+      "claim_queries": [
+        {
+          "needles": [
+            "architect re-invoked",
+            "CONSOLIDATED"
+          ],
+          "query": "what happens when an architect is re-invoked on task/NNNN"
+        }
+      ],
+      "derived_from": "curator_gate",
+      "members": [
+        "04e700e72948ede0",
+        "2dbb56b71cb88c1e",
+        "7087645ab5bb4e67",
+        "747524033f15c936",
+        "b0b810f8e9373ead",
+        "ea2f1308e8084399"
+      ],
+      "phrasings": [
+        {
+          "held_out": false,
+          "text": "architect re-invoked on a task branch loses plan.json"
+        },
+        {
+          "held_out": false,
+          "text": "plan json reconstruction after a lane reset"
+        },
+        {
+          "held_out": true,
+          "text": "the planner started over because its earlier plan was not on disk"
+        }
+      ],
+      "project_id": "reify",
+      "provenance": {
+        "cluster_id": "bf91bc5c-727c-48d8-a3cc-66e6938201ac",
+        "gate_ids": [
+          "esc-5610"
+        ],
+        "labels": {
+          "canonical": 1,
+          "duplicate": 6,
+          "other": 0
+        }
+      },
+      "supersedes_pairs": [
+        {
+          "successor_hash": "0878002b4fb0163a",
+          "superseded_hash": "7087645ab5bb4e67"
+        },
+        {
+          "successor_hash": "0878002b4fb0163a",
+          "superseded_hash": "b0b810f8e9373ead"
+        },
+        {
+          "successor_hash": "0878002b4fb0163a",
+          "superseded_hash": "04e700e72948ede0"
+        },
+        {
+          "successor_hash": "0878002b4fb0163a",
+          "superseded_hash": "ea2f1308e8084399"
+        },
+        {
+          "successor_hash": "0878002b4fb0163a",
+          "superseded_hash": "2dbb56b71cb88c1e"
+        },
+        {
+          "successor_hash": "0878002b4fb0163a",
+          "superseded_hash": "747524033f15c936"
+        }
+      ],
+      "topic": "warm-lane-plan-json-loss-reconstruction"
+    }
+  ],
+  "schema_version": 1
+}
