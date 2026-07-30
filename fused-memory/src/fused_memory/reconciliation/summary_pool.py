@@ -72,8 +72,21 @@ CYCLE_SUMMARY_TTL_DAYS: int = 30
 # reviewed and accepted as cheap, well-documented forward-compat metadata;
 # per YAGNI, no consumer is added here speculatively — one lands alongside
 # the dedup/near-duplicate tooling that needs it.
+#
+# Task 3041 gives LEDGER_STAMP its first two real readers: this module's own
+# record_type-aware eviction order in enforce_summary_pool_cap below, and
+# reconciliation.mem0_tombstone.is_protected_mirror_record. That module
+# mirrors this literal rather than importing it — it is imported BY this
+# module (for the trim-path tombstone write), so the reverse edge would be a
+# cycle. If either literal is ever edited, edit both.
 CYCLE_SUMMARY_RECORD_TYPE_LEDGER_STAMP: str = 'ledger_stamp'
 CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE: str = 'narrative'
+
+# metadata.kind identifying a cycle_summary record. Written by
+# write_cycle_summary's mirror below, keyed on by
+# services.memory_service._apply_cycle_summary_metadata_tagging, and now also
+# the enumeration constraint for enforce_summary_pool_cap (task 3041).
+_KIND_CYCLE_SUMMARY: str = 'cycle_summary'
 
 
 def _assume_utc(dt: datetime) -> datetime:
@@ -99,20 +112,52 @@ async def enforce_summary_pool_cap(
 ) -> int:
     """Trim the *recon_pool* pool to at most *cap* members.
 
-    Enumerates all Mem0 memories tagged ``{'recon_pool': recon_pool}`` via
+    Enumerates all Mem0 memories tagged
+    ``{'recon_pool': recon_pool, 'kind': 'cycle_summary'}`` via
     ``get_memories_by_metadata`` (deterministic Qdrant scroll — NOT semantic
-    search), sorts oldest-first by ``created_at``, then deletes the oldest
-    ``len - cap`` via parallel ``delete_memory`` calls.
+    search), sorts eviction-order-first, then deletes the first ``len - cap``
+    via parallel ``delete_memory`` calls.
 
     Best-effort posture (mirrors the original Stage 2
     ``_enforce_stage2_summary_pool_cap``):
     - Enumeration failure → logs WARNING, returns 0, does NOT raise.
     - Individual delete failure → logs WARNING, excluded from count.
 
-    Created_at ordering: uses the ``_assume_utc`` + ``datetime.fromisoformat``
-    convention. Members with missing/unparseable ``created_at`` sort LAST
-    (treated as newest/kept) so an undatable summary is never preferentially
-    deleted.
+    **Retention contract (task 3041).** Eviction order is
+    ``(is_ledger_stamp, has_parseable_created_at, created_at)``:
+
+    1. ``record_type='narrative'`` records are evicted BEFORE any
+       ``record_type='ledger_stamp'`` record. The ledger_stamp mirror is the
+       deterministic copy an auditor correlates against
+       :meth:`~fused_memory.services.memory_service.MemoryService.get_cycle_summary_presence`;
+       the narrative is the disposable LLM-authored duplicate that task 2468
+       already tried to suppress. Letting a narrative evict a ledger_stamp is
+       what made all three of run 84eae9bd's anchors vanish together (recon
+       gate 165 / esc-165-1).
+    2. Within a class, oldest-first by ``created_at`` (``_assume_utc`` +
+       ``datetime.fromisoformat``).
+    3. Members with missing/unparseable ``created_at`` sort LAST *within their
+       own class* (treated as newest/kept), preserving the pre-existing
+       invariant that an undatable summary is never preferentially deleted.
+    ``record_type`` is read defensively from ``item.get('metadata', {})`` — a
+    member dict with no metadata must not raise.
+
+    The ``kind`` filter constraint is load-bearing, not decorative:
+    ``_apply_cycle_summary_metadata_tagging`` is additive-only and never
+    strips a caller-supplied ``recon_pool``, so filtering on ``recon_pool``
+    alone would let a mis-tagged non-summary record join this pool and either
+    be trimmed by it or evict a real mirror.
+
+    **This pool is cap-bounded BY DESIGN, and that is not a bug.** A mirror
+    older than the newest *cap* ledger_stamps IS expected to be evicted — the
+    Mem0 mirror is documented as a best-effort searchable copy, and the
+    AUTHORITATIVE record is the ``ReconLedgerStore`` ``cycle_summary`` row
+    (read via ``get_cycle_summary_presence``), which survives untouched. What
+    was actually broken was DISCOVERABILITY: a designed eviction was
+    indistinguishable from silent data loss. From task 3041 on, every
+    eviction leaves a queryable tombstone. Raising the cap would only move
+    the cliff and trade a bounded pool for the unbounded growth tasks
+    1657/1831/2229 built this trim to prevent — so do NOT raise it.
 
     Args:
         memory_service: Service with ``get_memories_by_metadata`` and
@@ -133,7 +178,12 @@ async def enforce_summary_pool_cap(
     try:
         members = await memory_service.get_memories_by_metadata(
             project_id=project_id,
-            filters={'recon_pool': recon_pool},
+            # kind is load-bearing, not decorative (task 3041):
+            # _apply_cycle_summary_metadata_tagging is ADDITIVE-only and never
+            # strips a caller-supplied recon_pool, so filtering on recon_pool
+            # alone would let a mis-tagged non-summary record join this cap-2
+            # pool — and then either be trimmed by it or evict a real mirror.
+            filters={'recon_pool': recon_pool, 'kind': _KIND_CYCLE_SUMMARY},
         )
     except Exception:
         logger.warning(
@@ -149,14 +199,26 @@ async def enforce_summary_pool_cap(
         return 0
 
     def _sort_key(item: dict) -> tuple:
+        """Eviction order: narratives first, then oldest-first within a class.
+
+        Three-part key ``(is_ledger_stamp, has_parseable_created_at,
+        created_at)`` — ``sorted`` is ascending and the head of the list is
+        deleted, so ``False``/``0`` sorts first == is evicted first.
+        """
+        metadata = item.get('metadata')
+        record_type = (
+            metadata.get('record_type') if isinstance(metadata, dict) else None
+        )
+        is_ledger_stamp = record_type == CYCLE_SUMMARY_RECORD_TYPE_LEDGER_STAMP
+
         raw = item.get('created_at')
         if raw is None:
-            return (1, 0)
+            return (is_ledger_stamp, 1, 0)
         try:
             dt = _assume_utc(datetime.fromisoformat(raw))
-            return (0, dt)
+            return (is_ledger_stamp, 0, dt)
         except (ValueError, TypeError):
-            return (1, 0)
+            return (is_ledger_stamp, 1, 0)
 
     sorted_members = sorted(members, key=_sort_key)
     to_delete = sorted_members[: len(sorted_members) - cap]
