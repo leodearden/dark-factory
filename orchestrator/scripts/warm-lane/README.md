@@ -73,7 +73,8 @@ reify does not (the `.lane-state` record format, whose `state` values are the
 `LaneState` enum in `orchestrator/src/orchestrator/lane_lifecycle.py`; and
 `PROTECTED_PREFIXES` in `orchestrator/src/orchestrator/git_ops.py`). Its
 lane-state half was lifted out of `warm-lane-audit.sh`'s private reader — see
-Delta 4.
+Delta 4; its protected-prefix half has no in-tree consumer until leaf γ — see
+Delta 5.
 
 ### Why these ten
 
@@ -241,6 +242,58 @@ rewire, so editing it here would collide with γ's scope for no gain. Note β's
 renderer excludes the bands a pool sweep OWNS (`_lane-`, `_spec-`): handing
 those to gc as *protected* would make it skip every lane in both passes and stop
 reclaim outright.
+
+**`lane_protect_glob` therefore has NO in-tree consumer yet.** It and
+`LANE_PROTECT_GLOB_FALLBACK` ship ahead of the caller that uses them; today only
+`orchestrator/tests/test_lane_state_lib.py` exercises them. `warm-lane-audit.sh`
+sources the lib but uses only its lane-state half. Two consequences for whoever
+picks up γ, neither of them validated in situ here:
+
+- The `glob="$(lane_protect_glob …)" || glob="$LANE_PROTECT_GLOB_FALLBACK"`
+  contract is a *contract*, not an observed behaviour — no shipped caller
+  exercises the `||` yet.
+- Whatever names the deployment's interactive band must reach the bridge in
+  `REIFY_WARM_LANE_IACT_PREFIX` (below). `warm-lane-gc.sh`'s current
+  hand-maintained default hardcodes `_iact-*`, and also omits `.lane-state` and
+  `.task-meta` — the live INV-5 drift this leaf exists to make un-writable, and
+  which persists until γ deletes that default.
+
+### Delta 5 — `lib_lane_state.sh` reads the deployment's interactive band
+
+Not a divergence from reify (this file has no reify source) — recorded here
+because it is the one input `lane_protect_glob` takes from *outside* the
+registry, and the one way its answer can be wrong while looking right.
+
+Ten of the eleven `PROTECTED_PREFIXES` keys are constants, so rendering them
+cannot be wrong. The eleventh is not in the constant at all: the interactive
+band is `git.iact_prefix`, per-deployment config, merged in by
+`default_protected_prefixes()`. A bridge that rendered the FIELD DEFAULT would
+hand a renamed deployment a glob protecting `_iact-*` — a band it never mints —
+while omitting the band it does, so a wired sweep could reclaim live interactive
+worktrees. `lane_protect_glob` therefore reads **`REIFY_WARM_LANE_IACT_PREFIX`**
+(unset or empty ⇒ the field default; the value REPLACES the band rather than
+adding to it, matching `GitOps.protected_prefixes()`). The `REIFY_` namespace is
+the sibling scripts' one env namespace — renaming it wholesale is downstream
+leaf work, not this file's.
+
+Two robustness properties of the same bridge, pinned by the same test class:
+
+- **It prefers the checkout's own `.venv/bin/python3` over `PATH`.** The import
+  chain reaches pydantic, so a dependency-less system interpreter — what
+  `PATH=/usr/bin:/bin` gives a systemd unit, which is exactly this lib's stated
+  invocation path — cannot run it at all. Without the preference the sweep would
+  warn and degrade to the static fallback on *every* run: permanently reduced,
+  while training operators to read `[warn]` as noise. PATH `python3` stays the
+  fallback for a checkout with no in-tree venv.
+- **It probes the repo root it resolved, rather than trusting the arithmetic.**
+  These scripts are relocatable (`GitOps._project_script` prefers a
+  project-local override copy), and `cd ../../..` succeeds on almost anything,
+  so a copy at a different depth would aim PYTHONPATH at an unrelated directory
+  and degrade with an opaque `ImportError`. The root must now carry
+  `orchestrator/src/orchestrator/git_ops.py` or the function emits its one
+  attributable `[warn]` and returns non-zero. This narrows the wrong-root hazard
+  to *another dark-factory checkout at the same depth*; it does not eliminate
+  it, and that residue is the one case the fail-loud contract cannot detect.
 
 ## Sibling-seed defaults, and who resolves them
 
