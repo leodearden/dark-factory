@@ -265,16 +265,37 @@ def _write_detaching_terminal(
     p.chmod(0o755)
 
 
-def _base_env(bin_dir: pathlib.Path, terminal_name: str) -> dict[str, str]:
+def _hermetic_environ() -> dict[str, str]:
+    """Return a copy of the process environment with every known ambient
+    leak scrubbed -- the shared base for every env-construction site in
+    this file.
+    """
     env = dict(os.environ)
-    env["PATH"] = str(bin_dir) + ":" + env.get("PATH", "")
-    env["CLAUDE_TERMINAL_CMD"] = terminal_name
     env.pop("ESCALATION_TERMINAL_CMD", None)
     # The host's ~/.claude/settings.json env block (belt-and-braces layer of
     # the transcript-persistence fix) injects this into every Bash subprocess
     # -- including this pytest run. Drop it so the persistence-export tests
     # assert spawn-claude.sh's OWN unconditional export, not an ambient leak.
     env.pop("CLAUDE_CODE_FORCE_SESSION_PERSISTENCE", None)
+    # skills/spawn/spawn-claude.sh exports CLAUDE_SPAWN_SESSION_ID/PARENT_ID/
+    # WM_TITLE/RESULT_FILE into every session it launches (orchestrator adds
+    # ROLE/PROJECT/TASK_ID on top), so a suite run from INSIDE a spawned
+    # session -- e.g. an L2 escalation-watcher /unblock session running this
+    # suite before submitting a merge -- inherits them, while the merge
+    # worker's clean systemd unit never does, hiding the leak from CI.
+    # Prefix-generic by design (3rd point-fix of this class; the set keeps
+    # growing) -- sibling mechanism for the orchestrator suite:
+    # orchestrator/tests/test_session_hooks.py::_clear_claude_spawn_env
+    # (task 2643).
+    for key in [k for k in env if k.startswith("CLAUDE_SPAWN_")]:
+        env.pop(key, None)
+    return env
+
+
+def _base_env(bin_dir: pathlib.Path, terminal_name: str) -> dict[str, str]:
+    env = _hermetic_environ()
+    env["PATH"] = str(bin_dir) + ":" + env.get("PATH", "")
+    env["CLAUDE_TERMINAL_CMD"] = terminal_name
     # Keep the genuine-launcher-failure grace short so tests don't hang.
     env["SPAWN_LAUNCH_GRACE_SECS"] = "2"
     # Isolate the session-registry writes spawn-claude.sh now performs
