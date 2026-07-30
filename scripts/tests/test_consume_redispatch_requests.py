@@ -298,3 +298,198 @@ def test_non_stale_verdict_is_a_hard_skip(requests_dir, verdict):
     so the consumer refuses it rather than inferring intent."""
     req = _load(write_request(requests_dir, 5, 'gate_closure', verdict=verdict))
     assert req.skip_reason is not None and 'verdict' in req.skip_reason
+
+
+# ── step-3: the stdlib MCP client ────────────────────────────────────────────
+#
+# The consumer talks to the fused-memory MCP server over streamable HTTP with
+# urllib.request (stdlib-only posture -- see the module docstring). That means
+# re-implementing four behaviours the httpx McpClient in
+# fused-memory/scripts/cgl_eta_scheduler_gate.py already handles, so each one
+# gets a test here against a real socket rather than a mock.
+
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+
+class _FakeMcpServer:
+    """A real HTTP server on an ephemeral port, scripted per-request.
+
+    Records every received (headers, payload) so the client's session-id
+    handling can be asserted on the wire, not on internal attributes.
+    """
+
+    def __init__(self, responder):
+        self.received = []
+        self._responder = responder
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = 'HTTP/1.1'
+
+            def do_POST(self):
+                length = int(self.headers.get('Content-Length') or 0)
+                raw = self.rfile.read(length) if length else b''
+                try:
+                    payload = json.loads(raw) if raw else {}
+                except json.JSONDecodeError:
+                    payload = {'_raw': raw.decode()}
+                outer.received.append((dict(self.headers), payload))
+                status, headers, body = outer._responder(payload, len(outer.received))
+                data = body.encode()
+                self.send_response(status)
+                for k, v in headers.items():
+                    self.send_header(k, v)
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                if data:
+                    self.wfile.write(data)
+
+            def log_message(self, *a):
+                pass
+
+        self._httpd = HTTPServer(('127.0.0.1', 0), Handler)
+        self.url = f'http://127.0.0.1:{self._httpd.server_port}/mcp'
+
+    def __enter__(self):
+        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._httpd.shutdown()
+        self._httpd.server_close()
+        self._thread.join(timeout=5)
+
+
+def _json_rpc_ok(payload, result):
+    return json.dumps({'jsonrpc': '2.0', 'id': payload.get('id'), 'result': result})
+
+
+def _default_responder(session_id='sess-abc123', tool_result=None):
+    """initialize -> assigns a session id; notifications/initialized -> 202;
+    tools/call -> structuredContent."""
+    tool_result = tool_result if tool_result is not None else {'ok': True}
+
+    def responder(payload, n):
+        method = payload.get('method')
+        if method == 'initialize':
+            return (200, {'Content-Type': 'application/json',
+                          'mcp-session-id': session_id},
+                    _json_rpc_ok(payload, {'protocolVersion': '2024-11-05'}))
+        if method == 'notifications/initialized':
+            return (202, {}, '')
+        return (200, {'Content-Type': 'application/json'},
+                _json_rpc_ok(payload, {'structuredContent': tool_result}))
+
+    return responder
+
+
+def test_initialize_is_sent_session_less(requests_dir):
+    """The MCP streamable-HTTP contract requires the FIRST request to carry no
+    session id. A stateful server 404s "Session not found" on an invented one."""
+    with _FakeMcpServer(_default_responder()) as srv:
+        with crr.McpClient(srv.url) as client:
+            client.call_tool('get_task', {'id': '1'})
+    init_headers, init_payload = srv.received[0]
+    assert init_payload['method'] == 'initialize'
+    assert not any(k.lower() == 'mcp-session-id' for k in init_headers)
+
+
+def test_server_assigned_session_id_is_echoed_on_every_later_request():
+    with _FakeMcpServer(_default_responder(session_id='sess-xyz')) as srv:
+        with crr.McpClient(srv.url) as client:
+            client.call_tool('get_task', {'id': '1'})
+            client.call_tool('get_task', {'id': '2'})
+    assert len(srv.received) >= 4  # initialize, initialized, 2x tools/call
+    for headers, payload in srv.received[1:]:
+        got = {k.lower(): v for k, v in headers.items()}.get('mcp-session-id')
+        assert got == 'sess-xyz', payload.get('method')
+
+
+def test_session_id_is_captured_before_the_202_empty_body_early_return():
+    """`notifications/initialized` may answer 202 with NO body. Capturing the
+    header only after an empty-body early return loses the id entirely."""
+    def responder(payload, n):
+        if payload.get('method') == 'initialize':
+            # 202 + empty body + a session id, all at once: the exact shape the
+            # capture-before-early-return ordering exists for.
+            return (202, {'mcp-session-id': 'sess-from-202'}, '')
+        if payload.get('method') == 'notifications/initialized':
+            return (202, {}, '')
+        return (200, {'Content-Type': 'application/json'},
+                _json_rpc_ok(payload, {'structuredContent': {'ok': True}}))
+
+    with _FakeMcpServer(responder) as srv:
+        with crr.McpClient(srv.url) as client:
+            client.call_tool('get_task', {'id': '1'})
+    tool_headers = {k.lower(): v for k, v in srv.received[-1][0].items()}
+    assert tool_headers.get('mcp-session-id') == 'sess-from-202'
+
+
+def test_sse_response_is_parsed_by_extracting_the_first_data_line():
+    def responder(payload, n):
+        if payload.get('method') == 'initialize':
+            return (200, {'Content-Type': 'application/json',
+                          'mcp-session-id': 's'},
+                    _json_rpc_ok(payload, {}))
+        if payload.get('method') == 'notifications/initialized':
+            return (202, {}, '')
+        inner = _json_rpc_ok(payload, {'structuredContent': {'id': '5321'}})
+        return (200, {'Content-Type': 'text/event-stream'},
+                f'event: message\ndata: {inner}\n\n')
+
+    with _FakeMcpServer(responder) as srv:
+        with crr.McpClient(srv.url) as client:
+            assert client.call_tool('get_task', {'id': '5321'}) == {'id': '5321'}
+
+
+def test_structured_content_is_preferred_and_text_content_is_the_fallback():
+    with _FakeMcpServer(_default_responder(tool_result={'id': '7'})) as srv:
+        with crr.McpClient(srv.url) as client:
+            assert client.call_tool('get_task', {'id': '7'}) == {'id': '7'}
+
+    def text_responder(payload, n):
+        if payload.get('method') == 'initialize':
+            return (200, {'Content-Type': 'application/json', 'mcp-session-id': 's'},
+                    _json_rpc_ok(payload, {}))
+        if payload.get('method') == 'notifications/initialized':
+            return (202, {}, '')
+        return (200, {'Content-Type': 'application/json'},
+                _json_rpc_ok(payload, {
+                    'content': [{'type': 'text', 'text': json.dumps({'id': '9'})}]}))
+
+    with _FakeMcpServer(text_responder) as srv:
+        with crr.McpClient(srv.url) as client:
+            assert client.call_tool('get_task', {'id': '9'}) == {'id': '9'}
+
+
+def test_json_rpc_error_raises_rather_than_reading_as_success():
+    """An {"error": ...} envelope carries no result. Treating it as success is
+    how a failed write gets counted as applied -- exactly the confusion the
+    apply path's definite applied/failed outcome exists to prevent."""
+    def responder(payload, n):
+        if payload.get('method') == 'initialize':
+            return (200, {'Content-Type': 'application/json', 'mcp-session-id': 's'},
+                    _json_rpc_ok(payload, {}))
+        if payload.get('method') == 'notifications/initialized':
+            return (202, {}, '')
+        return (200, {'Content-Type': 'application/json'},
+                json.dumps({'jsonrpc': '2.0', 'id': payload.get('id'),
+                            'error': {'code': -32602, 'message': 'boom'}}))
+
+    with _FakeMcpServer(responder) as srv:
+        with crr.McpClient(srv.url) as client:
+            with pytest.raises(RuntimeError, match='boom'):
+                client.call_tool('set_task_status', {'id': '1', 'status': 'pending'})
+
+
+def test_client_identifies_itself_explicitly():
+    """The interceptor derives an actor class from clientInfo, so naming
+    ourselves is a deliberate choice rather than an incidental default."""
+    with _FakeMcpServer(_default_responder()) as srv:
+        with crr.McpClient(srv.url) as client:
+            client.call_tool('get_task', {'id': '1'})
+    _, init_payload = srv.received[0]
+    assert init_payload['params']['clientInfo']['name'] == crr.CLIENT_NAME
+    assert crr.CLIENT_NAME
