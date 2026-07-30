@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from shared.cli_invoke import AgentResult
-from shared.config_dir import TaskConfigDir
+from shared.config_dir import CONFIG_DIR_PREFIX, TaskConfigDir
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.invocation_outcome import CapHit, NearCap, classify_invocation
 from shared.usage_gate import (
@@ -789,6 +789,82 @@ class TestProbeConfigDirIsolation:
 
         mocks['work'].cleanup.assert_called_once()
         mocks['personal'].cleanup.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Probe-dir leak sweep (task 3086). The per-(account, pid) naming above fixed
+# the credential race but traded it for an unbounded /tmp population: nothing
+# reclaimed a dir once its owner was SIGKILLed, and the evals runner and the
+# recon harness never call shutdown() at all. 433,384 dirs / ~1.3M inodes were
+# measured on the reify host on 2026-07-27. A dead-PID sweep at gate
+# construction is the bound that survives SIGKILL.
+# ---------------------------------------------------------------------------
+
+PROBE_DIR_PREFIX = CONFIG_DIR_PREFIX + 'usage-gate-probe-'
+
+
+class TestProbeConfigDirLeakSweep:
+    """Stale probe-dir reclamation wired into UsageGate (task 3086)."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_sweep_guard(self, monkeypatch):
+        """Start every case as if this were a fresh process."""
+        monkeypatch.setattr('shared.usage_gate._probe_dir_sweep_done', False)
+
+    def test_gate_construction_sweeps_stale_probe_dirs(self):
+        with patch('shared.usage_gate.sweep_stale_pid_dirs', return_value=0) as sweep:
+            make_gate(['work'])
+
+        sweep.assert_called_once()
+
+    def test_sweep_prefix_covers_both_leaked_dir_shapes(self):
+        """The prefix must be the shared stem of both naming shapes.
+
+        Built from CONFIG_DIR_PREFIX rather than hard-coded, so it cannot
+        drift from the construction template.
+        """
+        with patch('shared.usage_gate.sweep_stale_pid_dirs', return_value=0) as sweep:
+            make_gate(['work'])
+
+        prefix = sweep.call_args.args[0]
+        assert prefix == PROBE_DIR_PREFIX
+        # Both shapes the gate actually creates start with it: the
+        # per-account dir and the no-accounts alias.
+        pid = os.getpid()
+        assert f'{CONFIG_DIR_PREFIX}usage-gate-probe-work-{pid}'.startswith(prefix)
+        assert f'{CONFIG_DIR_PREFIX}usage-gate-probe-{pid}'.startswith(prefix)
+
+    def test_sweep_runs_at_most_once_per_process(self):
+        """A make_gate-heavy run or an evals loop must not re-scan /tmp.
+
+        The pathological /tmp this bounds has a 40 MB directory inode, so a
+        per-gate readdir would be a real startup cost.
+        """
+        with patch('shared.usage_gate.sweep_stale_pid_dirs', return_value=0) as sweep:
+            make_gate(['work'])
+            make_gate(['personal'])
+            make_gate(['work', 'personal'])
+
+        sweep.assert_called_once()
+
+    def test_sweep_failure_cannot_break_gate_construction(self, caplog):
+        """Tmp hygiene must never be able to fail orchestrator startup."""
+        with caplog.at_level(logging.WARNING, logger='shared.usage_gate'), \
+                patch('shared.usage_gate.sweep_stale_pid_dirs', side_effect=OSError('boom')):
+            gate = make_gate(['work'])
+
+        assert gate._accounts
+        assert gate._probe_config_dirs['work'].path.exists()
+        assert any(r.levelno >= logging.WARNING for r in caplog.records)
+
+    def test_guard_is_set_even_when_the_sweep_raises(self):
+        """A raising sweep must not re-run on every subsequent gate."""
+        with patch('shared.usage_gate.sweep_stale_pid_dirs',
+                   side_effect=OSError('boom')) as sweep:
+            make_gate(['work'])
+            make_gate(['personal'])
+
+        sweep.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
