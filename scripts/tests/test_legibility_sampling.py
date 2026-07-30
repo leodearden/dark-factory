@@ -468,6 +468,90 @@ class TestStratifiedSampleReserveExceedsBudget:
         assert 'recon-2' not in selected_ids
 
 
+class TestStratifiedSampleRealWorldSizes:
+    """Realistically-sized sessions must still be selectable under the STOCK
+    daily budget, with NO cost_fn injected.
+
+    This pins the live defect. ``budgets.max_daily_digest_bytes`` is 300_000
+    — a DIGEST-output budget sized for ~19 of the §7.2 15KB digests a night
+    — but the sampler charged it against the raw ``.jsonl`` transcript size.
+    Real reify sessions run 0.5-6.5MB, so EVERY ONE of the records below
+    individually exceeds the entire nightly budget when charged at raw
+    transcript size: each reserve group is skipped whole, the greedy
+    leftover fill halts at its first record, and the selection comes back
+    empty. That is exactly why the live nightly trickle selected nothing at
+    all from 2026-07-16 to 2026-07-29.
+
+    Charged in the right units the same sessions are trivially affordable:
+    a measured 879,254-byte transcript of this shape renders to a
+    15,123-byte digest, so the per-stratum floor of 2 costs at most 2 x
+    15360 = 30_720 against 300_000. A non-empty selection is therefore
+    guaranteed by construction, not hoped for.
+    """
+
+    def _stock_config(self):
+        """The shipped budget/sampling numbers, verbatim — the point of these
+        tests is that the STOCK configuration works on real session sizes."""
+        return config_mod.LegibilityConfig(
+            project_id='dark_factory',
+            project_root='/home/leo/src/dark-factory',
+            escalation_port=8103,
+            cwd_prefixes=['/home/leo/src/dark-factory'],
+            budgets=config_mod.Budgets(max_daily_digest_bytes=300_000),
+            sampling=config_mod.Sampling(top_fraction=0.12, per_stratum_min=2),
+        )
+
+    def _single_stratum(self):
+        # Distinct WORD stems, never digits: _normalize_first_turn collapses
+        # digit runs to '#', so 'session 1'/'session 2' would fingerprint
+        # identically and dedupe away.
+        names = ('alpha', 'beta', 'gamma', 'delta', 'epsilon')
+        return [
+            _scored(
+                f'orch-{name}', 'orchestrated-task',
+                mod.SignalCounts(tool_error=score),
+                f'orchestrated task session {name}',
+                6_000_000,
+            )
+            for name, score in zip(names, (40, 35, 30, 25, 20))
+        ]
+
+    def _two_strata(self):
+        records = self._single_stratum()[:4]
+        for name, score in zip(('one', 'two', 'three'), (18, 14, 11)):
+            records.append(
+                _scored(
+                    f'recon-{name}', 'recon', mod.SignalCounts(not_found=score),
+                    f'reconciliation run {name}', 4_500_000,
+                )
+            )
+        return records
+
+    def test_multi_mb_sessions_are_still_selected(self):
+        result = mod.stratified_sample(self._single_stratum(), self._stock_config())
+        assert result.selected != []
+        assert len(result.selected) >= 2
+        assert result.budget_skipped == 0
+        assert result.bytes_used <= 300_000
+
+    def test_multi_mb_sessions_do_not_starve_a_second_stratum(self):
+        result = mod.stratified_sample(self._two_strata(), self._stock_config())
+        assert set(result.per_stratum_counts) == {'orchestrated-task', 'recon'}
+        assert result.per_stratum_counts['orchestrated-task'] >= 2
+        assert result.per_stratum_counts['recon'] >= 2
+        assert result.budget_skipped == 0
+        assert result.bytes_used <= 300_000
+
+    def test_bytes_used_is_not_the_raw_transcript_size(self):
+        # The units claim, stated directly: bytes_used describes digest
+        # output, so it must be nowhere near the 30MB of raw transcript the
+        # selection's sessions occupy on disk.
+        result = mod.stratified_sample(self._single_stratum(), self._stock_config())
+        raw_total = sum(r.size_bytes for r in result.selected)
+        assert raw_total >= 12_000_000
+        assert result.bytes_used < raw_total
+
+
 class TestStratifiedSampleCostSeam:
     """``stratified_sample`` charges the byte budget through an injectable
     per-record ``cost_fn`` seam, not through ``record.size_bytes``.
