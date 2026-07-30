@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from legibility import census_trigger, codebook, nightly
+from legibility import census_trigger, codebook, digest, nightly
 from legibility.config import load_config
 
 
@@ -206,6 +206,114 @@ def test_select_scored_records_excludes_out_of_scope_sessions(tmp_path):
     scored = nightly.select_scored_records(cfg, projects_root, date(2026, 7, 13))
 
     assert scored == []
+
+
+# ---------------------------------------------------------------------------
+# task 3268: select_digest_sessions charges DIGEST bytes, not raw transcript size
+# ---------------------------------------------------------------------------
+
+def _write_multi_mb_transcript(
+    path: Path, *, cwd: str, timestamp: str, session_id: str = 'session-big',
+    error_lines: int = 3000,
+) -> None:
+    """A :func:`_write_transcript`-shaped session padded to a REAL on-disk
+    size larger than the stock 300_000-byte daily budget.
+
+    This is the shape reify sessions actually have — thousands of
+    ``is_error`` tool_results — at ~400-900KB, the low end of the measured
+    0.5-6.5MB range."""
+    lines = [
+        {
+            'type': 'user', 'cwd': cwd, 'timestamp': timestamp, 'sessionId': session_id,
+            'message': {'role': 'user', 'content': 'please fix this confusing bug'},
+        },
+    ]
+    for i in range(error_lines):
+        lines.append({
+            'type': 'user', 'cwd': cwd, 'timestamp': timestamp, 'sessionId': session_id,
+            'message': {
+                'role': 'user',
+                'content': [
+                    {'type': 'tool_result', 'tool_use_id': f'tool-{i}', 'is_error': True,
+                     'content': f'No such file or directory: /tmp/missing-{i} ' + 'x' * 180},
+                ],
+            },
+        })
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('\n'.join(json.dumps(line) for line in lines) + '\n', encoding='utf-8')
+
+
+def test_select_digest_sessions_charges_real_digest_bytes(tmp_path, monkeypatch):
+    """The cost basis handed to the sampler must be the REAL rendered digest
+    size, computed at exactly the ``max_bytes`` ``build_digests`` will later
+    render with.
+
+    Both halves matter. Real digest bytes make ``max_daily_digest_bytes``
+    mean what it says; the SAME max_bytes constant makes ``bytes_used``
+    describe the digests that actually get produced rather than a parallel
+    estimate free to drift from them.
+    """
+    work_cwd = str(tmp_path / 'work')
+    cfg = load_config(_write_config(tmp_path, project_id='proj_a', cwd_prefixes=[work_cwd]))
+    projects_root = tmp_path / 'projects'
+    session_path = projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl'
+    _write_transcript(session_path, cwd=work_cwd, timestamp='2026-07-13T10:00:00Z')
+
+    captured = {}
+
+    def spy_stratified_sample(records, config, *, cost_fn=None):
+        captured['cost_fn'] = cost_fn
+        captured['records'] = list(records)
+        return nightly.sampling.SampleResult(
+            selected=list(records), per_stratum_counts={}, zero_signal_dropped=0,
+            bytes_used=0,
+        )
+
+    monkeypatch.setattr(nightly.sampling, 'stratified_sample', spy_stratified_sample)
+
+    nightly.select_digest_sessions(cfg, projects_root, date(2026, 7, 13))
+
+    cost_fn = captured['cost_fn']
+    assert cost_fn is not None, 'select_digest_sessions passed no cost_fn'
+
+    record = captured['records'][0]
+    expected = len(
+        digest.build_digest(
+            record.path,
+            agent_class_override=record.stratum,
+            max_bytes=nightly.DEFAULT_MAX_DIGEST_BYTES,
+        ).encode('utf-8')
+    )
+    assert cost_fn(record) == expected
+    assert expected != record.size_bytes
+
+
+def test_select_digest_sessions_selects_multi_mb_session_under_stock_budget(tmp_path):
+    """A session whose RAW transcript dwarfs the whole nightly budget must
+    still be selected — the live defect, end to end.
+
+    Measured basis: an 879,254-byte transcript of this shape renders to a
+    15,123-byte digest, so it costs ~5% of the 300_000-byte budget rather
+    than 293% of it. Charged at raw transcript size the single reserve
+    group here is skipped whole, the greedy leftover fill has nothing to
+    add, and select_digest_sessions returns [] — which is exactly what the
+    live nightly run did every night from 2026-07-16 to 2026-07-29.
+    """
+    work_cwd = str(tmp_path / 'work')
+    cfg = load_config(_write_config(tmp_path, project_id='proj_a', cwd_prefixes=[work_cwd]))
+    assert cfg.budgets.max_daily_digest_bytes == 300000, 'fixture must use the STOCK budget'
+
+    projects_root = tmp_path / 'projects'
+    session_path = projects_root / _encode_cwd(work_cwd) / 'session-big.jsonl'
+    _write_multi_mb_transcript(
+        session_path, cwd=work_cwd, timestamp='2026-07-13T10:00:00Z',
+    )
+    raw_size = session_path.stat().st_size
+    assert raw_size > 300000, f'fixture must exceed the whole budget; got {raw_size}'
+
+    selected = nightly.select_digest_sessions(cfg, projects_root, date(2026, 7, 13))
+
+    assert [r.path for r in selected] == [session_path]
 
 
 # ---------------------------------------------------------------------------
