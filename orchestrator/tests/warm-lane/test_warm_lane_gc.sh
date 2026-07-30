@@ -17,7 +17,10 @@
 #       reclaim missing --worktrees-dir or --base-target; --status-cmd is now
 #       an unknown flag (A8) — the Tier-3 machinery was removed (task 5326);
 #       a MISSING sibling scripts/lib_live_refs.sh fails LOUD with exit 2
-#       (wiring error) before argv is parsed (A9, task 5572 review)
+#       (wiring error) before argv is parsed (A9, task 5572 review); the same
+#       contract for the new sibling scripts/lib_lane_state.sh, with
+#       lib_live_refs.sh PRESENT so A9's guard cannot account for it
+#       (A10, task 3075)
 #   B — reset a divergent FREE lane (seed-script invoked with resolved gen path)
 #   C — remove an orphaned-landed clean worktree
 #   D — always-reclaim (task 5326): a DIRTY POOL LANE is now RECLAIMED (reset),
@@ -318,6 +321,36 @@ assert "A9: missing sibling lib_live_refs.sh exits 2 (wiring error, not runtime 
     test "$A9_RC" -eq 2
 assert "A9: stderr names the missing library (fail LOUD, not silent)" \
     bash -c 'printf "%s\n" "$1" | grep -qF "lib_live_refs.sh not found"' _ "$A9_ERR"
+
+# A10: the SAME contract for the new sibling scripts/lib_lane_state.sh (task
+# 3075). A silently-absent lane-state reader degrades reclaim back to exactly
+# the `FREE ≈ flock-free` approximation this leaf removes — invisible, and the
+# defect reify esc-5334-6 exists to close — so the guard that enforces its
+# presence cannot itself be untested.
+#
+# The fixture copies BOTH gc.sh AND lib_live_refs.sh, deliberately withholding
+# only lib_lane_state.sh. Copying lib_live_refs.sh is what makes the assertion
+# SPECIFIC: without it, A9's guard would fire first and A10 would prove nothing
+# about the new dependency.
+A10_DIR="$(mktemp -d /tmp/test-gc-a10-XXXXXX)"
+_TMPDIRS+=("$A10_DIR")
+cp "$SCRIPT" "$A10_DIR/warm-lane-gc.sh"
+cp "$WARM_LANE_SCRIPTS_DIR/lib_live_refs.sh" "$A10_DIR/lib_live_refs.sh"
+assert "A10: fixture — the copy HAS lib_live_refs.sh and has NO lib_lane_state.sh" \
+    bash -c '[ -f "$1/lib_live_refs.sh" ] && [ ! -e "$1/lib_lane_state.sh" ]' _ "$A10_DIR"
+A10_RC=0
+A10_ERR="$(bash "$A10_DIR/warm-lane-gc.sh" --help 2>&1 >/dev/null)" || A10_RC=$?
+# --help normally exits 0, so a 2 here also pins that the guard fires BEFORE
+# argv is parsed — the same ordering property A9 asserts.
+assert "A10a: missing sibling lib_lane_state.sh exits 2 (wiring error, not runtime 1)" \
+    test "$A10_RC" -eq 2
+# The VERBATIM fragment already registered in
+# orchestrator/tests/test_warm_lane_scripts_shipped.py FAIL_LOUD_FRAGMENTS,
+# established by warm-lane-audit.sh's guard in task 3074 — so the
+# shipped-and-wired contract test covers gc.sh's new guard with no change to its
+# assertion data.
+assert "A10b: stderr names the missing library with the registered fragment" \
+    bash -c 'printf "%s\n" "$1" | grep -qF "lib_lane_state.sh not found next to"' _ "$A10_ERR"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Block B — reset a divergent FREE lane
