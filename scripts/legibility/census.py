@@ -867,6 +867,7 @@ def run_census(
     report_path,
     date: str,
     force: bool = False,
+    max_batches: int | None = None,
 ) -> CensusOutcome:
     """Run one periodic legibility census end to end.
 
@@ -918,6 +919,18 @@ def run_census(
     A storm batch encountered during mining (see ``mine_to_saturation``) is
     logged loudly and called out in the report's cost note rather than
     silently folded into a clean-looking result.
+
+    OPERATOR COST CONTROL. *max_batches* bounds mining to that many
+    batches (``--max-batches``). It is the reusable spend brake for a run
+    that cannot rely on saturation to bound itself -- most sharply a FIRST
+    census against an empty codebook, where every batch's ``dup_rate``
+    only measures "the miner found nothing to match" and mining therefore
+    runs to source exhaustion. It defaults to ``None`` = today's
+    behavior: unbounded, no extra rendering. A capped run is deliberately
+    PARTIAL coverage and never pretends otherwise: the report states the
+    cap and says so in as many words, and ``CensusOutcome.stop_reason``
+    is ``"capped"`` -- distinct from the ``"exhausted"`` a source that
+    genuinely ran dry produces.
     """
     headroom = preflight_headroom(invoke, model=config.models.trickle)
     if not headroom.ok:
@@ -938,6 +951,7 @@ def run_census(
         model=config.models.census_miner,
         config=config.census.saturation,
         invoke=invoke,
+        max_batches=max_batches,
     )
 
     novel_clusters = _novel_clusters(mining_result.records)
