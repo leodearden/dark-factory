@@ -21,6 +21,8 @@ from fused_memory.server.markup_tripwire import (
     build_markup_block,
     find_markup_pattern,
     find_markup_violation,
+    markup_override_requested,
+    strip_markup_override,
 )
 
 
@@ -399,3 +401,136 @@ class TestMarkupStormCounter:
         counter = MarkupStormCounter(threshold=1, window_seconds=100.0, time_provider=clock)
         storm = counter.record()
         json.dumps(storm)
+
+
+class TestMarkupOverrideRequested:
+    """The escape hatch, fail-closed.
+
+    submit_task/update_task accept metadata as an object OR a JSON string, so
+    both shapes must be understood. Anything the helper cannot confidently read
+    as an explicit opt-in means NO override — an accidental harness leak must
+    never be waved through by a coincidence in the metadata.
+    """
+
+    def test_true_in_a_dict_enables_the_override(self):
+        assert markup_override_requested({MARKUP_OVERRIDE_KEY: True}) is True
+
+    def test_true_in_a_json_string_enables_the_override(self):
+        """The task tools accept metadata as a JSON string — same answer."""
+        assert markup_override_requested(json.dumps({MARKUP_OVERRIDE_KEY: True})) is True
+
+    def test_override_is_read_alongside_other_metadata_keys(self):
+        metadata = {'source': 'agent-followup', MARKUP_OVERRIDE_KEY: True, 'files': ['a.py']}
+        assert markup_override_requested(metadata) is True
+        assert markup_override_requested(json.dumps(metadata)) is True
+
+    def test_absent_key_does_not_enable_the_override(self):
+        assert markup_override_requested({'source': 'x'}) is False
+        assert markup_override_requested({}) is False
+
+    def test_only_a_literal_boolean_true_counts(self):
+        """Truthy-but-not-True values are REFUSED (fail-closed).
+
+        Mirrors add_memory's `metadata.get('allow_near_duplicate') is True` check
+        at tools.py:1199. A stray 'yes'/1 in metadata is far more likely to be
+        unrelated data than a deliberate, considered opt-in to writing raw MCP
+        envelope markup into the corpus.
+        """
+        for value in ('yes', 'true', 'True', 1, [1], {'a': 1}, 1.0):
+            assert markup_override_requested({MARKUP_OVERRIDE_KEY: value}) is False, (
+                f'Expected {value!r} NOT to enable the override'
+            )
+
+    def test_false_and_none_values_do_not_enable_the_override(self):
+        assert markup_override_requested({MARKUP_OVERRIDE_KEY: False}) is False
+        assert markup_override_requested({MARKUP_OVERRIDE_KEY: None}) is False
+        assert markup_override_requested({MARKUP_OVERRIDE_KEY: 0}) is False
+
+    def test_none_metadata_does_not_enable_the_override(self):
+        assert markup_override_requested(None) is False
+
+    def test_malformed_json_string_does_not_raise(self):
+        """Metadata this helper cannot parse is not its to reject — it just says no.
+
+        The write is still evaluated by the tripwire; whatever owns metadata
+        validation raises its own error later.
+        """
+        assert markup_override_requested('{not valid json') is False
+        assert markup_override_requested('') is False
+        assert markup_override_requested('   ') is False
+
+    def test_non_dict_json_payloads_do_not_enable_the_override(self):
+        for payload in ('[1, 2, 3]', '"a string"', 'null', '42', 'true'):
+            assert markup_override_requested(payload) is False, f'Expected False for {payload!r}'
+
+    def test_unexpected_types_do_not_raise(self):
+        for value in (123, 4.5, [], object(), True):
+            assert markup_override_requested(value) is False, f'Expected False for {value!r}'
+
+
+class TestStripMarkupOverride:
+    """The flag is write-time-only: it must never be persisted.
+
+    Returns the SAME SHAPE it was given (dict in -> dict out, JSON string in ->
+    JSON string out) so a call site can substitute the result inline before
+    forwarding to the service/interceptor.
+    """
+
+    def test_removes_the_key_from_a_dict(self):
+        result = strip_markup_override({MARKUP_OVERRIDE_KEY: True, 'source': 'x'})
+        assert result == {'source': 'x'}
+
+    def test_does_not_mutate_the_input_dict(self):
+        """Non-mutating: the caller's own metadata object is left intact.
+
+        The handler may still need the original (e.g. to re-read the override),
+        and silently mutating a caller-owned dict is the kind of action-at-a-
+        distance this guard should not introduce.
+        """
+        original = {MARKUP_OVERRIDE_KEY: True, 'source': 'x'}
+        strip_markup_override(original)
+        assert original == {MARKUP_OVERRIDE_KEY: True, 'source': 'x'}
+
+    def test_preserves_all_other_keys_and_values(self):
+        metadata = {
+            MARKUP_OVERRIDE_KEY: True,
+            'source': 'agent-followup',
+            'files': ['a.py', 'b.py'],
+            'nested': {'k': 'v'},
+        }
+        result = strip_markup_override(metadata)
+        assert result == {
+            'source': 'agent-followup',
+            'files': ['a.py', 'b.py'],
+            'nested': {'k': 'v'},
+        }
+
+    def test_is_a_no_op_when_the_key_is_absent(self):
+        assert strip_markup_override({'source': 'x'}) == {'source': 'x'}
+        assert strip_markup_override({}) == {}
+
+    def test_removes_the_key_from_a_json_string_and_returns_a_json_string(self):
+        result = strip_markup_override(json.dumps({MARKUP_OVERRIDE_KEY: True, 'source': 'x'}))
+        assert isinstance(result, str)
+        assert json.loads(result) == {'source': 'x'}
+
+    def test_json_string_without_the_key_round_trips_equivalently(self):
+        result = strip_markup_override(json.dumps({'source': 'x'}))
+        assert isinstance(result, str)
+        assert json.loads(result) == {'source': 'x'}
+
+    def test_returns_none_unchanged(self):
+        assert strip_markup_override(None) is None
+
+    def test_malformed_json_passes_through_byte_identical(self):
+        """Passthrough, never raise: a write must not fail because this helper
+        choked on metadata it does not own."""
+        malformed = '{not valid json'
+        assert strip_markup_override(malformed) == malformed
+
+    def test_non_dict_json_payload_passes_through_unchanged(self):
+        assert strip_markup_override('[1, 2, 3]') == '[1, 2, 3]'
+
+    def test_unexpected_types_pass_through_unchanged(self):
+        for value in (123, 4.5, []):
+            assert strip_markup_override(value) == value
