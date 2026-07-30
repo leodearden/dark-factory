@@ -50,6 +50,10 @@ RELOCATED_SCRIPTS = (
 SOURCED_LIBS = (
     'lib_live_refs.sh',
     'lib_portable.sh',
+    # dark-factory-native, added by task 3074 (leaf β) — not a reify relocation.
+    # In SOURCED_LIBS rather than a parallel test class so it inherits the
+    # exists / owner-execute-bit / `bash -n` coverage already written here.
+    'lib_lane_state.sh',
 )
 
 ALL_SHIPPED = RELOCATED_SCRIPTS + SOURCED_LIBS
@@ -105,10 +109,13 @@ class TestSiblingLibsTravelledWithTheScripts:
     #: "incomplete deployment" (deliberately NOT 1, which means runtime error).
     WIRING_EXIT = 2
 
-    #: The verbatim fail-loud fragments emitted by the two gc scripts' guards.
+    #: The verbatim fail-loud fragments emitted by the sourcing scripts' guards.
     FAIL_LOUD_FRAGMENTS = (
         'lib_live_refs.sh not found next to',
         'lib_portable.sh: No such file',
+        # warm-lane-audit.sh's guard for dark-factory's own lane-state lib
+        # (task 3074), copied in shape from warm-lane-gc.sh's.
+        'lib_lane_state.sh not found next to',
     )
 
     @pytest.mark.parametrize(
