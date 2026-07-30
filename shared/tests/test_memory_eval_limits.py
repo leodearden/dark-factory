@@ -22,10 +22,12 @@ import time
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from shared.memory_eval_limits import (
     GRANDFATHER_KEY_SEPARATOR,
     LimitsConfig,
+    LimitsSchemaError,
     MetricVerdict,
     binomial_two_sided_p,
     derive_alpha,
@@ -956,6 +958,48 @@ class TestProportionAndCountRules:
         assert verdict.value == metric.value
 
 
+class TestRuleKindGuards:
+    """Each rule refuses a metric of another kind, and says which.
+
+    The metric's ``kind`` fully determines its rule, and the downstream runner
+    leaves will be doing that dispatch themselves — so wiring the wrong rule to a
+    metric is a realistic mistake, and one that fails badly rather than loudly if
+    unguarded: ``evaluate_proportion`` on a count metric would go on to compute a
+    binomial p-value against ``denominator=None``, and ``evaluate_tripwire`` on
+    anything without ``items`` would silently read an empty failure set (no
+    failures, no alarms — a probe that can never fire).
+
+    The messages are part of the structured-facts-at-failure contract, so each
+    assertion pins both the kind name and the offending metric_id.
+    """
+
+    ALPHA = 1 / 360
+
+    @pytest.mark.parametrize(
+        ('rule', 'metric_id', 'message'),
+        [
+            (evaluate_tripwire, 'canonical-in-top-5', 'not tripwire'),
+            (evaluate_tripwire, 'dangling-pointers', 'not tripwire'),
+            (evaluate_tripwire, 'search-latency-p50-ms', 'not tripwire'),
+            (evaluate_proportion, 'dangling-pointers', 'not proportion'),
+            (evaluate_proportion, 'topic-canonical-present', 'not proportion'),
+            (evaluate_proportion, 'search-latency-p50-ms', 'not proportion'),
+            (evaluate_count, 'canonical-in-top-5', 'not count'),
+            (evaluate_count, 'topic-canonical-present', 'not count'),
+            (evaluate_count, 'search-latency-p50-ms', 'not count'),
+        ],
+        ids=lambda v: v.__name__ if callable(v) else str(v),
+    )
+    def test_a_rule_refuses_a_metric_of_another_kind(self, rule, metric_id, message):
+        metric = _metric(_series(_REGRESSION_STAMP), metric_id)
+        extra = (None,) if rule is evaluate_tripwire else (_baseline(), self.ALPHA, _MIN_SAMPLES)
+
+        with pytest.raises(ValueError, match=message) as exc_info:
+            rule(metric, *extra)
+        assert repr(metric_id) in str(exc_info.value)
+        assert repr(metric.kind) in str(exc_info.value)
+
+
 class TestMinSamplesGuard:
     """``insufficient_data`` is a REPORT STATUS and is NEVER an alarm.
 
@@ -1317,6 +1361,11 @@ class TestLimitsArtifact:
         assert load_limits_artifact(path).grandfather_set_hash == first.grandfather_hash
         assert sorted(p.name for p in path.parent.iterdir()) == ['limits-current.json']
 
+    def test_the_error_type_is_a_value_error(self):
+        # The M1 sibling's contract, restated for M2: a runner or dashboard
+        # catches ONE exception type without taking a pydantic import.
+        assert issubclass(LimitsSchemaError, ValueError)
+
     def test_a_wrong_schema_version_is_rejected(self, tmp_path):
         # A pinned Literal, so a future version is a loud validation failure
         # rather than a silent misread of fields that moved.
@@ -1324,8 +1373,14 @@ class TestLimitsArtifact:
         data = json.loads(path.read_text())
         data['schema_version'] = 2
         path.write_text(json.dumps(data))
-        with pytest.raises(ValueError):
+        # LimitsSchemaError, not ValueError: pydantic's ValidationError IS a
+        # ValueError, so the looser assertion passes with the whole try/except in
+        # load_limits_artifact deleted — i.e. it does not pin the wrapping
+        # contract at all.
+        with pytest.raises(LimitsSchemaError) as exc_info:
             load_limits_artifact(path)
+        # ...and the field-level pydantic detail is chained, not swallowed.
+        assert isinstance(exc_info.value.__cause__, ValidationError)
 
     def test_an_unknown_field_is_rejected(self, tmp_path):
         # extra='forbid': the evaluator's own state file gets the same strict
@@ -1334,8 +1389,89 @@ class TestLimitsArtifact:
         data = json.loads(path.read_text())
         data['grandfather_sett'] = []  # a typo an author would want caught
         path.write_text(json.dumps(data))
-        with pytest.raises(ValueError):
+        with pytest.raises(LimitsSchemaError) as exc_info:
             load_limits_artifact(path)
+        assert isinstance(exc_info.value.__cause__, ValidationError)
+
+    def test_a_tampered_grandfather_set_is_refused(self, tmp_path):
+        """Shape-valid is not the same as trustworthy.
+
+        The artifact is committed and hand-readable, so a hand-edit or a badly
+        resolved git conflict is a realistic way to get a grandfather set that
+        parses perfectly and is wrong. Dropping an entry turns into a burst of
+        phantom alarms on items nobody touched; adding one silently mutes a real
+        regression. The digest the writer already emits makes both detectable, so
+        it is recomputed on the resume path rather than merely carried.
+        """
+        result, path = self._write(tmp_path)
+        assert result.grandfather  # the fixture actually has known-bad entries
+
+        data = json.loads(path.read_text())
+        data['grandfather_set'] = [*data['grandfather_set'], 'topic-canonical-present::t-invented']
+        path.write_text(json.dumps(data))  # hash left untouched, as an editor would
+
+        with pytest.raises(LimitsSchemaError, match='grandfather_set_hash'):
+            load_limits_artifact(path)
+
+    def test_a_dropped_grandfather_entry_is_refused_too(self, tmp_path):
+        # The other direction, which is the one that would go quiet rather than
+        # loud if it slipped through: fewer known-bad entries means the next run
+        # alarms on items that never changed.
+        _, path = self._write(tmp_path)
+        data = json.loads(path.read_text())
+        data['grandfather_set'] = []
+        path.write_text(json.dumps(data))
+
+        with pytest.raises(LimitsSchemaError) as exc_info:
+            load_limits_artifact(path)
+        # structured-facts-at-failure: both digests are named, so a reader can
+        # tell a tampered file from a stale one without recomputing by hand.
+        assert grandfather_set_hash([]) in str(exc_info.value)
+
+    def test_an_untampered_artifact_still_loads(self, tmp_path):
+        # The integrity check must not reject what the writer just emitted.
+        result, path = self._write(tmp_path)
+        assert load_limits_artifact(path).grandfather_set_hash == result.grandfather_hash
+
+    @pytest.mark.parametrize(
+        ('field', 'value'),
+        [
+            ('false_alarm_budget', 0.0),
+            ('false_alarm_budget', -1.0),
+            ('runs_per_quarter', 0),
+            ('runs_per_quarter', -90),
+            ('min_samples', -1),
+            ('baseline_window', 0),
+            ('baseline_window', -3),
+        ],
+    )
+    def test_a_nonsensical_config_is_refused_at_construction(self, field, value):
+        """Every bad value here fails toward SILENT DEAFNESS, so none may be accepted.
+
+        A negative ``min_samples`` disables the sufficiency guard, so a one-item
+        run is judged as if fully powered. A ``baseline_window`` below 1 makes the
+        window empty, so every proportion and count metric reports
+        ``insufficient_data`` forever and the eval never alarms again — with no
+        error and an artifact that looks healthy. Mirrors
+        ``TestDerivedAlpha::test_zero_or_negative_divisors_raise``, which refuses
+        the same budget and cadence but only if it happens to be called.
+        """
+        kwargs = {
+            'false_alarm_budget': 1.0,
+            'runs_per_quarter': 90,
+            'min_samples': 10,
+            'baseline_window': 3,
+            field: value,
+        }
+        with pytest.raises(ValueError, match=field):
+            LimitsConfig(**kwargs)  # type: ignore[arg-type]
+
+    def test_the_permissive_edges_of_those_guards_are_still_allowed(self):
+        # min_samples=0 ("judge every run") is a coherent choice, and a
+        # single-run baseline window is the minimum that can compare anything.
+        config = LimitsConfig(runs_per_quarter=1, min_samples=0, baseline_window=1)
+        assert config.min_samples == 0
+        assert config.baseline_window == 1
 
     def test_config_defaults_to_one_false_alarm_per_quarter(self):
         # The PRD-sanctioned default (M2) — a budget DECLARATION, not a

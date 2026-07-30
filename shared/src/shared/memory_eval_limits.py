@@ -336,6 +336,16 @@ class LimitsConfig:
     that fails them reports ``insufficient_data`` rather than any verdict.
     Keyword-only so a four-number call site can never silently transpose two of
     them.
+
+    Every field is checked at construction because each nonsensical value fails
+    in the SAME direction — toward permanent deafness, silently. A negative
+    ``min_samples`` disables the sufficiency guard, so a one-item run is judged
+    as if it were fully powered. A ``baseline_window`` below 1 leaves every
+    statistical metric with an empty window, so the whole eval reports
+    ``insufficient_data`` forever and never alarms again — with a healthy-looking
+    artifact and no error to notice. A misconfiguration that makes an eval quiet
+    must not be reachable by construction; see :func:`derive_alpha`, which
+    refuses the same non-positive budget and cadence for the same reason.
     """
 
     false_alarm_budget: float = 1.0
@@ -349,6 +359,31 @@ class LimitsConfig:
 
     baseline_window: int
     """How many trailing runs pool into the baseline the current run is judged against."""
+
+    def __post_init__(self) -> None:
+        if self.false_alarm_budget <= 0:
+            raise ValueError(
+                f'LimitsConfig: false_alarm_budget={self.false_alarm_budget} must be positive '
+                '(a budget of zero admits no finite alpha).'
+            )
+        if self.runs_per_quarter <= 0:
+            raise ValueError(
+                f'LimitsConfig: runs_per_quarter={self.runs_per_quarter} must be positive — '
+                'an eval that never runs has no budget to split.'
+            )
+        if self.min_samples < 0:
+            raise ValueError(
+                f'LimitsConfig: min_samples={self.min_samples} must be non-negative. '
+                'A negative floor disables the sufficiency guard entirely, so a one-item '
+                'run would be judged as if it were fully powered.'
+            )
+        if self.baseline_window < 1:
+            raise ValueError(
+                f'LimitsConfig: baseline_window={self.baseline_window} must be at least 1. '
+                'A shorter window is an empty window, which makes every proportion and '
+                'count metric report insufficient_data forever — a permanently deaf eval '
+                'that still looks healthy.'
+            )
 
 
 def derive_alpha(
@@ -886,7 +921,9 @@ def evaluate_series(
     re-snapshot a metric that already had state and silently swallow a real
     regression as known-bad.
     """
-    window = list(baseline_window)[-config.baseline_window :] if config.baseline_window > 0 else []
+    # `config.baseline_window >= 1` is guaranteed by LimitsConfig.__post_init__,
+    # so this slice is never the accidental whole-list `[-0:]`.
+    window = list(baseline_window)[-config.baseline_window :]
     alarm_eligible = [m for m in current.metrics if m.kind != 'scalar']
     alpha = (
         derive_alpha(config.false_alarm_budget, config.runs_per_quarter, len(alarm_eligible))
@@ -1150,17 +1187,39 @@ def write_limits_artifact(result: EvaluationResult, path: str | Path) -> Path:
 
 
 def load_limits_artifact(path: str | Path) -> LimitsArtifact:
-    """Read and validate a ``limits-current.json``.
+    """Read, validate and integrity-check a ``limits-current.json``.
 
     Raises :class:`LimitsSchemaError` (a ``ValueError``) if the file does not
     match the schema, chaining the underlying validation error. Corrupt
     resumable state is not something to recover from silently: continuing from
     a half-understood grandfather set would either mute real alarms or fire
     phantom ones, and both are worse than stopping.
+
+    Shape validity is not enough for that promise, so ``grandfather_set_hash`` is
+    RECOMPUTED here rather than merely carried. The artifact is committed and
+    hand-readable, which makes a hand-edit, a partial rewrite or a badly resolved
+    git conflict realistic paths to a set that parses perfectly and is wrong —
+    and the two ways it can be wrong are exactly the two failures the docstring
+    above refuses: entries dropped means a burst of phantom alarms on items
+    nobody touched, entries added means real regressions silently muted. The
+    digest the writer already emits is what makes both detectable, so it is
+    checked at the one place a runner resumes from.
     """
     target = Path(path)
     raw = json.loads(target.read_text(encoding='utf-8'))
     try:
-        return LimitsArtifact.model_validate(raw)
+        artifact = LimitsArtifact.model_validate(raw)
     except ValidationError as exc:
         raise LimitsSchemaError(f'{target}: not a valid limits artifact: {exc}') from exc
+
+    recomputed = grandfather_set_hash(artifact.grandfather_set)
+    if recomputed != artifact.grandfather_set_hash:
+        raise LimitsSchemaError(
+            f'{target}: grandfather_set does not match grandfather_set_hash — '
+            f'recorded {artifact.grandfather_set_hash}, recomputed {recomputed} over '
+            f'{len(artifact.grandfather_set)} key(s). The known-bad list has been '
+            'edited or partially rewritten; resuming from it would either fire phantom '
+            'alarms on untouched items or mute real regressions. Regenerate the artifact '
+            'with write_limits_artifact rather than repairing it by hand.'
+        )
+    return artifact
