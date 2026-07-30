@@ -688,6 +688,12 @@ class TestBuildReportChurn:
         assert cell['churn'] is True
         assert cell['recount'] == 101
         assert [d for d in coverage['deltas'] if d.get('category') == OBS] == []
+        # The cell-level filter above is structurally blind to a
+        # collection-level delta (which carries no 'category' key), which is
+        # exactly how the report-level defect hid behind a green cell. Assert
+        # the REPORT verdict too, so that gap cannot reopen.
+        assert coverage['complete'] is True
+        assert coverage['deltas'] == []
 
     def test_churn_is_recorded_so_drift_is_distinguishable_from_truncation(self):
         cells = {'dark_factory': {OBS: _census([])}}
@@ -740,6 +746,95 @@ class TestBuildReportChurn:
         assert cell['recount'] is None
         assert cell['complete'] is False
         assert cell['churn'] is False
+
+    # -- collection-level reconciliation ------------------------------------
+    #
+    # The per-cell churn tolerance above left the level ABOVE it unfixed:
+    # the project residue compared sum(expected) -- the PRE-scroll counts --
+    # against a `collection_points` read AFTER every scroll, i.e. two
+    # unsynchronised reads of a live corpus treated as simultaneous. The
+    # counted total is therefore an interval [min, max] over
+    # (sum expected, sum recount), the collection total an interval over its
+    # bracketing pair, and the project is covered when they INTERSECT.
+
+    def test_collection_total_moving_under_the_scan_is_not_an_uncovered_residue(self):
+        # sum(expected)=100, sum(recount)=101, collection_points=101: the one
+        # extra point is the SAME write the cell already recorded as churn.
+        # Charging it again as an uncovered residue made a healthy census
+        # emit an artifact whose own banner declares it unusable.
+        cells = {'dark_factory': {OBS: _census([])}}
+        cov = {'dark_factory': _coverage('fused_dark_factory', 101, {OBS: (100, 101, 101)})}
+        coverage = _mod.build_report(cells, cov, top_n=50)['coverage']
+        assert coverage['complete'] is True
+        assert [d for d in coverage['deltas'] if d['kind'] == 'uncovered_points'] == []
+        proj = coverage['projects']['dark_factory']
+        assert proj['complete'] is True
+        # The residue a reader sees is the one that drove `complete`.
+        assert proj['uncovered_points'] == 0
+        # ...and the raw reads stay alongside it so the call is auditable.
+        assert proj['collection_points'] == 101
+        assert proj['counted'] == 100
+        assert proj['counted_interval'] == [100, 101]
+        assert proj['collection_points_interval'] == [101, 101]
+
+    def test_collection_total_movement_is_recorded_as_churn_not_swallowed(self):
+        cells = {'dark_factory': {OBS: _census([])}}
+        cov = {'dark_factory': _coverage('fused_dark_factory', 101, {OBS: (100, 101, 101)})}
+        coverage = _mod.build_report(cells, cov, top_n=50)['coverage']
+        moved = [c for c in coverage['churn'] if c.get('kind') == 'collection_total_moved']
+        assert len(moved) == 1
+        assert moved[0]['project_id'] == 'dark_factory'
+        assert moved[0]['collection'] == 'fused_dark_factory'
+        assert moved[0]['counted_interval'] == [100, 101]
+        assert moved[0]['collection_points_interval'] == [101, 101]
+
+    def test_negative_within_window_residue_is_churn_not_a_shortfall(self):
+        # A deletion landed mid-census: expected 100, scroll and re-count both
+        # agree at 99, and the collection now holds 99 points. The counted
+        # interval [99, 100] still contains 99, so nothing is unaccounted.
+        cells = {'fused_p1': {OBS: _census([])}}
+        cov = {'fused_p1': _coverage('fused_p1', 99, {OBS: (100, 99, 99)})}
+        coverage = _mod.build_report(cells, cov, top_n=50)['coverage']
+        assert coverage['complete'] is True
+        assert coverage['deltas'] == []
+        assert coverage['projects']['fused_p1']['uncovered_points'] == 0
+
+    def test_residue_outside_the_churn_window_is_still_named(self):
+        # Regression guard for the measured-live shape: a STABLE corpus
+        # (expected == recount on every cell) collapses both intervals to a
+        # point, so the 79-point dual-write residue must survive the churn
+        # tolerance exactly as before.
+        cells = {'reify': {OBS: _census([]), PROC: _census([]), PREF: _census([])}}
+        cov = {
+            'reify': _coverage(
+                'fused_reify',
+                29951,
+                {OBS: (24408, 24408), PROC: (3981, 3981), PREF: (1483, 1483)},
+            ),
+        }
+        coverage = _mod.build_report(cells, cov, top_n=50)['coverage']
+        assert coverage['complete'] is False
+        assert coverage['projects']['reify']['uncovered_points'] == 79
+        named = [d for d in coverage['deltas'] if d['kind'] == 'uncovered_points']
+        assert len(named) == 1
+        assert named[0]['delta'] == 79
+
+    def test_surviving_negative_residue_is_a_surplus_not_uncovered_points(self):
+        # The counted interval sits ENTIRELY above the collection total, far
+        # beyond any churn window: the categories counted more points than the
+        # collection holds. That is deletions or double-counting -- sending a
+        # reader hunting for an unenumerated category is a wrong diagnosis.
+        cells = {'fused_p1': {OBS: _census([])}}
+        cov = {'fused_p1': _coverage('fused_p1', 90, {OBS: (100, 100, 100)})}
+        coverage = _mod.build_report(cells, cov, top_n=50)['coverage']
+        assert coverage['complete'] is False
+        kinds = [d['kind'] for d in coverage['deltas']]
+        assert 'surplus_counted' in kinds
+        assert 'uncovered_points' not in kinds
+        surplus = next(d for d in coverage['deltas'] if d['kind'] == 'surplus_counted')
+        assert surplus['delta'] == -10
+        assert surplus['project_id'] == 'fused_p1'
+        assert coverage['projects']['fused_p1']['uncovered_points'] == -10
 
 
 # ===========================================================================
