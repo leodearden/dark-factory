@@ -23380,6 +23380,128 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
 
 
 # ---------------------------------------------------------------------------
+# TestReleaseOrCleanupDeregisters — the ledger invariant (task 3148)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestReleaseOrCleanupDeregisters:
+    """`_release_or_cleanup` must NEVER return with its path still in the ledger.
+
+    The invariant, and why it is worth pinning: the `spec_warm=True` branch
+    hands the lane back to the pool via `release_spec_lane` and returns without
+    deregistering, while the `spec_warm=False` branch deregisters via
+    `_cleanup_owned_merge_worktree`.  Any path that stays in
+    `_owned_merge_worktrees` after its request finalizes is os.utime'd forever
+    by `_touch_owned_merge_worktrees`, which pins the ROOT-inode mtime the
+    disk-scan coalesce arm reads — manufacturing exactly the immortal corpse
+    that arm now has to reap.  Such an entry is also permanently exempt from
+    reaping, because the worker passes
+    `keep_worktrees=set(self._owned_merge_worktrees)` into post-merge verify.
+
+    SCOPE HONESTY — this is defence-in-depth, NOT a demonstrated live leak.
+    On the dominant path the warm branch receives a `_spec-` POOL LANE, not a
+    `_merge-*` worktree: `spec_warm_lane_pool` is constructed with
+    `name_prefix='_spec-'` (git_ops.py:1655-1658), the
+    `_register_owned_merge_worktree` sites register `_merge-*` worktrees, and
+    the warm-acquire swap already deregisters the displaced `item.merge_wt`.  A
+    `_spec-` lane is additionally invisible to `find_inflight_merge_worktree`,
+    which enumerates only `_merge-*`, so it cannot be the disk-scan corpse.  So
+    today's warm branch is usually deregistering nothing.
+
+    The invariant is pinned anyway because the failure it forecloses is
+    silently unrecoverable: `release_spec_lane` no-ops on a path the pool does
+    not own, a retained ledger entry is both heartbeat-pinned and reaper-exempt,
+    and `worktree_ledger_violations` flags only worktrees ABSENT from the ledger
+    (`if path in owned: continue`), so a RETAINED entry is invisible to the
+    existing I6 audit.  One idempotent `.discard()` removes the whole class.
+    """
+
+    def _make_worker(self, tmp_path: Path):
+        """Return (worker, calls) with a recording stub git_ops."""
+        import types
+
+        calls: dict[str, list] = {'release_spec_lane': [], 'cleanup_merge_worktree': []}
+
+        async def _release_spec_lane(lane, *, warm):
+            calls['release_spec_lane'].append((lane, warm))
+
+        async def _cleanup_merge_worktree(wt):
+            calls['cleanup_merge_worktree'].append(wt)
+
+        stub = types.SimpleNamespace(
+            release_spec_lane=_release_spec_lane,
+            cleanup_merge_worktree=_cleanup_merge_worktree,
+        )
+        mq: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(
+            git_ops=stub,  # type: ignore[reportArgumentType]
+            queue=mq,
+        )
+        return worker, calls
+
+    async def test_a_warm_spec_release_deregisters(self, tmp_path: Path) -> None:
+        """spec_warm=True → lane RELEASED to the pool AND dropped from the ledger.
+
+        `p` is deliberately not named '_merge-verify':
+        `_register_owned_merge_worktree` no-ops for PERSISTENT_MERGE_WORKTREE_NAME,
+        which would make this pass/fail for the wrong reason.
+        """
+        worker, calls = self._make_worker(tmp_path)
+        p = tmp_path / '_spec-lane-1'
+        p.mkdir()
+        worker._register_owned_merge_worktree(p)
+        assert p in worker._owned_merge_worktrees, 'pre-condition: registered'
+
+        await worker._release_or_cleanup(p, spec_warm=True)
+
+        assert p not in worker._owned_merge_worktrees, (
+            'a retained ledger entry is heartbeat-pinned, reaper-exempt, and '
+            'invisible to worktree_ledger_violations — unrecoverable short of restart'
+        )
+        # The warm-lane contract must NOT regress: the lane goes back to the
+        # pool as FREE, it is not removed from disk.
+        assert calls['release_spec_lane'] == [(p, True)]
+        assert calls['cleanup_merge_worktree'] == []
+
+    async def test_b_cold_path_still_deregisters(self, tmp_path: Path) -> None:
+        """spec_warm=False → characterization: existing branch is left alone."""
+        worker, calls = self._make_worker(tmp_path)
+        p = tmp_path / '_merge-cold-1'
+        p.mkdir()
+        worker._register_owned_merge_worktree(p)
+
+        await worker._release_or_cleanup(p, spec_warm=False)
+
+        assert p not in worker._owned_merge_worktrees
+        assert calls['cleanup_merge_worktree'] == [p]
+        assert calls['release_spec_lane'] == []
+
+    async def test_c_none_worktree_is_safe(self, tmp_path: Path) -> None:
+        """merge_wt=None no-ops on both branches without raising."""
+        worker, calls = self._make_worker(tmp_path)
+
+        await worker._release_or_cleanup(None, spec_warm=True)
+        await worker._release_or_cleanup(None, spec_warm=False)
+
+        assert calls['release_spec_lane'] == []
+        assert calls['cleanup_merge_worktree'] == []
+
+    async def test_d_idempotent(self, tmp_path: Path) -> None:
+        """Calling twice does not raise and leaves p deregistered (.discard())."""
+        worker, calls = self._make_worker(tmp_path)
+        p = tmp_path / '_spec-lane-1'
+        p.mkdir()
+        worker._register_owned_merge_worktree(p)
+
+        await worker._release_or_cleanup(p, spec_warm=True)
+        await worker._release_or_cleanup(p, spec_warm=True)
+
+        assert p not in worker._owned_merge_worktrees
+        assert calls['release_spec_lane'] == [(p, True), (p, True)]
+
+
+# ---------------------------------------------------------------------------
 # TestSnapshotInflightCollection — task-1736 (ε) steps 1/3
 # ---------------------------------------------------------------------------
 
