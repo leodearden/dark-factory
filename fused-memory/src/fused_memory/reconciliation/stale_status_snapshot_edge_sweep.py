@@ -42,6 +42,34 @@ Design decisions (captured in plan.json):
   ``update_edge`` failure, by contrast, does NOT abort the loop — the
   remaining stale edges are still attempted, exactly like the per-item
   find/delete calls in ``sweep_degenerate_task_nodes``.
+- 'blocked' is now a recognized non-terminal snapshot status marker. Its
+  absence made the gate short-circuit
+  (``if not SNAPSHOT_STATUS_RE.search(fact): return set()``) fire before
+  the ``INACTIVE_TASK_STATUSES`` cross-reference could ever run, so
+  blocked-worded edges were structurally invisible regardless of the
+  referenced task's real status (task 2885 repro: 4 stale edges survived a
+  blocked->done transition; scanned=5868/invalidated=0). (amendment, task
+  3042)
+- The single ``_STATUS_MARKER_ALT`` constant now feeds the gate, the
+  anchored individual regex, and the phrase regex, so the gate can never
+  again be narrower than the anchored matchers — that drift (a marker
+  present in one but not the other) is the exact bug class task 3042
+  fixes. (amendment, task 3042)
+- Two anchoring paths with an explicit precision contract: closed-class
+  connective only (copula / 'in' / article) for the general individual
+  form (``INDIVIDUAL_SNAPSHOT_RE``); a lazy ``{0,3}``-word open-class gap
+  permitted ONLY when the marker is immediately followed by the literal
+  noun 'status' (``SNAPSHOT_STATUS_PHRASE_RE``). (amendment, task 3042)
+- 'blocked' is deliberately NOT added to ``INACTIVE_TASK_STATUSES`` — that
+  frozenset stays ``{done, cancelled}`` — which is what preserves
+  invalidate-only-on-positively-terminal (a genuinely-still-blocked task is
+  never selected). (amendment, task 3042)
+- Known residual (task 3042): a blocked-status assertion that neither uses
+  a closed-class connective nor the literal 'status' noun (e.g. "Task N
+  remains parked awaiting adjudication") is still not extracted. This is
+  the deliberate fail-safe direction — under-selection self-heals or is
+  caught by Stage 2, whereas over-selection would wrongly retire true
+  facts.
 """
 
 from __future__ import annotations

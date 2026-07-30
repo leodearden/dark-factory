@@ -6,15 +6,20 @@ once the task(s) they reference reach a terminal status (done/cancelled).
 This module adds a small deterministic post-processor: enumerate valid
 edges, cross-reference each referenced task_id's CURRENT status via a direct
 status lookup (taskmaster.get_statuses — NOT semantic search), and
-invalidate any edge whose asserted non-terminal (active/pending/in-progress)
-status now contradicts a terminal task.
+invalidate any edge whose asserted non-terminal (active/pending/blocked/
+in-progress) status now contradicts a terminal task.
 
 Covers:
 - extract_snapshot_edge_task_ids: pure lexical extractor — returns the
   specific task ids a status-snapshot edge asserts as active/pending/
-  in-progress; returns the empty set for text with no such status marker,
-  and for pure count-only snapshots with no specific task-id (the
-  stale-by-design audit trail this sweep must never touch).
+  blocked/in-progress; returns the empty set for text with no such status
+  marker, and for pure count-only snapshots with no specific task-id (the
+  stale-by-design audit trail this sweep must never touch). Includes the
+  task-3042 'blocked' regression class: the closed-class-connective
+  individual form ('Task N is in a blocked status ...'), the status-noun-
+  anchored phrase form for open-class gaps ('Task N is deliberately parked
+  in blocked status ...'), and the precision guards bounding both (no bind
+  inside 'unblocked', no cross-clause/cross-comma gap).
 - flatten_dedup_edges: flattens get_all_valid_edges' dict[entity_uuid,
   list[EdgeDict]] shape and dedups by edge uuid (handles the backend's
   double-attribution of each directed edge under both endpoint entities).
