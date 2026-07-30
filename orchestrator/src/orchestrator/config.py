@@ -3475,6 +3475,23 @@ class OrchestratorConfig(BaseSettings):
     # filing (tip arm disabled — byte-identical post-2370 behavior).
     main_tip_sweep_rerun_confirm_enabled: bool = Field(default=True)
 
+    # Isolated PRE-FILTER gating the main-tip sweep's full-suite retry (task
+    # 3095).  When a first-pass sweep fails, run_main_tip_sweep used to
+    # unconditionally re-run the WHOLE suite a second time in the same
+    # worktree — minutes of background CPU that itself worsens the contention
+    # it is trying to measure.  With this on, the sweep first re-runs just the
+    # first-pass failing node-ids, scoped + forced-serial + generous-timeout,
+    # in the already-pinned worktree: a deterministic reproduction SKIPS the
+    # expensive full retry, while a non-reproduction (or any unconfirmable
+    # outcome) still pays for it, so a genuine full-verify PASS remains the
+    # precondition for the harness's escalation self-heal.  The pre-filter is
+    # a COST gate only and never suppresses — the harness's fresh-worktree
+    # confirm_main_tip_failure_is_real gate remains the sole suppression
+    # authority.  Default-on, mirrors main_tip_sweep_rerun_confirm_enabled's
+    # operator kill-switch convention; set to False to restore byte-identical
+    # pre-3095 behavior (unconditional full retry).
+    main_tip_sweep_isolated_prefilter_enabled: bool = Field(default=True)
+
     # Category allowlist narrowing the terminal-subject auto-close (task 2724).
     # The subject-terminal Source-C close (criterion a above) used to fire for
     # ANY category — a status-only heuristic that silently dropped still-required
