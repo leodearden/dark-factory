@@ -69,6 +69,14 @@ from fused_memory.reconciliation.task_filter import (
     is_proposed_resolution_framing,
 )
 from fused_memory.server.manifest_stamping import stamp_capability_manifests
+from fused_memory.server.markup_tripwire import (
+    MarkupStormCounter,
+    build_markup_block,
+    emit_markup_storm_escalation,
+    find_markup_violation,
+    markup_override_requested,
+    strip_markup_override,
+)
 from fused_memory.server.near_duplicate_guard import (
     build_near_duplicate_block,
     build_topic_cluster_block,
@@ -402,6 +410,15 @@ Conventions:
   high similarity (error_type=ProceduralKnowledgeNearDuplicateWriteRejected). For either, override with
   metadata={'allow_near_duplicate': True} only when the content is genuinely distinct; recon-stage-*
   agents are exempt from both.
+- Never write raw MCP envelope markup into a payload. add_memory/add_episode content and
+  submit_task/update_task title/description/details/prompt are REJECTED
+  (error_type=McpEnvelopeMarkupWriteRejected) when they carry a leaked tool-call envelope
+  fragment; the response names the matched pattern and the offending field. This catches a
+  harness serialization bug whose specimens are permanent once stored (and which made a task
+  parser derive a wrong priority silently), so strip the fragment and resubmit rather than
+  rewording around it. Override with metadata={'allow_mcp_markup': True} only when the markup
+  is quoted deliberately (e.g. documenting the leak). The authoritative pattern list and
+  rationale live in fused_memory/server/markup_tripwire.py.
 - Tasks may carry memory_hints in metadata — structured pointers (search queries + entity names)
   that help future agents prefetch relevant context. Execute hint queries via search, look up
   hint entities via get_entity.
@@ -681,6 +698,88 @@ def create_mcp_server(
         """Return an error dict if project_id is absent from the known_projects registry."""
         return validate_known_project_id(project_id, _kp)
 
+    # Task 3141 (PRD memory-write-path-convergence §9 leaf o): reject writes
+    # carrying raw MCP envelope markup at all four write boundaries. Per-server
+    # (not module-global) so no counter state bleeds between servers or tests.
+    # DF 3083 owns the root cause and the retroactive corpus sweep.
+    _markup_storm = MarkupStormCounter()
+
+    def _markup_gate(
+        fields: dict[str, object],
+        agent_id: str | None,
+        metadata: object,
+        project_root: str | None,
+    ) -> dict | None:
+        """Return the structured rejection dict if any of *fields* carries markup.
+
+        Returns ``None`` when the write is clean or the caller set the explicit
+        ``allow_mcp_markup`` override (see markup_tripwire's module docstring for
+        why that hatch exists). Every rejection feeds the storm counter, so a
+        burst — meaning the upstream serialization leak is actively running — is
+        surfaced rather than silently absorbed into a stream of bounced writes.
+        """
+        if markup_override_requested(metadata):
+            return None
+        violation = find_markup_violation(fields)
+        if violation is None:
+            return None
+        field, pattern = violation
+        logger.warning(
+            'markup_tripwire: rejected write with leaked MCP envelope markup '
+            '(agent_id=%r field=%r matched_pattern=%r project_root=%r)',
+            agent_id, field, pattern, project_root,
+        )
+        storm = _markup_storm.record(project_root)
+        if storm is not None:
+            # A burst, not an isolated slip: the upstream leak is live. Log it at
+            # ERROR on one greppable line first — the block dict below only ever
+            # reaches the leaking caller, which is the party least likely to act
+            # on it, so this line is the operator-facing half of INV-4.
+            logger.error(
+                'markup_tripwire_storm: %d markup writes rejected in %.0fs '
+                '(threshold=%d agent_id=%r field=%r matched_pattern=%r '
+                'project_root=%r) — the upstream serialization leak is ACTIVE; '
+                'DF 3083 owns the root cause',
+                storm.get('count', -1), storm.get('window_seconds', -1.0),
+                storm.get('threshold', -1), agent_id, field, pattern, project_root,
+            )
+            # File against EVERY project seen in the window, not just the one
+            # whose write happened to cross the threshold: the counter is shared
+            # across all projects this server serves, so escalating only the
+            # crossing write would name the wrong leaker AND leave the actually
+            # leaking project with nothing (the per-window rate limit means it
+            # gets no second chance until the window rolls over). The per-project
+            # anchor dedup collapses repeats inside each queue.
+            targets = storm.get('projects') or ([project_root] if project_root else [])
+            filed: dict[str, str] = {}
+            for target in targets:
+                # Escalation is purely additive — the rejection is already
+                # decided. emit_markup_storm_escalation is built never to raise,
+                # but a call site that relied on that promise would turn a future
+                # regression there into an outage here (same reasoning as
+                # task_interceptor's wrapping of scope_violation_escalator).
+                try:
+                    esc_id = emit_markup_storm_escalation(target, storm)
+                except Exception:  # pragma: no cover — defensive only
+                    logger.exception(
+                        'markup_tripwire: emit_markup_storm_escalation raised for '
+                        'project_root=%r; continuing with the rejection',
+                        target,
+                    )
+                    continue
+                if esc_id is not None:
+                    filed[target] = esc_id
+            if filed:
+                # Echoed back so the refused caller (or a reviewer reading the
+                # response) can find the filed escalation without grepping logs —
+                # preferring THIS caller's project, falling back to any filed id
+                # when the caller's own project resolved to nothing.
+                storm = {
+                    **storm,
+                    'escalation_id': filed.get(project_root or '') or next(iter(filed.values())),
+                }
+        return build_markup_block(agent_id, field, pattern, str(fields[field]), storm=storm)
+
     async def _log_read(
         operation: str,
         project_id: str | None = None,
@@ -918,6 +1017,17 @@ def create_mcp_server(
         through Graphiti's extraction pipeline, then classified facts are dual-written
         to Mem0 as appropriate. Returns immediately; processing happens in background.
 
+        Content carrying a raw MCP envelope fragment is REJECTED outright
+        (error_type=McpEnvelopeMarkupWriteRejected) — a harness serialization
+        bug has been leaking tool-call envelope markup into write payloads, and
+        each one that lands is a permanent corpus specimen (worse here than for
+        add_memory: extraction would fan the fragment out across derived facts).
+        Strip the fragment and resubmit, or set
+        metadata={'allow_mcp_markup': True} if you are quoting the markup
+        deliberately. :mod:`fused_memory.server.markup_tripwire` holds the
+        authoritative pattern list and the rationale — it is deliberately the
+        only place in the package that enumerates the literals.
+
         Args:
             content: Raw text, conversation, or JSON to ingest
             project_id: Project scope (required)
@@ -925,7 +1035,11 @@ def create_mcp_server(
             agent_id: Which agent is writing (optional, auto-derived from MCP context)
             session_id: Session context (optional, auto-derived from MCP context)
             source_description: E.g. "pair programming session"
-            metadata: Optional key-value pairs (may contain _causation_id for recon)
+            metadata: Optional key-value pairs. Read here for _causation_id/source
+                routing only — add_episode does NOT persist metadata on the
+                episode. Set {'allow_mcp_markup': True} to bypass the MCP-markup
+                tripwire when the content quotes envelope markup deliberately;
+                the flag is write-time-only and is never forwarded.
             temporal_context: Optional temporal framing — one of "retrospective",
                 "planning", or "current". When set, the value is prepended to
                 source_description as '[temporal:X] ' so downstream readers can
@@ -948,6 +1062,18 @@ def create_mcp_server(
             return err
         if err := await _backlog_gate(project_id):
             return err
+        # Task 3141 / PRD leaf o: reject leaked MCP envelope markup BEFORE the
+        # recon-stage content guards below, so a partly-serialized payload can
+        # never be run through is_mixed_temporal_framing / the batch-plan and
+        # proposed-resolution auto-taggers and come back as some other, more
+        # misleading verdict. DF 3083 owns the root cause + corpus sweep.
+        if block := _markup_gate({'content': content}, agent_id, metadata, _kp.get(project_id)):
+            return block
+        # DEFENSIVE ONLY — nothing observes this today: add_episode reads metadata
+        # for _causation_id/source and never forwards it to the store, so the
+        # write-time flag cannot reach persistence by this path. Kept so a future
+        # metadata pass-through cannot silently start persisting it.
+        metadata = strip_markup_override(metadata)
         if temporal_context is not None and temporal_context not in _VALID_TEMPORAL_CONTEXTS:
             return {
                 'error': (
@@ -1083,6 +1209,16 @@ def create_mcp_server(
         replaces, with no ordering guarantee that those duplicates are
         deleted first).
 
+        Content carrying a raw MCP envelope fragment is REJECTED outright
+        (error_type=McpEnvelopeMarkupWriteRejected) — a harness serialization
+        bug has been leaking tool-call envelope markup into write payloads, and
+        each one that lands is a permanent corpus specimen. Strip the fragment
+        and resubmit. If you are quoting such markup DELIBERATELY (documenting
+        the leak itself), set metadata={'allow_mcp_markup': True}.
+        :mod:`fused_memory.server.markup_tripwire` holds the authoritative
+        pattern list and the rationale — it is deliberately the only place in
+        the package that enumerates the literals.
+
         Args:
             content: The memory itself (a fact, preference, procedure, etc.)
             project_id: Project scope (required)
@@ -1094,8 +1230,10 @@ def create_mcp_server(
             metadata: Arbitrary key-value pairs (optional). For procedural_knowledge,
                       set {'allow_near_duplicate': True} to bypass both the topic-cluster
                       and near-duplicate write guards when the content is genuinely
-                      distinct. This flag is write-time-only and is stripped before
-                      persistence — it is never stored on the resulting memory.
+                      distinct. Set {'allow_mcp_markup': True} to bypass the MCP-markup
+                      tripwire when the content quotes envelope markup deliberately.
+                      Both flags are write-time-only and are stripped before
+                      persistence — neither is ever stored on the resulting memory.
             dual_write: Force write to both stores (default: false)
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
@@ -1116,6 +1254,14 @@ def create_mcp_server(
                 ),
                 'error_type': 'ValidationError',
             }
+        # Task 3141 / PRD leaf o: reject leaked MCP envelope markup BEFORE the
+        # recon-stage content guards below, so a partly-serialized payload can
+        # never be run through is_count_snapshot / is_mixed_temporal_framing and
+        # come back as some other, more misleading verdict. DF 3083 owns the root
+        # cause + corpus sweep.
+        if block := _markup_gate({'content': content}, agent_id, metadata, _kp.get(project_id)):
+            return block
+        metadata = strip_markup_override(metadata)
         if (
             category == 'temporal_facts'
             and isinstance(agent_id, str)
@@ -3702,6 +3848,19 @@ def create_mcp_server(
         "planning_mode": True}`` synchronously — no ticket, no
         ``resolve_ticket`` follow-up needed.
 
+        ``title``/``description``/``details``/``prompt`` carrying a raw MCP
+        envelope fragment are REJECTED outright
+        (error_type=McpEnvelopeMarkupWriteRejected) before the description
+        parser sees them. A harness serialization bug has been leaking tool-call
+        envelope markup into task text, where the parser then derived WRONG
+        values from it silently (one reify task was filed priority=high and
+        stored as medium). Strip the fragment and resubmit, or set
+        metadata={'allow_mcp_markup': True} if you are quoting the markup
+        deliberately (e.g. filing a task ABOUT the leak).
+        :mod:`fused_memory.server.markup_tripwire` holds the authoritative
+        pattern list and the rationale — it is deliberately the only place in
+        the package that enumerates the literals.
+
         Args:
             project_root: Absolute path to project root
             prompt: Task description for AI generation (forwarded to Taskmaster)
@@ -3714,6 +3873,11 @@ def create_mcp_server(
                 tasks may supply ``before_done`` (required: ``script`` path
                 under project_root that exists and is executable, ``timeout_secs``
                 positive int) and/or ``always_escalates`` (bool) in metadata.
+
+                allow_mcp_markup (optional): set to ``True`` to bypass the
+                MCP-markup tripwire when the task text quotes envelope markup
+                deliberately. Write-time-only — it is stripped before
+                persistence, so it never enters the task metadata vocabulary.
 
                 complexity (optional): set to "simple" to route this task to
                 the single-agent fast path (one Sonnet agent explores, plans,
@@ -3756,6 +3920,19 @@ def create_mcp_server(
         if isinstance(_normalized, dict):
             return _normalized
         project_root = _normalized
+
+        # MCP-markup tripwire (task 3141 / PRD memory-write-path-convergence §9
+        # leaf o): reject leaked envelope markup FIRST, ahead of every guard
+        # below and well before the interceptor's description parser — DF 3083
+        # showed that parser mis-parses such a fragment SILENTLY (reify task 3210
+        # filed priority=high, stored as medium). All four text fields are
+        # scanned, matching premise_lint_guard's field set at this same boundary.
+        if block := _markup_gate(
+            {'title': title, 'description': description, 'details': details, 'prompt': prompt},
+            agent_id, metadata, project_root,
+        ):
+            return block
+        metadata = strip_markup_override(metadata)
 
         # Lock-charter guard γ: reject directory strings in metadata.files
         # before forwarding to the interceptor. Covers both the normal curator
@@ -4222,6 +4399,16 @@ def create_mcp_server(
         path which can drift on re-rewrite. It will be removed once the
         sqlite cutover is complete.
 
+        ``title``/``description``/``details``/``prompt`` carrying raw MCP
+        envelope markup are REJECTED outright
+        (error_type=McpEnvelopeMarkupWriteRejected) before the description parser
+        sees them — same guard, same reasoning as ``submit_task``. Strip the
+        leaked fragment and resubmit, or set metadata={'allow_mcp_markup': True}
+        if you are quoting the markup deliberately (which is the case when
+        updating a task ABOUT the leak). See
+        :mod:`fused_memory.server.markup_tripwire` for the authoritative pattern
+        list and rationale.
+
         Args:
             id: Task ID to update
             project_root: Absolute path to project root
@@ -4230,7 +4417,10 @@ def create_mcp_server(
                 is a shallow last-write-wins merge: ``{**existing, **incoming}``.
                 Omitted keys from ``metadata`` are preserved; every supplied key
                 (scalar or list) overwrites wholesale. Use ``metadata_mode`` to
-                change this behavior.
+                change this behavior.  ``allow_mcp_markup=True`` bypasses the
+                MCP-markup tripwire for deliberately quoted markup; it is
+                write-time-only and stripped before the merge, so it is never
+                persisted.
             metadata_mode: Controls how ``metadata`` is merged with the existing
                 blob. One of:
                 - ``'merge'`` (default when omitted) — shallow last-write-wins.
@@ -4277,6 +4467,17 @@ def create_mcp_server(
         if isinstance(_normalized, dict):
             return _normalized
         project_root = _normalized
+
+        # MCP-markup tripwire (task 3141 / PRD leaf o): see the matching
+        # submit_task call site above. Same four fields, same reason — they all
+        # reach the description parser DF 3083 proved mis-parses silently.
+        if block := _markup_gate(
+            {'title': title, 'description': description, 'details': details, 'prompt': prompt},
+            agent_id, metadata, project_root,
+        ):
+            return block
+        metadata = strip_markup_override(metadata)
+
         _dirs = directory_locks(extract_files(metadata))
         if _dirs:
             return lock_charter_error(_dirs)
