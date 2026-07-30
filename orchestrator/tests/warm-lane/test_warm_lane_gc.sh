@@ -78,7 +78,10 @@
 #       preserve and that a `released` lane still reclaims; S-reasons pins the
 #       reason vocabulary (the raw state stays visible; a null task_id never
 #       renders a dangling id), the GATE ORDER (record before the /proc walk),
-#       and the appended preserved_assigned= counter
+#       and the appended preserved_assigned= counter; S-fallback pins that the
+#       task-5572 /proc scan is INHERITED as the recordless fallback (PRD D7),
+#       that released/quarantined/corrupt all fall OPEN, and that a corrupt
+#       record is loud while the ordinary recordless case stays quiet
 #
 # The former Tier-3 blocks I/J/L (terminal-task reclaim + Pass-2 boundary,
 # task 5167) were deleted when task 5326 collapsed the Pass-1 gate to the
@@ -2094,6 +2097,97 @@ assert "S11: summary APPENDS preserved_assigned=3 after preserved_live_ref (neve
 
 kill "$SR_HELPER_PID" 2>/dev/null || true
 wait "$SR_HELPER_PID" 2>/dev/null || true
+_BGPIDS=()  # clear so EXIT cleanup does not re-kill a possibly-reused PID
+
+# ── S-fallback: the /proc gate is INHERITED, and every other class falls open ─
+# The state dir EXISTS here and only _lane-2's record is missing — sharper than
+# "no .lane-state at all", and the real shape of an `_iact-*` or manual operator
+# worktree living alongside pool lanes.
+#   _lane-1  released      — control, must reset.
+#   _lane-2  NO record + a live process reference — reaches the /proc gate via
+#            the recordless fall-through, proving the 5572 scan is SUPERSEDED,
+#            not deleted (PRD D7).
+#   _lane-3  quarantined   — falls open. Reset touches only target/, never the
+#            source tree or branch (sizing-lifecycle T1), so a quarantined
+#            lane's forensic state survives; only its disk is reclaimed.
+#   _lane-4  present, readable, but carrying no `state` string —
+#            LANE_STATE_CAUSE=unparseable-record. Must be LOUD and must still
+#            fall open: failing closed on a corrupt record would let one bad
+#            write freeze a lane out of reclaim forever.
+SF_ROOT="$(mktemp -d /tmp/test-gc-sf-XXXXXX)"
+_TMPDIRS+=("$SF_ROOT")
+
+SF_REPO="$SF_ROOT/repo"
+SF_WORKTREES="$SF_ROOT/worktrees"
+SF_BASE="$SF_ROOT/base"
+mkdir -p "$SF_WORKTREES" "$SF_BASE"
+
+make_repo "$SF_REPO"
+
+mkdir -p "$SF_BASE/target.gen.1"
+touch "$SF_BASE/target.gen.1.lock"
+ln -sfn "$SF_BASE/target.gen.1" "$SF_BASE/target"
+
+for _sf_name in _lane-1 _lane-2 _lane-3 _lane-4; do
+    git -C "$SF_REPO" worktree add -q "$SF_WORKTREES/$_sf_name"
+    mkdir -p "$SF_WORKTREES/$_sf_name/target"
+    touch "$SF_WORKTREES/$_sf_name/target/DIVERGENT_MARKER"
+done
+
+make_lane_state "$SF_WORKTREES" _lane-1 released
+# _lane-2: deliberately NO record — the state dir exists (make_lane_state above
+# created it), only this lane's entry is absent.
+make_lane_state "$SF_WORKTREES" _lane-3 quarantined
+make_lane_state_raw "$SF_WORKTREES" _lane-4 '{"lane": "_lane-4", "note": "truncated write'
+
+SF_READY="$SF_ROOT/lane2-holder.ready"
+( cd "$SF_WORKTREES/_lane-2/target" && touch "$SF_READY" && exec sleep 300 ) &
+SF_HELPER_PID=$!
+_BGPIDS+=("$SF_HELPER_PID")
+_wait_for_reader_lock "$SF_READY" 30
+
+SF_SEED_LOG="$SF_ROOT/seed_calls.log"
+SF_SEED_STUB="$SF_ROOT/seed_stub.sh"
+_seed_stub_body > "$SF_SEED_STUB"
+chmod +x "$SF_SEED_STUB"
+export SEED_LOG="$SF_SEED_LOG"
+
+run_helper reclaim \
+    --worktrees-dir "$SF_WORKTREES" \
+    --base-target "$SF_BASE/target" \
+    --seed-script "$SF_SEED_STUB" \
+    --main-ref main
+
+assert "S12: recordless _lane-2 reaches the INHERITED /proc gate (PRD D7)" \
+    bash -c 'printf "%s\n" "$1" | grep -qF "preserving _lane-2: live consumer (process reference)"' _ "$ERR_OUT"
+assert "S13: recordless _lane-2 preserved (marker intact, seed NOT invoked)" \
+    bash -c '[ -f "$1" ] && ([ ! -f "$2" ] || ! grep -q "_lane-2" "$2")' _ \
+    "$SF_WORKTREES/_lane-2/target/DIVERGENT_MARKER" "$SF_SEED_LOG"
+assert "S14: released _lane-1 reset (fail open on RELEASED)" \
+    bash -c 'grep -q "_lane-1" "$1" && [ ! -f "$2" ]' _ \
+    "$SF_SEED_LOG" "$SF_WORKTREES/_lane-1/target/DIVERGENT_MARKER"
+assert "S15: quarantined _lane-3 reset (QUARANTINED does not preserve)" \
+    bash -c 'grep -q "_lane-3" "$1" && [ ! -f "$2" ]' _ \
+    "$SF_SEED_LOG" "$SF_WORKTREES/_lane-3/target/DIVERGENT_MARKER"
+# INV-2, structured-facts-at-failure: a record that IS there and is wrong means
+# an assigned lane has silently degraded back to the pre-γ FREE≈flock-free
+# regime. That has to be visible AND attributable to the lane.
+assert "S16: a corrupt record is LOUD and names both the lane and the cause" \
+    bash -c 'printf "%s\n" "$1" | grep -qE "_lane-4.*unparseable-record"' _ "$ERR_OUT"
+assert "S17: ...and still falls open — _lane-4 is reset (one bad write cannot freeze a lane)" \
+    bash -c 'grep -q "_lane-4" "$1" && [ ! -f "$2" ]' _ \
+    "$SF_SEED_LOG" "$SF_WORKTREES/_lane-4/target/DIVERGENT_MARKER"
+# The asymmetry is the point: no-readable-record is the ORDINARY reading for
+# every recordless _iact-*/manual worktree, so warning on it would emit a line
+# per entry per pass and train operators to ignore the channel S16 exists to
+# raise.
+assert "S18: the ordinary recordless case stays QUIET (no no-readable-record spam)" \
+    bash -c '! printf "%s\n" "$1" | grep -qF "no-readable-record"' _ "$ERR_OUT"
+assert "S19: summary reset=3 with the preserve attributed to the /proc gate, not the record" \
+    bash -c 'printf "%s\n" "$1" | grep -qE "reset=3 .*preserved_live_ref=1 preserved_assigned=0"' _ "$OUT"
+
+kill "$SF_HELPER_PID" 2>/dev/null || true
+wait "$SF_HELPER_PID" 2>/dev/null || true
 _BGPIDS=()  # clear so EXIT cleanup does not re-kill a possibly-reused PID
 
 # ─────────────────────────────────────────────────────────────────────────────
