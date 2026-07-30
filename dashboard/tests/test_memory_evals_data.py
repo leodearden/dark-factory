@@ -260,3 +260,39 @@ def _write_escalation(
     }
     body.update(extra)
     return _dump(esc_dir / f'{esc_id}.json', body)
+
+
+# ---------------------------------------------------------------------------
+# step-1 — the config property
+# ---------------------------------------------------------------------------
+
+
+class TestConfigProperty:
+    """``DashboardConfig.memory_evals_dir`` — contract-fixed, NOT env-indirected."""
+
+    def test_memory_evals_dir_is_project_relative(self, tmp_path: Path) -> None:
+        config = DashboardConfig(project_root=tmp_path)
+
+        assert config.memory_evals_dir == tmp_path.resolve() / 'fused-memory' / 'data' / 'memory-evals'
+
+    def test_memory_evals_dir_ignores_runtime_data_dir_env_vars(self, tmp_path, monkeypatch) -> None:
+        """The M1 artifact path is contract-fixed — no ``_runtime_data_dir`` indirection.
+
+        ``QUEUE_DATA_DIR`` / ``RECONCILIATION_DATA_DIR`` relocate the *managed*
+        fused-memory runtime dirs (config.py:156) to an XDG-rooted path outside
+        the watched tree.  The memory-eval artifacts are NOT among them: they
+        are written relative to the repo at the path
+        ``docs/prds/memory-eval-program.md`` §3 pins, so a relocation env var
+        must leave this property untouched.  This test pins the deliberate
+        divergence, so a future "make it consistent" refactor fails loudly.
+        """
+        decoy = tmp_path / 'decoy-runtime'
+        for var in ('MEMORY_EVAL_DATA_DIR', 'RECONCILIATION_DATA_DIR', 'QUEUE_DATA_DIR'):
+            monkeypatch.setenv(var, str(decoy))
+
+        config = DashboardConfig(project_root=tmp_path)
+
+        assert config.memory_evals_dir == tmp_path.resolve() / 'fused-memory' / 'data' / 'memory-evals'
+        assert decoy not in config.memory_evals_dir.parents
+        # Control: an env-indirected sibling DOES move, proving the vars are live.
+        assert config.reconciliation_escalations_dir == decoy / 'escalations'
