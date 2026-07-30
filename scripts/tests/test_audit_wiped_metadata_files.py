@@ -34,6 +34,7 @@ from audit_wiped_metadata_files import (
     NO_SUCCESSFUL_MERGE_SHA,
     PlanFilesRecord,
     TaskRecord,
+    audit_project,
     classify_wipe_signature,
     load_merge_signatures,
     load_plan_files_from_disk,
@@ -845,3 +846,184 @@ def test_load_merge_signatures_skips_malformed_and_ignores_other_event_types(tmp
 
 def test_load_merge_signatures_on_empty_db_returns_empty(tmp_path):
     assert load_merge_signatures(str(_make_runs_db(tmp_path, []))) == {}
+
+
+# ---------------------------------------------------------------------------
+# audit_project — end-to-end over one project root:
+#   <root>/.taskmaster/tasks/tasks.db      (harness.py:1877 convention)
+#   <root>/data/orchestrator/runs.db
+#   <root>/.worktrees                      (config.py:1410 worktree_dir)
+# ---------------------------------------------------------------------------
+
+
+def _make_project(tmp_path, tasks=(), events=(), plans=(), name="proj"):
+    """Build a whole project root with the three inputs audit_project reads.
+
+    *plans* is a list of ``(worktree_name, plan_dict)`` written to the
+    canonical meta-root location.
+    """
+    root = tmp_path / name
+    tasks_dir = root / ".taskmaster" / "tasks"
+    tasks_dir.mkdir(parents=True)
+    _make_tasks_db(tasks_dir, list(tasks))
+
+    runs_dir = root / "data" / "orchestrator"
+    runs_dir.mkdir(parents=True)
+    _make_runs_db(runs_dir, list(events))
+
+    worktrees = root / ".worktrees"
+    worktrees.mkdir(parents=True)
+    for wt_name, plan in plans:
+        _write_meta_root_plan(worktrees, wt_name, plan)
+    return root
+
+
+def test_audit_project_reports_a_wiped_task_with_full_provenance(tmp_path):
+    """(a) non-empty plan scope + empty metadata.files IS reported, carrying
+    every field a downstream repair would need."""
+    root = _make_project(
+        tmp_path,
+        tasks=[{"id": 2464, "status": "done", "metadata": {"files": []}}],
+        events=[
+            {
+                "event_type": "merge_finalized",
+                "task_id": 2464,
+                "data": _finalized("already_merged"),
+            }
+        ],
+        plans=[("2464", {"task_id": 2464, "files": ["a.py", "b.py"]})],
+    )
+
+    audit = audit_project(str(root))
+
+    assert len(audit.candidates) == 1
+    candidate = audit.candidates[0]
+    assert candidate.task_id == 2464
+    assert candidate.tag == "master"
+    assert candidate.status == "done"
+    assert candidate.plan_files == ("a.py", "b.py")
+    assert candidate.plan_files_source == "meta_root_plan_json"
+    assert candidate.plan_files_fidelity == FIDELITY_FILE_LEVEL
+    assert candidate.wipe_signature == CONFIRMED_NULL_SHA_DONE_PATH
+
+
+def test_audit_project_does_not_report_a_task_whose_files_survived(tmp_path):
+    """(b) non-empty metadata.files means nothing was wiped."""
+    root = _make_project(
+        tmp_path,
+        tasks=[{"id": 1, "status": "done", "metadata": {"files": ["a.py"]}}],
+        plans=[("1", {"task_id": 1, "files": ["a.py"]})],
+    )
+    audit = audit_project(str(root))
+
+    assert audit.candidates == []
+    assert audit.coverage.total_tasks == 1
+    assert audit.coverage.tasks_with_file_level_signal == 1
+
+
+def test_audit_project_does_not_report_a_task_whose_plan_declared_no_scope(tmp_path):
+    """(c) an empty plan file list is not a declared scope, so an empty
+    metadata.files is not evidence of a wipe."""
+    root = _make_project(
+        tmp_path,
+        tasks=[{"id": 1, "status": "done", "metadata": {"files": []}}],
+        plans=[("1", {"task_id": 1, "files": []})],
+    )
+    audit = audit_project(str(root))
+
+    assert audit.candidates == []
+    # No usable plan signal was recovered, so the task is UNKNOWN, not clean.
+    assert audit.coverage.tasks_without_plan_signal == 1
+    assert audit.coverage.tasks_with_file_level_signal == 0
+
+
+def test_audit_project_counts_plan_records_with_no_matching_task(tmp_path):
+    """(d) a plan/event signal for a task absent from tasks.db is counted
+    separately rather than crashing or being silently dropped."""
+    root = _make_project(
+        tmp_path,
+        tasks=[{"id": 1, "status": "done", "metadata": {"files": []}}],
+        plans=[
+            ("1", {"task_id": 1, "files": ["a.py"]}),
+            ("9999", {"task_id": 9999, "files": ["ghost.py"]}),
+        ],
+    )
+    audit = audit_project(str(root))
+
+    assert [c.task_id for c in audit.candidates] == [1]
+    assert audit.coverage.plan_records_without_task == 1
+
+
+def test_audit_project_orders_candidates_by_tag_then_numeric_id(tmp_path):
+    """(e) deterministic ordering — numeric, so 100 sorts after 20."""
+    ids = [100, 20, 3]
+    root = _make_project(
+        tmp_path,
+        tasks=(
+            [{"id": i, "tag": "master", "metadata": {"files": []}} for i in ids]
+            + [{"id": 50, "tag": "alpha", "metadata": {"files": []}}]
+        ),
+        plans=[(str(i), {"task_id": i, "files": [f"{i}.py"]}) for i in ids + [50]],
+    )
+    audit = audit_project(str(root))
+
+    assert [(c.tag, c.task_id) for c in audit.candidates] == [
+        ("alpha", 50),
+        ("master", 3),
+        ("master", 20),
+        ("master", 100),
+    ]
+
+
+def test_audit_project_coverage_counts_every_tier(tmp_path):
+    """(f) total, file-level, lock-level-only, and no-signal counts, where
+    no-signal includes tasks with no plan record at all."""
+    root = _make_project(
+        tmp_path,
+        tasks=[
+            {"id": 1, "metadata": {"files": []}},   # file-level signal
+            {"id": 2, "metadata": {"files": []}},   # lock-level signal only
+            {"id": 3, "metadata": {"files": []}},   # no signal at all
+            {"id": 4, "metadata": {"files": ["kept.py"]}},  # file-level, intact
+        ],
+        events=[
+            {"event_type": "set_to_plan", "task_id": 2, "data": {"files": ["orchestrator"]}},
+            {"event_type": "phase_skipped", "task_id": 4, "data": {"plan_files": ["kept.py"]}},
+        ],
+        plans=[("1", {"task_id": 1, "files": ["one.py"]})],
+    )
+    audit = audit_project(str(root))
+
+    assert audit.coverage.total_tasks == 4
+    assert audit.coverage.tasks_with_file_level_signal == 2   # tasks 1 and 4
+    assert audit.coverage.tasks_with_lock_level_signal_only == 1  # task 2
+    assert audit.coverage.tasks_without_plan_signal == 1      # task 3
+    assert audit.coverage.project_root == str(root)
+    # Task 2's candidate carries the lock-level label so a repair cannot
+    # mistake a module path for a plan.files entry.
+    lock_candidates = [c for c in audit.candidates if c.task_id == 2]
+    assert lock_candidates[0].plan_files_fidelity == FIDELITY_LOCK_LEVEL
+    assert lock_candidates[0].plan_files == ("orchestrator",)
+
+
+def test_audit_project_degrades_to_no_merge_event_without_a_runs_db(tmp_path):
+    """A project with no runs.db still audits; every signature is UNKNOWN."""
+    root = _make_project(
+        tmp_path,
+        tasks=[{"id": 1, "metadata": {"files": []}}],
+        plans=[("1", {"task_id": 1, "files": ["a.py"]})],
+    )
+    (root / "data" / "orchestrator" / "runs.db").unlink()
+
+    audit = audit_project(str(root))
+
+    assert [c.wipe_signature for c in audit.candidates] == [NO_MERGE_EVENT]
+
+
+def test_audit_project_on_an_empty_project_reports_zero_and_does_not_crash(tmp_path):
+    root = _make_project(tmp_path)
+    audit = audit_project(str(root))
+
+    assert audit.candidates == []
+    assert audit.coverage.total_tasks == 0
+    assert audit.coverage.tasks_without_plan_signal == 0
