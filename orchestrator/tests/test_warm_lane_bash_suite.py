@@ -117,6 +117,43 @@ def test_manifest_matches_disk() -> None:
     )
 
 
+def test_every_invocable_script_has_ported_coverage() -> None:
+    """Every invocable relocated script must be exercised by a ported bash test.
+
+    The INV-5 replacement for reify's ``verify-pipeline-infra-tests.txt``
+    drift map, which this leaf excised from ``test_warm_lane_gc_sweep.sh``
+    (that file maps reify's paths and has no dark-factory counterpart).  This
+    assertion guards the same invariant against the directory that actually
+    exists here: it fails LOUDLY if a future leaf ships a new invocable script
+    into ``orchestrator/scripts/warm-lane/`` without ported bash coverage, or
+    removes one whose test is still listed.  PRD leaf κ needs that condition to
+    be false before it deletes reify's originals.
+
+    ``lib_live_refs.sh`` and ``lib_portable.sh`` are excluded from the key set by
+    decision, not oversight: both are ``source``-only, neither has a ``--help``
+    or any invocable entry point, and both are covered *transitively* — the
+    gc/gc-sweep ``exit 2``-on-missing-sibling assertions (``test_warm_lane_gc.sh``
+    A9) exercise ``lib_live_refs.sh``, and ``test_warm_lane_audit.sh`` exercises
+    ``lib_portable.sh`` on every audit invocation.
+    """
+    invocable = {
+        p.name for p in WARM_LANE_SCRIPT_DIR.glob('*.sh')
+        if not p.name.startswith('lib_')
+    }
+    assert set(SCRIPT_COVERAGE) == invocable, (
+        f'SCRIPT_COVERAGE and the invocable scripts in {WARM_LANE_SCRIPT_DIR} disagree.\n'
+        f'  mapped but absent (removed script?):  {sorted(set(SCRIPT_COVERAGE) - invocable)}\n'
+        f'  shipped but unmapped (no coverage?):  {sorted(invocable - set(SCRIPT_COVERAGE))}'
+    )
+    unported = {
+        script: test for script, test in SCRIPT_COVERAGE.items()
+        if test not in PORTED_TESTS
+    }
+    assert not unported, (
+        f'SCRIPT_COVERAGE names bash tests that are not in PORTED_TESTS: {unported}'
+    )
+
+
 def test_required_host_tools_are_present() -> None:
     """Fail — never skip — when a tool the ported tests hard-require is absent.
 
