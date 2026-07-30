@@ -1013,7 +1013,7 @@ class TaskSteward:
         persisted: it means "terminal for THIS steward", and a fresh steward
         for the same task is entitled to try again.
         """
-        self._capped_escalations.add(escalation_id)
+        pass
 
     def _dismiss_capped_l0(self, escalation: Escalation, reason: str) -> None:
         """Dismiss *escalation* on a give-up that files no L1 (task 3170).
