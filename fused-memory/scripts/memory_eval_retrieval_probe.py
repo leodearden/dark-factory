@@ -1829,14 +1829,15 @@ def render_probe_report(
     if unmatched:
         lines.append('')
         lines.append(f'canonicals matched by NEITHER key ({len(unmatched)}):')
-        lines.append(
-            '  Neither the content hash nor last_known_id matched anything '
+        for chunk in _wrap(
+            'Neither the content hash nor last_known_id matched anything '
             'returned. Either the entry is genuinely unfindable, the query '
             'was routed to a store the entry does not live in, or the '
             'registry fixture has decayed past both keys — the serving store '
             'is named per topic so an operator can tell those apart rather '
             'than guessing between them.'
-        )
+        ):
+            lines.append(f'  {chunk}')
         lines.extend(
             f'  - {topic} (served by: {", ".join(sorted(unmatched_stores[topic])) or "nothing"})'
             for topic in unmatched
