@@ -24,6 +24,19 @@ recorded in the payload's structured ``issues`` list — named, with its
 here raises: a degraded tree yields a degraded payload, never a 500.  Staleness
 is *displayed*, never alarmed on; this module files no escalations.
 
+Concretely, every artifact reader here distinguishes THREE disposal paths and
+names two of them: the file is absent (``missing_*``, and only where absence is
+meaningful — a tree where no eval has ever run is healthy, not degraded), it
+fails to parse (``unreadable_*``), or it parses but is not the expected type
+(``malformed_*``).  **No reader may discard a parsed artifact without appending
+to** ``issues``.  The third path is the easy one to omit and the costly one to
+lose: a discarded verdicts body leaves every row's verdict absent, which is
+indistinguishable from a healthy no-alarm tree unless the discard is recorded.
+This does not widen validation into producer territory — the reader still
+validates only what it must READ (JSON parses, top level is a dict, ``metrics``
+is a list); semantic M1 rules such as a proportion outside [0,1] still pass
+through verbatim with no issue.
+
 **Same-host file reads (DD1).**  The dashboard and the eval runner share a
 filesystem; there is no RPC in this path.
 """
