@@ -2178,12 +2178,13 @@ async def _run_post_merge_verify(
     Args:
         max_narrowed: Budget for the classified-infra-transient retry loop
             (task 2835) when this call's failed-only retry was actually
-            NARROWED (the D2 producer merged ``retry_env`` — see
-            ``narrowed`` below).  Default ``1`` matches the legacy
+            NARROWED — i.e. the D2 producer inside that branch built a
+            payload from attempt-0's own result and merged ``retry_env``
+            (see ``narrowed`` below).  Default ``1`` matches the legacy
             single-retry behaviour, so every existing caller that omits
             this param is byte-identical.  A non-narrowed retry (flag off,
-            or flag on but no sidecar yet) always uses ``max_enospc``
-            instead, regardless of this value.
+            or a payload that could not be built or corroborated) always
+            uses ``max_enospc`` instead, regardless of this value.
         narrowed_retries: Per-task counter dict for the narrowed budget
             above, mirroring ``enospc_retries`` but DECOUPLED from it (an
             earlier ENOSPC event never starves a narrowed retry, and vice
@@ -2198,7 +2199,7 @@ async def _run_post_merge_verify(
         shadow_baseline_sink: Optional mutable out-param (PRD
             verify-retry-failed-only D4, §5.4).  When supplied AND this call
             actually narrowed the retry (``narrowed`` — the D2 producer merged
-            ``retry_env`` on a tree-OID-corroborated attempt-0 sidecar), the
+            ``retry_env`` on a tree-OID-corroborated attempt-0 payload), the
             attempt-0 ``debug_verdicts`` ∪ ``release_verdicts`` map is copied
             into it.  :class:`SpeculativeMergeWorker` unions this with the
             PARTIAL narrowed-retry warm output (via
@@ -2441,15 +2442,68 @@ async def _run_post_merge_verify(
         # retry chance (see test_classified_infra_transient_zero_retry_after_
         # shared_budget_exhausted in test_merge_queue.py).
         elif not verify.passed and (verify.category or '') in INFRA_TRANSIENT_CATEGORIES:
-            # task 2835: a NARROWED (failed-only) retry — this call's D2
-            # producer actually merged retry_env, above — earns its own
-            # SEPARATE, larger budget (max_narrowed/narrowed_retries),
-            # decoupled from the legacy enospc_retries/max_enospc budget so
-            # an unrelated prior ENOSPC event can never starve it.  A
-            # non-narrowed retry (flag off, or flag on but no sidecar yet)
-            # keeps sharing the legacy budget, byte-identical to before this
-            # task (both are 1 in production today, so this loop performs
-            # exactly one retry either way until reify's sidecar lands).
+            # Failed-only merge-verify retry PRODUCER (PRD verify-retry-failed-
+            # only D2, re-wired in task 3059).  THIS is the only correct site:
+            # attempt-0 has just run and FAILED, so its own VerifyResult is the
+            # evidence the retry is narrowed against.  The shipped D2 built the
+            # env BEFORE the first dispatch from a sidecar nothing has ever
+            # written — which would have narrowed attempt-0 ITSELF had the file
+            # existed.  The causal chain now reads:
+            #
+            #   attempt-0 result -> _build_attempt0_payload (DF-owned: this
+            #   result's per-test verdicts + a `cargo nextest list` planned
+            #   probe, with only the tree-OID pin and the profile list from
+            #   reify's target/reify-verify-attempt.json) -> INV-3 tree-OID
+            #   corroboration (_assemble_retry_verify_env) -> narrowed retry.
+            #
+            # Guarded by req.retry_failed_only (D1, task 2833) so the flag-off /
+            # legacy path is byte-identical (D1's strict no-op guarantee).  Every
+            # fail-safe route — unreadable/malformed sidecar, a probe that could
+            # not produce a plan, a rebased or uncorroborated tree — returns None
+            # and leaves `spec` untouched, so the retry runs FULL via the
+            # existing _reverify_rebased_tree (M4) semantics.
+            #
+            # `not narrowed` keeps this a once-per-call operation: the loop below
+            # may dispatch several times, but the subset is always attempt-0's.
+            #
+            # NOTE (task 2822): injecting into `spec` means the merged verify_env
+            # flows into BOTH the retry dispatch below AND task 2822's
+            # post-dispatch remote-green cross-check re-verify (which reuses this
+            # same `spec`) — correct and desired: a failed-only retry's local
+            # trust-anchor cross-check should scope to the same subset.
+            if req.retry_failed_only and not narrowed:
+                attempt0 = await _build_attempt0_payload(merge_wt, verify)
+                if attempt0 is not None:
+                    retry_env = await _assemble_retry_verify_env(
+                        git_ops, req, merge_wt, attempt0
+                    )
+                    if retry_env is not None:
+                        spec = dataclasses.replace(
+                            spec, verify_env={**spec.verify_env, **retry_env}
+                        )
+                        narrowed = True
+                        # PRD verify-retry-failed-only D4 (§5.4): copy the
+                        # attempt-0 per-test verdict map into the caller's sink
+                        # so the warm shadow baseline is MERGED (attempt-0 ∪
+                        # partial narrowed-retry output) before storage.  This
+                        # narrowed retry re-runs ONLY the {did-not-pass} subset,
+                        # so its output alone OMITS every attempt-0-passed test →
+                        # a from-scratch full cold shadow compare would flag them
+                        # all only_cold → phantom born-at-L2 divergence.
+                        # Populated ONLY here (narrowed=True) so an
+                        # uncorroborated tree never seeds a stale baseline.
+                        if shadow_baseline_sink is not None:
+                            shadow_baseline_sink.update(
+                                {**attempt0.debug_verdicts, **attempt0.release_verdicts}
+                            )
+
+            # task 2835: a NARROWED (failed-only) retry — the producer directly
+            # above actually merged retry_env — earns its own SEPARATE, larger
+            # budget (max_narrowed/narrowed_retries), decoupled from the legacy
+            # enospc_retries/max_enospc budget so an unrelated prior ENOSPC event
+            # can never starve it.  A non-narrowed retry (flag off, or a payload
+            # that could not be built/corroborated) keeps sharing the legacy
+            # budget, byte-identical to before task 2835.
             retries, budget = (
                 (narrowed_retries, max_narrowed) if narrowed else (enospc_retries, max_enospc)
             )

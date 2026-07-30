@@ -14932,9 +14932,13 @@ class TestRunPostMergeVerify:
 
         with (
             patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            # task 3059: the payload is now BUILT from attempt-0's own result
+            # inside the retry branch, not read from a pre-dispatch sidecar.
+            # These budget tests only care that narrowing SUCCEEDED, so the
+            # builder is stubbed with an opaque non-None payload.
             patch(
-                'orchestrator.merge_queue._load_attempt0_sidecar',
-                MagicMock(return_value=object()),
+                'orchestrator.merge_queue._build_attempt0_payload',
+                AsyncMock(return_value=object()),
             ),
             patch(
                 'orchestrator.merge_queue._assemble_retry_verify_env',
@@ -14996,9 +15000,13 @@ class TestRunPostMergeVerify:
 
         with (
             patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            # task 3059: the payload is now BUILT from attempt-0's own result
+            # inside the retry branch, not read from a pre-dispatch sidecar.
+            # These budget tests only care that narrowing SUCCEEDED, so the
+            # builder is stubbed with an opaque non-None payload.
             patch(
-                'orchestrator.merge_queue._load_attempt0_sidecar',
-                MagicMock(return_value=object()),
+                'orchestrator.merge_queue._build_attempt0_payload',
+                AsyncMock(return_value=object()),
             ),
             patch(
                 'orchestrator.merge_queue._assemble_retry_verify_env',
@@ -15058,9 +15066,13 @@ class TestRunPostMergeVerify:
 
         with (
             patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            # task 3059: the payload is now BUILT from attempt-0's own result
+            # inside the retry branch, not read from a pre-dispatch sidecar.
+            # These budget tests only care that narrowing SUCCEEDED, so the
+            # builder is stubbed with an opaque non-None payload.
             patch(
-                'orchestrator.merge_queue._load_attempt0_sidecar',
-                MagicMock(return_value=object()),
+                'orchestrator.merge_queue._build_attempt0_payload',
+                AsyncMock(return_value=object()),
             ),
             patch(
                 'orchestrator.merge_queue._assemble_retry_verify_env',
@@ -15096,23 +15108,28 @@ class TestRunPostMergeVerify:
             f'not the transient-infra hold: {result.reason!r}'
         )
 
-    async def test_flag_on_without_narrowing_keeps_legacy_enospc_budget(self) -> None:
-        """(task 2835 step-7) RED — locks the "strict no-op until reify
+    async def test_flag_on_without_narrowing_keeps_legacy_enospc_budget(
+        self, tmp_path: Path,
+    ) -> None:
+        """(task 2835 step-7) RED — locks the "narrowing must actually happen"
 
-        lands" invariant: the larger narrowed budget is gated on ACTUAL
-        narrowing (the D2 producer applying retry_env), not on the raw
-        req.retry_failed_only flag. With the flag on but NO sidecar written
-        (the real tolerant _load_attempt0_sidecar returns None against a
-        bare MagicMock merge_wt), narrowed stays False and the retry must
-        still use the small legacy enospc_retries/max_enospc budget even
-        though a generous max_narrowed=5 is supplied.
+        invariant: the larger narrowed budget is gated on ACTUAL narrowing
+        (the D2 producer applying retry_env), not on the raw
+        req.retry_failed_only flag. With the flag on but NO sidecar present
+        in merge_wt, the real (unstubbed) _build_attempt0_payload returns
+        None (task 3059), narrowed stays False, and the retry must still use
+        the small legacy enospc_retries/max_enospc budget even though a
+        generous max_narrowed=5 is supplied.
+
+        merge_wt is a REAL empty directory, not a MagicMock: the production
+        payload builder resolves the sidecar path under it.
         """
         from orchestrator.merge_queue import _run_post_merge_verify
 
         git_ops = self._make_git_ops()
         req = self._make_req()
         req.retry_failed_only = True
-        merge_wt = MagicMock()
+        merge_wt = tmp_path
 
         infra_result = _infra_category_verify_result('semaphore_timeout')
 
@@ -15164,9 +15181,13 @@ class TestRunPostMergeVerify:
 
         with (
             patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            # task 3059: the payload is now BUILT from attempt-0's own result
+            # inside the retry branch, not read from a pre-dispatch sidecar.
+            # These budget tests only care that narrowing SUCCEEDED, so the
+            # builder is stubbed with an opaque non-None payload.
             patch(
-                'orchestrator.merge_queue._load_attempt0_sidecar',
-                MagicMock(return_value=object()),
+                'orchestrator.merge_queue._build_attempt0_payload',
+                AsyncMock(return_value=object()),
             ),
             patch(
                 'orchestrator.merge_queue._assemble_retry_verify_env',
@@ -15222,9 +15243,13 @@ class TestRunPostMergeVerify:
 
         with (
             patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            # task 3059: the payload is now BUILT from attempt-0's own result
+            # inside the retry branch, not read from a pre-dispatch sidecar.
+            # These budget tests only care that narrowing SUCCEEDED, so the
+            # builder is stubbed with an opaque non-None payload.
             patch(
-                'orchestrator.merge_queue._load_attempt0_sidecar',
-                MagicMock(return_value=object()),
+                'orchestrator.merge_queue._build_attempt0_payload',
+                AsyncMock(return_value=object()),
             ),
             patch(
                 'orchestrator.merge_queue._assemble_retry_verify_env',
