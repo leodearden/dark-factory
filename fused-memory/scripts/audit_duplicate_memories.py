@@ -208,6 +208,100 @@ def _lexical_pairs(
                 yield (i, j)
 
 
+# Every way the ANN candidate path can lose a candidate, enumerated ONCE so
+# the zero-filled disclosure dict has a single definition. The metrics layer
+# emits one metric per key; an absent key downstream is indistinguishable
+# from "not measured", so these are always all present, always integers,
+# always zero-filled on a clean run.
+_ANN_DISCLOSURE_KEYS: tuple[str, ...] = (
+    'top_k_saturated',
+    'below_threshold_dropped',
+    'unknown_neighbor_dropped',
+    'missing_vector',
+)
+
+
+def ann_pairs_from_neighbors(
+    memories: list[dict],
+    neighbors_by_id: dict[Any, list[dict]],
+    threshold: float,
+    *,
+    top_k: int | None = None,
+) -> tuple[list[tuple[int, int]], dict[str, int]]:
+    """ANN neighbour lists → candidate index pairs + a full loss disclosure.
+
+    The ANN sibling of ``_lexical_pairs``: both emit ``(i, j)`` index pairs
+    into ``cluster_memories_by_pairs``. This one catches the paraphrase class
+    the lexical scan structurally cannot — same meaning, almost no shared
+    wording — but unlike a full O(n^2) scan it can lose candidates, so every
+    loss is counted rather than absorbed.
+
+    Pure: no I/O. The caller supplies the already-fetched neighbour lists
+    (see ``fetch_ann_neighbors``), which keeps this fully testable without a
+    live Qdrant.
+
+    Args:
+        memories: Scanned records, each optionally carrying ``'vector'``.
+            Pair indices address this list.
+        neighbors_by_id: ``{memory_id: [{'id': ..., 'score': ...}, ...]}``.
+            A record absent from this mapping simply contributes no pairs.
+        threshold: Minimum score for a hit to become a candidate pair.
+            INCLUSIVE — a hit exactly at *threshold* is kept.
+        top_k: The per-record neighbour cap the query was issued with. When
+            given, a neighbour list filled to the cap is counted as
+            ``top_k_saturated``: further matches may have been cut off.
+
+    Returns:
+        ``(pairs, disclosure)``. *pairs* are canonical ``(low, high)`` index
+        tuples, deduped and sorted so the output is deterministic.
+        *disclosure* maps every key in ``_ANN_DISCLOSURE_KEYS`` to an int:
+
+          - ``top_k_saturated`` — records whose neighbour list hit the cap.
+            A property of the QUERY, so counted regardless of how many hits
+            then survived the threshold.
+          - ``below_threshold_dropped`` — hits scored under *threshold*.
+          - ``unknown_neighbor_dropped`` — hits naming a record outside the
+            scanned set (excluded by the category filter, or written between
+            the scroll and the query); it cannot be clustered, so it is lost.
+          - ``missing_vector`` — records with no stored vector to query with,
+            so they were never used as a query point.
+
+        A self-hit is dropped silently: a record is always its own nearest
+        neighbour, which is expected rather than a loss.
+
+    Does not mutate *memories*.
+    """
+    disclosure = dict.fromkeys(_ANN_DISCLOSURE_KEYS, 0)
+    index_by_id: dict[Any, int] = {m.get('id'): i for i, m in enumerate(memories)}
+    pairs: set[tuple[int, int]] = set()
+
+    for i, memory in enumerate(memories):
+        if memory.get('vector') is None:
+            # Never queried — with_vectors was off, or Qdrant returned the
+            # point without a vector. Either way its neighbourhood is unknown.
+            disclosure['missing_vector'] += 1
+            continue
+
+        hits = neighbors_by_id.get(memory.get('id')) or []
+        if top_k is not None and len(hits) >= top_k:
+            disclosure['top_k_saturated'] += 1
+
+        for hit in hits:
+            hit_id = hit.get('id')
+            if hit_id == memory.get('id'):
+                continue  # self-hit: expected, not a loss
+            if (hit.get('score') or 0.0) < threshold:
+                disclosure['below_threshold_dropped'] += 1
+                continue
+            j = index_by_id.get(hit_id)
+            if j is None:
+                disclosure['unknown_neighbor_dropped'] += 1
+                continue
+            pairs.add((i, j) if i < j else (j, i))
+
+    return sorted(pairs), disclosure
+
+
 def _created_at_sort_key(created_at: Any) -> tuple[int, float]:
     """Sort key placing parseable ``created_at`` oldest-first, unparseable last.
 
