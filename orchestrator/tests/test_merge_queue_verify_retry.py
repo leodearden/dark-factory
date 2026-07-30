@@ -789,3 +789,396 @@ async def test_build_attempt0_payload_none_when_probe_fails(tmp_path: Path) -> N
         )
 
     assert payload is None
+
+
+# ---------------------------------------------------------------------------
+# _run_post_merge_verify wiring — the task's HEADLINE user-observable signal
+# (task 3059, step 19).
+#
+# The shipped D2 built the retry env BEFORE the first dispatch, from a
+# DF-invented sidecar nothing has ever written.  That was doubly wrong: the file
+# never existed (so the capability was inert), and narrowing before attempt-0
+# runs would have narrowed ATTEMPT-0 ITSELF — there is no prior result to narrow
+# against at that point.
+#
+# The re-wire moves the narrowing INTO the classified-infra-transient retry
+# branch, built from THIS call's own attempt-0 VerifyResult.  These tests pin
+# that causal chain end to end:
+#
+#     attempt-0 dispatch (FULL) -> infra-transient red -> DF-owned payload
+#     -> INV-3 tree-OID corroboration -> narrowed retry dispatch
+#
+# Driven on the LOCAL path (runner=None) with a patched VerifyRunnerPool that
+# records the spec of every dispatch, so the assertions read the exact
+# verify_env each attempt was dispatched with.
+# ---------------------------------------------------------------------------
+
+
+def _recording_pool(results: list):
+    """A VerifyRunnerPool stand-in recording the spec of every dispatch.
+
+    Returns ``(pool_cls, specs)``; ``specs[i]`` is the ``MergeVerifySpec`` the
+    i-th dispatch was called with.  The last result is repeated if the loop
+    dispatches more times than there are results.
+    """
+    specs: list = []
+
+    class _Pool:
+        def __init__(self, runners, **kwargs) -> None:
+            self.runners = runners
+
+        async def dispatch(self, merge_sha, spec, **kwargs):
+            specs.append(spec)
+            return results[min(len(specs) - 1, len(results) - 1)]
+
+    return _Pool, specs
+
+
+def _wiring_req(task_id: str, *, retry_failed_only: bool = True) -> MagicMock:
+    """A MergeRequest double whose config keeps every unrelated branch inert."""
+    req = MagicMock()
+    req.task_id = task_id
+    req.task_files = None
+    req.module_configs = []
+    req.retry_failed_only = retry_failed_only
+    req.config.merge_verify_min_free_disk_bytes = 1024
+    req.config.merge_verify_workspace = False
+    req.config.merge_verify_breadth = 'scoped'
+    req.config.verify_env = {}
+    req.config.merge_verify_cold_command_timeout_secs = None
+    req.config.verify_cold_command_timeout_secs = None
+    # Lever C off: no dispatching-host scope derivation, no remote runner.
+    req.config.enabled_verify_runners = []
+    req.config.git.persistent_merge_worktree = False
+    return req
+
+
+def _infra_transient_attempt0(test_output: str):
+    """attempt-0's own failing result: infra-transient category, NOT ENOSPC."""
+    from orchestrator.verify import VerifyResult
+
+    return VerifyResult(
+        passed=False,
+        test_output=test_output,
+        lint_output='',
+        type_output='',
+        summary='attempt-0 infra-transient red',
+        category='semaphore_timeout',
+    )
+
+
+def _passing_result():
+    from orchestrator.verify import VerifyResult
+
+    return VerifyResult(
+        passed=True, test_output='', lint_output='', type_output='', summary='',
+    )
+
+
+_RETRY_ENV_KEYS = (
+    'REIFY_VERIFY_RETRY_SCOPE',
+    'REIFY_VERIFY_RETRY_TREE_OID',
+    'REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_DEBUG',
+    'REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_RELEASE',
+    'REIFY_RUN_ALL_MEMBER_SUBSET',
+    'REIFY_GUI_RETRY_SPECS',
+)
+
+
+def _no_retry_keys(env: dict) -> bool:
+    return not any(k.startswith('REIFY_VERIFY_RETRY') for k in env)
+
+
+async def _run_wiring(
+    merge_wt: Path,
+    *,
+    req: MagicMock,
+    results: list,
+    git_ops: MagicMock | None = None,
+    probe=None,
+    sink: dict[str, str] | None = None,
+    max_enospc: int = 1,
+    max_narrowed: int = 2,
+    narrowed_retries: dict[str, int] | None = None,
+    enospc_retries: dict[str, int] | None = None,
+):
+    """Drive _run_post_merge_verify on the LOCAL path with a recording pool."""
+    from orchestrator import merge_queue as mq
+
+    pool_cls, specs = _recording_pool(results)
+    git_ops = git_ops if git_ops is not None else _make_git_ops_mock()
+
+    async def _default_probe(_merge_wt, _profile, *, timeout_secs):
+        return list(_PROBED_PLANNED)
+
+    with (
+        patch.object(mq, '_ensure_verify_disk_space', AsyncMock(return_value=None)),
+        patch.object(mq, 'VerifyRunnerPool', pool_cls),
+        patch.object(mq, '_classify_main_health_red', AsyncMock(return_value=None)),
+        patch.object(
+            mq, '_probe_nextest_planned', probe if probe is not None else _default_probe
+        ),
+    ):
+        outcome = await mq._run_post_merge_verify(
+            git_ops, req, merge_wt,
+            timeouts={}, enospc_retries=enospc_retries if enospc_retries is not None else {},
+            max_timeouts=2, max_enospc=max_enospc,
+            max_narrowed=max_narrowed,
+            narrowed_retries=narrowed_retries if narrowed_retries is not None else {},
+            shadow_baseline_sink=sink,
+        )
+    return outcome, specs
+
+
+def _sidecar_oid() -> str:
+    return json.loads(_REIFY_SIDECAR_FIXTURE.read_text())['tree_oid']
+
+
+def _corroborating_git_ops() -> MagicMock:
+    """git_ops whose HEAD tree OID AGREES with the checked-in sidecar bytes."""
+    git_ops = _make_git_ops_mock()
+    git_ops.get_head_tree_hash = AsyncMock(return_value=_sidecar_oid())
+    return git_ops
+
+
+@pytest.mark.asyncio
+async def test_attempt0_is_never_narrowed_by_its_own_retry_contract(
+    tmp_path: Path,
+) -> None:
+    """(a) The FIRST dispatch carries NO REIFY_VERIFY_RETRY_* key.
+
+    Attempt-0 IS the evidence the narrowing is derived from — narrowing it
+    would scope the very run whose {did-not-pass} set the retry needs.  The
+    shipped D2 built the env before this dispatch; this test is the tripwire
+    that the narrowing point actually moved.
+    """
+    _place_real_sidecar(tmp_path)
+    req = _wiring_req('t-wire-a')
+
+    outcome, specs = await _run_wiring(
+        tmp_path,
+        req=req,
+        git_ops=_corroborating_git_ops(),
+        results=[_infra_transient_attempt0(_FAIL_FAST_OUTPUT), _passing_result()],
+    )
+
+    assert outcome is None, f'expected the retry to pass, got: {outcome!r}'
+    assert len(specs) >= 1
+    assert _no_retry_keys(specs[0].verify_env), (
+        f'attempt-0 must be dispatched FULL, got: {specs[0].verify_env!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_narrowed_retry_dispatch_carries_the_did_not_pass_subset(
+    tmp_path: Path,
+) -> None:
+    """(b) The SECOND dispatch carries the retry env and the {failed ∪ not-started} file."""
+    _place_real_sidecar(tmp_path)
+    req = _wiring_req('t-wire-b')
+
+    outcome, specs = await _run_wiring(
+        tmp_path,
+        req=req,
+        git_ops=_corroborating_git_ops(),
+        results=[_infra_transient_attempt0(_FAIL_FAST_OUTPUT), _passing_result()],
+    )
+
+    assert outcome is None
+    assert len(specs) == 2, f'expected attempt-0 + one narrowed retry, got {len(specs)}'
+    env = specs[1].verify_env
+    for key in _RETRY_ENV_KEYS:
+        assert key in env, f'{key} missing from the narrowed retry env: {env!r}'
+    assert env['REIFY_VERIFY_RETRY_SCOPE'] == 'failed_only'
+    assert env['REIFY_VERIFY_RETRY_TREE_OID'] == _sidecar_oid()
+
+    debug_lines = Path(
+        env['REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_DEBUG']
+    ).read_text().splitlines()
+    # 'alpha::test_two' is in the PROBED plan but absent from attempt-0's
+    # verdicts (nextest fail-fast cancelled it) — a not-started test MUST re-run.
+    assert 'test_end_to_end' in debug_lines, (
+        f'a fail-fast-cancelled test must be in the retry subset: {debug_lines!r}'
+    )
+    assert 'beta::test_three' in debug_lines, (
+        f'the FAILED test must be in the retry subset: {debug_lines!r}'
+    )
+    # 'alpha::test_one' PASSED in attempt-0 — narrowing it away is the point.
+    assert 'alpha::test_one' not in debug_lines, (
+        f'a passed test must NOT be re-run: {debug_lines!r}'
+    )
+    # A LATER profile is never narrowed on first-profile evidence.
+    assert Path(
+        env['REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_RELEASE']
+    ).read_text() == ''
+
+
+@pytest.mark.asyncio
+async def test_narrowed_true_unlocks_the_separate_narrowed_budget(
+    tmp_path: Path,
+) -> None:
+    """(c) `narrowed` is observable through the BUDGET selection.
+
+    With ``max_enospc=0`` the legacy budget affords no retry at all, so a
+    dispatch beyond attempt-0 happens ONLY if this call actually narrowed and
+    therefore switched to ``max_narrowed``.
+    """
+    _place_real_sidecar(tmp_path)
+    req = _wiring_req('t-wire-c')
+
+    outcome, specs = await _run_wiring(
+        tmp_path,
+        req=req,
+        git_ops=_corroborating_git_ops(),
+        results=[_infra_transient_attempt0(_FAIL_FAST_OUTPUT), _passing_result()],
+        max_enospc=0,
+        max_narrowed=2,
+        narrowed_retries=(nr := {}),
+        enospc_retries=(er := {}),
+    )
+
+    assert outcome is None
+    assert len(specs) == 2, (
+        f'narrowed=True must select max_narrowed=2, not max_enospc=0 — '
+        f'got {len(specs)} dispatch(es)'
+    )
+    assert nr[req.task_id] == 1, f'the narrowed counter must be the one spent: {nr}'
+    assert er == {}, f'the legacy ENOSPC counter must stay untouched: {er}'
+
+
+@pytest.mark.asyncio
+async def test_refused_narrowing_keeps_the_legacy_budget(tmp_path: Path) -> None:
+    """(c, contrapositive) Narrowing REFUSED -> the legacy max_enospc=0 budget.
+
+    Same scenario, but no sidecar: the payload cannot be built, ``narrowed``
+    stays False, and the retry loop gets ZERO budget — proving the extra
+    dispatch above was caused by the narrowing, not by max_narrowed alone.
+    """
+    req = _wiring_req('t-wire-c2')
+
+    outcome, specs = await _run_wiring(
+        tmp_path,  # no sidecar placed
+        req=req,
+        git_ops=_corroborating_git_ops(),
+        results=[_infra_transient_attempt0(_FAIL_FAST_OUTPUT), _passing_result()],
+        max_enospc=0,
+        max_narrowed=2,
+        narrowed_retries=(nr := {}),
+    )
+
+    assert outcome is not None, 'the un-retried infra red must surface as an outcome'
+    assert len(specs) == 1, (
+        f'a refused narrowing must NOT unlock max_narrowed, got {len(specs)} dispatches'
+    )
+    assert nr == {}, f'the narrowed counter must stay untouched: {nr}'
+
+
+@pytest.mark.asyncio
+async def test_shadow_baseline_sink_seeded_only_on_the_narrowed_path(
+    tmp_path: Path,
+) -> None:
+    """(d) D4/§5.4 phantom-divergence guard: attempt-0 verdicts reach the sink.
+
+    A narrowed retry re-runs ONLY the {did-not-pass} subset, so its warm output
+    alone omits every attempt-0-passed test.  Without this seed a from-scratch
+    cold shadow compare would flag them all ``only_cold``.
+    """
+    _place_real_sidecar(tmp_path)
+    req = _wiring_req('t-wire-d')
+    sink: dict[str, str] = {}
+
+    outcome, specs = await _run_wiring(
+        tmp_path,
+        req=req,
+        git_ops=_corroborating_git_ops(),
+        results=[_infra_transient_attempt0(_FAIL_FAST_OUTPUT), _passing_result()],
+        sink=sink,
+    )
+
+    assert outcome is None
+    assert len(specs) == 2
+    assert sink['crate-a alpha::test_one'] == 'pass'
+    assert sink['crate-a beta::test_three'] == 'fail'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('case', 'place_sidecar', 'probe_none', 'head_oid'),
+    [
+        ('probe_failed', True, True, None),
+        ('sidecar_absent', False, False, None),
+        ('tree_oid_disagrees', True, False, 'a' * 40),
+    ],
+)
+async def test_failsafe_routes_leave_the_retry_dispatch_full(
+    tmp_path: Path, case: str, place_sidecar: bool, probe_none: bool, head_oid: str | None,
+) -> None:
+    """(e) Every fail-safe route leaves the retry FULL and the sink EMPTY.
+
+    A partial plan, an absent sidecar and a disagreeing tree are each an
+    ABSENCE of corroboration — never a licence to narrow.  The retry still
+    happens (on the legacy budget); it is simply not scoped.
+    """
+    if place_sidecar:
+        _place_real_sidecar(tmp_path)
+    req = _wiring_req(f't-wire-e-{case}')
+    sink: dict[str, str] = {}
+
+    async def _none_probe(_merge_wt, _profile, *, timeout_secs):
+        return None
+
+    git_ops = _corroborating_git_ops()
+    if head_oid is not None:
+        git_ops.get_head_tree_hash = AsyncMock(return_value=head_oid)
+
+    outcome, specs = await _run_wiring(
+        tmp_path,
+        req=req,
+        git_ops=git_ops,
+        probe=_none_probe if probe_none else None,
+        results=[_infra_transient_attempt0(_FAIL_FAST_OUTPUT), _passing_result()],
+        sink=sink,
+        max_enospc=1,
+        max_narrowed=2,
+    )
+
+    assert outcome is None
+    assert len(specs) == 2, f'the legacy full retry must still run ({case})'
+    assert _no_retry_keys(specs[1].verify_env), (
+        f'{case}: a fail-safe route must not narrow: {specs[1].verify_env!r}'
+    )
+    assert sink == {}, f'{case}: an uncorroborated payload must not seed the baseline'
+
+
+@pytest.mark.asyncio
+async def test_flag_off_is_byte_identical_to_the_legacy_path(tmp_path: Path) -> None:
+    """(f) D1's strict no-op: retry_failed_only=False never narrows.
+
+    Even with a valid sidecar on disk and a corroborating tree OID, the flag
+    off leaves EVERY dispatch full and the sink untouched.
+    """
+    _place_real_sidecar(tmp_path)
+    req = _wiring_req('t-wire-f', retry_failed_only=False)
+    sink: dict[str, str] = {}
+    probe_calls: list[str] = []
+
+    async def _counting_probe(_merge_wt, profile, *, timeout_secs):
+        probe_calls.append(profile)
+        return list(_PROBED_PLANNED)
+
+    outcome, specs = await _run_wiring(
+        tmp_path,
+        req=req,
+        git_ops=_corroborating_git_ops(),
+        probe=_counting_probe,
+        results=[_infra_transient_attempt0(_FAIL_FAST_OUTPUT), _passing_result()],
+        sink=sink,
+    )
+
+    assert outcome is None
+    assert len(specs) == 2
+    assert all(_no_retry_keys(s.verify_env) for s in specs), (
+        'the flag-off path must be byte-identical to legacy'
+    )
+    assert sink == {}
+    assert probe_calls == [], 'the flag-off path must not even probe'
