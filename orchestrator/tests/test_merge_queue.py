@@ -12971,6 +12971,250 @@ class TestCoalesceOrEnqueueStaleWorktreeReap:
 
 
 # ---------------------------------------------------------------------------
+# TestCoalesceWorktreeCorpseReconcile — the 3148 incident regression
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCoalesceWorktreeCorpseReconcile:
+    """Disk-scan arm reconciles a HEARTBEAT-PINNED corpse against the snapshot.
+
+    THE INCIDENT: a merge request finalized (as `blocked`) but its `_merge-*`
+    worktree stayed in the worker's liveness ledger.  `_touch_owned_merge_
+    worktrees` then os.utime'd that worktree's ROOT inode every heartbeat tick,
+    so the disk-scan arm's `age <= liveness_secs` test was permanently true and
+    every resubmit for the branch coalesced onto the corpse.  Because the
+    disk-scan arm registers no retention alias and no waiter, the caller got a
+    documented-durable `attached` response with `inflight_task_id=null` and an
+    unpollable handle — the branch was wedged out of the merge queue until the
+    orchestrator restarted.
+
+    CRITICAL INVERSION vs. TestCoalesceOrEnqueueStaleWorktreeReap: that class
+    forces `os.utime(merge_wt, (0, 0))` with `liveness_secs=1` so the MTIME arm
+    fires.  Here the mtime is left FRESH and `liveness_secs` is the DEFAULT —
+    reproducing the heartbeat-pinned state, in which mtime says "alive" and the
+    live snapshot is the only signal that the owner has finalized.
+    """
+
+    def _make_event_store(self, tmp_path: Path) -> EventStore:
+        db = tmp_path / 'corpse_reconcile_events.db'
+        return EventStore(db_path=db, run_id='corpse-reconcile-test')
+
+    @staticmethod
+    def _reap_reasons(db_path) -> list[str]:
+        """Return the `reason` of every worktree_reaped event, in insert order."""
+        import json
+        import sqlite3
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            rows = conn.execute(
+                "SELECT data FROM events WHERE event_type = 'worktree_reaped'"
+                ' ORDER BY rowid'
+            ).fetchall()
+        finally:
+            conn.close()
+        return [json.loads(r[0]).get('reason') for r in rows]
+
+    async def test_a_owned_corpse_is_reaped_and_dispatched(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """Owned worktree + no live entry for its branch → reap + fresh dispatch.
+
+        `dispatched=True` at this seam IS the assertion "the resubmission
+        appears in get_merge_queue().entries": dispatch means
+        `enqueue_merge_request` ran and `snapshot()` reads that queue.
+        """
+        branch = 'corpse-owned-branch'
+        wt = await _make_branch_with_file(
+            git_ops, branch, 'corpse_owned.py', 'x = 1\n',
+        )
+        merge_result = await git_ops.merge_to_main(wt, branch)
+        assert merge_result.success, f'merge_to_main failed: {merge_result}'
+        merge_wt = merge_result.merge_worktree
+        assert merge_wt is not None
+
+        try:
+            queue: asyncio.Queue = asyncio.Queue()
+            registry = InFlightMergeRegistry()
+            event_store = self._make_event_store(tmp_path)
+            req = _make_request('corpse-owned', branch, tmp_path, config)
+
+            # Owned by this worker, but the pipeline carries NO entry for the
+            # branch — its request already finalized (e.g. as `blocked`).
+            def _snap() -> dict:
+                return {
+                    'entries': [],
+                    'owned_merge_worktrees': [str(merge_wt.resolve())],
+                }
+
+            result = await coalesce_or_enqueue_merge_request(
+                queue, req, event_store, registry,
+                git_ops=git_ops,
+                live_snapshot=_snap,
+            )
+
+            # The wedge is gone: a fresh merger is dispatched.
+            assert result.dispatched is True, f'Expected dispatched=True, got {result}'
+            assert result.in_flight is False
+            assert queue.qsize() == 1, f'Expected queue size 1, got {queue.qsize()}'
+            assert registry.is_inflight(branch) is True
+
+            # The caller must NOT receive the misleading attached shape at all.
+            assert result.source != 'worktree', (
+                f'coalesced onto a corpse instead of dispatching: {result}'
+            )
+
+            # The corpse is reaped from disk and from git's worktree list.
+            assert not merge_wt.exists(), (
+                f'Corpse worktree {merge_wt} should have been removed'
+            )
+            found = await git_ops.find_inflight_merge_worktree(branch)
+            assert found is None, f'Worktree still registered after reap: {found}'
+
+            # Distinct reason: a live worker heartbeating a finalized request's
+            # worktree is a LEDGER LEAK in progress, operationally different
+            # from 'stale_inflight' (an owner that died long ago).  Collapsing
+            # the two would make the leak invisible in the event stream exactly
+            # when it is happening.
+            assert _count_events(event_store.db_path, 'worktree_reaped') == 1
+            assert self._reap_reasons(event_store.db_path) == ['finalized_owner']
+
+        finally:
+            if merge_wt is not None and merge_wt.exists():
+                await git_ops.cleanup_merge_worktree(merge_wt)
+
+    async def test_b_foreign_worktree_still_coalesces(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """NOT owned by this worker → coalesce, untouched (crash-safety rail).
+
+        The disk-scan arm exists so an in-progress merger's worktree is detected
+        even when the in-memory registry was cleared by a process restart
+        (merge_queue.py:4146-4150, git_ops.py:9401-9404).  A foreign or
+        pre-restart merger is BY CONSTRUCTION absent from this worker's
+        `entries`, so ownership — not branch absence — has to gate the reap, or
+        this test would double-dispatch onto a live merge.
+        """
+        branch = 'corpse-foreign-branch'
+        wt = await _make_branch_with_file(
+            git_ops, branch, 'corpse_foreign.py', 'x = 2\n',
+        )
+        merge_result = await git_ops.merge_to_main(wt, branch)
+        assert merge_result.success, f'merge_to_main failed: {merge_result}'
+        merge_wt = merge_result.merge_worktree
+        assert merge_wt is not None
+
+        try:
+            queue: asyncio.Queue = asyncio.Queue()
+            registry = InFlightMergeRegistry()
+            event_store = self._make_event_store(tmp_path)
+            req = _make_request('corpse-foreign', branch, tmp_path, config)
+
+            def _snap() -> dict:
+                return {'entries': [], 'owned_merge_worktrees': []}
+
+            result = await coalesce_or_enqueue_merge_request(
+                queue, req, event_store, registry,
+                git_ops=git_ops,
+                live_snapshot=_snap,
+            )
+
+            assert result.in_flight is True, f'Expected in_flight=True, got {result}'
+            assert result.dispatched is False
+            assert result.source == 'worktree'
+            assert queue.qsize() == 0
+            assert merge_wt.exists(), (
+                f'Foreign worktree {merge_wt} must NOT be reaped — a live '
+                'cross-process merge would be destroyed and main double-merged'
+            )
+            assert _count_events(event_store.db_path, 'worktree_reaped') == 0
+
+        finally:
+            if merge_wt is not None and merge_wt.exists():
+                await git_ops.cleanup_merge_worktree(merge_wt)
+
+    async def test_c_live_branch_still_coalesces(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """Owned AND the snapshot carries an entry for the branch → coalesce."""
+        branch = 'corpse-live-branch'
+        wt = await _make_branch_with_file(
+            git_ops, branch, 'corpse_live.py', 'x = 3\n',
+        )
+        merge_result = await git_ops.merge_to_main(wt, branch)
+        assert merge_result.success, f'merge_to_main failed: {merge_result}'
+        merge_wt = merge_result.merge_worktree
+        assert merge_wt is not None
+
+        try:
+            queue: asyncio.Queue = asyncio.Queue()
+            registry = InFlightMergeRegistry()
+            event_store = self._make_event_store(tmp_path)
+            req = _make_request('corpse-live', branch, tmp_path, config)
+
+            def _snap() -> dict:
+                return {
+                    'entries': [{'branch': branch, 'request_id': 'mr-live'}],
+                    'owned_merge_worktrees': [str(merge_wt.resolve())],
+                }
+
+            result = await coalesce_or_enqueue_merge_request(
+                queue, req, event_store, registry,
+                git_ops=git_ops,
+                live_snapshot=_snap,
+            )
+
+            assert result.in_flight is True, f'Expected in_flight=True, got {result}'
+            assert result.dispatched is False
+            assert result.source == 'worktree'
+            assert queue.qsize() == 0
+            assert merge_wt.exists(), 'a genuinely in-flight merge must not be reaped'
+            assert _count_events(event_store.db_path, 'worktree_reaped') == 0
+
+        finally:
+            if merge_wt is not None and merge_wt.exists():
+                await git_ops.cleanup_merge_worktree(merge_wt)
+
+    async def test_d_no_snapshot_preserves_legacy(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """No live_snapshot (default None) → fresh-mtime worktree coalesces as today.
+
+        Back-compat for every caller that does not wire a worker.
+        """
+        branch = 'corpse-legacy-branch'
+        wt = await _make_branch_with_file(
+            git_ops, branch, 'corpse_legacy.py', 'x = 4\n',
+        )
+        merge_result = await git_ops.merge_to_main(wt, branch)
+        assert merge_result.success, f'merge_to_main failed: {merge_result}'
+        merge_wt = merge_result.merge_worktree
+        assert merge_wt is not None
+
+        try:
+            queue: asyncio.Queue = asyncio.Queue()
+            registry = InFlightMergeRegistry()
+            event_store = self._make_event_store(tmp_path)
+            req = _make_request('corpse-legacy', branch, tmp_path, config)
+
+            result = await coalesce_or_enqueue_merge_request(
+                queue, req, event_store, registry, git_ops=git_ops,
+            )
+
+            assert result.in_flight is True, f'Expected in_flight=True, got {result}'
+            assert result.dispatched is False
+            assert result.source == 'worktree'
+            assert queue.qsize() == 0
+            assert merge_wt.exists()
+            assert _count_events(event_store.db_path, 'worktree_reaped') == 0
+
+        finally:
+            if merge_wt is not None and merge_wt.exists():
+                await git_ops.cleanup_merge_worktree(merge_wt)
+
+
+# ---------------------------------------------------------------------------
 # TestReaperHeartbeatLivenessBoundary — α+β end-to-end contract (γ gate, task 1730)
 # ---------------------------------------------------------------------------
 
