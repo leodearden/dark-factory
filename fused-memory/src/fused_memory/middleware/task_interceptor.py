@@ -1678,14 +1678,30 @@ class TaskInterceptor:
         project_id: str,
         *,
         llm_reason: str | None = None,
+        advisory: bool = False,
     ) -> None:
-        """Fire the scope_violation escalation on a rejection verdict.
+        """Fire the scope_violation escalation for EITHER guard outcome.
 
         Pure side-effect helper: resolves the suggested root, builds the
         candidate title, and delegates to :attr:`_scope_violation_escalator`.
         Errors are logged and swallowed so a queue failure can never convert
-        a rejection into an exception (matches the never-raise convention).
-        No-ops when no escalator is configured.
+        a guard outcome into an exception (matches the never-raise
+        convention).  No-ops when no escalator is configured.
+
+        This helper is the SEAM where the two outcomes of
+        :meth:`_path_guard_or_skip` are distinguished, so *advisory* selects
+        which one the operator-facing escalation describes (task 3119):
+
+        * ``False`` (default) — the FILES-certain hard reject.  No task was
+          created; the caller receives the ``DarkFactoryPathScopeViolation``
+          error dict.
+        * ``True`` — the PROSE-only advisory.  Nothing was blocked: the task
+          WAS created and stamped with ``metadata.possible_scope_mismatch``.
+
+        Getting this wrong is not cosmetic — an advisory filed with rejection
+        wording tells the operator (and any agent reading it in a briefing)
+        that a task was rejected when it in fact exists, and instructs a
+        resubmission of work that already landed.
 
         The optional *llm_reason* is forwarded to ``report_rejection``
         (task 1822) so genuine-misroute / fail-safe cases carry the LLM
@@ -1712,6 +1728,7 @@ class TaskInterceptor:
                 suggested_project=verdict.suggested_project,
                 suggested_root=suggested_root,
                 llm_reason=llm_reason,
+                advisory=advisory,
             )
         except Exception:  # pragma: no cover — defensive only
             # Escalator is built to never raise (queue failures are
@@ -1821,9 +1838,11 @@ class TaskInterceptor:
 
         # PROSE-ADVISORY: a heuristic hit never blocks creation — the
         # escalation below preserves the signal loudly; the marker lets
-        # async triage see it too.
+        # async triage see it too.  advisory=True so the escalation the
+        # operator reads says the task was CREATED, not rejected (task 3119).
         self._emit_scope_violation_escalation(
-            verdict, candidate, kwargs, project_root, project_id, llm_reason=None,
+            verdict, candidate, kwargs, project_root, project_id,
+            llm_reason=None, advisory=True,
         )
         self._attach_possible_scope_mismatch(kwargs, verdict)
         return None
