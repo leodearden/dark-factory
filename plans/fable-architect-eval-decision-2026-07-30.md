@@ -213,3 +213,32 @@ contradiction: both are correct, under different metrics.
 Neither account is wrong. This record reports both tables above for exactly that
 reason, so a downstream reader does not have to reconcile the resolution against its
 own triage note unassisted.
+
+---
+
+## 5. Statistical significance
+
+_RAW OBSERVATION — transcribed with attribution._ The figures in this section are the
+campaign operator's own statistics, as recorded in esc-2862-1's resolution
+(`resolved_by: eval-campaign-2026-07-27`). They are not re-derived here: the per-cell
+JSONs give the raw `plan_quality` / `outcome` values behind them (§3, §4), but the
+resampling itself (the paired bootstrap, the permutation draws, the Wilson intervals)
+is not reproducible from those files without redoing the operator's procedure, so
+this record transcribes rather than silently re-presents them as its own computation.
+
+- **Paired per-fixture CI95** on the mean `plan_quality` difference (fable −
+  opus-max): **[-0.0433, +0.1633] — crosses zero.**
+- **Permutation test** (label swap within fixture-trial, n=18), two-sided: **p =
+  0.127.**
+- **Plan-rate Wilson CIs overlap almost completely**: fable [74.2%, 99.0%] vs
+  opus-max [67.2%, 96.9%]. The nominal plan-rate "win" is literally one cell (17/18
+  vs 16/18).
+- **Quality-when-planned is a tie**: 0.9188 vs 0.9087, with overlapping CIs.
+- **Leave-one-fixture-out**: dropping `reify_task_12` collapses the paired diff from
+  +0.060 to **+0.0073**; dropping any other single fixture leaves it at
+  +0.069..+0.072. The entire nominal effect rides on one high-variance fixture.
+- **Cross-campaign observation**: pooled over both this campaign and the earlier
+  22-fixture run (`plans/eval-architect-effort-verdict-2026-07-27.md`),
+  `reify_task_12` is 2/4 for fable and 2/4 for opus-max — it is high-variance for
+  *every* candidate, not a fable-specific weakness, and whichever candidate wins its
+  coin flip in a given run wins the aggregate comparison.
