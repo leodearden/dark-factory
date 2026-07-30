@@ -3265,6 +3265,13 @@ def _elapsed_ms(start: float | None) -> int | None:
     return round((time.monotonic() - start) * 1000)
 
 
+# Bound on how many SHAs / paths a single merge_attempt row spells out (task
+# 3178). Driver: reify 5566 attempt-2 cited 22 SHAs touching 7 files, and an
+# unbounded list would bloat runs.db rows. The TRUE count is persisted alongside
+# each truncated slice as ``<key>_total``, so the bounding is never silent.
+_MAX_EVENT_EVIDENCE_ITEMS = 10
+
+
 def _emit_merge_attempt(
     event_store: EventStore | None,
     task_id: str,
@@ -3277,6 +3284,7 @@ def _emit_merge_attempt(
     disposition: MergeFailureDisposition | None = None,
     origin_host: Literal['local', 'remote'] | None = None,
     probe_host: Literal['local', 'remote'] | None = None,
+    skew_evidence: SkewEvidence | None = None,
 ) -> None:
     """Emit a ``merge_attempt`` event for the given outcome.
 
@@ -3317,6 +3325,25 @@ def _emit_merge_attempt(
     verify ran remote. When omitted (the default; every non-main-health-red
     call site), neither key is added — existing callers' payloads stay
     byte-identical.
+
+    *skew_evidence* is the optional :class:`SkewEvidence` bundle GATHERED by
+    ``classify_merge_failure_disposition`` (task 3178). When supplied, its
+    ``failing_tests`` / ``implicated_commits`` / ``overlap_files`` are written as
+    json-serialisable lists, each BOUNDED at ``_MAX_EVENT_EVIDENCE_ITEMS`` with
+    the true length recorded under ``<key>_total`` — a silent cap would let a
+    reader infer "3 commits were cited" from a truncated row, so the truncation
+    is made self-describing. When omitted or None (every pre-3178 call site), no
+    key is added — existing callers' payloads stay byte-identical.
+
+    These keys appear on BOTH the ``integration_skew`` row and the ADJUDICATED
+    ``indeterminate`` row (classifier ran, cited landings, the I7/I5 gate refused
+    to promote). This helper is deliberately disposition-AGNOSTIC about evidence:
+    it writes whatever bundle it is handed, and deciding *when* to emit at all is
+    the caller's guard. That separation is what lets one code path serve both
+    rows. It closes the observability sub-gap where merge_attempt rows persisted
+    only ``{disposition, outcome}`` — which is why the false "shell guards parse
+    zero failing-test ids" premise underpinning tasks 2871 and 2918 survived two
+    task cycles unchecked: nobody could read the evidence back out of runs.db.
     """
     if event_store is not None:
         data: dict = {'outcome': outcome}
@@ -3332,6 +3359,16 @@ def _emit_merge_attempt(
             data['origin_host'] = origin_host
         if probe_host is not None:
             data['probe_host'] = probe_host
+        if skew_evidence is not None:
+            for key, items in (
+                ('failing_tests', skew_evidence.failing_tests),
+                ('implicated_commits', skew_evidence.implicated_commits),
+                ('overlap_files', skew_evidence.overlap_files),
+            ):
+                data[key] = list(items[:_MAX_EVENT_EVIDENCE_ITEMS])
+                # Recorded unconditionally: a reader never has to know the cap
+                # to tell a short citation from a truncated one.
+                data[f'{key}_total'] = len(items)
         event_store.emit(
             EventType.merge_attempt, task_id=task_id, phase='merge',
             data=data, duration_ms=duration_ms,
