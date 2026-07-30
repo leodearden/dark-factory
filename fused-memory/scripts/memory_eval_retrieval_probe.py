@@ -59,6 +59,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -280,6 +281,14 @@ class TopicRegistry:
 
     schema_version: int
     entries: tuple[RegistryEntry, ...]
+    disclosures: dict[str, int] = field(default_factory=dict)
+    """What derivation left out, carried from the payload's ``_disclosures``.
+
+    Derivation narrows its inputs (the count-1 census tail above all), and a
+    narrowing recorded only in the deriver's stdout is invisible by the time
+    anyone reads a run. Carrying it on the registry lets the report state, in
+    the same place as the results, what the probed set does NOT cover.
+    """
 
     @property
     def by_topic(self) -> dict[str, RegistryEntry]:
@@ -513,7 +522,16 @@ def load_topic_registry(path: str | Path) -> TopicRegistry:
             f'but this loader understands {REGISTRY_SCHEMA_VERSION}.'
         )
 
-    return TopicRegistry(schema_version=schema_version, entries=tuple(entries))
+    raw_disclosures = payload.get('_disclosures') or {}
+    disclosures = {
+        key: value for key, value in raw_disclosures.items() if isinstance(value, int)
+    } if isinstance(raw_disclosures, dict) else {}
+
+    return TopicRegistry(
+        schema_version=schema_version,
+        entries=tuple(entries),
+        disclosures=disclosures,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1642,7 +1660,46 @@ async def probe_topic(
 # unmeasured, and which canonicals could not be matched at all.
 # ---------------------------------------------------------------------------
 
-def render_probe_report(series, observations: ProbeObservations) -> str:
+def is_initial_run(root: str | Path, eval_id: str = EVAL_ID) -> bool:
+    """True when no prior metrics artifact for *eval_id* exists under *root*.
+
+    Globs ``metrics-*.json`` in the directory the shared
+    :func:`metrics_artifact_path` defines, so the layout is not restated here.
+    Scoped to this eval's own subdirectory because leaves β/γ/δ share one
+    artifact root — a γ run must not make β's first run look like its second.
+
+    Only the metrics artifact counts. A stray report with no series beside it
+    is not a prior measurement, and treating it as one would silently suppress
+    the initial-state snapshot D1 requires.
+    """
+    from shared.memory_eval_metrics import metrics_artifact_path  # noqa: PLC0415
+
+    directory = metrics_artifact_path(root, eval_id, 'ignored').parent
+    return not any(directory.glob('metrics-*.json'))
+
+
+def _wrap(text: str, width: int = 76) -> list[str]:
+    return textwrap.wrap(text, width=width) or ['']
+
+
+_KNOWN_BAD_PREAMBLE = (
+    'This is the INITIAL STATE of this eval: no prior run exists under this '
+    'artifact root. The items below are what the corpus looks like today, '
+    'inherited from the 3111/3112 fix lineage (canonical pinning, '
+    'consolidation, curator gates) that has been rewriting how memory is '
+    'written for months. They are a KNOWN-BAD snapshot, NOT A FINDING and not '
+    'a regression anyone introduced in this run. Deciding what to do with '
+    'this list is a separate leaf\'s job; this runner only measures.'
+)
+
+
+def render_probe_report(
+    series,
+    observations: ProbeObservations,
+    *,
+    is_initial_run: bool = False,
+    registry: TopicRegistry | None = None,
+) -> str:
     """The prose companion: the shared metric table plus this run's caveats.
 
     Every section here exists because a number alone would mislead. A
@@ -1651,10 +1708,34 @@ def render_probe_report(series, observations: ProbeObservations) -> str:
     matched by ``last_known_id`` reads as healthy while the fixture quietly
     rots. None of those are visible in the metrics table, so they are said here
     in words.
+
+    *is_initial_run* defaults to False so a caller that forgot to detect it
+    cannot fabricate a first run — a known-bad snapshot printed on run fifty
+    would excuse a real regression as inherited state.
+
+    Nothing here adjudicates. No bound, no ratchet and no pass/fail verdict
+    appears in this output, because all of that belongs to leaf α's evaluator
+    (G6/D1) and a second home for it would drift from the first.
     """
     from shared.memory_eval_metrics import render_report  # noqa: PLC0415
 
     lines = [render_report(series).rstrip('\n')]
+
+    if is_initial_run:
+        failing = [
+            item.item_key
+            for metric in series.metrics
+            if metric.metric_id == METRIC_TOPIC_CANONICAL_PRESENT
+            for item in (metric.items or [])
+            if not item.passed
+        ]
+        lines.append('')
+        lines.append(f'INITIAL STATE — known-bad items ({len(failing)}):')
+        for chunk in _wrap(_KNOWN_BAD_PREAMBLE):
+            lines.append(f'  {chunk}')
+        lines.extend(f'  - {key}' for key in failing)
+        if not failing:
+            lines.append('  (no tripwire item is failing in this initial run)')
 
     if observations.degraded_queries:
         lines.append('')
@@ -1723,6 +1804,74 @@ def render_probe_report(series, observations: ProbeObservations) -> str:
         for obs in missing_claims:
             needles = ', '.join(repr(n) for n in obs.missing_needles)
             lines.append(f'  - [{obs.topic}] {obs.query!r}: missing {needles}')
+
+    scored = [obs for obs in observations.phrasings if not obs.degraded]
+    if scored:
+        by_matcher: dict[str, int] = {
+            MATCHED_BY_CONTENT_HASH: 0, MATCHED_BY_LAST_KNOWN_ID: 0, 'unmatched': 0,
+        }
+        for obs in scored:
+            by_matcher[obs.matched_by or 'unmatched'] += 1
+        lines.append('')
+        lines.append('how the canonical was matched (observations):')
+        for chunk in _wrap(
+            'The registry keys a canonical by content hash first because memory '
+            'UUIDs rot on re-consolidation, with last_known_id as a disclosed '
+            'fallback. Which matcher fired is a fixture-health signal: a run '
+            'drifting toward last_known_id needs re-hashing, and unmatched '
+            'entries are either genuinely gone or keyed past both.'
+        ):
+            lines.append(f'  {chunk}')
+        for matcher, count in by_matcher.items():
+            lines.append(f'  {matcher}: {count}')
+
+    contamination = [c for c in observations.contamination if not c.degraded]
+    if contamination:
+        untopiced = sum(c.untopiced_count for c in contamination)
+        total = sum(c.scored_total for c in contamination)
+        foreign = sum(c.foreign_count for c in contamination)
+        lines.append('')
+        lines.append('contamination classification:')
+        lines.append(f'  scored results: {total}')
+        lines.append(f'  foreign (a DIFFERENT registered topic): {foreign}')
+        lines.append(f'  untopiced (no topic, or one this registry does not know): {untopiced}')
+        for chunk in _wrap(
+            'Untopiced results are NOT counted as contamination. The census '
+            'measured 491 of 49,628 entries carrying a topic at all, so '
+            'treating an unstamped result as foreign would measure stamping '
+            'coverage while claiming to measure contamination. As 3195/3201 '
+            'widen the vocabulary this remainder shrinks and the share reaches '
+            'further, with no change to how it is computed.'
+        ):
+            lines.append(f'  {chunk}')
+
+    if registry is not None:
+        composition: dict[str, int] = {}
+        for entry in registry.entries:
+            composition[entry.derived_from] = composition.get(entry.derived_from, 0) + 1
+        lines.append('')
+        lines.append(f'registry composition ({len(registry.entries)} topics):')
+        for source, count in sorted(composition.items()):
+            lines.append(f'  {source}: {count}')
+        if registry.disclosures:
+            lines.append('  what derivation left out:')
+            for key, value in sorted(registry.disclosures.items()):
+                lines.append(f'    {key}: {value}')
+
+    inversion_records = [
+        record
+        for obs in observations.inversions if not obs.degraded
+        for record in obs.inversions
+    ]
+    if inversion_records:
+        lines.append('')
+        lines.append(f'superseded entries outranking their successor ({len(inversion_records)}):')
+        for record in inversion_records:
+            lines.append(
+                f'  - [{record.topic}] {record.phrasing!r}: '
+                f'{record.superseded_hash} (rank {record.superseded_rank}) above '
+                f'{record.successor_hash} (rank {record.successor_rank})'
+            )
 
     return '\n'.join(lines) + '\n'
 
