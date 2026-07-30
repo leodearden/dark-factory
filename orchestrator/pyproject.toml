@@ -104,6 +104,7 @@ markers = [
     "guard_self_test: marks a test class as a self-test of _dry_run_unblock_e2e_guard; suppresses the fixture's teardown assertion so deliberate stub invocations inside pytest.raises do not produce a false-positive failure.",
     "exercise_merge_verify: opt a test OUT of the autouse `_mock_merge_queue_verification` patch so its post-merge verify gate runs the REAL orchestrator.merge_queue.run_scoped_verification (e.g. cargo) instead of the passed=True stub. Default: autouse mock installed in conftest.py.",
     "real_verify_admission: opt a test OUT of the autouse `_neutralize_verify_admission` patch so it exercises the REAL orchestrator.verify admission wiring (nice-prefix wrap + shared.verify_admission.acquire_task_slot) instead of the force-inactive stub. Default: autouse neutralize installed in conftest.py (task 2390).",
+    "warm_lane_bash: marks the pytest items in test_warm_lane_bash_suite.py that shell out to the ported warm-lane bash tests under tests/warm-lane/ (task 3073, PRD leaf α2). Registered for ON-DEMAND selection/deselection only (`-m warm_lane_bash` / `-m 'not warm_lane_bash'`); deliberately NOT deselected in addopts, because PRD leaf γ changes warm-lane-gc.sh's core predicate and needs this coverage actually running on its verify leg, and leaf κ deletes reify's originals on the strength of this suite being green. See orchestrator/tests/warm-lane/README.md.",
 ]
 
 [dependency-groups]
