@@ -116,6 +116,10 @@ from orchestrator.task_status import (
 )
 from orchestrator.usage_gate import UsageGate
 from orchestrator.workflow import TerminalReport, WorkflowOutcome, build_workflow
+from orchestrator.zero_progress_requeue import (
+    ZeroProgressRequeueTracker,
+    emit_zero_progress_requeue_alert,
+)
 from orchestrator.worktree_identity import identities_match, read_worktree_title
 
 if TYPE_CHECKING:
@@ -1409,6 +1413,14 @@ class Harness:
         # fallback when a workflow ignores the soft cancel_event.
         # See task 1491, ITEM 2 (hard-cancel fallback).
         self._workflow_slot_tasks: dict[str, asyncio.Task] = {}
+
+        # Per-task CONSECUTIVE streak of requeues that invoked no agent at all
+        # (task 3068).  Fed from _apply_retry_cap — the single per-report
+        # chokepoint that sees every outcome — and read by
+        # _maybe_zero_progress_requeue_alert.  Pure in-memory; entries are
+        # popped on any progress, so this stays proportional to the number of
+        # tasks CURRENTLY looping rather than growing over a weeks-long run.
+        self._zero_progress_tracker = ZeroProgressRequeueTracker()
 
         # Consecutive terminal-status poll counts per task.  Incremented each
         # poll a workflow is terminal but still active; reset when it is no
@@ -8295,6 +8307,21 @@ class Harness:
         """
         if self._run_id is None:
             return requeued
+
+        # Task 3068 — zero-progress backstop.  Placed here, after the _run_id
+        # guard (whose established role as a test no-op hook is preserved) and
+        # BEFORE the outcome branch below, so EVERY outcome flows through the
+        # tracker: requeues accumulate, DONE/BLOCKED reset.
+        #
+        # This is deliberately independent of report.counts_against_requeue_cap.
+        # workflow_types._disposition_table() sets that False for the warm-lane
+        # dispositions, which routes record_requeue below to its history-only
+        # path — so NEITHER ceiling in this method can trip for them, and a hard
+        # fault masquerading as transient backpressure would otherwise requeue
+        # forever, invisibly.  If you are editing the cap logic below, this is
+        # why a second, independent detector exists.
+        self._maybe_zero_progress_requeue_alert(task_id, report)
+
         if report.outcome == WorkflowOutcome.REQUEUED:
             attempt_cost = report.cost_usd + report.steward_cost_usd
             count = self.scheduler.record_requeue(
@@ -8339,6 +8366,43 @@ class Harness:
         elif report.outcome == WorkflowOutcome.DONE:
             self.scheduler.clear_requeue_count(task_id)
         return requeued
+
+    def _maybe_zero_progress_requeue_alert(
+        self, task_id: str, report: TaskReport,
+    ) -> None:
+        """Fold one dispatch into the zero-progress streak; alarm at threshold.
+
+        Thin config-reading adapter over ``orchestrator.zero_progress_requeue``
+        (the ``_maybe_pipeline_landing_tripwire`` / ``merge_skew_tripwire``
+        shape): the module stays pure and injectable, this method supplies
+        ``self._escalation_queue`` / ``self.event_store`` / the config.
+
+        Wholly wrapped in try/except by design.  This detector exists to
+        backstop the requeue cap; a bug in it must never be able to disturb the
+        cap accounting it sits beside.
+        """
+        try:
+            if not self.config.zero_progress_requeue.enabled:
+                return
+            streak = self._zero_progress_tracker.record(
+                task_id,
+                outcome=report.outcome,
+                agent_invocations=report.agent_invocations,
+            )
+            emit_zero_progress_requeue_alert(
+                escalation_queue=self._escalation_queue,
+                event_store=self.event_store,
+                task_id=task_id,
+                streak=streak,
+                threshold=self.config.zero_progress_requeue.threshold,
+                block_reason=report.block_reason,
+                block_phase=report.block_phase,
+            )
+        except Exception as exc:  # noqa: BLE001 — never disturb cap accounting
+            logger.warning(
+                'Task %s: zero-progress requeue check failed (non-fatal): %s',
+                task_id, exc,
+            )
 
     def _collect_done_reports(
         self, done: set[asyncio.Task], task_reports: list[TaskReport]
