@@ -3,6 +3,8 @@ orchestrator scheduler and the task curator."""
 
 from __future__ import annotations
 
+import pytest
+
 from shared.locking import (
     CODE_EXTENSIONS,
     directory_locks,
@@ -24,13 +26,61 @@ from shared.locking import (
 # ---------------------------------------------------------------------------
 
 _CANONICAL_EXTENSIONS = [
-    'c', 'cc', 'cjs', 'cpp', 'css', 'cts', 'cxx', 'gcode',
+    'c', 'cc', 'cjs', 'conf', 'cpp', 'css', 'cts', 'cxx',
+    'diff', 'envrc', 'example', 'example-systemd-config',
+    'gcode', 'gitattributes', 'gitignore', 'gitkeep', 'gitmodules', 'golden', 'grammar',
     'h', 'hh', 'hpp', 'html',
-    'js', 'json', 'jsonc', 'jsx',
-    'lock', 'md', 'mjs', 'mts', 'png', 'py',
+    'icns', 'ico',
+    'jq', 'js', 'json', 'jsonc', 'jsonl', 'jsx',
+    'lock', 'log',
+    'manifest', 'md', 'mjs', 'mts',
+    'npmrc', 'png', 'py', 'python-version',
     'ri', 'rs', 'scss', 'service', 'sh', 'step', 'stl', 'svg',
-    'toml', 'ts', 'tsx', 'txt',
+    'template', 'timer', 'toml', 'ts', 'tsx', 'txt', 'typed',
     'yaml', 'yml',
+]
+
+# ---------------------------------------------------------------------------
+# Classification corpus for the 22 extensions added by the 2026-07-28
+# ``git ls-files`` sweep (reify #5726 / dark_factory #3117).  One real tracked
+# path per new extension — dark-factory unless the comment says reify.
+# ---------------------------------------------------------------------------
+
+_WIDENED_ACCEPT_PATHS = [
+    'orchestrator/src/orchestrator/evals/reviewer_trial/corpus/mined/mined_1030.diff',
+    'dashboard/dark-factory-dashboard-watchdog.timer',
+    '.gitignore',
+    '.gitattributes',
+    '.gitmodules',
+    '.python-version',
+    '.envrc',
+    'scripts/dashboard.service.template',
+    'scripts/verify-task-845-tty.log',
+    'cockpit/src/cockpit/py.typed',
+    '.env.example',
+    'fused-memory/fused-memory.service.example-systemd-config',
+    'fused-memory/tests/fixtures/write_triage_calibration.jsonl',
+    'tests/infra/run-all-classification.manifest',  # reify — the incident path
+    'deploy/systemd/orchestrator-reify.service.d/warm-lane.conf',  # reify
+    'crates/reify-doc/tests/snapshots/.gitkeep',  # reify
+    'crates/reify-fdm/tests/fixtures/toolpath_bracket.golden',  # reify
+    'gui/src/editor/reify.grammar',  # reify
+    'gui/src-tauri/icons/icon.icns',  # reify
+    'gui/src-tauri/icons/icon.ico',  # reify
+    'scripts/reify-audit-snapshot-filter.jq',  # reify
+    'tree-sitter-reify/.npmrc',  # reify
+]
+
+# Real directories whose final segment carries a leading dot and no further dot.
+# These MUST stay directory-shaped — see
+# TestIsFilePath::test_leading_dot_directories_stay_directories for the rejected
+# "leading-dot segment => FILE" alternative this corpus pins against.
+_DOTTED_DIRECTORY_PATHS = [
+    '.worktrees',
+    '.task',
+    '.claude',
+    '.cargo',
+    '.taskmaster',
 ]
 
 
@@ -160,6 +210,52 @@ class TestIsFilePath:
         assert 'rs' in CODE_EXTENSIONS
         assert 'ts' in CODE_EXTENSIONS
         assert 'md' in CODE_EXTENSIONS
+
+    @pytest.mark.parametrize('path', _WIDENED_ACCEPT_PATHS)
+    def test_widened_allowlist_paths_are_files(self, path: str):
+        """Real tracked paths for the 22 extensions added by the 2026-07-28 sweep.
+
+        One representative path per extension added in reify #5726 /
+        dark_factory #3117.  Every path is a genuinely tracked file in
+        dark-factory or reify (verified with ``git ls-files``) — not a synthetic
+        filename — so the corpus documents the actual evidence that motivated
+        each entry rather than restating the allowlist.
+
+        ``tests/infra/run-all-classification.manifest`` is the path from the
+        originating incident: declaring it in ``metadata.files`` was rejected as
+        a directory lock because ``manifest`` was absent from the allowlist.
+        """
+        assert is_file_path(path), (
+            f'{path!r} must classify as a file — its extension is on the '
+            f'canonical allowlist (58 entries as of reify #5726 / #3117)'
+        )
+
+    @pytest.mark.parametrize('path', _DOTTED_DIRECTORY_PATHS)
+    def test_leading_dot_directories_stay_directories(self, path: str):
+        """Rejected alternative: a blanket "leading-dot segment => FILE" rule.
+
+        Seven of the 22 extensions added by the 2026-07-28 sweep are dotfiles
+        (.gitignore .gitkeep .envrc .npmrc .gitattributes .gitmodules
+        .python-version), so a one-line predicate rule "a segment starting with
+        '.' is a file" looks like an attractive simplification of seven list
+        entries.  It was considered and REJECTED: these paths are real
+        DIRECTORIES, and such a rule would flip every one of them to FILE —
+        letting a task declare ``.worktrees`` (the orchestrator's entire
+        worktree pool) or ``.task`` as its lock charter.  That is precisely the
+        over-wide-charter failure this guard exists to prevent.
+
+        The allowlist must therefore stay ENUMERATED: that is the property
+        making an unknown dotted segment default to directory.  Verified against
+        reify's α implementation — ``lock-charter-guard.sh classify .worktrees``
+        (and .task/.claude/.cargo/.taskmaster) returns REJECT.
+
+        These assertions pass both before and after the widening; they are
+        regression pins for a rejected design, not a behaviour change.
+        """
+        assert not is_file_path(path), (
+            f'{path!r} is a real directory and must NOT classify as a file; a '
+            f'blanket leading-dot=>file rule was rejected for exactly this reason'
+        )
 
 
 class TestDirectoryLocks:
