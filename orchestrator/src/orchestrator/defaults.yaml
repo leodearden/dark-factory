@@ -592,6 +592,17 @@ git:
   # _lane- (warm-lane pool) or _spec- (merge-speculation pool).
   iact_prefix: "_iact-"
 
+# Deep merge-ahead chains (task 3183, plans/deep-merge-ahead-prd.md α).
+# chain_cap is the single gate for the whole feature: a chain is built iff the
+# second verify slot is free AND chain_cap > 0 AND the merge queue holds >= 2
+# mergeable items.  0 (shipped default) is the KILL SWITCH — byte-identical to
+# pre-PRD merge behaviour, no chain code on any dispatch path (probe_fraction=0
+# precedent).  Staged 0 -> 6 (ζ canary, study-validated depth) -> 32 (η2,
+# "uncapped in practice") via scripts/merge-deep-set-cap.sh; green-tier
+# hot-reloadable (decision #7), so enable/retune/kill never needs a restart.
+merge_deep:
+  chain_cap: 0
+
 # Chronic pool-infra flake auto-file detector (task 2358). Gated OFF until
 # reify task 5142's flaky-ledger.jsonl + CHRONIC-FLAKY marker substrate is
 # confirmed on the target project's main (mirrors git.offline_lane_infra_enabled).
