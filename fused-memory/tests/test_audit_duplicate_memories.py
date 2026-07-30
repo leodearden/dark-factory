@@ -2471,6 +2471,7 @@ class _FakeMemoryService:
     """Stand-in for MemoryService with the surface _run actually touches."""
 
     instances: list = []
+    raw_by_category: dict[str, list[dict]] = {}
 
     def __init__(self, config):
         self.config = config
@@ -2489,7 +2490,7 @@ class _FakeMemoryService:
         self.deleted.append(memory_id)
 
 
-def _install_run_doubles(monkeypatch, raw_by_category, *, t_high=0.9):
+def _install_run_doubles(monkeypatch, raw_by_category, *, t_high: float | None = 0.9):
     import fused_memory.config.schema as schema_mod  # noqa: PLC0415
     import fused_memory.services.memory_service as service_mod  # noqa: PLC0415
 
