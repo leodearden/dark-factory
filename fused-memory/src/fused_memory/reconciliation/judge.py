@@ -403,8 +403,15 @@ class Judge:
 Review this run and provide your verdict as JSON.
 """
 
-    async def _call_llm(self, prompt: str) -> str:
-        """Single LLM call (not an agent loop)."""
+    async def _call_llm(self, prompt: str) -> dict | str:
+        """Single LLM call (not an agent loop).
+
+        Returns a ``dict`` for the ``claude_cli`` provider (the schema-validated
+        ``structured_output`` payload) and a ``str`` for the ``anthropic`` /
+        ``openai`` providers, which call their SDKs directly and therefore have no
+        ``--json-schema`` mechanism — prose is all they can return.
+        ``_parse_verdict`` dispatches on the type.
+        """
         if self.config.judge_llm_provider == 'claude_cli':
             return await self._call_judge_cli(prompt)
         elif self.config.judge_llm_provider == 'anthropic':
@@ -432,8 +439,13 @@ Review this run and provide your verdict as JSON.
             )
             return response.choices[0].message.content or ''
 
-    async def _call_judge_cli(self, prompt: str) -> str:
+    async def _call_judge_cli(self, prompt: str) -> dict | str:
         """Delegate to shared.cli_invoke.invoke_with_cap_retry for judge evaluation.
+
+        Returns the schema-validated verdict payload (a ``dict``) on success.  The
+        ``str`` return is now ONLY ever ``''`` — the benign exit-0/empty-stdout
+        legacy contract — and never model prose: the text channel is no longer
+        treated as the verdict.
 
         The verdict contract rides ``output_schema=JUDGE_VERDICT_SCHEMA`` rather
         than prose in the system prompt, so it survives every cap-retry resume:
@@ -485,7 +497,17 @@ Review this run and provide your verdict as JSON.
             raise JudgeInfraError(f'Claude CLI judge cap-wait exhausted: {e}') from e
 
         if result.success:
-            return result.output.strip()
+            # The verdict lives in the schema-validated payload, NOT in the text
+            # channel: after a cap-retry resume the model can (and on 2026-07-25
+            # did) emit conversational prose there, which the old
+            # ``result.output.strip()`` return handed to _parse_verdict to be
+            # fabricated into a phantom severity=serious halt.
+            structured = result.structured_output
+            if isinstance(structured, str):
+                # The CLI sometimes delivers the payload as a JSON string
+                # (agent_loop.py:388-392 handles the same shape).
+                structured = json.loads(structured)
+            return structured
 
         # Not successful: distinguish a genuine benign empty verdict from a
         # transport/infra failure via the shared failure taxonomy
@@ -510,8 +532,41 @@ Review this run and provide your verdict as JSON.
 
         raise JudgeInfraError(build_failure_message('Claude CLI judge', result))
 
-    def _parse_verdict(self, response_text: str, run_id: str) -> JudgeVerdict:
-        """Parse judge response into JudgeVerdict."""
+    def _verdict_from_payload(self, data: dict, run_id: str) -> JudgeVerdict:
+        """Build a JudgeVerdict from an already-structured verdict payload.
+
+        The single JudgeVerdict constructor shared by the structured
+        (``claude_cli``) path and the text-parsing (``anthropic`` / ``openai``)
+        fallback, so the two cannot drift on field defaults.  Keys the model has
+        no field for (e.g. ``summary``, which JUDGE_SYSTEM_PROMPT asks for) are
+        dropped here, exactly as they always were.
+        """
+        return JudgeVerdict(
+            run_id=run_id,
+            reviewed_at=datetime.now(UTC),
+            severity=data.get('severity', VerdictSeverity.ok),
+            findings=data.get('findings', []),
+            action_taken=VerdictAction.none,
+        )
+
+    def _parse_verdict(self, response: str | dict, run_id: str) -> JudgeVerdict:
+        """Turn a judge response into a JudgeVerdict.
+
+        A ``dict`` is an already-structured, already-validated payload from the
+        ``claude_cli`` provider (``_call_judge_cli`` reads it off
+        ``AgentResult.structured_output``) — it goes straight to
+        ``_verdict_from_payload`` with no text parsing at all.
+
+        The ``str`` path below is the fallback for the ``anthropic`` / ``openai``
+        providers, which call their SDKs directly and so have no ``--json-schema``
+        mechanism; prose is the only contract they have.  For ``claude_cli`` that
+        path is dead: a success with no usable payload is classified as infra in
+        ``_call_judge_cli`` and never reaches here.
+        """
+        if isinstance(response, dict):
+            return self._verdict_from_payload(response, run_id)
+
+        response_text = response
         if not response_text.strip():
             # Empty output is a documented benign case, NOT a parse failure:
             # _call_judge_cli returns '' for exit-0/empty-stdout CLI runs
@@ -544,13 +599,7 @@ Review this run and provide your verdict as JSON.
                 text = text.split('```')[1].split('```')[0].strip()
 
             data = json.loads(text)
-            return JudgeVerdict(
-                run_id=run_id,
-                reviewed_at=datetime.now(UTC),
-                severity=data.get('severity', VerdictSeverity.ok),
-                findings=data.get('findings', []),
-                action_taken=VerdictAction.none,
-            )
+            return self._verdict_from_payload(data, run_id)
         except (json.JSONDecodeError, IndexError, KeyError) as e:
             logger.error(f'Failed to parse judge response: {e}')
             # severity=serious is deliberate: it routes through the existing
