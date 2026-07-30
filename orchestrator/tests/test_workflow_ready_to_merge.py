@@ -234,3 +234,126 @@ class TestReadyToMergeHappyPath:
 
         assert f.merge_queue.qsize() == 1
         f.mark_blocked.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# C-2 — reject: any single broken predicate blocks WITHOUT a human escalation
+# ---------------------------------------------------------------------------
+
+# (kwargs that break exactly one predicate, expected `predicate` event name).
+_BROKEN_PREDICATES = [
+    pytest.param(
+        {'tip_is_ancestor_of_main': True}, 'clean_ff', id='already-on-main',
+    ),
+    pytest.param(
+        {'main_is_ancestor_of_tip': False}, 'clean_ff', id='diverged-from-main',
+    ),
+    pytest.param(
+        {'verified_tip': 'd' * 40}, 'verify_passed', id='verify-on-other-tip',
+    ),
+    pytest.param(
+        {'verified_tip': None}, 'verify_passed', id='verify-never-passed',
+    ),
+    pytest.param(
+        {'review_verdict': None}, 'review_pass', id='no-cached-review-verdict',
+    ),
+    pytest.param(
+        {'tree_hash': None}, 'review_pass', id='tree-hash-unresolvable',
+    ),
+    pytest.param(
+        {'tip': 'e' * 40, 'verified_tip': 'e' * 40}, 'cited_commit',
+        id='cited-commit-is-not-the-tip',
+    ),
+    pytest.param({'tip': None}, 'branch_resolved', id='branch-does-not-resolve'),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(('broken', 'predicate'), _BROKEN_PREDICATES)
+class TestReadyToMergeRejects:
+    """A false desync claim is an ARCHITECT MISTAKE, not an unworkable spec —
+    it blocks without escalating, and never enqueues a merge."""
+
+    async def _run(self, tmp_path: Path, broken: dict) -> _Fixture:
+        f = _make(tmp_path=tmp_path, **broken)
+        f.artifacts.write_ready_to_merge(commit=_TIP, evidence='ev')
+        f.outcome = await f.wf._handle_ready_to_merge_report()
+        return f
+
+    async def test_blocks_without_escalating_to_human(
+        self, tmp_path: Path, broken: dict, predicate: str,
+    ):
+        f = await self._run(tmp_path, broken)
+
+        assert f.outcome == WorkflowOutcome.BLOCKED
+        f.mark_blocked.assert_awaited_once()
+        assert f.mark_blocked.await_args.kwargs.get('escalate_to_human') is not True
+
+    async def test_enqueues_no_merge_request(
+        self, tmp_path: Path, broken: dict, predicate: str,
+    ):
+        f = await self._run(tmp_path, broken)
+
+        assert f.merge_queue.qsize() == 0
+
+    async def test_stamps_no_marker(
+        self, tmp_path: Path, broken: dict, predicate: str,
+    ):
+        f = await self._run(tmp_path, broken)
+
+        assert f.marker_stamps() == []
+
+    async def test_emits_structured_reject_event(
+        self, tmp_path: Path, broken: dict, predicate: str,
+    ):
+        """INV-2 structured-facts-at-failure: the FAILED PREDICATE and the
+        values it was judged against land on an event, not a log line."""
+        f = await self._run(tmp_path, broken)
+
+        rows = f.event_store.fetch_events_by_type_all_runs(
+            EventType.architect_desync_merge, task_id=_TASK_ID,
+        )
+        assert len(rows) == 1
+        data = rows[0].get('data') or {}
+        assert data['decision'] == 'rejected'
+        assert data['predicate'] == predicate
+        assert isinstance(data.get('measured'), dict) and data['measured']
+
+    async def test_block_reason_names_the_failed_predicate(
+        self, tmp_path: Path, broken: dict, predicate: str,
+    ):
+        """The blocked record is self-describing without cross-referencing the
+        event stream — reason names the predicate, detail carries the values."""
+        f = await self._run(tmp_path, broken)
+
+        reason = f.mark_blocked.await_args.args[0]
+        detail = f.mark_blocked.await_args.kwargs.get('detail') or ''
+        assert predicate in reason
+        assert detail
+
+
+@pytest.mark.asyncio
+class TestReadyToMergeMalformedArtifact:
+    """Missing/malformed report and missing infrastructure also block."""
+
+    async def test_missing_commit_blocks(self, tmp_path: Path):
+        f = _make(tmp_path=tmp_path)
+        f.artifacts.write_ready_to_merge(commit='', evidence='ev')
+
+        outcome = await f.wf._handle_ready_to_merge_report()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        f.mark_blocked.assert_awaited_once()
+        assert f.mark_blocked.await_args.kwargs.get('escalate_to_human') is not True
+        assert f.merge_queue.qsize() == 0
+        assert f.artifacts.read_ready_to_merge() is None  # still cleared
+
+    async def test_unavailable_merge_queue_blocks(self, tmp_path: Path):
+        f = _make(tmp_path=tmp_path, with_merge_queue=False)
+        f.artifacts.write_ready_to_merge(commit=_TIP, evidence='ev')
+
+        outcome = await f.wf._handle_ready_to_merge_report()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        f.mark_blocked.assert_awaited_once()
+        assert f.mark_blocked.await_args.kwargs.get('escalate_to_human') is not True
