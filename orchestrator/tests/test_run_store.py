@@ -596,3 +596,97 @@ class TestBlockContextPersistence:
         assert rows['101'] == ('', '')
         assert rows['102'] == ('warm_lane_pool_hard_down', 'execute')
         assert rows['103'] == ('verify_infra_failure', 'verify')
+
+    # -- Migration of an EXISTING (pre-3068) runs.db --------------------- #
+    #
+    # _ensure_schema is a bare executescript of CREATE TABLE IF NOT EXISTS, so
+    # a column added only to _SCHEMA would silently NOT apply to a runs.db that
+    # already exists — every deployed orchestrator would keep writing 14
+    # columns and the incident would stay unqueryable in exactly the DBs that
+    # matter.  These four tests pin the additive migration.
+
+    def test_migration_adds_columns_to_existing_db(self, tmp_path):
+        """Constructing RunStore over a legacy DB adds the two columns."""
+        db_path = tmp_path / 'runs.db'
+        _build_legacy_db(db_path)
+        assert 'block_reason' not in _task_results_columns(db_path), (
+            'legacy fixture is not actually legacy'
+        )
+
+        RunStore(db_path)
+
+        cols = _task_results_columns(db_path)
+        assert {'block_reason', 'block_phase'} <= set(cols), (
+            f'migration did not run on the existing DB; got {cols}'
+        )
+        # ALTER appends, so the migrated order must match the fresh-DB order.
+        assert cols[-2:] == ['block_reason', 'block_phase']
+
+    def test_migration_preserves_legacy_rows_as_null(self, tmp_path):
+        """The migration is additive: the pre-existing row survives, NULL."""
+        db_path = tmp_path / 'runs.db'
+        _build_legacy_db(db_path)
+
+        RunStore(db_path)
+
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute(
+                'SELECT title, outcome, block_reason, block_phase '
+                'FROM task_results WHERE task_id = ?',
+                ('900',),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row is not None, 'migration destroyed the legacy row'
+        assert row['title'] == 'Legacy row'
+        assert row['outcome'] == 'done'
+        # NULL, not '' — this row genuinely predates the fix, and that
+        # distinction is the whole point of the always-write-'' contract.
+        assert row['block_reason'] is None
+        assert row['block_phase'] is None
+
+    def test_writer_works_on_migrated_db(self, tmp_path):
+        """save_task_result writes the new columns on a migrated DB."""
+        db_path = tmp_path / 'runs.db'
+        _build_legacy_db(db_path)
+        store = RunStore(db_path)
+
+        store.save_task_result(
+            'run-legacy',
+            TaskReport(
+                task_id='901',
+                title='Post-migration task',
+                outcome=WorkflowOutcome.REQUEUED,
+                block_reason='warm_lane_pool_hard_down',
+                block_phase='review',
+                completed_at='2026-07-30T11:00:00+00:00',
+            ),
+            'proj-a',
+        )
+
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute(
+                'SELECT block_reason, block_phase FROM task_results '
+                'WHERE task_id = ?',
+                ('901',),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row['block_reason'] == 'warm_lane_pool_hard_down'
+        assert row['block_phase'] == 'review'
+
+    def test_migration_is_idempotent(self, tmp_path):
+        """A second construction must not raise "duplicate column name"."""
+        db_path = tmp_path / 'runs.db'
+        _build_legacy_db(db_path)
+
+        RunStore(db_path)
+        cols_after_first = _task_results_columns(db_path)
+        RunStore(db_path)  # unguarded ALTER would raise here
+        RunStore(db_path)
+
+        assert _task_results_columns(db_path) == cols_after_first
