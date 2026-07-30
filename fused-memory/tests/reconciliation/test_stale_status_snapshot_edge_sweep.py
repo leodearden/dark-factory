@@ -188,6 +188,60 @@ class TestExtractSnapshotEdgeTaskIds:
         """
         assert extract_snapshot_edge_task_ids('There are 3 blocked tasks') == set()
 
+    def test_blocked_status_phrase_with_intervening_words_task_2885_repro(self):
+        """'Task 2885 is deliberately parked in blocked status under escalation
+        esc-2885-17 pending human adjudication.' -> {2885}.
+
+        The SECOND literal edge fact from the task-2885 repro. Still set()
+        after task 3042's first change (the widened INDIVIDUAL_SNAPSHOT_RE
+        connective alone) because "deliberately parked" is an open-class gap
+        between the copula and the preposition that the closed-class
+        connective deliberately refuses. The phrase form is admitted only
+        because the marker ('blocked') is immediately followed by the
+        literal noun 'status' — that noun is what makes the span a status
+        assertion rather than an incidental mention.
+        """
+        result = extract_snapshot_edge_task_ids(
+            'Task 2885 is deliberately parked in blocked status under '
+            'escalation esc-2885-17 pending human adjudication.'
+        )
+        assert result == {2885}
+
+    def test_open_class_gap_without_status_noun_excluded(self):
+        """'Task 142 landed on the blocked branch' -> set().
+
+        An intervening verb with no 'status' noun following the marker must
+        never bind — the task-2613 precision invariant, restated for the
+        'blocked' marker.
+        """
+        result = extract_snapshot_edge_task_ids('Task 142 landed on the blocked branch')
+        assert result == set()
+
+    def test_unblocked_is_not_a_blocked_marker(self):
+        """'Task 9 unblocked the merge queue' -> set().
+
+        \\b prevents the marker from matching inside 'unblocked'.
+        """
+        assert extract_snapshot_edge_task_ids('Task 9 unblocked the merge queue') == set()
+
+    def test_status_phrase_does_not_cross_clause_boundary(self):
+        """'Task 5 is done. Task 9 is in blocked status' -> {9}.
+
+        The bounded gap must not reach across the sentence boundary and drag
+        in task 5's already-terminal snapshot.
+        """
+        result = extract_snapshot_edge_task_ids(
+            'Task 5 is done. Task 9 is in blocked status'
+        )
+        assert result == {9}
+
+    def test_status_phrase_does_not_cross_comma(self):
+        """'Task 5 landed, then 9 shipped in active branch' -> set()."""
+        result = extract_snapshot_edge_task_ids(
+            'Task 5 landed, then 9 shipped in active branch'
+        )
+        assert result == set()
+
 
 # --------------------------------------------------------------------------- #
 # flatten_dedup_edges
@@ -391,6 +445,23 @@ class TestSelectStaleStatusSnapshotEdges:
         }
 
         result = select_stale_status_snapshot_edges([edge], {'2885': 'cancelled'})
+
+        assert result == [edge]
+
+    def test_blocked_status_phrase_edge_selected_when_task_done(self):
+        """The second repro fact ('...deliberately parked in blocked status
+        under escalation esc-2885-17...') with statuses={'2885': 'done'} ->
+        selected."""
+        edge = {
+            'uuid': 'edge-1',
+            'fact': (
+                'Task 2885 is deliberately parked in blocked status under '
+                'escalation esc-2885-17 pending human adjudication.'
+            ),
+            'name': '',
+        }
+
+        result = select_stale_status_snapshot_edges([edge], {'2885': 'done'})
 
         assert result == [edge]
 
