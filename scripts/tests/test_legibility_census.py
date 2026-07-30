@@ -1687,6 +1687,116 @@ def test_run_census_without_max_batches_is_unchanged(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# task 3280 step-11: RED — run_census(max_verify_clusters=) bounds the
+# per-cluster verify spend WITHOUT losing data: the deferred remainder still
+# merges into the codebook as pending candidates, so "deferred" means "not yet
+# adjudicated", never "dropped".
+# ---------------------------------------------------------------------------
+
+_THREE_NOVEL_TITLES = ("novel one", "novel two", "novel three")
+
+
+def _three_novel_invoke(prompt, model):
+    """Fake coder-LLM reply chooser yielding THREE distinct novel candidate
+    titles, one per `nov-N` digest, so `_novel_clusters` produces exactly
+    three clusters in a deterministic mining order. Every other prompt
+    (including the headroom probe) is a matches-only duplicate carrying no
+    banner marker."""
+    for i, title in enumerate(_THREE_NOVEL_TITLES):
+        if f"nov-{i}" in prompt:
+            return json.dumps(
+                {
+                    "matches": [],
+                    "candidates": [
+                        {
+                            "title": title,
+                            "cause": f"cause for {title}",
+                            "area": "orchestrator",
+                            "origin_phase": "implement",
+                            "manifested_phase": "verify",
+                            "evidence_quote": f"quote for {title}",
+                        }
+                    ],
+                }
+            )
+    return json.dumps({"matches": [{"entry_id": "entry-a"}], "candidates": []})
+
+
+def _three_novel_batch():
+    return [_hand_digest(f"nov-{i}", f"novel body {i}") for i in range(3)]
+
+
+def test_run_census_max_verify_clusters_defers_the_rest_as_pending_candidates(tmp_path, caplog):
+    fake_verify_fn = _make_fake_verify_fn(verified_titles={_THREE_NOVEL_TITLES[0]})
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_three_novel_invoke),
+        batch_source=[_three_novel_batch()],
+        verify_fn=fake_verify_fn,
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=_make_fake_submit_fn(),
+        escalate_fn=_poison("escalate_fn"),
+        status_fetcher=_make_fake_status_fetcher(0),
+        commit=_make_fake_commit(),
+        max_verify_clusters=1,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    # (a) exactly one cluster verified, and it is the FIRST in mining order
+    assert len(fake_verify_fn.calls) == 1
+    verified_clusters = fake_verify_fn.calls[0]["clusters"]
+    assert len(verified_clusters) == 1
+    assert verified_clusters[0]["title"] == _THREE_NOVEL_TITLES[0], "first-N in mining order"
+
+    # (b) the DEFERRED titles are still in the dumped codebook, still pending
+    persisted = codebook.load(kwargs["codebook_path"])
+    assert codebook.validate(persisted) == []
+    by_title = {c["title"]: c for c in persisted["candidates"]}
+    for deferred_title in _THREE_NOVEL_TITLES[1:]:
+        assert deferred_title in by_title, "a deferred cluster must never be DROPPED"
+        assert by_title[deferred_title]["disposition"] == "pending", (
+            "deferred means unverified/not-yet-adjudicated, findable by a later census"
+        )
+
+    # (c) the report states the split
+    report_text = kwargs["report_path"].read_text(encoding="utf-8")
+    lowered = report_text.lower()
+    assert "verified 1 of 3 novel clusters" in lowered
+    assert "2 deferred" in lowered
+    assert "pending candidate" in lowered
+
+    # loud, never silent
+    assert any("defer" in r.message.lower() for r in caplog.records)
+
+    # (d) the rest of the pipeline still persisted
+    assert outcome.status == "done"
+    assert kwargs["census_state_path"].exists()
+
+
+def test_run_census_without_verify_cap_passes_every_novel_cluster(tmp_path):
+    fake_verify_fn = _make_fake_verify_fn(verified_titles={_THREE_NOVEL_TITLES[0]})
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_three_novel_invoke),
+        batch_source=[_three_novel_batch()],
+        verify_fn=fake_verify_fn,
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=_make_fake_submit_fn(),
+        escalate_fn=_poison("escalate_fn"),
+        status_fetcher=_make_fake_status_fetcher(0),
+        commit=_make_fake_commit(),
+    )
+
+    mod.run_census(**kwargs)
+
+    assert len(fake_verify_fn.calls[0]["clusters"]) == 3, "flagless -> every novel cluster"
+    report_text = kwargs["report_path"].read_text(encoding="utf-8")
+    assert "## Verification" not in report_text
+
+
+# ---------------------------------------------------------------------------
 # step-21: RED — main(argv) CLI
 # ---------------------------------------------------------------------------
 
