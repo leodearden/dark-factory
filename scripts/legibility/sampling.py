@@ -484,9 +484,14 @@ own ``max_bytes`` default.
 
 Used by :func:`stratified_sample` as its conservative flat per-record charge
 when no ``cost_fn`` is injected, and as :func:`digest_byte_cost_fn`'s default
-render cap. A digest can only ever be SMALLER than this, never larger, so
-charging it flat is always an over-estimate — never an over-run of the daily
-cap."""
+render cap. Charging it flat over-estimates any realistic digest — but do NOT
+build a hard-cap invariant on that. §7.2 is a SOFT cap:
+:func:`legibility.digest._truncate_sections` stops trimming once every section
+is empty "even if the (now section-free) digest is still over the cap — a soft
+cap can't shrink the frontmatter itself". A digest whose frontmatter alone
+exceeds *max_bytes* (a pathological ``cwd``/``session`` value, or a very small
+injected cap) therefore renders LARGER than this constant, and neither the flat
+fallback nor this value is a bound in that case."""
 
 
 def digest_byte_cost_fn(
@@ -514,15 +519,28 @@ def digest_byte_cost_fn(
     read exactly once even though the reserve phase reads each group's total
     twice.
 
-    A raising *build* does NOT propagate: the record is charged the flat
-    *max_bytes* conservative estimate and a warning is logged. This is a
-    deliberate degrade-to-loud, not a silent fail-soft — the record stays in
-    the running, reaches :func:`nightly.build_digests`, raises there again,
-    and is reported through the EXISTING structured ``extractor_failures``
-    -> escalation channel (PRD decision 8). Propagating here would instead
-    take down the entire night's run with a bare traceback from the sampler,
-    losing every other session's digest along with the failure's own
-    structured report.
+    A raising *build* does NOT propagate: the record is charged ZERO and a
+    warning is logged. Zero is the ACCURATE charge — a render that raises
+    produces no digest bytes, so it consumes none of the daily budget — and
+    it is also the charge that best preserves the loud path: the record
+    stays as affordable as possible, so it reaches
+    :func:`nightly.build_digests`, raises there again, and is reported
+    through the EXISTING structured ``extractor_failures`` -> escalation
+    channel (PRD decision 8). Propagating here would instead take down the
+    entire night's run with a bare traceback from the sampler, losing every
+    other session's digest along with the failure's own structured report.
+
+    This charge was previously the flat *max_bytes* — the most EXPENSIVE
+    charge available, which made a failed costing the candidate most likely
+    to be cut by the budget (a reserve group skipped whole, or the greedy
+    leftover fill halting on it). A cut record never reaches
+    ``build_digests``, so no ``extractor_failures`` entry and no escalation
+    were produced and the only trace was this warning: precisely the silent
+    fail-soft the degrade was written to avoid (reviewer_comprehensive,
+    task 3268 amendment pass). Charging zero removes the budget as a way to
+    lose the report — though note it is not an absolute guarantee: a
+    zero-cost record can still be skipped as part of an unaffordable reserve
+    GROUP, or sit behind the greedy fill's strict halt.
     """
     memo: dict[Path, int] = {}
 
@@ -539,12 +557,13 @@ def digest_byte_cost_fn(
             charged = len(rendered.encode('utf-8'))
         except Exception as exc:  # noqa: BLE001 - degrade loud, never propagate
             logger.warning(
-                'digest costing failed for %s (%s: %s); charging the flat %d-byte '
-                'estimate — the record stays selected so build_digests reports the '
-                'failure through extractor_failures',
-                record.path.name, type(exc).__name__, exc, max_bytes,
+                'digest costing failed for %s (%s: %s); charging 0 bytes — a render '
+                'that raises produces no digest, and the cheapest possible charge is '
+                'what keeps the record affordable enough to reach build_digests, '
+                'which reports the failure through extractor_failures',
+                record.path.name, type(exc).__name__, exc,
             )
-            charged = max_bytes
+            charged = 0
 
         memo[record.path] = charged
         return charged
@@ -611,9 +630,11 @@ def stratified_sample(
     *cost_fn* is the per-record BYTE-COST seam every budget charge routes
     through. Real callers inject :func:`digest_byte_cost_fn`, which charges
     the ACTUAL rendered digest size. When *cost_fn* is None each record is
-    charged a flat :data:`DEFAULT_DIGEST_MAX_BYTES` — correct UNITS and a
-    guaranteed over-estimate (a digest can only come in under the soft cap),
-    so the daily cap still holds. That fallback is deliberately
+    charged a flat :data:`DEFAULT_DIGEST_MAX_BYTES` — correct UNITS and an
+    over-estimate for any realistic digest, so the daily cap holds in
+    practice. It is NOT a hard bound: §7.2 is a soft cap and the frontmatter
+    is not trimmable, so see :data:`DEFAULT_DIGEST_MAX_BYTES` before relying
+    on it as one. That fallback is deliberately
     conservative, NOT the intended production basis: the PRD rules out a
     pure count cap, and a flat charge is exactly a count cap in disguise. It
     exists so this function stays injection-free and pure for the §8.4

@@ -758,7 +758,7 @@ class TestDigestByteCostFn:
         assert cost(record) == 50
         assert len(calls) == 1
 
-    def test_build_failure_degrades_to_the_flat_estimate_and_warns(self, caplog):
+    def test_build_failure_charges_zero_and_warns(self, caplog):
         def exploding_build(path, **kwargs):
             raise RuntimeError('transcript unreadable')
 
@@ -768,14 +768,64 @@ class TestDigestByteCostFn:
         with caplog.at_level('WARNING'):
             charged = cost(record)
 
-        # Degrades to the conservative flat estimate rather than propagating:
-        # the record still reaches nightly.build_digests, which raises again
-        # and routes the failure through the EXISTING structured
-        # extractor_failures -> escalation channel (PRD decision 8). A bare
-        # traceback out of the sampler would kill the whole night's run.
-        assert charged == 15360
+        # Zero, not the flat max_bytes estimate. A render that raises
+        # produces no digest bytes, so zero is the accurate charge — and it
+        # is the charge that keeps the record affordable enough to reach
+        # nightly.build_digests, which raises again and routes the failure
+        # through the EXISTING structured extractor_failures -> escalation
+        # channel (PRD decision 8). Charging the flat max_bytes made a
+        # failed costing the MOST expensive candidate and therefore the one
+        # most likely to be cut by the budget, which silently destroyed that
+        # report (reviewer_comprehensive, task 3268 amendment pass). A bare
+        # traceback out of the sampler would instead kill the whole night.
+        assert charged == 0
         assert 'cost-sess' in caplog.text
         assert 'transcript unreadable' in caplog.text
+
+    def test_build_failure_charge_does_not_starve_the_budget(self):
+        """The zero charge must actually BUY the survival its docstring
+        promises: a candidate whose costing render raises must still be
+        selected when the budget is otherwise exhausted, because only a
+        selected record reaches ``build_digests`` and gets reported.
+
+        Under the previous flat-``max_bytes`` failure charge this exact
+        arrangement dropped the failing record — the most expensive charge
+        available made a failed costing the first thing the greedy fill
+        halted on, so no ``extractor_failures`` entry and no escalation were
+        ever produced (reviewer_comprehensive, task 3268 amendment pass).
+        """
+        def build(path, **kwargs):
+            if path.stem == 'boom':
+                raise RuntimeError('transcript unreadable')
+            return 'x' * 40_000
+
+        records = [
+            # Higher score -> reserved first, and it eats the whole budget.
+            _scored('ok-1', 'interactive', mod.SignalCounts(tool_error=9),
+                    'healthy session alpha', 900),
+            # Lower score -> reaches the budget phase in the leftover fill,
+            # where the strict greedy halt is unforgiving of an over-charge.
+            _scored('boom', 'interactive', mod.SignalCounts(tool_error=8),
+                    'failing session beta', 900),
+        ]
+        cfg = config_mod.LegibilityConfig(
+            project_id='dark_factory',
+            project_root='/home/leo/src/dark-factory',
+            escalation_port=8103,
+            cwd_prefixes=['/home/leo/src/dark-factory'],
+            budgets=config_mod.Budgets(max_daily_digest_bytes=40_000),
+            sampling=config_mod.Sampling(top_fraction=1.0, per_stratum_min=1),
+        )
+
+        result = mod.stratified_sample(
+            records, cfg, cost_fn=mod.digest_byte_cost_fn(max_bytes=15360, build=build),
+        )
+
+        # 40_000 (ok-1) + 0 (boom) == the budget exactly, so both fit.
+        # Charged the old flat 15_360, boom needed 55_360 and was skipped.
+        assert {r.path.stem for r in result.selected} == {'ok-1', 'boom'}
+        assert result.budget_skipped == 0
+        assert result.bytes_used == 40_000
 
     def test_default_build_renders_a_real_transcript(self, tmp_path):
         from legibility import digest as digest_mod

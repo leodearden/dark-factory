@@ -171,10 +171,14 @@ def select_digest_sessions(
     candidates -- a small number of extra renders, not one per enumerated
     session -- and each at most once (both :func:`sampling.digest_byte_cost_fn`
     and ``stratified_sample`` memoize on the session path). A costing render
-    that FAILS degrades to the conservative flat estimate rather than
-    propagating, so the record stays selected, reaches :func:`build_digests`,
-    and has its failure reported through the structured ``extractor_failures``
-    channel (PRD decision 8) instead of aborting the night from the sampler.
+    that FAILS is charged ZERO rather than propagating — the accurate charge
+    (no digest was produced) and the one that keeps the record cheap enough
+    to reach :func:`build_digests`, where the same failure is reported
+    through the structured ``extractor_failures`` channel (PRD decision 8)
+    instead of aborting the night from the sampler. Cheap is not free of the
+    budget entirely: a zero-cost record can still fall inside a reserve
+    group that is unaffordable as a whole, or sit behind the greedy fill's
+    strict halt.
     """
     scored = select_scored_records(cfg, projects_root, target_date)
     return sampling.stratified_sample(
