@@ -1675,3 +1675,266 @@ class TestBuildSeries:
         assert report_path.parent == metrics_path.parent
         assert report_path.exists()
         assert load_metric_series(metrics_path) == series
+
+
+# ---------------------------------------------------------------------------
+# step-17: degraded-search disclosure
+#
+# MemoryService.search returns a SearchResults (a list subclass) carrying
+# degraded / failed_stores / failure_diagnostics, and its own docstring warns
+# that those attributes do NOT survive slicing, sorted(), concatenation or a
+# list comprehension — such a transform returns a plain list and drops them
+# silently. A probe that sliced to top-k first would therefore see a healthy
+# empty result set during a Qdrant outage and report a corpus-wide canonical
+# collapse. These tests use the REAL SearchResults so that failure mode is
+# exercised against the real semantics, not a double's imitation of them.
+# ---------------------------------------------------------------------------
+
+from fused_memory.services.memory_service import SearchResults  # noqa: E402
+
+
+def _degraded(results=(), *, stores=('mem0',), diagnostics=None):
+    return SearchResults(
+        results,
+        degraded=True,
+        failed_stores=list(stores),
+        failure_diagnostics=list(diagnostics or [
+            {'store': 'mem0', 'error_type': 'TimeoutError', 'project_id': 'dark_factory'},
+        ]),
+    )
+
+
+def _healthy(results=()):
+    return SearchResults(results)
+
+
+def _probe_entry(topic='alpha-topic', content=CANON, **kw):
+    """A registry entry with one tuned and one held-out phrasing plus a claim."""
+    m = _mod()
+    base = _entry(topic=topic, content=content, **kw)
+    return m.RegistryEntry(
+        topic=base.topic,
+        project_id=base.project_id,
+        derived_from=base.derived_from,
+        canonical=base.canonical,
+        phrasings=(m.Phrasing('tuned query', False), m.Phrasing('held out query', True)),
+        claim_queries=(m.ClaimQuery(query='claim query', needles=('canonical text',)),),
+    )
+
+
+def _search_returning(by_query, default_factory=_healthy):
+    """An async search double: query -> SearchResults."""
+    async def search(query, limit):
+        if query in by_query:
+            return by_query[query]
+        return default_factory()
+
+    return search
+
+
+class TestDegradedSearchDisclosure:
+    """The per-query probe band must never charge an outage as a regression."""
+
+    @pytest.mark.asyncio
+    async def test_a_degraded_query_marks_every_observation_it_produced(self):
+        m = _mod()
+        entry = _probe_entry()
+        registry = m.TopicRegistry(schema_version=1, entries=(entry,))
+        observations = m.ProbeObservations()
+        search = _search_returning({'tuned query': _degraded()})
+
+        await m.probe_topic(search, entry, registry, (5,), observations)
+
+        by_phrasing = {o.phrasing: o for o in observations.phrasings}
+        assert by_phrasing['tuned query'].degraded
+        assert not by_phrasing['held out query'].degraded
+
+    @pytest.mark.asyncio
+    async def test_degraded_queries_are_recorded_with_stores_and_diagnostics(self):
+        m = _mod()
+        entry = _probe_entry()
+        registry = m.TopicRegistry(schema_version=1, entries=(entry,))
+        observations = m.ProbeObservations()
+        search = _search_returning({'tuned query': _degraded(
+            stores=('mem0', 'graphiti'),
+            diagnostics=[{'store': 'mem0', 'error_type': 'TimeoutError'}],
+        )})
+
+        await m.probe_topic(search, entry, registry, (5,), observations)
+
+        assert len(observations.degraded_queries) == 1
+        record = observations.degraded_queries[0]
+        assert record.topic == 'alpha-topic'
+        assert record.query == 'tuned query'
+        assert set(record.failed_stores) == {'mem0', 'graphiti'}
+        assert record.diagnostics[0]['error_type'] == 'TimeoutError'
+
+    @pytest.mark.asyncio
+    async def test_a_degraded_query_is_excluded_from_every_denominator(self):
+        """(a) The exclusion, end to end through build_series."""
+        m = _mod()
+        entry = _probe_entry()
+        registry = m.TopicRegistry(schema_version=1, entries=(entry,))
+        observations = m.ProbeObservations()
+        search = _search_returning(
+            {'tuned query': _degraded()},
+            default_factory=lambda: _healthy([_R(content=CANON, id='ID-1')]),
+        )
+
+        await m.probe_topic(search, entry, registry, (5,), observations)
+        series = m.build_series(observations, {}, 'dark_factory', '20260730T101500Z', (5,))
+        by_id = {metric.metric_id: metric for metric in series.metrics}
+
+        assert by_id['canonical-in-top-5'].denominator == 1, 'only the healthy query'
+
+    def test_degrade_metadata_is_read_before_any_slicing(self):
+        """(b) The documented memory_service.py:706-712 footgun, exercised.
+
+        Slicing a SearchResults returns a plain list and silently drops the
+        degrade attributes. Reading them off the object first is the only
+        correct order, and this test fails for an implementation that slices
+        first — the sliced value genuinely has no `degraded` to read.
+        """
+        m = _mod()
+        raw = _degraded([_R(content='x') for _ in range(20)], stores=('graphiti',))
+
+        assert not hasattr(raw[:5], 'degraded'), 'the footgun this test guards'
+        info = m.read_degrade_metadata(raw)
+
+        assert info.degraded
+        assert info.failed_stores == ('graphiti',)
+        assert len(info.results) == 20
+
+    def test_a_plain_list_is_read_as_healthy(self):
+        """Not every caller hands back a SearchResults; absence is not degradation."""
+        info = _mod().read_degrade_metadata([_R(content='x')])
+
+        assert not info.degraded
+        assert info.failed_stores == ()
+
+    @pytest.mark.asyncio
+    async def test_a_wholly_degraded_topic_is_not_measured_not_failed(self):
+        """(c) A store outage must not manufacture a tripwire failure.
+
+        Leaf epsilon reads tripwire failures as candidate findings against the
+        3111 lineage. An outage that presented as 32 failing topics would be a
+        fabricated corpus-wide collapse.
+        """
+        m = _mod()
+        entry = _probe_entry()
+        registry = m.TopicRegistry(schema_version=1, entries=(entry,))
+        observations = m.ProbeObservations()
+
+        await m.probe_topic(
+            search=_search_returning({}, default_factory=_degraded),
+            entry=entry, registry=registry, ks=(5,), observations=observations,
+        )
+        series = m.build_series(observations, {}, 'dark_factory', '20260730T101500Z', (5,))
+        ids = {metric.metric_id for metric in series.metrics}
+
+        assert 'topic-canonical-present' not in ids, 'no item, so no tripwire'
+        assert m.not_measured_topics(observations) == ['alpha-topic']
+
+    @pytest.mark.asyncio
+    async def test_a_wholly_degraded_run_still_emits_a_valid_artifact(self, tmp_path):
+        """(d) Silence is never a healthy signal."""
+        from shared.memory_eval_metrics import (  # noqa: PLC0415
+            load_metric_series,
+            validate_metric_series,
+        )
+
+        m = _mod()
+        entry = _probe_entry()
+        registry = m.TopicRegistry(schema_version=1, entries=(entry,))
+        observations = m.ProbeObservations()
+
+        await m.probe_topic(
+            search=_search_returning({}, default_factory=_degraded),
+            entry=entry, registry=registry, ks=(5,), observations=observations,
+        )
+        series = m.build_series(observations, {}, 'dark_factory', '20260730T101500Z', (5,))
+        validate_metric_series(series)
+        metrics_path, _ = m.emit_series(series, tmp_path)
+
+        assert load_metric_series(metrics_path) == series
+        assert series.corpus.counts['degraded_observations'] > 0
+
+    @pytest.mark.asyncio
+    async def test_the_report_names_the_failed_stores_and_the_not_measured_topics(self):
+        """(a)+(c)+(d): the prose has to say what the numbers cannot."""
+        m = _mod()
+        entry = _probe_entry()
+        registry = m.TopicRegistry(schema_version=1, entries=(entry,))
+        observations = m.ProbeObservations()
+
+        await m.probe_topic(
+            search=_search_returning({}, default_factory=lambda: _degraded(
+                stores=('qdrant',),
+                diagnostics=[{'store': 'qdrant', 'error_type': 'ConnectionRefusedError'}],
+            )),
+            entry=entry, registry=registry, ks=(5,), observations=observations,
+        )
+        series = m.build_series(observations, {}, 'dark_factory', '20260730T101500Z', (5,))
+        report = m.render_probe_report(series, observations)
+
+        assert 'qdrant' in report
+        assert 'ConnectionRefusedError' in report
+        assert 'alpha-topic' in report
+        assert 'not measured' in report.lower()
+
+    @pytest.mark.asyncio
+    async def test_a_healthy_run_produces_observations_for_every_family(self):
+        """The band's happy path: phrasings, claims, contamination, inversions."""
+        m = _mod()
+        entry = _probe_entry()
+        registry = m.TopicRegistry(schema_version=1, entries=(entry,))
+        observations = m.ProbeObservations()
+        search = _search_returning(
+            {}, default_factory=lambda: _healthy([_R(content=CANON, id='ID-1')]),
+        )
+
+        await m.probe_topic(search, entry, registry, (5, 10), observations)
+
+        assert {o.k for o in observations.phrasings} == {5, 10}
+        assert len(observations.phrasings) == 4, 'two phrasings x two k values'
+        assert [o.query for o in observations.claims] == ['claim query']
+        assert observations.claims[0].recalled
+        assert [c.topic for c in observations.contamination] == ['alpha-topic'] * 2
+        assert [i.topic for i in observations.inversions] == ['alpha-topic'] * 2
+        assert observations.degraded_queries == []
+
+    @pytest.mark.asyncio
+    async def test_a_degraded_claim_query_is_excluded_too(self):
+        m = _mod()
+        entry = _probe_entry()
+        registry = m.TopicRegistry(schema_version=1, entries=(entry,))
+        observations = m.ProbeObservations()
+        search = _search_returning(
+            {'claim query': _degraded()},
+            default_factory=lambda: _healthy([_R(content=CANON, id='ID-1')]),
+        )
+
+        await m.probe_topic(search, entry, registry, (5,), observations)
+        series = m.build_series(observations, {}, 'dark_factory', '20260730T101500Z', (5,))
+        ids = {metric.metric_id for metric in series.metrics}
+
+        assert observations.claims[0].degraded
+        assert 'claim-recall' not in ids, 'no scorable claim trial remains'
+
+    @pytest.mark.asyncio
+    async def test_the_search_is_asked_for_the_widest_k(self):
+        """One search per query, sliced per k — probing twice would double the
+        embedding spend and could return two different result lists."""
+        m = _mod()
+        entry = _probe_entry()
+        registry = m.TopicRegistry(schema_version=1, entries=(entry,))
+        seen: list[tuple[str, int]] = []
+
+        async def search(query, limit):
+            seen.append((query, limit))
+            return _healthy([_R(content=CANON, id='ID-1')])
+
+        await m.probe_topic(search, entry, registry, (5, 10), m.ProbeObservations())
+
+        assert [limit for _, limit in seen] == [10, 10, 10]
+        assert len(seen) == 3, 'two phrasings + one claim query, once each'
