@@ -788,14 +788,73 @@ _SECTION_RENDERERS: dict[str, Any] = {
 """(detector, item-renderer) pair per section key, keyed identically to
 SECTION_HEADINGS/SECTION_PRIORITY."""
 
+ITEM_TRUNCATION_MARKER = '... [item truncated]'
+"""Appended to a per-item line that exceeded its byte cap. Explicit and
+ASCII (so its own byte length equals its character length), keeping
+degradation legible rather than silently lossy."""
 
-def _build_sections(records: list[dict[str, Any]]) -> dict[str, list[str]]:
+MAX_ITEM_BYTES = 2048
+"""Hard ceiling on a single rendered item's UTF-8 byte length, regardless
+of how large *max_bytes* is."""
+
+MIN_ITEM_BYTES = 256
+"""Floor on a single rendered item's cap, even for a very small
+*max_bytes* -- an item capped below this would be truncated into
+unreadable noise."""
+
+FRONTMATTER_RESERVE_BYTES = 512
+"""Bytes reserved for the frontmatter block plus a '## ' section heading
+when deriving the per-item cap from *max_bytes* (see
+:func:`_item_byte_cap`). Measured frontmatter is ~276-310 bytes;
+reserving 512 leaves headroom for a heading line too, so "frontmatter +
+heading + one capped item" always fits under any realistic max_bytes --
+this is what makes the R2 empty-body pathology structurally unreachable
+rather than merely checked (:func:`_warn_if_body_evicted` is the
+belt-and-braces backstop for the residual edge cases, e.g. a pathologically
+tiny max_bytes)."""
+
+
+def _item_byte_cap(max_bytes: int) -> int:
+    """Derive the per-item byte cap from the digest's overall *max_bytes*
+    budget: never above MAX_ITEM_BYTES, never below MIN_ITEM_BYTES,
+    otherwise *max_bytes* minus headroom for the frontmatter + heading."""
+    return max(MIN_ITEM_BYTES, min(MAX_ITEM_BYTES, max_bytes - FRONTMATTER_RESERVE_BYTES))
+
+
+def _cap_item(line: str, cap: int) -> str:
+    """Return *line* unchanged when its UTF-8 byte length is within *cap*;
+    otherwise byte-truncate (never splitting a multi-byte codepoint) and
+    append :data:`ITEM_TRUNCATION_MARKER`.
+
+    Byte-wise because the whole digest budget is measured in UTF-8 bytes
+    (:func:`_resolve_size_bytes`); ``decode(..., 'ignore')`` drops a
+    partial trailing codepoint instead of emitting a U+FFFD replacement
+    character, so a truncated item never introduces mojibake into text a
+    downstream LLM coder reads verbatim.
+    """
+    encoded = line.encode('utf-8')
+    if len(encoded) <= cap:
+        return line
+    keep = max(0, cap - len(ITEM_TRUNCATION_MARKER))
+    return encoded[:keep].decode('utf-8', 'ignore') + ITEM_TRUNCATION_MARKER
+
+
+def _build_sections(
+    records: list[dict[str, Any]], *, item_max_bytes: int = _item_byte_cap(15360),
+) -> dict[str, list[str]]:
     """Run every detector once and render its hits to markdown bullet
-    lines, keyed by section key. A section with zero hits maps to an empty
-    list -- render_digest skips emitting a heading for it."""
+    lines, keyed by section key, capping each rendered line to
+    *item_max_bytes* (see :func:`_cap_item`) at this single choke point --
+    applied uniformly across all seven sections so ONE oversized item
+    (e.g. a multi-KB pasted user turn, or a huge echoed tool_result) can
+    never evict every sibling section during :func:`_truncate_sections`'
+    trim loop. A section with zero hits maps to an empty list --
+    render_digest skips emitting a heading for it."""
     sections = {}
     for key, (detector, renderer) in _SECTION_RENDERERS.items():
-        sections[key] = renderer(detector(records))
+        sections[key] = [
+            _cap_item(line, item_max_bytes) for line in renderer(detector(records))
+        ]
     return sections
 
 
@@ -898,7 +957,7 @@ def render_digest(
         'signal_counts': counts,
     }
 
-    sections = _build_sections(records)
+    sections = _build_sections(records, item_max_bytes=_item_byte_cap(max_bytes))
     return _truncate_sections(meta, sections, max_bytes)
 
 
