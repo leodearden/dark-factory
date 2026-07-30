@@ -139,6 +139,13 @@ def _read_limits(
     the UI two disagreeing alarm truths and force a dashboard-side mapping
     between the vocabularies — exactly the re-derivation G6/INV-5 forbids.
     ``verdicts-current.json`` is the sole verdict source.
+
+    All three disposal paths are NAMED: absent (beside runs) is
+    ``missing_limits``, a parse failure is ``unreadable_limits`` (recorded by
+    the caller's handler), and an artifact that parses but is not an object is
+    ``malformed_limits``.  Without that third path a present-but-wrong-type
+    artifact produced no signal at all, since the absent-file issue does not
+    fire for a file that exists.
     """
     path = eval_dir / 'limits-current.json'
     if not path.is_file():
@@ -157,6 +164,18 @@ def _read_limits(
 
     body = _load_json(path)
     if not isinstance(body, dict):
+        # Valid JSON of the wrong shape — `_load_json` does not raise, so the
+        # caller's `unreadable_limits` handler never fires, and the file EXISTS
+        # so `missing_limits` above did not fire either.  Discarding it
+        # silently would lose the alpha/baseline/grandfather-hash provenance
+        # with no signal anywhere.  Carries an `eval_id`: unlike the
+        # root-scoped verdicts artifact, this one is per-eval.
+        _issue(
+            issues, 'malformed_limits', eval_id=eval_dir.name, path=path,
+            detail=f'expected an object, got {type(body).__name__}',
+        )
+        # Provenance stays absent rather than half-populated, and `rule_kind`
+        # on every metric row stays None.
         return None, {}
 
     # ``.get()`` throughout: a schema addition upstream is inert here, never
