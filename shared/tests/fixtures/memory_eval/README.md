@@ -91,6 +91,14 @@ metric_id containing `::` is refused at key-composition time. `e1-dual-tripwire`
 is the committed corpus for all of this — including the colliding `t-shared`
 key — because a single-tripwire corpus cannot distinguish the two designs.
 
+A run resumes from BOTH halves of the persisted state: `grandfather_set` and
+`snapshotted_metric_ids`. The second records which tripwires have already been
+snapshotted, because an empty grandfather slice cannot tell a metric that is
+NEW from one whose every known-bad item was fixed — and those two must behave
+in opposite ways. Without it, a probe wired up in month three would alarm on
+every one of its pre-existing failures, which M2 says to grandfather. It is
+evaluator state, not a dashboard signal.
+
 ## Regenerating — do not hand-edit
 
 `e1-retrieval-health/limits-current.json` is **generated** by
@@ -102,7 +110,8 @@ Its exact recipe lives in one place — `evaluate_exemplar()` in
 `tests/test_memory_eval_boundary.py` — so the artifact is reproducible rather
 than a mystery blob: the **regression run** (`metrics-20260704T031500Z.json`)
 judged against the three baseline runs, resuming from a grandfather set seeded
-by the *first* baseline run's failures, under
+by the *first* baseline run's failures (with the matching
+`snapshotted_metric_ids` ledger), under
 `LimitsConfig(false_alarm_budget=1.0, runs_per_quarter=90, min_samples=10,
 baseline_window=3)` — which derives α = 1/360 across 4 alarm-eligible metrics.
 That run was chosen because it exercises all three alarm paths at once (a

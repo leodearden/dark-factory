@@ -620,6 +620,99 @@ class TestGrandfatherScopingAcrossMetrics:
         assert without_b.alarms == ()
         assert sorted(without_b.grandfather) == ['probe-a::a1', 'probe-b::b1']
 
+    def test_a_tripwire_added_mid_programme_snapshots_rather_than_alarming(self):
+        """M2: pre-existing failures are grandfathered — including a new probe's.
+
+        Adding a metric is an expected event (it is why alpha is recomputed per
+        run), and a probe wired up in month three has the same pre-existing
+        failures day one had: the fix lineage's worklist, not news. Inferring
+        first-run-ness from the grandfather slice cannot work — an empty slice
+        means "new" and "all fixed" alike — so the ledger records it.
+        """
+        first = evaluate_series(self._run({'a1': False}), [], self.CONFIG, None)
+        added = evaluate_series(
+            self._run({'a1': False}, {'b1': False, 'b2': False, 'b3': False}),
+            [],
+            self.CONFIG,
+            first.grandfather,
+            first.snapshotted_metrics,
+        )
+        assert added.alarms == ()
+        assert _verdict_for(added, 'probe-b').status == 'baseline_snapshot'
+        # ...and the sibling that HAS state is untouched by the new arrival.
+        assert _verdict_for(added, 'probe-a').status == 'ok'
+        assert sorted(added.grandfather) == [
+            'probe-a::a1',
+            'probe-b::b1',
+            'probe-b::b2',
+            'probe-b::b3',
+        ]
+
+    def test_the_newly_added_tripwire_alarms_on_its_next_regression(self):
+        # Snapshotting a new probe must not make it permanently quiet: the run
+        # after it joins is judged against what it snapshotted.
+        first = evaluate_series(self._run({'a1': False}), [], self.CONFIG, None)
+        added = evaluate_series(
+            self._run({'a1': False}, {'b1': False}),
+            [],
+            self.CONFIG,
+            first.grandfather,
+            first.snapshotted_metrics,
+        )
+        later = evaluate_series(
+            self._run({'a1': False}, {'b1': False, 'b2': False}),
+            [],
+            self.CONFIG,
+            added.grandfather,
+            added.snapshotted_metrics,
+        )
+        assert [(a.metric_id, a.item_key) for a in later.alarms] == [('probe-b', 'b2')]
+
+    def test_the_ledger_keeps_a_metric_that_skipped_a_run(self):
+        # A probe absent from one run has not become new again — re-snapshotting
+        # it on return would swallow whatever regressed while it was away.
+        both = evaluate_series(self._run({'a1': False}, {'b1': False}), [], self.CONFIG, None)
+        without_b = evaluate_series(
+            self._run({'a1': False}), [], self.CONFIG, both.grandfather, both.snapshotted_metrics
+        )
+        assert without_b.snapshotted_metrics == frozenset({'probe-a', 'probe-b'})
+        returned = evaluate_series(
+            self._run({'a1': False}, {'b1': False, 'b2': False}),
+            [],
+            self.CONFIG,
+            without_b.grandfather,
+            without_b.snapshotted_metrics,
+        )
+        assert [(a.metric_id, a.item_key) for a in returned.alarms] == [('probe-b', 'b2')]
+
+    def test_a_missing_ledger_is_read_conservatively(self):
+        """Half-carried state degrades LOUD, never silent.
+
+        Passing a grandfather set without its ledger is a caller bug. Read the
+        other way — assume nothing was snapshotted — a metric that already had
+        state would re-snapshot today's failures and swallow a real regression
+        as known-bad. Alarming on a new probe's known-bad items is noisy and
+        self-correcting; silently muting a regression is neither.
+        """
+        first = evaluate_series(self._run({'a1': False}), [], self.CONFIG, None)
+        no_ledger = evaluate_series(
+            self._run({'a1': False}, {'b1': False}), [], self.CONFIG, first.grandfather
+        )
+        assert [(a.metric_id, a.item_key) for a in no_ledger.alarms] == [('probe-b', 'b1')]
+
+    def test_the_whole_first_run_ignores_a_stale_ledger(self):
+        # grandfather=None is the programme's first run by definition, so every
+        # tripwire snapshots whatever a caller claims to have snapshotted.
+        result = evaluate_series(
+            self._run({'a1': False}, {'b1': False}),
+            [],
+            self.CONFIG,
+            None,
+            frozenset({'probe-a', 'probe-b'}),
+        )
+        assert result.alarms == ()
+        assert {v.status for v in result.verdicts} == {'baseline_snapshot'}
+
     def test_the_scoped_key_helpers_round_trip(self):
         keys = {scoped_grandfather_key('probe-a', 'x'), scoped_grandfather_key('probe-b', 'x')}
         assert grandfather_slice(keys, 'probe-a') == frozenset({'x'})
@@ -995,6 +1088,15 @@ class TestLimitsArtifact:
         assert data['grandfather_set'] == sorted(result.grandfather)
         assert data['grandfather_set_hash'] == grandfather_set_hash(result.grandfather)
 
+    def test_artifact_records_the_snapshotted_metric_ledger(self, tmp_path):
+        # The other half of the resumable state: without it a tripwire added
+        # mid-programme cannot be told from one whose every failure was fixed.
+        result, path = self._write(tmp_path)
+        data = json.loads(path.read_text())
+
+        assert data['snapshotted_metric_ids'] == sorted(result.snapshotted_metrics)
+        assert data['snapshotted_metric_ids'] == ['topic-canonical-present']
+
     def test_artifact_records_the_current_alarms(self, tmp_path):
         # The regression run, evaluated against a seeded grandfather set, so
         # all three alarm kinds are present at once.
@@ -1017,6 +1119,7 @@ class TestLimitsArtifact:
 
         assert restored.grandfather_set == sorted(result.grandfather)
         assert restored.grandfather_set_hash == result.grandfather_hash
+        assert restored.snapshotted_metric_ids == sorted(result.snapshotted_metrics)
         assert restored.alpha == result.alpha
         assert restored.run_stamp == result.run_stamp
 
@@ -1034,7 +1137,11 @@ class TestLimitsArtifact:
 
         restored = load_limits_artifact(path)
         second = evaluate_series(
-            _series(_QUIET_STAMP), _baseline(), _config(), frozenset(restored.grandfather_set)
+            _series(_QUIET_STAMP),
+            _baseline(),
+            _config(),
+            frozenset(restored.grandfather_set),
+            restored.snapshotted_metric_ids,
         )
 
         assert second.alarms == ()

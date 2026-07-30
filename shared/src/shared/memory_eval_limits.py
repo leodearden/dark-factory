@@ -754,6 +754,14 @@ class EvaluationResult:
     grandfather: frozenset[str]
     grandfather_hash: str
     baseline_run_stamps: tuple[str, ...]
+    snapshotted_metrics: frozenset[str] = frozenset()
+    """Which tripwire metrics have ever been snapshotted — the other half of the state.
+
+    Carried forward alongside ``grandfather`` into the next run (see
+    :func:`evaluate_series`). An empty grandfather SLICE cannot distinguish "this
+    metric is new" from "every one of its known-bad items was fixed", so
+    first-run-ness is recorded rather than inferred.
+    """
 
 
 def evaluate_series(
@@ -761,6 +769,7 @@ def evaluate_series(
     baseline_window: Sequence[MetricSeries],
     config: LimitsConfig,
     grandfather: frozenset[str] | None,
+    snapshotted_metrics: Iterable[str] | None = None,
 ) -> EvaluationResult:
     """Evaluate every metric in a run and return the verdicts, alarms and next state.
 
@@ -780,6 +789,29 @@ def evaluate_series(
     Only the trailing ``config.baseline_window`` runs are used. A baseline that
     grew without bound would keep drifting further from current behaviour and
     would eventually alarm on the system's own gradual, intended changes.
+
+    **A tripwire ADDED mid-programme snapshots rather than alarming.** Adding
+    metrics is an expected event, not an edge case (it is why alpha is
+    recomputed per run at all), and M2 says pre-existing failures are
+    grandfathered — so a new structural probe's existing failures are the fix
+    lineage's worklist, exactly as they were on day one, and not news. That
+    cannot be inferred from the state: :func:`grandfather_slice` returns an
+    empty set both for a metric that is new and for one whose every known-bad
+    item has been fixed, and those two must behave in opposite ways. So
+    ``snapshotted_metrics`` RECORDS which tripwires have already been
+    snapshotted, and is carried from run to run beside ``grandfather``
+    (``EvaluationResult.snapshotted_metrics``, persisted as the artifact's
+    ``snapshotted_metric_ids``). Metrics not in the current run stay in the
+    ledger — a probe that skipped a run has not become new again.
+
+    Passing ``snapshotted_metrics=None`` alongside a non-``None`` grandfather
+    means the ledger was not carried, which is a caller bug rather than a
+    supported mode (``load_limits_artifact`` always supplies it). It is read
+    conservatively — every tripwire in the run is assumed already snapshotted —
+    so half-carried state degrades toward alarming on a new metric's known-bad
+    items, which is loud and self-correcting. The opposite default would
+    re-snapshot a metric that already had state and silently swallow a real
+    regression as known-bad.
     """
     window = list(baseline_window)[-config.baseline_window :] if config.baseline_window > 0 else []
     alarm_eligible = [m for m in current.metrics if m.kind != 'scalar']
@@ -795,9 +827,23 @@ def evaluate_series(
     # first-run snapshot.
     carried: set[str] = set(grandfather) if grandfather is not None else set()
 
+    tripwire_ids = {m.metric_id for m in current.metrics if m.kind == 'tripwire'}
+    if grandfather is None:
+        # Whole-programme first run: nothing has been snapshotted yet, whatever
+        # a caller may have passed.
+        known = set()
+    elif snapshotted_metrics is None:
+        known = set(tripwire_ids)  # ledger not carried — see the docstring
+    else:
+        known = set(snapshotted_metrics)
+
     for metric in current.metrics:
         if metric.kind == 'tripwire':
-            own = None if grandfather is None else grandfather_slice(grandfather, metric.metric_id)
+            own = (
+                grandfather_slice(grandfather, metric.metric_id)
+                if grandfather is not None and metric.metric_id in known
+                else None
+            )
             verdict, next_own = evaluate_tripwire(metric, own)
             prefix = scoped_grandfather_key(metric.metric_id, '')
             carried = {key for key in carried if not key.startswith(prefix)}
@@ -827,6 +873,10 @@ def evaluate_series(
         alarms=tuple(alarm for verdict in verdicts for alarm in verdict.alarms),
         grandfather=frozenset(carried),
         grandfather_hash=grandfather_set_hash(carried),
+        # Union, not replacement: a tripwire absent from this run has not
+        # become new again, so it keeps its place in the ledger just as it
+        # keeps its grandfather slice.
+        snapshotted_metrics=frozenset(known | tripwire_ids),
         baseline_run_stamps=tuple(series.run_stamp for series in window),
     )
 
@@ -902,6 +952,14 @@ class LimitsArtifact(BaseModel):
 
     grandfather_set: list[str] = Field(default_factory=list)
     grandfather_set_hash: str = Field(min_length=1)
+    snapshotted_metric_ids: list[str] = Field(default_factory=list)
+    """Tripwires that have already been snapshotted — state, not a published signal.
+
+    Present because a metric ADDED mid-programme must snapshot its pre-existing
+    failures rather than alarm on them, and an empty grandfather slice cannot
+    tell "new" from "all fixed". A dashboard has no use for this field; the
+    evaluator's own resume path does.
+    """
 
     verdicts: list[_VerdictRecord] = Field(default_factory=list)
     alarms: list[_AlarmRecord] = Field(default_factory=list)
@@ -932,6 +990,7 @@ def _artifact_from_result(result: EvaluationResult) -> LimitsArtifact:
         baseline_run_stamps=list(result.baseline_run_stamps),
         grandfather_set=sorted(result.grandfather),
         grandfather_set_hash=result.grandfather_hash,
+        snapshotted_metric_ids=sorted(result.snapshotted_metrics),
         verdicts=[_VerdictRecord(**asdict(verdict)) for verdict in result.verdicts],
         alarms=[_AlarmRecord(**asdict(alarm)) for alarm in result.alarms],
     )

@@ -36,6 +36,7 @@ from shared.memory_eval_limits import (
 )
 from shared.memory_eval_metrics import (
     MetricSchemaError,
+    MetricSeries,
     load_metric_series,
     parse_metric_series,
     serialize_metric_series,
@@ -87,10 +88,25 @@ def _seeded_grandfather() -> frozenset[str]:
     return frozenset(scoped_grandfather_key(tripwire.metric_id, key) for key in snapshot)
 
 
+def _seeded_snapshotted() -> frozenset[str]:
+    """The tripwire ids the seed run snapshotted — the ledger beside the seed set.
+
+    Carried explicitly rather than left to default, because that is the
+    supported resume path: a run resumes from BOTH halves of the persisted
+    state, and an exemplar that skipped one would document the wrong recipe.
+    """
+    first = _series(_BASELINE_STAMPS[0])
+    return frozenset(m.metric_id for m in first.metrics if m.kind == 'tripwire')
+
+
 def evaluate_exemplar():
     """Reproduce the committed limits artifact's evaluation. Used by step-20's generator."""
     return evaluate_series(
-        _series(_REGRESSION_STAMP), _baseline(), _EXEMPLAR_CONFIG, _seeded_grandfather()
+        _series(_REGRESSION_STAMP),
+        _baseline(),
+        _EXEMPLAR_CONFIG,
+        _seeded_grandfather(),
+        _seeded_snapshotted(),
     )
 
 
@@ -244,6 +260,37 @@ class TestTwoTripwireSeriesOverTheCommittedCorpus:
         first = evaluate_series(self._dual(_DUAL_STAMPS[0]), [], self.CONFIG, None)
         assert 'topic-canonical-present::t-shared' in first.grandfather
         assert 'successor-pointer-present::t-shared' not in first.grandfather
+
+    def test_a_tripwire_added_mid_programme_snapshots_over_the_committed_corpus(self):
+        """The e1-retrieval-health probe joining an eval that already has state.
+
+        Run 1 evaluates ONLY successor-pointer-present; run 2 adds
+        topic-canonical-present, whose failures are pre-existing rather than
+        new. M2 grandfathers them, so the run is silent — and the metric that
+        already had state keeps its own slice across the arrival.
+        """
+        first_run = self._dual(_DUAL_STAMPS[0])
+        solo = MetricSeries(
+            schema_version=first_run.schema_version,
+            eval_id=first_run.eval_id,
+            run_stamp=first_run.run_stamp,
+            corpus=first_run.corpus,
+            metrics=[m for m in first_run.metrics if m.metric_id == 'successor-pointer-present'],
+        )
+        first = evaluate_series(solo, [], self.CONFIG, None)
+        assert sorted(first.grandfather) == ['successor-pointer-present::t-beta']
+
+        added = evaluate_series(
+            first_run, [], self.CONFIG, first.grandfather, first.snapshotted_metrics
+        )
+        assert added.alarms == ()
+        assert _verdict(added, 'topic-canonical-present').status == 'baseline_snapshot'
+        assert _verdict(added, 'successor-pointer-present').status == 'ok'
+        assert sorted(added.grandfather) == [
+            'successor-pointer-present::t-beta',
+            'topic-canonical-present::t-recon-watcher-triage',
+            'topic-canonical-present::t-shared',
+        ]
 
     def test_the_dual_artifact_publishes_scoped_known_bad_keys(self, tmp_path):
         # The dashboard reads these strings, so the scoping has to be visible in

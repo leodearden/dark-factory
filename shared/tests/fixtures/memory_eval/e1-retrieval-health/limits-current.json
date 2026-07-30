@@ -50,6 +50,9 @@
   "run_stamp": "20260704T031500Z",
   "runs_per_quarter": 90,
   "schema_version": 1,
+  "snapshotted_metric_ids": [
+    "topic-canonical-present"
+  ],
   "verdicts": [
     {
       "alarms": [
