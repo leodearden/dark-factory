@@ -651,7 +651,15 @@ class TestDerivationIsPure:
 # ---------------------------------------------------------------------------
 
 class _R:
-    """A stand-in for MemoryResult: id, content, metadata, relevance_score."""
+    """A stand-in for MemoryResult: id, content, metadata, relevance_score.
+
+    ``source_store`` is DECLARED but deliberately left unset by ``__init__``:
+    a plain ``_R`` must lack the attribute at runtime so the store-disclosure
+    tests still exercise the probe's ``getattr(..., 'source_store', '')``
+    fallback path. ``_stored`` sets it when a test needs a served store.
+    """
+
+    source_store: str
 
     def __init__(self, content='', id='', metadata=None, relevance_score=0.0):
         self.id = id
@@ -660,7 +668,7 @@ class _R:
         self.relevance_score = relevance_score
 
 
-def _entry(topic='t', content='the canonical text', last_known_id='ID-1', **kw):
+def _entry(topic='t', content='the canonical text', last_known_id: str | None = 'ID-1', **kw):
     """Build a real RegistryEntry whose canonical hashes *content*."""
     m = _mod()
     return m.RegistryEntry(
