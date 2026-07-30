@@ -27,7 +27,7 @@ Covers:
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -531,6 +531,80 @@ class TestSweepStaleStatusSnapshotEdgesCore:
 
         assert stats == {'scanned': 2, 'candidate_edges': 1, 'invalidated': 1, 'errors': 0}, (
             f'Expected exactly the stale edge counted+invalidated, got stats={stats!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_blocked_status_snapshot_edges_invalidated_end_to_end(self):
+        """Deterministic stand-in for "re-run the sweep to confirm coverage"
+        (task 3042): drives the full enumerate -> extract -> cross-reference
+        -> invalidate path against the two literal task-2885 repro fact
+        texts plus a still-blocked control edge.
+
+        Both repro-fact edges reference task 2885, whose census status has
+        moved to 'done' — both must be invalidated. The control edge
+        references task 3001, whose census status is still 'blocked' (a
+        non-terminal status) — it must be left alone, pinning
+        invalidate-only-on-positively-terminal for the blocked marker
+        end-to-end, not just at the pure-function layer.
+        """
+        memory_service = _make_memory_service()
+        taskmaster = _make_taskmaster()
+
+        repro_edge_1 = {
+            'uuid': 'edge-2885-a',
+            'fact': 'Task 2885 is in a blocked status due to merge_retry_pending.',
+            'name': '',
+        }
+        repro_edge_2 = {
+            'uuid': 'edge-2885-b',
+            'fact': (
+                'Task 2885 is deliberately parked in blocked status under '
+                'escalation esc-2885-17 pending human adjudication.'
+            ),
+            'name': '',
+        }
+        control_edge = {
+            'uuid': 'edge-3001-control', 'fact': 'Task 3001 is blocked.', 'name': '',
+        }
+        memory_service.graphiti.get_all_valid_edges = AsyncMock(
+            return_value={'entity-a': [repro_edge_1, repro_edge_2, control_edge]},
+        )
+        taskmaster.get_statuses = AsyncMock(return_value={'2885': 'done', '3001': 'blocked'})
+        now = datetime(2026, 7, 30, 12, 0, 0, tzinfo=UTC)
+
+        stats = await sweep_stale_status_snapshot_edges(
+            memory_service, taskmaster, 'test_project', '/tmp/reify',
+            run_id='run-2885', now=now,
+        )
+
+        assert stats == {'scanned': 3, 'candidate_edges': 2, 'invalidated': 2, 'errors': 0}, (
+            f'Expected both blocked-worded task-2885 edges invalidated and the '
+            f'still-blocked control edge left alone, got stats={stats!r}'
+        )
+
+        assert memory_service.update_edge.await_count == 2, (
+            'Expected update_edge awaited exactly twice, for the two repro-fact edges only'
+        )
+        invalidated_uuids = {call.args[0] for call in memory_service.update_edge.await_args_list}
+        assert invalidated_uuids == {'edge-2885-a', 'edge-2885-b'}, (
+            f'Expected only the two task-2885 repro edges invalidated, never the '
+            f'still-blocked control edge, got {invalidated_uuids!r}'
+        )
+        for call in memory_service.update_edge.await_args_list:
+            assert call.kwargs.get('invalid_at') == now, (
+                f'Expected update_edge called with the explicit now= timestamp, got {call!r}'
+            )
+            assert call.kwargs.get('project_id') == 'test_project'
+            assert call.kwargs.get('agent_id') == 'recon-stage-memory_consolidator'
+            assert call.kwargs.get('causation_id') == 'run-2885'
+
+        taskmaster.get_statuses.assert_awaited_once()
+        get_statuses_call = taskmaster.get_statuses.await_args
+        assert get_statuses_call.args[0] == '/tmp/reify'
+        assert '2885' in set(get_statuses_call.kwargs.get('ids', [])), (
+            'Expected get_statuses called with 2885 among the candidate ids — proving the '
+            'blocked-worded ids now reach the cross-reference instead of being dropped by '
+            'the gate'
         )
 
 
