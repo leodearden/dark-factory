@@ -326,3 +326,83 @@ class TestEmitZeroProgressRequeueAlert:
         queue = EscalationQueue(tmp_path)
         assert _emit(**_default_kwargs(queue, None)) is True
         assert len(queue.get_by_task(_sentinel('3068'), status='pending')) == 1
+
+
+# ---------------------------------------------------------------------------
+# Part C.3 — the config section
+# ---------------------------------------------------------------------------
+
+
+def _load_package_defaults() -> dict:
+    """Read the shipped defaults.yaml (test_config_merge_deep.py:63-69 idiom)."""
+    import importlib.resources as pkg_resources
+
+    import yaml
+
+    defaults_file = pkg_resources.files('orchestrator') / 'defaults.yaml'
+    return yaml.safe_load(defaults_file.read_text())
+
+
+class TestZeroProgressRequeueConfig:
+    """The detector must be operator-visible, tunable, and hot-reloadable."""
+
+    def test_section_is_registered_on_orchestrator_config(self):
+        """OrchestratorConfig exposes zero_progress_requeue with the defaults.
+
+        Registration is load-bearing, not cosmetic: model_config sets
+        extra='ignore', so an UNREGISTERED yaml block would be silently
+        dropped — the operator would edit a stanza that does nothing.  The
+        field declaration is also what registers the key with
+        census_config_keys.
+        """
+        from orchestrator.config import OrchestratorConfig
+
+        cfg = OrchestratorConfig()
+        assert hasattr(cfg, 'zero_progress_requeue'), (
+            'zero_progress_requeue must be a registered field, or its yaml '
+            'block is silently dropped by extra="ignore"'
+        )
+        # Unlike chronic_flake (shipped off, pending an un-landed reify
+        # substrate), this detector reads only TaskReport fields that already
+        # exist — shipping it off would leave the gap open indefinitely.
+        assert cfg.zero_progress_requeue.enabled is True
+        assert cfg.zero_progress_requeue.threshold == 5
+
+    def test_threshold_must_be_at_least_one(self):
+        """threshold=0 is rejected — it would alarm on every single requeue."""
+        import pydantic
+
+        from orchestrator.config import ZeroProgressRequeueConfig
+
+        with pytest.raises(pydantic.ValidationError):
+            ZeroProgressRequeueConfig(threshold=0)
+        with pytest.raises(pydantic.ValidationError):
+            ZeroProgressRequeueConfig(threshold=-1)
+
+    def test_defaults_yaml_block_matches_the_field_defaults(self):
+        """The shipped stanza must not drift from the pydantic defaults.
+
+        YamlSettingsSource layers defaults.yaml UNDER the project YAML, so the
+        STANZA — not the Field(default=...) — is what actually applies.  A
+        drifted stanza would silently win.
+        """
+        defaults = _load_package_defaults()
+        assert 'zero_progress_requeue' in defaults, (
+            'the shipped defaults.yaml must declare the zero_progress_requeue: '
+            'block so the knob is discoverable without reading pydantic source'
+        )
+        block = defaults['zero_progress_requeue']
+        assert block['enabled'] is True
+        assert block['threshold'] == 5
+
+    def test_leaves_are_green_tier_hot_reloadable(self):
+        """Both leaves are in RELOADABLE_FIELDS.
+
+        An operator must be able to retune or silence a noisy detector live,
+        without a restart — a detector you can only silence by restarting the
+        fleet is one that gets silenced by ignoring it.
+        """
+        from orchestrator.config import RELOADABLE_FIELDS
+
+        assert 'zero_progress_requeue.enabled' in RELOADABLE_FIELDS
+        assert 'zero_progress_requeue.threshold' in RELOADABLE_FIELDS
