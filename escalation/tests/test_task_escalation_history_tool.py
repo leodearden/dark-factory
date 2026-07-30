@@ -136,3 +136,71 @@ class TestGetTaskEscalationHistoryTool:
 
         assert 'queue_dir' not in result
         assert 'project_id' not in result
+
+    async def test_level_filter_narrows_through_the_archive_tier(self, tmp_path: Path):
+        """level=2 matches the ARCHIVED record (it's the level-2 one in this
+        fixture), proving the filter is applied through the archive tier,
+        not merely against the queue root."""
+        queue = self._mixed_queue(tmp_path)
+        server = create_server(queue)
+
+        result = await _history(server, task_id='3164', level=2)
+
+        assert {e['id'] for e in result['escalations']} == {'esc-3164-1'}, (
+            f"Expected only the archived L2 record, got {result['escalations']}"
+        )
+        assert result['count'] == 1
+        assert result['level_filter'] == 2
+
+    async def test_unfiltered_level_filter_echoes_none(self, tmp_path: Path):
+        """Unfiltered call: level_filter echoes None and count reflects both
+        records. This is the legibility guard the PRD's thesis needs — a
+        reader seeing count == 0 must be able to tell a filtered miss from a
+        genuine never-filed."""
+        queue = self._mixed_queue(tmp_path)
+        server = create_server(queue)
+
+        result = await _history(server, task_id='3164')
+
+        assert result['level_filter'] is None
+        assert result['count'] == 2
+
+    async def test_empty_envelope_distinguishes_unknown_task_from_filtered_miss(
+        self, tmp_path: Path,
+    ):
+        """Two different kinds of zero, both legible at the call site: an
+        unknown task id (no records exist at all) versus a real task with a
+        level filter that matches nothing. Neither is an {'error': ...}
+        dict — unlike the adjacent get_escalation, this is a scan, not an
+        id lookup, so zero matches is a valid answer, not a failure."""
+        queue = self._mixed_queue(tmp_path)
+        server = create_server(queue)
+
+        unknown = await _history(server, task_id='no-such-task')
+        assert unknown == {
+            'task_id': 'no-such-task',
+            'count': 0,
+            'level_filter': None,
+            'escalations': [],
+        }
+        assert 'error' not in unknown
+
+        filtered_miss = await _history(server, task_id='3164', level=99)
+        assert filtered_miss['count'] == 0
+        assert filtered_miss['level_filter'] == 99
+
+    async def test_status_parameter_is_rejected(self, tmp_path: Path):
+        """No `status` parameter exists on this tool — deliberately, not an
+        oversight. Accepting status='pending' would let a caller silently
+        narrow a tool NAMED "history" back to the pending-only fast path,
+        recreating — under the most reassuring possible name — the exact
+        false-absence trap this PRD exists to remove. Callers who
+        legitimately need a status filter have the sibling
+        get_task_escalations. Do NOT "helpfully" add this parameter for
+        symmetry with the sibling; that would defeat the whole point.
+        """
+        queue = self._mixed_queue(tmp_path)
+        server = create_server(queue)
+
+        with pytest.raises(TypeError):
+            await _history(server, task_id='3164', status='pending')
