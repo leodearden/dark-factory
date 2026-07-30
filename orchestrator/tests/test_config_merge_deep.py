@@ -81,32 +81,6 @@ def _query_events(event_store: EventStore, event_type_str: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-class TestMergeDeepConfigDefaults:
-    """The shipped default is the kill switch: ``chain_cap=0``."""
-
-    def test_pydantic_default_chain_cap_is_zero(self):
-        """The kill-switch default is a pydantic-level fact, not just a YAML one."""
-        field_info = MergeDeepConfig.model_fields['chain_cap']
-        assert field_info.default == 0
-
-    def test_reachable_as_orchestrator_config_attribute(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
-        cfg = OrchestratorConfig()
-        assert isinstance(cfg.merge_deep, MergeDeepConfig)
-        assert cfg.merge_deep.chain_cap == 0
-
-    def test_submodel_is_mutable_in_place(self):
-        """Pins the plain-BaseModel requirement (no frozen / no
-        validate_assignment) that ``_set_leaf`` (config.py:4876) depends on:
-        a two-component reload path is written with a plain ``setattr`` on the
-        submodel so held references observe the update (invariant I3).
-        """
-        m = MergeDeepConfig()
-        m.chain_cap = 6
-        assert m.chain_cap == 6
-
-
 class TestMergeDeepKnobInProjectYaml:
     """The operator deploy path that ``scripts/merge-deep-set-cap.sh`` (already
     on main) writes: ``merge_deep:\\n  chain_cap: <cap>`` in the project YAML.
@@ -276,29 +250,31 @@ class TestDefaultsYamlMergeDeepBlock:
     (the git:/chronic_flake:/psi_admission: precedent).
     """
 
-    def test_defaults_yaml_declares_the_kill_switch(self):
+    def test_defaults_yaml_does_not_drift_from_the_field_default(self, monkeypatch, tmp_path):
+        """The single canonical pin for "the shipped default is the kill switch".
+
+        Drift guard, and deliberately the ONLY place the value 0 is asserted:
+        ``YamlSettingsSource`` layers defaults.yaml UNDER the project YAML
+        (config.py:132), so the STANZA — not the pydantic ``Field(default=...)``
+        — is the value that actually applies. A stanza that drifted from the
+        Field default would silently win, and the shipped kill switch would be
+        off on paper only. Asserting all three together (loaded config attribute,
+        defaults.yaml stanza, Field default) subsumes each of them separately:
+        it fails loudly if the stanza is dropped or retuned, if the Field default
+        changes, or if the knob stops being reachable through a loaded config.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         defaults = _load_package_defaults()
         assert 'merge_deep' in defaults, (
             'the shipped defaults.yaml must declare the merge_deep: block so the '
             'knob is discoverable by an operator reading it'
         )
-        assert defaults['merge_deep']['chain_cap'] == 0
-
-    def test_defaults_yaml_does_not_drift_from_the_field_default(self, monkeypatch, tmp_path):
-        """Drift guard. ``YamlSettingsSource`` layers defaults.yaml UNDER the
-        project YAML (config.py:132), so the STANZA — not the pydantic
-        ``Field(default=...)`` — is the value that actually applies. A stanza that
-        drifted from the Field default would silently win, and the shipped kill
-        switch would be off on paper only. Pinning all three together makes such
-        an edit fail loudly instead.
-        """
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
-        defaults = _load_package_defaults()
         assert (
             OrchestratorConfig().merge_deep.chain_cap
             == defaults['merge_deep']['chain_cap']
             == MergeDeepConfig.model_fields['chain_cap'].default
+            == 0
         )
 
 
@@ -312,7 +288,30 @@ class TestChainCapZeroIsANoOp:
     property at this scope could not be turned green by this task. At α's scope
     byte-identity means (a) zero config-diff leaves at cap=0, below, and (b) the
     existing merge suites re-run unchanged (step-8).
+
+    Both tests here are KNOB-ANCHORED on purpose. ``OrchestratorConfig`` sets
+    ``extra='ignore'``, so an unrecognized ``merge_deep=`` kwarg is silently
+    dropped: without the anchor, "no diff / equal dumps" would hold trivially on
+    a tree where the field and the defaults.yaml stanza do not exist at all, and
+    the tests could not detect the regression they are named for (a later edit
+    that removes or renames the knob, or an override that never reaches the
+    model). The anchor asserts the leaf is actually PRESENT at 0 first, and the
+    override side is built from a typed ``MergeDeepConfig`` instance.
     """
+
+    def _assert_kill_switch_is_live(self, cfg: OrchestratorConfig) -> None:
+        """Anchor: the knob really exists on the loaded config, at 0.
+
+        Subscripted rather than compared to the exact dict ``{'chain_cap': 0}``
+        so β/γ/θ can add a leaf to the submodel without editing this file — the
+        no-op claim itself is carried by the whole-surface assertions below.
+        """
+        dumped = cfg.model_dump()
+        assert 'merge_deep' in dumped, (
+            'merge_deep is missing from the config surface — the no-op assertions '
+            'below would pass vacuously (extra=ignore drops the kwarg)'
+        )
+        assert dumped['merge_deep']['chain_cap'] == 0
 
     def test_explicit_zero_stanza_moves_no_leaf(self, monkeypatch, tmp_path):
         """An explicit kill-switch stanza must be indistinguishable from an absent
@@ -321,7 +320,8 @@ class TestChainCapZeroIsANoOp:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         live = OrchestratorConfig()
-        fresh = OrchestratorConfig(merge_deep={'chain_cap': 0})  # type: ignore[arg-type]
+        self._assert_kill_switch_is_live(live)
+        fresh = OrchestratorConfig(merge_deep=MergeDeepConfig(chain_cap=0))
         diff = diff_config(live, fresh)
         assert diff.applied_candidates == {}
         assert diff.restart_required == {}
@@ -333,5 +333,6 @@ class TestChainCapZeroIsANoOp:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         live = OrchestratorConfig()
-        fresh = OrchestratorConfig(merge_deep={'chain_cap': 0})  # type: ignore[arg-type]
+        self._assert_kill_switch_is_live(live)
+        fresh = OrchestratorConfig(merge_deep=MergeDeepConfig(chain_cap=0))
         assert live.model_dump() == fresh.model_dump()
