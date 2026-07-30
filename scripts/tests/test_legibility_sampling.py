@@ -468,6 +468,137 @@ class TestStratifiedSampleReserveExceedsBudget:
         assert 'recon-2' not in selected_ids
 
 
+class TestStratifiedSampleCostSeam:
+    """``stratified_sample`` charges the byte budget through an injectable
+    per-record ``cost_fn`` seam, not through ``record.size_bytes``.
+
+    The daily budget (``budgets.max_daily_digest_bytes``) is a DIGEST-OUTPUT
+    budget, but the sampler historically charged it against the RAW
+    transcript size — a 20x-500x over-charge that made a single multi-MB
+    session unaffordable against the whole night's cap. The seam lets a
+    caller inject the real digest-byte cost while keeping
+    ``stratified_sample`` itself pure (all I/O confined to the injected
+    callable), which is what the PRD §8.4 boundary test depends on.
+
+    Every record here carries a 6MB ``size_bytes`` — individually larger
+    than the configured budget — so any assertion that yields a non-empty
+    selection can only pass if the injected cost, not ``size_bytes``, is
+    what was charged.
+    """
+
+    _COSTS = {
+        'recon-a': 1_000,
+        'recon-b': 2_000,
+        'interactive-a': 3_000,
+        'interactive-b': 4_000,
+    }
+
+    def _config(self, max_bytes=100_000):
+        return config_mod.LegibilityConfig(
+            project_id='dark_factory',
+            project_root='/home/leo/src/dark-factory',
+            escalation_port=8103,
+            cwd_prefixes=['/home/leo/src/dark-factory'],
+            budgets=config_mod.Budgets(max_daily_digest_bytes=max_bytes),
+            sampling=config_mod.Sampling(top_fraction=0.12, per_stratum_min=2),
+        )
+
+    def _build_records(self):
+        """Four candidates across two strata, each 6MB of raw transcript."""
+        return [
+            _scored('recon-a', 'recon', mod.SignalCounts(tool_error=9), 'recon alpha opening', 6_000_000),
+            _scored('recon-b', 'recon', mod.SignalCounts(not_found=8), 'recon beta opening', 6_000_000),
+            _scored('interactive-a', 'interactive', mod.SignalCounts(tool_error=5), 'human turn one', 6_000_000),
+            _scored('interactive-b', 'interactive', mod.SignalCounts(self_correct=4), 'human turn two', 6_000_000),
+        ]
+
+    def _build_records_with_noise(self):
+        """The four candidates plus one zero-signal record and a clone pair
+        that ``dedupe_shapes`` collapses — records that must never be costed."""
+        records = self._build_records()
+        records.append(
+            _scored('recon-zero', 'recon', mod.SignalCounts(), 'recon zero opening', 6_000_000)
+        )
+        records.append(
+            _scored(
+                'recon-clone-1', 'recon', mod.SignalCounts(tool_error=1),
+                'recon clone cycle 2026-07-10', 6_000_000,
+            )
+        )
+        records.append(
+            _scored(
+                'recon-clone-2', 'recon', mod.SignalCounts(tool_error=2),
+                'recon clone cycle 2026-07-11', 6_000_000,
+            )
+        )
+        return records
+
+    def _cost(self, record):
+        return self._COSTS[record.path.stem]
+
+    def test_injected_cost_is_charged_instead_of_size_bytes(self):
+        # Each record's size_bytes (6MB) alone blows the 100_000 budget, so a
+        # non-empty selection is only reachable via the injected cost.
+        result = mod.stratified_sample(
+            self._build_records(), self._config(), cost_fn=self._cost,
+        )
+        assert result.selected != []
+        assert {r.path.stem for r in result.selected} == set(self._COSTS)
+        assert result.budget_skipped == 0
+
+    def test_bytes_used_sums_the_injected_cost(self):
+        result = mod.stratified_sample(
+            self._build_records(), self._config(), cost_fn=self._cost,
+        )
+        assert result.bytes_used == sum(self._cost(r) for r in result.selected)
+        assert result.bytes_used == sum(self._COSTS.values())
+
+    def test_injected_cost_governs_the_budget_cut(self):
+        # Cheapest-floor-first, priced by the INJECTED cost: recon's floor
+        # costs 1_000+2_000 = 3_000 and interactive's 3_000+4_000 = 7_000, so
+        # a 5_000 budget admits recon's floor and skips interactive's whole.
+        # By raw size_bytes both floors are identical (12MB), so this
+        # ordering can only come from the injected cost.
+        result = mod.stratified_sample(
+            self._build_records(), self._config(5_000), cost_fn=self._cost,
+        )
+        assert {r.path.stem for r in result.selected} == {'recon-a', 'recon-b'}
+        assert result.bytes_used == 3_000
+        assert result.budget_skipped == 2
+
+    def test_cost_fn_invoked_at_most_once_per_record(self):
+        # The reserve phase reads each group's total twice (sort key, then
+        # charge), so an unmemoized I/O-backed cost_fn would render every
+        # candidate transcript twice. Memoization is part of the contract.
+        calls: dict[str, int] = {}
+
+        def counting_cost(record):
+            calls[record.path.stem] = calls.get(record.path.stem, 0) + 1
+            return self._cost(record)
+
+        mod.stratified_sample(self._build_records(), self._config(), cost_fn=counting_cost)
+
+        assert calls, 'cost_fn was never invoked'
+        assert max(calls.values()) == 1
+
+    def test_only_candidates_are_costed(self):
+        # Zero-signal drops and dedupe-collapsed clones never reach the
+        # budget phase, so they must never trigger an (expensive) costing.
+        costed: list[str] = []
+
+        def recording_cost(record):
+            costed.append(record.path.stem)
+            return self._COSTS.get(record.path.stem, 1_000)
+
+        mod.stratified_sample(
+            self._build_records_with_noise(), self._config(), cost_fn=recording_cost,
+        )
+
+        assert 'recon-zero' not in costed
+        assert 'recon-clone-1' not in costed
+        assert set(costed) == set(self._COSTS)
+
+
 class TestRenderManifest:
     def test_emits_one_json_object_per_line(self):
         records = [
