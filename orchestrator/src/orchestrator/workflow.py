@@ -983,6 +983,19 @@ def _iteration_entry_is_work(entry: dict) -> bool:
     - ``'judge'`` ``early_exit`` entries count only when ``substantive_work``
       is True (workflow.py ~4559) — a judge can legitimately declare a task
       complete with zero plan-steps marked done.
+    - ``'architect'`` ``execute_skipped`` entries count only when
+      ``steps_completed`` is non-empty (task 3033 / PRD §A1) — the entry
+      ``_execute_iterations`` writes when every plan step was pre-satisfied at
+      authoring time via ``mark_step_committed`` and EXECUTE ran zero
+      iterations. It IS real work: the branch genuinely carries the committed
+      implementation of every named step, and each pre-satisfied sha was
+      corroborated on-branch at authoring time by ``plan_tools``'
+      ``_sha_exists_on_branch`` reachability guard. Deliberately narrow — BOTH
+      the exact ``event`` name AND a non-empty ``steps_completed`` are required,
+      so a zero-work architect entry (or an architect entry with any other
+      event) can never resolve ``has_work=True``. The ``judge`` clause is the
+      direct precedent: an agent legitimately declaring the plan satisfied
+      without an implementer turn.
 
     An entry that explicitly recorded no durable commit (``committed is False``,
     task 2759) is not prior-implementation work regardless of agent type — the
@@ -1000,6 +1013,11 @@ def _iteration_entry_is_work(entry: dict) -> bool:
         return entry.get('source') == 'amendment' or bool(entry.get('steps_completed'))
     if agent == 'judge':
         return entry.get('event') == 'early_exit' and bool(entry.get('substantive_work'))
+    if agent == 'architect':
+        return (
+            entry.get('event') == 'execute_skipped'
+            and bool(entry.get('steps_completed'))
+        )
     return False
 
 
@@ -6468,6 +6486,32 @@ class TaskWorkflow:
                 self.task_id, self.metrics.execute_iterations,
                 len(done_step_ids), len(items),
             )
+            # Durable honest signal, mirroring the judge early_exit entry shape
+            # below. REQUIRED, not cosmetic: _has_prior_implementation needs at
+            # least one _iteration_entry_is_work entry, and the merge-phase
+            # guard _recover_before_merge uses the iteration-log-only fallback
+            # (wt_head=None). An all-committed plan writes zero
+            # implementer/debugger/judge entries, so without this the guard
+            # would resolve has_work=False on a branch that already landed and
+            # REFUSE to recover-DONE — re-planning merged work. The label is
+            # honest ('architect', not a forged 'implementer') so the log the
+            # reconciler and future architects read never claims an implementer
+            # turn that did not happen. Guarded on a non-empty done set so the
+            # entry can never claim work that does not exist (an all-empty plan
+            # cannot pass PLAN validation, but fail closed anyway).
+            if done_step_ids:
+                self.artifacts.append_iteration_log({
+                    'iteration': self.metrics.execute_iterations,
+                    'agent': 'architect',
+                    'event': 'execute_skipped',
+                    'steps_completed': done_step_ids,
+                    'committed': True,
+                    'summary': (
+                        'EXECUTE skipped — every plan step pre-satisfied at '
+                        'authoring time via mark_step_committed'
+                    ),
+                    'source': 'orchestrator',
+                })
             return WorkflowOutcome.DONE
 
         while self.artifacts.get_pending_steps():
