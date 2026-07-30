@@ -1871,6 +1871,71 @@ def test_run_census_dry_run_filing_writes_payloads_and_files_nothing(tmp_path, c
     assert any("dry" in r.message.lower() for r in caplog.records), "loud, never silent"
 
 
+# ---------------------------------------------------------------------------
+# task 3280 step-18: RED — the dry-run WARNING must describe the state the run
+# ACTUALLY left behind. A dry run is NOT a no-op that can be replayed: the
+# codebook merge, the promotions, codebook.dump and advance_census_state all
+# really happened, so re-running the census files NOTHING (the same confusions
+# now code as `matches` against the advanced codebook, `_novel_clusters` comes
+# back empty, build_task_payloads returns [], and _census_window_dates has
+# re-anchored at this run's last_census_at so the earlier window is never
+# enumerated again). Advertising a re-run as the recovery path sends the
+# operator down a road that silently drops the remediation work.
+# ---------------------------------------------------------------------------
+
+def test_run_census_dry_run_warning_states_advanced_state_and_no_rerun_recovery(
+    tmp_path, caplog,
+):
+    payloads_path = tmp_path / "confusion-census-2026-07-14-payloads.json"
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_happy_invoke_response),
+        batch_source=[_happy_batch("b0")],
+        verify_fn=_make_fake_verify_fn(
+            verified_titles={"Silent no-op subagent contract"},
+            rejected_titles={"Spurious pattern"},
+        ),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=_make_fake_submit_fn(),
+        escalate_fn=_poison("escalate_fn"),
+        status_fetcher=_make_fake_status_fetcher(3),
+        commit=_make_fake_commit(),
+        dry_run_payloads_path=payloads_path,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        mod.run_census(**kwargs)
+
+    records = [r for r in caplog.records if "dry-run-filing" in r.message]
+    assert len(records) == 1, "exactly one dry-run WARNING, loud and singular"
+    msg = records[0].message.lower()
+
+    # (a) still names the payload count and path -- the operator's handle on
+    # the work
+    assert "1 task payload" in msg
+    assert str(payloads_path).lower() in msg
+
+    # (b) states that the codebook AND census-state have already advanced --
+    # this run mutated persistent state, it was not a rehearsal
+    assert "codebook" in msg
+    assert "census-state" in msg or "census state" in msg
+    assert any(marker in msg for marker in ("advanced", "already")), (
+        "the WARNING must say the state was ALREADY advanced, not that it might be"
+    )
+
+    # (c) names hand-filing the payload file as the remaining path
+    assert "hand" in msg
+
+    # (d) THE FINDING: never advertise a re-run as recovery. A second census
+    # cannot re-file these payloads, so pointing the operator at one loses
+    # the remediation work.
+    for dead_end in ("re-run", "rerun", "run again"):
+        assert dead_end not in msg, (
+            f"WARNING advertises the dead recovery path {dead_end!r}: a repeat "
+            "census codes these confusions as matches and files nothing"
+        )
+
+
 def test_run_census_without_dry_run_files_normally_and_writes_no_payload_file(tmp_path):
     fake_submit_fn = _make_fake_submit_fn()
     kwargs = _run_census_kwargs(
