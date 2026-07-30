@@ -7571,6 +7571,80 @@ class TestPredicateModePassPath:
             f'stdout tail must appear in provenance note: {provenance!r}'
         )
 
+    async def test_predicate_pass_provenance_note_is_sanitized(self, tmp_path: Path):
+        """A chatty script's log noise never reaches done_provenance.note.
+
+        Task 3286 / specimen 2902: the note is read by fused-memory's
+        `_format_outcome_echo` and appended to a Mem0 completion summary, so
+        raw subprocess output landing here is ingested into memory.
+        """
+        from orchestrator.deterministic_runner import (
+            DeterministicRunner,
+            _summarize_predicate_output,
+        )
+
+        task = _predicate_task(task_id='700')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        script_runner = AsyncMock(return_value=(0, POLLUTED_PREDICATE_OUTPUT))
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        await runner.run(assignment)
+
+        note = scheduler.set_task_status.call_args.kwargs['done_provenance']['note']
+
+        assert note == _summarize_predicate_output(POLLUTED_PREDICATE_OUTPUT, rc=0)
+        for marker in (
+            'fused_memory.backends.graphiti_client',
+            'httpx',
+            'my_solar_challenge',
+        ):
+            assert marker not in note, f'{marker!r} leaked into the note: {note!r}'
+        # The live specimen was 1999 chars; the note is now bounded.
+        assert len(note) <= 500, f'note must stay bounded, got {len(note)}: {note!r}'
+
+    async def test_predicate_pass_logs_raw_output_before_summarizing(
+        self, tmp_path: Path, caplog,
+    ):
+        """The summarizer discards content — the raw text must stay recoverable.
+
+        The orchestrator log is the right home for it: durable and
+        operator-accessible, and (unlike the note) never memory-ingested.
+        """
+        import logging
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+
+        task = _predicate_task(task_id='700')
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        script_runner = AsyncMock(return_value=(0, POLLUTED_PREDICATE_OUTPUT))
+        unit_inspector = AsyncMock()
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=unit_inspector,
+            script_runner=script_runner,
+        )
+        with caplog.at_level(logging.INFO, logger='orchestrator.deterministic_runner'):
+            await runner.run(assignment)
+
+        logged = '\n'.join(record.getMessage() for record in caplog.records)
+        assert 'my_solar_challenge' in logged, (
+            f'raw predicate output must be logged, not silently dropped: {logged!r}'
+        )
+
     async def test_predicate_pass_script_runner_called_once_with_before_done(self, tmp_path: Path):
         """script_runner invoked exactly once with the full before_done dict (B7)."""
         from orchestrator.deterministic_runner import DeterministicRunner
