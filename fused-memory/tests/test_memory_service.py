@@ -19,6 +19,21 @@ from fused_memory.services.memory_service import (
 )
 
 
+# A realistic stored Qdrant point payload: the mem0-owned keys mem0's own
+# _update_memory recomputes-or-restores, plus this record's CUSTOM provenance
+# keys (the ones a naive content amend silently destroys).
+DEFAULT_POINT_PAYLOAD = {
+    'data': 'original content',
+    'hash': 'abc123hash',
+    'created_at': '2026-01-01T00:00:00+00:00',
+    'updated_at': '2026-01-02T00:00:00+00:00',
+    'user_id': 'testproject',
+    'kind': 'canonical',
+    'src_project': 'dark_factory',
+    'topic': 'docs-prd-landing',
+}
+
+
 @pytest.fixture
 def service(mock_config):
     """MemoryService with mocked backends (no real DB needed)."""
@@ -48,6 +63,16 @@ def service(mock_config):
     svc.mem0.add = AsyncMock(return_value={'results': [{'id': 'mem0-1'}]})
     svc.mem0.get_all = AsyncMock(return_value={'results': []})
     svc.mem0.delete = AsyncMock(return_value={'message': 'deleted'})
+    # In-place update surface (task 3088). Without these the service's
+    # update_memory path would reach bare non-awaitable MagicMocks and fail
+    # with a confusing TypeError instead of a clean assertion.
+    svc.mem0.update = AsyncMock(return_value={'message': 'Memory updated successfully!'})
+    svc.mem0.set_payload = AsyncMock(return_value=True)
+    svc.mem0.delete_payload = AsyncMock(return_value=True)
+    svc.mem0.overwrite_payload = AsyncMock(return_value=True)
+    # Default read payload carries BOTH mem0-owned keys and custom provenance
+    # keys, so the preservation assertions have something to preserve.
+    svc.mem0.get_point_by_id = AsyncMock(return_value=dict(DEFAULT_POINT_PAYLOAD))
 
     # Mock durable queue
     svc.durable_queue = MagicMock()
