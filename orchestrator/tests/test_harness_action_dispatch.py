@@ -1148,8 +1148,8 @@ class TestRestartClearsMergeRetryPending:
         # Order matters: the clear must land BEFORE the task goes 'pending', or
         # the scheduler can re-dispatch it while the stamp is still readable.
         manager = MagicMock()
-        manager.attach_mock(harness.scheduler.update_task, 'update_task')
-        manager.attach_mock(harness.scheduler.set_task_status, 'set_task_status')
+        manager.attach_mock(harness.scheduler.update_task, 'update_task')  # type: ignore[arg-type]
+        manager.attach_mock(harness.scheduler.set_task_status, 'set_task_status')  # type: ignore[arg-type]
 
         await harness._action_teardown_and_set_status('task-1', 'pending', 'restart')
 
