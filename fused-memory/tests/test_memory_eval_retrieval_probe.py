@@ -2916,3 +2916,145 @@ class TestSeededInducedRegression:
             assert before.is_initial_run and not after.is_initial_run
         finally:
             await memory.close()
+
+
+# ---------------------------------------------------------------------------
+# step-24: which store served the query
+#
+# The first live run against dark_factory made these tests necessary. It
+# reported canonical-in-top-5 = 2/38 and 72 unmatched observations, which reads
+# as a corpus-wide findability collapse. It is not one. MemoryService.search
+# ROUTES: the read router picks a store set per query, and result lists come
+# back homogeneous — one phrasing served entirely by Mem0 (canonical at rank 1,
+# exact content-hash match), the next served entirely by Graphiti, whose edge
+# facts are LLM-extracted sentences and can never contain a Mem0 entry's raw
+# content no matter how healthy retrieval is.
+#
+# The probe deliberately does NOT pin stores: an agent's search is routed too,
+# so "the router sent this query somewhere the canonical does not live" is a
+# real retrieval-health fact, not a confound to engineer away. But a rate that
+# is dominated by routing and does not SAY so is exactly the silent
+# fail-soft this leaf exists to prevent — leaf alpha would end up computing
+# limits over router coin-flips. So the served store set rides along with every
+# observation, in the artifact and in the report.
+#
+# Still no thresholds: these assert on recorded facts and disclosure presence.
+# ---------------------------------------------------------------------------
+
+def _stored(content, store, id='X'):
+    r = _R(content=content, id=id)
+    r.source_store = store
+    return r
+
+
+class TestStoresServedDisclosure:
+    """Which store answered is a recorded fact, not something to infer."""
+
+    def test_the_observation_records_the_stores_that_served_it(self):
+        m = _mod()
+        entry = _entry(content=CANON)
+        results = [_stored(CANON, 'mem0', 'ID-1'), _stored('other', 'graphiti', 'G1')]
+
+        obs = m.observe_phrasing(results, entry, m.Phrasing('q', False), 5)
+
+        assert obs.stores_served == ('graphiti', 'mem0')
+
+    def test_a_result_without_a_store_is_recorded_as_unknown(self):
+        """A shape this probe does not recognise must not silently vanish."""
+        m = _mod()
+        entry = _entry(content=CANON)
+
+        obs = m.observe_phrasing([_R(content=CANON, id='ID-1')], entry, m.Phrasing('q'), 5)
+
+        assert obs.stores_served == ('unknown',)
+
+    def test_only_the_top_k_slice_is_credited(self):
+        m = _mod()
+        entry = _entry(content=CANON)
+        results = [*[_stored('f', 'mem0', f'M{i}') for i in range(5)],
+                   _stored('g', 'graphiti', 'G1')]
+
+        assert m.observe_phrasing(results, entry, m.Phrasing('q'), 5).stores_served == ('mem0',)
+
+    def test_the_report_breaks_observations_down_by_serving_store(self):
+        m = _mod()
+        observations = _report_observations()
+        observations.phrasings.append(m.PhrasingObservation(
+            topic='alpha-topic', phrasing='routed away', held_out=False, k=5,
+            hit=False, rank=None, matched_by=None, stores_served=('graphiti',),
+        ))
+        report = m.render_probe_report(_report_series(observations), observations)
+
+        assert 'which store served' in report.lower()
+        assert 'graphiti' in report
+
+    def test_the_unmatched_section_names_the_stores_that_answered(self):
+        """An operator must not have to guess whether the canonical could
+        have been returned at all."""
+        m = _mod()
+        observations = m.ProbeObservations(phrasings=[
+            m.PhrasingObservation(
+                topic='routed-away-topic', phrasing='q', held_out=False, k=5,
+                hit=False, rank=None, matched_by=None, stores_served=('graphiti',),
+            ),
+            m.PhrasingObservation(
+                topic='routed-away-topic', phrasing='h', held_out=True, k=5,
+                hit=False, rank=None, matched_by=None, stores_served=('graphiti',),
+            ),
+        ])
+        report = m.render_probe_report(_build(observations), observations)
+
+        section = report.split('canonicals matched by NEITHER key')[1]
+        assert 'routed-away-topic' in section
+        assert 'graphiti' in section.split('\n\n')[0]
+
+    def test_the_serving_store_counts_ride_in_the_machine_readable_artifact(self):
+        """Prose-only disclosure is invisible to every consumer that reads JSON."""
+        m = _mod()
+        observations = m.ProbeObservations(phrasings=[
+            m.PhrasingObservation(
+                topic='a', phrasing='q', held_out=False, k=5, hit=True, rank=1,
+                matched_by=m.MATCHED_BY_CONTENT_HASH, stores_served=('mem0',),
+            ),
+            m.PhrasingObservation(
+                topic='a', phrasing='h', held_out=True, k=5, hit=False, rank=None,
+                matched_by=None, stores_served=('graphiti',),
+            ),
+        ])
+        counts = _build(observations).corpus.counts
+
+        assert counts['observations_served_by_mem0'] == 1
+        assert counts['observations_served_by_graphiti'] == 1
+
+    def test_the_probe_band_threads_the_served_stores_through(self):
+        """The wiring, not just the dataclass field."""
+        import asyncio  # noqa: PLC0415
+
+        m = _mod()
+        entry = _probe_entry()
+        registry = m.TopicRegistry(schema_version=1, entries=(entry,))
+        observations = m.ProbeObservations()
+        search = _search_returning({
+            'tuned query': _healthy([_stored(CANON, 'mem0', 'ID-1')]),
+            'held out query': _healthy([_stored('unrelated', 'graphiti', 'G1')]),
+        })
+
+        asyncio.run(m.probe_topic(search, entry, registry, (5,), observations))
+
+        by_phrasing = {o.phrasing: o for o in observations.phrasings}
+        assert by_phrasing['tuned query'].stores_served == ('mem0',)
+        assert by_phrasing['held out query'].stores_served == ('graphiti',)
+
+
+class TestCorpusCountScopeIsDisclosed:
+    """count_memories_by_metadata is a Mem0 count; the report must say so."""
+
+    def test_the_report_states_that_the_counts_are_mem0_side(self):
+        """The live run reported entities_and_relations: 0 against a graph
+        holding thousands. The zero is honest about what was counted and
+        misleading about what exists, so the report says which it is."""
+        m = _mod()
+        report = m.render_probe_report(_report_series(), _report_observations())
+
+        assert 'corpus counts' in report.lower()
+        assert 'mem0' in report.lower()
