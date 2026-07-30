@@ -1484,6 +1484,235 @@ class TestCallJudgeCliTaxonomy:
 
 
 # ─────────────────────────────────────────────────────────────────────
+# _call_judge_cli: success with NO usable verdict is INFRA, not content
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestCallJudgeCliStructuredOutputTaxonomy:
+    """A CLI success that carries no usable verdict is an INFRA failure.
+
+    This is the exact 2947 residual this task closes.  The 2026-07-25 halt came
+    from a cap-retry SUCCESS — exit 0, is_error=false, 727 output tokens — whose
+    text channel held conversational prose because the resume dropped the system
+    prompt.  Nothing was reviewed, so there is no verdict to trust; classifying it
+    as fail-closed malformed CONTENT fabricated a severity=serious halt that lied
+    about a review that never happened.
+
+    No verdict exists => JudgeInfraError => review_run's bounded backoff and a
+    truthful 'judge-unreachable' halt only at threshold.  Deliberately kept
+    DISTINCT from case (g): the benign exit-0/empty-stdout legacy contract.
+    """
+
+    def _judge(self):
+        config = _make_judge_config(
+            judge_llm_provider='claude_cli',
+            judge_llm_model='claude-sonnet-4-5',
+        )
+        return Judge(config=config, journal=MagicMock(), usage_gate=make_gate_mock())
+
+    async def _raises(self, result):
+        """Invoke _call_judge_cli against *result*, returning the JudgeInfraError."""
+        from fused_memory.reconciliation.judge import JudgeInfraError
+
+        judge = self._judge()
+        with patch(
+            'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+            new=AsyncMock(return_value=result),
+        ), pytest.raises(JudgeInfraError) as exc_info:
+            await judge._call_judge_cli('prompt')
+        return exc_info.value
+
+    @pytest.mark.asyncio
+    async def test_missing_structured_output_is_cli_output_empty(self):
+        """(a) success + structured_output=None, with the 07-25 prose in `output`:
+        the prose is NOT a verdict — this is cli_output_empty infra."""
+        from shared.cli_invoke import AgentResult
+
+        err = await self._raises(AgentResult(
+            success=True,
+            output="I'll check the repo for context...\n\n*Searches project files*",
+            output_tokens=727,
+        ))
+        assert err.code == 'cli_output_empty'
+        assert 'cli_output_empty' in str(err)
+
+    @pytest.mark.asyncio
+    async def test_empty_dict_structured_output_is_cli_output_empty(self):
+        """(b) success + structured_output={} carries no verdict either."""
+        from shared.cli_invoke import AgentResult
+
+        err = await self._raises(AgentResult(success=True, output='', structured_output={}))
+        assert err.code == 'cli_output_empty'
+
+    @pytest.mark.asyncio
+    async def test_unparseable_json_string_is_cli_output_unparseable(self):
+        """(c) A structured_output string that is not valid JSON must raise
+        JudgeInfraError, NOT let json.loads' JSONDecodeError escape into
+        review_run's broad except (which would silently return None)."""
+        from shared.cli_invoke import AgentResult
+
+        err = await self._raises(
+            AgentResult(success=True, output='', structured_output='not json {{{')
+        )
+        assert err.code == 'cli_output_unparseable'
+
+    @pytest.mark.asyncio
+    async def test_non_dict_non_str_payload_is_cli_output_unparseable(self):
+        """(d) A list (or any non-dict) payload is a wrong-typed verdict."""
+        from shared.cli_invoke import AgentResult
+
+        err = await self._raises(
+            AgentResult(success=True, output='', structured_output=['a', 'list'])
+        )
+        assert err.code == 'cli_output_unparseable'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('payload', [
+        {'findings': []},                              # severity missing
+        {'severity': 'catastrophic', 'findings': []},  # severity outside the enum
+    ])
+    async def test_bad_severity_is_cli_output_unparseable(self, payload):
+        """(e) A payload whose severity is missing or outside VerdictSeverity is
+        not a verdict we can act on — do not normalise it silently."""
+        from shared.cli_invoke import AgentResult
+
+        err = await self._raises(
+            AgentResult(success=True, output='', structured_output=payload)
+        )
+        assert err.code == 'cli_output_unparseable'
+
+    @pytest.mark.asyncio
+    async def test_non_list_findings_is_cli_output_unparseable(self):
+        """(f) findings must be a list: JudgeVerdict construction would otherwise
+        raise a pydantic ValidationError that review_run's broad except would
+        swallow into a silent None — no verdict, no halt, no signal."""
+        from shared.cli_invoke import AgentResult
+
+        err = await self._raises(AgentResult(
+            success=True, output='', structured_output={'severity': 'ok', 'findings': 'not-a-list'},
+        ))
+        assert err.code == 'cli_output_unparseable'
+
+    @pytest.mark.asyncio
+    async def test_genuine_empty_output_is_not_conflated_with_infra(self):
+        """(g) REGRESSION GUARD — the benign exit-0/empty-stdout legacy contract
+        ('empty stdout = valid empty verdict') still returns '' and must NOT be
+        raised as infra.  This is a NON-success result whose failure kind is
+        EMPTY_OUTPUT, categorically different from (a)-(f) above, which are all
+        SUCCESSES carrying no usable payload."""
+        from shared.cli_invoke import AgentResult
+
+        judge = self._judge()
+        result = AgentResult(
+            success=False,
+            output='',
+            subtype='error_empty_output',
+            api_error_status=None,
+            timed_out=False,
+        )
+        with patch(
+            'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+            new=AsyncMock(return_value=result),
+        ):
+            # Explicitly must NOT raise.
+            assert await judge._call_judge_cli('prompt') == ''
+
+
+class TestReviewRunNoStructuredVerdict:
+    """review_run treats a no-verdict CLI success as bounded-backoff infra.
+
+    THE headline user-observable signal of this task: a cap-storm resume no
+    longer writes a fabricated severity=serious row into judge_verdicts nor a
+    halt_state row whose reason starts 'Unparseable judge response'.
+    """
+
+    def _setup(self, mock_journal, project_id, **cfg):
+        from fused_memory.models.reconciliation import (
+            ReconciliationRun,
+            RunStatus,
+            RunType,
+        )
+
+        config = _make_judge_config(
+            judge_llm_provider='claude_cli',
+            judge_llm_model='claude-sonnet-4-5',
+            **cfg,
+        )
+        judge = Judge(config=config, journal=mock_journal, usage_gate=make_gate_mock())
+        run = ReconciliationRun(
+            id='run-nostruct',
+            project_id=project_id,
+            run_type=RunType.full,
+            trigger_reason='buffer_size:3',
+            started_at=datetime.now(UTC),
+            events_processed=3,
+            status=RunStatus.completed,
+            stage_reports={},
+        )
+        mock_journal.get_run = AsyncMock(return_value=run)
+        mock_journal.get_run_actions_combined = AsyncMock(return_value=[])
+        return judge
+
+    @staticmethod
+    def _prose_success():
+        """The literal 2026-07-25 shape: exit 0, is_error=false, real output
+        tokens, conversational prose, NO structured payload."""
+        from shared.cli_invoke import AgentResult
+
+        return AgentResult(
+            success=True,
+            output="I'll check the repo for context...\n\n*Searches project files*",
+            session_id='jsess-cap',
+            output_tokens=727,
+        )
+
+    @pytest.mark.asyncio
+    async def test_first_occurrence_stamps_no_verdict_and_does_not_halt(self, mock_journal):
+        """(h) First no-verdict success: no verdict row, no halt_state row, not
+        halted.  Before this task it stamped a fabricated severity=serious verdict
+        and halted the project on the very first occurrence."""
+        judge = self._setup(
+            mock_journal, 'proj-nostruct-a',
+            halt_on_judge_serious=True, judge_infra_max_consecutive_failures=3,
+        )
+        with patch(
+            'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+            new=AsyncMock(return_value=self._prose_success()),
+        ):
+            verdict = await judge.review_run('run-nostruct')
+
+        assert verdict is None
+        mock_journal.add_verdict.assert_not_called()
+        mock_journal.set_halt.assert_not_called()
+        assert judge.is_halted('proj-nostruct-a') is False
+
+    @pytest.mark.asyncio
+    async def test_third_consecutive_occurrence_halts_truthfully(self, mock_journal):
+        """(i) At threshold the halt fires, but with the TRUTHFUL
+        'judge-unreachable halt' reason — never 'Serious verdict' (a review that
+        never happened) and never 'Unparseable judge response' (reachable
+        malformed content, which this is not) — and still stamps no verdict."""
+        judge = self._setup(
+            mock_journal, 'proj-nostruct-b',
+            halt_on_judge_serious=True, judge_infra_max_consecutive_failures=3,
+        )
+        with patch(
+            'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+            new=AsyncMock(return_value=self._prose_success()),
+        ):
+            for _ in range(3):
+                await judge.review_run('run-nostruct')
+
+        assert judge.is_halted('proj-nostruct-b')
+        reason = judge.halt_reason('proj-nostruct-b')
+        assert reason is not None
+        assert reason.startswith('judge-unreachable halt')
+        assert 'Serious verdict' not in reason
+        assert 'Unparseable judge response' not in reason
+        mock_journal.add_verdict.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────────────
 # review_run bounded-backoff handling of JudgeInfraError (task 2947 ask a)
 # ─────────────────────────────────────────────────────────────────────
 
