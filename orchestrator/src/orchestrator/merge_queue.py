@@ -4320,15 +4320,30 @@ async def coalesce_or_enqueue_merge_request(
 
     *live_snapshot* (keyword-only, default None): a zero-argument callable
     that returns the live worker snapshot dict (same shape as
-    ``SpeculativeMergeWorker.snapshot()``).  When provided, the registry
-    fast-path **reconciles** the in-memory slot against the live snapshot
-    before coalescing: if the slot's ``request_id`` is absent from the
+    ``SpeculativeMergeWorker.snapshot()``).  When provided, it **reconciles
+    BOTH coalesce arms** against live worker state before coalescing.
+
+    *Registry arm*: if the slot's ``request_id`` is absent from the
     snapshot the slot is considered stale (the request finalized but its
     slot was not auto-released), it is reaped via
     ``registry.release(branch, detach_waiters=True)``, and the call falls
     through to the acquire-and-enqueue block dispatching a fresh request.
-    When absent (None) or when ``live_snapshot()`` raises, the gate
-    behaves exactly as today — trust the registry.
+
+    *Disk-scan arm*: the same reconciliation, but additionally gated on
+    OWNERSHIP via the snapshot's ``owned_merge_worktrees`` ledger (see
+    :func:`_inflight_worktree_is_stale`).  A worktree this worker is
+    heartbeating has a root-inode mtime pinned fresh by
+    ``_touch_owned_merge_worktrees``, so mtime cannot prove liveness; when the
+    snapshot additionally holds no entry for the branch, the owning request has
+    finalized and the worktree is a corpse — reaped with reason
+    ``finalized_owner`` (distinct from the mtime path's ``stale_inflight``),
+    falling through to a fresh dispatch.  Requiring ownership is what preserves
+    the cross-process crash-safety property documented above: a foreign or
+    pre-restart merger's worktree is by construction absent from this worker's
+    snapshot entries, so branch-absence alone would reap live foreign merges.
+
+    When absent (None) or when ``live_snapshot()`` raises, both arms behave
+    exactly as before — trust the registry and the on-disk mtime.
 
     *classifier_git_ops* (keyword-only, default None): when provided AND both
     ``entry.snapshot_tip`` and ``req.snapshot_tip`` are set, the registry
@@ -4355,7 +4370,10 @@ async def coalesce_or_enqueue_merge_request(
     registry mutation — the only await (ancestry classification) precedes them
     and performs no mutation.  When absent or either snapshot_tip is None, the
     gate is a no-op and the path preserves current behaviour (back-compat).
-    The disk-scan cross-process coalesce branch is intentionally left untouched.
+    The C3 submit-identity gate is scoped to the registry fast-path; the
+    disk-scan branch has no in-process entry to classify a tip against.  That
+    branch is reconciled instead by the ownership-gated staleness check
+    described under *live_snapshot* above.
     """
     branch = req.branch.bare_id  # bookkeeping key (registry / worktree scan / result)
 
@@ -4558,34 +4576,20 @@ async def coalesce_or_enqueue_merge_request(
     if git_ops is not None:
         wt = await git_ops.find_inflight_merge_worktree(branch)
         if wt is not None:
-            try:
-                age = time.time() - wt.stat().st_mtime
-            except OSError:
-                age = 0.0  # stat failed — treat as alive to be safe
-            if age <= liveness_secs:
-                # ALIVE: coalesce without enqueuing or reaping.
-                # No alias is registered here: the primary request_id belongs to
-                # a different process, so there is no in-process registry entry
-                # to alias onto.  Callers polling the coalesced id fall through
-                # to the event-store / git-authority tiers on a ring miss.
-                _emit_merge_coalesced(event_store, req, source='worktree', eta=None)
-                return MergeDispatchResult(
-                    dispatched=False,
-                    in_flight=True,
-                    branch=branch,
-                    source='worktree',
-                )
-            else:
-                # STALE/ABANDONED: reap the abandoned worktree so a fresh merger
-                # can be dispatched.  Foreign-process killing is deliberately out
-                # of scope — there is no cwd-based kill utility in the repo
-                # (terminate_process_group only handles procs the orchestrator
-                # spawned), and git worktree remove --force removes the tree so
-                # any orphaned build procs fail when their cwd vanishes.
+            if _inflight_worktree_is_stale(wt, branch, live_snapshot):
+                # FINALIZED-OWNER CORPSE: this worker owns the worktree (so its
+                # root mtime is heartbeat-pinned and carries no information about
+                # merge liveness) but the live pipeline holds no entry for the
+                # branch, i.e. the owning request already finalized.  Reap it so
+                # a fresh merger can be dispatched — otherwise the mtime check
+                # below coalesces onto the corpse forever and the branch can
+                # never re-enter the merge queue until the process restarts.
                 logger.warning(
-                    'coalesce_or_enqueue_merge_request: reaping stale '
-                    '_merge-* worktree %s for branch %r (age=%.0fs > liveness=%ss)',
-                    wt, branch, age, liveness_secs,
+                    'coalesce_or_enqueue_merge_request: reaping FINALIZED-OWNER '
+                    '_merge-* worktree %s for branch %r (owned by this worker but no '
+                    'live entry for the branch — its request already finalized; root '
+                    'mtime is heartbeat-pinned and cannot be trusted). Dispatching fresh.',
+                    wt, branch,
                 )
                 await git_ops.cleanup_merge_worktree(wt)
                 if event_store is not None:
@@ -4593,9 +4597,52 @@ async def coalesce_or_enqueue_merge_request(
                         EventType.worktree_reaped,
                         task_id=req.task_id,
                         phase='merge',
-                        data={'branch': branch, 'path': str(wt), 'reason': 'stale_inflight'},
+                        data={'branch': branch, 'path': str(wt), 'reason': 'finalized_owner'},
                     )
                 # Fall through to acquire-and-enqueue below
+            else:
+                try:
+                    age = time.time() - wt.stat().st_mtime
+                except OSError:
+                    age = 0.0  # stat failed — treat as alive to be safe
+                if age <= liveness_secs:
+                    # ALIVE: coalesce without enqueuing or reaping.
+                    # No alias is registered here: the primary request_id belongs to
+                    # a different process, so there is no in-process registry entry
+                    # to alias onto.  Callers polling the coalesced id fall through
+                    # to the event-store / git-authority tiers on a ring miss.
+                    _emit_merge_coalesced(event_store, req, source='worktree', eta=None)
+                    return MergeDispatchResult(
+                        dispatched=False,
+                        in_flight=True,
+                        branch=branch,
+                        source='worktree',
+                    )
+                else:
+                    # STALE/ABANDONED: reap the abandoned worktree so a fresh merger
+                    # can be dispatched.  Foreign-process killing is deliberately out
+                    # of scope — there is no cwd-based kill utility in the repo
+                    # (terminate_process_group only handles procs the orchestrator
+                    # spawned), and git worktree remove --force removes the tree so
+                    # any orphaned build procs fail when their cwd vanishes.
+                    logger.warning(
+                        'coalesce_or_enqueue_merge_request: reaping stale '
+                        '_merge-* worktree %s for branch %r (age=%.0fs > liveness=%ss)',
+                        wt, branch, age, liveness_secs,
+                    )
+                    await git_ops.cleanup_merge_worktree(wt)
+                    if event_store is not None:
+                        event_store.emit(
+                            EventType.worktree_reaped,
+                            task_id=req.task_id,
+                            phase='merge',
+                            data={
+                                'branch': branch,
+                                'path': str(wt),
+                                'reason': 'stale_inflight',
+                            },
+                        )
+                    # Fall through to acquire-and-enqueue below
 
     # ── 3. Atomic acquire-and-enqueue ─────────────────────────────────
     if registry.acquire(branch, req.task_id, req.result, request_id=req.request_id):
