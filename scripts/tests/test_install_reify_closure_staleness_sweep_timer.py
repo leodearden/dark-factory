@@ -24,6 +24,12 @@ SCRIPT = Path(__file__).parent.parent / 'install-reify-closure-staleness-sweep-t
 TEMPLATES_DIR = Path(__file__).parent.parent
 REPO_ROOT = TEMPLATES_DIR.parent
 
+# The units name the PRODUCTION checkout absolutely, since systemd resolves
+# ExecStart/WorkingDirectory absolutely and the installed unit is a byte copy
+# of the committed one -- so these assertions must not be derived from
+# REPO_ROOT, which is a .worktrees/<id> path when the suite runs in a lane.
+PRODUCTION_ROOT = '/home/leo/src/dark-factory'
+
 SERVICE_NAME = 'reify-closure-staleness-sweep.service'
 TIMER_NAME = 'reify-closure-staleness-sweep.timer'
 
@@ -222,18 +228,34 @@ def test_timer_is_installed_into_timers_target():
 
 
 def test_service_is_a_thin_oneshot_around_the_committed_wrapper():
+    """Paths are the PRODUCTION checkout's, not this test run's.
+
+    systemd resolves ExecStart absolutely and the installed unit is a byte copy
+    of the committed one, so the unit must name /home/leo/src/dark-factory even
+    when these tests run from a worktree under .worktrees/.
+    """
     text = _unit(SERVICE_NAME)
     assert 'Type=oneshot' in text
-    assert f'ExecStart={REPO_ROOT}/scripts/reify-closure-staleness-sweep.sh' in text
-    assert f'WorkingDirectory={REPO_ROOT}' in text
+    assert (f'ExecStart={PRODUCTION_ROOT}/scripts/'
+            f'reify-closure-staleness-sweep.sh') in text
+    assert f'WorkingDirectory={PRODUCTION_ROOT}' in text
 
 
 def test_service_execstart_points_at_a_real_executable_wrapper():
+    """The wrapper named by ExecStart exists and is executable.
+
+    Checked against THIS checkout (the production path's scripts/ tail mapped
+    onto the tree under test) so the assertion is meaningful from a worktree
+    too -- what it pins is that the unit does not name a wrapper that was
+    renamed or never committed.
+    """
     text = _unit(SERVICE_NAME)
     exec_line = next(ln for ln in text.splitlines() if ln.startswith('ExecStart='))
-    wrapper = exec_line.split('=', 1)[1]
-    assert os.path.isfile(wrapper), wrapper
-    assert os.access(wrapper, os.X_OK), wrapper
+    named = exec_line.split('=', 1)[1]
+    assert named.startswith(f'{PRODUCTION_ROOT}/scripts/'), named
+    here = TEMPLATES_DIR / named.split('/scripts/', 1)[1]
+    assert here.is_file(), here
+    assert os.access(here, os.X_OK), here
 
 
 def test_service_documents_where_the_normative_contract_lives():
