@@ -592,6 +592,15 @@ git:
   # _lane- (warm-lane pool) or _spec- (merge-speculation pool).
   iact_prefix: "_iact-"
 
+# Deep merge-ahead chains (task 3183).  chain_cap is the single gate for the
+# whole feature: the maximum number of queued items one verify may cover as a
+# chain.  0 (shipped default) is the KILL SWITCH — byte-identical to pre-PRD
+# merge behaviour.  Green-tier hot-reloadable, so enable/retune/kill never needs
+# a restart; set it with scripts/merge-deep-set-cap.sh.  Dispatch contract and
+# cap-staging plan: plans/deep-merge-ahead-prd.md.
+merge_deep:
+  chain_cap: 0
+
 # Chronic pool-infra flake auto-file detector (task 2358). Gated OFF until
 # reify task 5142's flaky-ledger.jsonl + CHRONIC-FLAKY marker substrate is
 # confirmed on the target project's main (mirrors git.offline_lane_infra_enabled).
