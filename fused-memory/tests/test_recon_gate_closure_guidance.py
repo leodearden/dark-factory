@@ -1,12 +1,19 @@
 """Composition-contract tests for _GATE_CLOSURE_ARCHIVE_GUIDANCE (task 3023).
 
 Stage 1 emits the finding/flag and Stage 2 files the remediation task, so the
-"a pending-only escalation probe is not proof of absence" suppression policy is
-only sound if BOTH stages hold the identical rule.  These tests pin the WIRING
-(one shared constant, embedded verbatim in both assembled prompts and surviving
-both branches of ``build_stage2_system_prompt``) rather than the prose — the
-same shape as the existing ``_STAGE1_/_STAGE2_GRAPHITI_QUEUED_GUIDANCE``
-constants.  Prose may be reworded freely; the wiring may not silently break.
+deterministic-gate closure rule is only sound if BOTH stages hold it.  These
+tests pin the WIRING (one shared constant, embedded verbatim in both assembled
+prompts and surviving both branches of ``build_stage2_system_prompt``) rather
+than the prose — the same shape as the existing
+``_STAGE1_/_STAGE2_GRAPHITI_QUEUED_GUIDANCE`` constants.  Prose may be reworded
+freely; the wiring may not silently break.
+
+The guidance is rendered as a SUBSECTION of the shared escalation-store
+boundary note (``render_escalation_boundary_note``), not pasted as a second
+top-level block: the general claims — store identity, the denied escalation
+read tools, "an empty result is not evidence of absence" — belong to that note
+and must be stated once (INV-5).  ``TestGateClosureRidesTheBoundaryNote`` pins
+that composition and the negative that motivated it.
 
 ``TestReconStageEscalationServerIdentity`` pins the second wiring fact the
 guidance depends on: the ``escalation`` MCP server a recon stage holds is backed
@@ -31,12 +38,17 @@ import yaml
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import StageId
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
-from fused_memory.reconciliation.prompts import _GATE_CLOSURE_ARCHIVE_GUIDANCE
+from fused_memory.reconciliation.prompts import (
+    _GATE_CLOSURE_ARCHIVE_GUIDANCE,
+    ESCALATION_BOUNDARY_NOTE,
+    render_escalation_boundary_note,
+)
 from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 from fused_memory.reconciliation.prompts.stage2 import (
     STAGE2_SYSTEM_PROMPT,
     build_stage2_system_prompt,
 )
+from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 
 # The orchestrator's escalation queue — a DIFFERENT store from the
@@ -119,6 +131,25 @@ class TestGateClosureArchiveGuidance:
             '_GATE_CLOSURE_ARCHIVE_GUIDANCE.'
         )
 
+    def test_appears_exactly_once_per_prompt(self):
+        """Rendered via the boundary note only — never a second pasted copy.
+
+        Regression guard for the review finding this constant's original
+        wiring shipped: a separate top-level block that restated (and
+        contradicted) the shared boundary note.  It now rides along with that
+        note, so exactly one copy can reach any assembled prompt.
+        """
+        for name, prompt in (
+            ('STAGE1_SYSTEM_PROMPT', STAGE1_SYSTEM_PROMPT),
+            ('STAGE2_SYSTEM_PROMPT', STAGE2_SYSTEM_PROMPT),
+            ('STAGE3_SYSTEM_PROMPT', STAGE3_SYSTEM_PROMPT),
+        ):
+            assert prompt.count(_GATE_CLOSURE_ARCHIVE_GUIDANCE) == 1, (
+                f'{name} must carry the gate-closure guidance exactly once — a '
+                'second copy means it was pasted separately again instead of '
+                'riding on render_escalation_boundary_note().'
+            )
+
     # The "no bare report-tool call example without run_id" drift trap is NOT
     # duplicated here: test_recon_report_guidance_drift.py's
     # TestReconReportRunIdGuardOverAssembledPrompts already scans all five
@@ -126,6 +157,45 @@ class TestGateClosureArchiveGuidance:
     # build_stage2_system_prompt branches), each of which embeds this constant
     # verbatim by the very property the tests above assert — and it does so
     # with correct balanced-paren argument extraction.
+
+
+class TestGateClosureRidesTheBoundaryNote:
+    """The guidance is a subsection of ESCALATION_BOUNDARY_NOTE, not a rival block.
+
+    The shared note (task 3163) already states, once for all three stages, that
+    the stage's escalation connection serves the RECONCILIATION store, that the
+    escalation READ tools are not available here, that an empty escalation
+    result is not evidence of absence, and that "no escalation was filed for
+    task X" must never be reported.  The gate-closure guidance adds only the
+    POSITIVE closure rule and the incident lineage; restating the shared core —
+    or describing an escalation read as a probe the stage ran or could run —
+    is what the review that produced this suite rejected.
+    """
+
+    @pytest.mark.parametrize('can_escalate', [True, False])
+    def test_render_carries_both_core_and_gate_closure_once(self, can_escalate: bool):
+        """Both the shared core and the subsection appear exactly once per render."""
+        rendered = render_escalation_boundary_note(can_escalate=can_escalate)
+
+        assert rendered.count(ESCALATION_BOUNDARY_NOTE) == 1
+        assert rendered.count(_GATE_CLOSURE_ARCHIVE_GUIDANCE) == 1, (
+            'render_escalation_boundary_note must emit the gate-closure guidance '
+            'as part of the boundary note (INV-5: one source for the shared core).'
+        )
+
+    def test_does_not_present_a_denied_escalation_read_as_a_probe(self):
+        """No stage holds `get_pending_escalations` — never describe it as usable.
+
+        ``DISALLOW_ESCALATION_READS`` (cli_stage_runner.py) denies the
+        escalation read tools in every stage and the denial OMITS them from the
+        agent's tool listing, so prose presenting one as the probe the auditor
+        ran contradicts the agent's own tool surface.
+        """
+        assert 'get_pending_escalations' not in _GATE_CLOSURE_ARCHIVE_GUIDANCE, (
+            'The gate-closure guidance must not name get_pending_escalations: no '
+            'recon stage holds it, and the shared boundary note already covers '
+            'why an empty escalation result proves nothing.'
+        )
 
 
 class TestReconStageEscalationServerIdentity:

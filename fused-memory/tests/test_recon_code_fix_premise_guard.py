@@ -625,8 +625,10 @@ class TestSeedRegistryRealSource:
       HERE, not in the stage modules, because the guidance is a constant
       interpolated into each stage's f-string.
     - src/fused_memory/reconciliation/prompts/stage2.py contains
-      "_GATE_CLOSURE_ARCHIVE_GUIDANCE" — the guidance is wired into the stage
-      that files remediation tasks.
+      "render_escalation_boundary_note(can_escalate=True)" — the guidance is
+      wired into the stage that files remediation tasks. It rides along with
+      the shared escalation-store boundary note (rendered as a subsection of
+      it), so that render call is the wiring token, not the constant name.
     """
 
     # tests/test_recon_code_fix_premise_guard.py -> tests/ -> fused-memory/

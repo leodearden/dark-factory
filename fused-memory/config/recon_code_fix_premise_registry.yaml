@@ -131,10 +131,14 @@
     ReconciliationConfig.escalation_queue_dir), a different store from
     data/escalations (port 8102, dark-factory-orchestrator.yaml), so no
     mcp__escalation__* result available to a stage can establish absence. Task
-    3023 therefore points Stage 1 / Stage 2 at that queue split and makes the
-    POSITIVE rule primary and sufficient: status='done' PLUS
-    metadata.gate_escalated_at PLUS a deterministic-gate done_provenance, read
-    via mcp__fused-memory__get_task, IS legitimate closure. Any recurrence
+    3023 therefore makes the POSITIVE rule primary and sufficient: status='done'
+    PLUS metadata.gate_escalated_at PLUS a deterministic-gate done_provenance,
+    read via mcp__fused-memory__get_task, IS legitimate closure. That rule is
+    rendered as a subsection of the shared escalation-store boundary note
+    (render_escalation_boundary_note, prompts/__init__.py) — which already
+    states the queue split and "an empty escalation result is not evidence of
+    absence" once for all three stages — rather than as a second block
+    restating it. Any recurrence
     should be dropped without an LLM call while the archive-inclusive scan and
     that guidance remain in place. Anchored on assertion-of-absence phrasings
     only (NOT a bare "gate_escalated_at" token), so a legitimate proposal to
@@ -180,9 +184,12 @@
         - "_GATE_CLOSURE_ARCHIVE_GUIDANCE"
         - "get_task_escalations"
     # ...and the guidance is actually WIRED INTO the stage that files
-    # remediation tasks. Unwiring it also self-corrects the guard, so the
-    # candidate is only dropped while an auditor genuinely had the
-    # disconfirming instruction in front of it.
+    # remediation tasks. It is rendered as a subsection of the shared
+    # escalation-store boundary note (render_escalation_boundary_note), not
+    # pasted separately, so the wiring token to pin in stage2.py is that render
+    # call. Unwiring it also self-corrects the guard, so the candidate is only
+    # dropped while an auditor genuinely had the disconfirming instruction in
+    # front of it.
     - file: src/fused_memory/reconciliation/prompts/stage2.py
       must_contain:
-        - "_GATE_CLOSURE_ARCHIVE_GUIDANCE"
+        - "render_escalation_boundary_note(can_escalate=True)"
