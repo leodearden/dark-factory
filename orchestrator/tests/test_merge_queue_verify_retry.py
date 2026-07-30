@@ -30,20 +30,35 @@ if TYPE_CHECKING:
 
 
 def _attempt0(tree_oid: str):
-    """A fixture attempt-0 payload with fail-fast-cancelled tests per profile."""
+    """An attempt-0 payload shaped exactly as _build_attempt0_payload builds one.
+
+    Ids are in ``parse_per_test_results``' key space (``"<binary-id> <test-name>"``)
+    so the filter-file assertions below exercise the real ``nextest_filter_ids``
+    mapping.  Only the FIRST profile (debug) is populated; release carries the
+    empty subset a later profile always gets.
+    """
     from orchestrator.merge_queue import _Attempt0Payload
 
     return _Attempt0Payload(
         tree_oid=tree_oid,
         profiles=('debug', 'release'),
-        # debug: 'c a::z' cancelled by fail-fast (absent from verdicts) → not-started
-        debug_planned=['c a::x', 'c a::y', 'c a::z'],
-        debug_verdicts={'c a::x': 'pass', 'c a::y': 'fail'},
-        # release: 'c b::q' cancelled → not-started
-        release_planned=['c b::p', 'c b::q'],
-        release_verdicts={'c b::p': 'pass'},
-        run_all_members=['mem_fail'],
-        gui_specs=['ui/x.ts'],
+        # 'alpha::test_two' and 'test_end_to_end' are absent from verdicts —
+        # fail-fast cancelled them, so they are 'not-started' and MUST re-run.
+        debug_planned=[
+            'crate-a alpha::test_one',
+            'crate-a alpha::test_two',
+            'crate-a beta::test_three',
+            'crate-a::integration test_end_to_end',
+        ],
+        debug_verdicts={
+            'crate-a alpha::test_one': 'pass',
+            'crate-a beta::test_three': 'fail',
+        },
+        # A LATER profile is never narrowed on first-profile evidence.
+        release_planned=[],
+        release_verdicts={},
+        run_all_members=['test_skip_ledger.sh'],
+        gui_specs=[],
     )
 
 
@@ -54,11 +69,14 @@ def _git_ops_returning(oid: str | None):
 
 
 @pytest.mark.asyncio
-async def test_assemble_retry_verify_env_tree_pinned(tmp_path: Path) -> None:
-    """Case A: current tree OID matches attempt-0 → build the retry env.
+async def test_assemble_retry_verify_env_subset_is_failed_union_not_started(
+    tmp_path: Path,
+) -> None:
+    """(a) The first profile's subset is {failed ∪ not-started}, NOT {failed}.
 
-    The nextest filter files carry the {did-not-pass} ids (failed ∪ not-started),
-    demonstrating the soundness core end-to-end through the gate.
+    Under nextest fail-fast a failing attempt-0 CANCELS the not-yet-started
+    tests, so they are absent from the verdicts.  A failed-only filter would
+    silently never re-run them.
     """
     from orchestrator.merge_queue import _assemble_retry_verify_env
 
@@ -67,45 +85,135 @@ async def test_assemble_retry_verify_env_tree_pinned(tmp_path: Path) -> None:
     env = await _assemble_retry_verify_env(git_ops, req, tmp_path, _attempt0('abc123'))
 
     assert env is not None
-    assert env['REIFY_VERIFY_RETRY_SCOPE'] == 'failed_only'
-    assert env['REIFY_VERIFY_RETRY_TREE_OID'] == 'abc123'
-
     debug_path = Path(env['REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_DEBUG'])
-    release_path = Path(env['REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_RELEASE'])
     assert tmp_path in debug_path.parents  # written under merge_wt
-    # {did-not-pass} = failed ∪ not-started (NOT just failed).
-    assert debug_path.read_text() == 'c a::y\nc a::z'
-    assert release_path.read_text() == 'c b::q'
+    lines = debug_path.read_text().splitlines()
+
+    # 'beta::test_three' FAILED; 'alpha::test_two' and 'test_end_to_end' were
+    # fail-fast CANCELLED.  All three re-run.
+    assert set(lines) == {'alpha::test_two', 'beta::test_three', 'test_end_to_end'}
+    # 'alpha::test_one' PASSED — it must NOT be in the subset.
+    assert 'alpha::test_one' not in lines
     git_ops.get_head_tree_hash.assert_awaited_once_with(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_assemble_retry_verify_env_filter_lines_are_bare_test_names(
+    tmp_path: Path,
+) -> None:
+    """(b) Filter-file lines are BARE nextest names, never DF's parse keys.
+
+    EMPIRICAL BASIS (cargo-nextest 0.9.136, the version reify's merge gate
+    runs): `test(=beta::test_three)` MATCHES, `test(=crate-a beta::test_three)`
+    matches NOTHING.  reify wraps each line as `test(=<line>)`
+    (verify.sh emit_nextest_pass), so a file of full parse keys is non-empty —
+    reify's "retry refused: no subset" loud fallback therefore never fires —
+    and matches ZERO tests: a narrowed retry that runs nothing and reports PASS.
+    A FALSE GREEN, strictly worse than not narrowing at all.
+    """
+    from orchestrator.merge_queue import _assemble_retry_verify_env
+
+    git_ops = _git_ops_returning('abc123')
+    req = cast('MergeRequest', SimpleNamespace(task_id='t-b', retry_failed_only=True))
+    env = await _assemble_retry_verify_env(git_ops, req, tmp_path, _attempt0('abc123'))
+
+    assert env is not None
+    debug_path = Path(env['REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_DEBUG'])
+    for line in debug_path.read_text().splitlines():
+        # A parse key is "<binary-id> <test-name>"; a bare name has no space.
+        assert ' ' not in line, (
+            f'filter line {line!r} still carries the parse-key form — '
+            'nextest would match ZERO tests and the retry would FALSE-GREEN'
+        )
+
+
+@pytest.mark.asyncio
+async def test_assemble_retry_verify_env_later_profile_file_is_empty(
+    tmp_path: Path,
+) -> None:
+    """(c) The later profile's filter file EXISTS and is EMPTY.
+
+    An empty per-profile filter file is exactly reify's loud per-profile
+    "retry refused: no subset" FULL-fallback trigger, so a profile whose
+    attempt-0 pass never ran degrades loudly rather than being skipped.
+    """
+    from orchestrator.merge_queue import _assemble_retry_verify_env
+
+    git_ops = _git_ops_returning('abc123')
+    req = cast('MergeRequest', SimpleNamespace(task_id='t-c', retry_failed_only=True))
+    env = await _assemble_retry_verify_env(git_ops, req, tmp_path, _attempt0('abc123'))
+
+    assert env is not None
+    release_path = Path(env['REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_RELEASE'])
+    assert release_path.exists()
+    assert release_path.read_text() == ''
+
+
+@pytest.mark.asyncio
+async def test_assemble_retry_verify_env_tree_oid_is_the_corroborated_oid(
+    tmp_path: Path,
+) -> None:
+    """(e) REIFY_VERIFY_RETRY_TREE_OID is the DOUBLY-corroborated OID.
+
+    Both arms agree here: DF's own `git_ops.get_head_tree_hash` read and
+    reify's independent `git rev-parse HEAD:` stamp from the sidecar.
+    """
+    from orchestrator.merge_queue import _assemble_retry_verify_env
+
+    git_ops = _git_ops_returning('abc123')
+    req = cast('MergeRequest', SimpleNamespace(task_id='t-e', retry_failed_only=True))
+    env = await _assemble_retry_verify_env(git_ops, req, tmp_path, _attempt0('abc123'))
+
+    assert env is not None
+    assert env['REIFY_VERIFY_RETRY_TREE_OID'] == 'abc123'
+    assert env['REIFY_VERIFY_RETRY_SCOPE'] == 'failed_only'
 
 
 @pytest.mark.asyncio
 async def test_assemble_retry_verify_env_rebased_returns_none(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Case B: a rebased tree (OID mismatch) → None + WARNING; defer to full verify."""
+    """(d) A rebased tree — DF's read disagrees with the SIDECAR's — → None + WARNING.
+
+    The two arms are genuinely independent reads of the same fact, so a
+    disagreement means the tree moved under the retry.  Falls back to the
+    existing M4 _reverify_rebased_tree FULL re-verify route.
+    """
     from orchestrator.merge_queue import _assemble_retry_verify_env
 
     git_ops = _git_ops_returning('different-oid')
     req = cast('MergeRequest', SimpleNamespace(task_id='t-2', retry_failed_only=True))
     with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
-        env = await _assemble_retry_verify_env(git_ops, req, tmp_path, _attempt0('abc123'))
+        env = await _assemble_retry_verify_env(
+            git_ops, req, tmp_path, _attempt0('abc123')
+        )
 
     assert env is None
-    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    warnings = _mq_warnings(caplog)
     assert any('full verify' in m for m in warnings), warnings
     assert any(('rebas' in m or 'does not match' in m) for m in warnings), warnings
 
 
 @pytest.mark.asyncio
-async def test_assemble_retry_verify_env_unknown_tree_returns_none(tmp_path: Path) -> None:
-    """Case C: get_head_tree_hash returns None → None (fail-safe full verify)."""
+async def test_assemble_retry_verify_env_unknown_tree_returns_none(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """(d) DF's own arm returning None → None (fail-safe full verify).
+
+    An unreadable OID is not a match — it is an absence of corroboration, and
+    the retry must not proceed on one arm alone.
+    """
     from orchestrator.merge_queue import _assemble_retry_verify_env
 
     git_ops = _git_ops_returning(None)
     req = cast('MergeRequest', SimpleNamespace(task_id='t-3', retry_failed_only=True))
-    env = await _assemble_retry_verify_env(git_ops, req, tmp_path, _attempt0('abc123'))
+    with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        env = await _assemble_retry_verify_env(
+            git_ops, req, tmp_path, _attempt0('abc123')
+        )
+
     assert env is None
+    assert any('full verify' in m for m in _mq_warnings(caplog))
 
 
 def test_build_retry_verify_env_writes_filter_files_and_env(tmp_path: Path) -> None:
