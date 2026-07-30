@@ -233,6 +233,170 @@ class TestEscalationEnabled:
     not sve_mod.HAS_ESCALATION,
     reason='escalation package not installed in this environment',
 )
+class TestAdvisoryVsRejectionWording:
+    """Task 3119: ``report_rejection`` serves BOTH path-guard outcomes, so its
+    wording must say which one actually happened.
+
+    The path guard has two outcomes since task 2206: a FILES-certain hard
+    reject (no task created, error dict returned) and a PROSE-only advisory
+    (task CREATED and stamped with ``metadata.possible_scope_mismatch``,
+    nothing blocked).  Both funnel through ``report_rejection``, which used to
+    hardcode rejection wording — so every advisory told the operator (and the
+    agent reading it in a briefing) that a task had been rejected when it had
+    not.  These tests pin the PAIR: advisory wording says CREATED, rejection
+    wording is unchanged.
+    """
+
+    @staticmethod
+    def _payloads(root):
+        """Return the escalation payloads written under *root* (sorted by id)."""
+        files = sorted((root / 'data' / 'escalations').glob('esc-*.json'))
+        return [json.loads(f.read_text()) for f in files]
+
+    def _one_payload(self, root):
+        payloads = self._payloads(root)
+        assert len(payloads) == 1, f'expected exactly one escalation, found: {payloads}'
+        return payloads[0]
+
+    def test_advisory_summary_states_created_not_rejected(self, tmp_path):
+        """The advisory summary must NOT say 'rejected' — nothing was rejected."""
+        esc = ScopeViolationEscalator()
+        esc_id = esc.report_rejection(
+            project_root=str(tmp_path),
+            project_id='reify',
+            candidate_title='Rework the gui panel',
+            matched_paths=('gui/',),
+            suggested_project='reify_gui',
+            advisory=True,
+        )
+        assert esc_id is not None
+        payload = self._one_payload(tmp_path)
+        summary = payload['summary']
+        assert 'ADVISORY' in summary, summary
+        assert 'CREATED' in summary, summary
+        assert 'gui/' in summary, summary
+        assert 'reify_gui' in summary, summary
+        # THE mislabel this task exists to kill: an advisory that says the
+        # submission was rejected, when in fact the task was created.
+        assert 'reject' not in summary.lower(), (
+            f'advisory summary must not claim a rejection: {summary!r}'
+        )
+
+    def test_advisory_detail_explains_not_blocked_and_names_stamp(self, tmp_path):
+        """Advisory detail: not blocked, task created, names the metadata stamp.
+
+        Also pins that the advisory branch replaces ONLY the closing prose
+        paragraph — the structured routing context an operator needs to act on
+        must survive untouched.
+        """
+        esc = ScopeViolationEscalator()
+        esc.report_rejection(
+            project_root=str(tmp_path),
+            project_id='reify',
+            candidate_title='Rework the gui panel',
+            matched_paths=('gui/',),
+            suggested_project='reify_gui',
+            advisory=True,
+        )
+        detail = self._one_payload(tmp_path)['detail']
+        # The submission was NOT blocked and the task WAS created.
+        assert 'NOT blocked' in detail, detail
+        assert 'WAS created' in detail, detail
+        # Named verbatim so the operator can grep the created task's metadata.
+        assert 'possible_scope_mismatch' in detail, detail
+        # No resubmission is required — the task already exists.
+        assert 'no resubmission' in detail.lower(), detail
+        assert 'was rejected' not in detail, (
+            f'advisory detail must not claim a rejection: {detail!r}'
+        )
+        # Structured routing context survives unchanged.
+        for field in (
+            'candidate_title=',
+            'rejecting_project_id=',
+            'matched_paths=',
+            'suggested_project=',
+        ):
+            assert field in detail, f'advisory detail dropped {field!r}: {detail!r}'
+
+    def test_advisory_suggested_action_is_not_resubmit(self, tmp_path):
+        """suggested_action is rendered verbatim into agent briefings.
+
+        ``orchestrator/agents/briefing.py`` prints it as "Suggested action:
+        resubmit_to_<project>" — a directly actionable instruction that
+        contradicts "you were not blocked" and is the specific behaviour agents
+        were observed acting on.  An advisory must not tell anyone to resubmit.
+        """
+        esc = ScopeViolationEscalator()
+        esc.report_rejection(
+            project_root=str(tmp_path),
+            project_id='reify',
+            candidate_title='Rework the gui panel',
+            matched_paths=('gui/',),
+            suggested_project='reify_gui',
+            advisory=True,
+        )
+        payload = self._one_payload(tmp_path)
+        assert payload['suggested_action'] == 'no_action_advisory_only', payload
+        assert 'resubmit' not in payload['suggested_action']
+
+    def test_rejection_wording_and_action_unchanged(self, tmp_path):
+        """The other half of the pair: the FILES-certain path is untouched.
+
+        Regression anchor — passes before the change and must keep passing
+        after it.  The rejection wording is CORRECT today (a task really was
+        rejected), so this change must not touch it.
+        """
+        esc = ScopeViolationEscalator()
+        esc.report_rejection(
+            project_root=str(tmp_path),
+            project_id='reify',
+            candidate_title='Edit fused-memory/X',
+            matched_paths=('fused-memory/',),
+            suggested_project='dark_factory',
+        )
+        payload = self._one_payload(tmp_path)
+        assert payload['summary'].startswith('Misrouted task rejected: cites '), payload
+        assert 'was rejected' in payload['detail'], payload
+        assert payload['suggested_action'] == 'resubmit_to_dark_factory', payload
+
+    def test_both_modes_are_severity_info(self, tmp_path):
+        """Both modes stay severity='info' — there is no tier below it.
+
+        ``escalation.models`` defines the severity vocabulary as
+        ``blocking | info | critical | urgent``, so 'info' is already the floor
+        and the advisory cannot drop lower.  The wording (above) is the
+        load-bearing correction, not the severity.
+        """
+        # Separate roots so the two modes cannot interact through dedup.
+        rejection_root = tmp_path / 'rejection'
+        advisory_root = tmp_path / 'advisory'
+        esc = ScopeViolationEscalator()
+        esc.report_rejection(
+            project_root=str(rejection_root),
+            project_id='reify',
+            candidate_title='Edit fused-memory/X',
+            matched_paths=('fused-memory/',),
+            suggested_project='dark_factory',
+        )
+        esc.report_rejection(
+            project_root=str(advisory_root),
+            project_id='reify',
+            candidate_title='Edit fused-memory/X',
+            matched_paths=('fused-memory/',),
+            suggested_project='dark_factory',
+            advisory=True,
+        )
+        for root in (rejection_root, advisory_root):
+            payload = self._one_payload(root)
+            assert payload['severity'] == 'info', (root, payload)
+            assert payload['category'] == 'scope_violation', (root, payload)
+            assert payload['agent_role'] == 'fused-memory/path-guard', (root, payload)
+
+
+@pytest.mark.skipif(
+    not sve_mod.HAS_ESCALATION,
+    reason='escalation package not installed in this environment',
+)
 class TestBudgetMisconfigEscalation:
     """ScopeViolationEscalator.report_budget_misconfig() — loud config-defect signal."""
 
