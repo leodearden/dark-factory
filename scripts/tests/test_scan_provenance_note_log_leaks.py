@@ -21,7 +21,10 @@ ABRIDGEMENT reproduced from the plan's analysis, never a live re-read.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import subprocess
+from pathlib import Path
 
 from scan_provenance_note_log_leaks import (
     NoteLeakMatch,
@@ -321,3 +324,80 @@ class TestFormatting:
         assert payload[0]['task_id'] == 2902
         assert payload[0]['leak_line'] == self.LONG_LINE
         assert payload[0]['provenance_kind'] == 'deterministic-milestone'
+
+    def test_format_json_empty_list_is_empty_array(self):
+        assert json.loads(format_json([])) == []
+
+
+# ---------------------------------------------------------------------------
+# CLI (main), driven via subprocess.run — mirrors the precedent suite.
+# ---------------------------------------------------------------------------
+
+SCRIPT = Path(__file__).parent.parent / 'scan_provenance_note_log_leaks.py'
+
+
+def _run_cli(*args, env=None, timeout=30):
+    child_env = {**os.environ, **(env or {})}
+    return subprocess.run(
+        ['python3', str(SCRIPT), *args],
+        capture_output=True, text=True, timeout=timeout, env=child_env,
+    )
+
+
+class TestCli:
+    """Exit codes: 0 = clean, 1 = leak found, 2 = no tasks.db resolvable."""
+
+    def test_clean_db_exits_0_with_no_leaks_message(self, tmp_path):
+        db_path = _make_db(tmp_path, [(1, _provenance('merged', commit='abc'))])
+
+        result = _run_cli('--db', db_path)
+
+        assert result.returncode == 0, result.stderr
+        assert 'no leaked log lines' in result.stdout
+
+    def test_polluted_db_exits_1_and_names_the_task(self, tmp_path):
+        db_path = _make_db(tmp_path, _MIXED_ROWS)
+        before = Path(db_path).read_bytes()
+
+        result = _run_cli('--db', db_path)
+
+        assert result.returncode == 1, result.stderr
+        assert '2902' in result.stdout
+        # Detection-only: the scan must not have touched the file.
+        assert Path(db_path).read_bytes() == before
+
+    def test_json_flag_emits_full_untruncated_leak_line(self, tmp_path):
+        db_path = _make_db(tmp_path, _MIXED_ROWS)
+
+        result = _run_cli('--db', db_path, '--json')
+
+        assert result.returncode == 1, result.stderr
+        payload = json.loads(result.stdout)
+        assert len(payload) == 1
+        assert payload[0]['task_id'] == 2902
+        # The FULL line, not the report's truncation.
+        assert payload[0]['leak_line'] in POLLUTED_NOTE
+        assert '...' not in payload[0]['leak_line']
+
+    def test_no_resolvable_db_exits_2(self, tmp_path):
+        result = _run_cli(
+            '--db', str(tmp_path / 'nonexistent' / 'tasks.db'),
+            env={'DASHBOARD_KNOWN_PROJECT_ROOTS': ''},
+        )
+
+        assert result.returncode == 2
+        assert 'no tasks.db resolvable' in result.stderr
+
+    def test_unreadable_db_is_warned_and_skipped_not_fatal(self, tmp_path):
+        """One corrupt file must not abort the sweep over the others."""
+        corrupt = tmp_path / 'corrupt.db'
+        corrupt.write_text('this is not a sqlite database at all')
+        good = _make_db(tmp_path, _MIXED_ROWS, name='good.db')
+
+        result = _run_cli('--db', str(corrupt), '--db', good)
+
+        # The good db was still scanned and its leak still reported.
+        assert result.returncode == 1, result.stderr
+        assert '2902' in result.stdout
+        assert 'corrupt.db' in result.stderr
+        assert 'incomplete' in result.stderr
