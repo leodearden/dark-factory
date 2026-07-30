@@ -1,0 +1,33 @@
+CONTRACT EXCERPT — verbatim from /home/leo/src/reify/tests/infra/run_all.sh:26-36
+(copied byte-for-byte; do not reword. See PROVENANCE.md.)
+
+# Output: After the "=== Summary: N discovered, M failed ===" line, if any
+# tests failed, two lines are emitted:
+#   "=== FAILED: <space-separated names> ===" — human-readable failure summary
+#     so the tail of captured merge-gate output is attributable without re-running.
+#   "FAILED <space-separated names>" — bare classifier marker that matches the
+#     dark-factory verify.py `^FAILED\s` -> test_failure regex (pattern #7b),
+#     checked before pattern #10 `tree-sitter generate` -> tree_sitter_generate_error.
+#     Without this marker a pure infra-suite failure falls through to
+#     tree_sitter_generate_error, triggering a thrash-escalating L1 merge
+#     escalation; with it the failure is reclassified as test_failure and handled
+#     by the normal debugger path.
+
+Emission site (run_all.sh:1839-1841), also verbatim:
+
+if [ "${#failed_names[@]}" -gt 0 ]; then
+    echo "=== FAILED: ${failed_names[*]} ==="
+    printf 'FAILED %s\n' "${failed_names[*]}"
+
+SYNTHETIC TAIL — below this line the bytes are NOT captured from a run. They use
+the exact line format the two source sites above emit, and nothing else.
+
+--- Running: test_worktree_lifecycle.sh ---
+  RESULT: FAIL (test_worktree_lifecycle.sh)
+--- Running: test_merge_gate.sh ---
+  RESULT: PASS (test_merge_gate.sh)
+--- Running: test_skip_ledger.sh ---
+  RESULT: FAIL (test_skip_ledger.sh)
+=== Summary: 3 discovered, 2 failed ===
+=== FAILED: test_worktree_lifecycle.sh test_skip_ledger.sh ===
+FAILED test_worktree_lifecycle.sh test_skip_ledger.sh

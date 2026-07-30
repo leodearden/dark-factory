@@ -44,3 +44,93 @@ Load-bearing facts a reader must not re-derive from prose:
   actually executed.
 
 ---
+
+## `nextest-list.json`
+
+| | |
+|---|---|
+| **Grounding** | **Captured run** |
+| **Producer** | `cargo nextest list --workspace --message-format json` |
+| **Version** | cargo-nextest **0.9.136** (`1d5bf1ec9 2026-05-16`) — the version reify's merge gate runs on this host |
+| **Captured** | 2026-07-30, from a throwaway two-crate workspace (no reify lane with warm binaries was available to list without a compile) |
+
+The workspace was synthetic; **the JSON was not** — it is unmodified
+cargo-nextest output. Shape that matters, and that the parser is pinned to:
+
+* top-level `rust-suites`, an object **keyed by suite id**;
+* each suite value carries `binary-id` and a `testcases` object **keyed by bare
+  test name**;
+* top-level `test-count` equals the total number of testcases.
+
+Capture covers 3 suites / 5 tests, including a lib suite, an integration-test
+suite (`crate-a::integration`), and two crates sharing a leaf test name — so the
+parser's suite-qualification and de-duplication paths are exercised by real
+bytes rather than a hand-written one-suite stub.
+
+### The empirical result that forced this fixture
+
+Run against the same 0.9.136 binary:
+
+```
+cargo nextest list -E 'test(=mymod::mytest)'          -> MATCHES
+cargo nextest list -E 'test(=nxprobe mymod::mytest)'  -> MATCHES NOTHING
+```
+
+reify wraps every filter-file line as `test(=<line>)` (`verify.sh`
+`emit_nextest_pass`). So writing DF's `"<binary-id> <test-name>"` parse key into
+a filter file yields a file that is **non-empty** (reify's "retry refused: no
+subset" loud fallback therefore never fires) and matches **zero tests** — a
+narrowed retry that runs nothing and reports PASS. That is a latent **FALSE
+GREEN**, strictly worse than the inertness the task names. Filter files must
+carry the **bare test name**; `merge_shadow.nextest_filter_ids` performs that
+mapping at the single write boundary.
+
+---
+
+## `run_all-failed-marker.txt`
+
+| | |
+|---|---|
+| **Grounding** | **Contract-derived from source** — *weaker* than the two above. Read this before trusting it. |
+| **Source** | `/home/leo/src/reify/tests/infra/run_all.sh:26-36` (documented contract) and `:1839-1841` (the emitting `echo`/`printf`) |
+| **Read** | 2026-07-30 |
+
+This is **not a captured run**. The header block and the emission site are
+copied verbatim from run_all.sh; the tail below the marked divider is synthetic
+and uses only the two line formats those sites emit. It is grounded in producer
+*source* rather than producer *output*, so a drift in run_all.sh's behaviour
+that does not touch those lines would not be caught here. If a real failing
+run_all log becomes available, prefer re-capturing over keeping this.
+
+Corroboration that the bare `FAILED <names>` line is real and already consumed:
+DF's own `verify.py` classifies it today via the `^FAILED\s` regex (pattern
+\#7b), which run_all.sh cites by name.
+
+### Known producer variant NOT handled by the current parser
+
+`run_all.sh:684-685` emits a **partial** marker when an outer timeout SIGTERMs
+the run mid-flight:
+
+```
+    echo "=== FAILED: ${_names} (partial) ==="
+    printf 'FAILED %s(partial)\n' "${_names:+$_names }"
+```
+
+`parse_failed_run_all_members` implements the documented
+`FAILED <space-separated names>` contract only, so against a partial marker it
+would return the literal token `(partial)` alongside the real member names.
+That degrades **safely** — run_all.sh warns
+`REIFY_RUN_ALL_MEMBER_SUBSET member '(partial)' not found in $INFRA_DIR
+(ignored)` and skips it — but it is noise, and it is recorded here rather than
+silently absorbed. Handling it is out of scope for task 3059 (filed as
+follow-up).
+
+---
+
+## Deliberately absent: a gui / vitest fixture
+
+`REIFY_GUI_RETRY_SPECS` ships **empty** in this leaf, which `verify.sh:2127-2158`
+treats as "run the full `npm test` suite" — unambiguously safe. No real reify
+gui failure log was available to pin a fixture to, and authoring one from prose
+is precisely the drift class this task corrects. A follow-up captures real gui
+bytes and adds the parser; until then there is no gui subset to get wrong.
