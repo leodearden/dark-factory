@@ -1800,66 +1800,111 @@ async def _assemble_retry_verify_env(
     )
 
 
-# reify writes the attempt-0 sidecar here (under the same .reify-verify-retry
-# subdir the filter files land in).  reify owns the authoritative schema (the
-# verify-retry-failed-only α/β/γ tasks); this DF reader is deliberately tolerant
-# and the whole retry path stays a no-op until reify lands and writes one.
-_ATTEMPT0_SIDECAR_NAME = 'attempt0.json'
+# reify's attempt-0 sidecar — the REAL one, relative to the worktree root.
+#
+# Producer: reify ``scripts/verify.sh`` ``add_test_passes()``, which stamps it as
+# its FIRST plan line so the pin survives a RED psi-gate / compile-gate / nextest
+# pole (reify task 5548).  ``verify.sh:738`` defines the path as
+# ``_ATTEMPT_SIDECAR_PATH="${REIFY_VERIFY_ATTEMPT_SIDECAR:-target/reify-verify-attempt.json}"``.
+#
+# Schema (exactly three keys; see tests/fixtures/reify_verify_retry/ for the
+# verbatim captured bytes and PROVENANCE.md)::
+#
+#     {"tree_oid": "<git rev-parse HEAD:>",
+#      "profiles": "debug release",          # SPACE-DELIMITED STRING, not a list
+#      "timestamp": "2026-07-30T04:56:41Z"}
+#
+# ``profiles`` records what the attempt PLANNED to run — because the stamp
+# precedes the test poles, it is NEVER proof that a profile actually executed.
+# That is precisely why only the FIRST profile may be narrowed (see
+# :func:`_build_attempt0_payload`).
+#
+# ``tree_oid`` is reify's own ``git rev-parse HEAD:`` — the same value DF's
+# ``git_ops.get_head_tree_hash`` produces, which is what makes the INV-3
+# corroboration two genuinely INDEPENDENT reads rather than one read twice.
+_REIFY_ATTEMPT_SIDECAR_RELPATH = 'target/reify-verify-attempt.json'
+
+# The cargo profiles DF can emit a per-profile nextest filter-file env key for.
+# A `profiles` value naming anything outside this set aborts to a full verify:
+# there is no REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_<X> key for a third
+# profile, so DF could not satisfy reify's "a filter file for EVERY profile
+# named in `profiles`, or fall back to a full verify" obligation
+# (verify.sh:219-230), and silently ignoring it would narrow a profile whose
+# attempt-0 pass never ran.
+_KNOWN_REIFY_PROFILES = frozenset({'debug', 'release'})
 
 
-def _load_attempt0_sidecar(merge_wt: Path) -> _Attempt0Payload | None:
-    """Tolerantly load the reify-written attempt-0 sidecar under ``merge_wt``.
+@dataclasses.dataclass(frozen=True)
+class _ReifyAttemptSidecar:
+    """The parsed contents of reify's ``target/reify-verify-attempt.json``.
 
-    Returns the parsed :class:`_Attempt0Payload`, or None (leaving the caller to
-    run a full verify) when the sidecar is absent, unreadable, malformed, or
-    missing the required ``tree_oid`` — never raises.  This tolerant degradation
-    is what keeps the failed-only retry a strict no-op until reify's α/β/γ land.
-
-    Expected JSON shape (reify-owned, read defensively)::
-
-        {"tree_oid": "<oid>",
-         "debug":   {"planned": [...], "verdicts": {...}},
-         "release": {"planned": [...], "verdicts": {...}},
-         "run_all_members": [...],
-         "gui_specs": [...]}
+    Fields:
+        tree_oid: reify's ``git rev-parse HEAD:`` stamp for the attempt-0 tree.
+        profiles: the cargo profiles attempt-0 PLANNED to run, in the order
+            reify named them (the sidecar's space-delimited ``profiles``
+            string, split).  Never proof a profile executed.
     """
-    path = Path(merge_wt) / _RETRY_FILTER_SUBDIR / _ATTEMPT0_SIDECAR_NAME
+
+    tree_oid: str
+    profiles: tuple[str, ...]
+
+
+def _load_reify_attempt_sidecar(merge_wt: Path) -> _ReifyAttemptSidecar | None:
+    """Tolerantly load reify's attempt-0 sidecar from ``merge_wt``.
+
+    Never raises.  Returns None — routing the caller to a FULL verify — when the
+    sidecar is absent, unreadable, not JSON, not an object, missing ``tree_oid``,
+    carries an empty/whitespace-only ``profiles``, or names a profile outside
+    :data:`_KNOWN_REIFY_PROFILES`.
+
+    Args:
+        merge_wt: the merge worktree root the sidecar path is relative to.
+
+    Returns:
+        The parsed :class:`_ReifyAttemptSidecar`, or None.
+    """
+    path = Path(merge_wt) / _REIFY_ATTEMPT_SIDECAR_RELPATH
     try:
         raw = path.read_text()
     except OSError:
-        # Absent sidecar is the common (pre-reify) case — no warning, just no-op.
+        # An absent sidecar is an ordinary outcome (non-reify project, or a
+        # verify that died before add_test_passes) — no warning, just full.
         return None
     try:
         data = json.loads(raw)
     except (ValueError, TypeError) as exc:
         logger.warning(
-            'attempt-0 sidecar at %s is not valid JSON (%s) — full verify', path, exc,
+            'reify attempt-0 sidecar at %s is not valid JSON (%s) — full verify',
+            path, exc,
         )
         return None
     if not isinstance(data, dict) or 'tree_oid' not in data:
         logger.warning(
-            'attempt-0 sidecar at %s missing tree_oid / not an object — full verify',
-            path,
+            'reify attempt-0 sidecar at %s missing tree_oid / not an object '
+            '— full verify', path,
         )
         return None
-    try:
-        debug = data.get('debug') or {}
-        release = data.get('release') or {}
-        return _Attempt0Payload(
-            tree_oid=str(data['tree_oid']),
-            debug_planned=list(debug.get('planned') or []),
-            debug_verdicts=dict(debug.get('verdicts') or {}),
-            release_planned=list(release.get('planned') or []),
-            release_verdicts=dict(release.get('verdicts') or {}),
-            run_all_members=list(data.get('run_all_members') or []),
-            gui_specs=list(data.get('gui_specs') or []),
-        )
-    except (TypeError, ValueError, AttributeError) as exc:
+
+    tree_oid = str(data['tree_oid'])
+    # `profiles` is a SPACE-DELIMITED STRING in reify's real bytes, not a list.
+    raw_profiles = data.get('profiles')
+    profiles = tuple(raw_profiles.split()) if isinstance(raw_profiles, str) else ()
+    if not profiles:
         logger.warning(
-            'attempt-0 sidecar at %s has malformed fields (%s) — full verify',
-            path, exc,
+            'reify attempt-0 sidecar at %s has empty/unparseable profiles %r '
+            '— full verify', path, raw_profiles,
         )
         return None
+    unknown = [p for p in profiles if p not in _KNOWN_REIFY_PROFILES]
+    if unknown:
+        logger.warning(
+            'reify attempt-0 sidecar at %s names unsupported profile(s) %r '
+            '(DF has no per-profile filter-file env key for them, so it cannot '
+            'satisfy reify\'s every-profile obligation) — full verify',
+            path, unknown,
+        )
+        return None
+    return _ReifyAttemptSidecar(tree_oid=tree_oid, profiles=profiles)
 
 
 async def _run_post_merge_verify(
@@ -2035,47 +2080,17 @@ async def _run_post_merge_verify(
 
     spec = build_merge_verify_spec(req.config, req.module_configs, task_files_tuple)
 
-    # Failed-only merge-verify retry PRODUCER (PRD verify-retry-failed-only D2).
-    # Guarded by req.retry_failed_only (D1, task 2833) so the flag-off / legacy
-    # path is byte-identical (D1's strict no-op guarantee preserved).  Reads the
-    # reify-written attempt-0 sidecar tolerantly (missing/malformed → None → leave
-    # spec untouched), corroborates the merge tree OID (INV-3), and on success
-    # MERGES the REIFY_VERIFY_RETRY_* env into spec.verify_env via
-    # dataclasses.replace.  A rebased/unknown tree returns None from
-    # _assemble_retry_verify_env → full verify via the existing
-    # _reverify_rebased_tree (M4) route.  NOTE (task 2822): injecting into `spec`
-    # here means the merged verify_env flows into BOTH the primary pool.dispatch
-    # below AND task 2822's post-dispatch remote-green cross-check re-verify (which
-    # reuses this same `spec`) — correct and desired: a failed-only retry's local
-    # trust-anchor cross-check should scope to the same {did-not-pass} subset.
     # narrowed (task 2835) tracks whether THIS call actually applied a
-    # narrowed retry_env below — the ONLY correct gate for the larger
-    # max_narrowed budget later.  req.retry_failed_only alone is NOT enough:
-    # until reify writes the attempt-0 sidecar, a flag-on retry is still a
-    # FULL re-verify and must keep the small legacy max_enospc budget.
+    # narrowed retry_env — the ONLY correct gate for the larger max_narrowed
+    # budget below.  req.retry_failed_only alone is NOT enough: a flag-on
+    # retry whose payload could not be built is still a FULL re-verify and
+    # must keep the small legacy max_enospc budget.
+    #
+    # The narrowing itself is applied in the classified-infra-transient retry
+    # branch below, built from THIS call's own attempt-0 VerifyResult (task
+    # 3059).  It deliberately does NOT happen here: attempt-0 has not run yet
+    # at this point, so narrowing here would narrow attempt-0 ITSELF.
     narrowed = False
-    if req.retry_failed_only:
-        attempt0 = _load_attempt0_sidecar(merge_wt)
-        if attempt0 is not None:
-            retry_env = await _assemble_retry_verify_env(git_ops, req, merge_wt, attempt0)
-            if retry_env is not None:
-                spec = dataclasses.replace(
-                    spec, verify_env={**spec.verify_env, **retry_env}
-                )
-                narrowed = True
-                # PRD verify-retry-failed-only D4 (§5.4): copy the attempt-0
-                # per-test verdict map into the caller's sink so the warm shadow
-                # baseline is MERGED (attempt-0 ∪ partial narrowed-retry output)
-                # before storage.  This narrowed retry re-runs ONLY the
-                # {did-not-pass} subset, so its output alone OMITS every
-                # attempt-0-passed test → a from-scratch full cold shadow compare
-                # would flag them all only_cold → phantom born-at-L2 divergence.
-                # Populated ONLY here (narrowed=True) so a rebased/uncorroborated
-                # tree (assemble→None) never seeds a stale baseline.
-                if shadow_baseline_sink is not None:
-                    shadow_baseline_sink.update(
-                        {**attempt0.debug_verdicts, **attempt0.release_verdicts}
-                    )
 
     # γ decision 4: additive runner= param selects the verify host.
     # runner=None (default) → LOCAL-ONLY pool, byte-identical to β for every
