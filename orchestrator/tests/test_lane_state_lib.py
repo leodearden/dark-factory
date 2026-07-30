@@ -195,3 +195,253 @@ class TestLaneStateReadHappyPath:
         assert proc.stdout == 'assigned 5551\n', (
             f'a bare lane name + explicit state dir must resolve; got {proc.stdout!r}'
         )
+
+
+class TestLaneStateReadFailsOpenWithAnAttributableCause:
+    """An unreadable record degrades that lane, never the run — and says why.
+
+    ``LANE_STATE_CAUSE`` distinguishes the two causes because they send an
+    operator to two different places: ``no-readable-record`` is a
+    filesystem/permissions question (and is also the ordinary reading for every
+    recordless ``_iact-*`` and manual operator worktree, which leaf γ routes to
+    the /proc fallback), while ``unparseable-record`` means the record IS there
+    and readable but corrupt, truncated, or reshaped.  Collapsing them into one
+    cause would point triage at a missing file that is often sitting right
+    there.
+    """
+
+    def test_corrupt_record_reads_unknown_with_unparseable_cause(
+        self, tmp_path: Path,
+    ) -> None:
+        base = _mount(
+            tmp_path / 'mount',
+            {'_lane-9': '{"state": "assig'},   # truncated mid-write
+        )
+        proc = _run_sourced(
+            f'lane_state_read {shlex.quote(str(base / "_lane-9"))}\n{_ECHO_GLOBALS}',
+        )
+        assert proc.returncode == 0, f'stderr={proc.stderr!r}'
+        assert proc.stdout.startswith('unknown\n'), (
+            f'a corrupt record must fail open to "unknown"; got {proc.stdout!r}'
+        )
+        published = _globals(proc.stdout)
+        assert published['CAUSE'] == 'unparseable-record', (
+            'a record that IS present and readable but yields no `state` string '
+            f'is unparseable, not missing; got {published!r}'
+        )
+
+    def test_record_with_no_state_key_reads_unparseable(self, tmp_path: Path) -> None:
+        base = _mount(tmp_path / 'mount', {'_lane-9': {'task_id': '77'}})
+        proc = _run_sourced(
+            f'lane_state_read {shlex.quote(str(base / "_lane-9"))} >/dev/null\n'
+            f'{_ECHO_GLOBALS}',
+        )
+        published = _globals(proc.stdout)
+        assert published['RAW'] == 'unknown'
+        assert published['CAUSE'] == 'unparseable-record', (
+            f'a readable record with no `state` string is unparseable; {published!r}'
+        )
+
+    def test_absent_state_dir_reads_no_readable_record(self, tmp_path: Path) -> None:
+        base = _mount(tmp_path / 'mount', {'_iact-demo': None})
+        assert not (base / '.lane-state').exists(), 'fixture must have no state dir'
+        proc = _run_sourced(
+            f'lane_state_read {shlex.quote(str(base / "_iact-demo"))} >/dev/null\n'
+            f'{_ECHO_GLOBALS}',
+        )
+        published = _globals(proc.stdout)
+        assert published['RAW'] == 'unknown'
+        assert published['CAUSE'] == 'no-readable-record', (
+            f'no state dir at all is a missing record, not a corrupt one; {published!r}'
+        )
+
+    def test_present_state_dir_missing_record_reads_no_readable_record(
+        self, tmp_path: Path,
+    ) -> None:
+        base = _mount(
+            tmp_path / 'mount',
+            {'_lane-28': _ASSIGNED_RECORD, '_lane-29': None},
+        )
+        assert (base / '.lane-state').is_dir(), 'fixture must have a state dir'
+        proc = _run_sourced(
+            f'lane_state_read {shlex.quote(str(base / "_lane-29"))} >/dev/null\n'
+            f'{_ECHO_GLOBALS}',
+        )
+        published = _globals(proc.stdout)
+        assert published['RAW'] == 'unknown'
+        assert published['CAUSE'] == 'no-readable-record', (
+            f'a state dir with no record for this lane is missing; {published!r}'
+        )
+
+    def test_null_task_id_reads_empty_without_losing_the_state(
+        self, tmp_path: Path,
+    ) -> None:
+        """``"task_id": null`` is the shape an UNASSIGNED lane's record carries.
+
+        It must read as an empty task id — the audit's ``pin`` column falls back
+        to the branch-derived id on exactly this signal — while the lane's state
+        still resolves normally.
+        """
+        base = _mount(
+            tmp_path / 'mount',
+            {'_lane-7': '{"state": "released", "task_id": null}'},
+        )
+        proc = _run_sourced(
+            f'lane_state_read {shlex.quote(str(base / "_lane-7"))}\n{_ECHO_GLOBALS}',
+        )
+        assert proc.stdout.startswith('released\n'), (
+            f'a null task_id must not suppress the state; got {proc.stdout!r}'
+        )
+        published = _globals(proc.stdout)
+        assert published == {'RAW': 'released', 'TASK': '', 'CAUSE': ''}, published
+
+    def test_absent_task_id_key_reads_empty_without_losing_the_state(
+        self, tmp_path: Path,
+    ) -> None:
+        base = _mount(tmp_path / 'mount', {'_lane-7': {'state': 'seed'}})
+        proc = _run_sourced(
+            f'lane_state_read {shlex.quote(str(base / "_lane-7"))}\n{_ECHO_GLOBALS}',
+        )
+        assert proc.stdout.startswith('seed\n'), proc.stdout
+        published = _globals(proc.stdout)
+        assert published == {'RAW': 'seed', 'TASK': '', 'CAUSE': ''}, published
+
+
+class TestLaneStateReadIsNonCreating:
+    """The read never brings the thing it is reading into existence.
+
+    Same A1 guarantee the audit's ``_lane_record`` carries, and it matters for
+    the same reason: this lib is about to be called by a reclaim sweep, and a
+    read that MINTED an empty ``.lane-state/<lane>.json`` would manufacture the
+    very record the sweep consults to decide whether a lane is free.
+    """
+
+    def test_reading_against_a_mount_with_no_state_dir_creates_nothing(
+        self, tmp_path: Path,
+    ) -> None:
+        base = _mount(tmp_path / 'mount', {'_iact-demo': None})
+        proc = _run_sourced(
+            f'lane_state_read {shlex.quote(str(base / "_iact-demo"))}',
+        )
+        assert proc.returncode == 0, f'stderr={proc.stderr!r}'
+        assert not (base / '.lane-state').exists(), (
+            'lane_state_read created the state directory — no mkdir is permitted'
+        )
+        assert sorted(p.name for p in base.iterdir()) == ['_iact-demo'], (
+            f'lane_state_read created something under the mount: '
+            f'{sorted(p.name for p in base.iterdir())}'
+        )
+
+    def test_reading_a_lane_with_no_record_creates_no_record(
+        self, tmp_path: Path,
+    ) -> None:
+        base = _mount(
+            tmp_path / 'mount',
+            {'_lane-28': _ASSIGNED_RECORD, '_lane-29': None},
+        )
+        state_dir = base / '.lane-state'
+        proc = _run_sourced(f'lane_state_read {shlex.quote(str(base / "_lane-29"))}')
+        assert proc.returncode == 0, f'stderr={proc.stderr!r}'
+        assert not (state_dir / '_lane-29.json').exists(), (
+            'lane_state_read created the missing record — no `>`-open, no touch'
+        )
+        assert sorted(p.name for p in state_dir.iterdir()) == ['_lane-28.json'], (
+            f'state dir gained an entry: {sorted(p.name for p in state_dir.iterdir())}'
+        )
+
+
+class TestLaneStateReadStateDirOverride:
+    """An explicit ``<state-dir>`` is honoured verbatim, including outside the mount.
+
+    ``warm-lane-audit.sh`` already supports ``--state-dir`` /
+    ``REIFY_WARM_LANE_AUDIT_STATE_DIR``, documented as possibly pointing
+    anywhere including outside the mount.  Deriving the state dir solely from
+    the lane dir would silently drop that override during the refactor —
+    changing observable audit behaviour under the banner of an extraction.
+    """
+
+    def test_explicit_state_dir_outside_the_mount_wins(self, tmp_path: Path) -> None:
+        base = _mount(tmp_path / 'mount', {'_lane-28': None})
+        elsewhere = tmp_path / 'somewhere-else'
+        elsewhere.mkdir()
+        (elsewhere / '_lane-28.json').write_text(json.dumps(_ASSIGNED_RECORD))
+
+        proc = _run_sourced(
+            f'lane_state_read {shlex.quote(str(base / "_lane-28"))} '
+            f'{shlex.quote(str(elsewhere))}',
+        )
+        assert proc.returncode == 0, f'stderr={proc.stderr!r}'
+        assert proc.stdout == 'assigned 5551\n', (
+            'an explicit state dir outside the mount must be honoured verbatim; '
+            f'got {proc.stdout!r}'
+        )
+
+    def test_explicit_state_dir_is_not_silently_ignored_for_a_derivable_lane(
+        self, tmp_path: Path,
+    ) -> None:
+        """The override WINS — it does not merely fill in for a missing default.
+
+        The lane's derived state dir here holds a DIFFERENT record, so a read
+        that answered from it would pass a weaker test while ignoring the
+        operator's override.
+        """
+        base = _mount(tmp_path / 'mount', {'_lane-28': _ASSIGNED_RECORD})
+        elsewhere = tmp_path / 'override'
+        elsewhere.mkdir()
+        (elsewhere / '_lane-28.json').write_text(
+            json.dumps({'state': 'quarantined', 'task_id': '9999'}),
+        )
+        proc = _run_sourced(
+            f'lane_state_read {shlex.quote(str(base / "_lane-28"))} '
+            f'{shlex.quote(str(elsewhere))}',
+        )
+        assert proc.stdout == 'quarantined 9999\n', (
+            'the derived default answered instead of the explicit override; '
+            f'got {proc.stdout!r}'
+        )
+
+
+class TestLaneStateReadNeverInheritsAPredecessorsValues:
+    """Every lane's triple is resolved from scratch.
+
+    The globals are process-wide, so without a reset at entry a lane whose
+    record cannot be read would report the PREVIOUS lane's task id — which in
+    the audit's ``pin`` column reads as "lane X is held by task N", a claim
+    about a lane the record never made.
+    """
+
+    def test_recordless_lane_after_an_assigned_lane_publishes_no_task_id(
+        self, tmp_path: Path,
+    ) -> None:
+        base = _mount(
+            tmp_path / 'mount',
+            {'_lane-28': _ASSIGNED_RECORD, '_iact-demo': None},
+        )
+        proc = _run_sourced(
+            f'lane_state_read {shlex.quote(str(base / "_lane-28"))} >/dev/null\n'
+            f'lane_state_read {shlex.quote(str(base / "_iact-demo"))} >/dev/null\n'
+            f'{_ECHO_GLOBALS}',
+        )
+        published = _globals(proc.stdout)
+        assert published['TASK'] == '', (
+            'the recordless lane inherited its predecessor\'s task id — the '
+            f'globals must be reset at entry; got {published!r}'
+        )
+        assert published['RAW'] == 'unknown', published
+        assert published['CAUSE'] == 'no-readable-record', published
+
+    def test_a_clean_read_clears_a_previous_lanes_cause(self, tmp_path: Path) -> None:
+        base = _mount(
+            tmp_path / 'mount',
+            {'_iact-demo': None, '_lane-28': _ASSIGNED_RECORD},
+        )
+        proc = _run_sourced(
+            f'lane_state_read {shlex.quote(str(base / "_iact-demo"))} >/dev/null\n'
+            f'lane_state_read {shlex.quote(str(base / "_lane-28"))} >/dev/null\n'
+            f'{_ECHO_GLOBALS}',
+        )
+        published = _globals(proc.stdout)
+        assert published == {'RAW': 'assigned', 'TASK': '5551', 'CAUSE': ''}, (
+            'a successful read must clear the previous lane\'s UNKNOWN cause, or '
+            f'the audit would warn about a lane that resolved fine; {published!r}'
+        )
