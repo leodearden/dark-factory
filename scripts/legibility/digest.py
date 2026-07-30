@@ -23,10 +23,13 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
+import logging
 import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger('legibility.digest')
 
 
 def load_transcript(path: Any) -> list[dict[str, Any]]:
@@ -896,7 +899,7 @@ def _resolve_size_bytes(meta: dict[str, Any], body: str) -> str:
 
 def _truncate_sections(
     meta: dict[str, Any], sections: dict[str, list[str]], max_bytes: int,
-) -> str:
+) -> tuple[str, dict[str, list[str]]]:
     """Trim *sections* in ASCENDING SECTION_PRIORITY order (lowest-signal
     first) until the fully-rendered digest fits within *max_bytes*, or
     there is nothing left to trim -- PRD Sec 7.2 "truncate lowest-signal
@@ -911,6 +914,11 @@ def _truncate_sections(
     the worst case every item in every section is removed, at which point
     the loop stops even if the (now section-free) digest is still over
     the cap -- a soft cap can't shrink the frontmatter itself.
+
+    Returns the rendered digest AND the post-trim section dict, so a
+    caller can inspect final section state (e.g. render_digest's
+    :func:`_warn_if_body_evicted` consistency guard) without re-parsing
+    the rendered markdown body.
     """
     sections = {key: list(lines) for key, lines in sections.items()}
     digest = _resolve_size_bytes(meta, _render_body(sections))
@@ -922,7 +930,35 @@ def _truncate_sections(
         sections[target_key].pop()
         digest = _resolve_size_bytes(meta, _render_body(sections))
 
-    return digest
+    return digest, sections
+
+
+def _warn_if_body_evicted(
+    meta: dict[str, Any], sections: dict[str, list[str]], max_bytes: int,
+) -> None:
+    """Emit-time consistency guard: nonzero ``signal_counts`` implies a
+    non-empty body. :func:`_item_byte_cap`'s per-item cap makes a
+    violation structurally unreachable for any realistic *max_bytes* (see
+    FRONTMATTER_RESERVE_BYTES) -- this is the belt-and-braces backstop for
+    the residual edge cases (e.g. a pathologically tiny *max_bytes*).
+
+    Never raises: a soft-cap edge case must not turn into a per-session
+    failure for census.py/nightly.py callers. Never silent either -- a
+    violation is logged LOUDLY, naming the session, the nonzero counts and
+    *max_bytes*, so the degenerate digest is never mistaken for a
+    genuinely signal-free session.
+    """
+    counts = meta['signal_counts']
+    if not any(counts.values()):
+        return
+    if any(sections.values()):
+        return
+    nonzero = {key: value for key, value in counts.items() if value}
+    logger.warning(
+        'digest body fully evicted despite nonzero signal_counts: '
+        'session=%s signal_counts=%s max_bytes=%d',
+        meta['session'], nonzero, max_bytes,
+    )
 
 
 def render_digest(
@@ -958,7 +994,9 @@ def render_digest(
     }
 
     sections = _build_sections(records, item_max_bytes=_item_byte_cap(max_bytes))
-    return _truncate_sections(meta, sections, max_bytes)
+    digest, trimmed_sections = _truncate_sections(meta, sections, max_bytes)
+    _warn_if_body_evicted(meta, trimmed_sections, max_bytes)
+    return digest
 
 
 def build_digest(
