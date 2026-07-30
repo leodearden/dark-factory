@@ -30,6 +30,9 @@ from fused_memory.reconciliation.cli_stage_runner import (
     _normalize_report,
     run_stage_via_cli,
 )
+from fused_memory.reconciliation.prompts import ESCALATION_BOUNDARY_NOTE
+from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
 from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
 from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
@@ -290,6 +293,74 @@ class TestDisallowedToolLists:
             assert set(DISALLOW_ESCALATION_READS).issubset(set(stage.get_disallowed_tools())), (
                 f'{cls.__name__}.get_disallowed_tools() must cover the escalation reads'
             )
+
+
+class TestEscalationBoundaryNote:
+    """The escalation-store boundary paragraph is one constant with three consumers.
+
+    Companion to the DISALLOW_ESCALATION_READS denial (task 3163).  Denying the
+    read tools removes the false ``[]`` answer, but ``--disallowed-tools`` OMITS
+    a denied tool from the agent's listing rather than rejecting the call — so
+    without this paragraph the agent simply finds the tool gone, with no
+    explanation, and may conclude the escalation surface does not exist or route
+    around it.  The note is what converts a silent absence into an understood
+    boundary, which makes it load-bearing rather than decorative.
+
+    These are wiring/invariant assertions, deliberately not a prose pin.
+    """
+
+    def test_boundary_note_is_a_single_nonempty_constant(self):
+        assert isinstance(ESCALATION_BOUNDARY_NOTE, str)
+        assert ESCALATION_BOUNDARY_NOTE.strip(), 'boundary note must not be empty'
+
+    def test_boundary_note_rendered_verbatim_into_all_three_stage_prompts(self):
+        """One constant, three consumers, no per-stage paste (INV-5).
+
+        Exactly-once, not merely present: a second copy would mean a stage
+        interpolated it twice or someone pasted the prose alongside the
+        constant, which is the drift this shared-constant shape exists to stop.
+        """
+        for prompt, name in (
+            (STAGE1_SYSTEM_PROMPT, 'STAGE1_SYSTEM_PROMPT'),
+            (build_stage2_system_prompt('dark_factory'), 'STAGE2_SYSTEM_PROMPT'),
+            (STAGE3_SYSTEM_PROMPT, 'STAGE3_SYSTEM_PROMPT'),
+        ):
+            assert ESCALATION_BOUNDARY_NOTE in prompt, f'{name} must render the boundary note'
+            assert prompt.count(ESCALATION_BOUNDARY_NOTE) == 1, (
+                f'{name} must render the boundary note exactly once'
+            )
+
+    def test_boundary_note_present_on_the_autopilot_video_stage2_path(self):
+        """The conditional guardrail-injection branch must not drop or duplicate it.
+
+        build_stage2_system_prompt takes a different code path for
+        autopilot_video (it splices the contamination guardrail in at the
+        '## Available Tools' sentinel), so the note is pinned on that branch too.
+        """
+        prompt = build_stage2_system_prompt('autopilot_video')
+        assert prompt.count(ESCALATION_BOUNDARY_NOTE) == 1
+
+    def test_boundary_note_does_not_contain_the_stage2_injection_sentinel(self):
+        """The note must not carry the '## Available Tools' heading.
+
+        Load-bearing: build_stage2_system_prompt raises RuntimeError unless that
+        sentinel appears EXACTLY once in STAGE2_SYSTEM_PROMPT.  A note carrying
+        the heading would make it appear twice and hard-fail Stage 2 prompt
+        construction for autopilot_video.
+        """
+        assert '## Available Tools' not in ESCALATION_BOUNDARY_NOTE
+
+    def test_boundary_note_states_the_absence_semantics(self):
+        """The two tokens the agent must actually act on.
+
+        Naming the reconciliation store tells the agent WHICH store it is
+        connected to; 'not evidence' tells it what it may not conclude from an
+        empty result.  Without the second, the note explains the boundary but
+        leaves the original incident (reading [] as proof of absence) available.
+        """
+        lowered = ESCALATION_BOUNDARY_NOTE.lower()
+        assert 'reconciliation' in lowered
+        assert 'not evidence' in lowered
 
 
 class TestStageSubclasses:
