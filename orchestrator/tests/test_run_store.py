@@ -379,3 +379,220 @@ class TestSchedulerStatePersistence:
         assert result is None, (
             f'Expected None after clear, got {result!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 3068 / Part B — block_reason + block_phase persistence
+# ---------------------------------------------------------------------------
+#
+# Origin incident (reify esc-5556-1): a 46h warm-lane requeue loop could not be
+# reconstructed after the fact because neither events.db nor runs.db recorded
+# WHY dispatches requeued.  runs.db's task_results held 14 counter-ish columns
+# and no block context at all, even though TaskReport has carried
+# block_reason/block_phase in memory since the retry-cap work.
+
+
+#: The pre-3068 task_results DDL, verbatim, for building a legacy DB by hand.
+#: Kept as a literal (rather than derived from _SCHEMA) precisely so it cannot
+#: drift with the production schema — the migration tests below need a genuinely
+#: OLD table, not whatever _SCHEMA happens to say today.
+_LEGACY_TASK_RESULTS_DDL = """\
+CREATE TABLE IF NOT EXISTS runs (
+    run_id         TEXT PRIMARY KEY,
+    project_id     TEXT NOT NULL,
+    prd_path       TEXT,
+    started_at     TEXT NOT NULL,
+    completed_at   TEXT,
+    total_tasks    INTEGER DEFAULT 0,
+    completed      INTEGER DEFAULT 0,
+    blocked        INTEGER DEFAULT 0,
+    escalated      INTEGER DEFAULT 0,
+    total_cost_usd REAL DEFAULT 0.0,
+    paused_for_cap INTEGER DEFAULT 0,
+    cap_pause_secs REAL DEFAULT 0.0
+);
+
+CREATE TABLE IF NOT EXISTS task_results (
+    run_id              TEXT NOT NULL REFERENCES runs(run_id),
+    task_id             TEXT NOT NULL,
+    project_id          TEXT NOT NULL,
+    title               TEXT,
+    outcome             TEXT NOT NULL,
+    cost_usd            REAL DEFAULT 0.0,
+    duration_ms         INTEGER DEFAULT 0,
+    agent_invocations   INTEGER DEFAULT 0,
+    execute_iterations  INTEGER DEFAULT 0,
+    verify_attempts     INTEGER DEFAULT 0,
+    review_cycles       INTEGER DEFAULT 0,
+    steward_cost_usd    REAL DEFAULT 0.0,
+    steward_invocations INTEGER DEFAULT 0,
+    completed_at        TEXT,
+    PRIMARY KEY (run_id, task_id)
+);
+"""
+
+
+def _task_results_columns(db_path) -> list[str]:
+    """Return task_results' column names in physical (PRAGMA) order."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return [row[1] for row in conn.execute('PRAGMA table_info(task_results)')]
+    finally:
+        conn.close()
+
+
+def _build_legacy_db(db_path) -> None:
+    """Create a pre-3068 runs.db with one legacy task_results row."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.executescript(_LEGACY_TASK_RESULTS_DDL)
+        conn.execute(
+            'INSERT INTO runs (run_id, project_id, started_at) VALUES (?, ?, ?)',
+            ('run-legacy', 'proj-a', '2026-07-01T10:00:00+00:00'),
+        )
+        conn.execute(
+            'INSERT INTO task_results '
+            '(run_id, task_id, project_id, title, outcome, '
+            ' cost_usd, duration_ms, agent_invocations, '
+            ' execute_iterations, verify_attempts, review_cycles, '
+            ' steward_cost_usd, steward_invocations, completed_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (
+                'run-legacy', '900', 'proj-a', 'Legacy row', 'done',
+                0.5, 1000, 4, 1, 1, 0, 0.0, 0, '2026-07-01T10:05:00+00:00',
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+class TestBlockContextPersistence:
+    """task_results must persist the classified block reason + phase."""
+
+    def test_fresh_schema_has_block_columns_last(self, tmp_path):
+        """A fresh DB declares block_reason/block_phase AFTER completed_at.
+
+        SQLite's ALTER TABLE ADD COLUMN can only APPEND.  If _SCHEMA declared
+        the new columns anywhere but last, a freshly-created runs.db would have
+        a different physical column ORDER than a migrated one — and an operator
+        forensic ``SELECT *`` (exactly the use case this task exists to serve)
+        would silently read different fields depending on the DB's vintage.
+        """
+        db_path = tmp_path / 'runs.db'
+        RunStore(db_path)
+
+        cols = _task_results_columns(db_path)
+        assert {'block_reason', 'block_phase'} <= set(cols), (
+            f'missing block-context columns; got {cols}'
+        )
+        assert cols.index('block_reason') > cols.index('completed_at')
+        assert cols.index('block_phase') > cols.index('completed_at')
+        # Appended, in this order, and nothing between them.
+        assert cols[-2:] == ['block_reason', 'block_phase'], (
+            f'block columns must be last for ALTER-parity; got {cols}'
+        )
+
+    def test_save_task_result_persists_block_context(self, tmp_path):
+        """The incremental writer round-trips block_reason/block_phase."""
+        db_path = tmp_path / 'runs.db'
+        store = RunStore(db_path)
+        store.start_run('run-1', 'proj-a', '2026-07-30T10:00:00+00:00')
+
+        store.save_task_result(
+            'run-1',
+            TaskReport(
+                task_id='3068',
+                title='Requeued task',
+                outcome=WorkflowOutcome.REQUEUED,
+                block_reason='warm_lane_pool_hard_down',
+                block_phase='plan',
+                completed_at='2026-07-30T10:05:00+00:00',
+            ),
+            'proj-a',
+        )
+
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute(
+                'SELECT block_reason, block_phase FROM task_results '
+                'WHERE run_id = ? AND task_id = ?',
+                ('run-1', '3068'),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row['block_reason'] == 'warm_lane_pool_hard_down'
+        assert row['block_phase'] == 'plan'
+
+    def test_save_task_result_clean_exit_persists_empty_not_null(self, tmp_path):
+        """A DONE report persists '' — NOT NULL.
+
+        Same honesty contract as the event payload (Part A): after this lands,
+        NULL in these columns means "row predates task 3068" while '' means
+        "clean exit, no block".
+        """
+        db_path = tmp_path / 'runs.db'
+        store = RunStore(db_path)
+        store.start_run('run-1', 'proj-a', '2026-07-30T10:00:00+00:00')
+
+        store.save_task_result(
+            'run-1',
+            TaskReport(
+                task_id='3069',
+                title='Clean task',
+                outcome=WorkflowOutcome.DONE,
+                completed_at='2026-07-30T10:06:00+00:00',
+            ),
+            'proj-a',
+        )
+
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute(
+                'SELECT block_reason, block_phase FROM task_results '
+                'WHERE task_id = ?',
+                ('3069',),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row['block_reason'] == '', 'clean exit must persist "" not NULL'
+        assert row['block_phase'] == '', 'clean exit must persist "" not NULL'
+
+    def test_save_run_batch_path_persists_block_context(self, tmp_path):
+        """The SECOND 14-column writer (save_run) must be extended too.
+
+        The task description named only save_task_result; save_run has its own
+        independent per-task INSERT.  Leaving it at 14 columns would silently
+        write NULLs on the batch path.
+        """
+        db_path = tmp_path / 'runs.db'
+        store = RunStore(db_path)
+
+        report = _sample_report()
+        report.task_reports[0].block_reason = ''
+        report.task_reports[0].block_phase = ''
+        report.task_reports[1].block_reason = 'warm_lane_pool_hard_down'
+        report.task_reports[1].block_phase = 'execute'
+        report.task_reports[2].block_reason = 'verify_infra_failure'
+        report.task_reports[2].block_phase = 'verify'
+
+        run_id = store.save_run(report, 'proj-a')
+
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = {
+                r['task_id']: (r['block_reason'], r['block_phase'])
+                for r in conn.execute(
+                    'SELECT task_id, block_reason, block_phase FROM task_results '
+                    'WHERE run_id = ?',
+                    (run_id,),
+                )
+            }
+        finally:
+            conn.close()
+        assert rows['101'] == ('', '')
+        assert rows['102'] == ('warm_lane_pool_hard_down', 'execute')
+        assert rows['103'] == ('verify_infra_failure', 'verify')
