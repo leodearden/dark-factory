@@ -248,6 +248,47 @@ def _wire_resolve_callback(queue: EscalationQueue, workflow: TaskWorkflow) -> No
     queue.set_resolve_callback(_on_resolved)
 
 
+def _time_the_wait(workflow: TaskWorkflow) -> dict[str, float]:
+    """Record how long ``_wait_for_resolution`` itself blocks for.
+
+    Returns a dict the caller reads AFTER ``run()`` returns; ``'elapsed'`` is
+    the cumulative time spent inside the wait (summed, so a hypothetical
+    second ESCALATED entry cannot hide a second unbounded wait behind a short
+    first one) and is ABSENT if the wait was never entered at all.
+
+    The bounded-wait assertions are about the WAIT, not about ``run()``.
+    Everything ``run()`` does after the wait — the resumed implementer, real
+    git subprocesses in a real worktree, and the DONE tail's real ``httpx``
+    POST to ``FakeMcp.url`` (nothing listens on :9999, so this is a genuine
+    connect failure, not a stub) — is unbounded-by-design wall-clock that
+    scales with machine load.  Measured on the verify box under its 32-worker
+    xdist fan-out that tail alone reached multiple seconds, which is what made
+    ``assert total_run_elapsed < 5`` fail while the wait it named was in fact
+    bounded to ~1.0s exactly as designed.
+
+    Timing the wait preserves the property verbatim — the wait expires on its
+    own derived window instead of riding the test's ``asyncio.wait_for``
+    backstop — while excluding work that property says nothing about.  A
+    regression to an unbounded wait is still caught: ``run()`` swallows the
+    backstop's cancellation, and the ``finally`` here records the full
+    rode-the-backstop duration on the way out.
+    """
+    timing: dict[str, float] = {}
+    original = workflow._wait_for_resolution
+
+    async def _timed() -> str:
+        started = asyncio.get_running_loop().time()
+        try:
+            return await original()
+        finally:
+            timing['elapsed'] = timing.get('elapsed', 0.0) + (
+                asyncio.get_running_loop().time() - started
+            )
+
+    workflow._wait_for_resolution = _timed  # type: ignore[method-assign]
+    return timing
+
+
 def _submit_l0(
     queue: EscalationQueue, task_id: str, *, category: str = 'task_failure',
 ) -> Escalation:
@@ -432,14 +473,17 @@ class TestEscalatedWaitIsBounded:
         invoke_mock = AsyncMock(return_value=AgentResult(success=True, output=''))
         workflow._invoke = invoke_mock  # type: ignore[method-assign]
 
-        t0 = asyncio.get_running_loop().time()
-        await asyncio.wait_for(workflow.run(), 10)
-        elapsed = asyncio.get_running_loop().time() - t0
+        timing = _time_the_wait(workflow)
 
-        assert elapsed < 5, (
-            f'the wait must be bounded by steward_completion_timeout '
-            f'({config.steward_completion_timeout}s), not by the test\'s own '
-            f'10s backstop; run() took {elapsed:.1f}s. (run() swallows the '
+        await asyncio.wait_for(workflow.run(), 10)
+
+        waited = timing.get('elapsed')
+        assert waited is not None, 'the ESCALATED wait was never entered'
+        assert waited < 5, (
+            f'the wait must be bounded by the derived window (timeouts.steward '
+            f'{config.timeouts.steward}s + steward_completion_timeout '
+            f'{config.steward_completion_timeout}s), not by the test\'s own 10s '
+            f'backstop; the wait took {waited:.1f}s. (run() swallows the '
             f'wait_for cancellation and returns, so an unbounded wait shows '
             f'up here rather than as a TimeoutError.)'
         )
@@ -1148,9 +1192,9 @@ class TestObservableProgressRefreshesTheWait:
         workflow._execute_verify_review_loop = evrl_mock  # type: ignore[method-assign]
         workflow._invoke = _make_marking_invoke(markers)  # type: ignore[method-assign]
 
-        t0 = asyncio.get_running_loop().time()
+        timing = _time_the_wait(workflow)
+
         await asyncio.wait_for(workflow.run(), 10)
-        elapsed = asyncio.get_running_loop().time() - t0
 
         archived = queue.get(esc.id)
         assert archived is not None, 'the record must still be readable'
@@ -1164,9 +1208,11 @@ class TestObservableProgressRefreshesTheWait:
             'the give-up must stay loud and greppable — one escalation_resolved '
             'event carrying outcome=steward_wait_timeout and the orphan id'
         )
-        assert elapsed < 10 / 2, (
+        waited = timing.get('elapsed')
+        assert waited is not None, 'the ESCALATED wait was never entered'
+        assert waited < 10 / 2, (
             f'the silent producer must still be given up on promptly, not '
-            f'ride the test\'s own backstop; run() took {elapsed:.1f}s'
+            f'ride the test\'s own backstop; the wait took {waited:.1f}s'
         )
 
 
