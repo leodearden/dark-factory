@@ -50,6 +50,7 @@ PORTED_TESTS = (
     'test_warm_lane_gc_sweep.sh',
     'test_warm_lane_audit.sh',
     'test_warm_lane_sizing_lifecycle.sh',
+    'test_provision_warm_lane_fs.sh',
 )
 
 #: Kept strictly BELOW the ``timeout(360)`` marker so a hung bash test fails as
