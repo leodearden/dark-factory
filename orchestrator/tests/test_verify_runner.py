@@ -1227,7 +1227,7 @@ class TestRetryScopeEventFields:
         # crash), while the comma-delimited run_all/gui still compute correctly.
         verify_env = {
             'REIFY_VERIFY_RETRY_SCOPE': 'failed_only',
-            'REIFY_RUN_ALL_MEMBER_SUBSET': 'm1,m2',
+            'REIFY_RUN_ALL_MEMBER_SUBSET': 'm1 m2',
             'REIFY_GUI_RETRY_SPECS': 'ui/x.ts',
             'REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_DEBUG': str(tmp_path / 'missing.filter'),
             # REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_RELEASE deliberately absent.
@@ -1237,7 +1237,7 @@ class TestRetryScopeEventFields:
         sizes = result['retry_subset_sizes']
         assert sizes['nextest_debug'] is None   # unreadable path → None
         assert sizes['nextest_release'] is None  # absent key → None
-        assert sizes['run_all'] == 2             # comma-values still compute
+        assert sizes['run_all'] == 2             # space-values still compute
         assert sizes['gui'] == 1
 
     def test_retry_scope_event_fields_nextest_non_utf8_degrades_honestly(self, tmp_path):
@@ -1251,7 +1251,7 @@ class TestRetryScopeEventFields:
         bad_file.write_bytes(b'\x80\x81\x82')  # invalid UTF-8 (lone continuation bytes)
         verify_env = {
             'REIFY_VERIFY_RETRY_SCOPE': 'failed_only',
-            'REIFY_RUN_ALL_MEMBER_SUBSET': 'm1,m2',
+            'REIFY_RUN_ALL_MEMBER_SUBSET': 'm1 m2',
             'REIFY_GUI_RETRY_SPECS': 'ui/x.ts',
             'REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_DEBUG': str(bad_file),
             # REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_RELEASE deliberately absent.
@@ -1261,7 +1261,7 @@ class TestRetryScopeEventFields:
         sizes = result['retry_subset_sizes']
         assert sizes['nextest_debug'] is None   # undecodable file → None (no crash)
         assert sizes['nextest_release'] is None  # absent key → None
-        assert sizes['run_all'] == 2             # comma-values still compute
+        assert sizes['run_all'] == 2             # space-values still compute
         assert sizes['gui'] == 1
 
 
