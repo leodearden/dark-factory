@@ -13700,6 +13700,7 @@ class TestSweepStaleMem0PoolTombstones:
         # A tombstone must never claim a record that is still alive.
         assert tombstone.await_count == 1
         call = tombstone.await_args
+        assert call is not None
         assert call.args[1] == 'dark_factory'
         assert call.args[2] == 'deleted-ok'
         assert call.kwargs['deleter'] == 'stage1_flag_marker_gc_sweep'
