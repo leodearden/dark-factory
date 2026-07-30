@@ -30,15 +30,29 @@ false-positives on stored remediation records), and this leak lives ONLY
 inside ``metadata.done_provenance.note``. Folding an opposite scanning policy
 into it would break its stated contract.
 
-The discriminator (``LOG_LINE_LEAK``) requires full log-LINE SHAPE — a
-leading ISO timestamp, then a logger-name field, then a level token — rather
-than a bare substring such as ``fused_memory.backends.graphiti_client``.
+The discriminator (``LOG_LINE_LEAK``) requires full log-LINE SHAPE — an ISO
+timestamp, then a logger-name field, then a level token — rather than a bare
+substring such as ``fused_memory.backends.graphiti_client``.
 That is not fastidiousness: task 3286's own description quotes both that
 logger name and ``httpx INFO HTTP Request`` as PROSE while instructing the
 reader to grep for them, so a substring scan would flag the very task hunting
 the leak. It is the same discipline ``LEAK_TAIL`` encodes in the precedent
 scanner, whose docstring records the identical over-reporting lesson from
 tasks 2938/2939 and solves it by requiring structural evidence.
+
+Those three requirements — and NOT a line-start anchor — are what carry that
+precision, so the pattern is deliberately unanchored: the fixed writer emits
+one-line notes prefixed ``predicate check passed (rc=0): ``, and a recurrence
+would therefore appear mid-line. See the comment on ``LOG_LINE_LEAK``.
+
+Known blind spot, shared with the writer it guards: a log line under a
+``%(name)s %(message)s``-style formatter (no timestamp, no level token) is
+matched by neither this discriminator nor
+``deterministic_runner._LOG_LINE_RE``, so such a line can reach a note and go
+unreported here. Detecting it would require naming logger substrings, which
+is precisely the over-reporting failure above. The writer's cap bounds the
+exposure to one ≤400-char line; a predicate script wanting a guaranteed-clean
+note should emit its verdict as trailing JSON.
 """
 from __future__ import annotations
 
@@ -54,8 +68,18 @@ from typing import NamedTuple
 # A real log line: ISO date+time (with optional ,milliseconds), then a
 # whitespace-separated logger-name field, then a standalone level token.
 # All three are required — prose naming a logger does not match.
+#
+# Deliberately NOT anchored at a line start.  Every note the fixed writer
+# produces is a SINGLE line of the form `predicate check passed (rc=0):
+# <payload>`, so any recurrence lands mid-line, after that prefix — a `^`
+# anchor would make this guard structurally blind to the exact format it
+# exists to guard, firing only on legacy multi-line notes.  The three
+# structural requirements above carry the precision on their own; the anchor
+# was never what excluded prose (prose carries no ISO timestamp).
+# `re.MULTILINE` is retained solely so the trailing `$` still means
+# end-of-LINE, keeping a reported match to one line.
 LOG_LINE_LEAK = re.compile(
-    r'^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}[,.\d]*\s+\S+\s+'
+    r'\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}[,.\d]*\s+\S+\s+'
     r'(?:DEBUG|INFO|WARNING|ERROR|CRITICAL)\b.*$',
     re.MULTILINE,
 )

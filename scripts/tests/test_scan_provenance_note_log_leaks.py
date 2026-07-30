@@ -98,6 +98,31 @@ PROSE_MENTIONING_MARKERS = (
     'A WARNING-level line from an unrelated project is the tell.'
 )
 
+# ---------------------------------------------------------------------------
+# RECURRENCE fixtures: what a leak would look like in a note written by the
+# FIXED orchestrator.
+#
+# These matter more than the historical POLLUTED_NOTE above. Every post-fix
+# note is a SINGLE line prefixed `predicate check passed (rc=0): `, so a
+# recurrence can only ever appear mid-line — a line-start-anchored
+# discriminator would report such a note clean and the guard would fire only
+# on legacy multi-line notes, i.e. never again.
+# ---------------------------------------------------------------------------
+
+PREFIXED_LEAK_NOTE = (
+    'predicate check passed (rc=0): 2026-07-30 16:39:00,523 httpx INFO '
+    'HTTP Request: GET http://localhost:6333 "HTTP/1.1 200 OK"'
+)
+
+# A tier-1 JSON payload whose string value embeds a log line: the note is one
+# line and the embedded newline is the two-character escape `\n`, so the log
+# line is neither at a line start nor preceded by real whitespace.
+JSON_EMBEDDED_LEAK_NOTE = (
+    'predicate check passed (rc=0): {"verdict":"clean","tail":"scan done'
+    '\\n2026-07-30 16:39:00,523 fused_memory.backends.graphiti_client '
+    'WARNING identity scan found 3 candidate nodes"}'
+)
+
 
 class TestDetectLogLeak:
     """The detector keys on log-LINE SHAPE, not on marker substrings."""
@@ -120,6 +145,28 @@ class TestDetectLogLeak:
     def test_clean_notes_are_not_flagged(self):
         for note in CLEAN_NOTES:
             assert detect_log_leak(note) is None, note
+
+    def test_leak_after_the_verdict_prefix_is_detected(self):
+        """The recurrence case: a mid-line leak in a post-fix note shape.
+
+        Anchoring at a line start would report this clean, leaving the guard
+        able to fire only on legacy multi-line notes — the opposite of its
+        stated purpose.
+        """
+        leak = detect_log_leak(PREFIXED_LEAK_NOTE)
+
+        assert leak is not None, PREFIXED_LEAK_NOTE
+        # The reported match is the log line itself, not the whole note: the
+        # `predicate check passed` prefix is not part of the evidence.
+        assert leak.startswith('2026-07-30 16:39:00,523 httpx INFO'), leak
+        assert '\n' not in leak, leak
+
+    def test_leak_embedded_in_a_json_payload_is_detected(self):
+        """A tier-1 JSON payload can still smuggle a log line in a value."""
+        leak = detect_log_leak(JSON_EMBEDDED_LEAK_NOTE)
+
+        assert leak is not None, JSON_EMBEDDED_LEAK_NOTE
+        assert 'fused_memory.backends.graphiti_client' in leak, leak
 
     def test_prose_mentioning_markers_is_not_flagged(self):
         """The guard against the naive-substring implementation.
@@ -226,6 +273,24 @@ class TestScanDb:
         ]
 
         assert scan_db(_make_db(tmp_path, rows)) == []
+
+    def test_recurrence_in_a_post_fix_note_shape_is_found(self, tmp_path):
+        """End-to-end on the shape the guard actually exists to catch.
+
+        A note written by the FIXED orchestrator is one line prefixed
+        `predicate check passed (rc=0): `; a leak recurring there sits
+        mid-line, and must still be reported alongside the clean rows.
+        """
+        rows = [
+            (3001, _provenance('deterministic-milestone', note=PREFIXED_LEAK_NOTE)),
+            (3002, _provenance('deterministic-milestone', note=CLEAN_NOTES[0])),
+            (3003, _provenance('deterministic-milestone', note=CLEAN_NOTES[1])),
+        ]
+
+        matches = scan_db(_make_db(tmp_path, rows))
+
+        assert [m.task_id for m in matches] == [3001], matches
+        assert matches[0].leak_line.startswith('2026-07-30'), matches[0]
 
 
 class TestDiscoverDbPaths:

@@ -7428,6 +7428,49 @@ class TestSummarizePredicateOutput:
 
         assert result == 'predicate check passed (rc=0)', result
 
+    def test_formatter_less_log_line_survives_as_documented_limitation(self):
+        """Tier 2 is a DENYLIST, and this pins the gap it leaves open.
+
+        A ``%(name)s %(message)s`` formatter emits no timestamp and no level
+        token, so ``_LOG_LINE_RE`` does not reject it and the line is kept as
+        the payload.  Tier 2 cannot be tightened into a grammar-based
+        allowlist without also dropping ``check ok: 0 flakes`` and
+        ``-- invariant holds`` (see the parametrized cases above), which are
+        structurally identical prose.
+
+        The exposure is bounded rather than closed — ONE line, capped — and
+        this test exists so the boundary is asserted rather than assumed.  If
+        a future change narrows tier 2, this expectation should flip
+        deliberately, not silently.
+        """
+        from orchestrator.deterministic_runner import _summarize_predicate_output
+
+        out = 'httpx HTTP Request: GET http://localhost:6333 secret=abc'
+
+        result = _summarize_predicate_output(out, rc=0)
+
+        assert result == f'predicate check passed (rc=0): {out}', result
+        # Still bounded: a single line, never the multi-KB 2902 blob.
+        assert '\n' not in result, result
+
+    # -- The verdict word is derived from rc, never hardcoded ---------------
+
+    def test_nonzero_rc_verdict_does_not_claim_passed(self):
+        """The prefix cannot contradict the code it renders.
+
+        Only the ``rc == 0`` branch calls this today, but a hardcoded
+        ``passed`` would let a future caller stamp
+        ``predicate check passed (rc=2)`` into a provenance note that flows
+        into a Mem0 completion summary.
+        """
+        from orchestrator.deterministic_runner import _summarize_predicate_output
+
+        result = _summarize_predicate_output('check failed: 3 flakes', rc=2)
+
+        assert result.startswith('predicate check failed (rc=2)'), result
+        assert 'passed' not in result, result
+        assert 'check failed: 3 flakes' in result, result
+
     # -- Size bound: elide wholesale, never slice mid-structure -------------
 
     def test_oversized_payload_is_elided_not_sliced(self):

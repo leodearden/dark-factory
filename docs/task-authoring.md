@@ -511,11 +511,20 @@ either a **trailing JSON block** (re-dumped compactly) or the **last output
 line if it is clean**, capped at 400 chars. Log-shaped lines (a leading
 timestamp, or a standalone `DEBUG`/`INFO`/`WARNING`/`ERROR`/`CRITICAL`
 token) are dropped, and an over-cap payload is replaced wholesale by an
-elision marker rather than sliced mid-structure. This is an **allowlist**:
-an unrecognized shape yields the verdict prefix alone.
+elision marker rather than sliced mid-structure. An unrecognized shape
+yields the verdict prefix alone.
+
+The two extraction tiers give **different guarantees**. The trailing-JSON
+tier is a true allowlist — only a parseable payload survives, and every
+preceding log line is excluded structurally. The last-clean-line tier is a
+best-effort heuristic with a log-shape *denylist*, so a log line under a
+bare `name message` formatter (no timestamp, no level token) can still
+reach the note; the cap bounds that to one ≤400-char line, and the
+recurrence guard shares the same blind spot.
 
 **If you want your predicate's verdict preserved, emit it as a trailing
-JSON object or as one clean final line.** The reason for the bound is that
+JSON object** (the only tier with a real guarantee) **or as one clean final
+line.** The reason for the bound is that
 `note` is not a private field — fused-memory's reconciliation
 `_format_outcome_echo` appends it to a Mem0 completion-summary write, so
 whatever lands there is ingested into memory. Task 2902 is the specimen: a

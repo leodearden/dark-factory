@@ -411,12 +411,9 @@ _LOG_LINE_RE = re.compile(
 def _summarize_predicate_output(out: object, *, rc: int) -> str:
     """Summarize a predicate check's raw output into a bounded provenance note.
 
-    An **ALLOWLIST**, not a denylist: only recognized *structured* shapes
-    survive.  Anything the extractor does not recognize is dropped, leaving
-    the bare verdict prefix — an unrecognized shape therefore yields a less
-    informative note, never a corrupted one.  A denylist that stripped known
-    log formats would leak on the first format nobody anticipated, which is
-    exactly how the motivating specimen arose.
+    Anything the extractor does not recognize is dropped, leaving the bare
+    verdict prefix — an unrecognized shape therefore yields a less
+    informative note, never a corrupted one.
 
     Motivating specimen — task 2902.  ``_default_run_script`` merges stderr
     into stdout and returns ``decode()[-2000:]``, so a chatty predicate
@@ -431,24 +428,49 @@ def _summarize_predicate_output(out: object, *, rc: int) -> str:
     Raw subprocess output is dropped at this seam for that reason alone; it
     stays recoverable in the orchestrator log, which is not memory-ingested.
 
-    Extraction runs two tiers: the script's own trailing JSON block, else a
-    single clean final line.  Tier 1 structurally excludes every preceding log
-    line rather than pattern-matching them; tier 2 rejects a final line
-    carrying log shape.
+    Extraction runs two tiers with DIFFERENT guarantees — do not read the
+    whole of it as an allowlist.  Tier 1 (the script's own trailing JSON
+    block) IS a true allowlist: only a parseable structured payload survives,
+    and every preceding log line is excluded STRUCTURALLY rather than by
+    pattern-matching.  Tier 2 (a single clean final line) is a best-effort
+    heuristic guarded by a log-shape DENYLIST (``_LOG_LINE_RE``), and it
+    inherits a denylist's weakness: a log line under a formatter nobody
+    anticipated still reaches the note.  Concretely, a ``%(name)s
+    %(message)s`` line such as ``httpx HTTP Request: GET http://...`` carries
+    neither timestamp nor level token and is kept verbatim.
 
-    That rejection is deliberately CONSERVATIVE and will drop an otherwise
-    clean final line that merely contains a standalone ``INFO``/``ERROR``
-    token.  Losing a payload is the safe failure direction: the verdict prefix
-    always survives, and ``_run_predicate`` logs the raw output before calling
-    this, so nothing is silently discarded.
+    Tier 2 cannot be tightened into a grammar-based allowlist without
+    discarding the very verdicts it exists to preserve: the real in-repo
+    predicate outputs ``check ok: 0 flakes`` and
+    ``check_merge_flakiness: ... -- invariant holds`` are prose-shaped and
+    structurally indistinguishable from a formatter-less log line.  The
+    residual exposure is therefore bounded rather than closed: at most ONE
+    line, at most ``_PREDICATE_NOTE_MAX_PAYLOAD_CHARS`` of it — never the
+    multi-KB blob task 2902 stamped.  ``scripts/scan_provenance_note_log_leaks.py``
+    shares this blind spot (its discriminator also requires a timestamp), so
+    a predicate script that wants its verdict preserved intact should emit
+    trailing JSON — tier 1 is the only tier with a real guarantee.
+
+    The denylist rejection is otherwise deliberately CONSERVATIVE and will
+    drop an otherwise clean final line that merely contains a standalone
+    ``INFO``/``ERROR`` token.  Losing a payload is the safe failure
+    direction: the verdict prefix always survives, and ``_run_predicate``
+    logs the raw output before calling this, so nothing is silently
+    discarded.
 
     An oversized payload is replaced WHOLESALE with a marker naming the
     dropped size — never sliced.  Task 2054 found a raw ``note[:N]`` slice
     downstream cutting mid-token (garbling ``8679,8680`` into ``8679,868``);
     a sliced JSON object is worse still, unparseable yet still
     structured-looking to a reader.
+
+    *rc* is rendered as both a word and a number, and the word is DERIVED
+    from the number (``passed`` iff ``rc == 0``).  Today the only caller is
+    ``_run_predicate``'s ``rc == 0`` branch, but a hardcoded ``passed`` would
+    let a future non-zero caller stamp the self-contradictory note
+    ``predicate check passed (rc=2)``; the text cannot contradict the value.
     """
-    verdict = f'predicate check passed (rc={rc})'
+    verdict = f'predicate check {"passed" if rc == 0 else "failed"} (rc={rc})'
     payload = _extract_predicate_payload(out)
     if payload is None:
         return verdict
