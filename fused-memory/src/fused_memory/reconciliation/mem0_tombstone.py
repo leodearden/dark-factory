@@ -74,18 +74,30 @@ import json
 import logging
 from datetime import UTC, datetime, timedelta
 
-from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord
+from fused_memory.reconciliation.recon_ledger import (
+    RECORD_KIND_MEM0_TOMBSTONE,
+    ReconLedgerRecord,
+)
 
 logger = logging.getLogger(__name__)
 
-# ReconLedgerStore record_kind for a recon-initiated Mem0 deletion tombstone.
+# RECORD_KIND_MEM0_TOMBSTONE ('mem0_tombstone') is the ReconLedgerStore
+# record_kind for a recon-initiated Mem0 deletion tombstone. It is defined in
+# recon_ledger (single source — this module already imports from there, and
+# the reverse edge would be a cycle) and re-exported here alongside the writer
+# that uses it.
 #
-# Deliberately NOT a member of recon_ledger.MARKER_KINDS: that tuple drives
-# gc()'s terminal-task DELETE arm and marker_task_ids(), both of which treat
-# the task_id column as a Taskmaster task id. A tombstone's task_id column
-# holds a Mem0 memory uuid, so it must never enter either path — it expires
-# purely via expires_at.
-RECORD_KIND_MEM0_TOMBSTONE: str = 'mem0_tombstone'
+# It is deliberately NOT a member of recon_ledger.MARKER_KINDS: that tuple
+# drives gc()'s terminal-task DELETE arm and marker_task_ids(), both of which
+# treat the task_id column as a Taskmaster task id. A tombstone's task_id
+# column holds a Mem0 memory uuid, so it must never enter either path — it
+# expires purely via expires_at.
+__all__ = [
+    'MEM0_TOMBSTONE_TTL_DAYS',
+    'RECORD_KIND_MEM0_TOMBSTONE',
+    'is_protected_mirror_record',
+    'record_mem0_deletion_tombstone',
+]
 
 # Retention window for tombstone rows. Follows the same rationale already
 # written down for summary_pool.CYCLE_SUMMARY_TTL_DAYS: the recon ledger is a
