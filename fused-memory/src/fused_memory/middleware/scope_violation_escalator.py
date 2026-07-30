@@ -23,7 +23,9 @@ The distinction is load-bearing rather than cosmetic (task 3119): this
 escalation is read by operators and rendered into agent briefings, so an
 advisory described in rejection wording reports that a task was rejected when
 it in fact exists — and tells the reader to resubmit work that already
-landed.  Both outcomes are severity ``info``.
+landed.  Both outcomes are severity ``info`` — the FLOOR of the
+``blocking|info|critical|urgent`` vocabulary in ``escalation.models``, so the
+wording is what distinguishes them, not the severity.
 
 Design mirrors :class:`fused_memory.middleware.curator_escalator.CuratorEscalator`:
 
@@ -49,14 +51,9 @@ first occurrence still escalates, but re-proposals of the same misroute
 (e.g. a daily reconciliation consolidation round) increment the parent's
 ``dedupe_count`` instead of filing a fresh escalation (task 2946).  The two
 outcome modes fold INDEPENDENTLY so a pending record of one can never absorb
-the other and report it with the wrong outcome.
-
-Note on history: the ~40 pre-existing on-disk ``esc-task-path-guard-*``
-records were all terminal (``dismissed``) when the advisory wording landed,
-and folding only ever targets PENDING parents, so no stale-worded parent can
-capture a future advisory.  They are deliberately NOT rewritten — this
-correction is forward-looking only, and a backfill would rewrite closed
-history in the live escalation store for no operational gain.
+the other and report it with the wrong outcome — see
+``_ADVISORY_FINGERPRINT_TOKEN`` for how, and why only one mode contributes a
+token.
 """
 
 from __future__ import annotations
@@ -97,9 +94,16 @@ _ANCHOR_TASK_ID: str = 'task-path-guard'
 _AGENT_ROLE: str = 'fused-memory/path-guard'
 _CATEGORY: str = 'scope_violation'
 
-# Dedup discriminator appended to the fingerprint's ``affected_ids`` on the
-# advisory branch ONLY (see report_rejection) so an advisory and a
-# FILES-certain rejection over the same paths never fold into one parent.
+# Dedup discriminator putting the outcome mode into the content fingerprint, so
+# an advisory and a FILES-certain rejection over the same paths never fold into
+# one parent whose wording would then mislabel the other (task 3119).
+#
+# Appended on the advisory branch ONLY, and the asymmetry is the whole point:
+# compute_content_fingerprint sorts and \x1f-joins affected_ids before hashing,
+# so a 'mode:rejection' counterpart would change the REJECTION digest too and
+# stop any parent that is still pending across this change from folding.  The
+# rejection composition is therefore left byte-identical to pre-task-3119, and
+# only the newly-introduced mode carries a token.
 _ADVISORY_FINGERPRINT_TOKEN: str = 'mode:advisory'
 
 # ``suggested_action`` for the PROSE-only advisory.  Deliberately NOT
@@ -128,16 +132,13 @@ class ScopeViolationEscalator:
     Handles two distinct categories:
 
     * **scope_violation** (:meth:`report_rejection`) — filed for BOTH
-      task-creation outcomes the path-scope guard produces: a FILES-certain
-      rejection (no task created) and a PROSE-only advisory (task created and
-      stamped with ``metadata.possible_scope_mismatch``).  The ``advisory=``
-      keyword selects which outcome the escalation's wording and
-      ``suggested_action`` describe — see :meth:`report_rejection`.  Recurring
-      identical events fold into one pending parent (content-fingerprint dedup,
-      unbounded window) and the first occurrence always escalates; the two
-      outcome modes fold INDEPENDENTLY of each other.  Disable via the
-      ``scope_violation_dedupe_enabled=False`` constructor escape hatch to
-      restore legacy one-escalation-per-call behavior.
+      task-creation outcomes the path-scope guard produces (module docstring has
+      the taxonomy); the ``advisory=`` keyword selects which one the record
+      describes.  Recurring identical events fold into one pending parent
+      (content-fingerprint dedup, unbounded window), the two modes folding
+      independently.  Disable via the ``scope_violation_dedupe_enabled=False``
+      constructor escape hatch to restore legacy one-escalation-per-call
+      behavior.
     * **adjudicator_config_defect** (:meth:`report_budget_misconfig`) — filed
       when the path-scope adjudicator's LLM call returns ``error_max_budget_usd``
       with ``cost_usd > 0``, indicating the per-call budget is too low for the
@@ -194,16 +195,11 @@ class ScopeViolationEscalator:
         """File a ``scope_violation`` escalation for EITHER guard outcome.
 
         Despite the name (kept for call-site/test-double back-compat), this
-        method covers BOTH outcomes the path-scope guard produces since task
-        2206, selected by *advisory*:
-
-        * ``advisory=False`` (default) — a FILES-certain hard rejection.  No
-          task was created and the caller got a ``DarkFactoryPathScopeViolation``
-          error dict.  Wording tells the operator to resubmit to the owner.
-        * ``advisory=True`` — a PROSE-only advisory.  The submission was NOT
-          blocked: the task WAS created and stamped with
-          ``metadata.possible_scope_mismatch``.  Wording says so, and
-          ``suggested_action`` is ``no_action_advisory_only`` (task 3119).
+        method covers BOTH outcomes described in the module docstring, selected
+        by *advisory*: a FILES-certain hard rejection (default — wording tells
+        the operator to resubmit to the owner) or a PROSE-only advisory (the
+        task WAS created and stamped, so the wording says so and
+        ``suggested_action`` is ``no_action_advisory_only``).
 
         Returns the escalation id when one was filed, ``None`` otherwise
         (escalation package missing, queue write failed, etc.).  Never
@@ -219,11 +215,8 @@ class ScopeViolationEscalator:
         therefore folds into the first pending escalation — this method then
         returns the EXISTING parent id, not a freshly-minted one — until a
         human resolves it, at which point a later recurrence re-escalates.
-
-        Advisories and rejections fold INDEPENDENTLY: the two modes are
-        distinguished in the fingerprint, so a pending advisory can never
-        swallow a later genuine rejection over the same paths (or vice versa)
-        and report it with the wrong outcome.
+        Advisories and rejections fold INDEPENDENTLY, so a pending record of one
+        can never swallow the other and report it with the wrong outcome.
 
         Sync because :meth:`escalation.queue.EscalationQueue.submit` is a
         synchronous filesystem write (atomic ``rename``); no await needed,
@@ -261,10 +254,14 @@ class ScopeViolationEscalator:
                 f'resubmit_to_{suggested_project}' if suggested_project else 'manual_route'
             )
 
+        # Labels are outcome-NEUTRAL ('filing_*', not 'rejecting_*'): detail is
+        # rendered verbatim into agent briefings, and on the advisory path
+        # nothing was rejected (task 3119).  Safe to relabel — detail is not an
+        # input to the dedup fingerprint.
         detail_lines = [
             f'candidate_title={candidate_title!r}',
-            f'rejecting_project_id={project_id!r}',
-            f'rejecting_project_root={project_root!r}',
+            f'filing_project_id={project_id!r}',
+            f'filing_project_root={project_root!r}',
             f'matched_paths={list(matched_paths)}',
             f'suggested_project={suggested_project!r}',
         ]
@@ -302,12 +299,7 @@ class ScopeViolationEscalator:
                 id=queue.make_id(_ANCHOR_TASK_ID),
                 task_id=_ANCHOR_TASK_ID,
                 agent_role=_AGENT_ROLE,
-                # 'info' for BOTH modes by deliberate choice, not oversight:
-                # escalation.models defines the severity vocabulary as
-                # blocking|info|critical|urgent, so 'info' is already the
-                # FLOOR — an advisory cannot be filed any quieter.  The
-                # wording below is what distinguishes the two, not the
-                # severity (task 3119).
+                # 'info' for BOTH modes: already the severity floor (module docstring).
                 severity='info',
                 category=_CATEGORY,
                 summary=(
@@ -327,16 +319,7 @@ class ScopeViolationEscalator:
                         *matched_paths,
                         f'suggested:{suggested_project or "none"}',
                         f'project:{project_id}',
-                        # ASYMMETRY IS DELIBERATE (task 3119): the mode must be
-                        # in the fingerprint so an advisory and a FILES-certain
-                        # rejection over the same shape can't fold into one
-                        # parent whose wording then mislabels the other.  But
-                        # there is NO 'mode:rejection' counterpart, because
-                        # compute_content_fingerprint sorts and \x1f-joins
-                        # affected_ids before hashing — adding any token to the
-                        # rejection branch would change its digest, orphan every
-                        # pending rejection parent already on disk, and re-flood
-                        # the operator queue that task 2946 quieted.
+                        # Advisory-only by design — see _ADVISORY_FINGERPRINT_TOKEN.
                         *([_ADVISORY_FINGERPRINT_TOKEN] if advisory else []),
                     ]),
                 ),
@@ -350,10 +333,8 @@ class ScopeViolationEscalator:
             esc_id = submit_or_dedupe(queue, esc, config)['id']  # type: ignore[possibly-unbound]
         except Exception:
             # Queue I/O failure must not propagate — the guard's own outcome
-            # stands either way (the error dict is still returned on the
-            # FILES-certain path; the task is still created and stamped on the
-            # advisory path), the operator just doesn't get the heads-up.
-            # Mirror curator_escalator's tolerance so a broken filesystem
+            # stands either way, the operator just doesn't get the heads-up.
+            # Mirrors curator_escalator's tolerance so a broken filesystem
             # can't break task creation.
             logger.exception(
                 'scope_violation_escalator: failed to submit escalation '

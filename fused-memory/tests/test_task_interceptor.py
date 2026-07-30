@@ -8029,15 +8029,14 @@ class TestPathGuardEscalationWordingEndToEnd:
         marker = (kwargs.get('metadata') or {}).get('possible_scope_mismatch')
         assert marker is not None, f'expected the advisory stamp: {kwargs!r}'
 
-        # What the operator reads must agree with it.
+        # What the operator reads must agree with it.  Only the two contracts
+        # that distinguish the branches are asserted here — the advisory prose
+        # itself is pinned once, in tests/test_scope_violation_escalator.py.
         payload = self._written_payload(tmp_path)
         summary = payload['summary']
-        assert 'ADVISORY' in summary, summary
-        assert 'CREATED' in summary, summary
         assert 'reject' not in summary.lower(), (
             f'record claims a rejection but the task was created: {summary!r}'
         )
-        assert 'possible_scope_mismatch' in payload['detail'], payload['detail']
         assert payload['suggested_action'] == 'no_action_advisory_only', payload
 
     async def test_files_certain_submission_writes_rejection_wording(

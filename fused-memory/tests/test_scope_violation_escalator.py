@@ -258,8 +258,17 @@ class TestAdvisoryVsRejectionWording:
         assert len(payloads) == 1, f'expected exactly one escalation, found: {payloads}'
         return payloads[0]
 
-    def test_advisory_summary_states_created_not_rejected(self, tmp_path):
-        """The advisory summary must NOT say 'rejected' — nothing was rejected."""
+    def test_advisory_record_never_claims_a_rejection(self, tmp_path):
+        """The advisory record must not label a created task as rejected.
+
+        Pins the STABLE contracts only, so a harmless rewording of the same
+        correct message doesn't break the suite: the ``ADVISORY`` marker, the
+        absence of 'reject' anywhere in the summary, the ``suggested_action``
+        value (rendered verbatim into agent briefings by
+        ``orchestrator/agents/briefing.py``, where ``resubmit_to_<project>``
+        would tell an agent to redo work that already landed), and the
+        ``possible_scope_mismatch`` stamp name an operator greps for.
+        """
         esc = ScopeViolationEscalator()
         esc_id = esc.report_rejection(
             project_root=str(tmp_path),
@@ -273,71 +282,57 @@ class TestAdvisoryVsRejectionWording:
         payload = self._one_payload(tmp_path)
         summary = payload['summary']
         assert 'ADVISORY' in summary, summary
-        assert 'CREATED' in summary, summary
-        assert 'gui/' in summary, summary
-        assert 'reify_gui' in summary, summary
         # THE mislabel this task exists to kill: an advisory that says the
         # submission was rejected, when in fact the task was created.
         assert 'reject' not in summary.lower(), (
             f'advisory summary must not claim a rejection: {summary!r}'
         )
+        assert payload['suggested_action'] == 'no_action_advisory_only', payload
 
-    def test_advisory_detail_explains_not_blocked_and_names_stamp(self, tmp_path):
-        """Advisory detail: not blocked, task created, names the metadata stamp.
-
-        Also pins that the advisory branch replaces ONLY the closing prose
-        paragraph — the structured routing context an operator needs to act on
-        must survive untouched.
-        """
-        esc = ScopeViolationEscalator()
-        esc.report_rejection(
-            project_root=str(tmp_path),
-            project_id='reify',
-            candidate_title='Rework the gui panel',
-            matched_paths=('gui/',),
-            suggested_project='reify_gui',
-            advisory=True,
-        )
-        detail = self._one_payload(tmp_path)['detail']
-        # The submission was NOT blocked and the task WAS created.
-        assert 'NOT blocked' in detail, detail
-        assert 'WAS created' in detail, detail
+        detail = payload['detail']
         # Named verbatim so the operator can grep the created task's metadata.
         assert 'possible_scope_mismatch' in detail, detail
-        # No resubmission is required — the task already exists.
-        assert 'no resubmission' in detail.lower(), detail
         assert 'was rejected' not in detail, (
             f'advisory detail must not claim a rejection: {detail!r}'
         )
-        # Structured routing context survives unchanged.
+        # The structured routing context survives the advisory branch, under
+        # outcome-NEUTRAL labels: a 'rejecting_project_id=' line would
+        # re-introduce the mislabel in the very field an operator (or a briefed
+        # agent) reads right next to the corrected suggested_action.
         for field in (
             'candidate_title=',
-            'rejecting_project_id=',
+            'filing_project_id=',
+            'filing_project_root=',
             'matched_paths=',
             'suggested_project=',
         ):
             assert field in detail, f'advisory detail dropped {field!r}: {detail!r}'
+        assert 'rejecting_project' not in detail, detail
 
-    def test_advisory_suggested_action_is_not_resubmit(self, tmp_path):
-        """suggested_action is rendered verbatim into agent briefings.
+    def test_advisory_without_suggested_project_is_still_advisory_only(self, tmp_path):
+        """advisory + no resolvable owner must not fall through to manual_route.
 
-        ``orchestrator/agents/briefing.py`` prints it as "Suggested action:
-        resubmit_to_<project>" — a directly actionable instruction that
-        contradicts "you were not blocked" and is the specific behaviour agents
-        were observed acting on.  An advisory must not tell anyone to resubmit.
+        Reachable in production: a prose scan can hit several projects, leaving
+        the guard with no single suggested owner.  If the advisory check were
+        ordered after the ``manual_route`` fallback, this shape would hand a
+        briefed agent a routing directive for a submission that was never
+        blocked — the same class of false instruction as ``resubmit_to_*``.
         """
         esc = ScopeViolationEscalator()
-        esc.report_rejection(
+        esc_id = esc.report_rejection(
             project_root=str(tmp_path),
             project_id='reify',
-            candidate_title='Rework the gui panel',
-            matched_paths=('gui/',),
-            suggested_project='reify_gui',
+            candidate_title='ambiguous prose hit',
+            matched_paths=('fused-memory/', 'crates_other/'),
+            suggested_project=None,
             advisory=True,
         )
+        assert esc_id is not None
         payload = self._one_payload(tmp_path)
         assert payload['suggested_action'] == 'no_action_advisory_only', payload
-        assert 'resubmit' not in payload['suggested_action']
+        # The unknown-owner placeholder still renders, still without 'reject'.
+        assert '<unknown' in payload['summary'], payload
+        assert 'reject' not in payload['summary'].lower(), payload
 
     def test_rejection_wording_and_action_unchanged(self, tmp_path):
         """The other half of the pair: the FILES-certain path is untouched.
@@ -358,6 +353,10 @@ class TestAdvisoryVsRejectionWording:
         assert payload['summary'].startswith('Misrouted task rejected: cites '), payload
         assert 'was rejected' in payload['detail'], payload
         assert payload['suggested_action'] == 'resubmit_to_dark_factory', payload
+        # The structured context labels are outcome-neutral on BOTH modes — the
+        # rejecting/filing project is the same project either way.
+        assert 'filing_project_id=' in payload['detail'], payload
+        assert 'rejecting_project' not in payload['detail'], payload
 
     def test_both_modes_are_severity_info(self, tmp_path):
         """Both modes stay severity='info' — there is no tier below it.
