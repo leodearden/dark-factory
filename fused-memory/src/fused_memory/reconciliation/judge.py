@@ -233,7 +233,10 @@ class Judge:
 
             # Successful transport (even a malformed-content verdict, which stays
             # fail-closed serious below) clears the per-project infra streak so a
-            # recovered judge starts fresh.
+            # recovered judge starts fresh.  For the claude_cli provider a success
+            # that carried NO usable verdict is not "successful transport" for this
+            # purpose — it raises JudgeInfraError above and is diverted before this
+            # line, so it correctly keeps counting toward the streak.
             self._consecutive_infra_failures.pop(run.project_id, None)
 
             verdict = self._parse_verdict(response_text, run_id)
@@ -255,6 +258,16 @@ class Judge:
                     # such marker and keeps the already-truthful reason. (Infra
                     # failures never reach here — they are diverted to
                     # _handle_infra_failure before _parse_verdict.)
+                    #
+                    # For the claude_cli provider this fabricated-serious branch
+                    # is now UNREACHABLE: its verdict arrives as a validated
+                    # structured payload, and a success carrying no usable
+                    # verdict is diverted to _handle_infra_failure BEFORE
+                    # _parse_verdict (raised in _call_judge_cli as
+                    # cli_output_empty / cli_output_unparseable). The branch
+                    # survives for the anthropic/openai text fallback, which has
+                    # no --json-schema mechanism and so can still return prose
+                    # that must be treated fail-closed.
                     is_parse_failure = any(
                         f.get('code') == 'unparseable_judge_response'
                         for f in verdict.findings
