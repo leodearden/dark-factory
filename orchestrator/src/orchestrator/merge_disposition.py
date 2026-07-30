@@ -70,7 +70,7 @@ import re
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import _run
@@ -108,6 +108,39 @@ class SkewEvidence:
     implicated_commits: tuple[str, ...]
     failing_tests: tuple[str, ...]
     overlap_files: tuple[str, ...]
+
+
+class ClassificationResult(NamedTuple):
+    """What ``classify_merge_failure_disposition`` returns.
+
+    A NamedTuple, so every existing positional unpack keeps working while call
+    sites can read the two evidence slots BY NAME. That matters here because
+    the slots differ only in their gate, not their type, and picking the wrong
+    one silently re-creates the bug this module was fixed for.
+
+    ``evidence`` — the ADJUDICATED attribution: non-``None`` **iff**
+    ``disposition is INTEGRATION_SKEW``. This is what
+    ``_render_skew_surfaces`` turns into the "port the landed commit … do not
+    hunt your own diff" directive, so its non-``None``-ness must keep meaning
+    "this IS a skew".
+
+    ``observed_evidence`` — the bundle GATHERED (task 3178): non-``None``
+    whenever implicated landings were found, REGARDLESS of verdict. On the
+    promoted path it is the same object as ``evidence``; on an I7/I5 DEGRADE it
+    is the evidence the gate refused to promote — which is what makes the
+    degrade measurable. ``None`` when no landings were implicated, when
+    classification could not proceed (no candidate files / no repo), and on the
+    fail-open path.
+
+    Explicitly NOT a skew verdict: read ``disposition`` for that. The
+    adjudicated slot is deliberately kept narrow — "a non-empty evidence field
+    means this is a skew" is the inference that let the false I7 premise
+    survive two task cycles (see the module docstring's I7 account).
+    """
+
+    disposition: MergeFailureDisposition
+    evidence: SkewEvidence | None
+    observed_evidence: SkewEvidence | None
 
 
 # ---------------------------------------------------------------------------
@@ -469,7 +502,7 @@ async def classify_merge_failure_disposition(
     task_id: str | None = None,
     repo_root: Path | None = None,
     event_store: EventStore | None = None,
-) -> tuple[MergeFailureDisposition, SkewEvidence | None, SkewEvidence | None]:
+) -> ClassificationResult:
     """Classify a merge-verify failure's disposition (git-only, read-only, fail-open).
 
     Invariants (continued from the module docstring):
@@ -518,35 +551,16 @@ async def classify_merge_failure_disposition(
             verdict). None degrades I5 to indeterminate (fail-open).
 
     Returns:
+        A :class:`ClassificationResult` — see its docstring for the contract
+        distinguishing the ADJUDICATED ``evidence`` slot from the GATHERED
+        ``observed_evidence`` slot. Unpacks positionally as
         ``(disposition, evidence, observed_evidence)``.
-
-        ``evidence`` — the ADJUDICATED attribution: a :class:`SkewEvidence`
-        iff ``disposition is MergeFailureDisposition.INTEGRATION_SKEW``, else
-        ``None``. This is the bundle ``_render_skew_surfaces`` turns into the
-        "port the landed commit … do not hunt your own diff" directive, so its
-        non-None-ness must keep meaning "this IS a skew". Unchanged contract.
-
-        ``observed_evidence`` — the bundle GATHERED (task 3178): non-None
-        whenever implicated landings were found, REGARDLESS of verdict. On the
-        promoted path it is the same object as ``evidence``; on an I7/I5
-        DEGRADE it is the evidence the gate refused to promote, which is what
-        makes the degrade measurable — the merge_attempt row can now record
-        which commits were cited and why the gate bit, instead of persisting
-        only ``{disposition, outcome}``. ``None`` when no landings were
-        implicated, when classification could not proceed (no candidate files /
-        no repo), and on the fail-open path.
-
-        Explicitly NOT a skew verdict: read ``disposition`` for that. The
-        adjudicated slot is deliberately kept narrow — "a non-empty evidence
-        field means this is a skew" is the inference that let the false I7
-        premise survive two task cycles, so the new channel is a separate
-        element rather than an overload of the old one.
     """
     try:
         if preexisting:
             # [boundary row 1] I1: refine the caller-computed bucket only —
             # never re-probe verify_failure_is_preexisting_on_main.
-            return (MergeFailureDisposition.MAIN_RED, None, None)
+            return ClassificationResult(MergeFailureDisposition.MAIN_RED, None, None)
 
         # Extract the branch's failing-test ids and the source/test files they
         # implicate (Open Q1: VerifyResult carries no structured per-test list,
@@ -559,7 +573,7 @@ async def classify_merge_failure_disposition(
         # failure, or there is no repo to search -> evidence is unavailable ->
         # INDETERMINATE. Never guess BRANCH_BUG from an empty extraction.
         if not candidate_files or repo_root is None:
-            return (MergeFailureDisposition.INDETERMINATE, None, None)
+            return ClassificationResult(MergeFailureDisposition.INDETERMINATE, None, None)
 
         # Map candidate files to landings on main between the branch's merge-base
         # and main's tip (I2 read-only git log; 2357: both SHAs are the
@@ -598,7 +612,7 @@ async def classify_merge_failure_disposition(
             # No landings -> nothing gathered, so observed_evidence is None too
             # (task 3178). That is what keeps the BRANCH_BUG merge_attempt row's
             # payload byte-identical under the widened emit guard.
-            return (MergeFailureDisposition.BRANCH_BUG, None, None)
+            return ClassificationResult(MergeFailureDisposition.BRANCH_BUG, None, None)
 
         # A landing IS implicated. I5: call it INTEGRATION_SKEW only when the
         # branch is *positively confirmed* green pre-merge (workflow_verify).
@@ -648,7 +662,9 @@ async def classify_merge_failure_disposition(
         )
         green = _branch_pre_merge_verify_green(event_store, task_id)
         if failing_tests and green is True:
-            return (MergeFailureDisposition.INTEGRATION_SKEW, observed, observed)
+            return ClassificationResult(
+                MergeFailureDisposition.INTEGRATION_SKEW, observed, observed,
+            )
 
         # Loud degrade (task 3178). This complements — does not replace — the
         # merge_attempt row the caller now emits: the row is the machine-readable
@@ -679,7 +695,9 @@ async def classify_merge_failure_disposition(
             len(overlap_files),
             overlap_files[:_MAX_LOGGED_EVIDENCE_ITEMS],
         )
-        return (MergeFailureDisposition.INDETERMINATE, None, observed)
+        return ClassificationResult(
+            MergeFailureDisposition.INDETERMINATE, None, observed,
+        )
     except Exception:
         logger.warning(
             'classify_merge_failure_disposition: internal error; degrading to '
@@ -689,4 +707,4 @@ async def classify_merge_failure_disposition(
         # A classifier fault gathered nothing and MUST NOT fabricate a bundle:
         # observed_evidence stays None, which is what keeps I3's fail-open path
         # byte-identical downstream (no merge_attempt row is emitted for it).
-        return (MergeFailureDisposition.INDETERMINATE, None, None)
+        return ClassificationResult(MergeFailureDisposition.INDETERMINATE, None, None)

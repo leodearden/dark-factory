@@ -31,7 +31,11 @@ from _orch_helpers import make_placeholder_future
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
-from orchestrator.merge_disposition import MergeFailureDisposition, SkewEvidence
+from orchestrator.merge_disposition import (
+    ClassificationResult,
+    MergeFailureDisposition,
+    SkewEvidence,
+)
 from orchestrator.merge_queue import (
     MAIN_HEALTH_RED_REASON_PREFIX,
     MergeOutcome,
@@ -880,8 +884,10 @@ class TestRunPostMergeVerifyRealMainHeadFilter:
 
         async def _fake_classify(**kwargs):
             captured.update(kwargs)
-            # 3-tuple since task 3178: (disposition, evidence, observed_evidence).
-            return MergeFailureDisposition.BRANCH_BUG, None, None
+            # Return the REAL type, not a bare 3-tuple: the wrapper reads the
+            # evidence slots by name, and a stub whose shape has drifted from
+            # the function it stands in for is how a false premise survives.
+            return ClassificationResult(MergeFailureDisposition.BRANCH_BUG, None, None)
 
         async def _run() -> tuple[
             MergeFailureDisposition, dict[str, str] | None, str, SkewEvidence | None,

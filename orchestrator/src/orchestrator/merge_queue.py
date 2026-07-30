@@ -966,7 +966,7 @@ async def _classify_disposition_for_outcome(
     fail-open path (a fault gathered nothing and must not fabricate a bundle).
     """
     try:
-        disposition, evidence, observed = await classify_merge_failure_disposition(
+        result = await classify_merge_failure_disposition(
             verify_result=verify,
             branch=req.branch.bare_id,
             merge_base_sha=merge_base_sha,
@@ -977,10 +977,16 @@ async def _classify_disposition_for_outcome(
             repo_root=req.config.project_root,
             event_store=event_store,
         )
-        # ADJUDICATED bundle to the renderer (only INTEGRATION_SKEW gets a
-        # directive); GATHERED bundle out to the caller (task 3178).
-        reason_suffix, failure_diagnostic = _render_skew_surfaces(disposition, evidence)
-        return disposition, failure_diagnostic, reason_suffix, observed
+        # Read the two evidence slots BY NAME (ClassificationResult): the
+        # ADJUDICATED bundle goes to the renderer (only INTEGRATION_SKEW gets a
+        # directive), the OBSERVED/gathered one out to the caller (task 3178).
+        reason_suffix, failure_diagnostic = _render_skew_surfaces(
+            result.disposition, result.evidence,
+        )
+        return (
+            result.disposition, failure_diagnostic, reason_suffix,
+            result.observed_evidence,
+        )
     except Exception:
         logger.warning(
             'Task %s: _classify_disposition_for_outcome failed; degrading to '
