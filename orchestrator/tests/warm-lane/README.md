@@ -86,7 +86,15 @@ Here the tests sit one level deeper (`orchestrator/tests/warm-lane/`) and the
 scripts sit at `orchestrator/scripts/warm-lane/`. The derivation is hoisted into
 one sourced `lib_warm_lane_paths.sh`, so the new depth is **one** edit point
 instead of eight independently-driftable ones, and each ported file's diff
-against reify stays a two-line delta.
+against reify stays a two-line delta (`source` + `SCRIPT=`).
+
+reify's `REPO_ROOT` binding is deliberately **not** carried over into the eight
+ported files. The lib still derives `DF_REPO_ROOT` — it is where a future
+consumer picks it up — but after Deltas 3–6 removed every reify-repo structural
+assertion, no ported file references a repo-root-relative path at all, so an
+alias in each file would be a dead variable reading as if such paths were still
+in play. That is exactly the class of thing this enumerated-delta discipline
+exists to keep visible rather than let accumulate.
 
 Resolution is **pure path arithmetic** from `${BASH_SOURCE[0]}`: it reads no
 environment and invokes no `git rev-parse`. Same discipline, and the same three
@@ -189,6 +197,42 @@ default `--mount`**, so nothing needed re-deriving for the new depth;
 `test_warm_lane_scripts_shipped.py::TestProvisionRepoRootParity` remains the
 sole pin on that behaviour.
 
+## Greenness predicate — exit 0 is not enough
+
+The driver's `test_bash_suite_passes` applies the same predicate reify's own
+runner (`tests/infra/run_all_ambient_isolation_lib.sh`) does: **exit 0 AND a
+`Results: N passed, 0 failed` line AND `N` at or above a per-suite floor**
+(`ASSERT_FLOORS`). Exit status alone cannot tell "all 837 asserts ran and
+passed" from "a block skipped and the rest passed", and leaf **κ** deletes
+reify's originals on the strength of these items being green — so the weaker
+predicate would have been the single weak link in that chain.
+
+Only two shortfalls against the measured counts below are legitimate, both from
+skip guards this leaf was required to preserve verbatim, so both are subtracted
+in the floor rather than left to pass silently:
+
+| Suite | measured | floor | conditional block |
+|---|---|---|---|
+| `test_provision_warm_lane_fs.sh` | 111 | 106 | Block I (5 asserts) — real-geometry `xfs_info`/`xfs_db` proof, guarded on `mkfs.xfs`/`xfs_info`/`xfs_db`. Measured both ways: 111 with xfsprogs, 106 without. |
+| `test_warm_lane_audit.sh` | 228 | 225 | L9 (3 asserts) — unreadable-record degradation, guarded on `id -u != 0` because mode 000 is not a barrier for root. |
+
+xfsprogs is deliberately **not** promoted into the driver's
+`REQUIRED_HOST_TOOLS`: Block I's guard exists so the bash file stays runnable by
+a developer on any host, and hard-requiring an optional package would red the
+whole orchestrator suite on a host that lacks only that. Every other suite's
+floor equals its measured count. `test_thin_warm_lane.sh`'s Block C df-delta
+assert is not a deduction — it is gated on `REIFY_WARM_LANE_MOUNT`, which the
+driver always strips, so 45 is both its floor and its measured count there.
+
+The driver also strips **every `REIFY_*` key** from the subprocess environment
+(a prefix rule, not a name list, so it cannot drift as leaves β/γ/δ/ε add
+seams). This host also develops reify, and the exposure was measured, not
+assumed: with `REIFY_WARM_LANE_AUDIT_SAFETY=off` leaked in, `test_warm_lane_audit.sh`
+reports 35 passed / 193 failed; with `REIFY_WARM_LANE_GC_PROTECT_GLOB='_lane-*'`,
+`test_warm_lane_gc.sh` reports 101 / 69. The strip is safe because every ported
+suite exports the `REIFY_*` vars it needs per invocation and reads none from the
+ambient environment.
+
 ## Measured wall-clock
 
 Measured on an unloaded host, each `.sh` run directly and sequentially:
@@ -238,14 +282,27 @@ prohibitive, the sanctioned route is `git.offline_lane_commands` in
 `dark-factory-orchestrator.yaml`, which runs a marker-selected bucket
 post-merge, off the verify hot path.
 
-Each item carries `@pytest.mark.timeout(360)` with an inner
-`subprocess.run(timeout=300)`. The marker is required because
-`orchestrator/pyproject.toml` sets `timeout = 60` with
-`timeout_method = "thread"` and `--max-worker-restart=0`: a bare local
-`pytest tests/warm-lane` would otherwise get 60s, and an over-limit item
-`os._exit()`s its whole xdist worker. Keeping the subprocess timeout strictly
-below the pytest timeout means a hung bash test fails as one clean pytest
-failure with its stdout/stderr captured. All items share
+Each item carries `@pytest.mark.timeout(360)` with an inner subprocess timeout
+of 300s. The marker is required because `orchestrator/pyproject.toml` sets
+`timeout = 60` with `timeout_method = "thread"` and `--max-worker-restart=0`: a
+bare local `pytest tests/warm-lane` would otherwise get 60s, and an over-limit
+item `os._exit()`s its whole xdist worker. Keeping the subprocess timeout
+strictly below the pytest timeout means a hung bash test fails as one clean
+pytest failure with its stdout/stderr captured.
+
+Delivering that failure shape takes an explicit `Popen` with
+`start_new_session=True` plus a `killpg` on timeout, not a plain
+`subprocess.run(timeout=...)`, for two measured reasons. First,
+`subprocess.run` SIGKILLs only the direct `bash`, so its `trap cleanup EXIT`
+never runs and its backgrounded helpers survive — `test_warm_lane_gc.sh`
+launches several `( flock -x 9 && … sleep 300 ) &` and
+`( cd <lane>/target && exec sleep 300 ) &` liveness fixtures, which would keep
+holding lane flocks and keeping lane trees busy for up to five minutes on the
+verify host, turning one timeout into a cascade. Measured on a synthetic hang:
+plain `subprocess.run(timeout=…)` left 2 orphans, the `killpg` path left 0.
+Second, `subprocess.run` *raises* `TimeoutExpired` rather than returning, so the
+hang path would surface as an exception with the output hanging off the exception
+object instead of the documented assertion-with-captured-tail. All items share
 `@pytest.mark.xdist_group('warm_lane_bash')` so `--dist loadgroup` co-locates
 them on a single worker — reify classifies all of these as `pool` (serialised),
 and `lib_live_refs.sh` walks `/proc`, where a concurrently-running sibling's cwd
