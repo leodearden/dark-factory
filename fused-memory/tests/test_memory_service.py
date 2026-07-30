@@ -1493,6 +1493,143 @@ class TestUpdateMemoryExistenceCheck:
         assert scope.project_id == 'dark_factory'
 
 
+class TestUpdateMemoryContentArm:
+    """MemoryService.update_memory content-amend arm (§5(b)).
+
+    Routes through Mem0Backend.update — which re-embeds, rewrites updated_at
+    and appends a mem0 history row. All three are correct for a genuine content
+    change and inherent to mem0.update(), not design choices.
+    """
+
+    @staticmethod
+    def _forwarded_metadata(service):
+        """The ``metadata=`` kwarg the service forwarded to Mem0Backend.update."""
+        service.mem0.update.assert_awaited_once()
+        return service.mem0.update.await_args.kwargs['metadata']
+
+    @pytest.mark.asyncio
+    async def test_envelope_echoes_same_point_id(self, service):
+        """Identity stability is assertable from the response, without re-fetching."""
+        result = await service.update_memory(
+            memory_id='point-1', project_id='test',
+            content='amended text', reason='test amend',
+        )
+
+        assert result['status'] == 'updated'
+        assert result['store'] == 'mem0'
+        assert result['id'] == 'point-1'
+        assert result['content_amended'] is True
+        assert result['metadata_patched'] is False
+
+    @pytest.mark.asyncio
+    async def test_created_at_is_not_forwarded_so_mem0_preserves_it(self, service):
+        """No mem0-owned key is forwarded — mem0 restores them from the stored point.
+
+        ``_update_memory`` re-attaches created_at from the existing payload and
+        regenerates updated_at/hash itself, so forwarding stale copies would at
+        best be inert and at worst fight mem0 for ownership of its own keys.
+        """
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            content='amended text', reason='test amend',
+        )
+
+        forwarded = self._forwarded_metadata(service)
+        from fused_memory.backends.mem0_client import _MEM0_MANAGED_METADATA_KEYS
+        assert not (set(forwarded) & _MEM0_MANAGED_METADATA_KEYS), (
+            f'mem0-owned keys must not be forwarded, got {sorted(forwarded)}'
+        )
+        assert 'created_at' not in forwarded
+
+    @pytest.mark.asyncio
+    async def test_custom_payload_keys_survive_a_bare_content_amend(self, service):
+        """THE load-bearing regression test for the §2 payload-overwrite bug.
+
+        mem0's ``_update_memory`` builds a FRESH payload from
+        ``deepcopy(metadata) if metadata is not None else {}`` and re-attaches
+        only its own nine keys — created_at among them. So an implementation
+        that forgot the read-existing-payload-then-reforward-custom-subset dance
+        still passes a created_at assertion while silently destroying every
+        custom provenance key on the record. This test asserts on the keys mem0
+        does NOT restore, and is the only one here that fails against that bug.
+        Do not drop it as redundant.
+        """
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            content='amended text', reason='test amend',
+        )
+
+        forwarded = self._forwarded_metadata(service)
+        assert forwarded is not None, (
+            'metadata=None wipes every custom payload key — the exact bug'
+        )
+        assert forwarded == {
+            'kind': 'canonical',
+            'src_project': 'dark_factory',
+            'topic': 'docs-prd-landing',
+        }, f'expected the stripped custom subset verbatim, got {forwarded!r}'
+
+    @pytest.mark.asyncio
+    async def test_exactly_one_backend_write(self, service):
+        """One write per call — the content arm never also touches the payload APIs."""
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            content='amended text', reason='test amend',
+        )
+
+        service.mem0.update.assert_awaited_once()
+        call_args = service.mem0.update.await_args
+        assert call_args.args[0] == 'point-1'
+        assert call_args.args[1] == 'amended text'
+        service.mem0.set_payload.assert_not_called()
+        service.mem0.delete_payload.assert_not_called()
+        service.mem0.overwrite_payload.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_one_journal_row_with_truncated_content(self, service):
+        """One log_write_op row; content truncated like update_edge truncates fact."""
+        journal = _journal_mock()
+        service._write_journal = journal
+
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            content='x' * 500, reason='test amend',
+            agent_id='recon-stage-1', session_id='sess-1',
+        )
+
+        journal.log_write_op.assert_awaited_once()
+        kwargs = journal.log_write_op.await_args.kwargs
+        assert kwargs['operation'] == 'update_memory'
+        assert kwargs['project_id'] == 'test'
+        assert kwargs['agent_id'] == 'recon-stage-1'
+        assert kwargs['session_id'] == 'sess-1'
+        assert kwargs['success'] is True
+        assert len(kwargs['params']['content']) == 200
+        assert kwargs['params']['memory_id'] == 'point-1'
+        assert kwargs['params']['reason'] == 'test amend'
+
+    @pytest.mark.asyncio
+    async def test_emits_memory_updated_event(self, service):
+        """The amendment is announced — an in-place rewrite is otherwise invisible."""
+        from fused_memory.models.reconciliation import EventType
+
+        buffer = MagicMock()
+        buffer.push = AsyncMock()
+        service._event_buffer = buffer
+
+        await service.update_memory(
+            memory_id='point-1', project_id='test',
+            content='amended text', reason='test amend',
+        )
+
+        buffer.push.assert_awaited_once()
+        event = buffer.push.await_args.args[0]
+        assert event.type == EventType.memory_updated
+        assert event.project_id == 'test'
+        assert event.payload['memory_id'] == 'point-1'
+        assert event.payload['store'] == 'mem0'
+
+
 class TestUpdateEdgeVerification:
     """Tests for the post-write persistence verification in update_edge (Guard 2)."""
 
