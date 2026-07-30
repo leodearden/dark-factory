@@ -622,3 +622,87 @@ class TestEnvironmentalCategoriesOutrankCodeFaults:
     def test_semaphore_timeout_outranks_test_failure(self):
         from orchestrator.verify import _worst_category
         assert _worst_category(['semaphore_timeout', 'test_failure']) == 'semaphore_timeout'
+
+
+# ---------------------------------------------------------------------------
+# PART 3 (task 3173): INFRA_KILL — a leg terminated by an EXTERNAL signal
+# (SIGKILL/SIGTERM/SIGINT/SIGHUP) never produced an exit verdict at all, so it
+# must not be reported as a branch fault.
+#
+# The measured incident: a merge-verify lint leg was SIGKILLed at 0.31s under
+# host load; ``classify_failure`` fell through to UNKNOWN_TEST_FAILURE (a
+# blocking, branch-blaming verdict) and the leg went on to discard the OTHER
+# host's completed 1097s PASS behind merge commit b1ac2c7f.
+#
+# RED today: FailureCategory.INFRA_KILL and INDETERMINATE_VERDICT_CATEGORIES
+# do not exist, so every test below fails on attribute access / ImportError.
+# ---------------------------------------------------------------------------
+
+
+class TestInfraKillCategory:
+    """INFRA_KILL is a new FailureCategory member with an infra-transient
+    policy row that — uniquely among the infra categories — ARCHIVES.
+    """
+
+    def test_member_exists_with_expected_value(self):
+        from orchestrator.verify_categories import FailureCategory
+        assert FailureCategory.INFRA_KILL == 'infra_kill'
+        assert FailureCategory.INFRA_KILL.value == 'infra_kill'
+
+    def test_policy_row(self):
+        from orchestrator.verify_categories import CATEGORY_POLICY, FailureCategory, RetryKind
+        row = CATEGORY_POLICY[FailureCategory.INFRA_KILL]
+        assert row.severity_rank == 1
+        assert row.archive is True
+        assert row.preexisting_probe is False
+        assert row.is_infra_transient is True
+        assert row.retry_kind == RetryKind.NONE
+
+    def test_is_infra_transient_registry_member(self):
+        from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES
+        assert 'infra_kill' in INFRA_TRANSIENT_CATEGORIES
+
+    def test_is_preexisting_break_skip_member(self):
+        from orchestrator.verify_categories import PREEXISTING_BREAK_SKIP_CATEGORIES
+        assert 'infra_kill' in PREEXISTING_BREAK_SKIP_CATEGORIES
+
+    def test_archives_unlike_every_other_infra_category(self):
+        # The ONLY forensic handle for an off-box, un-reproducible kill: the
+        # incident was diagnosable solely because the archive existed.
+        from orchestrator.verify_categories import ARCHIVE_DENY_LIST, should_archive
+        assert 'infra_kill' not in ARCHIVE_DENY_LIST
+        assert should_archive('infra_kill') is True
+
+    def test_outranks_every_output_derived_category_but_not_a_timeout(self):
+        # A kill means "no verdict was produced", so it must dominate any
+        # co-occurring output-derived category — but INFRA_TIMEOUT keeps rank 0.
+        from orchestrator.verify_categories import CATEGORY_PRIORITY
+        assert CATEGORY_PRIORITY[0:3] == ['infra_timeout', 'infra_kill', 'disk_full']
+
+
+class TestIndeterminateVerdictCategories:
+    """The derived registry naming the categories whose leg produced NO
+    completed verdict, and which therefore may not veto another host's
+    completed PASS (merge_queue's per-land cross-check).
+    """
+
+    def test_registry_exists_and_contains_infra_kill(self):
+        from orchestrator.verify_categories import INDETERMINATE_VERDICT_CATEGORIES
+        assert 'infra_kill' in INDETERMINATE_VERDICT_CATEGORIES
+
+    def test_excludes_infra_timeout(self):
+        # DESIGN DECISION (plan.json, task 3173): a hang is one of the few
+        # non-completions a branch can genuinely CAUSE (an infinite loop or a
+        # deadlock introduced by the diff), so a local timeout must keep
+        # vetoing a remote PASS — fail CLOSED there. Landing on a local
+        # timeout would be the false-GREEN class tasks 2822/1700 hardened.
+        from orchestrator.verify_categories import INDETERMINATE_VERDICT_CATEGORIES
+        assert 'infra_timeout' not in INDETERMINATE_VERDICT_CATEGORIES
+
+    def test_is_a_frozenset_of_categories(self):
+        from orchestrator.verify_categories import (
+            INDETERMINATE_VERDICT_CATEGORIES,
+            FailureCategory,
+        )
+        assert isinstance(INDETERMINATE_VERDICT_CATEGORIES, frozenset)
+        assert INDETERMINATE_VERDICT_CATEGORIES <= set(FailureCategory)
