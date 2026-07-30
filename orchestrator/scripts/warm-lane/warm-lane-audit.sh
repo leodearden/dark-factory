@@ -890,8 +890,9 @@ if [ -n "$MOUNT" ] && [ -d "$MOUNT" ]; then
             # detached HEAD), whereas the reservation record is written by
             # whoever made the reservation. Falls back to the branch-derived id
             # when the record carries no usable id, notably `"task_id": null`,
-            # which _record_scalar reports as empty because it requires a quoted
-            # value. Both halves come from reads already done above, so nothing
+            # which lib_lane_state.sh's scalar reader reports as empty because it
+            # requires a quoted value. Both halves come from reads already done
+            # above, so nothing
             # here re-opens the record or re-walks the refs.
             pin_id="${LANE_RECORD_TASK_ID:-$backing_id}"
             if [ "$pin_id" = "$backing_id" ]; then
