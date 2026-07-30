@@ -109,8 +109,48 @@ class RunStore:
         conn = self._connect()
         try:
             conn.executescript(_SCHEMA)
+            # Task 3068: CREATE TABLE IF NOT EXISTS is a no-op on an existing
+            # table, so the _SCHEMA additions above reach FRESH DBs only.  Every
+            # already-deployed runs.db needs the explicit ALTER.
+            self._migrate_task_results_block_context(conn)
         finally:
             conn.close()
+
+    def _migrate_task_results_block_context(self, conn: sqlite3.Connection) -> None:
+        """Add ``block_reason``/``block_phase`` to a pre-3068 ``task_results``.
+
+        Deliberately additive-only, with no ``PRAGMA user_version`` ladder:
+        ``RunStore`` has never had one, and this change needs no destructive
+        table rebuild, so the light feature-detect idiom
+        (``ticket_store._migrate_add_escalated_at`` /
+        ``write_journal._migrate``) is sufficient.  Introducing a version
+        header to an existing un-versioned DB would itself need a "version 0
+        means unknown" special case, for no benefit.
+
+        Idempotent, and a no-op on a fresh DB — ``_SCHEMA`` already declares
+        both columns there, so ``PRAGMA table_info`` finds them present.
+
+        Existing rows read NULL for both columns, which is exactly right: NULL
+        means "row predates task 3068", while ``''`` (what both writers now
+        always store) means "clean exit, no block".
+
+        Exceptions are deliberately NOT swallowed.  A failed schema migration
+        must surface loudly at construction rather than degrade into silently
+        writing NULLs for the very field this task exists to make durable
+        (repo no-silent-fail-soft invariant).
+        """
+        existing = {row[1] for row in conn.execute('PRAGMA table_info(task_results)')}
+        added = []
+        for column in ('block_reason', 'block_phase'):
+            if column not in existing:
+                # Column name is a hard-coded literal, never caller input.
+                conn.execute(f'ALTER TABLE task_results ADD COLUMN {column} TEXT')
+                added.append(column)
+        if added:
+            conn.commit()
+            logger.info(
+                'RunStore: migrated task_results — added %s', ', '.join(added)
+            )
 
     def start_run(
         self,
