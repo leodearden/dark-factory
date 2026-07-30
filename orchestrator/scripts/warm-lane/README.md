@@ -31,6 +31,16 @@ that both-paths WARNING rather than silently.
 hermeticity seam only** — production never sets it. See the autouse
 `_isolate_warm_lane_script_dir` fixture in `orchestrator/tests/conftest.py`.
 
+## Coverage
+
+`orchestrator/tests/test_warm_lane_scripts_shipped.py` and
+`test_warm_lane_script_resolution.py` pin the *shipped* and *resolution* halves
+of the contract above. The **behaviour** of every invocable script here is
+covered by the ported bash tests in `orchestrator/tests/warm-lane/` — see
+[that directory's README](../../tests/warm-lane/README.md) for provenance, the
+enumerated deltas from the reify sources, and the per-script coverage map.
+Those tests run in dark-factory's default `orchestrator` suite.
+
 ## Provenance
 
 Source repo: **reify** (`/home/leo/src/reify`), path `scripts/<name>`.
