@@ -144,8 +144,19 @@ the gate record it consumes rather than an unverified copy of it.
 
 - `planRate` = fraction of the 18 cells with `plan_steps > 0`.
 - `doneRate` = fraction of the 18 cells with `outcome == 'done'`.
-- `meanPQ_all` = mean `plan_quality` over all 18 cells; a no-plan cell (`plan_steps ==
-  0`) scores 0 in this average.
+- `meanPQ_all` = mean of the **recorded** `plan_quality` over all 18 cells, whatever
+  value the runner recorded — a no-plan cell (`plan_steps == 0`) is **not** coerced to
+  0. Eight of the nine no-plan cells in the scored 72 do record `plan_quality: 0.0`,
+  but one does not: `reify_task_12` × `architect-opus-high` trial 1 records
+  `plan_steps: 0` with `plan_quality: 0.31`. That 0.31 is the deterministic structural
+  floor, not a judge score — `score_plan_structure`
+  (`orchestrator/src/orchestrator/evals/judge.py`) is a *weighted* rubric over
+  independent detectors (`has_steps`, `tdd_alternation`, `files_declared`,
+  `design_decisions_present`, `reuse_items_present`, `plan_confirmed`), so a plan
+  artifact that exists and declares files/design-decisions but carries no steps still
+  scores above zero. Coercing no-plan cells to 0 instead would move
+  `architect-opus-high` to 0.7589 and leave the other three candidates unchanged; the
+  table above is the as-recorded convention.
 - `meanPQ_planned` = mean `plan_quality` over only the cells that produced a plan
   (the `planRate` numerator).
 - `$total` = sum of `cost_usd` over all 18 cells for that candidate.
