@@ -612,6 +612,26 @@ _do_reclaim() {
             continue
         fi
 
+        # Deliberately ASYMMETRIC, and the asymmetry is the point.
+        # `no-readable-record` is the ORDINARY reading for every recordless
+        # `_iact-*` and manual operator worktree, so warning on it would emit a
+        # line per such entry per pass and train operators to ignore the
+        # channel. `unparseable-record` means the record IS there and something
+        # wrote it wrong — an assigned lane has silently degraded back to the
+        # pre-γ `FREE ≈ flock-free` regime, which is precisely the defect this
+        # gate removes. That must be visible and attributable (INV-2,
+        # structured-facts-at-failure) — and it must still NOT preserve: failing
+        # closed on a corrupt record would let one bad write freeze a lane out
+        # of reclaim forever.
+        #
+        # There is deliberately NO third branch for an unrecognized state:
+        # lib_lane_state.sh does not set that cause, deriving it instead from
+        # lane_state_class returning UNKNOWN for a non-empty raw, so there is no
+        # second copy of the recognized-state table here to drift.
+        if [ "${LANE_STATE_CAUSE:-}" = "unparseable-record" ]; then
+            warn "$name: lane-state record is present but unparseable-record — falling back to the /proc live-consumer scan for this lane"
+        fi
+
         # Live-reference gate (task 5572). The flock above proves no consumer is
         # mid-ACQUIRE; it does NOT prove no consumer is mid-BUILD, because the
         # inv.2 flock is released once the acquire reseed completes while the
