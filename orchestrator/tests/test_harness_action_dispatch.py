@@ -14,6 +14,7 @@ Step-1 (Pair A) — legacy mapping + close_only no-op + dispatch skeleton:
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections import Counter
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1133,6 +1134,37 @@ _MRP_METADATA = {
 }
 
 
+def _wire_stateful_task_store(harness: Harness, metadata: dict) -> dict:
+    """Wire get_task/update_task as a tiny stateful stand-in for one task's metadata.
+
+    The restart teardown clears the stamp TWICE — once before the status write
+    (to beat a re-dispatch) and once in the finally block after the kill window
+    closes (to delete a stamp the dying workflow resurrected in between).  A
+    ``get_task`` mock returning the same stamped blob forever would therefore
+    make the second, idempotent clear look like a duplicate write.  This fake
+    honours delete-by-omission the way fused-memory does, so the second clear
+    reads the already-cleaned metadata and correctly writes nothing.
+
+    Returns the mutable store so a test can assert the end state.
+    """
+    store = {'metadata': dict(metadata)}
+
+    async def _get_task(_task_id):
+        return {'id': 'task-1', 'metadata': dict(store['metadata'])}
+
+    async def _update_task(_task_id, metadata=None, *, metadata_mode=None, **_kw):
+        incoming = dict(metadata or {})
+        if metadata_mode == 'replace':
+            store['metadata'] = incoming
+        else:  # 'merge'/'additive' — omitted keys are PRESERVED
+            store['metadata'] = {**store['metadata'], **incoming}
+        return True
+
+    harness.scheduler.get_task = AsyncMock(side_effect=_get_task)
+    harness.scheduler.update_task = AsyncMock(side_effect=_update_task)
+    return store
+
+
 @pytest.mark.asyncio
 class TestRestartClearsMergeRetryPending:
     """Part 2: restart teardown voids the durable merge-retry stamp."""
@@ -1140,9 +1172,7 @@ class TestRestartClearsMergeRetryPending:
     async def test_restart_clears_stamp_before_pending_write(self, harness: Harness):
         """The stamp is dropped by a replace-mode write, other keys preserved."""
         harness.scheduler.get_status = AsyncMock(return_value='blocked')
-        harness.scheduler.get_task = AsyncMock(
-            return_value={'id': 'task-1', 'metadata': dict(_MRP_METADATA)},
-        )
+        store = _wire_stateful_task_store(harness, _MRP_METADATA)
         harness.is_workflow_active = MagicMock(return_value=False)
 
         # Order matters: the clear must land BEFORE the task goes 'pending', or
@@ -1162,6 +1192,10 @@ class TestRestartClearsMergeRetryPending:
         )
         # Delete-by-omission means every OTHER key must be carried through.
         assert replaced[0].get('sibling') == 1
+        # End state at the backend, and proof the post-kill re-clear is a no-op
+        # once the first clear landed (exactly one write above).
+        assert 'merge_retry_pending' not in store['metadata']
+        assert store['metadata'].get('sibling') == 1
 
         harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
             'task-1', 'pending',
@@ -1206,6 +1240,108 @@ class TestRestartClearsMergeRetryPending:
         )
         harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
             'task-1', 'cancelled',
+        )
+
+    async def test_restart_reclears_a_stamp_resurrected_during_the_kill_window(
+        self, harness: Harness,
+    ):
+        """A workflow metadata write racing the teardown must not outlive it.
+
+        The first clear is ordered before the status write so a re-dispatch can
+        never read the stamp — which leaves the still-live workflow free to write
+        it back in the meantime: every workflow metadata read-modify-write goes
+        through ``_merge_fresh_metadata``'s ``{**in_memory, **backend}`` union in
+        merge mode, so a stamp still held in that workflow's in-memory copy is
+        persisted straight back and the re-dispatch fast-paths to merge anyway.
+        The idempotent second clear, after the kill window closes, deletes it.
+        """
+        harness.scheduler.get_status = AsyncMock(return_value='blocked')
+        store = _wire_stateful_task_store(harness, _MRP_METADATA)
+
+        cancelled: list[str] = []
+
+        def _cancel(task_id):
+            # The dying workflow flushes its own metadata (stamp included) on the
+            # way out — a merge-mode write, so the cleared key comes back.
+            store['metadata'] = {**store['metadata'], **dict(_MRP_METADATA)}
+            cancelled.append(task_id)
+            return True
+
+        harness.cancel_workflow = MagicMock(side_effect=_cancel)
+        harness.hard_cancel_workflow = MagicMock(return_value=True)
+        harness.is_workflow_active = MagicMock(side_effect=lambda _tid: not cancelled)
+        harness.config.terminal_status_hard_cancel_polls = 3
+
+        await harness._action_teardown_and_set_status('task-1', 'pending', 'restart')
+
+        harness.cancel_workflow.assert_called_once_with('task-1')  # type: ignore[attr-defined]
+        replaced = _replace_metadata_calls(harness.scheduler.update_task)  # type: ignore[arg-type]
+        assert len(replaced) == 2, (
+            'the post-kill clear must re-fire and delete the resurrected stamp; '
+            f'replace-mode writes were {replaced}'
+        )
+        assert all('merge_retry_pending' not in m for m in replaced)
+        # What actually matters: the restart does not leave the stamp behind.
+        assert 'merge_retry_pending' not in store['metadata']
+        assert store['metadata'].get('sibling') == 1
+
+    async def test_unreadable_task_is_logged_not_silently_skipped(
+        self, harness: Harness, caplog,
+    ):
+        """A None read must be loud: it is the failure that actually happens.
+
+        ``scheduler.get_task`` catches every exception and returns ``None``, so
+        the realistic read failure is not the except arm but a falsy task.
+        Returning quietly there would make 'this task had no obligation'
+        indistinguishable from 'we could not tell' — the silent degradation the
+        no-silent-fail-soft invariant forbids.
+        """
+        harness.scheduler.get_status = AsyncMock(return_value='blocked')
+        harness.scheduler.get_task = AsyncMock(return_value=None)
+        harness.is_workflow_active = MagicMock(return_value=False)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.harness'):
+            await harness._action_teardown_and_set_status('task-1', 'pending', 'restart')
+
+        harness.scheduler.update_task.assert_not_awaited()  # type: ignore[attr-defined]
+        assert any(
+            'could not read task task-1 to clear merge_retry_pending' in r.getMessage()
+            for r in caplog.records
+        ), f'an unreadable task must be logged; records={caplog.records}'
+        # Best-effort: the restart still proceeds.
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            'task-1', 'pending',
+        )
+
+    async def test_rejected_clearing_write_is_not_logged_as_success(
+        self, harness: Harness, caplog,
+    ):
+        """update_task returns False on MCP failure — it does not raise.
+
+        Emitting the 'cleared merge_retry_pending stamp' line regardless would
+        actively mislead an operator debugging a restart that failed to break the
+        fast-path: they would read the success line and rule out the real cause.
+        """
+        harness.scheduler.get_status = AsyncMock(return_value='blocked')
+        harness.scheduler.get_task = AsyncMock(
+            return_value={'id': 'task-1', 'metadata': dict(_MRP_METADATA)},
+        )
+        harness.scheduler.update_task = AsyncMock(return_value=False)
+        harness.is_workflow_active = MagicMock(return_value=False)
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.harness'):
+            await harness._action_teardown_and_set_status('task-1', 'pending', 'restart')
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert any('was rejected (update_task returned False)' in m for m in messages), (
+            f'a rejected clearing write must be logged as a failure; got {messages}'
+        )
+        assert not any('cleared merge_retry_pending stamp' in m for m in messages), (
+            f'must not claim the stamp was cleared when the write never landed; {messages}'
+        )
+        # Best-effort: the restart still proceeds.
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            'task-1', 'pending',
         )
 
     async def test_clear_failure_does_not_block_the_restart(self, harness: Harness):
