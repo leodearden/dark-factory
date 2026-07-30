@@ -128,6 +128,7 @@ from orchestrator.merge_shadow import (  # noqa: F401  re-export shim
     did_not_pass_subset,
     diff_per_test_results,
     merge_retry_shadow_baseline,
+    nextest_filter_ids,
     parse_per_test_results,
 )
 from orchestrator.merge_speculation_controller import (  # noqa: F401  re-export shim

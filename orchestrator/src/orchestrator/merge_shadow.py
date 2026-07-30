@@ -290,6 +290,56 @@ def did_not_pass_subset(fail_fast_map: Mapping[str, str]) -> list[str]:
     return sorted(t for t, v in fail_fast_map.items() if v != 'pass')
 
 
+def nextest_filter_ids(subset: Iterable[str]) -> list[str]:
+    """Map DF's per-test key space into cargo-nextest's ``test(=...)`` domain.
+
+    DF's internal ids are :func:`parse_per_test_results` keys — ``"<binary-id>
+    <test-name>"`` on the nextest branch, a bare test path on the libtest
+    branch.  cargo-nextest's ``test(=...)`` equality matcher accepts only the
+    **bare test name**, so this strips the binary-id prefix at the single
+    filter-file write boundary.  Everything upstream (``build_fail_fast_map``,
+    :func:`did_not_pass_subset`) keeps operating in the uniform parse-key space.
+
+    **Why this mapping exists.** Resolved empirically against cargo-nextest
+    0.9.136 — the exact version reify's merge gate runs — not from docs::
+
+        cargo nextest list -E 'test(=mymod::mytest)'          -> MATCHES
+        cargo nextest list -E 'test(=nxprobe mymod::mytest)'  -> MATCHES NOTHING
+
+    reify wraps every filter-file line as ``test(=<line>)`` at one construction
+    site (``verify.sh`` ``emit_nextest_pass``).  Emitting the full ``"<binary-id>
+    <test-name>"`` key therefore produces a file that is **non-empty** — so
+    reify's loud "retry refused: no subset" fallback never fires — and that
+    matches **ZERO tests**: a narrowed retry that runs nothing and reports PASS.
+    That is a **FALSE GREEN**, strictly worse than not narrowing at all.
+
+    **Soundness of the bare form.** An unqualified ``test(=name)`` term matches
+    that name in *every* binary, so the resulting run is a **superset** of the
+    intended subset.  That errs in the safe direction: it may re-run a test that
+    already passed in another binary, but it never *skips* a did-not-pass test.
+
+    Args:
+        subset: Test ids in :func:`parse_per_test_results`' key space.
+
+    Returns:
+        Bare nextest test names, **input order preserved**, exact duplicates
+        collapsed to their first occurrence (two binaries running the same test
+        name need only one ``test(=name)`` term).
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for test_id in subset:
+        # Split on the FIRST space only: nextest permits spaces inside test
+        # names for some harnesses, and splitting on every space would truncate
+        # such a name — silently dropping it from the retry subset.
+        _, _, bare = test_id.partition(' ')
+        name = bare if bare else test_id
+        if name not in seen:
+            seen.add(name)
+            out.append(name)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # shadow-baseline map merge (PRD verify-retry-failed-only D4, §5.4).
 # ---------------------------------------------------------------------------
