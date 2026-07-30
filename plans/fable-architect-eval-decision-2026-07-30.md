@@ -430,7 +430,7 @@ checkout can regenerate and verify it directly.
 
 ```python
 import json
-from collections import defaultdict
+from collections import defaultdict, Counter
 
 HARD_FIXTURES = {
     'df_task_2284_adv_regression', 'df_task_2339_adv_verify', 'df_task_2430_adv_plan',
@@ -461,6 +461,14 @@ assert len(scored) == 72  # 18 per candidate, no gaps
 by_cfg = defaultdict(list)
 for c in scored:
     by_cfg[c['config_name']].append(c)
+
+# The total-72 check above passes even if cells were misallocated across candidates
+# or fixtures (e.g. one dropped from opus-max, one double-counted for fable-high) —
+# exactly the class of error the supersede-by-rerun key exists to prevent. Check the
+# per-candidate and per-(fixture, candidate) shape explicitly rather than trusting the
+# total alone.
+assert all(len(by_cfg[c]) == 18 for c in CANDIDATES), {c: len(by_cfg[c]) for c in CANDIDATES}
+assert all(v == 3 for v in Counter((c['task_id'], c['config_name']) for c in scored).values())
 
 for cfg in CANDIDATES:
     cells = by_cfg[cfg]
