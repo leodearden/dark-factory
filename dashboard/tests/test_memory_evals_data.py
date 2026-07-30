@@ -1718,3 +1718,299 @@ class TestMemoryEvalsEndpoint:
         assert payload['root_present'] is False
         assert payload['evals'] == []
         assert payload['issues'] == []
+
+
+# ---------------------------------------------------------------------------
+# step-21 — the consumer-side boundary test over 3207's committed exemplars
+# ---------------------------------------------------------------------------
+
+# The newest stamp anywhere in the committed tree (e1-dual-tripwire's second
+# run), injected so staleness is measured against the artifacts rather than
+# against the wall clock.
+_EXEMPLAR_NOW = datetime(2026, 8, 2, 3, 15, 0, tzinfo=UTC)
+
+_EXEMPLAR_EVAL_IDS = ['e1-dual-tripwire', 'e1-retrieval-health', 'e1-thin', 'malformed']
+
+_RH_RUNS = [
+    '20260701T031500Z', '20260702T031500Z', '20260703T031500Z',
+    '20260704T031500Z', '20260705T031500Z',
+]
+
+
+def _exemplar_payload(tmp_path: Path) -> dict:
+    """``build_memory_evals`` over the REAL committed tree, read-only.
+
+    The escalations dir is an empty tmp path: 3207's fixtures are artifacts
+    only, and the join's own behaviour is pinned by ``TestEscalationJoin``.
+    """
+    from dashboard.data.memory_evals import build_memory_evals
+
+    return build_memory_evals(_FIXTURE_ROOT, tmp_path / 'escalations', now=_EXEMPLAR_NOW)
+
+
+def _by_eval(payload: dict) -> dict[str, dict]:
+    return {row['eval_id']: row for row in payload['evals']}
+
+
+class TestCommittedExemplarBoundary:
+    """The dashboard-shaped reader the memory-eval PRD's M1 promised, delivered.
+
+    Everything below runs the PRODUCTION entry point against 3207's committed
+    bytes under ``shared/tests/fixtures/memory_eval/`` — the only test in this
+    file that reads artifacts it did not write.  That is the point: the tmp_path
+    trees above agree with this file's own idea of the format, and only this
+    class can catch the two drifting apart.
+
+    Read-only by construction; the fixtures are committed and shared with the
+    producer's suite.
+    """
+
+    def test_every_committed_eval_dir_appears_with_no_per_eval_code(self, tmp_path: Path) -> None:
+        """Generic directory enumeration (DD5) — eval ids are data, never code.
+
+        The root ``README.md`` is a file, not a dir, and must not be mistaken
+        for an eval.
+        """
+        payload = _exemplar_payload(tmp_path)
+
+        assert [row['eval_id'] for row in payload['evals']] == _EXEMPLAR_EVAL_IDS
+        assert payload['root_present'] is True
+        assert payload['unmatched_escalations'] == []
+
+    def test_the_reader_never_writes_to_the_committed_tree(self, tmp_path: Path) -> None:
+        """A consumer of a shared fixture tree must leave it byte-identical."""
+        before = {p: p.stat().st_mtime_ns for p in sorted(_FIXTURE_ROOT.rglob('*')) if p.is_file()}
+
+        _exemplar_payload(tmp_path)
+
+        after = {p: p.stat().st_mtime_ns for p in sorted(_FIXTURE_ROOT.rglob('*')) if p.is_file()}
+        assert after == before
+
+    def test_retrieval_health_series_is_read_from_the_committed_bytes(self, tmp_path: Path) -> None:
+        row = _by_eval(_exemplar_payload(tmp_path))['e1-retrieval-health']
+
+        assert row['run_count'] == 5
+        assert row['runs_on_disk'] == 5
+        assert row['truncated'] is False
+        assert row['run_stamps'] == _RH_RUNS
+        assert row['latest_run_stamp'] == '20260705T031500Z'
+
+        by_id = {m['metric_id']: m for m in row['metrics']}
+        assert set(by_id) == {
+            'canonical-in-top-5', 'dangling-pointers', 'superseded-above-successor',
+            'topic-canonical-present', 'search-latency-p50-ms',
+        }
+        for metric_id, metric in by_id.items():
+            assert metric['trend']['labels'] == _RH_RUNS, metric_id
+            assert len(metric['trend']['values']) == 5, metric_id
+
+        # The committed series, verbatim — including the 0704 regression spike
+        # and the partial 0705 recovery the limits artifact alarms on.
+        assert by_id['canonical-in-top-5']['trend']['values'] == [
+            0.8, 0.8, 0.8, 0.4, 0.6666666666666666,
+        ]
+        assert by_id['dangling-pointers']['trend']['values'] == [4.0, 5.0, 6.0, 20.0, 8.0]
+        assert by_id['search-latency-p50-ms']['trend']['values'] == [41.5, 39.0, 43.25, 44.0, 40.0]
+
+        # Scalars come from the NEWEST run (0705), not the alarmed 0704 one.
+        assert by_id['canonical-in-top-5']['current_value'] == 0.6666666666666666
+        assert by_id['dangling-pointers']['current_value'] == 8.0
+        assert by_id['search-latency-p50-ms']['current_value'] == 40.0
+        assert by_id['canonical-in-top-5']['kind'] == 'proportion'
+        assert by_id['canonical-in-top-5']['denominator'] == 30
+        assert by_id['canonical-in-top-5']['direction'] == 'lower_is_worse'
+        assert by_id['search-latency-p50-ms']['kind'] == 'scalar'
+
+        assert row['corpus']['project_id'] == 'dark_factory'
+        assert row['corpus']['counts']['entities_and_relations'] == 1204
+
+    def test_committed_limits_provenance_passes_through_verbatim(self, tmp_path: Path) -> None:
+        """The provenance block reproduces the committed artifact, value for value.
+
+        These numbers are READ, never computed: the dashboard does no statistics
+        (G6/INV-5), so an alpha that disagrees with the artifact could only come
+        from a re-derivation that does not belong here.
+        """
+        limits = _by_eval(_exemplar_payload(tmp_path))['e1-retrieval-health']['limits']
+
+        assert limits['alpha'] == 0.002777777777777778
+        assert limits['false_alarm_budget'] == 1.0
+        assert limits['runs_per_quarter'] == 90
+        assert limits['min_samples'] == 10
+        assert limits['baseline_window'] == 3
+        assert limits['baseline_run_stamps'] == _RH_RUNS[:3]
+        assert limits['grandfather_set_hash'] == (
+            'f8c46981970a2cc2265806d08e9705ecceb66889e30476dcba0921a45a05dec5'
+        )
+        assert limits['run_stamp'] == '20260704T031500Z'
+        assert limits['generator'] == 'shared.memory_eval_limits'
+
+        # The committed exemplar exhibits the skew itself: limits stamped at the
+        # 0704 run, newest metrics at 0705.  Displaying that provenance beside a
+        # newer current value without disclosing it would present stale limits
+        # as though they governed the displayed run.
+        assert limits['stale_for_latest_run'] is True
+
+        # Whitelist, not passthrough: the artifact's own alarm vocabulary stays
+        # out of the payload entirely (it is not the M2 verdict vocabulary and
+        # carries no fingerprint, so it cannot join an escalation).
+        assert set(limits) == {
+            'alpha', 'false_alarm_budget', 'runs_per_quarter', 'min_samples',
+            'baseline_window', 'baseline_run_stamps', 'grandfather_set_hash',
+            'run_stamp', 'generator', 'stale_for_latest_run',
+        }
+
+    def test_rule_kind_comes_from_the_committed_limits_artifact(self, tmp_path: Path) -> None:
+        row = _by_eval(_exemplar_payload(tmp_path))['e1-retrieval-health']
+
+        assert {m['metric_id']: m['rule_kind'] for m in row['metrics']} == {
+            'canonical-in-top-5': 'proportion',
+            'dangling-pointers': 'count',
+            'superseded-above-successor': 'count',
+            'topic-canonical-present': 'tripwire',
+            'search-latency-p50-ms': 'scalar',
+        }
+
+    def test_thin_and_dual_tripwire_parse_cleanly(self, tmp_path: Path) -> None:
+        """The two shape edge cases 3207 committed: a one-run eval and a two-tripwire eval.
+
+        ``e1-dual-tripwire``'s two metrics share the item key ``t-shared`` — a
+        producer-side fixture property (it exists to exercise per-item
+        grandfathering), not something this payload carries: the dashboard reads
+        metric-level values, not per-item rows.
+        """
+        evals = _by_eval(_exemplar_payload(tmp_path))
+
+        thin = evals['e1-thin']
+        assert thin['run_count'] == 1
+        assert thin['run_stamps'] == ['20260704T031500Z']
+        thin_by_id = {m['metric_id']: m for m in thin['metrics']}
+        assert set(thin_by_id) == {'canonical-in-top-5', 'dangling-pointers'}
+        assert all(m['n'] == 6 for m in thin['metrics'])
+        assert thin_by_id['canonical-in-top-5']['trend']['values'] == [0.6666666666666666]
+
+        dual = evals['e1-dual-tripwire']
+        assert dual['run_count'] == 2
+        assert dual['run_stamps'] == ['20260801T031500Z', '20260802T031500Z']
+        dual_by_id = {m['metric_id']: m for m in dual['metrics']}
+        assert set(dual_by_id) == {'topic-canonical-present', 'successor-pointer-present'}
+        assert all(m['kind'] == 'tripwire' for m in dual['metrics'])
+        assert dual_by_id['topic-canonical-present']['trend']['values'] == [2.0, 2.0]
+
+        # Staleness, measured against the artifacts: the freshest eval is current,
+        # the month-old one is displayed as stale.  Displayed, never alarmed on.
+        assert dual['latest_run_age_seconds'] == 0.0
+        assert dual['stale'] is False
+        assert evals['e1-retrieval-health']['stale'] is True
+
+    def test_missing_limits_and_verdicts_are_named_for_this_tree(self, tmp_path: Path) -> None:
+        """3207's scope is M1 metrics + M2 limits; verdicts are 3211's (gamma re-verifies).
+
+        Their absence is therefore expected here — and is exactly the kind of
+        gap that must be NAMED rather than rendered as a blank column.
+        """
+        payload = _exemplar_payload(tmp_path)
+
+        missing_limits = {i['eval_id'] for i in payload['issues'] if i['kind'] == 'missing_limits'}
+        assert missing_limits == {'e1-dual-tripwire', 'e1-thin', 'malformed'}
+        assert _by_eval(payload)['e1-retrieval-health']['limits'] is not None
+        for eval_id in missing_limits:
+            assert _by_eval(payload)[eval_id]['limits'] is None
+
+        assert len([i for i in payload['issues'] if i['kind'] == 'missing_verdicts']) == 1
+
+        # No verdicts artifact means no verdict — never a defaulted "no_alarm".
+        for row in payload['evals']:
+            for metric in row['metrics']:
+                assert metric['verdict'] is None, (row['eval_id'], metric['metric_id'])
+                assert metric['escalation'] is None
+                assert metric['parity'] == 'clear'
+            assert row['storm_escape'] is None
+
+    def test_negative_exemplars_split_rendering_from_producer_validation(self, tmp_path: Path) -> None:
+        """The asymmetry the design decision pins, over the two committed negatives.
+
+        ``metrics-bad-kind.json``'s ``histogram`` is a RENDERING failure — there
+        is no chart primitive for a kind outside the closed vocabulary — so the
+        dashboard says so.  ``metrics-proportion-out-of-range.json``'s 1.4 is a
+        PRODUCER-side schema rule (M1 rejects it at emit time, not read time);
+        restating it here would be a second implementation of a decision the
+        producer already owns, so the value passes through verbatim.
+        """
+        payload = _exemplar_payload(tmp_path)
+        row = _by_eval(payload)['malformed']
+
+        # Both files parse: they are semantically malformed, not syntactically.
+        assert row['run_count'] == 2
+        assert [i['kind'] for i in payload['issues'] if i['eval_id'] == 'malformed'] == [
+            'missing_limits', 'unknown_kind',
+        ]
+
+        unknown = next(i for i in payload['issues'] if i['kind'] == 'unknown_kind')
+        assert 'histogram' in unknown['detail']
+        assert 'metrics-bad-kind.json' in unknown['path']
+
+        # The out-of-range proportion: displayed, uncommented.
+        metric = _only(row['metrics'], 'canonical-in-top-5')
+        assert metric['current_value'] == 1.4
+        assert metric['kind'] == 'proportion'
+
+    def test_the_whole_committed_tree_yields_exactly_the_known_gaps(self, tmp_path: Path) -> None:
+        """One count over the whole tree, so a new silent degradation cannot hide.
+
+        Three evals without limits, one absent root verdicts artifact, one
+        unrenderable kind — five, and nothing else.
+        """
+        payload = _exemplar_payload(tmp_path)
+
+        assert payload['issue_count'] == len(payload['issues']) == 5
+        assert sorted(i['kind'] for i in payload['issues']) == [
+            'missing_limits', 'missing_limits', 'missing_limits',
+            'missing_verdicts', 'unknown_kind',
+        ]
+
+    def test_neither_this_test_nor_the_reader_touches_the_producer(self) -> None:
+        """G6/INV-5 — artifacts only, never the module; and no statistics anywhere.
+
+        Checked over the AST rather than the raw text, for two reasons: a text
+        grep would match this assertion's own literals, and it would also match
+        the reader's docstring, which *names* ``math.comb`` precisely to record
+        that it must never appear.  The AST sees code, which is what the
+        sidecar's ``expect: absent`` grep over ``dashboard/src/dashboard/data/``
+        is actually about — and an unimported ``math`` is a stronger guarantee
+        than an ungrepped one.
+        """
+        import ast
+
+        import dashboard.data.memory_evals as memory_evals_module
+
+        def _imports(path: Path) -> set[str]:
+            found: set[str] = set()
+            for node in ast.walk(ast.parse(path.read_text())):
+                if isinstance(node, ast.Import):
+                    found.update(a.name for a in node.names)
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    found.add(node.module)
+            return found
+
+        # Neither side may reach for the producer: the on-disk artifact IS the
+        # contract, and importing the module would make these tests agree with
+        # its in-memory objects instead.
+        test_imports = _imports(Path(__file__))
+        assert not [m for m in test_imports if m.split('.')[0] == 'shared'], sorted(test_imports)
+
+        reader_path = Path(memory_evals_module.__file__)
+        reader_imports = _imports(reader_path)
+        assert not [m for m in reader_imports if m.split('.')[0] == 'shared'], sorted(reader_imports)
+        assert not reader_imports & {'math', 'statistics', 'scipy', 'numpy'}, sorted(reader_imports)
+
+        # And no statistics by attribute access either — verdicts are read,
+        # never re-derived (INV-1: the same file the evaluator read).
+        stats_calls = [
+            f'{node.value.id}.{node.attr}'
+            for node in ast.walk(ast.parse(reader_path.read_text()))
+            if isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in {'math', 'statistics'}
+        ]
+        assert stats_calls == []
