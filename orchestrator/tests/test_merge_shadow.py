@@ -35,12 +35,14 @@ mirroring task β's test_merge_gates.py:
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.git_ops import GitOps, _run
 from orchestrator.verify import VerifyResult
 
 
@@ -571,3 +573,151 @@ def test_build_warm_shadow_results_empty_parse_returned_unchanged() -> None:
     from orchestrator.merge_shadow import build_warm_shadow_results
 
     assert build_warm_shadow_results('', {'reify-spec test_passed': 'pass'}) == {}
+
+
+# ---------------------------------------------------------------------------
+# task 3018 (steps 9-10): a LIVE cold-shadow throwaway worktree must survive a
+# concurrent periodic reap.
+#
+# Task 3018 promoted `reap_orphaned_merge_worktrees` from a startup-only sweep
+# to a steady-state one fired from the merge worker's `_heartbeat_loop`, which
+# silently turned RESOURCE_AUDIT_WORKTREE_GRACE_SECS from a *detection*
+# threshold into a *destruction* deadline.  The cold-shadow throwaway
+# `_merge-<uuid>` worktree is neither registered in `_owned_merge_worktrees`
+# nor touched by `_touch_owned_merge_worktrees`, so its measured age is real
+# elapsed time and the reap's only remaining liveness gate is the per-lane
+# merge-verify flock consulted by `remove_merge_worktree_guarded` (the C1
+# primitive the reaper routes through).
+#
+# These fixtures deliberately use a REAL git repo + REAL throwaway worktree
+# (not the MagicMock git_ops the reach-back tests above use) so that
+# `lane_lock_path(wt)` names a real file and the flock contention is genuine —
+# a mocked git_ops cannot exercise a real lock.  Adapted from the fixture
+# pattern in test_remove_merge_worktree_guarded.py:46-84.
+# ---------------------------------------------------------------------------
+
+
+async def _setup_shadow_repo(repo: Path) -> None:
+    await _run(['git', 'init', '-b', 'main'], cwd=repo)
+    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
+    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
+    (repo / 'README.md').write_text('# Test\n')
+    await _run(['git', 'add', '-A'], cwd=repo)
+    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
+
+
+async def _shadow_head_sha(repo: Path) -> str:
+    rc, out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
+    assert rc == 0
+    return out.strip()
+
+
+@pytest.fixture
+def shadow_git_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    asyncio.run(_setup_shadow_repo(repo))
+    return repo
+
+
+@pytest.fixture
+def shadow_git_ops(shadow_git_repo: Path) -> GitOps:
+    git_config = GitConfig(
+        main_branch='main',
+        branch_prefix='task/',
+        remote='origin',
+        worktree_dir='.worktrees',
+        push_after_advance=False,
+    )
+    return GitOps(git_config, shadow_git_repo)
+
+
+@pytest.mark.asyncio
+class TestColdShadowVerifyHoldsLaneLease:
+    """_run_cold_shadow_verify must hold merge_verify_lease(lane_dir=wt) (3018).
+
+    The lane flock is the codebase's canonical "this tree is live" signal —
+    it is exactly what `remove_merge_worktree_guarded`'s acquire-then-remove
+    C1 primitive consults (git_ops.py:8486).  Holding it across the cold
+    verify makes the throwaway tree's protection independent of how long the
+    verify runs, rather than resting on an age heuristic.
+    """
+
+    async def test_live_cold_shadow_worktree_survives_concurrent_reap(
+        self, shadow_git_ops: GitOps, shadow_git_repo: Path,
+    ) -> None:
+        """A periodic reap firing mid-verify must be REFUSED, and the tree must
+        still be cleaned up once the verify returns.
+
+        Three assertions, in order of load-bearingness:
+
+        (a) the simulated sweep's outcome is ``'skipped_lease_held'`` — a
+            concurrent periodic reap CANNOT delete the checkout out from under
+            a running cold verify.  This is the assertion that goes RED today:
+            with no lease held, the sweep acquires the uncontended
+            ``<wt>.lock`` and returns ``'removed'``.
+        (b) the worktree still existed at that moment (the skip was real, not
+            an artefact of the tree already being gone).
+        (c) AFTER `_run_cold_shadow_verify` returns the worktree is GONE —
+            pinning that the lease is released BEFORE the existing
+            ``finally: cleanup_merge_worktree(wt)``.  If the lease wrapped the
+            finally too, the guarded removal's NON-BLOCKING acquire would fail
+            against OURSELVES and return ``'skipped_lease_held'``, leaking the
+            very tree the finally exists to remove — a worse leak than the one
+            being fixed.  (c) passes vacuously in the RED state, which is why
+            (a) leads.
+        """
+        from orchestrator.merge_shadow import _run_cold_shadow_verify
+
+        head = await _shadow_head_sha(shadow_git_ops.project_root)
+        recorded: list[tuple[str, bool, Path]] = []
+
+        async def _reaping_scoped(worktree: Path, *args, **kwargs) -> VerifyResult:
+            # Simulate the task-3018 periodic sweep firing WHILE the cold
+            # verify is running, via the very primitive
+            # reap_orphaned_merge_worktrees routes its removals through.
+            outcome = await shadow_git_ops.remove_merge_worktree_guarded(
+                worktree, reason='periodic-reap-sim',
+            )
+            recorded.append((outcome, worktree.exists(), worktree))
+            return VerifyResult(
+                passed=True,
+                test_output='PASS [0.01s] pkg cold::marker',
+                lint_output='', type_output='', summary='cold',
+            )
+
+        req = MagicMock()
+        req.task_id = 'task-3018-cold-lease'
+        req.task_files = None
+        req.module_configs = []
+        req.config = OrchestratorConfig(project_root=shadow_git_repo)
+
+        with patch(
+            'orchestrator.merge_queue.run_scoped_verification', _reaping_scoped,
+        ):
+            result = await _run_cold_shadow_verify(shadow_git_ops, req, head, None)
+
+        assert recorded, (
+            'the patched run_scoped_verification never ran, so the concurrent '
+            'reap was never simulated — the test proves nothing'
+        )
+        outcome, existed_mid_verify, wt = recorded[0]
+        assert outcome == 'skipped_lease_held', (
+            f'a periodic reap firing during a LIVE cold shadow verify must be '
+            f'refused by the lane flock, got {outcome!r} — the throwaway '
+            f'worktree at {wt} would have been deleted out from under the '
+            f'running verify'
+        )
+        assert existed_mid_verify is True, (
+            f'the throwaway worktree {wt} must still exist at the moment the '
+            f'reap is refused (otherwise the skip is vacuous)'
+        )
+        assert not wt.exists(), (
+            f'the lease must be released BEFORE the finally-block '
+            f'cleanup_merge_worktree, else the cleanup skips on our own lease '
+            f'and leaks {wt}'
+        )
+        assert result == {'pkg cold::marker': 'pass'}, (
+            f'the cold verify must still return its parsed per-test results '
+            f'unchanged, got {result!r}'
+        )
