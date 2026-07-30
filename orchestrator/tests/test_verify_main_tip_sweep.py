@@ -1405,3 +1405,175 @@ class TestConfirmMainTipFailureIsReal:
             f'Expected a WARNING log about the ambiguous node-id match; got '
             f'calls={mock_logger.warning.call_args_list!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# task-3095 step-1: verify._group_node_ids_by_subproject
+#
+# _group_node_ids_by_subproject(worktree, module_configs, node_ids, *,
+# log_label) -> dict[str, list[str]] | None
+#
+# Pure helper extracted from confirm_main_tip_failure_is_real's node-id ->
+# subproject existence-mapping block so the new sweep pre-filter reuses it
+# instead of the tree gaining a THIRD copy (INV-5). Returns None for any
+# unmapped node-id (the caller's fail-safe signal); WARNs and takes the first
+# candidate on an ambiguous match.
+# ---------------------------------------------------------------------------
+
+# Two subprojects owning DISTINCT test files — the "group separately" case.
+_GROUP_PROJECT_LAYOUT_TWO = {
+    'alpha/orchestrator.yaml': (
+        'test_command: "uv run --project alpha --directory alpha pytest tests/ --tb=short -q"\n'
+    ),
+    'alpha/tests/test_a.py': 'def test_a():\n    pass\n',
+    'beta/orchestrator.yaml': (
+        'test_command: "uv run --project beta --directory beta pytest tests/ --tb=short -q"\n'
+    ),
+    'beta/tests/test_b.py': 'def test_b():\n    pass\n',
+}
+
+
+def _materialize(root: Path, layout: dict[str, str]) -> None:
+    """Write *layout* (relpath -> content) under *root*."""
+    for relpath, content in layout.items():
+        p = root / relpath
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content)
+
+
+class TestGroupNodeIdsBySubproject:
+    """task-3095 step-1: the extracted pure node-id -> subproject mapper.
+
+    RED today: verify._group_node_ids_by_subproject does not exist.
+    """
+
+    @staticmethod
+    def _discover(root: Path):
+        from orchestrator.config import _discover_module_configs
+
+        return _discover_module_configs(root)
+
+    def test_subproject_relative_node_id_resolves_to_qualified_id(
+        self, tmp_path: Path
+    ) -> None:
+        """(a) A bare subproject-relative node-id resolves to its owning
+        prefix, and the returned id is PREFIX-QUALIFIED (worktree-root
+        relative) so the scoped re-run command names a real path."""
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, _GROUP_PROJECT_LAYOUT_TWO)
+        mcs = self._discover(tmp_path)
+
+        groups = verify_module._group_node_ids_by_subproject(
+            tmp_path, mcs, ['tests/test_a.py::test_a'], log_label='unit',
+        )
+
+        assert groups == {'alpha': ['alpha/tests/test_a.py::test_a']}, groups
+
+    def test_prefix_qualified_node_id_passes_through_unchanged(
+        self, tmp_path: Path
+    ) -> None:
+        """(b) An ALREADY prefix-qualified node-id maps to that prefix and is
+        returned verbatim (never double-prefixed)."""
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, _GROUP_PROJECT_LAYOUT_TWO)
+        mcs = self._discover(tmp_path)
+
+        groups = verify_module._group_node_ids_by_subproject(
+            tmp_path, mcs, ['beta/tests/test_b.py::test_b'], log_label='unit',
+        )
+
+        assert groups == {'beta': ['beta/tests/test_b.py::test_b']}, groups
+
+    def test_node_ids_group_by_owning_subproject_preserving_order(
+        self, tmp_path: Path
+    ) -> None:
+        """(c) Node-ids owned by different subprojects land in separate
+        groups, with input order preserved WITHIN each group."""
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, _GROUP_PROJECT_LAYOUT_TWO)
+        mcs = self._discover(tmp_path)
+
+        groups = verify_module._group_node_ids_by_subproject(
+            tmp_path,
+            mcs,
+            [
+                'tests/test_a.py::test_one',
+                'tests/test_b.py::test_two',
+                'tests/test_a.py::test_three',
+            ],
+            log_label='unit',
+        )
+
+        assert groups == {
+            'alpha': [
+                'alpha/tests/test_a.py::test_one',
+                'alpha/tests/test_a.py::test_three',
+            ],
+            'beta': ['beta/tests/test_b.py::test_two'],
+        }, groups
+
+    def test_unmapped_node_id_returns_none(self, tmp_path: Path) -> None:
+        """(d) A node-id whose file exists under NO discovered subproject
+        returns the None sentinel — the caller's fail-safe signal. One bad
+        node-id poisons the whole batch (no partial guessing)."""
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, _GROUP_PROJECT_LAYOUT_TWO)
+        mcs = self._discover(tmp_path)
+
+        groups = verify_module._group_node_ids_by_subproject(
+            tmp_path,
+            mcs,
+            ['tests/test_a.py::test_a', 'tests/test_nonexistent.py::test_ghost'],
+            log_label='unit',
+        )
+
+        assert groups is None, f'Expected None for an unmapped node-id, got {groups!r}'
+
+    def test_ambiguous_node_id_takes_first_and_warns(self, tmp_path: Path) -> None:
+        """(e) A relpath existing under TWO subprojects resolves to the FIRST
+        by module_configs iteration order and emits a WARNING naming both
+        candidate prefixes AND the caller's *log_label* (so the log line
+        attributes to the right call site)."""
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, _CONFIRM_PROJECT_LAYOUT_AMBIGUOUS)
+        mcs = self._discover(tmp_path)
+        assert list(mcs) == ['alpha', 'beta'], f'fixture precondition: {list(mcs)}'
+
+        with patch.object(verify_module, 'logger') as mock_logger:
+            groups = verify_module._group_node_ids_by_subproject(
+                tmp_path, mcs, [CONFIRM_AMBIGUOUS_NODE_ID], log_label='my-call-site',
+            )
+
+        assert groups == {'alpha': [f'alpha/{CONFIRM_AMBIGUOUS_NODE_ID}']}, groups
+
+        warned = False
+        for call in mock_logger.warning.call_args_list:
+            args = call.args
+            msg = (args[0] % args[1:]) if len(args) > 1 else args[0]
+            if 'alpha' in msg and 'beta' in msg and 'my-call-site' in msg:
+                warned = True
+                break
+        assert warned, (
+            'Expected a WARNING naming both candidate prefixes and the '
+            f'log_label; got calls={mock_logger.warning.call_args_list!r}'
+        )
+
+    def test_empty_node_ids_returns_empty_dict_not_none(self, tmp_path: Path) -> None:
+        """(f) An empty node-id list is NOT the unmapped sentinel — it returns
+        an empty dict, so callers distinguish "nothing to run" from
+        "unmappable" via their own cheap early-out."""
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, _GROUP_PROJECT_LAYOUT_TWO)
+        mcs = self._discover(tmp_path)
+
+        groups = verify_module._group_node_ids_by_subproject(
+            tmp_path, mcs, [], log_label='unit',
+        )
+
+        assert groups == {}, f'Expected {{}} for an empty node-id list, got {groups!r}'
