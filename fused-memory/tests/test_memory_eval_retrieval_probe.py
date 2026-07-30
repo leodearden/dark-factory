@@ -643,6 +643,153 @@ class TestDerivationIsPure:
         assert len(registry.entries) == len(payload['entries'])
 
 
+# ---------------------------------------------------------------------------
+# step-7: canonical-in-top-k, pure over synthetic result lists
+#
+# No assertion below is on a RATE. Every one is on a hit/miss boolean, a rank,
+# or a matched_by string — G6: this runner measures, leaf alpha sets limits.
+# ---------------------------------------------------------------------------
+
+class _R:
+    """A stand-in for MemoryResult: id, content, metadata, relevance_score."""
+
+    def __init__(self, content='', id='', metadata=None, relevance_score=0.0):
+        self.id = id
+        self.content = content
+        self.metadata = metadata or {}
+        self.relevance_score = relevance_score
+
+
+def _entry(topic='t', content='the canonical text', last_known_id='ID-1', **kw):
+    """Build a real RegistryEntry whose canonical hashes *content*."""
+    m = _mod()
+    return m.RegistryEntry(
+        topic=topic,
+        project_id=kw.pop('project_id', 'dark_factory'),
+        derived_from=kw.pop('derived_from', 'hand'),
+        canonical=m.Canonical(
+            content_hash=kw.pop('content_hash', m.content_key(content)),
+            content_prefix=content[:80],
+            last_known_id=last_known_id,
+        ),
+        phrasings=kw.pop('phrasings', (m.Phrasing('q', False), m.Phrasing('h', True))),
+        **kw,
+    )
+
+
+CANON = 'the canonical text'
+
+
+def _filler(n, start=0):
+    return [_R(content=f'unrelated filler {i}', id=f'F{i}') for i in range(start, start + n)]
+
+
+class TestCanonicalHit:
+    def test_rank_one_and_rank_k_both_hit(self):
+        entry = _entry(content=CANON)
+        at_one = [_R(content=CANON, id='ID-1'), *_filler(9)]
+        at_five = [*_filler(4), _R(content=CANON, id='ID-1'), *_filler(5, start=4)]
+
+        assert _mod().canonical_hit(at_one, entry, 5).hit
+        assert _mod().canonical_hit(at_one, entry, 5).rank == 1
+        assert _mod().canonical_hit(at_five, entry, 5).hit
+        assert _mod().canonical_hit(at_five, entry, 5).rank == 5
+
+    def test_rank_k_plus_one_does_not_hit(self):
+        entry = _entry(content=CANON)
+        results = [*_filler(5), _R(content=CANON, id='ID-1')]
+        outcome = _mod().canonical_hit(results, entry, 5)
+
+        assert not outcome.hit
+        assert outcome.rank == 6, 'the true rank is still reported, for the report'
+
+    def test_k_is_honored_independently(self):
+        """The parameterisation, exercised: rank 7 misses at k=5 and hits at k=10."""
+        entry = _entry(content=CANON)
+        results = [*_filler(6), _R(content=CANON, id='ID-1'), *_filler(3, start=6)]
+
+        assert not _mod().canonical_hit(results, entry, 5).hit
+        assert _mod().canonical_hit(results, entry, 10).hit
+
+    def test_content_hash_matches_even_when_the_id_rotated(self):
+        entry = _entry(content=CANON, last_known_id='OLD-UUID')
+        results = [_R(content=CANON, id='BRAND-NEW-UUID')]
+        outcome = _mod().canonical_hit(results, entry, 5)
+
+        assert outcome.hit
+        assert outcome.matched_by == 'content_hash'
+
+    def test_id_fallback_hits_and_flags_a_hash_repair(self):
+        entry = _entry(content=CANON, last_known_id='ID-1')
+        results = [_R(content='the canonical text, lightly reworded', id='ID-1')]
+        outcome = _mod().canonical_hit(results, entry, 5)
+
+        assert outcome.hit
+        assert outcome.matched_by == 'last_known_id'
+        assert outcome.needs_hash_repair
+
+    def test_content_hash_wins_when_both_could_match(self):
+        entry = _entry(content=CANON, last_known_id='ID-1')
+        results = [_R(content='something else', id='ID-1'), _R(content=CANON, id='OTHER')]
+        outcome = _mod().canonical_hit(results, entry, 5)
+
+        assert outcome.matched_by == 'content_hash'
+        assert outcome.rank == 2
+        assert not outcome.needs_hash_repair
+
+    def test_matching_neither_is_recorded_as_unmatched(self):
+        entry = _entry(content=CANON, last_known_id='ID-1')
+        outcome = _mod().canonical_hit(_filler(5), entry, 5)
+
+        assert not outcome.hit
+        assert outcome.matched_by is None
+        assert outcome.unmatched
+        assert outcome.rank is None
+
+    def test_hash_matching_survives_whitespace_churn(self):
+        entry = _entry(content=CANON)
+        results = [_R(content='  the   canonical\n text  ', id='X')]
+
+        assert _mod().canonical_hit(results, entry, 5).matched_by == 'content_hash'
+
+    def test_absent_last_known_id_never_matches_an_empty_result_id(self):
+        """A registry entry with no id must not match a result with no id."""
+        entry = _entry(content=CANON, last_known_id=None)
+        outcome = _mod().canonical_hit([_R(content='other', id='')], entry, 5)
+
+        assert not outcome.hit
+        assert outcome.unmatched
+
+
+class TestObservationBuilder:
+    def test_records_topic_phrasing_and_k(self):
+        m = _mod()
+        entry = _entry(topic='my-topic', content=CANON)
+        obs = m.observe_phrasing(
+            [_R(content=CANON, id='ID-1')], entry, m.Phrasing('some query', False), 5,
+        )
+
+        assert obs.topic == 'my-topic'
+        assert obs.phrasing == 'some query'
+        assert obs.k == 5
+        assert obs.hit
+        assert obs.matched_by == 'content_hash'
+
+    def test_held_out_phrasings_are_tagged(self):
+        m = _mod()
+        entry = _entry(content=CANON)
+        tuned = m.observe_phrasing([], entry, m.Phrasing('tuned', False), 5)
+        held = m.observe_phrasing([], entry, m.Phrasing('fresh', True), 5)
+
+        assert not tuned.held_out
+        assert held.held_out
+
+    def test_observation_is_not_degraded_by_default(self):
+        m = _mod()
+        obs = m.observe_phrasing([], _entry(content=CANON), m.Phrasing('q', False), 5)
+        assert not obs.degraded
+
+
 class TestContentKey:
     """`content_key(text)` — whitespace-normalized sha256[:16]."""
 
