@@ -1046,6 +1046,77 @@ leaked into the unflagged path (and therefore into the nightly trickle,
 which launches census.py with no extra argv)."""
 
 
+def _capped_mining_result(*, stop_reason, max_batches, batches=2):
+    return mod.MiningResult(
+        records=[],
+        batch_stats=[
+            mod.BatchStats(
+                index=i, total=10, succeeded=10, failed=0, dup_rate=0.1, saturated=False,
+            )
+            for i in range(batches)
+        ],
+        stop_reason=stop_reason,
+        max_batches=max_batches,
+    )
+
+
+def _render(**overrides):
+    kwargs = dict(
+        date="2026-07-14",
+        project_id="dark_factory",
+        force=False,
+        matrix_md="matrix",
+        mining_result=_sample_mining_result(),
+        synthesis_md="prose",
+        filed_task_ids=["1"],
+        cost_note="cost",
+    )
+    kwargs.update(overrides)
+    return mod.render_report(**kwargs)
+
+
+def test_render_report_capped_run_names_cap_and_partial_coverage():
+    report = _render(
+        mining_result=_capped_mining_result(stop_reason="capped", max_batches=2),
+    )
+
+    saturation_section = report.split("## Saturation", 1)[1].split("##", 1)[0]
+    lowered = saturation_section.lower()
+    assert "20" in saturation_section, "sessions actually mined (2 batches x 10) must be stated"
+    assert "2" in saturation_section, "batches mined and the cap value must be stated"
+    assert "cap" in lowered, "the operator cap must be named, never applied silently"
+    # A capped report must be unreadable as full coverage.
+    assert "partial" in lowered
+    assert "not mined" in lowered
+
+
+def test_render_report_cap_set_but_not_reached_is_reported_distinctly():
+    report = _render(
+        mining_result=_capped_mining_result(stop_reason="saturated", max_batches=99),
+    )
+
+    saturation_section = report.split("## Saturation", 1)[1].split("##", 1)[0]
+    lowered = saturation_section.lower()
+    assert "99" in saturation_section, "the cap is still named for the operator's record"
+    assert "cap" in lowered
+    assert "not reached" in lowered
+    # No partial-coverage claim: the run stopped on its own terms.
+    assert "partial" not in lowered
+    assert "not mined" not in lowered
+
+
+def test_render_report_no_cap_renders_no_coverage_line():
+    report = _render(
+        mining_result=_capped_mining_result(stop_reason="exhausted", max_batches=None),
+    )
+
+    saturation_section = report.split("## Saturation", 1)[1].split("##", 1)[0]
+    lowered = saturation_section.lower()
+    assert "cap" not in lowered, "an uncapped run must render no cap text at all"
+    assert "coverage" not in lowered
+    assert "partial" not in lowered
+
+
 def test_render_report_flagless_output_is_byte_identical_golden():
     report = mod.render_report(
         date="2026-07-14",
