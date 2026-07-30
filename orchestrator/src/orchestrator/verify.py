@@ -6290,6 +6290,131 @@ def _group_node_ids_by_subproject(
     return groups
 
 
+#: Generous per-test timeout (seconds) injected into the main-tip-sweep
+#: isolated PRE-FILTER's re-run command via ``_with_pytest_timeout_str``.
+#: Same rationale as ``_MERGE_FLAKE_CONFIRM_TIMEOUT_SECS``: the serial
+#: recovery's ``-o addopts=`` clears pyproject ``addopts`` but NOT the
+#: ``[tool.pytest.ini_options] timeout=60`` default, so without this explicit
+#: override a still-loaded host could starve the isolated run into a false
+#: "reproduces" verdict. Kept as a SEPARATE constant from the merge gate's so
+#: sweep tuning is not coupled to merge-gate tuning (they are retuned on
+#: different signals).
+_SWEEP_PREFILTER_TIMEOUT_SECS: int = 300
+
+
+async def _sweep_failure_reproduces_in_isolation(
+    worktree: Path,
+    config: 'OrchestratorConfig',
+    failing_result: VerifyResult,
+) -> bool | None:
+    """Does *failing_result*'s named failing test set reproduce in ISOLATION?
+
+    A COST pre-filter for ``run_main_tip_sweep``'s expensive full-suite retry
+    — **never a suppression verdict** (task 3095). The sole suppression
+    authority remains the harness's fresh-worktree
+    ``confirm_main_tip_failure_is_real`` gate; this helper only decides
+    whether paying for a second full ``run_full_verification`` is worthwhile.
+
+    Re-runs just the originally-failing node-ids, scoped + forced-serial +
+    generous-timeout, in the sweep's OWN already-pinned *worktree* (no second
+    ``git worktree add``). First-pass residue in that reused tree is
+    deliberately accepted: both error directions are safe by construction (see
+    Returns), so hermetic isolation would buy no precision here.
+
+    Returns:
+        ``True`` — REPRODUCES: at least one named test still fails in
+        isolation, so the failure is deterministic and the full retry is
+        near-certainly wasted work. A spurious True (residue-induced) only
+        skips the retry and hands a FAILING result to the harness, which still
+        re-runs the node-ids in a FRESH worktree before filing — so this
+        direction can never manufacture a false alarm.
+
+        ``False`` — DOES NOT REPRODUCE: every named test passed in isolation,
+        i.e. a suspected contention flake. The caller must run the full retry
+        as before, so a genuine FULL green is still required for the harness's
+        self-heal precondition.
+
+        ``None`` — UNCONFIRMABLE: no recoverable node-id (a lint/type failure
+        or an unparseable crash notice), a node-id owned by no discovered
+        subproject, an infra-sentinel re-run category
+        (``INFRA_TRANSIENT_CATEGORIES`` — never trusted as evidence either
+        way, independent of the ``passed`` flag), or ANY raised exception. The
+        caller falls through to byte-identical pre-3095 behavior.
+
+    Never raises: the whole body is wrapped, and the handler logs at WARNING
+    (not debug) — a pre-filter that keeps silently degrading to the expensive
+    path must be visible in the log stream.
+    """
+    try:
+        # Cheap early-out: nothing named means nothing to re-run — pay no
+        # subprocess at all.
+        node_ids = _extract_failing_test_ids(failing_result.test_output)
+        if not node_ids:
+            return None
+
+        # Discover module configs on the SWEEP worktree (never config's
+        # snapshot — that is for a different worktree/SHA). Lazy import
+        # mirrors confirm_main_tip_failure_is_real.
+        from orchestrator.config import _discover_module_configs  # noqa: PLC0415
+
+        module_configs = _discover_module_configs(worktree)
+
+        groups = _group_node_ids_by_subproject(
+            worktree, module_configs, node_ids,
+            log_label='run_main_tip_sweep prefilter',
+        )
+        # None = an unmapped node-id. An empty dict is unreachable here (the
+        # empty-node_ids early-out above already returned), but `not groups`
+        # keeps a hypothetical {} from being mistaken for "all groups clean"
+        # -> False, which would assert a not-reproduced verdict on zero
+        # evidence.
+        if not groups:
+            return None
+
+        for prefix, group_node_ids in groups.items():
+            mc = module_configs[prefix]
+            scoped_cmd = _with_pytest_timeout_str(
+                _serial_pytest_str(
+                    _scope_to_keyword(mc.test_command, 'pytest', group_node_ids),
+                ),
+                _SWEEP_PREFILTER_TIMEOUT_SECS,
+            )
+            scoped_mc = replace(
+                mc, test_command=scoped_cmd, lint_command=None, type_check_command=None,
+            )
+            result = await run_verification(
+                worktree, config, scoped_mc, max_retries=0, role='background',
+            )
+            # Category-first, independent of the passed flag (mirrors
+            # run_main_tip_sweep / _run_isolated_confirm_group): an infra
+            # sentinel is evidence of nothing, so it maps to UNCONFIRMABLE
+            # rather than to either verdict.
+            if result.category in INFRA_TRANSIENT_CATEGORIES:
+                logger.info(
+                    'run_main_tip_sweep prefilter: isolated re-run for %s hit '
+                    '%s — unconfirmable, falling through to the full retry',
+                    prefix, result.category,
+                )
+                return None
+            if not result.passed:
+                logger.info(
+                    'run_main_tip_sweep prefilter: %s still failed in '
+                    'isolation (category=%r) — deterministic reproduction',
+                    group_node_ids, result.category,
+                )
+                return True
+
+        return False
+
+    except Exception:
+        logger.warning(
+            'run_main_tip_sweep prefilter: unexpected error — unconfirmable, '
+            'falling through to the full-suite retry',
+            exc_info=True,
+        )
+        return None
+
+
 async def confirm_main_tip_failure_is_real(
     config: 'OrchestratorConfig',
     git_ops: object,
