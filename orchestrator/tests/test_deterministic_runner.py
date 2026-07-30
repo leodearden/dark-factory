@@ -7545,8 +7545,12 @@ class TestPredicateModePassPath:
         assert provenance is not None, 'done_provenance must be passed as a kwarg'
         assert provenance['kind'] == 'deterministic-milestone'
 
-    async def test_predicate_pass_provenance_note_contains_stdout_tail(self, tmp_path: Path):
-        """done_provenance.note contains the check's stdout tail (B7)."""
+    async def test_predicate_pass_provenance_note_contains_check_verdict(self, tmp_path: Path):
+        """done_provenance.note carries the check's own verdict line (B7).
+
+        Task 3286 narrowed this from the raw stdout tail to a bounded
+        structured summary; a single clean verdict line still survives intact.
+        """
         from orchestrator.deterministic_runner import DeterministicRunner
 
         task = _predicate_task(task_id='700')
@@ -7568,7 +7572,8 @@ class TestPredicateModePassPath:
         call = scheduler.set_task_status.call_args
         provenance = call.kwargs.get('done_provenance')
         assert 'check ok' in provenance.get('note', ''), (
-            f'stdout tail must appear in provenance note: {provenance!r}'
+            f"the check's verdict line must survive into the provenance "
+            f'note: {provenance!r}'
         )
 
     async def test_predicate_pass_provenance_note_is_sanitized(self, tmp_path: Path):
@@ -8211,7 +8216,8 @@ class TestPredicateModeResume:
             'predicate resume must not claim a systemd deploy happened'
         )
         assert 'check ok' in provenance.get('note', ''), (
-            f"the re-run's stdout tail must appear in provenance note: {provenance!r}"
+            f"the re-run's verdict line must survive into the provenance "
+            f'note: {provenance!r}'
         )
 
     async def test_predicate_resume_recheck_still_failing_refiles_and_stays_blocked(

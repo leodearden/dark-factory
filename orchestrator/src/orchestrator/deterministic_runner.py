@@ -1734,7 +1734,13 @@ class DeterministicRunner:
 
         Maps the outcome:
         - ``rc == 0`` -> ``WorkflowOutcome.DONE``, with
-          ``done_provenance.kind='deterministic-milestone'``.
+          ``done_provenance.kind='deterministic-milestone'`` and a BOUNDED,
+          STRUCTURED ``note`` from ``_summarize_predicate_output`` — never the
+          raw stdout tail (task 3286, specimen 2902).  The note is not a
+          private field: fused-memory's ``_format_outcome_echo`` appends it to
+          a Mem0 completion-summary write, so raw subprocess output landing
+          there is ingested into memory.  The full raw output is logged at
+          INFO immediately before summarizing, so nothing is silently lost.
         - ``rc != 0`` -> a milestone VERDICT failure: born-at-L2
           ``milestone_check_failed`` escalation + ``gate_escalated_at`` stamp
           + blocked (routes through section-1's resume/quiescence machinery
@@ -1803,6 +1809,11 @@ class DeterministicRunner:
             # hold"), not an infra fault — file milestone_check_failed (NOT
             # infra_issue) and stamp gate_escalated_at so a human resolving
             # the escalation drives the task to done on the next dispatch.
+            #
+            # The RAW `out` below is deliberate and must stay raw (task 3286):
+            # unlike done_provenance.note, an escalation detail is read by a
+            # human diagnosing the failing check and is never ingested into
+            # memory, so full subprocess output is exactly what is wanted here.
             fail_detail = '\n'.join([
                 description,
                 f'Predicate check exit code: rc={rc}',
@@ -1814,6 +1825,16 @@ class DeterministicRunner:
                 detail=fail_detail,
             )
 
+        # Log the RAW output before summarizing it.  `_summarize_predicate_output`
+        # deliberately discards everything it does not recognize, and dropping
+        # data with no trace would be a silent degradation — so the full text
+        # lands here first, in the orchestrator log, which (unlike the note) is
+        # never ingested into Mem0/Graphiti.
+        logger.info(
+            'DeterministicRunner: task %s predicate raw output (%d chars, '
+            'summarized into done_provenance.note): %s',
+            task_id, len(out) if isinstance(out, str) else 0, out,
+        )
         logger.info(
             'DeterministicRunner: task %s predicate check passed (rc=0) — setting done',
             task_id,
@@ -1821,7 +1842,10 @@ class DeterministicRunner:
         await self.scheduler.set_task_status(
             task_id,
             'done',
-            done_provenance=_build_done_provenance('deterministic-milestone', note=out),
+            done_provenance=_build_done_provenance(
+                'deterministic-milestone',
+                note=_summarize_predicate_output(out, rc=rc),
+            ),
         )
         return WorkflowOutcome.DONE
 

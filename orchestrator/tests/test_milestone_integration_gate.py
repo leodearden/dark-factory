@@ -442,7 +442,8 @@ class TestExemplarPassLifecycle:
         assert provenance is not None, 'done_provenance must be passed as a kwarg'
         assert provenance['kind'] == 'deterministic-milestone'
         assert 'invariant holds' in provenance.get('note', ''), (
-            f'stdout tail must appear in provenance note: {provenance!r}'
+            f"the real script's verdict line must survive into the bounded "
+            f'provenance note (task 3286): {provenance!r}'
         )
 
         unit_inspector.assert_not_awaited()
