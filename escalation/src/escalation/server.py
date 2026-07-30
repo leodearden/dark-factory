@@ -1013,6 +1013,49 @@ def create_server(
         return [e.to_dict() for e in escalations]
 
     @mcp.tool()
+    def get_task_escalation_history(
+        task_id: str,
+    ) -> dict[str, Any]:
+        """Every escalation ever filed for a task, as a self-describing envelope.
+
+        **ARCHIVE-INCLUSIVE BY CONSTRUCTION.** Returns pending AND resolved/
+        dismissed records that have been moved into ``data/escalations/
+        archive/<date>/``. This is the tool that answers "was an escalation
+        EVER filed for this task?".
+
+        Contrast with ``get_pending_escalations(task_id=...)``: that lookup
+        is pending-only by design and returns ``[]`` for a task whose only
+        escalation was resolved. That ``[]`` means "none currently OPEN",
+        never "none ever filed" — do not read it as evidence of absence.
+
+        Contrast with the sibling ``get_task_escalations``: both scan the
+        same underlying store (this tool delegates to it directly), but
+        that tool is the general FILTERABLE form — it accepts ``status``,
+        ``agent_role`` and ``compact``, and returns a bare list. Reach for
+        THIS tool when the question is the unfiltered ever-filed one and
+        you want a self-describing answer: it cannot be narrowed to
+        pending (no ``status`` parameter exists — that is deliberate, not
+        an oversight, so a caller can never silently recreate the
+        false-absence trap this tool exists to remove), and the envelope
+        echoes what was asked so a ``count: 0`` is attributable rather than
+        an anonymous ``[]``.
+
+        Inherits ``queue.get_by_task``'s documented dedup and cross-tier
+        pre-scan WARNING behaviour (queue.py:396-430) via the sibling.
+
+        A task with no matching records yields an empty envelope
+        (``count == 0``), not an ``{'error': ...}`` dict — deliberately
+        unlike the adjacent ``get_escalation``: this is a scan, not an id
+        lookup, so zero matches is a valid answer rather than a failure.
+        """
+        escalations = get_task_escalations(task_id)
+        return {
+            'task_id': task_id,
+            'count': len(escalations),
+            'escalations': escalations,
+        }
+
+    @mcp.tool()
     def get_escalation(
         escalation_id: str,
     ) -> dict[str, Any]:
