@@ -133,15 +133,23 @@ class MiningResult:
     across every consumed batch, per-batch stats, and why mining stopped
     (``"saturated"`` -- ``config.consecutive_batches`` consecutive batches
     at/above ``config.dup_rate``; ``"exhausted"`` -- ``batch_source`` ran
-    out first)."""
+    out first; ``"capped"`` -- the operator's ``max_batches`` cap was
+    reached, so coverage is deliberately PARTIAL).
+
+    ``max_batches`` echoes the operator cap this run was given (``None``
+    when uncapped -- the default). It travels on the result so
+    ``render_report`` can state the cap and its coverage consequence from
+    the mining facts it is already handed, without a second parameter."""
 
     records: list[dict] = field(default_factory=list)
     batch_stats: list[BatchStats] = field(default_factory=list)
     stop_reason: str = "exhausted"
+    max_batches: int | None = None
 
 
 def mine_to_saturation(
     batch_source, codebook_dict: dict, *, project: str, model: str, config, invoke,
+    max_batches: int | None = None,
 ) -> MiningResult:
     """Code batches from *batch_source* against *codebook_dict* via
     ``coder.code_digests`` until novelty saturates.
@@ -171,6 +179,25 @@ def mine_to_saturation(
     ``saturated`` is forced False and the consecutive-saturated counter is
     reset, exactly as if the batch scored below threshold.
 
+    *max_batches* is the OPERATOR COST CAP (``--max-batches``): mining
+    stops with ``stop_reason="capped"`` once that many batches have been
+    coded. The cap is enforced here, inside the loop, rather than by
+    islicing *batch_source* upstream, for two reasons: only this loop
+    knows WHY it stopped, so ``"capped"`` stays distinguishable from a
+    source that genuinely ran dry (an islice wrapper is indistinguishable
+    from ``"exhausted"`` -- exactly the silent-cap failure the cap must
+    not introduce), and the ``return`` happens before the next batch is
+    pulled, so a capped-away batch costs no digest render and no
+    ``coder.code_digests`` call. A capped run is deliberately PARTIAL
+    coverage: sessions beyond the cap were never mined, and
+    ``render_report`` says so in as many words. The saturation check
+    deliberately PRECEDES the cap check, so a run that saturates on
+    exactly the capped batch reports the stronger, more informative
+    ``"saturated"`` (novelty genuinely exhausted -- coverage was
+    sufficient regardless of the cap) rather than under-claiming as
+    partial. ``max_batches=None`` (the default) is exactly today's
+    behavior: no cap, no extra rendering, unbounded mining.
+
     *config* is a ``config.Saturation``-shaped object (``.dup_rate``,
     ``.consecutive_batches`` -- i.e. a project's
     ``LegibilityConfig.census.saturation``), not the whole
@@ -178,7 +205,7 @@ def mine_to_saturation(
     id (Sonnet miner routing per the ratified static policy -- this
     function does not read ``config.Models`` itself).
     """
-    result = MiningResult()
+    result = MiningResult(max_batches=max_batches)
     consecutive_saturated = 0
 
     for index, batch in enumerate(batch_source):
@@ -207,6 +234,18 @@ def mine_to_saturation(
         consecutive_saturated = consecutive_saturated + 1 if saturated else 0
         if consecutive_saturated >= config.consecutive_batches:
             result.stop_reason = "saturated"
+            return result
+
+        # Checked AFTER saturation, deliberately -- see the max_batches
+        # paragraph above. Returning here means batch N+1 is never pulled.
+        if max_batches is not None and len(result.batch_stats) >= max_batches:
+            logger.warning(
+                "mining stopped at the operator batch cap: %d batch(es) mined "
+                "(--max-batches=%d) -- coverage is PARTIAL, not saturated; "
+                "sessions beyond the cap were NOT mined",
+                len(result.batch_stats), max_batches,
+            )
+            result.stop_reason = "capped"
             return result
 
     result.stop_reason = "exhausted"
