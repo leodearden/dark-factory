@@ -50,7 +50,14 @@ import shutil
 import subprocess
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Collection
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Collection,
+    Iterable,
+    Mapping,
+)
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
@@ -592,6 +599,81 @@ PROTECTED_PREFIXES: dict[str, str] = {
     WorktreeKind.MAIN_PROBE.value: 'verify-main-probe',
     WorktreeKind.MAIN_SWEEP.value: 'verify-main-sweep',
 }
+
+
+#: Bands a warm-lane POOL SWEEP owns, and must therefore never be handed as
+#: protected.  Excluding them from a rendered protect glob is LOAD-BEARING, not
+#: cosmetic: ``warm-lane-gc.sh``'s whole job is reclaiming ``_lane-*``/
+#: ``_spec-*`` entries, so a naive render of :data:`PROTECTED_PREFIXES` would
+#: make it skip every pool lane in both passes — reclaim would stop entirely and
+#: the pool would accrete straight back to the 2026-07-10 ENOSPC outage the
+#: sweep exists to prevent.  Named explicitly, in the same band-ownership
+#: vocabulary :meth:`GitOps._refuse_foreign_band` already takes an ``owned``
+#: argument in, so the Python guard and the bash consumer agree on what
+#: "owned" means.
+PROTECT_GLOB_OWNED_POOL_BANDS: frozenset[str] = frozenset({'_lane-', '_spec-'})
+
+
+def default_protected_prefixes() -> dict[str, str]:
+    """The static band registry merged with the DEFAULT interactive band.
+
+    :data:`PROTECTED_PREFIXES` alone is not the authoritative band map: the
+    ``_iact-*`` band is config-shaped (:attr:`GitConfig.iact_prefix`), so it
+    lives outside the constant.  This is the process-wide default view, for
+    callers with no :class:`GitOps` instance to ask —
+    :meth:`GitOps.protected_prefixes` is the per-instance one and is built on
+    top of this, so the merge exists in exactly one place.
+
+    Returns a fresh dict; mutating it cannot affect the module registry.
+    """
+    from orchestrator.config import GitConfig
+
+    return {
+        **PROTECTED_PREFIXES,
+        GitConfig.model_fields['iact_prefix'].default: 'interactive',
+    }
+
+
+def render_protect_glob(
+    prefixes: Mapping[str, str] | None = None,
+    *,
+    owned: Iterable[str] = (),
+) -> str:
+    """Render a band map as the comma-separated protect glob a sweep consumes.
+
+    Pure — no I/O, no config read beyond the default band map.  Applies the two
+    key semantics :data:`PROTECTED_PREFIXES` already documents, rather than
+    inventing a third: a key ending in ``-`` is a PREFIX and renders
+    ``<key>*``; a key not ending in ``-`` is an EXACT worktree name and renders
+    verbatim.  Both directions matter — rendering an exact name as a glob
+    silently WIDENS the protected set, and rendering a prefix verbatim silently
+    NARROWS it, which is the direction that gets a live managed worktree
+    reclaimed.
+
+    Args:
+        prefixes: The band map to render.  ``None`` means
+            :func:`default_protected_prefixes`.
+        owned: Band tokens the calling sweep OWNS, excluded from the output.
+            Pass :data:`PROTECT_GLOB_OWNED_POOL_BANDS` for a warm-lane pool
+            sweep; see that constant for why omitting them is load-bearing.
+
+    Returns:
+        The bands, comma-joined in the map's own iteration order (deterministic,
+        and what an operator diffs against a previous default).
+
+    The bash consumer is ``lane_protect_glob`` in
+    ``orchestrator/scripts/warm-lane/lib_lane_state.sh``.  Its static fallback,
+    ``LANE_PROTECT_GLOB_FALLBACK``, is the one artifact that CAN drift from this
+    registry, and the INV-5 gate for that drift is
+    ``orchestrator/tests/test_lane_state_lib.py::TestProtectGlobFallbackDrift``.
+    """
+    mapping = default_protected_prefixes() if prefixes is None else prefixes
+    owned_set = frozenset(owned)
+    return ','.join(
+        f'{key}*' if key.endswith('-') else key
+        for key in mapping
+        if key not in owned_set
+    )
 
 
 # Positive-match namespace classifier for a worktree_base entry name (C2).
@@ -1778,8 +1860,16 @@ class GitOps:
         per deployment), so a single module constant cannot capture the
         authoritative band map — the per-instance view is the correct one
         for callers to consult, including :meth:`_refuse_foreign_band`.
+
+        Built on :func:`default_protected_prefixes` so the registry +
+        iact-band merge exists in exactly one place; this instance's
+        ``iact_prefix`` is applied last and therefore still wins over the
+        default band.
         """
-        return {**PROTECTED_PREFIXES, self.config.iact_prefix: 'interactive'}
+        return {
+            **default_protected_prefixes(),
+            self.config.iact_prefix: 'interactive',
+        }
 
     def _refuse_foreign_band(
         self, path: Path, owned: frozenset[str], context: str,
