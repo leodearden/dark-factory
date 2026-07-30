@@ -1603,6 +1603,90 @@ def test_run_census_storm_batch_is_logged_and_noted_in_report(tmp_path, caplog):
 
 
 # ---------------------------------------------------------------------------
+# task 3280 step-9: RED — run_census(max_batches=) threads the operator batch
+# cap end to end: mining is bounded, the capped-away batches are never pulled
+# from the source, the written report says coverage was PARTIAL, and the rest
+# of the pipeline still completes normally.
+# ---------------------------------------------------------------------------
+
+def _happy_batch(prefix):
+    """One run_census-shaped batch for the `_happy_invoke_response` fixture:
+    a duplicate, a novel-verified and a novel-rejected digest. *prefix*
+    keeps each batch's session ids distinct while preserving the
+    substrings `_happy_invoke_response` keys on."""
+    return [
+        _hand_digest(f"{prefix}-dup-1", "nothing new here"),
+        _hand_digest(f"{prefix}-novel-verified", "a genuinely new confusion shape"),
+        _hand_digest(f"{prefix}-novel-rejected", "a spurious one-off"),
+    ]
+
+
+def test_run_census_max_batches_caps_mining_and_reports_it(tmp_path):
+    source = _TrackingBatchSource([_happy_batch(f"b{i}") for i in range(4)])
+    fake_verify_fn = _make_fake_verify_fn(
+        verified_titles={"Silent no-op subagent contract"},
+        rejected_titles={"Spurious pattern"},
+    )
+    fake_submit_fn = _make_fake_submit_fn()
+    fake_commit = _make_fake_commit()
+
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_happy_invoke_response),
+        batch_source=source,
+        verify_fn=fake_verify_fn,
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=fake_submit_fn,
+        escalate_fn=_poison("escalate_fn"),
+        status_fetcher=_make_fake_status_fetcher(3),
+        commit=fake_commit,
+        max_batches=1,
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.stop_reason == "capped"
+    assert source.pulled == [0], "batches 1..3 must never be consumed from the source"
+
+    report_text = kwargs["report_path"].read_text(encoding="utf-8")
+    lowered = report_text.lower()
+    assert "operator batch cap = 1" in lowered
+    assert "partial" in lowered, "a capped run must never read as full coverage"
+    assert "not mined" in lowered
+
+    # The rest of the pipeline still ran to completion on the mined batch.
+    assert outcome.status == "done"
+    assert kwargs["codebook_path"].exists()
+    assert kwargs["census_state_path"].exists()
+    assert len(fake_verify_fn.calls) == 1
+    assert len(fake_submit_fn.calls) == 1, "the verified cluster is still filed"
+    assert len(fake_commit.calls) == 1
+
+
+def test_run_census_without_max_batches_is_unchanged(tmp_path):
+    source = _TrackingBatchSource([_happy_batch(f"b{i}") for i in range(2)])
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_happy_invoke_response),
+        batch_source=source,
+        verify_fn=_make_fake_verify_fn(verified_titles={"Silent no-op subagent contract"}),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=_make_fake_submit_fn(),
+        escalate_fn=_poison("escalate_fn"),
+        status_fetcher=_make_fake_status_fetcher(0),
+        commit=_make_fake_commit(),
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.stop_reason in {"saturated", "exhausted"}
+    report_text = kwargs["report_path"].read_text(encoding="utf-8")
+    lowered = report_text.lower()
+    assert "batch cap" not in lowered, "an uncapped run must render no cap text"
+    assert "coverage" not in lowered
+
+
+# ---------------------------------------------------------------------------
 # step-21: RED — main(argv) CLI
 # ---------------------------------------------------------------------------
 
