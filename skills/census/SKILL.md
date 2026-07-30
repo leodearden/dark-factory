@@ -48,7 +48,7 @@ Three composable flags bound what one run may spend. Each is optional and defaul
 
 - **`--max-batches N`** — stop mining after N batches. The report states the cap and that coverage is **partial** (sessions beyond the cap were never mined), and `stop_reason` becomes `capped` rather than `exhausted`.
 - **`--max-verify-clusters N`** — hand the verifier at most N novel clusters, taken in mining order. Verification costs one Sonnet call per cluster, and that is the spend being bounded. The rest still merge into the codebook as `pending` candidates for a later census to adjudicate — **deferred, never dropped**.
-- **`--dry-run-filing`** — write every would-be `submit_task` payload to `plans/confusion-census-<date>-payloads.json` for human review and file **nothing**. Everything else — codebook update, promotions, report, census-state advance — proceeds normally.
+- **`--dry-run-filing`** — write every would-be `submit_task` payload to `plans/confusion-census-<date>-payloads.json` for human review and file **nothing**. Everything else — codebook update, promotions, report, census-state advance — proceeds normally, and *because* those do happen, hand-filing the payload JSON is the only way to land the tasks. An existing payload file is never overwritten: a second run's payloads go to `…-payloads-2.json`.
 
 For an attended **first** census, run with all three:
 
@@ -66,7 +66,7 @@ Why: a first census cannot rely on saturation to bound spend — against an empt
 2. **Sanity-check per-stratum coverage counts.** The report should show mining coverage across the strata the sampler drew from — if one stratum has near-zero sightings while others are dense, that's worth a second look (could be a genuinely clean area, could be a sampling gap).
 3. **Confirm `census-state.json` advanced.** Check `docs/legibility/census-state.json` in the censused project — `last_census_at` should now be this run's timestamp and `last_census_report` should point at the new report. This is what makes the *next* census automatic: with a real anchor in place, `census_trigger` can now compute `days_since` and the interval/tasks-landed/novelty-spike conditions become live instead of perpetually "N/A".
 4. **Review the filed remediation tasks.** The run submits tasks through the normal curator path (`submit_fn`) — check the project's task tree for what landed and whether it needs triage/re-prioritization.
-5. **If you ran `--dry-run-filing`: review the payload JSON and file by hand** (or re-run without the flag) before treating the census as complete. Nothing was filed, so the remediation half of the census is still outstanding — `plans/confusion-census-<date>-payloads.json` is the deliverable to work through.
+5. **If you ran `--dry-run-filing`: review the payload JSON and file by hand.** This is the only path — the census-state anchor and the codebook have already advanced, so a second run mines a fresh window and files nothing. Work through `plans/confusion-census-<date>-payloads.json` (if you ran the census twice, the second run's payloads are in `…-payloads-2.json`; the first file is never overwritten). Until they're filed, the remediation half of the census is still outstanding.
 
 ## Anchor-seeding alternative — when a manual survey already happened
 

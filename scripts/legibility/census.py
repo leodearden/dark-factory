@@ -993,6 +993,18 @@ def run_census(
     ordering invariant above, and the file is appended to the best-effort
     *commit* paths -- a dry run's deliverable IS the payload file, so it
     is versioned alongside the report and codebook it came from.
+
+    A dry run is consequently NOT resumable by re-running: the mining, the
+    codebook merge, the promotions, ``codebook.dump`` and
+    ``advance_census_state`` all really happened, so a later census codes
+    these same confusions as ``matches`` (no novel clusters, empty
+    payloads) over a window that has re-anchored at this run's
+    ``last_census_at``. The payload file is the sole remaining handle on
+    the remediation work, which is why it is never overwritten: a
+    colliding path is left untouched and the payloads go to a numbered
+    sibling instead (see ``_free_payloads_path``), so ``dry_run.path`` --
+    not the requested path -- is what the report, the commit paths and
+    ``CensusOutcome`` name.
     """
     headroom = preflight_headroom(invoke, model=config.models.trickle)
     if not headroom.ok:
@@ -1593,7 +1605,9 @@ def main(argv: list[str] | None = None) -> int:
     ``--max-verify-clusters N`` bounds per-cluster verification, and
     ``--dry-run-filing`` writes every would-be task payload to
     ``plans/confusion-census-<date>-payloads.json`` (alongside the dated
-    report) for human review instead of filing it. They are composable
+    report) for human review instead of filing it -- those payloads must
+    then be filed by hand, since this run still advances the codebook and
+    census-state and a later census will not re-file them. They are composable
     and reusable, not first-census-only, though an attended FIRST census
     against an empty codebook is where all three matter most: saturation
     cannot bound that run, since every batch's dup_rate then only
@@ -1650,7 +1664,10 @@ def main(argv: list[str] | None = None) -> int:
         help="Operator cost control: write every would-be task payload to "
         "plans/confusion-census-<date>-payloads.json for human review and "
         "file NOTHING. Everything else (codebook update, promotions, report, "
-        "census-state advance) proceeds normally.",
+        "census-state advance) proceeds normally -- and because the codebook "
+        "and census-state DO advance, the payloads must be filed by hand; a "
+        "later census will not re-file them. An existing payload file is "
+        "never overwritten (the payloads go to a numbered sibling instead).",
     )
     args = parser.parse_args(argv)
 
