@@ -406,3 +406,202 @@ class TestZeroProgressRequeueConfig:
 
         assert 'zero_progress_requeue.enabled' in RELOADABLE_FIELDS
         assert 'zero_progress_requeue.threshold' in RELOADABLE_FIELDS
+
+
+# ---------------------------------------------------------------------------
+# Part C.4 — harness wiring
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def wired_harness(tmp_path, mock_orch_config):
+    """Harness driven through ``_apply_retry_cap`` directly.
+
+    ``_run_id`` is set so the method's existing ``if self._run_id is None:
+    return requeued`` guard (relied on as a test no-op hook elsewhere) does not
+    short-circuit, and the mocked scheduler returns a low requeue count so the
+    pre-existing cap never trips and cannot be mistaken for our alert.
+    """
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from escalation.queue import EscalationQueue
+    from _recording_event_store import _RecordingEventStore
+
+    from orchestrator.harness import Harness
+
+    with (
+        patch('orchestrator.harness.McpLifecycle'),
+        patch('orchestrator.harness.OverrideStore'),
+        patch('orchestrator.harness.Scheduler'),
+        patch('orchestrator.harness.BriefingAssembler'),
+    ):
+        h = Harness(mock_orch_config)
+
+    h._run_id = 'run-test'
+    h._escalation_queue = EscalationQueue(tmp_path)
+    h.event_store = _RecordingEventStore()  # type: ignore[assignment]
+
+    h.scheduler = MagicMock()
+    h.scheduler.record_requeue = MagicMock(return_value=1)
+    h.scheduler.transient_requeue_count = MagicMock(return_value=0)
+    h.scheduler.clear_requeue_count = MagicMock()
+    h.scheduler.requeue_history = MagicMock(return_value=[])
+    h.scheduler.trigger_retry_cap_exhausted = AsyncMock()
+
+    h.config.requeue_cap = 99
+    h.config.transient_requeue_cap = 99
+    h.config.zero_progress_requeue.enabled = True
+    h.config.zero_progress_requeue.threshold = 3
+    return h
+
+
+def _report(
+    outcome=None,
+    *,
+    agent_invocations: int = 0,
+    counts_against_requeue_cap: bool = False,
+    task_id: str = '3068',
+):
+    from orchestrator.harness import TaskReport
+
+    if outcome is None:
+        outcome = WorkflowOutcome.REQUEUED
+    return TaskReport(
+        task_id=task_id,
+        title='Looping task',
+        outcome=outcome,
+        agent_invocations=agent_invocations,
+        block_reason='warm_lane_pool_hard_down' if outcome is WorkflowOutcome.REQUEUED else '',
+        block_phase='plan' if outcome is WorkflowOutcome.REQUEUED else '',
+        counts_against_requeue_cap=counts_against_requeue_cap,
+    )
+
+
+def _alerts(harness, task_id: str = '3068'):
+    return harness._escalation_queue.get_by_task(_sentinel(task_id), status='pending')
+
+
+@pytest.mark.asyncio
+class TestHarnessZeroProgressWiring:
+    """``_apply_retry_cap`` is the chokepoint that feeds the tracker."""
+
+    async def test_fires_exactly_at_threshold(self, wired_harness):
+        """Two zero-progress requeues alarm nothing; the third fires once."""
+        for _ in range(2):
+            await wired_harness._apply_retry_cap('3068', _report(), True)
+        assert _alerts(wired_harness) == [], 'fired below threshold'
+
+        await wired_harness._apply_retry_cap('3068', _report(), True)
+        assert len(_alerts(wired_harness)) == 1
+
+        # And keeps deduping past the boundary — no sawtooth.
+        for _ in range(3):
+            await wired_harness._apply_retry_cap('3068', _report(), True)
+        assert len(_alerts(wired_harness)) == 1
+
+    async def test_done_between_requeues_resets(self, wired_harness):
+        """A DONE resets the streak, so two more requeues do not fire."""
+        for _ in range(2):
+            await wired_harness._apply_retry_cap('3068', _report(), True)
+        await wired_harness._apply_retry_cap(
+            '3068', _report(WorkflowOutcome.DONE), False,
+        )
+        for _ in range(2):
+            await wired_harness._apply_retry_cap('3068', _report(), True)
+
+        assert _alerts(wired_harness) == []
+
+    async def test_requeue_with_real_work_resets(self, wired_harness):
+        """A requeue that DID invoke an agent resets — genuine slow progress."""
+        for _ in range(2):
+            await wired_harness._apply_retry_cap('3068', _report(), True)
+        await wired_harness._apply_retry_cap(
+            '3068', _report(agent_invocations=1), True,
+        )
+        for _ in range(2):
+            await wired_harness._apply_retry_cap('3068', _report(), True)
+
+        assert _alerts(wired_harness) == []
+
+    async def test_disabled_never_fires(self, wired_harness):
+        """The kill switch holds however long the streak runs."""
+        wired_harness.config.zero_progress_requeue.enabled = False
+        for _ in range(20):
+            await wired_harness._apply_retry_cap('3068', _report(), True)
+
+        assert _alerts(wired_harness) == []
+
+    async def test_fires_for_non_counting_dispositions(self, wired_harness):
+        """counts_against_requeue_cap=False reports still fire — the whole point.
+
+        Gating on the disposition table would couple this backstop to the very
+        mechanism it exists to be independent of: a future disposition
+        mis-classified as counting would then be invisible to BOTH.
+        """
+        for _ in range(3):
+            await wired_harness._apply_retry_cap(
+                '3068', _report(counts_against_requeue_cap=False), True,
+            )
+
+        assert len(_alerts(wired_harness)) == 1
+        # The pre-existing cap genuinely did not fire for these.
+        wired_harness.scheduler.trigger_retry_cap_exhausted.assert_not_called()
+
+    async def test_existing_retry_cap_contract_unchanged(self, wired_harness):
+        """The new call must not perturb _apply_retry_cap's existing behaviour."""
+        assert await wired_harness._apply_retry_cap('3068', _report(), True) is True
+        wired_harness.scheduler.record_requeue.assert_called_once()
+        assert wired_harness.scheduler.record_requeue.call_args.kwargs[
+            'counts_against_cap'
+        ] is False
+
+        wired_harness.scheduler.clear_requeue_count.assert_not_called()
+
+        assert await wired_harness._apply_retry_cap(
+            '4000', _report(WorkflowOutcome.DONE, task_id='4000'), False,
+        ) is False
+        wired_harness.scheduler.clear_requeue_count.assert_called_once_with('4000')
+
+    async def test_run_id_guard_still_short_circuits(self, wired_harness):
+        """The _run_id=None no-op hook (relied on by other suites) is preserved."""
+        wired_harness._run_id = None
+        for _ in range(10):
+            await wired_harness._apply_retry_cap('3068', _report(), True)
+
+        assert _alerts(wired_harness) == []
+        wired_harness.scheduler.record_requeue.assert_not_called()
+
+    async def test_alert_emitter_failure_does_not_propagate(
+        self, wired_harness, monkeypatch,
+    ):
+        """A raising emitter must not escape or corrupt the return value.
+
+        The backstop must never be able to break the accounting it backstops.
+        """
+        import orchestrator.harness as harness_mod
+
+        def _boom(**kwargs):
+            raise RuntimeError('emitter exploded')
+
+        monkeypatch.setattr(
+            harness_mod, 'emit_zero_progress_requeue_alert', _boom,
+        )
+
+        for _ in range(4):
+            assert await wired_harness._apply_retry_cap('3068', _report(), True) is True
+
+        # Cap accounting still happened for every call.
+        assert wired_harness.scheduler.record_requeue.call_count == 4
+
+    async def test_tracker_failure_does_not_propagate(
+        self, wired_harness, monkeypatch,
+    ):
+        """A raising tracker is equally contained."""
+        from unittest.mock import MagicMock
+
+        broken = MagicMock()
+        broken.record.side_effect = RuntimeError('tracker exploded')
+        wired_harness._zero_progress_tracker = broken
+
+        assert await wired_harness._apply_retry_cap('3068', _report(), True) is True
+        wired_harness.scheduler.record_requeue.assert_called_once()
