@@ -98,8 +98,9 @@
 #   0  — Completed sweep (best-effort; per-candidate failures warn + continue).
 #   1  — Runtime error: could not resolve required argument (e.g. base-target symlink).
 #   2  — Usage/WIRING error: unknown flag, missing subcommand, missing required
-#        option, or a missing sibling library (scripts/lib_live_refs.sh). The
-#        library case is a wiring error, not a runtime one: nothing about the
+#        option, or a missing sibling library (scripts/lib_live_refs.sh,
+#        scripts/lib_lane_state.sh). The library case is a wiring error, not a
+#        runtime one: nothing about the
 #        invocation could have avoided it and no retry will fix it — the
 #        deployment is incomplete. Same class as an unknown flag, hence 2.
 #
@@ -229,7 +230,21 @@ source "$SCRIPT_DIR/lib_live_refs.sh"
 
 # Shared durable-lane-record reader (lane_state_read / lane_state_class), task
 # 3074. Pass 1's reclaimability gate consults dark-factory's own lane record
-# through it — see the Pass-1 record gate below.
+# through it — see the Pass-1 record gate below. Fail LOUDLY if it is missing,
+# for the same reason as the guard above and with the same exit code: a
+# silently-absent lane-state reader would degrade reclaim back to exactly the
+# `FREE ≈ flock-free` approximation this dependency exists to remove, and would
+# do it invisibly. Exit 2 (usage/WIRING), not 1 (runtime) — nothing about the
+# invocation could have avoided it and no retry will fix it; the deployment is
+# incomplete, the same class as an unknown flag.
+#
+# Ordered AFTER the lib_live_refs.sh guard deliberately: a copy carrying neither
+# sibling must still report the live-refs one first, which is what Block A9's
+# asserted message pins.
+if [ ! -f "$SCRIPT_DIR/lib_lane_state.sh" ]; then
+    echo "warm-lane-gc.sh: ERROR — scripts/lib_lane_state.sh not found next to warm-lane-gc.sh" >&2
+    exit 2
+fi
 # shellcheck source=scripts/lib_lane_state.sh
 source "$SCRIPT_DIR/lib_lane_state.sh"
 
