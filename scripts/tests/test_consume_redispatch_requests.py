@@ -857,3 +857,218 @@ def test_a_no_op_success_payload_counts_as_applied(requests_dir):
 
     client = _NoOpClient({5321: _row('blocked')})
     assert _apply(client, req) is True
+
+
+# ── step-9: archival, failure containment and blast radius ───────────────────
+#
+# Ordering is the safety property here: archive ON SUCCESS ONLY. Archiving
+# before a confirmed write would drop a request whose transition never landed,
+# and leaving a failed request in place makes the retry immediate and local
+# rather than dependent on the next sweep re-emitting it.
+
+
+def _run(requests_dir, client, **kw):
+    kw.setdefault('project_root', REIFY)
+    return crr.consume(str(requests_dir), client, **kw)
+
+
+def _top_level(requests_dir):
+    return sorted(p.name for p in requests_dir.iterdir() if p.is_file())
+
+
+def _archived(requests_dir):
+    d = requests_dir / 'consumed'
+    return sorted(p.name for p in d.iterdir()) if d.is_dir() else []
+
+
+def test_an_applied_request_is_archived_into_consumed(requests_dir):
+    _req(requests_dir, 5321, 'gate_closure')
+    client = RecordingClient({5321: _row('blocked')})
+    summary = _run(requests_dir, client)
+    assert summary.applied == 1
+    assert _top_level(requests_dir) == []
+    assert _archived(requests_dir) == ['redispatch-5321-gate_closure.json']
+
+
+def test_a_failed_apply_leaves_the_file_in_place_for_the_next_run(requests_dir):
+    _req(requests_dir, 5321, 'gate_closure')
+    client = RecordingClient({5321: _row('blocked')}, raises_on={'set_task_status'})
+    summary = _run(requests_dir, client)
+    assert summary.failed == 1 and summary.applied == 0
+    assert _top_level(requests_dir) == ['redispatch-5321-gate_closure.json']
+    assert _archived(requests_dir) == []
+
+
+def test_a_guard_skipped_request_is_left_in_place(requests_dir):
+    _req(requests_dir, 5321, 'gate_closure')
+    client = RecordingClient({5321: _row('done')})   # out of scope
+    summary = _run(requests_dir, client)
+    assert summary.skipped == 1 and summary.applied == 0
+    assert _top_level(requests_dir) == ['redispatch-5321-gate_closure.json']
+    assert _archived(requests_dir) == []
+
+
+def test_an_invalid_request_is_skipped_and_left_in_place(requests_dir):
+    write_request(requests_dir, 5321, 'gate_closure', verdict='CORRUPT-HOLD',
+                  mtime=SWEEP_MTIME)
+    client = RecordingClient({5321: _row('blocked')})
+    summary = _run(requests_dir, client)
+    assert summary.skipped == 1
+    assert client.calls == []            # never even read the row
+    assert _top_level(requests_dir) == ['redispatch-5321-gate_closure.json']
+
+
+def test_the_archive_destination_is_retraction_safe(requests_dir):
+    """The sweep's retraction globs "$REQUESTS_DIR"/redispatch-*.json at the
+    TOP LEVEL only, so a subdirectory is invisible to it -- which is what makes
+    the archive a durable audit trail rather than something the next sweep
+    deletes."""
+    import glob
+    _req(requests_dir, 5321, 'gate_closure')
+    _run(requests_dir, RecordingClient({5321: _row('blocked')}))
+    assert _archived(requests_dir) == ['redispatch-5321-gate_closure.json']
+    assert glob.glob(str(requests_dir / 'redispatch-*.json')) == []
+
+
+def test_max_writes_stops_after_n_applied_and_defers_the_rest(requests_dir):
+    rows = {}
+    for tid in range(1, 6):
+        _req(requests_dir, tid, 'gate_closure')
+        rows[tid] = _row('blocked', task_id=tid)
+    client = RecordingClient(rows)
+    summary = _run(requests_dir, client, max_writes=2)
+    assert summary.applied == 2
+    assert summary.deferred == 3
+    assert len(_archived(requests_dir)) == 2
+    assert len(_top_level(requests_dir)) == 3
+
+
+def test_deferred_requests_are_reported_not_silently_truncated(requests_dir, capsys):
+    for tid in (1, 2, 3):
+        _req(requests_dir, tid, 'gate_closure')
+    rows = {tid: _row('blocked', task_id=tid) for tid in (1, 2, 3)}
+    _run(requests_dir, RecordingClient(rows), max_writes=1)
+    err = capsys.readouterr().err
+    assert 'deferred' in err
+
+
+def test_a_skip_does_not_consume_the_max_writes_budget(requests_dir):
+    """The cap bounds WRITES, not requests looked at -- otherwise a directory
+    of already-applied no-ops would starve the requests that still need work."""
+    _req(requests_dir, 1, 'gate_closure')          # already cancelled -> skip
+    _req(requests_dir, 2, 'gate_closure')          # applies
+    client = RecordingClient({1: _row('cancelled', task_id=1),
+                              2: _row('blocked', task_id=2)})
+    summary = _run(requests_dir, client, max_writes=1)
+    assert summary.applied == 1 and summary.skipped == 1 and summary.deferred == 0
+
+
+def test_dry_run_guards_and_reports_but_writes_and_archives_nothing(requests_dir):
+    _req(requests_dir, 5321, 'gate_closure')
+    client = RecordingClient({5321: _row('blocked')})
+    summary = _run(requests_dir, client, dry_run=True)
+    assert summary.planned == 1 and summary.applied == 0
+    assert client.tools_called == ['get_task']     # the guard read, nothing else
+    assert _top_level(requests_dir) == ['redispatch-5321-gate_closure.json']
+    assert _archived(requests_dir) == []
+
+
+def test_dry_run_still_reports_skips(requests_dir):
+    _req(requests_dir, 5321, 'gate_closure')
+    summary = _run(requests_dir, RecordingClient({5321: _row('done')}), dry_run=True)
+    assert summary.skipped == 1 and summary.planned == 0
+
+
+def test_one_failing_request_does_not_stop_its_siblings(requests_dir):
+    _req(requests_dir, 1, 'gate_closure')
+    _req(requests_dir, 2, 'gate_closure')
+    _req(requests_dir, 3, 'gate_closure')
+
+    class _FailsOnTwo(RecordingClient):
+        def set_task_status(self, task_id, status, project_root):
+            if task_id == 2:
+                self.calls.append(('set_task_status', {'id': task_id}))
+                raise RuntimeError('nope')
+            return super().set_task_status(task_id, status, project_root)
+
+    client = _FailsOnTwo({tid: _row('blocked', task_id=tid) for tid in (1, 2, 3)})
+    summary = _run(requests_dir, client)
+    assert summary.applied == 2 and summary.failed == 1
+    assert _top_level(requests_dir) == ['redispatch-2-gate_closure.json']
+
+
+def test_summary_line_reports_every_bucket(requests_dir, capsys):
+    _req(requests_dir, 1, 'gate_closure')                       # applies
+    _req(requests_dir, 2, 'gate_closure')                       # skipped
+    _req(requests_dir, 3, 'gate_closure')                       # fails
+
+    class _FailsOnThree(RecordingClient):
+        def set_task_status(self, task_id, status, project_root):
+            if task_id == 3:
+                raise RuntimeError('nope')
+            return super().set_task_status(task_id, status, project_root)
+
+    client = _FailsOnThree({1: _row('blocked', task_id=1),
+                            2: _row('done', task_id=2),
+                            3: _row('blocked', task_id=3)})
+    _run(requests_dir, client)
+    line = [ln for ln in capsys.readouterr().err.splitlines() if 'SUMMARY' in ln]
+    assert len(line) == 1
+    for token in ('applied=1', 'skipped=1', 'failed=1', 'deferred=0'):
+        assert token in line[0]
+
+
+def test_an_empty_requests_dir_is_a_clean_zero_report(requests_dir):
+    summary = _run(requests_dir, RecordingClient({}))
+    assert (summary.applied, summary.skipped, summary.failed) == (0, 0, 0)
+
+
+def test_a_missing_requests_dir_is_a_clean_zero_report(tmp_path):
+    summary = crr.consume(str(tmp_path / 'absent'), RecordingClient({}),
+                          project_root=REIFY)
+    assert (summary.applied, summary.skipped, summary.failed) == (0, 0, 0)
+
+
+# ── exit codes ──────────────────────────────────────────────────────────────
+
+
+def _main(argv, client):
+    return crr.main(argv, client_factory=lambda server: client)
+
+
+def test_main_exits_zero_when_individual_requests_fail(requests_dir):
+    """A recurring `oneshot` that can fail enters systemd `failed` state and
+    STAYS there, so a single unactionable request would silently stop the whole
+    nightly job (the lesson already written into
+    scripts/fused-memory-flag-marker-sweep.sh)."""
+    _req(requests_dir, 5321, 'gate_closure')
+    client = RecordingClient({5321: _row('blocked')}, raises_on={'set_task_status'})
+    rc = _main(['--requests-dir', str(requests_dir), '--project-root', REIFY], client)
+    assert rc == 0
+
+
+def test_main_exits_zero_on_a_clean_run(requests_dir):
+    _req(requests_dir, 5321, 'gate_closure')
+    client = RecordingClient({5321: _row('blocked')})
+    assert _main(['--requests-dir', str(requests_dir), '--project-root', REIFY],
+                 client) == 0
+
+
+def test_main_exits_non_zero_on_a_usage_error(requests_dir):
+    with pytest.raises(SystemExit) as exc:
+        _main(['--not-a-flag'], RecordingClient({}))
+    assert exc.value.code != 0
+
+
+def test_main_rejects_a_non_positive_max_writes(requests_dir):
+    """A cap of 0 would silently do nothing every night while reporting success."""
+    with pytest.raises(SystemExit) as exc:
+        _main(['--requests-dir', str(requests_dir), '--max-writes', '0'],
+              RecordingClient({}))
+    assert exc.value.code != 0
+
+
+def test_main_default_max_writes_is_the_blast_radius_cap(requests_dir):
+    """Default 5: bounds a first-night surprise to a handful of transitions an
+    operator can read in the journal and undo."""
+    assert crr.DEFAULT_MAX_WRITES == 5
