@@ -416,6 +416,66 @@ def test_spawn_omits_wm_title_export_when_ambient_wm_title_leaks(
     )
 
 
+@pytest.mark.skipif(
+    __import__("platform").system() == "Darwin",
+    reason="exit-126 path requires non-Darwin host",
+)
+def test_no_emulator_found_yields_126_ignores_ambient_spawn_backend(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Proves the OTHER `dict(os.environ)` sites in this file are hermetic
+    too, not just `_base_env`: an ambient CLAUDE_SPAWN_BACKEND=tmux must not
+    reroute this no-emulator scenario down the tmux lane.
+
+    Both leak paths exit 126 (spawn-claude.sh's "tmux not found" branch vs.
+    its "no terminal emulator found" branch), so an exit-code-only assertion
+    can't discriminate between them -- confirmed empirically that
+    `CLAUDE_SPAWN_BACKEND=tmux pytest ...::test_no_emulator_found_yields_126`
+    passes today despite taking the wrong branch. This test asserts on
+    stderr content instead.
+
+    RED today: this test's own `dict(os.environ)` -- mirroring
+    test_no_emulator_found_yields_126's current construction below -- passes
+    the ambient CLAUDE_SPAWN_BACKEND straight through, so the run takes the
+    tmux branch and stderr says "tmux not found" instead of "no terminal
+    emulator found".
+    """
+    import shutil as _shutil
+
+    monkeypatch.setenv("CLAUDE_SPAWN_BACKEND", "tmux")
+
+    bin_dir = _make_bin_dir(tmp_path)
+    _write_fake_claude(bin_dir, exit_code=0)
+
+    # Minimal system-bin with only the utilities the script needs -- NO
+    # tmux, NO terminal emulator (mirrors test_no_emulator_found_yields_126's
+    # sys_bin exactly).
+    sys_bin = tmp_path / "sys_bin"
+    sys_bin.mkdir()
+    for util in ["bash", "mktemp", "sleep", "cat", "rm", "uname"]:
+        src = _shutil.which(util)
+        if src:
+            (sys_bin / util).symlink_to(src)
+
+    env = dict(os.environ)
+    env["PATH"] = str(bin_dir) + ":" + str(sys_bin)
+    env.pop("CLAUDE_TERMINAL_CMD", None)
+    env.pop("ESCALATION_TERMINAL_CMD", None)
+
+    result = _run_spawn(env, tmp_path, timeout=10)
+    stderr = result.stderr.decode()
+    assert result.returncode == 126, (
+        f"expected 126, got {result.returncode}\nstderr: {stderr}"
+    )
+    assert "no terminal emulator found" in stderr, (
+        f"expected the no-emulator branch (ambient CLAUDE_SPAWN_BACKEND must "
+        f"not leak through), got:\n{stderr}"
+    )
+    assert "tmux" not in stderr.lower(), (
+        f"expected the tmux branch NOT to run, got:\n{stderr}"
+    )
+
+
 # ===========================================================================
 # Step-1 tests: exit-code propagation
 # ===========================================================================
