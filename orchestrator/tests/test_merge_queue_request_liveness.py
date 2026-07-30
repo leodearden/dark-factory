@@ -34,9 +34,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fcntl
 import logging
+import os
+import re
 import time
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -90,6 +94,42 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
     """Single-host (no verify_runners) OrchestratorConfig."""
     return OrchestratorConfig(project_root=git_repo, git=git_config)
+
+
+# ── Warm-lane variants (task 3003, pre-1) ──────────────────────────────────
+# The plain `git_config` above omits `persistent_merge_worktree`, which
+# defaults to False (config.py:1483).  With the knob off,
+# `_acquire_warm_verify_worktree` returns `merge_wt` unchanged
+# (merge_liveness.py:712-713) and `reset_persistent_merge_worktree` is never
+# reached — the warm-swap reset seam would be untestable from this file.  The
+# `warm_*` trio below is byte-identical to the plain trio except for that one
+# knob, so a test can drive the LOCAL serial-head warm path for real (the
+# reset-contention seam this task fixes) while every pre-existing test keeps
+# the cold ephemeral path unchanged.
+
+
+@pytest.fixture
+def warm_git_config() -> GitConfig:
+    """`git_config` with the persistent warm merge-verify worktree ENABLED."""
+    return GitConfig(
+        main_branch='main',
+        branch_prefix='task/',
+        remote='origin',
+        worktree_dir='.worktrees',
+        push_after_advance=False,
+        persistent_merge_worktree=True,
+    )
+
+
+@pytest.fixture
+def warm_git_ops(warm_git_config: GitConfig, git_repo: Path) -> GitOps:
+    return GitOps(warm_git_config, git_repo)
+
+
+@pytest.fixture
+def warm_config(git_repo: Path, warm_git_config: GitConfig) -> OrchestratorConfig:
+    """Single-host OrchestratorConfig with the warm merge-verify lane ON."""
+    return OrchestratorConfig(project_root=git_repo, git=warm_git_config)
 
 
 def _make_request(
@@ -1527,6 +1567,95 @@ class TestRepeatedDeadVerifyBusyLoopCap:
         )
 
 
+# ---------------------------------------------------------------------------
+# task 3003 amend (reviewer_comprehensive, duplication): the three pieces of
+# scaffold every TestContendedLeaseDefers case below needs — a LOCAL host
+# lease, a refusing warm-swap reset, and one dispatch attempt through
+# _run_inflight_verify.  Factored here (the pattern this file already uses for
+# _make_merged_item) so each test carries only its own knobs and assertions:
+# the duplicated scaffold was ~150 of the class's lines and hid the real
+# per-test differences.
+# ---------------------------------------------------------------------------
+
+
+def _local_lease() -> Any:
+    """A single-slot LOCAL ``HostLease`` over a stub runner.
+
+    LOCAL because the whole contended-lane seam lives in
+    ``_run_inflight_verify``'s local warm-swap branch.  A fresh instance per
+    dispatch is deliberate and safe: ``_run_inflight_verify`` only reads
+    ``lease.is_local``/``lease.runner`` and never releases the lease (that is
+    ``_finalize_inflight``'s job), so nothing accumulates on it across attempts.
+    """
+    from orchestrator.verify_runner import HostLease  # noqa: PLC0415
+
+    fake_local = MagicMock()
+    fake_local.name = 'local'
+    fake_local.is_local = True
+    return HostLease(name='local', runner=fake_local, is_local=True)
+
+
+def _held_lane_reset(warm_path: Path, holder_pgid: int) -> Any:
+    """A ``reset_persistent_merge_worktree`` stand-in that refuses IMMEDIATELY.
+
+    Stands in for the FOREIGN-holder pre-check at the top of the real method:
+    ``MergeVerifyLeaseHeld``, raised with no bounded wait at all (hence no
+    ``wait_secs``), which is what makes the defer's minimum inter-attempt
+    period load-bearing.
+    """
+    from orchestrator.git_ops import MergeVerifyLeaseHeld  # noqa: PLC0415
+
+    async def _reset(*_a: object, **_k: object) -> Path:
+        raise MergeVerifyLeaseHeld(warm_path, holder_pgid)
+
+    return _reset
+
+
+async def _drive_defer(
+    worker: Any,
+    git_ops: GitOps,
+    config: OrchestratorConfig,
+    branch: str,
+    *,
+    task_id: str | None = None,
+    lease: Any = None,
+    reset: Any = None,
+    verify: Any = None,
+    timeout: float = 15.0,
+) -> tuple[MergeRequest, Any]:
+    """Drive ONE dispatch attempt for *task_id* through ``_run_inflight_verify``.
+
+    Fresh merged item on its own *branch* but (when *task_id* is given) the SAME
+    task_id, which is what a re-dispatch of one task looks like and what lets
+    the per-task streak state accumulate across attempts.
+
+    Patches ``reset_persistent_merge_worktree`` with *reset* and/or
+    ``_run_post_merge_verify`` with *verify* for the duration of the attempt
+    only.  Returns ``(req, InflightVerifyResult)``.
+    """
+    req, item = await _make_merged_item(
+        git_ops, config, branch, f'{branch}.py', 'x=1\n', task_id=task_id,
+    )
+    worker._register_owned_merge_worktree(item.merge_wt)
+    worker._request_ledger.on_dequeue(req, now=1_000_000.0)
+    with contextlib.ExitStack() as stack:
+        if reset is not None:
+            stack.enter_context(
+                patch.object(git_ops, 'reset_persistent_merge_worktree', reset)
+            )
+        if verify is not None:
+            stack.enter_context(
+                patch('orchestrator.merge_queue._run_post_merge_verify', verify)
+            )
+        result = await asyncio.wait_for(
+            worker._run_inflight_verify(
+                item, lease if lease is not None else _local_lease(),
+            ),
+            timeout=timeout,
+        )
+    return req, result
+
+
 @pytest.mark.asyncio
 class TestContendedLeaseDefers:
     """A contended merge-verify lease DEFERS (requeues), never blocks
@@ -1539,7 +1668,850 @@ class TestContendedLeaseDefers:
     MergeOutcome('blocked'); step-06 adds an ``except MergeVerifyLeaseContended``
     clause BEFORE it that requeues the item exactly like the operator-halt
     abort — req.result left pending, per-task retry counters untouched.
+
+    task 3003 extends the SAME contract to the warm-swap RESET seam, which
+    takes the SAME ``<lane_dir>.lock`` one step earlier in
+    ``_run_inflight_verify``: ``_acquire_warm_verify_worktree`` (merge_queue.py's
+    LOCAL branch) → ``GitOps.reset_persistent_merge_worktree``. Its bounded-wait
+    timeout used to raise a BARE RuntimeError, which the generic handler mapped
+    to a deterministic-reason MergeOutcome('blocked') — identical signature on
+    every attempt, which then fed workflow.py's consecutive_merge_thrash ladder
+    into a false-positive L2 (reify 5354/5300/5328, signature 3173b64436423738).
     """
+
+    async def test_reset_persistent_merge_worktree_contended_defers(
+        self,
+        warm_git_ops: GitOps,
+        warm_config: OrchestratorConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """task 3003, limb (a): a contended lane lock on the warm-swap RESET
+        must DEFER (requeue), exactly like a contended lease.
+
+        Mechanism reproduced verbatim from the incident: a SAME-process holder
+        of ``lane_lock_path(_merge-verify)`` with NO holder-pgid rendezvous
+        written.  ``_merge_verify_lease_active()`` (git_ops.py:2163) is
+        fail-OPEN on a missing rendezvous key, so the ``MergeVerifyLeaseHeld``
+        pre-check (which also excludes our OWN pgid) never fires and control
+        falls straight through to the bounded flock acquire — which times out.
+
+        RED on main: today that timeout is a bare ``RuntimeError``, so the
+        generic ``except Exception`` resolves
+        ``MergeOutcome('blocked', reason='Verification error: Timed out after
+        30s ...')`` with ``req.result`` RESOLVED.
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+        from orchestrator.merge_queue import (  # noqa: PLC0415
+            InflightStatus,
+            SpeculativeMergeWorker,
+        )
+        from orchestrator.verify_cancel import lane_lock_path  # noqa: PLC0415
+
+        # Shrink the RESET path's own bounded wait so the test doesn't sit for
+        # the real 30s.  STRICT setattr (no raising=False) on purpose: the
+        # reset must have its OWN constant, decoupled from the seed's
+        # `flock(1) -w` arg (_SEED_WARM_LANE_LOCK_WAIT_SECS) — if it silently
+        # kept sharing that one, this line must fail rather than pass by
+        # accident.
+        monkeypatch.setattr(git_ops_mod, '_RESET_WARM_LANE_LOCK_WAIT_SECS', 1)
+
+        req, item = await _make_merged_item(
+            warm_git_ops, warm_config, 'reset-contended-a', 'rca.py', 'x=1\n',
+        )
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(warm_git_ops, q)
+        worker._register_owned_merge_worktree(item.merge_wt)
+        # This test's raiser waits only 1s (shrunk above), so the defer's
+        # minimum inter-attempt period would otherwise sleep the remaining 29s.
+        # The throttle itself is covered by test_zero_wait_defer_is_throttled /
+        # test_self_throttling_raiser_is_not_slept_again — opt out here.
+        worker.CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS = 0.0
+
+        lease = _local_lease()
+
+        worker._request_ledger.on_dequeue(req, now=1_000_000.0)
+
+        # Sentinel: the defer must neither increment NOR pop this counter
+        # (unlike the generic 'blocked' path, which pops it).
+        worker._inflight_dead_verify_aborts[req.task_id] = 2
+
+        verify_started = False
+
+        async def _must_not_run(*_a: object, **_k: object) -> object:
+            nonlocal verify_started
+            verify_started = True
+            raise AssertionError(
+                'the warm-swap reset must raise BEFORE any verify is dispatched'
+            )
+
+        lock_path = lane_lock_path(warm_git_ops.persistent_merge_worktree_path)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            with (
+                patch(
+                    'orchestrator.merge_queue._run_post_merge_verify', _must_not_run,
+                ),
+                patch.object(
+                    worker, '_note_requeue', wraps=worker._note_requeue,
+                ) as spy_note,
+                patch.object(
+                    worker, '_release_or_cleanup', wraps=worker._release_or_cleanup,
+                ) as spy_release,
+            ):
+                result = await asyncio.wait_for(
+                    worker._run_inflight_verify(item, lease), timeout=15.0,
+                )
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+
+        assert not verify_started, (
+            'the reset raised before the verify — _run_post_merge_verify must '
+            'never have been reached'
+        )
+
+        # DEFER, not block:
+        assert result.status == InflightStatus.REQUEUED, (
+            f'a contended lane lock on the warm-swap reset must REQUEUE, got '
+            f'status={result.status!r} outcome={result.outcome!r}'
+        )
+        assert result.outcome is None, 'requeue must carry no MergeOutcome'
+        assert result.merge_wt is None, 'merge_wt must be released on requeue'
+        assert not req.result.done(), (
+            'req.result must be left PENDING (deferred), never resolved to '
+            'blocked — a resolved blocked outcome here is what fed the '
+            'consecutive_merge_thrash false-positive L2'
+        )
+
+        # Same requeue mechanics as the contended-lease block:
+        assert not q.empty(), 'the request must be re-dispatched onto _queue'
+        assert req.request_id not in worker._request_ledger.open_request_ids(), (
+            'on_requeued must clear the ledger entry so the parked request '
+            'never ages out'
+        )
+        spy_release.assert_called_once()
+        spy_note.assert_called_once()
+
+        # Per-task retry counter untouched (neither incremented nor popped).
+        assert worker._inflight_dead_verify_aborts.get(req.task_id) == 2, (
+            'the contended-reset requeue must leave the per-task '
+            'dead-verify-abort counter untouched'
+        )
+
+    async def test_reset_lane_lease_held_defers(
+        self,
+        warm_git_ops: GitOps,
+        warm_config: OrchestratorConfig,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """task 3003, limb (c): a DIFFERENT-process lease holder on the SAME
+        warm-swap seam must ALSO defer, not block.
+
+        ``MergeVerifyLeaseHeld`` is raised by the fail-CLOSED pre-check at the
+        very top of ``reset_persistent_merge_worktree`` (git_ops.py) when a
+        FOREIGN live pgid holds the merge-verify lease.  It reaches
+        ``_run_inflight_verify`` through exactly the same
+        ``_acquire_warm_verify_worktree`` call as the contended timeout, and
+        it deserves exactly the same response — the tree was never touched and
+        the holder will eventually go away.
+
+        RED on main: the type is not in the requeue ``except`` arm, so it falls
+        to the generic ``except Exception`` and resolves
+        ``MergeOutcome('blocked', reason='Verification error: Refusing to reset
+        persistent merge worktree ...')`` — another deterministic,
+        thrash-feeding signature, and a direct contradiction of the REQUEUE /
+        ``counts_against_requeue_cap=False`` disposition ALREADY declared for
+        this exact type in workflow_types.py.
+
+        Also pins the streak log's honesty: ``MergeVerifyLeaseHeld`` carries no
+        ``wait_secs``, so the rising-severity ERROR must NOT print a fabricated
+        "~0 min of continuous contention" duration — a zero there would tell an
+        operator the opposite of the truth (the holder has been there a while;
+        we simply cannot say how long from this exception).
+        """
+        from orchestrator.merge_queue import (  # noqa: PLC0415
+            InflightStatus,
+            SpeculativeMergeWorker,
+        )
+
+        # A pgid that is neither ours nor live (Linux pid_max is nowhere near
+        # 2**31-1) — stands in for the foreign holder the real pre-check finds.
+        foreign_pgid = 2**31 - 1
+        warm_path = warm_git_ops.persistent_merge_worktree_path
+        _lease_held_reset = _held_lane_reset(warm_path, foreign_pgid)
+
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(warm_git_ops, q)
+        # Small threshold so the SECOND attempt deterministically crosses it
+        # (mirrors test_consecutive_contended_requeues_raise_log_severity).
+        worker.CONTENDED_LEASE_REQUEUE_WARN_STREAK = 2
+        # MergeVerifyLeaseHeld carries no wait_secs, so the defer's minimum
+        # inter-attempt period would sleep its full 30s on EACH attempt here.
+        # The throttle is covered by test_zero_wait_defer_is_throttled — this
+        # test is about the defer contract and the streak log, so opt out.
+        worker.CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS = 0.0
+
+        lease = _local_lease()
+
+        task_id = 'lease-held-holder'
+
+        async def _drive_one(branch: str) -> tuple[MergeRequest, Any]:
+            # Distinct branch, SAME task_id — a re-dispatch of one task, which
+            # is what makes the per-task streak state accumulate.
+            return await _drive_defer(
+                worker, warm_git_ops, warm_config, branch,
+                task_id=task_id, lease=lease, reset=_lease_held_reset,
+            )
+
+        # ── Attempt 1: the full defer contract, identical to the contended case ──
+        worker._inflight_dead_verify_aborts[task_id] = 2
+        with (
+            patch.object(
+                worker, '_note_requeue', wraps=worker._note_requeue,
+            ) as spy_note,
+            patch.object(
+                worker, '_release_or_cleanup', wraps=worker._release_or_cleanup,
+            ) as spy_release,
+        ):
+            req, result = await _drive_one('lhd-0')
+
+        assert result.status == InflightStatus.REQUEUED, (
+            f'a foreign-held merge-verify lease on the warm-swap reset must '
+            f'REQUEUE, got status={result.status!r} outcome={result.outcome!r}'
+        )
+        assert result.outcome is None, 'requeue must carry no MergeOutcome'
+        assert result.merge_wt is None, 'merge_wt must be released on requeue'
+        assert not req.result.done(), (
+            'req.result must be left PENDING (deferred), never resolved to blocked'
+        )
+        assert not q.empty(), 'the request must be re-dispatched onto _queue'
+        assert req.request_id not in worker._request_ledger.open_request_ids(), (
+            'on_requeued must clear the ledger entry so the parked request '
+            'never ages out'
+        )
+        spy_release.assert_called_once()
+        spy_note.assert_called_once()
+        assert worker._inflight_dead_verify_aborts.get(task_id) == 2, (
+            'the lease-held requeue must leave the per-task dead-verify-abort '
+            'counter untouched'
+        )
+
+        # ── Attempt 2: crosses the streak threshold — the ERROR must not lie ──
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            _, result2 = await _drive_one('lhd-1')
+
+        assert result2.status == InflightStatus.REQUEUED
+        streak = worker.CONTENDED_LEASE_REQUEUE_WARN_STREAK
+        assert worker._contended_lease_requeues[task_id] == streak, (
+            'consecutive lease-held defers for one task must accumulate the '
+            'same operator-visible streak a contended lease does'
+        )
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert errors, 'crossing the streak threshold must log an ERROR'
+        msg = errors[0].getMessage()
+        assert str(streak) in msg, (
+            'the rising-severity ERROR must still name the streak length'
+        )
+        assert str(foreign_pgid) in msg, (
+            'the ERROR must name the foreign holder pgid so an operator can '
+            'identify who is holding the lane'
+        )
+        assert 'continuous contention' not in msg, (
+            'MergeVerifyLeaseHeld carries no wait_secs, so the streak ERROR '
+            'must NOT print a fabricated duration estimate (getattr(..., 0.0) '
+            'renders "~0 min of continuous contention", which tells the '
+            'operator the exact opposite of the truth). Suppress the duration '
+            'clause — or substitute a holder-pgid clause — when wait_secs is '
+            f'absent. Got: {msg!r}'
+        )
+
+    async def test_zero_wait_defer_is_throttled(
+        self,
+        warm_git_ops: GitOps,
+        warm_config: OrchestratorConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """task 3003 review fix (1): a ZERO-WAIT defer must be THROTTLED.
+
+        ``MergeVerifyLeaseHeld`` is raised by an IMMEDIATE fail-CLOSED
+        pre-check at the top of ``reset_persistent_merge_worktree`` — before
+        any bounded wait.  So unlike the two contended raisers (which have
+        already burned 30 s / 300 s inside the acquire by the time they
+        surface), this one costs nothing to hit.  With a bare
+        ``_release_or_cleanup`` + ``put_nowait`` defer the merger would spin
+        dequeue → ``git worktree add`` + merge → instant refusal → cleanup →
+        requeue at whatever rate git allows, for the WHOLE 1–2 h holder
+        window.  The defer must therefore observe a minimum INTER-ATTEMPT
+        period.
+
+        RED on main: ``CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS`` does not exist
+        (strict ``monkeypatch.setattr`` → AttributeError) and no sleep is
+        performed.
+        """
+        from orchestrator.merge_queue import (  # noqa: PLC0415
+            InflightStatus,
+            SpeculativeMergeWorker,
+        )
+
+        foreign_pgid = 2**31 - 1
+        warm_path = warm_git_ops.persistent_merge_worktree_path
+        _lease_held_reset = _held_lane_reset(warm_path, foreign_pgid)
+
+        req, item = await _make_merged_item(
+            warm_git_ops, warm_config, 'defer-throttle-a', 'dta.py', 'x=1\n',
+        )
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(warm_git_ops, q)
+        worker._register_owned_merge_worktree(item.merge_wt)
+        # STRICT setattr (raising=True): the throttle must be a real class
+        # attribute following the MAX_*/WARN_STREAK monkeypatch convention, not
+        # something this test invents on the instance.
+        monkeypatch.setattr(worker, 'CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS', 0.25)
+
+        lease = _local_lease()
+
+        worker._request_ledger.on_dequeue(req, now=1_000_000.0)
+
+        loop = asyncio.get_running_loop()
+        with patch.object(
+            warm_git_ops, 'reset_persistent_merge_worktree', _lease_held_reset,
+        ):
+            t0 = loop.time()
+            result = await asyncio.wait_for(
+                worker._run_inflight_verify(item, lease), timeout=15.0,
+            )
+            elapsed = loop.time() - t0
+
+        # A sleep can only ever OVERSHOOT its argument, so a lower bound
+        # slightly under the configured period is deterministic (no upper
+        # bound is asserted — that would be timing-fragile).
+        assert elapsed >= 0.2, (
+            f'a zero-wait MergeVerifyLeaseHeld defer must observe the minimum '
+            f'inter-attempt period (0.25s here) before re-queuing, else the '
+            f'merger hot-spins merge→refuse→cleanup→requeue for the whole '
+            f'holder window; returned after {elapsed:.3f}s'
+        )
+
+        # …and the throttle must not have cost us any of the defer contract:
+        assert result.status == InflightStatus.REQUEUED
+        assert result.outcome is None, 'requeue must carry no MergeOutcome'
+        assert result.merge_wt is None, 'merge_wt must be released on requeue'
+        assert not req.result.done(), (
+            'req.result must be left PENDING (deferred), never resolved'
+        )
+        assert not q.empty(), 'the request must be re-dispatched onto _queue'
+
+    async def test_self_throttling_raiser_is_not_slept_again(
+        self,
+        warm_git_ops: GitOps,
+        warm_config: OrchestratorConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """task 3003 review fix (1), scope fence: the throttle is a minimum
+        inter-attempt PERIOD, not an unconditional extra sleep.
+
+        A raiser that already burned a bounded wait inside the acquire has
+        ALREADY paid the period — task 2828's lease waits 300 s
+        (``_MERGE_VERIFY_LEASE_WAIT_SECS``) and the reset path waits 30 s
+        (``_RESET_WARM_LANE_LOCK_WAIT_SECS``), both ≥ any sane minimum period.
+        Sleeping again on top of that would slow the ALREADY-throttled paths
+        for no benefit, so the backoff must be ``max(0, PERIOD - wait_secs)``.
+        """
+        from orchestrator.git_ops import MergeVerifyLeaseContended  # noqa: PLC0415
+        from orchestrator.merge_queue import (  # noqa: PLC0415
+            InflightStatus,
+            SpeculativeMergeWorker,
+        )
+
+        async def _lease_contended_reset(*_a: object, **_k: object) -> Path:
+            raise MergeVerifyLeaseContended(Path('/x/_merge-verify.lock'), 300.0)
+
+        req, item = await _make_merged_item(
+            warm_git_ops, warm_config, 'defer-throttle-b', 'dtb.py', 'x=1\n',
+        )
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(warm_git_ops, q)
+        worker._register_owned_merge_worktree(item.merge_wt)
+        monkeypatch.setattr(worker, 'CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS', 0.25)
+
+        lease = _local_lease()
+
+        worker._request_ledger.on_dequeue(req, now=1_000_000.0)
+
+        # Asserted on the SLEEP, not on wall-clock elapsed.  The sibling test
+        # above states the rule — an upper bound is timing-fragile — and it
+        # binds here: the timed region also releases the merge worktree (real
+        # git work), so on a loaded box (this repo runs its own merge workers
+        # concurrently) that cost dwarfs the 0.25s signal and an `elapsed <`
+        # bound false-fails.  The backoff duration is load-independent and
+        # pins the contract directly.
+        _sleeps: list[float] = []
+        _real_sleep = asyncio.sleep
+
+        async def _recording_sleep(delay: float, *a: object, **k: object) -> object:
+            _sleeps.append(float(delay))
+            return await _real_sleep(delay, *a, **k)
+
+        with (
+            patch.object(
+                warm_git_ops,
+                'reset_persistent_merge_worktree',
+                _lease_contended_reset,
+            ),
+            patch.object(asyncio, 'sleep', _recording_sleep),
+        ):
+            result = await asyncio.wait_for(
+                worker._run_inflight_verify(item, lease), timeout=15.0,
+            )
+
+        assert not [d for d in _sleeps if d >= 0.2], (
+            f'wait_secs=300.0 already exceeds the 0.25s minimum inter-attempt '
+            f'period, so the defer must sleep ZERO additional seconds — the '
+            f'backoff is max(0, PERIOD - wait_secs), not an unconditional '
+            f'extra sleep; slept {_sleeps!r}'
+        )
+        assert result.status == InflightStatus.REQUEUED
+        assert result.outcome is None
+        assert not req.result.done()
+        assert not q.empty()
+
+    async def test_cancel_during_defer_backoff_leaves_requeue_to_canceller(
+        self,
+        warm_git_ops: GitOps,
+        warm_config: OrchestratorConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """task 3003 review fix (4): A CANCELLING CALLER OWNS THE REQUEST.
+
+        ``_run_inflight_verify`` runs as a background ``ensure_future`` task, so
+        a cancellation can land INSIDE the defer backoff.  It must NOT re-queue
+        from a ``finally`` there: every production cancel site already
+        discharges the request itself (``stop()`` resolves it with the shutdown
+        outcome and retires it BEFORE cancelling; ``_verifier_loop``'s
+        head-failure cascade either re-queues the entry or re-dispatches it via
+        ``_remerge``), so a ``finally`` would DOUBLE-file it.
+
+        This pins the convention already followed by the operator-halt and
+        dead-verify defer branches on this same coroutine: they await before
+        ``put_nowait`` too, and a cancellation there simply skips the requeue.
+        The sibling test below drives the cascade path that a ``finally`` would
+        actually corrupt.
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker  # noqa: PLC0415
+
+        foreign_pgid = 2**31 - 1
+        warm_path = warm_git_ops.persistent_merge_worktree_path
+        _lease_held_reset = _held_lane_reset(warm_path, foreign_pgid)
+
+        req, item = await _make_merged_item(
+            warm_git_ops, warm_config, 'defer-cancel', 'dc.py', 'x=1\n',
+        )
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(warm_git_ops, q)
+        worker._register_owned_merge_worktree(item.merge_wt)
+        # Long enough that the cancellation below lands squarely inside it.
+        monkeypatch.setattr(worker, 'CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS', 5.0)
+
+        lease = _local_lease()
+
+        worker._request_ledger.on_dequeue(req, now=1_000_000.0)
+
+        # Deterministic barrier: wait until the ephemeral worktree has actually
+        # been released before cancelling, so the cancellation provably lands in
+        # the backoff and not in the (unbounded, git-I/O) cleanup ahead of it.
+        # This also pins the ORDERING — the backoff must come AFTER the release,
+        # never hold a worktree and its disk across the wait.
+        released = asyncio.Event()
+        _real_release = worker._release_or_cleanup
+
+        async def _release_then_signal(
+            merge_wt: Path | None, *, spec_warm: bool
+        ) -> None:
+            try:
+                await _real_release(merge_wt, spec_warm=spec_warm)
+            finally:
+                released.set()
+
+        with patch.object(worker, '_release_or_cleanup', _release_then_signal), \
+                patch.object(
+                    warm_git_ops, 'reset_persistent_merge_worktree', _lease_held_reset,
+                ):
+            verify_fut = asyncio.ensure_future(
+                worker._run_inflight_verify(item, lease)
+            )
+            await asyncio.wait_for(released.wait(), timeout=10.0)
+            await asyncio.sleep(0.1)
+            assert not verify_fut.done(), (
+                'the defer must still be inside its backoff here — if it has '
+                'already returned there is no throttle to be cancelled during'
+            )
+            verify_fut.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await verify_fut
+
+        assert q.empty(), (
+            'cancellation mid-backoff must NOT re-queue: the cancelling caller '
+            'owns the request. stop() has already resolved+retired it, and the '
+            'head-failure cascade re-queues or re-dispatches it itself — a '
+            'requeue from here would put it on _queue a SECOND time'
+        )
+        assert req.request_id in worker._request_ledger.open_request_ids(), (
+            'the ledger entry must survive too: on_requeued belongs to the '
+            'cancelling caller, which re-arms (or retires) the request itself'
+        )
+        assert not req.result.done(), (
+            'a cancelled defer must still leave req.result PENDING — resolving '
+            'it is likewise the canceller\'s job'
+        )
+
+    async def test_defer_streak_caps_terminally_after_max_contention_secs(
+        self,
+        warm_git_ops: GitOps,
+        warm_config: OrchestratorConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """task 3003 review fix (2): the defer streak must be BOUNDED.
+
+        A contended-lane defer is deliberately fail-safe — it never escalates
+        and its disposition is ``counts_against_requeue_cap=False`` — so
+        ``_contended_lease_requeues`` only ever raises log severity.  A
+        PERMANENTLY wedged lane holder would therefore defer this task
+        forever, with no terminal resolution and nothing but a repeating
+        ERROR.  Past a generous elapsed budget the defer must convert to a
+        terminal 'blocked', mirroring the MAX_INFLIGHT_DEAD_VERIFY_ABORTS
+        busy-loop cap.
+
+        RED on main: ``MAX_CONTENDED_LEASE_DEFER_SECS`` does not exist (strict
+        monkeypatch → AttributeError) and every defer requeues unconditionally.
+        """
+        from orchestrator.merge_queue import (  # noqa: PLC0415
+            InflightStatus,
+            SpeculativeMergeWorker,
+        )
+
+        foreign_pgid = 2**31 - 1
+        warm_path = warm_git_ops.persistent_merge_worktree_path
+        _lease_held_reset = _held_lane_reset(warm_path, foreign_pgid)
+
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(warm_git_ops, q)
+        worker.CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS = 0.0
+        # Strict setattr: the cap must be a real class attribute (same
+        # convention as MAX_INFLIGHT_DEAD_VERIFY_ABORTS), not test invention.
+        monkeypatch.setattr(worker, 'MAX_CONTENDED_LEASE_DEFER_SECS', 0.05)
+
+        lease = _local_lease()
+
+        task_id = 'defer-cap'
+
+        async def _drive_one(branch: str) -> tuple[MergeRequest, Any]:
+            # Distinct branch, SAME task_id — a re-dispatch of one task, which
+            # is what makes the per-task streak state accumulate.
+            return await _drive_defer(
+                worker, warm_git_ops, warm_config, branch,
+                task_id=task_id, lease=lease, reset=_lease_held_reset,
+            )
+
+        # task 3003 amend (reviewer_comprehensive, resource_cleanup): one short
+        # of MAX_INFLIGHT_DEAD_VERIFY_ABORTS (3), so if the terminal cap below
+        # fails to pop this counter the task's very NEXT dead/hung verify after
+        # an operator clears the lane would trip the busy-loop cap and be
+        # abandoned without a requeue.
+        worker._inflight_dead_verify_aborts[task_id] = 2
+
+        # ── Attempt 1: inside the budget — the 3003 defer behaviour stands ──
+        req1, result1 = await _drive_one('cap-0')
+        assert result1.status == InflightStatus.REQUEUED, (
+            'contention BELOW the elapsed cap must still DEFER — the cap must '
+            'not collapse the whole fix back into an immediate block'
+        )
+        assert not req1.result.done(), 'a below-cap defer leaves req.result PENDING'
+        assert q.qsize() == 1
+        # The DEFER path is not terminal, so it must leave the dead-verify
+        # counter exactly as it found it (the pre-existing contract).
+        assert worker._inflight_dead_verify_aborts.get(task_id) == 2, (
+            'a defer must leave the per-task dead-verify-abort counter untouched'
+        )
+
+        await asyncio.sleep(0.1)  # push the streak past the 0.05s budget
+
+        # ── Attempt 2: past the budget — terminal, not another defer ──
+        req2, result2 = await _drive_one('cap-1')
+        assert result2.outcome is not None, (
+            'past MAX_CONTENDED_LEASE_DEFER_SECS the defer must resolve '
+            'TERMINALLY — an unbounded fail-safe requeue with no escalation '
+            'and no requeue-cap accounting never converges'
+        )
+        assert result2.outcome.status == 'blocked'
+        assert result2.merge_wt is None, 'the terminal branch must release merge_wt'
+        assert req2.result.done(), 'the capped attempt must resolve req.result'
+        assert req2.result.result() is result2.outcome
+        assert q.qsize() == 1, (
+            'the capped attempt must NOT be re-queued (only attempt 1 is on '
+            'the queue)'
+        )
+
+        reason = result2.outcome.reason or ''
+        assert str(foreign_pgid) in reason, (
+            f'the terminal reason must name the lane holder so an operator can '
+            f'go look at it; got {reason!r}'
+        )
+        assert re.search(r'\d+s', reason), (
+            f'the terminal reason must state how long the lane was unavailable; '
+            f'got {reason!r}'
+        )
+
+        # Both pieces of per-task state must be popped, so an operator-resolved
+        # re-submission of this task gets a FRESH budget instead of capping on
+        # its very first defer (same reason MAX_INFLIGHT_DEAD_VERIFY_ABORTS
+        # pops its counter on the terminal path).
+        assert task_id not in worker._contended_lease_requeues, (
+            'the terminal cap must pop the streak counter'
+        )
+        assert task_id not in worker._contended_lease_first_defer_at, (
+            'the terminal cap must pop the first-defer timestamp too, else a '
+            'later unrelated contention streak inherits a stale start and caps '
+            'out on its very first defer'
+        )
+        assert task_id not in worker._contended_lease_last_defer_at, (
+            'the terminal cap must pop the last-defer timestamp too — the three '
+            'streak dicts are only meaningful together'
+        )
+        # task 3003 amend (reviewer_comprehensive, resource_cleanup): and the
+        # dead-verify-abort counter, exactly as the two OTHER terminal 'blocked'
+        # exits on this coroutine do (the busy-loop cap and the generic
+        # `except Exception`, both for the reasons recorded at task 2420).
+        assert task_id not in worker._inflight_dead_verify_aborts, (
+            'a TERMINAL cap-out must pop the per-task dead-verify-abort counter '
+            'too, else the stale count survives an operator-resolved '
+            're-submission and the task\'s first dead verify trips the '
+            'busy-loop cap and is abandoned without a requeue — and the dict '
+            'grows unboundedly for permanently-blocked task_ids'
+        )
+
+    async def test_stale_streak_stamp_does_not_cap_a_fresh_defer(
+        self,
+        warm_git_ops: GitOps,
+        warm_config: OrchestratorConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """task 3003 amend (reviewer_comprehensive, robustness): the elapsed cap
+        must measure CONTINUOUS contention, so a STALE streak stamp must never
+        cap out the first defer of a fresh streak.
+
+        ``_contended_lease_first_defer_at`` is only cleared on exits that
+        actually re-reach ``_run_inflight_verify``.  A deferred request need not:
+        its requeued dispatch can remerge into a CONFLICT (a DecidedItem
+        passthrough that never enters this coroutine), be abandoned, or die at
+        shutdown — while the per-worker dicts live for the whole orchestrator
+        process (~8 h between fleet redeploys).
+
+        The failure this pins: task X defers once at T0 (stamp set), its
+        requeued dispatch resolves as a conflict so no verify ever runs, and
+        HOURS later the same task_id is re-submitted and hits ONE brief,
+        entirely transient lane contention.  With the stamp still in place the
+        elapsed span is already past the cap, so the VERY FIRST defer of that
+        fresh streak resolves ``MergeOutcome('blocked')`` — reintroducing exactly
+        the false-positive blocked-on-transient-lane-busy resolution this task
+        was chartered to remove, via its own guard.
+
+        RED before the amend: the first defer of the new streak caps out.
+        """
+        from orchestrator.merge_queue import (  # noqa: PLC0415
+            InflightStatus,
+            SpeculativeMergeWorker,
+        )
+
+        foreign_pgid = 2**31 - 1
+        warm_path = warm_git_ops.persistent_merge_worktree_path
+        _lease_held_reset = _held_lane_reset(warm_path, foreign_pgid)
+
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(warm_git_ops, q)
+        worker.CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS = 0.0
+        # A cap this task's seeded stamp is FAR past, so the only thing that can
+        # keep this defer alive is recognising the streak as broken.
+        monkeypatch.setattr(worker, 'MAX_CONTENDED_LEASE_DEFER_SECS', 5.0)
+        # Strict setattr: the staleness window must be a real class attribute
+        # (same convention as MAX_*/WARN_STREAK), not test invention.
+        monkeypatch.setattr(worker, 'CONTENDED_LEASE_STREAK_STALE_FACTOR', 4.0)
+        monkeypatch.setattr(worker, 'CONTENDED_LEASE_STREAK_STALE_FLOOR_SECS', 60.0)
+
+        task_id = 'stale-streak'
+
+        # The state an ABANDONED streak leaves behind: one defer, an hour ago,
+        # with nothing since — a gap no defer cadence can explain (the raiser
+        # here carries no wait at all and the throttle is 0, so the staleness
+        # window is its 60s floor).
+        _long_ago = time.monotonic() - 3600.0
+        worker._contended_lease_requeues[task_id] = 1
+        worker._contended_lease_first_defer_at[task_id] = _long_ago
+        worker._contended_lease_last_defer_at[task_id] = _long_ago
+
+        _, result = await _drive_defer(
+            worker, warm_git_ops, warm_config, 'stale-streak-0',
+            task_id=task_id, reset=_lease_held_reset,
+        )
+
+        assert result.status == InflightStatus.REQUEUED, (
+            f'the FIRST defer of a fresh streak must DEFER even when a stale '
+            f'start stamp from an abandoned streak survives — capping here is '
+            f'the false-positive blocked-on-transient-lane-busy resolution this '
+            f'task removed; got status={result.status!r} '
+            f'outcome={result.outcome!r}'
+        )
+        assert result.outcome is None, 'a fresh defer must carry no MergeOutcome'
+        assert q.qsize() == 1, 'the fresh defer must be re-queued'
+
+        # …and the streak state must have been RESTARTED, not merely tolerated:
+        # a fresh count of 1 and a stamp measuring ~0s elapsed, so the next real
+        # streak gets the full budget it is entitled to.
+        assert worker._contended_lease_requeues[task_id] == 1, (
+            f'the broken streak must be closed and a NEW one opened at 1, not '
+            f'continued; got {worker._contended_lease_requeues.get(task_id)!r}'
+        )
+        assert (
+            time.monotonic() - worker._contended_lease_first_defer_at[task_id]
+            < worker.MAX_CONTENDED_LEASE_DEFER_SECS
+        ), (
+            'the new streak must date from THIS defer — a stamp still inside '
+            'the stale window would cap out the very next defer instead'
+        )
+
+    async def test_capped_defer_reasons_are_thrash_signature_distinct(
+        self,
+        warm_git_ops: GitOps,
+        warm_config: OrchestratorConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """task 3003 review fix (2), the guard on the guard: two consecutive
+        cap-outs must NOT share a merge-outcome signature.
+
+        The cap re-introduces a 'blocked' resolution on the lane-contention
+        path — the exact resolution class 3003 was chartered to remove.  If its
+        reason string were invariant, two consecutive cap-outs would hash to
+        the same ``merge_outcome_signature`` and walk workflow.py's
+        ``consecutive_merge_thrash`` ladder (``max_consecutive_merge_thrash``
+        defaults to 2) straight back into the false-positive L2.
+
+        task 3003 amend (reviewer_comprehensive, test_quality): the collision is
+        forced rather than hoped against.  Resting the guarantee on the elapsed
+        seconds and the streak count would make it PROBABILISTIC, because in
+        production both are near-CONSTANT across consecutive cap-outs — each
+        streak starts fresh at the cap, so each caps at the first defer past the
+        same budget at the same cadence, rendering ~the same '14400s across 481
+        consecutive deferred attempts' and differing only in the sub-second
+        jitter that survives ``:.0f``.  So both cap-outs here are driven with
+        BYTE-IDENTICAL elapsed and streak components (seeded from inside the
+        refusing reset, i.e. microseconds before the arm reads them, so no real
+        git work can perturb the rendering) and the reasons must STILL differ.
+        Only a strictly-increasing per-worker cap-out ordinal can do that.
+
+        ``normalize_cause_hint`` strips only ANSI escapes and file:line tails,
+        so standalone digits genuinely survive into the hash — asserted below
+        rather than assumed, since the whole argument rests on it.
+        """
+        from shared.task_metadata import RetryLedger  # noqa: PLC0415
+
+        from orchestrator.merge_queue import (  # noqa: PLC0415
+            SpeculativeMergeWorker,
+        )
+
+        # The normalizer keeps standalone digits (its file:line rule needs a
+        # source-file extension before the colon), so an integer-seconds
+        # component is genuinely signature-bearing. Pin that here — the whole
+        # anti-thrash argument below rests on it.
+        assert (
+            RetryLedger.normalize_cause_hint('lane unavailable for 7s')
+            != RetryLedger.normalize_cause_hint('lane unavailable for 8s')
+        ), 'normalize_cause_hint must preserve standalone digits'
+
+        from orchestrator.git_ops import MergeVerifyLeaseHeld  # noqa: PLC0415
+
+        foreign_pgid = 2**31 - 1
+        warm_path = warm_git_ops.persistent_merge_worktree_path
+
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(warm_git_ops, q)
+        worker.CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS = 0.0
+        monkeypatch.setattr(worker, 'MAX_CONTENDED_LEASE_DEFER_SECS', 5.0)
+
+        lease = _local_lease()
+
+        task_id = 'defer-cap-sig'
+        # 7.0s of elapsed contention and a streak of 6+1 — the SAME numbers for
+        # both cap-outs.  Seeded from INSIDE the refusing reset, the last thing
+        # that runs before the defer arm, so the microsecond gap to the arm's
+        # own time.monotonic() read cannot shift the ':.0f' rendering; seeding
+        # before the dispatch would let _make_merged_item's real git work (which
+        # can easily take a second) push one cap-out's elapsed to '8s' and pass
+        # this test for entirely the wrong reason.
+        _seeded_elapsed = 7.0
+        _seeded_streak = 6
+
+        async def _seeding_reset(*_a: object, **_k: object) -> Path:
+            _now = time.monotonic()
+            worker._contended_lease_requeues[task_id] = _seeded_streak
+            worker._contended_lease_first_defer_at[task_id] = _now - _seeded_elapsed
+            worker._contended_lease_last_defer_at[task_id] = _now
+            raise MergeVerifyLeaseHeld(warm_path, foreign_pgid)
+
+        async def _drive_one(branch: str) -> tuple[MergeRequest, Any]:
+            # Distinct branch, SAME task_id — a re-dispatch of one task, which
+            # is what makes the per-task streak state accumulate.
+            return await _drive_defer(
+                worker, warm_git_ops, warm_config, branch,
+                task_id=task_id, lease=lease, reset=_seeding_reset,
+            )
+
+        # ── Two cap-outs of the same wedged lane, with IDENTICAL renderings of
+        # every OTHER reason component ──
+        _, result_a = await _drive_one('sig-a0')
+        assert result_a.outcome is not None and result_a.outcome.status == 'blocked'
+        reason_a = result_a.outcome.reason or ''
+        # Cap-out A popped all three streak dicts, so cap-out B genuinely
+        # re-seeds from scratch — exactly as a re-submission after an operator
+        # looked at (but did not fix) the lane would.
+        assert task_id not in worker._contended_lease_first_defer_at
+        _, result_b = await _drive_one('sig-b0')
+        assert result_b.outcome is not None and result_b.outcome.status == 'blocked'
+        reason_b = result_b.outcome.reason or ''
+
+        # Pre-condition of the real assertion: the elapsed + streak components
+        # genuinely COLLIDE here, so any surviving difference is structural.
+        _shape = re.compile(r'unavailable for (\d+)s across (\d+) consecutive')
+        _shape_a, _shape_b = _shape.search(reason_a), _shape.search(reason_b)
+        assert _shape_a is not None and _shape_b is not None, (
+            f'the terminal reason must state the elapsed span and the streak '
+            f'length; got {reason_a!r} / {reason_b!r}'
+        )
+        assert _shape_a.groups() == _shape_b.groups() == (
+            f'{_seeded_elapsed:.0f}', str(_seeded_streak + 1),
+        ), (
+            f'this test only means something if the elapsed/streak components '
+            f'collide — seed them harder; got {_shape_a.groups()} vs '
+            f'{_shape_b.groups()}'
+        )
+
+        assert reason_a != reason_b, (
+            f'two cap-outs whose elapsed span and streak length render '
+            f'IDENTICALLY produced an IDENTICAL reason — in production those two '
+            f'components are near-constant across consecutive cap-outs, so this '
+            f'is the invariant signature that fed the consecutive_merge_thrash '
+            f'false-positive L2 this task removed. Carry a strictly-increasing '
+            f'per-worker cap-out ordinal in the reason. Got {reason_a!r} both '
+            f'times.'
+        )
+        sig_a = RetryLedger.compute_merge_outcome_signature('', '', reason_a)
+        sig_b = RetryLedger.compute_merge_outcome_signature('', '', reason_b)
+        assert sig_a != sig_b, (
+            f'the cap-out reasons differ but normalise to the SAME '
+            f'merge_outcome_signature ({sig_a}), so consecutive cap-outs would '
+            f'still walk the anti-thrash ladder: {reason_a!r} vs {reason_b!r}'
+        )
 
     async def test_contended_lease_requeues_and_leaves_result_pending(
         self,
@@ -1548,7 +2520,6 @@ class TestContendedLeaseDefers:
     ) -> None:
         from orchestrator.git_ops import MergeVerifyLeaseContended
         from orchestrator.merge_queue import InflightStatus, SpeculativeMergeWorker
-        from orchestrator.verify_runner import HostLease
 
         async def _lease_contended_verify(*_args: object, **_kwargs: object) -> object:
             # The lease acquire timed out; merge_verify_lease raised before the
@@ -1565,10 +2536,7 @@ class TestContendedLeaseDefers:
         worker = SpeculativeMergeWorker(git_ops, q)
         worker._register_owned_merge_worktree(item.merge_wt)
 
-        fake_local = MagicMock()
-        fake_local.name = 'local'
-        fake_local.is_local = True
-        lease = HostLease(name='local', runner=fake_local, is_local=True)
+        lease = _local_lease()
 
         worker._request_ledger.on_dequeue(req, now=1_000_000.0)
 
@@ -1618,6 +2586,276 @@ class TestContendedLeaseDefers:
             'dead-verify-abort counter untouched'
         )
 
+    async def test_two_consecutive_contended_resets_produce_no_blocked_outcome(
+        self,
+        warm_git_ops: GitOps,
+        warm_config: OrchestratorConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """task 3003, the ANTI-THRASH invariant — the incident's exact shape.
+
+        Two consecutive dispatch attempts for the SAME task against a lane
+        lock that is held throughout must produce ZERO ``MergeOutcome``s.
+
+        Why this is the right altitude for "consecutive_merge_thrash
+        untouched", and not a workflow-level harness: ``workflow.py`` gates its
+        whole anti-thrash block on ``self._last_merge_block_reason``, which is
+        only ever set from a RESOLVED blocked outcome.  A defer leaves
+        ``req.result`` PENDING, so ``compute_merge_outcome_signature`` is never
+        computed and ``consecutive_merge_thrash`` is never incremented — the
+        counter is STRUCTURALLY unreachable for this failure class rather than
+        merely happening to stay at zero.  Asserting "no outcome, future
+        pending, twice in a row" is therefore the strongest honest statement
+        available here; reading a counter that is never written would be
+        theatre.
+
+        Two is the number that matters: ``max_consecutive_merge_thrash``
+        defaults to 2, so two identical contended timeouts were precisely what
+        tripped the false-positive L2 (reify 5354/5300/5328, signature
+        3173b64436423738) — each attempt used to resolve
+        ``MergeOutcome('blocked', reason='Verification error: Timed out after
+        30s ...')``, a reason string with no varying component, hence the same
+        signature every time.
+        """
+        from orchestrator import git_ops as git_ops_mod  # noqa: PLC0415
+        from orchestrator.merge_queue import (  # noqa: PLC0415
+            InflightStatus,
+            SpeculativeMergeWorker,
+        )
+        from orchestrator.verify_cancel import lane_lock_path  # noqa: PLC0415
+
+        monkeypatch.setattr(git_ops_mod, '_RESET_WARM_LANE_LOCK_WAIT_SECS', 1)
+
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(warm_git_ops, q)
+        # 1s bounded wait (shrunk above) → the defer's minimum inter-attempt
+        # period would sleep the remaining 29s on each of the two attempts.
+        # Covered separately by test_zero_wait_defer_is_throttled.
+        worker.CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS = 0.0
+
+        lease = _local_lease()
+
+        task_id = 'thrash-shape'
+
+        async def _must_not_run(*_a: object, **_k: object) -> object:
+            raise AssertionError(
+                'the warm-swap reset must raise BEFORE any verify is dispatched'
+            )
+
+        lock_path = lane_lock_path(warm_git_ops.persistent_merge_worktree_path)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            reqs = []
+            for i in range(2):
+                # Fresh merged item on a distinct branch, SAME task_id — this
+                # is what a re-dispatch of the same task looks like.
+                req, result = await _drive_defer(
+                    worker, warm_git_ops, warm_config, f'thrash-{i}',
+                    task_id=task_id, lease=lease, verify=_must_not_run,
+                )
+                reqs.append(req)
+
+                assert result.status == InflightStatus.REQUEUED, (
+                    f'attempt #{i + 1} against a held lane lock must REQUEUE, '
+                    f'got status={result.status!r} outcome={result.outcome!r}'
+                )
+                assert result.outcome is None, (
+                    f'attempt #{i + 1} produced a MergeOutcome — with a '
+                    f'deterministic reason this is exactly the thrash food '
+                    f'that tripped the false-positive L2: {result.outcome!r}'
+                )
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+
+        assert not any(r.result.done() for r in reqs), (
+            'ZERO MergeOutcomes across two consecutive contended attempts — '
+            'every req.result must still be PENDING, so no merge_outcome_'
+            'signature is ever computed and consecutive_merge_thrash stays '
+            'structurally unreachable'
+        )
+        assert worker._contended_lease_requeues[task_id] == 2, (
+            'both defers must land on the same per-task streak counter so a '
+            'genuinely wedged holder is still operator-visible'
+        )
+
+    async def test_genuine_verify_failure_still_blocks_on_warm_path(
+        self,
+        warm_git_ops: GitOps,
+        warm_config: OrchestratorConfig,
+    ) -> None:
+        """SCOPE FENCE: with the lane lock FREE, a real verify failure on the
+        warm path must still surface its failure — the defer must not have
+        swallowed the normal blocked route.
+
+        Both failure shapes are covered, and they legitimately differ:
+
+        * the verify RAISES → the generic ``except Exception`` resolves
+          ``MergeOutcome('blocked')`` on ``req.result`` immediately (so a
+          failed verify never stalls the queue);
+        * the verify RETURNS a failing outcome → ``_run_inflight_verify``
+          hands it back on ``InflightVerifyResult.outcome`` and leaves
+          ``req.result`` for ``_finalize_inflight`` to resolve, which is that
+          method's documented contract ("does NOT resolve req.result ...
+          except on exception").
+
+        What must hold for BOTH: NOT requeued, and the contended-lane streak
+        POPPED — because the lane lock genuinely WAS acquired here, so any
+        prior streak is broken.
+        """
+        from orchestrator.merge_queue import (  # noqa: PLC0415
+            InflightStatus,
+            SpeculativeMergeWorker,
+        )
+
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(warm_git_ops, q)
+
+        lease = _local_lease()
+
+        failing = MergeOutcome('blocked', reason='verify failed: 3 tests')
+
+        async def _verify_raises(*_a: object, **_k: object) -> object:
+            raise RuntimeError('verify boom')
+
+        async def _verify_returns_failure(*_a: object, **_k: object) -> object:
+            return failing
+
+        # ── Shape 1: the verify RAISES ──
+        task_id_a = 'warm-verify-raises'
+        req_a, item_a = await _make_merged_item(
+            warm_git_ops, warm_config, 'warm-fail-raise', 'wfr.py', 'x=1\n',
+            task_id=task_id_a,
+        )
+        worker._register_owned_merge_worktree(item_a.merge_wt)
+        worker._request_ledger.on_dequeue(req_a, now=1_000_000.0)
+        # Pre-seed a streak so we can prove an ACQUIRED lane breaks it.
+        worker._contended_lease_requeues[task_id_a] = 1
+        with patch('orchestrator.merge_queue._run_post_merge_verify', _verify_raises):
+            result_a = await asyncio.wait_for(
+                worker._run_inflight_verify(item_a, lease), timeout=15.0,
+            )
+
+        assert result_a.status != InflightStatus.REQUEUED, (
+            'a genuine verify failure must NOT be deferred — the lane lock was '
+            'free and the verify really ran'
+        )
+        assert result_a.outcome is not None and result_a.outcome.status == 'blocked', (
+            f'expected a blocked MergeOutcome, got {result_a.outcome!r}'
+        )
+        assert 'verify boom' in result_a.outcome.reason
+        assert req_a.result.done(), (
+            'a raising verify resolves req.result immediately so the failure '
+            'never stalls the queue'
+        )
+        assert q.empty(), 'a genuine verify failure must not be re-queued'
+        assert task_id_a not in worker._contended_lease_requeues, (
+            'the lane lock WAS acquired, so any prior contended streak is '
+            'broken and must be popped'
+        )
+
+        # ── Shape 2: the verify RETURNS a failing outcome ──
+        task_id_b = 'warm-verify-returns-fail'
+        req_b, item_b = await _make_merged_item(
+            warm_git_ops, warm_config, 'warm-fail-return', 'wfrt.py', 'y=1\n',
+            task_id=task_id_b,
+        )
+        worker._register_owned_merge_worktree(item_b.merge_wt)
+        worker._request_ledger.on_dequeue(req_b, now=1_000_000.0)
+        worker._contended_lease_requeues[task_id_b] = 1
+        with patch(
+            'orchestrator.merge_queue._run_post_merge_verify',
+            _verify_returns_failure,
+        ):
+            result_b = await asyncio.wait_for(
+                worker._run_inflight_verify(item_b, lease), timeout=15.0,
+            )
+
+        assert result_b.status != InflightStatus.REQUEUED, (
+            'a returned verify failure must NOT be deferred'
+        )
+        assert result_b.outcome is failing, (
+            f'the failing outcome must be handed back verbatim, got '
+            f'{result_b.outcome!r}'
+        )
+        assert q.empty(), 'a genuine verify failure must not be re-queued'
+        assert task_id_b not in worker._contended_lease_requeues, (
+            'the lane lock WAS acquired, so any prior contended streak is '
+            'broken and must be popped'
+        )
+
+    async def test_reset_git_failure_still_blocks(
+        self,
+        warm_git_ops: GitOps,
+        warm_config: OrchestratorConfig,
+    ) -> None:
+        """SCOPE FENCE: a non-contention fault from INSIDE the reset's body
+        must still map to ``MergeOutcome('blocked')``, never to a defer.
+
+        This is what keeps the typed raise honest.  ``reset_persistent_merge_
+        worktree`` raises a plain ``RuntimeError`` for every git fault in its
+        body (``git worktree add`` / ``git reset --hard`` / the artifact-
+        retaining clean) and ``MergeVerifyLeaseContended`` ONLY at the lock
+        acquire.  If the typed raise had been scoped any wider — e.g. wrapping
+        the whole method — a genuine, PERMANENT git fault would be re-queued
+        forever, converting a loud blocked outcome into a silent infinite
+        defer loop.  So this test is the reason the raise is site-local.
+        """
+        from orchestrator.merge_queue import (  # noqa: PLC0415
+            InflightStatus,
+            SpeculativeMergeWorker,
+        )
+
+        async def _reset_git_fault(*_a: object, **_k: object) -> Path:
+            # Verbatim shape of the in-body faults at git_ops.py's
+            # reset-in-place branch (a plain RuntimeError, NOT the typed class).
+            raise RuntimeError(
+                f'Failed to reset persistent merge worktree '
+                f'{warm_git_ops.persistent_merge_worktree_path} to deadbeef: '
+                f'fatal: Could not reset index file to revision'
+            )
+
+        async def _must_not_run(*_a: object, **_k: object) -> object:
+            raise AssertionError('the reset faulted — no verify may be dispatched')
+
+        req, item = await _make_merged_item(
+            warm_git_ops, warm_config, 'reset-git-fault', 'rgf.py', 'x=1\n',
+        )
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(warm_git_ops, q)
+        worker._register_owned_merge_worktree(item.merge_wt)
+
+        lease = _local_lease()
+
+        worker._request_ledger.on_dequeue(req, now=1_000_000.0)
+
+        with (
+            patch.object(
+                warm_git_ops, 'reset_persistent_merge_worktree', _reset_git_fault,
+            ),
+            patch('orchestrator.merge_queue._run_post_merge_verify', _must_not_run),
+        ):
+            result = await asyncio.wait_for(
+                worker._run_inflight_verify(item, lease), timeout=15.0,
+            )
+
+        assert result.status != InflightStatus.REQUEUED, (
+            f'a git fault inside the reset is a REAL failure, not a busy lane — '
+            f'deferring it would loop forever, got status={result.status!r}'
+        )
+        assert result.outcome is not None and result.outcome.status == 'blocked', (
+            f'expected a blocked MergeOutcome, got {result.outcome!r}'
+        )
+        assert 'Failed to reset persistent merge worktree' in result.outcome.reason
+        assert req.result.done(), 'a genuine git fault must RESOLVE req.result'
+        assert q.empty(), 'a genuine git fault must not be re-queued'
+        assert req.task_id not in worker._contended_lease_requeues, (
+            'a git fault is not lane contention — it must never open a '
+            'contended-lane streak'
+        )
+
     async def test_consecutive_contended_requeues_raise_log_severity(
         self,
         git_ops: GitOps,
@@ -1634,10 +2872,8 @@ class TestContendedLeaseDefers:
         from orchestrator.git_ops import MergeVerifyLeaseContended
         from orchestrator.merge_queue import (
             InflightStatus,
-            InflightVerifyResult,
             SpeculativeMergeWorker,
         )
-        from orchestrator.verify_runner import HostLease
 
         async def _lease_contended_verify(*_a: object, **_k: object) -> object:
             raise MergeVerifyLeaseContended(Path('/x/_merge-verify.lock'), 300.0)
@@ -1653,28 +2889,18 @@ class TestContendedLeaseDefers:
         # MAX_INFLIGHT_DEAD_VERIFY_ABORTS monkeypatch convention).
         worker.CONTENDED_LEASE_REQUEUE_WARN_STREAK = 3
 
-        fake_local = MagicMock()
-        fake_local.name = 'local'
-        fake_local.is_local = True
-        lease = HostLease(name='local', runner=fake_local, is_local=True)
+        lease = _local_lease()
 
         task_id = 'wedged-holder'
 
-        async def _drive_one(branch: str, verify: object) -> InflightVerifyResult:
-            # Fresh merged item on a distinct branch but the SAME task_id, so
-            # the per-task streak counter accumulates across dispatch attempts.
-            req, item = await _make_merged_item(
-                git_ops, config, branch, f'{branch}.py', 'x=1\n',
-                task_id=task_id,
+        async def _drive_one(branch: str, verify: object) -> Any:
+            # Distinct branch, SAME task_id — a re-dispatch of one task, which
+            # is what makes the per-task streak state accumulate.
+            _, result = await _drive_defer(
+                worker, git_ops, config, branch,
+                task_id=task_id, lease=lease, verify=verify, timeout=5.0,
             )
-            worker._register_owned_merge_worktree(item.merge_wt)
-            worker._request_ledger.on_dequeue(req, now=1_000_000.0)
-            with patch(
-                'orchestrator.merge_queue._run_post_merge_verify', verify,
-            ):
-                return await asyncio.wait_for(
-                    worker._run_inflight_verify(item, lease), timeout=5.0,
-                )
+            return result
 
         # Requeues 1..threshold-1 stay at WARNING (no ERROR yet).
         for i in range(worker.CONTENDED_LEASE_REQUEUE_WARN_STREAK - 1):
@@ -1706,4 +2932,250 @@ class TestContendedLeaseDefers:
         result = await _drive_one('clc-runs', _generic_verify_error)
         assert task_id not in worker._contended_lease_requeues, (
             'a verify that actually ran must reset the contended-lease streak'
+        )
+
+    async def test_streak_error_is_logged_once_at_the_crossing(
+        self,
+        warm_git_ops: GitOps,
+        warm_config: OrchestratorConfig,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """task 3003 review fix (3): the rising-severity ERROR fires ONCE, at
+        the crossing — not on every defer past it.
+
+        The branch tests ``streak >= CONTENDED_LEASE_REQUEUE_WARN_STREAK``, so
+        once the streak is crossed EVERY subsequent defer emits an identical
+        ERROR.  Against a wedged holder that is thousands of duplicate ERROR
+        lines saying nothing new.  The operator still wants a per-defer
+        heartbeat, so the WARNING stays on every defer; only the alarm is
+        de-duplicated (with step-10's terminal
+        ``MAX_CONTENDED_LEASE_DEFER_SECS`` cap closing the streak out loudly at
+        the other end).
+
+        RED on main: ``>=`` emits an ERROR on defers 2, 3 and 4.
+        """
+        from orchestrator.merge_queue import (  # noqa: PLC0415
+            InflightStatus,
+            SpeculativeMergeWorker,
+        )
+
+        foreign_pgid = 2**31 - 1
+        warm_path = warm_git_ops.persistent_merge_worktree_path
+        _lease_held_reset = _held_lane_reset(warm_path, foreign_pgid)
+
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(warm_git_ops, q)
+        worker.CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS = 0.0
+        worker.CONTENDED_LEASE_REQUEUE_WARN_STREAK = 2
+        # Comfortably above the whole test's wall-clock, so the terminal cap
+        # cannot fire first and truncate the streak we are measuring.
+        worker.MAX_CONTENDED_LEASE_DEFER_SECS = 3600.0
+
+        lease = _local_lease()
+
+        task_id = 'streak-log-dedupe'
+
+        async def _drive_one(branch: str) -> InflightStatus | None:
+            _, result = await _drive_defer(
+                worker, warm_git_ops, warm_config, branch,
+                task_id=task_id, lease=lease, reset=_lease_held_reset,
+            )
+            return result.status
+
+        # Four consecutive defers, NOT clearing caplog between them.
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            for i in range(4):
+                assert await _drive_one(f'sld-{i}') == InflightStatus.REQUEUED
+
+        lane_records = [
+            r for r in caplog.records if 'lane unavailable' in r.getMessage()
+        ]
+        errors = [r for r in lane_records if r.levelno >= logging.ERROR]
+        warnings = [r for r in lane_records if r.levelno == logging.WARNING]
+
+        assert len(errors) == 1, (
+            f'the streak ERROR must be emitted exactly ONCE, at the crossing — '
+            f'a `>=` test re-alarms on every defer past the threshold, which '
+            f'against a wedged holder is thousands of identical lines. Got '
+            f'{len(errors)}: {[r.getMessage() for r in errors]}'
+        )
+        assert str(worker.CONTENDED_LEASE_REQUEUE_WARN_STREAK) in (
+            errors[0].getMessage()
+        ), 'the crossing ERROR must still name the streak length'
+        assert len(warnings) == 3, (
+            f'defers below the threshold AND every defer past it must still '
+            f'emit a per-defer WARNING heartbeat (4 defers - 1 crossing ERROR '
+            f'= 3 WARNINGs); got {len(warnings)}'
+        )
+
+    async def test_deferred_attempt_does_not_advance_cold_verify_valve(
+        self,
+        warm_git_ops: GitOps,
+        warm_config: OrchestratorConfig,
+    ) -> None:
+        """task 3003, reviewer's secondary finding: a DEFERRED attempt must not
+        advance the periodic cold-verify safety valve.
+
+        ``self._verify_attempt_count += 1`` runs BEFORE
+        ``_acquire_warm_verify_worktree``, so an attempt that never reaches a
+        verify at all still counts toward
+        ``persistent_merge_worktree_safety_valve_every_n``.  A long wedge would
+        burn through the valve's period on pure defers and fire a from-scratch
+        cold verify for no reason.  The counter must measure attempts that
+        actually VERIFIED.
+
+        RED on main: two defers advance it by two.
+        """
+        from orchestrator.merge_queue import (  # noqa: PLC0415
+            InflightStatus,
+            SpeculativeMergeWorker,
+        )
+
+        foreign_pgid = 2**31 - 1
+        warm_path = warm_git_ops.persistent_merge_worktree_path
+        _lease_held_reset = _held_lane_reset(warm_path, foreign_pgid)
+
+        async def _verify_returns_failure(*_a: object, **_k: object) -> object:
+            return MergeOutcome('blocked', reason='verify failed: 1 test')
+
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(warm_git_ops, q)
+        worker.CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS = 0.0
+
+        lease = _local_lease()
+
+        count_before = worker._verify_attempt_count
+
+        # ── Two defers: the warm acquire never succeeded, no verify ran ──
+        for i in range(2):
+            _, result = await _drive_defer(
+                worker, warm_git_ops, warm_config, f'valve-defer-{i}',
+                task_id='valve-defer', lease=lease, reset=_lease_held_reset,
+            )
+            assert result.status == InflightStatus.REQUEUED
+
+        assert worker._verify_attempt_count == count_before, (
+            f'a deferred attempt never ran a verify, so it must not advance '
+            f'the cold-verify safety-valve counter — a long wedge would '
+            f'otherwise fire a from-scratch cold verify purely from defers. '
+            f'Went {count_before} -> {worker._verify_attempt_count}'
+        )
+
+        # ── One attempt that really verifies: the counter must advance by 1 ──
+        # (the fix DEFERS the commit; it must not DROP the count.)
+        req, item = await _make_merged_item(
+            warm_git_ops, warm_config, 'valve-real', 'vr.py', 'x=1\n',
+            task_id='valve-real',
+        )
+        worker._register_owned_merge_worktree(item.merge_wt)
+        worker._request_ledger.on_dequeue(req, now=1_000_000.0)
+        with patch(
+            'orchestrator.merge_queue._run_post_merge_verify',
+            _verify_returns_failure,
+        ):
+            result = await asyncio.wait_for(
+                worker._run_inflight_verify(item, lease), timeout=60.0,
+            )
+        assert result.status != InflightStatus.REQUEUED
+
+        assert worker._verify_attempt_count == count_before + 1, (
+            f'an attempt whose warm acquire SUCCEEDED must still advance the '
+            f'counter exactly once — the fix defers the commit past the '
+            f'acquire, it does not drop it. Got '
+            f'{worker._verify_attempt_count}, expected {count_before + 1}'
+        )
+
+    async def test_safety_valve_still_fires_on_the_nth_real_attempt(
+        self,
+        warm_git_ops: GitOps,
+        warm_config: OrchestratorConfig,
+    ) -> None:
+        """SCOPE FENCE for the counter move: the valve must keep its documented
+        1-BASED contract and must not shift by one.
+
+        ``_safety_valve_due`` documents ``attempt_count`` as "the 1-based count
+        of verifying attempts ... incremented before calling this", so the Nth
+        real attempt — and only the Nth — must be handed
+        ``safety_valve_due=True``.  Moving the commit past the acquire must
+        preserve that exactly; an off-by-one here would either never fire the
+        valve or fire it a verify early.
+        """
+        from orchestrator.merge_queue import SpeculativeMergeWorker  # noqa: PLC0415
+
+        every_n = 2
+        valve_config = warm_config.model_copy(
+            update={
+                'git': warm_config.git.model_copy(
+                    update={
+                        'persistent_merge_worktree_safety_valve_every_n': every_n,
+                    },
+                ),
+            },
+        )
+
+        async def _verify_returns_failure(*_a: object, **_k: object) -> object:
+            return MergeOutcome('blocked', reason='verify failed: 1 test')
+
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(warm_git_ops, q)
+
+        lease = _local_lease()
+
+        # Observed at the BEHAVIOURAL seam rather than by spying the
+        # safety_valve_due flag: _acquire_warm_verify_worktree's serial-head
+        # branch returns the ephemeral merge_wt untouched when the valve is due
+        # (`if not persistent_merge_worktree or safety_valve_due: return
+        # merge_wt, False`), so it calls reset_persistent_merge_worktree on a
+        # NOT-due attempt and skips it on a due one.  Spying that PUBLIC GitOps
+        # method pins the same 1-based contract through its observable effect —
+        # a cold from-scratch verify on the Nth attempt — and keeps this file
+        # clear of a new orchestrator.merge_queue.<private> reach-back patch,
+        # which test_merge_queue_reachback_patch_guard.py freezes by name (the
+        # private is imported into merge_queue at module load, so patching the
+        # defining merge_liveness module would not take effect and an
+        # ALLOWLIST entry in the guard is the only alternative).
+        reset_calls: list[str] = []
+        _real_reset = warm_git_ops.reset_persistent_merge_worktree
+
+        async def _spy_reset(merge_commit: str, *a: object, **k: object) -> Path:
+            reset_calls.append(merge_commit)
+            return await _real_reset(merge_commit, *a, **k)
+
+        for i in range(every_n):
+            req, item = await _make_merged_item(
+                warm_git_ops, valve_config, f'valve-real-{i}', f'vrn{i}.py', 'x=1\n',
+                task_id=f'valve-nth-{i}',
+            )
+            worker._register_owned_merge_worktree(item.merge_wt)
+            worker._request_ledger.on_dequeue(req, now=1_000_000.0)
+            _before = len(reset_calls)
+            with (
+                patch.object(
+                    warm_git_ops, 'reset_persistent_merge_worktree', _spy_reset,
+                ),
+                patch(
+                    'orchestrator.merge_queue._run_post_merge_verify',
+                    _verify_returns_failure,
+                ),
+            ):
+                await asyncio.wait_for(
+                    worker._run_inflight_verify(item, lease), timeout=60.0,
+                )
+            _warm_swapped = len(reset_calls) > _before
+            # 1-based: attempts 1..N-1 swap to the warm tree; the Nth is the
+            # valve's cold from-scratch attempt and must NOT swap.
+            _expected_warm = (i + 1) % every_n != 0
+            assert _warm_swapped is _expected_warm, (
+                f'with every_n={every_n} the valve must be due on the '
+                f'{every_n}th real attempt and only then (1-based contract), so '
+                f'attempt #{i + 1} must '
+                f'{"swap to the warm tree" if _expected_warm else "run cold"}; '
+                f'reset_persistent_merge_worktree '
+                f'{"was" if _warm_swapped else "was not"} called'
+            )
+
+        assert len(reset_calls) == every_n - 1, (
+            f'exactly the non-valve attempts may swap to the warm tree; got '
+            f'{len(reset_calls)} warm swaps across {every_n} attempts'
         )

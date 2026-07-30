@@ -37,6 +37,7 @@ from orchestrator.git_ops import (
     GitOps,
     MergeResult,
     MergeVerifyLeaseContended,
+    MergeVerifyLeaseHeld,
     WorktreeMissing,
     _run,
 )
@@ -7164,6 +7165,68 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # streak counts only UNBROKEN contention.  Kept as a class attribute so tests
     # can monkeypatch it small (mirrors MAX_INFLIGHT_DEAD_VERIFY_ABORTS).
     CONTENDED_LEASE_REQUEUE_WARN_STREAK: int = 5
+    # task 3003 (review fix 1): MINIMUM INTER-ATTEMPT PERIOD for a
+    # contended-lane DEFER — NOT an unconditional extra sleep.  The backoff
+    # actually slept is max(0, PERIOD - exc.wait_secs), so the two BOUNDED-WAIT
+    # raisers already self-throttle and sleep ZERO additional seconds
+    # (reset: 30 s via _RESET_WARM_LANE_LOCK_WAIT_SECS; lease: 300 s via
+    # _MERGE_VERIFY_LEASE_WAIT_SECS — both already ≥ this period).  It exists
+    # for MergeVerifyLeaseHeld, whose FOREIGN-holder pre-check
+    # (git_ops.reset_persistent_merge_worktree) refuses IMMEDIATELY and carries
+    # no wait at all: without a floor here a live foreign holder would make the
+    # merger spin dequeue → `git worktree add` + merge → instant refusal →
+    # cleanup → requeue at whatever rate git allows, for the entire 1–2 h holder
+    # window.  30 s matches the reset path's own bounded wait, so a
+    # zero-wait defer re-attempts at the same cadence a contended one does.
+    # Kept as a class attribute so tests can monkeypatch it small — or to 0.0
+    # to opt out (mirrors the MAX_*/WARN_STREAK monkeypatch convention above).
+    CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS: float = 30.0
+    # task 3003 (review fix 2): ELAPSED-TIME budget for an UNBROKEN
+    # contended-lane defer streak.  Past this, the defer converts to a terminal
+    # 'blocked' instead of re-queuing again — a contended-lane defer never
+    # escalates and never counts against the requeue cap, so without a bound a
+    # permanently wedged lane holder would defer one task forever.
+    #
+    # The default MUST stay above the longest LEGITIMATE holder.  The
+    # motivating incident is a 1–2 h merge-verify / speculative merge-ahead
+    # train holding the lane; a cap short enough to fire on THAT would
+    # re-create exactly the false-positive escalation this task removed.  4 h
+    # clears that class with margin while still bounding a genuinely wedged
+    # lane.
+    #
+    # ELAPSED time, not a raw defer COUNT: the effective re-attempt period
+    # differs per raiser (0 s for MergeVerifyLeaseHeld's immediate pre-check,
+    # 30 s for the reset acquire, 300 s for the lease acquire), so a count cap
+    # would mean a wildly different real-world budget depending on which one
+    # fired — and would shift again with any change to
+    # CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS above.  A time cap is invariant
+    # under both.  Class attribute so tests monkeypatch it small (mirrors
+    # MAX_INFLIGHT_DEAD_VERIFY_ABORTS).
+    MAX_CONTENDED_LEASE_DEFER_SECS: float = 14400.0
+    # task 3003 amend (reviewer_comprehensive, robustness): what makes the
+    # streak above CONTINUOUS.  MAX_CONTENDED_LEASE_DEFER_SECS measures elapsed
+    # time from the streak's FIRST defer, which is only a contention budget if
+    # the defers in between were actually consecutive.  They need not be: a
+    # deferred request can leave the defer loop entirely without ever
+    # re-reaching the except arm that clears the streak — its requeued dispatch
+    # can remerge into a conflict (DecidedItem passthrough), be abandoned, or
+    # die at shutdown — and the per-worker dicts live for the orchestrator
+    # process (~8 h between fleet redeploys).  Without this, a single defer at
+    # T0 followed hours later by ONE brief transient contention for the same
+    # task_id would cap out on the FIRST defer of the fresh streak, resolving
+    # exactly the false-positive 'blocked' this task was chartered to remove.
+    #
+    # So the streak is treated as BROKEN when the gap since its last defer is
+    # far larger than the defer cadence can explain: a gap that big means
+    # something other than a defer happened in between.  FACTOR x the expected
+    # inter-attempt period (whichever is larger — the configured throttle or
+    # this raiser's own bounded wait, so the 300 s lease acquire is not
+    # mis-judged by a 30 s yardstick), floored so a test/operator opting out of
+    # the throttle (PERIOD = 0.0) cannot collapse the window to zero and break
+    # a genuinely continuous streak on its second defer.  Both are class
+    # attributes so tests can monkeypatch them (mirrors MAX_*/WARN_STREAK).
+    CONTENDED_LEASE_STREAK_STALE_FACTOR: float = 4.0
+    CONTENDED_LEASE_STREAK_STALE_FLOOR_SECS: float = 60.0
     # MQ-invariants iota (task 1994): grace window (seconds, wall-clock mtime)
     # before an unregistered on-disk `_merge-*` worktree is flagged by
     # worktree_ledger_violations().  Tactical default sits strictly between
@@ -7361,6 +7424,47 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # UNBROKEN contention (unlike the requeue itself, which never counts
         # against the requeue cap and never escalates on its own).
         self._contended_lease_requeues: dict[str, int] = {}
+        # task 3003 (review fix 2): per-task time.monotonic() stamp of the FIRST
+        # defer in the current unbroken contended-lane streak, set with
+        # setdefault on each defer.  Its elapsed span is compared against
+        # MAX_CONTENDED_LEASE_DEFER_SECS to convert an unbounded fail-safe
+        # requeue loop into a terminal 'blocked'.  monotonic (not time.time())
+        # because this is a pure duration reference — never persisted, never
+        # compared against a stored wall-clock value — so it must be immune to
+        # NTP/manual clock steps, which could otherwise false-'block' a healthy
+        # task on a forward step (same rationale recorded for the dead-verify
+        # progress budget below).  Popped in lockstep with
+        # _contended_lease_requeues at every reset site, so a verify that
+        # actually runs clears BOTH — a stale start stamp would otherwise make
+        # a much later, unrelated streak cap out on its very first defer.
+        self._contended_lease_first_defer_at: dict[str, float] = {}
+        # task 3003 amend (reviewer_comprehensive, robustness): per-task
+        # time.monotonic() stamp of the MOST RECENT defer, the companion that
+        # makes the streak's "continuous" claim CHECKABLE rather than assumed.
+        # A gap since this stamp far larger than the defer cadence
+        # (CONTENDED_LEASE_STREAK_STALE_*) proves something other than a defer
+        # happened in between, so the streak is closed and a fresh one opened.
+        # Needed because a deferred request can leave the defer loop WITHOUT
+        # ever re-reaching the arm that clears the streak (its requeued dispatch
+        # remerges into a conflict, is abandoned, or dies at shutdown), and
+        # these dicts live for the whole orchestrator process.  Popped in
+        # lockstep with the other two via _clear_contended_lease_streak.
+        self._contended_lease_last_defer_at: dict[str, float] = {}
+        # task 3003 amend (reviewer_comprehensive, test_quality): per-WORKER
+        # count of terminal contended-lane cap-outs, rendered into the 'blocked'
+        # reason so two cap-outs are signature-distinct STRUCTURALLY rather than
+        # by scheduling jitter.  In production the elapsed-seconds and
+        # streak-count components are near-CONSTANT across consecutive cap-outs
+        # (each streak starts fresh at the cap, so each caps at the first defer
+        # past MAX_CONTENDED_LEASE_DEFER_SECS with the same cadence, rendering
+        # ~the same '14400s across 481 attempts'); they differed only in the
+        # sub-second jitter surviving ':.0f'.  With max_consecutive_merge_thrash
+        # defaulting to 2, an unlucky alignment would reopen the very
+        # false-positive ladder walk this task removed.  Deliberately NOT
+        # per-task: a plain incrementing worker ordinal cannot collide with
+        # itself.  (It restarts at 0 with the process, where the numeric
+        # components remain as the secondary difference.)
+        self._contended_lease_cap_outs: int = 0
         # Speculation-depth cap: one permit consumed by the Merger when it
         # prefetches a speculative item; released by the Verifier when it drains
         # that speculative item.  Symmetric accounting: acquire=prefetch,
@@ -13420,6 +13524,30 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             req, sig, esc_id or '', category, cause_hint, outcome.reason,
         )
 
+    def _clear_contended_lease_streak(self, task_id: str) -> None:
+        """Close out a task's contended-lane defer streak (task 3003 amend).
+
+        Pops all THREE per-task streak dicts in lockstep.  They are only
+        meaningful together: a surviving ``_contended_lease_first_defer_at``
+        without its counter would make a much later, unrelated streak cap out
+        terminally on its very first defer, and a surviving
+        ``_contended_lease_last_defer_at`` would mis-date the next streak's
+        staleness check.  Routing every reset through one method is what
+        guarantees that — the three call sites that previously popped two dicts
+        by hand were one edit away from drifting apart.
+
+        Called from every exit that proves the streak is over: a verify that
+        actually ran (pass, fail, or generic error), the terminal cap, and every
+        NON-defer exit from :meth:`_run_inflight_verify` — a dropped request, an
+        operator-halt requeue, a dead-verify abort or its busy-loop cap, and a
+        remote-runner-unavailable re-dispatch.  None of those is lane
+        contention, so none of them may leave a streak open behind it.
+        Idempotent: popping an absent task_id is a no-op.
+        """
+        self._contended_lease_requeues.pop(task_id, None)
+        self._contended_lease_first_defer_at.pop(task_id, None)
+        self._contended_lease_last_defer_at.pop(task_id, None)
+
     async def _run_inflight_verify(
         self,
         item: RealMergeItem,
@@ -13434,10 +13562,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         here; CAS advance_main and lease release are deferred to _finalize_inflight.
 
         LOCAL lease (lease.is_local=True):
-            Warm-swap runs: _verify_attempt_count incremented,
-            _acquire_warm_verify_worktree called, runner=None so the internal
-            LocalRunner sees the POST-swap merge_wt (byte-identical single-host
-            path).
+            Warm-swap runs: _acquire_warm_verify_worktree called, runner=None
+            so the internal LocalRunner sees the POST-swap merge_wt
+            (byte-identical single-host path).  _verify_attempt_count advances
+            only once that acquire has SUCCEEDED — i.e. only for attempts that
+            actually reach a verify; an attempt DEFERRED because the
+            merge-verify lane was unavailable leaves it untouched (task 3003),
+            so the periodic cold-verify safety valve it drives cannot be
+            advanced by attempts that never verified anything.
 
         REMOTE lease (lease.is_local=False):
             No warm-swap, no _verify_attempt_count increment.
@@ -13512,9 +13644,20 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # _verifier_loop finalize-head BaseException handler — which resolved
                 # the future as 'blocked' but did NOT clean the ephemeral merge
                 # worktree (a regression vs. the old _verifier_loop except clause).
-                self._verify_attempt_count += 1
+                #
+                # task 3003 (reviewer's secondary finding): the attempt counter
+                # is STAGED here and only committed once the warm acquire has
+                # SUCCEEDED. It drives the periodic cold-verify safety valve, so
+                # it must count attempts that actually reached a verify — a
+                # lane-unavailable DEFER (or any other acquire failure: no
+                # verify ran either way) would otherwise burn through the
+                # valve's period and fire a from-scratch cold verify for
+                # nothing. _safety_valve_due still receives the 1-BASED count it
+                # documents, so the valve fires on exactly the same Nth real
+                # attempt as before. This is the sole increment site.
+                _attempt_n = self._verify_attempt_count + 1
                 _due = _safety_valve_due(
-                    self._verify_attempt_count,
+                    _attempt_n,
                     req.config.git.persistent_merge_worktree_safety_valve_every_n,
                 )
                 merge_wt, _spec_warm = await _acquire_warm_verify_worktree(
@@ -13522,6 +13665,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     safety_valve_due=_due,
                     speculative=item.speculative,
                 )
+                self._verify_attempt_count = _attempt_n
                 assert merge_wt is not None
                 if merge_wt is not item.merge_wt:
                     self._deregister_owned_merge_worktree(item.merge_wt)
@@ -13648,6 +13792,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # normal-completion exit paths) to keep the dict scoped to
                     # genuinely live/in-flight task_ids on every exit path.
                     self._inflight_dead_verify_aborts.pop(req.task_id, None)
+                    # task 3003 amend (robustness): a NON-defer exit — whatever
+                    # contended-lane streak this task had is over, and leaving
+                    # its start stamp behind would let a much later, unrelated
+                    # contention cap out terminally on its first defer.
+                    self._clear_contended_lease_streak(req.task_id)
                     return InflightVerifyResult(
                         outcome=None,
                         merge_wt=None,
@@ -13675,6 +13824,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # MQ-reliability kappa (task 2169): mirror the re-arm onto
                     # the lifecycle registry.
                     self._note_requeue(req.request_id, live_obj=req)
+                    # task 3003 amend (robustness): an operator-halt requeue is
+                    # NOT a contended-lane defer — a verify was running, so the
+                    # lane lock had been acquired.  Close any open streak so its
+                    # elapsed budget cannot span this interruption.
+                    self._clear_contended_lease_streak(req.task_id)
                     return InflightVerifyResult(
                         outcome=None,
                         merge_wt=None,
@@ -13749,6 +13903,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     with contextlib.suppress(BaseException):
                         await verify_task
                     await self._release_or_cleanup(merge_wt, spec_warm=_spec_warm)
+                    # task 3003 amend (robustness): a dead/hung verify — abort or
+                    # busy-loop cap — is not lane contention either (the verify
+                    # got as far as running), so neither branch below may leave a
+                    # contended-lane streak open behind it.
+                    self._clear_contended_lease_streak(req.task_id)
                     if _busy_loop_capped:
                         # task 2420 amend (reviewer finding #2): the
                         # counter has served its purpose once the
@@ -13789,52 +13948,298 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 'will re-dispatch on another host',
                 req.task_id, merge_commit[:8],
             )
+            # task 3003 amend (robustness): a dead remote transport is not lane
+            # contention — this item is re-dispatched on another host, so close
+            # any open contended-lane streak rather than let its start stamp
+            # outlive the re-dispatch.
+            self._clear_contended_lease_streak(req.task_id)
             return InflightVerifyResult(
                 outcome=None,
                 merge_wt=merge_wt,
                 status=InflightStatus.RUNNER_UNAVAILABLE,
                 reason=str(exc),
             )
-        except MergeVerifyLeaseContended as exc:
-            # The merge-verify lane lock stayed contended past its bounded wait,
-            # so merge_verify_lease RAISED rather than run this verify
-            # UNPROTECTED (task 2828, limb 2). This is a transient "come back
-            # later," not a verify failure — DEFER by re-queuing for a later
-            # re-verify, mirroring the operator-halt abort branch above VERBATIM
-            # (release_or_cleanup + put_nowait + on_requeued + _note_requeue +
-            # InflightStatus.REQUEUED). req.result is left PENDING and the
-            # per-task dead-verify-abort counter is untouched, so this never
-            # counts as a dead-verify abort or a 'blocked' resolution. Placed
-            # BEFORE the generic `except Exception`, which would otherwise map
-            # it to MergeOutcome('blocked'). The verify_task has already failed
-            # (the lease raised on acquire, before the verify body ran), so
-            # there is no in-flight verify to abort/cancel here.
+        except (MergeVerifyLeaseContended, MergeVerifyLeaseHeld) as exc:
+            # The shared merge-verify <lane_dir>.lock was unavailable, so the
+            # raiser refused to proceed rather than act UNPROTECTED. This is a
+            # transient "come back later," not a verify failure — DEFER by
+            # re-queuing for a later re-verify, mirroring the operator-halt
+            # abort branch above VERBATIM (release_or_cleanup + put_nowait +
+            # on_requeued + _note_requeue + InflightStatus.REQUEUED).
+            # req.result is left PENDING and the per-task dead-verify-abort
+            # counter is untouched, so this never counts as a dead-verify abort
+            # or a 'blocked' resolution. Placed BEFORE the generic
+            # `except Exception`, which would otherwise map every one of these
+            # to MergeOutcome('blocked') — with a DETERMINISTIC reason string,
+            # hence an identical merge_outcome_signature on every attempt,
+            # which is exactly what tripped workflow.py's
+            # consecutive_merge_thrash ladder into a false-positive human
+            # escalation (reify 5354/5300/5328).
+            #
+            # THREE raise sites now land here:
+            #   1. merge_verify_lease's contended acquire (task 2828, limb 2) —
+            #      MergeVerifyLeaseContended, raised while the verify was
+            #      STARTING, surfacing at verify_task.result().
+            #   2. reset_persistent_merge_worktree's contended acquire (task
+            #      3003, limbs a/b), reached via _acquire_warm_verify_worktree
+            #      in the LOCAL warm-swap branch above —
+            #      MergeVerifyLeaseContended with operation=.
+            #   3. reset_persistent_merge_worktree's FOREIGN-holder pre-check
+            #      (task 3003, limb c) — MergeVerifyLeaseHeld, whose REQUEUE /
+            #      counts_against_requeue_cap=False disposition row in
+            #      workflow_types.py already declared this policy; before 3003
+            #      only the merge worker disagreed.
+            #
+            # The completed policy, as one story (task 3003 review fixes):
+            # a defer is TRANSIENT BUT BOUNDED, never an unbounded spin.
+            #   - it is THROTTLED to CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS
+            #     between attempts, which the two bounded-wait raisers have
+            #     already paid inside their acquire and the immediate
+            #     pre-check has not;
+            #   - the unbroken streak escalates to a single ERROR at the
+            #     CROSSING of CONTENDED_LEASE_REQUEUE_WARN_STREAK, with a
+            #     per-defer WARNING heartbeat either side of it;
+            #   - and continuous contention past MAX_CONTENDED_LEASE_DEFER_SECS
+            #     stops deferring and resolves terminally as 'blocked', with a
+            #     reason carrying the elapsed seconds and the streak count so
+            #     consecutive cap-outs stay signature-DISTINCT and cannot
+            #     re-feed the consecutive_merge_thrash ladder this whole task
+            #     was chartered to stop.
+            #
+            # In BOTH reset cases (2 and 3) the exception fires before
+            # verify_task exists at all, so merge_wt is still the ephemeral
+            # item.merge_wt and _spec_warm is still False — precisely what
+            # _release_or_cleanup(merge_wt, spec_warm=_spec_warm) already
+            # handled on today's blocked path. In case 1 the verify_task has
+            # already failed (the lease raised on acquire, before the verify
+            # body ran). So in no case is there an in-flight verify to
+            # abort/cancel here.
+            #
             # task 2828 amend (reviewer_comprehensive, robustness): count the
             # UNBROKEN contended-lease requeue streak for this task and RAISE the
             # log severity once it crosses CONTENDED_LEASE_REQUEUE_WARN_STREAK, so
             # a long-running / wedged lane holder (which would otherwise defer
             # this verify at the ~wait_secs cadence forever — never escalating,
             # never counting against the requeue cap) becomes operator-visible.
+            #
+            # task 3003 amend (reviewer_comprehensive, robustness): before
+            # touching the streak, CHECK that it is still continuous instead of
+            # assuming it.  Nothing guarantees a deferred request comes back
+            # through this arm: its requeued dispatch can remerge into a
+            # conflict (a DecidedItem passthrough that never reaches
+            # _run_inflight_verify at all), be abandoned, or die at shutdown —
+            # and these dicts live for the whole orchestrator process (~8 h
+            # between fleet redeploys).  Without this check, one defer at T0
+            # followed hours later by a single BRIEF transient contention for the
+            # same task_id would find _contended_elapsed already past the cap and
+            # resolve 'blocked' on the FIRST defer of a fresh streak — precisely
+            # the false-positive blocked-on-transient-lane-busy resolution this
+            # task exists to remove, reintroduced by its own guard.  A gap since
+            # the last defer far larger than the defer cadence can explain proves
+            # something else happened in between, so the streak is closed and
+            # this defer starts a new one.  (The pre-existing
+            # _contended_lease_requeues counter had the same staleness gap, but
+            # it only shaped log severity; the elapsed budget is TERMINAL, so the
+            # gap now has consequences.)
+            _defer_now = time.monotonic()
+            _waited = float(getattr(exc, 'wait_secs', 0.0) or 0.0)
+            _prev_defer_at = self._contended_lease_last_defer_at.get(req.task_id)
+            _streak_stale_after = max(
+                self.CONTENDED_LEASE_STREAK_STALE_FLOOR_SECS,
+                self.CONTENDED_LEASE_STREAK_STALE_FACTOR
+                * max(self.CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS, _waited),
+            )
+            if (
+                _prev_defer_at is not None
+                and _defer_now - _prev_defer_at > _streak_stale_after
+            ):
+                logger.info(
+                    'Task %s: %.0fs since its last contended-lane defer '
+                    '(> %.0fs) — that gap cannot be explained by the defer '
+                    'cadence, so the previous streak is closed and this defer '
+                    'starts a fresh one',
+                    req.task_id, _defer_now - _prev_defer_at, _streak_stale_after,
+                )
+                self._clear_contended_lease_streak(req.task_id)
+            self._contended_lease_last_defer_at[req.task_id] = _defer_now
             _contended_streak = self._contended_lease_requeues.get(req.task_id, 0) + 1
             self._contended_lease_requeues[req.task_id] = _contended_streak
-            if _contended_streak >= self.CONTENDED_LEASE_REQUEUE_WARN_STREAK:
+            # task 3003 (review fix 2): bound the streak in ELAPSED time. The
+            # stamp marks the START of the unbroken streak (setdefault), so the
+            # very first defer measures 0s and always defers.
+            _streak_started_at = self._contended_lease_first_defer_at.setdefault(
+                req.task_id, _defer_now,
+            )
+            _contended_elapsed = _defer_now - _streak_started_at
+            if _contended_elapsed >= self.MAX_CONTENDED_LEASE_DEFER_SECS:
+                # Terminal cap, shaped like the MAX_INFLIGHT_DEAD_VERIFY_ABORTS
+                # busy-loop guard above. A contended-lane defer never escalates
+                # and never counts against the requeue cap, so a permanently
+                # wedged holder would otherwise defer this task forever with no
+                # terminal resolution at all.
+                #
+                # Pop EVERY per-task dict: an operator-resolved re-submission of
+                # this task_id must get a FRESH budget rather than instantly
+                # re-capping on a stale start stamp, and none of them may grow
+                # unboundedly for permanently-blocked tasks.
+                self._clear_contended_lease_streak(req.task_id)
+                # task 3003 amend (reviewer_comprehensive, resource_cleanup):
+                # the dead-verify-abort counter too — this is a TERMINAL
+                # 'blocked' resolution, and both other terminal 'blocked' exits
+                # on this coroutine pop it for the two reasons recorded there
+                # (task 2420 amend).  Without this, a task carrying
+                # MAX_INFLIGHT_DEAD_VERIFY_ABORTS-1 stale aborts that caps out
+                # here would, once an operator clears the lane and re-submits
+                # it, trip the busy-loop cap on its very FIRST dead verify and
+                # be abandoned without a requeue; and the dict would grow
+                # unboundedly for permanently-blocked task_ids.
+                self._inflight_dead_verify_aborts.pop(req.task_id, None)
+                # task 3003 amend (reviewer_comprehensive, test_quality): a
+                # per-worker cap-out ordinal, rendered into the reason below.
+                # See the attribute's comment in __init__ for why the elapsed/
+                # streak components alone are NOT a structural distinctness
+                # guarantee in production.
+                self._contended_lease_cap_outs += 1
+                _cap_out_n = self._contended_lease_cap_outs
+                await self._release_or_cleanup(merge_wt, spec_warm=_spec_warm)
                 logger.error(
-                    'Task %s: merge-verify lease contended (%s) — DEFERRED %d '
-                    'times in a row (~%.0f min of continuous contention). A '
-                    'long-running or wedged lane holder is blocking this verify; '
-                    're-queuing again rather than running unprotected. If this '
-                    'persists, inspect the merge-verify lane lock holder.',
-                    req.task_id, exc, _contended_streak,
-                    _contended_streak * getattr(exc, 'wait_secs', 0.0) / 60.0,
+                    'Task %s: merge-verify lane has been unavailable for %.0fs '
+                    'across %d consecutive deferred attempts (%s) — resolving '
+                    'BLOCKED instead of deferring again (lane cap-out #%d). '
+                    'This is a genuine lane pathology: inspect the merge-verify '
+                    'lane lock holder.',
+                    req.task_id, _contended_elapsed, _contended_streak, exc,
+                    _cap_out_n,
+                )
+                # Deliberately routed through the ordinary blocked-merge path
+                # rather than workflow.py's consecutive_merge_thrash ladder:
+                # that ladder means "the SAME mechanical merge failure
+                # repeated", which lane unavailability is not.
+                #
+                # The reason must therefore never be INVARIANT across cap-outs,
+                # or two of them would hash to the same
+                # merge_outcome_signature and walk that ladder anyway
+                # (max_consecutive_merge_thrash defaults to 2) — the exact
+                # false-positive this task removed.  The cap-out ORDINAL is what
+                # guarantees that structurally: it strictly increases, so no two
+                # cap-outs from one worker can render the same string even when
+                # the elapsed seconds and streak count collide — which in
+                # production they very nearly always do, since each streak
+                # starts fresh at the cap and so caps at the first defer past the
+                # same budget with the same cadence.  The elapsed seconds and
+                # streak count are kept as operator information (and as a
+                # secondary difference across a process restart, which resets
+                # the ordinal).  Do NOT round these to a coarser unit (hours at
+                # .1f would render '4.0h' every time).
+                err_outcome = MergeOutcome(
+                    'blocked',
+                    reason=(
+                        f'merge-verify lane unavailable for '
+                        f'{_contended_elapsed:.0f}s across {_contended_streak} '
+                        f'consecutive deferred attempts '
+                        f'(lane cap-out #{_cap_out_n}): {exc}'
+                    ),
+                )
+                if not req.result.done():
+                    req.result.set_result(err_outcome)
+                return InflightVerifyResult(outcome=err_outcome, merge_wt=None)
+            if _contended_streak == self.CONTENDED_LEASE_REQUEUE_WARN_STREAK:
+                # task 3003 (review fix 3): `==`, not `>=` — this ERROR marks
+                # the CROSSING, once. A `>=` test re-alarms on every defer past
+                # the threshold, which against a genuinely wedged holder is
+                # thousands of identical lines telling the operator nothing
+                # new. Defers past the crossing fall to the `else` WARNING
+                # below (which carries the running streak count), so the
+                # per-defer heartbeat is preserved and only the alarm is
+                # de-duplicated. The streak is closed out loudly at the other
+                # end by the terminal MAX_CONTENDED_LEASE_DEFER_SECS cap above.
+                #
+                # task 3003: the "~N min of continuous contention" estimate is
+                # only meaningful for the two BOUNDED-WAIT raisers, which carry
+                # wait_secs. MergeVerifyLeaseHeld has no such attribute — its
+                # pre-check refuses IMMEDIATELY, so there is no wait to
+                # multiply. Rendering getattr(..., 0.0) as "~0 min" would tell
+                # an operator the exact opposite of the truth (the holder has
+                # been there a while; this exception simply cannot say how
+                # long), so the duration clause is SUPPRESSED when absent
+                # rather than printed as zero. The streak count and the
+                # exception detail (which names the holder pgid) are kept in
+                # both variants.
+                _wait_secs = getattr(exc, 'wait_secs', None)
+                _duration_clause = (
+                    f' (~{_contended_streak * _wait_secs / 60.0:.0f} min of '
+                    f'continuous contention)'
+                    if _wait_secs is not None
+                    else ''
+                )
+                logger.error(
+                    'Task %s: merge-verify lane unavailable (%s) — DEFERRED %d '
+                    'times in a row%s. A long-running or wedged lane holder is '
+                    'blocking this verify; re-queuing again rather than running '
+                    'unprotected. If this persists, inspect the merge-verify '
+                    'lane lock holder.',
+                    req.task_id, exc, _contended_streak, _duration_clause,
                 )
             else:
+                # task 3003: "lane unavailable" rather than "lease contended" —
+                # this arm now also covers MergeVerifyLeaseHeld (a FOREIGN
+                # holder refused immediately, never a bounded-wait contention)
+                # and the warm-swap reset's own acquire. The exception detail
+                # (%s) names which of the three it was.
                 logger.warning(
-                    'Task %s: merge-verify lease contended (%s) — re-queuing '
-                    'merge for re-verify rather than running the verify '
-                    'unprotected (consecutive contended-lease requeue #%d)',
+                    'Task %s: merge-verify lane unavailable (%s) — re-queuing '
+                    'merge for re-verify rather than proceeding unprotected '
+                    '(consecutive contended-lane requeue #%d)',
                     req.task_id, exc, _contended_streak,
                 )
+            # The ephemeral worktree and its disk are freed BEFORE the backoff
+            # below, never held across it.
             await self._release_or_cleanup(merge_wt, spec_warm=_spec_warm)
+            # task 3003 (review fix 1): throttle the re-attempt to a minimum
+            # INTER-ATTEMPT PERIOD.  The two bounded-wait raisers have already
+            # burned wait_secs inside the acquire, so they sleep 0 here and
+            # their cadence is byte-unchanged; MergeVerifyLeaseHeld's immediate
+            # pre-check carries no wait at all and would otherwise hot-spin the
+            # full dequeue → merge → refuse → cleanup → requeue cycle at git
+            # speed for the whole holder window.
+            #
+            # Accepted trade-off: _run_inflight_verify runs as a background
+            # asyncio.ensure_future task, so this sleep does NOT stall the
+            # merger's dequeue loop — but the HostLease is only released by
+            # _finalize_inflight once this coroutine returns, so the backoff
+            # holds the verify slot for ≤ the min period.  That is bounded,
+            # orders of magnitude shorter than the real verify the slot normally
+            # runs, and moot on the warm path anyway (any other local verify
+            # would contend on the same lane lock).
+            #
+            # task 3003 (review fix 4): the requeue bookkeeping deliberately
+            # runs ONLY on the non-cancelled path — NOT from a `finally`.
+            # A CANCELLING CALLER OWNS THE REQUEST.  That is the pre-existing
+            # convention on this coroutine: the operator-halt and dead-verify
+            # defer branches above also await before their put_nowait, and a
+            # cancellation there simply skips the requeue.  All three
+            # production cancel sites already discharge the request
+            # themselves:
+            #   - stop()'s finalizing-head short-circuit (~10796) and its
+            #     _inflight drain (~10921) BOTH resolve req.result with the
+            #     shutdown outcome and _retire_item BEFORE cancelling
+            #     verify_task;
+            #   - _verifier_loop's head-failure cascade (~12631) either
+            #     re-queues the entry itself (the _head_was_requeued branch)
+            #     or re-dispatches it through _remerge.
+            # Re-queuing from a `finally` would DOUBLE-file the request at
+            # every one of them.  Worst case is the cascade: a task cancelled
+            # inside the sleep is `cancelled()`, so `_entry_status` stays None
+            # and the REQUEUED `continue` guard at ~12693 does not fire;
+            # control reaches the `_head_was_requeued and ...cancelled()`
+            # branch, whose only other guard is `not _entry_req.result.done()`
+            # — and a deferred request's future is deliberately left PENDING.
+            # The request would land on _queue TWICE and be merged twice.
+            # _waited was computed at the top of this arm (it also scales the
+            # streak-staleness window), so it is reused rather than re-derived.
+            _backoff = max(0.0, self.CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS - _waited)
+            if _backoff:
+                await asyncio.sleep(_backoff)
             self._queue.put_nowait(req)
             self._request_ledger.on_requeued(req.request_id)
             self._note_requeue(req.request_id, live_obj=req)
@@ -13857,7 +14262,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             self._inflight_dead_verify_aborts.pop(req.task_id, None)
             # task 2828 amend: terminal 'blocked' exit — drop any contended-lease
             # streak so it never lingers stale for a task that will not re-verify.
-            self._contended_lease_requeues.pop(req.task_id, None)
+            # task 3003: the streak's start stamp is popped in lockstep, else a
+            # much later unrelated streak would inherit it and cap out on its
+            # very first defer.
+            self._clear_contended_lease_streak(req.task_id)
             err_outcome = MergeOutcome('blocked', reason=f'Verification error: {exc}')
             if not req.result.done():
                 req.result.set_result(err_outcome)
@@ -13874,7 +14282,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._inflight_dead_verify_aborts.pop(req.task_id, None)
         # task 2828 amend: the verify actually RAN (lease was acquired), so any
         # prior contended-lease requeue streak for this task is broken — reset it.
-        self._contended_lease_requeues.pop(req.task_id, None)
+        # task 3003: pop the streak's start stamp in lockstep, so the next
+        # streak measures its own elapsed span from its own first defer.
+        self._clear_contended_lease_streak(req.task_id)
 
         if out is None:
             logger.info(
