@@ -283,9 +283,17 @@ test('per-endpoint in-flight guard: a rejected fetch also clears the in-flight f
   const { api } = loadDataJs({ fetchStub: fetchImpl });
 
   const state = api.createPollState();
+  // A fake, manually-advanced clock (not Date.now()): a rejection now also
+  // triggers error backoff (steps 5-6), so the retry tick below needs the
+  // clock pushed past the resulting 3000ms nextAllowedAt — otherwise this
+  // test would depend on real wall-clock time not having advanced 3s
+  // between the two pollTick() calls, which happens to hold today only
+  // because they run milliseconds apart. This test's concern is the
+  // in-flight flag specifically; backoff itself is covered separately below.
+  let t = 0;
   const deps = {
     fetchImpl,
-    now: () => Date.now(),
+    now: () => t,
     random: () => Math.random(),
     sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
   };
@@ -297,6 +305,7 @@ test('per-endpoint in-flight guard: a rejected fetch also clears the in-flight f
 
   rejectSlow(new Error('simulated network failure'));
   await drain();
+  t = state.get(SLOW_ENDPOINT_PATH).nextAllowedAt; // past the backoff window opened by the rejection
 
   api.pollTick(opts);
   await drain();
