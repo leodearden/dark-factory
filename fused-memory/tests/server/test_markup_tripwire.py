@@ -13,13 +13,34 @@ from __future__ import annotations
 
 import json
 
+from fused_memory.server import markup_tripwire
 from fused_memory.server.markup_tripwire import (
     MARKUP_OVERRIDE_KEY,
     MCP_MARKUP_PATTERNS,
+    MarkupStormCounter,
     build_markup_block,
     find_markup_pattern,
     find_markup_violation,
 )
+
+
+class _FakeClock:
+    """A mutable, list-free monotonic stand-in for ``time.time``.
+
+    Injected via MarkupStormCounter(time_provider=...) so window behaviour is
+    asserted by ADVANCING the clock rather than by sleeping — a wall-clock test
+    of a 3600s window would either be unrunnable or flaky.
+    """
+
+    def __init__(self, start: float = 1_000.0) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
 
 # ---------------------------------------------------------------------------
 # Tier-1 same-file drift guard.
@@ -255,3 +276,126 @@ class TestBuildMarkupBlock:
         block = build_markup_block('a', 'content', '</invoke>', 'a </invoke> b')
         assert isinstance(block, dict)
         json.dumps(block)  # raises TypeError if a non-serializable value slipped in
+
+
+class TestMarkupStormCounter:
+    """Rolling-window burst detector (INV-4).
+
+    A single rejection is a bounced write; a BURST means the serialization leak
+    is actively running, which is the condition worth escalating. Every test
+    here drives an injected clock — no sleeping, no wall-clock dependence.
+    """
+
+    def test_returns_none_below_threshold(self):
+        clock = _FakeClock()
+        counter = MarkupStormCounter(threshold=3, window_seconds=100.0, time_provider=clock)
+        assert counter.record() is None
+        assert counter.record() is None
+
+    def test_fires_on_the_record_that_reaches_threshold(self):
+        clock = _FakeClock()
+        counter = MarkupStormCounter(threshold=3, window_seconds=100.0, time_provider=clock)
+        counter.record()
+        counter.record()
+        storm = counter.record()
+        assert storm is not None
+        assert storm['count'] == 3
+        assert storm['threshold'] == 3
+        assert storm['window_seconds'] == 100.0
+
+    def test_storm_hint_names_df_3083(self):
+        """The burst summary points at the owner of the root cause, not at itself."""
+        clock = _FakeClock()
+        counter = MarkupStormCounter(threshold=1, window_seconds=100.0, time_provider=clock)
+        storm = counter.record()
+        assert storm is not None
+        assert storm['hint']
+        assert '3083' in storm['hint'], f"storm hint must name DF 3083: {storm['hint']!r}"
+
+    def test_rate_limited_to_one_fire_per_window(self):
+        """Further rejections inside the same window return None.
+
+        Without this a leak emitting hundreds of writes would file hundreds of
+        escalations for one incident.
+        """
+        clock = _FakeClock()
+        counter = MarkupStormCounter(threshold=2, window_seconds=100.0, time_provider=clock)
+        counter.record()
+        assert counter.record() is not None  # fires
+        clock.advance(1.0)
+        assert counter.record() is None
+        clock.advance(1.0)
+        assert counter.record() is None
+
+    def test_can_fire_again_after_the_window_elapses(self):
+        """The rate limit expires with the window — a second incident still alarms."""
+        clock = _FakeClock()
+        counter = MarkupStormCounter(threshold=2, window_seconds=100.0, time_provider=clock)
+        counter.record()
+        assert counter.record() is not None
+
+        # Move past both the rate-limit window and the event window, then
+        # re-trip from scratch.
+        clock.advance(200.0)
+        assert counter.record() is None  # window pruned; only 1 event
+        assert counter.record() is not None
+
+    def test_a_slow_trickle_never_fires(self):
+        """Events older than window_seconds are pruned, so a trickle is not a storm.
+
+        Ten rejections spread far enough apart never accumulate to a threshold of
+        3 — this is the whole point of a rolling WINDOW rather than a total count.
+        """
+        clock = _FakeClock()
+        counter = MarkupStormCounter(threshold=3, window_seconds=100.0, time_provider=clock)
+        for _ in range(10):
+            assert counter.record() is None
+            clock.advance(150.0)
+
+    def test_events_exactly_at_the_window_edge_are_pruned(self):
+        """A window is a half-open interval — an event aged exactly window_seconds is out.
+
+        Pins the boundary so a future `<=`/`<` edit cannot silently shift when a
+        storm fires.
+        """
+        clock = _FakeClock()
+        counter = MarkupStormCounter(threshold=2, window_seconds=100.0, time_provider=clock)
+        counter.record()
+        clock.advance(100.0)
+        assert counter.record() is None
+
+    def test_module_defaults_are_the_documented_constants(self):
+        """The no-arg counter uses the module's own threshold/window."""
+        clock = _FakeClock()
+        counter = MarkupStormCounter(time_provider=clock)
+        for _ in range(markup_tripwire._MARKUP_STORM_THRESHOLD - 1):
+            assert counter.record() is None
+        storm = counter.record()
+        assert storm is not None
+        assert storm['threshold'] == markup_tripwire._MARKUP_STORM_THRESHOLD
+        assert storm['window_seconds'] == markup_tripwire._MARKUP_STORM_WINDOW_SECONDS
+
+    def test_default_threshold_and_window_values(self):
+        assert markup_tripwire._MARKUP_STORM_THRESHOLD == 3
+        assert markup_tripwire._MARKUP_STORM_WINDOW_SECONDS == 3600.0
+
+    def test_defaults_to_wall_clock_when_no_provider_is_injected(self):
+        """The production path needs no argument — time.time is the default."""
+        counter = MarkupStormCounter(threshold=1, window_seconds=100.0)
+        assert counter.record() is not None
+
+    def test_counters_do_not_share_state(self):
+        """Per-instance state, so one create_mcp_server cannot bleed into another."""
+        clock = _FakeClock()
+        first = MarkupStormCounter(threshold=2, window_seconds=100.0, time_provider=clock)
+        second = MarkupStormCounter(threshold=2, window_seconds=100.0, time_provider=clock)
+        first.record()
+        # `second` has seen exactly one event of its own, so it must not fire.
+        assert second.record() is None
+        assert first.record() is not None
+
+    def test_storm_summary_is_json_serializable(self):
+        clock = _FakeClock()
+        counter = MarkupStormCounter(threshold=1, window_seconds=100.0, time_provider=clock)
+        storm = counter.record()
+        json.dumps(storm)
