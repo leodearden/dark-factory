@@ -27,7 +27,9 @@ import sys
 from pathlib import Path
 
 from audit_wiped_metadata_files import (
+    _LOCK_LEVEL_CAVEAT,
     _SOURCE_PRECEDENCE,
+    CLEAN_MERGE_SHA,
     CONFIRMED_NULL_SHA_DONE_PATH,
     CONTRADICTED_REAL_MERGE_SHA,
     FIDELITY_FILE_LEVEL,
@@ -705,16 +707,40 @@ def test_merge_plan_file_sources_on_empty_inputs_returns_empty():
     assert merge_plan_file_sources({}, {}) == {}
 
 
-def test_merge_plan_file_sources_precedence_is_stated_once_and_is_total():
-    """The ordering lives in a single module-level tuple, and every source
-    label the loaders can emit appears in it — an unranked source would
-    otherwise be silently unorderable."""
-    assert _SOURCE_PRECEDENCE == (
-        "meta_root_plan_json",
-        "legacy_worktree_plan_json",
-        "phase_skipped_event",
-        "set_to_plan_event",
+def test_every_source_label_the_loaders_emit_is_ranked_by_the_precedence(tmp_path):
+    """TOTALITY, checked against the labels the loaders actually PRODUCE
+    rather than by restating the tuple's literal contents.
+
+    An unranked label does not raise — ``_source_rank`` sorts it last — so a
+    new loader emitting one would silently lose every precedence contest. This
+    drives all four loader paths from fixture data and asserts every label they
+    emit is ranked."""
+    base = tmp_path / "worktrees"
+    base.mkdir()
+    _write_meta_root_plan(base, "1", {"task_id": 1, "files": ["a.py"]})
+    _write_legacy_plan(base, "2", {"task_id": 2, "files": ["b.py"]})
+    db_path = _make_runs_db(
+        tmp_path,
+        [
+            {"event_type": "phase_skipped", "task_id": 3, "data": {"plan_files": ["c.py"]}},
+            {"event_type": "set_to_plan", "task_id": 4, "data": {"files": ["orchestrator"]}},
+        ],
     )
+
+    observed = {
+        record.source
+        for record in (
+            *load_plan_files_from_disk(str(base)).values(),
+            *load_plan_files_from_events(str(db_path)).values(),
+        )
+    }
+
+    # The fixture really did exercise all four loader paths...
+    assert len(observed) == 4
+    # ...and every label they emit is ranked, so none sorts last by accident.
+    assert observed <= set(_SOURCE_PRECEDENCE)
+    # A duplicated entry would make .index() unreachable for the later copy.
+    assert len(set(_SOURCE_PRECEDENCE)) == len(_SOURCE_PRECEDENCE)
 
 
 # ---------------------------------------------------------------------------
@@ -769,6 +795,25 @@ def test_classify_null_sha_failure_followed_by_a_real_merge_is_contradicted():
     ) == CONTRADICTED_REAL_MERGE_SHA
 
 
+def test_classify_a_history_of_only_real_shas_is_clean_not_contradicted():
+    """A merge history that NEVER contained a null-sha row must not be labelled
+    'contradicted': that label asserts a null-sha row exists, and the report
+    tells the operator not to repair contradicted tasks. Since
+    _reconcile_metadata_files_for_done ALSO blanks metadata.files on its
+    ``if err is not None`` branch (workflow.py:2001-2006) — which runs WITH a
+    real merge sha present — a clean-sha task with empty metadata.files is a
+    live candidate, not an exonerated one."""
+    assert classify_wipe_signature([_finalized("done", "abc123")]) == CLEAN_MERGE_SHA
+    assert classify_wipe_signature(
+        [_finalized("done", "abc123"), _finalized("already_merged", "def456")]
+    ) == CLEAN_MERGE_SHA
+    # And the contradicted label is still returned when a null-sha row DOES
+    # coexist with a real one, so the two outcomes are genuinely distinguished.
+    assert classify_wipe_signature(
+        [_finalized("blocked"), _finalized("done", "abc123")]
+    ) == CONTRADICTED_REAL_MERGE_SHA
+
+
 def test_classify_no_events_is_unknown_not_clean():
     """(d) other DONE paths (found_on_main recovery, eval mode) wipe without
     ever emitting merge_finalized, so silence is UNKNOWN, not exoneration."""
@@ -807,7 +852,7 @@ def test_classify_tolerates_junk_payload_entries():
     assert classify_wipe_signature(["not-a-dict", None]) == NO_MERGE_EVENT
     assert classify_wipe_signature(
         ["junk", _finalized("done", "abc123")]
-    ) == CONTRADICTED_REAL_MERGE_SHA
+    ) == CLEAN_MERGE_SHA
 
 
 def test_classify_treats_an_empty_string_sha_as_no_sha():
@@ -1014,6 +1059,44 @@ def test_audit_project_coverage_counts_every_tier(tmp_path):
     assert lock_candidates[0].plan_files == ("orchestrator",)
 
 
+def test_audit_project_coverage_tiers_partition_tasks_even_across_tags(tmp_path):
+    """The coverage tiers count TASKS, not plan records.
+
+    A plan record is keyed by a BARE task id, so the same numeric id under two
+    tags — two genuinely distinct tasks, which load_task_records keys apart on
+    purpose — matches ONE plan record. Counting that record once would leave
+    the second task inside the ``total - file_level - lock_level`` remainder
+    and report it as having NO plan signal when it had one. The coverage block
+    is the honesty artifact of this report, so its tiers must partition
+    total_tasks exactly.
+    """
+    root = _make_project(
+        tmp_path,
+        tasks=[
+            {"id": 42, "tag": "master", "metadata": {"files": []}},
+            {"id": 42, "tag": "alpha", "metadata": {"files": ["kept.py"]}},
+            {"id": 43, "tag": "master", "metadata": {"files": []}},  # no signal
+        ],
+        plans=[("42", {"task_id": 42, "files": ["a.py"]})],
+    )
+
+    coverage = audit_project(str(root)).coverage
+
+    assert coverage.total_tasks == 3
+    assert coverage.tasks_with_file_level_signal == 2   # BOTH id-42 tasks
+    assert coverage.tasks_with_lock_level_signal_only == 0
+    assert coverage.tasks_without_plan_signal == 1      # only task 43
+    assert (
+        coverage.tasks_with_file_level_signal
+        + coverage.tasks_with_lock_level_signal_only
+        + coverage.tasks_without_plan_signal
+    ) == coverage.total_tasks
+    # Only the tag whose files were emptied is a candidate.
+    assert [
+        (c.tag, c.task_id) for c in audit_project(str(root)).candidates
+    ] == [("master", 42)]
+
+
 def test_audit_project_degrades_to_no_merge_event_without_a_runs_db(tmp_path):
     """A project with no runs.db still audits; every signature is UNKNOWN."""
     root = _make_project(
@@ -1085,15 +1168,19 @@ def test_format_report_renders_every_field_a_repair_would_need(tmp_path):
     """(a) each line carries task_id, tag, status, signature, source,
     fidelity and the plan file count, grouped under the project root."""
     report = format_report([_audit([_candidate(2464)])])
+    lines = report.splitlines()
 
-    assert "/tmp/proj" in report
-    assert "2464" in report
-    assert "master" in report
-    assert "done" in report
-    assert CONFIRMED_NULL_SHA_DONE_PATH in report
-    assert "meta_root_plan_json" in report
-    assert FIDELITY_FILE_LEVEL in report
-    assert "2" in report  # the plan file count
+    assert "/tmp/proj:" in lines
+    # The WHOLE rendered line, keyed by field: a bare `"2464" in report` or
+    # `"2" in report` would pass on unrelated text (the id contains "2", the
+    # signature contains "done"), asserting nothing about the fields a repair
+    # actually consumes. _candidate() defaults to two plan files.
+    assert (
+        "  task_id=2464 tag=master status=done "
+        f"signature={CONFIRMED_NULL_SHA_DONE_PATH} "
+        "source=meta_root_plan_json "
+        f"fidelity={FIDELITY_FILE_LEVEL} plan_files=2"
+    ) in lines
 
 
 def test_format_report_always_prints_coverage_even_with_zero_candidates():
@@ -1128,10 +1215,21 @@ def test_format_report_marks_lock_level_candidates_with_an_explicit_caveat():
         ]
     )
 
-    lowered = report.lower()
-    assert "lock-level" in lowered or "lock_level" in lowered
-    assert "module" in lowered
-    assert "not" in lowered  # "not verbatim plan.files"
+    lines = report.splitlines()
+    candidate_at = next(i for i, line in enumerate(lines) if "task_id=7" in line)
+    # The caveat must ANNOTATE THAT LINE — asserting "lock-level" appears
+    # somewhere in the report would pass on the coverage block's own
+    # "with only a lock-level signal:" row and prove nothing.
+    caveat = lines[candidate_at + 1]
+    assert caveat == _LOCK_LEVEL_CAVEAT
+    lowered = caveat.lower()
+    assert "lock-level" in lowered            # what the paths are
+    assert "module path" in lowered           # ...and why that matters
+    assert "metadata.files" in lowered        # ...and what must not be done
+    assert "must not be backfilled" in lowered
+
+    # Negative control: a FILE_LEVEL candidate carries no caveat at all.
+    assert _LOCK_LEVEL_CAVEAT not in format_report([_audit([_candidate(8)])])
 
 
 def test_format_report_separates_contradicted_from_confirmed_candidates():
@@ -1155,6 +1253,48 @@ def test_format_report_separates_contradicted_from_confirmed_candidates():
     assert confirmed_at < contradicted_at
     lowered = report.lower()
     assert "contradicted" in lowered
+
+
+def test_format_report_keeps_clean_merge_sha_candidates_out_of_contradicted():
+    """A CLEAN_MERGE_SHA candidate has no null-sha row, so it belongs in the
+    reportable section: the err branch (workflow.py:2001-2006) can still have
+    wiped it, and the contradicted section explicitly says 'do not repair'."""
+    report = format_report([_audit([_candidate(11, wipe_signature=CLEAN_MERGE_SHA)])])
+
+    assert any("task_id=11" in line for line in report.splitlines())
+    assert "-- contradicted" not in report
+    assert "  -- candidates (1) --" in report.splitlines()
+
+
+def test_format_report_summary_counts_agree_with_the_exit_code_contract():
+    """The summary must report BOTH figures. main() exits 1 on ANY candidate
+    including contradicted ones, so a summary counting only the reportable
+    ones would say '0 candidate(s)' on a run that exits 1 — two contradictory
+    answers for one run."""
+    summary = format_report(
+        [
+            _audit(
+                [
+                    _candidate(1, wipe_signature=CONFIRMED_NULL_SHA_DONE_PATH),
+                    _candidate(2, wipe_signature=CONTRADICTED_REAL_MERGE_SHA),
+                    _candidate(3, wipe_signature=CONTRADICTED_REAL_MERGE_SHA),
+                ]
+            )
+        ]
+    ).splitlines()[-1]
+
+    assert summary.startswith("3 candidate(s) across 1 project(s)")
+    assert "1 reportable" in summary
+    assert "2 contradicted" in summary
+
+    # A contradicted-ONLY project still reports a non-zero candidate count,
+    # matching the exit code the CLI will return for it.
+    contradicted_only = format_report(
+        [_audit([_candidate(2, wipe_signature=CONTRADICTED_REAL_MERGE_SHA)])]
+    ).splitlines()[-1]
+    assert contradicted_only.startswith("1 candidate(s)")
+    assert "0 reportable" in contradicted_only
+    assert "1 contradicted" in contradicted_only
 
 
 def test_format_json_emits_an_object_with_untruncated_files_and_coverage():
@@ -1317,6 +1457,55 @@ def test_main_skips_a_corrupt_project_and_warns_that_results_are_incomplete(tmp_
     assert str(bad) in result.stderr
     assert "skipping" in stderr or "skipped" in stderr
     assert "incomplete" in stderr
+
+
+def test_main_exit_code_and_summary_agree_on_a_contradicted_only_project(tmp_path):
+    """A project whose ONLY candidate is contradicted still exits 1 (there IS
+    a row to look at), so the summary line must not claim zero candidates —
+    an operator or CI reading both would otherwise get two answers."""
+    root = _make_project(
+        tmp_path,
+        tasks=[{"id": 9, "metadata": {"files": []}}],
+        plans=[("9", {"task_id": 9, "files": ["a.py"]})],
+        events=[
+            {"event_type": "merge_finalized", "task_id": 9, "data": _finalized("blocked")},
+            {"event_type": "merge_finalized", "task_id": 9, "data": _finalized("done", "abc123")},
+        ],
+    )
+
+    result = _run_cli("--project-root", str(root))
+
+    assert result.returncode == 1
+    assert CONTRADICTED_REAL_MERGE_SHA in result.stdout
+    summary = result.stdout.strip().splitlines()[-1]
+    assert summary.startswith("1 candidate(s)")
+    assert "0 reportable" in summary and "1 contradicted" in summary
+
+
+def test_main_exits_3_when_every_resolved_project_was_unreadable(tmp_path):
+    """Nothing was audited at all — that must NOT share exit 0 with 'audited
+    everything, found nothing'. A cron/CI consumer reading only the exit code
+    would otherwise record a total failure as a clean sweep."""
+    bad_a = _make_project(tmp_path, name="bad-a")
+    bad_b = _make_project(tmp_path, name="bad-b")
+    for bad in (bad_a, bad_b):
+        (bad / ".taskmaster" / "tasks" / "tasks.db").write_text("not a database")
+
+    result = _run_cli("--project-root", str(bad_a), "--project-root", str(bad_b))
+
+    assert result.returncode == 3
+    stderr = result.stderr.lower()
+    assert "nothing was audited" in stderr
+    assert "incomplete" in stderr
+    # And the mixed case is still exit 1, not 3 — one readable project audited.
+    good = _make_project(
+        tmp_path,
+        tasks=[{"id": 5, "metadata": {"files": []}}],
+        plans=[("5", {"task_id": 5, "files": ["a.py"]})],
+        name="good",
+    )
+    mixed = _run_cli("--project-root", str(bad_a), "--project-root", str(good))
+    assert mixed.returncode == 1
 
 
 def test_main_audits_a_project_whose_runs_db_is_missing(tmp_path):

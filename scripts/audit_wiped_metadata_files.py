@@ -170,9 +170,22 @@ _FIDELITY_RANK = {FIDELITY_LOCK_LEVEL: 0, FIDELITY_FILE_LEVEL: 1}
 CONFIRMED_NULL_SHA_DONE_PATH = "confirmed_null_sha_done_path"
 # merge_finalized events exist but NONE ever carried a non-null merge sha.
 NO_SUCCESSFUL_MERGE_SHA = "no_successful_merge_sha"
-# A null-sha row exists, but the task later obtained a REAL merge sha — a
-# retried failure that landed. NOT a wipe.
+# A null-sha row exists AND the same task also obtained a REAL merge sha — a
+# failed attempt that was retried and landed. NOT the null-sha wipe. The claim
+# is COEXISTENCE, not ordering: emission order is not relied on, so the label
+# stays true whichever row came first.
 CONTRADICTED_REAL_MERGE_SHA = "contradicted_real_merge_sha"
+# Every merge_finalized row carried a real merge sha; there is NO null-sha row
+# at all. Kept DISTINCT from CONTRADICTED_REAL_MERGE_SHA because the latter
+# asserts a null-sha row exists, which would be factually false here.
+#
+# NOT an exoneration: _reconcile_metadata_files_for_done also blanks files on
+# its `if err is not None: files = []` branch (workflow.py:2001-2006), which
+# runs WITH a real merge sha present. A clean-sha task whose metadata.files is
+# empty is therefore still a live wipe candidate and is reported as one — it is
+# never filed under "contradicted", which would tell an operator not to repair
+# it.
+CLEAN_MERGE_SHA = "clean_merge_sha"
 # No merge_finalized at all. UNKNOWN, not clean: found_on_main recovery and
 # eval mode both reach DONE without emitting one.
 NO_MERGE_EVENT = "no_merge_event"
@@ -192,12 +205,19 @@ def classify_wipe_signature(merge_finalized_payloads: list) -> str:
     over thousands of tasks.
 
     Returns one of :data:`CONFIRMED_NULL_SHA_DONE_PATH`,
-    :data:`NO_SUCCESSFUL_MERGE_SHA`, :data:`CONTRADICTED_REAL_MERGE_SHA`, or
-    :data:`NO_MERGE_EVENT`. See the block comment above for the live-DB
-    measurement that justifies the state-aware rule.
+    :data:`NO_SUCCESSFUL_MERGE_SHA`, :data:`CONTRADICTED_REAL_MERGE_SHA`,
+    :data:`CLEAN_MERGE_SHA`, or :data:`NO_MERGE_EVENT`. See the block comment
+    above for the live-DB measurement that justifies the state-aware rule.
+
+    Null-sha and real-sha observations are tracked SEPARATELY so a history
+    that only ever carried real shas is labelled :data:`CLEAN_MERGE_SHA`
+    rather than "contradicted" — the latter asserts a null-sha row exists,
+    and mislabelling would tell an operator not to repair a task the err
+    branch (workflow.py:2001-2006) may genuinely have wiped.
     """
     saw_event = False
     saw_real_sha = False
+    saw_null_sha = False
     for payload in merge_finalized_payloads:
         if not isinstance(payload, dict):
             continue
@@ -209,13 +229,14 @@ def classify_wipe_signature(merge_finalized_payloads: list) -> str:
             # every other observation for this task.
             if state in _DONE_REACHING_STATES:
                 return CONFIRMED_NULL_SHA_DONE_PATH
+            saw_null_sha = True
             continue
         saw_real_sha = True
 
     if not saw_event:
         return NO_MERGE_EVENT
     if saw_real_sha:
-        return CONTRADICTED_REAL_MERGE_SHA
+        return CONTRADICTED_REAL_MERGE_SHA if saw_null_sha else CLEAN_MERGE_SHA
     return NO_SUCCESSFUL_MERGE_SHA
 
 
@@ -489,6 +510,10 @@ class AuditCoverage(NamedTuple):
     OBSERVABLE SUBSET, never the damaged population. Presenting it as
     complete would be a no-silent-fail-soft violation
     (docs/legibility/design-invariants.md).
+
+    The three signal tiers are counted over TASKS (not over plan records) and
+    partition ``total_tasks`` exactly:
+    ``file_level + lock_level_only + without_plan_signal == total_tasks``.
     """
 
     project_root: str
@@ -575,12 +600,20 @@ def audit_project(project_root: str) -> ProjectAudit:
             # or a different project's id). Counted, never silently dropped.
             continue
         matched_plan_ids.add(task_id)
-        if plan.fidelity == FIDELITY_FILE_LEVEL:
-            file_level += 1
-        else:
-            lock_level_only += 1
 
         for record in matching:
+            # Counted PER MATCHED TASK, not per plan record. One plan record is
+            # keyed by a bare task id, so when the same numeric id exists under
+            # two tags it matches two DISTINCT tasks; counting it once would
+            # leave the second task in the `total - file_level - lock_level`
+            # remainder and report it as having "NO plan signal at all" when it
+            # had one. The coverage block is the honesty artifact here, so an
+            # off-by-N in it undercuts the whole report.
+            if plan.fidelity == FIDELITY_FILE_LEVEL:
+                file_level += 1
+            else:
+                lock_level_only += 1
+
             if record.metadata_files:
                 continue  # files survived — nothing was wiped
             candidates.append(
@@ -655,16 +688,23 @@ def _format_coverage(coverage: AuditCoverage) -> list[str]:
 def format_report(audits: list[ProjectAudit]) -> str:
     """Render *audits* as a grouped, human-readable report.
 
-    Confirmed candidates and CONTRADICTED ones are printed in SEPARATE
-    sections: a contradicted candidate obtained a real merge sha later, so it
-    is a retried failure rather than a wipe and must not be consumed by a
-    repair job alongside the confirmed ones.
+    Reportable candidates and CONTRADICTED ones are printed in SEPARATE
+    sections: a contradicted candidate has BOTH a null-sha row and a real
+    merge sha, i.e. a failed attempt that was retried and landed, so it is not
+    the null-sha wipe and must not be consumed by a repair job alongside the
+    rest. Note that :data:`CLEAN_MERGE_SHA` candidates are deliberately NOT
+    contradicted — see that constant.
 
     The coverage block is emitted for every project, INCLUDING projects with
     zero candidates.
+
+    The trailing summary counts BOTH figures, because ``main()`` exits 1 on
+    any candidate including contradicted ones: a summary that counted only the
+    reportable ones would contradict the exit code on a contradicted-only run.
     """
     lines: list[str] = []
     total_confirmed = 0
+    total_contradicted = 0
     for audit in audits:
         lines.append(f"{audit.project_root}:")
 
@@ -677,6 +717,7 @@ def format_report(audits: list[ProjectAudit]) -> str:
             if c.wipe_signature != CONTRADICTED_REAL_MERGE_SHA
         ]
         total_confirmed += len(confirmed)
+        total_contradicted += len(contradicted)
 
         if confirmed:
             lines.append(f"  -- candidates ({len(confirmed)}) --")
@@ -689,9 +730,10 @@ def format_report(audits: list[ProjectAudit]) -> str:
 
         if contradicted:
             lines.append(
-                f"  -- contradicted ({len(contradicted)}): a null-sha row exists "
-                "but the task later obtained a REAL merge sha (a retried "
-                "failure that landed). NOT confirmed wipes — do not repair. --"
+                f"  -- contradicted ({len(contradicted)}): a null-sha row and a "
+                "REAL merge sha coexist for these tasks (a failed merge attempt "
+                "that was retried and landed), so the null-sha DONE path was "
+                "not what emptied them. NOT confirmed wipes — do not repair. --"
             )
             for candidate in contradicted:
                 lines.append(_format_candidate_line(candidate))
@@ -701,7 +743,9 @@ def format_report(audits: list[ProjectAudit]) -> str:
         lines.extend(_format_coverage(audit.coverage))
 
     lines.append(
-        f"{total_confirmed} candidate(s) across {len(audits)} project(s)"
+        f"{total_confirmed + total_contradicted} candidate(s) across "
+        f"{len(audits)} project(s): {total_confirmed} reportable, "
+        f"{total_contradicted} contradicted (not wipes)"
     )
     return "\n".join(lines)
 
@@ -781,6 +825,12 @@ def _build_parser() -> argparse.ArgumentParser:
             "task, event, or plan record. Remediation is a separate, "
             "individually-reviewed follow-up."
         ),
+        epilog=(
+            "exit codes: 0 = audited, no candidates; 1 = at least one "
+            "candidate found; 2 = no project root resolved to a readable "
+            "tasks.db; 3 = roots resolved but every one failed to audit, so "
+            "NOTHING was scanned (never treat 3 as a clean run)."
+        ),
     )
     parser.add_argument(
         "--project-root", dest="project_roots", action="append",
@@ -815,8 +865,15 @@ def _passes_min_fidelity(candidate: WipeCandidate, min_fidelity: str) -> bool:
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point.
 
-    Exit codes: 0 = no candidates, 1 = at least one candidate found, 2 = no
-    project root resolved to a readable tasks.db.
+    Exit codes: 0 = audited, no candidates; 1 = at least one candidate found;
+    2 = no project root resolved to a readable tasks.db; 3 = roots resolved
+    but EVERY one of them failed to audit, so NOTHING was scanned.
+
+    3 exists because 0 would otherwise be returned for two opposite outcomes —
+    "audited everything, found nothing" and "audited nothing at all" — and a
+    CI/cron consumer reading only the exit code would take a total failure for
+    a clean run. That is exactly the silent fail-soft this module refuses to do
+    (see the module docstring).
 
     A single unreadable project (a corrupt/locked tasks.db) does NOT abort the
     sweep: it is logged to stderr and skipped so every other project is still
@@ -861,6 +918,14 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(format_report(audits))
 
+    if unreadable and not audits:
+        # Nothing was scanned at all — never report that as a clean sweep.
+        print(
+            "error: every resolved project was unreadable; NOTHING was "
+            "audited (this is not a clean result)",
+            file=sys.stderr,
+        )
+        return 3
     return 1 if any(a.candidates for a in audits) else 0
 
 
