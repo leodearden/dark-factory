@@ -1527,8 +1527,8 @@ def build_claude_argv(
             # failing every structured-output call.  When a schema IS requested,
             # expand the wildcard into an explicit real-builtins deny-list that omits
             # ``StructuredOutput`` — keeping "no real tool access" while letting the
-            # schema tool through.  Callers without an output_schema (e.g. judge.py)
-            # keep ``'*'`` verbatim, so all tools stay blocked.  See the deny-list
+            # schema tool through.  A caller that passes no output_schema keeps
+            # ``'*'`` verbatim, so all tools stay blocked.  See the deny-list
             # constant above for the keep-in-sync caveat.
             if output_schema and '*' in disallowed_tools:
                 disallowed_tools = [

@@ -120,6 +120,85 @@ def test_parse_verdict_unparseable_response_is_loud_not_fabricated(mock_journal)
     assert 'Judge response could not be parsed' in verdict.findings[0].get('issue', '')
 
 
+def test_parse_verdict_text_path_invalid_severity_is_loud_not_silent(mock_journal):
+    """A semantically-invalid text payload must fail LOUD, not vanish silently.
+
+    Valid JSON, invalid enum member.  JudgeVerdict construction raises
+    pydantic.ValidationError, which is NOT in _parse_verdict's caught tuple, so
+    today it escapes to review_run's broad `except Exception` and the run silently
+    returns None — no verdict, no halt, no signal.  That violates the repo's
+    loud-over-silent-degradation norm.  It must instead get the same fail-closed
+    treatment as malformed text: severity=serious with the
+    code='unparseable_judge_response' marker (which review_run turns into the
+    truthful 'Unparseable judge response' halt reason).
+
+    Scoped to the RETAINED anthropic/openai text fallback — the claude_cli
+    provider classifies this same condition as cli_output_unparseable infra in
+    _call_judge_cli and never reaches here.
+    """
+    judge = Judge(config=_make_judge_config(), journal=mock_journal)
+
+    verdict = judge._parse_verdict('{"severity": "catastrophic", "findings": []}', 'run-z')
+
+    assert verdict.severity == VerdictSeverity.serious
+    assert len(verdict.findings) == 1
+    assert verdict.findings[0].get('code') == 'unparseable_judge_response'
+
+
+@pytest.mark.parametrize('response', [
+    '[{"severity": "ok", "findings": []}]',   # verdict wrapped in a list
+    '"ok"',                                   # bare JSON string
+    '5',                                      # bare JSON number
+    'null',                                   # JSON null
+])
+def test_parse_verdict_text_path_non_object_json_is_loud_not_silent(mock_journal, response):
+    """A top-level JSON value that is not an OBJECT must fail loud, not vanish.
+
+    Same silent-degradation class as the invalid-severity case above, reached via
+    a different exception type: these all parse cleanly at ``json.loads``, then
+    die on ``data.get(...)`` with an ``AttributeError`` — which was NOT in
+    _parse_verdict's caught tuple, so it escaped to review_run's broad
+    ``except Exception`` and the run returned None with no verdict, no halt and
+    no signal.
+
+    Every shape here is plausible output from a schema-less SDK provider asked
+    for JSON (list-wrapping is a routine LLM habit), and the ``anthropic`` /
+    ``openai`` branches have no ``--json-schema`` mechanism to prevent it.  The
+    ``claude_cli`` provider classifies the same condition as
+    cli_output_unparseable infra in _call_judge_cli and never reaches here.
+    """
+    judge = Judge(config=_make_judge_config(), journal=mock_journal)
+
+    verdict = judge._parse_verdict(response, 'run-nonobj')
+
+    assert verdict.severity == VerdictSeverity.serious
+    assert len(verdict.findings) == 1
+    assert verdict.findings[0].get('code') == 'unparseable_judge_response'
+
+
+def test_parse_verdict_accepts_structured_payload_dict(mock_journal):
+    """_parse_verdict accepts an already-structured payload dict and skips text parsing.
+
+    The claude_cli provider now hands _parse_verdict the validated
+    ``structured_output`` payload instead of prose, so the fence-stripping +
+    json.loads text path must not be involved.  Proven by the ``findings`` value:
+    a list-of-dicts survives verbatim, which no text-parsing route could produce
+    from a dict input (it would raise AttributeError on ``.strip()``).  The
+    ``summary`` key is dropped on construction, exactly as on the text path.
+    """
+    judge = Judge(config=_make_judge_config(), journal=mock_journal)
+
+    verdict = judge._parse_verdict(
+        {'severity': 'moderate', 'findings': [{'issue': 'y'}], 'summary': 'ignored'},
+        'run-x',
+    )
+
+    assert verdict.severity == VerdictSeverity.moderate
+    assert verdict.findings == [{'issue': 'y'}]
+    assert verdict.action_taken == VerdictAction.none
+    assert verdict.run_id == 'run-x'
+
+
 @pytest.mark.parametrize('empty_text', ['', '   ', '\n\t '])
 def test_parse_verdict_empty_response_stays_benign_not_serious(mock_journal, empty_text):
     """Empty (or whitespace-only) judge output must NOT be treated as a loud
@@ -961,16 +1040,20 @@ class TestJudgeCooldownExpired:
 
 @pytest.mark.asyncio
 async def test_call_judge_cli_delegates_to_invoke_with_cap_retry(mock_journal):
-    """_call_judge_cli delegates to invoke_with_cap_retry (no output_schema — free-form text).
+    """_call_judge_cli delegates to invoke_with_cap_retry, carrying the verdict schema.
 
     Verifies the essential delegation contract: prompt, system_prompt, model,
-    usage_gate, and timeout are wired through correctly.  Fine-grained knobs
-    (max_turns, permission_mode, disallowed_tools) are implementation details
-    covered by shared/tests/test_cli_invoke.py.
+    usage_gate, output_schema, and timeout are wired through correctly.
+    Fine-grained knobs (max_turns, permission_mode, disallowed_tools) are
+    implementation details covered by shared/tests/test_cli_invoke.py and, for
+    the schema-carrying invariants specifically, by
+    test_call_judge_cli_passes_judge_verdict_schema below.
     """
     from unittest.mock import AsyncMock
 
     from shared.cli_invoke import AgentResult
+
+    from fused_memory.reconciliation.judge import JUDGE_VERDICT_SCHEMA
 
     fake_gate = make_gate_mock()
     config = _make_judge_config(
@@ -982,6 +1065,7 @@ async def test_call_judge_cli_delegates_to_invoke_with_cap_retry(mock_journal):
     fake_result = AgentResult(
         success=True,
         output='{"severity": "ok", "findings": []}',
+        structured_output={'severity': 'ok', 'findings': []},
         session_id='jsess-1',
     )
 
@@ -1004,7 +1088,7 @@ async def test_call_judge_cli_delegates_to_invoke_with_cap_retry(mock_journal):
     assert call_kwargs['system_prompt'] == JUDGE_SYSTEM_PROMPT
     assert call_kwargs['model'] == config.judge_llm_model
     assert call_kwargs['timeout_seconds'] == float(config.judge_cli_timeout_seconds)
-    assert 'output_schema' not in call_kwargs  # judge output is free-form, no schema
+    assert call_kwargs['output_schema'] is JUDGE_VERDICT_SCHEMA
     assert call_kwargs['cwd'] == Path(config.explore_codebase_root)
 
     # usage_gate may be positional or keyword — accept either
@@ -1013,7 +1097,153 @@ async def test_call_judge_cli_delegates_to_invoke_with_cap_retry(mock_journal):
     else:
         assert call_positional[0] is fake_gate
 
-    assert result == '{"severity": "ok", "findings": []}'
+    # The verdict comes from the structured payload, not the text channel.
+    assert result == {'severity': 'ok', 'findings': []}
+
+
+@pytest.mark.asyncio
+async def test_call_judge_cli_passes_judge_verdict_schema(mock_journal):
+    """The judge's verdict contract rides ``output_schema``, not the system prompt.
+
+    This is the whole point of the migration: ``build_claude_argv`` emits
+    ``--json-schema`` UNCONDITIONALLY (cli_invoke.py:1552-1553) while it drops
+    ``--system-prompt-file`` on the resume path (:1501-1503).  A prose-only
+    contract is therefore droppable across a cap-retry resume; a schema-carried
+    one is not.  Pinned here at the invocation boundary:
+
+    - ``output_schema is JUDGE_VERDICT_SCHEMA`` — the contract is attached.
+    - ``disallowed_tools == ['*']`` — the judge keeps passing the wildcard
+      VERBATIM.  Expanding it into the ``StructuredOutput``-preserving
+      real-builtins deny-list is cli_invoke's job (:1533-1536), not the
+      caller's, so the judge inherits future central fixes instead of pinning a
+      stale copy of the CLI's built-in list.
+    - ``max_turns >= 3`` — the schema mechanism burns a tool-use turn, so
+      ``max_turns=1`` is incompatible with ``--json-schema``
+      (task_curator.py:2366-2372); 3 is the floor both migrated siblings use.
+    - ``system_prompt`` is unchanged — JUDGE_SYSTEM_PROMPT's "## Output Format"
+      block stays because it is the ONLY output contract the anthropic/openai
+      provider branches have (they never see ``--json-schema``).
+    """
+    from unittest.mock import AsyncMock
+
+    from shared.cli_invoke import AgentResult
+
+    from fused_memory.reconciliation.judge import JUDGE_VERDICT_SCHEMA
+
+    fake_gate = make_gate_mock()
+    config = _make_judge_config(
+        judge_llm_provider='claude_cli',
+        judge_llm_model='claude-sonnet-4-5',
+    )
+    judge = Judge(config=config, journal=mock_journal, usage_gate=fake_gate)
+
+    fake_result = AgentResult(
+        success=True,
+        output='',
+        structured_output={'severity': 'ok', 'findings': []},
+        session_id='jsess-1',
+    )
+
+    with patch(
+        'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+        new_callable=AsyncMock,
+        return_value=fake_result,
+    ) as mock_invoke:
+        await judge._call_judge_cli('Evaluate this run.')
+
+    call_kwargs = mock_invoke.call_args.kwargs
+    assert call_kwargs['output_schema'] is JUDGE_VERDICT_SCHEMA
+    assert call_kwargs['disallowed_tools'] == ['*']
+    assert call_kwargs['max_turns'] >= 3, (
+        'max_turns=1 is incompatible with --json-schema: the schema mechanism '
+        'burns a tool-use turn and the CLI returns error_max_turns even when '
+        'the payload is attached (task_curator.py:2366-2372)'
+    )
+    assert call_kwargs['system_prompt'] == JUDGE_SYSTEM_PROMPT
+
+
+def test_judge_verdict_schema_shape():
+    """JUDGE_VERDICT_SCHEMA matches the verdict the judge is asked to produce.
+
+    The severity enum is pinned against a LITERAL set, not against
+    ``VerdictSeverity``: the schema builds its enum from that very enum
+    (``_VERDICT_SEVERITY_VALUES``), so asserting the two agree can never fail and
+    is not coverage.  Pinning the literal is what actually catches something —
+    either a silent widening of VerdictSeverity or the schema quietly ceasing to
+    derive from it.
+    """
+    from fused_memory.reconciliation.judge import JUDGE_VERDICT_SCHEMA
+
+    assert JUDGE_VERDICT_SCHEMA['type'] == 'object'
+    assert 'severity' in JUDGE_VERDICT_SCHEMA['required']
+    assert 'findings' in JUDGE_VERDICT_SCHEMA['required']
+
+    properties = JUDGE_VERDICT_SCHEMA['properties']
+    assert set(properties['severity']['enum']) == {'ok', 'minor', 'moderate', 'serious'}
+    assert properties['findings']['type'] == 'array'
+
+
+@pytest.mark.asyncio
+async def test_call_judge_cli_returns_structured_payload_ignoring_prose(mock_journal):
+    """The verdict is read from structured_output — model prose is NOT the verdict.
+
+    ``output`` here is the literal 2026-07-25 transcript shape: conversational
+    prose with an italic stage-direction, produced after a cap-retry resume
+    dropped the system prompt.  Parsing THAT as the verdict is what fabricated a
+    ``severity=serious`` halt for a run nobody had reviewed.  The payload wins.
+    """
+    from unittest.mock import AsyncMock
+
+    from shared.cli_invoke import AgentResult
+
+    config = _make_judge_config(
+        judge_llm_provider='claude_cli',
+        judge_llm_model='claude-sonnet-4-5',
+    )
+    judge = Judge(config=config, journal=mock_journal, usage_gate=make_gate_mock())
+
+    payload = {'severity': 'moderate', 'findings': [{'issue': 'x', 'severity': 'moderate'}]}
+    result = AgentResult(
+        success=True,
+        output="I'll check the repo for context...\n\n*Searches project files*",
+        structured_output=payload,
+    )
+
+    with patch(
+        'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+        new=AsyncMock(return_value=result),
+    ):
+        assert await judge._call_judge_cli('p') == payload
+
+
+@pytest.mark.asyncio
+async def test_call_judge_cli_json_string_structured_output_is_loaded(mock_journal):
+    """A structured_output delivered as a JSON *string* is json.loads-ed to a dict.
+
+    Parity with agent_loop.py:388-392, the sibling that already consumes
+    ``structured_output`` from this same shared path.
+    """
+    from unittest.mock import AsyncMock
+
+    from shared.cli_invoke import AgentResult
+
+    config = _make_judge_config(
+        judge_llm_provider='claude_cli',
+        judge_llm_model='claude-sonnet-4-5',
+    )
+    judge = Judge(config=config, journal=mock_journal, usage_gate=make_gate_mock())
+
+    result = AgentResult(
+        success=True,
+        output='',
+        structured_output='{"severity": "ok", "findings": []}',
+    )
+
+    with patch(
+        'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+        new=AsyncMock(return_value=result),
+    ):
+        assert await judge._call_judge_cli('p') == {'severity': 'ok', 'findings': []}
 
 
 @pytest.mark.asyncio
@@ -1075,9 +1305,12 @@ async def test_call_judge_cli_forwards_cwd_to_invoke_claude_agent(mock_journal, 
         explore_codebase_root=explore_root,
     )
 
+    # A usable structured payload: a success carrying none is now classified as
+    # cli_output_empty infra, which would mask this test's kwargs assertion.
     fake_result = AgentResult(
         success=True,
-        output='{"severity": "ok"}',
+        output='',
+        structured_output={'severity': 'ok', 'findings': []},
         session_id='jsess-cwd',
     )
 
@@ -1182,8 +1415,12 @@ class TestJudgeCapWaitSanityBound:
         )
         mock_jrnl = MagicMock()
         judge = Judge(config=config, journal=mock_jrnl, usage_gate=make_gate_mock())
-        empty_result = AgentResult(success=True, output='')
-        mock = AsyncMock(return_value=empty_result)
+        # A usable structured payload: a success carrying none is now classified
+        # as cli_output_empty infra, which would mask this test's kwargs assertion.
+        ok_result = AgentResult(
+            success=True, output='', structured_output={'severity': 'ok', 'findings': []},
+        )
+        mock = AsyncMock(return_value=ok_result)
         with patch(
             'fused_memory.reconciliation.judge.invoke_with_cap_retry',
             new=mock,
@@ -1267,17 +1504,27 @@ class TestCallJudgeCliTaxonomy:
             assert await judge._call_judge_cli('prompt') == ''
 
     @pytest.mark.asyncio
-    async def test_success_returns_stripped_output(self):
-        """(d) A successful run returns result.output.strip()."""
+    async def test_success_returns_structured_payload(self):
+        """(d) A successful run returns the validated structured_output payload.
+
+        Replaces the retired ``result.output.strip()`` contract: the model's text
+        channel is no longer the verdict.  A success carrying NO usable payload is
+        a distinct case (infra, not content) — see
+        TestCallJudgeCliStructuredOutputTaxonomy.
+        """
         from shared.cli_invoke import AgentResult
 
         judge = self._judge()
-        result = AgentResult(success=True, output='  {"severity": "ok"}  \n')
+        result = AgentResult(
+            success=True,
+            output='  prose the CLI happened to print  \n',
+            structured_output={'severity': 'ok', 'findings': []},
+        )
         with patch(
             'fused_memory.reconciliation.judge.invoke_with_cap_retry',
             new=AsyncMock(return_value=result),
         ):
-            assert await judge._call_judge_cli('prompt') == '{"severity": "ok"}'
+            assert await judge._call_judge_cli('prompt') == {'severity': 'ok', 'findings': []}
 
     @pytest.mark.asyncio
     async def test_all_accounts_capped_raises_judge_infra_error(self):
@@ -1295,6 +1542,471 @@ class TestCallJudgeCliTaxonomy:
             new=AsyncMock(side_effect=AllAccountsCappedException(3, 1800.0, 'judge')),
         ), pytest.raises(JudgeInfraError):
             await judge._call_judge_cli('prompt')
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('subtype', ['error_max_turns', 'error_empty_output'])
+    async def test_schema_tool_denied_gets_its_own_code(self, subtype):
+        """(f) A blocked ``StructuredOutput`` tool is a systemic config break with
+        its own machine-readable code, not an anonymous UNKNOWN failure.
+
+        ``--json-schema`` rides the synthetic ``StructuredOutput`` tool, which
+        cli_invoke's wildcard expansion deliberately omits from
+        ``_REAL_BUILTIN_TOOLS_DENYLIST``.  If a future CLI change starts denying
+        it, EVERY judge run is starved of its verdict — the deny-list needs
+        fixing, and the log has to say so.  cli_invoke can only ever set
+        ``schema_tool_denied`` on a NON-success result (cli_invoke.py:1807 guards
+        on ``not is_success``), so the detection has to live on this branch;
+        checking it on the success branch is dead code.
+
+        The ``error_empty_output`` case is the ordering pin: a denial whose stdout
+        happens to be empty must NOT fall through to the benign ''
+        legacy contract.  Nothing was reviewed.
+        """
+        from shared.cli_invoke import AgentResult
+
+        from fused_memory.reconciliation.judge import JudgeInfraError
+
+        judge = self._judge()
+        result = AgentResult(
+            success=False,
+            output='',
+            subtype=subtype,
+            api_error_status=None,
+            timed_out=False,
+            schema_tool_denied=True,
+        )
+        with patch(
+            'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+            new=AsyncMock(return_value=result),
+        ), pytest.raises(JudgeInfraError) as exc_info:
+            await judge._call_judge_cli('prompt')
+        assert exc_info.value.code == 'cli_schema_tool_denied'
+        assert 'cli_schema_tool_denied' in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_ordinary_transport_failure_carries_no_code(self):
+        """(g) The new code is SPECIFIC: an ordinary transport failure keeps the
+        generic build_failure_message dump and a ``code`` of None, so
+        _handle_infra_failure's log can tell a deny-list break apart from a
+        run-of-the-mill api_error."""
+        from shared.cli_invoke import AgentResult
+
+        from fused_memory.reconciliation.judge import JudgeInfraError
+
+        judge = self._judge()
+        result = AgentResult(success=False, output='', api_error_status=429)
+        with patch(
+            'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+            new=AsyncMock(return_value=result),
+        ), pytest.raises(JudgeInfraError) as exc_info:
+            await judge._call_judge_cli('prompt')
+        assert exc_info.value.code is None
+
+
+# ─────────────────────────────────────────────────────────────────────
+# _call_judge_cli: success with NO usable verdict is INFRA, not content
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestCallJudgeCliStructuredOutputTaxonomy:
+    """A CLI success that carries no usable verdict is an INFRA failure.
+
+    This is the exact 2947 residual this task closes.  The 2026-07-25 halt came
+    from a cap-retry SUCCESS — exit 0, is_error=false, 727 output tokens — whose
+    text channel held conversational prose because the resume dropped the system
+    prompt.  Nothing was reviewed, so there is no verdict to trust; classifying it
+    as fail-closed malformed CONTENT fabricated a severity=serious halt that lied
+    about a review that never happened.
+
+    No verdict exists => JudgeInfraError => review_run's bounded backoff and a
+    truthful 'judge-unreachable' halt only at threshold.  Deliberately kept
+    DISTINCT from case (g): the benign exit-0/empty-stdout legacy contract.
+    """
+
+    def _judge(self):
+        config = _make_judge_config(
+            judge_llm_provider='claude_cli',
+            judge_llm_model='claude-sonnet-4-5',
+        )
+        return Judge(config=config, journal=MagicMock(), usage_gate=make_gate_mock())
+
+    async def _raises(self, result):
+        """Invoke _call_judge_cli against *result*, returning the JudgeInfraError."""
+        from fused_memory.reconciliation.judge import JudgeInfraError
+
+        judge = self._judge()
+        with patch(
+            'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+            new=AsyncMock(return_value=result),
+        ), pytest.raises(JudgeInfraError) as exc_info:
+            await judge._call_judge_cli('prompt')
+        return exc_info.value
+
+    @pytest.mark.asyncio
+    async def test_missing_structured_output_is_cli_output_empty(self):
+        """(a) success + structured_output=None, with the 07-25 prose in `output`:
+        the prose is NOT a verdict — this is cli_output_empty infra."""
+        from shared.cli_invoke import AgentResult
+
+        err = await self._raises(AgentResult(
+            success=True,
+            output="I'll check the repo for context...\n\n*Searches project files*",
+            output_tokens=727,
+        ))
+        assert err.code == 'cli_output_empty'
+        assert 'cli_output_empty' in str(err)
+
+    @pytest.mark.asyncio
+    async def test_empty_dict_structured_output_is_cli_output_empty(self):
+        """(b) success + structured_output={} carries no verdict either."""
+        from shared.cli_invoke import AgentResult
+
+        err = await self._raises(AgentResult(success=True, output='', structured_output={}))
+        assert err.code == 'cli_output_empty'
+
+    @pytest.mark.asyncio
+    async def test_unparseable_json_string_is_cli_output_unparseable(self):
+        """(c) A structured_output string that is not valid JSON must raise
+        JudgeInfraError, NOT let json.loads' JSONDecodeError escape into
+        review_run's broad except (which would silently return None)."""
+        from shared.cli_invoke import AgentResult
+
+        err = await self._raises(
+            AgentResult(success=True, output='', structured_output='not json {{{')
+        )
+        assert err.code == 'cli_output_unparseable'
+
+    @pytest.mark.asyncio
+    async def test_non_dict_non_str_payload_is_cli_output_unparseable(self):
+        """(d) A list (or any non-dict) payload is a wrong-typed verdict."""
+        from shared.cli_invoke import AgentResult
+
+        err = await self._raises(
+            AgentResult(success=True, output='', structured_output=['a', 'list'])
+        )
+        assert err.code == 'cli_output_unparseable'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('payload', [
+        {'findings': []},                              # severity missing
+        {'severity': 'catastrophic', 'findings': []},  # severity outside the enum
+    ])
+    async def test_bad_severity_is_cli_output_unparseable(self, payload):
+        """(e) A payload whose severity is missing or outside VerdictSeverity is
+        not a verdict we can act on — do not normalise it silently."""
+        from shared.cli_invoke import AgentResult
+
+        err = await self._raises(
+            AgentResult(success=True, output='', structured_output=payload)
+        )
+        assert err.code == 'cli_output_unparseable'
+
+    @pytest.mark.asyncio
+    async def test_non_list_findings_is_cli_output_unparseable(self):
+        """(f) findings must be a list: JudgeVerdict construction would otherwise
+        raise a pydantic ValidationError that review_run's broad except would
+        swallow into a silent None — no verdict, no halt, no signal."""
+        from shared.cli_invoke import AgentResult
+
+        err = await self._raises(AgentResult(
+            success=True, output='', structured_output={'severity': 'ok', 'findings': 'not-a-list'},
+        ))
+        assert err.code == 'cli_output_unparseable'
+
+    @pytest.mark.asyncio
+    async def test_non_dict_findings_items_is_cli_output_unparseable(self):
+        """A findings LIST whose ITEMS are not dicts is still not a usable verdict.
+
+        ``JudgeVerdict.findings`` is ``list[dict]``
+        (models/reconciliation.py:241), so a list of bare strings passes the
+        findings-is-a-list guard and then dies as a pydantic ValidationError
+        inside _verdict_from_payload — uncaught on the dict branch of
+        _parse_verdict, hence swallowed by review_run's broad except into a
+        silent None with NO infra accounting (the streak is popped one line
+        before _parse_verdict runs).
+
+        severity='serious' is deliberate: this is the exact payload shape that
+        would otherwise produce the phantom halt this whole task exists to
+        prevent.
+        """
+        from shared.cli_invoke import AgentResult
+
+        err = await self._raises(AgentResult(
+            success=True,
+            output='prose',
+            structured_output={'severity': 'serious', 'findings': ['a bare string finding']},
+            output_tokens=727,
+        ))
+        assert err.code == 'cli_output_unparseable'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('payload', [
+        {'severity': 'ok', 'findings': [{'issue': 'x'}]},
+        {'severity': 'ok', 'findings': []},
+    ])
+    async def test_findings_dict_items_are_accepted(self, payload):
+        """The guard must not be over-broad: a well-formed findings list is
+        RETURNED, not raised.  Without this pin, the fix above could be
+        'satisfied' by rejecting every payload that has findings at all."""
+        from shared.cli_invoke import AgentResult
+
+        judge = self._judge()
+        with patch(
+            'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+            new=AsyncMock(return_value=AgentResult(
+                success=True, output='', structured_output=payload,
+            )),
+        ):
+            assert await judge._call_judge_cli('prompt') == payload
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('payload', [
+        {'severity': 'ok', 'findings': [['nested', 'list']]},
+        {'severity': 'ok', 'findings': [None]},
+    ])
+    async def test_every_judge_verdict_field_constraint_is_enforced(self, payload):
+        """GENERALISATION GUARD — structurally plausible payloads that violate a
+        JudgeVerdict field constraint no hand-written guard above checks.
+
+        This is what forces validation to run CENTRALLY against the real model
+        rather than accreting one more hand-mirrored isinstance() check that the
+        next field added to JudgeVerdict would slip straight past.
+        """
+        from shared.cli_invoke import AgentResult
+
+        err = await self._raises(
+            AgentResult(success=True, output='prose', structured_output=payload)
+        )
+        assert err.code == 'cli_output_unparseable'
+
+    @pytest.mark.asyncio
+    async def test_genuine_empty_output_is_not_conflated_with_infra(self):
+        """(g) REGRESSION GUARD — the benign exit-0/empty-stdout legacy contract
+        ('empty stdout = valid empty verdict') still returns '' and must NOT be
+        raised as infra.  This is a NON-success result whose failure kind is
+        EMPTY_OUTPUT, categorically different from (a)-(f) above, which are all
+        SUCCESSES carrying no usable payload."""
+        from shared.cli_invoke import AgentResult
+
+        judge = self._judge()
+        result = AgentResult(
+            success=False,
+            output='',
+            subtype='error_empty_output',
+            api_error_status=None,
+            timed_out=False,
+        )
+        with patch(
+            'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+            new=AsyncMock(return_value=result),
+        ):
+            # Explicitly must NOT raise.
+            assert await judge._call_judge_cli('prompt') == ''
+
+
+class TestReviewRunNoStructuredVerdict:
+    """review_run treats a no-verdict CLI success as bounded-backoff infra.
+
+    THE headline user-observable signal of this task: a cap-storm resume no
+    longer writes a fabricated severity=serious row into judge_verdicts nor a
+    halt_state row whose reason starts 'Unparseable judge response'.
+    """
+
+    def _setup(self, mock_journal, project_id, **cfg):
+        from fused_memory.models.reconciliation import (
+            ReconciliationRun,
+            RunStatus,
+            RunType,
+        )
+
+        config = _make_judge_config(
+            judge_llm_provider='claude_cli',
+            judge_llm_model='claude-sonnet-4-5',
+            **cfg,
+        )
+        judge = Judge(config=config, journal=mock_journal, usage_gate=make_gate_mock())
+        run = ReconciliationRun(
+            id='run-nostruct',
+            project_id=project_id,
+            run_type=RunType.full,
+            trigger_reason='buffer_size:3',
+            started_at=datetime.now(UTC),
+            events_processed=3,
+            status=RunStatus.completed,
+            stage_reports={},
+        )
+        mock_journal.get_run = AsyncMock(return_value=run)
+        mock_journal.get_run_actions_combined = AsyncMock(return_value=[])
+        return judge
+
+    @staticmethod
+    def _prose_success():
+        """The literal 2026-07-25 shape: exit 0, is_error=false, real output
+        tokens, conversational prose, NO structured payload."""
+        from shared.cli_invoke import AgentResult
+
+        return AgentResult(
+            success=True,
+            output="I'll check the repo for context...\n\n*Searches project files*",
+            session_id='jsess-cap',
+            output_tokens=727,
+        )
+
+    @staticmethod
+    def _non_dict_findings_success():
+        """A success whose payload passes every hand-written guard but violates
+        ``JudgeVerdict.findings: list[dict]`` — the reviewer-confirmed hole."""
+        from shared.cli_invoke import AgentResult
+
+        return AgentResult(
+            success=True,
+            output='prose',
+            structured_output={'severity': 'serious', 'findings': ['a bare string finding']},
+            session_id='jsess-cap',
+            output_tokens=727,
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_dict_findings_success_is_counted_as_infra(self, mock_journal):
+        """A model-invalid structured payload must be COUNTED, not vanish.
+
+        Before the central validation probe, this payload produced "no verdict,
+        no halt, AND no signal": the ValidationError escaped _parse_verdict's
+        dict branch into review_run's broad except, and the infra streak had
+        already been popped one line earlier — so the occurrence never counted
+        toward judge_infra_max_consecutive_failures and no halt could EVER fire.
+        """
+        judge = self._setup(
+            mock_journal, 'proj-nostruct-findings',
+            halt_on_judge_serious=True, judge_infra_max_consecutive_failures=3,
+        )
+        with patch(
+            'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+            new=AsyncMock(return_value=self._non_dict_findings_success()),
+        ):
+            first = await judge.review_run('run-nostruct')
+
+            # First occurrence: still no fabricated severity=serious row.
+            assert first is None
+            mock_journal.add_verdict.assert_not_called()
+            mock_journal.set_halt.assert_not_called()
+            assert judge.is_halted('proj-nostruct-findings') is False
+
+            for _ in range(2):
+                await judge.review_run('run-nostruct')
+
+        # The assertion the reviewer's finding turns on: the occurrences are
+        # COUNTED, so the third consecutive one halts — truthfully.
+        assert judge.is_halted('proj-nostruct-findings')
+        reason = judge.halt_reason('proj-nostruct-findings')
+        assert reason is not None
+        assert reason.startswith('judge-unreachable halt')
+        assert 'Serious verdict' not in reason
+        assert 'Unparseable judge response' not in reason
+        mock_journal.add_verdict.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_first_occurrence_stamps_no_verdict_and_does_not_halt(self, mock_journal):
+        """(h) First no-verdict success: no verdict row, no halt_state row, not
+        halted.  Before this task it stamped a fabricated severity=serious verdict
+        and halted the project on the very first occurrence."""
+        judge = self._setup(
+            mock_journal, 'proj-nostruct-a',
+            halt_on_judge_serious=True, judge_infra_max_consecutive_failures=3,
+        )
+        with patch(
+            'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+            new=AsyncMock(return_value=self._prose_success()),
+        ):
+            verdict = await judge.review_run('run-nostruct')
+
+        assert verdict is None
+        mock_journal.add_verdict.assert_not_called()
+        mock_journal.set_halt.assert_not_called()
+        assert judge.is_halted('proj-nostruct-a') is False
+
+    @pytest.mark.asyncio
+    async def test_third_consecutive_occurrence_halts_truthfully(self, mock_journal):
+        """(i) At threshold the halt fires, but with the TRUTHFUL
+        'judge-unreachable halt' reason — never 'Serious verdict' (a review that
+        never happened) and never 'Unparseable judge response' (reachable
+        malformed content, which this is not) — and still stamps no verdict."""
+        judge = self._setup(
+            mock_journal, 'proj-nostruct-b',
+            halt_on_judge_serious=True, judge_infra_max_consecutive_failures=3,
+        )
+        with patch(
+            'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+            new=AsyncMock(return_value=self._prose_success()),
+        ):
+            for _ in range(3):
+                await judge.review_run('run-nostruct')
+
+        assert judge.is_halted('proj-nostruct-b')
+        reason = judge.halt_reason('proj-nostruct-b')
+        assert reason is not None
+        assert reason.startswith('judge-unreachable halt')
+        assert 'Serious verdict' not in reason
+        assert 'Unparseable judge response' not in reason
+        mock_journal.add_verdict.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_genuine_serious_structured_verdict_still_halts(self, mock_journal):
+        """PRESERVE task 2947's intent: a REAL severity=serious payload still halts.
+
+        If this fails, the no-verdict classification over-reached and started
+        treating genuine content verdicts as infra — do NOT 'fix' this test.
+        """
+        from shared.cli_invoke import AgentResult
+
+        judge = self._setup(
+            mock_journal, 'proj-genuine-struct', halt_on_judge_serious=True,
+        )
+        payload = {
+            'severity': 'serious',
+            'findings': [{'issue': 'mass incorrect deletions', 'severity': 'serious'}],
+        }
+        with patch(
+            'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+            new=AsyncMock(return_value=AgentResult(
+                success=True, output='', structured_output=payload,
+            )),
+        ):
+            verdict = await judge.review_run('run-nostruct')
+
+        assert verdict is not None
+        assert verdict.severity == VerdictSeverity.serious
+        assert verdict.action_taken == VerdictAction.halt
+        mock_journal.add_verdict.assert_called_once()
+        assert judge.is_halted('proj-genuine-struct')
+        reason = judge.halt_reason('proj-genuine-struct')
+        assert reason == 'Serious verdict in run run-nostruct'
+        assert 'judge-unreachable' not in reason
+        assert 'Unparseable judge response' not in reason
+
+    @pytest.mark.asyncio
+    async def test_moderate_structured_verdict_still_recommends_rollback(self, mock_journal):
+        """PRESERVE: a REAL severity=moderate payload still recommends rollback,
+        and does not halt."""
+        from shared.cli_invoke import AgentResult
+
+        judge = self._setup(
+            mock_journal, 'proj-moderate-struct', halt_on_judge_serious=True,
+        )
+        payload = {'severity': 'moderate', 'findings': [{'issue': 'drifted entry'}]}
+        with patch(
+            'fused_memory.reconciliation.judge.invoke_with_cap_retry',
+            new=AsyncMock(return_value=AgentResult(
+                success=True, output='', structured_output=payload,
+            )),
+        ):
+            verdict = await judge.review_run('run-nostruct')
+
+        assert verdict is not None
+        assert verdict.severity == VerdictSeverity.moderate
+        assert verdict.action_taken == VerdictAction.rollback
+        assert judge.is_halted('proj-moderate-struct') is False
+        mock_journal.set_halt.assert_not_called()
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1593,3 +2305,124 @@ async def test_halt_reason_cleared_on_unhalt(mock_journal):
 
     await judge.unhalt('proj-unhalt-reason')
     assert judge.halt_reason('proj-unhalt-reason') is None
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Acceptance regression: the 2026-07-25 cap-retry resume (task 3067)
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestJudgeCapRetryResumeKeepsVerdictContract:
+    """Replays the 2026-07-25 429-then-succeed sequence end to end.
+
+    Nothing inside judge.py is patched — the REAL _call_judge_cli drives the REAL
+    invoke_with_cap_retry, with only shared.cli_invoke.invoke_claude_agent (and the
+    cap cooldown sleep) mocked. That is the point: the resume branch at
+    cli_invoke.py:1270-1272 must be exercised for real.
+
+    The load-bearing assertion is that the RESUMED invocation still carries
+    output_schema. build_claude_argv drops --system-prompt-file on the resume path
+    (cli_invoke.py:1501-1503) but emits --json-schema unconditionally (:1552-1553),
+    so a prose-only verdict contract evaporates on resume while a schema-carried
+    one survives. On 2026-07-25 the resumed judge answered in prose and
+    _parse_verdict fabricated it into a severity=serious halt of a project nobody
+    had reviewed.
+
+    MUTATION CHECK (verified locally before committing): deleting
+    ``output_schema=JUDGE_VERDICT_SCHEMA`` from _call_judge_cli must make
+    assertion 1 fail. If it does not, this test is not pinning what it claims.
+    """
+
+    def _judge(self, mock_journal, project_id):
+        from fused_memory.models.reconciliation import (
+            ReconciliationRun,
+            RunStatus,
+            RunType,
+        )
+
+        config = _make_judge_config(
+            judge_llm_provider='claude_cli',
+            judge_llm_model='claude-sonnet-4-5',
+            halt_on_judge_serious=True,
+        )
+        gate = make_gate_mock(
+            account_count=2,
+            before_invoke=AsyncMock(side_effect=['tok-a', 'tok-b']),
+            detect_cap_hit=MagicMock(side_effect=[True, False]),
+            active_account_name='acct-b',
+        )
+        judge = Judge(config=config, journal=mock_journal, usage_gate=gate)
+        run = ReconciliationRun(
+            id='run-cap-resume',
+            project_id=project_id,
+            run_type=RunType.full,
+            trigger_reason='buffer_size:3',
+            started_at=datetime.now(UTC),
+            events_processed=3,
+            status=RunStatus.completed,
+            stage_reports={},
+        )
+        mock_journal.get_run = AsyncMock(return_value=run)
+        mock_journal.get_run_actions_combined = AsyncMock(return_value=[])
+        return judge
+
+    @pytest.mark.asyncio
+    async def test_429_then_succeed_yields_a_real_verdict_and_no_halt(self, mock_journal):
+        from shared.cli_invoke import CAP_HIT_RESUME_PROMPT, AgentResult
+
+        from fused_memory.reconciliation.judge import JUDGE_VERDICT_SCHEMA
+
+        judge = self._judge(mock_journal, 'proj-cap-resume')
+
+        # First attempt: capped (429) but carrying a session id, so the loop takes
+        # the RESUME branch rather than restarting fresh.
+        capped = AgentResult(
+            success=False, output='', cost_usd=0.0,
+            api_error_status=429, session_id='jsess-cap',
+        )
+        # The resumed attempt succeeds with a real payload — and, exactly as on
+        # 2026-07-25, an empty text channel is no obstacle because the verdict no
+        # longer lives there.
+        ok = AgentResult(
+            success=True, output='',
+            structured_output={'severity': 'ok', 'findings': []},
+            session_id='jsess-cap', output_tokens=727,
+        )
+
+        with (
+            patch(
+                'shared.cli_invoke.invoke_claude_agent',
+                new_callable=AsyncMock, side_effect=[capped, ok],
+            ) as mock_agent,
+            patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock),
+        ):
+            verdict = await judge.review_run('run-cap-resume')
+
+        # 1. The resume happened, and the verdict contract survived it.
+        assert mock_agent.call_count == 2
+        second = mock_agent.call_args_list[1].kwargs
+        assert second['resume_session_id'] == 'jsess-cap'
+        assert second['prompt'] == CAP_HIT_RESUME_PROMPT
+        assert second['output_schema'] is JUDGE_VERDICT_SCHEMA, (
+            'the resumed invocation must still carry the verdict schema — the '
+            'system prompt is dropped on resume, the schema is not'
+        )
+
+        # 2. A real, parseable verdict came back.
+        assert verdict is not None
+        assert verdict.severity == VerdictSeverity.ok
+        assert verdict.action_taken == VerdictAction.none
+
+        # 3. No halt_state row, project not halted.
+        mock_journal.set_halt.assert_not_called()
+        assert judge.is_halted('proj-cap-resume') is False
+
+        # 4. The judge_verdicts row is a real verdict, not a fabricated one.
+        mock_journal.add_verdict.assert_called_once()
+        stamped = mock_journal.add_verdict.call_args.args[0]
+        assert all(
+            'could not be parsed' not in f.get('issue', '') for f in stamped.findings
+        )
+        assert all(
+            f.get('code') != 'unparseable_judge_response' for f in stamped.findings
+        )
