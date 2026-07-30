@@ -846,6 +846,100 @@ class TestFormatCompositeTable:
         # No wall-clock / dict-order dependence: same report → identical bytes.
         assert format_composite_table(report) == format_composite_table(report)
 
+    # -- task 3099: the plan-only columns ---------------------------------
+
+    def _arch_report(self):
+        from orchestrator.evals.report import build_composite_report
+
+        return build_composite_report(
+            [
+                _arch('p1', 'arch-good', tr, plan_quality=0.9, cost_usd=0.3,
+                      duration_ms=60000)
+                for tr in (1, 2, 3)
+            ] + [
+                _arch('p1', 'arch-weak', tr, plan_quality=0.4, cost_usd=0.3,
+                      duration_ms=60000)
+                for tr in (1, 2, 3)
+            ] + [
+                # Every trial tainted → nothing measured at all.
+                _arch('p1', 'arch-dark', tr, plan_quality=None, cost_usd=0.0,
+                      duration_ms=0, cap_tainted=True)
+                for tr in (1, 2, 3)
+            ] + [
+                # One tainted trial among healthy ones → an exclusion COUNT.
+                _arch('p1', 'arch-mixed', 1, plan_quality=None, cost_usd=0.0,
+                      duration_ms=0, cap_tainted=True),
+                _arch('p1', 'arch-mixed', 2, plan_quality=0.7, cost_usd=0.3,
+                      duration_ms=60000),
+            ] + [
+                _mresult('p2', 'impl-a', 1, quality=1.0, cost_usd=5.0,
+                         duration_ms=900000, tests_pass=True),
+            ],
+        )
+
+    def _row(self, out, config):
+        """The rendered line for *config*, split into whitespace-separated cells."""
+        line = next(ln for ln in out.splitlines()
+                    if ln.split() and ln.split()[0] == config)
+        return line.split()
+
+    def test_header_carries_plan_quality_and_exclusion_columns(self):
+        from orchestrator.evals.report import format_composite_table
+
+        out = format_composite_table(self._arch_report())
+        header = out.splitlines()[1]
+        assert 'plan_quality' in header
+        assert 'pq_excluded' in header
+
+    def test_architect_row_renders_plan_quality_and_exclusion_count(self):
+        from orchestrator.evals.report import format_composite_table
+
+        out = format_composite_table(self._arch_report())
+        assert '0.9000' in self._row(out, 'arch-good')
+        assert '1' in self._row(out, 'arch-mixed')  # the exclusion COUNT
+        assert '3' in self._row(out, 'arch-dark')
+
+    def test_non_architect_row_renders_dash_not_a_fabricated_zero(self):
+        from orchestrator.evals.report import format_composite_table
+
+        out = format_composite_table(self._arch_report())
+        cells = self._row(out, 'impl-a')
+        # A workflow row has no plan_quality: '-' , never '0.0000'.
+        assert '-' in cells
+
+    def test_wholly_unmeasured_row_renders_dash_for_composite_and_quality(self):
+        from orchestrator.evals.report import format_composite_table
+
+        out = format_composite_table(self._arch_report())
+        cells = self._row(out, 'arch-dark')
+        # composite and quality are both None → '-'. "We measured nothing" must
+        # never render as the 0.0000 that "it scored nothing" would.
+        assert cells[1] == '-'
+        assert cells[2] == '-'
+        assert '0.0000' not in cells[1:3]
+
+    def test_operator_can_rank_architects_from_the_table_alone(self):
+        """The acceptance assertion for the reported defect.
+
+        In the 2026-07-27 OFAT every architect row rendered composite 0.0000, so
+        the table could not be ranked and the scores had to be recomputed by
+        hand from the per-cell result JSONs (defect 1).
+        """
+        from orchestrator.evals.report import format_composite_table
+
+        out = format_composite_table(self._arch_report())
+        good = self._row(out, 'arch-good')[1]
+        weak = self._row(out, 'arch-weak')[1]
+        assert good == '0.9400'
+        assert weak == '0.6400'
+        assert float(good) > float(weak)
+
+    def test_plan_only_table_renders_byte_identically(self):
+        from orchestrator.evals.report import format_composite_table
+
+        report = self._arch_report()
+        assert format_composite_table(report) == format_composite_table(report)
+
 
 # ---------------------------------------------------------------------------
 # _render_fixed_table — the ONE home for the width-computed ljust idiom every
