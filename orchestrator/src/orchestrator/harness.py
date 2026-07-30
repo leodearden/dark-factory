@@ -11650,7 +11650,10 @@ class Harness:
             # written straight back and the re-dispatch fast-paths to merge
             # anyway.  Re-running the clear after the kill window has closed
             # deletes any such resurrection.  Costs one get_task read and is a
-            # zero-write no-op when (normally) no stamp is present.
+            # zero-write no-op when (normally) no stamp is present.  It also runs
+            # on the SetTaskStatusRejected early return (the task went terminal
+            # mid-teardown), which is fine and mildly desirable: a done/cancelled
+            # task should not carry a merge-retry obligation either.
             if action == 'restart':
                 await self._clear_merge_retry_pending_for_restart(task_id)
 
@@ -11683,7 +11686,7 @@ class Harness:
         ``finally`` block after the kill window closes (to delete a stamp the
         dying workflow's own metadata write resurrected in between).
 
-        Best-effort by design: this runs BEFORE the status write, so a raised
+        Best-effort by design: the first call runs BEFORE the status write, so a raised
         metadata read/write error would abort the whole teardown and leave the
         task in its pre-restart status with the kill sequence never run —
         strictly worse than a surviving stamp.  So every failure is logged and
