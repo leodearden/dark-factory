@@ -11649,15 +11649,33 @@ class Harness:
         metadata first rather than writing a hand-built dict.
 
         No-op (zero MCP calls) unless the stamp is actually present.
+
+        Best-effort by design: this runs BEFORE the status write, so a raised
+        metadata read/write error would abort the whole teardown and leave the
+        task in its pre-restart status with the kill sequence never run —
+        strictly worse than a surviving stamp.  So every failure is logged and
+        swallowed; the restart proceeds either way.  (The workflow-side
+        conflict probe in ``_resume_merge_retry_if_pending`` is the other,
+        independent remedy for the same wedge, so a failure here is not the
+        last line of defence.)
         """
-        task = await self.scheduler.get_task(task_id)
-        metadata = (task or {}).get('metadata')
-        if not isinstance(metadata, dict) or 'merge_retry_pending' not in metadata:
+        try:
+            task = await self.scheduler.get_task(task_id)
+            metadata = (task or {}).get('metadata')
+            if not isinstance(metadata, dict) or 'merge_retry_pending' not in metadata:
+                return
+            cleaned = {k: v for k, v in metadata.items() if k != 'merge_retry_pending'}
+            await self.scheduler.update_task(
+                task_id, metadata=cleaned, metadata_mode='replace',
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort: never block the restart
+            logger.warning(
+                'action-teardown restart: could not clear merge_retry_pending for '
+                'task %s (%s) — proceeding with the restart; the re-dispatch may '
+                'still fast-path to merge',
+                task_id, exc,
+            )
             return
-        cleaned = {k: v for k, v in metadata.items() if k != 'merge_retry_pending'}
-        await self.scheduler.update_task(
-            task_id, metadata=cleaned, metadata_mode='replace',
-        )
         logger.info(
             'action-teardown restart: cleared merge_retry_pending stamp for task '
             '%s so the re-dispatch runs the full plan/execute/verify/review '
