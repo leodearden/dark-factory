@@ -148,15 +148,31 @@ the gate record it consumes rather than an unverified copy of it.
   value the runner recorded — a no-plan cell (`plan_steps == 0`) is **not** coerced to
   0. Eight of the nine no-plan cells in the scored 72 do record `plan_quality: 0.0`,
   but one does not: `reify_task_12` × `architect-opus-high` trial 1 records
-  `plan_steps: 0` with `plan_quality: 0.31`. That 0.31 is the deterministic structural
-  floor, not a judge score — `score_plan_structure`
-  (`orchestrator/src/orchestrator/evals/judge.py`) is a *weighted* rubric over
-  independent detectors (`has_steps`, `tdd_alternation`, `files_declared`,
-  `design_decisions_present`, `reuse_items_present`, `plan_confirmed`), so a plan
-  artifact that exists and declares files/design-decisions but carries no steps still
-  scores above zero. Coercing no-plan cells to 0 instead would move
-  `architect-opus-high` to 0.7589 and leave the other three candidates unchanged; the
-  table above is the as-recorded convention.
+  `plan_steps: 0` with `plan_quality: 0.31`. That 0.31 is the **LLM plan judge's own
+  score**, not the deterministic floor. The floor cannot produce it, for two
+  independent reasons: (a) `score_plan_structure`
+  (`orchestrator/src/orchestrator/evals/judge.py:348-373`) short-circuits — `if not
+  is_scorable_plan(plan): return 0.0` — and `is_scorable_plan` (`judge.py:320-345`) is
+  exactly `isinstance(plan, dict) and bool(plan.get('steps'))`, so a stepless plan
+  scores 0.0 outright with no partial credit, and the pre-refactor inline guard (`not
+  plan.get('steps')`) behaved identically for the 2026-07-28 wave this cell comes from;
+  (b) granularity — `PLAN_QUALITY_RUBRIC`'s weights sum to 8.0 and the floor returns
+  `round(satisfied_weight / 8, 4)`, so its only possible outputs are multiples of 0.125,
+  and 0.31 is not one of them. The per-cell artifact
+  (`reify_task_12__architect-opus-high__52c66767.json`) carries `invocation_error: null`,
+  no `cap_tainted`, and $4.72 of real spend, i.e. the normal path of `run_architect_eval`
+  (`runner.py:748-761`), where the judge's value is used verbatim and the floor is
+  consulted only if the judge returns `None`. Coercing no-plan cells to 0 instead would
+  move `architect-opus-high` to 0.7589 and leave the other three candidates unchanged;
+  the table above is the as-recorded convention.
+  - **Instrument observation worth a follow-up** (not intended behaviour, and not a
+    defect this record fixes): on this stepless artifact the judge and the floor
+    *disagree* — 0.31 versus 0.0. The floor's short-circuit is the deliberate
+    anti-fabrication guard from task 3118; the judge is under no such constraint and
+    will score a stepless plan on content. Worth filing alongside **task 3099** as a
+    plan-quality-instrument coherence question. It does not perturb this campaign: the
+    cell is one of 18 for a candidate that is not the recommendation subject, and the
+    sensitivity is bounded at 0.7761 → 0.7589 above.
 - `meanPQ_planned` = mean `plan_quality` over only the cells that produced a plan
   (the `planRate` numerator).
 - `$total` = sum of `cost_usd` over all 18 cells for that candidate.
