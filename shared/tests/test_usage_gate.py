@@ -866,6 +866,53 @@ class TestProbeConfigDirLeakSweep:
 
         sweep.assert_called_once()
 
+    # -- clean-exit half: both construction sites opt into atexit teardown --
+
+    def test_every_per_account_probe_dir_opts_into_atexit_cleanup(self):
+        """The per-account dict comprehension must pass cleanup_at_exit."""
+        with patch('shared.usage_gate.sweep_stale_pid_dirs', return_value=0), \
+                patch('shared.usage_gate.TaskConfigDir') as ctor:
+            make_gate(['work', 'personal'])
+
+        assert ctor.call_count == 2
+        for call in ctor.call_args_list:
+            assert call.kwargs.get('cleanup_at_exit') is True
+
+    def test_no_accounts_alias_probe_dir_opts_into_atexit_cleanup(self):
+        """The `or TaskConfigDir(...)` fallback leaks too — cover it.
+
+        With no configured accounts and no default credential, _init_accounts
+        returns [], so the dict comprehension creates nothing and the
+        no-accounts alias branch is the only construction site.
+        """
+        config = UsageCapConfig(accounts=[])
+
+        with patch('shared.usage_gate.sweep_stale_pid_dirs', return_value=0), \
+                patch('shared.usage_gate._read_oauth_token', return_value=None), \
+                patch('shared.usage_gate.TaskConfigDir') as ctor:
+            gate = UsageGate(config)
+
+        assert not gate._accounts
+        assert ctor.call_count == 1
+        assert ctor.call_args.args[0] == f'usage-gate-probe-{os.getpid()}'
+        assert ctor.call_args.kwargs.get('cleanup_at_exit') is True
+
+    def test_atexit_optin_does_not_perturb_the_per_account_dir_naming(self):
+        """The isolation fix (task 2139) must survive the new kwarg.
+
+        Re-asserts the exact contract pinned by
+        TestProbeConfigDirIsolation::test_config_dir_name_contains_account_name_and_pid
+        against a real, unpatched gate.
+        """
+        with patch('shared.usage_gate.sweep_stale_pid_dirs', return_value=0):
+            gate = make_gate(['work', 'personal'])
+
+        pid = os.getpid()
+        for acct in gate._accounts:
+            config_dir = gate._config_dir_for(acct)
+            assert config_dir.path.name == f'{PROBE_DIR_PREFIX}{acct.name}-{pid}'
+            assert config_dir.path.exists()
+
 
 # ---------------------------------------------------------------------------
 # Env-token precedence regression guard (task 2139 step 7, PRD §6 finding 5 /
