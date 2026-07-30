@@ -25,6 +25,7 @@ import sqlite3
 from pathlib import Path
 
 from audit_wiped_metadata_files import (
+    _SOURCE_PRECEDENCE,
     FIDELITY_FILE_LEVEL,
     FIDELITY_LOCK_LEVEL,
     PlanFilesRecord,
@@ -32,6 +33,7 @@ from audit_wiped_metadata_files import (
     load_plan_files_from_disk,
     load_plan_files_from_events,
     load_task_records,
+    merge_plan_file_sources,
 )
 
 # ---------------------------------------------------------------------------
@@ -602,3 +604,99 @@ def test_load_plan_files_from_disk_on_absent_base_returns_empty(tmp_path):
     assert load_plan_files_from_disk(str(tmp_path / "no-such-base")) == {}
     # An existing but empty base is also fine.
     assert load_plan_files_from_disk(str(tmp_path)) == {}
+
+
+# ---------------------------------------------------------------------------
+# merge_plan_file_sources — four-way precedence across disk and event sources:
+#   meta_root_plan_json > legacy_worktree_plan_json
+#     > phase_skipped_event > set_to_plan_event
+# ---------------------------------------------------------------------------
+
+
+def _rec(files, source, fidelity=FIDELITY_FILE_LEVEL):
+    return PlanFilesRecord(files=tuple(files), source=source, fidelity=fidelity)
+
+
+def test_merge_plan_file_sources_prefers_disk_over_event_within_file_level():
+    """(a) both are FILE_LEVEL, but the PERSISTED plan artifact is
+    authoritative over an event snapshot of it."""
+    disk = {"7": _rec(["from_plan.py"], "meta_root_plan_json")}
+    events = {"7": _rec(["from_event.py"], "phase_skipped_event")}
+
+    merged = merge_plan_file_sources(disk, events)
+
+    assert merged["7"].source == "meta_root_plan_json"
+    assert merged["7"].files == ("from_plan.py",)
+
+
+def test_merge_plan_file_sources_prefers_legacy_disk_over_event_snapshot():
+    """(a) the legacy disk artifact still outranks an event snapshot."""
+    disk = {"7": _rec(["legacy.py"], "legacy_worktree_plan_json")}
+    events = {"7": _rec(["evented.py"], "phase_skipped_event")}
+
+    assert merge_plan_file_sources(disk, events)["7"].source == "legacy_worktree_plan_json"
+
+
+def test_merge_plan_file_sources_prefers_any_file_level_over_lock_level():
+    """(b) every FILE_LEVEL source beats the LOCK_LEVEL set_to_plan record."""
+    lock = _rec(["orchestrator"], "set_to_plan_event", FIDELITY_LOCK_LEVEL)
+    for source in ("meta_root_plan_json", "legacy_worktree_plan_json"):
+        merged = merge_plan_file_sources({"7": _rec(["f.py"], source)}, {"7": lock})
+        assert merged["7"].source == source
+        assert merged["7"].fidelity == FIDELITY_FILE_LEVEL
+
+    merged = merge_plan_file_sources(
+        {}, {"7": _rec(["f.py"], "phase_skipped_event")}
+    )
+    assert merged["7"].source == "phase_skipped_event"
+
+
+def test_merge_plan_file_sources_carries_through_single_source_tasks():
+    """(c) a task present in only one map keeps its source and fidelity."""
+    disk = {"1": _rec(["only_disk.py"], "meta_root_plan_json")}
+    events = {"2": _rec(["orchestrator"], "set_to_plan_event", FIDELITY_LOCK_LEVEL)}
+
+    merged = merge_plan_file_sources(disk, events)
+
+    assert merged["1"] == _rec(["only_disk.py"], "meta_root_plan_json")
+    assert merged["2"].source == "set_to_plan_event"
+    assert merged["2"].fidelity == FIDELITY_LOCK_LEVEL
+    assert merged["2"].files == ("orchestrator",)
+
+
+def test_merge_plan_file_sources_does_not_mutate_either_input():
+    """(d) neither input dict is mutated."""
+    disk = {"7": _rec(["d.py"], "meta_root_plan_json")}
+    events = {"7": _rec(["e.py"], "phase_skipped_event"), "8": _rec(["x.py"], "phase_skipped_event")}
+    disk_before = dict(disk)
+    events_before = dict(events)
+
+    merged = merge_plan_file_sources(disk, events)
+
+    assert disk == disk_before
+    assert events == events_before
+    assert merged is not disk and merged is not events
+
+
+def test_merge_plan_file_sources_covers_the_union_of_task_ids():
+    """(e) the result covers the union of both inputs' task ids."""
+    disk = {"1": _rec(["a.py"], "meta_root_plan_json"), "2": _rec(["b.py"], "legacy_worktree_plan_json")}
+    events = {"2": _rec(["c.py"], "phase_skipped_event"), "3": _rec(["d.py"], "phase_skipped_event")}
+
+    assert set(merge_plan_file_sources(disk, events)) == {"1", "2", "3"}
+
+
+def test_merge_plan_file_sources_on_empty_inputs_returns_empty():
+    assert merge_plan_file_sources({}, {}) == {}
+
+
+def test_merge_plan_file_sources_precedence_is_stated_once_and_is_total():
+    """The ordering lives in a single module-level tuple, and every source
+    label the loaders can emit appears in it — an unranked source would
+    otherwise be silently unorderable."""
+    assert _SOURCE_PRECEDENCE == (
+        "meta_root_plan_json",
+        "legacy_worktree_plan_json",
+        "phase_skipped_event",
+        "set_to_plan_event",
+    )
