@@ -2020,6 +2020,79 @@ def test_main_config_flag_overrides_default_path_and_date_flag_threads_through(t
     assert kwargs["project_root"] == str(tmp_path)
 
 
+def test_main_cost_control_flags_thread_into_run_census(tmp_path, monkeypatch):
+    _write_legibility_yaml(_default_config_path(tmp_path))
+    fake_run_census = _make_fake_main_run_census()
+    monkeypatch.setattr(mod, "run_census", fake_run_census)
+    monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
+
+    exit_code = mod.main([
+        "--project-root", str(tmp_path),
+        "--force",
+        "--date", "2026-07-30",
+        "--max-batches", "50",
+        "--max-verify-clusters", "150",
+        "--dry-run-filing",
+    ])
+
+    assert exit_code == 0
+    kwargs = fake_run_census.calls[0]
+    assert kwargs["max_batches"] == 50
+    assert kwargs["max_verify_clusters"] == 150
+    # the dated payload file sits alongside the dated report
+    assert str(kwargs["dry_run_payloads_path"]) == str(
+        tmp_path / "plans" / "confusion-census-2026-07-30-payloads.json"
+    )
+    assert str(kwargs["report_path"]) == str(
+        tmp_path / "plans" / "confusion-census-2026-07-30.md"
+    )
+
+
+def test_main_without_cost_control_flags_passes_defaults(tmp_path, monkeypatch):
+    # The nightly launcher (nightly.py) runs census.py with NO extra argv, so
+    # this is the shape that must stay behaviorally byte-identical.
+    _write_legibility_yaml(_default_config_path(tmp_path))
+    fake_run_census = _make_fake_main_run_census()
+    monkeypatch.setattr(mod, "run_census", fake_run_census)
+    monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
+
+    exit_code = mod.main(["--project-root", str(tmp_path), "--force"])
+
+    assert exit_code == 0
+    kwargs = fake_run_census.calls[0]
+    assert kwargs["max_batches"] is None
+    assert kwargs["max_verify_clusters"] is None
+    assert kwargs["dry_run_payloads_path"] is None
+
+
+def test_main_dry_run_summary_line_names_payload_file(tmp_path, monkeypatch, capsys):
+    _write_legibility_yaml(_default_config_path(tmp_path))
+    payloads_path = "/p/plans/confusion-census-2026-07-30-payloads.json"
+    fake_run_census = _make_fake_main_run_census(
+        outcome=mod.CensusOutcome(
+            status="done",
+            report_path="plans/confusion-census-2026-07-30.md",
+            filed_task_ids=[],
+            stop_reason="capped",
+            dry_run=mod.DryRunFiling(path=payloads_path, payload_count=7),
+        )
+    )
+    monkeypatch.setattr(mod, "run_census", fake_run_census)
+    monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
+
+    exit_code = mod.main([
+        "--project-root", str(tmp_path), "--force", "--dry-run-filing",
+    ])
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert payloads_path in out
+    assert "7 payload" in out
+    assert "nothing filed" in out.lower()
+    # a bare filed_tasks=0 would read as "a normal run that filed nothing"
+    assert "filed_tasks=0" not in out
+
+
 def test_main_missing_config_returns_nonzero(tmp_path, monkeypatch):
     # no legibility.yaml written anywhere -- config.load_config must fail
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
