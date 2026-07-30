@@ -335,7 +335,11 @@ def _build_eval(
     paths = all_paths[-_TREND_RUN_CAP:] if _TREND_RUN_CAP else all_paths
     truncated = len(paths) < runs_on_disk
 
-    runs: list[tuple[Any, dict[str, dict]]] = []
+    # (in-body stamp, metric_id -> record, source path).  The path is carried
+    # so a per-run issue can name the FILE that caused it: the committed
+    # ``malformed/`` exemplar's two runs share one in-body run_stamp, so the
+    # stamp alone would not identify which artifact is at fault.
+    runs: list[tuple[Any, dict[str, dict], Path]] = []
     corpus: dict | None = None
     for path in paths:
         try:
@@ -365,15 +369,15 @@ def _build_eval(
             )
         if isinstance(body.get('corpus'), dict):
             corpus = dict(body['corpus'])
-        runs.append((stamp, {row['metric_id']: row for row in _metric_rows(body)}))
+        runs.append((stamp, {row['metric_id']: row for row in _metric_rows(body)}, path))
 
-    run_stamps = [stamp for stamp, _ in runs]
+    run_stamps = [stamp for stamp, _, _ in runs]
 
     # Metric identity is the metric_id, unioned across the whole window: a
     # metric that appears only in some runs still gets a full-width series
     # (with holes), so every series stays index-aligned to the shared axis.
     metric_ids: list[str] = []
-    for _, by_id in runs:
+    for _, by_id, _path in runs:
         for metric_id in by_id:
             if metric_id not in metric_ids:
                 metric_ids.append(metric_id)
@@ -410,17 +414,38 @@ def _build_eval(
         # A metric missing from a run contributes a None hole at that index
         # rather than being dropped — dropping would silently shift this
         # metric's points against its neighbours'.
-        values = [by_id.get(metric_id, {}).get('value') for _, by_id in runs]
+        values = [by_id.get(metric_id, {}).get('value') for _, by_id, _p in runs]
         current = latest.get(metric_id, {})
 
         # A kind outside the closed vocabulary is a RENDERING failure: there is
         # no chart primitive for it, so the dashboard genuinely cannot resolve
         # it and says so.  The value itself is still real and is still shown.
+        #
+        # Checked across the WHOLE window, not just the newest run: a trend
+        # line is drawn from every point, so an unrenderable kind anywhere in
+        # the series is a rendering failure even when the latest run is clean.
+        # The committed ``malformed/`` exemplar is exactly that shape — its
+        # bad-kind artifact sorts BEFORE its well-kinded one, so a latest-run
+        # check would have declared that fixture healthy.
+        #
+        # One issue per distinct (metric, kind): a kind that is wrong in every
+        # run of a 90-run window is one problem, not ninety.  Deduped on the
+        # repr so an unhashable value out of a malformed artifact cannot raise.
         kind = current.get('kind')
-        if kind is not None and kind not in _KNOWN_KINDS:
+        seen_kinds: set[str] = set()
+        for _stamp, by_id, run_path in runs:
+            run_kind = by_id.get(metric_id, {}).get('kind')
+            # ``isinstance`` before the set lookup: an unhashable kind out of a
+            # malformed artifact would make ``in _KNOWN_KINDS`` raise, and a
+            # non-string kind is unrenderable anyway.
+            if run_kind is None or (isinstance(run_kind, str) and run_kind in _KNOWN_KINDS):
+                continue
+            if repr(run_kind) in seen_kinds:
+                continue
+            seen_kinds.add(repr(run_kind))
             _issue(
-                issues, 'unknown_kind', eval_id=eval_id, path=eval_dir,
-                detail=f'metric {metric_id!r} has kind {kind!r}, which has no chart primitive',
+                issues, 'unknown_kind', eval_id=eval_id, path=run_path,
+                detail=f'metric {metric_id!r} has kind {run_kind!r}, which has no chart primitive',
             )
 
         # Absent verdict == absent, never defaulted to 'no_alarm'.  The empty
@@ -442,13 +467,11 @@ def _build_eval(
         # instead of N per-metric ones, so per-metric links are suppressed
         # here.  Showing them would invent links that were never filed.
         fingerprint = judged.get('fingerprint')
-        matched = (
-            escalation_index.get(fingerprint)
-            if storm is None and isinstance(fingerprint, str)
-            else None
-        )
-        if matched is not None:
-            linked_fingerprints.add(fingerprint)
+        matched: dict[str, Any] | None = None
+        if storm is None and isinstance(fingerprint, str) and fingerprint:
+            matched = escalation_index.get(fingerprint)
+            if matched is not None:
+                linked_fingerprints.add(fingerprint)
         escalation = _escalation_projection(matched) if matched is not None else None
 
         metrics.append({
@@ -562,13 +585,11 @@ def build_memory_evals(
     storm_block: dict[str, Any] | None = None
     if storm is not None:
         aggregate_fingerprint = storm.get('aggregate_fingerprint')
-        aggregate = (
-            escalation_index.get(aggregate_fingerprint)
-            if isinstance(aggregate_fingerprint, str)
-            else None
-        )
-        if aggregate is not None:
-            linked_fingerprints.add(aggregate_fingerprint)
+        aggregate: dict[str, Any] | None = None
+        if isinstance(aggregate_fingerprint, str) and aggregate_fingerprint:
+            aggregate = escalation_index.get(aggregate_fingerprint)
+            if aggregate is not None:
+                linked_fingerprints.add(aggregate_fingerprint)
         storm_block = {
             'triggered': storm.get('triggered'),
             'alarm_count': storm.get('alarm_count'),
