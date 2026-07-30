@@ -286,6 +286,16 @@ def _scope_prefix_to_keyword(raw: str, keyword: str, files: list[str]) -> Verify
     ``render`` reproduces byte-for-byte. The real ``ToolKind`` is kept rather
     than OPAQUE so ``run.cmd.tool`` stays meaningful downstream.
 
+    That raw-retained return DELIBERATELY drops the structured
+    ``targets``/``uv_project``/``base_flags`` the scoping produced: carrying
+    them alongside ``raw`` is exactly what ``render``'s P3 invariant forbids
+    (a field ``render()`` would silently ignore). The narrowed file list is
+    therefore not recoverable from the returned ``cmd`` — since every
+    subproject's ``lint_command`` chains a sibling checker, that is the
+    NORMAL shape here, not an edge case. Callers record it separately on
+    ``PlannedRun.scoped_targets`` (task 3219), which is why they pass the
+    same *files* list to both this function and that field.
+
     *keyword* absent from *raw*, or the prefix not parsing into one
     recognised structured invocation (P1), leaves *raw* untouched: the
     returned ``VerifyCmd`` is forced raw-retained (``raw=raw`` — the full
@@ -600,6 +610,7 @@ def _derive_fallback_runs(
         runs.append(PlannedRun(
             _FALLBACK_PREFIX, lint_cmd, ScopeKind.FILE_SCOPED,
             'lint: file-scoped to touched file(s)',
+            scoped_targets=tuple(py_files),
         ))
     else:
         runs.append(PlannedRun(
@@ -620,6 +631,7 @@ def _derive_fallback_runs(
             runs.append(PlannedRun(
                 _FALLBACK_PREFIX, type_cmd, ScopeKind.FILE_SCOPED,
                 'pyright: file-scoped to touched file(s)',
+                scoped_targets=tuple(py_files),
             ))
     else:
         runs.append(PlannedRun(
@@ -679,6 +691,7 @@ def _derive_fallback_runs(
             runs.append(PlannedRun(
                 _FALLBACK_PREFIX, test_cmd, ScopeKind.FILE_SCOPED,
                 'pytest: file-scoped to touched test file(s)',
+                scoped_targets=tuple(collectable_tests),
             ))
     else:
         runs.append(PlannedRun(
