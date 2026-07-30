@@ -7520,6 +7520,29 @@ class Harness:
                         'review_cycles': report.review_cycles,
                         'steward_cost_usd': report.steward_cost_usd,
                         'steward_invocations': report.steward_invocations,
+                        # Task 3068 (origin incident: reify esc-5556-1) — the
+                        # WHY, not just the counters.  A 46h warm-lane requeue
+                        # loop was forensically unqueryable because this payload
+                        # recorded THAT ~349 dispatches requeued but never why;
+                        # both fields were already in scope ~15 lines above and
+                        # simply not passed through.
+                        #
+                        # These two keys are ALWAYS present — empty string on a
+                        # clean/DONE exit, never omitted — so that
+                        # `json_extract(data,'$.reason')` is uniform across every
+                        # row: NULL means "event predates task 3068", '' means
+                        # "clean exit, no block".  Conditional omission would make
+                        # those two cases indistinguishable, which is exactly the
+                        # ambiguity that made the origin incident unqueryable.
+                        #
+                        # `block_detail` is deliberately NOT emitted: it carries
+                        # raw agent/verify output (full test logs, tracebacks) and
+                        # is effectively unbounded, while events.db is queried
+                        # operationally and rotated.  `block_reason` is the
+                        # classified, low-cardinality, GROUP-BY-able field the
+                        # requeue-cap path itself already uses.
+                        'reason': report.block_reason,
+                        'block_phase': report.block_phase,
                     },
                 )
 
