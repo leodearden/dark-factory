@@ -1248,6 +1248,21 @@ class InversionObservation:
     degraded: bool = False
 
 
+@dataclass(frozen=True)
+class DegradedQuery:
+    """One query whose search reported a failed store.
+
+    Carries the diagnostics verbatim rather than a boolean: "the run was
+    degraded" tells an operator to distrust the numbers, while "mem0 raised
+    TimeoutError" tells them what to restart.
+    """
+
+    topic: str
+    query: str
+    failed_stores: tuple[str, ...]
+    diagnostics: tuple[dict, ...] = ()
+
+
 @dataclass
 class ProbeObservations:
     """Everything one probe run measured, before aggregation.
@@ -1262,6 +1277,7 @@ class ProbeObservations:
     claims: list[ClaimObservation] = field(default_factory=list)
     contamination: list[ContaminationObservation] = field(default_factory=list)
     inversions: list[InversionObservation] = field(default_factory=list)
+    degraded_queries: list[DegradedQuery] = field(default_factory=list)
 
 
 def _proportion(
@@ -1468,6 +1484,247 @@ def build_series(
     )
     validate_metric_series(series)
     return series
+
+
+def not_measured_topics(
+    observations: ProbeObservations, k: int = TRIPWIRE_K,
+) -> list[str]:
+    """Topics that were probed but produced no usable observation at *k*.
+
+    Distinct from a failing topic and from an absent one. The report has to say
+    "we could not measure this" out loud: a topic that silently vanishes from
+    the tripwire's items is indistinguishable, in the artifact alone, from a
+    topic that passed.
+    """
+    attempted: set[str] = set()
+    measured: set[str] = set()
+    for obs in observations.phrasings:
+        if obs.k != k:
+            continue
+        attempted.add(obs.topic)
+        if not obs.degraded:
+            measured.add(obs.topic)
+    return sorted(attempted - measured)
+
+
+# ---------------------------------------------------------------------------
+# The per-query probe band
+#
+# The ONE place this module talks to a search callable. Everything downstream
+# is pure, which is what keeps the whole metric family testable in the merge
+# lane with no Qdrant and no OPENAI_API_KEY.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class DegradeInfo:
+    """A search's results together with the degrade metadata read off it."""
+
+    results: list
+    degraded: bool = False
+    failed_stores: tuple[str, ...] = ()
+    diagnostics: tuple[dict, ...] = ()
+
+
+def read_degrade_metadata(raw: Any) -> DegradeInfo:
+    """Read ``degraded``/``failed_stores``/``failure_diagnostics`` off *raw* FIRST.
+
+    ``MemoryService.search`` returns a ``SearchResults`` (a ``list`` subclass)
+    carrying that metadata in-band, and its own docstring
+    (``memory_service.py:706-712``) warns that the attributes do not survive a
+    slice, a ``sorted()``, a concatenation or a comprehension — those return a
+    plain ``list`` and drop them SILENTLY.
+
+    That is why this function exists and why the band calls it before touching
+    the list. A probe that sliced to top-k first would, during a Qdrant outage,
+    see an empty plain list with no degrade flag on it and report every
+    canonical as missing — a fabricated corpus-wide collapse, arriving in leaf
+    ε's lap as findings against the 3111 lineage.
+
+    A plain list is read as healthy: no metadata is the ordinary shape for a
+    caller that never had a degraded search to report, and inventing
+    degradation from its absence would be its own false signal.
+    """
+    degraded = bool(getattr(raw, 'degraded', False))
+    stores = tuple(getattr(raw, 'failed_stores', ()) or ())
+    diagnostics = tuple(getattr(raw, 'failure_diagnostics', ()) or ())
+    return DegradeInfo(
+        results=list(raw),
+        degraded=degraded or bool(stores),
+        failed_stores=stores,
+        diagnostics=diagnostics,
+    )
+
+
+async def probe_topic(
+    search,
+    entry: RegistryEntry,
+    registry: TopicRegistry,
+    ks: tuple[int, ...],
+    observations: ProbeObservations,
+) -> None:
+    """Probe one registry topic, appending every observation to *observations*.
+
+    *search* is an awaitable ``search(query, limit)`` returning the store's
+    result list — injected rather than reached for, so the whole band is
+    exercisable without a live store.
+
+    Each query is searched ONCE, at the widest *k*, and the single returned
+    list is then sliced per *k*. Searching per k would double the embedding
+    spend and, worse, compare two independently-retrieved lists: k=5 and k=10
+    would no longer be the same measurement at two depths.
+
+    Every query that reported a failed store is recorded in
+    ``degraded_queries`` and every observation it produced is flagged, so the
+    aggregation can exclude it instead of scoring an outage as a regression.
+    """
+    limit = max(ks) if ks else TRIPWIRE_K
+
+    for phrasing in entry.phrasings:
+        info = read_degrade_metadata(await search(phrasing.text, limit))
+        if info.degraded:
+            observations.degraded_queries.append(DegradedQuery(
+                topic=entry.topic,
+                query=phrasing.text,
+                failed_stores=info.failed_stores,
+                diagnostics=info.diagnostics,
+            ))
+        for k in ks:
+            observations.phrasings.append(observe_phrasing(
+                info.results, entry, phrasing, k, degraded=info.degraded,
+            ))
+        outcome = classify_contamination(info.results, entry, registry, TRIPWIRE_K)
+        observations.contamination.append(ContaminationObservation(
+            topic=entry.topic,
+            phrasing=phrasing.text,
+            k=TRIPWIRE_K,
+            foreign_count=outcome.foreign_count,
+            untopiced_count=outcome.untopiced_count,
+            scored_total=outcome.scored_total,
+            foreign_records=outcome.foreign_records,
+            degraded=info.degraded,
+        ))
+        observations.inversions.append(InversionObservation(
+            topic=entry.topic,
+            phrasing=phrasing.text,
+            pairs_examined=len(entry.supersedes_pairs),
+            inversions=tuple(
+                superseded_inversions(info.results, entry, phrasing=phrasing.text),
+            ),
+            degraded=info.degraded,
+        ))
+
+    for claim in entry.claim_queries:
+        info = read_degrade_metadata(await search(claim.query, limit))
+        if info.degraded:
+            observations.degraded_queries.append(DegradedQuery(
+                topic=entry.topic,
+                query=claim.query,
+                failed_stores=info.failed_stores,
+                diagnostics=info.diagnostics,
+            ))
+        outcome = claim_recalled(info.results, claim, TRIPWIRE_K)
+        observations.claims.append(ClaimObservation(
+            topic=entry.topic,
+            query=claim.query,
+            k=TRIPWIRE_K,
+            recalled=outcome.recalled,
+            missing_needles=outcome.missing_needles,
+            scorable=outcome.scorable,
+            degraded=info.degraded,
+        ))
+
+
+# ---------------------------------------------------------------------------
+# The human-readable report
+#
+# render_report() (shared) covers the metric table; this wraps it with what
+# only this runner knows — which queries degraded, which topics went
+# unmeasured, and which canonicals could not be matched at all.
+# ---------------------------------------------------------------------------
+
+def render_probe_report(series, observations: ProbeObservations) -> str:
+    """The prose companion: the shared metric table plus this run's caveats.
+
+    Every section here exists because a number alone would mislead. A
+    contamination share without its unclassifiable remainder reads as
+    authoritative; a tripwire missing an item reads as a pass; a canonical that
+    matched by ``last_known_id`` reads as healthy while the fixture quietly
+    rots. None of those are visible in the metrics table, so they are said here
+    in words.
+    """
+    from shared.memory_eval_metrics import render_report  # noqa: PLC0415
+
+    lines = [render_report(series).rstrip('\n')]
+
+    if observations.degraded_queries:
+        lines.append('')
+        lines.append(f'degraded queries ({len(observations.degraded_queries)}):')
+        lines.append(
+            '  These searches reported a failed store. Their observations are '
+            'EXCLUDED from every denominator above — an outage is not a '
+            'retrieval regression.'
+        )
+        for record in observations.degraded_queries:
+            stores = ', '.join(record.failed_stores) or 'unnamed store'
+            lines.append(f'  - [{record.topic}] {record.query!r}: failed stores: {stores}')
+            for diagnostic in record.diagnostics:
+                rendered = ', '.join(
+                    f'{k}={v}' for k, v in sorted(diagnostic.items())
+                )
+                lines.append(f'      {rendered}')
+
+    unmeasured = not_measured_topics(observations)
+    if unmeasured:
+        lines.append('')
+        lines.append(f'topics NOT MEASURED this run ({len(unmeasured)}):')
+        lines.append(
+            '  Every phrasing degraded, so these topics carry no tripwire item. '
+            'They are not passing and not failing — they were not measured.'
+        )
+        lines.extend(f'  - {topic}' for topic in unmeasured)
+
+    unmatched = sorted({
+        obs.topic for obs in observations.phrasings
+        if not obs.degraded and obs.unmatched
+    })
+    if unmatched:
+        lines.append('')
+        lines.append(f'canonicals matched by NEITHER key ({len(unmatched)}):')
+        lines.append(
+            '  Neither the content hash nor last_known_id matched anything '
+            'returned. Either the entry is genuinely unfindable, or the '
+            'registry fixture has decayed past both keys — the report says '
+            'which topics to go and check rather than guessing between them.'
+        )
+        lines.extend(f'  - {topic}' for topic in unmatched)
+
+    repairs = sorted({
+        obs.topic for obs in observations.phrasings
+        if not obs.degraded and obs.needs_hash_repair
+    })
+    if repairs:
+        lines.append('')
+        lines.append(f'canonicals matched by last_known_id only ({len(repairs)}):')
+        lines.append(
+            '  The content hash missed but the id hit: the stored text changed. '
+            'Counted as a hit (the entry IS findable) and reported so the '
+            'fixture can be re-hashed — a probe that silently rewrote its own '
+            'expectations could never fail.'
+        )
+        lines.extend(f'  - {topic}' for topic in repairs)
+
+    missing_claims = [
+        obs for obs in observations.claims
+        if not obs.degraded and obs.scorable and not obs.recalled
+    ]
+    if missing_claims:
+        lines.append('')
+        lines.append(f'claims not recalled ({len(missing_claims)}):')
+        for obs in missing_claims:
+            needles = ', '.join(repr(n) for n in obs.missing_needles)
+            lines.append(f'  - [{obs.topic}] {obs.query!r}: missing {needles}')
+
+    return '\n'.join(lines) + '\n'
 
 
 def emit_series(series, root: str | Path, *, stamp: str | None = None) -> tuple[Path, Path]:
