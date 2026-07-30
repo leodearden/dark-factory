@@ -167,6 +167,12 @@ class ClassificationResult(NamedTuple):
     adjudicated slot is deliberately kept narrow — "a non-empty evidence field
     means this is a skew" is the inference that let the false I7 premise
     survive two task cycles (see the module docstring's I7 account).
+
+    Known redundancy: ``evidence`` is derivable from the other two fields (it is
+    ``observed_evidence`` when the disposition is INTEGRATION_SKEW, else
+    ``None``), and its sole consumer already gates on ``disposition``. Task 3261
+    tracks collapsing it away, which removes the over-readable slot structurally
+    rather than by docstring.
     """
 
     disposition: MergeFailureDisposition
