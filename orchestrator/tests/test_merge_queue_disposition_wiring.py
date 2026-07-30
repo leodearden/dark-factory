@@ -861,7 +861,8 @@ class TestRunPostMergeVerifyRealMainHeadFilter:
 
         async def _fake_classify(**kwargs):
             captured.update(kwargs)
-            return MergeFailureDisposition.BRANCH_BUG, None
+            # 3-tuple since task 3178: (disposition, evidence, observed_evidence).
+            return MergeFailureDisposition.BRANCH_BUG, None, None
 
         async def _run() -> tuple[MergeFailureDisposition, dict[str, str] | None, str]:
             with patch(

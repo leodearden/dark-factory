@@ -200,7 +200,9 @@ class TestMainRedShortCircuit:
             main_sha='main111',
             preexisting=True,
         ))
-        assert result == (MergeFailureDisposition.MAIN_RED, None)
+        # (disposition, evidence, observed_evidence) — MAIN_RED short-circuits
+        # before any evidence is gathered, so both bundles are None.
+        assert result == (MergeFailureDisposition.MAIN_RED, None, None)
 
     def test_preexisting_true_never_reprobes_verify_failure_is_preexisting_on_main(
         self, monkeypatch: pytest.MonkeyPatch,
@@ -230,7 +232,9 @@ class TestMainRedShortCircuit:
             main_sha='main111',
             preexisting=True,
         ))
-        assert result == (MergeFailureDisposition.MAIN_RED, None)
+        # (disposition, evidence, observed_evidence) — MAIN_RED short-circuits
+        # before any evidence is gathered, so both bundles are None.
+        assert result == (MergeFailureDisposition.MAIN_RED, None, None)
 
 
 # ---------------------------------------------------------------------------

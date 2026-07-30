@@ -957,7 +957,11 @@ async def _classify_disposition_for_outcome(
     so the caller's outcome is never left half-attached.
     """
     try:
-        disposition, evidence = await classify_merge_failure_disposition(
+        # NOTE (task 3178 step-4): the classifier's third element is the
+        # GATHERED bundle (non-None on an I7/I5 degrade too). Discarded here for
+        # now — step-8 returns it as this wrapper's 4th element and threads it
+        # onto MergeOutcome so the merge_attempt emit can persist it.
+        disposition, evidence, _observed = await classify_merge_failure_disposition(
             verify_result=verify,
             branch=req.branch.bare_id,
             merge_base_sha=merge_base_sha,
