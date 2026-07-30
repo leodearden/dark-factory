@@ -936,7 +936,7 @@ async def _classify_disposition_for_outcome(
     main_sha: str,
     event_store: EventStore | None,
     real_main_head_sha: str | None = None,
-) -> tuple[MergeFailureDisposition, dict[str, str] | None, str]:
+) -> tuple[MergeFailureDisposition, dict[str, str] | None, str, SkewEvidence | None]:
     """Classify a non-preexisting merge-verify failure and render its I4
     surfaces (task 2383 β).
 
@@ -953,15 +953,20 @@ async def _classify_disposition_for_outcome(
 
     Belt-and-suspenders fail-open (I3): any exception — including one raised
     by the classifier itself, atop its own internal fail-open — is caught
-    here, logged at WARNING, and degrades to ``(INDETERMINATE, None, '')``
+    here, logged at WARNING, and degrades to ``(INDETERMINATE, None, '', None)``
     so the caller's outcome is never left half-attached.
+
+    The 4th element (task 3178) is the classifier's GATHERED bundle
+    (``observed_evidence``), not its adjudicated ``evidence``: it is the one the
+    step-18 ``merge_attempt`` emit needs, because that emit now persists evidence
+    on the ADJUDICATED-INDETERMINATE path too. ``_render_skew_surfaces`` keeps
+    receiving the ADJUDICATED bundle, so only INTEGRATION_SKEW ever renders the
+    "port the landed commit" directive — that contract is untouched. None when no
+    landings were implicated, when classification could not proceed, and on the
+    fail-open path (a fault gathered nothing and must not fabricate a bundle).
     """
     try:
-        # NOTE (task 3178 step-4): the classifier's third element is the
-        # GATHERED bundle (non-None on an I7/I5 degrade too). Discarded here for
-        # now — step-8 returns it as this wrapper's 4th element and threads it
-        # onto MergeOutcome so the merge_attempt emit can persist it.
-        disposition, evidence, _observed = await classify_merge_failure_disposition(
+        disposition, evidence, observed = await classify_merge_failure_disposition(
             verify_result=verify,
             branch=req.branch.bare_id,
             merge_base_sha=merge_base_sha,
@@ -972,8 +977,10 @@ async def _classify_disposition_for_outcome(
             repo_root=req.config.project_root,
             event_store=event_store,
         )
+        # ADJUDICATED bundle to the renderer (only INTEGRATION_SKEW gets a
+        # directive); GATHERED bundle out to the caller (task 3178).
         reason_suffix, failure_diagnostic = _render_skew_surfaces(disposition, evidence)
-        return disposition, failure_diagnostic, reason_suffix
+        return disposition, failure_diagnostic, reason_suffix, observed
     except Exception:
         logger.warning(
             'Task %s: _classify_disposition_for_outcome failed; degrading to '
@@ -981,7 +988,7 @@ async def _classify_disposition_for_outcome(
             req.task_id,
             exc_info=True,
         )
-        return MergeFailureDisposition.INDETERMINATE, None, ''
+        return MergeFailureDisposition.INDETERMINATE, None, '', None
 
 
 async def _resolve_dispatch_time_merge_base(
@@ -2576,6 +2583,10 @@ async def _run_post_merge_verify(
         # debugger's dry-run context too.
         disposition = MergeFailureDisposition.INDETERMINATE
         failure_diagnostic: dict[str, str] | None = None
+        # Stays None when classification is SKIPPED below (absent base facts) —
+        # the seam the step-18 emit guard keys on (task 3178): nothing was
+        # gathered, so no merge_attempt row is emitted for that INDETERMINATE.
+        skew_evidence: SkewEvidence | None = None
         if merge_base_sha is not None and main_sha is not None:
             # Resolve the CURRENT real published main HEAD (task 2869, I6): the
             # merge-skew classifier filters cited landings to ancestors of real
@@ -2600,7 +2611,7 @@ async def _run_post_merge_verify(
                     req.task_id,
                     exc_info=True,
                 )
-            disposition, failure_diagnostic, reason_suffix = (
+            disposition, failure_diagnostic, reason_suffix, skew_evidence = (
                 await _classify_disposition_for_outcome(
                     verify, req=req, merge_base_sha=merge_base_sha,
                     main_sha=main_sha, event_store=event_store,
@@ -2665,6 +2676,7 @@ async def _run_post_merge_verify(
             failure_cause_hint=verify.cause_hint,
             disposition=disposition,
             failure_diagnostic=failure_diagnostic,
+            skew_evidence=skew_evidence,
         )
 
     # Task 2823 (gate-hole #3/3): a config-only merge (no .py/.rs in the diff)
