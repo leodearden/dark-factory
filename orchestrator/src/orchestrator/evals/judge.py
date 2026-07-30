@@ -10,7 +10,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from itertools import combinations
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeGuard
 
 from orchestrator.agents.invoke import invoke_agent
 
@@ -317,14 +317,43 @@ PLAN_QUALITY_RUBRIC: dict[str, Any] = {
 }
 
 
+def is_scorable_plan(plan: object) -> TypeGuard[dict]:
+    """THE single test for "does this artifact carry content worth scoring?".
+
+    A plan with no steps is not a plan — whether it is absent (``None``), empty
+    (``{}``), not a dict at all, or the header-only stub ``create_plan`` writes
+    on the architect's FIRST plan-tools call (``plan_tools._create_plan``: a
+    TRUTHY dict with ``task_id`` / ``title`` / ``analysis`` / ``files`` and
+    ``steps: []``).
+
+    Deliberately shared by :func:`score_plan_structure`'s ``0.0``
+    short-circuit and by ``run_architect_eval``'s cap-taint predicate. Those
+    were once two independent tests — raw dict truthiness in the runner versus
+    ``not plan.get('steps')`` here — and they disagreed exactly on the
+    header-only stub, so a session cap landing right after ``create_plan`` left
+    the cell UNtainted and then floored it to a fabricated ``0.0``. Making both
+    call sites literally this function makes that drift structurally impossible.
+
+    Note this is a different question from the ``has_steps`` RUBRIC criterion
+    (:func:`_plan_has_steps`), which is scored per-plan against a real plan; do
+    not conflate the two roles.
+
+    Typed as a ``TypeGuard`` (a plain ``bool`` at runtime) so it also carries
+    the ``isinstance`` narrowing the inline guard it replaced used to give
+    :func:`score_plan_structure`.
+    """
+    return isinstance(plan, dict) and bool(plan.get('steps'))
+
+
 def score_plan_structure(
     plan: dict | None, rubric: dict[str, Any] = PLAN_QUALITY_RUBRIC,
 ) -> float:
     """Deterministic structural plan-quality score in ``[0, 1]``.
 
     Reads ONLY the produced plan dict — no LLM, no worktree, no transcript. A
-    plan with no steps (empty / ``None`` / empty ``steps`` list) is not a plan
-    and scores ``0.0`` outright. Otherwise returns the weight-weighted fraction
+    plan that is not :func:`is_scorable_plan` (empty / ``None`` / no steps /
+    the header-only ``create_plan`` stub) is not a plan and scores ``0.0``
+    outright. Otherwise returns the weight-weighted fraction
     of satisfied structural criteria,
     ``round(satisfied_weight / total_weight, 4)``, clamped to ``[0, 1]``.
 
@@ -336,7 +365,11 @@ def score_plan_structure(
     name, or a non-positive total weight — the rubric is code-owned, so a typo
     must fail loudly (structured-facts-at-failure / loud-over-silent).
     """
-    if not plan or not isinstance(plan, dict) or not plan.get('steps'):
+    # Exactly equivalent to the former inline
+    # ``not plan or not isinstance(plan, dict) or not plan.get('steps')``
+    # (an empty dict and a None both fail the steps test), now expressed via the
+    # ONE predicate the runner's taint decision also consults.
+    if not is_scorable_plan(plan):
         return 0.0
     criteria = rubric.get('criteria') or []
     if not criteria:
@@ -371,13 +404,19 @@ class PlanQualityVerdict:
     plan, or ``None`` — the parse-failure sentinel — when the judge output could
     not be parsed. ``run_architect_eval`` treats ``None`` as its signal to
     degrade to the deterministic :func:`score_plan_structure` floor, so the
-    persisted ``plan_quality`` is ALWAYS a non-sentinel float even when the
-    judge fails.
+    persisted ``plan_quality`` is a non-sentinel float even when the judge
+    fails (a judge failure never nulls a cell that has a real plan behind it).
     """
 
     plan_quality: float | None
     per_criterion: dict[str, Any]
     reasoning: str
+    # Set when the JUDGE'S OWN invocation was refused at the transport layer (a
+    # 429 cap hit / auth failure), so this ``None`` plan_quality is an INFRA
+    # failure — we never got a judgement — rather than an unparseable answer.
+    # Trailing and defaulted, so every existing 3-arg construction (including
+    # the parse-failure fallback below) is unaffected and keeps reading None.
+    invocation_error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -412,7 +451,12 @@ async def judge_plan_quality(
     :func:`score_plan_structure` weights deterministically.
 
     On any parse failure the verdict's ``plan_quality`` is ``None`` (the
-    sentinel :func:`run_architect_eval` degrades on), never a crash.
+    sentinel :func:`run_architect_eval` degrades on), never a crash. When the
+    judge's OWN invocation was refused at the transport layer (a 429 cap hit /
+    auth failure) the verdict additionally carries ``invocation_error``, so that
+    infra cause stays distinguishable from an unparseable answer; the caller
+    still degrades to the deterministic structural floor, which remains a
+    legitimate content-derived score whenever a real plan exists.
     """
     task_name = task.get('name', task.get('id', 'unknown'))
     task_desc = task.get('task_definition', {}).get('description', '')
@@ -465,6 +509,27 @@ Output JSON: {{"plan_quality": 0.0-1.0, "per_criterion": {{"<criterion>": 0.0-1.
         max_budget_usd=5.0,
         output_schema=PLAN_QUALITY_SCHEMA,
     )
+
+    # Was the JUDGE ITSELF refused at the transport layer? Checked BEFORE the
+    # parse block, because a 429 body is not JSON and would otherwise land in
+    # the parse-failure fallback — making an infra refusal indistinguishable
+    # from a judge that answered badly. Local import: keeps judge.py's
+    # module-level import surface unchanged (and there is no cycle either way —
+    # metrics.py does not import judge).
+    from .metrics import detect_invocation_error
+
+    invocation_error = detect_invocation_error(result)
+    if invocation_error:
+        logger.warning(
+            f'Plan judge invocation REFUSED at the transport layer: '
+            f'{invocation_error}'
+        )
+        return PlanQualityVerdict(
+            plan_quality=None,
+            per_criterion={},
+            reasoning=f'plan judge invocation refused: {invocation_error}',
+            invocation_error=invocation_error,
+        )
 
     # Parse verdict — structured_output first, else json.loads(output); a
     # missing/None/non-numeric plan_quality degrades to the None sentinel.

@@ -210,7 +210,23 @@ def build_composite_report(
     ``latency_secs`` is ``workflow_duration_ms / 1000`` (the workflow's own
     working time, not wall-clock, so eval/scheduler overhead is not charged to
     the config). ``recovery_score`` / ``plan_quality`` / ``role_under_test`` are
-    passthroughs of any trial's metrics (η/θ surfaces). ``cost_source`` (P5) is
+    passthroughs of any trial's metrics (η/θ surfaces) — except that
+    ``plan_quality`` deliberately skips CAP-TAINTED trials (task 3118) so an
+    infra refusal landing on the first trial cannot blank out a config that has
+    healthy trials; ``plan_quality_cap_excluded`` reports how many were skipped,
+    counted over ARCHITECT trials only so it agrees exactly with
+    :func:`build_plan_quality_report`'s architect-scoped ``cap_excluded``
+    (reviewer: docs-accuracy — two exclusion surfaces that disagree are worse
+    than one).
+
+    SCOPE of the taint exclusion, stated explicitly because it is narrow: only
+    the ``plan_quality`` passthrough skips tainted trials. The composite /
+    quality / cost / latency pools and the ``trials`` + ``tests_pass_rate``
+    denominators still COUNT them, deliberately — those pools measure the
+    implementer-path gates, which a tainted architect cell reports as an honest
+    failure rather than a fabricated score, and silently dropping trials from
+    the denominator ``select_survivors`` ranks on would shrink the sample
+    without saying so. ``cost_source`` (P5) is
     the config's single distinct per-trial source, or ``'mixed'`` when its
     trials span more than one — since ``cost_usd`` is a cross-trial mean,
     labelling it with just the first trial's source would mislabel a blended
@@ -257,6 +273,8 @@ def build_composite_report(
             'judge_invocations': 0, 'judge_cost_usd': 0.0,
             'cost_sources': set(),
             'first_metrics': None,
+            'first_untainted_metrics': None,
+            'plan_quality_cap_excluded': 0,
         }
 
     by_config: dict[str, dict[str, Any]] = defaultdict(_acc)
@@ -286,6 +304,20 @@ def build_composite_report(
         acc['cost_sources'].add(str(m.get('cost_source', 'cli')))
         if acc['first_metrics'] is None:
             acc['first_metrics'] = m
+        # The plan-quality passthrough deliberately skips cap-tainted trials, so
+        # an infra refusal that happened to land on the FIRST trial cannot blank
+        # out a config that has healthy ones (task 3118).
+        if m.get('cap_tainted'):
+            # Counted over ARCHITECT trials only, matching
+            # build_plan_quality_report's architect-scoped cap_excluded — the two
+            # exclusion surfaces describe the same cells and must not disagree.
+            # (A tainted non-architect trial has no plan_quality to exclude in
+            # the first place, so it is skipped as a passthrough source here and
+            # counted by neither surface.)
+            if m.get('role_under_test') == 'architect':
+                acc['plan_quality_cap_excluded'] += 1
+        elif acc['first_untainted_metrics'] is None:
+            acc['first_untainted_metrics'] = m
 
     rows: list[dict[str, Any]] = []
     for cfg in sorted(by_config):
@@ -317,7 +349,11 @@ def build_composite_report(
                 'cost_usd': acc['judge_cost_usd'],
             },
             'recovery_score': fm.get('recovery_score'),
-            'plan_quality': fm.get('plan_quality'),
+            # Falls back to fm only when EVERY trial was tainted — there is no
+            # untainted measurement to report, and the accompanying
+            # plan_quality_cap_excluded count says why.
+            'plan_quality': (acc['first_untainted_metrics'] or fm).get('plan_quality'),
+            'plan_quality_cap_excluded': acc['plan_quality_cap_excluded'],
         })
 
     return {
@@ -616,6 +652,58 @@ def format_markdown(report: dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Shared fixed-width table renderer
+#
+# The single home for the width-computed ljust idiom every deterministic table
+# below shares (recovery / plan-quality / per-config mean / price / composite).
+# It was copied five times before task 3118, which is exactly the drift this
+# invites: the '-'-not-'0.0000' fix had to be applied to two copies by hand and
+# the other three silently kept their trailing padding.
+# ---------------------------------------------------------------------------
+
+def _render_fixed_table(
+    columns: tuple[str, ...],
+    rendered: list[dict[str, str]],
+    *,
+    header: str | None = None,
+) -> list[str]:
+    """Render PRE-STRINGIFIED rows as a fixed-width, byte-deterministic block.
+
+    *rendered* is a list of ``{column: cell}`` dicts whose values are already
+    strings — every value/None/precision decision stays with the caller, which
+    is what keeps this generic. Column widths are the max of the header and all
+    cells, so the block is a function of its input alone: no wall-clock, no
+    dict-order dependence, and the same rows always render byte-identically.
+
+    Returns the block as LINES (optional *header* line, column headers, a dashes
+    rule, then the rows) rather than a joined string, so callers can append
+    further sections — several emit two or three blocks separated by blanks.
+
+    Lines are ``rstrip``ed: trailing padding on the last column is invisible
+    whitespace that makes an otherwise-identical table differ byte-for-byte,
+    and it lets a caller assert on a line's real ending (e.g. the per-config
+    mean block's ``-`` for "nothing scored", which must never read as
+    ``0.0000``).
+    """
+    widths = {
+        col: (
+            max(len(col), *(len(rr[col]) for rr in rendered))
+            if rendered else len(col)
+        )
+        for col in columns
+    }
+
+    def _fmt(cells: dict[str, str]) -> str:
+        return '  '.join(cells[col].ljust(widths[col]) for col in columns).rstrip()
+
+    lines = [header] if header is not None else []
+    lines.append(_fmt({col: col for col in columns}))
+    lines.append('  '.join('-' * widths[col] for col in columns))
+    lines.extend(_fmt(rr) for rr in rendered)
+    return lines
+
+
+# ---------------------------------------------------------------------------
 # recovery_score surface (eval-revival η)
 #
 # An ADDITIVE, interim per-(task_id, config_name) column distinct from the Elo
@@ -692,22 +780,9 @@ def format_recovery_table(report: dict[str, Any]) -> str:
         }
         for r in rows
     ]
-    widths = {
-        col: (
-            max(len(col), *(len(rr[col]) for rr in rendered))
-            if rendered else len(col)
-        )
-        for col in _RECOVERY_COLUMNS
-    }
-
-    def _fmt(cells: dict[str, str]) -> str:
-        return '  '.join(cells[col].ljust(widths[col]) for col in _RECOVERY_COLUMNS)
-
-    lines = ['recovery_score report:']
-    lines.append(_fmt({col: col for col in _RECOVERY_COLUMNS}))
-    lines.append('  '.join('-' * widths[col] for col in _RECOVERY_COLUMNS))
-    lines.extend(_fmt(rr) for rr in rendered)
-    return '\n'.join(lines)
+    return '\n'.join(_render_fixed_table(
+        _RECOVERY_COLUMNS, rendered, header='recovery_score report:',
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -725,7 +800,52 @@ def format_recovery_table(report: dict[str, Any]) -> str:
 # consume in the interim, mirroring η's recovery surface.
 # ---------------------------------------------------------------------------
 
-_PLAN_QUALITY_COLUMNS = ('task_id', 'config_name', 'role_under_test', 'plan_quality')
+_PLAN_QUALITY_COLUMNS = (
+    'task_id', 'config_name', 'role_under_test', 'plan_quality',
+    'invocation_error',
+)
+_PLAN_QUALITY_MEAN_COLUMNS = (
+    'config_name', 'n', 'cap_excluded', 'mean_plan_quality',
+)
+# The plan_quality cell of a cap-tainted row. Deliberately NOT a number and NOT
+# the bare '-' null sentinel (which already means "not an architect run"): a
+# reader must be able to tell "this candidate scored nothing" from "we could not
+# measure this candidate" at a glance.
+#
+# Spelled 'excluded', not 'cap-excluded' (reviewer: design-coherence): the
+# ``cap_tainted`` flag covers every unmeasurable cause — cap hit, auth failure,
+# model-not-found, zero-output wedge, harness error — and a PERMANENT config
+# error ("this candidate can never run") must not render as a TRANSIENT one
+# ("rerun after the cap window"). The cause is always carried in the adjacent
+# ``invocation_error`` column and broken out by cause in the summary line, so
+# the marker itself stays cause-neutral rather than asserting a cap.
+_CAP_EXCLUDED_CELL = 'excluded'
+_PLAN_QUALITY_MEAN_HEADER = 'plan_quality by config:'
+
+
+def _taint_cause(marker: str | None) -> str:
+    """Reduce a stage-prefixed ``invocation_error`` to its bare CAUSE key.
+
+    ``"architect:cap_hit: You've hit your session limit · resets 8pm"`` →
+    ``"cap_hit"``; ``"architect:model_not_found: ..."`` → ``"model_not_found"``.
+    Pure string surgery on the marker ``run_architect_eval`` builds — the eval
+    layer deliberately does not re-derive the cause from the AgentResult, which
+    is long gone by report time.
+
+    Falls back to ``'unknown'`` for an absent or unparseable marker rather than
+    guessing, so a mis-shaped marker shows up as its own bucket instead of being
+    silently folded into a real cause.
+    """
+    if not marker:
+        return 'unknown'
+    # Only the FIRST stage marker is used: the join order is architect-then-
+    # judge, and a judge-only refusal never taints, so the leading marker is
+    # always the one that drove the exclusion.
+    first = marker.split(';')[0].strip()
+    _stage, sep, rest = first.partition(':')
+    if not sep:
+        return first or 'unknown'
+    return rest.strip().partition(':')[0].strip() or 'unknown'
 
 
 def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
@@ -739,6 +859,27 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
     / ``role_under_test`` key) reads back as ``None`` for each, so old reports
     render unchanged. Rows are sorted by ``(task_id, config_name)`` so the
     surface is deterministic.
+
+    Rows additionally carry the task-3118 infra markers ``cap_tainted`` /
+    ``invocation_error`` (likewise default-safe: ``False`` / ``None`` for
+    metrics predating them), and the report gains a per-config aggregate over
+    ARCHITECT rows plus a report-level ``cap_excluded`` total.
+
+    THE INVARIANT: a cap-tainted cell is an infra failure — we never got to ask
+    the model — so it is EXCLUDED from ``mean_plan_quality`` and COUNTED as
+    excluded, never averaged in as a zero. Averaging it in would penalise
+    whichever candidate happened to be scheduled inside a cap window, which is a
+    property of the schedule, not of the candidate. A config with no scored cells
+    reports ``mean_plan_quality=None`` rather than ``0.0``, so "we measured
+    nothing" can never read as "it scored nothing".
+
+    ``cap_excluded_by_cause`` breaks that total out by CAUSE
+    (``{'cap_hit': 2, 'model_not_found': 1}``, key-sorted for determinism)
+    because the causes are not interchangeable: a cap hit is transient and
+    schedule-attributable ("rerun after the window"), whereas a model-not-found
+    or auth failure is a PERMANENT, candidate-specific configuration error. A
+    single "cap-excluded" total would let the latter masquerade as the former
+    and hide a config that can never run behind ``n=0, mean=None``.
     """
     rows: list[dict[str, Any]] = []
     for result in results:
@@ -747,9 +888,75 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
             'config_name': result.config_name,
             'role_under_test': result.metrics.get('role_under_test'),
             'plan_quality': result.metrics.get('plan_quality'),
+            'cap_tainted': bool(result.metrics.get('cap_tainted')),
+            'invocation_error': result.metrics.get('invocation_error'),
         })
     rows.sort(key=lambda r: (r['task_id'], r['config_name']))
-    return {'rows': rows}
+
+    # Per-config aggregate over ARCHITECT rows only — an implementer run never
+    # invokes the plan judge, so its null score is a different thing entirely
+    # and must not dilute the architect mean.
+    scored: dict[str, list[float]] = defaultdict(list)
+    excluded: dict[str, int] = defaultdict(int)
+    totals: dict[str, int] = defaultdict(int)
+    by_cause: dict[str, int] = defaultdict(int)
+    for row in rows:
+        if row['role_under_test'] != 'architect':
+            continue
+        cfg = row['config_name']
+        totals[cfg] += 1
+        if row['cap_tainted']:
+            excluded[cfg] += 1
+            by_cause[_taint_cause(row['invocation_error'])] += 1
+        elif row['plan_quality'] is not None:
+            scored[cfg].append(float(row['plan_quality']))
+
+    configs = [
+        {
+            'config_name': cfg,
+            'n': len(scored[cfg]),
+            'cap_excluded': excluded[cfg],
+            'total': totals[cfg],
+            'mean_plan_quality': (
+                round(sum(scored[cfg]) / len(scored[cfg]), 4)
+                if scored[cfg] else None
+            ),
+        }
+        for cfg in sorted(totals)
+    ]
+    return {
+        'rows': rows,
+        'configs': configs,
+        'cap_excluded': sum(excluded.values()),
+        'cap_excluded_by_cause': {c: by_cause[c] for c in sorted(by_cause)},
+    }
+
+
+def _format_plan_quality_mean_section(report: dict[str, Any]) -> list[str]:
+    """Render the per-config mean block: how many cells actually scored.
+
+    The point of the block is that ``mean_plan_quality`` is reported ALONGSIDE
+    the ``n`` it was computed over and the ``cap_excluded`` count it left out,
+    so a mean over 19 of 22 cells reads as exactly that instead of looking like
+    a mean over all of them. A config with nothing scored renders ``-``, never
+    ``0.0000``.
+    """
+    configs = report.get('configs', [])
+    rendered = [
+        {
+            'config_name': str(c['config_name']),
+            'n': str(c['n']),
+            'cap_excluded': str(c['cap_excluded']),
+            'mean_plan_quality': (
+                '-' if c['mean_plan_quality'] is None
+                else f'{float(c["mean_plan_quality"]):.4f}'
+            ),
+        }
+        for c in configs
+    ]
+    return _render_fixed_table(
+        _PLAN_QUALITY_MEAN_COLUMNS, rendered, header=_PLAN_QUALITY_MEAN_HEADER,
+    )
 
 
 def format_plan_quality_table(report: dict[str, Any]) -> str:
@@ -757,41 +964,58 @@ def format_plan_quality_table(report: dict[str, Any]) -> str:
 
     A ``plan_quality`` column shows the populated float (4 dp) for architect rows
     and ``-`` (the null sentinel) for non-architect rows; ``role_under_test``
-    renders ``-`` when ``None``. The same report always renders byte-identically
-    (no wall-clock or dict-order dependence).
+    and ``invocation_error`` render ``-`` when ``None``. A CAP-TAINTED row shows
+    the explicit ``excluded`` marker in place of a score, alongside the
+    ``invocation_error`` that caused it — an infra failure must never render as
+    ``0.0000``, and must stay distinguishable from the ``-`` a non-architect row
+    uses.
+
+    Two sections follow the rows: the exclusion count — how many architect cells
+    were not measurable, BROKEN OUT BY CAUSE so a permanent config error is not
+    read as a transient cap window — and the per-config mean block. Both are
+    computed from the report, so the CLI caller picks the exclusion up with no
+    change of its own. The same report always renders byte-identically (no
+    wall-clock or dict-order dependence).
     """
     rows = report.get('rows', [])
 
-    def _score_cell(value: float | None) -> str:
+    def _score_cell(row: dict[str, Any]) -> str:
+        if row.get('cap_tainted'):
+            return _CAP_EXCLUDED_CELL
+        value = row['plan_quality']
         return '-' if value is None else f'{value:.4f}'
 
-    def _role_cell(value: str | None) -> str:
+    def _text_cell(value: str | None) -> str:
         return '-' if value is None else str(value)
 
     rendered = [
         {
             'task_id': str(r['task_id']),
             'config_name': str(r['config_name']),
-            'role_under_test': _role_cell(r['role_under_test']),
-            'plan_quality': _score_cell(r['plan_quality']),
+            'role_under_test': _text_cell(r['role_under_test']),
+            'plan_quality': _score_cell(r),
+            'invocation_error': _text_cell(r.get('invocation_error')),
         }
         for r in rows
     ]
-    widths = {
-        col: (
-            max(len(col), *(len(rr[col]) for rr in rendered))
-            if rendered else len(col)
-        )
-        for col in _PLAN_QUALITY_COLUMNS
-    }
+    lines = _render_fixed_table(
+        _PLAN_QUALITY_COLUMNS, rendered, header='plan_quality report:',
+    )
 
-    def _fmt(cells: dict[str, str]) -> str:
-        return '  '.join(cells[col].ljust(widths[col]) for col in _PLAN_QUALITY_COLUMNS)
-
-    lines = ['plan_quality report:']
-    lines.append(_fmt({col: col for col in _PLAN_QUALITY_COLUMNS}))
-    lines.append('  '.join('-' * widths[col] for col in _PLAN_QUALITY_COLUMNS))
-    lines.extend(_fmt(rr) for rr in rendered)
+    architect_cells = sum(c['total'] for c in report.get('configs', []))
+    # Broken out by CAUSE so a permanent config error (model_not_found /
+    # auth_failed — "this candidate can never run") cannot masquerade as a
+    # transient schedule artifact (cap_hit — "rerun after the window").
+    by_cause = report.get('cap_excluded_by_cause') or {}
+    causes = ', '.join(f'{cause}: {n}' for cause, n in sorted(by_cause.items()))
+    lines.append('')
+    lines.append(
+        f'excluded: {report.get("cap_excluded", 0)} unmeasurable cell(s) of '
+        f'{architect_cells} architect cell(s)'
+        + (f' ({causes})' if causes else '')
+    )
+    lines.append('')
+    lines.extend(_format_plan_quality_mean_section(report))
     return '\n'.join(lines)
 
 
@@ -842,22 +1066,9 @@ def _format_price_table_section(price_table: dict[str, Any]) -> list[str]:
                 'input_per_1m': inp,
                 'output_per_1m': outp,
             })
-    widths = {
-        col: (
-            max(len(col), *(len(rr[col]) for rr in rendered))
-            if rendered else len(col)
-        )
-        for col in _PRICE_TABLE_COLUMNS
-    }
-
-    def _fmt(cells: dict[str, str]) -> str:
-        return '  '.join(cells[col].ljust(widths[col]) for col in _PRICE_TABLE_COLUMNS)
-
-    lines = ['price table:']
-    lines.append(_fmt({col: col for col in _PRICE_TABLE_COLUMNS}))
-    lines.append('  '.join('-' * widths[col] for col in _PRICE_TABLE_COLUMNS))
-    lines.extend(_fmt(rr) for rr in rendered)
-    return lines
+    return _render_fixed_table(
+        _PRICE_TABLE_COLUMNS, rendered, header='price table:',
+    )
 
 
 def format_composite_table(report: dict[str, Any]) -> str:
@@ -887,21 +1098,9 @@ def format_composite_table(report: dict[str, Any]) -> str:
         }
         for r in configs
     ]
-    widths = {
-        col: (
-            max(len(col), *(len(rr[col]) for rr in rendered))
-            if rendered else len(col)
-        )
-        for col in _COMPOSITE_COLUMNS
-    }
-
-    def _fmt(cells: dict[str, str]) -> str:
-        return '  '.join(cells[col].ljust(widths[col]) for col in _COMPOSITE_COLUMNS)
-
-    lines = ['composite report:']
-    lines.append(_fmt({col: col for col in _COMPOSITE_COLUMNS}))
-    lines.append('  '.join('-' * widths[col] for col in _COMPOSITE_COLUMNS))
-    lines.extend(_fmt(rr) for rr in rendered)
+    lines = _render_fixed_table(
+        _COMPOSITE_COLUMNS, rendered, header='composite report:',
+    )
 
     # Distinct price-table section.
     lines.append('')

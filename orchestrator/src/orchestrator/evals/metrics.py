@@ -9,6 +9,20 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+# The W4 cap/error classification seam (task 3118). Module-level import is safe
+# for the same reason agents.invoke above is: shared.invocation_outcome reaches
+# only shared.cli_invoke and has no import back into orchestrator, so there is
+# no cycle. detect_invocation_error below delegates to it rather than forking
+# its cap/auth string tables into the eval layer.
+from shared.invocation_outcome import (
+    OK,
+    AuthFailed,
+    CapHit,
+    ModelNotFound,
+    ZeroOutputWedge,
+    classify_invocation,
+)
+
 # Cost primitives (the USD/1M fallback rate + the PriceEntry-or-dict accessor)
 # have a SINGLE home in agents.invoke (task 2459); this module re-exports them
 # rather than re-declaring so the three-way copy can never drift (reviewer:
@@ -19,6 +33,8 @@ from typing import TYPE_CHECKING, Any
 from orchestrator.agents.invoke import _FALLBACK_PRICE, _rate
 
 if TYPE_CHECKING:
+    from shared.cli_invoke import AgentResult
+
     from orchestrator.workflow import TaskWorkflow
 
 logger = logging.getLogger(__name__)
@@ -99,11 +115,18 @@ class EvalMetrics:
     # from the base composite, populated ONLY for architect runs
     # (role_under_test=='architect'); ``None`` is the C4 ``plan_quality | null``
     # sentinel for non-architect (implementer) runs, kept distinct from a
-    # genuinely scored ``0.0``. Unlike recovery scoring (which degrades to
-    # None on failure), an architect run ALWAYS emits a non-sentinel float —
-    # ``run_architect_eval`` degrades to the deterministic ``score_plan_structure``
-    # floor if the LLM plan judge fails, so None here means "not an architect
-    # run", never "architect run whose scoring failed".
+    # genuinely scored ``0.0``. Unlike recovery scoring (which degrades to None
+    # on failure), an architect run that was actually ASKED always emits a
+    # non-sentinel float — ``run_architect_eval`` degrades to the deterministic
+    # ``score_plan_structure`` floor if the LLM plan judge fails.
+    #
+    # ``None`` therefore has exactly TWO causes, disambiguated by the markers
+    # below: (1) not an architect run at all (``role_under_test != 'architect'``,
+    # ``cap_tainted`` False), or (2) an architect run we could NOT measure
+    # because the invocation was refused at the transport layer — a 429 cap hit
+    # or auth failure — which carries ``cap_tainted=True`` and a stage-prefixed
+    # ``invocation_error`` (task 3118). A scoring FAILURE is still never a cause:
+    # it degrades to the structural floor, not to None.
     plan_quality: float | None = None
 
     # Which role this run put UNDER TEST (eval-revival θ / C4 role_under_test),
@@ -112,6 +135,50 @@ class EvalMetrics:
     # ordinary path. The plan-quality report keys its column on this being
     # ``'architect'``.
     role_under_test: str | None = None
+
+    # Infra-failure markers (task 3118) — the pair that keeps a TRANSPORT-layer
+    # refusal from being read as a CONTENT-domain score.
+    #
+    # ``invocation_error`` records WHAT happened: a stage-prefixed marker for an
+    # infra failure observed while producing this cell, e.g.
+    # ``"architect:cap_hit: You've hit your session limit · resets 8pm"``,
+    # ``"architect:model_not_found: ..."``, ``"architect:wedge: ..."`` or
+    # ``"judge:api_error: HTTP 429"``. ``None`` means no infra failure was
+    # observed — including for an ordinary content failure (an architect that
+    # ran fine and simply produced a bad/absent plan), which must keep scoring
+    # on content.
+    #
+    # ``cap_tainted`` is the SCORING DECISION derived from it: this cell is not
+    # a content measurement at all, so the plan_quality aggregates EXCLUDE it
+    # rather than average in a fabricated zero (which would penalise whichever
+    # candidate happened to be scheduled inside a cap window). Scope note: only
+    # the plan_quality surfaces exclude — ``build_composite_report``'s
+    # composite/quality pools and its ``trials`` / ``tests_pass_rate``
+    # denominators deliberately still COUNT a tainted trial, because those pools
+    # measure the implementer-path gates (which a tainted architect cell reports
+    # as an honest failure, not a fabricated score) and dropping trials from the
+    # denominator would silently shrink the sample ``select_survivors`` ranks on.
+    #
+    # NAME vs SCOPE (reviewer: design-coherence): the field name is ``cap_``
+    # because the campaign that motivated it was a session-cap window, but the
+    # set of causes is broader — any refusal that left NO model content to score
+    # (cap hit, auth failure, model-not-found, zero-output wedge, harness
+    # error). A cap hit is SCHEDULE-attributable (rerun later); a model-not-found
+    # is a PERMANENT config error. Those must not read alike, so the CAUSE is
+    # always carried in ``invocation_error`` and the report surfaces break the
+    # exclusion count out by cause rather than reporting a bare "cap" total.
+    #
+    # ``cap_tainted`` is kept as an explicit boolean — not inferred from
+    # ``plan_quality is None`` — for the same reason ``adversarial`` is kept
+    # distinct from ``recovery_score``: a null score would otherwise be ambiguous
+    # between "not an architect run" and "architect run we could not measure".
+    # This is the same null-gating discipline ``_is_false_green`` /
+    # ``_is_null_work`` already apply to ``tests_pass``, applied to the cap path.
+    #
+    # Both defaults are safe, so results persisted before these fields existed
+    # read back unchanged (no marker, not tainted).
+    invocation_error: str | None = None
+    cap_tainted: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -152,6 +219,75 @@ def _is_null_work(m: EvalMetrics) -> bool:
         and m.files_changed == 0
         and m.cost_usd > 0
     )
+
+
+# Cap/auth reasons are free-form CLI text; clip them so the marker stays a
+# single short line in result JSON and in the report tables.
+_MARKER_REASON_CHARS = 80
+
+
+def detect_invocation_error(
+    result: AgentResult | None, *, backend: str = 'claude',
+) -> str | None:
+    """Name the TRANSPORT-layer refusal behind a failed invocation, if any.
+
+    The third infra-failure guard alongside :func:`_is_false_green` /
+    :func:`_is_null_work`, and the input to the ``cap_tainted`` scoring
+    decision: it answers "did we ever actually get to ask the model?" so a CLI
+    429 stops being scored as if the model had answered badly.
+
+    Classification is DELEGATED to
+    :func:`shared.invocation_outcome.classify_invocation` rather than
+    re-matching 429/cap strings here — that seam already owns the cap/auth/
+    model-not-found tables (under a drift guard) and short-circuits ``OK`` on
+    ``result.success``, which is what stops a healthy run whose OUTPUT merely
+    quotes a cap string from being falsely tainted. Forking those tables into
+    the eval layer would reproduce exactly the false-positive class they were
+    built to prevent.
+
+    The explicit ``api_error_status == 429`` fallback is still required: 429 is
+    deliberately EXCLUDED from the ``AuthFailed`` variant (it normally carries a
+    cap-message body that the cap-TEXT tier recognises), so a BODY-LESS 429
+    would otherwise fall through to ``Failure(unclassified)`` and go unmarked.
+    It is checked BEFORE the wedge tier so a 429 that also timed out with zero
+    turns is reported as the 429 it is, not as a generic wedge.
+
+    ``ZeroOutputWedge`` is marked too (reviewer: robustness): a full-timeout
+    invocation with zero transcript turns produced no model answer at all, so it
+    is unmeasurable for exactly the reason a 429 is, and scoring it 0.0 would
+    reintroduce the fabricated zero this helper exists to remove.
+
+    Returns ``None`` — deliberately, not a marker — for ``result is None``, for
+    a successful invocation, and for every remaining variant (``NearCap``, which
+    is a WARNING that did not block this invocation; ``CliLocalError``, which is
+    explicitly not a cap; ``Failure(unclassified)``). An ORDINARY content failure
+    (an architect that really ran and simply produced a bad or absent plan) is a
+    genuine reliability signal that must keep scoring on content; laundering it
+    into an exclusion would hide it.
+
+    Pure: no I/O, no LLM, no mutation. Raising is left to the caller to guard
+    (``run_architect_eval`` wraps the call) so a classifier bug degrades that
+    one cell rather than being silently swallowed everywhere.
+    """
+    if result is None:
+        return None
+
+    outcome = classify_invocation(result, strict_confirm=True, backend=backend)
+    if isinstance(outcome, CapHit):
+        return f'cap_hit: {outcome.reason[:_MARKER_REASON_CHARS]}'
+    if isinstance(outcome, AuthFailed):
+        return f'auth_failed: HTTP {outcome.status}'
+    if isinstance(outcome, ModelNotFound):
+        return f'model_not_found: {outcome.reason[:_MARKER_REASON_CHARS]}'
+    if isinstance(outcome, OK):
+        # Preserve classify_invocation's OK short-circuit through the fallback
+        # below: a successful invocation is never an infra refusal.
+        return None
+    if getattr(result, 'api_error_status', None) == 429:
+        return 'api_error: HTTP 429'
+    if isinstance(outcome, ZeroOutputWedge):
+        return 'wedge: zero-output timeout (no transcript turns)'
+    return None
 
 
 def compute_composite(m: EvalMetrics) -> float:
