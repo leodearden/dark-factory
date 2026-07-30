@@ -1291,11 +1291,16 @@ class TestStrandedVerifiedGreenHappyPathIntegration:
     the action via an auto-dismissed escalation (NO pending L1, marker
     stamped).  The merge then LANDS (a MergeProvenance journal row makes the
     branch resolve ON_MAIN).  Sweep 2 marks the blocked task done via the
-    EXISTING found_on_main MARK_DONE_WITH_PROVENANCE path — which is only
-    reachable because (a) the record escalation is DISMISSED, not pending
-    (else the ``not report.open_escalations`` guard would block the flip),
-    and (b) the ``stranded_merge_request`` marker lives in metadata, ignored
-    by the mark-done path.  No ``stranded_merge_failed`` L2 is ever filed.
+    EXISTING found_on_main MARK_DONE_WITH_PROVENANCE path — reachable because
+    (a) the record escalation is DISMISSED, not pending, so the upgrade's
+    open-escalation guard is vacuously satisfied, and (b) the
+    ``stranded_merge_request`` marker lives in metadata, ignored by the
+    mark-done path.  No ``stranded_merge_failed`` L2 is ever filed.
+
+    Since PRD leaf δ that guard is ``_only_merge_remediable``, so a pending
+    ``stranded_blocked`` record would not block the flip either — this test
+    still pins the DISMISSED shape the submit path actually produces, and
+    TestVerifiedGreenVetoRelaxOnMain covers the still-pending case.
     """
 
     async def test_submit_then_land_marks_done_via_found_on_main(

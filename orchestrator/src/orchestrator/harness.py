@@ -4489,7 +4489,12 @@ class Harness:
         # the exact Fix #1a re-pend we are replacing).  The dismissed record
         # still lands in the archive as an audit trail, and leaving NO pending
         # escalation keeps the later found_on_main MARK_DONE flip unblocked
-        # (its report.open_escalations guard).
+        # (its open-escalation guard).  Since PRD leaf δ that guard is
+        # _only_merge_remediable, so a pending stranded_blocked would no longer
+        # block the flip either — the dismiss is now belt-and-braces for THIS
+        # record rather than load-bearing, and is kept because the archive
+        # audit trail plus a zero-pending-escalation task is the honest state:
+        # nothing here awaits a human.
         if self._escalation_queue is not None:
             from escalation.models import Escalation  # noqa: PLC0415
 
@@ -4870,11 +4875,20 @@ class Harness:
         # already-established degenerate-branch refinement pattern
         # (_branch_is_degenerate below) — rather than a change to θ1's
         # reviewed table (design decision, task 2243; esc-2243-4).
+        #
+        # The open-escalation clause is _only_merge_remediable, not the former
+        # `not report.open_escalations` (PRD leaf δ): a task whose branch landed
+        # while it was still blocked is often held by the reaper's OWN
+        # stranded_blocked — the escalation that ASKED for this landing — and
+        # letting it veto the self-heal pins the task blocked forever after its
+        # work is already on main.  Any non-remediable (human-concern)
+        # escalation still yields False and leaves the task alone, and an empty
+        # list is still True, so every other task classifies exactly as before.
         if (
             action == RecoveryAction.LEAVE
             and status == 'blocked'
             and report.live_claimant is None
-            and not report.open_escalations
+            and self._only_merge_remediable(report.open_escalations)
             and report.branch_state.kind in (
                 BranchStateKind.ON_MAIN, BranchStateKind.GONE_WITH_MERGE_MARKER,
             )
