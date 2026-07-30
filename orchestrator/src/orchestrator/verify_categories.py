@@ -14,6 +14,11 @@ The two ``verify_runner`` ``UNSCOPED_TYPECHECK_*`` sentinels are a separate,
 out-of-band gate namespace injected into ``VerifyResult.category`` — never
 produced by the classifier — and are deliberately NOT members here (see
 plans/verify-plan-prd.md task α design decisions).
+
+Task 3173 adds a fifth derived registry, ``INDETERMINATE_VERDICT_CATEGORIES``,
+naming the categories whose leg produced no completed verdict at all — so that
+leg may not veto another host's completed PASS in merge_queue's per-land
+cross-check.
 """
 
 from __future__ import annotations
@@ -24,9 +29,10 @@ from typing import cast
 
 
 class FailureCategory(StrEnum):
-    """The closed 14-value output domain of ``verify_classify.classify_failure``."""
+    """The closed 15-value output domain of ``verify_classify.classify_failure``."""
 
     INFRA_TIMEOUT = 'infra_timeout'
+    INFRA_KILL = 'infra_kill'
     DISK_FULL = 'disk_full'
     SEMAPHORE_TIMEOUT = 'semaphore_timeout'
     CARGO_CLI_ERROR = 'cargo_cli_error'
@@ -45,7 +51,7 @@ class FailureCategory(StrEnum):
 class RetryKind(Enum):
     """How ``run_verification`` recovers from a given category, if at all.
 
-    Populated for all 14 ``CATEGORY_POLICY`` rows per the PRD contract
+    Populated for all 15 ``CATEGORY_POLICY`` rows per the PRD contract
     (plans/verify-plan-prd.md task α item 4: ``CategoryPolicy(severity_rank,
     archive, preexisting_probe, is_infra_transient, retry_kind)``) but NOT
     yet dispatched on. ``run_verification`` still decides retries via two
@@ -82,8 +88,28 @@ CATEGORY_POLICY: dict[FailureCategory, CategoryPolicy] = {
         severity_rank=0, archive=False, preexisting_probe=False,
         is_infra_transient=False, retry_kind=RetryKind.TIMEOUT,
     ),
+    # A leg terminated by an EXTERNAL signal (SIGKILL/SIGTERM/SIGINT/SIGHUP —
+    # the OOM killer, systemd, verify_cancel.py's sweep, an operator) never
+    # produced an exit verdict at all, so no amount of output pattern-matching
+    # can make one up. Ranked immediately below INFRA_TIMEOUT: both mean "no
+    # verdict was produced", so a kill must dominate any co-occurring
+    # output-derived category in ``_worst_category``.
+    #
+    # ``archive=True`` deliberately DIVERGES from every other infra category
+    # (INFRA_TIMEOUT / DISK_FULL / SEMAPHORE_TIMEOUT / PYTEST_INTERNALERROR /
+    # ENV_TRANSIENT are all archive=False). A kill is the one infra cause that
+    # is genuinely off-box and un-reproducible after the fact, so the durable
+    # per-attempt record is its ONLY forensic handle — the incident that
+    # motivated this row (merge_sha b1ac2c7f) was diagnosable solely because
+    # the killed leg happened to land in archive=True UNKNOWN_TEST_FAILURE.
+    # Flipping to the usual infra archive=False would delete the evidence
+    # trail and make the whole class invisible again.
+    FailureCategory.INFRA_KILL: CategoryPolicy(
+        severity_rank=1, archive=True, preexisting_probe=False,
+        is_infra_transient=True, retry_kind=RetryKind.NONE,
+    ),
     FailureCategory.DISK_FULL: CategoryPolicy(
-        severity_rank=1, archive=False, preexisting_probe=False,
+        severity_rank=2, archive=False, preexisting_probe=False,
         is_infra_transient=True, retry_kind=RetryKind.NONE,
     ),
     # archive=True (task 3679): unlike its DISK_FULL sibling this category is
@@ -93,51 +119,51 @@ CATEGORY_POLICY: dict[FailureCategory, CategoryPolicy] = {
     # live incidents blocked on exactly that (reify data/verify-logs/5848 and
     # /5893 were never written).
     FailureCategory.SEMAPHORE_TIMEOUT: CategoryPolicy(
-        severity_rank=2, archive=True, preexisting_probe=False,
+        severity_rank=3, archive=True, preexisting_probe=False,
         is_infra_transient=True, retry_kind=RetryKind.NONE,
     ),
     FailureCategory.CARGO_CLI_ERROR: CategoryPolicy(
-        severity_rank=3, archive=True, preexisting_probe=True,
+        severity_rank=4, archive=True, preexisting_probe=True,
         is_infra_transient=False, retry_kind=RetryKind.NONE,
     ),
     FailureCategory.COMPILE_ERROR: CategoryPolicy(
-        severity_rank=4, archive=False, preexisting_probe=True,
+        severity_rank=5, archive=False, preexisting_probe=True,
         is_infra_transient=False, retry_kind=RetryKind.NONE,
     ),
     FailureCategory.TREE_SITTER_GENERATE_ERROR: CategoryPolicy(
-        severity_rank=5, archive=True, preexisting_probe=True,
+        severity_rank=6, archive=True, preexisting_probe=True,
         is_infra_transient=False, retry_kind=RetryKind.NONE,
     ),
     FailureCategory.FLOCK_ERROR: CategoryPolicy(
-        severity_rank=6, archive=True, preexisting_probe=False,
+        severity_rank=7, archive=True, preexisting_probe=False,
         is_infra_transient=False, retry_kind=RetryKind.NONE,
     ),
     FailureCategory.NPM_ERROR: CategoryPolicy(
-        severity_rank=7, archive=True, preexisting_probe=True,
+        severity_rank=8, archive=True, preexisting_probe=True,
         is_infra_transient=False, retry_kind=RetryKind.NONE,
     ),
     FailureCategory.PYTEST_INTERNALERROR: CategoryPolicy(
-        severity_rank=8, archive=False, preexisting_probe=False,
+        severity_rank=9, archive=False, preexisting_probe=False,
         is_infra_transient=True, retry_kind=RetryKind.NONE,
     ),
     FailureCategory.ENV_TRANSIENT: CategoryPolicy(
-        severity_rank=9, archive=False, preexisting_probe=False,
+        severity_rank=10, archive=False, preexisting_probe=False,
         is_infra_transient=True, retry_kind=RetryKind.ENV_SERIAL,
     ),
     FailureCategory.TEST_FAILURE: CategoryPolicy(
-        severity_rank=10, archive=False, preexisting_probe=True,
+        severity_rank=11, archive=False, preexisting_probe=True,
         is_infra_transient=False, retry_kind=RetryKind.NONE,
     ),
     FailureCategory.UNKNOWN_TEST_FAILURE: CategoryPolicy(
-        severity_rank=11, archive=True, preexisting_probe=True,
+        severity_rank=12, archive=True, preexisting_probe=True,
         is_infra_transient=False, retry_kind=RetryKind.NONE,
     ),
     FailureCategory.PASSED: CategoryPolicy(
-        severity_rank=12, archive=False, preexisting_probe=True,
+        severity_rank=13, archive=False, preexisting_probe=True,
         is_infra_transient=False, retry_kind=RetryKind.NONE,
     ),
     FailureCategory.NONE: CategoryPolicy(
-        severity_rank=13, archive=False, preexisting_probe=True,
+        severity_rank=14, archive=False, preexisting_probe=True,
         is_infra_transient=False, retry_kind=RetryKind.NONE,
     ),
 }
@@ -196,12 +222,34 @@ INFRA_TRANSIENT_CATEGORIES: frozenset[FailureCategory] = frozenset(
     c for c, p in CATEGORY_POLICY.items() if p.is_infra_transient
 )
 
+# Categories whose leg produced NO completed verdict, so the leg may not veto
+# another host's completed PASS (merge_queue's per-land cross-check). Derived
+# from INFRA_TRANSIENT_CATEGORIES minus INFRA_TIMEOUT.
+#
+# INFRA_TIMEOUT is deliberately EXCLUDED even though a timed-out leg is not a
+# completed FAIL either: a hang is one of the few non-completions a branch can
+# genuinely CAUSE (an infinite loop or a deadlock introduced by the diff), and
+# a remote host with a longer effective timeout or more cores could pass the
+# same commit. Silently landing on a local timeout would be a false-GREEN —
+# the exact class tasks 2822/1700 hardened against. Fail CLOSED there.
+#
+# UNRELATED to ``merge_disposition.MergeFailureDisposition.INDETERMINATE``
+# (task 3178), which is a DIFFERENT LAYER despite the shared word: that one is
+# POST-failure attribution (given a verify that already completed and FAILED,
+# was the cause the branch, integration skew, or unknown — feeding runs.db
+# stats). This registry is PRE-attribution and one layer down: did this leg
+# produce a verdict AT ALL. A signal-killed leg never reaches 3178's
+# classifier, because there is no completed failure to attribute.
+INDETERMINATE_VERDICT_CATEGORIES: frozenset[FailureCategory] = (
+    INFRA_TRANSIENT_CATEGORIES - {FailureCategory.INFRA_TIMEOUT}
+)
+
 
 def should_archive(category: str) -> bool:
     """Return True when *category* warrants durable human-triage archival.
 
     Pure CATEGORY_POLICY table lookup — no ``endswith('_error')`` heuristic.
-    A category outside the known 14 (e.g. a verify_runner UNSCOPED_TYPECHECK_*
+    A category outside the known 15 (e.g. a verify_runner UNSCOPED_TYPECHECK_*
     sentinel, or any other unrecognized string) defaults to False. See
     ``verify_classify.classify_failure``'s docstring for the closed-domain
     contract that keeps this default from silently misfiring on a future
@@ -221,7 +269,7 @@ def _assert_sentinels_disjoint(sentinels, enum_cls) -> None:
     an out-of-band sentinel namespace (e.g. verify_runner's
     UNSCOPED_TYPECHECK_* gate signals, injected into ``VerifyResult.category``
     but never produced by ``classify_failure``) is provably separate from
-    ``FailureCategory``'s closed 14-value output domain, so a future
+    ``FailureCategory``'s closed 15-value output domain, so a future
     accidental collision is caught fail-loud at import time instead of
     silently conflating a gate signal with a real classifier category.
     """

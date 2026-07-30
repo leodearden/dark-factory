@@ -32,13 +32,15 @@ import pytest
 # step-1: core surface
 # ---------------------------------------------------------------------------
 
-# The exact 14-member closed output domain of verify._classify_failure today
-# (the 12 legacy category strings plus task 2549's DISK_FULL/SEMAPHORE_TIMEOUT
-# host-infrastructure categories), including the '' (NONE) empty-string
-# sentinel (default of _worst_category on empty input; a member of both
-# _CATEGORY_PRIORITY and _ARCHIVE_DENY_LIST).
+# The exact 15-member closed output domain of verify._classify_failure today
+# (the 12 legacy category strings, task 2549's DISK_FULL/SEMAPHORE_TIMEOUT
+# host-infrastructure categories, and task 3173's INFRA_KILL external-signal
+# category), including the '' (NONE) empty-string sentinel (default of
+# _worst_category on empty input; a member of both _CATEGORY_PRIORITY and
+# _ARCHIVE_DENY_LIST).
 _EXPECTED_CATEGORY_VALUES = {
     'infra_timeout',
+    'infra_kill',
     'disk_full',
     'semaphore_timeout',
     'cargo_cli_error',
@@ -56,15 +58,15 @@ _EXPECTED_CATEGORY_VALUES = {
 
 
 class TestFailureCategoryMemberSet:
-    """FailureCategory is a StrEnum with exactly the 14 category strings."""
+    """FailureCategory is a StrEnum with exactly the 15 category strings."""
 
     def test_member_values_match_legacy_category_set_exactly(self):
         from orchestrator.verify_categories import FailureCategory
         assert {c.value for c in FailureCategory} == _EXPECTED_CATEGORY_VALUES
 
-    def test_member_count_is_fourteen(self):
+    def test_member_count_is_fifteen(self):
         from orchestrator.verify_categories import FailureCategory
-        assert len(list(FailureCategory)) == 14
+        assert len(list(FailureCategory)) == 15
 
     def test_is_strenum_subclass(self):
         from enum import StrEnum
@@ -132,9 +134,9 @@ class TestCategoryPolicyExhaustive:
         from orchestrator.verify_categories import CATEGORY_POLICY, FailureCategory
         assert set(CATEGORY_POLICY) == set(FailureCategory)
 
-    def test_row_count_is_fourteen(self):
+    def test_row_count_is_fifteen(self):
         from orchestrator.verify_categories import CATEGORY_POLICY
-        assert len(CATEGORY_POLICY) == 14
+        assert len(CATEGORY_POLICY) == 15
 
 
 class TestCategoryPolicyGoldenRows:
@@ -161,7 +163,7 @@ class TestCategoryPolicyGoldenRows:
     def test_none_row(self):
         from orchestrator.verify_categories import CATEGORY_POLICY, FailureCategory
         row = CATEGORY_POLICY[FailureCategory.NONE]
-        assert row.severity_rank == 13
+        assert row.severity_rank == 14
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +236,7 @@ class TestDerivedRegistriesByteIdentity:
         from orchestrator.verify_categories import CATEGORY_PRIORITY
         assert CATEGORY_PRIORITY == [
             'infra_timeout',
+            'infra_kill',
             'disk_full',
             'semaphore_timeout',
             'cargo_cli_error',
@@ -266,13 +269,14 @@ class TestDerivedRegistriesByteIdentity:
         from orchestrator.verify_categories import PREEXISTING_BREAK_SKIP_CATEGORIES
         assert frozenset({
             'infra_timeout', 'flock_error', 'pytest_internalerror', 'env_transient',
-            'disk_full', 'semaphore_timeout',
+            'disk_full', 'semaphore_timeout', 'infra_kill',
         }) == PREEXISTING_BREAK_SKIP_CATEGORIES
 
     def test_infra_transient_categories_matches_legacy_sweep_set(self):
         from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES
         assert frozenset({
             'pytest_internalerror', 'env_transient', 'disk_full', 'semaphore_timeout',
+            'infra_kill',
         }) == INFRA_TRANSIENT_CATEGORIES
 
 
@@ -292,6 +296,7 @@ class TestShouldArchive:
         ('category', 'expected'),
         [
             ('infra_timeout', False),
+            ('infra_kill', True),
             ('cargo_cli_error', True),
             ('compile_error', False),
             ('tree_sitter_generate_error', True),
