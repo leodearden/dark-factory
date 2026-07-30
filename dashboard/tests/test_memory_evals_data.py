@@ -522,3 +522,171 @@ class TestTrendCap:
         import dashboard.data.memory_evals as memory_evals_module
 
         assert memory_evals_module._TREND_RUN_CAP == 90
+
+
+# ---------------------------------------------------------------------------
+# step-7 — limits provenance (a provenance source, never a verdict source)
+# ---------------------------------------------------------------------------
+
+# The whitelist.  The limits artifact on disk carries a good deal more
+# (`alarms`, `alarmed_metric_count`, `grandfather_set`, `verdicts`,
+# `snapshotted_metric_ids`); asserting the block is EXACTLY these keys is what
+# pins that the extra fields are not quietly along for the ride.
+_LIMITS_KEYS = {
+    'alpha',
+    'false_alarm_budget',
+    'runs_per_quarter',
+    'min_samples',
+    'baseline_window',
+    'baseline_run_stamps',
+    'grandfather_set_hash',
+    'run_stamp',
+    'generator',
+    'stale_for_latest_run',
+}
+
+_LIMITS_RUNS = ['20260704T031500Z', '20260705T031500Z']
+_LIMITS_BASELINE = ['20260701T031500Z', '20260702T031500Z', '20260703T031500Z']
+
+
+def _limits_tree(
+    tmp_path: Path,
+    *,
+    limits_run_stamp: str = _LIMITS_RUNS[0],
+    write_limits: bool = True,
+    write_verdicts: bool = True,
+) -> tuple[Path, Path]:
+    """One eval, two runs, and a limits artifact whose embedded verdicts disagree.
+
+    ``unruled-metric`` deliberately has NO entry in the limits artifact's
+    ``verdicts[]`` array — so ``rule_kind`` has to be a lookup keyed on
+    ``metric_id``, not a positional zip over two independently-ordered lists.
+    """
+    root = tmp_path / 'memory-evals'
+    esc_dir = tmp_path / 'escalations'
+    esc_dir.mkdir(parents=True, exist_ok=True)
+
+    for i, stamp in enumerate(_LIMITS_RUNS):
+        _write_metrics(root, 'eval-a', stamp, [
+            _metric('canonical-in-top-5', 'proportion', 0.4, denominator=30, direction='lower_is_worse'),
+            _metric('dangling-pointers', 'count', float(4 + i), direction='higher_is_worse'),
+            _metric('topic-canonical-present', 'tripwire', 2.0, n=8),
+            _metric('search-latency-p50-ms', 'scalar', 44.0),
+            _metric('unruled-metric', 'scalar', 1.0),
+        ])
+
+    if write_limits:
+        _write_limits(
+            root,
+            'eval-a',
+            run_stamp=limits_run_stamp,
+            baseline_run_stamps=_LIMITS_BASELINE,
+            verdicts=[
+                _limits_verdict('canonical-in-top-5', 'proportion', status='alarm', p_value=1.8424481488582588e-06),
+                _limits_verdict('dangling-pointers', 'count', status='ok', p_value=1.0),
+                _limits_verdict('topic-canonical-present', 'tripwire', status='alarm', p_value=None),
+                _limits_verdict('search-latency-p50-ms', 'scalar', status='ok', p_value=None),
+            ],
+        )
+    if write_verdicts:
+        _write_verdicts(root, [])
+    return root, esc_dir
+
+
+def _only(rows: list[dict], metric_id: str) -> dict:
+    """The single metric row with *metric_id* (fails loudly if absent)."""
+    matches = [row for row in rows if row['metric_id'] == metric_id]
+    assert len(matches) == 1, f'expected exactly one {metric_id!r} row, got {len(matches)}'
+    return matches[0]
+
+
+class TestLimitsProvenance:
+    """The limits artifact contributes provenance + ``rule_kind``. Nothing else.
+
+    Design decision: ``verdicts-current.json`` is the SOLE verdict source.  The
+    limits artifact embeds its own ``verdicts[]``/``alarms[]`` in a DIFFERENT
+    vocabulary (``baseline_snapshot|ok|alarm|improved|insufficient_data``) and
+    carries no ``fingerprint``, so it cannot participate in the escalation join
+    at all.  Reading both would hand the UI two disagreeing alarm truths.
+    """
+
+    def test_provenance_passes_through_verbatim(self, tmp_path: Path) -> None:
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _limits_tree(tmp_path)
+
+        limits = build_memory_evals(root, esc_dir)['evals'][0]['limits']
+
+        assert set(limits) == _LIMITS_KEYS
+        assert limits['alpha'] == 0.002777777777777778
+        assert limits['false_alarm_budget'] == 1.0
+        assert limits['runs_per_quarter'] == 90
+        assert limits['min_samples'] == 10
+        assert limits['baseline_window'] == 3
+        assert limits['baseline_run_stamps'] == _LIMITS_BASELINE
+        assert limits['grandfather_set_hash'] == 'f8c4' * 16
+        assert limits['run_stamp'] == _LIMITS_RUNS[0]
+        assert limits['generator'] == 'shared.memory_eval_limits'
+
+    def test_rule_kind_is_looked_up_per_metric_id(self, tmp_path: Path) -> None:
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _limits_tree(tmp_path)
+
+        rows = build_memory_evals(root, esc_dir)['evals'][0]['metrics']
+
+        assert _only(rows, 'canonical-in-top-5')['rule_kind'] == 'proportion'
+        assert _only(rows, 'dangling-pointers')['rule_kind'] == 'count'
+        assert _only(rows, 'topic-canonical-present')['rule_kind'] == 'tripwire'
+        assert _only(rows, 'search-latency-p50-ms')['rule_kind'] == 'scalar'
+        # No limits entry for this one — absent means absent, not the
+        # neighbouring row's rule_kind.
+        assert _only(rows, 'unruled-metric')['rule_kind'] is None
+
+    def test_stale_for_latest_run_discloses_the_skew(self, tmp_path: Path) -> None:
+        """Provenance stamped at an older run does not govern the displayed one."""
+        from dashboard.data.memory_evals import build_memory_evals
+
+        stale_root, esc_dir = _limits_tree(tmp_path / 'stale', limits_run_stamp=_LIMITS_RUNS[0])
+        current_root, _ = _limits_tree(tmp_path / 'current', limits_run_stamp=_LIMITS_RUNS[-1])
+
+        stale = build_memory_evals(stale_root, esc_dir)['evals'][0]
+        current = build_memory_evals(current_root, esc_dir)['evals'][0]
+
+        assert stale['latest_run_stamp'] == _LIMITS_RUNS[-1]
+        assert stale['limits']['stale_for_latest_run'] is True
+        assert current['limits']['stale_for_latest_run'] is False
+
+    def test_limits_status_is_never_read_as_a_verdict(self, tmp_path: Path) -> None:
+        """Negative space: the limits vocabulary does not leak onto metric rows."""
+        from dashboard.data.memory_evals import build_memory_evals
+
+        # No root verdicts artifact at all — so the ONLY 'alarm' string on disk
+        # for this metric is the limits artifact's, and it must not be read.
+        root, esc_dir = _limits_tree(tmp_path, write_verdicts=False)
+
+        rows = build_memory_evals(root, esc_dir)['evals'][0]['metrics']
+
+        alarmed_in_limits = _only(rows, 'canonical-in-top-5')
+        assert 'verdict' in alarmed_in_limits, 'the verdict column must exist even when empty'
+        assert alarmed_in_limits['verdict'] is None
+        for row in rows:
+            assert 'status' not in row
+            assert 'p_value' not in row
+            assert 'alarms' not in row
+            assert 'baseline' not in row
+
+    def test_missing_limits_is_named_not_silent(self, tmp_path: Path) -> None:
+        """Metrics with no limits beside them = the evaluator is not completing."""
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _limits_tree(tmp_path, write_limits=False)
+
+        payload = build_memory_evals(root, esc_dir)
+
+        assert payload['evals'][0]['limits'] is None
+        assert payload['issue_count'] == len(payload['issues']) == 1
+        issue = payload['issues'][0]
+        assert issue['kind'] == 'missing_limits'
+        assert issue['eval_id'] == 'eval-a'
+        assert issue['path'] == str(root / 'eval-a' / 'limits-current.json')
