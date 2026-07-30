@@ -13,6 +13,14 @@ from fused_memory.backends.mem0_client import Mem0Backend
 from fused_memory.models.scope import Scope
 
 
+# Sentinel distinguishing "caller passed vector=None" (model a Qdrant point
+# that genuinely has no vector) from "caller passed nothing" (leave the
+# MagicMock attribute unset, so it auto-creates a truthy child mock).  A
+# plain None default would collapse those two cases and make the
+# missing-vector degradation test unable to fail.
+_UNSET = object()
+
+
 @pytest.fixture
 def backend(mock_config):
     """Mem0Backend using mock config (no real Qdrant/Mem0 needed)."""
@@ -227,6 +235,164 @@ class TestMem0BackendScrollByMetadata:
         assert any('truncated' in m or 'limit' in m for m in warning_msgs), (
             'Expected a truncation WARNING when len(points)==limit; '
             f'got warning messages: {warning_msgs}'
+        )
+
+
+class TestMem0BackendScrollByMetadataWithVectors:
+    """scroll_by_metadata can optionally return each point's stored vector.
+
+    Motivation (task 3210): the corpus-health detector generates ANN
+    candidate pairs by querying Qdrant with each record's OWN stored vector,
+    so it needs the vectors to come back on the enumeration pass.  Fetching
+    them here means the detector makes ZERO embedding API calls at runtime
+    and stays in the same metric space Mem0 itself wrote.
+
+    ``with_vectors`` defaults to False so every existing caller
+    (prune_recon_cycle_summaries, sweep_orphan_flag_markers, GC pool
+    enumeration, ...) keeps today's payload-only contract and pays no extra
+    bandwidth for vectors it does not read.
+
+    Mocked AsyncQdrantClient throughout — no live Qdrant, so these stay in
+    the unit lane alongside the sibling scroll_by_metadata tests above.
+    """
+
+    def _make_mock_point(
+        self,
+        point_id: str,
+        created_at: str | None,
+        extra_meta: dict | None = None,
+        vector=_UNSET,
+    ):
+        """Qdrant Record/ScoredPoint double, optionally carrying a vector.
+
+        ``vector`` defaults to the _UNSET sentinel meaning "leave the
+        attribute unset", which on a MagicMock auto-creates a truthy child
+        mock — exactly the trap the implementation must not fall into when
+        with_vectors=False.  Pass ``vector=None`` to model Qdrant returning a
+        point with no vector, or a list to model a real one.
+        """
+        payload = {}
+        if created_at is not None:
+            payload['created_at'] = created_at
+        if extra_meta:
+            payload.update(extra_meta)
+        point = MagicMock()
+        point.id = point_id
+        point.payload = payload
+        if vector is not _UNSET:
+            point.vector = vector
+        return point
+
+    @pytest.mark.asyncio
+    async def test_defaults_to_no_vectors(self, backend):
+        """Default call forwards with_vectors=False and returns dicts with NO 'vector' key.
+
+        Pins the back-compat contract: today's callers must not start seeing
+        a new key (nor pay to transfer vectors they never asked for).
+        """
+        p1 = self._make_mock_point('id-1', '2026-01-01T00:00:00+00:00', {'category': 'procedural_knowledge'})
+
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([p1], None))
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            result = await backend.scroll_by_metadata(
+                scope=Scope(project_id='p'),
+                filters={'category': 'procedural_knowledge'},
+            )
+
+        assert mock_client.scroll.call_args.kwargs.get('with_vectors') is False, (
+            'Default scroll_by_metadata must forward with_vectors=False to client.scroll, got '
+            f'{mock_client.scroll.call_args.kwargs.get("with_vectors")!r}'
+        )
+        assert len(result) == 1
+        assert 'vector' not in result[0], (
+            f"Default mode must not add a 'vector' key; got keys {sorted(result[0])}"
+        )
+        # Existing keys are untouched.
+        assert result[0]['id'] == 'id-1'
+        assert result[0]['created_at'] == '2026-01-01T00:00:00+00:00'
+        assert result[0]['metadata']['category'] == 'procedural_knowledge'
+
+    @pytest.mark.asyncio
+    async def test_with_vectors_true_forwards_and_lifts_vector(self, backend):
+        """with_vectors=True forwards the flag and lifts each point's vector onto the dict."""
+        vec1 = [0.1, 0.2, 0.3]
+        vec2 = [0.4, 0.5, 0.6]
+        p1 = self._make_mock_point(
+            'id-1', '2026-01-01T00:00:00+00:00', {'category': 'procedural_knowledge'}, vector=vec1,
+        )
+        p2 = self._make_mock_point(
+            'id-2', '2026-02-01T00:00:00+00:00', {'category': 'procedural_knowledge'}, vector=vec2,
+        )
+
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([p1, p2], None))
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            result = await backend.scroll_by_metadata(
+                scope=Scope(project_id='p'),
+                filters={'category': 'procedural_knowledge'},
+                with_vectors=True,
+            )
+
+        assert mock_client.scroll.call_args.kwargs.get('with_vectors') is True, (
+            'with_vectors=True must be forwarded to client.scroll, got '
+            f'{mock_client.scroll.call_args.kwargs.get("with_vectors")!r}'
+        )
+        assert len(result) == 2
+        assert result[0]['vector'] == vec1
+        assert result[1]['vector'] == vec2
+        # Existing keys are unchanged in this mode too.
+        assert result[0]['id'] == 'id-1'
+        assert result[0]['created_at'] == '2026-01-01T00:00:00+00:00'
+        assert result[0]['metadata']['category'] == 'procedural_knowledge'
+        assert result[1]['id'] == 'id-2'
+        assert result[1]['created_at'] == '2026-02-01T00:00:00+00:00'
+
+    @pytest.mark.asyncio
+    async def test_missing_vector_degrades_to_none(self, backend):
+        """A point returned without a vector yields vector=None rather than raising.
+
+        Qdrant can return a point with no vector (e.g. it was never stored, or
+        the collection uses named vectors).  The detector COUNTS these as a
+        ``missing_vector`` disclosure and skips them, so the backend must hand
+        back a clean None instead of exploding mid-enumeration and losing the
+        whole scan.
+        """
+        p_ok = self._make_mock_point('id-ok', '2026-01-01T00:00:00+00:00', vector=[0.1, 0.2])
+        p_missing = self._make_mock_point('id-missing', '2026-02-01T00:00:00+00:00', vector=None)
+
+        mock_client = AsyncMock()
+        mock_client.scroll = AsyncMock(return_value=([p_ok, p_missing], None))
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)):
+            result = await backend.scroll_by_metadata(
+                scope=Scope(project_id='p'),
+                filters={'category': 'procedural_knowledge'},
+                with_vectors=True,
+            )
+
+        assert len(result) == 2, 'A vector-less point must still be returned, not dropped'
+        assert result[0]['vector'] == [0.1, 0.2]
+        assert result[1]['vector'] is None
+        # The vector-less record keeps its identity so it can be counted/reported.
+        assert result[1]['id'] == 'id-missing'
+        assert result[1]['created_at'] == '2026-02-01T00:00:00+00:00'
+
+    @pytest.mark.asyncio
+    async def test_with_vectors_is_keyword_only(self, backend):
+        """with_vectors is keyword-only, so it can never be mistaken for `limit` positionally."""
+        import inspect
+
+        sig = inspect.signature(backend.scroll_by_metadata)
+        param = sig.parameters.get('with_vectors')
+        assert param is not None, 'scroll_by_metadata must accept a with_vectors parameter'
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY, (
+            f'with_vectors must be KEYWORD_ONLY, got {param.kind!r}'
+        )
+        assert param.default is False, (
+            f'with_vectors must default to False for back-compat, got {param.default!r}'
         )
 
 
