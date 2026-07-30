@@ -312,6 +312,94 @@ class Mem0Backend:
             timeout=self._write_timeout,
         )
 
+    async def set_payload(
+        self,
+        memory_id: str,
+        payload: dict[str, Any],
+        scope: Scope,
+    ) -> None:
+        """Partial-merge *payload* into a point's stored payload. No re-embed.
+
+        Straight to Qdrant's ``set_payload`` — a genuine storage-layer partial
+        merge, so pre-existing keys not named in *payload* survive and no
+        read-modify-write is needed to compute the result. Deliberately bypasses
+        mem0's ``AsyncMemory.update`` (see :meth:`update`), which would re-embed
+        the content, rewrite ``updated_at`` and append a mem0 history row for
+        what may be a purely cosmetic tag.
+
+        A write timeout PROPAGATES (raises ``TimeoutError``) rather than being
+        swallowed into a falsy return — the posture of
+        :meth:`get_point_by_id` / :meth:`count_by_metadata`, in deliberate
+        contrast to :meth:`get`. A caller must never mistake an unreachable
+        Qdrant for a completed write (no-silent-fail invariant).
+
+        NOTE: Qdrant answers ``acknowledged``/``completed`` for an UNKNOWN point
+        id — a no-op, not an error. Callers must confirm the point exists (see
+        :meth:`get_point_by_id`) before treating a return here as proof that
+        anything was written.
+        """
+        collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
+        client = await self._get_async_qdrant()
+        await asyncio.wait_for(
+            client.set_payload(
+                collection_name=collection_name,
+                payload=payload,
+                points=[memory_id],
+            ),
+            timeout=self._write_timeout,
+        )
+
+    async def delete_payload(
+        self,
+        memory_id: str,
+        keys: list[str],
+        scope: Scope,
+    ) -> None:
+        """Remove exactly *keys* from a point's stored payload. No re-embed.
+
+        Straight to Qdrant's ``delete_payload``; keys not named are untouched.
+        Same bypass rationale, same propagating-timeout posture and the same
+        unknown-point-id caveat as :meth:`set_payload`.
+        """
+        collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
+        client = await self._get_async_qdrant()
+        await asyncio.wait_for(
+            client.delete_payload(
+                collection_name=collection_name,
+                keys=keys,
+                points=[memory_id],
+            ),
+            timeout=self._write_timeout,
+        )
+
+    async def overwrite_payload(
+        self,
+        memory_id: str,
+        payload: dict[str, Any],
+        scope: Scope,
+    ) -> None:
+        """Replace a point's ENTIRE stored payload with *payload*. No re-embed.
+
+        Straight to Qdrant's ``overwrite_payload``. Unlike :meth:`set_payload`
+        this is NOT a merge: every key absent from *payload* is destroyed. In
+        particular the mem0-owned keys (``_MEM0_MANAGED_METADATA_KEYS``) must be
+        read back and re-attached by the caller, or the point becomes unreadable
+        by mem0's own ``get``/``search``.
+
+        Same bypass rationale, same propagating-timeout posture and the same
+        unknown-point-id caveat as :meth:`set_payload`.
+        """
+        collection_name = scope.mem0_collection_name(self.config.mem0.collection_prefix)
+        client = await self._get_async_qdrant()
+        await asyncio.wait_for(
+            client.overwrite_payload(
+                collection_name=collection_name,
+                payload=payload,
+                points=[memory_id],
+            ),
+            timeout=self._write_timeout,
+        )
+
     async def delete(self, memory_id: str, scope: Scope) -> dict[str, Any]:
         """Delete a memory."""
         instance = await self._get_instance(scope)
