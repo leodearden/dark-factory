@@ -592,6 +592,393 @@ def build_sweep_plan(
 
 
 # ---------------------------------------------------------------------------
+# Cluster metrics + the M1 metric series (pure — no I/O)
+# ---------------------------------------------------------------------------
+
+_EVAL_ID = 'e6-corpus-health'
+"""This detector's eval id — the artifact directory name under the M1 root."""
+
+_GLOBAL_SCOPE = 'all'
+"""metric_id suffix for a run-global counter, where no single category owns it.
+
+Every metric_id is ``<name>.<scope>`` so the suffix is always meaningful and
+always present. The ANN disclosures are properties of ONE query pass over the
+whole scanned set, not of a category, so inventing a per-category split for
+them would be a fabricated attribution.
+"""
+
+_SECONDS_PER_DAY = 86400.0
+
+# Metrics whose full shape (histogram, per-topic table, per-event table) is
+# too wide for a single scalar and lives in the companion details file.
+_DETAILED_METRICS: tuple[str, ...] = (
+    'cluster_size_max',
+    'cluster_size_mean',
+    'topic_accretion_rate_mean',
+    'consolidation_net_delta',
+)
+
+
+def _metric_id(name: str, scope: str) -> str:
+    return f'{name}.{scope}'
+
+
+def split_plan_by_category(
+    plan: dict[str, Any],
+    categories: Iterable[str],
+) -> dict[str, dict[str, list[dict]]]:
+    """Project a sweep plan into per-category slices.
+
+    ``build_sweep_plan`` already clusters ONCE PER CATEGORY and tags every
+    emitted group with the category it was clustered under, so this is a
+    projection of what the plan states — not a second categorisation that
+    could disagree with the one the plan actually used.
+
+    Every requested category gets a slice, empty ones included: an absent key
+    downstream would read as "not measured" rather than "measured, found
+    nothing".
+    """
+    slices: dict[str, dict[str, list[dict]]] = {
+        category: {'near_duplicate_groups': [], 'topic_carveout_groups': []}
+        for category in categories
+    }
+    for key in ('near_duplicate_groups', 'topic_carveout_groups'):
+        for group in plan.get(key) or []:
+            slot = slices.get(group.get('category'))
+            if slot is not None:
+                slot[key].append(group)
+    return slices
+
+
+def _parsed_timestamp(created_at: Any) -> float | None:
+    """Epoch seconds for a parseable ``created_at``, else None.
+
+    Delegates to ``_created_at_sort_key``'s tolerance so "what counts as a
+    usable timestamp" has one definition shared with survivor selection.
+    """
+    bucket, ts = _created_at_sort_key(created_at)
+    return None if bucket else ts
+
+
+def _topic_of(record: dict) -> str | None:
+    topic = (record.get('metadata') or {}).get('topic')
+    return str(topic) if topic else None
+
+
+def _absorbed_count(metadata: dict) -> int:
+    """How many predecessors a consolidation event RECORDS having absorbed.
+
+    Read strictly from ``supersedes``: a list contributes its length, a
+    non-empty scalar contributes 1. A record flagged ``canonical`` with no
+    ``supersedes`` names no predecessors, so it absorbed 0 *recorded* ones —
+    guessing a number for it would put an invented figure into a metric.
+    """
+    supersedes = metadata.get('supersedes')
+    if isinstance(supersedes, str):
+        return 1 if supersedes else 0
+    if isinstance(supersedes, list | tuple | set):
+        return len(supersedes)
+    return 1 if supersedes else 0
+
+
+def _topic_accretion_table(records: list[dict]) -> list[dict[str, Any]]:
+    """Per-topic ``members / span_days`` accretion, topics sorted for determinism.
+
+    Only records whose ``created_at`` parses can be placed on the span, so
+    ``members`` counts those and unparseable ones are counted separately (see
+    the ``unparseable_created_at`` metric) rather than silently inflating a
+    rate over a span they did not contribute to.
+
+    A topic spanning zero elapsed time has NO defined rate — ``rate_per_day``
+    is None. A rate needs elapsed time; dividing by a fudged epsilon would
+    manufacture an enormous rate out of a single record.
+    """
+    by_topic: dict[str, list[float]] = {}
+    for record in records:
+        topic = _topic_of(record)
+        if topic is None:
+            continue
+        ts = _parsed_timestamp(record.get('created_at'))
+        if ts is not None:
+            by_topic.setdefault(topic, []).append(ts)
+        else:
+            by_topic.setdefault(topic, [])
+
+    table: list[dict[str, Any]] = []
+    for topic in sorted(by_topic):
+        stamps = sorted(by_topic[topic])
+        span_days = (stamps[-1] - stamps[0]) / _SECONDS_PER_DAY if stamps else 0.0
+        rate = len(stamps) / span_days if span_days > 0 else None
+        table.append({
+            'topic': topic,
+            'members': len(stamps),
+            'span_days': span_days,
+            'rate_per_day': rate,
+        })
+    return table
+
+
+def _consolidation_events(
+    records: list[dict],
+    groups: list[dict],
+) -> list[dict[str, Any]]:
+    """Per-consolidation net delta: what accreted after it minus what it absorbed.
+
+    A consolidation event is a record carrying ``canonical: true`` and/or a
+    non-empty ``supersedes``. Its peer set — the population that can accrete
+    "after" it — is its shared ``metadata.topic`` when it has one, else the
+    near-duplicate cluster it belongs to. An event with neither has no
+    identifiable peers, so nothing is attributed to it (0), rather than
+    charging it with every later record in the category.
+
+    A negative delta means consolidation is winning; a positive one means the
+    topic is re-accreting faster than the consolidation absorbed.
+    """
+    cluster_by_id: dict[Any, frozenset] = {}
+    for group in groups:
+        members = frozenset(group.get('member_ids') or ())
+        for member_id in members:
+            cluster_by_id[member_id] = members
+
+    events: list[dict[str, Any]] = []
+    for record in records:
+        metadata = record.get('metadata') or {}
+        if not (metadata.get('canonical') or metadata.get('supersedes')):
+            continue
+        topic = _topic_of(record)
+        event_ts = _parsed_timestamp(record.get('created_at'))
+        peers = cluster_by_id.get(record.get('id'))
+
+        accreted = 0
+        if event_ts is not None:
+            for other in records:
+                if other is record:
+                    continue
+                if topic is not None:
+                    if _topic_of(other) != topic:
+                        continue
+                elif peers is None or other.get('id') not in peers:
+                    continue
+                other_ts = _parsed_timestamp(other.get('created_at'))
+                if other_ts is not None and other_ts > event_ts:
+                    accreted += 1
+
+        absorbed = _absorbed_count(metadata)
+        events.append({
+            'memory_id': record.get('id'),
+            'topic': topic,
+            'absorbed': absorbed,
+            'accreted_after': accreted,
+            'net_delta': accreted - absorbed,
+        })
+    return events
+
+
+def compute_cluster_metrics(
+    records_by_category: dict[str, list[dict]],
+    plan_by_category: dict[str, dict[str, list[dict]]],
+    disclosures: dict[str, Any],
+    *,
+    details_path: str | None = None,
+) -> tuple[list[Any], dict[str, Any]]:
+    """Corpus-health metrics for one run, plus the companion details payload.
+
+    Pure: takes the already-fetched records and the already-built plan, so the
+    whole metric surface is testable without a live Mem0.
+
+    Kind selection follows M2's rule vocabulary rather than taste. A ``count``
+    or ``proportion`` ARMS an exact statistical test, so it is used only where
+    a regression is well-defined and directional; everything whose movement is
+    not a regression is a ``scalar``, which is reported but never alarmed. In
+    particular the topic carve-out count is a scalar: more carve-outs is the
+    EXPECTED Option-C shape once 3195/3201 land, so arming a rule on it would
+    alarm on the feature working.
+
+    Args:
+        records_by_category: ``{category: [record, ...]}`` — the scanned
+            corpus. Its per-category lengths are the metric denominators.
+        plan_by_category: ``{category: {'near_duplicate_groups': [...],
+            'topic_carveout_groups': [...]}}`` (see
+            :func:`split_plan_by_category`).
+        disclosures: ``{counter_name: int | {category: int}}``. An int is a
+            run-global counter (emitted as ``<name>.all``); a mapping is
+            per-category (one metric per category, e.g. ``scan_truncated``).
+            EVERY key is emitted, zeros included — an absent metric is
+            indistinguishable from "not measured", and a cap that fired must
+            be a countable, alarmable number rather than invisible recall loss.
+        details_path: Filename of the companion details artifact, stamped onto
+            the metrics whose full shape lives there.
+
+    Returns:
+        ``(metrics, details)``. *metrics* is a list of
+        ``shared.memory_eval_metrics.Metric``, sorted by ``metric_id`` so two
+        identical runs serialise byte-identically. *details* carries the
+        per-category histogram, per-topic accretion table and per-event
+        consolidation table.
+
+    Note the clustered-member share is WITHHELD for an empty category and
+    named in ``details['categories'][cat]['undefined_metrics']``. M1 forbids a
+    zero-trial proportion, and emitting 0.0 would assert "0% of this corpus is
+    duplicated" about a corpus that contains nothing to measure.
+    """
+    from shared.memory_eval_metrics import Metric  # noqa: PLC0415
+
+    metrics: list[Any] = []
+    details: dict[str, Any] = {'categories': {}}
+    total_corpus = sum(len(v) for v in records_by_category.values())
+
+    for category in sorted(records_by_category):
+        records = records_by_category[category]
+        slice_ = plan_by_category.get(category) or {}
+        groups = slice_.get('near_duplicate_groups') or []
+        carveouts = slice_.get('topic_carveout_groups') or []
+        corpus_size = len(records)
+
+        sizes = [len(g.get('member_ids') or ()) for g in groups]
+        clustered_members = sum(sizes)
+        histogram: dict[str, int] = {}
+        for size in sizes:
+            histogram[str(size)] = histogram.get(str(size), 0) + 1
+
+        accretion = _topic_accretion_table(records)
+        rates = [r['rate_per_day'] for r in accretion if r['rate_per_day'] is not None]
+        events = _consolidation_events(records, groups)
+        unparseable = sum(
+            1 for r in records if _parsed_timestamp(r.get('created_at')) is None
+        )
+        undefined: list[str] = []
+
+        metrics.append(Metric(
+            metric_id=_metric_id('near_duplicate_clusters', category),
+            kind='count', value=float(len(groups)), n=corpus_size,
+            direction='higher_is_worse',
+        ))
+        if corpus_size > 0:
+            metrics.append(Metric(
+                metric_id=_metric_id('clustered_member_share', category),
+                kind='proportion', value=clustered_members / corpus_size,
+                n=corpus_size, denominator=corpus_size,
+                direction='higher_is_worse',
+            ))
+        else:
+            undefined.append(_metric_id('clustered_member_share', category))
+        metrics.append(Metric(
+            metric_id=_metric_id('cluster_size_max', category),
+            kind='scalar', value=float(max(sizes)) if sizes else 0.0,
+            n=len(groups), details_path=details_path,
+        ))
+        metrics.append(Metric(
+            metric_id=_metric_id('cluster_size_mean', category),
+            kind='scalar', value=(sum(sizes) / len(sizes)) if sizes else 0.0,
+            n=len(groups), details_path=details_path,
+        ))
+        metrics.append(Metric(
+            metric_id=_metric_id('topic_carveout_clusters', category),
+            kind='scalar', value=float(len(carveouts)), n=len(carveouts),
+        ))
+        metrics.append(Metric(
+            metric_id=_metric_id('topic_accretion_rate_mean', category),
+            kind='scalar', value=(sum(rates) / len(rates)) if rates else 0.0,
+            n=len(rates), details_path=details_path,
+        ))
+        metrics.append(Metric(
+            metric_id=_metric_id('consolidation_net_delta', category),
+            kind='scalar', value=float(sum(e['net_delta'] for e in events)),
+            n=len(events), details_path=details_path,
+        ))
+        metrics.append(Metric(
+            metric_id=_metric_id('unparseable_created_at', category),
+            kind='count', value=float(unparseable), n=corpus_size,
+            direction='higher_is_worse',
+        ))
+
+        details['categories'][category] = {
+            'corpus_size': corpus_size,
+            'clustered_members': clustered_members,
+            'cluster_size_histogram': histogram,
+            'topic_accretion': accretion,
+            'consolidation_events': events,
+            'undefined_metrics': undefined,
+        }
+
+    for name in sorted(disclosures):
+        value = disclosures[name]
+        if isinstance(value, dict):
+            for category in sorted(value):
+                metrics.append(Metric(
+                    metric_id=_metric_id(name, category), kind='count',
+                    value=float(value[category]),
+                    n=len(records_by_category.get(category) or ()),
+                    direction='higher_is_worse',
+                ))
+        else:
+            metrics.append(Metric(
+                metric_id=_metric_id(name, _GLOBAL_SCOPE), kind='count',
+                value=float(value), n=total_corpus, direction='higher_is_worse',
+            ))
+
+    metrics.sort(key=lambda m: m.metric_id)
+    return metrics, details
+
+
+def build_metric_series(
+    project_id: str,
+    metrics: Iterable[Any],
+    *,
+    corpus_counts: dict[str, int],
+    eval_id: str = _EVAL_ID,
+    run_stamp: str | None = None,
+) -> Any:
+    """Assemble one run's :class:`MetricSeries`, validating it at BUILD time.
+
+    Everything is routed through ``validate_metric_series`` on the raw payload
+    rather than relying on model construction, so a malformed metric — however
+    it was produced, ``Metric`` object or hand-built dict — surfaces as one
+    ``MetricSchemaError`` here in the runner that computed it. That is M1's
+    "rejected at emit time, not read time": by the time the dashboard reads the
+    artifact there is nobody left to tell.
+
+    The schema itself lives in ``shared.memory_eval_metrics`` and is never
+    restated here (INV-5) — this function only fills it in.
+
+    Args:
+        project_id: Scanned project; becomes ``Corpus.project_id``.
+        metrics: ``Metric`` models and/or raw metric dicts.
+        corpus_counts: Per-category corpus sizes — the denominators behind the
+            denominators.
+        eval_id: Artifact directory name (default :data:`_EVAL_ID`).
+        run_stamp: Run stamp; defaults to ``shared.memory_eval_metrics``'
+            helper, which honours ``MEMORY_EVAL_RUN_STAMP``.
+
+    Raises:
+        MetricSchemaError: The series is not emittable.
+    """
+    from shared.memory_eval_metrics import (  # noqa: PLC0415
+        SCHEMA_VERSION,
+        Metric,
+        MetricSeries,
+        validate_metric_series,
+    )
+    from shared.memory_eval_metrics import run_stamp as _run_stamp
+
+    payload = {
+        'schema_version': SCHEMA_VERSION,
+        'eval_id': eval_id,
+        'run_stamp': run_stamp if run_stamp is not None else _run_stamp(),
+        'corpus': {'project_id': project_id, 'counts': dict(corpus_counts)},
+        'metrics': [
+            m.model_dump(mode='json', exclude_none=True) if isinstance(m, Metric) else dict(m)
+            for m in metrics
+        ],
+    }
+    # Raises MetricSchemaError (never a bare pydantic error) on any malformed
+    # metric, unknown field, or duplicate metric_id. Parsing afterwards cannot
+    # fail: the same payload just validated.
+    validate_metric_series(payload)
+    return MetricSeries.model_validate(payload)
+
+
+# ---------------------------------------------------------------------------
 # I/O layer: fetch (thin, mock-tested)
 # ---------------------------------------------------------------------------
 
