@@ -1322,6 +1322,46 @@ class TestStalenessAndDegradedStates:
         assert payload['issues'][0]['kind'] == 'malformed_metrics'
         assert payload['issues'][0]['path'] == str(bad)
 
+    def test_wrong_type_verdicts_is_malformed_verdicts(self, tmp_path: Path) -> None:
+        """A verdicts artifact that PARSES but is not an object must still be named.
+
+        The third disposal path, and the one the reviewer found missing: absent
+        is ``missing_verdicts``, unparseable is ``unreadable_verdicts``, and
+        valid-JSON-but-wrong-type was silently discarded — which made a broken
+        verdicts file structurally identical to a healthy no-alarm tree while a
+        real alarm sat on disk.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _healthy_tree(tmp_path)
+        # Captured BEFORE the corruption: the healthy tree this payload must
+        # remain distinguishable from.
+        healthy = build_memory_evals(root, esc_dir)
+
+        bad = _dump(
+            root / 'verdicts-current.json',
+            [_verdict('eval-a', 'dangling-pointers', 'alarm', fingerprint='opaque-fp-1')],
+        )
+
+        payload = build_memory_evals(root, esc_dir)
+
+        assert payload['issue_count'] == len(payload['issues'])
+        malformed = [i for i in payload['issues'] if i['kind'] == 'malformed_verdicts']
+        assert len(malformed) == 1
+        assert malformed[0]['path'] == str(bad)
+        # The received type is named, so an operator reading the issue knows
+        # what shape landed rather than only that something was wrong.
+        assert 'list' in malformed[0]['detail']
+
+        # Absent, never defaulted to 'no_alarm' — the promise the comment at the
+        # unreadable-verdicts handler already made.
+        assert all(row['verdict'] is None for row in payload['evals'][0]['metrics'])
+
+        # The exact confusion the reviewer reproduced: a broken verdicts file
+        # must not read as "nothing alarmed".
+        assert healthy['issue_count'] == 0
+        assert payload['issue_count'] > healthy['issue_count']
+
     def test_unknown_kind_is_flagged_but_the_value_still_shows(self, tmp_path: Path) -> None:
         """A kind outside the closed vocabulary is a RENDERING failure.
 
