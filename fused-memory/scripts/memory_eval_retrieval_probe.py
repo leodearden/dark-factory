@@ -1649,8 +1649,19 @@ async def probe_topic(
     Every query that reported a failed store is recorded in
     ``degraded_queries`` and every observation it produced is flagged, so the
     aggregation can exclude it instead of scoring an outage as a regression.
+
+    Claim recall and contamination are defined at :data:`TRIPWIRE_K`, but this
+    function is public and callable directly, so it scores them at
+    ``min(TRIPWIRE_K, limit)`` — the depth actually FETCHED. Stamping the
+    constant instead would let ``probe_topic(ks=(3,))`` label observations
+    built from three results as "top 5". :func:`run_probe` normalises ``ks``
+    so that never happens from the CLI; this keeps the label honest for the
+    direct callers too, and neither guard depends on the other.
     """
     limit = max(ks) if ks else TRIPWIRE_K
+    # min(), not max(): a deeper fetch must not silently widen a metric that
+    # is defined at the tripwire's depth.
+    scored_k = min(TRIPWIRE_K, limit)
 
     for phrasing in entry.phrasings:
         info = read_degrade_metadata(await search(phrasing.text, limit))
@@ -1665,11 +1676,11 @@ async def probe_topic(
             observations.phrasings.append(observe_phrasing(
                 info.results, entry, phrasing, k, degraded=info.degraded,
             ))
-        outcome = classify_contamination(info.results, entry, registry, TRIPWIRE_K)
+        outcome = classify_contamination(info.results, entry, registry, scored_k)
         observations.contamination.append(ContaminationObservation(
             topic=entry.topic,
             phrasing=phrasing.text,
-            k=TRIPWIRE_K,
+            k=scored_k,
             foreign_count=outcome.foreign_count,
             untopiced_count=outcome.untopiced_count,
             scored_total=outcome.scored_total,
@@ -1695,11 +1706,11 @@ async def probe_topic(
                 failed_stores=info.failed_stores,
                 diagnostics=info.diagnostics,
             ))
-        outcome = claim_recalled(info.results, claim, TRIPWIRE_K)
+        outcome = claim_recalled(info.results, claim, scored_k)
         observations.claims.append(ClaimObservation(
             topic=entry.topic,
             query=claim.query,
-            k=TRIPWIRE_K,
+            k=scored_k,
             recalled=outcome.recalled,
             missing_needles=outcome.missing_needles,
             scorable=outcome.scorable,
@@ -1734,7 +1745,14 @@ def is_initial_run(root: str | Path, eval_id: str = EVAL_ID) -> bool:
 
 
 def _wrap(text: str, width: int = 76) -> list[str]:
-    return textwrap.wrap(text, width=width) or ['']
+    """Wrap *text*, never breaking a hyphenated token across lines.
+
+    ``break_on_hyphens`` defaults True, which split ``canonical-in-top-5-held-out``
+    mid-name in the prose. Every identifier this report names — metric ids,
+    topic slugs, item keys — is hyphenated, and a name broken across a
+    newline is a name an operator's grep will not find.
+    """
+    return textwrap.wrap(text, width=width, break_on_hyphens=False) or ['']
 
 
 _KNOWN_BAD_PREAMBLE = (
@@ -1755,6 +1773,8 @@ def render_probe_report(
     is_initial_run: bool = False,
     registry: TopicRegistry | None = None,
     skipped_topics: tuple[str, ...] = (),
+    requested_ks: tuple[int, ...] = (),
+    measured_ks: tuple[int, ...] = (),
 ) -> str:
     """The prose companion: the shared metric table plus this run's caveats.
 
@@ -1943,6 +1963,30 @@ def render_probe_report(
     ):
         lines.append(f'  {chunk}')
 
+    if measured_ks and tuple(requested_ks) != tuple(measured_ks):
+        added = ', '.join(
+            str(k) for k in measured_ks if k not in set(requested_ks)
+        )
+        lines.append('')
+        lines.append(
+            'measurement depth '
+            f'(requested {", ".join(str(k) for k in requested_ks) or "nothing"}; '
+            f'measured {", ".join(str(k) for k in measured_ks)}):'
+        )
+        for chunk in _wrap(
+            f'--k selects the depths canonical-in-top-k is scored at. k={added} '
+            'was added to this run because two metrics are DEFINED at it and '
+            'cannot be computed without it: the '
+            f'{METRIC_TOPIC_CANONICAL_PRESENT} tripwire and '
+            f'{METRIC_CANONICAL_IN_TOP_K_HELD_OUT.format(k=TRIPWIRE_K)}. A run '
+            'that dropped them would not fail — leaf α joins a run to its '
+            'baseline window by metric_id, so they would simply stop being '
+            'trended. Measuring a depth nobody asked for is a narrowing like '
+            'any other, so it is said here rather than left to be inferred '
+            'from which metrics happen to be present.'
+        ):
+            lines.append(f'  {chunk}')
+
     if skipped_topics:
         lines.append('')
         lines.append(f'topics NOT PROBED this run ({len(skipped_topics)}):')
@@ -2096,6 +2140,29 @@ async def count_corpus(memory, project_ids: tuple[str, ...]) -> dict[str, int]:
     return counts
 
 
+def normalise_ks(ks: tuple[int, ...]) -> tuple[int, ...]:
+    """*ks* with :data:`TRIPWIRE_K` guaranteed present, caller's order kept.
+
+    ``--k`` is a repeatable parameterisation, so ``--k 7`` is a legitimate
+    request — but two metrics are DEFINED at k=5 and cannot be computed
+    without it: the ``topic-canonical-present`` tripwire and the held-out
+    proportion. Without this, ``--k 7`` emitted neither, and did so silently:
+    leaf α's evaluator joins a run to its baseline window BY metric_id, so an
+    absent metric is not an error there, it simply stops being trended. A
+    metric that quietly stops existing is worse than one that crashes.
+
+    Normalising rather than rejecting keeps ``--k 7`` legal — the extra depth
+    is genuinely useful — while making the pinned metric set a guaranteed
+    superset of every run's, which is what keeps α's join keys stable. The
+    added depth is disclosed in the report; it is not left to be inferred
+    from the metric list.
+
+    Deliberately the idiom already one line below in :func:`run_probe`, which
+    dedups ``project_ids`` the same way.
+    """
+    return tuple(dict.fromkeys((*ks, TRIPWIRE_K)))
+
+
 @dataclass(frozen=True)
 class ProbeOutcome:
     """Everything one run produced, for a caller that wants more than an exit code."""
@@ -2127,7 +2194,12 @@ async def run_probe(
 
     Reads only. ``search`` and ``count_memories_by_metadata`` are the only two
     methods touched.
+
+    THE chokepoint for *ks*: normalising here means every caller — ``main``,
+    ``_run``, a test, a notebook — inherits the guarantee that the pinned
+    metrics are emitted, so no path can produce an artifact missing them.
     """
+    measured_ks = normalise_ks(tuple(ks))
     selected = tuple(dict.fromkeys(project_ids))
     wanted = set(selected)
     probed = tuple(e for e in registry.entries if e.project_id in wanted)
@@ -2142,7 +2214,7 @@ async def run_probe(
         # a result belongs to a different KNOWN topic, so the widest topic
         # vocabulary available gives the truest answer. Narrowing it here would
         # silently reclassify foreign results as untopiced.
-        await probe_topic(search, entry, registry, ks, observations)
+        await probe_topic(search, entry, registry, measured_ks, observations)
 
     counts = await count_corpus(memory, selected)
 
@@ -2156,7 +2228,7 @@ async def run_probe(
     initial = is_initial_run(out_root)
 
     series = build_series(
-        observations, counts, corpus_project_id(selected), stamp, tuple(ks),
+        observations, counts, corpus_project_id(selected), stamp, measured_ks,
     )
     metrics_path, report_path = emit_series(series, out_root, stamp=stamp)
 
@@ -2176,6 +2248,8 @@ async def run_probe(
             disclosures=registry.disclosures,
         ),
         skipped_topics=skipped,
+        requested_ks=tuple(ks),
+        measured_ks=measured_ks,
     )
     report_path.write_text(report, encoding='utf-8')
 
