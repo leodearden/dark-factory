@@ -1086,6 +1086,200 @@ class TestHumanCuratorGateAdjudicationGuard:
             },
         )
 
+    async def test_curator_gate_with_adjudication_stamp_drives_to_done_with_specific_provenance(
+        self, tmp_path: Path,
+    ):
+        """The POSITIVE path: a confirmed stamp closes the gate — with SPECIFIC
+        provenance, never the generic string.
+
+        The generic ``note='pure gate resolved'`` is what made task 3181's
+        phantom closure indistinguishable from a genuine one in the audit trail.
+        A curator gate that closes legitimately must say so, and must name the
+        evidence: the adjudication stamp, plus the escalation record that proved
+        rung one.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        stamp = '2026-07-31T09:00:00+00:00'
+        task = _curator_gate_task(
+            task_id='3181',
+            gate_escalated_at='2026-07-30T16:30:28.993178+00:00',
+            curator_adjudicated_at=stamp,
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        esc = _seed_resolved_gate(queue, '3181')
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+        done_calls = [
+            c for c in scheduler.set_task_status.await_args_list
+            if len(c.args) >= 2 and c.args[1] == 'done'
+        ]
+        assert len(done_calls) == 1
+        provenance = done_calls[0].kwargs['done_provenance']
+
+        assert provenance['kind'] == 'deterministic-gate'
+        assert provenance['note'] != 'pure gate resolved', (
+            'a curator gate must not close under the generic note — that is '
+            'exactly what made task 3181 unauditable'
+        )
+        assert 'curator' in provenance['note']
+        assert stamp in provenance['note'], 'the note must name the actual evidence'
+        # Rung-one evidence: the resolved gate record that proved a human acted.
+        assert provenance['escalation_id'] == esc.id
+
+        # And no re-ask was filed.
+        pending = queue.get_by_task(
+            '3181', status='pending', agent_role='orchestrator-deterministic',
+        )
+        assert not [e for e in pending if e.category == 'curator_adjudication_missing']
+
+    @pytest.mark.parametrize('stamp', ['', '   ', True, 0, None])
+    async def test_blank_adjudication_stamp_is_not_proof(self, tmp_path: Path, stamp):
+        """FAIL-CLOSED PIN: only a non-empty, non-whitespace ``str`` counts as proof.
+
+        Pins ``_curator_adjudication_confirmed`` against a future "just use
+        truthiness" simplification. ``True`` is the most dangerous value in this
+        table: it reads as "yes, adjudicated" while recording nothing about when
+        the review happened, so a hand edit that writes it must NOT close the gate.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _curator_gate_task(
+            task_id='3181',
+            gate_escalated_at='2026-07-30T16:30:28.993178+00:00',
+        )
+        # Stamp the value directly: _curator_gate_task skips a None value, and
+        # here we want the key PRESENT-but-invalid for every non-None case.
+        task['metadata']['curator_adjudicated_at'] = stamp
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        _seed_resolved_gate(queue, '3181')
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        done_calls = [
+            c for c in scheduler.set_task_status.await_args_list
+            if len(c.args) >= 2 and c.args[1] == 'done'
+        ]
+        assert not done_calls, f'{stamp!r} must not count as adjudication proof'
+        pending = queue.get_by_task(
+            '3181', status='pending', agent_role='orchestrator-deterministic',
+        )
+        assert [e for e in pending if e.category == 'curator_adjudication_missing']
+
+    async def test_string_truthy_curator_gate_marker_still_trips_the_guard(
+        self, tmp_path: Path,
+    ):
+        """FAIL-CLOSED PIN for the MARKER: ``'true'`` (a string) is still a curator gate.
+
+        Companion to the stamp pin above. Pins
+        ``_is_human_curator_gate``'s deliberate divergence from the neighbouring
+        ``_is_operational_llm_gate``'s strict ``is True``: a hand edit or a JSON
+        round-trip that yields the string ``'true'`` must not silently disarm the
+        safety guard and re-open the phantom-done.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _curator_gate_task(
+            task_id='3181',
+            gate_escalated_at='2026-07-30T16:30:28.993178+00:00',
+            marker='true',  # a STRING, not a bool
+        )
+        assert task['metadata']['human_curator_gate'] is not True
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        _seed_resolved_gate(queue, '3181')
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        done_calls = [
+            c for c in scheduler.set_task_status.await_args_list
+            if len(c.args) >= 2 and c.args[1] == 'done'
+        ]
+        assert not done_calls
+        pending = queue.get_by_task(
+            '3181', status='pending', agent_role='orchestrator-deterministic',
+        )
+        assert [e for e in pending if e.category == 'curator_adjudication_missing']
+
+    async def test_oversized_adjudication_stamp_is_truncated_in_the_note(
+        self, tmp_path: Path,
+    ):
+        """The note is BOUNDED, because it is memory-ingested downstream (task 3286).
+
+        ``done_provenance.note`` is not a private field: fused-memory
+        reconciliation's ``_format_outcome_echo`` appends it to the
+        "Task '<title>' completed." Mem0 write under a 500-char
+        ``max_note_chars`` cap. The curator note is the only note in the module
+        that interpolates an externally-supplied task-metadata value, and
+        ``_curator_adjudication_confirmed`` deliberately validates TYPE only —
+        never length — so an oversized stamp must be bounded at the note, not
+        rejected at the gate.
+
+        An oversized stamp is NOT a safety failure: it is still a stamp, so the
+        task still closes. It just gets truncated in the audit string.
+
+        The log-leak assertion uses the fallback form from the plan: the
+        detector lives in ``scripts/scan_provenance_note_log_leaks.py``, and
+        ``scripts/`` has no ``__init__.py`` — the header comment of this very
+        file (task 3286) already records that these two suites cannot share
+        imports. So the level-token check is inlined rather than imported.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        oversized = '2026-07-31T09:00:00+00:00 ' + 'x' * 5000
+        task = _curator_gate_task(
+            task_id='3181',
+            gate_escalated_at='2026-07-30T16:30:28.993178+00:00',
+            curator_adjudicated_at=oversized,
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        _seed_resolved_gate(queue, '3181')
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        outcome = await runner.run(assignment)
+
+        # Still closes — an oversized stamp is a formatting problem, not a
+        # safety one, and rejecting it would re-open the phantom-done.
+        assert outcome == WorkflowOutcome.DONE
+        done_calls = [
+            c for c in scheduler.set_task_status.await_args_list
+            if len(c.args) >= 2 and c.args[1] == 'done'
+        ]
+        assert len(done_calls) == 1
+        note = done_calls[0].kwargs['done_provenance']['note']
+
+        # Guard against a VACUOUS pass: the length bound below is trivially
+        # satisfied by the short generic note, so first pin that this really is
+        # the curator note carrying the interpolated stamp.
+        assert note != 'pure gate resolved'
+        assert 'curator' in note
+        assert len(note) < 500, (
+            'the note must stay inside _format_outcome_echo max_note_chars so a '
+            'multi-KB stamp cannot be pushed into the Mem0 completion summary'
+        )
+        # Fallback log-leak check (see docstring): the curator note must never
+        # acquire the log-line shape scan_provenance_note_log_leaks.py hunts.
+        for level in ('DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'):
+            assert f' {level} ' not in note
+
 
 # ---------------------------------------------------------------------------
 # Step-1: cross-unit deploy success (B6)
