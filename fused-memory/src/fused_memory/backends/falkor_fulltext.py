@@ -49,6 +49,8 @@ from __future__ import annotations
 
 import logging
 
+from graphiti_core.driver.falkordb_driver import STOPWORDS
+
 logger = logging.getLogger(__name__)
 
 
@@ -105,3 +107,42 @@ def escape_group_id(group_id: str) -> str:
     loud-over-silent-degradation norm forbids.
     """
     return group_id.replace('\\', '\\\\').replace('"', '\\"').replace('-', '\\-')
+
+
+def build_query(
+    sanitized_text: str,
+    group_ids: list[str] | None,
+    max_query_length: int,
+) -> str:
+    """Assemble a RediSearch fulltext query from ALREADY-sanitized text.
+
+    ``sanitized_text`` must have been through ``FalkorDriver.sanitize()``
+    already: this function deliberately does not sanitize, so the character-class
+    rules stay upstream's single source of truth and only term *assembly* is
+    replaced here.
+
+    Everything upstream does that already works is preserved byte-for-byte —
+    the quoted group filter, the ``' | '`` join, the ``STOPWORDS`` list (imported,
+    never re-declared), the leading space when there is no group filter, and the
+    over-length arithmetic.
+
+    That arithmetic — ``len(joined.split(' ')) + len(group_ids or '')`` — reads
+    like a bug: the ``' | '`` separators are counted as fields (N terms → 2N-1)
+    and ``len(group_ids or '')`` is the group_id COUNT.  It is reproduced exactly
+    on purpose.  "Fixing" it would change which queries get dropped, i.e.
+    silently change recall for every existing caller.
+    """
+    if not group_ids:
+        group_filter = ''
+    else:
+        group_values = '|'.join(f'"{escape_group_id(gid)}"' for gid in group_ids)
+        group_filter = f'(@group_id:{group_values})'
+
+    terms = [w for w in sanitized_text.split() if w.lower() not in STOPWORDS]
+    joined = ' | '.join(terms)
+
+    # Upstream's over-length guard, arithmetic included. See docstring.
+    if len(joined.split(' ')) + len(group_ids or '') >= max_query_length:
+        return ''
+
+    return group_filter + ' (' + joined + ')'

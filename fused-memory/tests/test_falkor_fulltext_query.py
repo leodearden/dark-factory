@@ -243,12 +243,17 @@ class TestBuildQueryUpstreamParity:
     def test_group_id_count_participates_in_the_length_guard(self) -> None:
         """``len(group_ids or '')`` is the COUNT of group_ids, not a string length.
 
-        63 terms (126 fields) is under the limit with one group_id but trips it
-        with two — proving the addend scales with the number of group_ids.
+        Boundary measured against the stock upstream method, not derived: 63
+        terms is 125 fields, so the guard (``>= 128``) trips at exactly three
+        group_ids and not at one or two.  That the addend has to reach 3 to
+        matter is precisely what proves it scales with the group_id COUNT — a
+        string-length reading of ``len(group_ids or '')`` would have tripped far
+        earlier, and a dropped addend would never trip here at all.
         """
         text = ' '.join(f'w{i}' for i in range(63))
         assert build_query(text, ['g'], 128) != ''
-        assert build_query(text, ['g', 'h'], 128) == ''
+        assert build_query(text, ['g', 'h'], 128) != ''
+        assert build_query(text, ['g', 'h', 'i'], 128) == ''
 
     def test_build_query_does_not_sanitize_its_input(self) -> None:
         """Input is pre-sanitized by the caller; ``build_query`` never re-does it.
