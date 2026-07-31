@@ -5782,15 +5782,33 @@ class TaskWorkflow:
 
         Caller has already verified the artifact exists.
 
-        Validation: ``commit`` must be non-empty and reachable from main.
-        ``git merge-base --is-ancestor`` returns false for both unknown SHAs
-        and SHAs not on main, so this single check covers both.
+        Validation, in two halves. **Reachability**: ``commit`` must be
+        non-empty and reachable from main — ``git merge-base --is-ancestor``
+        returns false for both unknown SHAs and SHAs not on main, so that
+        single check covers both. **Capability** (task 3057, seam 5 of
+        eleven): reachability proves only that the cited commit EXISTS on
+        main, never that THIS task's declared capability is present in it, so
+        when the task declares ``metadata.delivered_checks`` those are
+        re-checked against the SAME main SHA the reachability test used
+        (forwarded as ``main_sha=``, so no second ``get_main_sha`` call and no
+        risk of accepting a claim against one main while rejecting it against
+        another).
+
+        That second half matters here more than anywhere else in the eleven
+        stamp seams: this one is LLM-driven (an architect's claim) rather than
+        git-driven, which makes it the least self-correcting of them all — and
+        the repo's own architect prompt actively instructs agents to use
+        ``report_task_already_done``.
 
         On success: set task status to ``done`` with provenance pointing
         at the architect-named commit, return ``DONE``.
-        On validation failure: clear the artifact, route to ``_mark_blocked``
-        without escalating to a human — this is an architect mistake
-        (wrong/missing commit), not an unworkable task.
+        On validation failure of EITHER half: clear the artifact, route to
+        ``_mark_blocked`` without escalating to a human — this is an architect
+        mistake (wrong/missing commit, or a claim main does not support), not
+        an unworkable task, so a steward retry can resolve it. A capability
+        block surfaces as a VISIBLE blocked task rather than a silent no-op
+        precisely because the artifact is consumed before validation: unlike
+        the sweep seams, nothing here retries on a timer.
         """
         assert self.artifacts is not None
         report = self.artifacts.read_already_done()
@@ -5816,6 +5834,22 @@ class TaskWorkflow:
                 f'but commit is not reachable from main',
                 detail=(
                     f'commit: {commit}\nmain_sha: {main_sha}\n'
+                    f'evidence: {evidence}'
+                )[:2000],
+            )
+
+        block = await self._delivered_checks_block(
+            self.task_id, (self.task.get('metadata') or {}),
+            site='architect-already-done-report', main_sha=main_sha,
+        )
+        if block is not None:
+            return await self._mark_blocked(
+                f'Architect reported task already done at {commit[:12]} but '
+                f'the declared delivered_checks are not present on main',
+                detail=(
+                    f'commit: {commit}\nmain_sha: {block.main_sha or main_sha}\n'
+                    f'block_reason: {block.reason}\n'
+                    f'failed_check: {block.failed_check}\n'
                     f'evidence: {evidence}'
                 )[:2000],
             )
