@@ -749,7 +749,6 @@ class TestDelegatesToSharedAtomicWriter:
     def test_delegates_with_preserved_semantics(self, tmp_path, monkeypatch):
         """One delegated call, carrying this site's exact per-axis semantics."""
         import shared.safe_io as _safe_io
-
         from shared.prompt_artifact import _atomic_write_text
 
         calls = []
