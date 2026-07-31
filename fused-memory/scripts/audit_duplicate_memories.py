@@ -9,8 +9,8 @@ agents write the gotcha ad hoc without first ``search()``-ing Mem0 for
 existing coverage, so it recurs faster than any single consolidation pass
 absorbs it. This script is the automated backstop.
 
-Two detectors, both reported
-----------------------------
+Three detectors, all reported -- only two may DELETE
+----------------------------------------------------
 Candidate generation is dual-path; the transitive closure
 (``cluster_memories_by_pairs``) is shared, so the two can never disagree
 about what a cluster IS -- only about which pairs are candidates.
@@ -28,6 +28,30 @@ The ANN path is NOT a replacement -- swapping one detector for the other
 would lose signal, so the actioned plan clusters over the UNION and every
 emitted cluster records which path(s) found it (``found_by``,
 ``lexical_clustered``, ``ann_max_score``, ``lexical_max_ratio``).
+
+  - LIVENESS-SNAPSHOT RECURRENCE: point-in-time liveness observations that
+    re-assert one identical core FACT about the same task, grouped by
+    ``(category, subject_task_id, core_fact)``. Keyed on EXACT equality of
+    that fact, not on similarity -- there is no threshold to tune. It is
+    REPORT-ONLY: its groups feed neither ``delete_candidates`` nor
+    ``apply_delete_candidates`` and are never handed to the apply gate, so
+    ``--apply`` can never act on them.
+
+Why a third class rather than a lower threshold: measured on the four
+solar_challenge records that motivated it (tasks 94/96, Stage-1 finding
+724e7be4, run e149def2), the pairwise lexical ratios between the three
+liveness snapshots are 0.117-0.233 against a 0.85 threshold. The repeated
+core status fact is a single clause; the unique investigative payload
+(file/symlink checks, git-HEAD/reflog analysis, per-cycle grep/glob results)
+is several times longer and swamps every similarity metric. No cutoff those
+records could reach is settable without flooding the corpus with false
+clusters -- and under ``--apply`` a false cluster is an irreversible delete.
+This is not near-duplicate CONTENT; it is one FACT re-asserted at different
+timestamps, a different equivalence relation needing its own detector.
+
+Ownership seam: task 3098 authorizes DETECTION of this pattern only. The
+disposition of the specific existing solar_challenge entries is a separate
+human-gated decision on solar_challenge task 99.
 
 The ANN cutoff is READ, never invented
 --------------------------------------
@@ -47,7 +71,11 @@ The ANN path can lose candidates where a full scan cannot, so each loss is a
 metric rather than invisible recall: ``top_k_saturated``,
 ``below_threshold_dropped``, ``unknown_neighbor_dropped``, ``missing_vector``,
 ``cross_category_dropped``, ``unswept_category_dropped``, ``ann_query_errors``,
-per-category ``scan_truncated``, and ``ann_disabled_uncalibrated``.
+per-category ``scan_truncated``, and ``ann_disabled_uncalibrated``. The
+liveness path adds ``liveness_snapshot_untasked`` (a recognised snapshot that
+resolves to no subject task, so no group can hold it) and
+``liveness_snapshot_unfielded`` (point-in-time framing whose live fields could
+not be read).
 
 Only chain-free evidence may DELETE
 -----------------------------------
@@ -71,9 +99,13 @@ Artifacts: one M1 metric series per run at
 ``<--metrics-root>/<eval_id>/metrics-<STAMP>.json`` (default root
 ``fused-memory/data/memory-evals/``, eval_id ``e6-corpus-health``), with a
 human-readable ``report-<STAMP>.txt`` and a ``details-<STAMP>.json`` carrying
-the cluster-size histogram, per-topic accretion table and per-event
-consolidation table. Schema lives in ``shared.memory_eval_metrics`` and is
-never restated here. Suppress with ``--no-metrics``.
+the cluster-size histogram, per-topic accretion table, per-event
+consolidation table and per-group liveness-recurrence table. Schema lives in
+``shared.memory_eval_metrics`` and is never restated here. The stdout plan
+additionally carries ``liveness_snapshot_recurrence_groups``,
+``liveness_snapshot_recurrence_clusters`` and ``liveness_snapshot_disclosure``
+alongside the pre-existing keys, which keep their exact meaning and shape.
+Suppress the artifacts with ``--no-metrics``.
 
 ORDERING NOTE -- scheduling and gate-filing belong to task 3136, not here.
 This script is a detector with a stable CLI and a stable stdout contract;
@@ -105,6 +137,9 @@ Safety carve-outs:
     (see "Only chain-free evidence may DELETE" above).
   - A cluster whose members all share one ``metadata.topic`` is task 3136's
     Option-C carve-out: an expected shape, never a delete candidate.
+  - Liveness-snapshot recurrence groups are report-only BY CONSTRUCTION --
+    they are never added to the delete lists, rather than filtered out of
+    them downstream where a later refactor could drop the filter.
   - Missing/unextractable content degrades to ``''``, which never clusters
     and is never deleted.
 
@@ -557,20 +592,20 @@ def find_liveness_snapshot_recurrences(
     for (category, subject, core_fact), members in buckets.items():
         if len(members) < 2:
             continue
-        dated = [
-            m for m in members if _parsed_timestamp(m.get('created_at')) is not None
+        # (epoch seconds, the raw created_at it came from), parsed ONCE per
+        # member. Members whose timestamp does not parse are absent, so an
+        # all-unparseable group leaves the span undefined rather than 0.0.
+        stamped = [
+            (ts, m.get('created_at'))
+            for m in members
+            if (ts := _parsed_timestamp(m.get('created_at'))) is not None
         ]
-        first_seen = last_seen = None
-        span_days = None
-        if dated:
-            ordered = sorted(
-                dated, key=lambda m: _created_at_sort_key(m.get('created_at')),
-            )
-            first_seen = ordered[0].get('created_at')
-            last_seen = ordered[-1].get('created_at')
-            span_days = (
-                _parsed_timestamp(last_seen) - _parsed_timestamp(first_seen)
-            ) / _SECONDS_PER_DAY
+        first_seen = last_seen = span_days = None
+        if stamped:
+            stamped.sort(key=lambda pair: pair[0])
+            first_seen = stamped[0][1]
+            last_seen = stamped[-1][1]
+            span_days = (stamped[-1][0] - stamped[0][0]) / _SECONDS_PER_DAY
         groups.append({
             'subject_task_id': subject,
             'category': category,
