@@ -57,6 +57,42 @@ def load_config_scalar(path: Path, key: str) -> str:
     return yaml.safe_load(path.read_text(encoding='utf-8'))[key]
 
 
+def discover_lint_command_modules() -> dict[str, str]:
+    """Every immediate-subdir ``orchestrator.yaml`` that defines a ``lint_command``.
+
+    Returns ``{module_dir_name: lint_command}``. Modelled on
+    ``tests/scripts/test_fallback_verify_config.py``'s
+    ``_discover_per_module_configs`` (applied to ``lint_command`` rather than
+    ``test_command``) and adopted for the same stated reason: a hardcoded list
+    silently fails to cover a subproject added later. The corpus constants play
+    that file's known-names-floor role, and the completeness check in
+    ``test_verify_config_corpus.py`` is what ties the two together.
+
+    Configs defining only a ``test_command`` (e.g. ``scripts/orchestrator.yaml``)
+    are omitted by construction. Dot-prefixed parents are skipped so ``.venv``,
+    ``.task``, ``.claude`` — and any future dot-dir — stay deterministically out
+    of the result.
+
+    ``dark-factory-orchestrator.yaml`` is deliberately out of reach: it sits at
+    the repo root rather than under ``*/``, and its scalars are pinned by the
+    forward checks instead.
+
+    With ``load_config_scalar``, one of only two disk-reading entry points in
+    this module — neither is called at import time.
+    """
+    found: dict[str, str] = {}
+    for path in sorted(REPO_ROOT.glob('*/orchestrator.yaml')):
+        if path.parent.name.startswith('.'):
+            continue
+        try:
+            data = yaml.safe_load(path.read_text(encoding='utf-8'))
+        except (OSError, yaml.YAMLError):
+            continue
+        if isinstance(data, dict) and 'lint_command' in data:
+            found[path.parent.name] = data['lint_command']
+    return found
+
+
 # --- The corpus -------------------------------------------------------------
 #
 # Provenance comments name ``<yaml file>::<key>``, deliberately NOT a line
