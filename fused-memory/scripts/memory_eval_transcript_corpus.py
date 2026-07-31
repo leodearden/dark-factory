@@ -566,6 +566,52 @@ def scan_archive(
     return records, coverage
 
 
+def scan_transcript(
+    path: str | Path,
+    *,
+    tool_names: frozenset[str] = SEARCH_TOOL_NAMES,
+    max_failure_examples: int = DEFAULT_MAX_FAILURE_EXAMPLES,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Mine ONE transcript. Same return shape as :func:`scan_archive`.
+
+    Reads via ``legibility.digest.load_transcript`` — the slurping sibling of
+    the scan path's streaming reader. An ordered in-memory list is the right
+    shape for one small file, and it gives the operator-facing debug path a
+    second, independent reader onto the IDENTICAL core: if the two ever
+    disagree, a parser has been duplicated (INV-5 / PRD D9).
+
+    The coverage mapping is shape-identical, so ``coverage_status``,
+    ``render_report`` and ``write_corpus`` are shared verbatim between modes.
+    An unreadable file is accounted for the same way — ``total_failure`` and
+    its non-zero exit, not a traceback.
+    """
+    path = Path(path)
+    coverage = _new_coverage()
+    coverage['transcripts_found'] = 1
+    rel = path.name
+    provenance = parse_archive_path(rel)
+    if provenance['task_id'] is not None:
+        coverage['tasks_scanned'] = 1
+
+    try:
+        records = extract_searches(
+            load_transcript(path),
+            source=rel,
+            tool_names=tool_names,
+            provenance=provenance,
+        )
+    except OSError as exc:
+        _record_failure(coverage, rel, f'{type(exc).__name__}: {exc}', max_failure_examples)
+        return [], coverage
+
+    coverage['transcripts_read'] = 1
+    coverage['searches_extracted'] = len(records)
+    coverage['searches_unresolved'] = sum(
+        1 for record in records if record['result_status'] != 'ok'
+    )
+    return records, coverage
+
+
 # ---------------------------------------------------------------------------
 # Run status — the INV-2 / INV-4 seam
 # ---------------------------------------------------------------------------
