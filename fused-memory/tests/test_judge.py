@@ -1033,6 +1033,101 @@ class TestJudgeCooldownExpired:
         assert judge.cooldown_expired('proj') is False
 
 
+class TestJudgeHaltSnapshot:
+    """Judge.halt_snapshot()/halted_projects() — the operator/watcher read
+    surface (task 3050 deliverable A).
+
+    Before these existed, a halt was only observable by grepping harness logs:
+    a large ``reconciliation_backlog`` looked identical whether the project was
+    HALTED (remedy: unhalt_reconciliation) or merely unable to keep up (remedy:
+    capacity). The snapshot is JSON-ready — datetimes render as ISO-8601
+    strings — because its only consumers are MCP tool payloads.
+    """
+
+    @pytest.mark.asyncio
+    async def test_snapshot_after_apply_halt_carries_reason_and_times(self, mock_journal):
+        judge = Judge(config=_make_judge_config(), journal=mock_journal)
+        before = datetime.now(UTC)
+        await judge._apply_halt('proj', reason='Serious verdict in run r1')
+
+        snap = judge.halt_snapshot('proj')
+
+        assert snap['project_id'] == 'proj'
+        assert snap['halted'] is True
+        assert snap['halt_reason'] == 'Serious verdict in run r1'
+        assert snap['cooldown_expired'] is False
+        assert snap['unhalt_grace_remaining'] == 0
+        # JSON-ready: ISO-8601 strings, NOT datetimes.
+        assert isinstance(snap['halted_at'], str)
+        assert isinstance(snap['cooldown_until'], str)
+        halted_at = datetime.fromisoformat(snap['halted_at'])
+        assert before <= halted_at <= datetime.now(UTC)
+        # cooldown_until is halted_at + the configured cooldown.
+        cooldown_until = datetime.fromisoformat(snap['cooldown_until'])
+        assert cooldown_until > halted_at
+
+    def test_unknown_project_reports_not_halted_without_raising(self, mock_journal):
+        judge = Judge(config=_make_judge_config(), journal=mock_journal)
+
+        snap = judge.halt_snapshot('never-seen')
+
+        assert snap['project_id'] == 'never-seen'
+        assert snap['halted'] is False
+        assert snap['halt_reason'] is None
+        assert snap['halted_at'] is None
+        assert snap['cooldown_until'] is None
+        assert snap['cooldown_expired'] is False
+        assert snap['unhalt_grace_remaining'] == 0
+
+    @pytest.mark.asyncio
+    async def test_snapshot_after_unhalt_clears_halt_fields_and_seeds_grace(
+        self, mock_journal
+    ):
+        config = _make_judge_config()
+        judge = Judge(config=config, journal=mock_journal)
+        await judge._apply_halt('proj', reason='Serious verdict in run r1')
+
+        await judge.unhalt('proj')
+        snap = judge.halt_snapshot('proj')
+
+        assert snap['halted'] is False
+        assert snap['halt_reason'] is None
+        assert snap['halted_at'] is None
+        assert snap['cooldown_until'] is None
+        assert snap['cooldown_expired'] is False
+        assert snap['unhalt_grace_remaining'] == config.halt_grace_cycles
+
+    @pytest.mark.asyncio
+    async def test_halted_projects_is_sorted_and_tracks_unhalt(self, mock_journal):
+        judge = Judge(config=_make_judge_config(), journal=mock_journal)
+
+        assert judge.halted_projects() == []
+
+        await judge._apply_halt('b', reason='r-b')
+        await judge._apply_halt('a', reason='r-a')
+        assert judge.halted_projects() == ['a', 'b']
+
+        await judge.unhalt('a')
+        assert judge.halted_projects() == ['b']
+
+    @pytest.mark.asyncio
+    async def test_snapshot_reports_cooldown_expired(self, mock_journal):
+        """The incident's actual signature: halted, cooldown long past, and
+        nothing acted on it."""
+        from datetime import timedelta
+
+        judge = Judge(config=_make_judge_config(), journal=mock_journal)
+        await judge._apply_halt('proj', reason='judge-unreachable')
+        # Seed a past cooldown directly, mirroring TestJudgeCooldownExpired.
+        judge._halt_cooldown_until['proj'] = datetime.now(UTC) - timedelta(hours=1)
+
+        snap = judge.halt_snapshot('proj')
+
+        assert snap['halted'] is True
+        assert snap['cooldown_expired'] is True
+        assert snap['halt_reason'] == 'judge-unreachable'
+
+
 # ---------------------------------------------------------------------------
 # Delegation to invoke_with_cap_retry
 # ---------------------------------------------------------------------------
