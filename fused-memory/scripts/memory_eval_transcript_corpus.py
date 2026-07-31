@@ -85,6 +85,7 @@ Usage::
 from __future__ import annotations
 
 import json
+import re
 import sys
 from collections.abc import Iterable, Mapping
 from pathlib import Path
@@ -132,6 +133,76 @@ A frozenset rather than a constant string because ``--tool-name`` widens it:
 the archive spans months of tool-name history, and a future rename must be
 minable without editing this file.
 """
+
+
+# ---------------------------------------------------------------------------
+# Caller identity
+# ---------------------------------------------------------------------------
+
+_AGENT_ID_RE = re.compile(r'agent_id:\*\*\s*`([^`]+)`')
+"""The briefing's Agent Identity line: ``- **agent_id:** `claude-task-…` ``.
+
+Anchored on the backticks because the surrounding markdown varies between
+briefing templates while the backticked value does not.
+"""
+
+_TASK_ROLE_RE = re.compile(r'^claude-task-(\d+)-(.+)$')
+"""``claude-task-<id>-<role>``. Role is the REMAINDER, so a multi-segment role
+(``code-reviewer``) survives instead of truncating at its first hyphen."""
+
+
+def _empty_caller() -> dict[str, Any]:
+    return {'agent_id': None, 'task_id': None, 'role': None}
+
+
+def _caller_from_text(text: str) -> dict[str, Any] | None:
+    """Parse one record's text into a caller block, or None if it holds none.
+
+    Every part degrades independently: an agent_id that does not match
+    ``claude-task-<id>-<role>`` (an interactive session, say) is preserved
+    verbatim with task_id/role None. Nothing here raises, and nothing here
+    can suppress a search record — an unattributed search stays in the corpus
+    as a disclosed gap, because dropping it would bias the corpus toward
+    whichever roles happen to carry a parseable briefing.
+    """
+    match = _AGENT_ID_RE.search(text)
+    if match is None:
+        return None
+    agent_id = match.group(1)
+    caller = _empty_caller()
+    caller['agent_id'] = agent_id
+    shape = _TASK_ROLE_RE.match(agent_id)
+    if shape is not None:
+        caller['task_id'] = shape.group(1)
+        caller['role'] = shape.group(2)
+    return caller
+
+
+def _caller_from_record(record: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Look for the Agent Identity line in a ``user`` record's text.
+
+    Only user records: the briefing arrives as one, and an assistant record
+    quoting the marker back is the agent talking about identity, not carrying
+    it. Content may be a plain string (the usual briefing shape) or a block
+    list, so both are flattened.
+    """
+    if record.get('type') != 'user':
+        return None
+    message = record.get('message')
+    if not isinstance(message, Mapping):
+        return None
+    content = message.get('content')
+    if isinstance(content, str):
+        return _caller_from_text(content)
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, Mapping):
+                text = block.get('text')
+                if isinstance(text, str):
+                    caller = _caller_from_text(text)
+                    if caller is not None:
+                        return caller
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -230,10 +301,16 @@ def extract_searches(
     """
     emitted: list[dict[str, Any]] = []
     pending: dict[str, dict[str, Any]] = {}
+    caller: dict[str, Any] | None = None
 
     for record in records:
         if not isinstance(record, Mapping):
             continue
+        if caller is None:
+            # First match wins and is never overwritten: a later record
+            # quoting a different agent_id is one agent discussing another's
+            # briefing, not a change of who is running.
+            caller = _caller_from_record(record)
         for block in _content_blocks(record):
             block_type = block.get('type')
             if block_type == 'tool_use':
@@ -270,4 +347,11 @@ def extract_searches(
     # Anything left pending keeps the 'missing' status it was created with —
     # no end-of-walk flush is needed, because the pending partial IS the
     # already-emitted record. Nothing can be dropped by forgetting to flush.
+    #
+    # Caller is stamped after the walk, not during it: the briefing precedes
+    # every search in a real transcript, but relying on that ordering accident
+    # would silently unattribute any transcript that violates it.
+    resolved = caller or _empty_caller()
+    for record in emitted:
+        record['caller'] = dict(resolved)
     return emitted
