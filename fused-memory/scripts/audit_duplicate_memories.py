@@ -1341,10 +1341,15 @@ def split_plan_by_category(
     nothing".
     """
     slices: dict[str, dict[str, list[dict]]] = {
-        category: {'near_duplicate_groups': [], 'topic_carveout_groups': []}
+        category: {
+            'near_duplicate_groups': [],
+            'topic_carveout_groups': [],
+            'liveness_snapshot_recurrence_groups': [],
+        }
         for category in categories
     }
-    for key in ('near_duplicate_groups', 'topic_carveout_groups'):
+    for key in ('near_duplicate_groups', 'topic_carveout_groups',
+                'liveness_snapshot_recurrence_groups'):
         for group in plan.get(key) or []:
             slot = slices.get(group.get('category'))
             if slot is not None:
@@ -1521,7 +1526,8 @@ def compute_cluster_metrics(
         records_by_category: ``{category: [record, ...]}`` — the scanned
             corpus. Its per-category lengths are the metric denominators.
         plan_by_category: ``{category: {'near_duplicate_groups': [...],
-            'topic_carveout_groups': [...]}}`` (see
+            'topic_carveout_groups': [...],
+            'liveness_snapshot_recurrence_groups': [...]}}`` (see
             :func:`split_plan_by_category`).
         disclosures: ``{counter_name: int | {category: int}}``. An int is a
             run-global counter (emitted as ``<name>.all``); a mapping is
@@ -1555,6 +1561,7 @@ def compute_cluster_metrics(
         slice_ = plan_by_category.get(category) or {}
         groups = slice_.get('near_duplicate_groups') or []
         carveouts = slice_.get('topic_carveout_groups') or []
+        recurrences = slice_.get('liveness_snapshot_recurrence_groups') or []
         corpus_size = len(records)
 
         sizes = [len(g.get('member_ids') or ()) for g in groups]
@@ -1599,6 +1606,19 @@ def compute_cluster_metrics(
             metric_id=_metric_id('topic_carveout_clusters', category),
             kind='scalar', value=float(len(carveouts)), n=len(carveouts),
         ))
+        # A `count`/`higher_is_worse`, unlike the `scalar` used for the topic
+        # carve-out immediately above. M2's rule is that an ARMED kind is for
+        # a regression that is well-defined and directional: more carve-outs
+        # is the EXPECTED Option-C shape, so alarming on it would alarm on the
+        # feature working, whereas more liveness recurrence groups IS the
+        # indefinite accretion this detector exists to surface. Emitted for
+        # every swept category, empty ones included — an absent metric is
+        # indistinguishable from "not measured".
+        metrics.append(Metric(
+            metric_id=_metric_id('liveness_snapshot_recurrences', category),
+            kind='count', value=float(len(recurrences)), n=corpus_size,
+            direction='higher_is_worse',
+        ))
         metrics.append(Metric(
             metric_id=_metric_id('topic_accretion_rate_mean', category),
             kind='scalar', value=(sum(rates) / len(rates)) if rates else 0.0,
@@ -1621,6 +1641,16 @@ def compute_cluster_metrics(
             'cluster_size_histogram': histogram,
             'topic_accretion': accretion,
             'consolidation_events': events,
+            'liveness_snapshot_recurrences': [
+                {
+                    'subject_task_id': g.get('subject_task_id'),
+                    'core_fact': g.get('core_fact'),
+                    'member_ids': g.get('member_ids'),
+                    'snapshot_count': g.get('snapshot_count'),
+                    'span_days': g.get('span_days'),
+                }
+                for g in recurrences
+            ],
             'undefined_metrics': undefined,
         }
 
