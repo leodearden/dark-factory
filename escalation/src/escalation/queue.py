@@ -1293,8 +1293,10 @@ class EscalationQueue:
         archive to "catch up" — the counter is authoritative (PRD
         task-status-authority-prd.md contract C9 / finding 10.4).
 
-        The three degraded read outcomes are handled differently:
+        The four read outcomes, in full:
 
+        - Present and parseable (the steady state): authoritative, taken
+          verbatim, with ZERO disk scans of any kind.
         - Unparseable contents (``ValueError``): reconciled from a one-shot
           bounded ``_recover_seq_from_disk`` scan and logged as an ERROR.
           Still ERROR, not WARNING — a corrupt counter is unrecoverable data
@@ -1337,13 +1339,13 @@ class EscalationQueue:
                 try:
                     current = int(counter_path.read_text().strip())
                 except ValueError as e:
+                    current = self._recover_seq_from_disk(task_id)
                     logger.error(
                         f'make_id: could not parse counter file {counter_path}: {e}; '
-                        'treating as 0 — counter is authoritative with no archive-scan '
-                        'fallback, so this WILL mint ids that collide with any already '
-                        f'issued for task_id {task_id!r}'
+                        f'reconciled it from a one-shot bounded root+archive scan for '
+                        f'task_id {task_id!r} (highest observed sequence {current}) and '
+                        f'resuming at {current + 1}, so no already-issued id is reused'
                     )
-                    current = 0
             else:
                 current = self._recover_seq_from_disk(task_id)
                 if current > 0:
