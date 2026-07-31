@@ -255,22 +255,64 @@ def _project_results(raw_results: Iterable[Any]) -> list[dict[str, Any]]:
     return projected
 
 
+_RESULT_STATUS = ('ok', 'error', 'unparsed', 'missing')
+"""How well the search's ANSWER was recovered — a closed vocabulary.
+
+- ``ok``       the answer was decoded; ``results`` is what the agent saw.
+- ``error``    the tool call itself failed (``is_error``).
+- ``unparsed`` an answer arrived but could not be decoded.
+- ``missing``  no answer appears anywhere (a truncated transcript).
+
+Only ``ok`` is a measurement of the store. The other three are gaps in this
+instrument, and they are kept distinct from a genuine zero-hit search (which
+is ``ok`` with ``result_count == 0``) because all four look identical to a
+consumer that filters on the count alone — a decoding bug would then read as
+a recall collapse.
+"""
+
+
+def _result_text(content: Any) -> str | None:
+    """Flatten a ``tool_result`` payload to its JSON text, or None.
+
+    Two shapes occur: a bare string (the common one), and a list of blocks
+    whose ``text`` carries the payload.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [
+            block['text']
+            for block in content
+            if isinstance(block, Mapping) and isinstance(block.get('text'), str)
+        ]
+        if parts:
+            return ''.join(parts)
+    return None
+
+
 def _parse_tool_result(block: Mapping[str, Any]) -> tuple[str, list[dict[str, Any]]]:
     """Decode a ``tool_result`` block into ``(result_status, results)``.
 
-    The payload is a JSON *string* carrying ``{"results": [...]}``.
+    ``is_error`` is checked FIRST and wins even over a decodable payload: a
+    failed call's body is an error message, and reading one as results would
+    manufacture a measurement out of a failure.
     """
-    content = block.get('content')
-    if not isinstance(content, str):
+    if block.get('is_error') is True:
+        return 'error', []
+    text = _result_text(block.get('content'))
+    if text is None:
         return 'unparsed', []
     try:
-        payload = json.loads(content)
+        payload = json.loads(text)
     except (json.JSONDecodeError, ValueError):
         return 'unparsed', []
     if not isinstance(payload, Mapping):
         return 'unparsed', []
     raw_results = payload.get('results')
     if not isinstance(raw_results, list):
+        # A payload that decoded but carries no results list is not an empty
+        # search — it is a shape we do not understand, and saying so is the
+        # whole point of keeping 'unparsed' separate from 'ok'.
         return 'unparsed', []
     return 'ok', _project_results(raw_results)
 
