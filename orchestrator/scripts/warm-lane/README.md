@@ -124,8 +124,10 @@ not this leaf), and no provenance header is prepended to any script.
 ### Delta 1 — `provision-warm-lane-fs.sh`, `REPO_ROOT` resolution
 
 Added by leaf α, together with Delta 2 below — same file, same concern (path
-resolution at the new home). Delta 4 (leaf β) is the other file-content
-divergence from reify in this directory.
+resolution at the new home). Deltas 4, 6 and 7 are the other file-content
+divergences from reify in this directory. **Delta 7 is this same wrong-path
+class with a different cause**, and it revisits both this file's `_SCRIPT_DIR`
+assignment and `_default_mount()` below.
 
 The script derives `REPO_ROOT` from its own location, and `_default_mount()`
 hangs the operator-facing default `--mount` off it. In reify the script sat at
@@ -186,7 +188,9 @@ changing it, and it is pinned by the `.worktrees` case in
 ### Delta 3 — `warm-lane-gc.sh` / `thin-warm-lane.sh` sibling-seed defaults
 
 A **documented behavioural caveat, deliberately NOT patched** — no file
-content diverges. Both scripts default `--seed-script` to a sibling
+content diverges *for this reason*. (Delta 7 later diverged both files for an
+unrelated one, and its `--reseed` measurement sharpens the warning this delta
+already carried.) Both scripts default `--seed-script` to a sibling
 `seed-warm-lane.sh` that PRD §5 keeps project-owned, so at the new location
 that default cannot resolve. Rather than patch the scripts to guess at a
 project-owned path (PRD invariant C-1), the caller resolves it: see
@@ -358,6 +362,120 @@ same shape as Delta 4's:
    Fail-open is load-bearing in one direction only: preserving on an unknown
    reading would freeze reclaim whenever `.lane-state/` is absent, re-creating
    the 2026-07-10 ENOSPC accretion outage.
+
+### Delta 7 — five scripts resolve their own directory without forking `dirname`
+
+**`provision-warm-lane-fs.sh`, `thin-warm-lane.sh`, `warm-lane-audit.sh`,
+`warm-lane-gc.sh` and `warm-lane-gc-sweep.sh` are no longer byte-identical to
+reify.** Added by **task 3279**. Same wrong-path class as Delta 1, one cause
+removed: there the ascent was the wrong DEPTH; here the starting point itself
+silently becomes the caller's CWD.
+
+Every one of the five resolved its own directory as
+`"$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"`. `dirname` is an **external
+binary**, so that expression makes the resolution silently depend on `PATH` —
+and a `PATH` without it does not error: the substitution yields **empty**,
+`cd ""` **SUCCEEDS** as a no-op, and the directory resolves to the **caller's
+CWD**, at exit 0, with no diagnostic. A systemd unit's `PATH` need not carry
+coreutils, and `provision-warm-lane-fs.sh` is specifically run on a fresh host
+to provision the pool substrate — where a minimal `PATH` is likeliest.
+
+The sites converted, all to the parameter-expansion idiom
+`lib_lane_state.sh:265-273` already carried (`case "$src" in */*)
+dir="${src%/*}" …` then `cd "$dir" && pwd`; `cd`, `pwd` and `case` are
+builtins, so the arithmetic needs nothing on `PATH`):
+
+| File | Sites |
+|---|---|
+| `provision-warm-lane-fs.sh` | `_SCRIPT_DIR`, **and** `_default_mount()`'s `dirname "$REPO_ROOT"`, its `basename "$parent"` and the `dirname "$parent"` in its ascend branch |
+| `warm-lane-audit.sh`, `warm-lane-gc.sh`, `warm-lane-gc-sweep.sh` | `SCRIPT_DIR` |
+| `thin-warm-lane.sh` | `_script_dir` (the `--seed-script` default) |
+
+`provision-warm-lane-fs.sh` needed **all four** of its sites. Measured: with
+`_SCRIPT_DIR` converted and `_default_mount()` left alone, the advertised
+default is *still* `/warm-lanes`, because `_default_mount()` re-forks `dirname`
+on its own. A fix stopping at the assignment would pass a naive `SCRIPT_DIR`
+check while changing nothing an operator ever sees.
+
+#### What was measured
+
+Harness: a stub `PATH` entry whose `dirname` shim exits 127 (observationally
+identical to `command not found`), prepended to a real `PATH`. Base HEAD
+`8d276d3c5f`.
+
+| Script | `CWD=/` under a `dirname`-less `PATH` | CWD holding same-named decoy siblings |
+|---|---|---|
+| `provision-warm-lane-fs.sh` | **rc=0**, advertises default `--mount` = **`/warm-lanes`**, the bare filesystem root (control: `<repo-parent>/warm-lanes`). No guard exists anywhere on this path. | n/a — the resolution feeds a printed path, not a `source` |
+| `warm-lane-gc.sh` | rc=2, `lib_live_refs.sh not found next to` | **rc=0, sourced BOTH decoys** (`lib_live_refs.sh`, `lib_lane_state.sh`) |
+| `warm-lane-gc-sweep.sh` | rc=2, same shape | **rc=0, sourced the decoy `lib_live_refs.sh`** |
+| `warm-lane-audit.sh` | **rc=1** — bash's own bare `source` failure on `//lib_portable.sh`, **not** its `exit 2` guard | **rc=0, sourced BOTH decoys** (`lib_portable.sh`, `lib_lane_state.sh`) |
+| `thin-warm-lane.sh` | rc=0, `SEED_SCRIPT=<CWD>/seed-warm-lane.sh` | **EXECUTED the decoy** and reported `[ok] Re-seeded` |
+
+#### The corrected hypothesis
+
+This was filed expecting the sourcing scripts to land on their existing
+fail-loud wiring guards and `exit 2` — i.e. to degrade **loudly**. They do not,
+and the reason is structural: the guards are
+`[ ! -f "$SCRIPT_DIR/lib_*.sh" ]`, which test the **mis-resolved** path. Any
+CWD that happens to hold a same-named file satisfies them. **The loud degrade
+is contingent on the caller's CWD being empty**, so the guards cannot detect
+this class at all — and the middle column above is the *lucky* case, not the
+contract. The realistic, non-adversarial trigger for the right-hand column is
+invoking one of these from reify's own `scripts/` dir, or from another
+dark-factory checkout's `warm-lane/` dir: both carry precisely these
+filenames, at a possibly older version, in scripts whose job is deleting
+worktrees.
+
+`warm-lane-audit.sh` diverges from the taxonomy a second way: the `[ ! -f ]`
+guard Delta 4 added covers only `lib_lane_state.sh` and sits **after** the
+`lib_portable.sh` `source`, which has no guard at all. So the bare case exits
+**1**, the runtime code, where this class is assigned the exit-2 wiring
+sentinel. That gap is real and separately actionable, but it is a behaviour
+change this delta does not make: with `SCRIPT_DIR` resolved correctly the bare
+`source` failure is unreachable in every case measured.
+
+#### Why patch here rather than upstream to reify
+
+The rule at the top of this section makes this a real decision, not a
+one-liner. It was settled by measurement: reify's working tree has already
+drifted far past the pinned copy HEAD `638d97d8` (`warm-lane-audit.sh` +675
+diff lines, `warm-lane-gc.sh` +334), so "upstream and re-copy" would drag
+unrelated reify drift through a dark-factory merge lane that cannot verify it
+— defeating the pinned-HEAD provenance table it would be honouring. A
+cross-repo commit also cannot be part of a dark-factory task's diff, reviewed
+by its reviewer, or verified by its suite. Delta 1 is direct precedent for the
+same class.
+
+#### What is deliberately NOT changed
+
+Cosmetic `basename "$0"` in usage and diagnostic strings **still forks**. It
+feeds no path resolution — worst case a blank program name in a usage line —
+so converting it would widen the diff across five reify byte-copies for no
+measured hazard. Recorded here so the omission reads as a decision rather than
+an oversight; the pinning test for `provision-warm-lane-fs.sh` deliberately
+does not assert on the `Usage:` line that this blanks.
+
+#### Pinned by
+
+All in `orchestrator/tests/test_warm_lane_scripts_shipped.py`:
+
+* `TestProvisionRepoRootParity::test_default_mount_survives_a_path_without_dirname`
+  — parity against a same-run full-`PATH` control (never a hardcoded path),
+  over the plain, `worktrees` and `.worktrees` nestings, since `_default_mount()`
+  reaches a different fork in each.
+* `TestSiblingResolutionIgnoresTheCallersCwd` — asserts on **which file was
+  resolved** (a decoy-CWD marker), not on the exit code, for the reason above:
+  the exit code is a function of the caller's CWD, not of the defect.
+* `TestNoShippedScriptResolvesItsOwnDirectoryByForking` — the directory-wide
+  drift gate. Because a script's own directory is what tells it where its libs
+  are, this idiom cannot be extracted into a sourceable helper without
+  depending on the thing it resolves (`lib_lane_state.sh` carries its own copy
+  for exactly that reason), so the five copies are deliberate. The gate is the
+  inverse of Delta 4's single-definition-site guard: instead of "this idiom
+  appears exactly once", it asserts **the forking spelling appears zero
+  times** — scoped to self-directory resolution, and skipping whole-line
+  comments, so `warm-lane-gc.sh`'s legitimate `dirname "$MOUNT"` and the libs'
+  usage headers do not false-trip it.
 
 ## Sibling-seed defaults, and who resolves them
 
