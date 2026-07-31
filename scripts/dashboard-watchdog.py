@@ -190,9 +190,21 @@ def log(msg: str) -> None:
     """Write *msg* to the systemd journal tagged as ``dashboard-watchdog``.
 
     Falls back to stderr when ``systemd-cat`` is unavailable (e.g. a test
-    environment, or a systemd-less host). That is not a silent swallow: the
-    unit sets ``StandardError=journal``, so the message still reaches the same
-    journal by the other route.
+    environment, or a systemd-less host) or wedged. That is not a silent
+    swallow: the unit sets ``StandardError=journal``, so the message still
+    reaches the same journal by the other route.
+
+    BOUNDED, like every other subprocess in this file (probe 5s, systemctl
+    show 5s, reset-failed 10s, restart 45s, submit 120s) and for the same
+    reason restart_unit() states: a wedged child must not leave the oneshot
+    running into the next 30s tick. This one matters MORE than it looks. The
+    timer is ``OnUnitActiveSec=30``, measured from the unit's last activation,
+    and systemd disables TimeoutStartSec for ``Type=oneshot`` by default — so
+    a systemd-cat blocked on a stuck journald or a full /run would hang the
+    tick forever, the timer would never re-trigger, and supervision would stop
+    entirely with no signal. That is precisely the silent degradation the
+    storm escape exists to eliminate, arriving through the LOGGING path.
+    ``TimeoutStartSec`` in the unit file is the belt-and-braces second bound.
     """
     try:
         subprocess.run(
@@ -200,10 +212,12 @@ def log(msg: str) -> None:
             input=msg,
             text=True,
             check=False,
+            timeout=5,
         )
-    except OSError:
-        # systemd-cat missing/unexecutable — still emit, just via stderr.
-        print(f"{LOG_TAG}: {msg}", file=sys.stderr)
+    except (OSError, subprocess.SubprocessError) as exc:
+        # systemd-cat missing/unexecutable (OSError) or wedged past the bound
+        # (TimeoutExpired, a SubprocessError) — still emit, just via stderr.
+        print(f"{LOG_TAG}: {msg} [systemd-cat unusable: {exc!r}]", file=sys.stderr)
 
 
 class _JournalLog:
@@ -683,8 +697,9 @@ def tick() -> None:
     """Run one supervision tick — the whole body of a single oneshot firing.
 
     §Contract, in order. A healthy probe is the overwhelmingly common case and
-    resets the streak, so the steady state costs one HTTP GET and one small
-    atomic write every 30 seconds and actuates nothing.
+    resets the streak, so the steady state costs one systemctl query and one
+    HTTP GET every 30 seconds, actuates nothing, and — since there is no
+    streak to clear — does not even rewrite the state file.
     """
     state = load_state()
 
@@ -740,6 +755,15 @@ def tick() -> None:
     # that caused a restart would combine with the first post-grace miss to
     # restart again after a single failed probe — the incident's per-tick
     # behaviour, reintroduced through the back door.
+    #
+    # Both reset branches below write ONLY when there is a streak to clear.
+    # ``streak`` is the only key either one touches, so a tick with no streak
+    # would persist a byte-identical document — and save_state is not free:
+    # makedirs + mkstemp + write + os.replace, a new inode every time. At the
+    # timer's 30s cadence the healthy steady state is ~2880 of those a day,
+    # forever, each leaving a window in which a kill orphans a ``.state.*``
+    # temp file that nothing ever reaps. The guard is exactly the ``if
+    # state["streak"]`` the log lines already needed.
     active_enter = _unit_active_enter_epoch(DASHBOARD_UNIT)
     if active_enter is not None and int(time.time()) - active_enter < GRACE_SECS:
         if state["streak"]:
@@ -747,15 +771,15 @@ def tick() -> None:
                 f"{DASHBOARD_UNIT} activated <{GRACE_SECS}s ago; inside startup "
                 f"grace, clearing streak {state['streak']} and skipping the probe"
             )
-        state["streak"] = 0
-        save_state(state)
+            state["streak"] = 0
+            save_state(state)
         return
 
     if probe_health():
         if state["streak"]:
             log(f"{DASHBOARD_UNIT} healthy again; clearing streak {state['streak']}")
-        state["streak"] = 0
-        save_state(state)
+            state["streak"] = 0
+            save_state(state)
         return
 
     # Failed probe. Advance the streak and persist it — the next tick is a

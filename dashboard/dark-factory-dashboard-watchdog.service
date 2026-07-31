@@ -31,6 +31,17 @@ Type=oneshot
 # failure streak and the rolling restart window are persisted to disk by the
 # script rather than held in memory.
 ExecStart=/home/leo/src/dark-factory/scripts/dashboard-watchdog.py
+# Belt-and-braces bound on the WHOLE tick. systemd disables TimeoutStartSec for
+# Type=oneshot by default, and the timer's OnUnitActiveSec=30 measures from this
+# unit's last activation — so a tick that never returns is not a slow tick, it is
+# the END of supervision: the timer never re-triggers and nothing says so. The
+# script bounds each of its own children (probe 5s, systemctl show 5s,
+# reset-failed 10s, restart 45s, `escalation submit` 120s), whose worst-case
+# path — probe + show + submit — is ~130s. 300 sits comfortably above that, so
+# it can only ever fire on a genuine wedge (stuck journald, uninterruptible I/O),
+# never on a legitimately slow escalation, and a wedge costs one tick instead of
+# all of them.
+TimeoutStartSec=300
 # The script logs its decisions via systemd-cat -t dashboard-watchdog; these
 # two route anything else it prints to the same journal, so
 # `journalctl --user -t dashboard-watchdog` is the single place to read why
