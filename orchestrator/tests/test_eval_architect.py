@@ -1278,7 +1278,15 @@ def _architect_result(
     task_id: str = 'df_task_2605',
     config_name: str = 'architect-sonnet-high',
     plan_quality: float = 0.75,
+    plan_steps: int = 6,
 ):
+    """An architect cell that DID produce a plan.
+
+    ``plan_steps`` defaults NONZERO (task 3302): a ``plan_quality`` is a score
+    over the steps a plan actually carried, and ``plan_steps > 0`` is the
+    predicate the report layer reads to know one exists. A stepless cell is the
+    distinct no-plan shape, requested explicitly by the tests that exercise it.
+    """
     from orchestrator.evals.runner import EvalResult
 
     return EvalResult(
@@ -1288,6 +1296,7 @@ def _architect_result(
         metrics={
             'role_under_test': 'architect',
             'plan_quality': plan_quality,
+            'plan_steps': plan_steps,
             'composite_score': 0.0,
         },
         worktree_path='/tmp/wt-arch',
