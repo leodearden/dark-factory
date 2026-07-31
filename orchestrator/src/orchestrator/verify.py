@@ -4441,8 +4441,27 @@ async def run_verification(
     # broken `_merge-verify` worktree, task 2831's restart collateral, and task
     # 3367's mis-resolved pyright interpreter (esc-3359-1) — any of which a TYPE
     # or LINT leg can trip. The category therefore no longer implies the TEST
-    # leg was the failing one, so the gate below must establish that itself.
-    if category == FailureCategory.ENV_TRANSIENT and attempt.test.cmd is not None:
+    # leg was the failing one, so the gate below establishes that itself with an
+    # explicit `attempt.test.rc != 0`.
+    #
+    # THE RULE (task 3367): this recovery exists for the TEST leg's shared-venv
+    # mutation, and its only action is to re-run the TEST command serially. It
+    # therefore fires only when the TEST leg is the failing one. When the test
+    # leg already passed there is nothing to recover and the re-run cannot
+    # change the verdict — it just spends a full test-suite wall-clock (1320.9s
+    # in esc-3359-1, where test rc=0, lint rc=0, type rc=1) before returning the
+    # same red, under a "vanished xdist/pip" warning that misdescribes the
+    # actual failure. A lint/type env_transient is instead reported directly —
+    # loudly (see the per-check ERROR in _run_or_skip_timed) and
+    # infra-transient at the merge lane — with no pointless test re-run.
+    #
+    # The rc check is correct on its own terms, independent of task 3367's new
+    # classification: re-running a passing leg can never recover anything.
+    if (
+        category == FailureCategory.ENV_TRANSIENT
+        and attempt.test.cmd is not None
+        and attempt.test.rc != 0
+    ):
         logger.warning(
             'Verification hit an environmental shared-venv transient '
             '(vanished xdist/pip); retrying test command once, forced serial '
