@@ -240,3 +240,94 @@ class TestExtractSearches:
         assert _mod.extract_searches([
             {'type': 'user', 'message': {'role': 'user', 'content': 'plain text'}}
         ]) == []
+
+
+# ===========================================================================
+# step-5 — caller identity
+# ===========================================================================
+
+
+def _briefing(agent_id: str) -> dict:
+    """The first user record's briefing, in the measured live shape."""
+    return {
+        'type': 'user',
+        'message': {
+            'role': 'user',
+            'content': (
+                '# Context\n\n(elided)\n\n## Agent Identity\n\n'
+                f'- **agent_id:** `{agent_id}`\n'
+                '- **project_id:** `dark_factory`\n'
+            ),
+        },
+    }
+
+
+class TestCallerIdentity:
+    """Who issued the search — recovered from the briefing, never from the
+    ``tool_use`` block's same-named harness field.
+
+    PRD §3: the going-forward telemetry seam left 99.7% of journal rows
+    unattributed because agent_id was overloaded as a FILTER param, so retro
+    attribution cannot be read off the search call itself. The dispatched
+    briefing does carry it.
+
+    Every field degrades to None rather than blocking emission: dropping an
+    unattributed search would silently bias the corpus toward whichever agent
+    roles happen to carry a parseable briefing.
+    """
+
+    def _caller_for(self, agent_id: str) -> dict:
+        records = _mod.extract_searches([_briefing(agent_id), _tool_use('toolu_A', 'q')])
+        assert len(records) == 1
+        return records[0]['caller']
+
+    def test_stamps_agent_id_task_and_role(self):
+        # The measured live shape.
+        assert self._caller_for('claude-task-2280-architect') == {
+            'agent_id': 'claude-task-2280-architect',
+            'task_id': '2280',
+            'role': 'architect',
+        }
+
+    def test_hyphenated_role_survives(self):
+        # Role is the remainder after the numeric id, so a multi-segment role
+        # is not truncated at its first hyphen.
+        assert self._caller_for('claude-task-3214-code-reviewer') == {
+            'agent_id': 'claude-task-3214-code-reviewer',
+            'task_id': '3214',
+            'role': 'code-reviewer',
+        }
+
+    def test_unrecognised_shape_preserves_agent_id_verbatim(self):
+        # An interactive session's agent_id is not claude-task-<id>-<role>.
+        # What we DID observe is kept; what we cannot derive is None.
+        assert self._caller_for('claude-interactive') == {
+            'agent_id': 'claude-interactive',
+            'task_id': None,
+            'role': None,
+        }
+
+    def test_no_identity_block_leaves_all_fields_none(self):
+        records = _mod.extract_searches([_tool_use('toolu_A', 'q')])
+        assert len(records) == 1, 'an unattributed search must still be emitted'
+        assert records[0]['caller'] == {'agent_id': None, 'task_id': None, 'role': None}
+
+    def test_first_match_wins(self):
+        # A later record quoting a different agent_id (an agent discussing
+        # another agent's briefing) must not overwrite the real one.
+        records = _mod.extract_searches([
+            _briefing('claude-task-2280-architect'),
+            {'type': 'user', 'message': {'role': 'user',
+                                         'content': 'agent_id:** `claude-task-9999-imposter`'}},
+            _tool_use('toolu_A', 'q'),
+        ])
+        assert records[0]['caller']['agent_id'] == 'claude-task-2280-architect'
+
+    def test_identity_resolved_before_and_after_a_search_alike(self):
+        # The briefing precedes any search in a real transcript, but the
+        # extractor must not depend on that ordering accident.
+        records = _mod.extract_searches([
+            _tool_use('toolu_A', 'q'),
+            _briefing('claude-task-2280-architect'),
+        ])
+        assert records[0]['caller']['task_id'] == '2280'
