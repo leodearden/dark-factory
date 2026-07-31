@@ -211,7 +211,7 @@ After a successful direct merge:
 
 | Situation | Action |
 |-----------|--------|
-| Orchestrator running | Submit via `merge_request(wait_secs=100, verified_green=<True|False>)` — only when verification actually passed — then poll `merge_status` |
+| Orchestrator running | Submit via `merge_request(wait_secs=100, verified_green=...)` — `True` only when verification actually passed, `False` otherwise — then poll `merge_status` |
 | Orchestrator not running | Direct `git merge --no-ff` |
 | Submit returns `queued` or `attached` | Durable intent confirmed; poll the handle `poll_by` names (`request_id` for `queued` and the `poll_by=="request_id"` arm; `task_id`/`branch` when `attached` discloses them) with 15 s→60 s backoff |
 | `merge_status` returns `state: "unknown"` | Check `git merge-base --is-ancestor task/<TASK_ID> main` (exit 0 → done/found_on_main; exit 1 + healthy queue → resubmit). Never direct-merge in response to `unknown`. |
