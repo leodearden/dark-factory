@@ -421,3 +421,227 @@ class TestErrorTypes:
         assert 'invalid_topic_slug' in text
         assert 'TOPIC_SLUG_RE' in text
         assert 'fused_memory.memory_metadata' in text
+
+
+_UUID = '3f2504e0-4f89-11d3-9a0c-0305e82c3301'
+_UUID2 = '7c9e6679-7425-40de-944b-e07fc1f90ae7'
+
+
+def _codes(violations):
+    return {v.code for v in violations}
+
+
+def _by_key(violations, key):
+    return [v for v in violations if v.key == key]
+
+
+class TestValidateMemoryMetadata:
+    """Pure shape checks (leaf β owns SHAPES ONLY).
+
+    Signature: ``validate_memory_metadata(meta, *, enforce_kind_registry)``
+    -> ``list[MetadataViolation]``.  It mutates *meta* in place ONLY to
+    normalize `supersedes`, mirroring `parse_metadata`'s (value, warnings)
+    contract: the caller owns the warn-vs-reject decision.
+    """
+
+    def _validate(self, meta, *, enforce_kind_registry=False):
+        from fused_memory.memory_metadata import validate_memory_metadata
+
+        return validate_memory_metadata(meta, enforce_kind_registry=enforce_kind_registry)
+
+    # -- valid path ------------------------------------------------------
+
+    def test_fully_valid_metadata_yields_no_violations(self):
+        meta = {
+            'topic': 'a-good-slug',
+            'canonical': True,
+            'kind': 'cycle_summary',
+            'parent_id': _UUID,
+            'supersedes': [_UUID2],
+            'task_id': '3195',        # blessed
+            'x_experimental': 'ok',   # passthrough
+        }
+        assert self._validate(meta) == []
+        assert meta['supersedes'] == [_UUID2]
+
+    def test_absent_reserved_keys_are_never_a_violation(self):
+        """None of V1's five keys is required."""
+        assert self._validate({}) == []
+
+    # -- topic -----------------------------------------------------------
+
+    @pytest.mark.parametrize('bad', ['bad_slug', 'Bad-Slug', '-x', 'a--b', ''])
+    def test_bad_topic_slug(self, bad):
+        violations = _by_key(self._validate({'topic': bad}), 'topic')
+        assert [v.code for v in violations] == ['invalid_topic_slug']
+        assert 'TOPIC_SLUG_RE' in violations[0].message
+
+    def test_over_length_topic_slug(self):
+        from fused_memory.memory_metadata import TOPIC_SLUG_MAX_LEN
+
+        meta = {'topic': 'a' * (TOPIC_SLUG_MAX_LEN + 1)}
+        assert _codes(self._validate(meta)) == {'invalid_topic_slug'}
+
+    def test_non_str_topic(self):
+        assert _codes(self._validate({'topic': 123})) == {'invalid_topic_type'}
+
+    # -- canonical -------------------------------------------------------
+
+    def test_non_bool_canonical_rejected(self):
+        assert _codes(self._validate({'canonical': 'yes'})) == {'invalid_canonical_type'}
+
+    def test_canonical_one_is_rejected_not_treated_as_true(self):
+        """The check must be isinstance(x, bool), NOT truthiness.
+
+        `1 == True` in Python, so a truthiness check would silently accept
+        an int here — and the census counts exactly 1 live non-bool value,
+        which is the record this rule exists to surface.
+        """
+        assert _codes(self._validate({'canonical': 1})) == {'invalid_canonical_type'}
+        assert _codes(self._validate({'canonical': 0})) == {'invalid_canonical_type'}
+
+    @pytest.mark.parametrize('good', [True, False])
+    def test_bool_canonical_accepted(self, good):
+        assert self._validate({'canonical': good}) == []
+
+    # -- kind ------------------------------------------------------------
+
+    def test_known_kind_accepted(self):
+        assert self._validate({'kind': 'cycle_summary'}) == []
+
+    def test_unknown_kind_is_fatal_when_registry_enforced(self):
+        violations = self._validate(
+            {'kind': 'not_in_registry_xyz'}, enforce_kind_registry=True
+        )
+        assert len(violations) == 1
+        assert violations[0].code == 'unknown_kind'
+        assert violations[0].fatal is True
+        assert 'KIND_REGISTRY' in violations[0].message
+
+    def test_unknown_kind_still_censuses_when_registry_not_enforced(self):
+        """Same violation CODE, but non-fatal: it censuses, it does not reject.
+
+        This is the census-refuted-premise carve-out (PRD D3 amendment):
+        242 of 329 live kinds are singletons, so day-one rejection would
+        break the live fleet.
+        """
+        violations = self._validate(
+            {'kind': 'not_in_registry_xyz'}, enforce_kind_registry=False
+        )
+        assert len(violations) == 1
+        assert violations[0].code == 'unknown_kind'
+        assert violations[0].fatal is False
+
+    def test_non_str_kind(self):
+        assert _codes(self._validate({'kind': 42})) == {'invalid_kind_type'}
+
+    # -- parent_id (SHAPE only; liveness is leaf delta's) -----------------
+
+    @pytest.mark.parametrize('bad', ['deadbeef', 'deadbe', 'not-a-uuid', ''])
+    def test_bad_parent_id_shape(self, bad):
+        assert _codes(self._validate({'parent_id': bad})) == {'invalid_parent_id_shape'}
+
+    def test_non_str_parent_id(self):
+        assert _codes(self._validate({'parent_id': 123})) == {'invalid_parent_id_shape'}
+
+    def test_well_formed_parent_id_accepted(self):
+        assert self._validate({'parent_id': _UUID}) == []
+
+    def test_validator_is_a_pure_sync_dict_function(self):
+        """`parent_id` LIVENESS (leaf delta) is structurally out of reach.
+
+        The validator takes only a dict and is not a coroutine, so it
+        CANNOT perform a store lookup. That makes the beta/delta scope
+        boundary structural rather than a comment a later leaf could
+        overlook and duplicate.
+        """
+        import inspect
+
+        from fused_memory.memory_metadata import validate_memory_metadata
+
+        assert not inspect.iscoroutinefunction(validate_memory_metadata)
+        params = inspect.signature(validate_memory_metadata).parameters
+        assert list(params) == ['meta', 'enforce_kind_registry']
+
+    # -- supersedes ------------------------------------------------------
+
+    def test_scalar_supersedes_is_normalized_not_rejected(self):
+        """The beta-before-gamma hazard fix.
+
+        harness.py:1167 writes a scalar today (81 live records). Beta lands
+        BEFORE gamma migrates it, so rejecting the scalar form here would
+        break the recon harness's own writes for the whole window between.
+        """
+        meta = {'supersedes': _UUID}
+        assert self._validate(meta) == []
+        assert meta['supersedes'] == [_UUID]
+
+    def test_list_supersedes_accepted(self):
+        meta = {'supersedes': [_UUID, _UUID2]}
+        assert self._validate(meta) == []
+        assert meta['supersedes'] == [_UUID, _UUID2]
+
+    def test_short_hex_supersedes_member_rejected(self):
+        """3 live records carry this shape."""
+        violations = self._validate({'supersedes': [_UUID, 'deadbe']})
+        assert _codes(violations) == {'invalid_supersedes_member'}
+        assert 'deadbe' in violations[0].message
+
+    def test_non_str_supersedes_member_rejected(self):
+        """8 live records carry an 'other' member shape."""
+        violations = self._validate({'supersedes': [_UUID, 42]})
+        assert _codes(violations) == {'invalid_supersedes_member'}
+        assert '42' in violations[0].message
+
+    def test_empty_and_absent_supersedes_are_fine(self):
+        meta = {'supersedes': []}
+        assert self._validate(meta) == []
+        assert self._validate({}) == []
+
+    # -- unknown keys ----------------------------------------------------
+
+    def test_unknown_key_censuses_non_fatally(self):
+        violations = self._validate({'weird_key': 1})
+        assert len(violations) == 1
+        assert violations[0].code == 'unknown_key'
+        assert violations[0].key == 'weird_key'
+        assert violations[0].fatal is False
+
+    def test_x_prefixed_key_is_silent(self):
+        assert self._validate({'x_weird': 1}) == []
+
+    @pytest.mark.parametrize(
+        'key',
+        ['data', 'user_id', 'category', 'recon_pool', 'planned', 'task_id', 'source'],
+    )
+    def test_known_layer_keys_are_silent(self, key):
+        assert self._validate({key: 'v'}) == []
+
+    # -- no short-circuit ------------------------------------------------
+
+    def test_all_violations_are_returned_not_just_the_first(self):
+        """A validator that stopped at the first failure would make an
+        operator fix one violation per write attempt."""
+        meta = {
+            'topic': 'bad_slug',
+            'canonical': 'yes',
+            'kind': 'not_in_registry_xyz',
+            'parent_id': 'deadbeef',
+            'supersedes': [42],
+            'weird_key': 1,
+        }
+        violations = self._validate(meta, enforce_kind_registry=True)
+        assert _codes(violations) == {
+            'invalid_topic_slug',
+            'invalid_canonical_type',
+            'unknown_kind',
+            'invalid_parent_id_shape',
+            'invalid_supersedes_member',
+            'unknown_key',
+        }
+
+    def test_every_message_names_the_registry_location(self):
+        """V1: the hint must name where the vocabulary lives."""
+        meta = {'topic': 'bad_slug', 'canonical': 'yes', 'parent_id': 'x'}
+        for violation in self._validate(meta):
+            assert 'fused_memory.memory_metadata' in violation.message
