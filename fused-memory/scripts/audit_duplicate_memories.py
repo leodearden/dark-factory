@@ -1106,6 +1106,16 @@ def build_sweep_plan(
         ``restrict_delete_candidates_for_apply``) and ``path_verdicts``
         (``lexical_only_clusters`` / ``ann_only_clusters`` /
         ``both_paths_clusters``).
+
+        It also carries ``liveness_snapshot_recurrence_groups`` /
+        ``liveness_snapshot_recurrence_clusters`` /
+        ``liveness_snapshot_disclosure`` (see
+        ``find_liveness_snapshot_recurrences``). That class is REPORT-ONLY: it
+        never contributes to ``delete_candidates`` or
+        ``apply_delete_candidates``, and its groups are never handed to the
+        apply gate — it is surfaced for human review and consolidation only.
+        Task 3098 authorizes detection of the pattern, not disposition of the
+        records that exhibit it.
     """
     near_duplicate_groups: list[dict[str, Any]] = []
     # Mem0/Qdrant point ids can be int or str (ExtendedPointId), so this is
@@ -1239,6 +1249,17 @@ def build_sweep_plan(
             })
             delete_candidates.extend(loser_ids)
 
+    # The THIRD candidate class, run ONCE over the whole list rather than
+    # inside the per-category loop above: it does its own
+    # (category, subject, core_fact) bucketing, so the per-category isolation
+    # comes from the key. Running it inside the loop would be O(n x
+    # categories) and would multiply its disclosure counters by the number of
+    # categories — the same double-counting reason _count_ann_pair_drops is
+    # called once, outside.
+    liveness_groups, liveness_disclosure = find_liveness_snapshot_recurrences(
+        memories, categories=categories,
+    )
+
     apply_candidates, apply_withheld = restrict_delete_candidates_for_apply(
         near_duplicate_groups,
     )
@@ -1258,6 +1279,9 @@ def build_sweep_plan(
         'ann_disclosure': echoed_disclosure,
         'topic_carveout_clusters': len(topic_carveout_groups),
         'topic_carveout_groups': topic_carveout_groups,
+        'liveness_snapshot_recurrence_clusters': len(liveness_groups),
+        'liveness_snapshot_recurrence_groups': liveness_groups,
+        'liveness_snapshot_disclosure': liveness_disclosure,
         'apply_delete_candidates': apply_candidates,
         'apply_withheld_clusters': len(apply_withheld),
         'apply_withheld_groups': apply_withheld,
