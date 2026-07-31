@@ -5964,22 +5964,51 @@ async def run_main_tip_sweep(
         The harness treats ``None`` as "no signal — retry next tick" and does
         NOT mark the SHA as swept, so the same tip is retried on the next interval.
 
+    Isolated PRE-FILTER (task 3095, gated by
+    ``config.main_tip_sweep_isolated_prefilter_enabled``, default on): when the
+    first pass fails, ``_sweep_failure_reproduces_in_isolation`` re-runs JUST
+    the named failing node-ids — scoped, forced-serial, generous-timeout — in
+    this same pinned worktree BEFORE the full retry is paid for.  Only a
+    deterministic reproduction (``True``) short-circuits: the full retry is
+    skipped and the FIRST-PASS failing result is returned.  ``False``
+    (did-not-reproduce) and ``None`` (unconfirmable) both fall through to the
+    unchanged full retry below.  Setting the flag False restores
+    byte-identical pre-3095 behavior.
+
+    This is a COST gate, never a verdict.  The pre-filter can shorten the path
+    to a failing return but can never produce a passing one, so the sweep
+    NEVER returns a ``passed=True`` result derived from subset-only evidence —
+    which is what keeps the harness's self-heal precondition intact
+    (``_close_superseded_main_sweep_escalations`` fires on a passing sweep
+    result, and that must mean a genuine full-verify PASS; an isolated subset
+    re-run is weaker evidence than that).  Both error directions are safe:
+    a residue-induced false ``True`` only hands a FAILING result to the
+    harness, which still re-runs the node-ids in a FRESH worktree via
+    ``confirm_main_tip_failure_is_real`` — the sole suppression authority —
+    before filing anything; a false ``False`` merely pays for the retry as
+    before.
+
     Retry-on-flake: when the first ``run_full_verification`` call fails (and its
-    category is NOT one of the infra sentinels above), the function re-runs it
-    ONCE in the same pinned worktree (idempotent; no second ``git worktree
-    add``).  **The retry reuses first-pass worktree state by design** — no
-    cleanup of temp files, partially-written DBs, or caches is performed before
-    the re-run.  This is intentional: the purpose is a fast flake-vs-drift
-    heuristic, not a hermetic isolation guarantee.  A first run that fails
-    partway may leave residue that makes the retry non-representative in either
-    direction; the single-retry bound and the two-failure-escalates rule limit
-    the blast radius.
+    category is NOT one of the infra sentinels above, and the pre-filter did not
+    short-circuit), the function re-runs it ONCE in the same pinned worktree
+    (idempotent; no second ``git worktree add``).  **The retry reuses first-pass
+    worktree state by design** — no cleanup of temp files, partially-written
+    DBs, or caches is performed before the re-run.  This is intentional: the
+    purpose is a fast flake-vs-drift heuristic, not a hermetic isolation
+    guarantee.  A first run that fails partway may leave residue that makes the
+    retry non-representative in either direction; the single-retry bound and the
+    two-failure-escalates rule limit the blast radius.
 
     - Retry PASSES → emit a WARNING, append a record to
       ``verify._suppressed_flake_records`` (durable in-process audit trail), and
       return ``(main_sha, retry_result)`` so the harness files no drift
       escalation.  NOTE: this suppresses the flake but **MAY MASK a real
-      intermittent regression** introduced by a merge.
+      intermittent regression** introduced by a merge.  Since task 3095 that
+      masking window is NARROWER but not closed: it is now reachable only when
+      the pre-filter did NOT see the named tests reproduce, i.e. the failure
+      already looks load-induced — and a genuine FULL green is still required
+      to reach it.  A deterministic failure no longer gets a second lottery
+      ticket at being masked.
     - Retry FAILS → return ``(main_sha, retry_result)`` so deterministic drift
       still escalates.
     - Retry hits pytest INTERNALERROR or env_transient → return ``None``
@@ -6089,6 +6118,48 @@ async def run_main_tip_sweep(
                     'worktree to distinguish transient flake from deterministic drift',
                     _sha_prefix, result.category, result.cause_hint,
                 )
+
+                # COST pre-filter (task 3095): before paying for a whole
+                # second full-suite run, re-run just the named failing
+                # node-ids in isolation.  A deterministic reproduction means
+                # the full retry is near-certainly wasted work AND that the
+                # sweep would otherwise keep adding minutes of background load
+                # during a red-main investigation.  Only True short-circuits;
+                # False/None both fall through to the unchanged full retry, so
+                # a passing sweep result still requires a genuine FULL green.
+                #
+                # Defense-in-depth: the helper already wraps its own body, so
+                # in practice it cannot raise — but a raise escaping HERE would
+                # hit run_main_tip_sweep's outer `except Exception` and
+                # silently collapse a REAL red-main signal into the None
+                # "no signal" sentinel, dropping the drift on the floor. That
+                # failure mode is severe and silent enough to be worth pinning
+                # against a future edit to the helper, so the call is caught
+                # locally and degraded to "did not short-circuit".
+                _reproduced: bool | None = None
+                if config.main_tip_sweep_isolated_prefilter_enabled:
+                    try:
+                        _reproduced = await _sweep_failure_reproduces_in_isolation(
+                            tmp_path, config, result,
+                        )
+                    except Exception:
+                        logger.warning(
+                            'run_main_tip_sweep: isolated pre-filter raised at '
+                            '%s — falling through to the full-suite retry',
+                            _sha_prefix, exc_info=True,
+                        )
+                if _reproduced is True:
+                    logger.warning(
+                        'run_main_tip_sweep: first-pass failure at %s '
+                        'reproduced deterministically in isolation '
+                        '(category=%r, cause_hint=%r) — skipping the '
+                        'full-suite retry and returning the first-pass '
+                        'failure; the harness confirm gate still adjudicates '
+                        'before any escalation is filed',
+                        _sha_prefix, result.category, result.cause_hint,
+                    )
+                    return (main_sha, result)
+
                 retry = await run_full_verification(tmp_path, config, role='background')  # type: ignore[arg-type]
 
                 if retry.category in INFRA_TRANSIENT_CATEGORIES:
@@ -6203,6 +6274,216 @@ async def _run_isolated_confirm_group(
         if result.passed:
             return True
     return False
+
+
+def _group_node_ids_by_subproject(
+    worktree: Path,
+    module_configs: dict[str, ModuleConfig],
+    node_ids: list[str],
+    *,
+    log_label: str,
+) -> dict[str, list[str]] | None:
+    """Map each pytest node-id in *node_ids* to its owning subproject prefix.
+
+    PURE (no I/O beyond ``Path.exists`` probes against the on-disk
+    *worktree*), sync, never raises on ordinary input. Extracted from
+    ``confirm_main_tip_failure_is_real`` so the main-tip-sweep isolated
+    pre-filter reuses it rather than the tree gaining a THIRD copy of this
+    block (task 3095; the merge-path copy in
+    ``confirm_merge_verify_flake_suppressible`` takes list-shaped
+    module_configs and is deliberately left alone — filed as a follow-up).
+
+    For each node-id, the file component (``node_id.split('::', 1)[0]``) is
+    probed against EVERY discovered subproject — not just the first match —
+    so a bare relative path that happens to exist under more than one
+    subproject can be flagged rather than silently mis-attributed to
+    whichever prefix iterates first:
+
+    * ``<worktree>/<prefix>/<relpath>`` exists → subproject-relative node-id;
+      the qualified id ``<prefix>/<node_id>`` is recorded.
+    * ``<relpath>`` already starts with ``<prefix>/`` and
+      ``<worktree>/<relpath>`` exists → already worktree-root-relative; the
+      node-id is recorded verbatim.
+
+    Returns:
+        ``dict[prefix, list[qualified_node_id]]`` — node-ids owned by the same
+        subproject grouped together, INPUT ORDER preserved within each group,
+        so a caller can build one scoped re-run command per subproject.
+        An empty *node_ids* yields ``{}`` (NOT the None sentinel — "nothing to
+        map" is distinct from "unmappable"; callers early-out on empty input
+        themselves).
+
+        ``None`` when ANY node-id maps to no discovered subproject (logged at
+        INFO with *log_label*). This is the callers' fail-safe signal — one
+        unmappable node-id poisons the whole batch rather than the helper
+        guessing which subproject it belongs to, or silently running a
+        partial subset.
+
+    An ambiguous node-id (relpath present under >1 subproject) resolves
+    deterministically to the FIRST candidate by *module_configs* iteration
+    order and logs a WARNING naming every candidate prefix and *log_label* —
+    a low-likelihood, non-fatal ambiguity, not a fail-safe path.
+
+    Args:
+        worktree: Tree the existence probes run against.
+        module_configs: Prefix -> ModuleConfig, freshly discovered on
+            *worktree* by the caller (never a snapshot for a different tree).
+        node_ids: Extracted failing pytest node-ids, in output order.
+        log_label: Caller name, embedded in every log line so an operator can
+            attribute the message to the right call site.
+    """
+    groups: dict[str, list[str]] = {}
+    for node_id in node_ids:
+        file_part = node_id.split('::', 1)[0]
+        candidates: list[tuple[str, str]] = []
+        for prefix, _mc in module_configs.items():
+            if (worktree / prefix / file_part).exists():
+                candidates.append((prefix, f'{prefix}/{node_id}'))
+            elif file_part.startswith(f'{prefix}/') and (worktree / file_part).exists():
+                candidates.append((prefix, node_id))
+        if not candidates:
+            logger.info(
+                '%s: node-id %r did not map to any discovered subproject in '
+                '%s — unconfirmable',
+                log_label, node_id, worktree,
+            )
+            return None
+        if len(candidates) > 1:
+            logger.warning(
+                '%s: node-id %r matched %d discovered subprojects (%s) in %s '
+                '— using %r; a relative path shared across subprojects can '
+                'mis-attribute the isolated re-run to the wrong ModuleConfig',
+                log_label, node_id, len(candidates), [c[0] for c in candidates],
+                worktree, candidates[0][0],
+            )
+        matched_prefix, matched_node_id = candidates[0]
+        groups.setdefault(matched_prefix, []).append(matched_node_id)
+    return groups
+
+
+#: Generous per-test timeout (seconds) injected into the main-tip-sweep
+#: isolated PRE-FILTER's re-run command via ``_with_pytest_timeout_str``.
+#: Same rationale as ``_MERGE_FLAKE_CONFIRM_TIMEOUT_SECS``: the serial
+#: recovery's ``-o addopts=`` clears pyproject ``addopts`` but NOT the
+#: ``[tool.pytest.ini_options] timeout=60`` default, so without this explicit
+#: override a still-loaded host could starve the isolated run into a false
+#: "reproduces" verdict. Kept as a SEPARATE constant from the merge gate's so
+#: sweep tuning is not coupled to merge-gate tuning (they are retuned on
+#: different signals).
+_SWEEP_PREFILTER_TIMEOUT_SECS: int = 300
+
+
+async def _sweep_failure_reproduces_in_isolation(
+    worktree: Path,
+    config: 'OrchestratorConfig',
+    failing_result: VerifyResult,
+) -> bool | None:
+    """Does *failing_result*'s named failing test set reproduce in ISOLATION?
+
+    A COST pre-filter for ``run_main_tip_sweep``'s expensive full-suite retry
+    — **never a suppression verdict** (task 3095). The sole suppression
+    authority remains the harness's fresh-worktree
+    ``confirm_main_tip_failure_is_real`` gate; this helper only decides
+    whether paying for a second full ``run_full_verification`` is worthwhile.
+
+    Re-runs just the originally-failing node-ids, scoped + forced-serial +
+    generous-timeout, in the sweep's OWN already-pinned *worktree* (no second
+    ``git worktree add``). First-pass residue in that reused tree is
+    deliberately accepted: both error directions are safe by construction (see
+    Returns), so hermetic isolation would buy no precision here.
+
+    Returns:
+        ``True`` — REPRODUCES: at least one named test still fails in
+        isolation, so the failure is deterministic and the full retry is
+        near-certainly wasted work. A spurious True (residue-induced) only
+        skips the retry and hands a FAILING result to the harness, which still
+        re-runs the node-ids in a FRESH worktree before filing — so this
+        direction can never manufacture a false alarm.
+
+        ``False`` — DOES NOT REPRODUCE: every named test passed in isolation,
+        i.e. a suspected contention flake. The caller must run the full retry
+        as before, so a genuine FULL green is still required for the harness's
+        self-heal precondition.
+
+        ``None`` — UNCONFIRMABLE: no recoverable node-id (a lint/type failure
+        or an unparseable crash notice), a node-id owned by no discovered
+        subproject, an infra-sentinel re-run category
+        (``INFRA_TRANSIENT_CATEGORIES`` — never trusted as evidence either
+        way, independent of the ``passed`` flag), or ANY raised exception. The
+        caller falls through to byte-identical pre-3095 behavior.
+
+    Never raises: the whole body is wrapped, and the handler logs at WARNING
+    (not debug) — a pre-filter that keeps silently degrading to the expensive
+    path must be visible in the log stream.
+    """
+    try:
+        # Cheap early-out: nothing named means nothing to re-run — pay no
+        # subprocess at all.
+        node_ids = _extract_failing_test_ids(failing_result.test_output)
+        if not node_ids:
+            return None
+
+        # Discover module configs on the SWEEP worktree (never config's
+        # snapshot — that is for a different worktree/SHA). Lazy import
+        # mirrors confirm_main_tip_failure_is_real.
+        from orchestrator.config import _discover_module_configs  # noqa: PLC0415
+
+        module_configs = _discover_module_configs(worktree)
+
+        groups = _group_node_ids_by_subproject(
+            worktree, module_configs, node_ids,
+            log_label='run_main_tip_sweep prefilter',
+        )
+        # None = an unmapped node-id. An empty dict is unreachable here (the
+        # empty-node_ids early-out above already returned), but `not groups`
+        # keeps a hypothetical {} from being mistaken for "all groups clean"
+        # -> False, which would assert a not-reproduced verdict on zero
+        # evidence.
+        if not groups:
+            return None
+
+        for prefix, group_node_ids in groups.items():
+            mc = module_configs[prefix]
+            scoped_cmd = _with_pytest_timeout_str(
+                _serial_pytest_str(
+                    _scope_to_keyword(mc.test_command, 'pytest', group_node_ids),
+                ),
+                _SWEEP_PREFILTER_TIMEOUT_SECS,
+            )
+            scoped_mc = replace(
+                mc, test_command=scoped_cmd, lint_command=None, type_check_command=None,
+            )
+            result = await run_verification(
+                worktree, config, scoped_mc, max_retries=0, role='background',
+            )
+            # Category-first, independent of the passed flag (mirrors
+            # run_main_tip_sweep / _run_isolated_confirm_group): an infra
+            # sentinel is evidence of nothing, so it maps to UNCONFIRMABLE
+            # rather than to either verdict.
+            if result.category in INFRA_TRANSIENT_CATEGORIES:
+                logger.info(
+                    'run_main_tip_sweep prefilter: isolated re-run for %s hit '
+                    '%s — unconfirmable, falling through to the full retry',
+                    prefix, result.category,
+                )
+                return None
+            if not result.passed:
+                logger.info(
+                    'run_main_tip_sweep prefilter: %s still failed in '
+                    'isolation (category=%r) — deterministic reproduction',
+                    group_node_ids, result.category,
+                )
+                return True
+
+        return False
+
+    except Exception:
+        logger.warning(
+            'run_main_tip_sweep prefilter: unexpected error — unconfirmable, '
+            'falling through to the full-suite retry',
+            exc_info=True,
+        )
+        return None
 
 
 async def confirm_main_tip_failure_is_real(
@@ -6321,42 +6602,22 @@ async def confirm_main_tip_failure_is_real(
             )
             return True
 
-        # Map each node-id to its owning subproject (see docstring). Any
-        # unmapped node-id fails safe to alarm — no guessing which subproject
+        # Map each node-id to its owning subproject via the shared helper
+        # (see its docstring for the probe rules). Any unmapped node-id
+        # returns None and fails safe to alarm — no guessing which subproject
         # a node-id belongs to.
-        groups: dict[str, list[str]] = {}
-        for node_id in node_ids:
-            file_part = node_id.split('::', 1)[0]
-            # Collect EVERY subproject the node-id could belong to (not just
-            # the first) so a bare relative path that happens to exist under
-            # more than one discovered subproject can be flagged rather than
-            # silently mis-attributed to whichever prefix iterates first —
-            # see the docstring's "Node-id -> subproject mapping" section.
-            candidates: list[tuple[str, str]] = []
-            for prefix, _mc in module_configs.items():
-                if (tmp_path / prefix / file_part).exists():
-                    candidates.append((prefix, f'{prefix}/{node_id}'))
-                elif file_part.startswith(f'{prefix}/') and (tmp_path / file_part).exists():
-                    candidates.append((prefix, node_id))
-            if not candidates:
-                logger.info(
-                    'confirm_main_tip_failure_is_real: node-id %r did not map '
-                    'to any discovered subproject at %s — unconfirmable, '
-                    'filing alarm',
-                    node_id, _sha_prefix,
-                )
-                return True
-            if len(candidates) > 1:
-                logger.warning(
-                    'confirm_main_tip_failure_is_real: node-id %r matched %d '
-                    'discovered subprojects (%s) at %s — using %r; a relative '
-                    'path shared across subprojects can mis-attribute the '
-                    'isolated re-run to the wrong ModuleConfig',
-                    node_id, len(candidates), [c[0] for c in candidates],
-                    _sha_prefix, candidates[0][0],
-                )
-            matched_prefix, matched_node_id = candidates[0]
-            groups.setdefault(matched_prefix, []).append(matched_node_id)
+        groups = _group_node_ids_by_subproject(
+            tmp_path, module_configs, node_ids,
+            log_label='confirm_main_tip_failure_is_real',
+        )
+        if groups is None:
+            logger.info(
+                'confirm_main_tip_failure_is_real: an extracted node-id did '
+                'not map to a discovered subproject at %s — unconfirmable, '
+                'filing alarm',
+                _sha_prefix,
+            )
+            return True
 
         # Each subproject group gets its own scoped + forced-serial isolated
         # re-run. ALL groups must confirm green to suppress.

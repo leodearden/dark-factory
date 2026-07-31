@@ -3104,3 +3104,50 @@ class TestSessionResumeConfig:
                 f'{leaf} must be a member of RELOADABLE_FIELDS '
                 '(green-tier hot-reloadable via _submodel_leaf_paths)'
             )
+
+
+# ---------------------------------------------------------------------------
+# task 3095: main_tip_sweep_isolated_prefilter_enabled
+# ---------------------------------------------------------------------------
+
+
+class TestMainTipSweepIsolatedPrefilterEnabled:
+    """task 3095: operator kill-switch for the sweep's isolated PRE-FILTER.
+
+    ``run_main_tip_sweep`` gates its expensive full-suite retry behind a cheap
+    scoped+serial isolated re-run of the first-pass failing node-ids. The one
+    observable behavior delta is that a test which only passes as part of the
+    full suite is no longer rescued by a full-retry green and instead reaches
+    the harness's fresh-worktree confirm gate — so the loud-over-silent norm
+    calls for an operator revert path, mirroring
+    ``main_tip_sweep_rerun_confirm_enabled``.
+    """
+
+    def test_defaults_to_true(self):
+        """Default-on, matching the rest of the main_tip_sweep family."""
+        assert OrchestratorConfig().main_tip_sweep_isolated_prefilter_enabled is True
+
+    def test_false_round_trips(self):
+        """Explicit False round-trips — setting it restores byte-identical
+        pre-3095 behavior (the pre-filter is never invoked)."""
+        config = OrchestratorConfig(main_tip_sweep_isolated_prefilter_enabled=False)
+        assert config.main_tip_sweep_isolated_prefilter_enabled is False
+
+    def test_not_in_reloadable_fields(self):
+        """Restart-only, pinning the tier chosen to match its sibling.
+
+        No ``main_tip_sweep`` leaf is a member of RELOADABLE_FIELDS — in
+        particular ``main_tip_sweep_rerun_confirm_enabled`` is absent — so
+        adding this one would invent a new reload tier for the family. A
+        future edit must revisit that rationale rather than silently promoting
+        the leaf.
+        """
+        assert 'main_tip_sweep_rerun_confirm_enabled' not in RELOADABLE_FIELDS, (
+            'fixture precondition: the sibling whose tier this field matches '
+            'is expected to be restart-only'
+        )
+        assert 'main_tip_sweep_isolated_prefilter_enabled' not in RELOADABLE_FIELDS, (
+            'main_tip_sweep_isolated_prefilter_enabled is deliberately '
+            'restart-only (same tier as the rest of the main_tip_sweep '
+            'family) and must NOT be in RELOADABLE_FIELDS'
+        )
