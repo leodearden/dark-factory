@@ -959,3 +959,185 @@ class TestRenderReport:
         # 'no archive' from a zero.
         text = self._report(_coverage(found=0, read=0))
         assert 'no_input' in text
+
+
+# ===========================================================================
+# step-17 — THE END-TO-END SIGNAL TESTS
+#
+# Both halves of the capability manifest's `coverage-report-discloses-failures`
+# manual check: the committed mini-fixture round-trip PLUS an all-unparseable-
+# input case — driven through main() at the CLI boundary, not only at the pure
+# -function boundary TestCoverageStatus covers.
+# ===========================================================================
+
+
+def _run_cli(archive_root, out_root, *extra) -> tuple[int, dict, list[dict], str]:
+    """Drive main() in-process; return (exit_code, coverage, records, report)."""
+    code = _mod.main([
+        '--archive-root', str(archive_root),
+        '--out-root', str(out_root),
+        '--stamp', STAMP,
+        *extra,
+    ])
+    directory = Path(out_root) / _mod.EVAL_ID
+    coverage = json.loads((directory / f'coverage-{STAMP}.json').read_text(encoding='utf-8'))
+    corpus_text = (directory / f'corpus-{STAMP}.jsonl').read_text(encoding='utf-8')
+    records = [json.loads(line) for line in corpus_text.splitlines()]
+    report = (directory / f'report-{STAMP}.txt').read_text(encoding='utf-8')
+    return code, coverage, records, report
+
+
+class TestMiniFixtureRoundTrip:
+    """(a) The committed mini-fixture, end to end through the CLI.
+
+    The fixture's authored facts are asserted verbatim — queries, ids, scores,
+    identity, provenance — because that is what makes it a fixture rather than
+    a smoke test. See tests/fixtures/README.md.
+    """
+
+    FIXTURE_TASK = '4242'
+    FIXTURE_SESSION = '11111111-2222-3333-4444-555555555555'
+
+    def _run(self, tmp_path):
+        return _run_cli(FIXTURE_ARCHIVE, tmp_path)
+
+    def test_exits_zero(self, tmp_path):
+        code, _, _, _ = self._run(tmp_path)
+        assert code == 0
+
+    def test_extracts_all_three_searches(self, tmp_path):
+        _, _, records, _ = self._run(tmp_path)
+        assert len(records) == 3
+
+    def test_main_session_answered_search(self, tmp_path):
+        _, _, records, _ = self._run(tmp_path)
+        [record] = [r for r in records if r['query'] == 'transcript archive layout and gz naming']
+        assert record['result_status'] == 'ok'
+        assert record['result_count'] == 2
+        assert [(r['id'], r['score'], r['rank']) for r in record['results']] == [
+            ('aaaaaaaa-1111-4aaa-8aaa-aaaaaaaaaaaa', 0.87, 1),
+            ('bbbbbbbb-2222-4bbb-8bbb-bbbbbbbbbbbb', 0.42, 2),
+        ]
+        assert record['params'] == {'project_id': 'dark_factory', 'limit': 5}
+
+    def test_main_session_identity_and_provenance(self, tmp_path):
+        _, _, records, _ = self._run(tmp_path)
+        [record] = [r for r in records if r['query'] == 'transcript archive layout and gz naming']
+        assert record['caller'] == {
+            'agent_id': 'claude-task-4242-architect',
+            'task_id': '4242',
+            'role': 'architect',
+        }
+        assert record['task_id'] == self.FIXTURE_TASK
+        assert record['session_id'] == self.FIXTURE_SESSION
+        assert record['is_subagent'] is False
+
+    def test_unanswered_search_is_emitted_as_missing(self, tmp_path):
+        _, _, records, _ = self._run(tmp_path)
+        [record] = [r for r in records if r['query'] == 'search whose answer never arrived']
+        assert record['result_status'] == 'missing'
+        assert record['results'] == []
+
+    def test_subagent_search(self, tmp_path):
+        _, _, records, _ = self._run(tmp_path)
+        [record] = [r for r in records if r['is_subagent']]
+        assert record['query'] == 'coverage report discloses parse failures'
+        assert record['subagent_id'] == 'agent-abc123def4567890'
+        assert record['caller']['role'] == 'code-reviewer'
+        assert record['results'][0]['id'] == 'cccccccc-3333-4ccc-8ccc-cccccccccccc'
+
+    def test_non_search_tool_uses_are_absent(self, tmp_path):
+        _, _, records, _ = self._run(tmp_path)
+        assert all(r['tool_name'] == SEARCH for r in records)
+
+    def test_coverage_counts_match_the_fixture(self, tmp_path):
+        _, coverage, _, _ = self._run(tmp_path)
+        assert coverage['status'] == 'ok'
+        assert coverage['tasks_scanned'] == 1
+        assert coverage['transcripts_found'] == 2
+        assert coverage['transcripts_read'] == 2
+        assert coverage['searches_extracted'] == 3
+        assert coverage['searches_unresolved'] == 1
+
+    def test_blank_and_corrupt_lines_are_not_parse_failures(self, tmp_path):
+        # The fixture's main transcript carries one blank and one corrupt
+        # LINE. Those are reader-level skips; parse_failures counts unreadable
+        # FILES. Conflating them would make every truncated transcript in the
+        # live archive look like a broken one.
+        _, coverage, _, _ = self._run(tmp_path)
+        assert coverage['parse_failures']['count'] == 0
+
+    def test_report_names_the_counts(self, tmp_path):
+        _, _, _, report = self._run(tmp_path)
+        assert 'ok' in report
+        assert '3' in report
+
+
+class TestZeroSearchCasesAreDistinguishableEndToEnd:
+    """(b) The all-unparseable-input case, paired against an empty archive and
+    an absent one — the manifest's literal pin, at the CLI boundary.
+
+    All three extract zero searches. If they agreed on status or exit code, a
+    silently broken extractor could ship as a clean empty result.
+    """
+
+    def _all_corrupt(self, tmp_path) -> Path:
+        root = tmp_path / 'corrupt-archive'
+        for rel in ('1/-enc/a.jsonl.gz', '2/-enc/b.jsonl.gz', '3/-enc/c.jsonl.gz'):
+            _write_corrupt(root, rel)
+        return root
+
+    def test_all_unparseable_exits_three(self, tmp_path):
+        code, coverage, records, report = _run_cli(
+            self._all_corrupt(tmp_path), tmp_path / 'out')
+        assert code == 3
+        assert coverage['status'] == 'total_failure'
+        assert records == []
+
+    def test_all_unparseable_discloses_every_failure(self, tmp_path):
+        _, coverage, _, _ = _run_cli(self._all_corrupt(tmp_path), tmp_path / 'out')
+        assert coverage['parse_failures']['count'] == 3
+        assert coverage['parse_failures']['examples']
+
+    def test_all_unparseable_report_says_so_in_words(self, tmp_path):
+        # Not merely 'searches: 0' — the report must state that nothing could
+        # be read, or an operator reads a broken run as an empty archive.
+        _, _, _, report = _run_cli(self._all_corrupt(tmp_path), tmp_path / 'out')
+        assert 'total_failure' in report
+        assert 'NONE could be read' in report or 'none could be read' in report.lower()
+
+    def test_empty_archive_exits_two(self, tmp_path):
+        empty = tmp_path / 'empty-archive'
+        empty.mkdir()
+        code, coverage, _, report = _run_cli(empty, tmp_path / 'out')
+        assert code == 2
+        assert coverage['status'] == 'no_input'
+        assert 'no_input' in report
+
+    def test_absent_archive_exits_two(self, tmp_path):
+        # The real default when the script runs from a git worktree, which has
+        # no data/ dir at all.
+        code, coverage, _, _ = _run_cli(tmp_path / 'nope', tmp_path / 'out')
+        assert code == 2
+        assert coverage['status'] == 'no_input'
+
+    def test_the_three_zero_search_runs_are_distinguishable(self, tmp_path):
+        empty = tmp_path / 'empty'
+        empty.mkdir()
+        runs = {
+            'corrupt': _run_cli(self._all_corrupt(tmp_path), tmp_path / 'out-corrupt'),
+            'empty': _run_cli(empty, tmp_path / 'out-empty'),
+            'absent': _run_cli(tmp_path / 'nope', tmp_path / 'out-absent'),
+        }
+        codes = {name: run[0] for name, run in runs.items()}
+        coverages = {name: run[1] for name, run in runs.items()}
+
+        # Same observable count, different verdicts.
+        assert all(c['searches_extracted'] == 0 for c in coverages.values())
+        assert coverages['corrupt']['status'] != coverages['empty']['status']
+        assert codes['corrupt'] != codes['empty']
+        assert codes['corrupt'] != 0
+        assert codes['empty'] != 0
+        # An absent archive and an empty one are the same fact, deliberately.
+        assert coverages['absent']['status'] == coverages['empty']['status']
+        assert codes['absent'] == codes['empty']
