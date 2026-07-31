@@ -41,14 +41,18 @@ Usage:
 """
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
+from typing import Any, NamedTuple, Protocol
 
 from audit_wiped_metadata_files import (
     CONTRADICTED_REAL_MERGE_SHA,
     FIDELITY_FILE_LEVEL,
+    AuditCoverage,
     WipeCandidate,
     _coerce_file_list,
+    audit_project,
 )
 
 # Bind `shared` to the SAME checkout as this script via a __file__-relative
@@ -265,3 +269,286 @@ def classify_live_task(live_task: object, candidate: WipeCandidate) -> str:
     if current_files:
         return SKIP_FILES_PRESENT
     return REPAIR
+
+
+# ---------------------------------------------------------------------------
+# The write path.
+# ---------------------------------------------------------------------------
+
+
+class _ToolClient(Protocol):
+    """The one method this script needs from an MCP client (fake or real)."""
+
+    async def call_tool(self, name: str, arguments: dict) -> dict: ...
+
+
+class RepairOutcome(NamedTuple):
+    """What happened to ONE candidate, and why.
+
+    ``detail`` carries the operator-actionable reason for every non-REPAIR
+    disposition (the rejecting path, the error text) so the summary never has
+    to say "skipped" without saying why.
+    """
+
+    task_id: int
+    tag: str
+    disposition: str
+    files: tuple[str, ...]
+    detail: str | None = None
+
+
+def _error_detail(result: object) -> str | None:
+    """Return an error description if *result* is an error-shaped reply, else None.
+
+    The server can report a rejection by ANSWERING rather than raising — an
+    ``{"error": ...}`` body, or a ``{"success": False}`` flag. A bare truthiness
+    check on the reply would count both as a repair that never happened, which
+    is the silent fail-soft this script exists to avoid. Anything else
+    (including an empty dict, or a plain echoed task) is a success: the
+    ABSENCE of an error marker is not itself an error marker.
+    """
+    if not isinstance(result, dict):
+        return None
+    if result.get("error"):
+        return f"server returned an error: {result['error']}"
+    if result.get("success") is False:
+        detail = result.get("error_type") or result.get("message") or result
+        return f"server reported failure: {detail}"
+    return None
+
+
+async def repair_one(
+    client: _ToolClient,
+    project_root: str,
+    candidate: WipeCandidate,
+    *,
+    now_iso: str,
+) -> RepairOutcome:
+    """Write ONE candidate's recovered scope back, and never raise.
+
+    Mode is ``metadata_mode='merge'`` — a SHALLOW merge that leaves every key
+    this payload does not name untouched. Emphatically NOT ``'replace'``: that
+    is the exact primitive behind the wipe class being repaired
+    (``_execute_combine``, task_interceptor.py:1850, writes a 3-key blob in
+    replace mode; ``_merge_metadata``, sqlite_task_backend.py:3301, returns
+    ``incoming`` verbatim for that mode, deleting ``files``, ``spawned_from``,
+    ``source``, ``branch_base_sha`` and the rest). A repair must not use the
+    wiper's own primitive. Merge additionally raises loudly on a corrupt stored
+    blob instead of clobbering it.
+
+    ERRORS ARE RETURNED, NOT RAISED. ``candidate_key`` is recomputed from
+    (title, files) on every metadata-touching update, so backfilling ``files``
+    onto a batch can legitimately collide and raise
+    ``DuplicateCandidateKeyError``. One collision on task 12 of 35 must not
+    strand the remaining 23: the failure is captured, attributed and reported,
+    and drives a non-zero exit at the end.
+    """
+    payload = build_repair_payload(candidate, now_iso=now_iso)
+    try:
+        result = await client.call_tool(
+            "update_task",
+            {
+                # No `status` and no done_provenance anywhere in the payload —
+                # the StatusWriteAuthorityError / DoneProvenanceWriteAuthorityError
+                # floors (sqlite_task_backend.py:2575+).
+                "id": str(candidate.task_id),
+                "project_root": project_root,
+                "metadata": json.dumps(payload),
+                "metadata_mode": "merge",
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 — a per-task failure, never fatal
+        return RepairOutcome(
+            task_id=candidate.task_id,
+            tag=candidate.tag,
+            disposition=FAILED,
+            files=candidate.plan_files,
+            detail=f"{type(exc).__name__}: {exc}",
+        )
+
+    detail = _error_detail(result)
+    if detail is not None:
+        return RepairOutcome(
+            task_id=candidate.task_id,
+            tag=candidate.tag,
+            disposition=FAILED,
+            files=candidate.plan_files,
+            detail=detail,
+        )
+    return RepairOutcome(
+        task_id=candidate.task_id,
+        tag=candidate.tag,
+        disposition=REPAIR,
+        files=candidate.plan_files,
+    )
+
+
+class RepairResult(NamedTuple):
+    """One project's repair run: every disposition, plus the audit's coverage.
+
+    ``coverage`` travels with the outcomes VERBATIM, never recomputed or
+    summarised, because the candidate list is an observable subset and a reader
+    who sees only the outcomes cannot tell a clean project from an unobservable
+    one.
+    """
+
+    project_root: str
+    applied: bool
+    outcomes: list[RepairOutcome]
+    coverage: AuditCoverage
+
+
+async def repair_project(
+    client: _ToolClient | None,
+    project_root: str,
+    *,
+    apply: bool,
+    now_iso: str,
+) -> RepairResult:
+    """Audit *project_root* fresh, then repair what is safe to repair.
+
+    Sequence, in order:
+
+    1. ``audit_project`` IN-PROCESS — a fresh sweep every run. Never a pasted
+       payload; see the module docstring for the measured drift that makes a
+       stale feed unsafe.
+    2. ``select_repairable_candidates``. The dropped candidates are RECORDED
+       under :data:`SKIP_CONTRADICTED` / :data:`SKIP_LOCK_LEVEL_FIDELITY`
+       rather than silently filtered away, so an exclusion is visible in the
+       report as a decision rather than as an absence.
+    3. ``plan_files_rejection_reason`` — the lock-charter pre-check.
+    4. A live ``get_task`` re-read per surviving candidate, then
+       ``classify_live_task``.
+    5. On :data:`REPAIR` AND only when *apply* is true, ``repair_one``.
+
+    Writes are SEQUENTIAL, not gathered. The interceptor serialises per-project
+    writes under its own ``_write_lock`` anyway, so concurrency would buy
+    nothing, and a sequential loop keeps the per-task disposition log ordered
+    and attributable.
+
+    *client* may be None on the dry-run path — that is what lets a dry run
+    avoid dialling the server at all. A None client with ``apply=True`` is a
+    programming error and raises.
+    """
+    if apply and client is None:
+        raise ValueError("apply=True requires an MCP client")
+
+    audit = audit_project(project_root)
+    repairable = select_repairable_candidates(audit.candidates)
+    repairable_ids = {(c.tag, c.task_id) for c in repairable}
+
+    outcomes: list[RepairOutcome] = []
+
+    # (2) Record the exclusions explicitly.
+    for candidate in audit.candidates:
+        if (candidate.tag, candidate.task_id) in repairable_ids:
+            continue
+        if candidate.wipe_signature == CONTRADICTED_REAL_MERGE_SHA:
+            disposition = SKIP_CONTRADICTED
+            detail = (
+                "a null-sha row and a REAL merge sha coexist (a failed merge "
+                "attempt that was retried and landed), so the null-sha DONE "
+                "path is not what emptied this task"
+            )
+        else:
+            disposition = SKIP_LOCK_LEVEL_FIDELITY
+            detail = (
+                f"recovered scope is {candidate.plan_files_fidelity}, not "
+                f"{FIDELITY_FILE_LEVEL}: these are MODULE paths, not plan.files "
+                "entries, and must never be written into metadata.files as-is"
+            )
+        outcomes.append(
+            RepairOutcome(
+                task_id=candidate.task_id,
+                tag=candidate.tag,
+                disposition=disposition,
+                files=candidate.plan_files,
+                detail=detail,
+            )
+        )
+
+    for candidate in repairable:
+        # (3) Lock-charter pre-check, before any network call.
+        reason = plan_files_rejection_reason(candidate)
+        if reason is not None:
+            outcomes.append(
+                RepairOutcome(
+                    task_id=candidate.task_id,
+                    tag=candidate.tag,
+                    disposition=SKIP_LOCK_CHARTER,
+                    files=candidate.plan_files,
+                    detail=reason,
+                )
+            )
+            continue
+
+        # (4) Live re-read. On the dry-run path there is no client, so the
+        # live state is unknown and the candidate is reported as a would-be
+        # repair — the dry run's job is to show the SELECTION, and the gate
+        # is re-evaluated for real at write time.
+        if client is None:
+            outcomes.append(
+                RepairOutcome(
+                    task_id=candidate.task_id,
+                    tag=candidate.tag,
+                    disposition=REPAIR,
+                    files=candidate.plan_files,
+                    detail=(
+                        "dry run: live status not re-read (no MCP call made); "
+                        "the terminal/files-present gate is evaluated at write time"
+                    ),
+                )
+            )
+            continue
+
+        try:
+            live = await client.call_tool(
+                "get_task", {"id": str(candidate.task_id), "project_root": project_root}
+            )
+        except Exception as exc:  # noqa: BLE001 — one unreadable task, not a batch abort
+            outcomes.append(
+                RepairOutcome(
+                    task_id=candidate.task_id,
+                    tag=candidate.tag,
+                    disposition=SKIP_MISSING,
+                    files=candidate.plan_files,
+                    detail=f"live re-read failed: {type(exc).__name__}: {exc}",
+                )
+            )
+            continue
+
+        disposition = classify_live_task(_unwrap_task(live), candidate)
+        if disposition != REPAIR:
+            outcomes.append(
+                RepairOutcome(
+                    task_id=candidate.task_id,
+                    tag=candidate.tag,
+                    disposition=disposition,
+                    files=candidate.plan_files,
+                    detail="live re-read immediately before the write",
+                )
+            )
+            continue
+
+        # (5) Write.
+        outcomes.append(await repair_one(client, project_root, candidate, now_iso=now_iso))
+
+    return RepairResult(
+        project_root=project_root,
+        applied=apply,
+        outcomes=outcomes,
+        coverage=audit.coverage,
+    )
+
+
+def _unwrap_task(payload: Any) -> Any:
+    """Return the task dict from a ``get_task`` reply.
+
+    The MCP reply may be the task itself or may wrap it under a ``task`` key.
+    Anything else is passed through untouched, so ``classify_live_task``
+    (which fails closed on an unrecognised shape) makes the call rather than
+    this helper guessing.
+    """
+    if isinstance(payload, dict) and isinstance(payload.get("task"), dict):
+        return payload["task"]
+    return payload
