@@ -3839,47 +3839,53 @@ def create_mcp_server(
         # When page_size is None the response is the full untouched map (no
         # ``pagination`` key), preserving the single-keyed envelope that
         # tests/test_status_envelope_contract.py pins.
+        #
+        # Only paginate when the result is a proper mapping — a non-standard
+        # backend could return None or a list; in that case skip pagination and
+        # leave the result untouched rather than masking the real failure with a
+        # generic slicing error.
         pagination: dict[str, Any] | None = None
-        if page_size is not None:
-            page, total = _status_page(result, offset, page_size)
-            result = page
-            pagination = {
-                'total': total,
-                'offset': offset,
-                'page_size': page_size,
-                'returned': len(page),
-                'has_more': offset + len(page) < total,
-                'auto_paginated': False,
-            }
-        elif ids is None and len(result) > _STATUSES_AUTO_PAGE_LIMIT:
-            # Fail-OPEN degradation (task 3064).  An un-paginated full-population
-            # response this large is rejected wholesale by the MCP transport, so
-            # the caller would get ZERO data.  Return a first page plus an
-            # explicit continuation marker instead: real data the caller can use,
-            # and the structured facts needed to page to completion.  Never a
-            # silent truncation — that would look like a complete census and
-            # corrupt any cross-verification built on it.
-            page, total = _status_page(result, 0, _STATUSES_AUTO_PAGE_LIMIT)
-            result = page
-            pagination = {
-                'total': total,
-                'offset': 0,
-                'page_size': _STATUSES_AUTO_PAGE_LIMIT,
-                'returned': len(page),
-                'has_more': len(page) < total,
-                'auto_paginated': True,
-            }
-            # A degraded response must be visible in the server log too, not
-            # only in the payload the caller may ignore.
-            logger.warning(
-                'get_statuses auto-paginated an oversized full-population response',
-                extra={
-                    'project_root': project_root,
+        if isinstance(result, dict):
+            if page_size is not None:
+                page, total = _status_page(result, offset, page_size)
+                result = page
+                pagination = {
                     'total': total,
+                    'offset': offset,
+                    'page_size': page_size,
                     'returned': len(page),
+                    'has_more': offset + len(page) < total,
+                    'auto_paginated': False,
+                }
+            elif ids is None and len(result) > _STATUSES_AUTO_PAGE_LIMIT:
+                # Fail-OPEN degradation (task 3064).  An un-paginated
+                # full-population response this large is rejected wholesale by the
+                # MCP transport, so the caller would get ZERO data.  Return a first
+                # page plus an explicit continuation marker instead: real data the
+                # caller can use, and the structured facts needed to page to
+                # completion.  Never a silent truncation — that would look like a
+                # complete census and corrupt any cross-verification built on it.
+                page, total = _status_page(result, 0, _STATUSES_AUTO_PAGE_LIMIT)
+                result = page
+                pagination = {
+                    'total': total,
+                    'offset': 0,
                     'page_size': _STATUSES_AUTO_PAGE_LIMIT,
-                },
-            )
+                    'returned': len(page),
+                    'has_more': len(page) < total,
+                    'auto_paginated': True,
+                }
+                # A degraded response must be visible in the server log too, not
+                # only in the payload the caller may ignore.
+                logger.warning(
+                    'get_statuses auto-paginated an oversized full-population response',
+                    extra={
+                        'project_root': project_root,
+                        'total': total,
+                        'returned': len(page),
+                        'page_size': _STATUSES_AUTO_PAGE_LIMIT,
+                    },
+                )
 
         summary: dict[str, Any] = {'count': len(result)}
         if pagination is not None:
