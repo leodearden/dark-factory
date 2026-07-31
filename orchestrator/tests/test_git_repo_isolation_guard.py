@@ -9,7 +9,8 @@ helper handed a bare ``tmp_path`` silently retargets production state: three
 blobs were written into the live worktree's object store and ``foo.py`` was
 staged at stages 1/2/3, leaving ``UU foo.py`` in a real task's index.
 
-The two-layer defence under test here lives in ``_orch_helpers``:
+The defence has three layers.  The first two are per-call and live in
+``_orch_helpers``:
 
 * :func:`assert_isolated_git_repo` — a pure-filesystem pre-flight that runs
   BEFORE any subprocess, so a rejected call writes nothing anywhere.  This is
@@ -19,9 +20,21 @@ The two-layer defence under test here lives in ``_orch_helpers``:
   makes the upward walk physically unable to leave ``cwd`` even if the
   pre-flight is later refactored away.
 
-This module holds the guard-API unit tests plus the AST recurrence guard over
-``test_git_ops.py``.  The escape-path regression tests live in
-``test_git_ops.py`` itself, next to the module-private helpers they cover.
+Both are opt-in at each call site, which is the gap the third layer closes:
+
+* ``df_pytest_isolation._df_git_ceiling_at_basetemp`` (task 3355) — a
+  session-scoped autouse fixture setting the same kind of ceiling at this run's
+  pytest basetemp, for EVERY test in the suite, wired in via
+  ``orchestrator/tests/conftest.py``.  It is looser than the per-call helpers
+  (the basetemp rather than ``cwd.parent``) and, being a ceiling, cannot promise
+  zero writes — but it covers the ~155 git-invoking test files here that call
+  neither helper.  :class:`TestSessionCeilingIsLiveInThisSuite` asserts it is
+  actually armed in this run.
+
+This module holds the guard-API unit tests, that liveness assertion, plus the
+AST recurrence guard over ``test_git_ops.py``.  The escape-path regression tests
+live in ``test_git_ops.py`` itself, next to the module-private helpers they
+cover.
 """
 from __future__ import annotations
 
@@ -621,3 +634,45 @@ class TestNoUnguardedGitWritersInTestGitOps:
                 f'Remove the exemption and call {_GUARD_FUNC} instead. '
                 f'git subcommands found: {sorted(creators)}'
             )
+
+
+# ===========================================================================
+# Layer 3 liveness: the suite-wide session ceiling is armed HERE
+# ===========================================================================
+
+
+class TestSessionCeilingIsLiveInThisSuite:
+    """The suite-wide basetemp ceiling (task 3355) is ARMED in this run.
+
+    The verify lane runs ``cd orchestrator && uv run pytest tests/``, which makes
+    rootdir the SUBPROJECT — so the repo-root ``conftest.py`` is never loaded, and
+    a fixture wired only there would be dead in precisely the suite with the most
+    git-invoking test files.  Dead, and silently so: nothing else here fails when
+    the ceiling is absent, because its entire job is to prevent damage to a repo
+    OUTSIDE the run.
+
+    Asserting the fixture *exists* would prove nothing.  This asserts it *fired*.
+    """
+
+    def test_this_runs_basetemp_is_an_entry_in_the_ambient_ceiling(
+        self, tmp_path_factory: pytest.TempPathFactory,
+    ) -> None:
+        basetemp = str(tmp_path_factory.getbasetemp().resolve())
+
+        ceiling = os.environ.get('GIT_CEILING_DIRECTORIES')
+
+        assert ceiling is not None, (
+            'GIT_CEILING_DIRECTORIES is unset: the session ceiling is not armed '
+            'in the orchestrator suite. orchestrator/tests/conftest.py must '
+            'sys.path.append the repo root and import '
+            '_df_git_ceiling_at_basetemp from df_pytest_isolation (task 3355) — '
+            'the import IS the wiring, since pytest only collects fixtures bound '
+            "into a conftest's namespace."
+        )
+        # Entry MEMBERSHIP, not equality: an operator- or CI-set ambient ceiling
+        # is preserved and appended to, never clobbered.
+        assert basetemp in ceiling.split(':'), (
+            f"this run's basetemp {basetemp} is not one of the "
+            f'GIT_CEILING_DIRECTORIES entries {ceiling.split(":")!r}, so git run '
+            'from a tmp dir anywhere in this suite can still walk up out of it'
+        )
