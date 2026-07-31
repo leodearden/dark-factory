@@ -379,6 +379,76 @@ def ann_pairs_from_neighbors(
     return sorted(pairs), disclosure
 
 
+def ann_scores_for_pairs(
+    memories: list[dict],
+    neighbors_by_id: dict[Any, list[dict]],
+    pairs: Iterable[tuple[int, int]],
+) -> dict[tuple[int, int], float]:
+    """Recover each candidate pair's ANN score from EITHER endpoint's list.
+
+    The natural sibling of ``ann_pairs_from_neighbors``: same inputs, same
+    index space, same no-I/O contract, so it is testable without a live
+    Qdrant.
+
+    BOTH directions are scanned because ANN neighbour lists are NOT
+    symmetric — "the left endpoint's list contains the right" is a false
+    invariant, and the two states that break it are ones this detector
+    explicitly expects and counts:
+
+      - ``top_k_saturated`` — the right lists the left while the left's cap
+        is filled by nearer points, so the left never names the right.
+      - ``missing_vector`` — a vector-less record is never a query point
+        (``fetch_ann_neighbors`` skips it, so it is absent from
+        *neighbors_by_id* entirely), yet it is still reachable as another
+        record's hit.
+
+    Scanning one side would therefore silently mis-report precisely the
+    cases the disclosure counters exist to make legible.
+
+    Args:
+        memories: The scanned records; pair indices address this list.
+        neighbors_by_id: ``{memory_id: [{'id': ..., 'score': ...}, ...]}``,
+            as ``fetch_ann_neighbors`` returns it.
+        pairs: Canonical ``(low, high)`` index pairs to score.
+
+    Returns:
+        ``{(low, high): max_score}``. A pair NEITHER endpoint scored is
+        ABSENT from the mapping — never defaulted to 0.0. Absence is
+        load-bearing: ``build_sweep_plan`` already degrades an unscored pair
+        to ``ann_max_score: null``, whereas 0.0 is not None and so would be
+        published as a real measurement claiming the cluster was found
+        BELOW the cutoff that produced it. A hit carrying no score is
+        likewise an unrecorded measurement, not a measurement of zero.
+
+        For pairs ``ann_pairs_from_neighbors`` produced over the SAME
+        mapping, a score is by construction always recoverable from at
+        least one side (every such pair originated as a scored hit).
+        ``None`` is therefore the defensive contract value for a caller
+        supplying ``ann_pairs`` without scores, not a routine outcome.
+
+    Does not mutate *memories*.
+    """
+    index_by_id: dict[Any, int] = {m.get('id'): i for i, m in enumerate(memories)}
+    scores: dict[tuple[int, int], float] = {}
+
+    for left, right in pairs:
+        found: list[float] = []
+        # Both directions: (query point, the endpoint its hit must resolve to).
+        for source, target in ((left, right), (right, left)):
+            for hit in neighbors_by_id.get(memories[source].get('id')) or []:
+                # A self-hit resolves to `source`, never `target`, so it is
+                # skipped here without needing a special case.
+                if index_by_id.get(hit.get('id')) != target:
+                    continue
+                score = hit.get('score')
+                if score is not None:
+                    found.append(score)
+        if found:
+            scores[(left, right)] = max(found)
+
+    return scores
+
+
 def _created_at_sort_key(created_at: Any) -> tuple[int, float]:
     """Sort key placing parseable ``created_at`` oldest-first, unparseable last.
 
@@ -1438,13 +1508,9 @@ async def _run(args: argparse.Namespace) -> int:
                 records, neighbors, ann_threshold, top_k=args.ann_top_k,
             )
             disclosures.update(pair_disclosure)
-            index_by_id = {m.get('id'): i for i, m in enumerate(records)}
-            for left, right in ann_pairs:
-                best = 0.0
-                for hit in neighbors.get(records[left].get('id')) or []:
-                    if index_by_id.get(hit.get('id')) == right:
-                        best = max(best, hit.get('score') or 0.0)
-                ann_scores[(left, right)] = best
+            # Scans BOTH endpoints' lists: neighbour lists are asymmetric, so
+            # a pair is often recorded only on the side that discovered it.
+            ann_scores = ann_scores_for_pairs(records, neighbors, ann_pairs)
         else:
             disclosures.update(dict.fromkeys(_ANN_DISCLOSURE_KEYS, 0))
             disclosures['ann_query_errors'] = 0
