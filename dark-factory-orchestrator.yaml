@@ -50,26 +50,88 @@ test_command: "cd shared && uv run pytest tests/ --timeout=300 && cd ../escalati
 lint_command: "uv run ruff check shared escalation fused-memory orchestrator dashboard && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests"
 type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx pyright && cd ../dashboard && npx pyright"
 
-# Verification timeouts. The "full warm verify here is ~2 min" premise these were
-# sized against is STALE by an order of magnitude — it predates the monorepo growing
-# to 8 chained suites. Measured on the __fallback__ chain 2026-07-31 (task 3062,
-# esc-3062-3), attempt-2, per-suite completion lines:
-#   shared 2582 passed / 120.21s · escalation 898 / 123.29s
-#   orchestrator 13398 / 1366.23s · fused-memory 8658 / 123.87s
-#   = 1733.6s consumed BEFORE dashboard (1393 tests) even starts, leaving <67s of a
-#   1800s budget for dashboard + sampler + cockpit + tests/scripts (~127s alone).
-# The chain therefore could not fit in 1800s under any load — a structural overrun,
-# not a hang, and it timed out at 1800.66s having already passed 25,536 tests with
-# zero failures. Raised to 3600s warm (orchestrator alone is 76% of the old budget)
-# and 5400s cold, since cold additionally pays uv sync across 6 subprojects.
-# The tight-timeout rationale still holds and is unchanged in KIND — a genuine hang
-# should still surface on the first verify that touches the module, not 8 days later
-# — but the threshold has to exceed the honest cost of the work it gates, or every
-# task touching a slow-suite package false-REDs on the wall clock.
-# NOTE: this buys headroom, it does not fix the trend. orchestrator's suite alone
-# grew to 1366s; if it keeps growing, the answer is scoping verify to the task's
-# declared modules (task 3062's own plan.json-scoped verify runs green in ~127s),
-# not raising this number again.
+# Verification timeouts. verify_command_timeout_secs is a PER-COMMAND budget
+# (skills/orchestrate/references/project-setup.md:150) and the fallback fleet
+# chain above is ONE shell command, so this single ceiling bounds all seven
+# suites together.
+#
+# The "full warm verify here is ~2 min" premise these were originally sized
+# against is STALE by an order of magnitude — it predates the monorepo growing
+# to 8 chained suites. It is deleted rather than softened, because a stale
+# justification is worse than none. MEASURED per-segment durations (task 3062
+# attempt-2, .task/verify/attempt-2.__fallback__.{summary.json,test.log}, run
+# started 2026-07-31T02:00:48Z under `nice -n 15 ionice -c2 -n7`, surfaced as
+# escalation esc-3062-3):
+#
+#     shared         120.21   (2582 passed)
+#     escalation     123.29   (898 passed)
+#     orchestrator  1366.23   (13398 passed, zero failures)
+#     fused-memory   123.87   (8658 passed)
+#     tests/scripts  105.00   (lowest of four independent runs, 105-127s)
+#                   -------
+#                   1838.60s   <- five of seven segments; already > the old 1800
+#
+# dashboard, sampler and cockpit are absent because the run timed out at
+# 1800.66s before dashboard even started, so 1838.60 is a hard measured LOWER
+# BOUND, not an estimate. The old 1800s ceiling was provably below it: a healthy
+# run could not clear it, so it surfaced no hangs — it manufactured infra_timeout
+# on the honest green path, after already passing 25,536 tests with zero
+# failures. A structural overrun, not a hang.
+#
+# Raised to 3600s warm / 5400s cold. All seven segments accounted for — the five
+# measured plus the three unmeasured ones estimated rather than silently costed
+# at zero:
+#
+#     measured floor (five segments, above)       1838.60
+#     + dashboard  1393 collected @ ~0.137 s/test  ~190
+#     + sampler                                     ~60
+#     + cockpit     321 collected @ ~0.137 s/test   ~44   (conditional: the
+#                   segment is wrapped in `[ -d cockpit ] || exit 0`, so it
+#                   costs 0 on a checkout where cockpit is absent — but it IS
+#                   present here, so budget for it)
+#                                                 -------
+#     honest green path                            ~2133
+#
+# The ~0.137 s/test rate is escalation's 898 serial tests in 123.29s; dashboard
+# and cockpit both run serial (no pytest-xdist, per this file's own fanout
+# comment). 3600s leaves ~1.7x headroom over that path, covering the load
+# variance the two same-day orchestrator measurements demonstrate (1157.62s vs
+# 1366.23s, ~18%). Cold gets 5400s because it additionally pays the ~180s
+# `uv sync --all-packages` preprovision plus uv sync across 6 subprojects.
+#
+# It also un-starves the `orchestrator` module's OWN verify, which at 1366.23s
+# was consuming 76% of the old per-command ceiling.
+#
+# WHERE "tight timeouts surface hangs" LIVES NOW: on the PER-MODULE budgets —
+# each subproject's own orchestrator.yaml, plus tests/scripts/orchestrator.yaml's
+# 600s — not on starving the whole-fleet fallback chain. The tight-timeout
+# rationale still holds and is unchanged in KIND: a genuine hang should still
+# surface on the first verify that touches the module, not 8 days later at a
+# post-completion full review. But that property cannot hold at the FLEET level,
+# because a ceiling a green run cannot clear surfaces nothing but false
+# infra_timeouts. It holds per-module, where each suite's real cost is known.
+# Guarded by tests/scripts/test_fallback_verify_config.py::
+# test_fallback_verify_budget_clears_the_measured_fleet_chain_floor.
+#
+# BE PRECISE ABOUT WHAT THAT GUARD DOES, because overclaiming it would repeat
+# this comment's own original sin. It asserts the measured floor rather than
+# pinning a value, so it catches anyone LOWERING this budget back below
+# 1838.60s. It does NOT detect suite growth: MEASURED_FLEET_SEGMENT_SECS is a
+# frozen literal table, so if the orchestrator segment doubles tomorrow the
+# table still reads 1366.23, the floor still reads 1838.60, and the guard stays
+# green while the budget is once again provably below the honest green path.
+# Detecting that requires RE-MEASUREMENT — the table has no way to measure
+# itself. So the numbers above are a dated snapshot (2026-07-31), not a
+# self-maintaining invariant: when a verify run's own recorded durations diverge
+# from the table, re-measure and update BOTH the table and this derivation. (A
+# durations-based growth check would need to read a recent run's recorded
+# per-segment times rather than a literal; that is deliberately not built here —
+# the point is that nothing currently performs it, so a human must.)
+#
+# NOTE: this buys headroom, it does not fix the trend. orchestrator's suite
+# alone grew to 1366s; if it keeps growing, the answer is scoping verify to the
+# task's declared modules — which is what tests/scripts/orchestrator.yaml now
+# does for this very fallback path (task 3350) — not raising this number again.
 verify_command_timeout_secs: 3600
 verify_cold_command_timeout_secs: 5400
 
