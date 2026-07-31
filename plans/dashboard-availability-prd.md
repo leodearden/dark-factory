@@ -226,10 +226,33 @@ Labels are PRD-local; task IDs assigned at decompose.
 
 | Label | Title | Modules | Prereqs | Observable signal |
 |---|---|---|---|---|
-| **α** | Index `write_ops(created_at)` — kill the 108s memory-graphs scan | `fused-memory/services/write_journal.py` | — | `EXPLAIN QUERY PLAN` for all three `dashboard/data/write_journal.py` queries reports `SEARCH … (created_at>?)` not `SCAN`; `GET /api/v2/dashboard/memory-graphs` returns **< 2s** (measured baseline 108s) |
+| **α** | Index `write_ops(created_at)` — remove the timeseries full scan | `fused-memory/services/write_journal.py` | — | `EXPLAIN QUERY PLAN` reports `SEARCH … (created_at>?)` not `SCAN` for the **timeseries** and **agent-breakdown** queries; `get_operations_breakdown` **remains `SCAN` by design** (see note); `GET /api/v2/dashboard/memory-graphs` latency **measured and recorded** as materially improved from the 108s baseline — **not** asserted `< 2s` |
 | **β** | Frontend poll flow control: in-flight guard + backoff + jitter | `dashboard/static/redux/data.js`, `dashboard/tests/` | — | With an endpoint stubbed to exceed the poll interval, at most **one** in-flight request per endpoint exists at any time (regression test asserts it; today 36 stack) |
 | **γ** | Hysteresis watchdog with storm escape → L2 + stop | `scripts/`, `dashboard/*.service`, `dashboard/*.timer` | δ | Boundary-test table B1–B6 pass against a live unit; B4 leaves exactly one born-at-L2 record and zero further restarts |
 | **δ** | Bound the shutdown drain so a restart can't cost SIGKILL | `dashboard/dark-factory-dashboard.service` | — | B7: `systemctl restart` with a live polling client completes within the configured drain and the journal shows **no** `Killing process … with signal SIGKILL` |
+> **Note on α's corrected signal (amended 2026-07-31, watcher-df, on Leo's sign-off of esc-3304-2).**
+> Row α originally asserted "all three queries `SEARCH`" and "endpoint `< 2s`". Both are
+> unreachable by the single mandated index, and the error originated here rather than in the
+> decomposed task — task **3304** inherited it verbatim, and **ζ depends on α**, so it is corrected
+> at the source.
+> Measured by the architect on the real DB (6.97 GB, 16.4 M rows, never `ANALYZE`d) and reproduced
+> offline on an identical schema: `get_operations_breakdown`'s `GROUP BY operation` is satisfiable
+> in-order by walking `idx_wo_operation`, so SQLite's planner keeps that plan to avoid a temp
+> B-tree and pays a per-row `created_at` test across all 16.4 M rows. It never switches to
+> `idx_wo_created` — unchanged at 0 rows, at 5 000 rows, after `ANALYZE`, and with a covering
+> `(created_at, operation)` variant. That is planner behaviour, not a tuning miss.
+> `api_memory_graphs` (`dashboard/src/dashboard/app.py:589-598`) calls exactly
+> `get_memory_timeseries` + `get_operations_breakdown` — **`get_agent_breakdown` is not on this
+> endpoint's path** — so only one of the endpoint's two queries benefits, and the other measured
+> ~34.5 s. An endpoint carrying an unchanged ~34.5 s query cannot return in under 2 s.
+> **α is therefore necessary but not sufficient for the availability goal, and that is fine:** the
+> outage mechanism was ~36 *stacked* polls saturating the single aiosqlite worker thread, and
+> **β** (in-flight guard + backoff + jitter) is what bounds concurrency to one request per
+> endpoint regardless of query cost. α removes one scan; β removes the stacking. Neither alone
+> closes the outage. If the residual ~34.5 s latency is judged unacceptable *after* β lands, that
+> is a new decision (query reshape, cache, materialised rollup, or dropping the breakdown from
+> this endpoint) and needs its own row — do not silently widen α to chase it.
+
 | **ε** | `/healthz`: whole-handler deadline, deliverable budget | `dashboard/src/dashboard/app.py`, `dashboard/tests/` | — | With a DB made unresponsive, `/healthz` returns **503 `degraded` within its stated budget (< 5s)** instead of hanging (measured today: 50.6s); `conn.execute` is covered by the deadline, not just `fetchone` |
 | **ζ** | write_journal growth alarm (no pruning) | `fused-memory/`, `dashboard/` | α | When `write_journal.db` exceeds the configured size/growth threshold, a loud WARNING **and** an escalation appear naming the measured size (today 6.5 GB / 16.3M rows, ~50 MB/day) |
 | **η** | Dashboard unit-file parity check (in-repo vs installed) | `scripts/`, `dashboard/tests/` | γ, δ | Script exits non-zero and names the drifting directive when the installed unit differs from the repo copy (today: `DASHBOARD_KNOWN_PROJECT_ROOTS` = 9 roots installed vs 1 in repo) |
