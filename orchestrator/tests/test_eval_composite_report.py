@@ -220,7 +220,7 @@ class TestBuildPairwisePriceTable:
 
 def _mresult(
     task_id, config_name, trial, *, quality, cost_usd, duration_ms,
-    tests_pass=True, cost_source='price_table', recovery_score=None,
+    tests_pass: bool | None = True, cost_source='price_table', recovery_score=None,
     plan_quality=None, role_under_test='implementer',
     judge_invocations=0, judge_cost_usd=0.0,
     cap_tainted=False, invocation_error=None,

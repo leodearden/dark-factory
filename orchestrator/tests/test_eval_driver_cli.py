@@ -36,7 +36,7 @@ def _mk_result(
     composite: float = 0.8,
     cost: float = 1.5,
     dur_ms: int = 120_000,
-    tests_pass: bool = True,
+    tests_pass: bool | None = True,
     plan_quality: float | None = None,
     cap_tainted: bool = False,
     invocation_error: str | None = None,
