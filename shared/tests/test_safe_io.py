@@ -413,3 +413,101 @@ class TestAtomicWriteFailurePaths:
 
         assert p.read_text(encoding='utf-8') == 'ORIGINAL'
         assert sorted(q.name for q in tmp_path.iterdir()) == ['state.json']
+
+
+class TestAtomicWriteMode:
+    """Permission contract — guards against the silent 0664 -> 0600 narrowing.
+
+    ``tempfile.mkstemp`` creates 0600; ``open()``/``Path.write_text`` create
+    0o666 & ~umask.  Consolidating every site onto one writer must NOT change
+    the mode any site produces today, so ``mode`` is explicit per call.
+    Expected values are computed from a live ``write_text`` reference file so
+    the assertions stay umask-independent.
+    """
+
+    @staticmethod
+    def _mode_of(p):
+        return p.stat().st_mode & 0o777
+
+    def test_default_mode_matches_write_text(self, tmp_path):
+        """mode=None yields exactly what Path.write_text yields in the same dir."""
+        from shared.safe_io import atomic_write_text
+
+        reference = tmp_path / 'reference.json'
+        reference.write_text('ref', encoding='utf-8')
+
+        p = tmp_path / 'state.json'
+        atomic_write_text(p, 'payload')
+
+        assert self._mode_of(p) == self._mode_of(reference)
+
+    def test_explicit_0600_is_exact(self, tmp_path):
+        """mode=0o600 yields exactly 0o600 (the mkstemp-created sites' mode)."""
+        from shared.safe_io import atomic_write_text
+
+        p = tmp_path / 'state.json'
+        atomic_write_text(p, 'payload', mode=0o600)
+
+        assert self._mode_of(p) == 0o600
+
+    def test_explicit_0644_survives_umask(self, tmp_path):
+        """mode=0o644 is exact even when the umask would mask bits off."""
+        from shared.safe_io import atomic_write_text
+
+        old = os.umask(0o077)  # would strip group/other from an unguarded create
+        try:
+            p = tmp_path / 'state.json'
+            atomic_write_text(p, 'payload', mode=0o644)
+        finally:
+            os.umask(old)
+
+        assert self._mode_of(p) == 0o644
+
+    def test_mode_applies_to_destination_after_replace(self, tmp_path):
+        """The mode lands on the DESTINATION, not merely on the temp."""
+        from shared.safe_io import atomic_write_text
+
+        p = tmp_path / 'state.json'
+        p.write_text('old', encoding='utf-8')
+        os.chmod(p, 0o600)
+
+        atomic_write_text(p, 'new', mode=0o644)
+
+        assert p.read_text(encoding='utf-8') == 'new'
+        assert self._mode_of(p) == 0o644
+
+
+class TestAtomicWriteMkdir:
+    """``mkdir`` opt-in: only the sites that create their parents today do so."""
+
+    def test_mkdir_true_creates_missing_parents(self, tmp_path):
+        """mkdir=True creates the full parent chain before writing."""
+        from shared.safe_io import atomic_write_text
+
+        p = tmp_path / 'a' / 'b' / 'state.json'
+        assert not p.parent.exists()
+
+        atomic_write_text(p, 'payload', mkdir=True)
+
+        assert p.read_text(encoding='utf-8') == 'payload'
+
+    def test_mkdir_true_is_idempotent(self, tmp_path):
+        """mkdir=True against an existing parent is a no-op, not an error."""
+        from shared.safe_io import atomic_write_text
+
+        p = tmp_path / 'state.json'
+        atomic_write_text(p, 'one', mkdir=True)
+        atomic_write_text(p, 'two', mkdir=True)
+
+        assert p.read_text(encoding='utf-8') == 'two'
+
+    def test_mkdir_false_raises_on_missing_parent(self, tmp_path):
+        """mkdir=False (default) surfaces the missing dir instead of creating it."""
+        from shared.safe_io import atomic_write_text
+
+        p = tmp_path / 'nope' / 'state.json'
+
+        with pytest.raises(FileNotFoundError):
+            atomic_write_text(p, 'payload')
+
+        assert not p.parent.exists()
