@@ -147,16 +147,12 @@ class TestOrchTabRuntimeColumns:
 
 class TestOrchTabEmptyState:
     """The empty-task-list cell must read as a sentence, not a stringified
-    object (task 3313).
+    object (task 3313 — the regression itself is described in
+    static/redux/orch_filter.js's header comment).
 
-    The cell read `No {filter === 'all' ? '' : filter + ' '}tasks`, but
-    OrchTab's `filter` is an object ({active, pending, complete}) — the
-    equality is permanently false and the concatenation stringifies, so an
-    operator diagnosing a data-load failure reads the literal
-    "No [object Object] tasks". These assertions pin the wiring: the cell
-    delegates to window.DF_ORCH_FILTER's orchEmptyLabel, whose eight-
-    combination behaviour is exercised for real in
-    dashboard/tests/js/orch_filter.test.mjs.
+    These assertions pin only the wiring: the cell delegates to
+    window.DF_ORCH_FILTER's orchEmptyLabel, whose eight-combination behaviour
+    is exercised for real in dashboard/tests/js/orch_filter.test.mjs.
 
     The positive anchors in TestOrchTabCurrentFocusRemoved
     (`function OrchTab(`, `aria-label="Task filter"`) are what keep the
@@ -186,8 +182,17 @@ class TestOrchTabEmptyState:
         assert re.search(r'orchEmptyLabel\(\s*filter\s*\)', orch_tab_body)
 
     def test_destructures_orch_filter_global(self, tabs_jsx_body):
-        """window.DF_ORCH_FILTER (defined by orch_filter.js, loaded earlier in
-        index.html) must be destructured at module top level — checked against
-        the whole file since top-level destructures sit outside any single tab
-        function (same rationale as test_destructures_runtime_fmt)."""
-        assert re.search(r'\bDF_ORCH_FILTER\b', tabs_jsx_body)
+        """orchEmptyLabel must be bound from window.DF_ORCH_FILTER (defined by
+        orch_filter.js, loaded earlier in index.html) at module top level —
+        checked against the whole file since top-level destructures sit outside
+        any single tab function (same rationale as test_destructures_runtime_fmt).
+
+        Pins the binding itself, not merely the token: a bare
+        `\\bDF_ORCH_FILTER\\b` search would be satisfied by a comment mentioning
+        the global or by a dead reference left behind after the destructure was
+        deleted. The loose spacing lets the `|| { orchEmptyLabel: ... }`
+        availability fallback and any reformatting through.
+        """
+        assert re.search(
+            r'\{\s*orchEmptyLabel\s*\}\s*=\s*window\.DF_ORCH_FILTER', tabs_jsx_body
+        )
