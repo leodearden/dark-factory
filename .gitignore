@@ -60,6 +60,26 @@ coverage.xml
 # becomes the path, producing files like "<MagicMock name='...' id='...'>".
 <MagicMock*
 
+# ── pytest scratch debris — `--basetemp` inside a checkout ───────────
+# An agent passing `pytest --basetemp=.pytest-tmp` (legal and expected —
+# see orchestrator/tests/test_warm_lane_scripts_shipped.py and
+# _orch_helpers.py) drops scratch dirs inside the checkout. Those dirs
+# can contain embedded git repos (e.g. a fixture's own `git init`), which
+# breaks the mandated `git add -- .` staging command two ways: a
+# commit-less embedded repo makes git exit 128 ("does not have a commit
+# checked out" / "fatal: adding files failed"), aborting the whole
+# staging operation; one that HAS a commit exits 0 but silently stages a
+# 160000 gitlink that would then ride the task branch into the merge
+# lane. Deliberately NOT anchored — unlike /data/ above — because the
+# verify chain runs `cd <subproject> && uv run pytest`, so scratch also
+# lands at e.g. orchestrator/.pytest-tmp/, not just at the repo root.
+.pytest-tmp/
+# Same debris class. Previously ignored only in fused-memory/.gitignore,
+# leaving the other six subprojects exposed to the same staging
+# pollution. `git ls-files` confirms nothing is tracked under any
+# .pytest_cache, so promoting it here untracks nothing.
+.pytest_cache/
+
 # ── Runtime / debug artifacts ────────────────────────────────────────
 # Transient output from verification screenshots, MCP tooling, log runs,
 # and skill/watcher run-products.  None of this belongs in history.
