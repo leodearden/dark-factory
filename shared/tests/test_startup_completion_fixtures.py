@@ -20,6 +20,8 @@ from pathlib import Path
 import pytest
 import startup_completion_fixtures as scf
 
+from shared import cli_invoke
+
 # The closed sets the schema validates against, restated here so a silent
 # widening of the module's own constants cannot pass unnoticed.
 _REGIMES = {'healthy', 'wedge'}
@@ -286,3 +288,67 @@ class TestMaterialization:
         second, _ = scf.materialize_config_dir(rows[-1], tmp_path / 'b')
         assert first != second
         assert first.exists() and second.exists()
+
+
+class TestPredicateDiscrimination:
+    """The core deliverable: the chosen predicate's verdict on every row."""
+
+    @pytest.mark.parametrize('row', _corpus_rows(), ids=_row_ids())
+    def test_predicate_matches_the_recorded_verdict(self, row, tmp_path):
+        config_dir, session_id = scf.materialize_config_dir(row, tmp_path)
+        verdict = scf.evaluate_startup_completion_predicate(config_dir, session_id)
+        assert verdict is row['expected_startup_complete'], (
+            f'{row["id"]}: predicate returned {verdict!r}, row records '
+            f'{row["expected_startup_complete"]!r}'
+        )
+
+    @pytest.mark.parametrize('row', _corpus_rows(), ids=_row_ids())
+    def test_committed_substrate_returns_match_the_row(self, row, tmp_path):
+        # Proves the predicate is derived from artifacts already readable on main
+        # today — not from new production code 3326 has yet to write.
+        config_dir, session_id = scf.materialize_config_dir(row, tmp_path)
+        recorded = row['substrate_returns']
+
+        assert cli_invoke.transcript_exists(config_dir, session_id) is (
+            recorded['transcript_exists']
+        ), f'{row["id"]}: transcript_exists differs from the recorded observation'
+
+        records = cli_invoke.read_transcript_records(config_dir, session_id)
+        assert (records is None) is recorded['read_transcript_records_is_none'], (
+            f'{row["id"]}: read_transcript_records None-ness differs'
+        )
+        assert (None if records is None else len(records)) == recorded['record_count'], (
+            f'{row["id"]}: record_count differs'
+        )
+        assert cli_invoke.count_transcript_turns(config_dir, session_id) == (
+            recorded['count_transcript_turns']
+        ), f'{row["id"]}: count_transcript_turns differs'
+
+    def test_partition_is_non_degenerate(self, tmp_path):
+        # A predicate that returned one constant would satisfy every per-row
+        # assertion above. It must actually discriminate.
+        verdicts: dict[str, set] = {'healthy': set(), 'wedge': set()}
+        for index, row in enumerate(_corpus_rows()):
+            config_dir, session_id = scf.materialize_config_dir(row, tmp_path / str(index))
+            verdicts[row['regime']].add(
+                scf.evaluate_startup_completion_predicate(config_dir, session_id)
+            )
+
+        assert True in verdicts['healthy'], 'no healthy row evaluates True'
+        assert False in verdicts['wedge'], 'no wedge row evaluates False'
+
+    @pytest.mark.parametrize('row', _corpus_rows(), ids=_row_ids())
+    def test_unreadable_transcripts_yield_the_none_sentinel(self, row, tmp_path):
+        # The tri-state contract C5's conservative degrade rests on: "cannot
+        # locate/read the transcript" must never be folded into True or False.
+        config_dir, session_id = scf.materialize_config_dir(row, tmp_path)
+        unreadable = cli_invoke.read_transcript_records(config_dir, session_id) is None
+        verdict = scf.evaluate_startup_completion_predicate(config_dir, session_id)
+        if unreadable:
+            assert verdict is None, (
+                f'{row["id"]}: an unreadable transcript must yield None, got {verdict!r}'
+            )
+        else:
+            assert verdict is not None, (
+                f'{row["id"]}: a readable transcript must yield a bool, got None'
+            )
