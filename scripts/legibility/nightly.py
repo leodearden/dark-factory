@@ -662,6 +662,31 @@ def _report_sample_outcome(
     trigger. Partial truncation (``budget_skipped > 0`` with a non-empty
     selection) stays at INFO too -- that is the budget working as designed,
     and it is fully visible in the always-on line.
+
+    IT REPEATS EVERY NIGHT, BY DESIGN -- know this before you tune it.
+    Unlike the other decision-8 triggers (extractor crash, coder storm,
+    commit failure), which fire on exceptional events, total suppression is
+    caused by PERSISTENT CONFIG STATE: ``budgets.max_daily_digest_bytes``
+    too small for this project's session sizes. An undersized budget nobody
+    fixes therefore posts one info escalation per project per night, for as
+    long as it stays unfixed, under the same synthetic
+    ``task_id=legibility-trickle-<project_id>``
+    (:func:`_build_escalation_arguments`).
+
+    Repetition was chosen over de-duplicating repeats behind a state file
+    for two reasons. It is self-limiting by construction -- the escalation
+    stops the very first night the budget is raised, and the operator action
+    that stops it is exactly the action that fixes the underlying data loss,
+    so a nightly reminder is proportionate to a project silently digesting
+    NOTHING. And a "only escalate when the previous run was not suppressed"
+    latch has the worse failure mode for this specific incident: whoever
+    misses the single first-night escalation gets silence thereafter, which
+    is the precise pathology (14 indistinguishable nights, 2026-07-16..29)
+    this whole task exists to end. The recurring-alarm-fatigue risk is real
+    and accepted with eyes open; the WARNING line is the per-night signal
+    either way, and the severity stays ``info`` so this never gates
+    anything. If the repeats do become noise before the budget is fixed,
+    latch them here rather than downgrading the WARNING.
     """
     summary_line = sampling.format_sample_summary_line(
         sample, max_bytes=cfg.budgets.max_daily_digest_bytes,
