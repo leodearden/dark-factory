@@ -15,12 +15,20 @@ summarise and for the named predicate they pin.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
 import startup_completion_fixtures as scf
 
 from shared import cli_invoke
+
+# Live re-probe gate — mirrors test_cli_invoke_integration.py's _AVAILABLE_TOKENS
+# discovery, and startup_completion_probe._oauth_token's wider A..G sweep, so a
+# machine with no accounts records a legible skip instead of a spurious failure.
+_OAUTH_TOKEN_PRESENT = any(
+    os.environ.get(f'CLAUDE_OAUTH_TOKEN_{c}') for c in 'ABCDEFG'
+)
 
 # The closed sets the schema validates against, restated here so a silent
 # widening of the module's own constants cannot pass unnoticed.
@@ -464,3 +472,134 @@ class TestPredicateDiscrimination:
             assert verdict is not None, (
                 f'{row["id"]}: a readable transcript must yield a bool, got None'
             )
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    not _OAUTH_TOKEN_PRESENT,
+    reason='Requires at least 1 OAuth account in env (CLAUDE_OAUTH_TOKEN_[A-G])',
+)
+class TestLiveReprobe:
+    """Drift guard: re-probe a live CLI and diff it against the committed corpus.
+
+    The corpus is a snapshot of CLI 2.1.220's startup artifacts.  The predicate
+    is deliberately keyed on transcript existence and non-emptiness rather than
+    on record types, so a vocabulary change does not break it — but a change to
+    WHERE the transcript is written, or to whether it is created before the
+    first token, would silently invalidate the whole two-regime grace.  This
+    test makes that failure loud instead of letting the corpus rot.
+
+    ``@pytest.mark.integration`` keeps it out of the default run
+    (``addopts = "-m 'not integration'"`` in `shared/pyproject.toml`), so it
+    never participates in the RED/GREEN loop.  Run it deliberately after a CLI
+    bump::
+
+        cd shared && uv run pytest tests/test_startup_completion_fixtures.py -m integration
+    """
+
+    @staticmethod
+    def _committed_pre_first_token_row():
+        """The committed healthy row this re-probe is diffed against."""
+        rows = [
+            row
+            for row in scf.load_startup_completion_corpus()
+            if row['regime'] == 'healthy'
+            and row['substrate_returns']['count_transcript_turns'] == 0
+            and row['transcript_relpath'] is not None
+        ]
+        assert rows, 'no committed healthy pre-first-token row to diff against'
+        # Lowest record count — the earliest committed observation of the
+        # boundary, i.e. the tightest bar a fresh probe has to clear.
+        return min(rows, key=lambda r: r['substrate_returns']['record_count'])
+
+    @pytest.fixture(scope='class')
+    def fresh_observations(self, tmp_path_factory):
+        """Run the probe live once and return its observations."""
+        import startup_completion_probe as probe
+
+        out = tmp_path_factory.mktemp('reprobe') / 'fresh.jsonl'
+        rc = probe.main(['--mode', 'healthy', '--out', str(out)])
+        assert rc == 0, f'probe exited {rc}'
+        observations = [
+            json.loads(line)
+            for line in out.read_text(encoding='utf-8').splitlines()
+            if line.strip()
+        ]
+        assert observations, 'probe emitted no observations'
+        return observations
+
+    def test_a_transcript_still_materializes_before_the_first_token(
+        self, fresh_observations
+    ):
+        # The load-bearing claim: the CLI writes projects/*/<sid>.jsonl BEFORE
+        # any assistant record.  If a future CLI stops doing that, the predicate
+        # can no longer distinguish "started" from "never started" and C5's
+        # extended bound would be handed out on no evidence.
+        pre = [
+            o
+            for o in fresh_observations
+            if o['sample_kind'] == 'pre_first_token'
+        ]
+        assert pre, 'probe captured no pre_first_token sample'
+        sample = pre[-1]
+
+        assert sample['substrate_returns']['transcript_exists'] is True, (
+            'DRIFT: no transcript resolved at the pre-first-token boundary. '
+            f'CLI {sample["cli_version"]} no longer materializes '
+            'projects/*/<session-id>.jsonl before the first assistant record — '
+            'the SESSION-TRANSCRIPT-MATERIALIZED predicate is invalidated. '
+            'See docs/startup-completion-artifact-matrix.md §4.'
+        )
+        assert sample['substrate_returns']['count_transcript_turns'] == 0, (
+            'DRIFT: the pre-first-token sample already carries an assistant '
+            f'turn ({sample["substrate_returns"]["count_transcript_turns"]}); '
+            'the probe never observed the pre-turn-1 window this corpus is about'
+        )
+
+    def test_b_predicate_still_returns_true_at_that_boundary(
+        self, fresh_observations, tmp_path
+    ):
+        # Materialize the FRESH observation through the same loader path 3326
+        # uses, and run the committed predicate against it.
+        sample = [
+            o for o in fresh_observations if o['sample_kind'] == 'pre_first_token'
+        ][-1]
+        config_dir, session_id = scf.materialize_config_dir(sample, tmp_path)
+        verdict = scf.evaluate_startup_completion_predicate(config_dir, session_id)
+
+        assert verdict is True, (
+            f'DRIFT: the committed predicate returns {verdict!r} on a fresh '
+            f'{sample["cli_version"]} pre-first-token observation, not True. '
+            f'Observed transcript_relpath={sample["transcript_relpath"]!r}, '
+            f'substrate_returns={sample["substrate_returns"]!r}.'
+        )
+
+    def test_c_record_type_prefix_still_matches_the_committed_row(
+        self, fresh_observations
+    ):
+        # Not load-bearing for the predicate (see the report's rejected
+        # alternatives — a type-keyed rule was deliberately NOT chosen), but it
+        # is the earliest signal that the CLI's record vocabulary moved, which
+        # is worth knowing before something that IS load-bearing follows.
+        committed = self._committed_pre_first_token_row()
+        expected = [r.get('type') for r in committed['transcript_records']]
+
+        sample = [
+            o for o in fresh_observations if o['sample_kind'] == 'pre_first_token'
+        ][-1]
+        observed = [r.get('type') for r in (sample['transcript_records'] or [])]
+
+        # Prefix comparison, not equality: the record COUNT at the boundary is
+        # a race with the sampler (4 and 5 records were both observed across the
+        # two committed runs), so only the shared-length prefix is stable.
+        n = min(len(expected), len(observed))
+        assert n > 0, f'DRIFT: fresh pre-first-token sample carries no records ({observed})'
+        assert observed[:n] == expected[:n], (
+            'DRIFT: transcript record-type prefix changed.\n'
+            f'  committed ({committed["id"]}, CLI '
+            f'{committed["provenance"]["cli_version"]}): {expected}\n'
+            f'  observed  (CLI {sample["cli_version"]}): {observed}\n'
+            'The predicate does not key on record types, so this is a warning '
+            'sign rather than a break — but re-run the probe and append a fresh '
+            'corpus row per fixtures/startup_completion/README.md.'
+        )
