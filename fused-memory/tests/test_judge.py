@@ -997,6 +997,70 @@ async def test_initialize_rehydrates_halt_state(mock_journal):
     assert judge.unhalt_grace_remaining('grace-proj') == 2
 
 
+@pytest.mark.asyncio
+async def test_initialize_rehydrates_halt_reason_and_halted_at(mock_journal):
+    """A halt survives a restart WITH its reason and start time (task 3050).
+
+    Both observed halt incidents spanned a restart, so without this the new
+    read surface would report a halted project with halt_reason=None and
+    halted_at=None — the exact "I can see something is wrong but not why or
+    since when" failure the task exists to end. The journal row already
+    carries both; initialize() previously dropped them.
+    """
+    from datetime import timedelta as _td
+
+    now = datetime.now(tz=UTC)
+    halted_at = now - _td(hours=48)
+    mock_journal.get_halt_states = AsyncMock(return_value=[
+        {
+            'project_id': 'halted-proj',
+            'halted_at': halted_at,
+            'cooldown_until': now - _td(hours=47),
+            'reason': 'judge-unreachable after 3 consecutive infra failures',
+            'unhalted_at': None,
+            'unhalt_grace_remaining': 0,
+        },
+        {
+            'project_id': 'unhalted-proj',
+            'halted_at': now - _td(hours=2),
+            'cooldown_until': None,
+            'reason': 'old reason',
+            'unhalted_at': now - _td(minutes=5),
+            'unhalt_grace_remaining': 1,
+        },
+        {
+            'project_id': 'blank-reason-proj',
+            'halted_at': halted_at,
+            'cooldown_until': None,
+            'reason': '',
+            'unhalted_at': None,
+            'unhalt_grace_remaining': 0,
+        },
+    ])
+
+    judge = Judge(config=_make_judge_config(), journal=mock_journal)
+    await judge.initialize()
+
+    assert judge.halt_reason('halted-proj') == (
+        'judge-unreachable after 3 consecutive infra failures'
+    )
+    snap = judge.halt_snapshot('halted-proj')
+    assert snap['halted'] is True
+    assert snap['halted_at'] == halted_at.isoformat()
+    assert snap['halt_reason'] == 'judge-unreachable after 3 consecutive infra failures'
+    # The incident's signature: halted for 48h with the cooldown long past.
+    assert snap['cooldown_expired'] is True
+
+    # An already-unhalted row leaves no halt residue.
+    assert judge.halt_reason('unhalted-proj') is None
+    assert judge.halt_snapshot('unhalted-proj')['halted_at'] is None
+
+    # A stored empty reason means "unknown", not '' — never dress it up.
+    assert judge.halt_reason('blank-reason-proj') is None
+    assert judge.halt_snapshot('blank-reason-proj')['halt_reason'] is None
+    assert judge.halt_snapshot('blank-reason-proj')['halted'] is True
+
+
 class TestJudgeCooldownExpired:
     """Judge.cooldown_expired(project_id) — the harness uses this to decide
     auto-resume-after-cooldown when auto_unhalt_after_cooldown is enabled
