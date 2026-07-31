@@ -305,3 +305,51 @@ async def test_get_statuses_auto_paginates_oversized_full_population(paging_serv
     page1, page2 = set(result['statuses']), set(result2['statuses'])
     assert page1 & page2 == set(), f'Pages must not overlap, shared: {page1 & page2}'
     assert page1 | page2 == set(population), 'Pages must tile the full population with no gaps'
+
+
+@pytest.mark.asyncio
+async def test_get_statuses_ids_path_not_auto_capped_but_paginable(
+    paging_server, paging_task_interceptor
+):
+    """The auto-cap fires ONLY on the ids-less path; ids-filtered stays complete.
+
+    A caller that enumerated an explicit id set depends on getting an answer for
+    each one — silently dropping the tail would trade a loud transport failure
+    for a quiet correctness bug.  The ids-less enumeration is the unbounded one
+    (it grows with the project) and is the path that actually fails closed.
+
+    Guards against an implementation that caps every path indiscriminately.
+    """
+    from fused_memory.server.tools import _STATUSES_AUTO_PAGE_LIMIT as LIMIT
+
+    population = _set_population(_make_statuses(LIMIT + 5))
+    all_ids = list(population)
+
+    # (a) Oversized ids list, no page_size → every named id present, no cap.
+    result = await paging_server._tool_manager.call_tool(
+        'get_statuses',
+        {'project_root': '/project', 'ids': all_ids},
+    )
+    assert len(result['statuses']) == LIMIT + 5, (
+        f'ids path must return every named id, got {len(result["statuses"])} of {LIMIT + 5}'
+    )
+    assert 'pagination' not in result, (
+        f'ids path must not be auto-capped, got: {result.get("pagination")}'
+    )
+
+    # (b) Explicit pagination still works on the ids path.
+    result2 = await paging_server._tool_manager.call_tool(
+        'get_statuses',
+        {'project_root': '/project', 'ids': all_ids, 'page_size': 2, 'offset': 0},
+    )
+    assert len(result2['statuses']) == 2, f'Expected a 2-entry page, got: {result2["statuses"]}'
+    assert result2['pagination']['total'] == LIMIT + 5
+    assert result2['pagination']['has_more'] is True
+    assert result2['pagination']['auto_paginated'] is False
+
+    # (c) ids is forwarded to the interceptor unchanged — pagination must not
+    # alter what is asked of the backend.
+    forwarded = paging_task_interceptor.get_statuses.await_args.kwargs
+    assert forwarded['ids'] == all_ids, (
+        f'ids must reach the interceptor unchanged, got: {forwarded["ids"]!r}'
+    )
