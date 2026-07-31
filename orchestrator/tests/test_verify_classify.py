@@ -1532,10 +1532,18 @@ class TestBrokenWorktreeOrderingNegatives:
 # check's cmd) raises TypeError before the body even runs.
 
 
-def _summarize(*args):
+def _summarize(*args, **kwargs):
+    """Forward to ``verify._summarize_checks``.
+
+    ``**kwargs`` was added by task 3173 for the keyword-only
+    ``test_duration``/``lint_duration``/``type_duration`` params.  Every
+    pre-existing 12-positional-arg call site in this module passes no kwargs
+    and is byte-identical, which is the point: the duration params are
+    purely additive (see the design decision on keeping the 12 positionals).
+    """
     from orchestrator.verify import _summarize_checks  # noqa: PLC0415
 
-    return _summarize_checks(*args)
+    return _summarize_checks(*args, **kwargs)
 
 
 class TestSummarizeChecksThreadsToolIdentity:
@@ -1886,3 +1894,178 @@ class TestExternalKillIsIndeterminate:
     def test_rc_zero_still_passes(self):
         from orchestrator.verify_classify import classify_failure
         assert classify_failure(ToolKind.OPAQUE, 0, '', False) == FailureCategory.PASSED
+
+
+# ---------------------------------------------------------------------------
+# task 3173 step-5: the SUMMARY may never assert a property the gate did not
+# measure.
+#
+# ``_summarize_checks`` builds its ``parts`` purely from ``rc != 0``:
+# ``if lint_rc != 0: parts.append('lint issues')``.  So a lint leg that was
+# SIGKILLed before it could emit a single diagnostic is reported as
+# "lint issues", and merge_queue surfaces that verbatim as
+# ``Post-merge verification failed: Failures: lint issues`` — a branch-blaming
+# sentence about a process the branch never got to influence.  (Same defect
+# shape as task 3110.)
+#
+# RED today: ``_summarize_checks`` accepts no ``*_duration`` kwargs (TypeError)
+# and has no signal-aware branch in its parts assembly.
+# ---------------------------------------------------------------------------
+
+_MEASURED_LINT_CMD = './scripts/verify.sh lint --scope branch --include-infra'
+_MEASURED_LINT_OUT = 'DF_VERIFY_ROLE=merge — forcing --scope all\n'
+_MEASURED_LINT_DURATION = 0.31010722508654
+
+
+class TestSummarizeChecksNamesTheKill:
+    """A leg killed by an external signal contributes a note saying so,
+    instead of a fabricated tool verdict."""
+
+    # -- (a) THE MEASURED CASE --------------------------------------------
+
+    def test_measured_case_lint_leg_sigkilled_at_0_31s(self):
+        """The exact incident: lint SIGKILLed after 0.31s having flushed only
+        its role header, while test and type both passed."""
+        passed, category, cause_hint, summary = _summarize(
+            0, '', False, None,
+            -9, _MEASURED_LINT_OUT, False, _MEASURED_LINT_CMD,
+            0, '', False, None,
+            lint_duration=_MEASURED_LINT_DURATION,
+        )
+        assert not passed
+        assert category == FailureCategory.INFRA_KILL
+        # Says which leg, which signal, how long it survived, and that no
+        # verdict exists — every clause is a measured fact.
+        assert 'lint' in summary
+        assert 'signal 9' in summary
+        assert '0.31' in summary
+        assert 'no diagnostics produced' in summary
+        assert 'indeterminate' in summary
+        # And does NOT assert the property the gate never measured.
+        assert 'lint issues' not in summary
+
+    def test_measured_case_keeps_the_failures_envelope(self):
+        """Every existing consumer prefix/substring-matches on 'Failures: ',
+        so the envelope must survive."""
+        _, _, _, summary = _summarize(
+            0, '', False, None,
+            -9, _MEASURED_LINT_OUT, False, _MEASURED_LINT_CMD,
+            0, '', False, None,
+            lint_duration=_MEASURED_LINT_DURATION,
+        )
+        assert summary.startswith('Failures: ')
+
+    @pytest.mark.parametrize(
+        ('leg_index', 'label', 'duration_kw'),
+        [(0, 'test', 'test_duration'), (1, 'lint', 'lint_duration'), (2, 'type', 'type_duration')],
+    )
+    def test_every_leg_can_report_its_own_kill(self, leg_index, label, duration_kw):
+        """The note is per-leg, not lint-special-cased."""
+        args = [0, '', False, None] * 3
+        args[leg_index * 4] = -15
+        args[leg_index * 4 + 3] = f'./scripts/verify.sh {label}'
+        _, category, _, summary = _summarize(*args, **{duration_kw: 12.5})
+        assert category == FailureCategory.INFRA_KILL
+        assert label in summary
+        assert 'signal 15' in summary
+        assert '12.50' in summary
+        assert 'indeterminate' in summary
+
+    # -- (b) REGRESSION GUARD: a genuine failure is worded exactly as today -
+
+    def test_genuine_lint_failure_wording_is_byte_identical(self):
+        ruff_out = 'src/x.py:1:1: F401 [*] `os` imported but unused\nFound 1 error.\n'
+        passed, category, _, summary = _summarize(
+            0, '', False, None,
+            1, ruff_out, False, 'ruff check .',
+            0, '', False, None,
+            lint_duration=4.2,
+        )
+        assert not passed
+        assert summary == 'Failures: lint issues'
+        assert category != FailureCategory.INFRA_KILL
+
+    def test_genuine_multi_leg_failure_wording_is_byte_identical(self):
+        _, _, _, summary = _summarize(
+            1, 'FAILED tests/x.py::y\n', False, 'pytest tests/',
+            1, 'Found 1 error.\n', False, 'ruff check .',
+            1, 'error: bad type\n', False, 'pyright',
+        )
+        assert summary == 'Failures: tests failed, lint issues, type errors'
+
+    def test_all_passing_is_unchanged(self):
+        passed, category, cause_hint, summary = _summarize(
+            0, '', False, None,
+            0, '', False, None,
+            0, '', False, None,
+            test_duration=1.0, lint_duration=2.0, type_duration=3.0,
+        )
+        assert passed
+        assert summary == 'All checks passed'
+        assert category == 'passed'
+
+    # -- (c) MIXED: a real verdict plus a kill keeps BOTH ------------------
+
+    def test_real_test_failure_plus_killed_lint_keeps_both(self):
+        """The kill must not erase the leg that DID produce a verdict, and
+        must not be erased BY it (severity_rank=1 outranks test_failure)."""
+        passed, category, _, summary = _summarize(
+            1, 'FAILED tests/x.py::y\n', False, 'pytest tests/',
+            -9, _MEASURED_LINT_OUT, False, _MEASURED_LINT_CMD,
+            0, '', False, None,
+            test_duration=901.0, lint_duration=_MEASURED_LINT_DURATION,
+        )
+        assert not passed
+        assert category == FailureCategory.INFRA_KILL
+        assert 'tests failed' in summary
+        assert 'signal 9' in summary
+        assert 'no diagnostics produced' in summary
+        assert 'lint issues' not in summary
+
+    # -- (d) no duration in scope -> omit the clause, keep the sentence ----
+
+    def test_killed_leg_without_a_duration_omits_the_after_clause(self):
+        """None (not 0.0) is the default so a caller with no timing gets an
+        omitted clause rather than a fabricated 'after 0.00s'."""
+        _, category, _, summary = _summarize(
+            0, '', False, None,
+            -9, '', False, _MEASURED_LINT_CMD,
+            0, '', False, None,
+        )
+        assert category == FailureCategory.INFRA_KILL
+        assert 'lint' in summary
+        assert 'signal 9' in summary
+        assert 'no diagnostics produced' in summary
+        assert 'indeterminate' in summary
+        assert 'after' not in summary
+        assert '0.00' not in summary
+
+    # -- (e) crash-signal control -----------------------------------------
+
+    def test_crash_signal_leg_still_reports_lint_issues(self):
+        """SIGSEGV is a fault of the code under test, not an external kill:
+        today's wording and today's blocking verdict both stand."""
+        _, category, _, summary = _summarize(
+            0, '', False, None,
+            -11, '', False, 'ruff check .',
+            0, '', False, None,
+            lint_duration=0.5,
+        )
+        assert summary == 'Failures: lint issues'
+        assert category != FailureCategory.INFRA_KILL
+        assert 'signal' not in summary
+        assert 'indeterminate' not in summary
+
+    # -- (f) the new params are PURELY additive ----------------------------
+
+    def test_twelve_positional_args_with_no_kwargs_still_works(self):
+        """Proves the pre-existing 12-positional call sites (and the
+        `_summarize(*args)` harness above) need no edit."""
+        passed, category, _, summary = _summarize(
+            1, 'FAILED tests/x.py::y\n', False, 'pytest tests/',
+            0, '', False, None,
+            0, '', False, None,
+        )
+        assert not passed
+        assert category == FailureCategory.TEST_FAILURE
+        assert summary == 'Failures: tests failed'
