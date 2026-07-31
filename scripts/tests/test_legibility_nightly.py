@@ -439,6 +439,38 @@ def test_select_digest_sessions_selects_multi_mb_session_under_stock_budget(tmp_
     assert [r.path for r in selected] == [session_path]
 
 
+def test_select_digest_sessions_returns_the_whole_sample_result(tmp_path):
+    """The accounting must reach the caller, not be dropped on the floor.
+
+    Task 2573 computed ``budget_skipped`` correctly and task 2581's consumer
+    (this function) discarded it by returning only ``.selected`` — so for 14
+    nights (2026-07-16..29) a run that found real signal and threw ALL of it
+    away on the byte budget reported exactly what a genuine no-change night
+    reports. The whole ``SampleResult`` is the return value now.
+    """
+    work_cwd = str(tmp_path / 'work')
+    cfg = load_config(_write_config(tmp_path, project_id='proj_a', cwd_prefixes=[work_cwd]))
+    projects_root = tmp_path / 'projects'
+    session_path = projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl'
+    _write_transcript(session_path, cwd=work_cwd, timestamp='2026-07-13T10:00:00Z')
+
+    result = nightly.select_digest_sessions(cfg, projects_root, date(2026, 7, 13))
+
+    assert isinstance(result, nightly.sampling.SampleResult)
+    # The four accounting fields the operator line and the suppression
+    # predicate need, all reachable off the return value.
+    assert result.total_records == 1
+    assert result.zero_signal_dropped == 0
+    assert result.budget_skipped == 0
+    assert result.bytes_used > 0
+    assert [r.path for r in result.selected] == [session_path]
+
+    # The negative half, stated explicitly: a future refactor that re-narrows
+    # the return to `.selected` must fail a test rather than silently
+    # re-dropping the accounting the way 2581's consumer dropped 2573's field.
+    assert not isinstance(result, list)
+
+
 # ---------------------------------------------------------------------------
 # step-5/6: build_digests
 # ---------------------------------------------------------------------------
