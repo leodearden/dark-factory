@@ -1141,3 +1141,85 @@ class TestZeroSearchCasesAreDistinguishableEndToEnd:
         # An absent archive and an empty one are the same fact, deliberately.
         assert coverages['absent']['status'] == coverages['empty']['status']
         assert codes['absent'] == codes['empty']
+
+
+# ===========================================================================
+# step-19 — two readers, ONE core (INV-5 made checkable at runtime)
+# ===========================================================================
+
+FIXTURE_MAIN = (
+    FIXTURE_ARCHIVE / '4242' / '-home-leo-src-dark-factory--worktrees-4242'
+    / '11111111-2222-3333-4444-555555555555.jsonl.gz'
+)
+
+
+class TestReaderBindings:
+    """The module's readers ARE the imported ones — no local parser.
+
+    INV-5 / PRD D9 names both readers and forbids a third. Asserting the
+    BINDINGS, not just the behaviour, is what makes a future regression that
+    quietly reintroduces a local parser fail a test rather than pass review.
+    """
+
+    def test_load_transcript_is_the_imported_function(self):
+        import legibility.digest
+        assert _mod.load_transcript is legibility.digest.load_transcript
+
+    def test_iter_json_lines_is_the_imported_function(self):
+        import legibility.inventory
+        assert _mod.iter_json_lines is legibility.inventory.iter_json_lines
+
+
+class TestSingleTranscriptMode:
+    """``--transcript`` drives the SAME core through the OTHER reader."""
+
+    def _cli(self, path, out_root):
+        code = _mod.main([
+            '--transcript', str(path), '--out-root', str(out_root), '--stamp', STAMP,
+        ])
+        directory = Path(out_root) / _mod.EVAL_ID
+        coverage = json.loads(
+            (directory / f'coverage-{STAMP}.json').read_text(encoding='utf-8'))
+        corpus = (directory / f'corpus-{STAMP}.jsonl').read_text(encoding='utf-8')
+        return code, coverage, [json.loads(line) for line in corpus.splitlines()]
+
+    def test_exits_zero_and_emits_coverage(self, tmp_path):
+        code, coverage, records = self._cli(FIXTURE_MAIN, tmp_path)
+        assert code == 0
+        assert coverage['status'] == 'ok'
+        assert coverage['transcripts_found'] == 1
+        assert coverage['transcripts_read'] == 1
+        assert len(records) == 2
+
+    def test_matches_what_the_scan_path_produced_for_the_same_file(self, tmp_path):
+        # THE reuse assertion: load_transcript (slurp) and iter_json_lines
+        # (stream) feed ONE core, so for the same file they must agree
+        # exactly. Any divergence means a second parser has appeared.
+        _, _, via_slurp = self._cli(FIXTURE_MAIN, tmp_path / 'single')
+        _, _, scan_records, _ = _run_cli(FIXTURE_ARCHIVE, tmp_path / 'scan')
+        rel = FIXTURE_MAIN.relative_to(FIXTURE_ARCHIVE).as_posix()
+        via_scan = [r for r in scan_records if r['transcript'] == rel]
+
+        # Everything the CORE derives must be identical. Only the fields that
+        # come from the archive path itself may differ, since single-file mode
+        # has no archive root to be relative to.
+        from_path = {'transcript', 'task_id', 'session_id', 'is_subagent', 'subagent_id'}
+        def extracted(records):
+            return [{k: v for k, v in r.items() if k not in from_path} for r in records]
+
+        assert extracted(via_slurp) == extracted(via_scan)
+        assert len(via_slurp) == 2
+
+    def test_unreadable_file_is_total_failure_not_a_traceback(self, tmp_path):
+        bad = tmp_path / 'broken.jsonl.gz'
+        bad.write_bytes(b'not gzip at all\n')
+        code, coverage, records = self._cli(bad, tmp_path / 'out')
+        assert code == 3
+        assert coverage['status'] == 'total_failure'
+        assert coverage['parse_failures']['count'] == 1
+        assert records == []
+
+    def test_absent_file_is_total_failure(self, tmp_path):
+        code, coverage, _ = self._cli(tmp_path / 'nope.jsonl.gz', tmp_path / 'out')
+        assert code == 3
+        assert coverage['status'] == 'total_failure'
