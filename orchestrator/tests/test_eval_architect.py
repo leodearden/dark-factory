@@ -1264,6 +1264,107 @@ class TestRunArchitectEval:
 
 
 # ---------------------------------------------------------------------------
+# Task 3302: gate the LLM plan judge at the SOURCE.
+#
+# run_architect_eval's healthy branch called judge_plan_quality with no
+# scorability gate, and judge_plan_quality has no guard of its own — it returns
+# whatever the LLM says in [0, 1]. So a HEALTHY architect that produced a
+# stepless artifact persisted the self-contradictory cell
+# `cap_tainted=False, plan_steps=0, plan_quality=0.9`, which is exactly the
+# two-scorer disagreement score_plan_structure's anti-fabrication short-circuit
+# exists to prevent (Graphiti e2066ec6). Gating here keeps plan_steps and the
+# persisted plan_quality consistent for every NEW cell.
+# ---------------------------------------------------------------------------
+
+_STEPLESS_PLANS = [
+    pytest.param({}, id='empty-dict'),
+    pytest.param({'steps': []}, id='explicit-empty-steps'),
+    pytest.param(
+        {'task_id': 't', 'title': 'x', 'analysis': 'a', 'files': [], 'steps': []},
+        id='header-only-create_plan-stub',
+    ),
+]
+
+
+@pytest.mark.asyncio
+class TestSteplessPlanIsNeverJudged:
+    """A healthy architect that produced nothing scores the structural floor."""
+
+    def _cfg(self):
+        from orchestrator.evals.configs import EvalConfig
+
+        return EvalConfig(
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+        )
+
+    @staticmethod
+    def _confident_judge():
+        from orchestrator.evals.judge import PlanQualityVerdict
+
+        # What the ungated judge really does with an unjudgeable artifact.
+        return PlanQualityVerdict(
+            plan_quality=0.9, per_criterion={}, reasoning='looks fine',
+        )
+
+    @pytest.mark.parametrize('plan', _STEPLESS_PLANS)
+    async def test_stepless_plan_scores_the_structural_floor(self, plan):
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=plan,
+            judge_return=self._confident_judge(),
+            arch_success=True,
+        )
+        persisted = mocks['save'].call_args.args[0].metrics
+
+        # The deterministic floor, NOT the judge's 0.9.
+        assert persisted['plan_quality'] == 0.0
+        assert persisted['plan_steps'] == 0
+        assert result.metrics['plan_quality'] == 0.0
+
+    @pytest.mark.parametrize('plan', _STEPLESS_PLANS)
+    async def test_stepless_plan_is_a_content_failure_not_an_exclusion(self, plan):
+        """No infra failure occurred: the architect ran fine and answered with
+        nothing. That is worth 0.0, never the cap-tainted exclusion a transport
+        refusal earns (task 3118)."""
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=plan,
+            judge_return=self._confident_judge(),
+            arch_success=True,
+        )
+        persisted = mocks['save'].call_args.args[0].metrics
+
+        assert persisted['cap_tainted'] is False
+        assert persisted['invocation_error'] is None
+        assert result.metrics['cap_tainted'] is False
+
+    @pytest.mark.parametrize('plan', _STEPLESS_PLANS)
+    async def test_the_plan_judge_is_never_invoked(self, plan):
+        """Nothing to judge — and inside a cap window the call would 429 anyway,
+        so an opus invocation on an unjudgeable artifact is pure waste (the same
+        justification the arch_unmeasurable branch already records)."""
+        _, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=plan,
+            judge_return=self._confident_judge(),
+            arch_success=True,
+        )
+        mocks['judge'].assert_not_awaited()
+
+    async def test_a_real_plan_still_awaits_the_judge(self):
+        """The control: the gate fires ONLY on a stepless artifact."""
+        result, mocks = await _run_architect_eval_hermetic(
+            self._cfg(), produced_plan=_well_formed_plan(),
+        )
+        persisted = mocks['save'].call_args.args[0].metrics
+
+        mocks['judge'].assert_awaited_once()
+        assert persisted['plan_quality'] == 0.77
+        assert persisted['plan_steps'] > 0
+        assert persisted['cap_tainted'] is False
+
+
+# ---------------------------------------------------------------------------
 # plan_quality report column — additive interim surface (step-11/12)
 #
 # A distinct per-(task_id, config_name, role_under_test) column μ/λ consume in
