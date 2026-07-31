@@ -39,8 +39,13 @@ from audit_wiped_metadata_files import (
 
 from repair_wiped_metadata_files import (
     PROVENANCE_KEY,
+    REPAIR,
     REPAIR_TASK_ID,
+    SKIP_FILES_PRESENT,
+    SKIP_MISSING,
+    SKIP_NOT_TERMINAL,
     build_repair_payload,
+    classify_live_task,
     plan_files_rejection_reason,
     select_repairable_candidates,
 )
@@ -307,3 +312,77 @@ def test_build_repair_payload_provenance_key_uses_the_x_namespace():
     noise that census exists to surface."""
     assert PROVENANCE_KEY.startswith("x_")
     assert PROVENANCE_KEY == "x_files_backfill_provenance"
+
+
+# ---------------------------------------------------------------------------
+# classify_live_task — the immediately-before-write re-read gate.
+#
+# NOT CEREMONY. Task 3113's correction addendum documents _stamp_optimistic_path
+# (orchestrator/src/orchestrator/workflow.py:4550 — the method MOVED from 4413
+# since this plan was first written, so locate it by NAME) writing a task's
+# STALE dispatch-time metadata snapshot back as a whole blob. A repair applied
+# underneath a live workflow is therefore not merely racy: it is guaranteed to
+# be undone.
+# ---------------------------------------------------------------------------
+
+
+def test_classify_live_task_repairs_a_terminal_task_with_empty_files():
+    """(a) both terminal statuses, with files empty and with files absent."""
+    candidate = _candidate(20)
+
+    assert classify_live_task({"status": "done", "metadata": {"files": []}}, candidate) == REPAIR
+    assert classify_live_task({"status": "cancelled", "metadata": {}}, candidate) == REPAIR
+
+
+def test_classify_live_task_skips_every_non_terminal_status():
+    """(b) a live workflow holds a dispatch-time metadata snapshot it writes
+    back wholesale, so repairing underneath one would be undone."""
+    candidate = _candidate(21)
+
+    for status in ("pending", "in-progress", "blocked", "deferred", "review"):
+        live = {"status": status, "metadata": {"files": []}}
+        assert classify_live_task(live, candidate) == SKIP_NOT_TERMINAL, status
+
+
+def test_classify_live_task_terminal_set_is_an_allowlist_so_new_statuses_fail_closed():
+    """A status the system grows later must be SKIPPED, not written to — the
+    check is `status in {done, cancelled}`, never `status not in {...}`."""
+    live = {"status": "some_future_status", "metadata": {"files": []}}
+
+    assert classify_live_task(live, _candidate(22)) == SKIP_NOT_TERMINAL
+
+
+def test_classify_live_task_skips_a_task_whose_files_are_already_present():
+    """(c) someone else repaired it, or this is a re-run. This arm is what
+    makes the script idempotent and makes the post-3113 second pass a cheap
+    re-run rather than a re-derivation."""
+    live = {"status": "done", "metadata": {"files": ["a.py"]}}
+
+    assert classify_live_task(live, _candidate(23)) == SKIP_FILES_PRESENT
+
+
+def test_classify_live_task_skips_a_missing_or_empty_live_read():
+    """(d) get_task returned nothing usable — never write blind."""
+    for live in (None, {}, "not-a-dict", {"status": ""}):
+        assert classify_live_task(live, _candidate(24)) == SKIP_MISSING, live
+
+
+def test_classify_live_task_still_repairs_a_corrupt_files_value():
+    """(e) the emptiness predicate is the audit's _coerce_file_list, NOT bare
+    truthiness. A non-list `files`, or a list of only blanks/non-strings, is
+    corrupt data carrying no scope — the audit already nominated the task on
+    exactly that reading, so a divergent predicate here would make the two
+    disagree about the same record."""
+    candidate = _candidate(25)
+
+    for corrupt in ("a.py", 7, {"a": 1}, [""], ["  "], [None], [None, ""]):
+        live = {"status": "done", "metadata": {"files": corrupt}}
+        assert classify_live_task(live, candidate) == REPAIR, corrupt
+
+
+def test_classify_live_task_treats_a_non_dict_metadata_as_no_files():
+    """metadata itself can be NULL or malformed in the store; that is 'no
+    scope recorded', which is repairable, not a crash."""
+    for meta in (None, "null", 3, []):
+        live = {"status": "done", "metadata": meta}
+        assert classify_live_task(live, _candidate(26)) == REPAIR, meta
