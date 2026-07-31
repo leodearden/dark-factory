@@ -1218,15 +1218,28 @@ def test_b4_the_restart_that_reaches_the_ceiling_still_escalates_next_time(
 # ---------------------------------------------------------------------------
 
 
-def _tripped_state(mod, restart_age: int = 60) -> dict:
-    """State with the ceiling already open and a full restart window."""
+def _tripped_state(
+    mod, restart_age: int = 60, last_escalation_age: int | None = None
+) -> dict:
+    """State with the ceiling already open and a full restart window.
+
+    ``last_escalation_epoch`` defaults to "filed at the same time as those
+    restarts", which is the only self-consistent seed: a state whose ceiling is
+    OPEN is by construction a state where the L2 has already been filed.
+    Omitting it seeds "never filed", which quietly grants a free escalation to
+    every test built on this helper — exactly how the flap regression below
+    stayed invisible.
+    """
     import time as _time
 
     now = int(_time.time())
+    if last_escalation_age is None:
+        last_escalation_age = restart_age
     return {
         "streak": 0,
         "restarts": [now - restart_age] * mod.MAX_RESTARTS,
         "ceiling_open": True,
+        "last_escalation_epoch": now - last_escalation_age,
     }
 
 
@@ -1296,10 +1309,14 @@ def test_dedup_is_per_episode_not_forever(monkeypatch, state_env, queue_env):
     assert rec.states[-1]["ceiling_open"] is False
 
     # Time passes: the old restart epochs age out of the rolling window, so
-    # the next storm is measured on its own merits.
+    # the next storm is measured on its own merits. The L2 already on file
+    # ages out with them — both are keyed on the same RATE_WINDOW_SECS, so
+    # ageing one without the other would seed a state that cannot occur.
     now = int(_time.time())
+    stale = now - (mod.RATE_WINDOW_SECS + 600)
     aged = _load_watchdog().load_state()
-    aged["restarts"] = [now - (mod.RATE_WINDOW_SECS + 600)] * mod.MAX_RESTARTS
+    aged["restarts"] = [stale] * mod.MAX_RESTARTS
+    aged["last_escalation_epoch"] = stale
     _load_watchdog().save_state(aged)
 
     # Episode 2: a fresh storm — MAX_RESTARTS streaks exhaust the allowance,
@@ -1331,6 +1348,110 @@ def test_recovery_does_not_wipe_the_rolling_restart_window(
 
     assert len(rec.states[-1]["restarts"]) == mod.MAX_RESTARTS, (
         "recovery wiped the rolling window that bounds the next storm"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The flap regression — one L2 per rolling WINDOW, not per episode
+#
+# `ceiling_open` and the `restarts` window have different lifetimes, and a
+# flapping dashboard lives in the gap. A single successful probe closes the
+# episode (deliberately — see the recovery tests above) while the restart
+# epochs are deliberately preserved, so a [1 healthy tick, FAIL_STREAK failing
+# ticks] cycle re-trips the still-saturated ceiling every ~120s of wall clock.
+# Keying the escalation dedup on the episode therefore does not bound it at
+# all: the storm escape trades a restart storm for an escalation storm.
+# ---------------------------------------------------------------------------
+
+
+def _flap_cycle(mod) -> list[bool]:
+    """One recover-then-fail cycle: 4 ticks, ~120s at the 30s cadence.
+
+    Short enough that nothing ages out of RATE_WINDOW_SECS — which is the
+    point. No epoch is rewritten anywhere in the flap test; the storm is
+    driven purely by probe results, exactly as a real one would be.
+    """
+    return [True] + [False] * mod.FAIL_STREAK
+
+
+def test_flapping_dashboard_files_one_l2_per_rate_window(
+    monkeypatch, state_env, queue_env
+):
+    """A flapping dashboard must not page a human every two minutes.
+
+    ONE shared recorder across the whole run: the initial storm that trips the
+    ceiling organically, then five flap cycles. Every cycle closes the episode
+    with a single healthy probe and immediately re-completes a streak against a
+    restart window that is still saturated — so the ceiling re-trips with no
+    restart, and (before the fix) files another born-at-L2 each time: ~30
+    paging-severity escalations an hour for ONE outage, which is precisely the
+    escalation storm the module docstring claims the escape prevents.
+    """
+    mod = _load_watchdog()
+
+    # Trip the ceiling organically from the default state — MAX_RESTARTS
+    # restarts exhaust the allowance, the next completed streak escalates.
+    rec = _run_ticks(monkeypatch, [False] * (mod.FAIL_STREAK * (mod.MAX_RESTARTS + 1)))
+    assert len(rec.restarts) == mod.MAX_RESTARTS, "the allowance was not exhausted"
+    assert len(rec.escalations) == 1, "the ceiling did not trip exactly once"
+    assert rec.states[-1]["ceiling_open"] is True
+
+    for _ in range(5):
+        _run_ticks(monkeypatch, _flap_cycle(mod), recorder=rec)
+
+    assert len(rec.escalations) == 1, (
+        f"filed {len(rec.escalations)} L2s for one flapping outage. The dedup "
+        "is keyed on the ceiling EPISODE, which a single healthy probe ends — "
+        "so every ~120s flap cycle re-trips the still-saturated window and "
+        "pages again. It must be keyed on the same rolling RATE_WINDOW_SECS "
+        "the ceiling itself is measured over."
+    )
+    assert len(rec.restarts) == mod.MAX_RESTARTS, (
+        f"restarted {len(rec.restarts)} times; the window never drained, so "
+        "no restart may fire after the allowance was exhausted"
+    )
+
+
+def test_escalation_dedup_expires_with_the_rolling_window(
+    monkeypatch, state_env, queue_env
+):
+    """The suppression is a WINDOW, not a permanent gag.
+
+    A genuinely separate outage an hour later is new information and must page.
+    Both keys age together: the restart epochs leave the rolling window and the
+    L2 on file leaves it with them, so the fresh storm is measured — and
+    escalated — entirely on its own merits.
+    """
+    import time as _time
+
+    mod = _load_watchdog()
+
+    rec = _run_ticks(monkeypatch, [False] * (mod.FAIL_STREAK * (mod.MAX_RESTARTS + 1)))
+    for _ in range(5):
+        _run_ticks(monkeypatch, _flap_cycle(mod), recorder=rec)
+    assert len(rec.escalations) == 1
+
+    # The dashboard finally recovers, and an hour passes with it healthy.
+    _run_ticks(monkeypatch, [True], recorder=rec)
+    now = int(_time.time())
+    stale = now - (mod.RATE_WINDOW_SECS + 600)
+    aged = _load_watchdog().load_state()
+    aged["restarts"] = [stale] * mod.MAX_RESTARTS
+    aged["last_escalation_epoch"] = stale
+    _load_watchdog().save_state(aged)
+
+    # A brand-new outage: the allowance is fresh, so it is spent, and the
+    # ceiling it then reaches is a new fact a steward has not been told.
+    _run_ticks(
+        monkeypatch, [False] * (mod.FAIL_STREAK * (mod.MAX_RESTARTS + 1)), recorder=rec
+    )
+
+    assert len(rec.escalations) == 2, (
+        "a separate outage a full RATE_WINDOW_SECS later filed no new L2 — "
+        "the window-keyed dedup silenced the watchdog permanently instead"
+    )
+    assert len(rec.restarts) == 2 * mod.MAX_RESTARTS, (
+        "the aged-out window did not restore a fresh restart allowance"
     )
 
 
