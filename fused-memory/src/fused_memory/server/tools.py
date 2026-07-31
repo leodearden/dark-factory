@@ -648,6 +648,36 @@ def _maybe_kwargs(sentinel: object, **pairs: object) -> dict:
     return {k: v for k, v in pairs.items() if v is not sentinel}
 
 
+def _status_page(
+    statuses: dict[str, str], offset: int, page_size: int
+) -> tuple[dict[str, str], int]:
+    """Slice a deterministic page out of an ``{id: status}`` map.
+
+    Returns ``(page, total)`` where *page* holds at most *page_size* entries
+    starting at *offset*, and *total* is the full population size.
+
+    WHY the explicit sort: the backend's status query
+    (``SELECT id, status FROM tasks WHERE tag = ?`` in
+    ``backends/sqlite_task_backend.py``) has no ``ORDER BY``, so the row order
+    — and therefore the resulting dict's insertion order — is not a guaranteed
+    stable total order across calls.  Slicing an unordered mapping would let
+    successive pages overlap or skip entries, so a paginating caller would
+    silently build an INCOMPLETE census: exactly the class of failure task 3064
+    exists to fix.  Imposing an explicit total order here makes successive pages
+    tile the population with no gaps and no duplicates.
+
+    The order is numeric-aware rather than lexicographic so pages read as id
+    1..N instead of 1, 10, 100; non-numeric ids sort deterministically after
+    all numeric ones.
+    """
+    ordered = sorted(
+        statuses,
+        key=lambda k: (0, int(k), '') if k.lstrip('-').isdigit() else (1, 0, k),
+    )
+    page_keys = ordered[offset:offset + page_size]
+    return {k: statuses[k] for k in page_keys}, len(ordered)
+
+
 def create_mcp_server(
     memory_service: MemoryService,
     task_interceptor: TaskInterceptor | None = None,
@@ -3697,6 +3727,8 @@ def create_mcp_server(
         project_root: str,
         ids: list[str] | None = None,
         tag: str | None = None,
+        page_size: int | None = None,
+        offset: int = 0,
     ) -> dict[str, Any]:
         """Return a compact ``{id: status}`` mapping — status-only, ~95% smaller than get_tasks.
 
@@ -3709,6 +3741,23 @@ def create_mcp_server(
             ids: Optional list of task ids to filter to (unknown ids silently omitted).
                  Omit or pass null for all tasks.
             tag: Tag context (optional)
+            page_size: If provided, return at most this many statuses (must be a
+                positive integer).  When omitted (default), the full status map is
+                returned with no ``pagination`` key — backward-compatible behaviour
+                for every existing caller.
+            offset: Zero-based index of the first status to return (default 0).
+                Only meaningful when page_size is provided.
+
+        Pagination contract (shape-compatible with ``get_tasks``, so a caller can
+        share one paging loop across both tools):
+          * When a page is taken, the response carries a ``pagination`` dict with
+            ``total``, ``offset``, ``page_size``, ``returned``, ``has_more`` and
+            ``auto_paginated``.
+          * Page to completion by incrementing ``offset`` by ``page_size`` until
+            ``pagination['has_more']`` is False, merging the pages into one map.
+          * The ABSENCE of a ``pagination`` key means the response is COMPLETE.
+          * Pages are sliced from a deterministic total order, so successive pages
+            tile the population with no gaps and no duplicates.
 
         Shape note (deliberate asymmetry): this tool WRAPS its result under a
         top-level ``'statuses'`` key (``{'statuses': {id: status}}``), unlike
@@ -3724,11 +3773,35 @@ def create_mcp_server(
         result = await task_interceptor.get_statuses(
             project_root=project_root, ids=ids, tag=tag
         )
-        await _log_read(
-            'get_statuses',
-            result_summary={'count': len(result)},
-        )
-        return {'statuses': result}
+
+        # Opt-in pagination — only applied when page_size is explicitly provided.
+        # When page_size is None the response is the full untouched map (no
+        # ``pagination`` key), preserving the single-keyed envelope that
+        # tests/test_status_envelope_contract.py pins.
+        pagination: dict[str, Any] | None = None
+        if page_size is not None:
+            page, total = _status_page(result, offset, page_size)
+            result = page
+            pagination = {
+                'total': total,
+                'offset': offset,
+                'page_size': page_size,
+                'returned': len(page),
+                'has_more': offset + len(page) < total,
+                'auto_paginated': False,
+            }
+
+        summary: dict[str, Any] = {'count': len(result)}
+        if pagination is not None:
+            # Report returned-vs-total so a paged (reduced) response is visible
+            # in the read log rather than looking like a shrunken census.
+            summary['total'] = pagination['total']
+        await _log_read('get_statuses', result_summary=summary)
+
+        payload: dict[str, Any] = {'statuses': result}
+        if pagination is not None:
+            payload['pagination'] = pagination
+        return payload
 
     @mcp.tool()
     @mcp_tool_errors()
