@@ -1627,7 +1627,7 @@ class TestB9SubmitCli:
 # B10 — submit_task validation rejects ill-formed corners (step-13)
 # ---------------------------------------------------------------------------
 
-def _validate(task_kind: str, metadata: dict, project_root: str | None = None) -> dict | None:
+def _validate(task_kind: str, metadata: dict, project_root: str) -> dict | None:
     """Invoke α's deterministic_task_error validator.
 
     Tries in-process import first (succeeds in workspace-root venv).
@@ -1636,15 +1636,18 @@ def _validate(task_kind: str, metadata: dict, project_root: str | None = None) -
 
     Returns the error dict or None (valid).
 
+    ``project_root`` is required: the helper used to fall back to a bare
+    ``tempfile.mkdtemp()`` with no prefix and no teardown, leaking an
+    unreclaimed ``/tmp/tmp<random>`` dir on any call that omitted it. Every
+    call site passes a pytest ``tmp_path``-rooted path, so the fallback was
+    already dead; having no default keeps it structurally unreachable.
+
     Subprocess fallback notes:
     - metadata is serialised as JSON and re-parsed inside the child process
       with ``json.loads(...)`` so both paths receive a ``dict``, not a string.
     - ``uv`` is invoked as a standalone binary (``['uv', 'run', ...]``), NOT
       via ``python -m uv`` (uv is not an importable Python module).
     """
-    if project_root is None:
-        import tempfile
-        project_root = tempfile.mkdtemp()
     try:
         from fused_memory.middleware.deterministic_task_guard import (  # type: ignore[reportMissingImports]
             deterministic_task_error,
