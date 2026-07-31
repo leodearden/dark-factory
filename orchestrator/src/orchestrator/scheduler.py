@@ -7,7 +7,6 @@ import hashlib
 import json
 import logging
 import math
-import os
 import re
 import time
 from collections import deque
@@ -17,6 +16,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, overload, runtime_checkable
 
+from shared import safe_io
 from shared.locking import (
     files_to_modules,
     modules_conflict,
@@ -6706,8 +6706,12 @@ class Scheduler:
     def _write_state_snapshot_raw(self, path: Path, payload: str | None = None) -> None:
         """Atomically write the current state snapshot to *path* as JSON.
 
-        Creates parent directories if missing.  Uses a tmp-file + os.replace
-        atomic rename so concurrent readers never see a partial write.
+        Delegates to :func:`shared.safe_io.atomic_write_text` (task 3223),
+        which creates parent directories if missing and does the tmp-file +
+        ``os.replace`` atomic rename so concurrent readers never see a partial
+        write.  ``mode`` is deliberately left at the helper's umask default
+        rather than narrowed: this snapshot is read by other processes (the
+        dashboard, scripts/drain_check.py).
 
         Exceptions propagate to the caller (``_write_snapshot_best_effort``),
         which swallows them via its own try/except so the scheduler never stops
@@ -6727,16 +6731,13 @@ class Scheduler:
                 direct callers such as tests).
         """
         path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = path.with_suffix('.json.tmp')
         # Serialise the full snapshot (including snapshot_at) for the on-disk
         # record.  Note: this is independent of the dedup payload built in
         # _write_snapshot_best_effort; when a pre-built payload is passed,
         # no second get_state_snapshot() call is needed.
         if payload is None:
             payload = json.dumps(self.get_state_snapshot(), default=str)
-        tmp_path.write_text(payload, encoding='utf-8')
-        os.replace(tmp_path, path)
+        safe_io.atomic_write_text(path, payload, encoding='utf-8', mkdir=True)
 
     async def _write_snapshot_best_effort(self, force: bool = False) -> None:
         """Write the scheduler state snapshot to the default path off the event loop.

@@ -810,18 +810,22 @@ class TestWriteStateSnapshot:
         try/except.  Swallowing here would silently advance bookkeeping for a
         write that never persisted.
         """
-        import orchestrator.scheduler as scheduler_module
+        import shared.safe_io as safe_io_module
 
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
         scheduler.finish_startup()
         path = tmp_path / 'scheduler_state.json'
 
         # Inject a disk-full error at the os.replace boundary so the test
-        # exercises the propagation path inside the primitive itself.
+        # exercises the propagation path from inside the primitive itself.
+        # Since task 3223 that rename lives in shared.safe_io.atomic_write_text,
+        # so patch it there — patching the delegation call instead would only
+        # prove the call site re-raises, not that the write primitive's own
+        # failure path propagates through it.
         def _boom(*_args, **_kw):
             raise OSError('disk full')
 
-        monkeypatch.setattr(scheduler_module.os, 'replace', _boom)
+        monkeypatch.setattr(safe_io_module.os, 'replace', _boom)
 
         with pytest.raises(OSError):
             scheduler._write_state_snapshot_raw(path)

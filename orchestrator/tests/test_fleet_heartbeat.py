@@ -15,6 +15,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from orchestrator.fleet_heartbeat import (
     DEFAULT_FLEET_DIR,
     build_heartbeat_payload,

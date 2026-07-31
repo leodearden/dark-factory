@@ -7,7 +7,7 @@ Design highlights
 -----------------
 * Only ``MergeRequest`` (not ``GroupMergeRequest``) is journaled — train merges
   carry live scheduler callbacks that cannot be serialized.
-* Atomic file I/O (tmp + os.replace) mirrors b3_gate.py ``_save_state``.
+* Atomic file I/O via ``shared.safe_io.atomic_write_text`` (task 3223).
 * Fail-open reads: missing file → empty list (benign, silent); empty / corrupt
   file → empty list **plus** ``journal_corrupt=True`` and a deduped WARNING
   (empty files are treated as corrupt because _save_raw never writes an empty
@@ -21,11 +21,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from shared import safe_io
 from shared.safe_io import load_json_or_warn
 
 from orchestrator.merge_types import (
@@ -184,12 +184,22 @@ class MergeQueueStore:
         return data
 
     def _save_raw(self, state: dict[str, Any]) -> None:
-        """Atomically write *state* to disk (tmp + os.replace)."""
+        """Atomically write *state* to disk.
+
+        ``mode`` is deliberately left at the helper's umask default rather than
+        narrowed: this journal is read by other processes.
+
+        Fail-open, and that policy stays HERE rather than in the helper (which
+        always propagates): a failure to journal must never take down the merge
+        worker, so any OSError is logged at WARNING and swallowed.
+        """
         try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self._path.with_suffix('.json.tmp')
-            tmp.write_text(json.dumps(state), encoding='utf-8')
-            os.replace(str(tmp), str(self._path))
+            safe_io.atomic_write_text(
+                self._path,
+                json.dumps(state),
+                encoding='utf-8',
+                mkdir=True,
+            )
         except OSError as exc:
             logger.warning('merge_queue_store: failed to save journal: %s', exc)
 

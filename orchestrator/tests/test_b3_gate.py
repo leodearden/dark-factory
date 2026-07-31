@@ -17,6 +17,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
+
 # ---------------------------------------------------------------------------
 # Shared helpers (adapted from test_dry_run_unblock.py)
 # ---------------------------------------------------------------------------
