@@ -201,12 +201,25 @@ class Judge:
                 self._halted_projects.add(pid)
                 if row['cooldown_until'] is not None:
                     self._halt_cooldown_until[pid] = row['cooldown_until']
+                # Restore WHY and SINCE WHEN too (task 3050): the row already
+                # carries both, and without them the operator read surface
+                # would report a halt with no reason after every restart.
+                # A stored empty reason means "unknown" — keep it None rather
+                # than dressing '' up as an answer.
+                if row['halted_at'] is not None:
+                    self._halted_at[pid] = row['halted_at']
+                if row['reason']:
+                    self._halt_reason[pid] = row['reason']
             if (row['unhalt_grace_remaining'] or 0) > 0:
                 self._unhalt_grace_remaining[pid] = row['unhalt_grace_remaining']
         if self._halted_projects or self._unhalt_grace_remaining:
+            reasons = {
+                pid: self._halt_reason.get(pid) or 'unknown'
+                for pid in sorted(self._halted_projects)
+            }
             logger.info(
                 f'Judge: rehydrated halt state — halted={sorted(self._halted_projects)} '
-                f'grace={dict(self._unhalt_grace_remaining)}'
+                f'grace={dict(self._unhalt_grace_remaining)} reasons={reasons}'
             )
 
     async def review_run(self, run_id: str) -> JudgeVerdict | None:
