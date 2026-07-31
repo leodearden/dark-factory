@@ -397,3 +397,35 @@ def save_state(state: dict, path: str = STATE_PATH) -> None:
             except OSError:
                 pass
         logger.warning(f"save_state: failed to persist state to {path}: {exc!r}")
+
+
+# ---------------------------------------------------------------------------
+# Tick
+# ---------------------------------------------------------------------------
+
+
+def tick() -> None:
+    """Run one supervision tick — the whole body of a single oneshot firing.
+
+    §Contract, in order. A healthy probe is the overwhelmingly common case and
+    resets the streak, so the steady state costs one HTTP GET and one small
+    atomic write every 30 seconds and actuates nothing.
+    """
+    state = load_state()
+
+    if probe_health():
+        if state["streak"]:
+            log(f"{DASHBOARD_UNIT} healthy again; clearing streak {state['streak']}")
+        state["streak"] = 0
+        save_state(state)
+        return
+
+
+def main() -> int:
+    """Entry point for the oneshot unit."""
+    tick()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
