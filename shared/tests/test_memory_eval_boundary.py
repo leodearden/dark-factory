@@ -368,9 +368,27 @@ class TestDashboardShapedReader:
         serving both (INV-1/INV-5). If these ever diverge, the dashboard is
         re-implementing the limits rather than reading them.
         """
-        from_disk = {(a['metric_id'], a['item_key']) for a in self._read()['alarms']}
+        # `.get`, not `[...]`: an alarm that does not apply to one item OMITS
+        # item_key rather than nulling it, which is the same idiom the metrics
+        # artifact beside it already requires of a reader.
+        from_disk = {(a['metric_id'], a.get('item_key')) for a in self._read()['alarms']}
         from_evaluator = {(a.metric_id, a.item_key) for a in evaluate_exemplar().alarms}
         assert from_disk == from_evaluator
+
+    def test_the_published_alarms_omit_an_inapplicable_item_key(self):
+        """The absence IS the contract, so pin it rather than leave it to `.get`.
+
+        `.get` above would keep passing if every alarm carried an explicit
+        `null`, which is the shape this convention moved away from. A dashboard
+        distinguishes "this alarm names an item" from "this rule judges the
+        whole metric" by presence, so presence is what the exemplar must show.
+        """
+        alarms = {a['metric_id']: a for a in self._read()['alarms']}
+        # Whole-metric rules: proportion and count judge the metric as a whole.
+        assert 'item_key' not in alarms['canonical-in-top-5']
+        assert 'item_key' not in alarms['dangling-pointers']
+        # The tripwire alarm still names the item it fired for.
+        assert alarms['topic-canonical-present']['item_key'] == 't-worktree-lifecycle'
 
     def test_the_committed_artifact_is_exactly_what_the_writer_emits(self, tmp_path):
         # Same anti-drift guarantee the series fixtures get: regenerate, and

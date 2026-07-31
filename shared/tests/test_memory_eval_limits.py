@@ -26,6 +26,7 @@ from pydantic import ValidationError
 
 from shared.memory_eval_limits import (
     GRANDFATHER_KEY_SEPARATOR,
+    LimitsArtifact,
     LimitsConfig,
     LimitsSchemaError,
     MetricVerdict,
@@ -49,6 +50,7 @@ from shared.memory_eval_metrics import (
     MetricSeries,
     TripwireItem,
     load_metric_series,
+    serialize_metric_series,
 )
 
 _FIXTURES = Path(__file__).parent / 'fixtures' / 'memory_eval'
@@ -1726,6 +1728,132 @@ class TestLimitsArtifact:
             false_alarm_budget=2.0, runs_per_quarter=90, min_samples=10, baseline_window=3
         )
         assert derive_alpha(config.false_alarm_budget, config.runs_per_quarter, 4) == 2 / 360
+
+
+class TestNullSerializationConvention:
+    """ONE null convention across both memory-eval artifacts.
+
+    ``serialize_metric_series`` (M1) already omits a ``None``-valued optional
+    field; ``write_limits_artifact`` (M2) used to emit it as an explicit
+    ``null``. Two files under one artifact root, read by the same
+    dashboard-shaped reader, disagreeing about what "unused field" looks like —
+    a consumer would need a different idiom per file to read the same absence.
+
+    The convention that describes both exactly:
+
+        omit a ``None``-valued OPTIONAL field;
+        always emit a REQUIRED field, even when its value is null.
+
+    The second half is not an exception to the first — it is the half a bare
+    ``exclude_none=True`` cannot express. ``LimitsArtifact.alpha`` is required
+    AND nullable on purpose (see its docstring): its ABSENCE means "the
+    producer forgot the field", its ``null`` means "nothing was alarm-eligible
+    in this run". Collapsing those two is exactly the silent degradation the
+    repo's loud-over-silent norm forbids, and it also breaks the writer's own
+    round trip. That half is pinned by
+    ``TestARunWithNothingAlarmEligible::test_a_scalar_only_run_round_trips_through_the_artifact_with_a_null_alpha``
+    — which asserts the written ``alpha`` key is present-and-null AND that
+    ``load_limits_artifact`` accepts the file back — so it is not restated here.
+    """
+
+    def _written(self, tmp_path) -> dict:
+        result = evaluate_series(_series(_REGRESSION_STAMP), _baseline(), _config(), None)
+        path = limits_artifact_path(tmp_path, result.eval_id)
+        write_limits_artifact(result, path)
+        return json.loads(path.read_text(encoding='utf-8'))
+
+    def _alarm(self, data: dict, metric_id: str) -> dict:
+        return next(a for a in data['alarms'] if a['metric_id'] == metric_id)
+
+    def _verdict(self, data: dict, metric_id: str) -> dict:
+        return next(v for v in data['verdicts'] if v['metric_id'] == metric_id)
+
+    def test_a_whole_metric_alarm_omits_item_key_rather_than_nulling_it(self, tmp_path):
+        """``item_key`` scopes an alarm to ONE item; a whole-metric rule has no item.
+
+        Proportion and count rules judge the metric as a whole, so the field is
+        not "null for this alarm" — it does not apply to this alarm at all.
+        """
+        data = self._written(tmp_path)
+        for metric_id in ('canonical-in-top-5', 'dangling-pointers'):
+            alarm = self._alarm(data, metric_id)
+            assert 'item_key' not in alarm
+            # Positively: the fields that DO apply are still there, so this
+            # cannot pass by emitting an empty record.
+            assert alarm['metric_id'] == metric_id
+            assert alarm['p_value'] is not None
+            assert alarm['direction']
+
+    def test_a_tripwire_alarm_keeps_item_key_and_omits_what_does_not_apply(self, tmp_path):
+        """The mirror image, so the rule is "absent means N/A", not "always drop it"."""
+        alarm = self._alarm(self._written(tmp_path), 'topic-canonical-present')
+        assert alarm['item_key'] == 't-worktree-lifecycle'
+        # A tripwire is a structural predicate, not a statistical test.
+        assert 'p_value' not in alarm
+        assert 'alpha' not in alarm
+        assert 'direction' not in alarm
+
+    def test_a_scalar_verdict_omits_the_statistical_fields(self, tmp_path):
+        """Scalars are reported, never alarmed — so they carry no test result."""
+        verdict = self._verdict(self._written(tmp_path), 'search-latency-p50-ms')
+        assert 'p_value' not in verdict
+        assert 'direction' not in verdict
+        assert 'baseline' not in verdict
+        assert 'alpha' not in verdict
+        assert verdict['status'] == 'ok'
+        assert verdict['value'] is not None
+
+    def _all_scalar(self, tmp_path) -> dict:
+        """An artifact whose one required-nullable field really is null.
+
+        Without this the rule below is only half-tested: the alarming exemplar
+        has a value for ``alpha``, so "required fields survive" holds there even
+        under a naive ``exclude_none=True``.
+        """
+        series = MetricSeries(
+            schema_version=1,
+            eval_id='e1-scalar-only',
+            run_stamp='20260801T000000Z',
+            corpus=Corpus(project_id='dark_factory'),
+            metrics=[Metric(metric_id='mean-latency-ms', kind='scalar', value=42.5, n=30)],
+        )
+        result = evaluate_series(series, [], _config(), None)
+        path = limits_artifact_path(tmp_path, result.eval_id)
+        write_limits_artifact(result, path)
+        return json.loads(path.read_text(encoding='utf-8'))
+
+    @pytest.mark.parametrize('which', ['alarming', 'all_scalar'])
+    def test_the_convention_holds_field_by_field_not_just_for_the_fields_named_above(
+        self, tmp_path, which
+    ):
+        """State the RULE, so a field added later is covered without anyone remembering.
+
+        Derived from the model rather than a hand-listed key set: every REQUIRED
+        field is present whatever its value, and no key is present carrying a
+        literal ``null`` unless it is required. Run over BOTH an artifact with a
+        derived alpha and one where alpha is legitimately null, because it is
+        only the second that can catch a required field being dropped.
+        """
+        data = self._written(tmp_path) if which == 'alarming' else self._all_scalar(tmp_path)
+        required = {name for name, f in LimitsArtifact.model_fields.items() if f.is_required()}
+        assert required <= set(data)
+        nulled = {k for k, v in data.items() if v is None}
+        assert nulled <= required
+
+    def test_both_artifacts_under_one_root_agree_about_absence(self, tmp_path):
+        """The point of the whole item: one idiom reads an unused field in either file.
+
+        A consumer that must use ``.get`` for the metrics artifact and ``[...]``
+        for the limits artifact is reading two conventions, and the split is
+        invisible until it KeyErrors on the one it guessed wrong.
+        """
+        series = _series(_REGRESSION_STAMP)
+        metrics_payload = json.loads(serialize_metric_series(series))
+        scalar = next(m for m in metrics_payload['metrics'] if m['kind'] == 'scalar')
+        assert 'denominator' not in scalar
+
+        limits_payload = self._written(tmp_path)
+        assert 'item_key' not in self._alarm(limits_payload, 'canonical-in-top-5')
 
 
 class TestARunWithNothingAlarmEligible:
