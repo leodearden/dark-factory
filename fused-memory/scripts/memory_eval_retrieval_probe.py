@@ -53,6 +53,21 @@ re-consolidation), with ``last_known_id`` as a disclosed fallback. The
 registry is a committed fixture derived entirely from committed offline
 sources, so it works today — before the ``metadata.topic`` vocabulary of
 3195/3201 lands — and strictly widens when that vocabulary does.
+
+**When leaf γ or δ lands, split this file.** Five separable concerns live
+here: the registry data contract (models + loader), offline derivation, the
+pure metric math, the report renderer, and the CLI runner. Only the last
+belongs in ``scripts/``, and the cost is already visible — the tests reach
+this module through ``importlib.util.spec_from_file_location`` because it is
+not importable, and γ/δ will want the same registry and report vocabulary. At
+that point extract the registry model/loader and the pure metric functions
+into ``fused_memory/eval/retrieval_probe.py`` (importable, type-checked, no
+path loading) and leave this file as the thin argparse/``_run`` band, which is
+what D8's runner pattern and D2's precedent (artifact shapes live in
+``shared.memory_eval_metrics``, not in a runner) both point at. Deliberately
+not done now: one leaf's runner is not yet a shared contract, and a second
+home for the vocabulary before there is a second consumer is the drift this
+note exists to prevent.
 """
 from __future__ import annotations
 
@@ -2363,7 +2378,10 @@ def probe_report_sections(
         for source, count in sorted(composition.items()):
             lines.append(f'  {source}: {count}')
         if registry.disclosures:
-            lines.append('  what derivation and hand-selection left out:')
+            # "Left out" alone would mislabel the emitted-per-source counters
+            # that share this block; they are what the narrowings are a
+            # fraction OF, and both halves are needed to read either.
+            lines.append('  derivation ledger — what it produced, and what it left out:')
             for key, value in sorted(registry.disclosures.items()):
                 lines.append(f'    {key}: {value}')
         emit(SECTION_REGISTRY_COMPOSITION, lines)
