@@ -396,3 +396,37 @@ async def test_auto_page_limit_fits_documented_safe_envelope(paging_server):
         f'over the {62_000}-char documented-safe envelope. Lower '
         f'_STATUSES_AUTO_PAGE_LIMIT (currently {LIMIT}) — do NOT relax this bound.'
     )
+
+
+@pytest.mark.asyncio
+async def test_get_statuses_non_dict_result_skips_pagination(
+    paging_server, paging_task_interceptor
+):
+    """A non-dict interceptor result passes through untouched, no slicing error.
+
+    Mirrors the documented rationale of get_tasks' ``isinstance(all_tasks, list)``
+    guard: a non-standard backend returning the wrong shape must surface as the
+    real failure at the caller, not be masked by a generic TypeError raised from
+    inside the pagination code.
+    """
+    bogus = ['not', 'a', 'mapping']
+    paging_task_interceptor.get_statuses = AsyncMock(return_value=bogus)
+
+    # (a) No page_size — the pass-through path.
+    result = await paging_server._tool_manager.call_tool(
+        'get_statuses',
+        {'project_root': '/project'},
+    )
+    assert result == {'statuses': bogus}, f'Non-dict result must pass through, got: {result}'
+    assert 'pagination' not in result
+
+    # (b) With page_size — pagination is SKIPPED rather than attempting to sort
+    # or slice a non-mapping.
+    result2 = await paging_server._tool_manager.call_tool(
+        'get_statuses',
+        {'project_root': '/project', 'page_size': 2},
+    )
+    assert result2 == {'statuses': bogus}, (
+        f'Non-dict result must pass through even with page_size, got: {result2}'
+    )
+    assert 'pagination' not in result2
