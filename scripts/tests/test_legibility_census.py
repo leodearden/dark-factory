@@ -15,6 +15,7 @@ state.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 from datetime import datetime, timezone
@@ -2274,6 +2275,83 @@ def test_main_without_force_no_fire_noops_with_exit_zero(tmp_path, monkeypatch, 
     out = capsys.readouterr().out
     assert "no-fire" in out.lower(), "an explanatory stdout line naming the no-fire decision"
     assert "max-interval: not yet due" in out
+
+
+# ---------------------------------------------------------------------------
+# step-13: main() must configure logging -- census has the SAME omission as
+# nightly. Nothing under scripts/legibility/ called logging.basicConfig, so
+# root sat at its WARNING default and every INFO line this module emits --
+# notably "census: no codebook at ... yet, starting from an empty v2
+# document" -- was discarded before it reached the journal. Mirrors
+# test_legibility_nightly.py's step-11 trio.
+#
+# The _isolated_root_logging helper below is DUPLICATED verbatim from that
+# file. Its proper home is scripts/tests/conftest.py -- which task 3270 holds
+# no lock on, so the move is deferred to the next review cycle rather than
+# smuggled in. Not a norm, a known wart: keep the two copies in step.
+# ---------------------------------------------------------------------------
+
+@contextlib.contextmanager
+def _isolated_root_logging():
+    """Yield the ROOT logger with its handlers emptied, restoring it after.
+
+    ``config.configure_logging`` goes through ``logging.basicConfig``, which
+    is a NO-OP when root already has handlers -- the very property that makes
+    it safe under pytest -- so its effect is only observable with root
+    cleared first.
+
+    Restoring the level AND the exact handler list is load-bearing here: this
+    file runs ~10 ``caplog.at_level(logging.WARNING)`` blocks (lines 1318,
+    1520, 1650, 1817, 1938, 2018, ...) that leaked root state would silently
+    perturb.
+
+    Keep in step with the copy in test_legibility_nightly.py until one of
+    them moves to conftest.py -- see the section comment above.
+    """
+    root = logging.getLogger()
+    saved_level = root.level
+    saved_handlers = root.handlers[:]
+    root.handlers[:] = []
+    root.setLevel(logging.WARNING)  # the un-configured default this fix exists to beat
+    try:
+        yield root
+    finally:
+        root.handlers[:] = saved_handlers
+        root.setLevel(saved_level)
+
+
+def test_main_configures_logging_so_info_lines_reach_the_journal(tmp_path, monkeypatch):
+    """Driven down the cheap NO-FIRE path -- no LLM, no subprocess, exit 0 --
+    because logging must be configured before the gate, not only on runs that
+    fire."""
+    # The DEFAULT-level case, so the ambient env has to be cleared: this same
+    # change teaches the CLIs to honour LEGIBILITY_LOG_LEVEL, and a developer
+    # debugging the trickle (or a host whose unit env is sourced) exporting
+    # LEGIBILITY_LOG_LEVEL=WARNING would otherwise turn a working fix red.
+    monkeypatch.delenv("LEGIBILITY_LOG_LEVEL", raising=False)
+    _write_legibility_yaml(_default_config_path(tmp_path))
+    fake_run_census = _make_fake_main_run_census()
+    monkeypatch.setattr(mod, "run_census", fake_run_census)
+
+    def fake_decide(project_root, *, now=None, status_fetcher=None):
+        return census_trigger.Decision(fire=False, reasons=["max-interval: not yet due"])
+
+    monkeypatch.setattr(census_trigger, "decide_for_project", fake_decide)
+
+    with _isolated_root_logging() as root:
+        exit_code = mod.main(["--project-root", str(tmp_path)])
+        # Sample inside the block, assert outside, so a failing assertion is
+        # reported by pytest with root logging already restored.
+        effective_level = root.getEffectiveLevel()
+        handler_count = len(root.handlers)
+
+    assert exit_code == 0
+    assert fake_run_census.calls == [], "the NO-FIRE path must stay cheap -- no run_census"
+    assert effective_level <= logging.INFO, (
+        "census.main() must lower root to INFO -- otherwise the empty-codebook line "
+        "and every other census INFO line is dropped before it reaches the journal"
+    )
+    assert handler_count >= 1, "root needs a handler, or INFO records go nowhere"
 
 
 def test_main_without_force_fire_decision_runs_pipeline(tmp_path, monkeypatch):

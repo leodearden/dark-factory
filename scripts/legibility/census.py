@@ -1748,7 +1748,19 @@ def main(argv: list[str] | None = None) -> int:
     (headroom-preflight) outcome still exits 0, mirroring
     ``census_trigger``'s own CLI contract of reserving a non-zero exit for
     an operator-facing failure, not an expected defer/no-fire outcome.
+
+    Configures logging FIRST, before arg parsing and so before the trigger
+    gate, which is what gets this module's INFO lines (the empty-codebook
+    line, the per-stage progress lines) into the journal on EVERY
+    invocation -- including one that no-ops at the gate. Without it root
+    sits at its WARNING default and they are all silently dropped. Shares
+    ``config.configure_logging`` with ``nightly.main()`` rather than
+    inlining a second ``basicConfig``, so the env var
+    (``LEGIBILITY_LOG_LEVEL``), the default level and the format cannot
+    drift between the two entrypoints (INV-5 no-lockstep-duplication).
     """
+    config.configure_logging()
+
     parser = argparse.ArgumentParser(
         prog="census",
         description="Legibility periodic-census runner "

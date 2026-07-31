@@ -12,6 +12,7 @@ the commit path is genuinely exercised without risking main.
 """
 from __future__ import annotations
 
+import contextlib
 import gzip
 import json
 import logging
@@ -21,7 +22,7 @@ from pathlib import Path
 
 import pytest
 
-from legibility import census_trigger, codebook, digest, nightly
+from legibility import census_trigger, codebook, config as config_mod, digest, nightly
 from legibility.config import load_config
 
 
@@ -31,13 +32,23 @@ from legibility.config import load_config
 
 def _write_config(
     root: Path, *, project_id: str, escalation_port: int = 8199, cwd_prefixes=None,
-    agent_transcript_roots=None,
+    agent_transcript_roots=None, max_daily_digest_bytes: int | None = None,
 ) -> Path:
     """Write a minimal valid docs/legibility/legibility.yaml under *root*.
 
     When *agent_transcript_roots* is given, an ``agent_transcript_roots:``
     block is appended so the loaded cfg opts into archive-root enumeration
     (resolved against *root* by ``inventory.resolve_agent_transcript_roots``).
+
+    When *max_daily_digest_bytes* is given, a ``budgets:`` block is appended
+    so the loaded cfg carries a NON-stock daily byte budget. Omitted by
+    default, so every existing caller keeps the stock 300_000 (the
+    ``budgets`` block's own pydantic default) and its assertions stay
+    valid. Squeezing this is how the totally-budget-suppressed night of
+    2026-07-16..29 is replayed as sampler STATE (``selected == []`` with
+    ``budget_skipped > 0``) through the supported config seam, rather than
+    by resurrecting task 3268's already-fixed raw-transcript-bytes cost
+    basis.
     """
     cwd_prefixes = cwd_prefixes if cwd_prefixes is not None else [str(root / "work")]
     legibility_dir = root / "docs" / "legibility"
@@ -53,6 +64,9 @@ def _write_config(
     if agent_transcript_roots is not None:
         lines.append("agent_transcript_roots:")
         lines += [f"  - {r}" for r in agent_transcript_roots]
+    if max_daily_digest_bytes is not None:
+        lines.append("budgets:")
+        lines.append(f"  max_daily_digest_bytes: {max_daily_digest_bytes}")
     config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return config_path
 
@@ -103,6 +117,62 @@ def _write_transcript(
                 'content': [
                     {'type': 'tool_result', 'tool_use_id': 'tool-1', 'is_error': True,
                      'content': 'No such file or directory'},
+                ],
+            },
+        },
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('\n'.join(json.dumps(line) for line in lines) + '\n', encoding='utf-8')
+
+
+def _write_quiet_transcript(
+    path: Path, *, cwd: str, timestamp: str, session_id: str = 'session-quiet',
+) -> None:
+    """A sibling of :func:`_write_transcript` that carries NO confusion signal.
+
+    Same JSONL shape — a user turn, an assistant ``tool_use``, a user
+    ``tool_result`` — but the exchange SUCCEEDS: no ``is_error``, no
+    ``sampling._NOT_FOUND_PATTERNS`` text ('no such file' / 'not found' /
+    'does not exist' / 'command not found'), no
+    ``_SELF_CORRECT_PATTERNS`` in the assistant's text blocks, no
+    ``_DF_GUARD_TEXT_PATTERNS`` / ``_DF_GUARD_TOOL_NAMES``, and no
+    ``_INTERRUPT_PATTERNS``. So the record scores 0 and the sampler drops it
+    as zero-signal BEFORE the budget phase — a genuinely quiet night, never
+    a budget-skipped candidate. The score-0 claim is asserted (not assumed)
+    in ``test_run_nightly_quiet_night_is_not_reported_as_suppressed``.
+    """
+    lines = [
+        {
+            'type': 'user',
+            'cwd': cwd,
+            'timestamp': timestamp,
+            'sessionId': session_id,
+            'message': {'role': 'user', 'content': 'please add a docstring to the helper'},
+        },
+        {
+            'type': 'assistant',
+            'cwd': cwd,
+            'timestamp': timestamp,
+            'sessionId': session_id,
+            'message': {
+                'role': 'assistant',
+                'content': [
+                    {'type': 'text', 'text': 'Adding the docstring now.'},
+                    {'type': 'tool_use', 'id': 'tool-1', 'name': 'Read',
+                     'input': {'file_path': '/tmp/helper.py'}},
+                ],
+            },
+        },
+        {
+            'type': 'user',
+            'cwd': cwd,
+            'timestamp': timestamp,
+            'sessionId': session_id,
+            'message': {
+                'role': 'user',
+                'content': [
+                    {'type': 'tool_result', 'tool_use_id': 'tool-1',
+                     'content': 'def helper():\n    return 1\n'},
                 ],
             },
         },
@@ -330,7 +400,7 @@ def test_select_digest_sessions_costs_at_the_max_bytes_build_digests_renders_wit
     # COST side: select_digest_sessions -> digest_byte_cost_fn, which
     # resolves digest.build_digest at call time.
     monkeypatch.setattr(nightly.sampling.digest, 'build_digest', recording_build)
-    selected = nightly.select_digest_sessions(cfg, projects_root, date(2026, 7, 13))
+    sample = nightly.select_digest_sessions(cfg, projects_root, date(2026, 7, 13))
     assert caps == [nightly.DEFAULT_MAX_DIGEST_BYTES], (
         'the sampler must charge at the nightly cap, not at build_digest\'s own default'
     )
@@ -338,7 +408,7 @@ def test_select_digest_sessions_costs_at_the_max_bytes_build_digests_renders_wit
     # RENDER side: build_digests, called by run_nightly with no max_bytes
     # override, must reach the renderer with that SAME cap.
     caps.clear()
-    nightly.build_digests(selected, build=recording_build)
+    nightly.build_digests(sample.selected, build=recording_build)
     assert caps == [nightly.DEFAULT_MAX_DIGEST_BYTES]
 
 
@@ -350,8 +420,8 @@ def test_select_digest_sessions_selects_multi_mb_session_under_stock_budget(tmp_
     15,123-byte digest, so it costs ~5% of the 300_000-byte budget rather
     than 293% of it. Charged at raw transcript size the single reserve
     group here is skipped whole, the greedy leftover fill has nothing to
-    add, and select_digest_sessions returns [] — which is exactly what the
-    live nightly run did every night from 2026-07-16 to 2026-07-29.
+    add, and select_digest_sessions selects nothing — which is exactly what
+    the live nightly run did every night from 2026-07-16 to 2026-07-29.
     """
     work_cwd = str(tmp_path / 'work')
     cfg = load_config(_write_config(tmp_path, project_id='proj_a', cwd_prefixes=[work_cwd]))
@@ -365,9 +435,36 @@ def test_select_digest_sessions_selects_multi_mb_session_under_stock_budget(tmp_
     raw_size = session_path.stat().st_size
     assert raw_size > 300000, f'fixture must exceed the whole budget; got {raw_size}'
 
-    selected = nightly.select_digest_sessions(cfg, projects_root, date(2026, 7, 13))
+    sample = nightly.select_digest_sessions(cfg, projects_root, date(2026, 7, 13))
 
-    assert [r.path for r in selected] == [session_path]
+    assert [r.path for r in sample.selected] == [session_path]
+
+
+def test_select_digest_sessions_returns_the_whole_sample_result(tmp_path):
+    """The accounting must reach the caller, not be dropped on the floor.
+
+    Task 2573 computed ``budget_skipped`` correctly and task 2581's consumer
+    (this function) discarded it by returning only ``.selected`` — so for 14
+    nights (2026-07-16..29) a run that found real signal and threw ALL of it
+    away on the byte budget reported exactly what a genuine no-change night
+    reports. The whole ``SampleResult`` is the return value now.
+    """
+    work_cwd = str(tmp_path / 'work')
+    cfg = load_config(_write_config(tmp_path, project_id='proj_a', cwd_prefixes=[work_cwd]))
+    projects_root = tmp_path / 'projects'
+    session_path = projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl'
+    _write_transcript(session_path, cwd=work_cwd, timestamp='2026-07-13T10:00:00Z')
+
+    result = nightly.select_digest_sessions(cfg, projects_root, date(2026, 7, 13))
+
+    assert isinstance(result, nightly.sampling.SampleResult)
+    # The four accounting fields the operator line and the suppression
+    # predicate need, all reachable off the return value.
+    assert result.total_records == 1
+    assert result.zero_signal_dropped == 0
+    assert result.budget_skipped == 0
+    assert result.bytes_used > 0
+    assert [r.path for r in result.selected] == [session_path]
 
 
 # ---------------------------------------------------------------------------
@@ -420,13 +517,13 @@ def test_build_digests_reuses_the_costing_render(tmp_path):
     digest.build_digest = counting_build
     try:
         rendered: dict = {}
-        selected = nightly.select_digest_sessions(
+        sample = nightly.select_digest_sessions(
             cfg, projects_root, date(2026, 7, 13), rendered=rendered,
         )
         assert renders == [session_path], 'costing must render exactly once'
 
         digests, extractor_failures = nightly.build_digests(
-            selected, build=counting_build, rendered=rendered,
+            sample.selected, build=counting_build, rendered=rendered,
         )
     finally:
         digest.build_digest = real_build
@@ -436,7 +533,7 @@ def test_build_digests_reuses_the_costing_render(tmp_path):
     assert extractor_failures == []
     assert digests == [
         digest.build_digest(
-            session_path, agent_class_override=selected[0].stratum,
+            session_path, agent_class_override=sample.selected[0].stratum,
             max_bytes=nightly.DEFAULT_MAX_DIGEST_BYTES,
         )
     ], 'the cached digest must be byte-identical to a fresh render'
@@ -451,8 +548,8 @@ def test_build_digests_re_renders_when_no_cache_is_shared(tmp_path):
     session_path = projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl'
     _write_transcript(session_path, cwd=work_cwd, timestamp='2026-07-13T10:00:00Z')
 
-    selected = nightly.select_digest_sessions(cfg, projects_root, date(2026, 7, 13))
-    digests, extractor_failures = nightly.build_digests(selected)
+    sample = nightly.select_digest_sessions(cfg, projects_root, date(2026, 7, 13))
+    digests, extractor_failures = nightly.build_digests(sample.selected)
 
     assert extractor_failures == []
     assert len(digests) == 1
@@ -1001,6 +1098,257 @@ def test_run_nightly_happy_path_end_to_end(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# task 3270: run_nightly emits the sampler accounting on EVERY run
+# ---------------------------------------------------------------------------
+
+_SUMMARY_KEYS = ('enumerated=', 'zero_signal_dropped=', 'below_sampling_cut=',
+                 'budget_skipped=', 'selected=', 'bytes_used=')
+
+
+def _summary_lines(caplog):
+    """Every captured record carrying the sampler summary line's keys."""
+    return [
+        r.getMessage() for r in caplog.records
+        if all(key in r.getMessage() for key in _SUMMARY_KEYS)
+    ]
+
+
+def test_run_nightly_logs_the_sampler_summary_on_a_healthy_night(tmp_path, caplog):
+    """The operator's grep anchor is emitted on EVERY run, healthy included.
+
+    Without it, the only trace a night leaves in the journal is whether it
+    committed — so a night that sampled real signal and a night that sampled
+    nothing at all are the same observation.
+    """
+    work_cwd = str(tmp_path / 'work')
+    repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+    projects_root = tmp_path / 'projects'
+    _write_transcript(
+        projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl',
+        cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id='session-1',
+    )
+
+    with caplog.at_level('INFO', logger='legibility.nightly'):
+        result = nightly.run_nightly(
+            config_path=config_path,
+            projects_root=projects_root,
+            target_date=date(2026, 7, 13),
+            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc),
+            invoke=_fake_invoke_known_cause,
+            status_fetcher=None,
+            poster=lambda url, envelope: None,
+        )
+
+    assert result.exit_code == 0
+    lines = _summary_lines(caplog)
+    assert len(lines) == 1, f'expected exactly one summary line, got {lines}'
+    line = lines[0]
+
+    # The REAL numbers, not a zeros template: one session enumerated, one
+    # affordable and selected.
+    assert 'enumerated=1' in line
+    assert 'selected=1' in line
+    assert 'budget_skipped=0' in line
+    assert f'/{load_config(config_path).budgets.max_daily_digest_bytes}' in line
+
+    # One journal interleaves every project's timer, so the line has to say
+    # which project and which night it is describing.
+    assert 'testproj' in line
+    assert '2026-07-13' in line
+
+
+def test_run_nightly_logs_the_sampler_summary_when_there_are_no_sessions(tmp_path, caplog):
+    """A night with nothing to sample reports zeros — not silence."""
+    work_cwd = str(tmp_path / 'work')
+    repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+    projects_root = tmp_path / 'projects'  # never populated
+
+    with caplog.at_level('INFO', logger='legibility.nightly'):
+        result = nightly.run_nightly(
+            config_path=config_path,
+            projects_root=projects_root,
+            target_date=date(2026, 7, 13),
+            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc),
+            invoke=_fake_invoke_known_cause,
+            status_fetcher=None,
+            poster=lambda url, envelope: None,
+        )
+
+    assert result.exit_code == 0
+    lines = _summary_lines(caplog)
+    assert len(lines) == 1, f'expected exactly one summary line, got {lines}'
+    line = lines[0]
+    assert 'enumerated=0' in line
+    assert 'selected=0' in line
+    assert 'budget_skipped=0' in line
+    assert 'testproj' in line
+    assert '2026-07-13' in line
+
+
+def _nightly_warnings(caplog):
+    """Records at >= WARNING on this module's OWN logger.
+
+    Filtered by logger name deliberately: ``legibility.census_trigger`` emits
+    its own fail-safe WARNING on a fixture with no census baseline, which says
+    nothing about whether the trickle reported suppression.
+    """
+    return [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING and r.name == 'legibility.nightly'
+    ]
+
+
+def test_run_nightly_reports_a_totally_budget_suppressed_night(tmp_path, caplog):
+    """THE ACCEPTANCE REGRESSION (task 3270).
+
+    Replays the sampler STATE that every night from 2026-07-16 to 2026-07-29
+    actually produced -- real signal enumerated, then every candidate
+    discarded on the byte budget (``selected == []`` with
+    ``budget_skipped > 0``) -- and asserts it is now reported at every layer
+    an operator can observe: a structured flag on the result, a WARNING in
+    the journal, and a durable escalation.
+
+    Achievability basis, not a guessed threshold: ``_write_transcript``'s
+    digest measures 446 bytes (recorded at the top of
+    ``test_select_digest_sessions_charges_real_digest_bytes``), so a 10-byte
+    budget cannot fit the single reserve group and skips it whole. The
+    squeeze goes through the supported ``budgets`` config seam rather than
+    resurrecting task 3268's already-fixed raw-transcript-bytes cost basis,
+    which is no longer reachable from main.
+    """
+    work_cwd = str(tmp_path / 'work')
+    repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+    # Squeeze the daily budget below one digest. Overwrites _init_e2e_repo's
+    # own config in place, so run_nightly loads the squeezed one.
+    _write_config(
+        repo, project_id='testproj', escalation_port=8199, cwd_prefixes=[work_cwd],
+        max_daily_digest_bytes=10,
+    )
+    assert load_config(config_path).budgets.max_daily_digest_bytes == 10
+
+    projects_root = tmp_path / 'projects'
+    _write_transcript(
+        projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl',
+        cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id='session-1',
+    )
+
+    codebook_path = repo / 'docs' / 'legibility' / 'confusion-codebook.yaml'
+    before_bytes = codebook_path.read_bytes()
+    before_log = subprocess.run(
+        ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+
+    escalation_calls = []
+    with caplog.at_level('INFO', logger='legibility.nightly'):
+        result = nightly.run_nightly(
+            config_path=config_path,
+            projects_root=projects_root,
+            target_date=date(2026, 7, 13),
+            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc),
+            invoke=_fake_invoke_known_cause,
+            status_fetcher=None,
+            poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+        )
+
+    # Exit code stays 0 ON PURPOSE: a non-zero exit would flip
+    # legibility-trickle@testproj.service to failed and make
+    # check_trickle_liveness.sh scream every night about a timer that is in
+    # fact running perfectly.
+    assert result.exit_code == 0
+    assert result.budget_suppressed is True
+    assert result.escalated is True
+
+    # Structured facts, not log-scraping: ONE durable escalation, on the
+    # existing decision-8 envelope, unchanged.
+    assert len(escalation_calls) == 1
+    _url, envelope = escalation_calls[0]
+    arguments = envelope['params']['arguments']
+    assert arguments['category'] == 'infra_issue'
+    assert arguments['severity'] == 'info'
+    summary = arguments['summary'].lower()
+    assert 'budget' in summary
+    assert 'suppress' in summary
+    detail = arguments['detail']
+    assert 'budget_skipped=1' in detail
+    assert 'selected=0' in detail
+    assert '/10' in detail, 'the detail must name the byte budget that did the cutting'
+
+    # And loud in the journal, on this module's own logger.
+    loud = _nightly_warnings(caplog)
+    assert len(loud) >= 1
+    assert any(
+        'budget' in r.getMessage().lower() and 'budget_skipped=1' in r.getMessage()
+        for r in loud
+    ), f'expected a WARNING naming the suppression counts; got {[r.getMessage() for r in loud]}'
+
+    # Nothing was written: no digests were affordable, so no coding, no dump,
+    # no commit.
+    assert result.commit_made is False
+    assert codebook_path.read_bytes() == before_bytes
+    after_log = subprocess.run(
+        ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+    assert after_log == before_log
+
+
+def test_run_nightly_quiet_night_is_not_reported_as_suppressed(tmp_path, caplog):
+    """The CONTRAST case -- and the actual property under test.
+
+    A genuinely quiet night (sessions existed, none carried any confusion
+    signal, so none ever reached the budget phase) must stay quiet: no
+    suppression flag, no escalation, nothing loud in the journal. Paired with
+    the test above, this is what proves the two nights are now
+    DISTINGUISHABLE rather than merely proving that some string was logged.
+    """
+    work_cwd = str(tmp_path / 'work')
+    repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+    cfg = load_config(config_path)
+    assert cfg.budgets.max_daily_digest_bytes == 300000, 'contrast case must use the STOCK budget'
+
+    projects_root = tmp_path / 'projects'
+    for session_id in ('session-quiet-a', 'session-quiet-b'):
+        _write_quiet_transcript(
+            projects_root / _encode_cwd(work_cwd) / f'{session_id}.jsonl',
+            cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id=session_id,
+        )
+
+    # The fixture's zero-signal claim, ASSERTED rather than assumed: these
+    # records are dropped before the budget phase, so they can never be
+    # budget-skipped candidates.
+    scored = nightly.select_scored_records(cfg, projects_root, date(2026, 7, 13))
+    assert len(scored) == 2
+    assert [r.score for r in scored] == [0, 0]
+
+    escalation_calls = []
+    with caplog.at_level('INFO', logger='legibility.nightly'):
+        result = nightly.run_nightly(
+            config_path=config_path,
+            projects_root=projects_root,
+            target_date=date(2026, 7, 13),
+            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc),
+            invoke=_fake_invoke_known_cause,
+            status_fetcher=None,
+            poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+        )
+
+    assert result.exit_code == 0
+    assert result.budget_suppressed is False
+    assert result.escalated is False
+    assert escalation_calls == []
+    assert _nightly_warnings(caplog) == [], 'a quiet night must emit nothing loud'
+
+    # ...while the always-on INFO line still reports exactly WHY the night
+    # was empty: nothing had signal, and the budget cut nothing.
+    lines = _summary_lines(caplog)
+    assert len(lines) == 1
+    line = lines[0]
+    assert 'enumerated=2' in line
+    assert 'zero_signal_dropped=2' in line
+    assert 'budget_skipped=0' in line
+    assert 'selected=0' in line
+
+
+# ---------------------------------------------------------------------------
 # step-15/16: run_nightly -- fail-loud on coder storm (decision 8, §8.6)
 # ---------------------------------------------------------------------------
 
@@ -1345,3 +1693,175 @@ def test_main_run_propagates_fail_loud_exit_code(monkeypatch):
     exit_code = nightly.main(['run', '--project-id', 'proj_a'])
 
     assert exit_code == 1
+
+
+# ---------------------------------------------------------------------------
+# step-11: main() must configure logging -- gap (b) of the trickle-legibility
+# incident. Every INFO line in this module (the always-on sampler summary from
+# step-8, plus the pre-existing no-change-night and empty-codebook lines) is
+# discarded before it reaches the journal unless SOMETHING calls
+# logging.basicConfig: nothing under scripts/legibility/ did, so root stayed at
+# its WARNING default under the systemd ExecStart and all 14 silent nights of
+# 2026-07-16..29 wrote nothing an operator could read.
+# ---------------------------------------------------------------------------
+
+@contextlib.contextmanager
+def _isolated_root_logging():
+    """Yield the ROOT logger with its handlers emptied, restoring it after.
+
+    ``configure_logging`` deliberately goes through ``logging.basicConfig``,
+    which is a NO-OP when root already has handlers -- that no-op is exactly
+    what keeps it safe to call under pytest and from a library importer. So
+    its effect is only observable with root cleared first, which is what this
+    helper does.
+
+    Restoring both the level and the exact handler list matters: this file and
+    test_legibility_census.py both run many ``caplog.at_level(...)`` blocks,
+    and leaked root state would silently perturb them.
+
+    DUPLICATED verbatim in test_legibility_census.py, which is a known wart,
+    not a norm: its proper home is scripts/tests/conftest.py (today only
+    sys.path plumbing, no fixtures yet), which task 3270 holds no lock on --
+    so the move is deferred to the next review cycle rather than smuggled in.
+    Until then, a fix here (e.g. also restoring ``logging.root.filters``, or
+    closing handlers) has to be applied in BOTH copies.
+    """
+    root = logging.getLogger()
+    saved_level = root.level
+    saved_handlers = root.handlers[:]
+    root.handlers[:] = []
+    root.setLevel(logging.WARNING)  # the un-configured default this fix exists to beat
+    try:
+        yield root
+    finally:
+        root.handlers[:] = saved_handlers
+        root.setLevel(saved_level)
+
+
+def _main_run_with_stubbed_run_nightly(monkeypatch, tmp_path):
+    """Drive ``nightly.main(['run', ...])`` over a stub, returning
+    ``(exit_code, effective_root_level, root_handler_count)`` sampled while
+    still inside the isolated-root block."""
+    def _fake_run_nightly(**kwargs):
+        return nightly.NightlyResult(exit_code=0)
+
+    monkeypatch.setattr(nightly, 'run_nightly', _fake_run_nightly)
+
+    with _isolated_root_logging() as root:
+        exit_code = nightly.main(['run', '--config', str(tmp_path / 'legibility.yaml')])
+        # Sample inside the block; assert outside, so a failing assertion is
+        # reported by pytest with root logging already restored.
+        return exit_code, root.getEffectiveLevel(), len(root.handlers)
+
+
+def test_main_configures_logging_so_info_lines_reach_the_journal(monkeypatch, tmp_path):
+    # The DEFAULT-level case, so the ambient env has to be cleared: this same
+    # change teaches the CLIs to honour LEGIBILITY_LOG_LEVEL, and a developer
+    # debugging the trickle (or a host whose unit env is sourced) exporting
+    # LEGIBILITY_LOG_LEVEL=WARNING would otherwise turn a working fix red.
+    # Deliberately NOT hoisted into _main_run_with_stubbed_run_nightly: the
+    # sibling tests monkeypatch.setenv BEFORE calling it, so a delenv in there
+    # would clobber exactly the value they are asserting on.
+    monkeypatch.delenv('LEGIBILITY_LOG_LEVEL', raising=False)
+
+    exit_code, effective_level, handler_count = _main_run_with_stubbed_run_nightly(
+        monkeypatch, tmp_path,
+    )
+
+    assert exit_code == 0
+    assert effective_level <= logging.INFO, (
+        'main() must lower root to INFO -- otherwise the step-8 sampler summary, '
+        'the no-change-night line and the empty-codebook line are all dropped '
+        'before they reach the journal'
+    )
+    assert handler_count >= 1, 'root needs a handler, or INFO records go nowhere'
+
+
+def test_main_honours_the_legibility_log_level_env_var(monkeypatch, tmp_path):
+    monkeypatch.setenv('LEGIBILITY_LOG_LEVEL', 'WARNING')
+
+    exit_code, effective_level, handler_count = _main_run_with_stubbed_run_nightly(
+        monkeypatch, tmp_path,
+    )
+
+    assert exit_code == 0
+    assert effective_level == logging.WARNING, (
+        'an operator turning the trickle down via LEGIBILITY_LOG_LEVEL must be honoured'
+    )
+    assert handler_count >= 1
+
+
+def test_main_unparseable_log_level_degrades_to_info_without_raising(monkeypatch, tmp_path):
+    monkeypatch.setenv('LEGIBILITY_LOG_LEVEL', 'chatty')
+
+    # No pytest.raises wrapper on purpose: a bad env var must never take the
+    # nightly timer down. If configure_logging raises, this call propagates it
+    # and the test fails loudly, which is the point.
+    exit_code, effective_level, handler_count = _main_run_with_stubbed_run_nightly(
+        monkeypatch, tmp_path,
+    )
+
+    assert exit_code == 0, 'an unparseable LEGIBILITY_LOG_LEVEL must not fail the run'
+    assert effective_level <= logging.INFO, 'an unparseable level degrades to the INFO default'
+    assert handler_count >= 1
+
+
+# ---------------------------------------------------------------------------
+# configure_logging's never-raise contract, driven directly rather than
+# through main(): main() always passes the stock default_level, so the
+# caller-side half of the contract is unreachable from there.
+# ---------------------------------------------------------------------------
+
+def _configure_logging_and_sample(**kwargs):
+    """Call ``config.configure_logging(**kwargs)`` against a cleared root,
+    returning ``(effective_level, handler_count)`` sampled inside the block."""
+    with _isolated_root_logging() as root:
+        config_mod.configure_logging(**kwargs)
+        return root.getEffectiveLevel(), len(root.handlers)
+
+
+@pytest.mark.parametrize(
+    ('raw', 'expected'),
+    [
+        ('10', logging.DEBUG),
+        ('20', logging.INFO),
+        ('30', logging.WARNING),
+        (' 40 ', logging.ERROR),
+    ],
+)
+def test_configure_logging_honours_a_numeric_log_level(monkeypatch, raw, expected):
+    """A numeric LEGIBILITY_LOG_LEVEL is the OTHER spelling operators reach
+    for -- it is what logging's own API takes -- and it used to be rejected
+    as a typo, because getLevelName('10') returns the string 'Level 10'."""
+    monkeypatch.setenv('LEGIBILITY_LOG_LEVEL', raw)
+
+    effective_level, handler_count = _configure_logging_and_sample()
+
+    assert effective_level == expected
+    assert handler_count >= 1
+
+
+def test_configure_logging_never_raises_on_an_unknown_default_level(monkeypatch):
+    """The never-raise guarantee covers the CALLER's input too.
+
+    ``logging.getLevelName('CHATTY')`` returns the string 'Level CHATTY',
+    and ``basicConfig(level='Level CHATTY')`` raises ValueError -- out of
+    the helper whose stated job is to never take the timer down. A future
+    caller passing a typo'd default must degrade, not crash.
+    """
+    monkeypatch.delenv('LEGIBILITY_LOG_LEVEL', raising=False)
+
+    # No pytest.raises: a raise here propagates and fails the test loudly.
+    effective_level, handler_count = _configure_logging_and_sample(default_level='CHATTY')
+
+    assert effective_level == logging.INFO, 'an unknown default_level degrades to INFO'
+    assert handler_count >= 1
+
+
+def test_configure_logging_env_var_still_wins_over_an_unknown_default_level(monkeypatch):
+    """Degrading the default must not swallow a VALID operator override."""
+    monkeypatch.setenv('LEGIBILITY_LOG_LEVEL', 'DEBUG')
+
+    effective_level, _ = _configure_logging_and_sample(default_level='CHATTY')
+
+    assert effective_level == logging.DEBUG

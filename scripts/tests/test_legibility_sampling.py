@@ -302,6 +302,258 @@ class TestDedupeShapes:
         assert kept_clone.score == 3
 
 
+class TestSampleResultAccounting:
+    """``SampleResult`` accounts for EVERY record the sampler was handed.
+
+    Task 3270. Two facts the operator-facing summary line (and the
+    total-suppression predicate ``not selected and budget_skipped > 0``)
+    rest on:
+
+      (i) ``total_records`` is the number of records handed to the sampler
+          — one per enumerated session in both production callers, which is
+          what lets the summary label it "enumerated".
+      (ii) CANDIDATE CONSERVATION: every record that reached the budget
+           phase ends up in exactly one of ``selected`` or
+           ``budget_skipped``. That equality is what makes ``selected == []
+           and budget_skipped > 0`` provably mean "candidates existed and
+           were ALL discarded on budget" rather than "there was nothing to
+           sample" — so the predicate's premise is machine-checked here
+           instead of assumed at the call site.
+      (iii) TOTAL CONSERVATION: ``total_records`` equals the four drop
+            counts plus ``len(selected)``, with NO unaccounted remainder,
+            so the operator line balances.
+
+    The main batch is deliberately mixed so every accounting bucket is
+    non-zero: 2 zero-signal records dropped, 1 clone collapsed, 2
+    candidates selected and 2 budget-skipped, out of 7 handed in. Costs are
+    injected via ``cost_fn`` (the same convention as the sibling
+    budget-algebra classes) so the squeeze is explicit and hand-derivable
+    rather than dependent on real digest sizes.
+
+    That batch is built so every stratum's survivors ALL reach the
+    candidate stage, which is exactly why it cannot pin (iii) on its own —
+    it never exercises the ``top_fraction``/``per_stratum_min`` narrowing.
+    ``_build_narrowed_records`` is the second fixture that does, and the
+    reason ``below_sampling_cut`` exists: with it missing, 14 of 17 records
+    fell out of the accounting entirely and the summary line under-reported
+    its own denominator (reviewer_comprehensive/observability-accuracy,
+    task 3270 amendment pass).
+    """
+
+    _COST = staticmethod(lambda r: r.size_bytes)
+
+    def _config(self, max_bytes):
+        return config_mod.LegibilityConfig(
+            project_id='dark_factory',
+            project_root='/home/leo/src/dark-factory',
+            escalation_port=8103,
+            cwd_prefixes=['/home/leo/src/dark-factory'],
+            budgets=config_mod.Budgets(max_daily_digest_bytes=max_bytes),
+            sampling=config_mod.Sampling(top_fraction=0.12, per_stratum_min=2),
+        )
+
+    def _build_records(self):
+        """7 records; every stratum's survivors all reach the candidate stage.
+
+        - 'recon' (3): two clones (collapse to the higher scorer) + one
+          structurally distinct record -> 2 survivors, both candidates,
+          both reserved. Priced at 200_000 each, so the group cannot fit.
+        - 'interactive' (4): two zero-signal records (dropped before the
+          budget phase) + two distinct real-signal records -> 2 survivors,
+          both candidates, both reserved. Priced at 1_000 each, so the
+          group fits.
+        """
+        return [
+            _scored(
+                'recon-clone-a', 'recon', mod.SignalCounts(tool_error=3),
+                '## Reconciliation Run\nDate: 2026-07-10\n', 200_000,
+            ),
+            _scored(
+                'recon-clone-b', 'recon', mod.SignalCounts(tool_error=2),
+                '## Reconciliation Run\nDate: 2026-07-11\n', 200_000,
+            ),
+            _scored(
+                'recon-distinct', 'recon', mod.SignalCounts(self_correct=1, not_found=4),
+                'A completely different opening about something else entirely.', 200_000,
+            ),
+            _scored('quiet-a', 'interactive', mod.SignalCounts(), 'nothing went wrong here', 1_000),
+            _scored('quiet-b', 'interactive', mod.SignalCounts(), 'all green, no surprises', 1_000),
+            _scored('human-a', 'interactive', mod.SignalCounts(tool_error=9), 'human turn one', 1_000),
+            _scored('human-b', 'interactive', mod.SignalCounts(not_found=8), 'human turn two', 1_000),
+        ]
+
+    def _build_narrowed_records(self):
+        """17 distinct real-signal records in ONE stratum, so the sampling
+        cut — not the budget — is what excludes most of them.
+
+        At the stock ``top_fraction=0.12`` the cut is
+        ``max(ceil(0.12 * 17), per_stratum_min=2) == 3``, so 3 compete for
+        budget and 14 never do. Every first turn is structurally distinct
+        and every score non-zero, so neither the zero-signal filter nor
+        ``dedupe_shapes`` removes any of them: ``below_sampling_cut`` is the
+        ONLY bucket that can absorb the other 14.
+
+        The openers differ by LEADING WORD, not by an index number:
+        ``_normalize_first_turn`` rewrites every digit run to '#' before
+        fingerprinting (that is how it absorbs a recon clone's date drift),
+        so numbered variants of one sentence collapse to a single shape and
+        would silently land in ``dedupe_collapsed`` instead.
+        """
+        openers = (
+            'Kafka', 'Postgres', 'Redis', 'Terraform', 'Kubernetes', 'Envoy',
+            'Bazel', 'Rust', 'Grafana', 'Airflow', 'Vitess', 'Ceph',
+            'Nomad', 'Pulsar', 'Debezium', 'Flink', 'Clickhouse',
+        )
+        return [
+            _scored(
+                f'distinct-{index:02d}', 'interactive',
+                mod.SignalCounts(tool_error=index),
+                f'{opener} is behaving oddly and I need help working out why.',
+                1_000,
+            )
+            for index, opener in enumerate(openers, start=1)
+        ]
+
+    def test_total_records_counts_every_record_handed_to_the_sampler(self):
+        records = self._build_records()
+        result = mod.stratified_sample(records, self._config(3_000), cost_fn=self._COST)
+        assert result.total_records == len(records) == 7
+
+    def test_every_candidate_is_either_selected_or_budget_skipped(self):
+        records = self._build_records()
+        result = mod.stratified_sample(records, self._config(3_000), cost_fn=self._COST)
+
+        # The squeeze really did bite (otherwise the conservation law below
+        # would hold trivially with budget_skipped == 0).
+        assert result.zero_signal_dropped == 2
+        assert result.dedupe_collapsed == 1
+        assert {r.path.stem for r in result.selected} == {'human-a', 'human-b'}
+        assert result.budget_skipped == 2
+
+        # Derived through below_sampling_cut, not around it. This fixture
+        # happens to narrow nothing, and asserting that explicitly is what
+        # stops the derivation from being accidentally right.
+        assert result.below_sampling_cut == 0
+        candidates = (
+            result.total_records
+            - result.zero_signal_dropped
+            - result.dedupe_collapsed
+            - result.below_sampling_cut
+        )
+        assert candidates == 4
+        assert len(result.selected) + result.budget_skipped == candidates
+
+    def test_records_below_the_sampling_cut_are_counted_not_silently_dropped(self):
+        records = self._build_narrowed_records()
+        # Budget deliberately generous (17 x 1_000 would all fit): the ONLY
+        # thing excluding records here is the stratum sampling cut, so a
+        # non-zero budget_skipped would mean the fixture is not isolating
+        # what it claims to.
+        result = mod.stratified_sample(records, self._config(300_000), cost_fn=self._COST)
+
+        assert result.total_records == 17
+        assert result.zero_signal_dropped == 0
+        assert result.dedupe_collapsed == 0
+        assert result.budget_skipped == 0
+        assert len(result.selected) == 3, 'ceil(0.12 * 17) == 3 candidates'
+        assert result.below_sampling_cut == 14, (
+            'the 14 survivors the cut left out must land in a bucket — before '
+            'this counter existed they landed in none, and the operator line '
+            'reported enumerated=17 against selected=3 with no explanation'
+        )
+
+    def test_the_summary_line_balances_when_the_sampling_cut_bites(self):
+        """TOTAL CONSERVATION, on the fixture that actually narrows.
+
+        This is the property an operator relies on when they read the line
+        and ask "where did the other 14 go?": the five numbers must add up,
+        or the gap reads as a second, undiagnosed suppression mode.
+        """
+        for records, max_bytes in (
+            (self._build_narrowed_records(), 300_000),  # cut bites, budget does not
+            (self._build_narrowed_records(), 2_500),    # both bite
+            (self._build_records(), 3_000),             # dedupe + zero-signal + budget
+            (self._build_records(), 10),                # total suppression
+        ):
+            result = mod.stratified_sample(records, self._config(max_bytes), cost_fn=self._COST)
+            accounted = (
+                result.zero_signal_dropped
+                + result.dedupe_collapsed
+                + result.below_sampling_cut
+                + result.budget_skipped
+                + len(result.selected)
+            )
+            assert accounted == result.total_records, (
+                f'{result.total_records - accounted} record(s) unaccounted at '
+                f'max_bytes={max_bytes}'
+            )
+
+    def test_the_sampling_cut_never_hides_a_night_from_the_predicate(self):
+        """``below_sampling_cut`` must not open a NEW silent-suppression hole.
+
+        The failure this task exists to end is "real signal found, nothing
+        digested, night looks quiet". A third drop bucket is a fresh chance
+        to reintroduce it: if the cut could swallow an entire night's
+        survivors, the run would report ``selected=0 budget_skipped=0`` --
+        exactly what a genuine no-change night reports -- and
+        ``nightly._report_sample_outcome`` would stay silent.
+
+        It cannot, structurally: ``candidate_count`` is floored at
+        ``min(per_stratum_min, len(survivors))``, so ANY survivor yields at
+        least one candidate, and every candidate lands in ``selected`` or
+        ``budget_skipped``. Swept rather than argued, over stratum sizes
+        0..17 x eight budget regimes including 0.
+        """
+        base = self._build_narrowed_records()
+        for size in range(len(base) + 1):
+            for max_bytes in (0, 1, 999, 1_000, 1_001, 2_000, 3_000, 300_000):
+                result = mod.stratified_sample(
+                    base[:size], self._config(max_bytes), cost_fn=self._COST,
+                )
+                looks_like_nothing_to_sample = (
+                    not result.selected and result.budget_skipped == 0
+                )
+                had_real_signal = (
+                    result.total_records
+                    - result.zero_signal_dropped
+                    - result.dedupe_collapsed
+                ) > 0
+                assert not (looks_like_nothing_to_sample and had_real_signal), (
+                    f'n={size} max_bytes={max_bytes}: {result.below_sampling_cut} '
+                    f'record(s) of real signal, yet the night reads as a genuine '
+                    f'no-change night'
+                )
+
+    def test_the_operator_line_reports_the_sampling_cut(self):
+        """The counter is worthless if it never reaches the operator."""
+        result = mod.stratified_sample(
+            self._build_narrowed_records(), self._config(300_000), cost_fn=self._COST,
+        )
+        line = mod.format_sample_summary_line(result, max_bytes=300_000)
+        assert 'below_sampling_cut=14' in line
+
+    def test_total_suppression_is_distinguishable_from_nothing_to_sample(self):
+        """The predicate itself, on the two states it must tell apart."""
+        records = self._build_records()
+
+        # Budget squeezed below even the cheap group: real candidates existed
+        # and every one was discarded on budget.
+        suppressed = mod.stratified_sample(records, self._config(10), cost_fn=self._COST)
+        assert suppressed.selected == []
+        assert suppressed.budget_skipped == 4
+        assert (not suppressed.selected and suppressed.budget_skipped > 0) is True
+
+        # Nothing but zero-signal records: no candidate ever reached the
+        # budget phase, so the SAME empty selection must NOT read as
+        # suppression.
+        quiet = [r for r in records if r.score == 0]
+        quiet_result = mod.stratified_sample(quiet, self._config(300_000), cost_fn=self._COST)
+        assert quiet_result.selected == []
+        assert quiet_result.budget_skipped == 0
+        assert quiet_result.total_records == 2
+        assert (not quiet_result.selected and quiet_result.budget_skipped > 0) is False
+
+
 class TestStratifiedSampleBoundary:
     """§8.4 boundary fixture: ~100x size variance, clone shapes, several
     zero-signal records, and one TINY stratum. Drives the PURE
@@ -1146,3 +1398,106 @@ class TestMainCLI:
         )
         assert expected == [Path('/home/leo/src/dark-factory') / 'data/orchestrator/agent-transcripts']
         assert captured[0]['agent_transcript_roots'] == expected
+
+
+class TestFormatSampleSummaryLine:
+    """``format_sample_summary_line`` is the ONE greppable accounting line,
+    shared by this module's CLI stderr block and the nightly trickle's
+    journal INFO line (task 3270).
+
+    One source for both, so the diagnostic an operator runs by hand and the
+    line the systemd timer writes to the journal can never disagree about
+    what the budget was spent on — the drift that let a budget-suppressed
+    night look exactly like a genuine no-change night for 14 nights.
+    """
+
+    def _result(self):
+        """Every field a DISTINCT non-zero value, so a field wired to the
+        wrong attribute is caught (an all-zeros fixture would not be)."""
+        return mod.SampleResult(
+            selected=[
+                _scored('sess-a', 'recon', mod.SignalCounts(tool_error=5), 'text a'),
+                _scored('sess-b', 'interactive', mod.SignalCounts(not_found=3), 'text b'),
+            ],
+            per_stratum_counts={'recon': 1, 'interactive': 1},
+            zero_signal_dropped=3,
+            bytes_used=6,
+            dedupe_collapsed=4,
+            budget_skipped=5,
+            below_sampling_cut=8,
+            total_records=11,
+        )
+
+    def test_carries_every_field_in_stable_key_value_form(self):
+        line = mod.format_sample_summary_line(self._result(), max_bytes=7)
+        assert 'enumerated=11' in line
+        assert 'zero_signal_dropped=3' in line
+        assert 'dedupe_collapsed=4' in line
+        assert 'below_sampling_cut=8' in line
+        assert 'budget_skipped=5' in line
+        assert 'selected=2' in line
+        assert 'bytes_used=6/7' in line
+
+    def test_is_a_single_line_an_operator_can_grep(self):
+        # It is what `journalctl | grep` and a `grep` over the CLI's stderr
+        # both have to return as ONE unit, so it must carry no newline of
+        # its own (callers own their prefix and their line terminator).
+        line = mod.format_sample_summary_line(self._result(), max_bytes=7)
+        assert '\n' not in line
+        assert line == line.strip()
+
+    def test_main_stderr_carries_that_exact_line_verbatim(self, tmp_path, capsys, monkeypatch):
+        """The CLI's summary block and the shared formatter are ONE source.
+
+        Spies on the real sampler rather than replacing it, so the line is
+        asserted against the numbers a genuine two-session run produced.
+        """
+        projects_root = tmp_path / 'projects'
+        main_dir = projects_root / '-home-leo-src-dark-factory'
+        for session_id, first_turn in (
+            ('sess-1', 'Please help with X'), ('sess-2', 'Please help with Y'),
+        ):
+            _write_full_session(
+                main_dir, session_id, MAIN_CWD, '2026-07-13T09:00:00.000Z',
+                first_turn, include_tool_error=True,
+            )
+
+        config_path = tmp_path / 'legibility.yaml'
+        config_path.write_text(textwrap.dedent(f"""\
+            project_id: dark_factory
+            project_root: /home/leo/src/dark-factory
+            escalation_port: 8103
+            cwd_prefixes: [{MAIN_CWD}]
+            budgets: {{max_daily_digest_bytes: 300000}}
+            sampling: {{top_fraction: 0.12, per_stratum_min: 2}}
+            """))
+
+        seen = []
+        real_sample = mod.stratified_sample
+
+        def spy_stratified_sample(records, config, *, cost_fn=None):
+            result = real_sample(records, config, cost_fn=cost_fn)
+            seen.append((result, config.budgets.max_daily_digest_bytes))
+            return result
+
+        monkeypatch.setattr(mod, 'stratified_sample', spy_stratified_sample)
+
+        ret = mod.main([
+            '--config', str(config_path),
+            '--projects-root', str(projects_root),
+            '--date', '2026-07-13',
+        ])
+        assert ret == 0
+        assert len(seen) == 1
+
+        result, max_bytes = seen[0]
+        expected = mod.format_sample_summary_line(result, max_bytes=max_bytes)
+        err_lines = capsys.readouterr().err.splitlines()
+        assert expected in err_lines, (
+            'the CLI must emit the shared summary line verbatim, on its own line'
+        )
+        # Real numbers, not a zeros template: both fixture sessions were
+        # enumerated and both were affordable.
+        assert 'enumerated=2' in expected
+        assert 'selected=2' in expected
+        assert 'budget_skipped=0' in expected
