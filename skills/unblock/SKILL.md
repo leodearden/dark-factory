@@ -322,6 +322,7 @@ The merge procedure is iterative — don't assume one pass will be enough:
    - `status: "queued"` or `status: "attached"` → **durable intent confirmed** — the request is enqueued; proceed to poll:
      ```
      if result["status"] == "queued":
+         poll_by = "request_id"
          poll_kwargs = {"request_id": result["request_id"]}
      else:  # "attached" — pick the handle the response discloses (task 3148); a
             # missing poll_by (pre-3148 server) degrades to request_id, today's behaviour
@@ -337,22 +338,32 @@ The merge procedure is iterative — don't assume one pass will be enough:
                 # (see *Polled terminal failures*) before concluding anything
              poll_kwargs = {"branch": "task/<TASK_ID>"}
 
+     # unknown is terminal only when the polled id was actually enqueued — on the branch arm
+     # nothing was, so unknown is that arm's live state until the git-authority tier resolves it
+     terminal = ("done", "conflict", "blocked", "abandoned") if poll_by == "branch" \
+         else ("done", "conflict", "blocked", "abandoned", "unknown")
+     deadline = now() + 1200 if poll_by == "branch" else None  # 20-min hard ceiling; branch arm only — it alone lost its unknown exit
+     timed_out = False
      poll_interval = 15  # seconds; ramp up to 60 s
      loop:
          sleep(poll_interval)
          poll = mcp__escalation__merge_status(**poll_kwargs)
-         if poll["state"] in ("done", "conflict", "blocked", "abandoned", "unknown"):
-             break  # any terminal (or restart/unknown) state
+         if poll["state"] in terminal:
+             break
+         if deadline is not None and now() >= deadline:
+             timed_out = True
+             break
          eta = poll.get("eta_seconds") or poll_interval * 2  # eta_seconds may be None
          poll_interval = min(max(eta, 15), 60)
      ```
-     After the loop exits, dispatch on `poll["state"]`:
-     - `"done"` → `merge_status` returns **no merge SHA** (`poll["outcome"]` is the raw state string `"done"`, not a commit hash). Re-derive the merge commit from git:
+     After the loop exits:
+     - `timed_out` (branch-arm 20-minute deadline reached without a terminal state) → do NOT resubmit and do NOT direct-merge; go to *Polled terminal failures*'s `unknown` bullet below and follow its branch-arm carve-out (stop-and-report, not resubmit).
+     - `poll["state"] == "done"` → `merge_status` returns **no merge SHA** (`poll["outcome"]` is the raw state string `"done"`, not a commit hash) — except on the `poll_by == "branch"` arm, where `"done"` comes from the git-authority tier and carries `merge_sha` directly. Otherwise re-derive the merge commit from git:
        ```
        git log main --oneline | head -5
        ```
        Thread the first commit SHA into `done_provenance={"commit": "<sha>"}`. If no single commit is recoverable, fall back to `{"note": "<explanation>"}`. Then proceed to step 8.
-     - `"conflict"`, `"blocked"`, `"abandoned"`, or `"unknown"` → see *Polled terminal failures* below.
+     - `poll["state"] in ("conflict", "blocked", "abandoned", "unknown")` → see *Polled terminal failures* below.
 
    *(Immediate-response failure edges — `conflict`, `blocked`, `unknown_branch`, `failed`, orchestrator-down — and cancellation are covered below.)*
 
@@ -385,7 +396,7 @@ The merge procedure is iterative — don't assume one pass will be enough:
   #   (git log gives the merge commit; git merge-base gives the common ancestor, NOT the merge commit)
   # exit 1 (not on main) AND queue healthy: loop back to step 7 (resubmit).
   ```
-  **Never fall back to direct merge in response to `unknown`** — `unknown` means the server lost its record, not that the merge failed.
+  **Never fall back to direct merge in response to `unknown`** — `unknown` means the server lost its record, not that the merge failed. **This block's `resubmit` line does not apply to the `poll_by == "branch"` arm** — there nothing was ever enqueued, so `unknown` is that arm's expected live state, not a lost record; that arm never reaches this bullet as a terminal state (it's excluded from step 7's terminal set) — it arrives here only via the branch arm's 20-minute deadline, and the action there is to run the same ancestry check once more and, on exit 1, STOP and report to the human rather than resubmitting.
 
 *Abandonment (`merge_cancel`):*
 
