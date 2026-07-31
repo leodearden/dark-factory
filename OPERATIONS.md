@@ -294,6 +294,30 @@ session:
 | `mcp__escalation__get_task_runtime_state` | Live per-task phase/loop/attempt projection (what a task is doing *right now*) |
 | `mcp__fused-memory__get_tasks` / `get_task` | Full task tree, or one task's full record |
 | `mcp__fused-memory__get_statuses` | Compact `{id: status}` map — cheap when you only need status, not full records |
+| `mcp__fused-memory__get_status` | Backend health, plus `reconciliation_halt` — whether reconciliation is halted, why, since when, and whether the cooldown has expired. Pass no `project_id` for the fleet-wide `halted_projects` list |
+| `mcp__fused-memory__get_queue_stats` | Durable-write-queue counts, plus (per-project) `reconciliation_backlog` **and** `reconciliation_halt` — read both together, see below |
+
+### Is reconciliation halted, or just behind?
+
+A large `reconciliation_backlog` has two causes with **opposite remedies**,
+and they look identical from the number alone — that ambiguity cost two days
+of mis-triage on 2026-07-20.
+
+- Read `reconciliation_halt.halted` from the **same** `get_queue_stats` /
+  `get_status` probe; `halt_reason` and `halted_at` say why and since when.
+- **Halted** → `mcp__fused-memory__unhalt_reconciliation(project_id=...)`.
+- **Not halted** → it's capacity; the backlog is draining too slowly (task 3049).
+
+`trigger_reconciliation` on a halted project now answers `status='halted'`
+(with the reason and remedy) instead of `'requested'` — it used to report
+success while the harness skipped every cycle.
+
+This deployment runs `reconciliation.auto_unhalt_after_cooldown: true`
+(`fused-memory/config/config.yaml`, where the rationale sits next to the
+knob): a halt auto-resumes once its cooldown expires, and the judge re-halts
+if the pipeline is still sick. So a halt you find with an already-expired
+cooldown is about to clear itself on the next ~5s tick — in that one window a
+manual trigger IS consumed, and the tool says so.
 
 ---
 
