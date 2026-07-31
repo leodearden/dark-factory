@@ -213,70 +213,19 @@ def snapshot_config_dir(
     epoch: float | None = None,
     prune_prefixes: tuple[str, ...] = DEFAULT_PRUNE_PREFIXES,
 ) -> list[dict]:
-    """Return a sorted, content-free description of every entry under *config_dir*.
+    """Sample *config_dir*, pruning the noisy subtrees by default.
 
-    Each entry is ``{relpath, kind, size, mtime_delta_secs}`` where ``kind`` is
-    one of ``file`` / ``dir`` / ``symlink``.  Contents are NEVER inlined —
-    ``.credentials.json`` in particular is recorded by presence and size only.
-
-    ``mtime_delta_secs`` is the entry's mtime minus *epoch* (the spawn instant),
-    rounded, or ``None`` when no epoch is supplied.  It is provenance data, never
-    an asserted bound.
-
-    Any entry at or below a *prune_prefixes* path is collapsed: the prefix dir
-    itself is emitted once with a ``pruned_descendants`` count and its descendants
-    are omitted.  ``projects/`` (where the transcript lives) is never prunable.
+    A thin default-supplying wrapper over
+    ``startup_completion_fixtures.snapshot_config_dir`` — the SINGLE sampler
+    definition.  Probe output and materialized fixture trees are therefore
+    described by exactly one function, so a curated row can never encode a tree
+    shape that the sampler would not have produced.  The only difference is the
+    default: a live config dir needs the marketplace/backups prune, a
+    materialized fixture tree must round-trip verbatim.
     """
-    entries: list[dict] = []
-    if not config_dir.exists():
-        return entries
-    pruned_counts: dict[str, int] = {}
-    for path in sorted(config_dir.rglob('*')):
-        try:
-            relpath = str(path.relative_to(config_dir))
-            prefix = next(
-                (p for p in prune_prefixes if relpath == p or relpath.startswith(p + os.sep)),
-                None,
-            )
-            if prefix is not None and relpath != prefix:
-                pruned_counts[prefix] = pruned_counts.get(prefix, 0) + 1
-                continue
-            if path.is_symlink():
-                kind = 'symlink'
-                size = None
-            elif path.is_dir():
-                kind = 'dir'
-                size = None
-            else:
-                kind = 'file'
-                size = path.lstat().st_size
-            mtime_delta = None
-            if epoch is not None:
-                mtime_delta = round(path.lstat().st_mtime - epoch, 3)
-            entries.append(
-                {
-                    'relpath': relpath,
-                    'kind': kind,
-                    'size': size,
-                    'mtime_delta_secs': mtime_delta,
-                }
-            )
-        except OSError:
-            # A dir that vanished mid-walk (the CLI rotates temp state) is a real
-            # observation, not an error — record it as such rather than crashing
-            # a capture that cannot be cheaply repeated.
-            entries.append(
-                {
-                    'relpath': str(path),
-                    'kind': 'vanished',
-                    'size': None,
-                    'mtime_delta_secs': None,
-                }
-            )
-    for entry in entries:
-        if entry['relpath'] in pruned_counts:
-            entry['pruned_descendants'] = pruned_counts[entry['relpath']]
-    return entries
+    return _scf.snapshot_config_dir(
+        config_dir, epoch=epoch, prune_prefixes=prune_prefixes
+    )
 
 
 def sample_proc(pid: int | None) -> dict:

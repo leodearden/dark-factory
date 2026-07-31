@@ -34,6 +34,7 @@ rows summarise, the named predicate, and the failure-mode table.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -274,3 +275,131 @@ def load_startup_completion_corpus() -> list[StartupCompletionRow]:
             row['source_path'] = path.name
             rows.append(row)
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Materialization
+# ---------------------------------------------------------------------------
+
+
+def snapshot_config_dir(
+    config_dir: Path,
+    *,
+    epoch: float | None = None,
+    prune_prefixes: tuple[str, ...] = (),
+) -> list[dict]:
+    """Return a sorted, content-free description of every entry under *config_dir*.
+
+    THE single sampler: `startup_completion_probe.py` imports this to describe a
+    live config dir, and :func:`materialize_config_dir`'s round trip is checked
+    against it.  One function means probe output and materialized trees can never
+    drift into describing different things.
+
+    Each entry is ``{relpath, kind, size, mtime_delta_secs}``; ``kind`` is
+    ``file`` / ``dir`` / ``symlink`` (or ``vanished`` for an entry that
+    disappeared mid-walk, which is a real observation of a live dir, not an
+    error).  Contents are NEVER inlined — ``.credentials.json`` is recorded by
+    presence and size only.
+
+    ``prune_prefixes`` collapses a subtree to a ``pruned_descendants`` count on
+    the prefix entry.  It defaults to EMPTY here (a materialized tree is already
+    small and must round-trip exactly); the probe passes its own default for
+    live dirs, where the plugin marketplace git clone would otherwise dominate.
+    """
+    entries: list[dict] = []
+    if not config_dir.exists():
+        return entries
+    pruned_counts: dict[str, int] = {}
+    for path in sorted(config_dir.rglob('*')):
+        try:
+            relpath = str(path.relative_to(config_dir))
+            prefix = next(
+                (p for p in prune_prefixes if relpath == p or relpath.startswith(p + os.sep)),
+                None,
+            )
+            if prefix is not None and relpath != prefix:
+                pruned_counts[prefix] = pruned_counts.get(prefix, 0) + 1
+                continue
+            if path.is_symlink():
+                kind, size = 'symlink', None
+            elif path.is_dir():
+                kind, size = 'dir', None
+            else:
+                kind, size = 'file', path.lstat().st_size
+            mtime_delta = None
+            if epoch is not None:
+                mtime_delta = round(path.lstat().st_mtime - epoch, 3)
+            entries.append(
+                {
+                    'relpath': relpath,
+                    'kind': kind,
+                    'size': size,
+                    'mtime_delta_secs': mtime_delta,
+                }
+            )
+        except OSError:
+            entries.append(
+                {
+                    'relpath': str(path),
+                    'kind': 'vanished',
+                    'size': None,
+                    'mtime_delta_secs': None,
+                }
+            )
+    for entry in entries:
+        if entry['relpath'] in pruned_counts:
+            entry['pruned_descendants'] = pruned_counts[entry['relpath']]
+    return entries
+
+
+def materialize_config_dir(row: dict, dest: Path) -> tuple[Path, str]:
+    """Rebuild *row*'s observed config dir under *dest*; return ``(dir, session_id)``.
+
+    The entry point 3326's tests call.  The rebuilt tree is a real filesystem, so
+    a production predicate — and the real ``_run_subprocess`` watchdog — can be
+    pointed at it and will behave as they would against the observed dir:
+
+    - directories are created; plain files are written as a zero-or-placeholder
+      payload of the recorded ``size`` (contents were never captured, and the
+      predicate reads none of them);
+    - a recorded ``symlink`` is created as a DANGLING symlink to a
+      deliberately-absent target.  The production dir's ``settings.json`` points
+      into the invoking user's ``~/.claude/``, which is neither reproducible nor
+      relevant; what matters is that the entry is a symlink, which is what the
+      recorded ``kind`` — and the round trip — assert;
+    - the transcript is written at ``transcript_relpath`` from
+      ``transcript_records`` (one JSON object per line), so
+      ``_resolve_transcript_path``'s ``projects/*/<session_id>.jsonl`` glob
+      resolves exactly as it does for a real config dir.  A row carrying
+      ``transcript_raw_lines`` writes those literal lines instead — that is how
+      the truncated/unparseable degrade row is expressed.
+    """
+    config_dir = Path(dest)
+    config_dir.mkdir(parents=True, exist_ok=True)
+
+    # Shortest-first so a parent dir always exists before its children.
+    for entry in sorted(row['config_dir_tree'], key=lambda e: e['relpath'].count(os.sep)):
+        if entry['kind'] == 'vanished':
+            continue
+        path = config_dir / entry['relpath']
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if entry['kind'] == 'dir':
+            path.mkdir(parents=True, exist_ok=True)
+        elif entry['kind'] == 'symlink':
+            if not path.is_symlink():
+                path.symlink_to(config_dir / '__absent_symlink_target__')
+        else:
+            size = entry.get('size') or 0
+            path.write_bytes(b'\0' * size)
+
+    relpath = row['transcript_relpath']
+    if relpath is not None:
+        transcript = config_dir / relpath
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        if 'transcript_raw_lines' in row:
+            body = '\n'.join(row['transcript_raw_lines'])
+        else:
+            body = '\n'.join(json.dumps(record) for record in (row['transcript_records'] or []))
+        transcript.write_text(body + ('\n' if body else ''), encoding='utf-8')
+
+    return (config_dir, row['session_id'])
