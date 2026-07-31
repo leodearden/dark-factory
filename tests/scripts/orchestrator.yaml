@@ -1,0 +1,47 @@
+# Module config for the repo-root tests/scripts/ suite.
+#
+# WHY THIS FILE EXISTS (task 3350, escalation esc-3062-3)
+#
+# _build_fallback_config is consulted only when the discovered module_configs
+# list is EMPTY. For a diff confined to tests/scripts/, _single_subproject_prefix
+# and _root_plus_single_subproject_prefix both return None (`tests` has no
+# pyproject.toml, and no real subproject is touched), so it fell through to the
+# `config.test_command != 'pytest'` branch: prefix __fallback__, test_command =
+# the whole seven-segment fleet chain, verify_command_timeout_secs=None so the
+# repo-root global ceiling applied. Task 3062 attempt-2 measured that path
+# consuming 1733.60s across four of seven segments before dashboard even
+# started, then timing out at 1800.66s — category infra_timeout — on a diff
+# whose own tests take ~105s.
+#
+# Registering a real module config here makes module_configs non-empty, which
+# by itself is sufficient to bypass the fallback builder entirely. This is the
+# intent task 2361 already wrote into the root yaml's comment, but which a
+# trailing chain segment could never deliver: a segment at the end of a
+# 7-segment && chain only runs if all ~1800s of the preceding segments finish
+# first, so tests/scripts' own gating was hostage to every other suite.
+#
+# Registered at prefix `tests/scripts` (depth 2), not `tests` (depth 1):
+# depth 2 is <= the effective lock_depth of 4 (shipped by the package-bundled
+# orchestrator/src/orchestrator/defaults.yaml), so the config.py:4712-4725
+# "prefix deeper than lock_depth" warning does not fire and the
+# scheduler/workflow path can reach this config. Registering at `tests` would
+# additionally capture any future tests/<other>/ subtree that this `uv run
+# --project shared` environment cannot necessarily run, silently mis-gating it.
+#
+# Pin --project shared: tests/scripts/ lives at the repo root and is not itself
+# a workspace member, so a bare `uv run pytest` resolves against the
+# workspace-ROOT project (dark-factory), which declares no deps and no pytest ->
+# verify dies with "Failed to spawn: pytest" on a freshly-synced venv (e.g. a
+# fresh _merge-* verify worktree). shared is a member that declares pytest, and
+# these tests import no first-party package beyond what the root conftest puts
+# on sys.path, so its env suffices. No --directory, so cwd stays at the worktree
+# root and the tests/scripts/ path still resolves. Mirrors scripts/
+# orchestrator.yaml and the other subprojects' --project <member> convention;
+# verify.py's own _ROOT_OWNING_TEST_COMMAND and _FALLBACK_UV_PROJECT = 'shared'
+# already encode exactly this pairing.
+#
+# --timeout=300 is required by test_fallback_verify_config.py's
+# test_per_module_merge_verify_raises_per_test_timeout guard, and is correct on
+# its own merits: this verbatim FULL_SUITE form runs when a touched file
+# classifies STRUCTURAL and under merge-role merge_verify_breadth=full.
+test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q --timeout=300"
