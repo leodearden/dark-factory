@@ -131,13 +131,22 @@ def build_query(
     and ``len(group_ids or '')`` is the group_id COUNT.  It is reproduced exactly
     on purpose.  "Fixing" it would change which queries get dropped, i.e.
     silently change recall for every existing caller.
-    """
-    if not group_ids:
-        group_filter = ''
-    else:
-        group_values = '|'.join(f'"{escape_group_id(gid)}"' for gid in group_ids)
-        group_filter = f'(@group_id:{group_values})'
 
+    Two things differ from upstream, and both only ever *remove* operands
+    RediSearch cannot parse:
+
+    1. terms with no alphanumeric character are dropped (see
+       :func:`is_searchable_term`);
+    2. an empty term list short-circuits to ``''`` instead of emitting the
+       equally-unparseable empty operand group ``()``.
+
+    ``''`` is not an invention: it is graphiti's existing "no query" sentinel —
+    upstream returns it from the over-length guard above, and every fulltext
+    caller (``node_fulltext_search`` / ``edge_fulltext_search`` / community +
+    episode search) short-circuits on ``if fuzzy_query == '': return []``.  So
+    the short-circuit stays inside the contract callers already implement rather
+    than introducing a new one.
+    """
     # `is_searchable_term` is the repair, and it is NOT redundant with sanitize().
     # sanitize() leaves `_` and backticks alone, but RediSearch's own tokenizer
     # reduces a token like `_`, `__` or ``` `` ``` to NOTHING.  Emitted into the
@@ -153,6 +162,27 @@ def build_query(
         for w in sanitized_text.split()
         if w.lower() not in STOPWORDS and is_searchable_term(w)
     ]
+    # Second failure mode, independent of the first: when NOTHING survives
+    # filtering, upstream still emits `(@group_id:"dark_factory") ()`, and the
+    # empty operand group is itself unparseable. Short-circuit BEFORE the group
+    # filter is assembled — returning `' ()'` for the no-group_ids case would be
+    # just as broken, and is not the sentinel callers check for.
+    if not terms:
+        logger.debug(
+            'falkor fulltext: no searchable terms after sanitize/stopword/'
+            'unsearchable filtering (%d raw token(s), group_ids=%s) — '
+            'returning empty query',
+            len(sanitized_text.split()),
+            group_ids,
+        )
+        return ''
+
+    if not group_ids:
+        group_filter = ''
+    else:
+        group_values = '|'.join(f'"{escape_group_id(gid)}"' for gid in group_ids)
+        group_filter = f'(@group_id:{group_values})'
+
     joined = ' | '.join(terms)
 
     # Upstream's over-length guard, arithmetic included. See docstring.
