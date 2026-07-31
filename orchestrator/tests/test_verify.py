@@ -13,19 +13,19 @@ import pytest
 from orchestrator import verify, verify_plan
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.verify import (
-    SIGNAL_KILL_SUMMARY_MARKER,
     _CATEGORY_PRIORITY,
     _PRUNE_THROTTLE_SECS,
+    SIGNAL_KILL_SUMMARY_MARKER,
     VerifyResult,
     _aggregate_results,
     _apply_cargo_scope,
     _build_fallback_config,
     _build_summary_payload,
-    _killed_leg_note,
     _extract_cause_hint,
     _is_collectable_test_file,
     _is_structural_python_file,
     _is_test_file,
+    _killed_leg_note,
     _maybe_prune_archive,
     _resolve_verify_env,
     _root_plus_single_subproject_prefix,

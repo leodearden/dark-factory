@@ -1618,10 +1618,18 @@ def _build_summary_payload(runs: list[dict], category: str, cause_hint: str) -> 
     below — an explicit key whitelist, not a passthrough — silently DROPPED
     the one structured record of which segments never ran, leaving those facts
     only as free text inside the aggregated ``output`` blob.
+
+    A NEGATIVE rc is not a quiet outcome — it is asyncio reporting that the
+    process was terminated by signal ``-rc`` and never got to exit at all, so
+    it is the LOUDEST possible outcome and sorts above every non-negative rc
+    (task 3173).  Under the plain numeric ordering a -9 sorted below even a
+    passing 0, so a killed leg co-occurring with a passing leg made this
+    payload name the PASSING run — hiding the kill in the one artifact that
+    survives for triage.  Ordering among non-negative rcs is unchanged.
     """
     active_runs = [r for r in runs if r.get('cmd') is not None]
     if active_runs:
-        worst = max(active_runs, key=lambda r: (r['rc'], r['timed_out']))
+        worst = max(active_runs, key=lambda r: (r['rc'] < 0, r['rc'], r['timed_out']))
     else:
         worst = {'rc': 0, 'timed_out': False, 'cmd': None,
                  'started_at': '', 'duration_secs': 0.0}
@@ -5412,6 +5420,18 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
             parts.append('lint issues')
         if any('type errors' in r.summary for r in results):
             parts.append('type errors')
+        # task 3173: the three literals above are the ONLY fragments this
+        # substring scan knows about, so a signal-kill note from
+        # `_summarize_checks` matched none of them and a multi-subproject
+        # verify silently degraded to a bare 'Failures: ' with no parts at
+        # all — erasing the one fact that says the run produced no verdict.
+        # Carry every distinct kill note through verbatim, in child order,
+        # de-duplicated (two subprojects killed identically must not stutter
+        # the same sentence twice).
+        for r in results:
+            for fragment in r.summary.removeprefix('Failures: ').split(', '):
+                if SIGNAL_KILL_SUMMARY_MARKER in fragment and fragment not in parts:
+                    parts.append(fragment)
         summary = 'All checks passed' if passed else f'Failures: {", ".join(parts)}'
 
     # Collect cause_hint from failing child results; join with ' | '.
