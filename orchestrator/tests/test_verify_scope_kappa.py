@@ -45,6 +45,7 @@ from typing import Literal
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _verify_config_corpus import ROOT_LINT_COMMAND, ROOT_TYPE_CHECK_COMMAND
 from test_verify import _canned_passing_result, _real_worktree_reader, _write_guard_script
 from test_verify_plan import (  # noqa: F401 — reused by this module's byte-identical goldens (steps 3/7/9)
     DATA_MODULE_DIFF,
@@ -111,27 +112,35 @@ MIXED_ROOT_SUBPROJECT_DIFF: list[str] = [*FALLBACK_SUBPROJECT_DIFF, 'conftest.py
 # ruff-check clause — well-formed/never-OPAQUE even parsed whole — so a
 # second, genuinely multi-clause OPAQUE lint variant
 # (_FLEET_LINT_COMMAND_OPAQUE) is defined separately below for golden (f).
+#
+# The two constants immediately below are INTENTIONALLY HISTORICAL: neither is
+# the live YAML value, both are deliberately NOT drift-checked, and neither may
+# be migrated into `_verify_config_corpus.py`. _FLEET_TEST_COMMAND is the
+# 5-module chain as it stood at test_verify.py:4929 when tasks 2344/2355/2368
+# were fixed (today's live test_command adds --timeout=300 and sampler/cockpit/
+# tests-scripts segments); _FLEET_LINT_COMMAND is the deliberately single-clause
+# variant described above. Hoisting either would break this module's
+# byte-identical goldens, or leave test_verify_config_corpus.py permanently RED.
 _FLEET_TEST_COMMAND: str = (
     'cd shared && uv run pytest tests/ && cd ../escalation && uv run pytest tests/ '
     '&& cd ../orchestrator && uv run pytest tests/ && cd ../fused-memory && uv run pytest tests/ '
     '&& cd ../dashboard && uv run pytest tests/'
 )
 _FLEET_LINT_COMMAND: str = 'uv run ruff check shared escalation fused-memory orchestrator dashboard'
-_FLEET_TYPE_COMMAND: str = (
-    'cd fused-memory && npx pyright && cd ../orchestrator && npx pyright '
-    '&& cd ../dashboard && npx pyright'
-)
 
-# The real dark_factory lint_command verbatim (orchestrator/config.yaml) — a
-# genuine multi-clause OPAQUE chain (unlike _FLEET_LINT_COMMAND above). Reused
-# from TestBuildFallbackConfigWithNonDefaultCommands
+# The remaining two ARE the live values (byte-identical, and now drift-checked
+# at their definition site), so they alias the corpus rather than re-declaring
+# it. The _FLEET_* names are kept because they carry κ-specific meaning this
+# module's header documents — which shape is OPAQUE, which is single-clause —
+# that ROOT_* does not convey.
+_FLEET_TYPE_COMMAND: str = ROOT_TYPE_CHECK_COMMAND
+
+# The real dark_factory lint_command verbatim — a genuine multi-clause OPAQUE
+# chain (unlike _FLEET_LINT_COMMAND above). Reused from
+# TestBuildFallbackConfigWithNonDefaultCommands
 # .test_fallback_lint_reprojects_repo_root_file_to_ruff_bearing_context
 # (test_verify.py) for the OPAQUE-fleet-chain golden (f) below.
-_FLEET_LINT_COMMAND_OPAQUE: str = (
-    'uv run ruff check shared escalation fused-memory orchestrator dashboard '
-    '&& python3 fused-memory/scripts/check_bare_magicmock_config.py '
-    'shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests'
-)
+_FLEET_LINT_COMMAND_OPAQUE: str = ROOT_LINT_COMMAND
 
 
 # ---------------------------------------------------------------------------
