@@ -33,14 +33,20 @@ than testing ``isinstance(s, Open)``, which silently un-throttles mid-outage.
 
 from __future__ import annotations
 
+import logging
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+from shared.invocation_outcome import InvocationOutcome, ServerError
+
 if TYPE_CHECKING:
     from shared.cost_store import CostStore
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     'GateStats',
@@ -128,6 +134,20 @@ class Probing(GateState):
     consecutive_successes: int
 
 
+@dataclass(frozen=True)
+class _Sample:
+    """One reported invocation in the rolling window."""
+
+    ts: float
+    """Monotonic timestamp of the report."""
+
+    is_failure: bool
+    """True iff the outcome was a ``ServerError`` (5xx)."""
+
+    task_id: str | None
+    """Reporting task, or None for task-less invocations (watcher/steward)."""
+
+
 class ApiHealthGate:
     """In-memory C4 state machine over a rolling window of invocation outcomes.
 
@@ -190,6 +210,98 @@ class ApiHealthGate:
         self._wall_clock = wall_clock
 
         self._state: GateState = Closed()
+        # Rolling window of reported invocations, oldest first.  Same shape as
+        # Scheduler._blocked_transitions (scheduler.py:1551): a deque on the
+        # monotonic clock, evicted from the left on every report.
+        self._samples: deque[_Sample] = deque()
+
+    async def report(
+        self,
+        outcome: InvocationOutcome,
+        *,
+        task_id: str | None,
+        account: str,
+        role: str,
+    ) -> GateState:
+        """Feed one completed invocation to the gate; return the resulting state.
+
+        Called from the invocation choke point.  The returned value IS the
+        post-report state, so the caller needs no follow-up :meth:`state` call.
+
+        Args:
+            outcome: The classified invocation outcome.  ``ServerError`` counts
+                as a provider failure; ``OK`` as a provider success; every
+                other variant is neutral (see :meth:`_classify`).
+            task_id: The reporting task, or None for task-less invocations.
+            account: Account name, recorded on the forensics row.
+            role: Agent role, recorded on the forensics row.
+        """
+        now = self._monotonic_clock()
+        self._evict(now)
+
+        is_failure = isinstance(outcome, ServerError)
+        self._samples.append(_Sample(ts=now, is_failure=is_failure, task_id=task_id))
+
+        stats = self._stats()
+        # State mutation happens here, before any await: on a single-threaded
+        # event loop that makes the transition atomic, so two concurrent
+        # reporters cannot interleave mid-transition and no lock is needed.
+        self._state = self._next_state(outcome, stats)
+        return self._state
+
+    def _next_state(self, outcome: InvocationOutcome, stats: GateStats) -> GateState:
+        """Pure transition function: (current state, outcome, window stats) -> next state."""
+        if isinstance(self._state, Closed):
+            if self._should_trip(stats):
+                logger.warning(
+                    'ApiHealthGate TRIPPED (provider degraded): %d/%d failures (%.0f%%) '
+                    'across %d distinct tasks in %.0fs — thresholds %d/%d/%.2f',
+                    stats.failures,
+                    stats.completions,
+                    stats.failure_rate * 100,
+                    stats.distinct_tasks,
+                    stats.window_secs,
+                    self.min_failures,
+                    self.min_distinct_tasks,
+                    self.failure_rate_threshold,
+                )
+                return Open(since=self._wall_clock(), stats=stats)
+            return self._state
+        return self._state
+
+    def _should_trip(self, stats: GateStats) -> bool:
+        """All three C4 conditions must hold — each is independently necessary.
+
+        Count alone trips on one pathological task retrying; breadth alone
+        trips on three tasks that each failed once; rate alone trips on a
+        single failure in an otherwise-idle window.  Requiring all three is
+        what makes a trip mean "the provider is down" (decision 10:
+        throttle, not halt — never strand the healthy fraction).
+        """
+        return (
+            stats.failures >= self.min_failures
+            and stats.distinct_tasks >= self.min_distinct_tasks
+            and stats.failure_rate >= self.failure_rate_threshold
+        )
+
+    def _evict(self, now: float) -> None:
+        """Drop samples older than ``window_secs`` from the left of the deque."""
+        cutoff = now - self.window_secs
+        while self._samples and self._samples[0].ts < cutoff:
+            self._samples.popleft()
+
+    def _stats(self) -> GateStats:
+        """Summarise the current window."""
+        completions = len(self._samples)
+        failures = sum(1 for s in self._samples if s.is_failure)
+        distinct = {s.task_id for s in self._samples if s.is_failure and s.task_id is not None}
+        return GateStats(
+            failures=failures,
+            completions=completions,
+            distinct_tasks=len(distinct),
+            failure_rate=(failures / completions) if completions else 0.0,
+            window_secs=self.window_secs,
+        )
 
     def state(self) -> GateState:
         """Return the current state as an immutable snapshot.
