@@ -244,3 +244,62 @@ class TestEdgeCases:
         assert result is SENTINEL
         assert len(caplog.records) == 1, f'Expected one WARNING for empty file, got: {caplog.records}'
         assert str(p) in caplog.records[0].message
+
+
+class TestAtomicWriteText:
+    """Core contract of ``atomic_write_text``: content lands, nothing else does."""
+
+    def test_writes_text_to_destination(self, tmp_path):
+        """The destination holds exactly *text* after the call."""
+        from shared.safe_io import atomic_write_text
+
+        p = tmp_path / 'state.json'
+        atomic_write_text(p, '{"a": 1}')
+
+        assert p.read_text(encoding='utf-8') == '{"a": 1}'
+
+    def test_overwrites_existing_content(self, tmp_path):
+        """A pre-existing destination is replaced wholesale, not appended to."""
+        from shared.safe_io import atomic_write_text
+
+        p = tmp_path / 'state.json'
+        p.write_text('OLD-CONTENT-THAT-IS-LONGER', encoding='utf-8')
+
+        atomic_write_text(p, 'new')
+
+        assert p.read_text(encoding='utf-8') == 'new'
+
+    def test_happy_path_leaves_no_temp_file(self, tmp_path):
+        """After a successful write the parent dir holds ONLY the destination."""
+        from shared.safe_io import atomic_write_text
+
+        p = tmp_path / 'state.json'
+        atomic_write_text(p, 'payload')
+
+        assert sorted(q.name for q in tmp_path.iterdir()) == ['state.json']
+
+    def test_default_encoding_is_utf8(self, tmp_path):
+        """Non-ASCII payload round-trips through the utf-8 default."""
+        from shared.safe_io import atomic_write_text
+
+        payload = 'héllo — wörld ✓ 日本語'
+        p = tmp_path / 'state.json'
+        atomic_write_text(p, payload)
+
+        assert p.read_text(encoding='utf-8') == payload
+        assert p.read_bytes() == payload.encode('utf-8')
+
+    def test_accepts_str_path(self, tmp_path):
+        """*path* accepts a plain ``str`` as well as ``os.PathLike``."""
+        from shared.safe_io import atomic_write_text
+
+        p = tmp_path / 'state.json'
+        atomic_write_text(str(p), 'via-str')
+
+        assert p.read_text(encoding='utf-8') == 'via-str'
+
+    def test_exported_in_dunder_all(self):
+        """``atomic_write_text`` is part of the module's public surface."""
+        import shared.safe_io as _safe_io
+
+        assert 'atomic_write_text' in _safe_io.__all__
