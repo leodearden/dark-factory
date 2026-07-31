@@ -278,3 +278,44 @@ def test_healthz_budget_is_structurally_deliverable(tmp_path):
         f'{app_module._DB_PROBE_TIMEOUT} * {len(targets)} probes exceeds the '
         f'whole-handler budget of {app_module._HEALTHZ_TOTAL_BUDGET}s'
     )
+
+
+# ---------------------------------------------------------------------------
+# step-3 / step-4: TIMEOUT SCOPE BUG — conn.execute(...) itself blocking (not
+# just cursor.fetchone()) must not hang the handler
+# ---------------------------------------------------------------------------
+
+
+async def test_healthz_returns_degraded_when_execute_blocks(dashboard_config):
+    """conn.execute('SELECT 1') blocking in __aenter__ must not hang /healthz.
+
+    Today's code wraps only `cursor.fetchone()` in `asyncio.wait_for` — the
+    `async with conn.execute(...)` statement's own `__aenter__` (where
+    aiosqlite's real execute-the-query work happens) carries no deadline at
+    all. All three DB targets block there. Uses the DEFAULT shipped
+    constants (no monkeypatching) so this asserts the real user-observable
+    signal from the PRD, not an artificially shrunk one.
+    """
+    config = dashboard_config
+    pool = _BlockingPool(
+        {
+            config.reconciliation_db: _BlockingConn(block_on='execute'),
+            config.write_journal_db: _BlockingConn(block_on='execute'),
+            config.runs_db: _BlockingConn(block_on='execute'),
+        }
+    )
+    request = _make_healthz_request(config, pool)
+
+    resp, elapsed = await _call_healthz(request, hard_cap=8.0)
+    body = _body(resp)
+
+    assert resp.status_code == 503
+    assert body['status'] == 'degraded'
+    # The handler is bounded at _HEALTHZ_TOTAL_BUDGET (3.0s); ~2.0s of slack
+    # below the 5.0s curl --max-time ceiling absorbs event-loop scheduling
+    # and JSON serialisation (same convention as test_metrics_curator.py:924).
+    assert elapsed < 5.0, f'elapsed {elapsed:.3f}s >= 5.0s — verdict undeliverable to curl --max-time 5'
+    checks = body['checks']
+    assert checks['db_reconciliation'] == 'timeout'
+    assert checks['db_write_journal'] == 'timeout'
+    assert checks['db_runs'] == 'timeout'
