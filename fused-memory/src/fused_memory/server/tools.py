@@ -3333,6 +3333,27 @@ def create_mcp_server(
         Bypasses normal threshold/staleness logic. The reconciliation harness
         will pick this up on its next loop iteration (~5 seconds).
 
+        HALTED PROJECTS (task 3050): when the judge has halted the project the
+        harness skips every cycle, so this tool answers ``status='halted'``
+        rather than ``'requested'`` — it previously reported success while
+        nothing ran, which is how an operator who had finally spotted the
+        2026-07-20 backlog was told reconciliation would run and then waited.
+        The halted payload carries ``halted``, ``halt_reason``, ``halted_at``,
+        ``cooldown_until``, ``cooldown_expired``, ``trigger_requested`` and a
+        ``remedy`` naming ``unhalt_reconciliation``.
+
+        This is a truthful OUTCOME, not a tool failure, so it is a normal
+        result payload — ``error``/``error_type`` here stay reserved for
+        configuration/validation failures.
+
+        One nuance, kept honest in both directions: when the halt's cooldown
+        has expired AND ``auto_unhalt_after_cooldown`` is enabled, the next
+        loop tick auto-unhalts and then RUNS the cycle, so a manual trigger
+        genuinely is consumed. That case still forwards the request and
+        reports ``trigger_requested: True`` — refusing it would replace "lies
+        about success" with the mirror-image lie "claims nothing will run when
+        something will".
+
         Args:
             project_id: Project to trigger reconciliation for
         """
@@ -3342,6 +3363,42 @@ def create_mcp_server(
             return {
                 'error': 'Taskmaster is not configured. Cannot trigger reconciliation.',
                 'error_type': 'ConfigurationError',
+            }
+        halt = _halt_payload(project_id)
+        if halt is not None and halt['halted']:
+            # harness.config IS the ReconciliationConfig (harness.py:460).
+            auto_resume_pending = bool(
+                halt['cooldown_expired']
+                and reconciliation_harness.config.auto_unhalt_after_cooldown  # type: ignore[union-attr]
+            )
+            if auto_resume_pending:
+                # The next tick unhalts and falls through to run the cycle, so
+                # this request will actually be consumed.
+                await task_interceptor.buffer.request_trigger(project_id)  # type: ignore[union-attr]
+                tail = (
+                    'Its cooldown has expired and auto_unhalt_after_cooldown is '
+                    'enabled, so the halt auto-clears on the next ~5s tick and '
+                    'this trigger will be consumed by that cycle.'
+                )
+            else:
+                tail = (
+                    'Nothing was triggered, and nothing will run until the halt '
+                    'is cleared.'
+                )
+            return {
+                'status': 'halted',
+                'project_id': project_id,
+                **halt,
+                'trigger_requested': auto_resume_pending,
+                'remedy': (
+                    f'unhalt_reconciliation(project_id={project_id!r}) — clears the '
+                    'halt and resumes cycles.'
+                ),
+                'message': (
+                    f'Reconciliation is HALTED for {project_id} '
+                    f'(reason: {halt["halt_reason"] or "unknown"}; '
+                    f'since: {halt["halted_at"] or "unknown"}). {tail}'
+                ),
             }
         await task_interceptor.buffer.request_trigger(project_id)  # type: ignore[union-attr]
         return {
