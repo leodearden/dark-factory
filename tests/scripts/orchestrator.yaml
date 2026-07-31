@@ -80,3 +80,28 @@ test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q --tim
 # rather than only the per-file one.
 lint_command: "uv run --project shared ruff check tests/scripts/"
 type_check_command: "npx pyright tests/scripts/"
+
+# Per-module verify budget. MEASUREMENT PROVENANCE: this suite measured
+# 105-127s across four independent runs on the fallback path (task 3062,
+# escalation esc-3062-3), so 600s is ~4.7x the worst logged figure — generous
+# enough to absorb host-oversubscription variance (the same day showed the
+# orchestrator segment swing 1157.62s -> 1366.23s, ~18%), tight enough to
+# surface a genuine hang in minutes rather than in the ~50 minutes the
+# whole-fleet ceiling permits.
+#
+# This is where the root yaml's "tight timeouts surface hangs" intent actually
+# lives now. It could never hold at the whole-fleet level, because a ceiling
+# the honest green path cannot clear surfaces nothing but false infra_timeouts;
+# it holds here, scoped to a suite whose real cost is known.
+#
+# verify_command_timeout_secs is a PER-COMMAND budget
+# (skills/orchestrate/references/project-setup.md:150), so this bounds the TEST
+# leg on its own — not the sum of test+lint+type.
+#
+# verify_cold_command_timeout_secs is deliberately left UNSET here: this suite
+# has no build step whose cold cost would justify a separate cold budget. Note
+# what that actually means, per the _resolve_verify_timeout cascade
+# (verify.py:3634-3640) — an unset module cold knob falls through to
+# config.verify_cold_command_timeout_secs, which the repo root DOES set (3600),
+# NOT to the 600 below. The 600 is the warm budget only.
+verify_command_timeout_secs: 600
