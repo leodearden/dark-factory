@@ -7081,7 +7081,7 @@ async def test_run_loop_resumes_interrupted_runs_at_startup_before_reaper(
 
     async def stale_runs_side_effect():
         call_order.append('stale')
-        if harness._recover_stale_runs.call_count >= 2:
+        if harness._recover_stale_runs.call_count >= 2:  # type: ignore[attr-defined]
             stale_event.set()
 
     harness._resume_interrupted_runs = AsyncMock(side_effect=resume_side_effect)
