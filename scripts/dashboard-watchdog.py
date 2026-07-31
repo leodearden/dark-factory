@@ -61,9 +61,11 @@ asserted against the REAL born-at-L2 writer, which ``tests/scripts/`` cannot
 import).
 """
 
+import json
 import os
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 
@@ -277,3 +279,121 @@ def probe_health(url: str = PROBE_URL, timeout: float = PROBE_TIMEOUT) -> bool:
             f"({type(exc).__name__}: {exc}); counting as a failed probe"
         )
         return False
+
+
+# ---------------------------------------------------------------------------
+# Persisted tick state
+#
+# Every timer tick is a FRESH oneshot process, so the failure streak, the
+# rolling restart-epoch window and the escalation-dedup flag must all survive
+# on disk. An in-memory counter would reset every 30 seconds and the streak
+# gate would never reach FAIL_STREAK.
+# ---------------------------------------------------------------------------
+
+
+def default_state() -> dict:
+    """Return a fresh default state — no failures, no restarts, no open trip.
+
+    Also the documented fallback for every unreadable/ill-shaped state file:
+    losing the state means losing hysteresis history, which fails toward NOT
+    restarting (three fresh consecutive failures are needed again) rather than
+    toward a spurious restart.
+    """
+    return {"streak": 0, "restarts": [], "ceiling_open": False}
+
+
+def _normalise_state(raw: dict) -> dict:
+    """Coerce *raw* into the declared state schema, dropping what cannot be.
+
+    A hand-edited (or partially-written) state file must never crash a tick.
+    In particular a non-numeric entry inside ``restarts`` is dropped here
+    rather than left to poison the ``now - epoch`` arithmetic in
+    _prune_restarts. Booleans are excluded from the epoch list explicitly —
+    ``isinstance(True, int)`` is True in Python, and a stray ``true`` in the
+    list would otherwise be read as the epoch 1 (1970) and silently pruned.
+    """
+    streak = raw.get("streak")
+    if not isinstance(streak, int) or isinstance(streak, bool) or streak < 0:
+        streak = 0
+
+    restarts_raw = raw.get("restarts")
+    restarts: list[int] = []
+    if isinstance(restarts_raw, list):
+        for entry in restarts_raw:
+            if isinstance(entry, bool):
+                continue
+            if isinstance(entry, (int, float)):
+                restarts.append(int(entry))
+
+    return {
+        "streak": streak,
+        "restarts": restarts,
+        "ceiling_open": bool(raw.get("ceiling_open", False)),
+    }
+
+
+def load_state(path: str = STATE_PATH) -> dict:
+    """Return the persisted tick state from *path*, or defaults.
+
+    Fail-open, mirroring orchestrator-watchdog.py's
+    _read_last_fleet_deploy_epoch: never raises, and never creates anything —
+    reading is a pure query, so a first-ever tick on a fresh checkout (where
+    data/dashboard-watchdog/ does not exist yet) leaves the filesystem alone.
+
+    A missing file is the ordinary first-run case and is NOT warned about. A
+    file that exists but is corrupt, unreadable, or valid JSON of the wrong
+    shape IS warned about — that is a real anomaly worth a journal line — and
+    still degrades to defaults rather than wedging the watchdog.
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        return default_state()
+    except (OSError, ValueError) as exc:
+        logger.warning(
+            f"load_state: unreadable/corrupt state at {path}: {exc!r}; using defaults"
+        )
+        return default_state()
+
+    if not isinstance(raw, dict):
+        logger.warning(
+            f"load_state: state at {path} is {type(raw).__name__}, expected dict; "
+            "using defaults"
+        )
+        return default_state()
+
+    return _normalise_state(raw)
+
+
+def save_state(state: dict, path: str = STATE_PATH) -> None:
+    """Atomically persist *state* to *path*.
+
+    Python analogue of orchestrator-watchdog.py's _stamp_fm_deploy_clock:
+    makedirs → mkstemp a SIBLING (same filesystem, so os.replace is a true
+    atomic rename) → write → os.replace, unlinking the temp if anything fails.
+    Atomicity matters because the timer can fire while a previous tick is
+    still writing; a half-written file would otherwise be read as corrupt.
+
+    Fail-soft: makedirs/temp/rename errors are warn-logged and swallowed. An
+    unwritable state path degrades the watchdog to effectively stateless — it
+    stops restarting, since no streak can ever accumulate — which is the safe
+    direction. Crashing here would instead put the oneshot unit into 'failed'.
+    """
+    tmp_path: str | None = None
+    try:
+        state_dir = os.path.dirname(path) or "."
+        os.makedirs(state_dir, exist_ok=True)
+        payload = json.dumps(_normalise_state(state), sort_keys=True)
+        fd, tmp_path = tempfile.mkstemp(prefix=".state.", dir=state_dir)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(payload + "\n")
+        os.replace(tmp_path, path)
+        tmp_path = None  # renamed away — nothing to clean up
+    except Exception as exc:  # noqa: BLE001 -- a failed stamp must not crash the tick
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        logger.warning(f"save_state: failed to persist state to {path}: {exc!r}")
