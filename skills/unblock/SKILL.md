@@ -391,7 +391,7 @@ The merge procedure is iterative — don't assume one pass will be enough:
 
 To abandon a submitted merge (e.g. the task needs redesign after submission):
 ```
-mcp__escalation__merge_cancel(request_id=request_id)
+mcp__escalation__merge_cancel(request_id=result["request_id"])
 ```
 Whether the `request_id` you received cancels the in-flight entry depends on how you got it: for `queued`, and for `attached` with `poll_by == "request_id"`, it already is the in-flight entry's id (`attached` responses with a known `inflight_request_id` set `req_id_override=dispatch.inflight_request_id`) and cancel works as described above. For `attached` with `poll_by` `"task_id"` or `"branch"`, the id you received names your own coalesced submission, not the in-flight entry — treat the cancel as best-effort (`cancelled: false` / `state: "unknown"` is the expected outcome, not evidence of a lost record). Re-check the real state by the handle `poll_by` names (`merge_status(task_id=...)` or `merge_status(branch="task/<TASK_ID>")`) before deciding whether the merge still needs abandoning.
 
