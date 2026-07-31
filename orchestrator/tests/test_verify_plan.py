@@ -20,6 +20,13 @@ import json
 from pathlib import Path
 
 import pytest
+from _verify_config_corpus import (
+    FM_LINT_COMMAND,
+    MODULE_LINT_COMMANDS,
+    ROOT_LINT_COMMAND,
+    ROOT_TEST_COMMAND,
+    ROOT_TYPE_CHECK_COMMAND,
+)
 
 from orchestrator import verify
 from orchestrator.config import ModuleConfig, OrchestratorConfig
@@ -38,55 +45,11 @@ from orchestrator.verify_plan import (
     reverse_dependent_test_targets,
 )
 
-# ---------------------------------------------------------------------------
-# Real config command strings, verbatim from the repo's orchestrator configs
-# (verified byte-identical to the live YAML). Every subproject's lint_command
-# chains a `python3 fused-memory/scripts/check_*.py <dir>` sibling checker, so
-# these are the corpus that decides whether the pre-merge scoper preserves a
-# trailing clause or truncates at the keyword.
-# ---------------------------------------------------------------------------
-
-# fused-memory/orchestrator.yaml:11 — the only 3-segment chain (two checkers)
-_FM_LINT_COMMAND = (
-    'uv run --project fused-memory --directory fused-memory ruff check src/ tests/'
-    ' && python3 fused-memory/scripts/check_bare_magicmock_config.py fused-memory/tests'
-    ' && python3 fused-memory/scripts/check_asyncmock_assertion_style.py fused-memory/tests'
-)
-
-# cockpit/dashboard/escalation/orchestrator/sampler/shared orchestrator.yaml —
-# each the same 2-segment shape, differing only in the module name.
-_MODULE_LINT_COMMANDS = {
-    module: (
-        f'uv run --project {module} --directory {module} ruff check src/ tests/'
-        f' && python3 fused-memory/scripts/check_bare_magicmock_config.py {module}/tests'
-    )
-    for module in ('cockpit', 'dashboard', 'escalation', 'orchestrator', 'sampler', 'shared')
-}
-
-# dark-factory-orchestrator.yaml:50
-_ROOT_LINT_COMMAND = (
-    'uv run ruff check shared escalation fused-memory orchestrator dashboard'
-    ' && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests'
-    ' escalation/tests fused-memory/tests orchestrator/tests dashboard/tests'
-)
-
-# dark-factory-orchestrator.yaml:51
-_ROOT_TYPE_CHECK_COMMAND = (
-    'cd fused-memory && npx pyright && cd ../orchestrator && npx pyright'
-    ' && cd ../dashboard && npx pyright'
-)
-
-# dark-factory-orchestrator.yaml:41
-_ROOT_TEST_COMMAND = (
-    'cd shared && uv run pytest tests/ --timeout=300'
-    ' && cd ../escalation && uv run pytest tests/ --timeout=300'
-    ' && cd ../orchestrator && uv run pytest tests/ --timeout=300'
-    ' && cd ../fused-memory && uv run pytest tests/ --timeout=300'
-    ' && cd ../dashboard && uv run pytest tests/ --timeout=300'
-    ' && cd ../sampler && uv run pytest tests/ --timeout=300'
-    ' && cd .. && ( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/ --timeout=300 )'
-    ' && uv run --project shared pytest tests/scripts/ --timeout=300'
-)
+# The real config command strings this suite exercises live in
+# `_verify_config_corpus.py` (one definition site, shared with test_verify_cmd.py
+# and test_verify_scope_kappa.py); `test_verify_config_corpus.py` checks them
+# against the live YAML — the executable form of the "verified byte-identical"
+# claim this comment block used to make in prose.
 
 
 # ---------------------------------------------------------------------------
@@ -881,11 +844,11 @@ class TestDeriveVerifyPlanMergeBreadth:
 # pairings, which exercise the keyword-absent and keyword-in-a-later-segment
 # rejections.
 _REAL_CONFIG_COMMANDS: list[tuple[str, str]] = [
-    *((f'{module}-lint', cmd) for module, cmd in _MODULE_LINT_COMMANDS.items()),
-    ('fm-lint', _FM_LINT_COMMAND),
-    ('root-lint', _ROOT_LINT_COMMAND),
-    ('root-type-check', _ROOT_TYPE_CHECK_COMMAND),
-    ('root-test', _ROOT_TEST_COMMAND),
+    *((f'{module}-lint', cmd) for module, cmd in MODULE_LINT_COMMANDS.items()),
+    ('fm-lint', FM_LINT_COMMAND),
+    ('root-lint', ROOT_LINT_COMMAND),
+    ('root-type-check', ROOT_TYPE_CHECK_COMMAND),
+    ('root-test', ROOT_TEST_COMMAND),
     ('ruff-trailing-value-flag', 'ruff check src/ --select E'),
     ('opaque-mypy', 'mypy src/'),
     ('no-op-true', 'true'),
@@ -936,7 +899,7 @@ class TestScoperTrailingClausePreservation:
         byte-identically, still pointed at the whole ``fused-memory/tests``
         directory they assert an invariant over.
         """
-        scoped = verify._scope_to_keyword(_FM_LINT_COMMAND, 'ruff check', self._FILES)
+        scoped = verify._scope_to_keyword(FM_LINT_COMMAND, 'ruff check', self._FILES)
         assert scoped == (
             'uv run --project fused-memory ruff check fused-memory/tests/test_harness.py'
             ' && python3 fused-memory/scripts/check_bare_magicmock_config.py fused-memory/tests'
@@ -948,11 +911,11 @@ class TestScoperTrailingClausePreservation:
             '&& python3 fused-memory/scripts/check_asyncmock_assertion_style.py fused-memory/tests',
         ):
             assert checker in scoped, f'{checker!r} must survive verbatim'
-            assert checker in _FM_LINT_COMMAND, 'the slice asserted above must be verbatim'
+            assert checker in FM_LINT_COMMAND, 'the slice asserted above must be verbatim'
 
     def test_root_lint_chain_scopes_ruff_and_keeps_the_checker(self):
         """dark-factory-orchestrator.yaml:50 — the fallback path's own command."""
-        scoped = verify._scope_to_keyword(_ROOT_LINT_COMMAND, 'ruff check', self._FILES)
+        scoped = verify._scope_to_keyword(ROOT_LINT_COMMAND, 'ruff check', self._FILES)
         assert scoped == (
             'uv run ruff check fused-memory/tests/test_harness.py'
             ' && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests'
@@ -987,14 +950,14 @@ class TestScoperTrailingClausePreservation:
         the leading ``cd fused-memory``, so a surviving ``cd ../orchestrator``
         would resolve relative to the worktree ROOT and escape the repo.
         """
-        scoped = verify._scope_to_keyword(_ROOT_TYPE_CHECK_COMMAND, 'pyright', self._FILES)
+        scoped = verify._scope_to_keyword(ROOT_TYPE_CHECK_COMMAND, 'pyright', self._FILES)
         assert scoped == 'npx pyright fused-memory/tests/test_harness.py'
         assert 'cd ../orchestrator' not in scoped
         assert 'cd ../dashboard' not in scoped
 
     def test_root_test_fan_out_still_truncates(self):
         """Same hazard for ``dark-factory-orchestrator.yaml:41``'s 8-segment fan-out."""
-        scoped = verify._scope_to_keyword(_ROOT_TEST_COMMAND, 'pytest', self._FILES)
+        scoped = verify._scope_to_keyword(ROOT_TEST_COMMAND, 'pytest', self._FILES)
         assert scoped == 'uv run pytest fused-memory/tests/test_harness.py'
         assert 'cd ../escalation' not in scoped
         assert 'cockpit' not in scoped
@@ -1124,7 +1087,7 @@ class TestReprojectStrChainTail:
 
     @pytest.mark.parametrize(
         'raw',
-        [_ROOT_TYPE_CHECK_COMMAND, _ROOT_TEST_COMMAND],
+        [ROOT_TYPE_CHECK_COMMAND, ROOT_TEST_COMMAND],
         ids=['root-type-check-cd-fan-out', 'root-test-subshell-fan-out'],
     )
     def test_gate_reject_cases_still_no_op(self, raw):
@@ -1159,23 +1122,23 @@ class TestReprojectStrChainTail:
         — i.e. ``fused-memory/fused-memory/scripts/...`` -> exit 2 "can't open
         file" -> a spurious RED verify on a clean tree.
         """
-        result = verify._reproject_str(_FM_LINT_COMMAND, verify._FALLBACK_UV_PROJECT)
-        assert result == _FM_LINT_COMMAND
+        result = verify._reproject_str(FM_LINT_COMMAND, verify._FALLBACK_UV_PROJECT)
+        assert result == FM_LINT_COMMAND
         assert 'fused-memory/fused-memory' not in (result or '')
 
     @pytest.mark.parametrize(
         'raw',
         [
-            _FM_LINT_COMMAND,
-            *_MODULE_LINT_COMMANDS.values(),
-            _ROOT_LINT_COMMAND,
-            _ROOT_TYPE_CHECK_COMMAND,
-            _ROOT_TEST_COMMAND,
+            FM_LINT_COMMAND,
+            *MODULE_LINT_COMMANDS.values(),
+            ROOT_LINT_COMMAND,
+            ROOT_TYPE_CHECK_COMMAND,
+            ROOT_TEST_COMMAND,
             'uv run --directory sub pyright src/ && python3 tools/check.py d',
         ],
         ids=[
             'fused-memory-lint',
-            *(f'{module}-lint' for module in _MODULE_LINT_COMMANDS),
+            *(f'{module}-lint' for module in MODULE_LINT_COMMANDS),
             'root-lint',
             'root-type-check-cd-fan-out',
             'root-test-subshell-fan-out',
@@ -1539,7 +1502,7 @@ class TestReverseDependentTestTargets:
 # PlannedRun.scoped_targets: the D3 plan record's scoping provenance (task 3219)
 # ---------------------------------------------------------------------------
 
-# The single-clause counterpart of _MODULE_LINT_COMMANDS' chained shape — the
+# The single-clause counterpart of MODULE_LINT_COMMANDS' chained shape — the
 # UNIFORMITY control for test_unchained_lint_records_the_same_scoped_targets.
 # Nothing in the live configs looks like this today (every subproject chains a
 # sibling checker), which is exactly why the chained path's record loss went
@@ -1562,14 +1525,14 @@ _SWEEP_MODULE_CONFIGS: list[tuple[str, ModuleConfig]] = [
     # The live 2-segment chained lint + the root's cd-chained pyright/pytest.
     ('real-chained', ModuleConfig(
         prefix='orchestrator',
-        lint_command=_MODULE_LINT_COMMANDS['orchestrator'],
-        type_check_command=_ROOT_TYPE_CHECK_COMMAND,
-        test_command=_ROOT_TEST_COMMAND,
+        lint_command=MODULE_LINT_COMMANDS['orchestrator'],
+        type_check_command=ROOT_TYPE_CHECK_COMMAND,
+        test_command=ROOT_TEST_COMMAND,
     )),
     # The only 3-segment chain in the live configs (two sibling checkers).
     ('fm-three-segment-lint', ModuleConfig(
         prefix='orchestrator',
-        lint_command=_FM_LINT_COMMAND,
+        lint_command=FM_LINT_COMMAND,
         type_check_command='npx pyright',
         test_command='uv run pytest tests/ --timeout=300',
     )),
@@ -1577,7 +1540,7 @@ _SWEEP_MODULE_CONFIGS: list[tuple[str, ModuleConfig]] = [
     # (cmd.targets-populated) control the pre-3219 fixtures were all built from.
     ('root-lint-bare-tools', ModuleConfig(
         prefix='orchestrator',
-        lint_command=_ROOT_LINT_COMMAND,
+        lint_command=ROOT_LINT_COMMAND,
         type_check_command='pyright',
         test_command='pytest',
     )),
@@ -1612,9 +1575,9 @@ _FULL_BREADTH_CONFIG = OrchestratorConfig(
 _BARE_FALLBACK_CONFIG = OrchestratorConfig(project_root=Path('/fake'), test_command='pytest')
 _REAL_SUITE_FALLBACK_CONFIG = OrchestratorConfig(
     project_root=Path('/fake'),
-    lint_command=_ROOT_LINT_COMMAND,
-    type_check_command=_ROOT_TYPE_CHECK_COMMAND,
-    test_command=_ROOT_TEST_COMMAND,
+    lint_command=ROOT_LINT_COMMAND,
+    type_check_command=ROOT_TYPE_CHECK_COMMAND,
+    test_command=ROOT_TEST_COMMAND,
 )
 
 # The branches derive_verify_plan can take, split by whether a ModuleConfig is
@@ -1683,7 +1646,7 @@ class TestPlanRecordScopedTargets:
         two are the actual deliverable: the D3 record can now answer "which
         files was this scoped to?".
         """
-        mc = ModuleConfig(prefix='fused-memory', lint_command=_FM_LINT_COMMAND)
+        mc = ModuleConfig(prefix='fused-memory', lint_command=FM_LINT_COMMAND)
         plan = derive_verify_plan([_FM_TEST_FILE], [mc], None, fake_worktree_reader)
         run = _run_for(plan, 'fused-memory', 'lint:')
         assert run is not None
@@ -1732,7 +1695,7 @@ class TestPlanRecordScopedTargets:
         test_file = 'orchestrator/tests/test_x.py'
         mc = ModuleConfig(
             prefix='orchestrator',
-            type_check_command=_MODULE_LINT_COMMANDS['orchestrator'].replace(
+            type_check_command=MODULE_LINT_COMMANDS['orchestrator'].replace(
                 'ruff check', 'npx pyright',
             ),
             test_command='uv run pytest tests/ --timeout=300',
