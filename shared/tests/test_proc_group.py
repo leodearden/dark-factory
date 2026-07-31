@@ -106,14 +106,8 @@ class _TrapReadinessEOF(_TrapReadinessError):
 async def _await_trap_installed(
     proc: asyncio.subprocess.Process,
     *,
-    # Must-not-hang guard — NOT a latency SLA.
-    # Measured success path: 3.9-9.4ms across 8 spawns at loadavg ~200 on
-    # 32 cores (6.2-6.5x CPU oversubscription) — ~1000x headroom under this
-    # 10s deadline. A genuine hang (trap never installed) is infinite, so
-    # 10s cleanly separates pass from hang while staying well under the
-    # caller's @pytest.mark.timeout(30) (shared/pyproject.toml's suite
-    # default is timeout_method="signal"), so this descriptive
-    # AssertionError always fires before pytest-timeout's blunt kill.
+    # Must-not-hang guard, not a latency SLA — see task 3337 for the
+    # measured headroom and the derivation of this value.
     timeout: float = 10.0,
 ) -> None:
     """Wait for a shell child to announce that its SIGTERM trap is armed.
@@ -124,12 +118,9 @@ async def _await_trap_installed(
     happens-before edge proving SIGTERM's disposition is already SIG_IGN in
     the kernel — not a wall-clock guess about how long installation takes
     (the fixed ``asyncio.sleep(0.2)`` this helper replaces was exactly such
-    a guess, and it starved under CPU oversubscription).  Measured directly:
-    across 8 spawns at loadavg ~200 on 32 cores (6.2-6.5x oversubscribed),
-    the ``ready`` line arrived in 3.9-9.4 ms, and at that instant
-    ``/proc/<pid>/status`` already reported ``SigIgn=0x0000000000004000``
-    (bit ``1 << (SIGTERM-1)``) — confirming the line is a valid proxy for
-    the kernel-level precondition, not merely a plausible one.
+    a guess, and it starved under CPU oversubscription).  See task 3337 for
+    the measurement backing this claim (readiness latency and a direct
+    ``/proc/<pid>/status`` SigIgn check at the instant "ready" arrives).
 
     Raises (never a bare ``TimeoutError``, and never returns normally) if
     the precondition is not observed:
