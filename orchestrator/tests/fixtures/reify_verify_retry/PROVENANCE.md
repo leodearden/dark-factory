@@ -134,14 +134,33 @@ unconditionally in that case rather than carrying a distinct interrupted token.
 The rendered block sits ABOVE the synthetic tail so that a whole-file read still
 resolves (last-marker-wins) to the clean marker.
 
-`parse_failed_run_all_members` implements the documented
-`FAILED <space-separated names>` contract only, so against a partial marker it
-would return the literal token `(partial)` alongside the real member names.
-That degrades **safely** — run_all.sh warns
+**Handled: `parse_failed_run_all_members` refuses to narrow on either form.**
+When the `(partial)` token appears among the governing marker's tokens the
+parser returns `[]`, routing reify to the full run_all suite.
+
+An earlier revision of this entry called the variant out-of-scope and claimed it
+"degrades safely" because run_all.sh would warn
 `REIFY_RUN_ALL_MEMBER_SUBSET member '(partial)' not found in $INFRA_DIR
-(ignored)` and skips it — but it is noise, and it is recorded here rather than
-silently absorbed. Handling it is out of scope for task 3059 (filed as
-follow-up).
+(ignored)` and skip the bogus name. That was wrong, and the entry is corrected
+rather than deleted so the mis-analysis stays on the record:
+
+* **Empty `_names` — a total FALSE GREEN, not noise.** The marker is
+  `FAILED (partial)` with no real names at all, so the parse is `['(partial)']`
+  and the subset is the single bogus token. Non-empty means verify.sh:2545's
+  `[ -n "${REIFY_RUN_ALL_MEMBER_SUBSET:-}" ]` gate PASSES, so the safe
+  full-suite fallback never fires; run_all then warns-and-ignores the only
+  member it was given and runs **zero** members, reporting green with no
+  coverage. The warning is the mechanism of the false green, not a mitigation
+  of it.
+* **Non-empty `_names` — a real coverage hole, under-rated as "noise".** The
+  `(partial)` token itself is indeed ignored, but the surviving subset is an
+  INTERRUPTED run's failure list: members that had not yet executed when the
+  SIGTERM landed are neither passed nor failed, and narrowing to only the named
+  failures silently skips them on the retry.
+
+Both are instances of the same rule the rest of this leaf already follows —
+never narrow on an incomplete plan (cf. an unparseable `cargo nextest list`
+probe routing to a full verify, and the first-profile-only rule).
 
 ---
 

@@ -146,6 +146,14 @@ _LIBTEST_TEST_LINE_RE = re.compile(
 _RUN_ALL_FAILED_MARKER_RE = re.compile(r'^FAILED[ \t]+(.*)$', re.MULTILINE)
 
 
+# The sentinel token reify's SECOND marker producer appends when an outer
+# timeout SIGTERMs a run mid-flight: `tests/infra/run_all.sh:684-685`
+# (`_ra_on_term`) emits `printf 'FAILED %s(partial)\n' "${_names:+$_names }"`.
+# Its presence means the marker describes an INTERRUPTED run, so
+# :func:`parse_failed_run_all_members` refuses to narrow on it entirely.
+_RUN_ALL_PARTIAL_MARKER_TOKEN = '(partial)'
+
+
 def _classify_test_status(raw_status: str) -> str:
     """Map a raw nextest or libtest status token to a 3-valued verdict string.
 
@@ -421,6 +429,41 @@ def parse_failed_run_all_members(test_output: str) -> list[str]:
     the immediately preceding line; the anchored regex deliberately does not
     match it, so members are never double-counted.
 
+    **The ``(partial)`` marker refuses to narrow at all.** run_all.sh has a
+    SECOND marker producer — ``:684-685`` in ``_ra_on_term``, the outer-timeout
+    SIGTERM handler — which emits
+    ``printf 'FAILED %s(partial)\\n' "${_names:+$_names }"``.  Both of its forms
+    match the same regex as the clean producer:
+
+    ==============================  =====================================
+    ``FAILED (partial)``            SIGTERM landed before any member had
+                                    recorded a nonzero exit (the
+                                    ``${_names:+...}`` guard collapses)
+    ``FAILED a.sh b.sh (partial)``  some members had failed when it landed
+    ==============================  =====================================
+
+    Whenever that token appears among the governing marker's tokens this
+    returns ``[]`` — the full run_all suite.  Emitting the sentinel as a member
+    name instead would be a **false green**: a non-empty subset passes
+    ``verify.sh:2545``'s ``[ -n "${REIFY_RUN_ALL_MEMBER_SUBSET:-}" ]`` gate, so
+    the safe fallback never fires, and ``run_all.sh:1327`` then warns
+    ``member '(partial)' not found in $INFRA_DIR (ignored)`` and runs ZERO
+    members.  The named form is refused too, for a different reason: an
+    interrupted run's failed-set is not a *complete* failed-set — members that
+    had not yet executed are neither passed nor failed, so narrowing to just
+    the named failures would silently skip them on the retry.
+
+    That is this plan's single rule, now adopted for the third time: **never
+    narrow on an incomplete plan.**  Its two siblings are
+    ``merge_queue._probe_nextest_planned`` returning ``None`` (an unknown
+    planned set routes to a full verify) and the first-profile-only rule (a
+    profile whose attempt-0 nextest pass never executed is never narrowed).
+
+    The token is matched **anywhere** in the token list rather than only in
+    trailing position, because a real run_all member is always a ``.sh``
+    basename: no legitimate member can collide with it, so a looser check can
+    only ever widen the retry to the full suite.
+
     **[] is the SAFE degradation, not a silent narrowing.** An empty result
     means DF sets ``REIFY_RUN_ALL_MEMBER_SUBSET`` to the empty string, and
     ``verify.sh:2545`` gates the subset on ``[ -n "${REIFY_RUN_ALL_MEMBER_SUBSET:-}" ]``
@@ -441,17 +484,22 @@ def parse_failed_run_all_members(test_output: str) -> list[str]:
 
     Returns:
         Member names from the LAST marker in the log, in emission order, exact
-        duplicates collapsed.  ``[]`` when no marker is present or the marker
-        carries no names.
+        duplicates collapsed.  ``[]`` when no marker is present, when the marker
+        carries no names, or when the marker is a ``(partial)`` one.
     """
     matches = _RUN_ALL_FAILED_MARKER_RE.findall(test_output)
     if not matches:
         return []
     # A merge-gate log can concatenate more than one run_all invocation; the
     # LAST marker describes the final state.
+    tokens = matches[-1].split()
+    # Refusal is a property of the governing marker only: an earlier clean
+    # marker is not poisoned by a later partial one, and vice versa.
+    if _RUN_ALL_PARTIAL_MARKER_TOKEN in tokens:
+        return []
     seen: set[str] = set()
     out: list[str] = []
-    for name in matches[-1].split():
+    for name in tokens:
         if name not in seen:
             seen.add(name)
             out.append(name)
