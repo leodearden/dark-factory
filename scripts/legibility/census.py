@@ -569,7 +569,7 @@ def retire_entry(cb: dict, entry_id: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def advance_census_state(
-    path, *, now_iso: str, report_path: str, done_count: int,
+    path, *, now_iso: str, report_path: str, done_count: int | None,
 ) -> None:
     """Write the §7.5 census-state dict to *path*, atomically.
 
@@ -582,6 +582,30 @@ def advance_census_state(
     absent (census_trigger.py:410-416), and this module is
     census-state.json's SOLE writer, so this is the one place that
     baseline can ever be supplied.
+
+    ``done_count`` is THREE-VALUED (task 3291):
+
+    * a positive int -- a real observed done-count;
+    * ``0`` -- also a real observed done-count, for a project with no done
+      tasks. Unchanged, and still never dropped as falsy;
+    * ``None`` -- the done-count could not be OBSERVED at census time
+      (get_statuses unreachable, or it answered with something that was not
+      a ``{"statuses": mapping}`` envelope). Serialised as JSON ``null``,
+      so the key is still always present and the MUST-persist contract
+      above holds literally. ``compute_tasks_landed`` treats ``null``
+      exactly like an absent key, so condition (b) fails SAFE until the
+      next successful census, with condition (a) (``max_interval_days``)
+      remaining the unconditional backstop.
+
+    Writing a fabricated ``0`` for an unobservable count, or carrying
+    forward the previous file's value, are both FORBIDDEN here. The
+    fabricated 0 is exactly what made condition (b) always-fire: it turned
+    the delta into ``current_done - 0`` -- every done task ever, trivially
+    over the 120 threshold -- every ~7 days from 2026-07-24 onward. A
+    carried-forward stale count is merely a quieter guess, silently
+    under-reporting the next window's delta. ``null`` is the only honest
+    value for an unknown, and it is the caller's job to pass it rather than
+    invent a number.
 
     Uses the same ``tempfile.mkstemp`` + ``os.replace`` atomic-write
     pattern as ``codebook.dump`` (temp file in the same directory as
