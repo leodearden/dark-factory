@@ -467,6 +467,104 @@ _ANN_DISCLOSURE_KEYS: tuple[str, ...] = (
 )
 
 
+# Every way the liveness-recurrence path can lose a candidate, enumerated ONCE.
+# Kept as a THIRD sibling of _ANN_DISCLOSURE_KEYS / _PLAN_DISCLOSURE_KEYS
+# rather than folded into either, so each generator's disclosure contract stays
+# its own. Same contract as its siblings: every key always present, always an
+# int, always zero-filled on a clean run.
+_LIVENESS_DISCLOSURE_KEYS: tuple[str, ...] = ()
+
+
+def find_liveness_snapshot_recurrences(
+    memories: list[dict],
+    *,
+    categories: Iterable[str] = _ALL_CATEGORIES,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Group point-in-time liveness snapshots that re-assert one core FACT.
+
+    The third candidate class, and the only one that is REPORT-ONLY: its
+    groups never reach ``delete_candidates``. Task 3098 authorizes DETECTION
+    of this pattern, not disposition of the records that exhibit it.
+
+    Buckets by ``(category, subject_task_id, core_fact)`` and emits every
+    bucket with >= 2 members — the same >= 2 rule ``cluster_memories_by_pairs``
+    already applies, so "what counts as a group" does not acquire a second
+    meaning. Grouping is PER CATEGORY for the same reason ``build_sweep_plan``
+    clusters per category: a preference and an observation that happen to
+    report the same live fields are different kinds of knowledge, and unioning
+    them would be cross-store conflation rather than deduplication.
+
+    A record contributes to one bucket per subject it names, so a
+    re-verification covering two tasks joins both their groups — which is
+    exactly how memory 1eef7df7 links to the earlier 94 and 96 snapshots.
+
+    Args:
+        memories: Raw memory list (any/all categories).
+        categories: Categories to sweep. Records outside the set are ignored
+            entirely — they were never in scope, so they are not a loss.
+
+    Returns:
+        ``(groups, disclosure)``. Each group carries ``subject_task_id``,
+        ``category``, ``core_fact``, ``member_ids`` (sorted by ``str`` id),
+        ``snapshot_count``, ``first_seen``/``last_seen`` (the min/max member
+        ``created_at``) and ``span_days``. Timestamps go through
+        ``_parsed_timestamp``/``_created_at_sort_key`` so "what counts as a
+        usable timestamp" keeps the one definition it shares with
+        ``pick_survivor``; a group whose members ALL lack a parseable
+        timestamp reports None for all three rather than fabricating a span.
+        Groups are sorted by ``(category, subject_task_id, first member id)``
+        so two identical runs serialise byte-identically. Does not mutate
+        *memories* or its dicts.
+    """
+    swept = set(categories)
+    disclosure = dict.fromkeys(_LIVENESS_DISCLOSURE_KEYS, 0)
+    buckets: dict[tuple[str, str, str], list[dict]] = {}
+
+    for record in memories:
+        category = record.get('category')
+        if category not in swept:
+            continue
+        core_fact = extract_liveness_snapshot_fact(record)
+        if core_fact is None:
+            continue
+        for subject in liveness_snapshot_subject_task_ids(record):
+            buckets.setdefault((category, subject, core_fact), []).append(record)
+
+    groups: list[dict[str, Any]] = []
+    for (category, subject, core_fact), members in buckets.items():
+        if len(members) < 2:
+            continue
+        dated = [
+            m for m in members if _parsed_timestamp(m.get('created_at')) is not None
+        ]
+        first_seen = last_seen = None
+        span_days = None
+        if dated:
+            ordered = sorted(
+                dated, key=lambda m: _created_at_sort_key(m.get('created_at')),
+            )
+            first_seen = ordered[0].get('created_at')
+            last_seen = ordered[-1].get('created_at')
+            span_days = (
+                _parsed_timestamp(last_seen) - _parsed_timestamp(first_seen)
+            ) / _SECONDS_PER_DAY
+        groups.append({
+            'subject_task_id': subject,
+            'category': category,
+            'core_fact': core_fact,
+            'member_ids': sorted((m.get('id') for m in members), key=str),
+            'snapshot_count': len(members),
+            'first_seen': first_seen,
+            'last_seen': last_seen,
+            'span_days': span_days,
+        })
+
+    groups.sort(key=lambda g: (
+        str(g['category']), g['subject_task_id'], str(g['member_ids'][0]),
+    ))
+    return groups, disclosure
+
+
 def ann_pairs_from_neighbors(
     memories: list[dict],
     neighbors_by_id: dict[Any, list[dict]],
