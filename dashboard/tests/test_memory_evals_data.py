@@ -1708,11 +1708,15 @@ class TestStalenessAndDegradedStates:
         from dashboard.data.memory_evals import build_memory_evals
 
         root, esc_dir = _healthy_tree(tmp_path)
-        limits_path = _write_limits(root, 'eval-a', run_stamp=_AGE_RUN, verdicts=[
+        # Annotated `list[Any]`: the whole point is that two of these records
+        # are NOT the shape the artifact promises, which the writer's own
+        # parameter type would otherwise refuse to express.
+        records: list[Any] = [
             {'metric_id': 'dangling-pointers', 'rule_kind': 'count'},
             'not-an-object',
             {'metric_id': None, 'rule_kind': 'count'},
-        ])
+        ]
+        limits_path = _write_limits(root, 'eval-a', run_stamp=_AGE_RUN, verdicts=records)
 
         payload = build_memory_evals(root, esc_dir)
 
@@ -2670,13 +2674,23 @@ class TestCommittedExemplarBoundary:
         is a review property, stated in the module docstring, not something a
         test can police about itself.
 
-        Checked over the AST rather than the raw text, for two reasons: a text
-        grep would match this assertion's own literals, and it would also match
-        the reader's docstring, which *names* ``math.comb`` precisely to record
-        that it must never appear.  The AST sees code, which is what the
+        Checked over the AST rather than the raw text because a text grep
+        matches prose as readily as code — this assertion's own literals, and
+        any future docstring that has to *name* a forbidden symbol in order to
+        record that it must never appear.  The AST sees code, which is what the
         sidecar's ``expect: absent`` grep over ``dashboard/src/dashboard/data/``
-        is actually about — and an unimported ``math`` is a stronger guarantee
-        than an ungrepped one.
+        is actually about.
+
+        The ban is on the IMPORT, not only on attribute access, because
+        ``from math import comb`` leaves no ``math.`` prefix for the
+        attribute check below to find.  That is also why ``math`` is banned
+        whole rather than narrowed to its statistical surface: this reader
+        renders values it has already been handed, so it has no established
+        need for any of ``math``, and a ban with no exceptions cannot be
+        eroded one benign-looking import at a time.  If a real need appears
+        (``math.isnan`` on a NaN value, say), narrowing this to
+        ``{'statistics'}`` is the deliberate decision to make then — with the
+        attribute check still standing guard over the re-derivation risk.
         """
         import ast
 
