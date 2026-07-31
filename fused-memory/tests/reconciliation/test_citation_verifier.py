@@ -15,7 +15,9 @@ from unittest.mock import AsyncMock, call
 import pytest
 
 from fused_memory.reconciliation.citation_verifier import (
+    build_citation_tombstone,
     find_citation_occurrences,
+    is_concrete_memory_id,
     repoint_metadata,
     verify_cited_memories,
 )
@@ -449,3 +451,80 @@ class TestRepointMetadata:
         assert untouched == {k: v for k, v in metadata.items() if k != 'cited'}
         # The prefix twin is emphatically not collateral damage.
         assert repointed['nested']['twin'] == _PREFIX_TWIN
+
+
+# The literal string Stage 2 wrote as a "correction" during the incident.
+# Running that query live returned only superseded cluster members and routed
+# dispatch straight back into the contradictory advice consolidation existed
+# to collapse. It must never be accepted as a forwarding pointer.
+_INCIDENT_SEARCH_INSTRUCTION = 're-derive the current canonical entry via search(query=...)'
+
+
+class TestConcreteReplacementPointer:
+    """A forwarding pointer is only valid if it is a concrete id.
+
+    This is the mechanical guard against incident failure mode (2): UUID-shape
+    is a hard precondition of the tombstone builder, not advice in a prompt.
+    """
+
+    def test_canonical_uuid_is_concrete(self):
+        """(a) A canonical 36-char UUID is a concrete pointer."""
+        assert is_concrete_memory_id(_SURVIVOR) is True
+        assert is_concrete_memory_id(_DOOMED) is True
+
+    def test_incident_search_instruction_is_not_concrete(self):
+        """(b) The incident's re-derive-via-search prose is NOT a pointer."""
+        assert is_concrete_memory_id(_INCIDENT_SEARCH_INSTRUCTION) is False
+
+    @pytest.mark.parametrize(
+        'value',
+        [
+            _SURVIVOR[:8],          # truncated 8-char prefix
+            '',                     # empty
+            '   ',                  # whitespace
+            None,                   # missing
+            12345,                  # non-str
+            ['a-uuid'],             # non-str container
+            _SURVIVOR + 'x',        # 37 chars
+            _SURVIVOR[:-1],         # 35 chars
+            'ZZZZZZZZ-3333-4eee-8fff-000000000003',  # non-hex
+        ],
+    )
+    def test_non_uuid_values_are_not_concrete(self, value):
+        """(c) Prefixes, empties, None, non-strs and malformed UUIDs are rejected."""
+        assert is_concrete_memory_id(value) is False
+
+    def test_tombstone_names_both_ids_paths_and_run(self):
+        """(d) The tombstone record preserves the old->new mapping explicitly."""
+        record = build_citation_tombstone(
+            superseded_id=_DOOMED,
+            replacement_id=_SURVIVOR,
+            paths=['mem0_canonical_entry', 'memory_hints.queries[0]'],
+            run_id='run-abc',
+        )
+
+        assert record['superseded_memory_id'] == _DOOMED
+        assert record['replacement_memory_id'] == _SURVIVOR
+        assert record['paths'] == ['mem0_canonical_entry', 'memory_hints.queries[0]']
+        assert record['run_id'] == 'run-abc'
+
+    def test_tombstone_refuses_a_search_instruction_replacement(self):
+        """(e) A search instruction can never become a forwarding pointer."""
+        with pytest.raises(ValueError):
+            build_citation_tombstone(
+                superseded_id=_DOOMED,
+                replacement_id=_INCIDENT_SEARCH_INSTRUCTION,
+                paths=['mem0_canonical_entry'],
+                run_id='run-abc',
+            )
+
+    @pytest.mark.parametrize('bad', [_SURVIVOR[:8], '', None, 12345])
+    def test_tombstone_refuses_any_non_concrete_replacement(self, bad):
+        """(e) ...and the same refusal covers every non-concrete shape."""
+        with pytest.raises(ValueError):
+            build_citation_tombstone(
+                superseded_id=_DOOMED,
+                replacement_id=bad,
+                paths=[],
+                run_id='run-abc',
+            )
