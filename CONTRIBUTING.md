@@ -285,9 +285,13 @@ it strips any staged `.task/` files (see §8), then on `main` runs `ruff
 check`, the asyncmock/bare-MagicMock style checks on staged test files, and
 **pyright up to 3×** (once per touched package under `PYRIGHT_PACKAGES`, or
 across all three if the change touches a shared dependency like `shared` or
-`escalation`). This can comfortably exceed two minutes — give commit
-commands a timeout of at least `300000`ms (or run detached via `setsid` and
-poll) rather than letting a default 2-minute timeout kill it mid-hook.
+`escalation`). That stage is path-filtered since task 2551: a commit
+staging no `.py` files skips pyright entirely and finishes in seconds
+(`pre-commit: pyright skipped (no Python changes)`). A commit that does
+stage Python changes can comfortably exceed two minutes — give those a
+timeout of at least `300000`ms (or run detached via `setsid` and poll)
+rather than letting a default 2-minute timeout kill it mid-hook;
+docs/plans-only commits are exempt.
 Never `--no-verify` this hook to skip pyright/ruff on a code change; the
 two narrow documented exceptions are the *pre-merge-commit* emergency
 bypass (§5) and a **docs-only** commit landing under index-lock contention
