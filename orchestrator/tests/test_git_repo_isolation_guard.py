@@ -1,0 +1,195 @@
+"""Guard tests: test-suite git helpers cannot escape into an enclosing repo.
+
+Incident esc-3072-3.  Git repository discovery walks UP the directory tree.
+A test helper that shells out to git with a caller-supplied ``cwd`` therefore
+does not operate on "the directory the caller named" — it operates on
+*whatever repo encloses that directory*.  When pytest's basetemp happens to
+live inside a live task worktree (``.worktrees/<task>/.pytest-tmp/``), a
+helper handed a bare ``tmp_path`` silently retargets production state: three
+blobs were written into the live worktree's object store and ``foo.py`` was
+staged at stages 1/2/3, leaving ``UU foo.py`` in a real task's index.
+
+The two-layer defence under test here lives in ``_orch_helpers``:
+
+* :func:`assert_isolated_git_repo` — a pure-filesystem pre-flight that runs
+  BEFORE any subprocess, so a rejected call writes nothing anywhere.  This is
+  the property a mid-sequence git failure cannot provide: ``git hash-object -w``
+  writes its blobs before a later ``git update-index`` can fail.
+* :func:`git_env_with_ceiling` — a ``GIT_CEILING_DIRECTORIES`` env ceiling that
+  makes the upward walk physically unable to leave ``cwd`` even if the
+  pre-flight is later refactored away.
+
+This module holds the guard-API unit tests plus the AST recurrence guard over
+``test_git_ops.py``.  The escape-path regression tests live in
+``test_git_ops.py`` itself, next to the module-private helpers they cover.
+"""
+from __future__ import annotations
+
+import os
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from _orch_helpers import NonIsolatedGitRepoError, assert_isolated_git_repo
+
+
+def _init_repo(path: Path) -> Path:
+    """``git init`` a fresh repo at *path* with one commit.  Creates its own
+    target, so it cannot escape into an enclosing repo.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(['git', 'init', '-b', 'main'], cwd=path, check=True, capture_output=True)
+    subprocess.run(
+        ['git', 'config', 'user.email', 'test@test.com'], cwd=path, check=True, capture_output=True,
+    )
+    subprocess.run(
+        ['git', 'config', 'user.name', 'Test'], cwd=path, check=True, capture_output=True,
+    )
+    (path / 'README.md').write_text('# sentinel\n')
+    subprocess.run(['git', 'add', '-A'], cwd=path, check=True, capture_output=True)
+    subprocess.run(
+        ['git', 'commit', '-m', 'initial'], cwd=path, check=True, capture_output=True,
+    )
+    return path
+
+
+def _add_linked_worktree(repo: Path, name: str) -> Path:
+    """``git worktree add`` a linked worktree of *repo*; its ``.git`` is a FILE."""
+    wt = repo.parent / name
+    subprocess.run(
+        ['git', 'worktree', 'add', '-b', name, str(wt)],
+        cwd=repo, check=True, capture_output=True,
+    )
+    return wt
+
+
+class TestAssertIsolatedGitRepo:
+    """assert_isolated_git_repo(cwd) admits repo roots, refuses everything else."""
+
+    def test_accepts_normal_repo_root(self, tmp_path: Path):
+        """A normal checkout root (``.git`` is a DIRECTORY) is accepted."""
+        repo = _init_repo(tmp_path / 'repo')
+        assert (repo / '.git').is_dir(), 'precondition: normal checkout has a .git dir'
+
+        assert_isolated_git_repo(repo)  # must not raise
+
+    def test_accepts_linked_worktree_root(self, tmp_path: Path):
+        """A linked-worktree root (``.git`` is a FILE) is accepted.
+
+        Load-bearing: two legitimate ``_inject_uu_state`` call sites
+        (test_git_ops.py:787 and :5116) pass ``<tmp repo>/.worktrees/<task>``
+        roots produced by ``git_ops.create_worktree(...)``, where ``.git`` is a
+        gitdir *file*, not a directory.  A naive ``.git``-is-a-directory check
+        would reject correct callers.
+        """
+        repo = _init_repo(tmp_path / 'repo')
+        wt = _add_linked_worktree(repo, 'linked-wt')
+        assert (wt / '.git').is_file(), 'precondition: linked worktree has a .git file'
+
+        assert_isolated_git_repo(wt)  # must not raise
+
+    def test_raises_on_bare_uninitialized_dir(self, tmp_path: Path):
+        """A never-``git init``ed directory is refused."""
+        bare = tmp_path / 'never-a-repo'
+        bare.mkdir()
+
+        with pytest.raises(NonIsolatedGitRepoError):
+            assert_isolated_git_repo(bare)
+
+    def test_raises_on_non_repo_nested_inside_live_repo(self, tmp_path: Path):
+        """The esc-3072-3 shape: a non-repo dir NESTED inside a live repo.
+
+        This is exactly the layout that made the incident possible — git's
+        upward walk resolves the enclosing repo, so the helper would have
+        happily mutated it.  The rejection message must name the rejected path
+        so the failure is self-diagnosing.
+        """
+        sentinel = _init_repo(tmp_path / 'live-worktree')
+        nested = sentinel / '.pytest-tmp' / 'test_x0'
+        nested.mkdir(parents=True)
+
+        with pytest.raises(NonIsolatedGitRepoError) as excinfo:
+            assert_isolated_git_repo(nested)
+
+        message = str(excinfo.value)
+        assert str(nested) in message, (
+            f'Error must name the rejected path {nested} so the failure is '
+            f'self-diagnosing; got: {message}'
+        )
+
+    def test_error_names_the_enclosing_repo_git_would_have_hit(self, tmp_path: Path):
+        """The message points at the repo the upward walk WOULD have resolved.
+
+        Naming the victim is what turns "this call was refused" into "this call
+        was about to write into <that repo>".
+        """
+        sentinel = _init_repo(tmp_path / 'live-worktree')
+        nested = sentinel / '.pytest-tmp' / 'test_x0'
+        nested.mkdir(parents=True)
+
+        with pytest.raises(NonIsolatedGitRepoError) as excinfo:
+            assert_isolated_git_repo(nested)
+
+        assert str(sentinel) in str(excinfo.value), (
+            f'Error must name the enclosing repo {sentinel}; got: {excinfo.value}'
+        )
+
+    def test_performs_no_subprocess_work(self, tmp_path: Path, monkeypatch):
+        """The guard is pure filesystem — it spawns NO child process.
+
+        This is the zero-write property in executable form.  A guard that shells
+        out to ``git rev-parse`` to decide would already be too late for the
+        general case, and would itself be subject to the upward walk it exists
+        to contain.  Sabotage every spawn path and assert the guard still
+        reaches its verdict.
+        """
+        sentinel = _init_repo(tmp_path / 'live-worktree')
+        nested = sentinel / '.pytest-tmp' / 'test_x0'
+        nested.mkdir(parents=True)
+
+        def _no_spawn(*args, **kwargs):
+            raise AssertionError(
+                'assert_isolated_git_repo spawned a child process; it must be '
+                'pure-filesystem pre-flight so a rejected call writes nothing.'
+            )
+
+        monkeypatch.setattr(subprocess, 'Popen', _no_spawn)
+        monkeypatch.setattr(os, 'posix_spawn', _no_spawn)
+
+        # Refusal path: git resolution WOULD have succeeded here (the enclosing
+        # sentinel repo is reachable), and the guard refuses anyway.
+        with pytest.raises(NonIsolatedGitRepoError):
+            assert_isolated_git_repo(nested)
+
+        # Acceptance path: also decided without spawning anything.
+        assert_isolated_git_repo(sentinel)
+
+    def test_accepts_str_path(self, tmp_path: Path):
+        """A ``str`` cwd is accepted as readily as a ``Path``.
+
+        ``_inject_uu_state`` stringifies its cwd for ``subprocess.run``; callers
+        elsewhere in the suite pass either shape.
+        """
+        repo = _init_repo(tmp_path / 'repo')
+
+        assert_isolated_git_repo(str(repo))  # type: ignore[arg-type]
+
+    def test_raises_on_missing_dir(self, tmp_path: Path):
+        """A path that does not exist at all is refused, not crashed on."""
+        with pytest.raises(NonIsolatedGitRepoError):
+            assert_isolated_git_repo(tmp_path / 'does-not-exist')
+
+    def test_error_is_an_assertion_error(self, tmp_path: Path):
+        """``NonIsolatedGitRepoError`` reads as a test-harness contract violation.
+
+        Subclassing ``AssertionError`` (not ``Exception``) keeps an unguarded
+        call legible as "the test suite broke its own isolation contract"
+        rather than as a product error.
+        """
+        assert issubclass(NonIsolatedGitRepoError, AssertionError)
+
+        bare = tmp_path / 'nope'
+        bare.mkdir()
+        with pytest.raises(AssertionError):
+            assert_isolated_git_repo(bare)
