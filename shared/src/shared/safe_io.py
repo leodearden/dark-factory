@@ -19,6 +19,7 @@ file" site in the repo delegates to (task 3223).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -170,6 +171,16 @@ def atomic_write_text(
     # The temp lives in the destination's own directory so the rename stays on
     # one filesystem — required for os.replace to be atomic per rename(2).
     fd, tmp_str = tempfile.mkstemp(suffix='.tmp', prefix=p.name, dir=str(p.parent))
-    with os.fdopen(fd, 'w', encoding=encoding) as f:
-        f.write(text)
-    os.replace(tmp_str, str(p))
+    try:
+        with os.fdopen(fd, 'w', encoding=encoding) as f:
+            f.write(text)
+        os.replace(tmp_str, str(p))
+    except BaseException:
+        # BaseException, not Exception: a KeyboardInterrupt landing mid-write
+        # must still remove the temp, or an interrupted process leaves residue
+        # next to the destination forever.  Mirrors the prompt_artifact /
+        # memory_eval helpers this consolidates.  The unlink is best-effort;
+        # the ORIGINAL exception is what the caller must see.
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_str)
+        raise
