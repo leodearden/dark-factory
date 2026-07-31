@@ -2033,6 +2033,9 @@ class TestInitialRunDetection:
         assert _mod().is_initial_run(tmp_path)
 
 
+_STORE_SECTION_HEADER = 'which store served the query (observations):'
+
+
 class TestProbeReport:
     """`render_probe_report(series, observations, *, is_initial_run)`."""
 
@@ -2048,6 +2051,33 @@ class TestProbeReport:
         assert '3111' in report
         assert '3112' in report
         assert 'not a finding' in report.lower()
+
+    def test_the_known_bad_list_carries_the_routing_caveat_inline(self):
+        """(a) esc-3208-1: the misreading happens at the headline, so the
+        caveat has to be AT the known-bad list, not only in the store
+        breakdown far below it. The first live baseline was 72/78 observations
+        served by Graphiti against 72/78 unmatched — a reader who stops at the
+        rate takes a router property for a findability collapse."""
+        m = _mod()
+        report = m.render_probe_report(
+            _report_series(), _report_observations(), is_initial_run=True,
+        )
+
+        # Anchor on the section HEADER, not the bare phrase: the caveat itself
+        # names the section it points at, so slicing on the phrase would cut
+        # the report inside the very sentence under test.
+        head = report[:report.index(_STORE_SECTION_HEADER)]
+        assert 'router' in head.lower()
+        assert 'routing' in head.lower()
+
+    def test_the_routing_caveat_is_scoped_to_the_initial_run(self):
+        """It explains an inherited snapshot; on run fifty it would be noise."""
+        report = _mod().render_probe_report(
+            _report_series(), _report_observations(), is_initial_run=False,
+        )
+
+        head = report[:report.index(_STORE_SECTION_HEADER)]
+        assert 'router' not in head.lower()
 
     def test_a_later_run_has_no_initial_state_section(self):
         """(b) Inherited state is only inherited once."""

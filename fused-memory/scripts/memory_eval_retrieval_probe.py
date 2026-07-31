@@ -1780,6 +1780,15 @@ _KNOWN_BAD_PREAMBLE = (
     'this list is a separate leaf\'s job; this runner only measures.'
 )
 
+_KNOWN_BAD_ROUTING_CAVEAT = (
+    'Read this list together with "which store served the query" below BEFORE '
+    'concluding anything about findability. A phrasing the read router sent to '
+    'a store the canonical does not live in cannot hit however healthy '
+    'retrieval is, so a failing item here can be a routing fact rather than a '
+    'corpus one, and the two are not distinguishable from the rate alone. '
+    'Which it is belongs to the retrieval-fix lineage, not to this monitor.'
+)
+
 
 def render_probe_report(
     series,
@@ -1824,6 +1833,16 @@ def render_probe_report(
         lines.append(f'INITIAL STATE — known-bad items ({len(failing)}):')
         for chunk in _wrap(_KNOWN_BAD_PREAMBLE):
             lines.append(f'  {chunk}')
+        # The routing caveat is repeated HERE, not left to the store breakdown
+        # ~150 lines below, because this is the section an operator reads on the
+        # one run it matters for. The first live baseline came back 72/78
+        # observations served by Graphiti and 72/78 unmatched; a reader who
+        # stops at the headline rate takes a router property for a corpus-wide
+        # findability collapse (esc-3208-1).
+        lines.append('')
+        for chunk in _wrap(_KNOWN_BAD_ROUTING_CAVEAT):
+            lines.append(f'  {chunk}')
+        lines.append('')
         lines.extend(f'  - {key}' for key in failing)
         if not failing:
             lines.append('  (no tripwire item is failing in this initial run)')
