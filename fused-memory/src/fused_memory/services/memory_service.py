@@ -7,6 +7,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import os
 import re
 import time
 import uuid as uuid_mod
@@ -18,7 +19,11 @@ from graphiti_core.nodes import EpisodeType
 
 from fused_memory.backends.graphiti_client import GraphitiBackend
 from fused_memory.backends.mem0_client import Mem0Backend
-from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.config.schema import FusedMemoryConfig, MemoryMetadataConfig
+from fused_memory.memory_metadata import (
+    MemoryMetadataValidationError,
+    validate_memory_metadata,
+)
 from fused_memory.models.enums import (
     GRAPHITI_PRIMARY,
     MEM0_PRIMARY,
@@ -51,6 +56,11 @@ from fused_memory.reconciliation.standing_decision_writer import (
 from fused_memory.routing.classifier import WriteClassifier
 from fused_memory.routing.router import ReadRouter
 from fused_memory.services.durable_queue import DurableWriteQueue
+from fused_memory.services.memory_metadata_census import (
+    UnknownKeyStormDetector,
+    emit_schema_warnings,
+    file_unknown_key_storm_escalation,
+)
 from fused_memory.utils.async_utils import gather_collect, gather_or_raise
 from fused_memory.utils.task_naming import canonicalize_task_node_name
 
@@ -384,6 +394,76 @@ def _normalize_task_id_metadata(meta: dict) -> None:
     """
     if 'task_id' in meta and meta['task_id'] is not None:
         meta['task_id'] = str(meta['task_id'])
+
+
+def _apply_memory_metadata_validation(
+    meta: dict,
+    *,
+    project_id: str,
+    agent_id: str | None,
+    config: MemoryMetadataConfig,
+    storm_detector: UnknownKeyStormDetector,
+    project_root: str,
+) -> None:
+    """Validate the Mem0 metadata vocabulary at the write boundary, in place.
+
+    Task 3195 (leaf β of ``docs/prds/memory-metadata-vocabulary.md``).  The
+    third of this module's shared in-place metadata helpers, alongside
+    :func:`_normalize_task_id_metadata` and
+    :func:`_apply_cycle_summary_metadata_tagging`, and shared by
+    ``add_memory`` and ``add_system_record`` for the same reason the
+    task-2222 amendment made the cycle-summary tagging shared: PRD D8/§2 pin
+    enforcement at the SERVICE seam precisely because ``add_system_record``
+    is a second write path that a tools-layer validator would leak past.
+    Two call sites with drifting behaviour would reopen that hole.
+
+    Discharges three obligations:
+
+    1. **Normalize + shape-check** via ``validate_memory_metadata`` (the only
+       in-place mutation is ``supersedes`` scalar→list, PRD D2).
+    2. **Census** every violation, fatal or not, so warn-mode leaves a trace.
+    3. **Reject** — but ONLY when ``enforce`` is on AND at least one
+       violation is fatal.  Unknown keys are never fatal, so flipping
+       ``enforce`` cannot turn the 1,627-key long tail into an outage.
+
+    The enforce flags are read PER CALL off the shared config object rather
+    than captured, so a config edit takes effect on the next write.
+
+    Raises :class:`MemoryMetadataValidationError` when enforcing.  Everything
+    else here — the census line, the storm detector, the escalation filing —
+    is strictly best-effort and structurally cannot raise, because it runs on
+    the live memory write path where a raise would fail the write because the
+    *complaint about* the write failed.
+    """
+    violations = validate_memory_metadata(
+        meta, enforce_kind_registry=config.enforce_kind_registry
+    )
+    if not violations:
+        return
+
+    emit_schema_warnings(violations, project_id=project_id, agent_id=agent_id)
+
+    unknown_keys = [v.key for v in violations if v.code == 'unknown_key']
+    if unknown_keys and storm_detector.record(project_id, agent_id, unknown_keys):
+        if project_root:
+            file_unknown_key_storm_escalation(
+                project_root,
+                project_id=project_id,
+                agent_id=agent_id,
+                keys=unknown_keys,
+            )
+        else:
+            # No configured taskmaster.project_root means no project queue to
+            # file into. The census lines are already out, so the signal is
+            # not lost — only the escalation.
+            logger.debug(
+                'memory_metadata: unknown-key storm from project_id=%r '
+                'agent_id=%r but no project_root is configured; not escalating',
+                project_id, agent_id,
+            )
+
+    if config.enforce and any(v.fatal for v in violations):
+        raise MemoryMetadataValidationError([v for v in violations if v.fatal])
 
 
 def _apply_cycle_summary_metadata_tagging(
@@ -770,6 +850,29 @@ class MemoryService:
         # Process-start baselines for uptime reporting
         self._started_at: datetime = datetime.now(UTC)
         self._start_monotonic: float = time.monotonic()
+        # Mem0 metadata unknown-key storm detector (task 3195, leaf β).
+        # Constructed ONCE so warn counts survive across writes but never leak
+        # between processes; a per-write detector would reset its window every
+        # time and could never reach the threshold, leaving the escape hatch
+        # as dead code that still looked wired up. This is also why the two
+        # storm-tuning config leaves are restart-only rather than
+        # hot-reloadable — see MemoryMetadataConfig's docstring.
+        self._metadata_storm_detector = UnknownKeyStormDetector(
+            threshold=config.memory_metadata.unknown_key_storm_threshold,
+            window_seconds=config.memory_metadata.unknown_key_storm_window_seconds,
+        )
+
+    def _memory_metadata_project_root(self) -> str:
+        """Project root the unknown-key storm escalation would be filed into.
+
+        Reuses the established resolution (``config.taskmaster.project_root``
+        or empty, see ``reconciliation/harness.py`` and ``server/main.py``)
+        rather than introducing a second notion of "this project's root".
+        Returns ``''`` when unconfigured, which the caller treats as
+        "census only, do not escalate" — there is no queue to file into.
+        """
+        raw = self.config.taskmaster.project_root if self.config.taskmaster else ''
+        return os.path.expanduser(raw) if raw else ''
 
     def set_event_buffer(self, buffer: EventBuffer) -> None:
         """Wire the reconciliation event buffer into the service."""
@@ -2206,6 +2309,27 @@ class MemoryService:
         # treatment. See _apply_cycle_summary_metadata_tagging's docstring.
         _apply_cycle_summary_metadata_tagging(meta, causation_id, project_id=project_id)
 
+        # Mem0 metadata vocabulary validation (task 3195, leaf β). Placement is
+        # load-bearing at BOTH ends:
+        #   AFTER the two tagging helpers above, so category/recon_pool/run_id
+        #   are already in `meta` and get classified as server-stamped rather
+        #   than censused as unknown keys (the alternative is a second copy of
+        #   the server-stamped key list — an INV-5 violation);
+        #   BEFORE the write_graphiti/write_mem0 branching below, the
+        #   write-ahead mem0 intent, and every backend call, so a rejection can
+        #   never leave a pending intent for recover_mem0_intents to reconcile
+        #   or a half-written Graphiti twin. Being before the branching is also
+        #   what makes this cover Graphiti-primary writes, which never reach
+        #   Mem0 at all — V1 covers the seam, not just the Mem0 branch.
+        _apply_memory_metadata_validation(
+            meta,
+            project_id=project_id,
+            agent_id=agent_id,
+            config=self.config.memory_metadata,
+            storm_detector=self._metadata_storm_detector,
+            project_root=self._memory_metadata_project_root(),
+        )
+
         write_graphiti = (
             resolved_category in GRAPHITI_PRIMARY or dual_write
         )
@@ -2555,6 +2679,22 @@ class MemoryService:
         # system-record cycle_summary must not go untagged just because it
         # bypassed add_memory.
         _apply_cycle_summary_metadata_tagging(meta, causation_id, project_id=project_id)
+
+        # Same vocabulary validation add_memory applies (task 3195, leaf β).
+        # PRD D8/§2 name add_system_record as the second unguarded write path
+        # that a tools-layer validator would leak past, so it shares the very
+        # same helper rather than getting a parallel implementation that could
+        # drift. Placed after the tagging helpers and before the
+        # _journaled_backend_call below, for the reasons spelled out at
+        # add_memory's call site.
+        _apply_memory_metadata_validation(
+            meta,
+            project_id=project_id,
+            agent_id=agent_id,
+            config=self.config.memory_metadata,
+            storm_detector=self._metadata_storm_detector,
+            project_root=self._memory_metadata_project_root(),
+        )
 
         mem0_result = None
         mem0_ids: list[str] = []

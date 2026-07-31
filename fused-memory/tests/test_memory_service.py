@@ -7274,7 +7274,18 @@ class TestReconPoolAutoTagMissingStageWarning:
                 project_id='dark_factory',
                 metadata={'kind': 'note'},
             )
-        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        # Scoped to the logger this test names, matching its docstring: the
+        # claim is about THIS warning (the missing-stage one), not about the
+        # write being silent overall. caplog captures propagated records from
+        # every logger, so an unscoped assertion here was really asserting
+        # global silence — and task 3195's metadata census legitimately emits
+        # a memory_metadata.schema_warning for kind='note', which is not in
+        # KIND_REGISTRY. Narrowing preserves this test's actual claim exactly.
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and r.name == 'fused_memory.services.memory_service'
+        ]
         assert warning_records == [], (
             f'Expected no WARNING for a non-cycle_summary kind, got: '
             f'{[r.message for r in warning_records]}'
@@ -9135,8 +9146,12 @@ class TestMemoryMetadataValidationAtSeam:
         """
         caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
 
+        # `stage` is what the helper infers recon_pool FROM, and it must be a
+        # KNOWN stage (CYCLE_SUMMARY_STAGE_TO_RECON_POOL) or the helper no-ops
+        # on recon_pool. Without a real one this test would pass vacuously,
+        # never exercising the server-stamped key it exists to check.
         await _mm_write(service, entry_point, metadata={
-            'kind': 'cycle_summary', 'run_id': 'r1',
+            'kind': 'cycle_summary', 'run_id': 'r1', 'stage': 'task_knowledge_sync',
         })
         meta = _mm_backend_meta(service, entry_point)
         assert 'recon_pool' in meta, 'the tagging helper must have run'
