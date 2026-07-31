@@ -101,6 +101,17 @@ DEFAULT_SAMPLE_OFFSETS: tuple[float, ...] = (0.25, 1.0, 2.0, 5.0, 15.0, 30.0)
 #: Fine polling grid used to catch the pre-first-token boundary sample.
 _FINE_TICK_SECS = 0.2
 
+#: Config-dir subtrees collapsed to a single ``pruned_descendants`` count instead
+#: of one entry per file.  ``plugins/marketplaces`` is a full git CLONE (hundreds
+#: of loose objects) that the CLI populates on first run and that has nothing to
+#: do with startup completion; capturing it verbatim inflated the raw capture to
+#: 630 KB of noise.  ``projects/`` — where the transcript lives — is deliberately
+#: NEVER pruned.
+DEFAULT_PRUNE_PREFIXES: tuple[str, ...] = ('plugins/marketplaces', 'backups')
+
+#: Max scrubbed stderr characters retained per observation (provenance only).
+_STDERR_TAIL_CHARS = 600
+
 # ---------------------------------------------------------------------------
 # Redaction (capture-time gate)
 # ---------------------------------------------------------------------------
@@ -148,6 +159,19 @@ def _gate(observation: dict[str, Any]) -> dict[str, Any]:
     return observation
 
 
+def scrub_credential_material(text: str) -> str:
+    """Return *text* with every credential-shaped run replaced by ``<redacted>``.
+
+    The substituting counterpart to :func:`scan_for_credential_material`, used on
+    free-text provenance (an stderr tail) where raising would throw away a real,
+    already-paid-for capture.  Structured observation fields use the raising gate.
+    """
+    out = text
+    for _name, pattern in _CREDENTIAL_PATTERNS:
+        out = re.sub(pattern + r'\S*', '<redacted>', out)
+    return out
+
+
 def _redact_argv(argv: list[str]) -> list[str]:
     """Drop any argv element that looks credential-shaped."""
     out: list[str] = []
@@ -183,7 +207,12 @@ def redact_record(record: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def snapshot_config_dir(config_dir: Path, *, epoch: float | None = None) -> list[dict]:
+def snapshot_config_dir(
+    config_dir: Path,
+    *,
+    epoch: float | None = None,
+    prune_prefixes: tuple[str, ...] = DEFAULT_PRUNE_PREFIXES,
+) -> list[dict]:
     """Return a sorted, content-free description of every entry under *config_dir*.
 
     Each entry is ``{relpath, kind, size, mtime_delta_secs}`` where ``kind`` is
@@ -193,13 +222,25 @@ def snapshot_config_dir(config_dir: Path, *, epoch: float | None = None) -> list
     ``mtime_delta_secs`` is the entry's mtime minus *epoch* (the spawn instant),
     rounded, or ``None`` when no epoch is supplied.  It is provenance data, never
     an asserted bound.
+
+    Any entry at or below a *prune_prefixes* path is collapsed: the prefix dir
+    itself is emitted once with a ``pruned_descendants`` count and its descendants
+    are omitted.  ``projects/`` (where the transcript lives) is never prunable.
     """
     entries: list[dict] = []
     if not config_dir.exists():
         return entries
+    pruned_counts: dict[str, int] = {}
     for path in sorted(config_dir.rglob('*')):
         try:
             relpath = str(path.relative_to(config_dir))
+            prefix = next(
+                (p for p in prune_prefixes if relpath == p or relpath.startswith(p + os.sep)),
+                None,
+            )
+            if prefix is not None and relpath != prefix:
+                pruned_counts[prefix] = pruned_counts.get(prefix, 0) + 1
+                continue
             if path.is_symlink():
                 kind = 'symlink'
                 size = None
@@ -232,6 +273,9 @@ def snapshot_config_dir(config_dir: Path, *, epoch: float | None = None) -> list
                     'mtime_delta_secs': None,
                 }
             )
+    for entry in entries:
+        if entry['relpath'] in pruned_counts:
+            entry['pruned_descendants'] = pruned_counts[entry['relpath']]
     return entries
 
 
@@ -490,6 +534,44 @@ def _spawn_env(config_dir: Path, oauth_token: str | None) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
+def _drain_exit(proc: subprocess.Popen, *, mode: str) -> dict:
+    """Kill (if still running), drain stdout/stderr, and return exit provenance.
+
+    The stderr tail is SCRUBBED (patterns substituted, not raised on) and
+    truncated — it is provenance for the report, e.g. whether the CLI logged an
+    MCP connection failure while the stub server hung.
+    """
+    still_running = proc.poll() is None
+    if still_running:
+        proc.kill()
+    try:
+        stdout, stderr = proc.communicate(timeout=15)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        stdout, stderr = proc.communicate()
+    text = (stderr or b'').decode('utf-8', 'replace')
+    # Scalar-only projection of the CLI's --output-format json envelope: enough
+    # to explain a non-zero exit (e.g. `error_max_turns` vs a startup failure)
+    # without capturing the model's `result` text.
+    envelope: dict[str, Any] = {}
+    with contextlib.suppress(ValueError, AttributeError):
+        parsed = json.loads((stdout or b'').decode('utf-8', 'replace'))
+        if isinstance(parsed, dict):
+            envelope = {
+                k: parsed[k]
+                for k in ('subtype', 'is_error', 'num_turns', 'duration_ms', 'duration_api_ms')
+                if k in parsed and isinstance(parsed[k], (str, bool, int, float))
+            }
+    return {
+        'mode': mode,
+        'killed_by_probe': still_running,
+        'exit_code': proc.returncode,
+        'stdout_envelope': envelope,
+        'stderr_len': len(text),
+        'stderr_tail': scrub_credential_material(text[-_STDERR_TAIL_CHARS:]),
+    }
+
+
 def run_live_probe(
     *,
     mode: str,
@@ -582,7 +664,17 @@ def run_live_probe(
                 else:
                     # Keep only the most recent pre-turn-1 sample; it is the
                     # incident-shape observation the whole two-regime grace is for.
-                    pre_first_token = _take('pre_first_token_candidate')
+                    #
+                    # The turn can land BETWEEN the check above and this sample, so
+                    # re-read the candidate's OWN recorded turn count and discard it
+                    # if it already shows turn 1 — otherwise the row would be
+                    # labelled `pre_first_token` while carrying an assistant record,
+                    # which is exactly the mislabel that would let a curated corpus
+                    # row lie about the regime it came from.
+                    candidate = _take('pre_first_token_candidate')
+                    observed = candidate['substrate_returns']['count_transcript_turns']
+                    if observed is None or observed < 1:
+                        pre_first_token = candidate
             if proc.poll() is not None:
                 observations.append(_take('after_exit'))
                 break
@@ -591,9 +683,18 @@ def run_live_probe(
                 break
             time.sleep(_FINE_TICK_SECS)
 
+        # Flush the buffered pre-turn-1 sample BEFORE stamping, so it carries the
+        # same run_exit provenance as every other observation of this run.
         if not seen_turn and pre_first_token is not None:
             pre_first_token['sample_kind'] = 'pre_first_token'
             observations.append(pre_first_token)
+
+        # Drain the pipes and stamp exit provenance onto every observation of this
+        # run.  Draining matters: an undrained PIPE can block the child, which
+        # would make the probe itself the cause of the wedge it is measuring.
+        exit_provenance = _gate(_drain_exit(proc, mode=mode))
+        for observation in observations:
+            observation['run_exit'] = exit_provenance
     finally:
         if proc is not None and proc.poll() is None:
             proc.kill()
