@@ -28,6 +28,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from orchestrator.config import DeliveredChecksConfig
+from orchestrator.delivered_checks import DeliveredChecksBlock
 from orchestrator.harness import Harness
 from orchestrator.landing_evidence import LandingEvidenceVerdict
 
@@ -957,3 +959,287 @@ class TestAlreadyLandedDispatchGateInstall:
             'Harness must wire scheduler._already_landed_gate = '
             'harness._already_landed_dispatch_gate after construction'
         )
+
+
+# ---------------------------------------------------------------------------
+# TestAlreadyLandedGateDeliveredChecksGuard (task 3057 — step-3 RED / step-4 GREEN)
+#
+# Seam 2 of the eleven attribution-shaped mark-done seams. This gate's three
+# evidence arms (git ancestry / merge marker / content equivalence) each prove
+# only that SOMETHING of this branch reached main — never that THIS task's
+# declared capability survived to it. All three are covered, in one
+# parametrized matrix, so no single arm can regress unguarded.
+# ---------------------------------------------------------------------------
+
+_GATE_TARGET = 'orchestrator.harness.gate_mark_done_on_delivered_checks'
+
+#: (arm id, reason/site label, expected evidence sha) for the three stamp arms.
+_ARMS = [
+    pytest.param('ancestry', id='ancestry-arm'),
+    pytest.param('marker', id='marker-arm'),
+    pytest.param('content', id='content-equivalent-arm'),
+]
+
+_ARM_REASON = {
+    'ancestry': 'dispatch-gate-already-on-main',
+    'marker': 'dispatch-gate-marker-found',
+    'content': 'dispatch-gate-content-equivalent',
+}
+
+_CITATION_SHA = 'a' * 40
+_MARKER_SHA = 'b' * 40
+_BRANCH_BASE_SHA = '9' * 40
+
+_ARM_EVIDENCE_SHA = {
+    'ancestry': _CITATION_SHA,
+    'marker': _MARKER_SHA,
+    'content': _CITATION_SHA,
+}
+
+_DC_CHECK = {'name': 'cap-x', 'kind': 'grep', 'pattern': 'SomePattern', 'expect': 'present'}
+
+
+def _arm_harness(mock_orch_config, arm: str, *, metadata: dict | None = None) -> Harness:
+    """Build a harness wired so *arm* is the arm that reaches a stamp.
+
+    Reuses this module's existing per-arm wiring helpers verbatim, then
+    overlays the task metadata (each arm's helper hard-codes its own) and a
+    real ``delivered_checks`` config section so the guard has live knobs to
+    forward.
+    """
+    if arm == 'ancestry':
+        h = _wired_ancestry_harness(mock_orch_config)
+        base_meta: dict = {}
+    elif arm == 'marker':
+        h = _wired_marker_harness(
+            mock_orch_config,
+            marker_sha=_MARKER_SHA,
+            branch_base_sha=_BRANCH_BASE_SHA,
+            marker_is_ancestor_of_base=False,
+        )
+        base_meta = {'branch_base_sha': _BRANCH_BASE_SHA}
+    elif arm == 'content':
+        h = _wired_content_harness(
+            mock_orch_config, citation_sha=_CITATION_SHA, content_in_main=True,
+        )
+        base_meta = {}
+    else:  # pragma: no cover - guard against a typo in the parametrization
+        raise AssertionError(f'unknown arm {arm!r}')
+
+    meta = dict(base_meta)
+    meta.update(metadata if metadata is not None else {'delivered_checks': [_DC_CHECK]})
+    h.scheduler.get_task = AsyncMock(return_value={'id': '42', 'metadata': meta})
+    h.config.delivered_checks = DeliveredChecksConfig(
+        enabled=True, check_timeout_secs=11.0,
+    )
+    return h, meta
+
+
+@pytest.mark.asyncio
+class TestAlreadyLandedGateDeliveredChecksGuard:
+    """The delivered-capability guard on the pre-dispatch already-landed gate.
+
+    Task 2794's six-row acceptance matrix, applied to seam 2 and replicated
+    across ALL THREE evidence arms. The recovery on every block is this
+    gate's OWN existing "no landing evidence" path — ``return False``, i.e.
+    deliberately the pre-2313 behavior (dispatch normally) rather than gating.
+    A ``False`` return can never wedge a task the way a permanent gate could,
+    and the invariant being defended is "never stamp a hollow done".
+    """
+
+    # --- row 1: hollow-done regression / FAILED ---------------------------
+
+    @pytest.mark.parametrize('arm', _ARMS)
+    async def test_failed_block_withholds_stamp_and_dispatches(
+        self, mock_orch_config, arm,
+    ) -> None:
+        """FAILED: the branch reached main but the declared capability did
+        NOT. No stamp, and the gate returns False so the task DISPATCHES and
+        an agent actually delivers it."""
+        h, meta = _arm_harness(mock_orch_config, arm)
+        guard = AsyncMock(return_value=DeliveredChecksBlock(
+            reason='failed', main_sha='m' * 40, failed_check=_DC_CHECK,
+        ))
+
+        with patch(_GATE_TARGET, guard):
+            result = await h._already_landed_dispatch_gate('42')
+
+        assert result is False
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+
+        guard.assert_awaited_once()
+        assert guard.await_args.args[0] == '42'
+        assert guard.await_args.args[1] == meta
+        kwargs = guard.await_args.kwargs
+        assert kwargs['project_root'] == str(h.config.project_root)
+        assert kwargs['check_timeout_secs'] == 11.0
+        assert kwargs['enabled'] is True
+        assert kwargs['site'] == _ARM_REASON[arm]
+
+    # --- row 2: all_delivered -> byte-identical stamp ----------------------
+
+    @pytest.mark.parametrize('arm', _ARMS)
+    async def test_all_delivered_stamps_exactly_as_today(
+        self, mock_orch_config, arm,
+    ) -> None:
+        """The capability IS on main -> the arm's existing stamp fires with
+        its exact evidence sha / note / reason, and the gate returns True."""
+        h, _meta = _arm_harness(mock_orch_config, arm)
+        guard = AsyncMock(return_value=None)
+
+        with patch(_GATE_TARGET, guard):
+            result = await h._already_landed_dispatch_gate('42')
+
+        assert result is True
+        mark = cast(AsyncMock, h._mark_in_progress_done)
+        mark.assert_awaited_once()
+        assert mark.await_args.args[0] == '42'
+        assert mark.await_args.args[1] == _ARM_EVIDENCE_SHA[arm]
+        assert mark.await_args.args[3] == _ARM_REASON[arm]
+
+    # --- row 3: no delivered_checks -> unchanged, but still DELEGATED -----
+
+    @pytest.mark.parametrize('arm', _ARMS)
+    async def test_check_less_task_delegates_and_stamps(
+        self, mock_orch_config, arm,
+    ) -> None:
+        """A check-less task must not gain a new requirement.
+
+        The harness DELEGATES unconditionally (passing the metadata through)
+        rather than short-circuiting itself — the inertness lives in the
+        helper, pinned at source in test_delivered_check_gate.py. Duplicating
+        it here would be a second place for the kill-switch/inertness rule to
+        drift.
+        """
+        h, meta = _arm_harness(mock_orch_config, arm, metadata={})
+        guard = AsyncMock(return_value=None)
+
+        with patch(_GATE_TARGET, guard):
+            result = await h._already_landed_dispatch_gate('42')
+
+        assert result is True
+        cast(AsyncMock, h._mark_in_progress_done).assert_awaited_once()
+        guard.assert_awaited_once()
+        assert 'delivered_checks' not in guard.await_args.args[1]
+
+    # --- rows 4 & 5: fail-safe blocks are handled UNIFORMLY with FAILED ----
+
+    @pytest.mark.parametrize('arm', _ARMS)
+    @pytest.mark.parametrize('reason', ['errored', 'main_sha_unresolved'])
+    async def test_fail_safe_blocks_also_withhold_and_dispatch(
+        self, mock_orch_config, arm, reason,
+    ) -> None:
+        """ERRORED / main_sha_unresolved take the SAME recovery as FAILED.
+
+        Deliberate: a malformed delivered_checks descriptor ERRORs forever, so
+        a "wait and retry" degradation could WEDGE the task permanently. An
+        extra dispatch of an already-landed task is the strictly better
+        failure — it always terminates.
+        """
+        h, _meta = _arm_harness(mock_orch_config, arm)
+        guard = AsyncMock(return_value=DeliveredChecksBlock(reason=reason))
+
+        with patch(_GATE_TARGET, guard):
+            result = await h._already_landed_dispatch_gate('42')
+
+        assert result is False
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+
+    # --- row 6: kill switch is FORWARDED, never re-implemented -------------
+
+    @pytest.mark.parametrize('arm', _ARMS)
+    async def test_kill_switch_is_forwarded_not_short_circuited(
+        self, mock_orch_config, arm,
+    ) -> None:
+        """``delivered_checks.enabled=False`` is forwarded to the helper, which
+        owns the kill switch. The harness must NOT branch on it locally, or
+        one hot reload would stop disarming all eleven seams at once."""
+        h, _meta = _arm_harness(mock_orch_config, arm)
+        h.config.delivered_checks = DeliveredChecksConfig(
+            enabled=False, check_timeout_secs=11.0,
+        )
+        guard = AsyncMock(return_value=None)
+
+        with patch(_GATE_TARGET, guard):
+            result = await h._already_landed_dispatch_gate('42')
+
+        assert result is True
+        guard.assert_awaited_once()
+        assert guard.await_args.kwargs['enabled'] is False
+
+    @pytest.mark.parametrize('arm', _ARMS)
+    async def test_kill_switch_with_real_helper_stamps_as_today(
+        self, mock_orch_config, arm,
+    ) -> None:
+        """End-to-end with the REAL helper: disabled -> the stamp is
+        byte-identical to today, with zero check work."""
+        h, _meta = _arm_harness(mock_orch_config, arm)
+        h.config.delivered_checks = DeliveredChecksConfig(
+            enabled=False, check_timeout_secs=11.0,
+        )
+
+        result = await h._already_landed_dispatch_gate('42')
+
+        assert result is True
+        mark = cast(AsyncMock, h._mark_in_progress_done)
+        mark.assert_awaited_once()
+        assert mark.await_args.args[3] == _ARM_REASON[arm]
+
+    # --- ordering: no wasted check work on landings already refused -------
+
+    @pytest.mark.parametrize('arm', _ARMS)
+    async def test_rejected_landing_evidence_never_reaches_the_guard(
+        self, mock_orch_config, arm,
+    ) -> None:
+        """A REJECTED validate_landing_evidence verdict already means "no
+        usable landing evidence" — the guard must not pay for a git-grep on a
+        landing that is being refused anyway."""
+        h, _meta = _arm_harness(mock_orch_config, arm)
+        guard = AsyncMock(return_value=None)
+        rejected = LandingEvidenceVerdict(
+            accepted=False, evidence_sha=None, reason='no_citation',
+        )
+
+        with patch(_GATE_TARGET, guard), \
+                patch(
+                    'orchestrator.harness.validate_landing_evidence',
+                    AsyncMock(return_value=rejected),
+                ):
+            result = await h._already_landed_dispatch_gate('42')
+
+        assert result is False
+        guard.assert_not_awaited()
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
+
+    async def test_degenerate_branch_never_reaches_the_guard(
+        self, mock_orch_config,
+    ) -> None:
+        """The ancestry arm's degenerate-branch veto returns False BEFORE any
+        evidence is derived — the guard must sit downstream of it."""
+        h, _meta = _arm_harness(mock_orch_config, 'ancestry')
+        h._branch_is_degenerate = AsyncMock(return_value=True)
+        guard = AsyncMock(return_value=None)
+
+        with patch(_GATE_TARGET, guard):
+            result = await h._already_landed_dispatch_gate('42')
+
+        assert result is False
+        guard.assert_not_awaited()
+
+    @pytest.mark.parametrize('arm', _ARMS)
+    async def test_stale_conflict_skip_never_reaches_the_guard(
+        self, mock_orch_config, arm,
+    ) -> None:
+        """The task-2677 provenance-conflict memo short-circuits BEFORE the
+        git work; the guard must not resurrect that cost."""
+        h, _meta = _arm_harness(mock_orch_config, arm)
+        h._provenance_conflict_sink = MagicMock()
+        h._provenance_conflict_sink.should_skip = MagicMock(return_value=True)
+        guard = AsyncMock(return_value=None)
+
+        with patch(_GATE_TARGET, guard):
+            result = await h._already_landed_dispatch_gate('42')
+
+        assert result is True
+        guard.assert_not_awaited()
+        cast(AsyncMock, h._mark_in_progress_done).assert_not_awaited()
