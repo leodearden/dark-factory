@@ -70,3 +70,26 @@ if _SHARED_SRC.is_dir() and _ORCH_SRC.is_dir():
     for _p in (str(_SHARED_SRC), str(_ORCH_SRC)):
         if _p not in sys.path:
             sys.path.insert(0, _p)
+
+# Suite-wide git isolation (task 3355, incident esc-3072-3).  The verify lane
+# runs `cd escalation && uv run pytest tests/`, which makes rootdir the
+# SUBPROJECT — the repo-root conftest.py is never loaded, so each test-root
+# conftest wires the defence itself.  APPEND the repo root, never insert(0, ...):
+# at sys.path[0] it would make the subproject directories resolve as namespace
+# packages pointing at the project folder instead of src/<pkg>/, beating the
+# inserts above.  Placed after the stubbing block to keep that contiguous;
+# df_pytest_isolation is stdlib + pytest only, so it imports cleanly in this
+# venv, which deliberately excludes aiosqlite.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.append(str(REPO_ROOT))
+
+from df_pytest_isolation import (  # noqa: E402
+    _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
+    reject_unsafe_basetemp,
+)
+
+
+def pytest_configure(config):
+    """Refuse a --basetemp aimed inside a live task worktree (esc-3072-3)."""
+    reject_unsafe_basetemp(config)
