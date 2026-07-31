@@ -34,6 +34,7 @@ rows summarise, the named predicate, and the failure-mode table.
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 from typing import TypedDict
@@ -93,6 +94,51 @@ class StartupCompletionRow(TypedDict, total=False):
     substrate_returns: dict
     provenance: dict
     source_path: str
+
+
+# ---------------------------------------------------------------------------
+# Secret hygiene
+# ---------------------------------------------------------------------------
+
+#: ``(name, regex)`` pairs matching credential-shaped material.  Kept in sync
+#: with ``startup_completion_probe._CREDENTIAL_PATTERNS`` — the probe applies
+#: them as a CAPTURE-time gate (so unredacted material never reaches disk) and
+#: this module applies them as a COMMIT-time assertion (so a later hand-edit
+#: cannot reintroduce what the probe would have refused to write).  Both halves
+#: are needed: capture-time alone is not safe under maintenance, and
+#: commit-time alone is not safe during a fresh probe run.
+_CREDENTIAL_PATTERNS: tuple[tuple[str, str], ...] = (
+    ('sk-ant-token', r'sk-ant-'),
+    ('oauth-blob', r'claudeAiOauth'),
+    ('access-token', r'accessToken'),
+    ('refresh-token', r'refreshToken'),
+    ('bearer-jwt', r'Bearer\s+eyJ'),
+    # Generic long base64url run — catches a raw token pasted without any of the
+    # named markers above.  64 chars is comfortably longer than the base64-ish
+    # substrings that appear in ordinary content (session UUIDs are 36 with
+    # hyphens; the longest incidental run in the committed corpus is far below
+    # this), so it adds coverage without firing on legitimate data.
+    ('long-base64url-run', r'[A-Za-z0-9_-]{64,}'),
+)
+
+
+def assert_no_credential_material(text: str, *, source: str) -> None:
+    """Raise ``AssertionError`` if *text* carries credential-shaped material.
+
+    *source* names what is being scanned (a path, or ``synthetic:<label>``) and
+    is echoed in the failure message together with the pattern name and the
+    match offset, so a failure says WHERE to look rather than just "assertion
+    failed".  The matched text itself is never echoed — a guard that printed the
+    secret it caught would defeat its own purpose.
+    """
+    for name, pattern in _CREDENTIAL_PATTERNS:
+        match = re.search(pattern, text)
+        if match is not None:
+            raise AssertionError(
+                f'credential material in {source}: pattern {name!r} matched at '
+                f'offset {match.start()} (match text withheld). Redact it — '
+                f'record credential-bearing paths by presence/size only.'
+            )
 
 
 # ---------------------------------------------------------------------------

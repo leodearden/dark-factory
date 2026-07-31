@@ -17,7 +17,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-
 import startup_completion_fixtures as scf
 
 # The closed sets the schema validates against, restated here so a silent

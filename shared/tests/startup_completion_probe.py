@@ -72,6 +72,8 @@ for _p in (str(_TESTS_DIR), str(_SRC_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import startup_completion_fixtures as _scf  # noqa: E402  (isort: after src bootstrap)
+
 from shared.cli_invoke import (  # noqa: E402
     _resolve_transcript_path,
     count_transcript_turns,
@@ -122,24 +124,20 @@ _STDERR_TAIL_CHARS = 600
 #: adds.
 _RECORD_TYPE_KEYS = ('type', 'subtype', 'operation', 'isMeta', 'isSidechain')
 
-_CREDENTIAL_PATTERNS: tuple[tuple[str, str], ...] = (
-    ('sk-ant-token', r'sk-ant-'),
-    ('oauth-blob', r'claudeAiOauth'),
-    ('access-token', r'accessToken'),
-    ('refresh-token', r'refreshToken'),
-    ('bearer-jwt', r'Bearer\s+eyJ'),
-)
-
-#: Filenames whose CONTENT must never be captured, only presence/size metadata.
-CREDENTIAL_FILENAMES = frozenset({'.credentials.json'})
+#: The credential pattern set and the ``.credentials.json`` filename set are
+#: owned by ``startup_completion_fixtures`` (the committed assertion form) and
+#: imported here so the CAPTURE-time gate and the COMMIT-time assertion can
+#: never drift apart.  Widening one automatically widens the other.
+_CREDENTIAL_PATTERNS = _scf._CREDENTIAL_PATTERNS
+CREDENTIAL_FILENAMES = _scf.CREDENTIAL_FILENAMES
 
 
 def scan_for_credential_material(text: str) -> tuple[str, int] | None:
     """Return ``(pattern_name, offset)`` of the first credential-shaped match, else None.
 
-    Deliberately duplicated in ``startup_completion_fixtures`` as the committed
-    assertion form; this copy is the capture-time gate so unredacted material
-    never reaches disk in the first place.
+    The non-raising form of ``startup_completion_fixtures.assert_no_credential_material``
+    over the same pattern set, for call sites that need to substitute rather than
+    fail (see :func:`scrub_credential_material`).
     """
     for name, pattern in _CREDENTIAL_PATTERNS:
         match = re.search(pattern, text)
@@ -149,13 +147,15 @@ def scan_for_credential_material(text: str) -> tuple[str, int] | None:
 
 
 def _gate(observation: dict[str, Any]) -> dict[str, Any]:
-    """Raise if a fully-assembled observation carries credential material."""
-    hit = scan_for_credential_material(json.dumps(observation))
-    if hit is not None:
-        raise RuntimeError(
-            f'startup_completion_probe: refusing to emit observation — credential '
-            f'pattern {hit[0]!r} matched at offset {hit[1]}'
-        )
+    """Raise if a fully-assembled observation carries credential material.
+
+    The capture-time half of the two-sided guard: unredacted material never
+    reaches disk, so a probe run cannot produce a raw capture that the committed
+    ``TestCorpusSecretHygiene`` assertion would later have to catch.
+    """
+    _scf.assert_no_credential_material(
+        json.dumps(observation), source='startup_completion_probe:observation'
+    )
     return observation
 
 
