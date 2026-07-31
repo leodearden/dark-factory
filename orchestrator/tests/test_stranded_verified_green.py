@@ -18,11 +18,12 @@ from typing import Any, cast
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
-from _orch_helpers import wire_scheduler_liveness_mock
+from _orch_helpers import pydantic_spec, wire_scheduler_liveness_mock
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
 from orchestrator.artifacts import TaskArtifacts
+from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.harness import Harness
@@ -1479,7 +1480,7 @@ class TestSubmitVerifiedGreenMergeRequest:
         queue = merge_queue if merge_queue is not None else asyncio.Queue()
         cfg = config
         if cfg is None:
-            cfg = MagicMock()
+            cfg = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
             cfg.module_configs_or_empty = {}
         req = await submit_verified_green_merge_request(
             task_id=_TID,
@@ -1551,6 +1552,7 @@ class TestSubmitVerifiedGreenMergeRequest:
 
         update_task.assert_awaited_once()
         call = update_task.await_args
+        assert call is not None
         assert call.args[0] == _TID
         payload = call.args[1]
         # A single key keeps merge-mode writes from clobbering siblings — and
@@ -1568,7 +1570,9 @@ class TestSubmitVerifiedGreenMergeRequest:
         suppresses an immediate re-submit by the same caller."""
         update_task = AsyncMock(return_value=True)
         await self._submit(tmp_path, update_task=update_task)
-        marker = update_task.await_args.args[1]['architect_merge_request']
+        call = update_task.await_args
+        assert call is not None
+        marker = call.args[1]['architect_merge_request']
 
         assert merge_request_marker_is_fresh(marker, _TIP) is True
 

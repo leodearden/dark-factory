@@ -22,6 +22,7 @@ import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -473,7 +474,7 @@ class TestOnArchitectMergeDone:
     ):
         from orchestrator.merge_types import MergeOutcome
 
-        f = await self._fire(tmp_path, MergeOutcome(status=status))
+        f = await self._fire(tmp_path, MergeOutcome(status=cast(Any, status)))
 
         f.scheduler.mark_done.assert_not_awaited()
         rows = f.event_store.fetch_events_by_type_all_runs(
@@ -492,7 +493,7 @@ class TestOnArchitectMergeDone:
         failure event; the branch and lane are preserved by omission."""
         from orchestrator.merge_types import MergeOutcome
 
-        f = await self._fire(tmp_path, MergeOutcome(status=status))
+        f = await self._fire(tmp_path, MergeOutcome(status=cast(Any, status)))
 
         rows = f.event_store.fetch_events_by_type_all_runs(
             EventType.architect_desync_merge, task_id=_TASK_ID,
