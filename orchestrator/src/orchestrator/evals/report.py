@@ -508,9 +508,18 @@ def build_composite_report(
     # normalization denominator stays defined (every such workflow trial
     # hard-gates to 0 regardless, so this only keeps the baseline non-empty).
     # The same holds for a plan-only group in which NOTHING produced a plan: the
-    # fallback still admits those cells, so the denominator exists — and their
-    # quality axis is 0.0 anyway, so a favourable efficiency ratio cannot rank
-    # one no-plan candidate above a plan-producing one from another group.
+    # fallback still admits those cells, so the denominator exists — which means
+    # a no-plan cell that is the SOLE member of its (fixture, 'plan_only') group
+    # DOES earn ratios of 1.0 on both efficiency axes here. That is exactly why
+    # its composite is hard-gated to 0.0 by blend_composite(no_plan=True) below:
+    # flooring its quality axis bounds only the 0.6 quality weight, leaving 0.4
+    # of pure efficiency credit earned by FAILING to plan (task 3302 review —
+    # measured: a no-plan cell at 0.40 outranked a real 6-step plan at 0.26 and
+    # survived top_k=2). BOTH closures are needed and they close different
+    # routes: barring the cell from SEEDING the floor (above) closes the
+    # INTRA-group route, where it would deflate its plan-producing siblings; the
+    # gate closes the CROSS-group route, where it would outrank a plan-producing
+    # config normalized against a different fixture's floor.
     for key, v in best_cost_all.items():
         best_cost.setdefault(key, v)
     for key, v in best_latency_all.items():
@@ -553,6 +562,20 @@ def build_composite_report(
             scored_pq if plan_only and scored_pq is not None
             else float(m.get('composite_score', 0.0) or 0.0)
         )
+        # THE no-plan predicate, evaluated ONCE and reused by both the
+        # blend_composite hard gate below and the plan_quality_no_plan counter
+        # further down — so the gate and the count can never disagree about
+        # which cells produced no plan (task 3302).
+        #
+        # Scoped by _has_plan_quality_score, not by plan_only alone: a
+        # cap-tainted cell is UNMEASURABLE (we never got to ask), so it is
+        # counted by plan_quality_cap_excluded and must not also be counted as
+        # a content failure — the two causes are disjoint by construction. At
+        # the gate site the two spellings coincide exactly, because
+        # _is_unmeasurable is precisely "plan-only and not
+        # _has_plan_quality_score", so an inadmissible cell never reaches
+        # blend_composite at all.
+        no_plan = _has_plan_quality_score(m) and not produced_a_plan(m)
         # ONE admission decision (:func:`_is_unmeasurable`), applied to EVERY
         # measured pool. An unmeasurable plan-only trial is excluded from the
         # composite/quality pools rather than scored 0.0 — task 3118's invariant,
@@ -570,6 +593,7 @@ def build_composite_report(
                 _ratio_score(latency, best_latency.get(bkey, 0.0)),
                 tests_pass=tests_pass,
                 plan_only=plan_only,
+                no_plan=no_plan,
             ))
             acc['quality'].append(quality)
             acc['cost'].append(cost)
@@ -603,10 +627,12 @@ def build_composite_report(
         # …and the FLOOR gets its own count, parallel to the exclusion but
         # describing a DISJOINT cause (task 3302): this cell was admissible and
         # measured — a healthy architect that produced nothing — so it stays in
-        # every pool at 0.0 rather than leaving them. Counting it is what keeps a
-        # mean that absorbed zeros from reading identically to a mean over cells
-        # that all planned badly (loud-over-silent-degradation).
-        if _has_plan_quality_score(m) and not produced_a_plan(m):
+        # every pool (at 0.0 on quality, at its real spend on cost/latency, and
+        # hard-gated to 0.0 on the composite) rather than leaving them. Counting
+        # it is what keeps a mean that absorbed zeros from reading identically to
+        # a mean over cells that all planned badly
+        # (loud-over-silent-degradation). Reuses the SAME local the gate used.
+        if no_plan:
             acc['plan_quality_no_plan'] += 1
 
     rows: list[dict[str, Any]] = []
