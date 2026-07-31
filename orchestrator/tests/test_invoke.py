@@ -430,6 +430,70 @@ class TestRunSubprocessLocalCancellation:
             if pgid is not None and spawned and spawned[0].returncode is None:
                 _kill_group(pgid)
 
+    async def test_cancel_during_timeout_kill_still_reaps_group(self, tmp_path):
+        """A cancel landing inside the TimeoutError handler's kill must still reap.
+
+        If the awaiting task is cancelled while terminate_process_group is
+        already running (SIGTERM sent, SIGKILL escalation pending), a handler
+        that is only a SIBLING of `except TimeoutError:` cannot catch it --
+        an exception raised inside an except block is not caught by a sibling
+        handler of the same try. That would abandon the escalation with a
+        SIGTERM-ignoring child left alive. This asserts the cancellation is
+        instead caught by something that also wraps the timeout-kill path, so
+        terminate_process_group is retried.
+
+        Fully mocked -- no real process, no sleep-based timing. The fake
+        terminate_process_group hangs deterministically (on an unset Event)
+        on its first call so the test can synchronize on "the task is now
+        suspended inside the kill" without guessing at a sleep duration.
+        """
+        proc = MagicMock()
+        proc.pid = 12345  # int so pgid capture and safety-check pass
+        proc.communicate = AsyncMock(side_effect=TimeoutError)
+        proc.wait = AsyncMock()
+        proc.returncode = None
+
+        async def fake_exec(*args, **kwargs):
+            return proc
+
+        calls: list[tuple] = []
+        entered = asyncio.Event()
+        hang_forever = asyncio.Event()  # never set -- first call hangs until cancelled
+
+        async def fake_terminate_process_group(proc_arg, pgid_arg, grace_secs=5.0):
+            calls.append((proc_arg, pgid_arg, grace_secs))
+            if len(calls) == 1:
+                entered.set()
+                await hang_forever.wait()
+
+        with (
+            patch('orchestrator.agents.invoke.asyncio.create_subprocess_exec',
+                  side_effect=fake_exec),
+            patch('orchestrator.agents.invoke.terminate_process_group',
+                  side_effect=fake_terminate_process_group),
+        ):
+            task = asyncio.ensure_future(_run_subprocess_local(
+                ['fake'], cwd=tmp_path, env={}, backend='codex', model='gpt-5.4',
+                max_budget_usd=1.0, timeout_seconds=0.01,
+            ))
+
+            # Wait until the task is provably suspended inside the
+            # TimeoutError handler's terminate_process_group await.
+            await asyncio.wait_for(entered.wait(), timeout=5)
+
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        assert len(calls) == 2, (
+            f'expected terminate_process_group to be retried once the cancel '
+            f'landed during the abandoned timeout-kill, got {len(calls)} '
+            f'call(s): {calls}'
+        )
+        second_call = calls[1]
+        assert second_call[1] == 12345, f'pgid mismatch on retry: {second_call}'
+        assert second_call[2] == 5.0, f'grace_secs mismatch on retry: {second_call}'
+
 
 _CODEX_VALID_JSONL_STDOUT = (
     json.dumps({'type': 'thread.started', 'thread_id': 'tid-1'}) + '\n'
