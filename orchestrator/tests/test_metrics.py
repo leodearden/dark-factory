@@ -527,3 +527,78 @@ class TestCostPrimitivesSingleHome:
         from orchestrator.evals import metrics
 
         assert metrics._rate is invoke._rate
+
+
+# ---------------------------------------------------------------------------
+# Task 3302: THE plan-production predicate — `plan_steps > 0`, never
+# `plan_quality > 0` and never `outcome == 'done'`.
+#
+# `plan_steps` was persisted by run_architect_eval and read by NOBODY, so every
+# "did this architect actually produce a plan?" question downstream was answered
+# from plan_quality instead — a number the LLM judge can return NONZERO for a
+# stepless artifact that score_plan_structure floors to 0.0 (Graphiti episode
+# e2066ec6). These pin the predicate and its equivalence with the artifact-level
+# twin judge.is_scorable_plan.
+# ---------------------------------------------------------------------------
+
+class TestProducedAPlan:
+    """`produced_a_plan(metrics_dict)` — did this architect emit a plan?"""
+
+    def test_nonzero_plan_steps_is_a_plan(self):
+        from orchestrator.evals.metrics import produced_a_plan
+
+        assert produced_a_plan({'plan_steps': 3}) is True
+
+    def test_zero_plan_steps_is_not_a_plan(self):
+        from orchestrator.evals.metrics import produced_a_plan
+
+        assert produced_a_plan({'plan_steps': 0}) is False
+
+    def test_absent_key_is_not_a_plan(self):
+        """A legacy / hand-edited metrics dict must not read as a plan."""
+        from orchestrator.evals.metrics import produced_a_plan
+
+        assert produced_a_plan({}) is False
+
+    def test_none_plan_steps_is_not_a_plan(self):
+        """The `or 0` empty shape run_architect_eval's len(... or []) guards."""
+        from orchestrator.evals.metrics import produced_a_plan
+
+        assert produced_a_plan({'plan_steps': None}) is False
+
+    def test_does_not_consult_plan_quality(self):
+        """THE point of the predicate (task 2863 AMENDMENT §1 / e2066ec6).
+
+        The two scorers disagree exactly on a stepless artifact: the LLM plan
+        judge can score it 0.95 while score_plan_structure floors it to 0.0. So
+        a nonzero plan_quality is NOT evidence a plan exists, and a zero one is
+        NOT evidence it does not.
+        """
+        from orchestrator.evals.metrics import produced_a_plan
+
+        assert produced_a_plan({'plan_steps': 0, 'plan_quality': 0.95}) is False
+        assert produced_a_plan({'plan_steps': 4, 'plan_quality': 0.0}) is True
+
+    @pytest.mark.parametrize('plan', [
+        None,
+        {},
+        {'steps': []},
+        # The header-only stub create_plan writes on the architect's FIRST
+        # plan-tools call — TRUTHY, but not a plan.
+        {'task_id': 't', 'title': 'x', 'analysis': 'a', 'files': [], 'steps': []},
+        {'task_id': 't', 'title': 'x', 'steps': [{'id': 'step-1'}, {'id': 'step-2'}]},
+    ])
+    def test_equivalent_to_the_artifact_level_twin(self, plan):
+        """produced_a_plan(metrics) == is_scorable_plan(plan), by construction.
+
+        The report layer only ever sees a persisted metrics dict and cannot call
+        is_scorable_plan, which reads the plan ARTIFACT. run_architect_eval
+        derives plan_steps from the identical `len(plan.get('steps') or [])`, so
+        the two ask the same question — PINNED here rather than left to
+        coincidence (the drift hazard _has_plan_quality_score was written for).
+        """
+        from orchestrator.evals.judge import is_scorable_plan
+        from orchestrator.evals.metrics import produced_a_plan
+
+        persisted = {'plan_steps': len((plan or {}).get('steps') or [])}
+        assert produced_a_plan(persisted) is is_scorable_plan(plan)
