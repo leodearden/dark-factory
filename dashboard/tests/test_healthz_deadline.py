@@ -41,6 +41,7 @@ import pytest
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
+import dashboard.app as app_module
 from dashboard.app import healthz
 from dashboard.config import DashboardConfig
 from dashboard.data.db import DbPool
@@ -245,3 +246,35 @@ async def test_healthz_reports_healthy_when_all_dbs_respond(dashboard_config):
     assert 'uptime_seconds' in checks
 
     await pool.close_all()
+
+
+# ---------------------------------------------------------------------------
+# step-1 / step-2: budget must be structurally deliverable to the tightest
+# real caller (`curl -sf --max-time 5`, dark-factory-dashboard-watchdog.service:6)
+# ---------------------------------------------------------------------------
+
+
+def test_healthz_budget_is_structurally_deliverable(tmp_path):
+    """The shipped budget constants must fit under the tightest real caller.
+
+    dark-factory-dashboard-watchdog.service:6 calls `curl -sf --max-time 5`.
+    _HEALTHZ_TOTAL_BUDGET must stay strictly below that ceiling, and the SUM
+    of per-DB budgets (_DB_PROBE_TIMEOUT * probe count) must fit inside the
+    whole-handler budget — otherwise the 15s-behind-a-5s-caller arithmetic
+    bug (measured: 503 delivered at 50.6s) can silently return. The probe
+    count is derived from _healthz_db_targets(), not hard-coded, so adding a
+    4th database without raising the budget fails here too.
+    """
+    config = DashboardConfig(project_root=tmp_path)
+    targets = app_module._healthz_db_targets(config)
+
+    assert app_module._HEALTHZ_TOTAL_BUDGET < 5.0, (
+        'the whole-handler budget must stay strictly below the tightest real '
+        "caller's ceiling (curl -sf --max-time 5, "
+        'dark-factory-dashboard-watchdog.service:6) or its degraded verdict '
+        'is undeliverable'
+    )
+    assert app_module._DB_PROBE_TIMEOUT * len(targets) <= app_module._HEALTHZ_TOTAL_BUDGET, (
+        f'{app_module._DB_PROBE_TIMEOUT} * {len(targets)} probes exceeds the '
+        f'whole-handler budget of {app_module._HEALTHZ_TOTAL_BUDGET}s'
+    )
