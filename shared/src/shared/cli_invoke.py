@@ -622,28 +622,41 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
        shadow a genuine success — and above the timeout rule, which it cannot
        shadow either since the two flags are mutually exclusive by
        construction: the timeout path never sets this flag).
-    3. ``result.timed_out`` → ``TIMED_OUT`` (summary distinguishes a
+    3. ``is_server_error_status(result.api_error_status)`` → ``API_ERROR``
+       (task 3314, plans/server-side-api-error-handling-prd.md). Placed
+       ABOVE the timeout rule: a watchdog SIGTERM kill flushes the CLI's
+       result JSON with ``api_error_status`` set (2026-07-29 incident), so
+       ranking ``timed_out`` first discarded the 5xx evidence and misfiled a
+       provider outage as a zero-output wedge — and the
+       ``agent API error: HTTP <status>`` marker the scheduler's transient
+       requeue lane keys on was never produced. The summary's prefix is that
+       verbatim marker; a free-form kill-context suffix is appended only when
+       ``result.timed_out``, so the non-timed-out summary is unchanged.
+    4. ``result.timed_out`` → ``TIMED_OUT`` (summary distinguishes a
        PRODUCTIVE kill — ``transcript_turns > 0`` — from a no-progress wedge;
        see ``is_timed_out_with_progress``/reify-4827).
-    4. ``result.subtype == 'error_max_turns'`` → ``MAX_TURNS``
+    5. ``result.subtype == 'error_max_turns'`` → ``MAX_TURNS``
        (high ``turns`` + non-zero ``output_tokens`` but empty ``output``).
-    5. the outcome is ``ModelNotFound`` → ``MODEL_NOT_FOUND`` (TERMINAL —
+    6. the outcome is ``ModelNotFound`` → ``MODEL_NOT_FOUND`` (TERMINAL —
        no cross-account retry; placed ABOVE the ``api_error_status`` rule
        below because a 404 also sets ``api_error_status`` and would
        otherwise be mis-tagged as transient ``API_ERROR``).
-    6. ``result.api_error_status`` set, OR the outcome is ``AuthFailed`` →
+    7. ``result.api_error_status`` set, OR the outcome is ``AuthFailed`` →
        ``API_ERROR`` (includes status code in the summary; transient — worth
        retrying against another account). ``AuthFailed`` ({401, 403}) is a
        strict subset of "api_error_status is not None", so the ``OR`` never
        changes the verdict — it keeps this rule visibly tied to the
        InvocationOutcome contract without narrowing API_ERROR away from
-       429/5xx, which InvocationOutcome does not model.
-    7. ``result.subtype == 'error_empty_output'`` → ``EMPTY_OUTPUT``
+       429, which InvocationOutcome does not model. Since rule 3 landed, only
+       NON-5xx statuses ever reach here (a 5xx is claimed above), so this
+       rule now covers 4xx/429 exclusively — its verdict for those is
+       unchanged.
+    8. ``result.subtype == 'error_empty_output'`` → ``EMPTY_OUTPUT``
        (may be transient).
-    8. ``result.schema_salvaged`` → ``STRUCTURAL`` (schema-salvage: the
+    9. ``result.schema_salvaged`` → ``STRUCTURAL`` (schema-salvage: the
        subtype looked like an error but a valid structured output was
        recovered; callers usually treat as success).
-    9. otherwise → ``UNKNOWN``.
+    10. otherwise → ``UNKNOWN``.
 
     ``diagnostic_detail`` always includes: subtype, turns, cost_usd,
     duration_ms, timed_out, transcript_turns, api_error_status, output
@@ -684,6 +697,33 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
                 'agent ended its turn awaiting a still-pending backgrounded '
                 'task (work abandoned mid-turn)'
             ),
+            diagnostic_detail=diagnostic_detail,
+        )
+    # Server-side (5xx) API failure — ranked ABOVE the timeout rule below.
+    # A watchdog SIGTERM kill flushes the CLI's result JSON on the way out, so
+    # a timed-out result can still carry hard 5xx evidence; ranking timed_out
+    # first threw that evidence away and reported a provider outage as a local
+    # zero-output wedge (2026-07-29 incident). Reads is_server_error_status
+    # rather than an inline range check so the 5xx band has exactly one
+    # definition (INV-5) shared with invocation_outcome's ServerError tier.
+    #
+    # The `agent API error: HTTP <status>` PREFIX is a cross-module contract:
+    # orchestrator scheduler.py's _API_ERROR_REASON_RE searches block_reason
+    # for it and reads the status out to route the transient requeue lane, so
+    # it must stay verbatim and leading. The kill-context SUFFIX is free-form
+    # operator forensics (PRD open question 5) and is emitted only on the
+    # timed-out path, which keeps the non-timed-out summary byte-identical to
+    # what callers already assert on.
+    if is_server_error_status(result.api_error_status):
+        summary = f'agent API error: HTTP {result.api_error_status}'
+        if result.timed_out:
+            summary += (
+                f' (killed at {result.duration_ms // 1000}s pre-first-token; '
+                f'transcript_turns={result.transcript_turns})'
+            )
+        return AgentFailureClass(
+            kind=AgentFailureKind.API_ERROR,
+            summary=summary,
             diagnostic_detail=diagnostic_detail,
         )
     if result.timed_out:
