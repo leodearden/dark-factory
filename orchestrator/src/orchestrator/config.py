@@ -36,9 +36,13 @@ logger = logging.getLogger(__name__)
 
 # --- Priority-tier constants (value/h scheduler) ---
 #
-# Canonical 5-tier priority order.  Lower rank = higher priority.  Unknown
-# priority strings coerce to DEFAULT_TIER so legacy tasks and typos never crash
-# the scheduler.
+# Canonical 5-tier priority order.  Lower rank = higher priority.  An unset
+# (None) priority silently coerces to DEFAULT_TIER — that is a normal,
+# expected state (e.g. subtasks in this repo's tasks.json routinely carry no
+# priority), not an anomaly.  An unrecognized non-None value (a typo or a
+# stale tier string) also coerces to DEFAULT_TIER so it never crashes the
+# scheduler, but that path is logged loudly instead, since it means some
+# upstream caller passed something the config layer doesn't understand.
 PRIORITY_TIERS: tuple[str, ...] = ('critical', 'high', 'medium', 'low', 'polish')
 PRIORITY_RANK: dict[str, int] = {tier: i for i, tier in enumerate(PRIORITY_TIERS)}
 DEFAULT_TIER: str = 'medium'
@@ -58,16 +62,21 @@ TIER_BASE: dict[str, int] = {
 def coerce_tier(value: Any) -> str:
     """Normalize a priority value (possibly None/unknown) to a canonical tier.
 
-    Unknown/unrecognized values fall back to DEFAULT_TIER so legacy tasks and
-    typos never crash the scheduler, but that fallback is logged loudly
-    (rather than silently) per the repo's no-silent-fail-soft invariant:
-    an unrecognized value means some upstream caller passed something the
-    config layer doesn't understand, and that should be observable.
+    An unset (None) priority is a NORMAL expected state — not an anomaly —
+    so it falls back to DEFAULT_TIER silently; it is a default, not a
+    fail-soft fallback, and the repo's no-silent-fail-soft invariant does
+    not apply to it. An unrecognized non-None value (a typo or a stale tier
+    string) still falls back to DEFAULT_TIER so legacy tasks and typos never
+    crash the scheduler, but that fallback IS logged loudly (rather than
+    silently): it means some upstream caller passed something the config
+    layer doesn't understand, and that should be observable.
     ``stacklevel=2`` attributes the log record to the caller's file/line
     (the actual call site) rather than to this helper.
     """
     if isinstance(value, str) and value in PRIORITY_RANK:
         return value
+    if value is None:
+        return DEFAULT_TIER
     logger.warning(
         'coerce_tier: unrecognized priority %r, falling back to %r',
         value,
