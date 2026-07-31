@@ -87,6 +87,50 @@ mapping at the single write boundary.
 
 ---
 
+## `nextest-list-ignored.json`
+
+| | |
+|---|---|
+| **Grounding** | **Captured run** |
+| **Producer** | `cargo nextest list --workspace --message-format json -E 'not test(=gamma::test_one)'` |
+| **Version** | cargo-nextest **0.9.136** (`1d5bf1ec9 2026-05-16`) — same binary as `nextest-list.json` |
+| **Captured** | 2026-07-31, from a throwaway two-crate workspace carrying two `#[ignore]`d tests |
+
+Companion to `nextest-list.json`, capturing the shapes that file does not:
+`cargo nextest list` lists every **discovered** test, including ones it has
+already decided **not to run**, and marks them two different ways. Both appear
+here, verbatim:
+
+```json
+"alpha::test_ignored": {"kind":"test","ignored":true,
+                        "filter-match":{"status":"mismatch","reason":"ignored"}}
+"gamma::test_one":     {"kind":"test","ignored":false,
+                        "filter-match":{"status":"mismatch","reason":"expression"}}
+```
+
+The `-E` expression is what forces the second shape (`reason: "expression"` with
+`ignored: false`) — it cannot be produced by `#[ignore]` alone, and it is the
+shape reify's own per-pass filtersets emit.
+
+Load-bearing facts:
+
+* **`test-count` is NOT the planned count.** It is `5` here while only **2**
+  tests would run. Nothing may re-derive the plan from it.
+* **Excluded testcases are not planned.** `parse_per_test_results` deliberately
+  drops SKIP/ignored *result* lines, so a skipped test never earns a verdict, is
+  annotated `not-started` by `build_fail_fast_map`, and would land in the
+  {did-not-pass} subset of **every** narrowed retry. Never *unsafe* (nextest
+  still refuses to run it), but it inflates every filter file toward reify's
+  `REIFY_VERIFY_RETRY_MAX_SUBSET` ceiling — and tripping that ceiling makes
+  reify refuse narrowing for the whole profile, so an ignore-heavy workspace
+  would silently lose the capability. `merge_shadow._nextest_case_is_planned`
+  drops them.
+* **Unrecognised shapes are treated as PLANNED.** The superset bias is
+  deliberate and matches the module's `None`-is-never-an-empty-plan rule: a
+  future nextest schema change may make DF re-run more tests, never skip one.
+
+---
+
 ## `run_all-failed-marker.txt`
 
 | | |

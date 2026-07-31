@@ -582,6 +582,100 @@ def test_parse_nextest_list_planned_missing_binary_id_falls_back_to_key() -> Non
     assert parse_nextest_list_planned(doc) == ['crate-z::lib m::t']
 
 
+def test_parse_nextest_list_planned_excludes_ignored_and_filtered_out() -> None:
+    """`#[ignore]`d and filterset-excluded testcases are NOT planned.
+
+    Driven by REAL cargo-nextest 0.9.136 bytes
+    (``nextest-list-ignored.json``, captured with a `-E` expression so BOTH
+    exclusion shapes appear — ``reason: "ignored"`` and ``reason:
+    "expression"``).  See PROVENANCE.md.
+
+    Why it matters: `parse_per_test_results` deliberately drops SKIP/ignored
+    result lines, so a skipped test NEVER gets a verdict, is annotated
+    'not-started' by `build_fail_fast_map`, and therefore lands in the
+    {did-not-pass} subset of EVERY narrowed retry.  Never unsafe (nextest still
+    refuses to run it) — but it inflates every filter file toward reify's
+    REIFY_VERIFY_RETRY_MAX_SUBSET ceiling, and tripping that ceiling makes reify
+    refuse narrowing for the whole profile.  An ignore-heavy workspace would
+    silently lose the capability.
+    """
+    import json
+
+    from orchestrator.merge_shadow import parse_nextest_list_planned
+
+    raw = (_FIXTURE_DIR / 'nextest-list-ignored.json').read_text()
+    doc = json.loads(raw)
+
+    planned = parse_nextest_list_planned(raw)
+    assert planned is not None
+    assert planned == ['crate-a alpha::test_one', 'crate-a beta::test_three']
+
+    # The fixture really does carry all three shapes — otherwise this test
+    # would pass vacuously against a re-capture that lost them.
+    cases = {
+        f'{suite["binary-id"]} {case}': meta
+        for suite in doc['rust-suites'].values()
+        for case, meta in suite['testcases'].items()
+    }
+    assert cases['crate-a alpha::test_ignored']['ignored'] is True
+    assert cases['crate-a alpha::test_ignored']['filter-match'] == {
+        'status': 'mismatch', 'reason': 'ignored',
+    }
+    assert cases['crate-b gamma::test_one']['ignored'] is False
+    assert cases['crate-b gamma::test_one']['filter-match'] == {
+        'status': 'mismatch', 'reason': 'expression',
+    }
+    # The document's own `test-count` counts the EXCLUDED cases too, so it is
+    # NOT the planned count — pinned here so nobody re-derives the plan from it.
+    assert doc['test-count'] == 5
+    assert len(planned) == 2
+
+
+def test_parse_nextest_list_planned_unknown_case_shape_is_included() -> None:
+    """An unrecognised testcase shape is treated as PLANNED (superset bias).
+
+    The whole module errs toward re-running MORE tests, never fewer: a probe
+    that cannot be understood returns None (full verify), and a testcase that
+    cannot be understood stays in the plan.  A future nextest schema change must
+    not silently start SKIPPING tests on the retry.
+    """
+    from orchestrator.merge_shadow import parse_nextest_list_planned
+
+    doc = (
+        '{"rust-suites": {"crate-a": {"binary-id": "crate-a", "testcases": {'
+        '"m::no_meta": {},'                                     # no fields at all
+        '"m::not_a_dict": "surprise",'                          # wrong type
+        '"m::odd_status": {"filter-match": {"status": 7}},'     # non-string status
+        '"m::odd_filter_match": {"filter-match": "matches"},'   # non-dict filter-match
+        '"m::ignored_false": {"ignored": false}'
+        '}}}}'
+    )
+    assert parse_nextest_list_planned(doc) == [
+        'crate-a m::ignored_false',
+        'crate-a m::no_meta',
+        'crate-a m::not_a_dict',
+        'crate-a m::odd_filter_match',
+        'crate-a m::odd_status',
+    ]
+
+
+def test_parse_nextest_list_planned_all_cases_excluded_is_empty_not_none() -> None:
+    """A doc whose every testcase is ignored -> [], not None.
+
+    [] is a real answer the caller turns into "nothing to narrow" (and therefore
+    a full verify via the material-narrowing gate); None means "the probe
+    failed".  Conflating them would be the false-green this module guards.
+    """
+    from orchestrator.merge_shadow import parse_nextest_list_planned
+
+    doc = (
+        '{"rust-suites": {"crate-a": {"binary-id": "crate-a", "testcases": {'
+        '"m::t": {"ignored": true, "filter-match": {"status": "mismatch", '
+        '"reason": "ignored"}}}}}}'
+    )
+    assert parse_nextest_list_planned(doc) == []
+
+
 # ---------------------------------------------------------------------------
 # run_all {failed}-member extraction (task 3059).
 #

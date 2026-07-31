@@ -362,6 +362,47 @@ def nextest_filter_ids(subset: Iterable[str]) -> list[str]:
     return out
 
 
+def _nextest_case_is_planned(meta: object) -> bool:
+    """True when a ``testcases`` entry is a test nextest would actually RUN.
+
+    cargo-nextest lists every DISCOVERED test, including ones it has already
+    decided to skip, and marks them (real 0.9.136 bytes, see
+    ``tests/fixtures/reify_verify_retry/nextest-list-ignored.json``)::
+
+        "alpha::test_ignored": {"ignored": true,
+                                "filter-match": {"status": "mismatch",
+                                                 "reason": "ignored"}}
+        "gamma::test_one":     {"ignored": false,
+                                "filter-match": {"status": "mismatch",
+                                                 "reason": "expression"}}
+
+    Counting those as *planned* would be permanently self-inflating:
+    :func:`parse_per_test_results` deliberately drops SKIP/ignored result lines,
+    so a skipped test never has a verdict, is annotated ``'not-started'`` by
+    :func:`build_fail_fast_map`, and therefore lands in the {did-not-pass}
+    subset of **every** narrowed retry.  It is never *unsafe* — nextest still
+    refuses to run it — but it pushes every filter file toward reify's
+    ``REIFY_VERIFY_RETRY_MAX_SUBSET`` ceiling, and tripping that ceiling makes
+    reify refuse narrowing for the whole profile.  A workspace with many
+    ``#[ignore]``d tests would silently lose the capability.
+
+    Fail-safe bias: an entry whose shape is unrecognised (not a dict, no
+    ``filter-match``, a non-string ``status``) is treated as PLANNED.  That errs
+    toward the superset the module's ``None``-is-never-empty rule already
+    accepts — it can only re-run more tests, never skip one.
+    """
+    if not isinstance(meta, dict):
+        return True
+    if meta.get('ignored'):
+        return False
+    filter_match = meta.get('filter-match')
+    if isinstance(filter_match, dict):
+        status = filter_match.get('status')
+        if isinstance(status, str) and status != 'matches':
+            return False
+    return True
+
+
 def parse_nextest_list_planned(stdout: str) -> list[str] | None:
     """Parse ``cargo nextest list --message-format json`` into the planned set.
 
@@ -383,11 +424,19 @@ def parse_nextest_list_planned(stdout: str) -> list[str] | None:
     Args:
         stdout: Raw stdout of ``cargo nextest list --message-format json``.
 
+    **Skipped tests are NOT planned.** Entries nextest has already excluded —
+    ``#[ignore]``d, or filtered out by a filterset expression — are dropped via
+    :func:`_nextest_case_is_planned`; see that docstring for why counting them
+    would silently disable the capability on an ignore-heavy workspace.  Note
+    that the document's own top-level ``test-count`` counts them, so it is NOT
+    the planned count and is deliberately not read here.
+
     Returns:
         Sorted test ids on success.  ``[]`` for a well-formed document whose
-        suites carry no testcases (a genuinely test-free workspace).  ``None``
-        when the input is not a parseable nextest list document — the caller
-        MUST treat that as "do not narrow", not as an empty plan.
+        suites carry no RUNNABLE testcases (a genuinely test-free workspace, or
+        one where every test is ignored/filtered out).  ``None`` when the input
+        is not a parseable nextest list document — the caller MUST treat that as
+        "do not narrow", not as an empty plan.
     """
     try:
         doc = json.loads(stdout)
@@ -410,7 +459,11 @@ def parse_nextest_list_planned(stdout: str) -> list[str] | None:
             testcases = suite.get('testcases')
             if not isinstance(testcases, dict):
                 return None
-            planned.extend(f'{binary_id} {case}' for case in testcases)
+            planned.extend(
+                f'{binary_id} {case}'
+                for case, meta in testcases.items()
+                if _nextest_case_is_planned(meta)
+            )
     except (AttributeError, TypeError):
         return None
     return sorted(planned)
