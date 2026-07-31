@@ -19,6 +19,7 @@ FalkorDB (module v41800 / 4.18.0) behind an index-readiness barrier; see
 from __future__ import annotations
 
 import inspect
+from typing import TYPE_CHECKING, cast
 
 import pytest
 from graphiti_core.driver.falkordb_driver import STOPWORDS, FalkorDriver
@@ -31,6 +32,9 @@ from fused_memory.backends.falkor_fulltext import (
     is_searchable_term,
 )
 from fused_memory.backends.graphiti_client import _MultiTenantFalkorDriver
+
+if TYPE_CHECKING:
+    from falkordb.asyncio import FalkorDB
 
 # --- Genuine FAULT tokens -------------------------------------------------
 # RediSearch's tokenizer reduces each of these to nothing, so emitting one into
@@ -566,7 +570,12 @@ class TestMultiTenantDriverWiring:
         returns a plain ``FalkorDriver``, the hardening silently stops applying
         there while every other test in this file still passes.
         """
-        driver = _MultiTenantFalkorDriver(falkor_db=object(), database='graph_a')
+        # A stub client keeps this a unit test: upstream ``__init__`` uses a
+        # supplied ``falkor_db`` directly instead of dialling out, and neither
+        # ``clone()`` nor query assembly ever touches it.  ``cast`` is for
+        # pyright only — a real FalkorDB here would open a connection.
+        stub_client = cast('FalkorDB', object())
+        driver = _MultiTenantFalkorDriver(falkor_db=stub_client, database='graph_a')
         cloned = driver.clone('graph_b')
 
         assert isinstance(cloned, _MultiTenantFalkorDriver)
