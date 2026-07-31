@@ -1407,3 +1407,69 @@ class TestStateSnapshotOverrideStoreLogging:
         assert record.exc_info[0] is RuntimeError, (
             f'Expected exc_info[0] == RuntimeError, got {record.exc_info[0]!r}'
         )
+
+
+class TestDelegatesToSharedAtomicWriter:
+    """``Scheduler._write_state_snapshot_raw`` delegates to ``shared.safe_io.atomic_write_text``.
+
+    Task 3223 consolidated the repo's tmp+rename writers into ``shared.safe_io``,
+    which also gives this site a unique-per-writer temp name in place of the old
+    fixed ``<dest>.json.tmp`` (two concurrent writers used to share it).
+    ``mode`` must stay at the umask default: this file is read by other
+    processes (the dashboard, the gamma/epsilon watchers, scripts/drain_check.py),
+    so narrowing it to 0o600 is the specific silent regression this task avoids.
+    """
+
+    @staticmethod
+    def _recorder(monkeypatch):
+        import shared.safe_io as _safe_io
+
+        calls = []
+        real = _safe_io.atomic_write_text
+
+        def recorder(path, text, **kwargs):
+            calls.append((path, text, kwargs))
+            return real(path, text, **kwargs)
+
+        monkeypatch.setattr(_safe_io, 'atomic_write_text', recorder)
+        return calls
+
+    @staticmethod
+    def _assert_common(kwargs):
+        assert kwargs.get('mkdir') is True, 'this site created its parent dir'
+        assert kwargs.get('encoding') == 'utf-8'
+        assert not kwargs.get('fsync'), 'this site never fsynced'
+        assert kwargs.get('mode') is None, (
+            'umask default, NOT 0o600 — this file is read by other processes'
+        )
+
+    def test_delegates_with_preserved_semantics(self, tmp_path, monkeypatch):
+        calls = self._recorder(monkeypatch)
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
+        scheduler._write_state_snapshot_raw(tmp_path / 'nested' / 'scheduler_state.json')
+
+        assert len(calls) == 1, f'expected exactly one delegated call, got {calls}'
+        self._assert_common(calls[0][2])
+
+    def test_on_disk_mode_matches_write_text_reference(self, tmp_path):
+        reference = tmp_path / 'reference.json'
+        reference.write_text('ref', encoding='utf-8')
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
+        path = tmp_path / 'scheduler_state.json'
+        scheduler._write_state_snapshot_raw(path)
+        assert path.stat().st_mode & 0o777 == reference.stat().st_mode & 0o777
+
+    def test_oserror_still_propagates(self, tmp_path, monkeypatch):
+        """Propagation is required: _last_snapshot_payload must only advance on success."""
+        import shared.safe_io as _safe_io
+
+        def boom(*_a, **_kw):
+            raise OSError('disk full')
+
+        monkeypatch.setattr(_safe_io, 'atomic_write_text', boom)
+        scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
+        scheduler.finish_startup()
+        with pytest.raises(OSError, match='disk full'):
+            scheduler._write_state_snapshot_raw(tmp_path / 'scheduler_state.json')
