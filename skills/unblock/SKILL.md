@@ -321,11 +321,26 @@ The merge procedure is iterative — don't assume one pass will be enough:
 
    - `status: "queued"` or `status: "attached"` → **durable intent confirmed** — the request is enqueued; proceed to poll:
      ```
-     request_id = result["request_id"]
+     if result["status"] == "queued":
+         poll_kwargs = {"request_id": result["request_id"]}
+     else:  # "attached" — pick the handle the response discloses (task 3148); a
+            # missing poll_by (pre-3148 server) degrades to request_id, today's behaviour
+         poll_by = result.get("poll_by", "request_id")
+         if poll_by == "request_id":
+             poll_kwargs = {"request_id": result["request_id"]}
+         elif poll_by == "task_id":
+             poll_kwargs = {"task_id": result["inflight_task_id"]}
+         else:  # "branch" (pollable == False): neither handle known, another merger
+                # owns the worktree; the returned request_id was never enqueued, so a
+                # first-tick unknown here is NOT the "server lost its record" case below —
+                # keep polling by branch and confirm via git merge-base --is-ancestor
+                # (see *Polled terminal failures*) before concluding anything
+             poll_kwargs = {"branch": "task/<TASK_ID>"}
+
      poll_interval = 15  # seconds; ramp up to 60 s
      loop:
          sleep(poll_interval)
-         poll = mcp__escalation__merge_status(request_id=request_id)
+         poll = mcp__escalation__merge_status(**poll_kwargs)
          if poll["state"] in ("done", "conflict", "blocked", "abandoned", "unknown"):
              break  # any terminal (or restart/unknown) state
          eta = poll.get("eta_seconds") or poll_interval * 2  # eta_seconds may be None
