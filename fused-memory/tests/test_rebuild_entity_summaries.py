@@ -12,12 +12,10 @@ Covers:
 """
 from __future__ import annotations
 
-import ast
 import asyncio
 import contextlib
 import inspect
 import logging
-import textwrap
 from collections.abc import Callable
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -2361,44 +2359,24 @@ class TestRebuildEntitySummariesCancellation:
 # ---------------------------------------------------------------------------
 
 class TestDocstringCrossReferenceAccuracy716:
-    """Regression guard: pin both sides of the cross-reference.
+    """Regression guard: pin the DOCSTRING side of the cross-reference.
 
     test_runtime_error_still_accumulates_in_errors (TestRebuildEntitySummariesCancellation)
     references test_partial_failure_continues (TestRebuildEntitySummaries) in its docstring.
-    These tests pin (a) the exception type raised in the target test and (b) the key phrases
-    in the source docstring so that future drift on either side triggers a failure.
+    The test below pins the key phrases in that docstring so a stale ValueError claim
+    cannot silently reappear and the cross-reference stays explicit.
+
+    Scope note (task 3351): this class used to also pin the EXCEPTION-TYPE side, via a
+    companion test that ran ``inspect.getsource`` over the sibling test METHOD
+    test_partial_failure_continues and AST-walked its body to assert it still mentioned
+    RuntimeError.  That guarded no production behavior — it asserted on another test's
+    source text — so it was removed with no replacement.  The exception-type invariant it
+    was proxying for (a per-entity RuntimeError accumulates in ``result['errors']`` without
+    aborting the sweep) is asserted directly, against the real production path, by
+    TestRebuildEntitySummaries.test_partial_failure_continues and
+    TestRebuildEntitySummariesCancellation.test_runtime_error_still_accumulates_in_errors
+    themselves.
     """
-
-    def test_partial_failure_continues_still_raises_runtime_error_not_value_error(self):
-        """Pin the exception type in the cross-reference target via structural AST analysis.
-
-        Uses ast.parse + ast.walk rather than substring matching so that trivial
-        reformatting (multi-line raise, whitespace changes) cannot produce a false
-        negative.  Checks only the positive invariant — that RuntimeError is referenced —
-        without the overly-broad negative assertion that no ValueError appears anywhere
-        in the test body (which would break if a legitimate second scenario were added).
-
-        RuntimeError may be referenced as a direct raise statement OR as an exception
-        instance passed to _uuid_dispatch() — both patterns exercise the same production
-        code path.
-        """
-        src = inspect.getsource(TestRebuildEntitySummaries.test_partial_failure_continues)
-        tree = ast.parse(textwrap.dedent(src))
-        # Detect RuntimeError as a raised exception or as an instantiated Call node
-        # (e.g. passed to _uuid_dispatch as a mapping value).
-        error_names = {
-            node.func.id
-            for node in ast.walk(tree)
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-            )
-        }
-        assert 'RuntimeError' in error_names, (
-            "test_partial_failure_continues must reference RuntimeError — "
-            "the cross-reference in test_runtime_error_still_accumulates_in_errors "
-            "docstring claims it 'exercises RuntimeError'"
-        )
 
     def test_runtime_error_docstring_describes_runtime_error_cross_reference(self):
         """Pin only the critical cross-reference invariants in the source docstring.
