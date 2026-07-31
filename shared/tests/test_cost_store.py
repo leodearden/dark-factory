@@ -931,3 +931,133 @@ class TestSaveApiErrorEvent:
                 details=None,
                 created_at='2026-07-31T00:00:00+00:00',
             )
+
+
+# ---------------------------------------------------------------------------
+# TestAccountEventsInWindow — CostStore.account_events_in_window(...)
+# (task 3325 / plans/server-side-api-error-handling-prd.md C4)
+# ---------------------------------------------------------------------------
+
+
+async def _seed_event(
+    store: CostStore,
+    *,
+    event_type: str,
+    created_at: str,
+    account_name: str = 'max-d',
+    details: str | None = None,
+) -> None:
+    """Insert a minimal account_events row for account_events_in_window testing."""
+    await store.save_account_event(
+        account_name=account_name,
+        event_type=event_type,
+        project_id='dark_factory',
+        run_id='run-1',
+        details=details,
+        created_at=created_at,
+    )
+
+
+@pytest.mark.asyncio
+class TestAccountEventsInWindow:
+    """step-3: account_events_in_window() is the read path for api_error forensics."""
+
+    async def test_returns_dicts_keyed_by_column_name(self, tmp_path: Path) -> None:
+        """Rows come back as dicts with all six columns — callers never index by position."""
+        async with CostStore(tmp_path / 'costs.db') as store:
+            await _seed_event(
+                store,
+                event_type='api_error',
+                created_at='2026-07-31T12:00:00+00:00',
+                details='{"status": 529}',
+            )
+            rows = await store.account_events_in_window(
+                '2026-07-31T00:00:00+00:00',
+                '2026-07-31T23:59:59+00:00',
+            )
+        assert len(rows) == 1
+        assert rows[0] == {
+            'account_name': 'max-d',
+            'event_type': 'api_error',
+            'project_id': 'dark_factory',
+            'run_id': 'run-1',
+            'details': '{"status": 529}',
+            'created_at': '2026-07-31T12:00:00+00:00',
+        }
+
+    async def test_window_is_inclusive_at_both_bounds(self, tmp_path: Path) -> None:
+        """Matches cost_totals_in_window's inclusive BETWEEN semantics."""
+        async with CostStore(tmp_path / 'costs.db') as store:
+            await _seed_event(store, event_type='api_error', created_at='2026-07-31T00:00:00+00:00')
+            await _seed_event(store, event_type='api_error', created_at='2026-07-31T23:59:59+00:00')
+            rows = await store.account_events_in_window(
+                '2026-07-31T00:00:00+00:00',
+                '2026-07-31T23:59:59+00:00',
+            )
+        assert len(rows) == 2
+
+    async def test_excludes_rows_outside_window(self, tmp_path: Path) -> None:
+        async with CostStore(tmp_path / 'costs.db') as store:
+            await _seed_event(store, event_type='api_error', created_at='2026-07-30T23:59:59+00:00')
+            await _seed_event(store, event_type='api_error', created_at='2026-07-31T12:00:00+00:00')
+            await _seed_event(store, event_type='api_error', created_at='2026-08-01T00:00:00+00:00')
+            rows = await store.account_events_in_window(
+                '2026-07-31T00:00:00+00:00',
+                '2026-07-31T23:59:59+00:00',
+            )
+        assert [r['created_at'] for r in rows] == ['2026-07-31T12:00:00+00:00']
+
+    async def test_event_type_filter_narrows_to_one_type(self, tmp_path: Path) -> None:
+        """event_type='api_error' excludes the pre-existing cap_hit/switch rows."""
+        async with CostStore(tmp_path / 'costs.db') as store:
+            await _seed_event(store, event_type='cap_hit', created_at='2026-07-31T01:00:00+00:00')
+            await _seed_event(store, event_type='api_error', created_at='2026-07-31T02:00:00+00:00')
+            await _seed_event(store, event_type='switch', created_at='2026-07-31T03:00:00+00:00')
+            filtered = await store.account_events_in_window(
+                '2026-07-31T00:00:00+00:00',
+                '2026-07-31T23:59:59+00:00',
+                event_type='api_error',
+            )
+            unfiltered = await store.account_events_in_window(
+                '2026-07-31T00:00:00+00:00',
+                '2026-07-31T23:59:59+00:00',
+            )
+        assert [r['event_type'] for r in filtered] == ['api_error']
+        assert [r['event_type'] for r in unfiltered] == ['cap_hit', 'api_error', 'switch']
+
+    async def test_empty_window_returns_empty_list(self, tmp_path: Path) -> None:
+        async with CostStore(tmp_path / 'costs.db') as store:
+            await _seed_event(store, event_type='api_error', created_at='2026-07-31T12:00:00+00:00')
+            rows = await store.account_events_in_window(
+                '2026-01-01T00:00:00+00:00',
+                '2026-01-02T00:00:00+00:00',
+            )
+        assert rows == []
+
+    async def test_orders_by_created_at_ascending(self, tmp_path: Path) -> None:
+        """The dashboard strip renders a timeline — insertion order must not leak through."""
+        async with CostStore(tmp_path / 'costs.db') as store:
+            for stamp in (
+                '2026-07-31T05:00:00+00:00',
+                '2026-07-31T01:00:00+00:00',
+                '2026-07-31T03:00:00+00:00',
+            ):
+                await _seed_event(store, event_type='api_error', created_at=stamp)
+            rows = await store.account_events_in_window(
+                '2026-07-31T00:00:00+00:00',
+                '2026-07-31T23:59:59+00:00',
+            )
+        assert [r['created_at'] for r in rows] == [
+            '2026-07-31T01:00:00+00:00',
+            '2026-07-31T03:00:00+00:00',
+            '2026-07-31T05:00:00+00:00',
+        ]
+
+    async def test_not_opened_raises_runtime_error(self, tmp_path: Path) -> None:
+        """A never-opened store raises rather than reporting a healthy empty window."""
+        store = CostStore(tmp_path / 'costs.db')
+        with pytest.raises(RuntimeError, match='CostStore not opened'):
+            await store.account_events_in_window(
+                '2026-07-31T00:00:00+00:00',
+                '2026-07-31T23:59:59+00:00',
+            )
