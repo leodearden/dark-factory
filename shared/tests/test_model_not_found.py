@@ -31,6 +31,7 @@ from shared.invocation_outcome import (
     CapHit,
     Failure,
     ModelNotFound,
+    ServerError,
     classify_invocation,
 )
 from shared.usage_gate import AccountPhase, UsageGate
@@ -95,14 +96,18 @@ class TestClassifyInvocationModelNotFound:
         assert isinstance(outcome, CapHit)
         assert not isinstance(outcome, ModelNotFound)
 
-    def test_generic_500_with_unrelated_text_is_failure_not_model_not_found(self):
+    def test_generic_500_with_unrelated_text_is_server_error_not_model_not_found(self):
+        """This row's intent is "a generic 500 is NOT ModelNotFound"; the
+        Failure expectation it used to carry was superseded by task 3314's
+        ServerError tier (plans/server-side-api-error-handling-prd.md task
+        alpha), which now claims every 5xx below cap detection."""
         result = AgentResult(
             success=False,
             output='internal server error, please retry',
             api_error_status=500,
         )
         outcome = classify_invocation(result, strict_confirm=True)
-        assert isinstance(outcome, Failure)
+        assert isinstance(outcome, ServerError)
         assert not isinstance(outcome, ModelNotFound)
 
 
