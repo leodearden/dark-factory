@@ -44,7 +44,14 @@ CREATE INDEX IF NOT EXISTS idx_wo_operation ON write_ops(operation);
 -- free thereafter. _migrate() is for ALTER TABLE column additions plus indexes
 -- that depend on those new columns; duplicating the DDL there would be lock-step
 -- duplication. Same shape as idx_bo_created on backend_ops below.
--- one-time build on the live journal: <TBD, filled in by step-3>
+-- One-time build cost, measured 2026-07-31 on a page-for-page copy of the live
+-- journal (16,635,866 rows / 7.07 GB): 47.1 s wall, +696,004,608 bytes on disk
+-- (+9.9%, 7.069 -> 7.765 GB). Comfortably under the ~120 s bar, so it is built
+-- during initialize() at the next start — BEFORE the server accepts traffic, so
+-- the cost is a delayed start, never dropped audit rows. (Building it against a
+-- serving instance would be strictly worse: busy_timeout is 5000 ms and
+-- log_write_op swallows its errors, so a multi-minute write-lock hold would
+-- silently drop journal rows.)
 CREATE INDEX IF NOT EXISTS idx_wo_created ON write_ops(created_at);
 
 CREATE TABLE IF NOT EXISTS backend_ops (
