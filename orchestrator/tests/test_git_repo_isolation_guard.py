@@ -30,7 +30,11 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from _orch_helpers import NonIsolatedGitRepoError, assert_isolated_git_repo
+from _orch_helpers import (
+    NonIsolatedGitRepoError,
+    assert_isolated_git_repo,
+    git_env_with_ceiling,
+)
 
 
 def _init_repo(path: Path) -> Path:
@@ -192,3 +196,163 @@ class TestAssertIsolatedGitRepo:
         bare.mkdir()
         with pytest.raises(AssertionError):
             assert_isolated_git_repo(bare)
+
+
+def _object_store(repo: Path) -> set[str]:
+    """Snapshot of every loose/packed object file under ``<repo>/.git/objects``.
+
+    Used to prove that a refused call left the victim's object store byte-for-
+    byte unchanged — not merely that the command exited non-zero.
+    """
+    objects = repo / '.git' / 'objects'
+    if not objects.is_dir():
+        return set()
+    return {str(p.relative_to(objects)) for p in objects.rglob('*') if p.is_file()}
+
+
+class TestGitEnvWithCeiling:
+    """git_env_with_ceiling(cwd) contains git's upward repo discovery at cwd."""
+
+    def test_copies_os_environ(self, tmp_path: Path, monkeypatch):
+        """The returned mapping inherits the ambient environment, not a blank one.
+
+        A git child spawned with a blank env loses PATH, HOME and the git config
+        discovery it needs; the ceiling has to be an *addition* to os.environ.
+        """
+        repo = _init_repo(tmp_path / 'repo')
+        monkeypatch.setenv('DF_3182_SENTINEL', 'present')
+
+        env = git_env_with_ceiling(repo)
+
+        assert env.get('DF_3182_SENTINEL') == 'present'
+        assert 'PATH' in env
+
+    def test_does_not_mutate_os_environ(self, tmp_path: Path):
+        """It returns a COPY — the caller's own process env is left alone."""
+        repo = _init_repo(tmp_path / 'repo')
+        before = os.environ.get('GIT_CEILING_DIRECTORIES')
+
+        env = git_env_with_ceiling(repo)
+        env['DF_3182_MUTATION'] = 'x'
+
+        assert os.environ.get('GIT_CEILING_DIRECTORIES') == before
+        assert 'DF_3182_MUTATION' not in os.environ
+
+    def test_ceiling_is_the_parent_of_cwd(self, tmp_path: Path):
+        """The ceiling is cwd's PARENT: git may inspect cwd, never above it."""
+        repo = _init_repo(tmp_path / 'repo')
+
+        env = git_env_with_ceiling(repo)
+
+        assert env['GIT_CEILING_DIRECTORIES'] == str(repo.resolve().parent)
+
+    def test_ceiling_is_absolute(self, tmp_path: Path, monkeypatch):
+        """git ignores non-absolute ceiling entries outright, so relative in →
+        absolute out is load-bearing, not cosmetic.
+        """
+        repo = _init_repo(tmp_path / 'repo')
+        monkeypatch.chdir(repo)
+
+        env = git_env_with_ceiling(Path('.'))
+
+        assert Path(env['GIT_CEILING_DIRECTORIES']).is_absolute()
+        assert env['GIT_CEILING_DIRECTORIES'] == str(repo.resolve().parent)
+
+    def test_ceiling_resolves_symlinks(self, tmp_path: Path):
+        """git compares the ceiling against the symlink-resolved path.
+
+        An unresolved entry silently never matches, so the containment would be
+        inert — a fail-open no-one would notice.
+        """
+        repo = _init_repo(tmp_path / 'real' / 'repo')
+        link_dir = tmp_path / 'link'
+        link_dir.symlink_to(tmp_path / 'real', target_is_directory=True)
+
+        env = git_env_with_ceiling(link_dir / 'repo')
+
+        assert env['GIT_CEILING_DIRECTORIES'] == str((tmp_path / 'real').resolve())
+
+    def test_normal_repo_root_still_resolves(self, tmp_path: Path):
+        """A legitimate caller at a normal repo root is unaffected by the ceiling."""
+        repo = _init_repo(tmp_path / 'repo')
+
+        proc = subprocess.run(
+            ['git', 'rev-parse', '--show-toplevel'],
+            cwd=repo, capture_output=True, env=git_env_with_ceiling(repo),
+        )
+
+        assert proc.returncode == 0, f'ceiling broke a normal repo root: {proc.stderr!r}'
+        assert Path(proc.stdout.decode().strip()).resolve() == repo.resolve()
+
+    def test_linked_worktree_root_still_resolves(self, tmp_path: Path):
+        """A linked-worktree root is unaffected too.
+
+        This is the case that would break the two ``_inject_uu_state`` call
+        sites at test_git_ops.py:787 and :5116 if the ceiling were set one level
+        too low, so it is pinned explicitly rather than assumed.
+        """
+        repo = _init_repo(tmp_path / 'repo')
+        wt = _add_linked_worktree(repo, 'linked-wt')
+
+        proc = subprocess.run(
+            ['git', 'rev-parse', '--show-toplevel'],
+            cwd=wt, capture_output=True, env=git_env_with_ceiling(wt),
+        )
+
+        assert proc.returncode == 0, f'ceiling broke a linked worktree: {proc.stderr!r}'
+        assert Path(proc.stdout.decode().strip()).resolve() == wt.resolve()
+
+    def test_nested_non_repo_cannot_reach_enclosing_repo(self, tmp_path: Path):
+        """The esc-3072-3 shape: contained, and the victim gains NO objects.
+
+        ``git hash-object -w`` is the exact command that leaked blobs into a
+        live task worktree.  Under the ceiling it must fail before writing
+        anything — the object store is the assertion that matters, not the exit
+        code.
+        """
+        sentinel = _init_repo(tmp_path / 'live-worktree')
+        nested = sentinel / '.pytest-tmp' / 'test_x0'
+        nested.mkdir(parents=True)
+        before = _object_store(sentinel)
+
+        proc = subprocess.run(
+            ['git', 'hash-object', '-w', '--stdin'],
+            cwd=nested, capture_output=True, input=b'version base\n',
+            env=git_env_with_ceiling(nested),
+        )
+
+        assert proc.returncode != 0, (
+            f'ceiling failed to contain the upward walk; git succeeded with '
+            f'stdout={proc.stdout!r}'
+        )
+        assert _object_store(sentinel) == before, (
+            'objects leaked into the enclosing repo despite the ceiling'
+        )
+
+    def test_control_without_ceiling_the_walk_escapes(self, tmp_path: Path):
+        """Control: the SAME command without the ceiling reaches the enclosing repo.
+
+        Documents in-suite that the containment is what makes the difference —
+        without this case a future reader cannot tell whether the test above
+        proves anything or merely reflects the ambient directory layout.
+        """
+        sentinel = _init_repo(tmp_path / 'live-worktree')
+        nested = sentinel / '.pytest-tmp' / 'test_x0'
+        nested.mkdir(parents=True)
+        before = _object_store(sentinel)
+
+        env = os.environ.copy()
+        env.pop('GIT_CEILING_DIRECTORIES', None)
+        proc = subprocess.run(
+            ['git', 'hash-object', '-w', '--stdin'],
+            cwd=nested, capture_output=True, input=b'version base\n', env=env,
+        )
+
+        assert proc.returncode == 0, (
+            f'control precondition failed — git should escape upward here: '
+            f'{proc.stderr!r}'
+        )
+        assert _object_store(sentinel) != before, (
+            'control precondition failed — the escaping write should have '
+            "landed in the sentinel's object store"
+        )
