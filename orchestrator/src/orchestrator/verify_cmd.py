@@ -258,6 +258,30 @@ def split_top_level_and(raw: str) -> list[str]:
     return segments
 
 
+# Keywords whose slot may carry a preserved `&&` tail. An ALLOWLIST, not a
+# denylist, and that direction is the point (task 3218).
+#
+# `'pytest'` is deliberately ABSENT. A preserved tail makes the caller's
+# result RECOGNISED-BUT-UNSTRUCTURABLE (``VerifyCmd.raw is not None``), and
+# both `with_junitxml` and `with_pytest_timeout` are documented no-ops on
+# that shape — so the tail would be bought at the price of SILENTLY dropping
+# the `--junitxml` report that drives `_extract_failing_test_ids_from_junit`,
+# flake confirmation and the per-test timeout floor. An unscoped sibling
+# checker is not worth that trade in the test slot; in the lint/type slots
+# there is nothing to lose, since neither mutator applies there.
+#
+# The DEFAULT for an unlisted keyword is therefore NO preservation — exactly
+# the pre-task-3061 truncate-at-keyword behaviour. A verify slot added later
+# cannot silently acquire this degradation by existing: it has to opt in
+# here, explicitly, which is the fail-safe direction.
+#
+# `'uv run'` is listed for `verify._reproject_str`, whose tail preservation
+# is load-bearing rather than merely nice: without it a chained lint command
+# re-parses OPAQUE and the `--project` injection is silently dropped, which
+# the depless workspace-root project turns into exit 127 (task 2036).
+_TAIL_PRESERVING_KEYWORDS = frozenset({'ruff check', 'pyright', 'uv run'})
+
+
 def split_chain_tail(raw: str, keyword: str) -> tuple[str, str]:
     """Split *raw* into a *keyword*-bearing head and a preservable trailing chain.
 
@@ -335,6 +359,8 @@ def split_chain_tail(raw: str, keyword: str) -> tuple[str, str]:
     the only such caller. The two scopers apply ``strip_cwd``, so their
     ``cwd_rel`` is always ``None`` by render time.
     """
+    if keyword not in _TAIL_PRESERVING_KEYWORDS:
+        return raw, ''
     try:
         tokens = shlex.split(raw)
     except ValueError:
