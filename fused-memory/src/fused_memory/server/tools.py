@@ -3766,6 +3766,21 @@ def create_mcp_server(
         "Cross-project task dependencies"; tasks 1799/1807). Do not assume the
         two tools share an envelope shape.
         """
+        # Input validation — early-exit before touching the interceptor.
+        # Identical rules to get_tasks so both tools reject identical inputs
+        # identically (page_size=0 in particular must NOT become an empty page
+        # with has_more=True, which would spin a paging caller forever).
+        if page_size is not None and (not isinstance(page_size, int) or isinstance(page_size, bool) or page_size <= 0):
+            return {
+                'error': 'page_size must be a positive integer',
+                'error_type': 'ValidationError',
+            }
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            return {
+                'error': 'offset must be a non-negative integer',
+                'error_type': 'ValidationError',
+            }
+
         _normalized = _normalize_project_root(project_root)
         if isinstance(_normalized, dict):
             return _normalized

@@ -209,14 +209,26 @@ async def test_get_statuses_pagination_validation_and_backward_compat(
     assert bad_neg.get('error_type') == 'ValidationError', f'Expected ValidationError for page_size=-1, got: {bad_neg}'
     paging_task_interceptor.get_statuses.assert_not_awaited()
 
-    # (d) page_size=True → ValidationError (bool is an int subclass; a caller
-    # that passes a flag by mistake must not silently get a 1-entry page)
+    # (d) page_size=True / offset=True → ValidationError (bool is an int
+    # subclass, so an unguarded `isinstance(x, int)` would accept a flag as a
+    # page size).  Asserted against the tool FUNCTION rather than through
+    # _tool_manager.call_tool: the MCP boundary declares `page_size: int | None`,
+    # so pydantic coerces True → 1 before the guard can ever see a bool.  That
+    # coercion is pre-existing and identical for get_tasks, whose guards these
+    # are copied from verbatim — matching it is the point, so the bool rejection
+    # is pinned at the layer where it is actually reachable (any in-process
+    # caller of the tool function).
     paging_task_interceptor.get_statuses.reset_mock()
-    bad_bool = await paging_server._tool_manager.call_tool(
-        'get_statuses',
-        {'project_root': '/project', 'page_size': True},
-    )
+    get_statuses_fn = paging_server._tool_manager._tools['get_statuses'].fn
+
+    bad_bool = await get_statuses_fn(project_root='/project', page_size=True)
     assert bad_bool.get('error_type') == 'ValidationError', f'Expected ValidationError for page_size=True, got: {bad_bool}'
+    assert 'page_size' in bad_bool.get('error', '').lower(), f'Error message should mention page_size: {bad_bool}'
+
+    bad_bool_off = await get_statuses_fn(project_root='/project', page_size=2, offset=True)
+    assert bad_bool_off.get('error_type') == 'ValidationError', f'Expected ValidationError for offset=True, got: {bad_bool_off}'
+    assert 'offset' in bad_bool_off.get('error', '').lower(), f'Error message should mention offset: {bad_bool_off}'
+
     paging_task_interceptor.get_statuses.assert_not_awaited()
 
     # (e) offset=-1 with page_size=2 → ValidationError
