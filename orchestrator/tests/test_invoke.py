@@ -392,7 +392,16 @@ class TestRunSubprocessLocalCancellation:
 
         async def spy_exec(*args, **kwargs):
             proc = await real_exec(*args, **kwargs)
-            spawned.append(proc)
+            # This patches the *global* asyncio module attribute, so for the
+            # duration of the `with` block below EVERY subprocess spawned
+            # anywhere in this worker process (e.g. this suite's background
+            # git-subprocess workers, see conftest.py's
+            # _reap_leaked_merge_workers) flows through this spy too. Only
+            # record the ``sleep 30`` this test actually launched, so an
+            # unrelated concurrent spawn landing first can't be mistaken for
+            # it and have its process group polled/killed below.
+            if args[:2] == ('sleep', '30'):
+                spawned.append(proc)
             return proc
 
         pgid = None
@@ -413,7 +422,10 @@ class TestRunSubprocessLocalCancellation:
                 deadline = asyncio.get_event_loop().time() + 2.0
                 while not spawned and asyncio.get_event_loop().time() < deadline:
                     await asyncio.sleep(0.05)
-                assert spawned, 'sleep 30 was not spawned within 2s'
+                assert len(spawned) == 1, (
+                    f'expected exactly one matching "sleep 30" spawn within 2s, '
+                    f'got {len(spawned)}: {spawned}'
+                )
 
                 proc = spawned[0]
                 pgid = proc.pid  # start_new_session ⇒ pgid == pid
@@ -460,8 +472,15 @@ class TestRunSubprocessLocalCancellation:
         entered = asyncio.Event()
         hang_forever = asyncio.Event()  # never set -- first call hangs until cancelled
 
-        async def fake_terminate_process_group(proc_arg, pgid_arg, grace_secs=5.0):
-            calls.append((proc_arg, pgid_arg, grace_secs))
+        async def fake_terminate_process_group(*args, **kwargs):
+            # *args/**kwargs (rather than a `grace_secs=5.0`-defaulted
+            # parameter) so the recorded call distinguishes "grace_secs was
+            # passed as a keyword" from "grace_secs was omitted and a local
+            # default filled in" -- the real
+            # shared.proc_group.terminate_process_group declares grace_secs
+            # keyword-only, and a defaulted fake parameter would silently
+            # accept (and record 5.0 for) a positional-arg regression too.
+            calls.append((args, kwargs))
             if len(calls) == 1:
                 entered.set()
                 await hang_forever.wait()
@@ -490,9 +509,16 @@ class TestRunSubprocessLocalCancellation:
             f'landed during the abandoned timeout-kill, got {len(calls)} '
             f'call(s): {calls}'
         )
-        second_call = calls[1]
-        assert second_call[1] == 12345, f'pgid mismatch on retry: {second_call}'
-        assert second_call[2] == 5.0, f'grace_secs mismatch on retry: {second_call}'
+        second_args, second_kwargs = calls[1]
+        assert second_args[1] == 12345, f'pgid mismatch on retry: {calls[1]}'
+        # Must be a keyword, equal to 5.0 -- catches both "kwarg dropped"
+        # (kwargs would be {}) and "passed positionally" (it would show up
+        # in second_args instead, not second_kwargs).
+        assert second_kwargs.get('grace_secs') == 5.0, (
+            f'expected grace_secs=5.0 passed as a keyword on retry (the real '
+            f'shared.proc_group.terminate_process_group declares grace_secs '
+            f'keyword-only), got {calls[1]}'
+        )
 
 
 _CODEX_VALID_JSONL_STDOUT = (
