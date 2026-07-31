@@ -11,6 +11,8 @@ import yaml
 from pydantic import ValidationError
 
 from orchestrator.config import (
+    DEFAULT_TIER,
+    PRIORITY_TIERS,
     RELOADABLE_FIELDS,
     BackendsConfig,
     BudgetsConfig,
@@ -28,6 +30,7 @@ from orchestrator.config import (
     _deep_merge,
     _discover_module_configs,
     apply_reload,
+    coerce_tier,
     default_price_table,
     diff_config,
     load_config,
@@ -3150,4 +3153,78 @@ class TestMainTipSweepIsolatedPrefilterEnabled:
             'main_tip_sweep_isolated_prefilter_enabled is deliberately '
             'restart-only (same tier as the rest of the main_tip_sweep '
             'family) and must NOT be in RELOADABLE_FIELDS'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 3227: coerce_tier() observability — warn on real anomalies only
+# ---------------------------------------------------------------------------
+
+
+class TestCoerceTierObservability:
+    """coerce_tier() normalizes a priority value (possibly None/unknown) to a
+    canonical tier.
+
+    An absent/None priority is a NORMAL expected state — every one of this
+    repo's 39 subtasks carries priority=None, and the scheduler coerces
+    every task's priority on every tick — so it must return DEFAULT_TIER
+    silently rather than warn. Only a genuinely unrecognized non-None value
+    is a real anomaly worth a WARNING (see TestCoerceTierUnrecognizedValueDedup
+    below).
+    """
+
+    def test_unset_none_returns_default_tier_silently(
+        self, caplog: pytest.LogCaptureFixture
+    ):
+        """coerce_tier(None) returns DEFAULT_TIER and emits zero WARNING
+        records on the 'orchestrator.config' logger — None is a default,
+        not a fail-soft fallback."""
+        with caplog.at_level(logging.WARNING, logger='orchestrator.config'):
+            result = coerce_tier(None)
+
+        assert result == DEFAULT_TIER
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and r.name == 'orchestrator.config'
+        ]
+        assert warning_records == [], (
+            f"coerce_tier(None) must not warn; got: "
+            f"{[r.getMessage() for r in warning_records]}"
+        )
+
+    def test_absent_key_dict_get_returns_default_tier_silently(
+        self, caplog: pytest.LogCaptureFixture
+    ):
+        """The equivalent absent-key form used by the scheduler
+        (``tasks_by_id.get(tid, {}).get('priority')`` -> None, see
+        scheduler.py:4631) must also return DEFAULT_TIER silently."""
+        with caplog.at_level(logging.WARNING, logger='orchestrator.config'):
+            result = coerce_tier({}.get('priority'))
+
+        assert result == DEFAULT_TIER
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and r.name == 'orchestrator.config'
+        ]
+        assert warning_records == [], (
+            f"coerce_tier({{}}.get('priority')) must not warn; got: "
+            f"{[r.getMessage() for r in warning_records]}"
+        )
+
+    def test_each_known_tier_round_trips_unchanged_and_silently(
+        self, caplog: pytest.LogCaptureFixture
+    ):
+        """Every tier in PRIORITY_TIERS passes through coerce_tier()
+        unchanged, with zero WARNING records (happy-path regression guard)."""
+        with caplog.at_level(logging.WARNING, logger='orchestrator.config'):
+            results = [coerce_tier(tier) for tier in PRIORITY_TIERS]
+
+        assert results == list(PRIORITY_TIERS)
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and r.name == 'orchestrator.config'
+        ]
+        assert warning_records == [], (
+            f"coerce_tier() on a known tier must not warn; got: "
+            f"{[r.getMessage() for r in warning_records]}"
         )
