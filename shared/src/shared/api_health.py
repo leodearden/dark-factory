@@ -33,6 +33,7 @@ than testing ``isinstance(s, Open)``, which silently un-throttles mid-outage.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from collections import deque
@@ -256,7 +257,52 @@ class ApiHealthGate:
         # event loop that makes the transition atomic, so two concurrent
         # reporters cannot interleave mid-transition and no lock is needed.
         self._state = self._next_state(signal, stats)
+
+        if isinstance(outcome, ServerError):
+            # Strictly AFTER the transition: `state_after` must be accurate,
+            # and the in-memory state stays authoritative regardless of how
+            # long this I/O takes or whether it succeeds at all.
+            await self._write_api_error_row(
+                outcome, task_id=task_id, account=account, role=role, stats=stats
+            )
+
         return self._state
+
+    async def _write_api_error_row(
+        self,
+        outcome: ServerError,
+        *,
+        task_id: str | None,
+        account: str,
+        role: str,
+        stats: GateStats,
+    ) -> None:
+        """Record one ``api_error`` account event for forensics.
+
+        A gate with no cost store is fully functional — xi can wire the state
+        machine before the store, and the tests drive it without one.
+        """
+        if self._cost_store is None:
+            return
+        details = json.dumps(
+            {
+                'status': outcome.status,
+                'task_id': task_id,
+                'role': role,
+                'state_after': type(self._state).__name__,
+                'failures': stats.failures,
+                'completions': stats.completions,
+                'distinct_tasks': stats.distinct_tasks,
+                'failure_rate': stats.failure_rate,
+            }
+        )
+        await self._cost_store.save_api_error_event(
+            account_name=account,
+            project_id=self._project_id,
+            run_id=self._run_id,
+            details=details,
+            created_at=self._wall_clock().isoformat(),
+        )
 
     @staticmethod
     def _classify(outcome: InvocationOutcome) -> _Signal:
