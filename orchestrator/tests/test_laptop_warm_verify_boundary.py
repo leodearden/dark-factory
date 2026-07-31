@@ -1332,6 +1332,15 @@ def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
     holder = spawn_verify_merge(
         sha=head_sha, spec=sleeper_spec(300.0), cfg_file=cfg_file, request_id=HOLDER_REQUEST_ID,
     )
+    # task 3318: --request-id arms the holder's stdin watchdog (see
+    # spawn_verify_merge docstring), but unlike Row 3 this holder was never
+    # given a live HeartbeatWriter -- it self-killed at
+    # ~(WATCHDOG_HEARTBEAT_TIMEOUT_SECS + WATCHDOG_KILL_GRACE_SECS) = ~15-17s
+    # instead of surviving the full 300s sleeper_spec, well inside the
+    # waiter's own budget under full-suite xdist load (Python import alone
+    # ~9s). Pair it with a live heartbeat, mirroring Row 3, so it survives
+    # for the whole span the test needs it.
+    heartbeat_holder = HeartbeatWriter(holder, interval=0.2).start()
     try:
         holder_pgid_val = wait_for_pgid_file(pgf_holder)
         wait_subtree_live(holder_pgid_val)
@@ -1364,7 +1373,10 @@ def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
 
         assert waiter.returncode == 0, (
             f'expected exit 0 (contention result on stdout), got '
-            f'{waiter.returncode}; stderr={stderr.decode()[:2000]!r}'
+            # task 3318: tail-sliced (not head-truncated) -- the actual
+            # failure cause (e.g. a watchdog self-kill traceback) is at the
+            # END of stderr, and a 2000-char head slice was hiding it.
+            f'{waiter.returncode}; stderr={stderr.decode()[-4000:]!r}'
         )
         result = result_from_json(stdout.decode())
         assert is_flock_contention_failure(result), (
@@ -1393,6 +1405,7 @@ def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
             "(marker mtime changed)"
         )
     finally:
+        heartbeat_holder.stop_heartbeats()
         if holder.poll() is None:
             holder.kill()
             holder.wait(timeout=5)
