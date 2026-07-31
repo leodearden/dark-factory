@@ -14,7 +14,10 @@ from unittest.mock import AsyncMock, call
 
 import pytest
 
-from fused_memory.reconciliation.citation_verifier import verify_cited_memories
+from fused_memory.reconciliation.citation_verifier import (
+    find_citation_occurrences,
+    verify_cited_memories,
+)
 
 
 @pytest.mark.asyncio
@@ -226,3 +229,101 @@ async def test_multiple_findings_processed_independently():
     assert stats['stage1_citations_verified'] == 1
     assert stats['stage1_phantom_citations_dropped'] == 1
     assert stats['stage1_citation_verification_errors'] == 0
+
+
+# --------------------------------------------------------------------------- #
+# find_citation_occurrences — the mechanical all-keys metadata scan (task 3108)
+# --------------------------------------------------------------------------- #
+
+# Two distinct canonical UUIDs that deliberately SHARE an 8-char prefix, so the
+# prefix-collision guard (case g) exercises the truncated-UUID hazard that
+# ``prompts/stage1.py`` warns about at :99-113.
+_DOOMED = '2531b4d8-1111-4aaa-8bbb-000000000001'
+_PREFIX_TWIN = '2531b4d8-2222-4ccc-8ddd-000000000002'
+_SURVIVOR = '9f3ac071-3333-4eee-8fff-000000000003'
+
+
+class TestFindCitationOccurrences:
+    """``find_citation_occurrences`` is a pure recursive scan over ALL keys.
+
+    It exists because incident failure mode (1) was a hand-written enumeration
+    of citation-bearing tasks that found 3 of 8 — the 5 it missed included the
+    pending/dispatchable ones. A key allowlist cannot be trusted, so the scan
+    descends every dict key, every list index and every free-text string.
+    """
+
+    def test_top_level_scalar_value_is_the_uuid(self):
+        """(a) A top-level scalar whose value IS the UUID yields its bare key."""
+        metadata = {'mem0_canonical_entry': _DOOMED}
+
+        assert find_citation_occurrences(metadata, _DOOMED) == ['mem0_canonical_entry']
+
+    def test_uuid_nested_in_a_list_of_dicts_yields_indexed_path(self):
+        """(b) A UUID nested in a list of dicts yields a dotted+indexed path."""
+        metadata = {
+            'x_memory_write_caution': [
+                {'entry': _SURVIVOR, 'note': 'survivor'},
+                {'entry': _DOOMED, 'note': 'doomed'},
+            ],
+        }
+
+        assert find_citation_occurrences(metadata, _DOOMED) == [
+            'x_memory_write_caution[1].entry',
+        ]
+
+    def test_uuid_embedded_as_substring_of_free_text_query(self):
+        """(c) A UUID embedded INSIDE free text is found — the real
+        ``memory_hints.queries[0]`` shape (shared/task_metadata.py:185,193-194)
+        that the incident actually hit."""
+        metadata = {
+            'memory_hints': {
+                'entities': ['MemoryConsolidator'],
+                'queries': [f'see canonical entry {_DOOMED} for the consolidated advice'],
+            },
+        }
+
+        assert find_citation_occurrences(metadata, _DOOMED) == ['memory_hints.queries[0]']
+
+    def test_every_occurrence_in_one_blob_is_returned(self):
+        """(d) Multiple occurrences across unrelated keys are ALL returned."""
+        metadata = {
+            'mem0_canonical_entry': _DOOMED,
+            'memory_hints': {'entities': [], 'queries': [f'prose about {_DOOMED} here']},
+            'mem0_cluster_entries': [_SURVIVOR, _DOOMED],
+            'unrelated': {'deep': {'deeper': [{'k': _DOOMED}]}},
+        }
+
+        paths = find_citation_occurrences(metadata, _DOOMED)
+
+        assert sorted(paths) == sorted([
+            'mem0_canonical_entry',
+            'memory_hints.queries[0]',
+            'mem0_cluster_entries[1]',
+            'unrelated.deep.deeper[0].k',
+        ])
+
+    def test_absent_uuid_yields_empty_list(self):
+        """(e) A blob that does not cite the id yields no paths."""
+        metadata = {'mem0_canonical_entry': _SURVIVOR, 'memory_hints': {'queries': ['x']}}
+
+        assert find_citation_occurrences(metadata, _DOOMED) == []
+
+    @pytest.mark.parametrize('metadata', [{}, None, 'a string', 42, ['a', 'list']])
+    def test_malformed_or_empty_input_yields_empty_list_without_raising(self, metadata):
+        """(f) ``{}`` / ``None`` / non-dict input returns ``[]`` and never raises."""
+        assert find_citation_occurrences(metadata, _DOOMED) == []
+
+    def test_prefix_twin_uuid_is_not_matched(self):
+        """(g) A DIFFERENT uuid sharing an 8-char prefix is NOT a citation.
+
+        Guards the truncated-prefix hazard: matching on `'2531b4d8'` would
+        falsely repoint an unrelated entry.
+        """
+        metadata = {
+            'mem0_canonical_entry': _PREFIX_TWIN,
+            'memory_hints': {'queries': [f'mentions {_PREFIX_TWIN} only']},
+        }
+
+        assert find_citation_occurrences(metadata, _DOOMED) == []
+        # ...and the eight shared characters alone find nothing either.
+        assert find_citation_occurrences(metadata, _DOOMED[:8]) == []
