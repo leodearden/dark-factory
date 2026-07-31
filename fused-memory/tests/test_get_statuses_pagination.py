@@ -90,3 +90,68 @@ def paging_server(paging_task_interceptor):
         mock_service,
         task_interceptor=paging_task_interceptor,
     )
+
+
+# ---------------------------------------------------------------------------
+# Explicit pagination (task 3064)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_statuses_explicit_pagination_slices_and_reports_metadata(
+    paging_server,
+):
+    """get_statuses with page_size slices the status map and attaches a
+    pagination envelope — the get_statuses analogue of
+    test_task_tools.py::test_get_tasks_pagination_slices_and_reports_metadata.
+
+    Sub-scenarios over a 5-entry population (ids '1'..'5'):
+      (a) first page  → ids 1-2, has_more=True
+      (b) last page   → id 5 only, has_more=False
+      (c) beyond end  → empty map, returned=0, has_more=False (NOT an error)
+      (d) the wrapped 'statuses' envelope survives pagination
+    """
+    _set_population(_make_statuses(5))
+
+    # (a) First page: offset=0, page_size=2 → the numerically-first two ids
+    result = await paging_server._tool_manager.call_tool(
+        'get_statuses',
+        {'project_root': '/project', 'page_size': 2, 'offset': 0},
+    )
+    assert result.get('statuses') == {'1': 'pending', '2': 'pending'}, (
+        f'Expected first 2 statuses, got: {result.get("statuses")}'
+    )
+    assert result.get('pagination') == {
+        'total': 5,
+        'offset': 0,
+        'page_size': 2,
+        'returned': 2,
+        'has_more': True,
+        'auto_paginated': False,
+    }, f'Unexpected pagination dict: {result.get("pagination")}'
+
+    # (d) The wrapped envelope survives — the deliberate get_statuses vs
+    # get_external_statuses asymmetry pinned by test_status_envelope_contract.py
+    assert 'statuses' in result, f"Expected wrapped 'statuses' key, got: {result!r}"
+    assert isinstance(result['statuses'], dict), f'Expected a dict, got: {result["statuses"]!r}'
+
+    # (b) Last item: offset=4, page_size=2 → only id 5
+    result2 = await paging_server._tool_manager.call_tool(
+        'get_statuses',
+        {'project_root': '/project', 'page_size': 2, 'offset': 4},
+    )
+    assert result2.get('statuses') == {'5': 'pending'}, (
+        f'Expected last status only, got: {result2.get("statuses")}'
+    )
+    assert result2['pagination']['returned'] == 1
+    assert result2['pagination']['has_more'] is False
+    assert result2['pagination']['total'] == 5
+
+    # (c) Past end: offset=10 → empty map, not an error
+    result3 = await paging_server._tool_manager.call_tool(
+        'get_statuses',
+        {'project_root': '/project', 'page_size': 2, 'offset': 10},
+    )
+    assert result3.get('statuses') == {}, f'Expected empty map, got: {result3.get("statuses")}'
+    assert result3['pagination']['returned'] == 0
+    assert result3['pagination']['has_more'] is False
