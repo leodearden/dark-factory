@@ -1181,26 +1181,29 @@ class TestRetryScopeEventFields:
         release_file = tmp_path / 'nextest-retry-release.filter'
         release_file.write_text('\n'.join(['id::z']))  # 1 id
 
+        # SPACE-delimited (task 3059): merge_queue._build_retry_verify_env is the
+        # single source of truth for this format, and reify word-splits both
+        # values.  Counting with .split(',') would report 1 and 1 here.
         verify_env = {
             'REIFY_VERIFY_RETRY_SCOPE': 'failed_only',
-            'REIFY_RUN_ALL_MEMBER_SUBSET': 'm1,m2',
-            'REIFY_GUI_RETRY_SPECS': 'ui/x.ts',
+            'REIFY_RUN_ALL_MEMBER_SUBSET': 'a.sh b.sh c.sh',
+            'REIFY_GUI_RETRY_SPECS': 'x.test.ts y.test.ts',
             'REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_DEBUG': str(debug_file),
             'REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_RELEASE': str(release_file),
         }
         assert retry_scope_event_fields(verify_env) == {
             'retry_scope': 'failed_only',
             'retry_subset_sizes': {
-                'run_all': 2,
-                'gui': 1,
+                'run_all': 3,
+                'gui': 2,
                 'nextest_debug': 3,
                 'nextest_release': 1,
             },
         }
 
-        # Empty-subset edge: '' comma-values count 0 tokens (dodge the
-        # ''.split(',') == [''] pitfall), and a 0-byte filter file counts 0
-        # lines (dodge the ''.splitlines() == [] pitfall).
+        # Empty-subset edge: '' counts 0 tokens (str.split() with no argument
+        # already drops empties, dodging the ''.split(',') == [''] pitfall), and
+        # a 0-byte filter file counts 0 lines (dodge ''.splitlines() == []).
         empty_file = tmp_path / 'nextest-retry-empty.filter'
         empty_file.write_text('')  # 0 bytes
         empty_env = {
@@ -1224,7 +1227,7 @@ class TestRetryScopeEventFields:
         # crash), while the comma-delimited run_all/gui still compute correctly.
         verify_env = {
             'REIFY_VERIFY_RETRY_SCOPE': 'failed_only',
-            'REIFY_RUN_ALL_MEMBER_SUBSET': 'm1,m2',
+            'REIFY_RUN_ALL_MEMBER_SUBSET': 'm1 m2',
             'REIFY_GUI_RETRY_SPECS': 'ui/x.ts',
             'REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_DEBUG': str(tmp_path / 'missing.filter'),
             # REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_RELEASE deliberately absent.
@@ -1234,7 +1237,7 @@ class TestRetryScopeEventFields:
         sizes = result['retry_subset_sizes']
         assert sizes['nextest_debug'] is None   # unreadable path → None
         assert sizes['nextest_release'] is None  # absent key → None
-        assert sizes['run_all'] == 2             # comma-values still compute
+        assert sizes['run_all'] == 2             # space-values still compute
         assert sizes['gui'] == 1
 
     def test_retry_scope_event_fields_nextest_non_utf8_degrades_honestly(self, tmp_path):
@@ -1248,7 +1251,7 @@ class TestRetryScopeEventFields:
         bad_file.write_bytes(b'\x80\x81\x82')  # invalid UTF-8 (lone continuation bytes)
         verify_env = {
             'REIFY_VERIFY_RETRY_SCOPE': 'failed_only',
-            'REIFY_RUN_ALL_MEMBER_SUBSET': 'm1,m2',
+            'REIFY_RUN_ALL_MEMBER_SUBSET': 'm1 m2',
             'REIFY_GUI_RETRY_SPECS': 'ui/x.ts',
             'REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_DEBUG': str(bad_file),
             # REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_RELEASE deliberately absent.
@@ -1258,7 +1261,7 @@ class TestRetryScopeEventFields:
         sizes = result['retry_subset_sizes']
         assert sizes['nextest_debug'] is None   # undecodable file → None (no crash)
         assert sizes['nextest_release'] is None  # absent key → None
-        assert sizes['run_all'] == 2             # comma-values still compute
+        assert sizes['run_all'] == 2             # space-values still compute
         assert sizes['gui'] == 1
 
 
