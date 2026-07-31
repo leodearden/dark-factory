@@ -556,7 +556,28 @@ All in `orchestrator/tests/test_warm_lane_scripts_shipped.py`:
   reaches a different fork in each.
 * `TestSiblingResolutionIgnoresTheCallersCwd` — asserts on **which file was
   resolved** (a decoy-CWD marker), not on the exit code, for the reason above:
-  the exit code is a function of the caller's CWD, not of the defect.
+  the exit code is a function of the caller's CWD, not of the defect. Each of
+  its absence assertions is paired with a `Usage:` **positive control**: an
+  absence assertion alone is satisfied by a script that died at line 1 for an
+  unrelated reason, so without it the case could go green having never reached
+  the resolution it names.
+* `TestLeafExtractionBehaviourWithoutBasename` — the **behavioural** half for
+  the two converted leaf extractions, which the static gate below cannot
+  reach: it catches the fork reappearing, not a conversion that changed what
+  the script does. Under a `basename`-less `PATH`, `warm-lane-gc.sh reclaim`
+  must still report `skipping protected: _merge-x` at rc=0 with the entry
+  intact (the latent protected-glob fall-through), and `warm-lane-audit.sh`
+  must still emit its per-lane, `HEADROOM` and `PINNED` rows. These are what
+  make the "byte-identical to their full-`PATH` control" claim above CI-checked
+  rather than a recorded hand measurement.
+* `TestGcBaseTargetMatchesDirname` — the `BASE_TARGET` parity table, over the
+  eight reproducible inputs of the nine measured above. Asserted against the
+  real `dirname` **binary**, not `os.path.dirname`: the two disagree on three of
+  these very inputs (`worktrees` → `.` vs `''`, `/a/b/wt/` → `/a/b` vs
+  `/a/b/wt`), so a python control would encode the naive behaviour the table
+  exists to reject. Without it a "simplification" back to a bare `${MOUNT%/*}`
+  misderives a trailing-slash `--mount` with every other case still green;
+  measured against that mutation, five of the eight go red.
 * `TestThinSelfClobberGuardDoesNotDependOnPath::test_self_clobber_guard_survives_a_path_without_basename`
   — asserts all three of: the sentinel under `<pool>/base/target` survives
   (the actual safety property), rc≠0, and `refusing to thin` on stderr. Each

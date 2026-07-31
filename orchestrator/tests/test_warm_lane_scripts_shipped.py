@@ -651,6 +651,16 @@ class TestSiblingResolutionIgnoresTheCallersCwd:
     — which is exactly why the filed expectation of ``exit 2`` was wrong.
     """
 
+    #: Positive control for the two absence-only cases below.  All three
+    #: scripts print a ``Usage:`` heredoc on ``--help``, so its presence proves
+    #: the run actually REACHED the sibling-resolution code.  Without it a
+    #: script that died at line 1 for an unrelated reason (a future ``set -u``
+    #: on an unset var, a bad shebang, a binary shimmed away that is needed
+    #: earlier) satisfies "the decoy marker is absent" vacuously, and the case
+    #: goes green having proved nothing.  Same standard as
+    #: ``TestThinSelfClobberGuardDoesNotDependOnPath``'s three-assertion shape.
+    USAGE_MARKER = 'Usage:'
+
     @staticmethod
     def _help_under_a_hidden_dirname(
         name: str, *, cwd: Path, tmp_path: Path,
@@ -684,6 +694,11 @@ class TestSiblingResolutionIgnoresTheCallersCwd:
         )
         combined = proc.stdout + proc.stderr
 
+        assert self.USAGE_MARKER in combined, (
+            f'{name} --help never printed its usage text, so the absence '
+            f'assertion below would hold vacuously — this run proves nothing '
+            f'about sibling resolution.\noutput:\n{combined}'
+        )
         assert _DECOY_MARKER not in combined, (
             f'{name} --help sourced a sibling lib from the CALLER\'S CWD '
             f'instead of from {WARM_LANE_SCRIPT_DIR}.  Its own directory must '
@@ -723,6 +738,11 @@ class TestSiblingResolutionIgnoresTheCallersCwd:
         )
         combined = proc.stdout + proc.stderr
 
+        assert self.USAGE_MARKER in combined, (
+            'warm-lane-audit.sh --help never printed its usage text, so the '
+            'absence assertion below would hold vacuously — this run proves '
+            f'nothing about sibling resolution.\noutput:\n{combined}'
+        )
         assert str(tmp_path) not in combined, (
             f'warm-lane-audit.sh resolved a sibling lib under the caller\'s '
             f'CWD ({tmp_path}) rather than under {WARM_LANE_SCRIPT_DIR}.\n'
@@ -910,6 +930,210 @@ class TestThinSelfClobberGuardDoesNotDependOnPath:
         assert not (lane / 'target').exists(), (
             'thin-warm-lane.sh reported success but left `target/` in place.\n'
             f'output:\n{combined}'
+        )
+
+
+def _warm_lane_pool(tmp_path: Path) -> Path:
+    """A minimal pool fixture: ``<tmp>/pool/worktrees`` + a resolvable base target.
+
+    Returns the ``worktrees`` dir, i.e. the value to pass as ``--mount``.
+
+    Holds ONE entry, ``_merge-x``, which is both protected (it matches
+    ``warm-lane-gc.sh``'s default ``--protect-glob``) and a real git worktree
+    (so ``warm-lane-audit.sh``'s ``_is_git_worktree`` gate admits it and the
+    resident walk actually runs).  ``<pool>/base/target`` is a real symlink
+    because ``reclaim`` resolves it with ``readlink -f`` and returns early if
+    that fails, which would stop the run before the classification loop.
+    """
+    pool = tmp_path / 'pool'
+    worktrees = pool / 'worktrees'
+    merge = worktrees / '_merge-x'
+    merge.mkdir(parents=True)
+    (pool / 'base' / 'gen-1').mkdir(parents=True)
+    (pool / 'base' / 'target').symlink_to('gen-1')
+    subprocess.run(
+        ['git', 'init', '-q', '-b', 'main'],
+        cwd=merge, check=True, timeout=60, env=_sanitized_env(),
+    )
+    return worktrees
+
+
+class TestLeafExtractionBehaviourWithoutBasename:
+    """The two converted LEAF extractions do their real work without ``basename``.
+
+    ``test_only_cosmetic_program_name_forks_remain`` is a static spelling gate:
+    it catches a fork reappearing, not a conversion that changed what the
+    script DOES.  These two cases pin the semantics for the sites README.md
+    "Delta 7" makes its strongest claim about — output byte-identical to the
+    full-``PATH`` control — so that claim is enforced by CI rather than by a
+    recorded hand measurement.
+
+    ``warm-lane-gc.sh``'s classification loop is the one where the conversion
+    also closed a latent bug: an empty ``$name`` matches NEITHER
+    ``PROTECT_GLOB`` nor ``LANE_GLOB``, so a protected entry would fall through
+    to ``orphan_candidates``.  Only the 127 abort stood between that and an
+    orphan-removal pass over a protected worktree — which is exactly why
+    "protected entry still recognised as protected" is the assertion.
+    """
+
+    @staticmethod
+    def _run_without_basename(
+        argv: list[str], *, tmp_path: Path,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run *argv* with ``basename`` shimmed to exit 127."""
+        return subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=_sanitized_env(extra={
+                'PATH': (
+                    f'{_path_hiding(tmp_path, "basename")}'
+                    f'{os.pathsep}{os.environ["PATH"]}'
+                ),
+            }),
+        )
+
+    def test_gc_still_recognises_a_protected_entry_without_basename(
+        self, tmp_path: Path,
+    ) -> None:
+        """``reclaim`` classifies ``_merge-x`` as protected, ``basename`` or no ``basename``."""
+        mount = _warm_lane_pool(tmp_path)
+        proc = self._run_without_basename(
+            [
+                _BASH, str(WARM_LANE_SCRIPT_DIR / 'warm-lane-gc.sh'),
+                'reclaim', '--mount', str(mount),
+            ],
+            tmp_path=tmp_path,
+        )
+        combined = proc.stdout + proc.stderr
+
+        assert 'skipping protected: _merge-x' in combined, (
+            'warm-lane-gc.sh reclaim did not classify `_merge-x` as protected '
+            'under a PATH without `basename`.  An empty $name matches neither '
+            '--protect-glob nor --lane-glob, so the entry falls through to the '
+            f'DESTRUCTIVE orphan pass (README.md "Delta 7").\n'
+            f'output:\n{combined}'
+        )
+        assert proc.returncode == 0, (
+            'warm-lane-gc.sh reclaim failed under a PATH without `basename`; '
+            'the leaf extraction must need nothing on PATH.\n'
+            f'output:\n{combined}'
+        )
+        assert (mount / '_merge-x').is_dir(), (
+            'warm-lane-gc.sh reclaim REMOVED the protected `_merge-x` '
+            f'worktree.\noutput:\n{combined}'
+        )
+
+    def test_audit_still_reports_its_rows_without_basename(
+        self, tmp_path: Path,
+    ) -> None:
+        """The resident walk runs and the report rows are emitted, ``basename`` or no ``basename``."""
+        mount = _warm_lane_pool(tmp_path)
+        proc = self._run_without_basename(
+            [
+                _BASH, str(WARM_LANE_SCRIPT_DIR / 'warm-lane-audit.sh'),
+                '--mount', str(mount),
+            ],
+            tmp_path=tmp_path,
+        )
+        combined = proc.stdout + proc.stderr
+
+        assert 'lane=_merge-x' in combined, (
+            'warm-lane-audit.sh emitted no per-lane row for `_merge-x` under a '
+            'PATH without `basename` — the resident walk did not reach it.\n'
+            f'output:\n{combined}'
+        )
+        assert 'HEADROOM resident=1' in combined, (
+            'warm-lane-audit.sh reported no residents under a PATH without '
+            f'`basename`.\noutput:\n{combined}'
+        )
+        assert 'PINNED ' in combined, (
+            'warm-lane-audit.sh emitted no PINNED row under a PATH without '
+            f'`basename` — the report was cut short.\noutput:\n{combined}'
+        )
+        assert proc.returncode == 0, (
+            'warm-lane-audit.sh failed under a PATH without `basename`.\n'
+            f'output:\n{combined}'
+        )
+
+
+#: The info line ``reclaim`` prints before it touches anything:
+#: ``warm-lane-gc.sh reclaim: worktrees_dir=<...>  base_target=<...>  main_ref=<...>``.
+_REPORTED_BASE_TARGET_RE = re.compile(r'base_target=(?P<target>\S+)\s+main_ref=')
+
+
+class TestGcBaseTargetMatchesDirname:
+    """``BASE_TARGET``'s ``--mount`` derivation is byte-equal to ``dirname``.
+
+    The most intricate expansion in the delta — a ``%/`` trim, TWO separate
+    empty-result guards and a ``*/*`` case — and every guard is load-bearing on
+    a different input.  Nothing else in the suite pins the table: the shipped
+    callers only ever pass a plain absolute ``--mount``, so a "simplification"
+    back to a bare ``${MOUNT%/*}`` (the exact naive form the script's comment
+    warns about) would misderive a trailing-slash ``--mount`` with every other
+    case still green.
+
+    Asserted as PARITY against the real ``dirname`` binary rather than against
+    hardcoded strings, and against ``dirname`` rather than
+    ``os.path.dirname`` — the two disagree on three of these very inputs
+    (``worktrees`` → ``.`` vs ``''``; ``/a/b/wt/`` → ``/a/b`` vs ``/a/b/wt``),
+    so the python function would encode the naive behaviour this pins against.
+
+    ``--worktrees-dir`` is passed explicitly at an empty dir so the derivation
+    is the ONLY thing under test: without it a ``--mount /`` case would set
+    ``WORKTREES_DIR=/`` and the run would go on to walk the filesystem root.
+    ``BASE_TARGET`` is still derived from ``--mount`` (the derivation only
+    skips a value already set by its own flag), and the info line reports it
+    before ``readlink -f`` returns early on the nonexistent target.
+    """
+
+    #: The nine inputs README.md "Delta 7" records the parity measurement over,
+    #: minus "the real host value" (not reproducible in a test) and plus ``a/``.
+    #: ``/`` and ``/worktrees`` are the two that need the empty-result guards;
+    #: ``/a/b/wt/`` and ``a/`` are the trailing-slash edge; ``worktrees`` and
+    #: ``.`` are the slashless relative edge the ``*/*`` case covers.
+    @pytest.mark.parametrize(
+        'mount',
+        ['/worktrees', 'worktrees', '/a/b/wt', '/a/b/wt/', '/', '.', './x', 'a/'],
+    )
+    def test_derived_base_target_matches_dirname(
+        self, mount: str, tmp_path: Path,
+    ) -> None:
+        empty_worktrees = tmp_path / 'empty-worktrees'
+        empty_worktrees.mkdir()
+
+        control = subprocess.run(
+            ['dirname', mount],
+            capture_output=True, text=True, timeout=60, check=True,
+        ).stdout.strip()
+
+        proc = subprocess.run(
+            [
+                _BASH, str(WARM_LANE_SCRIPT_DIR / 'warm-lane-gc.sh'),
+                'reclaim', '--mount', mount,
+                '--worktrees-dir', str(empty_worktrees),
+            ],
+            cwd=str(tmp_path),
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=_sanitized_env(),
+        )
+        combined = proc.stdout + proc.stderr
+        match = _REPORTED_BASE_TARGET_RE.search(combined)
+        assert match is not None, (
+            'warm-lane-gc.sh reclaim printed no `base_target=` info line, so '
+            f'the derivation was never reported.\noutput:\n{combined}'
+        )
+
+        assert match.group('target') == f'{control}/base/target', (
+            f'--mount {mount!r} derived base_target '
+            f'{match.group("target")!r}, but `dirname {mount}` is {control!r}, '
+            f'giving {control}/base/target.  The parameter-expansion parent-of '
+            f'derivation must stay byte-equal to `dirname` (README.md '
+            f'"Delta 7") — the two header comment blocks in warm-lane-gc.sh '
+            f'document the derived VALUE, and it must not move.'
         )
 
 
