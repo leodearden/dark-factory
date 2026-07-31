@@ -16,8 +16,10 @@ Covers:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import signal
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
@@ -214,6 +216,142 @@ async def test_assemble_retry_verify_env_unknown_tree_returns_none(
 
     assert env is None
     assert any('full verify' in m for m in _mq_warnings(caplog))
+
+
+# ---------------------------------------------------------------------------
+# MATERIAL-NARROWING gate.
+#
+# `narrowed` is what unlocks MAX_POST_MERGE_VERIFY_NARROWED_RETRIES (2), on the
+# premise that a narrowed retry re-runs only the {did-not-pass} subset and is
+# therefore cheap.  Three reachable subset shapes make reify run the profile in
+# FULL anyway — so calling them "narrowed" would make the merge lane pay TWO
+# full re-verifies where the legacy max_enospc budget paid one.  Each must be
+# refused HERE (returning None), which routes the caller to the legacy budget
+# while leaving the retry itself completely unchanged.
+# ---------------------------------------------------------------------------
+
+
+def _payload(
+    *, debug_planned: list[str], debug_verdicts: dict[str, str], tree_oid: str = 'abc123',
+):
+    from orchestrator.merge_queue import _Attempt0Payload
+
+    return _Attempt0Payload(
+        tree_oid=tree_oid,
+        profiles=('debug', 'release'),
+        debug_planned=debug_planned,
+        debug_verdicts=debug_verdicts,
+        release_planned=[],
+        release_verdicts={},
+        run_all_members=[],
+        gui_specs=[],
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('case', 'planned', 'verdicts'),
+    [
+        # (a) attempt-0 red BEFORE any test ran — a compile-gate red,
+        # env_transient, or semaphore_timeout.  parse_per_test_results returns
+        # {}, so every planned test is 'not-started' and the "subset" is the
+        # ENTIRE plan.  reify then trips REIFY_VERIFY_RETRY_MAX_SUBSET (or
+        # simply re-runs everything) — a FULL verify wearing a narrowed label.
+        ('subset is the whole plan', ['c t1', 'c t2', 'c t3'], {}),
+        # (b) the probe legitimately returned [] (a test-free workspace, or one
+        # where every test is #[ignore]d): both filter files are empty, so
+        # reify's per-profile "retry refused: no subset" fires and runs FULL.
+        ('empty plan, empty subset', [], {}),
+        # (c) everything attempt-0 planned PASSED (the red was elsewhere —
+        # clippy, run_all, a gui spec).  Empty subset -> same reify fallback.
+        ('every planned test passed', ['c t1'], {'c t1': 'pass'}),
+    ],
+)
+async def test_assemble_refuses_a_subset_that_narrows_nothing(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    case: str,
+    planned: list[str],
+    verdicts: dict[str, str],
+) -> None:
+    """A retry that narrows NOTHING must not be reported as narrowed."""
+    from orchestrator.merge_queue import _assemble_retry_verify_env
+
+    git_ops = _git_ops_returning('abc123')
+    req = cast('MergeRequest', SimpleNamespace(task_id='t-mn', retry_failed_only=True))
+    with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+        env = await _assemble_retry_verify_env(
+            git_ops, req, tmp_path,
+            _payload(debug_planned=planned, debug_verdicts=verdicts),
+        )
+
+    assert env is None, case
+    warnings = _mq_warnings(caplog)
+    assert any('narrow NOTHING' in m for m in warnings), (case, warnings)
+    # The refusal must name the sizes, so the cost decision is auditable.
+    assert any('legacy budget' in m for m in warnings), (case, warnings)
+
+
+@pytest.mark.asyncio
+async def test_assemble_refuses_a_subset_at_the_reify_ceiling(
+    tmp_path: Path,
+) -> None:
+    """A subset at/over reify's REIFY_VERIFY_RETRY_MAX_SUBSET is refused wholesale.
+
+    reify's storm escape (verify.sh:1703, default 5000) rejects such a subset
+    and runs the profile FULL, so DF must mirror the ceiling rather than charge
+    a full re-verify to the narrowed budget.
+    """
+    from orchestrator.merge_queue import (
+        _REIFY_VERIFY_RETRY_MAX_SUBSET,
+        _assemble_retry_verify_env,
+    )
+
+    n = _REIFY_VERIFY_RETRY_MAX_SUBSET
+    planned = [f'c t{i}' for i in range(n + 2)]
+    # n+1 did-not-pass — a real reduction of the plan, but over the ceiling.
+    verdicts = {'c t0': 'pass'}
+
+    git_ops = _git_ops_returning('abc123')
+    req = cast('MergeRequest', SimpleNamespace(task_id='t-mn2', retry_failed_only=True))
+    env = await _assemble_retry_verify_env(
+        git_ops, req, tmp_path,
+        _payload(debug_planned=planned, debug_verdicts=verdicts),
+    )
+    assert env is None
+
+    # …and one BELOW the ceiling on the same plan shape still narrows, so the
+    # assertion above is about the ceiling and not about the plan being large.
+    verdicts_small = {f'c t{i}': 'pass' for i in range(2)}
+    planned_small = [f'c t{i}' for i in range(n)]
+    env_ok = await _assemble_retry_verify_env(
+        git_ops, req, tmp_path,
+        _payload(debug_planned=planned_small, debug_verdicts=verdicts_small),
+    )
+    assert env_ok is not None
+
+
+@pytest.mark.asyncio
+async def test_assemble_logs_per_suite_subset_sizes_when_it_narrows(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The narrowing site logs the sizes behind the larger-budget decision."""
+    from orchestrator.merge_queue import _assemble_retry_verify_env
+
+    git_ops = _git_ops_returning('abc123')
+    req = cast('MergeRequest', SimpleNamespace(task_id='t-mn3', retry_failed_only=True))
+    with caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'):
+        env = await _assemble_retry_verify_env(
+            git_ops, req, tmp_path, _attempt0('abc123')
+        )
+
+    assert env is not None
+    msgs = [
+        r.getMessage() for r in caplog.records
+        if r.name == 'orchestrator.merge_queue'
+    ]
+    # _attempt0(): 4 planned debug tests, 1 passed -> a 3/4 subset.
+    assert any('debug 3/4' in m for m in msgs), msgs
 
 
 def test_build_retry_verify_env_writes_filter_files_and_env(tmp_path: Path) -> None:
@@ -480,11 +618,12 @@ async def test_probe_nextest_planned_argv(
 
     seen: dict[str, object] = {}
 
-    async def _fake(argv, *, cwd, timeout_secs):
+    async def _fake(argv, *, cwd, timeout_secs, env=None):
         seen['argv'] = list(argv)
         seen['cwd'] = cwd
         seen['timeout_secs'] = timeout_secs
-        return 0, _NEXTEST_LIST_FIXTURE.read_text()
+        seen['env'] = env
+        return 0, _NEXTEST_LIST_FIXTURE.read_text(), ''
 
     with patch.object(mq, '_run_probe_cmd', _fake):
         planned = await mq._probe_nextest_planned(
@@ -517,8 +656,8 @@ async def test_probe_nextest_planned_parses_real_bytes(tmp_path: Path) -> None:
 
     raw = _NEXTEST_LIST_FIXTURE.read_text()
 
-    async def _fake(argv, *, cwd, timeout_secs):
-        return 0, raw
+    async def _fake(argv, *, cwd, timeout_secs, env=None):
+        return 0, raw, ''
 
     with patch.object(mq, '_run_probe_cmd', _fake):
         planned = await mq._probe_nextest_planned(tmp_path, 'debug', timeout_secs=5.0)
@@ -531,10 +670,10 @@ async def test_probe_nextest_planned_parses_real_bytes(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ('label', 'result', 'exc'),
     [
-        ('non-zero exit', (101, '{"rust-suites": {}}'), None),
-        ('empty stdout', (0, ''), None),
-        ('whitespace-only stdout', (0, '   \n'), None),
-        ('unparseable stdout', (0, 'error: could not compile'), None),
+        ('non-zero exit', (101, '{"rust-suites": {}}', 'error: no such command'), None),
+        ('empty stdout', (0, '', ''), None),
+        ('whitespace-only stdout', (0, '   \n', ''), None),
+        ('unparseable stdout', (0, 'error: could not compile', ''), None),
         ('timeout', None, TimeoutError()),
         ('cargo absent', None, FileNotFoundError('cargo')),
         ('spawn OSError', None, OSError('fork failed')),
@@ -544,7 +683,7 @@ async def test_probe_nextest_planned_failure_modes_return_none(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
     label: str,
-    result: tuple[int, str] | None,
+    result: tuple[int, str, str] | None,
     exc: BaseException | None,
 ) -> None:
     """Every failure mode returns None and WARNs, naming the profile and reason.
@@ -554,7 +693,7 @@ async def test_probe_nextest_planned_failure_modes_return_none(
     """
     from orchestrator import merge_queue as mq
 
-    async def _fake(argv, *, cwd, timeout_secs):
+    async def _fake(argv, *, cwd, timeout_secs, env=None):
         if exc is not None:
             raise exc
         assert result is not None
@@ -572,12 +711,248 @@ async def test_probe_nextest_planned_failure_modes_return_none(
 
 
 @pytest.mark.asyncio
+async def test_probe_nextest_planned_nonzero_exit_warning_carries_stderr(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A non-zero exit must say WHY, not just "exited 101".
+
+    Loud-over-silent-degradation (docs/legibility/design-invariants.md,
+    structured-facts-at-failure): 'cargo-nextest not installed', 'unknown flag',
+    'workspace failed to compile' and 'lockfile out of date' are all rc!=0 and
+    are otherwise indistinguishable in the log.  The tail is BOUNDED so a
+    runaway build log cannot flood the orchestrator log.
+    """
+    from orchestrator import merge_queue as mq
+
+    noise = 'x' * 5000
+    stderr = f'{noise}\nerror: no such command: `nextest`\n'
+
+    async def _fake(argv, *, cwd, timeout_secs, env=None):
+        return 101, '', stderr
+
+    with (
+        caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'),
+        patch.object(mq, '_run_probe_cmd', _fake),
+    ):
+        planned = await mq._probe_nextest_planned(
+            Path('/nonexistent'), 'debug', timeout_secs=5.0
+        )
+
+    assert planned is None
+    hit = [m for m in _mq_warnings(caplog) if 'exited 101' in m]
+    assert hit, _mq_warnings(caplog)
+    assert 'no such command' in hit[0], hit[0]
+    assert len(hit[0]) < len(stderr), (
+        'the stderr tail must be bounded, not the whole log'
+    )
+    assert mq._PROBE_STDERR_TAIL_CHARS <= 2000
+
+
+@pytest.mark.asyncio
+async def test_probe_threads_the_verify_env_into_the_subprocess() -> None:
+    """The probe must model the SAME build the verify performs.
+
+    `build_merge_verify_spec` puts `config.effective_verify_env` on the spec —
+    the shared sccache backend (RUSTC_WRAPPER, SCCACHE_*) that is *why* a warm
+    merge lane is warm.  A probe run under the bare ORCHESTRATOR environment
+    compiles without it, so on exactly the lanes this feature targets it burns
+    minutes and times out — silently degrading every narrowed retry to a full
+    verify while still paying the probe cost.
+    """
+    from orchestrator import merge_queue as mq
+
+    seen: dict[str, object] = {}
+
+    async def _fake(argv, *, cwd, timeout_secs, env=None):
+        seen['env'] = env
+        return 0, _NEXTEST_LIST_FIXTURE.read_text(), ''
+
+    verify_env = {'RUSTC_WRAPPER': '/usr/bin/sccache', 'SCCACHE_DIR': '/tmp/sccache'}
+    with patch.object(mq, '_run_probe_cmd', _fake):
+        planned = await mq._probe_nextest_planned(
+            Path('/nonexistent'), 'debug', timeout_secs=5.0, verify_env=verify_env,
+        )
+
+    assert planned is not None
+    assert seen['env'] == verify_env
+
+
+@pytest.mark.asyncio
 async def test_probe_nextest_planned_timeout_is_bounded_by_a_named_constant() -> None:
     """A module constant bounds the probe so it can never wedge the merge lane."""
     from orchestrator.merge_queue import _NEXTEST_LIST_PROBE_TIMEOUT_SECS
 
     assert isinstance(_NEXTEST_LIST_PROBE_TIMEOUT_SECS, (int, float))
     assert 0 < _NEXTEST_LIST_PROBE_TIMEOUT_SECS <= 900
+
+
+# ---------------------------------------------------------------------------
+# _run_probe_cmd — the ONE real subprocess seam this change adds.
+#
+# Every other test in this file patches it out, so without these its argv/cwd/
+# env wiring, its TimeoutError -> kill-the-process-GROUP -> reap -> re-raise
+# path, its `proc.returncode or 0` normalisation and its errors='replace'
+# decode would all ship unexercised.  The timeout path is the load-bearing one:
+# a hang there would wedge the merge lane the ceiling exists to protect.
+#
+# Hermetic: driven against `sh -c`, never cargo.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_probe_cmd_success_returns_rc_stdout_stderr(tmp_path: Path) -> None:
+    """rc, stdout and stderr all come back, decoded, from a real subprocess."""
+    from orchestrator import merge_queue as mq
+
+    rc, stdout, stderr = await mq._run_probe_cmd(
+        ['sh', '-c', 'printf hi; printf oops >&2'], cwd=tmp_path, timeout_secs=30.0,
+    )
+
+    assert (rc, stdout, stderr) == (0, 'hi', 'oops')
+
+
+@pytest.mark.asyncio
+async def test_run_probe_cmd_runs_in_cwd_with_the_layered_env(tmp_path: Path) -> None:
+    """`cwd` is honoured and `env` layers OVER os.environ (not replacing it)."""
+    from orchestrator import merge_queue as mq
+
+    (tmp_path / 'marker.txt').write_text('x')
+
+    rc, stdout, _ = await mq._run_probe_cmd(
+        ['sh', '-c', 'ls marker.txt; printf "|%s|%s" "$DF_PROBE_MARKER" "${PATH:+haspath}"'],
+        cwd=tmp_path,
+        timeout_secs=30.0,
+        env={'DF_PROBE_MARKER': 'sccache'},
+    )
+
+    assert rc == 0
+    assert 'marker.txt' in stdout
+    # The override is present AND the inherited PATH survived: env must be
+    # {**os.environ, **verify_env}, never a bare replacement (a bare dict would
+    # strip PATH and cargo would not even be findable).
+    assert '|sccache|haspath' in stdout
+
+
+@pytest.mark.asyncio
+async def test_run_probe_cmd_nonzero_exit_is_returned_not_raised(tmp_path: Path) -> None:
+    """A non-zero exit is DATA (the caller warns + falls back), not an exception."""
+    from orchestrator import merge_queue as mq
+
+    rc, stdout, _ = await mq._run_probe_cmd(
+        ['sh', '-c', 'exit 3'], cwd=tmp_path, timeout_secs=30.0,
+    )
+
+    assert rc == 3
+    assert stdout == ''
+
+
+@pytest.mark.asyncio
+async def test_run_probe_cmd_timeout_raises_promptly_and_reaps_the_child(
+    tmp_path: Path,
+) -> None:
+    """The timeout path raises TimeoutError FAST and leaves no live child.
+
+    This is the load-bearing path: a hang here would wedge the merge lane the
+    _NEXTEST_LIST_PROBE_TIMEOUT_SECS ceiling exists to protect.  Driven against
+    a real `sh -c sleep`, so the kill/reap/re-raise sequence is exercised end to
+    end rather than mocked.
+    """
+    import time as _time
+
+    from orchestrator import merge_queue as mq
+
+    spawned: list = []
+    real_exec = asyncio.create_subprocess_exec
+
+    async def _spy_exec(*argv, **kwargs):
+        proc = await real_exec(*argv, **kwargs)
+        spawned.append(proc)
+        return proc
+
+    started = _time.monotonic()
+    with (
+        patch.object(asyncio, 'create_subprocess_exec', _spy_exec),
+        pytest.raises(TimeoutError),
+    ):
+        await mq._run_probe_cmd(
+            ['sh', '-c', 'sleep 120'], cwd=tmp_path, timeout_secs=0.5,
+        )
+    elapsed = _time.monotonic() - started
+
+    assert 0.4 < elapsed < 20.0, (
+        f'the timeout path must fire at the ceiling and not hang (took {elapsed:.1f}s)'
+    )
+    # The reap is synchronous with the raise: the child is dead and collected
+    # by the time the caller sees TimeoutError — never left running or zombied.
+    assert len(spawned) == 1
+    assert spawned[0].returncode is not None, (
+        'the probe child must be reaped before TimeoutError propagates'
+    )
+
+
+def test_run_probe_cmd_spawns_its_own_session(tmp_path: Path) -> None:
+    """The spawn MUST pass start_new_session=True.
+
+    `cargo nextest list` spawns rustc / build-script children.  Without its own
+    session/process group there is no group for the timeout path to kill, so a
+    bare proc.kill() would leave those compiles running in the merge lane the
+    ceiling exists to protect.  Asserted at the SPAWN because whether an orphan
+    happens to die with its parent is OS/environment-dependent — the flag is
+    the thing this module actually controls.
+    """
+    from orchestrator import merge_queue as mq
+
+    seen: dict[str, object] = {}
+
+    async def _fake_exec(*argv, **kwargs):
+        seen.update(kwargs)
+        raise OSError('spawn intercepted')
+
+    async def _drive() -> None:
+        with (
+            patch.object(asyncio, 'create_subprocess_exec', _fake_exec),
+            pytest.raises(OSError),
+        ):
+            await mq._run_probe_cmd(
+                ['cargo', 'nextest', 'list'], cwd=tmp_path, timeout_secs=1.0,
+            )
+
+    asyncio.run(_drive())
+
+    assert seen.get('start_new_session') is True, seen
+    assert seen.get('stderr') == asyncio.subprocess.PIPE, (
+        'stderr must be CAPTURED, not DEVNULL — a bare exit code cannot tell '
+        '"cargo-nextest absent" from "workspace failed to compile"'
+    )
+
+
+def test_kill_probe_process_tree_kills_the_group_then_falls_back() -> None:
+    """The timeout kill targets the process GROUP, with a single-process fallback."""
+    from orchestrator import merge_queue as mq
+
+    proc = SimpleNamespace(pid=4242, kill=MagicMock())
+
+    with (
+        patch.object(mq.os, 'getpgid', return_value=4242) as getpgid,
+        patch.object(mq.os, 'killpg') as killpg,
+    ):
+        mq._kill_probe_process_tree(cast('asyncio.subprocess.Process', proc))
+
+    getpgid.assert_called_once_with(4242)
+    killpg.assert_called_once_with(4242, signal.SIGKILL)
+    proc.kill.assert_not_called()
+
+    # Already-reaped / no-such-group: fall back to the single process rather
+    # than letting the timeout path raise out of its own cleanup.
+    proc2 = SimpleNamespace(pid=4243, kill=MagicMock())
+    with (
+        patch.object(mq.os, 'getpgid', side_effect=ProcessLookupError()),
+        patch.object(mq.os, 'killpg') as killpg2,
+    ):
+        mq._kill_probe_process_tree(cast('asyncio.subprocess.Process', proc2))
+
+    killpg2.assert_not_called()
+    proc2.kill.assert_called_once_with()
 
 
 # ---------------------------------------------------------------------------
@@ -647,7 +1022,7 @@ async def test_build_attempt0_payload_narrows_only_the_first_profile(
     _place_real_sidecar(tmp_path)
     calls: list[str] = []
 
-    async def _fake_probe(merge_wt, profile, *, timeout_secs):
+    async def _fake_probe(merge_wt, profile, *, timeout_secs, verify_env=None):
         calls.append(profile)
         return list(_PROBED_PLANNED)
 
@@ -683,7 +1058,7 @@ async def test_build_attempt0_payload_fields_come_from_df_owned_sources(
 
     _place_real_sidecar(tmp_path)
 
-    async def _fake_probe(merge_wt, profile, *, timeout_secs):
+    async def _fake_probe(merge_wt, profile, *, timeout_secs, verify_env=None):
         return list(_PROBED_PLANNED)
 
     with patch.object(mq, '_probe_nextest_planned', _fake_probe):
@@ -715,7 +1090,7 @@ async def test_build_attempt0_payload_empty_verdicts_still_yields_a_payload(
 
     _place_real_sidecar(tmp_path)
 
-    async def _fake_probe(merge_wt, profile, *, timeout_secs):
+    async def _fake_probe(merge_wt, profile, *, timeout_secs, verify_env=None):
         return list(_PROBED_PLANNED)
 
     with patch.object(mq, '_probe_nextest_planned', _fake_probe):
@@ -735,7 +1110,7 @@ async def test_build_attempt0_payload_none_when_sidecar_absent(tmp_path: Path) -
 
     called = False
 
-    async def _fake_probe(merge_wt, profile, *, timeout_secs):
+    async def _fake_probe(merge_wt, profile, *, timeout_secs, verify_env=None):
         nonlocal called
         called = True
         return list(_PROBED_PLANNED)
@@ -758,7 +1133,7 @@ async def test_build_attempt0_payload_none_when_sidecar_malformed(
 
     _place_real_sidecar(tmp_path, text='{"tree_oid": "abc", "profiles": "bench"}')
 
-    async def _fake_probe(merge_wt, profile, *, timeout_secs):
+    async def _fake_probe(merge_wt, profile, *, timeout_secs, verify_env=None):
         return list(_PROBED_PLANNED)
 
     with patch.object(mq, '_probe_nextest_planned', _fake_probe):
@@ -767,6 +1142,112 @@ async def test_build_attempt0_payload_none_when_sidecar_malformed(
         )
 
     assert payload is None
+
+
+@pytest.mark.asyncio
+async def test_build_attempt0_payload_none_when_the_plan_misses_a_real_failure(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A probed plan that does not COVER attempt-0's failures refuses to narrow.
+
+    `build_fail_fast_map` iterates `planned` only and IGNORES verdict keys that
+    are not in it.  So a test attempt-0 reported FAIL that the probe never
+    listed is silently dropped from the retry subset — the retry then never
+    re-runs the actual failure and reports PASS: a FALSE GREEN.
+
+    The module comment asserts the probe returns a SUPERSET of attempt-0's plan
+    (`--workspace` ⊇ reify's `-p` selectors), but that holds only by coincidence
+    of reify's current flags; an `--all-features` / `--all-targets` /
+    `--cargo-profile` change on reify's side would break it with no signal.
+    This is the one form of plan-incompleteness DF can detect IN-PROCESS, so the
+    module's standing rule — never narrow on an incomplete plan — is ENFORCED
+    rather than assumed.
+    """
+    from orchestrator import merge_queue as mq
+
+    _place_real_sidecar(tmp_path)
+
+    # Everything from _FAIL_FAST_OUTPUT except the one test that FAILED.
+    partial_plan = [t for t in _PROBED_PLANNED if t != 'crate-a beta::test_three']
+
+    async def _fake_probe(merge_wt, profile, *, timeout_secs, verify_env=None):
+        return list(partial_plan)
+
+    with (
+        caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'),
+        patch.object(mq, '_probe_nextest_planned', _fake_probe),
+    ):
+        payload = await mq._build_attempt0_payload(
+            tmp_path, _verify_result(_FAIL_FAST_OUTPUT)
+        )
+
+    assert payload is None
+    warnings = _mq_warnings(caplog)
+    assert any('INCOMPLETE' in m for m in warnings), warnings
+    assert any('crate-a beta::test_three' in m for m in warnings), warnings
+
+
+@pytest.mark.asyncio
+async def test_build_attempt0_payload_coverage_gate_ignores_passes_and_libtest_ids(
+    tmp_path: Path,
+) -> None:
+    """The coverage gate fires on did-not-pass NEXTEST ids only.
+
+    * a `pass` outside the plan is harmless — it is only ever dropped from a
+      subset it would not have been in anyway;
+    * `parse_per_test_results` also emits BARE libtest paths (no space), which
+      `cargo nextest list` never produces, so they are not evidence of drift.
+
+    Without both carve-outs the gate would refuse to narrow on every mixed
+    nextest/libtest workspace — a silent, permanent loss of the capability.
+    """
+    from orchestrator import merge_queue as mq
+
+    _place_real_sidecar(tmp_path)
+
+    # 'crate-a alpha::test_one' PASSED; 'bare::libtest_case' is a libtest id.
+    output = (
+        '    Starting 2 tests across 1 binaries\n'
+        '        PASS [   0.130s] (  1/  2) crate-a alpha::test_one\n'
+        '        FAIL [   0.044s] (  2/  2) crate-a beta::test_three\n'
+        'test bare::libtest_case ... FAILED\n'
+    )
+    plan = ['crate-a beta::test_three', 'crate-a::integration test_end_to_end']
+
+    async def _fake_probe(merge_wt, profile, *, timeout_secs, verify_env=None):
+        return list(plan)
+
+    with patch.object(mq, '_probe_nextest_planned', _fake_probe):
+        payload = await mq._build_attempt0_payload(tmp_path, _verify_result(output))
+
+    assert payload is not None, (
+        'a passed-but-unplanned id and a bare libtest id must not trip the gate'
+    )
+    assert payload.debug_planned == plan
+
+
+@pytest.mark.asyncio
+async def test_build_attempt0_payload_threads_verify_env_into_the_probe(
+    tmp_path: Path,
+) -> None:
+    """attempt-0's own verify_env reaches the probe, so it models the same build."""
+    from orchestrator import merge_queue as mq
+
+    _place_real_sidecar(tmp_path)
+    seen: dict[str, object] = {}
+
+    async def _fake_probe(merge_wt, profile, *, timeout_secs, verify_env=None):
+        seen['verify_env'] = verify_env
+        return list(_PROBED_PLANNED)
+
+    env = {'RUSTC_WRAPPER': '/usr/bin/sccache'}
+    with patch.object(mq, '_probe_nextest_planned', _fake_probe):
+        payload = await mq._build_attempt0_payload(
+            tmp_path, _verify_result(_FAIL_FAST_OUTPUT), verify_env=env,
+        )
+
+    assert payload is not None
+    assert seen['verify_env'] == env
 
 
 @pytest.mark.asyncio
@@ -780,7 +1261,7 @@ async def test_build_attempt0_payload_none_when_probe_fails(tmp_path: Path) -> N
 
     _place_real_sidecar(tmp_path)
 
-    async def _fake_probe(merge_wt, profile, *, timeout_secs):
+    async def _fake_probe(merge_wt, profile, *, timeout_secs, verify_env=None):
         return None
 
     with patch.object(mq, '_probe_nextest_planned', _fake_probe):
@@ -908,7 +1389,7 @@ async def _run_wiring(
     pool_cls, specs = _recording_pool(results)
     git_ops = git_ops if git_ops is not None else _make_git_ops_mock()
 
-    async def _default_probe(_merge_wt, _profile, *, timeout_secs):
+    async def _default_probe(_merge_wt, _profile, *, timeout_secs, verify_env=None):
         return list(_PROBED_PLANNED)
 
     with (
@@ -995,8 +1476,10 @@ async def test_narrowed_retry_dispatch_carries_the_did_not_pass_subset(
     debug_lines = Path(
         env['REIFY_VERIFY_RETRY_NEXTEST_FILTER_FILE_DEBUG']
     ).read_text().splitlines()
-    # 'alpha::test_two' is in the PROBED plan but absent from attempt-0's
-    # verdicts (nextest fail-fast cancelled it) — a not-started test MUST re-run.
+    # 'crate-a::integration test_end_to_end' (and 'crate-b gamma::test_one') are
+    # in the PROBED plan but absent from _FAIL_FAST_OUTPUT's verdicts — nextest
+    # fail-fast cancelled them, so they are 'not-started' and MUST re-run.
+    # ('alpha::test_two' is NOT one of them: _FAIL_FAST_OUTPUT records it PASS.)
     assert 'test_end_to_end' in debug_lines, (
         f'a fail-fast-cancelled test must be in the retry subset: {debug_lines!r}'
     )
@@ -1074,6 +1557,50 @@ async def test_refused_narrowing_keeps_the_legacy_budget(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_a_non_narrowing_payload_keeps_the_legacy_budget(tmp_path: Path) -> None:
+    """(c, second contrapositive) A payload that narrows NOTHING is not narrowed.
+
+    The sidecar is present, the tree corroborates and the probe succeeds — every
+    gate the earlier tests exercise PASSES.  What fails is the cost premise:
+    attempt-0 died before a single test line was emitted (a compile-gate red),
+    so `parse_per_test_results` returns {} and the "subset" is the entire probed
+    plan.  reify would run those profiles in FULL.
+
+    Charging that to `max_narrowed=2` would make the merge lane pay TWO full
+    re-verifies where the legacy `max_enospc=1` paid one — a real worst-case
+    regression for exactly the infra-transient class this branch handles.  With
+    max_enospc=0 the legacy budget affords nothing, so a second dispatch here
+    would BE the regression.
+    """
+    _place_real_sidecar(tmp_path)
+    req = _wiring_req('t-wire-c3')
+    sink: dict[str, str] = {}
+
+    outcome, specs = await _run_wiring(
+        tmp_path,
+        req=req,
+        git_ops=_corroborating_git_ops(),
+        # A compile-gate red: no per-test lines at all -> verdicts == {}.
+        results=[
+            _infra_transient_attempt0('error: could not compile `crate-a`\n'),
+            _passing_result(),
+        ],
+        sink=sink,
+        max_enospc=0,
+        max_narrowed=2,
+        narrowed_retries=(nr := {}),
+    )
+
+    assert outcome is not None, 'the un-retried infra red must surface as an outcome'
+    assert len(specs) == 1, (
+        f'a retry that narrows nothing must NOT unlock max_narrowed, '
+        f'got {len(specs)} dispatches'
+    )
+    assert nr == {}, f'the narrowed counter must stay untouched: {nr}'
+    assert sink == {}, 'a refused narrowing must not seed the shadow baseline'
+
+
+@pytest.mark.asyncio
 async def test_shadow_baseline_sink_seeded_only_on_the_narrowed_path(
     tmp_path: Path,
 ) -> None:
@@ -1124,7 +1651,7 @@ async def test_failsafe_routes_leave_the_retry_dispatch_full(
     req = _wiring_req(f't-wire-e-{case}')
     sink: dict[str, str] = {}
 
-    async def _none_probe(_merge_wt, _profile, *, timeout_secs):
+    async def _none_probe(_merge_wt, _profile, *, timeout_secs, verify_env=None):
         return None
 
     git_ops = _corroborating_git_ops()
@@ -1162,7 +1689,7 @@ async def test_flag_off_is_byte_identical_to_the_legacy_path(tmp_path: Path) -> 
     sink: dict[str, str] = {}
     probe_calls: list[str] = []
 
-    async def _counting_probe(_merge_wt, profile, *, timeout_secs):
+    async def _counting_probe(_merge_wt, profile, *, timeout_secs, verify_env=None):
         probe_calls.append(profile)
         return list(_PROBED_PLANNED)
 

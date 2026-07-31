@@ -20,10 +20,11 @@ import logging
 import math
 import os
 import shutil
+import signal
 import time
 import traceback
 import uuid
-from collections.abc import Awaitable, Callable, Collection, Iterator
+from collections.abc import Awaitable, Callable, Collection, Iterator, Mapping, Sequence
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
@@ -1692,6 +1693,42 @@ _CROSS_CHECK_SENTINEL = '__verify_cross_check__'
 # Subdir under merge_wt holding the per-profile nextest filter files.
 _RETRY_FILTER_SUBDIR = '.reify-verify-retry'
 
+# DF-side MIRROR of reify's REIFY_VERIFY_RETRY_MAX_SUBSET storm-escape ceiling
+# (verify.sh:1703, default 5000).  reify refuses to narrow a profile whose
+# subset reaches it and runs that profile in FULL — so a subset at or above the
+# ceiling is not a narrowed retry, and DF must not charge it to the larger
+# narrowed budget.  Mirrored (not read from reify) because this is a DF-side
+# COST decision; a drift in reify's default only makes DF conservative.
+_REIFY_VERIFY_RETRY_MAX_SUBSET = 5000
+
+
+def _materially_narrows(planned: Sequence[str], subset: Sequence[str]) -> bool:
+    """True when ``subset`` is a REAL, reify-acceptable reduction of ``planned``.
+
+    Three ways a produced subset fails to narrow anything, all of which make
+    reify run the profile in FULL:
+
+    * **empty** — reify's per-profile "retry refused: no subset" fallback fires
+      (``verify.sh:1698``);
+    * **the whole plan** — reachable whenever attempt-0 reds before any test
+      line is emitted (compile-gate red, ``env_transient``,
+      ``semaphore_timeout``): ``parse_per_test_results`` returns ``{}``, so
+      every planned test is ``'not-started'``;
+    * **at/over the ceiling** — reify rejects it wholesale
+      (:data:`_REIFY_VERIFY_RETRY_MAX_SUBSET`).
+
+    Each is SAFE (the retry runs everything), but calling any of them
+    "narrowed" is a lie with a price: the caller would switch to the larger
+    ``MAX_POST_MERGE_VERIFY_NARROWED_RETRIES`` budget on the premise that a
+    narrowed retry is cheap, so the merge lane would pay TWO full re-verifies
+    where the legacy ``max_enospc`` budget paid one.
+    """
+    return (
+        bool(subset)
+        and len(subset) < len(planned)
+        and len(subset) <= _REIFY_VERIFY_RETRY_MAX_SUBSET
+    )
+
 
 def _build_retry_verify_env(
     *,
@@ -1806,6 +1843,12 @@ async def _assemble_retry_verify_env(
     carry nextest's ``test(=...)`` domain while the internal plan/verdict space
     stays uniform.  Failed run_all members / gui specs pass through unchanged.
 
+    **Third gate: the subset must actually narrow something.** A subset that is
+    empty, equal to the whole plan, or over reify's storm-escape ceiling makes
+    reify run the profile in FULL — so returning an env dict for it would let
+    the caller charge a full re-verify to the larger narrowed-retry budget.  See
+    :func:`_materially_narrows`.
+
     Args:
         git_ops: GitOps for DF's own tree-OID read.
         req: the merge request (for ``task_id`` in log lines).
@@ -1814,7 +1857,8 @@ async def _assemble_retry_verify_env(
         attempt0: the DF-constructed attempt-0 payload.
 
     Returns:
-        The REIFY_VERIFY_RETRY_* env dict on a corroborated tree, else None.
+        The REIFY_VERIFY_RETRY_* env dict on a corroborated tree whose subset
+        materially narrows, else None.
     """
     current = await git_ops.get_head_tree_hash(merge_wt)
     if current is None or current != attempt0.tree_oid:
@@ -1832,6 +1876,45 @@ async def _assemble_retry_verify_env(
     release_subset = did_not_pass_subset(
         build_fail_fast_map(attempt0.release_planned, attempt0.release_verdicts)
     )
+
+    # MATERIAL-NARROWING gate: a retry that narrows NOTHING must not be called
+    # narrowed.  `narrowed` is what unlocks the larger MAX_POST_MERGE_VERIFY_
+    # NARROWED_RETRIES budget, on the premise that a narrowed retry re-runs only
+    # the {did-not-pass} subset and is therefore cheap.  When that premise is
+    # false (see :func:`_materially_narrows`) the lane would pay TWO FULL
+    # re-verifies where the legacy max_enospc budget paid one — a real
+    # worst-case regression for exactly the infra-transient class this branch
+    # handles.  Returning None here routes the caller to the legacy budget AND
+    # leaves `spec` untouched, so nothing about the retry changes except its
+    # accounting.  Both profiles are checked because only the FIRST one is ever
+    # populated and the payload does not name which that was.
+    if not (
+        _materially_narrows(attempt0.debug_planned, debug_subset)
+        or _materially_narrows(attempt0.release_planned, release_subset)
+    ):
+        logger.warning(
+            'Task %s: failed-only retry would narrow NOTHING '
+            '(nextest debug %d/%d, release %d/%d; ceiling %d) — reify would run '
+            'these profiles in full anyway, so this is charged to the legacy '
+            'budget as a FULL retry, not the narrowed one',
+            req.task_id,
+            len(debug_subset), len(attempt0.debug_planned),
+            len(release_subset), len(attempt0.release_planned),
+            _REIFY_VERIFY_RETRY_MAX_SUBSET,
+        )
+        return None
+
+    # Per-suite sizes at the narrowing site, so the cost premise behind the
+    # larger narrowed budget is auditable from the log rather than inferred.
+    logger.info(
+        'Task %s: narrowed failed-only retry — nextest debug %d/%d, '
+        'release %d/%d, run_all %d, gui %d',
+        req.task_id,
+        len(debug_subset), len(attempt0.debug_planned),
+        len(release_subset), len(attempt0.release_planned),
+        len(attempt0.run_all_members), len(attempt0.gui_specs),
+    )
+
     # Map into nextest's matcher domain ONLY here, at the single write boundary:
     # a filter file of full "<binary-id> <test-name>" parse keys is non-empty
     # (so reify's "retry refused: no subset" fallback never fires) yet matches
@@ -1957,33 +2040,105 @@ def _load_reify_attempt_sidecar(merge_wt: Path) -> _ReifyAttemptSidecar | None:
 # merge lane the binaries are already built, so `nextest list` links and lists in
 # seconds; this ceiling only matters on a cold lane where the probe would have to
 # compile — and there, timing out into a full verify is the correct outcome.
+#
+# That "warm ⇒ seconds" premise is only true if the probe runs under the SAME
+# build environment as the verify (the shared sccache backend et al) — which is
+# why `verify_env` is threaded all the way down to the spawn.  Without it the
+# probe compiles cold on exactly the lanes this capability targets.
 _NEXTEST_LIST_PROBE_TIMEOUT_SECS = 300
+
+# Bound on how long the timeout path waits to REAP the killed probe.  The kill
+# is a SIGKILL to the whole process group, so this should be instant; the bound
+# exists only so a pathological un-reapable child can never wedge the merge lane
+# the outer ceiling is there to protect.
+_PROBE_REAP_TIMEOUT_SECS = 10.0
+
+# How much of a failed probe's stderr is carried into the WARNING.  Enough to
+# tell 'cargo-nextest not installed' from 'unknown flag' from 'workspace failed
+# to compile' from 'lockfile out of date' (structured-facts-at-failure, see
+# docs/legibility/design-invariants.md); short enough that a runaway build log
+# cannot flood the orchestrator log.
+_PROBE_STDERR_TAIL_CHARS = 500
+
+
+def _stderr_tail(stderr: str) -> str:
+    """Last :data:`_PROBE_STDERR_TAIL_CHARS` of ``stderr``, or an explicit marker."""
+    tail = stderr.strip()[-_PROBE_STDERR_TAIL_CHARS:]
+    return tail if tail else '<empty>'
+
+
+def _kill_probe_process_tree(proc: asyncio.subprocess.Process) -> None:
+    """SIGKILL the probe's whole process GROUP, falling back to the process.
+
+    ``cargo nextest list`` spawns ``rustc`` / build-script children that a bare
+    ``proc.kill()`` leaves running.  Since the probe exists precisely to be
+    bounded (:data:`_NEXTEST_LIST_PROBE_TIMEOUT_SECS`), leaking compiles into
+    the merge lane on the timeout path would defeat the ceiling.  The spawn
+    passes ``start_new_session=True`` so the probe leads its own group and this
+    ``killpg`` cannot reach the orchestrator itself.
+    """
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        # Already reaped, or no group to signal (e.g. a test double) — fall back
+        # to the single process; a second ProcessLookupError is benign.
+        with contextlib.suppress(ProcessLookupError, OSError):
+            proc.kill()
 
 
 async def _run_probe_cmd(
-    argv: list[str], *, cwd: Path, timeout_secs: float
-) -> tuple[int, str]:
-    """Run ``argv`` in ``cwd``, returning ``(returncode, stdout)``.
+    argv: list[str],
+    *,
+    cwd: Path,
+    timeout_secs: float,
+    env: Mapping[str, str] | None = None,
+) -> tuple[int, str, str]:
+    """Run ``argv`` in ``cwd``, returning ``(returncode, stdout, stderr)``.
 
     A thin, separately-patchable subprocess seam: it exists so
     :func:`_probe_nextest_planned` can be unit-tested hermetically without
     shelling out.  Raises :class:`TimeoutError` on timeout and :class:`OSError`
     (incl. :class:`FileNotFoundError`) on spawn failure — the caller converts
     both into a fail-safe ``None``.
+
+    ``env`` carries the verify's OWN environment overrides
+    (``MergeVerifySpec.verify_env`` — the shared sccache backend:
+    ``RUSTC_WRAPPER``, ``SCCACHE_*``, ``CARGO_INCREMENTAL``, …) layered OVER
+    ``os.environ``.  Threading it is load-bearing, not cosmetic: on a lane where
+    the sccache wrapper is *why* the merge worktree is warm, a probe run without
+    it compiles from scratch — burning minutes of lane CPU/disk and usually
+    timing out, i.e. silently degrading every narrowed retry to a full verify
+    while still paying the probe cost.  ``None`` inherits the orchestrator
+    environment unchanged (the legacy behaviour, kept for direct/test callers).
+
+    stderr is CAPTURED rather than discarded so the caller's failure WARNING can
+    name the actual reason instead of a bare exit code.
     """
     proc = await asyncio.create_subprocess_exec(
         *argv,
         cwd=str(cwd),
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+        env=({**os.environ, **env} if env else None),
+        # Own session/process group so the timeout path can kill the whole build
+        # tree — see :func:`_kill_probe_process_tree`.
+        start_new_session=True,
     )
     try:
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_secs)
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=timeout_secs
+        )
     except (TimeoutError, asyncio.CancelledError):
-        proc.kill()
-        await proc.wait()
+        _kill_probe_process_tree(proc)
+        # Bounded reap: never trade a probe timeout for an unbounded await.
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(proc.wait(), timeout=_PROBE_REAP_TIMEOUT_SECS)
         raise
-    return proc.returncode or 0, stdout.decode('utf-8', errors='replace')
+    return (
+        proc.returncode or 0,
+        stdout.decode('utf-8', errors='replace'),
+        stderr.decode('utf-8', errors='replace'),
+    )
 
 
 # Planned-set source: DECISION (task 3059).
@@ -2017,18 +2172,28 @@ async def _run_probe_cmd(
 # FULL verify.  Narrowing on a partial plan would silently skip every test the
 # probe failed to see.
 async def _probe_nextest_planned(
-    merge_wt: Path, profile: str, *, timeout_secs: float
+    merge_wt: Path,
+    profile: str,
+    *,
+    timeout_secs: float,
+    verify_env: Mapping[str, str] | None = None,
 ) -> list[str] | None:
     """Probe the merge lane for the ``profile``'s planned nextest set.
 
     Totally fail-safe: any non-zero exit, empty/unparseable stdout, timeout, or
     spawn failure returns ``None`` (→ full verify), logging a WARNING that names
-    the profile and the reason.
+    the profile and the reason (including a bounded stderr tail on a non-zero
+    exit, so 'cargo-nextest absent' is distinguishable from 'workspace failed to
+    compile').
 
     Args:
         merge_wt: the warm merge worktree to run the probe in.
         profile: ``'debug'`` or ``'release'`` — selects the ``--release`` flag.
         timeout_secs: hard ceiling on the probe.
+        verify_env: the verify's own env overrides (``MergeVerifySpec.verify_env``)
+            so the probe models the SAME build the verify performs — notably the
+            shared sccache backend that is why a warm lane is warm.  See
+            :func:`_run_probe_cmd`.
 
     Returns:
         Planned test ids in :func:`parse_per_test_results`' key space, or None.
@@ -2038,8 +2203,8 @@ async def _probe_nextest_planned(
         argv.append('--release')
 
     try:
-        rc, stdout = await _run_probe_cmd(
-            argv, cwd=Path(merge_wt), timeout_secs=timeout_secs
+        rc, stdout, stderr = await _run_probe_cmd(
+            argv, cwd=Path(merge_wt), timeout_secs=timeout_secs, env=verify_env
         )
     except TimeoutError:
         logger.warning(
@@ -2057,7 +2222,9 @@ async def _probe_nextest_planned(
 
     if rc != 0:
         logger.warning(
-            'nextest list probe for profile %r exited %s — full verify', profile, rc,
+            'nextest list probe for profile %r exited %s — full verify '
+            '(stderr tail: %s)',
+            profile, rc, _stderr_tail(stderr),
         )
         return None
     if not stdout.strip():
@@ -2077,7 +2244,10 @@ async def _probe_nextest_planned(
 
 
 async def _build_attempt0_payload(
-    merge_wt: Path, verify: VerifyResult
+    merge_wt: Path,
+    verify: VerifyResult,
+    *,
+    verify_env: Mapping[str, str] | None = None,
 ) -> _Attempt0Payload | None:
     """Build the retry payload from attempt-0's OWN result — no cross-repo handoff.
 
@@ -2106,6 +2276,8 @@ async def _build_attempt0_payload(
     Args:
         merge_wt: the merge worktree (sidecar location and probe cwd).
         verify: attempt-0's own failing :class:`VerifyResult`.
+        verify_env: attempt-0's own ``MergeVerifySpec.verify_env``, threaded to
+            the probe so it models the SAME build (sccache backend et al).
 
     Returns:
         The constructed :class:`_Attempt0Payload`, or None for a full verify.
@@ -2117,7 +2289,10 @@ async def _build_attempt0_payload(
     # Only the FIRST profile can be narrowed — see the rule above.
     first = sidecar.profiles[0]
     planned = await _probe_nextest_planned(
-        merge_wt, first, timeout_secs=_NEXTEST_LIST_PROBE_TIMEOUT_SECS
+        merge_wt,
+        first,
+        timeout_secs=_NEXTEST_LIST_PROBE_TIMEOUT_SECS,
+        verify_env=verify_env,
     )
     if planned is None:
         # Never narrow on a partial plan: an unknown plan cannot distinguish
@@ -2125,6 +2300,41 @@ async def _build_attempt0_payload(
         return None
 
     verdicts = parse_per_test_results(verify.test_output)
+
+    # PLAN-COVERAGE gate: the probe must SEE everything attempt-0 saw fail.
+    #
+    # `build_fail_fast_map` iterates `planned` only and documents "keys present
+    # in verdicts but not in planned are ignored".  So a test attempt-0 reported
+    # FAIL/TIMEOUT that the probe did not list is silently DROPPED from the
+    # retry subset — the retry then never re-runs the actual failure and reports
+    # PASS.  A FALSE GREEN, the worst outcome available here.
+    #
+    # The comment above claims the probe returns a SUPERSET of attempt-0's plan
+    # (`--workspace` ⊇ reify's `-p` selectors).  That holds TODAY by coincidence
+    # of reify's flags; a future `--all-features` / `--all-targets` /
+    # `--cargo-profile` change on reify's side would break it with no signal.
+    # This is the one form of plan-incompleteness DF can detect IN-PROCESS, so
+    # the module's standing rule — never narrow on an incomplete plan — is
+    # enforced here rather than assumed.
+    #
+    # Only nextest-shaped keys ("<binary-id> <test-name>", hence the space) are
+    # comparable: `parse_per_test_results` also emits bare libtest paths, which
+    # `cargo nextest list` never produces and which are not evidence of drift.
+    planned_ids = set(planned)
+    uncovered = sorted(
+        key
+        for key, verdict in verdicts.items()
+        if verdict != 'pass' and ' ' in key and key not in planned_ids
+    )
+    if uncovered:
+        logger.warning(
+            'nextest list probe for profile %r did not cover %d did-not-pass '
+            'id(s) attempt-0 observed (%s%s) — the probed plan is INCOMPLETE, '
+            'so narrowing would silently drop the real failure; full verify',
+            first, len(uncovered), ', '.join(uncovered[:5]),
+            ', …' if len(uncovered) > 5 else '',
+        )
+        return None
     # A later profile's planned set is never even requested — it could not be
     # used, and probing it would cost a `nextest list` for nothing.
     per_profile: dict[str, tuple[list[str], dict[str, str]]] = {
@@ -2472,9 +2682,12 @@ async def _run_post_merge_verify(
             # Guarded by req.retry_failed_only (D1, task 2833) so the flag-off /
             # legacy path is byte-identical (D1's strict no-op guarantee).  Every
             # fail-safe route — unreadable/malformed sidecar, a probe that could
-            # not produce a plan, a rebased or uncorroborated tree — returns None
-            # and leaves `spec` untouched, so the retry runs FULL via the
-            # existing _reverify_rebased_tree (M4) semantics.
+            # not produce a plan, a probe whose plan does not COVER attempt-0's
+            # observed failures, a rebased or uncorroborated tree, or a subset
+            # that would not materially narrow (_materially_narrows) — returns
+            # None and leaves `spec` untouched, so the retry runs FULL via the
+            # existing _reverify_rebased_tree (M4) semantics AND stays on the
+            # legacy budget.
             #
             # `not narrowed` keeps this a once-per-call operation: the loop below
             # may dispatch several times, but the subset is always attempt-0's.
@@ -2485,7 +2698,13 @@ async def _run_post_merge_verify(
             # same `spec`) — correct and desired: a failed-only retry's local
             # trust-anchor cross-check should scope to the same subset.
             if req.retry_failed_only and not narrowed:
-                attempt0 = await _build_attempt0_payload(merge_wt, verify)
+                # spec.verify_env is attempt-0's OWN build environment (the
+                # shared sccache backend et al).  Threading it makes the
+                # `cargo nextest list` probe model the same build the verify
+                # performs — without it a warm lane's probe compiles cold.
+                attempt0 = await _build_attempt0_payload(
+                    merge_wt, verify, verify_env=spec.verify_env
+                )
                 if attempt0 is not None:
                     retry_env = await _assemble_retry_verify_env(
                         git_ops, req, merge_wt, attempt0
