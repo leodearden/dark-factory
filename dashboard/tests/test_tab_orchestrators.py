@@ -143,3 +143,51 @@ class TestOrchTabRuntimeColumns:
         an offline row's age now degrades to '—' via rtAge instead of
         rendering the literal string "nullm"."""
         assert not re.search(r'\$\{\s*t\.started\s*\}m', orch_tab_body)
+
+
+class TestOrchTabEmptyState:
+    """The empty-task-list cell must read as a sentence, not a stringified
+    object (task 3313).
+
+    The cell read `No {filter === 'all' ? '' : filter + ' '}tasks`, but
+    OrchTab's `filter` is an object ({active, pending, complete}) — the
+    equality is permanently false and the concatenation stringifies, so an
+    operator diagnosing a data-load failure reads the literal
+    "No [object Object] tasks". These assertions pin the wiring: the cell
+    delegates to window.DF_ORCH_FILTER's orchEmptyLabel, whose eight-
+    combination behaviour is exercised for real in
+    dashboard/tests/js/orch_filter.test.mjs.
+
+    The positive anchors in TestOrchTabCurrentFocusRemoved
+    (`function OrchTab(`, `aria-label="Task filter"`) are what keep the
+    negative assertions here from passing vacuously against a deleted or
+    renamed file.
+    """
+
+    def test_stringified_filter_expression_removed(self, tabs_jsx_body):
+        """The `filter === 'all'` comparison must be gone from tabs.jsx.
+
+        This is the task's delivered_check verbatim (grep pattern
+        `filter === 'all'`, expect absent, on this file), asserted in-suite so
+        the gate cannot fail after a green local run.
+        """
+        assert "filter === 'all'" not in tabs_jsx_body
+
+    def test_object_concatenation_removed(self, orch_tab_body):
+        """The `filter + ' '` concatenation that produced the literal
+        "[object Object] " must be gone, not merely rewritten around."""
+        assert not re.search(r"filter\s*\+\s*'", orch_tab_body)
+
+    def test_empty_cell_routes_through_orch_empty_label(self, orch_tab_body):
+        """The empty cell must delegate to the tested pure helper rather than
+        re-implementing the copy inline — inline copy would leave the
+        eight-combination coverage in orch_filter.test.mjs asserting nothing
+        about what actually renders."""
+        assert re.search(r'orchEmptyLabel\(\s*filter\s*\)', orch_tab_body)
+
+    def test_destructures_orch_filter_global(self, tabs_jsx_body):
+        """window.DF_ORCH_FILTER (defined by orch_filter.js, loaded earlier in
+        index.html) must be destructured at module top level — checked against
+        the whole file since top-level destructures sit outside any single tab
+        function (same rationale as test_destructures_runtime_fmt)."""
+        assert re.search(r'\bDF_ORCH_FILTER\b', tabs_jsx_body)
