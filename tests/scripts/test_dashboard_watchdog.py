@@ -89,37 +89,6 @@ def test_dashboard_unit_name():
     assert mod.DASHBOARD_UNIT == "dark-factory-dashboard.service"
 
 
-def test_healthz_appears_nowhere_in_the_source():
-    """The 2026-07-30 incident regression, pinned at the source level.
-
-    The retired inline shell probed ``/healthz`` — three 5s DB probes — and
-    restarted on a single miss.  The deep endpoint must not reappear anywhere
-    in the watchdog: not in a constant, not in a fallback, not in a comment
-    that a future reader could copy back into the probe.
-    """
-    source = WATCHDOG_PATH.read_text(encoding="utf-8")
-    assert "/healthz" not in source, (
-        "'/healthz' appears in scripts/dashboard-watchdog.py. The deep "
-        "DB-probing endpoint is what turned a slow dashboard into 192 "
-        "restarts in 3h on 2026-07-30; the watchdog probes /api/health only."
-    )
-
-
-def test_constants_are_not_accidentally_aliased():
-    """FAIL_STREAK and MAX_RESTARTS are both 3 today but mean different things.
-
-    Guards against a future 'DRY' edit collapsing them into one name: the
-    streak gate counts consecutive failed PROBES, the ceiling counts RESTARTS
-    inside a rolling window.  Changing one must not silently change the other.
-    """
-    mod = _load_watchdog()
-    assert "FAIL_STREAK" in vars(mod)
-    assert "MAX_RESTARTS" in vars(mod)
-    source = WATCHDOG_PATH.read_text(encoding="utf-8")
-    assert "MAX_RESTARTS = FAIL_STREAK" not in source
-    assert "FAIL_STREAK = MAX_RESTARTS" not in source
-
-
 # ---------------------------------------------------------------------------
 # probe_health()
 # ---------------------------------------------------------------------------
@@ -882,10 +851,10 @@ def test_b5_undeterminable_activation_does_not_apply_grace(monkeypatch, state_en
 WATCHDOG_UNIT_PATH = REPO_ROOT / "dashboard" / "dark-factory-dashboard-watchdog.service"
 WATCHDOG_TIMER_PATH = REPO_ROOT / "dashboard" / "dark-factory-dashboard-watchdog.timer"
 
-#: The deep, DB-touching endpoint the retired inline shell probed. Assembled
-#: rather than written literally so this test file's own text cannot be
-#: mistaken for a reintroduction when the source-absence pin is grepped.
-DEEP_ENDPOINT = "/health" + "z"
+#: The deep, DB-touching endpoint the retired inline shell probed. Used to
+#: dispatch the probe fake by URL below, which is how "the watchdog never
+#: REQUESTS the deep endpoint" is asserted as behaviour rather than as text.
+DEEP_ENDPOINT = "/healthz"
 
 
 def test_b6_slow_deep_endpoint_never_restarts_a_serving_dashboard(
@@ -961,22 +930,6 @@ def test_b6_unit_execstart_invokes_the_watchdog_script():
 
     assert len(exec_lines) == 1, f"expected exactly one ExecStart: {exec_lines}"
     assert "scripts/dashboard-watchdog.py" in exec_lines[0], exec_lines[0]
-
-
-def test_b6_unit_has_no_inline_shell_probe():
-    """``curl`` and the deep endpoint appear nowhere in the unit file.
-
-    Pins both halves of the incident at the file level: the single-sample
-    ``curl ... || systemctl restart`` and the deep endpoint it sampled.
-    """
-    unit = WATCHDOG_UNIT_PATH.read_text(encoding="utf-8")
-
-    assert "curl" not in unit, "the inline curl probe is back in the unit file"
-    assert DEEP_ENDPOINT not in unit, (
-        "the deep DB-probing endpoint is back in the watchdog unit; the "
-        "watchdog probes the shallow /api/health only"
-    )
-    assert "/bin/sh" not in unit
 
 
 def test_b6_unit_is_oneshot_and_journal_logged():

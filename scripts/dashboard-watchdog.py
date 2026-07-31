@@ -3,17 +3,12 @@
 
 Replaces the single-sample inline shell that shipped as
 ``dark-factory-dashboard-watchdog.service``'s ``ExecStart``: a one-line
-``curl ... || systemctl --user restart`` that probed the DEEP, DB-touching
-health endpoint (three 5s DB probes) and restarted the dashboard on a SINGLE
+``curl ... || systemctl --user restart`` that probed ``/healthz``, the DEEP
+DB-touching endpoint (three 5s DB probes), and restarted the dashboard on a SINGLE
 miss, with no rate ceiling — which on 2026-07-30 produced 192 restarts in 3
 hours (~27% downtime) from a dashboard that was merely slow, not dead. It was
 also a contract-in-prose (INV-1): the supervision policy lived inside an
 ``sh -c`` string with no test able to reach it.
-
-The retired endpoint is named nowhere in this file on purpose — its literal
-absence is asserted by
-``tests/scripts/test_dashboard_watchdog.py::test_healthz_appears_nowhere_in_the_source``
-so no future edit can quietly route the probe back to it.
 
 The real contract this file implements is
 ``plans/dashboard-availability-prd.md`` §Contract — the supervision seam.

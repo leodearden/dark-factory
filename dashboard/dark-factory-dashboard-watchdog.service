@@ -3,19 +3,17 @@ Description=Dashboard availability watchdog (hysteresis probe, storm escape)
 
 [Service]
 Type=oneshot
-# 2026-07-30 incident. This ExecStart used to be a one-line inline shell: a
-# 5-second HTTP fetch of the DEEP health endpoint, ORed with an unconditional
-# `systemctl --user restart dark-factory-dashboard.service`. (Reproduced only
-# in prose — the literals are asserted ABSENT from this file by
-# tests/scripts/test_dashboard_watchdog.py::test_b6_unit_has_no_inline_shell_probe,
-# so no future edit can paste the old line back under a comment marker and
-# then uncomment it.)
+# 2026-07-30 incident. This ExecStart used to be a one-line inline shell —
+# /bin/sh -c running, in full:
 #
-# Two defects, compounding. It probed the DEEP health endpoint — three 5s DB
-# probes — so a dashboard that was merely SLOW read as dead; and it restarted
-# on a SINGLE miss with no rate ceiling, so every restart made the next probe
-# likelier to time out. Measured result: 192 restarts in 3 hours, ~27%
-# downtime, from a service that was still serving requests throughout.
+#   curl -sf --max-time 5 http://127.0.0.1:8080/healthz \
+#     || systemctl --user restart dark-factory-dashboard.service
+#
+# Two defects, compounding. It probed /healthz, the DEEP health endpoint —
+# three 5s DB probes — so a dashboard that was merely SLOW read as dead; and it
+# restarted on a SINGLE miss with no rate ceiling, so every restart made the
+# next probe likelier to time out. Measured result: 192 restarts in 3 hours,
+# ~27% downtime, from a service that was still serving requests throughout.
 #
 # The probe therefore moved to the SHALLOW endpoint (/api/health — a bare
 # {'status': 'ok'} handler with no DB access), and the policy moved out of
