@@ -412,3 +412,105 @@ class TestSeriesWindowLoader:
         (eval_dir / 'limits-current.json').write_text('{}', encoding='utf-8')
         window = load_series_window(tmp_path, 'e1-retrieval-health', limit=5)
         assert [s.run_stamp for s in window] == ['20260701T031500Z']
+
+    def test_before_stamp_excludes_the_current_runs_own_artifact(self, tmp_path):
+        """A run must not be pooled into the baseline it is about to be judged against.
+
+        The natural runner ordering is write-then-evaluate, so by the time the
+        baseline window is loaded the current run's own ``metrics-*.json`` is
+        already on disk. Pooling it drags ``p0``/``lam`` toward the observed
+        value and DAMPS the very regression the M2 rules (b)/(c) exist to catch
+        — the worse the run, the more it moves the bar it is measured against.
+        """
+        self._seed(
+            tmp_path,
+            [
+                '20260701T031500Z',
+                '20260702T031500Z',
+                '20260703T031500Z',
+                '20260704T031500Z',
+            ],
+        )
+        window = load_series_window(
+            tmp_path,
+            'e1-retrieval-health',
+            limit=3,
+            before_stamp='20260704T031500Z',
+        )
+        assert [s.run_stamp for s in window] == [
+            '20260701T031500Z',
+            '20260702T031500Z',
+            '20260703T031500Z',
+        ]
+
+    def test_limit_is_applied_after_the_exclusion_not_before(self, tmp_path):
+        """The window keeps its full length once the current run is dropped.
+
+        The subtle way this fix can be got wrong is filtering AFTER slicing: the
+        trailing ``limit`` files include the current run, dropping it leaves
+        ``limit - 1``, and the evidence base quietly halves with nothing to
+        signal it. Asking for 3 must yield the 3 newest strictly-earlier runs.
+        """
+        self._seed(
+            tmp_path,
+            [
+                '20260701T031500Z',
+                '20260702T031500Z',
+                '20260703T031500Z',
+                '20260704T031500Z',
+                '20260705T031500Z',
+                '20260706T031500Z',
+            ],
+        )
+        window = load_series_window(
+            tmp_path,
+            'e1-retrieval-health',
+            limit=3,
+            before_stamp='20260706T031500Z',
+        )
+        assert [s.run_stamp for s in window] == [
+            '20260703T031500Z',
+            '20260704T031500Z',
+            '20260705T031500Z',
+        ]
+
+    def test_before_stamp_also_excludes_a_later_run(self, tmp_path):
+        """A baseline holding a FUTURE run is no more a baseline than one holding the present.
+
+        The filter is a strict ``<`` over the zero-padded stamp, so a concurrent
+        runner, a re-run with a pinned stamp, or clock skew — all the same
+        contamination class — are refused by the same rule.
+        """
+        self._seed(tmp_path, ['20260701T031500Z', '20260702T031500Z', '20260709T031500Z'])
+        window = load_series_window(
+            tmp_path,
+            'e1-retrieval-health',
+            limit=5,
+            before_stamp='20260703T031500Z',
+        )
+        assert [s.run_stamp for s in window] == ['20260701T031500Z', '20260702T031500Z']
+
+    def test_before_stamp_none_keeps_the_whole_window(self, tmp_path):
+        """``None`` is the explicit opt-out: "no current run to exclude", not "I forgot"."""
+        self._seed(tmp_path, ['20260701T031500Z', '20260702T031500Z', '20260703T031500Z'])
+        window = load_series_window(
+            tmp_path,
+            'e1-retrieval-health',
+            limit=5,
+            before_stamp=None,
+        )
+        assert [s.run_stamp for s in window] == [
+            '20260701T031500Z',
+            '20260702T031500Z',
+            '20260703T031500Z',
+        ]
+
+    def test_omitting_before_stamp_is_a_type_error(self, tmp_path):
+        """Required-but-nullable, so the footgun cannot be re-entered by forgetting it.
+
+        A ``before_stamp=None`` DEFAULT would reinstate exactly the self-pooling
+        this parameter exists to prevent, for anyone who does the natural thing.
+        """
+        self._seed(tmp_path, ['20260701T031500Z'])
+        with pytest.raises(TypeError):
+            load_series_window(tmp_path, 'e1-retrieval-health', limit=3)  # type: ignore[call-arg]
