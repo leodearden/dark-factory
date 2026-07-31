@@ -179,6 +179,32 @@ test('each classic script assigns its window.DF_* global after the shared load',
   }
 });
 
+test('no classic script leaks a bare `API` binding into the shared global lexical scope', () => {
+  const { ctx } = loadAllClassicScripts();
+
+  // A genuine runtime probe of the post-load lexical scope, not a source-text
+  // grep. `typeof <name>` on an UNDECLARED identifier is the one expression
+  // that evaluates to 'undefined' instead of throwing a ReferenceError —
+  // whereas a top-level `const API` in any already-loaded classic script makes
+  // it a real binding in this context's global lexical environment, and
+  // `typeof API` comes back 'object'. So this reads exactly the shared state
+  // the bug lives in.
+  assert.equal(
+    vm.runInContext('typeof API', ctx),
+    'undefined',
+    'a classic /static/redux/*.js script still declares a bare top-level ' +
+      '`const API`. The convention is that every such module exposes its ' +
+      'surface under a module-unique `<MODULE>_API` const — PRD_GROUPING_API, ' +
+      'RUNTIME_FORMAT_API, ORCH_FILTER_API, DF_DATA_LOADER_API, ' +
+      'ESC_FLOW_LAYOUT_API, GRAPH_LAYOUT_API — never a bare `API`. A bare ' +
+      '`API` is a live landmine rather than a style nit: the NEXT module to ' +
+      'copy the boilerplate collides with it and aborts on load, silently ' +
+      'leaving its own window.DF_* global undefined. That is precisely how ' +
+      "this bug reached production — esc_flow_layout.js's header says it was " +
+      'written "mirroring graph_layout.js".',
+  );
+});
+
 test('the harness actually detects a duplicate top-level const (negative control)', () => {
   // Self-proving guard, mirroring
   // test_index_html.py::test_load_order_assertion_fires_on_deferred_cdn.
