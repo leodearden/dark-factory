@@ -60,6 +60,21 @@ class _Fixture:
             and 'architect_merge_request' in call.args[1]
         ]
 
+    def status_forcing_updates(self) -> list[dict]:
+        """Any ``update_task`` payload attempting to write the task status.
+
+        The blocked-row persist must go through ``set_task_status`` alone; a
+        terminal-exit rejection must be ACCEPTED, never re-forced through the
+        metadata back door.
+        """
+        return [
+            call.args[1]
+            for call in self.scheduler.update_task.await_args_list
+            if len(call.args) > 1
+            and isinstance(call.args[1], dict)
+            and 'status' in call.args[1]
+        ]
+
 
 def _make(
     *,
@@ -74,6 +89,7 @@ def _make(
     review_verdict: str | None = 'PASS',
     metadata: dict | None = None,
     with_merge_queue: bool = True,
+    set_task_status_side_effect: object = None,
 ) -> _Fixture:
     """Build a TaskWorkflow with fakes wired for the desync predicate.
 
@@ -104,7 +120,7 @@ def _make(
     config.module_configs_or_empty = {}
 
     scheduler = MagicMock()
-    scheduler.set_task_status = AsyncMock()
+    scheduler.set_task_status = AsyncMock(side_effect=set_task_status_side_effect)
     scheduler.update_task = AsyncMock(return_value=True)
     scheduler.get_status = AsyncMock(return_value=None)
     scheduler.mark_done = AsyncMock()
@@ -234,6 +250,64 @@ class TestReadyToMergeHappyPath:
         suggestions_only is as much proof of a review PASS as PASS itself."""
         f = await self._run(tmp_path, review_verdict='suggestions_only')
 
+        assert f.merge_queue.qsize() == 1
+        f.mark_blocked.assert_not_awaited()
+
+    async def test_persists_the_blocked_task_row(self, tmp_path: Path):
+        """The blocked row must reach the SCHEDULER, not just the in-memory
+        phase machine.
+
+        β files no escalation by design, so an in-progress row left behind
+        matches the recovery table's REVERT_TO_PENDING shape — (in-progress,
+        no live claimant, branch off main, no open escalation)
+        (task_ground_truth.py row (c)) — and the sweep would set the task back
+        to 'pending' (harness.py:5564) and replan it while its MergeRequest is
+        still sitting in the queue.  Persisting 'blocked' is what keeps the
+        enqueued merge from being raced by a duplicate replan.
+        """
+        f = await self._run(tmp_path)
+
+        f.scheduler.set_task_status.assert_awaited_once_with(_TASK_ID, 'blocked')
+        f.mark_blocked.assert_not_awaited()  # still no human escalation
+        assert f.merge_queue.qsize() == 1
+
+    async def test_terminal_exit_rejection_is_accepted_not_forced(
+        self, tmp_path: Path,
+    ):
+        """The benign already-terminal race: the merge callback or the
+        found_on_main backstop beat us to mark_done.
+
+        That row is CORRECT — the work landed.  Dragging it back to 'blocked'
+        would undo a legitimate done, so the rejection must be swallowed, not
+        retried and not re-forced through ``update_task``.
+        """
+        from orchestrator.scheduler import TerminalExitRejection
+
+        f = await self._run(
+            tmp_path,
+            set_task_status_side_effect=TerminalExitRejection(
+                task_id=_TASK_ID, old_status='done',
+                target_status='blocked', raw='terminal_exit_rejected',
+            ),
+        )
+
+        assert f.outcome == WorkflowOutcome.BLOCKED
+        assert f.merge_queue.qsize() == 1  # the merge still went out
+        f.scheduler.set_task_status.assert_awaited_once()  # no retry
+        assert f.status_forcing_updates() == []  # and no forced re-write
+
+    async def test_status_write_failure_never_fails_the_enqueue(
+        self, tmp_path: Path,
+    ):
+        """A transient scheduler failure must never turn a successfully
+        enqueued merge into a raised exception — the request is already in the
+        queue, and the found_on_main reconciler remains the durable backstop.
+        """
+        f = await self._run(
+            tmp_path, set_task_status_side_effect=RuntimeError('boom'),
+        )
+
+        assert f.outcome == WorkflowOutcome.BLOCKED
         assert f.merge_queue.qsize() == 1
         f.mark_blocked.assert_not_awaited()
 
@@ -399,6 +473,22 @@ class TestReadyToMergeIdempotency:
         assert f.marker_stamps() == []  # and no re-stamp
         assert f.outcome == WorkflowOutcome.BLOCKED
         f.mark_blocked.assert_not_awaited()  # still no human escalation
+
+    async def test_duplicate_skip_persists_the_blocked_task_row(
+        self, tmp_path: Path,
+    ):
+        """The skip exit is just as terminal as the enqueue exit, so it owes
+        the same durable 'blocked' row.
+
+        Otherwise the in-progress row left behind matches the recovery table's
+        REVERT_TO_PENDING shape (no escalation is open by design) and the task
+        gets replanned out from under the merge that is still in flight — the
+        exact storm the marker exists to prevent.
+        """
+        f = await self._run(tmp_path, _marker(tip=_TIP))
+
+        f.scheduler.set_task_status.assert_awaited_once_with(_TASK_ID, 'blocked')
+        assert f.merge_queue.qsize() == 0  # still no second MergeRequest
 
     async def test_duplicate_skip_is_recorded_structurally(self, tmp_path: Path):
         """The skip is a decision, not a silence — it lands on the event."""
