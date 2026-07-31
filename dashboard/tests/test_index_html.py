@@ -539,14 +539,44 @@ def test_runtime_format_js_loads_before_tab_tasks(index_html_body: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Regression guard: orch_filter.js must load BEFORE tabs.jsx (task 3313)
+# ---------------------------------------------------------------------------
+
+_ORCH_FILTER_PREFIX = '/static/redux/orch_filter.js'
+
+
+def test_orch_filter_js_loads_before_tabs(index_html_body: str) -> None:
+    """orch_filter.js must load as a classic synchronous script BEFORE tabs.jsx.
+
+    tabs.jsx destructures {orchEmptyLabel} from window.DF_ORCH_FILTER at
+    top-level execution time (unguarded, matching the window.DF_RUNTIME_FMT
+    precedent on the line above it) — if orch_filter.js loaded after (or not at
+    all), that destructure would throw on a bare undefined and take the whole
+    Orchestrators tab down, which is strictly worse than the
+    "No [object Object] tasks" render it replaces.
+    """
+    _assert_script_loads_before(
+        index_html_body,
+        _ORCH_FILTER_PREFIX,
+        _TABS_PREFIX,
+        before_label='orch_filter.js',
+        after_label='tabs.jsx',
+        consumer_note=(
+            'tabs.jsx (OrchTab) destructures window.DF_ORCH_FILTER at top '
+            'level; orch_filter.js must define it first.'
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Regression guard: all /static/redux/* cache-busters share one bumped version
 # ---------------------------------------------------------------------------
 
 
 def test_redux_cache_buster_bumped(index_html_body: str) -> None:
     """All /static/redux/*?v= cache-busters must share a single version >= 30,
-    and graph_layout.js / prd_grouping.js / runtime_format.js must all be
-    among the versioned assets.
+    and graph_layout.js / prd_grouping.js / runtime_format.js / orch_filter.js
+    must all be among the versioned assets.
 
     Mirrors the existing single-shared-version guards in test_tab_escalations.py,
     test_tab_scheduler.py, and test_scheduler_page.py, raising the floor to 30 to
@@ -574,4 +604,10 @@ def test_redux_cache_buster_bumped(index_html_body: str) -> None:
     assert re.search(r'/static/redux/runtime_format\.js\?v=\d+', index_html_body), (
         'runtime_format.js is not present among the versioned /static/redux/* '
         'assets in index.html.'
+    )
+    assert re.search(r'/static/redux/orch_filter\.js\?v=\d+', index_html_body), (
+        'orch_filter.js is not present among the versioned /static/redux/* '
+        'assets in index.html — a tag added without a cache-buster would both '
+        'miss an already-open browser and break the single-shared-version '
+        'invariant this test and four other modules assert.'
     )
