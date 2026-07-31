@@ -117,15 +117,6 @@ class TestIsProtectedMirrorRecord:
             == recon_pool_map.CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE
         )
 
-        # recon_pool_map must stay the import-free leaf that makes this
-        # single-sourcing possible from BOTH sides of the summary_pool ->
-        # mem0_tombstone edge.
-        import inspect
-
-        source = inspect.getsource(recon_pool_map)
-        assert 'import fused_memory' not in source
-        assert 'from fused_memory' not in source
-
 
 # Probe run in a FRESH interpreter by TestReconPoolMapIsImportFreeLeaf: import
 # the package the leaf sits in, snapshot the loaded ``fused_memory.*`` modules,

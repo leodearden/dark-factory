@@ -1,7 +1,10 @@
 """Canonical stage -> recon_pool map for per-cycle reconciliation summaries.
 
 LEAF module: must NOT import anything from ``fused_memory`` (not even
-``fused_memory.reconciliation``). This map has two independent consumers,
+``fused_memory.reconciliation``). That rule is enforced, not just documented:
+``tests/test_mem0_tombstone.py::TestReconPoolMapIsImportFreeLeaf`` imports this
+module in a fresh interpreter and fails if doing so loads any other
+``fused_memory.*`` module. This map has two independent consumers,
 each keying on a different half of it, for ``metadata.kind ==
 'cycle_summary'`` writes: reconciliation/summary_pool.py trims a pool by
 the ``recon_pool`` *value* (passed in as a parameter — see
