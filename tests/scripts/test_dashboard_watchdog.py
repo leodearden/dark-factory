@@ -17,8 +17,13 @@ dashboard/tests/test_dashboard_watchdog_storm_escape.py instead.
 """
 
 import importlib.util
+import os
 import pathlib
+import subprocess
+import time
 import types
+import urllib.error
+import urllib.parse
 
 import pytest  # pyright: ignore[reportMissingImports]
 
@@ -385,6 +390,14 @@ class _TickRecorder:
     query (kept separately in ``queries``): "zero systemctl invocations" in
     the behavioural boundary cases means zero ACTUATIONS — the grace gate
     legitimately queries the unit's activation timestamp on every tick.
+
+    Every subprocess is recorded BEFORE its outcome is applied, so a call that
+    RAISES (a timed-out restart, a failing submit) still counts as attempted —
+    which is exactly what the fail-soft tests need to assert.
+
+    ``requested`` is every URL the probe actually asked for, which is how "the
+    watchdog never touches the deep DB-probing endpoint" is asserted as
+    behaviour rather than as source text.
     """
 
     def __init__(self) -> None:
@@ -392,6 +405,7 @@ class _TickRecorder:
         self.queries: list[list[str]] = []
         self.escalations: list[list[str]] = []
         self.states: list[dict] = []
+        self.requested: list[str] = []
 
     @property
     def restarts(self) -> list[list[str]]:
@@ -402,12 +416,32 @@ class _TickRecorder:
         return [s["streak"] for s in self.states]
 
 
+def _patch_probe(monkeypatch, mod, rec: _TickRecorder, spec) -> None:
+    """Point *mod*'s urlopen at *spec*, recording every URL actually requested.
+
+    *spec* is one tick's probe outcome: a bool (True → the endpoint answers
+    200, False → it 503s), or a ``(url) -> response`` callable that may raise,
+    for the tests whose outcome has to depend on WHICH endpoint was asked for.
+    """
+
+    def recording_urlopen(url, *args, **kwargs):
+        rec.requested.append(url)
+        if callable(spec):
+            return spec(url)
+        if spec:
+            return _FakeResponse(200)
+        raise urllib_error_503(mod)
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", recording_urlopen)
+
+
 def _run_ticks(
     monkeypatch,
     probe_results,
     activated_secs_ago: int | None = OUTSIDE_GRACE_SECS,
     seed_state: dict | None = None,
     recorder: _TickRecorder | None = None,
+    subprocess_effect=None,
 ) -> _TickRecorder:
     """Run one simulated timer tick per entry in *probe_results*.
 
@@ -415,50 +449,73 @@ def _run_ticks(
     the timer fires a new ``Type=oneshot`` process every 30s, so anything the
     watchdog needs to remember has to round-trip through the state file.
 
-    *probe_results* is an iterable of bools; True means the probe answers 200.
+    *probe_results* is an iterable with one entry per tick, each a bool (True
+    means the probe answers 200) or a ``(url) -> response`` callable.
     *activated_secs_ago* seeds the unit's ActiveEnterTimestamp (None makes the
     ``systemctl show`` query fail, i.e. activation undeterminable).
     Pass *recorder* to accumulate across several _run_ticks calls.
-    """
-    import subprocess as _sp
-    import time as _time
 
+    *subprocess_effect* is the ONE seam for a test that needs a subprocess to
+    misbehave: ``(argv) -> CompletedProcess | BaseException | None``, where an
+    exception instance is RAISED and None means "the default success". It is
+    consulted only for the calls the watchdog makes to ACT — the systemctl
+    actuation and ``escalation submit`` — never for the systemd-cat logging
+    path or the read-only ``systemctl show`` query, which every test needs to
+    keep working.
+
+    Routing every fake through this single dispatch table is deliberate. The
+    fake used to be hand-reimplemented per test, and the copies had already
+    drifted: some matched a bare ``"show" in argv`` with no systemctl guard,
+    so any future argv merely CONTAINING that token would be misclassified,
+    and a new subprocess call site in the watchdog would land in a different
+    branch in each copy — silently changing what those tests asserted.
+    """
     rec = recorder if recorder is not None else _TickRecorder()
 
     if seed_state is not None:
         _load_watchdog().save_state(seed_state)
 
     active_enter = (
-        None if activated_secs_ago is None else int(_time.time()) - activated_secs_ago
+        None if activated_secs_ago is None else int(time.time()) - activated_secs_ago
     )
+
+    def apply_effect(argv_list: list[str]):
+        outcome = None if subprocess_effect is None else subprocess_effect(argv_list)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        if outcome is not None:
+            return outcome
+        return subprocess.CompletedProcess(argv_list, 0, stdout="", stderr="")
 
     def fake_run(argv, *args, **kwargs):
         argv_list = list(argv)
-        if argv_list and argv_list[0] == "systemd-cat":
-            return _sp.CompletedProcess(argv_list, 0, stdout="", stderr="")
+        if argv_list[:1] == ["systemd-cat"]:
+            return subprocess.CompletedProcess(argv_list, 0, stdout="", stderr="")
         if argv_list[:2] == ["systemctl", "--user"]:
             if "show" in argv_list:
                 rec.queries.append(argv_list)
                 if active_enter is None:
-                    return _sp.CompletedProcess(argv_list, 1, stdout="", stderr="")
-                return _sp.CompletedProcess(
+                    return subprocess.CompletedProcess(
+                        argv_list, 1, stdout="", stderr=""
+                    )
+                return subprocess.CompletedProcess(
                     argv_list,
                     0,
                     stdout=f"ActiveEnterTimestamp=@{active_enter}\n",
                     stderr="",
                 )
             rec.actuations.append(argv_list)
-            return _sp.CompletedProcess(argv_list, 0, stdout="", stderr="")
-        # Anything else is the `uv run ... escalation submit ...` invocation.
-        rec.escalations.append(argv_list)
-        return _sp.CompletedProcess(argv_list, 0, stdout="", stderr="")
+        else:
+            # Anything that is neither systemd-cat nor a `systemctl --user`
+            # call is the `uv run ... escalation submit ...` invocation.
+            rec.escalations.append(argv_list)
+        return apply_effect(argv_list)
 
-    monkeypatch.setattr(_sp, "run", fake_run)
+    monkeypatch.setattr(subprocess, "run", fake_run)
 
-    for healthy in probe_results:
+    for spec in probe_results:
         mod = _load_watchdog()
-        outcome = _FakeResponse(200) if healthy else urllib_error_503(mod)
-        _patch_urlopen(monkeypatch, mod, outcome)
+        _patch_probe(monkeypatch, mod, rec, spec)
         mod.tick()
         rec.states.append(_load_watchdog().load_state())
 
@@ -490,6 +547,35 @@ def test_b1_healthy_steady_state_never_actuates(monkeypatch, state_env):
     assert rec.streaks == [0] * 30
     assert all(s["restarts"] == [] for s in rec.states)
     assert all(s["ceiling_open"] is False for s in rec.states)
+
+
+def test_b1_healthy_steady_state_does_not_rewrite_the_state_file(
+    monkeypatch, state_env
+):
+    """A tick that changes nothing must not rewrite the state document.
+
+    save_state is makedirs + mkstemp + write + os.replace — a new inode every
+    call, and a window in which a kill orphans a ``.state.*`` temp nothing ever
+    reaps. At the timer's 30s cadence the healthy steady state would pay that
+    ~2880 times a day, forever, purely to rewrite an identical document. Both
+    halves are asserted: an untouched watchdog creates nothing at all, and one
+    with a state file on disk leaves that exact inode alone.
+    """
+    _run_ticks(monkeypatch, [True] * 10)
+    assert not state_env.exists(), (
+        "healthy ticks created a state file with nothing to record"
+    )
+
+    _load_watchdog().save_state({"streak": 0, "restarts": [], "ceiling_open": False})
+    before = state_env.stat()
+
+    _run_ticks(monkeypatch, [True] * 10)
+
+    after = state_env.stat()
+    assert (after.st_ino, after.st_mtime_ns) == (before.st_ino, before.st_mtime_ns), (
+        "healthy ticks rewrote an unchanged state file"
+    )
+    assert list(state_env.parent.glob(".state.*")) == [], "temp files left behind"
 
 
 def test_b1_healthy_tick_clears_a_pre_existing_streak(monkeypatch, state_env):
@@ -851,10 +937,25 @@ def test_b5_undeterminable_activation_does_not_apply_grace(monkeypatch, state_en
 WATCHDOG_UNIT_PATH = REPO_ROOT / "dashboard" / "dark-factory-dashboard-watchdog.service"
 WATCHDOG_TIMER_PATH = REPO_ROOT / "dashboard" / "dark-factory-dashboard-watchdog.timer"
 
+#: The unit the watchdog supervises — the only other place in the repo that
+#: names the port the probe URL has to reach.
+DASHBOARD_SERVICE_PATH = REPO_ROOT / "dashboard" / "dark-factory-dashboard.service"
+
 #: The deep, DB-touching endpoint the retired inline shell probed. Used to
 #: dispatch the probe fake by URL below, which is how "the watchdog never
 #: REQUESTS the deep endpoint" is asserted as behaviour rather than as text.
 DEEP_ENDPOINT = "/healthz"
+
+
+def _deep_endpoint_is_slow(url: str) -> _FakeResponse:
+    """One tick's probe outcome for the incident's shape: shallow 200, deep 503.
+
+    The deep endpoint's three 5s DB probes are simulated, not slept — the point
+    is that the OUTCOME differs by endpoint, not the wall clock.
+    """
+    if DEEP_ENDPOINT in url:
+        raise urllib.error.HTTPError(url, 503, "Service Unavailable", {}, None)  # type: ignore[arg-type]
+    return _FakeResponse(200)
 
 
 def test_b6_slow_deep_endpoint_never_restarts_a_serving_dashboard(
@@ -867,53 +968,16 @@ def test_b6_slow_deep_endpoint_never_restarts_a_serving_dashboard(
     watchdog restarted a healthy service 192 times in 3 hours (~27% downtime),
     and every restart made the next probe more likely to time out.
 
-    The fake dispatches on URL: the shallow endpoint answers 200 immediately,
-    the deep one raises a 503 after a simulated delay. Ten ticks must actuate
-    nothing — and the deep endpoint must never even be REQUESTED.
+    The probe fake dispatches on URL: the shallow endpoint answers 200
+    immediately, the deep one 503s. Ten ticks must actuate nothing — and the
+    deep endpoint must never even be REQUESTED.
     """
-    import subprocess as _sp
-    import time as _time
-    import urllib.error
+    rec = _run_ticks(monkeypatch, [_deep_endpoint_is_slow] * 10)
 
-    active_enter = int(_time.time()) - OUTSIDE_GRACE_SECS
-    actuations: list[list[str]] = []
-    requested: list[str] = []
-
-    def fake_run(argv, *args, **kwargs):
-        argv_list = list(argv)
-        if argv_list and argv_list[0] == "systemd-cat":
-            return _sp.CompletedProcess(argv_list, 0, stdout="", stderr="")
-        if "show" in argv_list:
-            return _sp.CompletedProcess(
-                argv_list,
-                0,
-                stdout=f"ActiveEnterTimestamp=@{active_enter}\n",
-                stderr="",
-            )
-        actuations.append(argv_list)
-        return _sp.CompletedProcess(argv_list, 0, stdout="", stderr="")
-
-    monkeypatch.setattr(_sp, "run", fake_run)
-
-    for _ in range(10):
-        mod = _load_watchdog()
-
-        def dispatching_urlopen(url, *args, **kwargs):
-            requested.append(url)
-            if DEEP_ENDPOINT in url:
-                # The slow DB probes: eventually a 503, well past any sane
-                # client timeout. Simulated, not slept — the point is the
-                # OUTCOME differs by endpoint, not the wall clock.
-                raise urllib.error.HTTPError(url, 503, "Service Unavailable", {}, None)  # type: ignore[arg-type]
-            return _FakeResponse(200)
-
-        monkeypatch.setattr(mod.urllib.request, "urlopen", dispatching_urlopen)
-        mod.tick()
-
-    assert actuations == [], f"restarted a serving dashboard: {actuations}"
-    assert requested, "the watchdog probed nothing at all"
-    assert all(DEEP_ENDPOINT not in url for url in requested), (
-        f"the watchdog requested the deep DB-probing endpoint: {requested}"
+    assert rec.actuations == [], f"restarted a serving dashboard: {rec.actuations}"
+    assert rec.requested, "the watchdog probed nothing at all"
+    assert all(DEEP_ENDPOINT not in url for url in rec.requested), (
+        f"the watchdog requested the deep DB-probing endpoint: {rec.requested}"
     )
     assert _load_watchdog().load_state()["streak"] == 0
 
@@ -930,6 +994,107 @@ def test_b6_unit_execstart_invokes_the_watchdog_script():
 
     assert len(exec_lines) == 1, f"expected exactly one ExecStart: {exec_lines}"
     assert "scripts/dashboard-watchdog.py" in exec_lines[0], exec_lines[0]
+
+
+def test_b6_watchdog_script_is_executable():
+    """ExecStart runs the script DIRECTLY, so it must stay mode 100755.
+
+    Lose the +x — a chmod, a copy through a tool that drops modes, a patch
+    applied with the wrong mode — and every tick dies with status 203/EXEC
+    before it runs: no probe, no restart, no escalation, and the only signal
+    is a red unit nobody is watching. Same untested-supervision-seam class
+    (INV-1) as the inline shell this rewrite retired.
+    """
+    assert os.access(WATCHDOG_PATH, os.X_OK), (
+        f"{WATCHDOG_PATH} is not executable; ExecStart= invokes it directly, "
+        "so systemd would fail every tick with 203/EXEC"
+    )
+
+
+def test_b6_unit_bounds_the_whole_tick():
+    """TimeoutStartSec must be finite, and above the script's slowest child.
+
+    systemd disables TimeoutStartSec for Type=oneshot by default, and the
+    timer's OnUnitActiveSec measures from the unit's last activation — so a
+    tick that never returns does not merely run late, it ENDS supervision:
+    the timer never re-triggers and nothing reports it. The bound also has to
+    clear the script's own worst-case child (the 120s `escalation submit`),
+    or the kill would land on the one tick that files the L2.
+    """
+    unit = WATCHDOG_UNIT_PATH.read_text(encoding="utf-8")
+    values = [
+        ln.split("=", 1)[1].strip()
+        for ln in unit.splitlines()
+        if ln.startswith("TimeoutStartSec=")
+    ]
+
+    assert len(values) == 1, f"expected exactly one TimeoutStartSec=: {values}"
+    assert values[0].isdigit(), (
+        f"TimeoutStartSec={values[0]!r} is not a plain seconds count; "
+        "'infinity' would leave the tick unbounded and a unit suffix is not "
+        "parsed here — keep it a bare integer"
+    )
+    assert int(values[0]) > 120, (
+        f"TimeoutStartSec={values[0]} does not clear the script's 120s "
+        "`escalation submit` bound, so the whole-tick kill can land on the "
+        "tick that files the L2"
+    )
+
+
+def _dashboard_execstart_argv() -> list[str]:
+    """Return the dashboard unit's ExecStart argv, line continuations joined.
+
+    That unit wraps its ExecStart over five physical lines with trailing
+    backslashes, so a naive single-line read would never see ``--port`` and
+    the pin below would pass vacuously.
+    """
+    lines = DASHBOARD_SERVICE_PATH.read_text(encoding="utf-8").splitlines()
+    starts = [i for i, ln in enumerate(lines) if ln.startswith("ExecStart=")]
+
+    assert len(starts) == 1, (
+        f"expected exactly one ExecStart= in {DASHBOARD_SERVICE_PATH}: {starts}"
+    )
+
+    idx = starts[0]
+    segments = [lines[idx][len("ExecStart=") :]]
+    while segments[-1].rstrip().endswith("\\"):
+        idx += 1
+        assert idx < len(lines), (
+            f"ExecStart continuation runs off the end of {DASHBOARD_SERVICE_PATH}"
+        )
+        segments.append(lines[idx])
+
+    return " ".join(seg.rstrip().rstrip("\\").strip() for seg in segments).split()
+
+
+def test_b6_probe_port_matches_the_dashboard_units_listen_port():
+    """PROBE_URL's port is pinned against the dashboard unit's ``--port``.
+
+    Nothing else ties the two together — the port is named here and in that
+    unit's ExecStart, nowhere else. Unpinned, moving the unit's --port makes
+    the watchdog probe a dead port: every probe fails, it restarts a perfectly
+    healthy dashboard MAX_RESTARTS times and then goes permanently quiet with
+    a spurious born-at-L2 on file. That manufactures the exact incident class
+    this rewrite exists to prevent, in a shape an operator reading the journal
+    cannot tell apart from a real outage. Same pairing-pin idiom as
+    test_b6_timer_cadence_is_thirty_seconds.
+    """
+    mod = _load_watchdog()
+    probe_port = urllib.parse.urlsplit(mod.PROBE_URL).port
+
+    assert probe_port is not None, (
+        f"PROBE_URL {mod.PROBE_URL!r} names no port, so it cannot be pinned "
+        f"against {DASHBOARD_SERVICE_PATH.name}'s --port"
+    )
+
+    # _argv_value is the B4 helper below — same "value following a flag" shape.
+    unit_port = int(_argv_value(_dashboard_execstart_argv(), "--port"))
+
+    assert probe_port == unit_port, (
+        f"the watchdog probes port {probe_port} but "
+        f"{DASHBOARD_SERVICE_PATH.name} serves on {unit_port}; the probe would "
+        "fail forever against a healthy dashboard"
+    )
 
 
 def test_b6_unit_is_oneshot_and_journal_logged():
@@ -1468,32 +1633,14 @@ def test_i5_restart_timeout_is_survived_and_still_recorded(
     ceiling unreachable: the watchdog would retry forever on a unit whose
     systemctl always hangs, which is the flap in a different costume.
     """
-    import subprocess as _sp
-    import time as _time
-
-    active_enter = int(_time.time()) - OUTSIDE_GRACE_SECS
-    attempted: list[list[str]] = []
-
-    def fake_run(argv, *args, **kwargs):
-        argv_list = list(argv)
-        if argv_list and argv_list[0] == "systemd-cat":
-            return _sp.CompletedProcess(argv_list, 0, stdout="", stderr="")
-        if "show" in argv_list:
-            return _sp.CompletedProcess(
-                argv_list, 0, stdout=f"ActiveEnterTimestamp=@{active_enter}\n", stderr=""
-            )
-        attempted.append(argv_list)
-        raise _sp.TimeoutExpired(argv_list, timeout=45)
-
-    monkeypatch.setattr(_sp, "run", fake_run)
-
     mod = _load_watchdog()
-    for _ in range(mod.FAIL_STREAK):
-        m = _load_watchdog()
-        _patch_urlopen(monkeypatch, m, urllib_error_503(m))
-        m.tick()  # must not raise
+    rec = _run_ticks(  # must not raise
+        monkeypatch,
+        [False] * mod.FAIL_STREAK,
+        subprocess_effect=lambda argv: subprocess.TimeoutExpired(argv, timeout=45),
+    )
 
-    assert any("restart" in a for a in attempted), "no restart was attempted"
+    assert rec.restarts, "no restart was attempted"
     assert len(_load_watchdog().load_state()["restarts"]) == 1, (
         "a timed-out restart was not recorded — the ceiling becomes unreachable"
     )
@@ -1525,42 +1672,29 @@ def test_i5_escalation_failure_does_not_resume_the_flap(
     trying to fix it ourselves" — is exactly the storm. Failing toward "quiet,
     with a journal line" loses the L2 but not the availability guarantee.
     """
-    import subprocess as _sp
-    import time as _time
-
     mod = _load_watchdog()
-    active_enter = int(_time.time()) - OUTSIDE_GRACE_SECS
-    actuations: list[list[str]] = []
 
-    def fake_run(argv, *args, **kwargs):
-        argv_list = list(argv)
-        if argv_list and argv_list[0] == "systemd-cat":
-            return _sp.CompletedProcess(argv_list, 0, stdout="", stderr="")
-        if argv_list[:2] == ["systemctl", "--user"]:
-            if "show" in argv_list:
-                return _sp.CompletedProcess(
-                    argv_list,
-                    0,
-                    stdout=f"ActiveEnterTimestamp=@{active_enter}\n",
-                    stderr="",
-                )
-            actuations.append(argv_list)
-            return _sp.CompletedProcess(argv_list, 0, stdout="", stderr="")
+    def only_the_submit_fails(argv: list[str]):
+        if argv[:2] == ["systemctl", "--user"]:
+            return None  # actuation itself still succeeds
         if failure == "nonzero":
-            return _sp.CompletedProcess(argv_list, 2, stdout="", stderr="argparse error")
+            return subprocess.CompletedProcess(
+                argv, 2, stdout="", stderr="argparse error"
+            )
         if failure == "missing-uv":
-            raise FileNotFoundError(mod.UV_BIN)
-        raise _sp.TimeoutExpired(argv_list, timeout=120)
+            return FileNotFoundError(mod.UV_BIN)
+        return subprocess.TimeoutExpired(argv, timeout=120)
 
-    monkeypatch.setattr(_sp, "run", fake_run)
+    rec = _run_ticks(  # must not raise
+        monkeypatch,
+        [False] * (mod.FAIL_STREAK + 10),
+        seed_state=_at_ceiling_state(mod),
+        subprocess_effect=only_the_submit_fails,
+    )
 
-    _load_watchdog().save_state(_at_ceiling_state(mod))
-    for _ in range(mod.FAIL_STREAK + 10):
-        m = _load_watchdog()
-        _patch_urlopen(monkeypatch, m, urllib_error_503(m))
-        m.tick()  # must not raise
-
-    assert actuations == [], f"resumed restarting after a failed submit: {actuations}"
+    assert rec.actuations == [], (
+        f"resumed restarting after a failed submit: {rec.actuations}"
+    )
     assert _load_watchdog().load_state()["ceiling_open"] is True
 
 
