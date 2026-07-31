@@ -3322,7 +3322,10 @@ class TestCoerceTierUnrecognizedValueDedup:
     ):
         """A non-string bad value (e.g. an int) must not raise when used as
         a dedupe key, and still warns exactly once across repeats —
-        confirms the dedupe key tolerates non-str input."""
+        confirms the dedupe key tolerates non-str, hashable input. (The
+        unhashable case — where using ``value`` itself as the dedupe key
+        instead of ``repr(value)`` would raise — is covered separately by
+        test_unhashable_unrecognized_value_dedupes_safely below.)"""
         with caplog.at_level(logging.WARNING, logger='orchestrator.config'):
             results = [coerce_tier(7) for _ in range(3)]
 
@@ -3337,6 +3340,32 @@ class TestCoerceTierUnrecognizedValueDedup:
             f"{[r.getMessage() for r in warning_records]}"
         )
 
+    def test_unhashable_unrecognized_value_dedupes_safely(
+        self, caplog: pytest.LogCaptureFixture
+    ):
+        """An unhashable bad value (e.g. a list — the shape a corrupt or
+        hand-edited tasks.json could produce for a 'priority' field) must
+        not raise, and still warns exactly once across repeats. This is
+        the case the repr(value) dedupe key exists to handle: an
+        implementation that memoized on ``value`` itself (instead of
+        ``repr(value)``) would raise ``TypeError: unhashable type`` on the
+        very first call here, so this is the test that actually pins the
+        repr()-keyed dedupe rather than merely exercising a non-str
+        value."""
+        with caplog.at_level(logging.WARNING, logger='orchestrator.config'):
+            results = [coerce_tier(['high']) for _ in range(3)]
+
+        assert results == [DEFAULT_TIER, DEFAULT_TIER, DEFAULT_TIER]
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and r.name == 'orchestrator.config'
+        ]
+        assert len(warning_records) == 1, (
+            f"expected exactly one WARNING total for a repeated unhashable "
+            f"unrecognized value; got: "
+            f"{[r.getMessage() for r in warning_records]}"
+        )
+
     def test_dedupe_memo_is_bounded_and_does_not_raise(
         self, caplog: pytest.LogCaptureFixture
     ):
@@ -3344,7 +3373,15 @@ class TestCoerceTierUnrecognizedValueDedup:
         memo must not grow without bound. Feeding more distinct
         unrecognized values than the cap must not grow the set past the
         cap, and coerce_tier must keep returning DEFAULT_TIER without
-        raising."""
+        raising.
+
+        This also pins the cap-boundary LOG BEHAVIOUR, not just the final
+        memo size: filling the cap must emit exactly one cap-reached
+        notice (not zero, and not one per call past the cap — the latter
+        would silently reproduce the very flood the cap exists to
+        prevent), and no further unrecognized-priority warnings of any
+        kind may be emitted once the memo is full.
+        """
         from orchestrator import config as _cfg
 
         assert hasattr(_cfg, '_MAX_WARNED_PRIORITY_VALUES'), (
@@ -3355,10 +3392,45 @@ class TestCoerceTierUnrecognizedValueDedup:
         cap = _cfg._MAX_WARNED_PRIORITY_VALUES
         assert cap > 0
 
+        def _warning_records():
+            return [
+                r for r in caplog.records
+                if r.levelno >= logging.WARNING and r.name == 'orchestrator.config'
+            ]
+
         with caplog.at_level(logging.WARNING, logger='orchestrator.config'):
-            for i in range(cap + 20):
+            for i in range(cap):
                 result = coerce_tier(f'not-a-real-tier-{i}')
                 assert result == DEFAULT_TIER
+
+            records_at_cap = _warning_records()
+            assert len(records_at_cap) == cap + 1, (
+                f"expected {cap} per-value warnings plus exactly one "
+                f"cap-reached notice ({cap + 1} records total) after "
+                f"feeding exactly {cap} distinct unrecognized values; got "
+                f"{len(records_at_cap)}: "
+                f"{[r.getMessage() for r in records_at_cap]}"
+            )
+            assert 'cap' in records_at_cap[-1].getMessage().lower(), (
+                "the final warning emitted upon filling the memo must be "
+                f"the cap-reached notice; got: "
+                f"{records_at_cap[-1].getMessage()!r}"
+            )
+
+            for i in range(cap, cap + 20):
+                result = coerce_tier(f'not-a-real-tier-{i}')
+                assert result == DEFAULT_TIER
+
+            records_after_overflow = _warning_records()
+            assert len(records_after_overflow) == len(records_at_cap), (
+                "no further records (neither per-value warnings nor "
+                "repeated cap-reached notices) may be emitted once the "
+                f"memo is full; had {len(records_at_cap)} records right "
+                f"after filling the cap, now have "
+                f"{len(records_after_overflow)} after 20 more distinct "
+                f"values: "
+                f"{[r.getMessage() for r in records_after_overflow]}"
+            )
 
         assert hasattr(_cfg, '_warned_priority_values'), (
             "orchestrator.config._warned_priority_values must exist "
