@@ -28,6 +28,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -39,7 +40,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
-from df_pytest_isolation import git_ceiling_value  # noqa: E402
+from df_pytest_isolation import (  # noqa: E402
+    basetemp_rejection_reason,
+    git_ceiling_value,
+    reject_unsafe_basetemp,
+)
 
 _CEILING_KEY = 'GIT_CEILING_DIRECTORIES'
 
@@ -245,3 +250,115 @@ class TestGitCeilingValueContainsRealGit:
 
         assert result.returncode == 0, result.stderr
         assert Path(result.stdout.strip()).resolve() == inner.resolve()
+
+
+# The gitignored worktree-root vocabulary, .gitignore:15-17.  Spelled out here
+# rather than imported so the test pins the values independently of the module.
+_WORKTREE_ROOTS = ['.worktrees', '.worktrees-orphaned', '.eval-worktrees']
+
+
+def _stub_config(basetemp: object) -> SimpleNamespace:
+    """A config exposing ONLY ``.option.basetemp``.
+
+    ``reject_unsafe_basetemp`` must read nothing else — ``config._tmp_path_factory``
+    is private and its availability during a conftest ``pytest_configure``
+    depends on plugin hook ordering.  A stub this thin fails loudly if the
+    implementation ever reaches past the public CLI option.
+    """
+    return SimpleNamespace(option=SimpleNamespace(basetemp=basetemp))
+
+
+class TestBasetempRejectionReason:
+    """A basetemp aimed inside a live worktree is named and explained."""
+
+    @pytest.mark.parametrize('worktree_root', _WORKTREE_ROOTS)
+    def test_rejects_every_gitignored_worktree_root(self, worktree_root: str) -> None:
+        reason = basetemp_rejection_reason(f'/home/dev/repo/{worktree_root}/3072/.pytest-tmp')
+
+        assert reason
+
+    def test_rejects_the_exact_incident_shape(self) -> None:
+        """``.worktrees/3072/.pytest-tmp`` — the basetemp that caused esc-3072-3."""
+        reason = basetemp_rejection_reason('/home/leo/src/dark-factory/.worktrees/3072/.pytest-tmp')
+
+        assert reason
+        assert '.worktrees' in reason
+
+    def test_the_message_names_the_remedy_not_just_the_verdict(self) -> None:
+        """The agent that trips this must be told what to change.
+
+        A bare "unsafe basetemp" verdict costs a round-trip to work out that
+        the offending input was a CLI flag.
+        """
+        reason = basetemp_rejection_reason('/home/dev/repo/.worktrees/3072/.pytest-tmp')
+
+        assert reason is not None
+        assert '--basetemp' in reason
+
+    def test_accepts_the_pytest_default_location(self) -> None:
+        """The verify lane's case: no --basetemp, so pytest defaults here."""
+        assert basetemp_rejection_reason('/tmp/pytest-of-someone/pytest-1') is None
+
+    def test_accepts_a_tmp_path_derived_basetemp(self, tmp_path: Path) -> None:
+        assert basetemp_rejection_reason(tmp_path) is None
+
+    def test_accepts_the_repo_root_itself(self) -> None:
+        """Only a basetemp INSIDE a worktree root is refused.
+
+        The repo whose .gitignore names these directories is not itself unsafe.
+        """
+        assert basetemp_rejection_reason('/home/leo/src/dark-factory/build/tmp') is None
+
+    @pytest.mark.parametrize(
+        'path',
+        [
+            '/tmp/my.worktrees-backup/x',
+            '/tmp/archived.worktrees/x',
+            '/tmp/eval-worktrees-old/x',
+        ],
+    )
+    def test_matches_path_components_not_substrings(self, path: str) -> None:
+        """A directory that merely CONTAINS the name is a different directory.
+
+        Substring matching here would refuse unrelated, perfectly safe
+        basetemps — turning a safety net into an outage.
+        """
+        assert basetemp_rejection_reason(path) is None
+
+
+class TestRejectUnsafeBasetemp:
+    """The pytest_configure hook: loud and early, or silent."""
+
+    def test_raises_usage_error_for_an_unsafe_basetemp(self) -> None:
+        """UsageError renders as a clean ``ERROR: ...`` with no traceback —
+        the right register for an operator/agent misconfiguration.
+        """
+        config = _stub_config('/home/dev/repo/.worktrees/3072/.pytest-tmp')
+
+        with pytest.raises(pytest.UsageError) as excinfo:
+            reject_unsafe_basetemp(config)
+
+        assert '--basetemp' in str(excinfo.value)
+
+    def test_raises_for_a_relative_basetemp_resolved_inside_a_worktree(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """How the incident was actually produced: ``--basetemp=.pytest-tmp``
+        run from inside the worktree, where the flag value never mentions
+        ``.worktrees`` at all.
+        """
+        worktree = tmp_path / '.worktrees' / '3072'
+        worktree.mkdir(parents=True)
+        monkeypatch.chdir(worktree)
+
+        with pytest.raises(pytest.UsageError):
+            reject_unsafe_basetemp(_stub_config('.pytest-tmp'))
+
+    def test_is_a_no_op_when_no_basetemp_was_passed(self) -> None:
+        """The verify lane's case — dark-factory-orchestrator.yaml passes no
+        --basetemp, so this must never fire there.
+        """
+        reject_unsafe_basetemp(_stub_config(None))
+
+    def test_is_a_no_op_for_a_safe_basetemp(self, tmp_path: Path) -> None:
+        reject_unsafe_basetemp(_stub_config(tmp_path))
