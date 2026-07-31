@@ -13,6 +13,7 @@ import string
 import sys
 import time
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -70,6 +71,10 @@ from orchestrator.artifacts import (
     TaskArtifacts,
 )
 from orchestrator.config import ModuleConfig, OrchestratorConfig
+from orchestrator.delivered_checks import (
+    DeliveredChecksBlock,
+    gate_mark_done_on_delivered_checks,
+)
 from orchestrator.dry_run_unblock import run_dry_run_unblock
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import (
@@ -12418,10 +12423,51 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             return False
         return self._has_prior_implementation(wt_head=wt_head).has_work
 
+    async def _delivered_checks_block(
+        self,
+        task_id: str,
+        metadata: Mapping[str, Any] | None,
+        *,
+        site: str,
+        main_sha: str | None = None,
+    ) -> DeliveredChecksBlock | None:
+        """Workflow-side binding of the ONE shared mark-done decision (task 3057).
+
+        The twin of :meth:`~orchestrator.harness.Harness._delivered_checks_block`,
+        so the workflow's attribution-shaped stamp seams cannot drift from the
+        harness's. A non-``None`` result means **do NOT stamp done at this
+        site** — take that site's EXISTING "no landing evidence" path instead.
+
+        ``project_root``, deliberately NOT ``self.worktree``: the ``grep`` kind
+        evaluates the COMMITTED tree at ``ref=main_sha``, so a worktree path
+        would silently audit the wrong tree — and would usually still pass,
+        leaving the guard looking armed while proving nothing about ``main``.
+
+        Inertness (no ``delivered_checks``) and the kill switch live in
+        :func:`~orchestrator.delivered_checks.gate_mark_done_on_delivered_checks`
+        ALONE; workflow sites delegate unconditionally rather than
+        re-implementing either locally. ``main_sha`` lets a seam that has
+        ALREADY resolved a main SHA forward it, so the guard audits the SAME
+        main that seam's other evidence test used with no second git call.
+
+        Never raises.
+        """
+        return await gate_mark_done_on_delivered_checks(
+            task_id,
+            metadata,
+            git_ops=self.git_ops,
+            project_root=str(self.config.project_root),
+            check_timeout_secs=self.config.delivered_checks.check_timeout_secs,
+            enabled=self.config.delivered_checks.enabled,
+            main_sha=main_sha,
+            site=site,
+            log=logger,
+        )
+
     async def _finalise_recovery_done(
         self, *, basis: str, sha: str, kind: str, note: str,
         files: list[str] | None = None,
-    ) -> WorkflowOutcome:
+    ) -> WorkflowOutcome | None:
         """Shared DONE-finalisation for all already-merged guards (PRD α, MP-2).
 
         The sole writer of :attr:`_merge_recovery_basis`.  Every already-merged
@@ -12452,6 +12498,31 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         provenance basis": a future guard that calls this chokepoint without
         a valid basis fails loudly instead of silently producing a
         phantom-done.
+
+        **Delivered-capability guard** (task 3057, seams 4+7 of eleven).
+        A journal row or a branch-on-main probe proves only that SOMETHING of
+        this branch reached ``main`` — never that THIS task's declared
+        capability (``metadata.delivered_checks``) survived to it. The guard
+        sits HERE, at the SINGLE chokepoint all six recovery stamps funnel
+        through (3x journal ``kind='merged'`` + 3x fallback
+        ``kind='found_on_main'``), rather than at the six call sites,
+        precisely so a future SEVENTH recovery arm cannot be added unguarded —
+        the failure mode that re-opened this defect class eight times.
+
+        Returning ``None`` means "capability not verifiably on main — withhold
+        the recovery and let the workflow actually deliver it". It is placed
+        AFTER the MP-2 ``AssertionError`` (so a malformed caller still fails
+        loudly rather than being masked by a capability withholding) and
+        BEFORE the ``_merge_recovery_basis`` write, so a withheld recovery
+        leaves ZERO side effects: no basis marker, no DONE phase, no
+        metadata-files reconcile, no ``mark_done``. All three callers are
+        already typed ``WorkflowOutcome | None`` where ``None`` already means
+        "no recovery — proceed with the phase", so the withholding needs no
+        new state machine.
+
+        The helper resolves ``main_sha`` itself, which is why the journal arm
+        (where no main SHA is in scope) needs no plumbing and both bases stay
+        uniform.
         """
         if basis not in ('journal', 'fallback') or not sha:
             raise AssertionError(
@@ -12459,6 +12530,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 f"(basis='journal'|'fallback' and a truthy sha) — got "
                 f'basis={basis!r}, sha={sha!r} (task {self.task_id})'
             )
+        if await self._delivered_checks_block(
+            self.task_id, (self.task.get('metadata') or {}),
+            site=f'workflow-recovery-{basis}',
+        ) is not None:
+            return None
         self._merge_recovery_basis = basis
         self._enter_phase(WorkflowState.DONE)
         await self._reconcile_metadata_files_for_done(override_files=files)
@@ -12491,7 +12567,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         Returns WorkflowOutcome.DONE if the branch is already merged to main AND
         there is prior implementation work.  Returns None in all other cases
-        (branch not merged, no prior work, missing worktree/git_ops, exceptions).
+        (branch not merged, no prior work, missing worktree/git_ops, exceptions,
+        or — task 3057 — the shared :meth:`_finalise_recovery_done` chokepoint
+        withholding the recovery because the task's declared
+        ``metadata.delivered_checks`` are not verifiably present on main).
         """
         row: LandedRow | None = MergeProvenance.lookup(self.task_id)
         if row is not None:
@@ -12649,8 +12728,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         already merged AND ``base_commit..wt_head`` is a non-empty diff.
         Returns ``None`` in all other cases (external worktree, not on main,
         on main but a zero-diff branch — a fresh, re-dispatched, or
-        otherwise stale/unadvanced branch point) so the caller proceeds with
-        the normal execute/verify/review loop.
+        otherwise stale/unadvanced branch point, or — task 3057 — the
+        chokepoint withholding the recovery because the task's declared
+        ``metadata.delivered_checks`` are not verifiably present on main) so
+        the caller proceeds with the normal execute/verify/review loop.
         """
         if self._worktree_external:
             return None
@@ -12716,8 +12797,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         Returns ``WorkflowOutcome.DONE`` (via the shared
         :meth:`_finalise_recovery_done` chokepoint, MP-2) when the branch is
         already merged AND there is prior implementation work. Returns
-        ``None`` in all other cases (not an ancestor, or a spurious merge
-        signal) so the caller proceeds with the merge-retry loop.
+        ``None`` in all other cases (not an ancestor, a spurious merge
+        signal, or — task 3057 — the chokepoint withholding the recovery
+        because the task's declared ``metadata.delivered_checks`` are not
+        verifiably present on main) so the caller proceeds with the
+        merge-retry loop, which is already how ``_run_merge_phase`` reads a
+        ``None`` result.
         """
         row: LandedRow | None = MergeProvenance.lookup(self.task_id)
         if row is not None:
