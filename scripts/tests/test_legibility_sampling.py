@@ -302,6 +302,118 @@ class TestDedupeShapes:
         assert kept_clone.score == 3
 
 
+class TestSampleResultAccounting:
+    """``SampleResult`` accounts for EVERY record the sampler was handed.
+
+    Task 3270. Two facts the operator-facing summary line (and the
+    total-suppression predicate ``not selected and budget_skipped > 0``)
+    rest on:
+
+      (i) ``total_records`` is the number of records handed to the sampler
+          — one per enumerated session in both production callers, which is
+          what lets the summary label it "enumerated".
+      (ii) CANDIDATE CONSERVATION: every record that reached the budget
+           phase ends up in exactly one of ``selected`` or
+           ``budget_skipped``. That equality is what makes ``selected == []
+           and budget_skipped > 0`` provably mean "candidates existed and
+           were ALL discarded on budget" rather than "there was nothing to
+           sample" — so the predicate's premise is machine-checked here
+           instead of assumed at the call site.
+
+    The batch is deliberately mixed so every accounting bucket is non-zero:
+    2 zero-signal records dropped, 1 clone collapsed, 2 candidates selected
+    and 2 budget-skipped, out of 7 handed in. Costs are injected via
+    ``cost_fn`` (the same convention as the sibling budget-algebra classes)
+    so the squeeze is explicit and hand-derivable rather than dependent on
+    real digest sizes.
+    """
+
+    _COST = staticmethod(lambda r: r.size_bytes)
+
+    def _config(self, max_bytes):
+        return config_mod.LegibilityConfig(
+            project_id='dark_factory',
+            project_root='/home/leo/src/dark-factory',
+            escalation_port=8103,
+            cwd_prefixes=['/home/leo/src/dark-factory'],
+            budgets=config_mod.Budgets(max_daily_digest_bytes=max_bytes),
+            sampling=config_mod.Sampling(top_fraction=0.12, per_stratum_min=2),
+        )
+
+    def _build_records(self):
+        """7 records; every stratum's survivors all reach the candidate stage.
+
+        - 'recon' (3): two clones (collapse to the higher scorer) + one
+          structurally distinct record -> 2 survivors, both candidates,
+          both reserved. Priced at 200_000 each, so the group cannot fit.
+        - 'interactive' (4): two zero-signal records (dropped before the
+          budget phase) + two distinct real-signal records -> 2 survivors,
+          both candidates, both reserved. Priced at 1_000 each, so the
+          group fits.
+        """
+        return [
+            _scored(
+                'recon-clone-a', 'recon', mod.SignalCounts(tool_error=3),
+                '## Reconciliation Run\nDate: 2026-07-10\n', 200_000,
+            ),
+            _scored(
+                'recon-clone-b', 'recon', mod.SignalCounts(tool_error=2),
+                '## Reconciliation Run\nDate: 2026-07-11\n', 200_000,
+            ),
+            _scored(
+                'recon-distinct', 'recon', mod.SignalCounts(self_correct=1, not_found=4),
+                'A completely different opening about something else entirely.', 200_000,
+            ),
+            _scored('quiet-a', 'interactive', mod.SignalCounts(), 'nothing went wrong here', 1_000),
+            _scored('quiet-b', 'interactive', mod.SignalCounts(), 'all green, no surprises', 1_000),
+            _scored('human-a', 'interactive', mod.SignalCounts(tool_error=9), 'human turn one', 1_000),
+            _scored('human-b', 'interactive', mod.SignalCounts(not_found=8), 'human turn two', 1_000),
+        ]
+
+    def test_total_records_counts_every_record_handed_to_the_sampler(self):
+        records = self._build_records()
+        result = mod.stratified_sample(records, self._config(3_000), cost_fn=self._COST)
+        assert result.total_records == len(records) == 7
+
+    def test_every_candidate_is_either_selected_or_budget_skipped(self):
+        records = self._build_records()
+        result = mod.stratified_sample(records, self._config(3_000), cost_fn=self._COST)
+
+        # The squeeze really did bite (otherwise the conservation law below
+        # would hold trivially with budget_skipped == 0).
+        assert result.zero_signal_dropped == 2
+        assert result.dedupe_collapsed == 1
+        assert {r.path.stem for r in result.selected} == {'human-a', 'human-b'}
+        assert result.budget_skipped == 2
+
+        candidates = (
+            result.total_records - result.zero_signal_dropped - result.dedupe_collapsed
+        )
+        assert candidates == 4
+        assert len(result.selected) + result.budget_skipped == candidates
+
+    def test_total_suppression_is_distinguishable_from_nothing_to_sample(self):
+        """The predicate itself, on the two states it must tell apart."""
+        records = self._build_records()
+
+        # Budget squeezed below even the cheap group: real candidates existed
+        # and every one was discarded on budget.
+        suppressed = mod.stratified_sample(records, self._config(10), cost_fn=self._COST)
+        assert suppressed.selected == []
+        assert suppressed.budget_skipped == 4
+        assert (not suppressed.selected and suppressed.budget_skipped > 0) is True
+
+        # Nothing but zero-signal records: no candidate ever reached the
+        # budget phase, so the SAME empty selection must NOT read as
+        # suppression.
+        quiet = [r for r in records if r.score == 0]
+        quiet_result = mod.stratified_sample(quiet, self._config(300_000), cost_fn=self._COST)
+        assert quiet_result.selected == []
+        assert quiet_result.budget_skipped == 0
+        assert quiet_result.total_records == 2
+        assert (not quiet_result.selected and quiet_result.budget_skipped > 0) is False
+
+
 class TestStratifiedSampleBoundary:
     """§8.4 boundary fixture: ~100x size variance, clone shapes, several
     zero-signal records, and one TINY stratum. Drives the PURE
