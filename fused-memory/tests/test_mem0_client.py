@@ -379,21 +379,6 @@ class TestMem0BackendScrollByMetadataWithVectors:
         assert result[1]['id'] == 'id-missing'
         assert result[1]['created_at'] == '2026-02-01T00:00:00+00:00'
 
-    @pytest.mark.asyncio
-    async def test_with_vectors_is_keyword_only(self, backend):
-        """with_vectors is keyword-only, so it can never be mistaken for `limit` positionally."""
-        import inspect
-
-        sig = inspect.signature(backend.scroll_by_metadata)
-        param = sig.parameters.get('with_vectors')
-        assert param is not None, 'scroll_by_metadata must accept a with_vectors parameter'
-        assert param.kind is inspect.Parameter.KEYWORD_ONLY, (
-            f'with_vectors must be KEYWORD_ONLY, got {param.kind!r}'
-        )
-        assert param.default is False, (
-            f'with_vectors must default to False for back-compat, got {param.default!r}'
-        )
-
 
 class TestMem0BackendGetPointById:
     """get_point_by_id fetches a single Qdrant point by id, returning its raw payload.

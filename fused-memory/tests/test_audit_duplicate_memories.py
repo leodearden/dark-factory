@@ -2617,6 +2617,109 @@ class TestCliBackCompat:
         assert args.no_metrics is True
 
 
+class TestCategoriesFlagRejectsUnsupportedNames:
+    """An unscrollable category must fail loudly, not report a clean zero sweep.
+
+    Only the three Mem0-backed categories live in Qdrant. A Graphiti-backed or
+    misspelled name scrolls nothing, so without a parse-time guard the run
+    reports a spotless corpus it never actually looked at -- a silent no-op in
+    a module whose whole ethos is that lost recall must be a counted metric.
+    """
+
+    @pytest.mark.parametrize('bad', [
+        'decisions_and_rationale',  # Graphiti-backed, plausible, and wrong
+        'entities_and_relations',
+        'temporal_facts',
+        'procedural-knowledge',     # hyphen typo
+        'nonsense',
+    ])
+    def test_unsupported_category_exits_at_parse_time(self, bad, capsys):
+        with pytest.raises(SystemExit) as exc:
+            _build_parser().parse_args(['--project-id', 'p', '--categories', bad])
+
+        assert exc.value.code == 2
+        message = capsys.readouterr().err
+        assert bad in message, 'the rejection must name the offending value'
+        for supported in _ALL_CATEGORIES:
+            assert supported in message, (
+                f'the rejection must name the supported category {supported!r} '
+                'so the operator can fix the invocation without reading source'
+            )
+
+    def test_a_valid_subset_is_still_accepted(self):
+        """The guard rejects unknowns without narrowing legitimate use."""
+        args = _build_parser().parse_args(
+            ['--project-id', 'p', '--categories', _OS],
+        )
+        assert list(args.categories) == [_OS]
+
+
+@pytest.mark.asyncio
+class TestRepeatedCategoryDoesNotDoubleIngest:
+    """A repeated --categories value must not make a record its own duplicate.
+
+    Ingesting one category twice appends a second copy of every record under
+    the SAME id. The copies are byte-identical, so they cluster at ratio 1.0
+    and pick_survivor returns one copy as survivor and the other -- carrying
+    that same id -- as a loser. Under --apply the id lands in delete_candidates
+    and the only copy of the record is destroyed, breaking the documented
+    "a survivor is always retained per cluster" carve-out. It also doubles
+    every metric denominator.
+    """
+
+    async def test_fetch_memories_skips_an_already_scanned_category(self):
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        memory = MagicMock()
+        memory.mem0 = MagicMock()
+        memory.mem0.scroll_by_metadata = _scroll_mock({
+            _PK: [_raw('m1', _VENV_GOTCHA_A, '2026-01-01T00:00:00+00:00')],
+        })
+
+        records, scan_stats = await fetch_memories(
+            memory, 'p', categories=(_PK, _PK, _PK),
+        )
+
+        assert memory.mem0.scroll_by_metadata.await_count == 1, (
+            'a category already in scan_stats must not be re-scrolled'
+        )
+        assert [r['id'] for r in records] == ['m1'], (
+            'the corpus must hold one copy per id, not one per repetition'
+        )
+        assert scan_stats[_PK]['scanned'] == 1, 'the denominator must not double'
+
+    async def test_run_dedupes_before_the_scroll(self, monkeypatch, tmp_path):
+        _install_run_doubles(monkeypatch, {_PK: [_raw('m1', _VENV_GOTCHA_A)]})
+        args = _build_parser().parse_args([
+            '--project-id', 'p', '--metrics-root', str(tmp_path),
+            '--categories', _PK, _PN, _PK,
+        ])
+        await _run(args)
+
+        calls = _FakeMemoryService.instances[-1].mem0.scroll_calls
+        assert [c['filters']['category'] for c in calls] == [_PK, _PN], (
+            'the repeat is dropped and the caller-supplied order is preserved'
+        )
+
+    async def test_a_repeated_category_never_makes_a_record_its_own_loser(
+        self, monkeypatch, tmp_path,
+    ):
+        """The end-to-end consequence: --apply must not delete the last copy."""
+        raw = {_PK: [_raw('m1', _VENV_GOTCHA_A, '2026-01-01T00:00:00+00:00')]}
+        _install_run_doubles(monkeypatch, raw)
+        args = _build_parser().parse_args([
+            '--project-id', 'p', '--metrics-root', str(tmp_path), '--apply',
+            '--categories', _PK, _PK,
+        ])
+        rc = await _run(args)
+        service = _FakeMemoryService.instances[-1]
+
+        assert service.deleted == [], (
+            'a lone record duplicated only by a repeated flag is not a duplicate'
+        )
+        assert rc == 1, 'no actionable candidates, so the empty-plan guard refuses'
+
+
 # --- _run wiring doubles -----------------------------------------------------
 
 def _fake_config(t_high: float | None = 0.9):

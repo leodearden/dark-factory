@@ -1219,6 +1219,13 @@ async def fetch_memories(
     scan_stats: dict[str, dict[str, int]] = {}
 
     for category in categories:
+        # Defense in depth against a repeated category (the CLI already
+        # de-duplicates): re-scrolling one appends a second copy of every
+        # record under the SAME id, which self-clusters and makes the id its
+        # own delete candidate. Skipping is safe -- scan_stats already holds
+        # that category's counts, so nothing is lost from the disclosure.
+        if category in scan_stats:
+            continue
         raw_records = await memory.mem0.scroll_by_metadata(
             scope, {'category': category}, limit=scan_limit, with_vectors=with_vectors,
         ) or []
@@ -1476,7 +1483,13 @@ async def _run(args: argparse.Namespace) -> int:
     if args.config:
         os.environ['CONFIG_PATH'] = str(args.config)
 
-    categories = tuple(args.categories)
+    # De-duplicate while preserving the caller's order. A repeated
+    # --categories value would otherwise ingest the same Qdrant points twice
+    # under one id; the two identical copies cluster at ratio 1.0 and
+    # pick_survivor hands back the second copy as a LOSER, so --apply would
+    # delete the id that is also the survivor -- i.e. the last copy of the
+    # record. It also doubles every metric denominator.
+    categories = tuple(dict.fromkeys(args.categories))
     stamp = run_stamp()
 
     config = _schema.FusedMemoryConfig()
@@ -1621,7 +1634,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         '--categories', nargs='+', default=list(_ALL_CATEGORIES),
-        help=f'Mem0 categories to sweep (default: {" ".join(_ALL_CATEGORIES)})',
+        choices=list(_ALL_CATEGORIES),
+        help=f'Mem0 categories to sweep (default: {" ".join(_ALL_CATEGORIES)}). '
+             'Only Mem0-backed categories are accepted; a Graphiti-backed or '
+             'unknown name is rejected at parse time rather than silently '
+             'scrolling an empty corpus and reporting a clean sweep.',
     )
     parser.add_argument(
         '--ann-top-k', dest='ann_top_k', type=int, default=_DEFAULT_ANN_TOP_K,
