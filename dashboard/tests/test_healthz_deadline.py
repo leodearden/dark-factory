@@ -230,22 +230,29 @@ async def test_healthz_reports_healthy_when_all_dbs_respond(dashboard_config):
     config = dashboard_config
     _make_real_dbs(config)
     pool = DbPool()
-    request = _make_healthz_request(config, pool)
+    try:
+        request = _make_healthz_request(config, pool)
 
-    resp, _elapsed = await _call_healthz(request, hard_cap=8.0)
-    body = _body(resp)
+        resp, _elapsed = await _call_healthz(request, hard_cap=8.0)
+        body = _body(resp)
 
-    assert resp.status_code == 200
-    assert body['status'] == 'healthy'
-    checks = body['checks']
-    assert checks['db_reconciliation'] == 'ok'
-    assert checks['db_write_journal'] == 'ok'
-    assert checks['db_runs'] == 'ok'
-    assert set(checks['threads']) == {'count', 'limit', 'ok'}
-    assert 'open' in checks['connections']
-    assert 'uptime_seconds' in checks
-
-    await pool.close_all()
+        assert resp.status_code == 200
+        assert body['status'] == 'healthy'
+        checks = body['checks']
+        assert checks['db_reconciliation'] == 'ok'
+        assert checks['db_write_journal'] == 'ok'
+        assert checks['db_runs'] == 'ok'
+        assert set(checks['threads']) == {'count', 'limit', 'ok'}
+        assert 'open' in checks['connections']
+        assert 'uptime_seconds' in checks
+        assert checks['budget_seconds'] == app_module._HEALTHZ_TOTAL_BUDGET
+        assert checks['deadline_exceeded'] is False
+    finally:
+        # A real DbPool's aiosqlite connections each own a non-daemon worker
+        # thread — without this in a `finally`, an assertion failure above
+        # (e.g. the new-key RED before step-10 lands) leaks those threads and
+        # hangs process/session teardown rather than just failing the test.
+        await pool.close_all()
 
 
 # ---------------------------------------------------------------------------
@@ -399,3 +406,53 @@ async def test_healthz_returns_verdict_when_cursor_cleanup_blocks(dashboard_conf
     assert checks['db_reconciliation'] == 'timeout'
     assert checks['db_write_journal'] == 'timeout'
     assert checks['db_runs'] == 'timeout'
+
+
+# ---------------------------------------------------------------------------
+# step-9 / step-10: /healthz must STATE its budget and flag deadline expiry,
+# not just enforce it silently
+# ---------------------------------------------------------------------------
+
+
+async def test_healthz_states_its_budget_and_flags_deadline_expiry(dashboard_config):
+    """An operator reading a 503 must be able to see the budget, not just infer it.
+
+    `checks['db_x'] == 'timeout'` alone cannot distinguish "this DB is slow"
+    from "the handler ran out of its own budget", nor reveal what that
+    budget was — a fact the handler already has in a variable. Mixed
+    scenario (one blocking DB, two real responsive temp DBs via a hybrid
+    pool) also re-confirms a blown probe does not poison its neighbours.
+    """
+    config = dashboard_config
+    _make_real_dbs(config)
+    real_pool = DbPool()
+    try:
+        write_journal_conn = await real_pool.get(config.write_journal_db)
+        runs_conn = await real_pool.get(config.runs_db)
+        pool = _BlockingPool(
+            {
+                config.reconciliation_db: _BlockingConn(block_on='execute'),
+                config.write_journal_db: write_journal_conn,
+                config.runs_db: runs_conn,
+            }
+        )
+        request = _make_healthz_request(config, pool)
+
+        resp, elapsed = await _call_healthz(request, hard_cap=8.0)
+        body = _body(resp)
+
+        assert resp.status_code == 503
+        assert body['status'] == 'degraded'
+        assert elapsed < 5.0, f'elapsed {elapsed:.3f}s >= 5.0s — verdict undeliverable to curl --max-time 5'
+        checks = body['checks']
+        assert checks['db_reconciliation'] == 'timeout'
+        assert checks['db_write_journal'] == 'ok'
+        assert checks['db_runs'] == 'ok'
+        assert checks['budget_seconds'] == app_module._HEALTHZ_TOTAL_BUDGET
+        assert checks['deadline_exceeded'] is True
+    finally:
+        # Same rationale as the pre-2 characterization test above: real_pool
+        # owns two real aiosqlite connections, each a non-daemon worker
+        # thread. Skipping close_all() on assertion failure (e.g. the
+        # pre-step-10 RED) leaks those threads and hangs process teardown.
+        await real_pool.close_all()
