@@ -287,11 +287,13 @@ check`, the asyncmock/bare-MagicMock style checks on staged test files, and
 across all three if the change touches a shared dependency like `shared` or
 `escalation`). That stage is path-filtered since task 2551: a commit
 staging no `.py` files skips pyright entirely and finishes in seconds
-(`pre-commit: pyright skipped (no Python changes)`). A commit that does
-stage Python changes can comfortably exceed two minutes — give those a
-timeout of at least `300000`ms (or run detached via `setsid` and poll)
-rather than letting a default 2-minute timeout kill it mid-hook;
-docs/plans-only commits are exempt.
+(`pre-commit: pyright skipped (no Python changes)`), and a staged `.py`
+outside every one of those prefixes (e.g. `scripts/`, a root-level
+`conftest.py`) skips it too — silently, with no such line printed. A
+commit that does stage Python under a configured package can comfortably
+exceed two minutes — give those a timeout of at least `300000`ms (or run
+detached via `setsid` and poll) rather than letting a default 2-minute
+timeout kill it mid-hook; the two skip cases above need no bumped timeout.
 Never `--no-verify` this hook to skip pyright/ruff on a code change; the
 two narrow documented exceptions are the *pre-merge-commit* emergency
 bypass (§5) and a **docs-only** commit landing under index-lock contention

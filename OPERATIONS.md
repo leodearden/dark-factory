@@ -1083,11 +1083,17 @@ directly, not just interactive sessions. Treat it accordingly:
     This is the 3x worst case and can comfortably exceed two minutes.
   - **Staged `.py` under exactly one of `fused-memory`, `orchestrator`,
     or `dashboard`** — pyright runs once, for that package only.
+  - **Staged `.py` outside every prefix above** (e.g. `scripts/`, a
+    root-level `conftest.py`) — pyright is skipped for the whole commit,
+    and unlike the no-Python case the hook prints *nothing*, so there is
+    no signal that it was skipped. This over-narrowing is deliberate
+    (root-level Python is itself unconfigured for pyright); if the changed
+    file is imported by a package, run `uv run pyright` there by hand.
 
-  When the commit stages Python changes, pass a generous timeout (five
-  minutes or more) to whatever you use to run commit commands, or run it
-  detached and poll, rather than letting a default timeout kill it
-  mid-hook.
+  In the two middle cases — the only ones that actually invoke pyright —
+  pass a generous timeout (five minutes or more) to whatever you use to
+  run commit commands, or run it detached and poll, rather than letting a
+  default timeout kill it mid-hook.
 - **Never run `git stash`** in the main checkout: the stash stack is
   consumed by the merge worker's own advance path, so a stash you push can
   be popped out from under you by an unrelated process. Park work-in-progress
