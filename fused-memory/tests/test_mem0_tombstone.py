@@ -15,6 +15,8 @@ Two units live in that module:
 
 import json
 import logging
+import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 
@@ -123,6 +125,85 @@ class TestIsProtectedMirrorRecord:
         source = inspect.getsource(recon_pool_map)
         assert 'import fused_memory' not in source
         assert 'from fused_memory' not in source
+
+
+# Probe run in a FRESH interpreter by TestReconPoolMapIsImportFreeLeaf: import
+# the package the leaf sits in, snapshot the loaded ``fused_memory.*`` modules,
+# import the leaf, snapshot again. The delta is exactly what importing the leaf
+# costs — measured, not read off the source text.
+_LEAF_IMPORT_PROBE = """
+import json
+import sys
+
+import fused_memory.reconciliation
+
+base = {m for m in sys.modules if m.startswith('fused_memory')}
+
+import fused_memory.reconciliation.recon_pool_map  # noqa: F401
+
+after = {m for m in sys.modules if m.startswith('fused_memory')}
+print(json.dumps({'base': sorted(base), 'delta': sorted(after - base)}))
+"""
+
+
+class TestReconPoolMapIsImportFreeLeaf:
+    """``recon_pool_map`` must stay a genuine import-free leaf.
+
+    That leaf-ness is what lets BOTH sides of the one-way
+    ``summary_pool -> mem0_tombstone`` edge reach the same cycle_summary
+    discriminator literals (see
+    :meth:`TestIsProtectedMirrorRecord.test_discriminators_are_single_sourced_not_copied`),
+    instead of keeping private copies "in sync by convention". Re-introducing
+    an intra-package import here re-creates the circular import documented in
+    ``recon_pool_map``'s own docstring and would force those copies back.
+
+    This asserts on OBSERVED RUNTIME IMPORTS, not on source text. It replaces
+    an ``inspect.getsource`` substring guard that was both brittle (a doc
+    cleanup touching the module's own near-miss prose about ``from
+    fused_memory`` broke the build without any real regression) and incomplete
+    (relative, dynamic and line-broken imports all re-created the cycle while
+    keeping it green). Same class of test this repo removed once already in
+    da8e5a4c96.
+    """
+
+    def test_importing_the_leaf_loads_no_other_fused_memory_module(self):
+        proc = subprocess.run(
+            [sys.executable, '-c', _LEAF_IMPORT_PROBE],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+        # (a) A probe that died on import must fail LOUDLY. Checking this
+        # first is what stops an empty delta from vacuously passing.
+        assert proc.returncode == 0, (
+            'the leaf-import probe did not run to completion — this test must '
+            'never pass vacuously.\n'
+            f'returncode: {proc.returncode}\nstdout: {proc.stdout}\n'
+            f'stderr: {proc.stderr}'
+        )
+        stdout_lines = [line for line in proc.stdout.splitlines() if line.strip()]
+        assert stdout_lines, f'probe produced no output.\nstderr: {proc.stderr}'
+        observed = json.loads(stdout_lines[-1])
+
+        # (b) Importing the leaf pulls in NO other fused_memory module. Catches
+        # absolute, relative AND dynamic imports alike.
+        assert observed['delta'] == ['fused_memory.reconciliation.recon_pool_map'], (
+            'recon_pool_map is no longer an import-free leaf; importing it now '
+            f'also loads {sorted(set(observed["delta"]) - {"fused_memory.reconciliation.recon_pool_map"})}. '
+            'It is imported by BOTH summary_pool and mem0_tombstone to '
+            'single-source the cycle_summary discriminators — see its module '
+            'docstring for the circular import this prevents.'
+        )
+
+        # (c) The two package __init__s the leaf sits under stay import-free
+        # too (1 and 6 lines today). If a future task legitimately makes a
+        # parent non-leaf, THIS is the intended signal.
+        assert observed['base'] == ['fused_memory', 'fused_memory.reconciliation'], (
+            'a package __init__ above recon_pool_map stopped being '
+            f'import-free; merely importing fused_memory.reconciliation now '
+            f'loads {observed["base"]}.'
+        )
 
 
 _NOW = datetime(2026, 7, 30, 12, 0, 0, tzinfo=UTC)
