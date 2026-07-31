@@ -50,6 +50,7 @@ import json
 import logging
 import os
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -394,6 +395,77 @@ class StatusFetchUnavailable(Exception):
     malformed payload. A dedicated exception (rather than letting an
     arbitrary one propagate) lets `compute_tasks_landed` -- and any other
     caller -- catch fetch failures deterministically."""
+
+
+def extract_done_count(payload) -> int:
+    """Count `"done"` values in a get_statuses payload, or raise
+    `StatusFetchUnavailable` if *payload* is not a usable get_statuses
+    envelope.
+
+    This is the SOLE place a get_statuses payload is turned into a number,
+    and it exists because the idiom it replaces silently fabricated
+    baselines. Both `compute_tasks_landed` below and `census.run_census`
+    used to inline `sum(1 for v in (payload.get("statuses") or {}).values()
+    if v == "done")`. That `or {}` swallowed *every* unusable payload into a
+    done-count of 0 -- no warning, no exception, no way to tell a real
+    empty project from a failed call. fused-memory's `@mcp_tool_errors`
+    returns its `{"error", "error_type"}` dict on an `isError: false`
+    JSON-RPC response, so `_extract_tool_result` unwraps it as though it
+    were a genuine result and the old idiom read it as 0. That fabricated 0
+    was persisted as a real census baseline on 2026-07-24 and 2026-07-31,
+    after which condition (b) computed `current_done - 0` (~2870, far over
+    its 120 threshold) and fired every ~7 days (task 3291).
+
+    `{"statuses": {}}` is deliberately a VALID done-count of 0: a project
+    with no done tasks is a real, expected state, and
+    `census.advance_census_state`'s contract explicitly guarantees a real 0
+    is never dropped as falsy. The distinction that matters is
+    presence-of-shape, not emptiness-of-content -- only a missing or
+    non-mapping `statuses` key, a non-dict payload, or the tool-error
+    envelope is treated as unavailable.
+
+    Note this strictness deliberately lives HERE and not in
+    `_extract_tool_result`: that unwrapper is shared with
+    `census._post_mcp_tool_call`, which serves `submit_task` and
+    `escalate_info`, and those callers legitimately receive and inspect the
+    `{"error": ...}` dict (submit_task's documented rejection shape).
+    Raising there would break unrelated paths; raising at the
+    get_statuses-specific boundary closes the hole at both call sites at
+    once without touching them.
+
+    Raises:
+        StatusFetchUnavailable: with a message naming the offending shape --
+            or quoting the server's own `error` text -- so the operator sees
+            the real cause rather than a generic complaint.
+    """
+    if not isinstance(payload, dict):
+        raise StatusFetchUnavailable(
+            f"get_statuses payload is not a dict (got {type(payload).__name__}): {payload!r}"
+        )
+
+    # The fused-memory tool-error envelope, checked before the shape
+    # complaint so the operator sees the actual server-side reason (e.g.
+    # "project_root must be a non-empty absolute path") instead of merely
+    # being told a `statuses` key was missing.
+    if "statuses" not in payload and "error" in payload:
+        raise StatusFetchUnavailable(
+            f"get_statuses returned a tool-error envelope "
+            f"({payload.get('error_type') or 'error'}): {payload.get('error')!r}"
+        )
+
+    if "statuses" not in payload:
+        raise StatusFetchUnavailable(
+            f"get_statuses payload has no 'statuses' key (keys: {sorted(payload)})"
+        )
+
+    statuses = payload["statuses"]
+    if not isinstance(statuses, Mapping):
+        raise StatusFetchUnavailable(
+            f"get_statuses 'statuses' is not a mapping "
+            f"(got {type(statuses).__name__}): {statuses!r}"
+        )
+
+    return sum(1 for status in statuses.values() if status == "done")
 
 
 def compute_tasks_landed(*, state: dict | None, status_fetcher) -> int | None:
