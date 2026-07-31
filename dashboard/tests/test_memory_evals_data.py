@@ -95,7 +95,7 @@ def _write_metrics(
     stamp: str,
     metrics: list[dict],
     *,
-    corpus: dict | None = None,
+    corpus: Any = _UNSET,  # default: the shared _CORPUS block
     filename: str | None = None,
     run_stamp: Any = _UNSET,  # default: the in-body stamp == *stamp*
 ) -> Path:
@@ -104,14 +104,18 @@ def _write_metrics(
     *filename* overrides the whole basename (for the stamp-less names the
     committed ``malformed/`` dir carries).  *run_stamp* overrides the in-body
     stamp; pass ``None`` explicitly to omit it entirely (the
-    ``missing_run_stamp`` degraded case).
+    ``missing_run_stamp`` degraded case).  *corpus* follows the same
+    convention — pass ``None`` explicitly to write a run with NO corpus block,
+    which the M1 schema permits and which the latest-run rule has to answer for.
     """
     body: dict[str, Any] = {
         'schema_version': 1,
         'eval_id': eval_id,
-        'corpus': dict(corpus) if corpus is not None else dict(_CORPUS),
         'metrics': list(metrics),
     }
+    resolved_corpus = _CORPUS if corpus is _UNSET else corpus
+    if resolved_corpus is not None:
+        body['corpus'] = dict(resolved_corpus)
     in_body = stamp if run_stamp is _UNSET else run_stamp
     if in_body is not None:
         body['run_stamp'] = in_body
@@ -457,6 +461,35 @@ class TestTrendsAndCurrentValues:
             'counts': {'entities_and_relations': 1204, 'temporal_facts': 588},
         }
         assert evals[1]['corpus'] == {'project_id': 'other_project', 'counts': {'temporal_facts': 7}}
+
+    def test_corpus_is_absent_when_the_latest_run_omits_it(self, tmp_path: Path) -> None:
+        """The corpus block describes the LATEST run, or it is absent.
+
+        Carrying the newest run that merely HAPPENED to have a corpus presents
+        an older run's counts as current with nothing disclosing the skew —
+        while every other latest-run scalar on the row (``current_value``,
+        ``n``, ``denominator``, ``kind``) comes from the latest run with no
+        fallback, and the module elsewhere goes out of its way to disclose
+        exactly this kind of drift (``limits.stale_for_latest_run``,
+        ``truncated``/``runs_on_disk``).  ``corpus`` is optional in M1, so
+        "this run reported no corpus" is a truthful answer; "here are last
+        week's counts, unlabelled" is not.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root = tmp_path / 'memory-evals'
+        esc_dir = tmp_path / 'escalations'
+        _write_metrics(
+            root, 'eval-a', '20260703T031500Z', [_metric('m', 'count', 1.0)],
+            corpus={'project_id': 'dark_factory', 'counts': {'temporal_facts': 3}},
+        )
+        # The newer run carries no corpus block at all.
+        _write_metrics(root, 'eval-a', '20260704T031500Z', [_metric('m', 'count', 2.0)], corpus=None)
+
+        row = build_memory_evals(root, esc_dir)['evals'][0]
+
+        assert row['latest_run_stamp'] == '20260704T031500Z'
+        assert row['corpus'] is None
 
     def test_healthy_tree_reports_no_issues(self, tmp_path: Path) -> None:
         from dashboard.data.memory_evals import build_memory_evals
@@ -1239,6 +1272,56 @@ class TestEscalationJoin:
         assert issue['kind'] == 'unknown_escalation_status'
         assert 'esc-alarmed-open' in issue['detail']
         assert set(payload) == _PAYLOAD_KEYS
+
+    def test_open_escalation_with_no_fingerprint_is_named_and_surfaced(self, tmp_path: Path) -> None:
+        """The fingerprint filter is the last place an OPEN alarm can vanish.
+
+        An absent or non-string ``dedupe_fingerprint`` cannot key the index —
+        and ``unmatched_escalations`` is derived FROM that index, so a bare
+        skip erases the escalation from the metric rows and from the
+        reverse-direction list in one move.  A live alarm that appears NOWHERE
+        in the payload is the precise blind spot the parity view exists to
+        close, and the module's own contract forbids discarding a parsed record
+        without naming it.  Unlike ``resolved``/``dismissed`` (the filter doing
+        its job) this record is genuinely open, so it is both named in
+        ``issues`` and carried into ``unmatched_escalations`` with the reason
+        it carries no link.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _join_tree(tmp_path)
+        _write_escalation(
+            esc_dir, 'esc-no-fingerprint',
+            dedupe_fingerprint=None,
+            summary='an open alarm the producer never fingerprinted',
+            timestamp=_JOIN_ESC_TIMESTAMP,
+        )
+        _write_escalation(
+            esc_dir, 'esc-bad-fingerprint',
+            # Unvalidated JSON: the field can be any type, not merely absent.
+            dedupe_fingerprint=cast(Any, {'eval': 'eval-a'}),
+            summary='an open alarm whose fingerprint is not a string',
+            timestamp=_JOIN_ESC_TIMESTAMP,
+        )
+
+        payload = build_memory_evals(root, esc_dir)
+
+        named = [i for i in payload['issues'] if i['kind'] == 'unfingerprinted_escalation']
+        assert len(named) == 2
+        details = ' '.join(i['detail'] for i in named)
+        assert 'esc-no-fingerprint' in details
+        assert 'esc-bad-fingerprint' in details
+        assert payload['issue_count'] == len(payload['issues'])
+
+        # Named in `issues` is not enough: the open alarm itself must still be
+        # visible where an operator looks for unexplained escalations.
+        unmatched = {entry['id']: entry for entry in payload['unmatched_escalations']}
+        assert unmatched['esc-no-fingerprint']['reason'] == 'no_fingerprint'
+        assert unmatched['esc-bad-fingerprint']['reason'] == 'no_fingerprint'
+        assert set(unmatched['esc-no-fingerprint']) == _UNMATCHED_KEYS
+        # The joinable records are untouched by the new path.
+        assert _only(payload['evals'][0]['metrics'], 'alarmed-open')['escalation'] is not None
+        assert unmatched['esc-unmatched']['reason'] == 'no_matching_verdict'
 
 
 # ---------------------------------------------------------------------------
@@ -2150,6 +2233,31 @@ class TestStalenessAndDegradedStates:
         assert payload['root_present'] is True
         assert payload['evals'] == []
         # No eval dirs means nothing is waiting on a verdict.
+        assert payload['issues'] == []
+        assert payload['issue_count'] == 0
+
+    def test_eval_dir_that_has_never_run_is_not_a_missing_verdict(self, tmp_path: Path) -> None:
+        """An eval dir with no runs is pre-deployment, not contract drift.
+
+        ``missing_verdicts`` answers "there are metrics on disk with nothing
+        judging them" — a real silent-failure mode.  Gating it on the eval
+        DIRECTORY existing instead of on any RUN existing fires it for a
+        freshly-registered eval that has not run yet, which is the same
+        empty-but-healthy state the absent-root case is explicitly not allowed
+        to flag.  ``_read_limits`` already draws the line at ``has_runs``; the
+        two readers must not disagree about what "never run" means, or one
+        harmless tree produces a standing issue operators learn to ignore.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root = tmp_path / 'memory-evals'
+        (root / 'e1-retrieval-health').mkdir(parents=True)
+
+        payload = build_memory_evals(root, tmp_path / 'escalations')
+
+        assert payload['root_present'] is True
+        assert [row['eval_id'] for row in payload['evals']] == ['e1-retrieval-health']
+        assert payload['evals'][0]['run_stamps'] == []
         assert payload['issues'] == []
         assert payload['issue_count'] == 0
 
