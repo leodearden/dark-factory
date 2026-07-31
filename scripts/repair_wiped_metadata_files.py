@@ -41,11 +41,26 @@ Usage:
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 from audit_wiped_metadata_files import (
     CONTRADICTED_REAL_MERGE_SHA,
     FIDELITY_FILE_LEVEL,
     WipeCandidate,
 )
+
+# Bind `shared` to the SAME checkout as this script via a __file__-relative
+# path, never a hardcoded absolute. An editable install puts the MAIN
+# checkout's shared/src on sys.path for a bare `python3`, so without this a
+# copy of this script running from a worktree would silently evaluate the lock
+# charter using the main checkout's predicate. Same reasoning and same form as
+# scripts/reviewer_redundancy_diagnostic.py:35-38 (tasks 2881/2882).
+_SHARED_SRC = Path(__file__).resolve().parent.parent / "shared" / "src"
+if str(_SHARED_SRC) not in sys.path:
+    sys.path.insert(0, str(_SHARED_SRC))
+
+from shared.locking import directory_locks  # noqa: E402
 
 
 def select_repairable_candidates(
@@ -85,3 +100,46 @@ def select_repairable_candidates(
         if candidate.plan_files_fidelity == FIDELITY_FILE_LEVEL
         and candidate.wipe_signature != CONTRADICTED_REAL_MERGE_SHA
     ]
+
+
+def plan_files_rejection_reason(candidate: WipeCandidate) -> str | None:
+    """Return why *candidate*'s plan_files cannot be written, or None if they can.
+
+    THE LOCK-CHARTER PRE-CHECK. ``_reject_directory_locks_in_update_metadata``
+    (fused-memory/src/fused_memory/middleware/task_interceptor.py:5284) rejects
+    any ``update_task`` metadata write whose ``files`` list carries a
+    DIRECTORY-classified entry, raising a ``lock_charter_error``. Discovering
+    that mid-batch gives an operator an opaque MCP failure on task N of 35;
+    pre-checking converts it into a named, attributable skip that says which
+    path is at fault, in the same summary as every other disposition.
+
+    The predicate is :func:`shared.locking.directory_locks`, IMPORTED, never
+    re-implemented. ``shared/src/shared/locking.py``'s own docstring records
+    that a drifting copy undercounting the extension allowlist by 22 entries is
+    exactly what incident #3117 was; ``fused_memory.middleware.lock_charter_guard``
+    duplicates it verbatim for the same reason. Note this correctly accepts
+    systemd ``.timer``/``.service`` units, which are in ``CODE_EXTENSIONS``.
+
+    An EMPTY (or all-blank) plan_files is rejected separately and first: there
+    is nothing to restore, and a write setting ``files`` to ``[]`` would
+    re-perform the very wipe this script exists to undo.
+
+    Measured against today's population: 0 of the 140 repairable path entries
+    trip the directory arm. This gate exists because the candidate population
+    drifts under a live wiper, not because it currently fires.
+    """
+    files = [f for f in candidate.plan_files if isinstance(f, str) and f.strip()]
+    if not files:
+        return (
+            "recovered plan_files is empty — nothing to restore (a write "
+            "setting files to [] would repeat the wipe, so none is issued)"
+        )
+
+    offenders = directory_locks(list(files))
+    if offenders:
+        return (
+            "plan_files carries directory-classified entries the interceptor's "
+            "lock charter would reject (lock_charter_error): "
+            + ", ".join(offenders)
+        )
+    return None
