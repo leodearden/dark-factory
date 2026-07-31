@@ -8915,3 +8915,87 @@ class TestTrivialPassEscalatedEventContract:
             )
         assert rec.events_of(EventType.trivial_pass_escalated) == []
         assert result.trivial is True
+
+
+class TestWithJunitxmlStr:
+    """_with_junitxml_str(cmd, junit_path) — the string wrapper around
+    parse_config_command -> with_junitxml -> render, joining verify.py's
+    established `*_str` family (_serial_pytest_str, _with_pytest_timeout_str,
+    _govern_cpu_str, _reproject_str, _cargo_scope_str).
+
+    Task 3218 part 1b. The logic previously lived inline in a closure inside
+    ``run_verification``, which made it untestable in isolation and left the
+    capability loss it can cause — a merge run that was supposed to collect
+    junit silently not collecting it — with nowhere to be reported from.
+    Extracting it gives that INFO a home at the point of ACTUAL loss, which
+    covers every cause of the no-op (raw-retained chain, OPAQUE, non-pytest),
+    not just tail preservation.
+    """
+
+    _JUNIT = '/abs/j.xml'
+
+    def test_injects_into_a_structured_pytest_command(self):
+        from orchestrator.verify import _with_junitxml_str
+
+        result = _with_junitxml_str('uv run pytest tests/', self._JUNIT)
+        assert result is not None
+        assert f'--junitxml {self._JUNIT}' in result
+
+    def test_none_input_returns_none(self):
+        from orchestrator.verify import _with_junitxml_str
+
+        assert _with_junitxml_str(None, self._JUNIT) is None
+
+    @pytest.mark.parametrize(
+        'cmd', ['ruff check src/', 'true'], ids=['non-pytest-ruff', 'opaque-true'],
+    )
+    def test_noop_is_byte_identical(self, cmd: str):
+        """The parse->render round-trip must be SKIPPED, not merely produce
+        an equal string: a from-scratch render is only argv-equivalent, so
+        the identity-check guard is what keeps a no-op byte-identical.
+        """
+        from orchestrator.verify import _with_junitxml_str
+
+        assert _with_junitxml_str(cmd, self._JUNIT) == cmd
+
+    def test_suppressed_injection_on_a_pytest_chain_is_logged(
+        self, caplog: pytest.LogCaptureFixture,
+    ):
+        """The capability loss must be VISIBLE, not silent.
+
+        A raw-retained pytest chain parses as ToolKind.PYTEST but
+        ``with_junitxml`` is a documented no-op on it — so this run was
+        expected to produce a junit report and will not. Exactly one INFO
+        record, naming the junit path and saying no report will be collected.
+        """
+        from orchestrator.verify import _with_junitxml_str
+
+        cmd = 'cd a && uv run pytest tests/ && cd ../b && uv run pytest tests/'
+        with caplog.at_level(logging.INFO, logger='orchestrator.verify'):
+            result = _with_junitxml_str(cmd, self._JUNIT)
+
+        assert result == cmd, 'the no-op must still be byte-identical'
+        records = [r for r in caplog.records if r.name == 'orchestrator.verify']
+        assert len(records) == 1, f'expected exactly one record, got {[r.message for r in records]}'
+        assert records[0].levelno == logging.INFO
+        assert self._JUNIT in records[0].getMessage()
+        assert 'junit' in records[0].getMessage().lower()
+
+    @pytest.mark.parametrize(
+        'cmd',
+        ['uv run pytest tests/', 'ruff check src/', 'true'],
+        ids=['successful-injection', 'non-pytest-ruff', 'opaque-true'],
+    )
+    def test_silent_on_the_ordinary_paths(
+        self, cmd: str, caplog: pytest.LogCaptureFixture,
+    ):
+        """No record for a successful injection, and none for a command that
+        was never eligible to produce junit in the first place — otherwise
+        the log fires on every lint/type leg and trains operators to ignore it.
+        """
+        from orchestrator.verify import _with_junitxml_str
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.verify'):
+            _with_junitxml_str(cmd, self._JUNIT)
+
+        assert [r.message for r in caplog.records if r.name == 'orchestrator.verify'] == []
