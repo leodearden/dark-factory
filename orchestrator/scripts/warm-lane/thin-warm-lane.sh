@@ -228,14 +228,20 @@ fi
 # self-clobber guard). The mount-root case is NOT caught by the under-mount
 # guard above: its trailing-slash case-match treats "$mount/" as matching
 # "$mount"/* (glob * also matches the empty tail), so the mount root alone
-# would otherwise slip through as "under" the mount ───────────────────────────
+# would otherwise slip through as "under" the mount.
+#
+# The leaf name comes from PARAMETER EXPANSION, not a `basename` fork: basename
+# is an external binary, and inside `[ ... ]` a 127 substitution yields the
+# EMPTY string WITHOUT tripping set -e, so the guard silently compares false and
+# the rm -rf below proceeds against the base dir. See README.md "Delta 7" ──────
 _self_clobber=0
 if [ -n "${REIFY_WARM_LANE_MOUNT:-}" ]; then
     _rp_mount_base="$(realpath -m "${REIFY_WARM_LANE_MOUNT}/base")"
     [ "$_rp_lane_dir" = "$_rp_mount_base" ] && _self_clobber=1
     [ "$_rp_lane_dir" = "$_rp_mount" ] && _self_clobber=1
 fi
-[ "$(basename "$_rp_lane_dir")" = "base" ] && _self_clobber=1
+_rp_lane_leaf="${_rp_lane_dir##*/}"
+[ "$_rp_lane_leaf" = "base" ] && _self_clobber=1
 if [ "$_self_clobber" = "1" ]; then
     err "Precondition guard: lane_dir resolves to (or is named) the base dir, or is the mount root — refusing to thin"
     err "  lane_dir: $_rp_lane_dir"
