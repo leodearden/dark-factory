@@ -76,18 +76,13 @@ function orchEmptyLabel(filter) {
   return `No ${head} or ${last} tasks`;
 }
 
-// Named ORCH_FILTER_API, module-unique by convention: every redux/*.js file
-// is loaded as a separate classic (non-module) <script> tag on the same page
-// (index.html), and top-level `const`/`let`/`class` bindings in classic
-// scripts share ONE global lexical scope across ALL of them. A name declared
-// by two of them aborts the second script to declare it with "Identifier 'X'
-// has already been declared" — thrown before its body runs, so this file
-// would silently leave window.DF_ORCH_FILTER undefined and downgrade every
-// empty cell to tabs.jsx's fallback label. Hence each module names its export
-// const `<MODULE>_API` and never a bare `API`; ORCH_FILTER_FACETS /
-// ORCH_FILTER_NONE_SELECTED / orchEmptyLabel are uniquely named across that
-// directory for the same reason. Guarded by
-// dashboard/tests/js/classic_script_scope.test.mjs.
+// Module-unique export const, never a bare `API` — see the
+// shared-classic-script-scope note in graph_layout.js's header, enforced by
+// dashboard/tests/js/classic_script_scope.test.mjs. A collision here would
+// leave window.DF_ORCH_FILTER undefined and downgrade every empty cell to
+// tabs.jsx's fallback label. The same rule is why this file's other top-level
+// names — ORCH_FILTER_FACETS, ORCH_FILTER_NONE_SELECTED, orchEmptyLabel — are
+// prefixed rather than generic.
 const ORCH_FILTER_API = { orchEmptyLabel };
 
 if (typeof module !== 'undefined' && module.exports) {

@@ -258,19 +258,12 @@ function layoutFlow(model, { width = 640, height = 260, nodeWidth = 14, nodePad 
   return { nodes, ribbons, width, height, colX };
 }
 
-// Named ESC_FLOW_LAYOUT_API, never a bare `API`: index.html loads this file
-// as one of several classic (non-module) <script> tags on the same page, and
-// top-level `const` bindings in classic scripts share ONE global lexical
-// scope across ALL of them. A name declared twice kills the second script to
-// declare it with "Identifier 'X' has already been declared" — thrown at
-// declaration-instantiation time, before a single statement of its body runs,
-// so the `window.DF_ESC_FLOW_LAYOUT` assignment below never happens and
-// esc_flow_diagram.jsx's top-level destructure of it gets `undefined`. That is
-// not hypothetical: this file shipped with a bare `const API` that collided
-// with graph_layout.js's, silently breaking the Workflow panel's mini-Sankey.
-// Guarded now by dashboard/tests/js/classic_script_scope.test.mjs, which loads
-// every classic script into one shared node:vm context (the sibling modules'
-// notes predate that harness and could only cite each other).
+// Module-unique export const, never a bare `API` — see the
+// shared-classic-script-scope note in graph_layout.js's header, enforced by
+// dashboard/tests/js/classic_script_scope.test.mjs. Not hypothetical here:
+// this file shipped with a bare `const API` copied from graph_layout.js, which
+// collided with graph_layout.js's own, left window.DF_ESC_FLOW_LAYOUT
+// undefined, and silently broke the Workflow panel's mini-Sankey.
 const ESC_FLOW_LAYOUT_API = { aggregateFlow, layoutFlow };
 
 if (typeof module !== 'undefined' && module.exports) {
