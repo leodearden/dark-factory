@@ -65,14 +65,19 @@ sidecar capability rows updated in the same commit):
 Both rows carry mechanical `delivered_check`s and were mirrored into 3211's
 `metadata.delivered_checks` via `update_task(metadata_mode='additive')`.
 
-## Substrate drift found at the re-walk
+## Re-walk spot-check: §6 row confirmed clean
 
-One §6 row is imprecise (conclusion unchanged, work strictly smaller than stated):
+One §6 row was re-checked at the re-walk and found accurate — no drift:
 
 - **`with_vectors` on `scroll_by_metadata`.** §6 reads "`with_vectors` not yet passed —
-  δ adds it". It *is* passed, hardcoded `with_vectors=False` at
-  `backends/mem0_client.py:454`. δ's job is to make it settable, not to introduce it.
-  Recorded on δ's binding and in δ's task text.
+  δ adds it". Confirmed on main: `scroll_by_metadata` (`backends/mem0_client.py:341-424`)
+  passes no `with_vectors` argument to `client.scroll` at all, so δ genuinely
+  introduces the parameter rather than widening an existing literal. The module's only
+  `with_vectors=False` literal belongs to a different method — `get_point_by_id`'s
+  `client.retrieve` at `backends/mem0_client.py:454` — which δ does not touch. An
+  earlier pass had it backwards, claiming §6 was imprecise; that claim has been
+  corrected on δ's binding in this manifest (task 3359). Task 3210's task text may
+  still carry the old wording, which is out of scope here.
 
 All other spot-checked rows verified clean on main: unvalidated `category: str`
 (`escalation/models.py:93`) ⇒ `eval_regression` filable; direct `EscalationQueue`
