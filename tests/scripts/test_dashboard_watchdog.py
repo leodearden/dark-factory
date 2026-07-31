@@ -1208,5 +1208,131 @@ def test_b4_the_restart_that_reaches_the_ceiling_still_escalates_next_time(
     assert rec.states[-1]["ceiling_open"] is True
 
 
+# ---------------------------------------------------------------------------
+# Ceiling-episode boundary — the trip must END, not wedge
+#
+# Invariant I4 says "no further restarts until an operator intervenes". Read
+# literally that means a state file an operator has to delete BY HAND: a
+# dashboard that fixes itself at 3am would stay unsupervised until someone
+# noticed the stale flag. The episode boundary is a self-recovered dashboard.
+# ---------------------------------------------------------------------------
+
+
+def _tripped_state(mod, restart_age: int = 60) -> dict:
+    """State with the ceiling already open and a full restart window."""
+    import time as _time
+
+    now = int(_time.time())
+    return {
+        "streak": 0,
+        "restarts": [now - restart_age] * mod.MAX_RESTARTS,
+        "ceiling_open": True,
+    }
+
+
+def test_episode_ends_when_the_dashboard_recovers(monkeypatch, state_env, queue_env):
+    """A successful probe while tripped CLEARS the trip.
+
+    There is nothing left to restart — the service is answering — so ending
+    the episode costs nothing and restores normal supervision. Leaving it open
+    would mean a dashboard that recovered on its own stays unwatched until a
+    human deletes a state file they do not know exists.
+    """
+    mod = _load_watchdog()
+    rec = _run_ticks(monkeypatch, [True], seed_state=_tripped_state(mod))
+
+    assert rec.states[-1]["ceiling_open"] is False, "the trip never clears"
+    assert rec.states[-1]["streak"] == 0
+    assert rec.actuations == [], "nothing to restart — the probe just succeeded"
+    assert rec.escalations == []
+
+
+def test_tripped_and_still_failing_stays_quiet(monkeypatch, state_env, queue_env):
+    """A dashboard that stays down stays cleanly down, with its L2 on file.
+
+    No restarts, no re-filing, and the trip stays open — the escape holds for
+    as long as the fault does.
+    """
+    mod = _load_watchdog()
+    rec = _run_ticks(monkeypatch, [False] * 20, seed_state=_tripped_state(mod))
+
+    assert rec.actuations == []
+    assert rec.escalations == []
+    assert all(s["ceiling_open"] is True for s in rec.states)
+
+
+def test_tripped_failures_do_not_bank_a_streak(monkeypatch, state_env, queue_env):
+    """The streak must NOT advance while the ceiling is open.
+
+    If 20 failing ticks banked a streak of 20, the instant a single successful
+    probe cleared the trip the very next miss would satisfy FAIL_STREAK and
+    restart immediately — the hysteresis gate bypassed by a counter that ran
+    while nobody was acting on it.
+    """
+    mod = _load_watchdog()
+    rec = _run_ticks(monkeypatch, [False] * 20, seed_state=_tripped_state(mod))
+
+    assert max(rec.streaks) == 0, f"banked a streak while tripped: {rec.streaks}"
+
+    # Recover, then fail ONCE. A banked streak would restart here.
+    rec2 = _run_ticks(monkeypatch, [True, False], recorder=rec)
+    assert rec2.actuations == [], "restarted on the first miss after recovery"
+    assert rec2.streaks[-1] == 1
+
+
+def test_dedup_is_per_episode_not_forever(monkeypatch, state_env, queue_env):
+    """A NEW storm after a recovery files a NEW L2.
+
+    The dedup exists to stop an escalation storm inside one episode, not to
+    silence the watchdog for the lifetime of the state file. A second,
+    genuinely separate outage is new information and a steward needs it.
+    """
+    import time as _time
+
+    mod = _load_watchdog()
+
+    # Episode 1: tripped, then the dashboard recovers.
+    rec = _run_ticks(monkeypatch, [True], seed_state=_tripped_state(mod))
+    assert rec.states[-1]["ceiling_open"] is False
+
+    # Time passes: the old restart epochs age out of the rolling window, so
+    # the next storm is measured on its own merits.
+    now = int(_time.time())
+    aged = _load_watchdog().load_state()
+    aged["restarts"] = [now - (mod.RATE_WINDOW_SECS + 600)] * mod.MAX_RESTARTS
+    _load_watchdog().save_state(aged)
+
+    # Episode 2: a fresh storm — MAX_RESTARTS streaks exhaust the allowance,
+    # the next one trips again.
+    rec2 = _run_ticks(
+        monkeypatch, [False] * (mod.FAIL_STREAK * (mod.MAX_RESTARTS + 1))
+    )
+
+    assert len(rec2.escalations) == 1, (
+        "a separate outage after a recovery filed no new L2 — the dedup "
+        "silenced the watchdog forever rather than for one episode"
+    )
+    assert rec2.states[-1]["ceiling_open"] is True
+
+
+def test_recovery_does_not_wipe_the_rolling_restart_window(
+    monkeypatch, state_env, queue_env
+):
+    """Clearing the trip must not also clear the restart history.
+
+    Those epochs are the evidence the ceiling is measured against. Wiping them
+    on recovery would let a dashboard alternate crash → recover → crash and
+    earn a fresh MAX_RESTARTS allowance every cycle, which is a restart storm
+    with extra steps.
+    """
+    mod = _load_watchdog()
+    tripped = _tripped_state(mod)
+    rec = _run_ticks(monkeypatch, [True], seed_state=tripped)
+
+    assert len(rec.states[-1]["restarts"]) == mod.MAX_RESTARTS, (
+        "recovery wiped the rolling window that bounds the next storm"
+    )
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))
