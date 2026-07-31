@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -1153,6 +1154,127 @@ class TestTailPreservationAllowlist:
         assert verify._scope_to_keyword(raw, 'pytest', self._FILES) == render(
             _scope_prefix_to_keyword(raw, 'pytest', self._FILES)
         )
+
+
+# ---------------------------------------------------------------------------
+# A gate-rejected multi-clause command must SAY what it dropped
+# ---------------------------------------------------------------------------
+
+
+class TestDroppedChainClausesAreLogged:
+    """Both scopers log the clauses a gate REJECT silently discards (task 3218 2b).
+
+    ``split_chain_tail`` returns ``(raw, '')`` for both "single-segment,
+    nothing to preserve" and "multi-segment, rejected", so today a caller
+    cannot tell them apart and the drop leaves no trace anywhere.
+
+    DEBUG, not the WARNING used by the reverse-dependency widening's no-op:
+    dropping a same-tool fan-out tail is INTENDED behaviour, and the root
+    ``type_check_command`` hits it on every fallback verify — a WARNING there
+    would be steady noise that trains operators to ignore the record. The
+    genuine capability loss (no junit collected) is the INFO in
+    ``verify._with_junitxml_str``.
+    """
+
+    _FILES = ['a.py']
+
+    @staticmethod
+    def _records(caplog: pytest.LogCaptureFixture, logger_name: str) -> list[str]:
+        return [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == logger_name and r.levelno == logging.DEBUG
+        ]
+
+    @pytest.mark.parametrize(
+        ('raw', 'keyword', 'dropped'),
+        [
+            (_ROOT_TYPE_CHECK_COMMAND, 'pyright', 5),
+            (_SIBLING_CHECKER_TEST_COMMAND, 'pytest', 1),
+            (_SIBLING_CHECKER_TEST_COMMAND_UNNAMED, 'pytest', 1),
+        ],
+        ids=['root-type-check-fan-out', 'pytest-named-sibling', 'pytest-unnamed-sibling'],
+    )
+    def test_plan_scoper_logs_the_drop(
+        self, raw, keyword, dropped, caplog: pytest.LogCaptureFixture,
+    ):
+        """The pytest cases are the record that makes part 1's deliberate
+        truncation non-silent: the allowlist rejects them, and this is where
+        that says so.
+        """
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.verify_plan'):
+            result = _scope_prefix_to_keyword(raw, keyword, self._FILES)
+
+        messages = self._records(caplog, 'orchestrator.verify_plan')
+        assert len(messages) == 1, f'expected exactly one record, got {messages}'
+        assert keyword in messages[0]
+        assert str(dropped) in messages[0]
+        assert result is not None
+
+    @pytest.mark.parametrize(
+        ('raw', 'keyword', 'dropped'),
+        [
+            (_ROOT_TYPE_CHECK_COMMAND, 'pyright', 5),
+            (_SIBLING_CHECKER_TEST_COMMAND, 'pytest', 1),
+            (_SIBLING_CHECKER_TEST_COMMAND_UNNAMED, 'pytest', 1),
+        ],
+        ids=['root-type-check-fan-out', 'pytest-named-sibling', 'pytest-unnamed-sibling'],
+    )
+    def test_string_scoper_logs_the_equivalent_record(
+        self, raw, keyword, dropped, caplog: pytest.LogCaptureFixture,
+    ):
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.verify'):
+            result = verify._scope_to_keyword(raw, keyword, self._FILES)
+
+        messages = self._records(caplog, 'orchestrator.verify')
+        assert len(messages) == 1, f'expected exactly one record, got {messages}'
+        assert keyword in messages[0]
+        assert str(dropped) in messages[0]
+        assert result is not None
+
+    @pytest.mark.parametrize(
+        ('raw', 'keyword'),
+        [
+            (_FM_LINT_COMMAND, 'ruff check'),
+            ('ruff check src/ --select E', 'ruff check'),
+        ],
+        ids=['tail-preserved', 'single-clause'],
+    )
+    def test_silent_when_nothing_was_dropped(
+        self, raw, keyword, caplog: pytest.LogCaptureFixture,
+    ):
+        """Neither an ACCEPT nor an unchained command may produce a record."""
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.verify_plan'):
+            _scope_prefix_to_keyword(raw, keyword, self._FILES)
+        assert self._records(caplog, 'orchestrator.verify_plan') == []
+
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.verify'):
+            verify._scope_to_keyword(raw, keyword, self._FILES)
+        assert self._records(caplog, 'orchestrator.verify') == []
+
+    @pytest.mark.parametrize(
+        ('raw', 'keyword'),
+        [
+            (_ROOT_TYPE_CHECK_COMMAND, 'pyright'),
+            (_ROOT_TEST_COMMAND, 'pytest'),
+            (_SIBLING_CHECKER_TEST_COMMAND, 'pytest'),
+            (_SIBLING_CHECKER_TEST_COMMAND_UNNAMED, 'pytest'),
+            (_FM_LINT_COMMAND, 'ruff check'),
+            ('ruff check src/ --select E', 'ruff check'),
+            ('mypy src/', 'ruff check'),
+            ('true', 'pytest'),
+        ],
+        ids=[
+            'root-type-check', 'root-test', 'pytest-named-sibling',
+            'pytest-unnamed-sibling', 'fm-lint', 'single-clause', 'opaque-mypy', 'no-op-true',
+        ],
+    )
+    def test_logging_is_the_only_observable_change(self, raw, keyword):
+        """Both scopers' returned commands stay byte-identical, and in lockstep."""
+        string_scoped = verify._scope_to_keyword(raw, keyword, self._FILES)
+        plan_scoped = render(_scope_prefix_to_keyword(raw, keyword, self._FILES))
+        assert string_scoped == plan_scoped
 
 
 # ---------------------------------------------------------------------------

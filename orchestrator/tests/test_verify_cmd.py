@@ -22,6 +22,7 @@ from orchestrator.verify_cmd import (
     apply_pytest_numprocesses,
     cargo_scope,
     govern_cpu,
+    has_unpreserved_chain_clauses,
     parse_config_command,
     render,
     reproject,
@@ -1453,3 +1454,102 @@ class TestGateMatchesToolAtArgvHead:
         assert prefix + tail == raw
         if not preserves:
             assert prefix == raw, 'a REJECT returns the whole untouched original'
+
+
+class TestHasUnpreservedChainClauses:
+    """has_unpreserved_chain_clauses(raw, tail) — the DIAGNOSTIC-ONLY predicate.
+
+    Task 3218 part 2b. ``split_chain_tail`` returns ``(raw, '')`` for BOTH
+    "single-segment, nothing to preserve" and "multi-segment, gate rejected",
+    so a caller cannot tell them apart and a dropped clause is invisible.
+    This predicate distinguishes them, and gates a log line — nothing else.
+    It deliberately feeds no control-flow decision, which is what makes
+    best-effort acceptable: a miss on an exotic spelling costs a missing log
+    record, never a behaviour change.
+    """
+
+    @pytest.mark.parametrize(
+        ('raw', 'tail'),
+        [
+            (_FM_LINT_COMMAND, '&& python3 fused-memory/scripts/check_x.py fused-memory/tests'),
+            ('ruff check src/ && python3 y.py', '&& python3 y.py'),
+        ],
+        ids=['fm-lint-chain', 'two-clause-chain'],
+    )
+    def test_false_whenever_a_tail_was_preserved(self, raw, tail):
+        """Nothing was dropped — even though *raw* is plainly a multi-clause chain."""
+        assert has_unpreserved_chain_clauses(raw, tail) is False
+
+    @pytest.mark.parametrize(
+        'raw', ['ruff check src/ --select E', ''], ids=['single-clause', 'empty'],
+    )
+    def test_false_for_a_single_clause_command(self, raw):
+        """A REJECT with nothing to preserve must NOT be reported as a drop.
+
+        This is the discrimination the predicate exists for: without it every
+        unchained command would log a spurious "clauses dropped" record.
+        """
+        assert has_unpreserved_chain_clauses(raw, '') is False
+
+    def test_true_for_a_gate_rejected_and_chain(self):
+        """The root type-check fan-out — five clauses dropped, silently, today."""
+        assert has_unpreserved_chain_clauses(_ROOT_TYPE_CHECK_COMMAND, '') is True
+
+    def test_true_for_the_unspaced_and_form(self):
+        """`a&&b` shlex-splits to one token, so token equality misses it.
+
+        Caught by the ``split_top_level_and`` disjunct, which is quote-aware
+        and does not care about whitespace around the operator.
+        """
+        assert has_unpreserved_chain_clauses('a&&b', '') is True
+        assert shlex.split('a&&b') == ['a&&b'], 'premise: token equality cannot see this'
+
+    @pytest.mark.parametrize(
+        'raw',
+        [
+            'ruff check src/ || echo fail',
+            'ruff check src/ ; echo done',
+            'ruff check src/ | tee log',
+        ],
+        ids=['or', 'semicolon', 'pipe'],
+    )
+    def test_true_for_non_and_chain_operators(self, raw):
+        """Caught by ``_CHAIN_OPERATOR_TOKENS``, which — unlike the gate's
+        narrower ``_NON_AND_CHAIN_TOKENS`` — deliberately includes `&&` too.
+        """
+        assert has_unpreserved_chain_clauses(raw, '') is True
+
+    def test_true_for_an_unbalanced_quote(self):
+        """Undecodable: log loudly rather than stay silent.
+
+        The predicate only gates a log record, so the loud direction is free.
+        """
+        assert has_unpreserved_chain_clauses('ruff check "x && y.py', '') is True
+
+    @pytest.mark.parametrize(
+        ('raw', 'keyword'),
+        [
+            (_ROOT_TYPE_CHECK_COMMAND, 'pyright'),
+            (_ROOT_TEST_COMMAND, 'pytest'),
+            (_SIBLING_CHECKER_TEST_COMMAND, 'pytest'),
+            (_SIBLING_CHECKER_TEST_COMMAND_UNNAMED, 'pytest'),
+            (_FM_LINT_COMMAND, 'ruff check'),
+            ('ruff check src/ --select E', 'ruff check'),
+        ],
+        ids=[
+            'root-type-check-rejected',
+            'root-test-rejected',
+            'pytest-named-sibling-rejected',
+            'pytest-unnamed-sibling-rejected',
+            'fm-lint-accepted',
+            'single-clause',
+        ],
+    )
+    def test_agrees_with_the_gate_on_the_real_corpus(self, raw, keyword):
+        """Composed against ``split_chain_tail``: True exactly when the gate
+        rejected something that HAD clauses to drop.
+        """
+        prefix, tail = split_chain_tail(raw, keyword)
+        dropped = has_unpreserved_chain_clauses(prefix, tail)
+        expected = not tail and len(split_top_level_and(raw)) > 1
+        assert dropped is expected
