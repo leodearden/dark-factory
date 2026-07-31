@@ -735,3 +735,51 @@ class TestDefaultArtifactsRoot:
         root = default_artifacts_root()
 
         assert root == fake_cwd / 'data' / 'prompt_artifacts'
+
+
+class TestDelegatesToSharedAtomicWriter:
+    """``_atomic_write_text`` delegates to ``shared.safe_io.atomic_write_text``.
+
+    Task 3223 consolidated four byte-identical copies of the tmp+rename writer
+    into ``shared.safe_io``.  These pin that this module's helper is now a
+    delegation preserving the exact semantics it had when inlined: the
+    ``tempfile.mkstemp``-created 0600 mode, utf-8, no fsync and no mkdir.
+    """
+
+    def test_delegates_with_preserved_semantics(self, tmp_path, monkeypatch):
+        """One delegated call, carrying this site's exact per-axis semantics."""
+        import shared.safe_io as _safe_io
+
+        from shared.prompt_artifact import _atomic_write_text
+
+        calls = []
+
+        def recorder(path, text, **kwargs):
+            calls.append((path, text, kwargs))
+
+        monkeypatch.setattr(_safe_io, 'atomic_write_text', recorder)
+
+        target = tmp_path / 'artifact.json'
+        _atomic_write_text(target, '{"a": 1}')
+
+        assert len(calls) == 1, f'expected exactly one delegated call, got {calls}'
+        path, text, kwargs = calls[0]
+        assert Path(path) == target
+        assert text == '{"a": 1}'
+        assert kwargs.get('mode') == 0o600, 'mkstemp created 0600; must not widen'
+        assert kwargs.get('encoding') == 'utf-8'
+        assert not kwargs.get('fsync'), 'this site never fsynced'
+        assert not kwargs.get('mkdir'), 'this site never created its parent'
+
+    def test_real_write_lands_0600_utf8(self, tmp_path):
+        """End-to-end: the delegated write still produces a 0600 utf-8 file."""
+        from shared.prompt_artifact import _atomic_write_text
+
+        target = tmp_path / 'artifact.json'
+        payload = '{"note": "h\u00e9llo \u2014 w\u00f6rld"}'
+        _atomic_write_text(target, payload)
+
+        assert target.read_text(encoding='utf-8') == payload
+        assert target.read_bytes() == payload.encode('utf-8')
+        assert target.stat().st_mode & 0o777 == 0o600
+        assert sorted(q.name for q in tmp_path.iterdir()) == ['artifact.json']
