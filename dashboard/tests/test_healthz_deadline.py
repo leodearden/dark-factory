@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sqlite3
 import time
 from pathlib import Path
@@ -130,6 +131,48 @@ class _BlockingConn:
         return _BlockingCursorCtx(self._block_on)
 
 
+class _RaisingCursorCtx:
+    """Fake for ``Connection.execute(...)`` that RAISES instead of blocking.
+
+    Mirrors :class:`_BlockingCursorCtx`'s dual protocol (directly awaitable
+    *and* usable as an async context manager), but ``_open()`` raises the
+    configured exception. Raising from ``_open`` rather than from
+    ``execute()`` matches aiosqlite: a sqlite error surfaces from the worker
+    thread at the AWAIT point, not at call time.
+    """
+
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
+
+    async def _open(self) -> _BlockingCursor:
+        raise self._exc
+
+    def __await__(self):
+        return self._open().__await__()
+
+    async def __aenter__(self) -> _BlockingCursor:
+        return await self._open()
+
+    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+        return None
+
+
+class _RaisingConn:
+    """Fake aiosqlite.Connection whose queries fail FAST by raising.
+
+    Models a corrupt database (``DatabaseError: database disk image is
+    malformed``), a connection closed under us (``ProgrammingError``), or a
+    disk I/O error — failures that return in ~0ms and so are emphatically
+    *not* the handler exceeding its budget.
+    """
+
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
+
+    def execute(self, sql: str, parameters: object = None) -> _RaisingCursorCtx:
+        return _RaisingCursorCtx(self._exc)
+
+
 class _BlockingPool:
     """Stands in for ``DbPool`` with per-db-path-configurable ``get()``.
 
@@ -137,6 +180,9 @@ class _BlockingPool:
       - a ``_BlockingConn`` instance   -> get() returns it immediately
       - ``None``                       -> get() returns None ('unavailable')
       - ``_BLOCK_IN_GET``               -> get() itself blocks for _BLOCK_SECONDS
+      - a ``BaseException`` instance   -> get() raises it, modelling a failing
+        acquire (``aiosqlite.connect`` raising ``OperationalError: unable to
+        open database file``)
       - a real ``aiosqlite.Connection`` -> returned as-is (step-9's hybrid pool)
 
     A db_path absent from *behaviors* defaults to 'unavailable' (None), same
@@ -152,6 +198,8 @@ class _BlockingPool:
         if behavior is _BLOCK_IN_GET:
             await asyncio.sleep(_BLOCK_SECONDS)
             return None  # pragma: no cover — a real caller cap always fires first
+        if isinstance(behavior, BaseException):
+            raise behavior
         return behavior
 
 
@@ -321,7 +369,9 @@ async def test_healthz_returns_degraded_when_execute_blocks(dashboard_config):
     # The handler is bounded at _HEALTHZ_TOTAL_BUDGET (3.0s); ~2.0s of slack
     # below the 5.0s curl --max-time ceiling absorbs event-loop scheduling
     # and JSON serialisation (same convention as test_metrics_curator.py:924).
-    assert elapsed < 5.0, f'elapsed {elapsed:.3f}s >= 5.0s — verdict undeliverable to curl --max-time 5'
+    assert elapsed < 5.0, (
+        f'elapsed {elapsed:.3f}s >= 5.0s — verdict undeliverable to curl --max-time 5'
+    )
     checks = body['checks']
     assert checks['db_reconciliation'] == 'timeout'
     assert checks['db_write_journal'] == 'timeout'
@@ -359,7 +409,9 @@ async def test_healthz_deadline_covers_the_connection_acquire_step(dashboard_con
 
     assert resp.status_code == 503
     assert body['status'] == 'degraded'
-    assert elapsed < 5.0, f'elapsed {elapsed:.3f}s >= 5.0s — verdict undeliverable to curl --max-time 5'
+    assert elapsed < 5.0, (
+        f'elapsed {elapsed:.3f}s >= 5.0s — verdict undeliverable to curl --max-time 5'
+    )
     checks = body['checks']
     assert checks['db_reconciliation'] == 'timeout'
     assert checks['db_write_journal'] == 'ok'
@@ -401,7 +453,9 @@ async def test_healthz_returns_verdict_when_cursor_cleanup_blocks(dashboard_conf
 
     assert resp.status_code == 503
     assert body['status'] == 'degraded'
-    assert elapsed < 5.0, f'elapsed {elapsed:.3f}s >= 5.0s — verdict undeliverable to curl --max-time 5'
+    assert elapsed < 5.0, (
+        f'elapsed {elapsed:.3f}s >= 5.0s — verdict undeliverable to curl --max-time 5'
+    )
     checks = body['checks']
     assert checks['db_reconciliation'] == 'timeout'
     assert checks['db_write_journal'] == 'timeout'
@@ -443,7 +497,9 @@ async def test_healthz_states_its_budget_and_flags_deadline_expiry(dashboard_con
 
         assert resp.status_code == 503
         assert body['status'] == 'degraded'
-        assert elapsed < 5.0, f'elapsed {elapsed:.3f}s >= 5.0s — verdict undeliverable to curl --max-time 5'
+        assert elapsed < 5.0, (
+            f'elapsed {elapsed:.3f}s >= 5.0s — verdict undeliverable to curl --max-time 5'
+        )
         checks = body['checks']
         assert checks['db_reconciliation'] == 'timeout'
         assert checks['db_write_journal'] == 'ok'
@@ -456,3 +512,96 @@ async def test_healthz_states_its_budget_and_flags_deadline_expiry(dashboard_con
         # thread. Skipping close_all() on assertion failure (e.g. the
         # pre-step-10 RED) leaks those threads and hangs process teardown.
         await real_pool.close_all()
+
+
+# ---------------------------------------------------------------------------
+# step-11 / step-12: a probe that fails FAST by raising is an 'error', not a
+# 'timeout' — and must not claim the handler blew its budget
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize('inject_at', ['acquire', 'execute'])
+async def test_healthz_reports_error_not_timeout_when_probe_raises(
+    dashboard_config, caplog, inject_at
+):
+    """A probe that RAISES must report 'error', not a budget expiry.
+
+    ``_probe_db`` maps every exception to ``'timeout'``, and the handler keys
+    ``checks['deadline_exceeded']`` on exactly that string. So a corrupt DB
+    (``sqlite3.DatabaseError: database disk image is malformed``), a
+    connection closed under us, or a disk I/O error — all of which return in
+    ~0ms — are reported to the operator as the handler having blown its
+    deadline. That points them at latency and budgets when the fact in hand
+    was an exception, inverting the very purpose ``deadline_exceeded`` was
+    added for in step-9/step-10. The exception is also swallowed with no
+    logging, so the real cause is unrecoverable anywhere (INV-2
+    ``structured-facts-at-failure``, docs/legibility/design-invariants.md).
+
+    Both failure-injection sites are covered: raising during the connection
+    acquire (``aiosqlite.connect`` failing) and raising during the query
+    execute (the worker thread surfacing a sqlite error at the await point).
+
+    The ``elapsed`` bound is chosen structurally, not guessed: it is strictly
+    below ONE per-DB budget, so if it holds, no probe can possibly have
+    reached its deadline — which is what makes ``deadline_exceeded is False``
+    a fact about the code rather than a coincidence. Three probes that raise
+    immediately return in ~0ms, so the margin is ~3 orders of magnitude,
+    ample for event-loop scheduling and JSON serialisation (the same headroom
+    convention as the ``elapsed < 5.0`` assertions above).
+    """
+    config = dashboard_config
+    targets = (config.reconciliation_db, config.write_journal_db, config.runs_db)
+
+    def _make_exc() -> sqlite3.DatabaseError:
+        # A fresh instance per target: re-raising one shared instance would
+        # chain three tracebacks onto the same object.
+        return sqlite3.DatabaseError('database disk image is malformed')
+
+    behaviors: dict[Path, object]
+    if inject_at == 'acquire':
+        behaviors = {path: _make_exc() for path in targets}
+    else:
+        behaviors = {path: _RaisingConn(_make_exc()) for path in targets}
+
+    pool = _BlockingPool(behaviors)
+    request = _make_healthz_request(config, pool)
+
+    with caplog.at_level(logging.WARNING, logger='dashboard.app'):
+        resp, elapsed = await _call_healthz(request, hard_cap=8.0)
+    body = _body(resp)
+
+    checks = body['checks']
+    assert checks['db_reconciliation'] == 'error'
+    assert checks['db_write_journal'] == 'error'
+    assert checks['db_runs'] == 'error'
+    assert checks['deadline_exceeded'] is False, (
+        'a probe that failed fast by raising must not be reported as the '
+        'handler having exceeded its budget — that sends the operator to look '
+        'at latency when the fact in hand was an exception'
+    )
+    # An errored probe must STILL flip healthy: a corrupt DB is not healthy.
+    # Guards against the fix over-correcting into a fail-soft.
+    assert resp.status_code == 503
+    assert body['status'] == 'degraded'
+    assert elapsed < app_module._DB_PROBE_TIMEOUT, (
+        f'elapsed {elapsed:.3f}s >= one per-DB budget '
+        f'({app_module._DB_PROBE_TIMEOUT}s) — a raising probe returns '
+        'immediately, so deadline_exceeded being False must be provable'
+    )
+
+    warning_records = [
+        r for r in caplog.records if r.levelno == logging.WARNING and r.name == 'dashboard.app'
+    ]
+    assert len(warning_records) == len(targets), (
+        f'expected one WARNING per failing probe ({len(targets)}), got '
+        f'{len(warning_records)} — the payload carries only a status string, '
+        'so an unlogged exception is unrecoverable everywhere'
+    )
+    for db_path, rec in zip(targets, warning_records, strict=True):
+        assert str(db_path) in rec.getMessage(), (
+            f'WARNING must name the failing db path: {rec.getMessage()!r}'
+        )
+        assert rec.exc_info is not None, (
+            'the payload carries only the status string "error", so the '
+            'exception TYPE must survive in the logs'
+        )
