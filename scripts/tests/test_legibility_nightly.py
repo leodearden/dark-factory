@@ -1106,8 +1106,8 @@ def test_run_nightly_happy_path_end_to_end(tmp_path):
 # task 3270: run_nightly emits the sampler accounting on EVERY run
 # ---------------------------------------------------------------------------
 
-_SUMMARY_KEYS = ('enumerated=', 'zero_signal_dropped=', 'budget_skipped=',
-                 'selected=', 'bytes_used=')
+_SUMMARY_KEYS = ('enumerated=', 'zero_signal_dropped=', 'below_sampling_cut=',
+                 'budget_skipped=', 'selected=', 'bytes_used=')
 
 
 def _summary_lines(caplog):

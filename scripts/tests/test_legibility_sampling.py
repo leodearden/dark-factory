@@ -319,13 +319,25 @@ class TestSampleResultAccounting:
            were ALL discarded on budget" rather than "there was nothing to
            sample" — so the predicate's premise is machine-checked here
            instead of assumed at the call site.
+      (iii) TOTAL CONSERVATION: ``total_records`` equals the four drop
+            counts plus ``len(selected)``, with NO unaccounted remainder,
+            so the operator line balances.
 
-    The batch is deliberately mixed so every accounting bucket is non-zero:
-    2 zero-signal records dropped, 1 clone collapsed, 2 candidates selected
-    and 2 budget-skipped, out of 7 handed in. Costs are injected via
-    ``cost_fn`` (the same convention as the sibling budget-algebra classes)
-    so the squeeze is explicit and hand-derivable rather than dependent on
-    real digest sizes.
+    The main batch is deliberately mixed so every accounting bucket is
+    non-zero: 2 zero-signal records dropped, 1 clone collapsed, 2
+    candidates selected and 2 budget-skipped, out of 7 handed in. Costs are
+    injected via ``cost_fn`` (the same convention as the sibling
+    budget-algebra classes) so the squeeze is explicit and hand-derivable
+    rather than dependent on real digest sizes.
+
+    That batch is built so every stratum's survivors ALL reach the
+    candidate stage, which is exactly why it cannot pin (iii) on its own —
+    it never exercises the ``top_fraction``/``per_stratum_min`` narrowing.
+    ``_build_narrowed_records`` is the second fixture that does, and the
+    reason ``below_sampling_cut`` exists: with it missing, 14 of 17 records
+    fell out of the accounting entirely and the summary line under-reported
+    its own denominator (reviewer_comprehensive/observability-accuracy,
+    task 3270 amendment pass).
     """
 
     _COST = staticmethod(lambda r: r.size_bytes)
@@ -370,6 +382,38 @@ class TestSampleResultAccounting:
             _scored('human-b', 'interactive', mod.SignalCounts(not_found=8), 'human turn two', 1_000),
         ]
 
+    def _build_narrowed_records(self):
+        """17 distinct real-signal records in ONE stratum, so the sampling
+        cut — not the budget — is what excludes most of them.
+
+        At the stock ``top_fraction=0.12`` the cut is
+        ``max(ceil(0.12 * 17), per_stratum_min=2) == 3``, so 3 compete for
+        budget and 14 never do. Every first turn is structurally distinct
+        and every score non-zero, so neither the zero-signal filter nor
+        ``dedupe_shapes`` removes any of them: ``below_sampling_cut`` is the
+        ONLY bucket that can absorb the other 14.
+
+        The openers differ by LEADING WORD, not by an index number:
+        ``_normalize_first_turn`` rewrites every digit run to '#' before
+        fingerprinting (that is how it absorbs a recon clone's date drift),
+        so numbered variants of one sentence collapse to a single shape and
+        would silently land in ``dedupe_collapsed`` instead.
+        """
+        openers = (
+            'Kafka', 'Postgres', 'Redis', 'Terraform', 'Kubernetes', 'Envoy',
+            'Bazel', 'Rust', 'Grafana', 'Airflow', 'Vitess', 'Ceph',
+            'Nomad', 'Pulsar', 'Debezium', 'Flink', 'Clickhouse',
+        )
+        return [
+            _scored(
+                f'distinct-{index:02d}', 'interactive',
+                mod.SignalCounts(tool_error=index),
+                f'{opener} is behaving oddly and I need help working out why.',
+                1_000,
+            )
+            for index, opener in enumerate(openers, start=1)
+        ]
+
     def test_total_records_counts_every_record_handed_to_the_sampler(self):
         records = self._build_records()
         result = mod.stratified_sample(records, self._config(3_000), cost_fn=self._COST)
@@ -386,11 +430,71 @@ class TestSampleResultAccounting:
         assert {r.path.stem for r in result.selected} == {'human-a', 'human-b'}
         assert result.budget_skipped == 2
 
+        # Derived through below_sampling_cut, not around it. This fixture
+        # happens to narrow nothing, and asserting that explicitly is what
+        # stops the derivation from being accidentally right.
+        assert result.below_sampling_cut == 0
         candidates = (
-            result.total_records - result.zero_signal_dropped - result.dedupe_collapsed
+            result.total_records
+            - result.zero_signal_dropped
+            - result.dedupe_collapsed
+            - result.below_sampling_cut
         )
         assert candidates == 4
         assert len(result.selected) + result.budget_skipped == candidates
+
+    def test_records_below_the_sampling_cut_are_counted_not_silently_dropped(self):
+        records = self._build_narrowed_records()
+        # Budget deliberately generous (17 x 1_000 would all fit): the ONLY
+        # thing excluding records here is the stratum sampling cut, so a
+        # non-zero budget_skipped would mean the fixture is not isolating
+        # what it claims to.
+        result = mod.stratified_sample(records, self._config(300_000), cost_fn=self._COST)
+
+        assert result.total_records == 17
+        assert result.zero_signal_dropped == 0
+        assert result.dedupe_collapsed == 0
+        assert result.budget_skipped == 0
+        assert len(result.selected) == 3, 'ceil(0.12 * 17) == 3 candidates'
+        assert result.below_sampling_cut == 14, (
+            'the 14 survivors the cut left out must land in a bucket — before '
+            'this counter existed they landed in none, and the operator line '
+            'reported enumerated=17 against selected=3 with no explanation'
+        )
+
+    def test_the_summary_line_balances_when_the_sampling_cut_bites(self):
+        """TOTAL CONSERVATION, on the fixture that actually narrows.
+
+        This is the property an operator relies on when they read the line
+        and ask "where did the other 14 go?": the five numbers must add up,
+        or the gap reads as a second, undiagnosed suppression mode.
+        """
+        for records, max_bytes in (
+            (self._build_narrowed_records(), 300_000),  # cut bites, budget does not
+            (self._build_narrowed_records(), 2_500),    # both bite
+            (self._build_records(), 3_000),             # dedupe + zero-signal + budget
+            (self._build_records(), 10),                # total suppression
+        ):
+            result = mod.stratified_sample(records, self._config(max_bytes), cost_fn=self._COST)
+            accounted = (
+                result.zero_signal_dropped
+                + result.dedupe_collapsed
+                + result.below_sampling_cut
+                + result.budget_skipped
+                + len(result.selected)
+            )
+            assert accounted == result.total_records, (
+                f'{result.total_records - accounted} record(s) unaccounted at '
+                f'max_bytes={max_bytes}'
+            )
+
+    def test_the_operator_line_reports_the_sampling_cut(self):
+        """The counter is worthless if it never reaches the operator."""
+        result = mod.stratified_sample(
+            self._build_narrowed_records(), self._config(300_000), cost_fn=self._COST,
+        )
+        line = mod.format_sample_summary_line(result, max_bytes=300_000)
+        assert 'below_sampling_cut=14' in line
 
     def test_total_suppression_is_distinguishable_from_nothing_to_sample(self):
         """The predicate itself, on the two states it must tell apart."""
@@ -1284,6 +1388,7 @@ class TestFormatSampleSummaryLine:
             bytes_used=6,
             dedupe_collapsed=4,
             budget_skipped=5,
+            below_sampling_cut=8,
             total_records=11,
         )
 
@@ -1292,6 +1397,7 @@ class TestFormatSampleSummaryLine:
         assert 'enumerated=11' in line
         assert 'zero_signal_dropped=3' in line
         assert 'dedupe_collapsed=4' in line
+        assert 'below_sampling_cut=8' in line
         assert 'budget_skipped=5' in line
         assert 'selected=2' in line
         assert 'bytes_used=6/7' in line
