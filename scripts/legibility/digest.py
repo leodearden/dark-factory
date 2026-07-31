@@ -25,6 +25,7 @@ import gzip
 import json
 import logging
 import sys
+import zlib
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -43,10 +44,32 @@ def load_transcript(path: Any) -> list[dict[str, Any]]:
     sessions rather than enumerate-then-drop them (the same gz idiom as
     ``inventory._iter_json_lines``).
 
-    Blank lines and lines that fail to parse as JSON are skipped rather
-    than raising: fire-and-forget transcript writers can leave a truncated
-    or corrupt trailing line, and one bad line must not abort the whole
-    read (mirrors analyze_speculation_depth.load_events).
+    Degradation splits at the file/line boundary, and that split is a
+    contract rather than an implementation detail. A corrupt LINE degrades
+    silently: blank lines and lines that fail to parse as JSON are skipped,
+    because fire-and-forget transcript writers can leave a truncated or
+    corrupt trailing line and one bad line must not abort the whole read
+    (mirrors analyze_speculation_depth.load_events). An unreadable FILE
+    raises ``OSError``, so a caller reporting coverage counts it once
+    instead of aborting its walk.
+
+    Making the ``OSError`` half true takes explicit normalization, because
+    gzip signals its three corruption shapes with three DIFFERENT exception
+    types — only the first of which is already an ``OSError``::
+
+        bad magic         -> gzip.BadGzipFile   (an OSError subclass)
+        truncated stream  -> EOFError           (not an OSError)
+        corrupt body      -> zlib.error         (not an OSError)
+
+    The last two are what a killed unit leaves behind, and archived fleet
+    transcripts are live runtime state, so both are expected shapes. They
+    are re-raised as ``OSError`` preserving the original message, so a
+    caller can still tell a half-written transcript from a corrupted one.
+    ``inventory.iter_json_lines`` — the streaming sibling cited above —
+    normalizes identically and to the same message, so the two readers are
+    interchangeable at this boundary as well as at the parse contract;
+    ``test_legibility_digest.TestLoadTranscriptCorruptionShapes`` asserts
+    that agreement directly.
     """
     records: list[dict[str, Any]] = []
     if str(path).endswith('.gz'):
@@ -54,14 +77,22 @@ def load_transcript(path: Any) -> list[dict[str, Any]]:
     else:
         f = open(path, encoding='utf-8')
     with f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                records.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
+        # Wrap only the read/decompress iteration — decompression happens
+        # lazily HERE, per chunk, not at open() — leaving the JSONDecodeError
+        # skip inside the loop so the file-level vs line-level split above is
+        # preserved. Deliberately not `except Exception`: normalize two known
+        # decompression failures, don't swallow anything else.
+        try:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        except (EOFError, zlib.error) as exc:
+            raise OSError(f'corrupt or truncated gzip stream: {exc}') from exc
     return records
 
 
