@@ -32,7 +32,10 @@ Your findings will be addressed in the next reconciliation cycle's Stage 1 and S
   **Always paginate:** pass `page_size` and `offset` on every call — \
   `get_statuses(project_root=..., page_size=1000, offset=0)` — then increment offset \
   by page_size until `pagination['has_more']` is False, merging the pages into one \
-  status map before enumerating. Do NOT rely on an un-paginated call: it does not \
+  status map before enumerating. **Keep `page_size` at or below 2000** — a larger page \
+  can itself exceed the transport limit and be rejected wholesale, which is the exact \
+  failure the loop exists to avoid (the tool does NOT clamp it for you). Do NOT rely \
+  on an un-paginated call: it does not \
   truncate for you, so on a large project the whole response can exceed the transport \
   limit and you get back NOTHING at all. If you cannot know the project size in \
   advance, `auto_paginate=true` is an opt-in one-shot fallback — it returns a FIRST \

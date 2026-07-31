@@ -528,3 +528,285 @@ async def test_get_statuses_non_dict_result_skips_pagination(
         f'Non-dict result must pass through even with page_size, got: {result2}'
     )
     assert 'pagination' not in result2
+
+
+# ---------------------------------------------------------------------------
+# auto_paginate must honour offset — no livelock (task 3064, review amendment)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_auto_paginate_honours_offset_so_the_paging_loop_terminates(
+    paging_server,
+):
+    """An ``auto_paginate`` paging loop must make forward progress and finish.
+
+    Regression: the auto branch originally hard-coded ``offset`` 0 and silently
+    dropped a caller-supplied offset.  A caller that opted in, saw
+    ``auto_paginated: True`` / ``has_more: True``, and then continued paging as
+    the contract instructs — but forgot to ALSO pass ``page_size``, an easy
+    mistake for the LLM Stage 3 caller this fallback exists for — got the SAME
+    first page back, again with ``has_more: True``, forever.  The loop never
+    terminates and the census never completes: task 3064's LOUD transport
+    failure converted into a SILENT livelock, which is the worse of the two.
+
+    Driven as a real paging loop rather than two spot-checks, because the
+    property under test is termination, not the content of any single page.
+    """
+    from fused_memory.server.tools import _STATUSES_AUTO_PAGE_LIMIT as LIMIT
+
+    population = _set_population(_make_statuses(LIMIT + 500))
+
+    # (a) The loop the docstring tells callers to write, with page_size OMITTED
+    # on every call — the exact shape that used to livelock.  Bounded so a
+    # regression fails the test instead of hanging the suite.
+    merged: dict[str, str] = {}
+    pages: list[dict] = []
+    offset = 0
+    max_pages = 10
+    for _ in range(max_pages):
+        page_result = await paging_server._tool_manager.call_tool(
+            'get_statuses',
+            {'project_root': '/project', 'auto_paginate': True, 'offset': offset},
+        )
+        merged.update(page_result['statuses'])
+        meta = page_result.get('pagination')
+        if meta is None or not meta['has_more']:
+            break
+        pages.append(meta)
+        # Advance by what was actually SERVED, per the documented contract.
+        offset += meta['page_size']
+    else:
+        pytest.fail(
+            f'auto_paginate loop did not terminate within {max_pages} pages — '
+            f'livelock: offsets served {[p["offset"] for p in pages]}'
+        )
+
+    # (b) It terminated having seen the COMPLETE census, no gaps, no dupes.
+    assert merged.keys() == population.keys(), (
+        f'Paging loop assembled {len(merged)} of {len(population)} ids — '
+        f'missing {len(set(population) - set(merged))}'
+    )
+
+    # (c) Two pages exactly (LIMIT + 500 over a LIMIT-sized page), and the
+    # second one really started where the first ended — the offset was honoured,
+    # not silently reset to 0.
+    second = await paging_server._tool_manager.call_tool(
+        'get_statuses',
+        {'project_root': '/project', 'auto_paginate': True, 'offset': LIMIT},
+    )
+    assert second['pagination'] == {
+        'total': LIMIT + 500,
+        'offset': LIMIT,
+        'page_size': LIMIT,
+        'returned': 500,
+        'has_more': False,
+        'auto_paginated': True,
+    }, f'Unexpected second-page pagination dict: {second["pagination"]}'
+    assert set(second['statuses']) == {str(i) for i in range(LIMIT + 1, LIMIT + 501)}, (
+        'Second auto-page must be the ids AFTER the first page, not the first '
+        'page served again'
+    )
+
+
+# ---------------------------------------------------------------------------
+# Deterministic ordering across mixed key shapes (task 3064, review amendment)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pages_tile_a_mixed_numeric_and_non_numeric_population(paging_server):
+    """Gap-free, duplicate-free tiling holds over MIXED id shapes too.
+
+    ``_status_page``'s ordering key has two branches — numeric and
+    non-numeric — and every other test in this file uses ``_make_statuses``,
+    which emits purely numeric ids, so the second branch was never exercised.
+    Deterministic tiling is the whole reason that sort exists (the backend's
+    ``SELECT id, status FROM tasks WHERE tag = ?`` has no ``ORDER BY``), and the
+    mixed population is precisely the case where an unstable or raising key
+    would let two page calls interleave differently and silently drop entries.
+
+    Not a synthetic shape: ``'3.1'`` is Taskmaster's subtask id form, and a
+    negative or non-numeric id is exactly the sort of value a non-standard
+    backend can hand back.
+    """
+    population = _set_population(
+        {'10': 'pending', '2': 'done', '3.1': 'pending', 'abc': 'blocked', '-5': 'done'}
+    )
+
+    # (a) Page to exhaustion at page_size=2 and reassemble.
+    merged: dict[str, str] = {}
+    order: list[str] = []
+    offset = 0
+    for _ in range(10):
+        page_result = await paging_server._tool_manager.call_tool(
+            'get_statuses',
+            {'project_root': '/project', 'page_size': 2, 'offset': offset},
+        )
+        page = page_result['statuses']
+        overlap = set(page) & set(merged)
+        assert overlap == set(), f'Pages must not overlap, duplicated: {overlap}'
+        merged.update(page)
+        order.extend(page)
+        if not page_result['pagination']['has_more']:
+            break
+        offset += page_result['pagination']['page_size']
+    else:
+        pytest.fail('Mixed-population paging loop did not terminate')
+
+    # (b) The union is the whole population — no gaps.
+    assert merged == population, (
+        f'Pages must tile the mixed population exactly, got {sorted(merged)} '
+        f'vs {sorted(population)}'
+    )
+
+    # (c) Numeric ids come out in NUMERIC order, ahead of the non-numeric ones,
+    # which are themselves deterministically ordered.  Pins the actual contract,
+    # not just "some stable order": a lexicographic sort would emit 10 before 2.
+    assert order == ['-5', '2', '10', '3.1', 'abc'], (
+        f'Unexpected total order across the numeric/non-numeric branches: {order}'
+    )
+
+
+def test_status_page_tolerates_non_string_keys():
+    """A non-str-keyed backend map must not raise from inside pagination.
+
+    Direct unit test of ``_status_page`` (the MCP layer declares
+    ``dict[str, Any]``, so an int-keyed map cannot be driven through the tool).
+    Before the ``str(k)`` coercion this raised ``AttributeError: 'int' object
+    has no attribute 'lstrip'`` from the sort key — masking the real backend
+    shape problem behind a traceback from the pagination code, which is the same
+    failure mode the ``isinstance`` guards at the call sites exist to avoid.
+    """
+    from fused_memory.server.tools import _status_page
+
+    mixed = {3: 'done', 1: 'pending', '2': 'blocked', 'x': 'done'}
+
+    page, total = _status_page(mixed, 0, 3)
+
+    assert total == 4
+    # Int-like keys still sort numerically alongside their str twins; the
+    # non-numeric key sorts deterministically last and so falls off page 1.
+    assert list(page) == [1, '2', 3], f'Unexpected order over mixed key types: {list(page)}'
+    tail, _ = _status_page(mixed, 3, 3)
+    assert list(tail) == ['x']
+
+
+# ---------------------------------------------------------------------------
+# Observability of the degraded response (task 3064, review amendment)
+# ---------------------------------------------------------------------------
+
+
+class _RecordingJournal:
+    """Minimal WriteJournal stand-in that captures ``_log_read`` calls."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    async def log_write_op(self, **kwargs):
+        self.calls.append(kwargs)
+
+
+@pytest.fixture
+def recording_journal():
+    return _RecordingJournal()
+
+
+@pytest.fixture
+def journalled_paging_server(paging_task_interceptor, recording_journal):
+    """Paging server wired with a read-log spy."""
+    return create_mcp_server(
+        AsyncMock(),
+        task_interceptor=paging_task_interceptor,
+        write_journal=recording_journal,
+    )
+
+
+@pytest.mark.asyncio
+async def test_auto_pagination_is_visible_in_the_server_log_and_read_log(
+    journalled_paging_server, recording_journal, caplog
+):
+    """A degraded response must be observable to an OPERATOR, not just the caller.
+
+    This is the other half of loud degradation: the payload's ``pagination``
+    marker only helps a caller that reads it, so the server must also say — in
+    its own log — that it served a reduced census, and the read log must carry
+    ``total`` so a paged response is distinguishable from a genuinely shrunken
+    project rather than looking like one.
+
+    Both behaviours are load-bearing design, but nothing asserted them, so a
+    refactor could drop either without a single test failing.
+    """
+    import logging
+
+    from fused_memory.server.tools import _STATUSES_AUTO_PAGE_LIMIT as LIMIT
+
+    _set_population(_make_statuses(LIMIT + 500))
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.server.tools'):
+        result = await journalled_paging_server._tool_manager.call_tool(
+            'get_statuses',
+            {'project_root': '/project', 'auto_paginate': True},
+        )
+    assert result['pagination']['auto_paginated'] is True  # precondition
+
+    # (a) A WARNING naming the degradation, carrying the structured facts an
+    # operator needs to size it (not just a bare "something happened").
+    degraded = [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING and 'auto-paginated' in r.getMessage()
+    ]
+    assert len(degraded) == 1, (
+        f'Expected exactly one auto-pagination warning, got '
+        f'{[r.getMessage() for r in caplog.records]}'
+    )
+    record = degraded[0]
+    assert getattr(record, 'total', None) == LIMIT + 500
+    assert getattr(record, 'returned', None) == LIMIT
+    assert getattr(record, 'page_size', None) == LIMIT
+    assert getattr(record, 'offset', None) == 0
+    assert getattr(record, 'project_root', None) == '/project'
+
+    # (b) The read log reports returned-vs-total, so a reduced response does not
+    # read as a shrunken census in the journal.
+    reads = [c for c in recording_journal.calls if c.get('operation') == 'get_statuses']
+    assert len(reads) == 1, f'Expected one get_statuses read-log entry, got {len(reads)}'
+    summary = reads[0]['result_summary']
+    assert summary['count'] == LIMIT, f'Unexpected read-log count: {summary}'
+    assert summary['total'] == LIMIT + 500, (
+        f"Read log must carry 'total' for a paged response, got: {summary}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_complete_response_logs_no_degradation_marker(
+    journalled_paging_server, recording_journal, caplog
+):
+    """The complementary half: a COMPLETE response must stay quiet.
+
+    Without this, the observability assertions above would still pass against an
+    implementation that warned on every call and stamped ``total`` on every read
+    — which would make the degradation signal worthless.
+    """
+    import logging
+
+    from fused_memory.server.tools import _STATUSES_AUTO_PAGE_LIMIT as LIMIT
+
+    _set_population(_make_statuses(LIMIT + 500))
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.server.tools'):
+        result = await journalled_paging_server._tool_manager.call_tool(
+            'get_statuses',
+            {'project_root': '/project'},
+        )
+    assert set(result.keys()) == {'statuses'}  # precondition: complete response
+
+    assert [r for r in caplog.records if 'auto-paginated' in r.getMessage()] == [], (
+        'A complete response must not emit a degradation warning'
+    )
+    reads = [c for c in recording_journal.calls if c.get('operation') == 'get_statuses']
+    assert len(reads) == 1
+    assert 'total' not in reads[0]['result_summary'], (
+        f"'total' marks a REDUCED response; a complete one must omit it, got: "
+        f'{reads[0]["result_summary"]}'
+    )

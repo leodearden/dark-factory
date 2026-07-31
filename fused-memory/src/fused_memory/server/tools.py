@@ -371,7 +371,7 @@ Read operations:
 
 Task operations (when Taskmaster is connected):
 - get_tasks / get_task: Read task tree
-- get_statuses: Compact {id: status} mapping (~95% smaller than get_tasks) for status-only callers; pass page_size/offset to paginate, with auto_paginate=True as an opt-in first-page fallback (never automatic — see the tool docstring)
+- get_statuses: Compact {id: status} mapping (~95% smaller than get_tasks) for status-only callers; pass page_size/offset to paginate (keep page_size <= 2000 — larger pages can exceed the MCP tool-response transport limit and be rejected wholesale), with auto_paginate=True as an opt-in one-page fallback (never automatic — see the tool docstring)
 - search_tasks: Semantic search over already-filed tasks (ranked by similarity, enriched with current status) — use to check if a task like X was already filed
 - set_task_status: Update status (triggers reconciliation for done/blocked/cancelled)
 - update_task / remove_task: Task CRUD
@@ -694,10 +694,85 @@ def _status_page(
     """
     ordered = sorted(
         statuses,
-        key=lambda k: (0, int(k), '') if k.lstrip('-').isdigit() else (1, 0, k),
+        # str(k) coercion, not a bare k.lstrip: a non-standard backend that keys
+        # its map with ints (or anything else) must not blow up the sort with an
+        # AttributeError raised from inside pagination — the real shape problem
+        # should surface at the caller, which is the same rationale as the
+        # isinstance guards around the call sites.  Int-like keys still sort
+        # numerically; anything else lands deterministically in the non-numeric
+        # bucket.
+        key=lambda k: (0, int(k), '') if str(k).lstrip('-').isdigit() else (1, 0, str(k)),
     )
     page_keys = ordered[offset:offset + page_size]
     return {k: statuses[k] for k in page_keys}, len(ordered)
+
+
+def _validate_paging(page_size: Any, offset: Any) -> dict[str, Any] | None:
+    """Validate shared ``page_size``/``offset`` paging inputs.
+
+    Returns a ValidationError payload dict when an input is malformed, or None
+    when both are acceptable.  Shared by ``get_tasks`` and ``get_statuses`` so
+    both tools reject identical inputs identically and a future fix to the
+    bool/int guard lands in ONE place (it was previously copy-pasted, so it
+    had to be fixed twice).
+
+    ``bool`` is rejected explicitly because it is an ``int`` subclass:
+    ``page_size=True`` would otherwise silently mean a 1-entry page.
+    ``page_size=0`` must NOT become an empty page with ``has_more=True``, which
+    would spin a paging caller forever.
+
+    Callers must invoke this BEFORE touching the interceptor, so a malformed
+    request costs no backend work.
+    """
+    if page_size is not None and (
+        not isinstance(page_size, int) or isinstance(page_size, bool) or page_size <= 0
+    ):
+        return {
+            'error': 'page_size must be a positive integer',
+            'error_type': 'ValidationError',
+        }
+    if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+        return {
+            'error': 'offset must be a non-negative integer',
+            'error_type': 'ValidationError',
+        }
+    return None
+
+
+def _pagination_meta(
+    *,
+    total: int,
+    offset: int,
+    page_size: int,
+    returned: int,
+    auto_paginated: bool | None = None,
+) -> dict[str, Any]:
+    """Build the ``pagination`` envelope shared by ``get_tasks``/``get_statuses``.
+
+    Five keys are common to both tools — ``total``, ``offset``, ``page_size``,
+    ``returned``, ``has_more`` — so a caller can drive both with one paging
+    loop keyed on ``has_more``.
+
+    ``auto_paginated`` is DELIBERATELY optional and omitted when None:
+    ``get_tasks`` has no auto-pagination concept, so the key must not appear in
+    its envelope (a caller keying on it would KeyError there).  ``get_statuses``
+    always passes an explicit bool.  This asymmetry is why the ``get_statuses``
+    docstring claims only that the five keys above are shared, not that the two
+    envelopes are identical.
+
+    ``has_more`` is derived here rather than passed in so the three call sites
+    cannot drift on the one field a paging loop's termination depends on.
+    """
+    meta: dict[str, Any] = {
+        'total': total,
+        'offset': offset,
+        'page_size': page_size,
+        'returned': returned,
+        'has_more': offset + returned < total,
+    }
+    if auto_paginated is not None:
+        meta['auto_paginated'] = auto_paginated
+    return meta
 
 
 def create_mcp_server(
@@ -3681,16 +3756,11 @@ def create_mcp_server(
                 rejected with a ValidationError.
         """
         # Input validation — early-exit before touching the interceptor.
-        if page_size is not None and (not isinstance(page_size, int) or isinstance(page_size, bool) or page_size <= 0):
-            return {
-                'error': 'page_size must be a positive integer',
-                'error_type': 'ValidationError',
-            }
-        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
-            return {
-                'error': 'offset must be a non-negative integer',
-                'error_type': 'ValidationError',
-            }
+        # Shared with get_statuses so both tools reject identical inputs
+        # identically (see _validate_paging for the bool/zero rationale).
+        _paging_error = _validate_paging(page_size, offset)
+        if _paging_error is not None:
+            return _paging_error
         if statuses is not None and not isinstance(statuses, list):
             return {
                 'error': 'statuses must be a list of status strings',
@@ -3725,13 +3795,14 @@ def create_mcp_server(
                     total = len(all_tasks)
                     page = all_tasks[offset:offset + page_size]
                     result['tasks'] = page
-                    result['pagination'] = {
-                        'total': total,
-                        'offset': offset,
-                        'page_size': page_size,
-                        'returned': len(page),
-                        'has_more': offset + len(page) < total,
-                    }
+                    # auto_paginated deliberately omitted — get_tasks has no
+                    # auto-pagination concept (see _pagination_meta).
+                    result['pagination'] = _pagination_meta(
+                        total=total,
+                        offset=offset,
+                        page_size=page_size,
+                        returned=len(page),
+                    )
 
             await _log_read(
                 'get_tasks',
@@ -3768,8 +3839,19 @@ def create_mcp_server(
                 positive integer).  When omitted (default), the full status map is
                 returned with no ``pagination`` key — backward-compatible behaviour
                 for every existing caller.
+                KEEP page_size <= ``_STATUSES_AUTO_PAGE_LIMIT`` (2000).  That bound
+                is not stylistic: it is the measured point at which a page still
+                fits the ~62 KB documented-safe MCP tool-response envelope.  A
+                larger page can exceed the transport limit and be rejected
+                WHOLESALE — reproducing the very incident this pagination exists
+                to fix, while the caller believes it followed the paging contract
+                (measured: 2,000 entries ≈ 46 KB, 3,000 entries ≈ 69 KB — past
+                the wall).  The value is NOT clamped; see "Why page_size is not
+                clamped" below.
             offset: Zero-based index of the first status to return (default 0).
-                Only meaningful when page_size is provided.
+                Honoured on both paged paths — the explicit ``page_size`` path
+                and the ``auto_paginate`` path — so a paging loop always makes
+                forward progress.
             auto_paginate: Opt in to fail-open auto-pagination on the ids-less
                 full-population path (default False).  Passing True IS the
                 caller's assertion that it inspects ``pagination['has_more']``
@@ -3777,27 +3859,40 @@ def create_mcp_server(
                 receives the COMPLETE status map.  See "Auto-pagination" below
                 for why this is opt-in rather than automatic.
 
-        Pagination contract (shape-compatible with ``get_tasks``, so a caller can
-        share one paging loop across both tools):
-          * When a page is taken, the response carries a ``pagination`` dict with
-            ``total``, ``offset``, ``page_size``, ``returned``, ``has_more`` and
-            ``auto_paginated``.
+        Pagination contract.  ``get_tasks`` and ``get_statuses`` share the five
+        keys a paging loop needs — ``total``, ``offset``, ``page_size``,
+        ``returned``, ``has_more`` — so one loop keyed on ``has_more`` drives
+        both.  The envelopes are NOT identical: ``auto_paginated`` is a
+        get_statuses-only key (``get_tasks`` has no auto-pagination concept and
+        omits it), so do not key a shared loop on it.
+          * When a page is taken, the response carries a ``pagination`` dict.
           * Page to completion by incrementing ``offset`` by ``page_size`` until
             ``pagination['has_more']`` is False, merging the pages into one map.
+            Advance by ``pagination['page_size']`` (what was actually served),
+            not by the value you requested.
           * The ABSENCE of a ``pagination`` key means the response is COMPLETE.
           * Pages are sliced from a deterministic total order, so successive pages
             tile the population with no gaps and no duplicates.
 
+        Why page_size is not clamped to the safe bound: clamping would silently
+        serve a smaller page than requested, and a loop that advances by its own
+        requested page_size (rather than the served ``pagination['page_size']``)
+        would then SKIP the difference — trading an oversized page's loud
+        transport rejection for a silently incomplete census.  Under this tool's
+        governing invariant (below) that is the strictly worse bargain, so an
+        oversized page_size is documented against and left to fail loudly.
+
         Auto-pagination (OPT-IN fail-open degradation, task 3064): when
         ``auto_paginate=True`` is passed AND ``page_size`` is omitted AND ``ids``
         is omitted AND the population exceeds ``_STATUSES_AUTO_PAGE_LIMIT``, the
-        tool returns the FIRST PAGE plus a ``pagination`` dict carrying
-        ``auto_paginated: True`` and ``has_more: True``, and logs a warning.  On
-        a token-limited transport an un-paginated response that large is rejected
-        wholesale, so for those callers the alternative is not a complete answer
-        but ZERO data.  A caller that sees ``auto_paginated`` must keep paging
-        with ``offset``/``page_size`` — treating that first page as the full
-        census would silently under-count the project.
+        tool returns ONE PAGE (starting at ``offset``, which is honoured on this
+        path too) plus a ``pagination`` dict carrying ``auto_paginated: True``
+        and the usual ``has_more``, and logs a warning.  On a token-limited
+        transport an un-paginated response that large is rejected wholesale, so
+        for those callers the alternative is not a complete answer but ZERO
+        data.  A caller that sees ``auto_paginated`` must keep paging until
+        ``has_more`` is False — treating that first page as the full census
+        would silently under-count the project.
 
         It is opt-in, NOT the default: without ``auto_paginate=True`` an
         oversized full-population call returns the COMPLETE map exactly as it
@@ -3819,30 +3914,53 @@ def create_mcp_server(
         The cap lives at the MCP tool layer only: ``get_external_statuses`` and
         all in-process reconciliation callers reach the backend through
         ``task_interceptor.get_statuses`` directly, NOT through this tool, so
-        they are unaffected.  But that enumeration is NOT the whole caller set,
-        and assuming it was is what made auto-pagination briefly the default.
-        Two live OUT-OF-PROCESS programmatic consumers call this tool over plain
-        HTTP MCP with ``{'project_root': ...}`` and nothing else, and read ONLY
-        the ``statuses`` key:
-          * ``orchestrator/src/orchestrator/scheduler.py:2523``
-            (``Scheduler.get_statuses`` → ``parse_tool_result(result,
-            'statuses', dict)``), dispatched with no ids from harness.py
-            2106/2111/2214/2326/3568/3738/4330.
-          * ``dashboard/src/dashboard/data/tasks.py:220`` (``fetch_statuses``).
-        Neither can see a ``pagination`` marker, and neither crosses a
-        token-limited transport (plain HTTP MCP imposes no response-size limit),
-        so truncating them buys nothing and costs correctness: a partial map
-        looks like a complete census, and ``harness.py:3636`` reads a missing id
-        as "task deleted" and acts on it destructively via
-        ``detach_lane_checkout``.  Its ``degraded`` guard does not catch this —
-        a truncated page is non-empty with ``err is None``, so ``resolver_failed``
-        is False.
+        they are unaffected.  Assuming that WAS the whole caller set is what
+        made auto-pagination briefly the default, and the resulting regression
+        is the reason for the invariant below.
+
+        Known out-of-process programmatic consumers — ILLUSTRATIVE, NOT
+        EXHAUSTIVE.  Each calls this tool over plain HTTP MCP with
+        ``{'project_root': ...}`` and nothing else, and reads ONLY the
+        ``statuses`` key; none can see a ``pagination`` marker.  Assume there
+        are others, in this repo and outside it:
+          * ``Scheduler.get_statuses`` (orchestrator/src/orchestrator/
+            scheduler.py) → ``parse_tool_result(result, 'statuses', dict)``,
+            dispatched with no ids from many call sites in
+            orchestrator/harness.py.
+          * ``fetch_statuses`` (dashboard/src/dashboard/data/tasks.py) — the
+            burndown collector and active-tasks view.
+          * the standalone status fetcher in scripts/legibility/
+            census_trigger.py, which posts a raw ``tools/call`` for this tool
+            and reads the map as a complete done-count census
+            (``last_census_done_count``, see skills/census/SKILL.md).
+        Also note the eval harness's fake get_statuses (the ``FakeMcpClient``-
+        style stub in orchestrator/src/orchestrator/evals/runner.py) does NOT
+        model pagination at all: it ignores page_size/offset/auto_paginate and
+        never emits a ``pagination`` key, so eval runs will not surface a
+        paging regression.
+
+        None of these crosses a token-limited transport (plain HTTP MCP imposes
+        no response-size limit), so truncating them buys nothing and costs
+        correctness: a partial map looks like a complete census, and the
+        lane-checkout reconciler in orchestrator/harness.py (its
+        ``elif bare_id not in live:`` branch) reads a missing id as "task
+        deleted" and acts on it destructively via ``detach_lane_checkout``.
+        Its ``degraded`` guard does not catch this — a truncated page is
+        non-empty with ``err is None``, so ``resolver_failed`` is False.
+
+        (Deliberately no line numbers above: these symbols live in three other
+        packages and any coordinate cited here rots on the first unrelated edit
+        there, leaving a confident-sounding but wrong rationale — the same
+        failure mode as the stale caller enumeration this note replaces.  Grep
+        the named symbols instead.)
 
         The rule for future maintainers, stated as an invariant: **never make
         truncation the default for a caller that did not ask for it.**  A tool
         cannot know whether its caller inspects ``pagination``, so silent
         truncation is sound only when the caller has explicitly asked for it.
-        ``auto_paginate=True`` IS that request.
+        ``auto_paginate=True`` IS that request.  The corollary, applied above to
+        ``page_size``: prefer a loud failure the caller can see over a quiet
+        truncation it cannot.
 
         Shape note (deliberate asymmetry): this tool WRAPS its result under a
         top-level ``'statuses'`` key (``{'statuses': {id: status}}``), unlike
@@ -3852,19 +3970,11 @@ def create_mcp_server(
         two tools share an envelope shape.
         """
         # Input validation — early-exit before touching the interceptor.
-        # Identical rules to get_tasks so both tools reject identical inputs
-        # identically (page_size=0 in particular must NOT become an empty page
-        # with has_more=True, which would spin a paging caller forever).
-        if page_size is not None and (not isinstance(page_size, int) or isinstance(page_size, bool) or page_size <= 0):
-            return {
-                'error': 'page_size must be a positive integer',
-                'error_type': 'ValidationError',
-            }
-        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
-            return {
-                'error': 'offset must be a non-negative integer',
-                'error_type': 'ValidationError',
-            }
+        # Shared with get_tasks so both tools reject identical inputs
+        # identically (see _validate_paging for the bool/zero rationale).
+        _paging_error = _validate_paging(page_size, offset)
+        if _paging_error is not None:
+            return _paging_error
         if not isinstance(auto_paginate, bool):
             return {
                 'error': 'auto_paginate must be a boolean',
@@ -3893,14 +4003,13 @@ def create_mcp_server(
             if page_size is not None:
                 page, total = _status_page(result, offset, page_size)
                 result = page
-                pagination = {
-                    'total': total,
-                    'offset': offset,
-                    'page_size': page_size,
-                    'returned': len(page),
-                    'has_more': offset + len(page) < total,
-                    'auto_paginated': False,
-                }
+                pagination = _pagination_meta(
+                    total=total,
+                    offset=offset,
+                    page_size=page_size,
+                    returned=len(page),
+                    auto_paginated=False,
+                )
             elif auto_paginate and ids is None and len(result) > _STATUSES_AUTO_PAGE_LIMIT:
                 # OPT-IN fail-OPEN degradation (task 3064).  On a token-limited
                 # transport an un-paginated full-population response this large is
@@ -3911,21 +4020,30 @@ def create_mcp_server(
                 # a complete census and corrupt any cross-verification built on it.
                 #
                 # Gated on ``auto_paginate`` because a tool cannot know whether its
-                # caller inspects ``pagination``.  Two live programmatic consumers
-                # (scheduler.py:2523, dashboard tasks.py:220) send project_root
-                # only and read just the ``statuses`` key — see the docstring's
-                # scope note for the destructive lane-detach a default-on cap
-                # would cause there.
-                page, total = _status_page(result, 0, _STATUSES_AUTO_PAGE_LIMIT)
+                # caller inspects ``pagination``.  Live programmatic consumers
+                # (Scheduler.get_statuses, the dashboard's fetch_statuses, the
+                # census trigger's status fetcher) send project_root only and read
+                # just the ``statuses`` key — see the docstring's scope note for
+                # the destructive lane-detach a default-on cap would cause there.
+                #
+                # ``offset`` is HONOURED here, not hard-coded to 0.  A caller that
+                # opted in, saw ``has_more: True``, and then continued paging with
+                # ``offset`` alone — forgetting to also pass ``page_size``, an easy
+                # mistake for the LLM caller this fallback exists for — would
+                # otherwise get the SAME first page back forever with
+                # ``has_more: True``: a livelock whose census never completes.
+                # That converts task 3064's loud transport failure into silent
+                # incompleteness, the exact class of defect this tool now exists
+                # to prevent.
+                page, total = _status_page(result, offset, _STATUSES_AUTO_PAGE_LIMIT)
                 result = page
-                pagination = {
-                    'total': total,
-                    'offset': 0,
-                    'page_size': _STATUSES_AUTO_PAGE_LIMIT,
-                    'returned': len(page),
-                    'has_more': len(page) < total,
-                    'auto_paginated': True,
-                }
+                pagination = _pagination_meta(
+                    total=total,
+                    offset=offset,
+                    page_size=_STATUSES_AUTO_PAGE_LIMIT,
+                    returned=len(page),
+                    auto_paginated=True,
+                )
                 # A degraded response must be visible in the server log too, not
                 # only in the payload the caller may ignore.
                 logger.warning(
@@ -3933,6 +4051,7 @@ def create_mcp_server(
                     extra={
                         'project_root': project_root,
                         'total': total,
+                        'offset': offset,
                         'returned': len(page),
                         'page_size': _STATUSES_AUTO_PAGE_LIMIT,
                     },
