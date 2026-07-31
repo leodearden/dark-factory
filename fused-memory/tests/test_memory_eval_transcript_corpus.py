@@ -812,3 +812,150 @@ class TestCoverageStatus:
         # failure path.
         for found, read, failed in [(3, 3, 0), (3, 2, 1), (0, 0, 0), (3, 0, 3)]:
             assert _mod.coverage_status(_coverage(found, read, failed)) in _mod.EXIT_CODES
+
+
+# ===========================================================================
+# step-15 — artifact emission
+# ===========================================================================
+
+STAMP = '20260731T120000Z'
+
+
+class TestWriteCorpus:
+    """Three artifacts under ``<out_root>/transcript-corpus/``.
+
+    The layout is delegated to ``shared.memory_eval_metrics``, never restated:
+    this leaf and its siblings must land in one place so a single memory-eval
+    run correlates across them.
+    """
+
+    RECORDS = [
+        {'schema_version': _mod.SCHEMA_VERSION, 'query': 'first', 'result_status': 'ok',
+         'results': [{'id': 'a', 'score': 0.9, 'rank': 1}], 'transcript': 'x/y/z.jsonl.gz'},
+        {'schema_version': _mod.SCHEMA_VERSION, 'query': 'secönd', 'result_status': 'missing',
+         'results': [], 'transcript': 'x/y/z.jsonl.gz'},
+    ]
+
+    def _write(self, out_root: Path, coverage=None):
+        coverage = coverage or _mod.stamp_status(_coverage(found=2, read=2, searches=2))
+        return _mod.write_corpus(self.RECORDS, coverage, out_root, stamp=STAMP)
+
+    def test_returns_three_paths(self, tmp_path):
+        corpus, cov, report = self._write(tmp_path)
+        assert corpus.name == f'corpus-{STAMP}.jsonl'
+        assert cov.name == f'coverage-{STAMP}.json'
+        assert report.name == f'report-{STAMP}.txt'
+
+    def test_report_path_is_the_shared_helper_verbatim(self, tmp_path):
+        # Pin the REUSE, not the literal layout: report_artifact_path already
+        # produces <root>/<eval_id>/report-<STAMP>.txt, so it is CALLED rather
+        # than re-derived — and stays correct if that helper ever moves.
+        from shared.memory_eval_metrics import report_artifact_path
+        _, _, report = self._write(tmp_path)
+        assert report == report_artifact_path(tmp_path, _mod.EVAL_ID, STAMP)
+
+    def test_all_three_share_the_eval_directory(self, tmp_path):
+        corpus, cov, report = self._write(tmp_path)
+        assert corpus.parent == cov.parent == report.parent
+        assert corpus.parent == tmp_path / _mod.EVAL_ID
+
+    def test_creates_the_directory(self, tmp_path):
+        corpus, _, _ = self._write(tmp_path / 'nested' / 'deeper')
+        assert corpus.exists()
+
+    def test_corpus_is_strict_json_lines(self, tmp_path):
+        corpus, _, _ = self._write(tmp_path)
+        text = corpus.read_text(encoding='utf-8')
+        assert text.endswith('\n')
+        lines = text.splitlines()
+        assert len(lines) == len(self.RECORDS)
+        # One object per PHYSICAL line — the one place the shared
+        # serialization idiom must be adapted rather than copied, since
+        # indent=2 would break the format outright.
+        for line in lines:
+            assert json.loads(line)
+            assert '\n' not in line
+
+    def test_corpus_lines_are_key_sorted_and_non_ascii_preserved(self, tmp_path):
+        corpus, _, _ = self._write(tmp_path)
+        lines = corpus.read_text(encoding='utf-8').splitlines()
+        parsed = [json.loads(line) for line in lines]
+        assert [json.dumps(p, sort_keys=True, ensure_ascii=False) for p in parsed] == lines
+        assert 'secönd' in lines[1], 'ensure_ascii=False keeps queries readable'
+
+    def test_every_corpus_line_carries_the_schema_version(self, tmp_path):
+        corpus, _, _ = self._write(tmp_path)
+        for line in corpus.read_text(encoding='utf-8').splitlines():
+            assert json.loads(line)['schema_version'] == _mod.SCHEMA_VERSION
+
+    def test_coverage_json_is_indented_and_stable(self, tmp_path):
+        _, cov, _ = self._write(tmp_path)
+        text = cov.read_text(encoding='utf-8')
+        assert text.endswith('\n')
+        payload = json.loads(text)
+        assert text == json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + '\n'
+
+    def test_coverage_json_carries_the_status(self, tmp_path):
+        _, cov, _ = self._write(tmp_path)
+        assert json.loads(cov.read_text(encoding='utf-8'))['status'] == 'ok'
+
+    def test_stamp_defaults_to_the_shared_run_stamp(self, tmp_path, monkeypatch):
+        # Reusing run_stamp/RUN_STAMP_ENV_VAR is what lets one logical
+        # memory-eval run be correlated across leaves.
+        from shared.memory_eval_metrics import RUN_STAMP_ENV_VAR
+        monkeypatch.setenv(RUN_STAMP_ENV_VAR, '20200101T000000Z')
+        coverage = _mod.stamp_status(_coverage(found=1, read=1))
+        corpus, cov, report = _mod.write_corpus(self.RECORDS, coverage, tmp_path)
+        assert corpus.name == 'corpus-20200101T000000Z.jsonl'
+        assert cov.name == 'coverage-20200101T000000Z.json'
+        assert report.name == 'report-20200101T000000Z.txt'
+
+    def test_two_identical_runs_are_byte_identical(self, tmp_path):
+        first = self._write(tmp_path / 'a')
+        second = self._write(tmp_path / 'b')
+        for lhs, rhs in zip(first, second, strict=True):
+            assert lhs.read_bytes() == rhs.read_bytes()
+
+
+class TestRenderReport:
+    """The operator-facing coverage report — what a human reads when pointed
+    at a run. It must state what was skipped, in words."""
+
+    def _report(self, coverage) -> str:
+        return _mod.render_report(_mod.stamp_status(coverage))
+
+    def test_states_the_status(self):
+        assert 'total_failure' in self._report(_coverage(found=3, read=0, failed=3))
+
+    def test_states_tasks_and_searches(self):
+        text = self._report(_coverage(found=9, read=9, searches=42))
+        assert '42' in text
+        assert 'searches' in text.lower()
+        assert 'transcripts' in text.lower()
+
+    def test_states_the_parse_failure_count(self):
+        text = self._report(_coverage(found=3, read=2, failed=1))
+        assert 'parse' in text.lower() or 'failure' in text.lower()
+        assert '1' in text
+
+    def test_names_the_failure_examples(self):
+        coverage = _coverage(found=2, read=1, failed=1)
+        coverage['parse_failures']['examples'] = [
+            {'transcript': '3006/-enc/bad.jsonl.gz', 'reason': 'BadGzipFile: nope'}
+        ]
+        text = self._report(coverage)
+        assert '3006/-enc/bad.jsonl.gz' in text
+        assert 'BadGzipFile' in text
+
+    def test_discloses_example_truncation_in_words(self):
+        coverage = _coverage(found=100, read=0, failed=100)
+        coverage['parse_failures']['examples_truncated'] = True
+        coverage['parse_failures']['examples_omitted'] = 80
+        text = self._report(coverage)
+        assert '80' in text
+
+    def test_no_input_report_says_so_rather_than_reporting_zero(self):
+        # The whole point: an operator reading this must not have to infer
+        # 'no archive' from a zero.
+        text = self._report(_coverage(found=0, read=0))
+        assert 'no_input' in text
