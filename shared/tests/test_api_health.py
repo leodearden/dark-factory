@@ -6,11 +6,14 @@ Contract: plans/server-side-api-error-handling-prd.md C4 (task 3325 / mu).
 from __future__ import annotations
 
 import dataclasses
+import json
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
 from shared.api_health import ApiHealthGate, Closed, GateState, GateStats, Open, Probing
+from shared.cost_store import CostStore
 from shared.invocation_outcome import (
     OK,
     AuthFailed,
@@ -615,3 +618,96 @@ class TestNeutralOutcomes:
         state = await _report_failures(gate, 8)
         assert isinstance(state, Closed)
         assert gate.is_degraded is False
+
+
+class TestForensicRows:
+    """step-21: one api_error row per ServerError, readable via the cost-store read path.
+
+    This is the task's VERIFY signal end to end: gate -> save_api_error_event
+    -> account_events -> account_events_in_window.
+    """
+
+    async def _gate_with_store(self, tmp_path: Path) -> tuple[ApiHealthGate, CostStore, _FakeWall]:
+        store = CostStore(tmp_path / 'costs.db')
+        await store.open()
+        mono, wall = _FakeMonotonic(), _FakeWall()
+        gate = ApiHealthGate(
+            cost_store=store,
+            project_id='dark_factory',
+            run_id='run-xyz',
+            monotonic_clock=mono,
+            wall_clock=wall,
+        )
+        return gate, store, wall
+
+    async def _rows(self, store: CostStore) -> list[dict]:
+        return await store.account_events_in_window(
+            '2000-01-01T00:00:00+00:00',
+            '2099-01-01T00:00:00+00:00',
+            event_type='api_error',
+        )
+
+    async def test_one_row_per_server_error_and_none_for_other_outcomes(
+        self, tmp_path: Path
+    ) -> None:
+        gate, store, _wall = await self._gate_with_store(tmp_path)
+        try:
+            await _report_failures(gate, 3)
+            await _report_ok(gate, 4)
+            await _report_outcome(gate, CapHit(resets_at=None, reason='limit'), 2)
+            await _report_outcome(gate, ZeroOutputWedge(), 2)
+            rows = await self._rows(store)
+        finally:
+            await store.close()
+        assert len(rows) == 3
+
+    async def test_row_carries_account_project_run_and_wall_clock(self, tmp_path: Path) -> None:
+        gate, store, wall = await self._gate_with_store(tmp_path)
+        wall.advance(60)
+        try:
+            await gate.report(
+                ServerError(status=503), task_id='t9', account='max-c', role='watcher'
+            )
+            rows = await self._rows(store)
+        finally:
+            await store.close()
+        assert len(rows) == 1
+        assert rows[0]['account_name'] == 'max-c'
+        assert rows[0]['project_id'] == 'dark_factory'
+        assert rows[0]['run_id'] == 'run-xyz'
+        assert rows[0]['created_at'] == (_WALL + timedelta(seconds=60)).isoformat()
+
+    async def test_details_json_reconstructs_the_moment(self, tmp_path: Path) -> None:
+        """A trip must be reconstructable from the row stream alone."""
+        gate, store, _wall = await self._gate_with_store(tmp_path)
+        try:
+            await _report_failures(gate, 8)
+            rows = await self._rows(store)
+        finally:
+            await store.close()
+        assert len(rows) == 8
+        first = json.loads(rows[0]['details'])
+        assert first['status'] == 529
+        assert first['task_id'] == 't1'
+        assert first['role'] == 'agent'
+        assert first['state_after'] == 'Closed'
+        assert first['failures'] == 1
+
+        last = json.loads(rows[-1]['details'])
+        assert last['state_after'] == 'Open', 'the row must record the POST-report state'
+        assert last['failures'] == 8
+        assert last['completions'] == 8
+        assert last['distinct_tasks'] == 3
+        assert last['failure_rate'] == 1.0
+
+    async def test_status_is_recorded_verbatim(self, tmp_path: Path) -> None:
+        gate, store, _wall = await self._gate_with_store(tmp_path)
+        try:
+            for status in (500, 502, 503, 529):
+                await gate.report(
+                    ServerError(status=status), task_id='t1', account='max-d', role='agent'
+                )
+            rows = await self._rows(store)
+        finally:
+            await store.close()
+        assert [json.loads(r['details'])['status'] for r in rows] == [500, 502, 503, 529]
