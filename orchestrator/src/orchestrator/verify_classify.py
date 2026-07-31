@@ -314,6 +314,79 @@ _VERIFY_WORKTREE_COLLATERAL_READ_FAILURE_RE = re.compile(
 # module's existing clippy::/error[E\d+]: SEMAPHORE_TIMEOUT veto style below.
 _RUSTC_DIAGNOSTIC_SPAN_RE = re.compile(r'-->\s*\S+:\d+:\d+', re.MULTILINE)
 
+# Mis-resolved pyright interpreter (task 3367 / esc-3359-1) — the SINGLE
+# detection site for this signature. verify.py imports the predicate below
+# rather than re-spelling this regex, so there is exactly one pattern to keep
+# grounded (Invariant C1 discipline).
+_UNRESOLVED_IMPORT_RE = re.compile(
+    r'Import "([\w.]+)" could not be resolved \(reportMissingImports\)'
+)
+
+# Modules EVERY uv-workspace member declares as a dev dependency, so a HEALTHY
+# environment always resolves them. Their absence from the resolved interpreter
+# is evidence the INTERPRETER is wrong, not that the branch's dependency set is.
+# Keep this to modules that are genuinely universal across members — a module
+# only some members depend on would make the sentinel a false-negative source.
+_BASELINE_WORKSPACE_MODULES = frozenset({'pytest'})
+
+# Minimum DISTINCT top-level unresolved modules required alongside the sentinel.
+# Set far below the observed signature (~40+ distinct modules) and far above the
+# realistic branch-defect shape (a branch adds one or two undeclared imports).
+_MIN_DISTINCT_UNRESOLVED_IMPORTS = 5
+
+
+def is_interpreter_missing_workspace_packages(output: str) -> bool:
+    """True when *output* shows a Python interpreter holding NONE of the
+    workspace's third-party packages — i.e. pyright resolved the wrong
+    interpreter, not a branch that is genuinely missing a dependency.
+
+    Task 3367 / esc-3359-1. Measured signature: 509-514 pyright errors, ~40+
+    DISTINCT unresolved third-party modules, emitted in a cold merge worktree
+    on a DOCS-ONLY diff — a branch that changed no Python at all. Root cause:
+    a subproject whose ``[tool.pyright]`` declared no ``venvPath``/``venv``, so
+    ``cd <sub> && npx pyright`` resolved its interpreter from the ambient
+    ``VIRTUAL_ENV``/``PATH`` — both of which ``verify._target_subprocess_env``
+    deliberately strips.
+
+    DISCRIMINATOR CONTRACT — deliberately conservative, and asymmetric on
+    purpose. A FALSE POSITIVE is the dangerous direction: it would excuse a
+    genuine missing-dependency regression as environmental and let it through
+    the merge gate as an infra hold instead of blaming the branch. So BOTH
+    conditions must hold, never either alone:
+
+      1. a baseline sentinel module (``_BASELINE_WORKSPACE_MODULES``) is among
+         the unresolved imports — every workspace member declares it as a dev
+         dependency, so a healthy env ALWAYS resolves it; losing it proves the
+         interpreter is wrong rather than the dependency set;
+      2. at least ``_MIN_DISTINCT_UNRESOLVED_IMPORTS`` DISTINCT top-level
+         modules are unresolved — which rejects the realistic defect shape of a
+         branch adding one or two undeclared imports.
+
+    Dotted names collapse to their top-level module, so submodules of a single
+    package (``qdrant_client.models``, ``qdrant_client.http``) cannot inflate
+    the distinct count on their own.
+
+    Pure and total: any input that grounds neither condition returns ``False``
+    rather than raising — a classifier must never be the thing that fails.
+    """
+    unresolved = _unresolved_top_level_modules(output)
+    return (
+        len(unresolved) >= _MIN_DISTINCT_UNRESOLVED_IMPORTS
+        and bool(unresolved & _BASELINE_WORKSPACE_MODULES)
+    )
+
+
+def _unresolved_top_level_modules(output: str) -> frozenset[str]:
+    """Distinct TOP-LEVEL module names reported unresolved in *output*.
+
+    The one place ``_UNRESOLVED_IMPORT_RE`` is applied — both the predicate
+    above and verify.py's loud log (which reports the count) read the signature
+    through this helper, so there is never a second copy of the regex.
+    """
+    return frozenset(
+        name.split('.')[0] for name in _UNRESOLVED_IMPORT_RE.findall(output) if name
+    )
+
 _VERIFY_WORKTREE_COLLATERAL_PATTERNS: list[re.Pattern[str]] = [
     # shape 2: the verify entrypoint script itself is gone (rc=127 lint
     # stage, <0.4s) — "./scripts/verify.sh: No such file or directory".
