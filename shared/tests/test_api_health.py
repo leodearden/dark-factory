@@ -5,6 +5,7 @@ Contract: plans/server-side-api-error-handling-prd.md C4 (task 3325 / mu).
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 import logging
@@ -336,9 +337,9 @@ class TestPartialDegradationStaysClosed:
     async def test_none_task_id_failures_still_count_toward_the_numerator(self) -> None:
         """They cannot attest breadth, but dropping them would under-report an outage.
 
-        6 task-less failures + 2 task-bearing ones across 3 distinct tasks
-        would be only 2 failures if Nones were discarded — it trips because
-        all 8 are counted.
+        5 task-less failures + 3 task-bearing ones across 3 distinct tasks
+        would be only 3 failures if Nones were discarded — short of
+        min_failures=8, so no trip.  It trips because all 8 are counted.
         """
         gate, _mono, _wall = _gate()
         await _report_failures(gate, 5, task_ids=[None])
@@ -466,6 +467,35 @@ class TestProbeClose:
         assert isinstance(state, Closed), 'a partial post-close burst must not trip'
         state = await _report_failures(gate, 1)
         assert isinstance(state, Open)
+
+    async def test_a_still_degraded_provider_can_flap_closed_on_two_lucky_probes(self) -> None:
+        """amend: pin the cost of `_close`'s clear, so the trade-off stays visible.
+
+        A provider that is 60% degraded — not recovered — hands out two
+        consecutive successes soon enough.  The gate closes, the fleet
+        un-throttles, AND the accumulated failure evidence is discarded, so
+        re-tripping needs a fresh full burst (8 failures / 3 tasks / >=50%)
+        rather than the one further failure the live window would justify.
+
+        Accepted, not overlooked: oscillation after a REAL recovery is
+        guaranteed and self-sustaining (the trip's own failures are always
+        still in window at close time), while this flap costs one burst of
+        throughput and then re-trips.  See `ApiHealthGate._close`.  If this
+        assertion ever has to change, that is a deliberate policy change.
+        """
+        gate, _mono, _wall = _gate()
+        assert isinstance(await _report_failures(gate, 8), Open)
+
+        # Two lucky probes out of a still-failing provider.
+        assert isinstance(await _report_ok(gate, 2), Closed)
+        assert gate.is_degraded is False, 'the whole fleet is now un-throttled'
+
+        # The evidence went with it: a 60%-failing provider needs a full fresh
+        # burst to trip again, not the single failure the true window implies.
+        state = await _report_failures(gate, 7)
+        assert isinstance(state, Closed)
+        assert state is gate.state()
+        assert isinstance(await _report_failures(gate, 1), Open), 're-trip needs the 8th'
 
     async def test_hysteresis_is_configurable(self) -> None:
         """close_after_successes=1 closes on the first success; =3 needs three."""
@@ -771,3 +801,194 @@ class TestPersistenceIsTelemetryOnly:
         assert isinstance(state, Open)
         state = await _report_ok(gate, 2)
         assert isinstance(state, Closed)
+
+
+class _SuspendingStore:
+    """A cost store whose forensics write parks until the test releases it.
+
+    Stands in for a slow disk / contended DB: it holds every reporter inside
+    `report()` at the one and only await, which is what lets a test observe
+    the state machine mid-flight.
+    """
+
+    def __init__(self) -> None:
+        self.entered = 0
+        self.release = asyncio.Event()
+
+    async def save_api_error_event(self, **kwargs) -> None:
+        self.entered += 1
+        await self.release.wait()
+
+
+async def _yield_until(predicate, *, ticks: int = 100) -> None:
+    """Yield to the loop until ``predicate()`` holds, or ``ticks`` are exhausted.
+
+    Deterministic (no wall-clock sleeps): the caller asserts on the condition
+    afterwards, so a genuine failure surfaces as that assertion, not a hang.
+    """
+    for _ in range(ticks):
+        if predicate():
+            return
+        await asyncio.sleep(0)
+
+
+class TestConcurrentReports:
+    """amend: `report()` mutates state before its only await — no lock needed.
+
+    The gate sits at the invocation choke point, so concurrent reports are the
+    normal case, not an edge.  The invariant is load-bearing and fragile to an
+    innocuous edit (awaiting anything before `self._state = ...`, or moving the
+    forensics write above the transition); the failure it would cause — a
+    sample or a trip silently lost during an outage — is invisible to every
+    other test here, all of which report sequentially.
+    """
+
+    async def _gather_failures(
+        self, gate: ApiHealthGate, store: _SuspendingStore, n: int
+    ) -> asyncio.Future:
+        """Start ``n`` concurrent ServerError reports and park them in the write."""
+        pending = asyncio.gather(
+            *[
+                gate.report(
+                    ServerError(status=529),
+                    task_id=f't{i % 3 + 1}',
+                    account='max-d',
+                    role='agent',
+                )
+                for i in range(n)
+            ]
+        )
+        await _yield_until(lambda: store.entered == n)
+        return pending
+
+    async def test_no_sample_is_lost_to_interleaving(self) -> None:
+        store = _SuspendingStore()
+        gate, _mono, _wall = _gate(cost_store=store)
+
+        pending = await self._gather_failures(gate, store, 12)
+        assert store.entered == 12, 'a report never reached the forensics write'
+        store.release.set()
+        states = await pending
+
+        final = gate.state()
+        assert isinstance(final, Open)
+        assert final.stats.completions == 12, 'a concurrent report was dropped from the window'
+        assert final.stats.failures == 12
+        assert final.stats.distinct_tasks == 3
+        assert states[-1] is final
+
+    async def test_the_transition_happens_exactly_once(self, caplog) -> None:
+        """12 concurrent failures trip the gate once, not once per over-threshold report."""
+        store = _SuspendingStore()
+        gate, _mono, _wall = _gate(cost_store=store)
+
+        with caplog.at_level(logging.WARNING, logger='shared.api_health'):
+            pending = await self._gather_failures(gate, store, 12)
+            store.release.set()
+            await pending
+
+        trips = [r for r in caplog.records if 'TRIPPED' in r.getMessage()]
+        assert len(trips) == 1, f'expected one Closed->Open transition, got {len(trips)}'
+
+    async def test_a_parked_reporter_returns_the_current_state_not_a_stale_snapshot(
+        self,
+    ) -> None:
+        """A reporter held in a slow write during someone else's trip must not un-throttle.
+
+        `report()` reads `self._state` at RETURN time, after its forensics
+        write, so every concurrent reporter observes the trip that landed while
+        it was parked.  Returning each reporter's own pre-trip snapshot instead
+        would hand a caller `Closed` during a known outage — the silent
+        un-throttle the module docstring warns about — so this ordering is the
+        contract, not an accident of where the await sits.
+        """
+        store = _SuspendingStore()
+        gate, _mono, _wall = _gate(cost_store=store)
+
+        pending = await self._gather_failures(gate, store, 12)
+        store.release.set()
+        states = await pending
+
+        final = gate.state()
+        assert isinstance(final, Open)
+        assert all(s is final for s in states), 'a parked reporter returned a superseded state'
+
+    async def test_state_is_visible_before_the_forensics_write_completes(self) -> None:
+        """The trip must not be gated on I/O — a reader mid-write already sees Open.
+
+        This is why the write is awaited AFTER the mutation: eight 5xx have
+        landed, the disk is stuck, and the scheduler reading the gate right now
+        must still throttle.
+        """
+        store = _SuspendingStore()
+        gate, _mono, _wall = _gate(cost_store=store)
+
+        pending = await self._gather_failures(gate, store, 8)
+        assert isinstance(gate.state(), Open), 'the trip waited on the forensics write'
+        assert gate.is_degraded is True
+        store.release.set()
+        await pending
+
+
+class TestStaleEvidence:
+    """amend: a degraded gate can outlive its evidence — expose that, don't hide it.
+
+    Nothing ages out and nothing closes while the fleet is silent, and a trip
+    CAUSES silence (dispatch throttles to a single probe).  Consumers whose
+    behaviour escalates with time-spent-open must be able to tell "failing us
+    right now" from "failed us hours ago and nothing has asked since".
+    """
+
+    async def test_fresh_gate_has_no_report_age(self) -> None:
+        gate, _mono, _wall = _gate()
+        assert gate.seconds_since_last_report() is None
+        assert gate.evidence_is_stale is True, 'no evidence at all is not fresh evidence'
+
+    async def test_report_age_tracks_the_monotonic_clock(self) -> None:
+        gate, mono, _wall = _gate()
+        await _report_failures(gate, 1)
+        assert gate.seconds_since_last_report() == 0.0
+        mono.advance(42.0)
+        assert gate.seconds_since_last_report() == 42.0
+
+    async def test_open_gate_goes_stale_after_a_silent_window(self) -> None:
+        """The L2 promotion clock reads Open.since; this is what qualifies it."""
+        gate, mono, _wall = _gate()
+        assert isinstance(await _report_failures(gate, 8), Open)
+        assert gate.evidence_is_stale is False
+
+        mono.advance(599.0)
+        assert gate.evidence_is_stale is False, 'still inside the window'
+        mono.advance(2.0)
+        assert gate.evidence_is_stale is True
+        assert gate.is_degraded is True, 'staleness must not silently un-throttle'
+        assert isinstance(gate.state(), Open), 'silence is not evidence of recovery'
+
+    async def test_a_probe_refreshes_the_evidence_without_closing(self) -> None:
+        gate, mono, _wall = _gate()
+        await _report_failures(gate, 8)
+        mono.advance(601.0)
+        assert gate.evidence_is_stale is True
+        await _report_ok(gate, 1)
+        assert gate.evidence_is_stale is False
+        assert gate.is_degraded is True, 'one probe is not recovery'
+
+    async def test_age_survives_the_close_time_window_clear(self) -> None:
+        """`_close` clears the samples; the report age is kept outside them on purpose."""
+        gate, mono, _wall = _gate()
+        await _report_failures(gate, 8)
+        await _report_ok(gate, 2)
+        assert isinstance(gate.state(), Closed)
+        mono.advance(5.0)
+        assert gate.seconds_since_last_report() == 5.0
+
+    async def test_state_is_not_mutated_by_reading_it(self) -> None:
+        """Reads never advance the machine — only a successful probe closes the gate."""
+        gate, mono, _wall = _gate()
+        opened = await _report_failures(gate, 8)
+        mono.advance(86_400.0)
+        for _ in range(3):
+            assert gate.state() is opened
+            assert gate.is_degraded is True
+        assert isinstance(opened, Open)
+        assert opened.stats.failures == 8, 'the carried evidence was rewritten by a read'

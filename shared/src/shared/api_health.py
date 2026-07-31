@@ -29,6 +29,23 @@ State machine::
 ``Probing`` is a sub-state of open: the provider is not healthy until the
 gate closes.  Consumers should read :attr:`ApiHealthGate.is_degraded` rather
 than testing ``isinstance(s, Open)``, which silently un-throttles mid-outage.
+
+**The gate is report-driven, and a degraded gate can outlive its evidence.**
+There is no timer: the window ages out only when a report arrives, and the
+only route from ``Open`` back to ``Closed`` is a successful probe.  So a gate
+that trips and then sees no traffic — an idle overnight queue, dispatch
+throttled to a single probe, a paused fleet — stays ``Open`` indefinitely on
+evidence that has fully aged out.  That is deliberate: closing on silence
+would declare recovery with no successful invocation to show for it, which
+is exactly the claim the probe-close contract exists to require.
+
+Any consumer whose behaviour escalates with TIME SPENT open — notably the
+``max_open_before_l2_hours`` promotion clock reading :attr:`Open.since` —
+must therefore weigh :attr:`ApiHealthGate.evidence_is_stale` (or
+:meth:`ApiHealthGate.seconds_since_last_report`) alongside the state.  "Open,
+last 5xx four seconds ago" and "Open, no traffic at all since the trip four
+hours ago" are the same state and very different facts; promoting the second
+one to L2 pages a human about a provider nothing has spoken to since.
 """
 
 from __future__ import annotations
@@ -224,6 +241,11 @@ class ApiHealthGate:
         # Scheduler._blocked_transitions (scheduler.py:1551): a deque on the
         # monotonic clock, evicted from the left on every report.
         self._samples: deque[_Sample] = deque()
+        # Monotonic stamp of the last report, kept OUTSIDE the deque so it
+        # survives eviction and the close-time clear.  It is what tells a
+        # time-sensitive consumer whether a degraded state still has live
+        # evidence behind it — see `seconds_since_last_report`.
+        self._last_report_monotonic: float | None = None
 
     async def report(
         self,
@@ -238,6 +260,13 @@ class ApiHealthGate:
         Called from the invocation choke point.  The returned value IS the
         post-report state, so the caller needs no follow-up :meth:`state` call.
 
+        Under concurrent reporters the return is the state as of RETURN time,
+        not a snapshot taken at this report's own transition: a reporter parked
+        in a slow forensics write while another reporter's 5xx trips the gate
+        gets back the trip.  That direction is deliberate — handing a caller a
+        superseded ``Closed`` during a known outage is the silent un-throttle
+        this module exists to prevent.
+
         Args:
             outcome: The classified invocation outcome.  ``ServerError`` counts
                 as a provider failure; ``OK`` as a provider success; every
@@ -247,6 +276,7 @@ class ApiHealthGate:
             role: Agent role, recorded on the forensics row.
         """
         now = self._monotonic_clock()
+        self._last_report_monotonic = now
         self._evict(now)
 
         signal = self._classify(outcome)
@@ -419,6 +449,25 @@ class ApiHealthGate:
 
         Requiring fresh post-close evidence makes a re-trip mean "the provider
         is down again" rather than "the provider was down a minute ago".
+
+        The cost, stated plainly because it is real: under a SUSTAINED partial
+        outage (say 60% failing), two lucky consecutive successes close the
+        gate, un-throttle the fleet AND discard the accumulated evidence, so
+        re-tripping needs a fresh full burst — ``min_failures`` across
+        ``min_distinct_tasks`` at ``failure_rate_threshold`` — during which the
+        fleet runs unthrottled against a provider that never recovered.
+        ``test_a_still_degraded_provider_can_flap_closed_on_two_lucky_probes``
+        pins that behaviour so it stays a visible trade-off rather than an
+        emergent surprise.
+
+        It is accepted here because the failure modes are not symmetric:
+        oscillation after a REAL recovery is guaranteed and self-sustaining
+        (the trip evidence is always still in window at close time), while a
+        flap-closed under partial degradation costs one burst of throughput
+        and then re-trips.  The knobs to reach for first if that flap is
+        observed in practice are ``close_after_successes`` (PRD-mandated at 2,
+        so a PRD change) and, failing that, carrying failure samples across a
+        close at reduced weight instead of clearing.
         """
         since = self._degraded_since()
         logger.info(
@@ -473,10 +522,13 @@ class ApiHealthGate:
         inflate the window mid-outage.
 
         Eviction is driven by REPORTS, not by a timer: an idle gate keeps
-        stale samples until the next report arrives.  That is harmless because
-        :meth:`report` always evicts before it evaluates, so no decision is
-        ever taken on an unevicted window — but it does mean :meth:`state` on a
-        long-idle gate reflects the last report, not the passage of time.
+        stale samples until the next report arrives.  No decision taken INSIDE
+        this class is affected, because :meth:`report` always evicts before it
+        evaluates — but decisions taken OUTSIDE it, off :meth:`state`, are:
+        a long-idle gate reflects the last report, not the passage of time,
+        and a degraded one stays degraded on evidence that has fully aged out.
+        :attr:`evidence_is_stale` is what exposes that to those callers; see
+        the module docstring.
 
         The comparison is strict (``<``), so a sample exactly ``window_secs``
         old is still in window; ``<=`` would silently shorten every window by
@@ -525,6 +577,13 @@ class ApiHealthGate:
 
         Sync on purpose: the scheduler's dispatch-eligibility hot path reads
         the gate without an await.
+
+        Deliberately does NOT evict or otherwise advance the machine: a read
+        must not mutate, and there is no state this could reach that a
+        successful probe would not reach more honestly.  The consequence is
+        that a long-idle gate reports the last REPORTED state, not the passage
+        of time — pair this with :attr:`evidence_is_stale` if the decision you
+        are taking depends on how fresh that state is (module docstring).
         """
         return self._state
 
@@ -535,5 +594,45 @@ class ApiHealthGate:
         Every C4 open-state consumer must keep throttling while probing.
         Exposing one boolean here makes "forgot to handle Probing" — a silent
         un-throttle mid-outage — unrepresentable at the call sites.
+
+        Throttling on stale evidence is the safe direction (it costs a little
+        throughput until the first probe lands and closes the gate), so this
+        flag is intentionally NOT staleness-aware.  Decisions that are not
+        safe in that direction — escalating, paging, promoting to L2 — must
+        consult :attr:`evidence_is_stale` too.
         """
         return not isinstance(self._state, Closed)
+
+    def seconds_since_last_report(self) -> float | None:
+        """Monotonic seconds since the last :meth:`report`, or None if never reported.
+
+        The age of the freshest evidence behind :meth:`state`.  Monotonic, so
+        an NTP step cannot make a degraded gate look freshly-fed or
+        hours-abandoned.
+        """
+        if self._last_report_monotonic is None:
+            return None
+        return self._monotonic_clock() - self._last_report_monotonic
+
+    @property
+    def evidence_is_stale(self) -> bool:
+        """True when no report has landed within the last ``window_secs``.
+
+        The gate is report-driven: nothing ages out and nothing closes while
+        the fleet is silent, and a tripped gate CAUSES silence (dispatch
+        throttles to a single probe; the queue may be idle anyway).  So
+        ``Open`` on its own does not distinguish "the provider is failing us
+        right now" from "the provider failed us hours ago and nothing has
+        asked it since".
+
+        Consult this before any escalation that measures time-spent-open —
+        chiefly the ``max_open_before_l2_hours`` promotion clock over
+        :attr:`Open.since`.  Promoting a stale-evidence gate to L2 pages a
+        human about a provider that may have recovered unobserved.
+
+        Meaningful while :attr:`is_degraded`; a Closed gate is making no claim
+        that needs backing, and a never-reported gate reads True because it
+        has no evidence at all.
+        """
+        idle = self.seconds_since_last_report()
+        return idle is None or idle >= self.window_secs
