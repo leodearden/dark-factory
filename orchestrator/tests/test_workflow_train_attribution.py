@@ -11,14 +11,16 @@ Step-13 (RED): edge cases — tip-as-offender, un-stack conflict, advance failur
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import pydantic_spec
 
 from orchestrator.config import OrchestratorConfig
+from orchestrator.delivered_checks import DeliveredChecksBlock
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import AdvanceOutcome
 from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
@@ -1257,3 +1259,292 @@ class TestAttributionConsumesLandedRow:
         )
         # ... AND the tip's write-ahead row consumed inline (PRD B1: lookup==None).
         assert outbox.lookup('103') is None
+
+
+# ---------------------------------------------------------------------------
+# Task 3057 step-11 (RED) — seam 11: the solo-passer stamp in
+# _attribute_train_failure.
+#
+# A member that passes solo and whose delta advances main proves the DELTA
+# landed; it never proves the member's DECLARED capability is what landed.
+# Like the inline train-member closure, this seam stamps OTHER member ids, so
+# it needs a scheduler.get_task(mid) round-trip for metadata.  A withholding
+# must be PER-MEMBER: a blocked member never aborts its siblings' attribution.
+# ---------------------------------------------------------------------------
+
+_ATTR_GATE_TARGET = 'orchestrator.workflow.gate_mark_done_on_delivered_checks'
+_ATTR_PROV_TARGET = 'orchestrator.workflow.MergeProvenance'
+_ATTR_DC_CHECK = {
+    'name': 'cap-x', 'kind': 'grep', 'pattern': 'SomePattern', 'expect': 'present',
+}
+_ATTR_TRAIN = 'T-dc-attr'
+
+
+def _attr_block(reason: str = 'failed') -> DeliveredChecksBlock:
+    return DeliveredChecksBlock(
+        reason=reason,  # type: ignore[arg-type]
+        main_sha='m' * 40,
+        failed_check=_ATTR_DC_CHECK if reason == 'failed' else None,
+    )
+
+
+def _attr_guard(blocked_ids: set[str], *, reason: str = 'failed') -> AsyncMock:
+    """A patched guard that blocks exactly *blocked_ids* — per member."""
+    async def _gate(task_id, metadata, **kwargs):  # noqa: ANN001, ANN202
+        return _attr_block(reason) if task_id in blocked_ids else None
+
+    return AsyncMock(side_effect=_gate)
+
+
+def _armed_attr_fixture(
+    *,
+    enabled: bool = True,
+    metadata_by_id: dict[str, dict] | None = None,
+    get_task: AsyncMock | None = None,
+) -> _Fixture:
+    """``_make`` plus a live ``delivered_checks`` config and member metadata.
+
+    Mirrors ``TestAttributionConsumesLandedRow``'s driver so the guard rows
+    exercise the SAME some-fail attribution path the seam lives on.
+    """
+    from orchestrator.config import DeliveredChecksConfig
+
+    f = _make(
+        task_id='103',
+        metadata={'train': {'id': _ATTR_TRAIN, 'order': 2,
+                            'members': ['101', '102', '103']}},
+    )
+    f.wf.config.delivered_checks = DeliveredChecksConfig(
+        enabled=enabled, check_timeout_secs=7.5,
+    )
+    f.wf.event_store = MagicMock()
+    f.wf.git_ops = f.git_ops
+    f.git_ops.get_main_sha = AsyncMock(return_value='main-sha-probe')
+    f.git_ops.delete_solo_branch = AsyncMock()
+    f.git_ops.advance_main = AsyncMock(
+        return_value=AdvanceOutcome('advanced', advanced_sha='landedsha'),
+    )
+
+    metas = metadata_by_id or {}
+    default = {'delivered_checks': [_ATTR_DC_CHECK]}
+
+    async def _get_task(mid):  # noqa: ANN001, ANN202
+        return {'id': mid, 'metadata': metas.get(mid, default)}
+
+    f.scheduler.get_task = get_task or AsyncMock(side_effect=_get_task)
+    return f
+
+
+async def _run_attribution(f: _Fixture) -> WorkflowOutcome:
+    """Drive the some-fail arm: 101 fails solo; 102 and the tip 103 pass."""
+    f.wf._reverify_one_member = AsyncMock(side_effect=[  # type: ignore[method-assign]
+        _solo_fail('101'),
+        _solo_pass_full('102'),
+        _solo_pass_full('103'),
+    ])
+    members = _train_members(train_id=_ATTR_TRAIN, tip_id='103')
+    return await f.wf._attribute_train_failure(
+        _make_tagged_result(), _ATTR_TRAIN, members,
+    )
+
+
+def _train_merged_ids(f: _Fixture) -> list[str]:
+    """Member ids reported as attributed via an EventType.train_merged emit."""
+    return [
+        c.kwargs.get('task_id')
+        for c in f.wf.event_store.emit.call_args_list  # type: ignore[union-attr]
+        if c.args and c.args[0] == EventType.train_merged
+    ]
+
+
+def _done_ids(f: _Fixture) -> list[str]:
+    return [c.args[0] for c in f.scheduler.mark_done.await_args_list]
+
+
+@pytest.mark.asyncio
+class TestAttributeTrainFailurePasserDeliveredChecksGuard:
+    """The delivered-capability guard on the attribution solo-passer stamp.
+
+    A withheld passer is never appended to ``landed_ids`` and never emits a
+    ``train_merged`` event — it must not be REPORTED as attributed when its
+    declared capability is unverifiable.  The write-ahead ``LandedRow`` is
+    retained and the member self-heals through the 2794-guarded stranded sweep.
+    """
+
+    # --- row 1: hollow-done regression / FAILED ---------------------------
+
+    async def test_failed_block_withholds_stamp_and_attribution_report(
+        self, tmp_path: Path, caplog,
+    ):
+        outbox = LandedOutbox(tmp_path / 'landed_outbox.json')
+        outbox.record(LandedRow(
+            task_id='103', branch_tip_sha='tip',
+            advanced_sha='landedsha', landed_at=1.0,
+        ))
+        MergeProvenance.bind(outbox)
+
+        f = _armed_attr_fixture()
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.workflow'), \
+                patch(_ATTR_GATE_TARGET, _attr_guard({'102', '103'})):
+            result = await _run_attribution(f)  # must return normally
+
+        assert _done_ids(f) == [], f'no passer may be stamped: {_done_ids(f)!r}'
+        assert _train_merged_ids(f) == [], (
+            'a withheld member must never be reported as attributed'
+        )
+        assert outbox.lookup('103') is not None, (
+            'the write-ahead row must survive a withholding'
+        )
+        # Tip was never landed → the tip surfaces BLOCKED, not DONE.
+        assert result == WorkflowOutcome.BLOCKED
+
+        blob = '\n'.join(r.getMessage() for r in caplog.records)
+        assert _ATTR_TRAIN in blob and '103' in blob
+
+    # --- row 2: all_delivered -> byte-identical land, in order -------------
+
+    async def test_all_delivered_lands_then_consumes_then_reports(self):
+        order: list[str] = []
+        f = _armed_attr_fixture()
+        f.scheduler.mark_done = AsyncMock(
+            side_effect=lambda *a, **k: order.append(f'mark_done:{a[0]}'),
+        )
+        prov = MagicMock()
+        prov.consume = MagicMock(
+            side_effect=lambda mid: order.append(f'consume:{mid}'),
+        )
+        emit = f.wf.event_store.emit  # type: ignore[union-attr]
+        emit.side_effect = lambda et, **k: (
+            order.append(f'emit:{k.get("task_id")}')
+            if et == EventType.train_merged else None
+        )
+
+        with patch(_ATTR_GATE_TARGET, AsyncMock(return_value=None)), \
+                patch(_ATTR_PROV_TARGET, prov):
+            result = await _run_attribution(f)
+
+        assert order == [
+            'mark_done:102', 'consume:102', 'emit:102',
+            'mark_done:103', 'consume:103', 'emit:103',
+        ], f'ordering must be byte-identical to today, got {order!r}'
+        assert result == WorkflowOutcome.DONE
+        call = f.scheduler.mark_done.await_args_list[-1]
+        assert call.kwargs['kind'] == 'merged'
+        assert call.kwargs['sha'] == 'landedsha'
+        assert call.kwargs['note'] == (
+            f'train {_ATTR_TRAIN} attribution: member passed solo'
+        )
+
+    # --- row 3: no delivered_checks -> unchanged (the common case) --------
+
+    async def test_check_less_members_land_unchanged(self):
+        """Real (inert) helper: members declaring no checks land as today."""
+        f = _armed_attr_fixture(
+            metadata_by_id={'101': {}, '102': {}, '103': {}},
+        )
+
+        result = await _run_attribution(f)
+
+        assert _done_ids(f) == ['102', '103']
+        assert _train_merged_ids(f) == ['102', '103']
+        assert result == WorkflowOutcome.DONE
+
+    # --- rows 4 & 5: fail-safe blocks withhold identically ----------------
+
+    @pytest.mark.parametrize('reason', ['errored', 'main_sha_unresolved'])
+    async def test_fail_safe_blocks_withhold_without_mutating_status(
+        self, reason: str,
+    ):
+        """A withheld PASSER's status is not mutated — only the failer '101' is
+        blocked — so the member is left for the 2794-guarded stranded sweep."""
+        f = _armed_attr_fixture()
+        prov = MagicMock()
+
+        with patch(_ATTR_GATE_TARGET,
+                   _attr_guard({'102', '103'}, reason=reason)), \
+                patch(_ATTR_PROV_TARGET, prov):
+            await _run_attribution(f)
+
+        assert _done_ids(f) == []
+        prov.consume.assert_not_called()
+        status_ids = [
+            c.args[0] for c in f.scheduler.set_task_status.await_args_list
+        ]
+        assert status_ids == ['101'], (
+            f'only the solo failer may be status-mutated, got {status_ids!r}'
+        )
+
+    # --- row 6: kill switch is FORWARDED, never re-implemented ------------
+
+    async def test_kill_switch_is_forwarded_not_short_circuited(self):
+        guard = AsyncMock(return_value=None)
+        f = _armed_attr_fixture(enabled=False)
+
+        with patch(_ATTR_GATE_TARGET, guard):
+            await _run_attribution(f)
+
+        assert _done_ids(f) == ['102', '103']
+        assert guard.await_args.kwargs['enabled'] is False
+
+    async def test_kill_switch_with_real_helper_lands_as_today(self):
+        f = _armed_attr_fixture(enabled=False)
+
+        result = await _run_attribution(f)
+
+        assert _done_ids(f) == ['102', '103']
+        assert result == WorkflowOutcome.DONE
+
+    # --- plumbing: ONE metadata round-trip per passer ---------------------
+
+    async def test_member_metadata_is_read_once_per_passer_and_forwarded(self):
+        guard = AsyncMock(return_value=None)
+        f = _armed_attr_fixture()
+
+        with patch(_ATTR_GATE_TARGET, guard):
+            await _run_attribution(f)
+
+        read_ids = [c.args[0] for c in f.scheduler.get_task.await_args_list]
+        assert read_ids == ['102', '103'], (
+            f'exactly one read per PASSER (never the failer), got {read_ids!r}'
+        )
+        gated = [c.args[0] for c in guard.await_args_list]
+        assert gated == ['102', '103'], 'must gate on the MEMBER ids'
+        assert guard.await_args.args[1] == {'delivered_checks': [_ATTR_DC_CHECK]}
+        assert guard.await_args.kwargs['site'] == 'train-attribution-solo-passer'
+        assert guard.await_args.kwargs['project_root'] == str(
+            f.wf.config.project_root,
+        ), 'checks evaluate the committed tree at main, not the worktree'
+
+    # --- fail-safe in ALL directions: unknown metadata withholds ----------
+
+    @pytest.mark.parametrize('mode', ['none', 'raises'])
+    async def test_unreadable_member_metadata_withholds_without_raising(
+        self, mode: str,
+    ):
+        get_task = (
+            AsyncMock(return_value=None) if mode == 'none'
+            else AsyncMock(side_effect=RuntimeError('scheduler down'))
+        )
+        f = _armed_attr_fixture(get_task=get_task)
+
+        result = await _run_attribution(f)  # must not raise
+
+        assert _done_ids(f) == []
+        assert _train_merged_ids(f) == []
+        assert result == WorkflowOutcome.BLOCKED
+
+    # --- per-member: a blocked member never aborts its siblings -----------
+
+    async def test_withholding_is_per_member_not_per_train(self):
+        """Member 102 blocked, tip 103 clean → 103 still lands normally."""
+        f = _armed_attr_fixture()
+
+        with patch(_ATTR_GATE_TARGET, _attr_guard({'102'})):
+            result = await _run_attribution(f)
+
+        assert _done_ids(f) == ['103'], (
+            f'the clean sibling must still land, got {_done_ids(f)!r}'
+        )
+        assert _train_merged_ids(f) == ['103']
+        assert result == WorkflowOutcome.DONE
