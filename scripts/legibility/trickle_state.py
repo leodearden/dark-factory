@@ -40,8 +40,20 @@ that let a suppressed night read like a quiet one for 14 nights
 from __future__ import annotations
 
 import logging
+import os
+import tempfile
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+STATE_FILENAME = 'trickle-state.json'
+"""Basename of the per-project run-state file."""
+
+STATE_SCHEMA_VERSION = 1
+"""Version of the recorded document's shape. :func:`load_state` treats any
+OTHER value as ``malformed`` rather than guessing at unknown fields — a
+reader that silently accepts a shape it does not understand is exactly the
+silent-degradation mode this module exists to close."""
 
 
 # ---------------------------------------------------------------------------
@@ -123,3 +135,65 @@ def classify_run(
     if (budget_skipped + below_sampling_cut) > 0:
         return OUTCOME_BARREN
     return OUTCOME_QUIET
+
+
+# ---------------------------------------------------------------------------
+# trickle_state_path — where the record lives, and why not in the repo
+# ---------------------------------------------------------------------------
+
+def trickle_state_path(project_id: str) -> Path:
+    """Return the per-project run-state file path.
+
+    ``${XDG_STATE_HOME:-~/.local/state}/dark-factory/legibility/
+    <project_id>/trickle-state.json``.
+
+    NOT UNDER ``docs/legibility/``, despite ``census-state.json`` living
+    there and looking like the local precedent. That file is git-TRACKED
+    and advances only when a census fires (rare, and committed then). A
+    file rewritten EVERY night cannot live on a tracked path: it would
+    either leave the machine-operated ``project_root`` checkout
+    permanently dirty — poisoning the startup dirty-tree guard and
+    warm-lane GC, the exact pollution class task 2439 fixed — or force a
+    nightly commit, which would make "the repo has a commit today" a valid
+    liveness signal and thereby CONTRADICT PRD decision 7 outright.
+    XDG-rooted host state is what this actually is: a record of what the
+    local timer did. It also needs no ``.gitignore`` entry, because the
+    path is outside every checkout.
+
+    RE-DERIVED, NOT REUSED. The rooting scheme and the ``Path.home()`` ->
+    ``RuntimeError`` -> ``tempfile.gettempdir()`` degradation mirror
+    ``orchestrator.mcp_lifecycle.managed_runtime_data_dirs``
+    (mcp_lifecycle.py, task 2439) verbatim in shape, but that function is
+    deliberately NOT imported: the ``orchestrator`` package is not
+    importable under the bare-``python3`` predicate path this module must
+    survive (see the module docstring). Cited here so the two stay
+    recognizably ONE convention rather than drifting into two.
+
+    ONE DELIBERATE DIVERGENCE from that scheme: an extra ``legibility/``
+    segment between ``dark-factory/`` and ``<project_id>/`` (mcp_lifecycle
+    uses ``dark-factory/<project_id>/queue|reconciliation``). This keeps
+    legibility state from colliding with the managed fused-memory runtime
+    dirs for the same project id.
+    """
+    xdg_state_home = os.environ.get('XDG_STATE_HOME')
+    if xdg_state_home:
+        base = Path(xdg_state_home)
+    else:
+        try:
+            base = Path.home() / '.local' / 'state'
+        except RuntimeError:
+            # Stripped daemon/CI environment: no HOME and no pwd entry.
+            # This helper is on the nightly run's unconditional path and on
+            # the predicate's, so an unguarded raise would turn an
+            # observability write into a new failure mode. Degrade loudly
+            # instead (task 2439 amendment's identical choice).
+            logger.warning(
+                'trickle_state_path: could not resolve a home directory '
+                '(HOME unset?); falling back to the OS temp dir for '
+                'project_id=%s — the recorded streak will not survive a '
+                'reboot',
+                project_id,
+            )
+            base = Path(tempfile.gettempdir())
+
+    return base / 'dark-factory' / 'legibility' / project_id / STATE_FILENAME
