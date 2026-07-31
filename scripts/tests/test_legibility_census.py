@@ -18,7 +18,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -917,6 +917,70 @@ def test_advance_census_state_done_count_zero_is_written_as_integer_zero(tmp_pat
     assert "last_census_done_count" in data, "must never be dropped as falsy"
     assert data["last_census_done_count"] == 0
     assert isinstance(data["last_census_done_count"], int)
+
+
+def test_advance_census_state_writes_none_done_count_as_json_null(tmp_path):
+    """Task 3291: when the done-count could not be OBSERVED, the honest
+    baseline is `null` -- not a fabricated 0 (that is the defect being
+    fixed), not a carried-forward stale value (a quieter guess), and not an
+    omitted key (which would violate the 2579/eta MUST-persist contract).
+    `null` honours that contract literally -- the key is still always
+    present -- while being truthful about the state being unknown."""
+    path = tmp_path / "census-state.json"
+
+    mod.advance_census_state(
+        path, now_iso="2026-07-31T12:00:00+00:00", report_path="plans/x.md", done_count=None,
+    )
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert "last_census_done_count" in data, "MUST-persist contract: key is never dropped"
+    assert data["last_census_done_count"] is None
+    assert '"last_census_done_count": null' in path.read_text(encoding="utf-8")
+
+
+def test_null_done_count_baseline_makes_condition_b_fail_safe(tmp_path, caplog):
+    """End-to-end proof that an UNKNOWN baseline disarms condition (b)
+    instead of always-firing it. A poisoned `0` baseline made
+    compute_tasks_landed return `current_done - 0` -- every done task ever,
+    trivially over the 120 threshold -- so (b) fired every ~7 days forever.
+    A `null` baseline routes into the existing absent-baseline branch: one
+    WARNING, `None`, no fire."""
+    path = tmp_path / "census-state.json"
+    mod.advance_census_state(
+        path, now_iso="2026-07-31T12:00:00+00:00", report_path="plans/x.md", done_count=None,
+    )
+
+    # A null baseline is UNKNOWN, not malformed -- the state file still loads.
+    status, data = census_trigger.load_census_state(path)
+    assert status == "ok"
+    assert data["last_census_done_count"] is None
+
+    with caplog.at_level(logging.WARNING):
+        landed = census_trigger.compute_tasks_landed(
+            state=data,
+            # A perfectly VALID fetcher: the fail-safe here comes from the
+            # unknown baseline, not from any fetch problem.
+            status_fetcher=lambda: {"statuses": {f"t{i}": "done" for i in range(2870)}},
+        )
+
+    assert landed is None
+    assert sum(1 for r in caplog.records if r.levelno == logging.WARNING) == 1
+
+    # ... and with tasks_landed=None, condition (b) cannot fire even when
+    # days_since is well past tasks_landed_min_days. Condition (a)
+    # (max_interval_days) remains the unconditional backstop.
+    config = census_trigger.CensusConfig()
+    now = datetime(2026, 7, 31, 12, 0, 0, tzinfo=timezone.utc)
+    decision = census_trigger.evaluate(
+        now=now,
+        last_census_at=now - timedelta(days=config.tasks_landed_min_days + 1),
+        never_censused=False,
+        tasks_landed=None,
+        candidate_first_seens=[],
+        config=config,
+    )
+
+    assert decision.fire is False
 
 
 def test_advance_census_state_round_trips_through_census_trigger_load(tmp_path):
