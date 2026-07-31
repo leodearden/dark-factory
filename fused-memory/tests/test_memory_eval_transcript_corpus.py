@@ -17,9 +17,11 @@ from __future__ import annotations
 
 import gzip
 import importlib.util
+import io
 import json
 import sys
 import types
+import zlib
 from pathlib import Path
 from typing import Any
 
@@ -576,6 +578,51 @@ def _write_corrupt(root: Path, rel: str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b'this is not gzip\n')
     return path
+
+
+def _gz_payload(n_records: int = 200) -> bytes:
+    """A multi-record JSONL body for the two damaged-archive helpers below.
+    Padded to many records so a cut at the halfway mark lands mid-stream."""
+    return ''.join(
+        json.dumps({'type': 'user', 'seq': i, 'pad': 'x' * 200}) + '\n'
+        for i in range(n_records)
+    ).encode('utf-8')
+
+
+def _write_truncated(root: Path, rel: str) -> Path:
+    """Half a valid gz stream — an archive write interrupted by a killed unit.
+
+    Raw ``gzip`` signals this with ``EOFError``, which is not an ``OSError``;
+    the readers normalize it so this script's ``except OSError`` counts it.
+    """
+    path = root / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    blob = gzip.compress(_gz_payload())
+    path.write_bytes(blob[: len(blob) // 2])
+    return path
+
+
+def _write_corrupt_body(root: Path, rel: str) -> Path:
+    """A gz whose DEFLATE body is damaged — raw ``gzip`` raises ``zlib.error``.
+
+    Probes for the first single-byte flip producing that shape (most flips
+    only trip the trailing checksum, which is already an ``OSError``), using
+    stdlib gzip directly so the helper is independent of the readers.
+    """
+    path = root / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    blob = gzip.compress(_gz_payload())
+    for index in range(10, len(blob)):
+        candidate = bytearray(blob)
+        candidate[index] ^= 0xFF
+        try:
+            gzip.GzipFile(fileobj=io.BytesIO(bytes(candidate))).read()
+        except zlib.error:
+            path.write_bytes(bytes(candidate))
+            return path
+        except Exception:
+            continue  # a different corruption shape — keep probing
+    raise AssertionError('no single-byte flip produced a zlib.error body')
 
 
 class TestScanArchive:
@@ -1224,3 +1271,148 @@ class TestSingleTranscriptMode:
         code, coverage, _ = self._cli(tmp_path / 'nope.jsonl.gz', tmp_path / 'out')
         assert code == 3
         assert coverage['status'] == 'total_failure'
+
+
+# ===========================================================================
+# step-27 — a PARTIALLY-WRITTEN archived transcript is counted, not fatal
+#
+# The `except OSError` handlers in this script are only as good as the
+# contract the readers keep. Measured, raw gzip signals its three corruption
+# shapes with three different types, and only bad magic is already an
+# OSError:
+#
+#     bad magic         -> gzip.BadGzipFile   (an OSError subclass)
+#     truncated stream  -> EOFError           (not an OSError)
+#     corrupt body      -> zlib.error         (not an OSError)
+#
+# Before the readers normalized them, ONE truncated file among the live
+# archive's ~2814 aborted the entire run with a traceback: no corpus, no
+# coverage file, no report, and an exit status outside the documented
+# ok/degraded/no_input/total_failure vocabulary. That is precisely the
+# ambiguity this module exists to make impossible, so it is pinned here at
+# the CLI boundary rather than only at the reader.
+#
+# The archive is fire-and-forget runtime state written by the running fleet:
+# a unit killed mid-write and a file read while still being compressed both
+# produce exactly these shapes. No handler in the script changes — these
+# tests are what prove `except OSError` is now sufficient rather than
+# assuming it.
+# ===========================================================================
+
+
+class TestPartiallyWrittenTranscriptsAreCounted:
+    GOOD_REL = '5150/-enc-a/good-session.jsonl.gz'
+    TRUNCATED_REL = '5150/-enc-a/truncated-session.jsonl.gz'
+    CORRUPT_BODY_REL = '5151/-enc-b/corrupt-body-session.jsonl.gz'
+
+    def _one_bad_one_good(self, tmp_path: Path) -> Path:
+        root = tmp_path / 'archive'
+        _write_transcript(root, self.GOOD_REL, [
+            _briefing('claude-task-5150-implementer'),
+            _tool_use('toolu_ok', 'the search that must survive'),
+            _tool_result('toolu_ok', {'results': [_result('mem-1', 0.87)]}),
+        ])
+        _write_truncated(root, self.TRUNCATED_REL)
+        return root
+
+    def _all_bad(self, tmp_path: Path) -> Path:
+        root = tmp_path / 'all-bad-archive'
+        _write_truncated(root, self.TRUNCATED_REL)
+        _write_corrupt_body(root, self.CORRUPT_BODY_REL)
+        return root
+
+    # -- (a) partial corruption: degraded, and the run survives -------------
+
+    def test_one_truncated_file_does_not_cost_the_others(self, tmp_path):
+        # The whole point. One bad file among many must cost exactly one
+        # counted failure, not the entire corpus.
+        code, coverage, records, _ = _run_cli(
+            self._one_bad_one_good(tmp_path), tmp_path / 'out')
+
+        assert code == 0
+        assert coverage['status'] == 'degraded'
+        assert [r['query'] for r in records] == ['the search that must survive']
+        assert records[0]['results'][0]['id'] == 'mem-1'
+
+    def test_the_truncated_file_is_named_in_the_disclosed_failures(self, tmp_path):
+        _, coverage, _, report = _run_cli(
+            self._one_bad_one_good(tmp_path), tmp_path / 'out')
+
+        failures = coverage['parse_failures']
+        assert failures['count'] == 1
+        assert coverage['transcripts_found'] == 2
+        assert coverage['transcripts_read'] == 1
+        assert [ex['transcript'] for ex in failures['examples']] == [self.TRUNCATED_REL]
+        assert self.TRUNCATED_REL in report
+
+    # -- (b) wholesale corruption: total_failure, said in words -------------
+
+    def test_every_file_unreadable_exits_three(self, tmp_path):
+        code, coverage, records, _ = _run_cli(self._all_bad(tmp_path), tmp_path / 'out')
+
+        assert code == 3
+        assert coverage['status'] == 'total_failure'
+        assert coverage['parse_failures']['count'] == 2
+        assert records == []
+
+    def test_every_file_unreadable_report_says_so_in_words(self, tmp_path):
+        # Not merely 'searches: 0' — an operator must not read a wholly
+        # unreadable archive as an empty one.
+        _, _, _, report = _run_cli(self._all_bad(tmp_path), tmp_path / 'out')
+
+        assert 'total_failure' in report
+        assert 'none could be read' in report.lower()
+
+    # -- (c) both shapes reach the counted path, distinguishably ------------
+
+    def test_the_two_corruption_shapes_report_different_reasons(self, tmp_path):
+        # Both are normalized to OSError so one handler catches them, but the
+        # disclosed reason must still say WHICH — an operator triaging the
+        # archive writer needs to tell a half-written file from a damaged one.
+        _, coverage, _, _ = _run_cli(self._all_bad(tmp_path), tmp_path / 'out')
+
+        reasons = {ex['transcript']: ex['reason'] for ex in
+                   coverage['parse_failures']['examples']}
+        assert set(reasons) == {self.TRUNCATED_REL, self.CORRUPT_BODY_REL}
+        assert reasons[self.TRUNCATED_REL] != reasons[self.CORRUPT_BODY_REL]
+        assert 'end-of-stream' in reasons[self.TRUNCATED_REL]
+        assert 'decompressing' in reasons[self.CORRUPT_BODY_REL]
+
+    # -- (d) the other reader, via --transcript ----------------------------
+
+    def test_single_transcript_mode_on_a_truncated_file(self, tmp_path):
+        # --transcript reads through load_transcript, the OTHER reader, and
+        # must answer the same way rather than raising through main().
+        truncated = _write_truncated(tmp_path, 'lone/truncated.jsonl.gz')
+        out_root = tmp_path / 'out'
+
+        code = _mod.main([
+            '--transcript', str(truncated),
+            '--out-root', str(out_root), '--stamp', STAMP,
+        ])
+
+        coverage = json.loads(
+            (out_root / _mod.EVAL_ID / f'coverage-{STAMP}.json').read_text(
+                encoding='utf-8'))
+        assert code == 3
+        assert coverage['status'] == 'total_failure'
+        assert coverage['parse_failures']['count'] == 1
+
+    # -- (e) distinguishability, extended to this failure class ------------
+
+    def test_a_corrupt_archive_still_reads_differently_from_an_empty_one(self, tmp_path):
+        # Mirrors TestZeroSearchCasesAreDistinguishableEndToEnd for the shapes
+        # that used to escape entirely: normalizing them into the counted path
+        # must not have quietly converted a wholly unreadable archive into
+        # something that looks like a clean empty one.
+        empty = tmp_path / 'empty'
+        empty.mkdir()
+        corrupt_code, corrupt_cov, _, _ = _run_cli(
+            self._all_bad(tmp_path), tmp_path / 'out-corrupt')
+        empty_code, empty_cov, _, _ = _run_cli(empty, tmp_path / 'out-empty')
+
+        assert corrupt_cov['searches_extracted'] == empty_cov['searches_extracted'] == 0
+        assert corrupt_cov['status'] != empty_cov['status']
+        assert corrupt_code != empty_code
+        assert corrupt_code != 0
+        assert empty_code != 0
