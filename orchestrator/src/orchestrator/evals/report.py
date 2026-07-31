@@ -471,8 +471,21 @@ def build_composite_report(
         # is the shared θ cascade — preserving the same rule the workflow group
         # applies: a cheap-but-UNMEASURABLE run cannot set the floor and deflate
         # the runs that were actually measured.
+        #
+        # …AND it must actually have produced a plan (task 3302). A no-plan cell
+        # is measurable — it stays in every pool at 0.0 — but it is cheap and
+        # fast precisely BECAUSE it returned nothing:
+        # plans/eval-architect-effort-verdict-2026-07-27.md measured one at
+        # $0.5-$3 against a real plan's ~$3.7. Letting it seed the floor hands a
+        # schedule-independent "2x cheaper, 2x faster" bonus to the candidate
+        # that FAILED to plan and deflates every candidate that succeeded. This
+        # is the plan-only spelling of the rule the workflow group already
+        # applies to a failing trial, not a new one.
         passed = (
-            _has_plan_quality_score(r.metrics) if _is_plan_only(r.metrics)
+            (
+                _has_plan_quality_score(r.metrics)
+                and produced_a_plan(r.metrics)
+            ) if _is_plan_only(r.metrics)
             else bool(r.metrics.get('tests_pass'))
         )
         if cost > 0:
@@ -486,6 +499,10 @@ def build_composite_report(
     # Groups with no passing trial fall back to the all-trials baseline so the
     # normalization denominator stays defined (every such workflow trial
     # hard-gates to 0 regardless, so this only keeps the baseline non-empty).
+    # The same holds for a plan-only group in which NOTHING produced a plan: the
+    # fallback still admits those cells, so the denominator exists — and their
+    # quality axis is 0.0 anyway, so a favourable efficiency ratio cannot rank
+    # one no-plan candidate above a plan-producing one from another group.
     for key, v in best_cost_all.items():
         best_cost.setdefault(key, v)
     for key, v in best_latency_all.items():
