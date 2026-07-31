@@ -62,8 +62,14 @@ from fused_memory.middleware.task_interceptor import (
 )
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.scope import resolve_main_checkout, resolve_project_id
+from fused_memory.reconciliation.citation_verifier import (
+    find_citation_occurrences,
+    is_concrete_memory_id,
+    repoint_task_citations,
+)
 from fused_memory.reconciliation.task_filter import (
     ACTIVE_TASK_STATUSES,
+    INACTIVE_TASK_STATUSES,
     find_conflicting_task_status_ids,
     find_present_tense_completion_claim_task_ids,
     frames_live_task_status_as_current_fact,
@@ -1336,6 +1342,23 @@ def create_mcp_server(
         'rephrase to past/aspirational tense — "will land" / "planned to resolve" / '
         '"intended to enforce" — or wait until the task is actually done/cancelled'
     )
+    # (task 3108) Actionable remediation for a refused consolidation delete.
+    # Names the concrete fix AND rules out the incident's re-derive-via-search
+    # "correction", which resolved back to the superseded cluster members the
+    # consolidation was collapsing.
+    _CITATION_REPOINT_HINT = (
+        'retry with replacement_memory_id=<the surviving entry\'s full 36-char '
+        'UUID>; the cited tasks will be repointed to it before the delete runs. '
+        'A search(query=...) instruction is NOT an acceptable replacement value '
+        '— re-deriving at read time resolves back to the superseded duplicates '
+        'this consolidation is collapsing. Terminal (done/cancelled) citers are '
+        'reported, never rewritten.'
+    )
+    _CITATION_SCAN_FAILED_HINT = (
+        'the task DB could not be read, so an unknown citation state cannot be '
+        'distinguished from "no citations". This delete is irreversible, so it '
+        'is refused rather than risked; retry once the task backend is reachable.'
+    )
     # Categories the premature-completion-claim guard (task 2824) covers — the
     # same four the live-task-status guard (task 2628) covers.
     # preferences_and_norms/procedural_knowledge are deliberately excluded: a norm
@@ -1404,6 +1427,136 @@ def create_mcp_server(
             'blocked_task_ids': sorted(blocked),
             'hint': _PREMATURE_COMPLETION_HINT,
         }
+
+    async def _citation_repoint_gate(
+        memory_id: str,
+        store: str,
+        project_id: str,
+        agent_id: str,
+        replacement_memory_id: str | None,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """Repoint live task-metadata citations BEFORE an irreversible delete.
+
+        Returns ``(rejection, repoint_stats)``: a structured error dict to
+        REFUSE the delete, or ``(None, stats)`` to allow it. Same
+        "return None to allow / return an error dict to reject" contract as
+        :func:`_premature_completion_block` (task 2824), and the same
+        ``_taskmaster_configured and project_id in _kp`` precondition — but the
+        opposite failure posture, deliberately (see below).
+
+        Scoped to consolidation deletes only: a ``recon-stage-*`` ``agent_id``
+        AND ``store == 'mem0'``. The recon-stage predicate mirrors the
+        ``recon_write_policy`` call-site idiom (``task_interceptor.py:893``,
+        :3953) and bounds the blast radius to the path the incident came from,
+        so an interactive delete pays no extra ``get_tasks`` read. The mem0
+        scoping mirrors ``verify_cited_memories``' own: the incident's
+        citations were Mem0 entry UUIDs.
+
+        Why here and not in ``MemoryConsolidator.run()``: the consolidator
+        never deletes from Python — the Stage-1 LLM agent calls this very tool
+        (``STAGE1_DISALLOWED`` in ``cli_stage_runner.py:138-143`` does NOT
+        include ``DISALLOW_MEMORY_WRITES``, so the call is permitted and
+        prompt-level discipline was the only guard). A sweep inside ``run()``
+        would therefore execute AFTER the delete and could only report damage.
+        This handler is the one seam that is both strictly before the
+        irreversible destruction and where the surviving id is knowable.
+
+        Fails CLOSED. If the task-DB read raises, the delete is REJECTED rather
+        than allowed. This diverges from ``_premature_completion_block``'s
+        fail-open posture on purpose, and the distinction is the cost of being
+        wrong: that gate blocks a cheap, correctable status claim, this one
+        blocks an irreversible destruction whose harm — a dangling live pointer
+        — is exactly what "unknown" might be hiding. It follows
+        ``flag_dedup.filter_false_absence_flags``' posture instead ("present or
+        inconclusive -> drop, to prevent irreversible delete_memory ops"). A
+        refused delete is retried next cycle; a silently permitted one
+        manufactures the L2.
+        """
+        if not isinstance(agent_id, str) or not agent_id.startswith('recon-stage-'):
+            return None, None
+        if store != 'mem0':
+            return None, None
+        if not _taskmaster_configured or project_id not in _kp:
+            # No live task DB to scan — the pre-existing behaviour for
+            # unregistered projects is preserved exactly.
+            return None, None
+
+        project_root = _kp[project_id]
+        try:
+            citers = await _scan_task_citations(project_root, memory_id)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            logger.warning(
+                'citation gate: task scan failed for %s; failing closed',
+                memory_id,
+                exc_info=True,
+            )
+            return {
+                'error': (
+                    'Could not determine whether any task still cites '
+                    f'{memory_id}; refusing an irreversible delete on an '
+                    'unknown citation state.'
+                ),
+                'error_type': 'CitationScanFailed',
+                'memory_id': memory_id,
+                'scan_error': str(exc),
+                'scan_error_type': type(exc).__name__,
+                'hint': _CITATION_SCAN_FAILED_HINT,
+            }, None
+
+        live_citers = [c for c in citers if not c['terminal']]
+        if not live_citers:
+            # Nothing live points at this id, so the delete cannot dangle one.
+            return None, None
+
+        if replacement_memory_id is None:
+            return {
+                'error': (
+                    f'{len(live_citers)} live task(s) still cite {memory_id}. '
+                    'Supply replacement_memory_id so those citations are '
+                    'repointed before this irreversible delete.'
+                ),
+                'error_type': 'CitationRepointRequired',
+                'memory_id': memory_id,
+                'citing_tasks': [
+                    {'task_id': c['task_id'], 'status': c['status'], 'paths': c['paths']}
+                    for c in live_citers
+                ],
+                'hint': _CITATION_REPOINT_HINT,
+            }, None
+
+        return None, None
+
+    async def _scan_task_citations(
+        project_root: str, memory_id: str
+    ) -> list[dict[str, Any]]:
+        """Return one record per task whose metadata cites *memory_id*.
+
+        A read-only pre-pass over the same snapshot semantics
+        ``repoint_task_citations`` uses, so the gate can decide whether a
+        repoint is needed (and name the citers in a refusal) before committing
+        to any write.
+        """
+        tasks_data = await task_interceptor.get_tasks(project_root)  # type: ignore[union-attr]
+        tasks = (tasks_data or {}).get('tasks') or []
+        found: list[dict[str, Any]] = []
+        if not isinstance(tasks, list):
+            return found
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            paths = find_citation_occurrences(task.get('metadata'), memory_id)
+            if not paths:
+                continue
+            status = task.get('status')
+            found.append({
+                'task_id': str(task.get('id')),
+                'status': status,
+                'paths': paths,
+                'terminal': status in INACTIVE_TASK_STATUSES,
+            })
+        return found
 
     @mcp.tool()
     @mcp_tool_errors()
@@ -2557,6 +2710,7 @@ def create_mcp_server(
         agent_id: str | None = None,
         session_id: str | None = None,
         metadata: dict | None = None,
+        replacement_memory_id: str | None = None,
         ctx: Context | None = None,
     ) -> dict[str, Any]:
         """Delete a specific memory from a store. IRREVERSIBLE.
@@ -2573,6 +2727,13 @@ def create_mcp_server(
         search results and this tool's own response return). Exactly one must
         be provided; supplying both with conflicting values is an error.
 
+        **Consolidation deletes** (a ``recon-stage-*`` caller deleting a
+        ``store='mem0'`` duplicate in favour of a survivor) additionally pass
+        through the citation-repoint gate: task metadata still citing the
+        doomed entry is repointed to *replacement_memory_id* BEFORE the delete
+        runs, and the delete is refused outright if that cannot be done. See
+        ``_citation_repoint_gate``.
+
         Args:
             store: "graphiti" or "mem0" (from search results)
             project_id: Project scope (required)
@@ -2583,6 +2744,13 @@ def create_mcp_server(
             agent_id: Which agent is deleting (optional, auto-derived from MCP context)
             session_id: Session context (optional, auto-derived from MCP context)
             metadata: Optional key-value pairs (may contain _causation_id for recon)
+            replacement_memory_id: The SURVIVING entry's full 36-char UUID, when
+                this delete supersedes one duplicate in favour of another.
+                Required for a consolidation delete whose id is still cited by a
+                live task. Must be a concrete UUID — a ``search(query=...)``
+                instruction is rejected, because re-deriving at read time
+                resolves back to the superseded entries consolidation was
+                collapsing.
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
         project_id, err = _canonicalize_project_id_arg(project_id)
@@ -2612,7 +2780,15 @@ def create_mcp_server(
                 'error_type': 'ValidationError',
             }
         causation_id, source, _ = _extract_causation(metadata, agent_id)
-        return await memory_service.delete_memory(
+        # Repoint live task-metadata citations BEFORE the irreversible delete.
+        # Order is the whole point: a rejection here never reaches the service
+        # call, so the dangling-pointer window is closed rather than moved.
+        rejection, repoint_stats = await _citation_repoint_gate(
+            resolved_id, store, project_id, agent_id, replacement_memory_id,
+        )
+        if rejection:
+            return rejection
+        result = await memory_service.delete_memory(
             memory_id=resolved_id,
             store=store,
             project_id=project_id,
@@ -2621,6 +2797,9 @@ def create_mcp_server(
             causation_id=causation_id,
             _source=source,
         )
+        if repoint_stats and isinstance(result, dict):
+            result = {**result, **repoint_stats}
+        return result
 
     @mcp.tool()
     @mcp_tool_errors()
