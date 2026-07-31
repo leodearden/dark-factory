@@ -50,14 +50,28 @@ test_command: "cd shared && uv run pytest tests/ --timeout=300 && cd ../escalati
 lint_command: "uv run ruff check shared escalation fused-memory orchestrator dashboard && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests"
 type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx pyright && cd ../dashboard && npx pyright"
 
-# Verification timeouts — dark-factory is Python-only (no cargo builds), so the
-# package defaults (1800s warm / 5400s cold, sized for reify's big Rust builds)
-# are much too loose. Full warm verify here is ~2 min; cold adds uv sync across
-# 6 subprojects (~3 min). Tight timeouts surface hangs (e.g. asyncio-sleep
-# loops in a misconfigured mock) on the first verify that touches the module,
-# not 8 days later at a post-completion full review.
-verify_command_timeout_secs: 1800
-verify_cold_command_timeout_secs: 3600
+# Verification timeouts. The "full warm verify here is ~2 min" premise these were
+# sized against is STALE by an order of magnitude — it predates the monorepo growing
+# to 8 chained suites. Measured on the __fallback__ chain 2026-07-31 (task 3062,
+# esc-3062-3), attempt-2, per-suite completion lines:
+#   shared 2582 passed / 120.21s · escalation 898 / 123.29s
+#   orchestrator 13398 / 1366.23s · fused-memory 8658 / 123.87s
+#   = 1733.6s consumed BEFORE dashboard (1393 tests) even starts, leaving <67s of a
+#   1800s budget for dashboard + sampler + cockpit + tests/scripts (~127s alone).
+# The chain therefore could not fit in 1800s under any load — a structural overrun,
+# not a hang, and it timed out at 1800.66s having already passed 25,536 tests with
+# zero failures. Raised to 3600s warm (orchestrator alone is 76% of the old budget)
+# and 5400s cold, since cold additionally pays uv sync across 6 subprojects.
+# The tight-timeout rationale still holds and is unchanged in KIND — a genuine hang
+# should still surface on the first verify that touches the module, not 8 days later
+# — but the threshold has to exceed the honest cost of the work it gates, or every
+# task touching a slow-suite package false-REDs on the wall clock.
+# NOTE: this buys headroom, it does not fix the trend. orchestrator's suite alone
+# grew to 1366s; if it keeps growing, the answer is scoping verify to the task's
+# declared modules (task 3062's own plan.json-scoped verify runs green in ~127s),
+# not raising this number again.
+verify_command_timeout_secs: 3600
+verify_cold_command_timeout_secs: 5400
 
 # Cold-verify shared-venv pre-provision (task 2997, esc-2913-3). On a COLD verify
 # worktree the shared workspace .venv is populated only as a SIDE EFFECT of the
