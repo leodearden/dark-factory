@@ -182,7 +182,10 @@ The response is `{ cancelled, state, reason }`:
 
 **Important:** `merge_cancel` is the **only** explicit-cancellation path. An MCP client disconnect no longer cancels the merge (durable intent), so an abandoned submission must be cancelled deliberately.
 
-If your submit returned `status: "attached"`, your submission was coalesced with an in-flight entry. Cancel using the `request_id` returned with that `attached` response — it points to the shared in-flight entry.
+If your submit returned `status: "attached"`, whether the returned `request_id` cancels the shared in-flight entry depends on that response's `poll_by`:
+
+- `poll_by == "request_id"` — the returned `request_id` IS the in-flight entry's id; cancel it as shown above.
+- `poll_by == "task_id"` or `poll_by == "branch"` — the returned `request_id` names your own coalesced submission, not the in-flight entry. Treat the cancel as best-effort: `cancelled: false` / `state: "unknown"` is the expected outcome here, not evidence of a problem. On `"branch"` specifically, a foreign or pre-restart merger owns the worktree — reaching the real entry isn't this caller's cancel to make. Re-check the actual state first (`merge_status(task_id=...)` / `merge_status(branch="task/<TASK_ID>")`, which self-resolves a landed merge via the git-authority tier), then the `git merge-base --is-ancestor` confirmation described under `state: "unknown"` above, before deciding anything further.
 
 ### 6. Fallback: direct merge
 
