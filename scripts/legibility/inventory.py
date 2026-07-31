@@ -22,6 +22,7 @@ import argparse
 import gzip
 import json
 import sys
+import zlib
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -121,30 +122,58 @@ def iter_json_lines(path: Path) -> Iterator[dict[str, Any]]:
     Mirrors ``digest.load_transcript``'s graceful-degrade contract: a
     transcript is written fire-and-forget and can have a truncated or
     corrupt trailing line, which must not abort the whole read. Raises
-    ``OSError`` if *path* cannot be opened or decompressed at all —
-    ``gzip.BadGzipFile`` (a corrupt ``.gz``) is an ``OSError`` subclass, so
-    the caller's existing ``except OSError`` degrade path already covers it.
+    ``OSError`` if *path* cannot be opened or decompressed at all.
 
     That split is a contract, not an implementation detail: a corrupt LINE
     degrades silently, an unreadable FILE raises. Callers that report
     coverage rely on it to count unreadable files without inflating the
     count with truncated trailing lines.
+
+    Making that ``OSError`` promise true takes explicit normalization,
+    because gzip signals its three corruption shapes with three DIFFERENT
+    exception types — only the first of which is already an ``OSError``::
+
+        bad magic         -> gzip.BadGzipFile   (an OSError subclass)
+        truncated stream  -> EOFError           (not an OSError)
+        corrupt body      -> zlib.error         (not an OSError)
+
+    The last two are exactly what a fire-and-forget writer produces when a
+    unit is killed mid-write or a file is read while still being compressed,
+    and the archived fleet transcripts this reader walks are live runtime
+    state — so both are expected shapes, not theoretical ones. Left
+    un-normalized they escape every consumer's degrade path and abort a
+    whole-archive walk over one bad file. This reader therefore re-raises
+    them as ``OSError`` (preserving the original message, so a coverage
+    report can still tell a half-written transcript from a corrupted one),
+    which is the single contract ``sampling``, ``check_transcript_persistence``
+    and the cross-package ``memory_eval_transcript_corpus`` extractor all
+    already code against with ``except OSError``.
     """
     if str(path).endswith('.gz'):
         f = gzip.open(path, 'rt', encoding='utf-8')
     else:
         f = open(path, encoding='utf-8')
     with f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(record, dict):
-                yield record
+        # The wrap covers only the read/decompress iteration — decompression
+        # happens lazily HERE, per chunk, not at open() — while the
+        # JSONDecodeError skip stays inside the loop, so the file-level vs
+        # line-level split above is preserved. Deliberately not `except
+        # Exception`: the point is to normalize two known decompression
+        # failures, not to swallow errors from the caller's consumption of
+        # this generator.
+        try:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict):
+                    yield record
+        except (EOFError, zlib.error) as exc:
+            raise OSError(f'corrupt or truncated gzip stream: {exc}') from exc
 
 
 _iter_json_lines = iter_json_lines
