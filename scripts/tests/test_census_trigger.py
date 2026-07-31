@@ -434,6 +434,81 @@ def test_compute_tasks_landed_missing_baseline_returns_none_with_one_warning(cap
     assert sum(1 for r in caplog.records if r.levelno == logging.WARNING) == 1
 
 
+# ---------------------------------------------------------------------------
+# task 3291: extract_done_count() — the ONE place a get_statuses payload
+# becomes a number, and the one place the silent-zero hole is closed.
+#
+# The idiom this replaces -- `(payload.get("statuses") or {})`, duplicated at
+# census_trigger.compute_tasks_landed and census.run_census -- coerced EVERY
+# unusable payload to a done-count of 0 with no warning and no exception.
+# That is how a fabricated 0 was persisted as a real census baseline on
+# 2026-07-24 and again on 2026-07-31, which in turn made trigger condition
+# (b) compute `current_done - 0` (~2870, vastly over its 120 threshold) and
+# fire every ~7 days forever.
+# ---------------------------------------------------------------------------
+
+# fused-memory's `_normalize_project_root` hard-rejects a relative path with
+# exactly this payload. Verified live against localhost:8002 with
+# `{"project_root": "."}` -- and critically, the JSON-RPC envelope carries
+# `isError: false`, so `_extract_tool_result` unwraps this dict as though it
+# were a genuine tool result and hands it straight to the caller.
+_TOOL_ERROR_ENVELOPE = {
+    "error": "project_root must be a non-empty absolute path, got: '.'",
+    "error_type": "ValidationError",
+}
+
+
+def test_extract_done_count_counts_done_values():
+    assert ct.extract_done_count({"statuses": {"1": "done", "2": "done", "3": "pending"}}) == 2
+
+
+def test_extract_done_count_empty_statuses_is_a_valid_zero():
+    """A project with zero done tasks is a real, expected state and MUST stay
+    distinguishable from a failed call -- it is precisely the case
+    `advance_census_state`'s "0 is never dropped as falsy" contract exists
+    for. The distinction that matters is presence-of-shape, not
+    emptiness-of-content."""
+    assert ct.extract_done_count({"statuses": {}}) == 0
+
+
+def test_extract_done_count_raises_on_fused_memory_tool_error_envelope():
+    """The regression that poisoned the live baseline. `@mcp_tool_errors`
+    returns this dict with `isError: false` at the JSON-RPC layer, so
+    `_extract_tool_result` unwraps it happily; the old
+    `(payload.get("statuses") or {})` idiom then read it as a done-count of
+    0 -- silently, with no warning and no exception."""
+    with pytest.raises(ct.StatusFetchUnavailable) as excinfo:
+        ct.extract_done_count(_TOOL_ERROR_ENVELOPE)
+
+    # structured-facts-at-failure: the operator must see the REAL cause, not
+    # a generic shape complaint, so the server's own error text is quoted.
+    assert "project_root must be a non-empty absolute path" in str(excinfo.value)
+
+
+def test_extract_done_count_raises_when_statuses_key_absent():
+    with pytest.raises(ct.StatusFetchUnavailable) as excinfo:
+        ct.extract_done_count({})
+
+    assert "statuses" in str(excinfo.value)
+
+
+def test_extract_done_count_raises_when_statuses_is_not_a_mapping():
+    with pytest.raises(ct.StatusFetchUnavailable) as excinfo:
+        ct.extract_done_count({"statuses": ["1", "2"]})
+
+    # The message must name the offending shape, not just that something failed.
+    assert "statuses" in str(excinfo.value)
+    assert "list" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("payload", [None, [], "oops", 0])
+def test_extract_done_count_raises_on_non_dict_payload(payload):
+    with pytest.raises(ct.StatusFetchUnavailable) as excinfo:
+        ct.extract_done_count(payload)
+
+    assert type(payload).__name__ in str(excinfo.value)
+
+
 def test_default_status_fetcher_raises_status_fetch_unavailable_when_unreachable(tmp_path):
     fetcher = ct.default_status_fetcher(tmp_path)
 
