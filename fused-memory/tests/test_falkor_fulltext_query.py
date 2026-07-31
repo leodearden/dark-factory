@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import pytest
 
-from fused_memory.backends.falkor_fulltext import is_searchable_term
+from fused_memory.backends.falkor_fulltext import escape_group_id, is_searchable_term
 
 # --- Genuine FAULT tokens -------------------------------------------------
 # RediSearch's tokenizer reduces each of these to nothing, so emitting one into
@@ -98,3 +98,56 @@ class TestIsSearchableTerm:
         assert is_searchable_term('日本語') is True
         assert is_searchable_term('naïve') is True
         assert is_searchable_term('Ω') is True
+
+
+class TestEscapeGroupId:
+    """Pin group-id escaping for the ``(@group_id:"...")`` filter.
+
+    Upstream emits ``f'(@group_id:"{gid}")'`` with a comment claiming the quoting
+    handles "special characters like hyphens".  MEASURED against live FalkorDB
+    (5/5 both directions): that claim is false — ``(@group_id:"a-b") (alpha)``
+    fails to parse while ``(@group_id:"a\\-b") (alpha)`` succeeds.  An unescaped
+    ``"`` additionally lets a group_id break out of the quoted filter, which is a
+    latent query-injection seam.
+    """
+
+    def test_ordinary_group_id_is_unchanged(self) -> None:
+        """The overwhelmingly common case must stay byte-identical to upstream.
+
+        Every real project_id reaching this code today is already
+        ``[A-Za-z0-9_]``-only (``canonicalize_project_id`` folds ``-`` to ``_`` at
+        every backend entry, CGL seam S4 / task 2269).  If escaping perturbed
+        these, search behaviour would shift for every existing query — so the
+        no-op case is asserted first and explicitly.
+        """
+        assert escape_group_id('dark_factory') == 'dark_factory'
+        assert escape_group_id('main') == 'main'
+        assert escape_group_id('proj123') == 'proj123'
+
+    def test_hyphen_is_escaped(self) -> None:
+        """``a-b`` → ``a\\-b``; the bare form is rejected by the live parser."""
+        assert escape_group_id('a-b') == r'a\-b'
+
+    def test_double_quote_is_escaped(self) -> None:
+        """``q"uote`` → ``q\\"uote``; the bare form escapes the quoted filter."""
+        assert escape_group_id('q"uote') == r'q\"uote'
+
+    def test_backslash_is_escaped(self) -> None:
+        """A literal backslash doubles."""
+        assert escape_group_id('x\\y') == 'x\\\\y'
+
+    def test_backslash_is_escaped_first(self) -> None:
+        """Ordering is load-bearing, so it is asserted rather than assumed.
+
+        Escaping ``\\`` *after* the ``-``/``"`` rules would double-escape the
+        backslashes those rules just introduced (``a-b`` → ``a\\-b`` → ``a\\\\-b``),
+        producing a literal-backslash match instead of an escaped hyphen.
+        """
+        assert escape_group_id('a-b') == 'a' + '\\' + '-b'
+        # A backslash already adjacent to a hyphen is the discriminating case:
+        # escape-last would emit four backslashes here instead of three.
+        assert escape_group_id('a\\-b') == 'a' + '\\\\' + '\\-' + 'b'
+
+    def test_all_three_escaped_exactly_once(self) -> None:
+        """Combined input: each special character is escaped once, not twice."""
+        assert escape_group_id('a-b"c\\d') == 'a\\-b\\"c\\\\d'
