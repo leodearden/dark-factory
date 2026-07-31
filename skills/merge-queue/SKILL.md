@@ -72,15 +72,27 @@ The call returns with **either** a **terminal** status **or** a **non-terminal**
   - `superseded` means your request was absorbed into a coalesced train before it could be individually processed. The response includes `superseded_by: "<train_request_id>"`. Re-poll the train request immediately (step 4 / follow-the-train protocol below).
 
 - **Non-terminal** (`queued`, `attached`): the submission succeeded as **durable intent** — the merge worker has accepted the request and will process it. This is **not a failure**. The `request_id` in the response identifies your submission. Proceed to "Poll for completion" below.
-  - `attached` means your submission was coalesced with an already-in-flight request for the same branch; you share that request's `request_id`.
+  - `attached` means your submission was coalesced with an already-in-flight request for the same branch. Whether you share that in-flight entry's `request_id` depends on the response's own disclosure — see "Poll for completion" below, which branches on the `poll_by` field the response carries alongside `source`, `inflight_request_id`, `inflight_task_id`, and `pollable`.
 
 ### Poll for completion
 
-Call `merge_status(request_id)` on a backoff schedule until the state is terminal:
+**Pick the poll handle from the submit response's `poll_by` field** (present on `attached` responses since task 3148; a `queued` response has no in-flight entry to disclose, so it's always polled by its own `request_id`). Read it defensively — `result.get("poll_by", "request_id")` — so a response from a server predating this field degrades to today's behaviour instead of raising:
 
-```
-mcp__escalation__merge_status(request_id="<request_id from submit>")
-```
+- `poll_by == "request_id"` (or absent) — the returned `request_id` IS the handle:
+  ```
+  mcp__escalation__merge_status(request_id="<request_id from submit>")
+  ```
+- `poll_by == "task_id"` — no in-flight `request_id` is known; the returned `request_id` is your *own* submitting call's id, not a handle. Poll the in-flight task instead:
+  ```
+  mcp__escalation__merge_status(task_id="<inflight_task_id from submit>")
+  ```
+- `poll_by == "branch"` (equivalently `pollable == false`) — neither handle is known: a foreign or pre-restart merger owns the worktree, so there's no in-process entry, no retention alias, and no waiter. The returned `request_id` was never enqueued — polling it directly resolves `state: "unknown"`, which here is expected, NOT a lost record. Poll by branch instead, which benefits from `merge_status`'s git-authority tier (self-resolves a landed merge to `state: "done"` / `kind: "found_on_main"`):
+  ```
+  mcp__escalation__merge_status(branch="task/<TASK_ID>")
+  ```
+  Cross-check `get_merge_queue()` for queue-wide context if useful. Do NOT read a first-tick `unknown` on this arm as a terminal failure or as licence to direct-merge.
+
+Whichever handle you poll, the cadence and state handling below are the same for all three arms:
 
 **Backoff:** start at **15 s**, cap at **60 s**. When the response contains an `eta_seconds` field whose value is a **positive number**, use that value as the sleep duration (capped at 60 s); if `eta_seconds` is absent or `null`, fall back to the 15 s→60 s backoff schedule.
 
@@ -198,7 +210,7 @@ After a successful direct merge:
 |-----------|--------|
 | Orchestrator running | Submit via `merge_request(wait_secs=100, verified_green=<True|False>)` — only when verification actually passed — then poll `merge_status` |
 | Orchestrator not running | Direct `git merge --no-ff` |
-| Submit returns `queued` or `attached` | Submission succeeded (durable intent); poll `merge_status(request_id)` with 15 s→60 s backoff |
+| Submit returns `queued` or `attached` | Durable intent confirmed; poll the handle `poll_by` names (`request_id` for `queued` and the `poll_by=="request_id"` arm; `task_id`/`branch` when `attached` discloses them) with 15 s→60 s backoff |
 | `merge_status` returns `state: "unknown"` | Check `git merge-base --is-ancestor task/<TASK_ID> main` (exit 0 → done/found_on_main; exit 1 + healthy queue → resubmit). Never direct-merge in response to `unknown`. |
 | Outcome `conflict` | Fix in worktree, resubmit |
 | Outcome `blocked` | Read reason, fix, resubmit |
