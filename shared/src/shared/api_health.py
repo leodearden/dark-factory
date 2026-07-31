@@ -154,6 +154,26 @@ class ApiHealthGate:
         monotonic_clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
+        # Validate eagerly and fail LOUD rather than clamping to something
+        # plausible.  A clamped-to-zero threshold is not a degraded gate, it
+        # is an inverted one: `min_failures=0` or `failure_rate_threshold=0`
+        # trips on the empty window and stays tripped, throttling the entire
+        # fleet forever with no signal anywhere that a config typo caused it.
+        # Refusing to construct surfaces the typo at startup, next to the
+        # config that caused it.
+        if window_secs <= 0:
+            raise ValueError(f'window_secs must be > 0, got {window_secs!r}')
+        if min_failures < 1:
+            raise ValueError(f'min_failures must be >= 1, got {min_failures!r}')
+        if min_distinct_tasks < 1:
+            raise ValueError(f'min_distinct_tasks must be >= 1, got {min_distinct_tasks!r}')
+        if not 0 < failure_rate_threshold <= 1:
+            raise ValueError(
+                f'failure_rate_threshold must be in (0, 1], got {failure_rate_threshold!r}'
+            )
+        if close_after_successes < 1:
+            raise ValueError(f'close_after_successes must be >= 1, got {close_after_successes!r}')
+
         self.window_secs = window_secs
         self.min_failures = min_failures
         self.min_distinct_tasks = min_distinct_tasks
