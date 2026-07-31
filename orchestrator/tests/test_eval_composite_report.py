@@ -626,6 +626,122 @@ class TestPlanOnlyComposite:
 
 
 # ---------------------------------------------------------------------------
+# Task 3099 (reviewer amendment): an UNMEASURABLE plan-only cell leaves EVERY
+# pool, and the decision to drop it has ONE home.
+#
+# Excluding it from the composite pool alone left the mirror image of the defect
+# task 3118 removed: the tainted cell reports $0.00 / 0 ms because it never ran,
+# so averaging those into cost/latency handed a schedule-attributable BONUS to
+# whichever candidate happened to be scheduled inside a cap window — on the very
+# table this task makes the operator's ranking surface.
+# ---------------------------------------------------------------------------
+
+class TestUnmeasurableCellLeavesEveryPool:
+    """One admission decision, applied to composite / quality / cost / latency."""
+
+    def _mixed_and_clean(self):
+        """Two configs with IDENTICAL measured cells; one also has a dead trial."""
+        return [
+            _arch('p1', 'arch-mixed', 1, plan_quality=None, cost_usd=0.0,
+                  duration_ms=0, cap_tainted=True),
+            _arch('p1', 'arch-mixed', 2, plan_quality=0.8, cost_usd=0.3,
+                  duration_ms=60000),
+            _arch('p1', 'arch-clean', 1, plan_quality=0.8, cost_usd=0.3,
+                  duration_ms=60000),
+        ]
+
+    def test_cost_and_latency_are_not_deflated_by_an_unmeasurable_cell(self):
+        """Identical measured cells ⇒ identical cost/latency, cap window or not.
+
+        Averaging the tainted cell's fabricated $0.00 / 0 ms in reported
+        arch-mixed as 2x cheaper and 2x faster than arch-clean purely because it
+        was scheduled inside a cap window (reviewer: correctness).
+        """
+        from orchestrator.evals.report import build_composite_report
+
+        rows = {r['config']: r for r in
+                build_composite_report(self._mixed_and_clean())['configs']}
+
+        assert rows['arch-mixed']['cost_usd'] == pytest.approx(0.3)
+        assert rows['arch-mixed']['latency_secs'] == pytest.approx(60.0)
+        assert rows['arch-mixed']['cost_usd'] == rows['arch-clean']['cost_usd']
+        assert (rows['arch-mixed']['latency_secs']
+                == rows['arch-clean']['latency_secs'])
+        # The sample size is still reported honestly — by the columns that exist
+        # to report it, not by silently averaging a zero into the cost figure.
+        assert rows['arch-mixed']['trials'] == 2
+        assert rows['arch-mixed']['plan_quality_cap_excluded'] == 1
+
+    def test_wholly_unmeasured_config_is_not_the_cheapest_row_in_the_table(self):
+        """All-tainted ⇒ cost/latency are None ('-'), not 0.0 ("free and instant")."""
+        from orchestrator.evals.report import build_composite_report
+
+        results = [
+            _arch('p1', 'arch-dark', tr, plan_quality=None, cost_usd=0.0,
+                  duration_ms=0, cap_tainted=True)
+            for tr in (1, 2, 3)
+        ]
+        row = build_composite_report(results)['configs'][0]
+        assert row['cost_usd'] is None
+        assert row['latency_secs'] is None
+        assert row['trials'] == 3
+
+    def test_unmeasured_row_has_no_zero_width_interval_at_zero(self):
+        """One row must not say both "we measured nothing" and "we measured a
+        zero-width interval at zero" (reviewer: correctness)."""
+        from orchestrator.evals.report import build_composite_report
+
+        results = [
+            _arch('p1', 'arch-dark', tr, plan_quality=None, cost_usd=0.0,
+                  duration_ms=0, cap_tainted=True)
+            for tr in (1, 2, 3)
+        ]
+        row = build_composite_report(results)['configs'][0]
+        assert row['composite'] is None
+        assert row['ci95']['composite'] is None
+        assert row['ci95']['cost'] is None
+        assert row['ci95']['latency'] is None
+
+    def test_a_tainted_cell_carrying_a_score_is_refused_by_every_surface(self):
+        """ONE predicate, so the surfaces cannot disagree (reviewer: robustness).
+
+        ``run_architect_eval`` currently taints exactly when it has no score, so
+        the two predicates coincided by COUPLING rather than by construction. A
+        hand-edited result, a legacy JSON, or a future taint cause that keeps the
+        structural floor would feed a score the plan_quality pool refuses into
+        the composite/quality pools — making one row's ``quality`` and
+        ``plan_quality`` cells disagree and putting a fabricated number back into
+        the figure ``select_survivors`` ranks on.
+        """
+        from orchestrator.evals.report import (
+            build_composite_report,
+            build_plan_quality_report,
+        )
+
+        results = [
+            # Tainted, yet carrying a score AND an outlier cost/latency.
+            _arch('p1', 'arch-odd', 1, plan_quality=0.2, cost_usd=9.9,
+                  duration_ms=999000, cap_tainted=True),
+            _arch('p1', 'arch-odd', 2, plan_quality=0.8, cost_usd=0.3,
+                  duration_ms=60000),
+        ]
+        row = build_composite_report(results)['configs'][0]
+
+        # Only the healthy cell survives: it IS its group's floor, so both
+        # efficiency axes are 1.0 → 0.6*0.8 + 0.2 + 0.2 == 0.88.
+        assert row['plan_quality'] == pytest.approx(0.8)
+        assert row['quality'] == pytest.approx(row['plan_quality'])
+        assert row['composite'] == pytest.approx(0.88, abs=1e-4)
+        assert row['cost_usd'] == pytest.approx(0.3)
+        assert row['latency_secs'] == pytest.approx(60.0)
+        assert row['plan_quality_cap_excluded'] == 1
+        # …and the θ surface reduces the identical pool, bit for bit.
+        assert row['plan_quality'] == (
+            build_plan_quality_report(results)['configs'][0]['mean_plan_quality']
+        )
+
+
+# ---------------------------------------------------------------------------
 # Task 3099 (reviewer: correctness): the composite row's `plan_quality` is the
 # config's POOLED MEAN, not its first untainted trial.
 #
@@ -1061,24 +1177,49 @@ class TestFormatCompositeTable:
         assert 'pq_excluded' in header
 
     def test_architect_row_renders_plan_quality_and_exclusion_count(self):
-        from orchestrator.evals.report import format_composite_table
+        """Asserted by COLUMN INDEX, not membership (reviewer: test-quality).
 
+        A bare ``'1' in row`` is satisfied by the trailing trials/fixtures cells,
+        so it would still pass if ``pq_excluded`` regressed to 0 — it pins
+        nothing. The index is asserted against ``_COMPOSITE_COLUMNS`` first, so a
+        column reorder fails loudly here instead of silently re-aiming every
+        positional assertion below at the wrong cell.
+        """
+        from orchestrator.evals.report import (
+            _COMPOSITE_COLUMNS,
+            format_composite_table,
+        )
+
+        assert _COMPOSITE_COLUMNS[3] == 'plan_quality'
+        assert _COMPOSITE_COLUMNS[4] == 'pq_excluded'
         out = format_composite_table(self._arch_report())
-        assert '0.9000' in self._row(out, 'arch-good')
-        assert '1' in self._row(out, 'arch-mixed')  # the exclusion COUNT
-        assert '3' in self._row(out, 'arch-dark')
+        assert self._row(out, 'arch-good')[3] == '0.9000'
+        assert self._row(out, 'arch-good')[4] == '0'
+        assert self._row(out, 'arch-mixed')[4] == '1'   # the exclusion COUNT
+        assert self._row(out, 'arch-dark')[4] == '3'
 
     def test_non_architect_row_renders_dash_not_a_fabricated_zero(self):
         from orchestrator.evals.report import format_composite_table
 
         out = format_composite_table(self._arch_report())
         cells = self._row(out, 'impl-a')
-        # A workflow row has no plan_quality: '-' , never '0.0000'.
-        assert '-' in cells
+        # A workflow row has no plan_quality: '-' , never '0.0000'. Positional:
+        # a bare `'-' in cells` would also pass if `composite` wrongly rendered
+        # '-' (reviewer: test-quality).
+        assert cells[3] == '-'
+        assert cells[1] != '-'   # …while its composite IS measured.
 
-    def test_wholly_unmeasured_row_renders_dash_for_composite_and_quality(self):
-        from orchestrator.evals.report import format_composite_table
+    def test_wholly_unmeasured_row_renders_dash_for_every_measured_cell(self):
+        """Not just composite/quality: an all-tainted row must not render as the
+        cheapest and fastest config in the table, nor carry a zero-width CI."""
+        from orchestrator.evals.report import (
+            _COMPOSITE_COLUMNS,
+            format_composite_table,
+        )
 
+        assert _COMPOSITE_COLUMNS[5] == 'cost_usd'
+        assert _COMPOSITE_COLUMNS[7] == 'latency_secs'
+        assert _COMPOSITE_COLUMNS[8] == 'ci95_composite'
         out = format_composite_table(self._arch_report())
         cells = self._row(out, 'arch-dark')
         # composite and quality are both None → '-'. "We measured nothing" must
@@ -1086,6 +1227,24 @@ class TestFormatCompositeTable:
         assert cells[1] == '-'
         assert cells[2] == '-'
         assert '0.0000' not in cells[1:3]
+        # …and neither may the cost/latency cells (0.0000 / 0.00 would make the
+        # config that never ran the cheapest and fastest row on the screen), nor
+        # the CI95 cell, which used to render '[0.0000, 0.0000]' right beside the
+        # composite '-' (reviewer: correctness).
+        assert cells[5] == '-'
+        assert cells[7] == '-'
+        assert cells[8] == '-'
+
+    def test_cap_window_is_not_rendered_as_a_cost_advantage(self):
+        """arch-mixed's measured cell is arch-good's price; only its plan quality
+        differs. The table must not present it as half the cost/latency."""
+        from orchestrator.evals.report import format_composite_table
+
+        out = format_composite_table(self._arch_report())
+        mixed = self._row(out, 'arch-mixed')
+        good = self._row(out, 'arch-good')
+        assert mixed[5] == good[5] == '0.3000'
+        assert mixed[7] == good[7] == '60.00'
 
     def test_operator_can_rank_architects_from_the_table_alone(self):
         """The acceptance assertion for the reported defect.
