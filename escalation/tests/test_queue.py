@@ -1486,32 +1486,45 @@ class TestMakeIdCounter:
         )
 
     def test_make_id_does_not_scan_archive(self, tmp_path: Path):
-        """make_id() never touches the archive — _iter_archive_paths is not called.
+        """make_id() never touches the archive WHILE THE COUNTER IS INTACT.
 
-        Seeds an archive file directly (bypassing the queue/counter) so that
-        if make_id() still consulted the archive it would see it. Spies on
-        _iter_archive_paths and asserts it is never invoked.
+        Seeds an archive file directly (bypassing the queue) so that if
+        make_id() still consulted the archive it would see it, AND a counter
+        file, so the fixture expresses the real steady state (counter
+        present + archive present) rather than a lost counter. Spies on
+        _iter_archive_paths and asserts it is never invoked; the minted ids
+        are counter-derived and archive-independent.
 
         RED on main: make_id() calls _scan_archive_max_seq() ->
         _iter_archive_paths() on the cache miss (the first call for this
         task_id), so call_count would be >= 1, not 0.
+
+        For the LOST-counter path — where a bounded one-shot archive scan IS
+        performed, exactly once, to avoid re-minting ids that get() resolves
+        to archived records — see
+        ``test_make_id_recovery_scan_is_one_shot_then_steady_state_is_scan_free``.
         """
         queue_dir = tmp_path / 'queue'
         archive_dir = queue_dir / 'archive' / '2025-06-10'
         archive_dir.mkdir(parents=True, exist_ok=True)
         seeded = _make_escalation('esc-cnt-5', task_id='cnt', status='resolved')
         (archive_dir / 'esc-cnt-5.json').write_text(seeded.to_json())
+        (queue_dir / 'esc-cnt.seq').write_text('5')
 
         queue = EscalationQueue(queue_dir)
         with patch.object(
             queue, '_iter_archive_paths', wraps=queue._iter_archive_paths,
         ) as spy:
-            queue.make_id('cnt')
-            queue.make_id('cnt')
+            first_id = queue.make_id('cnt')
+            second_id = queue.make_id('cnt')
 
         assert spy.call_count == 0, (
-            f'make_id() must not scan the archive; _iter_archive_paths called '
-            f'{spy.call_count}x'
+            f'make_id() must not scan the archive while the counter is intact; '
+            f'_iter_archive_paths called {spy.call_count}x'
+        )
+        assert (first_id, second_id) == ('esc-cnt-6', 'esc-cnt-7'), (
+            f'Expected counter-derived (archive-independent) ids; got '
+            f'{first_id!r}, {second_id!r}'
         )
 
     def test_make_id_corrupt_counter_logs_error_and_resets_to_one(
@@ -1581,14 +1594,16 @@ class TestMakeIdCounter:
         self, tmp_path: Path, caplog,
     ):
         """An absent counter file is logged as an ERROR when the queue root
-        already holds escalations for the task_id.
+        already holds escalations for the task_id, and the counter is
+        reconciled past them.
 
-        Without this check, a lost counter (aggressive cleanup, fresh
-        checkout, disk restore, accidental rm of the non-.json sidecar) is
-        indistinguishable from a legitimately-new task_id and silently
-        re-mints ids that collide with ones already issued — with zero
-        observability. The mint still starts from 0 (no archive-scan
-        fallback survives this check); only the logging changes.
+        A lost counter (aggressive cleanup, fresh checkout, disk restore,
+        accidental rm of the non-.json sidecar) is indistinguishable from a
+        legitimately-new task_id on its own, and silently re-minting from 1
+        would collide with ids already issued — here, literally with the
+        esc-cnt-1 already sitting in the queue root. The mint reconciles
+        from a one-shot bounded root+archive scan (max observed + 1) and
+        stays loudly observable.
         """
         queue_dir = tmp_path / 'queue'
         queue = EscalationQueue(queue_dir)
@@ -1598,9 +1613,12 @@ class TestMakeIdCounter:
         with caplog.at_level(logging.ERROR, logger='escalation.queue'):
             result = queue.make_id('cnt')
 
-        assert result == 'esc-cnt-1', (
-            'counter is authoritative with no archive-scan fallback — even when '
-            'suspicious, it must still start from 0, not derive a seq from disk'
+        assert result == 'esc-cnt-2', (
+            'the lost counter must be reconciled past the esc-cnt-1 already in '
+            f'the queue root, not restarted from 0; got {result!r}'
+        )
+        assert queue.get('esc-cnt-2') is None, (
+            'the minted id must not resolve to a pre-existing record'
         )
 
         error_records = [
@@ -1610,8 +1628,14 @@ class TestMakeIdCounter:
         assert error_records, (
             f"Expected an ERROR at logger 'escalation.queue'; got records: {caplog.records}"
         )
-        assert any('counter file' in r.message and 'absent' in r.message for r in error_records), (
-            f'Expected an ERROR about the absent counter file; got: {[r.message for r in error_records]}'
+        assert any(
+            'counter file' in r.message
+            and 'absent' in r.message
+            and 'highest observed sequence 1' in r.message
+            for r in error_records
+        ), (
+            'Expected an ERROR about the absent counter file naming the recovered '
+            f'maximum (1); got: {[r.message for r in error_records]}'
         )
 
     def test_make_id_missing_counter_no_existing_escalations_silent(
