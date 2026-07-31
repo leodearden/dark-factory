@@ -617,6 +617,79 @@ class NightlyResult:
     escalated: bool = False
     reason: str | None = None
 
+    budget_suppressed: bool = False
+    """True when this night found real signal and then discarded ALL of it on
+    the digest-byte budget (``not sample.selected and
+    sample.budget_skipped > 0``) -- NOT a no-change night.
+
+    A structured fact rather than a log line to scrape: the two states are
+    otherwise identical in every observable a caller has (``applied == 0``,
+    ``commit_made is False``, ``exit_code == 0``), which is precisely why the
+    live trickle's 14 fully-suppressed nights (2026-07-16..29) went
+    unnoticed. ``exit_code`` deliberately stays 0 -- see
+    :func:`_report_sample_outcome`."""
+
+
+def _report_sample_outcome(
+    cfg: LegibilityConfig,
+    sample: sampling.SampleResult,
+    target_date: date,
+    *,
+    poster=None,
+) -> bool:
+    """Report *sample*'s accounting, loudly if the night was totally
+    suppressed. Returns whether an escalation was posted.
+
+    Always emits the operator's grep anchor at INFO -- what was enumerated,
+    what was dropped and why, what the budget bought -- prefixed with the
+    project id and target date, since one journal interleaves every project's
+    timer. Its visibility depends on ``config.configure_logging()`` being
+    called from ``main()``; the two halves are one contract.
+
+    On ``not sample.selected and sample.budget_skipped > 0`` -- which the
+    :class:`~legibility.sampling.SampleResult` conservation invariant makes
+    exactly "candidates existed and were ALL discarded on the byte budget" --
+    it additionally logs ONE WARNING and posts ONE best-effort
+    :func:`post_escalation`, reusing the decision-8
+    ``escalate_info``/``infra_issue``/severity=info envelope unchanged.
+
+    Two deliberate non-behaviors. It does NOT touch the exit code: a non-zero
+    exit flips ``legibility-trickle@<project>.service`` to ``Result=failed``,
+    so ``check_trickle_liveness.sh`` would fail every night for a timer that
+    is running perfectly -- trading a silent-failure mode for a permanent
+    false alarm, and burning the one signal that currently works. And it does
+    not stop the run: a suppressed night has no reason to skip the census
+    trigger. Partial truncation (``budget_skipped > 0`` with a non-empty
+    selection) stays at INFO too -- that is the budget working as designed,
+    and it is fully visible in the always-on line.
+    """
+    summary_line = sampling.format_sample_summary_line(
+        sample, max_bytes=cfg.budgets.max_daily_digest_bytes,
+    )
+    logger.info(
+        'legibility trickle sampler: project=%s date=%s %s',
+        cfg.project_id, target_date.isoformat(), summary_line,
+    )
+
+    if sample.selected or sample.budget_skipped <= 0:
+        return False
+
+    summary = (
+        f'legibility trickle night totally suppressed by the digest byte budget: '
+        f'{sample.budget_skipped} candidate(s) discarded, 0 selected'
+    )
+    detail = (
+        f'project={cfg.project_id} date={target_date.isoformat()} {summary_line}. '
+        f'Real confusion signal WAS found and then entirely discarded on '
+        f'budgets.max_daily_digest_bytes='
+        f'{cfg.budgets.max_daily_digest_bytes} -- this is NOT a no-change '
+        f'night. Either the budget is too small for this project\'s session '
+        f'sizes or the cost basis is over-charging; raise the budget or '
+        f'investigate the sampler cost basis.'
+    )
+    logger.warning('%s -- %s', summary, detail)
+    return post_escalation(cfg, summary, detail, poster=poster)
+
 
 def run_nightly(
     *,
@@ -668,20 +741,16 @@ def run_nightly(
     rendered: dict[tuple, str] = {}
     sample = select_digest_sessions(cfg, projects_root, target_date, rendered=rendered)
 
-    # The operator's grep anchor, emitted on EVERY run whatever the outcome:
-    # what was enumerated, what was thrown away and why, what the budget
-    # bought. Placed BEFORE the digest stage so the numbers are reported even
-    # when a later stage fails loud and returns early. Its VISIBILITY depends
-    # on main()'s config.configure_logging() call -- the journal's root logger
-    # defaults to WARNING, so an INFO line nobody configured for is an INFO
-    # line nobody sees; the two halves are one contract, and a night whose
-    # accounting is invisible is the defect this line exists to fix.
-    logger.info(
-        'legibility trickle sampler: project=%s date=%s %s',
-        cfg.project_id, target_date.isoformat(),
-        sampling.format_sample_summary_line(
-            sample, max_bytes=cfg.budgets.max_daily_digest_bytes,
-        ),
+    # The operator's grep anchor plus the total-suppression signal, emitted on
+    # EVERY run whatever the outcome. Placed BEFORE the digest stage so the
+    # numbers are reported even when a later stage fails loud and returns
+    # early. Its VISIBILITY depends on main()'s config.configure_logging()
+    # call -- the journal's root logger defaults to WARNING, so an INFO line
+    # nobody configured for is an INFO line nobody sees; the two halves are
+    # one contract.
+    budget_suppressed = not sample.selected and sample.budget_skipped > 0
+    suppression_escalated = _report_sample_outcome(
+        cfg, sample, target_date, poster=poster,
     )
 
     digests, extractor_failures = build_digests(sample.selected, rendered=rendered)
@@ -698,7 +767,8 @@ def run_nightly(
         escalated = post_escalation(cfg, summary, detail, poster=poster)
         return NightlyResult(
             exit_code=1,
-            escalated=escalated,
+            escalated=escalated or suppression_escalated,
+            budget_suppressed=budget_suppressed,
             reason=summary,
         )
 
@@ -734,7 +804,8 @@ def run_nightly(
         return NightlyResult(
             exit_code=1,
             coder_status=run.status,
-            escalated=escalated,
+            escalated=escalated or suppression_escalated,
+            budget_suppressed=budget_suppressed,
             reason=summary,
         )
 
@@ -761,7 +832,8 @@ def run_nightly(
             exit_code=1,
             applied=applied,
             coder_status=run.status,
-            escalated=escalated,
+            escalated=escalated or suppression_escalated,
+            budget_suppressed=budget_suppressed,
             reason=summary,
         )
 
@@ -783,7 +855,8 @@ def run_nightly(
                     exit_code=1,
                     applied=applied,
                     coder_status=run.status,
-                    escalated=escalated,
+                    escalated=escalated or suppression_escalated,
+                    budget_suppressed=budget_suppressed,
                     reason=summary,
                 )
             commit_made = True
@@ -809,6 +882,8 @@ def run_nightly(
         coder_status=run.status,
         census_line=census_line,
         census_fire=census_fire,
+        escalated=suppression_escalated,
+        budget_suppressed=budget_suppressed,
     )
 
 
