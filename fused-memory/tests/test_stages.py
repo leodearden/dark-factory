@@ -2835,29 +2835,19 @@ class TestTaskKnowledgeSyncUsesFilterTaskTree:
     async def test_stage_does_not_apply_second_slice_on_done_tasks(
         self, mock_deps, watermark
     ):
-        """Stage must NOT apply a second done_tasks slice on top of filter_task_tree's cap.
+        """Exactly MAX_DONE_TASKS_RETAINED done tasks must ALL appear in Recently Completed.
 
-        Two assertions:
-        (1) Source-level guard: assemble_payload source must not contain a slice on
-            done_tasks (e.g. ``done_tasks[:30]``).  This is a tripwire — it fires the
-            moment someone re-introduces a hardcoded re-slice that duplicates the cap
-            already enforced by filter_task_tree.
-        (2) Behavioral guard: exactly MAX_DONE_TASKS_RETAINED done tasks must ALL appear
-            in the Recently Completed section — the stage must not silently trim them.
+        At the cap boundary the stage must not silently trim: filter_task_tree has already
+        enforced MAX_DONE_TASKS_RETAINED, so every task it hands over has to survive
+        assemble_payload's rendering.
+
+        Scope note: this feeds *exactly* MAX_DONE_TASKS_RETAINED tasks, so a re-introduced
+        ``done_tasks[:30]`` re-slice passes all 30 through unchanged and would keep this
+        test green.  The oversized-tree case that actually detects a redundant re-slice
+        lives in ``test_assemble_payload_does_not_re_slice_an_oversized_done_tasks_tree``
+        (which also replaced the inspect.getsource source-text tripwire this test used to
+        carry as its first assertion — see task 3351).
         """
-        import inspect
-        import re
-
-        # (1) Source-level tripwire: assemble_payload must not slice done_tasks.
-        source = inspect.getsource(TaskKnowledgeSync.assemble_payload)
-        assert not re.search(r'done_tasks\[.*:.*\]', source), (
-            "assemble_payload contains a slice on done_tasks (e.g. done_tasks[:30]). "
-            "This is dead code — filter_task_tree already caps done_tasks at "
-            f"MAX_DONE_TASKS_RETAINED={MAX_DONE_TASKS_RETAINED}. "
-            "Remove the slice; filter_task_tree is the single source of truth."
-        )
-
-        # (2) Behavioral guard: all MAX_DONE_TASKS_RETAINED tasks pass through uncut.
         stage = make_configured_task_knowledge_sync_stage(mock_deps, project_id='test_project', project_root='/tmp/test_project')
         mock_deps['taskmaster'].get_tasks.return_value = {
             'tasks': [
