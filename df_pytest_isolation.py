@@ -45,7 +45,17 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pytest
+
 _CEILING_ENV = 'GIT_CEILING_DIRECTORIES'
+
+# This repo's own definition of "this directory is a live worktree root",
+# taken verbatim from .gitignore:15-17 rather than invented in parallel here.
+_WORKTREE_ROOT_COMPONENTS = frozenset({
+    '.worktrees',
+    '.worktrees-orphaned',
+    '.eval-worktrees',
+})
 
 
 def git_ceiling_value(basetemp: str | os.PathLike[str], existing: str | None = None) -> str:
@@ -70,3 +80,60 @@ def git_ceiling_value(basetemp: str | os.PathLike[str], existing: str | None = N
     if entry in existing.split(':'):
         return existing
     return f'{existing}:{entry}'
+
+
+def basetemp_rejection_reason(path: str | os.PathLike[str]) -> str | None:
+    """Explain why *path* is an unsafe pytest basetemp, or ``None`` if it is fine.
+
+    Deliberately NARROW: it refuses only a basetemp sitting inside one of this
+    repo's own gitignored worktree roots.  The tempting general rule — "reject
+    any basetemp with an enclosing git repo" — would hard-fail every developer
+    and CI setup that legitimately points ``--basetemp`` inside a checkout,
+    turning a safety net into an outage.
+
+    Matching is on resolved path COMPONENTS, never substrings: a directory
+    merely *containing* the name (``my.worktrees-backup``) is a different,
+    perfectly safe directory.  Resolution is what catches the shape that
+    actually caused the incident — ``--basetemp=.pytest-tmp`` run from inside
+    the worktree, where the flag value never mentions ``.worktrees`` at all.
+    """
+    resolved = Path(path).resolve()
+    offenders = _WORKTREE_ROOT_COMPONENTS.intersection(resolved.parts)
+    if not offenders:
+        return None
+    return (
+        f'unsafe --basetemp: {resolved} is inside a live task worktree '
+        f'({"/".join(sorted(offenders))}).\n'
+        'Git repository discovery walks UP the directory tree, so every '
+        'git command a test runs under that basetemp resolves against the '
+        "enclosing worktree's repo and mutates production state "
+        '(incident esc-3072-3: blobs written and a file staged at stages '
+        '1/2/3 in a live task). The untracked tree it creates can also be '
+        'swept into a commit by `git add -A` or trip a clean-worktree gate.\n'
+        'Fix: pass --basetemp somewhere OUTSIDE the worktree, or omit it '
+        'entirely and let pytest default to /tmp/pytest-of-<user>/.'
+    )
+
+
+def reject_unsafe_basetemp(config: object) -> None:
+    """Fail collection loudly when ``--basetemp`` points inside a worktree.
+
+    Reads only the PUBLIC ``config.option.basetemp`` CLI option, which is
+    populated by the time ``pytest_configure`` runs.  It deliberately does not
+    consult ``config._tmp_path_factory``: that attribute is private and its
+    availability during a *conftest* ``pytest_configure`` depends on plugin
+    hook ordering.
+
+    A no-op when no ``--basetemp`` was passed — the verify lane's case, which
+    runs bare ``uv run pytest tests/`` and lands in ``/tmp/pytest-of-<user>/``.
+
+    ``pytest.UsageError`` is the right register here: pytest renders it as a
+    clean ``ERROR: ...`` and exits without a traceback, which is what an
+    operator/agent misconfiguration deserves.
+    """
+    basetemp = getattr(getattr(config, 'option', None), 'basetemp', None)
+    if not basetemp:
+        return
+    reason = basetemp_rejection_reason(basetemp)
+    if reason is not None:
+        raise pytest.UsageError(reason)
