@@ -23,6 +23,8 @@ from _verify_config_corpus import (
 )
 
 from orchestrator.verify_cmd import (
+    _CHAIN_OPERATOR_TOKENS,
+    _NON_AND_CHAIN_TOKENS,
     ToolKind,
     VerifyCmd,
     apply_pytest_numprocesses,
@@ -1145,3 +1147,69 @@ class TestSplitChainTail:
         # ACCEPT: only the unquoted `&&` is a split point.
         assert prefix == "ruff check -k 'a && b' src/ "
         assert tail == '&& python3 x.py'
+
+
+class TestChainOperatorTokenCoverage:
+    """`&&` is the one chain operator whose tail `split_chain_tail` will carry.
+
+    NOT a tautology, and NOT a RED-first test — it is green on write. The
+    relationship it pins already holds: `_NON_AND_CHAIN_TOKENS` happens to list
+    exactly the non-`&&` operators plus the two paren tokens, so there is no
+    failure to observe first. Deriving one constant from the other is a pure
+    identity refactor and no failing test can honestly precede it.
+
+    Its value is FORWARD-looking, and rests on the cases being generated FROM
+    `_CHAIN_OPERATOR_TOKENS` rather than hardcoded. Add a future operator to
+    that set — say `&` — and a case for it appears here automatically,
+    asserting through the public API that `split_chain_tail` actually refuses
+    it. Before the derivation the two constants could silently disagree (a new
+    operator recognised as a chain delimiter but absent from the refusal set,
+    so its tail gets carried across control flow it was never safe to cross);
+    after it they cannot, and this test is what proves the derivation is
+    load-bearing rather than decorative.
+
+    Driven through the public gate, never by asserting the private constant's
+    literal members — a test that restates the definition would pass whatever
+    the definition became.
+    """
+
+    _CHAIN = 'ruff check src/ {op} python3 check.py dir/'
+    _KEYWORD = 'ruff check'
+
+    def test_and_chain_carries_its_tail(self):
+        """`&&`: a sibling-checker chain — head scoped, tail preserved verbatim."""
+        raw = self._CHAIN.format(op='&&')
+        prefix, tail = split_chain_tail(raw, self._KEYWORD)
+        assert tail, 'a plain `&&` sibling-checker chain must have its tail preserved'
+        assert prefix + tail == raw
+        assert 'python3 check.py dir/' in tail
+
+    @pytest.mark.parametrize('operator', sorted(_CHAIN_OPERATOR_TOKENS - {'&&'}))
+    def test_every_other_operator_is_refused(self, operator):
+        """Every non-`&&` chain operator: refused, raw echoed back unchanged.
+
+        The tail after a `||` / `;` / `|` is not "further independent commands
+        that would have run anyway" — it is conditional on, sequenced after, or
+        fed by the head, so lifting it out of the chain changes what runs.
+        """
+        raw = self._CHAIN.format(op=operator)
+        assert split_chain_tail(raw, self._KEYWORD) == (raw, ''), (
+            f'{operator!r} is a recognised chain operator, so split_chain_tail must refuse '
+            f'to carry a tail across it'
+        )
+
+    def test_refusal_set_covers_every_non_and_operator(self):
+        """The set-level relationship the step-11 derivation encodes.
+
+        Stated as containment plus one exclusion rather than as an equality:
+        `_NON_AND_CHAIN_TOKENS` legitimately holds MORE than the operators —
+        the `(` and `)` paren tokens — because grouping is disqualifying for
+        its own reason, distinct from being a chain delimiter.
+        """
+        assert (_CHAIN_OPERATOR_TOKENS - {'&&'}) <= _NON_AND_CHAIN_TOKENS, (
+            'every chain operator except `&&` must be refused by split_chain_tail'
+        )
+        assert '&&' not in _NON_AND_CHAIN_TOKENS, (
+            '`&&` is the one carryable operator — listing it here would disable '
+            'tail preservation entirely'
+        )
