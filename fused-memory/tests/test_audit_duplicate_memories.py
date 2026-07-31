@@ -54,6 +54,7 @@ fetch_procedural_memories = _mod.fetch_procedural_memories
 fetch_memories = _mod.fetch_memories
 _ALL_CATEGORIES = _mod._ALL_CATEGORIES
 extract_liveness_snapshot_fact = _mod.extract_liveness_snapshot_fact
+liveness_snapshot_subject_task_ids = _mod.liveness_snapshot_subject_task_ids
 apply_deletions = _mod.apply_deletions
 resolve_ann_threshold = _mod.resolve_ann_threshold
 fetch_ann_neighbors = _mod.fetch_ann_neighbors
@@ -3838,3 +3839,66 @@ class TestExtractLivenessSnapshotFact:
             'the project lock, so Stage 2 did not write.',
             category=_OS,
         )) is None
+
+
+class TestLivenessSnapshotSubjectTaskIds:
+    """Which task(s) a snapshot is ABOUT -- a union, not `metadata.task_id`.
+
+    The task description phrases the pattern as "sharing the same task_id",
+    but the live corpus disproves the strict reading: 1eef7df7 is filed under
+    task_id='99' while being a re-verification of tasks 94 AND 96. Under a
+    strict grouping every bucket in the motivating corpus is a singleton and
+    the detector emits nothing on the exact pattern it was built for.
+    """
+
+    def test_metadata_task_id_alone(self):
+        assert liveness_snapshot_subject_task_ids(
+            _memory('m', 'no task refs here', metadata={'task_id': '94'}),
+        ) == {'94'}
+
+    def test_int_task_id_is_coerced_to_str(self):
+        """The project-wide convention `_normalize_task_id_metadata` enforces."""
+        assert liveness_snapshot_subject_task_ids(
+            _memory('m', 'no task refs here', metadata={'task_id': 94}),
+        ) == {'94'}
+
+    def test_related_task_ids_and_content_refs_union_in(self):
+        """The real 1eef7df7 shape: filed under 99, about 94 and 96."""
+        subjects = liveness_snapshot_subject_task_ids(_memory(
+            '1eef7df7', _LIVENESS_REVERIFY_94_96_JUL26, category=_OS,
+            metadata={'task_id': '99', 'related_task_ids': ['94', '96']},
+        ))
+
+        assert {'94', '96', '99'} <= subjects
+
+    def test_content_ref_alone_still_groups_a_snapshot(self):
+        """Absent/blank metadata must not make a snapshot ungroupable."""
+        assert liveness_snapshot_subject_task_ids(
+            _memory('6b245659', _LIVENESS_SNAPSHOT_94_JUL24, category=_OS),
+        ) == {'94'}
+
+    def test_no_metadata_id_and_no_content_ref_is_empty(self):
+        assert liveness_snapshot_subject_task_ids(
+            _memory('m', 'a note that names no task at all'),
+        ) == set()
+
+    @pytest.mark.parametrize('related', ['77', None, 12, {'nested': 'dict'}])
+    def test_non_list_related_task_ids_degrades_without_raising(self, related):
+        subjects = liveness_snapshot_subject_task_ids(
+            _memory('m', 'no task refs here',
+                    metadata={'task_id': '94', 'related_task_ids': related}),
+        )
+
+        assert '94' in subjects, 'the metadata task id survives regardless'
+        assert all(isinstance(s, str) for s in subjects)
+
+    def test_the_record_is_not_mutated(self):
+        record = _memory(
+            '1eef7df7', _LIVENESS_REVERIFY_94_96_JUL26, category=_OS,
+            metadata={'task_id': '99', 'related_task_ids': ['94', '96']},
+        )
+        before = json.dumps(record, sort_keys=True, default=str)
+
+        liveness_snapshot_subject_task_ids(record)
+
+        assert json.dumps(record, sort_keys=True, default=str) == before
