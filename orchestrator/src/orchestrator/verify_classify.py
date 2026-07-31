@@ -369,14 +369,14 @@ def is_interpreter_missing_workspace_packages(output: str) -> bool:
     Pure and total: any input that grounds neither condition returns ``False``
     rather than raising — a classifier must never be the thing that fails.
     """
-    unresolved = _unresolved_top_level_modules(output)
+    unresolved = unresolved_top_level_modules(output)
     return (
         len(unresolved) >= _MIN_DISTINCT_UNRESOLVED_IMPORTS
         and bool(unresolved & _BASELINE_WORKSPACE_MODULES)
     )
 
 
-def _unresolved_top_level_modules(output: str) -> frozenset[str]:
+def unresolved_top_level_modules(output: str) -> frozenset[str]:
     """Distinct TOP-LEVEL module names reported unresolved in *output*.
 
     The one place ``_UNRESOLVED_IMPORT_RE`` is applied — both the predicate
@@ -386,6 +386,7 @@ def _unresolved_top_level_modules(output: str) -> frozenset[str]:
     return frozenset(
         name.split('.')[0] for name in _UNRESOLVED_IMPORT_RE.findall(output) if name
     )
+
 
 _VERIFY_WORKTREE_COLLATERAL_PATTERNS: list[re.Pattern[str]] = [
     # shape 2: the verify entrypoint script itself is gone (rc=127 lint

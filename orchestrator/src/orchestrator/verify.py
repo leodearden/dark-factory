@@ -42,7 +42,11 @@ from orchestrator.verify_categories import (
     FailureCategory,
     should_archive,
 )
-from orchestrator.verify_classify import classify_failure
+from orchestrator.verify_classify import (
+    classify_failure,
+    is_interpreter_missing_workspace_packages,
+    unresolved_top_level_modules,
+)
 from orchestrator.verify_cmd import (
     ToolKind,
     VerifyCmd,
@@ -4284,6 +4288,34 @@ async def run_verification(
                 log_path=_stream_log_path(label, current_attempt),
                 **_scope_kw,
                 **_clock_kw,
+            )
+        # Mis-resolved interpreter (task 3367 / esc-3359-1): make the condition
+        # LEGIBLE at the point it is observed. Classification alone routes the
+        # merge lane correctly (ENV_TRANSIENT -> a loud infra_issue hold) but
+        # says nothing about WHY; an operator reading hundreds of phantom
+        # "could not be resolved" lines has no way to tell a mis-resolved
+        # interpreter from a branch that genuinely dropped its dependencies.
+        #
+        # Structurally fires at most ONCE per failing check: this is the single
+        # post-_run_cmd path, so hundreds of matching output lines collapse to
+        # one statement with no de-dup counter. Uses the SAME shared predicate
+        # the classifier does — one detection site, never a second copy of the
+        # regex. The raw pyright text still streams to the per-leg log file
+        # untouched; this line is an interpretation layered ON TOP of it, not a
+        # replacement for it (loud-over-silent-degradation).
+        if rc != 0 and is_interpreter_missing_workspace_packages(out):
+            logger.error(
+                'Verification %r check failed against a Python interpreter that '
+                'has NONE of the workspace third-party packages: %d distinct '
+                'top-level modules are unresolved, including baseline dev '
+                'dependencies. This is an ENVIRONMENT mis-resolution, NOT a '
+                'branch defect — pyright resolved an interpreter from the '
+                'ambient VIRTUAL_ENV/PATH (which verify strips deliberately) '
+                'instead of this worktree\'s own .venv. Fix surface: pin '
+                '[tool.pyright] venvPath/venv in the checked subproject\'s '
+                'pyproject.toml. See task 3367 / esc-3359-1.',
+                label,
+                len(unresolved_top_level_modules(out)),
             )
         return CheckRun(
             label=label,
