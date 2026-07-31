@@ -41,6 +41,7 @@ def _load_module() -> types.ModuleType:
 _mod = _load_module()
 cluster_memories_by_pairs = _mod.cluster_memories_by_pairs
 ann_pairs_from_neighbors = _mod.ann_pairs_from_neighbors
+ann_scores_for_pairs = _mod.ann_scores_for_pairs
 _ANN_DISCLOSURE_KEYS = _mod._ANN_DISCLOSURE_KEYS
 find_near_duplicate_memory_groups = _mod.find_near_duplicate_memory_groups
 pick_survivor = _mod.pick_survivor
@@ -1270,6 +1271,188 @@ class TestAnnPathCatchesParaphraseLexicalPathMisses:
         plan = build_sweep_plan(memories)
         assert plan['clusters_total'] == 0
         assert plan['delete_candidates'] == []
+
+
+# ===========================================================================
+# ANN score back-mapping survives neighbour-list ASYMMETRY (task 3210)
+# ===========================================================================
+
+class TestAnnScoresForPairs:
+    """Recover each pair's cosine from EITHER endpoint's neighbour list.
+
+    ``ann_pairs_from_neighbors`` emits canonical ``(low, high)`` pairs
+    discovered from either side, so "the left endpoint's list names the
+    right" is a FALSE invariant. Two states this detector explicitly expects
+    and counts break it:
+
+      - ``top_k_saturated`` — the right lists the left while the left's cap
+        is filled by nearer points.
+      - ``missing_vector`` — a vector-less record is never a query point
+        (``fetch_ann_neighbors`` skips it) yet is still reachable as another
+        record's hit.
+
+    Scanning one side silently mis-reports precisely the cases the
+    disclosure counters exist to make legible, and defaulting the miss to
+    0.0 compounds it into a fabricated fact: 0.0 is not None, so it passes
+    ``build_sweep_plan``'s guard and publishes a score BELOW the cutoff that
+    produced the cluster — in the stdout report task 3136 consumes, and the
+    figure an operator uses to sanity-check an irreversible ``--apply``.
+
+    Pure: no I/O, following ``TestAnnPairsFromNeighbors``'s style. The "real
+    score" is step-7's ``_MEASURED_COSINE`` — a measured number from the
+    curator-labeled fixture, not an invented one.
+    """
+
+    # Mutually dissimilar contents, so the LEXICAL path never clusters these
+    # and every cluster under test is unambiguously ANN-attributed.
+    _CONTENTS = (
+        'quantum harmonic oscillator eigenstates',
+        'baking sourdough bread at home',
+        'tidal patterns along rocky coastlines',
+        'jazz improvisation over modal changes',
+    )
+
+    def _memories(self, n: int) -> list[dict]:
+        out = []
+        for i in range(n):
+            m = _memory(f'm{i}', self._CONTENTS[i])
+            m['vector'] = [0.1 * i, 0.2]
+            out.append(m)
+        return out
+
+    def test_score_recovered_when_only_the_right_endpoint_listed_the_pair(self):
+        """top_k saturation: the left's slots are filled by NEARER points.
+
+        m0's two neighbour slots go to m2/m3, so m1 never appears in m0's
+        list even though the pair cleared the cutoff. This is the counted
+        ``top_k_saturated`` state, not a malfunction — the score is still on
+        record, from m1's side.
+        """
+        memories = self._memories(4)
+        neighbors = {
+            'm0': [_hit('m2', 0.99), _hit('m3', 0.98)],  # cap full, m1 crowded out
+            'm1': [_hit('m0', _MEASURED_COSINE)],
+            'm2': [],
+            'm3': [],
+        }
+        scores = ann_scores_for_pairs(memories, neighbors, [(0, 1)])
+        assert scores[(0, 1)] == pytest.approx(_MEASURED_COSINE, abs=1e-12), (
+            f'the real cosine must be recovered from the RIGHT endpoint; '
+            f'got {scores.get((0, 1))!r} (0.0 means only the left was scanned)'
+        )
+
+    def test_score_recovered_when_the_left_endpoint_has_no_vector(self):
+        """A vector-less record is never a query point, yet is still a hit.
+
+        ``fetch_ann_neighbors`` skips it, so it is absent from *neighbors*
+        entirely and counted as ``missing_vector`` — but m1's query found it,
+        which is exactly how the pair came to exist.
+        """
+        memories = self._memories(2)
+        memories[0]['vector'] = None
+        neighbors = {'m1': [_hit('m0', _MEASURED_COSINE)]}  # no 'm0' key at all
+        scores = ann_scores_for_pairs(memories, neighbors, [(0, 1)])
+        assert scores[(0, 1)] == pytest.approx(_MEASURED_COSINE, abs=1e-12), (
+            f'a left endpoint absent from the mapping must not zero the score; '
+            f'got {scores.get((0, 1))!r}'
+        )
+
+    def test_max_is_returned_when_both_directions_scored_the_pair(self):
+        memories = self._memories(2)
+        neighbors = {
+            'm0': [_hit('m1', _MEASURED_COSINE - 0.01)],
+            'm1': [_hit('m0', _MEASURED_COSINE)],
+        }
+        scores = ann_scores_for_pairs(memories, neighbors, [(0, 1)])
+        assert scores[(0, 1)] == pytest.approx(_MEASURED_COSINE, abs=1e-12)
+
+    def test_pair_neither_endpoint_scored_is_absent_not_zero(self):
+        """Absence, never a 0.0 default — that is the load-bearing half.
+
+        ``build_sweep_plan`` already degrades an unscored pair to
+        ``ann_max_score: null``; omitting the key reuses that path instead of
+        introducing a second sentinel that lies about the measurement.
+        """
+        memories = self._memories(3)
+        neighbors = {'m0': [_hit('m2', 0.99)], 'm1': [], 'm2': []}
+        scores = ann_scores_for_pairs(memories, neighbors, [(0, 1)])
+        assert (0, 1) not in scores, (
+            f'an unrecoverable score must be ABSENT so the plan reports null; '
+            f'got {scores.get((0, 1))!r}'
+        )
+
+    def test_self_hit_never_supplies_a_pair_score(self):
+        """A record is its own nearest neighbour; that resolves to itself, not the partner."""
+        memories = self._memories(2)
+        neighbors = {'m0': [_hit('m0', 1.0)], 'm1': [_hit('m1', 1.0)]}
+        scores = ann_scores_for_pairs(memories, neighbors, [(0, 1)])
+        assert (0, 1) not in scores, f'self-hits must not score the pair, got {scores!r}'
+
+    def test_hit_without_a_score_is_not_treated_as_zero(self):
+        """A scoreless hit is an unrecorded measurement, not a measurement of 0.0."""
+        memories = self._memories(2)
+        neighbors = {'m0': [{'id': 'm1'}], 'm1': []}
+        scores = ann_scores_for_pairs(memories, neighbors, [(0, 1)])
+        assert (0, 1) not in scores, f'expected the key to be absent, got {scores!r}'
+
+    def test_unknown_neighbour_ids_are_ignored_without_raising(self):
+        memories = self._memories(2)
+        neighbors = {'m0': [_hit('not-in-scan', 0.99), _hit('m1', _MEASURED_COSINE)]}
+        scores = ann_scores_for_pairs(memories, neighbors, [(0, 1)])
+        assert scores[(0, 1)] == pytest.approx(_MEASURED_COSINE, abs=1e-12)
+
+    def test_empty_pairs_produce_an_empty_mapping(self):
+        memories = self._memories(2)
+        assert ann_scores_for_pairs(memories, {'m0': [_hit('m1', 0.99)]}, []) == {}
+
+    def test_input_memories_not_mutated(self):
+        memories = self._memories(2)
+        snapshot = [dict(m) for m in memories]
+        ann_scores_for_pairs(memories, {'m1': [_hit('m0', 0.99)]}, [(0, 1)])
+        assert memories == snapshot
+
+    # -- end to end through build_sweep_plan -------------------------------
+
+    def test_plan_reports_the_real_cosine_for_a_right_side_only_pair(self):
+        """The regression, end to end: never publish a score below the cutoff.
+
+        Runs the real generator over an asymmetric mapping (m0's query
+        returned nothing), then back-maps and reports.
+        """
+        memories = self._memories(2)
+        cutoff = _calibrated_ann_threshold()
+        neighbors = {'m1': [_hit('m0', _MEASURED_COSINE)]}
+
+        pairs, _disclosure = ann_pairs_from_neighbors(
+            memories, neighbors, threshold=cutoff, top_k=10,
+        )
+        assert pairs == [(0, 1)], 'precondition: the right endpoint alone proposes the pair'
+
+        plan = build_sweep_plan(
+            memories,
+            ann_pairs=pairs,
+            ann_scores=ann_scores_for_pairs(memories, neighbors, pairs),
+            ann_threshold=cutoff,
+        )
+        group = plan['near_duplicate_groups'][0]
+        assert group['found_by'] == ['ann']
+        assert group['ann_max_score'] == pytest.approx(_MEASURED_COSINE, abs=1e-12)
+        assert group['ann_max_score'] >= cutoff, (
+            f'reported score {group["ann_max_score"]!r} is below the cutoff '
+            f'{cutoff!r} that produced the cluster — a self-contradicting number'
+        )
+
+    def test_plan_reports_null_when_no_endpoint_scored_the_pair(self):
+        """A caller supplying ann_pairs without scores gets null, not 0.0."""
+        memories = self._memories(2)
+        plan = build_sweep_plan(
+            memories,
+            ann_pairs=[(0, 1)],
+            ann_scores=ann_scores_for_pairs(memories, {}, [(0, 1)]),
+            ann_threshold=0.88,
+        )
+        assert plan['clusters_total'] == 1
+        assert plan['near_duplicate_groups'][0]['ann_max_score'] is None
 
 
 # ===========================================================================
