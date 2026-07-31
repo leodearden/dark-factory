@@ -66,6 +66,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 
@@ -400,6 +401,62 @@ def save_state(state: dict, path: str = STATE_PATH) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Actuation
+# ---------------------------------------------------------------------------
+
+
+def restart_unit(unit: str = DASHBOARD_UNIT) -> None:
+    """Restart *unit* via the USER manager: ``reset-failed`` then ``restart``.
+
+    §Contract "actuation". Two deliberate divergences from
+    scripts/orchestrator-watchdog.py's restart_unit, which does a three-phase
+    stop → reset-failed → start:
+
+      * ``restart`` rather than stop+start. Task 3306 bounded this unit's
+        drain explicitly (``--timeout-graceful-shutdown 8`` inside
+        ``TimeoutStopSec=15``) and PRD row B7 states its expectation against
+        ``systemctl restart``, so the single verb is the contract the rest of
+        the batch is written against. It is also atomic from systemd's point
+        of view: a stop+start pair can leave the dashboard DOWN if the
+        oneshot is killed between the two calls, which is the worse failure
+        for an availability watchdog to own.
+      * ``reset-failed`` still runs FIRST, and unconditionally. Without it a
+        unit that has exhausted StartLimitBurst silently ignores the restart:
+        systemctl returns, the watchdog logs "restart issued", the streak
+        resets — and nothing actually happened. That is a fail-soft hole that
+        makes the gate LOOK like it fired, so it is pinned by
+        test_b3_reset_failed_precedes_the_restart.
+
+    Timeouts are bounded (10s for the cheap reset, 45s for the restart —
+    comfortably above the unit's TimeoutStopSec=15) so a wedged systemctl
+    cannot leave the oneshot running into the next 30s tick. A TimeoutExpired
+    is warn-logged and swallowed: the restart is still RECORDED by the caller
+    (a timed-out restart very often still took effect, and counting it is the
+    fail-direction that leads to the storm escape rather than to a flap).
+    """
+    try:
+        subprocess.run(
+            ["systemctl", "--user", "reset-failed", unit], check=False, timeout=10
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            f"systemctl reset-failed {unit} timed out after 10s; "
+            "attempting the restart anyway"
+        )
+    except Exception as exc:  # noqa: BLE001 -- actuation must never crash the oneshot
+        logger.warning(f"systemctl reset-failed {unit} failed: {exc!r}")
+
+    try:
+        subprocess.run(
+            ["systemctl", "--user", "restart", unit], check=False, timeout=45
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning(f"systemctl restart {unit} timed out after 45s")
+    except Exception as exc:  # noqa: BLE001 -- actuation must never crash the oneshot
+        logger.warning(f"systemctl restart {unit} failed: {exc!r}")
+
+
+# ---------------------------------------------------------------------------
 # Tick
 # ---------------------------------------------------------------------------
 
@@ -435,6 +492,24 @@ def tick() -> None:
             "consecutive); below the streak gate, taking no action"
         )
         return
+
+    # §Contract "hysteresis", gate reached: FAIL_STREAK consecutive failed
+    # probes. Actuation is per COMPLETED STREAK, never per tick (invariant
+    # I3) — the streak is reset to 0 below, so the NEXT restart needs another
+    # FAIL_STREAK consecutive misses rather than firing again in 30 seconds.
+    logger.warning(
+        f"{DASHBOARD_UNIT} failed {state['streak']} consecutive probes "
+        f"(>= FAIL_STREAK={FAIL_STREAK}); restarting"
+    )
+    restart_unit(DASHBOARD_UNIT)
+
+    # Record the restart BEFORE resetting the streak, and record it even if
+    # systemctl misbehaved: the rolling window that feeds the storm escape is
+    # measured against these epochs, so an unrecorded restart would make the
+    # ceiling unreachable and re-open the flap the escape exists to stop.
+    state["restarts"].append(int(time.time()))
+    state["streak"] = 0
+    save_state(state)
 
 
 def main() -> int:
