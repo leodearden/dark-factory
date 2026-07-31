@@ -111,6 +111,99 @@ def _assume_utc(dt: datetime) -> datetime:
     return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt
 
 
+async def _warn_on_untrimmable_pool_residue(
+    memory_service,
+    project_id: str,
+    run_id: str,
+    *,
+    recon_pool: str,
+    trimmable: int,
+) -> int | None:
+    """Warn when the pool holds records this trim can no longer see.
+
+    :func:`enforce_summary_pool_cap` enumerates on
+    ``{'recon_pool': ..., 'kind': 'cycle_summary'}``. The ``kind`` constraint
+    is what stops a mis-tagged record from evicting a real mirror — but it
+    also means a record carrying ``recon_pool`` WITHOUT
+    ``kind='cycle_summary'`` is no longer enumerated, so it is never evicted
+    either. It is not covered by the protected-mirror guard, and no other
+    collector claims it. Before the ``kind`` constraint such a record was
+    trimmed; after it, it would accumulate with ZERO signal — which is the
+    unbounded pool growth tasks 1657/1831/2229 built this trim to prevent,
+    reintroduced in a shape nothing reports (reviewer finding robustness,
+    task 3041 amendment pass).
+
+    That shape is realistic, not theoretical: cycle_summary metadata is
+    LLM-supplied on the narrative write path, and
+    ``_apply_cycle_summary_metadata_tagging`` backfills ``run_id`` precisely
+    BECAUSE prompt compliance is not guaranteed — a write that lands
+    ``recon_pool`` (or has it auto-stamped from ``metadata.stage``) while
+    dropping ``kind`` produces exactly this residue.
+
+    So the narrowed delete filter stays and the pool gets an observability
+    backstop instead: one ``count_memories_by_metadata`` on the ``recon_pool``
+    tag ALONE. Anything in that count beyond what the narrowed enumeration
+    returned is untrimmable residue, and gets one WARNING naming the size.
+
+    Diagnostic-only and fully fail-safe — this must never change what the trim
+    does, only what it says:
+
+    - a ``memory_service`` without ``count_memories_by_metadata`` (the shape
+      several inline test fakes have) is skipped silently;
+    - a non-int result (an unspecced mock) is skipped silently;
+    - a raising count logs one WARNING and returns, since a blind backstop is
+      itself worth knowing about, but the trim proceeds regardless.
+
+    Returns:
+        The residue size when one was computed, ``0`` when the pool is clean,
+        or ``None`` when the check could not run.
+    """
+    counter = getattr(memory_service, 'count_memories_by_metadata', None)
+    if counter is None:
+        return None
+    try:
+        total = await counter(project_id=project_id, filters={'recon_pool': recon_pool})
+    except Exception:
+        logger.warning(
+            'reconciliation.enforce_summary_pool_cap: '
+            'untrimmable-residue count failed for project_id=%s recon_pool=%s; '
+            'the trim itself is unaffected, but mis-tagged pool residue is now unreported',
+            project_id,
+            recon_pool,
+            exc_info=True,
+            extra={'project_id': project_id, 'run_id': run_id, 'recon_pool': recon_pool},
+        )
+        return None
+    if not isinstance(total, int) or isinstance(total, bool):
+        return None
+
+    residue = total - trimmable
+    if residue <= 0:
+        return 0
+
+    logger.warning(
+        'reconciliation.enforce_summary_pool_cap: '
+        '%d record(s) tagged recon_pool=%s are NOT kind=%s in project_id=%s — '
+        'they are invisible to this trim and no other collector reaps them; '
+        'pool total=%d, trimmable=%d',
+        residue,
+        recon_pool,
+        _KIND_CYCLE_SUMMARY,
+        project_id,
+        total,
+        trimmable,
+        extra={
+            'project_id': project_id,
+            'run_id': run_id,
+            'recon_pool': recon_pool,
+            'pool_total': total,
+            'trimmable': trimmable,
+            'untrimmable_residue': residue,
+        },
+    )
+    return residue
+
+
 async def enforce_summary_pool_cap(
     memory_service,
     project_id: str,
@@ -120,13 +213,21 @@ async def enforce_summary_pool_cap(
     trim_source: str,
     cap: int,
 ) -> int:
-    """Trim the *recon_pool* pool to at most *cap* members.
+    """Trim the ``kind='cycle_summary'`` members of the *recon_pool* pool to at most *cap*.
 
     Enumerates all Mem0 memories tagged
     ``{'recon_pool': recon_pool, 'kind': 'cycle_summary'}`` via
     ``get_memories_by_metadata`` (deterministic Qdrant scroll — NOT semantic
     search), sorts eviction-order-first, then deletes the first ``len - cap``
     via parallel ``delete_memory`` calls.
+
+    **Scope note (task 3041):** despite the generic name this is
+    cycle-summary-specific — the ``kind`` constraint below means a record
+    tagged with this ``recon_pool`` but NOT ``kind='cycle_summary'`` is
+    neither enumerated nor evicted here. Nothing else collects such a record
+    either, so it would accumulate silently; instead it is counted and
+    reported by :func:`_warn_on_untrimmable_pool_residue`, which runs on every
+    call and is diagnostic-only.
 
     Best-effort posture (mirrors the original Stage 2
     ``_enforce_stage2_summary_pool_cap``):
@@ -222,6 +323,17 @@ async def enforce_summary_pool_cap(
             extra={'project_id': project_id, 'run_id': run_id, 'recon_pool': recon_pool},
         )
         return 0
+
+    # Diagnostic only — never changes what is deleted, and deliberately runs
+    # BEFORE the under-cap early return: mis-tagged residue accumulates
+    # whether or not this cycle has anything to trim.
+    await _warn_on_untrimmable_pool_residue(
+        memory_service,
+        project_id,
+        run_id,
+        recon_pool=recon_pool,
+        trimmable=len(members),
+    )
 
     if len(members) >= SUMMARY_POOL_SCROLL_LIMIT:
         # The enumeration may be a PARTIAL view of the pool, so the members

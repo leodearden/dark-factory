@@ -1185,6 +1185,184 @@ class TestEnforceSummaryPoolCapEnumerationBound:
         assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
 
 
+class TestEnforceSummaryPoolCapResidueBackstop:
+    """A record this trim can no longer see must not accumulate in silence.
+
+    The kind='cycle_summary' enumeration constraint (task 3041) is what stops a
+    mis-tagged record from evicting a real mirror — but it also makes any
+    record carrying recon_pool WITHOUT that kind invisible to the trim: never
+    enumerated, so never evicted, and not covered by the protected-mirror
+    guard either. No other collector claims it. Before the constraint it was
+    trimmed; after it, it would grow unbounded with zero signal — the exact
+    failure mode tasks 1657/1831/2229 built this trim to prevent.
+
+    That shape is realistic: cycle_summary metadata is LLM-supplied on the
+    narrative path (which is why _apply_cycle_summary_metadata_tagging
+    backfills run_id at all), so a write that lands recon_pool while dropping
+    kind is a prompt-compliance failure away. So the narrow delete filter
+    stays and the pool gets a diagnostic count instead (reviewer finding
+    robustness, task 3041 amendment pass).
+    """
+
+    @staticmethod
+    def _service(members, *, pool_total):
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=pool_total)
+        return memory_service
+
+    @staticmethod
+    def _members(n):
+        return [
+            {
+                'id': f'm{i}',
+                'created_at': f'2026-01-{i + 1:02d}T00:00:00+00:00',
+                'metadata': {'kind': 'cycle_summary', 'record_type': 'ledger_stamp'},
+            }
+            for i in range(n)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_mistagged_residue_is_counted_and_warned(self, caplog):
+        """pool total > enumerated members → one WARNING naming the residue."""
+        members = self._members(2)
+        # 5 records carry the recon_pool tag; only 2 are kind='cycle_summary'.
+        memory_service = self._service(members, pool_total=5)
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER):
+            result = await enforce_summary_pool_cap(
+                memory_service,
+                project_id='dark_factory',
+                run_id='run-1',
+                recon_pool='stage1_cycle_summary',
+                trim_source='stage1_cycle_summary_trim',
+                cap=2,
+            )
+
+        # Diagnostic only: the trim's behaviour is completely unchanged.
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+
+        # The backstop counts on the recon_pool tag ALONE — narrowing it would
+        # make it blind to the very records it exists to find.
+        memory_service.count_memories_by_metadata.assert_awaited_once_with(
+            project_id='dark_factory',
+            filters={'recon_pool': 'stage1_cycle_summary'},
+        )
+
+        residue_warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and 'untrimmable_residue' in r.__dict__
+        ]
+        assert len(residue_warnings) == 1, (
+            f'expected one residue WARNING, got {[r.message for r in caplog.records]!r}'
+        )
+        assert residue_warnings[0].__dict__['untrimmable_residue'] == 3
+        assert residue_warnings[0].__dict__['pool_total'] == 5
+        assert residue_warnings[0].__dict__['trimmable'] == 2
+
+    @pytest.mark.asyncio
+    async def test_runs_even_when_the_pool_is_under_cap(self, caplog):
+        """Residue accumulates whether or not this cycle has anything to trim.
+
+        The check therefore runs BEFORE the under-cap early return; putting it
+        after would silence it in the steady state, which is precisely when
+        the pool is quietly growing.
+        """
+        memory_service = self._service(self._members(1), pool_total=4)
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER):
+            result = await enforce_summary_pool_cap(
+                memory_service,
+                project_id='dark_factory',
+                run_id='run-1',
+                recon_pool='stage1_cycle_summary',
+                trim_source='stage1_cycle_summary_trim',
+                cap=2,
+            )
+
+        assert result == 0
+        assert [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and 'untrimmable_residue' in r.__dict__
+        ], 'an under-cap pool with residue must still warn'
+
+    @pytest.mark.asyncio
+    async def test_clean_pool_does_not_warn(self, caplog):
+        """Every recon_pool-tagged record is a cycle_summary → silence."""
+        memory_service = self._service(self._members(3), pool_total=3)
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER):
+            await enforce_summary_pool_cap(
+                memory_service,
+                project_id='dark_factory',
+                run_id='run-1',
+                recon_pool='stage1_cycle_summary',
+                trim_source='stage1_cycle_summary_trim',
+                cap=2,
+            )
+
+        assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+    @pytest.mark.asyncio
+    async def test_a_raising_count_warns_but_never_breaks_the_trim(self, caplog):
+        """The backstop is diagnostic: its own failure cannot change the trim.
+
+        It is still reported — a blind backstop is worth knowing about — but
+        the deletion count and the deletes themselves are untouched.
+        """
+        members = self._members(3)
+        memory_service = self._service(members, pool_total=3)
+        memory_service.count_memories_by_metadata = AsyncMock(
+            side_effect=RuntimeError('qdrant count exploded')
+        )
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER):
+            result = await enforce_summary_pool_cap(
+                memory_service,
+                project_id='dark_factory',
+                run_id='run-1',
+                recon_pool='stage1_cycle_summary',
+                trim_source='stage1_cycle_summary_trim',
+                cap=2,
+            )
+
+        assert result == 1
+        assert memory_service.delete_memory.await_count == 1
+        assert [r for r in caplog.records if r.levelno == logging.WARNING], (
+            'a blind residue backstop must say so'
+        )
+
+    @pytest.mark.asyncio
+    async def test_service_without_a_counter_is_skipped_silently(self, caplog):
+        """A memory_service lacking count_memories_by_metadata still trims.
+
+        Keeps the backstop from becoming a hard dependency of the trim — the
+        optional-capability posture used throughout this module
+        (getattr(memory_service, 'recon_ledger', None)).
+        """
+        class _NoCounter:
+            def __init__(self, members):
+                self.get_memories_by_metadata = AsyncMock(return_value=members)
+                self.delete_memory = AsyncMock(return_value=None)
+
+        memory_service = _NoCounter(self._members(3))
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER):
+            result = await enforce_summary_pool_cap(
+                memory_service,
+                project_id='dark_factory',
+                run_id='run-1',
+                recon_pool='stage1_cycle_summary',
+                trim_source='stage1_cycle_summary_trim',
+                cap=2,
+            )
+
+        assert result == 1
+        assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+
 class _StatefulMem0Pool:
     """A dict-backed stand-in for the Mem0 half of MemoryService.
 
