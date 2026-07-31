@@ -2884,6 +2884,68 @@ class TestTaskKnowledgeSyncUsesFilterTaskTree:
             f"Section content:\n{section}"
         )
 
+    @pytest.mark.asyncio
+    async def test_assemble_payload_does_not_re_slice_an_oversized_done_tasks_tree(
+        self, mock_deps, watermark
+    ):
+        r"""assemble_payload must render EVERY done task it is handed — no second truncation.
+
+        This asserts on RENDERED OUTPUT (the '### Recently Completed Tasks' section of the
+        assembled payload), **not on source text**.  It replaces an
+        ``inspect.getsource(TaskKnowledgeSync.assemble_payload)`` +
+        ``re.search(r'done_tasks\[.*:.*\]', source)`` tripwire that was both:
+
+        - *brittle* — the needle was prose-reachable: a comment or docstring inside
+          ``assemble_payload`` merely mentioning ``done_tasks[...]`` tripped it even though
+          nothing sliced; and
+        - *incomplete* — it matched only literal subscript slices, so ``itertools.islice``,
+          ``heapq.nlargest`` or any computed-bound truncation kept it green.
+
+        Observing what actually reaches the payload catches all of those.  Precedent for
+        swapping a source scan for a behavioral guard: commit da8e5a4c96 and
+        ``TestReconPoolMapIsImportFreeLeaf`` in test_mem0_tombstone.py.
+
+        Why a *separate* test from the sibling
+        ``test_stage_does_not_apply_second_slice_on_done_tasks``: that one feeds exactly
+        ``MAX_DONE_TASKS_RETAINED`` done tasks, so a re-introduced ``done_tasks[:30]``
+        passes all 30 through unchanged and stays green.  Here the tree is deliberately
+        OVERSIZED (``MAX_DONE_TASKS_RETAINED + 5``) — a state ``filter_task_tree`` can never
+        produce, but reachable by injecting a ``FilteredTaskTree`` directly (the same
+        external-construction seam ``TestInvariantAfterTask643`` uses), which
+        ``assemble_payload`` honours ahead of its ``filter_task_tree`` fallback.  Any second
+        truncation is therefore directly observable as missing task ids.
+        """
+        n_done = MAX_DONE_TASKS_RETAINED + 5
+        stage = make_configured_task_knowledge_sync_stage(
+            mock_deps, project_id='test_project', project_root='/tmp/test_project'
+        )
+        # done_count == len(done_tasks) so _check_filtered_tree_invariant stays quiet;
+        # the only anomaly under test is the size of the tree, not its internal consistency.
+        stage.filtered_task_tree = FilteredTaskTree(
+            active_tasks=[],
+            done_tasks=[self._make_task(i, 'done') for i in range(1, n_done + 1)],
+            done_count=n_done,
+            cancelled_tasks=[],
+            cancelled_count=0,
+            other_count=0,
+            total_count=n_done,
+        )
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        section = _extract_section(payload, '### Recently Completed Tasks')
+        assert section, "Payload missing '### Recently Completed Tasks' section"
+
+        missing = [tid for tid in range(1, n_done + 1) if f'- [{tid}] ' not in section]
+        assert not missing, (
+            f"Task ids {missing} were dropped from the Recently Completed section. "
+            f"assemble_payload was handed {n_done} done tasks and must render all of them. "
+            f"filter_task_tree is the single source of truth for the "
+            f"MAX_DONE_TASKS_RETAINED={MAX_DONE_TASKS_RETAINED} cap, so any truncation "
+            f"inside the stage is a redundant re-slice — remove it.\n"
+            f"Section content:\n{section}"
+        )
+
     # --- Step: other-status exclusion from proactive pool (task-709) ---
 
     @pytest.mark.asyncio
