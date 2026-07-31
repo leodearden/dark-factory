@@ -454,3 +454,111 @@ def extract_searches(
     for record in emitted:
         record['caller'] = dict(resolved)
     return emitted
+
+
+# ---------------------------------------------------------------------------
+# Archive scan + coverage accounting
+# ---------------------------------------------------------------------------
+
+DEFAULT_MAX_FAILURE_EXAMPLES = 20
+"""Enough to see a pattern, few enough that the report stays readable. The
+COUNT is never capped, and a truncated example list discloses itself."""
+
+
+def _new_coverage() -> dict[str, Any]:
+    """A zeroed coverage mapping. Every key is always present, even at zero:
+    an absent counter reads as "not measured", which is a different claim."""
+    return {
+        'tasks_scanned': 0,
+        'transcripts_found': 0,
+        'transcripts_read': 0,
+        'searches_extracted': 0,
+        'searches_unresolved': 0,
+        'parse_failures': {
+            'count': 0,
+            'examples': [],
+            'examples_truncated': False,
+            'examples_omitted': 0,
+        },
+    }
+
+
+def _record_failure(
+    coverage: dict[str, Any], rel: str, reason: str, max_examples: int
+) -> None:
+    """Count an unreadable file, keeping a bounded, self-disclosing example."""
+    failures = coverage['parse_failures']
+    failures['count'] += 1
+    if len(failures['examples']) < max_examples:
+        failures['examples'].append({'transcript': rel, 'reason': reason})
+    else:
+        failures['examples_truncated'] = True
+        failures['examples_omitted'] += 1
+
+
+def iter_transcripts(root: Path) -> list[Path]:
+    """Every transcript under *root*, in deterministic (sorted) order.
+
+    Both archive suffixes, both layouts. Sorted so two runs over an unchanged
+    archive emit byte-identical corpora — without that, a re-run would diff
+    against itself and a real change would be unreadable.
+    """
+    if not root.is_dir():
+        return []
+    found = set(root.glob('*/**/*.jsonl.gz')) | set(root.glob('*/**/*.jsonl'))
+    return sorted(p for p in found if p.is_file())
+
+
+def scan_archive(
+    root: str | Path,
+    *,
+    tool_names: frozenset[str] = SEARCH_TOOL_NAMES,
+    max_failure_examples: int = DEFAULT_MAX_FAILURE_EXAMPLES,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Mine a whole archive tree. Returns ``(records, coverage)``.
+
+    Each file streams through the PROMOTED ``legibility.inventory.iter_json_lines``
+    rather than being slurped: the live archive is thousands of multi-MB gz
+    files, so memory has to stay bounded by the largest single record.
+
+    Per that reader's documented contract, a blank or corrupt LINE is skipped
+    silently while an unreadable FILE raises ``OSError`` (``gzip.BadGzipFile``
+    subclasses it). That split is exactly the accounting this coverage needs:
+    ``parse_failures`` counts files we could not read at all, and a truncated
+    trailing line — which every fire-and-forget writer eventually produces —
+    does not inflate it into a false alarm.
+
+    A missing *root* is not an error here; it is zero transcripts found, which
+    :func:`coverage_status` turns into ``no_input``.
+    """
+    root = Path(root)
+    coverage = _new_coverage()
+    records: list[dict[str, Any]] = []
+    tasks: set[str] = set()
+
+    for path in iter_transcripts(root):
+        rel = path.relative_to(root).as_posix()
+        coverage['transcripts_found'] += 1
+        provenance = parse_archive_path(rel)
+        if provenance['task_id'] is not None:
+            tasks.add(provenance['task_id'])
+        try:
+            extracted = extract_searches(
+                iter_json_lines(path),
+                source=rel,
+                tool_names=tool_names,
+                provenance=provenance,
+            )
+        except OSError as exc:
+            _record_failure(coverage, rel, f'{type(exc).__name__}: {exc}',
+                            max_failure_examples)
+            continue
+        coverage['transcripts_read'] += 1
+        records.extend(extracted)
+
+    coverage['tasks_scanned'] = len(tasks)
+    coverage['searches_extracted'] = len(records)
+    coverage['searches_unresolved'] = sum(
+        1 for record in records if record['result_status'] != 'ok'
+    )
+    return records, coverage
