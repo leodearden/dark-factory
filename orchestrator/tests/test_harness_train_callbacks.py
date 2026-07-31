@@ -477,6 +477,13 @@ class TestHarnessWiring:
         # Inject a FakeScheduler with one seeded member.
         sched = FakeScheduler()
         await sched.set_task_status('4442', 'merge-deferred')
+        # task 3057: the harness now arms the factory with self.config, so the
+        # delivered-checks guard makes a get_task round-trip per member. Seed
+        # the record a real scheduler would have — an ABSENT one is the
+        # fail-safe "unknown metadata -> withhold" case, not the happy path
+        # this test is about (that case has its own coverage in
+        # TestTrainCallbacksDeliveredChecksGuard).
+        sched.task_data['4442'] = {'id': '4442', 'metadata': {}}
         harness.scheduler = sched  # type: ignore[assignment]
 
         # Stub git_ops so the worker constructor doesn't fail on project_root.
