@@ -48,6 +48,20 @@ test_command: "cd shared && uv run pytest tests/ --timeout=300 && cd ../escalati
 # fallback path (per-module orchestrator.yaml lint_commands carry the per-package
 # scope; also runs in merge-queue verify; see hooks/project-checks).
 lint_command: "uv run ruff check shared escalation fused-memory orchestrator dashboard && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests"
+# The bare ``npx pyright`` spelling is DELIBERATE and safe (task 3367 /
+# esc-3359-1): every ``cd`` target below pins pyright's own interpreter via
+# ``[tool.pyright] venvPath = ".."`` / ``venv = ".venv"`` in its pyproject.toml,
+# resolved relative to that file's directory — so each clause always type-checks
+# against THIS worktree's own .venv, never an ambient VIRTUAL_ENV/PATH one
+# (verify._target_subprocess_env strips both) and never another tree's.
+# Enforced by tests/scripts/test_fallback_verify_config.py::
+# TestRootTypeCheckCommandPyrightInterpreterPinned, which walks these clauses.
+# Do NOT "fix" this by rewriting the clauses to ``uv run --project <sub> pyright``:
+# ``uv run --project`` SYNCS that member's environment, and every member of this
+# uv workspace shares ONE root .venv — that would add a second concurrent
+# shared-venv mutator racing the TEST leg's own ``cd X && uv run pytest`` fanout,
+# reintroducing the mutation class tasks 2045/2048 exist to paper over. The
+# pyproject pin is static config: zero mutation, zero concurrency.
 type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx pyright && cd ../dashboard && npx pyright"
 
 # Verification timeouts. verify_command_timeout_secs is a PER-COMMAND budget
