@@ -612,3 +612,72 @@ class TestProvisionRepoRootParity:
             'and the arithmetic ascended from the caller\'s CWD instead of '
             'the script\'s own location.'
         )
+
+
+class TestSiblingResolutionIgnoresTheCallersCwd:
+    """A script sources the siblings next to ITSELF, never next to the caller.
+
+    ``TestSiblingLibsTravelledWithTheScripts`` above pins that the libs
+    travelled with the relocation.  This class pins the other half: that the
+    right COPY of them is the one loaded.  Under a ``PATH`` without ``dirname``
+    the ``$(dirname "${BASH_SOURCE[0]}")`` fork yields the empty string,
+    ``cd ""`` succeeds as a no-op, and ``SCRIPT_DIR`` silently becomes the
+    caller's CWD — so the script sources whatever files with those names happen
+    to be sitting there.
+
+    The realistic, non-adversarial trigger is not an attacker: it is invoking
+    one of these from reify's own ``scripts/`` dir, or from another
+    dark-factory checkout's ``warm-lane/`` dir.  Both carry precisely these
+    filenames, at a different (possibly older) version.
+
+    This REFUTES the hypothesis these scripts were filed under — that a
+    mis-resolution would land on their existing fail-loud wiring guards and
+    ``exit 2``.  The guards are ``[ ! -f "$SCRIPT_DIR/lib_*.sh" ]``, which test
+    the MIS-RESOLVED path, so any CWD holding a same-named file satisfies them.
+    The loud degrade is therefore contingent on the caller's CWD being empty,
+    and cannot detect this class at all.
+
+    MEASURED RED on base HEAD 8d276d3c5f, from a decoy CWD under a
+    ``dirname``-less ``PATH``: ``warm-lane-gc.sh`` exit 0 having sourced BOTH
+    the decoy ``lib_live_refs.sh`` and the decoy ``lib_lane_state.sh``;
+    ``warm-lane-gc-sweep.sh`` exit 0 having sourced the decoy
+    ``lib_live_refs.sh``; ``warm-lane-audit.sh`` exit 0 having sourced both the
+    decoy ``lib_portable.sh`` and the decoy ``lib_lane_state.sh``.  These are
+    scripts whose job is deleting worktrees and reporting pool state.
+
+    Deliberately NO exit-code assertion: the decoys make the run SUCCEED, and
+    the defect is *which files were sourced*, not how the process ended.  The
+    exit code here is a function of the caller's CWD rather than of the defect
+    — which is exactly why the filed expectation of ``exit 2`` was wrong.
+    """
+
+    @pytest.mark.parametrize(
+        'name',
+        ['warm-lane-gc.sh', 'warm-lane-gc-sweep.sh'],
+    )
+    def test_help_does_not_source_a_lib_from_the_callers_cwd(
+        self, name: str, tmp_path: Path,
+    ) -> None:
+        script = WARM_LANE_SCRIPT_DIR / name
+        assert script.is_file(), f'{name} is not shipped at {script}'
+        proc = subprocess.run(
+            [_BASH, str(script), '--help'],
+            cwd=str(_decoy_dir(tmp_path, *SOURCED_LIBS)),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=_sanitized_env(extra={
+                'PATH': (
+                    f'{_path_hiding(tmp_path, "dirname")}'
+                    f'{os.pathsep}{os.environ["PATH"]}'
+                ),
+            }),
+        )
+        combined = proc.stdout + proc.stderr
+
+        assert _DECOY_MARKER not in combined, (
+            f'{name} --help sourced a sibling lib from the CALLER\'S CWD '
+            f'instead of from {WARM_LANE_SCRIPT_DIR}.  Its own directory must '
+            f'resolve by parameter expansion, which reads no PATH.\n'
+            f'output:\n{combined}'
+        )
