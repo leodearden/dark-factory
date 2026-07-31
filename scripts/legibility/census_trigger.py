@@ -16,9 +16,27 @@ docs/legibility/census-state.json): in addition to the §7.5 minimal shape
 done-task count as of the last census, used to compute the "tasks landed
 since last census" delta for condition (b). fused-memory's get_statuses
 returns only a `{id: status}` status snapshot with no timestamps, so that
-delta is uncomputable without a persisted baseline. When
-`last_census_done_count` is absent (never censused, or η not yet writing
-it), condition (b) fails SAFE — it never fires — rather than guessing.
+delta is uncomputable without a persisted baseline. That baseline is
+THREE-VALUED (task 3291):
+
+  * an int — a real observed done-count as of the last census. A real `0`
+    (a project with no done tasks) is included and is NOT treated as
+    missing;
+  * `null` — the count could not be OBSERVED at census time. Condition (b)
+    fails SAFE, exactly as for an absent key, until the next successful
+    census; condition (a) (`max_interval_days`) remains the unconditional
+    backstop;
+  * absent — never censused, or η not yet writing it. Condition (b) fails
+    SAFE.
+
+Only a real int ever arms condition (b). A FABRICATED `0` used to be the
+fourth case, and it was the dangerous one: `census.py` wrote 0 whenever the
+get_statuses call failed, which made the delta `current_done - 0` — every
+done task ever, trivially over the threshold — so condition (b) fired every
+~7 days. Task 3291 removed that path; `census.advance_census_state` now
+persists `null` for an unobservable count, and `extract_done_count` below is
+the single chokepoint that refuses to turn an unusable payload into a
+number.
 
 This module does NOT import task β's `legibility.yaml` config *loader*
 (`legibility.config.load_config`): that loader requires four mandatory
