@@ -331,3 +331,134 @@ class TestCallerIdentity:
             _briefing('claude-task-2280-architect'),
         ])
         assert records[0]['caller']['task_id'] == '2280'
+
+
+# ===========================================================================
+# step-7 — result resolution status (INV-2)
+# ===========================================================================
+
+
+class TestResultStatus:
+    """A search whose answer could not be recovered is DISCLOSED, never
+    silently dropped and never mistaken for a search that found nothing.
+
+    Those are different facts about the corpus: "the store returned nothing"
+    is a retrieval measurement, "we could not read what the store returned" is
+    a gap in our own instrument. Collapsing them would let a decoding bug read
+    as a recall collapse.
+    """
+
+    def _one(self, records) -> dict:
+        emitted = _mod.extract_searches(records)
+        assert len(emitted) == 1, 'the search must be emitted whatever its answer'
+        return emitted[0]
+
+    def test_no_tool_result_anywhere_is_missing(self):
+        # The truncated-transcript case: archiving raced the session's end.
+        record = self._one([_tool_use('toolu_A', 'q')])
+        assert record['result_status'] == 'missing'
+        assert record['results'] == []
+        assert record['result_count'] == 0
+
+    def test_undecodable_content_is_unparsed(self):
+        record = self._one([
+            _tool_use('toolu_A', 'q'),
+            _tool_result('toolu_A', 'not json at all {['),
+        ])
+        assert record['result_status'] == 'unparsed'
+        assert record['results'] == []
+
+    def test_is_error_flag_is_error(self):
+        # The tool itself failed. The search was still issued, and that it
+        # failed is a fact about the corpus worth keeping.
+        record = self._one([
+            _tool_use('toolu_A', 'q'),
+            _tool_result('toolu_A', 'MCP error -32603: backend unavailable', is_error=True),
+        ])
+        assert record['result_status'] == 'error'
+        assert record['results'] == []
+
+    def test_is_error_wins_over_a_decodable_payload(self):
+        record = self._one([
+            _tool_use('toolu_A', 'q'),
+            _tool_result('toolu_A', {'results': [_result('a', 0.5)]}, is_error=True),
+        ])
+        assert record['result_status'] == 'error'
+
+    def test_missing_results_key_is_unparsed(self):
+        record = self._one([
+            _tool_use('toolu_A', 'q'),
+            _tool_result('toolu_A', {'something_else': 1}),
+        ])
+        assert record['result_status'] == 'unparsed'
+
+    def test_non_list_results_is_unparsed(self):
+        record = self._one([
+            _tool_use('toolu_A', 'q'),
+            _tool_result('toolu_A', {'results': 'nope'}),
+        ])
+        assert record['result_status'] == 'unparsed'
+
+    def test_genuine_zero_hit_search_is_ok(self):
+        # THE distinction this class exists for: an empty answer is a
+        # measurement, and it is distinguishable from an unrecovered one.
+        record = self._one([
+            _tool_use('toolu_A', 'q'),
+            _tool_result('toolu_A', {'results': []}),
+        ])
+        assert record['result_status'] == 'ok'
+        assert record['result_count'] == 0
+        assert record['results'] == []
+
+    def test_zero_hit_and_unrecovered_are_distinguishable(self):
+        # Asserted as a property, not inferred from the two tests above: all
+        # four zero-result cases share result_count == 0, so ONLY the status
+        # separates them. A consumer that filters on count alone would merge
+        # a decoding bug into the recall measurement.
+        cases = {
+            'ok': [_tool_use('t', 'q'), _tool_result('t', {'results': []})],
+            'missing': [_tool_use('t', 'q')],
+            'unparsed': [_tool_use('t', 'q'), _tool_result('t', 'garbage{')],
+            'error': [_tool_use('t', 'q'), _tool_result('t', 'boom', is_error=True)],
+        }
+        observed = {name: self._one(records) for name, records in cases.items()}
+        assert all(r['result_count'] == 0 for r in observed.values())
+        assert {name: r['result_status'] for name, r in observed.items()} == {
+            'ok': 'ok', 'missing': 'missing', 'unparsed': 'unparsed', 'error': 'error',
+        }
+
+    def test_status_vocabulary_is_closed(self):
+        assert set(_mod._RESULT_STATUS) == {'ok', 'error', 'unparsed', 'missing'}
+
+    def test_result_entry_missing_fields_degrades_without_losing_siblings(self):
+        record = self._one([
+            _tool_use('toolu_A', 'q'),
+            _tool_result('toolu_A', {'results': [
+                {'content': 'no id and no score here'},
+                _result('bbbbbbbb-2222-4bbb-8bbb-bbbbbbbbbbbb', 0.42, content='intact'),
+            ]}),
+        ])
+        assert record['result_status'] == 'ok'
+        assert record['result_count'] == 2
+        degraded, intact = record['results']
+        assert degraded['id'] is None
+        assert degraded['score'] is None
+        assert degraded['rank'] == 1
+        assert degraded['content_chars'] == len('no id and no score here')
+        assert intact['id'] == 'bbbbbbbb-2222-4bbb-8bbb-bbbbbbbbbbbb'
+        assert intact['score'] == 0.42
+        assert intact['rank'] == 2
+
+    def test_block_list_content_shape_is_decoded(self):
+        # Some tool results arrive as [{'type': 'text', 'text': '<json>'}]
+        # rather than a bare string.
+        payload = json.dumps({'results': [_result('aaaa', 0.9, content='hi')]})
+        record = self._one([
+            _tool_use('toolu_A', 'q'),
+            {'type': 'user', 'message': {'role': 'user', 'content': [
+                {'type': 'tool_result', 'tool_use_id': 'toolu_A',
+                 'content': [{'type': 'text', 'text': payload}]},
+            ]}},
+        ])
+        assert record['result_status'] == 'ok'
+        assert record['results'][0]['id'] == 'aaaa'
