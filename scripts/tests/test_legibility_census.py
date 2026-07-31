@@ -18,7 +18,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -919,6 +919,71 @@ def test_advance_census_state_done_count_zero_is_written_as_integer_zero(tmp_pat
     assert isinstance(data["last_census_done_count"], int)
 
 
+def test_advance_census_state_writes_none_done_count_as_json_null(tmp_path):
+    """Task 3291: when the done-count could not be OBSERVED, the honest
+    baseline is `null` -- not a fabricated 0 (that is the defect being
+    fixed), not a carried-forward stale value (a quieter guess), and not an
+    omitted key (which would violate the 2579/eta MUST-persist contract).
+    `null` honours that contract literally -- the key is still always
+    present -- while being truthful about the state being unknown."""
+    path = tmp_path / "census-state.json"
+
+    mod.advance_census_state(
+        path, now_iso="2026-07-31T12:00:00+00:00", report_path="plans/x.md", done_count=None,
+    )
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert "last_census_done_count" in data, "MUST-persist contract: key is never dropped"
+    assert data["last_census_done_count"] is None
+    assert '"last_census_done_count": null' in path.read_text(encoding="utf-8")
+
+
+def test_null_done_count_baseline_makes_condition_b_fail_safe(tmp_path, caplog):
+    """End-to-end proof that an UNKNOWN baseline disarms condition (b)
+    instead of arming it. A poisoned `0` baseline makes compute_tasks_landed
+    return `current_done - 0` -- every done task ever, ~24x over the 120
+    threshold -- as soon as the get_statuses fetch works (task 3291; see
+    census_trigger's module docstring for the replayed measurements). A
+    `null` baseline instead routes into the existing absent-baseline branch:
+    one WARNING, `None`, no fire."""
+    path = tmp_path / "census-state.json"
+    mod.advance_census_state(
+        path, now_iso="2026-07-31T12:00:00+00:00", report_path="plans/x.md", done_count=None,
+    )
+
+    # A null baseline is UNKNOWN, not malformed -- the state file still loads.
+    status, data = census_trigger.load_census_state(path)
+    assert status == "ok"
+    assert data["last_census_done_count"] is None
+
+    with caplog.at_level(logging.WARNING):
+        landed = census_trigger.compute_tasks_landed(
+            state=data,
+            # A perfectly VALID fetcher: the fail-safe here comes from the
+            # unknown baseline, not from any fetch problem.
+            status_fetcher=lambda: {"statuses": {f"t{i}": "done" for i in range(2870)}},
+        )
+
+    assert landed is None
+    assert sum(1 for r in caplog.records if r.levelno == logging.WARNING) == 1
+
+    # ... and with tasks_landed=None, condition (b) cannot fire even when
+    # days_since is well past tasks_landed_min_days. Condition (a)
+    # (max_interval_days) remains the unconditional backstop.
+    config = census_trigger.CensusConfig()
+    now = datetime(2026, 7, 31, 12, 0, 0, tzinfo=timezone.utc)
+    decision = census_trigger.evaluate(
+        now=now,
+        last_census_at=now - timedelta(days=config.tasks_landed_min_days + 1),
+        never_censused=False,
+        tasks_landed=None,
+        candidate_first_seens=[],
+        config=config,
+    )
+
+    assert decision.fire is False
+
+
 def test_advance_census_state_round_trips_through_census_trigger_load(tmp_path):
     path = tmp_path / "census-state.json"
 
@@ -1510,6 +1575,104 @@ def test_run_census_happy_path_full_seam_wiring(tmp_path):
     assert outcome.report_path == str(kwargs["report_path"])
     assert outcome.filed_task_ids == ["task-1"]
     assert outcome.stop_reason == "exhausted"
+
+
+# ---------------------------------------------------------------------------
+# task 3291: run_census() must never persist a FABRICATED done-count baseline.
+#
+# This is the test that would have caught the 2026-07-24 regression on the day
+# it happened. census.py's CLI defaults --project-root to "." and
+# nightly._default_census_launcher launches it with no arguments, so the
+# get_statuses call went out with a relative path; fused-memory rejected it
+# with a {"error", "error_type"} envelope on an isError:false response; and
+# the old `(status.get("statuses") or {})` idiom silently read that as a
+# done-count of 0 and persisted it as a real baseline.
+# ---------------------------------------------------------------------------
+
+def _make_error_envelope_status_fetcher():
+    """Fake `status_fetcher() -> dict` returning fused-memory's tool-error
+    envelope verbatim as observed live against localhost:8002. It is a
+    perfectly well-formed dict -- that is precisely why the old idiom
+    swallowed it -- so nothing short of a shape check can distinguish it
+    from a real status snapshot."""
+    def fake_status_fetcher():
+        return {
+            "error": "project_root must be a non-empty absolute path, got: '.'",
+            "error_type": "ValidationError",
+        }
+
+    return fake_status_fetcher
+
+
+def _make_raising_status_fetcher():
+    def fake_status_fetcher():
+        raise census_trigger.StatusFetchUnavailable("get_statuses unreachable at localhost:8002")
+
+    return fake_status_fetcher
+
+
+@pytest.mark.parametrize(
+    "make_fetcher",
+    [_make_error_envelope_status_fetcher, _make_raising_status_fetcher],
+    ids=["tool-error-envelope", "raising-fetcher"],
+)
+def test_run_census_unobservable_done_count_persists_null_not_zero(
+    tmp_path, caplog, make_fetcher
+):
+    """An unobservable done-count degrades the BASELINE only -- it must not
+    abandon a run whose mining has already been paid for and whose dated
+    report is already on disk.
+
+    Before task 3291 the envelope case silently persisted 0, and the raising
+    case crashed run_census AFTER the report write, leaving the codebook and
+    census state unadvanced."""
+    batch = [
+        _hand_digest("dup-1", "nothing new here"),
+        _hand_digest("novel-verified", "a genuinely new confusion shape"),
+    ]
+    fake_commit = _make_fake_commit()
+
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_happy_invoke_response),
+        batch_source=[batch],
+        verify_fn=_make_fake_verify_fn(verified_titles={"Silent no-op subagent contract"}),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=_make_fake_submit_fn(),
+        escalate_fn=_poison("escalate_fn"),
+        status_fetcher=make_fetcher(),
+        commit=fake_commit,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    # --- the census still COMPLETES; only the baseline degrades ---
+    assert outcome.status == "done"
+    assert kwargs["report_path"].exists(), "the paid-for report must survive"
+    assert kwargs["codebook_path"].exists(), "codebook must still be dumped"
+    assert len(fake_commit.calls) == 1, "the run must still commit"
+
+    # --- the baseline is an honest null, NOT a fabricated 0 ---
+    state = json.loads(kwargs["census_state_path"].read_text(encoding="utf-8"))
+    assert "last_census_done_count" in state, "MUST-persist contract still holds"
+    assert state["last_census_done_count"] is None
+    assert state["last_census_done_count"] != 0, "a fabricated 0 is the defect being fixed"
+
+    # --- the degradation is LOUD: exactly one warning naming the failure ---
+    fetch_warnings = [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING and "done-count" in r.getMessage()
+    ]
+    assert len(fetch_warnings) == 1, "degrading silently is what caused the incident"
+
+    # --- round-trip: condition (b) is fail-SAFE, not always-armed ---
+    status, data = census_trigger.load_census_state(kwargs["census_state_path"])
+    assert status == "ok"
+    assert census_trigger.compute_tasks_landed(
+        state=data,
+        status_fetcher=lambda: {"statuses": {f"t{i}": "done" for i in range(2870)}},
+    ) is None
 
 
 # ---------------------------------------------------------------------------
