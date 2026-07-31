@@ -353,3 +353,46 @@ async def test_get_statuses_ids_path_not_auto_capped_but_paginable(
     assert forwarded['ids'] == all_ids, (
         f'ids must reach the interceptor unchanged, got: {forwarded["ids"]!r}'
     )
+
+
+@pytest.mark.asyncio
+async def test_auto_page_limit_fits_documented_safe_envelope(paging_server):
+    """A WORST-CASE full auto-page must serialise inside the safe envelope.
+
+    Derivation of the 62,000-char bound (auditable, not magic):
+      * get_statuses failed closed on reify at payloads of 80,795 and 84,638
+        chars — the MCP transport rejected them wholesale.
+      * ~62 KB is the documented-safe envelope from the same incident record.
+      * So the wall sits between 62 KB and ~80 KB; 62,000 chars is the
+        conservative side of it.
+
+    Worst case is modelled as 4-digit ids plus the longest realistic status
+    string ('in-progress'), which is the densest shape a real project produces.
+
+    This asserts on the REAL constant and the REAL serialised tool response, so
+    a future bump to _STATUSES_AUTO_PAGE_LIMIT cannot silently re-cross the wall
+    that cost reify three consecutive reconciliation cycles.
+    """
+    import json
+
+    from fused_memory.server.tools import _STATUSES_AUTO_PAGE_LIMIT as LIMIT
+
+    # 4-digit ids (start at 1000) + the longest realistic status string.
+    _set_population(
+        _make_statuses(LIMIT + 5, start=1000, status='in-progress')
+    )
+
+    result = await paging_server._tool_manager.call_tool(
+        'get_statuses',
+        {'project_root': '/project'},
+    )
+    # Precondition: this really is a full auto-page, not a short one.
+    assert result['pagination']['auto_paginated'] is True
+    assert result['pagination']['returned'] == LIMIT
+
+    serialised = json.dumps(result)
+    assert len(serialised) < 62_000, (
+        f'A worst-case full auto-page serialises to {len(serialised)} chars, at or '
+        f'over the {62_000}-char documented-safe envelope. Lower '
+        f'_STATUSES_AUTO_PAGE_LIMIT (currently {LIMIT}) — do NOT relax this bound.'
+    )
