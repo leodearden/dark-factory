@@ -232,3 +232,36 @@ class CostStore(AsyncSqliteBase):
             'VALUES (?, ?, ?, ?, ?, ?)',
             (account_name, event_type, project_id, run_id, details, created_at),
         )
+
+    async def save_api_error_event(
+        self,
+        *,
+        account_name: str,
+        project_id: str | None,
+        run_id: str | None,
+        details: str | None,
+        created_at: str,
+    ) -> None:
+        """Insert one ``api_error`` account event (server-side 5xx forensics).
+
+        Typed wrapper over :meth:`save_account_event` for
+        ``plans/server-side-api-error-handling-prd.md`` contract C4 (task mu):
+        ``ApiHealthGate`` emits one row per ServerError report so a trip is
+        reconstructable from the row stream alone.
+
+        The literal ``'api_error'`` event_type lives HERE and nowhere else —
+        it is the discriminator the gate writes, the dashboard provider-health
+        strip queries, and operators grep for.  Callers pass no ``event_type``
+        so a typo cannot fork the row stream into two silently-disjoint types.
+
+        ``details`` is a JSON blob (HTTP status, task_id, role, post-report
+        state and window stats); it is opaque to this layer.
+        """
+        await self.save_account_event(
+            account_name=account_name,
+            event_type='api_error',
+            project_id=project_id,
+            run_id=run_id,
+            details=details,
+            created_at=created_at,
+        )
