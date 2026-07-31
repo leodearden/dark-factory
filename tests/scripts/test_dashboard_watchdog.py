@@ -249,7 +249,17 @@ def test_probe_health_requests_exactly_probe_url_with_probe_timeout(monkeypatch)
 # Persisted state — the "fresh process every tick" contract
 # ---------------------------------------------------------------------------
 
-DEFAULT_STATE = {"streak": 0, "restarts": [], "ceiling_open": False}
+#: The documented fallback for every unreadable/ill-shaped state file. Spelled
+#: as a literal rather than read from the module so a silent schema drift shows
+#: up here as a failing test. ``last_escalation_epoch`` 0 means "never filed"
+#: and always permits filing — the fail-direction is a duplicate L2, never a
+#: suppressed one.
+DEFAULT_STATE = {
+    "streak": 0,
+    "restarts": [],
+    "ceiling_open": False,
+    "last_escalation_epoch": 0,
+}
 
 
 @pytest.fixture()
@@ -323,6 +333,10 @@ def test_load_state_valid_json_but_not_a_dict_returns_defaults(state_env):
         '{"streak": 1, "restarts": "nope", "ceiling_open": false}',
         '{"streak": 1, "restarts": [1, "x", null], "ceiling_open": false}',
         '{"streak": -5, "restarts": [], "ceiling_open": false}',
+        '{"streak": 0, "restarts": [], "last_escalation_epoch": "soon"}',
+        '{"streak": 0, "restarts": [], "last_escalation_epoch": true}',
+        '{"streak": 0, "restarts": [], "last_escalation_epoch": -17}',
+        '{"streak": 0, "restarts": [], "last_escalation_epoch": null}',
     ],
 )
 def test_load_state_normalises_missing_and_ill_typed_keys(state_env, payload):
@@ -331,6 +345,13 @@ def test_load_state_normalises_missing_and_ill_typed_keys(state_env, payload):
     Every key is normalised to its declared type; a non-numeric entry inside
     ``restarts`` is dropped rather than poisoning the later ``now - epoch``
     arithmetic in the rolling-window prune.
+
+    ``last_escalation_epoch`` gets the same treatment for the same reason —
+    it feeds the identically shaped comparison in the escalation gate. Note
+    that a NEGATIVE epoch is not merely odd: read literally it says the L2 was
+    filed before 1970, which satisfies the window forever and would silently
+    suppress every future escalation. It degrades to the 0 "never filed"
+    sentinel, i.e. toward filing.
     """
     state_env.parent.mkdir(parents=True, exist_ok=True)
     state_env.write_text(payload, encoding="utf-8")
@@ -342,6 +363,9 @@ def test_load_state_normalises_missing_and_ill_typed_keys(state_env, payload):
     assert isinstance(st["restarts"], list)
     assert all(isinstance(e, int) for e in st["restarts"])
     assert isinstance(st["ceiling_open"], bool)
+    assert isinstance(st["last_escalation_epoch"], int)
+    assert not isinstance(st["last_escalation_epoch"], bool)
+    assert st["last_escalation_epoch"] >= 0
 
 
 def test_save_state_leaves_no_temp_file_behind(state_env):

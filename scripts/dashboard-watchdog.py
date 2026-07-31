@@ -31,9 +31,10 @@ Summarised:
              all, and its streak is reset — a fresh activation invalidates any
              pre-restart streak.
   ceiling    At most MAX_RESTARTS restarts within a rolling RATE_WINDOW_SECS.
-             On reaching the ceiling the watchdog files ONE born-at-L2
-             escalation and STOPS restarting (the storm escape) rather than
-             continuing to flap a service that restarting plainly does not fix.
+             On reaching the ceiling the watchdog files at most ONE born-at-L2
+             escalation per rolling RATE_WINDOW_SECS and STOPS restarting (the
+             storm escape) rather than continuing to flap a service that
+             restarting plainly does not fix.
   fail-soft  Every tooling failure (systemctl, state IO, the escalation
              subprocess) is warn-logged and swallowed. The oneshot never exits
              non-zero and never acts on a probe it did not actually run.
@@ -140,9 +141,9 @@ except (KeyError, ValueError):
     RATE_WINDOW_SECS = 3600
 
 #: Persisted tick state: ``{"streak": int, "restarts": [epoch, ...],
-#: "ceiling_open": bool}``. Every timer tick is a FRESH oneshot process, so
-#: none of this can live in memory. Sits under the root-anchored ``/data/``
-#: gitignore.
+#: "ceiling_open": bool, "last_escalation_epoch": int}``. Every timer tick is a
+#: FRESH oneshot process, so none of this can live in memory. Sits under the
+#: root-anchored ``/data/`` gitignore.
 STATE_PATH = os.environ.get(
     "DASHBOARD_WATCHDOG_STATE",
     os.path.join(REPO_DIR, "data", "dashboard-watchdog", "state.json"),
@@ -299,8 +300,17 @@ def default_state() -> dict:
     losing the state means losing hysteresis history, which fails toward NOT
     restarting (three fresh consecutive failures are needed again) rather than
     toward a spurious restart.
+
+    ``last_escalation_epoch`` 0 is the "never filed" sentinel and always
+    permits filing — which is also what an on-disk state file written before
+    this key existed normalises to, so no migration is needed.
     """
-    return {"streak": 0, "restarts": [], "ceiling_open": False}
+    return {
+        "streak": 0,
+        "restarts": [],
+        "ceiling_open": False,
+        "last_escalation_epoch": 0,
+    }
 
 
 def _normalise_state(raw: dict) -> dict:
@@ -326,10 +336,24 @@ def _normalise_state(raw: dict) -> dict:
             if isinstance(entry, (int, float)):
                 restarts.append(int(entry))
 
+    # Same coercion as a restarts entry, for the same reason: this epoch feeds
+    # a ``now - epoch`` comparison in tick()'s escalation gate. Anything
+    # unusable — including a negative, which would read as "filed before 1970"
+    # and permanently satisfy the window — degrades to the 0 "never filed"
+    # sentinel, i.e. toward filing the L2 rather than toward silence.
+    last_escalation = raw.get("last_escalation_epoch", 0)
+    if (
+        isinstance(last_escalation, bool)
+        or not isinstance(last_escalation, (int, float))
+        or last_escalation < 0
+    ):
+        last_escalation = 0
+
     return {
         "streak": streak,
         "restarts": restarts,
         "ceiling_open": bool(raw.get("ceiling_open", False)),
+        "last_escalation_epoch": int(last_escalation),
     }
 
 
@@ -547,7 +571,7 @@ def _prune_restarts(restarts: list[int], now: int) -> list[int]:
 
 
 def file_ceiling_escalation(restart_count: int, window_secs: int) -> None:
-    """File ONE born-at-L2 escalation reporting the restart ceiling.
+    """File a born-at-L2 escalation reporting the restart ceiling.
 
     Shells out to ``escalation submit`` through ``uv run --project`` rather
     than importing it: this script is stdlib-only by design (it must run as a
@@ -568,12 +592,27 @@ def file_ceiling_escalation(restart_count: int, window_secs: int) -> None:
     orchestrator/src/orchestrator/merge_skew_tripwire.py — there is no owning
     task for an infra failure, and attaching one would misattribute the L2.
 
-    DEDUP is keyed on the watchdog's own persisted ``ceiling_open`` flag, NOT
-    on a ``queue.get_by_task(..., status='pending')`` query the way the merge
-    tripwire does, precisely because this script cannot import escalation to
-    run that query. The caller sets the flag in the same tick, so at most one
-    L2 is filed per ceiling EPISODE; without it the storm escape would trade a
-    restart storm for an escalation storm at two L2s a minute, forever.
+    DEDUP is the CALLER's job and lives in tick(): at most one L2 per rolling
+    RATE_WINDOW_SECS, keyed on the persisted ``last_escalation_epoch``. That is
+    deliberately the SAME window the ceiling itself is measured over, so
+    "the ceiling is saturated" and "an L2 about this saturation is already on
+    file" cannot disagree.
+
+    It is keyed on that epoch rather than on a
+    ``queue.get_by_task(..., status='pending')`` query — the way the merge
+    tripwire does it — precisely because this script cannot import escalation
+    to run that query.
+
+    An earlier version keyed the dedup on the ``ceiling_open`` flag instead,
+    reasoning that one L2 per ceiling EPISODE was the same thing. It is not: a
+    single successful probe ends an episode, while the restart window it is
+    measured against is deliberately preserved across that recovery. A
+    flapping dashboard — one healthy tick, then FAIL_STREAK failing ones, four
+    ticks and ~120s at the timer's cadence — therefore closed the episode and
+    immediately re-tripped the still-saturated ceiling, filing a fresh
+    paging-severity L2 roughly every two minutes. The escape has to bound the
+    escalation rate over the same horizon as the restart rate, or it just
+    trades a restart storm for an escalation storm.
 
     Fail-soft: a missing uv, a non-zero exit, or a timeout is warn-logged and
     swallowed. A failed submit must not leave the watchdog restarting again —
@@ -655,9 +694,10 @@ def tick() -> None:
     state = load_state()
 
     # §Contract "ceiling", tripped state. INV-4: once the ceiling has been
-    # reached, no further restarts happen until the episode ends, and the L2
-    # is not re-filed (the dedup — it was filed exactly once, when the flag
-    # was first set).
+    # reached, no further restarts happen until the episode ends. This branch
+    # never files anything at all — the L2 was filed on the tick that tripped
+    # the ceiling, and its rate limit (one per rolling RATE_WINDOW_SECS) is
+    # enforced there, not here.
     #
     # The tick still PROBES, because the episode has to be able to end. Taken
     # literally, I4's "until an operator intervenes" means a state file
@@ -753,9 +793,34 @@ def tick() -> None:
         logger.warning(
             f"{DASHBOARD_UNIT} hit the restart ceiling "
             f"({len(state['restarts'])} restarts in {RATE_WINDOW_SECS}s >= "
-            f"MAX_RESTARTS={MAX_RESTARTS}); escalating and NOT restarting"
+            f"MAX_RESTARTS={MAX_RESTARTS}); NOT restarting"
         )
-        file_ceiling_escalation(len(state["restarts"]), RATE_WINDOW_SECS)
+
+        # The L2 is rate-limited over the SAME rolling window the ceiling is
+        # measured over. Not over the ceiling episode: a single healthy probe
+        # ends an episode while these restart epochs survive it, so a flapping
+        # dashboard re-reaches this branch every ~120s and would page a human
+        # every time. 0 means never filed and always permits filing, so a
+        # pre-existing state file from before this key existed still escalates.
+        #
+        # The stamp is written when the submit is ATTEMPTED, not when it
+        # succeeds — file_ceiling_escalation is fail-soft, and stamping on
+        # success would make a persistently broken submit path retry on every
+        # re-trip, which is the same storm wearing a different costume (uv
+        # spawns instead of records) at the moment the host is least healthy.
+        # The L2 is still retried, just at window cadence, and the failure is
+        # already in the journal.
+        last_escalation = state["last_escalation_epoch"]
+        if last_escalation == 0 or now - last_escalation >= RATE_WINDOW_SECS:
+            state["last_escalation_epoch"] = now
+            file_ceiling_escalation(len(state["restarts"]), RATE_WINDOW_SECS)
+        else:
+            log(
+                f"{DASHBOARD_UNIT} re-reached the restart ceiling, but an L2 "
+                f"filed {now - last_escalation}s ago already describes it "
+                f"(one per {RATE_WINDOW_SECS}s window); not re-filing"
+            )
+
         state["ceiling_open"] = True
         state["streak"] = 0
         save_state(state)
