@@ -16,6 +16,7 @@ import pytest
 
 from fused_memory.reconciliation.citation_verifier import (
     find_citation_occurrences,
+    repoint_metadata,
     verify_cited_memories,
 )
 
@@ -334,3 +335,117 @@ class TestFindCitationOccurrences:
             'prose': f'{_PREFIX_TWIN} and {_DOOMED} are different entries',
         }
         assert find_citation_occurrences(mixed, _DOOMED) == ['doomed', 'prose']
+
+
+class TestRepointMetadata:
+    """``repoint_metadata`` rewrites every occurrence to the survivor.
+
+    Pure and deep-copying: the caller's blob is never mutated, so a failed
+    write can never leave a half-rewritten object behind.
+    """
+
+    def test_exact_scalar_occurrence_is_replaced(self):
+        """(a) A scalar whose whole value is the doomed id becomes the survivor."""
+        metadata = {'mem0_canonical_entry': _DOOMED}
+
+        repointed, count = repoint_metadata(metadata, _DOOMED, _SURVIVOR)
+
+        assert repointed == {'mem0_canonical_entry': _SURVIVOR}
+        assert count == 1
+
+    def test_free_text_substring_rewritten_with_prose_preserved(self):
+        """(b) An embedded id is rewritten in place; the surrounding prose is
+        preserved verbatim."""
+        metadata = {
+            'memory_hints': {
+                'entities': ['MemoryConsolidator'],
+                'queries': [f'see canonical entry {_DOOMED} for the consolidated advice'],
+            },
+        }
+
+        repointed, count = repoint_metadata(metadata, _DOOMED, _SURVIVOR)
+
+        assert repointed['memory_hints']['queries'] == [
+            f'see canonical entry {_SURVIVOR} for the consolidated advice',
+        ]
+        assert repointed['memory_hints']['entities'] == ['MemoryConsolidator']
+        assert count == 1
+
+    def test_nested_list_and_dict_occurrences_all_rewritten(self):
+        """(c) Occurrences at every depth are rewritten, not just top-level ones."""
+        metadata = {
+            'x_memory_write_caution': [
+                {'entry': _DOOMED},
+                {'entry': _SURVIVOR},
+            ],
+            'deep': {'deeper': {'deepest': [_DOOMED, 'unrelated']}},
+        }
+
+        repointed, count = repoint_metadata(metadata, _DOOMED, _SURVIVOR)
+
+        assert repointed['x_memory_write_caution'] == [
+            {'entry': _SURVIVOR},
+            {'entry': _SURVIVOR},
+        ]
+        assert repointed['deep']['deeper']['deepest'] == [_SURVIVOR, 'unrelated']
+        assert count == 2
+
+    def test_count_agrees_with_find_citation_occurrences(self):
+        """(d) The two functions cannot drift: the rewrite count equals the
+        number of paths the scanner reports for the same blob."""
+        metadata = {
+            'mem0_canonical_entry': _DOOMED,
+            'memory_hints': {'entities': [], 'queries': [f'prose {_DOOMED} prose']},
+            'mem0_cluster_entries': [_SURVIVOR, _DOOMED],
+            'unrelated': {'deep': [{'k': _DOOMED}]},
+        }
+
+        paths = find_citation_occurrences(metadata, _DOOMED)
+        _, count = repoint_metadata(metadata, _DOOMED, _SURVIVOR)
+
+        assert count == len(paths) == 4
+
+    def test_input_metadata_is_not_mutated(self):
+        """(e) Deep-copy semantics — the caller's object still cites the doomed id."""
+        metadata = {
+            'mem0_canonical_entry': _DOOMED,
+            'memory_hints': {'queries': [f'prose {_DOOMED}']},
+        }
+
+        repointed, _ = repoint_metadata(metadata, _DOOMED, _SURVIVOR)
+
+        assert metadata['mem0_canonical_entry'] == _DOOMED
+        assert metadata['memory_hints']['queries'] == [f'prose {_DOOMED}']
+        # ...and the returned blob is a genuinely separate object graph.
+        assert repointed['memory_hints'] is not metadata['memory_hints']
+
+    def test_absent_uuid_leaves_blob_unchanged(self):
+        """(f) Nothing to repoint -> an equal blob and a zero count."""
+        metadata = {'mem0_canonical_entry': _SURVIVOR, 'memory_hints': {'queries': ['x']}}
+
+        repointed, count = repoint_metadata(metadata, _DOOMED, _SURVIVOR)
+
+        assert repointed == metadata
+        assert count == 0
+
+    def test_unrelated_keys_and_values_are_identical_afterwards(self):
+        """(g) Everything that is not a citation round-trips byte-identically,
+        including non-string scalars the walk must not coerce."""
+        metadata = {
+            'cited': _DOOMED,
+            'priority': 'high',
+            'attempts': 3,
+            'flag': True,
+            'nothing': None,
+            'ratio': 0.5,
+            'nested': {'list': ['a', 'b'], 'twin': _PREFIX_TWIN},
+        }
+
+        repointed, count = repoint_metadata(metadata, _DOOMED, _SURVIVOR)
+
+        assert count == 1
+        assert repointed['cited'] == _SURVIVOR
+        untouched = {k: v for k, v in repointed.items() if k != 'cited'}
+        assert untouched == {k: v for k, v in metadata.items() if k != 'cited'}
+        # The prefix twin is emphatically not collateral damage.
+        assert repointed['nested']['twin'] == _PREFIX_TWIN
