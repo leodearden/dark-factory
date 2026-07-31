@@ -56,9 +56,24 @@ TIER_BASE: dict[str, int] = {
 
 
 def coerce_tier(value: Any) -> str:
-    """Normalize a priority value (possibly None/unknown) to a canonical tier."""
+    """Normalize a priority value (possibly None/unknown) to a canonical tier.
+
+    Unknown/unrecognized values fall back to DEFAULT_TIER so legacy tasks and
+    typos never crash the scheduler, but that fallback is logged loudly
+    (rather than silently) per the repo's no-silent-fail-soft invariant:
+    an unrecognized value means some upstream caller passed something the
+    config layer doesn't understand, and that should be observable.
+    ``stacklevel=2`` attributes the log record to the caller's file/line
+    (the actual call site) rather than to this helper.
+    """
     if isinstance(value, str) and value in PRIORITY_RANK:
         return value
+    logger.warning(
+        'coerce_tier: unrecognized priority %r, falling back to %r',
+        value,
+        DEFAULT_TIER,
+        stacklevel=2,
+    )
     return DEFAULT_TIER
 
 
