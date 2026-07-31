@@ -1192,7 +1192,6 @@ class TestConcurrentLoop:
         fake_client = _patch_pod_infra(monkeypatch)
 
         attempted: list[str] = []
-        attempted_lock_marker: list[str] = []  # for assertion ordering
 
         def fake_run(cmd, *args, **kwargs):
             if (
@@ -1203,10 +1202,13 @@ class TestConcurrentLoop:
                 config_name = cmd[cmd.index("--config-name") + 1]
                 task_id = Path(task_arg).stem
                 attempted.append(task_id)
-                attempted_lock_marker.append(task_id)
-                _REAL_SLEEP(0.1)
                 if task_id == "df_task_11":
-                    # Simulate failure: write a "blocked" outcome.
+                    # Simulate failure: write a "blocked" outcome. Skip the
+                    # shared 0.1s sleep so this future is deterministically
+                    # the first FIRST_COMPLETED completion the executor loop
+                    # observes, instead of racing df_task_10's equal-duration
+                    # sleep to decide how many extra tasks get refilled
+                    # before --stop-on-first-failure is noticed.
                     results.mkdir(parents=True, exist_ok=True)
                     _write_result(
                         results,
@@ -1217,6 +1219,7 @@ class TestConcurrentLoop:
                         metrics={"cost_usd": 5.0},
                     )
                     return SimpleNamespace(returncode=1)
+                _REAL_SLEEP(0.1)
                 results.mkdir(parents=True, exist_ok=True)
                 _write_result(results, task_id, config_name, f"r{len(attempted):08d}")
                 return SimpleNamespace(returncode=0)
@@ -1249,18 +1252,13 @@ class TestConcurrentLoop:
 
         assert rc == 1  # one task blocked → non-zero exit
         assert fake_client.terminate_calls == ["pod-fake-1"]
-        # Tasks 10 and 11 were the initial wave; 11 failed. Tasks 12 and 13
-        # may or may not have been picked up depending on scheduling (the
-        # stop-on-first-failure flag is only observed at the top of each
-        # loop iteration, so a worker can plausibly race ahead by one extra
-        # task under load) — assert the invariant that the queue stopped
-        # early rather than pinning the exact race boundary. df_task_14,
-        # the last-queued task, is only reachable after multiple full task
-        # cycles past the failure and must NOT have been submitted.
-        assert "df_task_10" in attempted
-        assert "df_task_11" in attempted
-        assert len(attempted) < len(task_ids)
-        assert "df_task_14" not in attempted
+        # df_task_11 (the failure) skips the shared 0.1s sleep in fake_run,
+        # so it always wins the FIRST_COMPLETED race against df_task_10 by a
+        # wide margin. The executor loop therefore notices
+        # --stop-on-first-failure and drains `remaining` before a third task
+        # is ever refilled, so the attempted set is exactly the initial wave
+        # — deterministic, with no race window left to tolerate.
+        assert set(attempted) == {"df_task_10", "df_task_11"}
         # Summaries cover whatever was attempted.
         summary_ids = {s.task_id for s in captured["summaries"]}
         assert summary_ids == set(attempted)
