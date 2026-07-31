@@ -244,6 +244,7 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
         BranchResetError,
         EphemeralWorktreeError,
         InteractiveWorktreeLimitError,
+        LaneLockSelfOwnedLeak,
         MergeParkContentionError,
         MergeParkError,
         MergeVerifyLeaseContended,
@@ -504,6 +505,31 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
             requeue_kind=RequeueKind.REQUEUE,
             counts_against_requeue_cap=False,
             reason_prefix='merge_verify_lease_contended',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        # Task 3081 (D8/B13). IS-A MergeVerifyLeaseContended, and keeps that
+        # row's REQUEUE + no-cap-burn: a leaked lane lock is an infra fault the
+        # task must not be charged for. Diverges on ONE axis --
+        # escalate_to_human -- because unlike ordinary contention it can never
+        # resolve by waiting: nothing releases the leaked fd before process
+        # exit. In reify esc-5548-5 three tasks blocked behind one identical
+        # merge_outcome_signature 3173b64436423738 and nothing surfaced until an
+        # unattended restart ~3h later. An explicit row is required regardless
+        # (BD-2 completeness enumerates git_ops' exports), but the MRO would
+        # otherwise resolve it to the parent's escalate_to_human=False.
+        #
+        # HONEST LIMITATION: on the merge-worker path this exception is caught
+        # by merge_queue.py's contended-defer arm (it IS-A the parent) BEFORE
+        # the disposition table is consulted, so this row governs the OTHER
+        # consumers -- cli.py verify-merge and workflow block classification.
+        # The loud FIRST-OCCURRENCE signal is the logger.error at the detection
+        # site in GitOps._lane_lock_self_owned_leak, not this flag.
+        LaneLockSelfOwnedLeak: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=True,
+            requeue_kind=RequeueKind.REQUEUE,
+            counts_against_requeue_cap=False,
+            reason_prefix='lane_lock_self_owned_leak',
             block_class=BlockClass.AGENT_FAILURE,
         ),
         IllegalTransitionError: BlockDisposition(
