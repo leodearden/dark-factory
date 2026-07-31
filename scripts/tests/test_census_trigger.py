@@ -509,6 +509,46 @@ def test_extract_done_count_raises_on_non_dict_payload(payload):
     assert type(payload).__name__ in str(excinfo.value)
 
 
+def test_compute_tasks_landed_tool_error_envelope_returns_none_with_one_warning(caplog):
+    """Before task 3291 this returned `0 - 500 == -500` with ZERO warnings --
+    a silent negative delta from a payload that was never a status snapshot
+    at all. A shape failure must land in the same "one WARNING, return None"
+    fail-safe branch as an unreachable server."""
+    state = {"last_census_done_count": 500}
+
+    with caplog.at_level(logging.WARNING):
+        result = ct.compute_tasks_landed(
+            state=state, status_fetcher=lambda: _TOOL_ERROR_ENVELOPE
+        )
+
+    assert result is None
+    assert sum(1 for r in caplog.records if r.levelno == logging.WARNING) == 1
+
+
+def test_compute_tasks_landed_payload_without_statuses_returns_none_with_one_warning(caplog):
+    state = {"last_census_done_count": 500}
+
+    with caplog.at_level(logging.WARNING):
+        result = ct.compute_tasks_landed(state=state, status_fetcher=lambda: {})
+
+    assert result is None
+    assert sum(1 for r in caplog.records if r.levelno == logging.WARNING) == 1
+
+
+def test_compute_tasks_landed_empty_project_computes_a_real_zero_delta(caplog):
+    """Regression guard in the OPPOSITE direction: collapsing "empty result"
+    into "failed call" would break the first baseline of a newly-onboarded
+    project with no done tasks. A real 0 baseline against a real empty
+    snapshot is a real delta of 0, not a fail-safe None, and warns nothing."""
+    state = {"last_census_done_count": 0}
+
+    with caplog.at_level(logging.WARNING):
+        result = ct.compute_tasks_landed(state=state, status_fetcher=_wrapped_fetcher({}))
+
+    assert result == 0
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+
 def test_default_status_fetcher_raises_status_fetch_unavailable_when_unreachable(tmp_path):
     fetcher = ct.default_status_fetcher(tmp_path)
 
