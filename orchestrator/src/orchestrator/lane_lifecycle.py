@@ -15,16 +15,16 @@ mixing those in would break the pool's purity and its existing 2-value
 
 from __future__ import annotations
 
-import contextlib
 import json
+import locale
 import logging
-import os
-import tempfile
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from shared import safe_io
 
 if TYPE_CHECKING:
     from escalation.queue import EscalationQueue
@@ -300,23 +300,26 @@ class LaneLifecycle:
     def _write(self, lane: Path | str, record: LaneRecord) -> None:
         """Atomically write *record* for *lane* (tmp file + os.replace).
 
-        Mirrors ``escalation.queue.EscalationQueue._atomic_write_path``: the
-        tmp file is created in the target's own parent dir so the replace
-        stays within one filesystem, and is cleaned up on failure.
+        Delegates to :func:`shared.safe_io.atomic_write_text` (task 3223, which
+        consolidated this repo's copies of the tmp+rename writer). The
+        arguments reproduce exactly what the previously-inlined body produced:
+        ``mkdir=True`` for the parent-dir create, ``mode=0o600`` matching the
+        :func:`tempfile.mkstemp` create, and no fsync.
+
+        ``encoding`` is passed as the process's preferred encoding because the
+        old body used a bare ``os.fdopen(fd, 'w')``, which is locale-dependent.
+        That is a latent bug — JSON written under a non-UTF-8 locale — but
+        changing it is out of scope for a consolidation, so it is preserved
+        verbatim and stated here at the call site rather than hidden in the
+        shared helper's default. Tracked as separate follow-up work.
         """
-        path = self._record_path(lane)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_path_str = tempfile.mkstemp(
-            suffix='.tmp', prefix=path.stem, dir=str(path.parent),
+        safe_io.atomic_write_text(
+            self._record_path(lane),
+            record.to_json(),
+            encoding=locale.getpreferredencoding(False),
+            mode=0o600,
+            mkdir=True,
         )
-        try:
-            with os.fdopen(fd, 'w') as f:
-                f.write(record.to_json())
-            os.replace(tmp_path_str, str(path))
-        except Exception:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp_path_str)
-            raise
 
     def transition(self, lane: Path | str, to: LaneState, **fields: object) -> LaneRecord:
         """The one mutator: validate (from, to), persist, return the new record.

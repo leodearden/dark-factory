@@ -22,19 +22,21 @@ import argparse
 import contextlib
 import fcntl
 import json
+import locale
 import logging
 import os
 import re
 import shutil
 import subprocess
 import sys
-import tempfile
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
+
+from shared import safe_io
 
 # ---------------------------------------------------------------------------
 # Schema / contract (PRD §6 G5): consumers import this; they never re-derive
@@ -586,28 +588,31 @@ class CorruptSessionRecord(Exception):
 def _atomic_write_text(path: Path, text: str) -> None:
     """Atomically write *text* to *path* (tmp file in the same dir, then os.replace).
 
-    Mirrors ``LaneStore._write`` (lane_lifecycle.py:279-298): the tmp file is
-    created in the target's own parent dir so the replace stays within one
-    filesystem, and is cleaned up on any failure. Shared atomic-write core:
-    write_record calls this and lets a failure propagate (its sole caller,
-    the CLI main(), provides the outer fail-soft boundary); write_decision
-    calls this too but swallows a failure itself (it is called directly by
-    watchers/cockpit code with no such boundary).
+    Delegates to :func:`shared.safe_io.atomic_write_text` (task 3223, which
+    consolidated this repo's copies of the tmp+rename writer). The arguments
+    reproduce exactly what the previously-inlined body produced: ``mkdir=True``
+    for the parent-dir create, ``mode=0o600`` matching the
+    :func:`tempfile.mkstemp` create, and no fsync.
+
+    ``encoding`` is passed as the process's preferred encoding because the old
+    body used a bare ``os.fdopen(fd, 'w')``, which is locale-dependent. That is
+    a latent bug — JSON written under a non-UTF-8 locale — but changing it is
+    out of scope for a consolidation, so it is preserved verbatim and stated
+    here at the call site rather than hidden in the shared helper's default.
+    Tracked as separate follow-up work.
+
+    Error policy is unchanged and stays with the callers: write_record lets a
+    failure propagate (its sole caller, the CLI main(), provides the outer
+    fail-soft boundary); write_decision swallows a failure itself (it is called
+    directly by watchers/cockpit code with no such boundary).
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path_str = tempfile.mkstemp(
-        suffix='.tmp',
-        prefix=path.stem,
-        dir=str(path.parent),
+    safe_io.atomic_write_text(
+        path,
+        text,
+        encoding=locale.getpreferredencoding(False),
+        mode=0o600,
+        mkdir=True,
     )
-    try:
-        with os.fdopen(fd, 'w') as f:
-            f.write(text)
-        os.replace(tmp_path_str, str(path))
-    except Exception:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_path_str)
-        raise
 
 
 def write_record(record: SessionRecord, root: Path | str | None = None) -> None:
