@@ -356,8 +356,19 @@ The merge procedure is iterative — don't assume one pass will be enough:
      # FIRST tick, before the foreign merger has done anything. Only git ancestry proves
      # that *this* attempt landed.
      def accept_terminal(poll):
-         if poll_by != "branch":
-             return True          # request_id / task_id arms are submission-scoped already
+         if poll_by == "request_id":
+             return True          # request_id names exactly this in-flight entry — always submission-scoped
+         if poll_by == "task_id":
+             # Submission-scoped only while the live snapshot tier is still serving this
+             # task_id. Once that stops (e.g. a mid-flight orchestrator restart), durable
+             # lookups resolve task_id to the most-recent *finalized* record for the task
+             # (ring.get_by_task / latest_merge_finalized(task_id=...)) — not scoped to this
+             # submission, since task_ids are reused verbatim across resubmissions just like
+             # branches. A terminal that arrives before you've observed any live/queued poll
+             # for this attempt is suspect — sanity-check it with the same
+             # `git merge-base --is-ancestor task/<TASK_ID> main` check used below for branch
+             # before trusting it.
+             return True
          if poll["state"] == "done":
              # shell: git merge-base --is-ancestor task/<TASK_ID> main  → True iff exit 0
              return branch_is_ancestor_of_main()   # unconfirmed `done` is stale → keep polling
@@ -376,7 +387,7 @@ The merge procedure is iterative — don't assume one pass will be enough:
      ```
      After the loop exits:
      - `timed_out` (branch-arm 20-minute deadline reached without an accepted terminal state) → do NOT resubmit and do NOT direct-merge; go to *Polled terminal failures*'s `unknown` bullet below and follow its branch-arm carve-out (stop-and-report, not resubmit).
-     - `poll["state"] == "done"` → **if the response carries `merge_sha`** (the git-authority tier's `kind: "found_on_main"` shape), thread that SHA directly. **Otherwise** — including on the `poll_by == "branch"` arm, where a durable retention-ring/event-store record resolves `done` with only `state`/`request_id`/`generation`/`outcome`/`finished_at` and *no* `merge_sha` (`escalation/server.py:2404-2420`) — `merge_status` gives you no commit hash (`poll["outcome"]` is the raw state string `"done"`), so re-derive the merge commit from git:
+     - `poll["state"] == "done"` → **if the response carries `merge_sha`** (the git-authority tier's `kind: "found_on_main"` shape), thread it as `done_provenance={"kind": "found_on_main", "commit": "<merge_sha>", "note": "<explanation>"}` — **not** a bare `commit`. `merge_sha` is not always the merge commit: on the live-branch resolution path it's the *branch tip* SHA, a distinct commit from the actual merge commit for a `--no-ff` merge; only the deleted-branch path's `merge_sha` is the true merge-commit SHA (`_found_on_main_response`'s docstring, `escalation/server.py:2290-2305`). **Otherwise** — including on the `poll_by == "branch"` arm, where a durable retention-ring/event-store record resolves `done` with only `state`/`request_id`/`generation`/`outcome`/`finished_at` and *no* `merge_sha` (`escalation/server.py:2404-2420`) — `merge_status` gives you no commit hash (`poll["outcome"]` is the raw state string `"done"`), so re-derive the true merge commit from git:
        ```
        git log main --oneline | head -5
        ```
