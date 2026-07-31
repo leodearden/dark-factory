@@ -1416,7 +1416,10 @@ class TestMakeIdCounter:
     """make_id() is backed by a single durable per-task_id counter file —
     NOT a directory/archive scan (PRD task-status-authority-prd.md contract
     C9 / finding 10.4).  These tests encode PRD boundary test D1: strictly
-    increasing, no collision, no rescan dependence.
+    increasing, no collision, and no directory-rescan dependence *in steady
+    state* (task 3238 added a one-shot bounded reconciliation that fires only
+    when the counter is absent or unparseable; the sibling gate statement is
+    escalation/tests/test_status_authority_gate.py::TestD1MakeIdCounter).
     """
 
     def test_make_id_is_durable_across_restart(self, tmp_path: Path):
@@ -1486,44 +1489,63 @@ class TestMakeIdCounter:
         )
 
     def test_make_id_does_not_scan_archive(self, tmp_path: Path):
-        """make_id() never touches the archive — _iter_archive_paths is not called.
+        """make_id() never touches the archive WHILE THE COUNTER IS INTACT.
 
-        Seeds an archive file directly (bypassing the queue/counter) so that
-        if make_id() still consulted the archive it would see it. Spies on
-        _iter_archive_paths and asserts it is never invoked.
+        Seeds an archive file directly (bypassing the queue) so that if
+        make_id() still consulted the archive it would see it, AND a counter
+        file, so the fixture expresses the real steady state (counter
+        present + archive present) rather than a lost counter. Spies on
+        _iter_archive_paths and asserts it is never invoked; the minted ids
+        are counter-derived and archive-independent.
 
         RED on main: make_id() calls _scan_archive_max_seq() ->
         _iter_archive_paths() on the cache miss (the first call for this
         task_id), so call_count would be >= 1, not 0.
+
+        For the LOST-counter path — where a bounded one-shot archive scan IS
+        performed, exactly once, to avoid re-minting ids that get() resolves
+        to archived records — see
+        ``test_make_id_recovery_scan_is_one_shot_then_steady_state_is_scan_free``.
         """
         queue_dir = tmp_path / 'queue'
         archive_dir = queue_dir / 'archive' / '2025-06-10'
         archive_dir.mkdir(parents=True, exist_ok=True)
         seeded = _make_escalation('esc-cnt-5', task_id='cnt', status='resolved')
         (archive_dir / 'esc-cnt-5.json').write_text(seeded.to_json())
+        (queue_dir / 'esc-cnt.seq').write_text('5')
 
         queue = EscalationQueue(queue_dir)
         with patch.object(
             queue, '_iter_archive_paths', wraps=queue._iter_archive_paths,
         ) as spy:
-            queue.make_id('cnt')
-            queue.make_id('cnt')
+            first_id = queue.make_id('cnt')
+            second_id = queue.make_id('cnt')
 
         assert spy.call_count == 0, (
-            f'make_id() must not scan the archive; _iter_archive_paths called '
-            f'{spy.call_count}x'
+            f'make_id() must not scan the archive while the counter is intact; '
+            f'_iter_archive_paths called {spy.call_count}x'
+        )
+        assert (first_id, second_id) == ('esc-cnt-6', 'esc-cnt-7'), (
+            f'Expected counter-derived (archive-independent) ids; got '
+            f'{first_id!r}, {second_id!r}'
         )
 
-    def test_make_id_corrupt_counter_logs_error_and_resets_to_one(
+    def test_make_id_corrupt_counter_with_no_disk_evidence_starts_at_one(
         self, tmp_path: Path, caplog,
     ):
-        """A corrupt/unparseable counter file is treated as 0 and logged as an ERROR.
+        """A corrupt counter with NOTHING to recover from reconciles to 0, minting 1.
 
-        The counter is authoritative with no archive-scan fallback (PRD C9):
-        losing it is unrecoverable data loss, not a routine, self-healing
-        event, so it must be loud (ERROR) rather than a WARNING — a lost
-        counter silently re-mints ids from 1, colliding with any escalations
-        already issued for this task_id.
+        This pins the nothing-to-recover sub-case of the corrupt-counter
+        path: an unparseable counter is reconciled from the one-shot bounded
+        root+archive scan (``test_make_id_corrupt_counter_reconciles_instead_of_colliding``
+        covers the case where that scan finds records), and for a genuinely
+        fresh task_id — empty queue root, no archive at all — the scan yields
+        0, so the mint is legitimately 'esc-cnt-1'.
+
+        The ERROR is still unconditional here, unlike the absent-counter
+        branch: an unparseable counter is unrecoverable data loss an operator
+        must see even when it happens to be self-healing, whereas an absent
+        counter is the ordinary first-mint state of every new task_id.
         """
         queue_dir = tmp_path / 'queue'
         queue = EscalationQueue(queue_dir)
@@ -1532,7 +1554,10 @@ class TestMakeIdCounter:
         with caplog.at_level(logging.ERROR, logger='escalation.queue'):
             result = queue.make_id('cnt')
 
-        assert result == 'esc-cnt-1'
+        assert result == 'esc-cnt-1', (
+            'with no root or archive records to recover from, reconciliation '
+            f'yields 0 and the mint is 1; got {result!r}'
+        )
 
         error_records = [
             r for r in caplog.records
@@ -1581,14 +1606,16 @@ class TestMakeIdCounter:
         self, tmp_path: Path, caplog,
     ):
         """An absent counter file is logged as an ERROR when the queue root
-        already holds escalations for the task_id.
+        already holds escalations for the task_id, and the counter is
+        reconciled past them.
 
-        Without this check, a lost counter (aggressive cleanup, fresh
-        checkout, disk restore, accidental rm of the non-.json sidecar) is
-        indistinguishable from a legitimately-new task_id and silently
-        re-mints ids that collide with ones already issued — with zero
-        observability. The mint still starts from 0 (no archive-scan
-        fallback survives this check); only the logging changes.
+        A lost counter (aggressive cleanup, fresh checkout, disk restore,
+        accidental rm of the non-.json sidecar) is indistinguishable from a
+        legitimately-new task_id on its own, and silently re-minting from 1
+        would collide with ids already issued — here, literally with the
+        esc-cnt-1 already sitting in the queue root. The mint reconciles
+        from a one-shot bounded root+archive scan (max observed + 1) and
+        stays loudly observable.
         """
         queue_dir = tmp_path / 'queue'
         queue = EscalationQueue(queue_dir)
@@ -1598,9 +1625,12 @@ class TestMakeIdCounter:
         with caplog.at_level(logging.ERROR, logger='escalation.queue'):
             result = queue.make_id('cnt')
 
-        assert result == 'esc-cnt-1', (
-            'counter is authoritative with no archive-scan fallback — even when '
-            'suspicious, it must still start from 0, not derive a seq from disk'
+        assert result == 'esc-cnt-2', (
+            'the lost counter must be reconciled past the esc-cnt-1 already in '
+            f'the queue root, not restarted from 0; got {result!r}'
+        )
+        assert queue.get('esc-cnt-2') is None, (
+            'the minted id must not resolve to a pre-existing record'
         )
 
         error_records = [
@@ -1610,8 +1640,14 @@ class TestMakeIdCounter:
         assert error_records, (
             f"Expected an ERROR at logger 'escalation.queue'; got records: {caplog.records}"
         )
-        assert any('counter file' in r.message and 'absent' in r.message for r in error_records), (
-            f'Expected an ERROR about the absent counter file; got: {[r.message for r in error_records]}'
+        assert any(
+            'counter file' in r.message
+            and 'absent' in r.message
+            and 'highest observed sequence 1' in r.message
+            for r in error_records
+        ), (
+            'Expected an ERROR about the absent counter file naming the recovered '
+            f'maximum (1); got: {[r.message for r in error_records]}'
         )
 
     def test_make_id_missing_counter_no_existing_escalations_silent(
@@ -1619,9 +1655,10 @@ class TestMakeIdCounter:
     ):
         """An absent counter file for a genuinely-new task_id logs nothing.
 
-        Complements the previous test: the ERROR is conditional on finding
-        pre-existing root evidence, not fired on every absent counter (which
-        would make the common brand-new-task_id path noisy).
+        Complements the previous test: the ERROR is conditional on
+        reconciliation actually recovering something — pre-existing root OR
+        archive evidence — not fired on every absent counter (which would
+        make the common brand-new-task_id path noisy).
         """
         queue_dir = tmp_path / 'queue'
         queue = EscalationQueue(queue_dir)
@@ -1656,6 +1693,259 @@ class TestMakeIdCounter:
         # Simulate restart: fresh instance, no in-memory state carried over.
         queue2 = EscalationQueue(queue_dir)
         assert queue2.make_id('1-2') == 'esc-1-2-3'
+
+    def test_make_id_lost_counter_does_not_mint_id_resolving_to_archived_record(
+        self, tmp_path: Path, caplog,
+    ):
+        """A LOST counter must not mint an id that get() resolves to an old record.
+
+        This is the headline acceptance criterion (task 3238): every
+        escalation for a task_id may have been resolved and archived, leaving
+        the queue root empty and (after an aggressive cleanup / fresh
+        checkout / disk restore) no counter file either.  The root-only
+        ``_root_has_existing_escalations`` probe cannot see that evidence, so
+        the mint restarted from 1 — and because ``get()`` falls back to the
+        archive, each re-minted id resolved to a DIFFERENT, older,
+        already-resolved record, corrupting escalation identity and audit
+        provenance.
+
+        The fix reconciles the counter from a one-shot bounded root+archive
+        scan on the repair path, so the next id is strictly greater than
+        every sequence observed on disk.
+
+        RED before the fix: make_id() returns 'esc-cnt-1' on the very first
+        call and ``queue.get('esc-cnt-1')`` resolves the archived record via
+        _locate_path's archive fallback; nothing is logged at all (the
+        archive-only case is invisible to the root-only probe).
+        """
+        queue_dir = tmp_path / 'queue'
+        archive_dir = queue_dir / 'archive' / '2026-01-02'
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        for seq in (1, 2, 3):
+            seeded = _make_escalation(f'esc-cnt-{seq}', task_id='cnt', status='resolved')
+            (archive_dir / f'{seeded.id}.json').write_text(seeded.to_json())
+
+        # The lost-counter fixture: no root records, no counter file.
+        assert not list(queue_dir.glob('esc-cnt-*.json'))
+        assert not (queue_dir / 'esc-cnt.seq').exists()
+
+        queue = EscalationQueue(queue_dir)
+        with caplog.at_level(logging.ERROR, logger='escalation.queue'):
+            minted = [queue.make_id('cnt') for _ in range(3)]
+
+        assert minted == ['esc-cnt-4', 'esc-cnt-5', 'esc-cnt-6'], (
+            f'Expected the counter to be reconciled past the archived max (3); '
+            f'got {minted}'
+        )
+
+        for minted_id in minted:
+            assert queue.get(minted_id) is None, (
+                f'{minted_id} resolves to a pre-existing record — a freshly '
+                f'minted id must never collide with an archived escalation'
+            )
+
+        error_records = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno >= logging.ERROR
+        ]
+        assert error_records, (
+            f"Expected an ERROR at logger 'escalation.queue'; got records: {caplog.records}"
+        )
+        assert any(
+            'highest observed sequence 3' in r.message and 'reconcil' in r.message.lower()
+            for r in error_records
+        ), (
+            'Expected an ERROR naming the recovered maximum (3) and the '
+            f'reconciliation; got: {[r.message for r in error_records]}'
+        )
+
+    def test_make_id_recovery_max_is_numeric_not_lexicographic(
+        self, tmp_path: Path,
+    ):
+        """Recovery takes the NUMERIC maximum, not the lexicographic one.
+
+        Every other recovery fixture uses single-digit sequences, where
+        ``max(int(...))`` and ``max(str)`` agree — so a regression from an
+        integer comparison to a raw-stem-suffix string comparison would pass
+        all of them. It would NOT be benign: for a task_id that accumulated
+        ten escalations, '9' > '10' lexicographically, so recovery would come
+        back as 9 and mint 'esc-cnt-10' — an id the seeded archive already
+        holds, which is exactly the collision task 3238 exists to prevent.
+        The multi-digit case is also the realistic one: a task_id whose
+        counter was lost has usually issued more than nine escalations.
+        """
+        queue_dir = tmp_path / 'queue'
+        archive_dir = queue_dir / 'archive' / '2026-01-02'
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        for seq in (9, 10):
+            seeded = _make_escalation(f'esc-cnt-{seq}', task_id='cnt', status='resolved')
+            (archive_dir / f'{seeded.id}.json').write_text(seeded.to_json())
+
+        assert not (queue_dir / 'esc-cnt.seq').exists()
+
+        queue = EscalationQueue(queue_dir)
+        # Fixture guard: the record a lexicographic max would collide with is
+        # genuinely resolvable, so the assertion below is not vacuous.
+        assert queue.get('esc-cnt-10') is not None
+
+        minted = queue.make_id('cnt')
+        assert minted == 'esc-cnt-11', (
+            f"Expected the numeric max (10) + 1; got {minted!r} — 'esc-cnt-10' "
+            f'means recovery compared stem suffixes as strings and recovered 9'
+        )
+        assert queue.get(minted) is None, (
+            f'{minted} resolves to a pre-existing archived record'
+        )
+
+    def test_make_id_recovery_is_prefix_anchored_for_hyphenated_task_ids(
+        self, tmp_path: Path,
+    ):
+        """Recovery anchors on the KNOWN task_id, never parsing it out of a filename.
+
+        The retired archive-scan derivation parsed the trailing integer after
+        the last hyphen of an esc-<task_id>-<seq> stem — a latent correctness
+        bug for hyphenated task_ids (see
+        ``test_make_id_task_id_with_hyphen_uses_correct_counter_file``).
+        Reintroducing that parse on the repair path would resurrect it:
+        recovering task '1-2' would match esc-1-2-3-9.json (a DIFFERENT
+        task_id, '1-2-3') and mint 'esc-1-2-10'.
+
+        Recovery instead strips the literal 'esc-{task_id}-' prefix and
+        requires the remainder to parse as an int, so the glob's over-match
+        is harmless.
+
+        RED before the fix: returns 'esc-1-2-1' (no recovery at all).
+        """
+        queue_dir = tmp_path / 'queue'
+        archive_dir = queue_dir / 'archive' / '2026-01-02'
+        archive_dir.mkdir(parents=True, exist_ok=True)
+
+        # Genuine evidence for task '1-2': seq 4.
+        real = _make_escalation('esc-1-2-4', task_id='1-2', status='resolved')
+        (archive_dir / f'{real.id}.json').write_text(real.to_json())
+        # Decoy: task '1-2-3' seq 9 — matches the glob, must NOT parse as a seq for '1-2'.
+        decoy_archive = _make_escalation('esc-1-2-3-9', task_id='1-2-3', status='resolved')
+        (archive_dir / f'{decoy_archive.id}.json').write_text(decoy_archive.to_json())
+        # Decoy in the root: task '1-2x' seq 7 — excluded by the glob prefix itself.
+        decoy_root = _make_escalation('esc-1-2x-7', task_id='1-2x')
+        (queue_dir / f'{decoy_root.id}.json').write_text(decoy_root.to_json())
+
+        assert not (queue_dir / 'esc-1-2.seq').exists()
+
+        queue = EscalationQueue(queue_dir)
+        first = queue.make_id('1-2')
+        assert first == 'esc-1-2-5', (
+            f"Expected esc-1-2-5 (max+1 over prefix-anchored matches only); got "
+            f"{first!r} — 'esc-1-2-10' means the '1-2-3' decoy contaminated "
+            f"recovery, 'esc-1-2-1' means no recovery happened"
+        )
+
+        # The reconciled counter is durable, so a restart continues from it.
+        assert (queue_dir / 'esc-1-2.seq').exists()
+        queue2 = EscalationQueue(queue_dir)
+        assert queue2.make_id('1-2') == 'esc-1-2-6'
+
+    def test_make_id_corrupt_counter_reconciles_instead_of_colliding(
+        self, tmp_path: Path, caplog,
+    ):
+        """An UNPARSEABLE counter reconciles from disk rather than restarting at 1.
+
+        Same acceptance criterion as the lost-counter case, applied to the
+        corrupt-counter path: resetting to 0 mints 'esc-cnt-1', which
+        ``get()`` resolves to the live root record. Recovery spans BOTH
+        halves of the namespace (root esc-cnt-1 + archived esc-cnt-2), so
+        the next id is 3.
+
+        RED after step-2: the ``except ValueError`` branch still hard-sets
+        current = 0, so make_id returns 'esc-cnt-1' and the counter is
+        repaired to 1, not 3.
+        """
+        queue_dir = tmp_path / 'queue'
+        queue = EscalationQueue(queue_dir)
+        queue.submit(_make_escalation('esc-cnt-1', task_id='cnt'))
+
+        archive_dir = queue_dir / 'archive' / '2026-01-02'
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        archived = _make_escalation('esc-cnt-2', task_id='cnt', status='resolved')
+        (archive_dir / f'{archived.id}.json').write_text(archived.to_json())
+
+        (queue_dir / 'esc-cnt.seq').write_text('not-an-int')
+
+        with caplog.at_level(logging.ERROR, logger='escalation.queue'):
+            result = queue.make_id('cnt')
+
+        assert result == 'esc-cnt-3', (
+            f'Expected max observed across root (1) and archive (2), +1; got {result!r}'
+        )
+        assert queue.get('esc-cnt-3') is None, (
+            'the minted id must resolve to no pre-existing record, root or archive'
+        )
+
+        error_records = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno >= logging.ERROR
+        ]
+        assert error_records, (
+            f"Expected an ERROR at logger 'escalation.queue'; got records: {caplog.records}"
+        )
+        assert any(
+            'could not parse counter file' in r.message
+            and 'highest observed sequence 2' in r.message
+            for r in error_records
+        ), (
+            "Expected an ERROR retaining 'could not parse counter file' and naming "
+            f'the recovered maximum (2); got: {[r.message for r in error_records]}'
+        )
+
+        # The corrupt contents were durably repaired, so a restart continues
+        # from the reconciled value with no further archive scan.
+        assert (queue_dir / 'esc-cnt.seq').read_text().strip() == '3'
+        queue2 = EscalationQueue(queue_dir)
+        with patch.object(
+            queue2, '_iter_archive_paths', wraps=queue2._iter_archive_paths,
+        ) as spy:
+            assert queue2.make_id('cnt') == 'esc-cnt-4'
+        assert spy.call_count == 0, (
+            f'The repaired counter must make the next mint scan-free; '
+            f'_iter_archive_paths called {spy.call_count}x'
+        )
+
+    def test_make_id_recovery_scan_is_one_shot_then_steady_state_is_scan_free(
+        self, tmp_path: Path,
+    ):
+        """The repair scan fires at most once per task_id per counter lifetime.
+
+        PRD C9's substance — the counter, not a directory scan, is the sole
+        source of the next sequence — is preserved: the reconciliation scan
+        runs only when the counter is absent-or-unparseable, and its result
+        is immediately made durable, so every subsequent mint is scan-free.
+
+        RED before the fix: the first-call count is 0, not 1 (no recovery
+        scan exists).
+        """
+        queue_dir = tmp_path / 'queue'
+        archive_dir = queue_dir / 'archive' / '2026-01-02'
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        for seq in (1, 2, 3):
+            seeded = _make_escalation(f'esc-cnt-{seq}', task_id='cnt', status='resolved')
+            (archive_dir / f'{seeded.id}.json').write_text(seeded.to_json())
+
+        queue = EscalationQueue(queue_dir)
+        with patch.object(
+            queue, '_iter_archive_paths', wraps=queue._iter_archive_paths,
+        ) as spy:
+            assert queue.make_id('cnt') == 'esc-cnt-4'
+            assert spy.call_count == 1, (
+                f'The lost-counter repair must scan the archive exactly once; '
+                f'_iter_archive_paths called {spy.call_count}x'
+            )
+
+            for _ in range(3):
+                queue.make_id('cnt')
+            assert spy.call_count == 1, (
+                f'Steady state must be scan-free once the counter is durable; '
+                f'_iter_archive_paths called {spy.call_count}x in total'
+            )
 
 
 class TestIterAllEscalationPaths:
