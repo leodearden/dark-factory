@@ -748,14 +748,23 @@ cells both occur — task 2863 AMENDMENT §1.
 | Cause | Treatment | Count |
 |---|---|---|
 | Transport refusal (`cap_tainted`: 429 / auth / model-not-found / wedge) — we never got to ask | **EXCLUDED** from every pool | `plan_quality_cap_excluded` (composite row) / `cap_excluded` (θ table) |
-| No plan produced (`not produced_a_plan`) — we asked, the answer was nothing | **FLOORED** to `0.0`, kept in every pool | `plan_quality_no_plan` (composite row) / `no_plan` (θ table) |
+| No plan produced (`not produced_a_plan`) — we asked, the answer was nothing | **FLOORED** to `0.0` on the quality axis *and* **HARD-GATED** to `composite = 0.0` (`blend_composite(no_plan=True)`), kept in every pool and counted | `plan_quality_no_plan` (composite row) / `no_plan` (θ table) |
 
 A no-plan cell is additionally barred from *setting* its `(fixture,
 'plan_only')` cost/latency baseline, though its real spend still enters the
 row's pools: it is cheap and fast precisely because it failed
 (`plans/eval-architect-effort-verdict-2026-07-27.md` measured $0.5–$3 against a
 real plan's ~$3.7), so seeding the floor with it deflates every candidate that
-succeeded.
+succeeded. Barring it from the baseline was *not sufficient on its own*: it
+closes only the intra-group route. Flooring the quality axis bounds just the
+0.6 quality weight, and a no-plan cell that is the sole cell of its `(fixture,
+'plan_only')` group takes the all-trials fallback baseline — earning ratios of
+`1.0` on both efficiency axes and banking the remaining 0.4 as credit for
+having failed. Measured on the pre-fix pipeline: a no-plan cell scored `0.40`,
+outranked a config that produced a real 6-step plan at `0.26`, and survived
+`select_survivors(top_k=2)` while the plan-producing one was cut. Hence the
+composite hard gate — the plan-only analogue of the workflow `tests_pass` gate,
+closing the cross-group route.
 
 **Fixed at both ends.** `run_architect_eval` gates the LLM judge on
 `is_scorable_plan` so no new incoherent cell is written; `report._plan_quality_score`
