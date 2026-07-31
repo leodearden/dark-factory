@@ -420,20 +420,62 @@ def _healthz_db_targets(config: DashboardConfig) -> list[tuple[str, Path]]:
     ]
 
 
+# Abandoned _probe_db tasks (see below) — the event loop only holds a WEAK
+# reference to a Task, so an unreferenced one can be garbage-collected
+# mid-flight; this set holds the strong reference until each task's own
+# done-callback removes it.
+_ABANDONED_PROBES: set[asyncio.Task] = set()
+
+
+def _discard_abandoned_probe(task: asyncio.Task) -> None:
+    _ABANDONED_PROBES.discard(task)
+    if not task.cancelled():
+        task.exception()  # consume so "exception was never retrieved" isn't logged
+
+
 async def _probe_db(pool: DbPool, db_path: Path, budget: float) -> str:
     """Probe one database under a single deadline covering acquire + execute + fetch.
 
     Returns 'ok' | 'failed' | 'timeout' | 'unavailable'. Never raises: a
     /healthz probe must always yield a verdict for its DB.
+
+    Runs the probe in its own task and, on expiry, ABANDONS it rather than
+    awaiting its cancellation. A deadline wrapped around `async with
+    conn.execute(...)` is not actually hang-free: when it fires mid-fetch,
+    the cancellation is consumed unwinding into the cursor's `__aexit__`,
+    which issues a NEW `await cursor.close()` that nothing will cancel a
+    second time. `asyncio.wait_for`/`asyncio.timeout` both await that
+    cancelled operation's unwinding, reintroducing the hazard.
+    `asyncio.wait(..., timeout=budget)` returns at the deadline WITHOUT
+    awaiting the task, so a hung cleanup can never block this handler.
+
+    Cancelling the abandoned task does NOT stop aiosqlite's underlying
+    worker thread — a wedged connection stays wedged and will simply time
+    out again on the next /healthz call. That's intended: /healthz reports,
+    it does not repair, and per-DB caps mean a poisoned connection costs one
+    _DB_PROBE_TIMEOUT, never the whole handler.
     """
+
+    async def _inner() -> str:
+        conn = await pool.get(db_path)
+        if conn is None:
+            return 'unavailable'
+        # Explicit await + close on the success path only — no `async with`,
+        # so cancellation never triggers a second, uncancellable close().
+        cursor = await conn.execute('SELECT 1')
+        row = await cursor.fetchone()
+        await cursor.close()
+        return 'ok' if row is not None else 'failed'
+
+    task = asyncio.create_task(_inner())
+    done, _pending = await asyncio.wait({task}, timeout=budget)
+    if task not in done:
+        task.cancel()  # fire-and-forget — do NOT await the unwinding
+        _ABANDONED_PROBES.add(task)
+        task.add_done_callback(_discard_abandoned_probe)
+        return 'timeout'
     try:
-        async with asyncio.timeout(budget):
-            conn = await pool.get(db_path)
-            if conn is None:
-                return 'unavailable'
-            async with conn.execute('SELECT 1') as cursor:
-                row = await cursor.fetchone()
-            return 'ok' if row is not None else 'failed'
+        return task.result()
     except Exception:
         return 'timeout'
 
