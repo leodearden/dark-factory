@@ -1152,25 +1152,19 @@ class TestSplitChainTail:
 class TestChainOperatorTokenCoverage:
     """`&&` is the one chain operator whose tail `split_chain_tail` will carry.
 
-    NOT a tautology, and NOT a RED-first test — it is green on write. The
-    relationship it pins already holds: `_NON_AND_CHAIN_TOKENS` happens to list
-    exactly the non-`&&` operators plus the two paren tokens, so there is no
-    failure to observe first. Deriving one constant from the other is a pure
-    identity refactor and no failing test can honestly precede it.
+    Every other member of `_CHAIN_OPERATOR_TOKENS` is refused with `(raw, '')`.
 
-    Its value is FORWARD-looking, and rests on the cases being generated FROM
-    `_CHAIN_OPERATOR_TOKENS` rather than hardcoded. Add a future operator to
-    that set — say `&` — and a case for it appears here automatically,
-    asserting through the public API that `split_chain_tail` actually refuses
-    it. Before the derivation the two constants could silently disagree (a new
-    operator recognised as a chain delimiter but absent from the refusal set,
-    so its tail gets carried across control flow it was never safe to cross);
-    after it they cannot, and this test is what proves the derivation is
-    load-bearing rather than decorative.
+    The cases are generated FROM `_CHAIN_OPERATOR_TOKENS` rather than hardcoded,
+    so an operator added there — say `&` — is auto-covered here, and the derived
+    `_NON_AND_CHAIN_TOKENS` cannot silently disagree with what `split_chain_tail`
+    really refuses (a new delimiter missing from the refusal set would get its
+    tail carried across control flow it was never safe to cross).
 
     Driven through the public gate, never by asserting the private constant's
     literal members — a test that restates the definition would pass whatever
-    the definition became.
+    the definition became. That makes the template load-bearing: it must carry a
+    FIXED top-level `&&` so the refusal set, not the `len(segments) < 2` guard,
+    is the branch under test.
     """
 
     # The FIXED `&&` is load-bearing: it guarantees a multi-segment chain for
