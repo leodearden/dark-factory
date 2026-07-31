@@ -258,7 +258,7 @@ class TestTerminateProcessGroup:
         )
 
     @pytest.mark.asyncio
-    @pytest.mark.timeout(10)
+    @pytest.mark.timeout(30)
     async def test_terminate_process_group_escalates_to_sigkill(self):
         """When the child ignores SIGTERM, SIGKILL fires after grace_secs.
 
@@ -266,17 +266,18 @@ class TestTerminateProcessGroup:
         SIGKILL should kill the group. proc.returncode == -9 (SIGKILL).
         """
         proc = await asyncio.create_subprocess_shell(
-            "trap '' TERM; sleep 30",
+            "trap '' TERM; echo ready; sleep 30",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
         )
         pgid = proc.pid
 
-        # Let the shell install the trap before we send SIGTERM; otherwise
-        # the signal may arrive during shell parsing and kill the shell
-        # directly (rc=-15) instead of being ignored.
-        await asyncio.sleep(0.2)
+        # The "ready" line is a happens-before edge proving `trap '' TERM`
+        # has already returned — i.e. SIGTERM's disposition is SIG_IGN
+        # before we signal — rather than a wall-clock assumption that a
+        # fixed sleep was long enough (task 3337 de-flake).
+        await _await_trap_installed(proc)
 
         await terminate_process_group(proc, pgid, grace_secs=0.5)
 
