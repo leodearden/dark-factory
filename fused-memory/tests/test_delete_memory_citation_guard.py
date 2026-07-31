@@ -148,3 +148,109 @@ class TestCitationRepointRequired:
         hint = result['hint']
         assert 'replacement_memory_id' in hint
         assert 'search(' in hint
+
+
+class TestRepointThenDelete:
+    """With a concrete replacement, citers are repointed and THEN deleted."""
+
+    @pytest.fixture
+    def mock_service(self):
+        return _make_service()
+
+    @pytest.fixture
+    def interceptor(self):
+        return _make_interceptor([
+            _task('201', 'pending', {'mem0_canonical_entry': DOOMED}),
+            _task('202', 'in-progress', {
+                'memory_hints': {'entities': [], 'queries': [f'advice {DOOMED}']},
+            }),
+            _task('203', 'done', {'cited': DOOMED}),
+            _task('204', 'pending', {'unrelated': 'nothing'}),
+        ])
+
+    @pytest.fixture
+    def mcp_server(self, mock_service, interceptor):
+        return create_mcp_server(
+            mock_service,
+            task_interceptor=interceptor,
+            known_projects=KNOWN_PROJECTS,
+        )
+
+    @pytest.mark.asyncio
+    async def test_delete_succeeds_and_reports_repoint_stats(
+        self, mcp_server, mock_service,
+    ):
+        """(a) The delete runs, and its result carries the repoint stats."""
+        result = await _call_delete(mcp_server, replacement_memory_id=SURVIVOR)
+
+        assert result['status'] == 'deleted'
+        mock_service.delete_memory.assert_awaited_once()
+
+        repoint = result['citation_repoint']
+        assert repoint['stage1_citation_tasks_repointed'] == 2
+        assert repoint['stage1_citations_repointed'] == 2
+        assert repoint['stage1_citation_repoint_failures'] == 0
+        assert repoint['stage1_terminal_citations_reported'] == 1
+
+    @pytest.mark.asyncio
+    async def test_every_repoint_write_lands_before_the_delete(
+        self, mcp_server, mock_service, interceptor,
+    ):
+        """(b) ORDERING is the guarantee. If the delete could interleave ahead
+        of a repoint, the dangling-pointer window would still exist — it would
+        just be narrower. Record both call streams and assert the boundary."""
+        order: list[str] = []
+
+        async def _record_update(**kwargs):
+            order.append(f'repoint:{kwargs["task_id"]}')
+            return {'success': True}
+
+        async def _record_delete(**kwargs):
+            order.append('delete')
+            return {'status': 'deleted', 'store': 'mem0', 'id': DOOMED}
+
+        interceptor.update_task = AsyncMock(side_effect=_record_update)
+        mock_service.delete_memory = AsyncMock(side_effect=_record_delete)
+
+        await _call_delete(mcp_server, replacement_memory_id=SURVIVOR)
+
+        assert order.count('delete') == 1
+        assert order[-1] == 'delete'
+        # Both live citers were repointed strictly before it.
+        assert set(order[:-1]) == {'repoint:201', 'repoint:202'}
+
+    @pytest.mark.asyncio
+    async def test_terminal_citer_is_reported_not_written(
+        self, mcp_server, interceptor,
+    ):
+        """(c) A done citer is surfaced on the result and never rewritten —
+        the terminal dangler is made visible rather than silenced."""
+        result = await _call_delete(mcp_server, replacement_memory_id=SURVIVOR)
+
+        terminal = result['citation_repoint']['terminal_citations']
+        assert [t['task_id'] for t in terminal] == ['203']
+        assert terminal[0]['status'] == 'done'
+        assert terminal[0]['paths'] == ['cited']
+
+        written = {c[1]['task_id'] for c in interceptor.update_task.call_args_list}
+        assert '203' not in written
+
+    @pytest.mark.asyncio
+    async def test_no_citers_deletes_without_any_write(self, mock_service):
+        """(d) Nothing cites the id -> the delete proceeds and no task is
+        touched. The gate must not manufacture writes."""
+        interceptor = _make_interceptor([
+            _task('301', 'pending', {'cited': SURVIVOR}),
+            _task('302', 'pending', {'unrelated': 'nothing'}),
+        ])
+        mcp_server = create_mcp_server(
+            mock_service,
+            task_interceptor=interceptor,
+            known_projects=KNOWN_PROJECTS,
+        )
+
+        result = await _call_delete(mcp_server, replacement_memory_id=SURVIVOR)
+
+        assert result['status'] == 'deleted'
+        mock_service.delete_memory.assert_awaited_once()
+        interceptor.update_task.assert_not_awaited()
