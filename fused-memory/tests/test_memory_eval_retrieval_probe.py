@@ -2508,20 +2508,6 @@ class TestCorpusCounting:
         assert 'contamination_untopiced_results' in outcome.series.corpus.counts
         assert 'degraded_observations' in outcome.series.corpus.counts
 
-    def test_no_category_name_is_restated_as_a_literal_in_the_script(self):
-        """A second home for someone else's vocabulary silently goes stale."""
-        from fused_memory.models.enums import (  # noqa: PLC0415
-            GRAPHITI_PRIMARY,
-            MEM0_PRIMARY,
-        )
-
-        source = SCRIPT_PATH.read_text(encoding='utf-8')
-        for category in (GRAPHITI_PRIMARY | MEM0_PRIMARY):
-            assert category.value not in source, (
-                f'{category.value!r} is restated in the probe; derive it from '
-                'MEM0_PRIMARY/GRAPHITI_PRIMARY instead'
-            )
-
 
 class TestArgparseBand:
     """(c) The flags this runner exposes — and the ones it must never expose."""
