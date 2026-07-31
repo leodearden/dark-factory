@@ -138,7 +138,8 @@ async def _await_trap_installed(
       exited before reaching the ``echo``, which would otherwise look
       identical to "line not yet available" and let a naive caller mistake
       early-exit for a successfully armed trap.
-    - ``_TrapReadinessError`` — a line arrived but wasn't ``b"ready\\n"``.
+    - ``_TrapReadinessError`` — a line arrived but wasn't ``ready`` (compared
+      after stripping surrounding whitespace).
 
     All three subclass ``AssertionError``; the concrete subclass is the
     contract callers discriminate on, not the message text.
@@ -162,7 +163,8 @@ async def _await_trap_installed(
         )
     if line.strip() != b'ready':
         raise _TrapReadinessError(
-            f'shell pid={proc.pid} announced {line!r}, expected b"ready\\n"'
+            f'shell pid={proc.pid} announced {line!r}, expected "ready" '
+            f'(compared after stripping surrounding whitespace)'
         )
 
 
@@ -175,7 +177,7 @@ async def test_await_trap_installed_fails_loudly_when_readiness_never_arrives():
     starvation can't quietly regress this helper back into the racy
     "signal anyway" behaviour this task removes.
 
-    Two sub-cases, discriminated by exception TYPE rather than message
+    Three sub-cases, discriminated by exception TYPE rather than message
     prose (substring checks on wording are lock-in with false positives —
     e.g. 'ready' also matches "already", 'closed' also matches
     "disclosed"):
@@ -188,11 +190,14 @@ async def test_await_trap_installed_fails_loudly_when_readiness_never_arrives():
         naive implementation would treat as success.  Must raise
         _TrapReadinessEOF, a type distinct from (a)'s, so EOF can never be
         silently reclassified as — or fall through to — a deadline expiry.
+    (c) the shell announces something other than "ready" — must raise the
+        base _TrapReadinessError and NEITHER subclass, so a wrong-content
+        line can't be misreported as a timeout or an EOF.
 
-    Both are AssertionError subclasses, which each sub-case confirms
-    directly: pytest.raises is keyed on the concrete subclass (the real
-    discrimination), and the isinstance check pins the cross-cutting
-    guarantee that these are test FAILUREs, not a leaked TimeoutError.
+    All three are AssertionError subclasses, which each sub-case confirms
+    directly: pytest.raises is keyed on the concrete type (the real
+    discrimination), and an accompanying check pins the cross-cutting
+    guarantee that these are test FAILUREs, never a leaked TimeoutError.
     """
     # (a) Never announces.
     proc = await asyncio.create_subprocess_shell(
@@ -237,6 +242,30 @@ async def test_await_trap_installed_fails_loudly_when_readiness_never_arrives():
         # this window — only not signalling does.
         with contextlib.suppress(Exception):
             await proc2.wait()
+
+    # (c) Announces something other than "ready".
+    proc3 = await asyncio.create_subprocess_shell(
+        'echo nope; sleep 30',
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        with pytest.raises(_TrapReadinessError) as excinfo3:
+            await _await_trap_installed(proc3)
+        # Exact-type, not isinstance: _TrapReadinessTimeout and
+        # _TrapReadinessEOF are themselves _TrapReadinessError, so
+        # isinstance alone wouldn't prove THIS branch fired rather than
+        # one of the other two.
+        assert type(excinfo3.value) is _TrapReadinessError, (
+            f'expected the base _TrapReadinessError (not a subclass), got '
+            f'{type(excinfo3.value).__name__}'
+        )
+    finally:
+        if proc3.returncode is None:
+            _kill_group(proc3.pid)
+        with contextlib.suppress(Exception):
+            await proc3.wait()
 
 
 class TestTerminateProcessGroup:
