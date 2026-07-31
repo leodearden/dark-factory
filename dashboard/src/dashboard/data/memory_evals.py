@@ -51,10 +51,14 @@ Skipping a ``resolved`` / ``dismissed`` escalation, or an escalation from
 another category, is the filter doing its job — the record is not wanted, so
 its absence is not a loss and earns no issue.  Skipping a record the reader
 cannot CLASSIFY is a genuine discard and is named
-(``unknown_escalation_status``).  The openness test is positive (``status`` is
-``pending``) rather than a blocklist of closed states, so a status vocabulary
-that grows a new terminal state fails toward "not shown as open" rather than
-toward a closed alarm rendered as live.
+(``unknown_escalation_status``).  So is skipping one it cannot KEY: an open
+escalation with no usable ``dedupe_fingerprint`` is named
+(``unfingerprinted_escalation``) and still surfaced in
+``unmatched_escalations``, because the index is what that list is built from
+and a live alarm must never be absent from both.  The openness test is positive
+(``status`` is ``pending``) rather than a blocklist of closed states, so a
+status vocabulary that grows a new terminal state fails toward "not shown as
+open" rather than toward a closed alarm rendered as live.
 
 **Same-host file reads (DD1).**  The dashboard and the eval runner share a
 filesystem; there is no RPC in this path.
@@ -365,10 +369,23 @@ def _read_verdicts(
     A malformed ``entries`` does NOT suppress ``storm_escape``: the storm block
     is run-scoped and parses independently, so dropping it too would turn one
     named degradation into a second silent one.
+
+    ``missing_verdicts`` is gated on a RUN existing, not on an eval directory
+    existing — a registered eval that has never run is empty-but-healthy, the
+    same standing the absent root gets, and ``_read_limits`` gates on the same
+    signal.
     """
     path = root / 'verdicts-current.json'
     if not path.is_file():
-        if eval_dirs:
+        # Gated on any RUN existing, not on the eval DIRECTORIES existing.  An
+        # eval that is registered but has never run is the same
+        # empty-but-healthy state as an absent root, which this module
+        # deliberately does not flag; firing here would put a standing issue on
+        # a tree with nothing wrong and train operators past the list.
+        # ``_read_limits`` draws the line in exactly this place (``has_runs``),
+        # and two readers disagreeing about what "never run" means would make
+        # the two artifacts' absence stories contradict each other.
+        if any(next(d.glob('metrics-*.json'), None) is not None for d in eval_dirs):
             # Metrics on disk with nothing judging them: the UI would show
             # trends beside a blank verdict column and look healthy.
             misplaced = [d / 'verdicts-current.json' for d in eval_dirs if (d / 'verdicts-current.json').is_file()]
@@ -504,6 +521,12 @@ def _unmatched_projection(record: dict[str, Any], reason: str) -> dict[str, Any]
     row deliberately renders none.  Per-metric filings from EARLIER runs stay
     open across a storm (program PRD §M3), so this is the ordinary case rather
     than a rare one.
+    ``no_fingerprint`` — the record carries no usable ``dedupe_fingerprint``,
+    so it could not be joined by ANY row: the failure is upstream of the
+    matching question rather than an answer to it.  Distinguished from
+    ``no_matching_verdict`` because the operator's next step differs — a
+    missing fingerprint is a producer bug, not contract drift between the
+    evaluator and the tree.
 
     Without the discriminator both land in one undifferentiated list that the
     payload calls "no metric row explains this" — which would fire on
@@ -516,8 +539,13 @@ def _unmatched_projection(record: dict[str, Any], reason: str) -> dict[str, Any]
 def _index_escalations(
     escalations_dir: Path,
     issues: list[dict[str, Any]],
-) -> dict[str, dict[str, Any]]:
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
     """Index open ``eval_regression`` escalations by ``dedupe_fingerprint``.
+
+    Returns ``(fingerprint -> record, open records that carry no usable
+    fingerprint)``.  The second list exists because the fingerprint is the
+    index KEY: a record without one cannot be represented in the index at all,
+    yet it is still an open alarm the payload owes the operator.
 
     Reuses :func:`dashboard.data.escalations.load_queue_escalations` (INV-5 —
     a call site, never a second reader).  Its existing contracts carry most of
@@ -558,8 +586,18 @@ def _index_escalations(
     first, and that is ``Path.glob`` order rather than a meaningful ranking —
     which is exactly why the issue names BOTH ids: the operator can see the
     colliding pair without depending on which one won.
+
+    An OPEN record whose ``dedupe_fingerprint`` is absent or not a string is
+    the last place a live alarm could leave this payload: it cannot key the
+    index, and ``unmatched_escalations`` is derived FROM the index, so a bare
+    skip would erase it from the metric rows and from the reverse-direction
+    list in one move — the exact blind spot the parity view exists to close.
+    It is therefore both NAMED and returned for surfacing.  That is the
+    opposite standing from ``resolved``/``dismissed``, which are dropped with
+    no issue precisely because dropping them is the filter doing its job.
     """
     index: dict[str, dict[str, Any]] = {}
+    unfingerprinted: list[dict[str, Any]] = []
     for record in load_queue_escalations(escalations_dir):
         if not isinstance(record, dict):
             continue
@@ -588,18 +626,31 @@ def _index_escalations(
             )
             continue
         fingerprint = record.get('dedupe_fingerprint')
-        if isinstance(fingerprint, str) and fingerprint:
-            if fingerprint in index:
-                _issue(
-                    issues, 'duplicate_escalation_fingerprint', path=escalations_dir,
-                    detail=(
-                        f'escalation {record.get("id")!r} shares dedupe_fingerprint '
-                        f'{fingerprint!r} with {index[fingerprint].get("id")!r}; the first is used'
-                    ),
-                )
-                continue
-            index[fingerprint] = record
-    return index
+        if not (isinstance(fingerprint, str) and fingerprint):
+            # Open, but unjoinable: no fingerprint means no index key, and the
+            # index is what ``unmatched_escalations`` is built from.  Named AND
+            # carried out, so the open alarm stays visible even though no
+            # metric row can ever claim it.
+            _issue(
+                issues, 'unfingerprinted_escalation', path=escalations_dir,
+                detail=(
+                    f'escalation {record.get("id")!r} is open but carries no usable '
+                    f'dedupe_fingerprint ({fingerprint!r}); it can never join a metric row'
+                ),
+            )
+            unfingerprinted.append(record)
+            continue
+        if fingerprint in index:
+            _issue(
+                issues, 'duplicate_escalation_fingerprint', path=escalations_dir,
+                detail=(
+                    f'escalation {record.get("id")!r} shares dedupe_fingerprint '
+                    f'{fingerprint!r} with {index[fingerprint].get("id")!r}; the first is used'
+                ),
+            )
+            continue
+        index[fingerprint] = record
+    return index, unfingerprinted
 
 
 def _parity(verdict: Any, escalation: dict[str, Any] | None) -> str:
@@ -680,8 +731,19 @@ def _build_eval(
                 issues, 'missing_run_stamp', eval_id=eval_id, path=path,
                 detail='run artifact carries no in-body run_stamp',
             )
-        if isinstance(body.get('corpus'), dict):
-            corpus = dict(body['corpus'])
+        # The corpus block describes THIS run, so the row carries the LATEST
+        # parsed run's block or none at all — never the newest run that merely
+        # HAPPENED to carry one.  Carrying it forward would present an older
+        # run's counts as current with nothing disclosing the skew, while every
+        # other latest-run field on this row (``current_value``, ``n``,
+        # ``denominator``, ``kind``) has no such fallback and the module
+        # elsewhere discloses drift explicitly (``limits.stale_for_latest_run``,
+        # ``truncated``/``runs_on_disk``).  ``corpus`` is optional in M1, so
+        # "this run reported none" is a truthful answer.  Assigning on every
+        # appended run keeps this field pinned to ``runs[-1]``, the same run
+        # ``latest_run_stamp`` and the latest-run scalars are read from.
+        run_corpus = body.get('corpus')
+        corpus = dict(run_corpus) if isinstance(run_corpus, dict) else None
         runs.append((stamp, _by_metric_id(body, eval_id, path, issues), path))
 
     run_stamps = [stamp for stamp, _, _ in runs]
@@ -939,7 +1001,7 @@ def build_memory_evals(
         verdict_index, storm = {}, None
 
     try:
-        escalation_index = _index_escalations(escalations_dir, issues)
+        escalation_index, unfingerprinted = _index_escalations(escalations_dir, issues)
     except _ARTIFACT_ERRORS as exc:
         # The join reads a second unvalidated artifact tree, so it is a
         # boundary like the verdicts read, the limits read and the root walk —
@@ -953,7 +1015,7 @@ def build_memory_evals(
             issues, 'unreadable_escalations',
             path=escalations_dir, detail=str(exc),
         )
-        escalation_index = {}
+        escalation_index, unfingerprinted = {}, []
 
     consumed: set[tuple[str, str]] = set()
     linked_fingerprints: set[str] = set()
@@ -1000,6 +1062,12 @@ def build_memory_evals(
         )
         for fingerprint, record in escalation_index.items()
         if fingerprint not in linked_fingerprints
+    ] + [
+        # Open, and unlinkable rather than merely unlinked: with no usable
+        # fingerprint these never reached the index, so this is the only place
+        # in the payload they can appear at all.
+        _unmatched_projection(record, 'no_fingerprint')
+        for record in unfingerprinted
     ]
 
     # A verdict resolving onto nothing is contract drift between the evaluator
