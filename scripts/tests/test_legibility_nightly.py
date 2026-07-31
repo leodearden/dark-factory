@@ -1189,6 +1189,169 @@ def test_run_nightly_logs_the_sampler_summary_when_there_are_no_sessions(tmp_pat
     assert '2026-07-13' in line
 
 
+def _nightly_warnings(caplog):
+    """Records at >= WARNING on this module's OWN logger.
+
+    Filtered by logger name deliberately: ``legibility.census_trigger`` emits
+    its own fail-safe WARNING on a fixture with no census baseline, which says
+    nothing about whether the trickle reported suppression.
+    """
+    return [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING and r.name == 'legibility.nightly'
+    ]
+
+
+def test_run_nightly_reports_a_totally_budget_suppressed_night(tmp_path, caplog):
+    """THE ACCEPTANCE REGRESSION (task 3270).
+
+    Replays the sampler STATE that every night from 2026-07-16 to 2026-07-29
+    actually produced -- real signal enumerated, then every candidate
+    discarded on the byte budget (``selected == []`` with
+    ``budget_skipped > 0``) -- and asserts it is now reported at every layer
+    an operator can observe: a structured flag on the result, a WARNING in
+    the journal, and a durable escalation.
+
+    Achievability basis, not a guessed threshold: ``_write_transcript``'s
+    digest measures 446 bytes (recorded at the top of
+    ``test_select_digest_sessions_charges_real_digest_bytes``), so a 10-byte
+    budget cannot fit the single reserve group and skips it whole. The
+    squeeze goes through the supported ``budgets`` config seam rather than
+    resurrecting task 3268's already-fixed raw-transcript-bytes cost basis,
+    which is no longer reachable from main.
+    """
+    work_cwd = str(tmp_path / 'work')
+    repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+    # Squeeze the daily budget below one digest. Overwrites _init_e2e_repo's
+    # own config in place, so run_nightly loads the squeezed one.
+    _write_config(
+        repo, project_id='testproj', escalation_port=8199, cwd_prefixes=[work_cwd],
+        max_daily_digest_bytes=10,
+    )
+    assert load_config(config_path).budgets.max_daily_digest_bytes == 10
+
+    projects_root = tmp_path / 'projects'
+    _write_transcript(
+        projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl',
+        cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id='session-1',
+    )
+
+    codebook_path = repo / 'docs' / 'legibility' / 'confusion-codebook.yaml'
+    before_bytes = codebook_path.read_bytes()
+    before_log = subprocess.run(
+        ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+
+    escalation_calls = []
+    with caplog.at_level('INFO', logger='legibility.nightly'):
+        result = nightly.run_nightly(
+            config_path=config_path,
+            projects_root=projects_root,
+            target_date=date(2026, 7, 13),
+            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc),
+            invoke=_fake_invoke_known_cause,
+            status_fetcher=None,
+            poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+        )
+
+    # Exit code stays 0 ON PURPOSE: a non-zero exit would flip
+    # legibility-trickle@testproj.service to failed and make
+    # check_trickle_liveness.sh scream every night about a timer that is in
+    # fact running perfectly.
+    assert result.exit_code == 0
+    assert result.budget_suppressed is True
+    assert result.escalated is True
+
+    # Structured facts, not log-scraping: ONE durable escalation, on the
+    # existing decision-8 envelope, unchanged.
+    assert len(escalation_calls) == 1
+    _url, envelope = escalation_calls[0]
+    arguments = envelope['params']['arguments']
+    assert arguments['category'] == 'infra_issue'
+    assert arguments['severity'] == 'info'
+    summary = arguments['summary'].lower()
+    assert 'budget' in summary
+    assert 'suppress' in summary
+    detail = arguments['detail']
+    assert 'budget_skipped=1' in detail
+    assert 'selected=0' in detail
+    assert '/10' in detail, 'the detail must name the byte budget that did the cutting'
+
+    # And loud in the journal, on this module's own logger.
+    loud = _nightly_warnings(caplog)
+    assert len(loud) >= 1
+    assert any(
+        'budget' in r.getMessage().lower() and 'budget_skipped=1' in r.getMessage()
+        for r in loud
+    ), f'expected a WARNING naming the suppression counts; got {[r.getMessage() for r in loud]}'
+
+    # Nothing was written: no digests were affordable, so no coding, no dump,
+    # no commit.
+    assert result.commit_made is False
+    assert codebook_path.read_bytes() == before_bytes
+    after_log = subprocess.run(
+        ['git', 'log', '--oneline'], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+    assert after_log == before_log
+
+
+def test_run_nightly_quiet_night_is_not_reported_as_suppressed(tmp_path, caplog):
+    """The CONTRAST case -- and the actual property under test.
+
+    A genuinely quiet night (sessions existed, none carried any confusion
+    signal, so none ever reached the budget phase) must stay quiet: no
+    suppression flag, no escalation, nothing loud in the journal. Paired with
+    the test above, this is what proves the two nights are now
+    DISTINGUISHABLE rather than merely proving that some string was logged.
+    """
+    work_cwd = str(tmp_path / 'work')
+    repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+    cfg = load_config(config_path)
+    assert cfg.budgets.max_daily_digest_bytes == 300000, 'contrast case must use the STOCK budget'
+
+    projects_root = tmp_path / 'projects'
+    for session_id in ('session-quiet-a', 'session-quiet-b'):
+        _write_quiet_transcript(
+            projects_root / _encode_cwd(work_cwd) / f'{session_id}.jsonl',
+            cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id=session_id,
+        )
+
+    # The fixture's zero-signal claim, ASSERTED rather than assumed: these
+    # records are dropped before the budget phase, so they can never be
+    # budget-skipped candidates.
+    scored = nightly.select_scored_records(cfg, projects_root, date(2026, 7, 13))
+    assert len(scored) == 2
+    assert [r.score for r in scored] == [0, 0]
+
+    escalation_calls = []
+    with caplog.at_level('INFO', logger='legibility.nightly'):
+        result = nightly.run_nightly(
+            config_path=config_path,
+            projects_root=projects_root,
+            target_date=date(2026, 7, 13),
+            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc),
+            invoke=_fake_invoke_known_cause,
+            status_fetcher=None,
+            poster=lambda url, envelope: escalation_calls.append((url, envelope)),
+        )
+
+    assert result.exit_code == 0
+    assert result.budget_suppressed is False
+    assert result.escalated is False
+    assert escalation_calls == []
+    assert _nightly_warnings(caplog) == [], 'a quiet night must emit nothing loud'
+
+    # ...while the always-on INFO line still reports exactly WHY the night
+    # was empty: nothing had signal, and the budget cut nothing.
+    lines = _summary_lines(caplog)
+    assert len(lines) == 1
+    line = lines[0]
+    assert 'enumerated=2' in line
+    assert 'zero_signal_dropped=2' in line
+    assert 'budget_skipped=0' in line
+    assert 'selected=0' in line
+
+
 # ---------------------------------------------------------------------------
 # step-15/16: run_nightly -- fail-loud on coder storm (decision 8, §8.6)
 # ---------------------------------------------------------------------------
