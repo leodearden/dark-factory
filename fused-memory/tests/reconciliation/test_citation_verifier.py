@@ -325,5 +325,12 @@ class TestFindCitationOccurrences:
         }
 
         assert find_citation_occurrences(metadata, _DOOMED) == []
-        # ...and the eight shared characters alone find nothing either.
-        assert find_citation_occurrences(metadata, _DOOMED[:8]) == []
+
+        # And when BOTH ids are present, only the doomed one is a citation —
+        # the twin is never dragged along by its shared prefix.
+        mixed = {
+            'twin': _PREFIX_TWIN,
+            'doomed': _DOOMED,
+            'prose': f'{_PREFIX_TWIN} and {_DOOMED} are different entries',
+        }
+        assert find_citation_occurrences(mixed, _DOOMED) == ['doomed', 'prose']

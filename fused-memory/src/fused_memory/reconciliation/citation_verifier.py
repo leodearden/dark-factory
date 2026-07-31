@@ -1,13 +1,23 @@
-"""Post-assembly citation verification for Stage-1 reconciliation (task 2978).
+"""Citation integrity for Stage-1 reconciliation (tasks 2978, 3108).
 
-``verify_cited_memories`` walks each finding's ``cited_memories`` list and
-re-resolves every cited Mem0 id against the live store, so a finding's claim
-can never be silently backed by an id that does not (or no longer) exist.
+This module owns one invariant end-to-end: **a cited memory id must resolve.**
+It covers both halves of that invariant, so there is one owner rather than two
+mechanisms that can drift.
 
-It is a small, single-purpose async helper in the ``reconciliation/``
-convention (cf. ``flag_dedup``/``task_filter``): it takes the memory service
-and post-processes ``report.items_flagged`` in place, returning ``stage1_*``
-stats that ``MemoryConsolidator.run()`` merges into ``report.stats``.
+Half 1 — recon-report citations (task 2978). ``verify_cited_memories`` walks
+each finding's ``cited_memories`` list and re-resolves every cited Mem0 id
+against the live store, so a finding's claim can never be silently backed by an
+id that does not (or no longer) exist.
+
+Half 2 — task-metadata citations (task 3108). ``find_citation_occurrences`` /
+``repoint_metadata`` / ``repoint_task_citations`` find and rewrite live
+pointers to a memory id that is about to be deleted, so a consolidation delete
+repoints citations BEFORE the irreversible destruction rather than leaving
+dangling pointers behind it.
+
+These are small, single-purpose helpers in the ``reconciliation/`` convention
+(cf. ``flag_dedup``/``task_filter``), returning ``stage1_*`` stats that
+``MemoryConsolidator.run()`` merges into ``report.stats``.
 """
 
 from __future__ import annotations
@@ -114,3 +124,72 @@ async def verify_cited_memories(
                 stats['stage1_phantom_citations_dropped'] += 1
         finding['cited_memories'] = kept
     return stats
+
+
+# --------------------------------------------------------------------------- #
+# Task-metadata citation scanning (task 3108)
+# --------------------------------------------------------------------------- #
+
+
+def find_citation_occurrences(metadata: Any, memory_id: str) -> list[str]:
+    """Return a dotted/indexed path for EVERY occurrence of ``memory_id``.
+
+    A pure, side-effect-free recursive walk over ``metadata``:
+
+    - **dicts** are descended by key (``memory_hints`` -> ``memory_hints.x``);
+    - **lists/tuples** are descended by index (``queries`` -> ``queries[0]``);
+    - **strings** match on SUBSTRING containment, so an id embedded in free
+      prose (``'see canonical entry <uuid> for ...'``) is found, not just a
+      scalar whose whole value is the id.
+
+    Never mutates its input, and never raises on malformed input: a ``None``,
+    a bare string, an int or a top-level list all return ``[]``.
+
+    **Why this is a mechanical all-keys scan and not a known-field lookup.**
+    Incident failure mode (1) was exactly a known-field/known-task
+    enumeration: a hand-written pass over the citation-bearing tasks found 3
+    of 8, and the 5 it missed included the pending/dispatchable ones — i.e.
+    the ones that actually mattered, because they were still going to be
+    dispatched against a dead pointer. The reflex fix ("just list the
+    citation-bearing keys") is worse than it looks here: the known citation
+    key names from that incident (``mem0_canonical_entry``,
+    ``mem0_cluster_entries``, ``x_memory_write_caution``) are *reify-project*
+    task-DB keys with ZERO occurrences in this repo, so an allowlist built
+    from them would be empty-by-construction and would silently pass every
+    delete. Metadata is ``extra='allow'`` (``shared/task_metadata.py:474``)
+    with a wide-open Tier-C ``x_`` namespace, so the set of keys that may
+    carry a citation is not knowable in advance. Scan everything instead.
+
+    ``memory_id`` is matched in full. A truncated 8-char prefix therefore
+    matches nothing, which is deliberate: two distinct UUIDs can share a
+    prefix (the hazard ``prompts/stage1.py:99-113`` warns about), and a
+    prefix match would repoint an unrelated entry.
+    """
+    if not memory_id or not isinstance(memory_id, str):
+        return []
+    if not isinstance(metadata, dict):
+        # A non-dict blob carries no addressable top-level keys. Returning []
+        # (rather than raising) keeps the scan callable on whatever the task
+        # backend hands back, including a missing/NULL metadata column.
+        return []
+
+    paths: list[str] = []
+
+    def _walk(node: Any, path: str) -> None:
+        if isinstance(node, str):
+            if memory_id in node:
+                paths.append(path)
+            return
+        if isinstance(node, dict):
+            for key, value in node.items():
+                child = f'{path}.{key}' if path else str(key)
+                _walk(value, child)
+            return
+        if isinstance(node, (list, tuple)):
+            for index, value in enumerate(node):
+                _walk(value, f'{path}[{index}]')
+            return
+        # Any other scalar (int/float/bool/None) cannot contain a uuid.
+
+    _walk(metadata, '')
+    return paths
