@@ -965,3 +965,79 @@ class TestNoShippedScriptResolvesItsOwnDirectoryByForking:
             'the caller\'s CWD (README.md "Delta 7"):\n  '
             + '\n  '.join(offenders)
         )
+
+    #: The ONE fork allowed to remain, by EXACT spelling rather than by a loose
+    #: "mentions ``$0``" match — so a future ``$(basename "$0" .sh)`` or
+    #: ``$(dirname "$0")`` is caught rather than waved through.  It feeds no
+    #: path resolution: worst case under a hidden ``basename`` is a blank
+    #: program name in a ``Usage:`` line.
+    COSMETIC_PROGRAM_NAME = '$(basename "$0")'
+
+    #: Any fork that derives a path from a value, in either direction.
+    PATH_DERIVING_FORKS = ('$(basename ', '$(dirname ')
+
+    def test_only_cosmetic_program_name_forks_remain(self) -> None:
+        """The superset gate: no path-deriving fork survives, in EITHER direction.
+
+        The test above is scoped to ``$(dirname "${BASH_SOURCE`` /
+        ``$(dirname "$0"``.  That scope is exactly why nothing in this suite
+        flagged ``thin-warm-lane.sh``'s self-clobber guard — a ``basename``
+        fork on a VARIABLE is neither spelling — and why README "Delta 7" was
+        able to assert the residual forks were cosmetic when six were not.  A
+        gate that cannot see the class it is guarding is the defect; this is
+        the widening.  The narrower test above stays as-is: it remains the
+        specific, well-named self-directory gate, and it names the distinct
+        ``cd ""`` failure mode in its message.
+
+        MEASURED RED at this point in the sequence — exactly six offenders,
+        confirmed present on branch HEAD 27fbfb4ea5: ``warm-lane-gc.sh:452``
+        (``BASE_TARGET="$(dirname "$MOUNT")/base/target"``), ``gc.sh``
+        :531/:606/:632/:838 (``name="$(basename ...)"``), and
+        ``warm-lane-audit.sh:825``.  ``warm-lane-disk-guard.sh`` and
+        ``warm-lane-degenerate-ref-check.sh`` carry only the cosmetic spelling
+        and pass trivially.
+
+        What those six do TODAY under a hidden ``basename``, measured rather
+        than assumed, because it differs materially from the ``thin`` site and
+        from what the review finding expected: every one sits in an ASSIGNMENT,
+        where a 127 substitution PROPAGATES and ``set -e`` aborts.  With
+        ``basename`` shimmed to exit 127, ``warm-lane-gc.sh reclaim`` exits
+        **127** at the ``name=`` assignment BEFORE ``_matches_glob "$name"
+        "$PROTECT_GLOB"`` runs, and the protected ``_merge-x`` worktree
+        SURVIVES (control: ``skipping protected: _merge-x``, rc=0);
+        ``warm-lane-audit.sh`` exits **127** after its first info line,
+        emitting no report rows (control: the ``HEADROOM`` / ``PINNED`` rows).
+
+        So these six are loud-and-non-destructive today — but by the ACCIDENT
+        of their syntactic context, not by any guard.  ``[ "$(basename ...)" =
+        ... ]`` is the same missing binary in the other context and silently
+        deletes a pool's seed source.  Converting them removes the dependency
+        on that accident and makes Delta 7's cosmetic-only claim true by
+        construction instead of by caveat.
+
+        Comment lines are excluded exactly as above: ``lib_portable.sh``,
+        ``lib_lane_state.sh``, ``warm-lane-gc.sh`` and ``warm-lane-gc-sweep.sh``
+        all quote these spellings in header/usage prose.  That is
+        documentation, not a fork.
+        """
+        offenders = []
+        for path in sorted(WARM_LANE_SCRIPT_DIR.glob('*.sh')):
+            for lineno, line in enumerate(path.read_text().splitlines(), start=1):
+                if line.lstrip().startswith('#'):
+                    continue
+                # Strip the allowed spelling first, then look at what is LEFT —
+                # so a line carrying both an allowed and a disallowed fork is
+                # still reported.
+                residue = line.replace(self.COSMETIC_PROGRAM_NAME, '')
+                if any(fork in residue for fork in self.PATH_DERIVING_FORKS):
+                    offenders.append(f'{path.name}:{lineno}: {line.strip()}')
+
+        assert not offenders, (
+            'These shipped scripts still derive a path by forking `basename` '
+            'or `dirname`.  Only the cosmetic '
+            f'`{self.COSMETIC_PROGRAM_NAME}` may remain: an external binary '
+            'missing from PATH yields an EMPTY substitution, which aborts at '
+            '127 in an assignment but compares silently FALSE inside '
+            '`[ ... ]` (README.md "Delta 7"):\n  '
+            + '\n  '.join(offenders)
+        )
