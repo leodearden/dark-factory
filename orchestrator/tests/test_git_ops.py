@@ -11762,7 +11762,7 @@ class TestGetHeadTreeHash:
         assert after  # non-empty
 
     async def test_non_git_dir_returns_none(
-        self, git_ops: GitOps, git_repo: Path
+        self, git_ops: GitOps, git_repo: Path, monkeypatch
     ):
         """Fail-safe: a non-git directory yields None, never raises.
 
@@ -11781,6 +11781,20 @@ class TestGetHeadTreeHash:
         """
         not_a_repo = git_repo / 'not-a-repo'
         not_a_repo.mkdir()
+
+        # Cap git's upward walk at not_a_repo so the fail-soft contract holds by
+        # construction rather than by luck of directory layout.  ``_run`` spawns
+        # its child with ``{**os.environ, ...}``, so setenv is the right seam
+        # here (the git call is made by production code, not by a subprocess
+        # this test spawns).  Same pattern as test_warm_base_coherence.py:409,
+        # test_session_hooks.py:1491 and _orch_helpers.git_env_with_ceiling.
+        #
+        # NOTE: this pins the TEST's hermeticity ONLY.  Whether production
+        # get_head_tree_hash should itself refuse to fail-soft into an enclosing
+        # repo when handed a non-repo path is a separate production-behaviour
+        # question, with its own callers and blast radius, tracked as a
+        # follow-up — do not read this ceiling as a production guarantee.
+        monkeypatch.setenv('GIT_CEILING_DIRECTORIES', str(not_a_repo.resolve().parent))
 
         assert await git_ops.get_head_tree_hash(not_a_repo) is None
 
