@@ -34,6 +34,53 @@ CREATE TABLE IF NOT EXISTS write_ops (
 CREATE INDEX IF NOT EXISTS idx_wo_causation ON write_ops(causation_id);
 CREATE INDEX IF NOT EXISTS idx_wo_project_time ON write_ops(project_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_wo_operation ON write_ops(operation);
+-- idx_wo_created (task 3304): the dashboard filters a BARE `WHERE created_at >= ?`
+-- in get_memory_timeseries / get_operations_breakdown / get_agent_breakdown
+-- (dashboard/src/dashboard/data/write_journal.py — cited by function name, not
+-- line number, so the reference survives edits to that file). Every other
+-- write_ops index has created_at in SECOND position, so none of them can
+-- range-seek that predicate — the queries full-scanned all 16.6M rows.
+-- Lives here rather than in _migrate() because initialize() runs
+-- executescript(SCHEMA_SQL) unconditionally on every start and the DDL is
+-- IF NOT EXISTS: this block alone builds the index once on an existing DB and is
+-- free thereafter. _migrate() is for ALTER TABLE column additions plus indexes
+-- that depend on those new columns; duplicating the DDL there would be lock-step
+-- duplication. Same shape as idx_bo_created on backend_ops below.
+--
+-- One-time build cost, measured 2026-07-31 on a page-for-page copy of the live
+-- journal (16,635,866 rows / 7.07 GB): 47.1 s wall, +696,004,608 bytes on disk
+-- (+9.9%, 7.069 -> 7.765 GB).
+--
+-- DEPLOYMENT — that 47.1 s is NOT 73 s of headroom under the ~120 s watchdog
+-- grace; the grace covers the WHOLE start-to-listening path, not just this DDL.
+-- initialize() is awaited at server/main.py:545, well before uvicorn accepts
+-- traffic, and the baseline it adds to (FalkorDB + Qdrant cold-start handshake
+-- plus event-buffer replay) "routinely runs 30-60s" per
+-- scripts/fused-memory.service.template. So the first start after this lands is
+-- ~77-107 s against STARTUP_GRACE_SECS = 120 in scripts/orchestrator-watchdog.py
+-- — roughly 13-43 s of real margin. Blow it and fused_memory_liveness_pass()
+-- sees port 8002 down past the grace and issues stop->start, SIGTERMing the
+-- in-progress CREATE INDEX; SQLite rolls the build back and the next start pays
+-- the full 47 s again — a restart loop that never converges, on the one restart
+-- that is supposed to deliver the index. The same restart can also blow the
+-- orchestrator's FM_RESTART_RETRY_WINDOW_SECS (120 s, sized against a "~15s
+-- observed fm start") and any deterministic deploy hook left at
+-- DeterministicRunner's default timeout_secs = 60.
+-- PREFERRED, therefore: build it out-of-band with fused-memory STOPPED, before
+-- the deploy restart --
+--   sqlite3 write_journal.db 'CREATE INDEX IF NOT EXISTS idx_wo_created ON write_ops(created_at);'
+-- -- after which initialize() finds it present and IF NOT EXISTS costs nothing.
+-- The alternative is to widen STARTUP_GRACE_SECS (and the deploy hook's
+-- timeout_secs) for that one restart. Either way, NEVER build it against a
+-- SERVING instance: busy_timeout is 5000 ms and log_write_op swallows its
+-- errors, so a multi-minute write-lock hold silently drops journal rows.
+--
+-- Steady state: created_at is monotonically increasing, so every insert is a
+-- right-most B-tree append — write amplification on the hot log_write_op path is
+-- negligible. The +9.9% is permanent and grows with the table, though: write_ops
+-- has no prune path (unlike prune_mem0_intents / prune_idempotent_ops), which is
+-- what sibling task ζ (journal growth alarm) exists to watch.
+CREATE INDEX IF NOT EXISTS idx_wo_created ON write_ops(created_at);
 
 CREATE TABLE IF NOT EXISTS backend_ops (
     id TEXT PRIMARY KEY,
