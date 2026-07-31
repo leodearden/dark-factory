@@ -44,6 +44,7 @@ from orchestrator.verify_categories import (
 )
 from orchestrator.verify_classify import (
     classify_failure,
+    is_external_kill_rc,
     is_interpreter_missing_workspace_packages,
     unresolved_top_level_modules,
 )
@@ -1477,10 +1478,42 @@ def _tool_for_cmd(cmd: str | None) -> ToolKind:
     return parse_config_command(cmd).tool
 
 
+# task 3173: the substring that marks a summary fragment as a signal-kill
+# note.  Shared by `_killed_leg_note` (producer) and `_aggregate_results`
+# (consumer), so multi-module aggregation — which rebuilds the summary by
+# substring-scanning child summaries for 'tests failed'/'lint issues'/
+# 'type errors' — cannot silently drop the one fact that says the run means
+# nothing.  Any new consumer should match on this constant, never a literal.
+SIGNAL_KILL_SUMMARY_MARKER = 'killed by signal'
+
+
+def _killed_leg_note(label: str, rc: int, duration: float | None) -> str:
+    """Describe a leg that was terminated by an external signal.
+
+    Every clause is a MEASURED fact: which leg, which signal delivered it,
+    how long the process survived, and — the point of the whole exercise —
+    that no verdict exists.  ``duration`` is ``None`` (not ``0.0``) when the
+    caller has no timing in scope, in which case the "after N.NNs" clause is
+    omitted rather than fabricating "after 0.00s".
+
+    ``rc`` is asyncio's returncode, i.e. the NEGATIVE signal number, so the
+    signal is ``-rc``.
+    """
+    after = f' after {duration:.2f}s' if duration is not None else ''
+    return (
+        f'{label} leg {SIGNAL_KILL_SUMMARY_MARKER} {-rc}{after}; '
+        f'no diagnostics produced; verdict indeterminate'
+    )
+
+
 def _summarize_checks(
     test_rc: int, test_out: str, test_timed_out: bool, test_cmd: str | None,
     lint_rc: int, lint_out: str, lint_timed_out: bool, lint_cmd: str | None,
     type_rc: int, type_out: str, type_timed_out: bool, type_cmd: str | None,
+    *,
+    test_duration: float | None = None,
+    lint_duration: float | None = None,
+    type_duration: float | None = None,
 ) -> tuple[bool, str, str, str]:
     """Classify the three check results into (passed, category, cause_hint, summary).
 
@@ -1503,6 +1536,24 @@ def _summarize_checks(
     knows whether this is the first pass (loop-bounded by ``max_retries``) or
     the env-recovery retry, and overrides the returned ``summary`` with
     timeout-specific text when its own ``timed_out`` is True.
+
+    CONTRACT (task 3173): **the summary may never assert a property the gate
+    did not measure.**  ``parts`` used to be derived purely from ``rc != 0``,
+    so a leg SIGKILLed before it could emit a single diagnostic was reported
+    as "lint issues" — and ``merge_queue`` surfaced that verbatim as
+    ``Post-merge verification failed: Failures: lint issues``, blaming the
+    branch for a process it never got to influence (the measured incident;
+    same defect shape as task 3110).  A leg whose rc is an EXTERNAL
+    termination signal now contributes ``_killed_leg_note`` instead.
+    Non-killed legs keep byte-identical wording, and the
+    ``f'Failures: {...}'`` envelope is preserved so every existing consumer
+    that prefix- or substring-matches on it stays green.
+
+    ``test_duration``/``lint_duration``/``type_duration`` are keyword-only and
+    default to ``None``, so the twelve positional parameters are untouched and
+    every pre-existing caller is byte-identical (see the design decision on
+    not refactoring to take ``CheckRun`` objects).  Both production call sites
+    pass ``attempt.<leg>.duration_secs``, which they already hold.
     """
     passed = test_rc == 0 and lint_rc == 0 and type_rc == 0
     if passed:
@@ -1524,12 +1575,21 @@ def _summarize_checks(
     category = _worst_category(per_check_categories) if per_check_categories else 'unknown_test_failure'
 
     parts = []
-    if test_rc != 0:
-        parts.append('tests failed')
-    if lint_rc != 0:
-        parts.append('lint issues')
-    if type_rc != 0:
-        parts.append('type errors')
+    for rc, label, tool_verdict, duration in (
+        (test_rc, 'test', 'tests failed', test_duration),
+        (lint_rc, 'lint', 'lint issues', lint_duration),
+        (type_rc, 'type', 'type errors', type_duration),
+    ):
+        if rc == 0:
+            continue
+        # An externally killed leg produced no verdict, so it gets a note
+        # saying exactly that instead of a fabricated tool verdict. Crash
+        # signals (SIGSEGV/SIGABRT/...) are NOT external kills — they are
+        # genuine faults of the code under test and keep today's wording.
+        if is_external_kill_rc(rc):
+            parts.append(_killed_leg_note(label, rc, duration))
+        else:
+            parts.append(tool_verdict)
     summary = f'Failures: {", ".join(parts)}'
     return passed, category, cause_hint, summary
 
@@ -5040,6 +5100,9 @@ async def run_verification(
         attempt.test.rc, attempt.test.output, attempt.test.timed_out, attempt.test.cmd,
         attempt.lint.rc, attempt.lint.output, attempt.lint.timed_out, attempt.lint.cmd,
         attempt.type.rc, attempt.type.output, attempt.type.timed_out, attempt.type.cmd,
+        test_duration=attempt.test.duration_secs,
+        lint_duration=attempt.lint.duration_secs,
+        type_duration=attempt.type.duration_secs,
     )
     if timed_out:
         summary = f'Verification timed out after {max_retries} retries' if max_retries > 0 else 'Verification timed out'
@@ -5129,6 +5192,9 @@ async def run_verification(
             attempt.test.rc, attempt.test.output, attempt.test.timed_out, attempt.test.cmd,
             attempt.lint.rc, attempt.lint.output, attempt.lint.timed_out, attempt.lint.cmd,
             attempt.type.rc, attempt.type.output, attempt.type.timed_out, attempt.type.cmd,
+            test_duration=attempt.test.duration_secs,
+            lint_duration=attempt.lint.duration_secs,
+            type_duration=attempt.type.duration_secs,
         )
         if timed_out:
             # Distinct wording from the first-pass timeout summary: this
