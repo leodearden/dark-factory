@@ -1,0 +1,143 @@
+"""Architect/SIMPLE_TASK prompt enumeration of the α/β exit surfaces (task 3034).
+
+PRD: ``plans/architect-already-complete-exits.md`` §ζ ("Update the architect
+prompt/skill exit enumeration to teach: use ``mark_step_committed`` for
+already-committed-green steps (skip implement); use ``report_ready_to_merge``
+for the merge-landing desync (not ``report_unactionable``)").
+
+α (task 3030) landed ``mark_step_committed`` end-to-end, INCLUDING the
+``_PLAN_CREATOR_TOOLS`` grant (see
+``test_architect_all_committed_plan.py::TestArchitectCanReachMarkStepCommitted``).
+β (task 3031) landed ``report_ready_to_merge`` end-to-end EXCEPT the allowlist
+grant — the tool existed on the plan-tools MCP server but no role could reach
+it. ζ's job is twofold:
+
+  1. Grant ``mcp__plan-tools__report_ready_to_merge`` to ARCHITECT and
+     SIMPLE_TASK via ``_PLAN_CREATOR_TOOLS`` (roles.py) — otherwise the prose
+     below would teach an exit the agent cannot structurally call.
+  2. Teach BOTH new surfaces in the prompt bodies that enumerate exits:
+     ``ARCHITECT.system_prompt`` (rule-2 exit list + the pre-satisfy note),
+     ``SIMPLE_TASK.system_prompt`` (the "## Rejection artifacts" list), and
+     the two ``BriefingAssembler`` dispatch-time prompts that carry their own
+     rejection-exit enumerations (``build_plan_completion_prompt``,
+     ``build_simple_task_prompt``).
+
+Covered surfaces:
+
+  - ``ARCHITECT.allowed_tools`` / ``SIMPLE_TASK.allowed_tools`` grant
+    ``mcp__plan-tools__report_ready_to_merge`` (and IMPLEMENTER/DEBUGGER
+    deliberately do NOT) — roles.py
+  - The granted name resolves to an actually-registered plan-tools MCP tool
+    (the dead-grant check) — mcp/plan_tools.py
+  - ``ARCHITECT.system_prompt`` enumerates both ``report_ready_to_merge`` and
+    ``mark_step_committed`` with a discriminating when-to-use keyword each —
+    roles.py
+  - ``SIMPLE_TASK.system_prompt`` enumerates both — roles.py
+  - ``BriefingAssembler.build_plan_completion_prompt`` and
+    ``build_simple_task_prompt`` enumerate ``report_ready_to_merge`` (and the
+    former also teaches ``mark_step_committed`` for the partial-plan-resume
+    case) — briefing.py
+
+Assertions here are deliberately COMPACT — tool-name presence plus one
+discriminating keyword per surface, not sentence-wording pins — mirroring the
+existing prompt-anchor convention (``test_roles_staging_command.py``,
+``test_roles_background_warning.py``) and this task's own design decision to
+avoid freezing prose a later prompt-tuning pass would need to touch anyway.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from orchestrator.artifacts import TaskArtifacts
+
+# ---------------------------------------------------------------------------
+# step-1 RED: allowlist reachability for report_ready_to_merge
+# ---------------------------------------------------------------------------
+#
+# allowed_tools is the ENFORCED tool surface — agents/invoke.py:979-985 builds
+# the backend `--tools` allowlist from it (and loudly drops specs it cannot
+# express), so a tool absent from allowed_tools is structurally unreachable no
+# matter what the prompt says. See the identical rationale in
+# test_architect_all_committed_plan.py::TestArchitectCanReachMarkStepCommitted.
+
+_REPORT_READY_TO_MERGE = 'mcp__plan-tools__report_ready_to_merge'
+
+
+class TestArchitectCanReachReportReadyToMerge:
+    def test_architect_is_granted_report_ready_to_merge(self):
+        from orchestrator.agents.roles import ARCHITECT  # noqa: PLC0415
+
+        assert _REPORT_READY_TO_MERGE in ARCHITECT.allowed_tools, (
+            f'ARCHITECT.allowed_tools omits {_REPORT_READY_TO_MERGE!r} — the '
+            f'backend allowlist built at agents/invoke.py:979-985 would strip '
+            f'the call, making the ζ signal structurally unreachable. Got: '
+            f'{ARCHITECT.allowed_tools!r}'
+        )
+
+    def test_simple_task_is_granted_report_ready_to_merge(self):
+        """workflow.py:4465 dispatches the ready-to-merge artifact on the
+        SIMPLE_TASK path too (the same handler as the architect path), so a
+        simple-task agent hitting a merge-landing desync needs the same
+        reachable exit."""
+        from orchestrator.agents.roles import SIMPLE_TASK  # noqa: PLC0415
+
+        assert _REPORT_READY_TO_MERGE in SIMPLE_TASK.allowed_tools, (
+            f'SIMPLE_TASK.allowed_tools omits {_REPORT_READY_TO_MERGE!r} — '
+            f'workflow.py:4465 dispatches .task/ready_to_merge.json on this '
+            f'path too, so the tool must be reachable here as well. Got: '
+            f'{SIMPLE_TASK.allowed_tools!r}'
+        )
+
+    def test_implementer_is_not_granted_report_ready_to_merge(self):
+        """Reporting merge-readiness is an AUTHORING-time authority, not an
+        execution one — same reasoning as mark_step_committed's role split."""
+        from orchestrator.agents.roles import IMPLEMENTER  # noqa: PLC0415
+
+        assert _REPORT_READY_TO_MERGE not in IMPLEMENTER.allowed_tools
+
+    def test_debugger_is_not_granted_report_ready_to_merge(self):
+        from orchestrator.agents.roles import DEBUGGER  # noqa: PLC0415
+
+        assert _REPORT_READY_TO_MERGE not in DEBUGGER.allowed_tools
+
+    def test_architect_declares_plan_tools_family(self):
+        """Keeps the inverse-capability invariant satisfied by the grant.
+
+        test_agent_capability_wiring.py::TestInverseCapabilityInvariant
+        asserts every role allowing an ``mcp__plan-tools__`` prefix declares
+        the ``plan_tools`` family; asserted here too so a grant added without
+        the family declaration fails in this suite as well.
+        """
+        from orchestrator.agents.roles import ARCHITECT  # noqa: PLC0415
+
+        assert 'plan_tools' in ARCHITECT.mcp_families
+
+    def test_simple_task_declares_plan_tools_family(self):
+        from orchestrator.agents.roles import SIMPLE_TASK  # noqa: PLC0415
+
+        assert 'plan_tools' in SIMPLE_TASK.mcp_families
+
+
+@pytest.mark.asyncio
+class TestGrantedReadyToMergeToolExists:
+    async def test_granted_name_resolves_to_a_registered_tool(self, tmp_path: Path):
+        """The grant must never name a tool the server does not register.
+
+        Mirrors test_architect_all_committed_plan.py::TestGrantedToolActuallyExists
+        — an allowlist entry for a non-existent tool is a silent dead grant.
+        """
+        from orchestrator.mcp import plan_tools  # noqa: PLC0415
+
+        artifacts = TaskArtifacts(tmp_path)
+        artifacts.init('42', 'X', 'desc', base_commit='base')
+        server = plan_tools.create_server(artifacts)
+
+        tool = await server.get_tool('report_ready_to_merge')
+
+        assert tool is not None
+        # The granted allowlist name is the mcp__<server>__<tool> spelling of
+        # exactly this registered tool.
+        assert _REPORT_READY_TO_MERGE.endswith('__report_ready_to_merge')
