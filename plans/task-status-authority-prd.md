@@ -265,6 +265,7 @@ workflow stamp all route through it / the status. `resume` on an infra-held task
 One durable per-`task_id` counter file, fsync-incremented under `escalation_id_lock`, is the sole source
 of the next sequence in `make_id`; the archive-scan + `_archive_max_seq_cache` (task 1879) is retired.
 `get_by_task` correctness follows from the counter.
+*Amended 2026-07-31 for the lost-counter case — see "Amendment (2026-07-31)" below.*
 
 ### C10 — datetime convention (escalation, 10.5)
 Code stays on `datetime.UTC` (already true). Add a one-line convention note (escalation package
@@ -294,6 +295,58 @@ Each row faces **both** sides of a seam; postconditions assert through product r
 | C3 | header levels narrow but cannot widen | identity ceiling `{0,1}` + header `0,1,2` | still denied L2 |
 | C4 | `promote_to_l2` gated | identity ∉ PROMOTE_ALLOWED | `level_forbidden`; header-less caller → allowed |
 | D1 | escalation ID uniqueness under the counter | rapid submits + archive present | ids strictly increasing, no collision, no directory rescan dependence |
+
+*D1 amended 2026-07-31 — see "Amendment (2026-07-31)" below.*
+
+### Amendment (2026-07-31) — C9's counter is still sole-source; a bounded repair path is added (task 3238)
+
+Recorded because C9 as originally written, read literally, forbids the fix for a defect it created.
+Do not re-derive the tension: the contract's *substance* is unchanged and task 1879's retired
+per-mint scan stays retired.
+
+**The defect.** C9 gave `make_id` no fallback at all, so a counter file that was *lost* (aggressive
+cleanup, fresh checkout, disk restore, accidental `rm` of the non-`.json` sidecar) was
+indistinguishable from a brand-new `task_id` and silently re-minted `esc-<task>-1`, `-2`, … The
+root-only `_root_has_existing_escalations` diagnostic could not see the real-world case — a
+`task_id` whose escalations were all resolved and therefore live only in `archive/YYYY-MM-DD/`.
+Because `EscalationQueue.get()` falls back to the archive, each re-minted id then resolved to a
+DIFFERENT, older, already-resolved record, corrupting escalation identity and audit provenance;
+a fresh `submit` could also shadow a prior record under the same id. Both existing contract tests
+seeded exactly that fixture (archive record, no counter) and asserted zero archive scans, so the
+gap was pinned as intended behaviour and was not observable.
+
+**The amendment.** The counter remains the SOLE source of the next sequence **in steady state**,
+and the task-1879 archive-scan + `_archive_max_seq_cache` stays retired. Task 3238 adds
+`EscalationQueue._recover_seq_from_disk(task_id)` — a one-shot bounded root+archive scan returning
+`max(observed sequence) + 1` — which fires ONLY when the counter is **absent** or **unparseable**.
+Its result is immediately made durable by `_write_seq_counter` inside the same
+`escalation_id_lock`, so the scan is **amortized at most once per `task_id` per counter lifetime**
+and never gates a steady-state mint. A counter present and parseable is still taken verbatim with
+zero disk scans of any kind.
+
+Three sub-decisions, recorded so they are not relitigated:
+
+1. **`OSError` is NOT reconciled** — it still propagates. A present-but-momentarily-unreadable
+   counter (transient I/O, EINTR, fd exhaustion, permission flap) is not evidence of loss, and
+   reconciling there would derive a maximum from SUBMITTED records only, silently rewinding the
+   counter below any id minted but never submitted.
+2. **Recovery is prefix-anchored** on the known `task_id` (strip the literal `esc-{task_id}-`,
+   require an integer remainder) — NOT the retired parse-after-the-last-hyphen derivation, which
+   would resurrect the hyphenated-`task_id` bug (recovering `1-2` would match `esc-1-2-3-9.json`,
+   a different `task_id`).
+3. **The repair logs an ERROR, it does not file an escalation** — `queue.py` IS the escalation
+   store, so self-filing on a degraded-counter path risks recursion through the very code that
+   just failed. The absent-counter ERROR is conditional on `recovered > 0`, keeping the common
+   brand-new-`task_id` path silent.
+
+**D1 restated.** "Ids strictly increasing, no collision, no directory rescan dependence *while the
+counter is intact*." Added lost-counter obligations: no minted id resolves to a pre-existing
+record (root or archive), and the recovery scan is one-shot. Both existing archive-scan contract
+tests — `test_make_id_does_not_scan_archive` and D1's
+`test_make_id_does_not_scan_archive_even_when_archive_present` — now seed a counter file so their
+fixtures express the real steady state; their anti-regression value is unchanged (reintroducing a
+per-mint archive derivation still fails them). The lost- and corrupt-counter paths are covered by
+four new tests in `escalation/tests/test_queue.py::TestMakeIdCounter`.
 
 ## Cross-PRD relationship (G4)
 
