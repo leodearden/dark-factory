@@ -1264,6 +1264,62 @@ def _with_pytest_timeout_str(cmd: str | None, secs: int) -> str | None:
     return render(rewritten)
 
 
+def _with_junitxml_str(cmd: str | None, junit_path: str) -> str | None:
+    """Inject ``--junitxml <junit_path>`` into a structured ``pytest`` command, via VerifyCmd.
+
+    Thin string-level wrapper around ``parse_config_command`` ->
+    ``with_junitxml`` -> ``render`` (mirrors ``_with_pytest_timeout_str``).
+    Returns *cmd* unchanged — BYTE-identically, via the ``is`` identity check,
+    since a from-scratch render is only argv-equivalent — when it is ``None``
+    or does not parse into a structured PYTEST command.
+
+    **Why this logs (task 3218).** The no-op is not always benign. The caller
+    only injects when ``role=='merge'`` and ``breadth=='full'``, i.e. exactly
+    when a junit report WAS expected: it drives
+    ``_extract_failing_test_ids_from_junit``, the α flake-confirmation gate
+    and the per-test timeout floor. Silently skipping it there degrades those
+    downstream capabilities with no record anywhere — the failure mode the
+    reverse-dependency widening already avoids by logging its own no-op
+    (see the ``logger.warning`` in ``reverse_dependent_test_targets``'s
+    caller). So a suppressed injection on a command that IS pytest is
+    reported at INFO, naming the path that will not be written.
+
+    The INFO is gated on ``parsed.tool is ToolKind.PYTEST`` deliberately: a
+    lint/type/OPAQUE command was never eligible to produce junit, and logging
+    those would fire on legs that were never going to collect a report,
+    training operators to ignore the record.
+
+    Siting the log HERE rather than in ``split_chain_tail`` covers every
+    cause of the no-op — a raw-retained ``&&``-chain, an OPAQUE command, a
+    non-pytest tool — rather than only the tail-preservation one. As of task
+    3218 step-2 the tail-preservation cause is no longer reachable through
+    the two scopers at all (``'pytest'`` is off ``_TAIL_PRESERVING_KEYWORDS``,
+    so a chained pytest slot now comes back structured); this remains as
+    defence in depth for a hand-written multi-clause ``test_command`` that
+    reaches the injection site directly.
+
+    *junit_path* should be absolute: the rendered command may run with a
+    shifted cwd (a structured command's own ``cd <cwd_rel> &&``), so a
+    relative value would land in the wrong directory.
+    """
+    if cmd is None:
+        return None
+    parsed = parse_config_command(cmd)
+    rewritten = with_junitxml(parsed, junit_path)
+    if rewritten is parsed:
+        if parsed.tool is ToolKind.PYTEST:
+            logger.info(
+                'junitxml injection suppressed: %s is pytest but not structured '
+                '(raw-retained &&-chain or unparseable), so no junit report will be '
+                'collected at %s for this run — junit-driven failing-test extraction, '
+                'flake confirmation and the per-test timeout floor are unavailable',
+                cmd,
+                junit_path,
+            )
+        return cmd
+    return render(rewritten)
+
+
 def _tool_for_cmd(cmd: str | None) -> ToolKind:
     """Resolve *cmd*'s ``ToolKind`` for ``classify_failure`` dispatch (task δ).
 
@@ -4209,17 +4265,19 @@ async def run_verification(
         config_cmd = cmd
         # junitxml injection (task μ, verify-scope-inversion-prd.md): only
         # the 'test' leg, only when junit_path was computed above (role
-        # =='merge' and breadth=='full'). Identity-check mirrors the
-        # apply_pytest_numprocesses guard further below — with_junitxml
-        # no-ops for OPAQUE/raw-retained/non-pytest commands, so skip the
-        # parse->render round-trip when nothing was actually touched. MUST
-        # run before the cpu-governance wrap immediately below: once
-        # governed, cmd is an opaque outer `<exec> -- /bin/bash -c '...'`
-        # string that parse_config_command can no longer see as pytest.
+        # =='merge' and breadth=='full'). _with_junitxml_str keeps the
+        # identity-check semantics this site always had — with_junitxml
+        # no-ops for OPAQUE/raw-retained/non-pytest commands, so the
+        # parse->render round-trip is skipped and a no-op stays
+        # byte-identical — and additionally reports a suppressed injection
+        # on a pytest command at INFO (task 3218), since reaching here means
+        # a junit report was expected and will not be written. MUST run
+        # before the cpu-governance wrap immediately below: once governed,
+        # cmd is an opaque outer `<exec> -- /bin/bash -c '...'` string that
+        # parse_config_command can no longer see as pytest.
         if junit_path is not None and label == 'test':
-            _parsed_for_junit = parse_config_command(cmd)
-            _mutated_for_junit = with_junitxml(_parsed_for_junit, str(junit_path))
-            cmd = cmd if _mutated_for_junit is _parsed_for_junit else render(_mutated_for_junit)
+            cmd = _with_junitxml_str(cmd, str(junit_path))
+            assert cmd is not None  # None only when the input is None; guarded above
         # Wrap the command in cpu-governed-exec.sh when role=='merge' and
         # cpu_governance is enabled + exec resolves.  Fail-open: returns cmd
         # unchanged when governance is disabled or the path is non-executable,
