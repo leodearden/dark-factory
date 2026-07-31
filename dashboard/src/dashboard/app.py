@@ -390,7 +390,34 @@ async def health() -> dict:
 
 
 _THREAD_LIMIT = 50
-_DB_PROBE_TIMEOUT = 5.0
+# Per-DB probe deadline. Invariant (machine-checked by
+# test_healthz_budget_is_structurally_deliverable):
+#   _DB_PROBE_TIMEOUT * len(_healthz_db_targets(...)) <= _HEALTHZ_TOTAL_BUDGET
+#   0.9 * 3 = 2.7 <= 3.0, leaving 0.3s of slack so the total deadline is a
+#   real backstop for non-probe overhead rather than a bound that coincides
+#   exactly with the sum of the parts. Raising either constant requires
+#   raising the other.
+_DB_PROBE_TIMEOUT = 0.9
+# Whole-handler deadline, strictly below the tightest real caller
+# (`curl -sf --max-time 5` in dark-factory-dashboard-watchdog.service:6),
+# leaving ~2s of headroom for HTTP connect/serialisation so the degraded
+# verdict is actually deliverable to that caller instead of arriving behind it
+# (measured before this budget existed: 503 delivered at 50.6s).
+_HEALTHZ_TOTAL_BUDGET = 3.0
+
+
+def _healthz_db_targets(config: DashboardConfig) -> list[tuple[str, Path]]:
+    """The (name, path) pairs /healthz probes.
+
+    Kept introspectable (rather than inlined in the handler) so the budget
+    invariant above can be checked against however many DBs are actually
+    probed instead of a hard-coded count.
+    """
+    return [
+        ('reconciliation', config.reconciliation_db),
+        ('write_journal', config.write_journal_db),
+        ('runs', config.runs_db),
+    ]
 
 
 @app.get('/healthz')
@@ -409,11 +436,7 @@ async def healthz(request: Request) -> JSONResponse:
     config: DashboardConfig = request.app.state.config
     checks['connections'] = {'open': pool.open_count}
 
-    for name, db_path in [
-        ('reconciliation', config.reconciliation_db),
-        ('write_journal', config.write_journal_db),
-        ('runs', config.runs_db),
-    ]:
+    for name, db_path in _healthz_db_targets(config):
         conn = await pool.get(db_path)
         if conn is None:
             checks[f'db_{name}'] = 'unavailable'
