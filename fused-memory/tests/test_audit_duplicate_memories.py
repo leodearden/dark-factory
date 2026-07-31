@@ -4105,3 +4105,103 @@ class TestFindLivenessSnapshotRecurrencesDisclosure:
         )
 
         assert set(disclosure.values()) == {0}
+
+
+# The plan keys that existed before task 3098. Pinned so an additive change
+# stays additive: no pre-existing key may be dropped or renamed.
+_PRE_3098_PLAN_KEYS = frozenset({
+    'clusters_total', 'near_duplicate_groups', 'delete_candidates',
+    'threshold', 'ann_threshold', 'ann_disclosure',
+    'topic_carveout_clusters', 'topic_carveout_groups',
+    'apply_delete_candidates', 'apply_withheld_clusters',
+    'apply_withheld_groups', 'path_verdicts',
+})
+
+_LIVENESS_PLAN_KEYS = frozenset({
+    'liveness_snapshot_recurrence_groups',
+    'liveness_snapshot_recurrence_clusters',
+    'liveness_snapshot_disclosure',
+})
+
+
+class TestBuildSweepPlanLivenessRecurrences:
+    """The third class reaches the plan -- and never reaches a delete."""
+
+    def test_the_two_real_groups_are_reported(self):
+        plan = build_sweep_plan(_liveness_corpus())
+
+        assert plan['liveness_snapshot_recurrence_clusters'] == 2
+        assert [(g['subject_task_id'], g['member_ids'])
+                for g in plan['liveness_snapshot_recurrence_groups']] == [
+            ('94', ['1eef7df7', '6b245659']),
+            ('96', ['08aa0017', '1eef7df7']),
+        ]
+        assert plan['liveness_snapshot_disclosure'] == dict.fromkeys(
+            _LIVENESS_DISCLOSURE_KEYS, 0,
+        )
+
+    def test_no_liveness_member_is_ever_a_delete_candidate(self):
+        """Task 3098 authorizes DETECTION only.
+
+        Disposition of these specific solar_challenge entries is a separate
+        human-gated decision on solar_challenge task 99. If these groups fed
+        `delete_candidates`, a routine --apply run would delete them and
+        silently override that gate.
+        """
+        plan = build_sweep_plan(_liveness_corpus())
+
+        for member_id in ('6b245659', '08aa0017', '1eef7df7', '68dd5f93'):
+            assert member_id not in plan['delete_candidates']
+            assert member_id not in plan['apply_delete_candidates']
+        assert plan['delete_candidates'] == []
+        assert plan['apply_delete_candidates'] == []
+
+    def test_the_apply_gate_is_never_handed_a_liveness_group(self, monkeypatch):
+        """Report-only by CONSTRUCTION, not by a downstream filter.
+
+        A filter can be dropped by a later refactor; never handing the gate
+        these groups in the first place cannot be.
+        """
+        seen: list[list[dict]] = []
+        real = _mod.restrict_delete_candidates_for_apply
+
+        def _spy(groups):
+            seen.append(groups)
+            return real(groups)
+
+        monkeypatch.setattr(_mod, 'restrict_delete_candidates_for_apply', _spy)
+        build_sweep_plan(_liveness_corpus())
+
+        assert seen, 'the apply gate still runs'
+        assert all(
+            'core_fact' not in g and 'subject_task_id' not in g
+            for handed in seen for g in handed
+        )
+
+    def test_pre_existing_keys_are_untouched_and_new_keys_are_never_absent(self):
+        """A corpus with no liveness snapshots reports empty, not missing."""
+        plan = build_sweep_plan(
+            [
+                _memory('m1', _VENV_GOTCHA_A, created_at='2026-07-13T00:00:00+00:00'),
+                _memory('m2', _VENV_GOTCHA_B, created_at='2026-07-12T00:00:00+00:00'),
+                _memory('m4', _DISTRACTOR),
+            ],
+            threshold=_THRESHOLD,
+        )
+
+        assert set(plan) == _PRE_3098_PLAN_KEYS | _LIVENESS_PLAN_KEYS
+        assert plan['clusters_total'] == 1, 'the lexical path is unaffected'
+        assert plan['delete_candidates'] == (
+            plan['near_duplicate_groups'][0]['delete_candidate_ids']
+        )
+        assert plan['liveness_snapshot_recurrence_groups'] == []
+        assert plan['liveness_snapshot_recurrence_clusters'] == 0
+        assert plan['liveness_snapshot_disclosure'] == dict.fromkeys(
+            _LIVENESS_DISCLOSURE_KEYS, 0,
+        )
+
+    def test_plan_is_still_json_serializable(self):
+        """stdout is task 3136's report contract."""
+        assert isinstance(
+            json.dumps(build_sweep_plan(_liveness_corpus()), default=str), str,
+        )
