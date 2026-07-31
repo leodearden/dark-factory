@@ -8808,6 +8808,53 @@ class TestGetMem0DeletionTombstone:
         assert 'mem-victim' in caplog.text
 
     @pytest.mark.asyncio
+    async def test_raising_store_returns_none_and_warns(self, service, caplog):
+        """A raising ledger read → None plus one WARNING with exc_info.
+
+        The docstring promises "fail-safe throughout", so the guard belongs
+        HERE and not only at the MCP boundary — otherwise any future
+        in-process caller without its own try/except eats the raise. And it
+        must be LOUD: a broken tombstone store returning a bare None is
+        indistinguishable from "never deliberately deleted", which is exactly
+        the undiscoverability class task 3041 was filed to fix (reviewer
+        finding robustness, amendment pass).
+        """
+        service.recon_ledger = MagicMock()
+        service.recon_ledger.get_mem0_tombstone = AsyncMock(
+            side_effect=RuntimeError('database is locked')
+        )
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            result = await service.get_mem0_deletion_tombstone('dark_factory', 'mem-victim')
+
+        assert result is None
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1, f'expected exactly one WARNING, got {warnings!r}'
+        assert 'mem-victim' in caplog.text
+        assert warnings[0].exc_info is not None, (
+            'the WARNING must carry exc_info — the fault type is the diagnostic'
+        )
+
+    @pytest.mark.asyncio
+    async def test_ordinary_absence_is_silent(self, service, caplog):
+        """No ledger and no row are ordinary STATES, not faults — neither logs.
+
+        The other half of the loud-over-silent split: if every never-deleted
+        lookup warned, the fault WARNING above would drown in noise and stop
+        meaning "the tombstone store is broken".
+        """
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            assert await service.get_mem0_deletion_tombstone('dark_factory', 'm') is None
+
+            service.recon_ledger = MagicMock()
+            service.recon_ledger.get_mem0_tombstone = AsyncMock(return_value=None)
+            assert await service.get_mem0_deletion_tombstone('dark_factory', 'm') is None
+
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
+            f'ordinary absence must be silent: {caplog.text!r}'
+        )
+
+    @pytest.mark.asyncio
     async def test_non_object_payload_returns_none_and_warns(self, service, caplog):
         """Valid JSON that isn't an object (e.g. a list) is treated as malformed."""
         service.recon_ledger = MagicMock()

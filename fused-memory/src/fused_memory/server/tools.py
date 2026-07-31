@@ -1885,6 +1885,21 @@ def create_mcp_server(
                     project_id, memory_id
                 )
             except Exception:
+                # get_mem0_deletion_tombstone is itself fail-safe for every
+                # ORDINARY case (no ledger, no row, malformed payload), so
+                # anything reaching this belt-and-braces handler is an
+                # unexpected fault. Degrading it silently would leave the
+                # auditor unable to tell "no tombstone exists" from "the
+                # tombstone store is broken" — the same undiscoverability
+                # class task 3041 exists to fix. Log loudly, answer correctly.
+                logger.warning(
+                    'get_memory_by_id: tombstone lookup FAILED for memory_id=%s '
+                    'in project=%s; returning the (correct) found:False without one',
+                    memory_id,
+                    project_id,
+                    exc_info=True,
+                    extra={'project_id': project_id, 'memory_id': memory_id},
+                )
                 tombstone = None
             if tombstone:
                 miss['tombstone'] = tombstone

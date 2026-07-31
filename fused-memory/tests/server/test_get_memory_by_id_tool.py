@@ -15,6 +15,7 @@ Mirrors tests/server/test_get_memories_by_metadata_tool.py.
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -259,13 +260,21 @@ class TestGetMemoryByIdTool:
         mock_service.get_mem0_deletion_tombstone.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_tombstone_lookup_failure_still_returns_clean_found_false(self):
+    async def test_tombstone_lookup_failure_still_returns_clean_found_false(self, caplog):
         """A raising tombstone lookup must NOT convert a correct miss into an error.
 
         The tombstone is diagnostic garnish on an answer that is already
         right. Letting its failure surface as {'error'} would break the
         load-bearing miss-vs-backend-failure distinction this tool exists for
         — trading a real signal for a decorative one.
+
+        It must still be LOUD in the log (task 3041 amendment pass).
+        get_mem0_deletion_tombstone is internally fail-safe for every ordinary
+        case (no ledger, no row, malformed payload), so anything that reaches
+        this handler is an unexpected fault — a silent degrade would leave the
+        auditor unable to tell "no tombstone exists" from "the tombstone store
+        is broken", which is the very undiscoverability this task exists to
+        fix (loud-over-silent / no-silent-fail-soft).
         """
         mock_service = AsyncMock()
         mock_service.get_memory_by_id = AsyncMock(return_value=None)
@@ -274,10 +283,11 @@ class TestGetMemoryByIdTool:
         )
         server = create_mcp_server(mock_service)
 
-        result = await server._tool_manager.call_tool(
-            'get_memory_by_id',
-            {'project_id': _PROJECT_ID, 'memory_id': _MEMORY_ID},
-        )
+        with caplog.at_level(logging.WARNING, logger='fused_memory.server.tools'):
+            result = await server._tool_manager.call_tool(
+                'get_memory_by_id',
+                {'project_id': _PROJECT_ID, 'memory_id': _MEMORY_ID},
+            )
 
         assert result == {
             'found': False,
@@ -287,6 +297,47 @@ class TestGetMemoryByIdTool:
         assert 'error' not in result, (
             f'A tombstone failure must not become a tool error: {result!r}'
         )
+
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and r.name == 'fused_memory.server.tools'
+        ]
+        assert len(warnings) == 1, (
+            f'a broken tombstone store must log exactly one WARNING, got {warnings!r}'
+        )
+        assert _MEMORY_ID in warnings[0].getMessage()
+        assert warnings[0].exc_info is not None, (
+            'the WARNING must carry exc_info — the fault type is the diagnostic'
+        )
+
+    @pytest.mark.asyncio
+    async def test_absent_tombstone_is_silent(self, caplog):
+        """The ORDINARY miss (no tombstone) must not log — only faults are loud.
+
+        Guards the other half of the loud-over-silent split: if every plain
+        never-deleted lookup warned, the WARNING above would be noise and stop
+        meaning "the tombstone store is broken".
+        """
+        mock_service = AsyncMock()
+        mock_service.get_memory_by_id = AsyncMock(return_value=None)
+        mock_service.get_mem0_deletion_tombstone = AsyncMock(return_value=None)
+        server = create_mcp_server(mock_service)
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.server.tools'):
+            result = await server._tool_manager.call_tool(
+                'get_memory_by_id',
+                {'project_id': _PROJECT_ID, 'memory_id': _MEMORY_ID},
+            )
+
+        assert result == {
+            'found': False,
+            'memory_id': _MEMORY_ID,
+            'project_id': _PROJECT_ID,
+        }
+        assert not [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and r.name == 'fused_memory.server.tools'
+        ], f'an ordinary absent tombstone must be silent: {caplog.text!r}'
 
     @pytest.mark.asyncio
     async def test_backend_failure_still_omits_found_with_a_tombstone_available(self):

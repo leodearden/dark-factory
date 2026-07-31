@@ -3412,10 +3412,21 @@ class MemoryService:
         reading one must never be worse than not having it. No ledger wired
         (``recon_ledger_enabled=False``, same
         ``getattr(self, 'recon_ledger', None)`` precedent as
-        :meth:`get_cycle_summary_presence`), no row, or a payload that is
-        undecodable or not a JSON object all return ``None``; only the
-        malformed-payload case logs (one WARNING), since the other two are
-        ordinary states rather than faults.
+        :meth:`get_cycle_summary_presence`), no row, a payload that is
+        undecodable or not a JSON object, and a *raising* store read (ledger
+        not initialized, SQLite locked/corrupt, aiosqlite thread error) all
+        return ``None``.
+
+        The two FAULT cases — malformed payload and a raising store read —
+        each log one WARNING (the latter with ``exc_info``); the two ordinary
+        states (no ledger, no row) log nothing. That split is the point: a
+        broken tombstone store must not be indistinguishable from "no
+        tombstone exists", which is the same undiscoverability class task 3041
+        was filed to fix (loud-over-silent / no-silent-fail-soft, see
+        ``docs/legibility/design-invariants.md``). The store guard lives HERE
+        rather than only at the MCP boundary so that "fail-safe throughout"
+        holds for every caller, not just the one that happens to wrap it
+        (reviewer finding robustness, task 3041 amendment pass).
 
         ``None`` therefore means "no readable tombstone", which covers both
         "never deliberately deleted" and "the tombstone expired past
@@ -3426,7 +3437,21 @@ class MemoryService:
         ledger = getattr(self, 'recon_ledger', None)
         if ledger is None:
             return None
-        record = await ledger.get_mem0_tombstone(project_id, memory_id)
+        try:
+            record = await ledger.get_mem0_tombstone(project_id, memory_id)
+        except Exception:
+            # A FAULT, not an ordinary state — the caller cannot tell this
+            # apart from "no tombstone exists" by the return value alone, so
+            # it must be loud in the log even though the return degrades.
+            logger.warning(
+                'get_mem0_deletion_tombstone: tombstone store read FAILED for '
+                'memory_id=%s in project=%s; reporting no tombstone',
+                memory_id,
+                project_id,
+                exc_info=True,
+                extra={'project_id': project_id, 'memory_id': memory_id},
+            )
+            return None
         if record is None:
             return None
         try:
