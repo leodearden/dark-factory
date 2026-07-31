@@ -84,13 +84,37 @@ err()   { printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2; }
 #     arithmetic return the logical one, so the two disagree under a symlinked
 #     ancestor (reify's production .worktrees is exactly such a symlink).
 # An existence guard cannot catch any of them: the wrong paths all exist.
-_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+#
+# dirname by PARAMETER EXPANSION, not a `dirname` fork: an external binary would
+# make this resolution silently depend on PATH, and a PATH without it does not
+# error — `$(dirname ...)` yields EMPTY, `cd ""` SUCCEEDS as a no-op, and
+# _SCRIPT_DIR resolves to the CALLER'S CWD. `cd`, `pwd` and `case` are builtins,
+# so this arithmetic now needs nothing on PATH at all. See README.md "Delta 7".
+_src="${BASH_SOURCE[0]}"
+_dir='.'
+case "$_src" in
+    */*) _dir="${_src%/*}"
+         [ -n "$_dir" ] || _dir='/' ;;
+esac
+_SCRIPT_DIR="$(cd "$_dir" && pwd)"
+unset _src _dir
 REPO_ROOT="$(cd "$_SCRIPT_DIR/../../.." && pwd)"
 
 # ── default mount dir: ascend past the worktrees dir if present ────────────────
 _default_mount() {
-    local parent
-    parent="$(dirname "$REPO_ROOT")"
+    local root parent leaf
+    # Same parameter-expansion dirname/basename as the repo-root resolution
+    # above, for the same reason and by the same measurement (README.md
+    # "Delta 7"): a fork HERE re-empties `parent` no matter how correctly
+    # REPO_ROOT resolved above, so the advertised default mount is still the
+    # bare filesystem root `/warm-lanes` — the whole operator-facing symptom.
+    # Fixing only the _SCRIPT_DIR assignment changes nothing an operator sees.
+    root="$REPO_ROOT"
+    parent='.'
+    case "$root" in
+        */*) parent="${root%/*}"
+             [ -n "$parent" ] || parent='/' ;;
+    esac
     # If the repo root is inside a worktrees directory, surface one level higher
     # so the warm-lanes dir lives beside the worktrees tree, not inside a worktree.
     #
@@ -101,8 +125,15 @@ _default_mount() {
     # fail to ascend and advertise <repo>/.worktrees/warm-lanes, i.e. INSIDE
     # the worktrees tree, which is precisely what this ascend exists to
     # prevent. Matching both spellings preserves the intent at the new home.
-    case "$(basename "$parent")" in
-        worktrees|.worktrees) parent="$(dirname "$parent")" ;;
+    leaf="${parent##*/}"
+    case "$leaf" in
+        worktrees|.worktrees)
+            root="$parent"
+            parent='.'
+            case "$root" in
+                */*) parent="${root%/*}"
+                     [ -n "$parent" ] || parent='/' ;;
+            esac ;;
     esac
     echo "$parent/warm-lanes"
 }
