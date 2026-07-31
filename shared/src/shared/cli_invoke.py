@@ -16,7 +16,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeGuard
 
 # VllmBridge depends on aiohttp, which is not installed in every consumer
 # environment (e.g. dashboard's venv).  Tolerate ImportError so that callers
@@ -547,7 +547,7 @@ def is_timed_out_with_progress(result: AgentResult) -> bool:
     return result.timed_out and (result.transcript_turns or 0) > 0
 
 
-def is_server_error_status(status: int | None) -> bool:
+def is_server_error_status(status: int | None) -> TypeGuard[int]:
     """Return True when *status* is a server-side HTTP error (5xx).
 
     PRD contract C1 (plans/server-side-api-error-handling-prd.md): a 5xx —
@@ -574,6 +574,12 @@ def is_server_error_status(status: int | None) -> bool:
     4xx statuses deliberately fall OUTSIDE this band so the existing routing is
     untouched: 401/403 stay with ``AuthFailed``, 404 with ``ModelNotFound``,
     and 429 keeps its cap carve-out.
+
+    Typed as a ``TypeGuard`` (a plain ``bool`` at runtime) so a True result
+    also narrows ``int | None`` to ``int`` for the caller — the same narrowing
+    the inline ``== 404`` / ``in (401, 403)`` status checks in
+    ``classify_invocation`` already give, which is what lets the ``ServerError``
+    tier pass ``result.api_error_status`` straight to ``ServerError(status=...)``.
     """
     return status is not None and 500 <= status <= 599
 
