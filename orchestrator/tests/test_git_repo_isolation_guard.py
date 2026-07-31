@@ -25,6 +25,7 @@ This module holds the guard-API unit tests plus the AST recurrence guard over
 """
 from __future__ import annotations
 
+import ast
 import os
 import subprocess
 from pathlib import Path
@@ -356,3 +357,266 @@ class TestGitEnvWithCeiling:
             'control precondition failed — the escaping write should have '
             "landed in the sentinel's object store"
         )
+
+
+# ===========================================================================
+# Recurrence guard: no NEW unguarded git-writing helper in test_git_ops.py
+# ===========================================================================
+#
+# The behavioural tests above and in test_git_ops.py cover the two helpers that
+# exist today.  They would not notice a THIRD one added next month — and the
+# incident report frames esc-3072-3 as an ongoing recurrence risk for every task
+# that touches test_git_ops.py, not a one-off.  This guard closes that gap.
+#
+# It reads CALL NODES via the AST, never comments or string literals, so a
+# docstring that merely mentions these names can never trip it.  Structural
+# code analysis, not a documentation meta-test.
+
+_TARGET_MODULE = Path(__file__).parent / 'test_git_ops.py'
+
+# Module-level helpers that CREATE their own repo before touching it (a
+# `git init` / `git clone` earlier in the same body).  Their cwd is a repo root
+# by construction, so there is no enclosing repo for git's upward walk to find.
+# Kept explicit rather than inferred, and self-verifying: the companion test
+# below asserts each entry really does contain that init/clone, so the
+# allowlist cannot quietly rot into a blanket exemption.
+_SELF_INITIALISING_HELPERS = frozenset({
+    '_setup_repo',
+    '_setup_repo_with_remote',
+    '_push_n_commits_to_origin',
+})
+
+# git subcommands that only READ.  Deliberately an allowlist of readers rather
+# than a denylist of writers: an unrecognised — or newly invented —
+# subcommand is then treated as mutating, so this guard fails CLOSED.
+# ``symbolic-ref`` is pointedly absent: its two-argument form writes.
+_READ_ONLY_GIT_SUBCOMMANDS = frozenset({
+    'blame', 'cat-file', 'check-ignore', 'cherry', 'count-objects', 'describe',
+    'diff', 'diff-index', 'diff-tree', 'for-each-ref', 'grep', 'log',
+    'ls-files', 'ls-remote', 'ls-tree', 'merge-base', 'name-rev', 'patch-id',
+    'rev-list', 'rev-parse', 'shortlog', 'show', 'show-ref', 'status', 'var',
+    'verify-pack', 'whatchanged',
+})
+
+_GUARD_FUNC = 'assert_isolated_git_repo'
+
+
+def _param_names(func: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+    a = func.args
+    return {arg.arg for arg in (*a.posonlyargs, *a.args, *a.kwonlyargs)}
+
+
+def _mentions_param(expr: ast.expr, params: set[str]) -> bool:
+    """True if *expr* reads any of *params* (e.g. ``cwd`` inside ``str(cwd)``)."""
+    return any(
+        isinstance(n, ast.Name) and n.id in params for n in ast.walk(expr)
+    )
+
+
+def _is_caller_supplied_git_write(call: ast.Call, params: set[str]) -> bool:
+    """True if *call* runs a MUTATING git command at a caller-supplied ``cwd``.
+
+    Two shapes are recognised, with deliberately different strictness:
+
+    * ``subprocess.run(..., cwd=<anything derived from a parameter>)`` — the
+      raw, unwrapped seam.  It bypasses ``_run`` and every convention attached
+      to it, so any parameter-derived cwd counts.  This is the shape
+      ``_inject_uu_state`` used when it corrupted a live task worktree.
+    * ``_run(['git', <subcommand>, ...], cwd=<bare parameter name>)`` — a raw
+      path handed straight in by the caller.  An *attribute* such as
+      ``git_ops.project_root`` is NOT matched: that path comes off a ``GitOps``
+      instance, which is a repository root by construction rather than an
+      arbitrary caller-chosen directory.
+
+    Read-only git commands are excluded: they cannot corrupt the repo they
+    wrongly resolve to.  (Their premise can still silently change — see
+    ``test_non_git_dir_returns_none`` — but that is a hermeticity bug in the
+    calling test, not a mutation hazard in the helper.)
+    """
+    cwd_kw = next((k for k in call.keywords if k.arg == 'cwd'), None)
+    if cwd_kw is None:
+        return False
+
+    func = call.func
+    if (
+        isinstance(func, ast.Attribute)
+        and func.attr == 'run'
+        and isinstance(func.value, ast.Name)
+        and func.value.id == 'subprocess'
+    ):
+        return _mentions_param(cwd_kw.value, params)
+
+    if not (isinstance(func, ast.Name) and func.id == '_run'):
+        return False
+    if not (isinstance(cwd_kw.value, ast.Name) and cwd_kw.value.id in params):
+        return False
+    cmd = call.args[0] if call.args else None
+    if not (isinstance(cmd, ast.List) and len(cmd.elts) >= 2):
+        return False
+    program, subcommand = cmd.elts[0], cmd.elts[1]
+    if not (isinstance(program, ast.Constant) and program.value == 'git'):
+        return False
+    if not isinstance(subcommand, ast.Constant):
+        return True  # non-literal subcommand: fail closed
+    return subcommand.value not in _READ_ONLY_GIT_SUBCOMMANDS
+
+
+def _module_level_functions(
+    tree: ast.Module,
+) -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
+    return [
+        n for n in tree.body
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+
+
+def _unguarded_git_writers(tree: ast.Module) -> list[str]:
+    """Module-level helpers that write via git at a caller-supplied cwd without
+    calling ``assert_isolated_git_repo`` FIRST.
+
+    "First" is literal: the guard must appear at a lower line number than the
+    git call.  A guard that ran afterwards would be decorative —
+    ``git hash-object -w`` has already written its blobs by then.
+    """
+    offenders: list[str] = []
+    for func in _module_level_functions(tree):
+        if func.name in _SELF_INITIALISING_HELPERS:
+            continue
+        params = _param_names(func)
+        guard_lines = [
+            n.lineno for n in ast.walk(func)
+            if isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Name)
+            and n.func.id == _GUARD_FUNC
+        ]
+        first_guard = min(guard_lines) if guard_lines else None
+        for node in ast.walk(func):
+            if not isinstance(node, ast.Call):
+                continue
+            if not _is_caller_supplied_git_write(node, params):
+                continue
+            if first_guard is None or first_guard >= node.lineno:
+                offenders.append(f'{func.name} (git write at line {node.lineno})')
+                break
+    return offenders
+
+
+class TestNoUnguardedGitWritersInTestGitOps:
+    """No module-level helper in test_git_ops.py writes via git unguarded."""
+
+    def test_every_git_writing_helper_calls_the_guard_first(self) -> None:
+        tree = ast.parse(_TARGET_MODULE.read_text(encoding='utf-8'))
+
+        offenders = _unguarded_git_writers(tree)
+
+        assert not offenders, (
+            'Unguarded git-writing helper(s) in test_git_ops.py.\n'
+            'Each of these runs a MUTATING git command at a cwd handed in by '
+            'its caller. Git repository discovery walks UP the directory tree, '
+            'so if that cwd is not itself a repo root the command silently '
+            'retargets whatever repo encloses it — under a pytest basetemp '
+            'nested inside a live task worktree, that is production state '
+            '(esc-3072-3).\n'
+            'Fix: call assert_isolated_git_repo(<cwd>) as the FIRST statement, '
+            'before any subprocess and before any filesystem write, and pass '
+            'env=git_env_with_ceiling(<cwd>) to raw subprocess calls. If the '
+            'helper git-inits or git-clones its own target, add it to '
+            '_SELF_INITIALISING_HELPERS in this file with a comment.\n'
+            f'Offenders: {offenders}'
+        )
+
+    def test_the_guard_actually_detects_an_unguarded_helper(self) -> None:
+        """Self-test: the detector is not vacuously green.
+
+        A structural guard that silently matches nothing is worse than no
+        guard, because it reads as coverage. Feed it a helper with the exact
+        offending shape and require a hit.
+        """
+        tree = ast.parse(
+            'async def _bad_helper(repo):\n'
+            "    await _run(['git', 'add', '-A'], cwd=repo)\n"
+        )
+
+        assert _unguarded_git_writers(tree) != []
+
+    def test_the_guard_accepts_a_correctly_guarded_helper(self) -> None:
+        """Self-test: adding the guard call clears the finding."""
+        tree = ast.parse(
+            'async def _good_helper(repo):\n'
+            '    assert_isolated_git_repo(repo)\n'
+            "    await _run(['git', 'add', '-A'], cwd=repo)\n"
+        )
+
+        assert _unguarded_git_writers(tree) == []
+
+    def test_a_guard_placed_after_the_write_does_not_count(self) -> None:
+        """Self-test: ordering is enforced, not merely presence.
+
+        A guard that runs after the git call is decorative — the blobs are
+        already written by then.
+        """
+        tree = ast.parse(
+            'async def _late_helper(repo):\n'
+            "    await _run(['git', 'add', '-A'], cwd=repo)\n"
+            '    assert_isolated_git_repo(repo)\n'
+        )
+
+        assert _unguarded_git_writers(tree) != []
+
+    def test_read_only_git_commands_are_not_flagged(self) -> None:
+        """Self-test: a read-only command cannot corrupt what it mis-resolves."""
+        tree = ast.parse(
+            'async def _reader(wt_path):\n'
+            "    await _run(['git', 'rev-parse', '--git-dir'], cwd=wt_path)\n"
+        )
+
+        assert _unguarded_git_writers(tree) == []
+
+    def test_unknown_subcommand_is_treated_as_mutating(self) -> None:
+        """Self-test: the reader allowlist fails CLOSED.
+
+        A subcommand nobody has classified must be assumed to write, so a new
+        git verb cannot slip through by being unrecognised.
+        """
+        tree = ast.parse(
+            'async def _mystery(repo):\n'
+            "    await _run(['git', 'brand-new-verb'], cwd=repo)\n"
+        )
+
+        assert _unguarded_git_writers(tree) != []
+
+    def test_allowlist_entries_really_create_their_own_repo(self) -> None:
+        """Every _SELF_INITIALISING_HELPERS entry genuinely git-inits/clones.
+
+        Keeps the exemption honest: if one of these is ever refactored to
+        operate on a repo it did not create, its exemption stops being true and
+        this fails rather than silently widening the hole.
+        """
+        tree = ast.parse(_TARGET_MODULE.read_text(encoding='utf-8'))
+        by_name = {f.name: f for f in _module_level_functions(tree)}
+
+        for name in sorted(_SELF_INITIALISING_HELPERS):
+            func = by_name.get(name)
+            assert func is not None, (
+                f'_SELF_INITIALISING_HELPERS names {name}, which no longer '
+                f'exists in test_git_ops.py — drop the stale entry'
+            )
+            creators = {
+                node.args[0].elts[1].value
+                for node in ast.walk(func)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == '_run'
+                and node.args
+                and isinstance(node.args[0], ast.List)
+                and len(node.args[0].elts) >= 2
+                and isinstance(node.args[0].elts[0], ast.Constant)
+                and node.args[0].elts[0].value == 'git'
+                and isinstance(node.args[0].elts[1], ast.Constant)
+            }
+            assert creators & {'init', 'clone'}, (
+                f'{name} is exempted as self-initialising but no longer runs '
+                f'git init/clone; it now operates on a repo it did not create. '
+                f'Remove the exemption and call {_GUARD_FUNC} instead. '
+                f'git subcommands found: {sorted(creators)}'
+            )

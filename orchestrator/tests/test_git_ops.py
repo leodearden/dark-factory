@@ -8057,6 +8057,60 @@ async def _add_warm_lane_scripts(repo: Path, port: int = 39411) -> None:
 
 
 @pytest.mark.asyncio
+class TestWarmLaneScriptsHelperIsolation:
+    """_add_warm_lane_scripts cannot commit into a repo it was not handed.
+
+    Same defect class as esc-3072-3 and the more dangerous shape of the two:
+    ``_inject_uu_state`` leaked index entries, whereas this helper runs
+    ``git add -A`` + ``git commit``, so an escaping call would write a real
+    COMMIT into a live task worktree — sweeping up whatever uncommitted work
+    that worktree happened to be holding.  Before this guard it was safe only
+    by call-site discipline across ~33 callers.
+    """
+
+    async def test_cannot_commit_into_an_enclosing_repo(self, tmp_path: Path):
+        sentinel = tmp_path / 'live-worktree'
+        sentinel.mkdir()
+        await _setup_repo(sentinel)
+
+        # Stand-in for a pytest basetemp nested inside that live worktree.
+        nested = sentinel / '.pytest-tmp' / 'test_x0'
+        nested.mkdir(parents=True)
+
+        rc, head_before, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=sentinel)
+        assert rc == 0, err
+        rc, status_before, err = await _run(
+            ['git', 'status', '--porcelain'], cwd=sentinel,
+        )
+        assert rc == 0, err
+
+        with pytest.raises(NonIsolatedGitRepoError):
+            await _add_warm_lane_scripts(nested)
+
+        rc, head_after, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=sentinel)
+        assert rc == 0, err
+        assert head_after == head_before, (
+            f'a commit landed in the enclosing repo: {head_before.strip()} -> '
+            f'{head_after.strip()}'
+        )
+
+        rc, status_after, err = await _run(
+            ['git', 'status', '--porcelain'], cwd=sentinel,
+        )
+        assert rc == 0, err
+        assert status_after == status_before, (
+            f'enclosing repo state changed: {status_before!r} -> {status_after!r}'
+        )
+
+        # No filesystem litter either: the guard must run BEFORE the mkdir and
+        # the two write_text calls, not merely before the git commands.
+        assert not (nested / 'scripts').exists(), (
+            'stub scripts were written into the rejected directory; the guard '
+            'must be the first statement in the helper'
+        )
+
+
+@pytest.mark.asyncio
 class TestCreateWorktreeWarmLaneRouting:
     """create_worktree uses the pool when enabled; raises on exhaustion (no cold fallback)."""
 
