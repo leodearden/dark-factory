@@ -980,7 +980,6 @@ class TestBuildEscalationAnalyticsPerf:
     """PRD boundary row 7: a cold ~10k-record archive walk completes in < 5s."""
 
     def test_cold_10k_archive_under_5_seconds(self, tmp_path):
-        import os
         import time
 
         from dashboard.data.escalation_analytics import build_escalation_analytics
@@ -993,26 +992,31 @@ class TestBuildEscalationAnalyticsPerf:
             ('perf-done-1', 'done', f'{(now - timedelta(days=1)).date().isoformat()}T09:00:00+00:00'),
         ])
 
-        started = time.monotonic()
+        started = time.process_time()
         result = build_escalation_analytics([('dark_factory', esc_dir, runs_db)], now=now)
-        elapsed = time.monotonic() - started
+        cpu_elapsed = time.process_time() - started
 
         # The bound guards against an O(n^2) archive-walk regression, NOT a
-        # wall-clock SLA. Under 32-worker xdist merge-verify contention the
-        # 10k-file fixture's disk I/O + CPU oversubscription made a
-        # second-level budget flaky (observed 8.32s and 5.05s, task 2702),
-        # mirroring test_single_call_latency_smoke
-        # (fused-memory/tests/test_task_interceptor.py). So this timing
-        # assertion only runs single-worker, where idle runtime is a few
-        # seconds; 15s gives generous headroom for single-worker CI variance
-        # while still catching a real blowup (minutes at 10k records under
-        # an O(n^2) regression). The correctness assertions below always
+        # wall-clock SLA. A wall-clock (time.monotonic) budget here proved
+        # contention-sensitive twice: first to intra-process xdist worker
+        # contention (task 2702/2722, observed 8.32s/5.05s against a then-5s
+        # bound, widened to 15s and gated to single-worker-only), then to
+        # cross-worktree contention from concurrent orchestrator verifies on
+        # the same host (task 3344, observed 34.78s single-worker against
+        # the widened 15s bound; nproc=32 with loadavg 78-138 at the time).
+        # time.process_time() measures actual CPU seconds consumed by this
+        # process — it excludes time spent waiting for a CPU slot or for
+        # disk I/O while other processes (xdist workers, sibling worktree
+        # verifies) are scheduled, so it stays stable regardless of host
+        # contention while still catching a real O(n^2) blowup (which would
+        # burn far more than 15s of actual CPU at 10k records). No
+        # single-worker gate is needed: the measure itself is
+        # contention-insensitive. The correctness assertions below always
         # run, including under xdist.
-        if not os.environ.get('PYTEST_XDIST_WORKER'):
-            assert elapsed < 15.0, (
-                f'cold build_escalation_analytics took {elapsed:.2f}s '
-                '(budget 15.0s, single-worker)'
-            )
+        assert cpu_elapsed < 15.0, (
+            f'cold build_escalation_analytics used {cpu_elapsed:.2f}s of CPU time '
+            '(budget 15.0s)'
+        )
 
         # Well-formed at scale: parse_failures==0 (every fixture record is
         # valid), one per-project entry with non-empty samples.
