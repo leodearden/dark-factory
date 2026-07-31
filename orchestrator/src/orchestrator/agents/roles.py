@@ -203,10 +203,13 @@ _PLAN_CREATOR_TOOLS = [
     # Architect task-rejection escape hatches.
     # report_blocking_dependency — depends on un-merged sibling task.
     # report_task_already_done — work is already on main (skip planning).
+    # report_ready_to_merge — work is complete on THIS BRANCH; only the merge
+    #   to main is missing (clean-FF + verify-passed + review-PASS).
     # report_unactionable_task — spec is broken, jump straight to L1.
     # report_false_premise — RED-test premise is false/unreachable (design_concern L1).
     'mcp__plan-tools__report_blocking_dependency',
     'mcp__plan-tools__report_task_already_done',
+    'mcp__plan-tools__report_ready_to_merge',
     'mcp__plan-tools__report_unactionable_task',
     'mcp__plan-tools__report_false_premise',
     # Authoring-time pre-satisfy (task 3033 / PRD §A1, substrate from task 3030).
