@@ -336,3 +336,93 @@ re-derivable only against a live store; the curator-gate 20 are not.
   since the calibration session. They are kept deliberately: their
   content hashes are still valid, so they exercise the hash-primary /
   id-fallback matcher on real decay rather than on a synthetic case.
+
+---
+
+## `transcript_corpus/`
+
+A miniature **agent-transcript archive** for the retro replay-corpus
+extractor (`docs/prds/memory-eval-program.md` §5 leaf θ, decision D9, task
+3214). Consumed by `fused-memory/scripts/memory_eval_transcript_corpus.py`
+(via `--archive-root` and `--transcript`) and asserted end-to-end in
+`fused-memory/tests/test_memory_eval_transcript_corpus.py`.
+
+Unlike the two fixtures above this one is a directory of gzipped JSONL, not
+a single file: the extractor's provenance parsing reads task/session/subagent
+identity **out of the path**, so a flat fixture could not exercise it.
+
+### Purpose
+
+The fixture is the committed, reviewable stand-in for the live archive at
+`<main-checkout>/data/orchestrator/agent-transcripts/` — untracked runtime
+state that exists on one machine, cannot be committed, and grows under the
+fleet. It is a hand-written miniature of the record **shapes** measured
+there, deliberately **not** a pasted real transcript: a real one carries
+incidental session content that would drift, bloat the diff, and make a
+failure hard to read.
+
+Its round-trip is one half of the capability manifest's
+`coverage-report-discloses-failures` check
+(`docs/prds/memory-eval-program.capability-manifest.yaml`); the other half is
+an all-unparseable-input case, which is built in a temp dir because a
+deliberately-corrupt `.gz` is not something to commit.
+
+### Layout
+
+Mirrors what `shared/src/shared/transcript_archive.py` writes, both variants:
+
+```
+transcript_corpus/
+└── 4242/                                            # <task_id>
+    └── -home-leo-src-dark-factory--worktrees-4242/  # <encoded cwd>
+        ├── 11111111-…-555555555555.jsonl.gz         # main session
+        └── 11111111-…-555555555555/
+            └── subagents/
+                └── agent-abc123def4567890.jsonl.gz  # subagent session
+```
+
+Task id, session id, `is_subagent` and the subagent id are all recovered
+from these path components — never from the record bodies — so renaming a
+directory changes what the extractor reports.
+
+### What each line exercises
+
+The main transcript is 9 physical lines yielding 7 records; the two missing
+ones are the point:
+
+| line | record | exercises |
+|---|---|---|
+| 1 | `{"type": "queue-operation", …}` | a non-message record interleaved mid-session — must be skipped, not crashed on |
+| 2 | first `user` record | the briefing **Agent Identity** line, `agent_id:** ` + backticked `claude-task-4242-architect` — the only place caller identity is recoverable (see below) |
+| 3 | *(blank)* | reader-level skip — **not** a parse failure |
+| 4 | `{"type": "user", "message": {broken` | corrupt JSON — reader-level skip, **not** a parse failure. A fire-and-forget writer can truncate its last line; that must not lose the whole file, and must not inflate `parse_failures` (which counts unreadable **files**) |
+| 5 | `assistant` + `tool_use` | an `mcp__fused-memory__search` call: `input.query` / `project_id` / `limit` |
+| 6 | `user` + `tool_result` | its answer — `content` is a JSON **string** decoding to `{"results": [...]}`, two results at **distinct** `relevance_score`s so rank order is observable |
+| 7 | `{"type": "queue-operation", …}` | a second interleaved skip, *between* a search and its successor |
+| 8 | `assistant` + two `tool_use` | `Read` and `mcp__fused-memory__add_memory` — non-search tools that must contribute **nothing** |
+| 9 | `assistant` + `tool_use` | a second search with **no** matching `tool_result` anywhere: the truncated-transcript case, which must be emitted with `result_status: "missing"` rather than dropped |
+
+The subagent transcript is 3 records: a briefing whose agent_id
+(`claude-task-4242-code-reviewer`) has a **hyphenated role**, plus one
+answered search. Its records also carry `isSidechain` / `agentId` /
+`gitBranch`, mirroring the live shape — the extractor ignores them and
+derives `is_subagent` from the path, so the fixture keeps them available for
+a future cross-check without asserting one today.
+
+### The `caller` name collision
+
+Every search `tool_use` block in the fixture carries its own
+`"caller": {"type": "direct"}`, exactly as the live archive does. That is a
+Claude Code harness field, uniform across every measured call, and it is
+**not** agent identity — it is reproduced here precisely so the extractor is
+tested against the collision. The corpus record's `caller` field means *who
+issued the search*, recovered from the briefing text on line 2.
+
+### Regenerating
+
+The `.gz` files are written with `mtime=0` so the committed bytes are
+reproducible. They are small (< 1 KB each) and hand-authored; edit by
+decompressing, changing the JSONL, and recompressing with `mtime=0`.
+Changing a query, an id, or a score will fail the round-trip test by
+design — the test asserts the fixture's authored facts verbatim, which is
+what makes it a fixture rather than a smoke test.
