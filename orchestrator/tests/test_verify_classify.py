@@ -1620,3 +1620,70 @@ class TestInterpreterMissingWorkspacePackages:
     ) -> None:
         """Exception-safe on any input — a classifier must never raise."""
         assert verify_classify.is_interpreter_missing_workspace_packages(text) is False
+
+
+class TestInterpreterMisresolutionClassifiesEnvTransient:
+    """The mis-resolved-interpreter signature classifies ENV_TRANSIENT, tool-blind.
+
+    Task 3367 / esc-3359-1. Before this, the fleet chain
+    ``cd fused-memory && npx pyright && ...`` parsed to ``ToolKind.OPAQUE``
+    (``verify_cmd._parse_chain`` — multi-segment, neither pytest nor cargo), so
+    ``classify_failure`` dispatched to ``_classify_opaque``, whose ladder fell
+    through to ``UNKNOWN_TEST_FAILURE`` — i.e. the host's mis-resolved
+    interpreter read as a BRANCH DEFECT, burning a merge cycle and a steward
+    escalation on a docs-only diff.
+    """
+
+    def test_opaque_fleet_chain_signature_is_env_transient(self) -> None:
+        """OPAQUE is the case that actually matters — the fleet chain's ToolKind."""
+        assert (
+            verify_classify.classify_failure(ToolKind.OPAQUE, 1, PHANTOM_MISSING_IMPORTS, False)
+            == FailureCategory.ENV_TRANSIENT
+        )
+
+    def test_pyright_tool_kind_signature_is_env_transient(self) -> None:
+        """The per-module `uv run --project X pyright` commands too.
+
+        Proves the detection lives in the tool-blind guard (guard 3, which runs
+        BEFORE per-tool dispatch), not in one tool's table.
+        """
+        assert (
+            verify_classify.classify_failure(ToolKind.PYRIGHT, 1, PHANTOM_MISSING_IMPORTS, False)
+            == FailureCategory.ENV_TRANSIENT
+        )
+
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_rc_zero_still_passes_with_the_phantom_text_present(
+        self, tool: ToolKind
+    ) -> None:
+        """Guard 1 precedence is unchanged: rc==0 is PASSED regardless of output."""
+        assert (
+            verify_classify.classify_failure(tool, 0, PHANTOM_MISSING_IMPORTS, False)
+            == FailureCategory.PASSED
+        )
+
+    @pytest.mark.parametrize('tool', ALL_TOOL_KINDS)
+    def test_timed_out_still_wins_over_the_phantom_text(self, tool: ToolKind) -> None:
+        """Guard 2 precedence is unchanged: the wall-clock limit is the root cause."""
+        assert (
+            verify_classify.classify_failure(tool, 1, PHANTOM_MISSING_IMPORTS, True)
+            == FailureCategory.INFRA_TIMEOUT
+        )
+
+    def test_single_genuine_missing_import_is_not_excused_as_environmental(self) -> None:
+        """A real branch defect keeps its pre-existing category, never ENV_TRANSIENT."""
+        genuine = _unresolved_import_lines('brand_new_lib')
+        assert (
+            verify_classify.classify_failure(ToolKind.OPAQUE, 1, genuine, False)
+            != FailureCategory.ENV_TRANSIENT
+        )
+
+    def test_env_transient_is_infra_transient_at_the_merge_lane(self) -> None:
+        """Documents the merge-lane consequence this classification buys.
+
+        ``merge_queue``'s ``INFRA_TRANSIENT_CATEGORIES`` branch turns this into a
+        loud infra_issue hold that never blames the branch — the exact outcome
+        that would have saved esc-3359-1's merge cycle. No new FailureCategory
+        member is introduced; ENV_TRANSIENT already carries precisely this policy.
+        """
+        assert FailureCategory.ENV_TRANSIENT in INFRA_TRANSIENT_CATEGORIES
