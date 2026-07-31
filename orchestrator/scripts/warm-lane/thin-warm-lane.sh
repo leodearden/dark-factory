@@ -180,8 +180,21 @@ fi
 
 # Default --seed-script: sibling scripts/seed-warm-lane.sh, resolved via
 # BASH_SOURCE so this script works when invoked via a relative/symlinked path.
+#
+# dirname by PARAMETER EXPANSION, not a fork: a PATH without dirname yields an
+# EMPTY substitution, `cd ""` succeeds as a no-op, and _script_dir silently
+# becomes the CALLER'S CWD — making "resolved via BASH_SOURCE" above untrue, and
+# here that mis-resolution is EXECUTED, not merely sourced. See README.md
+# "Delta 7".
 if [ -z "$SEED_SCRIPT" ]; then
-    _script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    _src="${BASH_SOURCE[0]}"
+    _dir='.'
+    case "$_src" in
+        */*) _dir="${_src%/*}"
+             [ -n "$_dir" ] || _dir='/' ;;
+    esac
+    _script_dir="$(cd "$_dir" && pwd)"
+    unset _src _dir
     SEED_SCRIPT="$_script_dir/seed-warm-lane.sh"
 fi
 
