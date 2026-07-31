@@ -215,9 +215,13 @@ test('the harness actually detects a duplicate top-level const (negative control
   const source = fs.readFileSync(path.join(REDUX_DIR, 'graph_layout.js'), 'utf8');
   new vm.Script(source, { filename: 'graph_layout.js' }).runInContext(ctx);
 
+  // Redeclares GRAPH_LAYOUT_API — the name graph_layout.js actually declares.
+  // Keep these two in sync: pointed at a name that file does NOT declare, this
+  // control would stop throwing and the assertion below would fail loudly
+  // rather than silently rot.
   assert.throws(
     () => {
-      new vm.Script('const API = { collide: true };', {
+      new vm.Script('const GRAPH_LAYOUT_API = { collide: true };', {
         filename: 'synthetic-collider.js',
       }).runInContext(ctx);
     },
