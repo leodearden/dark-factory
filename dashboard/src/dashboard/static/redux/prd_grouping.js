@@ -154,14 +154,16 @@ function orderPrdGroups(groups, computeTiers) {
   return noPrdGroup ? [...ordered, noPrdGroup] : ordered;
 }
 
-// Named PRD_GROUPING_API (not the graph_layout.js boilerplate's plain `API`):
-// both files are loaded as separate classic (non-module) <script> tags on the
-// same page (index.html), and top-level `const` bindings in classic scripts
-// share one global lexical scope across ALL of them — a second top-level
-// `const API` here would collide with graph_layout.js's, throwing
-// "Identifier 'API' has already been declared" and aborting this entire
-// script (verified in a real browser), silently leaving window.DF_PRD_GROUPING
-// undefined and breaking tab_tasks.jsx's top-level destructure of it.
+// Named PRD_GROUPING_API, module-unique by convention: every redux/*.js file
+// is loaded as a separate classic (non-module) <script> tag on the same page
+// (index.html), and top-level `const`/`let`/`class` bindings in classic
+// scripts share ONE global lexical scope across ALL of them. A name declared
+// by two of them aborts the second script to declare it with "Identifier 'X'
+// has already been declared" (verified in a real browser) — thrown before its
+// body runs, so this file would silently leave window.DF_PRD_GROUPING
+// undefined and break tab_tasks.jsx's top-level destructure of it. Hence each
+// module names its export const `<MODULE>_API` and never a bare `API`.
+// Guarded by dashboard/tests/js/classic_script_scope.test.mjs.
 const PRD_GROUPING_API = { prdTitle, aggregatePrdStatus, summarizePrdMembers, groupTasksByPrd, orderPrdGroups };
 
 if (typeof module !== 'undefined' && module.exports) {
