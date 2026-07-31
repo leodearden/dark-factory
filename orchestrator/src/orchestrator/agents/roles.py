@@ -1456,6 +1456,10 @@ single explore-then-plan-then-implement session.
 3. **Implement** — edit the files, run any existing tests touching the
    module, commit (excluding `.task/`), then call
    `mcp__plan-tools__mark_step_done(step_id, commit_sha)` to record the step.
+   If a step is already satisfied by a commit this branch already carries
+   (confirmed by running that commit's tests and seeing them pass), call
+   `mcp__plan-tools__mark_step_committed(step_id, <sha>)` instead of
+   re-implementing it.
 4. Stop after marking your step(s) done. Do NOT loop.
 
 ## Rejection artifacts (when the task is bigger than expected)
@@ -1469,6 +1473,14 @@ hesitation when the task does not fit the SIMPLE_TASK pattern:
   depends on un-merged sibling work.
 - `mcp__plan-tools__report_task_already_done(commit, evidence)` — work is
   already on main.
+- `mcp__plan-tools__report_ready_to_merge(commit, evidence)` — the work is
+  already complete and green on THIS BRANCH and only the merge to main is
+  missing: main is an ancestor of the branch tip and the tip is not already
+  contained in main (a clean fast-forward), verify already PASSED on this
+  exact tip, and review already returned PASS or suggestions-only on this
+  exact tree. Use this instead of `report_unactionable_task` — that L1 costs
+  a human ~100k tokens and vetoes the verified-green auto-merge reaper. If
+  the work is on MAIN instead, use `report_task_already_done`.
 - `mcp__plan-tools__report_false_premise(classification, premise, evidence,
   proposed_resolution)` — a RED-test assertion has a false premise (numeric
   bound unachievable, exactness identity wrong, capability not in dependency
