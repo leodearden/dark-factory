@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from typing import cast
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _workflow_helpers import (  # noqa: F401  _Fixture: re-export, see test_workflow_helpers.py
@@ -23,6 +24,8 @@ from _workflow_helpers import (  # noqa: F401  _Fixture: re-export, see test_wor
     _make,
 )
 
+from orchestrator.config import DeliveredChecksConfig
+from orchestrator.delivered_checks import DeliveredChecksBlock
 from orchestrator.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.merge_queue import reconcile_landed_outbox
 from orchestrator.scheduler import SetTaskStatusRejected
@@ -913,3 +916,302 @@ class TestFinaliseMergedDoneConsumesLandedRow:
         # The write-ahead row must STILL be present — a rejected done-write
         # must not consume it.
         assert outbox.lookup(f.wf.task_id) is not None
+
+
+# ---------------------------------------------------------------------------
+# TestFinaliseRecoveryDoneDeliveredChecksGuard (task 3057 — step-5 RED /
+# step-6 GREEN)
+#
+# Seams 4+7 of the eleven attribution-shaped mark-done seams, guarded at the
+# ONE chokepoint they all funnel through. `_finalise_recovery_done` is the
+# sole route to a recovery-DONE for all six recovery arms (3x journal
+# kind='merged' + 3x fallback kind='found_on_main'), so the guard sits here
+# rather than at the six call sites — a future seventh recovery arm cannot be
+# added unguarded.
+# ---------------------------------------------------------------------------
+
+_WF_GATE_TARGET = 'orchestrator.workflow.gate_mark_done_on_delivered_checks'
+
+#: (basis, kind) for the two recovery bases, parametrized everywhere so
+#: neither the journal arm nor the fallback arm can regress independently.
+_RECOVERY_ARMS = [
+    pytest.param('journal', 'merged', id='journal-merged'),
+    pytest.param('fallback', 'found_on_main', id='fallback-found-on-main'),
+]
+
+_WF_DC_CHECK = {
+    'name': 'cap-x', 'kind': 'grep', 'pattern': 'SomePattern', 'expect': 'present',
+}
+
+
+def _arm_recovery_fixture(
+    tmp_path: Path, *, metadata: dict | None = None, enabled: bool = True,
+) -> _Fixture:
+    """`_make` plus a live ``delivered_checks`` config and task metadata.
+
+    The stock ``_make`` config is a ``MagicMock(spec_set=...)``, so
+    ``config.delivered_checks`` would hand the guard MagicMocks rather than
+    the real knobs it must forward. A real ``DeliveredChecksConfig`` keeps the
+    forwarding assertions honest.
+    """
+    f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+    f.wf.task['metadata'] = (
+        {'delivered_checks': [_WF_DC_CHECK]} if metadata is None else metadata
+    )
+    f.wf.config.delivered_checks = DeliveredChecksConfig(
+        enabled=enabled, check_timeout_secs=7.5,
+    )
+    f.wf._reconcile_metadata_files_for_done = AsyncMock()  # type: ignore[method-assign]
+    return f
+
+
+def _spy_phases(f: _Fixture) -> list[WorkflowState]:
+    """Record every ``_enter_phase`` target while preserving real behaviour."""
+    seen: list[WorkflowState] = []
+    real = f.wf._enter_phase
+
+    def _spy(new_state: WorkflowState) -> None:
+        seen.append(new_state)
+        real(new_state)
+
+    f.wf._enter_phase = _spy  # type: ignore[method-assign]
+    return seen
+
+
+@pytest.mark.asyncio
+class TestFinaliseRecoveryDoneDeliveredChecksGuard:
+    """The delivered-capability guard on the recovery-DONE chokepoint.
+
+    A journal row or a branch-on-main probe proves only that SOMETHING of this
+    branch reached main — never that THIS task's declared capability survived
+    to it. On any block the chokepoint returns ``None``, which every caller
+    already reads as "no recovery, proceed with the phase", so the workflow
+    goes on to actually deliver the task.
+    """
+
+    # --- row 1: hollow-done regression / FAILED -> ZERO side effects -------
+
+    @pytest.mark.parametrize(('basis', 'kind'), _RECOVERY_ARMS)
+    async def test_failed_block_withholds_recovery_with_zero_side_effects(
+        self, tmp_path: Path, basis: str, kind: str,
+    ):
+        """A withheld recovery must leave NOTHING behind: no stamp, no DONE
+        phase, no metadata-files reconcile, and no ``_merge_recovery_basis``
+        marker (that marker is this chokepoint's own provenance record — a
+        recovery that did not happen must not claim one)."""
+        f = _arm_recovery_fixture(tmp_path)
+        phases = _spy_phases(f)
+        guard = AsyncMock(return_value=DeliveredChecksBlock(
+            reason='failed', main_sha='m' * 40, failed_check=_WF_DC_CHECK,
+        ))
+
+        with patch(_WF_GATE_TARGET, guard):
+            outcome = await f.wf._finalise_recovery_done(
+                basis=basis, sha='advancedsha123', kind=kind, note='n',
+            )
+
+        assert outcome is None
+        f.mark_done.assert_not_awaited()
+        assert WorkflowState.DONE not in phases
+        assert f.wf.state != WorkflowState.DONE
+        cast(AsyncMock, f.wf._reconcile_metadata_files_for_done).assert_not_awaited()
+        assert f.wf._merge_recovery_basis is None
+
+    # --- row 2: all_delivered -> byte-identical recovery -------------------
+
+    @pytest.mark.parametrize(('basis', 'kind'), _RECOVERY_ARMS)
+    async def test_all_delivered_finalises_exactly_as_today(
+        self, tmp_path: Path, basis: str, kind: str,
+    ):
+        """Capability verifiably on main -> today's exact stamp, basis marker,
+        DONE phase and metadata-files reconcile, in today's order."""
+        f = _arm_recovery_fixture(tmp_path)
+        guard = AsyncMock(return_value=None)
+
+        with patch(_WF_GATE_TARGET, guard):
+            outcome = await f.wf._finalise_recovery_done(
+                basis=basis, sha='advancedsha123', kind=kind, note='n',
+                files=['a.py'],
+            )
+
+        assert outcome == WorkflowOutcome.DONE
+        assert f.wf._merge_recovery_basis == basis
+        assert f.wf.state == WorkflowState.DONE
+        f.mark_done.assert_awaited_once_with(
+            f.wf.task_id, kind=kind, sha='advancedsha123', note='n',
+        )
+        cast(
+            AsyncMock, f.wf._reconcile_metadata_files_for_done,
+        ).assert_awaited_once_with(override_files=['a.py'])
+
+    # --- row 3: no delivered_checks -> unchanged, but still DELEGATED ------
+
+    @pytest.mark.parametrize(('basis', 'kind'), _RECOVERY_ARMS)
+    async def test_check_less_task_delegates_and_finalises(
+        self, tmp_path: Path, basis: str, kind: str,
+    ):
+        """A check-less task must not gain a new requirement. The workflow
+        DELEGATES unconditionally (forwarding the task's metadata) rather than
+        short-circuiting itself — inertness lives in the helper alone."""
+        f = _arm_recovery_fixture(tmp_path, metadata={})
+        guard = AsyncMock(return_value=None)
+
+        with patch(_WF_GATE_TARGET, guard):
+            outcome = await f.wf._finalise_recovery_done(
+                basis=basis, sha='advancedsha123', kind=kind, note='n',
+            )
+
+        assert outcome == WorkflowOutcome.DONE
+        f.mark_done.assert_awaited_once()
+        guard.assert_awaited_once()
+        assert guard.await_args.args[1] == f.wf.task['metadata']
+
+    # --- rows 4 & 5: fail-safe blocks are handled UNIFORMLY with FAILED ----
+
+    @pytest.mark.parametrize(('basis', 'kind'), _RECOVERY_ARMS)
+    @pytest.mark.parametrize('reason', ['errored', 'main_sha_unresolved'])
+    async def test_fail_safe_blocks_also_withhold_the_recovery(
+        self, tmp_path: Path, basis: str, kind: str, reason: str,
+    ):
+        """ERRORED / main_sha_unresolved take the SAME path as FAILED: no
+        claim either way means no recovery-DONE. Fail-safe here is cheap —
+        the workflow simply proceeds with the phase and re-delivers."""
+        f = _arm_recovery_fixture(tmp_path)
+        guard = AsyncMock(return_value=DeliveredChecksBlock(reason=reason))
+
+        with patch(_WF_GATE_TARGET, guard):
+            outcome = await f.wf._finalise_recovery_done(
+                basis=basis, sha='advancedsha123', kind=kind, note='n',
+            )
+
+        assert outcome is None
+        f.mark_done.assert_not_awaited()
+        assert f.wf.state != WorkflowState.DONE
+        assert f.wf._merge_recovery_basis is None
+
+    # --- row 6: kill switch is FORWARDED, never re-implemented -------------
+
+    @pytest.mark.parametrize(('basis', 'kind'), _RECOVERY_ARMS)
+    async def test_kill_switch_is_forwarded_not_short_circuited(
+        self, tmp_path: Path, basis: str, kind: str,
+    ):
+        f = _arm_recovery_fixture(tmp_path, enabled=False)
+        guard = AsyncMock(return_value=None)
+
+        with patch(_WF_GATE_TARGET, guard):
+            outcome = await f.wf._finalise_recovery_done(
+                basis=basis, sha='advancedsha123', kind=kind, note='n',
+            )
+
+        assert outcome == WorkflowOutcome.DONE
+        guard.assert_awaited_once()
+        assert guard.await_args.kwargs['enabled'] is False
+
+    @pytest.mark.parametrize(('basis', 'kind'), _RECOVERY_ARMS)
+    async def test_kill_switch_with_real_helper_finalises_as_today(
+        self, tmp_path: Path, basis: str, kind: str,
+    ):
+        """End-to-end with the REAL helper: disabled -> byte-identical
+        recovery, with zero check work."""
+        f = _arm_recovery_fixture(tmp_path, enabled=False)
+
+        outcome = await f.wf._finalise_recovery_done(
+            basis=basis, sha='advancedsha123', kind=kind, note='n',
+        )
+
+        assert outcome == WorkflowOutcome.DONE
+        f.mark_done.assert_awaited_once()
+        cast(AsyncMock, f.wf.git_ops.get_main_sha).assert_not_awaited()
+
+    # --- plumbing: the MAIN checkout, never the worktree -------------------
+
+    @pytest.mark.parametrize(('basis', 'kind'), _RECOVERY_ARMS)
+    async def test_forwards_main_checkout_config_knobs(
+        self, tmp_path: Path, basis: str, kind: str,
+    ):
+        """``project_root`` must be the MAIN checkout, NOT ``self.worktree``.
+
+        The grep kind evaluates the COMMITTED tree at ``ref=main_sha``, so a
+        worktree path here would silently audit the wrong tree — and, worse,
+        would usually still pass, making the guard look armed while proving
+        nothing about main.
+        """
+        f = _arm_recovery_fixture(tmp_path)
+        guard = AsyncMock(return_value=None)
+
+        with patch(_WF_GATE_TARGET, guard):
+            await f.wf._finalise_recovery_done(
+                basis=basis, sha='advancedsha123', kind=kind, note='n',
+            )
+
+        kwargs = guard.await_args.kwargs
+        assert kwargs['project_root'] == str(f.wf.config.project_root)
+        assert kwargs['project_root'] != str(f.wf.worktree)
+        assert kwargs['check_timeout_secs'] == 7.5
+        assert kwargs['enabled'] is True
+        assert guard.await_args.args[0] == f.wf.task_id
+        assert basis in kwargs['site']
+
+    # --- ordering: the MP-2 structural guard still fires FIRST -------------
+
+    @pytest.mark.parametrize('bad', [
+        pytest.param({'basis': 'nonsense', 'sha': 'advancedsha123'}, id='bad-basis'),
+        pytest.param({'basis': 'journal', 'sha': ''}, id='falsy-sha'),
+    ])
+    async def test_mp2_assertion_precedes_the_guard(
+        self, tmp_path: Path, bad: dict,
+    ):
+        """A malformed caller must fail LOUDLY, never be masked by a
+        capability withholding — the MP-2 AssertionError (no recovery-DONE
+        without a provenance basis) still raises before any check work."""
+        f = _arm_recovery_fixture(tmp_path)
+        guard = AsyncMock(return_value=None)
+
+        with patch(_WF_GATE_TARGET, guard), pytest.raises(AssertionError):
+            await f.wf._finalise_recovery_done(kind='merged', note='n', **bad)
+
+        guard.assert_not_awaited()
+
+    # --- integration: the REAL callers honour the widened return type ------
+
+    async def test_recover_before_execute_journal_arm_honours_a_block(
+        self, tmp_path: Path,
+    ):
+        """Guard 2's journal arm, driven end-to-end: a blocked chokepoint must
+        surface as ``None`` (no recovery — proceed with EXECUTE), not as a
+        crash or a phantom DONE."""
+        f = _arm_recovery_fixture(tmp_path)
+        _bind_landed_row(tmp_path, task_id=f.wf.task_id, advanced_sha='advancedsha123')
+        guard = AsyncMock(return_value=DeliveredChecksBlock(
+            reason='failed', main_sha='m' * 40, failed_check=_WF_DC_CHECK,
+        ))
+
+        with patch(_WF_GATE_TARGET, guard):
+            outcome = await f.wf._recover_before_execute()
+
+        assert outcome is None
+        f.mark_done.assert_not_awaited()
+        assert f.wf._merge_recovery_basis is None
+
+    async def test_recover_if_already_merged_fallback_arm_honours_a_block(
+        self, tmp_path: Path,
+    ):
+        """Guard 1's fallback (``found_on_main``) arm, driven end-to-end —
+        the arm whose stamps the acceptance predicate actually audits."""
+        f = _arm_recovery_fixture(tmp_path)
+        f.wf._check_branch_on_main = AsyncMock(  # type: ignore[method-assign]
+            return_value=('wthead123', 'mainsha123'),
+        )
+        f.wf._has_prior_implementation = MagicMock(  # type: ignore[method-assign]
+            return_value=_PriorImplStatus(has_work=True, entries=[], base_commit=None),
+        )
+        guard = AsyncMock(return_value=DeliveredChecksBlock(
+            reason='failed', main_sha='m' * 40, failed_check=_WF_DC_CHECK,
+        ))
+
+        with patch(_WF_GATE_TARGET, guard):
+            outcome = await f.wf._recover_if_already_merged()
+
+        assert outcome is None
+        f.mark_done.assert_not_awaited()
+        assert f.wf._merge_recovery_basis is None
