@@ -857,6 +857,38 @@ def render_manifest(selected: Sequence[ScoredRecord]) -> str:
     return '\n'.join(lines)
 
 
+def format_sample_summary_line(result: SampleResult, *, max_bytes: int) -> str:
+    """Render *result*'s accounting as ONE greppable ``key=value`` line.
+
+    The single source for both operator-facing surfaces: :func:`main`'s
+    stderr summary block appends it, and ``nightly.run_nightly`` logs it at
+    INFO on EVERY run. One formatter rather than two field lists, so the
+    diagnostic an operator runs by hand and the line the systemd timer
+    writes to the journal can never disagree about what the budget was
+    spent on (INV-5 no-lockstep-duplication) — the drift that let a
+    totally-budget-suppressed night read exactly like a genuine no-change
+    night for 14 nights (2026-07-16..29, task 3270).
+
+    Emits no prefix and no trailing newline: callers own both (nightly
+    prefixes the project id and target date, since one journal interleaves
+    every project's timer). Every field is on one line because that is what
+    an operator's ``journalctl ... | grep`` has to return as a single unit;
+    the per-stratum breakdown deliberately stays in :func:`main`'s
+    multi-line block, where it does not have to fit.
+
+    ``enumerated`` is :attr:`SampleResult.total_records` — one per
+    enumerated session in both production callers.
+    """
+    return (
+        f'enumerated={result.total_records} '
+        f'zero_signal_dropped={result.zero_signal_dropped} '
+        f'dedupe_collapsed={result.dedupe_collapsed} '
+        f'budget_skipped={result.budget_skipped} '
+        f'selected={len(result.selected)} '
+        f'bytes_used={result.bytes_used}/{max_bytes}'
+    )
+
+
 def _find_first_user_turn(path: Path) -> dict[str, Any] | None:
     """Find a session's first non-sidechain, non-meta user-turn record.
 
@@ -941,7 +973,11 @@ def main(argv: Sequence[str]) -> int:
     print(render_manifest(result.selected))
 
     summary = ['=== legibility sampler summary ===', '']
-    summary.append(f'sessions enumerated: {len(sessions)}')
+    # result.total_records rather than len(sessions): the same number (one
+    # ScoredRecord per enumerated session, just above), sourced from the
+    # object the greppable line below is also formatted from, so the
+    # human block and the one-liner cannot drift apart.
+    summary.append(f'sessions enumerated: {result.total_records}')
     summary.append(f'zero-signal dropped: {result.zero_signal_dropped}')
     summary.append(f'near-duplicate clones collapsed: {result.dedupe_collapsed}')
     for stratum in sorted(result.per_stratum_counts):
@@ -950,6 +986,13 @@ def main(argv: Sequence[str]) -> int:
         f'digest bytes used: {result.bytes_used} / {cfg.budgets.max_daily_digest_bytes}'
     )
     summary.append(f'budget-skipped candidates (would exceed cap): {result.budget_skipped}')
+    # The same greppable one-liner ``nightly.run_nightly`` logs to the
+    # journal, from the same formatter — so this hand-run diagnostic and the
+    # timer's nightly line can never report different numbers (INV-5).
+    summary.append('')
+    summary.append(
+        format_sample_summary_line(result, max_bytes=cfg.budgets.max_daily_digest_bytes)
+    )
     print('\n'.join(summary), file=sys.stderr)
 
     return 0
