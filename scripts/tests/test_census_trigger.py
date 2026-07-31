@@ -443,9 +443,16 @@ def test_compute_tasks_landed_missing_baseline_returns_none_with_one_warning(cap
 # census_trigger.compute_tasks_landed and census.run_census -- coerced EVERY
 # unusable payload to a done-count of 0 with no warning and no exception.
 # That is how a fabricated 0 was persisted as a real census baseline on
-# 2026-07-24 and again on 2026-07-31, which in turn made trigger condition
-# (b) compute `current_done - 0` (~2870, vastly over its 120 threshold) and
-# fire every ~7 days forever.
+# 2026-07-24 and again on 2026-07-31.
+#
+# Be precise about the harm, because the arithmetic matters: while the fetch
+# was also broken the poisoned baseline was self-cancelling (`current_done`
+# was zeroed by the same defect, so the delta was `0 - 0` and condition (b)
+# did NOT fire -- measured by replaying the 2026-07-31 decision against the
+# pre-task code). It is unsound because it ARMS (b) with a delta of ~2872,
+# ~24x its 120 threshold, the instant the fetch is repaired. Which is why
+# the payload guard, the absolute-project_root fix and the on-disk baseline
+# repair all had to land together. See census_trigger's module docstring.
 # ---------------------------------------------------------------------------
 
 # fused-memory's `_normalize_project_root` hard-rejects a relative path with
@@ -491,6 +498,16 @@ def test_extract_done_count_raises_when_statuses_key_absent():
         ct.extract_done_count({})
 
     assert "statuses" in str(excinfo.value)
+
+
+def test_extract_done_count_prefers_a_present_statuses_key_over_an_error_key():
+    """Pin the documented precedence of the error-envelope guard: it is
+    conditioned on `"statuses" not in payload`, so a payload that DOES carry a
+    real status snapshot is counted even if some stray `error` key rides along.
+    Untested, a future reorder of the two guards would flip this silently --
+    and the wrong direction (rejecting a usable snapshot) reintroduces exactly
+    the never-observable baseline this module exists to avoid."""
+    assert ct.extract_done_count({"statuses": {"1": "done"}, "error": "x"}) == 1
 
 
 def test_extract_done_count_raises_when_statuses_is_not_a_mapping():
@@ -686,6 +703,25 @@ def test_default_status_fetcher_sends_absolute_project_root_for_relative_subdir(
 
     assert sent == str((tmp_path / "sub" / "dir").resolve())
     assert Path(sent).is_absolute()
+
+
+def test_default_status_fetcher_leaves_absolute_project_root_unchanged(tmp_path, monkeypatch):
+    """The other half of the contract: an ALREADY-absolute root must cross the
+    wire byte-for-byte unchanged. Both tests above start from a relative path,
+    so on their own they would not notice a "fix" that mangles absolute inputs.
+
+    This matters concretely because fused-memory keys its `_MAIN_CHECKOUT_CACHE`
+    on the path it is handed: if `resolve()` were ever to rewrite an operator's
+    configured root (a symlinked home, say `/home/leo` -> elsewhere), the cache
+    key would silently stop matching the configured one. Pinning pass-through
+    for the already-absolute case is what keeps this fix a normalisation of
+    relative paths rather than a rewrite of every path."""
+    monkeypatch.chdir(tmp_path)
+    absolute_root = str(tmp_path)
+
+    sent = _capture_get_statuses_project_root(monkeypatch, absolute_root)
+
+    assert sent == absolute_root
 
 
 # ---------------------------------------------------------------------------

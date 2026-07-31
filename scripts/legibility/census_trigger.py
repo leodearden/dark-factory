@@ -31,9 +31,34 @@ THREE-VALUED (task 3291):
 
 Only a real int ever arms condition (b). A FABRICATED `0` used to be the
 fourth case, and it was the dangerous one: `census.py` wrote 0 whenever the
-get_statuses call failed, which made the delta `current_done - 0` — every
-done task ever, trivially over the threshold — so condition (b) fired every
-~7 days. Task 3291 removed that path; `census.advance_census_state` now
+get_statuses call failed, and that 0 was persisted as a real baseline on
+2026-07-24 and on 2026-07-31. It is UNSOUND rather than immediately
+visible, and the distinction matters for anyone debugging over-firing —
+these are the measured facts (2026-07-31 decision replayed against the
+pre-task code at merge-base `2b0afe47d9`, with the historical state and
+codebook from `3e462e1b56^`):
+
+  * while the fetch was ALSO broken the fabricated 0 was self-cancelling.
+    The same relative-project_root defect zeroed `current_done` too, so the
+    delta was `0 - 0 = 0` — far under the 120 threshold. Replay of the real
+    pre-fix census.py gate reports `tasks-landed: 0 landed since last
+    census (threshold 120)`: condition (b) did NOT fire. In the nightly
+    trickle it could not fire at all, since `run_nightly` defaults
+    `status_fetcher=None` (nightly.py:727 -> :901) and (b) is structurally
+    N/A there;
+  * but it ARMS (b) the moment the fetch is repaired: with a working
+    fetcher the same replay reports `tasks-landed: 2872 landed since last
+    census (threshold 120) -> FIRE`, ~24x over. So the root-cause fix below
+    would have DETONATED the poisoned baseline had the two not landed
+    together with the on-disk data repair.
+
+What actually fired the 2026-07-31 census was condition (c): `novelty-spike:
+25 candidate(s) within 72h (threshold 4)`. Condition (a) did not fire either
+(7.4d elapsed, 10d threshold). Recalibrating the novelty-spike thresholds is
+NOT part of task 3291 — see the follow-up filed against
+docs/legibility/legibility.yaml.
+
+Task 3291 removed the fabricated-0 path; `census.advance_census_state` now
 persists `null` for an unobservable count, and `extract_done_count` below is
 the single chokepoint that refuses to turn an unusable payload into a
 number.
@@ -421,6 +446,39 @@ class StatusFetchUnavailable(Exception):
     caller -- catch fetch failures deterministically."""
 
 
+# Every `StatusFetchUnavailable` message below is re-emitted verbatim by
+# `compute_tasks_landed`'s WARNING and by `census.run_census`'s "done-count
+# unobservable (%s)" WARNING, i.e. into the nightly systemd journal. An
+# unbounded `{payload!r}` there would dump a whole malformed-but-large body
+# (get_statuses over a big project is thousands of entries) into a single log
+# line -- the opposite of the legible failure this module is for. Diagnosis
+# only ever needs the shape, so the reprs are truncated and the type
+# name/key list, which is what actually identifies the fault, is always
+# reported outside the truncated part.
+_MAX_REPR_CHARS = 200
+_MAX_REPORTED_KEYS = 20
+
+
+def _bounded_repr(value, limit: int = _MAX_REPR_CHARS) -> str:
+    """`repr(value)` truncated to *limit* chars with an explicit elision
+    marker, so a log line stays one readable line regardless of payload size."""
+    text = repr(value)
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}... (repr truncated, {len(text)} chars total)"
+
+
+def _bounded_keys(mapping) -> str:
+    """A bounded, order-stable summary of a mapping's keys. Sorts by `str` so
+    a payload with mixed-type keys cannot raise `TypeError` from inside the
+    error path itself -- a failure while reporting a failure is the worst
+    possible place to be clever."""
+    keys = sorted(mapping, key=str)
+    shown = keys[:_MAX_REPORTED_KEYS]
+    suffix = f", ... ({len(keys)} total)" if len(keys) > _MAX_REPORTED_KEYS else ""
+    return f"{shown}{suffix}"
+
+
 def extract_done_count(payload) -> int:
     """Count `"done"` values in a get_statuses payload, or raise
     `StatusFetchUnavailable` if *payload* is not a usable get_statuses
@@ -436,9 +494,13 @@ def extract_done_count(payload) -> int:
     returns its `{"error", "error_type"}` dict on an `isError: false`
     JSON-RPC response, so `_extract_tool_result` unwraps it as though it
     were a genuine result and the old idiom read it as 0. That fabricated 0
-    was persisted as a real census baseline on 2026-07-24 and 2026-07-31,
-    after which condition (b) computed `current_done - 0` (~2870, far over
-    its 120 threshold) and fired every ~7 days (task 3291).
+    was persisted as a real census baseline on 2026-07-24 and on 2026-07-31
+    (task 3291) — an unsound baseline that stayed latent only for as long as
+    the fetch itself was broken (the same defect zeroed `current_done`, so
+    the delta was `0 - 0`), and that arms condition (b) with a delta of
+    ~2872 — every done task ever, ~24x its 120 threshold — as soon as the
+    fetch is repaired. See the module docstring for the replayed
+    measurements, including what actually fired the 2026-07-31 census.
 
     `{"statuses": {}}` is deliberately a VALID done-count of 0: a project
     with no done tasks is a real, expected state, and
@@ -460,11 +522,16 @@ def extract_done_count(payload) -> int:
     Raises:
         StatusFetchUnavailable: with a message naming the offending shape --
             or quoting the server's own `error` text -- so the operator sees
-            the real cause rather than a generic complaint.
+            the real cause rather than a generic complaint. The identifying
+            facts (type name, key list, container length) are always stated
+            in full; any embedded value repr is bounded, because this message
+            is re-emitted into the nightly journal as a single log line (see
+            `_bounded_repr`).
     """
     if not isinstance(payload, dict):
         raise StatusFetchUnavailable(
-            f"get_statuses payload is not a dict (got {type(payload).__name__}): {payload!r}"
+            f"get_statuses payload is not a dict (got {type(payload).__name__}): "
+            f"{_bounded_repr(payload)}"
         )
 
     # The fused-memory tool-error envelope, checked before the shape
@@ -474,19 +541,21 @@ def extract_done_count(payload) -> int:
     if "statuses" not in payload and "error" in payload:
         raise StatusFetchUnavailable(
             f"get_statuses returned a tool-error envelope "
-            f"({payload.get('error_type') or 'error'}): {payload.get('error')!r}"
+            f"({payload.get('error_type') or 'error'}): "
+            f"{_bounded_repr(payload.get('error'))}"
         )
 
     if "statuses" not in payload:
         raise StatusFetchUnavailable(
-            f"get_statuses payload has no 'statuses' key (keys: {sorted(payload)})"
+            f"get_statuses payload has no 'statuses' key (keys: {_bounded_keys(payload)})"
         )
 
     statuses = payload["statuses"]
     if not isinstance(statuses, Mapping):
+        sized = f", len={len(statuses)}" if hasattr(statuses, "__len__") else ""
         raise StatusFetchUnavailable(
             f"get_statuses 'statuses' is not a mapping "
-            f"(got {type(statuses).__name__}): {statuses!r}"
+            f"(got {type(statuses).__name__}{sized}): {_bounded_repr(statuses)}"
         )
 
     return sum(1 for status in statuses.values() if status == "done")
@@ -593,7 +662,9 @@ def _extract_tool_result(rpc_response: dict) -> dict:
     """
     result = rpc_response.get("result") if isinstance(rpc_response, dict) else None
     if not isinstance(result, dict):
-        raise StatusFetchUnavailable(f"malformed MCP response (no result): {rpc_response!r}")
+        raise StatusFetchUnavailable(
+            f"malformed MCP response (no result): {_bounded_repr(rpc_response)}"
+        )
 
     structured = result.get("structuredContent")
     if isinstance(structured, dict):
@@ -612,7 +683,8 @@ def _extract_tool_result(rpc_response: dict) -> dict:
                 return parsed
 
     raise StatusFetchUnavailable(
-        f"MCP tools/call result has neither structuredContent nor parseable content: {result!r}"
+        f"MCP tools/call result has neither structuredContent nor parseable "
+        f"content: {_bounded_repr(result)}"
     )
 
 

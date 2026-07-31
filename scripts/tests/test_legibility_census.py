@@ -940,11 +940,12 @@ def test_advance_census_state_writes_none_done_count_as_json_null(tmp_path):
 
 def test_null_done_count_baseline_makes_condition_b_fail_safe(tmp_path, caplog):
     """End-to-end proof that an UNKNOWN baseline disarms condition (b)
-    instead of always-firing it. A poisoned `0` baseline made
-    compute_tasks_landed return `current_done - 0` -- every done task ever,
-    trivially over the 120 threshold -- so (b) fired every ~7 days forever.
-    A `null` baseline routes into the existing absent-baseline branch: one
-    WARNING, `None`, no fire."""
+    instead of arming it. A poisoned `0` baseline makes compute_tasks_landed
+    return `current_done - 0` -- every done task ever, ~24x over the 120
+    threshold -- as soon as the get_statuses fetch works (task 3291; see
+    census_trigger's module docstring for the replayed measurements). A
+    `null` baseline instead routes into the existing absent-baseline branch:
+    one WARNING, `None`, no fire."""
     path = tmp_path / "census-state.json"
     mod.advance_census_state(
         path, now_iso="2026-07-31T12:00:00+00:00", report_path="plans/x.md", done_count=None,
