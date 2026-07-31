@@ -29,6 +29,15 @@ from datetime import UTC, datetime, timedelta
 
 from fused_memory.reconciliation.mem0_tombstone import record_mem0_deletion_tombstone
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord
+from fused_memory.reconciliation.recon_pool_map import (
+    CYCLE_SUMMARY_KIND,
+)
+from fused_memory.reconciliation.recon_pool_map import (
+    CYCLE_SUMMARY_RECORD_TYPE_LEDGER_STAMP as _CYCLE_SUMMARY_RECORD_TYPE_LEDGER_STAMP,
+)
+from fused_memory.reconciliation.recon_pool_map import (
+    CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE as _CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE,
+)
 from fused_memory.utils.async_utils import gather_collect
 
 logger = logging.getLogger(__name__)
@@ -48,46 +57,35 @@ CYCLE_SUMMARY_TTL_DAYS: int = 30
 # reconstruction/self-heal cycle_summary write in
 # ``reconciliation.prompts.stage2`` (NARRATIVE).
 #
-# Only LEDGER_STAMP is actually single-sourced today: it is imported by this
-# module's own write_cycle_summary below, so changing its value here changes
-# the real write. NARRATIVE has no Python consumer yet — prompts/stage2.py
-# and recon_self_model.py hardcode the literal 'narrative' in prose/f-string
-# text instead of importing it, because those prompt modules are deliberately
-# import-light (prompt-import path) and must not pull in this module's
-# recon_ledger -> aiosqlite import chain just to read a string constant (see
-# recon_self_model.py's module docstring). NARRATIVE is therefore a reserved
-# placeholder documenting the intended value for a future Python consumer
-# (e.g. near-duplicate/dedup tooling) that sits on the same import side as
-# this module; until such a consumer exists, keeping the prompt-side literal
-# in sync with this value is a manual, reviewed invariant rather than an
-# enforced one. Both literal values are frozen by convention — plain string
-# discriminators with no anticipated reason to ever change. There is no
-# automated pin test guarding them; if either constant is ever edited, also
-# check that the prompt-side literal (prompts/stage2.py, recon_self_model.py)
-# stays in sync, since that invariant is reviewed rather than enforced.
-#
-# record_type is write-only as of task 2468: no reader (dedup/near-duplicate
-# tooling, Path-2 verification, pool-cap trim) filters on it yet — the fix
-# that actually stops the double-write is the removed normal-flow LLM
-# instruction (recon_self_model.py), not this discriminator. That is
-# reviewed and accepted as cheap, well-documented forward-compat metadata;
-# per YAGNI, no consumer is added here speculatively — one lands alongside
-# the dedup/near-duplicate tooling that needs it.
+# record_type was write-only as of task 2468: no reader (dedup/near-duplicate
+# tooling, Path-2 verification, pool-cap trim) filtered on it — the fix that
+# actually stopped the double-write was the removed normal-flow LLM
+# instruction (recon_self_model.py), not this discriminator.
 #
 # Task 3041 gives LEDGER_STAMP its first two real readers: this module's own
 # record_type-aware eviction order in enforce_summary_pool_cap below, and
-# reconciliation.mem0_tombstone.is_protected_mirror_record. That module
-# mirrors this literal rather than importing it — it is imported BY this
-# module (for the trim-path tombstone write), so the reverse edge would be a
-# cycle. If either literal is ever edited, edit both.
-CYCLE_SUMMARY_RECORD_TYPE_LEDGER_STAMP: str = 'ledger_stamp'
-CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE: str = 'narrative'
+# reconciliation.mem0_tombstone.is_protected_mirror_record. Because
+# mem0_tombstone is imported BY this module (for the trim-path tombstone
+# write), it cannot import back — so the literals now live in the leaf
+# recon_pool_map alongside the pool names, single-sourced for both readers,
+# and are re-exported here under their historical names. See that module for
+# why (task 3041 amendment pass: they were previously duplicated with nothing
+# pinning the copies equal, so an edit to one side would silently disable half
+# the protected-mirror guard).
+#
+# NARRATIVE still has no Python consumer; keeping the prompt-side literal
+# (prompts/stage2.py, recon_self_model.py) in sync remains a reviewed
+# invariant rather than an enforced one.
+CYCLE_SUMMARY_RECORD_TYPE_LEDGER_STAMP: str = _CYCLE_SUMMARY_RECORD_TYPE_LEDGER_STAMP
+CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE: str = _CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE
 
 # metadata.kind identifying a cycle_summary record. Written by
 # write_cycle_summary's mirror below, keyed on by
 # services.memory_service._apply_cycle_summary_metadata_tagging, and now also
 # the enumeration constraint for enforce_summary_pool_cap (task 3041).
-_KIND_CYCLE_SUMMARY: str = 'cycle_summary'
+# Single-sourced in recon_pool_map for the same reason as the record_types
+# above — mem0_tombstone.is_protected_mirror_record needs the same literal.
+_KIND_CYCLE_SUMMARY: str = CYCLE_SUMMARY_KIND
 
 # Explicit scroll bound for the pool enumeration below (task 3041). Same value
 # as get_memories_by_metadata's own default, which this previously relied on

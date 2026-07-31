@@ -75,6 +75,55 @@ class TestIsProtectedMirrorRecord:
         assert isinstance(MEM0_TOMBSTONE_TTL_DAYS, int)
         assert MEM0_TOMBSTONE_TTL_DAYS > 0
 
+    def test_discriminators_are_single_sourced_not_copied(self):
+        """Every module's view of the two discriminators must be ONE literal.
+
+        The guard above is an OR over ``kind`` and ``record_type``, and the
+        pool trim in summary_pool matches on the same two literals from the
+        other side of an import edge this module cannot traverse back. They
+        were originally duplicated here and "kept in sync BY CONVENTION", with
+        nothing pinning the copies equal — so an edit to summary_pool's copy
+        alone would have silently disabled half this guard (a ledger_stamp
+        mirror would stop being protected while still being trimmed), which is
+        indistinguishable from the silent loss task 3041 exists to make
+        impossible.
+
+        They now live in the import-free leaf ``recon_pool_map``. This test
+        fails loudly if anyone re-duplicates them (reviewer finding
+        duplication, task 3041 amendment pass).
+        """
+        from fused_memory.reconciliation import mem0_tombstone, recon_pool_map, summary_pool
+
+        assert recon_pool_map.CYCLE_SUMMARY_KIND == 'cycle_summary'
+        assert recon_pool_map.CYCLE_SUMMARY_RECORD_TYPE_LEDGER_STAMP == 'ledger_stamp'
+        assert recon_pool_map.CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE == 'narrative'
+
+        # The predicate's inputs and the trim's filter/eviction-order inputs
+        # must be the SAME value, not two that merely happen to match today.
+        assert (
+            mem0_tombstone._KIND_CYCLE_SUMMARY
+            == summary_pool._KIND_CYCLE_SUMMARY
+            == recon_pool_map.CYCLE_SUMMARY_KIND
+        )
+        assert (
+            mem0_tombstone._RECORD_TYPE_LEDGER_STAMP
+            == summary_pool.CYCLE_SUMMARY_RECORD_TYPE_LEDGER_STAMP
+            == recon_pool_map.CYCLE_SUMMARY_RECORD_TYPE_LEDGER_STAMP
+        )
+        assert (
+            summary_pool.CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE
+            == recon_pool_map.CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE
+        )
+
+        # recon_pool_map must stay the import-free leaf that makes this
+        # single-sourcing possible from BOTH sides of the summary_pool ->
+        # mem0_tombstone edge.
+        import inspect
+
+        source = inspect.getsource(recon_pool_map)
+        assert 'import fused_memory' not in source
+        assert 'from fused_memory' not in source
+
 
 _NOW = datetime(2026, 7, 30, 12, 0, 0, tzinfo=UTC)
 _VICTIM_METADATA = {

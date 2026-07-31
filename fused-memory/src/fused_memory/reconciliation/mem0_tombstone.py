@@ -59,13 +59,16 @@ point instead, where every current and future sweep inherits it.
 
 Import posture
 --------------
-NEAR-LEAF: imports only ``reconciliation.recon_ledger`` — the same single
-import edge ``reconciliation.summary_pool`` already has. It must NOT import
+NEAR-LEAF: imports only ``reconciliation.recon_ledger`` (for the store's row
+type and record_kind) and the import-free leaf ``reconciliation.recon_pool_map``
+(for the two cycle_summary metadata discriminators) — both of which
+``reconciliation.summary_pool`` also imports. It must NOT import
 ``summary_pool`` (which imports this module for the trim-path tombstone
 write, so that edge would be a cycle) nor anything under
 ``fused_memory.services`` (see ``recon_pool_map.py``'s docstring for the
 memory_consolidator -> task_knowledge_sync -> services -> memory_service
-cycle this package is careful to avoid).
+cycle this package is careful to avoid). Every shared literal therefore lives
+DOWN-import from both readers, never duplicated across the summary_pool edge.
 """
 
 from __future__ import annotations
@@ -77,6 +80,10 @@ from datetime import UTC, datetime, timedelta
 from fused_memory.reconciliation.recon_ledger import (
     RECORD_KIND_MEM0_TOMBSTONE,
     ReconLedgerRecord,
+)
+from fused_memory.reconciliation.recon_pool_map import (
+    CYCLE_SUMMARY_KIND,
+    CYCLE_SUMMARY_RECORD_TYPE_LEDGER_STAMP,
 )
 
 logger = logging.getLogger(__name__)
@@ -108,18 +115,22 @@ __all__ = [
 # the window in which an auditor investigates a missing record.
 MEM0_TOMBSTONE_TTL_DAYS: int = 30
 
-# Kept in sync BY CONVENTION with summary_pool.CYCLE_SUMMARY_RECORD_TYPE_LEDGER_STAMP
-# (task 2468) rather than imported from it: summary_pool imports THIS module
-# (enforce_summary_pool_cap writes a tombstone per trimmed member), so an
-# import in the other direction would be a cycle. If either literal is ever
-# edited, edit both — summary_pool.py carries the reciprocal note.
-_RECORD_TYPE_LEDGER_STAMP: str = 'ledger_stamp'
-
-# metadata.kind identifying the cycle_summary mirror pool. Mirrored from the
-# literal written by summary_pool.write_cycle_summary's add_system_record
-# call and by services.memory_service._apply_cycle_summary_metadata_tagging;
-# same no-cycle rationale as above.
-_KIND_CYCLE_SUMMARY: str = 'cycle_summary'
+# The two discriminators is_protected_mirror_record checks. SINGLE-SOURCED in
+# the leaf recon_pool_map (task 3041 amendment pass), which also owns the
+# recon_pool names for the same pool, and which imports nothing at all so both
+# this module and summary_pool can reach it.
+#
+# They used to be private copies here, "kept in sync BY CONVENTION" with
+# summary_pool's, because summary_pool imports THIS module
+# (enforce_summary_pool_cap writes a tombstone per trimmed member) and the
+# reverse edge would be a cycle. Nothing pinned the copies equal, so an edit to
+# one side would have silently disabled half the guard below — the lockstep
+# literal duplication INV-5 forbids (same fix as RECORD_KIND_MEM0_TOMBSTONE
+# above, in the other direction). tests/test_mem0_tombstone.py now also pins
+# every module's view of these literals identical, so a re-duplication fails
+# loudly rather than degrading the guard.
+_RECORD_TYPE_LEDGER_STAMP: str = CYCLE_SUMMARY_RECORD_TYPE_LEDGER_STAMP
+_KIND_CYCLE_SUMMARY: str = CYCLE_SUMMARY_KIND
 
 # Identifying victim keys copied into a tombstone payload. Deliberately an
 # identity-only projection — never the record's content — so a tombstone
