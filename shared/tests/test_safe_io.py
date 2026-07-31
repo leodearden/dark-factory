@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import stat
 
 import pytest
 
@@ -511,3 +512,93 @@ class TestAtomicWriteMkdir:
             atomic_write_text(p, 'payload')
 
         assert not p.parent.exists()
+
+
+class TestAtomicWriteDurability:
+    """``fsync`` opt-in — the durability contract ``landed_outbox`` depends on.
+
+    Ordering is the substance here: fsyncing the parent directory BEFORE the
+    rename provides no durability for that rename, so the test pins the temp-fd
+    fsync as pre-replace and the dir-fd fsync as post-replace, not merely a
+    call count.
+    """
+
+    @staticmethod
+    def _record_calls(monkeypatch):
+        """Patch os.fsync/os.replace on the module and return the event log."""
+        import shared.safe_io as _safe_io
+
+        events: list[str] = []
+        real_fsync = os.fsync
+        real_replace = os.replace
+
+        def traced_fsync(fd):
+            # A directory fd reports S_ISDIR; a regular temp file does not.
+            kind = 'dir' if stat.S_ISDIR(os.fstat(fd).st_mode) else 'file'
+            events.append(f'fsync:{kind}')
+            return real_fsync(fd)
+
+        def traced_replace(src, dst):
+            events.append('replace')
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(_safe_io.os, 'fsync', traced_fsync)
+        monkeypatch.setattr(_safe_io.os, 'replace', traced_replace)
+        return events
+
+    def test_default_does_not_fsync(self, tmp_path, monkeypatch):
+        """fsync=False (default) calls os.fsync zero times — nine sites rely on this."""
+        from shared.safe_io import atomic_write_text
+
+        events = self._record_calls(monkeypatch)
+        atomic_write_text(tmp_path / 'state.json', 'payload')
+
+        assert [e for e in events if e.startswith('fsync')] == []
+        assert events == ['replace']
+
+    def test_fsync_true_syncs_file_before_and_dir_after_replace(self, tmp_path, monkeypatch):
+        """fsync=True: temp fd before the rename, parent dir fd after it."""
+        from shared.safe_io import atomic_write_text
+
+        events = self._record_calls(monkeypatch)
+        p = tmp_path / 'state.json'
+        atomic_write_text(p, 'payload', fsync=True)
+
+        assert events == ['fsync:file', 'replace', 'fsync:dir']
+        assert len([e for e in events if e.startswith('fsync')]) == 2
+        assert p.read_text(encoding='utf-8') == 'payload'
+
+    def test_dir_fd_closed_even_when_dir_fsync_raises(self, tmp_path, monkeypatch):
+        """A failing directory fsync must not leak the fd it opened."""
+        import shared.safe_io as _safe_io
+
+        opened: list[int] = []
+        closed: list[int] = []
+        real_open = os.open
+        real_close = os.close
+        real_fsync = os.fsync
+
+        def traced_open(path, flags, *a, **kw):
+            fd = real_open(path, flags, *a, **kw)
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                opened.append(fd)
+            return fd
+
+        def traced_close(fd):
+            closed.append(fd)
+            return real_close(fd)
+
+        def traced_fsync(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError('dir fsync failed')
+            return real_fsync(fd)
+
+        monkeypatch.setattr(_safe_io.os, 'open', traced_open)
+        monkeypatch.setattr(_safe_io.os, 'close', traced_close)
+        monkeypatch.setattr(_safe_io.os, 'fsync', traced_fsync)
+
+        with pytest.raises(OSError, match='dir fsync failed'):
+            _safe_io.atomic_write_text(tmp_path / 'state.json', 'payload', fsync=True)
+
+        assert opened, 'expected a directory fd to have been opened for the dir fsync'
+        assert set(opened) <= set(closed), f'leaked dir fds: {set(opened) - set(closed)}'
