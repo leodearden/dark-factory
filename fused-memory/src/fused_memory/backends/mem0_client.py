@@ -343,6 +343,8 @@ class Mem0Backend:
         scope: Scope,
         filters: dict[str, Any],
         limit: int = 1000,
+        *,
+        with_vectors: bool = False,
     ) -> list[dict[str, Any]]:
         """Deterministic enumeration of memories whose payload matches all *filters*.
 
@@ -365,11 +367,26 @@ class Mem0Backend:
                 count_by_metadata).  Empty dict is rejected to avoid silently
                 enumerating every memory in the collection.
             limit: Maximum number of points to return (default 1000).
+            with_vectors: When False (default) only the payload is fetched,
+                preserving the payload-only contract every existing caller
+                relies on and paying no bandwidth for vectors nobody reads.
+                When True, each point's stored vector is fetched and lifted
+                onto its result dict under ``'vector'``.  This exists for ANN
+                candidate generation (``scripts/audit_duplicate_memories.py``):
+                re-using the vector Mem0 already wrote means the caller can
+                query Qdrant for neighbours without making a single embedding
+                API call, and without risking a second metric space.
 
         Returns:
             List of dicts ``{'id': ..., 'created_at': ..., 'metadata': {...}}``
             where ``created_at`` is the raw string from the Qdrant payload (or
             ``None`` if absent) and ``metadata`` is the full payload dict.
+            When *with_vectors* is True each dict additionally carries
+            ``'vector'`` — the stored embedding, or ``None`` if Qdrant
+            returned that point without one.  A vector-less point is still
+            returned (degraded, not dropped) so the caller can count and
+            report it rather than losing it silently; the ``'vector'`` key is
+            absent entirely when *with_vectors* is False.
 
         Raises:
             ValueError: If *filters* is empty.
@@ -397,6 +414,7 @@ class Mem0Backend:
                 collection_name=collection_name,
                 scroll_filter=qdrant_filter,
                 with_payload=True,
+                with_vectors=with_vectors,
                 limit=limit,
             ),
             timeout=self._read_timeout,
@@ -405,11 +423,18 @@ class Mem0Backend:
         result = []
         for point in points:
             payload: dict[str, Any] = dict(point.payload) if point.payload else {}
-            result.append({
+            record: dict[str, Any] = {
                 'id': point.id,
                 'created_at': payload.get('created_at'),
                 'metadata': payload,
-            })
+            }
+            if with_vectors:
+                # getattr-with-default, not point.vector: Qdrant can return a
+                # point carrying no vector at all.  Degrade to None so the
+                # caller can count it as a disclosure — raising here would
+                # discard an entire otherwise-good scan over one bad point.
+                record['vector'] = getattr(point, 'vector', None)
+            result.append(record)
 
         if len(points) == limit:
             logger.warning(
