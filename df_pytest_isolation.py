@@ -137,3 +137,35 @@ def reject_unsafe_basetemp(config: object) -> None:
     reason = basetemp_rejection_reason(basetemp)
     if reason is not None:
         raise pytest.UsageError(reason)
+
+
+@pytest.fixture(scope='session', autouse=True)
+def _df_git_ceiling_at_basetemp(tmp_path_factory: pytest.TempPathFactory):
+    """Contain git's upward walk inside this run's pytest basetemp.
+
+    SESSION scope is deliberate, on two counts.  Cost: the repo already
+    documents this concern for ``_ABSENT_WARM_LANE_SCRIPT_DIR`` in
+    ``orchestrator/tests/conftest.py`` — a per-test fixture runs "thousands of
+    times, times every xdist worker".  Coverage: a function-scoped autouse
+    fixture would miss git run from module- and session-scoped fixtures, which
+    is exactly where expensive repo setup tends to live.
+
+    Under xdist each worker process gets its own ``popen-gwN`` basetemp and
+    sets its own ceiling in its own environment; no coordination is needed.
+
+    Restores the previous value EXACTLY on teardown, including restoring
+    absence by deleting the key rather than setting an empty string — git reads
+    an empty entry as the "subsequent entries are not symlinks" marker, not as
+    "unset".
+    """
+    saved = os.environ.get(_CEILING_ENV)
+    os.environ[_CEILING_ENV] = git_ceiling_value(
+        tmp_path_factory.getbasetemp(), existing=saved,
+    )
+    try:
+        yield
+    finally:
+        if saved is None:
+            os.environ.pop(_CEILING_ENV, None)
+        else:
+            os.environ[_CEILING_ENV] = saved
