@@ -6,6 +6,8 @@ import json
 import logging
 import os
 import stat
+import threading
+from pathlib import Path
 
 import pytest
 
@@ -602,3 +604,133 @@ class TestAtomicWriteDurability:
 
         assert opened, 'expected a directory fd to have been opened for the dir fsync'
         assert set(opened) <= set(closed), f'leaked dir fds: {set(opened) - set(closed)}'
+
+
+class TestAtomicWriteRaceSafety:
+    """The regression this consolidation exists to pin.
+
+    Five of the migrated sites derived their temp name deterministically from
+    the destination (``<dest>.json.tmp``), so two concurrent writers shared one
+    temp and could interleave into a torn ``os.replace``.  These tests pin the
+    properties that make that impossible.
+    """
+
+    def test_destination_never_holds_a_partial_write(self, tmp_path, monkeypatch):
+        """At the instant before the rename the destination still holds the OLD content.
+
+        Deterministic — no threads.  The payload is >1MiB so that a naive
+        direct write would necessarily be chunked and observably partial.
+        """
+        import shared.safe_io as _safe_io
+
+        old = 'OLD' * 8
+        new = 'N' * (1024 * 1024 + 7)
+
+        p = tmp_path / 'state.json'
+        p.write_text(old, encoding='utf-8')
+
+        observed: list[str] = []
+        real_replace = os.replace
+
+        def peeking_replace(src, dst):
+            # Read the DESTINATION just before it is atomically swapped.
+            observed.append(Path(dst).read_text(encoding='utf-8'))
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(_safe_io.os, 'replace', peeking_replace)
+        _safe_io.atomic_write_text(p, new)
+
+        assert observed == [old], 'destination was mutated before the rename'
+        assert p.read_text(encoding='utf-8') == new
+
+    def test_repeated_writes_leave_exactly_one_file(self, tmp_path):
+        """50 sequential writes to one destination leave no temp residue."""
+        from shared.safe_io import atomic_write_text
+
+        p = tmp_path / 'state.json'
+        for i in range(50):
+            atomic_write_text(p, f'payload-{i}')
+
+        assert sorted(q.name for q in tmp_path.iterdir()) == ['state.json']
+        assert p.read_text(encoding='utf-8') == 'payload-49'
+
+    def test_temp_name_is_unique_per_writer(self, tmp_path, monkeypatch):
+        """Concurrent writers to one destination never share a temp path.
+
+        This is precisely what a fixed ``<dest>.json.tmp`` name cannot satisfy.
+        """
+        import shared.safe_io as _safe_io
+
+        sources: list[str] = []
+        lock = threading.Lock()
+        real_replace = os.replace
+
+        def recording_replace(src, dst):
+            with lock:
+                sources.append(str(src))
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(_safe_io.os, 'replace', recording_replace)
+
+        p = tmp_path / 'state.json'
+        barrier = threading.Barrier(8)
+
+        def writer(n):
+            barrier.wait()
+            _safe_io.atomic_write_text(p, f'payload-{n}')
+
+        threads = [threading.Thread(target=writer, args=(n,)) for n in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert len(sources) == 8
+        assert len(set(sources)) == 8, f'temp names collided across writers: {sources}'
+
+    def test_concurrent_writers_never_expose_torn_json(self, tmp_path):
+        """A reader racing N writers only ever sees one writer's complete payload.
+
+        Asserts completeness of whatever was observed — never a minimum number
+        of observed reads — so scheduling can never make this flake.
+        """
+        from shared.safe_io import atomic_write_text
+
+        p = tmp_path / 'state.json'
+        payloads = {n: json.dumps({'writer': n, 'filler': 'x' * 50_000}) for n in range(6)}
+        p.write_text(payloads[0], encoding='utf-8')
+
+        stop = threading.Event()
+        bad: list[str] = []
+        seen: list[int] = []
+
+        def reader():
+            while not stop.is_set():
+                try:
+                    raw = p.read_text(encoding='utf-8')
+                except FileNotFoundError:
+                    bad.append('destination vanished mid-write')
+                    continue
+                try:
+                    seen.append(json.loads(raw)['writer'])
+                except ValueError:
+                    bad.append(f'torn read: {raw[:60]!r}... len={len(raw)}')
+
+        def writer(n):
+            for _ in range(20):
+                atomic_write_text(p, payloads[n])
+
+        r = threading.Thread(target=reader, daemon=True)
+        r.start()
+        threads = [threading.Thread(target=writer, args=(n,)) for n in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        stop.set()
+        r.join(timeout=10)
+
+        assert bad == [], f'reader observed incomplete state: {bad[:3]}'
+        assert all(w in payloads for w in seen), 'reader saw a payload no writer wrote'
+        assert p.read_text(encoding='utf-8') in payloads.values()
+        assert sorted(q.name for q in tmp_path.iterdir()) == ['state.json']
