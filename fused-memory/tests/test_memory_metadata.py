@@ -645,3 +645,48 @@ class TestValidateMemoryMetadata:
         meta = {'topic': 'bad_slug', 'canonical': 'yes', 'parent_id': 'x'}
         for violation in self._validate(meta):
             assert 'fused_memory.memory_metadata' in violation.message
+
+    # -- fatal flag ------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        ('meta', 'code'),
+        [
+            ({'topic': 'bad_slug'}, 'invalid_topic_slug'),
+            ({'topic': 123}, 'invalid_topic_type'),
+            ({'canonical': 'yes'}, 'invalid_canonical_type'),
+            ({'kind': 42}, 'invalid_kind_type'),
+            ({'parent_id': 'deadbeef'}, 'invalid_parent_id_shape'),
+            ({'supersedes': [42]}, 'invalid_supersedes_member'),
+        ],
+    )
+    def test_shape_violations_are_fatal(self, meta, code):
+        """Malformed RESERVED keys are fatal; `enforce` is what decides
+        whether a fatal violation actually rejects.
+
+        This is the pin step-15's seam behaviour rests on: with
+        `enforce=True` a bad `topic` slug must RAISE, which is only true if
+        the shape violation carries fatal=True. Asserting it here — on the
+        pure function — means the seam test cannot be the only thing
+        standing between a silent downgrade and a lost contract.
+        """
+        violations = [v for v in self._validate(meta) if v.code == code]
+        assert violations, f'expected a {code} violation'
+        assert all(v.fatal is True for v in violations)
+
+    @pytest.mark.parametrize(
+        ('meta', 'kwargs', 'code'),
+        [
+            ({'weird_key': 1}, {}, 'unknown_key'),
+            ({'kind': 'not_in_registry_xyz'}, {}, 'unknown_kind'),
+        ],
+    )
+    def test_census_only_violations_are_not_fatal(self, meta, kwargs, code):
+        """The two census axes never reject under the shipped defaults.
+
+        `unknown_key` is census-only by design (1,627 distinct live keys);
+        `unknown_kind` is non-fatal unless `enforce_kind_registry` is on,
+        because leaf alpha measured D3's closed-registry premise false.
+        """
+        violations = [v for v in self._validate(meta, **kwargs) if v.code == code]
+        assert violations, f'expected a {code} violation'
+        assert all(v.fatal is False for v in violations)
