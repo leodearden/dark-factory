@@ -22,8 +22,9 @@ directory on ``sys.path``::
     import startup_completion_fixtures as scf
 
     for row in scf.load_startup_completion_corpus():
-        config_dir, session_id = scf.materialize_config_dir(row, tmp_path)
-        assert my_production_predicate(config_dir, session_id) == (
+        # ONE ROW PER DESTINATION — see materialize_config_dir's guard.
+        config_dir, session_id = scf.materialize_config_dir(row, tmp_path / row['id'])
+        assert my_production_predicate(config_dir, session_id) is (
             row['expected_startup_complete']
         )
 
@@ -467,8 +468,30 @@ def materialize_config_dir(row: Mapping[str, Any], dest: Path) -> tuple[Path, st
       resolves exactly as it does for a real config dir.  A row carrying
       ``transcript_raw_lines`` writes those literal lines instead — that is how
       the truncated/unparseable degrade row is expressed.
+
+    ONE ROW PER DESTINATION, enforced: a *dest* that already exists and is
+    non-empty raises ``AssertionError`` before anything is created.  The corpus
+    deliberately reuses session IDs across rows — they are samples of the SAME
+    probe run at different offsets — so reuse contaminates structurally rather
+    than incidentally: a leftover transcript from an earlier row is found by a
+    later row watching the same session.  Measured over the whole corpus, a
+    shared destination inverts exactly the row C5's conservative degrade rests
+    on (``wedge_transcript_unreadable_session_mismatch`` yields ``True`` instead
+    of the ``None`` unreadable sentinel), so this fails loudly instead of
+    handing 3326 a quietly wrong verdict.  An absent or existing-but-empty
+    *dest* — the shape every call site uses — is permitted.
     """
     config_dir = Path(dest)
+    # Explicit raise, not a bare `assert`: this guard must survive `python -O`,
+    # matching the sibling convention in `assert_no_credential_material`.
+    if config_dir.is_dir() and any(config_dir.iterdir()):
+        raise AssertionError(
+            f'materialize_config_dir: destination {config_dir} already exists and is '
+            f'not empty. Callers must materialize ONE ROW PER DESTINATION (e.g. '
+            f"`tmp_path / row['id']`) — the corpus reuses session IDs across rows, so "
+            f'a leftover transcript from an earlier row is found by a later row '
+            f'watching the same session, silently inverting its verdict.'
+        )
     config_dir.mkdir(parents=True, exist_ok=True)
 
     # Shortest-first so a parent dir always exists before its children.
