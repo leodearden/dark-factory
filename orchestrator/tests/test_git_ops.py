@@ -11762,11 +11762,26 @@ class TestGetHeadTreeHash:
         assert after  # non-empty
 
     async def test_non_git_dir_returns_none(
-        self, git_ops: GitOps, tmp_path: Path
+        self, git_ops: GitOps, git_repo: Path
     ):
-        not_a_repo = tmp_path / 'not-a-repo'
+        """Fail-safe: a non-git directory yields None, never raises.
+
+        The non-repo directory is placed INSIDE a live repo on purpose.  The
+        old version used a bare ``tmp_path / 'not-a-repo'``, whose "this is not
+        a git directory" premise was only ever true by accident of where
+        pytest's basetemp happened to live: under a basetemp nested inside a
+        git checkout, ``git rev-parse HEAD^{tree}`` walks UP, resolves the
+        enclosing repo and returns a real tree hash, so the ``is None``
+        assertion silently stops testing what it claims (esc-3072-3, same
+        defect class as ``_inject_uu_state``).
+
+        Nesting it makes the hazard the DEFAULT case rather than an
+        environmental accident, so the contract is asserted where it is hard
+        rather than where it is easy.
+        """
+        not_a_repo = git_repo / 'not-a-repo'
         not_a_repo.mkdir()
-        # Fail-safe: a non-git directory yields None, never raises.
+
         assert await git_ops.get_head_tree_hash(not_a_repo) is None
 
 
