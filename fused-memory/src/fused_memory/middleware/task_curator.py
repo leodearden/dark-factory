@@ -612,7 +612,8 @@ class TaskCurator:
         self._operational_registry_load_attempted: bool = False
         # Consecutive-ZOT circuit breaker (task 1743).
         # Counts CONSECUTIVE zero-output/full-timeout curator LLM failures;
-        # reset to 0 on any real LLM success or non-ZOT failure.
+        # reset to 0 only on a real LLM success. A non-ZOT failure leaves
+        # this counter untouched (neither incremented nor reset).
         self._consecutive_zero_output_timeouts: int = 0
         # monotonic() time until which the breaker is open (None = closed).
         self._zero_output_breaker_open_until: float | None = None

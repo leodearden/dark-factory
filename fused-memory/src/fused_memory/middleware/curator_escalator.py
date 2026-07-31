@@ -424,7 +424,7 @@ class CuratorEscalator:
             agent_role='fused-memory/task-curator',
             severity='blocking',
             category='curator_failure',
-            summary='TaskCurator LLM failing; dedupe disabled',
+            summary='TaskCurator LLM failing; dedupe disabled for this ticket.',
             detail=detail,
             level=1,
         )
