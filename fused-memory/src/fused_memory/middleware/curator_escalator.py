@@ -424,7 +424,10 @@ class CuratorEscalator:
             agent_role='fused-memory/task-curator',
             severity='blocking',
             category='curator_failure',
-            summary='TaskCurator LLM failing; dedupe disabled for this ticket.',
+            summary=(
+                'TaskCurator LLM failing; dedupe bypassed for this ticket '
+                '(and for further filings while the outage persists).'
+            ),
             detail=detail,
             level=1,
         )
