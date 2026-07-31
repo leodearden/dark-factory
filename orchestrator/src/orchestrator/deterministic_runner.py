@@ -239,6 +239,51 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
      stamp failure re-files rather than silently skipping the gate).
    - Set task status to ``blocked``.
    - Return BLOCKED (B2).
+
+   **Resuming a pure gate** — the proof ladder has TWO rungs, not one:
+
+   (i) An archive-inclusive, role-scoped escalation record must exist (task
+   2954). This proves a gate was established and is no longer pending. An
+   empty PENDING queue alone is not proof: a LOST escalation would otherwise
+   let an operator's re-pend of a stuck task silently bypass the gate.
+
+   (ii) If ``metadata.human_curator_gate`` is truthy, then
+   ``metadata.curator_adjudicated_at`` must carry a non-empty string (task
+   3341). This proves the human-judgment CONTENT work actually happened.
+
+   Rung (i) passing is NOT evidence rung (ii) holds. Task 3181 was a
+   ``human_curator_gate`` pure gate; ``esc-3181-1`` was resolved by
+   ``escalation-watcher`` with ``action='resume'`` on 2026-07-30T19:41Z, and
+   that resolution's own text says the ~13-entry Mem0 corpus edit was
+   "curator action, deliberately NOT executed here". The resume path
+   nonetheless drove the task to ``done`` with the generic
+   ``note='pure gate resolved'``, contradicting the task's own
+   ``consolidation_note``. Closing an escalation record and performing the
+   curator's content review are different propositions.
+
+   Both rung-(ii) checks fail CLOSED: a truthy-but-not-``True`` marker still
+   trips the guard, and a non-``str`` or blank stamp is not proof. An
+   unproven curator gate files a born-at-L2 ``curator_adjudication_missing``
+   escalation — a DISTINCT category, so the re-ask is legible in the census
+   and does not present to a resolver as "the same gate again" — and stays
+   BLOCKED. The block → resolve → re-dispatch → block loop is bounded by the
+   harness ``reblock_guard`` (``Harness._check_reblock_guard``), which keys
+   on ``category:summary``, so the distinct category gets its own counter
+   (INV-4's storm-escape, with no second counter built here — INV-5).
+
+   Ordering matters and is pinned by test: rung (i) runs FIRST. Zero records
+   anywhere means the gate was never established, so re-filing the ORIGINAL
+   ``milestone_gate`` is the correct recovery; asking for an adjudication
+   stamp on a gate nobody has yet seen would be incoherent.
+
+   A curator gate that DOES close carries a specific ``done_provenance.note``
+   naming the adjudication stamp (plus the gate record via
+   ``escalation_id``), never the generic string — that genericness is what
+   made 3181's phantom closure indistinguishable from a genuine one. The
+   interpolated stamp is length-capped because this note is memory-ingested
+   downstream (``_format_outcome_echo``, task 3286) — the same constraint
+   section 2's predicate subsection documents, so both note-writing sites in
+   this module read consistently.
 """
 
 from __future__ import annotations
