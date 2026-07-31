@@ -289,3 +289,117 @@ class TestBuildQueryUpstreamParity:
         assert build_query(text, group_ids, 128) == stock.build_fulltext_query(
             text, group_ids, 128
         )
+
+
+# Hostile inputs, each one a real-world shape that produces a token RediSearch
+# tokenizes to nothing.  The lone ``_`` cases are the reproduction of dead-letter
+# 9950; the rest are the sibling shapes found while characterising it.
+ADVERSARIAL_CORPUS: list[str] = [
+    'Please note _ is the Python throwaway variable',
+    'for _ in range 10 pass  note the idiom',
+    'note `` empty code span',
+    'See the note _ escaped underscore in markdown',
+    '_ _ _ alpha',
+    'alpha _',
+    '_ alpha',
+    '` alpha `',
+    '`` alpha ``',
+    'alpha __ beta',
+    'alpha — beta',
+    'alpha • beta → gamma',
+    'note _',
+    'alpha _ _ beta',
+]
+# NOTE: every entry above keeps at least one searchable term on purpose.  Inputs
+# where NOTHING survives filtering (a bare ``_``, all-stopwords, empty) hit a
+# different failure — the empty operand group ``()`` — and are owned by
+# TestEmptyTermListShortCircuits below, so that the two repairs stay
+# independently pinned rather than one masking the other.
+
+
+def _operand_group(query: str) -> str:
+    """Return the text between the outermost parentheses of the operand group."""
+    assert query.endswith(')')
+    return query[query.rindex('(') + 1 : -1]
+
+
+class TestUnsearchableTokensDropped:
+    """The core repair: a token RediSearch tokenizes to nothing never reaches the query.
+
+    Emitting one leaves the ``|`` union operator with no right-hand operand and
+    the whole query fails to parse — reported as ``Syntax error at offset N near
+    <the PRECEDING word>``, which is why dead-letter 9950 read "near note" and
+    twice sent an investigation looking for a reserved word.
+    """
+
+    def test_lone_underscore_repro_is_dropped(self) -> None:
+        """The exact dead-letter 9950 class, reproduced and pinned.
+
+        On a live FalkorDB this input produced ``RediSearch: Syntax error at
+        offset 46 near note`` — same class as 9950's "offset 122 near note".
+        """
+        assert (
+            build_query(
+                'Please note _ is the Python throwaway variable', ['dark_factory'], 128
+            )
+            == '(@group_id:"dark_factory") (Please | note | Python | throwaway | variable)'
+        )
+
+    def test_python_throwaway_variable_idiom_keeps_surrounding_terms(self) -> None:
+        """``for _ in ...`` is ordinary stored content; only the ``_`` is dropped."""
+        assert (
+            build_query('for _ in range 10 pass  note the idiom', ['dark_factory'], 128)
+            == '(@group_id:"dark_factory") (range | 10 | pass | note | idiom)'
+        )
+
+    def test_bare_double_backtick_is_dropped(self) -> None:
+        """An empty markdown code span leaves a bare ```` `` ```` token."""
+        assert (
+            build_query('note `` empty code span', ['dark_factory'], 128)
+            == '(@group_id:"dark_factory") (note | empty | code | span)'
+        )
+
+    def test_markdown_escaped_underscore_is_dropped(self) -> None:
+        r"""``\_`` in markdown: ``sanitize`` eats the ``\``, leaving a lone ``_``.
+
+        This is the sneakiest trigger — the source text contains no bare
+        underscore at all, so it survives every "does the content look odd?"
+        inspection.
+        """
+        assert (
+            build_query('See the note _ escaped underscore in markdown', ['g'], 128)
+            == '(@group_id:"g") (See | note | escaped | underscore | markdown)'
+        )
+
+    @pytest.mark.parametrize('text', ADVERSARIAL_CORPUS)
+    def test_no_dangling_operand_for_any_adversarial_input(self, text: str) -> None:
+        """Structural invariant over the whole hostile corpus.
+
+        Asserting the *shape* rather than a per-input literal is what makes this
+        closed against inputs nobody thought to enumerate: whatever comes out,
+        the ``|`` union operator always has an operand on both sides, and every
+        emitted term independently satisfies the safety predicate.
+        """
+        result = build_query(text, ['dark_factory'], 128)
+        if result == '':
+            return
+
+        operands = _operand_group(result)
+        assert '| |' not in result
+        assert not result.endswith('|)')
+        assert not result.endswith('| )')
+        assert not operands.startswith('|')
+        assert not operands.endswith('|')
+        for term in operands.split(' | '):
+            assert is_searchable_term(term), f'unsearchable operand {term!r} in {result!r}'
+
+    def test_multilingual_content_is_not_collateral_damage(self) -> None:
+        """Only the bare em-dash goes; every alnum-bearing term survives verbatim.
+
+        The predicate is unicode-aware, so hardening the query must not quietly
+        cost recall on non-Latin episodes.
+        """
+        assert (
+            build_query('café — naïve 日本語 note', ['dark_factory'], 128)
+            == '(@group_id:"dark_factory") (café | naïve | 日本語 | note)'
+        )
