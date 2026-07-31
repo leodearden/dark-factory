@@ -2968,6 +2968,14 @@ def create_mcp_server(
           This is the metric that governs backlog escalations and the one a
           watcher MUST probe to confirm a drain. It is per-project, so the
           global (``project_id``-less) call omits it — probe per-project.
+        * ``reconciliation_halt`` (same gating, plus a wired reconciliation
+          harness — task 3050) tells you WHICH of that backlog's two
+          opposite-remedy causes you are looking at: the project is HALTED
+          (``halted: True`` — remedy ``unhalt_reconciliation``, and
+          ``halt_reason``/``halted_at`` say why and since when) or it simply
+          cannot keep up (``halted: False`` — remedy capacity, task 3049).
+          2920's number alone could not separate them, and the ambiguity cost
+          two days of mis-triage.
 
         Args:
             project_id: Scope counts to a specific project (optional). When
@@ -3009,6 +3017,16 @@ def create_mcp_server(
             stats['reconciliation_backlog'] = await backlog_policy.current_backlog(
                 project_id,
             )
+        # task 3050 (A): say WHICH cause that backlog has. Per-project only,
+        # mirroring reconciliation_backlog's gating so the global call's shape
+        # is unchanged.
+        if (
+            project_id is not None
+            and isinstance(stats, dict)
+            and 'error' not in stats
+            and (halt := _halt_payload(project_id)) is not None
+        ):
+            stats['reconciliation_halt'] = halt
         return stats
 
     @mcp.tool()
