@@ -610,3 +610,83 @@ class TestRootTypeCheckCommandPyrightInterpreterPinned:
             f"Either the chain no longer runs pyright, or its shape changed such "
             f"that the &&-clause walk no longer resolves its cwds; got: {cmd!r}"
         )
+
+
+# Floor for the workspace-wide interpreter-pin invariant below: proof that
+# runtime discovery from the root pyproject's ``[tool.uv.workspace].members``
+# still resolves the members that actually carry pyright configs. NOT the
+# authoritative list — same convention as KNOWN_PER_MODULE_CONFIG_NAMES above,
+# so a newly-added workspace member is auto-covered with no edit here.
+KNOWN_PYRIGHT_PINNED_MEMBERS = frozenset(
+    {"shared", "escalation", "orchestrator", "fused-memory"}
+)
+
+
+class TestWorkspacePyrightInterpreterPinned:
+    """EVERY uv-workspace member declaring ``[tool.pyright]`` must pin the worktree venv.
+
+    Task 3367 / esc-3359-1 — the generalisation of the fleet-chain guard above.
+
+    ``TestRootTypeCheckCommandPyrightInterpreterPinned`` covers only the
+    directories today's ``type_check_command`` happens to ``cd`` into. That is the
+    incident's exact blast radius, but it leaves the hole one config edit away from
+    reopening: ``shared`` and ``escalation`` are type-checked through their own
+    ``<sub>/orchestrator.yaml`` ``uv run --project X --directory X pyright``
+    commands, where uv (not ``[tool.pyright]``) currently supplies the interpreter.
+    Adding either to the fleet chain — or dropping the ``uv run --project`` wrapper
+    from their per-module commands — would silently reintroduce ambient resolution.
+
+    Members are DISCOVERED at runtime from the root ``pyproject.toml``'s
+    ``[tool.uv.workspace].members``, so a newly-added subproject is covered on day
+    one rather than escaping a hardcoded list.
+    """
+
+    def _workspace_member_dirs(self) -> list[str]:
+        root = _pyproject_at(".")
+        members = root.get("tool", {}).get("uv", {}).get("workspace", {}).get("members")
+        assert members, (
+            "root pyproject.toml declares no [tool.uv.workspace].members (task "
+            "3367) — the workspace-wide interpreter-pin invariant cannot discover "
+            "its subjects and would pass vacuously"
+        )
+        return list(members)
+
+    def test_every_workspace_member_pyright_config_pins_the_worktree_venv(self) -> None:
+        # The root pyproject is checked too: it is the mirror the members' ".."
+        # pins resolve to, spelled ``venvPath = "."`` from its own directory.
+        checked: set[str] = set()
+        for rel_dir in [".", *self._workspace_member_dirs()]:
+            # cockpit is presence-guarded elsewhere in this file (it landed on
+            # main after some guards were scoped); skip any member directory that
+            # is genuinely absent rather than failing on a stale members list.
+            if not (REPO_ROOT / rel_dir / "pyproject.toml").is_file():
+                continue
+            pyright = _pyproject_at(rel_dir).get("tool", {}).get("pyright")
+            if pyright is None:
+                # A member that never runs pyright has no interpreter to pin.
+                continue
+            _assert_pyright_pins_worktree_venv(
+                rel_dir,
+                pyright,
+                why=(
+                    f"{rel_dir!r} is a uv-workspace member that declares a "
+                    "[tool.pyright] table, so pyright can be invoked there — by "
+                    "the fleet chain, by its own orchestrator.yaml, or by a "
+                    "developer — and every such invocation must resolve THIS "
+                    "worktree's own .venv."
+                ),
+            )
+            checked.add(rel_dir)
+
+        assert checked, (
+            "no workspace member with a [tool.pyright] table was discovered "
+            "(task 3367, esc-3359-1) — this invariant would pass vacuously"
+        )
+        missing = KNOWN_PYRIGHT_PINNED_MEMBERS - checked
+        assert not missing, (
+            f"runtime discovery from [tool.uv.workspace].members failed to resolve "
+            f"known pyright-configured member(s) {sorted(missing)} (task 3367); "
+            f"checked: {sorted(checked)}. Either a member was dropped from the "
+            f"workspace, or its [tool.pyright] table was removed — both need an "
+            f"explicit decision, not a silently shrinking guard"
+        )
