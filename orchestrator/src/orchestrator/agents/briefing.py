@@ -14,6 +14,44 @@ from orchestrator.mcp_lifecycle import mcp_call
 
 logger = logging.getLogger(__name__)
 
+COMMIT_BULLET_LIMIT = 40
+"""Max commit bullets rendered in one briefing section (task 3033 amendment).
+
+Bounds the architect's already-committed-work section, whose source
+(``TaskWorkflow._detect_committed_branch_work``) returns ALL of
+``base_commit..HEAD`` — unbounded on a long-lived branch that accumulated WIP
+safety-commits across many requeues/rebases plus normal step commits. Without a
+cap the section grows with branch length and its ``git show <sha>`` protocol
+drives one architect tool call per commit. Its sibling
+``_detect_tip_wip_commits`` needs no cap: it is naturally bounded by the
+contiguous WIP run at HEAD.
+"""
+
+
+def _format_commit_bullets(commits: list[dict], limit: int | None = None) -> str:
+    """Render ``[{'sha': ..., 'subject': ...}]`` as HEAD-first markdown bullets.
+
+    Single source of the 12-char abbreviation convention, shared by
+    :meth:`BriefingAssembler.build_architect_prompt`'s committed-work section
+    and :meth:`BriefingAssembler.build_implementer_prompt`'s WIP section — both
+    consume the same shape from the two sibling detectors, so the format must
+    not drift between them.
+
+    ``limit`` caps the rendered bullets (HEAD-first, i.e. most recent) and
+    appends an explicit "…and N more" line: a truncation must be VISIBLE in the
+    prompt, never silent, so the agent knows the list is partial and can widen
+    it itself. ``None`` (the default) renders everything.
+    """
+    shown = commits if limit is None else commits[:limit]
+    lines = [f"- `{c['sha'][:12]}` — {c['subject']}" for c in shown]
+    hidden = len(commits) - len(shown)
+    if hidden > 0:
+        lines.append(
+            f'- …and {hidden} more commit(s) on this branch (not shown — run '
+            f'`git log --oneline` to see the rest)'
+        )
+    return '\n'.join(lines)
+
 
 @dataclass
 class CompletionJudgeVerdict:
@@ -69,6 +107,7 @@ class BriefingAssembler:
         context: str | None = None,
         *,
         include_prior_proposals: bool = False,
+        committed_work: list[dict] | None = None,
     ) -> str:
         """Build prompt for the architect agent.
 
@@ -79,6 +118,16 @@ class BriefingAssembler:
                 first dispatch stays proposal-free (C-A1 anti-anchoring) —
                 only the re-plan path (an existing plan fell through to
                 architect) should pass True.
+            committed_work: HEAD-first ``[{'sha': ..., 'subject': ...}]`` for
+                every commit this branch already carries beyond its base, as
+                produced by ``TaskWorkflow._detect_committed_branch_work``
+                (task 3033 / PRD §A1). When truthy, renders the
+                already-committed-work section that teaches the architect to
+                pre-satisfy already-implemented steps via
+                ``mark_step_committed`` instead of leaving them pending. When
+                None or empty — the truly-fresh first dispatch — the prompt is
+                byte-identical to the pre-γ baseline, so nothing is added on
+                the common path.
         """
         if context is None:
             context = await self._get_memory_context(task.get('id'))
@@ -90,6 +139,47 @@ class BriefingAssembler:
         if include_prior_proposals:
             prior_proposal_section = self._format_prior_proposal(task)
 
+        # Mirrors build_implementer_prompt's wip_section structurally (same
+        # bullet format, same corroborate-then-attribute numbered protocol) so
+        # both briefings teach one consistent habit; the substantive differences
+        # are the tool named (mark_step_committed, an authoring-time authority,
+        # vs mark_step_done) and the explicit VERIFY-is-the-gate warning.
+        committed_section = ''
+        if committed_work:
+            commits_list = _format_commit_bullets(
+                committed_work, limit=COMMIT_BULLET_LIMIT,
+            )
+            committed_section = f"""
+## Already-Committed Work On This Branch — Pre-Satisfy, Don't Re-Plan-As-Pending
+
+This branch already carries the commit(s) below beyond its base. A prior
+dispatch may have implemented some (or all) of this task before the plan was
+lost, so part of the work you are about to plan may already be done, committed,
+and green on this very branch.
+
+{commits_list}
+
+Protocol:
+
+1. Run `git show <sha>` for each commit above to see exactly what it contains.
+2. Author the plan's steps as normal — do NOT drop or merge steps just because
+   the work exists. The full TDD structure and its provenance must be preserved.
+3. For every step the committed work ALREADY satisfies — confirmed first-hand by
+   running that step's tests on this branch and seeing them pass — call
+   `mark_step_committed(step_id, <sha>)` with the commit that carries it,
+   instead of leaving the step pending. That marks the step done and tags its
+   description `[COMMITTED <sha>]` so the provenance is durable.
+4. Leave genuinely-unsatisfied steps pending, so the implementer does only the
+   remaining work.
+5. If EVERY step is pre-satisfied, the EXECUTE loop is skipped entirely and the
+   branch flows PLAN → VERIFY → REVIEW → MERGE with zero implementer turns.
+
+VERIFY is the semantic gate, not `mark_step_committed`. A falsely pre-satisfied
+step surfaces as a VERIFY failure and BLOCKS the task — so never pre-satisfy a
+step you have not actually seen pass on this branch. When in doubt, leave it
+pending: an unnecessary implementer turn is cheap, a false green is not.
+"""
+
         return f"""\
 {context}
 
@@ -99,7 +189,7 @@ class BriefingAssembler:
 
 {task_block}
 
-{prior_proposal_section}
+{prior_proposal_section}{committed_section}
 # Action
 
 1. Explore the codebase thoroughly — read relevant files, understand existing patterns and utilities.
@@ -481,9 +571,9 @@ Review any overlap with your plan steps before continuing — file contents may 
 
         wip_section = ''
         if wip_notice:
-            commits_list = '\n'.join(
-                f"- `{n['sha'][:12]}` — {n['subject']}" for n in wip_notice
-            )
+            # No limit: _detect_tip_wip_commits is bounded by the contiguous
+            # WIP run at HEAD, unlike the architect's whole-branch detector.
+            commits_list = _format_commit_bullets(wip_notice)
             wip_section = f"""
 ## Already-Committed WIP — Verify Before Re-Implementing
 

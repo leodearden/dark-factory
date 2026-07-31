@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import string
 import sys
 import time
 import uuid
@@ -367,6 +368,7 @@ class _BriefingLike(Protocol):
     async def build_architect_prompt(
         self, task: dict, worktree: Path | None = ..., context: str | None = ...,
         *, include_prior_proposals: bool = ...,
+        committed_work: list[dict] | None = ...,
     ) -> str: ...
     async def build_resume_prompt(
         self,
@@ -965,6 +967,34 @@ class _PriorImplStatus(NamedTuple):
     """SHA read from metadata.json, or None if the file is absent."""
 
 
+_MIN_ABBREV_SHA_LEN = 7
+"""Shortest recorded ``commit`` value accepted as provenance — git's own
+default abbreviation length."""
+
+
+def _is_plausible_sha(value: object) -> bool:
+    """True iff ``value`` looks like a git SHA (or an abbreviation git emits).
+
+    Gate for the bidirectional prefix match that credits a plan step's recorded
+    ``commit`` with beyond-base provenance (task 3033 amendment). Without it,
+    ``recorded.startswith(sha) or sha.startswith(recorded)`` admits arbitrarily
+    short values: an LLM-recorded ``'a'`` or ``'ab'`` prefixes SOME beyond-base
+    SHA on any branch of a few commits, and a value LONGER than 40 hex chars
+    (a full SHA plus trailing junk) passes the first arm outright. Either would
+    re-open the fail-closed hole the provenance filter exists to close, letting
+    ``_recover_before_merge`` resolve ``has_work=True`` on unbacked provenance.
+
+    The sibling idiom in ``_detect_tip_wip_commits`` needs no such gate: there
+    the match only DEDUPs, where a false positive is benign (a commit merely
+    isn't re-surfaced in the next briefing).
+    """
+    text = str(value or '')
+    return (
+        _MIN_ABBREV_SHA_LEN <= len(text) <= 40
+        and all(ch in string.hexdigits for ch in text)
+    )
+
+
 def _iteration_entry_is_work(entry: dict) -> bool:
     """Classify a single iterations.jsonl entry as genuine prior-implementation
     work (task 2372, Layer A).
@@ -982,6 +1012,25 @@ def _iteration_entry_is_work(entry: dict) -> bool:
     - ``'judge'`` ``early_exit`` entries count only when ``substantive_work``
       is True (workflow.py ~4559) — a judge can legitimately declare a task
       complete with zero plan-steps marked done.
+    - ``'architect'`` ``execute_skipped`` entries count only when
+      ``steps_completed`` is non-empty (task 3033 / PRD §A1) — the entry
+      ``_execute_iterations`` writes when every plan step was pre-satisfied at
+      authoring time via ``mark_step_committed`` and EXECUTE ran zero
+      iterations. It IS real work, but NOT because of the authoring-time
+      guard: ``plan_tools._sha_exists_on_branch`` is ``git merge-base
+      --is-ancestor <sha> HEAD``, which accepts ``base_commit`` ITSELF and
+      arbitrary main ancestors below base, so it does NOT establish
+      beyond-base work (and ``update_step_status`` permits ``commit=None``
+      outright). The real basis is at the WRITER: ``_execute_iterations``
+      only ever emits this entry after confirming that every id it names
+      carries a commit that is a member of ``base_commit..HEAD`` at write
+      time, so a non-empty ``steps_completed`` is itself the evidence.
+      Deliberately narrow — BOTH the exact ``event`` name AND a non-empty
+      ``steps_completed`` are required, so a zero-work architect entry (or an
+      architect entry with any other event) can never resolve
+      ``has_work=True``. The ``judge`` clause is the direct precedent: an
+      agent legitimately declaring the plan satisfied without an implementer
+      turn.
 
     An entry that explicitly recorded no durable commit (``committed is False``,
     task 2759) is not prior-implementation work regardless of agent type — the
@@ -999,6 +1048,11 @@ def _iteration_entry_is_work(entry: dict) -> bool:
         return entry.get('source') == 'amendment' or bool(entry.get('steps_completed'))
     if agent == 'judge':
         return entry.get('event') == 'early_exit' and bool(entry.get('substantive_work'))
+    if agent == 'architect':
+        return (
+            entry.get('event') == 'execute_skipped'
+            and bool(entry.get('steps_completed'))
+        )
     return False
 
 
@@ -3877,9 +3931,34 @@ class TaskWorkflow:
             # entirely. A present-but-empty {} plan carries no steps/session
             # data to re-plan from either, so it is semantically equivalent
             # to "no plan" and correctly falls to fresh-dispatch here too.
+            #
+            # committed_work (task 3033 / PRD §A1): surface every commit this
+            # branch already carries so a re-invoked architect can pre-satisfy
+            # already-implemented steps via mark_step_committed instead of
+            # re-planning them as pending.  Scoped to THIS branch of _plan by
+            # design decision — the completion-pass and revalidation branches
+            # above are deliberately left unchanged (both already carry
+            # done-step semantics and explicit "do NOT remove or replace steps
+            # with status done" instructions).  Inert on the common path: on a
+            # truly-fresh first dispatch HEAD == base_commit, so the detector
+            # returns [] and the briefing is byte-identical to today's.
+            #
+            # Belt-and-braces best-effort: the detector already swallows its own
+            # exceptions and returns [], but a failure here must NEVER sink
+            # PLAN, so the call site falls back to [] too.
+            try:
+                committed_work = await self._detect_committed_branch_work()
+            except Exception:
+                logger.warning(
+                    'Task %s: committed-branch-work detection raised at the '
+                    '_plan call site; briefing without it (task 3033)',
+                    self.task_id, exc_info=True,
+                )
+                committed_work = []
             prompt = await self.briefing.build_architect_prompt(
                 self.task, worktree=self.worktree,
                 include_prior_proposals=bool(existing_plan),
+                committed_work=committed_work,
             )
 
         # Snapshot pre-architect open L0 ids so the post-loop check can
@@ -6399,7 +6478,191 @@ class TaskWorkflow:
         self._progress_resume_churn_info = None
         self._preserve_config_dir = False
         self._preserve_config_dir_reason = None
-        while self.artifacts.get_pending_steps():
+
+        # Zero-iteration EXECUTE (task 3033 / PRD §A1): nothing is pending, so
+        # the loop below would fall straight through to `return DONE` and emit
+        # NOTHING — making "0 EXECUTE iterations" a pure absence, which a
+        # consumer cannot distinguish from a lost event log. Emit the skip
+        # explicitly instead. Reached when an architect pre-satisfied every step
+        # via mark_step_committed against an already-green branch, and ALSO on a
+        # re-entry after a review cycle with nothing left pending — which is why
+        # execute_iterations is reported FROM THE METRIC rather than hard-coded
+        # to 0. Purely additive: the non-empty path below is byte-for-byte
+        # unchanged.
+        pending = self.artifacts.get_pending_steps()
+        if not pending:
+            plan = self.artifacts.read_plan()
+            items = [
+                s
+                for col in ('prerequisites', 'steps')
+                for s in plan.get(col, [])
+                if isinstance(s, dict)
+            ]
+            done_step_ids = [
+                str(s.get('id')) for s in items if s.get('status') == 'done'
+            ]
+            # Provenance evidence for the durable work entry below. `status ==
+            # 'done'` alone is NOT evidence: mark_step_committed's authoring
+            # guard (plan_tools._sha_exists_on_branch) is `git merge-base
+            # --is-ancestor <sha> HEAD`, which is satisfied by base_commit
+            # ITSELF and by every main ancestor below base — and
+            # update_step_status permits commit=None outright. Reuse the
+            # step-4 detector rather than reimplementing the git call: it
+            # returns exactly `base_commit..HEAD` and already collapses every
+            # missing-collaborator / unset-base / git-error case to [], which
+            # is precisely the fail-closed posture wanted here (no evidence ⇒
+            # no work entry). Belt-and-braces try/except: a detector failure
+            # must degrade to "no evidence", never sink EXECUTE.
+            try:
+                beyond_base = {
+                    str(c['sha']) for c in await self._detect_committed_branch_work()
+                }
+            except Exception:
+                logger.warning(
+                    'Task %s: beyond-base provenance detection failed; treating '
+                    'as no committed work (task 3033)',
+                    self.task_id, exc_info=True,
+                )
+                beyond_base = set()
+            # Bidirectional prefix match, the established idiom at
+            # _detect_tip_wip_commits (~:7062): an abbreviated sha recorded by
+            # mark_step_done still matches a full beyond-base sha, while a
+            # base-reachable or absent sha never does. Gated on
+            # _is_plausible_sha first — unlike the dedup site that idiom comes
+            # from, a false positive HERE credits unbacked provenance, and a
+            # too-short recorded value (e.g. 'a') prefixes some beyond-base sha
+            # on almost any branch.
+            committed_step_ids = [
+                str(s.get('id'))
+                for s in items
+                if s.get('status') == 'done' and _is_plausible_sha(s.get('commit'))
+                and any(
+                    str(s['commit']).startswith(sha) or sha.startswith(str(s['commit']))
+                    for sha in beyond_base
+                )
+            ]
+            if self.event_store:
+                self.event_store.emit(
+                    EventType.phase_skipped,
+                    task_id=self.task_id,
+                    phase='execute',
+                    data={
+                        'reason': 'no_pending_steps',
+                        'execute_iterations': self.metrics.execute_iterations,
+                        'step_count': len(items),
+                        'done_step_ids': done_step_ids,
+                        # Both sets, deliberately: a plan claiming N done steps
+                        # while the branch carries provenance for only M is a
+                        # real anomaly that must be visible in the event log.
+                        'committed_step_ids': committed_step_ids,
+                    },
+                )
+            logger.info(
+                'Task %s: EXECUTE skipped — no pending steps at entry '
+                '(execute_iterations=%s, %s/%s items already done) — every step '
+                'was pre-satisfied at authoring time, or a review re-entry left '
+                'nothing to do (task 3033 / PRD A1)',
+                self.task_id, self.metrics.execute_iterations,
+                len(done_step_ids), len(items),
+            )
+            # Durable honest signal, mirroring the judge early_exit entry shape
+            # below. REQUIRED, not cosmetic: _has_prior_implementation needs at
+            # least one _iteration_entry_is_work entry, and the merge-phase
+            # guard _recover_before_merge uses the iteration-log-only fallback
+            # (wt_head=None). An all-committed plan writes zero
+            # implementer/debugger/judge entries, so without this the guard
+            # would resolve has_work=False on a branch that already landed and
+            # REFUSE to recover-DONE — re-planning merged work. The label is
+            # honest ('architect', not a forged 'implementer') so the log the
+            # reconciler and future architects read never claims an implementer
+            # turn that did not happen.
+            #
+            # FAILS CLOSED ON PROVENANCE, not on `status`: the entry is written
+            # only when at least one done item's recorded commit is a genuine
+            # member of `base_commit..HEAD`, and it names ONLY those ids.
+            # Status alone is insufficient because a done step can carry no
+            # commit at all, or a commit that is base_commit itself / an
+            # arbitrary main ancestor below base — all of which pass the
+            # authoring-time reachability guard while representing zero work on
+            # this branch. Without this filter an architect who pre-satisfied
+            # every step against base-reachable shas would produce a
+            # `committed: True` entry that _iteration_entry_is_work classifies
+            # as work, letting _recover_before_merge recovery-DONE a branch
+            # that implemented nothing. `committed: True` is therefore
+            # evidence-backed by the non-empty committed_step_ids set below
+            # rather than asserted.
+            if done_step_ids and len(committed_step_ids) < len(done_step_ids):
+                unbacked = sorted(set(done_step_ids) - set(committed_step_ids))
+                # Loud over silent: a plan asserting done steps the branch does
+                # not carry is a real anomaly (falsely pre-satisfied steps, or a
+                # rebase that orphaned the recorded shas). VERIFY remains the
+                # semantic gate for it, but it must never vanish from the log.
+                logger.warning(
+                    'Task %s: EXECUTE skip — %s plan item(s) claim status=done '
+                    'but only %s carry a commit in base..HEAD; unbacked ids: %s '
+                    '(task 3033 — no work entry is written for these)',
+                    self.task_id, len(done_step_ids), len(committed_step_ids),
+                    unbacked,
+                )
+            #
+            # ATTRIBUTION MUST MATCH WHAT HAPPENED. This branch is ALSO reached
+            # on a review/amendment RE-ENTRY (execute_iterations > 0), where the
+            # steps were completed by an IMPLEMENTER in an earlier EXECUTE pass
+            # — not pre-satisfied by an architect at authoring time. Writing the
+            # authoring-time claim there would put a false statement in the
+            # durable record the reconciler and future architects read (exactly
+            # the harm the honest 'architect' label avoids on the authoring
+            # path), re-list step ids the implementer entries already attribute,
+            # and repeat once per review cycle. On re-entry the merge-recovery
+            # motivation is already satisfied by those earlier work entries, so
+            # write nothing — unless the log carries no work entry at all, in
+            # which case fall through to an entry whose summary says only what
+            # is true of the re-entry rather than dropping the has_work signal.
+            # That fallback keeps agent='architect' deliberately: it is the only
+            # agent value _iteration_entry_is_work's execute_skipped clause
+            # recognises, so any other label would write an entry that cannot
+            # restore the very has_work signal it exists for.
+            reentry = self.metrics.execute_iterations > 0
+            prior_work = False
+            if reentry:
+                prior_entries, _corrupted = self.artifacts.read_iteration_log()
+                prior_work = any(_iteration_entry_is_work(e) for e in prior_entries)
+                if prior_work:
+                    logger.info(
+                        'Task %s: EXECUTE skip at re-entry (iteration %s) — '
+                        'earlier work entries already establish has_work; no '
+                        'execute_skipped entry written (task 3033)',
+                        self.task_id, self.metrics.execute_iterations,
+                    )
+            if committed_step_ids and not prior_work:
+                self.artifacts.append_iteration_log({
+                    'iteration': self.metrics.execute_iterations,
+                    'agent': 'architect',
+                    'event': 'execute_skipped',
+                    'steps_completed': committed_step_ids,
+                    'committed': True,
+                    'summary': (
+                        'EXECUTE skipped — no pending steps at re-entry; the '
+                        'named steps carry commits on this branch'
+                        if reentry else
+                        'EXECUTE skipped — every plan step pre-satisfied at '
+                        'authoring time via mark_step_committed'
+                    ),
+                    'source': 'orchestrator',
+                })
+            return WorkflowOutcome.DONE
+
+        # The `pending` probe above IS this loop's first "is there work?"
+        # check: nothing between it and here mutates the plan, so re-reading
+        # would be a redundant plan.json read that also DOUBLE-COUNTS the
+        # check for anything observing get_pending_steps() — which silently
+        # cost the first implementer iteration in the progress-resume
+        # accounting suite, whose stub answers a canned sequence one call at a
+        # time. Short-circuit the first evaluation onto the result already in
+        # hand; every loop-back after that re-reads exactly as before.
+        reuse_entry_probe = True
+        while reuse_entry_probe or self.artifacts.get_pending_steps():
+            reuse_entry_probe = False
             if (
                 self.metrics.execute_iterations - self.metrics.progress_resume_total
                 >= self.config.max_execute_iterations
@@ -7248,6 +7511,58 @@ class TaskWorkflow:
         except Exception:
             logger.warning(
                 'WIP-tip detection failed; treating as no WIP commits',
+                exc_info=True,
+            )
+            return []
+
+    async def _detect_committed_branch_work(self) -> list[dict]:
+        """Detect EVERY commit this branch carries beyond its base (task 3033).
+
+        The ARCHITECT-facing counterpart of the implementer-facing
+        :meth:`_detect_tip_wip_commits` above. Both share the one git
+        primitive (``git_ops.get_commit_subjects``) and the same best-effort
+        posture; only the filter policy differs, and it differs deliberately
+        in two ways:
+
+        - **No ``is_wip_safety_commit`` filter.** ``_detect_tip_wip_commits``
+          stops at the first non-WIP subject, so it cannot see the ordinary
+          ``feat(...)``/``test(...)`` commits an already-committed-green branch
+          is actually made of — precisely the scenario this detector exists to
+          surface (the architect is re-invoked against a branch whose work has
+          already landed, e.g. the canonical ``complete_not_on_main_replan`` /
+          ``lost_plan_reconstruction`` cases).
+        - **No dedup against already-``done`` plan steps.** That dedup is
+          correct for the implementer's attribution loop (don't re-surface an
+          already-attributed commit every iteration — task 2386), but wrong
+          here: the architect is RE-AUTHORING the plan from scratch, so every
+          branch commit is candidate provenance for a step that does not exist
+          yet.
+
+        Proves ONLY that commits exist on this branch — never that they
+        satisfy any plan step. VERIFY remains the semantic gate: a step
+        pre-satisfied against a commit that does not actually implement it
+        surfaces as a VERIFY failure, never a silent green.
+
+        Best-effort and defensive, mirroring its sibling: returns ``[]`` on any
+        missing collaborator (``worktree``/``git_ops``/``artifacts``), an unset
+        ``base_commit``, or any git error — a false negative here just reverts
+        to today's baseline briefing and must never sink PLAN.
+
+        Returns HEAD-first ``[{'sha': ..., 'subject': ...}]`` for
+        ``base_commit..HEAD``.
+        """
+        if self.worktree is None or self.git_ops is None or self.artifacts is None:
+            return []
+        base = self.artifacts.read_base_commit()
+        if not base:
+            return []
+        try:
+            commits = await self.git_ops.get_commit_subjects(self.worktree, base)
+            return [{'sha': sha, 'subject': subject} for sha, subject in commits]
+        except Exception:
+            logger.warning(
+                'Committed-branch-work detection failed; treating as no '
+                'committed work (task 3033)',
                 exc_info=True,
             )
             return []
