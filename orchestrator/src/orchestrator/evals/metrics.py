@@ -151,13 +151,16 @@ class EvalMetrics:
     # ``cap_tainted`` is the SCORING DECISION derived from it: this cell is not
     # a content measurement at all, so the plan_quality aggregates EXCLUDE it
     # rather than average in a fabricated zero (which would penalise whichever
-    # candidate happened to be scheduled inside a cap window). Scope note: only
-    # the plan_quality surfaces exclude — ``build_composite_report``'s
-    # composite/quality pools and its ``trials`` / ``tests_pass_rate``
-    # denominators deliberately still COUNT a tainted trial, because those pools
-    # measure the implementer-path gates (which a tainted architect cell reports
-    # as an honest failure, not a fabricated score) and dropping trials from the
-    # denominator would silently shrink the sample ``select_survivors`` ranks on.
+    # candidate happened to be scheduled inside a cap window). Scope note
+    # (REVISED by task 3099): the plan_quality surfaces exclude, and so do
+    # ``build_composite_report``'s composite/quality pools for a PLAN-ONLY
+    # trial. Those pools used to COUNT a tainted trial, on the grounds that they
+    # measured the implementer-path gates — which a tainted architect cell
+    # reports as an honest failure, not a fabricated score. That no longer holds
+    # now that a plan-only composite is DERIVED from plan_quality: a fabricated
+    # 0.0 would land in exactly the number ``select_survivors`` ranks on. The
+    # ``trials`` denominator still counts every trial (the sample is never
+    # silently shrunk) and ``plan_quality_cap_excluded`` reports the skips.
     #
     # NAME vs SCOPE (reviewer: design-coherence): the field name is ``cap_``
     # because the campaign that motivated it was a session-cap window, but the
@@ -331,6 +334,7 @@ def blend_composite(
     latency_score: float,
     *,
     tests_pass: bool | None,
+    plan_only: bool = False,
     weights: dict[str, float] = DEFAULT_COMPOSITE_WEIGHTS,
 ) -> float:
     """The C4 efficiency-adjusted ``composite``: *quality* blended with
@@ -346,8 +350,21 @@ def blend_composite(
     ``report._ratio_score``), supplied by the report layer where the
     cross-config context to normalize exists. PURE and additive: this does not
     touch ``compute_composite``.
+
+    **plan_only** (task 3099) — the cell under test is a PLAN-ONLY run (an
+    architect eval freezes implementer/debugger/reviewer/verify), so no test was
+    ever run and there is no test signal to gate on. The caller then supplies
+    *quality* as the θ-rubric ``plan_quality`` and the ``tests_pass`` hard gate
+    is deliberately bypassed: keeping it would read "no signal collected" as
+    "the answer was wrong" and zero the number that drives survivor selection.
+
+    Under *plan_only* the CALLER — not this function — owns the exclusion of an
+    UNMEASURABLE cell: a cap-tainted trial (no ``plan_quality`` at all) must be
+    dropped from the pool by the report layer, never passed here as a fabricated
+    ``0.0``, which would penalise whichever candidate happened to be scheduled
+    inside a cap window (the task-3118 invariant, one layer up).
     """
-    if not tests_pass:
+    if not plan_only and not tests_pass:
         return 0.0
     blended = (
         weights['quality'] * quality

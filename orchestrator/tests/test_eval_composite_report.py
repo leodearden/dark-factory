@@ -220,7 +220,7 @@ class TestBuildPairwisePriceTable:
 
 def _mresult(
     task_id, config_name, trial, *, quality, cost_usd, duration_ms,
-    tests_pass=True, cost_source='price_table', recovery_score=None,
+    tests_pass: bool | None = True, cost_source='price_table', recovery_score=None,
     plan_quality=None, role_under_test='implementer',
     judge_invocations=0, judge_cost_usd=0.0,
     cap_tainted=False, invocation_error=None,
@@ -256,15 +256,21 @@ def _mresult(
 def _union_dataset():
     """Configs A,B across fixtures f1,f2 (3 trials each); C in f1 ONLY (3 trials).
 
-    Per-fixture best cost/latency drives the normalization:
-      f1: cost A=2 B=4 C=1 → best 1 (C); latency A=2 B=4 C=1 → best 1 (C)
-      f2: cost A=2 B=4     → best 2 (A); latency A=2 B=4     → best 2 (A)
+    C is an ARCHITECT (plan-only) row, so the efficiency baselines are keyed on
+    ``(fixture, role_group)`` and C normalizes against its OWN group — a
+    plan-only cell's cost is one architect invocation, a workflow cell's is a
+    full run, so a shared floor would crush the workflow rows (task 3099).
 
-    Hand-computed per-trial blends (quality 1.0 everywhere, weights .6/.2/.2):
-      f1 A: blend(1.0, 2→0.5, 2→0.5) = 0.8   f2 A: blend(1.0, 1.0, 1.0) = 1.0
-      f1 B: blend(1.0, 4→0.25, 0.25) = 0.7   f2 B: blend(1.0, 0.5, 0.5) = 0.8
-      f1 C: blend(1.0, 1.0, 1.0)     = 1.0
-    Per-config composite means: A=0.9, B=0.75, C=1.0.
+    Per-(fixture, role_group) best cost/latency drives the normalization:
+      f1 workflow:  cost A=2 B=4 → best 2 (A); latency A=2 B=4 → best 2 (A)
+      f2 workflow:  cost A=2 B=4 → best 2 (A); latency A=2 B=4 → best 2 (A)
+      f1 plan_only: cost C=1     → best 1 (C); latency C=1     → best 1 (C)
+
+    Hand-computed per-trial blends (weights .6/.2/.2):
+      f1 A: blend(1.0, 2→1.0, 2→1.0)  = 1.0   f2 A: blend(1.0, 1.0, 1.0) = 1.0
+      f1 B: blend(1.0, 4→0.5, 4→0.5)  = 0.8   f2 B: blend(1.0, 0.5, 0.5) = 0.8
+      f1 C: blend(0.9, 1.0, 1.0, plan_only) = 0.94   ← quality is plan_quality
+    Per-config composite means: A=1.0, B=0.8, C=0.94.
 
     Results are inserted in scrambled config order (C, A, B) to prove the impl
     sorts rows by config name.
@@ -313,8 +319,10 @@ class TestBuildCompositeReport:
         rows = {row['config']: row for row in report['configs']}
 
         a = rows['A']
-        # composite = mean per-fixture-normalized blend = mean([0.8]*3+[1.0]*3)
-        assert a['composite'] == pytest.approx(0.9)
+        # composite = mean per-(fixture, role_group)-normalized blend. A is the
+        # cheapest+fastest WORKFLOW row on both fixtures → mean([1.0]*6). The
+        # architect row C no longer sets the workflow floor (task 3099).
+        assert a['composite'] == pytest.approx(1.0)
         assert a['quality'] == pytest.approx(1.0)     # mean pure composite_score
         assert a['cost_usd'] == pytest.approx(2.0)    # mean cost
         assert a['latency_secs'] == pytest.approx(2.0)  # mean duration_ms/1000
@@ -325,18 +333,22 @@ class TestBuildCompositeReport:
         # ci95 carries composite/cost/latency sub-dicts, sufficient at >=3 trials
         for axis in ('composite', 'cost', 'latency'):
             assert a['ci95'][axis]['sufficient'] is True
-        assert a['ci95']['composite']['mean'] == pytest.approx(0.9)
+        assert a['ci95']['composite']['mean'] == pytest.approx(1.0)
 
         b = rows['B']
-        assert b['composite'] == pytest.approx(0.75)  # mean([0.7]*3+[0.8]*3)
+        assert b['composite'] == pytest.approx(0.8)  # mean([0.8]*6)
         assert b['cost_usd'] == pytest.approx(4.0)
         assert b['latency_secs'] == pytest.approx(4.0)
         assert b['trials'] == 6
         assert b['fixtures'] == 2
 
         c = rows['C']
-        # C is cheapest+fastest+top-quality in its only fixture → blend 1.0.
-        assert c['composite'] == pytest.approx(1.0)
+        # C is an ARCHITECT row, so it scores through the plan-only path
+        # (task 3099): quality is its plan_quality 0.9, not its composite_score.
+        # Cheapest+fastest in f1 → both efficiency axes 1.0 →
+        # 0.6*0.9 + 0.2*1.0 + 0.2*1.0 == 0.94.
+        assert c['composite'] == pytest.approx(0.94)
+        assert c['quality'] == pytest.approx(0.9)
         assert c['cost_usd'] == pytest.approx(1.0)
         assert c['trials'] == 3
         assert c['fixtures'] == 1
@@ -469,6 +481,496 @@ class TestBuildCompositeReport:
         row = report['configs'][0]
         assert row['judge']['invocations'] == 3
         assert row['judge']['cost_usd'] == pytest.approx(0.03)
+
+
+# ---------------------------------------------------------------------------
+# Task 3099: the PLAN-ONLY composite path.
+#
+# An architect eval freezes every downstream role, so its cells carry no test
+# signal. Scored through the workflow path they ALL collapsed to composite
+# 0.0000 — which then made select_survivors' alphabetical tie-break the entire
+# architect selection mechanism (plans/eval-architect-effort-verdict-2026-07-27.md,
+# defects 1-2). A plan-only row is scored on its θ-rubric plan_quality instead.
+# ---------------------------------------------------------------------------
+
+def _arch(task_id, config_name, trial, *, plan_quality, cost_usd, duration_ms,
+          cap_tainted=False):
+    """A plan-only architect cell, shaped as run_architect_eval writes it:
+    tests_pass=None (no test signal) and quality carried by plan_quality."""
+    return _mresult(
+        task_id, config_name, trial,
+        quality=0.0,                 # composite_score is never set on this path
+        cost_usd=cost_usd, duration_ms=duration_ms,
+        tests_pass=None, role_under_test='architect',
+        plan_quality=plan_quality, cap_tainted=cap_tainted,
+        invocation_error='architect:cap_hit: session limit' if cap_tainted else None,
+    )
+
+
+def _table_row_cells(text, name, *, section=''):
+    """The whitespace-split cells of the rendered row for *name*.
+
+    *section* optionally scopes the search to everything after a section header
+    (e.g. ``'plan_quality by config:'``), because one rendering can carry
+    several tables whose rows each start with the same config name.
+    """
+    scoped = text.partition(section)[2] if section else text
+    return next(ln.split() for ln in scoped.splitlines()
+                if ln.split() and ln.split()[0] == name)
+
+
+class TestPlanOnlyComposite:
+    """A plan-only (architect) row scores on plan_quality, not on tests_pass."""
+
+    def test_plan_only_row_scores_its_plan_quality(self):
+        """The reported defect: this row used to report composite 0.0000."""
+        from orchestrator.evals.report import build_composite_report
+
+        # Sole config on the fixture → it IS its own cost/latency best → both
+        # efficiency axes 1.0. 0.6*0.9 + 0.2*1.0 + 0.2*1.0 == 0.94.
+        results = [
+            _arch('p1', 'arch-a', tr, plan_quality=0.9, cost_usd=0.3,
+                  duration_ms=60000)
+            for tr in (1, 2, 3)
+        ]
+        row = build_composite_report(results)['configs'][0]
+        assert row['composite'] == pytest.approx(0.94, abs=1e-4)
+        # …and `quality` is the axis that ACTUALLY fed the composite, so the
+        # table can never show quality=0.0000 beside a non-zero composite.
+        assert row['quality'] == pytest.approx(0.9, abs=1e-4)
+
+    def test_plan_only_rows_rank_by_plan_quality(self):
+        """Identical but for plan_quality → DIFFERENT, correctly-ordered
+        composites. Every architect row collapsing to 0.0000 is the defect."""
+        from orchestrator.evals.report import build_composite_report
+
+        results = [
+            _arch('p1', 'arch-good', tr, plan_quality=0.9, cost_usd=0.3,
+                  duration_ms=60000)
+            for tr in (1, 2, 3)
+        ] + [
+            _arch('p1', 'arch-weak', tr, plan_quality=0.4, cost_usd=0.3,
+                  duration_ms=60000)
+            for tr in (1, 2, 3)
+        ]
+        rows = {r['config']: r
+                for r in build_composite_report(results)['configs']}
+        # 0.6*0.9 + 0.4 == 0.94   vs   0.6*0.4 + 0.4 == 0.64
+        assert rows['arch-good']['composite'] == pytest.approx(0.94, abs=1e-4)
+        assert rows['arch-weak']['composite'] == pytest.approx(0.64, abs=1e-4)
+        assert rows['arch-good']['composite'] > rows['arch-weak']['composite']
+
+    def test_cap_tainted_trial_is_excluded_not_scored_zero(self):
+        """Task 3118's invariant, applied to the number that DRIVES selection.
+
+        A tainted cell measured NOTHING, so averaging it in as 0.0 would
+        penalise whichever candidate happened to be scheduled inside a cap
+        window. It is excluded from the composite/quality pools — but still
+        COUNTED, in `trials` and in `plan_quality_cap_excluded`, so nothing is
+        dropped silently.
+        """
+        from orchestrator.evals.report import build_composite_report
+
+        results = [
+            # One tainted (no plan_quality, zero cost — a 429 refusal) + one healthy.
+            _arch('p1', 'arch-mixed', 1, plan_quality=None, cost_usd=0.0,
+                  duration_ms=0, cap_tainted=True),
+            _arch('p1', 'arch-mixed', 2, plan_quality=0.8, cost_usd=0.3,
+                  duration_ms=60000),
+            # The control: the SAME healthy trial, with no tainted sibling.
+            _arch('p1', 'arch-clean', 1, plan_quality=0.8, cost_usd=0.3,
+                  duration_ms=60000),
+        ]
+        rows = {r['config']: r
+                for r in build_composite_report(results)['configs']}
+
+        assert rows['arch-mixed']['composite'] == pytest.approx(
+            rows['arch-clean']['composite'], abs=1e-9,
+        )
+        assert rows['arch-mixed']['composite'] == pytest.approx(0.88, abs=1e-4)
+        # Counted, not dropped.
+        assert rows['arch-mixed']['trials'] == 2
+        assert rows['arch-mixed']['plan_quality_cap_excluded'] == 1
+        assert rows['arch-clean']['plan_quality_cap_excluded'] == 0
+
+    def test_wholly_unmeasured_config_reports_none_not_zero(self):
+        """"We measured nothing" must never read as "it scored nothing"."""
+        from orchestrator.evals.report import build_composite_report
+
+        results = [
+            _arch('p1', 'arch-dark', tr, plan_quality=None, cost_usd=0.0,
+                  duration_ms=0, cap_tainted=True)
+            for tr in (1, 2, 3)
+        ]
+        row = build_composite_report(results)['configs'][0]
+        assert row['composite'] is None
+        assert row['quality'] is None
+        assert row['trials'] == 3
+        assert row['plan_quality_cap_excluded'] == 3
+
+    def test_plan_only_row_has_no_fabricated_tests_pass_rate(self):
+        """No test ran, so there is no pass RATE — not a 0% one."""
+        from orchestrator.evals.report import build_composite_report
+
+        results = [
+            _arch('p1', 'arch-a', 1, plan_quality=0.9, cost_usd=0.3,
+                  duration_ms=60000),
+            _mresult('p2', 'impl-a', 1, quality=1.0, cost_usd=5.0,
+                     duration_ms=900000, tests_pass=True),
+        ]
+        rows = {r['config']: r
+                for r in build_composite_report(results)['configs']}
+        assert rows['arch-a']['tests_pass_rate'] is None
+        # …while a workflow row keeps a real float.
+        assert rows['impl-a']['tests_pass_rate'] == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# Task 3099 (reviewer amendment): an UNMEASURABLE plan-only cell leaves EVERY
+# pool, and the decision to drop it has ONE home.
+#
+# Excluding it from the composite pool alone left the mirror image of the defect
+# task 3118 removed: the tainted cell reports $0.00 / 0 ms because it never ran,
+# so averaging those into cost/latency handed a schedule-attributable BONUS to
+# whichever candidate happened to be scheduled inside a cap window — on the very
+# table this task makes the operator's ranking surface.
+# ---------------------------------------------------------------------------
+
+class TestUnmeasurableCellLeavesEveryPool:
+    """One admission decision, applied to composite / quality / cost / latency."""
+
+    def _mixed_and_clean(self):
+        """Two configs with IDENTICAL measured cells; one also has a dead trial."""
+        return [
+            _arch('p1', 'arch-mixed', 1, plan_quality=None, cost_usd=0.0,
+                  duration_ms=0, cap_tainted=True),
+            _arch('p1', 'arch-mixed', 2, plan_quality=0.8, cost_usd=0.3,
+                  duration_ms=60000),
+            _arch('p1', 'arch-clean', 1, plan_quality=0.8, cost_usd=0.3,
+                  duration_ms=60000),
+        ]
+
+    def test_cost_and_latency_are_not_deflated_by_an_unmeasurable_cell(self):
+        """Identical measured cells ⇒ identical cost/latency, cap window or not.
+
+        Averaging the tainted cell's fabricated $0.00 / 0 ms in reported
+        arch-mixed as 2x cheaper and 2x faster than arch-clean purely because it
+        was scheduled inside a cap window (reviewer: correctness).
+        """
+        from orchestrator.evals.report import build_composite_report
+
+        rows = {r['config']: r for r in
+                build_composite_report(self._mixed_and_clean())['configs']}
+
+        assert rows['arch-mixed']['cost_usd'] == pytest.approx(0.3)
+        assert rows['arch-mixed']['latency_secs'] == pytest.approx(60.0)
+        assert rows['arch-mixed']['cost_usd'] == rows['arch-clean']['cost_usd']
+        assert (rows['arch-mixed']['latency_secs']
+                == rows['arch-clean']['latency_secs'])
+        # The sample size is still reported honestly — by the columns that exist
+        # to report it, not by silently averaging a zero into the cost figure.
+        assert rows['arch-mixed']['trials'] == 2
+        assert rows['arch-mixed']['plan_quality_cap_excluded'] == 1
+
+    def test_wholly_unmeasured_config_is_not_the_cheapest_row_in_the_table(self):
+        """All-tainted ⇒ cost/latency are None ('-'), not 0.0 ("free and instant")."""
+        from orchestrator.evals.report import build_composite_report
+
+        results = [
+            _arch('p1', 'arch-dark', tr, plan_quality=None, cost_usd=0.0,
+                  duration_ms=0, cap_tainted=True)
+            for tr in (1, 2, 3)
+        ]
+        row = build_composite_report(results)['configs'][0]
+        assert row['cost_usd'] is None
+        assert row['latency_secs'] is None
+        assert row['trials'] == 3
+
+    def test_unmeasured_row_has_no_zero_width_interval_at_zero(self):
+        """One row must not say both "we measured nothing" and "we measured a
+        zero-width interval at zero" (reviewer: correctness)."""
+        from orchestrator.evals.report import build_composite_report
+
+        results = [
+            _arch('p1', 'arch-dark', tr, plan_quality=None, cost_usd=0.0,
+                  duration_ms=0, cap_tainted=True)
+            for tr in (1, 2, 3)
+        ]
+        row = build_composite_report(results)['configs'][0]
+        assert row['composite'] is None
+        assert row['ci95']['composite'] is None
+        assert row['ci95']['cost'] is None
+        assert row['ci95']['latency'] is None
+
+    def test_a_tainted_cell_carrying_a_score_is_refused_by_every_surface(self):
+        """ONE predicate, so the surfaces cannot disagree (reviewer: robustness).
+
+        ``run_architect_eval`` currently taints exactly when it has no score, so
+        the two predicates coincided by COUPLING rather than by construction. A
+        hand-edited result, a legacy JSON, or a future taint cause that keeps the
+        structural floor would feed a score the plan_quality pool refuses into
+        the composite/quality pools — making one row's ``quality`` and
+        ``plan_quality`` cells disagree and putting a fabricated number back into
+        the figure ``select_survivors`` ranks on.
+        """
+        from orchestrator.evals.report import (
+            build_composite_report,
+            build_plan_quality_report,
+        )
+
+        results = [
+            # Tainted, yet carrying a score AND an outlier cost/latency.
+            _arch('p1', 'arch-odd', 1, plan_quality=0.2, cost_usd=9.9,
+                  duration_ms=999000, cap_tainted=True),
+            _arch('p1', 'arch-odd', 2, plan_quality=0.8, cost_usd=0.3,
+                  duration_ms=60000),
+        ]
+        row = build_composite_report(results)['configs'][0]
+
+        # Only the healthy cell survives: it IS its group's floor, so both
+        # efficiency axes are 1.0 → 0.6*0.8 + 0.2 + 0.2 == 0.88.
+        assert row['plan_quality'] == pytest.approx(0.8)
+        assert row['quality'] == pytest.approx(row['plan_quality'])
+        assert row['composite'] == pytest.approx(0.88, abs=1e-4)
+        assert row['cost_usd'] == pytest.approx(0.3)
+        assert row['latency_secs'] == pytest.approx(60.0)
+        assert row['plan_quality_cap_excluded'] == 1
+        # …and the θ surface reduces the identical pool, bit for bit.
+        assert row['plan_quality'] == (
+            build_plan_quality_report(results)['configs'][0]['mean_plan_quality']
+        )
+
+
+# ---------------------------------------------------------------------------
+# Task 3099 (reviewer: correctness): the composite row's `plan_quality` is the
+# config's POOLED MEAN, not its first untainted trial.
+#
+# The field was a harmless diagnostic ECHO of one trial until this task promoted
+# it to a DECISION surface — select_survivors' steps 3-4 rank on it and
+# format_composite_table renders it beside the composite. Every plan_quality
+# case that predates this block uses IDENTICAL per-trial scores, which is
+# exactly why a trial-1 passthrough survived review, so every case below carries
+# per-trial VARIANCE.
+# ---------------------------------------------------------------------------
+
+class TestPlanQualityIsTheConfigMean:
+    """The composite row's ``plan_quality`` is the config's pooled mean."""
+
+    def _varied(self):
+        """One architect config whose trials VARY: tainted, then 0.9, then 0.3.
+
+        Scored pool ``[0.9, 0.3]`` → mean 0.6. A first-scored-trial passthrough
+        reports 0.9 instead; averaging the tainted cell in as a zero reports 0.4.
+        """
+        return [
+            _arch('p1', 'arch-varied', 1, plan_quality=None, cost_usd=0.0,
+                  duration_ms=0, cap_tainted=True),
+            _arch('p1', 'arch-varied', 2, plan_quality=0.9, cost_usd=0.3,
+                  duration_ms=60000),
+            _arch('p1', 'arch-varied', 3, plan_quality=0.3, cost_usd=0.3,
+                  duration_ms=60000),
+        ]
+
+    def test_row_reports_the_pooled_mean_not_the_first_scored_trial(self):
+        from orchestrator.evals.report import build_composite_report
+
+        row = build_composite_report(self._varied())['configs'][0]
+        assert row['plan_quality'] == pytest.approx(0.6)
+        # Neither the first SCORED trial (0.9) nor the tainted-as-zero mean (0.4).
+        assert row['plan_quality'] != pytest.approx(0.9)
+        assert row['plan_quality'] != pytest.approx(0.4)
+        # Counted-and-excluded: the unmeasurable cell is still reported, so
+        # nothing is silently dropped from the sample it was averaged over.
+        assert row['plan_quality_cap_excluded'] == 1
+        assert row['trials'] == 3
+
+    def test_agrees_bit_identically_with_the_plan_quality_surface(self):
+        """ONE shared reduction, so ``==`` and not ``approx``: the two surfaces
+        must be structurally incapable of drifting, not merely close today."""
+        from orchestrator.evals.report import (
+            build_composite_report,
+            build_plan_quality_report,
+        )
+
+        results = self._varied()
+        row = build_composite_report(results)['configs'][0]
+        cfg = build_plan_quality_report(results)['configs'][0]
+        assert cfg['config_name'] == row['config']
+        assert row['plan_quality'] == cfg['mean_plan_quality']
+
+    def test_the_two_adjacent_tables_render_the_same_cell(self):
+        """``_emit_composite_report`` now prints both tables on one screen, so an
+        operator must not be able to read contradictory answers to one question.
+        """
+        from orchestrator.evals.report import (
+            _PLAN_QUALITY_MEAN_HEADER,
+            build_composite_report,
+            build_plan_quality_report,
+            format_composite_table,
+            format_plan_quality_table,
+        )
+
+        results = self._varied()
+        composite = _table_row_cells(
+            format_composite_table(build_composite_report(results)),
+            'arch-varied',
+        )
+        means = _table_row_cells(
+            format_plan_quality_table(build_plan_quality_report(results)),
+            'arch-varied', section=_PLAN_QUALITY_MEAN_HEADER,
+        )
+        # _COMPOSITE_COLUMNS[3] is plan_quality; the mean section's last column
+        # is mean_plan_quality.
+        assert composite[3] == '0.6000'
+        assert means[-1] == '0.6000'
+        # …and the single-trial score must not appear in the composite row at all.
+        assert '0.9000' not in composite
+
+    def test_quality_and_plan_quality_cells_of_one_row_agree(self):
+        """Two cells of the SAME row must not contradict either: for a plan-only
+        row ``quality`` is the mean of the axis that fed the composite, which is
+        the same pool ``plan_quality`` now reduces."""
+        from orchestrator.evals.report import build_composite_report
+
+        row = build_composite_report(self._varied())['configs'][0]
+        assert row['quality'] == pytest.approx(row['plan_quality'])
+
+    def test_identical_per_trial_scores_are_unchanged(self):
+        """Regression: with no per-trial variance the mean IS the passthrough
+        score, and a workflow row still reports ``None``."""
+        from orchestrator.evals.report import build_composite_report
+
+        rows = {r['config']: r
+                for r in build_composite_report(_union_dataset())['configs']}
+        assert rows['C']['plan_quality'] == pytest.approx(0.9)  # three 0.9 cells
+        assert rows['A']['plan_quality'] is None                # a workflow row
+
+
+class TestSurvivorRankingUsesTheConfigMean:
+    """A REAL composite tie is broken by the better MEAN plan quality."""
+
+    def _tied(self):
+        """Two architect configs on ``p1`` constructed to tie EXACTLY at 0.76.
+
+        ``arch-zeta``  cost 0.3 / 60s — it sets its group's floor, so both
+          efficiency axes are 1.0; plan_quality ``[0.9, 0.3]`` → per-trial blends
+          ``0.6*0.9 + 0.4 = 0.94`` and ``0.6*0.3 + 0.4 = 0.58`` → composite mean
+          0.76, mean plan_quality 0.6.
+        ``arch-alpha`` cost 0.5 / 75s — cost score ``0.3/0.5 = 0.6``, latency
+          score ``60/75 = 0.8``; plan_quality ``[0.8, 0.8]`` →
+          ``0.6*0.8 + 0.2*0.6 + 0.2*0.8 = 0.76`` on both trials → composite mean
+          0.76, mean plan_quality 0.8.
+        """
+        return [
+            _arch('p1', 'arch-zeta', 1, plan_quality=0.9, cost_usd=0.3,
+                  duration_ms=60000),
+            _arch('p1', 'arch-zeta', 2, plan_quality=0.3, cost_usd=0.3,
+                  duration_ms=60000),
+            _arch('p1', 'arch-alpha', 1, plan_quality=0.8, cost_usd=0.5,
+                  duration_ms=75000),
+            _arch('p1', 'arch-alpha', 2, plan_quality=0.8, cost_usd=0.5,
+                  duration_ms=75000),
+        ]
+
+    def test_the_tie_is_exact(self):
+        """Pinned separately and EXACTLY so the ranking test below can never pass
+        for the wrong reason — a tie that quietly stopped being one."""
+        from orchestrator.evals.report import build_composite_report
+
+        rows = {r['config']: r
+                for r in build_composite_report(self._tied())['configs']}
+        assert rows['arch-zeta']['composite'] == pytest.approx(0.76)
+        assert rows['arch-zeta']['composite'] == rows['arch-alpha']['composite']
+
+    def test_better_mean_plan_quality_wins_the_tie(self):
+        from orchestrator.evals.report import (
+            build_composite_report,
+            select_survivors,
+        )
+
+        report = build_composite_report(self._tied())
+        rows = {r['config']: r for r in report['configs']}
+        assert rows['arch-zeta']['composite'] == rows['arch-alpha']['composite']
+        # THE DEFECT: on a first-scored-trial passthrough zeta reports 0.9
+        # against alpha's 0.8, so the WORSE-mean config wins the tie.
+        assert rows['arch-zeta']['plan_quality'] == pytest.approx(0.6)
+        assert rows['arch-alpha']['plan_quality'] == pytest.approx(0.8)
+        assert select_survivors(report, top_k=1, roles=['architect']) == {
+            'architect': ['arch-alpha'],
+        }
+
+
+class TestRoleScopedEfficiencyBaseline:
+    """The cost/latency floor is keyed on ``(fixture, role_group)``.
+
+    ``ofat_candidates()`` returns architect + implementer + judge candidates and
+    ``run_ofat_stage`` runs them over the SAME fixtures into ONE result list. A
+    plan-only cell's cost is a single architect invocation (~$0.30/60s); a
+    workflow cell's is a full run (~$5/900s). Sharing one floor per fixture
+    therefore both crushes the workflow rows and clamps every plan-only row's
+    efficiency axes to 1.0 — making an architect campaign's ranking depend on
+    whether unrelated implementer rows happened to be in the same result set.
+    """
+
+    def _mixed(self):
+        """The shape ofat_candidates() actually produces: one fixture carrying a
+        cheap plan-only architect cell alongside expensive workflow cells."""
+        return [
+            _mresult('m1', 'impl-a', tr, quality=1.0, cost_usd=5.0,
+                     duration_ms=900000, tests_pass=True)
+            for tr in (1, 2, 3)
+        ] + [
+            _mresult('m1', 'impl-b', tr, quality=1.0, cost_usd=10.0,
+                     duration_ms=1800000, tests_pass=True)
+            for tr in (1, 2, 3)
+        ]
+
+    def test_plan_only_cell_never_sets_the_workflow_floor(self):
+        """Adding an architect cell must not move ANY implementer composite."""
+        from orchestrator.evals.report import build_composite_report
+
+        without = {r['config']: r['composite']
+                   for r in build_composite_report(self._mixed())['configs']}
+        with_arch = {
+            r['config']: r['composite']
+            for r in build_composite_report(self._mixed() + [
+                _arch('m1', 'arch-a', tr, plan_quality=0.9, cost_usd=0.3,
+                      duration_ms=60000)
+                for tr in (1, 2, 3)
+            ])['configs']
+        }
+
+        assert without['impl-a'] == with_arch['impl-a']
+        assert without['impl-b'] == with_arch['impl-b']
+        # …and the workflow rows are still normalized against each other:
+        # impl-a is the cheapest+fastest workflow run → 1.0; impl-b is 2x on
+        # both axes → 0.6 + 0.2*0.5 + 0.2*0.5 == 0.8.
+        assert with_arch['impl-a'] == pytest.approx(1.0)
+        assert with_arch['impl-b'] == pytest.approx(0.8)
+
+    def test_plan_only_rows_normalize_against_each_other(self):
+        """Two architect configs differing only in cost must get DIFFERENT
+        cost-driven composites, not both clamp to 1.0 against implementer cost.
+        """
+        from orchestrator.evals.report import build_composite_report
+
+        rows = {
+            r['config']: r['composite']
+            for r in build_composite_report(self._mixed() + [
+                _arch('m1', 'arch-cheap', tr, plan_quality=0.8, cost_usd=0.3,
+                      duration_ms=60000)
+                for tr in (1, 2, 3)
+            ] + [
+                _arch('m1', 'arch-dear', tr, plan_quality=0.8, cost_usd=0.6,
+                      duration_ms=120000)
+                for tr in (1, 2, 3)
+            ])['configs']
+        }
+
+        # 0.6*0.8 + 0.2*1.0 + 0.2*1.0 == 0.88  vs  0.6*0.8 + 0.2*0.5 + 0.2*0.5 == 0.68
+        assert rows['arch-cheap'] == pytest.approx(0.88, abs=1e-4)
+        assert rows['arch-dear'] == pytest.approx(0.68, abs=1e-4)
+        assert rows['arch-cheap'] > rows['arch-dear']
 
 
 class TestEfficiencyBaselineIgnoresFailingTrials:
@@ -629,6 +1131,141 @@ class TestFormatCompositeTable:
 
         report = _priced_unpriced_report()
         # No wall-clock / dict-order dependence: same report → identical bytes.
+        assert format_composite_table(report) == format_composite_table(report)
+
+    # -- task 3099: the plan-only columns ---------------------------------
+
+    def _arch_report(self):
+        from orchestrator.evals.report import build_composite_report
+
+        return build_composite_report(
+            [
+                _arch('p1', 'arch-good', tr, plan_quality=0.9, cost_usd=0.3,
+                      duration_ms=60000)
+                for tr in (1, 2, 3)
+            ] + [
+                _arch('p1', 'arch-weak', tr, plan_quality=0.4, cost_usd=0.3,
+                      duration_ms=60000)
+                for tr in (1, 2, 3)
+            ] + [
+                # Every trial tainted → nothing measured at all.
+                _arch('p1', 'arch-dark', tr, plan_quality=None, cost_usd=0.0,
+                      duration_ms=0, cap_tainted=True)
+                for tr in (1, 2, 3)
+            ] + [
+                # One tainted trial among healthy ones → an exclusion COUNT.
+                _arch('p1', 'arch-mixed', 1, plan_quality=None, cost_usd=0.0,
+                      duration_ms=0, cap_tainted=True),
+                _arch('p1', 'arch-mixed', 2, plan_quality=0.7, cost_usd=0.3,
+                      duration_ms=60000),
+            ] + [
+                _mresult('p2', 'impl-a', 1, quality=1.0, cost_usd=5.0,
+                         duration_ms=900000, tests_pass=True),
+            ],
+        )
+
+    def _row(self, out, config):
+        """The rendered line for *config*, split into whitespace-separated cells."""
+        return _table_row_cells(out, config)
+
+    def test_header_carries_plan_quality_and_exclusion_columns(self):
+        from orchestrator.evals.report import format_composite_table
+
+        out = format_composite_table(self._arch_report())
+        header = out.splitlines()[1]
+        assert 'plan_quality' in header
+        assert 'pq_excluded' in header
+
+    def test_architect_row_renders_plan_quality_and_exclusion_count(self):
+        """Asserted by COLUMN INDEX, not membership (reviewer: test-quality).
+
+        A bare ``'1' in row`` is satisfied by the trailing trials/fixtures cells,
+        so it would still pass if ``pq_excluded`` regressed to 0 — it pins
+        nothing. The index is asserted against ``_COMPOSITE_COLUMNS`` first, so a
+        column reorder fails loudly here instead of silently re-aiming every
+        positional assertion below at the wrong cell.
+        """
+        from orchestrator.evals.report import (
+            _COMPOSITE_COLUMNS,
+            format_composite_table,
+        )
+
+        assert _COMPOSITE_COLUMNS[3] == 'plan_quality'
+        assert _COMPOSITE_COLUMNS[4] == 'pq_excluded'
+        out = format_composite_table(self._arch_report())
+        assert self._row(out, 'arch-good')[3] == '0.9000'
+        assert self._row(out, 'arch-good')[4] == '0'
+        assert self._row(out, 'arch-mixed')[4] == '1'   # the exclusion COUNT
+        assert self._row(out, 'arch-dark')[4] == '3'
+
+    def test_non_architect_row_renders_dash_not_a_fabricated_zero(self):
+        from orchestrator.evals.report import format_composite_table
+
+        out = format_composite_table(self._arch_report())
+        cells = self._row(out, 'impl-a')
+        # A workflow row has no plan_quality: '-' , never '0.0000'. Positional:
+        # a bare `'-' in cells` would also pass if `composite` wrongly rendered
+        # '-' (reviewer: test-quality).
+        assert cells[3] == '-'
+        assert cells[1] != '-'   # …while its composite IS measured.
+
+    def test_wholly_unmeasured_row_renders_dash_for_every_measured_cell(self):
+        """Not just composite/quality: an all-tainted row must not render as the
+        cheapest and fastest config in the table, nor carry a zero-width CI."""
+        from orchestrator.evals.report import (
+            _COMPOSITE_COLUMNS,
+            format_composite_table,
+        )
+
+        assert _COMPOSITE_COLUMNS[5] == 'cost_usd'
+        assert _COMPOSITE_COLUMNS[7] == 'latency_secs'
+        assert _COMPOSITE_COLUMNS[8] == 'ci95_composite'
+        out = format_composite_table(self._arch_report())
+        cells = self._row(out, 'arch-dark')
+        # composite and quality are both None → '-'. "We measured nothing" must
+        # never render as the 0.0000 that "it scored nothing" would.
+        assert cells[1] == '-'
+        assert cells[2] == '-'
+        assert '0.0000' not in cells[1:3]
+        # …and neither may the cost/latency cells (0.0000 / 0.00 would make the
+        # config that never ran the cheapest and fastest row on the screen), nor
+        # the CI95 cell, which used to render '[0.0000, 0.0000]' right beside the
+        # composite '-' (reviewer: correctness).
+        assert cells[5] == '-'
+        assert cells[7] == '-'
+        assert cells[8] == '-'
+
+    def test_cap_window_is_not_rendered_as_a_cost_advantage(self):
+        """arch-mixed's measured cell is arch-good's price; only its plan quality
+        differs. The table must not present it as half the cost/latency."""
+        from orchestrator.evals.report import format_composite_table
+
+        out = format_composite_table(self._arch_report())
+        mixed = self._row(out, 'arch-mixed')
+        good = self._row(out, 'arch-good')
+        assert mixed[5] == good[5] == '0.3000'
+        assert mixed[7] == good[7] == '60.00'
+
+    def test_operator_can_rank_architects_from_the_table_alone(self):
+        """The acceptance assertion for the reported defect.
+
+        In the 2026-07-27 OFAT every architect row rendered composite 0.0000, so
+        the table could not be ranked and the scores had to be recomputed by
+        hand from the per-cell result JSONs (defect 1).
+        """
+        from orchestrator.evals.report import format_composite_table
+
+        out = format_composite_table(self._arch_report())
+        good = self._row(out, 'arch-good')[1]
+        weak = self._row(out, 'arch-weak')[1]
+        assert good == '0.9400'
+        assert weak == '0.6400'
+        assert float(good) > float(weak)
+
+    def test_plan_only_table_renders_byte_identically(self):
+        from orchestrator.evals.report import format_composite_table
+
+        report = self._arch_report()
         assert format_composite_table(report) == format_composite_table(report)
 
 

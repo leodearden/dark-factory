@@ -974,6 +974,37 @@ class TestRunArchitectEval:
         assert result.metrics['cap_tainted'] is False
         assert result.metrics['plan_quality'] is not None
 
+    @pytest.mark.parametrize('arch_result_factory', [None, _cap_agent_result])
+    async def test_plan_only_cell_records_tests_pass_as_unknown(
+        self, arch_result_factory,
+    ):
+        """A plan-only cell collected NO test signal — ``tests_pass`` is None.
+
+        ``run_architect_eval`` freezes implementer/debugger/reviewer/verify, so
+        no test is ever run. The two wrong answers are both live risks:
+
+        - ``False`` (today's dataclass default) reads as "the tests FAILED",
+          which is what hard-gates ``blend_composite`` to 0.0 and collapses
+          every architect row's composite — the defect this task removes.
+        - ``True`` would fabricate a pass for a run that never invoked verify,
+          and would additionally let a ~$0.30/60s plan-only cell set the
+          per-fixture cost/latency FLOOR that ``build_composite_report`` draws
+          from PASSING trials, deflating the ~$5/900s full-workflow implementer
+          rows that ``ofat_candidates()`` puts in the same result set.
+
+        Pinned on BOTH the healthy and the cap-tainted path: the absence of a
+        test signal is a property of the plan-only MODE, not of the outcome.
+        """
+        result, _ = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=_well_formed_plan(),
+            arch_result=arch_result_factory() if arch_result_factory else None,
+        )
+
+        assert result.metrics['tests_pass'] is None
+        assert result.metrics['tests_pass'] is not False
+        assert result.metrics['tests_pass'] is not True
+
     async def test_cap_refusal_that_left_a_plan_keeps_the_structural_floor(self):
         """A cap landing MID-run, after plan.json was already written.
 

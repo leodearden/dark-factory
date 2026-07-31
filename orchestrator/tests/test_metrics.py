@@ -452,6 +452,57 @@ class TestBlendComposite:
             -5.0, 0.0, 0.0, tests_pass=True,
         ) == 0.0
 
+    # -- task 3099: the PLAN-ONLY path ------------------------------------
+    # An architect eval freezes every downstream role, so the cell never runs
+    # a test. The ``tests_pass`` hard gate is therefore the wrong instrument
+    # there: it reads "no test signal collected" as "the answer was wrong" and
+    # zeroes the number that drives survivor selection. Under ``plan_only``
+    # the caller supplies plan_quality as the QUALITY axis instead.
+
+    def test_plan_only_blends_plan_quality_without_test_signal(self):
+        """plan_only=True scores the θ-rubric plan_quality, not tests_pass."""
+        from orchestrator.evals.metrics import blend_composite
+
+        # 0.6*0.9 + 0.2*1.0 + 0.2*1.0 == 0.54 + 0.2 + 0.2 == 0.94
+        assert blend_composite(
+            0.9, 1.0, 1.0, tests_pass=None, plan_only=True,
+        ) == pytest.approx(0.94, abs=1e-4)
+
+    def test_plan_only_bypasses_the_tests_pass_hard_gate(self):
+        """Even an explicit tests_pass=False must not gate a plan-only cell.
+
+        A plan-only cell has NO test signal at all, so ``tests_pass`` — whatever
+        its value — must not decide its composite. Pinned separately from the
+        ``None`` case so a future "treat False as authoritative" edit fails.
+        """
+        from orchestrator.evals.metrics import blend_composite
+
+        assert blend_composite(
+            0.9, 1.0, 1.0, tests_pass=False, plan_only=True,
+        ) == pytest.approx(0.94, abs=1e-4)
+
+    def test_plan_only_defaults_false_so_the_implementer_gate_is_intact(self):
+        """The workflow path is byte-identical: no plan_only → hard gate."""
+        from orchestrator.evals.metrics import blend_composite
+
+        assert blend_composite(
+            1.0, 1.0, 1.0, tests_pass=False,
+        ) == 0.0
+        assert blend_composite(
+            1.0, 1.0, 1.0, tests_pass=None,
+        ) == 0.0
+
+    def test_plan_only_result_still_clamped_to_unit_interval(self):
+        """The bound is a property of the blend, not of the gate."""
+        from orchestrator.evals.metrics import blend_composite
+
+        assert blend_composite(
+            2.0, 1.0, 1.0, tests_pass=None, plan_only=True,
+        ) == 1.0
+        assert blend_composite(
+            -5.0, 0.0, 0.0, tests_pass=None, plan_only=True,
+        ) == 0.0
+
 
 # ---------------------------------------------------------------------------
 # Amendment (reviewer: code-reuse) — the cost primitives (_FALLBACK_PRICE / _rate)

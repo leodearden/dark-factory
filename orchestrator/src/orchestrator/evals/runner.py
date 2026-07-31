@@ -776,6 +776,23 @@ async def run_architect_eval(
     metrics = EvalMetrics(
         plan_quality=plan_quality,
         role_under_test='architect',
+        # NO test signal exists for a plan-only cell (task 3099): this path
+        # freezes implementer/debugger/reviewer/verify, so verification never
+        # runs. ``None`` is the documented "unknown" sentinel; the dataclass
+        # DEFAULT of ``False`` would read as "the tests failed" and hard-gate
+        # ``blend_composite`` to 0.0, collapsing every architect row's composite
+        # to 0.0000 and leaving ``select_survivors``' alphabetical tie-break as
+        # the whole selection mechanism.
+        #
+        # ``True`` is NOT the fix either, on two counts:
+        #   - ``build_composite_report`` draws each fixture's cost/latency FLOOR
+        #     from PASSING trials, and ``ofat_candidates()`` mixes architect,
+        #     implementer and judge candidates over the SAME fixtures into one
+        #     result set. A ~$0.30/60s plan-only cell marked passing would
+        #     become the floor for ~$5/900s full-workflow cells.
+        #   - it would fabricate a 100% ``tests_pass_rate`` for a cell that
+        #     never ran a test.
+        tests_pass=None,
         # ``or []``, not a .get default: a plan can carry an explicit
         # ``steps: None`` (the normalizer's other empty shape), and len(None)
         # would crash the cell OUTSIDE the try above — turning a marked,
