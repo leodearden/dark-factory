@@ -219,3 +219,205 @@ class TestKindRegistry:
 
     def test_registry_is_closed_not_open(self):
         assert 'not_a_real_kind_xyz' not in KIND_REGISTRY
+
+
+class TestKeyLayers:
+    """The layered top-level key allowlist, and the INV-5 single-home pin for D12.
+
+    Four layers, deliberately disjoint: mem0-managed (the store owns them),
+    server-stamped (this server writes them), reserved vocabulary (V1's five),
+    and blessed conventional keys (the measured >=1000 tier).
+    """
+
+    def test_mem0_managed_keys_are_the_expected_nine(self):
+        from fused_memory.backends import mem0_client
+
+        assert mem0_client.MEM0_MANAGED_METADATA_KEYS == frozenset({
+            'data', 'hash', 'created_at', 'updated_at',
+            'user_id', 'agent_id', 'run_id', 'actor_id', 'role',
+        })
+
+    def test_mem0_managed_keys_is_one_object_not_a_copy(self):
+        """INV-5 / PRD D12: `backends/mem0_client.py` is the decided home.
+
+        Identity, not equality — two equal frozensets in two modules is
+        exactly the duplication D12 exists to prevent.
+        """
+        from fused_memory.backends import mem0_client
+        from fused_memory import memory_metadata as mm
+
+        assert mm.MEM0_MANAGED_METADATA_KEYS is mem0_client.MEM0_MANAGED_METADATA_KEYS
+
+    def test_script_retains_an_alias_not_a_copy(self):
+        """The script's private name must be an ALIAS to the extracted object.
+
+        Keeping the module-local spelling means
+        `tests/test_tag_cgl_eta_rehome_scope.py:309` needs no edit, while
+        identity proves the extraction left one object rather than two.
+        """
+        import importlib.util
+        import sys
+        from fused_memory.backends import mem0_client
+
+        script_path = Path(__file__).parent.parent / 'scripts' / 'tag_cgl_eta_rehome_scope.py'
+        spec = importlib.util.spec_from_file_location('tag_cgl_eta_rehome_scope', script_path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules['tag_cgl_eta_rehome_scope'] = module
+        try:
+            spec.loader.exec_module(module)
+            assert module._MEM0_MANAGED_METADATA_KEYS is mem0_client.MEM0_MANAGED_METADATA_KEYS
+        finally:
+            sys.modules.pop('tag_cgl_eta_rehome_scope', None)
+
+    def test_server_stamped_keys(self):
+        from fused_memory.memory_metadata import SERVER_STAMPED_KEYS
+
+        assert SERVER_STAMPED_KEYS == frozenset({
+            'category',    # memory_service.py:2193 (add_memory), :2542 (add_system_record)
+            'recon_pool',  # _apply_cycle_summary_metadata_tagging (memory_service.py:389)
+            'run_id',      # _apply_cycle_summary_metadata_tagging (memory_service.py:389)
+            'planned',     # NOT a write-seam stamp — a server-owned search-result
+                           # annotation (memory_service.py:1932, :2921, read back at
+                           # :2962). Included so a round-tripped search result
+                           # re-written as metadata does not census-warn on the
+                           # server's own field.
+        })
+
+    def test_reserved_vocabulary_keys(self):
+        from fused_memory.memory_metadata import RESERVED_VOCABULARY_KEYS
+
+        assert RESERVED_VOCABULARY_KEYS == frozenset({
+            'topic', 'canonical', 'kind', 'parent_id', 'supersedes',
+        })
+
+    @pytest.mark.parametrize(
+        ('key', 'census_count'),
+        [
+            ('task_id', 18850),
+            ('source', 16364),
+            ('transition', 15529),
+            ('_deferred', 8263),
+            ('_causation_id', 8262),
+            ('stage', 2865),
+            ('stage2_suppress', 1588),
+            ('echo_used_provenance', 1284),
+        ],
+    )
+    def test_blessed_keys_contain_the_measured_cut(self, key, census_count):
+        """The >=1000 cut, re-derived from the artifact so the tier cannot
+        drift from the measurement that justified it."""
+        from fused_memory.memory_metadata import BLESSED_METADATA_KEYS
+
+        assert key in BLESSED_METADATA_KEYS
+        report = json.loads(_CENSUS_ARTIFACT.read_text())
+        measured = {
+            e['value']: e['count'] for e in report['grand_total']['keys']['entries']
+        }
+        assert measured[key] == census_count
+        assert measured[key] >= 1000
+
+    def test_layers_are_pairwise_disjoint(self):
+        """No key may be classified twice.
+
+        `run_id` is the live trap: it is server-stamped AND measures 4,518
+        occurrences, so it is exactly the key that would otherwise land in
+        both the blessed tier and the server-stamped tier.
+        """
+        from fused_memory.backends.mem0_client import MEM0_MANAGED_METADATA_KEYS
+        from fused_memory.memory_metadata import (
+            BLESSED_METADATA_KEYS,
+            RESERVED_VOCABULARY_KEYS,
+            SERVER_STAMPED_KEYS,
+        )
+
+        assert not (BLESSED_METADATA_KEYS & RESERVED_VOCABULARY_KEYS)
+        assert not (BLESSED_METADATA_KEYS & MEM0_MANAGED_METADATA_KEYS)
+        assert not (BLESSED_METADATA_KEYS & SERVER_STAMPED_KEYS)
+        assert 'run_id' not in BLESSED_METADATA_KEYS
+
+    def test_classify_unknown_keys_returns_only_genuinely_unknown(self):
+        from fused_memory.memory_metadata import classify_unknown_keys
+
+        meta = {
+            'data': 1,                 # mem0-managed
+            'category': 'x',           # server-stamped
+            'kind': 'cycle_summary',   # reserved
+            'task_id': '3195',         # blessed
+            'x_experimental': True,    # x_ passthrough
+            'totally_novel_key': 'v',  # unknown
+        }
+        assert classify_unknown_keys(meta) == ['totally_novel_key']
+
+    def test_classify_unknown_keys_empty_dict(self):
+        from fused_memory.memory_metadata import classify_unknown_keys
+
+        assert classify_unknown_keys({}) == []
+
+    def test_bare_x_prefix_passes(self):
+        from fused_memory.memory_metadata import classify_unknown_keys
+
+        assert classify_unknown_keys({'x_': 1}) == []
+
+
+class TestErrorTypes:
+    """`MetadataViolation` / `MemoryMetadataValidationError`.
+
+    V1 requires the rejection hint to name BOTH the violated rule and where
+    the registry lives, so an agent that trips it can find the vocabulary.
+    """
+
+    def test_violation_carries_the_expected_fields(self):
+        from fused_memory.memory_metadata import MetadataViolation
+
+        v = MetadataViolation(
+            key='topic', code='invalid_topic_slug', message='bad', fatal=True
+        )
+        assert v.key == 'topic'
+        assert v.code == 'invalid_topic_slug'
+        assert v.message == 'bad'
+        assert v.fatal is True
+
+    def test_violation_is_comparable_and_hashable(self):
+        from fused_memory.memory_metadata import MetadataViolation
+
+        a = MetadataViolation(key='k', code='c', message='m', fatal=False)
+        b = MetadataViolation(key='k', code='c', message='m', fatal=False)
+        assert a == b
+        assert len({a, b}) == 1
+
+    def test_error_subclasses_exception_and_exposes_violations(self):
+        from fused_memory.memory_metadata import (
+            MemoryMetadataValidationError,
+            MetadataViolation,
+        )
+
+        assert issubclass(MemoryMetadataValidationError, Exception)
+        v = MetadataViolation(
+            key='topic',
+            code='invalid_topic_slug',
+            message="topic 'bad_slug' must match TOPIC_SLUG_RE",
+            fatal=True,
+        )
+        err = MemoryMetadataValidationError([v])
+        assert err.violations == [v]
+
+    def test_error_str_names_the_rule_and_the_registry_location(self):
+        """V1: the hint names the rule AND where the registry lives."""
+        from fused_memory.memory_metadata import (
+            MemoryMetadataValidationError,
+            MetadataViolation,
+        )
+
+        err = MemoryMetadataValidationError([
+            MetadataViolation(
+                key='topic',
+                code='invalid_topic_slug',
+                message="topic 'bad_slug' must match TOPIC_SLUG_RE",
+                fatal=True,
+            )
+        ])
+        text = str(err)
+        assert 'invalid_topic_slug' in text
+        assert 'TOPIC_SLUG_RE' in text
+        assert 'fused_memory.memory_metadata' in text
