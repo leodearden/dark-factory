@@ -258,7 +258,7 @@ for row in scf.load_startup_completion_corpus():          # list[StartupCompleti
 | `snapshot_config_dir(config_dir, ...)` | `-> list[dict]` — the sampler shared with the probe, so probe output and materialized trees are describable by one function. |
 | `evaluate_startup_completion_predicate(config_dir, session_id)` | `-> bool \| None` — the reference implementation. Diff a production port against it. |
 | `validate_row(row)` / `assert_no_credential_material(text, *, source)` | Schema gate and secret-hygiene guard; reusable if ν appends rows. |
-| `row['expected_startup_complete']` | `bool \| None` — the recorded verdict. **`None` is a real value**, not a missing one: it is the unreadable sentinel, and it is what four of the fourteen rows carry. |
+| `row['expected_startup_complete']` | `bool \| None` — the recorded verdict. **`None` is a real value**, not a missing one: it is the unreadable sentinel, and it is what eight of the fourteen rows carry. |
 | `row['substrate_returns']` | `{transcript_exists, read_transcript_records_is_none, record_count, count_transcript_turns}` — the three committed substrate calls' returns, so a port can be checked against the substrate and not just the verdict. |
 
 **Tri-state convention.** `True` → startup proven, extend the pre-turn-1 bound to
