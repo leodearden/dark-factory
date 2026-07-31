@@ -34,6 +34,18 @@ CREATE TABLE IF NOT EXISTS write_ops (
 CREATE INDEX IF NOT EXISTS idx_wo_causation ON write_ops(causation_id);
 CREATE INDEX IF NOT EXISTS idx_wo_project_time ON write_ops(project_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_wo_operation ON write_ops(operation);
+-- idx_wo_created (task 3304): the dashboard filters a BARE `WHERE created_at >= ?`
+-- (dashboard/src/dashboard/data/write_journal.py lines 52-58, 88-91, 116-120).
+-- Every other write_ops index has created_at in SECOND position, so none of them
+-- can range-seek that predicate — the queries full-scanned 16.4M rows.
+-- Lives here rather than in _migrate() because initialize() runs
+-- executescript(SCHEMA_SQL) unconditionally on every start and the DDL is
+-- IF NOT EXISTS: this block alone builds the index once on an existing DB and is
+-- free thereafter. _migrate() is for ALTER TABLE column additions plus indexes
+-- that depend on those new columns; duplicating the DDL there would be lock-step
+-- duplication. Same shape as idx_bo_created on backend_ops below.
+-- one-time build on the live journal: <TBD, filled in by step-3>
+CREATE INDEX IF NOT EXISTS idx_wo_created ON write_ops(created_at);
 
 CREATE TABLE IF NOT EXISTS backend_ops (
     id TEXT PRIMARY KEY,
