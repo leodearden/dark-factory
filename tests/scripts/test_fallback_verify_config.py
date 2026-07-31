@@ -394,3 +394,55 @@ def test_fallback_verify_budget_clears_the_measured_fleet_chain_floor() -> None:
         'it is strictly more expensive; a warm budget above the cold one is '
         'incoherent by construction'
     )
+
+
+def test_nested_module_configs_are_covered_by_the_per_test_timeout_guard() -> None:
+    """Discovery must reach module configs at ANY depth, keyed by module prefix.
+
+    Task 3350. ``_discover_per_module_configs`` globbed
+    ``REPO_ROOT/*/orchestrator.yaml`` — ONE level only — while its own docstring
+    promised "a newly-added subproject is auto-covered by the per-test timeout
+    guard ... and cannot silently regress to the 60s default". A depth-2 config
+    such as ``tests/scripts/orchestrator.yaml`` silently escaped it, so the
+    guard's coverage claim was false exactly when a new config appeared
+    somewhere the glob did not look — the drift class the dynamic discovery was
+    introduced to prevent.
+
+    It also keyed the discovered set on ``path.parent.name``, which collides
+    ``scripts`` with ``tests/scripts``: two distinct module configs, one key.
+    Assertion (b) pins that they stay DISTINCT, which is only possible if the
+    set is keyed on the repo-relative module PREFIX rather than the bare
+    directory name.
+    """
+    discovered = _discover_per_module_configs()
+
+    # (a) The depth-2 config is reached at all.
+    assert 'tests/scripts' in discovered, (
+        "per-module config discovery did not find 'tests/scripts' (task 3350) — "
+        'a config nested deeper than one level escapes the per-test timeout '
+        'guard, so it can silently inherit the flaky 60s pyproject default while '
+        'this test vacuously passes on a shrunken set. Discovered: '
+        f'{sorted(discovered)}'
+    )
+
+    # (b) ... without colliding with the depth-1 'scripts' config. Both exist,
+    # they are different files with different test_commands, and a name-keyed
+    # set would silently drop one of them.
+    assert 'scripts' in discovered, (
+        "per-module config discovery lost the depth-1 'scripts' config while "
+        f'gaining nested ones (task 3350). Discovered: {sorted(discovered)}'
+    )
+    assert discovered['scripts'] is not discovered['tests/scripts'], (
+        "'scripts' and 'tests/scripts' resolved to the SAME module config (task "
+        '3350) — the discovered set is keyed on the bare directory name, so the '
+        'two collide and one is silently dropped from the timeout guard'
+    )
+
+    # (c) The known-7 floor still holds against the re-keyed set. Depth-1
+    # prefixes are identical to their bare names, so KNOWN_PER_MODULE_CONFIG_NAMES
+    # needed only the new 'tests/scripts' entry.
+    missing = KNOWN_PER_MODULE_CONFIG_NAMES - set(discovered)
+    assert not missing, (
+        f'discovery failed to resolve known per-module config(s) {sorted(missing)} '
+        f'(task 3350); discovered: {sorted(discovered)}'
+    )
