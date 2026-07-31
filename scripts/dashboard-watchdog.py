@@ -62,6 +62,10 @@ import).
 """
 
 import os
+import subprocess
+import sys
+import urllib.error
+import urllib.request
 
 # ---------------------------------------------------------------------------
 # Contract constants — plans/dashboard-availability-prd.md §Contract.
@@ -172,3 +176,104 @@ ESCALATION_CATEGORY = "infra_issue"
 #: own environment — this script is stdlib-only and cannot import escalation.
 #: Default matches dashboard/dark-factory-dashboard.service's ExecStart.
 UV_BIN = os.environ.get("DASHBOARD_WATCHDOG_UV_BIN", "/home/leo/.local/bin/uv")
+
+#: systemd-cat tag every log line carries — ``journalctl --user -t
+#: dashboard-watchdog`` is the single place to read this watchdog's decisions.
+LOG_TAG = "dashboard-watchdog"
+
+
+# ---------------------------------------------------------------------------
+# Logging (reused idiom-for-idiom from scripts/orchestrator-watchdog.py)
+# ---------------------------------------------------------------------------
+
+
+def log(msg: str) -> None:
+    """Write *msg* to the systemd journal tagged as ``dashboard-watchdog``.
+
+    Falls back to stderr when ``systemd-cat`` is unavailable (e.g. a test
+    environment, or a systemd-less host). That is not a silent swallow: the
+    unit sets ``StandardError=journal``, so the message still reaches the same
+    journal by the other route.
+    """
+    try:
+        subprocess.run(
+            ["systemd-cat", "-t", LOG_TAG],
+            input=msg,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        # systemd-cat missing/unexecutable — still emit, just via stderr.
+        print(f"{LOG_TAG}: {msg}", file=sys.stderr)
+
+
+class _JournalLog:
+    """Route ``.warning(...)`` through the systemd-cat ``log()`` helper.
+
+    Itself fail-soft: a journald-write failure must never convert a fail-soft
+    handler's swallow-and-continue contract into a raised exception.
+
+    Intentionally exposes ONLY ``.warning()`` — the minimal attribute-call
+    surface required by the silent-fallthrough gate's WARN_METHODS check
+    (shared/tests/silent_fallthrough_scan.py::_handler_has_warn_log, whose
+    _SCOPE_ROOTS includes ``scripts``). This is not a general-purpose logging
+    facade; non-handler call sites in this module keep calling bare ``log()``.
+    Copied deliberately from scripts/orchestrator-watchdog.py so the two
+    watchdogs' journal behaviour stays identical.
+    """
+
+    def warning(self, msg: str) -> None:
+        try:
+            log(f"WARNING: {msg}")
+        except Exception:  # noqa: BLE001 -- logging must never break a fail-soft path
+            pass
+
+
+logger = _JournalLog()
+
+
+# ---------------------------------------------------------------------------
+# Probe
+# ---------------------------------------------------------------------------
+
+
+def probe_health(url: str = PROBE_URL, timeout: float = PROBE_TIMEOUT) -> bool:
+    """Return True iff *url* answers HTTP 200 within *timeout* seconds.
+
+    §Contract "probe". 200 is the ONLY success: a non-200 status, a connection
+    refusal and a timeout are all failures. Note that a failure here does not
+    actuate anything on its own — FAIL_STREAK consecutive failures are
+    required before any restart, which is the whole point of this rewrite.
+
+    DELIBERATE INVERSION vs scripts/orchestrator-watchdog.py's probe_health,
+    which returns True on a 503. Do not "fix" one to match the other:
+
+      * That probe guards fused-memory, whose /health returns 503 when a
+        backing STORE (FalkorDB/Qdrant) is degraded. Restarting the process
+        would not fix a down store and would flap the single shared instance
+        all seven orchestrators depend on — so there, ANY HTTP response means
+        the event loop is alive, and only silence is a failure.
+      * This probe targets the dashboard's shallow ``{'status': 'ok'}``
+        handler, which performs no I/O whatsoever. If it answers anything
+        other than 200, the ASGI app itself is broken — and that a restart
+        CAN fix. Accepting a 503 here would mean never noticing the exact
+        failure the watchdog exists to catch.
+
+    Fail-soft: every exception is caught and reported as "not healthy". A
+    tooling failure inside the probe can therefore contribute to a streak, but
+    still cannot by itself trigger a restart.
+    """
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return resp.status == 200
+    except urllib.error.HTTPError as exc:
+        # The server answered, but not with 200 — the shallow handler cannot
+        # legitimately return anything else, so this is a real failure.
+        log(f"probe_health({url!r}) got HTTP {exc.code} (expected 200)")
+        return False
+    except Exception as exc:  # noqa: BLE001 -- any other failure means no 200
+        logger.warning(
+            f"probe_health({url!r}) got no usable response "
+            f"({type(exc).__name__}: {exc}); counting as a failed probe"
+        )
+        return False
