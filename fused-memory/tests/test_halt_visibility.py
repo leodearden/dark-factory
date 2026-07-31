@@ -304,3 +304,215 @@ class TestGetQueueStatsReconciliationHalt:
             await journal.close()
             if buf:
                 await buf.close()
+
+
+# ── deliverable (B): trigger_reconciliation stops lying under halt ──────────
+
+
+def _make_interceptor():
+    """Mock TaskInterceptor exposing an awaitable buffer.request_trigger."""
+    interceptor = MagicMock()
+    interceptor.buffer = MagicMock()
+    interceptor.buffer.request_trigger = AsyncMock(return_value=None)
+    return interceptor
+
+
+def _expire_cooldown(judge, project_id='proj'):
+    from datetime import UTC, datetime, timedelta
+
+    judge._halt_cooldown_until[project_id] = datetime.now(UTC) - timedelta(hours=1)
+
+
+class TestTriggerReconciliationUnderHalt:
+    """trigger_reconciliation must not answer 'requested' while the harness is
+    skipping every cycle for that project.
+
+    That false success is the second half of the incident: an operator, having
+    finally noticed the backlog, ran the trigger, was told reconciliation
+    'will trigger within ~5 seconds', and waited. Nothing ran.
+    """
+
+    @pytest.mark.asyncio
+    async def test_halted_with_live_cooldown_reports_halted_and_requests_nothing(
+        self, tmp_path,
+    ):
+        harness, journal, buf = await _make_harness(tmp_path)
+        try:
+            await harness.judge._apply_halt('proj', reason=_REAL_REASON)
+            interceptor = _make_interceptor()
+            server = create_mcp_server(
+                _make_status_mock_service(),
+                task_interceptor=interceptor,
+                reconciliation_harness=harness,
+            )
+
+            result = await server._tool_manager.call_tool(
+                'trigger_reconciliation', {'project_id': 'proj'},
+            )
+
+            assert result['status'] == 'halted'
+            assert result['status'] != 'requested'
+            assert result['halted'] is True
+            assert result['halt_reason'] == _REAL_REASON
+            assert result['halted_at'] is not None
+            assert result['cooldown_until'] is not None
+            assert result['cooldown_expired'] is False
+            assert result['trigger_requested'] is False
+            assert 'unhalt_reconciliation' in result['remedy']
+            # Nothing was requested, so nothing may be promised.
+            interceptor.buffer.request_trigger.assert_not_awaited()
+        finally:
+            await journal.close()
+            if buf:
+                await buf.close()
+
+    @pytest.mark.asyncio
+    async def test_expired_cooldown_with_auto_unhalt_forwards_the_trigger(
+        self, tmp_path,
+    ):
+        """The mirror-image lie is also forbidden: with auto-unhalt enabled and
+        the cooldown expired, the next tick unhalts and then RUNS the cycle, so
+        a manual trigger genuinely is consumed. Say 'halted', but forward it."""
+        harness, journal, buf = await _make_harness(
+            tmp_path, auto_unhalt_after_cooldown=True,
+        )
+        try:
+            await harness.judge._apply_halt('proj', reason=_REAL_REASON)
+            _expire_cooldown(harness.judge)
+            interceptor = _make_interceptor()
+            server = create_mcp_server(
+                _make_status_mock_service(),
+                task_interceptor=interceptor,
+                reconciliation_harness=harness,
+            )
+
+            result = await server._tool_manager.call_tool(
+                'trigger_reconciliation', {'project_id': 'proj'},
+            )
+
+            assert result['status'] == 'halted'
+            assert result['cooldown_expired'] is True
+            assert result['trigger_requested'] is True
+            interceptor.buffer.request_trigger.assert_awaited_once_with('proj')
+            assert 'auto' in result['message'].lower()
+        finally:
+            await journal.close()
+            if buf:
+                await buf.close()
+
+    @pytest.mark.asyncio
+    async def test_expired_cooldown_without_auto_unhalt_requests_nothing(
+        self, tmp_path,
+    ):
+        """Cooldown expiry alone does not clear a halt when auto-unhalt is off —
+        the project stays halted until someone acts."""
+        harness, journal, buf = await _make_harness(
+            tmp_path, auto_unhalt_after_cooldown=False,
+        )
+        try:
+            await harness.judge._apply_halt('proj', reason=_REAL_REASON)
+            _expire_cooldown(harness.judge)
+            interceptor = _make_interceptor()
+            server = create_mcp_server(
+                _make_status_mock_service(),
+                task_interceptor=interceptor,
+                reconciliation_harness=harness,
+            )
+
+            result = await server._tool_manager.call_tool(
+                'trigger_reconciliation', {'project_id': 'proj'},
+            )
+
+            assert result['status'] == 'halted'
+            assert result['cooldown_expired'] is True
+            assert result['trigger_requested'] is False
+            assert 'unhalt_reconciliation' in result['remedy']
+            interceptor.buffer.request_trigger.assert_not_awaited()
+        finally:
+            await journal.close()
+            if buf:
+                await buf.close()
+
+    @pytest.mark.asyncio
+    async def test_not_halted_keeps_legacy_requested_behaviour(self, tmp_path):
+        harness, journal, buf = await _make_harness(tmp_path)
+        try:
+            interceptor = _make_interceptor()
+            server = create_mcp_server(
+                _make_status_mock_service(),
+                task_interceptor=interceptor,
+                reconciliation_harness=harness,
+            )
+
+            result = await server._tool_manager.call_tool(
+                'trigger_reconciliation', {'project_id': 'proj'},
+            )
+
+            assert result['status'] == 'requested'
+            assert result['project_id'] == 'proj'
+            interceptor.buffer.request_trigger.assert_awaited_once_with('proj')
+        finally:
+            await journal.close()
+            if buf:
+                await buf.close()
+
+    @pytest.mark.asyncio
+    async def test_no_harness_wired_keeps_legacy_behaviour(self):
+        """Missing observability must never block a trigger."""
+        interceptor = _make_interceptor()
+        server = create_mcp_server(
+            _make_status_mock_service(), task_interceptor=interceptor,
+        )
+
+        result = await server._tool_manager.call_tool(
+            'trigger_reconciliation', {'project_id': 'proj'},
+        )
+
+        assert result['status'] == 'requested'
+        interceptor.buffer.request_trigger.assert_awaited_once_with('proj')
+
+    @pytest.mark.asyncio
+    async def test_harness_without_judge_keeps_legacy_behaviour(self, tmp_path):
+        harness, journal, buf = await _make_harness(tmp_path)
+        try:
+            harness.judge = None
+            interceptor = _make_interceptor()
+            server = create_mcp_server(
+                _make_status_mock_service(),
+                task_interceptor=interceptor,
+                reconciliation_harness=harness,
+            )
+
+            result = await server._tool_manager.call_tool(
+                'trigger_reconciliation', {'project_id': 'proj'},
+            )
+
+            assert result['status'] == 'requested'
+            interceptor.buffer.request_trigger.assert_awaited_once_with('proj')
+        finally:
+            await journal.close()
+            if buf:
+                await buf.close()
+
+    @pytest.mark.asyncio
+    async def test_taskmaster_unconfigured_still_returns_configuration_error(
+        self, tmp_path,
+    ):
+        """The config check runs before the halt check — a halted project with
+        no Taskmaster still reports the config failure, not a halt."""
+        harness, journal, buf = await _make_harness(tmp_path)
+        try:
+            await harness.judge._apply_halt('proj', reason=_REAL_REASON)
+            server = create_mcp_server(
+                _make_status_mock_service(), reconciliation_harness=harness,
+            )
+
+            result = await server._tool_manager.call_tool(
+                'trigger_reconciliation', {'project_id': 'proj'},
+            )
+
+            assert result['error_type'] == 'ConfigurationError'
+        finally:
+            await journal.close()
+            if buf:
+                await buf.close()
