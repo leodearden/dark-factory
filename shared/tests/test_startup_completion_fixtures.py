@@ -290,6 +290,118 @@ class TestMaterialization:
         assert first.exists() and second.exists()
 
 
+class TestWedgeShapeCoverage:
+    """The corpus covers every shape C5 has to survive, and stays probe-backed.
+
+    Coverage is the difference between "the predicate works on the case we
+    happened to capture" and "the predicate was measured against every wedge the
+    PRD names".  Provenance-linkage is what stops a curated row from drifting
+    free of the empirical capture it claims to summarise — a hand-written row
+    that no probe ever observed is exactly the fabrication this task must not
+    produce.
+    """
+
+    #: The three PRD-named wedge shapes, plus the reader-side degrade case C5
+    #: must handle explicitly (artifacts unreadable -> conservative fallback).
+    _REQUIRED_WEDGE_SHAPES = (
+        'from_source_build',
+        'uv_resolving',
+        'mcp_init_hang',
+        'transcript_unreadable',
+    )
+
+    @pytest.mark.parametrize('shape', _REQUIRED_WEDGE_SHAPES)
+    def test_every_required_wedge_shape_has_a_row(self, shape):
+        shapes = [
+            row['wedge_shape']
+            for row in scf.load_startup_completion_corpus()
+            if row['regime'] == 'wedge'
+        ]
+        assert shape in shapes, (
+            f'wedge corpus has no row for {shape!r}; observed {sorted(set(shapes))}'
+        )
+
+    def test_transcript_unreadable_covers_both_degrade_variants(self):
+        # The two genuinely different ways the artifacts stop being readable:
+        # (a) nothing resolves for the watched session -> read_transcript_records
+        #     returns None -> predicate None -> C5 degrades to today's bound;
+        # (b) the file resolves but every line is truncated/unparseable ->
+        #     read_transcript_records returns [] (tolerant parsing) -> predicate
+        #     False.  Both are conservative, but they are NOT the same return,
+        #     and 3326 must handle each.
+        rows = [
+            row
+            for row in scf.load_startup_completion_corpus()
+            if row['wedge_shape'] == 'transcript_unreadable'
+        ]
+        assert rows, 'no transcript_unreadable degrade rows'
+
+        absent = [row for row in rows if row['transcript_relpath'] is None]
+        present_but_unparseable = [
+            row
+            for row in rows
+            if row['transcript_relpath'] is not None and row.get('transcript_raw_lines')
+        ]
+        assert absent, 'no transcript_unreadable row where the transcript never resolves'
+        assert present_but_unparseable, (
+            'no transcript_unreadable row where the file exists but every line is '
+            'truncated/unparseable'
+        )
+
+    def test_healthy_corpus_has_a_pre_first_token_row(self):
+        # The incident shape the whole two-regime grace exists for: the CLI has
+        # finished starting up but no assistant turn has landed yet, so today's
+        # single 120s startup bound is the only thing holding it.  A corpus
+        # without this row would not describe the case C5 changes.
+        pre_first_token = [
+            row
+            for row in scf.load_startup_completion_corpus()
+            if row['regime'] == 'healthy'
+            and row['substrate_returns']['count_transcript_turns'] == 0
+        ]
+        assert pre_first_token, (
+            'healthy corpus carries no pre-first-token row (observed assistant '
+            'turns == 0) — the exact state the two-regime grace discriminates'
+        )
+        # And such a row must be the one the predicate calls started, or the
+        # corpus would not demonstrate the discrimination at all.
+        assert any(row['expected_startup_complete'] is True for row in pre_first_token)
+
+    def test_every_row_is_linked_to_a_raw_probe_run(self):
+        raw_run_ids = {
+            json.loads(line)['probe_run_id']
+            for line in scf.RAW_CAPTURE_PATH.read_text(encoding='utf-8').splitlines()
+            if line.strip()
+        }
+        assert raw_run_ids, 'raw capture carries no probe_run_id'
+
+        for row in scf.load_startup_completion_corpus():
+            run_id = row['provenance']['probe_run_id']
+            assert run_id in raw_run_ids, (
+                f'{row["id"]}: provenance.probe_run_id {run_id!r} is not present in '
+                f'{scf.RAW_CAPTURE_PATH.name} — a curated row must be traceable to '
+                f'the observation it summarises, never hand-written'
+            )
+
+    def test_derived_rows_declare_their_derivation(self):
+        # A row that could not be produced by spawning a CLI (the reader-side
+        # degrade cases) is still probe-backed, but it is a TRANSFORM of a raw
+        # observation rather than a raw observation.  Saying so in provenance is
+        # what keeps "empirically observed" an honest claim.
+        for row in scf.load_startup_completion_corpus():
+            method = row['provenance']['capture_method']
+            if method == 'live_spawn':
+                continue
+            assert row['provenance'].get('derived_from'), (
+                f'{row["id"]}: capture_method {method!r} must name the raw sample '
+                f'it was derived from'
+            )
+            assert row['provenance'].get('derivation'), (
+                f'{row["id"]}: capture_method {method!r} must describe the transform '
+                f'applied to that sample'
+            )
+
+
 class TestPredicateDiscrimination:
     """The core deliverable: the chosen predicate's verdict on every row."""
 
