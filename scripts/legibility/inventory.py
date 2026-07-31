@@ -92,8 +92,22 @@ def is_member(cwd: str, cwd_prefixes: Sequence[str]) -> bool:
     return any(cwd_path.is_relative_to(Path(prefix)) for prefix in cwd_prefixes)
 
 
-def _iter_json_lines(path: Path) -> Iterator[dict[str, Any]]:
+def iter_json_lines(path: Path) -> Iterator[dict[str, Any]]:
     """Yield parsed dict records from a JSONL file, skipping blank/malformed lines.
+
+    **The** low-level streaming transcript reader — public, and deliberately
+    so: cross-package consumers exist (``memory_eval_transcript_corpus.py``
+    in ``fused-memory/scripts/`` mines the archived fleet transcripts through
+    it), and a consumer reaching for an underscore name across a package
+    boundary is how a second copy of this function gets written instead.
+    ``_iter_json_lines`` is retained below as a module-level alias so the
+    in-package callers (``sampling``, ``check_transcript_persistence``) keep
+    working; it is the same object, not a second implementation.
+
+    Streaming rather than slurping is the point of this one: callers walk
+    thousands of multi-MB archived transcripts, so memory stays bounded by
+    the largest single record. ``digest.load_transcript`` is the slurping
+    sibling for the single-file case, with a byte-identical parse contract.
 
     Transparently reads gzip-compressed transcripts: a ``*.jsonl.gz`` path
     (the archived fleet-transcript format written by
@@ -110,6 +124,11 @@ def _iter_json_lines(path: Path) -> Iterator[dict[str, Any]]:
     ``OSError`` if *path* cannot be opened or decompressed at all —
     ``gzip.BadGzipFile`` (a corrupt ``.gz``) is an ``OSError`` subclass, so
     the caller's existing ``except OSError`` degrade path already covers it.
+
+    That split is a contract, not an implementation detail: a corrupt LINE
+    degrades silently, an unreadable FILE raises. Callers that report
+    coverage rely on it to count unreadable files without inflating the
+    count with truncated trailing lines.
     """
     if str(path).endswith('.gz'):
         f = gzip.open(path, 'rt', encoding='utf-8')
@@ -126,6 +145,17 @@ def _iter_json_lines(path: Path) -> Iterator[dict[str, Any]]:
                 continue
             if isinstance(record, dict):
                 yield record
+
+
+_iter_json_lines = iter_json_lines
+"""Retained alias for the pre-promotion private name.
+
+The same object as :func:`iter_json_lines` (asserted in
+``test_legibility_inventory.TestPublicIterJsonLines``), kept so the existing
+callers — ``sampling``, ``check_transcript_persistence`` — need no edit and
+the several docstrings citing the old name stay accurate. New code should
+use the public name.
+"""
 
 
 def _session_cwd_and_date(path: Path) -> tuple[str | None, date | None]:
@@ -145,7 +175,7 @@ def _session_cwd_and_date(path: Path) -> tuple[str | None, date | None]:
     cwd: str | None = None
     session_date: date | None = None
     try:
-        for record in _iter_json_lines(path):
+        for record in iter_json_lines(path):
             if cwd is None:
                 candidate_cwd = record.get('cwd')
                 if isinstance(candidate_cwd, str) and candidate_cwd:
