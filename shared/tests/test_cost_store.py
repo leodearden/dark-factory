@@ -863,3 +863,71 @@ class TestModelCostInWindow:
                 '2026-01-01T00:00:00',
                 '2026-12-31T23:59:59',
             )
+
+
+# ---------------------------------------------------------------------------
+# TestSaveApiErrorEvent — CostStore.save_api_error_event(...)
+# (task 3325 / plans/server-side-api-error-handling-prd.md C4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSaveApiErrorEvent:
+    """step-1: save_api_error_event() writes one account_events row typed 'api_error'."""
+
+    async def test_writes_single_row_with_api_error_type(self, tmp_path: Path) -> None:
+        """All six columns round-trip verbatim, and event_type is the literal 'api_error'.
+
+        The literal matters beyond this test: it is the discriminator ApiHealthGate
+        forensics, the dashboard provider-health strip and operators all query on.
+        """
+        async with CostStore(tmp_path / 'costs.db') as store:
+            await store.save_api_error_event(
+                account_name='max-d',
+                project_id='dark_factory',
+                run_id='run-1',
+                details='{"status": 529}',
+                created_at='2026-07-31T00:00:00+00:00',
+            )
+            async with _conn(store).execute(
+                'SELECT account_name, event_type, project_id, run_id, details, created_at '
+                'FROM account_events'
+            ) as cur:
+                rows = await cur.fetchall()
+        assert len(rows) == 1
+        assert rows[0] == (
+            'max-d',
+            'api_error',
+            'dark_factory',
+            'run-1',
+            '{"status": 529}',
+            '2026-07-31T00:00:00+00:00',
+        )
+
+    async def test_nullable_fields_accept_none(self, tmp_path: Path) -> None:
+        """project_id / run_id / details are nullable — a watcher invocation has no project."""
+        async with CostStore(tmp_path / 'costs.db') as store:
+            await store.save_api_error_event(
+                account_name='max-c',
+                project_id=None,
+                run_id=None,
+                details=None,
+                created_at='2026-07-31T01:00:00+00:00',
+            )
+            async with _conn(store).execute(
+                'SELECT event_type, project_id, run_id, details FROM account_events'
+            ) as cur:
+                row = await cur.fetchone()
+        assert row == ('api_error', None, None, None)
+
+    async def test_raises_if_not_opened(self, tmp_path: Path) -> None:
+        """A never-opened store raises rather than silently dropping forensics."""
+        store = CostStore(tmp_path / 'costs.db')
+        with pytest.raises(RuntimeError, match='CostStore not opened'):
+            await store.save_api_error_event(
+                account_name='max-d',
+                project_id=None,
+                run_id=None,
+                details=None,
+                created_at='2026-07-31T00:00:00+00:00',
+            )
