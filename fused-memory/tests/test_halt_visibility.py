@@ -205,3 +205,102 @@ class TestGetStatusReconciliationHalt:
             await journal.close()
             if buf:
                 await buf.close()
+
+
+# ── deliverable (A): get_queue_stats answers both questions in one probe ────
+
+
+class TestGetQueueStatsReconciliationHalt:
+    """The drain-confirmation probe must distinguish HALTED from cannot-keep-up.
+
+    task 2920 gave this tool ``reconciliation_backlog``; on its own that number
+    could not separate the two causes, which is how the 2026-07-20 halt was
+    mis-triaged as a capacity problem for two days.
+    """
+
+    @pytest.mark.asyncio
+    async def test_backlog_and_halt_in_one_call(self, tmp_path):
+        buf = EventBuffer(db_path=tmp_path / 'hv_qs_eb.db', buffer_size_threshold=100)
+        await buf.initialize()
+        journal = None
+        try:
+            await _seed_buffered(buf, 'proj', n=5)
+            policy = BacklogPolicy(
+                buf,
+                _StubQueue(queue_depth=7, retry_in_flight=2),
+                lambda _: False,
+                hard_limit=500,
+            )
+            harness, journal, _ = await _make_harness(
+                tmp_path, backlog_policy=policy, event_buffer=buf,
+            )
+            await harness.judge._apply_halt('proj', reason=_REAL_REASON)
+
+            server = create_mcp_server(
+                _make_status_mock_service(),
+                reconciliation_harness=harness,
+                backlog_policy=policy,
+            )
+            result = await server._tool_manager.call_tool(
+                'get_queue_stats', {'project_id': 'proj'},
+            )
+
+            # One probe, both answers.
+            assert result['reconciliation_backlog'] == 14  # 5 buffered + 7 + 2
+            halt = result['reconciliation_halt']
+            assert halt['halted'] is True
+            assert halt['halt_reason'] == _REAL_REASON
+            assert halt['halted_projects'] == ['proj']
+        finally:
+            if journal:
+                await journal.close()
+            await buf.close()
+
+    @pytest.mark.asyncio
+    async def test_non_halted_project_reports_not_halted(self, tmp_path):
+        """A big backlog with halted=False is the capacity case — a genuinely
+        different remedy, so the field must say so rather than stay silent."""
+        harness, journal, buf = await _make_harness(tmp_path)
+        try:
+            server = create_mcp_server(
+                _make_status_mock_service(), reconciliation_harness=harness,
+            )
+            result = await server._tool_manager.call_tool(
+                'get_queue_stats', {'project_id': 'proj'},
+            )
+            assert result['reconciliation_halt']['halted'] is False
+            assert result['reconciliation_halt']['halt_reason'] is None
+        finally:
+            await journal.close()
+            if buf:
+                await buf.close()
+
+    @pytest.mark.asyncio
+    async def test_absent_when_no_harness_wired(self):
+        """No harness → no key, so test_queue_stats_tool.py's
+        ``result == _FAKE_STATS`` exact-equality assertions stay valid."""
+        server = create_mcp_server(_make_status_mock_service())
+        result = await server._tool_manager.call_tool(
+            'get_queue_stats', {'project_id': 'proj'},
+        )
+        assert 'reconciliation_halt' not in result
+        assert result == {
+            'counts': {'completed': 8648, 'dead': 3},
+            'oldest_pending_age_seconds': None,
+        }
+
+    @pytest.mark.asyncio
+    async def test_global_call_shape_unchanged(self, tmp_path):
+        """Per-project only, mirroring reconciliation_backlog's gating."""
+        harness, journal, buf = await _make_harness(tmp_path)
+        try:
+            await harness.judge._apply_halt('proj', reason=_REAL_REASON)
+            server = create_mcp_server(
+                _make_status_mock_service(), reconciliation_harness=harness,
+            )
+            result = await server._tool_manager.call_tool('get_queue_stats', {})
+            assert 'reconciliation_halt' not in result
+        finally:
+            await journal.close()
+            if buf:
+                await buf.close()
