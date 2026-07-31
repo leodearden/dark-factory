@@ -282,6 +282,72 @@ def split_top_level_and(raw: str) -> list[str]:
 _TAIL_PRESERVING_KEYWORDS = frozenset({'ruff check', 'pyright', 'uv run'})
 
 
+def _segment_invokes_tool(segment: str, keyword: str) -> bool:
+    """True if *segment* actually INVOKES *keyword*'s tool at an argv-head position.
+
+    ``split_chain_tail``'s later-segment check (task 3218 part 2). Replaces a
+    plain ``keyword in segment`` substring test, which could not tell a real
+    invocation from the tool's name merely OCCURRING in the segment — as it
+    does inside a sibling checker's script path
+    (``python3 scripts/check_pyright_config.py``) or a quoted flag value
+    (``--tool "ruff check"``).
+
+    An argv-head position is index 0, or the index just past a recognised
+    wrapper prefix:
+
+    * ``uv run`` followed by any run of ``--project X`` / ``--directory X``
+      pairs, in either order, both optional — mirroring
+      ``_parse_single_segment``'s peel loop, so the gate's notion of "where a
+      tool head can begin" is the same as the parser's;
+    * ``npx``;
+    * ``python`` / ``python3`` followed by ``-m``.
+
+    Index 0 is a head position BEFORE any wrapper is peeled, which is what
+    keeps the ``'uv run'`` keyword (``verify._reproject_str``'s) matching
+    segment 0 of a ``uv run ... ruff check ...`` command.
+
+    ``shlex.split`` raising ``ValueError`` returns True: an undecodable
+    segment counts as a MATCH, so the gate rejects and the pre-3218
+    disposition is restored. Conservative by construction.
+
+    **Why tightening this is safe — the two error directions are not
+    symmetric.** The old substring test OVER-rejects: a legitimate sibling
+    checker is dropped, so a real check never runs, which is a possible false
+    GREEN — the bug class the tail-preservation gate exists to close.
+    Argv-head matching can only UNDER-reject, and only for a same-tool
+    fan-out behind a wrapper this module does not recognise (``poetry run
+    ruff check b/``); the consequence there is that clause running UNSCOPED,
+    which is a SUPERSET of the checks that would otherwise have run and can
+    never produce a false GREEN. It also cannot misresolve relative paths,
+    because ``split_chain_tail``'s condition 4 already rejects any chain
+    containing a ``cd`` token — the property that makes an unscoped tail safe
+    in the first place. Under-rejection is the strictly safer failure
+    direction, which is what licenses the precise test over the blunt one.
+    """
+    try:
+        tokens = shlex.split(segment)
+    except ValueError:
+        return True
+
+    head_positions = {0}
+    idx = 0
+    if tokens[idx : idx + 2] == ['uv', 'run']:
+        idx += 2
+        while True:
+            if tokens[idx : idx + 1] in (['--project'], ['--directory']) and len(tokens) > idx + 1:
+                idx += 2
+            else:
+                break
+        head_positions.add(idx)
+    elif tokens[idx : idx + 1] == ['npx']:
+        head_positions.add(idx + 1)
+    elif tokens[idx : idx + 1] in (['python'], ['python3']) and tokens[idx + 1 : idx + 2] == ['-m']:
+        head_positions.add(idx + 2)
+
+    kw_tokens = keyword.split()
+    return any(tokens[i : i + len(kw_tokens)] == kw_tokens for i in head_positions)
+
+
 def split_chain_tail(raw: str, keyword: str) -> tuple[str, str]:
     """Split *raw* into a *keyword*-bearing head and a preservable trailing chain.
 
@@ -378,7 +444,7 @@ def split_chain_tail(raw: str, keyword: str) -> tuple[str, str]:
         return raw, ''
     if keyword not in segments[0]:
         return raw, ''
-    if any(keyword in segment for segment in segments[1:]):
+    if any(_segment_invokes_tool(segment, keyword) for segment in segments[1:]):
         return raw, ''
     return segments[0], raw[len(segments[0]) :]
 
