@@ -7199,6 +7199,90 @@ class TestProseAdvisoryDeliverableAttribution:
         assert len(calls) == 1, f'Expected exactly one escalation, got: {calls!r}'
         assert calls[0].get('advisory') is True
 
+    # -- LEGIBILITY: a suppression is RECORDED, never silent ----------------
+
+    @staticmethod
+    def _suppression_records(caplog):
+        """INFO records from the interceptor that report a guard suppression.
+
+        Selected by the stable greppable token an operator would search for,
+        deliberately NOT by exact sentence wording — the assertions below
+        pin the FACTS the record carries, so the sentence stays free to
+        change.
+        """
+        return [
+            rec for rec in caplog.records
+            if rec.name == 'fused_memory.middleware.task_interceptor'
+            and 'path-guard' in rec.getMessage()
+            and 'suppress' in rec.getMessage().lower()
+        ]
+
+    @pytest.mark.asyncio
+    async def test_suppression_is_logged_with_structured_facts(
+        self, interceptor_with_store, ticket_store, taskmaster, tmp_path, caplog,
+    ):
+        """Suppressing an advisory must leave a trail (INV-2 structured-facts).
+
+        The decision is CORRECT, not degraded, so it belongs in the log at
+        INFO rather than in the operator escalation queue — but it must not
+        be silent, or the guard's most consequential branch becomes
+        invisible to anyone auditing why a task was never flagged.
+        """
+        with caplog.at_level(
+            logging.INFO, logger='fused_memory.middleware.task_interceptor',
+        ):
+            result, calls = await self._submit(
+                interceptor_with_store, tmp_path,
+                metadata={'files': ['fused-memory/src/x.py']},
+            )
+
+        meta = await self._persisted_meta(ticket_store, result)
+        assert 'possible_scope_mismatch' not in meta
+        assert calls == []
+
+        records = self._suppression_records(caplog)
+        assert len(records) == 1, (
+            f'Expected exactly one suppression record, got: '
+            f'{[r.getMessage() for r in records]!r}'
+        )
+        record = records[0]
+        assert record.levelno == logging.INFO, (
+            'A correct attribution decision is INFO, not WARNING — it is a '
+            'log-trail fact, not an operator-queue item'
+        )
+        message = record.getMessage()
+        for fact in (
+            'crates/',                 # the matched prose prefix
+            'fused-memory/src/x.py',   # the attesting deliverable signal
+            'dark_factory',            # the filing project
+            'reify',                   # the prose-suggested owner
+        ):
+            assert fact in message, (
+                f'Suppression record must carry {fact!r}; got: {message!r}'
+            )
+
+    @pytest.mark.asyncio
+    async def test_no_suppression_record_when_advisory_fires(
+        self, interceptor_with_store, ticket_store, taskmaster, tmp_path, caplog,
+    ):
+        """Paired negative: the unowned-files case advises, so nothing is suppressed."""
+        with caplog.at_level(
+            logging.INFO, logger='fused_memory.middleware.task_interceptor',
+        ):
+            result, calls = await self._submit(
+                interceptor_with_store, tmp_path, metadata={'files': ['README.md']},
+            )
+
+        meta = await self._persisted_meta(ticket_store, result)
+        assert meta.get('possible_scope_mismatch') is not None
+        assert len(calls) == 1
+
+        records = self._suppression_records(caplog)
+        assert records == [], (
+            f'Expected no suppression record when the advisory fires, got: '
+            f'{[r.getMessage() for r in records]!r}'
+        )
+
     # -- NEGATIVE CONTROL: the FILES-certain hard reject is untouched -------
 
     @pytest.mark.asyncio
