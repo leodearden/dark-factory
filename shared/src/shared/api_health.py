@@ -285,7 +285,23 @@ class ApiHealthGate:
         )
 
     def _evict(self, now: float) -> None:
-        """Drop samples older than ``window_secs`` from the left of the deque."""
+        """Drop samples older than ``window_secs`` from the left of the deque.
+
+        Mirrors ``Scheduler._blocked_transitions`` (scheduler.py:1551): a deque
+        ordered by monotonic timestamp, trimmed from the left.  Monotonic
+        rather than wall-clock so an NTP step cannot retroactively empty or
+        inflate the window mid-outage.
+
+        Eviction is driven by REPORTS, not by a timer: an idle gate keeps
+        stale samples until the next report arrives.  That is harmless because
+        :meth:`report` always evicts before it evaluates, so no decision is
+        ever taken on an unevicted window — but it does mean :meth:`state` on a
+        long-idle gate reflects the last report, not the passage of time.
+
+        The comparison is strict (``<``), so a sample exactly ``window_secs``
+        old is still in window; ``<=`` would silently shorten every window by
+        one sample at the boundary.
+        """
         cutoff = now - self.window_secs
         while self._samples and self._samples[0].ts < cutoff:
             self._samples.popleft()
