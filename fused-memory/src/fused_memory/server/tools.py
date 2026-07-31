@@ -648,6 +648,25 @@ def _maybe_kwargs(sentinel: object, **pairs: object) -> dict:
     return {k: v for k, v in pairs.items() if v is not sentinel}
 
 
+# Cap on the un-paginated full-population get_statuses response (task 3064).
+#
+# NOT a guessed threshold — derived from the incident measurements.  get_statuses
+# failed CLOSED on reify across three consecutive reconciliation cycles (5,603 /
+# 5,680 / 5,845 tasks): the serialised map exceeded the MCP tool-response
+# transport limit, so the transport rejected it wholesale and the caller got zero
+# data.  Observed failing payloads were 80,795 and 84,638 chars against a
+# documented-safe envelope of ~62 KB, so the wall sits between 62 KB and ~80 KB.
+#
+# Observed density: 84,638 chars / 5,845 tasks = ~14.5 chars per entry.  At that
+# density 2,000 entries is ~29 KB; in the worst realistic case (4-digit id plus
+# the longest status string, 'in-progress') it is ~46 KB.  Both sit inside the
+# 62 KB safe envelope, while keeping a 5,845-task project to three pages.
+#
+# test_get_statuses_pagination.py pins this with a json.dumps assertion against
+# the 62,000-char bound, so raising this limit cannot silently re-cross the wall.
+_STATUSES_AUTO_PAGE_LIMIT = 2000
+
+
 def _status_page(
     statuses: dict[str, str], offset: int, page_size: int
 ) -> tuple[dict[str, str], int]:
@@ -3759,6 +3778,16 @@ def create_mcp_server(
           * Pages are sliced from a deterministic total order, so successive pages
             tile the population with no gaps and no duplicates.
 
+        Auto-pagination (fail-open degradation, task 3064): when ``page_size`` is
+        omitted AND ``ids`` is omitted AND the population exceeds
+        ``_STATUSES_AUTO_PAGE_LIMIT``, the tool returns the FIRST PAGE plus a
+        ``pagination`` dict carrying ``auto_paginated: True`` and
+        ``has_more: True``, and logs a warning.  Un-paginated responses that large
+        are rejected wholesale by the MCP transport, so the alternative is not a
+        complete answer but ZERO data.  A caller that sees ``auto_paginated`` must
+        keep paging with ``offset``/``page_size`` — treating that first page as
+        the full census would silently under-count the project.
+
         Shape note (deliberate asymmetry): this tool WRAPS its result under a
         top-level ``'statuses'`` key (``{'statuses': {id: status}}``), unlike
         ``get_external_statuses`` which intentionally returns a FLAT
@@ -3805,6 +3834,35 @@ def create_mcp_server(
                 'has_more': offset + len(page) < total,
                 'auto_paginated': False,
             }
+        elif ids is None and len(result) > _STATUSES_AUTO_PAGE_LIMIT:
+            # Fail-OPEN degradation (task 3064).  An un-paginated full-population
+            # response this large is rejected wholesale by the MCP transport, so
+            # the caller would get ZERO data.  Return a first page plus an
+            # explicit continuation marker instead: real data the caller can use,
+            # and the structured facts needed to page to completion.  Never a
+            # silent truncation — that would look like a complete census and
+            # corrupt any cross-verification built on it.
+            page, total = _status_page(result, 0, _STATUSES_AUTO_PAGE_LIMIT)
+            result = page
+            pagination = {
+                'total': total,
+                'offset': 0,
+                'page_size': _STATUSES_AUTO_PAGE_LIMIT,
+                'returned': len(page),
+                'has_more': len(page) < total,
+                'auto_paginated': True,
+            }
+            # A degraded response must be visible in the server log too, not
+            # only in the payload the caller may ignore.
+            logger.warning(
+                'get_statuses auto-paginated an oversized full-population response',
+                extra={
+                    'project_root': project_root,
+                    'total': total,
+                    'returned': len(page),
+                    'page_size': _STATUSES_AUTO_PAGE_LIMIT,
+                },
+            )
 
         summary: dict[str, Any] = {'count': len(result)}
         if pagination is not None:
