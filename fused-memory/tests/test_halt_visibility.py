@@ -22,6 +22,7 @@ from fused_memory.reconciliation.backlog_policy import BacklogPolicy
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.harness import ReconciliationHarness
 from fused_memory.reconciliation.journal import ReconciliationJournal
+from fused_memory.reconciliation.judge import Judge
 from fused_memory.server.tools import create_mcp_server
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -92,6 +93,19 @@ async def _make_harness(tmp_path, *, backlog_policy=None, event_buffer=None, **c
     return harness, journal, buf if owns_buf else None
 
 
+def _judge(harness: ReconciliationHarness) -> Judge:
+    """Narrow ``harness.judge`` (declared ``Judge | None``) to the live judge.
+
+    ``_make_harness`` builds every harness with ``judge_enabled=True`` and
+    asserts the judge is wired, but that narrowing does not survive the return,
+    so reaching through ``harness.judge`` at a call site trips pyright's
+    reportOptionalMemberAccess. Go through here instead.
+    """
+    judge = harness.judge
+    assert judge is not None, 'harness was built with judge_enabled=True'
+    return judge
+
+
 _REAL_REASON = 'Serious verdict in run 33581299'
 
 
@@ -106,7 +120,7 @@ class TestGetStatusReconciliationHalt:
     async def test_halted_project_reports_reason_and_times(self, tmp_path):
         harness, journal, buf = await _make_harness(tmp_path)
         try:
-            await harness.judge._apply_halt('proj', reason=_REAL_REASON)
+            await _judge(harness)._apply_halt('proj', reason=_REAL_REASON)
 
             server = create_mcp_server(
                 _make_status_mock_service(), reconciliation_harness=harness,
@@ -137,7 +151,7 @@ class TestGetStatusReconciliationHalt:
         project is halted — nobody knew to go looking last time."""
         harness, journal, buf = await _make_harness(tmp_path)
         try:
-            await harness.judge._apply_halt('proj', reason=_REAL_REASON)
+            await _judge(harness)._apply_halt('proj', reason=_REAL_REASON)
 
             server = create_mcp_server(
                 _make_status_mock_service(), reconciliation_harness=harness,
@@ -162,7 +176,7 @@ class TestGetStatusReconciliationHalt:
     ):
         harness, journal, buf = await _make_harness(tmp_path)
         try:
-            await harness.judge._apply_halt('proj', reason=_REAL_REASON)
+            await _judge(harness)._apply_halt('proj', reason=_REAL_REASON)
 
             server = create_mcp_server(
                 _make_status_mock_service(), reconciliation_harness=harness,
@@ -234,7 +248,7 @@ class TestGetQueueStatsReconciliationHalt:
             harness, journal, _ = await _make_harness(
                 tmp_path, backlog_policy=policy, event_buffer=buf,
             )
-            await harness.judge._apply_halt('proj', reason=_REAL_REASON)
+            await _judge(harness)._apply_halt('proj', reason=_REAL_REASON)
 
             server = create_mcp_server(
                 _make_status_mock_service(),
@@ -294,7 +308,7 @@ class TestGetQueueStatsReconciliationHalt:
         """Per-project only, mirroring reconciliation_backlog's gating."""
         harness, journal, buf = await _make_harness(tmp_path)
         try:
-            await harness.judge._apply_halt('proj', reason=_REAL_REASON)
+            await _judge(harness)._apply_halt('proj', reason=_REAL_REASON)
             server = create_mcp_server(
                 _make_status_mock_service(), reconciliation_harness=harness,
             )
@@ -338,7 +352,7 @@ class TestTriggerReconciliationUnderHalt:
     ):
         harness, journal, buf = await _make_harness(tmp_path)
         try:
-            await harness.judge._apply_halt('proj', reason=_REAL_REASON)
+            await _judge(harness)._apply_halt('proj', reason=_REAL_REASON)
             interceptor = _make_interceptor()
             server = create_mcp_server(
                 _make_status_mock_service(),
@@ -377,8 +391,8 @@ class TestTriggerReconciliationUnderHalt:
             tmp_path, auto_unhalt_after_cooldown=True,
         )
         try:
-            await harness.judge._apply_halt('proj', reason=_REAL_REASON)
-            _expire_cooldown(harness.judge)
+            await _judge(harness)._apply_halt('proj', reason=_REAL_REASON)
+            _expire_cooldown(_judge(harness))
             interceptor = _make_interceptor()
             server = create_mcp_server(
                 _make_status_mock_service(),
@@ -410,8 +424,8 @@ class TestTriggerReconciliationUnderHalt:
             tmp_path, auto_unhalt_after_cooldown=False,
         )
         try:
-            await harness.judge._apply_halt('proj', reason=_REAL_REASON)
-            _expire_cooldown(harness.judge)
+            await _judge(harness)._apply_halt('proj', reason=_REAL_REASON)
+            _expire_cooldown(_judge(harness))
             interceptor = _make_interceptor()
             server = create_mcp_server(
                 _make_status_mock_service(),
@@ -502,7 +516,7 @@ class TestTriggerReconciliationUnderHalt:
         no Taskmaster still reports the config failure, not a halt."""
         harness, journal, buf = await _make_harness(tmp_path)
         try:
-            await harness.judge._apply_halt('proj', reason=_REAL_REASON)
+            await _judge(harness)._apply_halt('proj', reason=_REAL_REASON)
             server = create_mcp_server(
                 _make_status_mock_service(), reconciliation_harness=harness,
             )
