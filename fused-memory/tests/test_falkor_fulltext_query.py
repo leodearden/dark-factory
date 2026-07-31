@@ -18,8 +18,11 @@ FalkorDB (module v41800 / 4.18.0) behind an index-readiness barrier; see
 
 from __future__ import annotations
 
+import inspect
+
 import pytest
 from graphiti_core.driver.falkordb_driver import STOPWORDS, FalkorDriver
+from graphiti_core.search import search_utils
 
 from fused_memory.backends.falkor_fulltext import (
     build_query,
@@ -403,3 +406,83 @@ class TestUnsearchableTokensDropped:
             build_query('café — naïve 日本語 note', ['dark_factory'], 128)
             == '(@group_id:"dark_factory") (café | naïve | 日本語 | note)'
         )
+
+
+# Inputs where NOTHING survives sanitize + stopword + unsearchable filtering.
+# Upstream emits '(@group_id:"dark_factory") ()' for these; the empty operand
+# group is itself unparseable — measured on live FalkorDB as
+# ``Syntax error at offset 28 near dark_factory``.
+EMPTY_TERM_CORPUS: list[str] = [
+    'the and of',  # every token a stopword
+    '',  # empty content
+    '   ',  # whitespace only
+    '_ _ _',  # every token unsearchable
+    '`',
+    '__',
+    '— • →',
+    'the _ and ` of',  # stopwords and unsearchable tokens mixed
+]
+
+
+class TestEmptyTermListShortCircuits:
+    """The second failure mode: an empty operand group ``()`` is also unparseable.
+
+    Dropping unsearchable tokens (step 8) is not sufficient on its own — when it
+    drops *everything*, upstream's assembly still emits
+    ``(@group_id:"dark_factory") ()`` and RediSearch rejects that too.  So the
+    repair has to short-circuit, not merely filter.
+    """
+
+    @pytest.mark.parametrize('text', EMPTY_TERM_CORPUS)
+    def test_empty_term_list_returns_the_no_query_sentinel(self, text: str) -> None:
+        """Nothing searchable → ``''``, never an empty operand group."""
+        assert build_query(text, ['dark_factory'], 128) == ''
+
+    @pytest.mark.parametrize('text', EMPTY_TERM_CORPUS)
+    def test_short_circuit_happens_before_the_group_filter(self, text: str) -> None:
+        """With no group_ids the result is ``''`` — NOT upstream's ``' ()'``.
+
+        This pins that the short-circuit precedes assembly.  A short-circuit
+        placed after the group filter was built would return ``' ()'`` here,
+        which is both unparseable and not the sentinel callers check for.
+        """
+        assert build_query(text, None, 128) == ''
+
+    @pytest.mark.parametrize('text', EMPTY_TERM_CORPUS + ADVERSARIAL_CORPUS)
+    def test_no_input_ever_yields_an_empty_operand_group(self, text: str) -> None:
+        """Corpus-wide invariant across BOTH failure modes at once."""
+        for group_ids in (None, [], ['dark_factory'], ['a', 'b']):
+            result = build_query(text, group_ids, 128)
+            assert '()' not in result, f'empty operand group for {text!r}: {result!r}'
+
+    def test_empty_string_is_graphitis_documented_no_query_sentinel(self) -> None:
+        """Pin the CALLER contract this short-circuit depends on.
+
+        Returning ``''`` is only safe because graphiti already treats it as "no
+        query" — upstream's own over-length guard returns ``''``, and
+        ``node_fulltext_search`` short-circuits on it before touching the driver.
+
+        Asserting it against live source means a graphiti-core upgrade that drops
+        the sentinel fails loudly HERE, instead of silently turning every
+        all-stopword episode into an unfiltered or malformed search.
+        """
+        source = inspect.getsource(search_utils.node_fulltext_search)
+        assert "fuzzy_query == ''" in source, (
+            'graphiti-core no longer short-circuits on the empty-query sentinel; '
+            'build_query returning \'\' is no longer safe — re-verify the caller '
+            'contract before shipping.'
+        )
+
+    def test_upstream_by_contrast_emits_the_unparseable_empty_group(self) -> None:
+        """Baseline proving the short-circuit is load-bearing, not decorative.
+
+        Stock upstream really does emit ``(@group_id:"dark_factory") ()`` for
+        all-stopword content.  If a future graphiti-core fixes this, this test
+        fails and tells us the override can be narrowed.
+        """
+        stock = object.__new__(FalkorDriver)
+        assert (
+            stock.build_fulltext_query('the and of', ['dark_factory'], 128)
+            == '(@group_id:"dark_factory") ()'
+        )
+        assert build_query('the and of', ['dark_factory'], 128) == ''
