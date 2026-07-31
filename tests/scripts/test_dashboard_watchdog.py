@@ -555,5 +555,90 @@ def test_b2_alternating_failures_never_reach_the_gate(monkeypatch, state_env):
     assert max(rec.streaks) == 1
 
 
+# ---------------------------------------------------------------------------
+# B3 — sustained outage restarts exactly once per completed streak
+# ---------------------------------------------------------------------------
+
+
+def test_b3_sustained_outage_restarts_on_the_streak_th_tick(monkeypatch, state_env):
+    """Exactly ONE restart, and it fires on the FAIL_STREAK-th tick — not earlier.
+
+    Detection latency is therefore FAIL_STREAK × the timer's 30s cadence ≈ 90s,
+    which is the number the unit-file comment documents.
+    """
+    mod_consts = _load_watchdog()
+    rec = _run_ticks(monkeypatch, [False] * mod_consts.FAIL_STREAK)
+
+    assert len(rec.restarts) == 1, f"expected 1 restart, got {rec.restarts}"
+    # It fired on the last tick: the streak reset to 0 only at the end, and no
+    # restart epoch was recorded before then.
+    assert rec.streaks == [1, 2, 0][: mod_consts.FAIL_STREAK]
+    assert [len(s["restarts"]) for s in rec.states] == [0, 0, 1][
+        : mod_consts.FAIL_STREAK
+    ]
+
+    restart_argv = rec.restarts[0]
+    assert restart_argv[-1] == mod_consts.DASHBOARD_UNIT
+    assert "--user" in restart_argv, "must act on the USER manager, not the system one"
+    assert rec.escalations == [], "a first restart must not file an escalation"
+
+
+def test_b3_reset_failed_precedes_the_restart(monkeypatch, state_env):
+    """``reset-failed`` clears StartLimitBurst first.
+
+    Without it, a unit that has already exhausted its start limit silently
+    ignores the restart — the watchdog would log "restart issued", the streak
+    would reset, and nothing would actually happen. That is a fail-soft hole
+    that makes the gate LOOK like it fired.
+    """
+    mod = _load_watchdog()
+    rec = _run_ticks(monkeypatch, [False] * mod.FAIL_STREAK)
+
+    verbs = [a[2] for a in rec.actuations]
+    assert verbs == ["reset-failed", "restart"], f"unexpected actuation order: {verbs}"
+    assert all(a[-1] == mod.DASHBOARD_UNIT for a in rec.actuations)
+
+
+def test_b3_second_streak_restarts_exactly_once_more(monkeypatch, state_env):
+    """Invariant I3: the restart is per COMPLETED STREAK, never per tick.
+
+    2 × FAIL_STREAK failing ticks produce exactly 2 restarts — not 6. A
+    per-tick loop is exactly what the incident was.
+    """
+    mod = _load_watchdog()
+    rec = _run_ticks(monkeypatch, [False] * (2 * mod.FAIL_STREAK))
+
+    assert len(rec.restarts) == 2, f"expected 2 restarts, got {len(rec.restarts)}"
+    assert len(rec.states[-1]["restarts"]) == 2, "both restart epochs must be recorded"
+
+
+def test_b3_restart_epoch_is_recorded_for_the_rate_window(monkeypatch, state_env):
+    """Each restart appends a plausible epoch — the rolling ceiling window is
+    measured against these, so an unrecorded restart would make the storm
+    escape unreachable."""
+    import time
+
+    before = int(time.time())
+    mod = _load_watchdog()
+    rec = _run_ticks(monkeypatch, [False] * mod.FAIL_STREAK)
+    after = int(time.time())
+
+    epochs = rec.states[-1]["restarts"]
+    assert len(epochs) == 1
+    assert before <= epochs[0] <= after
+
+
+def test_b3_streak_resets_after_the_restart(monkeypatch, state_env):
+    """Post-restart the counter starts over, so the next restart needs another
+    FAIL_STREAK consecutive misses — hysteresis applies to repeat actuation
+    too, not just the first one."""
+    mod = _load_watchdog()
+    rec = _run_ticks(monkeypatch, [False] * (mod.FAIL_STREAK + 1))
+
+    assert rec.streaks[mod.FAIL_STREAK - 1] == 0, "streak not reset after restart"
+    assert rec.streaks[mod.FAIL_STREAK] == 1, "next miss must start a fresh streak"
+    assert len(rec.restarts) == 1
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))
