@@ -58,6 +58,22 @@ TIER_BASE: dict[str, int] = {
     'polish': 1000,
 }
 
+# Per-process warn-once dedup for coerce_tier()'s unrecognized-value WARNING
+# below, keyed by repr(value) (safe for unhashable/non-str inputs) — mirrors
+# the b3_gate._warned_description_read_failures / sqlite_task_backend
+# ._warned_malformed_task_ids house pattern for module-level dedup sets. A
+# process restart clears the memo and re-enables the warning.
+#
+# Bounded because orchestrator.config is imported into the scheduler's
+# multi-day daemon process: an unbounded stream of distinct bad priority
+# values (an adversarial or corrupt tasks.json) would otherwise grow this
+# set forever. Once the cap is reached, coerce_tier() emits exactly one
+# final WARNING noting the cap and then suppresses further
+# unrecognized-priority warnings entirely (rather than either leaking
+# memory or re-flooding the log on every call past the cap).
+_warned_priority_values: set[str] = set()
+_MAX_WARNED_PRIORITY_VALUES = 1000
+
 
 def coerce_tier(value: Any) -> str:
     """Normalize a priority value (possibly None/unknown) to a canonical tier.
@@ -71,18 +87,39 @@ def coerce_tier(value: Any) -> str:
     silently): it means some upstream caller passed something the config
     layer doesn't understand, and that should be observable.
     ``stacklevel=2`` attributes the log record to the caller's file/line
-    (the actual call site) rather than to this helper.
+    (the actual call site) rather than to this helper. To avoid flooding a
+    hot path (e.g. the scheduler re-coercing the same raw values every
+    tick), each distinct unrecognized value is only warned about once per
+    process — see ``_warned_priority_values`` above.
     """
     if isinstance(value, str) and value in PRIORITY_RANK:
         return value
     if value is None:
         return DEFAULT_TIER
-    logger.warning(
-        'coerce_tier: unrecognized priority %r, falling back to %r',
-        value,
-        DEFAULT_TIER,
-        stacklevel=2,
-    )
+
+    key = repr(value)
+    # Cap not yet reached and this value hasn't been warned about before —
+    # if the memo is already full, or this value was already warned about,
+    # fall straight through and suppress silently (the cap-reached notice
+    # below fires exactly once, on the call that fills the last slot).
+    if (
+        key not in _warned_priority_values
+        and len(_warned_priority_values) < _MAX_WARNED_PRIORITY_VALUES
+    ):
+        _warned_priority_values.add(key)
+        logger.warning(
+            'coerce_tier: unrecognized priority %r, falling back to %r',
+            value,
+            DEFAULT_TIER,
+            stacklevel=2,
+        )
+        if len(_warned_priority_values) >= _MAX_WARNED_PRIORITY_VALUES:
+            logger.warning(
+                'coerce_tier: unrecognized-priority warning memo reached '
+                'its cap of %d distinct values; suppressing further '
+                'unrecognized-priority warnings until process restart',
+                _MAX_WARNED_PRIORITY_VALUES,
+            )
     return DEFAULT_TIER
 
 
