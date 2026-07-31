@@ -254,3 +254,156 @@ class TestRepointThenDelete:
         assert result['status'] == 'deleted'
         mock_service.delete_memory.assert_awaited_once()
         interceptor.update_task.assert_not_awaited()
+
+
+# The literal string Stage 2 wrote as a "correction" during the incident.
+INCIDENT_SEARCH_INSTRUCTION = 're-derive the current canonical entry via search(query=...)'
+
+
+class TestCitationGateScopingAndFailures:
+    """The gate is narrowly scoped, and every failure refuses the delete."""
+
+    @pytest.fixture
+    def mock_service(self):
+        return _make_service()
+
+    @pytest.fixture
+    def interceptor(self):
+        return _make_interceptor([_task('401', 'pending', {'cited': DOOMED})])
+
+    @pytest.fixture
+    def mcp_server(self, mock_service, interceptor):
+        return create_mcp_server(
+            mock_service,
+            task_interceptor=interceptor,
+            known_projects=KNOWN_PROJECTS,
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_recon_caller_bypasses_the_gate_entirely(
+        self, mcp_server, mock_service, interceptor,
+    ):
+        """(a) An interactive caller pays no extra get_tasks read and is never
+        blocked — the gate is scoped to the consolidation path the incident
+        actually came from."""
+        result = await _call_delete(mcp_server, agent_id='claude-interactive')
+
+        assert result['status'] == 'deleted'
+        mock_service.delete_memory.assert_awaited_once()
+        interceptor.get_tasks.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_graphiti_store_bypasses_the_gate_entirely(
+        self, mcp_server, mock_service, interceptor,
+    ):
+        """(a) The gate is mem0-scoped, mirroring verify_cited_memories."""
+        result = await _call_delete(mcp_server, store='graphiti')
+
+        assert result['status'] == 'deleted'
+        mock_service.delete_memory.assert_awaited_once()
+        interceptor.get_tasks.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_search_instruction_replacement_is_rejected(
+        self, mcp_server, mock_service, interceptor,
+    ):
+        """(b) The incident's re-derive-via-search "correction" is refused
+        mechanically. Running that query live returned only superseded cluster
+        members, so accepting it would preserve the dangling pointer under a
+        new name instead of closing it."""
+        result = await _call_delete(
+            mcp_server, replacement_memory_id=INCIDENT_SEARCH_INSTRUCTION,
+        )
+
+        assert result['error_type'] == 'CitationReplacementInvalid'
+        mock_service.delete_memory.assert_not_awaited()
+        # Nothing was rewritten to the bogus pointer either.
+        interceptor.update_task.assert_not_awaited()
+        assert 'search(' in result['hint']
+
+    @pytest.mark.asyncio
+    async def test_truncated_uuid_replacement_is_rejected(
+        self, mcp_server, mock_service,
+    ):
+        """(b) An 8-char prefix is not a forwarding pointer — the same
+        truncated-UUID hazard prompts/stage1.py already warns about."""
+        result = await _call_delete(mcp_server, replacement_memory_id=SURVIVOR[:8])
+
+        assert result['error_type'] == 'CitationReplacementInvalid'
+        mock_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_rejected_repoint_write_blocks_the_delete(self, mock_service):
+        """(c) Delete only AFTER the repoint actually landed. Interceptor gates
+        refuse by RETURNING {'success': False}, never by raising, so a
+        truthy-dict check would have let this through."""
+        interceptor = _make_interceptor(
+            [_task('501', 'pending', {'cited': DOOMED})],
+            update_result={
+                'success': False,
+                'error': 'write refused',
+                'error_type': 'ReconTerminalWriteRejected',
+            },
+        )
+        mcp_server = create_mcp_server(
+            mock_service,
+            task_interceptor=interceptor,
+            known_projects=KNOWN_PROJECTS,
+        )
+
+        result = await _call_delete(mcp_server, replacement_memory_id=SURVIVOR)
+
+        assert result['error_type'] == 'CitationRepointFailed'
+        mock_service.delete_memory.assert_not_awaited()
+        assert [u['task_id'] for u in result['unrepointed']] == ['501']
+
+    @pytest.mark.asyncio
+    async def test_scan_failure_fails_closed(self, mock_service):
+        """(d) FAIL CLOSED. An unreadable task DB means 'unknown', and unknown
+        must not be treated as 'no citations' when the next step destroys data
+        irreversibly. A refused delete is retried next cycle; a silently
+        permitted one manufactures the L2."""
+        interceptor = _make_interceptor([])
+        interceptor.get_tasks = AsyncMock(side_effect=RuntimeError('task db unreachable'))
+        mcp_server = create_mcp_server(
+            mock_service,
+            task_interceptor=interceptor,
+            known_projects=KNOWN_PROJECTS,
+        )
+
+        result = await _call_delete(mcp_server, replacement_memory_id=SURVIVOR)
+
+        assert result['error_type'] == 'CitationScanFailed'
+        mock_service.delete_memory.assert_not_awaited()
+        assert result['memory_id'] == DOOMED
+
+    @pytest.mark.asyncio
+    async def test_no_task_interceptor_leaves_behaviour_unchanged(self, mock_service):
+        """(e) The baseline test_delete_memory_alias.py construction — no
+        interceptor, no known_projects registry — must keep working exactly as
+        before, gate or no gate."""
+        mcp_server = create_mcp_server(mock_service)
+
+        result = await _call_delete(mcp_server, replacement_memory_id=SURVIVOR)
+
+        assert result['status'] == 'deleted'
+        mock_service.delete_memory.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_project_absent_from_registry_leaves_behaviour_unchanged(
+        self, mock_service,
+    ):
+        """(e) An interceptor wired but the project unregistered: no live task
+        DB to scan, so the pre-existing behaviour is preserved."""
+        interceptor = _make_interceptor([_task('601', 'pending', {'cited': DOOMED})])
+        mcp_server = create_mcp_server(
+            mock_service,
+            task_interceptor=interceptor,
+            known_projects=None,
+        )
+
+        result = await _call_delete(mcp_server, replacement_memory_id=SURVIVOR)
+
+        assert result['status'] == 'deleted'
+        mock_service.delete_memory.assert_awaited_once()
+        interceptor.get_tasks.assert_not_awaited()
