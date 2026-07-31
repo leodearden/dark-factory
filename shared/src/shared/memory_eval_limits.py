@@ -1296,19 +1296,55 @@ def _atomic_write_text(path: Path, text: str) -> None:
         raise
 
 
+def _artifact_payload(artifact: LimitsArtifact) -> dict[str, object]:
+    """Dump *artifact* under the one null convention both memory-eval artifacts keep.
+
+        omit a ``None``-valued OPTIONAL field;
+        always emit a REQUIRED field, even when its value is null.
+
+    The first half is ``exclude_none``, matching
+    :func:`shared.memory_eval_metrics.serialize_metric_series` — these two files
+    land under one artifact root and are read by the same dashboard-shaped
+    reader, so a consumer needing ``.get`` for one and ``[...]`` for the other
+    would be reading two conventions, with the split invisible until it
+    ``KeyError``s on the one it guessed wrong.
+
+    The second half is not an exception to the first — it is the half
+    ``exclude_none`` alone cannot express. :attr:`LimitsArtifact.alpha` is
+    required AND nullable on purpose (see its docstring): its ABSENCE means "the
+    producer forgot the field", its ``null`` means "nothing in this run was
+    alarm-eligible". Collapsing those two would be exactly the silent
+    degradation this repo's loud-over-silent norm forbids — and concretely, a
+    bare ``exclude_none=True`` drops ``alpha`` from an all-scalar run and makes
+    :func:`load_limits_artifact` raise :class:`LimitsSchemaError` on a file this
+    writer itself just emitted.
+
+    The always-emit set is DERIVED from the model rather than hardcoded to
+    ``alpha``: a required-nullable field added later is then covered without
+    anyone remembering to, instead of being silently dropped from the artifact.
+    The nested verdict/alarm records need no such fix-up — every nullable field
+    on them carries a ``None`` default, i.e. all optional — which the round-trip
+    test proves rather than assumes.
+    """
+    payload = artifact.model_dump(mode='json', exclude_none=True)
+    for name, field in type(artifact).model_fields.items():
+        if field.is_required() and name not in payload:
+            payload[name] = None
+    return payload
+
+
 def write_limits_artifact(result: EvaluationResult, path: str | Path) -> Path:
     """Persist *result* to *path* atomically, returning the path written.
 
     ``sort_keys=True`` and a trailing newline so two runs that concluded the
     same thing produce the same bytes — a committed artifact should diff to
     nothing when nothing changed, which is what makes a real change legible.
+    Which KEYS appear is :func:`_artifact_payload`'s null convention.
     """
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     artifact = _artifact_from_result(result)
-    text = json.dumps(
-        artifact.model_dump(mode='json'), indent=2, sort_keys=True, ensure_ascii=False
-    )
+    text = json.dumps(_artifact_payload(artifact), indent=2, sort_keys=True, ensure_ascii=False)
     _atomic_write_text(target, text + '\n')
     return target
 

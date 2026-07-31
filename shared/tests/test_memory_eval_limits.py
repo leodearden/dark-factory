@@ -1511,7 +1511,10 @@ class TestLimitsArtifact:
         # An equality, not an `any`: a membership check would still pass with
         # the per-metric scoping deleted, because the extra alarms a mis-seeded
         # run produces are additions rather than removals.
-        assert {(a['metric_id'], a['item_key']) for a in data['alarms']} == {
+        # `.get`, not `[...]`: a whole-metric rule OMITS item_key rather than
+        # nulling it (TestNullSerializationConvention), so `None` here is the
+        # reader's own default for an absent key, not a value on disk.
+        assert {(a['metric_id'], a.get('item_key')) for a in data['alarms']} == {
             ('canonical-in-top-5', None),
             ('dangling-pointers', None),
             ('topic-canonical-present', 't-worktree-lifecycle'),
@@ -1757,16 +1760,35 @@ class TestNullSerializationConvention:
     """
 
     def _written(self, tmp_path) -> dict:
-        result = evaluate_series(_series(_REGRESSION_STAMP), _baseline(), _config(), None)
+        """The regression run judged on the RESUME path, so a tripwire can alarm.
+
+        ``grandfather=None`` would make this run the tripwire's FIRST sighting,
+        which snapshots rather than alarms (``evaluate_series``' added-
+        mid-programme rule) — leaving no tripwire alarm for the mirror-image
+        case below to inspect. Seeding from an earlier run's own output is the
+        recipe a real runner follows, via the helper that already exists rather
+        than a second hand-built one.
+        """
+        grandfather, snapshotted = _seeded_state()
+        result = evaluate_series(
+            _series(_REGRESSION_STAMP), _baseline(), _config(), grandfather, snapshotted
+        )
         path = limits_artifact_path(tmp_path, result.eval_id)
         write_limits_artifact(result, path)
         return json.loads(path.read_text(encoding='utf-8'))
 
     def _alarm(self, data: dict, metric_id: str) -> dict:
-        return next(a for a in data['alarms'] if a['metric_id'] == metric_id)
+        # Named lookup, not `next(...)`: a missing alarm means the fixture stopped
+        # exercising the case, and that must read as "no alarm for X" rather than
+        # a bare StopIteration from inside a helper.
+        alarms = {a['metric_id']: a for a in data['alarms']}
+        assert metric_id in alarms, f'no alarm for {metric_id}; got {sorted(alarms)}'
+        return alarms[metric_id]
 
     def _verdict(self, data: dict, metric_id: str) -> dict:
-        return next(v for v in data['verdicts'] if v['metric_id'] == metric_id)
+        verdicts = {v['metric_id']: v for v in data['verdicts']}
+        assert metric_id in verdicts, f'no verdict for {metric_id}; got {sorted(verdicts)}'
+        return verdicts[metric_id]
 
     def test_a_whole_metric_alarm_omits_item_key_rather_than_nulling_it(self, tmp_path):
         """``item_key`` scopes an alarm to ONE item; a whole-metric rule has no item.

@@ -149,10 +149,34 @@ dashboard would), and by regenerating it and asserting byte-identity. The first
 pins the published contract; the second stops the committed bytes drifting from
 what the writer emits.
 
-The `metrics-*.json` series files are hand-authored, but in the writer's exact
-canonical serialization: `json.dumps(..., indent=2, sort_keys=True,
-ensure_ascii=False)` plus a trailing newline, with `None`-valued optional
-fields omitted. `test_memory_eval_boundary.py` asserts byte-identity by
+### The null convention — one rule, both artifacts
+
+Both writers — `serialize_metric_series` (M1) and `write_limits_artifact` (M2)
+— emit the same canonical serialization: `json.dumps(..., indent=2,
+sort_keys=True, ensure_ascii=False)` plus a trailing newline, and:
+
+> omit a `None`-valued **optional** field;
+> always emit a **required** field, even when its value is null.
+
+The two files land under one artifact root and are read by the same
+dashboard-shaped reader, so one idiom must read an unused field in either:
+absence means "does not apply here" (`.get`, never `[...]` — e.g. `item_key` on
+a whole-metric alarm, `denominator` on a non-proportion metric).
+
+The second half is not an exception to the first, it is the half `exclude_none`
+alone cannot express. `LimitsArtifact.alpha` is required **and** nullable on
+purpose: its *absence* means "the producer forgot the field", its `null` means
+"nothing in this run was alarm-eligible". A bare `exclude_none=True` collapses
+those two — it drops `alpha` from an all-scalar run and makes the writer emit a
+file `load_limits_artifact` then rejects. The always-emit set is derived from
+`LimitsArtifact.model_fields[...].is_required()`, so a required-nullable field
+added later is covered without anyone remembering to. M1 needs no such fix-up:
+every nullable field on `Metric`/`MetricSeries` carries a `None` default, i.e.
+all optional. Pinned by `TestNullSerializationConvention` in
+`test_memory_eval_limits.py`.
+
+The `metrics-*.json` series files are hand-authored, but in that exact
+canonical serialization. `test_memory_eval_boundary.py` asserts byte-identity by
 re-emitting each parsed exemplar through `write_metric_series`, so any drift
 fails CI rather than silently diverging from what the runners actually produce.
 
