@@ -10,7 +10,8 @@ plan for the full three-way contract (keep / drop+mark / keep+mark).
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, call
+import json
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
@@ -19,6 +20,7 @@ from fused_memory.reconciliation.citation_verifier import (
     find_citation_occurrences,
     is_concrete_memory_id,
     repoint_metadata,
+    repoint_task_citations,
     verify_cited_memories,
 )
 
@@ -528,3 +530,317 @@ class TestConcreteReplacementPointer:
                 paths=[],
                 run_id='run-abc',
             )
+
+
+# --------------------------------------------------------------------------- #
+# repoint_task_citations — the pre-delete task-DB sweep (task 3108)
+# --------------------------------------------------------------------------- #
+
+_RECON_AGENT_ID = 'recon-stage-memory_consolidator'
+
+# The 7-member non-terminal set (shared.task_statuses.ACTIVE). The incident's
+# missed tasks were PENDING — the ones that were still dispatchable — so the
+# sweep must cover every one of these, not just in-progress.
+_NON_TERMINAL_STATUSES = [
+    'pending',
+    'in-progress',
+    'blocked',
+    'deferred',
+    'review',
+    'merge-deferred',
+    'infra-hold',
+]
+
+
+def _make_task_interceptor(tasks, update_result=None):
+    """Build a fake TaskInterceptor with EXPLICIT AsyncMock children.
+
+    ``get_tasks``/``update_task`` must be declared rather than left as
+    MagicMock auto-attributes: tests/test_check_bare_magicmock_config.py and
+    tests/test_check_asyncmock_assertion_style.py lint for exactly that.
+    """
+    interceptor = MagicMock()
+    interceptor.get_tasks = AsyncMock(return_value={'tasks': tasks})
+    interceptor.update_task = AsyncMock(
+        return_value=update_result if update_result is not None else {'success': True},
+    )
+    return interceptor
+
+
+def _task(task_id, status, metadata):
+    return {'id': task_id, 'status': status, 'title': f'task {task_id}', 'metadata': metadata}
+
+
+class TestRepointTaskCitations:
+    """The sweep repoints live pointers and REPORTS terminal ones."""
+
+    @pytest.mark.asyncio
+    async def test_pending_task_is_repointed_through_the_interceptor(self):
+        """(a) A pending citer is rewritten via a single merge-mode write."""
+        interceptor = _make_task_interceptor([
+            _task('101', 'pending', {'mem0_canonical_entry': _DOOMED, 'priority': 'high'}),
+        ])
+
+        stats = await repoint_task_citations(
+            interceptor,
+            '/tmp/root',
+            memory_id=_DOOMED,
+            replacement_id=_SURVIVOR,
+            run_id='run-abc',
+        )
+
+        interceptor.get_tasks.assert_awaited_once_with('/tmp/root')
+        interceptor.update_task.assert_awaited_once()
+        kwargs = interceptor.update_task.call_args[1]
+
+        # Merge mode is mandatory: 'replace' would clobber the whole blob and
+        # 'additive' is scalar-collision OLD-wins so it structurally cannot
+        # overwrite a citation. A bare append=False write is rejected outright
+        # by the backend after the task-2180 metadata-wipe incident.
+        assert kwargs['metadata_mode'] == 'merge'
+        assert kwargs['agent_id'] == _RECON_AGENT_ID
+        assert kwargs['task_id'] == '101'
+        assert kwargs['project_root'] == '/tmp/root'
+
+        # The payload is a JSON STRING, per the update_task metadata contract.
+        assert isinstance(kwargs['metadata'], str)
+        payload = json.loads(kwargs['metadata'])
+
+        assert payload['mem0_canonical_entry'] == _SURVIVOR
+        tombstones = payload['x_memory_citation_tombstones']
+        assert len(tombstones) == 1
+        assert tombstones[0]['superseded_memory_id'] == _DOOMED
+        assert tombstones[0]['replacement_memory_id'] == _SURVIVOR
+        assert tombstones[0]['paths'] == ['mem0_canonical_entry']
+        assert tombstones[0]['run_id'] == 'run-abc'
+
+        assert stats['stage1_citations_repointed'] == 1
+        assert stats['stage1_citation_tasks_repointed'] == 1
+        assert stats['stage1_citation_repoint_failures'] == 0
+
+    @pytest.mark.asyncio
+    async def test_nested_repoint_carries_the_whole_top_level_key(self):
+        """(a2) merge is SHALLOW last-write-wins (tools.py:4984-4985), so
+        repointing memory_hints.queries[0] must resend the ENTIRE memory_hints
+        value — a partial nested fragment would wipe its siblings."""
+        interceptor = _make_task_interceptor([
+            _task('102', 'pending', {
+                'memory_hints': {
+                    'entities': ['MemoryConsolidator', 'CitationVerifier'],
+                    'queries': [
+                        f'canonical advice {_DOOMED}',
+                        'an unrelated second query',
+                    ],
+                },
+                'priority': 'high',
+            }),
+        ])
+
+        await repoint_task_citations(
+            interceptor,
+            '/tmp/root',
+            memory_id=_DOOMED,
+            replacement_id=_SURVIVOR,
+            run_id='run-abc',
+        )
+
+        payload = json.loads(interceptor.update_task.call_args[1]['metadata'])
+
+        # The whole memory_hints value travels, siblings intact.
+        assert payload['memory_hints'] == {
+            'entities': ['MemoryConsolidator', 'CitationVerifier'],
+            'queries': [
+                f'canonical advice {_SURVIVOR}',
+                'an unrelated second query',
+            ],
+        }
+        # Untouched top-level keys are NOT resent (merge preserves omitted keys).
+        assert 'priority' not in payload
+
+    @pytest.mark.asyncio
+    async def test_every_non_terminal_status_is_scanned(self):
+        """(b) All 7 non-terminal statuses are repointed — the incident's
+        missed tasks were pending, not in-progress."""
+        tasks = [
+            _task(str(200 + i), status, {'cited': _DOOMED})
+            for i, status in enumerate(_NON_TERMINAL_STATUSES)
+        ]
+        interceptor = _make_task_interceptor(tasks)
+
+        stats = await repoint_task_citations(
+            interceptor, '/tmp/root',
+            memory_id=_DOOMED, replacement_id=_SURVIVOR, run_id='run-abc',
+        )
+
+        assert interceptor.update_task.await_count == len(_NON_TERMINAL_STATUSES)
+        written_ids = {c[1]['task_id'] for c in interceptor.update_task.call_args_list}
+        assert written_ids == {str(200 + i) for i in range(len(_NON_TERMINAL_STATUSES))}
+        assert stats['stage1_citation_tasks_repointed'] == len(_NON_TERMINAL_STATUSES)
+
+    @pytest.mark.asyncio
+    async def test_terminal_tasks_are_reported_never_written(self):
+        """(c) done/cancelled citers are surfaced, not rewritten — rewriting a
+        done task's record would falsify history, and recon_write_policy Gate 1
+        would refuse it anyway."""
+        interceptor = _make_task_interceptor([
+            _task('301', 'done', {'cited': _DOOMED}),
+            _task('302', 'cancelled', {'memory_hints': {'queries': [f'x {_DOOMED}']}}),
+            _task('303', 'pending', {'cited': _DOOMED}),
+        ])
+
+        stats = await repoint_task_citations(
+            interceptor, '/tmp/root',
+            memory_id=_DOOMED, replacement_id=_SURVIVOR, run_id='run-abc',
+        )
+
+        # Only the pending task was written.
+        interceptor.update_task.assert_awaited_once()
+        assert interceptor.update_task.call_args[1]['task_id'] == '303'
+
+        reported = {r['task_id']: r for r in stats['terminal_citations']}
+        assert set(reported) == {'301', '302'}
+        assert reported['301']['status'] == 'done'
+        assert reported['301']['paths'] == ['cited']
+        assert reported['302']['status'] == 'cancelled'
+        assert reported['302']['paths'] == ['memory_hints.queries[0]']
+        assert stats['stage1_terminal_citations_reported'] == 2
+
+    @pytest.mark.asyncio
+    async def test_tasks_without_the_uuid_are_untouched(self):
+        """(d) Non-citing tasks are scanned but never written."""
+        interceptor = _make_task_interceptor([
+            _task('401', 'pending', {'cited': _SURVIVOR}),
+            _task('402', 'pending', {'memory_hints': {'queries': ['nothing relevant']}}),
+            _task('403', 'pending', None),
+            _task('404', 'pending', {}),
+        ])
+
+        stats = await repoint_task_citations(
+            interceptor, '/tmp/root',
+            memory_id=_DOOMED, replacement_id=_SURVIVOR, run_id='run-abc',
+        )
+
+        interceptor.update_task.assert_not_awaited()
+        assert stats['stage1_citation_tasks_scanned'] == 4
+        assert stats['stage1_citation_tasks_repointed'] == 0
+        assert stats['terminal_citations'] == []
+        assert stats['unrepointed'] == []
+
+    @pytest.mark.asyncio
+    async def test_rejected_write_is_counted_and_listed_not_raised(self):
+        """(e) Interceptor gates REFUSE BY RETURNING a {'success': False}
+        dict (recon_write_policy.py:309), never by raising — so the failure
+        must be read from the response and tallied, not caught."""
+        interceptor = _make_task_interceptor(
+            [_task('501', 'pending', {'cited': _DOOMED})],
+            update_result={
+                'success': False,
+                'error': 'recon-stage write to terminal task refused',
+                'error_type': 'ReconTerminalWriteRejected',
+            },
+        )
+
+        stats = await repoint_task_citations(
+            interceptor, '/tmp/root',
+            memory_id=_DOOMED, replacement_id=_SURVIVOR, run_id='run-abc',
+        )
+
+        assert stats['stage1_citation_repoint_failures'] == 1
+        assert stats['stage1_citation_tasks_repointed'] == 0
+        assert len(stats['unrepointed']) == 1
+        assert stats['unrepointed'][0]['task_id'] == '501'
+        assert stats['unrepointed'][0]['paths'] == ['cited']
+
+    @pytest.mark.asyncio
+    async def test_write_raising_is_tallied_and_the_sweep_continues(self):
+        """(e) A raised per-task write error is tallied too, and does not
+        abandon the remaining citers."""
+        interceptor = _make_task_interceptor([
+            _task('601', 'pending', {'cited': _DOOMED}),
+            _task('602', 'pending', {'cited': _DOOMED}),
+        ])
+
+        async def _update(**kwargs):
+            if kwargs['task_id'] == '601':
+                raise RuntimeError('backend exploded')
+            return {'success': True}
+
+        interceptor.update_task = AsyncMock(side_effect=_update)
+
+        stats = await repoint_task_citations(
+            interceptor, '/tmp/root',
+            memory_id=_DOOMED, replacement_id=_SURVIVOR, run_id='run-abc',
+        )
+
+        assert stats['stage1_citation_repoint_failures'] == 1
+        assert stats['stage1_citation_tasks_repointed'] == 1
+        assert [u['task_id'] for u in stats['unrepointed']] == ['601']
+
+    @pytest.mark.asyncio
+    async def test_stats_shape_is_complete_on_the_no_occurrences_path(self):
+        """(f) Every key is present on EVERY path, so a consumer never has to
+        guard a missing counter."""
+        interceptor = _make_task_interceptor([])
+
+        stats = await repoint_task_citations(
+            interceptor, '/tmp/root',
+            memory_id=_DOOMED, replacement_id=_SURVIVOR, run_id='run-abc',
+        )
+
+        assert set(stats) == {
+            'stage1_citation_tasks_scanned',
+            'stage1_citations_repointed',
+            'stage1_citation_tasks_repointed',
+            'stage1_citation_repoint_failures',
+            'stage1_terminal_citations_reported',
+            'terminal_citations',
+            'unrepointed',
+        }
+        assert stats['stage1_citation_tasks_scanned'] == 0
+        interceptor.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_get_tasks_failure_propagates_so_the_caller_can_fail_closed(self):
+        """(g) The BULK read failing means 'unknown', and unknown must not be
+        treated as 'no citations' — it propagates so the delete-side guard can
+        refuse rather than destroy."""
+        interceptor = _make_task_interceptor([])
+        interceptor.get_tasks = AsyncMock(side_effect=RuntimeError('task db unreachable'))
+
+        with pytest.raises(RuntimeError, match='task db unreachable'):
+            await repoint_task_citations(
+                interceptor, '/tmp/root',
+                memory_id=_DOOMED, replacement_id=_SURVIVOR, run_id='run-abc',
+            )
+
+        interceptor.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_existing_tombstones_are_appended_to_not_replaced(self):
+        """A prior forwarding record is preserved: merge overwrites the key
+        wholesale, so the existing list must be resent alongside the new entry."""
+        prior = {
+            'superseded_memory_id': 'aaaaaaaa-0000-4000-8000-000000000000',
+            'replacement_memory_id': _DOOMED,
+            'paths': ['cited'],
+            'run_id': 'run-earlier',
+        }
+        interceptor = _make_task_interceptor([
+            _task('701', 'pending', {
+                'cited': _DOOMED,
+                'x_memory_citation_tombstones': [prior],
+            }),
+        ])
+
+        await repoint_task_citations(
+            interceptor, '/tmp/root',
+            memory_id=_DOOMED, replacement_id=_SURVIVOR, run_id='run-abc',
+        )
+
+        payload = json.loads(interceptor.update_task.call_args[1]['metadata'])
+        tombstones = payload['x_memory_citation_tombstones']
+        assert len(tombstones) == 2
+        # The prior record survives verbatim, including its own now-superseded
+        # pointer — history is appended to, never rewritten.
+        assert tombstones[0] == prior
+        assert tombstones[1]['replacement_memory_id'] == _SURVIVOR
