@@ -1526,7 +1526,18 @@ def create_mcp_server(
                 'hint': _CITATION_REPOINT_HINT,
             }, None
 
-        return None, None
+        # Repoint BEFORE the delete. The caller falls through to
+        # memory_service.delete_memory only after this returns, which is the
+        # ordering guarantee: no window exists in which the entry is gone but a
+        # live task still points at it.
+        stats = await repoint_task_citations(
+            task_interceptor,
+            project_root,
+            memory_id=memory_id,
+            replacement_id=replacement_memory_id,
+            run_id=None,
+        )
+        return None, {'citation_repoint': stats}
 
     async def _scan_task_citations(
         project_root: str, memory_id: str
