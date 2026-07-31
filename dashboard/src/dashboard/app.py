@@ -436,8 +436,16 @@ def _discard_abandoned_probe(task: asyncio.Task) -> None:
 async def _probe_db(pool: DbPool, db_path: Path, budget: float) -> str:
     """Probe one database under a single deadline covering acquire + execute + fetch.
 
-    Returns 'ok' | 'failed' | 'timeout' | 'unavailable'. Never raises: a
-    /healthz probe must always yield a verdict for its DB.
+    Returns 'ok' | 'failed' | 'timeout' | 'error' | 'unavailable'. Never
+    raises: a /healthz probe must always yield a verdict for its DB.
+
+    'timeout' means the probe did not finish inside *budget*. 'error' means
+    it finished fast by RAISING (corrupt DB, connection closed under us,
+    disk I/O error) — a distinct fact, kept distinct because the handler
+    keys `checks['deadline_exceeded']` on 'timeout' and would otherwise tell
+    the operator a ~0ms failure blew the deadline. Only the status string
+    reaches the payload, so the exception itself is logged at WARNING with
+    exc_info; without that it would be unrecoverable anywhere.
 
     Runs the probe in its own task and, on expiry, ABANDONS it rather than
     awaiting its cancellation. A deadline wrapped around `async with
@@ -473,11 +481,15 @@ async def _probe_db(pool: DbPool, db_path: Path, budget: float) -> str:
         task.cancel()  # fire-and-forget — do NOT await the unwinding
         _ABANDONED_PROBES.add(task)
         task.add_done_callback(_discard_abandoned_probe)
-        return 'timeout'
+        return 'timeout'  # ONLY a real budget expiry is a 'timeout'
     try:
         return task.result()
     except Exception:
-        return 'timeout'
+        # The payload can only carry a status string, so the exception itself
+        # would be unrecoverable if it were not logged here (INV-2
+        # structured-facts-at-failure).
+        logger.warning('/healthz probe failed for %s', db_path, exc_info=True)
+        return 'error'
 
 
 @app.get('/healthz')
@@ -493,6 +505,10 @@ async def healthz(request: Request) -> JSONResponse:
     (`checks['budget_seconds']` / `checks['deadline_exceeded']`) so an
     operator reading a 503 doesn't have to read the source to recover facts
     the handler already had in hand.
+
+    `checks['deadline_exceeded']` reflects budget expiry ONLY. A probe that
+    fails fast by raising is reported as `'error'` (with the exception
+    logged), not `'timeout'`, so the field means what it says.
     """
     checks: dict = {}
     healthy = True
@@ -525,6 +541,10 @@ async def healthz(request: Request) -> JSONResponse:
         checks[f'db_{name}'] = status
         if status not in ('ok', 'unavailable'):
             healthy = False
+        # Load-bearing: keyed on 'timeout' ALONE. _probe_db reports a probe
+        # that raised as 'error', which flips healthy above but must not
+        # claim the handler blew its budget — folding 'error' back into
+        # 'timeout' here would silently re-break this flag.
         if status == 'timeout':
             deadline_exceeded = True
 
