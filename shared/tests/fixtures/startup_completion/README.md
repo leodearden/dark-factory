@@ -26,7 +26,18 @@ failure-mode table. This file documents the *schema*; the report documents the
 ## Record schema
 
 Each corpus file is `{task, prd, consumer, report, schema, raw_capture, regime, rows: [...]}`.
-`validate_row()` in the loader is the single gate and enforces exactly the rules below.
+
+`load_startup_completion_corpus()` runs `validate_row()` over **every** row before
+returning it, so the schema check runs in the consumer's own test path — a malformed row
+appended in a downstream branch fails at load with a row-id-prefixed `AssertionError`,
+not as a `KeyError` deep inside a watchdog test. (`validate=False` skips the gate, for
+debugging a row *because* it fails.) `validate_row()` enforces every per-row rule below;
+each rule has a matching negative test in
+`TestValidateRowRejects`, so a dead or inverted assertion cannot silently stop firing.
+
+**Row-id uniqueness is the one documented rule `validate_row()` cannot enforce** — it is
+handed one row at a time and cannot see the other file. It is asserted at corpus level by
+`test_row_ids_are_unique_across_both_files`.
 
 ```
 {

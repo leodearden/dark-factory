@@ -41,13 +41,19 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, NotRequired, TypedDict
 
-from shared.cli_invoke import read_transcript_records
-
+# The bootstrap must precede the ``shared`` import, not follow it: this module
+# advertises itself as importable as a top-level module, and
+# `startup_completion_probe.py` imports it while running as a bare script, where
+# ``shared`` is not necessarily already on the path.  Ordering it after the
+# import would make it dead code that looks like a guarantee.  Same shape as the
+# probe's own bootstrap.
 _TESTS_DIR = Path(__file__).resolve().parent
 _SRC_DIR = _TESTS_DIR.parent / 'src'
 for _p in (str(_TESTS_DIR), str(_SRC_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
+
+from shared.cli_invoke import read_transcript_records  # noqa: E402  (after src bootstrap)
 
 _FIXTURES_DIR = _TESTS_DIR / 'fixtures' / 'startup_completion'
 
@@ -117,26 +123,49 @@ class StartupCompletionRow(TypedDict):
 # Secret hygiene
 # ---------------------------------------------------------------------------
 
-#: ``(name, regex)`` pairs matching credential-shaped material.  Kept in sync
-#: with ``startup_completion_probe._CREDENTIAL_PATTERNS`` — the probe applies
-#: them as a CAPTURE-time gate (so unredacted material never reaches disk) and
-#: this module applies them as a COMMIT-time assertion (so a later hand-edit
-#: cannot reintroduce what the probe would have refused to write).  Both halves
-#: are needed: capture-time alone is not safe under maintenance, and
+#: ``(name, regex)`` pairs matching UNAMBIGUOUS credential markers.  A hit is a
+#: real secret, not a coincidence of ordinary content, so every call site treats
+#: these as fatal.  Kept in sync with ``startup_completion_probe`` — the probe
+#: applies them as a CAPTURE-time gate (so unredacted material never reaches
+#: disk) and this module applies them as a COMMIT-time assertion (so a later
+#: hand-edit cannot reintroduce what the probe would have refused to write).
+#: Both halves are needed: capture-time alone is not safe under maintenance, and
 #: commit-time alone is not safe during a fresh probe run.
-_CREDENTIAL_PATTERNS: tuple[tuple[str, str], ...] = (
+NAMED_CREDENTIAL_PATTERNS: tuple[tuple[str, str], ...] = (
     ('sk-ant-token', r'sk-ant-'),
     ('oauth-blob', r'claudeAiOauth'),
     ('access-token', r'accessToken'),
     ('refresh-token', r'refreshToken'),
     ('bearer-jwt', r'Bearer\s+eyJ'),
-    # Generic long base64url run — catches a raw token pasted without any of the
-    # named markers above.  64 chars is comfortably longer than the base64-ish
-    # substrings that appear in ordinary content (session UUIDs are 36 with
-    # hyphens; the longest incidental run in the committed corpus is far below
-    # this), so it adds coverage without firing on legitimate data.
-    ('long-base64url-run', r'[A-Za-z0-9_-]{64,}'),
 )
+
+#: Heuristic backstop: a long base64url run, catching a raw token pasted without
+#: any of the named markers above.  Unlike those, this one CAN false-positive —
+#: so it is PATH-AWARE by construction.  The lookarounds refuse a run that is a
+#: path segment (adjacent to ``/``), because the dominant base64url-shaped run in
+#: an observation is the config-dir project slug: the invoking cwd with ``/``
+#: replaced by ``-``.  On this worktree that slug is 44 chars, but its length is
+#: purely a function of how deep the checkout is — a worktree named for its task
+#: (`.worktrees/task-3326-two-regime-watchdog-startup-grace`) yields ~81 and
+#: would trip an unanchored pattern, destroying a real-money live capture over a
+#: path.  ``/`` cannot appear INSIDE a run (it is not in the char class), so a
+#: run adjacent to one is always a path segment, never a bare token.
+#:
+#: The tradeoff, stated plainly: a raw token embedded in a URL path would be
+#: missed here.  Every token shape this repo actually handles carries one of the
+#: named markers above (``sk-ant-oat01-…``, ``accessToken``), which are scanned
+#: everywhere and unconditionally.
+GENERIC_CREDENTIAL_PATTERNS: tuple[tuple[str, str], ...] = (
+    ('long-base64url-run', r'(?<![A-Za-z0-9_/-])[A-Za-z0-9_-]{64,}(?![A-Za-z0-9_/-])'),
+)
+
+#: Every pattern, named first.  Scanned in this order so a hit reports the most
+#: specific matching pattern.
+_CREDENTIAL_PATTERNS: tuple[tuple[str, str], ...] = (
+    NAMED_CREDENTIAL_PATTERNS + GENERIC_CREDENTIAL_PATTERNS
+)
+
+_GENERIC_PATTERN_NAMES = frozenset(name for name, _ in GENERIC_CREDENTIAL_PATTERNS)
 
 
 def assert_no_credential_material(text: str, *, source: str) -> None:
@@ -147,14 +176,26 @@ def assert_no_credential_material(text: str, *, source: str) -> None:
     match offset, so a failure says WHERE to look rather than just "assertion
     failed".  The matched text itself is never echoed — a guard that printed the
     secret it caught would defeat its own purpose.
+
+    The remediation advice differs by pattern class: a NAMED hit is a secret and
+    must be redacted, whereas a GENERIC hit may be a long path segment the
+    lookarounds did not exclude, so the message says to check that first rather
+    than sending the reader hunting for a token that is not there.
     """
     for name, pattern in _CREDENTIAL_PATTERNS:
         match = re.search(pattern, text)
         if match is not None:
+            if name in _GENERIC_PATTERN_NAMES:
+                advice = (
+                    'This is the heuristic long-run backstop, which can fire on a '
+                    'long non-path identifier — confirm it is actually a secret '
+                    'before redacting.'
+                )
+            else:
+                advice = 'Redact it — record credential-bearing paths by presence/size only.'
             raise AssertionError(
                 f'credential material in {source}: pattern {name!r} matched at '
-                f'offset {match.start()} (match text withheld). Redact it — '
-                f'record credential-bearing paths by presence/size only.'
+                f'offset {match.start()} (match text withheld). {advice}'
             )
 
 
@@ -181,8 +222,15 @@ _REQUIRED_KEYS: tuple[str, ...] = (
 def validate_row(row: Mapping[str, Any]) -> None:
     """Raise ``AssertionError`` if *row* violates the documented schema.
 
-    The single schema gate — `fixtures/startup_completion/README.md` documents
-    exactly these rules in prose.
+    The single per-row schema gate, applied to every row by
+    :func:`load_startup_completion_corpus` —
+    `fixtures/startup_completion/README.md` documents exactly these rules in
+    prose.  The one documented rule NOT enforced here is row-id uniqueness, which
+    is a property of the corpus rather than of a row; see the loader's docstring.
+
+    Every rule below has a matching negative test in
+    ``test_startup_completion_fixtures.py::TestValidateRowRejects``, so a dead or
+    inverted assertion cannot silently stop firing.
     """
     row_id = row.get('id', '<no id>')
 
@@ -241,6 +289,12 @@ def validate_row(row: Mapping[str, Any]) -> None:
         assert isinstance(row['transcript_raw_lines'], list), (
             f'{row_id}: transcript_raw_lines must be a list of str'
         )
+        # Element type matters, not just list-ness: materialize_config_dir joins
+        # these with '\n', so a non-str element raises TypeError deep inside the
+        # materializer rather than failing here with a row id.
+        assert all(isinstance(line, str) for line in row['transcript_raw_lines']), (
+            f'{row_id}: every transcript_raw_lines element must be a str'
+        )
         assert relpath is not None, (
             f'{row_id}: transcript_raw_lines needs a transcript_relpath to write to'
         )
@@ -278,17 +332,31 @@ def validate_row(row: Mapping[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def load_startup_completion_corpus() -> list[StartupCompletionRow]:
+def load_startup_completion_corpus(*, validate: bool = True) -> list[StartupCompletionRow]:
     """Load and return every curated row from BOTH corpus files, in file order.
 
     Each row is stamped with ``source_path`` (the corpus file's basename) so a
     caller can tell which file a row came from without re-reading either.
+
+    THE loading gate: every row is passed through :func:`validate_row` before it
+    is returned, so the schema check runs in the consumer's test path (task
+    3326's included) and not only in this repo's own suite.  A malformed row
+    appended in a downstream branch fails at load with a ``row_id``-prefixed
+    ``AssertionError`` rather than surfacing as a confusing ``KeyError`` inside a
+    watchdog test.  Pass ``validate=False`` only to inspect a row that is being
+    debugged *because* it fails validation.
+
+    Row-id uniqueness is a CORPUS-level rule and therefore not checkable here —
+    :func:`validate_row` sees one row at a time.  It is asserted by
+    ``test_row_ids_are_unique_across_both_files``.
     """
     rows: list[StartupCompletionRow] = []
     for path in CORPUS_PATHS:
         payload = json.loads(path.read_text(encoding='utf-8'))
         for row in payload['rows']:
             row['source_path'] = path.name
+            if validate:
+                validate_row(row)
             rows.append(row)
     return rows
 
@@ -327,15 +395,19 @@ def snapshot_config_dir(
         return entries
     pruned_counts: dict[str, int] = {}
     for path in sorted(config_dir.rglob('*')):
+        # Computed OUTSIDE the try: it is a pure string operation that cannot
+        # raise OSError, and the ``vanished`` branch below needs it.  Recording
+        # the absolute path there instead would break the tree-entry contract AND
+        # leak the capturing host's username/worktree layout into a committed row.
+        relpath = str(path.relative_to(config_dir))
+        prefix = next(
+            (p for p in prune_prefixes if relpath == p or relpath.startswith(p + os.sep)),
+            None,
+        )
+        if prefix is not None and relpath != prefix:
+            pruned_counts[prefix] = pruned_counts.get(prefix, 0) + 1
+            continue
         try:
-            relpath = str(path.relative_to(config_dir))
-            prefix = next(
-                (p for p in prune_prefixes if relpath == p or relpath.startswith(p + os.sep)),
-                None,
-            )
-            if prefix is not None and relpath != prefix:
-                pruned_counts[prefix] = pruned_counts.get(prefix, 0) + 1
-                continue
             if path.is_symlink():
                 kind, size = 'symlink', None
             elif path.is_dir():
@@ -356,7 +428,7 @@ def snapshot_config_dir(
         except OSError:
             entries.append(
                 {
-                    'relpath': str(path),
+                    'relpath': relpath,
                     'kind': 'vanished',
                     'size': None,
                     'mtime_delta_secs': None,

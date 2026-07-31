@@ -253,11 +253,11 @@ for row in scf.load_startup_completion_corpus():          # list[StartupCompleti
 
 | Symbol | Signature / meaning |
 |---|---|
-| `load_startup_completion_corpus()` | `-> list[StartupCompletionRow]` — every row from both corpus files, each stamped with `source_path`. |
+| `load_startup_completion_corpus(*, validate=True)` | `-> list[StartupCompletionRow]` — every row from both corpus files, each stamped with `source_path`, each passed through `validate_row()` on the way out. The gate therefore runs in ν's test path too, not only in λ's suite. |
 | `materialize_config_dir(row, dest)` | `-> tuple[Path, str]` — rebuilds the observed tree under `dest` as a **real filesystem** and returns `(config_dir, session_id)`. `_resolve_transcript_path`'s `projects/*/<session_id>.jsonl` glob resolves against it exactly as against a live config dir, so a production predicate — or the real `_run_subprocess` watchdog — can be pointed at it directly. |
 | `snapshot_config_dir(config_dir, ...)` | `-> list[dict]` — the sampler shared with the probe, so probe output and materialized trees are describable by one function. |
 | `evaluate_startup_completion_predicate(config_dir, session_id)` | `-> bool \| None` — the reference implementation. Diff a production port against it. |
-| `validate_row(row)` / `assert_no_credential_material(text, *, source)` | Schema gate and secret-hygiene guard; reusable if ν appends rows. |
+| `validate_row(row)` / `assert_no_credential_material(text, *, source)` | Per-row schema gate (already applied by the loader — call it directly only when validating a row you built by hand) and secret-hygiene guard; reusable if ν appends rows. Row-id uniqueness is corpus-level and is *not* checked by `validate_row`. |
 | `row['expected_startup_complete']` | `bool \| None` — the recorded verdict. **`None` is a real value**, not a missing one: it is the unreadable sentinel, and it is what eight of the fourteen rows carry. |
 | `row['substrate_returns']` | `{transcript_exists, read_transcript_records_is_none, record_count, count_transcript_turns}` — the three committed substrate calls' returns, so a port can be checked against the substrate and not just the verdict. |
 
