@@ -75,6 +75,25 @@ def _kill_group(pgid: int) -> None:
         os.killpg(pgid, signal.SIGKILL)
 
 
+class _TrapReadinessError(AssertionError):
+    """The SIGTERM-trap readiness precondition was not observed.
+
+    Subclasses AssertionError so an unmet precondition surfaces as a
+    test FAILURE (never a bare TimeoutError, never a silent return).
+    The concrete subclass — not the message text — is the contract:
+    callers/tests discriminate failure modes by type, so the
+    human-readable message stays free to change.
+    """
+
+
+class _TrapReadinessTimeout(_TrapReadinessError):
+    """No readiness line arrived within the bounded deadline."""
+
+
+class _TrapReadinessEOF(_TrapReadinessError):
+    """The child closed stdout before announcing readiness (early exit)."""
+
+
 async def _await_trap_installed(
     proc: asyncio.subprocess.Process,
     *,
@@ -103,32 +122,37 @@ async def _await_trap_installed(
     (bit ``1 << (SIGTERM-1)``) — confirming the line is a valid proxy for
     the kernel-level precondition, not merely a plausible one.
 
-    Raises ``AssertionError`` (never a bare ``TimeoutError``, and never
-    returns normally) if the precondition is not observed: either the
-    deadline elapses with no line, or the child closes stdout (EOF) first —
-    e.g. it exited before reaching the ``echo`` — which would otherwise look
-    identical to "line not yet available" and let a naive caller mistake
-    early-exit for a successfully armed trap.
+    Raises (never a bare ``TimeoutError``, and never returns normally) if
+    the precondition is not observed:
+    - ``_TrapReadinessTimeout`` — the deadline elapsed with no line.
+    - ``_TrapReadinessEOF`` — the child closed stdout (EOF) first, e.g. it
+      exited before reaching the ``echo``, which would otherwise look
+      identical to "line not yet available" and let a naive caller mistake
+      early-exit for a successfully armed trap.
+    - ``_TrapReadinessError`` — a line arrived but wasn't ``b"ready\\n"``.
+
+    All three subclass ``AssertionError``; the concrete subclass is the
+    contract callers discriminate on, not the message text.
     """
     assert proc.stdout is not None
     started = asyncio.get_running_loop().time()
     try:
         line = await asyncio.wait_for(proc.stdout.readline(), timeout)
     except TimeoutError:
-        raise AssertionError(
+        raise _TrapReadinessTimeout(
             f'shell pid={proc.pid} never announced "ready" within {timeout}s '
             f'(returncode={proc.returncode}) — the SIGTERM trap was never '
             f'confirmed installed, so escalation cannot be tested'
         ) from None
     if not line:
-        raise AssertionError(
+        raise _TrapReadinessEOF(
             f'shell pid={proc.pid} closed stdout (EOF) after '
             f'{asyncio.get_running_loop().time() - started:.3f}s without '
             f'announcing "ready" (returncode={proc.returncode}) — it exited '
             f'before installing the SIGTERM trap'
         )
     if line.strip() != b'ready':
-        raise AssertionError(
+        raise _TrapReadinessError(
             f'shell pid={proc.pid} announced {line!r}, expected b"ready\\n"'
         )
 
