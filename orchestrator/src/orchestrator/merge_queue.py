@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from orchestrator.critical_gate import critical_filing_gate
+from orchestrator.delivered_checks import gate_mark_done_on_delivered_checks
 from orchestrator.dry_run_unblock import run_dry_run_unblock
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import (
@@ -5868,6 +5869,9 @@ async def reconcile_landed_row(
     outbox: LandedOutbox,
     main_sha: str,
     provenance_conflict_sink: Any = None,
+    project_root: str | Path | None = None,
+    check_timeout_secs: float | None = None,
+    delivered_checks_enabled: bool = True,
 ) -> str:
     """Reconcile a single :class:`LandedRow` against RC-1/RC-2/RC-3 (task 2155, W1 γ).
 
@@ -5947,6 +5951,31 @@ async def reconcile_landed_row(
       gate's re-pend recipe, ``resolve_issue`` alone is sufficient here
       because ``should_skip`` reads the escalation's own status, not the
       task's.
+    * ``'delivered_checks_withheld'`` (task 3057) — the delivered-capability
+      guard refused the RC-2 done-write: git ancestry proves the branch tip
+      reached ``main_sha``, but the task's declared
+      ``metadata.delivered_checks`` are NOT verifiably present in that tree,
+      so stamping ``kind='merged'`` here would write a hollow done. Like
+      ``'skipped'``/``'stale_conflict'`` the row is left UNCONSUMED — the task
+      is not done, and the row is the only surviving record of the
+      crash-window intent — and :func:`reconcile_landed_task` maps this
+      disposition to ``False`` so the task stays DISPATCHABLE and an agent
+      actually delivers the capability. Deliberately NOT folded into
+      ``'skipped'``, which maps to ``True`` (do not dispatch) and would
+      convert a misattribution into a permanent strand.
+
+      The guard is OPT-IN: it runs only when BOTH *project_root* and
+      *check_timeout_secs* are supplied (the harness arms them from live
+      config — see ``Harness._reconcile_landed_outbox`` /
+      ``Harness._landed_dispatch_gate``). Their ``None`` defaults leave every
+      other caller byte-identical to the pre-3057 behavior.
+      *delivered_checks_enabled* forwards ``config.delivered_checks.enabled``
+      so the fleet-wide kill switch stays single-sourced in
+      :func:`~orchestrator.delivered_checks.gate_mark_done_on_delivered_checks`
+      rather than being re-implemented here. The already-resolved *main_sha*
+      is threaded to the guard so it audits the SAME main the RC-1 ancestry
+      test used — re-resolving could evaluate a different (newer) main than
+      the decision being gated, and would cost an extra git round-trip.
     """
     if not await git_ops.is_ancestor(row.advanced_sha, main_sha):
         outbox.consume(row.task_id)
@@ -5961,9 +5990,14 @@ async def reconcile_landed_row(
     # task 2677 amendment (reviewer_comprehensive #2): intentionally omits
     # reopen_at here, unlike the harness's dispatch-gate and stranded-sweep
     # should_skip call sites — a LandedRow (task_id/branch_tip_sha/
-    # advanced_sha/landed_at) carries no task metadata, and fetching it would
-    # require an extra scheduler round-trip this module-level function does
-    # not otherwise make. This site therefore cannot self-heal on a fresh
+    # advanced_sha/landed_at) carries no task metadata. Amended by task 3057:
+    # this function DOES now make a scheduler round-trip for metadata, but
+    # only on the delivered-checks path below — i.e. only when the guard is
+    # ARMED *and* the row already reached RC-2, which is once per
+    # crash-recovered landing, never on the hot dispatch path (the
+    # overwhelmingly common no-row case returns at the caller's lookup with
+    # zero I/O). Widening it to also feed should_skip's reopen_at arm was NOT
+    # in 3057's scope, so this site still cannot self-heal on a fresh
     # reopen_at; it only re-attempts once the provenance_conflict escalation
     # is resolved. See the docstring above for the full rationale.
     if (
@@ -5971,6 +6005,42 @@ async def reconcile_landed_row(
         and provenance_conflict_sink.should_skip(row.task_id)
     ):
         return 'stale_conflict'
+    # task 3057 — delivered-capability guard on the RC-2 done-write. Ancestry
+    # above proves the branch TIP reached main; it never proves THIS task's
+    # declared capability rode along with it. Placed last so the cheap
+    # dispositions ('skipped'/'already_done_pruned'/'stale_conflict') still
+    # short-circuit with zero check work, and structurally immediately before
+    # the mark_done it guards so a later refactor cannot drift them apart.
+    if project_root is not None and check_timeout_secs is not None:
+        try:
+            task = await scheduler.get_task(row.task_id)
+        except Exception:
+            logger.warning(
+                'reconcile_landed_row: task %s metadata unreadable — '
+                'withholding the RC-2 done-write (fail-safe); row retained '
+                'for the next pass',
+                row.task_id, exc_info=True,
+            )
+            return 'delivered_checks_withheld'
+        if task is None:
+            logger.warning(
+                'reconcile_landed_row: task %s has no scheduler record — '
+                'withholding the RC-2 done-write (fail-safe); row retained '
+                'for the next pass',
+                row.task_id,
+            )
+            return 'delivered_checks_withheld'
+        if await gate_mark_done_on_delivered_checks(
+            row.task_id,
+            (task.get('metadata') or {}),
+            project_root=project_root,
+            check_timeout_secs=check_timeout_secs,
+            main_sha=main_sha,
+            enabled=delivered_checks_enabled,
+            site='landed-reconcile-rc2',
+            log=logger,
+        ) is not None:
+            return 'delivered_checks_withheld'
     try:
         await scheduler.mark_done(row.task_id, kind='merged', sha=row.advanced_sha)
     except StaleEvidenceRejection as exc:
@@ -6021,6 +6091,9 @@ async def reconcile_landed_task(
     scheduler: Any,
     outbox: LandedOutbox,
     provenance_conflict_sink: Any = None,
+    project_root: str | Path | None = None,
+    check_timeout_secs: float | None = None,
+    delivered_checks_enabled: bool = True,
 ) -> bool:
     """Single-task landed-outbox consult for the scheduler dispatch gate (task 2156, W1 δ / SD-1).
 
@@ -6049,10 +6122,18 @@ async def reconcile_landed_task(
     via ``'skipped'``, or gate via ``'stale_conflict'`` — task 2677: a
     contested task under provenance-conflict arbitration must never
     dispatch) has already happened inline via ``reconcile_landed_row``.
-    Returns ``False`` when there is no row, or when the row's disposition is
+    Returns ``False`` when there is no row, when the row's disposition is
     ``'pruned_not_landed'`` — the task never actually landed (crash before
     the CAS advance), so it stays normally dispatchable and its stale row
-    has already been pruned.
+    has already been pruned — or when it is ``'delivered_checks_withheld'``
+    (task 3057): the RC-2 done-write was refused because the task's declared
+    ``metadata.delivered_checks`` are not verifiably on main, and the correct
+    recovery is precisely to DISPATCH so an agent delivers them. Gating there
+    would wedge the task forever, converting a would-be misattribution into a
+    permanent strand. The three delivered-checks params are forwarded
+    verbatim to :func:`reconcile_landed_row`; leaving *project_root* /
+    *check_timeout_secs* at their ``None`` defaults keeps the guard unarmed
+    and this function byte-identical to its pre-3057 behavior.
     """
     row = outbox.lookup(task_id)
     if row is None:
@@ -6061,8 +6142,11 @@ async def reconcile_landed_task(
     disposition = await reconcile_landed_row(
         row, git_ops=git_ops, scheduler=scheduler, outbox=outbox, main_sha=main_sha,
         provenance_conflict_sink=provenance_conflict_sink,
+        project_root=project_root,
+        check_timeout_secs=check_timeout_secs,
+        delivered_checks_enabled=delivered_checks_enabled,
     )
-    return disposition != 'pruned_not_landed'
+    return disposition not in ('pruned_not_landed', 'delivered_checks_withheld')
 
 
 async def reconcile_landed_outbox(
@@ -6070,6 +6154,9 @@ async def reconcile_landed_outbox(
     git_ops: Any,
     scheduler: Any,
     provenance_conflict_sink: Any = None,
+    project_root: str | Path | None = None,
+    check_timeout_secs: float | None = None,
+    delivered_checks_enabled: bool = True,
 ) -> dict[str, int]:
     """Scan *outbox* at startup and reconcile every unconsumed row (task 2155, W1 γ).
 
@@ -6106,6 +6193,15 @@ async def reconcile_landed_outbox(
     self-cleaning at the next boot and never a phantom-done risk — and is
     additionally guarded against an RC-2 re-done by the server-side
     reopen-freshness gate.
+
+    The three delivered-checks params (task 3057) are forwarded verbatim to
+    :func:`reconcile_landed_row`, which arms its RC-2 capability guard only
+    when BOTH *project_root* and *check_timeout_secs* are supplied. A refused
+    done-write is tallied under ``'delivered_checks_withheld'`` — a
+    first-class disposition, NOT an error — and its row is deliberately left
+    unconsumed so the next pass re-evaluates it. The key is always present in
+    the report (initialised to 0) so a reader never has to distinguish
+    "absent" from "none withheld".
     """
     report = {
         'pruned_not_landed': 0,
@@ -6113,6 +6209,7 @@ async def reconcile_landed_outbox(
         'already_done_pruned': 0,
         'skipped': 0,
         'stale_conflict': 0,
+        'delivered_checks_withheld': 0,
         'errors': 0,
     }
     main_sha = await git_ops.get_main_sha()
@@ -6121,6 +6218,9 @@ async def reconcile_landed_outbox(
             disposition = await reconcile_landed_row(
                 row, git_ops=git_ops, scheduler=scheduler, outbox=outbox, main_sha=main_sha,
                 provenance_conflict_sink=provenance_conflict_sink,
+                project_root=project_root,
+                check_timeout_secs=check_timeout_secs,
+                delivered_checks_enabled=delivered_checks_enabled,
             )
             report[disposition] += 1
         except Exception:

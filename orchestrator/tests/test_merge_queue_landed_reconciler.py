@@ -243,6 +243,9 @@ class TestReconcileLandedOutboxRobustness:
             'already_done_pruned': 0,
             'skipped': 0,
             'stale_conflict': 0,
+            # task 3057 — every disposition key is present at zero so a report
+            # reader never has to distinguish "absent" from "none of these".
+            'delivered_checks_withheld': 0,
             'errors': 0,
         }
         scheduler.get_status.assert_not_called()
