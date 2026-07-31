@@ -265,3 +265,85 @@ class TestSimpleTaskPromptEnumeratesNewExits:
             f'Expected the mark_step_committed guidance to mention "pending" '
             f'or "committed". Window: {window!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-7 RED: BriefingAssembler dispatch-time prompts enumerate both new exits
+# ---------------------------------------------------------------------------
+#
+# Separate from the roles.py system_prompt strings covered above: these are
+# the dispatch-time briefings TaskWorkflow actually sends for the
+# partial-plan-resume path (build_plan_completion_prompt) and the SIMPLE_TASK
+# path (build_simple_task_prompt). Fixture shape mirrors test_briefing.py's
+# `briefing` fixture (BriefingAssembler over a tmp_path project_root);
+# `context=''` bypasses the real fused-memory search call, matching the
+# convention used throughout test_briefing.py for methods that accept a
+# `context` override.
+
+
+@pytest.fixture
+def briefing(tmp_path: Path):
+    from orchestrator.agents.briefing import BriefingAssembler  # noqa: PLC0415
+    from orchestrator.config import GitConfig, OrchestratorConfig  # noqa: PLC0415
+
+    config = OrchestratorConfig(
+        project_root=tmp_path,
+        git=GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+        ),
+    )
+    return BriefingAssembler(config)
+
+
+def _partial_plan_with_pending_steps() -> dict:
+    return {
+        'task_id': '3822',
+        'title': 'Add recon closure',
+        'files': ['recon.py'],
+        'analysis': 'partial analysis',
+        'prerequisites': [],
+        'steps': [
+            {'id': 'step-1', 'type': 'test', 'description': 'test a',
+             'status': 'pending', 'commit': None},
+            {'id': 'step-2', 'type': 'impl', 'description': 'impl a',
+             'status': 'pending', 'commit': None},
+        ],
+    }
+
+
+@pytest.mark.asyncio
+class TestBriefingPromptsEnumerateNewExits:
+    async def test_plan_completion_prompt_names_report_ready_to_merge(self, briefing):
+        """Path-c rejection-exit list (briefing.py, build_plan_completion_prompt)
+        must offer report_ready_to_merge alongside the pre-existing three."""
+        task = {'id': '3822', 'title': 'Add recon closure', 'description': 'Demo'}
+        prompt = await briefing.build_plan_completion_prompt(
+            task, _partial_plan_with_pending_steps(), worktree=None, context='',
+        )
+        assert 'report_ready_to_merge' in prompt
+
+    async def test_plan_completion_prompt_names_mark_step_committed_for_partial_resume(
+        self, briefing,
+    ):
+        """Finishing a partial plan must also teach pre-satisfying steps the
+        branch already carries green commits for, instead of leaving them
+        pending — the same guidance build_architect_prompt gives on fresh
+        derivation."""
+        task = {'id': '3822', 'title': 'Add recon closure', 'description': 'Demo'}
+        prompt = await briefing.build_plan_completion_prompt(
+            task, _partial_plan_with_pending_steps(), worktree=None, context='',
+        )
+        assert 'mark_step_committed' in prompt
+
+    async def test_simple_task_prompt_names_report_ready_to_merge(self, briefing):
+        """The SIMPLE_TASK dispatch briefing's only exit sentence currently
+        names just report_unactionable_task; it must also teach
+        report_ready_to_merge for the branch-complete-but-unmerged case."""
+        task = {'id': '77', 'title': 'Small fix', 'description': 'Demo'}
+        prompt = await briefing.build_simple_task_prompt(
+            task, worktree=None, context='',
+        )
+        assert 'report_ready_to_merge' in prompt
