@@ -2,17 +2,18 @@
 """Dashboard availability watchdog — hysteresis probe with a storm escape.
 
 Replaces the single-sample inline shell that shipped as
-``dark-factory-dashboard-watchdog.service``'s ``ExecStart``:
+``dark-factory-dashboard-watchdog.service``'s ``ExecStart``: a one-line
+``curl ... || systemctl --user restart`` that probed the DEEP, DB-touching
+health endpoint (three 5s DB probes) and restarted the dashboard on a SINGLE
+miss, with no rate ceiling — which on 2026-07-30 produced 192 restarts in 3
+hours (~27% downtime) from a dashboard that was merely slow, not dead. It was
+also a contract-in-prose (INV-1): the supervision policy lived inside an
+``sh -c`` string with no test able to reach it.
 
-    /bin/sh -c 'curl -sf --max-time 5 http://127.0.0.1:8080/healthz ||
-                systemctl --user restart dark-factory-dashboard.service'
-
-That one-liner probed the DEEP ``/healthz`` endpoint (three 5s DB probes) and
-restarted the dashboard on a SINGLE miss, with no rate ceiling — which on
-2026-07-30 produced 192 restarts in 3 hours (~27% downtime) from a dashboard
-that was merely slow, not dead. It was also a contract-in-prose (INV-1): the
-supervision policy lived inside an ``sh -c`` string with no test able to reach
-it.
+The retired endpoint is named nowhere in this file on purpose — its literal
+absence is asserted by
+``tests/scripts/test_dashboard_watchdog.py::test_healthz_appears_nowhere_in_the_source``
+so no future edit can quietly route the probe back to it.
 
 The real contract this file implements is
 ``plans/dashboard-availability-prd.md`` §Contract — the supervision seam.
@@ -59,3 +60,115 @@ streak, grace, ceiling, unit-file contract) and
 asserted against the REAL born-at-L2 writer, which ``tests/scripts/`` cannot
 import).
 """
+
+import os
+
+# ---------------------------------------------------------------------------
+# Contract constants — plans/dashboard-availability-prd.md §Contract.
+#
+# Numeric values are env-overridable using the same
+# ``try: int(os.environ[...]) except (KeyError, ValueError)`` shape as
+# scripts/orchestrator-watchdog.py's STALENESS_GRACE_SECS: a typo'd env var
+# must fall back to the default, never crash the oneshot.
+# ---------------------------------------------------------------------------
+
+#: Repo checkout the watchdog supervises. Hardcoded rather than derived from
+#: __file__ so a stray copy of this script cannot silently supervise a
+#: different tree; mirrors orchestrator-watchdog.py:REPO_DIR.
+REPO_DIR = "/home/leo/src/dark-factory"
+
+#: §Contract "target": the unit this watchdog restarts. Its drain is bounded by
+#: task 3306 (--timeout-graceful-shutdown 8 under TimeoutStopSec=15).
+DASHBOARD_UNIT = "dark-factory-dashboard.service"
+
+#: §Contract "probe": the SHALLOW liveness endpoint — dashboard/src/dashboard/
+#: app.py's ``@app.get('/api/health') -> {'status': 'ok'}``, no DB access. The
+#: deep DB-probing sibling immediately below it in that file is what the
+#: retired inline shell used; see probe_health() for the fail-direction.
+PROBE_URL = os.environ.get(
+    "DASHBOARD_WATCHDOG_PROBE_URL", "http://127.0.0.1:8080/api/health"
+)
+
+#: §Contract "probe": seconds a single probe may take before it counts as a
+#: failure. Well above the shallow handler's real latency (no I/O), well below
+#: the timer's 30s cadence so a hung probe cannot overlap the next tick.
+try:
+    PROBE_TIMEOUT = int(os.environ["DASHBOARD_WATCHDOG_PROBE_TIMEOUT"])
+except (KeyError, ValueError):
+    PROBE_TIMEOUT = 5
+
+#: §Contract "grace": a unit that activated less than this many seconds ago is
+#: not probed at all (invariant I5 — never act on a probe that was not run),
+#: and its streak is reset. Covers uvicorn startup plus the SPA mount.
+try:
+    GRACE_SECS = int(os.environ["DASHBOARD_WATCHDOG_GRACE_SECS"])
+except (KeyError, ValueError):
+    GRACE_SECS = 60
+
+#: §Contract "hysteresis": consecutive failed probes required before ANY
+#: actuation. 3 × the timer's OnUnitActiveSec=30 sets the ~90s
+#: sustained-outage detection latency. This is the constant name the task's
+#: sidecar delivered_check greps ``scripts/`` for — do not rename it.
+try:
+    FAIL_STREAK = int(os.environ["DASHBOARD_WATCHDOG_FAIL_STREAK"])
+except (KeyError, ValueError):
+    FAIL_STREAK = 3
+
+#: §Contract "ceiling": restarts permitted inside one rolling
+#: RATE_WINDOW_SECS. Deliberately a SEPARATE constant from FAIL_STREAK even
+#: though both are 3 today — one counts consecutive failed probes, the other
+#: counts restarts in a window. Reaching this ceiling files one born-at-L2
+#: escalation and STOPS restarting (INV-4, the storm escape).
+try:
+    MAX_RESTARTS = int(os.environ["DASHBOARD_WATCHDOG_MAX_RESTARTS"])
+except (KeyError, ValueError):
+    MAX_RESTARTS = 3
+
+#: §Contract "ceiling": width of the ROLLING window the restart count is
+#: measured over (1h). Rolling, not lifetime: epochs older than this are
+#: pruned, so a service that misbehaves once a day never trips the ceiling.
+try:
+    RATE_WINDOW_SECS = int(os.environ["DASHBOARD_WATCHDOG_RATE_WINDOW_SECS"])
+except (KeyError, ValueError):
+    RATE_WINDOW_SECS = 3600
+
+#: Persisted tick state: ``{"streak": int, "restarts": [epoch, ...],
+#: "ceiling_open": bool}``. Every timer tick is a FRESH oneshot process, so
+#: none of this can live in memory. Sits under the root-anchored ``/data/``
+#: gitignore.
+STATE_PATH = os.environ.get(
+    "DASHBOARD_WATCHDOG_STATE",
+    os.path.join(REPO_DIR, "data", "dashboard-watchdog", "state.json"),
+)
+
+#: File-backed escalation queue the storm escape writes into — the same
+#: directory dark-factory-orchestrator.yaml:116 configures as
+#: ``escalation.queue_dir``, so the record is visible to the dashboard and the
+#: escalation server without an MCP round-trip.
+ESCALATION_QUEUE_DIR = os.environ.get(
+    "DASHBOARD_WATCHDOG_QUEUE_DIR", os.path.join(REPO_DIR, "data", "escalations")
+)
+
+#: String-sentinel task id for an infra escalation with no owning task,
+#: following the ``pipeline-landing-tripwire-{sha12}`` precedent in
+#: orchestrator/src/orchestrator/merge_skew_tripwire.py — so the L2 is not
+#: misattributed to an unrelated numeric task.
+ESCALATION_TASK_SENTINEL = "dashboard-watchdog-restart-ceiling"
+
+#: Must carry a ``harness-``/``orchestrator-`` prefix: escalation/src/
+#: escalation/submit.py REJECTS a non-sentinel role at the argparse boundary,
+#: because the CLI stamps level=2 directly and bypasses the server's chokepoint.
+ESCALATION_AGENT_ROLE = "harness-dashboard-watchdog"
+
+#: Must be a member of escalation.models.BORN_AT_L2_SEVERITIES ('critical',
+#: 'urgent') — submit.py restricts --severity to those via argparse choices.
+ESCALATION_SEVERITY = "critical"
+
+#: Escalation category. 'infra_issue' matches the escalate_* category
+#: vocabulary a dashboard/steward reader expects for a supervision failure.
+ESCALATION_CATEGORY = "infra_issue"
+
+#: uv launcher used to run ``escalation submit`` in the escalation project's
+#: own environment — this script is stdlib-only and cannot import escalation.
+#: Default matches dashboard/dark-factory-dashboard.service's ExecStart.
+UV_BIN = os.environ.get("DASHBOARD_WATCHDOG_UV_BIN", "/home/leo/.local/bin/uv")
