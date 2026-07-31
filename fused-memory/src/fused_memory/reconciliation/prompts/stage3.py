@@ -26,9 +26,16 @@ Your findings will be addressed in the next reconciliation cycle's Stage 1 and S
 - `mcp__fused-memory__get_status` — health check for backends
 - `mcp__fused-memory__get_statuses` — **PRIMARY task enumerator.** Returns \
   `{{'statuses': {{id: status, ...}}}}` — a compact status map (~95% smaller than \
-  get_tasks, ~62 KB vs ~600 KB). Proven safe on projects with 4500+ tasks. **Always \
-  call this first** and unwrap via `result['statuses']` to enumerate all task IDs and \
-  statuses; then call `get_task` for per-task detail only on the sampled or flagged subset.
+  get_tasks, ~62 KB vs ~600 KB). **Always call this first** and unwrap via \
+  `result['statuses']` to enumerate all task IDs and statuses; then call `get_task` \
+  for per-task detail only on the sampled or flagged subset. \
+  **Paginate on large projects:** pass `page_size` and `offset` — \
+  `get_statuses(project_root=..., page_size=1000, offset=0)` — then increment offset \
+  by page_size until `pagination['has_more']` is False, merging the pages into one \
+  status map before enumerating. If you call it WITHOUT `page_size` on a project above \
+  the auto-page limit, you get back only a FIRST PAGE plus a `pagination` dict with \
+  `auto_paginated: true` and `has_more: true` — that is NOT the full census, so keep \
+  paging. The ABSENCE of a `pagination` key means the response is complete.
 - `mcp__fused-memory__get_task` — get a single task by ID (carries `project_id` stamp \
   for cross-project routing verification — see routing guard below).
 - `mcp__fused-memory__get_tasks` — **Full-scan fallback only.** Returns the full task \
@@ -263,9 +270,17 @@ and the data is from another project. Include the offending task IDs in your des
 
 Example verification (pseudocode — preferred get_statuses + get_task pattern):
 ```
-# Step 1: enumerate all statuses (compact, safe on large projects)
+# Step 1: enumerate all statuses (compact), paging to completion
 # get_statuses returns {{'statuses': {{id: status, ...}}}} — unwrap the envelope
-statuses = get_statuses(project_root="<this project's root>")['statuses']
+statuses = {{}}
+offset = 0
+while True:
+    page = get_statuses(project_root="<this project's root>",
+                        page_size=1000, offset=offset)
+    statuses.update(page['statuses'])   # unwrap and merge this page
+    if not page.get('pagination', {{}}).get('has_more'):
+        break                           # no pagination key => response complete
+    offset += 1000
 # statuses is now the bare {{id: status, ...}} dict — no project_id stamp here
 
 # Step 2: verify routing by sampling one task via get_task
