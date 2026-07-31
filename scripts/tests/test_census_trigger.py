@@ -15,6 +15,7 @@ import json
 import logging
 import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 import yaml
@@ -605,6 +606,60 @@ def test_default_status_fetcher_sends_streamable_http_accept_headers(tmp_path, m
     envelope = captured_kwargs.get("json") or {}
     assert envelope.get("method") == "tools/call"
     assert envelope.get("params", {}).get("name") == "get_statuses"
+
+
+def _capture_get_statuses_project_root(monkeypatch, project_root):
+    """Drive `default_status_fetcher(project_root)` against a fake httpx and
+    return the `project_root` argument it actually put on the wire. Reuses
+    the `_FakeHttpxResponse` + sys.modules injection harness above (the
+    `import httpx` inside `_fetch` is lazy precisely so this works)."""
+    captured_kwargs = {}
+    fake_httpx = type(sys)("httpx")
+
+    def _fake_post(url, **kwargs):
+        captured_kwargs.update(kwargs)
+        return _FakeHttpxResponse(
+            {"jsonrpc": "2.0", "id": 1, "result": {"structuredContent": {"statuses": {}}}}
+        )
+
+    fake_httpx.post = _fake_post
+    monkeypatch.setitem(sys.modules, "httpx", fake_httpx)
+
+    ct.default_status_fetcher(project_root)()
+    return captured_kwargs["json"]["params"]["arguments"]["project_root"]
+
+
+def test_default_status_fetcher_sends_absolute_project_root_for_dot(tmp_path, monkeypatch):
+    """Task 3291 root cause. fused-memory's `_normalize_project_root` hard-
+    rejects ANY relative path -- verified live against localhost:8002, which
+    answered `{"project_root": "."}` with
+    `{"error": "project_root must be a non-empty absolute path, got: '.'",
+      "error_type": "ValidationError"}`.
+
+    In production that call ALWAYS carried a relative path: census.py's CLI
+    defaults `--project-root` to `"."`, and `nightly._default_census_launcher`
+    (nightly.py:521) launches census.py with no arguments at all. The MCP
+    argument is resolved by the SERVER's cwd, not the client's, so a relative
+    path is meaningless over the wire."""
+    monkeypatch.chdir(tmp_path)
+
+    sent = _capture_get_statuses_project_root(monkeypatch, ".")
+
+    assert sent == str(tmp_path.resolve())
+    assert Path(sent).is_absolute()
+
+
+def test_default_status_fetcher_sends_absolute_project_root_for_relative_subdir(
+    tmp_path, monkeypatch
+):
+    """Second case so the fix cannot pass by special-casing `"."` alone."""
+    (tmp_path / "sub" / "dir").mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+
+    sent = _capture_get_statuses_project_root(monkeypatch, "sub/dir")
+
+    assert sent == str((tmp_path / "sub" / "dir").resolve())
+    assert Path(sent).is_absolute()
 
 
 # ---------------------------------------------------------------------------
