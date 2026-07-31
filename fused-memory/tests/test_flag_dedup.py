@@ -6501,15 +6501,46 @@ class TestDedupFlagsLedgerMarkerPath:
 # module-surface contract — dead compensation code removed (task 2227 step-11)
 #
 # RED until step-12 deletes confirm_marker_persisted, _write_and_confirm_marker,
-# _marker_query, _CONFIRMATION_MISS_THRESHOLD, _CONFIRM_RETRY_DELAY_SECS and
-# strips their now-dead references out of dedup_flags' source. _is_completion_flag
-# must survive the cleanup (task-2312 completion-marker self-delete stays).
+# _marker_query, _CONFIRMATION_MISS_THRESHOLD and _CONFIRM_RETRY_DELAY_SECS from
+# the module. _is_completion_flag must survive the cleanup (task-2312
+# completion-marker self-delete stays).
+#
+# SCOPE (narrowed by task 3351): these are module-surface SYMBOL-removal checks
+# only — hasattr on the module, nothing more. Two companion tests that scanned
+# dedup_flags' SOURCE TEXT for banned/required tokens were deleted; the runtime
+# behavior they stood in for is pinned by real tests, listed on the class
+# docstring below.
 # ---------------------------------------------------------------------------
 
 
 class TestModuleSurfaceCompensationsRemoved:
     """Pins that the Mem0 compensation chain is fully deleted from the module
-    surface while the task-2312 completion-marker predicate survives."""
+    surface while the task-2312 completion-marker predicate survives.
+
+    These tests assert only that the module no longer EXPORTS the retired
+    symbols (and still exports ``_is_completion_flag``).  They deliberately do
+    not inspect ``dedup_flags``' source — task 3351 removed the two
+    ``inspect.getsource`` token scans that did, as brittle (a comment mentioning
+    a banned token tripped them) and incomplete (a circuit breaker under
+    different local names, or ``limit = 50``, kept them green; measured — both
+    stayed green against a real injected circuit breaker).
+
+    Where the behavior is actually pinned:
+
+    - no in-batch ``seen_signatures`` memo —
+      ``test_duplicate_completion_signature_in_batch_self_annotates_each_occurrence``
+    - no Mem0 search/delete, no ``limit=50`` reclamation, and no per-invocation
+      circuit breaker that halts marker writes mid-batch —
+      ``test_recurring_marker_path_never_touches_mem0_search_or_delete`` (across
+      recurring cycles) and ``test_large_batch_writes_a_marker_for_every_flag_with_no_mem0_io``
+      (across a 60-flag batch of distinct signatures)
+    - retired module constants (``_CONFIRMATION_MISS_THRESHOLD``,
+      ``_CONFIRM_RETRY_DELAY_SECS``) — the surviving hasattr tests in this class
+    - the task-2312 ``completion_marker_self_deleted`` annotation, formerly
+      required by a source scan — asserted on real returned flags at seven
+      call sites across ``TestIsCompletionFlag`` (four, one of them negative)
+      and ``TestDedupFlagsLedgerMarkerPath`` (three)
+    """
 
     def test_confirm_marker_persisted_removed(self):
         import fused_memory.reconciliation.flag_dedup as fd
@@ -6557,35 +6588,6 @@ class TestModuleSurfaceCompensationsRemoved:
         assert hasattr(fd, '_is_completion_flag'), (
             '_is_completion_flag (task-2312) must survive the compensation '
             'cleanup — the completion-marker self-delete branch depends on it.'
-        )
-
-    def test_dedup_flags_source_free_of_compensation_machinery(self):
-        import inspect
-
-        import fused_memory.reconciliation.flag_dedup as fd
-
-        source = inspect.getsource(fd.dedup_flags)
-        for banned in (
-            'seen_signatures',
-            'confirmation_disabled',
-            'consecutive_confirmation_misses',
-            'confirm_marker_persisted',
-            'limit=50',
-        ):
-            assert banned not in source, (
-                f'dedup_flags source must not reference {banned!r} — the '
-                'ledger UPSERT replaced the compensation chain that used it.'
-            )
-
-    def test_dedup_flags_source_retains_completion_marker_annotation(self):
-        import inspect
-
-        import fused_memory.reconciliation.flag_dedup as fd
-
-        source = inspect.getsource(fd.dedup_flags)
-        assert 'completion_marker_self_deleted' in source, (
-            'dedup_flags source must still annotate completion_marker_self_deleted '
-            '— the task-2312 completion branch must survive the cleanup.'
         )
 
 
