@@ -46,6 +46,16 @@ make the loser invisible everywhere in the payload — no row link and no
 ``unmatched_escalations`` entry — which is exactly the silent degradation the
 parity view exists to catch.
 
+Index FILTERS are held to the same standard, with one deliberate exception.
+Skipping a ``resolved`` / ``dismissed`` escalation, or an escalation from
+another category, is the filter doing its job — the record is not wanted, so
+its absence is not a loss and earns no issue.  Skipping a record the reader
+cannot CLASSIFY is a genuine discard and is named
+(``unknown_escalation_status``).  The openness test is positive (``status`` is
+``pending``) rather than a blocklist of closed states, so a status vocabulary
+that grows a new terminal state fails toward "not shown as open" rather than
+toward a closed alarm rendered as live.
+
 **Same-host file reads (DD1).**  The dashboard and the eval runner share a
 filesystem; there is no RPC in this path.
 """
@@ -68,6 +78,16 @@ logger = logging.getLogger(__name__)
 # dedupe_fingerprint; joining it would attribute someone else's alert to a
 # memory-eval metric.
 _EVAL_REGRESSION_CATEGORY = 'eval_regression'
+
+# Openness is a POSITIVE test on this value, not the absence of a closed one:
+# a status vocabulary that grows a new terminal state must not silently start
+# rendering as open.  `park()` keeps a genuinely-open L2 at 'pending', so a
+# parked escalation still joins.
+_OPEN_ESCALATION_STATUS = 'pending'
+
+# The known terminal states.  Skipping one is the filter working as intended,
+# so — unlike an unrecognised status — it is not recorded as a discard.
+_CLOSED_ESCALATION_STATUSES = frozenset({'resolved', 'dismissed'})
 
 # One screen of trend == one alpha-derivation window.  Matches
 # ``runs_per_quarter=90`` in the committed limits artifact, which is what the
@@ -289,12 +309,18 @@ def _read_verdicts(
     second vocabulary to keep in sync with the evaluator's, and the first
     divergence would silently mislabel an alarm.
 
-    All three disposal paths are NAMED: absent is ``missing_verdicts``, a parse
-    failure is ``unreadable_verdicts`` (recorded by the caller's handler), and
-    an artifact that parses but is not an object is ``malformed_verdicts``.
-    That third path matters most: a discarded verdicts body leaves every row's
-    verdict absent, which is indistinguishable from a healthy no-alarm tree
-    unless the discard is recorded.
+    Every disposal path is NAMED: absent is ``missing_verdicts``, a parse
+    failure is ``unreadable_verdicts`` (recorded by the caller's handler), a
+    body that parses but is not an object — or is an object whose ``entries``
+    is absent or not a list — is ``malformed_verdicts``, and an individual
+    non-object element is ``malformed_verdict_entry``.  The ``entries`` paths
+    matter most: a discarded verdicts body leaves every row's verdict absent,
+    which is indistinguishable from a healthy no-alarm tree unless the discard
+    is recorded.
+
+    A malformed ``entries`` does NOT suppress ``storm_escape``: the storm block
+    is run-scoped and parses independently, so dropping it too would turn one
+    named degradation into a second silent one.
     """
     path = root / 'verdicts-current.json'
     if not path.is_file():
@@ -328,9 +354,38 @@ def _read_verdicts(
         )
         return {}, None
 
+    entries = body.get('entries')
+    if entries is None:
+        # Absent entirely — same standing as a body of the wrong type: every
+        # row's verdict goes absent, which reads exactly like a healthy
+        # no-alarm tree unless the discard is named.
+        _issue(
+            issues, 'malformed_verdicts', path=path,
+            detail='expected an "entries" list, got no such field',
+        )
+        entries = []
+    elif not isinstance(entries, list):
+        # The body IS an object but `entries` is not a list.  Iterating it
+        # directly would walk a dict's KEYS (or a string's characters), fail
+        # every `isinstance(entry, dict)` test below, and yield an empty index
+        # with no signal anywhere — the costly silent discard this reader
+        # exists to prevent.  Named, then treated as empty.
+        _issue(
+            issues, 'malformed_verdicts', path=path,
+            detail=f'expected a list "entries" field, got {type(entries).__name__}',
+        )
+        entries = []
+
     index: dict[tuple[str, str], dict[str, Any]] = {}
-    for entry in body.get('entries') or []:
+    for entry in entries:
         if not isinstance(entry, dict):
+            # A non-object element cannot carry an (eval_id, metric_id) key, so
+            # it can never link a row.  Named rather than dropped, per the
+            # module's no-silent-discard invariant.
+            _issue(
+                issues, 'malformed_verdict_entry', path=path,
+                detail=f'entries element is {type(entry).__name__}, not an object; skipped',
+            )
             continue
         eval_id = entry.get('eval_id')
         metric_id = entry.get('metric_id')
@@ -402,12 +457,29 @@ def _index_escalations(
     """Index open ``eval_regression`` escalations by ``dedupe_fingerprint``.
 
     Reuses :func:`dashboard.data.escalations.load_queue_escalations` (INV-5 —
-    a call site, never a second reader).  Its existing contracts carry this
-    join: a missing dir returns ``[]`` so the no-queue case needs no guard,
-    unparseable files are skipped and logged so a corrupt escalation cannot
-    crash the join, and the archive subtree is NOT walked — so only PENDING
-    escalations are joined, which is exactly what the "still-open" parity
-    states mean.
+    a call site, never a second reader).  Its existing contracts carry most of
+    this join: a missing dir returns ``[]`` so the no-queue case needs no
+    guard, and unparseable files are skipped and logged so a corrupt
+    escalation cannot crash the join.
+
+    Openness is filtered EXPLICITLY on ``status``, not inferred from the fact
+    that ``load_queue_escalations`` skips the archive subtree.  That inference
+    does not hold: ``escalation.queue._archive_resolved`` is best-effort — on
+    ``OSError`` it logs a warning and leaves the RESOLVED record in the queue
+    root — and ``dashboard.data.escalations._bucket`` counts ``resolved`` /
+    ``dismissed`` among the very records this same reader returns.  Without the
+    filter a closed alarm renders as ``alarmed_open``, and a closed orphan
+    renders as a still-open ``unmatched_escalations`` entry — the parity view
+    reporting the exact falsehood it exists to catch.
+
+    The test is POSITIVE (``status`` is ``pending``) rather than a blocklist of
+    closed values, so a status vocabulary that grows a new terminal state does
+    not silently start rendering as open.  ``park()`` deliberately keeps
+    ``status='pending'`` for a genuinely-open L2, so a parked escalation still
+    joins.  A record with no ``status`` at all is treated as pending, matching
+    the ``Escalation.status`` model default.  An UNRECOGNISED status is skipped
+    and NAMED — that skip is a real discard, unlike the resolved/dismissed case
+    which is the filter doing its job.
 
     Matching is ``==`` over the WHOLE fingerprint string.  The fingerprint is
     the producer's private construction; nothing here parses its substructure,
@@ -427,6 +499,20 @@ def _index_escalations(
         if not isinstance(record, dict):
             continue
         if record.get('category') != _EVAL_REGRESSION_CATEGORY:
+            continue
+        status = record.get('status')
+        if status is not None and status != _OPEN_ESCALATION_STATUS:
+            if status in _CLOSED_ESCALATION_STATUSES:
+                # The filter doing its job, not a discard: a closed escalation
+                # is precisely what must NOT render as open.
+                continue
+            _issue(
+                issues, 'unknown_escalation_status', path=escalations_dir,
+                detail=(
+                    f'escalation {record.get("id")!r} has unrecognised status {status!r}; '
+                    'not joined (only pending escalations are treated as open)'
+                ),
+            )
             continue
         fingerprint = record.get('dedupe_fingerprint')
         if isinstance(fingerprint, str) and fingerprint:

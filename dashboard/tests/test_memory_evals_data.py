@@ -1095,6 +1095,117 @@ class TestEscalationJoin:
         # No storm here, so this really is the "nothing claims it" case.
         assert unmatched[0]['reason'] == 'no_matching_verdict'
 
+    def test_resolved_escalation_is_not_rendered_as_open(self, tmp_path: Path) -> None:
+        """A CLOSED escalation must not produce an ``alarmed_open`` row.
+
+        The join originally inferred openness from ``load_queue_escalations``
+        not walking the archive subtree.  That inference does not hold:
+        ``escalation.queue._archive_resolved`` is best-effort — on ``OSError``
+        it logs a warning and leaves the resolved record in the queue root —
+        and ``dashboard.data.escalations._bucket`` counts ``resolved`` among
+        the very records this same reader returns.  A resolved alarm rendering
+        as open is the parity view asserting the exact falsehood it exists to
+        catch.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _join_tree(tmp_path)
+        # Same record, same fingerprint, same place on disk — only closed.
+        _write_escalation(
+            esc_dir, 'esc-alarmed-open',
+            dedupe_fingerprint=_FP_ALARMED_OPEN,
+            summary='canonical-in-top-5 regressed', severity='blocking', level=1,
+            timestamp=_JOIN_ESC_TIMESTAMP,
+            status='resolved', resolved_at='2026-07-30T04:00:00+00:00',
+        )
+
+        payload = build_memory_evals(root, esc_dir)
+        row = _only(payload['evals'][0]['metrics'], 'alarmed-open')
+
+        assert row['escalation'] is None
+        assert row['parity'] == 'alarmed_unlinked'
+        # And the reverse direction: a closed escalation is not a still-open
+        # orphan either, so it must not appear as unmatched.
+        assert 'esc-alarmed-open' not in [e['id'] for e in payload['unmatched_escalations']]
+        # Excluding a KNOWN terminal state is the filter working, not a
+        # discard — so it is not reported as an issue.
+        assert payload['issue_count'] == len(payload['issues']) == 0
+
+    def test_dismissed_escalation_is_not_rendered_as_open(self, tmp_path: Path) -> None:
+        """``dismissed`` is the other known terminal state, and is treated alike."""
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _join_tree(tmp_path)
+        _write_escalation(
+            esc_dir, 'esc-recovered-open',
+            dedupe_fingerprint=_FP_RECOVERED_OPEN,
+            summary='dangling-pointers regressed', severity='blocking', level=0,
+            timestamp=_JOIN_ESC_TIMESTAMP,
+            status='dismissed',
+        )
+
+        payload = build_memory_evals(root, esc_dir)
+        row = _only(payload['evals'][0]['metrics'], 'recovered-open')
+
+        assert row['escalation'] is None
+        assert row['parity'] == 'clear'
+        assert payload['issue_count'] == 0
+
+    def test_escalation_with_no_status_field_still_joins(self, tmp_path: Path) -> None:
+        """Absent ``status`` reads as pending, matching the model default.
+
+        ``Escalation.status`` defaults to ``'pending'``, so a record that omits
+        the field is an open one — the filter must not swallow it.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _join_tree(tmp_path)
+        body = json.loads((esc_dir / 'esc-alarmed-open.json').read_text())
+        del body['status']
+        (esc_dir / 'esc-alarmed-open.json').write_text(json.dumps(body))
+
+        payload = build_memory_evals(root, esc_dir)
+        row = _only(payload['evals'][0]['metrics'], 'alarmed-open')
+
+        assert row['parity'] == 'alarmed_open'
+        assert row['escalation']['id'] == 'esc-alarmed-open'
+        assert payload['issue_count'] == 0
+
+    def test_unrecognised_status_is_skipped_and_named(self, tmp_path: Path) -> None:
+        """The openness test is POSITIVE, and the resulting skip is a real discard.
+
+        A status vocabulary that grows a new terminal state must not silently
+        start rendering as open — hence the positive ``pending`` test rather
+        than a blocklist of closed values.  But unlike ``resolved`` /
+        ``dismissed``, an unrecognised value drops a record the reader cannot
+        classify, so it is NAMED (the module's no-silent-discard invariant).
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _join_tree(tmp_path)
+        _write_escalation(
+            esc_dir, 'esc-alarmed-open',
+            dedupe_fingerprint=_FP_ALARMED_OPEN,
+            summary='canonical-in-top-5 regressed', severity='blocking', level=1,
+            timestamp=_JOIN_ESC_TIMESTAMP,
+            status='quarantined',
+        )
+
+        payload = build_memory_evals(root, esc_dir)
+        row = _only(payload['evals'][0]['metrics'], 'alarmed-open')
+
+        # Not joined: unknown openness must not be rendered as open.
+        assert row['escalation'] is None
+        assert row['parity'] == 'alarmed_unlinked'
+
+        assert payload['issue_count'] == len(payload['issues']) == 1
+        issue = payload['issues'][0]
+        assert issue['kind'] == 'unknown_escalation_status'
+        # Both the id and the offending value, so an operator can find the
+        # record without re-deriving which one was dropped.
+        assert 'esc-alarmed-open' in issue['detail']
+        assert 'quarantined' in issue['detail']
+
 
 # ---------------------------------------------------------------------------
 # step-13 — storm collapse, modelled (gamma's gate owns the full matrix)
@@ -1469,6 +1580,109 @@ class TestStalenessAndDegradedStates:
         # must not read as "nothing alarmed".
         assert healthy['issue_count'] == 0
         assert payload['issue_count'] > healthy['issue_count']
+
+    def test_wrong_type_entries_is_malformed_verdicts(self, tmp_path: Path) -> None:
+        """The body is an OBJECT but ``entries`` is not a list — still a discard.
+
+        The narrower sibling of the wrong-type-body case, and the one the
+        original guard missed: iterating a dict-valued ``entries`` walks its
+        KEYS, fails every per-entry ``isinstance`` test, and yields an empty
+        index with no signal — byte-identical to a healthy no-alarm tree while
+        a real alarm sits on disk.  The guard's own detail string already
+        claimed to be checking for "an object with an 'entries' list", so the
+        intent was there but the check was not.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _healthy_tree(tmp_path)
+        healthy = build_memory_evals(root, esc_dir)
+
+        bad = _dump(root / 'verdicts-current.json', {
+            'schema_version': 1,
+            # A plausible producer bug: entries keyed by eval rather than listed.
+            'entries': {'eval-a': {'dangling-pointers': 'alarm'}},
+        })
+
+        payload = build_memory_evals(root, esc_dir)
+
+        malformed = [i for i in payload['issues'] if i['kind'] == 'malformed_verdicts']
+        assert len(malformed) == 1
+        assert malformed[0]['path'] == str(bad)
+        assert 'dict' in malformed[0]['detail']
+
+        assert all(row['verdict'] is None for row in payload['evals'][0]['metrics'])
+        # The whole point: distinguishable from the healthy tree.
+        assert healthy['issue_count'] == 0
+        assert payload['issue_count'] == len(payload['issues']) > 0
+
+    def test_absent_entries_field_is_malformed_verdicts(self, tmp_path: Path) -> None:
+        """``entries`` missing entirely has the same standing as a wrong type."""
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _healthy_tree(tmp_path)
+        _dump(root / 'verdicts-current.json', {'schema_version': 1})
+
+        payload = build_memory_evals(root, esc_dir)
+
+        malformed = [i for i in payload['issues'] if i['kind'] == 'malformed_verdicts']
+        assert len(malformed) == 1
+        # Named as absent rather than as a type, so the operator is not sent
+        # looking for a field that was never written.
+        assert 'no such field' in malformed[0]['detail']
+
+    def test_non_object_entry_is_named_not_dropped(self, tmp_path: Path) -> None:
+        """One unusable element must not vanish while its siblings are read."""
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _healthy_tree(tmp_path)
+        # Written directly rather than through `_write_verdicts`: the whole
+        # point is an element the typed helper would not let a producer emit.
+        _dump(root / 'verdicts-current.json', {
+            'schema_version': 1,
+            'run_stamp': _AGE_RUN,
+            'entries': [
+                'not-an-entry',
+                _verdict('eval-a', 'dangling-pointers', 'alarm', fingerprint='opaque-fp-1', run_stamp=_AGE_RUN),
+            ],
+        })
+
+        payload = build_memory_evals(root, esc_dir)
+
+        # The good sibling is still read — the bad element is skipped, not the file.
+        assert _only(payload['evals'][0]['metrics'], 'dangling-pointers')['verdict'] == 'alarm'
+
+        assert payload['issue_count'] == len(payload['issues']) == 1
+        assert payload['issues'][0]['kind'] == 'malformed_verdict_entry'
+        assert 'str' in payload['issues'][0]['detail']
+
+    def test_malformed_entries_does_not_suppress_the_storm_block(self, tmp_path: Path) -> None:
+        """One named degradation must not become a second silent one.
+
+        ``storm_escape`` is run-scoped and parses independently of ``entries``,
+        so a broken entries list has no bearing on whether a storm is in
+        effect — and a suppressed storm banner is exactly the kind of quiet
+        loss this reader is built to refuse.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _healthy_tree(tmp_path)
+        _dump(root / 'verdicts-current.json', {
+            'schema_version': 1,
+            'entries': 'not-a-list',
+            'storm_escape': {
+                'triggered': True,
+                'alarm_count': 7,
+                'aggregate_fingerprint': _FP_AGGREGATE,
+            },
+        })
+
+        payload = build_memory_evals(root, esc_dir)
+
+        assert payload['storm_escape'] is not None
+        assert payload['storm_escape']['triggered'] is True
+        assert payload['storm_escape']['alarm_count'] == 7
+        # And the entries breakage is still reported.
+        assert [i['kind'] for i in payload['issues']] == ['malformed_verdicts']
 
     def test_wrong_type_limits_is_malformed_limits(self, tmp_path: Path) -> None:
         """The limits reader carries the identical defect, and the same fix.
