@@ -29,6 +29,7 @@ import json
 
 from audit_wiped_metadata_files import (
     CLEAN_MERGE_SHA,
+    AuditCoverage,
     CONFIRMED_NULL_SHA_DONE_PATH,
     CONTRADICTED_REAL_MERGE_SHA,
     FIDELITY_FILE_LEVEL,
@@ -45,9 +46,16 @@ from repair_wiped_metadata_files import (
     SKIP_FILES_PRESENT,
     SKIP_MISSING,
     SKIP_NOT_TERMINAL,
+    ALL_DISPOSITIONS,
     FAILED,
+    SKIP_CONTRADICTED,
+    SKIP_LOCK_CHARTER,
+    SKIP_LOCK_LEVEL_FIDELITY,
+    RepairOutcome,
+    RepairResult,
     build_repair_payload,
     classify_live_task,
+    format_summary,
     plan_files_rejection_reason,
     repair_one,
     select_repairable_candidates,
@@ -519,6 +527,145 @@ def test_repair_one_accepts_a_plain_success_shape():
         result = asyncio.run(repair_one(client, _ROOT, _candidate(4), now_iso=_NOW))
 
         assert result.disposition == REPAIR, payload
+
+
+# ---------------------------------------------------------------------------
+# format_summary — THE HONESTY ARTIFACT.
+#
+# The candidate list is an OBSERVABLE SUBSET. Most tasks have no recoverable
+# plan scope at all and are UNKNOWN — neither clean nor damaged. A summary that
+# let a reader mistake this run for "fixed the blast radius" would be the
+# no-silent-fail-soft violation named in docs/legibility/design-invariants.md.
+# ---------------------------------------------------------------------------
+
+_COVERAGE = AuditCoverage(
+    project_root=_ROOT,
+    total_tasks=3363,
+    tasks_with_file_level_signal=951,
+    tasks_with_lock_level_signal_only=135,
+    tasks_without_plan_signal=2277,
+    plan_records_without_task=6,
+)
+
+
+def _outcome(task_id, disposition, *, detail=None, files=("a.py",)):
+    return RepairOutcome(
+        task_id=task_id,
+        tag="master",
+        disposition=disposition,
+        files=tuple(files),
+        detail=detail,
+    )
+
+
+def _result(outcomes=(), *, applied=True):
+    return RepairResult(
+        project_root=_ROOT,
+        applied=applied,
+        outcomes=list(outcomes),
+        coverage=_COVERAGE,
+    )
+
+
+def test_format_summary_prints_every_disposition_including_the_zero_ones():
+    """(a) a bucket that is merely ABSENT reads as 'did not happen' when it may
+    mean 'was never evaluated'. Every disposition gets a line with its count."""
+    summary = format_summary(_result([_outcome(1, REPAIR)]))
+
+    for disposition in ALL_DISPOSITIONS:
+        assert disposition in summary, disposition
+    # The zero buckets are printed as zero, not omitted.
+    assert f"{FAILED}" in summary
+    assert "0" in summary
+
+
+def test_format_summary_lists_each_failure_individually_with_its_error():
+    """(b) an aggregate '2 failed' is not actionable. Each id and error text
+    must appear so the operator can act without re-deriving them."""
+    summary = format_summary(
+        _result(
+            [
+                _outcome(2464, FAILED, detail="DuplicateCandidateKeyError: collides with 9999"),
+                _outcome(2465, FAILED, detail="server returned an error: lock_charter_error"),
+            ]
+        )
+    )
+
+    assert "2464" in summary and "9999" in summary
+    assert "2465" in summary and "lock_charter_error" in summary
+
+
+def test_format_summary_lists_each_lock_charter_skip_individually():
+    """(b) same for the pre-check skips — the offending path must be named."""
+    summary = format_summary(
+        _result(
+            [
+                _outcome(
+                    77,
+                    SKIP_LOCK_CHARTER,
+                    detail="directory-classified entries: orchestrator/src/orchestrator",
+                )
+            ]
+        )
+    )
+
+    assert "77" in summary
+    assert "orchestrator/src/orchestrator" in summary
+
+
+def test_format_summary_echoes_the_audit_coverage_block():
+    """(c) the coverage counts travel with the result, verbatim."""
+    summary = format_summary(_result([_outcome(1, REPAIR)]))
+
+    for count in ("3363", "951", "135", "2277"):
+        assert count in summary, count
+
+
+def test_format_summary_states_the_observable_subset_caveat_even_with_zero_repairs():
+    """(d) THE POINT. A run that repaired nothing must still say that 2277
+    tasks are UNKNOWN — neither clean nor damaged — and must not read as
+    'fixed the blast radius'."""
+    summary = format_summary(_result([]))
+
+    lowered = summary.lower()
+    assert "observable subset" in lowered
+    assert "unknown" in lowered
+    assert "neither clean nor damaged" in lowered
+    assert "2277" in summary
+
+
+def test_format_summary_labels_a_dry_run_and_says_no_write_was_attempted():
+    """(e) a dry-run summary that looked like an apply summary would let an
+    operator believe a repair landed when nothing was written."""
+    summary = format_summary(_result([_outcome(1, REPAIR)], applied=False))
+
+    lowered = summary.lower()
+    assert "dry run" in lowered or "dry-run" in lowered
+    assert "no write" in lowered or "nothing was written" in lowered
+
+
+def test_format_summary_apply_run_is_not_labelled_a_dry_run():
+    """The complement: an apply run must not carry the dry-run disclaimer."""
+    summary = format_summary(_result([_outcome(1, REPAIR)], applied=True))
+
+    assert "no write was attempted" not in summary.lower()
+
+
+def test_format_summary_reports_the_exclusions_as_decisions():
+    """A contradicted or lock-level candidate was DECIDED against, not absent.
+    Both must appear with their ids so the report and the audit agree on the
+    same population."""
+    summary = format_summary(
+        _result(
+            [
+                _outcome(3086, SKIP_CONTRADICTED, detail="null-sha row and a REAL merge sha"),
+                _outcome(3087, SKIP_LOCK_LEVEL_FIDELITY, detail="module paths, not plan.files"),
+            ]
+        )
+    )
+
+    assert "3086" in summary
+    assert "3087" in summary
 
 
 def test_classify_live_task_treats_a_non_dict_metadata_as_no_files():
