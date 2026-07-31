@@ -225,3 +225,43 @@ class TestArchitectPromptEnumeratesNewExits:
             f'Expected the escalate_blocker fall-through sentence to list '
             f'report_ready_to_merge. Window: {window!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-5 RED: SIMPLE_TASK.system_prompt enumerates both new exits
+# ---------------------------------------------------------------------------
+#
+# workflow.py:4465 routes .task/ready_to_merge.json on the simple-task path
+# with the identical handler as the architect path, so a simple-task agent
+# hitting a merge-landing desync has the same correct exit available and must
+# be taught it.
+
+
+class TestSimpleTaskPromptEnumeratesNewExits:
+    def test_rejection_artifacts_list_names_report_ready_to_merge(self):
+        from orchestrator.agents.roles import SIMPLE_TASK  # noqa: PLC0415
+
+        assert 'mcp__plan-tools__report_ready_to_merge' in SIMPLE_TASK.system_prompt
+
+    def test_report_ready_to_merge_entry_has_discriminating_keyword(self):
+        from orchestrator.agents.roles import SIMPLE_TASK  # noqa: PLC0415
+
+        window = _window_around(
+            SIMPLE_TASK.system_prompt, 'mcp__plan-tools__report_ready_to_merge',
+        )
+        assert 'fast-forward' in window, (
+            f'Expected the report_ready_to_merge entry to name the '
+            f'clean-fast-forward predicate. Window: {window!r}'
+        )
+
+    def test_prompt_names_mark_step_committed_with_pre_satisfy_guidance(self):
+        from orchestrator.agents.roles import SIMPLE_TASK  # noqa: PLC0415
+
+        assert 'mark_step_committed' in SIMPLE_TASK.system_prompt
+        window = _window_around(
+            SIMPLE_TASK.system_prompt, 'mark_step_committed(',
+        ).lower()
+        assert 'pending' in window or 'committed' in window, (
+            f'Expected the mark_step_committed guidance to mention "pending" '
+            f'or "committed". Window: {window!r}'
+        )
