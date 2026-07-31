@@ -8,6 +8,7 @@ union-aggregation of Elo ratings.
 
 from __future__ import annotations
 
+import logging
 from math import sqrt
 
 import pytest
@@ -1286,6 +1287,150 @@ class TestNoPlanCellsAreCounted:
         assert 'no_plan' in header
         assert cells[header.index('no_plan')] == '1'
 
+    def test_the_composite_table_renders_the_count(self):
+        """The count must reach the RANKING surface, not only the θ table.
+
+        format_composite_table is what select_survivors ranks on and what an
+        operator reads to compare candidates; there, a floored 0.0 is otherwise
+        indistinguishable from a badly-planned one. ``pq_no_plan`` beside
+        ``pq_excluded`` is the second of the two counts the invariant promises
+        (reviewer: design-coherence).
+        """
+        from orchestrator.evals.report import (
+            _COMPOSITE_COLUMNS,
+            build_composite_report,
+            format_composite_table,
+        )
+
+        # Pinned by index against the column tuple first, so a reorder fails
+        # here rather than silently re-aiming the cell assertion below.
+        assert _COMPOSITE_COLUMNS[4] == 'pq_excluded'
+        assert _COMPOSITE_COLUMNS[5] == 'pq_no_plan'
+        out = format_composite_table(
+            build_composite_report(self._one_no_plan_among_two())
+        )
+        header = out.splitlines()[1].split()
+        cells = _table_row_cells(out, 'arch-mixed')
+
+        assert 'pq_no_plan' in header
+        assert cells[header.index('pq_no_plan')] == '1'
+        # …and the exclusion count stays its own, disjoint cell.
+        assert cells[header.index('pq_excluded')] == '0'
+
+    def test_an_all_planning_config_renders_a_zero_count(self):
+        """The control: the column is a COUNT, not a marker that only appears
+        when it fires — a blank would read as 'not applicable'."""
+        from orchestrator.evals.report import (
+            build_composite_report,
+            format_composite_table,
+        )
+
+        results = [
+            _arch('p1', 'arch-real', tr, plan_steps=6, plan_quality=0.6,
+                  cost_usd=0.3, duration_ms=60000)
+            for tr in (1, 2, 3)
+        ]
+        out = format_composite_table(build_composite_report(results))
+        header = out.splitlines()[1].split()
+        cells = _table_row_cells(out, 'arch-real')
+        assert cells[header.index('pq_no_plan')] == '0'
+
+
+class TestTheDiscardedJudgeScoreIsLoggedNotSwallowed:
+    """The floor DISCARDS a persisted LLM-judge score — loudly, or not at all.
+
+    `_plan_quality_score`'s warning is the ONLY runtime signal that a number
+    written to disk was overridden at read time, and the two-scorer disagreement
+    it reports (Graphiti e2066ec6) is exactly what an operator needs to see. An
+    untested log line is a log line a refactor deletes (reviewer: test-coverage);
+    these also exercise the `where=` plumbing that exists solely to serve it.
+    """
+
+    _LOGGER = 'orchestrator.evals.report'
+
+    @staticmethod
+    def _floor_records(caplog):
+        return [r for r in caplog.records if 'Plan-quality floor' in r.getMessage()]
+
+    def test_a_discarded_nonzero_score_warns_once_and_names_the_cell(self, caplog):
+        from orchestrator.evals.report import build_composite_report
+
+        results = [
+            _arch('p1', 'arch-noplan', 1, plan_steps=0, plan_quality=0.9,
+                  cost_usd=0.3, duration_ms=60000),
+            _arch('p1', 'arch-noplan', 2, plan_steps=6, plan_quality=0.6,
+                  cost_usd=0.3, duration_ms=60000),
+        ]
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            build_composite_report(results)
+
+        records = self._floor_records(caplog)
+        # ONE build, ONE floored cell, ONE warning — the second (planning) trial
+        # must not warn, and the floored one must not warn twice per build.
+        assert len(records) == 1
+        message = records[0].getMessage()
+        # The `where=` plumbing: fixture x config, so the line identifies the
+        # cell an operator has to go and look at. Rendered through getMessage(),
+        # so a mis-shaped lazy %s arg fails here rather than shipping green.
+        assert 'p1 x arch-noplan' in message
+        # …and it reports the number that was DISCARDED, not just that one was.
+        assert '0.9' in message
+        assert records[0].levelno == logging.WARNING
+
+    def test_a_cell_that_scored_zero_anyway_does_not_warn(self, caplog):
+        """Nothing was discarded: the judge and the floor AGREE at 0.0, so there
+        is no two-scorer disagreement to report and the line would be noise."""
+        from orchestrator.evals.report import build_composite_report
+
+        results = [
+            _arch('p1', 'arch-noplan', tr, plan_steps=0, plan_quality=0.0,
+                  cost_usd=0.3, duration_ms=60000)
+            for tr in (1, 2)
+        ]
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            build_composite_report(results)
+
+        assert self._floor_records(caplog) == []
+
+    def test_a_real_plan_never_warns(self, caplog):
+        """The control: the floor — and its warning — fire ONLY on a stepless
+        artifact, so a healthy campaign's log stays readable."""
+        from orchestrator.evals.report import (
+            build_composite_report,
+            build_plan_quality_report,
+        )
+
+        results = [
+            _arch('p1', 'arch-real', tr, plan_steps=6, plan_quality=0.9,
+                  cost_usd=0.3, duration_ms=60000)
+            for tr in (1, 2, 3)
+        ]
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            build_composite_report(results)
+            build_plan_quality_report(results)
+
+        assert self._floor_records(caplog) == []
+
+    def test_the_theta_surface_warns_on_its_own_read(self, caplog):
+        """Each surface reports the floor decisions IT made: the accessor is
+        pure, so the warning belongs to the build that read the cell. The CLI
+        builds both, so a floored cell warns once per surface — documented on
+        :func:`_plan_quality_score`, and pinned here so the count is a decision
+        rather than an accident.
+        """
+        from orchestrator.evals.report import build_plan_quality_report
+
+        results = [
+            _arch('p1', 'arch-noplan', 1, plan_steps=0, plan_quality=0.9,
+                  cost_usd=0.3, duration_ms=60000),
+        ]
+        with caplog.at_level(logging.WARNING, logger=self._LOGGER):
+            build_plan_quality_report(results)
+
+        records = self._floor_records(caplog)
+        assert len(records) == 1
+        assert 'p1 x arch-noplan' in records[0].getMessage()
+
 
 class TestNoPlanCellCannotSetTheEfficiencyFloor:
     """A cell that returned NOTHING must not become the cost/latency baseline.
@@ -1515,9 +1660,9 @@ class TestFormatCompositeTable:
             format_composite_table,
         )
 
-        assert _COMPOSITE_COLUMNS[5] == 'cost_usd'
-        assert _COMPOSITE_COLUMNS[7] == 'latency_secs'
-        assert _COMPOSITE_COLUMNS[8] == 'ci95_composite'
+        assert _COMPOSITE_COLUMNS[6] == 'cost_usd'
+        assert _COMPOSITE_COLUMNS[8] == 'latency_secs'
+        assert _COMPOSITE_COLUMNS[9] == 'ci95_composite'
         out = format_composite_table(self._arch_report())
         cells = self._row(out, 'arch-dark')
         # composite and quality are both None → '-'. "We measured nothing" must
@@ -1529,9 +1674,9 @@ class TestFormatCompositeTable:
         # config that never ran the cheapest and fastest row on the screen), nor
         # the CI95 cell, which used to render '[0.0000, 0.0000]' right beside the
         # composite '-' (reviewer: correctness).
-        assert cells[5] == '-'
-        assert cells[7] == '-'
+        assert cells[6] == '-'
         assert cells[8] == '-'
+        assert cells[9] == '-'
 
     def test_cap_window_is_not_rendered_as_a_cost_advantage(self):
         """arch-mixed's measured cell is arch-good's price; only its plan quality
@@ -1541,8 +1686,8 @@ class TestFormatCompositeTable:
         out = format_composite_table(self._arch_report())
         mixed = self._row(out, 'arch-mixed')
         good = self._row(out, 'arch-good')
-        assert mixed[5] == good[5] == '0.3000'
-        assert mixed[7] == good[7] == '60.00'
+        assert mixed[6] == good[6] == '0.3000'
+        assert mixed[8] == good[8] == '60.00'
 
     def test_operator_can_rank_architects_from_the_table_alone(self):
         """The acceptance assertion for the reported defect.

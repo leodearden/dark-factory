@@ -1363,6 +1363,33 @@ class TestSteplessPlanIsNeverJudged:
         assert persisted['plan_steps'] > 0
         assert persisted['cap_tainted'] is False
 
+    @pytest.mark.parametrize('plan', _STEPLESS_PLANS + [
+        pytest.param(None, id='no-plan-artifact'),
+        pytest.param(_well_formed_plan(), id='real-plan'),
+    ])
+    async def test_persisted_metrics_agree_with_the_artifact_level_twin(self, plan):
+        """produced_a_plan(PERSISTED metrics) == is_scorable_plan(artifact).
+
+        The equivalence the report layer depends on: it only ever sees a
+        persisted metrics dict and cannot call is_scorable_plan, which reads the
+        plan ARTIFACT. Driven through the REAL runner (reviewer: test-quality) —
+        asserting against a metrics dict the test built itself would only pin
+        produced_a_plan against a copy of run_architect_eval's derivation living
+        in this file, and would stay green while the two surfaces diverged.
+        """
+        from orchestrator.evals.judge import is_scorable_plan
+        from orchestrator.evals.metrics import produced_a_plan
+
+        _, mocks = await _run_architect_eval_hermetic(
+            self._cfg(),
+            produced_plan=plan,
+            judge_return=self._confident_judge(),
+            arch_success=True,
+        )
+        persisted = mocks['save'].call_args.args[0].metrics
+
+        assert produced_a_plan(persisted) is is_scorable_plan(plan)
+
 
 # ---------------------------------------------------------------------------
 # plan_quality report column — additive interim surface (step-11/12)

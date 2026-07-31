@@ -254,6 +254,14 @@ def _plan_quality_score(
     *where* names the cell (``"fixture x config"``) for that warning; the metrics
     dict carries neither, so the caller — which holds the ``EvalResult`` — passes
     it. Purely diagnostic: it never changes the returned score.
+
+    A floored cell therefore warns ONCE PER REPORT BUILD, and the CLI builds both
+    surfaces over the same results, so it appears twice per run. Deliberate: the
+    accessor stays PURE, and the alternative — remembering which cells have
+    already been warned about — is either module-level state that goes quiet on
+    the second campaign of a long-lived process or a per-build set threaded
+    through both builders. Two identical, cell-named lines are the cheaper
+    failure mode; both name their ``where``, so neither reads as a second cell.
     """
     if not _has_plan_quality_score(metrics):
         return None
@@ -1248,6 +1256,16 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
                 result.metrics,
                 where=f'{result.task_id} x {result.config_name}',
             ),
+            # The predicate's ANSWER, computed here from the metrics dict its
+            # contract is written against — never re-derived downstream from the
+            # row (reviewer: robustness). ``plan_steps`` above is carried for the
+            # READER; asking ``produced_a_plan(row)`` instead would work only
+            # while the row happens to spell that key identically to the metrics
+            # dict, and a rename would silently answer False for EVERY row —
+            # flooring every scored cell to 0.0 with no exception, no log and no
+            # failing test. Sourced beside ``scored_plan_quality`` so the count
+            # below and the score above can never describe different cells.
+            'produced_a_plan': produced_a_plan(result.metrics),
         })
     rows.sort(key=lambda r: (r['task_id'], r['config_name']))
 
@@ -1268,9 +1286,10 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
             excluded[cfg] += 1
             by_cause[_taint_cause(row['invocation_error'])] += 1
         elif row['scored_plan_quality'] is not None:
-            # The row carries ``plan_steps`` verbatim from the metrics dict, so
-            # the predicate reads it here exactly as it does one layer up.
-            if not produced_a_plan(row):
+            # Subscript, not ``.get``: the answer was computed from the metrics
+            # dict when the row was built, so a dropped key must raise here
+            # rather than read back as "no config produced a plan".
+            if not row['produced_a_plan']:
                 # DISJOINT from the exclusion above: this cell was measured and
                 # kept, at the 0.0 the accessor floored it to (task 3302).
                 no_plan[cfg] += 1
@@ -1410,11 +1429,18 @@ def format_plan_quality_table(report: dict[str, Any]) -> str:
 # what separates a transient cap window from a permanent model-not-found — lives
 # only in :func:`format_plan_quality_table`, so the CLI emits both for an
 # architect result set.
+#
+# ``pq_no_plan`` (task 3302) is the COUNT beside it, and both belong on THIS
+# table because this is the surface ``select_survivors`` ranks on: the two
+# treatments of a zero-scoring cell — transport refusal EXCLUDED, no-plan
+# FLOORED — are otherwise indistinguishable here, and a column of
+# ``plan_quality 0.0000`` would read as "these candidates all planned badly"
+# when it means "these candidates produced no plan at all".
 # ---------------------------------------------------------------------------
 
 _COMPOSITE_COLUMNS = (
     'config', 'composite', 'quality', 'plan_quality', 'pq_excluded',
-    'cost_usd', 'cost_source', 'latency_secs', 'ci95_composite',
+    'pq_no_plan', 'cost_usd', 'cost_source', 'latency_secs', 'ci95_composite',
     'trials', 'fixtures',
 )
 _PRICE_TABLE_COLUMNS = ('config', 'role', 'input_per_1m', 'output_per_1m')
@@ -1491,6 +1517,13 @@ def format_composite_table(report: dict[str, Any]) -> str:
     :func:`format_plan_quality_table`, which the CLI emits alongside this table
     for an architect result set.
 
+    ``pq_no_plan`` (task 3302) is its counterpart: how many of that config's
+    architect cells were FLOORED to 0.0 because they produced no plan. Rendered
+    here and not only on the θ table because ranking happens on THIS surface —
+    without it a row reads ``plan_quality 0.0000`` beside ``pq_excluded 0`` and
+    an operator cannot tell a config that planned badly from one that did not
+    plan at all. Two causes, two treatments, two counts, neither silent.
+
     ``composite`` / ``quality`` / ``plan_quality`` all render ``-`` when the row
     measured nothing (:func:`_optional_float_cell`): "we measured nothing" must
     never read as "it scored nothing".
@@ -1504,6 +1537,7 @@ def format_composite_table(report: dict[str, Any]) -> str:
             'quality': _optional_float_cell(r.get('quality')),
             'plan_quality': _optional_float_cell(r.get('plan_quality')),
             'pq_excluded': str(int(r.get('plan_quality_cap_excluded', 0) or 0)),
+            'pq_no_plan': str(int(r.get('plan_quality_no_plan', 0) or 0)),
             'cost_usd': _optional_float_cell(r.get('cost_usd', 0.0)),
             'cost_source': str(r.get('cost_source', '')),
             'latency_secs': _optional_float_cell(
