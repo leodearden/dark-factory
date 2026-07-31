@@ -626,3 +626,119 @@ def stamp_status(coverage: dict[str, Any]) -> dict[str, Any]:
     """
     coverage['status'] = coverage_status(coverage)
     return coverage
+
+
+# ---------------------------------------------------------------------------
+# Artifacts
+# ---------------------------------------------------------------------------
+
+
+def render_report(coverage: Mapping[str, Any]) -> str:
+    """The human-readable coverage report.
+
+    What an operator reads when pointed at a run. It leads with the STATUS,
+    in words, because the counters alone cannot distinguish an empty archive
+    from a wholesale failure — and an operator should never have to infer
+    "there was no archive" from a zero.
+    """
+    failures = coverage.get('parse_failures') or {}
+    status = coverage.get('status') or coverage_status(coverage)
+    lines = [
+        f'memory-eval run: {EVAL_ID}',
+        f'status:          {status}  (exit {EXIT_CODES.get(status, "?")})',
+        '',
+        f'tasks scanned:       {coverage.get("tasks_scanned", 0)}',
+        f'transcripts found:   {coverage.get("transcripts_found", 0)}',
+        f'transcripts read:    {coverage.get("transcripts_read", 0)}',
+        f'searches extracted:  {coverage.get("searches_extracted", 0)}',
+        f'searches unresolved: {coverage.get("searches_unresolved", 0)}'
+        '   (answer not recoverable; see result_status)',
+        '',
+        f'parse failures (unreadable transcripts): {failures.get("count", 0)}',
+    ]
+
+    if status == 'no_input':
+        lines.append(
+            '  NO INPUT — no transcripts were found. This is NOT a measurement '
+            'of an empty archive; nothing was read at all.'
+        )
+    elif status == 'total_failure':
+        lines.append(
+            '  TOTAL FAILURE — transcripts were found but NONE could be read. '
+            'The zero searches below measure this instrument, not the archive.'
+        )
+    elif status == 'degraded':
+        lines.append(
+            '  DEGRADED — some transcripts were unreadable. The corpus is '
+            'usable but incomplete by exactly the count above.'
+        )
+
+    examples = failures.get('examples') or []
+    if examples:
+        lines.append('')
+        lines.append('  examples:')
+        lines.extend(
+            f'    {ex.get("transcript")} — {ex.get("reason")}' for ex in examples
+        )
+    if failures.get('examples_truncated'):
+        lines.append(
+            f'    … and {failures.get("examples_omitted", 0)} more not shown '
+            '(example list capped; the count above is complete).'
+        )
+    return '\n'.join(lines) + '\n'
+
+
+def write_corpus(
+    records: Iterable[Mapping[str, Any]],
+    coverage: Mapping[str, Any],
+    out_root: str | Path,
+    *,
+    stamp: str | None = None,
+) -> tuple[Path, Path, Path]:
+    """Write the three artifacts. Returns ``(corpus, coverage, report)`` paths.
+
+    Stamping goes through the shared ``run_stamp``/``RUN_STAMP_ENV_VAR``, so
+    one logical memory-eval run correlates across leaves.
+
+    The layout is delegated, never restated: ``report_artifact_path`` already
+    produces ``<root>/<eval_id>/report-<STAMP>.txt``, so it is called
+    verbatim, and the two artifacts with no helper are placed in the directory
+    it implies (the sibling probe's ``metrics_artifact_path(..., 'ignored').parent``
+    idiom).
+
+    Serialization mirrors ``serialize_metric_series`` — ``sort_keys=True``,
+    ``ensure_ascii=False``, trailing newline — so two identical runs are
+    byte-identical and a real change diffs cleanly. The corpus drops ``indent``
+    only because JSON Lines requires one object per physical line.
+
+    Plain writes, not an atomic writer: this is a one-shot script with no
+    concurrent reader, and copying ``memory_eval_metrics._atomic_write_text``
+    (itself already a documented copy) would create a third copy of it.
+    """
+    from shared.memory_eval_metrics import (  # noqa: PLC0415
+        metrics_artifact_path,
+        report_artifact_path,
+        run_stamp,
+    )
+
+    stamp = stamp or run_stamp()
+    report_path = report_artifact_path(out_root, EVAL_ID, stamp)
+    directory = metrics_artifact_path(out_root, EVAL_ID, 'ignored').parent
+    directory.mkdir(parents=True, exist_ok=True)
+
+    corpus_path = directory / f'corpus-{stamp}.jsonl'
+    coverage_path = directory / f'coverage-{stamp}.json'
+
+    corpus_path.write_text(
+        ''.join(
+            json.dumps(record, sort_keys=True, ensure_ascii=False) + '\n'
+            for record in records
+        ),
+        encoding='utf-8',
+    )
+    coverage_path.write_text(
+        json.dumps(coverage, indent=2, sort_keys=True, ensure_ascii=False) + '\n',
+        encoding='utf-8',
+    )
+    report_path.write_text(render_report(coverage), encoding='utf-8')
+    return corpus_path, coverage_path, report_path
