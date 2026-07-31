@@ -14,6 +14,15 @@ bare MENTION ("see ``fused-memory/``") or an English slash-construction
 project_id of the first mismatched prefix so the caller can resubmit (or
 the LLM can re-route under the multi-project Stage 2 prompt).
 
+The guard runs on TWO signals with different certainties.  DECLARED files
+(``metadata.files`` &c.) are classified exactly, via
+:meth:`ProjectPrefixRegistry.project_for_path`; PROSE is classified
+heuristically, via :func:`find_paths`.  Because prose cannot distinguish
+"modifies X" from "merely cites X", the prose branch is now gated on the
+declared signal: :func:`local_deliverable_attested` (task 3106) asks whether
+the submission declares any deliverable owned by the FILING project, and the
+interceptor suppresses the prose advisory when it does.
+
 Wired into :class:`fused_memory.middleware.task_interceptor.TaskInterceptor`
 at the ``submit_task`` entry point.  Path-guard
 rejections also fire a ``scope_violation`` escalation via
@@ -447,6 +456,55 @@ def all_files_foreign_owner(
     if len(foreign_owners) != 1:
         return None
     return first_owner
+
+
+def local_deliverable_attested(
+    signals: list[str] | None,
+    project_id: str,
+    registry: ProjectPrefixRegistry,
+) -> bool:
+    """Return True iff ANY declared deliverable signal is owned by *project_id*.
+
+    POSITIVE-attribution counterpart to :func:`all_files_foreign_owner`'s
+    negative one, and its exact logical complement: that function asks "is
+    EVERY owned entry foreign under ONE owner", this asks "is ANY entry
+    LOCAL".  The two are therefore mutually exclusive by construction — a
+    signal set with a locally-owned entry makes ``all_files_foreign_owner``
+    return ``None`` immediately — so the interceptor's cross-repo
+    allow-and-tag branch and its prose-advisory suppression branch can never
+    both fire on the same submission.
+
+    *signals* are the submission's DECLARED deliverables — the union of
+    ``metadata.files``, ``metadata.files_to_modify`` and ``metadata.modules``
+    (task 3106).  They are classified with the CERTAIN
+    :meth:`ProjectPrefixRegistry.project_for_path` lookup, never the
+    heuristic regex-over-prose :func:`find_paths`.  That matters: a declared
+    DIRECTORY (``'fused-memory/src'``, a ``modules`` lock key) and an
+    ABSOLUTE spelling both classify correctly here, where the prose
+    scanner's right-boundary assertion (task 3120) deliberately misses them.
+    It also means attribution inherits ``project_for_path``'s documented
+    fail-open residue (``'../other-repo/x.py'``, ``'~user/...'``) in the SAFE
+    direction: an unclassifiable signal simply fails to attest, so the
+    advisory still fires.
+
+    Entries with no registered owner are NEUTRAL — they never establish
+    attribution, matching :func:`_aggregate_owner_mismatches`' conservative
+    direction.  Declaring only ``README.md`` is no evidence of local work.
+
+    CALLER CONTRACT: consulted ONLY after :func:`check_files_for_scope` has
+    already returned ``ok``, i.e. after "no declared file is FOREIGN" is
+    established.  This adds the positive half — "and at least one declared
+    entry is LOCAL" — so the pair together is a complete attribution.  A
+    submission with no declared deliverable, or with only unowned entries,
+    yields no attribution and falls back to the unchanged advisory, which is
+    where the guard's real protection lives.
+
+    Returns False when the registry is empty/falsy or *signals* is
+    empty/falsy.
+    """
+    if not registry or not signals:
+        return False
+    return any(registry.project_for_path(s) == project_id for s in signals)
 
 
 def is_routing_override(routing_override_reason: str | None) -> bool:
