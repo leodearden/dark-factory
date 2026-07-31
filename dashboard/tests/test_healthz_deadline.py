@@ -319,3 +319,41 @@ async def test_healthz_returns_degraded_when_execute_blocks(dashboard_config):
     assert checks['db_reconciliation'] == 'timeout'
     assert checks['db_write_journal'] == 'timeout'
     assert checks['db_runs'] == 'timeout'
+
+
+# ---------------------------------------------------------------------------
+# step-5 / step-6: the deadline must also cover the connection-acquire step
+# (pool.get), not just execute + fetch
+# ---------------------------------------------------------------------------
+
+
+async def test_healthz_deadline_covers_the_connection_acquire_step(dashboard_config):
+    """A stalled pool.get(db_path) must not hang the handler either.
+
+    DbPool.get (dashboard/src/dashboard/data/db.py:66-119) has two unbounded
+    awaits of its own: the per-path open-lock, and aiosqlite.connect(). Under
+    contention or a stalled filesystem, acquire alone hangs the handler even
+    though step-4 already bounds every query. Only the `reconciliation`
+    target's acquire blocks; the other two targets are promptly-responsive,
+    so one wedged acquire must not starve its neighbours of a real verdict.
+    """
+    config = dashboard_config
+    pool = _BlockingPool(
+        {
+            config.reconciliation_db: _BLOCK_IN_GET,
+            config.write_journal_db: _BlockingConn(),
+            config.runs_db: _BlockingConn(),
+        }
+    )
+    request = _make_healthz_request(config, pool)
+
+    resp, elapsed = await _call_healthz(request, hard_cap=8.0)
+    body = _body(resp)
+
+    assert resp.status_code == 503
+    assert body['status'] == 'degraded'
+    assert elapsed < 5.0, f'elapsed {elapsed:.3f}s >= 5.0s — verdict undeliverable to curl --max-time 5'
+    checks = body['checks']
+    assert checks['db_reconciliation'] == 'timeout'
+    assert checks['db_write_journal'] == 'ok'
+    assert checks['db_runs'] == 'ok'
