@@ -75,6 +75,37 @@ def _kill_group(pgid: int) -> None:
         os.killpg(pgid, signal.SIGKILL)
 
 
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_await_trap_installed_returns_once_shell_armed():
+    """_await_trap_installed returns once the shell announces readiness.
+
+    The shell's ``ready`` line is only printed after ``trap '' TERM`` has
+    returned, so observing it on stdout is a happens-before edge proving the
+    SIGTERM disposition is already SIG_IGN — see _await_trap_installed's own
+    docstring for the supporting /proc/<pid>/status measurement.  The proc
+    must still be alive (unreaped) afterwards: the handshake only observes
+    readiness, it must not consume/reap the shell out from under the
+    subsequent terminate_process_group call.
+    """
+    proc = await asyncio.create_subprocess_shell(
+        "trap '' TERM; echo ready; sleep 30",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        await _await_trap_installed(proc)
+        assert proc.returncode is None, (
+            f'expected shell pid={proc.pid} still running after the '
+            f'readiness handshake, got returncode={proc.returncode}'
+        )
+    finally:
+        _kill_group(proc.pid)
+        with contextlib.suppress(Exception):
+            await proc.wait()
+
+
 class TestTerminateProcessGroup:
     """Unit/integration tests for terminate_process_group."""
 
