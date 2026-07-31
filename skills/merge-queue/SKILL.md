@@ -52,7 +52,7 @@ mcp__escalation__merge_request(
   worktree="<path to worktree>",
   description="<brief description of what's being merged>",
   wait_secs=100,
-  verified_green=True
+  verified_green=<True|False>  # decide per the verified_green rule below — do not default to True
 )
 ```
 
@@ -62,7 +62,7 @@ Parameters:
 - `worktree` — absolute path to the task's worktree (e.g., `/home/leo/src/dark-factory/.worktrees/42/`)
 - `description` — optional context for logs
 - `wait_secs=100` — **always pass this explicitly.** The value 100 equals the server's maximum bounded wait (`_MAX_WAIT_SECS`), so fast/idle-queue merges return their terminal outcome in the same call. The call always returns within ≤100 s.
-- `verified_green` — pass `True` **only** when the verification suite (tests, lint, type-check from step 1 "Prepare your branch") actually ran and passed on this branch, on top of its own base; omit it (or pass `False`) if you skipped verification, or it failed and you're submitting anyway for an unrelated reason (e.g. resubmitting after a `conflict`/`blocked` fix-up you haven't re-verified). This vouches to the merge queue that the branch was seen green pre-merge — it emits a `workflow_verify` event so a later merge failure caused by an unrelated main landing can be attributed as `INTEGRATION_SKEW` instead of degrading to `INDETERMINATE`. Since `/do` lands its branches through this skill, honoring this rule here also covers `/do` submissions.
+- `verified_green` — a **per-submission decision, not a default.** Pass `True` **only** when the verification suite (tests, lint, type-check from step 1 "Prepare your branch") actually ran and passed on this branch, on top of its own base; omit it (or pass `False`) if you skipped verification, or it failed and you're submitting anyway for an unrelated reason (e.g. resubmitting after a `conflict`/`blocked` fix-up you haven't re-verified). This vouches to the merge queue that the branch was seen green pre-merge — it emits a `workflow_verify` event so a later merge failure caused by an unrelated main landing can be attributed as `INTEGRATION_SKEW` instead of degrading to `INDETERMINATE`. Since `/do` lands its branches through this skill, honoring this rule here also covers `/do` submissions. `/unblock`'s step 6 D2 is this same rule, with an added D1/D2 split for its rebase/re-verify loop — an agent holding both skills is applying one rule, not two.
   - **Caution — not retractable:** the classifier's green fact is *any-prior-green, keyed by task ID* — once `verified_green=True` has been emitted for a task ID, omitting it (or passing `False`) on a **later** resubmission for that same task ID does not undo the earlier green. If you resubmit after an unverified fix-up (e.g. a quick conflict resolution you didn't re-run the suite on), a genuine `BRANCH_BUG` in that fix-up can still be misattributed to `INTEGRATION_SKEW` on a later merge failure, because the classifier only sees "this task ID was green once," not which commit. When in doubt, re-run verification before resubmitting rather than relying on an earlier `True`.
 
 The call returns with **either** a **terminal** status **or** a **non-terminal** status:
@@ -196,7 +196,7 @@ After a successful direct merge:
 
 | Situation | Action |
 |-----------|--------|
-| Orchestrator running | Submit via `merge_request(wait_secs=100, verified_green=True)` — only when verification actually passed — then poll `merge_status` |
+| Orchestrator running | Submit via `merge_request(wait_secs=100, verified_green=<True|False>)` — only when verification actually passed — then poll `merge_status` |
 | Orchestrator not running | Direct `git merge --no-ff` |
 | Submit returns `queued` or `attached` | Submission succeeded (durable intent); poll `merge_status(request_id)` with 15 s→60 s backoff |
 | `merge_status` returns `state: "unknown"` | Check `git merge-base --is-ancestor task/<TASK_ID> main` (exit 0 → done/found_on_main; exit 1 + healthy queue → resubmit). Never direct-merge in response to `unknown`. |
