@@ -631,6 +631,19 @@ class NightlyResult:
     unnoticed. ``exit_code`` deliberately stays 0 -- see
     :func:`_report_sample_outcome`."""
 
+    barren_escalated: bool = False
+    """True when THIS run crossed the barren-streak threshold and posted the
+    streak escalation (see :func:`_record_trickle_progress`).
+
+    Distinct from both of its neighbours, and deliberately not folded into
+    either. ``escalated`` covers the decision-8 triggers (extractor crash,
+    coder storm, validation failure, commit failure) plus
+    :func:`_report_sample_outcome`'s per-night suppression notice.
+    ``budget_suppressed`` is a PER-NIGHT fact about one run's sampler
+    accounting. This one is about a WINDOW: N consecutive runs that
+    digested nothing despite real signal arriving. Different predicate,
+    different window, different remedy prompt."""
+
 
 def _report_sample_outcome(
     cfg: LegibilityConfig,
@@ -654,6 +667,19 @@ def _report_sample_outcome(
     it additionally logs ONE WARNING and posts ONE best-effort
     :func:`post_escalation`, reusing the decision-8
     ``escalate_info``/``infra_issue``/severity=info envelope unchanged.
+
+    IT NOW REPORTS BOTH BARREN DOORS AT WARNING, BUT ESCALATES ONLY THE
+    BUDGET ONE PER-NIGHT (task 3340). The sibling door -- ``not
+    sample.selected and sample.budget_skipped <= 0 and
+    sample.below_sampling_cut > 0``, i.e. real signal held back by the
+    SAMPLING cut, which never even reached the budget phase -- was
+    entirely unobserved before and now gets a WARNING naming its OWN
+    remedy (``sampling.top_fraction`` / ``sampling.per_stratum_min``,
+    never ``budgets.max_daily_digest_bytes``; ``SampleResult``'s docstring
+    is explicit that conflating the two is wrong). It posts no per-night
+    escalation: escalation for BOTH doors is owned by the edge-triggered
+    barren-STREAK signal in :func:`_record_trickle_progress`, so per-night
+    alarm volume does not rise.
 
     Two deliberate non-behaviors. It does NOT touch the exit code: a non-zero
     exit flips ``legibility-trickle@<project>.service`` to ``Result=failed``,
@@ -698,6 +724,27 @@ def _report_sample_outcome(
         cfg.project_id, target_date.isoformat(), summary_line,
     )
 
+    if not sample.selected and sample.budget_skipped <= 0 and sample.below_sampling_cut > 0:
+        # The SIBLING barren door, unobserved before task 3340: real,
+        # distinct, non-duplicate signal ranked below its stratum's cut and
+        # never reached the budget phase at all. WARNING only -- no
+        # per-night escalation, because the barren STREAK owns escalation
+        # for this mode (see _record_trickle_progress), so per-night alarm
+        # volume does not rise for a condition that, like suppression,
+        # repeats every night until someone changes config.
+        logger.warning(
+            'legibility trickle night produced nothing: project=%s date=%s %s. '
+            'Real confusion signal WAS found and then held back by the '
+            'SAMPLING CUT (below_sampling_cut=%d, budget_skipped=0) -- this '
+            'is NOT a no-change night, and raising '
+            'budgets.max_daily_digest_bytes will not help: these records '
+            'never competed for budget. Raise sampling.top_fraction or '
+            'sampling.per_stratum_min instead.',
+            cfg.project_id, target_date.isoformat(), summary_line,
+            sample.below_sampling_cut,
+        )
+        return False
+
     if sample.selected or sample.budget_skipped <= 0:
         return False
 
@@ -725,6 +772,7 @@ def _record_trickle_progress(
     result: NightlyResult,
     *,
     recorder=None,
+    poster=None,
     now: datetime | None = None,
 ) -> None:
     """Record WHY this night went the way it did, best-effort.
@@ -753,7 +801,7 @@ def _record_trickle_progress(
     record = recorder if recorder is not None else trickle_state.record_run
     recorded_at = now if now is not None else datetime.now(timezone.utc)
     try:
-        record(
+        doc = record(
             cfg.project_id,
             target_date=target_date,
             recorded_at=recorded_at,
@@ -775,6 +823,100 @@ def _record_trickle_progress(
             'progress probe will read a stale streak',
             cfg.project_id, target_date.isoformat(), type(exc).__name__, exc,
         )
+        return
+
+    _escalate_barren_streak(cfg, doc, target_date, result, poster=poster)
+
+
+def _escalate_barren_streak(
+    cfg: LegibilityConfig,
+    doc,
+    target_date: date,
+    result: NightlyResult,
+    *,
+    poster=None,
+) -> None:
+    """Post ONE escalation on the run where the barren streak first REACHES
+    :data:`trickle_state.DEFAULT_MAX_BARREN_RUNS`. Best-effort; mutates
+    *result* in place.
+
+    EDGE-TRIGGERED BY EXACT EQUALITY, not ``>=``. That is what makes it
+    fire once per streak and re-arm only after a productive or quiet run
+    resets the counter to 0. Level-triggering would re-fire every night
+    from the threshold on, re-opening task 3270's alarm-fatigue debate;
+    a one-shot latch would instead reproduce the worse failure mode 3270
+    explicitly rejected -- whoever misses the single first escalation gets
+    silence thereafter, which is the precise pathology (14
+    indistinguishable nights) this whole task exists to end. Re-arming
+    after a reset is the middle path, and it is exactly what
+    ``_report_sample_outcome``'s own docstring invited ("If the repeats do
+    become noise before the budget is fixed, latch them here").
+
+    This is a GENUINELY DIFFERENT signal from that per-night notice, not a
+    duplicate of it: different predicate (a window, not one run),
+    different door coverage (BOTH barren doors, not just the budget one),
+    and a different remedy prompt.
+
+    ``result.exit_code`` IS NOT TOUCHED. A non-zero exit flips
+    ``legibility-trickle@<project>.service`` to ``Result=failed``, so
+    ``check_trickle_liveness.sh`` would fail every night for a timer that
+    is running perfectly -- trading a silent-failure mode for a permanent
+    false alarm and burning the one signal that currently works. This is
+    the identical refusal :func:`_report_sample_outcome` already records,
+    for the identical reason.
+    """
+    if not isinstance(doc, dict):
+        return
+    if doc.get('outcome') != trickle_state.OUTCOME_BARREN:
+        return
+    if doc.get('consecutive_barren_runs') != trickle_state.DEFAULT_MAX_BARREN_RUNS:
+        return
+
+    counters = doc.get('counters') or {}
+    budget_skipped = counters.get('budget_skipped') or 0
+    below_sampling_cut = counters.get('below_sampling_cut') or 0
+
+    # DOOR-SPECIFIC remedy. SampleResult's docstring (sampling.py) is
+    # explicit that the two doors have different fixes: raising the byte
+    # budget recovers a budget_skipped record and does nothing whatever for
+    # a below_sampling_cut one. Never conflate them.
+    remedies = []
+    if budget_skipped > 0:
+        remedies.append(
+            'raise budgets.max_daily_digest_bytes (candidates competed for '
+            'budget and were ALL discarded on it)'
+        )
+    if below_sampling_cut > 0:
+        remedies.append(
+            'raise sampling.top_fraction or sampling.per_stratum_min (these '
+            'records ranked below their stratum cut and never competed for '
+            'budget, so a bigger byte budget will not recover them)'
+        )
+    remedy = '; '.join(remedies) or (
+        'inspect the recorded counters: no door counter is set, which should '
+        'be impossible for a barren run'
+    )
+
+    summary = (
+        f'legibility trickle has produced nothing for '
+        f'{trickle_state.DEFAULT_MAX_BARREN_RUNS} consecutive runs'
+    )
+    detail = (
+        f'project={cfg.project_id} date={target_date.isoformat()} '
+        f'outcome=barren consecutive_barren_runs='
+        f'{doc.get("consecutive_barren_runs")} '
+        f'below_sampling_cut={below_sampling_cut} '
+        f'budget_skipped={budget_skipped} '
+        f'last_productive_at={doc.get("last_productive_at")}. '
+        f'Real confusion signal reached the sampling/budget stage on each of '
+        f'those runs and NOTHING was digested -- three consecutive means '
+        f'persistent config state, not a run of bad luck. Remedy: {remedy}. '
+        f'Probe on demand with: check_trickle_progress.py '
+        f'{cfg.project_id} {trickle_state.DEFAULT_MAX_BARREN_RUNS}'
+    )
+    logger.warning('%s -- %s', summary, detail)
+    if post_escalation(cfg, summary, detail, poster=poster):
+        result.barren_escalated = True
 
 
 def run_nightly(
@@ -1011,7 +1153,8 @@ def run_nightly(
         return result
     finally:
         _record_trickle_progress(
-            cfg, sample, target_date, result, recorder=recorder, now=now,
+            cfg, sample, target_date, result,
+            recorder=recorder, poster=poster, now=now,
         )
 
 

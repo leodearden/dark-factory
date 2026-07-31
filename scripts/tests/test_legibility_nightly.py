@@ -2354,10 +2354,17 @@ def test_report_sample_outcome_warns_on_a_sampling_cut_only_night(tmp_path, capl
         f'the sampling-cut door has its OWN remedy and must name it; got '
         f'{message!r}'
     )
-    assert 'max_daily_digest_bytes' not in message, (
-        'raising the byte budget does nothing whatever for a '
-        'below_sampling_cut record — SampleResult says so explicitly'
-    )
+    # Raising the byte budget does nothing whatever for a
+    # below_sampling_cut record (SampleResult says so explicitly), so the
+    # message may only mention that knob in order to DISCLAIM it. Silence
+    # would be weaker: an operator primed by task 3270's budget escalation
+    # will reach for max_daily_digest_bytes by default, and only an
+    # explicit "that will not help" stops them.
+    if 'max_daily_digest_bytes' in message:
+        assert 'not help' in message, (
+            f'the byte-budget knob may only appear as an explicit '
+            f'non-remedy; got {message!r}'
+        )
 
 
 def test_report_sample_outcome_budget_door_is_unchanged(tmp_path, caplog):

@@ -375,3 +375,24 @@ def record_run(
         raise
 
     return doc
+
+
+DEFAULT_MAX_BARREN_RUNS = 3
+"""Consecutive barren runs before ``nightly.py`` escalates and
+``check_trickle_progress.py`` fails.
+
+WHY 3. One barren night can be an ordinary bad day — an unusually large
+session, a transient spike that ate the budget. THREE CONSECUTIVE means
+PERSISTENT CONFIG STATE: the budget or the sampling cut is simply wrong
+for this project's session sizes, and no night is going to fix itself.
+That is the same reasoning ``nightly._report_sample_outcome`` already
+records for why total suppression repeats every night, applied to a
+window instead of a single run. The real 2026-07-16..29 incident would
+have fired on night 3 of 14 rather than never.
+
+A MODULE CONSTANT, NOT A ``legibility.yaml`` FIELD, deliberately: reading
+that config would drag pydantic + PyYAML onto the bare-``python3``
+predicate path this module must survive (see the module docstring). The
+progress probe also takes the threshold as an argument, so a binding that
+wants a different window passes one rather than editing config.
+"""
