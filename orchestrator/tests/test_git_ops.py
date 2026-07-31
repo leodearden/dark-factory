@@ -8042,6 +8042,13 @@ class TestRecoverRedMain:
 
 async def _add_warm_lane_scripts(repo: Path, port: int = 39411) -> None:
     """Commit stub seed-warm-lane.sh + setup-worktree-debug-port.sh into repo."""
+    # esc-3072-3: git discovery walks UP, so a *repo* that is not itself a
+    # repository root sends the `git add -A` + `git commit` below into whatever
+    # repo encloses it — a real COMMIT into a live task worktree, sweeping up
+    # whatever uncommitted work it was holding. FIRST statement deliberately:
+    # ahead of the mkdir and write_text calls too, so a rejected call leaves no
+    # stub-script litter in the wrong directory either.
+    assert_isolated_git_repo(repo)
     scripts_dir = repo / 'scripts'
     scripts_dir.mkdir(parents=True, exist_ok=True)
     seed_script = scripts_dir / 'seed-warm-lane.sh'
