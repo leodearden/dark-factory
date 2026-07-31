@@ -15,6 +15,15 @@ Replaces verify.py's raw-shell-string find/replace-surgery command model
 
 ``ToolKind`` is a ``StrEnum`` — mirrors verify_categories.FailureCategory
 (task α) so tool identity is JSON-serialisable and ``str(ToolKind.X) == 'x'``.
+
+``split_chain_tail`` decides whether a scoper may carry an ``&&``-chained
+sibling clause past its truncation point. Which SLOTS may do so is a keyword
+ALLOWLIST (``_TAIL_PRESERVING_KEYWORDS``), because the preserved-tail return
+shape is precisely the RECOGNISED-BUT-UNSTRUCTURABLE one described above, on
+which several mutators are documented no-ops: buying a tail in the pytest
+slot would mean paying for it with ``--junitxml``/``--timeout``, so that slot
+is excluded and truncates instead. ``has_unpreserved_chain_clauses`` is the
+diagnostic-only companion that lets a caller log what a REJECT discarded.
 """
 
 from __future__ import annotations
@@ -373,6 +382,14 @@ def split_chain_tail(raw: str, keyword: str) -> tuple[str, str]:
 
     The gate, cheapest condition first — ACCEPT requires ALL of:
 
+    0. *keyword* is in ``_TAIL_PRESERVING_KEYWORDS``. An ALLOWLIST, so the
+       DEFAULT for any keyword not named there is no preservation — exactly
+       the pre-task-3061 truncate-at-*keyword* behaviour. ``'pytest'`` is
+       deliberately excluded (task 3218): a preserved tail makes the caller's
+       result raw-retained, and ``with_junitxml``/``with_pytest_timeout`` are
+       documented no-ops on that shape, so the tail would cost the junit
+       report that drives failing-test extraction, flake confirmation and the
+       per-test timeout floor. See that constant for the full rationale;
     1. ``shlex.split(raw)`` succeeds (an unbalanced quote means the string is
        not safely decomposable at all);
     2. no token in ``_NON_AND_CHAIN_TOKENS`` — the chain is plain `&&`, with
@@ -392,12 +409,30 @@ def split_chain_tail(raw: str, keyword: str) -> tuple[str, str]:
        substitution: both sides count the nested `&&` alike, so condition 3
        is the only thing standing between that input and a mangled command.);
     6. at least two segments (nothing to preserve otherwise);
-    7. *keyword* occurs in ``segments[0]`` and in NO later segment.
+    7. *keyword* occurs in ``segments[0]`` — a plain substring test, kept
+       deliberately, so a keyword reachable only mid-segment stays consistent
+       with the caller's ``head.find(keyword)`` truncation — and NO later
+       segment INVOKES the tool at an ARGV-HEAD position
+       (``_segment_invokes_tool``).
 
     Conditions 4 and 7 are what distinguish a SIBLING-CHECKER chain (a
     different tool, no cwd sequencing — safe and desirable to preserve) from
     a SAME-TOOL FAN-OUT (which must keep being truncated), and both are load-
-    bearing against real configs:
+    bearing against real configs.
+
+    Condition 7's later-segment half is an argv-head test rather than a
+    substring one (task 3218) because the tool's NAME occurring in a segment
+    is not the same as that segment invoking it. The motivating case is the
+    sibling checker named after what it checks — ``python3
+    scripts/check_pyright_config.py src`` in a ``pyright`` chain, ``python3
+    scripts/check_pytest_markers.py tests`` in a ``pytest`` one: a substring
+    test reads those as a fan-out and drops the clause, so a real check never
+    runs. That is an over-rejection, i.e. the possible-false-GREEN direction;
+    argv-head matching can only under-reject, and only behind an unrecognised
+    wrapper, which merely runs that clause unscoped. See
+    ``_segment_invokes_tool`` for the full error-direction argument.
+
+    The real configs this gate was built against:
 
     * ``dark-factory-orchestrator.yaml:51`` is ``cd fused-memory && npx
       pyright && cd ../orchestrator && npx pyright && cd ../dashboard && npx
@@ -409,8 +444,13 @@ def split_chain_tail(raw: str, keyword: str) -> tuple[str, str]:
       ``cd``-token rejection (4) stops it; the duplicate-``pyright``
       rejection (7) independently stops it too.
     * ``dark-factory-orchestrator.yaml:41`` is an 8-segment ``cd X && uv run
-      pytest`` fan-out with a ``( ... )`` subshell — rejected by (2), (3),
-      (4) and (7) alike.
+      pytest`` fan-out with a ``( ... )`` subshell — rejected by (0), (2),
+      (3), (4) and (7) alike.
+
+    The CONSTRAINT — every REJECT returns ``(raw, '')``, the whole untouched
+    original — holds for the two reject paths added by task 3218 (condition
+    0, and condition 7's tightened later-segment test) exactly as it does for
+    the rest, since both take the same ``return raw, ''``.
 
     A ``cd`` token anywhere is disqualifying rather than only in the tail:
     once any segment shifts the shell's cwd, every later segment's relative
@@ -981,9 +1021,17 @@ def with_junitxml(cmd: VerifyCmd, junit_path: str) -> VerifyCmd:
     covers a raw-retained pytest chain (``cmd.raw is not None``): there is no
     regex-rewrite branch here, so a recognised-but-unstructurable
     ``&&``-chained pytest command is left byte-identical rather than
-    rewritten. Callers degrade gracefully (no junit collected for that run —
-    B3) rather than risk a mis-scoped injection into an unstructured shell
-    string.
+    rewritten, rather than risking a mis-scoped injection into an
+    unstructured shell string.
+
+    That no-op used to be reachable from the two scopers, which would hand
+    back a raw-retained chain whenever ``split_chain_tail`` preserved a tail
+    — so the run simply collected no junit (B3), silently. Task 3218 closed
+    that route: ``'pytest'`` is off ``_TAIL_PRESERVING_KEYWORDS``, so a
+    chained pytest slot now comes back structured and injectable. The
+    raw-retained no-op remains reachable only for a hand-written
+    multi-clause command that reaches the injection site directly, and
+    ``verify._with_junitxml_str`` reports it at INFO when it happens.
 
     *junit_path* should be an absolute path: the rendered command may run
     with a shifted cwd (a structured command's own ``cd <cwd_rel> &&``), so a
@@ -1006,7 +1054,9 @@ def with_pytest_timeout(cmd: VerifyCmd, secs: int) -> VerifyCmd:
     raw-retained pytest chain (``cmd.raw is not None``): there is no
     regex-rewrite branch here, so a recognised-but-unstructurable
     ``&&``-chained pytest command is left byte-identical rather than
-    rewritten.
+    rewritten. As with ``with_junitxml``, task 3218 made that no-op
+    unreachable via the two scopers — the pytest slot is off the gate's
+    tail-preservation allowlist, so it now yields a structured command.
 
     The α confirm gate injects this AFTER ``serial_pytest``'s
     ``-p no:xdist -o addopts=`` recovery form: the pyproject per-test

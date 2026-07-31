@@ -304,6 +304,19 @@ def _scope_prefix_to_keyword(raw: str, keyword: str, files: list[str]) -> Verify
     unscoped AND leave a ``cd ../orchestrator`` that misresolves once
     ``strip_cwd`` has removed the leading ``cd``.
 
+    The PYTEST slot is excluded from tail preservation outright (task 3218):
+    ``'pytest'`` is off the gate's ``_TAIL_PRESERVING_KEYWORDS``, so a
+    chained ``test_command`` always truncates and the returned ``VerifyCmd``
+    stays STRUCTURED (``raw is None``) — which is what keeps
+    ``with_junitxml`` and ``with_pytest_timeout`` live on it. A preserved
+    tail there would have silently cost the junit report that drives
+    ``_extract_failing_test_ids_from_junit``, flake confirmation and the
+    per-test timeout floor. The dropped clauses are not silent: a
+    multi-clause command whose tail the gate rejects is reported at DEBUG
+    below, naming the keyword and the dropped-clause count — the same record
+    ``verify._scope_to_keyword`` emits, since STRUCTURAL lockstep is this
+    pair's documented property.
+
     If the *keyword*-prefix parses into a structured, non-OPAQUE command, it
     is scoped to *files*. When a tail was preserved the result is returned
     raw-retained — ``VerifyCmd(tool=<scoped tool>, raw=render(scoped) +

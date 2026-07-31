@@ -164,6 +164,17 @@ def _scope_to_keyword(cmd: str | None, keyword: str, files: list[str]) -> str | 
     two more subprojects unscoped AND leave a ``cd ../orchestrator`` that
     misresolves once ``strip_cwd`` has removed the leading ``cd``.
 
+    The PYTEST slot is excluded from tail preservation outright (task 3218):
+    ``'pytest'`` is off the gate's ``_TAIL_PRESERVING_KEYWORDS``, so a
+    chained ``test_command`` always truncates and the scoped result stays
+    STRUCTURED — which is what keeps ``with_junitxml`` and
+    ``with_pytest_timeout`` live on it. A preserved tail there would have
+    silently cost the junit report that drives
+    ``_extract_failing_test_ids_from_junit``, flake confirmation and the
+    per-test timeout floor. The dropped clauses are not silent: a
+    multi-clause command whose tail the gate rejects is reported at DEBUG
+    below, naming the keyword and the dropped-clause count.
+
     Lockstep with ``verify_plan._scope_prefix_to_keyword`` (the ``VerifyCmd``-
     layer counterpart) is now STRUCTURAL rather than a convention: both route
     through that one shared ``split_chain_tail`` gate. When the gate rejects,
@@ -218,8 +229,21 @@ def _reproject_str(cmd: str | None, project: str) -> str | None:
 
     The gate is driven with the keyword ``'uv run'`` because that is exactly
     the head phrase ``reproject`` rewrites: "the thing I am about to rewrite
-    lives in segment 0, appears in no later segment, and there is no ``cd``
-    sequencing" is precisely the right admission test here too. When the gate
+    lives in segment 0, no later segment invokes it, and there is no ``cd``
+    sequencing" is precisely the right admission test here too. ``'uv run'``
+    is therefore one of the three keywords on the gate's
+    ``_TAIL_PRESERVING_KEYWORDS`` allowlist, and it is there because
+    preservation here is LOAD-BEARING rather than merely desirable — see the
+    exit-127 paragraph above. (``split_chain_tail`` tests index 0 as an
+    argv-head position BEFORE peeling any wrapper, which is what keeps this
+    two-token keyword matchable at the front of a ``uv run ... ruff check``
+    segment 0.)
+
+    This helper is only ever called on a ``lint_command`` /
+    ``type_check_command`` (the fallback path's three call sites), never on a
+    ``test_command`` — so its preserved tail can never reach the junitxml
+    injection site and the ``'uv run'`` allowlist entry cannot resurrect the
+    no-op task 3218 closed for the pytest slot. When the gate
     rejects, ``head is cmd`` and ``tail == ''``, so the body below collapses
     to its pre-gate form byte-for-byte. All three bail-outs return *cmd* —
     the full original, never ``head`` — so a rejected command can never be
