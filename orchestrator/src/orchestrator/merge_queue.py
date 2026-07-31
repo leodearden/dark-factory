@@ -198,6 +198,7 @@ from orchestrator.verify import (
     verify_failure_is_preexisting_on_main,
 )
 from orchestrator.verify_categories import (
+    INDETERMINATE_VERDICT_CATEGORIES,
     INFRA_TRANSIENT_CATEGORIES,
     PREEXISTING_BREAK_SKIP_CATEGORIES,
 )
@@ -2797,6 +2798,12 @@ async def _run_post_merge_verify(
     #   local RunnerUnavailable   → fail-SAFE: emit verify_cross_check_inconclusive
     #                               and TRUST the remote green (never block a land
     #                               on a local infra hiccup — DriftDetector Invariant 5).
+    #   local INDETERMINATE       → fail-SAFE (task 3173): the local leg returned
+    #                               NORMALLY with passed=False but its category says
+    #                               it never produced a verdict at all (killed, out of
+    #                               disk, semaphore timeout). Emit
+    #                               verify_cross_check_inconclusive and TRUST the
+    #                               remote green — see the invariant on that arm.
     if (
         runner is not None
         and verify.passed
@@ -2888,7 +2895,58 @@ async def _run_post_merge_verify(
                 req.task_id, merge_sha, runner.name, exc,
             )
         else:
-            if local_verify.passed == verify.passed:
+            # INVARIANT (task 3173): only a COMPLETED failing verdict on either
+            # host may veto a completed PASS.  A leg that was killed by an
+            # external signal, ran out of disk, or lost a semaphore never
+            # produced a verdict AT ALL — it holds no evidence about the branch,
+            # so discarding an already-built, already-verified merge commit on
+            # its say-so is pure waste.  Measured case: merge_sha b1ac2c7f, a
+            # completed 1097s remote PASS thrown away because the local leg was
+            # SIGKILLed at 0.31s under host load, then surfaced to the human as
+            # "Post-merge verification failed: Failures: lint issues" — a
+            # branch-blaming sentence about a process that emitted zero
+            # diagnostics.
+            #
+            # Same fail-SAFE shape as the two `except` arms above (emit
+            # verify_cross_check_inconclusive, do NOT quarantine, do NOT
+            # escalate, do NOT adopt a verdict — leave `verify` = the remote
+            # green so the `if not verify.passed:` path below is skipped and the
+            # land proceeds).  They are unreachable here only because a killed
+            # leg returns NORMALLY with passed=False instead of raising.
+            #
+            # infra_timeout is deliberately NOT in the registry: a hang is one
+            # of the few non-completions a branch can genuinely cause, so a
+            # local timeout keeps vetoing (fail CLOSED).  An EMPTY category is
+            # likewise not a licence to land.  See
+            # INDETERMINATE_VERDICT_CATEGORIES — and note it is UNRELATED to
+            # merge_disposition.MergeFailureDisposition.INDETERMINATE, which is
+            # post-failure attribution one layer up.
+            if not local_verify.passed and (
+                (local_verify.category or '') in INDETERMINATE_VERDICT_CATEGORIES
+            ):
+                if event_store is not None:
+                    event_store.emit(
+                        EventType.verify_cross_check_inconclusive,
+                        task_id=req.task_id,
+                        data={
+                            'merge_sha': merge_sha,
+                            'remote_runner': runner.name,
+                            'local_category': local_verify.category,
+                            'reason': (
+                                f'local trust-anchor produced no verdict '
+                                f'(category={local_verify.category!r}): '
+                                f'{local_verify.summary}'
+                            ),
+                        },
+                    )
+                logger.warning(
+                    'Task %s: local cross-check trust-anchor produced NO verdict '
+                    'for %s (remote=%s, category=%s) — trusting the remote green '
+                    '(fail-safe, DriftDetector Invariant 5): %s',
+                    req.task_id, merge_sha, runner.name,
+                    local_verify.category, local_verify.summary,
+                )
+            elif local_verify.passed == verify.passed:
                 # AGREE — both green.  Emit parity telemetry and proceed to land.
                 if event_store is not None:
                     event_store.emit(
