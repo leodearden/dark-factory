@@ -20,7 +20,6 @@ import logging
 import math
 import os
 import shutil
-import signal
 import time
 import traceback
 import uuid
@@ -2047,11 +2046,9 @@ def _load_reify_attempt_sidecar(merge_wt: Path) -> _ReifyAttemptSidecar | None:
 # probe compiles cold on exactly the lanes this capability targets.
 _NEXTEST_LIST_PROBE_TIMEOUT_SECS = 300
 
-# Bound on how long the timeout path waits to REAP the killed probe.  The kill
-# is a SIGKILL to the whole process group, so this should be instant; the bound
-# exists only so a pathological un-reapable child can never wedge the merge lane
-# the outer ceiling is there to protect.
-_PROBE_REAP_TIMEOUT_SECS = 10.0
+# Per-signal grace for the timeout path's group kill (SIGTERM, then SIGKILL).
+# Kept short: the probe is a `nextest list`, so there is nothing to flush.
+_PROBE_KILL_GRACE_SECS = 2.0
 
 # How much of a failed probe's stderr is carried into the WARNING.  Enough to
 # tell 'cargo-nextest not installed' from 'unknown flag' from 'workspace failed
@@ -2067,23 +2064,27 @@ def _stderr_tail(stderr: str) -> str:
     return tail if tail else '<empty>'
 
 
-def _kill_probe_process_tree(proc: asyncio.subprocess.Process) -> None:
-    """SIGKILL the probe's whole process GROUP, falling back to the process.
+async def _kill_probe_process_tree(
+    proc: asyncio.subprocess.Process, pgid: int
+) -> None:
+    """Terminate the probe's whole process GROUP via the shared helper.
 
     ``cargo nextest list`` spawns ``rustc`` / build-script children that a bare
     ``proc.kill()`` leaves running.  Since the probe exists precisely to be
     bounded (:data:`_NEXTEST_LIST_PROBE_TIMEOUT_SECS`), leaking compiles into
-    the merge lane on the timeout path would defeat the ceiling.  The spawn
-    passes ``start_new_session=True`` so the probe leads its own group and this
-    ``killpg`` cannot reach the orchestrator itself.
+    the merge lane on the timeout path would defeat the ceiling.
+
+    Delegates to :func:`shared.proc_group.terminate_process_group` — the
+    repo's single blessed SIGTERM→SIGKILL group-kill (landed on main; see also
+    ``verify.py``) — rather than re-implementing it.  ``pgid`` MUST be the value
+    captured immediately after the ``start_new_session=True`` spawn (where
+    ``pgid == proc.pid`` by POSIX guarantee): calling ``os.getpgid(proc.pid)``
+    here instead would be unsafe, because by this point the process may already
+    have been reaped and its pid recycled onto an unrelated group.
     """
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError):
-        # Already reaped, or no group to signal (e.g. a test double) — fall back
-        # to the single process; a second ProcessLookupError is benign.
-        with contextlib.suppress(ProcessLookupError, OSError):
-            proc.kill()
+    from shared.proc_group import terminate_process_group
+
+    await terminate_process_group(proc, pgid, grace_secs=_PROBE_KILL_GRACE_SECS)
 
 
 async def _run_probe_cmd(
@@ -2124,15 +2125,23 @@ async def _run_probe_cmd(
         # tree — see :func:`_kill_probe_process_tree`.
         start_new_session=True,
     )
+    # Capture the pgid NOW, while proc is guaranteed alive and unreaped: with
+    # start_new_session=True, pgid == proc.pid by POSIX guarantee.  Reading it
+    # later (os.getpgid) could hit a recycled pid and signal a stranger.
+    pgid = proc.pid
     try:
         stdout, stderr = await asyncio.wait_for(
             proc.communicate(), timeout=timeout_secs
         )
     except (TimeoutError, asyncio.CancelledError):
-        _kill_probe_process_tree(proc)
-        # Bounded reap: never trade a probe timeout for an unbounded await.
+        # Hard-bounded: a cancelled communicate() can leave proc.wait() pending
+        # on still-open pipe transports, so the cleanup itself gets a ceiling.
+        # Never trade a probe timeout for an unbounded await in the merge lane.
         with contextlib.suppress(Exception):
-            await asyncio.wait_for(proc.wait(), timeout=_PROBE_REAP_TIMEOUT_SECS)
+            await asyncio.wait_for(
+                _kill_probe_process_tree(proc, pgid),
+                timeout=_PROBE_KILL_GRACE_SECS * 3,
+            )
         raise
     return (
         proc.returncode or 0,

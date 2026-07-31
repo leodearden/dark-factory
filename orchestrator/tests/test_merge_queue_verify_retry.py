@@ -19,7 +19,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import signal
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
@@ -926,33 +925,57 @@ def test_run_probe_cmd_spawns_its_own_session(tmp_path: Path) -> None:
     )
 
 
-def test_kill_probe_process_tree_kills_the_group_then_falls_back() -> None:
-    """The timeout kill targets the process GROUP, with a single-process fallback."""
+@pytest.mark.asyncio
+async def test_kill_probe_process_tree_delegates_to_the_shared_group_kill() -> None:
+    """The timeout kill reuses shared.proc_group.terminate_process_group.
+
+    That helper is the repo's single blessed SIGTERM->SIGKILL group kill (it
+    already backs verify.py), and it is the reason the pgid must be CAPTURED at
+    spawn rather than re-read with os.getpgid(): by kill time the process may
+    have been reaped and its pid recycled onto an unrelated group, which a
+    hand-rolled killpg would then signal.
+    """
     from orchestrator import merge_queue as mq
 
-    proc = SimpleNamespace(pid=4242, kill=MagicMock())
+    proc = cast('asyncio.subprocess.Process', SimpleNamespace(pid=4242))
+    seen: dict[str, object] = {}
+
+    async def _fake_terminate(p, pgid, *, grace_secs=5.0):
+        seen.update(proc=p, pgid=pgid, grace_secs=grace_secs)
+
+    with patch('shared.proc_group.terminate_process_group', _fake_terminate):
+        await mq._kill_probe_process_tree(proc, 4242)
+
+    assert seen['proc'] is proc
+    assert seen['pgid'] == 4242
+    assert seen['grace_secs'] == mq._PROBE_KILL_GRACE_SECS
+
+
+@pytest.mark.asyncio
+async def test_run_probe_cmd_kills_with_the_pgid_captured_at_spawn(
+    tmp_path: Path,
+) -> None:
+    """The pgid handed to the kill is proc.pid, read while the child is alive."""
+    from orchestrator import merge_queue as mq
+
+    seen: dict[str, object] = {}
+
+    async def _spy_kill(proc, pgid):
+        seen['pgid'] = pgid
+        seen['pid'] = proc.pid
+        proc.kill()
+        await proc.wait()
 
     with (
-        patch.object(mq.os, 'getpgid', return_value=4242) as getpgid,
-        patch.object(mq.os, 'killpg') as killpg,
+        patch.object(mq, '_kill_probe_process_tree', _spy_kill),
+        pytest.raises(TimeoutError),
     ):
-        mq._kill_probe_process_tree(cast('asyncio.subprocess.Process', proc))
+        await mq._run_probe_cmd(
+            ['sh', '-c', 'sleep 120'], cwd=tmp_path, timeout_secs=0.5,
+        )
 
-    getpgid.assert_called_once_with(4242)
-    killpg.assert_called_once_with(4242, signal.SIGKILL)
-    proc.kill.assert_not_called()
-
-    # Already-reaped / no-such-group: fall back to the single process rather
-    # than letting the timeout path raise out of its own cleanup.
-    proc2 = SimpleNamespace(pid=4243, kill=MagicMock())
-    with (
-        patch.object(mq.os, 'getpgid', side_effect=ProcessLookupError()),
-        patch.object(mq.os, 'killpg') as killpg2,
-    ):
-        mq._kill_probe_process_tree(cast('asyncio.subprocess.Process', proc2))
-
-    killpg2.assert_not_called()
-    proc2.kill.assert_called_once_with()
+    # start_new_session=True makes pgid == pid by POSIX guarantee.
+    assert seen['pgid'] == seen['pid']
 
 
 # ---------------------------------------------------------------------------
