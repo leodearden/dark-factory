@@ -2539,6 +2539,53 @@ class TestMemoryEvalsEndpoint:
         # Still serving: the other two runs render.
         assert payload['evals'][0]['run_stamps'] == list(_ROUTE_RUNS[1:])
 
+    def test_corrupt_escalation_file_is_a_200_not_a_500(self, client, tmp_path: Path) -> None:
+        """The other artifact tree the route reads must degrade the same way.
+
+        ``test_malformed_artifact_never_500s_and_is_counted`` corrupts a
+        METRICS artifact; the escalation queue is the second unvalidated tree
+        this route walks, and it reaches the reader through a different code
+        path (``load_queue_escalations``, reused per INV-5 rather than
+        reimplemented).  This pins the half of the contract this module
+        depends on but does not own: an unparseable queue file is skipped, so
+        the section still renders and the row degrades to unlinked rather than
+        the whole poll 500ing.
+
+        A characterisation test, not a RED-first one — the behaviour holds
+        today by virtue of ``load_queue_escalations``'s own contract.  It is
+        worth pinning because that contract is a dependency: if the shared
+        reader ever started propagating a ``JSONDecodeError``, this route would
+        be one of the callers that breaks, and nothing else here would catch it.
+
+        Note the asymmetry it also documents: the skip produces NO payload
+        issue, because the discard happens inside the shared reader rather than
+        in this module.  A corrupt file holding an open alarm therefore leaves
+        the parity view silently short one escalation — the reason
+        ``unmatched_escalations`` cannot be read as exhaustive, and a gap that
+        can only be closed in ``dashboard/data/escalations.py``.
+        """
+        from dashboard.app import _memory_evals_cache_clear
+
+        config = _route_tree(tmp_path)
+        client.app.state.config = config
+        _memory_evals_cache_clear()
+
+        pre = client.get(_ROUTE_URL).json()['MEMORY_EVALS']
+        assert _only(pre['evals'][0]['metrics'], 'dangling-pointers')['parity'] == 'alarmed_open'
+
+        _corrupt(config.reconciliation_escalations_dir / 'esc-eval-1.json')
+        _memory_evals_cache_clear()
+        resp = client.get(_ROUTE_URL)
+
+        assert resp.status_code == 200
+        payload = resp.json()['MEMORY_EVALS']
+        # The eval section still renders in full; only the join is lost.
+        assert payload['evals'][0]['run_stamps'] == list(_ROUTE_RUNS)
+        row = _only(payload['evals'][0]['metrics'], 'dangling-pointers')
+        assert row['escalation'] is None
+        # Degraded to unlinked — never silently re-rendered as still-linked.
+        assert row['parity'] == 'alarmed_unlinked'
+
     def test_ttl_cache_single_flights_the_scan(self, client, tmp_path: Path) -> None:
         """Within the TTL window the disk is not re-scanned.
 
