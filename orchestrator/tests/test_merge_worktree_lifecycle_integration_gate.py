@@ -198,7 +198,94 @@ accepted on purpose -- the PRD's done gate is defined as a single readable
 Sec.9 row matrix -- but if you are here because a change made two files
 red, the right-hand column is where the ORIGINAL unit-level contract
 lives; treat this file as the composition/traceability layer over it, and
-do not deepen a port here that would be better expressed upstream.
+do not deepen a port here that would be better expressed upstream. The
+MEASURED split below tells you which assertions in each port are safe to
+re-sync mechanically from that column versus which are original
+contracts you must re-derive by hand. This acceptance is a recorded
+DECISION, not an assumption: see D9 and the `G7 waiver:
+no-lockstep-duplication` in docs/prds/merge-worktree-lifecycle-integrity.md
+Sec.5.
+
+MEASURED duplicate-vs-unique split (per row) -- vs upstream, vs capstone
+----------------------------------------------------------------------------
+The PROVENANCE table above says WHERE each row was ported from; it does
+not say WHICH assertions duplicate that origin (safe to drop) versus the
+gate's own capstone (:class:`TestFiveThreeTwoSixReplayGate`, load-bearing
+HERE). Conflating the two is how row 3's port silently DROPPED an
+upstream assertion (repaired 2026-07-30, task 3153) while row 9's port
+silently GAINED unique coverage -- neither fact was written down until
+now. Measured by a full assertion-level diff, not estimated:
+
+  rows 1,2,4 | vs upstream: FULLY SUBSUMED -- mechanical re-sync from
+             |   test_crash_recovery.py::TestRecoverCrashedTasksC2Namespace::
+             |   test_infra_and_merge_survive_sweep_only_task_shaped_cleaned.
+             |   The gate's real-git repo is inert on the C2 arm (pure
+             |   in-process classification against a mocked git_ops), so
+             |   re-derive a production-change fix from that node id
+             |   rather than from scratch.
+             | vs capstone: NOT subsumed, ORIGINAL CONTRACT -- re-derive
+             |   by hand. The capstone asserts survival,
+             |   cleaned_paths.isdisjoint(protected) and the upper-bound
+             |   pin, but NEVER the INFO skip-REPORTING (no info_messages
+             |   name loop). LOAD-BEARING HERE.
+  3          | vs upstream: PARTIAL -- the gate ADDS a stale-.lock file
+             |   plus a guaranteed-dead pgid setup (upstream's dead tree
+             |   has no lock file at all) and a logger-scoped WARNING
+             |   count; it had DROPPED upstream's no-skip-WARNING-on-
+             |   fail-open assertion, restored 2026-07-30 (task 3153).
+             |   Upstream's 8 sibling outcome tests (skipped_persistent
+             |   x2, not_present, failed, lock-unlink/preserve, the
+             |   CleanupMergeWorktreeRouting pair) are deliberately NOT
+             |   ported.
+             | vs capstone: PARTIAL -- the capstone re-covers only the
+             |   skipped_lease_held / removed OUTCOMES via the reaper
+             |   spy, never the dead-holder fail-open and never the
+             |   WARNING count/pgid/reason. LOAD-BEARING HERE.
+  6,7        | vs upstream: FULLY SUBSUMED -- mechanical re-sync from
+             |   test_merge_queue_store.py::
+             |   TestRecoverPendingMergesRegistryDedup, including its
+             |   order-independence contract (the descendant wins
+             |   regardless of journal order). git_ops is a MagicMock in
+             |   both files, so the gate is not "more real" than its
+             |   origin.
+             | vs capstone: NOT subsumed, ORIGINAL CONTRACT -- re-derive
+             |   by hand. The capstone asserts
+             |   recovered/coalesced/len(requests)/winner-is-descendant/
+             |   qsize but NEVER the peer-future MIRROR (no waiters
+             |   assertion, no peer .result()) and drives only ONE
+             |   journal order. LOAD-BEARING HERE.
+  8          | vs upstream: FULLY SUBSUMED -- mechanical re-sync from
+             |   test_merge_queue_c3_submit_identity.py::
+             |   TestC3SubmitGateInVerify::test_in_verify_newer_sha_rejects.
+             |   NOTE: the gate passes event_store=None where upstream
+             |   passes a real EventStore; this is DELIBERATE and INERT
+             |   -- coalesce_or_enqueue_merge_request's duplicate_in_verify
+             |   reject returns BEFORE any of the function's
+             |   event_store emit sites (all of which sit on the
+             |   coalesce/registry branches), so a real EventStore is
+             |   never touched on this path. Do not "fix" it.
+             | vs capstone: not covered at all. SOLE COVERAGE IN THIS FILE.
+  9          | vs upstream: PARTIAL, and the ONE port with genuinely NEW
+             |   detection -- the retirement -> IMMEDIATE-resubmit
+             |   composition driven through the production entry point
+             |   coalesce_or_enqueue_merge_request WITH the retention
+             |   ring is absent upstream, which never composes
+             |   retirement with coalesce_or_enqueue_merge_request (it
+             |   exercises retention only via enqueue_merge_request +
+             |   retire_cancelled_merge_request separately, in
+             |   test_merge_cancel_retire.py). Segments A (full
+             |   retirement) and C (late stale retirement / identity
+             |   guard) mechanically re-sync from that same
+             |   TestRetireCancelledMergeRequest origin; only segment B
+             |   is new.
+             | vs capstone: not covered at all. SOLE COVERAGE IN THIS FILE.
+
+Practical upshot for the next production change that turns two files red:
+rows 1,2,4,6,7,8's "FULLY SUBSUMED" halves can be re-synced MECHANICALLY
+from the upstream node id named in the PROVENANCE table above. Row 3's
+capstone-delta and row 9's segment-B retention-composition are ORIGINAL
+contracts with no upstream analogue -- re-derive them by hand; do not
+assume re-copying the upstream diff covers them.
 """
 
 from __future__ import annotations
@@ -248,6 +335,21 @@ from orchestrator.verify_cancel import (
 #: test_merge_verify_lease_guard.py's _DEAD_PGID (per-file duplication
 #: convention).
 _DEAD_PGID = 2**31 - 1
+
+
+def _git_ops_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """WARNING messages emitted by git_ops' OWN logger during the current capture.
+
+    Both legs of row 3 need the same filter, and `caplog.at_level(logger=...)`
+    does NOT filter `caplog.records` -- it only lowers the level for that logger,
+    so records from every other propagated logger still land in the list. Scoping
+    by `r.name` is what makes a count assertion a statement about the contract
+    under test rather than about global session log noise.
+    """
+    return [
+        r.getMessage() for r in caplog.records
+        if r.levelno == logging.WARNING and r.name == 'orchestrator.git_ops'
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -588,20 +690,27 @@ class TestDeleterFace:
 
         _plant_dead_holder_tree(base, dead_wt)
 
-        outcome_dead = await git_ops.remove_merge_worktree_guarded(dead_wt, reason='reaper')
+        # Clear first: scope the WARNING capture to this removal call, not
+        # to setup noise from _make_ephemeral_worktree / _plant_dead_holder_tree.
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            outcome_dead = await git_ops.remove_merge_worktree_guarded(dead_wt, reason='reaper')
         assert outcome_dead == 'removed', (
             'a stale holder-pgid record with no live flock must fail OPEN'
         )
         assert not dead_wt.exists()
+        assert _git_ops_warnings(caplog) == [], (
+            'fail-open must not emit a skip WARNING: a stale holder-pgid record is not '
+            'contention. Restored from test_remove_merge_worktree_guarded.py::'
+            'test_dead_holder_pgid_fails_open_and_removes, which the row-3 port dropped.'
+        )
 
         fd_live = _plant_leased_tree(base, live_wt)
         try:
-            # Scope the WARNING count to THIS call and to git_ops' own logger:
-            # `caplog.records` accumulates every propagated record for the whole
-            # call phase (including the dead-holder removal above, and any
-            # WARNING from an unrelated logger), so an unscoped
-            # `len(warnings) == 1` would be an assertion about global session
-            # log noise rather than about the live-lease skip.
+            # Clear first: `caplog.records` accumulates across the whole capture
+            # phase, so without this the dead-holder removal above would leak
+            # into this call's WARNING count. `_git_ops_warnings` (module-level,
+            # above) does the per-logger scoping.
             caplog.clear()
             with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
                 outcome_live = await git_ops.remove_merge_worktree_guarded(live_wt, reason='reaper')
@@ -611,17 +720,13 @@ class TestDeleterFace:
             )
             assert live_wt.exists(), 'a live lease holder must leave the tree intact'
 
-            warnings = [
-                r for r in caplog.records
-                if r.levelno == logging.WARNING and r.name == 'orchestrator.git_ops'
-            ]
+            warnings = _git_ops_warnings(caplog)
             assert len(warnings) == 1, (
                 f'expected exactly one orchestrator.git_ops WARNING, got '
-                f'{len(warnings)}: {[r.getMessage() for r in warnings]}'
+                f'{len(warnings)}: {warnings}'
             )
-            message = warnings[0].getMessage()
-            assert str(os.getpgrp()) in message, message
-            assert 'reaper' in message, message
+            assert str(os.getpgrp()) in warnings[0], warnings[0]
+            assert 'reaper' in warnings[0], warnings[0]
         finally:
             release_merge_verify_flock(fd_live)
             remove_lock_holder_pgid(base)
