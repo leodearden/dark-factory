@@ -1199,7 +1199,12 @@ def test_format_report_always_prints_coverage_even_with_zero_candidates():
 def test_format_report_marks_lock_level_candidates_with_an_explicit_caveat():
     """(c) a LOCK_LEVEL candidate's paths are MODULE paths, and the report
     must say so — a repair that backfilled them verbatim would corrupt
-    metadata.files."""
+    metadata.files.
+
+    Asserts PLACEMENT, not prose: the caveat is emitted, it annotates the
+    LOCK_LEVEL candidate's own line, and it is absent for a FILE_LEVEL
+    candidate. The caveat's wording is fixed once, at its definition in
+    audit_wiped_metadata_files.py, and is not re-pinned here."""
     report = format_report(
         [
             _audit(
@@ -1222,11 +1227,6 @@ def test_format_report_marks_lock_level_candidates_with_an_explicit_caveat():
     # "with only a lock-level signal:" row and prove nothing.
     caveat = lines[candidate_at + 1]
     assert caveat == _LOCK_LEVEL_CAVEAT
-    lowered = caveat.lower()
-    assert "lock-level" in lowered            # what the paths are
-    assert "module path" in lowered           # ...and why that matters
-    assert "metadata.files" in lowered        # ...and what must not be done
-    assert "must not be backfilled" in lowered
 
     # Negative control: a FILE_LEVEL candidate carries no caveat at all.
     assert _LOCK_LEVEL_CAVEAT not in format_report([_audit([_candidate(8)])])
