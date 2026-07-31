@@ -35,7 +35,10 @@ from audit_wiped_metadata_files import (
     WipeCandidate,
 )
 
-from repair_wiped_metadata_files import select_repairable_candidates
+from repair_wiped_metadata_files import (
+    plan_files_rejection_reason,
+    select_repairable_candidates,
+)
 
 # ---------------------------------------------------------------------------
 # Synthetic candidate builder.
@@ -138,3 +141,73 @@ def test_select_preserves_input_order_and_does_not_mutate_the_input():
 
 def test_select_on_an_empty_feed_returns_empty():
     assert select_repairable_candidates([]) == []
+
+
+# ---------------------------------------------------------------------------
+# plan_files_rejection_reason — the lock-charter PRE-CHECK.
+#
+# The interceptor's _reject_directory_locks_in_update_metadata
+# (fused-memory/src/fused_memory/middleware/task_interceptor.py:5284) rejects a
+# metadata.files write carrying a DIRECTORY entry with an opaque
+# lock_charter_error. Pre-checking turns that into a named, attributable skip.
+# ---------------------------------------------------------------------------
+
+
+def test_plan_files_rejection_reason_accepts_an_all_file_level_list():
+    """(a) every entry is file-level -> no reason. The systemd unit paths are
+    deliberate: `timer` and `service` ARE in shared.locking.CODE_EXTENSIONS, so
+    a naive "no dot-py suffix means directory" check would wrongly reject real
+    repairable paths measured in today's population."""
+    candidate = _candidate(
+        1,
+        plan_files=(
+            "orchestrator/src/orchestrator/workflow.py",
+            "scripts/reclaim-orphaned-worktrees.timer",
+            "scripts/reclaim-orphaned-worktrees.service",
+            "scripts/restart-all-orchestrators.sh",
+            "dark-factory-orchestrator.yaml",
+            "pyproject.toml",
+        ),
+    )
+
+    assert plan_files_rejection_reason(candidate) is None
+
+
+def test_plan_files_rejection_reason_names_every_directory_entry():
+    """(b) a directory-looking entry -> a non-empty reason NAMING it, so the
+    operator can act on the summary without re-deriving which path tripped."""
+    candidate = _candidate(
+        2,
+        plan_files=(
+            "orchestrator/src/orchestrator/workflow.py",
+            "orchestrator/src/orchestrator",
+            "shared/src/shared/",
+        ),
+    )
+
+    reason = plan_files_rejection_reason(candidate)
+
+    assert reason
+    assert "orchestrator/src/orchestrator" in reason
+    assert "shared/src/shared/" in reason
+    # The clean entry is not slandered as an offender.
+    assert "workflow.py" not in reason
+
+
+def test_plan_files_rejection_reason_rejects_an_empty_plan_files():
+    """(c) nothing to restore. A write setting files to [] would re-perform the
+    very wipe this script exists to undo, so it must never be issued."""
+    reason = plan_files_rejection_reason(_candidate(3, plan_files=()))
+
+    assert reason
+    assert "empty" in reason.lower()
+
+
+def test_plan_files_rejection_reason_rejects_a_list_of_only_blanks():
+    """A whitespace-only entry carries no scope either. directory_locks skips
+    blanks, so a bare directory check would call this list clean and issue a
+    write whose files list the server then coerces to nothing."""
+    reason = plan_files_rejection_reason(_candidate(4, plan_files=("", "   ")))
+
+    assert reason
+    assert "empty" in reason.lower()
