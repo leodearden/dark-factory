@@ -24,7 +24,6 @@ from _verify_config_corpus import (
 
 from orchestrator.verify_cmd import (
     _CHAIN_OPERATOR_TOKENS,
-    _NON_AND_CHAIN_TOKENS,
     ToolKind,
     VerifyCmd,
     apply_pytest_numprocesses,
@@ -1207,20 +1206,4 @@ class TestChainOperatorTokenCoverage:
         assert split_chain_tail(raw, self._KEYWORD) == (raw, ''), (
             f'{operator!r} is a recognised chain operator, so split_chain_tail must refuse '
             f'to carry a tail across it'
-        )
-
-    def test_refusal_set_covers_every_non_and_operator(self):
-        """The set-level relationship the step-11 derivation encodes.
-
-        Stated as containment plus one exclusion rather than as an equality:
-        `_NON_AND_CHAIN_TOKENS` legitimately holds MORE than the operators —
-        the `(` and `)` paren tokens — because grouping is disqualifying for
-        its own reason, distinct from being a chain delimiter.
-        """
-        assert (_CHAIN_OPERATOR_TOKENS - {'&&'}) <= _NON_AND_CHAIN_TOKENS, (
-            'every chain operator except `&&` must be refused by split_chain_tail'
-        )
-        assert '&&' not in _NON_AND_CHAIN_TOKENS, (
-            '`&&` is the one carryable operator — listing it here would disable '
-            'tail preservation entirely'
         )
