@@ -655,13 +655,42 @@ def tick() -> None:
     state = load_state()
 
     # §Contract "ceiling", tripped state. INV-4: once the ceiling has been
-    # reached, no further restarts happen until the episode ends. Returning
-    # here also enforces the dedup — the L2 is filed exactly once, when the
-    # flag is first set, never re-filed while it remains set.
+    # reached, no further restarts happen until the episode ends, and the L2
+    # is not re-filed (the dedup — it was filed exactly once, when the flag
+    # was first set).
+    #
+    # The tick still PROBES, because the episode has to be able to end. Taken
+    # literally, I4's "until an operator intervenes" means a state file
+    # someone deletes by hand — so a dashboard that recovered on its own at
+    # 3am would stay unsupervised until a human noticed a stale flag they do
+    # not know exists. A successful probe is unambiguous evidence the episode
+    # is over: the service is answering, there is nothing left to restart, and
+    # normal supervision (which still requires FAIL_STREAK fresh consecutive
+    # misses before it acts) can safely resume. A dashboard that stays down
+    # stays cleanly down, with its L2 on file, for as long as the fault lasts.
     if state["ceiling_open"]:
+        if probe_health():
+            logger.warning(
+                f"{DASHBOARD_UNIT} is healthy again; closing the restart-ceiling "
+                "episode and resuming normal supervision. The L2 already on "
+                "file still describes what happened and is not withdrawn."
+            )
+            state["ceiling_open"] = False
+            state["streak"] = 0
+            # The restart epochs are deliberately NOT cleared. They are the
+            # evidence the rolling ceiling is measured against; wiping them
+            # here would let a dashboard alternate crash → recover → crash and
+            # earn a fresh MAX_RESTARTS allowance every cycle — a restart storm
+            # with extra steps.
+            save_state(state)
+            return
+
+        # Still down. Log and leave the streak at 0: banking a streak while
+        # nobody is acting on it would mean the first miss after a recovery
+        # instantly satisfies FAIL_STREAK, bypassing the hysteresis gate.
         logger.warning(
-            f"{DASHBOARD_UNIT} restart ceiling is OPEN (an L2 is on file); "
-            "not restarting and not re-filing"
+            f"{DASHBOARD_UNIT} restart ceiling is OPEN and the probe is still "
+            "failing; an L2 is on file, taking no action"
         )
         return
 
