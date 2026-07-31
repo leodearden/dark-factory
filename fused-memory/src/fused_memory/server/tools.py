@@ -1359,6 +1359,12 @@ def create_mcp_server(
         'distinguished from "no citations". This delete is irreversible, so it '
         'is refused rather than risked; retry once the task backend is reachable.'
     )
+    _CITATION_REPOINT_FAILED_HINT = (
+        'the listed tasks still cite the doomed entry — deleting now would '
+        'strand exactly the pointers this gate protects. Inspect unrepointed[] '
+        'for each write rejection, then retry the delete; already-repointed '
+        'tasks are idempotent on a second pass.'
+    )
     # Categories the premature-completion-claim guard (task 2824) covers — the
     # same four the live-task-status guard (task 2628) covers.
     # preferences_and_norms/procedural_knowledge are deliberately excluded: a norm
@@ -1526,17 +1532,80 @@ def create_mcp_server(
                 'hint': _CITATION_REPOINT_HINT,
             }, None
 
+        # A forwarding pointer is only a pointer if it is a concrete id. This
+        # is the mechanical form of incident failure mode (2): prose describing
+        # how to FIND the survivor (the re-derive-via-search "correction") is
+        # not a survivor, and re-deriving at read time resolved straight back
+        # into the superseded duplicates this delete is collapsing.
+        if not is_concrete_memory_id(replacement_memory_id):
+            return {
+                'error': (
+                    f'replacement_memory_id {replacement_memory_id!r} is not a '
+                    'concrete 36-char UUID, so it cannot forward the citations '
+                    f'that {len(live_citers)} live task(s) hold on {memory_id}.'
+                ),
+                'error_type': 'CitationReplacementInvalid',
+                'memory_id': memory_id,
+                'replacement_memory_id': replacement_memory_id,
+                'citing_tasks': [
+                    {'task_id': c['task_id'], 'status': c['status'], 'paths': c['paths']}
+                    for c in live_citers
+                ],
+                'hint': _CITATION_REPOINT_HINT,
+            }, None
+
         # Repoint BEFORE the delete. The caller falls through to
         # memory_service.delete_memory only after this returns, which is the
         # ordering guarantee: no window exists in which the entry is gone but a
         # live task still points at it.
-        stats = await repoint_task_citations(
-            task_interceptor,
-            project_root,
-            memory_id=memory_id,
-            replacement_id=replacement_memory_id,
-            run_id=None,
-        )
+        try:
+            stats = await repoint_task_citations(
+                task_interceptor,
+                project_root,
+                memory_id=memory_id,
+                replacement_id=replacement_memory_id,
+                run_id=None,
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            logger.warning(
+                'citation gate: repoint sweep failed for %s; failing closed',
+                memory_id,
+                exc_info=True,
+            )
+            return {
+                'error': (
+                    f'Citation repoint sweep failed for {memory_id}; refusing '
+                    'the delete so no live citation is left dangling.'
+                ),
+                'error_type': 'CitationRepointFailed',
+                'memory_id': memory_id,
+                'replacement_memory_id': replacement_memory_id,
+                'unrepointed': [],
+                'repoint_error': str(exc),
+                'repoint_error_type': type(exc).__name__,
+                'hint': _CITATION_SCAN_FAILED_HINT,
+            }, None
+
+        if stats['stage1_citation_repoint_failures']:
+            # At least one live citer was NOT repointed. Deleting now would
+            # strand exactly the pointer this gate exists to protect, so the
+            # delete is refused and retried next cycle instead.
+            return {
+                'error': (
+                    f'{stats["stage1_citation_repoint_failures"]} live citation(s) '
+                    f'of {memory_id} could not be repointed to '
+                    f'{replacement_memory_id}; refusing the delete.'
+                ),
+                'error_type': 'CitationRepointFailed',
+                'memory_id': memory_id,
+                'replacement_memory_id': replacement_memory_id,
+                'unrepointed': stats['unrepointed'],
+                'citation_repoint': stats,
+                'hint': _CITATION_REPOINT_FAILED_HINT,
+            }, None
+
         return None, {'citation_repoint': stats}
 
     async def _scan_task_citations(
