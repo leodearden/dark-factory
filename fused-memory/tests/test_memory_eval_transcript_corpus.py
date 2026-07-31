@@ -21,6 +21,7 @@ import json
 import sys
 import types
 from pathlib import Path
+from typing import Any
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'memory_eval_transcript_corpus.py'
 FIXTURE_ARCHIVE = Path(__file__).parent / 'fixtures' / 'transcript_corpus'
@@ -79,7 +80,7 @@ def _tool_use(tool_use_id: str, query: str, *, name: str = SEARCH, **params):
 
 def _tool_result(tool_use_id: str, payload, *, is_error: bool = False):
     """A user record carrying the answer. ``content`` is a JSON STRING."""
-    block = {
+    block: dict[str, Any] = {
         'type': 'tool_result',
         'tool_use_id': tool_use_id,
         'content': payload if isinstance(payload, str) else json.dumps(payload),
@@ -1162,11 +1163,11 @@ class TestReaderBindings:
     """
 
     def test_load_transcript_is_the_imported_function(self):
-        import legibility.digest
+        import legibility.digest  # type: ignore[reportMissingImports]
         assert _mod.load_transcript is legibility.digest.load_transcript
 
     def test_iter_json_lines_is_the_imported_function(self):
-        import legibility.inventory
+        import legibility.inventory  # type: ignore[reportMissingImports]
         assert _mod.iter_json_lines is legibility.inventory.iter_json_lines
 
 

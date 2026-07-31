@@ -196,8 +196,12 @@ _SCRIPTS_ROOT = _REPO_ROOT / 'scripts'
 if _SCRIPTS_ROOT.exists() and str(_SCRIPTS_ROOT) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_ROOT))
 
-from legibility.digest import load_transcript  # noqa: E402
-from legibility.inventory import iter_json_lines  # noqa: E402
+# The `# type: ignore[reportMissingImports]` is not a defect being papered
+# over: these resolve at RUNTIME via the insert above, but pyright is invoked
+# from fused-memory/ whose extraPaths cannot see repo-root scripts/. Same
+# situation, same idiom, as escalation/'s imports of orchestrator.*.
+from legibility.digest import load_transcript  # type: ignore[reportMissingImports]  # noqa: E402
+from legibility.inventory import iter_json_lines  # type: ignore[reportMissingImports]  # noqa: E402
 from shared.memory_eval_metrics import RUN_STAMP_ENV_VAR  # noqa: E402
 
 # INV-5 / D9: TWO existing readers, ONE core, ZERO new parsers. The scan path
@@ -352,7 +356,7 @@ def _caller_from_record(record: Mapping[str, Any]) -> dict[str, Any] | None:
 # ---------------------------------------------------------------------------
 
 
-def _content_blocks(record: Mapping[str, Any]) -> list[dict[str, Any]]:
+def _content_blocks(record: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     """The record's ``message.content`` blocks, or [] for anything else.
 
     Absorbs every non-message shape the archive interleaves: records with no
