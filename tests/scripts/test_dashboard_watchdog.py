@@ -1100,6 +1100,30 @@ def test_b4_escalation_summary_carries_the_measured_evidence(
     assert mod.PROBE_URL in detail, "the detail must name what was actually probed"
 
 
+def test_b4_summary_is_one_line_within_the_record_contract(
+    monkeypatch, state_env, queue_env
+):
+    """escalation.models.Escalation declares ``summary: str  # one-line``.
+
+    Nothing ENFORCES that — there is no max_length on the field — so an
+    embedded newline or a 2KB paragraph would be written to the queue happily
+    and then wrap or truncate wherever a steward reads it (dashboard row,
+    notification, digest). The contract is documentation-only, which is
+    exactly the kind that rots, so it is pinned here instead.
+    """
+    mod = _load_watchdog()
+    rec = _run_ticks(
+        monkeypatch,
+        [False] * mod.FAIL_STREAK,
+        seed_state=_at_ceiling_state(mod),
+    )
+
+    summary = _argv_value(rec.escalations[0], "--summary")
+
+    assert "\n" not in summary, f"summary is not one line: {summary!r}"
+    assert len(summary) <= 400, f"summary is {len(summary)} chars: {summary!r}"
+
+
 def test_b4_dedup_at_most_one_l2_per_ceiling_episode(
     monkeypatch, state_env, queue_env
 ):
