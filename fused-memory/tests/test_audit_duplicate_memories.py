@@ -2501,11 +2501,13 @@ def _dated(id: str, content: str, created_at: str | None, *,
 
 
 def _plan_slice(groups: list[dict] | None = None,
-                carveouts: list[dict] | None = None) -> dict:
+                carveouts: list[dict] | None = None,
+                liveness: list[dict] | None = None) -> dict:
     """A per-category plan slice, as produced by split_plan_by_category."""
     return {
         'near_duplicate_groups': groups or [],
         'topic_carveout_groups': carveouts or [],
+        'liveness_snapshot_recurrence_groups': liveness or [],
     }
 
 
@@ -2543,7 +2545,7 @@ class TestSplitPlanByCategory:
         """An empty slice, not a missing key — every requested category reports."""
         by_cat = split_plan_by_category({'near_duplicate_groups': []}, (_PK, _OS))
         assert set(by_cat) == {_PK, _OS}
-        assert by_cat[_OS] == {'near_duplicate_groups': [], 'topic_carveout_groups': []}
+        assert by_cat[_OS] == _plan_slice()
 
 
 class TestComputeClusterMetricsPerCategory:
@@ -4205,3 +4207,79 @@ class TestBuildSweepPlanLivenessRecurrences:
         assert isinstance(
             json.dumps(build_sweep_plan(_liveness_corpus()), default=str), str,
         )
+
+
+class TestLivenessRecurrenceMetrics:
+    """The recurrence count is an ARMED, directional metric -- not a scalar.
+
+    `topic_carveout_clusters` is a scalar because more carve-outs is the
+    EXPECTED Option-C shape, so alarming on it would alarm on the feature
+    working. Indefinite accretion of the same status fact is the opposite:
+    it IS the pathology this detector exists to surface.
+    """
+
+    def _fixture(self):
+        plan = build_sweep_plan(_liveness_corpus())
+        records = {_OS: _liveness_corpus(), _PK: [_dated('x', 'unrelated', None)]}
+        return records, split_plan_by_category(plan, (_OS, _PK))
+
+    def test_split_plan_projects_the_groups_into_their_category(self):
+        plan = build_sweep_plan(_liveness_corpus())
+
+        by_cat = split_plan_by_category(plan, (_OS, _PK, _PN))
+
+        assert [g['subject_task_id']
+                for g in by_cat[_OS]['liveness_snapshot_recurrence_groups']] == ['94', '96']
+        assert by_cat[_PK]['liveness_snapshot_recurrence_groups'] == []
+        assert by_cat[_PN]['liveness_snapshot_recurrence_groups'] == [], (
+            'an absent key downstream would read as "not measured"'
+        )
+
+    def test_metric_is_an_armed_directional_count_per_category(self):
+        records, plans = self._fixture()
+
+        metrics, _details = compute_cluster_metrics(records, plans, {})
+        by_id = _by_id(metrics)
+
+        metric = by_id[f'liveness_snapshot_recurrences.{_OS}']
+        assert metric.kind == 'count'
+        assert metric.direction == 'higher_is_worse'
+        assert metric.value == 2.0
+        assert metric.n == 4, 'n is the exposure: the category corpus size'
+
+    def test_a_category_with_none_still_reports_zero(self):
+        records, plans = self._fixture()
+
+        metrics, _details = compute_cluster_metrics(records, plans, {})
+
+        assert _by_id(metrics)[f'liveness_snapshot_recurrences.{_PK}'].value == 0.0
+
+    def test_details_carry_the_per_group_table(self):
+        records, plans = self._fixture()
+
+        _metrics, details = compute_cluster_metrics(records, plans, {})
+        table = details['categories'][_OS]['liveness_snapshot_recurrences']
+
+        assert [row['subject_task_id'] for row in table] == ['94', '96']
+        assert all(set(row) == {'subject_task_id', 'core_fact', 'member_ids',
+                                'snapshot_count', 'span_days'} for row in table)
+        assert table[0]['member_ids'] == ['1eef7df7', '6b245659']
+        assert table[0]['snapshot_count'] == 2
+        assert table[0]['core_fact'] == _CORE_FACT_STRANDED
+        assert table[0]['span_days'] == _span_days(_TS_94_JUL24, _TS_REVERIFY)
+        assert details['categories'][_PK]['liveness_snapshot_recurrences'] == []
+
+    def test_series_still_validates_and_metrics_stay_sorted(self):
+        from shared.memory_eval_metrics import validate_metric_series  # noqa: PLC0415
+
+        records, plans = self._fixture()
+        metrics, _details = compute_cluster_metrics(records, plans, {})
+
+        ids = [m.metric_id for m in metrics]
+        assert ids == sorted(ids)
+        assert len(ids) == len(set(ids)), 'no duplicate metric_id'
+        validate_metric_series(build_metric_series(
+            'dark_factory', metrics,
+            corpus_counts={c: len(v) for c, v in records.items()},
+            run_stamp='20260731T000000Z',
+        ))
