@@ -851,5 +851,141 @@ def test_b5_undeterminable_activation_does_not_apply_grace(monkeypatch, state_en
     assert rec.queries, "the grace gate must still have asked for the timestamp"
 
 
+# ---------------------------------------------------------------------------
+# B6 — slow-but-alive (the 2026-07-30 incident regression) + unit-file contract
+# ---------------------------------------------------------------------------
+
+WATCHDOG_UNIT_PATH = REPO_ROOT / "dashboard" / "dark-factory-dashboard-watchdog.service"
+WATCHDOG_TIMER_PATH = REPO_ROOT / "dashboard" / "dark-factory-dashboard-watchdog.timer"
+
+#: The deep, DB-touching endpoint the retired inline shell probed. Assembled
+#: rather than written literally so this test file's own text cannot be
+#: mistaken for a reintroduction when the source-absence pin is grepped.
+DEEP_ENDPOINT = "/health" + "z"
+
+
+def test_b6_slow_deep_endpoint_never_restarts_a_serving_dashboard(
+    monkeypatch, state_env
+):
+    """THE incident. A dashboard whose DB probes are slow is still SERVING.
+
+    On 2026-07-30 the deep endpoint's three 5s DB probes exceeded the inline
+    shell's ``curl --max-time 5`` while the app itself answered fine, so the
+    watchdog restarted a healthy service 192 times in 3 hours (~27% downtime),
+    and every restart made the next probe more likely to time out.
+
+    The fake dispatches on URL: the shallow endpoint answers 200 immediately,
+    the deep one raises a 503 after a simulated delay. Ten ticks must actuate
+    nothing — and the deep endpoint must never even be REQUESTED.
+    """
+    import subprocess as _sp
+    import time as _time
+    import urllib.error
+
+    active_enter = int(_time.time()) - OUTSIDE_GRACE_SECS
+    actuations: list[list[str]] = []
+    requested: list[str] = []
+
+    def fake_run(argv, *args, **kwargs):
+        argv_list = list(argv)
+        if argv_list and argv_list[0] == "systemd-cat":
+            return _sp.CompletedProcess(argv_list, 0, stdout="", stderr="")
+        if "show" in argv_list:
+            return _sp.CompletedProcess(
+                argv_list,
+                0,
+                stdout=f"ActiveEnterTimestamp=@{active_enter}\n",
+                stderr="",
+            )
+        actuations.append(argv_list)
+        return _sp.CompletedProcess(argv_list, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(_sp, "run", fake_run)
+
+    for _ in range(10):
+        mod = _load_watchdog()
+
+        def dispatching_urlopen(url, *args, **kwargs):
+            requested.append(url)
+            if DEEP_ENDPOINT in url:
+                # The slow DB probes: eventually a 503, well past any sane
+                # client timeout. Simulated, not slept — the point is the
+                # OUTCOME differs by endpoint, not the wall clock.
+                raise urllib.error.HTTPError(url, 503, "Service Unavailable", {}, None)  # type: ignore[arg-type]
+            return _FakeResponse(200)
+
+        monkeypatch.setattr(mod.urllib.request, "urlopen", dispatching_urlopen)
+        mod.tick()
+
+    assert actuations == [], f"restarted a serving dashboard: {actuations}"
+    assert requested, "the watchdog probed nothing at all"
+    assert all(DEEP_ENDPOINT not in url for url in requested), (
+        f"the watchdog requested the deep DB-probing endpoint: {requested}"
+    )
+    assert _load_watchdog().load_state()["streak"] == 0
+
+
+def test_b6_unit_execstart_invokes_the_watchdog_script():
+    """The supervision policy must live in a tested script, not in an sh -c.
+
+    The retired ExecStart was a contract-in-prose (INV-1): probe target,
+    timeout, and restart policy were all inside a shell string no test could
+    reach, which is why a single-sample restarter shipped unnoticed.
+    """
+    unit = WATCHDOG_UNIT_PATH.read_text(encoding="utf-8")
+    exec_lines = [ln for ln in unit.splitlines() if ln.startswith("ExecStart=")]
+
+    assert len(exec_lines) == 1, f"expected exactly one ExecStart: {exec_lines}"
+    assert "scripts/dashboard-watchdog.py" in exec_lines[0], exec_lines[0]
+
+
+def test_b6_unit_has_no_inline_shell_probe():
+    """``curl`` and the deep endpoint appear nowhere in the unit file.
+
+    Pins both halves of the incident at the file level: the single-sample
+    ``curl ... || systemctl restart`` and the deep endpoint it sampled.
+    """
+    unit = WATCHDOG_UNIT_PATH.read_text(encoding="utf-8")
+
+    assert "curl" not in unit, "the inline curl probe is back in the unit file"
+    assert DEEP_ENDPOINT not in unit, (
+        "the deep DB-probing endpoint is back in the watchdog unit; the "
+        "watchdog probes the shallow /api/health only"
+    )
+    assert "/bin/sh" not in unit
+
+
+def test_b6_unit_is_oneshot_and_journal_logged():
+    """Type=oneshot is what makes each tick a fresh process (hence the
+    persisted state), and journal routing is the only way an operator can see
+    why the watchdog did or did not act."""
+    unit = WATCHDOG_UNIT_PATH.read_text(encoding="utf-8")
+
+    assert "Type=oneshot" in unit
+    assert "StandardOutput=journal" in unit
+    assert "StandardError=journal" in unit
+
+
+def test_b6_timer_cadence_is_thirty_seconds():
+    """FAIL_STREAK × OnUnitActiveSec is the ~90s sustained-outage detection
+    latency the unit-file comment documents. Changing the cadence silently
+    changes that latency, so it is pinned here alongside FAIL_STREAK."""
+    timer = WATCHDOG_TIMER_PATH.read_text(encoding="utf-8")
+    mod = _load_watchdog()
+
+    assert "OnUnitActiveSec=30" in timer
+    assert mod.FAIL_STREAK * 30 == 90
+
+
+def test_b6_timer_install_stanza_is_untouched():
+    """This task is repo-side only: RE-ARMING the installed timer is task
+    3289's job. Disarming it here — by dropping [Install] — would leave the
+    dashboard unsupervised while looking like a fix."""
+    timer = WATCHDOG_TIMER_PATH.read_text(encoding="utf-8")
+
+    assert "[Install]" in timer
+    assert "WantedBy=timers.target" in timer
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))
