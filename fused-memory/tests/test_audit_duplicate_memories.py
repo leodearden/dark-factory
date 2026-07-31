@@ -57,6 +57,7 @@ _ALL_CATEGORIES = _mod._ALL_CATEGORIES
 extract_liveness_snapshot_fact = _mod.extract_liveness_snapshot_fact
 liveness_snapshot_subject_task_ids = _mod.liveness_snapshot_subject_task_ids
 find_liveness_snapshot_recurrences = _mod.find_liveness_snapshot_recurrences
+_LIVENESS_DISCLOSURE_KEYS = _mod._LIVENESS_DISCLOSURE_KEYS
 apply_deletions = _mod.apply_deletions
 resolve_ann_threshold = _mod.resolve_ann_threshold
 fetch_ann_neighbors = _mod.fetch_ann_neighbors
@@ -4019,3 +4020,88 @@ class TestFindLivenessSnapshotRecurrences:
         groups, _ = find_liveness_snapshot_recurrences(corpus, categories=(_PK,))
 
         assert groups == []
+
+
+# A recognised snapshot that names no task anywhere -- no metadata.task_id, no
+# related_task_ids, and no TASK_REF_RE match in the content ("get_task" is not
+# a task reference). It cannot be grouped, so it is a genuine recall loss.
+_LIVENESS_SNAPSHOT_UNTASKED = (
+    'Point-in-time liveness check performed 2026-07-24 during reconciliation '
+    'run 4b262e10-3624-44e5-b420-4dbedfd2bb8b (Stage 2, task_knowledge_sync): '
+    'get_task reports status="in-progress" but claimant_run_id=null and '
+    'heartbeat_at=null for the item under investigation.'
+)
+
+# Point-in-time framing plus a LIVE_TASK_STATUS_RE PARAPHRASE, with no
+# <field>=<value> assignment anywhere: a snapshot whose fields could not be
+# read, which is a different loss from "not a snapshot at all".
+_LIVENESS_SNAPSHOT_UNFIELDED = (
+    'Point-in-time liveness check performed 2026-07-24 on task 94: the task '
+    'is actively driven by an orchestrator process holding the project lock, '
+    'so Stage 2 did not write.'
+)
+
+# Point-in-time framing and NOTHING live-status-shaped: never a snapshot, so
+# neither counter may fire on it.
+_POINT_IN_TIME_NON_STATUS = (
+    'Point-in-time liveness check performed 2026-07-24 on the config sweep: '
+    'nothing of note was observed this cycle.'
+)
+
+
+class TestFindLivenessSnapshotRecurrencesDisclosure:
+    """Every way this path can lose a candidate is a counted, alarmable int.
+
+    An absent key downstream is indistinguishable from "not measured", so the
+    counters are always all present, always ints, always zero-filled on a
+    clean run -- the same contract _ANN_DISCLOSURE_KEYS carries.
+    """
+
+    def test_clean_run_zero_fills_every_key(self):
+        _, disclosure = find_liveness_snapshot_recurrences(_liveness_corpus())
+
+        assert set(disclosure) == set(_LIVENESS_DISCLOSURE_KEYS)
+        assert all(type(v) is int for v in disclosure.values()), 'ints, not bools'
+        assert set(disclosure.values()) == {0}
+
+    def test_untasked_snapshot_is_counted_not_silently_dropped(self):
+        _, disclosure = find_liveness_snapshot_recurrences([
+            _dated('u', _LIVENESS_SNAPSHOT_UNTASKED, _TS_94_JUL24, category=_OS),
+        ])
+
+        assert disclosure['liveness_snapshot_untasked'] == 1
+        assert disclosure['liveness_snapshot_unfielded'] == 0, (
+            'its fields read fine — it is only the subject that is missing'
+        )
+
+    def test_unfielded_snapshot_is_counted(self):
+        _, disclosure = find_liveness_snapshot_recurrences([
+            _dated('p', _LIVENESS_SNAPSHOT_UNFIELDED, _TS_94_JUL24,
+                   category=_OS, metadata={'task_id': '94'}),
+        ])
+
+        assert disclosure['liveness_snapshot_unfielded'] == 1
+        assert disclosure['liveness_snapshot_untasked'] == 0, (
+            'it names task 94 — it is only the fields that could not be read'
+        )
+
+    def test_point_in_time_prose_with_no_live_status_counts_as_neither(self):
+        """"Not a snapshot at all" is not a loss — nothing was ever in hand."""
+        _, disclosure = find_liveness_snapshot_recurrences([
+            _dated('n', _POINT_IN_TIME_NON_STATUS, _TS_94_JUL24,
+                   category=_OS, metadata={'task_id': '94'}),
+        ])
+
+        assert set(disclosure.values()) == {0}
+
+    def test_unswept_category_counts_neither(self):
+        """It was never in scope, so it is not a recall loss."""
+        _, disclosure = find_liveness_snapshot_recurrences(
+            [
+                _dated('u', _LIVENESS_SNAPSHOT_UNTASKED, _TS_94_JUL24, category=_OS),
+                _dated('p', _LIVENESS_SNAPSHOT_UNFIELDED, _TS_94_JUL24, category=_OS),
+            ],
+            categories=(_PK,),
+        )
+
+        assert set(disclosure.values()) == {0}
