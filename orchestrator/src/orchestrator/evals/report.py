@@ -196,6 +196,31 @@ def _is_plan_only(metrics: dict[str, Any]) -> bool:
     return metrics.get('role_under_test') == 'architect'
 
 
+def _mean_plan_quality(scores: list[float]) -> float | None:
+    """Reduce a pool of θ-rubric plan-quality scores to its mean (4 dp).
+
+    THE ONE reduction, called by BOTH :func:`build_composite_report`'s row and
+    :func:`build_plan_quality_report`'s per-config aggregate (task 3099). The
+    composite row's ``plan_quality`` used to be a first-untainted-TRIAL
+    passthrough — a harmless diagnostic echo until this task promoted the field
+    to a DECISION surface (:func:`select_survivors` ranks on it and
+    :func:`format_composite_table` renders it beside the composite). A trial-1
+    score sitting next to a mean would let the two tables the CLI now prints
+    ADJACENTLY — and the ``quality`` / ``plan_quality`` cells of one row — give
+    contradictory answers about the same quantity, reintroducing the "two
+    exclusion surfaces that disagree are worse than one" hazard on the very
+    surface this task exists to make trustworthy. Sharing the reduction (rather
+    than duplicating the arithmetic and asserting the two agree) makes that drift
+    structurally impossible.
+
+    An EMPTY pool is ``None``, never ``0.0``: "we measured nothing" must not read
+    as "it scored nothing".
+    """
+    if not scores:
+        return None
+    return round(sum(scores) / len(scores), 4)
+
+
 # ``(fixture, role_group)`` — the key of every efficiency baseline map in
 # :func:`build_composite_report` (task 3099). Module-level, not function-local:
 # a name bound inside a function body is not usable in a type expression.
@@ -239,19 +264,25 @@ def build_composite_report(
 
     ``latency_secs`` is ``workflow_duration_ms / 1000`` (the workflow's own
     working time, not wall-clock, so eval/scheduler overhead is not charged to
-    the config). ``recovery_score`` / ``plan_quality`` / ``role_under_test`` are
-    passthroughs of any trial's metrics (η/θ surfaces) — except that
-    ``plan_quality`` deliberately skips CAP-TAINTED trials (task 3118) so an
-    infra refusal landing on the first trial cannot blank out a config that has
-    healthy trials; ``plan_quality_cap_excluded`` reports how many were skipped,
-    counted over ARCHITECT trials only so it agrees exactly with
-    :func:`build_plan_quality_report`'s architect-scoped ``cap_excluded``
-    (reviewer: docs-accuracy — two exclusion surfaces that disagree are worse
-    than one).
+    the config). ``recovery_score`` / ``role_under_test`` are passthroughs of any
+    trial's metrics (η surfaces). ``plan_quality`` (θ) is NOT a passthrough: it is
+    the config's POOLED MEAN over its scored plan-only cells, reduced by
+    :func:`_mean_plan_quality` — the SAME function
+    :func:`build_plan_quality_report` reduces ``mean_plan_quality`` with, so the
+    two surfaces the CLI prints adjacently are structurally incapable of
+    disagreeing (task 3099; it was a first-untainted-TRIAL passthrough while it
+    was only a diagnostic echo, which is not defensible once
+    :func:`select_survivors` RANKS on it). Its pool admits a cell on the
+    byte-identical cascade that surface applies — architect-only, skip
+    CAP-TAINTED (task 3118), score not ``None`` — so an infra refusal is never
+    averaged in as a zero; ``plan_quality_cap_excluded`` reports how many were
+    skipped, counted over ARCHITECT trials only so it agrees exactly with that
+    surface's architect-scoped ``cap_excluded`` (reviewer: docs-accuracy — two
+    exclusion surfaces that disagree are worse than one).
 
     SCOPE of the taint exclusion (REVISED by task 3099): the ``plan_quality``
-    passthrough and — for a PLAN-ONLY trial — the ``composite`` / ``quality``
-    pools skip tainted trials. The earlier scope kept tainted trials in the
+    pool and — for a PLAN-ONLY trial — the ``composite`` / ``quality`` pools all
+    skip tainted trials. The earlier scope kept tainted trials in the
     composite pool on the grounds that it measured the implementer-path gates,
     which a tainted architect cell reports as an honest failure; once the
     composite is DERIVED from ``plan_quality`` that justification no longer
@@ -340,7 +371,7 @@ def build_composite_report(
             'judge_invocations': 0, 'judge_cost_usd': 0.0,
             'cost_sources': set(),
             'first_metrics': None,
-            'first_untainted_metrics': None,
+            'plan_quality_scores': [],
             'plan_quality_cap_excluded': 0,
         }
 
@@ -391,20 +422,19 @@ def build_composite_report(
         acc['cost_sources'].add(str(m.get('cost_source', 'cli')))
         if acc['first_metrics'] is None:
             acc['first_metrics'] = m
-        # The plan-quality passthrough deliberately skips cap-tainted trials, so
-        # an infra refusal that happened to land on the FIRST trial cannot blank
-        # out a config that has healthy ones (task 3118).
-        if m.get('cap_tainted'):
-            # Counted over ARCHITECT trials only, matching
-            # build_plan_quality_report's architect-scoped cap_excluded — the two
-            # exclusion surfaces describe the same cells and must not disagree.
-            # (A tainted non-architect trial has no plan_quality to exclude in
-            # the first place, so it is skipped as a passthrough source here and
-            # counted by neither surface.)
-            if m.get('role_under_test') == 'architect':
-                acc['plan_quality_cap_excluded'] += 1
-        elif acc['first_untainted_metrics'] is None:
-            acc['first_untainted_metrics'] = m
+        # The plan-quality POOL admits a cell on the byte-identical cascade
+        # build_plan_quality_report applies (architect-only / skip cap_tainted /
+        # score is not None), so a cap-tainted cell is counted-and-excluded here
+        # exactly as it is there (task 3118) and is never averaged in as a zero.
+        if plan_only and not m.get('cap_tainted') and raw_pq is not None:
+            acc['plan_quality_scores'].append(float(raw_pq))
+        # Counted over ARCHITECT trials only, matching
+        # build_plan_quality_report's architect-scoped cap_excluded — the two
+        # exclusion surfaces describe the same cells and must not disagree. (A
+        # tainted non-architect trial has no plan_quality to exclude in the first
+        # place, so it is counted by neither surface.)
+        if m.get('cap_tainted') and plan_only:
+            acc['plan_quality_cap_excluded'] += 1
 
     rows: list[dict[str, Any]] = []
     for cfg in sorted(by_config):
@@ -446,10 +476,12 @@ def build_composite_report(
                 'cost_usd': acc['judge_cost_usd'],
             },
             'recovery_score': fm.get('recovery_score'),
-            # Falls back to fm only when EVERY trial was tainted — there is no
-            # untainted measurement to report, and the accompanying
-            # plan_quality_cap_excluded count says why.
-            'plan_quality': (acc['first_untainted_metrics'] or fm).get('plan_quality'),
+            # The config's POOLED MEAN over its scored plan-only cells, through
+            # the SAME reduction build_plan_quality_report uses. An empty pool
+            # (every cell unmeasurable, or a workflow config with no plan-only
+            # cell at all) is None → rendered '-', with the accompanying
+            # plan_quality_cap_excluded count saying why.
+            'plan_quality': _mean_plan_quality(acc['plan_quality_scores']),
             'plan_quality_cap_excluded': acc['plan_quality_cap_excluded'],
         })
 
@@ -1046,10 +1078,9 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
             'n': len(scored[cfg]),
             'cap_excluded': excluded[cfg],
             'total': totals[cfg],
-            'mean_plan_quality': (
-                round(sum(scored[cfg]) / len(scored[cfg]), 4)
-                if scored[cfg] else None
-            ),
+            # THE ONE reduction, shared with build_composite_report's row so the
+            # two surfaces cannot drift (task 3099, :func:`_mean_plan_quality`).
+            'mean_plan_quality': _mean_plan_quality(scored[cfg]),
         }
         for cfg in sorted(totals)
     ]
@@ -1232,10 +1263,14 @@ def format_composite_table(report: dict[str, Any]) -> str:
     wall-clock/dict-order dependence). An unpriced config's ``cost_source`` shows
     the explicit marker (e.g. ``unpriced_proxy``), never a blank.
 
-    ``plan_quality`` (task 3099) is the θ-rubric score of a PLAN-ONLY architect
-    config and ``-`` for a workflow row that never invoked the plan judge — so an
-    operator can rank an architect campaign from this table alone instead of
-    recomputing from the per-cell result JSONs. ``pq_excluded`` is that config's
+    ``plan_quality`` (task 3099) is a PLAN-ONLY architect config's MEAN θ-rubric
+    score over its scored cells — not one trial's — and ``-`` for a workflow row
+    that never invoked the plan judge. Being the config-level mean is exactly what
+    makes an architect campaign rankable from this table alone instead of
+    recomputing from the per-cell result JSONs, and is why it renders the same
+    number as the ``plan_quality by config:`` block of the
+    :func:`format_plan_quality_table` the CLI prints directly beneath it
+    (:func:`_mean_plan_quality` is shared). ``pq_excluded`` is that config's
     COUNT of unmeasurable (cap-tainted) architect cells; the per-CAUSE breakdown
     that distinguishes a transient cap window from a permanent model-not-found is
     deliberately NOT duplicated here — it lives in
