@@ -628,6 +628,17 @@ class SampleResult:
     "the budget cut off real signal" (reviewer_comprehensive/observability,
     task 2573 amendment pass #2) — the previous summary reported the first
     two but left budget-driven truncation invisible.
+
+    CONSERVATION INVARIANT: every record that reaches the candidate stage
+    ends up in exactly one of ``selected`` or ``budget_skipped``, so
+    ``len(selected) + budget_skipped == candidates``. That is what makes
+    ``not selected and budget_skipped > 0`` mean exactly "candidates existed
+    and were ALL discarded on the byte budget" — the total-suppression
+    predicate ``nightly._report_sample_outcome`` escalates on, and the
+    reason a budget-suppressed night is no longer indistinguishable from a
+    genuine no-change night (task 3270). Because that equivalence is a
+    property of code that could change, it is pinned as a test:
+    ``test_legibility_sampling.TestSampleResultAccounting``.
     """
 
     selected: list[ScoredRecord]
@@ -648,6 +659,20 @@ class SampleResult:
 
     dedupe_collapsed: int = 0
     budget_skipped: int = 0
+
+    total_records: int = 0
+    """How many records were HANDED TO :func:`stratified_sample` — the
+    denominator every other count in this dataclass is a slice of.
+
+    Both production callers build exactly ONE ``ScoredRecord`` per
+    ``inventory.enumerate_sessions`` hit (:func:`main`'s scoring loop and
+    ``nightly.select_scored_records``), so this is 1:1 with the sessions
+    enumerated for the target date — which is why the operator summary line
+    may label it ``enumerated=``. It is the number of INPUTS, not of
+    survivors: ``total_records - zero_signal_dropped - dedupe_collapsed``
+    is what reached the candidate stage (see the conservation invariant
+    above). Defaulted so the existing all-keyword construction sites, and
+    hand-built ``SampleResult``s in tests, stay valid."""
 
 
 def stratified_sample(
@@ -717,8 +742,9 @@ def stratified_sample(
     score-descending order. ``dedupe_collapsed`` (records collapsed away by
     :func:`dedupe_shapes` in step 3) and ``budget_skipped`` (candidates
     excluded solely by the byte cap in steps 5-6) are accumulated
-    alongside the selection for :func:`main`'s summary — see
-    :class:`SampleResult`.
+    alongside the selection for :func:`main`'s summary — as is
+    ``total_records`` (``len(records)``, one per enumerated session in both
+    production callers) — see :class:`SampleResult`.
     """
     top_fraction = config.sampling.top_fraction
     per_stratum_min = config.sampling.per_stratum_min
@@ -804,6 +830,7 @@ def stratified_sample(
         bytes_used=bytes_used,
         dedupe_collapsed=dedupe_collapsed,
         budget_skipped=budget_skipped,
+        total_records=len(records),
     )
 
 
