@@ -22,12 +22,16 @@ no package __init__ needed).
 from __future__ import annotations
 
 import gzip
+import io
 import json
 import logging
+import zlib
 
+import pytest
 import yaml
 
 import digest as mod
+from legibility import inventory as inventory_mod
 
 
 def _assistant(*blocks):
@@ -125,6 +129,62 @@ def _write_jsonl_gz(tmp_path, records, name='transcript.jsonl.gz'):
 
 
 # ---------------------------------------------------------------------------
+# Corruption scaffolding for the file-level contract tests below. A near-copy
+# of the pair in test_legibility_inventory.py, deliberately: pytest runs here
+# under --import-mode=importlib (pyproject.toml), which does not make sibling
+# test modules importable by bare name, and scripts/tests/conftest.py is a
+# sys.path bootstrap with no fixtures. The coupling that matters — that both
+# readers answer the same way — is asserted directly by
+# TestLoadTranscriptCorruptionShapes.test_both_readers_agree_on_a_truncated_file
+# rather than implied by a shared helper.
+# ---------------------------------------------------------------------------
+
+def _gz_payload(n_records: int = 200) -> bytes:
+    """Serialize a multi-record JSONL body — the payload the helpers below
+    compress and then damage. Many padded records so a cut at the halfway
+    mark lands mid-stream rather than inside the 10-byte header."""
+    return ''.join(
+        json.dumps({'type': 'user', 'seq': i, 'pad': 'x' * 200}) + '\n'
+        for i in range(n_records)
+    ).encode('utf-8')
+
+
+def _write_truncated_gz(path):
+    """Write the first half of a valid gz stream — the interrupted-write
+    shape, which decompresses to ``EOFError`` (NOT an ``OSError``)."""
+    blob = gzip.compress(_gz_payload())
+    path.write_bytes(blob[: len(blob) // 2])
+    return path
+
+
+def _write_corrupt_body_gz(path):
+    """Write a gz whose DEFLATE body is damaged, so decompression raises
+    ``zlib.error`` (also NOT an ``OSError``).
+
+    Where a flipped byte lands decides which failure gzip reports — most
+    flips still decode and only trip the trailing checksum
+    (``gzip.BadGzipFile``, already an ``OSError``), a few truncate the bit
+    stream (``EOFError``), and only a flip that makes the DEFLATE stream
+    itself unparseable raises ``zlib.error``. So probe for the first flip
+    position producing that shape rather than assuming a byte. The probe runs
+    against STDLIB ``gzip``, never a reader under test, so it stays valid on
+    both sides of the normalization.
+    """
+    blob = gzip.compress(_gz_payload())
+    for index in range(10, len(blob)):
+        candidate = bytearray(blob)
+        candidate[index] ^= 0xFF
+        try:
+            gzip.GzipFile(fileobj=io.BytesIO(bytes(candidate))).read()
+        except zlib.error:
+            path.write_bytes(bytes(candidate))
+            return path
+        except Exception:
+            continue  # a different corruption shape — keep probing
+    raise AssertionError('no single-byte flip produced a zlib.error body')
+
+
+# ---------------------------------------------------------------------------
 # load_transcript — ordered parse; blank/malformed lines degrade (skip)
 # rather than raise (mirrors analyze_speculation_depth.load_events).
 # ---------------------------------------------------------------------------
@@ -179,6 +239,93 @@ class TestLoadTranscriptGzAware:
         path = _write_jsonl(tmp_path, records)
 
         loaded = mod.load_transcript(path)
+
+        assert [r['message']['content'] for r in loaded] == ['one', 'two']
+
+
+# ---------------------------------------------------------------------------
+# load_transcript — the FILE-level half of the degrade contract. This slurping
+# reader has the byte-identical gzip.open + iterate body as its streaming
+# sibling inventory.iter_json_lines, so it has the identical hole: gzip
+# signals its three corruption shapes with three different exception types,
+# and only bad magic (gzip.BadGzipFile) is already an OSError. A truncated
+# stream raises EOFError and a corrupt body raises zlib.error, neither of
+# which any consumer's documented `except OSError` degrade path catches.
+#
+# The corpus extractor's `--transcript` operator mode reads through THIS
+# function under `except OSError`, so an archived transcript whose write was
+# interrupted aborts that run with a traceback rather than being counted.
+# ---------------------------------------------------------------------------
+
+class TestLoadTranscriptCorruptionShapes:
+    def test_truncated_gz_raises_oserror(self, tmp_path):
+        truncated = _write_truncated_gz(tmp_path / 'truncated.jsonl.gz')
+        with pytest.raises(OSError):
+            mod.load_transcript(truncated)
+
+    def test_corrupt_body_gz_raises_oserror(self, tmp_path):
+        corrupt = _write_corrupt_body_gz(tmp_path / 'corrupt-body.jsonl.gz')
+        with pytest.raises(OSError):
+            mod.load_transcript(corrupt)
+
+    def test_bad_magic_gz_raises_oserror(self, tmp_path):
+        # Already true (BadGzipFile subclasses OSError) — pinned here so the
+        # three shapes are asserted as one contract at this reader, and so a
+        # regression in the newly-added wrap cannot quietly change it.
+        corrupt = tmp_path / 'not-gzip.jsonl.gz'
+        corrupt.write_bytes(b'this is not gzip at all\n')
+        with pytest.raises(OSError):
+            mod.load_transcript(corrupt)
+
+    def test_the_two_shapes_are_distinguishable_in_the_message(self, tmp_path):
+        # Normalizing to one TYPE must not flatten them to one MESSAGE: the
+        # reason string is what a coverage-reporting caller discloses, and an
+        # operator has to tell a half-written transcript from a corrupted one
+        # without re-reading the file.
+        truncated = _write_truncated_gz(tmp_path / 'truncated.jsonl.gz')
+        corrupt = _write_corrupt_body_gz(tmp_path / 'corrupt-body.jsonl.gz')
+
+        with pytest.raises(OSError) as truncated_exc:
+            mod.load_transcript(truncated)
+        with pytest.raises(OSError) as corrupt_exc:
+            mod.load_transcript(corrupt)
+
+        assert str(truncated_exc.value) != str(corrupt_exc.value)
+        assert 'end-of-stream' in str(truncated_exc.value)
+        assert 'decompressing' in str(corrupt_exc.value)
+
+    def test_both_readers_agree_on_a_truncated_file(self, tmp_path):
+        # The property the corpus extractor's design rests on: two readers,
+        # one core, ONE failure contract. Its scan mode reads via
+        # inventory.iter_json_lines and its --transcript mode via
+        # load_transcript; if the two disagreed here, the same corrupt archive
+        # would be reported differently depending on which mode an operator
+        # reached for.
+        truncated = _write_truncated_gz(tmp_path / 'truncated.jsonl.gz')
+
+        with pytest.raises(OSError) as slurped:
+            mod.load_transcript(truncated)
+        with pytest.raises(OSError) as streamed:
+            list(inventory_mod.iter_json_lines(truncated))
+
+        assert type(slurped.value) is type(streamed.value)
+        assert str(slurped.value) == str(streamed.value)
+
+    def test_corrupt_line_in_a_valid_gz_still_degrades_silently(self, tmp_path):
+        # The line-level half, unchanged: a well-formed gz whose LAST line is
+        # a half-written record still yields every parseable record and still
+        # does not raise. A fix that wrapped the parse loop too broadly would
+        # collapse this into the file-level path and inflate a caller's
+        # unreadable-file count with ordinary trailing debris.
+        path = tmp_path / 'trailing-partial.jsonl.gz'
+        with gzip.open(path, 'wt', encoding='utf-8') as f:
+            f.write(json.dumps(_user_text('one')) + '\n')
+            f.write('\n')
+            f.write('{not valid json,,,\n')
+            f.write(json.dumps(_user_text('two')) + '\n')
+            f.write('{"type": "user", "message": {"content": "cut mid-writ')
+
+        loaded = mod.load_transcript(path)  # must not raise
 
         assert [r['message']['content'] for r in loaded] == ['one', 'two']
 
