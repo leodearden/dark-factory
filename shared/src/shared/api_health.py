@@ -291,7 +291,28 @@ class ApiHealthGate:
             self._samples.popleft()
 
     def _stats(self) -> GateStats:
-        """Summarise the current window."""
+        """Summarise the current window.
+
+        Three accounting choices, each with a consequence worth stating:
+
+        * **Denominator = every sample**, not just failures and successes.
+          C4's rate is "5xx / completed invocations", and a CapHit or a local
+          wedge IS a completed invocation.  Excluding them would inflate the
+          measured 5xx rate, so a fleet that is sick LOCALLY would trip the
+          provider breaker and halt itself.  Counting them makes the rate
+          conservative: local failures dilute it rather than amplify it.
+
+        * **Numerator = ServerError only.**  The gate exists to detect
+          provider degradation; every other failure mode has its own handler.
+
+        * **Breadth = distinct non-None task_ids among FAILURES only.**  It
+          answers "is this provider-wide or one bad task", so it must not
+          count tasks that merely succeeded.  A None task_id (watcher/steward
+          invocations) cannot attest breadth and is excluded here — but note
+          it is NOT excluded from ``failures`` above: dropping it would
+          under-report a real outage, while folding all Nones into one
+          synthetic task would let a burst of watcher failures fake breadth.
+        """
         completions = len(self._samples)
         failures = sum(1 for s in self._samples if s.is_failure)
         distinct = {s.task_id for s in self._samples if s.is_failure and s.task_id is not None}
