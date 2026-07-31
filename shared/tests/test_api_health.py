@@ -11,7 +11,17 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from shared.api_health import ApiHealthGate, Closed, GateState, GateStats, Open, Probing
-from shared.invocation_outcome import OK, ServerError
+from shared.invocation_outcome import (
+    OK,
+    AuthFailed,
+    CapHit,
+    CliLocalError,
+    Failure,
+    ModelNotFound,
+    NearCap,
+    ServerError,
+    ZeroOutputWedge,
+)
 
 _WALL = datetime(2026, 7, 31, 12, 0, 0, tzinfo=UTC)
 
@@ -528,3 +538,80 @@ class TestProbeRegression:
         assert isinstance(state, Open)
         assert state.since == opened.since
         assert state.stats.failures == 9
+
+
+_NEUTRAL_OUTCOMES = [
+    CapHit(resets_at=None, reason='limit reached'),
+    NearCap(reason='approaching limit'),
+    AuthFailed(status=401),
+    CliLocalError(marker='ENOENT'),
+    ModelNotFound(reason='no such model'),
+    ZeroOutputWedge(),
+    Failure(kind='unknown'),
+]
+
+
+async def _report_outcome(
+    gate: ApiHealthGate, outcome, n: int = 1, *, task_id: str | None = 't1'
+) -> GateState:
+    state: GateState = gate.state()
+    for _ in range(n):
+        state = await gate.report(outcome, task_id=task_id, account='max-d', role='agent')
+    return state
+
+
+class TestNeutralOutcomes:
+    """step-19: everything that is neither OK nor ServerError is denominator-only."""
+
+    @pytest.mark.parametrize('outcome', _NEUTRAL_OUTCOMES, ids=lambda o: type(o).__name__)
+    async def test_counted_in_completions_never_in_failures(self, outcome) -> None:
+        gate, _mono, _wall = _gate()
+        await _report_outcome(gate, outcome, 5)
+        await _report_failures(gate, 3)
+        state = gate.state()
+        assert isinstance(state, Closed)
+        # Force a trip to read the stats off a state that carries them.
+        opened = await _report_failures(gate, 5)
+        assert isinstance(opened, Open)
+        assert opened.stats.completions == 13
+        assert opened.stats.failures == 8
+
+    @pytest.mark.parametrize('outcome', _NEUTRAL_OUTCOMES, ids=lambda o: type(o).__name__)
+    async def test_closed_gate_saturated_with_neutrals_never_trips(self, outcome) -> None:
+        """A locally-sick fleet must not trip the PROVIDER breaker."""
+        gate, _mono, _wall = _gate()
+        state = await _report_outcome(gate, outcome, 50)
+        assert isinstance(state, Closed)
+        assert gate.is_degraded is False
+
+    @pytest.mark.parametrize('outcome', _NEUTRAL_OUTCOMES, ids=lambda o: type(o).__name__)
+    async def test_neutral_neither_advances_nor_resets_the_probe_streak(self, outcome) -> None:
+        """From Probing(1): a neutral leaves it Probing(1) — no close, no reopen.
+
+        A CapHit is no evidence the provider recovered (so it must not close
+        the gate) and none that it is still down (so it must not reopen it).
+        """
+        gate, _mono, _wall = _gate()
+        await _report_failures(gate, 8)
+        probing = await _report_ok(gate, 1)
+        assert isinstance(probing, Probing)
+
+        state = await _report_outcome(gate, outcome, 3)
+        assert isinstance(state, Probing)
+        assert state.consecutive_successes == 1
+        assert gate.is_degraded is True
+
+        state = await _report_ok(gate, 1)
+        assert isinstance(state, Closed), 'the streak was not preserved across neutrals'
+
+    async def test_neutrals_dilute_the_rate_rather_than_inflating_it(self) -> None:
+        """8 failures across 3 tasks + 12 neutrals = 40%, so no trip.
+
+        Excluding neutrals from the denominator would read 100% and halt a
+        fleet whose problem is entirely local.
+        """
+        gate, _mono, _wall = _gate()
+        await _report_outcome(gate, CapHit(resets_at=None, reason='limit'), 12)
+        state = await _report_failures(gate, 8)
+        assert isinstance(state, Closed)
+        assert gate.is_degraded is False
