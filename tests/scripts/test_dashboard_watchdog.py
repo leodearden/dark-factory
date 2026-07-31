@@ -640,5 +640,216 @@ def test_b3_streak_resets_after_the_restart(monkeypatch, state_env):
     assert len(rec.restarts) == 1
 
 
+# ---------------------------------------------------------------------------
+# B5 — startup grace
+#
+# (a) _unit_active_enter_epoch() parsing, against verbatim systemctl output.
+# (b) The behavioural gate: a freshly-activated unit is not probed at all.
+# ---------------------------------------------------------------------------
+
+
+def _patch_systemctl_show(monkeypatch, mod, returncode: int, stdout: str):
+    """Fake ``subprocess.run`` for the ``systemctl show`` query only.
+
+    Returns the list of recorded argvs so the test can assert the query
+    actually asked for the field the task mandates.
+    """
+    import subprocess as _sp
+
+    calls: list[list[str]] = []
+
+    def fake_run(argv, *args, **kwargs):
+        argv_list = list(argv)
+        calls.append(argv_list)
+        return _sp.CompletedProcess(argv_list, returncode, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(_sp, "run", fake_run)
+    return calls
+
+
+def test_active_enter_epoch_parses_the_unix_timestamp(monkeypatch):
+    """``--timestamp=unix`` yields ``@<epoch>``; the leading @ is stripped."""
+    mod = _load_watchdog()
+    _patch_systemctl_show(
+        monkeypatch, mod, 0, "ActiveEnterTimestamp=@1753900000\n"
+    )
+    assert mod._unit_active_enter_epoch(mod.DASHBOARD_UNIT) == 1753900000
+
+
+def test_active_enter_epoch_queries_the_mandated_field(monkeypatch):
+    """The argv must ask for ActiveEnterTimestamp with ``--timestamp=unix``.
+
+    ActiveEnterTimestamp — not ExecMainStartTimestamp — is the field the task
+    mandates: it marks when the unit reached 'active', i.e. when the grace
+    window for THIS activation began.  ``--timestamp=unix`` is what makes the
+    value a timezone-independent integer instead of a locale-formatted string
+    that int() would reject (silently disabling the grace gate).
+    """
+    mod = _load_watchdog()
+    calls = _patch_systemctl_show(
+        monkeypatch, mod, 0, "ActiveEnterTimestamp=@1753900000\n"
+    )
+
+    mod._unit_active_enter_epoch(mod.DASHBOARD_UNIT)
+
+    assert len(calls) == 1
+    argv = calls[0]
+    assert argv[:3] == ["systemctl", "--user", "show"]
+    assert "--timestamp=unix" in argv
+    assert "ActiveEnterTimestamp" in argv
+    assert mod.DASHBOARD_UNIT in argv
+
+
+def test_active_enter_epoch_never_activated_is_none(monkeypatch):
+    """``@0`` is systemd's 'never activated' sentinel, not the 1970 epoch.
+
+    Read as an epoch it would put activation 56 years in the past — grace
+    would never apply, and the very first tick after a boot-time failure to
+    start could restart a unit that had not even tried to come up yet.
+    """
+    mod = _load_watchdog()
+    _patch_systemctl_show(monkeypatch, mod, 0, "ActiveEnterTimestamp=@0\n")
+    assert mod._unit_active_enter_epoch(mod.DASHBOARD_UNIT) is None
+
+
+def test_active_enter_epoch_nonzero_returncode_is_none(monkeypatch):
+    """systemctl failing (no user manager, unknown unit) → undeterminable."""
+    mod = _load_watchdog()
+    _patch_systemctl_show(monkeypatch, mod, 1, "")
+    assert mod._unit_active_enter_epoch(mod.DASHBOARD_UNIT) is None
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        "ActiveEnterTimestamp=Thu 2026-07-30 11:02:03 BST\n",  # --timestamp=unix ignored
+        "ActiveEnterTimestamp=\n",  # empty value
+        "ActiveEnterTimestamp=@notanumber\n",
+        "",  # no output at all
+        "no-equals-sign-here\n",
+    ],
+)
+def test_active_enter_epoch_unparseable_is_none(monkeypatch, stdout):
+    """Anything that is not a clean integer is None, never a guess."""
+    mod = _load_watchdog()
+    _patch_systemctl_show(monkeypatch, mod, 0, stdout)
+    assert mod._unit_active_enter_epoch(mod.DASHBOARD_UNIT) is None
+
+
+def test_active_enter_epoch_is_fail_soft_on_oserror(monkeypatch):
+    """A missing systemctl binary must not crash the oneshot."""
+    import subprocess as _sp
+
+    mod = _load_watchdog()
+
+    def boom(*args, **kwargs):
+        raise FileNotFoundError("systemctl")
+
+    monkeypatch.setattr(_sp, "run", boom)
+    assert mod._unit_active_enter_epoch(mod.DASHBOARD_UNIT) is None
+
+
+def test_b5_freshly_activated_unit_is_not_probed_or_restarted(monkeypatch, state_env):
+    """A unit that activated 10s ago is inside GRACE_SECS: no probe, no action.
+
+    uvicorn needs a few seconds to bind and mount the SPA, so probing during
+    startup would fail for a perfectly healthy service — and, with a streak
+    carried over from before the restart, could restart it again immediately.
+    That is the flap the grace window exists to break.
+    """
+    rec = _run_ticks(monkeypatch, [False] * 5, activated_secs_ago=10)
+
+    assert rec.actuations == [], f"restarted inside the grace window: {rec.actuations}"
+    assert rec.escalations == []
+    assert rec.streaks == [0] * 5, "a fresh activation must invalidate the streak"
+
+
+def test_b5_grace_resets_a_streak_carried_across_a_restart(monkeypatch, state_env):
+    """The pre-restart streak must not survive into the new activation.
+
+    Without the reset, the two ticks left over from the streak that CAUSED the
+    restart would combine with the first post-grace miss to restart again after
+    a single failed probe — reintroducing the incident's per-tick behaviour.
+    """
+    rec = _run_ticks(
+        monkeypatch,
+        [False],
+        activated_secs_ago=5,
+        seed_state={"streak": 2, "restarts": [], "ceiling_open": False},
+    )
+
+    assert rec.streaks == [0]
+    assert rec.actuations == []
+
+
+def test_b5_grace_is_a_window_not_a_permanent_suppression(monkeypatch, state_env):
+    """Once the unit is GRACE_SECS + 120s old, the same failing ticks DO act.
+
+    Paired deliberately with the test above: together they prove the gate is
+    bounded in time.  A grace check that never expired would be a watchdog
+    that never watches.
+    """
+    mod = _load_watchdog()
+    rec = _run_ticks(
+        monkeypatch,
+        [False] * mod.FAIL_STREAK,
+        activated_secs_ago=mod.GRACE_SECS + 120,
+    )
+
+    assert len(rec.restarts) == 1, f"grace suppressed a real outage: {rec.actuations}"
+
+
+def test_b5_grace_skips_the_probe_entirely(monkeypatch, state_env):
+    """Invariant I5: never act on a probe that was not run — so don't run one.
+
+    Inside grace the watchdog cannot use the answer either way, so it must not
+    ask — otherwise every 30s tick during a slow startup burns a 5s socket
+    timeout for an answer that is discarded.
+
+    The fake RECORDS rather than raises: probe_health() catches Exception by
+    design (any failure counts as a failed probe), so an exploding urlopen
+    would be swallowed and this test would pass with no grace gate at all.
+    """
+    import subprocess as _sp
+    import time as _time
+
+    active_enter = int(_time.time()) - 5
+
+    def fake_run(argv, *args, **kwargs):
+        argv_list = list(argv)
+        if argv_list and argv_list[0] == "systemd-cat":
+            return _sp.CompletedProcess(argv_list, 0, stdout="", stderr="")
+        return _sp.CompletedProcess(
+            argv_list, 0, stdout=f"ActiveEnterTimestamp=@{active_enter}\n", stderr=""
+        )
+
+    monkeypatch.setattr(_sp, "run", fake_run)
+
+    mod = _load_watchdog()
+    probes = _patch_urlopen(monkeypatch, mod, _FakeResponse(200))
+
+    mod.tick()
+
+    assert probes == [], "probed the dashboard inside the startup grace window"
+
+
+def test_b5_undeterminable_activation_does_not_apply_grace(monkeypatch, state_env):
+    """``systemctl show`` failing means grace CANNOT be determined, so it does
+    not apply — the watchdog proceeds to probe.
+
+    Mirrors orchestrator-watchdog.py's documented convention (None = "cannot
+    determine, don't guess").  Failing the other way would let a broken
+    systemctl query permanently disarm the watchdog: the probe would never run
+    and a genuinely dead dashboard would stay dead forever.
+    """
+    mod = _load_watchdog()
+    rec = _run_ticks(
+        monkeypatch, [False] * mod.FAIL_STREAK, activated_secs_ago=None
+    )
+
+    assert len(rec.restarts) == 1
+    assert rec.queries, "the grace gate must still have asked for the timestamp"
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))
