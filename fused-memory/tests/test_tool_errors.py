@@ -273,6 +273,30 @@ def test_registered_tool_handlers_have_no_hand_copied_cancellation_guards():
     marker test above (test_all_registered_tools_carry_mcp_tool_errors_marker)
     already enforces the primary invariant; this adds the narrower "and it
     wasn't hand-rolled alongside the decorator" drift check.
+
+    EVALUATED AND KEPT — task 3351.  That task swept the remaining
+    inspect.getsource meta-tests out of fused-memory/tests (sites in
+    test_flag_dedup.py, test_stages.py and test_rebuild_entity_summaries.py, all
+    replaced by behavioral guards or deleted outright, following commit
+    da8e5a4c96).  This site was examined and deliberately retained; a future
+    sweeper should not re-litigate it:
+
+    (i)   The needle is an EXACT CODE CONSTRUCT, not prose.  Unlike the removed
+          scans — whose needles a comment or docstring rewrite could trip — no
+          amount of documentation editing can produce a false positive here.
+    (ii)  It is scoped per tool.fn through the functools.wraps __wrapped__ chain,
+          not a module text scan, so it cannot be tripped by unrelated code
+          elsewhere in the module.
+    (iii) It does not stand alone.  The primary invariant is already behavioral
+          (test_all_registered_tools_carry_mcp_tool_errors_marker); this only
+          adds a duplication/drift check on top of it, so its failure modes are
+          bounded.
+    (iv)  ACKNOWLEDGED LIMITATION: a reordered or line-broken except tuple keeps
+          this green, so it is an incomplete guard.  That is accepted rather
+          than fixed, because no behavioral equivalent EXISTS — a hand-copied
+          guard inside an already-decorated handler is runtime-indistinguishable
+          from the decorated one, so there is nothing observable to assert on.
+          Removing this would trade a weak guard for no guard.
     """
     mock_service = AsyncMock()
     server = create_mcp_server(mock_service)
