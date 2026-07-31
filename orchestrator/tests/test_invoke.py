@@ -419,8 +419,8 @@ class TestRunSubprocessLocalCancellation:
                 ))
 
                 # Bounded poll (~2s max) until the spy has recorded the spawned proc.
-                deadline = asyncio.get_event_loop().time() + 2.0
-                while not spawned and asyncio.get_event_loop().time() < deadline:
+                deadline = asyncio.get_running_loop().time() + 2.0
+                while not spawned and asyncio.get_running_loop().time() < deadline:
                     await asyncio.sleep(0.05)
                 assert len(spawned) == 1, (
                     f'expected exactly one matching "sleep 30" spawn within 2s, '
