@@ -375,6 +375,19 @@ def build_composite_report(
     surface's architect-scoped ``cap_excluded`` (reviewer: docs-accuracy — two
     exclusion surfaces that disagree are worse than one).
 
+    THE PLAN-PRODUCTION INVARIANT (task 3302): the θ score of every admitted cell
+    comes from :func:`_plan_quality_score`, so a cell whose architect ran fine
+    but produced NO PLAN (``not metrics.produced_a_plan`` — ``plan_steps == 0``)
+    is FLOORED to ``0.0`` rather than reported at whatever the LLM plan judge
+    said, and is counted as ``plan_quality_no_plan``. A no-plan cell is also
+    barred from SETTING its ``(fixture, 'plan_only')`` cost/latency baseline
+    (step 1 below), though its real spend still enters the row's pools. The two
+    treatments are deliberately different because the causes are: a cap-tainted
+    cell is EXCLUDED and counted (we never asked the model, so any number would
+    be fabricated); a no-plan cell is FLOORED and counted (we asked, and the
+    answer was nothing — which is worth exactly 0.0, the same answer
+    :func:`judge.score_plan_structure` gives that artifact). Neither is silent.
+
     SCOPE of the taint exclusion (REVISED by task 3099): an UNMEASURABLE
     plan-only trial (:func:`_is_unmeasurable`) leaves EVERY measured pool —
     ``plan_quality``, ``composite``, ``quality``, ``cost``, ``latency``, the
@@ -488,6 +501,7 @@ def build_composite_report(
             'first_metrics': None,
             'plan_quality_scores': [],
             'plan_quality_cap_excluded': 0,
+            'plan_quality_no_plan': 0,
         }
 
     by_config: dict[str, dict[str, Any]] = defaultdict(_acc)
@@ -561,6 +575,14 @@ def build_composite_report(
         # place, so it is counted by neither surface.)
         if m.get('cap_tainted') and plan_only:
             acc['plan_quality_cap_excluded'] += 1
+        # …and the FLOOR gets its own count, parallel to the exclusion but
+        # describing a DISJOINT cause (task 3302): this cell was admissible and
+        # measured — a healthy architect that produced nothing — so it stays in
+        # every pool at 0.0 rather than leaving them. Counting it is what keeps a
+        # mean that absorbed zeros from reading identically to a mean over cells
+        # that all planned badly (loud-over-silent-degradation).
+        if _has_plan_quality_score(m) and not produced_a_plan(m):
+            acc['plan_quality_no_plan'] += 1
 
     rows: list[dict[str, Any]] = []
     for cfg in sorted(by_config):
@@ -613,6 +635,10 @@ def build_composite_report(
             # plan_quality_cap_excluded count saying why.
             'plan_quality': _mean_plan_quality(acc['plan_quality_scores']),
             'plan_quality_cap_excluded': acc['plan_quality_cap_excluded'],
+            # How many of the cells that pool DID admit produced no plan at all
+            # and were scored 0.0 — the content-failure counterpart of the
+            # transport-failure count above.
+            'plan_quality_no_plan': acc['plan_quality_no_plan'],
         })
 
     return {
@@ -1096,7 +1122,7 @@ _PLAN_QUALITY_COLUMNS = (
     'invocation_error',
 )
 _PLAN_QUALITY_MEAN_COLUMNS = (
-    'config_name', 'n', 'cap_excluded', 'mean_plan_quality',
+    'config_name', 'n', 'cap_excluded', 'no_plan', 'mean_plan_quality',
 )
 # The plan_quality cell of a cap-tainted row. Deliberately NOT a number and NOT
 # the bare '-' null sentinel (which already means "not an architect run"): a
@@ -1164,6 +1190,15 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
     reports ``mean_plan_quality=None`` rather than ``0.0``, so "we measured
     nothing" can never read as "it scored nothing".
 
+    ITS COUNTERPART (task 3302): a cell whose architect ran fine but produced NO
+    PLAN (``not metrics.produced_a_plan``) is the opposite case — a genuine
+    content measurement — so it is FLOORED to ``0.0`` by
+    :func:`_plan_quality_score`, KEPT in the mean, and counted separately as
+    ``no_plan``. Two causes, two treatments, two counts, neither silent:
+    transport refusal → excluded + ``cap_excluded``; content failure → floored +
+    ``no_plan``. Conflating them would either let the candidate that failed to
+    plan escape the pool entirely or penalise the one that merely hit a cap.
+
     ``cap_excluded_by_cause`` breaks that total out by CAUSE
     (``{'cap_hit': 2, 'model_not_found': 1}``, key-sorted for determinism)
     because the causes are not interchangeable: a cap hit is transient and
@@ -1179,6 +1214,10 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
             'config_name': result.config_name,
             'role_under_test': result.metrics.get('role_under_test'),
             'plan_quality': result.metrics.get('plan_quality'),
+            # The PLAN-PRODUCTION predicate's input (task 3302), carried
+            # verbatim so the row is self-describing: a reader can see the step
+            # count the adjacent plan_quality was — or was not — scored over.
+            'plan_steps': result.metrics.get('plan_steps'),
             'cap_tainted': bool(result.metrics.get('cap_tainted')),
             'invocation_error': result.metrics.get('invocation_error'),
             # The θ score this cell contributes to the aggregate, through THE
@@ -1200,6 +1239,7 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
     # and must not dilute the architect mean.
     scored: dict[str, list[float]] = defaultdict(list)
     excluded: dict[str, int] = defaultdict(int)
+    no_plan: dict[str, int] = defaultdict(int)
     totals: dict[str, int] = defaultdict(int)
     by_cause: dict[str, int] = defaultdict(int)
     for row in rows:
@@ -1211,6 +1251,12 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
             excluded[cfg] += 1
             by_cause[_taint_cause(row['invocation_error'])] += 1
         elif row['scored_plan_quality'] is not None:
+            # The row carries ``plan_steps`` verbatim from the metrics dict, so
+            # the predicate reads it here exactly as it does one layer up.
+            if not produced_a_plan(row):
+                # DISJOINT from the exclusion above: this cell was measured and
+                # kept, at the 0.0 the accessor floored it to (task 3302).
+                no_plan[cfg] += 1
             # THE shared accessor's answer (task 3302), not the raw persisted
             # score: a cell whose architect produced no plan lands here as a
             # floored 0.0, identically to build_composite_report's pool, so
@@ -1222,6 +1268,10 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
             'config_name': cfg,
             'n': len(scored[cfg]),
             'cap_excluded': excluded[cfg],
+            # How many of those ``n`` scored cells produced NO plan and were
+            # floored to 0.0 (task 3302). Disjoint from ``cap_excluded``: those
+            # cells are not in ``n`` at all.
+            'no_plan': no_plan[cfg],
             'total': totals[cfg],
             # THE ONE reduction, shared with build_composite_report's row so the
             # two surfaces cannot drift (task 3099, :func:`_mean_plan_quality`).
@@ -1241,10 +1291,11 @@ def _format_plan_quality_mean_section(report: dict[str, Any]) -> list[str]:
     """Render the per-config mean block: how many cells actually scored.
 
     The point of the block is that ``mean_plan_quality`` is reported ALONGSIDE
-    the ``n`` it was computed over and the ``cap_excluded`` count it left out,
-    so a mean over 19 of 22 cells reads as exactly that instead of looking like
-    a mean over all of them. A config with nothing scored renders ``-``, never
-    ``0.0000``.
+    the ``n`` it was computed over, the ``cap_excluded`` count it left out and
+    the ``no_plan`` count it scored as zeros, so a mean over 19 of 22 cells —
+    four of which produced no plan at all — reads as exactly that instead of
+    looking like a mean over 22 comparable plans. A config with nothing scored
+    renders ``-``, never ``0.0000``.
     """
     configs = report.get('configs', [])
     rendered = [
@@ -1252,6 +1303,7 @@ def _format_plan_quality_mean_section(report: dict[str, Any]) -> list[str]:
             'config_name': str(c['config_name']),
             'n': str(c['n']),
             'cap_excluded': str(c['cap_excluded']),
+            'no_plan': str(c['no_plan']),
             'mean_plan_quality': (
                 '-' if c['mean_plan_quality'] is None
                 else f'{float(c["mean_plan_quality"]):.4f}'
