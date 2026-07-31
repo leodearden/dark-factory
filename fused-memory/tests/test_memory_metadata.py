@@ -7,16 +7,40 @@ vocabulary (PRD V1 / INV-5): consumers import it, they never restate it.
 These tests pin that contract mechanically.
 """
 
+import json
 import re
+from pathlib import Path
 
 import pytest
 
 from fused_memory.config.schema import _default_topic_guard_clusters
 from fused_memory.memory_metadata import (
+    KIND_REGISTRY,
     TOPIC_SLUG_MAX_LEN,
     TOPIC_SLUG_RE,
     normalize_supersedes,
 )
+
+#: Leaf α's committed census artifact — the oracle the registry is
+#: grandfathered from.  Resolved from ``__file__`` (repo root is two
+#: parents up from ``fused-memory/tests/<this file>``) rather than from
+#: cwd, so the test is invariant to where pytest is invoked.
+_CENSUS_ARTIFACT = (
+    Path(__file__).resolve().parents[2] / 'plans' / 'memory-metadata-census-report.json'
+)
+
+
+def _census_kind_values() -> list[str]:
+    """Return every ``kind`` value leaf α actually measured.
+
+    ``coverage.complete`` is asserted before the values are used: a
+    partial scroll must never silently seed a grandfather list.
+    """
+    report = json.loads(_CENSUS_ARTIFACT.read_text())
+    assert report['coverage']['complete'] is True, (
+        'census coverage is incomplete — the grandfather set is not authoritative'
+    )
+    return [entry['value'] for entry in report['grand_total']['kind']['entries']]
 
 
 class TestTopicSlug:
@@ -126,3 +150,72 @@ class TestNormalizeSupersedes:
     def test_idempotent(self, value):
         once = normalize_supersedes(value)
         assert normalize_supersedes(once) == once
+
+
+class TestKindRegistry:
+    """`KIND_REGISTRY` — PRD D3's closed registry, grandfathered from the census.
+
+    Oracled against the committed artifact so the registry can never
+    silently drift from the measurement it claims to grandfather.
+    """
+
+    #: The five names the PRD's §6 row claimed were live but that leaf α
+    #: measured at ZERO live records.  Three have verified live in-repo
+    #: Mem0 writers (scope_freshness.py:97/:251/:495, harness.py:1166,
+    #: cleanup_count_snapshots.py:210); two do not (see the registry's
+    #: block 2 comments).  All five are retained regardless:
+    #: grandfathering means "what is written", not only "what survives"
+    #: an aging sweep, and excluding them would reject in-repo code the
+    #: moment `enforce_kind_registry` flips.
+    ZERO_RECORD_IN_REPO_KINDS = frozenset({
+        'stage1_flag_marker',
+        'project_status_correction',
+        'consolidated_scope_correction',
+        'entity_standing_decision',
+        'count_snapshot_cleanup_audit',
+    })
+
+    #: PRD V1's two new kinds (triage attach outcomes).  Both confirmed
+    #: ABSENT from the live corpus, so they must be added explicitly
+    #: rather than assumed present via the census.
+    NEW_IN_PRD_KINDS = frozenset({'amendment', 'sighting'})
+
+    def test_is_a_frozenset_of_str(self):
+        assert isinstance(KIND_REGISTRY, frozenset)
+        assert all(isinstance(value, str) for value in KIND_REGISTRY)
+
+    def test_superset_of_every_census_measured_value(self):
+        """Every kind that exists live must be grandfathered — otherwise
+        flipping `enforce_kind_registry` rejects live writers."""
+        measured = set(_census_kind_values())
+        missing = measured - KIND_REGISTRY
+        assert not missing, f'census-measured kinds absent from the registry: {sorted(missing)}'
+
+    def test_contains_the_two_new_prd_kinds(self):
+        assert self.NEW_IN_PRD_KINDS <= KIND_REGISTRY
+
+    def test_contains_the_zero_record_in_repo_kinds(self):
+        assert self.ZERO_RECORD_IN_REPO_KINDS <= KIND_REGISTRY
+
+    def test_exact_size(self):
+        """Pin the size so any unreviewed addition or removal fails loudly
+        rather than drifting silently away from the measurement."""
+        measured = set(_census_kind_values())
+        assert len(measured) == 329, 'census artifact changed — re-derive the registry'
+        # 329 census-measured + 2 new-in-PRD + 5 zero-record-but-in-repo.
+        assert len(KIND_REGISTRY) == len(measured) + 7
+        assert len(KIND_REGISTRY) == 336
+
+    def test_the_seven_additions_are_exactly_the_expected_names(self):
+        """Not just the right count — the right names."""
+        measured = set(_census_kind_values())
+        additions = KIND_REGISTRY - measured
+        assert additions == self.NEW_IN_PRD_KINDS | self.ZERO_RECORD_IN_REPO_KINDS
+
+    def test_entries_are_clean_non_empty_strings(self):
+        for value in KIND_REGISTRY:
+            assert value, 'empty kind value in registry'
+            assert value == value.strip(), f'{value!r} carries leading/trailing whitespace'
+
+    def test_registry_is_closed_not_open(self):
+        assert 'not_a_real_kind_xyz' not in KIND_REGISTRY
