@@ -36,16 +36,23 @@ here so a future reader need not re-derive the taxonomy from the call site:
    title/description/details with no files-level mismatch.  NEVER rejects:
    the task is created, stamped ``metadata.possible_scope_mismatch``, and a
    non-blocking advisory escalation fires.  ITSELF GATED on attribution —
-   :func:`local_deliverable_attested` (task 3106) asks whether any declared
-   deliverable is owned by the FILING project, and the interceptor suppresses
-   BOTH the stamp and the escalation when one is, logging the decision at
-   INFO instead.  With no declared deliverable, or only unowned ones, the
-   advisory fires unchanged.
+   :func:`local_attesting_signals` (task 3106) asks whether the DECLARED
+   deliverables (``metadata.files`` ∪ ``files_to_modify`` ∪ ``modules``)
+   attest work in the FILING project, i.e. at least one is owned by it and
+   NONE is owned by another; when they do, the interceptor suppresses BOTH
+   the stamp and the escalation, logging the decision at INFO instead.  With
+   no declared deliverable, with only unowned ones, or with a MIXED
+   declaration, the advisory fires unchanged.
 
 (1) and (2) partition the DECLARED signal; (3) applies only once neither
 fired.  (2) and (3)'s suppression are logical complements — one needs every
-owned file foreign, the other needs at least one local — so they can never
-both apply.
+owned file foreign, the other needs at least one local and none foreign — so
+they can never both apply.
+
+THIS IS THE CANONICAL STATEMENT of the taxonomy: the interceptor's
+``_path_guard_or_skip`` and the individual functions below cross-reference
+it by outcome number rather than restating it, so there is one place to edit
+when the ordering or the attribution inputs change.
 
 Wired into :class:`fused_memory.middleware.task_interceptor.TaskInterceptor`
 at the ``submit_task`` entry point.  Path-guard
@@ -482,25 +489,38 @@ def all_files_foreign_owner(
     return first_owner
 
 
-def local_deliverable_attested(
+def local_attesting_signals(
     signals: list[str] | None,
     project_id: str,
     registry: ProjectPrefixRegistry,
-) -> bool:
-    """Return True iff ANY declared deliverable signal is owned by *project_id*.
+) -> list[str]:
+    """Return the declared deliverable signals that ATTEST *project_id* work.
 
-    POSITIVE-attribution counterpart to :func:`all_files_foreign_owner`'s
-    negative one, and its exact logical complement: that function asks "is
-    EVERY owned entry foreign under ONE owner", this asks "is ANY entry
-    LOCAL".  The two are therefore mutually exclusive by construction — a
-    signal set with a locally-owned entry makes ``all_files_foreign_owner``
-    return ``None`` immediately — so the interceptor's cross-repo
-    allow-and-tag branch and its prose-advisory suppression branch can never
-    both fire on the same submission.
+    Gate for the module docstring's outcome (3) — the prose advisory —
+    returning the WITNESS rather than a bare bool so the caller can name the
+    attesting entries in its log without reclassifying.  Truthiness IS the
+    predicate: :func:`local_deliverable_attested` is ``bool()`` of this, so
+    the two cannot drift and every signal is classified exactly once.
 
     *signals* are the submission's DECLARED deliverables — the union of
     ``metadata.files``, ``metadata.files_to_modify`` and ``metadata.modules``
-    (task 3106).  They are classified with the CERTAIN
+    (task 3106).  Attestation requires BOTH:
+
+    1. at least one signal OWNED by *project_id* (the positive half the
+       module docstring describes), and
+    2. NO signal owned by a DIFFERENT project.
+
+    (2) exists because the caller's upstream ``check_files_for_scope`` sees a
+    NARROWER list than this one: only ``files``, or (when ``files`` is
+    absent) ``files_to_modify`` — never ``modules``, and never a
+    ``files_to_modify`` entry shadowed by a present ``files`` key.  A foreign
+    entry in that non-overlapping remainder was therefore never classified by
+    the hard reject, so a MIXED declaration (local ``files`` + foreign
+    ``modules``) must not buy silence here.  It is advisory-only: declining
+    to attest leaves such a submission on the unchanged
+    stamp-plus-advisory path, and never creates a new rejection.
+
+    Signals are classified with the CERTAIN
     :meth:`ProjectPrefixRegistry.project_for_path` lookup, never the
     heuristic regex-over-prose :func:`find_paths`.  That matters: a declared
     DIRECTORY (``'fused-memory/src'``, a ``modules`` lock key) and an
@@ -511,24 +531,44 @@ def local_deliverable_attested(
     direction: an unclassifiable signal simply fails to attest, so the
     advisory still fires.
 
-    Entries with no registered owner are NEUTRAL — they never establish
-    attribution, matching :func:`_aggregate_owner_mismatches`' conservative
+    Entries with no registered owner are NEUTRAL — they neither attest nor
+    veto, matching :func:`_aggregate_owner_mismatches`' conservative
     direction.  Declaring only ``README.md`` is no evidence of local work.
 
-    CALLER CONTRACT: consulted ONLY after :func:`check_files_for_scope` has
-    already returned ``ok``, i.e. after "no declared file is FOREIGN" is
-    established.  This adds the positive half — "and at least one declared
-    entry is LOCAL" — so the pair together is a complete attribution.  A
-    submission with no declared deliverable, or with only unowned entries,
-    yields no attribution and falls back to the unchanged advisory, which is
-    where the guard's real protection lives.
-
-    Returns False when the registry is empty/falsy or *signals* is
+    Returns ``[]`` when the registry is empty/falsy or *signals* is
     empty/falsy.
     """
     if not registry or not signals:
-        return False
-    return any(registry.project_for_path(s) == project_id for s in signals)
+        return []
+    local: list[str] = []
+    for signal in signals:
+        owner = registry.project_for_path(signal)
+        if owner is None:
+            continue  # unowned → neutral
+        if owner != project_id:
+            return []  # foreign entry anywhere in the union → no attestation
+        local.append(signal)
+    return local
+
+
+def local_deliverable_attested(
+    signals: list[str] | None,
+    project_id: str,
+    registry: ProjectPrefixRegistry,
+) -> bool:
+    """Return True iff the declared deliverables attest *project_id* work.
+
+    Pure predicate form of :func:`local_attesting_signals` (see it for the
+    two conditions and why the second exists); the interceptor uses the
+    witness-returning form so it can log what attested.
+
+    POSITIVE-attribution counterpart to :func:`all_files_foreign_owner`'s
+    negative one, and its exact logical complement — that function needs
+    EVERY owned entry foreign under ONE owner, this needs at least one LOCAL
+    and none foreign — so the module docstring's outcomes (2) and (3)-
+    suppressed can never both fire.
+    """
+    return bool(local_attesting_signals(signals, project_id, registry))
 
 
 def is_routing_override(routing_override_reason: str | None) -> bool:

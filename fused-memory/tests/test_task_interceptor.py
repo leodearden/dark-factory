@@ -7184,6 +7184,52 @@ class TestProseAdvisoryDeliverableAttribution:
         assert len(calls) == 1, f'Expected exactly one escalation, got: {calls!r}'
         assert calls[0].get('advisory') is True
 
+    @pytest.mark.parametrize('foreign_key', ['files_to_modify', 'modules'])
+    @pytest.mark.asyncio
+    async def test_mixed_union_with_foreign_in_unchecked_key_still_advises(
+        self, foreign_key, interceptor_with_store, ticket_store, taskmaster, tmp_path,
+    ):
+        """A foreign entry the HARD REJECT never saw must not be suppressed.
+
+        check_files_for_scope classifies only _extract_meta_files' output:
+        ``files``, or (when absent) ``files_to_modify`` — never ``modules``,
+        and never a ``files_to_modify`` entry shadowed by a present ``files``
+        key. Attribution reads the wider UNION. Without the foreign-veto in
+        local_attesting_signals this shape would fall through BOTH: the
+        reject only classifies the local ``files`` entry and returns ok, then
+        the local entry suppresses the advisory — so a submission declaring
+        foreign work would get neither the reject nor the advisory it used to
+        get.
+        """
+        registry = self._two_project_registry(tmp_path)
+        # Anti-vacuity: the foreign entry IS classified to the other project,
+        # and the hard reject demonstrably does NOT see it (files shadows it).
+        assert registry.project_for_path('crates/widget.rs') == 'reify'
+        metadata = {
+            'files': ['fused-memory/src/x.py'],
+            foreign_key: ['crates/widget.rs'],
+        }
+        assert TaskInterceptor._extract_meta_files({'metadata': metadata}) == [
+            'fused-memory/src/x.py',
+        ], 'The hard reject must not see the foreign entry, or this proves nothing'
+
+        result, calls = await self._submit(
+            interceptor_with_store, tmp_path, metadata=metadata,
+        )
+
+        # Still CREATED — the veto only declines to suppress; it never
+        # promotes the advisory into a rejection (task 2206 blast radius
+        # unchanged).
+        meta = await self._persisted_meta(ticket_store, result)
+        marker = meta.get('possible_scope_mismatch')
+        assert marker is not None, (
+            f'A foreign {foreign_key} entry must veto the suppression: {meta!r}'
+        )
+        assert marker['matched_paths'] == ['crates/']
+        assert marker['suggested_project'] == 'reify'
+        assert len(calls) == 1, f'Expected exactly one escalation, got: {calls!r}'
+        assert calls[0].get('advisory') is True
+
     @pytest.mark.asyncio
     async def test_no_declared_deliverable_still_advises(
         self, interceptor_with_store, ticket_store, taskmaster, tmp_path,

@@ -64,7 +64,7 @@ from fused_memory.middleware.path_scope_guard import (
     check_files_for_scope,
     check_text_for_scope,
     is_routing_override,
-    local_deliverable_attested,
+    local_attesting_signals,
 )
 from fused_memory.middleware.pre_done_hook import run_hook as _run_hook
 from fused_memory.middleware.project_prefix_registry import ProjectPrefixRegistry
@@ -1563,12 +1563,11 @@ class TaskInterceptor:
         would mean a foreign lock-key entry starts hard-REJECTING
         submissions — a behaviour change well outside this task.
 
-        Attribution wants the opposite bias: MAXIMUM positive evidence that
-        the filer declared local work, so the union is right here.  The
-        widening is provably safe in one direction only — this list feeds
-        ONLY :meth:`_local_attesting_signals`, consulted solely after
-        ``check_files_for_scope`` already returned ``ok``, so a wider signal
-        set can only ever suppress an ADVISORY, never weaken a REJECTION.
+        Attribution wants the widest view of what the filer declared, and
+        this list feeds ONLY :meth:`_local_attesting_signals`, so it can
+        never weaken a rejection.  :func:`local_attesting_signals` documents
+        how the extra keys are treated in BOTH directions — they can attest,
+        and a foreign one vetoes.
         """
         out: list[str] = []
         seen: set[str] = set()
@@ -1714,22 +1713,13 @@ class TaskInterceptor:
         kwargs: dict[str, Any],
         project_id: str,
     ) -> list[str]:
-        """Return the declared deliverable signals OWNED by *project_id*.
+        """Return the declared deliverable signals that ATTEST *project_id*.
 
-        Truthy (non-empty) exactly when the submission attests local work.
-        Positive-attribution counterpart to :meth:`_all_files_foreign_owner`
-        (task 3106), with the same thin-wrapper shape — registry guard here,
-        registry-only logic in the pure :func:`local_deliverable_attested` —
-        and, like it, returning the WITNESS rather than a bare bool so the
-        caller can name it in the log without recomputing.  The two are exact
-        logical complements — that one needs EVERY owned file foreign under
-        ONE owner, this needs at least ONE local — so the cross-repo
-        allow-and-tag branch and the prose-advisory suppression can never
-        both fire.
-
-        The pure predicate stays the gate: the attesting subset is filtered
-        out only AFTER it returns True, i.e. only on the suppression path,
-        never on the hot path of an ordinary submission.
+        Thin wrapper — registry guard here, all registry logic in the pure
+        :func:`local_attesting_signals` (which documents the two conditions
+        attestation requires and why).  Same shape as the sibling
+        :meth:`_all_files_foreign_owner`, and, like it, returns the WITNESS
+        rather than a bare bool so the caller can name it in the log.
 
         Reads ``kwargs`` directly rather than ``candidate.files_to_modify``:
         the candidate's list has already been narrowed by
@@ -1745,10 +1735,9 @@ class TaskInterceptor:
         registry = self._prefix_registry
         if registry is None:
             return []
-        signals = self._extract_deliverable_signals(kwargs)
-        if not local_deliverable_attested(signals, project_id, registry):
-            return []
-        return [s for s in signals if registry.project_for_path(s) == project_id]
+        return local_attesting_signals(
+            self._extract_deliverable_signals(kwargs), project_id, registry,
+        )
 
     def _path_guard_check(
         self,
@@ -1868,54 +1857,32 @@ class TaskInterceptor:
         """Run the path-scope guard, escalate on rejection, return error dict.
 
         Returns the structured error dict on a hard rejection, or ``None``
-        when the submission is allowed (including the PROSE-ADVISORY case
-        below, which allows creation but attaches a marker).
+        when the submission is allowed (including the PROSE-ADVISORY case,
+        which allows creation but attaches a marker).
 
-        Split by signal quality (task 2206):
+        This method IS the evaluation order the three-outcome taxonomy in
+        :mod:`fused_memory.middleware.path_scope_guard`'s module docstring
+        describes — read it there rather than re-deriving it here; only the
+        facts specific to this seam are recorded below.
 
-        * FILES-CERTAIN (:meth:`_files_scope_check`) — an exact
-          ``metadata.files`` owner-mismatch is a hard reject.  No LLM
-          adjudication: the file's owner is either known and different, or
-          it isn't, so there is nothing to adjudicate.
-        * PROSE-ADVISORY (:meth:`_path_guard_check`) — a regex-over-prose
-          heuristic hit in title/description/details, with no files-level
-          mismatch.  This never rejects: the submission proceeds, but
+        * Outcome (1), FILES-CERTAIN reject — :meth:`_files_scope_check`.  No
+          LLM adjudication: the file's owner is either known and different,
+          or it isn't, so there is nothing to adjudicate.
+        * Outcome (2), CROSS-REPO allow-and-tag — :meth:`_all_files_foreign_owner`.
+        * Outcome (3), PROSE-ADVISORY — :meth:`_path_guard_check`, gated on
+          :meth:`_local_attesting_signals`.  The registry is always present
+          (defaults to ``ProjectPrefixRegistry.default()``, task 2208), so
+          the advisory is the ONLY prose path — the pre-task-2208
+          hard-reject-on-prose back-compat branch has been retired.  On an
+          unsuppressed hit,
           ``kwargs['metadata']['possible_scope_mismatch']`` is attached (via
           :meth:`_attach_possible_scope_mismatch`) and a ``scope_violation``
-          escalation still fires (loud, non-blocking).  The registry is
-          always present (defaults to ``ProjectPrefixRegistry.default()``,
-          task 2208), so this is the ONLY path — the pre-task-2208
-          hard-reject-on-prose back-compat branch has been retired.
-        * PROSE-hit SUPPRESSED BY LOCAL ATTRIBUTION
-          (:meth:`_local_attesting_signals`, task 3106) — the prose hit
-          above is discarded, with NEITHER the stamp NOR the escalation, when
-          the submission declares at least one deliverable
-          (``metadata.files`` ∪ ``files_to_modify`` ∪ ``modules``) OWNED by
-          the filing project.  Prose lexing cannot distinguish "modifies X"
-          from "merely cites X"; a declared deliverable can, so the better
-          signal wins.
+          escalation fires (loud, non-blocking).
 
-          ORDERING INVARIANT: this runs only AFTER the FILES-certain check
-          returned ``ok``, i.e. "no declared file is FOREIGN" is already
-          established.  Attribution adds the positive half — "and at least
-          one declared entry is LOCAL" — so the pair together is a complete
-          attribution, and a locally-owned entry can never buy a MIXED
-          submission past the hard reject above.
-
-          MUTUALLY EXCLUSIVE with the cross-repo allow-and-tag branch: that
-          one requires EVERY owned file to be foreign under one owner, this
-          one requires at least one LOCAL file, so they can never both fire.
-
-          RETAINED PROTECTION: a submission with NO declared deliverable, or
-          with only UNOWNED entries (``README.md``, ``docs/x.md``), has no
-          positive attribution and fires the advisory exactly as before —
-          which is where the guard's real protection lives.
-
-          NOT SILENT: the suppression emits one structured INFO record
-          carrying the matched prose prefixes, the prose-suggested owner,
-          the filing project and the attesting signals, so the branch stays
-          auditable without putting a non-actionable item in the operator
-          queue.
+          NOT SILENT when suppressed: one structured INFO record carries the
+          matched prose prefixes, the prose-suggested owner, the filing
+          project and the attesting signals, so the branch stays auditable
+          without putting a non-actionable item in the operator queue.
 
         The inline Stage-2 LLM adjudicator (task 1822) is no longer
         consulted here: FILES-certain rejects have nothing to adjudicate,
@@ -1983,13 +1950,11 @@ class TaskInterceptor:
         if not verdict.is_rejection:
             return None
 
-        # PROSE-hit SUPPRESSED BY LOCAL ATTRIBUTION (task 3106): the
-        # submission DECLARES a deliverable owned by the filing project, so
-        # the foreign path in its prose is an incidental citation ("mirror
-        # the logic in <other-project>/x.rs"), not a misrouting. Prose lexing
-        # cannot tell "modifies X" from "mentions X"; a declared deliverable
-        # can, so the better signal wins and neither the stamp nor the
-        # escalation fires.
+        # PROSE-hit SUPPRESSED BY LOCAL ATTRIBUTION (task 3106): the declared
+        # deliverables attest local work (see local_attesting_signals for the
+        # exact conditions), so the foreign path in the prose is an incidental
+        # citation ("mirror the logic in <other-project>/x.rs"), not a
+        # misrouting — neither the stamp nor the escalation fires.
         #
         # INFO, not WARNING, and deliberately not an escalation: this is a
         # CORRECT attribution decision replacing operator-queue noise, so it
