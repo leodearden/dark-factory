@@ -982,11 +982,12 @@ class TestReviewLoopRouting:
 def _make_steward(*, worktree: Path, config_overrides=None, suggestion_count=15):
     """Build a minimal TaskSteward with mocked dependencies.
 
-    *worktree* is required and keyword-only on purpose: the helper used to
-    allocate its own ``tempfile.mkdtemp(prefix='test-steward-wt-')`` dir
-    that nothing ever removed, leaking one ``/tmp`` entry per call (plus a
-    ``/tmp/.task-meta/<name>`` sibling, see below).  Having no default
-    forecloses that path structurally rather than by convention.
+    *worktree* must be a pytest ``tmp_path``-rooted directory, so that
+    pytest's own retention policy reclaims it; it is keyword-only with no
+    default so no caller can fall back to an unmanaged temp dir.  The
+    helper creates the directory itself — the steward's pre-flight
+    auto-escalates "Worktree missing" on a path that is not a directory —
+    and nothing else inside it needs to exist.
     """
     from orchestrator.steward import TaskSteward
 
@@ -1024,16 +1025,6 @@ def _make_steward(*, worktree: Path, config_overrides=None, suggestion_count=15)
     mcp.mcp_config_json.return_value = {}
 
     task = {'id': '42', 'title': 'Test Task', 'description': 'desc'}
-    # Callers pass a pytest ``tmp_path``-rooted directory, which pytest
-    # garbage-collects itself (it retains only the 3 most recent numbered
-    # roots under pytest-of-<user>/) — so the dir is reclaimed even when a
-    # run is hard-killed and finalizers never fire.  It must actually exist:
-    # the steward's pre-flight (added in the zombie-escalation fix) checks
-    # `worktree.is_dir()` and auto-escalates "Worktree missing" before the
-    # test gets a chance to assert.  Tests mock invoke_agent so nothing
-    # actually runs against this directory, and no `.task` subdir is needed
-    # — _pre_triage_suggestions and _write_triage_verdict each mkdir the
-    # meta-root they use.
     worktree.mkdir(parents=True, exist_ok=True)
     steward = TaskSteward(
         task_id='42',
