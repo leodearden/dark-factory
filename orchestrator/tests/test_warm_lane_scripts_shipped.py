@@ -651,18 +651,16 @@ class TestSiblingResolutionIgnoresTheCallersCwd:
     — which is exactly why the filed expectation of ``exit 2`` was wrong.
     """
 
-    @pytest.mark.parametrize(
-        'name',
-        ['warm-lane-gc.sh', 'warm-lane-gc-sweep.sh'],
-    )
-    def test_help_does_not_source_a_lib_from_the_callers_cwd(
-        self, name: str, tmp_path: Path,
-    ) -> None:
+    @staticmethod
+    def _help_under_a_hidden_dirname(
+        name: str, *, cwd: Path, tmp_path: Path,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run ``<name> --help`` from *cwd* with ``dirname`` hidden from ``PATH``."""
         script = WARM_LANE_SCRIPT_DIR / name
         assert script.is_file(), f'{name} is not shipped at {script}'
-        proc = subprocess.run(
+        return subprocess.run(
             [_BASH, str(script), '--help'],
-            cwd=str(_decoy_dir(tmp_path, *SOURCED_LIBS)),
+            cwd=str(cwd),
             capture_output=True,
             text=True,
             timeout=60,
@@ -673,11 +671,60 @@ class TestSiblingResolutionIgnoresTheCallersCwd:
                 ),
             }),
         )
+
+    @pytest.mark.parametrize(
+        'name',
+        ['warm-lane-gc.sh', 'warm-lane-gc-sweep.sh', 'warm-lane-audit.sh'],
+    )
+    def test_help_does_not_source_a_lib_from_the_callers_cwd(
+        self, name: str, tmp_path: Path,
+    ) -> None:
+        proc = self._help_under_a_hidden_dirname(
+            name, cwd=_decoy_dir(tmp_path, *SOURCED_LIBS), tmp_path=tmp_path,
+        )
         combined = proc.stdout + proc.stderr
 
         assert _DECOY_MARKER not in combined, (
             f'{name} --help sourced a sibling lib from the CALLER\'S CWD '
             f'instead of from {WARM_LANE_SCRIPT_DIR}.  Its own directory must '
             f'resolve by parameter expansion, which reads no PATH.\n'
+            f'output:\n{combined}'
+        )
+
+    def test_a_bare_hostile_cwd_does_not_reach_lib_portable_from_the_cwd(
+        self, tmp_path: Path,
+    ) -> None:
+        """``warm-lane-audit.sh`` from an EMPTY hostile CWD, and the exit code it uses.
+
+        The audit-specific half, recorded because it corrects the filed
+        expectation twice over.  The hypothesis said audit "would land on its
+        existing fail-loud ``source`` guard and exit 2".  It does not:
+
+        * The ``[ ! -f ]`` guard task 3074 added covers only
+          ``lib_lane_state.sh``, and sits AFTER the ``lib_portable.sh``
+          ``source``, which has no guard at all.
+        * So with nothing to pick up in the CWD, audit dies on bash's own bare
+          ``source`` failure at exit **1** — the RUNTIME code, not the exit-2
+          wiring sentinel the exit-code taxonomy assigns this class.  MEASURED
+          on base with CWD=/: ``warm-lane-audit.sh: line 145:
+          //lib_portable.sh: No such file or directory``, exit 1.  A
+          triage-misleading exit code on top of a wrong path.
+
+        Asserted on the RESOLVED PATH, not the exit code, for the reason in the
+        class docstring: the exit code here is whatever the caller's CWD makes
+        it.  The unguarded-``lib_portable.sh`` gap is real and separately
+        actionable, but it is a behaviour change to a reify byte-copy that this
+        task's Delta does not cover — and with ``SCRIPT_DIR`` resolved
+        correctly the bare ``source`` failure is unreachable in every case
+        measured here.
+        """
+        proc = self._help_under_a_hidden_dirname(
+            'warm-lane-audit.sh', cwd=tmp_path, tmp_path=tmp_path,
+        )
+        combined = proc.stdout + proc.stderr
+
+        assert str(tmp_path) not in combined, (
+            f'warm-lane-audit.sh resolved a sibling lib under the caller\'s '
+            f'CWD ({tmp_path}) rather than under {WARM_LANE_SCRIPT_DIR}.\n'
             f'output:\n{combined}'
         )
