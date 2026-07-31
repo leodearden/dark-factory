@@ -485,17 +485,45 @@ def load_series_window(
     eval_id: str,
     *,
     limit: int,
+    before_stamp: str | None,
 ) -> list[MetricSeries]:
-    """The trailing *limit* runs for *eval_id*, oldest first.
+    """The trailing *limit* runs for *eval_id* stamped before *before_stamp*, oldest first.
 
     Sorted by filename, which is chronological because the stamp is zero-padded
     UTC (see :data:`_STAMP_FORMAT`). A missing eval directory yields an empty
     window rather than raising — "this eval has never run" is a legitimate state
     the evaluator handles as ``insufficient_data``, not an error. A file that
     exists but does not parse still raises (see :func:`load_metric_series`).
+
+    *before_stamp* keeps the current run out of its own baseline. The natural
+    runner ordering is write-then-evaluate, so by the time this is called the
+    current run's ``metrics-<STAMP>.json`` is already on disk; pooling it drags
+    ``p0``/``lam`` toward the observed value and DAMPS the very regression the
+    M2 rules (b)/(c) exist to catch — the worse the run, the more it moves the
+    bar it is measured against. The filter is a strict ``<``, so an artifact
+    stamped LATER is dropped too: a concurrent runner, a re-run with a pinned
+    stamp, or clock skew are the same contamination class, and a "baseline"
+    holding a future run is no more a baseline than one holding the present.
+
+    It is keyword-only and REQUIRED but nullable — no default. ``None`` means
+    "there is no current run to exclude" (a dashboard or analysis read over the
+    whole history), a deliberate choice rather than an omission; a ``None``
+    default would silently reinstate the self-pooling for every caller who does
+    the natural thing.
+
+    The exclusion runs BEFORE the ``[-limit:]`` slice, so asking for *limit*
+    runs yields *limit* runs. Filtering after slicing would return a window one
+    short and quietly shrink the evidence base with nothing to signal it.
     """
     eval_dir = Path(root) / eval_id
     if not eval_dir.is_dir():
         return []
     paths = sorted(eval_dir.glob('metrics-*.json'))
+    if before_stamp is not None:
+        # Compare rendered filenames rather than re-parsing the stamp: the
+        # zero-padded-UTC invariant this function already relies on to order the
+        # window (see _STAMP_FORMAT) is the same fact that orders the cutoff, so
+        # there is one way to order runs here, not two.
+        cutoff = metrics_artifact_path(root, eval_id, before_stamp).name
+        paths = [p for p in paths if p.name < cutoff]
     return [load_metric_series(p) for p in paths[-limit:]] if limit > 0 else []

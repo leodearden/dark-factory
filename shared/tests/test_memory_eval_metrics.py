@@ -391,7 +391,7 @@ class TestSeriesWindowLoader:
 
     def test_window_is_returned_in_chronological_order(self, tmp_path):
         self._seed(tmp_path, ['20260703T031500Z', '20260701T031500Z', '20260702T031500Z'])
-        window = load_series_window(tmp_path, 'e1-retrieval-health', limit=3)
+        window = load_series_window(tmp_path, 'e1-retrieval-health', limit=3, before_stamp=None)
         assert [s.run_stamp for s in window] == [
             '20260701T031500Z',
             '20260702T031500Z',
@@ -400,17 +400,17 @@ class TestSeriesWindowLoader:
 
     def test_limit_keeps_the_trailing_runs(self, tmp_path):
         self._seed(tmp_path, ['20260701T031500Z', '20260702T031500Z', '20260703T031500Z'])
-        window = load_series_window(tmp_path, 'e1-retrieval-health', limit=2)
+        window = load_series_window(tmp_path, 'e1-retrieval-health', limit=2, before_stamp=None)
         assert [s.run_stamp for s in window] == ['20260702T031500Z', '20260703T031500Z']
 
     def test_missing_eval_dir_yields_an_empty_window(self, tmp_path):
-        assert load_series_window(tmp_path, 'never-ran', limit=3) == []
+        assert load_series_window(tmp_path, 'never-ran', limit=3, before_stamp=None) == []
 
     def test_window_excludes_non_metric_files(self, tmp_path):
         self._seed(tmp_path, ['20260701T031500Z'])
         eval_dir = tmp_path / 'e1-retrieval-health'
         (eval_dir / 'limits-current.json').write_text('{}', encoding='utf-8')
-        window = load_series_window(tmp_path, 'e1-retrieval-health', limit=5)
+        window = load_series_window(tmp_path, 'e1-retrieval-health', limit=5, before_stamp=None)
         assert [s.run_stamp for s in window] == ['20260701T031500Z']
 
     def test_before_stamp_excludes_the_current_runs_own_artifact(self, tmp_path):
