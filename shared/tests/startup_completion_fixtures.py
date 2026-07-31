@@ -37,8 +37,8 @@ import json
 import os
 import re
 import sys
-from pathlib import Path
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any, NotRequired, TypedDict
 
 from shared.cli_invoke import read_transcript_records
