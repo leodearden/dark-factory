@@ -1381,7 +1381,7 @@ class TestParseMetadataFailurePolicy:
         assert warnings[0].field == 'mystery_field'
         assert model.model_dump()['mystery_field'] == 'v'
 
-    # A representative spread of the 34 Tier-A blessed conventional keys
+    # A representative spread of the 39 Tier-A blessed conventional keys
     # (see _BLESSED_METADATA_KEYS), plus one genuine control key
     # (mystery_zzz) that must still warn. RED: none of the blessed keys are
     # skipped yet, so each one currently emits its own unknown_key warning.
@@ -1434,7 +1434,7 @@ class TestParseMetadataFailurePolicy:
 
     # Table-driven over the FULL _BLESSED_METADATA_KEYS frozenset (imported
     # directly), rather than the hand-maintained partial sample above (which
-    # only covers 25 of the 34 entries). Every key gets its own parametrized
+    # only covers 25 of the 39 entries). Every key gets its own parametrized
     # case, so a typo'd or accidentally-unskipped entry fails immediately
     # instead of silently reappearing as unknown_key census noise, and the
     # test stays in lockstep as the allowlist grows -- no manual sample to
