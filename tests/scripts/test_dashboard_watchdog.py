@@ -376,5 +376,142 @@ def test_save_state_is_fail_soft_when_the_path_is_unwritable(monkeypatch, tmp_pa
     mod.save_state({"streak": 1, "restarts": [], "ceiling_open": False})  # must not raise
 
 
+# ---------------------------------------------------------------------------
+# Tick harness — simulates consecutive timer firings
+# ---------------------------------------------------------------------------
+
+#: How long ago the dashboard unit activated, for ticks that should be well
+#: clear of the startup-grace window. Any value >> GRACE_SECS works.
+OUTSIDE_GRACE_SECS = 10_000
+
+
+class _TickRecorder:
+    """Records what a run of simulated ticks actually did.
+
+    ``actuations`` deliberately excludes the read-only ``systemctl show``
+    query (kept separately in ``queries``): "zero systemctl invocations" in
+    the behavioural boundary cases means zero ACTUATIONS — the grace gate
+    legitimately queries the unit's activation timestamp on every tick.
+    """
+
+    def __init__(self) -> None:
+        self.actuations: list[list[str]] = []
+        self.queries: list[list[str]] = []
+        self.escalations: list[list[str]] = []
+        self.states: list[dict] = []
+
+    @property
+    def restarts(self) -> list[list[str]]:
+        return [a for a in self.actuations if "restart" in a]
+
+    @property
+    def streaks(self) -> list[int]:
+        return [s["streak"] for s in self.states]
+
+
+def _run_ticks(
+    monkeypatch,
+    probe_results,
+    activated_secs_ago: int | None = OUTSIDE_GRACE_SECS,
+    seed_state: dict | None = None,
+    recorder: _TickRecorder | None = None,
+) -> _TickRecorder:
+    """Run one simulated timer tick per entry in *probe_results*.
+
+    Each tick gets a FRESH ``_load_watchdog()`` — that is the whole point:
+    the timer fires a new ``Type=oneshot`` process every 30s, so anything the
+    watchdog needs to remember has to round-trip through the state file.
+
+    *probe_results* is an iterable of bools; True means the probe answers 200.
+    *activated_secs_ago* seeds the unit's ActiveEnterTimestamp (None makes the
+    ``systemctl show`` query fail, i.e. activation undeterminable).
+    Pass *recorder* to accumulate across several _run_ticks calls.
+    """
+    import subprocess as _sp
+    import time as _time
+
+    rec = recorder if recorder is not None else _TickRecorder()
+
+    if seed_state is not None:
+        _load_watchdog().save_state(seed_state)
+
+    active_enter = (
+        None if activated_secs_ago is None else int(_time.time()) - activated_secs_ago
+    )
+
+    def fake_run(argv, *args, **kwargs):
+        argv_list = list(argv)
+        if argv_list and argv_list[0] == "systemd-cat":
+            return _sp.CompletedProcess(argv_list, 0, stdout="", stderr="")
+        if argv_list[:2] == ["systemctl", "--user"]:
+            if "show" in argv_list:
+                rec.queries.append(argv_list)
+                if active_enter is None:
+                    return _sp.CompletedProcess(argv_list, 1, stdout="", stderr="")
+                return _sp.CompletedProcess(
+                    argv_list,
+                    0,
+                    stdout=f"ActiveEnterTimestamp=@{active_enter}\n",
+                    stderr="",
+                )
+            rec.actuations.append(argv_list)
+            return _sp.CompletedProcess(argv_list, 0, stdout="", stderr="")
+        # Anything else is the `uv run ... escalation submit ...` invocation.
+        rec.escalations.append(argv_list)
+        return _sp.CompletedProcess(argv_list, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(_sp, "run", fake_run)
+
+    for healthy in probe_results:
+        mod = _load_watchdog()
+        outcome = _FakeResponse(200) if healthy else urllib_error_503(mod)
+        _patch_urlopen(monkeypatch, mod, outcome)
+        mod.tick()
+        rec.states.append(_load_watchdog().load_state())
+
+    return rec
+
+
+def urllib_error_503(mod):
+    import urllib.error
+
+    return urllib.error.HTTPError(mod.PROBE_URL, 503, "Service Unavailable", {}, None)  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# B1 — healthy steady state
+# ---------------------------------------------------------------------------
+
+
+def test_b1_healthy_steady_state_never_actuates(monkeypatch, state_env):
+    """30 consecutive healthy ticks (15 minutes of real time) touch nothing.
+
+    The floor the whole rewrite has to clear: the retired inline shell would
+    restart the dashboard the first time the deep endpoint was slow, so a
+    watchdog that is quiet while the service is healthy is the primary signal.
+    """
+    rec = _run_ticks(monkeypatch, [True] * 30)
+
+    assert rec.actuations == [], f"healthy ticks actuated systemctl: {rec.actuations}"
+    assert rec.escalations == [], f"healthy ticks filed escalations: {rec.escalations}"
+    assert rec.streaks == [0] * 30
+    assert all(s["restarts"] == [] for s in rec.states)
+    assert all(s["ceiling_open"] is False for s in rec.states)
+
+
+def test_b1_healthy_tick_clears_a_pre_existing_streak(monkeypatch, state_env):
+    """A recovered service resets the counter — hysteresis is CONSECUTIVE
+    failures, not cumulative ones. Without this, failures separated by hours
+    of health would eventually add up to a restart."""
+    rec = _run_ticks(
+        monkeypatch,
+        [True],
+        seed_state={"streak": 2, "restarts": [], "ceiling_open": False},
+    )
+
+    assert rec.streaks == [0]
+    assert rec.actuations == []
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))
