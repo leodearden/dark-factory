@@ -45,3 +45,38 @@
 # its own merits: this verbatim FULL_SUITE form runs when a touched file
 # classifies STRUCTURAL and under merge-role merge_verify_breadth=full.
 test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q --timeout=300"
+
+# ALL THREE commands are declared DELIBERATELY, not incidentally.
+#
+# Omitting either of the two below would NOT leave them running as they do
+# today — it would DELETE them. verify_plan.py:334-363 emits an explicit
+# SKIPPED PlannedRun for a falsy lint_command/type_check_command,
+# _executed_module_configs_from_plan leaves the field None (verify.py:4892),
+# and _run_or_skip_timed turns a None command into a CheckRun.skipped that is
+# VACUOUSLY PASSING at rc=0. So a test-only module config would silently drop
+# lint and type gating for every tests/scripts diff — strictly worse than the
+# fallback path this file replaces, which esc-3062-3 logs narrowing both legs
+# correctly (ruff check <file> rc=0, pyright <file> rc=0). Closing the TEST gap
+# must not open a LINT/TYPE one; the guard for that is
+# test_tests_scripts_module_config.py's (c)/(d) assertions.
+#
+# Both forms are the directory-wide widening of what esc-3062-3 already logs at
+# rc=0 on the fallback path, and task 3350's pre-1 verified them clean
+# directory-wide before declaring them here (ruff rc=0 as-is; pyright needed 4
+# fixes, all confined to tests/scripts/ and made in commit 2fe3a3ef6d rather
+# than by weakening either command).
+#
+# --project shared on ruff for the same PATH reason the root yaml's own comment
+# gives — "ruff is not on PATH at the worktree root, only inside each member
+# venv"; verify.py's _FALLBACK_UV_PROJECT = 'shared' encodes the same choice.
+#
+# npx pyright matches the root type_check_command's invocation style and
+# resolves [tool.pyright] extraPaths from the root pyproject.toml, which is what
+# lets `from orchestrator.config import ...` resolve in these tests.
+#
+# Note both run VERBATIM (not file-scoped) under merge-role
+# merge_verify_breadth=full, and type_check widens to this directory form when a
+# touched file classifies STRUCTURAL — hence pre-1 checking the directory form
+# rather than only the per-file one.
+lint_command: "uv run --project shared ruff check tests/scripts/"
+type_check_command: "npx pyright tests/scripts/"
