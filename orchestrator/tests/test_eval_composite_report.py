@@ -507,6 +507,18 @@ def _arch(task_id, config_name, trial, *, plan_quality, cost_usd, duration_ms,
     )
 
 
+def _table_row_cells(text, name, *, section=''):
+    """The whitespace-split cells of the rendered row for *name*.
+
+    *section* optionally scopes the search to everything after a section header
+    (e.g. ``'plan_quality by config:'``), because one rendering can carry
+    several tables whose rows each start with the same config name.
+    """
+    scoped = text.partition(section)[2] if section else text
+    return next(ln.split() for ln in scoped.splitlines()
+                if ln.split() and ln.split()[0] == name)
+
+
 class TestPlanOnlyComposite:
     """A plan-only (architect) row scores on plan_quality, not on tests_pass."""
 
@@ -611,6 +623,165 @@ class TestPlanOnlyComposite:
         assert rows['arch-a']['tests_pass_rate'] is None
         # …while a workflow row keeps a real float.
         assert rows['impl-a']['tests_pass_rate'] == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# Task 3099 (reviewer: correctness): the composite row's `plan_quality` is the
+# config's POOLED MEAN, not its first untainted trial.
+#
+# The field was a harmless diagnostic ECHO of one trial until this task promoted
+# it to a DECISION surface — select_survivors' steps 3-4 rank on it and
+# format_composite_table renders it beside the composite. Every plan_quality
+# case that predates this block uses IDENTICAL per-trial scores, which is
+# exactly why a trial-1 passthrough survived review, so every case below carries
+# per-trial VARIANCE.
+# ---------------------------------------------------------------------------
+
+class TestPlanQualityIsTheConfigMean:
+    """The composite row's ``plan_quality`` is the config's pooled mean."""
+
+    def _varied(self):
+        """One architect config whose trials VARY: tainted, then 0.9, then 0.3.
+
+        Scored pool ``[0.9, 0.3]`` → mean 0.6. A first-scored-trial passthrough
+        reports 0.9 instead; averaging the tainted cell in as a zero reports 0.4.
+        """
+        return [
+            _arch('p1', 'arch-varied', 1, plan_quality=None, cost_usd=0.0,
+                  duration_ms=0, cap_tainted=True),
+            _arch('p1', 'arch-varied', 2, plan_quality=0.9, cost_usd=0.3,
+                  duration_ms=60000),
+            _arch('p1', 'arch-varied', 3, plan_quality=0.3, cost_usd=0.3,
+                  duration_ms=60000),
+        ]
+
+    def test_row_reports_the_pooled_mean_not_the_first_scored_trial(self):
+        from orchestrator.evals.report import build_composite_report
+
+        row = build_composite_report(self._varied())['configs'][0]
+        assert row['plan_quality'] == pytest.approx(0.6)
+        # Neither the first SCORED trial (0.9) nor the tainted-as-zero mean (0.4).
+        assert row['plan_quality'] != pytest.approx(0.9)
+        assert row['plan_quality'] != pytest.approx(0.4)
+        # Counted-and-excluded: the unmeasurable cell is still reported, so
+        # nothing is silently dropped from the sample it was averaged over.
+        assert row['plan_quality_cap_excluded'] == 1
+        assert row['trials'] == 3
+
+    def test_agrees_bit_identically_with_the_plan_quality_surface(self):
+        """ONE shared reduction, so ``==`` and not ``approx``: the two surfaces
+        must be structurally incapable of drifting, not merely close today."""
+        from orchestrator.evals.report import (
+            build_composite_report,
+            build_plan_quality_report,
+        )
+
+        results = self._varied()
+        row = build_composite_report(results)['configs'][0]
+        cfg = build_plan_quality_report(results)['configs'][0]
+        assert cfg['config_name'] == row['config']
+        assert row['plan_quality'] == cfg['mean_plan_quality']
+
+    def test_the_two_adjacent_tables_render_the_same_cell(self):
+        """``_emit_composite_report`` now prints both tables on one screen, so an
+        operator must not be able to read contradictory answers to one question.
+        """
+        from orchestrator.evals.report import (
+            _PLAN_QUALITY_MEAN_HEADER,
+            build_composite_report,
+            build_plan_quality_report,
+            format_composite_table,
+            format_plan_quality_table,
+        )
+
+        results = self._varied()
+        composite = _table_row_cells(
+            format_composite_table(build_composite_report(results)),
+            'arch-varied',
+        )
+        means = _table_row_cells(
+            format_plan_quality_table(build_plan_quality_report(results)),
+            'arch-varied', section=_PLAN_QUALITY_MEAN_HEADER,
+        )
+        # _COMPOSITE_COLUMNS[3] is plan_quality; the mean section's last column
+        # is mean_plan_quality.
+        assert composite[3] == '0.6000'
+        assert means[-1] == '0.6000'
+        # …and the single-trial score must not appear in the composite row at all.
+        assert '0.9000' not in composite
+
+    def test_quality_and_plan_quality_cells_of_one_row_agree(self):
+        """Two cells of the SAME row must not contradict either: for a plan-only
+        row ``quality`` is the mean of the axis that fed the composite, which is
+        the same pool ``plan_quality`` now reduces."""
+        from orchestrator.evals.report import build_composite_report
+
+        row = build_composite_report(self._varied())['configs'][0]
+        assert row['quality'] == pytest.approx(row['plan_quality'])
+
+    def test_identical_per_trial_scores_are_unchanged(self):
+        """Regression: with no per-trial variance the mean IS the passthrough
+        score, and a workflow row still reports ``None``."""
+        from orchestrator.evals.report import build_composite_report
+
+        rows = {r['config']: r
+                for r in build_composite_report(_union_dataset())['configs']}
+        assert rows['C']['plan_quality'] == pytest.approx(0.9)  # three 0.9 cells
+        assert rows['A']['plan_quality'] is None                # a workflow row
+
+
+class TestSurvivorRankingUsesTheConfigMean:
+    """A REAL composite tie is broken by the better MEAN plan quality."""
+
+    def _tied(self):
+        """Two architect configs on ``p1`` constructed to tie EXACTLY at 0.76.
+
+        ``arch-zeta``  cost 0.3 / 60s — it sets its group's floor, so both
+          efficiency axes are 1.0; plan_quality ``[0.9, 0.3]`` → per-trial blends
+          ``0.6*0.9 + 0.4 = 0.94`` and ``0.6*0.3 + 0.4 = 0.58`` → composite mean
+          0.76, mean plan_quality 0.6.
+        ``arch-alpha`` cost 0.5 / 75s — cost score ``0.3/0.5 = 0.6``, latency
+          score ``60/75 = 0.8``; plan_quality ``[0.8, 0.8]`` →
+          ``0.6*0.8 + 0.2*0.6 + 0.2*0.8 = 0.76`` on both trials → composite mean
+          0.76, mean plan_quality 0.8.
+        """
+        return [
+            _arch('p1', 'arch-zeta', 1, plan_quality=0.9, cost_usd=0.3,
+                  duration_ms=60000),
+            _arch('p1', 'arch-zeta', 2, plan_quality=0.3, cost_usd=0.3,
+                  duration_ms=60000),
+            _arch('p1', 'arch-alpha', 1, plan_quality=0.8, cost_usd=0.5,
+                  duration_ms=75000),
+            _arch('p1', 'arch-alpha', 2, plan_quality=0.8, cost_usd=0.5,
+                  duration_ms=75000),
+        ]
+
+    def test_the_tie_is_exact(self):
+        """Pinned separately and EXACTLY so the ranking test below can never pass
+        for the wrong reason — a tie that quietly stopped being one."""
+        from orchestrator.evals.report import build_composite_report
+
+        rows = {r['config']: r
+                for r in build_composite_report(self._tied())['configs']}
+        assert rows['arch-zeta']['composite'] == pytest.approx(0.76)
+        assert rows['arch-zeta']['composite'] == rows['arch-alpha']['composite']
+
+    def test_better_mean_plan_quality_wins_the_tie(self):
+        from orchestrator.evals.report import (
+            build_composite_report,
+            select_survivors,
+        )
+
+        report = build_composite_report(self._tied())
+        rows = {r['config']: r for r in report['configs']}
+        assert rows['arch-zeta']['composite'] == rows['arch-alpha']['composite']
+        # THE DEFECT: on a first-scored-trial passthrough zeta reports 0.9
+        # against alpha's 0.8, so the WORSE-mean config wins the tie.
+        assert rows['arch-zeta']['plan_quality'] == pytest.approx(0.6)
+        assert rows['arch-alpha']['plan_quality'] == pytest.approx(0.8)
+        assert select_survivors(report, top_k=1, roles=['architect']) == {
+            'architect': ['arch-alpha'],
+        }
 
 
 class TestRoleScopedEfficiencyBaseline:
@@ -879,9 +1050,7 @@ class TestFormatCompositeTable:
 
     def _row(self, out, config):
         """The rendered line for *config*, split into whitespace-separated cells."""
-        line = next(ln for ln in out.splitlines()
-                    if ln.split() and ln.split()[0] == config)
-        return line.split()
+        return _table_row_cells(out, config)
 
     def test_header_carries_plan_quality_and_exclusion_columns(self):
         from orchestrator.evals.report import format_composite_table
