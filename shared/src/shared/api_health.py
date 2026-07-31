@@ -39,6 +39,7 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import Enum
 from typing import TYPE_CHECKING
 
 from shared.invocation_outcome import OK, InvocationOutcome, ServerError
@@ -132,6 +133,14 @@ class Probing(GateState):
 
     stats: GateStats
     consecutive_successes: int
+
+
+class _Signal(Enum):
+    """What one outcome says about the provider — see :meth:`ApiHealthGate._classify`."""
+
+    FAILURE = 'failure'
+    SUCCESS = 'success'
+    NEUTRAL = 'neutral'
 
 
 @dataclass(frozen=True)
@@ -239,18 +248,48 @@ class ApiHealthGate:
         now = self._monotonic_clock()
         self._evict(now)
 
-        is_failure = isinstance(outcome, ServerError)
-        self._samples.append(_Sample(ts=now, is_failure=is_failure, task_id=task_id))
+        signal = self._classify(outcome)
+        self._samples.append(_Sample(ts=now, is_failure=signal is _Signal.FAILURE, task_id=task_id))
 
         stats = self._stats()
         # State mutation happens here, before any await: on a single-threaded
         # event loop that makes the transition atomic, so two concurrent
         # reporters cannot interleave mid-transition and no lock is needed.
-        self._state = self._next_state(outcome, stats)
+        self._state = self._next_state(signal, stats)
         return self._state
 
-    def _next_state(self, outcome: InvocationOutcome, stats: GateStats) -> GateState:
-        """Pure transition function: (current state, outcome, window stats) -> next state."""
+    @staticmethod
+    def _classify(outcome: InvocationOutcome) -> _Signal:
+        """Reduce an invocation outcome to what it says about the PROVIDER.
+
+        Three-way, and single-sourced here so a variant added to
+        ``InvocationOutcome`` later lands in exactly one place:
+
+        * ``ServerError`` -> FAILURE.  The only outcome that is evidence the
+          provider is degraded; every other failure mode has its own handler.
+        * ``OK`` -> SUCCESS.  Evidence the provider is serving.
+        * everything else -> NEUTRAL (CapHit, NearCap, AuthFailed,
+          CliLocalError, ModelNotFound, ZeroOutputWedge, Failure).
+
+        Neutral is not "ignored".  A neutral outcome still counts in the rate
+        DENOMINATOR, because C4's rate is 5xx per *completed invocation* and a
+        cap hit or a local wedge is a completed invocation.  Dropping them
+        would inflate the measured 5xx rate until a fleet whose problem is
+        entirely local tripped the provider breaker and halted itself.
+
+        But a neutral outcome must not touch the probe streak in either
+        direction: a CapHit is no evidence the provider recovered (so it must
+        not advance the streak toward closing) and none that it is still down
+        (so it must not reset one).
+        """
+        if isinstance(outcome, ServerError):
+            return _Signal.FAILURE
+        if isinstance(outcome, OK):
+            return _Signal.SUCCESS
+        return _Signal.NEUTRAL
+
+    def _next_state(self, signal: _Signal, stats: GateStats) -> GateState:
+        """Pure transition function: (current state, signal, window stats) -> next state."""
         if isinstance(self._state, Closed):
             if self._should_trip(stats):
                 logger.warning(
@@ -269,7 +308,7 @@ class ApiHealthGate:
             return self._state
 
         # --- Degraded (Open or Probing): watch for recovery ---------------
-        if isinstance(outcome, OK):
+        if signal is _Signal.SUCCESS:
             streak = 1
             if isinstance(self._state, Probing):
                 streak = self._state.consecutive_successes + 1
@@ -281,7 +320,7 @@ class ApiHealthGate:
                 consecutive_successes=streak,
             )
 
-        if isinstance(outcome, ServerError):
+        if signal is _Signal.FAILURE:
             # A failed probe means the outage never ended: back to Open, streak
             # discarded (dropping Probing IS the reset — there is no counter to
             # zero), evidence refreshed from the live window.
