@@ -311,27 +311,44 @@ MIN_SHUTDOWN_MARGIN_SECONDS = 5
 # renders the template rather than restating its contents.
 POLL_JS = REPO_ROOT / "dashboard" / "src" / "dashboard" / "static" / "redux" / "data.js"
 
-_SET_INTERVAL_RE = re.compile(r"setInterval\(.*,\s*(\d+)\s*\)")
+# The poller names its period explicitly, so anchor on that name rather than on
+# whichever call site happens to consume it.  An earlier revision scraped the
+# sole ``setInterval(..., <literal>)`` in the file; that broke the moment the
+# poller was refactored to pass a named constant (and gained unrelated
+# setTimeout-based fetch deadlines), because the literal no longer appeared at
+# the call site.  Binding to the declaration is both stabler and more precise.
+_POLL_INTERVAL_DECL_RE = re.compile(
+    r"^\s*(?:const|let|var)\s+POLL_INTERVAL_MS\s*=\s*(\d+)\s*;", re.MULTILINE
+)
+_POLL_INTERVAL_USE_RE = re.compile(r"setInterval\([^;]*?,\s*POLL_INTERVAL_MS\s*\)")
 
 
 def _parse_poll_interval_ms(source: str, origin: str) -> int:
-    """Return the sole ``setInterval(...)`` period in *source*, in milliseconds.
+    """Return the browser's data-refresh period in *source*, in milliseconds.
 
-    Requires exactly one match on purpose.  Zero means the poller was rewritten
-    (or moved) and the keep-alive bound is no longer being checked against
-    anything real; more than one means the period is ambiguous and this parser
-    cannot tell which interval is the data poll.  Both are reported rather than
-    skipped, so the check can never silently pass by measuring nothing.
+    Reads the ``POLL_INTERVAL_MS`` declaration, and separately asserts that the
+    constant is what actually drives a ``setInterval``.  Both halves must hold:
+    a declaration nobody schedules on would let this module measure a dead
+    constant, and a scheduler whose period we cannot read would let the
+    keep-alive bound be checked against nothing.  Exactly one declaration is
+    required so the period can never be ambiguous.
     """
-    matches = _SET_INTERVAL_RE.findall(source)
-    assert len(matches) == 1, (
-        f"Expected exactly one setInterval(...) period in {origin}, found "
-        f"{len(matches)}: {matches}. The keep-alive bound in this module is "
-        "derived from that period; if the poller was rewritten or a second "
-        "interval was added, update _parse_poll_interval_ms to identify the "
-        "data-refresh interval explicitly rather than dropping the check."
+    decls = _POLL_INTERVAL_DECL_RE.findall(source)
+    assert len(decls) == 1, (
+        f"Expected exactly one POLL_INTERVAL_MS = <literal> declaration in "
+        f"{origin}, found {len(decls)}: {decls}. The keep-alive bound in this "
+        "module is derived from that period; if the poller was renamed, moved, "
+        "or its period made non-literal, update _parse_poll_interval_ms to "
+        "identify the data-refresh interval explicitly rather than dropping "
+        "the check."
     )
-    return int(matches[0])
+    assert _POLL_INTERVAL_USE_RE.search(source), (
+        f"POLL_INTERVAL_MS is declared in {origin} but never passed as a "
+        "setInterval(...) period, so it may no longer be the browser's actual "
+        "data-refresh interval. Update _parse_poll_interval_ms to read "
+        "whatever now schedules the poll."
+    )
+    return int(decls[0])
 
 
 def _client_poll_interval_ms() -> int:
@@ -641,7 +658,8 @@ def test_poll_interval_parser_requires_exactly_one_interval() -> None:
     """
     assert (
         _parse_poll_interval_ms(
-            "setInterval(() => { if (!window.__DF_PAUSE) refresh(); }, 3000);",
+            "const POLL_INTERVAL_MS = 3000;\n"
+            "const handle = setInterval(() => pollTick(opts), POLL_INTERVAL_MS);\n",
             "synthetic",
         )
         == 3000
@@ -652,7 +670,17 @@ def test_poll_interval_parser_requires_exactly_one_interval() -> None:
 
     with pytest.raises(AssertionError, match="found 2"):
         _parse_poll_interval_ms(
-            "setInterval(a, 3000);\nsetInterval(b, 9000);\n", "synthetic"
+            "const POLL_INTERVAL_MS = 3000;\n"
+            "const POLL_INTERVAL_MS = 9000;\n"
+            "setInterval(tick, POLL_INTERVAL_MS);\n",
+            "synthetic",
+        )
+
+    # Declared but nothing schedules on it: the constant may be vestigial, so the
+    # keep-alive bound would be measured against a period the browser never uses.
+    with pytest.raises(AssertionError, match="never passed as a setInterval"):
+        _parse_poll_interval_ms(
+            "const POLL_INTERVAL_MS = 3000;\nsetInterval(tick, 250);\n", "synthetic"
         )
 
 
