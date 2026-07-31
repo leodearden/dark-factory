@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import gzip
 import importlib.util
+import io
 import json
+import zlib
 from collections.abc import Callable
 from datetime import date as dt_date
 from functools import lru_cache
@@ -69,6 +71,63 @@ REAL_ENCODED_DIR_PAIRS: tuple[tuple[str, str], ...] = (
     ),
     ('/media/leo/data_lv_1/leo/reify-build', '-media-leo-data-lv-1-leo-reify-build'),
 )
+
+
+# ---------------------------------------------------------------------------
+# Corruption scaffolding — a gz payload plus the two damage shapes a
+# fire-and-forget archive writer really produces (a write interrupted by a
+# killed unit, or a file read while it is still being compressed). Kept local
+# to this file rather than hoisted into conftest: scripts/tests/conftest.py is
+# sys.path bootstrap only, and each test module here already carries its own
+# write helpers.
+# ---------------------------------------------------------------------------
+
+def _gz_payload(n_records: int = 200) -> bytes:
+    """Serialize a multi-record JSONL body — the payload the helpers below
+    compress and then damage. Deliberately many padded records so a cut at the
+    halfway mark lands mid-stream rather than inside the 10-byte header."""
+    return ''.join(
+        json.dumps({'type': 'user', 'seq': i, 'pad': 'x' * 200}) + '\n'
+        for i in range(n_records)
+    ).encode('utf-8')
+
+
+def _write_truncated_gz(path: Path) -> Path:
+    """Write the first half of a valid gz stream — the interrupted-write shape.
+
+    Decompression reaches the end of the bytes before the end-of-stream marker
+    and raises ``EOFError``, which is NOT an ``OSError``.
+    """
+    blob = gzip.compress(_gz_payload())
+    path.write_bytes(blob[: len(blob) // 2])
+    return path
+
+
+def _write_corrupt_body_gz(path: Path) -> Path:
+    """Write a gz whose DEFLATE body is damaged, so decompression raises
+    ``zlib.error`` — a THIRD distinct shape, and also not an ``OSError``.
+
+    Where a flipped byte lands decides which failure gzip reports: many flips
+    still decode and only trip the trailing checksum (``gzip.BadGzipFile``,
+    already an ``OSError``), a few truncate the bit stream (``EOFError``), and
+    only a flip that makes the DEFLATE stream itself unparseable raises
+    ``zlib.error``. So this probes for the first flip position that produces
+    that shape rather than assuming any particular byte does. The probe runs
+    against STDLIB ``gzip`` — never the reader under test — so the helper
+    stays valid both before and after the reader normalizes its exceptions.
+    """
+    blob = gzip.compress(_gz_payload())
+    for index in range(10, len(blob)):
+        candidate = bytearray(blob)
+        candidate[index] ^= 0xFF
+        try:
+            gzip.GzipFile(fileobj=io.BytesIO(bytes(candidate))).read()
+        except zlib.error:
+            path.write_bytes(bytes(candidate))
+            return path
+        except Exception:
+            continue  # a different corruption shape — keep probing
+    raise AssertionError('no single-byte flip produced a zlib.error body')
 
 
 class TestEncodeCwd:
@@ -420,6 +479,77 @@ class TestPublicIterJsonLines:
         corrupt.write_bytes(b'this is not gzip at all\n')
         with pytest.raises(OSError):
             list(mod.iter_json_lines(corrupt))
+
+
+class TestIterJsonLinesCorruptionShapes:
+    """ALL THREE gzip corruption shapes must raise ``OSError`` at the FILE level.
+
+    ``test_corrupt_gz_raises_oserror`` above covers only bad MAGIC, which
+    happens to be an ``OSError`` already (``gzip.BadGzipFile``). Measured, the
+    other two shapes are not::
+
+        truncated stream  -> EOFError    ("ended before the end-of-stream marker")
+        corrupt body      -> zlib.error  ("Error -3 while decompressing data")
+
+    Neither derives from ``OSError``, so both escape every consumer's
+    documented ``except OSError`` degrade path — ``sampling.py``,
+    ``check_transcript_persistence.py``, and the cross-package corpus
+    extractor alike — and abort the whole walk with a traceback. Both are
+    exactly what a fire-and-forget archive writer produces on a killed unit,
+    and the archive is live fleet runtime state, so this is not a theoretical
+    shape. These tests pin the contract the docstring already advertises: one
+    documented degrade path covers every way a FILE can be unreadable.
+    """
+
+    def test_truncated_gz_raises_oserror(self, tmp_path):
+        truncated = _write_truncated_gz(tmp_path / 'truncated.jsonl.gz')
+        with pytest.raises(OSError):
+            list(mod.iter_json_lines(truncated))
+
+    def test_corrupt_body_gz_raises_oserror(self, tmp_path):
+        corrupt = _write_corrupt_body_gz(tmp_path / 'corrupt-body.jsonl.gz')
+        with pytest.raises(OSError):
+            list(mod.iter_json_lines(corrupt))
+
+    def test_the_two_shapes_are_distinguishable_in_the_message(self, tmp_path):
+        # The reason string is what a coverage-reporting caller puts in its
+        # disclosed `examples` list, so an operator must be able to tell a
+        # half-written transcript from a corrupted one without re-reading the
+        # file. Normalizing to a single TYPE must not flatten them to a single
+        # MESSAGE.
+        truncated = _write_truncated_gz(tmp_path / 'truncated.jsonl.gz')
+        corrupt = _write_corrupt_body_gz(tmp_path / 'corrupt-body.jsonl.gz')
+
+        with pytest.raises(OSError) as truncated_exc:
+            list(mod.iter_json_lines(truncated))
+        with pytest.raises(OSError) as corrupt_exc:
+            list(mod.iter_json_lines(corrupt))
+
+        assert str(truncated_exc.value) != str(corrupt_exc.value)
+        assert 'end-of-stream' in str(truncated_exc.value)
+        assert 'decompressing' in str(corrupt_exc.value)
+
+    def test_corrupt_line_in_a_valid_gz_still_degrades_silently(self, tmp_path):
+        # The other half of the split, and the one a too-broad fix would
+        # destroy: a well-formed gz whose LAST line is a half-written record
+        # (the line-level analogue of a truncated file) still yields every
+        # parseable record and still does NOT raise. If the file-level wrap
+        # swallowed the parse loop as well, this read would start raising and
+        # the coverage counters would double-count ordinary trailing debris as
+        # unreadable files.
+        good = [{'type': 'user', 'seq': 1}, {'type': 'assistant', 'seq': 2}]
+        body = (
+            json.dumps(good[0]) + '\n'
+            + '\n'
+            + '{"type": "user", "message": {broken\n'
+            + json.dumps(good[1]) + '\n'
+            + '{"type": "assistant", "message": {"content": "cut mid-writ'
+        )
+        path = tmp_path / 'trailing-partial.jsonl.gz'
+        with gzip.open(path, 'wt', encoding='utf-8') as f:
+            f.write(body)
+
+        assert list(mod.iter_json_lines(path)) == good
 
 
 class TestResolveAgentTranscriptRoots:
