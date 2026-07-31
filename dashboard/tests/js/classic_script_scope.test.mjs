@@ -21,11 +21,20 @@
 // over dashboard/tests/js/ — no pytest wrapper change is needed (same as
 // esc_flow_layout.test.mjs and runtime_format.test.mjs before it).
 //
-// DELIBERATE SCOPE LIMIT: only the CLASSIC `.js` scripts are covered. The 15
-// `type="text/babel"` `.jsx` tags in index.html are transformed by
-// Babel-standalone in the browser at runtime and are not loadable by node:vm
-// as-is, so they are out of this harness's reach. None of them currently
-// declares a top-level `const API`, but that is not machine-checked here.
+// SCOPE — the CLASSIC `.js` scripts are covered, and they are exactly the
+// files at risk. The 15 `type="text/babel"` `.jsx` tags in index.html do NOT
+// share this hazard: Babel-standalone transforms them at runtime and
+// downlevels their top-level bindings, so those bindings never join the
+// classic-script global lexical scope. That is an observed fact, not an
+// assumption — `tab_escalations.jsx`, `tab_escalation_analytics.jsx` and
+// `esc_flow_diagram.jsx` each declare a top-level `const C`;
+// `tab_curator.jsx`, `tab_overview.jsx` and `tab_scheduler.jsx` each declare
+// `const D`; `tabs.jsx`, `tab_escalations.jsx` and
+// `tab_escalation_analytics.jsx` each declare `const DF`, `usePersistedState`
+// and `useOpenSet` — and every one of those tabs renders fine in the browser.
+// Under a shared lexical scope those triples would kill each other on load.
+// So there is no uncovered `.jsx` gap to chase here, and the duplicated
+// `.jsx` names above are correct as written rather than latent collisions.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -122,10 +131,26 @@ test('index.html exposes the classic /static/redux/*.js scripts in document orde
       'load test below silently cover nothing',
   );
 
-  for (const expected of ['graph_layout.js', 'esc_flow_layout.js']) {
+  // Inverse containment: every module this harness CLAIMS to cover must
+  // actually have been extracted from index.html. Paired with the forward
+  // check in the window.DF_* test below (every extracted src must have an
+  // EXPECTED_WINDOW_GLOBALS entry), this pins the two sets equal.
+  //
+  // Without it the zero-match guard above is not enough: it only fires when
+  // the regex matches NOTHING. A partially-stale regex — someone adds `defer`
+  // to one tag, reorders its attributes, or drops a script from index.html —
+  // would silently shrink the shared-scope load to the surviving subset while
+  // every test below stays green, i.e. coverage loss that looks exactly like
+  // success. Failing loudly here is the point.
+  for (const expected of Object.keys(EXPECTED_WINDOW_GLOBALS)) {
     assert.ok(
       srcs.includes(expected),
-      `expected ${expected} among the extracted classic scripts, got: ${srcs.join(', ')}`,
+      `${expected} is listed in EXPECTED_WINDOW_GLOBALS but was NOT extracted ` +
+        `from ${INDEX_HTML}. Either its <script> tag changed shape (so ` +
+        'CLASSIC_SCRIPT_RE no longer matches it and it silently dropped out of ' +
+        'the shared-scope load below), or it was intentionally removed from ' +
+        'index.html — in which case delete its EXPECTED_WINDOW_GLOBALS entry. ' +
+        `Extracted: ${srcs.join(', ')}`,
     );
   }
 });
