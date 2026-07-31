@@ -20,11 +20,14 @@ merge-verify time.
 from __future__ import annotations
 
 import dataclasses
+import re
 
 import pytest
 
 from shared.cli_invoke import (
+    AgentFailureKind,
     AgentResult,
+    classify_agent_failure,
     is_server_error_status,
     is_zero_output_timeout,
 )
@@ -244,3 +247,129 @@ class TestClassifyInvocationServerErrorPrecedence:
             api_error_status=503,
         )
         assert isinstance(classify_invocation(result, strict_confirm=True), ModelNotFound)
+
+
+# shared/ must not import orchestrator/ (layering doctrine), so this is a
+# byte-identical LOCAL copy of orchestrator/src/orchestrator/scheduler.py's
+# ``_API_ERROR_REASON_RE``.  The scheduler's transient-requeue lane keys on this
+# marker to read the status out of block_reason, so the ``agent API error: HTTP
+# <status>`` prefix is a cross-module contract: this test pins the PRODUCING
+# side of it, and PRD task beta pins the consuming side.
+_API_ERROR_REASON_RE = re.compile(r'agent API error: HTTP (\d{3})')
+
+
+class TestClassifyAgentFailureServerError:
+    """PRD boundary row 1 (classification half): ``classify_agent_failure``
+    gains a 5xx rule ranked ABOVE ``timed_out``.
+
+    A watchdog SIGTERM kill flushes the CLI's result JSON with
+    ``api_error_status`` set (2026-07-29 incident), so ranking ``timed_out``
+    first discarded the 5xx evidence and misfiled a provider outage as a
+    zero-output wedge — and the marker the scheduler's transient requeue lane
+    keys on was never produced.
+    """
+
+    def test_incident_shape_is_api_error_not_timed_out(self):
+        classified = classify_agent_failure(_incident_result())
+        assert classified.kind is AgentFailureKind.API_ERROR
+        assert classified.kind is not AgentFailureKind.TIMED_OUT
+
+    def test_incident_shape_summary_carries_the_verbatim_marker(self):
+        summary = classify_agent_failure(_incident_result()).summary
+        assert summary.startswith('agent API error: HTTP 529')
+        match = _API_ERROR_REASON_RE.search(summary)
+        assert match is not None, f'scheduler marker regex did not match {summary!r}'
+        assert match.group(1) == '529'
+
+    def test_incident_shape_summary_appends_kill_context(self):
+        """The prefix is a contract; the suffix is free-form operator forensics
+        (PRD open question 5) and is emitted only on the timed-out path."""
+        summary = classify_agent_failure(_incident_result()).summary
+        assert 'killed' in summary
+        assert '127' in summary, f'expected the elapsed seconds in {summary!r}'
+        assert 'transcript_turns=0' in summary
+
+    def test_incident_shape_diagnostic_detail_unchanged(self):
+        detail = classify_agent_failure(_incident_result()).diagnostic_detail
+        assert 'api_error_status=529' in detail
+        assert 'transcript_turns=0' in detail
+
+    def test_non_timed_out_529_summary_has_no_kill_context(self):
+        """Pins that the suffix is conditional on ``timed_out`` — the
+        non-timed-out summary stays byte-identical to today's."""
+        result = AgentResult(success=False, output=OVERLOADED_BODY, api_error_status=529)
+        classified = classify_agent_failure(result)
+        assert classified.kind is AgentFailureKind.API_ERROR
+        assert classified.summary == 'agent API error: HTTP 529'
+
+    @pytest.mark.parametrize('status', [500, 599])
+    def test_timed_out_5xx_boundaries_are_api_error(self, status: int):
+        classified = classify_agent_failure(_incident_result(status))
+        assert classified.kind is AgentFailureKind.API_ERROR
+        match = _API_ERROR_REASON_RE.search(classified.summary)
+        assert match is not None
+        assert match.group(1) == str(status)
+
+    def test_timed_out_499_stays_timed_out(self):
+        """Below the 5xx floor — unchanged."""
+        assert classify_agent_failure(_incident_result(499)).kind is AgentFailureKind.TIMED_OUT
+
+
+class TestClassifyAgentFailureServerErrorPrecedence:
+    """Every neighbouring rule must stay byte-identical."""
+
+    def test_sigkill_subpath_with_no_flushed_json_stays_a_wedge(self):
+        """PRD boundary row 2: the SIGKILL sub-path flushes no JSON, so there is
+        no ``api_error_status`` to key on and the wedge phrasing is unchanged."""
+        result = AgentResult(
+            success=False,
+            output='',
+            subtype='error_empty_output',
+            timed_out=True,
+            transcript_turns=0,
+            duration_ms=127000,
+            api_error_status=None,
+        )
+        classified = classify_agent_failure(result)
+        assert classified.kind is AgentFailureKind.TIMED_OUT
+        assert 'wedge' in classified.summary
+        assert 'productive' not in classified.summary
+
+    def test_timed_out_with_progress_and_no_status_is_unchanged(self):
+        result = AgentResult(
+            success=False,
+            output='',
+            timed_out=True,
+            transcript_turns=13,
+            duration_ms=127000,
+        )
+        classified = classify_agent_failure(result)
+        assert classified.kind is AgentFailureKind.TIMED_OUT
+        assert 'productive' in classified.summary
+
+    def test_ended_awaiting_background_outranks_the_5xx_rule(self):
+        result = AgentResult(
+            success=False,
+            output='',
+            ended_awaiting_background=True,
+            api_error_status=529,
+        )
+        classified = classify_agent_failure(result)
+        assert classified.kind is AgentFailureKind.ENDED_AWAITING_BACKGROUND
+
+    @pytest.mark.parametrize('status', [401, 403])
+    def test_auth_statuses_stay_api_error(self, status: int):
+        result = AgentResult(success=False, output='Unauthorized', api_error_status=status)
+        assert classify_agent_failure(result).kind is AgentFailureKind.API_ERROR
+
+    def test_404_stays_model_not_found(self):
+        result = AgentResult(
+            success=False,
+            output='{"type":"error","error":{"type":"not_found_error"}}',
+            api_error_status=404,
+        )
+        assert classify_agent_failure(result).kind is AgentFailureKind.MODEL_NOT_FOUND
+
+    def test_success_with_5xx_status_stays_success(self):
+        result = AgentResult(success=True, output='done', api_error_status=529)
+        assert classify_agent_failure(result).kind is AgentFailureKind.SUCCESS
