@@ -3788,6 +3788,20 @@ def create_mcp_server(
         keep paging with ``offset``/``page_size`` — treating that first page as
         the full census would silently under-count the project.
 
+        Why only the ids-less path is auto-capped (a deliberate asymmetry): the
+        full-population enumeration is UNBOUNDED — it grows with the project, and
+        it is the exact path that failed closed.  The ids-filtered path is
+        caller-bounded: the caller already enumerated the id set and depends on an
+        answer for each id, so silently dropping the tail would trade a loud
+        transport failure for a quiet correctness bug.  Every named id is returned
+        intact; a caller whose own id list is large enough to need paging can pass
+        ``page_size``/``offset`` explicitly.
+
+        Scope note: this cap lives at the MCP tool layer only.
+        ``get_external_statuses`` and all in-process reconciliation callers reach
+        the backend through ``task_interceptor.get_statuses`` directly, NOT through
+        this tool, and cross no token-limited transport — they are unaffected.
+
         Shape note (deliberate asymmetry): this tool WRAPS its result under a
         top-level ``'statuses'`` key (``{'statuses': {id: status}}``), unlike
         ``get_external_statuses`` which intentionally returns a FLAT
