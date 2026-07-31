@@ -281,6 +281,22 @@ class ApiHealthGate:
                 consecutive_successes=streak,
             )
 
+        if isinstance(outcome, ServerError):
+            # A failed probe means the outage never ended: back to Open, streak
+            # discarded (dropping Probing IS the reset — there is no counter to
+            # zero), evidence refreshed from the live window.
+            #
+            # `since` is deliberately NOT restamped.  It measures the true
+            # CONTINUOUS outage, which is what omicron's
+            # `max_open_before_l2_hours` promotion clock reads.  Restamping on
+            # every flap would let a provider that fails one probe every 90
+            # minutes sit Open forever and never promote to L2 — exactly the
+            # storm-escape decision 12 exists to prevent.
+            return Open(since=self._degraded_since(), stats=stats)
+
+        # Neutral outcome while degraded — see _classify's note: no evidence
+        # either way about the provider, so the state (and any probe streak
+        # inside it) is left exactly as it was.
         return self._state
 
     def _close(self, stats: GateStats) -> GateState:
