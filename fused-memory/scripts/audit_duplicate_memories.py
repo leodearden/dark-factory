@@ -365,6 +365,14 @@ def _lexical_pairs_scored(
 # deliberately the SAME four `task_filter.LIVE_TASK_STATUS_RE` gates on, so
 # "what counts as a live field" keeps one definition shared with the gate that
 # forces these observations into their durable point-in-time form.
+#
+# That alignment is now LOAD-BEARING, not merely tidy: both call sites below
+# prefilter on `LIVE_TASK_STATUS_RE`, which is only semantics-preserving while
+# every name here is one the imported gate also recognises in assignment form.
+# Adding a field here without the matching `task_filter` change would silently
+# start DROPPING real snapshots rather than counting them — the parametrized
+# premise guard in `TestLivenessDetectorRegexBudget` exists to catch exactly
+# that edit.
 _LIVE_FIELD_NAMES: tuple[str, ...] = (
     'status',
     'claimant_run_id',
@@ -381,6 +389,28 @@ _LIVE_FIELD_ASSIGNMENT_RE = re.compile(
     r'\b(' + '|'.join(_LIVE_FIELD_NAMES) + r')\s*=\s*"?([A-Za-z0-9_./:+-]+)"?',
     re.IGNORECASE,
 )
+
+
+def _liveness_snapshot_fact(content: str, *, point_in_time: bool) -> str | None:
+    """Canonical key for *content*, given an already-evaluated point-in-time verdict.
+
+    Split out of ``extract_liveness_snapshot_fact`` so the expensive
+    ``POINT_IN_TIME_CHECK_RE`` verdict is computed ONCE per record by the
+    caller and then reused, instead of being re-derived at every place that
+    needs it. Takes the predicate rather than evaluating it; the key
+    construction below is unchanged.
+    """
+    if not point_in_time:
+        return None
+
+    pairs: set[str] = set()
+    for field, value in _LIVE_FIELD_ASSIGNMENT_RE.findall(content):
+        cleaned = value.rstrip('./:+-').lower()
+        if cleaned:
+            pairs.add(f'{field.lower()}={cleaned}')
+    if not pairs:
+        return None
+    return '|'.join(sorted(pairs))
 
 
 def extract_liveness_snapshot_fact(record: dict) -> str | None:
@@ -417,17 +447,22 @@ def extract_liveness_snapshot_fact(record: dict) -> str | None:
         a different key and never groups with this one.
     """
     content = record.get('content') or ''
-    if not POINT_IN_TIME_CHECK_RE.search(content):
+    # Cheap gate FIRST. ``POINT_IN_TIME_CHECK_RE``'s two ``(?=.*...)``
+    # lookaheads under ``re.DOTALL`` make it quadratic in content length —
+    # measured 2.2 ms at 424 chars rising to 794 ms at 4240 on NON-matching
+    # input, versus 0.015-0.35 ms for the lookahead-free
+    # ``LIVE_TASK_STATUS_RE`` — and a non-match is the overwhelmingly common
+    # case: this detector always runs, with no flag to disable it, over a
+    # default 5000-records-per-category scan of mostly ordinary prose.
+    # The gate is SOUND because ``_LIVE_FIELD_ASSIGNMENT_RE`` is
+    # ``LIVE_TASK_STATUS_RE``'s first alternative plus extra obligations, so
+    # an assignment hit implies a live-status hit: a record failing this check
+    # could never have yielded a key anyway.
+    if not LIVE_TASK_STATUS_RE.search(content):
         return None
-
-    pairs: set[str] = set()
-    for field, value in _LIVE_FIELD_ASSIGNMENT_RE.findall(content):
-        cleaned = value.rstrip('./:+-').lower()
-        if cleaned:
-            pairs.add(f'{field.lower()}={cleaned}')
-    if not pairs:
-        return None
-    return '|'.join(sorted(pairs))
+    return _liveness_snapshot_fact(
+        content, point_in_time=bool(POINT_IN_TIME_CHECK_RE.search(content)),
+    )
 
 
 def liveness_snapshot_subject_task_ids(record: dict) -> set[str]:
@@ -569,15 +604,28 @@ def find_liveness_snapshot_recurrences(
         category = record.get('category')
         if category not in swept:
             continue
-        core_fact = extract_liveness_snapshot_fact(record)
+        content = record.get('content') or ''
+        # The same cheap prefilter `extract_liveness_snapshot_fact` applies,
+        # hoisted here so the quadratic `POINT_IN_TIME_CHECK_RE` is consulted
+        # AT MOST ONCE per record instead of once by the extractor and again
+        # by the disclosure branch below. Deliberately `LIVE_TASK_STATUS_RE`
+        # and NOT the narrower `_LIVE_FIELD_ASSIGNMENT_RE`:
+        # `liveness_snapshot_unfielded` counts exactly the paraphrase records
+        # the narrower pattern would discard, so prefiltering on it would
+        # drive that counter to a permanent zero — turning a counted loss back
+        # into an invisible one.
+        if not LIVE_TASK_STATUS_RE.search(content):
+            continue
+        point_in_time = bool(POINT_IN_TIME_CHECK_RE.search(content))
+        core_fact = _liveness_snapshot_fact(content, point_in_time=point_in_time)
         if core_fact is None:
             # "Not a snapshot at all" and "a snapshot whose fields could not be
             # read" are different outcomes, and only the second is a loss. The
             # discrimination lives HERE rather than inside the extractor, which
-            # keeps its single None/key contract.
-            content = record.get('content') or ''
-            if (POINT_IN_TIME_CHECK_RE.search(content)
-                    and LIVE_TASK_STATUS_RE.search(content)):
+            # keeps its single None/key contract. The `LIVE_TASK_STATUS_RE`
+            # half of this condition is already guaranteed by the prefilter
+            # above, so only the point-in-time verdict is left to test.
+            if point_in_time:
                 disclosure['liveness_snapshot_unfielded'] += 1
             continue
         subjects = liveness_snapshot_subject_task_ids(record)
