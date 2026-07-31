@@ -22,8 +22,20 @@ These are small, single-purpose helpers in the ``reconciliation/`` convention
 
 from __future__ import annotations
 
+import json
+import logging
 import re
 from typing import Any
+
+from fused_memory.middleware.task_interceptor import interceptor_write_succeeded
+from fused_memory.reconciliation.task_filter import INACTIVE_TASK_STATUSES
+
+logger = logging.getLogger(__name__)
+
+# The recon-stage caller identity the repoint writes are attributed to.
+# Matches the `recon-stage-` prefix that recon_write_policy scopes on
+# (task_interceptor.py:893, :3953).
+REPOINT_AGENT_ID = 'recon-stage-memory_consolidator'
 
 # Canonical 36-char UUID, the ONLY shape accepted as a forwarding pointer.
 # Anchored end-to-end so a uuid embedded in prose does not qualify: a
@@ -314,3 +326,176 @@ def build_citation_tombstone(
         'paths': list(paths),
         'run_id': run_id,
     }
+
+
+async def repoint_task_citations(
+    task_interceptor: Any,
+    project_root: str,
+    *,
+    memory_id: str,
+    replacement_id: str,
+    run_id: str | None = None,
+    log: logging.Logger | None = None,
+) -> dict[str, Any]:
+    """Repoint every LIVE task-metadata citation of ``memory_id``, before a delete.
+
+    One ``get_tasks(project_root)`` read yields both worklists, partitioned in
+    Python by ``INACTIVE_TASK_STATUSES`` (``task_filter.py:668`` =
+    ``{'done', 'cancelled'}``):
+
+    - **non-terminal** citers are REPOINTED: their metadata is rewritten to
+      ``replacement_id`` and a :func:`build_citation_tombstone` record is
+      appended, in ONE ``update_task(..., metadata_mode='merge')`` write, so a
+      task can never end up rewritten-but-unlabelled;
+    - **terminal** citers are REPORTED into ``terminal_citations`` and never
+      written. Rewriting a done task's record would falsify history, and
+      ``recon_write_policy`` Gate 1 refuses recon-stage writes to terminal
+      tasks anyway. Surfacing them keeps a terminal dangler visible instead of
+      silent.
+
+    A single unfiltered read (rather than two status-filtered ones) means both
+    worklists come from the SAME snapshot, and guarantees pending tasks are
+    covered — the four tasks the incident's manual pass missed were pending,
+    i.e. still dispatchable, i.e. the ones that mattered.
+
+    **Merge is shallow last-write-wins** (``tools.py:4982-5002``): supplied
+    keys overwrite wholesale and omitted keys are preserved. So the payload
+    carries WHOLE top-level key values — repointing ``memory_hints.queries[0]``
+    resends the entire ``memory_hints`` value, never a nested fragment, or the
+    write would wipe its siblings. An explicit ``metadata_mode`` is mandatory
+    rather than stylistic: a bare ``append=False`` metadata write is rejected
+    by the backend after the task-2180 metadata-wipe incident.
+
+    Write success is read via ``interceptor_write_succeeded``, NOT try/except:
+    interceptor gates REFUSE BY RETURNING ``{'success': False, 'error_type':
+    ...}`` (e.g. ``recon_write_policy.py:309``) and never raise, so a truthy-dict
+    check would mistake a rejection for a success and let the delete proceed.
+
+    Error posture, deliberately asymmetric:
+
+    - a **per-task** write failure (returned rejection or raised error) is
+      tallied into ``unrepointed`` and the sweep continues, per the prevailing
+      best-effort sweep convention (``stale_status_snapshot_edge_sweep.py``);
+    - the **bulk** ``get_tasks`` read failure PROPAGATES. It means "unknown",
+      and unknown must not be read as "no citations" when the caller is about
+      to perform an irreversible delete — the caller fails closed on it.
+
+    Known limitation: ``get_tasks`` defaults to a single tag, so a multi-tag
+    project would need ``list_tags()`` aggregation. Out of scope here.
+
+    Returns a stats dict whose keys are ALWAYS present, on every path.
+    """
+    log = log or logger
+    stats: dict[str, Any] = {
+        'stage1_citation_tasks_scanned': 0,
+        'stage1_citations_repointed': 0,
+        'stage1_citation_tasks_repointed': 0,
+        'stage1_citation_repoint_failures': 0,
+        'stage1_terminal_citations_reported': 0,
+        'terminal_citations': [],
+        'unrepointed': [],
+    }
+
+    # Deliberately NOT wrapped: a failed bulk read must reach the caller so it
+    # can refuse the delete rather than treat 'unknown' as 'nothing to do'.
+    tasks_data = await task_interceptor.get_tasks(project_root)
+    tasks = (tasks_data or {}).get('tasks') or []
+    if not isinstance(tasks, list):
+        return stats
+
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        stats['stage1_citation_tasks_scanned'] += 1
+        metadata = task.get('metadata')
+        paths = find_citation_occurrences(metadata, memory_id)
+        if not paths:
+            continue
+
+        task_id = str(task.get('id'))
+        status = task.get('status')
+
+        if status in INACTIVE_TASK_STATUSES:
+            stats['terminal_citations'].append(
+                {'task_id': task_id, 'status': status, 'paths': paths},
+            )
+            stats['stage1_terminal_citations_reported'] += 1
+            continue
+
+        try:
+            repointed, count = repoint_metadata(metadata, memory_id, replacement_id)
+            tombstone = build_citation_tombstone(
+                superseded_id=memory_id,
+                replacement_id=replacement_id,
+                paths=paths,
+                run_id=run_id,
+            )
+            # Existing tombstones must be resent: merge overwrites the key
+            # wholesale, so omitting them would drop prior provenance. They are
+            # taken from the REPOINTED blob, not the original, deliberately: a
+            # prior record forwarding to the id being deleted would otherwise
+            # park a dangling pointer in a field literally named
+            # replacement_memory_id — the exact harm this sweep prevents,
+            # merely relocated. Transitively repointing it keeps the chain
+            # resolvable, and the record appended just below preserves the hop
+            # that collapse discarded. Only superseded_memory_id slots (which
+            # are meant to name dead ids) still mention the deleted entry.
+            existing = repointed.get(X_CITATION_TOMBSTONE_KEY)
+            tombstones = list(existing) if isinstance(existing, list) else []
+            tombstones.append(tombstone)
+
+            # Send ONLY the top-level keys that actually changed, each as a
+            # WHOLE value (shallow merge), so untouched keys are preserved by
+            # omission rather than by round-tripping them through JSON.
+            changed_top_level = {
+                key: value
+                for key, value in repointed.items()
+                if key != X_CITATION_TOMBSTONE_KEY and value != metadata.get(key)
+            }
+            changed_top_level[X_CITATION_TOMBSTONE_KEY] = tombstones
+
+            resp = await task_interceptor.update_task(
+                task_id=task_id,
+                project_root=project_root,
+                metadata=json.dumps(changed_top_level),
+                metadata_mode='merge',
+                agent_id=REPOINT_AGENT_ID,
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:  # noqa: BLE001 — best-effort per-task sweep
+            log.warning(
+                'citation repoint failed for task %s (%s -> %s): %s',
+                task_id, memory_id, replacement_id, exc,
+            )
+            stats['stage1_citation_repoint_failures'] += 1
+            stats['unrepointed'].append({
+                'task_id': task_id,
+                'status': status,
+                'paths': paths,
+                'error': str(exc),
+                'error_type': type(exc).__name__,
+            })
+            continue
+
+        if interceptor_write_succeeded(resp):
+            stats['stage1_citation_tasks_repointed'] += 1
+            stats['stage1_citations_repointed'] += count
+        else:
+            # A REFUSAL, not an exception — see the docstring.
+            log.warning(
+                'citation repoint rejected for task %s (%s -> %s): %s',
+                task_id, memory_id, replacement_id, resp,
+            )
+            stats['stage1_citation_repoint_failures'] += 1
+            stats['unrepointed'].append({
+                'task_id': task_id,
+                'status': status,
+                'paths': paths,
+                'error': (resp or {}).get('error') if isinstance(resp, dict) else None,
+                'error_type': (
+                    (resp or {}).get('error_type') if isinstance(resp, dict) else None
+                ),
+            })
+
+    return stats

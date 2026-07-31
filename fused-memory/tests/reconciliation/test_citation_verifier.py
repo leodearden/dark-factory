@@ -817,10 +817,20 @@ class TestRepointTaskCitations:
 
     @pytest.mark.asyncio
     async def test_existing_tombstones_are_appended_to_not_replaced(self):
-        """A prior forwarding record is preserved: merge overwrites the key
-        wholesale, so the existing list must be resent alongside the new entry."""
+        """A prior forwarding record is retained (merge overwrites the key
+        wholesale, so the existing list must be resent) — and its now-stale
+        destination is transitively repointed.
+
+        The prior record forwarded ``A -> _DOOMED``. ``_DOOMED`` is the entry
+        being deleted, so leaving that record verbatim would park a dangling
+        pointer in a field literally named ``replacement_memory_id`` — the
+        exact harm this sweep exists to prevent, merely relocated. Repointing
+        it to the survivor keeps the chain resolvable; the appended record
+        preserves the ``_DOOMED -> _SURVIVOR`` hop that was collapsed.
+        """
+        prior_superseded = 'aaaaaaaa-0000-4000-8000-000000000000'
         prior = {
-            'superseded_memory_id': 'aaaaaaaa-0000-4000-8000-000000000000',
+            'superseded_memory_id': prior_superseded,
             'replacement_memory_id': _DOOMED,
             'paths': ['cited'],
             'run_id': 'run-earlier',
@@ -840,7 +850,23 @@ class TestRepointTaskCitations:
         payload = json.loads(interceptor.update_task.call_args[1]['metadata'])
         tombstones = payload['x_memory_citation_tombstones']
         assert len(tombstones) == 2
-        # The prior record survives verbatim, including its own now-superseded
-        # pointer — history is appended to, never rewritten.
-        assert tombstones[0] == prior
+
+        # The prior record is retained and its provenance is intact — what A
+        # was superseded FROM never changes...
+        assert tombstones[0]['superseded_memory_id'] == prior_superseded
+        assert tombstones[0]['paths'] == ['cited']
+        assert tombstones[0]['run_id'] == 'run-earlier'
+        # ...but its destination now resolves, instead of pointing at the entry
+        # this very call is about to delete.
+        assert tombstones[0]['replacement_memory_id'] == _SURVIVOR
+
+        # The collapsed hop is recorded explicitly by the appended record.
+        assert tombstones[1]['superseded_memory_id'] == _DOOMED
         assert tombstones[1]['replacement_memory_id'] == _SURVIVOR
+        assert tombstones[1]['run_id'] == 'run-abc'
+
+        # Net effect: no surviving pointer anywhere addresses the deleted id
+        # EXCEPT the explicitly-labelled superseded_memory_id slot.
+        assert find_citation_occurrences(payload, _DOOMED) == [
+            'x_memory_citation_tombstones[1].superseded_memory_id',
+        ]
