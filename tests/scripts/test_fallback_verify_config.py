@@ -385,14 +385,26 @@ def test_fallback_verify_budget_clears_the_measured_fleet_chain_floor() -> None:
     on the honest green path. That is what task 3062 attempt-2 hit at 1800.66s.
 
     This asserts against the measured floor rather than pinning the chosen
-    value, deliberately. Pinning a number would re-encode a constant that the
-    next suite-growth event falsifies again — the exact failure mode of the
-    "~2 min" comment this test exists to replace. A floor derived from logged
-    per-suite durations cannot be wrong in the direction that matters (three
-    segments are excluded, so it is provably a lower bound), and it keeps
-    failing loudly if the suite grows past the recorded floor — at which point
-    ``MEASURED_FLEET_SEGMENT_SECS``, with its provenance comment above, is the
-    obvious thing to re-measure.
+    value, deliberately. Pinning a number would re-encode a constant with no
+    stated basis — the exact failure mode of the "~2 min" comment this test
+    exists to replace. A floor derived from logged per-suite durations cannot be
+    wrong in the direction that matters: three segments are excluded, so it is
+    provably a lower bound on the chain's real cost.
+
+    SCOPE — what this guard does NOT do. It is a floor-REGRESSION guard: it
+    fails if someone lowers ``verify_command_timeout_secs`` back below the
+    measured 1838.60s lower bound. It is NOT a suite-growth detector, and
+    nothing here re-measures anything. ``MEASURED_FLEET_SEGMENT_SECS`` is a
+    frozen literal asserted against a config value; if the orchestrator segment
+    doubles to 2700s tomorrow, the table still reads 1366.23, the floor still
+    reads 1838.60, and this test passes green while the budget is once again
+    provably below the honest green path. Genuine growth detection would have to
+    come from RE-MEASUREMENT — an operator runbook step, or a check against
+    durations recorded by a recent verify run — not from a hardcoded table
+    asserting against itself. Stating that plainly is the point: task 3350
+    exists because a justification nobody re-checked was left standing until it
+    was off by an order of magnitude, and a guard that overstates its own reach
+    is the same defect wearing a test's clothes.
     """
     budgets = _verify_budgets()
     warm = budgets['verify_command_timeout_secs']

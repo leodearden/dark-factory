@@ -46,6 +46,36 @@
 # classifies STRUCTURAL and under merge-role merge_verify_breadth=full.
 test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q --timeout=300"
 
+# KNOWN COST, recorded rather than left invisible (task 3350 amendment).
+#
+# This command is BYTE-IDENTICAL to scripts/orchestrator.yaml's test_command
+# (verified). That is not an accident — scripts/ has no tests of its own and has
+# always pointed at this suite — but it means the suite now runs TWICE, and the
+# two dedupe layers each miss it for a different reason:
+#
+#   * run_full_verification (verify.py:4735) asyncio.gathers over
+#     module_configs.values() with NO dedupe by command, so on every review
+#     checkpoint, run_main_tip_sweep and merge full-verify, `scripts` and
+#     `tests/scripts` both fire this identical command CONCURRENTLY in one
+#     worktree — two pytest processes sharing the worktree-root .pytest_cache
+#     and tests/scripts/__pycache__.
+#   * workflow._resolve_module_configs dedupes by `mc.prefix` (`seen[mc.prefix]
+#     = mc`, workflow.py:3558), not by command, so a SCOPED verify whose touched
+#     files span both scripts/ and tests/scripts/ also runs it twice.
+#
+# Cost: ~110-230s of duplicated work per full verify. That cuts against this
+# file's own premise — the 600s budget below is sized for a ~39% run-to-run
+# spread attributed to host oversubscription, and duplicate execution is itself
+# a contributor to that oversubscription.
+#
+# It is documented here rather than fixed because both fixes are out of this
+# task's lock scope: narrowing/removing scripts/orchestrator.yaml's test_command
+# would edit a file this task does not hold, and a dedupe-identical-commands
+# guard in run_full_verification is a production-code change of a different
+# class. Filed as follow-up. Recording it keeps the cost measured and visible —
+# the same standard this file applies to its timeout budgets — instead of
+# leaving a silent 2x for someone to rediscover under load.
+
 # ALL THREE commands are declared DELIBERATELY, not incidentally.
 #
 # Omitting either of the two below would NOT leave them running as they do
