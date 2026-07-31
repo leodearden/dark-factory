@@ -40,6 +40,7 @@ from _verify_config_corpus import (
     ROOT_LINT_COMMAND,
     ROOT_TEST_COMMAND,
     ROOT_TYPE_CHECK_COMMAND,
+    discover_lint_command_modules,
     load_config_scalar,
 )
 
@@ -104,4 +105,41 @@ class TestModuleLintCommandsMatchLiveYaml:
             f'it a dedicated constant the way fused-memory has FM_LINT_COMMAND, and drop it '
             f'from MODULE_LINT_COMMANDS. Either way also check test_verify_plan.py\'s goldens, '
             f'which iterate this dict. Do NOT loosen this comparison to a substring match.'
+        )
+
+
+class TestCorpusCoversEveryLiveLintCommand:
+    """Every module that defines a ``lint_command`` today is covered by the corpus.
+
+    The completeness half of the drift gate. The forward checks above are
+    structurally blind to one failure mode: a NEW subproject lands its own
+    ``orchestrator.yaml`` with a ``lint_command``, the corpus never grows to
+    cover it, and the scoper suites go on claiming to "exercise the real
+    configs" while silently missing one. Only a check that DISCOVERS the live
+    set can see that.
+    """
+
+    def test_discovered_modules_are_exactly_the_covered_modules(self):
+        discovered = set(discover_lint_command_modules())
+        covered = {'fused-memory'} | set(MODULE_LINT_COMMANDS)
+
+        uncovered = discovered - covered
+        assert not uncovered, (
+            f'These modules define a lint_command that the verify-config corpus does not '
+            f'cover: {sorted(uncovered)}.\n'
+            f'FIX: if the chain matches the common 2-segment shape, add the module name to '
+            f'MODULE_LINT_COMMANDS in orchestrator/tests/_verify_config_corpus.py; if the '
+            f'shape differs, give it a dedicated constant the way fused-memory has '
+            f'FM_LINT_COMMAND. Then extend the verify-scoper goldens to exercise it — an '
+            f'uncovered module is a real command shape the scoper has never been tested '
+            f'against.'
+        )
+
+        stale = covered - discovered
+        assert not stale, (
+            f'The verify-config corpus covers these modules, but no live lint_command was '
+            f'discovered for them: {sorted(stale)}.\n'
+            f'FIX: the module\'s orchestrator.yaml has lost its lint_command, or the module '
+            f'was deleted or renamed. Drop the corpus entry (MODULE_LINT_COMMANDS, or the '
+            f'dedicated constant) together with the verify-scoper goldens that consume it.'
         )
