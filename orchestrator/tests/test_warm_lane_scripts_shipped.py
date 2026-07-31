@@ -786,6 +786,133 @@ class TestSiblingResolutionIgnoresTheCallersCwd:
         )
 
 
+class TestThinSelfClobberGuardDoesNotDependOnPath:
+    """``thin-warm-lane.sh``'s self-clobber guard must fire without ``basename``.
+
+    A DIFFERENT failure mechanism from every case above, and the reason this
+    class exists separately rather than as one more parametrization of
+    ``TestSiblingResolutionIgnoresTheCallersCwd``:
+
+    **A ``$(...)`` substitution that fails with 127 inside ``[ ... ]`` does not
+    abort under ``set -e``.**  ``[ "$(basename "$X")" = "base" ]`` sees only the
+    empty string, compares FALSE, and execution continues — whereas the same
+    failure in an ASSIGNMENT (``name="$(basename "$X")"``) propagates 127 and
+    ``set -e`` kills the script.  Same missing binary, opposite blast radius:
+    the assignment sites in ``warm-lane-gc.sh`` / ``warm-lane-audit.sh`` are
+    loud-and-non-destructive by that accident (both measured; see
+    ``test_only_cosmetic_program_name_forks_remain``), while this one degrades
+    SILENTLY and destructively.
+
+    The site is ``thin-warm-lane.sh``'s ``[ "$(basename "$_rp_lane_dir")" =
+    "base" ]``, the load-bearing half of the self-clobber guard and the ONLY
+    half that fires when ``REIFY_WARM_LANE_MOUNT`` is unset (the two
+    mount-relative checks above it are inside ``if [ -n
+    "${REIFY_WARM_LANE_MOUNT:-}" ]``).  It sits 33 lines above
+    ``rm -rf "$LANE_DIR/target"``.
+
+    MEASURED RED on branch HEAD 27fbfb4ea5 with ``basename`` shimmed to exit
+    127, ``REIFY_WARM_LANE_MOUNT`` unset and ``lane_dir=<pool>/base``: the
+    guard is silently defeated and the script prints ``[ok] Freed
+    <pool>/base/target`` / ``[ok] Thinned lane`` at **rc=0**, deleting the
+    pool's seed source.  Control (``basename`` present): ``Precondition guard:
+    lane_dir resolves to (or is named) the base dir ... refusing to thin``,
+    rc=1, tree intact.
+
+    ``REIFY_WARM_LANE_MOUNT`` is deliberately left UNSET here (``_sanitized_env``
+    strips it) — that is the branch under test.  Setting it would let the
+    mount-relative checks reach ``_self_clobber=1`` on their own and mask the
+    defect entirely.
+    """
+
+    @staticmethod
+    def _thin_without_basename(
+        lane: Path, *, tmp_path: Path,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run ``thin-warm-lane.sh <lane>`` with ``basename`` hidden from ``PATH``."""
+        script = WARM_LANE_SCRIPT_DIR / 'thin-warm-lane.sh'
+        assert script.is_file(), f'thin-warm-lane.sh is not shipped at {script}'
+        return subprocess.run(
+            [_BASH, str(script), str(lane)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=_sanitized_env(extra={
+                'PATH': (
+                    f'{_path_hiding(tmp_path, "basename")}'
+                    f'{os.pathsep}{os.environ["PATH"]}'
+                ),
+            }),
+        )
+
+    def test_self_clobber_guard_survives_a_path_without_basename(
+        self, tmp_path: Path,
+    ) -> None:
+        """A lane literally named ``base`` is refused, ``basename`` or no ``basename``.
+
+        Three assertions, because any ONE of them can pass for the wrong
+        reason: a script that died early for an unrelated reason satisfies (a)
+        and (b) while proving nothing about the guard, and a script that
+        printed the refusal after already deleting would satisfy (b) and (c).
+        Together they pin the safety property, the failure, and the DIAGNOSIS.
+        """
+        pool = tmp_path / 'pool'
+        sentinel = pool / 'base' / 'target' / 'seed-source-file'
+        sentinel.parent.mkdir(parents=True)
+        sentinel.write_text('the pool seed source\n')
+
+        proc = self._thin_without_basename(pool / 'base', tmp_path=tmp_path)
+        combined = proc.stdout + proc.stderr
+
+        # (a) the actual safety property.
+        assert sentinel.is_file(), (
+            'thin-warm-lane.sh DELETED the pool seed source under a PATH '
+            'without `basename`: the self-clobber guard tests '
+            '`[ "$(basename "$_rp_lane_dir")" = "base" ]`, and a 127 '
+            'substitution inside `[ ... ]` yields the empty string WITHOUT '
+            'tripping `set -e`, so the guard silently compares false '
+            f'(README.md "Delta 7").\noutput:\n{combined}'
+        )
+        # (b) it must FAIL, not succeed-having-done-nothing.
+        assert proc.returncode != 0, (
+            'thin-warm-lane.sh reported SUCCESS for a lane named `base`.\n'
+            f'output:\n{combined}'
+        )
+        # (c) and fail for THIS reason.
+        assert 'refusing to thin' in combined, (
+            'thin-warm-lane.sh failed for some reason other than the '
+            f'self-clobber guard.\noutput:\n{combined}'
+        )
+
+    def test_a_normally_named_lane_still_thins_without_basename(
+        self, tmp_path: Path,
+    ) -> None:
+        """No-regression companion: the guard must not start refusing everything.
+
+        A guard that fires on every input satisfies the case above while
+        breaking the script, so the fix has to be shown to be a CORRECTION of
+        the comparison rather than a widening of it.  MEASURED against the
+        prototype fix: ``<pool>/_lane-1`` still thins to rc=0 with its
+        ``target/`` removed under the same hidden-``basename`` PATH.
+        """
+        pool = tmp_path / 'pool'
+        lane = pool / '_lane-1'
+        (lane / 'target').mkdir(parents=True)
+        (lane / 'target' / 'checkout-file').write_text('reclaimable\n')
+
+        proc = self._thin_without_basename(lane, tmp_path=tmp_path)
+        combined = proc.stdout + proc.stderr
+
+        assert proc.returncode == 0, (
+            'thin-warm-lane.sh refused a normally-named lane under a PATH '
+            'without `basename` — the self-clobber guard must be corrected, '
+            f'not widened.\noutput:\n{combined}'
+        )
+        assert not (lane / 'target').exists(), (
+            'thin-warm-lane.sh reported success but left `target/` in place.\n'
+            f'output:\n{combined}'
+        )
+
+
 class TestNoShippedScriptResolvesItsOwnDirectoryByForking:
     """Directory-wide drift gate: the forking spelling appears ZERO times.
 
