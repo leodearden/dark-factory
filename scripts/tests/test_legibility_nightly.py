@@ -2104,3 +2104,308 @@ class TestRunNightlyRecordsTrickleState:
         assert doc['project_id'] == 'testproj'
         assert doc['outcome'] == 'productive'
         assert doc['target_date'] == '2026-07-13'
+
+
+# ---------------------------------------------------------------------------
+# task 3340 step-11/12: edge-triggered barren-streak escalation
+# ---------------------------------------------------------------------------
+
+def _streak_escalations(calls):
+    """Escalations posted by the STREAK trigger, distinguished from
+    _report_sample_outcome's per-night suppression notice (a different
+    predicate, window and remedy prompt, posted on the same envelope)."""
+    return [
+        (url, env) for url, env in calls
+        if 'consecutive' in env['params']['arguments']['summary'].lower()
+    ]
+
+
+class _NightRunner:
+    """Drive REAL consecutive run_nightly calls against one repo, so the
+    streak is built by the actual pipeline + recorder rather than a
+    hand-seeded state file."""
+
+    def __init__(self, tmp_path):
+        self.tmp_path = tmp_path
+        self.work_cwd = str(tmp_path / 'work')
+        self.repo, self.config_path = _init_e2e_repo(
+            tmp_path, work_cwd=self.work_cwd,
+        )
+        self.projects_root = tmp_path / 'projects'
+        self.projects_root.mkdir(parents=True, exist_ok=True)
+        self.escalations = []
+
+    def night(self, day, kind):
+        """Run one night. *kind* is 'barren' (real signal, squeezed budget),
+        'productive' (real signal, stock budget) or 'quiet' (no sessions at
+        all for this date)."""
+        target = date(2026, 7, day)
+        _write_config(
+            self.repo, project_id='testproj', escalation_port=8199,
+            cwd_prefixes=[self.work_cwd],
+            max_daily_digest_bytes=10 if kind == 'barren' else None,
+        )
+        if kind in ('barren', 'productive'):
+            _write_transcript(
+                self.projects_root / _encode_cwd(self.work_cwd)
+                / f'session-{day}.jsonl',
+                cwd=self.work_cwd,
+                timestamp=f'2026-07-{day:02d}T10:00:00Z',
+                session_id=f'session-{day}',
+            )
+        return nightly.run_nightly(
+            config_path=self.config_path,
+            projects_root=self.projects_root,
+            target_date=target,
+            now=datetime(2026, 7, day + 1, 3, 0, 0, tzinfo=timezone.utc),
+            invoke=_fake_invoke_known_cause,
+            status_fetcher=None,
+            poster=lambda url, env: self.escalations.append((url, env)),
+        )
+
+
+class TestBarrenStreakEscalation:
+    """The LIVE CALLER, so the new probe is not "a probe nobody runs".
+
+    nightly.py owns this because it is the only thing that already runs
+    every night. EDGE-triggered (fires on the run where the streak first
+    REACHES the threshold, re-arms only after a productive/quiet run
+    resets it) — which sidesteps task 3270's alarm-fatigue debate rather
+    than re-opening it, and avoids the one-shot latch's worse failure mode
+    that 3270 explicitly rejected.
+    """
+
+    def test_threshold_default_is_three(self):
+        """One barren night can be an ordinary bad day; three consecutive
+        means PERSISTENT CONFIG STATE. The real 2026-07-16..29 incident
+        would have fired on night 3 of 14 instead of never."""
+        assert trickle_state.DEFAULT_MAX_BARREN_RUNS == 3
+
+    def test_nights_one_and_two_do_not_escalate_the_streak(self, tmp_path):
+        runner = _NightRunner(tmp_path)
+
+        first = runner.night(13, 'barren')
+        assert first.barren_escalated is False
+        assert _streak_escalations(runner.escalations) == []
+
+        second = runner.night(14, 'barren')
+        assert second.barren_escalated is False
+        assert _streak_escalations(runner.escalations) == []
+
+    def test_night_three_escalates_exactly_once(self, tmp_path):
+        runner = _NightRunner(tmp_path)
+        runner.night(13, 'barren')
+        runner.night(14, 'barren')
+        third = runner.night(15, 'barren')
+
+        assert third.barren_escalated is True
+
+        streak = _streak_escalations(runner.escalations)
+        assert len(streak) == 1, (
+            f'expected exactly ONE streak escalation; got '
+            f'{[e["params"]["arguments"]["summary"] for _u, e in streak]}'
+        )
+        arguments = streak[0][1]['params']['arguments']
+
+        # The decision-8 envelope, reused unchanged, so it never gates
+        # anything.
+        assert streak[0][1]['params']['name'] == 'escalate_info'
+        assert arguments['category'] == 'infra_issue'
+        assert arguments['severity'] == 'info'
+
+        assert '3' in arguments['summary'], 'summary must name the streak count'
+        detail = arguments['detail']
+        assert 'testproj' in detail
+        assert 'budget_skipped' in detail
+        assert 'max_daily_digest_bytes' in detail, (
+            'the budget door has its OWN remedy and must be named'
+        )
+
+    def test_night_four_does_not_escalate_again(self, tmp_path):
+        """EDGE-triggered, not level-triggered."""
+        runner = _NightRunner(tmp_path)
+        for day in (13, 14, 15):
+            runner.night(day, 'barren')
+        assert len(_streak_escalations(runner.escalations)) == 1
+
+        fourth = runner.night(16, 'barren')
+
+        assert fourth.barren_escalated is False
+        assert len(_streak_escalations(runner.escalations)) == 1, (
+            'a level-triggered alarm would re-fire every night from here on'
+        )
+
+    def test_a_productive_night_rearms_the_trigger(self, tmp_path):
+        """A one-shot latch would reproduce exactly the pathology 3270
+        warned about: whoever misses the single first escalation gets
+        silence thereafter."""
+        runner = _NightRunner(tmp_path)
+        for day in (13, 14, 15):
+            runner.night(day, 'barren')
+        assert len(_streak_escalations(runner.escalations)) == 1
+
+        recovered = runner.night(16, 'productive')
+        assert recovered.barren_escalated is False
+
+        for day in (17, 18):
+            assert runner.night(day, 'barren').barren_escalated is False
+        assert len(_streak_escalations(runner.escalations)) == 1
+
+        refired = runner.night(19, 'barren')
+        assert refired.barren_escalated is True
+        assert len(_streak_escalations(runner.escalations)) == 2
+
+    def test_a_quiet_night_also_rearms_the_trigger(self, tmp_path):
+        runner = _NightRunner(tmp_path)
+        for day in (13, 14, 15):
+            runner.night(day, 'barren')
+        runner.night(16, 'quiet')
+
+        for day in (17, 18):
+            assert runner.night(day, 'barren').barren_escalated is False
+        assert runner.night(19, 'barren').barren_escalated is True
+
+    def test_exit_code_stays_zero_on_the_streak_escalation_path(self, tmp_path):
+        """A non-zero exit flips legibility-trickle@testproj.service to
+        Result=failed, permanently false-alarming check_trickle_liveness.sh
+        — the exact trade _report_sample_outcome already refused. It would
+        trade a silent-failure mode for a permanent false alarm and burn
+        the one signal that works."""
+        runner = _NightRunner(tmp_path)
+        runner.night(13, 'barren')
+        runner.night(14, 'barren')
+        third = runner.night(15, 'barren')
+
+        assert third.barren_escalated is True
+        assert third.exit_code == 0
+
+    def test_a_quiet_streak_never_escalates(self, tmp_path):
+        """PRD decision 7's no-false-alarm guarantee, asserted END-TO-END
+        through the real pipeline rather than only at the classifier."""
+        runner = _NightRunner(tmp_path)
+        for day in (13, 14, 15, 16):
+            result = runner.night(day, 'quiet')
+            assert result.barren_escalated is False
+            assert result.exit_code == 0
+
+        assert runner.escalations == [], (
+            f'a quiet project must post NOTHING however long it stays quiet; '
+            f'got {runner.escalations!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 3340 step-11/12: the sibling barren door gets journal visibility
+# ---------------------------------------------------------------------------
+
+def _sample(*, selected=(), zero_signal_dropped=0, dedupe_collapsed=0,
+            below_sampling_cut=0, budget_skipped=0):
+    """Hand-build a SampleResult satisfying the conservation identity. The
+    sampling-cut-only barren night is NOT reachable end-to-end (a stratum's
+    cut is max(ceil(top_fraction*n), per_stratum_min) >= 1, so something is
+    always selected unless the BUDGET also cuts), so this mode is exercised
+    at the _report_sample_outcome boundary directly."""
+    selected = list(selected)
+    return nightly.sampling.SampleResult(
+        selected=selected,
+        per_stratum_counts={},
+        zero_signal_dropped=zero_signal_dropped,
+        bytes_used=0,
+        dedupe_collapsed=dedupe_collapsed,
+        budget_skipped=budget_skipped,
+        below_sampling_cut=below_sampling_cut,
+        total_records=(
+            zero_signal_dropped + dedupe_collapsed + below_sampling_cut
+            + budget_skipped + len(selected)
+        ),
+    )
+
+
+def _cfg_for(tmp_path):
+    return load_config(_write_config(tmp_path, project_id='testproj'))
+
+
+def test_report_sample_outcome_warns_on_a_sampling_cut_only_night(tmp_path, caplog):
+    """The sibling absence mode task 3270 left ENTIRELY unobserved: real,
+    distinct signal held back by the sampling cut, nothing digested. It
+    gets journal visibility now, and escalation only via the streak, so
+    per-night alarm volume does not rise."""
+    cfg = _cfg_for(tmp_path)
+    posted = []
+
+    with caplog.at_level('INFO', logger='legibility.nightly'):
+        escalated = nightly._report_sample_outcome(
+            cfg, _sample(below_sampling_cut=3), date(2026, 7, 13),
+            poster=lambda url, env: posted.append((url, env)),
+        )
+
+    assert escalated is False
+    assert posted == [], (
+        'the streak owns escalation for this mode; a per-night escalation '
+        'here would raise alarm volume for a signal that already repeats'
+    )
+
+    loud = _nightly_warnings(caplog)
+    assert len(loud) == 1, (
+        f'expected exactly one WARNING; got {[r.getMessage() for r in loud]}'
+    )
+    message = loud[0].getMessage()
+    assert 'top_fraction' in message or 'per_stratum_min' in message, (
+        f'the sampling-cut door has its OWN remedy and must name it; got '
+        f'{message!r}'
+    )
+    assert 'max_daily_digest_bytes' not in message, (
+        'raising the byte budget does nothing whatever for a '
+        'below_sampling_cut record — SampleResult says so explicitly'
+    )
+
+
+def test_report_sample_outcome_budget_door_is_unchanged(tmp_path, caplog):
+    """The budget door keeps its per-night escalation exactly as 3270 left
+    it — this change adds a sibling branch, it does not alter this one."""
+    cfg = _cfg_for(tmp_path)
+    posted = []
+
+    with caplog.at_level('INFO', logger='legibility.nightly'):
+        escalated = nightly._report_sample_outcome(
+            cfg, _sample(budget_skipped=4), date(2026, 7, 13),
+            poster=lambda url, env: posted.append((url, env)),
+        )
+
+    assert escalated is True
+    assert len(posted) == 1
+    assert 'suppress' in posted[0][1]['params']['arguments']['summary'].lower()
+
+
+def test_report_sample_outcome_stays_quiet_on_a_quiet_night(tmp_path, caplog):
+    cfg = _cfg_for(tmp_path)
+    posted = []
+
+    with caplog.at_level('INFO', logger='legibility.nightly'):
+        escalated = nightly._report_sample_outcome(
+            cfg, _sample(zero_signal_dropped=9, dedupe_collapsed=2),
+            date(2026, 7, 13),
+            poster=lambda url, env: posted.append((url, env)),
+        )
+
+    assert escalated is False
+    assert posted == []
+    assert _nightly_warnings(caplog) == []
+
+
+def test_report_sample_outcome_partial_truncation_stays_at_info(tmp_path, caplog):
+    """Selected something AND skipped some on budget: the budget working as
+    designed, never an absence."""
+    cfg = _cfg_for(tmp_path)
+    posted = []
+
+    with caplog.at_level('INFO', logger='legibility.nightly'):
+        escalated = nightly._report_sample_outcome(
+            cfg, _sample(selected=['digest'], budget_skipped=2),
+            date(2026, 7, 13),
+            poster=lambda url, env: posted.append((url, env)),
+        )
+
+    assert escalated is False
+    assert posted == []
+    assert _nightly_warnings(caplog) == []
