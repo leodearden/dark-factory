@@ -143,3 +143,64 @@ def plan_files_rejection_reason(candidate: WipeCandidate) -> str | None:
             + ", ".join(offenders)
         )
     return None
+
+
+# ---------------------------------------------------------------------------
+# The write payload.
+# ---------------------------------------------------------------------------
+
+# This task's id, stamped into every backfill so a later reader can attribute
+# the write without consulting the event log.
+REPAIR_TASK_ID = "3329"
+
+# WHY x_-PREFIXED, and not the bare `files_backfill_provenance` the task
+# description names. docs/task-authoring.md §Tier-C is explicit that a one-off
+# annotation key "must never be filed as a bespoke top-level metadata key —
+# that just adds another code=unknown_key census line. Use the x_-prefixed
+# forward-compat namespace instead — silently allowed, no warning."  Verified
+# in code: shared/src/shared/task_metadata.py:933 exempts x_-prefixed keys from
+# the unknown_key warning, and `files_backfill_provenance` is NOT in
+# _BLESSED_METADATA_KEYS. A bare key would therefore emit one
+# `task_metadata.schema_warning code=unknown_key` line per repaired task — 35+
+# lines of precisely the drift signal that census exists to surface, spent on a
+# one-off repair annotation. The record's SEMANTIC content (this task's id, the
+# recovery source, the wipe signature) is unchanged from the description's
+# spec; only the key spelling honours the repo's documented vocabulary. Grep
+# found zero in-repo consumers of either spelling.
+PROVENANCE_KEY = "x_files_backfill_provenance"
+
+
+def build_repair_payload(candidate: WipeCandidate, *, now_iso: str) -> dict:
+    """Build the metadata patch that restores *candidate*'s wiped file scope.
+
+    A MINIMAL ADDITIVE PATCH: exactly two keys, both of which this write is
+    responsible for. That minimality is load-bearing three times over.
+
+    * No ``status``. ``SqliteTaskBackend.update_task`` raises
+      ``StatusWriteAuthorityError`` (backends/sqlite_task_backend.py:2575) for a
+      status carried on a metadata write — ``set_task_status`` is the only
+      sanctioned writer.
+    * No ``done_provenance``, at any nesting depth, for the same reason via
+      ``DoneProvenanceWriteAuthorityError``.
+    * No ``modules`` and no ``files_tagged_at``. This restores a scope record;
+      it does not re-run the module tagger, and claiming a fresh tagging would
+      be a false provenance stamp.
+
+    Because the write goes out under ``metadata_mode='merge'``, every key NOT
+    named here is left untouched on the stored blob — which is the whole point,
+    since the wipe class being repaired is precisely a whole-blob overwrite.
+
+    ``now_iso`` is INJECTED rather than stamped from the clock inside, so the
+    caller decides the batch timestamp (one value for a whole run) and tests
+    can assert an exact string.
+    """
+    return {
+        "files": list(candidate.plan_files),
+        PROVENANCE_KEY: {
+            "task": REPAIR_TASK_ID,
+            "src": candidate.plan_files_source,
+            "sig": candidate.wipe_signature,
+            "fidelity": candidate.plan_files_fidelity,
+            "at": now_iso,
+        },
+    }
