@@ -2914,13 +2914,17 @@ async def _run_post_merge_verify(
             # land proceeds).  They are unreachable here only because a killed
             # leg returns NORMALLY with passed=False instead of raising.
             #
-            # infra_timeout is deliberately NOT in the registry: a hang is one
-            # of the few non-completions a branch can genuinely cause, so a
-            # local timeout keeps vetoing (fail CLOSED).  An EMPTY category is
-            # likewise not a licence to land.  See
-            # INDETERMINATE_VERDICT_CATEGORIES — and note it is UNRELATED to
-            # merge_disposition.MergeFailureDisposition.INDETERMINATE, which is
-            # post-failure attribution one layer up.
+            # infra_timeout and pytest_internalerror are deliberately NOT in
+            # the registry, even though both are infra-transient elsewhere: a
+            # hang and a collection-time INTERNALERROR are non-completions a
+            # diff can genuinely CAUSE (an introduced deadlock; a conftest or
+            # plugin that raises only on this host's interpreter), so both keep
+            # vetoing (fail CLOSED).  An EMPTY category is likewise not a
+            # licence to land.  The registry is derived per-row from
+            # CategoryPolicy.verdict_indeterminate, NOT from the infra-transient
+            # set — see INDETERMINATE_VERDICT_CATEGORIES, and note it is
+            # UNRELATED to merge_disposition.MergeFailureDisposition.INDETERMINATE,
+            # which is post-failure attribution one layer up.
             if not local_verify.passed and (
                 (local_verify.category or '') in INDETERMINATE_VERDICT_CATEGORIES
             ):

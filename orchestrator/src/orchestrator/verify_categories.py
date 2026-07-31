@@ -74,19 +74,41 @@ class RetryKind(Enum):
 
 @dataclass(frozen=True)
 class CategoryPolicy:
-    """Everything the rest of verify.py needs to know about one category."""
+    """Everything the rest of verify.py needs to know about one category.
+
+    ``verdict_indeterminate`` (task 3173) is a TWO-part predicate, and both
+    halves must hold for a row to set it True:
+
+    1. the leg produced NO completed verdict — it never reached an exit
+       decision about the branch, so nothing it "says" is evidence; AND
+    2. the branch under test could not have CAUSED that non-completion —
+       the cause is a host condition, not the diff.
+
+    It has no default on purpose: adding a category forces its author to
+    adjudicate (2) explicitly rather than inherit an answer.  Getting it
+    wrong in the True direction is a false-GREEN (a branch-caused
+    non-completion silently lands), which is why ``is_infra_transient`` —
+    which only answers "is retrying worthwhile" — is NOT reused here even
+    though the two sets look similar today.
+    """
 
     severity_rank: int
     archive: bool
     preexisting_probe: bool
     is_infra_transient: bool
+    verdict_indeterminate: bool
     retry_kind: RetryKind  # see RetryKind's docstring: populated now, dispatched by task ε
 
 
 CATEGORY_POLICY: dict[FailureCategory, CategoryPolicy] = {
+    # verdict_indeterminate=False DESPITE producing no verdict: a hang is one
+    # of the few non-completions a branch can genuinely CAUSE (an infinite
+    # loop or a deadlock introduced by the diff), so predicate (2) fails and a
+    # timed-out leg keeps its veto over another host's PASS.  Fail CLOSED.
     FailureCategory.INFRA_TIMEOUT: CategoryPolicy(
         severity_rank=0, archive=False, preexisting_probe=False,
-        is_infra_transient=False, retry_kind=RetryKind.TIMEOUT,
+        is_infra_transient=False, verdict_indeterminate=False,
+        retry_kind=RetryKind.TIMEOUT,
     ),
     # A leg terminated by an EXTERNAL signal (SIGKILL/SIGTERM/SIGINT/SIGHUP —
     # the OOM killer, systemd, verify_cancel.py's sweep, an operator) never
@@ -106,11 +128,13 @@ CATEGORY_POLICY: dict[FailureCategory, CategoryPolicy] = {
     # trail and make the whole class invisible again.
     FailureCategory.INFRA_KILL: CategoryPolicy(
         severity_rank=1, archive=True, preexisting_probe=False,
-        is_infra_transient=True, retry_kind=RetryKind.NONE,
+        is_infra_transient=True, verdict_indeterminate=True,
+        retry_kind=RetryKind.NONE,
     ),
     FailureCategory.DISK_FULL: CategoryPolicy(
         severity_rank=2, archive=False, preexisting_probe=False,
-        is_infra_transient=True, retry_kind=RetryKind.NONE,
+        is_infra_transient=True, verdict_indeterminate=True,
+        retry_kind=RetryKind.NONE,
     ),
     # archive=True (task 3679): unlike its DISK_FULL sibling this category is
     # infra-transient but NOT self-clearing — retry_kind=NONE means no serial
@@ -120,51 +144,75 @@ CATEGORY_POLICY: dict[FailureCategory, CategoryPolicy] = {
     # /5893 were never written).
     FailureCategory.SEMAPHORE_TIMEOUT: CategoryPolicy(
         severity_rank=3, archive=True, preexisting_probe=False,
-        is_infra_transient=True, retry_kind=RetryKind.NONE,
+        is_infra_transient=True, verdict_indeterminate=True,
+        retry_kind=RetryKind.NONE,
     ),
     FailureCategory.CARGO_CLI_ERROR: CategoryPolicy(
         severity_rank=4, archive=True, preexisting_probe=True,
-        is_infra_transient=False, retry_kind=RetryKind.NONE,
+        is_infra_transient=False, verdict_indeterminate=False,
+        retry_kind=RetryKind.NONE,
     ),
     FailureCategory.COMPILE_ERROR: CategoryPolicy(
         severity_rank=5, archive=False, preexisting_probe=True,
-        is_infra_transient=False, retry_kind=RetryKind.NONE,
+        is_infra_transient=False, verdict_indeterminate=False,
+        retry_kind=RetryKind.NONE,
     ),
     FailureCategory.TREE_SITTER_GENERATE_ERROR: CategoryPolicy(
         severity_rank=6, archive=True, preexisting_probe=True,
-        is_infra_transient=False, retry_kind=RetryKind.NONE,
+        is_infra_transient=False, verdict_indeterminate=False,
+        retry_kind=RetryKind.NONE,
     ),
     FailureCategory.FLOCK_ERROR: CategoryPolicy(
         severity_rank=7, archive=True, preexisting_probe=False,
-        is_infra_transient=False, retry_kind=RetryKind.NONE,
+        is_infra_transient=False, verdict_indeterminate=False,
+        retry_kind=RetryKind.NONE,
     ),
     FailureCategory.NPM_ERROR: CategoryPolicy(
         severity_rank=8, archive=True, preexisting_probe=True,
-        is_infra_transient=False, retry_kind=RetryKind.NONE,
+        is_infra_transient=False, verdict_indeterminate=False,
+        retry_kind=RetryKind.NONE,
     ),
+    # verdict_indeterminate=False DESPITE is_infra_transient=True: retrying an
+    # INTERNALERROR is usually worthwhile (predicate 1 holds — collection died
+    # before any test ran), but predicate (2) FAILS.  `_PYTEST_INTERNALERROR_RE`
+    # matches a bare `^INTERNALERROR>`, which a conftest.py or plugin ADDED BY
+    # THE DIFF can raise at collection time — and it may raise only on the
+    # local host's interpreter/plugin set while a remote with a cached env
+    # collects fine.  Letting that pass for a remote PASS would land a
+    # branch-caused break: exactly the false-GREEN class tasks 2822/1700
+    # hardened against.  Fail CLOSED; only the retry loop treats it as infra.
     FailureCategory.PYTEST_INTERNALERROR: CategoryPolicy(
         severity_rank=9, archive=False, preexisting_probe=False,
-        is_infra_transient=True, retry_kind=RetryKind.NONE,
+        is_infra_transient=True, verdict_indeterminate=False,
+        retry_kind=RetryKind.NONE,
     ),
+    # verdict_indeterminate=True: the signatures behind this row are
+    # shared-venv mutations (a concurrent `uv sync` vanishing xdist/pip) and a
+    # broken `_merge-verify` worktree — host conditions the diff cannot reach.
     FailureCategory.ENV_TRANSIENT: CategoryPolicy(
         severity_rank=10, archive=False, preexisting_probe=False,
-        is_infra_transient=True, retry_kind=RetryKind.ENV_SERIAL,
+        is_infra_transient=True, verdict_indeterminate=True,
+        retry_kind=RetryKind.ENV_SERIAL,
     ),
     FailureCategory.TEST_FAILURE: CategoryPolicy(
         severity_rank=11, archive=False, preexisting_probe=True,
-        is_infra_transient=False, retry_kind=RetryKind.NONE,
+        is_infra_transient=False, verdict_indeterminate=False,
+        retry_kind=RetryKind.NONE,
     ),
     FailureCategory.UNKNOWN_TEST_FAILURE: CategoryPolicy(
         severity_rank=12, archive=True, preexisting_probe=True,
-        is_infra_transient=False, retry_kind=RetryKind.NONE,
+        is_infra_transient=False, verdict_indeterminate=False,
+        retry_kind=RetryKind.NONE,
     ),
     FailureCategory.PASSED: CategoryPolicy(
         severity_rank=13, archive=False, preexisting_probe=True,
-        is_infra_transient=False, retry_kind=RetryKind.NONE,
+        is_infra_transient=False, verdict_indeterminate=False,
+        retry_kind=RetryKind.NONE,
     ),
     FailureCategory.NONE: CategoryPolicy(
         severity_rank=14, archive=False, preexisting_probe=True,
-        is_infra_transient=False, retry_kind=RetryKind.NONE,
+        is_infra_transient=False, verdict_indeterminate=False,
+        retry_kind=RetryKind.NONE,
     ),
 }
 
@@ -222,16 +270,21 @@ INFRA_TRANSIENT_CATEGORIES: frozenset[FailureCategory] = frozenset(
     c for c, p in CATEGORY_POLICY.items() if p.is_infra_transient
 )
 
-# Categories whose leg produced NO completed verdict, so the leg may not veto
-# another host's completed PASS (merge_queue's per-land cross-check). Derived
-# from INFRA_TRANSIENT_CATEGORIES minus INFRA_TIMEOUT.
+# Categories whose leg produced NO completed verdict AND whose non-completion
+# the branch could not have caused, so the leg may not veto another host's
+# completed PASS (merge_queue's per-land cross-check). Derived from
+# CategoryPolicy.verdict_indeterminate — see that field's docstring for the
+# two-part predicate each row answers.
 #
-# INFRA_TIMEOUT is deliberately EXCLUDED even though a timed-out leg is not a
-# completed FAIL either: a hang is one of the few non-completions a branch can
-# genuinely CAUSE (an infinite loop or a deadlock introduced by the diff), and
-# a remote host with a longer effective timeout or more cores could pass the
-# same commit. Silently landing on a local timeout would be a false-GREEN —
-# the exact class tasks 2822/1700 hardened against. Fail CLOSED there.
+# Deliberately NOT spelled as a subtraction from INFRA_TRANSIENT_CATEGORIES.
+# The two sets answer different questions ("is retrying worthwhile" vs "may
+# this leg overrule another host"), and a set-arithmetic spelling made the
+# exclusions invisible: INFRA_TIMEOUT is already is_infra_transient=False, so
+# subtracting it was a no-op that merely LOOKED like an adjudication, and
+# PYTEST_INTERNALERROR rode in unadjudicated. Both now carry an explicit
+# verdict_indeterminate=False with the reasoning on their policy rows: a hang
+# and a collection-time INTERNALERROR are both non-completions a diff can
+# genuinely CAUSE, so both keep vetoing. Fail CLOSED there.
 #
 # UNRELATED to ``merge_disposition.MergeFailureDisposition.INDETERMINATE``
 # (task 3178), which is a DIFFERENT LAYER despite the shared word: that one is
@@ -240,8 +293,8 @@ INFRA_TRANSIENT_CATEGORIES: frozenset[FailureCategory] = frozenset(
 # stats). This registry is PRE-attribution and one layer down: did this leg
 # produce a verdict AT ALL. A signal-killed leg never reaches 3178's
 # classifier, because there is no completed failure to attribute.
-INDETERMINATE_VERDICT_CATEGORIES: frozenset[FailureCategory] = (
-    INFRA_TRANSIENT_CATEGORIES - {FailureCategory.INFRA_TIMEOUT}
+INDETERMINATE_VERDICT_CATEGORIES: frozenset[FailureCategory] = frozenset(
+    c for c, p in CATEGORY_POLICY.items() if p.verdict_indeterminate
 )
 
 
