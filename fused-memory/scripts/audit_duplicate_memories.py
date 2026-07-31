@@ -128,6 +128,7 @@ import asyncio
 import difflib
 import json
 import logging
+import re
 import sys
 from collections.abc import Iterable, Iterator
 from datetime import datetime
@@ -323,6 +324,75 @@ def _lexical_pairs_scored(
             ratio = matcher.ratio()
             if ratio >= threshold:
                 yield (i, j, ratio)
+
+
+# The live task-table fields a liveness snapshot reports, enumerated ONCE and
+# deliberately the SAME four `task_filter.LIVE_TASK_STATUS_RE` gates on, so
+# "what counts as a live field" keeps one definition shared with the gate that
+# forces these observations into their durable point-in-time form.
+_LIVE_FIELD_NAMES: tuple[str, ...] = (
+    'status',
+    'claimant_run_id',
+    'heartbeat_at',
+    'pid',
+)
+
+# ``<field> = <value>`` with optional surrounding quotes. The value class stops
+# at the punctuation these observations wrap their fields in, so `null,` and
+# `null)` read as `null` rather than carrying the delimiter into the key; the
+# characters it does admit (`-`, `.`, `/`, `:`, `+`) are the ones real values
+# need — `in-progress`, a path, an ISO timestamp.
+_LIVE_FIELD_ASSIGNMENT_RE = re.compile(
+    r'\b(' + '|'.join(_LIVE_FIELD_NAMES) + r')\s*=\s*"?([A-Za-z0-9_./:+-]+)"?',
+    re.IGNORECASE,
+)
+
+
+def extract_liveness_snapshot_fact(record: dict) -> str | None:
+    """Canonical key for the core FACT a point-in-time liveness snapshot asserts.
+
+    A third equivalence relation, alongside the lexical and ANN paths: not
+    "reads alike" but "asserts the same live fields". Two snapshots taken days
+    apart share one clause verbatim and differ everywhere else, so no
+    similarity threshold reachable by them could be set without flooding the
+    corpus with false clusters — and under ``--apply`` a false cluster is an
+    irreversible delete. Keying on an exact repeated fact instead introduces
+    no tunable at all.
+
+    Classification requires BOTH markers:
+
+    * ``POINT_IN_TIME_CHECK_RE`` — the timestamped "liveness check performed
+      <date>" framing. Requiring it is not incidental: gate 2628
+      (``task_filter.frames_live_task_status_as_current_fact``) BLOCKS the
+      bare current-fact framing in the four gated categories, so every
+      liveness observation written since it landed necessarily carries this
+      framing. Requiring it therefore costs no recall on the corpus this
+      detector sweeps, while excluding incidental prose that merely happens to
+      contain ``status=``.
+    * At least one extractable ``<live_field>=<value>`` assignment. A
+      ``LIVE_TASK_STATUS_RE`` paraphrase ("actively driven by") names no
+      readable fields, so there is no fact to key on.
+
+    Returns:
+        The canonical key — distinct ``field=value`` pairs, values lowercased
+        with the delimiter and any trailing punctuation stripped, sorted (by
+        field name, then value) and joined on ``|`` — or None when *record* is
+        not a point-in-time liveness snapshot. Compared by EXACT string
+        equality downstream: a snapshot reporting a different status produces
+        a different key and never groups with this one.
+    """
+    content = record.get('content') or ''
+    if not POINT_IN_TIME_CHECK_RE.search(content):
+        return None
+
+    pairs: set[str] = set()
+    for field, value in _LIVE_FIELD_ASSIGNMENT_RE.findall(content):
+        cleaned = value.rstrip('./:+-').lower()
+        if cleaned:
+            pairs.add(f'{field.lower()}={cleaned}')
+    if not pairs:
+        return None
+    return '|'.join(sorted(pairs))
 
 
 # The three Mem0-backed categories, enumerated ONCE. Graphiti-backed
