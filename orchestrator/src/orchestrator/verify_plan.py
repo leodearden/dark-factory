@@ -9,6 +9,7 @@ Unifies the twice-fixed scope decision between ``scope_module_config`` and
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -19,12 +20,16 @@ from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.verify_cmd import (
     ToolKind,
     VerifyCmd,
+    has_unpreserved_chain_clauses,
     parse_config_command,
     render,
     scope_to,
     split_chain_tail,
+    split_top_level_and,
     strip_cwd,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class FileKind(Enum):
@@ -324,6 +329,16 @@ def _scope_prefix_to_keyword(raw: str, keyword: str, files: list[str]) -> Verify
     unscoped = parsed if parsed.raw is not None else VerifyCmd(tool=parsed.tool, raw=raw)
 
     head, tail = split_chain_tail(raw, keyword)
+    # Mirrors verify._scope_to_keyword's record verbatim in substance — see
+    # there for why this is DEBUG rather than the widening site's WARNING.
+    if has_unpreserved_chain_clauses(raw, tail):
+        logger.debug(
+            'scope-to-keyword %r dropped %d trailing chain clause(s) from %r '
+            '(gate rejected tail preservation)',
+            keyword,
+            len(split_top_level_and(raw)) - 1,
+            raw,
+        )
     idx = head.find(keyword)
     if idx == -1:
         return unscoped

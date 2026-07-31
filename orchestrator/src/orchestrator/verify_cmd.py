@@ -449,6 +449,47 @@ def split_chain_tail(raw: str, keyword: str) -> tuple[str, str]:
     return segments[0], raw[len(segments[0]) :]
 
 
+def has_unpreserved_chain_clauses(raw: str, tail: str) -> bool:
+    """True if *raw* carried chain clauses that ``split_chain_tail`` dropped.
+
+    DIAGNOSTIC-ONLY and best-effort. It gates a log record and NOTHING else —
+    it deliberately feeds no control-flow decision anywhere, which is what
+    makes best-effort acceptable: a miss on an exotic spelling costs a
+    missing log line, never a behaviour change. Keeping it a pure predicate
+    is also what keeps this module logging-free, as it is today.
+
+    It exists because ``split_chain_tail`` returns ``(raw, '')`` for BOTH
+    "single-segment, nothing to preserve" and "multi-segment, gate rejected".
+    The caller cannot distinguish them, so a genuinely dropped clause is
+    indistinguishable from a command that never had one — and a same-tool
+    fan-out's tail therefore disappears with no record anywhere.
+
+    False as soon as *tail* is non-empty (the gate ACCEPTED — nothing was
+    dropped). Otherwise *raw* is scanned two ways, because neither alone is
+    sufficient:
+
+    * any token in ``_CHAIN_OPERATOR_TOKENS`` — note this is the WIDE set,
+      which includes ``&&``, not ``split_chain_tail``'s narrower
+      ``_NON_AND_CHAIN_TOKENS`` (which deliberately excludes it);
+    * ``len(split_top_level_and(raw)) > 1`` — token equality only sees an
+      operator ``shlex`` isolates as its own whitespace-separated token, so
+      the unspaced ``a&&b`` form (one token, ``'a&&b'``) slips past it while
+      the quote-aware splitter still finds the split point.
+
+    An unbalanced quote returns True: undecodable, so report it loudly rather
+    than stay silent.
+    """
+    if tail:
+        return False
+    try:
+        tokens = shlex.split(raw)
+    except ValueError:
+        return True
+    if any(tok in _CHAIN_OPERATOR_TOKENS for tok in tokens):
+        return True
+    return len(split_top_level_and(raw)) > 1
+
+
 def parse_config_command(raw: str) -> VerifyCmd:
     """Parse a config-level command string into a VerifyCmd.
 

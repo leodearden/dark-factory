@@ -53,12 +53,14 @@ from orchestrator.verify_cmd import (
     apply_pytest_numprocesses,
     cargo_scope,
     govern_cpu,
+    has_unpreserved_chain_clauses,
     parse_config_command,
     render,
     reproject,
     scope_to,
     serial_pytest,
     split_chain_tail,
+    split_top_level_and,
     strip_cwd,
     with_junitxml,
     with_pytest_timeout,
@@ -173,6 +175,20 @@ def _scope_to_keyword(cmd: str | None, keyword: str, files: list[str]) -> str | 
     if cmd is None:
         return None
     head, tail = split_chain_tail(cmd, keyword)
+    # DEBUG, not the WARNING the reverse-dependency widening's no-op uses
+    # further down this module: dropping a same-tool fan-out tail is INTENDED
+    # behaviour, and the root `type_check_command` hits it on every fallback
+    # verify — a WARNING there would be steady noise that trains operators to
+    # ignore the record. The genuine capability loss (a junit report expected
+    # but not collected) is reported at INFO by `_with_junitxml_str`.
+    if has_unpreserved_chain_clauses(cmd, tail):
+        logger.debug(
+            'scope-to-keyword %r dropped %d trailing chain clause(s) from %r '
+            '(gate rejected tail preservation)',
+            keyword,
+            len(split_top_level_and(cmd)) - 1,
+            cmd,
+        )
     idx = head.find(keyword)
     if idx == -1:
         return cmd
