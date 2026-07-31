@@ -401,6 +401,80 @@ def save_state(state: dict, path: str = STATE_PATH) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Startup grace
+# ---------------------------------------------------------------------------
+
+
+def _unit_active_enter_epoch(unit: str = DASHBOARD_UNIT) -> int | None:
+    """Return *unit*'s ActiveEnterTimestamp as a Unix epoch, or None.
+
+    Near-verbatim reuse of scripts/orchestrator-watchdog.py's function of the
+    same name, so the two watchdogs read systemd the same way.
+
+    ``ActiveEnterTimestamp`` — not ``ExecMainStartTimestamp`` — is the field
+    the §Contract "grace" row is written against: it marks when the unit
+    reached *active*, i.e. when the grace window for THIS activation began.
+    ``--timestamp=unix`` is what makes the value a timezone-independent
+    ``@<epoch>`` integer rather than a locale-formatted date string that
+    int() would reject (which would silently disable the gate).
+
+    Returns None — meaning "the activation time cannot be determined" — for
+    the ``@0`` never-activated sentinel, an unparseable value, a non-zero
+    returncode, or any OS/subprocess error. Callers must treat None as
+    "grace does not apply" and go on to probe, rather than guessing: failing
+    the other way would let a broken systemctl query permanently disarm the
+    watchdog, leaving a genuinely dead dashboard dead forever.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "systemctl",
+                "--user",
+                "show",
+                unit,
+                "--timestamp=unix",
+                "-p",
+                "ActiveEnterTimestamp",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            logger.warning(
+                f"_unit_active_enter_epoch({unit!r}): systemctl show exited "
+                f"{result.returncode}; grace cannot be determined this tick"
+            )
+            return None
+        for line in result.stdout.splitlines():
+            if "=" not in line:
+                continue
+            val = line.split("=", 1)[1].strip()
+            if val.startswith("@"):
+                val = val[1:]
+            try:
+                epoch = int(val)
+            except ValueError:
+                logger.warning(
+                    f"_unit_active_enter_epoch({unit!r}): unparseable "
+                    f"ActiveEnterTimestamp {val!r}; grace does not apply"
+                )
+                return None
+            if epoch == 0:
+                # systemd's never-activated sentinel. Read as an epoch it
+                # would place activation in 1970 and grace would never apply.
+                return None
+            return epoch
+        return None
+    except Exception as exc:  # noqa: BLE001 -- a query failure must not crash the tick
+        logger.warning(
+            f"_unit_active_enter_epoch({unit!r}): swallowed {exc!r}; "
+            "returning None (grace undeterminable this tick)"
+        )
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Actuation
 # ---------------------------------------------------------------------------
 
@@ -469,6 +543,28 @@ def tick() -> None:
     atomic write every 30 seconds and actuates nothing.
     """
     state = load_state()
+
+    # §Contract "grace". A unit that activated less than GRACE_SECS ago is not
+    # probed AT ALL (invariant I5 — never act on a probe that was not run, so
+    # do not run one whose answer must be discarded): uvicorn needs a few
+    # seconds to bind and mount the SPA, and a probe during that window fails
+    # for a perfectly healthy service.
+    #
+    # The streak is RESET here rather than merely left alone. A fresh
+    # activation invalidates any pre-restart streak: without this, the ticks
+    # that caused a restart would combine with the first post-grace miss to
+    # restart again after a single failed probe — the incident's per-tick
+    # behaviour, reintroduced through the back door.
+    active_enter = _unit_active_enter_epoch(DASHBOARD_UNIT)
+    if active_enter is not None and int(time.time()) - active_enter < GRACE_SECS:
+        if state["streak"]:
+            log(
+                f"{DASHBOARD_UNIT} activated <{GRACE_SECS}s ago; inside startup "
+                f"grace, clearing streak {state['streak']} and skipping the probe"
+            )
+        state["streak"] = 0
+        save_state(state)
+        return
 
     if probe_health():
         if state["streak"]:
