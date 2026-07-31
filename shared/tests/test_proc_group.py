@@ -76,7 +76,17 @@ def _kill_group(pgid: int) -> None:
 
 
 async def _await_trap_installed(
-    proc: asyncio.subprocess.Process, *, timeout: float = 10.0
+    proc: asyncio.subprocess.Process,
+    *,
+    # Must-not-hang guard — NOT a latency SLA.
+    # Measured success path: 3.9-9.4ms across 8 spawns at loadavg ~200 on
+    # 32 cores (6.2-6.5x CPU oversubscription) — ~1000x headroom under this
+    # 10s deadline. A genuine hang (trap never installed) is infinite, so
+    # 10s cleanly separates pass from hang while staying well under the
+    # caller's @pytest.mark.timeout(30) (shared/pyproject.toml's suite
+    # default is timeout_method="signal"), so this descriptive
+    # AssertionError always fires before pytest-timeout's blunt kill.
+    timeout: float = 10.0,
 ) -> None:
     """Wait for a shell child to announce that its SIGTERM trap is armed.
 
@@ -92,9 +102,35 @@ async def _await_trap_installed(
     ``/proc/<pid>/status`` already reported ``SigIgn=0x0000000000004000``
     (bit ``1 << (SIGTERM-1)``) — confirming the line is a valid proxy for
     the kernel-level precondition, not merely a plausible one.
+
+    Raises ``AssertionError`` (never a bare ``TimeoutError``, and never
+    returns normally) if the precondition is not observed: either the
+    deadline elapses with no line, or the child closes stdout (EOF) first —
+    e.g. it exited before reaching the ``echo`` — which would otherwise look
+    identical to "line not yet available" and let a naive caller mistake
+    early-exit for a successfully armed trap.
     """
     assert proc.stdout is not None
-    await asyncio.wait_for(proc.stdout.readline(), timeout)
+    started = asyncio.get_running_loop().time()
+    try:
+        line = await asyncio.wait_for(proc.stdout.readline(), timeout)
+    except TimeoutError:
+        raise AssertionError(
+            f'shell pid={proc.pid} never announced "ready" within {timeout}s '
+            f'(returncode={proc.returncode}) — the SIGTERM trap was never '
+            f'confirmed installed, so escalation cannot be tested'
+        ) from None
+    if not line:
+        raise AssertionError(
+            f'shell pid={proc.pid} closed stdout (EOF) after '
+            f'{asyncio.get_running_loop().time() - started:.3f}s without '
+            f'announcing "ready" (returncode={proc.returncode}) — it exited '
+            f'before installing the SIGTERM trap'
+        )
+    if line.strip() != b'ready':
+        raise AssertionError(
+            f'shell pid={proc.pid} announced {line!r}, expected b"ready\\n"'
+        )
 
 
 @pytest.mark.asyncio
