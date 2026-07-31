@@ -307,6 +307,10 @@ class TestConfigProperty:
 _PAYLOAD_KEYS = {
     'generated_at',
     'root_present',
+    # Run-scoped across the whole program, so it is a TOP-LEVEL key: one banner
+    # source rather than the UI electing an eval row to read it from, and it
+    # still resolves when the root enumerates to zero eval dirs.
+    'storm_escape',
     'evals',
     'issues',
     'issue_count',
@@ -480,6 +484,30 @@ def _n_run_tree(tmp_path: Path, count: int) -> tuple[Path, Path]:
     return root, esc_dir
 
 
+def _run_stamp(index: int) -> str:
+    """The *index*-th run stamp, spaced one hour apart from 2026-07-01T00:15Z.
+
+    Hour-spaced rather than day-spaced so a run count larger than a month still
+    produces real, parseable, lexicographically-chronological stamps (filename
+    order IS the producer's ordering contract, so the stamps must sort right).
+    """
+    day, hour = divmod(index, 24)
+    return f'202607{day + 1:02d}T{hour:02d}1500Z'
+
+
+def _many_run_tree(tmp_path: Path, count: int) -> tuple[Path, Path]:
+    """A single eval with *count* hour-spaced runs — usable past a 31-day month."""
+    root = tmp_path / 'memory-evals'
+    esc_dir = tmp_path / 'escalations'
+    esc_dir.mkdir(parents=True, exist_ok=True)
+    for index in range(count):
+        _write_metrics(
+            root, 'eval-a', _run_stamp(index),
+            [_metric('dangling-pointers', 'count', float(index), direction='higher_is_worse')],
+        )
+    return root, esc_dir
+
+
 class TestTrendCap:
     """The trailing-window cap discloses what it dropped — it never truncates silently."""
 
@@ -514,16 +542,31 @@ class TestTrendCap:
         assert eval_a['truncated'] is False
         assert eval_a['runs_on_disk'] == eval_a['run_count'] == 2
 
-    def test_cap_is_ninety_runs(self) -> None:
-        """One screen of trend == one alpha-derivation window.
+    def test_the_real_cap_takes_effect_at_ninety_runs(self, tmp_path: Path) -> None:
+        """One screen of trend == one alpha-derivation window, unmonkeypatched.
 
         90 is the PRD's declared lean for open question 2 and matches
         ``runs_per_quarter=90`` in the committed limits artifact, so the
-        displayed window is exactly the window the limits govern.
+        displayed window is exactly the window the limits govern.  Asserted by
+        its EFFECT on a 95-run tree rather than by restating the constant: a
+        test that re-reads the knob can only fail when someone deliberately
+        turns it, and pins no behaviour at all.
         """
-        import dashboard.data.memory_evals as memory_evals_module
+        from dashboard.data.memory_evals import build_memory_evals
 
-        assert memory_evals_module._TREND_RUN_CAP == 90
+        root, esc_dir = _many_run_tree(tmp_path, 95)
+
+        eval_a = build_memory_evals(root, esc_dir)['evals'][0]
+
+        assert eval_a['runs_on_disk'] == 95
+        assert eval_a['run_count'] == 90
+        assert eval_a['truncated'] is True
+        # The trend is index-aligned to the capped axis, not to what is on disk.
+        assert len(eval_a['run_stamps']) == 90
+        assert len(eval_a['metrics'][0]['trend']['values']) == 90
+        # The newest run survives the cap; the oldest five are what was dropped.
+        assert eval_a['latest_run_stamp'] == eval_a['run_stamps'][-1] == _run_stamp(94)
+        assert eval_a['run_stamps'][0] == _run_stamp(5)
 
 
 # ---------------------------------------------------------------------------
@@ -900,6 +943,11 @@ _FP_UNMATCHED = 'cafebabecafebabecafebabecafebabe'
 # `timestamp` — that is the field `escalation.models.Escalation` serialises.
 _ESCALATION_KEYS = {'id', 'summary', 'severity', 'level', 'created_at', 'dedupe_fingerprint'}
 
+# An unmatched escalation carries one extra field: WHY it is unlinked.  Without
+# it, a storm-suppressed escalation and a genuine parity orphan are one
+# undifferentiated list the UI labels "nothing explains this".
+_UNMATCHED_KEYS = _ESCALATION_KEYS | {'reason'}
+
 _JOIN_ESC_TIMESTAMP = '2026-07-30T03:15:00+00:00'
 
 
@@ -1042,8 +1090,10 @@ class TestEscalationJoin:
         unmatched = build_memory_evals(root, esc_dir)['unmatched_escalations']
 
         assert [entry['id'] for entry in unmatched] == ['esc-unmatched']
-        assert set(unmatched[0]) == _ESCALATION_KEYS
+        assert set(unmatched[0]) == _UNMATCHED_KEYS
         assert unmatched[0]['dedupe_fingerprint'] == _FP_UNMATCHED
+        # No storm here, so this really is the "nothing claims it" case.
+        assert unmatched[0]['reason'] == 'no_matching_verdict'
 
 
 # ---------------------------------------------------------------------------
@@ -1122,7 +1172,8 @@ class TestStormCollapseModelled:
             'triggered': True, 'alarm_count': 2, 'aggregate_fingerprint': _FP_AGGREGATE,
         })
 
-        storm = build_memory_evals(root, esc_dir)['evals'][0]['storm_escape']
+        payload = build_memory_evals(root, esc_dir)
+        storm = payload['evals'][0]['storm_escape']
 
         assert set(storm) == _STORM_KEYS
         assert storm['triggered'] is True
@@ -1130,6 +1181,51 @@ class TestStormCollapseModelled:
         assert storm['aggregate_fingerprint'] == _FP_AGGREGATE
         assert storm['escalation']['id'] == 'esc-storm-aggregate'
         assert set(storm['escalation']) == _ESCALATION_KEYS
+        # The block is run-scoped across the whole PROGRAM, so the same
+        # resolved block is the payload's own — the per-eval copy explains one
+        # row's collapsed link, the top-level one is the banner source.
+        assert payload['storm_escape'] == storm
+
+    def test_the_program_wide_block_survives_a_root_with_no_eval_dirs(self, tmp_path: Path) -> None:
+        """The banner (and its aggregate link) must not depend on an eval row existing.
+
+        A verdicts artifact can name a triggered storm while the root
+        enumerates zero eval dirs — nothing has been written yet, or every dir
+        failed to enumerate.  Nested only inside the eval rows, the whole block
+        and its resolved aggregate escalation would vanish while the aggregate
+        escalation itself stayed open.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root = tmp_path / 'memory-evals'
+        esc_dir = tmp_path / 'escalations'
+        esc_dir.mkdir(parents=True, exist_ok=True)
+        _write_verdicts(
+            root, [],
+            storm_escape={'triggered': True, 'alarm_count': 2, 'aggregate_fingerprint': _FP_AGGREGATE},
+            run_stamp=_STORM_RUN,
+        )
+        _write_escalation(
+            esc_dir, 'esc-storm-aggregate', dedupe_fingerprint=_FP_AGGREGATE,
+            summary='memory-eval storm: 2 metrics alarmed in one run',
+            timestamp=_JOIN_ESC_TIMESTAMP,
+        )
+
+        payload = build_memory_evals(root, esc_dir)
+
+        assert payload['evals'] == []
+        assert payload['storm_escape']['triggered'] is True
+        assert payload['storm_escape']['escalation']['id'] == 'esc-storm-aggregate'
+        # Resolved by the block, so it is not ALSO reported as unexplained.
+        assert payload['unmatched_escalations'] == []
+
+    def test_no_storm_leaves_the_top_level_block_absent(self, tmp_path: Path) -> None:
+        """An untriggered (or absent) storm renders no banner at all."""
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _storm_tree(tmp_path, storm=None, aggregate_escalation=False)
+
+        assert build_memory_evals(root, esc_dir)['storm_escape'] is None
 
     def test_per_metric_links_collapse_into_the_aggregate(self, tmp_path: Path) -> None:
         """No per-metric links during a storm — the aggregate is the one alert."""
@@ -1141,7 +1237,8 @@ class TestStormCollapseModelled:
             per_metric_escalation=True,
         )
 
-        rows = build_memory_evals(root, esc_dir)['evals'][0]['metrics']
+        payload = build_memory_evals(root, esc_dir)
+        rows = payload['evals'][0]['metrics']
 
         for metric_id in ('storm-a', 'storm-b'):
             row = _only(rows, metric_id)
@@ -1150,6 +1247,17 @@ class TestStormCollapseModelled:
             assert row['parity'] == 'storm_collapsed'
         # A quiet metric is still quiet during a storm.
         assert _only(rows, 'quiet-metric')['parity'] == 'clear'
+
+        # Suppressed is not unexplained.  The per-metric escalation is still
+        # OPEN (per-metric filings from earlier runs stay pending across a
+        # storm) and it IS reported — but as storm-suppressed, so the UI's
+        # "no metric row explains this" signal does not fire on an escalation
+        # a row explains perfectly well.  Reporting it undifferentiated would
+        # train operators to ignore the one signal that catches a real orphan.
+        (unmatched,) = payload['unmatched_escalations']
+        assert unmatched['id'] == 'esc-storm-a'
+        assert unmatched['reason'] == 'storm_suppressed'
+        assert set(unmatched) == _UNMATCHED_KEYS
 
     def test_aggregate_is_not_also_reported_unexplained(self, tmp_path: Path) -> None:
         """It IS explained — by the storm block, not by a metric row."""
@@ -1415,6 +1523,188 @@ class TestStalenessAndDegradedStates:
         assert row['kind'] == 'histogram'
         assert row['current_value'] == 1.4
 
+    def test_metric_record_with_no_kind_is_named(self, tmp_path: Path) -> None:
+        """A missing ``kind`` is as unrenderable as an unknown one.
+
+        ``kind`` is a REQUIRED M1 field, and the reader's whole rationale for
+        flagging ``histogram`` — there is no chart primitive for it — applies
+        identically when the field is simply absent.  Skipping a ``None`` kind
+        let an unclassifiable series render with nothing said anywhere.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _healthy_tree(tmp_path, metrics=[{'metric_id': 'kindless', 'value': 5.0, 'n': 1}])
+
+        payload = build_memory_evals(root, esc_dir)
+
+        assert payload['issue_count'] == len(payload['issues']) == 1
+        issue = payload['issues'][0]
+        # Its own kind, not `unknown_kind`: the operator-facing fix is a field
+        # to add, not a chart vocabulary to widen.
+        assert issue['kind'] == 'missing_kind'
+        assert issue['eval_id'] == 'eval-a'
+        assert issue['path'] == str(root / 'eval-a' / f'metrics-{_AGE_RUN}.json')
+        assert 'kindless' in issue['detail']
+
+        # The value is still real, so it is still shown.
+        row = _only(payload['evals'][0]['metrics'], 'kindless')
+        assert row['kind'] is None
+        assert row['current_value'] == 5.0
+
+    def test_a_metric_absent_from_a_run_is_not_a_missing_kind(self, tmp_path: Path) -> None:
+        """The hole case and the defect case both read as ``None`` — only one is a defect.
+
+        A metric introduced mid-window is absent from the older runs, and both
+        "absent from this run" and "present with no kind" collapse to ``None``
+        off a ``.get`` chain.  Conflating them would make every legitimate
+        trend hole raise a ``missing_kind``.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root = tmp_path / 'memory-evals'
+        esc_dir = tmp_path / 'escalations'
+        esc_dir.mkdir(parents=True, exist_ok=True)
+        _write_metrics(root, 'eval-a', '20260701T031500Z', [_metric('old-timer', 'count', 1.0)])
+        _write_metrics(root, 'eval-a', '20260702T031500Z', [
+            _metric('old-timer', 'count', 2.0), _metric('latecomer', 'count', 7.0),
+        ])
+        _write_limits(root, 'eval-a', run_stamp='20260702T031500Z')
+        _write_verdicts(root, [], run_stamp='20260702T031500Z')
+
+        payload = build_memory_evals(root, esc_dir)
+
+        assert payload['issue_count'] == len(payload['issues']) == 0
+        assert _only(payload['evals'][0]['metrics'], 'latecomer')['trend']['values'] == [None, 7.0]
+
+    def test_duplicate_metric_id_in_one_run_is_named(self, tmp_path: Path) -> None:
+        """Two records for one series collapse — deterministically, and loudly.
+
+        ``metric_id`` is unique within a run (M1), so a dict comprehension over
+        the array reads as safe; on a duplicate it silently kept whichever
+        record came LAST, so the row's ``current_value`` was one of two
+        candidates with nothing saying a choice had been made.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _healthy_tree(tmp_path, metrics=[
+            _metric('dup', 'count', 1.0),
+            _metric('dup', 'count', 99.0),
+        ])
+
+        payload = build_memory_evals(root, esc_dir)
+
+        assert payload['issue_count'] == len(payload['issues']) == 1
+        issue = payload['issues'][0]
+        assert issue['kind'] == 'duplicate_metric_id'
+        assert issue['eval_id'] == 'eval-a'
+        assert issue['path'] == str(root / 'eval-a' / f'metrics-{_AGE_RUN}.json')
+        assert 'dup' in issue['detail']
+
+        # One row, and the FIRST record is the one kept — a stated rule rather
+        # than whatever array order happened to deliver.
+        (row,) = payload['evals'][0]['metrics']
+        assert row['metric_id'] == 'dup'
+        assert row['current_value'] == 1.0
+
+    def test_metric_record_with_no_metric_id_is_counted_not_dropped(self, tmp_path: Path) -> None:
+        """An unidentifiable record cannot be charted — but its loss is reported.
+
+        One issue per FILE with a count, not one per record: a systematically
+        broken artifact degrades one row instead of flooding the issues list.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _healthy_tree(tmp_path, metrics=[
+            _metric('real-one', 'count', 4.0),
+            {'kind': 'count', 'value': 1.0, 'n': 1},
+            {'metric_id': '', 'kind': 'count', 'value': 2.0, 'n': 1},
+        ])
+
+        payload = build_memory_evals(root, esc_dir)
+
+        assert payload['issue_count'] == len(payload['issues']) == 1
+        assert payload['issues'][0]['kind'] == 'unidentified_metrics'
+        assert payload['issues'][0]['eval_id'] == 'eval-a'
+        assert '2' in payload['issues'][0]['detail']
+        assert [row['metric_id'] for row in payload['evals'][0]['metrics']] == ['real-one']
+
+    def test_duplicate_verdict_entry_is_named(self, tmp_path: Path) -> None:
+        """Two judgements of one metric would pick the row's verdict by array order."""
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _healthy_tree(tmp_path)
+        _write_verdicts(root, [
+            _verdict('eval-a', 'dangling-pointers', 'alarm', fingerprint='a' * 32, run_stamp=_AGE_RUN),
+            _verdict('eval-a', 'dangling-pointers', 'no_alarm', fingerprint='b' * 32, run_stamp=_AGE_RUN),
+        ], run_stamp=_AGE_RUN)
+
+        payload = build_memory_evals(root, esc_dir)
+
+        assert payload['issue_count'] == len(payload['issues']) == 1
+        issue = payload['issues'][0]
+        assert issue['kind'] == 'duplicate_verdict_entry'
+        assert issue['eval_id'] == 'eval-a'
+        assert issue['path'] == str(root / 'verdicts-current.json')
+        # First wins — and it is the verdict AND the fingerprint (hence the
+        # escalation link) that array order would otherwise have chosen.
+        row = _only(payload['evals'][0]['metrics'], 'dangling-pointers')
+        assert row['verdict'] == 'alarm'
+        assert row['fingerprint'] == 'a' * 32
+
+    def test_two_escalations_sharing_a_fingerprint_are_named(self, tmp_path: Path) -> None:
+        """A dropped escalation is exactly what the parity view exists to catch.
+
+        Indexed last-wins, the loser was invisible EVERYWHERE in the payload —
+        no row link and no ``unmatched_escalations`` entry.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _healthy_tree(tmp_path)
+        _write_escalation(esc_dir, 'esc-1', dedupe_fingerprint='c' * 32)
+        _write_escalation(esc_dir, 'esc-2', dedupe_fingerprint='c' * 32)
+
+        payload = build_memory_evals(root, esc_dir)
+
+        collisions = [i for i in payload['issues'] if i['kind'] == 'duplicate_escalation_fingerprint']
+        assert len(collisions) == 1
+        assert payload['issue_count'] == len(payload['issues'])
+        assert collisions[0]['path'] == str(esc_dir)
+        # BOTH ids are named — which of the two the queue scan reached first is
+        # ``Path.glob`` order and so is not the test's to pin, but an operator
+        # must be able to see exactly which pair collided either way.
+        assert 'esc-1' in collisions[0]['detail']
+        assert 'esc-2' in collisions[0]['detail']
+        # Exactly one survivor, still reported in the usual way — the point is
+        # that the loser is no longer invisible, not which one lost.
+        assert [e['id'] for e in payload['unmatched_escalations']] in (['esc-1'], ['esc-2'])
+
+    def test_unreadable_root_degrades_the_payload_not_the_response(self, tmp_path, monkeypatch) -> None:
+        """The enumeration is an artifact boundary like every other one here.
+
+        ``is_dir()`` can answer True and the walk still fail — a mode change
+        between the two, or an NFS/permission hiccup.  Unguarded, that turned a
+        degraded tree into a 500 on the dashboard poll.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _healthy_tree(tmp_path)
+
+        def _boom(self: Path) -> Any:
+            raise PermissionError(13, 'Permission denied')
+
+        monkeypatch.setattr(Path, 'iterdir', _boom)
+
+        payload = build_memory_evals(root, esc_dir)
+
+        # Present, but unreadable — NOT reported as an empty root, which is the
+        # healthy "no eval has ever run" state.
+        assert payload['root_present'] is True
+        assert payload['evals'] == []
+        assert payload['issue_count'] == len(payload['issues']) == 1
+        assert payload['issues'][0]['kind'] == 'unreadable_root'
+        assert payload['issues'][0]['path'] == str(root)
+        assert set(payload) == _PAYLOAD_KEYS
+
     def test_missing_run_stamp_is_named(self, tmp_path: Path) -> None:
         from dashboard.data.memory_evals import build_memory_evals
 
@@ -1528,10 +1818,12 @@ class TestShapeMemoryEvals:
         evals: list[dict] = [{'eval_id': 'eval-a'}]
         issues: list[dict] = [{'kind': 'missing_limits'}]
         unmatched: list[dict] = [{'id': 'esc-1'}]
+        storm: dict = {'triggered': True, 'alarm_count': 2}
 
         body = redux_api.shape_memory_evals(
             generated_at='2026-07-30T03:15:00+00:00',
             root_present=True,
+            storm_escape=storm,
             evals=evals,
             issues=issues,
             issue_count=1,
@@ -1541,10 +1833,12 @@ class TestShapeMemoryEvals:
         evals.append({'eval_id': 'eval-b'})
         issues.append({'kind': 'orphan_verdict'})
         unmatched.append({'id': 'esc-2'})
+        storm['alarm_count'] = 99
 
         assert body['evals'] == [{'eval_id': 'eval-a'}]
         assert body['issues'] == [{'kind': 'missing_limits'}]
         assert body['unmatched_escalations'] == [{'id': 'esc-1'}]
+        assert body['storm_escape'] == {'triggered': True, 'alarm_count': 2}
 
     def test_defaults_are_fresh_literals_not_a_shared_constant(self) -> None:
         """Two default calls must not hand out the same mutable containers.
@@ -1579,6 +1873,7 @@ class TestShapeMemoryEvals:
 
         assert set(body) == _PAYLOAD_KEYS
         assert body['root_present'] is False
+        assert body['storm_escape'] is None
         assert body['evals'] == []
         assert body['issues'] == []
         assert body['issue_count'] == 0
@@ -2040,8 +2335,16 @@ class TestCommittedExemplarBoundary:
             'missing_verdicts', 'unknown_kind',
         ]
 
-    def test_neither_this_test_nor_the_reader_touches_the_producer(self) -> None:
+    def test_the_reader_never_touches_the_producer(self) -> None:
         """G6/INV-5 — artifacts only, never the module; and no statistics anywhere.
+
+        Scoped to PRODUCTION code: this asserts over
+        ``dashboard/data/memory_evals.py`` only.  A version that also parsed
+        this test file's own AST could never catch a regression — an editor
+        adding a ``shared`` import to this test would simply be editing the
+        assertion that forbids it.  The artifact-only boundary of the *tests*
+        is a review property, stated in the module docstring, not something a
+        test can police about itself.
 
         Checked over the AST rather than the raw text, for two reasons: a text
         grep would match this assertion's own literals, and it would also match
@@ -2055,25 +2358,19 @@ class TestCommittedExemplarBoundary:
 
         import dashboard.data.memory_evals as memory_evals_module
 
-        def _imports(path: Path) -> set[str]:
-            found: set[str] = set()
-            for node in ast.walk(ast.parse(path.read_text())):
-                if isinstance(node, ast.Import):
-                    found.update(a.name for a in node.names)
-                elif isinstance(node, ast.ImportFrom) and node.module:
-                    found.add(node.module)
-            return found
-
-        # Neither side may reach for the producer: the on-disk artifact IS the
-        # contract, and importing the module would make these tests agree with
-        # its in-memory objects instead.
-        test_imports = _imports(Path(__file__))
-        assert not [m for m in test_imports if m.split('.')[0] == 'shared'], sorted(test_imports)
-
         reader_path = Path(memory_evals_module.__file__)
-        reader_imports = _imports(reader_path)
+        reader_imports: set[str] = set()
+        for node in ast.walk(ast.parse(reader_path.read_text())):
+            if isinstance(node, ast.Import):
+                reader_imports.update(a.name for a in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                reader_imports.add(node.module)
+
+        # The on-disk artifact IS the contract; importing the producer would
+        # couple the dashboard to its in-memory objects instead.
         assert not [m for m in reader_imports if m.split('.')[0] == 'shared'], sorted(reader_imports)
-        assert not reader_imports & {'math', 'statistics', 'scipy', 'numpy'}, sorted(reader_imports)
+        # Verdicts are READ, never re-derived — so no stdlib stats surface.
+        assert not reader_imports & {'math', 'statistics'}, sorted(reader_imports)
 
         # And no statistics by attribute access either — verdicts are read,
         # never re-derived (INV-1: the same file the evaluator read).

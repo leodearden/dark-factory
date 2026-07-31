@@ -37,6 +37,15 @@ validates only what it must READ (JSON parses, top level is a dict, ``metrics``
 is a list); semantic M1 rules such as a proportion outside [0,1] still pass
 through verbatim with no issue.
 
+The same rule governs the reader's INDEXES.  Every ``{key: record}`` build here
+(metrics by ``metric_id``, verdicts by ``(eval_id, metric_id)``, escalations by
+``dedupe_fingerprint``) would silently keep whichever record came last on a key
+collision, so each one instead keeps the FIRST and names the drop
+(``duplicate_*``).  A dropped escalation is the sharpest case: last-wins would
+make the loser invisible everywhere in the payload — no row link and no
+``unmatched_escalations`` entry — which is exactly the silent degradation the
+parity view exists to catch.
+
 **Same-host file reads (DD1).**  The dashboard and the eval runner share a
 filesystem; there is no RPC in this path.
 """
@@ -203,22 +212,64 @@ def _read_limits(
 
     by_metric: dict[str, Any] = {}
     for record in body.get('verdicts') or []:
-        if isinstance(record, dict) and isinstance(record.get('metric_id'), str):
-            by_metric[record['metric_id']] = record
+        if not isinstance(record, dict):
+            continue
+        metric_id = record.get('metric_id')
+        if not isinstance(metric_id, str):
+            continue
+        if metric_id in by_metric:
+            # Last-wins would silently change the displayed ``rule_kind``.
+            _issue(
+                issues, 'duplicate_limits_verdict', eval_id=eval_dir.name, path=path,
+                detail=f'metric {metric_id!r} has more than one limits verdict; the first is used',
+            )
+            continue
+        by_metric[metric_id] = record
     return block, by_metric
 
 
-def _metric_rows(body: Any) -> list[dict]:
-    """The metric records of one parsed run body, or ``[]`` if unusable."""
-    if not isinstance(body, dict):
-        return []
-    metrics = body.get('metrics')
-    if not isinstance(metrics, list):
-        return []
-    return [
-        m for m in metrics
-        if isinstance(m, dict) and isinstance(m.get('metric_id'), str) and m.get('metric_id')
-    ]
+def _by_metric_id(
+    body: dict[str, Any],
+    eval_id: str,
+    path: Path,
+    issues: list[dict[str, Any]],
+) -> dict[str, dict]:
+    """Index one run's metric records by ``metric_id``, naming every discard.
+
+    ``metric_id`` is unique within a run (M1 §"Record schema"), so a dict
+    comprehension over the array reads as safe — but on a duplicate it keeps
+    whichever record happened to come LAST, and the row's ``current_value`` and
+    every scalar beside it then silently become one of two candidates with
+    nothing in the payload saying so.  A record carrying no usable ``metric_id``
+    is likewise unchartable and was previously filtered away without a trace.
+
+    Both discards are NAMED (DD6/INV-2) and the survivor is the FIRST record,
+    deterministically: with a duplicate neither candidate is more correct, so
+    the payload picks one rule, states it in the issue, and lets the operator
+    see that a choice was made at all.  The unidentified records are reported
+    once per file with a count rather than one issue apiece, so a systematically
+    broken artifact degrades one row instead of flooding the issues list.
+    """
+    by_id: dict[str, dict] = {}
+    unidentified = 0
+    for record in body.get('metrics') or []:
+        metric_id = record.get('metric_id') if isinstance(record, dict) else None
+        if not isinstance(metric_id, str) or not metric_id:
+            unidentified += 1
+            continue
+        if metric_id in by_id:
+            _issue(
+                issues, 'duplicate_metric_id', eval_id=eval_id, path=path,
+                detail=f'metric {metric_id!r} appears more than once in this run; the first record is used',
+            )
+            continue
+        by_id[metric_id] = record
+    if unidentified:
+        _issue(
+            issues, 'unidentified_metrics', eval_id=eval_id, path=path,
+            detail=f'{unidentified} metric record(s) carry no usable "metric_id" and cannot be charted',
+        )
+    return by_id
 
 
 def _read_verdicts(
@@ -284,7 +335,17 @@ def _read_verdicts(
         eval_id = entry.get('eval_id')
         metric_id = entry.get('metric_id')
         if isinstance(eval_id, str) and isinstance(metric_id, str):
-            index[(eval_id, metric_id)] = entry
+            key = (eval_id, metric_id)
+            if key in index:
+                # Two judgements of one metric in one run: last-wins would pick
+                # the row's verdict AND its fingerprint (hence its escalation
+                # link) by array order alone.  First wins, and the drop is named.
+                _issue(
+                    issues, 'duplicate_verdict_entry', eval_id=eval_id, path=path,
+                    detail=f'metric {metric_id!r} has more than one verdict entry; the first is used',
+                )
+                continue
+            index[key] = entry
 
     # Run-scoped, which is why it lives beside the entries rather than inside
     # them.  Surfaced only while TRIGGERED — an untriggered block is the
@@ -313,7 +374,31 @@ def _escalation_projection(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _index_escalations(escalations_dir: Path) -> dict[str, dict[str, Any]]:
+def _unmatched_projection(record: dict[str, Any], reason: str) -> dict[str, Any]:
+    """An open escalation that no metric row links, plus WHY it carries no link.
+
+    ``no_matching_verdict`` — nothing in the verdicts artifact claims this
+    fingerprint.  That covers genuine contract drift AND escalations no metric
+    row can ever explain (the runner-failure self-report is itself an
+    ``eval_regression``).
+    ``storm_suppressed`` — a metric row DOES claim this fingerprint, but this
+    run's storm escape collapsed per-metric links into the aggregate, so the
+    row deliberately renders none.  Per-metric filings from EARLIER runs stay
+    open across a storm (program PRD §M3), so this is the ordinary case rather
+    than a rare one.
+
+    Without the discriminator both land in one undifferentiated list that the
+    payload calls "no metric row explains this" — which would fire on
+    escalations that are in fact fully explained, and train operators to ignore
+    the one signal that catches a real parity orphan.
+    """
+    return {**_escalation_projection(record), 'reason': reason}
+
+
+def _index_escalations(
+    escalations_dir: Path,
+    issues: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
     """Index open ``eval_regression`` escalations by ``dedupe_fingerprint``.
 
     Reuses :func:`dashboard.data.escalations.load_queue_escalations` (INV-5 —
@@ -327,6 +412,15 @@ def _index_escalations(escalations_dir: Path) -> dict[str, dict[str, Any]]:
     Matching is ``==`` over the WHOLE fingerprint string.  The fingerprint is
     the producer's private construction; nothing here parses its substructure,
     so the producer can change how it is built without breaking the dashboard.
+
+    Two open escalations may share a fingerprint (a dedupe that did not take).
+    Indexing them last-wins would make the loser invisible EVERYWHERE in the
+    payload — no row link, no ``unmatched_escalations`` entry — which is
+    precisely the silent degradation the parity view exists to catch, so the
+    collision is named.  The survivor is whichever record the queue scan reached
+    first, and that is ``Path.glob`` order rather than a meaningful ranking —
+    which is exactly why the issue names BOTH ids: the operator can see the
+    colliding pair without depending on which one won.
     """
     index: dict[str, dict[str, Any]] = {}
     for record in load_queue_escalations(escalations_dir):
@@ -336,6 +430,15 @@ def _index_escalations(escalations_dir: Path) -> dict[str, dict[str, Any]]:
             continue
         fingerprint = record.get('dedupe_fingerprint')
         if isinstance(fingerprint, str) and fingerprint:
+            if fingerprint in index:
+                _issue(
+                    issues, 'duplicate_escalation_fingerprint', path=escalations_dir,
+                    detail=(
+                        f'escalation {record.get("id")!r} shares dedupe_fingerprint '
+                        f'{fingerprint!r} with {index[fingerprint].get("id")!r}; the first is used'
+                    ),
+                )
+                continue
             index[fingerprint] = record
     return index
 
@@ -359,6 +462,7 @@ def _build_eval(
     consumed: set[tuple[str, str]],
     escalation_index: dict[str, dict[str, Any]],
     linked_fingerprints: set[str],
+    storm_suppressed: set[str],
     storm: dict[str, Any] | None,
     now: datetime,
 ) -> dict[str, Any]:
@@ -419,7 +523,7 @@ def _build_eval(
             )
         if isinstance(body.get('corpus'), dict):
             corpus = dict(body['corpus'])
-        runs.append((stamp, {row['metric_id']: row for row in _metric_rows(body)}, path))
+        runs.append((stamp, _by_metric_id(body, eval_id, path, issues), path))
 
     run_stamps = [stamp for stamp, _, _ in runs]
 
@@ -470,6 +574,10 @@ def _build_eval(
         # A kind outside the closed vocabulary is a RENDERING failure: there is
         # no chart primitive for it, so the dashboard genuinely cannot resolve
         # it and says so.  The value itself is still real and is still shown.
+        # An ABSENT kind is exactly as unrenderable — ``kind`` is a required M1
+        # field — so it is named too, under its own issue kind because the
+        # operator-facing fix differs (a field to add, not a vocabulary to
+        # widen).
         #
         # Checked across the WHOLE window, not just the newest run: a trend
         # line is drawn from every point, so an unrenderable kind anywhere in
@@ -484,19 +592,36 @@ def _build_eval(
         kind = current.get('kind')
         seen_kinds: set[str] = set()
         for _stamp, by_id, run_path in runs:
-            run_kind = by_id.get(metric_id, {}).get('kind')
+            record = by_id.get(metric_id)
+            if record is None:
+                # Absent from THIS run: a None hole in the trend, which is a
+                # legitimate shape (a metric introduced mid-window).  This is
+                # why an absent record cannot be conflated with a record whose
+                # ``kind`` is missing — both read as None off a ``.get`` chain,
+                # and only the second is a defect.
+                continue
+            run_kind = record.get('kind')
             # ``isinstance`` before the set lookup: an unhashable kind out of a
             # malformed artifact would make ``in _KNOWN_KINDS`` raise, and a
             # non-string kind is unrenderable anyway.
-            if run_kind is None or (isinstance(run_kind, str) and run_kind in _KNOWN_KINDS):
+            if isinstance(run_kind, str) and run_kind in _KNOWN_KINDS:
                 continue
             if repr(run_kind) in seen_kinds:
                 continue
             seen_kinds.add(repr(run_kind))
-            _issue(
-                issues, 'unknown_kind', eval_id=eval_id, path=run_path,
-                detail=f'metric {metric_id!r} has kind {run_kind!r}, which has no chart primitive',
-            )
+            if run_kind is None:
+                _issue(
+                    issues, 'missing_kind', eval_id=eval_id, path=run_path,
+                    detail=(
+                        f'metric {metric_id!r} carries no "kind" (a required M1 field), '
+                        'so it has no chart primitive'
+                    ),
+                )
+            else:
+                _issue(
+                    issues, 'unknown_kind', eval_id=eval_id, path=run_path,
+                    detail=f'metric {metric_id!r} has kind {run_kind!r}, which has no chart primitive',
+                )
 
         # Absent verdict == absent, never defaulted to 'no_alarm'.  The empty
         # dict makes every verdict field read as None below without a second
@@ -516,12 +641,21 @@ def _build_eval(
         # While a storm is triggered the runner files ONE aggregate escalation
         # instead of N per-metric ones, so per-metric links are suppressed
         # here.  Showing them would invent links that were never filed.
+        #
+        # Suppressed is NOT unexplained: a per-metric escalation from an
+        # earlier run stays open while this run's storm collapses, and it must
+        # not then be reported as an escalation nothing accounts for.  The row
+        # renders no link; the fingerprint is recorded so
+        # ``unmatched_escalations`` can say WHY.
         fingerprint = judged.get('fingerprint')
         matched: dict[str, Any] | None = None
-        if storm is None and isinstance(fingerprint, str) and fingerprint:
-            matched = escalation_index.get(fingerprint)
-            if matched is not None:
-                linked_fingerprints.add(fingerprint)
+        if isinstance(fingerprint, str) and fingerprint:
+            if storm is None:
+                matched = escalation_index.get(fingerprint)
+                if matched is not None:
+                    linked_fingerprints.add(fingerprint)
+            elif fingerprint in escalation_index:
+                storm_suppressed.add(fingerprint)
         escalation = _escalation_projection(matched) if matched is not None else None
 
         metrics.append({
@@ -560,6 +694,10 @@ def _build_eval(
         'latest_run_age_seconds': age_seconds,
         'stale': age_seconds is not None and age_seconds > _STALE_AFTER_SECONDS,
         'limits': limits,
+        # The same run-scoped block the payload carries at its TOP level (which
+        # is the one the program-wide banner reads).  Repeated per row purely so
+        # a row showing ``storm_collapsed`` parity carries, in place, the reason
+        # its escalation link is absent.
         'storm_escape': storm,
         'run_stamps': run_stamps,
         'run_count': len(run_stamps),
@@ -597,6 +735,13 @@ def build_memory_evals(
     payload: dict[str, Any] = {
         'generated_at': resolved_now.isoformat(),
         'root_present': True,
+        # Run-scoped across the WHOLE program, so it is carried here rather than
+        # only inside the eval rows: the banner has one source instead of the UI
+        # arbitrarily electing an eval row to read it from, and it survives a
+        # root that enumerates to zero eval dirs — the case where the aggregate
+        # escalation exists and every per-eval copy would have vanished.  Set on
+        # every return path so the key never has to be probed for.
+        'storm_escape': None,
         'evals': [],
         'issues': issues,
         'issue_count': 0,
@@ -610,7 +755,18 @@ def build_memory_evals(
         payload['root_present'] = False
         return payload
 
-    eval_dirs = sorted(p for p in memory_evals_dir.iterdir() if p.is_dir())
+    try:
+        eval_dirs = sorted(p for p in memory_evals_dir.iterdir() if p.is_dir())
+    except _ARTIFACT_ERRORS as exc:
+        # ``is_dir()`` above already answered, but the walk itself can still
+        # fail — a mode change between the two, or an NFS/permission hiccup.
+        # Every other artifact boundary here is guarded; leaving this one open
+        # turned a degraded tree into a 500 on the dashboard poll.  The root IS
+        # present, so that is what the payload says: it is the enumeration that
+        # failed, and the failure is named rather than mistaken for an empty root.
+        _issue(issues, 'unreadable_root', path=memory_evals_dir, detail=str(exc))
+        payload['issue_count'] = len(issues)
+        return payload
 
     try:
         verdict_index, storm = _read_verdicts(memory_evals_dir, eval_dirs, issues)
@@ -623,10 +779,13 @@ def build_memory_evals(
         )
         verdict_index, storm = {}, None
 
-    escalation_index = _index_escalations(escalations_dir)
+    escalation_index = _index_escalations(escalations_dir, issues)
 
     consumed: set[tuple[str, str]] = set()
     linked_fingerprints: set[str] = set()
+    # Fingerprints a metric row claims but deliberately does not link because a
+    # storm collapsed this run's per-metric filings into one aggregate.
+    storm_suppressed: set[str] = set()
 
     # The storm block is run-scoped across the whole program; resolve its
     # aggregate against the SAME escalation index the metric rows use, and
@@ -646,20 +805,25 @@ def build_memory_evals(
             'aggregate_fingerprint': aggregate_fingerprint,
             'escalation': _escalation_projection(aggregate) if aggregate is not None else None,
         }
+    payload['storm_escape'] = storm_block
 
     payload['evals'] = [
         _build_eval(
             d, issues, verdict_index, consumed, escalation_index,
-            linked_fingerprints, storm_block, resolved_now,
+            linked_fingerprints, storm_suppressed, storm_block, resolved_now,
         )
         for d in eval_dirs
     ]
 
     # The reverse direction: an open eval_regression escalation that no metric
-    # row explains.  Surfaced rather than dropped, so parity can be checked
-    # both ways.
+    # row links.  Surfaced rather than dropped, so parity can be checked both
+    # ways — and each one says WHY it is unlinked, so a genuine parity orphan
+    # is distinguishable from one a triggered storm merely suppressed.
     payload['unmatched_escalations'] = [
-        _escalation_projection(record)
+        _unmatched_projection(
+            record,
+            'storm_suppressed' if fingerprint in storm_suppressed else 'no_matching_verdict',
+        )
         for fingerprint, record in escalation_index.items()
         if fingerprint not in linked_fingerprints
     ]
