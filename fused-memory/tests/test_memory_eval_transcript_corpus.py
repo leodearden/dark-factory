@@ -15,6 +15,7 @@ the script only reads transcripts off disk.
 """
 from __future__ import annotations
 
+import gzip
 import importlib.util
 import json
 import sys
@@ -552,3 +553,170 @@ class TestProvenanceThreadedIntoRecords:
         record = self._record(MAIN_REL)
         assert record['transcript'] == MAIN_REL
         assert not record['transcript'].startswith('/')
+
+
+# ===========================================================================
+# step-11 — archive scan + coverage counters
+# ===========================================================================
+
+
+def _write_transcript(root: Path, rel: str, records: list[dict]) -> Path:
+    """Write a gzipped transcript at *rel* under *root*."""
+    path = root / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(path, 'wt', encoding='utf-8') as f:
+        f.write('\n'.join(json.dumps(r) for r in records) + '\n')
+    return path
+
+
+def _write_corrupt(root: Path, rel: str) -> Path:
+    """A file under a .jsonl.gz name that is not gzip at all."""
+    path = root / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b'this is not gzip\n')
+    return path
+
+
+class TestScanArchive:
+    """Walk an archive tree, extract, and account for what could not be read.
+
+    The counters are the operator-facing half of this script: a scan that
+    under-reports is indistinguishable from a scan of a smaller archive unless
+    it says what it skipped.
+    """
+
+    GOOD_REL = '2280/-enc-a/aaaa-1111.jsonl.gz'
+    EMPTY_REL = '2280/-enc-a/bbbb-2222.jsonl.gz'
+    BAD_REL = '3006/-enc-b/cccc-3333.jsonl.gz'
+
+    def _tree(self, tmp_path: Path) -> Path:
+        root = tmp_path / 'archive'
+        _write_transcript(root, self.GOOD_REL, [
+            _briefing('claude-task-2280-architect'),
+            _tool_use('toolu_1', 'first'),
+            _tool_result('toolu_1', {'results': [_result('a', 0.9)]}),
+            _tool_use('toolu_2', 'second'),
+            _tool_result('toolu_2', {'results': []}),
+        ])
+        # Parses fine, holds no searches — must count as READ, not as failed.
+        _write_transcript(root, self.EMPTY_REL, [{'type': 'queue-operation'}])
+        _write_corrupt(root, self.BAD_REL)
+        return root
+
+    def test_returns_the_good_files_records(self, tmp_path):
+        records, _ = _mod.scan_archive(self._tree(tmp_path))
+        assert [r['query'] for r in records] == ['first', 'second']
+
+    def test_counters(self, tmp_path):
+        _, coverage = _mod.scan_archive(self._tree(tmp_path))
+        assert coverage['tasks_scanned'] == 2
+        assert coverage['transcripts_found'] == 3
+        assert coverage['transcripts_read'] == 2
+        assert coverage['searches_extracted'] == 2
+
+    def test_parse_failure_is_counted_and_exemplified(self, tmp_path):
+        _, coverage = _mod.scan_archive(self._tree(tmp_path))
+        failures = coverage['parse_failures']
+        assert failures['count'] == 1
+        assert len(failures['examples']) == 1
+        example = failures['examples'][0]
+        # The archive-relative path, so an operator can find the file, and a
+        # reason, so they know whether to care.
+        assert example['transcript'] == self.BAD_REL
+        assert example['reason']
+        assert not example['transcript'].startswith('/')
+
+    def test_searches_unresolved_counts_non_ok_statuses(self, tmp_path):
+        root = tmp_path / 'archive'
+        _write_transcript(root, self.GOOD_REL, [
+            _tool_use('toolu_1', 'answered'),
+            _tool_result('toolu_1', {'results': [_result('a', 0.9)]}),
+            _tool_use('toolu_2', 'never answered'),
+        ])
+        _, coverage = _mod.scan_archive(root)
+        assert coverage['searches_extracted'] == 2
+        assert coverage['searches_unresolved'] == 1
+
+    def test_provenance_recovered_from_the_tree(self, tmp_path):
+        records, _ = _mod.scan_archive(self._tree(tmp_path))
+        assert records[0]['task_id'] == '2280'
+        assert records[0]['session_id'] == 'aaaa-1111'
+        assert records[0]['is_subagent'] is False
+        assert records[0]['transcript'] == self.GOOD_REL
+        assert records[0]['caller']['role'] == 'architect'
+
+    def test_subagent_transcripts_are_scanned(self, tmp_path):
+        root = tmp_path / 'archive'
+        _write_transcript(root, '3006/-enc-b/sess-1/subagents/agent-ff00.jsonl.gz', [
+            _tool_use('toolu_1', 'from a subagent'),
+            _tool_result('toolu_1', {'results': []}),
+        ])
+        records, coverage = _mod.scan_archive(root)
+        assert coverage['transcripts_found'] == 1
+        assert len(records) == 1
+        assert records[0]['is_subagent'] is True
+        assert records[0]['subagent_id'] == 'agent-ff00'
+
+    def test_plain_jsonl_transcripts_are_scanned_too(self, tmp_path):
+        root = tmp_path / 'archive'
+        path = root / '2280/-enc-a/plain.jsonl'
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps(_tool_use('toolu_1', 'uncompressed')) + '\n')
+        records, coverage = _mod.scan_archive(root)
+        assert coverage['transcripts_found'] == 1
+        assert [r['query'] for r in records] == ['uncompressed']
+
+    def test_missing_root_reports_zero_without_raising(self, tmp_path):
+        records, coverage = _mod.scan_archive(tmp_path / 'does-not-exist')
+        assert records == []
+        assert coverage['transcripts_found'] == 0
+        assert coverage['parse_failures']['count'] == 0
+
+    def test_deterministic_order_across_runs(self, tmp_path):
+        root = self._tree(tmp_path)
+        first, _ = _mod.scan_archive(root)
+        second, _ = _mod.scan_archive(root)
+        # Byte-identical corpora from the same tree — otherwise two runs of an
+        # unchanged archive would diff, and a real change would be unreadable.
+        assert json.dumps(first, sort_keys=True) == json.dumps(second, sort_keys=True)
+
+    def test_tool_names_is_threaded_through(self, tmp_path):
+        root = tmp_path / 'archive'
+        _write_transcript(root, self.GOOD_REL, [_tool_use('t', 'q', name='legacy__search')])
+        records, _ = _mod.scan_archive(root, tool_names=frozenset({'legacy__search'}))
+        assert len(records) == 1
+
+
+class TestFailureExamplesAreCapped:
+    """The example list is bounded — and says so when it truncates.
+
+    An unbounded list could be thousands of entries; a silently truncated one
+    would understate a systemic failure as a handful of stragglers.
+    """
+
+    def _two_failures(self, tmp_path: Path) -> Path:
+        root = tmp_path / 'archive'
+        _write_corrupt(root, '1/-enc/a.jsonl.gz')
+        _write_corrupt(root, '2/-enc/b.jsonl.gz')
+        return root
+
+    def test_count_is_never_capped(self, tmp_path):
+        _, coverage = _mod.scan_archive(self._two_failures(tmp_path), max_failure_examples=1)
+        assert coverage['parse_failures']['count'] == 2
+
+    def test_examples_are_capped(self, tmp_path):
+        _, coverage = _mod.scan_archive(self._two_failures(tmp_path), max_failure_examples=1)
+        assert len(coverage['parse_failures']['examples']) == 1
+
+    def test_truncation_is_disclosed(self, tmp_path):
+        _, coverage = _mod.scan_archive(self._two_failures(tmp_path), max_failure_examples=1)
+        failures = coverage['parse_failures']
+        assert failures['examples_truncated'] is True
+        assert failures['examples_omitted'] == 1
+
+    def test_no_truncation_is_disclosed_as_such(self, tmp_path):
+        _, coverage = _mod.scan_archive(self._two_failures(tmp_path), max_failure_examples=10)
+        failures = coverage['parse_failures']
+        assert failures['examples_truncated'] is False
+        assert failures['examples_omitted'] == 0
+        assert len(failures['examples']) == 2
