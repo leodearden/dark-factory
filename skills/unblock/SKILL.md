@@ -342,33 +342,29 @@ The merge procedure is iterative — don't assume one pass will be enough:
      # nothing was, so unknown is that arm's live state until the git-authority tier resolves it
      terminal = ("done", "conflict", "blocked", "abandoned") if poll_by == "branch" \
          else ("done", "conflict", "blocked", "abandoned", "unknown")
-     deadline = now() + 1200 if poll_by == "branch" else None  # 20-min hard ceiling; branch arm only — it alone lost its unknown exit
+     # 20-min hard ceiling on BOTH unscoped arms (branch and task_id): each can reject a
+     # terminal `done` (see accept_terminal), and a durable tier re-serves the same stale
+     # record every tick, so without a floor the loop would spin forever. request_id is
+     # submission-scoped, never rejects, and keeps its unbounded wait.
+     deadline = None if poll_by == "request_id" else now() + 1200
      timed_out = False
      poll_interval = 15  # seconds; ramp up to 60 s
 
-     # BRANCH-ARM STALENESS GUARD. A branch-keyed poll resolves the most-recent
-     # *finalized* record for that branch (retention ring `get_by_branch` → event store
-     # `latest_merge_finalized(branch=...)`, escalation/server.py:2251-2286) — nothing ties
-     # that record to *this* submission, and the event store is durable across restarts.
-     # Task branches are reused verbatim across resubmissions (this skill's own retry loop
-     # is "fix in worktree, resubmit" on the same `task/<TASK_ID>`), so a previous round's
-     # done/conflict/blocked/abandoned record can satisfy the terminal test on the very
-     # FIRST tick, before the foreign merger has done anything. Only git ancestry proves
-     # that *this* attempt landed.
+     # UNSCOPED-HANDLE STALENESS GUARD (applies to the `branch` AND `task_id` arms).
+     # Neither key is tied to *this* submission once the live-snapshot tier stops serving
+     # it (e.g. a mid-flight orchestrator restart): the durable tiers resolve both to the
+     # most-recent *finalized* record for that key — retention ring `get_by_branch` /
+     # `get_by_task` → event store `latest_merge_finalized(branch=...)` /
+     # `latest_merge_finalized(task_id=...)` (escalation/server.py:2244-2287) — and the
+     # event store survives restarts. Branches AND task_ids are both reused verbatim
+     # across resubmissions (this skill's own retry loop is "fix in worktree, resubmit"
+     # on the same `task/<TASK_ID>`), so a previous round's done/conflict/blocked/
+     # abandoned record can satisfy the terminal test on the very FIRST tick, before this
+     # attempt has done anything. Only git ancestry proves that *this* attempt landed.
      def accept_terminal(poll):
          if poll_by == "request_id":
              return True          # request_id names exactly this in-flight entry — always submission-scoped
-         if poll_by == "task_id":
-             # Submission-scoped only while the live snapshot tier is still serving this
-             # task_id. Once that stops (e.g. a mid-flight orchestrator restart), durable
-             # lookups resolve task_id to the most-recent *finalized* record for the task
-             # (ring.get_by_task / latest_merge_finalized(task_id=...)) — not scoped to this
-             # submission, since task_ids are reused verbatim across resubmissions just like
-             # branches. A terminal that arrives before you've observed any live/queued poll
-             # for this attempt is suspect — sanity-check it with the same
-             # `git merge-base --is-ancestor task/<TASK_ID> main` check used below for branch
-             # before trusting it.
-             return True
+         # branch and task_id arms: both unscoped, both gated identically.
          if poll["state"] == "done":
              # shell: git merge-base --is-ancestor task/<TASK_ID> main  → True iff exit 0
              return branch_is_ancestor_of_main()   # unconfirmed `done` is stale → keep polling
@@ -386,13 +382,13 @@ The merge procedure is iterative — don't assume one pass will be enough:
          poll_interval = min(max(eta, 15), 60)
      ```
      After the loop exits:
-     - `timed_out` (branch-arm 20-minute deadline reached without an accepted terminal state) → do NOT resubmit and do NOT direct-merge; go to *Polled terminal failures*'s `unknown` bullet below and follow its branch-arm carve-out (stop-and-report, not resubmit).
-     - `poll["state"] == "done"` → **if the response carries `merge_sha`** (the git-authority tier's `kind: "found_on_main"` shape), thread it as `done_provenance={"kind": "found_on_main", "commit": "<merge_sha>", "note": "<explanation>"}` — **not** a bare `commit`. `merge_sha` is not always the merge commit: on the live-branch resolution path it's the *branch tip* SHA, a distinct commit from the actual merge commit for a `--no-ff` merge; only the deleted-branch path's `merge_sha` is the true merge-commit SHA (`_found_on_main_response`'s docstring, `escalation/server.py:2290-2305`). **Otherwise** — including on the `poll_by == "branch"` arm, where a durable retention-ring/event-store record resolves `done` with only `state`/`request_id`/`generation`/`outcome`/`finished_at` and *no* `merge_sha` (`escalation/server.py:2404-2420`) — `merge_status` gives you no commit hash (`poll["outcome"]` is the raw state string `"done"`), so re-derive the true merge commit from git:
+     - `timed_out` (either unscoped arm's 20-minute deadline reached without an accepted terminal state — i.e. the only `done` on offer never became an ancestor of main) → do NOT resubmit and do NOT direct-merge; run `git merge-base --is-ancestor task/<TASK_ID> main` one final time, and on exit 1 stop and report to the human, per *Polled terminal failures*'s `unknown` bullet below.
+     - `poll["state"] == "done"` → **if the response carries `merge_sha`** (the git-authority tier's `kind: "found_on_main"` shape), thread it as `done_provenance={"kind": "found_on_main", "commit": "<merge_sha>", "note": "<explanation>"}` — **not** a bare `commit`. `merge_sha` is not always the merge commit: on the live-branch resolution path it's the *branch tip* SHA, a distinct commit from the actual merge commit for a `--no-ff` merge; only the deleted-branch path's `merge_sha` is the true merge-commit SHA (`_found_on_main_response`'s docstring, `escalation/server.py:2290-2305`). **Otherwise** — including on either unscoped arm (`poll_by` `"branch"` or `"task_id"`), where a durable retention-ring/event-store record resolves `done` with only `state`/`request_id`/`generation`/`outcome`/`finished_at` and *no* `merge_sha` (`escalation/server.py:2404-2420`) — `merge_status` gives you no commit hash (`poll["outcome"]` is the raw state string `"done"`), so re-derive the true merge commit from git:
        ```
        git log main --oneline | head -5
        ```
        Thread the SHA into `done_provenance={"commit": "<sha>"}`. If no single commit is recoverable, fall back to `{"note": "<explanation>"}`. Then proceed to step 8.
-     - `poll["state"] in ("conflict", "blocked", "abandoned", "unknown")` → see *Polled terminal failures* below. **On the `poll_by == "branch"` arm these are UNCONFIRMED** — per the staleness guard above they may be a prior round's record for this same branch rather than this submission's outcome. Before acting on one, re-check `mcp__escalation__get_merge_queue()` and who owns the worktree; if this branch is still in flight, keep polling to the 20-minute ceiling instead of resubmitting on a stale failure.
+     - `poll["state"] in ("conflict", "blocked", "abandoned", "unknown")` → see *Polled terminal failures* below. **On the unscoped arms (`poll_by` `"branch"` or `"task_id"`) these are UNCONFIRMED** — per the staleness guard above they may be a prior round's record for this same reused branch/task_id rather than this submission's outcome. Before acting on one, re-check `mcp__escalation__get_merge_queue()` and who owns the worktree; if this branch is still in flight, keep polling to the 20-minute ceiling instead of resubmitting on a stale failure.
 
    *(Immediate-response failure edges — `conflict`, `blocked`, `unknown_branch`, `failed`, orchestrator-down — and cancellation are covered below.)*
 
