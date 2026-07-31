@@ -1180,6 +1180,113 @@ class TestNoPlanCellScoresZeroNotTheJudgesNumber:
         assert row['quality'] == pytest.approx(0.95, abs=1e-9)
 
 
+class TestNoPlanCellsAreCounted:
+    """The floor is COUNTED, never silent (loud-over-silent-degradation).
+
+    A mean that silently absorbs zeros for cells that produced nothing reads
+    identically to a mean over cells that all planned badly. The two causes get
+    two disjoint counts: ``no_plan`` (content failure, floored to 0.0 and kept)
+    and ``cap_excluded`` (transport refusal, dropped from the pool entirely).
+    """
+
+    @staticmethod
+    def _one_no_plan_among_two():
+        return [
+            _arch('p1', 'arch-mixed', 1, plan_steps=0, plan_quality=0.9,
+                  cost_usd=0.3, duration_ms=60000),
+            _arch('p1', 'arch-mixed', 2, plan_steps=6, plan_quality=0.6,
+                  cost_usd=0.3, duration_ms=60000),
+            _arch('p1', 'arch-mixed', 3, plan_steps=6, plan_quality=0.6,
+                  cost_usd=0.3, duration_ms=60000),
+        ]
+
+    def test_both_surfaces_count_the_floored_cell_and_agree(self):
+        from orchestrator.evals.report import (
+            build_composite_report,
+            build_plan_quality_report,
+        )
+
+        results = self._one_no_plan_among_two()
+        row = build_composite_report(results)['configs'][0]
+        theta = build_plan_quality_report(results)['configs'][0]
+
+        assert row['plan_quality_no_plan'] == 1
+        assert theta['no_plan'] == 1
+        assert row['plan_quality_no_plan'] == theta['no_plan']
+
+    def test_an_all_planning_config_reports_zero_never_absent(self):
+        """A count that vanishes when it is zero cannot be read as 'none'."""
+        from orchestrator.evals.report import (
+            build_composite_report,
+            build_plan_quality_report,
+        )
+
+        results = [
+            _arch('p1', 'arch-real', tr, plan_steps=6, plan_quality=0.6,
+                  cost_usd=0.3, duration_ms=60000)
+            for tr in (1, 2, 3)
+        ]
+        row = build_composite_report(results)['configs'][0]
+        theta = build_plan_quality_report(results)['configs'][0]
+
+        assert row['plan_quality_no_plan'] == 0
+        assert theta['no_plan'] == 0
+
+    def test_cap_tainted_is_counted_as_excluded_not_as_no_plan(self):
+        """Disjoint causes, disjoint counts: a transport refusal never got to
+        ask the model, so it is not a cell that 'produced no plan' — it is a
+        cell we could not measure at all (task 3118)."""
+        from orchestrator.evals.report import (
+            build_composite_report,
+            build_plan_quality_report,
+        )
+
+        results = [
+            # Refused at the transport layer: no score, no plan, EXCLUDED.
+            _arch('p1', 'arch-both', 1, plan_steps=0, plan_quality=None,
+                  cost_usd=0.0, duration_ms=0, cap_tainted=True),
+            # Healthy, but produced nothing: FLOORED to 0.0 and kept.
+            _arch('p1', 'arch-both', 2, plan_steps=0, plan_quality=0.9,
+                  cost_usd=0.3, duration_ms=60000),
+            _arch('p1', 'arch-both', 3, plan_steps=6, plan_quality=0.6,
+                  cost_usd=0.3, duration_ms=60000),
+        ]
+        row = build_composite_report(results)['configs'][0]
+        theta = build_plan_quality_report(results)['configs'][0]
+
+        assert row['plan_quality_cap_excluded'] == 1
+        assert row['plan_quality_no_plan'] == 1
+        assert theta['cap_excluded'] == 1
+        assert theta['no_plan'] == 1
+        # Neither treatment shrinks the sample silently.
+        assert row['trials'] == 3
+        assert theta['total'] == 3
+        # …and the mean is over the two admitted cells: (0.0 + 0.6) / 2.
+        assert theta['n'] == 2
+        assert theta['mean_plan_quality'] == pytest.approx(0.3, abs=1e-9)
+
+    def test_the_theta_mean_table_renders_the_count(self):
+        """mean_plan_quality must be readable beside the no-plan cells it
+        scored as zeros, not just the n it averaged."""
+        from orchestrator.evals.report import (
+            _PLAN_QUALITY_MEAN_HEADER,
+            build_plan_quality_report,
+            format_plan_quality_table,
+        )
+
+        out = format_plan_quality_table(
+            build_plan_quality_report(self._one_no_plan_among_two())
+        )
+        header = _table_row_cells(
+            out, 'config_name', section=_PLAN_QUALITY_MEAN_HEADER,
+        )
+        cells = _table_row_cells(
+            out, 'arch-mixed', section=_PLAN_QUALITY_MEAN_HEADER,
+        )
+        assert 'no_plan' in header
+        assert cells[header.index('no_plan')] == '1'
+
+
 # ---------------------------------------------------------------------------
 # Task 2477 step-11: format_composite_table — deterministic renderer of the
 # C4 composite report (per-config table + a distinct price-table section).
