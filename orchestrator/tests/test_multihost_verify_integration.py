@@ -2005,12 +2005,25 @@ class TestTwoHostFalseGreenCapstone:
 
 
 @pytest.mark.asyncio
-class TestIndeterminateLocalLegDoesNotVeto(TestPerLandCrossCheck):
-    """Inherits TestPerLandCrossCheck so the task-2822 fail-CLOSED contract is
-    re-run verbatim alongside the new arm — the two must coexist."""
+class TestIndeterminateLocalLegDoesNotVeto:
+    """The new INDETERMINATE arm, plus its own fail-CLOSED controls.
+
+    Deliberately NOT a subclass of TestPerLandCrossCheck: pytest already
+    collects that class in this module, so inheriting it would re-run every
+    parent test a second time for zero added coverage.  The claim that the
+    task-2822 fail-CLOSED contract still holds alongside the new arm is
+    pinned by this class's OWN controls below, which drive the same
+    `_run_post_merge_verify` callee through `_drive`.
+    """
+
+    _KILLED_LEG_SUMMARY = (
+        'Failures: lint leg killed by signal 9 after 0.31s; '
+        'no diagnostics produced; verdict indeterminate'
+    )
 
     @staticmethod
-    async def _drive(tmp_path, *, local_category: str, merge_sha: str):
+    async def _drive(tmp_path, *, local_category: str, merge_sha: str,
+                     local_summary: str | None = None):
         """Remote PASS + local FAIL(*local_category*) through the real callee."""
         from unittest.mock import patch
 
@@ -2027,8 +2040,8 @@ class TestIndeterminateLocalLegDoesNotVeto(TestPerLandCrossCheck):
         local_fail.lint_output = ''
         local_fail.type_output = ''
         local_fail.summary = (
-            'Failures: lint leg killed by signal 9 after 0.31s; '
-            'no diagnostics produced; verdict indeterminate'
+            TestIndeterminateLocalLegDoesNotVeto._KILLED_LEG_SUMMARY
+            if local_summary is None else local_summary
         )
         eq = _FakeEscalationQueue()
         es = _RecordingEventStore()
@@ -2137,6 +2150,34 @@ class TestIndeterminateLocalLegDoesNotVeto(TestPerLandCrossCheck):
         assert len(mismatch) == 1, f'expected 1 mismatch escalation, got {eq.submitted}'
         assert mismatch[0].severity == 'blocking'
         assert mismatch[0].level == 1
+        assert es.events_of(EventType.verify_cross_check_mismatch)
+        assert es.events_of(EventType.verify_cross_check_inconclusive) == []
+
+    async def test_branch_caused_collection_error_still_vetoes(self, tmp_path):
+        """A pytest INTERNALERROR is infra-transient for RETRY purposes, but a
+        conftest.py or plugin added by the diff can raise it at collection
+        time — and may raise only on this host's interpreter/plugin set while
+        a remote with a cached env collects fine.  So it is deliberately kept
+        OUT of INDETERMINATE_VERDICT_CATEGORIES: it must keep vetoing, or the
+        widened exemption would land a branch-caused break (fail CLOSED)."""
+        from orchestrator.verify_categories import (
+            INDETERMINATE_VERDICT_CATEGORIES,
+            INFRA_TRANSIENT_CATEGORIES,
+        )
+
+        # The premise this control exists for: infra-transient, yet vetoing.
+        assert 'pytest_internalerror' in INFRA_TRANSIENT_CATEGORIES
+        assert 'pytest_internalerror' not in INDETERMINATE_VERDICT_CATEGORIES
+
+        outcome, git_ops, eq, es, quarantine, _ = await self._drive(
+            tmp_path, local_category='pytest_internalerror', merge_sha='ctrl0003',
+            local_summary='Failures: tests failed',
+        )
+        assert outcome is not None, 'a branch-causable collection error must veto'
+        assert outcome.status == 'blocked'
+        git_ops.cleanup_merge_worktree.assert_awaited()
+        assert 'laptop' in quarantine
+        assert len(eq.submitted) == 1
         assert es.events_of(EventType.verify_cross_check_mismatch)
         assert es.events_of(EventType.verify_cross_check_inconclusive) == []
 
