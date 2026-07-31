@@ -542,6 +542,88 @@ class TestMaterialization:
         assert first.exists() and second.exists()
 
 
+class TestMaterializeRejectsSharedDestination:
+    """One row per destination is ENFORCED, not merely documented.
+
+    The corpus deliberately reuses session IDs across rows — they are samples of
+    the SAME probe run at different offsets — so cross-row contamination in a
+    shared destination is structural, not incidental: a leftover transcript from
+    an earlier sample is found by a later row watching the same session.
+
+    Measured before this guard existed, the shared-destination loop inverted
+    exactly the row C5's conservative degrade rests on:
+    `wedge_transcript_unreadable_session_mismatch` evaluated `True` instead of
+    the `None` unreadable sentinel.  A 3326 test written from that pattern would
+    either fail spuriously against a correct production port, or pass against a
+    broken one that folds `None` into `True` — so the wrong pattern must be
+    impossible to write SILENTLY, not merely discouraged in a docstring.
+    """
+
+    def test_a_second_row_into_one_destination_is_rejected(self, tmp_path):
+        rows = _corpus_rows()
+        dest = tmp_path / 'shared'
+        scf.materialize_config_dir(rows[0], dest)
+        before = scf.snapshot_config_dir(dest)
+
+        with pytest.raises(AssertionError) as excinfo:
+            scf.materialize_config_dir(rows[1], dest)
+
+        message = str(excinfo.value)
+        assert str(dest) in message, (
+            f'the rejection must name the offending dest; got {message!r}'
+        )
+        assert 'one row per destination' in message.lower(), (
+            f'the rejection must state the one-row-per-destination rule; '
+            f'got {message!r}'
+        )
+        # Rejected BEFORE creating anything — a guard that half-wrote the second
+        # row would leave precisely the contaminated tree it exists to prevent.
+        assert scf.snapshot_config_dir(dest) == before, (
+            'the rejected materialize modified the destination anyway'
+        )
+
+    def test_a_missing_destination_is_permitted(self, tmp_path):
+        # The guard must not over-fire: an absent dest is the common case.
+        dest = tmp_path / 'absent'
+        assert not dest.exists()
+
+        config_dir, session_id = scf.materialize_config_dir(_corpus_rows()[0], dest)
+
+        assert config_dir == dest and config_dir.is_dir()
+        assert session_id == _corpus_rows()[0]['session_id']
+
+    def test_an_existing_empty_destination_is_permitted(self, tmp_path):
+        # The bare-`tmp_path` shape every current call site in this file uses:
+        # the directory already exists, but holds nothing.
+        dest = tmp_path / 'empty'
+        dest.mkdir()
+
+        config_dir, _session_id = scf.materialize_config_dir(_corpus_rows()[0], dest)
+
+        assert config_dir == dest
+        assert any(config_dir.iterdir()), 'nothing was materialized into the empty dest'
+
+    def test_the_advertised_consumption_loop_reproduces_every_verdict(self, tmp_path):
+        """The exact loop 3326 is handed, pinned end to end.
+
+        `docs/startup-completion-artifact-matrix.md` §7 advertises a PER-ROW
+        destination; this asserts that pattern reproduces every recorded verdict
+        with zero mismatches, so the contract a consumer copies is the one that
+        has been measured.
+        """
+        mismatches = []
+        for row in scf.load_startup_completion_corpus():
+            config_dir, session_id = scf.materialize_config_dir(row, tmp_path / row['id'])
+            verdict = scf.evaluate_startup_completion_predicate(config_dir, session_id)
+            if verdict is not row['expected_startup_complete']:
+                mismatches.append((row['id'], verdict, row['expected_startup_complete']))
+
+        assert not mismatches, (
+            f'the advertised per-row-destination consumption loop did not '
+            f'reproduce every recorded verdict — (id, got, recorded): {mismatches}'
+        )
+
+
 class TestWedgeShapeCoverage:
     """The corpus covers every shape C5 has to survive, and stays probe-backed.
 
