@@ -13,12 +13,15 @@ import pytest
 from orchestrator import verify, verify_plan
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.verify import (
+    SIGNAL_KILL_SUMMARY_MARKER,
     _CATEGORY_PRIORITY,
     _PRUNE_THROTTLE_SECS,
     VerifyResult,
     _aggregate_results,
     _apply_cargo_scope,
     _build_fallback_config,
+    _build_summary_payload,
+    _killed_leg_note,
     _extract_cause_hint,
     _is_collectable_test_file,
     _is_structural_python_file,
@@ -9093,3 +9096,153 @@ class TestWithJunitxmlStr:
             _with_junitxml_str(cmd, self._JUNIT)
 
         assert [r.message for r in caplog.records if r.name == 'orchestrator.verify'] == []
+
+
+# ---------------------------------------------------------------------------
+# task 3173 step-7: the two paths that would otherwise ERASE the kill signal
+# after `_summarize_checks` (step-6) correctly recorded it.
+#
+# (a) `_aggregate_results` rebuilds the multi-subproject summary by
+#     substring-scanning child summaries for exactly three literals
+#     ('tests failed' / 'lint issues' / 'type errors').  A kill note matches
+#     none of them, so a multi-module verify silently degrades to a bare
+#     'Failures: ' with no parts at all.
+# (b) `_build_summary_payload` picks the "loudest raw exit code" with
+#     max(key=(rc, timed_out)).  A NEGATIVE rc sorts BELOW a passing rc=0, so
+#     whenever a killed leg co-occurs with a passing leg the archived summary
+#     reports the PASSING run's rc/cmd/duration — actively hiding the kill in
+#     the one artifact that survives for triage.  (This whole defect was only
+#     diagnosable because that archive existed; see the archive=True design
+#     decision.)
+# ---------------------------------------------------------------------------
+
+_KILLED_LINT_CMD = './scripts/verify.sh lint --scope branch --include-infra'
+
+
+def _kill_note_child(*, module: str = 'orchestrator') -> VerifyResult:
+    """A child result whose lint leg was SIGKILLed at 0.31s."""
+    return VerifyResult(
+        passed=False,
+        test_output='',
+        lint_output='DF_VERIFY_ROLE=merge — forcing --scope all\n',
+        type_output='',
+        summary=f'Failures: {_killed_leg_note("lint", -9, 0.31010722508654)}',
+        category='infra_kill',
+        cause_hint=f'{module}: killed',
+    )
+
+
+class TestAggregateResultsKeepsKillNote:
+    """A kill note must survive multi-subproject aggregation verbatim."""
+
+    def test_kill_note_survives_aggregation_with_a_passing_sibling(self):
+        passing = VerifyResult(
+            passed=True, test_output='', lint_output='', type_output='',
+            summary='All checks passed', category='passed',
+        )
+        agg = _aggregate_results([passing, _kill_note_child()])
+        assert not agg.passed
+        assert SIGNAL_KILL_SUMMARY_MARKER in agg.summary
+        assert 'killed by signal 9' in agg.summary
+        assert 'indeterminate' in agg.summary
+        # The bug's signature: everything after the envelope dropped away.
+        assert agg.summary != 'Failures: '
+        assert agg.summary.strip() != 'Failures:'
+
+    def test_kill_note_and_a_real_test_failure_both_survive(self):
+        real_failure = VerifyResult(
+            passed=False, test_output='FAILED tests/x.py::y\n', lint_output='',
+            type_output='', summary='Failures: tests failed',
+            category='test_failure',
+        )
+        agg = _aggregate_results([real_failure, _kill_note_child(module='fused-memory')])
+        assert 'tests failed' in agg.summary
+        assert 'killed by signal 9' in agg.summary
+        assert 'indeterminate' in agg.summary
+
+    def test_aggregate_category_is_infra_kill(self):
+        """_worst_category must let severity_rank=1 dominate test_failure."""
+        real_failure = VerifyResult(
+            passed=False, test_output='FAILED tests/x.py::y\n', lint_output='',
+            type_output='', summary='Failures: tests failed',
+            category='test_failure',
+        )
+        agg = _aggregate_results([real_failure, _kill_note_child()])
+        assert agg.category == 'infra_kill'
+
+    def test_duplicate_kill_notes_are_not_repeated(self):
+        """Two subprojects killed identically must not stutter the same
+        sentence twice; ordering stays deterministic."""
+        agg = _aggregate_results([_kill_note_child(), _kill_note_child(module='dashboard')])
+        assert agg.summary.count('killed by signal 9') == 1
+
+    def test_genuine_multi_child_wording_is_unchanged(self):
+        """REGRESSION GUARD: with no kill anywhere, aggregation is
+        byte-identical to today."""
+        a = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='Failures: tests failed', category='test_failure',
+        )
+        b = VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='Failures: lint issues, type errors', category='test_failure',
+        )
+        agg = _aggregate_results([a, b])
+        assert agg.summary == 'Failures: tests failed, lint issues, type errors'
+
+
+class TestSummaryPayloadNamesTheKilledRun:
+    """The archived summary.json must name the run that was killed."""
+
+    @staticmethod
+    def _runs() -> list[dict]:
+        return [
+            {'label': 'test', 'cmd': 'pytest', 'rc': 0, 'timed_out': False,
+             'started_at': 't0', 'duration_secs': 900.0},
+            {'label': 'lint', 'cmd': _KILLED_LINT_CMD, 'rc': -9, 'timed_out': False,
+             'started_at': 't1', 'duration_secs': 0.31},
+        ]
+
+    def test_killed_run_outranks_a_passing_run(self):
+        payload = _build_summary_payload(self._runs(), 'infra_kill', '')
+        assert payload['rc'] == -9
+        assert payload['cmd'] == _KILLED_LINT_CMD
+        assert payload['duration_secs'] == 0.31
+        assert payload['started_at'] == 't1'
+
+    def test_killed_run_outranks_a_genuine_nonzero_failure(self):
+        runs = self._runs()
+        runs[0]['rc'] = 1
+        payload = _build_summary_payload(runs, 'infra_kill', '')
+        assert payload['rc'] == -9
+        assert payload['cmd'] == _KILLED_LINT_CMD
+
+    def test_all_commands_are_still_listed(self):
+        payload = _build_summary_payload(self._runs(), 'infra_kill', '')
+        assert [c['label'] for c in payload['commands']] == ['test', 'lint']
+        assert [c['rc'] for c in payload['commands']] == [0, -9]
+
+    def test_control_loudest_nonnegative_rc_is_unchanged(self):
+        """CONTROL: with no negative rc anywhere, the existing
+        "loudest raw exit code" ordering (rc=1 beats rc=0) still holds."""
+        runs = [
+            {'label': 'test', 'cmd': 'pytest', 'rc': 1, 'timed_out': False,
+             'started_at': 't0', 'duration_secs': 12.0},
+            {'label': 'lint', 'cmd': 'ruff check .', 'rc': 0, 'timed_out': False,
+             'started_at': 't1', 'duration_secs': 3.0},
+        ]
+        payload = _build_summary_payload(runs, 'test_failure', '')
+        assert payload['rc'] == 1
+        assert payload['cmd'] == 'pytest'
+        assert payload['duration_secs'] == 12.0
+
+    def test_control_timed_out_tiebreak_is_unchanged(self):
+        runs = [
+            {'label': 'test', 'cmd': 'pytest', 'rc': 1, 'timed_out': True,
+             'started_at': 't0', 'duration_secs': 600.0},
+            {'label': 'lint', 'cmd': 'ruff check .', 'rc': 1, 'timed_out': False,
+             'started_at': 't1', 'duration_secs': 3.0},
+        ]
+        payload = _build_summary_payload(runs, 'infra_timeout', '')
+        assert payload['cmd'] == 'pytest'
+        assert payload['timed_out'] is True
