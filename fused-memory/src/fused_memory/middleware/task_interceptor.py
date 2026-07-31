@@ -64,6 +64,7 @@ from fused_memory.middleware.path_scope_guard import (
     check_files_for_scope,
     check_text_for_scope,
     is_routing_override,
+    local_deliverable_attested,
 )
 from fused_memory.middleware.pre_done_hook import run_hook as _run_hook
 from fused_memory.middleware.project_prefix_registry import ProjectPrefixRegistry
@@ -1690,6 +1691,39 @@ class TaskInterceptor:
         )
         return all_files_foreign_owner(files, project_id, registry)
 
+    def _local_deliverable_attested(
+        self,
+        kwargs: dict[str, Any],
+        project_id: str,
+    ) -> bool:
+        """Return True iff the submission DECLARES a deliverable owned by *project_id*.
+
+        Positive-attribution counterpart to :meth:`_all_files_foreign_owner`
+        (task 3106), with the same thin-wrapper shape: registry guard here,
+        registry-only logic in the pure :func:`local_deliverable_attested`.
+        The two are exact logical complements — that one needs EVERY owned
+        file foreign under ONE owner, this needs at least ONE local — so the
+        cross-repo allow-and-tag branch and the prose-advisory suppression
+        can never both fire.
+
+        Reads ``kwargs`` directly rather than ``candidate.files_to_modify``:
+        the candidate's list has already been narrowed by
+        :meth:`_extract_meta_files_from_meta`'s ``files``-over-
+        ``files_to_modify`` precedence and carries no ``modules`` at all, so
+        it is the wrong signal for attribution, which wants the UNION (see
+        :meth:`_extract_deliverable_signals_from_meta`).
+
+        Returns False when no :attr:`_prefix_registry` is configured — with
+        no owner map nothing can attest, so the caller falls through to the
+        unchanged advisory.
+        """
+        registry = self._prefix_registry
+        if registry is None:
+            return False
+        return local_deliverable_attested(
+            self._extract_deliverable_signals(kwargs), project_id, registry,
+        )
+
     def _path_guard_check(
         self,
         candidate: CandidateTask | None,
@@ -1826,6 +1860,30 @@ class TaskInterceptor:
           always present (defaults to ``ProjectPrefixRegistry.default()``,
           task 2208), so this is the ONLY path — the pre-task-2208
           hard-reject-on-prose back-compat branch has been retired.
+        * PROSE-hit SUPPRESSED BY LOCAL ATTRIBUTION
+          (:meth:`_local_deliverable_attested`, task 3106) — the prose hit
+          above is discarded, with NEITHER the stamp NOR the escalation, when
+          the submission declares at least one deliverable
+          (``metadata.files`` ∪ ``files_to_modify`` ∪ ``modules``) OWNED by
+          the filing project.  Prose lexing cannot distinguish "modifies X"
+          from "merely cites X"; a declared deliverable can, so the better
+          signal wins.
+
+          ORDERING INVARIANT: this runs only AFTER the FILES-certain check
+          returned ``ok``, i.e. "no declared file is FOREIGN" is already
+          established.  Attribution adds the positive half — "and at least
+          one declared entry is LOCAL" — so the pair together is a complete
+          attribution, and a locally-owned entry can never buy a MIXED
+          submission past the hard reject above.
+
+          MUTUALLY EXCLUSIVE with the cross-repo allow-and-tag branch: that
+          one requires EVERY owned file to be foreign under one owner, this
+          one requires at least one LOCAL file, so they can never both fire.
+
+          RETAINED PROTECTION: a submission with NO declared deliverable, or
+          with only UNOWNED entries (``README.md``, ``docs/x.md``), has no
+          positive attribution and fires the advisory exactly as before —
+          which is where the guard's real protection lives.
 
         The inline Stage-2 LLM adjudicator (task 1822) is no longer
         consulted here: FILES-certain rejects have nothing to adjudicate,
@@ -1891,6 +1949,16 @@ class TaskInterceptor:
 
         verdict = self._path_guard_check(candidate, kwargs, project_id)
         if not verdict.is_rejection:
+            return None
+
+        # PROSE-hit SUPPRESSED BY LOCAL ATTRIBUTION (task 3106): the
+        # submission DECLARES a deliverable owned by the filing project, so
+        # the foreign path in its prose is an incidental citation ("mirror
+        # the logic in <other-project>/x.rs"), not a misrouting. Prose lexing
+        # cannot tell "modifies X" from "mentions X"; a declared deliverable
+        # can, so the better signal wins and neither the stamp nor the
+        # escalation fires.
+        if self._local_deliverable_attested(kwargs, project_id):
             return None
 
         # PROSE-ADVISORY: a heuristic hit never blocks creation — the

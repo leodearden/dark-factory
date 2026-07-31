@@ -6445,10 +6445,18 @@ class TestSubmitTaskGuardrailMultiProject:
         taskmaster,
         tmp_path,
     ):
-        """PROSE mentions another project's dir; metadata.files are all
-        in-project. The hit is a non-rejecting advisory: the ticket is
-        still created, and the persisted blob's metadata carries
-        possible_scope_mismatch (matched_paths + suggested_project)."""
+        """PROSE mentions another project's dir; no deliverable is declared.
+        The hit is a non-rejecting advisory: the ticket is still created, and
+        the persisted blob's metadata carries possible_scope_mismatch
+        (matched_paths + suggested_project).
+
+        Task 3106: this submission declares NO metadata deliverable, which is
+        load-bearing — supplying a filer-owned file (this test used to pass
+        metadata={'files': ['crates/widget.rs']}) now ATTESTS local work and
+        suppresses both the stamp and the escalation. The unique coverage
+        here is ticket PERSISTENCE of the marker, so the metadata was dropped
+        rather than the assertions inverted.
+        """
         interceptor_with_store._prefix_registry = self._two_project_registry(tmp_path)
 
         try:
@@ -6459,7 +6467,6 @@ class TestSubmitTaskGuardrailMultiProject:
                 project_root=str(tmp_path / 'reify'),
                 title='Investigate fused-memory/src/harness.py deadlock',
                 description='See fused-memory/src/ for context',
-                metadata={'files': ['crates/widget.rs']},
             )
         finally:
             await _cancel_interceptor_workers(interceptor_with_store)
@@ -6868,9 +6875,17 @@ class TestProseRightBoundarySignal:
         'not a backend/timeout error' is English punctuation, not a path.
         'backend/' IS a registered prefix owned by 'webapp' (asserted inline
         below against the built registry, which is the anti-vacuity guard),
-        and metadata.files are all in-project, so before task 3120 this
-        submission was stamped with possible_scope_mismatch and fired a
-        scope_violation escalation. It must now do neither.
+        so before task 3120 this submission was stamped with
+        possible_scope_mismatch and fired a scope_violation escalation. It
+        must now do neither.
+
+        Task 3106: this submission declares NO metadata deliverable, and that
+        omission is load-bearing. It used to pass
+        metadata={'files': ['crates/widget.rs']} — owned by the filer 'reify'
+        — which under 3106's attribution rule would suppress the stamp and
+        the escalation ON ITS OWN, so both assertions below would hold even
+        if 3120's right-boundary narrowing were fully reverted. Dropping the
+        metadata keeps the LEXER narrowing the sole reason this test passes.
         """
         registry = self._three_project_registry(tmp_path)
         interceptor_with_store._prefix_registry = registry
@@ -6897,7 +6912,6 @@ class TestProseRightBoundarySignal:
                     'get_memory_by_id returned found=false, '
                     'not a backend/timeout error'
                 ),
-                metadata={'files': ['crates/widget.rs']},
             )
         finally:
             await _cancel_interceptor_workers(interceptor_with_store)
@@ -6941,6 +6955,15 @@ class TestProseRightBoundarySignal:
         The narrowing must not be a silent disabling of the guard. A genuine
         multi-segment citation of another project's tree still produces the
         advisory marker with the correct routing.
+
+        Task 3106: this submission declares NO metadata deliverable. It used
+        to pass metadata={'files': ['fused-memory/src/x.py']} — owned by the
+        filer 'dark_factory' — and that spelling no longer stamps, because
+        the ATTRIBUTION rule (not the lexer) now treats the crates/ citation
+        as incidental when local work is attested. Dropping the metadata
+        keeps this as the genuine-DETECTION positive its sibling negative is
+        paired against; see TestProseAdvisoryDeliverableAttribution for the
+        owned-file spelling.
         """
         interceptor_with_store._prefix_registry = self._three_project_registry(tmp_path)
 
@@ -6949,7 +6972,6 @@ class TestProseRightBoundarySignal:
                 project_root=str(tmp_path / 'dark-factory'),
                 title='Port the engine edit path',
                 description='Mirror the logic in crates/reify-eval/src/engine_edit.rs',
-                metadata={'files': ['fused-memory/src/x.py']},
             )
         finally:
             await _cancel_interceptor_workers(interceptor_with_store)
