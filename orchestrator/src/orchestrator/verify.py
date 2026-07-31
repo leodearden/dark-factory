@@ -1282,11 +1282,22 @@ def _tool_for_cmd(cmd: str | None) -> ToolKind:
     token).
 
     The same gating applies unconditionally to the lint/type checks: their
-    commands never resolve here to ``ToolKind.PYTEST``, so their outputs can
-    never classify as env_transient either — unlike the pre-δ tool-blind
-    ladder, which consulted these signatures for every check's output (see
-    the env-recovery retry's comment in ``run_verification`` for the fuller
-    note on this narrowing).
+    commands never resolve here to ``ToolKind.PYTEST``, so the pytest-scoped
+    shared-venv-mutation signatures can never fire for them — unlike the pre-δ
+    tool-blind ladder, which consulted these signatures for every check's
+    output (see the env-recovery retry's comment in ``run_verification`` for
+    the fuller note on this narrowing).
+
+    That is a statement about THIS pattern source only, NOT about the category
+    (task 3367 correction — this NOTE previously over-claimed that a lint/type
+    output "can never classify as env_transient either"). ``classify_failure``
+    guard 3 (``_classify_environmental``) is tool-blind and has three
+    ToolKind-independent ``ENV_TRANSIENT`` producers: task 2756's broken
+    ``_merge-verify`` worktree, task 2831's restart collateral, and task 3367's
+    mis-resolved pyright interpreter. A TYPE check therefore CAN classify
+    ``ENV_TRANSIENT`` today, which is exactly why the env-recovery retry gate
+    below now checks ``attempt.test.rc != 0`` explicitly rather than inferring
+    the failing leg from the category.
     """
     if not cmd:
         return ToolKind.OPAQUE
@@ -4384,13 +4395,21 @@ async def run_verification(
     # case: the pre-δ tool-blind ladder also consulted these env_transient
     # signatures against the LINT and TYPE check outputs (it classified
     # whatever output it was handed, uniformly across all three checks),
-    # whereas the RUFF/PYRIGHT tables and the OPAQUE fallback never do now —
-    # so a lint or type-check failure cannot classify as env_transient by
-    # construction, only the test leg can. A conscious tradeoff, not an
-    # unnoticed side effect: the signatures are pytest/xdist-specific text
-    # ruff/pyright would not emit, and this retry only ever re-runs the test
-    # command regardless (lint/type don't exercise xdist/pip — see above),
-    # so there is no observable behavior change from this narrowing.
+    # whereas the RUFF/PYRIGHT tables and the OPAQUE fallback never do now.
+    # A conscious tradeoff, not an unnoticed side effect: the signatures are
+    # pytest/xdist-specific text ruff/pyright would not emit, and this retry
+    # only ever re-runs the test command regardless (lint/type don't exercise
+    # xdist/pip — see above).
+    #
+    # RETIRED COROLLARY (task 3367): this block used to conclude from the above
+    # that "a lint or type-check failure cannot classify as env_transient by
+    # construction, only the test leg can". That is FALSE as of task 3367.
+    # `classify_failure` guard 3 (`_classify_environmental`) is tool-blind and
+    # now has three ToolKind-independent ENV_TRANSIENT producers — task 2756's
+    # broken `_merge-verify` worktree, task 2831's restart collateral, and task
+    # 3367's mis-resolved pyright interpreter (esc-3359-1) — any of which a TYPE
+    # or LINT leg can trip. The category therefore no longer implies the TEST
+    # leg was the failing one, so the gate below must establish that itself.
     if category == FailureCategory.ENV_TRANSIENT and attempt.test.cmd is not None:
         logger.warning(
             'Verification hit an environmental shared-venv transient '
