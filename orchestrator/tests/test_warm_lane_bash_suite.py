@@ -107,14 +107,18 @@ SCRIPT_COVERAGE = {
 #: gated on ``REIFY_WARM_LANE_MOUNT``, which ``_sanitized_env`` always strips, so
 #: 45 is both its floor and its measured count under this driver.
 #:
-#: Any OTHER shortfall — a block short-circuited by a future edit, e.g. leaf γ's
-#: rewrite of ``warm-lane-gc.sh``'s reclaimability predicate — fails loudly here
-#: instead of passing as a green item that ran less than it claims.
+#: Any OTHER shortfall — a block short-circuited by a future edit — fails loudly
+#: here instead of passing as a green item that ran less than it claims.  Leaf γ
+#: (dark-factory task 3075) was the anticipated case and has now landed: it
+#: rewrote ``warm-lane-gc.sh``'s Pass-1 reclaimability predicate around the
+#: durable lane record and added 28 asserts (Block S + Block A's A10), so the
+#: floor moved 170 → 198.  It moved because the count was RE-MEASURED, not to
+#: make a red run green.
 ASSERT_FLOORS = {
     'test_warm_lane_disk_guard.sh': 62,
     'test_warm_lane_degenerate_ref.sh': 70,
     'test_thin_warm_lane.sh': 45,
-    'test_warm_lane_gc.sh': 170,
+    'test_warm_lane_gc.sh': 198,  # 170 + 28 (Block S 23 + A10 3 + S9b/S10b)
     'test_warm_lane_gc_sweep.sh': 86,
     'test_warm_lane_audit.sh': 225,  # 228 measured − 3 (L9, root-guarded)
     'test_warm_lane_sizing_lifecycle.sh': 65,
@@ -124,11 +128,36 @@ ASSERT_FLOORS = {
 #: ``test_helpers.sh::test_summary``'s pass/fail protocol line, verbatim.
 _RESULTS_RE = re.compile(r'^Results: (\d+) passed, (\d+) failed$', re.MULTILINE)
 
-#: Kept strictly BELOW the ``timeout(360)`` marker so a hung bash test fails as
+#: Kept strictly BELOW the ``timeout(960)`` marker so a hung bash test fails as
 #: one clean pytest failure with its stdout/stderr captured, instead of
 #: pytest-timeout's thread method ``os._exit()``ing the whole xdist worker
-#: (``--max-worker-restart=0`` is set, so that death is unrecoverable).
-SUBPROC_TIMEOUT = 300
+#: (``--max-worker-restart=0`` is set, so that death is unrecoverable).  The 60s
+#: gap is what the post-kill recovery ``communicate(timeout=30)`` below spends,
+#: doubled; it is the reason the pair moves together and never independently.
+#:
+#: 300 → 900 on 2026-07-30 (task 3075 debug leg), because 300 was calibrated
+#: against a measurement that no longer holds.  It dated from when
+#: ``test_warm_lane_gc.sh`` ran 16.95s and the whole driver module 47s (see the
+#: README's wall-clock table).  Both of the two largest suites have since grown
+#: — ``test_warm_lane_audit.sh`` 225 asserts via task 3074's Block L,
+#: ``test_warm_lane_gc.sh`` 170 → 198 via task 3075's Block S — and dark-factory
+#: runs its verify legs on a host whose own concurrent lane fleet sits at
+#: loadavg ~120 on 32 cores.  RE-MEASURED there on 2026-07-30 at loadavg 124,
+#: the two run 128.3s and 190.2s at 2-way concurrency and BOTH PASS (198/198 and
+#: 228/228, exit 0); under the full 16-worker driver the same run exceeded 300s
+#: mid-block, with no ``FAIL:`` line, having reached ~67% and ~52% of their
+#: nominal block sequence — a ~3.5x and ~3.1x dilation, extrapolating to ~450s
+#: and ~580s to completion.  900 clears the worse of those with headroom.
+#:
+#: This is a resource ceiling, not an expectation: it is raised only against a
+#: re-measurement, never to make a red run green, and the arithmetic above is
+#: recorded so the next mover can check it rather than re-derive it.  The cost
+#: is bounded and one-sided — a genuinely hung suite now reports in 15 minutes
+#: instead of 5.  If the fleet-load figure keeps climbing, the sanctioned next
+#: lever is NOT another bump but the README's documented escape:
+#: ``git.offline_lane_commands``, which runs the ``warm_lane_bash`` bucket
+#: post-merge, off the verify hot path.
+SUBPROC_TIMEOUT = 900
 
 #: Host tools reify's originals hard-require with no skip guards.
 REQUIRED_HOST_TOOLS = ('bash', 'git', 'flock', 'du', 'dd', 'python3')
@@ -155,17 +184,38 @@ _HOSTILE_ENV_KEYS = ('GIT_DIR', 'GIT_WORK_TREE')
 #: read from the ambient environment.
 _HOSTILE_ENV_PREFIXES = ('REIFY_',)
 
-# ``timeout(360)``: pytest-timeout ranks a marker above both the ini ``timeout =
+# ``timeout(960)``: pytest-timeout ranks a marker above both the ini ``timeout =
 # 60`` and the ``--timeout=300`` every configured invocation passes on the CLI,
-# so a bare local ``pytest tests/warm-lane`` cannot silently get 60s.
+# so a bare local ``pytest tests/warm-lane`` cannot silently get 60s.  It must
+# stay strictly ABOVE ``SUBPROC_TIMEOUT`` — see that constant for why the pair
+# moved 360/300 → 960/900 together, and why moving either alone is a bug.
 # ``xdist_group``: reify classifies all of these as ``pool`` (serialised), and
 # ``lib_live_refs.sh`` walks ``/proc`` for live consumers, where a concurrently
 # running sibling's cwd could perturb a liveness probe.  ``--dist loadgroup`` is
 # already in addopts, so a shared group co-locates them on one worker while the
 # rest of the suite still runs in parallel.
+PYTEST_TIMEOUT = 960
+
+# The ordering the two constants' comments assert, made checkable instead of
+# merely stated.  Raising ``SUBPROC_TIMEOUT`` to or past the marker is the exact
+# footgun the marker exists to prevent — pytest-timeout would fire FIRST and
+# ``os._exit()`` the whole xdist worker under ``--max-worker-restart=0``, losing
+# every remaining item in this serialised group instead of failing one test with
+# its output captured.  A module-level assert, not a test: it must fire at
+# COLLECTION, before a mis-set pair can kill a worker, and it adds no pytest item
+# (the README's "12 pytest items … measured 47s" figure stays a true statement
+# about the same set).  The 30s margin is the post-kill recovery
+# ``communicate(timeout=30)`` in ``_run_bash_suite``, which must fit inside the
+# gap or the recovery is itself cut short by the marker.
+assert SUBPROC_TIMEOUT + 30 < PYTEST_TIMEOUT, (
+    f'SUBPROC_TIMEOUT ({SUBPROC_TIMEOUT}s) must leave more than the 30s post-kill '
+    f'recovery window below the pytest-timeout marker ({PYTEST_TIMEOUT}s); '
+    f'they move together, never independently.'
+)
+
 pytestmark = [
     pytest.mark.warm_lane_bash,
-    pytest.mark.timeout(360),
+    pytest.mark.timeout(PYTEST_TIMEOUT),
     pytest.mark.xdist_group('warm_lane_bash'),
 ]
 
@@ -334,7 +384,7 @@ def _run_bash_suite(name: str) -> tuple[int, str, str]:
             # ``Popen.communicate``'s ``TimeoutExpired`` carries no output (only
             # ``subprocess.run`` repopulates it), so the resumed call is what
             # recovers the captured tail.  Bounded: a pipe held open by a
-            # survivor must not turn this into the >360s pytest-timeout worker
+            # survivor must not turn this into the >960s pytest-timeout worker
             # kill that SUBPROC_TIMEOUT exists to stay clear of.
             try:
                 stdout, stderr = proc.communicate(timeout=30)

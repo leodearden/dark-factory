@@ -98,8 +98,9 @@
 #   0  — Completed sweep (best-effort; per-candidate failures warn + continue).
 #   1  — Runtime error: could not resolve required argument (e.g. base-target symlink).
 #   2  — Usage/WIRING error: unknown flag, missing subcommand, missing required
-#        option, or a missing sibling library (scripts/lib_live_refs.sh). The
-#        library case is a wiring error, not a runtime one: nothing about the
+#        option, or a missing sibling library (scripts/lib_live_refs.sh,
+#        scripts/lib_lane_state.sh). The library case is a wiring error, not a
+#        runtime one: nothing about the
 #        invocation could have avoided it and no retry will fix it — the
 #        deployment is incomplete. Same class as an unknown flag, hence 2.
 #
@@ -134,9 +135,29 @@
 #     that holds the lanes (so gc.sh's WORKTREES_DIR assignment is correct).
 #     Explicit --worktrees-dir / --base-target override the derived values, so the
 #     hermetic test harness continues to use arbitrary temp paths without change.
-#   - Reclaimability is computed purely from filesystem + git + flock; dark-factory
-#     FREE/ASSIGNED state is NOT consulted. "FREE/idle" ≈ no live consumer holding
-#     the lane flock (mirroring refresh-warm-base.sh reader-refcount GC).
+#   - Pass-1 reclaimability is decided by dark-factory's OWN durable lane record
+#     at <worktrees-dir>/.lane-state/<lane>.json, read PER LANE through
+#     scripts/lib_lane_state.sh (task 3075, reify esc-5334-6). `assigned` and
+#     `in_use` preserve the lane; `released`/`seed`/`registered`, `quarantined`,
+#     and every unknown, unreadable or corrupt reading fall through to the gates
+#     below and then to reclaim.
+#     This REPLACES the rule that stood here until task 3075 — "reclaimability is
+#     computed purely from filesystem + git + flock; dark-factory FREE/ASSIGNED
+#     state is NOT consulted; FREE/idle ≈ no live consumer holding the lane
+#     flock". That rule adopted the wrong repo boundary and was false in BOTH
+#     halves: the inv.2 flock is held only across the acquire reseed and across
+#     run_scoped_verification, never across the implement phase, so for most of
+#     an ASSIGNED lane's life the flock is free and task 5326's always-reclaim —
+#     written for "a FREE pool lane" — fired on lanes dark-factory had assigned
+#     to a live task. It is deleted rather than softened.
+#     FAIL-OPEN, and the direction is not negotiable: an unknown/unreadable/
+#     corrupt record reclaims. Preserving on unknown would freeze reclaim the
+#     moment .lane-state/ is absent or unreadable, re-creating the 2026-07-10
+#     ENOSPC accretion outage. A corrupt record additionally warns (see the
+#     record gate in Pass 1), because it means an assigned lane has silently
+#     degraded back to the pre-3075 regime; a merely ABSENT record does not,
+#     because that is the ordinary reading for every _iact-* and manual operator
+#     worktree and a per-entry warn would drown the signal.
 #   - inv.preserve shared predicate (_is_reclaimable): skip on dirty tracked changes
 #     (git status --porcelain), unlanded ahead-of-main (merge-base --is-ancestor),
 #     or live consumer (flock -n -x <dir>.lock fails).
@@ -154,13 +175,25 @@
 #     reused; committed work lives on refs/heads/task/NNNN and reset touches
 #     only target/, never the source tree or branch (sizing-lifecycle T1).
 #     Preserving a flock-free lane's target/ thus yields zero warm-cache value
-#     and only accretes disk. Pass 1 has exactly TWO preserve gates, checked in
-#     this order: (1) the live-consumer flock (inv.2), and (2) a live PROCESS
-#     REFERENCE at or under the lane dir (cwd / open fd / mmap — task 5572).
-#     This subsumes the former Tier-3 terminal-task reclaim
+#     and only accretes disk. Task 5326's rule survives VERBATIM for a lane that
+#     is genuinely FREE; what task 3075 changed is that FREE is now DETERMINED
+#     from dark-factory's record rather than APPROXIMATED from the flock.
+#     Pass 1 has THREE preserve gates, checked in this order: (1) the
+#     live-consumer flock (inv.2); (2) the durable LANE RECORD (task 3075);
+#     (3) a live PROCESS REFERENCE at or under the lane dir (cwd / open fd /
+#     mmap — task 5572). The record sits BETWEEN the other two because it is
+#     both the cheaper and the more decisive predicate — see the record gate's
+#     own note in Pass 1. This subsumes the former Tier-3 terminal-task reclaim
 #     (task 5167): the rebase-orphan ahead-of-main lane it targeted is now
 #     reclaimed by the general rule. Pass 2 keeps the clean+landed
 #     _is_reclaimable rule.
+#   - PASS 2 IS DELIBERATELY UNCHANGED — it does NOT read the lane record, and
+#     the scoping is substantive rather than an oversight. Pass 2's candidates
+#     are exactly the entries matching NEITHER --lane-glob NOR --protect-glob,
+#     i.e. not pool lanes, so the orchestrator mints no LaneLifecycle record for
+#     them by construction. A read there would be dead code that returns
+#     `unknown` for every candidate while implying a coverage that does not
+#     exist. live_ref_present remains their liveness guard (Block Q pins it).
 #   - Live-reference gate (task 5572, both passes): the inv.2 flock is held only
 #     across the ACQUIRE reseed, NOT across the consumer's long cargo verify
 #     build, so during that build the flock is FREE and always-reclaim would wipe
@@ -175,6 +208,18 @@
 #     snapshot, which would leave a lane that goes live mid-traversal
 #     unprotected across a 25-40 minute pass. Over-preserving is safe and
 #     TEMPORARY: a lingering reference costs one extra sweep.
+#     Since task 3075 it is Pass 1's LAST gate and the RECORDLESS FALLBACK
+#     (PRD warm-lane-infra-repatriation §D7): SUPERSEDED as the primary liveness
+#     oracle by the durable record, RETAINED because `_iact-*` and manual
+#     operator worktrees carry no record at all — and retained UNCONDITIONALLY
+#     for record-carrying lanes too. It is NOT gated on "record absent". Gating
+#     it that way would create a NEW under-preserving path: a lane whose record
+#     reads `released` while a straggler build process is still live would be
+#     reset — esc-5375-1 reopened, and precisely the failure class this work
+#     closes. Records are written at release time; processes can outlive the
+#     write. Running it for every lane the record did not already preserve costs
+#     nothing versus the pre-3075 behaviour, where it ran on every flock-free
+#     lane. (This answers PRD §11 open question 3, answered in place there too.)
 #   - COST REVERSAL, stated explicitly (task 5572 review). Moving from ONE batch
 #     /proc scan to a PER-ENTRY scan is O(entries × /proc), and the sweep comment
 #     this replaced called a per-entry scan "too costly for the hot path". That
@@ -196,6 +241,16 @@
 #       * awk's early exit only fires once EVERY candidate is found, so the
 #         common case (free entry, about to be reclaimed) always pays the full
 #         walk — and that is exactly the verdict that must be fresh.
+#     AMENDED by task 3075: every measurement above STANDS, but the per-lane
+#     budget changed and the reversal now runs the OTHER WAY. Pass 1 pays a ~1ms
+#     record read (one file read + a couple of seds) for EVERY lane, and the
+#     ~1.9s walk only for lanes the record did not already preserve — an
+#     ASSIGNED lane short-circuits before it. So the third bullet above ("in a
+#     pool at rest almost every lane is flock-free, budget for the full
+#     entries × 1.9s") is now the WORST case, reached when the pool is idle, and
+#     a BUSY pool gets cheaper the busier it is. That is the opposite direction
+#     to the reversal task 5572 had to accept, and it is bought with an
+#     AUTHORITATIVE predicate rather than a probe.
 #     What IS bought back, cheaply: live_ref_present short-circuits after the
 #     cwd/fd pass (~1.5s instead of ~1.9s for a live entry), and Pass 2 runs the
 #     ~18ms _is_reclaimable git pair BEFORE the walk so only an orphan that would
@@ -207,8 +262,9 @@
 #     (D8 reader-refcount seam; same contract as the acquire path).
 #   - Safety-ranked order: reset lanes first (cheap), then remove orphans (destructive).
 #   - Stdout: machine-readable summary line only —
-#     `reclaim: reset=N removed=N preserved=N preserved_live_ref=N`. New fields
-#     are APPENDED so prefix-matching consumers keep working.
+#     `reclaim: reset=N removed=N preserved=N preserved_live_ref=N
+#     preserved_assigned=N`. New fields are APPENDED so prefix-matching
+#     consumers keep working.
 #     Stderr: all diagnostics (info/ok/warn/err).
 
 set -euo pipefail
@@ -225,6 +281,26 @@ if [ ! -f "$SCRIPT_DIR/lib_live_refs.sh" ]; then
 fi
 # shellcheck source=scripts/lib_live_refs.sh
 source "$SCRIPT_DIR/lib_live_refs.sh"
+
+# Shared durable-lane-record reader (lane_state_read / lane_state_class), task
+# 3074. Pass 1's reclaimability gate consults dark-factory's own lane record
+# through it — see the Pass-1 record gate below. Fail LOUDLY if it is missing,
+# for the same reason as the guard above and with the same exit code: a
+# silently-absent lane-state reader would degrade reclaim back to exactly the
+# `FREE ≈ flock-free` approximation this dependency exists to remove, and would
+# do it invisibly. Exit 2 (usage/WIRING), not 1 (runtime) — nothing about the
+# invocation could have avoided it and no retry will fix it; the deployment is
+# incomplete, the same class as an unknown flag.
+#
+# Ordered AFTER the lib_live_refs.sh guard deliberately: a copy carrying neither
+# sibling must still report the live-refs one first, which is what Block A9's
+# asserted message pins.
+if [ ! -f "$SCRIPT_DIR/lib_lane_state.sh" ]; then
+    echo "warm-lane-gc.sh: ERROR — scripts/lib_lane_state.sh not found next to warm-lane-gc.sh" >&2
+    exit 2
+fi
+# shellcheck source=scripts/lib_lane_state.sh
+source "$SCRIPT_DIR/lib_lane_state.sh"
 
 # ── log helpers (all write to stderr) ─────────────────────────────────────────
 info()  { printf '\033[1;34m[info]\033[0m  %s\n' "$*" >&2; }
@@ -280,9 +356,13 @@ Usage: $(basename "$0") reclaim --mount WORKTREE_BASE [OPTIONS]
 
   Output:
     stdout: machine-readable summary:
-            reclaim: reset=N removed=M preserved=K preserved_live_ref=L
+            reclaim: reset=N removed=M preserved=K preserved_live_ref=L preserved_assigned=A
             (L is the share of K held back by a live process reference — the
              only preserve reason that can shield an entry indefinitely)
+            (A is the share of K held back by dark-factory's own durable lane
+             record reading assigned/in_use — the only preserve reason that is
+             AUTHORITATIVE rather than a probe, and one that self-clears when
+             the lane is released)
     stderr: all diagnostics.
 EOF
 }
@@ -478,6 +558,14 @@ _do_reclaim() {
     # per-entry `preserving <name>: live consumer (process reference)` warn on
     # stderr names WHICH entries, so an operator can find and clear the holder.
     local preserved_live_ref_count=0
+    # Sub-count of preserved_count attributable to the Pass-1 lane-record gate
+    # (task 3075). Reported SEPARATELY from preserved_live_ref_count, not folded
+    # into it, because the two shares mean opposite things about pool health: a
+    # rising preserved_assigned is a BUSY pool and self-clears the moment
+    # dark-factory releases the lane, whereas a rising preserved_live_ref can
+    # shield a lane INDEFINITELY. One combined number would hide a permanently
+    # shielded pool behind ordinary business.
+    local preserved_assigned_count=0
 
     info "warm-lane-gc.sh reclaim: worktrees_dir=$WORKTREES_DIR  base_target=$BASE_TARGET  main_ref=$MAIN_REF"
 
@@ -544,6 +632,102 @@ _do_reclaim() {
             warn "preserving $name: live consumer (flock held)"
             preserved_count=$((preserved_count + 1))
             continue
+        fi
+
+        # ── Pass-1 record gate (task 3075, reify esc-5334-6) ─────────────────
+        # Pass 1 has THREE preserve gates, checked in this order:
+        #   (1) the live-consumer flock (inv.2) — acquired above;
+        #   (2) THIS gate: dark-factory's own durable lane record at
+        #       <worktrees-dir>/.lane-state/<lane>.json;
+        #   (3) a live PROCESS REFERENCE at or under the lane dir (task 5572).
+        #
+        # The record is read BEFORE the /proc walk because it is BOTH the
+        # cheaper and the more decisive predicate — cheapest-decisive-first, the
+        # same rationale already documented for Pass 2's ordering. One file read
+        # + a couple of seds is ~1ms against the walk's measured ~1.9s, and its
+        # verdict is AUTHORITATIVE (dark-factory wrote it) rather than a probe.
+        # So an assigned lane short-circuits before the walk and a BUSY pool
+        # gets cheaper, not more expensive.
+        #
+        # Single-argument form deliberately: lane_state_read derives
+        # `<dirname of lane-dir>/.lane-state`, which for a lane at
+        # $WORKTREES_DIR/<name> is exactly $WORKTREES_DIR/.lane-state — the same
+        # path warm-lane-audit.sh computes as $MOUNT/.lane-state. No flag, no
+        # precomputed map, nothing marshalled in from a caller.
+        #
+        # PLACEMENT is load-bearing on four axes — the same shape as the
+        # live-reference gate note below:
+        #   - INSIDE the loop, immediately before the reset, resolved from THIS
+        #     lane's own path. Hoisting it above the loop — or precomputing a
+        #     state map, or accepting an `--assigned-lanes CSV` — reintroduces
+        #     exactly the up-front-snapshot TOCTOU this gate removes: one verdict
+        #     computed once, then consumed across a 25-40 minute lane-by-lane
+        #     traversal. That is not theoretical. warm-lane-gc-sweep.sh computed
+        #     its protect CSV once and consumed it across a sweep that ran
+        #     06:32-06:59 BST while _lane-5 dropped OUT of the protect set at
+        #     06:32; and that same sweep reset _lane-5 at 20:55Z while a task-5334
+        #     agent session started 20:36Z was live (PRD §2). Block S-toctou goes
+        #     RED against any such hoist.
+        #   - UNDER the flock this loop already holds, so the read and the reset
+        #     share one critical section and nothing can reassign the lane
+        #     between verdict and action.
+        #   - BEFORE both reset branches below (the --disk-pressure rm and the α
+        #     reseed), so neither path can bypass it — the same "before BOTH
+        #     branches" property Block K5 pins for the live-reference gate.
+        #   - AFTER the flock acquire, so a flock-held lane keeps its own
+        #     distinct diagnostic and all three preserve reasons stay
+        #     distinguishable in dark-factory's logs.
+        #
+        # This is a COST REVERSAL of the direction the header's existing COST
+        # REVERSAL note describes, and is stated rather than left to be inferred:
+        # an ASSIGNED lane now short-circuits BEFORE the ~1.9s walk, so the
+        # busier the pool the cheaper the pass — the opposite of what task 5572
+        # had to accept.
+        #
+        # FAIL-OPEN is load-bearing. lane_state_read reports `unknown` for a
+        # missing/unreadable/corrupt record, and UNKNOWN and QUARANTINED both
+        # fall through to the gates below and then to reclaim. Preserving on
+        # UNKNOWN would freeze reclaim the moment .lane-state/ is absent — the
+        # 2026-07-10 ENOSPC accretion outage, re-created.
+        lane_state_read "$lane" >/dev/null
+        local lane_class
+        lane_class="$(lane_state_class "$LANE_STATE_RAW")"
+        if [ "$lane_class" = "ASSIGNED" ]; then
+            exec 8>&-
+            # The `(state=<raw>)` suffix keeps the PRD-pinned prefix
+            # `preserving _lane-5: assigned to task 5334` matching as a
+            # substring while surfacing `in_use` vs `assigned` — the distinction
+            # leaf δ will begin writing and leaf ε depends on. A record with no
+            # task_id gets its OWN wording: `assigned to task ` with an empty id
+            # would be a dangling fact.
+            if [ -n "$LANE_STATE_TASK_ID" ]; then
+                warn "preserving $name: assigned to task $LANE_STATE_TASK_ID (state=$LANE_STATE_RAW)"
+            else
+                warn "preserving $name: assigned, no task id in record (state=$LANE_STATE_RAW)"
+            fi
+            preserved_count=$((preserved_count + 1))
+            preserved_assigned_count=$((preserved_assigned_count + 1))
+            continue
+        fi
+
+        # Deliberately ASYMMETRIC, and the asymmetry is the point.
+        # `no-readable-record` is the ORDINARY reading for every recordless
+        # `_iact-*` and manual operator worktree, so warning on it would emit a
+        # line per such entry per pass and train operators to ignore the
+        # channel. `unparseable-record` means the record IS there and something
+        # wrote it wrong — an assigned lane has silently degraded back to the
+        # pre-γ `FREE ≈ flock-free` regime, which is precisely the defect this
+        # gate removes. That must be visible and attributable (INV-2,
+        # structured-facts-at-failure) — and it must still NOT preserve: failing
+        # closed on a corrupt record would let one bad write freeze a lane out
+        # of reclaim forever.
+        #
+        # There is deliberately NO third branch for an unrecognized state:
+        # lib_lane_state.sh does not set that cause, deriving it instead from
+        # lane_state_class returning UNKNOWN for a non-empty raw, so there is no
+        # second copy of the recognized-state table here to drift.
+        if [ "${LANE_STATE_CAUSE:-}" = "unparseable-record" ]; then
+            warn "$name: lane-state record is present but unparseable-record — falling back to the /proc live-consumer scan for this lane"
         fi
 
         # Live-reference gate (task 5572). The flock above proves no consumer is
@@ -718,12 +902,14 @@ _do_reclaim() {
     done
 
     # ── Summary ───────────────────────────────────────────────────────────────
-    # preserved_live_ref is APPENDED, never interposed: existing consumers match
-    # the reset=/removed=/preserved= prefix, so a trailing field extends the line
-    # without breaking them.
-    printf 'reclaim: reset=%d removed=%d preserved=%d preserved_live_ref=%d\n' \
-        "$reset_count" "$removed_count" "$preserved_count" "$preserved_live_ref_count"
-    ok "reclaim complete: reset=$reset_count removed=$removed_count preserved=$preserved_count preserved_live_ref=$preserved_live_ref_count"
+    # preserved_live_ref and preserved_assigned are APPENDED, never interposed:
+    # existing consumers match the reset=/removed=/preserved= prefix (and the
+    # `preserved=N preserved_live_ref=M` adjacency), so a trailing field extends
+    # the line without breaking them.
+    printf 'reclaim: reset=%d removed=%d preserved=%d preserved_live_ref=%d preserved_assigned=%d\n' \
+        "$reset_count" "$removed_count" "$preserved_count" "$preserved_live_ref_count" \
+        "$preserved_assigned_count"
+    ok "reclaim complete: reset=$reset_count removed=$removed_count preserved=$preserved_count preserved_live_ref=$preserved_live_ref_count preserved_assigned=$preserved_assigned_count"
 }
 
 # ── dispatch ───────────────────────────────────────────────────────────────────

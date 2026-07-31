@@ -34,6 +34,23 @@ at that HEAD:
 | `test_warm_lane_gc.sh` | 1939 | `973fde7955` | 2026-07-28 |
 | `test_warm_lane_audit.sh` | 1999 | `973fde7955` | 2026-07-28 |
 
+`test_warm_lane_gc.sh` has since grown DARK-FACTORY-NATIVE coverage that has no
+reify counterpart, added by **task 3075** (PRD leaf γ) — the line count and SHA
+above still describe the ported baseline, not the current file:
+
+- **Block S** (23 asserts) — the durable lane record is Pass 1's reclaimability
+  gate. `S-basic` pins that an `assigned` lane survives with a FREE flock and no
+  `--extra-protect-glob` (the dark-factory ε shape); `S-reasons` pins the reason
+  vocabulary, the gate ORDER by attribution, and the appended
+  `preserved_assigned=` counter; `S-fallback` pins that the task-5572 `/proc`
+  scan is inherited as the recordless fallback and that
+  released/quarantined/corrupt all fall open; `S-toctou` pins PLACEMENT — a lane
+  assigned mid-pass is still preserved, so the read cannot be hoisted into an
+  up-front snapshot without going red.
+- **A10** (3 asserts) — the fail-loud guard for the new sibling
+  `lib_lane_state.sh`, with `lib_live_refs.sh` deliberately PRESENT in the
+  fixture so A9's guard cannot account for the result.
+
 ## Why these eight
 
 The port set was confirmed against **what α actually relocated**, not against a
@@ -246,13 +263,56 @@ Measured on an unloaded host, each `.sh` run directly and sequentially:
 | `test_provision_warm_lane_fs.sh` | 111 | 1.49s |
 | `test_warm_lane_gc_sweep.sh` | 86 | 6.73s |
 | `test_warm_lane_audit.sh` | 228 | 12.93s |
-| `test_warm_lane_gc.sh` | 170 | 16.95s |
-| **total** | **837** | **≈42s** |
+| `test_warm_lane_gc.sh` | 198 | 16.95s (stale — see below) |
+| **total** | **865** | **≈42s (stale)** |
 
 `test_warm_lane_gc.sh` dominates: 34 `git worktree add` calls, 33 `flock`
 acquisitions and `/proc/<pid>/{exe,cwd,fd,maps}` liveness walks. Under
 concurrent load these figures roughly double; the full driver module
 (12 pytest items, all co-located on one xdist worker) measured 47s.
+
+**"Roughly double" is the unloaded-host reading and it does NOT hold on a
+dark-factory verify host** — the correction is measured, not argued. This
+machine runs its own concurrent lane fleet at **loadavg ~120 on 32 cores**, and
+re-measured there on 2026-07-30 at **loadavg 124**, with the two largest suites
+run concurrently against each other, the dilation is **~10-15x**, not 2x:
+
+| Ported test | unloaded | at loadavg 124 | dilation |
+|---|---|---|---|
+| `test_warm_lane_audit.sh` | 12.93s | 190.2s (228 passed, 0 failed) | ~14.7x |
+| `test_warm_lane_gc.sh` | 16.95s | 128.3s (198 passed, 0 failed) | ~7.6x |
+
+Both **pass** at that load — this is a cost figure, not a failure. Per-block
+elapsed for `test_warm_lane_gc.sh` at loadavg 124 puts Block S (this leaf's
+addition) at **112.4s → 128.3s = 15.9s**, matching the ~+12s the plan budgeted
+for its four `run_helper reclaim` invocations, so the growth is accounted for
+and is not where the dilation comes from.
+
+This is what sized the driver's timeout pair. Under the full 16-worker driver
+on the same host, both suites blew the then-300s subprocess ceiling *mid-block
+with no `FAIL:` line* — `gc` having reached ~67% and `audit` ~52% of their
+nominal block sequence, a ~3.5x and ~3.1x further dilation extrapolating to
+~450s and ~580s to completion. `SUBPROC_TIMEOUT`/`@pytest.mark.timeout` were
+therefore re-calibrated 300/360 → **900/960** (task 3075 debug leg); the
+arithmetic is recorded on `SUBPROC_TIMEOUT` in the driver. Note the ranking
+inversion this table's unloaded column does not predict: under fleet load
+`test_warm_lane_audit.sh`, not `test_warm_lane_gc.sh`, is the binding suite.
+
+**The `test_warm_lane_gc.sh` wall-clock is OWED a re-measurement (task 3075).**
+Its assert count moved 170 → 198 when leaf γ added Block S and A10 (four new
+`run_helper reclaim` invocations, shaped to keep at most two `/proc`-walking
+lanes each). Two measurements exist, both on a heavily loaded host and so
+neither comparable to this table's unloaded baseline: **79.3s at loadavg
+109.67** and **128.3s at loadavg 124** (the latter with `test_warm_lane_audit.sh`
+running concurrently). They are recorded here as observations and deliberately
+NOT promoted into the table — and their spread, 79.3s to 128.3s for the same
+198 asserts at a nominally similar load, is itself the reason a loaded figure
+cannot stand in for an unloaded one. Writing either in as the new unloaded figure, or writing
+in an estimate dressed as a measurement, would put a false number on main —
+which is what this table exists to prevent, since its stated purpose is that
+the *measured* cost is what justified answering PRD §11 q4 with "the default
+orchestrator suite". Re-measure on an unloaded host and replace both the row
+and the total.
 
 For reference, the whole orchestrator suite with these included is ~253s for
 ~13,100 tests.
@@ -282,8 +342,19 @@ prohibitive, the sanctioned route is `git.offline_lane_commands` in
 `dark-factory-orchestrator.yaml`, which runs a marker-selected bucket
 post-merge, off the verify hot path.
 
-Each item carries `@pytest.mark.timeout(360)` with an inner subprocess timeout
-of 300s. The marker is required because `orchestrator/pyproject.toml` sets
+**This escape is now the next lever, and the timeout bump was not a substitute
+for it.** The 300/360 → 900/960 re-calibration bought headroom against a
+*measured* fleet-load dilation; it did not make the bucket cheaper, and the
+whole `warm_lane_bash` group is serialised on one xdist worker by design (see
+`xdist_group` below), so its cost is additive on the verify hot path. A future
+bump is the wrong answer — if these figures climb again, take the escape.
+
+Each item carries `@pytest.mark.timeout(960)` with an inner subprocess timeout
+of 900s (raised from 360/300 on 2026-07-30 — rationale and arithmetic on
+`SUBPROC_TIMEOUT`). The two move together and never independently: the marker
+must stay strictly above the subprocess timeout, and the 60s gap is the
+post-kill recovery `communicate(timeout=30)` doubled. The marker is required
+because `orchestrator/pyproject.toml` sets
 `timeout = 60` with `timeout_method = "thread"` and `--max-worker-restart=0`: a
 bare local `pytest tests/warm-lane` would otherwise get 60s, and an over-limit
 item `os._exit()`s its whole xdist worker. Keeping the subprocess timeout
