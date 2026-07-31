@@ -32,12 +32,20 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 __all__ = [
     'RUN_STAMP_ENV_VAR',
@@ -79,6 +87,23 @@ trailing baseline window by sorting filenames, the same string-comparison
 convention ``canary.load_window_rows`` uses.
 """
 
+_STAMP_PATTERN = re.compile(r'[0-9]{8}T[0-9]{6}Z')
+"""The rendered shape of :data:`_STAMP_FORMAT` — ENFORCED, not assumed.
+
+The equivalence above is load-bearing in two places, the ``sorted()`` that finds
+the trailing window and the ``<`` that cuts the current run out of it, and it
+holds only for a fixed-width, zero-padded, single-timezone rendering.
+``'2026-07-04T03:15:00Z'`` is a perfectly reasonable-looking stamp that sorts
+BEFORE every ``2026…`` one, so a caller who supplies it gets an empty or
+contaminated baseline window and no error at all — a declared invariant nothing
+checks is exactly the silent degradation this module argues against everywhere
+else. So it is checked at each boundary a stamp can enter from: the schema
+field, the env override, the write-time override and the window cutoff.
+
+``[0-9]`` rather than ``\\d``: ``\\d`` also matches non-ASCII digits, which
+render as a plausible stamp and sort nowhere near their ASCII equivalents.
+"""
+
 _WHOLE_NUMBER_TOL = 1e-9
 """Relative slack when asking "is this float a whole number?".
 
@@ -97,6 +122,28 @@ class MetricSchemaError(ValueError):
     underlying ``pydantic.ValidationError`` is always chained as ``__cause__``,
     so the field-level detail is never lost.
     """
+
+
+def _validate_stamp(stamp: str, *, what: str) -> str:
+    """Return *stamp* if it matches :data:`_STAMP_PATTERN`, else raise.
+
+    Raises :class:`MetricSchemaError` — the module's one error type — so a
+    malformed stamp reads the same to a caller wherever it entered from, and so
+    a runner still catches a single exception without importing pydantic. Inside
+    the schema's field validator that surfaces as the usual
+    ``MetricSchemaError`` via :func:`_coerce_series`, because it is a
+    ``ValueError`` and pydantic wraps it like any other.
+    """
+    if _STAMP_PATTERN.fullmatch(stamp) is None:
+        raise MetricSchemaError(
+            f'{what} {stamp!r} is not a {_STAMP_FORMAT} run stamp (expected '
+            f'/{_STAMP_PATTERN.pattern}/, e.g. 20260704T031500Z). Artifact filenames '
+            'carry the stamp and every window operation orders and cuts runs by '
+            'comparing those filenames as strings, so a differently-shaped stamp '
+            'sorts into the wrong place — an empty or a contaminated baseline, with '
+            'nothing to signal which.'
+        )
+    return stamp
 
 
 def _is_whole(value: float) -> bool:
@@ -259,6 +306,17 @@ class MetricSeries(BaseModel):
     corpus: Corpus
     metrics: list[Metric]
 
+    @field_validator('run_stamp')
+    @classmethod
+    def _check_stamp_shape(cls, value: str) -> str:
+        # The series' own stamp becomes its filename, and the whole baseline
+        # window is ordered and cut by comparing those filenames as strings
+        # (see _STAMP_PATTERN). Checking the shape here rather than only at the
+        # write call makes it a property of the schema, so an artifact that
+        # sorts into the wrong place cannot be constructed, written OR read
+        # back — one rule instead of a guard per entry point.
+        return _validate_stamp(value, what='run_stamp')
+
     @model_validator(mode='after')
     def _check_unique_metric_ids(self) -> MetricSeries:
         # Uniqueness can only be checked with the whole list in view. It is
@@ -352,10 +410,15 @@ def run_stamp(*, env_var: str = RUN_STAMP_ENV_VAR) -> str:
 
     Honours *env_var* first (see :data:`RUN_STAMP_ENV_VAR`), else the current
     UTC time in :data:`_STAMP_FORMAT`.
+
+    An override that is not a :data:`_STAMP_PATTERN` stamp raises
+    :class:`MetricSchemaError` here, at the one place an operator-supplied
+    string enters the module, rather than becoming a filename that sorts wrong
+    for the rest of the programme.
     """
     override = os.environ.get(env_var)
     if override:
-        return override
+        return _validate_stamp(override, what=f'${env_var}')
     return datetime.now(UTC).strftime(_STAMP_FORMAT)
 
 
@@ -454,10 +517,16 @@ def write_metric_series(
     half-artifact for the evaluator to trip over later.
 
     *stamp* defaults to the series' own ``run_stamp``, so the filename and the
-    payload agree unless a caller deliberately overrides it.
+    payload agree unless a caller deliberately overrides it. An override gets
+    the same shape check the schema applies to ``run_stamp`` — it is going into
+    a filename the window loader will order and cut by string comparison, and
+    overriding is precisely how a caller sidesteps the validated field.
     """
     model = _coerce_series(series)
-    effective_stamp = stamp if stamp is not None else model.run_stamp
+    if stamp is None:
+        effective_stamp = model.run_stamp  # already shape-checked by the schema
+    else:
+        effective_stamp = _validate_stamp(stamp, what='stamp override')
     metrics_path = metrics_artifact_path(root, model.eval_id, effective_stamp)
     report_path = report_artifact_path(root, model.eval_id, effective_stamp)
     metrics_path.parent.mkdir(parents=True, exist_ok=True)
@@ -514,7 +583,18 @@ def load_series_window(
     The exclusion runs BEFORE the ``[-limit:]`` slice, so asking for *limit*
     runs yields *limit* runs. Filtering after slicing would return a window one
     short and quietly shrink the evidence base with nothing to signal it.
+
+    A *before_stamp* that is not a :data:`_STAMP_PATTERN` stamp raises
+    :class:`MetricSchemaError` rather than cutting the window somewhere
+    arbitrary: the cutoff is a string comparison, so a differently-shaped stamp
+    does not fail, it just silently selects the wrong runs.
     """
+    # Before the missing-directory short-circuit, so a malformed cutoff is
+    # refused whether or not the eval happens to have run yet — otherwise the
+    # first run of a new eval would swallow the bad argument and only the
+    # second would report it.
+    if before_stamp is not None:
+        _validate_stamp(before_stamp, what='before_stamp')
     eval_dir = Path(root) / eval_id
     if not eval_dir.is_dir():
         return []

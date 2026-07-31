@@ -514,3 +514,122 @@ class TestSeriesWindowLoader:
         self._seed(tmp_path, ['20260701T031500Z'])
         with pytest.raises(TypeError):
             load_series_window(tmp_path, 'e1-retrieval-health', limit=3)  # type: ignore[call-arg]
+
+
+# Plausible-looking stamps that are not `%Y%m%dT%H%M%SZ`. Every one of them
+# sorts somewhere other than where its date says, and none of them is exotic:
+# the ISO-8601 spelling is what most callers would reach for first.
+_MISSHAPEN_STAMPS = [
+    '2026-07-04T03:15:00Z',  # ISO-8601 with separators — sorts before every 2026… stamp
+    '20260704T031500',  # no trailing Z
+    '20260704031500Z',  # no T
+    '2026074T031500Z',  # month not zero-padded, so ordering breaks at the boundary
+    '20260704T0315Z',  # seconds dropped — a different width
+    '20260704T031500Z ',  # trailing whitespace, invisible in a diff
+    'latest',  # a symbolic name
+    '',  # empty
+]
+
+
+class TestStampShapeIsEnforcedNotAssumed:
+    """The lexicographic-order-is-chronological-order invariant, made checkable.
+
+    ``_STAMP_FORMAT``'s docstring has always DECLARED that the stamp is
+    fixed-width zero-padded UTC, and both window operations rely on it — the
+    ``sorted()`` that finds the trailing runs and the ``<`` that cuts the
+    current one out. Nothing checked it. A differently-shaped stamp does not
+    fail, it just sorts somewhere else: ``'2026-07-04T03:15:00Z'`` orders before
+    EVERY ``20260…`` stamp, so it silently yields an empty baseline (as a
+    cutoff) or a contaminated one (as a filename). That is the silent
+    degradation this module argues against everywhere else, so the shape is now
+    refused at each boundary a stamp can enter from.
+    """
+
+    @pytest.mark.parametrize('stamp', _MISSHAPEN_STAMPS)
+    def test_the_schema_refuses_a_misshapen_run_stamp(self, stamp):
+        # On the field, so an artifact that sorts into the wrong place cannot be
+        # constructed, written OR read back — one rule, not a guard per caller.
+        with pytest.raises(MetricSchemaError):
+            validate_metric_series(_make_series(run_stamp=stamp))
+
+    @pytest.mark.parametrize('stamp', _MISSHAPEN_STAMPS)
+    def test_the_env_override_is_refused_at_the_source(self, stamp, monkeypatch):
+        # The one place an operator-supplied string enters the module. Refusing
+        # it here means the bad stamp never becomes a filename in the first
+        # place, so the failure names the env var rather than a mystery window.
+        monkeypatch.setenv('MEMORY_EVAL_RUN_STAMP', stamp)
+        if not stamp:
+            # An empty override is falsy, so it means "unset" — not a stamp at
+            # all — and legitimately falls through to the clock.
+            assert re.fullmatch(r'[0-9]{8}T[0-9]{6}Z', run_stamp())
+            return
+        with pytest.raises(MetricSchemaError) as exc_info:
+            run_stamp()
+        assert 'MEMORY_EVAL_RUN_STAMP' in str(exc_info.value)
+
+    @pytest.mark.parametrize('stamp', _MISSHAPEN_STAMPS)
+    def test_a_write_time_stamp_override_is_refused(self, tmp_path, stamp):
+        # Overriding is exactly how a caller sidesteps the validated field, so
+        # the override gets the same check — and, like every other malformed
+        # write, leaves nothing behind.
+        with pytest.raises(MetricSchemaError):
+            write_metric_series(_make_series(), tmp_path, stamp=stamp)
+        assert not (tmp_path / 'e1-retrieval-health').exists()
+
+    @pytest.mark.parametrize('stamp', _MISSHAPEN_STAMPS)
+    def test_a_misshapen_before_stamp_is_refused_rather_than_cutting_arbitrarily(
+        self, tmp_path, stamp
+    ):
+        (tmp_path / 'e1-retrieval-health').mkdir()
+        write_metric_series(_make_series(), tmp_path)
+        with pytest.raises(MetricSchemaError):
+            load_series_window(tmp_path, 'e1-retrieval-health', limit=3, before_stamp=stamp)
+
+    @pytest.mark.parametrize('stamp', _MISSHAPEN_STAMPS)
+    def test_a_misshapen_before_stamp_is_refused_even_when_the_eval_never_ran(
+        self, tmp_path, stamp
+    ):
+        """Validated BEFORE the missing-directory short-circuit.
+
+        Otherwise the first run of a new eval swallows the bad argument and only
+        the second one reports it — a bug that surfaces a day late, in a
+        different run, with nothing pointing back at the caller.
+        """
+        with pytest.raises(MetricSchemaError):
+            load_series_window(tmp_path, 'never-ran', limit=3, before_stamp=stamp)
+
+    def test_the_error_names_the_shape_it_wanted(self, tmp_path):
+        # structured-facts-at-failure: the message must be actionable without
+        # opening the module, so it carries the offending value AND the format.
+        with pytest.raises(MetricSchemaError) as exc_info:
+            load_series_window(
+                tmp_path, 'e1-retrieval-health', limit=3, before_stamp='2026-07-04T03:15:00Z'
+            )
+        message = str(exc_info.value)
+        assert '2026-07-04T03:15:00Z' in message
+        assert '%Y%m%dT%H%M%SZ' in message
+        assert 'before_stamp' in message
+
+    def test_a_non_ascii_digit_stamp_is_refused(self):
+        """``\\d`` would accept this; ``[0-9]`` does not.
+
+        Arabic-Indic digits render as a plausible stamp and sort nowhere near
+        their ASCII equivalents, so this is the same wrong-window failure in a
+        shape a reviewer would never spot by eye.
+        """
+        with pytest.raises(MetricSchemaError):
+            validate_metric_series(_make_series(run_stamp='٢٠٢٦٠٧٠٤T٠٣١٥٠٠Z'))
+
+    def test_a_well_formed_stamp_still_passes_everywhere(self, tmp_path):
+        # The guard must not be so tight that the real thing fails: one stamp
+        # through all four boundaries.
+        monkeypatch_free_stamp = '20260704T031500Z'
+        validate_metric_series(_make_series(run_stamp=monkeypatch_free_stamp))
+        path, _ = write_metric_series(_make_series(), tmp_path, stamp=monkeypatch_free_stamp)
+        assert path.name == f'metrics-{monkeypatch_free_stamp}.json'
+        assert (
+            load_series_window(
+                tmp_path, 'e1-retrieval-health', limit=3, before_stamp='20260705T031500Z'
+            )
+            != []
+        )
