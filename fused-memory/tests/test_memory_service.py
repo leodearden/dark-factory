@@ -8890,3 +8890,338 @@ class TestGetMem0DeletionTombstone:
         service.mem0.get_point_by_id = AsyncMock(side_effect=TimeoutError('qdrant timed out'))
         with pytest.raises(TimeoutError):
             await service.get_memory_by_id(project_id='dark_factory', memory_id='mem-victim')
+
+
+# --- Mem0 metadata vocabulary validation at the write seam (task 3195, leaf β) ---
+
+_MM_UUID = '3f2504e0-4f89-11d3-9a0c-0305e82c3301'
+_MM_CENSUS_LOGGER = 'fused_memory.services.memory_metadata_census'
+
+
+def _mm_install_journal(svc):
+    """Install a mock write journal on *svc* and return it.
+
+    REQUIRED SETUP, not redundant boilerplate — do not delete it.
+    ``MemoryService.__init__`` sets ``self._write_journal = None`` and only
+    ``set_write_journal()`` populates it, which the shared ``service``
+    fixture never calls. Without this install the entire
+    ``if self._write_journal:`` write-ahead-intent branch is DEAD under the
+    fixture, so any ``log_mem0_intent.assert_not_called()`` would either
+    raise AttributeError on None or pass for the wrong reason — proving
+    nothing about rejection ordering while looking like it did.
+
+    An ``AsyncMock`` rather than a ``MagicMock`` with hand-picked async
+    attributes, because the success path also awaits ``resolve_mem0_intent``
+    and ``log_write_op``; a bare MagicMock would return non-awaitables there
+    and fail the positive control for an unrelated reason.
+    """
+    journal = AsyncMock()
+    svc.set_write_journal(journal)
+    return journal
+
+
+async def _mm_write(svc, entry_point, *, metadata, category='observations_and_summaries',
+                    project_id='dark_factory', agent_id='claude-task-3195'):
+    """Drive one write through either seam.
+
+    D8/§2 pin enforcement at the SERVICE seam precisely so
+    ``add_system_record`` cannot bypass it, so every case runs against both.
+    """
+    if entry_point == 'add_memory':
+        return await svc.add_memory(
+            content='some content',
+            category=category,
+            project_id=project_id,
+            agent_id=agent_id,
+            metadata=metadata,
+            causation_id='c1',
+        )
+    svc.mem0.add_system_record = AsyncMock(return_value={'results': [{'id': 'sys-1'}]})
+    return await svc.add_system_record(
+        content='some content',
+        project_id=project_id,
+        agent_id=agent_id,
+        category=category,
+        metadata=metadata,
+        causation_id='c1',
+    )
+
+
+def _mm_backend_mock(svc, entry_point):
+    return svc.mem0.add if entry_point == 'add_memory' else svc.mem0.add_system_record
+
+
+def _mm_backend_meta(svc, entry_point):
+    """The metadata dict the backend actually received."""
+    return _mm_backend_mock(svc, entry_point).call_args.kwargs['metadata']
+
+
+def _mm_census_codes(caplog):
+    codes = []
+    for record in caplog.records:
+        message = record.getMessage()
+        if 'memory_metadata.schema_warning' not in message:
+            continue
+        for token in message.split():
+            if token.startswith('code='):
+                codes.append(token.removeprefix('code='))
+    return codes
+
+
+_MM_ENTRY_POINTS = ['add_memory', 'add_system_record']
+
+
+class TestMemoryMetadataValidationAtSeam:
+    """PRD V1 enforcement at the MemoryService write seam (task 3195, leaf β)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_valid_metadata_round_trips_to_the_backend(self, service, entry_point):
+        """Every caller-supplied key survives alongside the server stamps."""
+        await _mm_write(service, entry_point, metadata={
+            'topic': 'a-good-slug',
+            'canonical': True,
+            'kind': 'cycle_summary',
+            'parent_id': _MM_UUID,
+            'task_id': '3195',
+            'x_experimental': 'ok',
+        })
+        meta = _mm_backend_meta(service, entry_point)
+        assert meta['topic'] == 'a-good-slug'
+        assert meta['canonical'] is True
+        assert meta['kind'] == 'cycle_summary'
+        assert meta['parent_id'] == _MM_UUID
+        assert meta['task_id'] == '3195'
+        assert meta['x_experimental'] == 'ok'
+        assert meta['category'] == 'observations_and_summaries'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_scalar_supersedes_is_normalized_before_the_backend(
+        self, service, entry_point
+    ):
+        """The observable that proves the β-before-γ hazard is closed.
+
+        harness.py:1167 writes a scalar today and γ (which migrates it) lands
+        AFTER β. If the seam rejected — or passed through — the scalar form,
+        the window between the two leaves would either break the recon
+        harness's own writes or leave the list contract unmet.
+        """
+        await _mm_write(service, entry_point, metadata={'supersedes': _MM_UUID})
+        assert _mm_backend_meta(service, entry_point)['supersedes'] == [_MM_UUID]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_default_config_warns_and_proceeds_on_a_bad_slug(
+        self, service, entry_point, caplog
+    ):
+        """THE census-refuted-premise safety default.
+
+        This is the regression that would otherwise silently take the fleet
+        down when someone flips a default: 98 of 352 distinct live `topic`
+        values are snake_case, so a shipped-on enforce would reject a large
+        slice of real traffic on day one.
+        """
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+        assert service.config.memory_metadata.enforce is False
+
+        await _mm_write(service, entry_point, metadata={'topic': 'bad_slug'})
+
+        _mm_backend_mock(service, entry_point).assert_awaited_once()
+        assert 'invalid_topic_slug' in _mm_census_codes(caplog)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_enforce_rejects_before_any_backend_call(self, service, entry_point):
+        from fused_memory.memory_metadata import MemoryMetadataValidationError
+
+        service.config.memory_metadata.enforce = True
+        with pytest.raises(MemoryMetadataValidationError):
+            await _mm_write(service, entry_point, metadata={'topic': 'bad_slug'})
+        _mm_backend_mock(service, entry_point).assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_enforce_rejects_before_the_write_ahead_intent(self, service):
+        """A rejected write must leave NO pending intent to reconcile.
+
+        ``recover_mem0_intents`` reconciles pending intents at startup, so a
+        rejection raised after the intent was journalled would convert a
+        clean structured rejection into permanent store-reconciliation debt.
+
+        add_memory only: ``add_system_record`` has no write-ahead intent — it
+        goes straight to ``_journaled_backend_call`` — so its equivalent
+        "no persistence side effect" observable is asserted separately below.
+        """
+        from fused_memory.memory_metadata import MemoryMetadataValidationError
+
+        journal = _mm_install_journal(service)
+        service.config.memory_metadata.enforce = True
+
+        with pytest.raises(MemoryMetadataValidationError):
+            await _mm_write(service, 'add_memory', metadata={'topic': 'bad_slug'})
+
+        journal.log_mem0_intent.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_positive_control_valid_write_does_log_the_intent(self, service):
+        """Without this, `not_called` cannot distinguish "rejected before the
+        intent" from "the branch never runs at all"."""
+        journal = _mm_install_journal(service)
+        await _mm_write(service, 'add_memory', metadata={'topic': 'a-good-slug'})
+        journal.log_mem0_intent.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_enforce_rejects_before_add_system_record_journals_anything(self, service):
+        from fused_memory.memory_metadata import MemoryMetadataValidationError
+
+        journal = _mm_install_journal(service)
+        service.config.memory_metadata.enforce = True
+
+        with pytest.raises(MemoryMetadataValidationError):
+            await _mm_write(service, 'add_system_record', metadata={'topic': 'bad_slug'})
+
+        journal.log_backend_op.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_kind_registry_carve_out_is_real(self, service, entry_point, caplog):
+        """`enforce=True` + `enforce_kind_registry=False`: unknown kind warns
+        and PROCEEDS, while a bad slug in the same call still raises.
+
+        The carve-out has to be checked in one call, not two: a validator
+        that simply downgraded everything under the kind flag would pass two
+        separate tests while silently disabling the shape checks too.
+        """
+        from fused_memory.memory_metadata import MemoryMetadataValidationError
+
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+        service.config.memory_metadata.enforce = True
+        service.config.memory_metadata.enforce_kind_registry = False
+
+        await _mm_write(service, entry_point, metadata={'kind': 'invented_kind_xyz'})
+        _mm_backend_mock(service, entry_point).assert_awaited_once()
+        assert 'unknown_kind' in _mm_census_codes(caplog)
+
+        with pytest.raises(MemoryMetadataValidationError):
+            await _mm_write(service, entry_point, metadata={
+                'kind': 'invented_kind_xyz', 'topic': 'bad_slug',
+            })
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_unknown_key_censuses_but_x_prefixed_key_is_silent(
+        self, service, entry_point, caplog
+    ):
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+
+        await _mm_write(service, entry_point, metadata={'totally_novel_key': 1})
+        assert 'unknown_key' in _mm_census_codes(caplog)
+
+        caplog.clear()
+        await _mm_write(service, entry_point, metadata={'x_novel': 1})
+        assert _mm_census_codes(caplog) == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_validation_runs_after_the_existing_tagging_helpers(
+        self, service, entry_point, caplog
+    ):
+        """A cycle_summary write must not census-warn on the SERVER's own stamps.
+
+        ``_apply_cycle_summary_metadata_tagging`` writes recon_pool/run_id
+        into meta. Validating before it would either warn on the server's own
+        fields or force a second copy of the server-stamped key list, so the
+        ordering is a real contract rather than an implementation detail.
+        """
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+
+        await _mm_write(service, entry_point, metadata={
+            'kind': 'cycle_summary', 'run_id': 'r1',
+        })
+        meta = _mm_backend_meta(service, entry_point)
+        assert 'recon_pool' in meta, 'the tagging helper must have run'
+        assert 'unknown_key' not in _mm_census_codes(caplog)
+
+    @pytest.mark.asyncio
+    async def test_graphiti_primary_writes_are_validated_too(self, service, caplog):
+        """V1 covers the SEAM, not just the Mem0 branch.
+
+        `entities_and_relations` never reaches Mem0, so a validator wired
+        into the Mem0 branch instead of the seam would leave this whole
+        category unvalidated and uncensused.
+        """
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+
+        await _mm_write(
+            service, 'add_memory',
+            category='entities_and_relations',
+            metadata={'topic': 'bad_slug'},
+        )
+        service.mem0.add.assert_not_called()
+        assert 'invalid_topic_slug' in _mm_census_codes(caplog)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_storm_crossing_files_one_escalation_naming_the_writer(
+        self, service, entry_point
+    ):
+        """The INV-4 escape: a drifting writer is heard, not logged into oblivion."""
+        filed = []
+
+        def _fake_filer(project_root, *, project_id, agent_id, keys):
+            filed.append((project_id, agent_id, list(keys)))
+            return 'esc-memory-metadata-unknown-key-storm-1'
+
+        crossing = MagicMock()
+        crossing.record = MagicMock(return_value=True)
+        service._metadata_storm_detector = crossing
+
+        with patch.object(memory_service, 'file_unknown_key_storm_escalation', _fake_filer):
+            await _mm_write(
+                service, entry_point,
+                metadata={'drifting_key': 1},
+                agent_id='claude-drifter',
+            )
+
+        assert len(filed) == 1
+        project_id, agent_id, keys = filed[0]
+        assert project_id == 'dark_factory'
+        assert agent_id == 'claude-drifter'
+        assert keys == ['drifting_key']
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_no_storm_no_escalation(self, service, entry_point):
+        with patch.object(memory_service, 'file_unknown_key_storm_escalation') as filer:
+            await _mm_write(service, entry_point, metadata={'drifting_key': 1})
+        filer.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_detector_is_built_once_per_service(self, service):
+        """Process-lifetime state: counts survive across writes.
+
+        A detector rebuilt per write would reset its window every time and
+        could never reach the threshold — the storm escape would be dead code
+        that still looked wired up.
+        """
+        from fused_memory.services.memory_metadata_census import UnknownKeyStormDetector
+
+        assert isinstance(service._metadata_storm_detector, UnknownKeyStormDetector)
+        before = service._metadata_storm_detector
+        await _mm_write(service, 'add_memory', metadata={'a_novel_key': 1})
+        assert service._metadata_storm_detector is before
+
+    @pytest.mark.asyncio
+    async def test_enforce_flag_is_read_per_call_not_cached(self, service):
+        """A config reload must take effect on the NEXT write.
+
+        Caching the flag at __init__ would make the red-tier restart
+        requirement worse than documented: even a restart-free reload path
+        that did land the value would be ignored.
+        """
+        from fused_memory.memory_metadata import MemoryMetadataValidationError
+
+        await _mm_write(service, 'add_memory', metadata={'topic': 'bad_slug'})
+        service.config.memory_metadata.enforce = True
+        with pytest.raises(MemoryMetadataValidationError):
+            await _mm_write(service, 'add_memory', metadata={'topic': 'bad_slug'})
