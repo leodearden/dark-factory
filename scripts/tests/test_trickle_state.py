@@ -24,8 +24,12 @@ The three outcomes:
 """
 from __future__ import annotations
 
+import tempfile
+from pathlib import Path
+
 import pytest
 
+from legibility import trickle_state
 from legibility.trickle_state import (
     OUTCOME_BARREN,
     OUTCOME_PRODUCTIVE,
@@ -160,3 +164,109 @@ class TestQuietNightNeverBarren:
             f"door is exactly the 'genuinely quiet night' decision 7 "
             f"protects and must never alarm."
         )
+
+
+class TestTrickleStatePath:
+    """Where the state file lives — and, just as load-bearing, where it
+    does NOT.
+
+    Rooted at ``${XDG_STATE_HOME:-~/.local/state}/dark-factory/legibility/
+    <project_id>/trickle-state.json``, re-deriving
+    ``orchestrator.mcp_lifecycle.managed_runtime_data_dirs``'s scheme
+    (task 2439). Never under ``docs/legibility/``: that path is
+    git-TRACKED, and a file rewritten EVERY night on a tracked path would
+    either leave the machine-operated project_root checkout permanently
+    dirty or force a nightly commit — which would make "the repo has a
+    commit today" a valid liveness signal and CONTRADICT PRD decision 7
+    outright.
+    """
+
+    def test_uses_xdg_state_home_when_set(self, tmp_path, monkeypatch):
+        monkeypatch.setenv('XDG_STATE_HOME', str(tmp_path))
+        result = trickle_state.trickle_state_path('dark_factory')
+        assert result == (
+            tmp_path / 'dark-factory' / 'legibility' / 'dark_factory'
+            / 'trickle-state.json'
+        )
+
+    def test_falls_back_under_home_local_state(self, tmp_path, monkeypatch):
+        monkeypatch.delenv('XDG_STATE_HOME', raising=False)
+        fake_home = tmp_path / 'home' / 'someone'
+        monkeypatch.setattr(Path, 'home', classmethod(lambda cls: fake_home))
+
+        result = trickle_state.trickle_state_path('dark_factory')
+
+        assert result == (
+            fake_home / '.local' / 'state' / 'dark-factory' / 'legibility'
+            / 'dark_factory' / 'trickle-state.json'
+        )
+
+    def test_empty_xdg_state_home_is_treated_as_unset(self, tmp_path, monkeypatch):
+        """An empty env var is the classic systemd `Environment=` foot-gun:
+        `XDG_STATE_HOME=` set-but-empty must fall back, not resolve to the
+        filesystem root."""
+        monkeypatch.setenv('XDG_STATE_HOME', '')
+        fake_home = tmp_path / 'home' / 'someone'
+        monkeypatch.setattr(Path, 'home', classmethod(lambda cls: fake_home))
+
+        result = trickle_state.trickle_state_path('dark_factory')
+
+        assert result == (
+            fake_home / '.local' / 'state' / 'dark-factory' / 'legibility'
+            / 'dark_factory' / 'trickle-state.json'
+        )
+
+    def test_distinct_projects_never_collide(self, tmp_path, monkeypatch):
+        monkeypatch.setenv('XDG_STATE_HOME', str(tmp_path))
+        a = trickle_state.trickle_state_path('dark_factory')
+        b = trickle_state.trickle_state_path('reify')
+        assert a != b
+        assert a.parent != b.parent
+
+    def test_no_home_degrades_to_tempdir_instead_of_raising(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """A stripped daemon/CI environment with no HOME (and no pwd entry)
+        makes Path.home() raise RuntimeError. The probe must still produce
+        a verdict, never a traceback — mirroring
+        managed_runtime_data_dirs' identical degradation (task 2439
+        amendment)."""
+        monkeypatch.delenv('XDG_STATE_HOME', raising=False)
+
+        def _no_home(cls):
+            raise RuntimeError('Could not determine home directory.')
+
+        monkeypatch.setattr(Path, 'home', classmethod(_no_home))
+
+        with caplog.at_level('WARNING'):
+            result = trickle_state.trickle_state_path('dark_factory')
+
+        assert result == (
+            Path(tempfile.gettempdir()) / 'dark-factory' / 'legibility'
+            / 'dark_factory' / 'trickle-state.json'
+        )
+        assert any(r.levelname == 'WARNING' for r in caplog.records), (
+            'the temp-dir degradation must be announced, not silent'
+        )
+
+    def test_state_path_is_outside_any_repo_checkout(self, tmp_path, monkeypatch):
+        """The location property that motivated the whole choice: the state
+        file must never dirty a machine-operated checkout, and must never
+        become a git signal."""
+        monkeypatch.delenv('XDG_STATE_HOME', raising=False)
+        fake_home = tmp_path / 'home' / 'someone'
+        monkeypatch.setattr(Path, 'home', classmethod(lambda cls: fake_home))
+
+        result = trickle_state.trickle_state_path('dark_factory')
+
+        worktree_root = Path(__file__).resolve().parent.parent.parent
+        parents = list(result.parents)
+        assert worktree_root not in parents, (
+            f'{result} lives inside the checkout at {worktree_root}; a file '
+            f'rewritten every night must not dirty a machine-operated tree'
+        )
+        parts = result.parts
+        assert not any(
+            parts[i] == 'docs' and parts[i + 1] == 'legibility'
+            for i in range(len(parts) - 1)
+        ), f'{result} must not live under the git-tracked docs/legibility/'
