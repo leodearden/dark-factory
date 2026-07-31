@@ -1495,7 +1495,7 @@ class TestParseMetadataFailurePolicy:
 
         human_curator_gate marks a deterministic pure gate whose resolution
         requires human CONTENT adjudication, not merely a closed escalation
-        record; curator_adjudicated_at is the ISO-8601 stamp proving the
+        record; human_curator_adjudicated_at is the ISO-8601 stamp proving the
         per-entry review happened. Both are read by DeterministicRunner's
         pure-gate resume guard, which refuses to drive such a task to done
         without the stamp — so both are load-bearing Tier-A conventions.
@@ -1506,7 +1506,7 @@ class TestParseMetadataFailurePolicy:
         _, warnings = parse_metadata(
             {
                 'human_curator_gate': True,
-                'curator_adjudicated_at': '2026-07-31T09:00:00+00:00',
+                'human_curator_adjudicated_at': '2026-07-31T09:00:00+00:00',
             },
             direction='read',
         )
@@ -1514,8 +1514,8 @@ class TestParseMetadataFailurePolicy:
         assert 'human_curator_gate' not in unknown_key_fields, (
             f'Expected no unknown_key warning for human_curator_gate; got: {sorted(unknown_key_fields)}'
         )
-        assert 'curator_adjudicated_at' not in unknown_key_fields, (
-            f'Expected no unknown_key warning for curator_adjudicated_at; got: {sorted(unknown_key_fields)}'
+        assert 'human_curator_adjudicated_at' not in unknown_key_fields, (
+            f'Expected no unknown_key warning for human_curator_adjudicated_at; got: {sorted(unknown_key_fields)}'
         )
 
     def test_deterministic_invariant_violation_write_enforce_raises(self):

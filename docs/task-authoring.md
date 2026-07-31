@@ -697,7 +697,8 @@ capability_manifest, curator_action, curator_justification, combined_at,
 gate_escalated_at, before_done_ran_at, before_done_verified_at,
 before_done_verified_pid, files_tagged_at, origin_finding_id,
 spawned_from, program, program_stream, stream, cross_repo,
-cross_repo_project, human_curator_gate, curator_adjudicated_at
+cross_repo_project, human_curator_gate,
+human_curator_adjudicated_at
 ```
 
 `cross_repo` + `cross_repo_project` are the cross-repo deliverable marker
@@ -706,10 +707,17 @@ cross_repo_project, human_curator_gate, curator_adjudicated_at
 filer is itself registered), and read by the orchestrator pre-merge
 narrowing gate.
 
+Two unrelated curators appear in this list, and the prefixes keep them
+apart: `curator_action` / `curator_justification` / `combined_at` are
+written by the **automated task curator**'s combine flow (fused-memory
+`task_interceptor`), while the `human_curator_*` keys below belong to a
+**human content curator** adjudicating a deterministic gate.
+
 #### The human-curator-gate contract
 
-`human_curator_gate` + `curator_adjudicated_at` mark, and then discharge, a
-deterministic pure gate that only a human's **content judgement** can close.
+`human_curator_gate` + `human_curator_adjudicated_at` mark, and then
+discharge, a deterministic pure gate that only a human's **content
+judgement** can close.
 
 **`metadata.human_curator_gate`** (truthy) on a `task_kind='deterministic'`
 pure gate (`before_done` absent, `always_escalates=true`) declares that the
@@ -718,7 +726,13 @@ born-at-L2 `milestone_gate` escalation is **not by itself sufficient** to
 close such a task: closing an escalation record and performing the review
 are different propositions.
 
-**`metadata.curator_adjudicated_at`** (ISO-8601 string) is the required
+The marker belongs on a **pure** gate only. A `before_done` action is a
+machine step that closes the task, which contradicts "only a human's content
+judgement closes this" — a task carrying both takes the act-then-ask path
+with the marker unread, and `DeterministicRunner` logs a warning naming the
+authoring defect on every dispatch. Do not combine them.
+
+**`metadata.human_curator_adjudicated_at`** (ISO-8601 string) is the required
 content-adjudication signal, stamped via `update_task` (with
 `metadata_mode='merge'`) by whoever actually performed the review.
 
@@ -730,8 +744,12 @@ or is not a non-empty string, the runner files a born-at-L2
 the task **blocked** rather than driving it to `done`. Both checks fail
 closed: a truthy-but-not-`true` marker still trips the guard, and a
 `bool`/`int`/blank stamp is not accepted as proof. A curator gate that does
-close carries a `done_provenance.note` naming the adjudication stamp, so a
-genuine closure is distinguishable from a phantom one in the audit trail.
+close carries a `done_provenance.note` naming the adjudication stamp
+(truncated if oversized — the note is memory-ingested downstream) and a
+`done_provenance.escalation_id` naming the `milestone_gate` record that
+proved rung one — **not** the `curator_adjudication_missing` re-ask, which
+proves nothing about the gate. So a genuine closure is distinguishable from
+a phantom one in the audit trail.
 
 The originating incident is task 3181, whose gate escalation `esc-3181-1`
 was resolved by the automated `escalation-watcher` — with the resolution's

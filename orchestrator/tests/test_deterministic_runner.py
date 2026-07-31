@@ -899,7 +899,7 @@ def _curator_gate_task(
     deps: list | None = None,
     gate_options: list | None = None,
     gate_escalated_at: str | None = None,
-    curator_adjudicated_at: object = None,
+    human_curator_adjudicated_at: object = None,
     marker: object = True,
 ) -> dict:
     """Build a deterministic pure-gate task dict carrying the curator marker.
@@ -912,7 +912,7 @@ def _curator_gate_task(
 
     *marker* is deliberately parameterisable (and not typed ``bool``) so the
     fail-closed tests can pass a truthy-but-not-``True`` value such as the
-    string ``'true'``.  *curator_adjudicated_at* is stamped only when not
+    string ``'true'``.  *human_curator_adjudicated_at* is stamped only when not
     ``None``, so the default task is an UNADJUDICATED curator gate.
     """
     task = _gate_task(
@@ -924,8 +924,8 @@ def _curator_gate_task(
         gate_escalated_at=gate_escalated_at,
     )
     task['metadata']['human_curator_gate'] = marker
-    if curator_adjudicated_at is not None:
-        task['metadata']['curator_adjudicated_at'] = curator_adjudicated_at
+    if human_curator_adjudicated_at is not None:
+        task['metadata']['human_curator_adjudicated_at'] = human_curator_adjudicated_at
     return task
 
 
@@ -957,7 +957,7 @@ class TestHumanCuratorGateAdjudicationGuard:
         self, tmp_path: Path,
     ):
         """The task-3181 incident, reproduced: curator gate + resolved-and-archived
-        record + NO ``curator_adjudicated_at`` stamp must NOT drive to done.
+        record + NO ``human_curator_adjudicated_at`` stamp must NOT drive to done.
 
         It files a born-at-L2 ``curator_adjudication_missing`` escalation naming
         the remediation and stays BLOCKED.
@@ -969,7 +969,7 @@ class TestHumanCuratorGateAdjudicationGuard:
             task_id='3181',
             gate_escalated_at='2026-07-30T16:30:28.993178+00:00',
         )
-        assert 'curator_adjudicated_at' not in task['metadata']  # unadjudicated
+        assert 'human_curator_adjudicated_at' not in task['metadata']  # unadjudicated
         assignment = _make_assignment(task)
         queue = EscalationQueue(tmp_path)
         _seed_resolved_gate(queue, '3181')  # the exact esc-3181-1 shape
@@ -1001,7 +1001,7 @@ class TestHumanCuratorGateAdjudicationGuard:
         assert pending[0].level == 2
         assert pending[0].agent_role == 'orchestrator-deterministic'
         # The detail must name the remediation the human has to perform.
-        assert 'curator_adjudicated_at' in pending[0].detail
+        assert 'human_curator_adjudicated_at' in pending[0].detail
 
         scheduler.set_task_status.assert_any_await('3181', 'blocked')
 
@@ -1105,7 +1105,7 @@ class TestHumanCuratorGateAdjudicationGuard:
         task = _curator_gate_task(
             task_id='3181',
             gate_escalated_at='2026-07-30T16:30:28.993178+00:00',
-            curator_adjudicated_at=stamp,
+            human_curator_adjudicated_at=stamp,
         )
         assignment = _make_assignment(task)
         queue = EscalationQueue(tmp_path)
@@ -1157,7 +1157,7 @@ class TestHumanCuratorGateAdjudicationGuard:
         )
         # Stamp the value directly: _curator_gate_task skips a None value, and
         # here we want the key PRESENT-but-invalid for every non-None case.
-        task['metadata']['curator_adjudicated_at'] = stamp
+        task['metadata']['human_curator_adjudicated_at'] = stamp
         assignment = _make_assignment(task)
         queue = EscalationQueue(tmp_path)
         _seed_resolved_gate(queue, '3181')
@@ -1233,11 +1233,15 @@ class TestHumanCuratorGateAdjudicationGuard:
         An oversized stamp is NOT a safety failure: it is still a stamp, so the
         task still closes. It just gets truncated in the audit string.
 
-        The log-leak assertion uses the fallback form from the plan: the
-        detector lives in ``scripts/scan_provenance_note_log_leaks.py``, and
-        ``scripts/`` has no ``__init__.py`` — the header comment of this very
-        file (task 3286) already records that these two suites cannot share
-        imports. So the level-token check is inlined rather than imported.
+        The plan's optional log-leak assertion is deliberately NOT here
+        (reviewer amendment). Both available forms were vacuous: the detector in
+        ``scripts/scan_provenance_note_log_leaks.py`` cannot be imported (no
+        ``__init__.py``; the header comment of this file records that), and the
+        inlined ``' INFO '``-style level-token check could never fail — the note
+        is a fixed template plus a stamp hard-truncated at construction, so no
+        log-line shape can appear regardless of input. What replaced it pins the
+        thing that CAN regress: that truncation, not merely some bound, is what
+        keeps the note small.
         """
         from orchestrator.deterministic_runner import DeterministicRunner
         from orchestrator.workflow import WorkflowOutcome
@@ -1246,7 +1250,7 @@ class TestHumanCuratorGateAdjudicationGuard:
         task = _curator_gate_task(
             task_id='3181',
             gate_escalated_at='2026-07-30T16:30:28.993178+00:00',
-            curator_adjudicated_at=oversized,
+            human_curator_adjudicated_at=oversized,
         )
         assignment = _make_assignment(task)
         queue = EscalationQueue(tmp_path)
@@ -1275,10 +1279,198 @@ class TestHumanCuratorGateAdjudicationGuard:
             'the note must stay inside _format_outcome_echo max_note_chars so a '
             'multi-KB stamp cannot be pushed into the Mem0 completion summary'
         )
-        # Fallback log-leak check (see docstring): the curator note must never
-        # acquire the log-line shape scan_provenance_note_log_leaks.py hunts.
-        for level in ('DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'):
-            assert f' {level} ' not in note
+        # Pin that TRUNCATION is what bounded it (reviewer amendment). The
+        # `< 500` bound alone is satisfied by any cap at or below ~440, so a
+        # regression widening _CURATOR_STAMP_NOTE_MAX_CHARS to 400 would sail
+        # past it while shipping a note four times the intended size.
+        from orchestrator.deterministic_runner import _CURATOR_STAMP_NOTE_MAX_CHARS
+
+        assert note.endswith('…'), 'an oversized stamp must be visibly elided'
+        assert 'x' * 100 not in note, 'the 5000-char tail must not survive'
+        stamp_segment = note.split('confirmed at ', 1)[1]
+        assert len(stamp_segment) == _CURATOR_STAMP_NOTE_MAX_CHARS + 1, (
+            'the interpolated stamp must be exactly the cap plus the ellipsis'
+        )
+
+    async def test_curator_gate_remediation_round_trip_cites_the_gate_record(
+        self, tmp_path: Path,
+    ):
+        """END-TO-END: the exact remediation the escalation detail instructs.
+
+        Runs the runner TWICE against ONE queue, walking the full loop the
+        ``curator_adjudication_missing`` detail asks a human to perform:
+
+          1. gate resolved, no stamp        -> BLOCKED, re-ask filed
+          2. human reviews, stamps, resolves the re-ask
+          3. re-dispatch                    -> DONE
+
+        Two things only this path can pin:
+
+        * ``done_provenance.escalation_id`` must name the **milestone_gate**
+          record (rung-one evidence), NOT the ``curator_adjudication_missing``
+          re-ask. By step 3 there are two own-role records and the re-ask is
+          the NEWER one, so a "newest own record" selection cites the record
+          that proves nothing about the gate — silently mis-aiming the very
+          audit trail this change exists to sharpen. Every single-record test
+          above is blind to this.
+        * ``_file_curator_adjudication_missing_and_block`` must not re-stamp
+          ``gate_escalated_at`` — its docstring claims this and nothing else
+          checks it. A re-stamp would be harmless today but would quietly make
+          the re-ask indistinguishable from a freshly established gate.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _curator_gate_task(
+            task_id='3181',
+            gate_escalated_at='2026-07-30T16:30:28.993178+00:00',
+        )
+        queue = EscalationQueue(tmp_path)
+        gate_esc = _seed_resolved_gate(queue, '3181')  # (A) the original gate
+        scheduler = _mock_scheduler(task)
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+
+        # ── 1. resume with no stamp: BLOCKED, re-ask filed ──────────────────
+        assert await runner.run(_make_assignment(task)) == WorkflowOutcome.BLOCKED
+        re_asks = queue.get_by_task(
+            '3181', status='pending', agent_role='orchestrator-deterministic',
+        )
+        assert len(re_asks) == 1
+        re_ask = re_asks[0]
+        assert re_ask.category == 'curator_adjudication_missing'
+        assert re_ask.id != gate_esc.id
+
+        # ── 2. the human does the work, stamps, and resolves the re-ask ─────
+        stamp = '2026-07-31T11:15:00+00:00'
+        task['metadata']['human_curator_adjudicated_at'] = stamp
+        queue.resolve(re_ask.id, 'reviewed all 13 entries', resolved_by='human')
+
+        # ── 3. re-dispatch: closes, citing the GATE record ──────────────────
+        assert await runner.run(_make_assignment(task)) == WorkflowOutcome.DONE
+
+        done_calls = [
+            c for c in scheduler.set_task_status.await_args_list
+            if len(c.args) >= 2 and c.args[1] == 'done'
+        ]
+        assert len(done_calls) == 1
+        provenance = done_calls[0].kwargs['done_provenance']
+        assert stamp in provenance['note']
+        assert provenance['escalation_id'] == gate_esc.id, (
+            'escalation_id is rung-ONE evidence and must name the milestone_gate '
+            'record; citing the curator_adjudication_missing re-ask (the NEWER '
+            'own-role record here) points the audit trail at the one record that '
+            'proves nothing about the gate'
+        )
+
+        # Sanity: the re-ask really was the newer record, so this test would
+        # fail against a plain "newest own record" selection rather than
+        # passing by accident on a tie.
+        own = sorted(
+            queue.get_by_task('3181', agent_role='orchestrator-deterministic'),
+            key=lambda e: e.timestamp,
+        )
+        assert len(own) == 2
+        assert own[-1].id == re_ask.id
+
+        # The re-ask never re-stamped gate_escalated_at (docstring claim).
+        assert not [
+            c for c in scheduler.update_task.await_args_list
+            if 'gate_escalated_at' in str(c.args) + str(c.kwargs)
+        ]
+
+    async def test_blocked_writeback_failure_still_returns_blocked(
+        self, tmp_path: Path,
+    ):
+        """A severed scheduler connection must not turn a BLOCK into an exception.
+
+        ``_file_curator_adjudication_missing_and_block`` files the escalation to
+        local disk FIRST, then writes ``blocked`` best-effort. If that writeback
+        raises (fused-memory connection severed mid-dispatch), the escalation is
+        already durable, so the correct outcome is still BLOCKED — never a
+        propagated exception, and above all never a fall-through to ``done``.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _curator_gate_task(
+            task_id='3181',
+            gate_escalated_at='2026-07-30T16:30:28.993178+00:00',
+        )
+        queue = EscalationQueue(tmp_path)
+        _seed_resolved_gate(queue, '3181')
+        scheduler = _mock_scheduler(task)
+        scheduler.set_task_status = AsyncMock(
+            side_effect=RuntimeError('fused-memory connection severed'),
+        )
+
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        outcome = await runner.run(_make_assignment(task))
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        # And the escalation survived the failed writeback — it is on disk, so
+        # the human still sees the re-ask even though the task row says pending.
+        pending = queue.get_by_task(
+            '3181', status='pending', agent_role='orchestrator-deterministic',
+        )
+        assert [e for e in pending if e.category == 'curator_adjudication_missing']
+
+    async def test_curator_marker_on_a_non_pure_gate_is_loud(
+        self, tmp_path: Path, caplog,
+    ):
+        """A curator marker on an act-then-ask task must WARN, not vanish.
+
+        The rung-two guard lives only on the pure-gate resume path, because
+        ``human_curator_gate`` and a ``before_done`` action are contradictory:
+        one says only a human's content judgement closes this task, the other is
+        a machine step that closes it. But the marker is LLM-authored
+        (reconciliation Stage 2) and ``shared.task_metadata`` blesses the key
+        with no co-occurrence validation, so a misauthored task CAN carry both —
+        and would then be driven to done with the marker never read.
+
+        That is a silent fail-OPEN of exactly the failure class task 3341
+        exists to close, so the runner says so loudly on every dispatch. It
+        stays a WARNING rather than a block on purpose: the defect is in task
+        authoring, and hard-failing would strand deploys with no curator
+        semantics at all. Write-time rejection belongs in
+        ``shared.task_metadata`` and is tracked separately.
+        """
+        import logging
+
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _deploy_task(task_id='200')
+        task['metadata']['human_curator_gate'] = True
+        assert task['metadata']['before_done'] is not None  # NOT a pure gate
+        queue = EscalationQueue(tmp_path)
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(
+            scheduler=scheduler,
+            escalation_queue=queue,
+            unit_inspector=AsyncMock(
+                side_effect=[_BASELINE_UNIT_STATE, _FRESH_UNIT_STATE],
+            ),
+            script_runner=AsyncMock(return_value=(0, 'ok')),
+        )
+        with caplog.at_level(
+            logging.WARNING, logger='orchestrator.deterministic_runner',
+        ):
+            outcome = await runner.run(_make_assignment(task))
+
+        warned = '\n'.join(
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        )
+        assert 'human_curator_gate' in warned
+        assert 'before_done' in warned, (
+            'the warning must name the contradiction, not just the marker'
+        )
+
+        # Behaviour is deliberately unchanged: the deploy still completes.
+        assert outcome == WorkflowOutcome.DONE
+        assert not queue.get_by_task(
+            '200', status='pending', agent_role='orchestrator-deterministic',
+        )
 
 
 # ---------------------------------------------------------------------------
