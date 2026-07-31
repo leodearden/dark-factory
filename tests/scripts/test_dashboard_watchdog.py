@@ -513,5 +513,47 @@ def test_b1_healthy_tick_clears_a_pre_existing_streak(monkeypatch, state_env):
     assert rec.actuations == []
 
 
+# ---------------------------------------------------------------------------
+# B2 — a single transient miss must not restart anything
+# ---------------------------------------------------------------------------
+
+
+def test_b2_single_transient_miss_never_restarts(monkeypatch, state_env):
+    """success, success, FAIL, success, success → nothing happens.
+
+    THE regression this task exists to prevent. The retired inline shell
+    restarted on exactly this sequence, which on 2026-07-30 turned a
+    momentarily-slow dashboard into 192 restarts in 3 hours (~27% downtime).
+    """
+    rec = _run_ticks(monkeypatch, [True, True, False, True, True])
+
+    assert rec.actuations == [], f"a single miss actuated systemctl: {rec.actuations}"
+    assert rec.escalations == []
+    # The failing tick is index 2; the streak must be exactly 1 there, and
+    # back to 0 once the service answers again.
+    assert rec.streaks == [0, 0, 1, 0, 0]
+    assert all(s["restarts"] == [] for s in rec.states)
+
+
+def test_b2_streak_survives_the_process_boundary(monkeypatch, state_env):
+    """Two consecutive misses accumulate to 2 — across two separate module
+    loads. A streak that reset every tick would look identical to B2 from the
+    outside (still no restart), so this asserts the counter really advances."""
+    rec = _run_ticks(monkeypatch, [False, False])
+
+    assert rec.streaks == [1, 2]
+    assert rec.actuations == [], "acted before FAIL_STREAK consecutive misses"
+
+
+def test_b2_alternating_failures_never_reach_the_gate(monkeypatch, state_env):
+    """FAIL, ok, FAIL, ok, FAIL, ok … forever — a flapping-but-serving
+    dashboard. Cumulative failures far exceed FAIL_STREAK, but no CONSECUTIVE
+    run ever does, so the watchdog stays quiet."""
+    rec = _run_ticks(monkeypatch, [False, True] * 10)
+
+    assert rec.actuations == []
+    assert max(rec.streaks) == 1
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))
