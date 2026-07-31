@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import pathlib
 
+from orchestrator import verify, verify_plan
 from orchestrator.config import OrchestratorConfig, _discover_module_configs
 from orchestrator.module_charter import derive_modules
 
@@ -140,4 +141,114 @@ def test_tests_scripts_is_a_registered_module_config() -> None:
         f'cfg.for_module({MODULE_PREFIX!r}) did not resolve to the discovered '
         f'module config (got {resolved_prefix!r}); module_configs would be empty '
         'on the workflow path and the fleet-chain fallback would be reached'
+    )
+
+
+# Command fragments that would betray the fleet chain leaking back in: each is a
+# segment of dark-factory-orchestrator.yaml's seven-suite test_command. If any
+# appears in the executed test_command, the module config is not doing its job.
+_FLEET_CHAIN_MARKERS = (
+    'cd shared',
+    'cd ../escalation',
+    'cd ../orchestrator',
+    'cd ../fused-memory',
+    'cd ../dashboard',
+    'cd ../sampler',
+    'cockpit',
+)
+
+
+def _executed_for_touched(files: list[str]):
+    """Run the PRODUCTION plan->execution bridge and return the single executed config.
+
+    ``derive_verify_plan`` decides scope; ``_executed_module_configs_from_plan``
+    renders those PlannedRuns into the exact ModuleConfig ``run_verification``
+    executes. Asserting on THAT is what makes "the tests/scripts segment ran" a
+    structural claim rather than an exit-code claim.
+
+    The ``lambda _f: None`` worktree_reader keeps this hermetic: no file reads,
+    and nothing classifies STRUCTURAL, so pyright stays FILE_SCOPED.
+    """
+    mc = _discovered()[MODULE_PREFIX]
+    cfg = OrchestratorConfig(project_root=REPO_ROOT)
+    plan = verify_plan.derive_verify_plan(files, [mc], cfg, lambda _f: None)
+    executed = verify._executed_module_configs_from_plan([mc], plan)
+    assert len(executed) == 1, (
+        f'expected exactly one executed module config for {files!r}, got '
+        f'{[e.prefix for e in executed]!r}'
+    )
+    return executed[0]
+
+
+def test_tests_scripts_diff_executes_its_own_suite_and_keeps_lint_and_type() -> None:
+    """The task's acceptance criterion, asserted STRUCTURALLY rather than via rc.
+
+    "A diff touching only tests/scripts/ should complete verify well inside
+    budget, and its own tests/scripts/ tests must actually execute (assert the
+    segment ran, not merely that the command exited 0)." An exit code cannot
+    carry that claim — task 3338's failure mode is precisely an &&-chain that
+    exits 0 without the trailing segment ever running. So this asserts on the
+    command strings the production bridge hands to ``run_verification``.
+
+    (c) and (d) are the anti-regression half, and they are not hypothetical:
+    ``verify_plan.py:334-363`` emits an explicit SKIPPED PlannedRun for a falsy
+    lint_command/type_check_command, ``_executed_module_configs_from_plan``
+    leaves the field None (verify.py:4892), and ``_run_or_skip_timed`` turns a
+    None command into a ``CheckRun.skipped`` that is VACUOUSLY PASSING at rc=0.
+    A test-only module config would therefore silently DELETE lint and type
+    gating for every tests/scripts diff — strictly WORSE than the fallback path
+    it replaces, which esc-3062-3 logs narrowing both legs correctly
+    (``ruff check tests/scripts/test_spawn_claude.py`` rc=0,
+    ``pyright tests/scripts/test_spawn_claude.py`` rc=0). Closing the TEST gap
+    must not open a LINT/TYPE one.
+    """
+    executed = _executed_for_touched([SAMPLE_TOUCHED_FILE])
+
+    # (a) The tests/scripts segment ACTUALLY RUNS.
+    assert executed.test_command is not None, (
+        'executed test_command is None for a tests/scripts-only diff (task '
+        '3350) — derive_verify_plan emitted a SKIPPED run, so _run_or_skip_timed '
+        'records a vacuously-passing CheckRun.skipped and this suite is not '
+        'gated at all'
+    )
+    assert 'pytest' in executed.test_command, (
+        f'executed test_command {executed.test_command!r} invokes no pytest, so '
+        'the tests/scripts suite does not run'
+    )
+    assert MODULE_PREFIX in executed.test_command, (
+        f'executed test_command {executed.test_command!r} does not target '
+        f'{MODULE_PREFIX}/ — the suite that was actually touched is not the '
+        'suite being run'
+    )
+
+    # (b) The fleet chain is gone. This is the whole point of the module config:
+    # no other subproject's suite may appear in the command for this diff.
+    for marker in _FLEET_CHAIN_MARKERS:
+        assert marker not in executed.test_command, (
+            f'executed test_command contains fleet-chain segment {marker!r} '
+            f'(task 3350): {executed.test_command!r}. A tests/scripts-only diff '
+            'has fallen back to dark-factory-orchestrator.yaml\'s whole-fleet '
+            'test_command, which measured 1800.66s / infra_timeout in task 3062 '
+            'attempt-2 — the exact defect this module config exists to remove'
+        )
+
+    # (c) LINT still gates. See the docstring: a None command is a vacuous pass.
+    assert executed.lint_command is not None and 'ruff' in executed.lint_command, (
+        f'executed lint_command is {executed.lint_command!r} (task 3350) — '
+        'declaring only test_command on the module config downgrades LINT to a '
+        'vacuously-passing CheckRun.skipped at rc=0, silently DELETING gating '
+        'that the fallback path performs correctly today (esc-3062-3 logs '
+        'ruff check tests/scripts/test_spawn_claude.py rc=0)'
+    )
+
+    # (d) TYPE still gates, same reasoning.
+    assert (
+        executed.type_check_command is not None
+        and 'pyright' in executed.type_check_command
+    ), (
+        f'executed type_check_command is {executed.type_check_command!r} (task '
+        '3350) — declaring only test_command on the module config downgrades '
+        'TYPE to a vacuously-passing CheckRun.skipped at rc=0, silently '
+        'DELETING gating that the fallback path performs correctly today '
+        '(esc-3062-3 logs pyright tests/scripts/test_spawn_claude.py rc=0)'
     )
