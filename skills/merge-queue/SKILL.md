@@ -90,7 +90,7 @@ The call returns with **either** a **terminal** status **or** a **non-terminal**
   ```
   mcp__escalation__merge_status(branch="task/<TASK_ID>")
   ```
-  Cross-check `get_merge_queue()` for queue-wide context if useful. Do NOT read a first-tick `unknown` on this arm as a terminal failure or as licence to direct-merge.
+  Cross-check `get_merge_queue()` for queue-wide context if useful. On this arm `unknown` is the **live** state, not a first-tick fluke — it persists for as long as the foreign merger is still working, since the git-authority tier can only resolve once the branch tip is provably an ancestor of main (`escalation/server.py:2422-2461`). Do NOT read it as a terminal failure or as licence to direct-merge, and do NOT resubmit on it (the `state: "unknown"` resubmit rule below is scoped to the other two arms). **Exception to "same for all three arms" below: this arm alone is bounded by a 20-minute wall-clock ceiling** (matching `skills/unblock/SKILL.md` and `skills/unblock-low-risk/SKILL.md:177-189`) — past it, run the ancestry check under `state: "unknown"` below one final time and, if still not on main, stop and report rather than resubmitting or direct-merging.
 
 Whichever handle you poll, the cadence and state handling below are the same for all three arms:
 
@@ -108,7 +108,7 @@ mcp__escalation__merge_status(request_id="<superseded_by value>")
 
 Poll the train request with the same 15 s→60 s backoff until it reaches a terminal state (`done`, `conflict`, `blocked`, `abandoned`). Your absorbed branch lands when the train lands. Handle the train's terminal state per step 4.
 
-**`state: "unknown"`** — the orchestrator restarted and the retention ring no longer holds this request. `merge_status` now self-resolves a landed merge via its git-authority tier: if the branch is provably on `main` it returns `state: "done"` with `kind: "found_on_main"` and `merge_sha` directly. If `merge_status` still returns `unknown`, confirm deterministically:
+**`state: "unknown"`** — for the `request_id`/`task_id` poll arms, this means the orchestrator restarted and the retention ring no longer holds this request (a record that *was* enqueued). `merge_status` now self-resolves a landed merge via its git-authority tier: if the branch is provably on `main` it returns `state: "done"` with `kind: "found_on_main"` and `merge_sha` directly. If `merge_status` still returns `unknown`, confirm deterministically:
 ```bash
 git merge-base --is-ancestor task/<TASK_ID> main && echo "on main" || echo "not on main"
 # If exit 0 (on main): treat as done/found_on_main — use done_provenance kind='found_on_main',
@@ -116,7 +116,7 @@ git merge-base --is-ancestor task/<TASK_ID> main && echo "on main" || echo "not 
 #   (git log gives the merge commit; git merge-base gives the common ancestor, NOT the merge commit)
 # If exit 1 (not on main) AND queue is healthy: resubmit (go back to step 3).
 ```
-**Never fall back to a direct merge in response to `unknown`** — `unknown` means the server lost its record, NOT that the merge failed. The direct-merge fallback (step 6) is ONLY for orchestrator down/congested.
+**Never fall back to a direct merge in response to `unknown`** — `unknown` means the server lost its record, NOT that the merge failed. The direct-merge fallback (step 6) is ONLY for orchestrator down/congested. **This block's `resubmit` line does not apply to the `poll_by == "branch"` arm** — there nothing was ever enqueued, so `unknown` is that arm's expected live state, not a lost record; see its 20-minute ceiling above for the bounded exit instead.
 
 ### 4. Handle the outcome
 
