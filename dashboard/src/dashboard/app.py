@@ -482,9 +482,21 @@ async def _probe_db(pool: DbPool, db_path: Path, budget: float) -> str:
 
 @app.get('/healthz')
 async def healthz(request: Request) -> JSONResponse:
-    """Deep health check — detects thread leaks and unresponsive DB connections."""
+    """Deep health check — detects thread leaks and unresponsive DB connections.
+
+    A deep diagnostic/readiness surface — deliberately NOT a liveness probe,
+    and deliberately wired to nothing that kills (see
+    plans/dashboard-availability-prd.md task epsilon, Resolved-decision 1).
+    Always returns a verdict within `_HEALTHZ_TOTAL_BUDGET` seconds, no
+    matter how badly a backing DB connection is wedged, and states that
+    budget plus whether any probe hit its deadline in the response
+    (`checks['budget_seconds']` / `checks['deadline_exceeded']`) so an
+    operator reading a 503 doesn't have to read the source to recover facts
+    the handler already had in hand.
+    """
     checks: dict = {}
     healthy = True
+    deadline_exceeded = False
 
     thread_count = threading.active_count()
     threads_ok = thread_count < _THREAD_LIMIT
@@ -503,6 +515,7 @@ async def healthz(request: Request) -> JSONResponse:
         if remaining <= 0:
             checks[f'db_{name}'] = 'deadline_exceeded'
             healthy = False
+            deadline_exceeded = True
             continue
         # _probe_db covers acquire + execute + fetch under ONE deadline, so a
         # stalled pool.get() (per-path open-lock contention, a slow
@@ -512,8 +525,12 @@ async def healthz(request: Request) -> JSONResponse:
         checks[f'db_{name}'] = status
         if status not in ('ok', 'unavailable'):
             healthy = False
+        if status == 'timeout':
+            deadline_exceeded = True
 
     checks['uptime_seconds'] = round(time.monotonic() - request.app.state.start_time, 1)
+    checks['budget_seconds'] = _HEALTHZ_TOTAL_BUDGET
+    checks['deadline_exceeded'] = deadline_exceeded
 
     return JSONResponse(
         content={'status': 'healthy' if healthy else 'degraded', 'checks': checks},
