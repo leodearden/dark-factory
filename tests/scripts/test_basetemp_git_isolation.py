@@ -362,3 +362,42 @@ class TestRejectUnsafeBasetemp:
 
     def test_is_a_no_op_for_a_safe_basetemp(self, tmp_path: Path) -> None:
         reject_unsafe_basetemp(_stub_config(tmp_path))
+
+
+class TestCeilingIsLiveInThisRun:
+    """The fixture is WIRED, not merely defined.
+
+    Everything above tests pure functions and a stub config; those would all
+    stay green if the fixture were never loaded by any conftest.  This class is
+    the only assertion that the defence is actually armed in the process
+    running it — the difference between a wired defence and a dead one.
+    """
+
+    def test_this_runs_basetemp_is_a_ceiling_entry(
+        self, tmp_path_factory: pytest.TempPathFactory,
+    ) -> None:
+        """Entry membership, not equality: an operator- or CI-set ambient
+        ceiling is preserved alongside ours, and under xdist each worker
+        contributes its own ``popen-gwN`` basetemp.
+        """
+        basetemp = str(tmp_path_factory.getbasetemp().resolve())
+
+        entries = os.environ[_CEILING_KEY].split(':')
+
+        assert basetemp in entries, (
+            f'{_CEILING_KEY} does not contain this run\'s basetemp {basetemp}.\n'
+            'The session ceiling fixture is not loaded for this rootdir. Wire '
+            'the test-root conftest to import _df_git_ceiling_at_basetemp from '
+            'df_pytest_isolation.'
+        )
+
+    def test_the_ambient_ceiling_has_no_duplicate_entries(self) -> None:
+        """Idempotence, end-to-end.
+
+        Conftests nest — a run whose rootdir is the repo root loads the root
+        conftest AND a subproject conftest — so the pure-function idempotence
+        proved above must also hold for the value actually in the environment.
+        """
+        entries = os.environ[_CEILING_KEY].split(':')
+
+        assert len(entries) == len(set(entries)), f'duplicate entries: {entries}'
