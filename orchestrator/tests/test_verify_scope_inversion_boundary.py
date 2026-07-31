@@ -1478,8 +1478,7 @@ def _fake_run_verification_killed_lint(passed_prefixes: dict[str, bool]) -> Asyn
     )
 
     async def _fake(worktree, config, module_config=None, **kwargs):
-        prefix = getattr(module_config, 'prefix', None)
-        if module_config is None or passed_prefixes.get(prefix, True):
+        if module_config is None or passed_prefixes.get(module_config.prefix, True):
             return VerifyResult(
                 passed=True, test_output='', lint_output='', type_output='',
                 summary='All checks passed', failing_test_ids=[],

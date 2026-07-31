@@ -710,4 +710,4 @@ class TestIndeterminateVerdictCategories:
             FailureCategory,
         )
         assert isinstance(INDETERMINATE_VERDICT_CATEGORIES, frozenset)
-        assert INDETERMINATE_VERDICT_CATEGORIES <= set(FailureCategory)
+        assert INDETERMINATE_VERDICT_CATEGORIES.issubset(set(FailureCategory))
