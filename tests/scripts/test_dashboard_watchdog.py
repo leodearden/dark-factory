@@ -987,5 +987,202 @@ def test_b6_timer_install_stanza_is_untouched():
     assert "WantedBy=timers.target" in timer
 
 
+# ---------------------------------------------------------------------------
+# B4 part 1 — the rate ceiling and the storm escape, at argv level
+#
+# The literal acceptance signal ("exactly ONE born-at-L2 record on disk") is
+# asserted against the REAL escalation.submit writer in
+# dashboard/tests/test_dashboard_watchdog_storm_escape.py — this lane is
+# stdlib-only and cannot import escalation.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def queue_env(monkeypatch, tmp_path):
+    """Point DASHBOARD_WATCHDOG_QUEUE_DIR at a tmp dir; resolved at import."""
+    qdir = tmp_path / "escalations"
+    monkeypatch.setenv("DASHBOARD_WATCHDOG_QUEUE_DIR", str(qdir))
+    return qdir
+
+
+def _argv_value(argv: list[str], flag: str) -> str:
+    """Return the value following *flag* in *argv* (fails loudly if absent)."""
+    assert flag in argv, f"{flag} missing from {argv}"
+    idx = argv.index(flag)
+    assert idx + 1 < len(argv), f"{flag} has no value in {argv}"
+    return argv[idx + 1]
+
+
+def _at_ceiling_state(mod, age_secs: int = 60) -> dict:
+    """State carrying MAX_RESTARTS restart epochs *age_secs* ago."""
+    import time as _time
+
+    now = int(_time.time())
+    return {
+        "streak": 0,
+        "restarts": [now - age_secs] * mod.MAX_RESTARTS,
+        "ceiling_open": False,
+    }
+
+
+def test_b4_ceiling_stops_restarting(monkeypatch, state_env, queue_env):
+    """INV-4, the storm escape. At the ceiling the watchdog STOPS restarting.
+
+    This is the whole point of the rewrite. MAX_RESTARTS restarts inside one
+    RATE_WINDOW_SECS is proof that restarting is not fixing the problem, so
+    continuing to restart only adds downtime — on 2026-07-30 it added ~27%.
+    The watchdog escalates to a human instead and goes quiet.
+    """
+    mod = _load_watchdog()
+    rec = _run_ticks(
+        monkeypatch,
+        [False] * mod.FAIL_STREAK,
+        seed_state=_at_ceiling_state(mod),
+    )
+
+    assert rec.restarts == [], f"restarted at the ceiling: {rec.restarts}"
+    assert len(rec.escalations) == 1, f"expected 1 escalation, got {rec.escalations}"
+    assert rec.states[-1]["ceiling_open"] is True
+
+
+def test_b4_ceiling_escalation_argv_is_the_born_at_l2_contract(
+    monkeypatch, state_env, queue_env
+):
+    """The argv must satisfy escalation submit's ENFORCED argparse boundary.
+
+    submit.py stamps level=2 directly, bypassing the server's chokepoint, so
+    it restricts --severity to BORN_AT_L2_SEVERITIES and REJECTS an
+    --agent-role without a harness-/orchestrator- sentinel prefix. Getting
+    either wrong means the escalation is never filed — the watchdog would go
+    quiet at the ceiling with nobody told, the worst of both behaviours.
+    """
+    mod = _load_watchdog()
+    rec = _run_ticks(
+        monkeypatch,
+        [False] * mod.FAIL_STREAK,
+        seed_state=_at_ceiling_state(mod),
+    )
+
+    argv = rec.escalations[0]
+    assert "submit" in argv, f"the submit subcommand must lead the CLI args: {argv}"
+    assert _argv_value(argv, "--queue-dir") == mod.ESCALATION_QUEUE_DIR
+    assert _argv_value(argv, "--task") == "dashboard-watchdog-restart-ceiling"
+    assert _argv_value(argv, "--severity") == "critical"
+    assert _argv_value(argv, "--category") == "infra_issue"
+    assert _argv_value(argv, "--agent-role") == "harness-dashboard-watchdog"
+    assert _argv_value(argv, "--agent-role").startswith("harness-")
+
+
+def test_b4_escalation_summary_carries_the_measured_evidence(
+    monkeypatch, state_env, queue_env
+):
+    """A human reading only the summary must be able to act on it.
+
+    Naming the unit, the restart COUNT and the WINDOW is what distinguishes
+    "the dashboard is flapping and restarting does not fix it" from a generic
+    'infra_issue' the steward has to go digging to understand.
+    """
+    mod = _load_watchdog()
+    rec = _run_ticks(
+        monkeypatch,
+        [False] * mod.FAIL_STREAK,
+        seed_state=_at_ceiling_state(mod),
+    )
+
+    argv = rec.escalations[0]
+    summary = _argv_value(argv, "--summary")
+    detail = _argv_value(argv, "--detail")
+
+    assert mod.DASHBOARD_UNIT in summary
+    assert str(mod.MAX_RESTARTS) in summary
+    assert summary.strip()
+    assert detail.strip(), "an empty --detail wastes the one L2 this episode gets"
+    assert mod.PROBE_URL in detail, "the detail must name what was actually probed"
+
+
+def test_b4_dedup_at_most_one_l2_per_ceiling_episode(
+    monkeypatch, state_env, queue_env
+):
+    """Ten more failing ticks file NOTHING further.
+
+    Without the dedup the storm escape would replace a restart storm with an
+    escalation storm — 2 L2s a minute, forever, each one paging a human.
+    """
+    mod = _load_watchdog()
+    rec = _run_ticks(
+        monkeypatch,
+        [False] * mod.FAIL_STREAK,
+        seed_state=_at_ceiling_state(mod),
+    )
+    assert len(rec.escalations) == 1
+
+    _run_ticks(monkeypatch, [False] * 10, recorder=rec)
+
+    assert rec.restarts == [], f"restarted after the ceiling tripped: {rec.restarts}"
+    assert len(rec.escalations) == 1, (
+        f"re-filed while the ceiling was open: {len(rec.escalations)} escalations"
+    )
+
+
+def test_b4_window_is_rolling_not_a_lifetime_counter(monkeypatch, state_env, queue_env):
+    """MAX_RESTARTS restarts LAST YEAR must not trip today's ceiling.
+
+    A lifetime counter would eventually wedge the watchdog permanently on a
+    service that misbehaves once a month — it would stop supervising and file
+    an L2 about a problem that no longer exists.
+    """
+    mod = _load_watchdog()
+    rec = _run_ticks(
+        monkeypatch,
+        [False] * mod.FAIL_STREAK,
+        seed_state=_at_ceiling_state(mod, age_secs=mod.RATE_WINDOW_SECS + 600),
+    )
+
+    assert len(rec.restarts) == 1, "an aged-out window must restart normally"
+    assert rec.escalations == [], "an aged-out window must not file anything"
+    assert rec.states[-1]["ceiling_open"] is False
+    # The stale epochs are pruned, so only the fresh restart remains.
+    assert len(rec.states[-1]["restarts"]) == 1
+
+
+def test_b4_ceiling_needs_max_restarts_not_one_fewer(monkeypatch, state_env, queue_env):
+    """MAX_RESTARTS - 1 prior restarts still permits one more.
+
+    Pins the boundary: an off-by-one here either escalates a service that had
+    two ordinary blips (crying wolf) or permits a fourth restart the ceiling
+    was written to prevent.
+    """
+    mod = _load_watchdog()
+    below = _at_ceiling_state(mod)
+    below["restarts"] = below["restarts"][:-1]
+
+    rec = _run_ticks(monkeypatch, [False] * mod.FAIL_STREAK, seed_state=below)
+
+    assert len(rec.restarts) == 1
+    assert rec.escalations == []
+    assert len(rec.states[-1]["restarts"]) == mod.MAX_RESTARTS
+
+
+def test_b4_the_restart_that_reaches_the_ceiling_still_escalates_next_time(
+    monkeypatch, state_env, queue_env
+):
+    """The Nth restart happens; the (N+1)th is what escalates instead.
+
+    Drives two full streaks from MAX_RESTARTS - 1 prior restarts: the first
+    completes the allowance, the second finds the window full and escalates.
+    """
+    mod = _load_watchdog()
+    below = _at_ceiling_state(mod)
+    below["restarts"] = below["restarts"][:-1]
+
+    rec = _run_ticks(
+        monkeypatch, [False] * (2 * mod.FAIL_STREAK), seed_state=below
+    )
+
+    assert len(rec.restarts) == 1, "the allowed restart did not fire"
+    assert len(rec.escalations) == 1, "the over-ceiling streak did not escalate"
+    assert rec.states[-1]["ceiling_open"] is True
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))
