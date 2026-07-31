@@ -187,6 +187,45 @@ class EvalMetrics:
         return asdict(self)
 
 
+def produced_a_plan(metrics: dict[str, Any]) -> bool:
+    """THE plan-production predicate: did this architect actually emit a plan?
+
+    Reads the PERSISTED ``plan_steps`` field above and nothing else. This is the
+    metrics-dict twin of :func:`orchestrator.evals.judge.is_scorable_plan`, which
+    asks the same question of the plan ARTIFACT — the form the report layer can
+    never use, because by report time it holds only a persisted metrics dict.
+    ``run_architect_eval`` derives ``plan_steps`` from the identical
+    ``len(plan.get('steps') or [])``, so the two are equivalent BY CONSTRUCTION
+    (pinned by ``TestProducedAPlan.test_equivalent_to_the_artifact_level_twin``
+    rather than left to coincidence — the drift hazard
+    ``report._has_plan_quality_score`` was written to close).
+
+    **Why not ``plan_quality > 0``** (the rule this replaces everywhere, task
+    3302): the two plan scorers disagree exactly on a stepless artifact.
+    :func:`judge.score_plan_structure` returns ``0.0`` for one as a deliberate
+    ANTI-FABRICATION guard, while the LLM plan judge has no such guard and can
+    score the same artifact nonzero (Graphiti episode e2066ec6). So a nonzero
+    ``plan_quality`` is not evidence a plan exists, and a zero one is not
+    evidence it does not — the number is the thing being decided, not the
+    evidence for it.
+
+    **Why not ``outcome == 'done'``** (task 2863 AMENDMENT §1): done-without-a-plan
+    and blocked-with-a-good-plan cells both occur, so the workflow outcome
+    answers a different question.
+
+    Two in-repo surfaces already got this right and this predicate makes the
+    pipeline agree with them rather than contradict them:
+    ``scripts/eval_bootstrap_smoke.sh`` gates its smoke on ``metrics.plan_steps
+    > 0 & outcome == 'done'``, and ``plans/eval-architect-effort-verdict-2026-07-27.md``
+    hand-computed the campaign's ``planRate`` / ``meanPQ_all`` from
+    ``plan_steps > 0`` because the pipeline's own ranking could not be used.
+
+    Pure: no I/O, no mutation. Tolerates a missing key and an explicit ``None``
+    (the empty shape ``len(... or [])`` guards) — both mean "no plan".
+    """
+    return int(metrics.get('plan_steps') or 0) > 0
+
+
 def _is_false_green(m: EvalMetrics, max_iterations: int) -> bool:
     """The 404-bug signature: iteration cap hit with zero work but T/T/T.
 
