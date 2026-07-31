@@ -771,16 +771,41 @@ _ALLOWED_RENAMERS = {
         'Moves a resolved file into the dated archive dir; not a write path.',
     ('escalation/src/escalation/sweep.py', '_atomic_move'):
         'Out of task 3223 enumerated scope; moves an existing file, does not write.',
+    ('orchestrator/src/orchestrator/digest.py', 'write_digest_entry'):
+        'Out of task 3223 enumerated scope. Notable: b3_gate._save_state was '
+        'originally documented as "modelled on digest.py" — this is where one '
+        'of the ten copies came from, so it is a prime candidate for the '
+        'follow-up migration.',
+    ('orchestrator/src/orchestrator/evals/rereview.py', 'atomic_write_json'):
+        'Out of task 3223 enumerated scope; left alone deliberately.',
+    (
+        'orchestrator/src/orchestrator/service_restart.py',
+        'StaleServiceRestartCoordinator._persist_last_fire_wall',
+    ):
+        'Out of task 3223 enumerated scope; left alone deliberately.',
+    ('orchestrator/src/orchestrator/agents/invoke.py', '_invoke_pi'):
+        'Swaps .mcp.json with a backup and back again; renames existing files '
+        'rather than writing new content, so atomic_write_text does not apply.',
 }
 
 
 def _find_renamers(source: str) -> list[str]:
     """Return the qualified names of functions in *source* that rename a path.
 
-    Detects ``os.replace(...)`` and ``os.rename(...)`` calls — both halves
-    matter: ``escalation.queue._atomic_write_path`` uses ``os.rename`` while
-    every other site uses ``os.replace``, so scanning for only one of them
-    would miss half the pattern.
+    Covers all four spellings the repo actually uses, because a scan for any
+    one of them leaves a hole big enough to hide a copy in:
+
+    * ``os.replace(tmp, dest)`` — eight of the ten sites 3223 consolidated.
+    * ``os.rename(tmp, dest)`` — ``escalation.queue._atomic_write_path``.
+    * ``tmp.replace(dest)`` — ``evals.rereview``, ``service_restart``.
+    * ``tmp.rename(dest)`` — ``digest.write_digest_entry``, which is the
+      writer ``b3_gate._save_state`` was documented as modelled on.
+
+    The two ``Path``-method forms are matched by arity: ``Path.replace`` and
+    ``Path.rename`` take exactly one positional argument, while the far more
+    common ``str.replace(old, new)`` takes two, so requiring exactly one
+    positional arg and no keywords separates them without a type-inference
+    pass.
 
     AST-based rather than a text grep on purpose: six of the migrated modules
     still *mention* ``os.replace`` in a docstring describing what
@@ -795,22 +820,26 @@ def _find_renamers(source: str) -> list[str]:
 
     found: list[str] = []
 
+    def is_rename(sub) -> bool:
+        if not (isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)):
+            return False
+        if sub.func.attr not in ('replace', 'rename'):
+            return False
+        receiver = sub.func.value
+        if isinstance(receiver, ast.Name) and receiver.id == 'os':
+            return True
+        # Path.replace(target) / Path.rename(target): exactly one positional
+        # argument.  str.replace(old, new) takes two and is excluded here.
+        return len(sub.args) == 1 and not sub.keywords
+
     def visit(node, prefix: str) -> None:
         for child in ast.iter_child_nodes(node):
             if isinstance(child, ast.ClassDef):
                 visit(child, f'{prefix}{child.name}.')
             elif isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef):
                 qualname = f'{prefix}{child.name}'
-                for sub in ast.walk(child):
-                    if (
-                        isinstance(sub, ast.Call)
-                        and isinstance(sub.func, ast.Attribute)
-                        and sub.func.attr in ('replace', 'rename')
-                        and isinstance(sub.func.value, ast.Name)
-                        and sub.func.value.id == 'os'
-                    ):
-                        found.append(qualname)
-                        break
+                if any(is_rename(sub) for sub in ast.walk(child)):
+                    found.append(qualname)
                 visit(child, f'{qualname}.')
             else:
                 visit(child, prefix)
@@ -858,6 +887,35 @@ class TestNoRegrownAtomicWriters:
             '        os.rename(tmp, path)\n'
         )
         assert _find_renamers(os_rename_variant) == ['S._write']
+
+        # Path-method spellings: the hole that let digest.write_digest_entry,
+        # rereview.atomic_write_json and service_restart sit unseen by an
+        # os.replace-only scan.
+        path_method_variant = (
+            'def _write(path, text):\n'
+            '    tmp = path.with_suffix(".tmp")\n'
+            '    tmp.write_text(text)\n'
+            '    tmp.rename(path)\n'
+        )
+        assert _find_renamers(path_method_variant) == ['_write']
+
+        path_replace_variant = (
+            'def _write(path, text):\n'
+            '    tmp.replace(path)\n'
+        )
+        assert _find_renamers(path_replace_variant) == ['_write']
+
+    def test_detector_ignores_str_replace(self):
+        """``str.replace(old, new)`` is not a rename.
+
+        The Path-method branch keys on arity, so this is the false positive
+        that would fire on half the repo if the arity check regressed.
+        """
+        two_arg = (
+            'def normalise(s):\n'
+            '    return s.replace("-", "_").replace(" ", "")\n'
+        )
+        assert _find_renamers(two_arg) == []
 
     def test_detector_ignores_docstring_mentions(self):
         """A docstring describing the pattern is not an implementation of it.

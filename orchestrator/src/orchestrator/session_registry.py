@@ -915,8 +915,10 @@ def decision_id_lock(decision_id: str, root: Path | str | None = None) -> Iterat
     task 1609) near-verbatim, retargeted to the decisions dir.
 
     WHY A SIDECAR (PRD-D3 rationale, same as 1609): write_decision's writer
-    is atomic tmp+os.replace (_atomic_write_text). After a replace, the data
-    file ``<decisions_dir>/<id>.json`` is a NEW inode. A second writer that
+    is atomic tmp+os.replace (``_atomic_write_text``, which since task 3223
+    delegates to :func:`shared.safe_io.atomic_write_text` — same mechanism,
+    same consequence here). After a replace, the data file
+    ``<decisions_dir>/<id>.json`` is a NEW inode. A second writer that
     flock()s the (new) data-file path binds to a different inode and races
     anyway -- the lock is defeated. The fix is a STABLE lock target:
     ``<decisions_dir>/<id>.json.lock``, created once via os.open(O_CREAT)
