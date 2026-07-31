@@ -98,6 +98,24 @@ def wire_scheduler_liveness_mock(scheduler_mock: MagicMock) -> None:
 # test_merge_queue_invariant_integration_gate.py).
 MERGE_RESULT_TIMEOUT = 45
 
+# task 3307: generous synchronization-barrier ceiling for the workflow
+# CancellationScope tests (test_workflow_cancellation.py).  These barriers
+# wait for REAL work — git worktree creation, artifact writes, stubbed
+# agent round-trips — to reach a known point; they assert nothing about
+# cancellation latency, so a slow-but-correct host must never fail them.
+# Measured on a 32-core host at load avg ~100: the same two tests span
+# 0.26s-3.09s green and were observed failing at exactly 5.01s (the
+# retired inline 5.0s literal), i.e. a >=19x wall-clock tail — which is
+# why 5.0s was inside the distribution rather than above it.  45s is 16x
+# the worst green observation and matches the value already established
+# for this exact shape (task 2350's `wait_for(<event>.wait(), timeout=45.0)`
+# in test_merge_queue_concurrent_verify.py, and MERGE_RESULT_TIMEOUT above).
+# Never-narrow: only replaces literals <=15 in test_workflow_cancellation.py.
+# Any class using it MUST also carry @pytest.mark.timeout(180) — two of
+# these barriers exceed the 60s pyproject default, which pytest-timeout's
+# thread method answers by os._exit()ing the xdist worker.
+CANCEL_SCOPE_BARRIER_TIMEOUT = 45
+
 # Constants for the process lifetime — lifted out of pydantic_spec (task 1426)
 # to avoid re-computing BaseModel reflection on every call.
 _BASEMODEL_PROPS: frozenset[str] = frozenset(
