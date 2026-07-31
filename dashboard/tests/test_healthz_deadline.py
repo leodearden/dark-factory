@@ -357,3 +357,45 @@ async def test_healthz_deadline_covers_the_connection_acquire_step(dashboard_con
     assert checks['db_reconciliation'] == 'timeout'
     assert checks['db_write_journal'] == 'ok'
     assert checks['db_runs'] == 'ok'
+
+
+# ---------------------------------------------------------------------------
+# step-7 / step-8: the deepest trap — asyncio.timeout around `async with
+# conn.execute(...)` is not hang-free, because cancellation-triggered cursor
+# cleanup issues a NEW, uncancelled await
+# ---------------------------------------------------------------------------
+
+
+async def test_healthz_returns_verdict_when_cursor_cleanup_blocks(dashboard_config):
+    """Cursor cleanup blocking on cancellation must not hang /healthz.
+
+    When asyncio.timeout's deadline fires, CancelledError is raised at
+    whatever await is in progress. If that's `fetchone()`, the exception
+    unwinds through the `async with conn.execute(...) as cursor:` block's
+    `__aexit__`, which issues a NEW `await cursor.close()` — a fresh await
+    that the ALREADY-FIRED (one-shot) timeout will not cancel again. Using
+    `block_on='fetch_and_close'` reproduces this precisely: fetchone() blocks
+    long enough for the deadline to fire *during* the with-block (consuming
+    the one cancellation), and close() then blocks with nothing left to
+    interrupt it — hanging step-6's implementation despite its deadline.
+    """
+    config = dashboard_config
+    pool = _BlockingPool(
+        {
+            config.reconciliation_db: _BlockingConn(block_on='fetch_and_close'),
+            config.write_journal_db: _BlockingConn(block_on='fetch_and_close'),
+            config.runs_db: _BlockingConn(block_on='fetch_and_close'),
+        }
+    )
+    request = _make_healthz_request(config, pool)
+
+    resp, elapsed = await _call_healthz(request, hard_cap=8.0)
+    body = _body(resp)
+
+    assert resp.status_code == 503
+    assert body['status'] == 'degraded'
+    assert elapsed < 5.0, f'elapsed {elapsed:.3f}s >= 5.0s — verdict undeliverable to curl --max-time 5'
+    checks = body['checks']
+    assert checks['db_reconciliation'] == 'timeout'
+    assert checks['db_write_journal'] == 'timeout'
+    assert checks['db_runs'] == 'timeout'
