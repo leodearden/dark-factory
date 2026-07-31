@@ -375,9 +375,24 @@ def test_classify_live_task_still_repairs_a_corrupt_files_value():
     disagree about the same record."""
     candidate = _candidate(25)
 
-    for corrupt in ("a.py", 7, {"a": 1}, [""], ["  "], [None], [None, ""]):
+    for corrupt in ("a.py", 7, {"a": 1}, [""], [None], [None, ""]):
         live = {"status": "done", "metadata": {"files": corrupt}}
         assert classify_live_task(live, candidate) == REPAIR, corrupt
+
+
+def test_classify_live_task_agrees_with_the_audit_on_a_whitespace_only_entry():
+    """THE BOUNDARY OF 'byte-identical', asserted rather than left implicit.
+
+    _coerce_file_list drops empty strings and non-strings but KEEPS a
+    whitespace-only entry (`"  "` is a truthy str). A task whose files is
+    `["  "]` therefore has non-empty metadata_files by the audit's reading and
+    is never nominated as a candidate at all. The repair must read it the same
+    way — treating it as 'no scope' here would make the repair claim damage the
+    audit does not see, which is the divergence reusing _coerce_file_list
+    exists to prevent."""
+    live = {"status": "done", "metadata": {"files": ["  "]}}
+
+    assert classify_live_task(live, _candidate(27)) == SKIP_FILES_PRESENT
 
 
 def test_classify_live_task_treats_a_non_dict_metadata_as_no_files():

@@ -48,6 +48,7 @@ from audit_wiped_metadata_files import (
     CONTRADICTED_REAL_MERGE_SHA,
     FIDELITY_FILE_LEVEL,
     WipeCandidate,
+    _coerce_file_list,
 )
 
 # Bind `shared` to the SAME checkout as this script via a __file__-relative
@@ -204,3 +205,63 @@ def build_repair_payload(candidate: WipeCandidate, *, now_iso: str) -> dict:
             "at": now_iso,
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Dispositions.
+#
+# EVERY candidate the audit surfaces ends up under exactly one of these, and
+# every one of them is printed with its count — including the zero ones. A
+# disposition that is merely absent from a report reads as "did not happen"
+# when it may well mean "was never evaluated".
+# ---------------------------------------------------------------------------
+
+REPAIR = "repair"                                # written (or would be, in a dry run)
+SKIP_CONTRADICTED = "skip_contradicted"          # constraint 2, dropped by selection
+SKIP_LOCK_LEVEL_FIDELITY = "skip_lock_level_fidelity"  # constraint 1, dropped by selection
+SKIP_LOCK_CHARTER = "skip_lock_charter"          # the interceptor would reject the files
+SKIP_NOT_TERMINAL = "skip_not_terminal"          # live task is not done/cancelled
+SKIP_FILES_PRESENT = "skip_files_present"        # already has a scope; re-run safe
+SKIP_MISSING = "skip_missing"                    # live re-read returned nothing usable
+FAILED = "failed"                                # the write was attempted and errored
+
+# Statuses this repair may write to. An ALLOWLIST, deliberately, not a
+# "not in {pending, in-progress, ...}" denylist: a status the system grows
+# later must fail CLOSED (skipped and reported) rather than silently becoming
+# writable underneath a workflow nobody has considered yet.
+TERMINAL_STATUSES = frozenset({"done", "cancelled"})
+
+
+def classify_live_task(live_task: object, candidate: WipeCandidate) -> str:
+    """Decide what to do with *candidate* given its LIVE ``get_task`` re-read.
+
+    Called immediately before each write, never resolved in advance. Task
+    3113's correction addendum documents ``_stamp_optimistic_path``
+    (orchestrator/src/orchestrator/workflow.py:4550 — located by NAME; it moved
+    from 4413 while this plan was open) writing a task's stale dispatch-time
+    ``metadata`` snapshot back as a whole blob, which is the DF 3260 clobber
+    class. Repairing underneath a live workflow is therefore not merely racy,
+    it is guaranteed to be undone — hence :data:`SKIP_NOT_TERMINAL`.
+
+    :data:`SKIP_FILES_PRESENT` is what makes this script idempotent: a second
+    pass (the one the addendum predicts will be needed once 3113 lands) re-runs
+    cheaply and touches only what is still empty.
+
+    The emptiness test reuses the audit's ``_coerce_file_list`` rather than
+    bare truthiness, so the predicate deciding "this task still has no scope"
+    is byte-identical to the one that nominated the candidate. A divergent one
+    would let the audit and the repair disagree about the same record — the
+    audit reporting damage the repair silently declines to fix.
+    """
+    if not isinstance(live_task, dict) or not live_task.get("status"):
+        return SKIP_MISSING
+    if str(live_task.get("status")) not in TERMINAL_STATUSES:
+        return SKIP_NOT_TERMINAL
+
+    metadata = live_task.get("metadata")
+    current_files = (
+        _coerce_file_list(metadata.get("files")) if isinstance(metadata, dict) else ()
+    )
+    if current_files:
+        return SKIP_FILES_PRESENT
+    return REPAIR
