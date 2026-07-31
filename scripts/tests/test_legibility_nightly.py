@@ -37,6 +37,23 @@ from legibility.config import load_config
 # Shared test fixtures
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def _isolate_trickle_state(tmp_path, monkeypatch):
+    """Point XDG_STATE_HOME at tmp_path for EVERY test in this module.
+
+    ``run_nightly`` records run state through ``trickle_state.record_run``
+    on every exit path (task 3340), so without this an ordinary test run
+    would write real state files for the fixture's synthetic
+    ``project_id=testproj`` into the operator's real
+    ``~/.local/state/dark-factory/legibility/``. Module-scoped rather than
+    scoped to the recorder tests because EVERY run_nightly test now
+    reaches the recorder — including the ones that assert on this module's
+    WARNING records, which a failed real-home write would otherwise
+    pollute.
+    """
+    monkeypatch.setenv('XDG_STATE_HOME', str(tmp_path / 'xdg-state'))
+
+
 def _write_config(
     root: Path, *, project_id: str, escalation_port: int = 8199, cwd_prefixes=None,
     agent_transcript_roots=None, max_daily_digest_bytes: int | None = None,
@@ -1909,11 +1926,6 @@ class TestRunNightlyRecordsTrickleState:
     Recording only on the happy path would let the progress probe read a
     stale streak as healthy after repeated crashes.
     """
-
-    @pytest.fixture(autouse=True)
-    def _xdg(self, tmp_path, monkeypatch):
-        """No test here may ever write to the real ~/.local/state."""
-        monkeypatch.setenv('XDG_STATE_HOME', str(tmp_path / 'xdg'))
 
     def _run(self, tmp_path, *, recorder=None, budget_bytes=None,
              invoke=_fake_invoke_known_cause, committer=None, poster=None,
