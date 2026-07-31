@@ -43,6 +43,17 @@
 __pycache__/
 *.pyc
 
+# ── Coverage artifacts — pytest-cov run products ─────────────────────
+# .coverage is a SQLite DB rewritten by every `pytest --cov` run.  One was
+# committed accidentally as shared/.coverage (task 3324).  Because the
+# project_root checkout is machine-operated (merge worker, startup
+# reconciler, git hooks all act on the working tree directly), a tracked
+# copy shows up as a perpetually-modified binary after any local test run.
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
 # ── Test SQLite artifacts — MagicMock path side-effects ──────────────
 # OverrideStore creates an SQLite DB at config.overrides_db_path; when
 # tests pass an unpatched MagicMock as config the stringified mock name
