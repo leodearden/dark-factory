@@ -59,20 +59,27 @@ TIER_BASE: dict[str, int] = {
 }
 
 # Per-process warn-once dedup for coerce_tier()'s unrecognized-value WARNING
-# below, keyed by repr(value) (safe for unhashable/non-str inputs) — mirrors
-# the b3_gate._warned_description_read_failures / sqlite_task_backend
-# ._warned_malformed_task_ids house pattern for module-level dedup sets. A
-# process restart clears the memo and re-enables the warning.
+# below, keyed by a length-capped repr(value) (safe for unhashable/non-str
+# inputs) — mirrors the b3_gate._warned_description_read_failures /
+# sqlite_task_backend._warned_malformed_task_ids house pattern for
+# module-level dedup sets. A process restart clears the memo and
+# re-enables the warning.
 #
-# Bounded because orchestrator.config is imported into the scheduler's
-# multi-day daemon process: an unbounded stream of distinct bad priority
-# values (an adversarial or corrupt tasks.json) would otherwise grow this
-# set forever. Once the cap is reached, coerce_tier() emits exactly one
-# final WARNING noting the cap and then suppresses further
-# unrecognized-priority warnings entirely (rather than either leaking
-# memory or re-flooding the log on every call past the cap).
+# Bounded in two dimensions because orchestrator.config is imported into
+# the scheduler's multi-day daemon process:
+#   - entry COUNT: an unbounded stream of distinct bad priority values (an
+#     adversarial or corrupt tasks.json) would otherwise grow this set
+#     forever. Once the cap is reached, coerce_tier() emits exactly one
+#     final WARNING noting the cap and then suppresses further
+#     unrecognized-priority warnings entirely (rather than either leaking
+#     memory or re-flooding the log on every call past the cap).
+#   - entry SIZE: the same adversarial/corrupt tasks.json could hand a
+#     large nested blob as a "priority", so both the memo key and the
+#     logged value are truncated to _MAX_PRIORITY_VALUE_REPR_LEN instead
+#     of retaining/logging the full repr().
 _warned_priority_values: set[str] = set()
 _MAX_WARNED_PRIORITY_VALUES = 1000
+_MAX_PRIORITY_VALUE_REPR_LEN = 200
 
 
 def coerce_tier(value: Any) -> str:
@@ -97,7 +104,7 @@ def coerce_tier(value: Any) -> str:
     if value is None:
         return DEFAULT_TIER
 
-    key = repr(value)
+    key = repr(value)[:_MAX_PRIORITY_VALUE_REPR_LEN]
     # Cap not yet reached and this value hasn't been warned about before —
     # if the memo is already full, or this value was already warned about,
     # fall straight through and suppress silently (the cap-reached notice
@@ -107,9 +114,13 @@ def coerce_tier(value: Any) -> str:
         and len(_warned_priority_values) < _MAX_WARNED_PRIORITY_VALUES
     ):
         _warned_priority_values.add(key)
+        # Log the (already-truncated) key rather than %r-formatting the raw
+        # value again — for a large/adversarial value that second repr()
+        # would blow the log-line-size bound the truncation above exists
+        # to enforce.
         logger.warning(
-            'coerce_tier: unrecognized priority %r, falling back to %r',
-            value,
+            'coerce_tier: unrecognized priority %s, falling back to %r',
+            key,
             DEFAULT_TIER,
             stacklevel=2,
         )
