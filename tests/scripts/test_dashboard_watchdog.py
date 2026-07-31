@@ -245,5 +245,136 @@ def test_probe_health_requests_exactly_probe_url_with_probe_timeout(monkeypatch)
     assert kwargs.get("timeout") == mod.PROBE_TIMEOUT
 
 
+# ---------------------------------------------------------------------------
+# Persisted state — the "fresh process every tick" contract
+# ---------------------------------------------------------------------------
+
+DEFAULT_STATE = {"streak": 0, "restarts": [], "ceiling_open": False}
+
+
+@pytest.fixture()
+def state_env(monkeypatch, tmp_path):
+    """Point DASHBOARD_WATCHDOG_STATE at a tmp file and yield its path.
+
+    STATE_PATH is resolved at module-import time, so this must be applied
+    BEFORE any _load_watchdog() call in the test body.
+    """
+    path = tmp_path / "wd" / "state.json"
+    monkeypatch.setenv("DASHBOARD_WATCHDOG_STATE", str(path))
+    return path
+
+
+def test_load_state_missing_file_returns_documented_defaults(state_env):
+    """A first-ever tick must not crash and must not create anything.
+
+    The oneshot runs before data/dashboard-watchdog/ exists on a fresh
+    checkout; reading is a pure query, so nothing is written until an actual
+    state change happens.
+    """
+    mod = _load_watchdog()
+    assert mod.load_state() == DEFAULT_STATE
+    assert not state_env.exists()
+    assert not state_env.parent.exists(), "load_state() must not create the state dir"
+
+
+def test_state_round_trips_across_a_fresh_module_load(state_env):
+    """THE contract this whole design exists for.
+
+    Each timer tick is a fresh ``Type=oneshot`` process, so an in-memory
+    counter would reset to 0 every 30 seconds and the streak gate would never
+    reach FAIL_STREAK. Writing with one module instance and reading with a
+    SECOND, independently-loaded instance is what actually proves that.
+    """
+    writer = _load_watchdog()
+    writer.save_state({"streak": 2, "restarts": [1753900000, 1753900100], "ceiling_open": True})
+
+    reader = _load_watchdog()
+    assert reader is not writer
+    loaded = reader.load_state()
+    assert loaded["streak"] == 2
+    assert loaded["restarts"] == [1753900000, 1753900100]
+    assert loaded["ceiling_open"] is True
+
+
+def test_load_state_corrupt_json_returns_defaults(state_env):
+    """A truncated write (power cut mid-tick) must not wedge the watchdog."""
+    state_env.parent.mkdir(parents=True, exist_ok=True)
+    state_env.write_text('{"streak": 2, "restarts": [17539', encoding="utf-8")
+
+    mod = _load_watchdog()
+    assert mod.load_state() == DEFAULT_STATE
+
+
+def test_load_state_valid_json_but_not_a_dict_returns_defaults(state_env):
+    """Valid JSON of the wrong SHAPE is a distinct failure from corrupt JSON:
+    json.load succeeds, so only an explicit isinstance check catches it."""
+    state_env.parent.mkdir(parents=True, exist_ok=True)
+    state_env.write_text("[]", encoding="utf-8")
+
+    mod = _load_watchdog()
+    assert mod.load_state() == DEFAULT_STATE
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{}',
+        '{"streak": "three", "restarts": [], "ceiling_open": false}',
+        '{"streak": 1, "restarts": "nope", "ceiling_open": false}',
+        '{"streak": 1, "restarts": [1, "x", null], "ceiling_open": false}',
+        '{"streak": -5, "restarts": [], "ceiling_open": false}',
+    ],
+)
+def test_load_state_normalises_missing_and_ill_typed_keys(state_env, payload):
+    """A hand-edited state file must not be able to crash a tick.
+
+    Every key is normalised to its declared type; a non-numeric entry inside
+    ``restarts`` is dropped rather than poisoning the later ``now - epoch``
+    arithmetic in the rolling-window prune.
+    """
+    state_env.parent.mkdir(parents=True, exist_ok=True)
+    state_env.write_text(payload, encoding="utf-8")
+
+    mod = _load_watchdog()
+    st = mod.load_state()
+    assert isinstance(st["streak"], int)
+    assert st["streak"] >= 0
+    assert isinstance(st["restarts"], list)
+    assert all(isinstance(e, int) for e in st["restarts"])
+    assert isinstance(st["ceiling_open"], bool)
+
+
+def test_save_state_leaves_no_temp_file_behind(state_env):
+    """The write is atomic (tmp + os.replace), so the state dir holds exactly
+    the state file afterwards — a leftover temp would accumulate one file per
+    tick, i.e. 2880 files a day."""
+    mod = _load_watchdog()
+    mod.save_state({"streak": 1, "restarts": [], "ceiling_open": False})
+
+    entries = sorted(p.name for p in state_env.parent.iterdir())
+    assert entries == [state_env.name], f"unexpected leftovers: {entries}"
+
+
+def test_save_state_creates_the_state_directory(state_env):
+    """data/dashboard-watchdog/ does not exist on a fresh checkout."""
+    assert not state_env.parent.exists()
+    mod = _load_watchdog()
+    mod.save_state(DEFAULT_STATE)
+    assert state_env.exists()
+
+
+def test_save_state_is_fail_soft_when_the_path_is_unwritable(monkeypatch, tmp_path):
+    """A state path that is a DIRECTORY cannot be written — the tick must
+    warn and continue, not raise. An unwritable state file degrades the
+    watchdog to stateless (it stops restarting), which is the safe direction;
+    crashing the oneshot would put the unit into 'failed'."""
+    blocked = tmp_path / "state.json"
+    blocked.mkdir()
+    monkeypatch.setenv("DASHBOARD_WATCHDOG_STATE", str(blocked))
+
+    mod = _load_watchdog()
+    mod.save_state({"streak": 1, "restarts": [], "ceiling_open": False})  # must not raise
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))
