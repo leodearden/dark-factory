@@ -363,13 +363,22 @@ same shape as Delta 4's:
    reading would freeze reclaim whenever `.lane-state/` is absent, re-creating
    the 2026-07-10 ENOSPC accretion outage.
 
-### Delta 7 — five scripts resolve their own directory without forking `dirname`
+### Delta 7 — five scripts derive paths without forking `dirname` or `basename`
 
 **`provision-warm-lane-fs.sh`, `thin-warm-lane.sh`, `warm-lane-audit.sh`,
 `warm-lane-gc.sh` and `warm-lane-gc-sweep.sh` are no longer byte-identical to
 reify.** Added by **task 3279**. Same wrong-path class as Delta 1, one cause
 removed: there the ascent was the wrong DEPTH; here the starting point itself
 silently becomes the caller's CWD.
+
+Scope, stated precisely because it grew once: this is a **five-script `dirname`
+change** (the self-directory resolutions, below) **plus a three-script
+`basename` change** (`thin-warm-lane.sh`, `warm-lane-gc.sh`,
+`warm-lane-audit.sh` — see "The `[ ... ]` vs assignment asymmetry"). The second
+half was found by review *after* the first had landed and had already written
+off the residual `basename` forks as cosmetic. It is not split into a Delta 8:
+same divergence class, same files, same task — and the provenance table's only
+drift check during the α→κ duplication window is that it stays diffable.
 
 Every one of the five resolved its own directory as
 `"$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"`. `dirname` is an **external
@@ -390,6 +399,35 @@ builtins, so the arithmetic needs nothing on `PATH`):
 | `provision-warm-lane-fs.sh` | `_SCRIPT_DIR`, **and** `_default_mount()`'s `dirname "$REPO_ROOT"`, its `basename "$parent"` and the `dirname "$parent"` in its ascend branch |
 | `warm-lane-audit.sh`, `warm-lane-gc.sh`, `warm-lane-gc-sweep.sh` | `SCRIPT_DIR` |
 | `thin-warm-lane.sh` | `_script_dir` (the `--seed-script` default) |
+
+Plus the six **non**-self-directory path derivations found by the later review
+pass, converted in the same task for the reason in "The `[ ... ]` vs assignment
+asymmetry" below:
+
+| File | Site | What it feeds |
+|---|---|---|
+| `thin-warm-lane.sh` | self-clobber guard, `basename "$_rp_lane_dir"` → `${_rp_lane_dir##*/}` | the `= "base"` refusal, 33 lines above `rm -rf "$LANE_DIR/target"` |
+| `warm-lane-gc.sh` | `BASE_TARGET`, `dirname "$MOUNT"` → guarded `%/*` | the `--mount` derivation |
+| `warm-lane-gc.sh` | `_is_reclaimable`'s `name` | diagnostics only |
+| `warm-lane-gc.sh` | classification loop's `name` | `_matches_glob "$name" "$PROTECT_GLOB"`, then `"$LANE_GLOB"` |
+| `warm-lane-gc.sh` | Pass 1 lane `name`, Pass 2 orphan `name` | `${WORKTREES_DIR}/${name}.lock`, the per-entry mutex |
+| `warm-lane-audit.sh` | resident-walk `name` | `_lane_role`, `_probe_live "$MOUNT/$name.lock"`, `_read_lane_assignment` |
+
+The five leaf extractions are plain `${X##*/}`: each operand is an assignment
+whose trailing slash the caller already stripped, so expansion and `basename`
+agree on every reachable input. `BASE_TARGET` needed the **full guarded shape**
+instead, because the derived VALUE is documented in two header comment blocks
+and must not move. Measured against `dirname` across nine inputs, which found
+two edges beyond the ones anticipated: a `--mount` with a **trailing slash**
+(`dirname /a/b/wt/` = `/a/b`, bare `%/*` = `/a/b/wt` — a silent misderivation on
+plausible operator input), fixed with the same trim-then-`%/*` shape
+`lib_lane_state.sh:141-146` already uses; and then `--mount /`, which that trim
+newly broke (trims to empty → `.` where `dirname` gives `/`), so the trim needs
+its own empty-guard alongside the `%/*` one. The result is byte-equal to
+`dirname` over `/worktrees`, `worktrees`, `/a/b/wt`, `/a/b/wt/`, `/`, `.`,
+`./x`, `a/` and the real host value. Multiple trailing slashes (`/a/b//`) still
+differ; recorded rather than papered over, and it matches `lib_lane_state.sh`'s
+existing behaviour.
 
 `provision-warm-lane-fs.sh` needed **all four** of its sites. Measured: with
 `_SCRIPT_DIR` converted and `_default_mount()` left alone, the advertised
@@ -434,6 +472,45 @@ sentinel. That gap is real and separately actionable, but it is a behaviour
 change this delta does not make: with `SCRIPT_DIR` resolved correctly the bare
 `source` failure is unreachable in every case measured.
 
+#### The `[ ... ]` vs assignment asymmetry — the rule for judging any future fork
+
+The generalisable lesson, and the reason the first pass of this delta got the
+residual forks wrong. **`set -e` does not see a failed substitution inside
+`[ ... ]`.**
+
+* `name="$(basename "$X")"` — an **assignment**. A missing binary propagates
+  **127** and `set -e` kills the script.
+* `[ "$(basename "$X")" = "base" ]` — a **test**. The substitution yields the
+  empty string, the comparison is simply **false**, and execution continues.
+
+Same missing binary, opposite blast radius. Measured on task 3279's HEAD
+`27fbfb4ea5` with `basename` shimmed to exit 127:
+
+| Site | Context | Measured |
+|---|---|---|
+| `thin-warm-lane.sh` self-clobber guard (`REIFY_WARM_LANE_MOUNT` unset, `lane_dir=<pool>/base`) | `[ ... ]` | guard **silently defeated** — `[ok] Freed <pool>/base/target`, `[ok] Thinned lane`, **rc=0**, pool seed source destroyed. Control: `refusing to thin`, rc=1, tree intact. |
+| `warm-lane-gc.sh` classification loop | assignment | abort at **rc=127** *before* `_matches_glob "$name" "$PROTECT_GLOB"` runs; protected `_merge-x` **survives**. Control: `skipping protected: _merge-x`, rc=0. |
+| `warm-lane-audit.sh` resident walk | assignment | abort at **rc=127** after the first info line; **no** report rows. Control: the `HEADROOM` / `PINNED` rows. |
+
+The `thin` site is the load-bearing half of that guard and the **only** half
+that fires when `REIFY_WARM_LANE_MOUNT` is unset — the two mount-relative checks
+above it are inside `if [ -n "${REIFY_WARM_LANE_MOUNT:-}" ]`.
+
+The two assignment sites are therefore loud and non-destructive **today — by the
+accident of their syntactic context, not by any guard**. Read that as an
+accident, not a designed safety property: nothing in either script chose it, and
+the identical fork one line-shape over deletes a pool's seed source. Converting
+them removes the dependency on the accident.
+
+Converting the gc classification site also closed a **latent bug the 127 was
+masking**: an empty `$name` matches neither `PROTECT_GLOB` nor `LANE_GLOB`, so a
+protected `_merge-*` / `_iact-*` worktree would fall through to
+`orphan_candidates` — i.e. be classified as removable. Only the abort stood
+between that and an orphan-removal pass over a protected entry.
+
+After the conversion, both scripts run under a `basename`-less `PATH` with
+output **byte-identical** to their full-`PATH` control.
+
 #### Why patch here rather than upstream to reify
 
 The rule at the top of this section makes this a real decision, not a
@@ -448,12 +525,26 @@ same class.
 
 #### What is deliberately NOT changed
 
-Cosmetic `basename "$0"` in usage and diagnostic strings **still forks**. It
-feeds no path resolution — worst case a blank program name in a usage line —
-so converting it would widen the diff across five reify byte-copies for no
-measured hazard. Recorded here so the omission reads as a decision rather than
-an oversight; the pinning test for `provision-warm-lane-fs.sh` deliberately
-does not assert on the `Usage:` line that this blanks.
+**Only the exact spelling `$(basename "$0")`, in usage and diagnostic strings,
+still forks.** It feeds no path resolution — worst case a blank program name in
+a `Usage:` line — so converting it would widen the diff across five reify
+byte-copies for nothing. The pinning test for `provision-warm-lane-fs.sh`
+deliberately does not assert on the `Usage:` line that this blanks.
+
+Note the scope, which is the correction: this claim is about **that one
+spelling**, not about `basename` generally. An earlier revision of this section
+said the residual `basename` forks were cosmetic *as a class*, at a moment when
+six non-`$0` forks remained in the very files this delta covers — one of them
+silently defeating a data-destruction guard. It told the next reader there was
+nothing here to act on.
+
+What makes the claim safe to make now is that it is **enforced rather than
+asserted**: `test_only_cosmetic_program_name_forks_remain` fails on *any*
+`$(basename ` or `$(dirname ` on a non-comment line in `warm-lane/*.sh` except
+that one spelling — matched literally, so a future `$(basename "$0" .sh)` or
+`$(dirname "$0")` is caught rather than waved through. Cosmetic-only is now true
+by construction, and a regression is caught mechanically instead of by the next
+reader trusting this paragraph.
 
 #### Pinned by
 
@@ -466,16 +557,36 @@ All in `orchestrator/tests/test_warm_lane_scripts_shipped.py`:
 * `TestSiblingResolutionIgnoresTheCallersCwd` — asserts on **which file was
   resolved** (a decoy-CWD marker), not on the exit code, for the reason above:
   the exit code is a function of the caller's CWD, not of the defect.
+* `TestThinSelfClobberGuardDoesNotDependOnPath::test_self_clobber_guard_survives_a_path_without_basename`
+  — asserts all three of: the sentinel under `<pool>/base/target` survives
+  (the actual safety property), rc≠0, and `refusing to thin` on stderr. Each
+  alone can pass for the wrong reason. Its companion case pins that a
+  normally-named `<pool>/_lane-1` still thins under the same `PATH`, so the fix
+  is shown to be a **correction** of the comparison rather than a widening of
+  it.
 * `TestNoShippedScriptResolvesItsOwnDirectoryByForking` — the directory-wide
-  drift gate. Because a script's own directory is what tells it where its libs
-  are, this idiom cannot be extracted into a sourceable helper without
-  depending on the thing it resolves (`lib_lane_state.sh` carries its own copy
-  for exactly that reason), so the five copies are deliberate. The gate is the
-  inverse of Delta 4's single-definition-site guard: instead of "this idiom
-  appears exactly once", it asserts **the forking spelling appears zero
-  times** — scoped to self-directory resolution, and skipping whole-line
-  comments, so `warm-lane-gc.sh`'s legitimate `dirname "$MOUNT"` and the libs'
-  usage headers do not false-trip it.
+  drift gate, now two tests. Because a script's own directory is what tells it
+  where its libs are, this idiom cannot be extracted into a sourceable helper
+  without depending on the thing it resolves (`lib_lane_state.sh` carries its
+  own copy for exactly that reason), so the five copies are deliberate. The
+  gate is the inverse of Delta 4's single-definition-site guard: instead of
+  "this idiom appears exactly once", it asserts **the forking spelling appears
+  zero times**.
+  * `test_no_shipped_script_resolves_its_own_directory_by_forking_dirname` —
+    the original, scoped to `$(dirname "${BASH_SOURCE` / `$(dirname "$0"`. Kept
+    as the specific, well-named self-directory gate; it names the distinct
+    `cd ""` failure mode in its message.
+  * `test_only_cosmetic_program_name_forks_remain` — the superset, added
+    because that scope is **exactly why nothing here flagged the `thin`
+    self-clobber guard**: a `basename` fork on a variable is neither spelling.
+    A gate that cannot see the class it guards is itself a defect, so the
+    widening is part of this delta rather than a follow-up.
+
+  Both skip whole-line comments, so the libs' usage headers and `warm-lane-gc.sh`'s
+  prose do not false-trip them. That exclusion is deliberately not load-bearing:
+  the two `warm-lane-gc.sh` header blocks that documented
+  `BASE_TARGET=$(dirname "$MOUNT")/base/target` were reworded to describe the
+  parent-of-`MOUNT` derivation without the fork spelling.
 
 ## Sibling-seed defaults, and who resolves them
 
