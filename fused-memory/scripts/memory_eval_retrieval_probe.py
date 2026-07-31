@@ -58,11 +58,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
+import os
 import re
 import sys
+import tempfile
 import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -2435,6 +2438,39 @@ def join_report_sections(sections: tuple[ReportSection, ...]) -> str:
     return '\n'.join(line for section in sections for line in section.lines) + '\n'
 
 
+def write_report_text(path: str | Path, text: str) -> None:
+    """Replace the report at *path* with *text*, atomically.
+
+    A plain ``write_text`` here would be a truncate-and-write over the file
+    :func:`shared.memory_eval_metrics.write_metric_series` had just written
+    atomically — and that module's ``_atomic_write_text`` exists precisely
+    because the memory-eval leaves (β/γ/δ) share one artifact root and the
+    dashboard reads these as plain files. A crash, an ENOSPC or a concurrent
+    reader mid-write would leave a truncated report beside a valid metrics
+    artifact, which is the one state the shared module's atomicity was
+    designed to exclude. Widening the report must not reopen the hole.
+
+    The mechanism is copied rather than imported: ``_atomic_write_text`` is
+    module-private in ``shared`` and this leaf holds no lock on that package.
+    :func:`tempfile.mkstemp` gives an OS-guaranteed fresh, exclusively-created
+    sibling — not a pid-derived name, which concurrent writers under the
+    shared root could collide on. A reader sees either the old contents or
+    the complete new ones; a failed write unlinks the temp and leaves nothing.
+    """
+    path = Path(path)
+    fd, tmp_name = tempfile.mkstemp(
+        suffix='.tmp', prefix=f'{path.name}.', dir=str(path.parent),
+    )
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            handle.write(text)
+        os.replace(tmp_name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
+
+
 def emit_series(series, root: str | Path, *, stamp: str | None = None) -> tuple[Path, Path]:
     """Write *series* under *root*, returning ``(metrics_path, report_path)``.
 
@@ -2493,7 +2529,6 @@ def corpus_categories() -> tuple[str, ...]:
     memory-metadata PRD, and a copy of it here would keep reporting six
     categories on the day a seventh is added — the artifact would look
     complete while silently under-counting the corpus it claims to describe.
-    A test asserts no category name appears as a literal in this file.
     """
     from fused_memory.models.enums import (  # noqa: PLC0415
         GRAPHITI_PRIMARY,
@@ -2657,9 +2692,11 @@ async def run_probe(
     metrics_path, report_path = emit_series(series, out_root, stamp=stamp)
 
     # emit_series wrote the shared render_report as the companion; replace it
-    # with the extended one. The shared write still happens first, so emit-time
-    # validation continues to gate whether any artifact is created at all — the
-    # report is only ever widened over a series that already validated.
+    # with the extended one — through the same atomic path, so the widening
+    # cannot leave a truncated report beside a valid metrics artifact. The
+    # shared write still happens first, so emit-time validation continues to
+    # gate whether any artifact is created at all — the report is only ever
+    # widened over a series that already validated.
     sections = probe_report_sections(
         series,
         observations,
@@ -2676,7 +2713,7 @@ async def run_probe(
         measured_ks=measured_ks,
     )
     report = join_report_sections(sections)
-    report_path.write_text(report, encoding='utf-8')
+    write_report_text(report_path, report)
 
     return ProbeOutcome(
         series=series,
@@ -2783,8 +2820,6 @@ async def _run(args: argparse.Namespace) -> int:
     except RegistryError as exc:
         print(str(exc), file=sys.stderr)
         return 2
-
-    import os  # noqa: PLC0415
 
     from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
     from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415

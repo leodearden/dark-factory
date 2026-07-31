@@ -1920,6 +1920,41 @@ class TestBuildSeries:
         assert series.corpus.counts['topics'] == 32
         assert series.corpus.counts['entries_probed'] == 96
 
+    def test_a_caller_supplied_count_may_not_shadow_a_run_disclosure(self):
+        """The guard is deliberately loud, so it needs a test to stay loud.
+
+        `corpus.counts` is one free-form mapping shared by the caller's
+        per-category corpus sizes and this runner's own narrowings. Silently
+        overwriting either direction would hide one of them — a corpus size
+        replaced by a disclosure is wrong, a disclosure replaced by a corpus
+        size is a silent cap. So the collision raises and names the key.
+        """
+        with pytest.raises(ValueError) as excinfo:
+            _build(counts={'degraded_queries': 1})
+
+        assert 'degraded_queries' in str(excinfo.value)
+
+    def test_the_collision_guard_covers_the_depth_keyed_disclosures_too(self):
+        m = _mod()
+        observations = m.ProbeObservations(phrasings=[
+            m.PhrasingObservation(
+                topic='a', phrasing='h', held_out=True, k=5, hit=True, rank=1,
+                matched_by=m.MATCHED_BY_CONTENT_HASH, stores_served=('mem0',),
+            ),
+        ])
+
+        with pytest.raises(ValueError) as excinfo:
+            _build(observations, counts={'observations_served_by_mem0_at_k5': 99})
+
+        assert 'observations_served_by_mem0_at_k5' in str(excinfo.value)
+
+    def test_a_non_colliding_caller_key_passes_through(self):
+        """The guard must not be a ban on caller-supplied counts."""
+        counts = _build(counts={'entities_and_relations': 12}).corpus.counts
+
+        assert counts['entities_and_relations'] == 12
+        assert counts['degraded_queries'] == 0
+
     def test_the_untopiced_disclosure_reaches_the_artifact(self):
         """The step-13 disclosure must survive into the machine-readable surface.
 
@@ -2891,6 +2926,60 @@ class TestReadOnlyGuarantee:
         assert series.eval_id == m.EVAL_ID
         assert outcome.report_path.exists()
         assert outcome.report_path.read_text(encoding='utf-8').strip()
+
+    def test_the_widened_report_replaces_the_shared_one_atomically(
+        self, monkeypatch, tmp_path,
+    ):
+        """A truncated report beside a valid metrics artifact is the one
+        state the shared module's atomicity was designed to exclude.
+
+        `write_metric_series` writes both files through temp-in-dir +
+        os.replace precisely because the memory-eval leaves share one
+        artifact root and the dashboard reads these as plain files. The
+        runner then REPLACES the report with its widened form; a plain
+        truncate-and-write there would reopen the hole a crash or a
+        concurrent reader falls into. Asserted by failing the write
+        mid-flight: the previously-written report must survive intact.
+        """
+        import asyncio  # noqa: PLC0415
+
+        m = _mod()
+        registry = _probe_registry()
+        double = _ServiceDouble(by_query=_canned_hits(registry))
+
+        def _boom(handle, text):
+            raise OSError(28, 'No space left on device')
+
+        outcome = asyncio.run(m.run_probe(
+            double, registry, project_ids=('dark_factory',), ks=(5,),
+            out_root=tmp_path, stamp='20260730T091500Z',
+        ))
+        intact = outcome.report_path.read_text(encoding='utf-8')
+
+        monkeypatch.setattr(m.os, 'replace', _boom)
+        with pytest.raises(OSError):
+            m.write_report_text(outcome.report_path, 'a widened report')
+
+        assert outcome.report_path.read_text(encoding='utf-8') == intact
+        siblings = [
+            p for p in outcome.report_path.parent.iterdir() if p.suffix == '.tmp'
+        ]
+        assert not siblings, f'a failed write left {siblings!r} behind'
+
+    def test_the_report_on_disk_is_the_widened_one_not_the_shared_one(self, tmp_path):
+        """The atomic path must still actually replace the file."""
+        import asyncio  # noqa: PLC0415
+
+        m = _mod()
+        registry = _probe_registry()
+        double = _ServiceDouble(by_query=_canned_hits(registry))
+
+        outcome = asyncio.run(m.run_probe(
+            double, registry, project_ids=('dark_factory',), ks=(5,),
+            out_root=tmp_path, stamp='20260730T091500Z',
+        ))
+
+        assert outcome.report_path.read_text(encoding='utf-8') == outcome.report
 
     def test_the_probed_project_id_is_recorded_on_the_corpus(self, tmp_path):
         """An ephemeral run must never be mistakable for a live one."""
