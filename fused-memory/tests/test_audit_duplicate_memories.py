@@ -4283,3 +4283,87 @@ class TestLivenessRecurrenceMetrics:
             corpus_counts={c: len(v) for c, v in records.items()},
             run_stamp='20260731T000000Z',
         ))
+
+
+def _liveness_raw_corpus() -> dict[str, list[dict]]:
+    """The real four records in scroll_by_metadata's raw payload shape."""
+    return {_OS: [
+        _raw('6b245659', _LIVENESS_SNAPSHOT_94_JUL24, _TS_94_JUL24, _OS,
+             {'task_id': '94', 'kind': 'stranded_task_investigation'}),
+        _raw('08aa0017', _LIVENESS_SNAPSHOT_96_JUL24, _TS_96_JUL24, _OS,
+             {'task_id': '96', 'kind': 'live_workflow_deferral_note'}),
+        _raw('68dd5f93', _INVESTIGATION_NOTE_96, _TS_NOTE_96, _OS,
+             {'task_id': '96', 'kind': 'investigation_note'}),
+        _raw('1eef7df7', _LIVENESS_REVERIFY_94_96_JUL26, _TS_REVERIFY, _OS,
+             {'task_id': '99', 'related_task_ids': ['94', '96'],
+              'kind': 'task_lifecycle_reverification'}),
+    ]}
+
+
+@pytest.mark.asyncio
+class TestRunLivenessRecurrenceWiring:
+    """End to end on the real corpus: the report and the metrics both carry it."""
+
+    async def _parse(self, tmp_path, *argv):
+        return _build_parser().parse_args(
+            ['--project-id', 'p', '--metrics-root', str(tmp_path), *argv],
+        )
+
+    async def test_stdout_report_carries_the_recurrences(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        _install_run_doubles(monkeypatch, _liveness_raw_corpus())
+
+        rc = await _run(await self._parse(tmp_path))
+        plan = json.loads(capsys.readouterr().out)
+
+        assert rc == 0
+        assert plan['liveness_snapshot_recurrence_clusters'] == 2
+        assert [g['subject_task_id']
+                for g in plan['liveness_snapshot_recurrence_groups']] == ['94', '96']
+        assert plan['liveness_snapshot_disclosure'] == dict.fromkeys(
+            _LIVENESS_DISCLOSURE_KEYS, 0,
+        )
+        assert plan['delete_candidates'] == [], 'detection only — never a delete'
+
+    async def test_metric_series_carries_the_count_and_both_disclosures(
+        self, monkeypatch, tmp_path,
+    ):
+        from shared.memory_eval_metrics import (  # noqa: PLC0415
+            RUN_STAMP_ENV_VAR,
+            load_metric_series,
+        )
+
+        monkeypatch.setenv(RUN_STAMP_ENV_VAR, _STAMP)
+        _install_run_doubles(monkeypatch, _liveness_raw_corpus())
+        await _run(await self._parse(tmp_path))
+
+        series = load_metric_series(tmp_path / _EVAL_ID / f'metrics-{_STAMP}.json')
+        by_id = _by_id(series.metrics)
+
+        assert by_id[f'liveness_snapshot_recurrences.{_OS}'].value == 2.0
+        # Run-global scope: these are properties of ONE pass over the whole
+        # scanned set, not of a category, so a per-category split would be a
+        # fabricated attribution.
+        for key in _LIVENESS_DISCLOSURE_KEYS:
+            assert f'{key}.{_GLOBAL_SCOPE}' in by_id, f'{key} must be disclosed'
+        for key in (*_ANN_DISCLOSURE_KEYS, *_PLAN_DISCLOSURE_KEYS):
+            assert f'{key}.{_GLOBAL_SCOPE}' in by_id, 'the ANN disclosures survive'
+
+    async def test_no_metrics_still_writes_no_artifact(self, monkeypatch, tmp_path):
+        _install_run_doubles(monkeypatch, _liveness_raw_corpus())
+        await _run(await self._parse(tmp_path, '--no-metrics'))
+
+        assert list(tmp_path.iterdir()) == []
+
+
+class TestLivenessDetectorAddsNoCliSurface:
+    """The detector is O(n), always runs and never deletes -- so no knob."""
+
+    def test_scheduled_invocation_contract_is_byte_for_byte_unchanged(self):
+        """Task 3136 schedules `--project-id X [--apply]`; no new flag was added."""
+        dry = _build_parser().parse_args(['--project-id', 'X'])
+        applied = _build_parser().parse_args(['--project-id', 'X', '--apply'])
+
+        assert (dry.project_id, dry.apply) == ('X', False)
+        assert (applied.project_id, applied.apply) == ('X', True)
