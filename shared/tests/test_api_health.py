@@ -464,3 +464,67 @@ class TestProbeClose:
         assert isinstance(await _report_ok(strict, 1), Probing)
         assert isinstance(await _report_ok(strict, 1), Probing)
         assert isinstance(await _report_ok(strict, 1), Closed)
+
+
+class TestProbeRegression:
+    """step-17: a failed probe returns to Open without restarting the outage clock."""
+
+    async def test_failure_while_probing_returns_to_open(self) -> None:
+        gate, _mono, _wall = _gate()
+        await _report_failures(gate, 8)
+        assert isinstance(await _report_ok(gate, 1), Probing)
+        state = await _report_failures(gate, 1)
+        assert isinstance(state, Open)
+        assert gate.is_degraded is True
+
+    async def test_since_is_the_original_trip_not_restamped(self) -> None:
+        """The L2 promotion clock must measure the TRUE continuous outage.
+
+        Restamping on every probe flap would let a provider that fails one
+        probe every 90 minutes stay Open indefinitely and never promote to
+        L2 — precisely the storm-escape decision 12 exists to prevent.
+        """
+        gate, _mono, wall = _gate()
+        opened = await _report_failures(gate, 8)
+        assert isinstance(opened, Open)
+        wall.advance(5400)
+        await _report_ok(gate, 1)
+        wall.advance(5400)
+        state = await _report_failures(gate, 1)
+        assert isinstance(state, Open)
+        assert state.since == opened.since
+        assert state.since == _WALL
+
+    async def test_stats_are_refreshed_from_the_current_window(self) -> None:
+        """since is preserved, but the evidence is not frozen at the first trip."""
+        gate, _mono, _wall = _gate()
+        opened = await _report_failures(gate, 8)
+        assert isinstance(opened, Open)
+        await _report_ok(gate, 1)
+        state = await _report_failures(gate, 1)
+        assert isinstance(state, Open)
+        assert state.stats.completions == 10
+        assert state.stats.failures == 9
+        assert state.stats != opened.stats
+
+    async def test_streak_resets_to_zero_not_resumed(self) -> None:
+        """After a failed probe it takes a FULL fresh streak to close."""
+        gate, _mono, _wall = _gate()
+        await _report_failures(gate, 8)
+        await _report_ok(gate, 1)
+        await _report_failures(gate, 1)
+        state = await _report_ok(gate, 1)
+        assert isinstance(state, Probing), 'streak resumed at 1 and closed too early'
+        assert state.consecutive_successes == 1
+        state = await _report_ok(gate, 1)
+        assert isinstance(state, Closed)
+
+    async def test_failure_while_open_keeps_since_and_refreshes_stats(self) -> None:
+        gate, _mono, wall = _gate()
+        opened = await _report_failures(gate, 8)
+        assert isinstance(opened, Open)
+        wall.advance(600)
+        state = await _report_failures(gate, 1)
+        assert isinstance(state, Open)
+        assert state.since == opened.since
+        assert state.stats.failures == 9
