@@ -58,6 +58,13 @@ extract_liveness_snapshot_fact = _mod.extract_liveness_snapshot_fact
 liveness_snapshot_subject_task_ids = _mod.liveness_snapshot_subject_task_ids
 find_liveness_snapshot_recurrences = _mod.find_liveness_snapshot_recurrences
 _LIVENESS_DISCLOSURE_KEYS = _mod._LIVENESS_DISCLOSURE_KEYS
+# Bound here, off the module, so the regex-budget class below can delegate to
+# the REAL compiled patterns while a counting proxy stands in their place on
+# `_mod`. Captured once at import, so a monkeypatched module global can never
+# make these aliases stale.
+POINT_IN_TIME_CHECK_RE = _mod.POINT_IN_TIME_CHECK_RE
+LIVE_TASK_STATUS_RE = _mod.LIVE_TASK_STATUS_RE
+_LIVE_FIELD_NAMES = _mod._LIVE_FIELD_NAMES
 apply_deletions = _mod.apply_deletions
 resolve_ann_threshold = _mod.resolve_ann_threshold
 fetch_ann_neighbors = _mod.fetch_ann_neighbors
@@ -4367,3 +4374,216 @@ class TestLivenessDetectorAddsNoCliSurface:
 
         assert (dry.project_id, dry.apply) == ('X', False)
         assert (applied.project_id, applied.apply) == ('X', True)
+
+
+# An ordinary reconciliation observation at the size real ones run (~2 KB),
+# carrying NO LIVE_TASK_STATUS_RE marker and no point-in-time framing: the
+# overwhelming majority of what a default 5000-records-per-category scan walks,
+# and precisely the non-matching input on which POINT_IN_TIME_CHECK_RE's two
+# `(?=.*...)` lookaheads are at their quadratic worst.
+_LONG_PROSE_NO_MARKER = (
+    'Stage 1 walked the merge lane for reconciliation cycle 812 and traced '
+    'every handoff between the coordinator, the merge worker and the pooled '
+    'worktree lanes. The coordinator picked up three queued branches in the '
+    'order they were enqueued and rebased each one onto the tip of main '
+    'before handing it to the worker; two landed cleanly and the third came '
+    'back with a conflict in the shared fixture module, which the worker '
+    'parked on the retry shelf rather than forcing. A direct read of the lane '
+    'pool directory shows all four pooled lanes present with populated '
+    'virtualenvs, and the reflog for each lane advances monotonically with no '
+    'rewind. The pre-merge-commit hook fired on every landing and its pyright '
+    'pass took just under two minutes per invocation, which is the dominant '
+    'cost of a landing and the reason the queue drains slowly whenever three '
+    'or more branches arrive together. Nothing in the worker log suggests a '
+    'wedged unit: the watchdog probe answered on its first attempt each cycle '
+    'and the fleet-deploy clock was never consulted. The one thing worth '
+    'carrying forward is that the conflicted branch has now been parked twice '
+    'for the same fixture hunk, so whoever picks it up should rebase it by '
+    'hand instead of re-queueing it and expecting a different outcome. Two '
+    'further branches sit behind it in the queue and will inherit the same '
+    'conflict if that fixture is not reconciled first. The lane that carried '
+    'the conflicted branch was released back to the pool without a reset, so '
+    'its working tree still holds the half-applied rebase; a future claimant '
+    'will find a dirty tree and should reset it before starting rather than '
+    'committing over the leftovers. No escalation was filed during this pass '
+    'and no task changed state, so this note is a pure observation of the '
+    'lane mechanics and carries no disposition of its own.'
+)
+
+
+class _CountingPattern:
+    """A delegating stand-in for a compiled pattern that counts `.search`.
+
+    Delegates to the real pattern rather than stubbing it, so behaviour is
+    unchanged and the class below measures COST, not semantics. It exposes
+    `search` and nothing else on purpose: if the implementation ever reaches
+    for `.match`/`.findall`/`.finditer` on this pattern, the AttributeError
+    surfaces that here instead of letting an uncounted consult pass as free.
+    """
+
+    def __init__(self, pattern):
+        self._pattern = pattern
+        self.searches = 0
+
+    def search(self, string, *args, **kwargs):
+        self.searches += 1
+        return self._pattern.search(string, *args, **kwargs)
+
+
+class TestLivenessDetectorRegexBudget:
+    """How many times the QUADRATIC pattern may be consulted, per record.
+
+    `POINT_IN_TIME_CHECK_RE` carries two `(?=.*...)` lookaheads under
+    `re.DOTALL`, so on non-matching input its cost grows with the square of
+    the content length, while the lookahead-free `LIVE_TASK_STATUS_RE` stays
+    linear. It is currently the FIRST gate applied to every swept record, and
+    the disclosure branch re-evaluates it — so ordinary prose, which cannot
+    produce a group at all, pays the worst case twice per record across a
+    detector that always runs and has no flag to disable it.
+
+    Consult COUNTS, never wall-clock timings: a timing assertion would pin the
+    machine and the CI load of the day rather than the algorithm.
+    """
+
+    @pytest.fixture
+    def consults(self, monkeypatch):
+        """Install the counter as the script's module global.
+
+        The script looks `POINT_IN_TIME_CHECK_RE` up on its own module at call
+        time, so patching `_mod` reaches every call site at once.
+        """
+        counter = _CountingPattern(POINT_IN_TIME_CHECK_RE)
+        monkeypatch.setattr(_mod, 'POINT_IN_TIME_CHECK_RE', counter)
+        return counter
+
+    def test_the_prose_fixture_really_is_marker_free_and_long(self):
+        """Fixture guard: a marker creeping in would make the headline case vacuous."""
+        assert not LIVE_TASK_STATUS_RE.search(_LONG_PROSE_NO_MARKER)
+        assert not POINT_IN_TIME_CHECK_RE.search(_LONG_PROSE_NO_MARKER)
+        assert len(_LONG_PROSE_NO_MARKER) > 1500, 'the size real observations run'
+
+    def test_long_prose_without_a_live_marker_is_never_consulted(self, consults):
+        """The headline failure, and the dominant corpus cost."""
+        groups, disclosure = find_liveness_snapshot_recurrences(
+            [_dated('prose', _LONG_PROSE_NO_MARKER, _TS_94_JUL24, category=_OS)],
+        )
+
+        assert consults.searches == 0, (
+            'a non-matching string is the quadratic worst case, and ordinary '
+            'prose is most of the corpus'
+        )
+        assert groups == []
+        assert disclosure == dict.fromkeys(_LIVENESS_DISCLOSURE_KEYS, 0)
+
+    def test_a_recognised_snapshot_is_consulted_exactly_once(self, consults):
+        """Pins that the fix does not regress the case the detector exists for."""
+        groups, _ = find_liveness_snapshot_recurrences(
+            [_dated('6b245659', _LIVENESS_SNAPSHOT_94_JUL24, _TS_94_JUL24,
+                    category=_OS, metadata={'task_id': '94'})],
+        )
+
+        assert consults.searches == 1, 'the classification itself, and nothing more'
+        assert groups == [], 'one snapshot is a singleton, not a recurrence'
+
+    def test_an_unfielded_paraphrase_is_consulted_once_and_still_counted(
+        self, consults,
+    ):
+        """The load-bearing case for choosing the BROADER prefilter.
+
+        This is the one record class that matches `LIVE_TASK_STATUS_RE` (via
+        the "actively driven by" paraphrase) but NOT
+        `_LIVE_FIELD_ASSIGNMENT_RE`. Prefiltering on the narrower assignment
+        pattern would read as one consult here too, while silently driving
+        `liveness_snapshot_unfielded` to a permanent zero — turning a counted
+        loss back into an invisible one.
+        """
+        _, disclosure = find_liveness_snapshot_recurrences(
+            [_dated('p', _LIVENESS_SNAPSHOT_UNFIELDED, _TS_94_JUL24,
+                    category=_OS, metadata={'task_id': '94'})],
+        )
+
+        assert consults.searches == 1, 'consulted for the classification, not twice'
+        assert disclosure['liveness_snapshot_unfielded'] == 1, (
+            'the disclosure must survive the prefilter'
+        )
+
+    def test_an_unswept_category_does_no_content_work(self, consults):
+        """The category check stays ahead of anything that reads content."""
+        find_liveness_snapshot_recurrences(
+            [_dated('6b245659', _LIVENESS_SNAPSHOT_94_JUL24, _TS_94_JUL24,
+                    category=_OS, metadata={'task_id': '94'})],
+            categories=(_PK,),
+        )
+
+        assert consults.searches == 0
+
+    def test_consults_do_not_scale_with_corpus_size(self, consults):
+        """Fifty marker-free records in ONE call still cost nothing."""
+        corpus = [
+            _dated(f'prose-{i}', f'{_LONG_PROSE_NO_MARKER} Lane {i}.',
+                   _TS_94_JUL24, category=_OS)
+            for i in range(50)
+        ]
+
+        groups, disclosure = find_liveness_snapshot_recurrences(corpus)
+
+        assert consults.searches == 0, 'the expensive pattern must not scale with n'
+        assert groups == []
+        assert disclosure == dict.fromkeys(_LIVENESS_DISCLOSURE_KEYS, 0)
+
+    def test_a_mixed_corpus_consults_only_records_that_could_be_snapshots(
+        self, consults,
+    ):
+        """The real four buried in bulk prose: same groups, three consults."""
+        corpus = _liveness_corpus() + [
+            _dated(f'prose-{i}', f'{_LONG_PROSE_NO_MARKER} Lane {i}.',
+                   _TS_94_JUL24, category=_OS)
+            for i in range(50)
+        ]
+
+        groups, disclosure = find_liveness_snapshot_recurrences(corpus)
+
+        assert consults.searches == 3, (
+            'only the three records carrying a live-status marker — the '
+            'prose-only investigation note and the 50 fillers never reach it'
+        )
+        assert [(g['subject_task_id'], g['member_ids']) for g in groups] == [
+            ('94', ['1eef7df7', '6b245659']),
+            ('96', ['08aa0017', '1eef7df7']),
+        ]
+        assert disclosure == dict.fromkeys(_LIVENESS_DISCLOSURE_KEYS, 0)
+
+    def test_the_public_extractor_keeps_its_single_arg_contract(self, consults):
+        """Still one argument, still None/key — and free on a marker-free record."""
+        no_marker = _memory('prose', _LONG_PROSE_NO_MARKER, category=_OS)
+        snapshot = _memory('6b245659', _LIVENESS_SNAPSHOT_94_JUL24, category=_OS)
+
+        assert extract_liveness_snapshot_fact(no_marker) is None
+        assert consults.searches == 0, 'no marker -> the expensive pattern is skipped'
+
+        assert extract_liveness_snapshot_fact(snapshot) == _CORE_FACT_STRANDED
+        assert consults.searches <= 1, 'at most one consult for a real snapshot'
+
+    @pytest.mark.parametrize('field', _LIVE_FIELD_NAMES)
+    def test_every_local_field_name_is_one_the_imported_gate_recognises(self, field):
+        """The premise that makes the cheap prefilter SOUND.
+
+        The prefilter is only semantics-preserving while every name in
+        `_LIVE_FIELD_NAMES` is one `LIVE_TASK_STATUS_RE` also matches in
+        assignment form. A later edit adding a field here without a matching
+        `task_filter` change would otherwise start silently DROPPING real
+        snapshots instead of merely counting them.
+        """
+        assert LIVE_TASK_STATUS_RE.search(f'{field}=x'), (
+            f'{field}= must be visible to the gate the prefilter delegates to'
+        )
+
+    def test_the_motivating_corpus_is_output_identical(self):
+        """Refactor equivalence: the optimization changes cost, never output."""
+        groups, disclosure = find_liveness_snapshot_recurrences(_liveness_corpus())
+
+        assert [(g['subject_task_id'], g['member_ids']) for g in groups] == [
+            ('94', ['1eef7df7', '6b245659']),
+            ('96', ['08aa0017', '1eef7df7']),
+        ]
+        assert disclosure == dict.fromkeys(_LIVENESS_DISCLOSURE_KEYS, 0)
