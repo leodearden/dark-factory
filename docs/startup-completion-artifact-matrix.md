@@ -35,8 +35,12 @@ guard is `not seen_turn and live_turns == 0 and elapsed >= startup_grace_secs`
 (`shared/src/shared/cli_invoke.py:2111`), and `live_turns` is assigned **only** when
 `count_transcript_turns` returns non-`None` (`:2088-2091`). Those wedges have no transcript, so
 `count_transcript_turns` returns `None`, `live_turns` stays `None`, and `live_turns == 0` is never
-true. Measured over all 14 corpus rows (§5), today's kill fires on **exactly three**: the two
-healthy pre-first-token rows and the truncated-transcript degrade. The guard's own comment says it
+true. Measured over all 14 corpus rows (§5), today's kill fires on **exactly four** — the rows
+whose `count_transcript_turns` is `0`: `healthy_pre_first_token_5rec`,
+`healthy_pre_first_token_4rec`, `wedge_mcp_init_hang_pre_first_token`, and the
+`wedge_transcript_unreadable_truncated` degrade. (`test_today_kill_row_count` recomputes this from
+the corpus.) Note what that list does *not* contain: no `from_source_build` or `uv_resolving` row.
+The guard's own comment says it
 "catches genuine from-source-build / uv / MCP-startup wedges" — on this evidence it does not; those
 wedges are already carried through to the per-role ceiling by the `None`-degrade. What the 120 s
 kill actually fires on is the *healthy* pre-first-token state, which is precisely the 2026-07-29
@@ -51,9 +55,11 @@ healthy. So this shape is **unvalidated as a wedge**, not "discriminated" — se
 `risk_identified` note filed to ν.
 
 Consequence for C5: the predicate's verdict differs from today's behaviour on **one** observed
-state — a materialised transcript with zero assistant turns — and on the measured evidence that
-state is the healthy pre-first-token one. C5 is a targeted fix for the incident shape, not a
-broad re-arming of the startup watchdog.
+artifact state — a materialised, readable transcript with zero assistant turns — which occurs on
+**three** corpus rows: both healthy pre-first-token samples *and*
+`wedge_mcp_init_hang_pre_first_token`. C5 is a targeted fix for the incident shape, but it is not
+confined to the healthy path: it also changes behaviour on a PRD-named wedge shape, bounded by the
+per-role ceiling (§5, §6). It is not a broad re-arming of the startup watchdog.
 
 ---
 
@@ -214,9 +220,16 @@ startup kill does not fire, and the invocation is carried to the per-role ceilin
 today. Nothing new is needed for this case; it is a matter of not accidentally folding `None` into
 `False`.
 
-**The one thing C5 changes.** Across all 14 rows, C5's verdict differs from today's on exactly the
-two `healthy_pre_first_token_*` rows: KILL → no kill. That is the whole delta, and it is the
-incident.
+**What C5 changes.** Across all 14 rows, C5's verdict differs from today's on **exactly three**:
+both `healthy_pre_first_token_*` rows *and* `wedge_mcp_init_hang_pre_first_token`, all KILL → no
+kill. That is the whole delta. (`test_c5_delta_rows` recomputes it from the corpus.)
+
+Two of the three are the incident shape. The third is a PRD-named wedge shape, so C5's blast radius
+is **not** confined to the healthy path — read §6 before sizing it: on that capture the run was not
+actually wedged (F3), and if a real MCP-init hang did stall post-transcript, C5 extends it 120 s →
+900 s, per-role-ceiling capped. The remaining today-kill row,
+`wedge_transcript_unreadable_truncated`, is where C5 agrees with today: predicate `False` → still
+KILL.
 
 ---
 

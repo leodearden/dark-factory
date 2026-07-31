@@ -162,6 +162,90 @@ class TestCorpusLoads:
         assert len(ids) == len(set(ids)), f'duplicate row ids: {sorted(ids)}'
 
 
+class TestReportedCountsMatchTheCorpus:
+    """Guard the quantified claims in docs/startup-completion-artifact-matrix.md.
+
+    §1 F2 and §5 state how many rows today's watchdog kills and how many C5
+    changes.  Those numbers were hand-counted once and drifted from the data
+    (they said three and two; the corpus says four and three), and no test
+    noticed because every other test checks row *shape*, not aggregates.
+    These recompute both from the corpus, so prose and data cannot diverge
+    again silently.
+
+    Pinned as id sets rather than bare counts: a bare count still passes when
+    one row leaves the set and another joins, and the failure message should
+    name the row that moved.
+    """
+
+    # Today: shared/src/shared/cli_invoke.py:2111 kills iff
+    # `not seen_turn and live_turns == 0 and elapsed >= startup_grace_secs`,
+    # and live_turns is only assigned when count_transcript_turns is non-None
+    # (:2088-2091) — so `None` never kills and the predicate is `turns == 0`.
+    TODAY_KILL_IDS = frozenset({
+        'healthy_pre_first_token_5rec',
+        'healthy_pre_first_token_4rec',
+        'wedge_mcp_init_hang_pre_first_token',
+        'wedge_transcript_unreadable_truncated',
+    })
+
+    # C5: kill only when the predicate is explicitly False.  The delta against
+    # today is therefore the today-kill rows whose predicate is NOT False —
+    # None degrades to today's behaviour, so it is never part of the delta.
+    C5_DELTA_IDS = frozenset({
+        'healthy_pre_first_token_5rec',
+        'healthy_pre_first_token_4rec',
+        'wedge_mcp_init_hang_pre_first_token',
+    })
+
+    def test_today_kill_row_count(self):
+        rows = scf.load_startup_completion_corpus()
+        fires = {
+            row['id']
+            for row in rows
+            if row['substrate_returns']['count_transcript_turns'] == 0
+        }
+        assert fires == self.TODAY_KILL_IDS, (
+            "today's 120 s kill fires on a different row set than §1 F2 reports; "
+            f'corpus says {sorted(fires)}, doc says {sorted(self.TODAY_KILL_IDS)}'
+        )
+        # The doc's headline number, asserted as a number too.
+        assert len(fires) == 4
+
+    def test_c5_delta_rows(self):
+        rows = scf.load_startup_completion_corpus()
+        by_id = {row['id']: row for row in rows}
+        delta = {
+            row_id
+            for row_id in self.TODAY_KILL_IDS
+            if by_id[row_id]['expected_startup_complete'] is not False
+        }
+        assert delta == self.C5_DELTA_IDS, (
+            "C5's delta against today differs from what §5 reports; "
+            f'corpus says {sorted(delta)}, doc says {sorted(self.C5_DELTA_IDS)}'
+        )
+        assert len(delta) == 3
+
+    def test_the_delta_is_not_confined_to_the_healthy_regime(self):
+        # The specific understatement that was corrected: the delta includes a
+        # PRD-named wedge shape, so 3326 must not size C5's blast radius as
+        # "healthy path only".
+        rows = {row['id']: row for row in scf.load_startup_completion_corpus()}
+        regimes = {rows[row_id]['regime'] for row_id in self.C5_DELTA_IDS}
+        assert regimes == {'healthy', 'wedge'}, (
+            f'expected the C5 delta to span both regimes, got {sorted(regimes)}'
+        )
+
+    def test_no_build_or_uv_wedge_is_killed_today(self):
+        # F2's load-bearing negative claim: today's kill is already inert on the
+        # wedge shapes its own source comment says it catches.
+        for row in scf.load_startup_completion_corpus():
+            if row['wedge_shape'] in {'from_source_build', 'uv_resolving'}:
+                assert row['substrate_returns']['count_transcript_turns'] is None, (
+                    f'{row["id"]}: F2 asserts these wedges never materialise a '
+                    f'transcript, so today\'s kill cannot fire on them'
+                )
+
+
 def _base_row() -> dict[str, Any]:
     """A known-good, fully-populated row to mutate: healthy, transcript present.
 
