@@ -148,6 +148,7 @@ __all__ = [
     'ended_awaiting_background_for_session',
     'invoke_claude_agent',
     'invoke_with_cap_retry',
+    'is_server_error_status',
     'is_timed_out_with_progress',
     'is_zero_output_timeout',
     'read_transcript_records',
@@ -544,6 +545,37 @@ def is_timed_out_with_progress(result: AgentResult) -> bool:
     - task γ: decides whether to resume a killed productive run.
     """
     return result.timed_out and (result.transcript_turns or 0) > 0
+
+
+def is_server_error_status(status: int | None) -> bool:
+    """Return True when *status* is a server-side HTTP error (5xx).
+
+    PRD contract C1 (plans/server-side-api-error-handling-prd.md): a 5xx —
+    including 529 "Overloaded" — is a PROVIDER-side failure.  It is not
+    account-scoped and not caused by anything local, so it must be routed to
+    the transient-requeue lane rather than to cap/auth accounting.
+
+    This is the single canonical definition (INV-5) shared by:
+
+    - The ``ServerError`` tier in ``shared.invocation_outcome.
+      classify_invocation`` (ranked below CapHit/NearCap, above
+      ZeroOutputWedge).
+    - ``classify_agent_failure``'s 5xx rule, which emits the verbatim
+      ``agent API error: HTTP <status>`` marker.
+    - Via ``shared``'s re-export, the orchestrator scheduler / workflow
+      consumers landing in PRD tasks beta/gamma/delta.
+
+    Every one of those callers must call THIS function rather than inline a
+    ``500 <= n <= 599`` check, so the band has exactly one definition.
+
+    ``None`` means "no structured status was reported" and is False — the
+    absence of evidence is never evidence of a server error.
+
+    4xx statuses deliberately fall OUTSIDE this band so the existing routing is
+    untouched: 401/403 stay with ``AuthFailed``, 404 with ``ModelNotFound``,
+    and 429 keeps its cap carve-out.
+    """
+    return status is not None and 500 <= status <= 599
 
 
 class AgentFailureKind(enum.StrEnum):
