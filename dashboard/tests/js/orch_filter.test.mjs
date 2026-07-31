@@ -12,11 +12,8 @@
 // therefore default-import the module and destructure instead (mirrors
 // runtime_format.test.mjs / prd_grouping.test.mjs / graph_layout.test.mjs).
 //
-// The regression under test (task 3313): the empty cell used to read
-// `No {filter === 'all' ? '' : filter + ' '}tasks`, but `filter` is an
-// object ({active, pending, complete}) — so the equality was permanently
-// false and the concatenation stringified to the literal
-// "No [object Object] tasks" on an operator's screen.
+// The regression under test (task 3313) is described once, in orch_filter.js's
+// own header comment.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
@@ -149,50 +146,27 @@ test('orchEmptyLabel: an empty object is the none-selected state', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Defensive input — getFilter carries a back-compat branch for "old string
-// values" persisted in localStorage under df.orch.filter, so a non-object
-// argument is a shape this helper can genuinely be handed. It must degrade to
-// the none-selected sentence rather than throwing (which would take the whole
-// Orchestrators tab down — strictly worse than the bug being fixed).
+// Defensive input — a non-object argument must not throw (a throw during
+// render takes out all of OrchTab, not just this cell). getFilter normalises
+// every stored value, including the legacy strings, to a three-boolean object
+// before calling us, so these shapes are unreachable in practice; when the
+// branch does run it mirrors getFilter's own DEFAULT_FILTER (active-only)
+// rather than inventing a third behaviour, so the sentence agrees with what
+// the table would actually be showing.
 // ---------------------------------------------------------------------------
 
-test('orchEmptyLabel: undefined does not throw and reads as none-selected', () => {
-  assert.equal(orchEmptyLabel(undefined), NONE_SELECTED);
+const GET_FILTER_DEFAULT_LABEL = 'No active tasks';
+
+test('orchEmptyLabel: undefined does not throw and mirrors getFilter\'s default', () => {
+  assert.equal(orchEmptyLabel(undefined), GET_FILTER_DEFAULT_LABEL);
 });
 
-test('orchEmptyLabel: null does not throw and reads as none-selected', () => {
-  assert.equal(orchEmptyLabel(null), NONE_SELECTED);
+test('orchEmptyLabel: null does not throw and mirrors getFilter\'s default', () => {
+  assert.equal(orchEmptyLabel(null), GET_FILTER_DEFAULT_LABEL);
 });
 
-test('orchEmptyLabel: the legacy \'all\' string shape reads as none-selected', () => {
-  assert.equal(orchEmptyLabel('all'), NONE_SELECTED);
-});
-
-// ---------------------------------------------------------------------------
-// The regression itself — no rendered label may ever leak a stringified
-// object or a stray `undefined` into the operator's view, in ANY state.
-// ---------------------------------------------------------------------------
-
-test('orchEmptyLabel: no state ever renders "[object Object]" or "undefined"', () => {
-  const inputs = [
-    ...ALL_COMBINATIONS.map(([filter]) => filter),
-    undefined,
-    null,
-    'all',
-    {},
-    { active: true },
-    { complete: true, active: true },
-  ];
-  for (const filter of inputs) {
-    const label = orchEmptyLabel(filter);
-    assert.equal(typeof label, 'string', `label for ${JSON.stringify(filter)} should be a string`);
-    assert.ok(
-      !label.includes('[object Object]'),
-      `label for ${JSON.stringify(filter)} leaked a stringified object: ${label}`,
-    );
-    assert.ok(
-      !label.includes('undefined'),
-      `label for ${JSON.stringify(filter)} leaked "undefined": ${label}`,
-    );
-  }
+test('orchEmptyLabel: the legacy \'all\' string shape mirrors getFilter\'s default', () => {
+  // getFilter maps this exact stored shape to DEFAULT_FILTER = active-only,
+  // so the label must say "active", not "no filters selected".
+  assert.equal(orchEmptyLabel('all'), GET_FILTER_DEFAULT_LABEL);
 });

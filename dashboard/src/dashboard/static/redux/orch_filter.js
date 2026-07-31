@@ -49,13 +49,19 @@ const ORCH_FILTER_NONE_SELECTED =
   'No filters selected — choose Active, Pending or Complete above';
 
 // ── Empty-state label for a given filter state ──
-// Accepts anything: a non-object argument (including the old string values
-// getFilter's back-compat branch still admits from localStorage) degrades to
-// the none-selected sentence rather than throwing, which would take the whole
-// Orchestrators tab down via tabs.jsx's top-level destructure — strictly worse
-// than the bug this replaces.
+// The only producer is OrchTab's getFilter (tabs.jsx), which always hands us a
+// normalised {active, pending, complete} object — the legacy string values it
+// still tolerates in localStorage are mapped to DEFAULT_FILTER before they ever
+// reach this function. The non-object branch below is therefore unreachable in
+// practice and exists only so a future caller cannot make this throw (a throw
+// during render takes out all of OrchTab, not just this one cell).
+//
+// It falls back to getFilter's own default — active-only — rather than
+// inventing a third behaviour: were the branch ever reached, the table would in
+// fact be showing the active facet, and a "no filters selected" sentence would
+// point the operator at a remedy that isn't the problem.
 function orchEmptyLabel(filter) {
-  const f = (filter && typeof filter === 'object') ? filter : {};
+  const f = (filter && typeof filter === 'object') ? filter : { active: true };
   const names = ORCH_FILTER_FACETS.filter(([key]) => f[key]).map(([, name]) => name);
 
   if (names.length === 0) return ORCH_FILTER_NONE_SELECTED;
