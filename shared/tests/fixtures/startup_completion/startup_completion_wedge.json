@@ -1,0 +1,596 @@
+{
+  "task": "3324",
+  "prd": "plans/server-side-api-error-handling-prd.md",
+  "consumer": "task 3326 \u2014 watchdog two-regime startup grace (contract C5)",
+  "report": "docs/startup-completion-artifact-matrix.md",
+  "schema": "shared/tests/fixtures/startup_completion/README.md",
+  "raw_capture": "startup_completion_probe_raw.jsonl",
+  "regime": "wedge",
+  "rows": [
+    {
+      "id": "wedge_from_source_build_t5",
+      "regime": "wedge",
+      "wedge_shape": "from_source_build",
+      "sample_offset_secs": 5.019,
+      "session_id": "43c54f2f-0137-416c-89b8-32eb141e7b9e",
+      "config_dir_tree": [
+        {
+          "kind": "file",
+          "mtime_delta_secs": -0.004,
+          "relpath": ".credentials.json",
+          "size": 146
+        },
+        {
+          "kind": "symlink",
+          "mtime_delta_secs": -0.004,
+          "relpath": "settings.json",
+          "size": null
+        },
+        {
+          "kind": "symlink",
+          "mtime_delta_secs": -0.004,
+          "relpath": "settings.local.json",
+          "size": null
+        }
+      ],
+      "transcript_relpath": null,
+      "transcript_records": null,
+      "proc": {
+        "alive": true,
+        "children": [
+          {
+            "comm": "sleep",
+            "pid": 1191865
+          }
+        ],
+        "cmdline": [
+          "/bin/sh",
+          "/tmp/startup_probe_stubs_nztpzvk9/claude-build-wrapper.sh"
+        ],
+        "comm": "claude-build-wr",
+        "pid": 1191864,
+        "state": "S"
+      },
+      "expected_startup_complete": null,
+      "substrate_returns": {
+        "count_transcript_turns": null,
+        "read_transcript_records_is_none": true,
+        "record_count": null,
+        "transcript_exists": false
+      },
+      "provenance": {
+        "probe_run_id": "build_wedge-721c2ab8ebb1",
+        "mode": "build_wedge",
+        "sample_kind": "scheduled",
+        "sample_index": 26,
+        "cli_version": "2.1.220 (Claude Code)",
+        "capture_method": "live_spawn",
+        "captured_at": "2026-07-31T01:33:56.082667+00:00",
+        "run_exit": {
+          "exit_code": -9,
+          "killed_by_probe": true,
+          "mode": "build_wedge",
+          "stderr_len": 112,
+          "stderr_tail": "Building claude-code from source (this may take a while)...\n   Compiling cli v2.1.220 (/home/build/claude-code)\n",
+          "stdout_envelope": {}
+        },
+        "note": "Wrapper is still compiling the CLI from source; nothing has touched the config dir beyond what TaskConfigDir itself created."
+      }
+    },
+    {
+      "id": "wedge_from_source_build_t60",
+      "regime": "wedge",
+      "wedge_shape": "from_source_build",
+      "sample_offset_secs": 60.192,
+      "session_id": "43c54f2f-0137-416c-89b8-32eb141e7b9e",
+      "config_dir_tree": [
+        {
+          "kind": "file",
+          "mtime_delta_secs": -0.004,
+          "relpath": ".credentials.json",
+          "size": 146
+        },
+        {
+          "kind": "symlink",
+          "mtime_delta_secs": -0.004,
+          "relpath": "settings.json",
+          "size": null
+        },
+        {
+          "kind": "symlink",
+          "mtime_delta_secs": -0.004,
+          "relpath": "settings.local.json",
+          "size": null
+        }
+      ],
+      "transcript_relpath": null,
+      "transcript_records": null,
+      "proc": {
+        "alive": true,
+        "children": [
+          {
+            "comm": "sleep",
+            "pid": 1191865
+          }
+        ],
+        "cmdline": [
+          "/bin/sh",
+          "/tmp/startup_probe_stubs_nztpzvk9/claude-build-wrapper.sh"
+        ],
+        "comm": "claude-build-wr",
+        "pid": 1191864,
+        "state": "S"
+      },
+      "expected_startup_complete": null,
+      "substrate_returns": {
+        "count_transcript_turns": null,
+        "read_transcript_records_is_none": true,
+        "record_count": null,
+        "transcript_exists": false
+      },
+      "provenance": {
+        "probe_run_id": "build_wedge-721c2ab8ebb1",
+        "mode": "build_wedge",
+        "sample_kind": "deadline",
+        "sample_index": 278,
+        "cli_version": "2.1.220 (Claude Code)",
+        "capture_method": "live_spawn",
+        "captured_at": "2026-07-31T01:34:51.254886+00:00",
+        "run_exit": {
+          "exit_code": -9,
+          "killed_by_probe": true,
+          "mode": "build_wedge",
+          "stderr_len": 112,
+          "stderr_tail": "Building claude-code from source (this may take a while)...\n   Compiling cli v2.1.220 (/home/build/claude-code)\n",
+          "stdout_envelope": {}
+        },
+        "note": "Same wedge half the current 120s startup_grace_secs in \u2014 still no transcript."
+      }
+    },
+    {
+      "id": "wedge_uv_resolving_t5",
+      "regime": "wedge",
+      "wedge_shape": "uv_resolving",
+      "sample_offset_secs": 5.008,
+      "session_id": "f8d12ef5-7e6f-4b52-b41c-c122250f4917",
+      "config_dir_tree": [
+        {
+          "kind": "file",
+          "mtime_delta_secs": -0.0,
+          "relpath": ".credentials.json",
+          "size": 146
+        },
+        {
+          "kind": "symlink",
+          "mtime_delta_secs": -0.002,
+          "relpath": "settings.json",
+          "size": null
+        },
+        {
+          "kind": "symlink",
+          "mtime_delta_secs": -0.002,
+          "relpath": "settings.local.json",
+          "size": null
+        }
+      ],
+      "transcript_relpath": null,
+      "transcript_records": null,
+      "proc": {
+        "alive": true,
+        "children": [
+          {
+            "comm": "sleep",
+            "pid": 1257398
+          }
+        ],
+        "cmdline": [
+          "/bin/sh",
+          "/tmp/startup_probe_stubs_ddfuzdzb/claude-uv-wrapper.sh"
+        ],
+        "comm": "claude-uv-wrapp",
+        "pid": 1257397,
+        "state": "S"
+      },
+      "expected_startup_complete": null,
+      "substrate_returns": {
+        "count_transcript_turns": null,
+        "read_transcript_records_is_none": true,
+        "record_count": null,
+        "transcript_exists": false
+      },
+      "provenance": {
+        "probe_run_id": "uv_wedge-d178e0084890",
+        "mode": "uv_wedge",
+        "sample_kind": "scheduled",
+        "sample_index": 26,
+        "cli_version": "2.1.220 (Claude Code)",
+        "capture_method": "live_spawn",
+        "captured_at": "2026-07-31T01:35:31.513689+00:00",
+        "run_exit": {
+          "exit_code": -9,
+          "killed_by_probe": true,
+          "mode": "uv_wedge",
+          "stderr_len": 59,
+          "stderr_tail": "Resolved 214 packages in 1.24s\nDownloading numpy (18.2MiB)\n",
+          "stdout_envelope": {}
+        },
+        "note": "uv is still resolving/downloading the environment; the CLI has never been exec'd."
+      }
+    },
+    {
+      "id": "wedge_uv_resolving_t60",
+      "regime": "wedge",
+      "wedge_shape": "uv_resolving",
+      "sample_offset_secs": 60.105,
+      "session_id": "f8d12ef5-7e6f-4b52-b41c-c122250f4917",
+      "config_dir_tree": [
+        {
+          "kind": "file",
+          "mtime_delta_secs": -0.0,
+          "relpath": ".credentials.json",
+          "size": 146
+        },
+        {
+          "kind": "symlink",
+          "mtime_delta_secs": -0.002,
+          "relpath": "settings.json",
+          "size": null
+        },
+        {
+          "kind": "symlink",
+          "mtime_delta_secs": -0.002,
+          "relpath": "settings.local.json",
+          "size": null
+        }
+      ],
+      "transcript_relpath": null,
+      "transcript_records": null,
+      "proc": {
+        "alive": true,
+        "children": [
+          {
+            "comm": "sleep",
+            "pid": 1257398
+          }
+        ],
+        "cmdline": [
+          "/bin/sh",
+          "/tmp/startup_probe_stubs_ddfuzdzb/claude-uv-wrapper.sh"
+        ],
+        "comm": "claude-uv-wrapp",
+        "pid": 1257397,
+        "state": "S"
+      },
+      "expected_startup_complete": null,
+      "substrate_returns": {
+        "count_transcript_turns": null,
+        "read_transcript_records_is_none": true,
+        "record_count": null,
+        "transcript_exists": false
+      },
+      "provenance": {
+        "probe_run_id": "uv_wedge-d178e0084890",
+        "mode": "uv_wedge",
+        "sample_kind": "deadline",
+        "sample_index": 279,
+        "cli_version": "2.1.220 (Claude Code)",
+        "capture_method": "live_spawn",
+        "captured_at": "2026-07-31T01:36:26.634174+00:00",
+        "run_exit": {
+          "exit_code": -9,
+          "killed_by_probe": true,
+          "mode": "uv_wedge",
+          "stderr_len": 59,
+          "stderr_tail": "Resolved 214 packages in 1.24s\nDownloading numpy (18.2MiB)\n",
+          "stdout_envelope": {}
+        },
+        "note": "Same wedge at 60s."
+      }
+    },
+    {
+      "id": "wedge_mcp_init_hang_t2",
+      "regime": "wedge",
+      "wedge_shape": "mcp_init_hang",
+      "sample_offset_secs": 2.026,
+      "session_id": "d0b85889-bb42-4922-96e7-725b1db9448b",
+      "config_dir_tree": [
+        {
+          "kind": "file",
+          "mtime_delta_secs": 1.782,
+          "relpath": ".claude.json",
+          "size": 389
+        },
+        {
+          "kind": "file",
+          "mtime_delta_secs": -0.004,
+          "relpath": ".credentials.json",
+          "size": 146
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 1.566,
+          "pruned_descendants": 1,
+          "relpath": "backups",
+          "size": null
+        },
+        {
+          "kind": "symlink",
+          "mtime_delta_secs": -0.004,
+          "relpath": "settings.json",
+          "size": null
+        },
+        {
+          "kind": "symlink",
+          "mtime_delta_secs": -0.004,
+          "relpath": "settings.local.json",
+          "size": null
+        }
+      ],
+      "transcript_relpath": null,
+      "transcript_records": null,
+      "proc": {
+        "alive": true,
+        "children": [
+          {
+            "comm": "claude",
+            "pid": 1309486
+          }
+        ],
+        "cmdline": [
+          "claude",
+          "--print",
+          "--output-format",
+          "json",
+          "--model",
+          "haiku",
+          "--system-prompt-file",
+          "/tmp/startup_probe_sysprompt_x_jnags6.txt",
+          "--session-id",
+          "d0b85889-bb42-4922-96e7-725b1db9448b",
+          "--permission-mode",
+          "bypassPermissions",
+          "--max-turns",
+          "1",
+          "--disallowed-tools",
+          "*",
+          "--mcp-config",
+          "/tmp/startup_probe_mcp_o01zpa54.json",
+          "--strict-mcp-config",
+          "-p",
+          "ok"
+        ],
+        "comm": "claude",
+        "pid": 1308453,
+        "state": "D"
+      },
+      "expected_startup_complete": null,
+      "substrate_returns": {
+        "count_transcript_turns": null,
+        "read_transcript_records_is_none": true,
+        "record_count": null,
+        "transcript_exists": false
+      },
+      "provenance": {
+        "probe_run_id": "mcp_wedge-7182760110c3",
+        "mode": "mcp_wedge",
+        "sample_kind": "scheduled",
+        "sample_index": 11,
+        "cli_version": "2.1.220 (Claude Code)",
+        "capture_method": "live_spawn",
+        "captured_at": "2026-07-31T01:37:02.790604+00:00",
+        "run_exit": {
+          "exit_code": 1,
+          "killed_by_probe": false,
+          "mode": "mcp_wedge",
+          "stderr_len": 0,
+          "stderr_tail": "",
+          "stdout_envelope": {
+            "duration_api_ms": 0,
+            "duration_ms": 2755,
+            "is_error": true,
+            "num_turns": 1,
+            "subtype": "success"
+          }
+        },
+        "note": "A stdio MCP server that accepts the connection and never answers initialize is alive as a direct child; at t~2s the transcript still does not resolve."
+      }
+    },
+    {
+      "id": "wedge_mcp_init_hang_pre_first_token",
+      "regime": "wedge",
+      "wedge_shape": "mcp_init_hang",
+      "sample_offset_secs": 7.503,
+      "session_id": "d0b85889-bb42-4922-96e7-725b1db9448b",
+      "config_dir_tree": [
+        {
+          "kind": "file",
+          "mtime_delta_secs": 5.236,
+          "relpath": ".claude.json",
+          "size": 30114
+        },
+        {
+          "kind": "file",
+          "mtime_delta_secs": -0.004,
+          "relpath": ".credentials.json",
+          "size": 146
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 1.566,
+          "pruned_descendants": 1,
+          "relpath": "backups",
+          "size": null
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 5.121,
+          "relpath": "plugins",
+          "size": null
+        },
+        {
+          "kind": "file",
+          "mtime_delta_secs": 3.528,
+          "relpath": "plugins/installed_plugins.json",
+          "size": 35
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 6.266,
+          "pruned_descendants": 31,
+          "relpath": "plugins/marketplaces",
+          "size": null
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 5.37,
+          "relpath": "projects",
+          "size": null
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 5.376,
+          "relpath": "projects/-home-leo-src-dark-factory--worktrees-3324",
+          "size": null
+        },
+        {
+          "kind": "file",
+          "mtime_delta_secs": 5.376,
+          "relpath": "projects/-home-leo-src-dark-factory--worktrees-3324/d0b85889-bb42-4922-96e7-725b1db9448b.jsonl",
+          "size": 1543
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 3.347,
+          "relpath": "session-env",
+          "size": null
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 3.347,
+          "relpath": "session-env/d0b85889-bb42-4922-96e7-725b1db9448b",
+          "size": null
+        },
+        {
+          "kind": "dir",
+          "mtime_delta_secs": 3.482,
+          "relpath": "sessions",
+          "size": null
+        },
+        {
+          "kind": "file",
+          "mtime_delta_secs": 3.482,
+          "relpath": "sessions/1308453.json",
+          "size": 288
+        },
+        {
+          "kind": "symlink",
+          "mtime_delta_secs": -0.004,
+          "relpath": "settings.json",
+          "size": null
+        },
+        {
+          "kind": "symlink",
+          "mtime_delta_secs": -0.004,
+          "relpath": "settings.local.json",
+          "size": null
+        }
+      ],
+      "transcript_relpath": "projects/-home-leo-src-dark-factory--worktrees-3324/d0b85889-bb42-4922-96e7-725b1db9448b.jsonl",
+      "transcript_records": [
+        {
+          "operation": "enqueue",
+          "type": "queue-operation"
+        },
+        {
+          "operation": "dequeue",
+          "type": "queue-operation"
+        },
+        {
+          "attachment": {
+            "hookName": "SessionStart:startup",
+            "type": "hook_success"
+          },
+          "isSidechain": false,
+          "type": "attachment"
+        },
+        {
+          "isSidechain": false,
+          "message": {
+            "role": "user"
+          },
+          "type": "user"
+        }
+      ],
+      "proc": {
+        "alive": true,
+        "children": [
+          {
+            "comm": "python3",
+            "pid": 1310275
+          },
+          {
+            "comm": "git",
+            "pid": 1311664
+          }
+        ],
+        "cmdline": [
+          "claude",
+          "--print",
+          "--output-format",
+          "json",
+          "--model",
+          "haiku",
+          "--system-prompt-file",
+          "/tmp/startup_probe_sysprompt_x_jnags6.txt",
+          "--session-id",
+          "d0b85889-bb42-4922-96e7-725b1db9448b",
+          "--permission-mode",
+          "bypassPermissions",
+          "--max-turns",
+          "1",
+          "--disallowed-tools",
+          "*",
+          "--mcp-config",
+          "/tmp/startup_probe_mcp_o01zpa54.json",
+          "--strict-mcp-config",
+          "-p",
+          "ok"
+        ],
+        "comm": "claude",
+        "pid": 1308453,
+        "state": "R"
+      },
+      "expected_startup_complete": true,
+      "substrate_returns": {
+        "count_transcript_turns": 0,
+        "read_transcript_records_is_none": false,
+        "record_count": 4,
+        "transcript_exists": true
+      },
+      "provenance": {
+        "probe_run_id": "mcp_wedge-7182760110c3",
+        "mode": "mcp_wedge",
+        "sample_kind": "pre_first_token",
+        "sample_index": 34,
+        "cli_version": "2.1.220 (Claude Code)",
+        "capture_method": "live_spawn",
+        "captured_at": "2026-07-31T01:37:08.267225+00:00",
+        "run_exit": {
+          "exit_code": 1,
+          "killed_by_probe": false,
+          "mode": "mcp_wedge",
+          "stderr_len": 0,
+          "stderr_tail": "",
+          "stdout_envelope": {
+            "duration_api_ms": 0,
+            "duration_ms": 2755,
+            "is_error": true,
+            "num_turns": 1,
+            "subtype": "success"
+          }
+        },
+        "note": "Load-bearing honesty row: with the never-responding MCP server STILL alive as a direct child, the transcript resolves with turns == 0 \u2014 so transcript creation is NOT gated on MCP initialize completing. The predicate reports startup complete here. See the failure-mode table in docs/startup-completion-artifact-matrix.md."
+      }
+    }
+  ]
+}
