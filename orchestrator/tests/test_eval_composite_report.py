@@ -1287,6 +1287,68 @@ class TestNoPlanCellsAreCounted:
         assert cells[header.index('no_plan')] == '1'
 
 
+class TestNoPlanCellCannotSetTheEfficiencyFloor:
+    """A cell that returned NOTHING must not become the cost/latency baseline.
+
+    plans/eval-architect-effort-verdict-2026-07-27.md measured a no-plan cell at
+    $0.5-$3 against a real plan's ~$3.7: it is cheap and fast precisely BECAUSE
+    it failed. Letting it seed its group's floor hands the failing candidate a
+    "2x cheaper, 2x faster" bonus and deflates every candidate that succeeded —
+    the same rule already applied to a failing workflow trial, applied to the
+    plan-only group.
+    """
+
+    @staticmethod
+    def _two_configs():
+        return [
+            # Cheap and fast because it returned nothing.
+            _arch('p1', 'arch-noplan', tr, plan_steps=0, plan_quality=0.95,
+                  cost_usd=0.3, duration_ms=60000)
+            for tr in (1, 2, 3)
+        ] + [
+            _arch('p1', 'arch-real', tr, plan_steps=6, plan_quality=0.7,
+                  cost_usd=1.2, duration_ms=240000)
+            for tr in (1, 2, 3)
+        ]
+
+    def test_the_plan_producing_config_is_its_own_floor(self):
+        from orchestrator.evals.report import build_composite_report
+
+        rows = {r['config']: r
+                for r in build_composite_report(self._two_configs())['configs']}
+
+        # arch-real is the only plan-producing cell, so it IS its
+        # (fixture, plan_only) floor: 0.6*0.7 + 0.2*1.0 + 0.2*1.0.
+        assert rows['arch-real']['composite'] == pytest.approx(0.82, abs=1e-4)
+        # …and explicitly NOT the deflated number a no-plan floor produces:
+        # 0.6*0.7 + 0.2*(0.3/1.2) + 0.2*(60/240).
+        assert rows['arch-real']['composite'] != pytest.approx(0.52, abs=1e-4)
+
+    def test_the_no_plan_cells_spend_is_still_reported(self):
+        """Barred from the BASELINE, not from the pools: it really did burn
+        budget, and dropping that would hide what the failure cost."""
+        from orchestrator.evals.report import build_composite_report
+
+        rows = {r['config']: r
+                for r in build_composite_report(self._two_configs())['configs']}
+
+        assert rows['arch-noplan']['cost_usd'] == pytest.approx(0.3)
+        assert rows['arch-noplan']['latency_secs'] == pytest.approx(60.0)
+        assert rows['arch-noplan']['trials'] == 3
+
+    def test_survivor_selection_promotes_the_config_that_planned(self):
+        """The end-to-end consequence, through the real pipeline path."""
+        from orchestrator.evals.report import (
+            build_composite_report,
+            select_survivors,
+        )
+
+        report = build_composite_report(self._two_configs())
+        assert select_survivors(report, top_k=1, roles=['architect']) == {
+            'architect': ['arch-real'],
+        }
+
+
 # ---------------------------------------------------------------------------
 # Task 2477 step-11: format_composite_table — deterministic renderer of the
 # C4 composite report (per-config table + a distinct price-table section).
