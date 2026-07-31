@@ -7120,6 +7120,104 @@ class TestExtractMetaFiles:
 
 
 # ---------------------------------------------------------------------------
+# Unit tests for TaskInterceptor._extract_deliverable_signals (task 3106)
+# ---------------------------------------------------------------------------
+
+
+class TestExtractDeliverableSignals:
+    """Unit tests for the _extract_deliverable_signals static helper.
+
+    Deliberately DIVERGES from _extract_meta_files: it takes the UNION of
+    ``files`` ∪ ``files_to_modify`` ∪ ``modules`` rather than the
+    files-over-files_to_modify PRECEDENCE, and it is a separate helper
+    rather than a widening of _extract_meta_files_from_meta.
+
+    Why the divergence is safe in one direction only: _extract_meta_files
+    feeds the FILES-CERTAIN hard reject (check_files_for_scope) and the
+    cross-repo tagger (all_files_foreign_owner), where ONE authoritative
+    declared list is wanted and where admitting ``modules`` would make a
+    foreign lock-key entry start hard-REJECTING submissions.  This union
+    feeds ONLY the prose-advisory attribution suppression, reached solely
+    after the hard reject already returned ``ok`` — so a wider signal set
+    here can only ever suppress an advisory, never weaken a rejection.
+    """
+
+    def test_files_key_only(self):
+        kwargs = {'metadata': {'files': ['a/x.py']}}
+        assert TaskInterceptor._extract_deliverable_signals(kwargs) == ['a/x.py']
+
+    def test_files_to_modify_key_only(self):
+        kwargs = {'metadata': {'files_to_modify': ['b/y.py']}}
+        assert TaskInterceptor._extract_deliverable_signals(kwargs) == ['b/y.py']
+
+    def test_modules_key_only(self):
+        """metadata.modules (Tier-A path-like lock keys) is a signal too.
+
+        _extract_meta_files does NOT read this key — attribution does,
+        because a declared module directory is evidence of local work.
+        """
+        kwargs = {'metadata': {'modules': ['c/z']}}
+        assert TaskInterceptor._extract_deliverable_signals(kwargs) == ['c/z']
+
+    def test_all_three_keys_union_in_declared_order(self):
+        """UNION, not precedence — contrasted inline with _extract_meta_files.
+
+        The contrast assertion pins the divergence as INTENTIONAL: for the
+        SAME kwargs the hard-reject extractor still returns only ``files``.
+        """
+        kwargs = {
+            'metadata': {
+                'files': ['a/x.py'],
+                'files_to_modify': ['b/y.py'],
+                'modules': ['c/z'],
+            }
+        }
+        assert TaskInterceptor._extract_deliverable_signals(kwargs) == [
+            'a/x.py', 'b/y.py', 'c/z',
+        ]
+        # Divergence pinned: the FILES-certain extractor keeps its precedence.
+        assert TaskInterceptor._extract_meta_files(kwargs) == ['a/x.py']
+
+    def test_duplicates_deduped_first_occurrence_wins(self):
+        kwargs = {
+            'metadata': {
+                'files': ['a/x.py', 'dup.py'],
+                'files_to_modify': ['dup.py', 'b/y.py'],
+                'modules': ['a/x.py', 'c/z'],
+            }
+        }
+        assert TaskInterceptor._extract_deliverable_signals(kwargs) == [
+            'a/x.py', 'dup.py', 'b/y.py', 'c/z',
+        ]
+
+    def test_scalar_string_value_coerced_to_list(self):
+        """Matches _extract_meta_files_from_meta's scalar-str coercion."""
+        kwargs = {'metadata': {'modules': 'c/z'}}
+        assert TaskInterceptor._extract_deliverable_signals(kwargs) == ['c/z']
+
+    def test_falsy_entries_dropped_and_non_strings_coerced(self):
+        kwargs = {'metadata': {'files': ['', None, 'src/bar.py'], 'modules': [42]}}
+        assert TaskInterceptor._extract_deliverable_signals(kwargs) == [
+            'src/bar.py', '42',
+        ]
+
+    def test_json_string_metadata_parsed_via_same_path(self):
+        """JSON-string metadata goes through _parse_metadata, as _extract_meta_files does."""
+        kwargs = {'metadata': '{"files": ["a/x.py"], "modules": ["c/z"]}'}
+        assert TaskInterceptor._extract_deliverable_signals(kwargs) == ['a/x.py', 'c/z']
+
+    def test_missing_non_dict_or_keyless_metadata_returns_empty(self):
+        assert TaskInterceptor._extract_deliverable_signals({}) == []
+        assert TaskInterceptor._extract_deliverable_signals({'metadata': None}) == []
+        assert TaskInterceptor._extract_deliverable_signals(
+            {'metadata': ['some', 'list']},
+        ) == []
+        assert TaskInterceptor._extract_deliverable_signals(
+            {'metadata': {'priority': 'low'}},
+        ) == []
+
+
+# ---------------------------------------------------------------------------
 # Regression tests — prompt-only fallback must also scan metadata files
 # ---------------------------------------------------------------------------
 
