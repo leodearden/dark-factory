@@ -1576,6 +1576,24 @@ class TaskInterceptor:
             values = meta.get(key) or []
             if isinstance(values, str):
                 values = [values]
+            if not isinstance(values, (list, tuple, set)):
+                # Malformed caller metadata (``modules: 5``, ``modules:
+                # {...}``).  ``metadata`` is still unvalidated kwargs at this
+                # seam and :func:`_parse_metadata` deliberately
+                # warns-and-continues rather than raising, so degrade the
+                # same way: an unusable value contributes NO signal (falling
+                # back to the unchanged advisory) instead of raising
+                # ``TypeError`` out of ``submit_task`` as an unstructured
+                # crash.  A dict is the quiet variant — iterating it would
+                # walk its KEYS and could silently attest.
+                logger.warning(
+                    'task_metadata.schema_warning source=%s error=%s '
+                    '(type=%s); deliverable-signal key discarded',
+                    'TaskInterceptor._extract_deliverable_signals_from_meta',
+                    f'metadata.{key} is not a list/tuple/set of paths',
+                    type(values).__name__,
+                )
+                continue
             for value in values:
                 if not value:
                     continue

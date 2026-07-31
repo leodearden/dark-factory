@@ -7533,6 +7533,47 @@ class TestExtractDeliverableSignals:
             'src/bar.py', '42',
         ]
 
+    def test_scalar_non_string_value_is_discarded_not_raised(self):
+        """A non-iterable value degrades to no signal — it never raises.
+
+        ``metadata`` is unvalidated caller kwargs at this seam and
+        ``_parse_metadata`` warns-and-continues rather than raising, so this
+        helper must too: a malformed submission is a graceful degrade (the
+        prose advisory then fires unchanged), not a ``TypeError`` escaping
+        ``submit_task`` as an unstructured crash.  ``modules`` is the sharp
+        edge — it was never read on this path before task 3106.
+        """
+        assert TaskInterceptor._extract_deliverable_signals(
+            {'metadata': {'modules': 5}},
+        ) == []
+        assert TaskInterceptor._extract_deliverable_signals(
+            {'metadata': {'files': 5}},
+        ) == []
+        # A malformed key discards only ITSELF; well-formed siblings survive.
+        assert TaskInterceptor._extract_deliverable_signals(
+            {'metadata': {'files': ['a/x.py'], 'modules': 5}},
+        ) == ['a/x.py']
+
+    def test_dict_value_is_discarded_rather_than_iterated_as_keys(self):
+        """The quiet variant: a dict must not attest off its KEYS.
+
+        Plain iteration would yield ``'fused-memory/src'`` here and could
+        silently suppress a prose advisory on metadata the author never
+        meant as a path list.
+        """
+        assert TaskInterceptor._extract_deliverable_signals(
+            {'metadata': {'modules': {'fused-memory/src': 1}}},
+        ) == []
+
+    def test_tuple_and_set_values_are_accepted(self):
+        """Sequence shapes other than list still carry signal."""
+        assert TaskInterceptor._extract_deliverable_signals(
+            {'metadata': {'files': ('a/x.py', 'b/y.py')}},
+        ) == ['a/x.py', 'b/y.py']
+        assert TaskInterceptor._extract_deliverable_signals(
+            {'metadata': {'modules': {'c/z'}}},
+        ) == ['c/z']
+
     def test_json_string_metadata_parsed_via_same_path(self):
         """JSON-string metadata goes through _parse_metadata, as _extract_meta_files does."""
         kwargs = {'metadata': '{"files": ["a/x.py"], "modules": ["c/z"]}'}
