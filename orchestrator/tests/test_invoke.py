@@ -7,6 +7,7 @@ import contextlib
 import json
 import logging
 import os
+import signal
 import subprocess
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -320,6 +321,114 @@ class TestRunSubprocessLocalTimedOut:
         assert call_args.args[0] is proc
         assert call_args.args[1] == 12345
         assert result.timed_out is True
+
+
+# ── _run_subprocess_local cancellation (task 3224) ──────────────────────────
+#
+# shared/tests is NOT on this suite's sys.path (conftest.py adds
+# orchestrator/tests, orchestrator/src, shared/src, escalation/src only), so
+# these helpers mirror shared/tests/test_proc_group.py's _pgid_gone_within /
+# _kill_group rather than importing them.
+
+
+async def _pgid_gone_within(pgid: int, timeout: float = 5.0, step: float = 0.1) -> bool:
+    """Poll until a process group is fully reaped by the kernel.
+
+    A one-shot ``os.killpg(pgid, 0)`` right after a kill is racy: reaping is
+    asynchronous (grandchildren can be reparented to a subreaper and linger
+    as zombies briefly), so this asserts the real contract — eventual group
+    death — via a bounded poll instead of a single check.
+
+    PermissionError (EPERM) is also treated as "gone": it can only fire once
+    the kernel has recycled *pgid* to a process owned by another user, which
+    means the group this test spawned is definitively no longer around.
+    """
+    iterations = max(1, int(timeout / step))
+    for _ in range(iterations):
+        try:
+            os.killpg(pgid, 0)
+        except (ProcessLookupError, PermissionError):
+            return True
+        await asyncio.sleep(step)
+    return False
+
+
+def _kill_group(pgid: int) -> None:
+    """Best-effort SIGKILL of an entire process group (test cleanup only).
+
+    Precondition: *pgid* must belong to a process known to still be ALIVE.
+    Calling this after the process has already been reaped risks landing on
+    a recycled, unrelated process group.
+    """
+    with contextlib.suppress(ProcessLookupError, OSError):
+        os.killpg(pgid, signal.SIGKILL)
+
+
+@pytest.mark.asyncio
+class TestRunSubprocessLocalCancellation:
+
+    @pytest.mark.timeout(20)
+    async def test_cancellation_reaps_real_process_group(self, tmp_path):
+        """Cancelling the awaiting task must reap the real OS process group.
+
+        Regression test for task 3224: _run_subprocess_local spawns with
+        start_new_session=True but (pre-fix) has no except asyncio.CancelledError
+        handler, so asyncio.wait_for(proc.communicate(...)) is cancelled while
+        the spawned process group is never signalled — the agent survives as
+        an orphan still editing/committing in its worktree.
+
+        Drives a REAL ``sleep 30`` subprocess (not a mock) and asserts the OS
+        process group is actually gone after cancellation, via a bounded poll
+        on os.killpg(pgid, 0). A mock-only "terminate_process_group was
+        called" assertion would pass even with the wrong pgid and would not
+        have caught the original orphan.
+        """
+        # Capture the real spawner BEFORE patching -- orchestrator.agents.invoke.asyncio
+        # IS the global asyncio module, so a self-delegating spy captured after
+        # patching would recurse into itself.
+        real_exec = asyncio.create_subprocess_exec
+
+        spawned: list[asyncio.subprocess.Process] = []
+
+        async def spy_exec(*args, **kwargs):
+            proc = await real_exec(*args, **kwargs)
+            spawned.append(proc)
+            return proc
+
+        pgid = None
+        try:
+            with patch('orchestrator.agents.invoke.asyncio.create_subprocess_exec',
+                        side_effect=spy_exec):
+                task = asyncio.ensure_future(_run_subprocess_local(
+                    ['sleep', '30'],
+                    cwd=tmp_path,
+                    env=dict(os.environ),
+                    backend='codex',
+                    model='gpt-5.4',
+                    max_budget_usd=1.0,
+                    timeout_seconds=30.0,
+                ))
+
+                # Bounded poll (~2s max) until the spy has recorded the spawned proc.
+                deadline = asyncio.get_event_loop().time() + 2.0
+                while not spawned and asyncio.get_event_loop().time() < deadline:
+                    await asyncio.sleep(0.05)
+                assert spawned, 'sleep 30 was not spawned within 2s'
+
+                proc = spawned[0]
+                pgid = proc.pid  # start_new_session ⇒ pgid == pid
+
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+
+            assert await _pgid_gone_within(pgid), (
+                f'Process group {pgid} was not reaped within 5s after '
+                f'cancellation — orphaned agent process group left running.'
+            )
+        finally:
+            if pgid is not None and spawned and spawned[0].returncode is None:
+                _kill_group(pgid)
 
 
 _CODEX_VALID_JSONL_STDOUT = (
