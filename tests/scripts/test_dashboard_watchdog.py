@@ -1334,5 +1334,176 @@ def test_recovery_does_not_wipe_the_rolling_restart_window(
     )
 
 
+# ---------------------------------------------------------------------------
+# Fail-soft / invariant I5
+#
+# The watchdog must never convert its own tooling failure into a restart, and
+# must never crash the oneshot unit. A watchdog in `failed` state supervises
+# nothing, and one that restarts on a systemctl hiccup is the incident again.
+# ---------------------------------------------------------------------------
+
+
+def test_i5_undeterminable_activation_alone_never_restarts(
+    monkeypatch, state_env, queue_env
+):
+    """`systemctl show` failing is not evidence the dashboard is unhealthy.
+
+    Paired with test_b5_undeterminable_activation_does_not_apply_grace: there,
+    a genuinely failing PROBE still restarts. Here the probe SUCCEEDS, so the
+    broken query alone must actuate nothing — otherwise a systemd hiccup, not
+    the dashboard, decides when to restart.
+    """
+    rec = _run_ticks(monkeypatch, [True] * 5, activated_secs_ago=None)
+
+    assert rec.actuations == [], f"a broken systemctl query restarted: {rec.actuations}"
+    assert rec.escalations == []
+    assert rec.streaks == [0] * 5
+
+
+def test_i5_restart_timeout_is_survived_and_still_recorded(
+    monkeypatch, state_env, queue_env
+):
+    """A TimeoutExpired from systemctl must not raise — and must still count.
+
+    A timed-out restart very often took effect anyway, so recording it is the
+    fail-direction that leads to the storm escape. Dropping it would make the
+    ceiling unreachable: the watchdog would retry forever on a unit whose
+    systemctl always hangs, which is the flap in a different costume.
+    """
+    import subprocess as _sp
+    import time as _time
+
+    active_enter = int(_time.time()) - OUTSIDE_GRACE_SECS
+    attempted: list[list[str]] = []
+
+    def fake_run(argv, *args, **kwargs):
+        argv_list = list(argv)
+        if argv_list and argv_list[0] == "systemd-cat":
+            return _sp.CompletedProcess(argv_list, 0, stdout="", stderr="")
+        if "show" in argv_list:
+            return _sp.CompletedProcess(
+                argv_list, 0, stdout=f"ActiveEnterTimestamp=@{active_enter}\n", stderr=""
+            )
+        attempted.append(argv_list)
+        raise _sp.TimeoutExpired(argv_list, timeout=45)
+
+    monkeypatch.setattr(_sp, "run", fake_run)
+
+    mod = _load_watchdog()
+    for _ in range(mod.FAIL_STREAK):
+        m = _load_watchdog()
+        _patch_urlopen(monkeypatch, m, urllib_error_503(m))
+        m.tick()  # must not raise
+
+    assert any("restart" in a for a in attempted), "no restart was attempted"
+    assert len(_load_watchdog().load_state()["restarts"]) == 1, (
+        "a timed-out restart was not recorded — the ceiling becomes unreachable"
+    )
+
+
+def test_i5_unwritable_state_never_raises_from_tick(monkeypatch, tmp_path, queue_env):
+    """A state path that is a DIRECTORY degrades the watchdog to stateless.
+
+    No streak can accumulate, so it stops restarting — the safe direction.
+    Crashing here would instead put the oneshot into `failed`, where it
+    supervises nothing at all and no longer even logs.
+    """
+    blocked = tmp_path / "state.json"
+    blocked.mkdir()
+    monkeypatch.setenv("DASHBOARD_WATCHDOG_STATE", str(blocked))
+
+    rec = _run_ticks(monkeypatch, [False] * 5)  # must not raise
+
+    assert rec.actuations == [], "restarted with no working state to gate on"
+
+
+@pytest.mark.parametrize("failure", ["nonzero", "missing-uv", "timeout"])
+def test_i5_escalation_failure_does_not_resume_the_flap(
+    monkeypatch, state_env, queue_env, failure
+):
+    """A failed submit must leave the ceiling TRIPPED, not restarting again.
+
+    The tempting fail-direction — "the escalation didn't go through, so keep
+    trying to fix it ourselves" — is exactly the storm. Failing toward "quiet,
+    with a journal line" loses the L2 but not the availability guarantee.
+    """
+    import subprocess as _sp
+    import time as _time
+
+    mod = _load_watchdog()
+    active_enter = int(_time.time()) - OUTSIDE_GRACE_SECS
+    actuations: list[list[str]] = []
+
+    def fake_run(argv, *args, **kwargs):
+        argv_list = list(argv)
+        if argv_list and argv_list[0] == "systemd-cat":
+            return _sp.CompletedProcess(argv_list, 0, stdout="", stderr="")
+        if argv_list[:2] == ["systemctl", "--user"]:
+            if "show" in argv_list:
+                return _sp.CompletedProcess(
+                    argv_list,
+                    0,
+                    stdout=f"ActiveEnterTimestamp=@{active_enter}\n",
+                    stderr="",
+                )
+            actuations.append(argv_list)
+            return _sp.CompletedProcess(argv_list, 0, stdout="", stderr="")
+        if failure == "nonzero":
+            return _sp.CompletedProcess(argv_list, 2, stdout="", stderr="argparse error")
+        if failure == "missing-uv":
+            raise FileNotFoundError(mod.UV_BIN)
+        raise _sp.TimeoutExpired(argv_list, timeout=120)
+
+    monkeypatch.setattr(_sp, "run", fake_run)
+
+    _load_watchdog().save_state(_at_ceiling_state(mod))
+    for _ in range(mod.FAIL_STREAK + 10):
+        m = _load_watchdog()
+        _patch_urlopen(monkeypatch, m, urllib_error_503(m))
+        m.tick()  # must not raise
+
+    assert actuations == [], f"resumed restarting after a failed submit: {actuations}"
+    assert _load_watchdog().load_state()["ceiling_open"] is True
+
+
+@pytest.mark.parametrize(
+    "boom",
+    [OSError("systemctl exploded"), RuntimeError("unexpected"), ValueError("bad")],
+)
+def test_i5_main_exits_zero_even_when_tick_raises(monkeypatch, state_env, boom):
+    """A wedged tick must not put the oneshot unit into `failed`.
+
+    Mirrors orchestrator-watchdog.main()'s isolation. A `failed` oneshot is
+    silently skipped by some restart tooling and shows up as a red unit an
+    operator has to clear by hand before supervision resumes — a much worse
+    outcome than one skipped tick 30 seconds before the next.
+    """
+    mod = _load_watchdog()
+
+    def exploding_tick():
+        raise boom
+
+    monkeypatch.setattr(mod, "tick", exploding_tick)
+    monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: None)
+
+    assert mod.main() == 0
+
+
+def test_i5_main_exits_zero_on_a_normal_tick(monkeypatch, state_env, queue_env):
+    """The ordinary path returns 0 too — so a non-zero exit means something."""
+    import subprocess as _sp
+
+    monkeypatch.setattr(
+        _sp,
+        "run",
+        lambda argv, *a, **k: _sp.CompletedProcess(list(argv), 0, stdout="", stderr=""),
+    )
+
+    mod = _load_watchdog()
+    _patch_urlopen(monkeypatch, mod, _FakeResponse(200))
+
+    assert mod.main() == 0
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))
