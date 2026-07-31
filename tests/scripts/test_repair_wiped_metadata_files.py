@@ -24,6 +24,7 @@ gets subprocess coverage.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 
 from audit_wiped_metadata_files import (
@@ -44,9 +45,11 @@ from repair_wiped_metadata_files import (
     SKIP_FILES_PRESENT,
     SKIP_MISSING,
     SKIP_NOT_TERMINAL,
+    FAILED,
     build_repair_payload,
     classify_live_task,
     plan_files_rejection_reason,
+    repair_one,
     select_repairable_candidates,
 )
 
@@ -393,6 +396,129 @@ def test_classify_live_task_agrees_with_the_audit_on_a_whitespace_only_entry():
     live = {"status": "done", "metadata": {"files": ["  "]}}
 
     assert classify_live_task(live, _candidate(27)) == SKIP_FILES_PRESENT
+
+
+# ---------------------------------------------------------------------------
+# repair_one — the write itself, against a FAKE client. No network, no MCP
+# server, no live database.
+# ---------------------------------------------------------------------------
+
+_ROOT = "/tmp/proj"
+
+
+class _FakeClient:
+    """Records every call_tool invocation; optionally raises or returns a shape."""
+
+    def __init__(self, *, raises=None, returns=None):
+        self.calls: list[tuple[str, dict]] = []
+        self._raises = raises
+        self._returns = returns if returns is not None else {"success": True}
+
+    async def call_tool(self, name: str, arguments: dict) -> dict:
+        self.calls.append((name, arguments))
+        if self._raises is not None:
+            raise self._raises
+        return self._returns
+
+
+class _DuplicateCandidateKeyError(RuntimeError):
+    """Shape-alike for the real fused_memory DuplicateCandidateKeyError.
+
+    Defined in fused-memory/src/fused_memory/backends/task_backend_errors.py:37
+    and raised from the update_task path at sqlite_task_backend.py:2543:
+    candidate_key is recomputed from (title, files) on EVERY metadata-touching
+    update, so backfilling files onto a batch of tasks can genuinely collide
+    with another non-cancelled row. Simulated rather than imported so this test
+    stays a pure unit test of repair_one's error handling."""
+
+
+def test_repair_one_issues_exactly_one_merge_mode_update_task():
+    """(a) one update_task carrying id/project_root/metadata/metadata_mode."""
+    client = _FakeClient()
+    candidate = _candidate(2464, plan_files=("a.py", "b.py"))
+
+    result = asyncio.run(repair_one(client, _ROOT, candidate, now_iso=_NOW))
+
+    assert result.disposition == REPAIR
+    assert len(client.calls) == 1
+    name, arguments = client.calls[0]
+    assert name == "update_task"
+    assert arguments["id"] == "2464"
+    assert isinstance(arguments["id"], str)
+    assert arguments["project_root"] == _ROOT
+    assert arguments["metadata_mode"] == "merge"
+    assert json.loads(arguments["metadata"]) == build_repair_payload(
+        candidate, now_iso=_NOW
+    )
+
+
+def test_repair_one_never_uses_replace_or_append_mode():
+    """(b) replace is the primitive that CAUSED this wipe class: _execute_combine
+    (task_interceptor.py:1850) writes a 3-key blob in replace mode and
+    _merge_metadata (sqlite_task_backend.py:3301) returns `incoming` verbatim for
+    that mode, deleting every untouched key. A repair must not use the wiper's
+    own primitive."""
+    client = _FakeClient()
+
+    asyncio.run(repair_one(client, _ROOT, _candidate(1), now_iso=_NOW))
+
+    _, arguments = client.calls[0]
+    assert arguments["metadata_mode"] not in ("replace", "append")
+    assert "append" not in arguments
+
+
+def test_repair_one_passes_no_status_argument():
+    """(c) StatusWriteAuthorityError floor (sqlite_task_backend.py:2575) — a
+    metadata write carrying status is rejected outright."""
+    client = _FakeClient()
+
+    asyncio.run(repair_one(client, _ROOT, _candidate(1), now_iso=_NOW))
+
+    _, arguments = client.calls[0]
+    assert "status" not in arguments
+    assert "done_provenance" not in json.loads(arguments["metadata"])
+
+
+def test_repair_one_captures_a_raised_error_instead_of_propagating():
+    """(d) a candidate_key collision is a genuine per-task risk across a
+    35-task batch. It must be captured, attributed and reported — never allowed
+    to abort the batch and strand the remaining candidates."""
+    client = _FakeClient(
+        raises=_DuplicateCandidateKeyError("candidate_key collides with task 9999")
+    )
+
+    result = asyncio.run(repair_one(client, _ROOT, _candidate(2464), now_iso=_NOW))
+
+    assert result.disposition == FAILED
+    assert result.task_id == 2464
+    assert "9999" in (result.detail or "")
+
+
+def test_repair_one_treats_an_error_shaped_result_as_failed():
+    """(e) the server can answer with an error PAYLOAD rather than raising. A
+    truthy-response check would count that as a success and report a repair
+    that never happened."""
+    for payload in (
+        {"error": "lock_charter_error: directory lock rejected"},
+        {"success": False, "error_type": "DuplicateCandidateKeyError"},
+    ):
+        client = _FakeClient(returns=payload)
+
+        result = asyncio.run(repair_one(client, _ROOT, _candidate(3), now_iso=_NOW))
+
+        assert result.disposition == FAILED, payload
+        assert result.detail, payload
+
+
+def test_repair_one_accepts_a_plain_success_shape():
+    """The complement of the above: an ordinary success must not be misread as
+    a failure just because it carries no explicit success flag."""
+    for payload in ({}, {"success": True}, {"id": "2464", "status": "done"}):
+        client = _FakeClient(returns=payload)
+
+        result = asyncio.run(repair_one(client, _ROOT, _candidate(4), now_iso=_NOW))
+
+        assert result.disposition == REPAIR, payload
 
 
 def test_classify_live_task_treats_a_non_dict_metadata_as_no_files():
