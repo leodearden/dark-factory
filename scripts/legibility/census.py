@@ -1334,8 +1334,30 @@ def run_census(
     # (reviewer_comprehensive finding #4).
     Path(report_path).write_text(report_md, encoding="utf-8")
 
-    status = status_fetcher()
-    done_count = sum(1 for v in (status.get("statuses") or {}).values() if v == "done")
+    # An unobservable done-count degrades ONLY the next window's condition-(b)
+    # baseline -- it must never abandon a run whose mining has already been
+    # paid for and whose dated report is already on disk above. Aborting would
+    # also leave last_census_at unadvanced, so condition (a) would re-fire the
+    # census every single night: a strictly more over-eager loop than the
+    # weekly one task 3291 exists to fix.
+    #
+    # Both the fetch and the extraction are guarded. extract_done_count is what
+    # stops fused-memory's {"error", "error_type"} envelope -- which rides an
+    # isError:false JSON-RPC response and so arrives here looking like a
+    # perfectly good dict -- from being counted as a done-count of 0 and
+    # persisted as a REAL baseline. That fabricated 0 is what armed condition
+    # (b) to fire every ~7 days. See advance_census_state's docstring for why
+    # null, not 0 and not a carried-forward value, is the honest degradation.
+    try:
+        done_count = census_trigger.extract_done_count(status_fetcher())
+    except Exception as exc:  # noqa: BLE001 - a bad baseline must not fail the census
+        done_count = None
+        logger.warning(
+            "census: done-count unobservable (%s) -- persisting a null "
+            "last_census_done_count; the tasks-landed trigger condition will "
+            "fail safe until the next successful census",
+            exc,
+        )
 
     # codebook.dump() and advance_census_state() are adjacent on purpose
     # (reviewer_comprehensive finding #4): nothing else here can raise
