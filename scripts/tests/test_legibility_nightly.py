@@ -22,7 +22,14 @@ from pathlib import Path
 
 import pytest
 
-from legibility import census_trigger, codebook, config as config_mod, digest, nightly
+from legibility import (
+    census_trigger,
+    codebook,
+    config as config_mod,
+    digest,
+    nightly,
+    trickle_state,
+)
 from legibility.config import load_config
 
 
@@ -1865,3 +1872,223 @@ def test_configure_logging_env_var_still_wins_over_an_unknown_default_level(monk
     effective_level, _ = _configure_logging_and_sample(default_level='CHATTY')
 
     assert effective_level == logging.DEBUG
+
+
+# ---------------------------------------------------------------------------
+# task 3340 step-9/10: run_nightly records trickle run state on EVERY path
+# ---------------------------------------------------------------------------
+
+def _recorder_spy():
+    """A ``recorder=`` seam spy that DELEGATES to the real
+    ``trickle_state.record_run``, so the assertions below run against real
+    classifier + streak output rather than a mock that could drift from it.
+    Returns (fn, calls) where each call is (kwargs, returned_doc)."""
+    calls = []
+
+    def _record(project_id, **kwargs):
+        doc = trickle_state.record_run(project_id, **kwargs)
+        calls.append((dict(kwargs, project_id=project_id), doc))
+        return doc
+
+    return _record, calls
+
+
+def _one_recorded(calls):
+    assert len(calls) == 1, (
+        f'expected exactly ONE recorder call, got {len(calls)}: '
+        f'{[c[0] for c in calls]}'
+    )
+    return calls[0][1]
+
+
+class TestRunNightlyRecordsTrickleState:
+    """``run_nightly`` records WHY the night went the way it did — on every
+    exit path, including the fail-loud ones and an unexpected raise.
+
+    One recording point (a single try/finally) cannot forget a branch.
+    Recording only on the happy path would let the progress probe read a
+    stale streak as healthy after repeated crashes.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _xdg(self, tmp_path, monkeypatch):
+        """No test here may ever write to the real ~/.local/state."""
+        monkeypatch.setenv('XDG_STATE_HOME', str(tmp_path / 'xdg'))
+
+    def _run(self, tmp_path, *, recorder=None, budget_bytes=None,
+             invoke=_fake_invoke_known_cause, committer=None, poster=None,
+             transcript=True):
+        work_cwd = str(tmp_path / 'work')
+        repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+        if budget_bytes is not None:
+            _write_config(
+                repo, project_id='testproj', escalation_port=8199,
+                cwd_prefixes=[work_cwd], max_daily_digest_bytes=budget_bytes,
+            )
+        projects_root = tmp_path / 'projects'
+        if transcript:
+            _write_transcript(
+                projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl',
+                cwd=work_cwd, timestamp='2026-07-13T10:00:00Z',
+                session_id='session-1',
+            )
+        else:
+            projects_root.mkdir(parents=True, exist_ok=True)
+
+        kwargs = dict(
+            config_path=config_path,
+            projects_root=projects_root,
+            target_date=date(2026, 7, 13),
+            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc),
+            invoke=invoke,
+            status_fetcher=None,
+            poster=poster if poster is not None else (lambda url, envelope: None),
+        )
+        if recorder is not None:
+            kwargs['recorder'] = recorder
+        if committer is not None:
+            kwargs['committer'] = committer
+        return nightly.run_nightly(**kwargs), repo
+
+    def test_happy_path_records_a_productive_run(self, tmp_path):
+        recorder, calls = _recorder_spy()
+        result, _repo = self._run(tmp_path, recorder=recorder)
+
+        assert result.exit_code == 0
+        assert result.commit_made is True
+
+        doc = _one_recorded(calls)
+        assert doc['outcome'] == 'productive'
+        assert doc['consecutive_barren_runs'] == 0
+        assert doc['commit_made'] is True
+        assert doc['exit_code'] == 0
+        assert doc['applied'] == result.applied
+        assert doc['target_date'] == '2026-07-13'
+        assert doc['counters']['selected_count'] == 1
+        assert doc['counters']['budget_skipped'] == 0
+
+    def test_budget_suppressed_night_records_barren(self, tmp_path):
+        """The 2026-07-16..29 incident replay, now RECORDED as barren
+        instead of being indistinguishable from a quiet night."""
+        recorder, calls = _recorder_spy()
+        result, _repo = self._run(tmp_path, recorder=recorder, budget_bytes=10)
+
+        assert result.exit_code == 0
+        assert result.budget_suppressed is True
+
+        doc = _one_recorded(calls)
+        assert doc['outcome'] == 'barren'
+        assert doc['budget_suppressed'] is True
+        assert doc['exit_code'] == 0
+        assert doc['consecutive_barren_runs'] == 1
+        assert doc['counters']['budget_skipped'] > 0
+        assert doc['counters']['selected_count'] == 0
+
+    def test_quiet_night_records_quiet_with_streak_zero(self, tmp_path):
+        recorder, calls = _recorder_spy()
+        result, _repo = self._run(tmp_path, recorder=recorder, transcript=False)
+
+        assert result.exit_code == 0
+        assert result.budget_suppressed is False
+
+        doc = _one_recorded(calls)
+        assert doc['outcome'] == 'quiet'
+        assert doc['consecutive_barren_runs'] == 0
+        assert doc['exit_code'] == 0
+
+    def test_extractor_crash_still_records(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(nightly, 'build_digests', _crashing_build_digests)
+        recorder, calls = _recorder_spy()
+        result, _repo = self._run(tmp_path, recorder=recorder)
+
+        assert result.exit_code == 1
+        doc = _one_recorded(calls)
+        assert doc['exit_code'] == 1
+        assert doc['counters']['selected_count'] == 1
+
+    def test_coder_storm_still_records(self, tmp_path):
+        recorder, calls = _recorder_spy()
+        result, _repo = self._run(
+            tmp_path, recorder=recorder, invoke=_fake_invoke_unparseable,
+        )
+
+        assert result.exit_code == 1
+        assert result.coder_status == 'failure'
+        doc = _one_recorded(calls)
+        assert doc['exit_code'] == 1
+        assert doc['counters']['selected_count'] == 1
+
+    def test_codebook_validation_failure_still_records(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            codebook, 'validate', lambda cb: ['synthetic validation error'],
+        )
+        recorder, calls = _recorder_spy()
+        result, _repo = self._run(tmp_path, recorder=recorder)
+
+        assert result.exit_code == 1
+        doc = _one_recorded(calls)
+        assert doc['exit_code'] == 1
+        assert doc['commit_made'] is False
+
+    def test_commit_failure_still_records(self, tmp_path):
+        recorder, calls = _recorder_spy()
+        result, _repo = self._run(
+            tmp_path, recorder=recorder, committer=_failing_committer,
+        )
+
+        assert result.exit_code == 1
+        doc = _one_recorded(calls)
+        assert doc['exit_code'] == 1
+        assert doc['commit_made'] is False
+
+    def test_unexpected_exception_mid_run_still_records(self, tmp_path, monkeypatch):
+        """A crashed night that recorded NOTHING would let the progress
+        probe read a stale streak as healthy. The exception must still
+        propagate — recording is not swallowing."""
+        def _boom(selected, **kwargs):
+            raise RuntimeError('synthetic mid-run explosion')
+
+        monkeypatch.setattr(nightly, 'build_digests', _boom)
+        recorder, calls = _recorder_spy()
+
+        with pytest.raises(RuntimeError, match='synthetic mid-run explosion'):
+            self._run(tmp_path, recorder=recorder)
+
+        doc = _one_recorded(calls)
+        assert doc['exit_code'] != 0, (
+            'a crashed night must record its crash honestly'
+        )
+        assert doc['counters']['selected_count'] == 1, (
+            'the sample was computed before the crash, so its real counters '
+            'are still recordable'
+        )
+
+    def test_a_raising_recorder_never_breaks_the_run(self, tmp_path, caplog):
+        """Observability must never become a new failure mode — mirroring
+        post_escalation's established best-effort contract."""
+        def _raising_recorder(project_id, **kwargs):
+            raise OSError('synthetic state-write failure')
+
+        with caplog.at_level('WARNING', logger='legibility.nightly'):
+            result, _repo = self._run(tmp_path, recorder=_raising_recorder)
+
+        assert result.exit_code == 0
+        assert result.commit_made is True
+        assert any(
+            r.levelname == 'WARNING' for r in caplog.records
+        ), 'a swallowed state-write failure must still be announced once'
+
+    def test_wired_for_real_end_to_end(self, tmp_path):
+        """No recorder= override: the two modules are wired together for
+        real, not just against a spy."""
+        result, _repo = self._run(tmp_path)
+        assert result.exit_code == 0
+
+        status, doc = trickle_state.load_state(
+            trickle_state.trickle_state_path('testproj')
+        )
+        assert status == 'ok', f'expected a real state file; got {status!r}'
+        assert doc is not None
+        assert doc['project_id'] == 'testproj'
+        assert doc['outcome'] == 'productive'
+        assert doc['target_date'] == '2026-07-13'
