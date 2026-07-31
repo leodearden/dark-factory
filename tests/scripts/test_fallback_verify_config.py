@@ -28,12 +28,15 @@ This test loads the *committed* ``dark-factory-orchestrator.yaml`` directly
 in ``test_orchestrator_restart_config_drift.py``.
 """
 
+import os
 import pathlib
 import re
+import tomllib
 
 import yaml
 
 from orchestrator.config import ModuleConfig, _discover_module_configs
+from orchestrator.verify import _AND_CLAUSE_SPLIT_RE, _cd_clause_target
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 DF_CONFIG_PATH = REPO_ROOT / "dark-factory-orchestrator.yaml"
@@ -80,6 +83,52 @@ TIMEOUT_GUARD_EXCLUSIONS = frozenset({"cockpit"})
 
 def _fleet_test_command() -> str:
     return yaml.safe_load(DF_CONFIG_PATH.read_text(encoding="utf-8"))["test_command"]
+
+
+def _fleet_type_check_command() -> str:
+    return yaml.safe_load(DF_CONFIG_PATH.read_text(encoding="utf-8"))["type_check_command"]
+
+
+def _pyproject_at(rel_dir: str) -> dict:
+    """Parse the ``pyproject.toml`` of the repo-relative directory *rel_dir*."""
+    path = REPO_ROOT / rel_dir / "pyproject.toml"
+    assert path.is_file(), (
+        f"no pyproject.toml at {rel_dir}/ (task 3367) — the interpreter-pin "
+        "invariant cannot be evaluated for a directory with no pyright config"
+    )
+    return tomllib.loads(path.read_text(encoding="utf-8"))
+
+
+def _assert_pyright_pins_worktree_venv(rel_dir: str, pyright: dict, why: str) -> None:
+    """Assert *rel_dir*'s ``[tool.pyright]`` table pins the worktree-root ``.venv``.
+
+    Shared by both interpreter-pin invariants below (task 3367): the narrow
+    fleet-chain guard and the general every-workspace-member guard assert the
+    SAME property, and must not drift apart.
+    """
+    for key in ("venvPath", "venv"):
+        assert key in pyright, (
+            f"{rel_dir}/pyproject.toml [tool.pyright] does not declare {key!r} "
+            f"(task 3367, esc-3359-1). {why} Without an explicit venvPath/venv "
+            "pin, pyright resolves its Python interpreter from the ambient "
+            "VIRTUAL_ENV/PATH — which verify._target_subprocess_env deliberately "
+            "strips — so in a cold merge worktree it type-checks against an "
+            "environment holding none of the workspace's third-party packages "
+            "and emits hundreds of phantom 'could not be resolved' "
+            "(reportMissingImports) errors, false-reddening TYPE on a branch "
+            "with no defect (509+ errors on a DOCS-ONLY diff in esc-3359-1)"
+        )
+    resolved = (REPO_ROOT / rel_dir / pyright["venvPath"] / pyright["venv"]).resolve()
+    expected = (REPO_ROOT / ".venv").resolve()
+    assert resolved == expected, (
+        f"{rel_dir}/pyproject.toml [tool.pyright] pins venvPath="
+        f"{pyright['venvPath']!r} venv={pyright['venv']!r}, which resolves to "
+        f"{resolved} — not this worktree's own root .venv at {expected} (task "
+        "3367, esc-3359-1). The pin is resolved by pyright RELATIVE TO THE "
+        "CONFIG FILE'S OWN DIRECTORY, which is what makes it correct per-worktree; "
+        "a pin that resolves anywhere else reintroduces cross-worktree "
+        "interpreter leakage"
+    )
 
 
 def _discover_per_module_configs() -> dict[str, ModuleConfig]:
@@ -486,3 +535,78 @@ def test_nested_module_configs_are_covered_by_the_per_test_timeout_guard() -> No
         f'discovery failed to resolve known per-module config(s) {sorted(missing)} '
         f'(task 3350); discovered: {sorted(discovered)}'
     )
+
+
+class TestRootTypeCheckCommandPyrightInterpreterPinned:
+    """Every bare-``pyright`` clause of the fleet chain must be interpreter-pinned.
+
+    Task 3367 / esc-3359-1 — the DOCS-ONLY-DIFF guard.
+
+    A docs-only diff contains zero ``.py`` files, so ``verify._build_fallback_config``
+    returns ``None`` and the RAW ``type_check_command`` from
+    ``dark-factory-orchestrator.yaml`` runs verbatim — none of the
+    ``_scope_fallback_tool_to_subproject`` rescoping (tasks 2355/3022) applies.
+    Its outcome then depends on exactly one property: whether every directory the
+    chain ``cd``s into pins pyright's interpreter at that worktree's own ``.venv``.
+
+    If a clause does not, pyright falls back to ambient VIRTUAL_ENV/PATH resolution
+    — and ``verify._target_subprocess_env`` deliberately strips both — so a cold
+    merge worktree type-checks against an interpreter holding none of the
+    workspace's third-party packages. Measured under exactly that scrubbed env:
+    fused-memory 514 errors, orchestrator 496, all phantom reportMissingImports;
+    0 in both once the pin is present.
+    """
+
+    def test_every_bare_pyright_clause_runs_in_an_interpreter_pinned_dir(self) -> None:
+        cmd = _fleet_type_check_command()
+
+        # Walk the &&-chain tracking cwd through `cd <dir>` clauses, using the
+        # PRODUCTION helpers verify.py itself uses to read this same command
+        # (task 3022's cwd-relative amendment) so this guard cannot drift from
+        # how the scoper interprets the chain.
+        parts = _AND_CLAUSE_SPLIT_RE.split(cmd)
+        cwd = "."
+        checked: list[str] = []
+        for i in range(0, len(parts), 2):
+            clause = parts[i]
+            cd_target = _cd_clause_target(clause)
+            if cd_target is not None:
+                cwd = os.path.normpath(os.path.join(cwd, cd_target))
+                continue
+            if "pyright" not in clause:
+                continue
+            if "uv run --project" in clause:
+                # Already interpreter-pinned, by uv rather than by [tool.pyright]:
+                # `uv run --project <sub>` selects the workspace venv itself.
+                continue
+            pyproject = _pyproject_at(cwd)
+            pyright = pyproject.get("tool", {}).get("pyright")
+            assert pyright is not None, (
+                f"fleet type_check_command clause {clause.strip()!r} runs bare "
+                f"pyright in {cwd!r}, whose pyproject.toml has no [tool.pyright] "
+                "table at all (task 3367, esc-3359-1) — so pyright resolves its "
+                "interpreter from ambient VIRTUAL_ENV/PATH, which "
+                "verify._target_subprocess_env strips"
+            )
+            _assert_pyright_pins_worktree_venv(
+                cwd,
+                pyright,
+                why=(
+                    f"It is the cwd of fleet type_check_command clause "
+                    f"{clause.strip()!r}, which a DOCS-ONLY diff runs verbatim "
+                    "(no .py files -> _build_fallback_config returns None -> no "
+                    "rescoping)."
+                ),
+            )
+            checked.append(cwd)
+
+        # Non-vacuity: if the chain's shape changes such that no bare-pyright
+        # clause is found, this guard must fail loudly rather than pass on an
+        # empty set.
+        assert checked, (
+            "no bare (non-`uv run --project`) pyright clause was found in "
+            f"dark-factory-orchestrator.yaml type_check_command (task 3367, "
+            f"esc-3359-1) — this interpreter-pin guard would pass vacuously. "
+            f"Either the chain no longer runs pyright, or its shape changed such "
+            f"that the &&-clause walk no longer resolves its cwds; got: {cmd!r}"
+        )
