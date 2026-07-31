@@ -40,6 +40,8 @@ import sys
 from pathlib import Path
 from typing import TypedDict
 
+from shared.cli_invoke import read_transcript_records
+
 _TESTS_DIR = Path(__file__).resolve().parent
 _SRC_DIR = _TESTS_DIR.parent / 'src'
 for _p in (str(_TESTS_DIR), str(_SRC_DIR)):
@@ -403,3 +405,49 @@ def materialize_config_dir(row: dict, dest: Path) -> tuple[Path, str]:
         transcript.write_text(body + ('\n' if body else ''), encoding='utf-8')
 
     return (config_dir, row['session_id'])
+
+
+# ---------------------------------------------------------------------------
+# The chosen predicate — SESSION-TRANSCRIPT-MATERIALIZED
+# ---------------------------------------------------------------------------
+
+def evaluate_startup_completion_predicate(config_dir: Path, session_id: str) -> bool | None:
+    """Has the CLI finished starting up, even though turn 1 has not landed?
+
+    The REFERENCE implementation of the predicate named
+    **SESSION-TRANSCRIPT-MATERIALIZED** in
+    `docs/startup-completion-artifact-matrix.md`, which task 3326 ports into
+    production for contract C5.  Built exclusively on substrate that is already
+    public on main — ``shared.cli_invoke.read_transcript_records`` — so the
+    discrimination is proven against today's code, and the port inherits that
+    function's tolerant parsing and ``None``-on-unreadable semantics for free.
+
+    Definition::
+
+        records = read_transcript_records(config_dir, session_id)
+        None  if records is None      # cannot locate/read — cannot prove
+        True  if len(records) >= 1    # session init reached; prompt enqueued
+        False otherwise               # file exists but carries no record yet
+
+    Tri-state, mirroring the house convention that ``None`` means "unreadable,
+    cannot prove either way".  ``count_transcript_turns`` already returns ``None``
+    on an unlocatable transcript, and the existing startup kill deliberately
+    fires only on an explicit ``live_turns == 0``, never on ``None``
+    (cli_invoke.py:2111-2119).  C5's "predicate unreadable -> degrade to today's
+    120s behaviour" needs that third state: a two-valued predicate would have to
+    fold unreadable into True (extending the bound for a possible wedge) or
+    False (killing a possibly-healthy server-retry cycle).
+
+    WHY >= 1 RECORD, and not something narrower: the probe observed the leading
+    record types to be ``queue-operation`` (prompt enqueue), ``queue-operation``,
+    ``attachment`` (the SessionStart hook) and ``user`` — every one of them
+    written BEFORE any ``assistant`` record.  Their presence proves the CLI
+    reached session init and accepted the prompt.  A narrower rule keyed on a
+    specific record type would pin this predicate to one CLI version's record
+    vocabulary for no gain in discrimination; see the report's rejected
+    alternatives.
+    """
+    records = read_transcript_records(config_dir, session_id)
+    if records is None:
+        return None
+    return len(records) >= 1
