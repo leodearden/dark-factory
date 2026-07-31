@@ -39,7 +39,11 @@ import pytest
 # Cross-module reuse (task 2610 precedent — see test_workflow_terminal_report.py
 # for the same import shape): these factories live in _workflow_helpers.py, not
 # in any single test module's private namespace.
-from _orch_helpers import _init_harness_state_for_test, wire_scheduler_liveness_mock
+from _orch_helpers import (
+    CANCEL_SCOPE_BARRIER_TIMEOUT,
+    _init_harness_state_for_test,
+    wire_scheduler_liveness_mock,
+)
 from _workflow_helpers import (
     AgentStub,
     _build_workflow,
@@ -748,6 +752,140 @@ class TestSoftCancelCoversNewAwait:
         workflow._cancel_event.set()
         done, _pending = await asyncio.wait({run_task}, timeout=5.0)
         assert run_task in done, 'run() task did not finish within 5s'
+        assert not run_task.cancelled(), (
+            'CancelledError escaped run() on a soft-cancel'
+        )
+
+        report = run_task.result()
+        assert isinstance(report, TerminalReport)
+        assert report.outcome == WorkflowOutcome.SOFT_CANCELLED
+        assert workflow.machine.state == WorkflowState.CANCELLED
+        assert report.phase == WorkflowState.CANCELLED
+        assert release_calls == ['42'], (
+            'kind=soft must release the lane even from a still-working state'
+        )
+
+
+# ---------------------------------------------------------------------------
+# task 3307: cancel-scope barriers must tolerate a slow (but real) prologue
+# ---------------------------------------------------------------------------
+#
+# TestRunSingleCatchHardCancel and TestSoftCancelCoversNewAwait above give
+# _drive()'s real pre-VERIFY prologue (git worktree creation, artifact
+# writes, a _recover_if_already_merged git-plumbing check, then PLAN/EXECUTE
+# via the AgentStub) a fixed wall-clock budget to complete before wedging in
+# VERIFY. That budget is a SYNCHRONIZATION barrier on real work reaching a
+# known point, not a latency assertion about cancellation — the cancel ->
+# TerminalReport contract under test only begins once the barrier clears.
+# This class proves that contract survives a prologue slower than the
+# retired 5.0s literal, by injecting a deterministic delay at the setup seam.
+
+_SLOW_PROLOGUE_S = 6.0  # task 3307: strictly > the retired 5.0s inline barrier
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(180)  # task 3307: must exceed the 6s injected prologue + 2 x
+# CANCEL_SCOPE_BARRIER_TIMEOUT (45s) inner barriers below (see pyproject.toml's
+# "Slow tests opt out with @pytest.mark.timeout(N)" convention).
+class TestCancelBarrierToleratesSlowPrologue:
+    """The cancel-scope ``wait_for``/``wait`` barriers exercised above are
+    SYNCHRONIZATION barriers on real work (git worktree creation, artifact
+    writes, stubbed agent round-trips) reaching a known point — not latency
+    assertions about cancellation itself. The subject under test (cancel ->
+    ``TerminalReport``) only begins after the barrier clears, so a
+    slow-but-correct host must never fail them. This class injects an
+    artificial delay into ``TaskWorkflow._setup_worktree_and_artifacts``
+    (``_SLOW_PROLOGUE_S``, strictly greater than the retired 5.0s budget) and
+    proves the hard-cancel and soft-cancel contracts still hold — pinning the
+    regression this task's widened ``CANCEL_SCOPE_BARRIER_TIMEOUT`` fixes.
+    """
+
+    async def test_hard_cancel_mid_verify_survives_slow_prologue(
+        self, config, git_ops, task_assignment, monkeypatch,
+    ):
+        stub = AgentStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+
+        _orig_setup = workflow._setup_worktree_and_artifacts
+
+        async def _slow_setup(branch_name: str) -> None:
+            await asyncio.sleep(_SLOW_PROLOGUE_S)
+            return await _orig_setup(branch_name)
+
+        workflow._setup_worktree_and_artifacts = _slow_setup  # type: ignore[method-assign]
+
+        wedged = asyncio.Event()
+
+        async def _wedge_verify() -> WorkflowOutcome:
+            # Entered only after _enter_phase(VERIFY) — reachable only once
+            # the slow setup + PLAN + EXECUTE have all completed.
+            wedged.set()
+            await asyncio.sleep(3600)
+            raise AssertionError('unreachable — cancelled before the sleep returns')
+
+        workflow._verify_debugfix_loop = _wedge_verify  # type: ignore[method-assign]
+
+        run_task = asyncio.create_task(workflow.run())
+        await asyncio.wait_for(wedged.wait(), timeout=CANCEL_SCOPE_BARRIER_TIMEOUT)
+        assert workflow.machine.state == WorkflowState.VERIFY
+
+        # Harness-style hard-cancel: cancel the task running run() directly.
+        run_task.cancel()
+        done, _pending = await asyncio.wait({run_task}, timeout=CANCEL_SCOPE_BARRIER_TIMEOUT)
+        assert run_task in done, 'run() task did not finish within the barrier'
+
+        assert not run_task.cancelled(), (
+            'CancelledError escaped run() instead of being translated into '
+            'a TerminalReport(outcome=CANCELLED)'
+        )
+        report = run_task.result()
+        assert isinstance(report, TerminalReport)
+        assert report.outcome == WorkflowOutcome.CANCELLED
+        assert workflow.machine.state == WorkflowState.CANCELLED
+        assert report.phase == WorkflowState.CANCELLED
+
+    async def test_soft_cancel_during_unwrapped_await_survives_slow_prologue(
+        self, config, git_ops, task_assignment, monkeypatch,
+    ):
+        stub = AgentStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+
+        _orig_setup = workflow._setup_worktree_and_artifacts
+
+        async def _slow_setup(branch_name: str) -> None:
+            await asyncio.sleep(_SLOW_PROLOGUE_S)
+            return await _orig_setup(branch_name)
+
+        workflow._setup_worktree_and_artifacts = _slow_setup  # type: ignore[method-assign]
+
+        wedged = asyncio.Event()
+        release_calls: list[str] = []
+
+        async def _wedge_verify() -> WorkflowOutcome:
+            # A stand-in for a long, non-_await_cancellable-wrapped wait (e.g.
+            # a steward wait) — entered only after the slow setup + PLAN +
+            # EXECUTE have all completed and _enter_phase(VERIFY) has fired.
+            wedged.set()
+            await asyncio.sleep(3600)
+            raise AssertionError('unreachable — soft-cancelled before the sleep returns')
+
+        async def _spy_release_lane(task_id: str) -> bool:
+            release_calls.append(task_id)
+            return True
+
+        workflow._verify_debugfix_loop = _wedge_verify  # type: ignore[method-assign]
+        workflow.git_ops.release_lane_for_terminal_task = _spy_release_lane  # type: ignore[method-assign]
+
+        run_task = asyncio.create_task(workflow.run())
+        await asyncio.wait_for(wedged.wait(), timeout=CANCEL_SCOPE_BARRIER_TIMEOUT)
+        assert workflow.machine.state == WorkflowState.VERIFY
+
+        # Soft-cancel: set the event directly — no task.cancel() involved.
+        workflow._cancel_event.set()
+        done, _pending = await asyncio.wait({run_task}, timeout=CANCEL_SCOPE_BARRIER_TIMEOUT)
+        assert run_task in done, 'run() task did not finish within the barrier'
         assert not run_task.cancelled(), (
             'CancelledError escaped run() on a soft-cancel'
         )
