@@ -390,3 +390,77 @@ class TestWindowEviction:
         state = await _report_failures(gate, 1)
         assert isinstance(state, Open)
         assert state.stats.failures == 8
+
+
+class TestProbeClose:
+    """step-15: Open --OK--> Probing --OK--> Closed, with hysteresis."""
+
+    async def test_first_success_moves_open_to_probing(self) -> None:
+        gate, _mono, _wall = _gate()
+        opened = await _report_failures(gate, 8)
+        assert isinstance(opened, Open)
+        state = await _report_ok(gate, 1)
+        assert isinstance(state, Probing)
+        assert state.consecutive_successes == 1
+
+    async def test_probing_carries_since_and_stats_from_open(self) -> None:
+        gate, _mono, wall = _gate()
+        opened = await _report_failures(gate, 8)
+        assert isinstance(opened, Open)
+        wall.advance(120)
+        state = await _report_ok(gate, 1)
+        assert isinstance(state, Probing)
+        assert state.since == opened.since
+        assert state.stats == opened.stats
+
+    async def test_probing_is_still_degraded(self) -> None:
+        """One success is not recovery — consumers must keep throttling."""
+        gate, _mono, _wall = _gate()
+        await _report_failures(gate, 8)
+        await _report_ok(gate, 1)
+        assert gate.is_degraded is True
+
+    async def test_second_success_closes_the_gate(self) -> None:
+        gate, _mono, _wall = _gate()
+        await _report_failures(gate, 8)
+        await _report_ok(gate, 1)
+        state = await _report_ok(gate, 1)
+        assert isinstance(state, Closed)
+        assert state is gate.state()
+        assert gate.is_degraded is False
+
+    async def test_close_clears_the_window_so_one_failure_cannot_re_trip(self) -> None:
+        """The outage's own failures are still inside window_secs at close time.
+
+        Without clearing, the very next 5xx would instantly re-trip and the
+        breaker would oscillate.  A re-trip must mean "the provider is down
+        again", not "the provider was down a minute ago".
+        """
+        gate, _mono, _wall = _gate()
+        await _report_failures(gate, 8)
+        await _report_ok(gate, 2)
+        assert isinstance(gate.state(), Closed)
+        state = await _report_failures(gate, 1)
+        assert isinstance(state, Closed)
+        assert state.__class__ is Closed
+
+    async def test_re_trip_requires_a_fresh_full_burst(self) -> None:
+        gate, _mono, _wall = _gate()
+        await _report_failures(gate, 8)
+        await _report_ok(gate, 2)
+        state = await _report_failures(gate, 7)
+        assert isinstance(state, Closed), 'a partial post-close burst must not trip'
+        state = await _report_failures(gate, 1)
+        assert isinstance(state, Open)
+
+    async def test_hysteresis_is_configurable(self) -> None:
+        """close_after_successes=1 closes on the first success; =3 needs three."""
+        gate, _mono, _wall = _gate(close_after_successes=1)
+        await _report_failures(gate, 8)
+        assert isinstance(await _report_ok(gate, 1), Closed)
+
+        strict, _mono2, _wall2 = _gate(close_after_successes=3)
+        await _report_failures(strict, 8)
+        assert isinstance(await _report_ok(strict, 1), Probing)
+        assert isinstance(await _report_ok(strict, 1), Probing)
+        assert isinstance(await _report_ok(strict, 1), Closed)
