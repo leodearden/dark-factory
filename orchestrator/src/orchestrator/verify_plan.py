@@ -182,12 +182,66 @@ class PlannedRun:
     an explicit reasoned PlannedRun (``cmd=None``, non-empty ``reason``)
     rather than a silently dropped command (the task-1852 "not silent"
     requirement).
+
+    ``scoped_targets`` is the worktree-root-relative file list this (module,
+    tool) slot was NARROWED to. **Invariant: non-empty iff ``scope_kind is
+    ScopeKind.FILE_SCOPED``** — FULL_SUITE is deliberately unscoped and
+    SKIPPED/TRIVIAL never ran, so empty is the correct and MEANINGFUL value
+    there, not an absence of information. (Pinned by tests, deliberately not
+    by a ``__post_init__`` assert: ``verify._safe_derive_verify_plan_dict``
+    swallows exceptions and returns ``None``, so an assert here would
+    degrade an invariant violation into losing the ENTIRE plan record —
+    silently destroying the very observability this field exists to supply.)
+
+    FIDELITY: it records the scoping INTENT the decision layer computed, NOT
+    a guarantee about what the command actually ran on — the executed command
+    may be BROADER, never narrower. Two reachable divergences: (i) when
+    :func:`_scope_prefix_to_keyword` cannot narrow (the keyword is absent, or
+    the prefix parses OPAQUE) it returns the command UNSCOPED while the slot
+    is still labelled FILE_SCOPED, so a ``type_check_command='mypy src/'``
+    slot records the touched files but type-checks the whole tree; (ii) after
+    ``verify._executed_fallback_plan`` reconciliation this field still holds
+    the DECISION-layer flat list while ``cmd`` is the executed, possibly
+    subproject-rescoped or unscoped command — the same intent-vs-execution
+    gap :func:`_derive_fallback_runs`' own "Fidelity caveat" paragraph
+    documents for ``module_prefix``/``cmd``. Read it as "what the planner
+    decided to narrow to", and ``cmd`` as "what ran".
+
+    It exists (task 3219) because ``cmd.targets`` CANNOT answer "which files
+    was this scoped to?" whenever ``cmd`` is raw-retained, and two paths
+    routinely produce exactly that: the tail-preserving chained-lint accept
+    path in :func:`_scope_prefix_to_keyword` (which every subproject's
+    ``lint_command`` hits, since each chains a sibling checker), and every
+    run rebuilt by ``verify._executed_fallback_plan``. In both cases the
+    rendered string still carries the narrowed file list, but the
+    machine-readable record was lost. It is populated uniformly for chained
+    AND unchained FILE_SCOPED runs, so a consumer never has to branch on
+    ``cmd.raw`` to read it; where ``cmd.targets`` is also populated the two
+    agree, which is a consistency check rather than a second source of truth.
+
+    It lives HERE and not on ``VerifyCmd`` because ``VerifyCmd`` is the
+    execution model, whose P3 invariant (``verify_cmd.render``) exists to
+    guarantee that no field it carries is silently dropped by ``render()`` —
+    a deliberately-non-rendering field there would be precisely the class of
+    field P3 forbids, and would make P3 self-contradictory. Relaxing P3 to
+    let a raw-retained command carry these targets instead was considered
+    and rejected: P3 is a general guard, not a lint on one call site, so
+    admitting one caller's provenance need would also free ``cargo_scope``
+    and ``serial_pytest`` — which mutate raw-retained commands by rewriting
+    ``raw`` — to leave stale structured ``targets`` behind with nothing left
+    to catch it. Scoping provenance is a PLAN fact, and ``PlannedRun`` is
+    the plan record: sibling to ``scope_kind``/``reason``, which already
+    record the WHY of a narrowing to this field's WHAT. It also rides
+    untouched through ``verify._executed_fallback_plan``'s
+    ``dataclasses.replace``-based reconciliation, which a ``VerifyCmd``-hosted
+    field would not.
     """
 
     module_prefix: str
     cmd: VerifyCmd | None
     scope_kind: ScopeKind
     reason: str
+    scoped_targets: tuple[str, ...] = ()
 
     def to_dict(self) -> dict:
         """Render as a plain JSON-native dict (D3) — see ``_verify_cmd_to_dict``."""
@@ -196,6 +250,7 @@ class PlannedRun:
             'cmd': _verify_cmd_to_dict(self.cmd) if self.cmd is not None else None,
             'scope_kind': str(self.scope_kind),
             'reason': self.reason,
+            'scoped_targets': list(self.scoped_targets),
         }
 
 
@@ -250,6 +305,11 @@ def _scope_prefix_to_keyword(raw: str, keyword: str, files: list[str]) -> Verify
     tail)`` — the same shape both bail-outs below already produce, which
     ``render`` reproduces byte-for-byte. The real ``ToolKind`` is kept rather
     than OPAQUE so ``run.cmd.tool`` stays meaningful downstream.
+
+    That raw-retained return drops the structured ``targets`` by design (P3),
+    so the narrowed file list is not recoverable from the returned ``cmd``;
+    scoping provenance is recorded by the caller on
+    :class:`PlannedRun`'s ``scoped_targets`` — see that field's docstring.
 
     *keyword* absent from *raw*, or the prefix not parsing into one
     recognised structured invocation (P1), leaves *raw* untouched: the
@@ -335,6 +395,7 @@ def _derive_module_runs(
         lint_cmd = _scope_prefix_to_keyword(mc.lint_command, 'ruff check', scoped)
         runs.append(PlannedRun(
             mc.prefix, lint_cmd, ScopeKind.FILE_SCOPED, 'lint: file-scoped to touched file(s)',
+            scoped_targets=tuple(scoped),
         ))
     else:
         runs.append(PlannedRun(
@@ -356,6 +417,7 @@ def _derive_module_runs(
             runs.append(PlannedRun(
                 mc.prefix, type_cmd, ScopeKind.FILE_SCOPED,
                 'pyright: file-scoped to touched file(s)',
+                scoped_targets=tuple(scoped),
             ))
     else:
         runs.append(PlannedRun(
@@ -386,6 +448,7 @@ def _derive_module_runs(
             runs.append(PlannedRun(
                 mc.prefix, test_cmd, ScopeKind.FILE_SCOPED,
                 'pytest: file-scoped to touched test file(s)',
+                scoped_targets=tuple(collectable_tests),
             ))
         elif role == 'task':
             test_cmd = parse_config_command(mc.test_command)
@@ -562,6 +625,7 @@ def _derive_fallback_runs(
         runs.append(PlannedRun(
             _FALLBACK_PREFIX, lint_cmd, ScopeKind.FILE_SCOPED,
             'lint: file-scoped to touched file(s)',
+            scoped_targets=tuple(py_files),
         ))
     else:
         runs.append(PlannedRun(
@@ -582,6 +646,7 @@ def _derive_fallback_runs(
             runs.append(PlannedRun(
                 _FALLBACK_PREFIX, type_cmd, ScopeKind.FILE_SCOPED,
                 'pyright: file-scoped to touched file(s)',
+                scoped_targets=tuple(py_files),
             ))
     else:
         runs.append(PlannedRun(
@@ -641,6 +706,7 @@ def _derive_fallback_runs(
             runs.append(PlannedRun(
                 _FALLBACK_PREFIX, test_cmd, ScopeKind.FILE_SCOPED,
                 'pytest: file-scoped to touched test file(s)',
+                scoped_targets=tuple(collectable_tests),
             ))
     else:
         runs.append(PlannedRun(

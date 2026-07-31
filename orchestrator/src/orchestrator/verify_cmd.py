@@ -554,6 +554,12 @@ def render(cmd: VerifyCmd) -> str:
     worktree-root-relative there. ``wrappers`` is exempt from the P3 check
     too — a raw-retained command legitimately carries a ``govern_cpu``
     wrapper (the "legitimate wrapper context").
+
+    A raw-retained return therefore drops the structured ``targets`` a
+    scoper produced; scoping provenance is recorded on
+    ``verify_plan.PlannedRun.scoped_targets`` instead — see that field's
+    docstring for why P3 was kept rather than relaxed to carry it (task
+    3219).
     """
     if cmd.raw is not None:
         assert cmd.cwd_rel is None and not cmd.targets, (
