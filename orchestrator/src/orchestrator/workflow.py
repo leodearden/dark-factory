@@ -99,6 +99,13 @@ from orchestrator.scheduler import (
     normalize_lock,
 )
 from orchestrator.session_registry import build_session_slug
+from orchestrator.stranded_verified_green import (
+    DURABLE_MERGE_FAILURE_STATUSES,
+    SUCCESS_TRANSIENT_MERGE_STATUSES,
+    last_verified_green_tip,
+    merge_request_marker_is_fresh,
+    submit_verified_green_merge_request,
+)
 from orchestrator.task_status import (
     ACTIVE_TASK_STATUSES,
     TERMINAL_STATUSES,
@@ -4051,7 +4058,10 @@ class TaskWorkflow:
             # none interacts with the consecutive_no_plan_failures cycle
             # counter.  Order matters: unactionable_task and false_premise are
             # the most decisive (jump straight to L1, bypass steward);
-            # already_done is a clean DONE; blocking_dependency may re-loop
+            # already_done is a clean DONE; ready_to_merge is a deterministic
+            # merge submit (less decisive than already_done's clean DONE — the
+            # work is on the BRANCH, not main — but more decisive than a
+            # re-looping blocking_dependency); blocking_dependency may re-loop
             # the architect.
             if self.artifacts.read_unactionable_task() is not None:
                 return await self._handle_unactionable_task_report()
@@ -4059,6 +4069,8 @@ class TaskWorkflow:
                 return await self._handle_false_premise_report()
             if self.artifacts.read_already_done() is not None:
                 return await self._handle_already_done_report()
+            if self.artifacts.read_ready_to_merge() is not None:
+                return await self._handle_ready_to_merge_report()
             # Fix B: the architect may have written a blocking_dependency
             # report instead of a plan.
             if self.artifacts.read_blocking_dependency() is not None:
@@ -4450,6 +4462,8 @@ class TaskWorkflow:
             return await self._handle_false_premise_report()
         if self.artifacts.read_already_done() is not None:
             return await self._handle_already_done_report()
+        if self.artifacts.read_ready_to_merge() is not None:
+            return await self._handle_ready_to_merge_report()
         if self.artifacts.read_blocking_dependency() is not None:
             # Falling through — the architect path's
             # _handle_blocking_dep_report logic re-acquires base_commit
@@ -5831,6 +5845,568 @@ class TaskWorkflow:
                 escalate_to_human=True,
             )
         return WorkflowOutcome.DONE
+
+    async def _handle_ready_to_merge_report(self) -> WorkflowOutcome:
+        """Process a ``.task/ready_to_merge.json`` report from the architect.
+
+        Caller has already verified the artifact exists.
+
+        The architect's *merge-landing desync* exit (PRD ``plans/architect-
+        already-complete-exits.md`` §β): the work is complete on THIS BRANCH
+        and only the physical merge to main is missing.  The advised exit
+        before this one — ``report_unactionable_task`` — opened an L1 that
+        cost a human ~100k tokens AND vetoed the verified-green auto-merge
+        reaper, so a branch that was already green sat stranded.
+
+        The report is NEVER trusted.  Every predicate is re-derived FIRST-HAND
+        here (INV-3 corroborate-before-acting):
+
+        1. the cited ``commit`` equals the branch tip we resolve ourselves;
+        2. clean fast-forward — main is an ancestor of the tip, and the tip is
+           NOT already contained in main (that would be ``already_done``);
+        3. verify PASSED on this exact tip
+           (:func:`last_verified_green_tip`, read cross-run);
+        4. review returned a non-blocking verdict on this exact committed tree
+           (``record_review_verdict`` only ever caches PASS / suggestions_only,
+           so a cache hit on the current tree hash is proof).
+
+        On a match: enqueue a ``MergeRequest`` tagged ``source=
+        'architect-desync'`` and leave the task BLOCKED with NO open human
+        escalation — the merge worker's own scoped re-verify is the sole gate
+        that advances main, and the done flip arrives via the merge callback
+        (with the existing found_on_main reconciler as the restart-safe
+        backstop).  This handler never lands main itself.
+
+        On any miss: ``_mark_blocked`` WITHOUT escalating to a human — a false
+        ready-to-merge claim is an architect mistake, not an unworkable spec
+        (mirrors the already_done reject path).
+        """
+        assert self.artifacts is not None
+        report = self.artifacts.read_ready_to_merge()
+        assert report is not None  # caller must have verified
+
+        commit = str(report.get('commit') or '').strip()
+        evidence = str(report.get('evidence') or '')
+
+        self.artifacts.clear_ready_to_merge()
+
+        async def _reject(
+            predicate: str, summary: str, measured: dict,
+        ) -> WorkflowOutcome:
+            """Block on a failed desync predicate — no human escalation.
+
+            INV-2 structured-facts-at-failure: the failed *predicate* name and
+            the first-hand values it was judged against land on an
+            ``architect_desync_merge`` event AND on the blocked record, so
+            neither has to be reconstructed from log scraping.
+            """
+            if self.event_store:
+                self.event_store.emit(
+                    EventType.architect_desync_merge,
+                    task_id=self.task_id,
+                    phase='plan',
+                    data={
+                        'decision': 'rejected',
+                        'predicate': predicate,
+                        'measured': measured,
+                    },
+                )
+            detail = '\n'.join(f'{k}: {v}' for k, v in measured.items())
+            return await self._mark_blocked(
+                f'Architect ready_to_merge rejected ({predicate}): {summary}',
+                detail=f'{detail}\nevidence: {evidence}'[:2000],
+            )
+
+        if not commit:
+            return await _reject(
+                'cited_commit',
+                'malformed ready_to_merge.json — missing commit',
+                {'report': json.dumps(report)[:500]},
+            )
+
+        if self.merge_queue is None or self.worktree is None:
+            return await _reject(
+                'merge_queue_available',
+                'merge queue or worktree unavailable — cannot enqueue',
+                {'merge_queue': repr(self.merge_queue),
+                 'worktree': repr(self.worktree)},
+            )
+
+        branch_name = self.task_id  # matches _submit_to_merge_queue convention
+        main_sha = await self.git_ops.get_main_sha()
+        tip = await self.git_ops.resolve_branch_sha(
+            f'{self.config.git.branch_prefix}{branch_name}',
+        )
+        if not tip:
+            return await _reject(
+                'branch_resolved',
+                'the task branch does not resolve',
+                {'branch': branch_name, 'main_sha': main_sha, 'cited': commit},
+            )
+        if commit != tip:
+            return await _reject(
+                'cited_commit',
+                f'cited {commit[:12]} but the branch tip is {tip[:12]}',
+                {'cited': commit, 'tip': tip},
+            )
+
+        main_on_branch = await self.git_ops.is_ancestor(main_sha, tip)
+        branch_on_main = await self.git_ops.is_ancestor(tip, main_sha)
+        if not main_on_branch or branch_on_main:
+            return await _reject(
+                'clean_ff',
+                'the branch is not a clean fast-forward of main',
+                {'tip': tip, 'main_sha': main_sha,
+                 'main_is_ancestor_of_tip': main_on_branch,
+                 'tip_is_ancestor_of_main': branch_on_main},
+            )
+
+        verified_tip = last_verified_green_tip(self.event_store, self.task_id)
+        if verified_tip != tip:
+            return await _reject(
+                'verify_passed',
+                'verify has not passed on the branch tip',
+                {'tip': tip, 'last_verified_green_tip': verified_tip},
+            )
+
+        tree_hash = await self.git_ops.get_head_tree_hash(self.worktree)
+        cached = (
+            self.artifacts.get_cached_verdict(tree_hash) if tree_hash else None
+        )
+        if not cached:
+            return await _reject(
+                'review_pass',
+                'review has not passed on the branch tree',
+                {'tip': tip, 'tree_hash': tree_hash,
+                 'cached_verdict': cached},
+            )
+
+        # INV-4 storm-escape: a re-invoked architect on the SAME tip must not
+        # pile a second request onto the branch.  The durable marker key is
+        # deliberately distinct from the stranded reaper's
+        # `stranded_merge_request` so the two submit paths never clobber each
+        # other.  Fail-safe, mirroring the reaper: a malformed / stale /
+        # tip-mismatched marker falls through to a fresh submit rather than a
+        # wedged skip — a lost marker must never permanently strand the task.
+        marker = (self.task.get('metadata') or {}).get('architect_merge_request')
+        if merge_request_marker_is_fresh(marker, tip):
+            logger.info(
+                'Task %s: architect-desync merge already submitted for tip %s '
+                '— skipping re-submit (merge presumed in-flight; task stays '
+                'blocked)',
+                self.task_id, tip[:12],
+            )
+            if self.event_store:
+                self.event_store.emit(
+                    EventType.architect_desync_merge,
+                    task_id=self.task_id,
+                    phase='plan',
+                    data={
+                        'decision': 'duplicate',
+                        'tip': tip,
+                        'main_sha': main_sha,
+                        'marker': marker,
+                    },
+                )
+            await self._persist_blocked_row(
+                why=f'architect-desync merge already in flight for {tip[:12]}',
+            )
+            self._enter_phase(WorkflowState.BLOCKED)
+            return WorkflowOutcome.BLOCKED
+
+        logger.info(
+            'Task %s: architect reported merge-landing desync at %s — '
+            'enqueuing deterministic merge (no escalation; merge-queue '
+            'verify is the gate)',
+            self.task_id, tip[:12],
+        )
+        from orchestrator.merge_types import QueuedBranch  # noqa: PLC0415
+
+        req = await submit_verified_green_merge_request(
+            task_id=self.task_id,
+            branch=QueuedBranch.parse(
+                branch_name, self.config.git.branch_prefix,
+            ),
+            worktree=self.worktree,
+            tip_sha=tip,
+            config=self.config,
+            module_configs=list(self.config.module_configs_or_empty.values()),
+            merge_queue=self.merge_queue,
+            event_store=self.event_store,
+            source='architect-desync',
+            marker_key='architect_merge_request',
+            done_callback=lambda fut: self._schedule_architect_merge_done(
+                fut, tip=tip, evidence=evidence,
+            ),
+            update_task=self.scheduler.update_task,
+        )
+        if self.event_store:
+            self.event_store.emit(
+                EventType.architect_desync_merge,
+                task_id=self.task_id,
+                phase='plan',
+                data={
+                    'decision': 'enqueued',
+                    'tip': tip,
+                    'main_sha': main_sha,
+                    'request_id': req.request_id,
+                    'evidence': evidence[:400],
+                },
+            )
+        # Terminal BLOCKED with NO open human escalation: nothing here awaits a
+        # human, and an empty escalation set keeps the found_on_main MARK_DONE
+        # backstop unvetoed if the in-memory merge callback is lost to a
+        # restart.
+        #
+        # The durable row write is LOAD-BEARING, precisely BECAUSE no escalation
+        # is filed: an in-progress row with no live claimant, a branch off main
+        # and no open escalation is exactly the recovery table's
+        # REVERT_TO_PENDING shape (task_ground_truth.py rows (c)/(d)), so the
+        # sweep would set the task back to 'pending' (harness.py:5564) and
+        # replan it while this MergeRequest is still queued.  'blocked' with no
+        # escalation is instead LEAVE-shaped, and the merge callback (or the
+        # found_on_main reconciler) flips it done once main actually moves.
+        await self._persist_blocked_row(
+            why=f'architect-desync merge enqueued for {tip[:12]}',
+        )
+        self._enter_phase(WorkflowState.BLOCKED)
+        return WorkflowOutcome.BLOCKED
+
+    async def _persist_blocked_row(self, *, why: str) -> None:
+        """Durably write ``status='blocked'`` for a non-escalating terminal exit.
+
+        ``_handle_ready_to_merge_report``'s two success-shaped exits (merge
+        enqueued / duplicate skipped) deliberately do NOT route through
+        :meth:`_mark_blocked`: its ``if not merge_phase:`` block calls
+        :meth:`_spawn_dry_run_unblock` regardless of ``skip_escalation``, which
+        would launch a "why is this stuck?" investigation against a task that is
+        merely waiting on its own queued merge.  They still owe the durable row
+        write that ``_mark_blocked`` would otherwise have done — see the
+        REVERT_TO_PENDING note at the enqueue exit.
+
+        Fail-safe in both directions, because the merge is ALREADY enqueued by
+        the time this runs and must never be undone by a bookkeeping failure:
+
+        * :class:`TerminalExitRejection` is the BENIGN already-terminal race —
+          the merge done-callback or the found_on_main reconciler beat us to
+          ``mark_done``.  That row is correct; log at info and leave it
+          terminal.  Never reopen, never retry (unlike ``_mark_blocked``'s
+          bypass trip-wire, a terminal row here is the EXPECTED good outcome).
+        * Any other exception is logged at warning and swallowed; the
+          found_on_main reconciler remains the durable backstop.
+        """
+        try:
+            await self.scheduler.set_task_status(self.task_id, 'blocked')
+        except TerminalExitRejection as exc:
+            logger.info(
+                'Task %s: blocked-row write skipped, row is already terminal '
+                '(%s) — the merge callback or found_on_main got there first; '
+                'leaving it (%s)',
+                self.task_id, exc.old_status, why,
+            )
+        except Exception as exc:
+            logger.warning(
+                'Task %s: blocked-row write failed (%s): %s — continuing; the '
+                'found_on_main reconciler is the durable backstop',
+                self.task_id, why, exc,
+            )
+
+    def _schedule_architect_merge_done(
+        self, fut: asyncio.Future, *, tip: str, evidence: str,
+    ) -> None:
+        """Sync done-callback for an architect-desync MergeRequest.
+
+        Fires on the loop when the MergeRequest future resolves.  Derives the
+        terminal :class:`MergeOutcome` — a RAISING future is treated as a
+        durable failure, never as a silent success — and schedules
+        :meth:`_on_architect_merge_done` as a tracked background task.
+
+        A CANCELLED future is handled here instead, and is deliberately NOT a
+        durable failure — it is recorded as ``decision='merge_abandoned'`` and
+        goes no further.  This mirrors the sibling reaper callback
+        (``Harness._on_stranded_merge_done``: ``if fut.cancelled(): return  #
+        abandoned/superseded``) and the queue's own canonical classification
+        (``enqueue_merge_request._on_finalized`` maps a cancelled future to
+        state ``'abandoned'``, distinct from ``'error'``).  Both callers that
+        cancel one of these futures are benign:
+
+        * ``merge_cancel`` — a deliberate operator cancellation (the human is
+          already in the loop; paging them for their own action is backwards);
+        * ``InFlightMergeRegistry.release(detach_waiters=True)`` — the
+          stale-reap path, which cancels the stale primary and immediately
+          re-acquires the slot for a FRESH request on the same branch.  That
+          successor lands the branch and the found_on_main reconciler flips
+          the task done.
+
+        Routing cancellation into the durable branch would file a born-at-L2
+        ``stranded_merge_failed`` (critical, human-routed) for both of those,
+        so it is a spurious page.  It is also not needed to avoid a strand: a
+        task left ``blocked`` / no-escalation / branch EXISTS_OFF_MAIN is
+        picked up by the harness sweep's EXISTS_OFF_MAIN upgrade
+        (``harness.py`` — ``_only_merge_remediable([])`` is vacuously true, so
+        LEAVE is upgraded to ``RE_FILE_ESCALATION``), which files a
+        ``stranded_blocked`` L1 that the watcher auto-resolves into a re-pend.
+        The task is re-dispatched, the architect re-reports the desync, and
+        the (now stale) marker lets it re-submit.  Abandonment self-heals; a
+        durable FAILURE must not take that path, which is exactly why
+        ``stranded_merge_failed`` is excluded from
+        ``MERGE_REMEDIABLE_ESC_CATEGORIES`` — it blocks the upgrade and stops
+        a failed branch being re-submitted into the same failure.
+
+        Wrapped fail-safe: any error is logged and never propagated (mirrors
+        ``enqueue_merge_request._on_finalized`` and the reaper's
+        ``_on_stranded_merge_done``).  Losing this callback is survivable: the
+        task is left blocked with no open escalation, so the found_on_main
+        reconciler still marks it done on the next sweep.
+        """
+        try:
+            from orchestrator.merge_types import MergeOutcome  # noqa: PLC0415
+
+            if fut.cancelled():
+                logger.info(
+                    'Task %s: architect-desync merge future was cancelled at '
+                    'tip %s (abandoned/superseded, not a failure) — no '
+                    'escalation; the stranded-blocked sweep re-drives',
+                    self.task_id, tip[:12],
+                )
+                if self.event_store:
+                    self.event_store.emit(
+                        EventType.architect_desync_merge,
+                        task_id=self.task_id,
+                        phase='merge',
+                        data={
+                            'decision': 'merge_abandoned',
+                            'status': 'cancelled',
+                            'tip': tip,
+                            'reason': 'merge future cancelled',
+                        },
+                    )
+                return
+            if (exc := fut.exception()) is not None:
+                outcome = MergeOutcome(
+                    status='error', reason=f'merge future raised: {exc}',
+                )
+            else:
+                outcome = fut.result()
+            _task = asyncio.create_task(
+                self._on_architect_merge_done(
+                    outcome, tip=tip, evidence=evidence,
+                ),
+                name=f'architect_merge_done_{self.task_id}',
+            )
+            self._background_tasks.add(_task)
+            _task.add_done_callback(self._background_tasks.discard)
+        except Exception:
+            logger.warning(
+                'Task %s: architect-desync merge done-callback failed '
+                '(found_on_main reconciler remains the backstop)',
+                self.task_id, exc_info=True,
+            )
+
+    async def _on_architect_merge_done(
+        self, outcome: MergeOutcome, *, tip: str, evidence: str,
+    ) -> None:
+        """Report an architect-desync merge's terminal outcome onto the task.
+
+        The FAST path of the done flip (the restart-safe DURABLE backstop is
+        the existing found_on_main reconciler, which can act because this exit
+        leaves the task blocked with NO open escalation):
+
+        - success WITH a landed sha → ``mark_done(kind='found_on_main')``;
+        - success without a sha → no provenance to write, so degrade to the
+          reconciler rather than stamping a bogus one;
+        - transient / superseded → a strict no-op, re-driven by a later sweep;
+        - durable failure, or any status in NEITHER classification set →
+          leave the task blocked, emit a structured failure event AND file a
+          born-at-L2 ``stranded_merge_failed`` (:meth:`_file_architect_merge_failed`).
+          Loud over silent: an unclassified outcome must not no-op into a
+          stranded task with no operator signal.
+
+        The L2 on the durable path is LOAD-BEARING, not decoration.  The
+        enqueue exit deliberately leaves the task ``blocked`` with NO open
+        escalation — which is LEAVE-shaped for the recovery sweep — and the
+        stranded reaper cannot re-drive it either (``detect_verified_green``
+        requires an assigned lane AND an all-steps-done plan.json, and this
+        exit fires precisely when the architect wrote no plan).  So on a
+        durable merge failure nothing else re-drives the task and nothing else
+        signals a human: without this escalation the exit that exists to stop
+        a branch sitting stranded would itself strand the task forever, worse
+        than the pre-change ``report_unactionable_task`` L1 it replaced.
+        """
+        status = outcome.status
+        landed = outcome.merge_sha
+        if status in SUCCESS_TRANSIENT_MERGE_STATUSES:
+            if status == 'done' and landed:
+                logger.info(
+                    'Task %s: architect-desync merge landed at %s — marking '
+                    'done (found_on_main)',
+                    self.task_id, landed[:12],
+                )
+                try:
+                    await self.scheduler.mark_done(
+                        self.task_id,
+                        kind='found_on_main',
+                        sha=landed,
+                        note=(
+                            f'architect-desync merge landed; '
+                            f'evidence: {evidence[:400]}'
+                        ),
+                    )
+                except Exception:
+                    logger.warning(
+                        'Task %s: mark_done after architect-desync merge '
+                        'failed — leaving blocked for the found_on_main '
+                        'reconciler',
+                        self.task_id, exc_info=True,
+                    )
+                return
+            logger.info(
+                'Task %s: architect-desync merge outcome %r — no-op (task '
+                'stays blocked; a later sweep re-drives)',
+                self.task_id, status,
+            )
+            return
+
+        if status not in DURABLE_MERGE_FAILURE_STATUSES:
+            logger.error(
+                'Task %s: architect-desync merge returned UNCLASSIFIED status '
+                '%r — treating as a durable failure (classify it into '
+                'DURABLE_MERGE_FAILURE_STATUSES or '
+                'SUCCESS_TRANSIENT_MERGE_STATUSES)',
+                self.task_id, status,
+            )
+        else:
+            logger.warning(
+                'Task %s: architect-desync merge failed durably (%s) — task '
+                'stays blocked',
+                self.task_id, status,
+            )
+        if self.event_store:
+            self.event_store.emit(
+                EventType.architect_desync_merge,
+                task_id=self.task_id,
+                phase='merge',
+                data={
+                    'decision': 'merge_failed',
+                    'status': status,
+                    'tip': tip,
+                    'reason': outcome.reason,
+                    'classified': status in DURABLE_MERGE_FAILURE_STATUSES,
+                },
+            )
+        self._file_architect_merge_failed(outcome, tip=tip)
+
+    def _file_architect_merge_failed(
+        self, outcome: MergeOutcome, *, tip: str,
+    ) -> None:
+        """File a BORN-AT-L2 ``stranded_merge_failed`` for a durably-failed
+        architect-desync merge.
+
+        The sibling of :meth:`Harness._file_stranded_merge_failed`
+        (harness.py) for the byte-identical outcome: a branch that was
+        submitted straight to the merge queue on a verified-green claim and
+        then failed the queue's own verify/merge durably.  Same category on
+        purpose — ``stranded_merge_failed`` is deliberately EXCLUDED from
+        ``Harness.MERGE_REMEDIABLE_ESC_CATEGORIES`` (see the comment at
+        harness.py:4668), so re-using it also buys the invariant that a branch
+        which already failed the merge is never auto-re-submitted into the same
+        failure.
+
+        ``agent_role='orchestrator-architect-desync-merge'`` (a harness-sentinel
+        role) + ``severity='critical'`` + ``level=2`` make the record BORN AT
+        L2 — it bypasses the auto-watcher and routes straight to a human.
+
+        Does NOT touch task status, the lane, or the branch: the task is
+        already ``blocked`` and the branch is preserved for inspection
+        (preservation by omission).  Deduped via a scoped pending/L2/role read.
+        Fail-safe: a missing queue logs loudly and returns; any submit failure
+        is logged and swallowed so a bookkeeping error never propagates out of
+        a done-callback.
+        """
+        status = getattr(outcome, 'status', 'unknown')
+        reason = getattr(outcome, 'reason', '') or ''
+        if self.escalation_queue is None:
+            logger.error(
+                'Task %s: architect-desync merge failed durably (status=%s, '
+                'reason=%r) at tip %s but NO escalation queue is attached — '
+                'the task is blocked with no operator signal',
+                self.task_id, status, reason, tip[:12],
+            )
+            return
+
+        role = 'orchestrator-architect-desync-merge'
+        try:
+            existing = self.escalation_queue.get_by_task(
+                self.task_id, status='pending', level=2, agent_role=role,
+            )
+            if any(e.category == 'stranded_merge_failed' for e in existing):
+                logger.warning(
+                    'Task %s: stranded_merge_failed L2 already open for the '
+                    'architect-desync merge — suppressing duplicate',
+                    self.task_id,
+                )
+                return
+
+            from escalation.models import Escalation  # noqa: PLC0415
+
+            esc = Escalation(
+                id=self.escalation_queue.make_id(self.task_id),
+                task_id=self.task_id,
+                agent_role=role,
+                severity='critical',
+                category='stranded_merge_failed',
+                summary=(
+                    f'Architect-desync merge FAILED for task {self.task_id} '
+                    f'(status={status}) — manual intervention.'
+                )[:200],
+                detail=(
+                    f'The architect reported a merge-landing desync for task '
+                    f'{self.task_id} and the handler enqueued its branch tip '
+                    f'{tip} directly to the merge queue '
+                    f"(source='architect-desync'), but the merge/verify failed "
+                    f'durably: status={status}, reason={reason!r}.  The task '
+                    f'remains blocked and the branch is preserved (untouched) '
+                    f'for inspection.  Nothing re-drives this task on its own: '
+                    f'the exit files no other escalation by design, and the '
+                    f'verified-green stranded reaper cannot pick it up (it '
+                    f'requires an assigned lane AND an all-steps-done '
+                    f'plan.json, and this exit fires when the architect wrote '
+                    f'no plan).  A branch whose verified-green claim does not '
+                    f"survive the merge queue's own full verify lands here — "
+                    f'the exit never bypasses that gate.  Investigate and '
+                    f're-drive or triage manually.'
+                ),
+                suggested_action='manual_intervention',
+                level=2,
+            )
+            self.escalation_queue.submit(esc)
+        except Exception:
+            logger.error(
+                'Task %s: FAILED to file the architect-desync '
+                'stranded_merge_failed L2 (status=%s) — the task is blocked '
+                'with no operator signal',
+                self.task_id, status, exc_info=True,
+            )
+            return
+
+        if self.event_store:
+            self.event_store.emit(
+                EventType.escalation_created,
+                task_id=self.task_id,
+                data={
+                    'escalation_id': esc.id,
+                    'category': 'stranded_merge_failed',
+                    'severity': 'critical',
+                    'level': 2,
+                    'reason': f'architect-desync-merge-{status}',
+                },
+            )
+        logger.warning(
+            'Task %s: filed born-at-L2 stranded_merge_failed %s for the '
+            'architect-desync merge (status=%s) — task stays blocked, branch '
+            'preserved',
+            self.task_id, esc.id, status,
+        )
 
     async def _handle_unactionable_task_report(self) -> WorkflowOutcome:
         """Process a ``.task/unactionable_task.json`` report from the architect.

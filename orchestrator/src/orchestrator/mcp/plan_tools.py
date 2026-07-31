@@ -429,6 +429,22 @@ def _report_task_already_done(
     return {'status': 'ok', 'commit': commit}
 
 
+def _report_ready_to_merge(
+    artifacts: TaskArtifacts,
+    commit: str,
+    evidence: str,
+) -> dict[str, Any]:
+    """Write the ready-to-merge artifact for the workflow to act on.
+
+    The architect calls this when the task's work is already complete on
+    *this branch* at *commit* and only the physical merge to main is
+    missing.  The workflow re-validates the merge-landing-desync predicate
+    first-hand and, if it holds, enqueues a deterministic merge request.
+    """
+    artifacts.write_ready_to_merge(commit=commit, evidence=evidence)
+    return {'status': 'ok', 'commit': commit}
+
+
 def _report_unactionable_task(
     artifacts: TaskArtifacts,
     reason: str,
@@ -842,6 +858,49 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
                 commit appears to subsume this task's scope.
         """
         return _report_task_already_done(artifacts, commit, evidence)
+
+    @mcp.tool()
+    def report_ready_to_merge(
+        commit: str,
+        evidence: str,
+    ) -> dict[str, Any]:
+        """Report that this task's work is COMPLETE ON THIS BRANCH at
+        ``commit`` and only the physical merge to main is missing.
+
+        Use this INSTEAD of writing a plan when you discover, during the
+        verify-premises phase, that this task's branch is a *merge-landing
+        desync*: every one of the following holds and the ONLY thing left
+        to do is land the branch on main.
+
+          - The branch is a clean fast-forward of main — main is an
+            ancestor of the branch tip, and the branch is NOT already
+            contained in main.
+          - Verify already PASSED on this exact branch tip.
+          - Review already returned PASS (or suggestions-only) on this
+            exact tree.
+
+        Do NOT use this when work is genuinely missing, when verify or
+        review never passed on this tip, or when the branch has diverged
+        from main (needs a rebase/merge to resolve) — write a plan
+        instead.  If the work is already ON MAIN, use
+        ``report_task_already_done``.
+
+        After calling this tool, stop. Do NOT call ``create_plan`` or
+        ``escalate_blocker``. The orchestrator re-validates the desync
+        predicate FIRST-HAND (it does not trust this report) and, if it
+        holds, enqueues a deterministic merge request — no human
+        escalation is filed. This tool never lands main itself; the merge
+        worker's scoped re-verify remains the sole gate.
+
+        Args:
+            commit: The git SHA of THIS BRANCH's tip that holds the
+                completed work. The orchestrator resolves the branch tip
+                itself and rejects the report if it does not match.
+            evidence: Brief description of what you checked — how you
+                established the clean fast-forward, and where the passing
+                verify and review results came from.
+        """
+        return _report_ready_to_merge(artifacts, commit, evidence)
 
     @mcp.tool()
     def report_unactionable_task(

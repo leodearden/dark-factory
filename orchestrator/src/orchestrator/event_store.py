@@ -308,6 +308,19 @@ class EventType(StrEnum):
     # workflow uses that plan instead of discarding it and re-planning.
     plan_salvaged = 'plan_salvaged'
 
+    # Architect merge-landing-desync exit (plans/architect-already-complete-
+    # exits.md §β) — emitted once per `.task/ready_to_merge.json` report by
+    # TaskWorkflow._handle_ready_to_merge_report, on BOTH dispositions, so the
+    # decision is legible without scraping logs:
+    #   accepted  → data: {decision: 'enqueued', tip, main_sha, request_id,
+    #                      evidence}
+    #   duplicate → data: {decision: 'duplicate', tip, main_sha, marker}
+    #   rejected  → data: {decision: 'rejected', predicate: <name>,
+    #                      measured: {...}}  — `predicate` names the FIRST
+    #               desync predicate that failed and `measured` carries the
+    #               first-hand values it was judged against.
+    architect_desync_merge = 'architect_desync_merge'
+
     # Phase skipped — emitted when an optimistic-path optimisation
     # short-circuits a workflow phase (B: revalidation skipped on overlap=0;
     # C: full architect+implementer skipped via SIMPLE_TASK).

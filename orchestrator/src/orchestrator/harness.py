@@ -95,7 +95,14 @@ from orchestrator.service_restart import (
     StaleServiceRestartCoordinator,
     schedule_detached_systemd_restart,
 )
-from orchestrator.stranded_verified_green import detect_verified_green
+from orchestrator.stranded_verified_green import (
+    DURABLE_MERGE_FAILURE_STATUSES,
+    MERGE_REQUEST_RESUBMIT_GRACE_S,
+    SUCCESS_TRANSIENT_MERGE_STATUSES,
+    detect_verified_green,
+    merge_request_marker_is_fresh,
+    submit_verified_green_merge_request,
+)
 from orchestrator.systemd_inspect import (
     _INSPECT_TIMEOUT_SECS,
     _deterministic_deploy_health_verdict,
@@ -230,7 +237,9 @@ _WARM_LANE_RECLAIM_PROTECTED_STATUSES: frozenset[str] = frozenset(
 # tick.  Once the window elapses (or the lane tip advances past the marker),
 # a fresh submit re-drives (self-healing).  Sized to comfortably cover an
 # in-flight merge+verify while still re-driving a genuinely lost/hung one.
-_STRANDED_MERGE_RESUBMIT_GRACE_S: float = 30 * 60.0  # 30 minutes
+# Aliases the shared window so the reaper and the architect-desync exit
+# (task 3031 β) cannot drift apart.
+_STRANDED_MERGE_RESUBMIT_GRACE_S: float = MERGE_REQUEST_RESUBMIT_GRACE_S
 
 # Prior auto-eval redo siblings (task 2075) are only safe to silently
 # supersede (cancel) when they are still idle and unclaimed by anyone.
@@ -4442,24 +4451,14 @@ class Harness:
         marker (or a mismatched tip / stale timestamp) returns False, so the
         caller falls through to a fresh submit rather than a wedged skip — a
         lost marker must never permanently strand the task.
+
+        Delegates to the shared :func:`merge_request_marker_is_fresh` — the
+        architect-desync exit's ``metadata.architect_merge_request`` guard
+        (task 3031 β) is the second caller of the same predicate.
         """
-        if not isinstance(marker, dict):
-            return False
-        if marker.get('tip_sha') != tip_sha:
-            return False
-        submitted_at = marker.get('submitted_at')
-        if not isinstance(submitted_at, str) or not submitted_at:
-            return False
-        try:
-            ts = datetime.fromisoformat(submitted_at)
-        except (ValueError, TypeError):
-            return False
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=UTC)
-        # A future timestamp (clock skew) yields a negative age < grace → treated
-        # as fresh (skip), which is the safe side: never a duplicate submit.
-        age_s = (datetime.now(UTC) - ts).total_seconds()
-        return age_s < _STRANDED_MERGE_RESUBMIT_GRACE_S
+        return merge_request_marker_is_fresh(
+            marker, tip_sha, grace_s=_STRANDED_MERGE_RESUBMIT_GRACE_S,
+        )
 
     async def _maybe_submit_stranded_verified_green(
         self, tid: str, metadata: dict[str, Any],
@@ -4527,60 +4526,34 @@ class Harness:
             )
             return True
 
-        from orchestrator.merge_queue import enqueue_merge_request
-        from orchestrator.merge_types import (
-            MergeOutcome,
-            MergeRequest,
-            QueuedBranch,
-        )
+        from orchestrator.merge_types import QueuedBranch  # noqa: PLC0415
 
-        future: asyncio.Future[MergeOutcome] = (
-            asyncio.get_running_loop().create_future()
-        )
-        req = MergeRequest(
+        # Build + enqueue + stamp the durable race-guard marker (PRD leaf α §7)
+        # via the shared submit primitive — the architect-desync exit (task
+        # 3031 β) is its second caller, and the two differ ONLY in the source
+        # tag, the marker key, and the terminal done-callback.  The marker
+        # stamp is best-effort inside the helper: a lost marker only means a
+        # benign re-submit next sweep, so a failed write must never abort the
+        # remediation.  It lives in metadata so the found_on_main MARK_DONE
+        # path ignores it entirely (non-interference).
+        #
+        # Durable merge/verify FAILURE → born-at-L2 stranded_merge_failed; the
+        # callback is a strict no-op for success / transient outcomes, so the
+        # branch + lane are preserved by omission.
+        req = await submit_verified_green_merge_request(
             task_id=tid,
             branch=QueuedBranch.parse(tid, self.config.git.branch_prefix),
             worktree=match.worktree,
-            pre_rebased=False,
-            task_files=None,
-            module_configs=list(self.config.module_configs_or_empty.values()),
+            tip_sha=match.tip_sha,
             config=self.config,
-            result=future,
-            snapshot_tip=match.tip_sha,
+            module_configs=list(self.config.module_configs_or_empty.values()),
+            merge_queue=self._merge_queue,
+            event_store=self.event_store,
+            source='stranded-reaper',
+            marker_key='stranded_merge_request',
+            done_callback=lambda fut: self._on_stranded_merge_done(fut, tid=tid),
+            update_task=self.scheduler.update_task,
         )
-        # Durable merge/verify FAILURE → born-at-L2 stranded_merge_failed; the
-        # callback body is wired in step-14 (a strict no-op for success /
-        # transient outcomes, so the branch + lane are preserved by omission).
-        req.result.add_done_callback(
-            lambda fut: self._on_stranded_merge_done(fut, tid=tid),
-        )
-        await enqueue_merge_request(
-            self._merge_queue, req, self.event_store, source='stranded-reaper',
-        )
-
-        # Stamp the durable race-guard marker (PRD leaf α §7).  Best-effort:
-        # a lost marker only means a benign re-submit next sweep, so a failed
-        # write must never abort the remediation.  Merge-mode write (the
-        # scheduler default) touches ONLY this key, preserving siblings; the
-        # marker lives in metadata so the found_on_main MARK_DONE path ignores
-        # it entirely (non-interference).
-        try:
-            await self.scheduler.update_task(
-                tid,
-                {
-                    'stranded_merge_request': {
-                        'tip_sha': match.tip_sha,
-                        'request_id': req.request_id,
-                        'submitted_at': datetime.now(UTC).isoformat(),
-                    },
-                },
-            )
-        except Exception:
-            logger.warning(
-                'Reconcile: task %s — failed to stamp stranded_merge_request '
-                'marker (benign; only risks a re-submit next sweep)',
-                tid, exc_info=True,
-            )
 
         # Record the action (PRD §2.1): file a stranded_blocked escalation and
         # IMMEDIATELY auto-resolve it with a close_only/dismiss disposition.
@@ -4666,21 +4639,20 @@ class Harness:
     # new/unclassified outcome can never silently no-op into a stranded task
     # with no operator signal (the exact silent-strand class PRD leaf α fixes).
     #
+    # Both sets are ALIASES of the shared vocabulary in
+    # stranded_verified_green — the architect-desync exit (task 3031 β)
+    # classifies its own merge outcome against the same partition, and two
+    # copies would drift.
+    #
     # Durable merge/verify failure outcomes for a stranded-reaper submission —
     # a stale-green branch failing the merge queue's own verify lands here and
     # warrants a born-at-L2 (PRD leaf α §2.2).
-    _DURABLE_MERGE_FAILURE_STATUSES: frozenset[str] = frozenset({
-        'conflict', 'blocked', 'error', 'unknown_branch',
-        'unmerged_state', 'stash_failed', 'wip_recovery_no_advance',
-    })
+    _DURABLE_MERGE_FAILURE_STATUSES: frozenset[str] = DURABLE_MERGE_FAILURE_STATUSES
     # Success / transient outcomes — a strict no-op: the happy 'done' is
     # delivered by the existing found_on_main path, and a transient/superseded
     # outcome is re-driven by a later sweep.  The branch + lane are preserved
     # by omission (the callback never touches them).
-    _SUCCESS_TRANSIENT_MERGE_STATUSES: frozenset[str] = frozenset({
-        'done', 'already_merged', 'done_wip_recovery', 'superseded',
-        'wip_halted',
-    })
+    _SUCCESS_TRANSIENT_MERGE_STATUSES: frozenset[str] = SUCCESS_TRANSIENT_MERGE_STATUSES
 
     # Escalation categories a MERGE can itself remediate (PRD leaf δ §2.2).
     #

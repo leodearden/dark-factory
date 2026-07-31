@@ -461,6 +461,37 @@ class TaskArtifacts:
         """Remove ``.task/already_done.json`` if present."""
         self._clear_path('already_done.json')
 
+    def write_ready_to_merge(self, commit: str, evidence: str) -> None:
+        """Write ``.task/ready_to_merge.json`` — architect's claim that this
+        task's work is complete on the branch at ``commit`` and only the
+        physical merge to main is missing (a merge-landing desync).
+
+        The workflow validates the desync predicate first-hand (clean
+        fast-forward of main, verify PASSED on this tip, review PASS on this
+        tree) and, if it holds, deterministically enqueues a merge request
+        rather than filing a human escalation.  The exit never lands main
+        itself — the merge worker's scoped re-verify remains the sole gate.
+        """
+        data = {
+            'commit': commit,
+            'evidence': evidence,
+            'reported_at': datetime.now(UTC).isoformat(),
+        }
+        self._write_json(self.root / 'ready_to_merge.json', data)
+
+    def read_ready_to_merge(self) -> dict | None:
+        """Return the parsed ``.task/ready_to_merge.json`` artifact if
+        present, else ``None``.
+        """
+        path = self._read_path('ready_to_merge.json')
+        if not path.exists():
+            return None
+        return json.loads(path.read_text())
+
+    def clear_ready_to_merge(self) -> None:
+        """Remove ``.task/ready_to_merge.json`` if present."""
+        self._clear_path('ready_to_merge.json')
+
     def write_unactionable_task(self, reason: str, evidence: str) -> None:
         """Write ``.task/unactionable_task.json`` — architect's claim that
         the task spec itself is unworkable (false premise, contradiction,

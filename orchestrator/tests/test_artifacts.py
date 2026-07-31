@@ -1099,6 +1099,52 @@ class TestAlreadyDone:
         assert data['evidence'] == 'second evidence'
 
 
+class TestReadyToMerge:
+    """Round-trip and edge-case tests for the architect's
+    ``.task/ready_to_merge.json`` artifact."""
+
+    def test_read_returns_none_when_absent(self, artifacts: TaskArtifacts):
+        assert artifacts.read_ready_to_merge() is None
+
+    def test_round_trip(self, artifacts: TaskArtifacts):
+        artifacts.write_ready_to_merge(
+            commit='abc123def456',
+            evidence='branch is a clean FF of main; verify PASSED; review PASS',
+        )
+        data = artifacts.read_ready_to_merge()
+        assert data is not None
+        assert data['commit'] == 'abc123def456'
+        assert data['evidence'] == (
+            'branch is a clean FF of main; verify PASSED; review PASS'
+        )
+        from datetime import datetime
+        datetime.fromisoformat(data['reported_at'])
+
+    def test_artifact_path_is_under_task_dir(self, artifacts: TaskArtifacts):
+        artifacts.write_ready_to_merge('sha', 'e')
+        path = artifacts.root / 'ready_to_merge.json'
+        assert path.exists()
+        json.loads(path.read_text())
+
+    def test_clear_removes_artifact(self, artifacts: TaskArtifacts):
+        artifacts.write_ready_to_merge('sha', 'e')
+        artifacts.clear_ready_to_merge()
+        assert artifacts.read_ready_to_merge() is None
+
+    def test_clear_is_idempotent(self, artifacts: TaskArtifacts):
+        # No raise even when the artifact doesn't exist.
+        artifacts.clear_ready_to_merge()
+        artifacts.clear_ready_to_merge()
+
+    def test_write_overwrites_prior_artifact(self, artifacts: TaskArtifacts):
+        artifacts.write_ready_to_merge('first-sha', 'first evidence')
+        artifacts.write_ready_to_merge('second-sha', 'second evidence')
+        data = artifacts.read_ready_to_merge()
+        assert data is not None
+        assert data['commit'] == 'second-sha'
+        assert data['evidence'] == 'second evidence'
+
+
 class TestUnactionableTask:
     """Round-trip and edge-case tests for the architect's
     ``.task/unactionable_task.json`` artifact."""
