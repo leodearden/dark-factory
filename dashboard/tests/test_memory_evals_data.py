@@ -29,7 +29,7 @@ import builtins
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from dashboard.config import DashboardConfig
 
@@ -1206,6 +1206,40 @@ class TestEscalationJoin:
         assert 'esc-alarmed-open' in issue['detail']
         assert 'quarantined' in issue['detail']
 
+    def test_unhashable_status_is_named_not_raised(self, tmp_path: Path) -> None:
+        """A non-string ``status`` is a classification failure, not a crash.
+
+        ``status`` arrives from an unvalidated JSON artifact, so it can be any
+        JSON type.  An unhashable one (``[]``, ``{}``) reaching the closed-set
+        membership test raises ``TypeError`` — which escapes ``build_memory_evals``
+        (documented "never raises") and 500s the whole section.  It takes the
+        same named-discard path as an unrecognised string: a status this reader
+        cannot classify must never render as open.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _join_tree(tmp_path)
+        _write_escalation(
+            esc_dir, 'esc-alarmed-open',
+            dedupe_fingerprint=_FP_ALARMED_OPEN,
+            summary='canonical-in-top-5 regressed', severity='blocking', level=1,
+            timestamp=_JOIN_ESC_TIMESTAMP,
+            # Deliberately the artifact shape the model forbids — the point of
+            # the test is that the reader survives a producer that violates it.
+            status=cast(Any, ['weird']),
+        )
+
+        payload = build_memory_evals(root, esc_dir)
+        row = _only(payload['evals'][0]['metrics'], 'alarmed-open')
+
+        assert row['escalation'] is None
+        assert row['parity'] == 'alarmed_unlinked'
+        assert payload['issue_count'] == len(payload['issues']) == 1
+        issue = payload['issues'][0]
+        assert issue['kind'] == 'unknown_escalation_status'
+        assert 'esc-alarmed-open' in issue['detail']
+        assert set(payload) == _PAYLOAD_KEYS
+
 
 # ---------------------------------------------------------------------------
 # step-13 — storm collapse, modelled (gamma's gate owns the full matrix)
@@ -2031,6 +2065,39 @@ class TestStalenessAndDegradedStates:
         assert payload['issue_count'] == len(payload['issues']) == 1
         assert payload['issues'][0]['kind'] == 'unreadable_root'
         assert payload['issues'][0]['path'] == str(root)
+        assert set(payload) == _PAYLOAD_KEYS
+
+    def test_unreadable_escalations_degrades_the_payload_not_the_response(
+        self, tmp_path: Path, monkeypatch: Any,
+    ) -> None:
+        """The escalation join is an artifact boundary like every other one here.
+
+        Every other boundary in ``build_memory_evals`` (verdicts, limits, the
+        root walk, each metrics run) is wrapped, so the "never raises" contract
+        holds structurally.  Leaving the join open made that contract depend on
+        auditing every field access inside the index for an unvalidated JSON
+        type — which is how the unhashable-``status`` 500 got in.
+        """
+        from dashboard.data import memory_evals as memory_evals_mod
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _healthy_tree(tmp_path)
+
+        def _boom(_dir: Path) -> Any:
+            raise PermissionError(13, 'Permission denied')
+
+        monkeypatch.setattr(memory_evals_mod, 'load_queue_escalations', _boom)
+
+        payload = build_memory_evals(root, esc_dir)
+
+        # The eval rows still render — only the join is lost, and it is NAMED
+        # rather than silently reading as "nothing is escalated".
+        assert payload['root_present'] is True
+        assert payload['evals'] != []
+        assert payload['unmatched_escalations'] == []
+        assert payload['issue_count'] == len(payload['issues']) == 1
+        assert payload['issues'][0]['kind'] == 'unreadable_escalations'
+        assert payload['issues'][0]['path'] == str(esc_dir)
         assert set(payload) == _PAYLOAD_KEYS
 
     def test_missing_run_stamp_is_named(self, tmp_path: Path) -> None:

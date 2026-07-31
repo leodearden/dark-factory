@@ -542,7 +542,9 @@ def _index_escalations(
     joins.  A record with no ``status`` at all is treated as pending, matching
     the ``Escalation.status`` model default.  An UNRECOGNISED status is skipped
     and NAMED — that skip is a real discard, unlike the resolved/dismissed case
-    which is the filter doing its job.
+    which is the filter doing its job.  A status that is not a string at all
+    (the artifact is unvalidated JSON) is unrecognised in exactly that sense
+    and takes the same path.
 
     Matching is ``==`` over the WHOLE fingerprint string.  The fingerprint is
     the producer's private construction; nothing here parses its substructure,
@@ -565,7 +567,15 @@ def _index_escalations(
             continue
         status = record.get('status')
         if status is not None and status != _OPEN_ESCALATION_STATUS:
-            if status in _CLOSED_ESCALATION_STATUSES:
+            # ``isinstance`` FIRST for the same reason the metric-kind loop
+            # tests it: ``status`` is an unvalidated JSON value, so an
+            # unhashable one (``[]``, ``{}``) would make ``in
+            # _CLOSED_ESCALATION_STATUSES`` raise ``TypeError``.  A non-string
+            # status is not a status this reader can classify, so it takes the
+            # unrecognised path — named and not joined — rather than the
+            # closed-filter path, which is reserved for values that ARE known
+            # to be terminal.
+            if isinstance(status, str) and status in _CLOSED_ESCALATION_STATUSES:
                 # The filter doing its job, not a discard: a closed escalation
                 # is precisely what must NOT render as open.
                 continue
@@ -928,7 +938,22 @@ def build_memory_evals(
         )
         verdict_index, storm = {}, None
 
-    escalation_index = _index_escalations(escalations_dir, issues)
+    try:
+        escalation_index = _index_escalations(escalations_dir, issues)
+    except _ARTIFACT_ERRORS as exc:
+        # The join reads a second unvalidated artifact tree, so it is a
+        # boundary like the verdicts read, the limits read and the root walk —
+        # and it is the LAST one here that was not wrapped.  Unwrapped, the
+        # "never raises" contract held only as long as every field access
+        # inside the index happened to tolerate every JSON type it could be
+        # handed, which is not a property a reader can keep by inspection.
+        # Losing the join is a real degradation — rows render unlinked — so it
+        # is named rather than read as "nothing is escalated".
+        _issue(
+            issues, 'unreadable_escalations',
+            path=escalations_dir, detail=str(exc),
+        )
+        escalation_index = {}
 
     consumed: set[tuple[str, str]] = set()
     linked_fingerprints: set[str] = set()
