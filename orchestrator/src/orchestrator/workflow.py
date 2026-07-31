@@ -1605,6 +1605,27 @@ class TaskWorkflow:
             return statuses or {}  # type: ignore[return-value]
 
         async def _mark_member_done(mid: str, sha: str) -> None:
+            # task 3057 (seam 10): a landed train proves MAIN advanced, never
+            # that THIS member's declared capability rode along (a member can be
+            # mis-stacked, dropped by a rebase, or have delivered nothing at
+            # all).  On a withholding we RETURN rather than raise: the merge
+            # worker's post-advance flip loop collects raises into
+            # TRAIN_PARTIAL_FLIP, and this is NOT a partial flip — the merge
+            # genuinely advanced main; only this member's declared deliverable
+            # is unverifiable.  The write-ahead LandedRow is deliberately NOT
+            # consumed (it is the only record of the crash-window intent), the
+            # member's status is left untouched, and the un-flipped member
+            # self-heals through the 2794-guarded stranded sweep.
+            if await self._member_delivered_checks_withhold(
+                mid, site='workflow-train-member-merged',
+            ):
+                logger.warning(
+                    'Task %s: train %r member %s — delivered_checks not '
+                    'verifiably on main; NOT flipping to done (LandedRow '
+                    'retained for the reconciler)',
+                    self.task_id, train_id, mid,
+                )
+                return
             await self.scheduler.mark_done(
                 mid, kind='merged', sha=sha, note=f'train {train_id}',
             )
@@ -10645,6 +10666,20 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         - All pass → genuine cross-member INTERACTION: emit train_derailed
           (verdict='interaction'), escalate the train, land nothing.
         - Some fail → land each passer, block each failer (steps 12/14).
+
+        Delivered-capability guard (task 3057, seam 11):
+          A passer's solo verify + ``advance_main`` prove its DELTA reached
+          main; they say nothing about whether the member's DECLARED
+          ``metadata.delivered_checks`` capability is present there.  Each
+          passer's done-stamp is therefore gated on
+          :meth:`_member_delivered_checks_withhold`, and a withheld passer
+          ``continue``\\ s — never raises — WITHOUT appending to ``landed_ids``
+          and WITHOUT emitting ``train_merged``, so it is never REPORTED as
+          attributed.  Its write-ahead ``LandedRow`` stays unconsumed (the only
+          record of the crash-window intent) and its status is left untouched,
+          so the 2794-guarded stranded sweep re-evaluates it — the withholding
+          closes a self-healing loop rather than opening a new one.  The
+          decision is per-member: a blocked member never aborts its siblings.
         """
         # Sort members by their metadata train 'order' (root→tip) so that the
         # predecessor_ref computation is correct regardless of caller-side ordering.
@@ -10799,6 +10834,27 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 landed_sha: str = (
                     (outcome.advanced_sha if outcome else None) or r.merge_sha
                 )
+                # task 3057 (seam 11): passing solo and advancing main proves
+                # the member's DELTA landed — never that its DECLARED
+                # capability is what landed.  On a withholding we `continue`
+                # rather than raise, deliberately WITHOUT appending to
+                # landed_ids and WITHOUT emitting train_merged, so a member
+                # whose capability is unverifiable is never REPORTED as
+                # attributed.  Per-member by construction: a blocked member
+                # never aborts its siblings' attribution.  The write-ahead
+                # LandedRow is left unconsumed and the member's status is left
+                # untouched, so the 2794-guarded stranded sweep re-evaluates it.
+                if await self._member_delivered_checks_withhold(
+                    r.member_id, site='train-attribution-solo-passer',
+                ):
+                    logger.warning(
+                        'Task %s: train %r member %s passed solo and advanced '
+                        'main to %s, but delivered_checks are not verifiably '
+                        'on main — NOT flipping to done (left for the '
+                        'stranded sweep)',
+                        self.task_id, train_id, r.member_id, landed_sha,
+                    )
+                    continue
                 await self.scheduler.mark_done(
                     r.member_id,
                     kind='merged',
@@ -12528,6 +12584,60 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             site=site,
             log=logger,
         )
+
+    async def _member_delivered_checks_withhold(
+        self, mid: str, *, site: str,
+    ) -> bool:
+        """``True`` => do NOT stamp train member *mid* done here (task 3057).
+
+        The shared binding for the two workflow seams that stamp OTHER
+        members' rows (the inline ``_mark_member_done`` closure and
+        ``_attribute_train_failure``'s solo-passer arm), so those two cannot
+        drift apart — and so a future third member-stamping seam has a
+        one-line adoption path rather than a block to hand-copy.
+
+        Unlike the self-task seams, the metadata is not in scope here: a
+        member id is, so this costs ONE ``scheduler.get_task(mid)``
+        round-trip, taken only when the guard is actually armed (the check-less
+        and kill-switched cases still short-circuit inside
+        :func:`~orchestrator.delivered_checks.gate_mark_done_on_delivered_checks`
+        with zero I/O beyond that read).
+
+        Fail-safe in ALL directions, and it NEVER propagates an exception to
+        the caller: an unreadable member row, an absent member, or an errored
+        guard all WITHHOLD. Stamping done on unknown metadata is the exact
+        failure this task exists to close, and a raise escaping a train-flip
+        callback would be misread by the merge worker's post-advance loop as a
+        ``TRAIN_PARTIAL_FLIP`` — a capability check must never be ABLE to
+        fabricate one.
+        """
+        try:
+            member = await self.scheduler.get_task(mid)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                'Task %s: could not read member %s metadata for the '
+                'delivered-checks guard (%s) — withholding the done-stamp',
+                self.task_id, mid, site, exc_info=True,
+            )
+            return True
+        if member is None:
+            logger.warning(
+                'Task %s: member %s has no scheduler task row (%s) — '
+                'withholding the done-stamp',
+                self.task_id, mid, site,
+            )
+            return True
+        try:
+            return await self._delivered_checks_block(
+                mid, (member.get('metadata') or {}), site=site,
+            ) is not None
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                'Task %s: delivered-checks guard errored for member %s (%s) '
+                '— withholding the done-stamp',
+                self.task_id, mid, site, exc_info=True,
+            )
+            return True
 
     async def _finalise_recovery_done(
         self, *, basis: str, sha: str, kind: str, note: str,
