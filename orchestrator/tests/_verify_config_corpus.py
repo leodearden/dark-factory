@@ -71,6 +71,25 @@ FM_LINT_COMMAND = (
     ' && python3 fused-memory/scripts/check_asyncmock_assertion_style.py fused-memory/tests'
 )
 
+# cockpit/dashboard/escalation/orchestrator/sampler/shared
+# orchestrator.yaml::lint_command — each the same 2-segment shape, differing
+# only in the module name.
+#
+# Deliberately an explicit pinned literal rather than discovery from disk:
+# ``test_verify_plan.py``'s goldens ITERATE this dict to build deterministic
+# scope expectations, and a disk-derived dict would make those goldens vary
+# with the checkout — a suite whose expected values are read from the same
+# place as its inputs proves nothing. Discovery is used only by
+# ``discover_lint_command_modules`` below, which cross-CHECKS this literal
+# instead of replacing it.
+MODULE_LINT_COMMANDS = {
+    module: (
+        f'uv run --project {module} --directory {module} ruff check src/ tests/'
+        f' && python3 fused-memory/scripts/check_bare_magicmock_config.py {module}/tests'
+    )
+    for module in ('cockpit', 'dashboard', 'escalation', 'orchestrator', 'sampler', 'shared')
+}
+
 # dark-factory-orchestrator.yaml::lint_command
 ROOT_LINT_COMMAND = (
     'uv run ruff check shared escalation fused-memory orchestrator dashboard'
