@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -35,11 +35,21 @@ from shared.capability_manifest import DeliveredCheckMeta
 
 from orchestrator import git_ops
 
+#: Module alias for :mod:`orchestrator.git_ops`.
+#: ``gate_mark_done_on_delivered_checks`` takes a parameter named ``git_ops``
+#: (the attribute name every adopting seam already uses for its own handle),
+#: which shadows the module inside that function's body. The alias keeps the
+#: module reachable for the default-runner binding without renaming it in the
+#: two pre-existing functions below.
+git_ops_module = git_ops
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
     'DeliveredCheckResult',
+    'DeliveredChecksBlock',
     'DeliveredChecksVerdict',
+    'gate_mark_done_on_delivered_checks',
     'run_delivered_check',
     'verify_delivered_checks_on_main',
 ]
@@ -236,15 +246,41 @@ async def verify_delivered_checks_on_main(
     the aggregation stays pure and unit-testable with a fake runner and no git,
     and so the verdict can echo the exact SHA the checks ran against.
 
-    The current production caller is the reconcile-sweep
-    ``found_on_main``/MARK_DONE_WITH_PROVENANCE arm in
-    ``Harness._reconcile_one_stranded`` (harness.py, task 2794). The other
-    mark-done-on-main stamp sites SHOULD adopt this same guard so a hollow-done
-    can never be stamped from any of them: the harness pre-dispatch
-    ``found_on_main`` check (~harness.py:8033), ``TaskWorkflow._recover_before_execute``
-    in workflow.py (pre-EXECUTE recovery — a different module/class a Harness
-    method could not serve, which is why this is a module-level function), and
-    the harness coalesce ``redrive_member`` path (~harness.py:779).
+    Production callers reach this function through exactly ONE intermediary —
+    :func:`gate_mark_done_on_delivered_checks` — so the mark-done DECISION
+    (main-SHA resolution, verdict collapse, fail-safe arms, operator WARNING)
+    has a single implementation rather than one copy per stamp seam. Task 3057
+    routed every attribution-shaped ``mark_done`` seam through it:
+
+    - ``Harness._reconcile_one_stranded`` — the reconcile-sweep
+      ``found_on_main``/MARK_DONE_WITH_PROVENANCE arm (originally task 2794's
+      inline block, since folded onto the shared helper);
+    - ``Harness._already_landed_dispatch_gate`` — all three evidence arms
+      (ancestry / merge-marker / content-equivalent);
+    - ``Harness.build_train_callback_factory``'s ``mark_member_done`` and
+      ``redrive_member`` closures (train-member flip; coalesce-derail redrive);
+    - ``TaskWorkflow._finalise_recovery_done`` — the single funnel for all six
+      recovery stamps (3x journal ``kind='merged'`` + 3x fallback
+      ``kind='found_on_main'``);
+    - ``TaskWorkflow._handle_already_done_report`` — the architect's
+      "already done" claim;
+    - ``TaskWorkflow._on_architect_merge_done`` — the architect-desync
+      merge-landed flip;
+    - ``TaskWorkflow``'s inline ``_mark_member_done`` closure and the
+      solo-passer arm of ``TaskWorkflow._attribute_train_failure``;
+    - ``merge_queue.reconcile_landed_row`` — the RC-2 crash-window journal
+      recovery.
+
+    Those seams span three modules and both free functions and methods, which
+    is why the guard is a module-level function rather than a Harness method.
+    Deliberately NOT routed: ``TaskWorkflow``'s own post-merge success stamp,
+    where the workflow performed the merge itself and holds its own merge SHA —
+    guarding it would convert an attribution guard into a fleet-wide
+    merge-blocking quality gate (task 3057 design decision 2; a follow-up task
+    holds that decision open for a human).
+
+    Sites are named by SYMBOL only, never by line number: the numeric anchors
+    this paragraph used to carry had all gone stale within two months.
     """
     async def _run_one(
         check: dict[str, Any],
@@ -296,3 +332,179 @@ async def verify_delivered_checks_on_main(
 
     # Some ERRORED and none FAILED (or no checks ran at all) — fail-safe wait.
     return DeliveredChecksVerdict(outcome='errored', main_sha=main_sha)
+
+
+@dataclass(frozen=True)
+class DeliveredChecksBlock:
+    """"Do NOT stamp this task done here" — the result of
+    :func:`gate_mark_done_on_delivered_checks` when a mark-done must be
+    withheld (task 3057).
+
+    A ``None`` return from that helper means "mark-done may proceed"; a
+    ``DeliveredChecksBlock`` means the caller MUST NOT stamp, and should take
+    its OWN existing "no landing evidence" path instead.
+
+    ``reason`` distinguishes the one case that is a DEFINITIVE absence from the
+    two that are merely unknown:
+
+    - ``'failed'`` — the checks ran cleanly and the declared capability is
+      provably NOT on main. The only reason that may drive an ACTIVE recovery
+      (e.g. the stranded arm's revert-to-pending for re-dispatch), because it
+      is the only one that actually knows something.
+    - ``'errored'`` — the checks could not be evaluated (git error, malformed
+      descriptor, timeout). Fail-safe: makes no claim either way.
+    - ``'main_sha_unresolved'`` — there was no ``main`` ref to evaluate
+      against at all. Also fail-safe.
+
+    Callers deliberately collapse all three into the same recovery except where
+    task 2794 already distinguished them: the alternative (a fail-safe "wait and
+    retry" for ``errored``) can WEDGE a task permanently, since a malformed
+    descriptor ERRORs forever — and a wedged task is a worse outcome than an
+    extra dispatch of an already-landed one. The invariant being defended is
+    "never stamp a hollow done"; degrading toward re-delivery always satisfies
+    it, degrading toward waiting does not always terminate.
+
+    ``main_sha`` echoes the SHA the checks were evaluated at (``None`` when it
+    could not be resolved); ``failed_check`` carries the first FAILED descriptor
+    when ``reason == 'failed'`` (``None`` otherwise).
+    """
+
+    reason: Literal['failed', 'errored', 'main_sha_unresolved']
+    main_sha: str | None = None
+    failed_check: dict[str, Any] | None = None
+
+
+async def gate_mark_done_on_delivered_checks(
+    task_id: str,
+    metadata: Mapping[str, Any] | None,
+    *,
+    project_root: str | Path,
+    check_timeout_secs: float,
+    site: str,
+    git_ops: Any = None,
+    main_sha: str | None = None,
+    enabled: bool = True,
+    log: logging.Logger = logger,
+    runner: _Runner = git_ops_module._run,
+) -> DeliveredChecksBlock | None:
+    """The ONE shared mark-done decision for every attribution-shaped stamp
+    seam (task 3057). Never raises.
+
+    Returns ``None`` when the caller MAY stamp done — either because the guard
+    is inert (disabled, or the task declares no ``delivered_checks``) or because
+    the declared capability is verifiably present on ``main``. Returns a
+    :class:`DeliveredChecksBlock` otherwise, having ALREADY emitted the operator
+    WARNING on *log*.
+
+    Why one helper rather than one guard per seam: this defect class's history
+    is a chain of point fixes (1087 -> 1091 -> 1180 -> 2372 -> 2500 -> 2648 ->
+    2787 -> 2794), each re-opened by a seam the previous fix did not cover — and
+    during task 3057's own queue wait a BRAND-NEW unguarded ``found_on_main``
+    seam was added by task 3031. Eleven hand-copied blocks would be eleven
+    independent drift surfaces; the next refactor only has to miss one.
+
+    Contract notes for adopting seams:
+
+    - *log* is a PARAMETER, not this module's logger, so each seam keeps its own
+      module logger and its existing caplog-addressable name (task 2794's
+      stranded-arm assertions on ``logger='orchestrator.harness'`` still hold
+      verbatim after the fold).
+    - *site* is a short label naming the seam; it appears in every WARNING so an
+      operator can tell WHICH of the eleven withheld a stamp.
+    - *main_sha*, when supplied, short-circuits SHA resolution entirely. That is
+      a correctness requirement, not an optimization: the two seams that pass it
+      (``merge_queue.reconcile_landed_row`` and
+      ``TaskWorkflow._handle_already_done_report``) have ALREADY made an
+      ancestry decision against that exact SHA, and re-resolving could audit a
+      DIFFERENT (newer) ``main`` than the decision being gated.
+    - the evaluation itself is delegated to
+      :func:`verify_delivered_checks_on_main` VERBATIM — no second check runner
+      is forked, so grep/script semantics, the per-check timeout and the
+      malformed-descriptor degradation are shared rather than re-derived.
+    - the call is still wrapped in ``try/except`` as defence in depth: that
+      function documents "Never raises", but a guard must never be ABLE to crash
+      a mark-done path, so a broken contract degrades to an ``errored`` block.
+    """
+    checks = (metadata or {}).get('delivered_checks')
+    if not checks or not enabled:
+        # Inert, with ZERO I/O: check-less tasks keep their exact pre-guard
+        # behavior, and the `enabled` kill switch is single-sourced HERE so one
+        # hot reload of delivered_checks.enabled disarms all eleven seams at
+        # once. Every seam FORWARDS the flag rather than short-circuiting
+        # locally, which is what makes that true.
+        return None
+
+    sha = main_sha
+    if not sha:
+        if git_ops is None:
+            log.warning(
+                'Delivered-checks guard [%s]: task %s carries delivered_checks '
+                'but neither a git_ops handle nor a pre-resolved main SHA was '
+                'supplied — cannot verify the capability, NOT marking done '
+                '(fail-safe)',
+                site, task_id,
+            )
+            return DeliveredChecksBlock('main_sha_unresolved')
+        try:
+            sha = await git_ops.get_main_sha()
+        except Exception:
+            log.warning(
+                'Delivered-checks guard [%s]: task %s carries delivered_checks '
+                'but the main SHA could not be resolved (get_main_sha raised) '
+                '— NOT marking done (fail-safe), will retry',
+                site, task_id, exc_info=True,
+            )
+            return DeliveredChecksBlock('main_sha_unresolved')
+        if not sha:
+            log.warning(
+                'Delivered-checks guard [%s]: task %s carries delivered_checks '
+                'but get_main_sha() returned empty — NOT marking done '
+                '(fail-safe), will retry',
+                site, task_id,
+            )
+            return DeliveredChecksBlock('main_sha_unresolved')
+
+    try:
+        verdict = await verify_delivered_checks_on_main(
+            checks,
+            project_root=project_root,
+            main_sha=sha,
+            check_timeout_secs=check_timeout_secs,
+            runner=runner,
+        )
+    except Exception:
+        log.warning(
+            'Delivered-checks guard [%s]: task %s — verify_delivered_checks_on_main '
+            'raised at main@%s despite its never-raises contract; NOT marking '
+            'done (fail-safe)',
+            site, task_id, sha, exc_info=True,
+        )
+        return DeliveredChecksBlock('errored', sha)
+
+    if verdict.outcome == 'failed':
+        failed_check = verdict.failed_check or {}
+        is_grep = failed_check.get('kind') == 'grep'
+        log.warning(
+            'Delivered-checks guard [%s]: task %s delivered-check %r (%s=%r) is '
+            'absent from main@%s — declared capability not present, NOT marking '
+            'done',
+            site, task_id, failed_check.get('name'),
+            'pattern' if is_grep else 'script',
+            failed_check.get('pattern') if is_grep else failed_check.get('script'),
+            sha,
+        )
+        return DeliveredChecksBlock('failed', sha, verdict.failed_check)
+
+    if verdict.outcome == 'errored':
+        # Some check could not be evaluated and none FAILED — make no claim
+        # either way.
+        log.warning(
+            'Delivered-checks guard [%s]: task %s delivered-checks could not be '
+            'evaluated at main@%s (errored) — NOT marking done (fail-safe)',
+            site, task_id, sha,
+        )
+        return DeliveredChecksBlock('errored', sha)
+
+    # outcome == 'all_delivered' — the declared capability is present on main;
+    # the caller's mark_done proceeds, unchanged.
+    return None
