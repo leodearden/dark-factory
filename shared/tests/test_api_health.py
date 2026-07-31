@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -711,3 +712,62 @@ class TestForensicRows:
         finally:
             await store.close()
         assert [json.loads(r['details'])['status'] for r in rows] == [500, 502, 503, 529]
+
+
+class _ExplodingStore:
+    """A cost store whose forensics write always fails (full disk, locked DB, ...)."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def save_api_error_event(self, **kwargs) -> None:
+        self.calls += 1
+        raise OSError('disk full')
+
+
+class TestPersistenceIsTelemetryOnly:
+    """step-23: forensics are best-effort; the in-memory state machine is authoritative."""
+
+    async def test_write_failure_does_not_propagate(self) -> None:
+        """A full disk must never fail the invocation that reported the 5xx."""
+        store = _ExplodingStore()
+        gate, _mono, _wall = _gate(cost_store=store)
+        state = await gate.report(
+            ServerError(status=529), task_id='t1', account='max-d', role='agent'
+        )
+        assert isinstance(state, Closed)
+        assert store.calls == 1
+
+    async def test_trip_still_happens_through_a_failing_store(self) -> None:
+        """A write failure must not suppress the trip — that would hide an outage."""
+        store = _ExplodingStore()
+        gate, _mono, _wall = _gate(cost_store=store)
+        state = await _report_failures(gate, 8)
+        assert isinstance(state, Open)
+        assert gate.is_degraded is True
+        assert store.calls == 8
+
+    async def test_close_still_happens_through_a_failing_store(self) -> None:
+        store = _ExplodingStore()
+        gate, _mono, _wall = _gate(cost_store=store)
+        await _report_failures(gate, 8)
+        await _report_ok(gate, 2)
+        assert isinstance(gate.state(), Closed)
+
+    async def test_write_failure_is_logged_at_warning(self, caplog) -> None:
+        """Loud, not silent: the operator must be able to see forensics were lost."""
+        store = _ExplodingStore()
+        gate, _mono, _wall = _gate(cost_store=store)
+        with caplog.at_level(logging.WARNING, logger='shared.api_health'):
+            await gate.report(ServerError(status=529), task_id='t1', account='max-d', role='agent')
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert warnings, 'the dropped forensics row was swallowed silently'
+        assert 'disk full' in caplog.text
+
+    async def test_gate_without_a_cost_store_trips_normally(self) -> None:
+        """Usable in xi before the store is wired."""
+        gate, _mono, _wall = _gate(cost_store=None)
+        state = await _report_failures(gate, 8)
+        assert isinstance(state, Open)
+        state = await _report_ok(gate, 2)
+        assert isinstance(state, Closed)

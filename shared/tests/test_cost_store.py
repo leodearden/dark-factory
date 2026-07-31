@@ -893,7 +893,7 @@ class TestSaveApiErrorEvent:
                 'SELECT account_name, event_type, project_id, run_id, details, created_at '
                 'FROM account_events'
             ) as cur:
-                rows = await cur.fetchall()
+                rows = list(await cur.fetchall())
         assert len(rows) == 1
         assert rows[0] == (
             'max-d',
