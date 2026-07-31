@@ -224,13 +224,15 @@ async def test_await_trap_installed_fails_loudly_when_readiness_never_arrives():
         start_new_session=True,
     )
     try:
-        # timeout=5.0 is load-bearing, not arbitrary: it proves EOF is
-        # detected as EOF immediately rather than being swallowed and
-        # re-surfacing later as a deadline expiry — an implementation that
-        # fell through to the timeout path would raise
-        # _TrapReadinessTimeout here and fail this assertion.
+        # The discrimination this sub-case buys — EOF detected as EOF
+        # immediately, not swallowed and re-surfaced later as a deadline
+        # expiry (which would raise _TrapReadinessTimeout and fail this
+        # assertion) — holds for any non-expiring deadline; it doesn't
+        # pin a specific number.  Use the helper's own default rather
+        # than a tuned value so this test carries no wall-clock
+        # assumption of its own.
         with pytest.raises(_TrapReadinessEOF) as excinfo2:
-            await _await_trap_installed(proc2, timeout=5.0)
+            await _await_trap_installed(proc2)
         assert isinstance(excinfo2.value, AssertionError)
     finally:
         # `true` has already exited: reap it rather than killpg-ing a pid
