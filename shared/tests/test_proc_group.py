@@ -75,6 +75,28 @@ def _kill_group(pgid: int) -> None:
         os.killpg(pgid, signal.SIGKILL)
 
 
+async def _await_trap_installed(
+    proc: asyncio.subprocess.Process, *, timeout: float = 10.0
+) -> None:
+    """Wait for a shell child to announce that its SIGTERM trap is armed.
+
+    Callers spawn a shell whose command starts with ``trap '' TERM; echo
+    ready; ...``.  Bash only reaches the ``echo`` once the preceding `trap`
+    builtin has returned, so observing the ``ready`` line on stdout is a
+    happens-before edge proving SIGTERM's disposition is already SIG_IGN in
+    the kernel — not a wall-clock guess about how long installation takes
+    (the fixed ``asyncio.sleep(0.2)`` this helper replaces was exactly such
+    a guess, and it starved under CPU oversubscription).  Measured directly:
+    across 8 spawns at loadavg ~200 on 32 cores (6.2-6.5x oversubscribed),
+    the ``ready`` line arrived in 3.9-9.4 ms, and at that instant
+    ``/proc/<pid>/status`` already reported ``SigIgn=0x0000000000004000``
+    (bit ``1 << (SIGTERM-1)``) — confirming the line is a valid proxy for
+    the kernel-level precondition, not merely a plausible one.
+    """
+    assert proc.stdout is not None
+    await asyncio.wait_for(proc.stdout.readline(), timeout)
+
+
 @pytest.mark.asyncio
 @pytest.mark.timeout(30)
 async def test_await_trap_installed_returns_once_shell_armed():
