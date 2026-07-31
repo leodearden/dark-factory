@@ -198,9 +198,10 @@ class EscalationQueue:
         a spurious ``rglob`` call on a missing directory.  Centralising the
         existence-check + rglob here means get() and get_by_task() both
         benefit from any future caching or indexing added in one place.
-        Note: make_id() uses this only on the repair path
-        (``_recover_seq_from_disk``), never while the counter is intact —
-        its counter remains authoritative in steady state.
+        Note: make_id() uses this only via ``_recover_seq_from_disk`` — i.e.
+        when its counter file is absent or unparseable, which includes a
+        brand-new task_id's first mint — never while the counter is intact;
+        the counter remains authoritative in steady state.
         """
         archive_root = self.queue_dir / archive.ARCHIVE_SUBDIR
         if archive_root.exists():
@@ -1235,15 +1236,18 @@ class EscalationQueue:
     def _recover_seq_from_disk(self, task_id: str) -> int:
         """Highest sequence observed on disk for *task_id*, or 0 if none.
 
-        REPAIR-PATH ONLY. This is never consulted while the counter file is
-        present and parseable, so PRD C9's contract — the counter, not a
-        directory scan, is the sole source of the next sequence — holds in
-        steady state, and task 1879's retired per-mint archive glob +
-        ``_archive_max_seq_cache`` stays retired.  ``make_id`` calls this
-        only when the counter is ABSENT or UNPARSEABLE, and immediately
-        makes the result durable via ``_write_seq_counter``, so the scan is
-        amortized at most once per task_id per counter lifetime and never
+        Consulted ONLY when the counter file is ABSENT or UNPARSEABLE, never
+        while it is present and parseable, so PRD C9's contract — the
+        counter, not a directory scan, is the sole source of the next
+        sequence — holds in steady state, and task 1879's retired per-mint
+        archive glob + ``_archive_max_seq_cache`` stays retired.  ``make_id``
+        immediately makes the result durable via ``_write_seq_counter``, so
+        this runs at most once per task_id per counter lifetime and never
         gates a steady-state mint.
+
+        Not *purely* a repair path, despite the framing above: the FIRST
+        mint for every brand-new task_id also lands on the absent-counter
+        branch and pays one scan.  See "Cost" below.
 
         Scans both halves of the id namespace, because a task_id whose
         escalations were all resolved has evidence ONLY in the archive — and
@@ -1264,6 +1268,32 @@ class EscalationQueue:
         ``'1-2'`` correctly ignores ``esc-1-2-3-9.json`` (task ``'1-2-3'``),
         which the glob over-matches.  Reintroducing the retired
         parse-after-last-hyphen derivation here would resurrect that bug.
+        The comparison is NUMERIC (``max`` over parsed ints, not over stem
+        suffixes as strings): lexicographically ``'9' > '10'``, which would
+        under-report the max and mint a colliding id.
+
+        Cost, and why the archive half is a FRESH targeted rglob rather than
+        the memoised ``_get_archive_listing()``: that memo is built once per
+        instance and can predate another ``EscalationQueue`` instance's
+        archival of records for this task_id.  ``_locate_path`` tolerates
+        that staleness because it is an EXISTENCE lookup — it verifies a
+        memo hit with ``.exists()`` and re-probes on a memo miss — but a
+        MAXIMUM derived from a merely-incomplete memo is wrong in the
+        collision-producing direction: it under-reports and mints an id an
+        archived record already holds, the exact defect this scan exists to
+        prevent.  The freshness is therefore deliberate, and the price is
+        one archive rglob per task_id per counter lifetime (so, in a
+        long-lived instance, once per new task_id) rather than one per
+        instance — paid off the steady-state mint path, under the per-counter
+        lock, and bounded by ``prune_archive`` retention.
+
+        Recovery observes SUBMITTED records only.  An id that was minted but
+        not yet submitted when the counter was lost is invisible here and
+        can therefore still be re-minted — a residual hole inherent to any
+        disk-derived recovery, and far narrower than the pre-3238 behaviour
+        of restarting from 1.  It is also why ``make_id``'s ``OSError``
+        branch is NOT routed here: there the counter still exists and
+        remains authoritative over disk.
         """
         prefix = f'esc-{task_id}-'
         pattern = f'{prefix}*.json'
@@ -1307,7 +1337,10 @@ class EscalationQueue:
           a non-zero recovery means the counter was LOST (aggressive
           cleanup, fresh checkout, disk restore, accidental rm of the
           non-.json sidecar) while escalations for this task_id already
-          exist, and is logged as an ERROR.
+          exist, and is logged as an ERROR.  Note this branch is not only a
+          repair path — every brand-new task_id's FIRST mint takes it and
+          pays one reconciliation scan (see ``_recover_seq_from_disk``
+          "Cost"); every mint after that is counter-derived and scan-free.
         - An ``OSError`` while reading an EXISTING file (transient I/O error,
           EINTR, fd exhaustion, permission flap) is NOT reconciled — it is
           allowed to propagate so the mint fails loudly.  A present-but-
@@ -1322,7 +1355,9 @@ class EscalationQueue:
         fallback resolves to a pre-existing, already-resolved record (task
         3238).  The reconciled value is written durably BEFORE the id is
         returned, which is what bounds the repair scan to once per task_id
-        per counter lifetime.
+        per counter lifetime.  The residual hole: recovery observes
+        SUBMITTED records only, so an id minted but not yet submitted when
+        the counter was lost is invisible to it and can still be re-minted.
 
         The read -> increment -> durable write (tmp+fsync+rename+dir-fsync,
         see ``_write_seq_counter``) all happen inside
@@ -1344,7 +1379,9 @@ class EscalationQueue:
                         f'make_id: could not parse counter file {counter_path}: {e}; '
                         f'reconciled it from a one-shot bounded root+archive scan for '
                         f'task_id {task_id!r} (highest observed sequence {current}) and '
-                        f'resuming at {current + 1}, so no already-issued id is reused'
+                        f'resuming at {current + 1}, so no already-recorded id is '
+                        'reused (an id minted but never submitted is not observable '
+                        'on disk and is not covered)'
                     )
             else:
                 current = self._recover_seq_from_disk(task_id)
@@ -1355,7 +1392,9 @@ class EscalationQueue:
                         f'(highest observed sequence {current}); reconciled the '
                         f'counter from a one-shot bounded root+archive scan and '
                         f'resuming at {current + 1} rather than re-minting from 1, '
-                        'so no already-issued id is reused'
+                        'so no already-recorded id is reused (an id minted but '
+                        'never submitted is not observable on disk and is not '
+                        'covered)'
                     )
             nxt = current + 1
             self._write_seq_counter(counter_path, nxt)

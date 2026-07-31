@@ -324,6 +324,24 @@ Its result is immediately made durable by `_write_seq_counter` inside the same
 and never gates a steady-state mint. A counter present and parseable is still taken verbatim with
 zero disk scans of any kind.
 
+**What the reconciliation does NOT cover.** It derives its maximum from *submitted* records — the
+only evidence on disk. An id that was minted but not yet submitted at the moment the counter was
+lost is invisible to it and can still be re-minted. That hole is inherent to any disk-derived
+recovery and is far narrower than the pre-3238 behaviour (restart from 1); it is also why
+sub-decision 1 below keeps `OSError` unreconciled. The two ERROR messages say "no already-*recorded*
+id is reused" for this reason, not "already-issued".
+
+**Cost, stated plainly.** The absent-counter branch is not exclusively a repair path: every
+brand-new `task_id`'s FIRST `make_id` lands on it and pays one root glob plus one targeted archive
+`rglob`. The archive half is deliberately a FRESH scan rather than the instance-memoised
+`_get_archive_listing()`: that memo can predate another `EscalationQueue` instance's archival, and
+where `_locate_path` tolerates staleness (an existence lookup — memo hits are `.exists()`-verified,
+memo misses re-probe), a *maximum* taken from a merely-incomplete memo is wrong in the
+collision-producing direction and would reintroduce the very defect this scan prevents. So the
+price is one archive `rglob` per `task_id` per counter lifetime — in a long-lived instance, once per
+new `task_id` — paid off the steady-state mint path, under the per-counter lock, bounded by
+`prune_archive` retention.
+
 Three sub-decisions, recorded so they are not relitigated:
 
 1. **`OSError` is NOT reconciled** — it still propagates. A present-but-momentarily-unreadable
