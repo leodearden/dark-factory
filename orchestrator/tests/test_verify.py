@@ -9246,3 +9246,146 @@ class TestSummaryPayloadNamesTheKilledRun:
         payload = _build_summary_payload(runs, 'infra_timeout', '')
         assert payload['cmd'] == 'pytest'
         assert payload['timed_out'] is True
+
+
+# ---------------------------------------------------------------------------
+# task 3173 amendment: the two couplings the step-5..8 tests left unpinned.
+#
+# (a) `_summarize_checks` joins its fragments with ', ' and `_aggregate_results`
+#     recovers them with `.split(', ')`, keeping only the marker-bearing ones.
+#     That works TODAY only because `_killed_leg_note` happens to separate its
+#     clauses with '; '.  A future comma inside the note — a plausible edit —
+#     would split it in two, and only the marker half would survive: the same
+#     silent degradation the carry-through was added to fix, one edit later.
+#     Pin it at the PRODUCER so the edit fails loudly there.
+# (b) `run_verification`'s two `_summarize_checks(...)` call sites are the only
+#     production consumers of test_duration/lint_duration/type_duration, and
+#     every other duration assertion in the suite calls `_summarize_checks`
+#     directly.  A cross-wire (`lint_duration=attempt.type.duration_secs`)
+#     would keep all of them green while the operator-facing sentence reported
+#     the wrong leg's survival time — and `_killed_leg_note`'s whole contract
+#     is that every clause is a MEASURED fact.
+# ---------------------------------------------------------------------------
+
+
+class TestKillNoteIsOneAggregationFragment:
+    """The ', '-joined summary is the wire format between `_summarize_checks`
+    and `_aggregate_results`, so a kill note must never contain ', '."""
+
+    @pytest.mark.parametrize(
+        ('label', 'rc', 'duration'),
+        [
+            ('test', -9, 900.5),
+            ('lint', -9, 0.31010722508654),
+            ('lint', -15, None),      # no duration in scope -> clause omitted
+            ('type', -2, 0.0),
+            ('type', -1, 12.5),
+        ],
+    )
+    def test_note_never_contains_the_fragment_separator(self, label, rc, duration):
+        note = _killed_leg_note(label, rc, duration)
+        assert ', ' not in note, (
+            f'a comma+space in the note splits it across `.split(", ")` in '
+            f'_aggregate_results and only the {SIGNAL_KILL_SUMMARY_MARKER!r} '
+            f'half survives; use "; " to separate clauses. Got: {note!r}'
+        )
+
+    def test_note_round_trips_through_the_consumer_split_intact(self):
+        """Exactly the parse `_aggregate_results` performs, run against the
+        producer's own output: one fragment in, one fragment out."""
+        note = _killed_leg_note('lint', -9, 0.31010722508654)
+        summary = f'Failures: {note}'
+        assert summary.removeprefix('Failures: ').split(', ') == [note]
+
+    def test_note_beside_a_real_verdict_still_round_trips(self):
+        """The mixed case: a genuine 'tests failed' fragment plus a kill note
+        must recover as exactly two fragments, the second one whole."""
+        note = _killed_leg_note('lint', -9, 0.31)
+        summary = f'Failures: tests failed, {note}'
+        assert summary.removeprefix('Failures: ').split(', ') == ['tests failed', note]
+
+
+class TestRunVerificationThreadsEachLegsOwnDuration:
+    """END-TO-END through `run_verification`: the reported survival time is
+    the KILLED leg's own, not another leg's."""
+
+    @staticmethod
+    def _config(tmp_path: Path) -> OrchestratorConfig:
+        return OrchestratorConfig(
+            project_root=tmp_path,
+            test_command='__test_cmd__',
+            lint_command='__lint_cmd__',
+            type_check_command='__type_cmd__',
+            verify_command_timeout_secs=30.0,
+            verify_timeout_retries=0,
+        )
+
+    @staticmethod
+    def _reported_duration(summary: str, signal: int) -> float:
+        import re
+        m = re.search(rf'killed by signal {signal} after (\d+\.\d+)s', summary)
+        assert m is not None, f'no "after N.NNs" clause for signal {signal}: {summary!r}'
+        return float(m.group(1))
+
+    @pytest.mark.asyncio
+    async def test_killed_lint_leg_reports_the_lint_legs_survival_time(self, tmp_path: Path):
+        """Only lint is killed, and it is the SLOW leg: test/type finish
+        immediately.  A cross-wire to either of them reports ~0.00s."""
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            if cmd == '__lint_cmd__':
+                await asyncio.sleep(0.30)
+                return -9, '', False  # SIGKILL: not one diagnostic emitted
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(tmp_path, self._config(tmp_path), max_retries=0)
+
+        assert not result.passed
+        assert result.category == 'infra_kill'
+        assert 'lint leg killed by signal 9' in result.summary
+        assert 'lint issues' not in result.summary
+        # >= 0.25 is comfortably above the other two legs (~0.00s) and immune
+        # to scheduler jitter and the ``:.2f`` rounding.
+        assert self._reported_duration(result.summary, 9) >= 0.25, result.summary
+
+    @pytest.mark.asyncio
+    async def test_two_killed_legs_each_report_their_own_duration(self, tmp_path: Path):
+        """The strict wiring test: distinct signals AND distinct durations, so
+        a swap between any two of the three kwargs is detectable."""
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            if cmd == '__type_cmd__':
+                await asyncio.sleep(0.40)
+                return -15, '', False  # SIGTERM, the slow leg
+            if cmd == '__test_cmd__':
+                return -9, '', False   # SIGKILL, immediate
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(tmp_path, self._config(tmp_path), max_retries=0)
+
+        assert result.category == 'infra_kill'
+        assert 'test leg killed by signal 9' in result.summary
+        assert 'type leg killed by signal 15' in result.summary
+        assert 'lint' not in result.summary, 'the passing leg must not be named'
+        # test died instantly; type survived 0.40s.  Cross-wiring the kwargs
+        # swaps these two numbers.
+        assert self._reported_duration(result.summary, 9) < 0.25, result.summary
+        assert self._reported_duration(result.summary, 15) >= 0.35, result.summary
+
+    @pytest.mark.asyncio
+    async def test_control_a_genuine_lint_failure_is_worded_as_today(self, tmp_path: Path):
+        """REGRESSION GUARD: the durations change nothing for a leg that
+        actually produced a verdict."""
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            if cmd == '__lint_cmd__':
+                await asyncio.sleep(0.05)
+                return 1, 'Found 1 error.\n', False
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+            result = await run_verification(tmp_path, self._config(tmp_path), max_retries=0)
+
+        assert not result.passed
+        assert result.summary == 'Failures: lint issues'
+        assert result.category != 'infra_kill'
+        assert SIGNAL_KILL_SUMMARY_MARKER not in result.summary

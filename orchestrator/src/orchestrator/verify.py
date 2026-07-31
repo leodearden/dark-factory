@@ -1484,6 +1484,15 @@ def _tool_for_cmd(cmd: str | None) -> ToolKind:
 # substring-scanning child summaries for 'tests failed'/'lint issues'/
 # 'type errors' — cannot silently drop the one fact that says the run means
 # nothing.  Any new consumer should match on this constant, never a literal.
+#
+# CONSTRAINT ON PRODUCERS: a marker-bearing fragment must not contain ', '.
+# `_summarize_checks` JOINS fragments with ', ' and `_aggregate_results`
+# recovers them with `.split(', ')`, so a comma inside the note splits it in
+# two and only the marker-bearing half survives — silently truncating the
+# sentence, which is the exact degradation the carry-through exists to
+# prevent.  Separate clauses with '; '.  Pinned by
+# test_verify.py::TestKillNoteIsOneAggregationFragment, which fails at the
+# producer rather than letting the consumer degrade quietly.
 SIGNAL_KILL_SUMMARY_MARKER = 'killed by signal'
 
 
@@ -1498,6 +1507,12 @@ def _killed_leg_note(label: str, rc: int, duration: float | None) -> str:
 
     ``rc`` is asyncio's returncode, i.e. the NEGATIVE signal number, so the
     signal is ``-rc``.
+
+    Clauses are separated by ``'; '`` and the sentence must stay free of
+    ``', '`` — see ``SIGNAL_KILL_SUMMARY_MARKER``'s producer constraint: the
+    ``', '``-joined summary is the wire format between this function and
+    ``_aggregate_results``, and a comma here would silently truncate the note
+    on the way through aggregation.
     """
     after = f' after {duration:.2f}s' if duration is not None else ''
     return (
