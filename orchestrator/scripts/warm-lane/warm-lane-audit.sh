@@ -822,7 +822,7 @@ if [ -n "$MOUNT" ] && [ -d "$MOUNT" ]; then
     for entry in "$MOUNT"/*/; do
         entry="${entry%/}"
         [ -d "$entry" ] || continue
-        name="$(basename "$entry")"
+        name="${entry##*/}"
         _is_git_worktree "$entry" || continue
 
         RESIDENT=$((RESIDENT + 1))

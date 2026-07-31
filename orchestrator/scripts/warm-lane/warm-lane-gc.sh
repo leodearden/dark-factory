@@ -35,7 +35,7 @@
 #                          DIR (/home/leo/src/warm-lanes/worktrees), NOT the XFS mount
 #                          point (/home/leo/src/warm-lanes).
 #                          Derives: WORKTREES_DIR=$MOUNT (lanes live directly under it),
-#                                   BASE_TARGET=$(dirname "$MOUNT")/base/target
+#                                   BASE_TARGET=<parent of $MOUNT>/base/target
 #                                   (the XFS-sibling base dir, one level up from
 #                                   the worktrees-dir).
 #                          The two scripts consume the shared value differently:
@@ -124,7 +124,7 @@
 #       THIS script (gc.sh): --mount = the WORKTREES DIR.  The value is assigned to
 #         WORKTREES_DIR directly, and BASE_TARGET is derived from its PARENT:
 #           WORKTREES_DIR  = <--mount value>
-#           BASE_TARGET    = $(dirname <--mount value>)/base/target
+#           BASE_TARGET    = <parent of the --mount value>/base/target
 #         On the real host: --mount = /home/leo/src/warm-lanes/worktrees, so
 #           WORKTREES_DIR = /home/leo/src/warm-lanes/worktrees
 #           BASE_TARGET   = /home/leo/src/warm-lanes/base/target
@@ -447,9 +447,35 @@ fi
 # ── apply --mount derivation (before required-options validation) ──────────────
 # --mount sets WORKTREES_DIR and BASE_TARGET when not already set by explicit flags.
 # Explicit --worktrees-dir / --base-target always override the derived values.
+#
+# The parent of $MOUNT comes from PARAMETER EXPANSION, not a `dirname` fork —
+# see README.md "Delta 7". This is the same trim-then-`%/*` shape as
+# lib_lane_state.sh L141-146, and the guards are load-bearing, because the
+# derived VALUE must stay exactly what the header comments above document:
+#   - the `%/` trim: dirname "/a/b/wt/" is "/a/b", but a bare "${MOUNT%/*}"
+#     would give "/a/b/wt" — a trailing slash on --mount is plausible operator
+#     input, and this is the one edge where the naive form silently misderives.
+#   - BOTH empty-result guards: "${MOUNT%/}" is empty for MOUNT=/ and
+#     "${_mnt_trimmed%/*}" is empty for MOUNT=/worktrees; dirname answers "/"
+#     in both cases, so each needs its own `|| ...='/'`.
+#   - the `*/*` case: for a slashless relative MOUNT=worktrees, dirname gives
+#     "." where "${MOUNT%/*}" leaves it unchanged.
+# Verified equal to `dirname` over /worktrees, worktrees, /a/b/wt, /a/b/wt/, /,
+# ., ./x and the real host value. Not equal for MULTIPLE trailing slashes
+# (--mount /a/b//), which the single `%/` trim leaves at /a/b — stated rather
+# than papered over; it matches lib_lane_state.sh's existing behaviour and
+# --mount is documented above as a directory path.
 if [ -n "$MOUNT" ]; then
     [ -n "$WORKTREES_DIR" ] || WORKTREES_DIR="$MOUNT"
-    [ -n "$BASE_TARGET"   ] || BASE_TARGET="$(dirname "$MOUNT")/base/target"
+    _mnt_trimmed="${MOUNT%/}"
+    [ -n "$_mnt_trimmed" ] || _mnt_trimmed='/'
+    _mnt_parent='.'
+    case "$_mnt_trimmed" in
+        */*) _mnt_parent="${_mnt_trimmed%/*}"
+             [ -n "$_mnt_parent" ] || _mnt_parent='/' ;;
+    esac
+    [ -n "$BASE_TARGET" ] || BASE_TARGET="$_mnt_parent/base/target"
+    unset _mnt_trimmed _mnt_parent
 fi
 
 # ── validate required options ──────────────────────────────────────────────────
@@ -528,7 +554,7 @@ _is_git_worktree() {
 _is_reclaimable() {
     local dir="$1"
     local name
-    name="$(basename "$dir")"
+    name="${dir##*/}"
 
     # (a) dirty tracked changes
     local dirty
@@ -603,7 +629,10 @@ _do_reclaim() {
         # Strip trailing slash
         entry="${entry%/}"
         [ -d "$entry" ] || continue
-        name="$(basename "$entry")"
+        # Leaf by parameter expansion (README.md "Delta 7"): an EMPTY $name here
+        # matches NEITHER glob below, so a protected _merge-*/_iact-* entry would
+        # fall through to orphan_candidates.
+        name="${entry##*/}"
 
         # Skip protected entries entirely — count them as preserved in the summary
         # (they are not reclaimed, which is the user-visible meaning of "preserved").
@@ -629,7 +658,7 @@ _do_reclaim() {
     # ── Pass 1: reset reclaimable lanes ───────────────────────────────────────
     local lane
     for lane in "${lane_candidates[@]+${lane_candidates[@]}}"; do
-        name="$(basename "$lane")"
+        name="${lane##*/}"
         local lane_lock="${WORKTREES_DIR}/${name}.lock"
 
         # Acquire the lane lock NON-BLOCKING in the PARENT shell so the same
@@ -835,7 +864,7 @@ _do_reclaim() {
     # ── Pass 2: remove reclaimable orphans ────────────────────────────────────
     local orphan
     for orphan in "${orphan_candidates[@]+${orphan_candidates[@]}}"; do
-        name="$(basename "$orphan")"
+        name="${orphan##*/}"
         local orphan_lock="${WORKTREES_DIR}/${name}.lock"
 
         # Same single-acquisition pattern as Pass 1: non-blocking exclusive
