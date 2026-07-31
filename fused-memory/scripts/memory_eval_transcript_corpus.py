@@ -136,6 +136,59 @@ minable without editing this file.
 
 
 # ---------------------------------------------------------------------------
+# Archive-path provenance
+# ---------------------------------------------------------------------------
+
+
+def _strip_transcript_suffix(name: str) -> str:
+    """``<x>.jsonl.gz`` / ``<x>.jsonl`` -> ``<x>``."""
+    if name.endswith('.jsonl.gz'):
+        return name[: -len('.jsonl.gz')]
+    if name.endswith('.jsonl'):
+        return name[: -len('.jsonl')]
+    return name
+
+
+def parse_archive_path(rel_path: str | Path) -> dict[str, Any]:
+    """Recover task/session/subagent identity from an archive-relative path.
+
+    The layout is the one ``shared.transcript_archive`` WRITES — named rather
+    than line-cited so this reader stays coupled to that producer by name as
+    it evolves::
+
+        <task_id>/<enc-cwd>/<session_id>.jsonl.gz
+        <task_id>/<enc-cwd>/<session_id>/subagents/agent-<hex>.jsonl.gz
+
+    Every field degrades to None independently rather than raising. An archive
+    is append-only runtime state that can acquire a stray file, and one
+    unexpected name must not abort a scan over thousands of good ones.
+
+    Note this is the ONLY source of task/session identity the corpus uses.
+    Records do carry ``isSidechain``/``gitBranch`` hints, but those are a
+    property of what the agent was doing rather than of where the transcript
+    was filed, so the path stays authoritative.
+    """
+    parts = Path(rel_path).parts
+    parsed: dict[str, Any] = {
+        'task_id': None,
+        'session_id': None,
+        'is_subagent': False,
+        'subagent_id': None,
+    }
+    if len(parts) >= 1:
+        parsed['task_id'] = parts[0] if len(parts) > 1 else None
+    if len(parts) == 3:
+        # <task_id>/<enc-cwd>/<session_id>.jsonl.gz
+        parsed['session_id'] = _strip_transcript_suffix(parts[2])
+    elif len(parts) == 5 and parts[3] == 'subagents':
+        # <task_id>/<enc-cwd>/<session_id>/subagents/agent-<hex>.jsonl.gz
+        parsed['session_id'] = parts[2]
+        parsed['is_subagent'] = True
+        parsed['subagent_id'] = _strip_transcript_suffix(parts[4])
+    return parsed
+
+
+# ---------------------------------------------------------------------------
 # Caller identity
 # ---------------------------------------------------------------------------
 
@@ -322,6 +375,7 @@ def extract_searches(
     *,
     source: str | None = None,
     tool_names: frozenset[str] = SEARCH_TOOL_NAMES,
+    provenance: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Mine one transcript's records into corpus records. Pure, single-pass.
 
@@ -340,6 +394,8 @@ def extract_searches(
         source: archive-RELATIVE path of the transcript, stamped on each
             record so the corpus stays portable across machines.
         tool_names: which tool names count as a search.
+        provenance: task/session fields from :func:`parse_archive_path`,
+            merged into every emitted record.
     """
     emitted: list[dict[str, Any]] = []
     pending: dict[str, dict[str, Any]] = {}
@@ -374,6 +430,7 @@ def extract_searches(
                     'result_count': 0,
                     'results': [],
                 }
+                partial.update(dict(provenance or {}))
                 emitted.append(partial)
                 if isinstance(tool_use_id, str):
                     pending[tool_use_id] = partial
