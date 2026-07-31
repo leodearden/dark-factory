@@ -1,4 +1,15 @@
 {
+  "_disclosures": {
+    "census_rows_malformed_count": 0,
+    "census_rows_malformed_value": 0,
+    "census_topics_emitted": 49,
+    "census_topics_skipped_singleton": 303,
+    "curator_clusters_without_canonical": 0,
+    "curator_gate_clusters": 20,
+    "derived_candidates_not_carried": 46,
+    "slug_collisions_dropped": 0,
+    "topic_guard_clusters": 5
+  },
   "entries": [
     {
       "canonical": {

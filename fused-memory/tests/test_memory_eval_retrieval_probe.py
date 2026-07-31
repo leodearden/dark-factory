@@ -261,6 +261,78 @@ class TestLoadTopicRegistry:
 
         assert len(_mod().load_topic_registry(path).entries) == 1
 
+    # -- the version check runs BEFORE the entry shapes it does not understand --
+
+    def test_a_future_schema_version_names_the_version_not_an_entry(self, tmp_path):
+        """A v2 registry whose entry shape changed must not be reported as a
+        broken v1 entry.
+
+        Validating entries first produced "topic 'x': required field
+        'canonical' is missing" for a file that is perfectly valid for its own
+        version — a message that names the wrong cause and sends an operator
+        to edit an entry that is correct. The version is the first thing this
+        loader can be wrong about, so it is the first thing it checks.
+        """
+        payload = _registry_payload({'topic': 'v2-shaped', 'canonical_ref': 'moved'})
+        payload['schema_version'] = 2
+        path = _write_registry(tmp_path, payload)
+
+        with pytest.raises(_mod().RegistryError) as excinfo:
+            _mod().load_topic_registry(path)
+
+        message = str(excinfo.value)
+        assert 'schema_version' in message
+        assert '2' in message
+        assert 'v2-shaped' not in message, 'the entry is not what is wrong here'
+
+    # -- _disclosures: strict, because a dropped disclosure erases a narrowing --
+
+    def test_disclosures_load_as_a_count_mapping(self, tmp_path):
+        payload = _registry_payload()
+        payload['_disclosures'] = {'census_topics_skipped_singleton': 303}
+        path = _write_registry(tmp_path, payload)
+
+        registry = _mod().load_topic_registry(path)
+
+        assert registry.disclosures == {'census_topics_skipped_singleton': 303}
+
+    def test_an_absent_disclosures_block_is_legal(self, tmp_path):
+        path = _write_registry(tmp_path, _registry_payload())
+
+        assert _mod().load_topic_registry(path).disclosures == {}
+
+    @pytest.mark.parametrize('value', ['41', 41.5, None, True, ['41']])
+    def test_a_non_integer_disclosure_is_a_named_failure_not_a_silent_drop(
+        self, tmp_path, value,
+    ):
+        """Dropping it would delete the statement that a narrowing happened.
+
+        The report renders "what derivation and hand-selection left out" from
+        this block. A hand-merged `"303"` that vanished would render the
+        section WITHOUT the line — indistinguishable from a derivation that
+        left nothing out, which is the exact reading the block exists to
+        prevent. `True` is in the list because bool is an int subclass and a
+        `True` here is a miscount, not a count.
+        """
+        payload = _registry_payload()
+        payload['_disclosures'] = {'census_topics_skipped_singleton': value}
+        path = _write_registry(tmp_path, payload)
+
+        with pytest.raises(_mod().RegistryError) as excinfo:
+            _mod().load_topic_registry(path)
+
+        assert 'census_topics_skipped_singleton' in str(excinfo.value)
+
+    def test_a_non_object_disclosures_block_is_a_named_failure(self, tmp_path):
+        payload = _registry_payload()
+        payload['_disclosures'] = ['census_topics_skipped_singleton']
+        path = _write_registry(tmp_path, payload)
+
+        with pytest.raises(_mod().RegistryError) as excinfo:
+            _mod().load_topic_registry(path)
+
+        assert '_disclosures' in str(excinfo.value)
+
 
 # ---------------------------------------------------------------------------
 # step-3: the committed registry fixture's data contract
@@ -329,6 +401,43 @@ class TestCommittedRegistryFixture:
 
     def test_breadth_floor(self, registry):
         assert len(registry.entries) >= MIN_TOPICS
+
+    def test_the_fixture_carries_its_derivation_disclosures(self, registry):
+        """32 topics is a SELECTION, and the report has to be able to say so.
+
+        `--derive-registry` emits 74 candidates and skips a census tail
+        larger still. With no `_disclosures` block the registry-composition
+        section renders the composition and nothing else — a reader of a
+        production report sees 32 topics with no hint that anything was left
+        out, which is the narrowing-invisible-by-the-time-anyone-reads-a-run
+        failure the block exists to prevent.
+
+        Asserted as "carries the keys", never as "carries these values": the
+        counts move whenever the census or the calibration file does, and a
+        pinned number here would turn a corpus change into a test failure.
+        """
+        assert registry.disclosures, 'the committed registry discloses nothing'
+        for key in (
+            'census_topics_skipped_singleton',
+            'curator_clusters_without_canonical',
+            'census_rows_malformed_value',
+            'census_rows_malformed_count',
+            'slug_collisions_dropped',
+            'derived_candidates_not_carried',
+        ):
+            assert key in registry.disclosures, key
+
+    def test_the_disclosed_narrowings_reach_the_operators_report(self, registry):
+        """The block is only worth carrying if it renders."""
+        m = _mod()
+        section = {
+            s.key: s for s in m.probe_report_sections(
+                _report_series(), _report_observations(), registry=registry,
+            )
+        }[m.SECTION_REGISTRY_COMPOSITION].text
+
+        for key in ('census_topics_skipped_singleton', 'derived_candidates_not_carried'):
+            assert key in section
 
     def test_every_entry_has_enough_phrasings_including_a_held_out_one(self, registry):
         for entry in registry.entries:
@@ -525,6 +634,26 @@ class TestDeriveFromCuratorGates:
                 assert pair['superseded_hash'] in members
                 assert pair['successor_hash'] == candidate['canonical']['content_hash']
 
+    def test_a_cluster_with_no_canonical_row_is_counted_not_silently_skipped(
+        self, census_report, guard_clusters,
+    ):
+        """A calibration file that lost its canonical labels would derive
+        fewer topics while reading, from the disclosures alone, exactly like a
+        smaller corpus. The skip is correct; the silence is not."""
+        rows = [
+            {'cluster_id': 'has-one', 'label': 'canonical', 'content': 'the canonical'},
+            {'cluster_id': 'has-none', 'label': 'duplicate', 'content': 'orphan a'},
+            {'cluster_id': 'has-none', 'label': 'duplicate', 'content': 'orphan b'},
+        ]
+        result = _mod().derive_registry_candidates(rows, census_report, guard_clusters)
+
+        assert len(_of(result, 'curator_gate')) == 1
+        assert result.disclosures['curator_clusters_without_canonical'] == 1
+
+    def test_the_committed_calibration_file_leaves_no_cluster_behind(self, derived):
+        """Today the counter reads zero — pinned so it stops being zero LOUDLY."""
+        assert derived.disclosures['curator_clusters_without_canonical'] == 0
+
 
 class TestDeriveFromCensus:
     """Multi-entry census topics, with the skipped long tail DISCLOSED."""
@@ -562,6 +691,42 @@ class TestDeriveFromCensus:
             calibration_rows, payload, guard_clusters,
         )
         assert {c['topic'] for c in _of(result, 'census_topic')} == {'multi-topic'}
+
+    def test_a_malformed_row_is_not_mislabelled_as_a_singleton(
+        self, calibration_rows, guard_clusters,
+    ):
+        """A broken census and a healthy census with a short tail are not the
+        same fact.
+
+        Folding a row whose `value` or `count` is the wrong shape into
+        `census_topics_skipped_singleton` reports a schema break as a corpus
+        property — the one reading that stops anyone looking. Each cause gets
+        its own counter.
+        """
+        payload = {'grand_total': {'topic': {'entries': [
+            {'value': 'kept-topic', 'count': 3},
+            {'value': 'lonely-topic', 'count': 1},
+            {'value': '', 'count': 9},
+            {'value': ['not', 'a', 'string'], 'count': 9},
+            'not even a row',
+            {'value': 'bad-count', 'count': 'nine'},
+            {'value': 'bool-count', 'count': True},
+        ]}}}
+        result = _mod().derive_registry_candidates(
+            calibration_rows, payload, guard_clusters,
+        )
+
+        assert {c['topic'] for c in _of(result, 'census_topic')} == {'kept-topic'}
+        assert result.disclosures['census_topics_skipped_singleton'] == 1
+        assert result.disclosures['census_rows_malformed_value'] == 3
+        assert result.disclosures['census_rows_malformed_count'] == 2
+
+    def test_the_committed_census_is_well_formed(self, derived):
+        """Both malformed counters read zero today — pinned so they stop
+        reading zero loudly rather than quietly re-tagging rows as
+        singletons."""
+        assert derived.disclosures['census_rows_malformed_value'] == 0
+        assert derived.disclosures['census_rows_malformed_count'] == 0
 
 
 class TestDeriveFromGuardClusters:

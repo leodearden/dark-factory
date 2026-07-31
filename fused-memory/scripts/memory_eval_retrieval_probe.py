@@ -303,12 +303,14 @@ class TopicRegistry:
     schema_version: int
     entries: tuple[RegistryEntry, ...]
     disclosures: dict[str, int] = field(default_factory=dict)
-    """What derivation left out, carried from the payload's ``_disclosures``.
+    """What the probed set does NOT cover, from the payload's ``_disclosures``.
 
-    Derivation narrows its inputs (the count-1 census tail above all), and a
-    narrowing recorded only in the deriver's stdout is invisible by the time
-    anyone reads a run. Carrying it on the registry lets the report state, in
-    the same place as the results, what the probed set does NOT cover.
+    Two narrowings stack here. Derivation narrows its inputs (the count-1
+    census tail above all), and then hand-selection narrows derivation's
+    candidates down to the committed fixture. A narrowing recorded only in
+    the deriver's stdout is invisible by the time anyone reads a run, so the
+    fixture carries both and the report states them in the same place as the
+    results.
     """
 
     @property
@@ -491,6 +493,41 @@ def _parse_entry(raw: Any, index: int) -> RegistryEntry:
     )
 
 
+def _parse_disclosures(path: Path, raw: Any) -> dict[str, int]:
+    """The payload's ``_disclosures`` block, or a named failure.
+
+    Strict, not tolerant, and deliberately unlike the entry loader's
+    additive tolerance. A disclosure is the record of what derivation LEFT
+    OUT; dropping a malformed one would delete the very statement that a
+    narrowing happened, and the report would then render "what derivation
+    left out" without the line — indistinguishable from a derivation that
+    left nothing out. So a non-int value (a hand-merged ``"41"``, say) names
+    itself here rather than vanishing.
+
+    Absent is legal and means "this registry records no narrowing"; a
+    disclosure block is not something every registry has to carry.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise RegistryError(
+            f'topic registry {str(path)!r}: "_disclosures" must be an object mapping '
+            f'a narrowing to its count, got {type(raw).__name__}.'
+        )
+    disclosures: dict[str, int] = {}
+    for key, value in raw.items():
+        # bool is an int subclass; a True here is a miscount, not a count.
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise RegistryError(
+                f'topic registry {str(path)!r}: disclosure {key!r} is '
+                f'{value!r} ({type(value).__name__}), not an integer count. '
+                'Dropping it would erase the record that derivation narrowed '
+                'its inputs, which reads downstream as "nothing was left out".'
+            )
+        disclosures[str(key)] = value
+    return disclosures
+
+
 def load_topic_registry(path: str | Path) -> TopicRegistry:
     """Load and validate the committed topic registry at *path*.
 
@@ -522,6 +559,17 @@ def load_topic_registry(path: str | Path) -> TopicRegistry:
         raise RegistryError(
             f'topic registry {str(path)!r} is missing its "entries" list.'
         )
+    # BEFORE any entry is parsed, deliberately. A future schema_version=2
+    # registry whose entry shape changed would otherwise fail on the first
+    # entry with "topic 'x': required field 'canonical' is missing" — a
+    # message that names the wrong cause and sends an operator to edit an
+    # entry that is correct for its own version. Version first, shape second.
+    schema_version = payload.get('schema_version', REGISTRY_SCHEMA_VERSION)
+    if schema_version != REGISTRY_SCHEMA_VERSION:
+        raise RegistryError(
+            f'topic registry {str(path)!r} declares schema_version={schema_version!r}, '
+            f'but this loader understands {REGISTRY_SCHEMA_VERSION}.'
+        )
     # A stale, truncated, or half-written registry decodes as a well-formed
     # object carrying zero entries. Loading it would emit `"metrics": []` and
     # exit 0 — silence leaf alpha cannot distinguish from a healthy run, and a
@@ -548,22 +596,10 @@ def load_topic_registry(path: str | Path) -> TopicRegistry:
             )
         seen[entry.topic] = i
 
-    schema_version = payload.get('schema_version', REGISTRY_SCHEMA_VERSION)
-    if schema_version != REGISTRY_SCHEMA_VERSION:
-        raise RegistryError(
-            f'topic registry {str(path)!r} declares schema_version={schema_version!r}, '
-            f'but this loader understands {REGISTRY_SCHEMA_VERSION}.'
-        )
-
-    raw_disclosures = payload.get('_disclosures') or {}
-    disclosures = {
-        key: value for key, value in raw_disclosures.items() if isinstance(value, int)
-    } if isinstance(raw_disclosures, dict) else {}
-
     return TopicRegistry(
         schema_version=schema_version,
         entries=tuple(entries),
-        disclosures=disclosures,
+        disclosures=_parse_disclosures(path, payload.get('_disclosures')),
     )
 
 
@@ -585,6 +621,12 @@ class DerivationResult:
     count-1 census tail, rows the curator adjudicated as distinct), and a
     narrowing nobody can see reads downstream as "there was nothing there" —
     the silent cap this repo's norms forbid.
+
+    So EVERY drop is counted, and the counters are kept distinct by cause: a
+    census row dropped for a malformed ``value`` is a broken census, while
+    one dropped for ``count <= 1`` is a healthy census with an uninformative
+    tail. Folding them into one number reports a schema break as a corpus
+    property, which is the reading that stops anyone looking.
     """
 
     candidates: tuple[dict[str, Any], ...]
@@ -634,15 +676,25 @@ def _candidate(
     }
 
 
-def _derive_curator_gate_candidates(rows: list[dict]) -> list[dict[str, Any]]:
+def _derive_curator_gate_candidates(rows: list[dict]) -> tuple[list[dict[str, Any]], int]:
+    """Curator-gate candidates, plus the clusters that carried no canonical row.
+
+    A cluster the curator never adjudicated a canonical for cannot become an
+    entry — "is the canonical in the top k" has no subject. Skipping it is
+    correct; skipping it in silence is not, because a calibration file that
+    lost its canonical labels would derive fewer topics while reading, from
+    the disclosure block alone, exactly like a smaller corpus.
+    """
     groups: dict[str, list[dict]] = {}
     for row in rows:
         groups.setdefault(row['cluster_id'], []).append(row)
 
     candidates: list[dict[str, Any]] = []
+    without_canonical = 0
     for cluster_id, group in sorted(groups.items()):
         canonical_rows = [r for r in group if r.get('label') == 'canonical']
         if not canonical_rows:
+            without_canonical += 1
             continue
         canonical = canonical_rows[0]
         # ONLY 'duplicate'. The curator adjudicated 'distinct' and
@@ -680,27 +732,52 @@ def _derive_curator_gate_candidates(rows: list[dict]) -> list[dict[str, Any]]:
                 },
             },
         ))
-    return candidates
+    return candidates, without_canonical
 
 
-def _derive_census_candidates(census: dict) -> tuple[list[dict[str, Any]], int]:
-    """Multi-entry census topics, plus the number of singletons skipped.
+class _CensusDerivation(NamedTuple):
+    """``(candidates, skipped_singleton, malformed_value, malformed_count)``.
+
+    Three separate narrowing counters, not one: a row dropped because its
+    ``value`` was not a string is a MALFORMED census, while a row dropped for
+    ``count <= 1`` is a healthy census whose tail is uninformative. Folding
+    them together (as an earlier shape did) reported a schema break as a
+    corpus property, which is the one reading that stops anyone looking.
+    """
+
+    candidates: list[dict[str, Any]]
+    skipped_singleton: int
+    malformed_value: int
+    malformed_count: int
+
+
+def _derive_census_candidates(census: dict) -> _CensusDerivation:
+    """Multi-entry census topics, plus every row the derivation had to drop.
 
     A count-1 topic has exactly one entry, so "is the canonical in the top k"
     is answered by that entry's mere existence — it measures presence, not
     retrieval. They are skipped, and the count is returned so the skip is
-    reported rather than silently applied.
+    reported rather than silently applied. Rows whose ``value`` or ``count``
+    is the wrong shape are counted separately, for the reason
+    :class:`_CensusDerivation` states.
     """
     table = ((census.get('grand_total') or {}).get('topic') or {}).get('entries') or []
     candidates: list[dict[str, Any]] = []
     skipped = 0
+    malformed_value = 0
+    malformed_count = 0
     for item in table:
         if not isinstance(item, dict):
+            malformed_value += 1
             continue
         value, count = item.get('value'), item.get('count', 0)
         if not isinstance(value, str) or not value:
+            malformed_value += 1
             continue
-        if not isinstance(count, int) or count <= 1:
+        if not isinstance(count, int) or isinstance(count, bool):
+            malformed_count += 1
+            continue
+        if count <= 1:
             skipped += 1
             continue
         candidates.append(_candidate(
@@ -715,7 +792,7 @@ def _derive_census_candidates(census: dict) -> tuple[list[dict[str, Any]], int]:
             members=[],
             provenance={'census_topic_value': value, 'census_count': count},
         ))
-    return candidates, skipped
+    return _CensusDerivation(candidates, skipped, malformed_value, malformed_count)
 
 
 def _derive_guard_cluster_candidates(clusters) -> list[dict[str, Any]]:
@@ -754,9 +831,11 @@ def derive_registry_candidates(
     per-facet claim needles. Those are hand-authored, which is exactly why the
     CLI band prints rather than overwrites (see :func:`run_derive_registry`).
     """
-    candidates = list(_derive_curator_gate_candidates(calibration_rows))
-    census_candidates, skipped = _derive_census_candidates(census_report)
-    candidates.extend(census_candidates)
+    curator_candidates, clusters_without_canonical = _derive_curator_gate_candidates(
+        calibration_rows,
+    )
+    census = _derive_census_candidates(census_report)
+    candidates = [*curator_candidates, *census.candidates]
     candidates.extend(_derive_guard_cluster_candidates(guard_clusters))
 
     seen: set[str] = set()
@@ -779,11 +858,19 @@ def derive_registry_candidates(
             'census_topics_emitted': sum(
                 1 for c in deduped if c['derived_from'] == 'census_topic'
             ),
-            'census_topics_skipped_singleton': skipped,
+            'census_topics_skipped_singleton': census.skipped_singleton,
             'topic_guard_clusters': sum(
                 1 for c in deduped if c['derived_from'] == 'topic_guard_cluster'
             ),
             'slug_collisions_dropped': collisions,
+            # The three narrowings that used to happen in silence. Each one
+            # means a DIFFERENT thing has gone wrong upstream, so each gets its
+            # own counter rather than being folded into the singleton skip:
+            # a calibration file that lost its canonical labels, a census whose
+            # topic values changed shape, and a census whose counts did.
+            'curator_clusters_without_canonical': clusters_without_canonical,
+            'census_rows_malformed_value': census.malformed_value,
+            'census_rows_malformed_count': census.malformed_count,
         },
     )
 
@@ -2109,7 +2196,7 @@ def probe_report_sections(
         for source, count in sorted(composition.items()):
             lines.append(f'  {source}: {count}')
         if registry.disclosures:
-            lines.append('  what derivation left out:')
+            lines.append('  what derivation and hand-selection left out:')
             for key, value in sorted(registry.disclosures.items()):
                 lines.append(f'    {key}: {value}')
         emit(SECTION_REGISTRY_COMPOSITION, lines)

@@ -227,7 +227,9 @@ limits evaluator, not here).
 
 ### Record schema
 
-Top level is `{"schema_version": 1, "entries": [...]}`. Per entry:
+Top level is `{"schema_version": 1, "_disclosures": {...}, "entries": [...]}`.
+`_disclosures` is described under "What the registry does **not** cover"
+below. Per entry:
 
 | field | meaning |
 |---|---|
@@ -284,6 +286,32 @@ this one result list" — no pointer-shape knowledge at runtime at all.
   is the highest-leverage query surface in the system: those four run against
   every dispatched task's context window.
 - **3 `hand`** — single-entry dark_factory topics.
+
+### What the registry does **not** cover (`_disclosures`)
+
+32 topics is a *selection*. `scripts/memory_eval_retrieval_probe.py
+--derive-registry` emits 74 candidates from the committed offline sources,
+and the census tail it never offered at all is larger still. Every one of
+those narrowings is recorded in the top-level `_disclosures` block and
+rendered into the run report's registry-composition section, because a
+narrowing nobody can see reads downstream as "there was nothing there".
+
+| key | meaning |
+|---|---|
+| `curator_gate_clusters` / `census_topics_emitted` / `topic_guard_clusters` | Candidates derivation produced, per source. |
+| `census_topics_skipped_singleton` | Census topics with `count <= 1`. A one-entry topic answers "is the canonical in the top k" by that entry's mere existence — presence, not retrieval. |
+| `curator_clusters_without_canonical` | Calibration clusters carrying no `canonical`-labelled row, so no entry could be built. |
+| `census_rows_malformed_value` / `census_rows_malformed_count` | Census rows whose `value` / `count` was the wrong shape. Counted **separately** from the singleton skip: a malformed row is a broken census, a singleton is a healthy one — folding them together reports a schema break as a corpus property. |
+| `slug_collisions_dropped` | Candidates whose slug collided with one already emitted. |
+| `derived_candidates_not_carried` | Candidates derivation emitted that this fixture does **not** contain. Mostly census topics whose canonical `content_hash` is unknown offline (derivation leaves it empty) and which no operator has resolved against a live read-only scroll yet. |
+
+Regenerate the derivation half with `--derive-registry` and merge; the flag
+prints and never overwrites, because the hand-authored held-out phrasings
+are the part a machine cannot regenerate.
+
+A `_disclosures` value that is not an integer is a **named load failure**,
+not a silently dropped key — dropping it would erase the record that a
+narrowing happened, which is exactly the state the block exists to prevent.
 
 The `topic_guard_cluster`, `census_topic`, `hand` and `briefing_query`
 canonicals were resolved by a **read-only Qdrant payload scroll** on
