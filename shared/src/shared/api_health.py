@@ -41,7 +41,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from shared.invocation_outcome import InvocationOutcome, ServerError
+from shared.invocation_outcome import OK, InvocationOutcome, ServerError
 
 if TYPE_CHECKING:
     from shared.cost_store import CostStore
@@ -267,7 +267,64 @@ class ApiHealthGate:
                 )
                 return Open(since=self._wall_clock(), stats=stats)
             return self._state
+
+        # --- Degraded (Open or Probing): watch for recovery ---------------
+        if isinstance(outcome, OK):
+            streak = 1
+            if isinstance(self._state, Probing):
+                streak = self._state.consecutive_successes + 1
+            if streak >= self.close_after_successes:
+                return self._close(stats)
+            return Probing(
+                since=self._degraded_since(),
+                stats=self._degraded_stats(),
+                consecutive_successes=streak,
+            )
+
         return self._state
+
+    def _close(self, stats: GateStats) -> GateState:
+        """Transition to Closed, clearing the window.
+
+        Clearing is load-bearing, not tidiness.  At the moment the closing
+        probe lands, the failures that CAUSED the trip are still inside
+        ``window_secs`` — so without the clear the very next 5xx would find a
+        full burst waiting for it and instantly re-trip, and the breaker would
+        oscillate for a whole window after every recovery.  Same trap
+        ``Scheduler.resume()`` documents when it clears ``_blocked_transitions``
+        (scheduler.py:1862-1867).
+
+        Requiring fresh post-close evidence makes a re-trip mean "the provider
+        is down again" rather than "the provider was down a minute ago".
+        """
+        since = self._degraded_since()
+        logger.info(
+            'ApiHealthGate CLOSED (provider recovered) after %s — '
+            'closing window held %d/%d failures',
+            self._wall_clock() - since,
+            stats.failures,
+            stats.completions,
+        )
+        self._samples.clear()
+        return Closed()
+
+    def _degraded_since(self) -> datetime:
+        """The current degraded state's original trip instant."""
+        state = self._state
+        if isinstance(state, Open | Probing):
+            return state.since
+        # Unreachable: only called from the degraded branch.  Fall back to now
+        # rather than crash an invocation over a state-machine bug.
+        logger.warning('_degraded_since called in state %r — falling back to now', state)
+        return self._wall_clock()
+
+    def _degraded_stats(self) -> GateStats:
+        """The evidence captured at the original trip, carried across probes."""
+        state = self._state
+        if isinstance(state, Open | Probing):
+            return state.stats
+        logger.warning('_degraded_stats called in state %r — falling back to live window', state)
+        return self._stats()
 
     def _should_trip(self, stats: GateStats) -> bool:
         """All three C4 conditions must hold — each is independently necessary.
