@@ -19,8 +19,13 @@ FalkorDB (module v41800 / 4.18.0) behind an index-readiness barrier; see
 from __future__ import annotations
 
 import pytest
+from graphiti_core.driver.falkordb_driver import STOPWORDS, FalkorDriver
 
-from fused_memory.backends.falkor_fulltext import escape_group_id, is_searchable_term
+from fused_memory.backends.falkor_fulltext import (
+    build_query,
+    escape_group_id,
+    is_searchable_term,
+)
 
 # --- Genuine FAULT tokens -------------------------------------------------
 # RediSearch's tokenizer reduces each of these to nothing, so emitting one into
@@ -151,3 +156,131 @@ class TestEscapeGroupId:
     def test_all_three_escaped_exactly_once(self) -> None:
         """Combined input: each special character is escaped once, not twice."""
         assert escape_group_id('a-b"c\\d') == 'a\\-b\\"c\\\\d'
+
+
+class TestBuildQueryUpstreamParity:
+    """Pin byte-parity with upstream for inputs that ALREADY worked.
+
+    The hardening in this module only ever *removes* operands that RediSearch
+    cannot parse.  For every input that upstream already assembled successfully,
+    ``build_query`` must emit the byte-identical string — otherwise the fix would
+    silently change recall for the entire existing corpus, which is a far worse
+    regression than the dead-letter it repairs.
+
+    ``build_query`` takes text that has ALREADY been through
+    ``FalkorDriver.sanitize``; it does not sanitize itself.  The driver override
+    (steps 12/14) is what composes the two, so the character-class rules stay
+    upstream's rather than being forked here.
+    """
+
+    def test_ordinary_query_is_byte_identical_to_upstream_shape(self) -> None:
+        """The canonical shape: quoted group filter, space, pipe-joined operands.
+
+        ``about`` is asserted to survive because it is NOT in upstream's
+        ``STOPWORDS`` (verified against the real list below, not guessed).
+        """
+        assert (
+            build_query('task 3334 note about RediSearch', ['dark_factory'], 128)
+            == '(@group_id:"dark_factory") (task | 3334 | note | about | RediSearch)'
+        )
+
+    def test_stopword_removal_uses_upstream_list(self) -> None:
+        """Stopwords come from upstream's ``STOPWORDS``, not a local re-declaration.
+
+        The expectation is built FROM the imported list, so a graphiti-core
+        upgrade that changes the stopword set cannot leave this test asserting a
+        stale literal.
+        """
+        assert 'the' in STOPWORDS
+        assert 'about' not in STOPWORDS
+
+        text = 'the quick brown fox'
+        expected_terms = [w for w in text.split() if w.lower() not in STOPWORDS]
+        assert expected_terms == ['quick', 'brown', 'fox']
+        assert build_query(text, ['g'], 128) == '(@group_id:"g") (quick | brown | fox)'
+
+    def test_stopword_match_is_case_insensitive(self) -> None:
+        """Upstream lowercases the token before the ``STOPWORDS`` lookup."""
+        assert build_query('The quick', ['g'], 128) == '(@group_id:"g") (quick)'
+
+    @pytest.mark.parametrize('group_ids', [None, []])
+    def test_no_group_ids_preserves_upstream_leading_space(
+        self, group_ids: list[str] | None
+    ) -> None:
+        """No filter → upstream still emits the leading space; keep it byte-exact.
+
+        Upstream computes ``group_filter + ' (' + joined + ')'`` with an empty
+        filter, so the result genuinely starts with a space.  Trimming it would
+        be a cosmetic "improvement" that breaks parity for every ungrouped query.
+        """
+        assert build_query('alpha beta', group_ids, 128) == ' (alpha | beta)'
+
+    def test_multiple_group_ids_are_pipe_joined_inside_one_paren(self) -> None:
+        """Upstream shape for a multi-tenant filter: ``(@group_id:"a"|"b")``."""
+        assert build_query('alpha', ['a', 'b'], 128) == '(@group_id:"a"|"b") (alpha)'
+
+    def test_over_length_query_returns_empty_string(self) -> None:
+        """200 distinct words at ``max_query_length=128`` → the no-query sentinel."""
+        text = ' '.join(f'w{i}' for i in range(200))
+        assert build_query(text, ['dark_factory'], 128) == ''
+
+    def test_over_length_arithmetic_matches_upstream_exactly(self) -> None:
+        """Pin upstream's ODD length arithmetic at its exact boundary.
+
+        Upstream measures ``len(joined.split(' ')) + len(group_ids or '')`` where
+        ``joined`` is ``' | '``-separated — so the pipes are COUNTED as fields
+        (N terms → 2N-1), and ``len(group_ids or '')`` is the group_id COUNT.
+
+        That looks like a bug and is tempting to "fix" to a plain word count.  It
+        is deliberately preserved: changing it would alter which queries upstream
+        drops, i.e. silently change recall.  The boundary below discriminates the
+        two readings — with one group_id, 64 terms trips the guard (2*64-1+1 =
+        128) while a naive word count (64+1 = 65) would not.
+        """
+        assert build_query(' '.join(f'w{i}' for i in range(64)), ['g'], 128) == ''
+        assert build_query(' '.join(f'w{i}' for i in range(63)), ['g'], 128) != ''
+
+    def test_group_id_count_participates_in_the_length_guard(self) -> None:
+        """``len(group_ids or '')`` is the COUNT of group_ids, not a string length.
+
+        63 terms (126 fields) is under the limit with one group_id but trips it
+        with two — proving the addend scales with the number of group_ids.
+        """
+        text = ' '.join(f'w{i}' for i in range(63))
+        assert build_query(text, ['g'], 128) != ''
+        assert build_query(text, ['g', 'h'], 128) == ''
+
+    def test_build_query_does_not_sanitize_its_input(self) -> None:
+        """Input is pre-sanitized by the caller; ``build_query`` never re-does it.
+
+        A comma would have been mapped to a space by ``FalkorDriver.sanitize``.
+        Seeing ``alpha,beta`` survive as ONE token proves the character rules are
+        not forked into this module — the driver override reuses upstream's
+        ``sanitize()`` and only term assembly is replaced.
+        """
+        assert build_query('alpha,beta', ['g'], 128) == '(@group_id:"g") (alpha,beta)'
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            'task 3334 note about RediSearch',
+            'the quick brown fox',
+            'alpha beta gamma',
+            'café naïve 日本語 note',
+        ],
+    )
+    @pytest.mark.parametrize('group_ids', [None, [], ['dark_factory'], ['a', 'b']])
+    def test_matches_stock_upstream_output_for_benign_inputs(
+        self, text: str, group_ids: list[str] | None
+    ) -> None:
+        """Cross-check against the REAL upstream method, not a transcription of it.
+
+        For inputs upstream already handled (no fault tokens, non-empty term
+        list, no group_id needing escaping) the two must agree byte-for-byte.
+        Calling the unbound upstream method on an uninitialised instance keeps
+        this a pure-assembly comparison with no live connection.
+        """
+        stock = object.__new__(FalkorDriver)
+        assert build_query(text, group_ids, 128) == stock.build_fulltext_query(
+            text, group_ids, 128
+        )
