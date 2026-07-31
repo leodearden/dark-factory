@@ -37,6 +37,7 @@ that all three libs actually travelled along.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -350,6 +351,25 @@ def _default_mount_in_usage(
     return proc.stdout + proc.stderr
 
 
+#: The advertised default mount, as rendered into the usage text:
+#: ``--mount DIR     Mount point (default: ${REIFY_WARM_LANE_MOUNT:-<path>})``.
+#: The ``${...:-}`` wrapper is literal in the heredoc (escaped there), so only
+#: the interpolated ``_default_mount`` result varies.
+_ADVERTISED_MOUNT_RE = re.compile(
+    r'Mount point \(default: \$\{REIFY_WARM_LANE_MOUNT:-(?P<mount>[^}]*)\}\)',
+)
+
+
+def _advertised_default_mount(usage: str) -> str:
+    """The default ``--mount`` path parsed out of a captured usage text."""
+    match = _ADVERTISED_MOUNT_RE.search(usage)
+    assert match is not None, (
+        'the usage text carries no "--mount DIR ... (default: ...)" line at all '
+        f'— the script did not get as far as printing usage.\nusage:\n{usage}'
+    )
+    return match.group('mount')
+
+
 class TestProvisionRepoRootParity:
     """The default ``--mount`` is derived from the REPO ROOT, not the script's parent.
 
@@ -514,4 +534,81 @@ class TestProvisionRepoRootParity:
             f'The ascend-past-{worktrees_dir} behaviour is missing — the '
             f'warm-lanes dir would live inside the worktrees tree.\n'
             f'usage:\n{usage}'
+        )
+
+    @pytest.mark.parametrize(
+        'nesting',
+        [('repo',), ('worktrees', 'repo'), ('.worktrees', 'repo')],
+        ids=['plain', 'worktrees', 'dot-worktrees'],
+    )
+    def test_default_mount_survives_a_path_without_dirname(
+        self, tmp_path: Path, nesting: tuple[str, ...],
+    ) -> None:
+        """A ``PATH`` lacking ``dirname`` must not change the advertised mount.
+
+        The sixth repo-root failure mode, and the only one that is silent end
+        to end.  ``dirname`` and ``basename`` are EXTERNAL BINARIES: under a
+        ``PATH`` without them ``$(dirname ...)`` yields the empty string,
+        ``cd ""`` SUCCEEDS as a no-op, and the resolution lands on the caller's
+        CWD — no error, no warning, exit 0.  A systemd unit's ``PATH`` need not
+        carry coreutils, and this script is run on a fresh host to provision
+        the pool substrate, which is exactly where a minimal ``PATH`` is
+        likeliest.
+
+        MEASURED RED on base HEAD 8d276d3c5f: control ``/tmp/<...>/warm-lanes``,
+        hidden-``dirname`` ``/warm-lanes`` — the bare FILESYSTEM ROOT,
+        advertised to an operator about to provision a multi-terabyte XFS
+        volume, at rc=0 with no diagnostic of any kind.  Unlike the three
+        lib-sourcing scripts this one has NO ``[ ! -f ]`` check anywhere on the
+        path, so a mis-resolution has nothing at all to trip over.
+
+        Asserted as PARITY against a same-run control rather than a literal
+        expected path: the synthetic repo lives under ``tmp_path``, so a
+        hardcoded mount would encode the harness's layout and rot the moment
+        ``_stage_provision_script`` changes.  "the answer with ``dirname``
+        hidden equals the answer with ``dirname`` present" IS the contract.
+        The second assertion pins the specific regression so the case cannot
+        pass by both sides being equally broken.
+
+        All three nestings are exercised because ``_default_mount()`` reaches a
+        DIFFERENT fork in each: the plain repo uses only the ``dirname
+        "$REPO_ROOT"`` at the top, while a repo inside a worktrees dir also
+        takes the ascend branch's second ``dirname``.  ``.worktrees`` is
+        dark-factory's own spelling (README Delta 2), i.e. the shape an agent
+        or operator in THIS repo actually runs from.
+
+        No assertion on the ``Usage:`` program-name line: ``basename "$0"``
+        there is deliberately left forking (README Delta 7), so that line
+        renders blank under this ``PATH`` by design.
+        """
+        repo = tmp_path.joinpath(*nesting)
+        repo.mkdir(parents=True)
+        staged = _stage_provision_script(repo, git_init=False)
+
+        control = _advertised_default_mount(
+            _default_mount_in_usage(staged, ceiling=repo),
+        )
+        hidden = _advertised_default_mount(_default_mount_in_usage(
+            staged,
+            ceiling=repo,
+            extra_env={
+                'PATH': (
+                    f'{_path_hiding(tmp_path, "dirname", "basename")}'
+                    f'{os.pathsep}{os.environ["PATH"]}'
+                ),
+            },
+        ))
+
+        assert hidden == control, (
+            f'The advertised default mount depends on PATH: with dirname/'
+            f'basename present it is {control!r}, with them hidden it is '
+            f'{hidden!r}.  The resolution must be pure parameter expansion '
+            f'over builtins, which reads no PATH at all.'
+        )
+        assert hidden != '/warm-lanes', (
+            'The default mount resolved to the bare filesystem root — the '
+            'empty-substitution failure this case exists to catch: '
+            '`$(dirname ...)` returned nothing, `cd ""` succeeded as a no-op, '
+            'and the arithmetic ascended from the caller\'s CWD instead of '
+            'the script\'s own location.'
         )
