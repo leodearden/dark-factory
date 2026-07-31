@@ -320,11 +320,16 @@ def merge_plan_file_sources(
     return merged
 
 
-def _read_plan_file(plan_path: Path) -> tuple[str, tuple[str, ...]] | None:
+def _read_plan_file(plan_path: Path, dir_name: str) -> tuple[str, tuple[str, ...]] | None:
     """Read one plan.json, returning ``(task_id_key, files)`` or None.
 
     The key is the plan's OWN ``task_id`` field when present, falling back to
-    the caller-supplied directory name — the same self-identification
+    *dir_name* — the caller-supplied lane/meta-root entry name. The caller must
+    pass it explicitly because the two layouts nest the plan at different
+    depths (``<base>/.task-meta/<name>/plan.json`` vs
+    ``<base>/<name>/.task/plan.json``), so deriving it from ``plan_path``
+    would yield the literal ``.task`` for every legacy plan and collapse them
+    all onto one key. This is the same self-identification
     ``_find_lane_by_plan_task_id`` relies on (git_ops.py:6793-6845), which is
     robust to a plan sitting in a pooled lane directory whose name is not the
     task id.
@@ -346,7 +351,7 @@ def _read_plan_file(plan_path: Path) -> tuple[str, tuple[str, ...]] | None:
         return None
     raw_task_id = payload.get("task_id")
     if raw_task_id is None or raw_task_id == "":
-        key = plan_path.parent.name
+        key = dir_name
     else:
         key = str(raw_task_id)
     return key, files
@@ -375,8 +380,8 @@ def load_plan_files_from_disk(worktree_base: str) -> dict[str, PlanFilesRecord]:
     records: dict[str, PlanFilesRecord] = {}
     base = Path(worktree_base)
 
-    def _ingest(plan_path: Path, source: str) -> None:
-        read = _read_plan_file(plan_path)
+    def _ingest(plan_path: Path, dir_name: str, source: str) -> None:
+        read = _read_plan_file(plan_path, dir_name)
         if read is None:
             return
         key, files = read
@@ -394,7 +399,7 @@ def load_plan_files_from_disk(worktree_base: str) -> dict[str, PlanFilesRecord]:
     except OSError:
         meta_entries = []
     for entry in meta_entries:
-        _ingest(entry / "plan.json", "meta_root_plan_json")
+        _ingest(entry / "plan.json", entry.name, "meta_root_plan_json")
 
     try:
         base_entries = sorted(base.iterdir())
@@ -405,7 +410,7 @@ def load_plan_files_from_disk(worktree_base: str) -> dict[str, PlanFilesRecord]:
         # <base>/.task-meta/.task/plan.json must not be mis-scanned as a lane.
         if entry.name == TASK_META_DIRNAME:
             continue
-        _ingest(entry / ".task" / "plan.json", "legacy_worktree_plan_json")
+        _ingest(entry / ".task" / "plan.json", entry.name, "legacy_worktree_plan_json")
 
     return records
 

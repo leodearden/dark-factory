@@ -547,6 +547,25 @@ def test_load_plan_files_from_disk_prefers_in_file_task_id_over_dir_name(tmp_pat
     assert records["4444"].files == ("c.py",)
 
 
+def test_load_plan_files_from_disk_keys_task_id_less_legacy_plans_by_lane_dir(tmp_path):
+    """(d2) the legacy layout nests the plan one level deeper
+    (``<base>/<lane>/.task/plan.json``), so the dir-name fallback must be the
+    LANE name, not the plan's literal parent (``.task``). Two task_id-less
+    legacy plans under distinct lanes must both survive — keying both as
+    ``".task"`` would silently drop one, under-reporting the damaged
+    population the audit exists to size."""
+    _write_legacy_plan(tmp_path, "111", {"files": ["111.py"]})
+    _write_legacy_plan(tmp_path, "222", {"files": ["222.py"]})
+
+    records = load_plan_files_from_disk(str(tmp_path))
+
+    assert set(records) == {"111", "222"}
+    assert records["111"].files == ("111.py",)
+    assert records["222"].files == ("222.py",)
+    assert records["111"].source == "legacy_worktree_plan_json"
+    assert records["222"].source == "legacy_worktree_plan_json"
+
+
 def test_load_plan_files_from_disk_resolves_legacy_symlink_without_duplicating(tmp_path):
     """(e) the REAL layout: the legacy path is an absolute symlink into the
     meta-root. Reading it must not crash and must not produce a second,
