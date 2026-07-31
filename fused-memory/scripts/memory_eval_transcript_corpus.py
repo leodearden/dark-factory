@@ -55,6 +55,93 @@ decoding to ``{"results": [{"id", "content", "category", "source_store",
    recovered from the briefing's Agent Identity line — a different thing that
    happens to share a name. Do not conflate them.
 
+Record schema
+-------------
+The corpus is JSON Lines — one search per line, keys sorted, UTF-8 kept
+verbatim. ``schema_version`` is stamped on every RECORD rather than in a
+header so a consumer that reads a single line still knows what it is
+holding::
+
+    {
+      "schema_version": 1,             // SCHEMA_VERSION; bump on any change
+      "transcript":     "3214/-home-…/<session>.jsonl.gz",
+      "task_id":        "3214",        // ─┐
+      "session_id":     "<uuid>",      //  │ ALL path-derived, by
+      "is_subagent":    false,         //  │ parse_archive_path — never
+      "subagent_id":    null,          // ─┘ read from the record bodies
+      "tool_use_id":    "toolu_…",     // correlates the call to its answer
+      "tool_name":      "mcp__fused-memory__search",
+      "query":          "<the full query text>",
+      "params":         {"project_id": "dark_factory", "limit": 5},
+      "caller":         {"agent_id": "claude-task-3214-implementer",
+                         "task_id": "3214", "role": "implementer"},
+      "result_status":  "ok",          // ok | error | unparsed | missing
+      "result_count":   2,
+      "results": [
+        {"rank": 1,                    // 1-based, the order the agent SAW
+         "id": "<memory uuid>",
+         "score": 0.91,                // the store's relevance_score
+         "source_store": "graphiti",
+         "category": "decisions_and_rationale",
+         "content_chars": 148}         // LENGTH only — see below
+      ]
+    }
+
+Field provenance, and why each is where it is:
+
+- ``transcript`` is archive-RELATIVE (in ``--transcript`` mode, the bare
+  file name), so the corpus stays portable across machines and checkouts.
+- ``task_id`` / ``session_id`` / ``is_subagent`` / ``subagent_id`` come from
+  the archive PATH alone. Records do carry ``isSidechain`` / ``agentId`` /
+  ``gitBranch`` hints, but those describe what the agent was doing rather
+  than where the transcript was filed, so the path stays authoritative and
+  the hints remain available as an independent cross-check.
+- ``query`` is lifted out of the tool ``input``; ``params`` is everything
+  else that was passed (``project_id``, ``limit``, …). Splitting them keeps
+  the query greppable without discarding the call's other arguments.
+- ``caller`` is *who issued the search*, recovered from the briefing's Agent
+  Identity line — **not** the ``tool_use`` block's own ``caller`` key (see
+  the warning above). Its nested ``task_id`` is the id the agent believes it
+  is running as; the TOP-LEVEL ``task_id`` is the id the archive filed it
+  under. They normally agree, and keeping both means a disagreement is
+  visible rather than averaged away.
+- ``results[].content_chars`` is a LENGTH, never the text. The corpus records
+  *what was retrieved and how well it scored*, which is what a retrieval eval
+  measures; copying result bodies would duplicate the live memory store into
+  a gitignored file that silently staled the moment a memory was edited.
+  A consumer that needs the text looks the ``id`` up in the store.
+- ``result_status`` is a closed four-value vocabulary — ``ok``, ``error``,
+  ``unparsed``, ``missing`` — recording how well the search's ANSWER was
+  recovered. Only ``ok`` is a measurement of the store; the other three are
+  gaps in this instrument. They are kept distinct from a genuine zero-hit
+  search (``ok`` with ``result_count == 0``) because all four look identical
+  to a consumer filtering on the count alone, and a decoding bug would then
+  read as a recall collapse. See :data:`_RESULT_STATUS`.
+
+Artifacts (paths named here in TEXT because the lock-charter file lint's
+extension allowlist has no ``jsonl`` entry, so they cannot be declared in
+``metadata.files``)::
+
+    fused-memory/data/memory-evals/transcript-corpus/corpus-<STAMP>.jsonl
+    fused-memory/data/memory-evals/transcript-corpus/coverage-<STAMP>.json
+    fused-memory/data/memory-evals/transcript-corpus/report-<STAMP>.txt
+
+``data/`` is gitignored, so a run never dirties a diff.
+
+Declared consumers
+------------------
+- PRD leaf η's **write-after-miss validation set** — the population of real
+  searches with real answers that it would otherwise have to synthesise.
+- **Operators**, who read ``report-<STAMP>.txt`` to see how much of the
+  archive a run actually covered and what it could not read.
+- Future **E3 / E8 runners** and the **shadow-replay harness**, which need a
+  fixed, re-runnable set of historical queries to replay against.
+
+Scope boundary (PRD §7): this leaf produces the CORPUS ONLY. No shadow-replay
+harness, no E3 golden query set, no E8 re-derivation audit, and no write or
+mutation of the live memory corpus — the script reads transcripts off disk
+and writes under ``fused-memory/data/memory-evals/``, nothing else.
+
 Failure semantics
 -----------------
 A run that extracted nothing must never be ambiguous about why, so coverage

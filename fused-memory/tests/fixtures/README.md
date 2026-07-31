@@ -418,6 +418,51 @@ Claude Code harness field, uniform across every measured call, and it is
 tested against the collision. The corpus record's `caller` field means *who
 issued the search*, recovered from the briefing text on line 2.
 
+### Record schema
+
+Unlike the two fixtures above, this fixture's own records are *transcripts*
+(shapes tabulated under "What each line exercises"). The schema worth stating
+here is the one the round-trip **produces** from them — the corpus record. The
+normative definition, field by field, lives in the extractor's module
+docstring (`fused-memory/scripts/memory_eval_transcript_corpus.py`, "Record
+schema"); this is the reader's-digest version, kept here because the
+round-trip test asserts against it.
+
+One JSON object per line, keys sorted:
+
+| field | meaning |
+|---|---|
+| `schema_version` | `SCHEMA_VERSION`, stamped per **record** (not in a header) so a consumer reading one line still knows what it holds. |
+| `transcript` | Archive-**relative** posix path (in `--transcript` mode, the bare file name), so the corpus is portable across machines. |
+| `task_id`, `session_id`, `is_subagent`, `subagent_id` | All derived from the archive **path** by `parse_archive_path` — never from record bodies. This is why the fixture must be a directory tree. |
+| `tool_use_id` | Correlates the `tool_use` call to its later `tool_result` answer. |
+| `tool_name` | The matched tool. A frozenset, widenable via `--tool-name`, because the archive spans months of tool-name history. |
+| `query` | `input.query`, lifted out so it stays greppable. |
+| `params` | Everything else that was passed (`project_id`, `limit`, …). |
+| `caller` | `{agent_id, task_id, role}` — *who issued the search*, from the briefing's Agent Identity line. **Not** the `tool_use` block's own `caller` key (see above). Its nested `task_id` is who the agent thinks it is; the top-level `task_id` is how the archive filed it — keeping both makes a disagreement visible. |
+| `result_status` | `ok` \| `error` \| `unparsed` \| `missing`. Only `ok` measures the store; the rest are gaps in the instrument, kept distinct from a genuine zero-hit search (`ok` with `result_count == 0`) so a decoding bug cannot read as a recall collapse. Line 9 of the main transcript pins `missing`. |
+| `result_count` | `len(results)`. |
+| `results[]` | `{rank, id, score, source_store, category, content_chars}`. `rank` is 1-based and positional — the order the agent **saw**. `content_chars` is a **length, never the text**: the corpus records what was retrieved and how well it scored, and copying result bodies would duplicate the live store into a gitignored file that stales the moment a memory is edited. Look the `id` up if you need text. |
+
+A run writes three artifacts (named here in text because the lock-charter file
+lint's extension allowlist has no `jsonl` entry, so they cannot be declared in
+`metadata.files`):
+
+```
+fused-memory/data/memory-evals/transcript-corpus/corpus-<STAMP>.jsonl
+fused-memory/data/memory-evals/transcript-corpus/coverage-<STAMP>.json
+fused-memory/data/memory-evals/transcript-corpus/report-<STAMP>.txt
+```
+
+`fused-memory/data/` is gitignored, so no run dirties a diff — and no artifact
+is committed. Declared consumers: PRD leaf η's **write-after-miss validation
+set**; **operators** reading `report-<STAMP>.txt` for how much of the archive a
+run covered and what it could not read; and future **E3 / E8 runners** and the
+**shadow-replay harness**, which need a fixed, re-runnable set of historical
+queries. Scope boundary (PRD §7): this leaf produces the corpus **only** — no
+shadow-replay harness, no E3 golden query set, no E8 re-derivation audit, and
+no write or mutation of the live memory corpus.
+
 ### Regenerating
 
 The `.gz` files are written with `mtime=0` so the committed bytes are
