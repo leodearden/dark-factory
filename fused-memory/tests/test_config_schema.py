@@ -1495,3 +1495,92 @@ class TestWriteTriageConfig:
         assert isinstance(annotation, type) and issubclass(annotation, WriteTriageConfig), (
             f'write_triage must be annotated as a bare submodel, got {annotation!r}'
         )
+
+
+class TestMemoryMetadataConfig:
+    """`memory_metadata` — the Mem0 metadata write-boundary section (task 3195, leaf β).
+
+    A direct sibling of ``TaskMetadataConfig``: same top-level placement, same
+    warn-by-default posture, same RED-TIER/restart-only wording on the enforce
+    flags. PRD D3 names that precedent explicitly ("census first, tiers later"),
+    so this section follows it rather than inventing a second shape.
+    """
+
+    def _cls(self):
+        from fused_memory.config.schema import MemoryMetadataConfig  # noqa: PLC0415
+
+        return MemoryMetadataConfig
+
+    def test_section_is_top_level_not_nested(self):
+        """Top-level, NOT under ``taskmaster``/``reconciliation``.
+
+        It governs a vocabulary shared beyond any one backend (the registry
+        lives in ``fused_memory.memory_metadata`` and leaf ι's prompt tests
+        import it), exactly the rationale ``TaskMetadataConfig`` records for
+        its own placement.
+        """
+        from fused_memory.config.schema import (  # noqa: PLC0415
+            MemoryMetadataConfig,
+            ReconciliationConfig,
+            TaskmasterConfig,
+        )
+
+        assert 'memory_metadata' in FusedMemoryConfig.model_fields
+        annotation = FusedMemoryConfig.model_fields['memory_metadata'].annotation
+        assert isinstance(annotation, type) and issubclass(annotation, MemoryMetadataConfig)
+        assert 'memory_metadata' not in TaskmasterConfig.model_fields
+        assert 'memory_metadata' not in ReconciliationConfig.model_fields
+
+    def test_defaults_are_warn_mode(self):
+        """Both enforce flags default OFF.
+
+        This is the census-refuted-premise safety default, not timidity: leaf
+        α measured 242 of 329 live `kind` values as singletons, so a day-one
+        strict reject would turn every newly invented kind into a hard
+        memory-write failure on the live fleet.
+        """
+        cfg = FusedMemoryConfig().memory_metadata
+        assert cfg.enforce is False
+        assert cfg.enforce_kind_registry is False
+        assert cfg.unknown_key_storm_threshold == 50
+        assert cfg.unknown_key_storm_window_seconds == 300
+
+    def test_extra_keys_are_forbidden(self):
+        """A mistyped leaf must fail LOUD at config load/reload.
+
+        With ``extra='ignore'`` an operator who typed ``enforce_kind_regsitry``
+        would get a silently-ignored key and believe enforcement was on — the
+        no-silent-fail-soft invariant applied to the config surface.
+        """
+        assert self._cls().model_config.get('extra') == 'forbid'
+        with pytest.raises(ValidationError):
+            self._cls()(enfroce=True)
+
+    @pytest.mark.parametrize('bad', [0, -1, -50])
+    def test_storm_threshold_rejects_non_positive(self, bad):
+        with pytest.raises(ValidationError):
+            self._cls()(unknown_key_storm_threshold=bad)
+
+    @pytest.mark.parametrize('bad', [0, -1, -300])
+    def test_storm_window_rejects_non_positive(self, bad):
+        with pytest.raises(ValidationError):
+            self._cls()(unknown_key_storm_window_seconds=bad)
+
+    def test_round_trips_from_a_config_dict(self):
+        cfg = FusedMemoryConfig(
+            **{'memory_metadata': {'enforce': True, 'enforce_kind_registry': True}}
+        )
+        assert cfg.memory_metadata.enforce is True
+        assert cfg.memory_metadata.enforce_kind_registry is True
+
+    @pytest.mark.parametrize('field', ['enforce', 'enforce_kind_registry'])
+    def test_enforce_flags_document_their_reload_tier(self, field):
+        """The reload tier must be discoverable where an operator will look.
+
+        An existence-and-substring check, deliberately not a prose pin: the
+        wording may be edited, but a flag that stops saying it is restart-only
+        would leave an operator expecting `reload_config` to flip it.
+        """
+        description = self._cls().model_fields[field].description or ''
+        assert description
+        assert 'restart' in description.lower()
