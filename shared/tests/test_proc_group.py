@@ -70,7 +70,16 @@ async def _spawn_sleeper_in(cwd) -> asyncio.subprocess.Process:
 
 
 def _kill_group(pgid: int) -> None:
-    """Best-effort SIGKILL of an entire process group (test cleanup)."""
+    """Best-effort SIGKILL of an entire process group (test cleanup).
+
+    Precondition: *pgid* must belong to a process known to be ALIVE
+    (not yet reaped).  os.killpg on a reaped pid can land on a
+    recycled, unrelated process group — the task 845 incident class
+    that shared.proc_group guards against with its
+    ``returncode is not None`` short-circuit.  For a child that exits
+    on its own, ``await proc.wait()`` is the correct cleanup; do not
+    reach for this helper.
+    """
     with contextlib.suppress(ProcessLookupError, OSError):
         os.killpg(pgid, signal.SIGKILL)
 
@@ -183,7 +192,8 @@ async def test_await_trap_installed_returns_once_shell_armed():
             f'readiness handshake, got returncode={proc.returncode}'
         )
     finally:
-        _kill_group(proc.pid)
+        if proc.returncode is None:
+            _kill_group(proc.pid)
         with contextlib.suppress(Exception):
             await proc.wait()
 
@@ -228,7 +238,8 @@ async def test_await_trap_installed_fails_loudly_when_readiness_never_arrives():
             await _await_trap_installed(proc, timeout=0.3)
         assert isinstance(excinfo.value, AssertionError)
     finally:
-        _kill_group(proc.pid)
+        if proc.returncode is None:
+            _kill_group(proc.pid)
         with contextlib.suppress(Exception):
             await proc.wait()
 
@@ -249,7 +260,13 @@ async def test_await_trap_installed_fails_loudly_when_readiness_never_arrives():
             await _await_trap_installed(proc2, timeout=5.0)
         assert isinstance(excinfo2.value, AssertionError)
     finally:
-        _kill_group(proc2.pid)
+        # `true` has already exited: reap it rather than killpg-ing a pid
+        # the kernel may have recycled (task 845 incident class — see the
+        # shared.proc_group module docstring and
+        # test_no_killpg_after_explicit_reap below).  Measured: at the
+        # instant readline() returns b'', returncode is still None in
+        # ~1/3 of spawns, so a `returncode is None` gate would not close
+        # this window — only not signalling does.
         with contextlib.suppress(Exception):
             await proc2.wait()
 
