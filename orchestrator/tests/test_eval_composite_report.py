@@ -1066,6 +1066,121 @@ class TestCostSourceMixedLabel:
 
 
 # ---------------------------------------------------------------------------
+# Task 3302: the PLAN-PRODUCTION predicate applied to the composite pipeline.
+#
+# run_architect_eval used to call the LLM plan judge with no scorability gate,
+# so a HEALTHY architect that produced a stepless artifact persisted the
+# self-contradictory cell `cap_tainted=False, plan_steps=0, plan_quality=0.95`.
+# The report layer admitted that cell on `plan_quality is not None` and averaged
+# the judge's number into every surface that ranks candidates.
+#
+# The rule, from plans/eval-architect-effort-verdict-2026-07-27.md's own hand
+# analysis: a no-plan cell scores 0 (`meanPQ_all`), it is FLOORED and counted —
+# never excluded the way a cap-tainted (transport-refused) cell is.
+# ---------------------------------------------------------------------------
+
+class TestNoPlanCellScoresZeroNotTheJudgesNumber:
+    """A healthy architect that emitted NO plan scores 0.0, not the judge's."""
+
+    def test_no_plan_cell_scores_zero_across_every_surface(self):
+        from orchestrator.evals.report import build_composite_report
+
+        # The exact shape the ungated LLM judge writes for a stepless artifact:
+        # healthy (not tainted), zero steps, a confident 0.95.
+        results = [
+            _arch('p1', 'arch-noplan', tr, plan_steps=0, plan_quality=0.95,
+                  cost_usd=0.3, duration_ms=60000)
+            for tr in (1, 2, 3)
+        ]
+        row = build_composite_report(results)['configs'][0]
+
+        # meanPQ_all: the cell produced nothing, so it is worth 0 — never 0.95.
+        assert row['plan_quality'] == pytest.approx(0.0, abs=1e-9)
+        assert row['quality'] == pytest.approx(0.0, abs=1e-9)
+        # Sole config on the fixture → both efficiency axes 1.0.
+        # 0.6*0.0 + 0.2 + 0.2 == 0.4.
+        assert row['composite'] == pytest.approx(0.4, abs=1e-4)
+
+    def test_no_plan_cell_is_floored_not_excluded(self):
+        """A cap-tainted cell is EXCLUDED (we never asked the model); a no-plan
+        cell is a genuine CONTENT measurement worth 0.0 and stays in every pool,
+        including the cost and latency it really did burn."""
+        from orchestrator.evals.report import build_composite_report
+
+        results = [
+            _arch('p1', 'arch-noplan', tr, plan_steps=0, plan_quality=0.95,
+                  cost_usd=0.3, duration_ms=60000)
+            for tr in (1, 2, 3)
+        ]
+        row = build_composite_report(results)['configs'][0]
+
+        assert row['trials'] == 3
+        assert row['plan_quality_cap_excluded'] == 0
+        assert row['cost_usd'] == pytest.approx(0.3)
+        assert row['latency_secs'] == pytest.approx(60.0)
+        assert row['composite'] is not None
+
+    def test_both_surfaces_agree_bit_identically(self):
+        """The composite row and the θ table are ONE reduction, so the floor
+        must be applied where they share it — not on one side only."""
+        from orchestrator.evals.report import (
+            build_composite_report,
+            build_plan_quality_report,
+        )
+
+        results = [
+            _arch('p1', 'arch-noplan', tr, plan_steps=0, plan_quality=0.95,
+                  cost_usd=0.3, duration_ms=60000)
+            for tr in (1, 2, 3)
+        ]
+        row = build_composite_report(results)['configs'][0]
+        theta = build_plan_quality_report(results)['configs'][0]
+
+        assert row['plan_quality'] == theta['mean_plan_quality']
+        assert theta['mean_plan_quality'] == pytest.approx(0.0, abs=1e-9)
+        # The floored cells were SCORED (as zeros), not excluded, so they count
+        # toward the n the mean was taken over.
+        assert theta['n'] == 3
+        assert theta['cap_excluded'] == 0
+        assert theta['total'] == 3
+
+    def test_mixed_pool_averages_the_floor_in(self):
+        """One no-plan trial among two real ones: (0.0 + 0.6 + 0.6) / 3."""
+        from orchestrator.evals.report import (
+            build_composite_report,
+            build_plan_quality_report,
+        )
+
+        results = [
+            _arch('p1', 'arch-mixed', 1, plan_steps=0, plan_quality=0.9,
+                  cost_usd=0.3, duration_ms=60000),
+            _arch('p1', 'arch-mixed', 2, plan_steps=6, plan_quality=0.6,
+                  cost_usd=0.3, duration_ms=60000),
+            _arch('p1', 'arch-mixed', 3, plan_steps=6, plan_quality=0.6,
+                  cost_usd=0.3, duration_ms=60000),
+        ]
+        row = build_composite_report(results)['configs'][0]
+        theta = build_plan_quality_report(results)['configs'][0]
+
+        assert row['plan_quality'] == pytest.approx(0.4, abs=1e-9)
+        assert theta['mean_plan_quality'] == pytest.approx(0.4, abs=1e-9)
+        assert row['plan_quality'] == theta['mean_plan_quality']
+
+    def test_a_real_plan_still_reports_its_judged_score(self):
+        """The control: the floor fires ONLY on a stepless artifact."""
+        from orchestrator.evals.report import build_composite_report
+
+        results = [
+            _arch('p1', 'arch-real', tr, plan_steps=6, plan_quality=0.95,
+                  cost_usd=0.3, duration_ms=60000)
+            for tr in (1, 2, 3)
+        ]
+        row = build_composite_report(results)['configs'][0]
+        assert row['plan_quality'] == pytest.approx(0.95, abs=1e-9)
+        assert row['quality'] == pytest.approx(0.95, abs=1e-9)
+
+
+# ---------------------------------------------------------------------------
 # Task 2477 step-11: format_composite_table — deterministic renderer of the
 # C4 composite report (per-config table + a distinct price-table section).
 # ---------------------------------------------------------------------------
