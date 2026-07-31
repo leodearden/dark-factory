@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 from unittest.mock import patch
 
@@ -208,9 +209,7 @@ class TestSaveAccountEvent:
                     details=None,
                     created_at='2024-01-01T00:00:00',
                 )
-            async with _conn(store).execute(
-                'SELECT COUNT(*) FROM account_events'
-            ) as cur:
+            async with _conn(store).execute('SELECT COUNT(*) FROM account_events') as cur:
                 row = await cur.fetchone()
         assert row is not None
         (count,) = row
@@ -451,7 +450,10 @@ class TestCostStoreOpenClose:
             conn.executescript = failing_executescript  # type: ignore[method-assign,assignment]
             return conn
 
-        with patch('shared.async_sqlite_base.aiosqlite.connect', side_effect=fake_connect), pytest.raises(RuntimeError, match='schema failure'):
+        with (
+            patch('shared.async_sqlite_base.aiosqlite.connect', side_effect=fake_connect),
+            pytest.raises(RuntimeError, match='schema failure'),
+        ):
             await store.open()
 
         assert store._conn is None, '_conn should remain None on setup failure'
@@ -700,7 +702,9 @@ class TestCostTotalsInWindow:
         """One watcher row inside window → (cost, cost)."""
         async with CostStore(tmp_path / 'costs.db') as store:
             await _seed_row(
-                store, role='watcher', cost_usd=3.5,
+                store,
+                role='watcher',
+                cost_usd=3.5,
                 completed_at='2026-06-01T12:00:00',
             )
             result = await store.cost_totals_in_window(
@@ -709,13 +713,13 @@ class TestCostTotalsInWindow:
             )
         assert result == (pytest.approx(3.5), pytest.approx(3.5))
 
-    async def test_single_non_watcher_row_returns_zero_watcher(
-        self, tmp_path: Path
-    ) -> None:
+    async def test_single_non_watcher_row_returns_zero_watcher(self, tmp_path: Path) -> None:
         """One non-watcher row inside window → (cost, 0.0)."""
         async with CostStore(tmp_path / 'costs.db') as store:
             await _seed_row(
-                store, role='orchestrator', cost_usd=2.0,
+                store,
+                role='orchestrator',
+                cost_usd=2.0,
                 completed_at='2026-06-01T12:00:00',
             )
             result = await store.cost_totals_in_window(
@@ -728,11 +732,15 @@ class TestCostTotalsInWindow:
         """Mixed watcher + non-watcher → (sum_all, sum_watcher)."""
         async with CostStore(tmp_path / 'costs.db') as store:
             await _seed_row(
-                store, role='watcher', cost_usd=4.0,
+                store,
+                role='watcher',
+                cost_usd=4.0,
                 completed_at='2026-06-01T10:00:00',
             )
             await _seed_row(
-                store, role='orchestrator', cost_usd=1.5,
+                store,
+                role='orchestrator',
+                cost_usd=1.5,
                 completed_at='2026-06-01T11:00:00',
             )
             result = await store.cost_totals_in_window(
@@ -748,17 +756,23 @@ class TestCostTotalsInWindow:
         async with CostStore(tmp_path / 'costs.db') as store:
             # Before window
             await _seed_row(
-                store, role='watcher', cost_usd=99.0,
+                store,
+                role='watcher',
+                cost_usd=99.0,
                 completed_at='2026-05-31T23:59:59',
             )
             # After window
             await _seed_row(
-                store, role='watcher', cost_usd=99.0,
+                store,
+                role='watcher',
+                cost_usd=99.0,
                 completed_at='2026-06-02T00:00:00',
             )
             # Inside window
             await _seed_row(
-                store, role='watcher', cost_usd=1.0,
+                store,
+                role='watcher',
+                cost_usd=1.0,
                 completed_at='2026-06-01T12:00:00',
             )
             result = await store.cost_totals_in_window(
@@ -773,7 +787,9 @@ class TestCostTotalsInWindow:
         async with CostStore(tmp_path / 'costs.db') as store:
             for role in ('escalation-watcher-auto', 'watcher-supervisor', 'my-watcher'):
                 await _seed_row(
-                    store, role=role, cost_usd=1.0,
+                    store,
+                    role=role,
+                    cost_usd=1.0,
                     completed_at='2026-06-01T12:00:00',
                 )
             result = await store.cost_totals_in_window(
@@ -808,20 +824,32 @@ class TestModelCostInWindow:
         'opus' row -> only the two in-window 'opus' rows are summed."""
         async with CostStore(tmp_path / 'costs.db') as store:
             await _seed_row(
-                store, role='implementer', cost_usd=2.0,
-                completed_at='2026-06-01T10:00:00', model='opus',
+                store,
+                role='implementer',
+                cost_usd=2.0,
+                completed_at='2026-06-01T10:00:00',
+                model='opus',
             )
             await _seed_row(
-                store, role='debugger', cost_usd=3.0,
-                completed_at='2026-06-01T11:00:00', model='opus',
+                store,
+                role='debugger',
+                cost_usd=3.0,
+                completed_at='2026-06-01T11:00:00',
+                model='opus',
             )
             await _seed_row(
-                store, role='implementer', cost_usd=5.0,
-                completed_at='2026-06-01T12:00:00', model='sonnet',
+                store,
+                role='implementer',
+                cost_usd=5.0,
+                completed_at='2026-06-01T12:00:00',
+                model='sonnet',
             )
             await _seed_row(
-                store, role='implementer', cost_usd=99.0,
-                completed_at='2026-05-31T23:59:59', model='opus',
+                store,
+                role='implementer',
+                cost_usd=99.0,
+                completed_at='2026-05-31T23:59:59',
+                model='opus',
             )
             result = await store.model_cost_in_window(
                 'opus',
@@ -834,8 +862,11 @@ class TestModelCostInWindow:
         """A model with no matching rows in the window -> 0.0."""
         async with CostStore(tmp_path / 'costs.db') as store:
             await _seed_row(
-                store, role='implementer', cost_usd=2.0,
-                completed_at='2026-06-01T10:00:00', model='sonnet',
+                store,
+                role='implementer',
+                cost_usd=2.0,
+                completed_at='2026-06-01T10:00:00',
+                model='sonnet',
             )
             result = await store.model_cost_in_window(
                 'opus',
@@ -1061,3 +1092,161 @@ class TestAccountEventsInWindow:
                 '2026-07-31T00:00:00+00:00',
                 '2026-07-31T23:59:59+00:00',
             )
+
+
+# ---------------------------------------------------------------------------
+# amend: sub-second window bounds, account_events indexes, event-type constant
+# ---------------------------------------------------------------------------
+
+
+class TestSubSecondWindowBounds:
+    """amend: a whole-second upper bound must not drop rows inside that second.
+
+    `BETWEEN` compares ISO-8601 STRINGS and `datetime.isoformat()` emits
+    microseconds only when non-zero, so '...T23:59:59.500000+00:00' sorts
+    AFTER a bound of '...T23:59:59+00:00' ('.' 0x2E > '+' 0x2B).  On the
+    forensics read path the dropped row is exactly the 5xx the operator went
+    looking for, so the bound is widened — see `_inclusive_end_bound`.
+    """
+
+    async def test_sub_second_row_is_included_by_a_whole_second_end_bound(
+        self, tmp_path: Path
+    ) -> None:
+        async with CostStore(tmp_path / 'costs.db') as store:
+            await _seed_event(
+                store, event_type='api_error', created_at='2026-07-31T23:59:59.500000+00:00'
+            )
+            rows = await store.account_events_in_window(
+                '2026-07-31T00:00:00+00:00',
+                '2026-07-31T23:59:59+00:00',
+            )
+        assert [r['created_at'] for r in rows] == ['2026-07-31T23:59:59.500000+00:00']
+
+    async def test_sub_second_row_after_the_bound_second_is_still_excluded(
+        self, tmp_path: Path
+    ) -> None:
+        """Widening covers the bound's own second only — it must not run over into the next."""
+        async with CostStore(tmp_path / 'costs.db') as store:
+            await _seed_event(
+                store, event_type='api_error', created_at='2026-07-31T23:59:59.999999+00:00'
+            )
+            await _seed_event(
+                store, event_type='api_error', created_at='2026-08-01T00:00:00.000001+00:00'
+            )
+            rows = await store.account_events_in_window(
+                '2026-07-31T00:00:00+00:00',
+                '2026-07-31T23:59:59+00:00',
+            )
+        assert [r['created_at'] for r in rows] == ['2026-07-31T23:59:59.999999+00:00']
+
+    async def test_explicit_micro_bound_is_honoured_exactly(self, tmp_path: Path) -> None:
+        """A bound that already carries microseconds is exact — the caller meant it."""
+        async with CostStore(tmp_path / 'costs.db') as store:
+            await _seed_event(
+                store, event_type='api_error', created_at='2026-07-31T12:00:00.100000+00:00'
+            )
+            await _seed_event(
+                store, event_type='api_error', created_at='2026-07-31T12:00:00.900000+00:00'
+            )
+            rows = await store.account_events_in_window(
+                '2026-07-31T00:00:00+00:00',
+                '2026-07-31T12:00:00.500000+00:00',
+            )
+        assert [r['created_at'] for r in rows] == ['2026-07-31T12:00:00.100000+00:00']
+
+    async def test_sub_second_row_survives_the_event_type_filter_too(self, tmp_path: Path) -> None:
+        """Normalisation happens before the filter is appended, not only on the bare path."""
+        async with CostStore(tmp_path / 'costs.db') as store:
+            await _seed_event(
+                store, event_type='api_error', created_at='2026-07-31T23:59:59.500000+00:00'
+            )
+            rows = await store.account_events_in_window(
+                '2026-07-31T00:00:00+00:00',
+                '2026-07-31T23:59:59+00:00',
+                event_type='api_error',
+            )
+        assert len(rows) == 1
+
+    def test_unparseable_end_bound_passes_through_and_warns(self, caplog) -> None:
+        """A malformed bound must neither crash the read nor vanish silently."""
+        from shared.cost_store import _inclusive_end_bound
+
+        with caplog.at_level(logging.WARNING, logger='shared.cost_store'):
+            assert _inclusive_end_bound('not-a-timestamp') == 'not-a-timestamp'
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING], (
+            'the unnormalisable bound was swallowed silently'
+        )
+
+    @pytest.mark.parametrize(
+        'bound',
+        [
+            '2026-07-31',  # date-only: does not compare against isoformat() rows at all
+            '2026-07-31T23:59:59Z',  # 'Z' spelling: ditto
+            '2026-07-31T23:59:59.500000+00:00',  # already exact
+        ],
+    )
+    def test_non_canonical_or_exact_bounds_are_left_alone(self, bound: str) -> None:
+        """Only a canonical fraction-less timestamp is widened; nothing else is reinterpreted."""
+        from shared.cost_store import _inclusive_end_bound
+
+        assert _inclusive_end_bound(bound) == bound
+
+
+class TestAccountEventsIndexes:
+    """amend: both window-read shapes must be index-backed, not full scans."""
+
+    async def test_both_created_at_indexes_exist(self, tmp_path: Path) -> None:
+        """The composite index cannot serve the type-less read (leading-column rule)."""
+        async with (
+            CostStore(tmp_path / 'costs.db') as store,
+            _conn(store).execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='account_events'"
+            ) as cur,
+        ):
+            names = {row[0] for row in await cur.fetchall()}
+        assert 'idx_acct_evt_type_created' in names
+        assert 'idx_acct_evt_created' in names
+
+    async def test_type_less_window_read_uses_the_created_at_index(self, tmp_path: Path) -> None:
+        """EXPLAIN QUERY PLAN, so a dropped index shows up here and not as a prod full scan."""
+        async with (
+            CostStore(tmp_path / 'costs.db') as store,
+            _conn(store).execute(
+                'EXPLAIN QUERY PLAN SELECT account_name FROM account_events '
+                'WHERE created_at BETWEEN ? AND ? ORDER BY created_at ASC',
+                ('2026-07-31T00:00:00+00:00', '2026-07-31T23:59:59+00:00'),
+            ) as cur,
+        ):
+            plan = ' '.join(str(row[-1]) for row in await cur.fetchall())
+        assert 'idx_acct_evt_created' in plan, plan
+        assert 'SCAN account_events' not in plan, plan
+
+
+class TestApiErrorEventTypeConstant:
+    """amend: the 'api_error' discriminator is single-sourced as a module constant."""
+
+    def test_constant_value(self) -> None:
+        from shared.cost_store import API_ERROR_EVENT_TYPE
+
+        assert API_ERROR_EVENT_TYPE == 'api_error'
+
+    def test_constant_is_not_in_public_all(self) -> None:
+        """test_public_api.py pins cost_store.__all__ to exactly {'CostStore'}."""
+        from shared import cost_store
+
+        assert set(cost_store.__all__) == {'CostStore'}
+
+    async def test_wrapper_writes_the_constant(self, tmp_path: Path) -> None:
+        from shared.cost_store import API_ERROR_EVENT_TYPE
+
+        async with CostStore(tmp_path / 'costs.db') as store:
+            await store.save_api_error_event(
+                account_name='max-d',
+                project_id='dark_factory',
+                run_id='run-1',
+                details=None,
+                created_at='2026-07-31T12:00:00+00:00',
+            )
+            async with _conn(store).execute('SELECT event_type FROM account_events') as cur:
+                rows = await cur.fetchall()
+        assert [r[0] for r in rows] == [API_ERROR_EVENT_TYPE]

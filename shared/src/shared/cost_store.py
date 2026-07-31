@@ -9,12 +9,25 @@ Uses a persistent connection opened via open()/close() or the async context mana
 
 from __future__ import annotations
 
+import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from shared.async_sqlite_base import AsyncSqliteBase
 
 __all__ = ['CostStore']
+
+logger = logging.getLogger(__name__)
+
+# The `account_events.event_type` discriminator for server-side 5xx forensics
+# (plans/server-side-api-error-handling-prd.md C4).  Single-sourced here so a
+# writer, a reader and an operator's grep all agree on one spelling; importable
+# by out-of-package readers (the dashboard strip) that build their own SQL.
+# Deliberately NOT in __all__: shared/tests/test_public_api.py pins
+# cost_store.__all__ to exactly {'CostStore'}, and this is a module-level
+# constant, not part of the shared package's re-exported surface.
+API_ERROR_EVENT_TYPE = 'api_error'
 
 # Schema without PRAGMA — pragmas are set once on the persistent connection.
 _SCHEMA = """\
@@ -64,7 +77,59 @@ CREATE INDEX IF NOT EXISTS idx_acct_evt_account
 
 CREATE INDEX IF NOT EXISTS idx_acct_evt_type_created
     ON account_events(event_type, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_acct_evt_created
+    ON account_events(created_at);
 """
+# Two account_events indexes on purpose.  The composite one serves the
+# type-scoped window read (`event_type='api_error'`), but SQLite's
+# leading-column rule makes it unusable when event_type is omitted — and the
+# type-less branch of account_events_in_window is the shared reader for the
+# pre-existing cap_hit/switch/resume rows.  Without a bare created_at index
+# that branch degrades to a full scan of an append-only table that grows for
+# the life of the deployment.
+
+
+def _inclusive_end_bound(end_iso: str) -> str:
+    """Widen a whole-second upper bound so it covers that entire second.
+
+    ``created_at`` is compared as a STRING — SQLite ``BETWEEN`` over ISO-8601
+    text — and ``datetime.isoformat()`` emits microseconds only when they are
+    non-zero.  So a row stored at ``2026-07-31T23:59:59.500000+00:00`` sorts
+    AFTER a bound of ``2026-07-31T23:59:59+00:00``: past the shared prefix,
+    ``'.'`` (0x2E) beats ``'+'`` (0x2B).  A caller who floors their upper
+    bound to the second therefore loses every sub-second row inside it, and on
+    the forensics read path a dropped row is exactly the 5xx an operator went
+    looking for.
+
+    Widening a fraction-less bound to ``.999999`` makes "inclusive at both
+    ends" true at the granularity the bound is actually spelled at.  A bound
+    that already carries microseconds is returned untouched — it is exact and
+    the caller meant it.
+
+    The widen is applied only when ``end_iso`` round-trips through
+    ``datetime.isoformat()`` unchanged, i.e. it is a canonical, fraction-less
+    timestamp.  A date-only (``2026-07-31``) or ``Z``-suffixed bound is left
+    alone rather than silently reinterpreted: those spellings do not compare
+    correctly against stored ``isoformat()`` values in the first place, and
+    inventing a different window would hide that from the caller.
+
+    An unparseable bound is passed through verbatim AND logged at WARNING: a
+    read path must not refuse the query over a bound it cannot normalise, but
+    the caller's malformed input must not vanish silently either.
+    """
+    try:
+        parsed = datetime.fromisoformat(end_iso)
+    except ValueError:
+        logger.warning(
+            'account_events_in_window: upper bound %r is not ISO-8601 — using it verbatim; '
+            'sub-second rows in the final second may be excluded',
+            end_iso,
+        )
+        return end_iso
+    if parsed.microsecond or parsed.isoformat() != end_iso:
+        return end_iso
+    return parsed.replace(microsecond=999999).isoformat()
 
 
 class CostStore(AsyncSqliteBase):
@@ -166,6 +231,15 @@ class CostStore(AsyncSqliteBase):
         — any invocations whose ``completed_at`` is written after that snapshot
         are silently excluded, which is acceptable for a fail-open cost guard.
 
+        Sub-second caveat: ``BETWEEN`` compares ISO-8601 STRINGS, so a
+        fraction-less ``end_iso`` (``...T23:59:59+00:00``) excludes rows
+        stamped inside that second (``...T23:59:59.5+00:00``) — ``'.'`` sorts
+        after ``'+'``.  Bounds taken from ``datetime.now(UTC).isoformat()``
+        carry microseconds and are unaffected; floor-to-the-second bounds are
+        not.  This method deliberately does NOT normalise (unlike
+        :meth:`account_events_in_window`): it feeds the cost guard, whose
+        behaviour under load is not worth perturbing for a sub-second edge.
+
         Returns:
             (total_usd, watcher_usd): total cost across all roles, and the
             subset matching ``role LIKE '%watcher%'``.  Both values are 0.0
@@ -198,7 +272,8 @@ class CostStore(AsyncSqliteBase):
 
         Uses a single SELECT so the invocations table is scanned exactly once.
         The window is **inclusive** at both ends (SQLite ``BETWEEN``), matching
-        :meth:`cost_totals_in_window`.
+        :meth:`cost_totals_in_window` — including its sub-second caveat: a
+        fraction-less ``end_iso`` excludes rows stamped inside that second.
 
         Returns:
             Total cost for ``model`` in the window; 0.0 when no rows match.
@@ -227,17 +302,32 @@ class CostStore(AsyncSqliteBase):
     ) -> list[dict[str, Any]]:
         """Return account_events created in ``[start_iso, end_iso]``, oldest first.
 
-        The read path for ``api_error`` forensics
-        (``plans/server-side-api-error-handling-prd.md`` C4): the dashboard
-        provider-health strip reconstructs an outage from this row stream, so
-        ordering is by ``created_at`` ascending rather than insertion order.
+        The CostStore read path for ``api_error`` forensics
+        (``plans/server-side-api-error-handling-prd.md`` C4): an outage is
+        reconstructed from this row stream, so ordering is by ``created_at``
+        ascending rather than insertion order.
+
+        Note on consumers, so nobody reads a claim this layer cannot make:
+        today's only callers are this package's tests and any future
+        CostStore-holding reader.  The dashboard reads ``account_events``
+        through its own aiosqlite connections and raw SQL
+        (``dashboard/data/costs.py``, ``dashboard/data/cap_history.py``) and
+        has NOT been repointed here — consolidating those onto this method is
+        out of this task's lock scope and filed as follow-up work.
 
         The window is **inclusive** at both ends (SQLite ``BETWEEN``), matching
-        :meth:`cost_totals_in_window` and :meth:`model_cost_in_window`.
+        :meth:`cost_totals_in_window` and :meth:`model_cost_in_window`.  Unlike
+        those two, the upper bound is normalised by :func:`_inclusive_end_bound`
+        first, so a whole-second ``end_iso`` also covers the sub-second rows
+        inside that second — see that function for why string comparison
+        otherwise drops them.
 
         Args:
-            start_iso: Inclusive lower bound on ``created_at``.
-            end_iso: Inclusive upper bound on ``created_at``.
+            start_iso: Inclusive lower bound on ``created_at``.  NOT normalised:
+                a fraction-less lower bound already sorts before every
+                sub-second row in its second, so it is inclusive as spelled.
+            end_iso: Inclusive upper bound on ``created_at``, widened to the end
+                of its second when it carries no fractional part.
             event_type: When given, restrict to that one type (e.g.
                 ``'api_error'``).  When None, every type in the window is
                 returned — the pre-existing ``cap_hit``/``switch``/``resume``
@@ -261,7 +351,7 @@ class CostStore(AsyncSqliteBase):
             'FROM account_events '
             'WHERE created_at BETWEEN ? AND ?'
         )
-        params: tuple[Any, ...] = (start_iso, end_iso)
+        params: tuple[Any, ...] = (start_iso, _inclusive_end_bound(end_iso))
         if event_type is not None:
             sql += ' AND event_type = ?'
             params += (event_type,)
@@ -316,17 +406,25 @@ class CostStore(AsyncSqliteBase):
         ``ApiHealthGate`` emits one row per ServerError report so a trip is
         reconstructable from the row stream alone.
 
-        The literal ``'api_error'`` event_type lives HERE and nowhere else —
-        it is the discriminator the gate writes, the dashboard provider-health
-        strip queries, and operators grep for.  Callers pass no ``event_type``
-        so a typo cannot fork the row stream into two silently-disjoint types.
+        The event_type is the module-level :data:`API_ERROR_EVENT_TYPE`
+        constant — the single source for the discriminator the gate writes,
+        the dashboard provider-health strip queries, and operators grep for.
+        The constant (not this wrapper) is what out-of-package readers building
+        their own SQL should import; the wrapper additionally spares gate-side
+        callers from passing ``event_type`` at all, so a typo cannot fork the
+        row stream into two silently-disjoint types.
+
+        The sibling types (``cap_hit``/``switch``/``resume``) are still written
+        as inline literals by ``UsageGate._write_cost_event``; giving them the
+        same treatment means editing ``orchestrator/`` and is out of this
+        task's lock scope.
 
         ``details`` is a JSON blob (HTTP status, task_id, role, post-report
         state and window stats); it is opaque to this layer.
         """
         await self.save_account_event(
             account_name=account_name,
-            event_type='api_error',
+            event_type=API_ERROR_EVENT_TYPE,
             project_id=project_id,
             run_id=run_id,
             details=details,
