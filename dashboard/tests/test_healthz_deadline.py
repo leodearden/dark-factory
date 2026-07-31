@@ -43,6 +43,7 @@ from fastapi.responses import JSONResponse
 
 from dashboard.app import healthz
 from dashboard.config import DashboardConfig
+from dashboard.data.db import DbPool
 
 # ---------------------------------------------------------------------------
 # Shared harness
@@ -210,3 +211,37 @@ def _make_real_dbs(config: DashboardConfig) -> None:
 
 def _body(resp: JSONResponse) -> dict:
     return json.loads(bytes(resp.body))
+
+
+# ---------------------------------------------------------------------------
+# pre-2: happy-path characterization (must stay green through every step below)
+# ---------------------------------------------------------------------------
+
+
+async def test_healthz_reports_healthy_when_all_dbs_respond(dashboard_config):
+    """Baseline characterization: all three DBs responsive -> 200 healthy.
+
+    Pins the response contract the deadline refactor must not break: the
+    per-DB ``checks`` keys, the ``threads``/``connections``/``uptime_seconds``
+    shape, and the 200/``healthy`` mapping. Not a RED — this must stay green
+    through every impl step in this plan.
+    """
+    config = dashboard_config
+    _make_real_dbs(config)
+    pool = DbPool()
+    request = _make_healthz_request(config, pool)
+
+    resp, _elapsed = await _call_healthz(request, hard_cap=8.0)
+    body = _body(resp)
+
+    assert resp.status_code == 200
+    assert body['status'] == 'healthy'
+    checks = body['checks']
+    assert checks['db_reconciliation'] == 'ok'
+    assert checks['db_write_journal'] == 'ok'
+    assert checks['db_runs'] == 'ok'
+    assert set(checks['threads']) == {'count', 'limit', 'ok'}
+    assert 'open' in checks['connections']
+    assert 'uptime_seconds' in checks
+
+    await pool.close_all()
