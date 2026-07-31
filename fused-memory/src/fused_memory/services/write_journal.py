@@ -37,7 +37,7 @@ CREATE INDEX IF NOT EXISTS idx_wo_operation ON write_ops(operation);
 -- idx_wo_created (task 3304): the dashboard filters a BARE `WHERE created_at >= ?`
 -- (dashboard/src/dashboard/data/write_journal.py lines 52-58, 88-91, 116-120).
 -- Every other write_ops index has created_at in SECOND position, so none of them
--- can range-seek that predicate — the queries full-scanned 16.4M rows.
+-- can range-seek that predicate — the queries full-scanned all 16.6M rows.
 -- Lives here rather than in _migrate() because initialize() runs
 -- executescript(SCHEMA_SQL) unconditionally on every start and the DDL is
 -- IF NOT EXISTS: this block alone builds the index once on an existing DB and is
