@@ -52,6 +52,7 @@ from audit_wiped_metadata_files import (
     AuditCoverage,
     WipeCandidate,
     _coerce_file_list,
+    _format_coverage,
     audit_project,
 )
 
@@ -228,6 +229,30 @@ SKIP_NOT_TERMINAL = "skip_not_terminal"          # live task is not done/cancell
 SKIP_FILES_PRESENT = "skip_files_present"        # already has a scope; re-run safe
 SKIP_MISSING = "skip_missing"                    # live re-read returned nothing usable
 FAILED = "failed"                                # the write was attempted and errored
+
+# Report order, and the exhaustive list the summary iterates. Printed in full
+# on EVERY run, zero counts included.
+ALL_DISPOSITIONS = (
+    REPAIR,
+    SKIP_CONTRADICTED,
+    SKIP_LOCK_LEVEL_FIDELITY,
+    SKIP_LOCK_CHARTER,
+    SKIP_NOT_TERMINAL,
+    SKIP_FILES_PRESENT,
+    SKIP_MISSING,
+    FAILED,
+)
+
+# Dispositions whose entries are listed INDIVIDUALLY, with id and reason. An
+# aggregate "2 failed" tells an operator nothing they can act on.
+_ITEMISED_DISPOSITIONS = (
+    FAILED,
+    SKIP_LOCK_CHARTER,
+    SKIP_CONTRADICTED,
+    SKIP_LOCK_LEVEL_FIDELITY,
+    SKIP_NOT_TERMINAL,
+    SKIP_MISSING,
+)
 
 # Statuses this repair may write to. An ALLOWLIST, deliberately, not a
 # "not in {pending, in-progress, ...}" denylist: a status the system grows
@@ -552,3 +577,123 @@ def _unwrap_task(payload: Any) -> Any:
     if isinstance(payload, dict) and isinstance(payload.get("task"), dict):
         return payload["task"]
     return payload
+
+
+# ---------------------------------------------------------------------------
+# Reporting — the honesty artifact.
+# ---------------------------------------------------------------------------
+
+# Printed on EVERY run, including one that repaired nothing. The candidate list
+# is an observable subset; the unobservable remainder is not "clean", it is
+# UNKNOWN. Omitting this on a quiet run is precisely the no-silent-fail-soft
+# violation named in docs/legibility/design-invariants.md, and it is what would
+# let this repair be reported as "fixed the blast radius" when it fixed only
+# the part that could be seen.
+_OBSERVABLE_SUBSET_CAVEAT = (
+    "  SCOPE OF THIS RUN: the candidates above are an OBSERVABLE SUBSET, not "
+    "the full",
+    "  damaged population. Tasks with no recoverable plan scope are UNKNOWN — "
+    "neither",
+    "  clean nor damaged — and are NOT repaired here. Do not report this run as "
+    '"fixed',
+    '  the blast radius"; it fixed the observable part of it.',
+)
+
+_DRY_RUN_BANNER = (
+    "  DRY RUN — NO WRITE WAS ATTEMPTED. Candidates listed under "
+    f"'{REPAIR}' are what",
+    "  an --apply run would write; their live status is re-read and re-judged "
+    "at that",
+    "  point, so this list is a selection, not a promise.",
+)
+
+
+def _counts(result: "RepairResult") -> dict[str, int]:
+    """Count EVERY disposition, seeding the zero ones explicitly."""
+    counts = dict.fromkeys(ALL_DISPOSITIONS, 0)
+    for outcome in result.outcomes:
+        counts[outcome.disposition] = counts.get(outcome.disposition, 0) + 1
+    return counts
+
+
+def format_summary(result: "RepairResult") -> str:
+    """Render one project's repair run as a human-readable summary.
+
+    Three properties this owes its reader, each of them tested:
+
+    * Every disposition bucket is printed WITH ITS COUNT, zeros included. A
+      bucket that is merely absent reads as "did not happen" when it may mean
+      "was never evaluated".
+    * Every failure and every skip that an operator could act on is listed
+      INDIVIDUALLY, with its task id and its reason.
+    * The audit's coverage block and the observable-subset caveat are printed
+      unconditionally, including on a run that repaired nothing.
+    """
+    counts = _counts(result)
+    mode = "APPLY" if result.applied else "DRY RUN"
+    lines = [f"{result.project_root}: [{mode}]"]
+
+    if not result.applied:
+        lines.extend(_DRY_RUN_BANNER)
+
+    lines.append("  -- dispositions --")
+    for disposition in ALL_DISPOSITIONS:
+        lines.append(f"    {disposition:<26} {counts[disposition]}")
+
+    for disposition in _ITEMISED_DISPOSITIONS:
+        entries = [o for o in result.outcomes if o.disposition == disposition]
+        if not entries:
+            continue
+        lines.append(f"  -- {disposition} ({len(entries)}) --")
+        for outcome in entries:
+            lines.append(
+                f"    task_id={outcome.task_id} tag={outcome.tag}: "
+                f"{outcome.detail or 'no detail recorded'}"
+            )
+
+    repaired = [o for o in result.outcomes if o.disposition == REPAIR]
+    if repaired:
+        verb = "repaired" if result.applied else "would repair"
+        lines.append(f"  -- {verb} ({len(repaired)}) --")
+        for outcome in repaired:
+            lines.append(
+                f"    task_id={outcome.task_id} tag={outcome.tag} "
+                f"files={len(outcome.files)}"
+            )
+
+    # Reuse the audit's own coverage phrasing rather than paraphrasing it —
+    # one wording for one claim, so the two reports can never drift into
+    # describing the same counts differently.
+    lines.extend(_format_coverage(result.coverage))
+    lines.extend(_OBSERVABLE_SUBSET_CAVEAT)
+    return "\n".join(lines)
+
+
+def format_json_summary(results: list["RepairResult"]) -> str:
+    """Render *results* as a JSON OBJECT carrying dispositions AND coverage.
+
+    An object rather than a bare array, mirroring
+    ``audit_wiped_metadata_files.format_json``: the coverage counts must travel
+    with the outcomes, or a consumer that received only a list of repairs could
+    not tell a clean project from an unobservable one.
+    """
+    return json.dumps(
+        {
+            "projects": [
+                {
+                    "project_root": result.project_root,
+                    "applied": result.applied,
+                    "coverage": result.coverage._asdict(),
+                    "counts": _counts(result),
+                    "outcomes": [
+                        {**o._asdict(), "files": list(o.files)}
+                        for o in result.outcomes
+                    ],
+                    "observable_subset_caveat": " ".join(
+                        line.strip() for line in _OBSERVABLE_SUBSET_CAVEAT
+                    ),
+                }
+                for result in results
+            ]
+        }
+    )
