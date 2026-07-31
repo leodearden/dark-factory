@@ -151,29 +151,25 @@ what the writer emits.
 
 ### The null convention — one rule, both artifacts
 
-Both writers — `serialize_metric_series` (M1) and `write_limits_artifact` (M2)
-— emit the same canonical serialization: `json.dumps(..., indent=2,
-sort_keys=True, ensure_ascii=False)` plus a trailing newline, and:
+**Stated in one place: the `shared.memory_eval_metrics` module docstring.**
+Read it there. Restating it here would make the convention that exists to stop
+two artifacts drifting apart into three copies of prose that can themselves
+drift — so this section only says what it means *for these fixtures*:
 
-> omit a `None`-valued **optional** field;
-> always emit a **required** field, even when its value is null.
+- Both writers render through `shared.memory_eval_metrics.canonical_json_text`
+  (`indent=2, sort_keys=True, ensure_ascii=False` + trailing newline), so any
+  exemplar you author or regenerate must be in exactly that form.
+- A field that does not apply is **absent**, not `null` — e.g. `item_key` on a
+  whole-metric alarm, `denominator` on a non-proportion metric. Read them with
+  `.get`, never `[...]`.
+- The one field that *is* emitted as an explicit `null` is
+  `limits-current.json`'s top-level `alpha`, on a run with nothing
+  alarm-eligible. That is the convention's always-emit half, not an exception
+  to it.
 
-The two files land under one artifact root and are read by the same
-dashboard-shaped reader, so one idiom must read an unused field in either:
-absence means "does not apply here" (`.get`, never `[...]` — e.g. `item_key` on
-a whole-metric alarm, `denominator` on a non-proportion metric).
-
-The second half is not an exception to the first, it is the half `exclude_none`
-alone cannot express. `LimitsArtifact.alpha` is required **and** nullable on
-purpose: its *absence* means "the producer forgot the field", its `null` means
-"nothing in this run was alarm-eligible". A bare `exclude_none=True` collapses
-those two — it drops `alpha` from an all-scalar run and makes the writer emit a
-file `load_limits_artifact` then rejects. The always-emit set is derived from
-`LimitsArtifact.model_fields[...].is_required()`, so a required-nullable field
-added later is covered without anyone remembering to. M1 needs no such fix-up:
-every nullable field on `Metric`/`MetricSeries` carries a `None` default, i.e.
-all optional. Pinned by `TestNullSerializationConvention` in
-`test_memory_eval_limits.py`.
+Pinned by `TestNullSerializationConvention` in `test_memory_eval_limits.py`,
+which checks the rule field-by-field at every level the writer emits (artifact,
+verdicts, alarms) rather than only for the fields named above.
 
 The `metrics-*.json` series files are hand-authored, but in that exact
 canonical serialization. `test_memory_eval_boundary.py` asserts byte-identity by

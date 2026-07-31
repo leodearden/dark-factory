@@ -25,6 +25,32 @@ rejected in the producing runner (M1: "malformed metric rejected at emit time,
 not read time"), because by the time the dashboard reads the artifact there is
 nobody left to tell. Readers, by contrast, just ``json.load`` — so extra fields
 a future schema version adds never break them.
+
+**The null convention — one rule, every memory-eval artifact.**
+
+    Omit a ``None``-valued OPTIONAL field;
+    always emit a REQUIRED field, even when its value is null.
+
+This is THE statement of the rule; the limits writer, the fixtures README and
+the tests point here rather than restating it, because a convention whose whole
+job is to stop two artifacts drifting apart must not itself exist in three
+copies. It binds this module's ``metrics-*.json`` and
+``shared.memory_eval_limits``' ``limits-current.json`` alike: they land under
+one artifact root and are read by the same dashboard-shaped reader, so a
+consumer needing ``.get`` for one and ``[...]`` for the other would be reading
+two conventions, with the split invisible until it ``KeyError``s on the one it
+guessed wrong. Absence therefore means "does not apply here" — ``denominator``
+on a non-proportion metric, ``item_key`` on a whole-metric alarm — never "the
+value happened to be null".
+
+The second half is not an exception to the first: it is the half
+``exclude_none`` alone cannot express. A required-AND-nullable field
+(``LimitsArtifact.alpha`` is the only one today) is what distinguishes "the
+producer forgot this field" from "nothing in this run was alarm-eligible", and
+collapsing those two is the silent degradation this repo's loud-over-silent norm
+forbids. Both writers render the resulting payload through
+:func:`canonical_json_text`, so the byte-level half of the convention is one
+code path rather than a habit each module keeps locally.
 """
 
 from __future__ import annotations
@@ -57,6 +83,7 @@ __all__ = [
     'MetricSchemaError',
     'MetricSeries',
     'TripwireItem',
+    'canonical_json_text',
     'load_metric_series',
     'load_series_window',
     'metrics_artifact_path',
@@ -437,15 +464,35 @@ def report_artifact_path(root: str | Path, eval_id: str, stamp: str) -> Path:
     return Path(root) / eval_id / f'report-{stamp}.txt'
 
 
+def canonical_json_text(payload: object) -> str:
+    """Render *payload* as canonical memory-eval artifact text.
+
+    ``indent=2, sort_keys=True, ensure_ascii=False`` plus a trailing newline, so
+    two runs that concluded the same thing produce byte-identical files and a
+    real change diffs cleanly.
+
+    Shared with :func:`shared.memory_eval_limits.serialize_limits_artifact`
+    rather than hand-repeated there. The whole point of the null convention
+    above is that the two artifacts under one root do not drift; a second copy
+    of these four arguments would be a place they could drift at the byte level
+    while every doc still said they agreed.
+
+    This function only renders what it is handed — WHICH keys a payload carries
+    is the null convention, applied by each writer against its own model.
+    """
+    return json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + '\n'
+
+
 def serialize_metric_series(series: MetricSeries) -> str:
     """Render *series* as the canonical artifact text.
 
-    ``sort_keys=True`` plus a trailing newline so two identical runs produce
-    byte-identical files and a real change diffs cleanly; ``exclude_none`` so an
-    unused optional field is absent rather than an explicit ``null``.
+    ``exclude_none`` alone implements the module docstring's null convention
+    here: every nullable field on :class:`Metric`/:class:`MetricSeries` carries
+    a ``None`` default, i.e. all of them are optional, so M1 has no
+    required-nullable field needing the always-emit half. (M2 has exactly one —
+    see :func:`shared.memory_eval_limits.serialize_limits_artifact`.)
     """
-    payload = series.model_dump(mode='json', exclude_none=True)
-    return json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + '\n'
+    return canonical_json_text(series.model_dump(mode='json', exclude_none=True))
 
 
 def render_report(series: MetricSeries) -> str:

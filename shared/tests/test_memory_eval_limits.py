@@ -20,9 +20,10 @@ import math
 import os
 import time
 from pathlib import Path
+from typing import get_args
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from shared.memory_eval_limits import (
     GRANDFATHER_KEY_SEPARATOR,
@@ -30,6 +31,13 @@ from shared.memory_eval_limits import (
     LimitsConfig,
     LimitsSchemaError,
     MetricVerdict,
+    # _AlarmRecord/_VerdictRecord are private by design — the nested record
+    # models are an implementation detail of the artifact, not part of what a
+    # dashboard reads. test_no_nested_record_field_is_both_required_and_nullable
+    # has to reach them anyway: its whole job is to check a property of those
+    # two classes that the public surface cannot express.
+    _AlarmRecord,
+    _VerdictRecord,
     binomial_two_sided_p,
     derive_alpha,
     evaluate_count,
@@ -42,6 +50,7 @@ from shared.memory_eval_limits import (
     load_limits_artifact,
     poisson_two_sided_p,
     scoped_grandfather_key,
+    serialize_limits_artifact,
     write_limits_artifact,
 )
 from shared.memory_eval_metrics import (
@@ -49,6 +58,7 @@ from shared.memory_eval_metrics import (
     Metric,
     MetricSeries,
     TripwireItem,
+    canonical_json_text,
     load_metric_series,
     serialize_metric_series,
 )
@@ -1733,49 +1743,66 @@ class TestLimitsArtifact:
         assert derive_alpha(config.false_alarm_budget, config.runs_per_quarter, 4) == 2 / 360
 
 
+@pytest.fixture(scope='module')
+def alarming_payload() -> dict:
+    """The regression run judged on the RESUME path, so a tripwire can alarm.
+
+    ``grandfather=None`` would make this run the tripwire's FIRST sighting,
+    which snapshots rather than alarms (``evaluate_series``' added-mid-programme
+    rule) — leaving no tripwire alarm for the mirror-image case to inspect.
+    Seeding from an earlier run's own output is the recipe a real runner
+    follows, via the helper that already exists rather than a second hand-built
+    one.
+
+    Module-scoped and built through :func:`serialize_limits_artifact`: the
+    convention is a property of the PAYLOAD, so inspecting it needs neither a
+    ``tmp_path`` nor a re-evaluated series per assertion. The consuming tests
+    only read it.
+    """
+    grandfather, snapshotted = _seeded_state()
+    result = evaluate_series(
+        _series(_REGRESSION_STAMP), _baseline(), _config(), grandfather, snapshotted
+    )
+    return json.loads(serialize_limits_artifact(result))
+
+
+@pytest.fixture(scope='module')
+def all_scalar_payload() -> dict:
+    """An artifact whose one required-nullable field really is null.
+
+    Without this the derived rule is only half-tested: the alarming exemplar has
+    a value for ``alpha``, so "required fields survive" holds there even under a
+    naive ``exclude_none=True``.
+    """
+    series = MetricSeries(
+        schema_version=1,
+        eval_id='e1-scalar-only',
+        run_stamp='20260801T000000Z',
+        corpus=Corpus(project_id='dark_factory'),
+        metrics=[Metric(metric_id='mean-latency-ms', kind='scalar', value=42.5, n=30)],
+    )
+    return json.loads(serialize_limits_artifact(evaluate_series(series, [], _config(), None)))
+
+
+def _is_nullable(annotation: object) -> bool:
+    """Does this field's annotation admit ``None``? (``str | None`` -> True.)"""
+    return type(None) in get_args(annotation)
+
+
 class TestNullSerializationConvention:
     """ONE null convention across both memory-eval artifacts.
 
-    ``serialize_metric_series`` (M1) already omits a ``None``-valued optional
-    field; ``write_limits_artifact`` (M2) used to emit it as an explicit
-    ``null``. Two files under one artifact root, read by the same
-    dashboard-shaped reader, disagreeing about what "unused field" looks like —
-    a consumer would need a different idiom per file to read the same absence.
+    The rule is stated once, in the ``shared.memory_eval_metrics`` module
+    docstring, and is not restated here — a convention whose whole job is to
+    stop two artifacts drifting apart must not itself exist in several copies.
+    These tests pin it; that docstring says what it is and why.
 
-    The convention that describes both exactly:
-
-        omit a ``None``-valued OPTIONAL field;
-        always emit a REQUIRED field, even when its value is null.
-
-    The second half is not an exception to the first — it is the half a bare
-    ``exclude_none=True`` cannot express. ``LimitsArtifact.alpha`` is required
-    AND nullable on purpose (see its docstring): its ABSENCE means "the
-    producer forgot the field", its ``null`` means "nothing was alarm-eligible
-    in this run". Collapsing those two is exactly the silent degradation the
-    repo's loud-over-silent norm forbids, and it also breaks the writer's own
-    round trip. That half is pinned by
+    What is worth saying HERE is which half each test covers. The omit half is
+    the field-by-field cases below. The always-emit half is pinned by
     ``TestARunWithNothingAlarmEligible::test_a_scalar_only_run_round_trips_through_the_artifact_with_a_null_alpha``
-    — which asserts the written ``alpha`` key is present-and-null AND that
-    ``load_limits_artifact`` accepts the file back — so it is not restated here.
+    — the written ``alpha`` key present-and-null AND ``load_limits_artifact``
+    accepting the file back — so it is not duplicated here either.
     """
-
-    def _written(self, tmp_path) -> dict:
-        """The regression run judged on the RESUME path, so a tripwire can alarm.
-
-        ``grandfather=None`` would make this run the tripwire's FIRST sighting,
-        which snapshots rather than alarms (``evaluate_series``' added-
-        mid-programme rule) — leaving no tripwire alarm for the mirror-image
-        case below to inspect. Seeding from an earlier run's own output is the
-        recipe a real runner follows, via the helper that already exists rather
-        than a second hand-built one.
-        """
-        grandfather, snapshotted = _seeded_state()
-        result = evaluate_series(
-            _series(_REGRESSION_STAMP), _baseline(), _config(), grandfather, snapshotted
-        )
-        path = limits_artifact_path(tmp_path, result.eval_id)
-        write_limits_artifact(result, path)
-        return json.loads(path.read_text(encoding='utf-8'))
 
     def _alarm(self, data: dict, metric_id: str) -> dict:
         # Named lookup, not `next(...)`: a missing alarm means the fixture stopped
@@ -1790,15 +1817,14 @@ class TestNullSerializationConvention:
         assert metric_id in verdicts, f'no verdict for {metric_id}; got {sorted(verdicts)}'
         return verdicts[metric_id]
 
-    def test_a_whole_metric_alarm_omits_item_key_rather_than_nulling_it(self, tmp_path):
+    def test_a_whole_metric_alarm_omits_item_key_rather_than_nulling_it(self, alarming_payload):
         """``item_key`` scopes an alarm to ONE item; a whole-metric rule has no item.
 
         Proportion and count rules judge the metric as a whole, so the field is
         not "null for this alarm" — it does not apply to this alarm at all.
         """
-        data = self._written(tmp_path)
         for metric_id in ('canonical-in-top-5', 'dangling-pointers'):
-            alarm = self._alarm(data, metric_id)
+            alarm = self._alarm(alarming_payload, metric_id)
             assert 'item_key' not in alarm
             # Positively: the fields that DO apply are still there, so this
             # cannot pass by emitting an empty record.
@@ -1806,18 +1832,18 @@ class TestNullSerializationConvention:
             assert alarm['p_value'] is not None
             assert alarm['direction']
 
-    def test_a_tripwire_alarm_keeps_item_key_and_omits_what_does_not_apply(self, tmp_path):
+    def test_a_tripwire_alarm_keeps_item_key_and_omits_what_does_not_apply(self, alarming_payload):
         """The mirror image, so the rule is "absent means N/A", not "always drop it"."""
-        alarm = self._alarm(self._written(tmp_path), 'topic-canonical-present')
+        alarm = self._alarm(alarming_payload, 'topic-canonical-present')
         assert alarm['item_key'] == 't-worktree-lifecycle'
         # A tripwire is a structural predicate, not a statistical test.
         assert 'p_value' not in alarm
         assert 'alpha' not in alarm
         assert 'direction' not in alarm
 
-    def test_a_scalar_verdict_omits_the_statistical_fields(self, tmp_path):
+    def test_a_scalar_verdict_omits_the_statistical_fields(self, alarming_payload):
         """Scalars are reported, never alarmed — so they carry no test result."""
-        verdict = self._verdict(self._written(tmp_path), 'search-latency-p50-ms')
+        verdict = self._verdict(alarming_payload, 'search-latency-p50-ms')
         assert 'p_value' not in verdict
         assert 'direction' not in verdict
         assert 'baseline' not in verdict
@@ -1825,44 +1851,74 @@ class TestNullSerializationConvention:
         assert verdict['status'] == 'ok'
         assert verdict['value'] is not None
 
-    def _all_scalar(self, tmp_path) -> dict:
-        """An artifact whose one required-nullable field really is null.
+    @staticmethod
+    def _assert_rule_holds(record: dict, model: type[BaseModel], where: str) -> None:
+        """The convention, stated as a check over one emitted mapping.
 
-        Without this the rule below is only half-tested: the alarming exemplar
-        has a value for ``alpha``, so "required fields survive" holds there even
-        under a naive ``exclude_none=True``.
+        Every REQUIRED field present whatever its value; no key present carrying
+        a literal ``null`` unless it is required.
         """
-        series = MetricSeries(
-            schema_version=1,
-            eval_id='e1-scalar-only',
-            run_stamp='20260801T000000Z',
-            corpus=Corpus(project_id='dark_factory'),
-            metrics=[Metric(metric_id='mean-latency-ms', kind='scalar', value=42.5, n=30)],
-        )
-        result = evaluate_series(series, [], _config(), None)
-        path = limits_artifact_path(tmp_path, result.eval_id)
-        write_limits_artifact(result, path)
-        return json.loads(path.read_text(encoding='utf-8'))
+        required = {name for name, f in model.model_fields.items() if f.is_required()}
+        assert required <= set(record), f'{where}: missing required {required - set(record)}'
+        nulled = {k for k, v in record.items() if v is None}
+        assert nulled <= required, f'{where}: optional field(s) emitted as null: {nulled - required}'
 
-    @pytest.mark.parametrize('which', ['alarming', 'all_scalar'])
+    @pytest.mark.parametrize('payload', ['alarming_payload', 'all_scalar_payload'])
     def test_the_convention_holds_field_by_field_not_just_for_the_fields_named_above(
-        self, tmp_path, which
+        self, request, payload
     ):
         """State the RULE, so a field added later is covered without anyone remembering.
 
-        Derived from the model rather than a hand-listed key set: every REQUIRED
-        field is present whatever its value, and no key is present carrying a
-        literal ``null`` unless it is required. Run over BOTH an artifact with a
-        derived alpha and one where alpha is legitimately null, because it is
-        only the second that can catch a required field being dropped.
-        """
-        data = self._written(tmp_path) if which == 'alarming' else self._all_scalar(tmp_path)
-        required = {name for name, f in LimitsArtifact.model_fields.items() if f.is_required()}
-        assert required <= set(data)
-        nulled = {k for k, v in data.items() if v is None}
-        assert nulled <= required
+        Derived from each model rather than a hand-listed key set, and applied at
+        EVERY level the writer emits — the top-level artifact, each verdict, and
+        each alarm (both the published feed and the per-verdict list). The
+        nested records carry most of the nullable fields, so a check that stopped
+        at the top level would not actually deliver the promise its name makes.
 
-    def test_both_artifacts_under_one_root_agree_about_absence(self, tmp_path):
+        Run over BOTH an artifact with a derived alpha and one where alpha is
+        legitimately null, because only the second can catch a required field
+        being dropped.
+        """
+        data = request.getfixturevalue(payload)
+        self._assert_rule_holds(data, LimitsArtifact, 'artifact')
+        for verdict in data['verdicts']:
+            where = f'verdict {verdict["metric_id"]!r}'
+            self._assert_rule_holds(verdict, _VerdictRecord, where)
+            for alarm in verdict['alarms']:
+                self._assert_rule_holds(alarm, _AlarmRecord, f'{where} -> nested alarm')
+        for alarm in data['alarms']:
+            self._assert_rule_holds(alarm, _AlarmRecord, f'alarm {alarm["metric_id"]!r}')
+
+    def test_no_nested_record_field_is_both_required_and_nullable(self):
+        """The assumption ``_artifact_payload``'s top-level fix-up rests on, made checkable.
+
+        The always-emit restore derives its set from ``LimitsArtifact`` — the TOP
+        model — while ``exclude_none`` prunes the nested verdict/alarm payloads
+        too. That is safe only because no field on either record is both
+        required and nullable. Adding one would reintroduce, one level down,
+        exactly the bug the restore exists to prevent: silently dropped from
+        every artifact, and then rejected by ``load_limits_artifact`` on the
+        writer's own output.
+
+        So the assumption fails HERE, loudly, at the moment someone adds such a
+        field — rather than in a stranger's dashboard. The fix at that point is
+        to give the field a ``None`` default (making it optional, which is what
+        every nullable field on these records already is) or to extend the
+        restore to recurse.
+        """
+        for model in (_VerdictRecord, _AlarmRecord):
+            offenders = {
+                name
+                for name, field in model.model_fields.items()
+                if field.is_required() and _is_nullable(field.annotation)
+            }
+            assert not offenders, (
+                f'{model.__name__}: {sorted(offenders)} are required AND nullable, which '
+                "_artifact_payload's top-level-only restore cannot cover — see this test's "
+                'docstring.'
+            )
+
+    def test_both_artifacts_under_one_root_agree_about_absence(self, alarming_payload):
         """The point of the whole item: one idiom reads an unused field in either file.
 
         A consumer that must use ``.get`` for the metrics artifact and ``[...]``
@@ -1874,8 +1930,38 @@ class TestNullSerializationConvention:
         scalar = next(m for m in metrics_payload['metrics'] if m['kind'] == 'scalar')
         assert 'denominator' not in scalar
 
-        limits_payload = self._written(tmp_path)
-        assert 'item_key' not in self._alarm(limits_payload, 'canonical-in-top-5')
+        assert 'item_key' not in self._alarm(alarming_payload, 'canonical-in-top-5')
+
+    def test_both_writers_render_through_the_one_canonical_dump(self):
+        """The byte-level half of the convention is a shared code path, not a shared habit.
+
+        ``indent=2, sort_keys=True, ensure_ascii=False`` + trailing newline was
+        hand-repeated in each writer; both now go through
+        ``canonical_json_text``. Asserted as a property of the OUTPUT so the test
+        survives a refactor of who calls whom.
+        """
+        grandfather, snapshotted = _seeded_state()
+        limits_text = serialize_limits_artifact(
+            evaluate_series(
+                _series(_REGRESSION_STAMP), _baseline(), _config(), grandfather, snapshotted
+            )
+        )
+        metrics_text = serialize_metric_series(_series(_REGRESSION_STAMP))
+        for text in (limits_text, metrics_text):
+            assert text.endswith('\n')
+            assert not text.endswith('\n\n')
+            assert text == canonical_json_text(json.loads(text))
+
+    def test_the_writer_emits_exactly_what_the_serializer_returns(self, tmp_path):
+        """The disk wrapper adds a location, not a second serialization.
+
+        Two ways to produce the same bytes is how the pure and the on-disk forms
+        drift; pinning them equal is what makes ``serialize_limits_artifact`` a
+        safe way to inspect what a run WOULD write.
+        """
+        result = evaluate_series(_series(_QUIET_STAMP), _baseline(), _config(), None)
+        path = write_limits_artifact(result, limits_artifact_path(tmp_path, result.eval_id))
+        assert path.read_text(encoding='utf-8') == serialize_limits_artifact(result)
 
 
 class TestARunWithNothingAlarmEligible:
