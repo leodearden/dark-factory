@@ -591,14 +591,19 @@ def test_orch_filter_js_loads_before_tabs(index_html_body: str) -> None:
 
 
 def test_redux_cache_buster_bumped(index_html_body: str) -> None:
-    """All /static/redux/*?v= cache-busters must share a single version >= 30,
-    and graph_layout.js / prd_grouping.js / runtime_format.js / orch_filter.js
-    must all be among the versioned assets.
+    """All /static/redux/*?v= cache-busters must share a single version >= 37,
+    and graph_layout.js / prd_grouping.js / runtime_format.js / orch_filter.js /
+    esc_flow_layout.js must all be among the versioned assets.
 
     Mirrors the existing single-shared-version guards in test_tab_escalations.py,
-    test_tab_scheduler.py, and test_scheduler_page.py, raising the floor to 30 to
-    prove the uniform bump landed alongside task 2637's runtime_format.js
-    addition and its tabs.jsx/tab_tasks.jsx wiring.
+    test_tab_scheduler.py, and test_scheduler_page.py. Floor provenance: 30
+    proved the uniform bump from 29 alongside task 2637's runtime_format.js
+    addition; 37 proves the bump for task 3332's `const API` collision fix
+    (esc_flow_layout.js / graph_layout.js renamed to ESC_FLOW_LAYOUT_API /
+    GRAPH_LAYOUT_API). That bump matters more than a usual one: before the fix,
+    an already-open browser had cached an esc_flow_layout.js that dies on load,
+    leaving window.DF_ESC_FLOW_LAYOUT undefined, so without a new ?v= the fix
+    would not reach it.
     """
     versions = set(re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body))
     assert len(versions) == 1, (
@@ -606,9 +611,12 @@ def test_redux_cache_buster_bumped(index_html_body: str) -> None:
         'bump all of them uniformly to the same value.'
     )
     v = int(next(iter(versions)))
-    assert v >= 30, (
-        f'index.html cache-buster version is {v}, expected >= 30 (proves the '
-        'uniform bump from 29 alongside task 2637\'s runtime_format.js addition).'
+    assert v >= 37, (
+        f'index.html cache-buster version is {v}, expected >= 37 (proves the '
+        "uniform bump for task 3332's `const API` collision fix actually "
+        'reaches already-open browsers holding the broken esc_flow_layout.js; '
+        'the previous floor, 30, proved the bump from 29 alongside task 2637\'s '
+        'runtime_format.js addition).'
     )
     assert re.search(r'/static/redux/graph_layout\.js\?v=\d+', index_html_body), (
         'graph_layout.js is not present among the versioned /static/redux/* '
@@ -627,4 +635,12 @@ def test_redux_cache_buster_bumped(index_html_body: str) -> None:
         'assets in index.html — a tag added without a cache-buster would both '
         'miss an already-open browser and break the single-shared-version '
         'invariant this test and four other modules assert.'
+    )
+    assert re.search(r'/static/redux/esc_flow_layout\.js\?v=\d+', index_html_body), (
+        'esc_flow_layout.js is not present among the versioned /static/redux/* '
+        'assets in index.html — this test enumerated four of the six classic '
+        'scripts and omitted this one, the very file task 3332 fixes, so an '
+        'unversioned tag here would both miss an already-open browser (still '
+        'holding the copy that dies on load) and break the single-shared-version '
+        'invariant unnoticed.'
     )

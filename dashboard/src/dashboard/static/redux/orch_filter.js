@@ -76,17 +76,13 @@ function orchEmptyLabel(filter) {
   return `No ${head} or ${last} tasks`;
 }
 
-// Named ORCH_FILTER_API (not the graph_layout.js boilerplate's plain `API`):
-// graph_layout.js, prd_grouping.js, runtime_format.js and this file are all
-// loaded as separate classic (non-module) <script> tags on the same page
-// (index.html), and top-level `const` bindings in classic scripts share one
-// global lexical scope across ALL of them — a second top-level `const API`
-// here would collide with graph_layout.js's, throwing "Identifier 'API' has
-// already been declared" and aborting this entire script (see
-// runtime_format.js's / prd_grouping.js's identical note), silently leaving
-// window.DF_ORCH_FILTER undefined and downgrading every empty cell to
-// tabs.jsx's fallback label. ORCH_FILTER_FACETS / ORCH_FILTER_NONE_SELECTED /
-// orchEmptyLabel are uniquely named across that directory for the same reason.
+// Module-unique export const, never a bare `API` — see the
+// shared-classic-script-scope note in graph_layout.js's header, enforced by
+// dashboard/tests/js/classic_script_scope.test.mjs. A collision here would
+// leave window.DF_ORCH_FILTER undefined and downgrade every empty cell to
+// tabs.jsx's fallback label. The same rule is why this file's other top-level
+// names — ORCH_FILTER_FACETS, ORCH_FILTER_NONE_SELECTED, orchEmptyLabel — are
+// prefixed rather than generic.
 const ORCH_FILTER_API = { orchEmptyLabel };
 
 if (typeof module !== 'undefined' && module.exports) {
