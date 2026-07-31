@@ -11,6 +11,10 @@ JSON state file" pattern into two clearly-separated branches:
 
 Other OSErrors (PermissionError, IsADirectoryError, …) propagate uncaught
 so the caller sees genuinely unexpected environmental failures.
+
+Also provides :func:`atomic_write_text`, the write-side counterpart: the
+consolidated tmp+rename atomic writer that every "write optional JSON state
+file" site in the repo delegates to (task 3223).
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +33,7 @@ logger = logging.getLogger(__name__)
 # A restart re-enables the warning (mirrors sqlite_task_backend._warned_malformed_task_ids:51).
 _warned_corrupt_paths: set[str] = set()
 
-__all__ = ['load_json_or_warn']
+__all__ = ['atomic_write_text', 'load_json_or_warn']
 
 
 def load_json_or_warn(
@@ -125,3 +130,46 @@ def load_json_or_warn(
         return (default, False)
 
     return (parsed, True)
+
+
+def atomic_write_text(
+    path: str | os.PathLike[str],
+    text: str,
+    *,
+    encoding: str = 'utf-8',
+    mode: int | None = None,
+    fsync: bool = False,
+    mkdir: bool = False,
+) -> None:
+    """Write *text* to *path* atomically via the tmp+rename pattern.
+
+    Parameters
+    ----------
+    path:
+        Destination file.  Accepts any ``os.PathLike`` or ``str``.
+    text:
+        Complete contents to write.  The destination is replaced wholesale.
+    encoding:
+        Text encoding for the write.  Defaults to ``'utf-8'``.
+    mode:
+        Permission bits for the destination.  ``None`` (default) applies the
+        process umask exactly as ``open()``/``Path.write_text`` would.
+    fsync:
+        Reserved — see later steps.
+    mkdir:
+        Reserved — see later steps.
+
+    Raises
+    ------
+    OSError
+        Any failure to create, write, or rename propagates unchanged; this
+        helper never swallows.  Error policy belongs to the caller.
+    """
+    p = Path(path)
+
+    # The temp lives in the destination's own directory so the rename stays on
+    # one filesystem — required for os.replace to be atomic per rename(2).
+    fd, tmp_str = tempfile.mkstemp(suffix='.tmp', prefix=p.name, dir=str(p.parent))
+    with os.fdopen(fd, 'w', encoding=encoding) as f:
+        f.write(text)
+    os.replace(tmp_str, str(p))
