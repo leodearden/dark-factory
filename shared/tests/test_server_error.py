@@ -42,7 +42,6 @@ from shared.invocation_outcome import (
     CapHit,
     CliLocalError,
     Failure,
-    InvocationOutcome,
     ModelNotFound,
     ServerError,
     ZeroOutputWedge,
@@ -113,6 +112,12 @@ class TestServerErrorStatusPublicSurface:
     """The predicate must be reachable as ``from shared import
     is_server_error_status`` -- that re-export is what makes it a single source
     for the orchestrator consumers in PRD tasks beta/gamma/delta.
+
+    Membership in ``cli_invoke.__all__`` / ``shared.__all__`` is NOT asserted
+    here: test_public_api.py already pins both as exact sets (and derives
+    ``shared.__all__`` as the union of the module ``__all__``s).  What that
+    suite does not assert -- and what this one does -- is the IDENTITY of the
+    re-exported object.
     """
 
     def test_reexported_from_shared_package(self):
@@ -120,36 +125,11 @@ class TestServerErrorStatusPublicSurface:
 
         assert reexported is is_server_error_status
 
-    def test_listed_in_cli_invoke_all(self):
-        from shared import cli_invoke
 
-        assert 'is_server_error_status' in cli_invoke.__all__
-
-    def test_listed_in_shared_all(self):
-        import shared
-
-        assert 'is_server_error_status' in shared.__all__
-
-
-class TestServerErrorVariant:
-    """``ServerError`` is a frozen ``InvocationOutcome`` variant carrying the
-    HTTP status, so a consumer can log/route on the exact code."""
-
-    def test_is_an_invocation_outcome(self):
-        assert isinstance(ServerError(status=529), InvocationOutcome)
-
-    def test_round_trips_status(self):
-        assert ServerError(status=529).status == 529
-
-    def test_is_frozen(self):
-        outcome = ServerError(status=529)
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            outcome.status = 500  # type: ignore[misc]
-
-    def test_equality_is_status_scoped(self):
-        assert ServerError(status=529) == ServerError(status=529)
-        assert ServerError(status=529) != ServerError(status=500)
-        assert ServerError(status=529) != Failure(kind='unclassified')
+# The ``ServerError`` variant contract itself (InvocationOutcome membership,
+# status round-trip, frozen-ness) lives in test_invocation_outcome.py alongside
+# every other variant's -- that module is the single home for sum-type variant
+# contracts, so it is not restated here.
 
 
 class TestClassifyInvocationServerError:
@@ -196,6 +176,14 @@ class TestClassifyInvocationServerError:
         cause-blind answer.  The cause-awareness lives in the classifier
         instead.  Both halves are asserted on the SAME fixture so a future edit
         cannot quietly make the predicate cause-aware.
+
+        RESIDUAL GAP this lock deliberately leaves open: keeping the predicate
+        cause-blind means workflow.py's zero-output hang circuit breaker (which
+        keys on it) still counts a 5xx-caused timeout toward
+        ``consecutive_zero_output`` and can block the task as an infra_issue --
+        the misfiling this PRD exists to eliminate.  This task closes it at the
+        classifier and cap-retry layers only; making that workflow consumer
+        cause-aware is PRD task gamma's job.
         """
         result = _incident_result()
         assert is_zero_output_timeout(result) is True
@@ -353,6 +341,90 @@ class TestClassifyAgentFailureServerErrorPrecedence:
         assert classified.kind is AgentFailureKind.TIMED_OUT
         assert 'productive' in classified.summary
 
+    def test_productive_kill_with_a_5xx_stays_timed_out(self):
+        """A PRODUCTIVE wall-clock kill (transcript_turns > 0) that happens to
+        carry a 5xx keeps its TIMED_OUT kind and its truthful productive
+        phrasing.  The 5xx rule exists for the pre-first-token outage shape;
+        claiming a run that did 13 turns of real work was 'killed
+        pre-first-token' is exactly the untruthful phrasing task 2360 fix #3 /
+        reify-4827 removed, and re-kinding it would also drop it out of
+        dry_run_unblock's infra-failure kinds and into the scheduler's
+        transient-requeue lane.  The 5xx evidence survives in
+        ``diagnostic_detail``.
+        """
+        result = AgentResult(
+            success=False,
+            output='',
+            timed_out=True,
+            transcript_turns=13,
+            duration_ms=127000,
+            api_error_status=503,
+        )
+        classified = classify_agent_failure(result)
+        assert classified.kind is AgentFailureKind.TIMED_OUT
+        assert 'productive' in classified.summary
+        assert 'pre-first-token' not in classified.summary
+        assert _API_ERROR_REASON_RE.search(classified.summary) is None, (
+            'a productive kill must not emit the transient-requeue marker'
+        )
+        assert 'api_error_status=503' in classified.diagnostic_detail
+
+    def test_timed_out_5xx_with_unknown_transcript_turns_claims_neither(self):
+        """``transcript_turns=None`` means the transcript was never read — not
+        evidence of progress, and equally not evidence the kill landed before
+        the first token.  The rule still fires (the count is not positive), but
+        the suffix must not assert 'pre-first-token'."""
+        result = AgentResult(
+            success=False,
+            output='',
+            timed_out=True,
+            transcript_turns=None,
+            duration_ms=127000,
+            api_error_status=529,
+        )
+        classified = classify_agent_failure(result)
+        assert classified.kind is AgentFailureKind.API_ERROR
+        assert classified.summary.startswith('agent API error: HTTP 529')
+        assert 'pre-first-token' not in classified.summary
+        assert 'transcript_turns=unknown' in classified.summary
+
+    def test_error_max_turns_with_a_5xx_stays_max_turns(self):
+        """Saturation detection (workflow's ``_stamp_simple_saturated`` keys on
+        MAX_TURNS) must survive an incidental 5xx: the 5xx rule outranks the
+        TIMEOUT rule only, not the max_turns rule below it."""
+        result = AgentResult(
+            success=False,
+            output='',
+            subtype='error_max_turns',
+            turns=200,
+            output_tokens=4096,
+            api_error_status=503,
+        )
+        assert classify_agent_failure(result).kind is AgentFailureKind.MAX_TURNS
+
+    def test_model_not_found_marker_outranks_the_5xx_rule(self):
+        """INV-5: the two classifiers must agree.  ``classify_invocation``
+        ranks ModelNotFound ABOVE ServerError (mirrored by
+        TestClassifyInvocationServerErrorPrecedence.
+        test_model_not_found_marker_outranks_server_error), and
+        ``invoke_with_cap_retry`` treats ModelNotFound as TERMINAL — so if this
+        rule claimed the result, the scheduler would read the transient marker
+        out of block_reason and requeue a run the retry loop already gave up
+        on.
+        """
+        result = AgentResult(
+            success=False,
+            output='{"type":"error","error":{"type":"not_found_error"}}',
+            api_error_status=503,
+        )
+        classified = classify_agent_failure(result)
+        assert classified.kind is AgentFailureKind.MODEL_NOT_FOUND
+        assert _API_ERROR_REASON_RE.search(classified.summary) is None, (
+            'a terminal ModelNotFound must not emit the transient-requeue marker'
+        )
+        # Both classifiers agree on this shape.
+        assert isinstance(classify_invocation(result, strict_confirm=True), ModelNotFound)
+
     def test_ended_awaiting_background_outranks_the_5xx_rule(self):
         result = AgentResult(
             success=False,
@@ -426,10 +498,10 @@ class _CountingCli:
     counting its calls.
 
     Deliberately tolerates being called more than once (rather than raising
-    once "exhausted"): under the CURRENT pre-fix implementation the heuristic
-    cap net misclassifies a fast zero-cost 529 as a cap hit and fails over
-    across the whole pool, and this test must OBSERVE that churn as a call
-    count rather than mask it behind a harness exception.
+    once "exhausted"): before this task's fix the heuristic cap net
+    misclassified a fast zero-cost 529 as a cap hit and failed over across the
+    whole pool, so a regression must show up as an OBSERVED call count rather
+    than be masked behind a harness exception.
     """
 
     def __init__(self, result: AgentResult) -> None:
@@ -486,9 +558,9 @@ class TestInvokeWithCapRetryServerError:
     """
 
     async def test_row9_fast_zero_cost_529_does_not_cap_or_failover(self):
-        """PRD boundary row 9. Currently RED: the heuristic cap net
-        (zero-cost / <=1 turn / <5s) marks a healthy acct-0 CAPPED and fails
-        over pointlessly."""
+        """PRD boundary row 9. Regression guard: before this fix the heuristic
+        cap net (zero-cost / <=1 turn / <5s) marked a healthy acct-0 CAPPED and
+        failed over pointlessly."""
         gate = _make_gate(['acct-0', 'acct-1'])
         result = AgentResult(
             success=False,
