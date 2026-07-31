@@ -3228,3 +3228,143 @@ class TestCoerceTierObservability:
             f"coerce_tier() on a known tier must not warn; got: "
             f"{[r.getMessage() for r in warning_records]}"
         )
+
+
+class TestCoerceTierUnrecognizedValueDedup:
+    """coerce_tier() warns on a genuinely unrecognized (non-None) priority
+    value, but only ONCE per distinct value per process — a persistent bad
+    value in tasks.json would otherwise re-fire its warning on every
+    scheduler tick (task 3227 review feedback). The dedupe memo is bounded
+    (see test_dedupe_memo_is_bounded_and_does_not_raise below) since
+    orchestrator.config lives inside a multi-day daemon process.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clear_warned_priority_values_dedup(self):
+        """Scoped to this class only — mirrors
+        fused-memory/tests/test_sqlite_task_backend.py:54-62's
+        hasattr-guarded module-level dedup-set fixture. The hasattr guard
+        keeps this file collectible while _warned_priority_values does not
+        yet exist (RED, before step-5 lands), so this class's tests RED on
+        an assertion rather than a collection error.
+        """
+        from orchestrator import config as _cfg
+        if hasattr(_cfg, '_warned_priority_values'):
+            _cfg._warned_priority_values.clear()
+        yield
+        if hasattr(_cfg, '_warned_priority_values'):
+            _cfg._warned_priority_values.clear()
+
+    def test_unrecognized_value_warns_exactly_once_and_names_the_value(
+        self, caplog: pytest.LogCaptureFixture
+    ):
+        """A single call with a genuinely unrecognized value returns
+        DEFAULT_TIER and emits exactly one WARNING naming the value."""
+        with caplog.at_level(logging.WARNING, logger='orchestrator.config'):
+            result = coerce_tier('urgent')
+
+        assert result == DEFAULT_TIER
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and r.name == 'orchestrator.config'
+        ]
+        assert len(warning_records) == 1, (
+            f"expected exactly one WARNING for a single unrecognized value; "
+            f"got: {[r.getMessage() for r in warning_records]}"
+        )
+        assert 'urgent' in warning_records[0].getMessage()
+
+    def test_repeated_calls_with_same_unrecognized_value_warn_once(
+        self, caplog: pytest.LogCaptureFixture
+    ):
+        """Three calls in a row with the SAME unrecognized value still emit
+        exactly one warning total (dedupe)."""
+        with caplog.at_level(logging.WARNING, logger='orchestrator.config'):
+            results = [coerce_tier('urgent') for _ in range(3)]
+
+        assert results == [DEFAULT_TIER, DEFAULT_TIER, DEFAULT_TIER]
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and r.name == 'orchestrator.config'
+        ]
+        assert len(warning_records) == 1, (
+            f"expected exactly one WARNING total across 3 repeated calls "
+            f"with the same unrecognized value; got: "
+            f"{[r.getMessage() for r in warning_records]}"
+        )
+
+    def test_dedupe_is_per_value_not_global(self, caplog: pytest.LogCaptureFixture):
+        """Two distinct unrecognized values each warn exactly once (2 total)
+        — dedupe is keyed per-value, not a single global 'already warned'
+        flag that would suppress the second, distinct value's warning."""
+        with caplog.at_level(logging.WARNING, logger='orchestrator.config'):
+            coerce_tier('urgent')
+            coerce_tier('urgent')
+            coerce_tier('P0')
+            coerce_tier('P0')
+            coerce_tier('P0')
+
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and r.name == 'orchestrator.config'
+        ]
+        assert len(warning_records) == 2, (
+            f"expected exactly one WARNING per distinct unrecognized value "
+            f"(2 total for 'urgent' and 'P0'); got: "
+            f"{[r.getMessage() for r in warning_records]}"
+        )
+        messages = [r.getMessage() for r in warning_records]
+        assert any('urgent' in m for m in messages), messages
+        assert any('P0' in m for m in messages), messages
+
+    def test_non_string_unrecognized_value_dedupes_safely(
+        self, caplog: pytest.LogCaptureFixture
+    ):
+        """A non-string bad value (e.g. an int) must not raise when used as
+        a dedupe key, and still warns exactly once across repeats —
+        confirms the dedupe key tolerates non-str input."""
+        with caplog.at_level(logging.WARNING, logger='orchestrator.config'):
+            results = [coerce_tier(7) for _ in range(3)]
+
+        assert results == [DEFAULT_TIER, DEFAULT_TIER, DEFAULT_TIER]
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and r.name == 'orchestrator.config'
+        ]
+        assert len(warning_records) == 1, (
+            f"expected exactly one WARNING total for a repeated non-string "
+            f"unrecognized value; got: "
+            f"{[r.getMessage() for r in warning_records]}"
+        )
+
+    def test_dedupe_memo_is_bounded_and_does_not_raise(
+        self, caplog: pytest.LogCaptureFixture
+    ):
+        """config.py runs inside a multi-day daemon process, so the dedupe
+        memo must not grow without bound. Feeding more distinct
+        unrecognized values than the cap must not grow the set past the
+        cap, and coerce_tier must keep returning DEFAULT_TIER without
+        raising."""
+        from orchestrator import config as _cfg
+
+        assert hasattr(_cfg, '_MAX_WARNED_PRIORITY_VALUES'), (
+            "orchestrator.config._MAX_WARNED_PRIORITY_VALUES must exist as "
+            "the dedupe memo's bound (introduced by task 3227 step-5); "
+            "currently absent, so the memo would be unbounded"
+        )
+        cap = _cfg._MAX_WARNED_PRIORITY_VALUES
+        assert cap > 0
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.config'):
+            for i in range(cap + 20):
+                result = coerce_tier(f'not-a-real-tier-{i}')
+                assert result == DEFAULT_TIER
+
+        assert hasattr(_cfg, '_warned_priority_values'), (
+            "orchestrator.config._warned_priority_values must exist "
+            "alongside the cap constant"
+        )
+        assert len(_cfg._warned_priority_values) <= cap, (
+            f"dedupe memo grew to {len(_cfg._warned_priority_values)} "
+            f"entries, exceeding cap {cap}"
+        )
