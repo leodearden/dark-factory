@@ -12,6 +12,7 @@ the commit path is genuinely exercised without risking main.
 """
 from __future__ import annotations
 
+import contextlib
 import gzip
 import json
 import logging
@@ -1697,3 +1698,98 @@ def test_main_run_propagates_fail_loud_exit_code(monkeypatch):
     exit_code = nightly.main(['run', '--project-id', 'proj_a'])
 
     assert exit_code == 1
+
+
+# ---------------------------------------------------------------------------
+# step-11: main() must configure logging -- gap (b) of the trickle-legibility
+# incident. Every INFO line in this module (the always-on sampler summary from
+# step-8, plus the pre-existing no-change-night and empty-codebook lines) is
+# discarded before it reaches the journal unless SOMETHING calls
+# logging.basicConfig: nothing under scripts/legibility/ did, so root stayed at
+# its WARNING default under the systemd ExecStart and all 14 silent nights of
+# 2026-07-16..29 wrote nothing an operator could read.
+# ---------------------------------------------------------------------------
+
+@contextlib.contextmanager
+def _isolated_root_logging():
+    """Yield the ROOT logger with its handlers emptied, restoring it after.
+
+    ``configure_logging`` deliberately goes through ``logging.basicConfig``,
+    which is a NO-OP when root already has handlers -- that no-op is exactly
+    what keeps it safe to call under pytest and from a library importer. So
+    its effect is only observable with root cleared first, which is what this
+    helper does.
+
+    Restoring both the level and the exact handler list matters: this file and
+    test_legibility_census.py both run many ``caplog.at_level(...)`` blocks,
+    and leaked root state would silently perturb them.
+    """
+    root = logging.getLogger()
+    saved_level = root.level
+    saved_handlers = root.handlers[:]
+    root.handlers[:] = []
+    root.setLevel(logging.WARNING)  # the un-configured default this fix exists to beat
+    try:
+        yield root
+    finally:
+        root.handlers[:] = saved_handlers
+        root.setLevel(saved_level)
+
+
+def _main_run_with_stubbed_run_nightly(monkeypatch, tmp_path):
+    """Drive ``nightly.main(['run', ...])`` over a stub, returning
+    ``(exit_code, effective_root_level, root_handler_count)`` sampled while
+    still inside the isolated-root block."""
+    def _fake_run_nightly(**kwargs):
+        return nightly.NightlyResult(exit_code=0)
+
+    monkeypatch.setattr(nightly, 'run_nightly', _fake_run_nightly)
+
+    with _isolated_root_logging() as root:
+        exit_code = nightly.main(['run', '--config', str(tmp_path / 'legibility.yaml')])
+        # Sample inside the block; assert outside, so a failing assertion is
+        # reported by pytest with root logging already restored.
+        return exit_code, root.getEffectiveLevel(), len(root.handlers)
+
+
+def test_main_configures_logging_so_info_lines_reach_the_journal(monkeypatch, tmp_path):
+    exit_code, effective_level, handler_count = _main_run_with_stubbed_run_nightly(
+        monkeypatch, tmp_path,
+    )
+
+    assert exit_code == 0
+    assert effective_level <= logging.INFO, (
+        'main() must lower root to INFO -- otherwise the step-8 sampler summary, '
+        'the no-change-night line and the empty-codebook line are all dropped '
+        'before they reach the journal'
+    )
+    assert handler_count >= 1, 'root needs a handler, or INFO records go nowhere'
+
+
+def test_main_honours_the_legibility_log_level_env_var(monkeypatch, tmp_path):
+    monkeypatch.setenv('LEGIBILITY_LOG_LEVEL', 'WARNING')
+
+    exit_code, effective_level, handler_count = _main_run_with_stubbed_run_nightly(
+        monkeypatch, tmp_path,
+    )
+
+    assert exit_code == 0
+    assert effective_level == logging.WARNING, (
+        'an operator turning the trickle down via LEGIBILITY_LOG_LEVEL must be honoured'
+    )
+    assert handler_count >= 1
+
+
+def test_main_unparseable_log_level_degrades_to_info_without_raising(monkeypatch, tmp_path):
+    monkeypatch.setenv('LEGIBILITY_LOG_LEVEL', 'chatty')
+
+    # No pytest.raises wrapper on purpose: a bad env var must never take the
+    # nightly timer down. If configure_logging raises, this call propagates it
+    # and the test fails loudly, which is the point.
+    exit_code, effective_level, handler_count = _main_run_with_stubbed_run_nightly(
+        monkeypatch, tmp_path,
+    )
+
+    assert exit_code == 0, 'an unparseable LEGIBILITY_LOG_LEVEL must not fail the run'
+    assert effective_level <= logging.INFO, 'an unparseable level degrades to the INFO default'
+    assert handler_count >= 1
