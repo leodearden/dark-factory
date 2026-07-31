@@ -1577,6 +1577,104 @@ def test_run_census_happy_path_full_seam_wiring(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# task 3291: run_census() must never persist a FABRICATED done-count baseline.
+#
+# This is the test that would have caught the 2026-07-24 regression on the day
+# it happened. census.py's CLI defaults --project-root to "." and
+# nightly._default_census_launcher launches it with no arguments, so the
+# get_statuses call went out with a relative path; fused-memory rejected it
+# with a {"error", "error_type"} envelope on an isError:false response; and
+# the old `(status.get("statuses") or {})` idiom silently read that as a
+# done-count of 0 and persisted it as a real baseline.
+# ---------------------------------------------------------------------------
+
+def _make_error_envelope_status_fetcher():
+    """Fake `status_fetcher() -> dict` returning fused-memory's tool-error
+    envelope verbatim as observed live against localhost:8002. It is a
+    perfectly well-formed dict -- that is precisely why the old idiom
+    swallowed it -- so nothing short of a shape check can distinguish it
+    from a real status snapshot."""
+    def fake_status_fetcher():
+        return {
+            "error": "project_root must be a non-empty absolute path, got: '.'",
+            "error_type": "ValidationError",
+        }
+
+    return fake_status_fetcher
+
+
+def _make_raising_status_fetcher():
+    def fake_status_fetcher():
+        raise census_trigger.StatusFetchUnavailable("get_statuses unreachable at localhost:8002")
+
+    return fake_status_fetcher
+
+
+@pytest.mark.parametrize(
+    "make_fetcher",
+    [_make_error_envelope_status_fetcher, _make_raising_status_fetcher],
+    ids=["tool-error-envelope", "raising-fetcher"],
+)
+def test_run_census_unobservable_done_count_persists_null_not_zero(
+    tmp_path, caplog, make_fetcher
+):
+    """An unobservable done-count degrades the BASELINE only -- it must not
+    abandon a run whose mining has already been paid for and whose dated
+    report is already on disk.
+
+    Before task 3291 the envelope case silently persisted 0, and the raising
+    case crashed run_census AFTER the report write, leaving the codebook and
+    census state unadvanced."""
+    batch = [
+        _hand_digest("dup-1", "nothing new here"),
+        _hand_digest("novel-verified", "a genuinely new confusion shape"),
+    ]
+    fake_commit = _make_fake_commit()
+
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_happy_invoke_response),
+        batch_source=[batch],
+        verify_fn=_make_fake_verify_fn(verified_titles={"Silent no-op subagent contract"}),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        submit_fn=_make_fake_submit_fn(),
+        escalate_fn=_poison("escalate_fn"),
+        status_fetcher=make_fetcher(),
+        commit=fake_commit,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    # --- the census still COMPLETES; only the baseline degrades ---
+    assert outcome.status == "done"
+    assert kwargs["report_path"].exists(), "the paid-for report must survive"
+    assert kwargs["codebook_path"].exists(), "codebook must still be dumped"
+    assert len(fake_commit.calls) == 1, "the run must still commit"
+
+    # --- the baseline is an honest null, NOT a fabricated 0 ---
+    state = json.loads(kwargs["census_state_path"].read_text(encoding="utf-8"))
+    assert "last_census_done_count" in state, "MUST-persist contract still holds"
+    assert state["last_census_done_count"] is None
+    assert state["last_census_done_count"] != 0, "a fabricated 0 is the defect being fixed"
+
+    # --- the degradation is LOUD: exactly one warning naming the failure ---
+    fetch_warnings = [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING and "done-count" in r.getMessage()
+    ]
+    assert len(fetch_warnings) == 1, "degrading silently is what caused the incident"
+
+    # --- round-trip: condition (b) is fail-SAFE, not always-armed ---
+    status, data = census_trigger.load_census_state(kwargs["census_state_path"])
+    assert status == "ok"
+    assert census_trigger.compute_tasks_landed(
+        state=data,
+        status_fetcher=lambda: {"statuses": {f"t{i}": "done" for i in range(2870)}},
+    ) is None
+
+
+# ---------------------------------------------------------------------------
 # amend: run_census() must treat submit_fn as best-effort, per payload — a
 # raised exception or a non-dict result must never abort the run after
 # codebook.dump() has already persisted (reviewer_comprehensive finding #2).
