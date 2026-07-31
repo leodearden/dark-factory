@@ -29,7 +29,6 @@ from shared.config_models import AccountConfig, UsageCapConfig
 from shared.invocation_outcome import (
     OK,
     CapHit,
-    Failure,
     ModelNotFound,
     ServerError,
     classify_invocation,
