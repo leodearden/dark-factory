@@ -73,6 +73,26 @@ _ROOT_TEST_COMMAND = (
     ' && uv run --project shared pytest tests/scripts/ --timeout=300'
 )
 
+# Not a config in this repo (yet) — the shape task 3218 predicts and must not
+# regress on: a pytest slot chaining a whole-directory sibling checker. Two
+# spellings, because the SCRIPT PATH decides which degradation fires today:
+#
+# * `check_pytest_markers.py` NAMES the tool, so the pre-3218 substring test
+#   at condition 7 sees 'pytest' in segment 1 and rejects — accidentally
+#   protecting the pytest slot. Once step-6 replaces that substring test with
+#   argv-head matching the accident disappears, and only the keyword
+#   ALLOWLIST (condition 0) keeps the slot structured.
+# * `check_markers.py` does NOT name the tool, so the tail is preserved TODAY
+#   and the scoped command comes back raw-retained — on which `with_junitxml`
+#   and `with_pytest_timeout` are documented no-ops. That is degradation 1
+#   live, and it is what makes this class RED before the allowlist lands.
+_SIBLING_CHECKER_TEST_COMMAND = (
+    'uv run pytest tests/ && python3 scripts/check_pytest_markers.py tests'
+)
+_SIBLING_CHECKER_TEST_COMMAND_UNNAMED = (
+    'uv run pytest tests/ && python3 scripts/check_markers.py tests'
+)
+
 
 class TestToolKind:
     """ToolKind is a StrEnum whose members are the JSON-serialisable tool identities."""
@@ -1174,3 +1194,101 @@ class TestSplitChainTail:
         # ACCEPT: only the unquoted `&&` is a split point.
         assert prefix == "ruff check -k 'a && b' src/ "
         assert tail == '&& python3 x.py'
+
+
+class TestTailPreservationAllowlist:
+    """Tail preservation is restricted to an ALLOWLIST of keywords (condition 0).
+
+    Task 3218 part 1. A preserved tail makes the gate's caller return a
+    RECOGNISED-BUT-UNSTRUCTURABLE ``VerifyCmd`` (``raw is not None``), and
+    ``with_junitxml``/``with_pytest_timeout`` are documented no-ops on that
+    shape. For the lint/type slots that costs nothing. For the PYTEST slot it
+    silently drops the ``--junitxml`` report that drives
+    ``_extract_failing_test_ids_from_junit``, flake confirmation and the
+    per-test timeout floor — so ``'pytest'`` is deliberately absent from the
+    allowlist and a pytest chain is always rejected to ``(raw, '')``.
+
+    The default for an UNLISTED keyword is no preservation, i.e. exactly the
+    pre-task-3061 behaviour: a future verify slot cannot silently acquire the
+    degradation by being added, it must opt in explicitly.
+    """
+
+    @pytest.mark.parametrize(
+        'raw',
+        [_SIBLING_CHECKER_TEST_COMMAND, _SIBLING_CHECKER_TEST_COMMAND_UNNAMED],
+        ids=['sibling-names-the-tool', 'sibling-does-not-name-the-tool'],
+    )
+    def test_pytest_chain_is_never_tail_preserved(self, raw):
+        """Both spellings reject, and to the WHOLE original — never ``segments[0]``.
+
+        The unnamed-sibling spelling is the one that is ACCEPTED before this
+        change; the named-sibling spelling is accepted once step-6 replaces
+        condition 7's substring test with argv-head matching. The allowlist
+        is what makes the disposition independent of the sibling's filename.
+        """
+        assert split_chain_tail(raw, 'pytest') == (raw, '')
+
+    @pytest.mark.parametrize(
+        ('raw', 'keyword', 'expected_tail'),
+        [
+            (
+                _FM_LINT_COMMAND,
+                'ruff check',
+                '&& python3 fused-memory/scripts/check_bare_magicmock_config.py'
+                ' fused-memory/tests'
+                ' && python3 fused-memory/scripts/check_asyncmock_assertion_style.py'
+                ' fused-memory/tests',
+            ),
+            ('npx pyright && python3 y.py', 'pyright', '&& python3 y.py'),
+            (
+                _FM_LINT_COMMAND,
+                'uv run',
+                '&& python3 fused-memory/scripts/check_bare_magicmock_config.py'
+                ' fused-memory/tests'
+                ' && python3 fused-memory/scripts/check_asyncmock_assertion_style.py'
+                ' fused-memory/tests',
+            ),
+        ],
+        ids=['ruff-check', 'pyright', 'uv-run'],
+    )
+    def test_allowlisted_keywords_still_preserve(self, raw, keyword, expected_tail):
+        """The three allowlisted keywords keep today's ACCEPT disposition exactly.
+
+        ``'uv run'`` is on the list for ``verify._reproject_str``, whose tail
+        preservation is load-bearing: without it a chained lint command
+        re-parses OPAQUE and the ``--project`` injection is silently dropped,
+        which the depless workspace-root project turns into an exit-127
+        breakage (task 2036), not a cosmetic diff.
+        """
+        prefix, tail = split_chain_tail(raw, keyword)
+        assert tail == expected_tail
+        assert prefix + tail == raw
+
+    @pytest.mark.parametrize(
+        ('raw', 'keyword'),
+        [
+            (_SIBLING_CHECKER_TEST_COMMAND, 'pytest'),
+            (_SIBLING_CHECKER_TEST_COMMAND_UNNAMED, 'pytest'),
+            (_FM_LINT_COMMAND, 'ruff check'),
+            (_FM_LINT_COMMAND, 'uv run'),
+            ('npx pyright && python3 y.py', 'pyright'),
+        ],
+        ids=[
+            'reject-pytest-named-sibling',
+            'reject-pytest-unnamed-sibling',
+            'accept-ruff-check',
+            'accept-uv-run',
+            'accept-pyright',
+        ],
+    )
+    def test_prefix_plus_tail_is_always_the_original(self, raw, keyword):
+        """The CONSTRAINT holds on the new reject path too — no byte is lost."""
+        prefix, tail = split_chain_tail(raw, keyword)
+        assert prefix + tail == raw
+
+    def test_reject_returns_the_whole_original_not_segment_zero(self):
+        """A REJECT must not silently truncate — that is the bug the gate exists to fix."""
+        prefix, tail = split_chain_tail(_SIBLING_CHECKER_TEST_COMMAND_UNNAMED, 'pytest')
+        assert prefix == _SIBLING_CHECKER_TEST_COMMAND_UNNAMED
+        assert tail == ''
+        assert prefix != split_top_level_and(_SIBLING_CHECKER_TEST_COMMAND_UNNAMED)[0]

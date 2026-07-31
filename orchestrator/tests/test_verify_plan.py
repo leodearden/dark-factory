@@ -23,7 +23,13 @@ import pytest
 
 from orchestrator import verify
 from orchestrator.config import ModuleConfig, OrchestratorConfig
-from orchestrator.verify_cmd import parse_config_command, render
+from orchestrator.verify_cmd import (
+    ToolKind,
+    parse_config_command,
+    render,
+    with_junitxml,
+    with_pytest_timeout,
+)
 from orchestrator.verify_plan import (
     FileKind,
     PlannedRun,
@@ -86,6 +92,17 @@ _ROOT_TEST_COMMAND = (
     ' && cd ../sampler && uv run pytest tests/ --timeout=300'
     ' && cd .. && ( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/ --timeout=300 )'
     ' && uv run --project shared pytest tests/scripts/ --timeout=300'
+)
+
+# Task 3218: not a config in this repo (yet), but the shape the pytest slot
+# must never tail-preserve. Mirrors test_verify_cmd.py's pair — the sibling
+# script path is the only difference, and it is what decides which of the two
+# degradations fires before this task lands (see that module's comment).
+_SIBLING_CHECKER_TEST_COMMAND = (
+    'uv run pytest tests/ && python3 scripts/check_pytest_markers.py tests'
+)
+_SIBLING_CHECKER_TEST_COMMAND_UNNAMED = (
+    'uv run pytest tests/ && python3 scripts/check_markers.py tests'
 )
 
 
@@ -1052,6 +1069,92 @@ class TestScoperTrailingClausePreservation:
 
 # ---------------------------------------------------------------------------
 # verify._reproject_str: &&-chain tail awareness (task 3061)
+# ---------------------------------------------------------------------------
+# Tail-preservation keyword allowlist: the pytest slot stays junit-injectable
+# ---------------------------------------------------------------------------
+
+
+class TestTailPreservationAllowlist:
+    """Both scopers must return a STRUCTURED command for a chained pytest slot.
+
+    Task 3218 part 1. ``split_chain_tail``'s ACCEPT makes
+    ``_scope_prefix_to_keyword`` return ``VerifyCmd(tool=PYTEST, raw=...)``
+    and ``verify._scope_to_keyword`` return a multi-clause string that
+    re-parses the same way. ``with_junitxml`` and ``with_pytest_timeout`` are
+    documented no-ops on ``raw is not None``, so the merge leg's
+    ``--junitxml`` report — which drives
+    ``_extract_failing_test_ids_from_junit``, flake confirmation and the
+    per-test timeout floor — is silently never collected.
+
+    Excluding ``'pytest'`` from the gate's keyword allowlist closes this at
+    all five pytest-slot consumers at once, because both scopers route
+    through that one shared gate.
+    """
+
+    _FILES = ['a/test_x.py']
+
+    @pytest.mark.parametrize(
+        'raw',
+        [_SIBLING_CHECKER_TEST_COMMAND, _SIBLING_CHECKER_TEST_COMMAND_UNNAMED],
+        ids=['sibling-names-the-tool', 'sibling-does-not-name-the-tool'],
+    )
+    def test_plan_scoper_yields_structured_junit_injectable_pytest(self, raw):
+        """_scope_prefix_to_keyword: raw-retained is the failure mode; assert against it."""
+        scoped = _scope_prefix_to_keyword(raw, 'pytest', self._FILES)
+        assert scoped.tool is ToolKind.PYTEST
+        assert scoped.raw is None, 'a raw-retained pytest cmd silently loses --junitxml'
+
+        injected = with_junitxml(scoped, '/tmp/j.xml')
+        assert injected is not scoped
+        assert '--junitxml /tmp/j.xml' in render(injected)
+
+        timed = with_pytest_timeout(scoped, 300)
+        assert timed is not scoped
+        assert '--timeout 300' in render(timed)
+
+    @pytest.mark.parametrize(
+        'raw',
+        [_SIBLING_CHECKER_TEST_COMMAND, _SIBLING_CHECKER_TEST_COMMAND_UNNAMED],
+        ids=['sibling-names-the-tool', 'sibling-does-not-name-the-tool'],
+    )
+    def test_string_scoper_yields_structured_junit_injectable_pytest(self, raw):
+        """verify._scope_to_keyword's output must re-parse structured at the injection site.
+
+        The junit injection at ``run_verification`` re-parses the scoped
+        string, so what matters there is the string's PARSE, not the scoper's
+        internal shape.
+        """
+        scoped = verify._scope_to_keyword(raw, 'pytest', self._FILES)
+        assert scoped is not None
+        parsed = parse_config_command(scoped)
+        assert parsed.tool is ToolKind.PYTEST
+        assert parsed.raw is None
+
+        injected = with_junitxml(parsed, '/tmp/j.xml')
+        assert injected is not parsed
+        assert '--junitxml /tmp/j.xml' in render(injected)
+
+    def test_lint_slot_still_preserves_its_sibling_checker(self):
+        """Non-regression: the allowlisted lint keyword keeps task 3061's behaviour."""
+        scoped = verify._scope_to_keyword(_FM_LINT_COMMAND, 'ruff check', self._FILES)
+        assert scoped is not None
+        assert (
+            '&& python3 fused-memory/scripts/check_bare_magicmock_config.py'
+            ' fused-memory/tests'
+        ) in scoped
+
+    @pytest.mark.parametrize(
+        'raw',
+        [_SIBLING_CHECKER_TEST_COMMAND, _SIBLING_CHECKER_TEST_COMMAND_UNNAMED],
+        ids=['sibling-names-the-tool', 'sibling-does-not-name-the-tool'],
+    )
+    def test_lockstep_holds_on_the_rejected_pytest_chains(self, raw):
+        """The two scopers must agree here too — the gate is shared, so this is structural."""
+        assert verify._scope_to_keyword(raw, 'pytest', self._FILES) == render(
+            _scope_prefix_to_keyword(raw, 'pytest', self._FILES)
+        )
+
+
 # ---------------------------------------------------------------------------
 
 
