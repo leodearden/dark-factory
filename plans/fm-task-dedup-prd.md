@@ -9,6 +9,18 @@ tracker is the core durable store the whole factory dispatches from.
 **Findings addressed:** fm-task-layer cluster (findings 1, 3, 5) in
 `plans/bug-hotspot-survey-2026-07-06-full-findings.json`.
 
+> **Note on the D1 prose advisory (amended 2026-07-31, task 3106).** As
+> shipped, the prose scan was the LAST word even when a submission carried a
+> better signal: a task declaring `metadata.files` owned by the filing project
+> and merely CITING another project's path in its description was still
+> stamped and escalated. That measured as ~76% of live advisory volume
+> (genuine paths cited as evidence + bare directory tokens), all of it
+> non-actionable. The advisory is now ATTRIBUTED on the declared deliverable:
+> a prose hit is discarded when any declared entry is owned by the filer, and
+> fires unchanged when none is. This does not relax the D1 files decision —
+> attribution is consulted only after it returns `ok`. Affected below: §1
+> goal 3, §5 approach, §6 D1 invariants, §6b BT-D1a/BT-D1b, §8 D1 signal.
+
 ---
 
 ## 1. Goal (user-observable behaviour)
@@ -34,9 +46,11 @@ Three durable-integrity outcomes an operator can observe:
 3. **Cross-project mis-filing is rejected on structured evidence, not prose
    regex.** A task whose `metadata.files` point at another project's tree is
    rejected; a task that merely *mentions* another project's directory name in
-   prose is created (with a `possible_scope_mismatch` advisory + escalation),
-   not falsely rejected — ending the false-positive tuning treadmill that cost
-   a wasted L2 round-trip per over-fire.
+   prose is created, not falsely rejected — ending the false-positive tuning
+   treadmill that cost a wasted L2 round-trip per over-fire. The prose
+   advisory (`possible_scope_mismatch` + escalation) attaches only when the
+   submission declares **no filer-owned deliverable** (amended by task 3106 —
+   see §6's D1 invariants).
 
 ## 2. Background
 
@@ -144,6 +158,10 @@ pass-1/pass-2 blank-title mismatch — dies.
   `metadata.possible_scope_mismatch`, and fire the scope-violation escalator
   (loud, non-blocking) — the existing LLM adjudicator/curator triage the
   ambiguous middle asynchronously. No hard reject on prose.
+  *(Amended by task 3106: the advisory is itself attributed on the declared
+  signal — a prose hit is discarded, with neither stamp nor escalation, when
+  the submission declares a deliverable owned by the FILING project. Same
+  principle, applied one level down: structured evidence outranks prose.)*
 - Delete the `dark_factory_path_guard` shim: switch interceptor imports to
   `path_scope_guard`, fold the hard-coded `DARK_FACTORY_PATH_PREFIXES` into the
   registry default.
@@ -295,6 +313,16 @@ Invariants:
 - Prose decision: a `find_paths` hit in title/description/details with no
   files-level mismatch → **advisory**: create + `metadata.possible_scope_mismatch`
   + fire escalator. Never reject.
+- Prose ATTRIBUTION (amended by task 3106): the advisory above fires only when
+  the submission declares **no** deliverable owned by the filing project. If any
+  entry across `metadata.files` ∪ `files_to_modify` ∪ `modules` resolves via
+  `project_for_path(...)` to the submitting project, the prose hit is an
+  incidental citation → create with **neither** stamp **nor** escalation, and
+  one structured INFO record naming the matched prefixes, the suggested owner
+  and the attesting signals. Consulted only AFTER the files decision returned
+  `ok`, so it can never soften a reject; mutually exclusive with the
+  cross-repo allow-and-tag path (task 3004), which requires every owned file
+  to be foreign.
 - `routing_override_reason` (task 1845) still short-circuits both.
 
 ## 6b. Boundary-test sketch (H) — faces both sides of each seam
@@ -309,7 +337,8 @@ Invariants:
 | BT-C1 | `update_task(metadata.done_provenance=…)` via tools.py **and** via interceptor | — | both surfaces return the **byte-identical** canonical rejection dict |
 | BT-C2 | `set_task_status('done', done_provenance=…)` | valid provenance | `stamp_audit_metadata` persists it; `get_task` shows `done_provenance` — sanctioned writer still works end-to-end |
 | BT-C3 | `update_task(status='done')` | — | rejected by backend floor via canonical `status_via_update_task` shape |
-| BT-D1 | Task: prose mentions `orchestrator/…`, `metadata.files` all in submitting project | multi-project registry | **created** with `possible_scope_mismatch` + escalation fired — NOT rejected |
+| BT-D1a | Task: prose mentions `orchestrator/…`, submission declares a deliverable OWNED by the submitting project | multi-project registry | **created**, **no** `possible_scope_mismatch`, **no** escalation — one structured INFO record instead (amended by task 3106; this row previously read as BT-D1b's outcome) |
+| BT-D1b | Task: prose mentions `orchestrator/…`, submission declares NO deliverable, or only UNOWNED ones (`README.md`) | multi-project registry | **created** with `possible_scope_mismatch` + escalation fired — NOT rejected |
 | BT-D2 | Task: `metadata.files` = `orchestrator/foo.py`, filed under reify | registry | **rejected** with structured error naming the owning project |
 | BT-D3 | `grep dark_factory_path_guard fused-memory/src` after D2 | — | empty (shim deleted); dark-factory mis-file still rejected via registry default |
 
@@ -394,11 +423,13 @@ Labels are PRD-local; task IDs assigned at decompose. `[modules]` are file-level
 
 - **D1** — `ProjectPrefixRegistry.project_for_path` + reject-on-files /
   advise-on-prose in the interceptor path-guard decision.
-  *Signal:* a task whose prose mentions another project's dir but whose
-  `metadata.files` are all in-project is **created** with
-  `metadata.possible_scope_mismatch` + a fired escalation; a task whose
-  `metadata.files` point at another project's tree is **rejected** with the
-  structured error naming the owner. *Consumer:* D2 + submit_task user surface.
+  *Signal:* a task whose prose mentions another project's dir but which
+  declares **no filer-owned deliverable** is **created** with
+  `metadata.possible_scope_mismatch` + a fired escalation; the same task
+  declaring a deliverable owned by the filing project is **created clean**
+  (amended by task 3106); a task whose `metadata.files` point at another
+  project's tree is **rejected** with the structured error naming the owner.
+  *Consumer:* D2 + submit_task user surface.
   *[project_prefix_registry.py, path_scope_guard.py, task_interceptor.py]*
 - **D2** — delete the `dark_factory_path_guard` shim. Switch interceptor imports
   to `path_scope_guard`; fold `DARK_FACTORY_PATH_PREFIXES` into the registry

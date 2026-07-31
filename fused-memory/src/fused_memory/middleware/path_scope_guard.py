@@ -18,10 +18,34 @@ The guard runs on TWO signals with different certainties.  DECLARED files
 (``metadata.files`` &c.) are classified exactly, via
 :meth:`ProjectPrefixRegistry.project_for_path`; PROSE is classified
 heuristically, via :func:`find_paths`.  Because prose cannot distinguish
-"modifies X" from "merely cites X", the prose branch is now gated on the
-declared signal: :func:`local_deliverable_attested` (task 3106) asks whether
-the submission declares any deliverable owned by the FILING project, and the
-interceptor suppresses the prose advisory when it does.
+"modifies X" from "merely cites X", the prose branch is gated on the declared
+signal (task 3106).
+
+That yields THREE outcomes at the interceptor's ``submit_task`` seam
+(``TaskInterceptor._path_guard_or_skip``), in evaluation order — recorded
+here so a future reader need not re-derive the taxonomy from the call site:
+
+1. FILES-CERTAIN REJECT (:func:`check_files_for_scope`, task 2206) — a
+   DECLARED file is owned by another project.  Hard reject, no LLM
+   adjudication: the owner is either known and different, or it isn't.
+2. CROSS-REPO ALLOW-AND-TAG (:func:`all_files_foreign_owner`, task 3004) —
+   EVERY owned declared file belongs to ONE other REGISTERED project, and
+   the filer is registered too.  A legitimate cross-repo deliverable: allowed
+   and tagged (``metadata.cross_repo``), not rejected.
+3. PROSE ADVISORY (:func:`check_text_for_scope`) — a heuristic hit in
+   title/description/details with no files-level mismatch.  NEVER rejects:
+   the task is created, stamped ``metadata.possible_scope_mismatch``, and a
+   non-blocking advisory escalation fires.  ITSELF GATED on attribution —
+   :func:`local_deliverable_attested` (task 3106) asks whether any declared
+   deliverable is owned by the FILING project, and the interceptor suppresses
+   BOTH the stamp and the escalation when one is, logging the decision at
+   INFO instead.  With no declared deliverable, or only unowned ones, the
+   advisory fires unchanged.
+
+(1) and (2) partition the DECLARED signal; (3) applies only once neither
+fired.  (2) and (3)'s suppression are logical complements — one needs every
+owned file foreign, the other needs at least one local — so they can never
+both apply.
 
 Wired into :class:`fused_memory.middleware.task_interceptor.TaskInterceptor`
 at the ``submit_task`` entry point.  Path-guard
