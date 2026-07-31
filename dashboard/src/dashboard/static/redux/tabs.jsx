@@ -3,7 +3,12 @@ const { Sparkline: SP, LineChart: LC, StackedAreaChart: SA, BarChart: BC, HBarCh
 const { Glyph: GL, ProjectGroup, Segmented, ChipGroup } = window.DF_SHELL;
 const DF = window.DF_DATA;
 const { rtCell, rtAge } = window.DF_RUNTIME_FMT;
-const { orchEmptyLabel } = window.DF_ORCH_FILTER;
+// Guarded, unlike the DF_* destructures above: those globals gate real
+// rendering, but orchEmptyLabel only supplies one cosmetic empty-state label.
+// A 404'd / mis-ordered orch_filter.js must not throw here and blank every tab
+// defined in this file — index.html's load order (guarded by
+// test_index_html.py) is the real contract; this is the degradation path.
+const { orchEmptyLabel } = window.DF_ORCH_FILTER || { orchEmptyLabel: () => 'No tasks' };
 const { useState: uS, useEffect: uE } = React;
 
 // shared open-state helper for furl/unfurl, persisted to localStorage by key

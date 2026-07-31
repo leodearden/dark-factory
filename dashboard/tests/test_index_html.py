@@ -545,15 +545,32 @@ def test_runtime_format_js_loads_before_tab_tasks(index_html_body: str) -> None:
 _ORCH_FILTER_PREFIX = '/static/redux/orch_filter.js'
 
 
+def test_orch_filter_js_is_served(client) -> None:
+    """GET /static/redux/orch_filter.js returns 200.
+
+    The load-order guard below only inspects the <script> tag's position in
+    index.html, so a file that exists in git but is not actually served (a
+    packaging or StaticFiles-mount regression) would keep CI green while the
+    browser 404s. tabs.jsx degrades to a plain 'No tasks' label in that case
+    rather than blanking the tab, which makes the failure quiet enough to need
+    its own assertion.
+    """
+    resp = client.get(_ORCH_FILTER_PREFIX)
+    assert resp.status_code == 200, (
+        f'expected 200 for {_ORCH_FILTER_PREFIX}, got {resp.status_code} — the '
+        'module is registered in index.html but not reachable at runtime.'
+    )
+
+
 def test_orch_filter_js_loads_before_tabs(index_html_body: str) -> None:
     """orch_filter.js must load as a classic synchronous script BEFORE tabs.jsx.
 
     tabs.jsx destructures {orchEmptyLabel} from window.DF_ORCH_FILTER at
-    top-level execution time (unguarded, matching the window.DF_RUNTIME_FMT
-    precedent on the line above it) — if orch_filter.js loaded after (or not at
-    all), that destructure would throw on a bare undefined and take the whole
-    Orchestrators tab down, which is strictly worse than the
-    "No [object Object] tasks" render it replaces.
+    top-level execution time — if orch_filter.js loaded after (or not at all),
+    that destructure falls through to its `|| { orchEmptyLabel }` guard and
+    every Orchestrators empty cell silently degrades to a bare 'No tasks',
+    losing the per-facet sentence this task added. Correct load order is the
+    real contract; the guard only keeps a missing module from blanking the tab.
     """
     _assert_script_loads_before(
         index_html_body,

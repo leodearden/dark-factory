@@ -14,7 +14,9 @@
 //
 // index.html loads this file (classic script, before the Babel JSX tags) so
 // `window.DF_ORCH_FILTER` is defined before tabs.jsx executes its top-level
-// `const { orchEmptyLabel } = window.DF_ORCH_FILTER;` destructure.
+// destructure of it. That destructure carries a `|| { orchEmptyLabel }`
+// fallback, so a 404'd or mis-ordered load costs the operator one cosmetic
+// label rather than blanking every tab defined in tabs.jsx.
 //
 // Load-bearing contract (task 3313): the cell this feeds used to read
 // `No {filter === 'all' ? '' : filter + ' '}tasks`, but OrchTab's `filter` is
@@ -82,8 +84,8 @@ function orchEmptyLabel(filter) {
 // here would collide with graph_layout.js's, throwing "Identifier 'API' has
 // already been declared" and aborting this entire script (see
 // runtime_format.js's / prd_grouping.js's identical note), silently leaving
-// window.DF_ORCH_FILTER undefined and breaking tabs.jsx's top-level
-// destructure of it. ORCH_FILTER_FACETS / ORCH_FILTER_NONE_SELECTED /
+// window.DF_ORCH_FILTER undefined and downgrading every empty cell to
+// tabs.jsx's fallback label. ORCH_FILTER_FACETS / ORCH_FILTER_NONE_SELECTED /
 // orchEmptyLabel are uniquely named across that directory for the same reason.
 const ORCH_FILTER_API = { orchEmptyLabel };
 
