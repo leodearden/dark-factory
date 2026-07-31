@@ -138,7 +138,21 @@ def build_query(
         group_values = '|'.join(f'"{escape_group_id(gid)}"' for gid in group_ids)
         group_filter = f'(@group_id:{group_values})'
 
-    terms = [w for w in sanitized_text.split() if w.lower() not in STOPWORDS]
+    # `is_searchable_term` is the repair, and it is NOT redundant with sanitize().
+    # sanitize() leaves `_` and backticks alone, but RediSearch's own tokenizer
+    # reduces a token like `_`, `__` or ``` `` ``` to NOTHING.  Emitted into the
+    # ' | '-joined operand list, such a token leaves the union operator with no
+    # right-hand operand, and the whole query fails to parse:
+    #     RediSearch: Syntax error at offset N near <the PRECEDING word>
+    # The message names the word BEFORE the fault, so it reads as a reserved-word
+    # collision and has twice sent an investigation down that path (dead-letter
+    # 9950, and an identical 2026-04-02 occurrence). Do not "simplify" this
+    # predicate away because the tokens look harmless in the source text.
+    terms = [
+        w
+        for w in sanitized_text.split()
+        if w.lower() not in STOPWORDS and is_searchable_term(w)
+    ]
     joined = ' | '.join(terms)
 
     # Upstream's over-length guard, arithmetic included. See docstring.
