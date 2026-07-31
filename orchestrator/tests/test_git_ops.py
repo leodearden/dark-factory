@@ -11,7 +11,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-from _orch_helpers import NonIsolatedGitRepoError
+from _orch_helpers import (
+    NonIsolatedGitRepoError,
+    assert_isolated_git_repo,
+    git_env_with_ceiling,
+)
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig
@@ -84,10 +88,32 @@ async def _inject_uu_state(cwd: Path, path: str, tag: str = '') -> None:
 
     *tag* is interpolated into the blob content so that multiple calls in the
     same repository produce distinct shas even for different paths.
+
+    ISOLATION INVARIANT (esc-3072-3): *cwd* must BE a git repository root, so
+    this helper can only ever mutate the repo rooted exactly there.  Git's
+    repository discovery walks UP the directory tree, so a *cwd* that is merely
+    *inside* some repo silently retargets whatever encloses it — and when
+    pytest's basetemp lives inside a live task worktree
+    (``.worktrees/<task>/.pytest-tmp/``) that is production state.  This helper
+    once wrote three blobs into a live worktree's object store and staged
+    ``foo.py`` at stages 1/2/3, leaving a real task's index unmerged.
+
+    Two layers enforce that invariant, and neither is redundant:
+
+    * :func:`assert_isolated_git_repo` runs FIRST, before any subprocess, so a
+      rejected call writes nothing anywhere.  Nothing weaker suffices —
+      ``git hash-object -w`` below writes its blobs before ``git update-index``
+      can fail, so a guard that only makes git error out mid-sequence still
+      leaves objects behind in the victim.
+    * :func:`git_env_with_ceiling` caps git's upward walk at *cwd*, so escape is
+      impossible at the git level even if the pre-flight is ever refactored away.
     """
+    assert_isolated_git_repo(cwd)
+    env = git_env_with_ceiling(cwd)
+
     def _run_sync(cmd, **kwargs):
         return subprocess.run(
-            cmd, cwd=str(cwd), capture_output=True, check=True, **kwargs,
+            cmd, cwd=str(cwd), capture_output=True, check=True, env=env, **kwargs,
         )
 
     h1 = _run_sync(
@@ -3398,14 +3424,24 @@ class TestUnmergedDetection:
     async def test_inject_uu_state_raises_on_non_git_cwd(
         self, tmp_path: Path,
     ):
-        """_inject_uu_state raises CalledProcessError when cwd is not a git repo.
+        """_inject_uu_state refuses a cwd that is not a git repository root.
 
-        git hash-object exits with rc != 0 in a non-git directory; without
-        check=True the helper silently builds an invalid payload.  With
-        check=True it raises immediately, turning silent corruption into an
-        actionable CalledProcessError that includes stderr.
+        This expectation used to be ``pytest.raises(CalledProcessError)``, on
+        the premise that "git fails in a non-git directory".  That premise was
+        CONDITIONAL, and the condition was invisible: it holds only while
+        pytest's basetemp is not itself nested inside a git repo.  Under a
+        basetemp inside a live task worktree the bare ``tmp_path`` below IS
+        inside a repo, git's upward walk resolves it, the injection SUCCEEDS,
+        and the test then reports a puzzling "DID NOT RAISE" — long after the
+        blobs have already landed in the victim's object store (esc-3072-3).
+
+        ``NonIsolatedGitRepoError`` holds unconditionally, because the guard
+        decides from the filesystem shape of *cwd* alone rather than from
+        whatever git happens to find above it.  It is also unambiguous: a bare
+        ``CalledProcessError`` can arise from any incidental git failure,
+        whereas this type proves the isolation guard specifically fired.
         """
-        with pytest.raises(subprocess.CalledProcessError):
+        with pytest.raises(NonIsolatedGitRepoError):
             await _inject_uu_state(tmp_path, 'foo.py')
 
     async def test_inject_uu_state_cannot_mutate_an_enclosing_repo(
