@@ -318,3 +318,79 @@ def test_per_module_merge_verify_raises_per_test_timeout() -> None:
                 f"--timeout={timeout_value}, which is below the 300s floor "
                 "(task 2769) mirroring the FALLBACK chain's own convention"
             )
+
+
+# Measured per-segment wall-clock of the FALLBACK fleet chain, in seconds.
+#
+# PROVENANCE: task 3062, .task/verify/attempt-2.__fallback__.{summary.json,
+# test.log}; run started 2026-07-31T02:00:48Z under `nice -n 15 ionice -c2 -n7`;
+# surfaced as escalation esc-3062-3. These are LOGGED durations, not estimates.
+#
+# `tests/scripts` uses the LOWEST of four independent measurements (105-127s),
+# and `dashboard`, `sampler` and `cockpit` are OMITTED ENTIRELY — the run timed
+# out at 1800.66s before dashboard even started, so no figure exists for them.
+# The sum is therefore a hard measured LOWER BOUND on the chain's cost: the real
+# green-path chain is strictly more expensive than this, never less.
+MEASURED_FLEET_SEGMENT_SECS = {
+    'shared': 120.21,
+    'escalation': 123.29,
+    'orchestrator': 1366.23,
+    'fused-memory': 123.87,
+    'tests/scripts': 105.0,
+}
+
+
+def _verify_budgets() -> dict:
+    return yaml.safe_load(DF_CONFIG_PATH.read_text(encoding='utf-8'))
+
+
+def test_fallback_verify_budget_clears_the_measured_fleet_chain_floor() -> None:
+    """The warm per-command budget must exceed the MEASURED fleet-chain floor.
+
+    Task 3350. ``verify_command_timeout_secs`` is a PER-COMMAND budget and the
+    fleet chain is ONE shell command, so this single ceiling bounds all seven
+    suites together. It was set to 1800s under the comment "Full warm verify
+    here is ~2 min" — false by roughly an order of magnitude.
+
+    A ceiling below a five-of-seven-segment measured floor cannot be cleared by
+    a healthy run, so it does not surface hangs; it manufactures ``infra_timeout``
+    on the honest green path. That is what task 3062 attempt-2 hit at 1800.66s.
+
+    This asserts against the measured floor rather than pinning the chosen
+    value, deliberately. Pinning a number would re-encode a constant that the
+    next suite-growth event falsifies again — the exact failure mode of the
+    "~2 min" comment this test exists to replace. A floor derived from logged
+    per-suite durations cannot be wrong in the direction that matters (three
+    segments are excluded, so it is provably a lower bound), and it keeps
+    failing loudly if the suite grows past the recorded floor — at which point
+    ``MEASURED_FLEET_SEGMENT_SECS``, with its provenance comment above, is the
+    obvious thing to re-measure.
+    """
+    budgets = _verify_budgets()
+    warm = budgets['verify_command_timeout_secs']
+    floor = sum(MEASURED_FLEET_SEGMENT_SECS.values())
+
+    assert warm > floor, (
+        f'dark-factory-orchestrator.yaml verify_command_timeout_secs={warm} is '
+        f'below the measured fleet-chain floor of {floor:.2f}s — short by '
+        f'{floor - warm:.2f}s (task 3350). That floor sums only FIVE of seven '
+        f'logged segments ({", ".join(sorted(MEASURED_FLEET_SEGMENT_SECS))}); '
+        'dashboard, sampler and cockpit are excluded entirely because task 3062 '
+        'attempt-2 timed out at 1800.66s before dashboard even started. A '
+        'per-command ceiling below a five-of-seven floor surfaces no hangs — it '
+        'manufactures infra_timeout on the honest green path. Raise the budget, '
+        'or split the chain and re-measure this table.'
+    )
+
+    # Internal coherence: a cold run does strictly MORE work than a warm one —
+    # the same chain PLUS verify_cold_preprovision_command (uv sync
+    # --all-packages) — so a warm ceiling above the cold one is incoherent by
+    # construction, regardless of what either value is.
+    cold = budgets['verify_cold_command_timeout_secs']
+    assert warm <= cold, (
+        f'verify_command_timeout_secs={warm} exceeds '
+        f'verify_cold_command_timeout_secs={cold} (task 3350). A cold verify runs '
+        'the same command chain plus the uv sync --all-packages preprovision, so '
+        'it is strictly more expensive; a warm budget above the cold one is '
+        'incoherent by construction'
+    )
