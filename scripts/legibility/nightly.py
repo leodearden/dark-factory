@@ -667,6 +667,23 @@ def run_nightly(
     # signal-item count, so this is roughly a 2x on the job's dominant cost.
     rendered: dict[tuple, str] = {}
     sample = select_digest_sessions(cfg, projects_root, target_date, rendered=rendered)
+
+    # The operator's grep anchor, emitted on EVERY run whatever the outcome:
+    # what was enumerated, what was thrown away and why, what the budget
+    # bought. Placed BEFORE the digest stage so the numbers are reported even
+    # when a later stage fails loud and returns early. Its VISIBILITY depends
+    # on main()'s config.configure_logging() call -- the journal's root logger
+    # defaults to WARNING, so an INFO line nobody configured for is an INFO
+    # line nobody sees; the two halves are one contract, and a night whose
+    # accounting is invisible is the defect this line exists to fix.
+    logger.info(
+        'legibility trickle sampler: project=%s date=%s %s',
+        cfg.project_id, target_date.isoformat(),
+        sampling.format_sample_summary_line(
+            sample, max_bytes=cfg.budgets.max_daily_digest_bytes,
+        ),
+    )
+
     digests, extractor_failures = build_digests(sample.selected, rendered=rendered)
 
     if extractor_failures:
