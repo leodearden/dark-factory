@@ -1226,6 +1226,7 @@ async def invoke_with_cap_retry(
                     CapHit,
                     CliLocalError,
                     ModelNotFound,
+                    ServerError,
                     ZeroOutputWedge,
                     classify_invocation,
                 )
@@ -1382,16 +1383,37 @@ async def invoke_with_cap_retry(
                     and result.turns <= 1
                     and result.duration_ms < 5000
                 ):
-                    if isinstance(outcome, CliLocalError):
-                        # A recognised local CLI/usage error (e.g. --session-id
-                        # collision) exits zero-cost and instantly, but it is NOT a
-                        # usage cap.  Counting it as a cap loops forever (reify-3604).
-                        # Fall through: Branch C retries fresh when resuming, else the
-                        # failed result is returned for normal verify/steward handling.
-                        logger.warning(
-                            f'{label}: zero-cost instant exit is a CLI error, not a cap '
-                            f'(stderr={result.stderr[:160]!r}) — not counting as cap hit',
-                        )
+                    if isinstance(outcome, (CliLocalError, ServerError)):
+                        # Two different causes, one mechanism: a zero-cost instant
+                        # exit that we can POSITIVELY attribute to something other
+                        # than a cap must not be counted as a cap.
+                        #
+                        # CliLocalError — a recognised local CLI/usage error (e.g.
+                        # --session-id collision) exits zero-cost and instantly, but
+                        # it is NOT a usage cap.  Counting it as a cap loops forever
+                        # (reify-3604).
+                        #
+                        # ServerError — a fast 5xx (e.g. 529 Overloaded) has exactly
+                        # the same zero-cost / <=1-turn / sub-5s shape, so without
+                        # this escape the net marks a perfectly HEALTHY account
+                        # CAPPED and fails over pointlessly (2026-07-29 incident).
+                        # This escape is what prevents that; the terminal branch
+                        # below is what then exits the loop.
+                        #
+                        # Fall through: Branch C retries fresh when resuming, else
+                        # the failed result is returned for normal verify/steward
+                        # handling.
+                        if isinstance(outcome, ServerError):
+                            logger.warning(
+                                f'{label}: zero-cost instant exit is a server-side API '
+                                f'error (HTTP {outcome.status}), not a cap — not '
+                                f'counting as cap hit, not mutating account state',
+                            )
+                        else:
+                            logger.warning(
+                                f'{label}: zero-cost instant exit is a CLI error, not a cap '
+                                f'(stderr={result.stderr[:160]!r}) — not counting as cap hit',
+                            )
                     else:
                         logger.warning(
                             f'{label}: suspicious zero-cost instant exit (turns={result.turns}, '
@@ -1441,6 +1463,50 @@ async def invoke_with_cap_retry(
 
                             await asyncio.sleep(cooldown)
                             continue
+
+                # Server-side API error is TERMINAL for this loop (task 3314,
+                # PRD decision 4).  Server errors are NOT account-scoped — the
+                # 2026-07-29 incident data showed the FRESHEST account carrying
+                # the HIGHEST failure rate — so cross-account failover only
+                # multiplies load on an already-degraded provider without ever
+                # finding a healthy account.  The failed result goes straight
+                # back to the caller, and the workflow/scheduler (PRD tasks
+                # γ/β) owns the requeue, with pacing.
+                #
+                # `slot.confirm` (mirroring the ModelNotFound terminal branch
+                # above) settles the slot as a normal completion WITHOUT any
+                # cap/auth transition: "no account mutation" means no phase
+                # change, not an unsettled slot.
+                #
+                # Placement is load-bearing in three directions:
+                # - AFTER slot.detect_cap_hit, so the loop's control flow
+                #   mirrors the sum type's CapHit > ServerError precedence
+                #   exactly and a 429/cap-body result keeps today's cap-and-
+                #   failover path byte-for-byte.
+                # - AFTER the heuristic net, which keeps that net's ServerError
+                #   escape live as defence-in-depth (it, not this break, is
+                #   what stops a fast 529 from marking a healthy account
+                #   CAPPED).
+                # - BEFORE the "resume failed → retry fresh" fallback below,
+                #   which would otherwise restart the invocation on a new slot
+                #   — an implicit failover the PRD forbids.
+                #
+                # Note: because ServerError now outranks ZeroOutputWedge, the
+                # wedge resume-guard above no longer fires for a timed-out 5xx.
+                # This branch exits the loop instead, so the orphaned provider
+                # session is still never re-resumed (PRD decision 2's intent) —
+                # which is why is_zero_output_timeout itself stays deliberately
+                # shape-based and untouched.
+                if isinstance(outcome, ServerError):
+                    logger.warning(
+                        f'{label}: server-side API error (HTTP {outcome.status}) on '
+                        f'account {account_name} — not account-scoped, no '
+                        f'cross-account failover; returning result to caller for '
+                        f'transient requeue',
+                    )
+                    if not unattributed_cap:
+                        slot.confirm(result.cost_usd)
+                    break
 
                 # Progress-timeout guard (reify-4827, task 2360 fix #2): a
                 # RESUMED invocation that hit the working-regime ceiling but
