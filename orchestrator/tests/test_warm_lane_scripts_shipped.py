@@ -728,3 +728,113 @@ class TestSiblingResolutionIgnoresTheCallersCwd:
             f'CWD ({tmp_path}) rather than under {WARM_LANE_SCRIPT_DIR}.\n'
             f'output:\n{combined}'
         )
+
+    def test_reseed_does_not_execute_a_seed_script_from_the_callers_cwd(
+        self, tmp_path: Path,
+    ) -> None:
+        """``thin-warm-lane.sh --reseed`` EXECUTES what it resolves.
+
+        The other three scripts here merely *source* the mis-resolved path;
+        this one runs it as a program, with the lane dir as an argument.
+
+        MEASURED RED on base HEAD 8d276d3c5f: the decoy ran — stderr carries
+        the marker followed by ``[ok] Re-seeded: <lane>/target``, i.e.
+        thin-warm-lane reported SUCCESS for a reseed performed by an arbitrary
+        file picked up off the caller's CWD.
+
+        Reachability, recorded honestly because it is what makes this
+        low-priority rather than urgent: ``_script_dir`` is computed only when
+        ``--seed-script`` was NOT passed, and README "Delta 3" states
+        dark-factory's own caller never passes ``--reseed`` at all.  The
+        exposure is a future caller — and the warning Delta 3 already carries
+        ("any future caller that does pass --reseed must also pass
+        --seed-script") is exactly the one this closes properly.
+
+        Note also what hiding ``dirname`` CONVERTS: with a full ``PATH`` the
+        default seed script resolves to a sibling that deliberately does not
+        exist here (``seed-warm-lane.sh`` stayed project-owned, PRD §5), so the
+        reseed fails harmlessly and says so.  Hiding ``dirname`` turns that
+        safe no-op into an execution.
+        """
+        lane = tmp_path / 'lane'
+        (lane / 'target').mkdir(parents=True)
+        base = tmp_path / 'base-target'
+        base.mkdir()
+
+        proc = subprocess.run(
+            [
+                _BASH, str(WARM_LANE_SCRIPT_DIR / 'thin-warm-lane.sh'),
+                str(lane), '--reseed', '--base', str(base),
+            ],
+            cwd=str(_decoy_dir(tmp_path, 'seed-warm-lane.sh')),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=_sanitized_env(extra={
+                'PATH': (
+                    f'{_path_hiding(tmp_path, "dirname")}'
+                    f'{os.pathsep}{os.environ["PATH"]}'
+                ),
+            }),
+        )
+        combined = proc.stdout + proc.stderr
+
+        assert _DECOY_MARKER not in combined, (
+            'thin-warm-lane.sh --reseed EXECUTED a seed script from the '
+            f'CALLER\'S CWD instead of resolving one beside itself in '
+            f'{WARM_LANE_SCRIPT_DIR}.\noutput:\n{combined}'
+        )
+
+
+class TestNoShippedScriptResolvesItsOwnDirectoryByForking:
+    """Directory-wide drift gate: the forking spelling appears ZERO times.
+
+    D2 forces the correct idiom to be DUPLICATED across five scripts — a
+    script's own directory is what tells it where its libs are, so the
+    resolution cannot be extracted into a sourceable helper without depending
+    on the very thing it resolves.  That rules out the single-definition-site
+    guard task 3074 used for the record-scalar ``sed`` idiom.  This is its
+    inverse and the only such discipline available here: instead of "the idiom
+    appears exactly once", assert "the forking spelling appears zero times".
+
+    Scoped to SELF-directory resolution deliberately, along two axes, because
+    a blanket ``dirname`` scan false-trips on things that are not this defect:
+
+    * By SPELLING — ``warm-lane-gc.sh`` legitimately forks
+      ``dirname "$MOUNT"`` for ``BASE_TARGET``, which is arithmetic on an
+      argument, not on the script's own location.
+    * By COMMENT — ``lib_portable.sh:5`` and ``lib_lane_state.sh:6`` both
+      document their own ``source "$(dirname "${BASH_SOURCE[0]}")/<lib>"``
+      call convention in a usage header.  That is the CALLER's spelling being
+      quoted in prose; measured, an unscoped gate reports both as offenders.
+      Only whole-line comments are skipped, so a real resolution with a
+      trailing comment is still caught.
+
+    ``warm-lane-disk-guard.sh`` and ``warm-lane-degenerate-ref-check.sh``
+    carry no self-directory resolution at all and pass trivially.
+    """
+
+    #: The two spellings of "resolve my own directory by forking ``dirname``".
+    FORKING_SELF_DIR = (
+        '$(dirname "${BASH_SOURCE',
+        '$(dirname "$0"',
+    )
+
+    def test_no_shipped_script_resolves_its_own_directory_by_forking_dirname(
+        self,
+    ) -> None:
+        offenders = [
+            f'{path.name}:{lineno}: {line.strip()}'
+            for path in sorted(WARM_LANE_SCRIPT_DIR.glob('*.sh'))
+            for lineno, line in enumerate(path.read_text().splitlines(), start=1)
+            if not line.lstrip().startswith('#')
+            and any(spelling in line for spelling in self.FORKING_SELF_DIR)
+        ]
+
+        assert not offenders, (
+            'These shipped scripts still resolve their own directory by '
+            'forking `dirname`, so under a PATH without it the substitution '
+            'is EMPTY, `cd ""` succeeds as a no-op, and the directory becomes '
+            'the caller\'s CWD (README.md "Delta 7"):\n  '
+            + '\n  '.join(offenders)
+        )
