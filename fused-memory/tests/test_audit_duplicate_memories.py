@@ -8,6 +8,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import types
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -55,6 +56,7 @@ fetch_memories = _mod.fetch_memories
 _ALL_CATEGORIES = _mod._ALL_CATEGORIES
 extract_liveness_snapshot_fact = _mod.extract_liveness_snapshot_fact
 liveness_snapshot_subject_task_ids = _mod.liveness_snapshot_subject_task_ids
+find_liveness_snapshot_recurrences = _mod.find_liveness_snapshot_recurrences
 apply_deletions = _mod.apply_deletions
 resolve_ann_threshold = _mod.resolve_ann_threshold
 fetch_ann_neighbors = _mod.fetch_ann_neighbors
@@ -3902,3 +3904,118 @@ class TestLivenessSnapshotSubjectTaskIds:
         liveness_snapshot_subject_task_ids(record)
 
         assert json.dumps(record, sort_keys=True, default=str) == before
+
+
+def _liveness_corpus() -> list[dict]:
+    """The four real solar_challenge records, in their real shapes."""
+    return [
+        _dated('6b245659', _LIVENESS_SNAPSHOT_94_JUL24, _TS_94_JUL24,
+               category=_OS, metadata={'task_id': '94',
+                                       'kind': 'stranded_task_investigation'}),
+        _dated('08aa0017', _LIVENESS_SNAPSHOT_96_JUL24, _TS_96_JUL24,
+               category=_OS, metadata={'task_id': '96',
+                                       'kind': 'live_workflow_deferral_note'}),
+        _dated('68dd5f93', _INVESTIGATION_NOTE_96, _TS_NOTE_96,
+               category=_OS, metadata={'task_id': '96',
+                                       'kind': 'investigation_note'}),
+        _dated('1eef7df7', _LIVENESS_REVERIFY_94_96_JUL26, _TS_REVERIFY,
+               category=_OS, metadata={'task_id': '99',
+                                       'related_task_ids': ['94', '96'],
+                                       'kind': 'task_lifecycle_reverification'}),
+    ]
+
+
+def _span_days(earlier: str, later: str) -> float:
+    return (datetime.fromisoformat(later).timestamp()
+            - datetime.fromisoformat(earlier).timestamp()) / 86400.0
+
+
+class TestFindLivenessSnapshotRecurrences:
+    """The two groups the real corpus contains -- and nothing else.
+
+    `metadata.kind` differs across all four records, so the grouping key is
+    (category, subject_task_id, core_fact). Subject 99 is a singleton and
+    68dd5f93 is not a snapshot at all: both fall out, which is the
+    "preserve genuinely unique investigative content" requirement.
+    """
+
+    def test_exactly_the_two_real_groups(self):
+        groups, _ = find_liveness_snapshot_recurrences(_liveness_corpus())
+
+        assert [(g['subject_task_id'], g['member_ids']) for g in groups] == [
+            ('94', ['1eef7df7', '6b245659']),
+            ('96', ['08aa0017', '1eef7df7']),
+        ]
+        assert all(g['snapshot_count'] == 2 for g in groups)
+        assert all(g['category'] == _OS for g in groups)
+        assert all(g['core_fact'] == _CORE_FACT_STRANDED for g in groups)
+
+    def test_singleton_subject_and_non_snapshot_are_absent(self):
+        groups, _ = find_liveness_snapshot_recurrences(_liveness_corpus())
+
+        assert '99' not in {g['subject_task_id'] for g in groups}, (
+            'one snapshot about task 99 is a singleton, not a recurrence'
+        )
+        assert all('68dd5f93' not in g['member_ids'] for g in groups), (
+            'the prose-only investigation note carries no repeated core fact'
+        )
+
+    def test_first_seen_last_seen_and_span_days(self):
+        groups, _ = find_liveness_snapshot_recurrences(_liveness_corpus())
+        by_subject = {g['subject_task_id']: g for g in groups}
+
+        assert by_subject['94']['first_seen'] == _TS_94_JUL24
+        assert by_subject['94']['last_seen'] == _TS_REVERIFY
+        assert by_subject['94']['span_days'] == _span_days(_TS_94_JUL24, _TS_REVERIFY)
+        assert by_subject['96']['first_seen'] == _TS_96_JUL24
+        assert by_subject['96']['last_seen'] == _TS_REVERIFY
+        assert by_subject['96']['span_days'] == _span_days(_TS_96_JUL24, _TS_REVERIFY)
+
+    def test_no_parseable_timestamp_reports_none_not_a_fabricated_span(self):
+        undated = [
+            _dated('a', _LIVENESS_SNAPSHOT_94_JUL24, None,
+                   category=_OS, metadata={'task_id': '94'}),
+            _dated('b', _LIVENESS_REVERIFY_94_96_JUL26, 'not-a-timestamp',
+                   category=_OS, metadata={'task_id': '94'}),
+        ]
+        groups, _ = find_liveness_snapshot_recurrences(undated)
+
+        assert len(groups) == 1
+        assert groups[0]['first_seen'] is None
+        assert groups[0]['last_seen'] is None
+        assert groups[0]['span_days'] is None
+
+    def test_input_order_does_not_change_the_result(self):
+        corpus = _liveness_corpus()
+        shuffled = [corpus[3], corpus[1], corpus[0], corpus[2]]
+
+        assert (find_liveness_snapshot_recurrences(shuffled)[0]
+                == find_liveness_snapshot_recurrences(corpus)[0])
+
+    def test_input_is_not_mutated(self):
+        corpus = _liveness_corpus()
+        before = json.dumps(corpus, sort_keys=True, default=str)
+
+        find_liveness_snapshot_recurrences(corpus)
+
+        assert json.dumps(corpus, sort_keys=True, default=str) == before
+
+    def test_grouping_never_unions_across_categories(self):
+        """A preference and an observation reporting the same live fields are
+        different kinds of knowledge -- the same invariant build_sweep_plan
+        enforces by clustering per category."""
+        corpus = _liveness_corpus()
+        corpus[0]['category'] = _PN  # 6b245659, the other half of subject 94
+
+        groups, _ = find_liveness_snapshot_recurrences(corpus)
+
+        assert [g['subject_task_id'] for g in groups] == ['96'], (
+            'subject 94 is now one snapshot per category -- two singletons'
+        )
+
+    def test_unswept_categories_are_ignored(self):
+        corpus = _liveness_corpus()
+
+        groups, _ = find_liveness_snapshot_recurrences(corpus, categories=(_PK,))
+
+        assert groups == []
