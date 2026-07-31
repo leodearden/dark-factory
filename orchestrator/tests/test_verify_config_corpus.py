@@ -120,7 +120,7 @@ class TestCorpusCoversEveryLiveLintCommand:
     """
 
     def test_discovered_modules_are_exactly_the_covered_modules(self):
-        discovered = set(discover_lint_command_modules())
+        discovered = discover_lint_command_modules()
         covered = {'fused-memory'} | set(MODULE_LINT_COMMANDS)
 
         uncovered = discovered - covered
