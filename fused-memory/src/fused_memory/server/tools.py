@@ -677,6 +677,32 @@ def create_mcp_server(
             return verdict.to_error_dict()
         return None
 
+    def _halt_payload(project_id: str | None = None) -> dict[str, Any] | None:
+        """The single ``reconciliation_halt`` shape shared by every tool that
+        reports halt state (task 3050).
+
+        Returns None when no harness/judge is wired — callers then omit the
+        field entirely, which keeps the legacy payloads byte-identical (the
+        same gate task 2920 used for ``reconciliation_backlog``) and means an
+        unwired deployment never has a trigger blocked by missing
+        observability.
+
+        Always carries ``halted_projects`` (the fleet view — a halt nobody
+        knew to look for). When ``project_id`` is supplied, the per-project
+        snapshot is merged in: halted / halt_reason / halted_at /
+        cooldown_until / cooldown_expired / unhalt_grace_remaining. One
+        builder, so the same fact never grows two shapes across three tools —
+        that divergence is what made the durable-write-queue counts and the
+        reconciliation backlog confusable in the first place.
+        """
+        if reconciliation_harness is None or reconciliation_harness.judge is None:
+            return None
+        judge = reconciliation_harness.judge
+        payload: dict[str, Any] = {'halted_projects': judge.halted_projects()}
+        if project_id is not None:
+            payload.update(judge.halt_snapshot(project_id))
+        return payload
+
     # WP-E (task 1549): reject write-tool calls whose project_id is absent from
     # the known_projects registry.  Mirrors _backlog_gate but is synchronous and
     # fires BEFORE _backlog_gate so an unknown id never touches downstream state.
@@ -2821,6 +2847,24 @@ def create_mcp_server(
     ) -> dict[str, Any]:
         """Health check and statistics for both backends.
 
+        Emits a top-level ``reconciliation_halt`` field when a reconciliation
+        harness is wired (task 3050). It always carries ``halted_projects``
+        (every currently-halted project id), plus — when ``project_id`` is
+        supplied — ``halted``, ``halt_reason``, ``halted_at``,
+        ``cooldown_until``, ``cooldown_expired`` and
+        ``unhalt_grace_remaining``.
+
+        Read it whenever ``get_queue_stats``' ``reconciliation_backlog`` looks
+        large: that one number has two causes with OPPOSITE remedies — the
+        project is HALTED (remedy: ``unhalt_reconciliation``) or the pipeline
+        cannot keep up (remedy: capacity, task 3049). Before this field
+        existed a halt was observable only in harness logs, and one ran
+        unnoticed for 48h.
+
+        The field is deliberately top-level rather than inside ``queue``:
+        ``queue`` is the durable-write-queue subsystem, and conflating it with
+        reconciliation state is the exact mis-triage task 2920 fixed.
+
         Args:
             project_id: Get stats for a specific project (optional)
         """
@@ -2865,6 +2909,12 @@ def create_mcp_server(
                 'event_queue': event_dead,
                 'total': durable_dead + event_dead,
             }
+
+        # task 3050 (A): surface reconciliation halt state so an operator can
+        # tell a HALTED project from one that merely cannot keep up. Top-level,
+        # not under `queue` — see the docstring.
+        if isinstance(result, dict) and (halt := _halt_payload(project_id)) is not None:
+            result['reconciliation_halt'] = halt
 
         return result
 
