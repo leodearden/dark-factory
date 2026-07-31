@@ -41,7 +41,13 @@ and "a failing get_statuses fails SAFE" is testable with a raising fake.
 standalone CLI, unwrapping the real MCP `tools/call` JSON-RPC envelope via
 `_extract_tool_result` (the tool's actual return value lives at
 `result.structuredContent` or `result.content[0].text`, never at the
-envelope's top level); task ε injects the real MCP-backed fetcher.
+envelope's top level); task ε injects the real MCP-backed fetcher. It
+resolves its `project_root` to an ABSOLUTE path before sending it: the MCP
+argument is interpreted by the server's cwd, not the client's, and
+fused-memory's `_normalize_project_root` hard-rejects any relative path
+(task 3291). Whatever the fetcher returns is converted to a number by
+`extract_done_count`, never by an inline `.get("statuses")` -- see that
+function for why.
 """
 from __future__ import annotations
 
@@ -605,8 +611,37 @@ def default_status_fetcher(project_root: str | Path):
     `_extract_tool_result` before returning, so the callable's return value
     matches `compute_tasks_landed`'s expected `{"statuses": {...}}` shape
     instead of the outer JSON-RPC envelope.
+
+    *project_root* is resolved to an ABSOLUTE path before it crosses the
+    wire: the MCP `get_statuses` argument is interpreted by the SERVER's
+    cwd, not the client's, so a relative path is meaningless there and is
+    hard-rejected by fused-memory's `_normalize_project_root` (task 3291 --
+    see the comment at the resolve call below).
     """
-    project_root_str = str(project_root)
+    # THE ROOT-CAUSE FIX (task 3291). The MCP argument is resolved by the
+    # server process, not this one, so a relative path is not merely
+    # fragile -- fused-memory's `_normalize_project_root` rejects it
+    # outright with {"error": "project_root must be a non-empty absolute
+    # path, got: '.'", "error_type": "ValidationError"}. That envelope rides
+    # an `isError: false` JSON-RPC response, so it used to sail through
+    # `_extract_tool_result` and get counted as a done-count of 0.
+    #
+    # In production this call ALWAYS carried a relative path: census.py's
+    # CLI defaults --project-root to "." and nightly._default_census_launcher
+    # (nightly.py:521) launches census.py with no arguments at all.
+    #
+    # Resolving HERE, at the wire boundary, rather than at each CLI
+    # entrypoint, fixes every consumer at once -- census.py's main(), the
+    # nightly trickle's decide_for_project, and the `evaluate` CLI all build
+    # their fetcher through this one function. Fixing it at the CLIs instead
+    # would need lockstep edits with the same silent-failure risk this
+    # module already single-sources MCP_STREAMABLE_HTTP_HEADERS to avoid.
+    #
+    # census.py's own Path(args.project_root) stays relative-friendly: it is
+    # used for local filesystem access (config, codebook, report, state),
+    # where a cwd-relative path resolves correctly in-process. Only the
+    # over-the-wire argument was ever broken.
+    project_root_str = str(Path(project_root).resolve())
     url = os.environ.get(_FUSED_MEMORY_URL_ENV_VAR, _DEFAULT_FUSED_MEMORY_URL)
 
     def _fetch() -> dict:
