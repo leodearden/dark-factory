@@ -188,6 +188,13 @@ def _read_limits(
     ``malformed_limits``.  Without that third path a present-but-wrong-type
     artifact produced no signal at all, since the absent-file issue does not
     fire for a file that exists.
+
+    The embedded ``verdicts[]`` gets the same treatment one level down: a
+    ``verdicts`` field that is not a list is ``malformed_limits_verdicts``, and
+    records within it that cannot be keyed are counted into one
+    ``unidentified_limits_verdicts``.  Both are scoped to what is actually
+    lost — the per-metric ``rule_kind`` — and neither discards the provenance
+    block, which parsed fine and is still worth displaying.
     """
     path = eval_dir / 'limits-current.json'
     if not path.is_file():
@@ -230,12 +237,35 @@ def _read_limits(
     # though it governed the displayed run.
     block['stale_for_latest_run'] = body.get('run_stamp') != latest_run_stamp
 
+    records = body.get('verdicts')
+    if records is None:
+        records = []
+    elif not isinstance(records, list):
+        # The body IS an object, so `malformed_limits` above did not fire and
+        # the provenance block is perfectly usable.  But iterating a non-list
+        # here would walk a dict's KEYS (or a string's characters), fail every
+        # record check below, and leave EVERY metric's `rule_kind` None with no
+        # signal — the `entries` defect of the verdicts reader, one function
+        # earlier.  Scoped to what is actually lost: the rule kinds, not the
+        # provenance that parsed fine.
+        _issue(
+            issues, 'malformed_limits_verdicts', eval_id=eval_dir.name, path=path,
+            detail=(
+                f'expected a list "verdicts" field, got {type(records).__name__}; '
+                'no metric rule_kind could be read'
+            ),
+        )
+        records = []
+
     by_metric: dict[str, Any] = {}
-    for record in body.get('verdicts') or []:
+    unkeyable = 0
+    for record in records:
         if not isinstance(record, dict):
+            unkeyable += 1
             continue
         metric_id = record.get('metric_id')
-        if not isinstance(metric_id, str):
+        if not isinstance(metric_id, str) or not metric_id:
+            unkeyable += 1
             continue
         if metric_id in by_metric:
             # Last-wins would silently change the displayed ``rule_kind``.
@@ -245,6 +275,17 @@ def _read_limits(
             )
             continue
         by_metric[metric_id] = record
+    if unkeyable:
+        # Counted once per file rather than one issue apiece, mirroring
+        # `_by_metric_id`: a systematically broken artifact should cost one row
+        # of the issues list, not flood it into uselessness.
+        _issue(
+            issues, 'unidentified_limits_verdicts', eval_id=eval_dir.name, path=path,
+            detail=(
+                f'{unkeyable} limits verdict record(s) carry no usable "metric_id"; '
+                'their metrics report no rule_kind'
+            ),
+        )
     return block, by_metric
 
 
@@ -312,11 +353,14 @@ def _read_verdicts(
     Every disposal path is NAMED: absent is ``missing_verdicts``, a parse
     failure is ``unreadable_verdicts`` (recorded by the caller's handler), a
     body that parses but is not an object — or is an object whose ``entries``
-    is absent or not a list — is ``malformed_verdicts``, and an individual
-    non-object element is ``malformed_verdict_entry``.  The ``entries`` paths
-    matter most: a discarded verdicts body leaves every row's verdict absent,
-    which is indistinguishable from a healthy no-alarm tree unless the discard
-    is recorded.
+    is absent or not a list — is ``malformed_verdicts``, an individual
+    non-object element is ``malformed_verdict_entry``, and elements that ARE
+    objects but carry no usable ``(eval_id, metric_id)`` pair are counted into
+    one ``unidentified_verdicts``.  The ``entries`` paths matter most: a
+    discarded verdicts body leaves every row's verdict absent, which is
+    indistinguishable from a healthy no-alarm tree unless the discard is
+    recorded — and the record-level form is the same confusion one row at a
+    time, since an unkeyable entry also renders as ``verdict: None``.
 
     A malformed ``entries`` does NOT suppress ``storm_escape``: the storm block
     is run-scoped and parses independently, so dropping it too would turn one
@@ -377,6 +421,7 @@ def _read_verdicts(
         entries = []
 
     index: dict[tuple[str, str], dict[str, Any]] = {}
+    unkeyable = 0
     for entry in entries:
         if not isinstance(entry, dict):
             # A non-object element cannot carry an (eval_id, metric_id) key, so
@@ -389,7 +434,14 @@ def _read_verdicts(
             continue
         eval_id = entry.get('eval_id')
         metric_id = entry.get('metric_id')
-        if isinstance(eval_id, str) and isinstance(metric_id, str):
+        if not isinstance(eval_id, str) or not isinstance(metric_id, str) or not eval_id or not metric_id:
+            # An object, but one that can never be keyed onto a row.  Dropping
+            # it silently leaves that row's verdict absent — indistinguishable
+            # from "no entry was ever written for it", which is the same
+            # confusion the artifact-level guards above exist to prevent, just
+            # one row at a time instead of the whole tree.
+            unkeyable += 1
+        else:
             key = (eval_id, metric_id)
             if key in index:
                 # Two judgements of one metric in one run: last-wins would pick
@@ -401,6 +453,17 @@ def _read_verdicts(
                 )
                 continue
             index[key] = entry
+    if unkeyable:
+        # Counted once per file rather than one issue apiece, mirroring
+        # `_by_metric_id`: a systematically broken artifact should cost one row
+        # of the issues list, not flood it into uselessness.
+        _issue(
+            issues, 'unidentified_verdicts', path=path,
+            detail=(
+                f'{unkeyable} verdict entr(ies) carry no usable "eval_id"/"metric_id" pair '
+                'and cannot be matched to a metric row'
+            ),
+        )
 
     # Run-scoped, which is why it lives beside the entries rather than inside
     # them.  Surfaced only while TRIGGERED — an untriggered block is the
