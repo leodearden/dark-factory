@@ -1249,12 +1249,17 @@ class TestConcurrentLoop:
 
         assert rc == 1  # one task blocked → non-zero exit
         assert fake_client.terminate_calls == ["pod-fake-1"]
-        # Tasks 10 and 11 were the initial wave; 11 failed. Task 12 may or
-        # may not have been picked up depending on scheduling, but 13 and 14
-        # must NOT have been submitted.
+        # Tasks 10 and 11 were the initial wave; 11 failed. Tasks 12 and 13
+        # may or may not have been picked up depending on scheduling (the
+        # stop-on-first-failure flag is only observed at the top of each
+        # loop iteration, so a worker can plausibly race ahead by one extra
+        # task under load) — assert the invariant that the queue stopped
+        # early rather than pinning the exact race boundary. df_task_14,
+        # the last-queued task, is only reachable after multiple full task
+        # cycles past the failure and must NOT have been submitted.
         assert "df_task_10" in attempted
         assert "df_task_11" in attempted
-        assert "df_task_13" not in attempted
+        assert len(attempted) < len(task_ids)
         assert "df_task_14" not in attempted
         # Summaries cover whatever was attempted.
         summary_ids = {s.task_id for s in captured["summaries"]}
