@@ -2317,6 +2317,11 @@ def test_main_configures_logging_so_info_lines_reach_the_journal(tmp_path, monke
     """Driven down the cheap NO-FIRE path -- no LLM, no subprocess, exit 0 --
     because logging must be configured before the gate, not only on runs that
     fire."""
+    # The DEFAULT-level case, so the ambient env has to be cleared: this same
+    # change teaches the CLIs to honour LEGIBILITY_LOG_LEVEL, and a developer
+    # debugging the trickle (or a host whose unit env is sourced) exporting
+    # LEGIBILITY_LOG_LEVEL=WARNING would otherwise turn a working fix red.
+    monkeypatch.delenv("LEGIBILITY_LOG_LEVEL", raising=False)
     _write_legibility_yaml(_default_config_path(tmp_path))
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)

@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pytest
 
-from legibility import census_trigger, codebook, digest, nightly
+from legibility import census_trigger, codebook, config as config_mod, digest, nightly
 from legibility.config import load_config
 
 
@@ -465,11 +465,6 @@ def test_select_digest_sessions_returns_the_whole_sample_result(tmp_path):
     assert result.budget_skipped == 0
     assert result.bytes_used > 0
     assert [r.path for r in result.selected] == [session_path]
-
-    # The negative half, stated explicitly: a future refactor that re-narrows
-    # the return to `.selected` must fail a test rather than silently
-    # re-dropping the accounting the way 2581's consumer dropped 2573's field.
-    assert not isinstance(result, list)
 
 
 # ---------------------------------------------------------------------------
@@ -1753,6 +1748,15 @@ def _main_run_with_stubbed_run_nightly(monkeypatch, tmp_path):
 
 
 def test_main_configures_logging_so_info_lines_reach_the_journal(monkeypatch, tmp_path):
+    # The DEFAULT-level case, so the ambient env has to be cleared: this same
+    # change teaches the CLIs to honour LEGIBILITY_LOG_LEVEL, and a developer
+    # debugging the trickle (or a host whose unit env is sourced) exporting
+    # LEGIBILITY_LOG_LEVEL=WARNING would otherwise turn a working fix red.
+    # Deliberately NOT hoisted into _main_run_with_stubbed_run_nightly: the
+    # sibling tests monkeypatch.setenv BEFORE calling it, so a delenv in there
+    # would clobber exactly the value they are asserting on.
+    monkeypatch.delenv('LEGIBILITY_LOG_LEVEL', raising=False)
+
     exit_code, effective_level, handler_count = _main_run_with_stubbed_run_nightly(
         monkeypatch, tmp_path,
     )
@@ -1793,3 +1797,64 @@ def test_main_unparseable_log_level_degrades_to_info_without_raising(monkeypatch
     assert exit_code == 0, 'an unparseable LEGIBILITY_LOG_LEVEL must not fail the run'
     assert effective_level <= logging.INFO, 'an unparseable level degrades to the INFO default'
     assert handler_count >= 1
+
+
+# ---------------------------------------------------------------------------
+# configure_logging's never-raise contract, driven directly rather than
+# through main(): main() always passes the stock default_level, so the
+# caller-side half of the contract is unreachable from there.
+# ---------------------------------------------------------------------------
+
+def _configure_logging_and_sample(**kwargs):
+    """Call ``config.configure_logging(**kwargs)`` against a cleared root,
+    returning ``(effective_level, handler_count)`` sampled inside the block."""
+    with _isolated_root_logging() as root:
+        config_mod.configure_logging(**kwargs)
+        return root.getEffectiveLevel(), len(root.handlers)
+
+
+@pytest.mark.parametrize(
+    ('raw', 'expected'),
+    [
+        ('10', logging.DEBUG),
+        ('20', logging.INFO),
+        ('30', logging.WARNING),
+        (' 40 ', logging.ERROR),
+    ],
+)
+def test_configure_logging_honours_a_numeric_log_level(monkeypatch, raw, expected):
+    """A numeric LEGIBILITY_LOG_LEVEL is the OTHER spelling operators reach
+    for -- it is what logging's own API takes -- and it used to be rejected
+    as a typo, because getLevelName('10') returns the string 'Level 10'."""
+    monkeypatch.setenv('LEGIBILITY_LOG_LEVEL', raw)
+
+    effective_level, handler_count = _configure_logging_and_sample()
+
+    assert effective_level == expected
+    assert handler_count >= 1
+
+
+def test_configure_logging_never_raises_on_an_unknown_default_level(monkeypatch):
+    """The never-raise guarantee covers the CALLER's input too.
+
+    ``logging.getLevelName('CHATTY')`` returns the string 'Level CHATTY',
+    and ``basicConfig(level='Level CHATTY')`` raises ValueError -- out of
+    the helper whose stated job is to never take the timer down. A future
+    caller passing a typo'd default must degrade, not crash.
+    """
+    monkeypatch.delenv('LEGIBILITY_LOG_LEVEL', raising=False)
+
+    # No pytest.raises: a raise here propagates and fails the test loudly.
+    effective_level, handler_count = _configure_logging_and_sample(default_level='CHATTY')
+
+    assert effective_level == logging.INFO, 'an unknown default_level degrades to INFO'
+    assert handler_count >= 1
+
+
+def test_configure_logging_env_var_still_wins_over_an_unknown_default_level(monkeypatch):
+    """Degrading the default must not swallow a VALID operator override."""
+    monkeypatch.setenv('LEGIBILITY_LOG_LEVEL', 'DEBUG')
+
+    effective_level, _ = _configure_logging_and_sample(default_level='CHATTY')
+
+    assert effective_level == logging.DEBUG

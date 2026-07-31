@@ -155,6 +155,31 @@ def load_config(path: Path | str) -> LegibilityConfig:
     return LegibilityConfig(**raw)
 
 
+def _resolve_level(value: str) -> int | None:
+    """Resolve *value* to a logging level int, or None if it is not one.
+
+    Accepts both spellings operators actually reach for: a level NAME
+    (case-insensitive, surrounding whitespace tolerated) and a NUMERIC
+    level. The numeric form matters because it is what ``logging``'s own
+    API takes, so ``LEGIBILITY_LOG_LEVEL=10`` is a reasonable thing to
+    write in a unit file — and ``getLevelName('10')`` returns the string
+    ``'Level 10'``, so a name-only lookup would reject it as a typo.
+
+    Returns None rather than raising: every caller here degrades on an
+    unresolvable value, and :func:`configure_logging`'s contract is that
+    nothing it is handed can take the nightly timer down.
+    """
+    text = value.strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return int(text)
+    resolved = logging.getLevelName(text.upper())
+    # getLevelName returns the int for a known name, else the string
+    # 'Level <name>' — an int is the only success signal.
+    return resolved if isinstance(resolved, int) else None
+
+
 def configure_logging(default_level: str = 'INFO') -> None:
     """Point the legibility CLIs' log output at stderr, at a visible level.
 
@@ -174,10 +199,17 @@ def configure_logging(default_level: str = 'INFO') -> None:
 
     ``LEGIBILITY_LOG_LEVEL`` overrides *default_level* (matching the
     ``LEGIBILITY_SEARCH_ROOTS`` / ``LEGIBILITY_CLAUDE_BIN`` env convention
-    already used across these modules). An unparseable value degrades to
-    *default_level* and logs one warning — it must never raise, because a
-    typo in a unit file's ``Environment=`` must not take the nightly timer
-    down.
+    already used across these modules). Either spelling operators reach for
+    is accepted — a level NAME (``DEBUG``, case-insensitive) or a numeric
+    level (``10``, which is what ``logging``'s own API takes). An
+    unparseable value degrades to *default_level* and logs one warning — it
+    must never raise, because a typo in a unit file's ``Environment=`` must
+    not take the nightly timer down.
+
+    NEITHER input path can raise, *default_level* included: an unknown
+    *default_level* from a future caller falls back to ``INFO`` rather than
+    reaching ``basicConfig`` as the string ``'Level FOO'`` and raising
+    ValueError out of the helper whose whole job is to never do that.
 
     Call from ``main()``, NEVER at import: ``basicConfig`` is a documented
     no-op when root already has handlers, so an import-time call would be a
@@ -185,14 +217,18 @@ def configure_logging(default_level: str = 'INFO') -> None:
     import-time call from a library context would hijack the importer's
     logging setup.
     """
+    level = _resolve_level(default_level)
+    if level is None:
+        # Not the operator's doing, so it is not the operator's warning:
+        # a bad *default_level* is a caller bug. Degrade to INFO — the
+        # level this helper exists to guarantee — rather than raise.
+        level = logging.INFO
+
     raw = os.environ.get(LOG_LEVEL_ENV_VAR)
-    level = logging.getLevelName(default_level)
     unparseable = None
     if raw is not None and raw.strip():
-        candidate = logging.getLevelName(raw.strip().upper())
-        # getLevelName returns the int for a known name, else the string
-        # 'Level <name>' — an int is the only success signal.
-        if isinstance(candidate, int):
+        candidate = _resolve_level(raw)
+        if candidate is not None:
             level = candidate
         else:
             unparseable = raw
@@ -205,8 +241,13 @@ def configure_logging(default_level: str = 'INFO') -> None:
     # explicit call above into a no-op — silently defeating the whole point of
     # this helper on precisely the runs that already have a misconfiguration.
     if unparseable is not None:
+        # Reports the level actually in force, not *default_level*: those
+        # differ when default_level was itself unresolvable, and a warning
+        # that names a level the process is NOT running at is worse than no
+        # warning at all.
         logging.getLogger('legibility.config').warning(
             '%s=%r is not a valid log level; falling back to %s. '
-            'Valid values: CRITICAL, ERROR, WARNING, INFO, DEBUG.',
-            LOG_LEVEL_ENV_VAR, unparseable, default_level,
+            'Valid values: CRITICAL, ERROR, WARNING, INFO, DEBUG, '
+            'or a numeric level such as 10.',
+            LOG_LEVEL_ENV_VAR, unparseable, logging.getLevelName(level),
         )
