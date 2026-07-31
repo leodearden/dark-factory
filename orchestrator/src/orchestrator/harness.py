@@ -11,7 +11,7 @@ import logging
 import os
 import time
 from collections import Counter, deque
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -45,7 +45,9 @@ from orchestrator.config import (
     load_config,
 )
 from orchestrator.delivered_checks import (
+    DeliveredChecksBlock,
     DeliveredChecksVerdict,
+    gate_mark_done_on_delivered_checks,
     verify_delivered_checks_on_main,
 )
 from orchestrator.deploy_state import DeployPhase, DeployState
@@ -5567,6 +5569,52 @@ class Harness:
         )
         return 'reverted'
 
+    async def _delivered_checks_block(
+        self,
+        task_id: str,
+        metadata: Mapping[str, Any] | None,
+        *,
+        site: str,
+        main_sha: str | None = None,
+    ) -> DeliveredChecksBlock | None:
+        """Harness-side binding of the ONE shared mark-done decision (task 3057).
+
+        The single rule for every harness stamp seam: a non-``None`` result
+        means **do NOT stamp done at this site** — take the site's EXISTING
+        "no landing evidence" path instead. Never invent a new recovery: each
+        site's no-evidence path is already proven safe and self-healing, so
+        reusing it adds no new state machine.
+
+        ``None`` means the caller MAY proceed, either because the guard is
+        inert (kill switch off, or the task declares no ``delivered_checks``)
+        or because the declared capability is verifiably present on ``main``.
+        The inertness and the kill switch live in
+        :func:`~orchestrator.delivered_checks.gate_mark_done_on_delivered_checks`
+        ALONE — harness sites delegate unconditionally rather than
+        re-implementing either locally, so one hot reload disarms all eleven
+        attribution-shaped seams at once.
+
+        ``log=logger`` keeps every WARNING addressable as
+        ``orchestrator.harness`` (task 2794's caplog assertions depend on it),
+        and ``main_sha`` lets a seam that has ALREADY resolved a main SHA
+        forward it so the guard audits the SAME main that seam's other
+        evidence test used, with no second git call.
+
+        Never raises — the helper it delegates to is documented "never raises",
+        so a guard can never crash a mark-done path.
+        """
+        return await gate_mark_done_on_delivered_checks(
+            task_id,
+            metadata,
+            git_ops=self.git_ops,
+            project_root=str(self.config.project_root),
+            check_timeout_secs=self.config.delivered_checks.check_timeout_secs,
+            enabled=self.config.delivered_checks.enabled,
+            main_sha=main_sha,
+            site=site,
+            log=logger,
+        )
+
     async def _mark_in_progress_done(
         self,
         tid: str,
@@ -9840,6 +9888,34 @@ class Harness:
         tick at the same ``reopen_at``: it short-circuits before the
         git-ancestry subprocess work and before re-attempting the
         already-rejected write.
+
+        **Delivered-capability guard** (task 3057, seam 2 of eleven): all
+        three evidence arms above — git ancestry, merge marker, content
+        equivalence — prove only that SOMETHING of this branch reached main.
+        None of them proves that THIS task's declared capability
+        (``metadata.delivered_checks``) survived to it, which is exactly the
+        hollow-done shape ``check_found_on_main_spurious_rate.py`` audits. So
+        each arm re-checks the capability via
+        :meth:`_delivered_checks_block` IMMEDIATELY before its
+        ``_mark_in_progress_done`` call, as an early return, so the stamp
+        stays structurally on the fall-through and a later refactor cannot
+        drift it out from behind the guard.
+
+        On ANY block — ``failed``, ``errored`` or ``main_sha_unresolved``
+        alike — the arm returns ``False``: deliberately this gate's own
+        pre-2313 behavior (dispatch normally) rather than gating dispatch.
+        The invariant being defended is "never stamp a hollow done", and a
+        ``False`` return can never wedge a task the way a permanent gate
+        could — the task dispatches and an agent actually delivers it. The
+        fail-safe reasons are handled UNIFORMLY with ``failed`` for the same
+        reason: a malformed check descriptor ERRORs forever, so any
+        wait-and-retry degradation would wedge the task permanently, whereas
+        an extra dispatch of an already-landed task always terminates.
+
+        The guard sits DOWNSTREAM of every existing veto (open L1, the
+        task-2677 ``should_skip`` memo, the degenerate-branch check, and each
+        arm's ``validate_landing_evidence`` verdict), so a landing that is
+        being refused anyway never pays for check work.
         """
         if (
             self._escalation_queue is not None
@@ -9894,6 +9970,10 @@ class Harness:
                 # (it returned False here before the helper extraction too),
                 # so this is not a newly-introduced silent failure.
                 return False
+            if await self._delivered_checks_block(
+                task_id, metadata, site='dispatch-gate-already-on-main',
+            ) is not None:
+                return False
             await self._mark_in_progress_done(
                 task_id, verdict.evidence_sha,
                 'reconcile: pre-dispatch check found branch already on main',
@@ -9923,6 +10003,10 @@ class Harness:
                 if not verdict.accepted:
                     self._file_unattributed_landing_escalation(task_id, branch, verdict)
                     return False
+                if await self._delivered_checks_block(
+                    task_id, metadata, site='dispatch-gate-marker-found',
+                ) is not None:
+                    return False
                 await self._mark_in_progress_done(
                     task_id, marker,
                     'reconcile: pre-dispatch check found merge marker on main',
@@ -9946,6 +10030,10 @@ class Harness:
             )
             if not verdict.accepted:
                 self._file_unattributed_landing_escalation(task_id, branch, verdict)
+                return False
+            if await self._delivered_checks_block(
+                task_id, metadata, site='dispatch-gate-content-equivalent',
+            ) is not None:
                 return False
             await self._mark_in_progress_done(
                 task_id, verdict.evidence_sha,

@@ -1197,7 +1197,7 @@ class TestAlreadyLandedGateDeliveredChecksGuard:
         h, _meta = _arm_harness(mock_orch_config, arm)
         guard = AsyncMock(return_value=None)
         rejected = LandingEvidenceVerdict(
-            accepted=False, evidence_sha=None, reason='no_citation',
+            accepted=False, evidence_sha=None, reason='no_citation', probe={},
         )
 
         with patch(_GATE_TARGET, guard), \
