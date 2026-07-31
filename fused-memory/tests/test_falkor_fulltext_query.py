@@ -24,11 +24,13 @@ import pytest
 from graphiti_core.driver.falkordb_driver import STOPWORDS, FalkorDriver
 from graphiti_core.search import search_utils
 
+from fused_memory.backends import graphiti_client
 from fused_memory.backends.falkor_fulltext import (
     build_query,
     escape_group_id,
     is_searchable_term,
 )
+from fused_memory.backends.graphiti_client import _MultiTenantFalkorDriver
 
 # --- Genuine FAULT tokens -------------------------------------------------
 # RediSearch's tokenizer reduces each of these to nothing, so emitting one into
@@ -486,3 +488,104 @@ class TestEmptyTermListShortCircuits:
             == '(@group_id:"dark_factory") ()'
         )
         assert build_query('the and of', ['dark_factory'], 128) == ''
+
+
+class TestMultiTenantDriverWiring:
+    """Pin the driver override that actually puts the hardening on the write path.
+
+    Unit-level: every driver here is built without opening a connection, either
+    via ``object.__new__`` (query assembly touches only ``self.sanitize``) or by
+    passing a stub ``falkor_db=`` (which upstream ``__init__`` uses directly
+    instead of dialling out).
+    """
+
+    @staticmethod
+    def _driver() -> _MultiTenantFalkorDriver:
+        return object.__new__(_MultiTenantFalkorDriver)
+
+    def test_signature_matches_upstream(self) -> None:
+        """The override must be signature-compatible with what it replaces.
+
+        graphiti calls this method positionally from ``search_utils``; a
+        graphiti-core upgrade that adds or reorders a parameter would otherwise
+        bind silently against our override and mis-assemble every query.
+        """
+        assert inspect.signature(
+            _MultiTenantFalkorDriver.build_fulltext_query
+        ) == inspect.signature(FalkorDriver.build_fulltext_query)
+
+    def test_validate_group_ids_still_invoked(self, monkeypatch) -> None:
+        """Upstream validates group_ids first; the override must not drop that.
+
+        Silently skipping validation would let a malformed group_id through to
+        the query instead of failing fast — trading graphiti's loud error for a
+        subtly wrong (or cross-tenant) search.
+        """
+        seen: list[object] = []
+        monkeypatch.setattr(
+            graphiti_client,
+            'validate_group_ids',
+            lambda group_ids: seen.append(group_ids),
+        )
+        self._driver().build_fulltext_query('alpha', ['dark_factory'])
+        assert seen == [['dark_factory']]
+
+    def test_delegates_to_upstream_sanitize(self, monkeypatch) -> None:
+        """``self.sanitize`` is what feeds ``build_query`` — the rules are not forked.
+
+        Asserting delegation (rather than just "the output looks sanitized")
+        is what keeps the character-class rules owned by upstream: if graphiti
+        changes them, we inherit the change instead of drifting.
+        """
+        driver = self._driver()
+        calls: list[str] = []
+
+        def spy(text: str) -> str:
+            calls.append(text)
+            return 'alpha beta'
+
+        monkeypatch.setattr(driver, 'sanitize', spy)
+        result = driver.build_fulltext_query('<raw>{content}', ['g'])
+        assert calls == ['<raw>{content}']
+        assert result == '(@group_id:"g") (alpha | beta)'
+
+    def test_upstream_sanitize_rules_are_applied_end_to_end(self) -> None:
+        """Unspied: the real ``sanitize`` strips ``<>{}[]`` before assembly."""
+        assert (
+            self._driver().build_fulltext_query('<alpha>{beta}[gamma]', ['g'])
+            == '(@group_id:"g") (alpha | beta | gamma)'
+        )
+
+    def test_clone_preserves_hardening(self) -> None:
+        """``clone()`` must keep returning a hardened driver.
+
+        This is the load-bearing wiring assertion: every per-group driver from
+        ``_driver_for()`` / ``_client_for()`` — including the one behind
+        ``get_relevant_nodes``' dedup query on the ``add_episode`` write path
+        where dead-letter 9950 originated — comes from ``clone()``.  If it ever
+        returns a plain ``FalkorDriver``, the hardening silently stops applying
+        there while every other test in this file still passes.
+        """
+        driver = _MultiTenantFalkorDriver(falkor_db=object(), database='graph_a')
+        cloned = driver.clone('graph_b')
+
+        assert isinstance(cloned, _MultiTenantFalkorDriver)
+        assert cloned.build_fulltext_query(
+            'Please note _ is the Python throwaway variable', ['dark_factory']
+        ) == '(@group_id:"dark_factory") (Please | note | Python | throwaway | variable)'
+
+    def test_end_to_end_repro_via_driver(self) -> None:
+        """The dead-letter 9950 reproduction, through the real driver entry point."""
+        query = self._driver().build_fulltext_query(
+            'Please note _ is the Python throwaway variable', ['dark_factory']
+        )
+        assert ' _ ' not in query
+        assert '_' not in query.split(') (')[-1]
+        assert query == (
+            '(@group_id:"dark_factory") (Please | note | Python | throwaway | variable)'
+        )
+
+    def test_default_max_query_length_is_honoured(self) -> None:
+        """The 128 default must reach ``build_query``, not be silently unbounded."""
+        long_text = ' '.join(f'w{i}' for i in range(200))
+        assert self._driver().build_fulltext_query(long_text, ['g']) == ''
