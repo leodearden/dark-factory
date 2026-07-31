@@ -240,3 +240,68 @@ async def test_get_statuses_pagination_validation_and_backward_compat(
     assert bad_off.get('error_type') == 'ValidationError', f'Expected ValidationError for offset=-1, got: {bad_off}'
     assert 'offset' in bad_off.get('error', '').lower(), f'Error message should mention offset: {bad_off}'
     paging_task_interceptor.get_statuses.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Fail-open auto-pagination — the core defect (task 3064)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_statuses_auto_paginates_oversized_full_population(paging_server):
+    """An un-paginated full-population call DEGRADES to a first page.
+
+    This is the defect: on reify (5,603 / 5,680 / 5,845 tasks) the full map
+    exceeded the MCP tool-response transport limit and the call failed CLOSED —
+    the caller got ZERO data.  A caller that would happily accept a first page
+    got nothing at all.
+
+    The fix degrades fail-OPEN: real data plus a loud, structured continuation
+    marker (``auto_paginated: True``, ``has_more: True``), never silent
+    truncation that would look like a complete census.
+
+    Asserted against the real ``_STATUSES_AUTO_PAGE_LIMIT`` constant, never a
+    hard-coded magic number, so the test tracks the implementation's own bound.
+    """
+    from fused_memory.server.tools import _STATUSES_AUTO_PAGE_LIMIT as LIMIT
+
+    population = _set_population(_make_statuses(LIMIT + 5))
+
+    result = await paging_server._tool_manager.call_tool(
+        'get_statuses',
+        {'project_root': '/project'},
+    )
+
+    # (a) Non-empty (the fail-closed regression) and not the whole population.
+    assert result['statuses'] != {}, 'Fail-closed regression: auto-paged response must not be empty'
+    assert len(result['statuses']) == LIMIT, (
+        f'Expected a {LIMIT}-entry first page, got {len(result["statuses"])}'
+    )
+
+    # (b) A loud, structured continuation marker rather than silent truncation.
+    assert result.get('pagination') == {
+        'total': LIMIT + 5,
+        'offset': 0,
+        'page_size': LIMIT,
+        'returned': LIMIT,
+        'has_more': True,
+        'auto_paginated': True,
+    }, f'Unexpected pagination dict: {result.get("pagination")}'
+
+    # (c) The page is exactly the numerically-first LIMIT ids.
+    expected_first = {str(i) for i in range(1, LIMIT + 1)}
+    assert set(result['statuses'].keys()) == expected_first, (
+        'Auto-page must be the numerically-first ids, not an arbitrary dict slice'
+    )
+
+    # (d) Tiling property: page 2 completes the census with no gaps, no dupes.
+    result2 = await paging_server._tool_manager.call_tool(
+        'get_statuses',
+        {'project_root': '/project', 'offset': LIMIT, 'page_size': LIMIT},
+    )
+    assert len(result2['statuses']) == 5, f'Expected the remaining 5, got {len(result2["statuses"])}'
+    assert result2['pagination']['has_more'] is False
+
+    page1, page2 = set(result['statuses']), set(result2['statuses'])
+    assert page1 & page2 == set(), f'Pages must not overlap, shared: {page1 & page2}'
+    assert page1 | page2 == set(population), 'Pages must tile the full population with no gaps'
