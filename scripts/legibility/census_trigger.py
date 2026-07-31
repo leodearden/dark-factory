@@ -473,11 +473,19 @@ def compute_tasks_landed(*, state: dict | None, status_fetcher) -> int | None:
 
     Returns `None` (never fires condition (b)) plus exactly one WARNING
     when: `status_fetcher` is `None`; `state` has no `last_census_done_count`
-    baseline (§7.5 extended read contract, see module docstring); or calling
-    `status_fetcher` raises for any reason. Otherwise counts `"done"` values
-    in the fetcher's wrapped `{"statuses": {id: status}}` envelope (matching
-    get_statuses' real shape -- fused-memory/src/fused_memory/server/tools.py:2665)
-    and returns `current_done - baseline`.
+    baseline (§7.5 extended read contract, see module docstring); calling
+    `status_fetcher` raises for any reason; or the fetched payload is not a
+    usable `{"statuses": {id: status}}` envelope (matching get_statuses' real
+    shape -- fused-memory/src/fused_memory/server/tools.py:2665). In
+    particular fused-memory's `{"error", "error_type"}` tool-error dict --
+    which rides an `isError: false` JSON-RPC response and so survives
+    `_extract_tool_result` intact -- fails SAFE here rather than counting
+    zero; see `extract_done_count` for why counting zero was the defect
+    (task 3291). Otherwise returns `current_done - baseline`.
+
+    A bad payload and an unreachable server deliberately share ONE code path
+    and ONE warning, so there is no separate failure mode to reason about --
+    only the warning TEXT distinguishes them in the journal.
     """
     baseline = (state or {}).get("last_census_done_count")
     if baseline is None:
@@ -499,8 +507,15 @@ def compute_tasks_landed(*, state: dict | None, status_fetcher) -> int | None:
         logger.warning("tasks-landed: status_fetcher failed: %s", exc)
         return None
 
-    statuses = payload.get("statuses") or {} if isinstance(payload, dict) else {}
-    current_done = sum(1 for status in statuses.values() if status == "done")
+    # Extraction is guarded separately from the fetch so the warning TEXT can
+    # distinguish "server unreachable" from "server answered with something
+    # unusable" -- but both land on the same return-None fail-safe branch.
+    try:
+        current_done = extract_done_count(payload)
+    except StatusFetchUnavailable as exc:
+        logger.warning("tasks-landed: get_statuses returned an unusable payload: %s", exc)
+        return None
+
     return current_done - baseline
 
 
