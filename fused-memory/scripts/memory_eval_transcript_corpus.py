@@ -84,6 +84,7 @@ Usage::
 """
 from __future__ import annotations
 
+import argparse
 import json
 import re
 import sys
@@ -110,6 +111,7 @@ if _SCRIPTS_ROOT.exists() and str(_SCRIPTS_ROOT) not in sys.path:
 
 from legibility.digest import load_transcript  # noqa: E402
 from legibility.inventory import iter_json_lines  # noqa: E402
+from shared.memory_eval_metrics import RUN_STAMP_ENV_VAR  # noqa: E402
 
 # INV-5 / D9: TWO existing readers, ONE core, ZERO new parsers. The scan path
 # streams via iter_json_lines (memory-bounded across thousands of multi-MB gz
@@ -742,3 +744,115 @@ def write_corpus(
     )
     report_path.write_text(render_report(coverage), encoding='utf-8')
     return corpus_path, coverage_path, report_path
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+ARCHIVE_RELPATH = Path('data') / 'orchestrator' / 'agent-transcripts'
+
+
+def default_archive_root() -> Path:
+    """``<main checkout>/data/orchestrator/agent-transcripts``.
+
+    Resolved against the MAIN checkout, not this file's own: the archive is
+    untracked runtime state that exists only there, and a git worktree has no
+    ``data/`` directory at all. A ``__file__``-relative default would make
+    every worktree run of a correct script report ``no_input`` — which is the
+    worst failure mode for this particular script, because it would train
+    operators to read exit 2 as normal and hollow out the very signal the
+    script exists to create. Exit 2 has to keep meaning what it says.
+
+    ``resolve_main_checkout`` raises ``ValueError`` when the path is not
+    inside a git working tree or ``git`` is unavailable (a hermetic temp-dir
+    test, say); the repo's established fallback still canonicalizes. Called
+    lazily so merely importing this module never spawns ``git``.
+    """
+    from fused_memory.models.scope import resolve_main_checkout  # noqa: PLC0415
+
+    try:
+        checkout = Path(resolve_main_checkout(_PACKAGE_ROOT))
+    except ValueError:
+        checkout = Path(_REPO_ROOT).resolve()
+    return checkout / ARCHIVE_RELPATH
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        '--archive-root',
+        default=None,
+        help=(
+            'Root of the agent-transcript archive. Defaults to the MAIN '
+            "checkout's data/orchestrator/agent-transcripts (resolved via "
+            'git worktree list), because the archive is untracked runtime '
+            'state that exists only there — a worktree has no data/ dir. '
+            'A genuinely absent or empty archive yields no_input / exit 2, '
+            'never a silent empty corpus.'
+        ),
+    )
+    parser.add_argument(
+        '--transcript',
+        default=None,
+        help='Mine ONE transcript file instead of the whole archive (debugging).',
+    )
+    parser.add_argument(
+        '--out-root',
+        default=str(DEFAULT_OUT_ROOT),
+        help='Artifact root (default: %(default)s). Gitignored.',
+    )
+    parser.add_argument(
+        '--stamp',
+        default=None,
+        help=f'Run stamp; defaults to ${RUN_STAMP_ENV_VAR} or the current UTC time.',
+    )
+    parser.add_argument(
+        '--max-failure-examples',
+        type=int,
+        default=DEFAULT_MAX_FAILURE_EXAMPLES,
+        help='Cap on disclosed failure examples (default: %(default)s). '
+             'The COUNT is never capped, and truncation is disclosed.',
+    )
+    parser.add_argument(
+        '--tool-name',
+        action='append',
+        dest='tool_names',
+        default=None,
+        help='Tool name counting as a search (repeatable). '
+             f'Default: {sorted(SEARCH_TOOL_NAMES)}.',
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+    tool_names = frozenset(args.tool_names) if args.tool_names else SEARCH_TOOL_NAMES
+
+    if args.transcript:
+        records, coverage = scan_transcript(
+            Path(args.transcript),
+            tool_names=tool_names,
+            max_failure_examples=args.max_failure_examples,
+        )
+    else:
+        root = Path(args.archive_root) if args.archive_root else default_archive_root()
+        records, coverage = scan_archive(
+            root,
+            tool_names=tool_names,
+            max_failure_examples=args.max_failure_examples,
+        )
+
+    stamp_status(coverage)
+    _, _, report_path = write_corpus(records, coverage, args.out_root, stamp=args.stamp)
+    report = render_report(coverage)
+    print(report, end='')
+    print(f'report: {report_path}')
+    return EXIT_CODES[coverage['status']]
+
+
+if __name__ == '__main__':
+    sys.exit(main())
