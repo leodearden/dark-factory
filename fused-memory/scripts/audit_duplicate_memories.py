@@ -395,6 +395,54 @@ def extract_liveness_snapshot_fact(record: dict) -> str | None:
     return '|'.join(sorted(pairs))
 
 
+def liveness_snapshot_subject_task_ids(record: dict) -> set[str]:
+    """Which task(s) a liveness snapshot is ABOUT, as a set of ``str`` ids.
+
+    The union of three sources, not ``metadata.task_id`` alone, despite the
+    pattern reading as "repeated snapshots of the same task". Measured against
+    the live corpus: memory 1eef7df7 is filed under ``task_id='99'`` while its
+    content re-verifies tasks 94 AND 96 (it carries
+    ``related_task_ids=['94', '96']``). Under a strict ``metadata.task_id``
+    grouping the buckets are 94={6b245659}, 96={08aa0017}, 99={1eef7df7} —
+    every one a singleton, leaving the detector inert on the exact corpus that
+    motivated it.
+
+    Risk posture: a content ref can over-attribute an incidental mention. That
+    is acceptable ONLY because this class is report-only and a subject needs
+    >= 2 records sharing an IDENTICAL core fact before anything is emitted, so
+    an over-attributed single mention falls out as a singleton. Over-firing
+    costs a reviewer one glance, never data.
+
+    Every id is coerced to ``str`` and blanks are dropped — the project-wide
+    convention ``memory_service._normalize_task_id_metadata`` enforces at every
+    write boundary, so an int ``94`` and the string ``'94'`` are one subject
+    rather than two. A ``related_task_ids`` that is not a collection degrades
+    without raising: a scalar contributes itself, anything else contributes
+    nothing. Does not mutate *record*.
+    """
+    metadata = record.get('metadata') or {}
+    subjects: set[str] = set()
+
+    def _add(value: Any) -> None:
+        text = str(value).strip() if value is not None else ''
+        if text:
+            subjects.add(text)
+
+    _add(metadata.get('task_id'))
+
+    related = metadata.get('related_task_ids')
+    if isinstance(related, list | tuple | set):
+        for item in related:
+            _add(item)
+    elif isinstance(related, str | int):
+        _add(related)
+
+    for ref in TASK_REF_RE.findall(record.get('content') or ''):
+        _add(ref)
+
+    return subjects
+
+
 # The three Mem0-backed categories, enumerated ONCE. Graphiti-backed
 # categories (entities_and_relations, temporal_facts, decisions_and_rationale)
 # are deliberately absent: this detector reads the Mem0/Qdrant collection, and
