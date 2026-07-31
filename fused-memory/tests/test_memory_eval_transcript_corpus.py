@@ -462,3 +462,93 @@ class TestResultStatus:
         ])
         assert record['result_status'] == 'ok'
         assert record['results'][0]['id'] == 'aaaa'
+
+
+# ===========================================================================
+# step-9 — archive-path provenance
+# ===========================================================================
+
+MAIN_REL = '2280/-home-leo-src-dark-factory--worktrees-2280/775be5c7-539a-4071-ad3c-89422cf3317a.jsonl.gz'
+SUB_REL = (
+    '3006/-home-leo-src-dark-factory--worktrees-3006/'
+    '2f747640-1111-2222-3333-444444444444/subagents/agent-a2af78e35bd434081.jsonl.gz'
+)
+
+
+class TestParseArchivePath:
+    """Task/session/subagent identity comes from the PATH, because that is
+    where ``shared.transcript_archive`` puts it.
+
+    Both live layouts are covered. A path that does not conform degrades every
+    field to None rather than raising: an archive can acquire a stray file, and
+    one of those must not abort a whole-archive scan.
+    """
+
+    def test_main_session_layout(self):
+        assert _mod.parse_archive_path(MAIN_REL) == {
+            'task_id': '2280',
+            'session_id': '775be5c7-539a-4071-ad3c-89422cf3317a',
+            'is_subagent': False,
+            'subagent_id': None,
+        }
+
+    def test_subagent_layout(self):
+        assert _mod.parse_archive_path(SUB_REL) == {
+            'task_id': '3006',
+            'session_id': '2f747640-1111-2222-3333-444444444444',
+            'is_subagent': True,
+            'subagent_id': 'agent-a2af78e35bd434081',
+        }
+
+    def test_plain_jsonl_suffix_also_parses(self):
+        parsed = _mod.parse_archive_path('2280/-enc-cwd/session-abc.jsonl')
+        assert parsed['task_id'] == '2280'
+        assert parsed['session_id'] == 'session-abc'
+
+    def test_too_shallow_path_degrades_without_raising(self):
+        assert _mod.parse_archive_path('loose-file.jsonl.gz') == {
+            'task_id': None, 'session_id': None,
+            'is_subagent': False, 'subagent_id': None,
+        }
+
+    def test_unexpected_shape_degrades_without_raising(self):
+        parsed = _mod.parse_archive_path('a/b/c/d/e/f.jsonl.gz')
+        assert parsed['task_id'] == 'a'
+        assert parsed['session_id'] is None
+        assert parsed['is_subagent'] is False
+
+    def test_accepts_a_path_object(self):
+        assert _mod.parse_archive_path(Path(MAIN_REL))['task_id'] == '2280'
+
+
+class TestProvenanceThreadedIntoRecords:
+    """Emitted records carry the provenance and an archive-RELATIVE path."""
+
+    def _record(self, rel: str) -> dict:
+        records = _mod.extract_searches(
+            [_tool_use('toolu_A', 'q')],
+            source=rel,
+            provenance=_mod.parse_archive_path(rel),
+        )
+        assert len(records) == 1
+        return records[0]
+
+    def test_main_session_provenance(self):
+        record = self._record(MAIN_REL)
+        assert record['task_id'] == '2280'
+        assert record['session_id'] == '775be5c7-539a-4071-ad3c-89422cf3317a'
+        assert record['is_subagent'] is False
+
+    def test_subagent_provenance(self):
+        record = self._record(SUB_REL)
+        assert record['task_id'] == '3006'
+        assert record['is_subagent'] is True
+        assert record['subagent_id'] == 'agent-a2af78e35bd434081'
+
+    def test_transcript_path_is_archive_relative(self):
+        # An absolute machine path would make the corpus unreadable on any
+        # other machine and would leak the operator's home directory into a
+        # shared artifact.
+        record = self._record(MAIN_REL)
+        assert record['transcript'] == MAIN_REL
+        assert not record['transcript'].startswith('/')
