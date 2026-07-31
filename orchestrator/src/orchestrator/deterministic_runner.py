@@ -347,6 +347,37 @@ OPERATIONAL_LLM_NEEDS_LANE_TOKEN: str = 'operational_llm_needs_lane'
 # operational_mode) is the precise signal to key on.
 OPERATIONAL_LLM_GATE_MARKER_KEY: str = 'x_operational_llm_gate'
 
+# Task 3341: the human-curator-gate contract, as two bare orchestrator-side
+# literals in the same metadata-key-as-literal convention as the key above.
+#
+# `human_curator_gate` marks a pure deterministic gate whose resolution requires
+# human CONTENT adjudication, not merely a closed escalation record.  It is
+# written today by reconciliation Stage 2 (LLM-authored; no code produces it).
+# `curator_adjudicated_at` is the ISO-8601 stamp that PROVES the per-entry
+# review actually happened — stamped on the task via `update_task` by whoever
+# performed the review.  Both are blessed Tier-A keys
+# (shared.task_metadata._BLESSED_METADATA_KEYS) because this module reads them.
+#
+# The two are deliberately separate: the marker says "a human must judge the
+# CONTENT", the stamp says "a human did".  Task 3181 is the incident where the
+# runner had the first and inferred the second from a closed escalation record.
+HUMAN_CURATOR_GATE_KEY: str = 'human_curator_gate'
+CURATOR_ADJUDICATED_AT_KEY: str = 'curator_adjudicated_at'
+
+# Length bound applied to the externally-supplied `curator_adjudicated_at` value
+# when it is interpolated into the curator-gate `done_provenance.note`.
+#
+# Task 3286 established that `done_provenance.note` is NOT a private field:
+# fused-memory reconciliation's `_format_outcome_echo` appends it to the
+# "Task '<title>' completed." Mem0 write under a 500-char `max_note_chars` cap.
+# `_curator_adjudication_confirmed` deliberately proves only "a human stamped
+# something" — it is NOT a length validator, because rejecting a long-but-
+# genuine stamp would re-open the very phantom-done failure mode task 3341
+# exists to close.  So the bound lives here, at the note-construction site,
+# where an over-length stamp degrades the audit string but never the safety
+# decision.
+_CURATOR_STAMP_NOTE_MAX_CHARS: int = 64
+
 # Task 2238 (W10-δ): a guaranteed-non-self placeholder `own_unit` fed to
 # proc_supervision.RestartPlan.execute() on the cross-unit blocking deploy
 # path when the runner's own ORCH_UNIT-derived own_unit is falsy (the
@@ -525,6 +556,46 @@ def _is_operational_llm_gate(metadata: dict) -> bool:
     marker, so reading the raw mode would false-positive that case.
     """
     return metadata.get(OPERATIONAL_LLM_GATE_MARKER_KEY) is True
+
+
+def _is_human_curator_gate(metadata: dict) -> bool:
+    """Return True iff *metadata* marks a gate needing human CONTENT adjudication.
+
+    Task 3341.  Keys on ``HUMAN_CURATOR_GATE_KEY`` via plain TRUTHINESS —
+    a DELIBERATE divergence from ``_is_operational_llm_gate`` directly above,
+    which uses a strict ``is True``.  The two markers have opposite failure
+    costs, so they get opposite postures:
+
+    * ``_is_operational_llm_gate`` is a ROUTING hint. A false positive
+      misroutes a human-handling lane, so failing open (``is True``) is right.
+    * This is a SAFETY gate. A false NEGATIVE silently reproduces the task-3181
+      phantom-done — the exact failure this predicate exists to prevent. So a
+      truthy-but-not-``True`` value (e.g. the string ``'true'`` from a hand
+      edit or a JSON round-trip) must fail CLOSED: the guard still applies.
+
+    Pinned by ``test_string_truthy_curator_gate_marker_still_trips_the_guard``.
+    """
+    return bool(metadata.get(HUMAN_CURATOR_GATE_KEY))
+
+
+def _curator_adjudication_confirmed(metadata: dict) -> bool:
+    """Return True iff *metadata* carries positive proof the content review happened.
+
+    Task 3341.  Proof is ``CURATOR_ADJUDICATED_AT_KEY`` holding a non-empty,
+    non-whitespace ``str`` (an ISO-8601 stamp).  Every other value — ``bool``,
+    ``int``, ``None``, an empty or blank string — is NOT proof and fails CLOSED.
+
+    Note ``bool`` is excluded explicitly rather than incidentally: ``True`` is
+    the single most likely wrong value a hand edit produces here (it reads as
+    "yes, adjudicated"), and it must not be accepted as a stamp.
+
+    This checks TYPE and EMPTINESS only, never length or ISO shape — see
+    ``_CURATOR_STAMP_NOTE_MAX_CHARS`` for why bounding belongs at the
+    note-construction site instead. Pinned by
+    ``test_blank_adjudication_stamp_is_not_proof``.
+    """
+    stamp = metadata.get(CURATOR_ADJUDICATED_AT_KEY)
+    return isinstance(stamp, str) and bool(stamp.strip())
 
 
 def _is_scheduled_self_deploy_complete(task: dict | None) -> bool:
@@ -1179,6 +1250,122 @@ class DeterministicRunner:
                 '(connection may still be severed): %s: %s — the stop_instruction '
                 'escalation is already durable on local disk, so returning '
                 'BLOCKED regardless',
+                task_id, type(exc).__name__, exc,
+            )
+        return WorkflowOutcome.BLOCKED
+
+    async def _file_curator_adjudication_missing_and_block(
+        self, task_id: str, task: dict, metadata: dict,
+    ) -> WorkflowOutcome:
+        """File a born-at-L2 ``curator_adjudication_missing`` escalation and block.
+
+        Task 3341.  Reached when a ``human_curator_gate`` pure gate resumes with
+        its own escalation record closed but NO ``curator_adjudicated_at`` stamp
+        — i.e. the record says "someone closed the gate", nothing says "the
+        human reviewed the content".
+
+        Modelled verbatim on ``_file_stop_instruction_and_block``: category-
+        scoped client-side dedup (``get_by_task`` has no server-side category
+        filter, and an unrelated pending record must not suppress THIS distinct
+        signal), a born-at-L2 ``Escalation`` that survives the server's
+        downgrade gate, and a best-effort blocked writeback wrapped so a severed
+        fused-memory connection cannot turn a durable on-disk escalation into a
+        propagated exception.
+
+        Two deliberate omissions:
+
+        * It does NOT re-stamp ``gate_escalated_at`` — already stamped; this is
+          a re-ask on an established gate, not a new one.
+        * It does NOT re-file a ``milestone_gate``. A DISTINCT category keeps
+          the census legible, stops the re-ask presenting to a resolver as
+          "the same gate again" (which would invite the identical auto-
+          resolution that caused task 3181), gives the harness ``reblock_guard``
+          its own signature — it keys on ``category:summary``, so INV-4's
+          storm-escape is satisfied without building a second counter (INV-5) —
+          and lets a future watcher policy special-case "never auto-resolve
+          this category".
+
+        Returns:
+            WorkflowOutcome.BLOCKED
+        """
+        from escalation.models import Escalation
+
+        title = task.get('title') or task_id
+        summary = f'Human curator gate {task_id} resumed without content adjudication'
+        detail = (
+            f"Task {task_id} ({title!r}) is a deterministic pure gate marked "
+            f"`metadata.{HUMAN_CURATOR_GATE_KEY}`, meaning it closes only when a "
+            f"human has adjudicated its CONTENT — not merely when its escalation "
+            f"record is closed.\n\n"
+            f"An escalation record for this gate exists and is no longer pending, "
+            f"so the task-2954 proof check passed. But "
+            f"`metadata.{CURATOR_ADJUDICATED_AT_KEY}` is absent or is not a "
+            f"non-empty string, so there is NO evidence the per-entry review "
+            f"actually happened. Driving to done here would repeat task 3181, "
+            f"where esc-3181-1 was resolved by the automated escalation-watcher "
+            f"whose own resolution text said the curator work was "
+            f"'deliberately NOT executed here' — and the task was nonetheless "
+            f"closed with the generic note 'pure gate resolved'.\n\n"
+            f"REMEDIATION — one of:\n"
+            f"  (a) Perform the per-entry content review this gate asks for, then "
+            f"stamp the proof and resolve this escalation:\n"
+            f"      update_task({task_id}, metadata={{'{CURATOR_ADJUDICATED_AT_KEY}': "
+            f"'<ISO-8601 timestamp>'}}, metadata_mode='merge')\n"
+            f"      The stamp must be a non-empty string; a bare `true` is NOT "
+            f"accepted (it asserts the conclusion without recording when the "
+            f"review happened).\n"
+            f"  (b) Cancel the task, if the content work is no longer wanted.\n\n"
+            f"Resolving THIS escalation without doing (a) or (b) will simply "
+            f"re-file it on the next dispatch."
+        )
+
+        # category-scoped dedup — see docstring. An unrelated pending record
+        # (e.g. the original milestone_gate) must not suppress this signal.
+        existing_pending = [
+            e for e in self.escalation_queue.get_by_task(
+                task_id, status='pending', agent_role=DETERMINISTIC_AGENT_ROLE,
+            )
+            if e.category == 'curator_adjudication_missing'
+        ]
+        if existing_pending:
+            logger.info(
+                'DeterministicRunner: task %s already has %d pending '
+                'curator_adjudication_missing escalation(s) — skipping re-file '
+                '(curator_adjudication_missing dedup guard)',
+                task_id, len(existing_pending),
+            )
+        else:
+            esc = Escalation(
+                id=self.escalation_queue.make_id(task_id),
+                task_id=task_id,
+                agent_role=DETERMINISTIC_AGENT_ROLE,
+                severity='critical',
+                category='curator_adjudication_missing',
+                summary=summary[:200],
+                detail=detail,
+                level=2,
+            )
+            self.escalation_queue.submit(esc)
+            logger.info(
+                'DeterministicRunner: filed L2 curator_adjudication_missing '
+                'escalation %s for task %s',
+                esc.id, task_id,
+            )
+
+        try:
+            await self.scheduler.set_task_status(task_id, 'blocked')
+            logger.info(
+                'DeterministicRunner: task %s blocked — curator adjudication missing',
+                task_id,
+            )
+        except Exception as exc:
+            # Same rationale as _file_stop_instruction_and_block: the escalation
+            # is already durable on local disk, so return BLOCKED regardless.
+            logger.warning(
+                'DeterministicRunner: task %s blocked-status writeback failed '
+                '(connection may still be severed): %s: %s — the '
+                'curator_adjudication_missing escalation is already durable on '
+                'local disk, so returning BLOCKED regardless',
                 task_id, type(exc).__name__, exc,
             )
         return WorkflowOutcome.BLOCKED
@@ -2116,6 +2303,45 @@ class DeterministicRunner:
                             task_id,
                         )
                         return await self._file_milestone_gate_and_block(
+                            task_id, task, metadata,
+                        )
+                    # ORDERING INVARIANT (task 3341) — these two branches are
+                    # NOT interchangeable, and the curator guard below MUST stay
+                    # second:
+                    #   no record at all  ⇒ the gate was never established
+                    #                     ⇒ re-file the ORIGINAL milestone_gate
+                    #                       (above); asking for an adjudication
+                    #                       stamp on a gate nobody has yet seen
+                    #                       would be incoherent.
+                    #   a record exists,
+                    #   content unproven  ⇒ ask for the adjudication stamp
+                    #                       (below).
+                    # Pinned by
+                    # test_curator_gate_with_zero_records_still_refiles_milestone_gate.
+                    #
+                    # Second rung of the pure-gate proof ladder (task 3341): an
+                    # existing, no-longer-pending record proves a gate was
+                    # established and closed — it does NOT prove a human did the
+                    # CONTENT work a curator gate asks for. Task 3181 is where
+                    # the two diverged. Fail closed.
+                    if (
+                        _is_human_curator_gate(metadata)
+                        and not _curator_adjudication_confirmed(metadata)
+                    ):
+                        logger.warning(
+                            'DeterministicRunner: task %s pure-gate resume — '
+                            'metadata.%s is set but metadata.%s carries no '
+                            'non-empty string, so the human CONTENT adjudication '
+                            'is unproven; a closed escalation record is not '
+                            'evidence the review happened (task 3181 precedent: '
+                            'esc-3181-1 was auto-resolved by escalation-watcher '
+                            'and the curator work was explicitly not done) — '
+                            'filing curator_adjudication_missing and staying '
+                            'BLOCKED instead of driving to done',
+                            task_id, HUMAN_CURATOR_GATE_KEY,
+                            CURATOR_ADJUDICATED_AT_KEY,
+                        )
+                        return await self._file_curator_adjudication_missing_and_block(
                             task_id, task, metadata,
                         )
                 logger.info(
