@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from _orch_helpers import NonIsolatedGitRepoError
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig
@@ -3406,6 +3407,82 @@ class TestUnmergedDetection:
         """
         with pytest.raises(subprocess.CalledProcessError):
             await _inject_uu_state(tmp_path, 'foo.py')
+
+    async def test_inject_uu_state_cannot_mutate_an_enclosing_repo(
+        self, tmp_path: Path,
+    ):
+        """esc-3072-3 regression: a nested non-repo cwd must not reach its parent.
+
+        Reconstructs the incident layout — a live task worktree with a pytest
+        basetemp nested inside it (``.worktrees/3072/.pytest-tmp/``).  git's
+        repository discovery walks UP, so ``_inject_uu_state`` handed that bare
+        nested directory resolved the enclosing worktree and injected stages
+        1/2/3 into a REAL task's index, leaving ``UU foo.py`` behind.
+
+        Both halves are asserted, and the second is the load-bearing one.
+        "The helper raised" is exactly what
+        ``test_inject_uu_state_raises_on_non_git_cwd`` already claimed, and it
+        did not prevent the incident: ``git hash-object -w`` writes its blobs
+        BEFORE ``git update-index`` runs, so the corruption was complete before
+        ``pytest.raises`` could report anything.  The property that actually
+        matters — and the only assertion that would have caught this — is that
+        no bytes reached the enclosing repo at all.
+        """
+        # Sentinel standing in for the live task worktree that was corrupted.
+        sentinel = tmp_path / 'live-worktree'
+        sentinel.mkdir()
+        await _setup_repo(sentinel)
+
+        # Stand-in for a pytest basetemp nested INSIDE that worktree.
+        nested = sentinel / '.pytest-tmp' / 'test_x0'
+        nested.mkdir(parents=True)
+
+        # Pre-compute the three payload blob shas WITHOUT -w, so this probe
+        # cannot itself write the very objects it is about to look for.
+        payload_shas: list[str] = []
+        for content in ('version base\n', 'version ours\n', 'version theirs\n'):
+            rc, out, err = await _run(
+                ['git', 'hash-object', '--stdin'], cwd=sentinel, input_text=content,
+            )
+            assert rc == 0, f'sha probe failed: {err}'
+            payload_shas.append(out.strip())
+
+        # Baseline: the untracked .pytest-tmp/ is expected to show up here, so
+        # compare before/after rather than asserting a bare-clean tree.
+        rc, status_before, err = await _run(
+            ['git', 'status', '--porcelain'], cwd=sentinel,
+        )
+        assert rc == 0, err
+
+        with pytest.raises(NonIsolatedGitRepoError):
+            await _inject_uu_state(nested, 'foo.py')
+
+        rc, unmerged, err = await _run(['git', 'ls-files', '-u'], cwd=sentinel)
+        assert rc == 0, err
+        assert unmerged.strip() == '', (
+            f'esc-3072-3 recurrence: unmerged entries injected into the '
+            f'enclosing repo: {unmerged!r}'
+        )
+
+        rc, status_after, err = await _run(
+            ['git', 'status', '--porcelain'], cwd=sentinel,
+        )
+        assert rc == 0, err
+        assert status_after == status_before, (
+            f'enclosing repo state changed: {status_before!r} -> {status_after!r}'
+        )
+
+        assert not (sentinel / 'foo.py').exists(), (
+            'the injected path materialised in the enclosing worktree'
+        )
+
+        for sha in payload_shas:
+            rc, _, _ = await _run(['git', 'cat-file', '-e', sha], cwd=sentinel)
+            assert rc != 0, (
+                f'payload blob {sha} leaked into the enclosing object store — '
+                f'a guard that only makes git fail mid-sequence is not enough; '
+                f'the refusal must happen before the first subprocess'
+            )
 
 
 @pytest.mark.asyncio
