@@ -37,6 +37,7 @@ that all three libs actually travelled along.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -47,6 +48,11 @@ import pytest
 # cwd while a plain ``pytest orchestrator/tests`` runs from the repo root, and
 # this contract must hold identically under both.
 WARM_LANE_SCRIPT_DIR = Path(__file__).resolve().parents[1] / 'scripts' / 'warm-lane'
+
+#: Resolved ONCE, absolutely, so a case may hand a script a hostile ``PATH``
+#: without also hiding the interpreter this harness needs to launch it.  Same
+#: discipline as ``test_lane_state_lib.py``'s module-scope ``_BASH``.
+_BASH = shutil.which('bash') or '/bin/bash'
 
 #: The seven project-agnostic scripts relocated by this leaf.  ``seed-warm-lane.sh``
 #: and ``refresh-warm-base.sh`` are deliberately NOT here — PRD §5 keeps those
@@ -251,6 +257,70 @@ def _sanitized_env(
     if extra:
         env.update(extra)
     return env
+
+
+# ---------------------------------------------------------------------------
+# hostile-PATH / decoy-CWD harness (task 3279)
+# ---------------------------------------------------------------------------
+
+#: The single assertion vocabulary for "the script reached a file it picked up
+#: off the CALLER'S CWD instead of the one next to itself".  Defined once
+#: because three separate cases below assert on its absence.
+_DECOY_MARKER = 'DECOY'
+
+
+def _path_hiding(tmp_path: Path, *names: str) -> Path:
+    """A stub bin dir that HIDES *names*, to be PREPENDED to ``PATH``.
+
+    Each named binary gets a ``#!/bin/sh`` / ``exit 127`` shim.  A shim that
+    exits 127 printing nothing is observationally IDENTICAL to
+    ``command not found`` — empty command substitution, status 127 — so
+    ``$(dirname ...)`` yields the empty string exactly as it does on a host
+    whose ``PATH`` genuinely lacks the binary.
+
+    PREPEND, do not replace.  ``test_lane_state_lib.py``'s
+    ``_stub_path_dir(tmp_path, 'nothing-here')`` idiom — an EMPTY directory
+    used as the whole ``PATH`` — works there only because *sourcing* a lib
+    forks nothing.  It cannot drive these executable scripts: MEASURED,
+    ``provision-warm-lane-fs.sh --help`` under an emptied ``PATH`` exits 127
+    having printed nothing at all, because its usage heredoc forks ``cat``.  A
+    test built on that would fail for a reason unrelated to the defect under
+    test — and would go on "failing" after the fix, i.e. it would be a doomed
+    RED.  Leaving the rest of ``PATH`` intact lets the script still reach
+    ``cat``, ``realpath``, ``git``: everything except the one binary whose
+    absence is the subject.
+    """
+    stub = tmp_path / ('stub-bin-hiding-' + '-'.join(names))
+    stub.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        shim = stub / name
+        shim.write_text('#!/bin/sh\nexit 127\n')
+        shim.chmod(0o755)
+    return stub
+
+
+def _decoy_dir(tmp_path: Path, *names: str) -> Path:
+    """A directory holding same-named decoys for *names*, fit to be the ``cwd``.
+
+    Each decoy announces itself with ``_DECOY_MARKER`` on stderr and does
+    nothing else, so it is detectable whether it was *sourced* or *executed*.
+
+    Handed to a subprocess as its ``cwd`` this stands in for the realistic,
+    NON-adversarial trigger: invoking a warm-lane script from reify's own
+    ``scripts/`` dir, or from another dark-factory checkout's ``warm-lane/``
+    dir — both carry precisely these filenames.
+    """
+    stem = '-'.join(name.rsplit('.', 1)[0] for name in names)
+    decoys = tmp_path / f'decoy-cwd-{stem}'
+    decoys.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        decoy = decoys / name
+        decoy.write_text(
+            '#!/usr/bin/env bash\n'
+            f'echo "{_DECOY_MARKER} {name} SOURCED FROM CWD" >&2\n'
+        )
+        decoy.chmod(0o755)
+    return decoys
 
 
 def _default_mount_in_usage(
