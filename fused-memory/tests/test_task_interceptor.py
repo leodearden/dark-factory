@@ -6979,6 +6979,232 @@ class TestProseRightBoundarySignal:
 
 
 # ---------------------------------------------------------------------------
+# Task 3106: the PROSE advisory is attributed on DECLARED deliverable
+# signals, not on incidental prose path tokens.
+#
+# Prose lexing cannot distinguish "modifies X" from "merely cites X"; a
+# declared deliverable can. When a submission declares at least one
+# file/module owned by the FILING project, a foreign path in its prose is an
+# incidental citation, so BOTH the possible_scope_mismatch stamp and the
+# advisory escalation are suppressed. With no declared deliverable, or only
+# UNOWNED ones, there is no positive attribution and the advisory fires
+# exactly as before — that is where the guard's real protection lives.
+# ---------------------------------------------------------------------------
+
+
+class TestProseAdvisoryDeliverableAttribution:
+    """Suppression and retained-protection halves, end-to-end via submit_task.
+
+    Every test asserts BOTH the persisted ``possible_scope_mismatch`` stamp
+    AND the escalator spy, so the two outcomes can never drift apart: killing
+    only the escalation would leave a false marker on the task for operators
+    and async triage to read.
+    """
+
+    # A genuine multi-segment citation of reify's tree, filed under
+    # dark_factory. Identical prose in every case below, so the ONLY variable
+    # is the declared deliverable.
+    _FOREIGN_PROSE = 'Mirror the logic in crates/reify-eval/src/engine_edit.rs'
+
+    @staticmethod
+    def _two_project_registry(tmp_path):
+        """Reify (crates/) + dark-factory (fused-memory/).
+
+        ``exist_ok=True`` so a test may build the registry once for an
+        inline anti-vacuity assertion and let ``_submit`` build it again.
+        """
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'reify').mkdir(exist_ok=True)
+        (tmp_path / 'reify' / 'crates').mkdir(exist_ok=True)
+        (tmp_path / 'dark-factory').mkdir(exist_ok=True)
+        (tmp_path / 'dark-factory' / 'fused-memory').mkdir(exist_ok=True)
+        return ProjectPrefixRegistry.from_roots(
+            [str(tmp_path / 'reify'), str(tmp_path / 'dark-factory')]
+        )
+
+    async def _submit(self, interceptor, tmp_path, metadata=None):
+        """Submit the foreign-prose task under dark_factory; return (result, calls)."""
+        registry = self._two_project_registry(tmp_path)
+        interceptor._prefix_registry = registry
+
+        # Anti-vacuity: the prose really does still lex as a foreign-path hit.
+        # Without this, a suppression assertion below could pass merely because
+        # the lexer stopped matching rather than because attribution fired.
+        assert registry.project_for_prefix('crates/') == 'reify'
+        probe = interceptor._path_guard_check(
+            None, {'description': self._FOREIGN_PROSE}, 'dark_factory',
+        )
+        assert probe.is_rejection and probe.matched_paths == ('crates/',), (
+            f'Expected the prose scan to still hit crates/, got: {probe!r}'
+        )
+
+        calls: list = []
+
+        class SpyEscalator:
+            def report_rejection(self, **kwargs):
+                calls.append(kwargs)
+
+        interceptor._scope_violation_escalator = SpyEscalator()
+
+        kwargs = {}
+        if metadata is not None:
+            kwargs['metadata'] = metadata
+        try:
+            result = await interceptor.submit_task(
+                project_root=str(tmp_path / 'dark-factory'),
+                title='Port the engine edit path',
+                description=self._FOREIGN_PROSE,
+                **kwargs,
+            )
+        finally:
+            await _cancel_interceptor_workers(interceptor)
+        return result, calls
+
+    @staticmethod
+    async def _persisted_meta(ticket_store, result):
+        """Read the persisted candidate blob's metadata back out of the store."""
+        assert isinstance(result, dict)
+        assert 'error_type' not in result, f'Expected no error, got: {result}'
+        ticket_id = result.get('ticket', '')
+        assert ticket_id.startswith('tkt_'), f'Expected tkt_-prefixed ticket: {result}'
+
+        db = ticket_store._db
+        assert db is not None
+        cursor = await db.execute(
+            'SELECT candidate_json FROM tickets WHERE ticket_id = ?',
+            (ticket_id,),
+        )
+        row = await cursor.fetchone()
+        assert row is not None, f'Expected persisted row for {ticket_id!r}'
+        return json.loads(row['candidate_json']).get('metadata') or {}
+
+    # -- SUPPRESSION: a locally-owned declared deliverable attests ----------
+
+    @pytest.mark.asyncio
+    async def test_owned_files_entry_suppresses_stamp_and_escalation(
+        self, interceptor_with_store, ticket_store, taskmaster, tmp_path,
+    ):
+        """metadata.files names a dark_factory file → the crates/ citation is
+        incidental. Ticket created, NO stamp, NO escalation."""
+        result, calls = await self._submit(
+            interceptor_with_store, tmp_path,
+            metadata={'files': ['fused-memory/src/x.py']},
+        )
+
+        meta = await self._persisted_meta(ticket_store, result)
+        assert 'possible_scope_mismatch' not in meta, (
+            f'A declared filer-owned deliverable must suppress the stamp: {meta!r}'
+        )
+        assert calls == [], f'Expected no scope_violation escalation, got: {calls!r}'
+
+    @pytest.mark.asyncio
+    async def test_owned_modules_entry_suppresses(
+        self, interceptor_with_store, ticket_store, taskmaster, tmp_path,
+    ):
+        """The modules leg: a declared DIRECTORY lock key attests too.
+
+        _extract_meta_files does not read `modules` at all, so this case can
+        only pass through the new union extractor — and the entry is a bare
+        directory, which find_paths deliberately does not lex as a path.
+        """
+        result, calls = await self._submit(
+            interceptor_with_store, tmp_path,
+            metadata={'modules': ['fused-memory/src/fused_memory/middleware']},
+        )
+
+        meta = await self._persisted_meta(ticket_store, result)
+        assert 'possible_scope_mismatch' not in meta, f'got: {meta!r}'
+        assert calls == [], f'got: {calls!r}'
+
+    @pytest.mark.asyncio
+    async def test_owned_files_to_modify_entry_suppresses(
+        self, interceptor_with_store, ticket_store, taskmaster, tmp_path,
+    ):
+        """The files_to_modify leg (legacy curator-internal key) attests too."""
+        result, calls = await self._submit(
+            interceptor_with_store, tmp_path,
+            metadata={'files_to_modify': ['fused-memory/src/x.py']},
+        )
+
+        meta = await self._persisted_meta(ticket_store, result)
+        assert 'possible_scope_mismatch' not in meta, f'got: {meta!r}'
+        assert calls == [], f'got: {calls!r}'
+
+    # -- RETAINED PROTECTION: no positive attribution → advisory unchanged --
+
+    @pytest.mark.asyncio
+    async def test_only_unowned_declared_files_still_advises(
+        self, interceptor_with_store, ticket_store, taskmaster, tmp_path,
+    ):
+        """Declaring only UNOWNED files is no evidence of local work.
+
+        This is the retained-protection boundary: 'some deliverable was
+        declared' must not be enough, or a genuinely misrouted task can buy
+        silence with a README.md.
+        """
+        registry = self._two_project_registry(tmp_path)
+        assert registry.project_for_path('README.md') is None, (
+            'README.md must be UNOWNED or this test proves nothing'
+        )
+
+        result, calls = await self._submit(
+            interceptor_with_store, tmp_path, metadata={'files': ['README.md']},
+        )
+
+        meta = await self._persisted_meta(ticket_store, result)
+        marker = meta.get('possible_scope_mismatch')
+        assert marker is not None, f'Expected the advisory stamp to fire: {meta!r}'
+        assert marker['matched_paths'] == ['crates/']
+        assert marker['suggested_project'] == 'reify'
+        assert len(calls) == 1, f'Expected exactly one escalation, got: {calls!r}'
+        assert calls[0].get('advisory') is True
+
+    @pytest.mark.asyncio
+    async def test_no_declared_deliverable_still_advises(
+        self, interceptor_with_store, ticket_store, taskmaster, tmp_path,
+    ):
+        """No metadata at all → no attribution → the advisory is unchanged."""
+        result, calls = await self._submit(interceptor_with_store, tmp_path)
+
+        meta = await self._persisted_meta(ticket_store, result)
+        marker = meta.get('possible_scope_mismatch')
+        assert marker is not None, f'Expected the advisory stamp to fire: {meta!r}'
+        assert marker['matched_paths'] == ['crates/']
+        assert marker['suggested_project'] == 'reify'
+        assert len(calls) == 1, f'Expected exactly one escalation, got: {calls!r}'
+        assert calls[0].get('advisory') is True
+
+    # -- NEGATIVE CONTROL: the FILES-certain hard reject is untouched -------
+
+    @pytest.mark.asyncio
+    async def test_mixed_declared_files_still_hard_reject(
+        self, interceptor_with_store, ticket_store, taskmaster, tmp_path,
+    ):
+        """A locally-owned entry cannot buy its way past the hard reject.
+
+        Attribution is consulted ONLY after check_files_for_scope returned
+        'ok'. Here it returns a rejection (the crates/ file is foreign to the
+        dark_factory filer), so the suppression branch is never reached — and
+        the mixed set is not all-foreign, so the cross-repo tagger declines it
+        too (task 2206 preserved).
+        """
+        result, _calls = await self._submit(
+            interceptor_with_store, tmp_path,
+            metadata={'files': ['crates/widget.rs', 'fused-memory/src/x.py']},
+        )
+
+        assert isinstance(result, dict)
+        assert result.get('error_type') == 'DarkFactoryPathScopeViolation', (
+            f'Expected the FILES-certain hard reject, got: {result}'
+        )
+        assert 'crates/widget.rs' in result.get('matched_paths', [])
+        assert result.get('suggested_project') == 'reify'
+
+
+# ---------------------------------------------------------------------------
 # Unit tests for TaskInterceptor._extract_meta_files
 # ---------------------------------------------------------------------------
 
