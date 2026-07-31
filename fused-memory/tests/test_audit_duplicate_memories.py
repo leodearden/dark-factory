@@ -53,6 +53,7 @@ partition_topic_carveout = _mod.partition_topic_carveout
 fetch_procedural_memories = _mod.fetch_procedural_memories
 fetch_memories = _mod.fetch_memories
 _ALL_CATEGORIES = _mod._ALL_CATEGORIES
+extract_liveness_snapshot_fact = _mod.extract_liveness_snapshot_fact
 apply_deletions = _mod.apply_deletions
 resolve_ann_threshold = _mod.resolve_ann_threshold
 fetch_ann_neighbors = _mod.fetch_ann_neighbors
@@ -3659,3 +3660,181 @@ class TestRunWiring:
         _install_run_doubles(monkeypatch, {_PK: [_raw('m1', 'x')]})
         await _run(await self._parse(tmp_path))
         assert _FakeMemoryService.instances[-1].closed is True
+
+
+# ---------------------------------------------------------------------------
+# Liveness-snapshot recurrence fixtures (task 3098)
+# ---------------------------------------------------------------------------
+#
+# Real-world fixture basis: four solar_challenge observations_and_summaries
+# memories written by agent_id `recon-stage-task_knowledge_sync`, surfaced by
+# Stage-1 finding 724e7be4 (run e149def2). Provenance by memory id:
+#
+#   6b245659  metadata.task_id="94"  kind=stranded_task_investigation
+#   08aa0017  metadata.task_id="96"  kind=live_workflow_deferral_note
+#   68dd5f93  metadata.task_id="96"  kind=investigation_note
+#   1eef7df7  metadata.task_id="99", related_task_ids=["94","96"]
+#                                    kind=task_lifecycle_reverification
+#
+# Contents below are the real ones, abbreviated in the tail but VERBATIM
+# through the status-bearing clause. `metadata.kind` differs across all four,
+# so keying on it is not viable; the repeated CORE FACT is.
+#
+# Why a third detector class is needed: the pairwise difflib.SequenceMatcher
+# ratios between the three liveness snapshots are 0.1173 / 0.2328 / 0.1770 on
+# the full records (measured and recorded in task 3098's plan) and
+# 0.1648 / 0.2882 / 0.2687 on the abbreviated fixture text below (measured
+# before authoring this fixture) -- against a production LEXICAL threshold of
+# 0.85. The unique investigative payload is several times the length of the
+# repeated core status fact and swamps every similarity metric, so the lexical
+# path structurally cannot reach these records. Following the discipline of
+# the _VENV_GOTCHA_* block above, no assertion pins those ratio values.
+_LIVENESS_SNAPSHOT_94_JUL24 = (
+    'Point-in-time liveness check performed 2026-07-24 during reconciliation '
+    'run 4b262e10-3624-44e5-b420-4dbedfd2bb8b (Stage 2, task_knowledge_sync) '
+    'on task 94 ("Point orchestrator config references at canonical '
+    'dark-factory-orchestrator.yaml and drop the transitional symlink"): '
+    'get_task reports status="in-progress" but claimant_run_id=null and '
+    'heartbeat_at=null, and this cycle\'s Live-Workflow Signals section does '
+    'NOT list task/94 (no registered worktree signal, no recent-commit '
+    'signal, no active-orchestrator signal) — even though a worktree '
+    'directory with a populated .venv exists on disk at .worktrees/94/. '
+    'Direct file reads this cycle confirm the task\'s SCOPE item 1 has NOT '
+    'landed on the main checkout: CLAUDE.md:95 still reads "orchestrator.yaml" '
+    'and .envrc:5-6 still reference the legacy '
+    '/home/leo/src/solar-challenge/orchestrator.yaml path, both of which task '
+    '94 is supposed to retarget to dark-factory-orchestrator.yaml.'
+)
+
+_LIVENESS_SNAPSHOT_96_JUL24 = (
+    'Point-in-time liveness check performed 2026-07-24 during reconciliation '
+    'run dcd89ed9-8df5-404a-8e33-caa296a0a73c (Stage 2, task_knowledge_sync) '
+    'on task 96 ("Fix stale briefing.yaml POSTURE header + deferred-task '
+    'tally — third recurrence"): get_task at that timestamp reported '
+    'status="in-progress" (claimant_run_id=null, heartbeat_at=null), and the '
+    'reconciliation payload\'s Live-Workflow Signals section at that same '
+    'timestamp listed task/96 as having a registered git worktree AND an '
+    'active orchestrator process holding the project lock. Stage 1 had '
+    'separately confirmed via direct file read that '
+    '/home/leo/src/solar-challenge/review/briefing.yaml already contained the '
+    'corrected POSTURE header + deferred-task tally content matching task '
+    "96's acceptance criteria."
+)
+
+# The "genuinely unique investigative content" the task says to preserve: it
+# reports task 96 as in-progress in PROSE, with no <field>=<value> assignment
+# and no point-in-time framing at all. It must never be grouped.
+_INVESTIGATION_NOTE_96 = (
+    'Task 96 ("Fix stale briefing.yaml POSTURE header + deferred-task tally — '
+    'third recurrence") remains in-progress as of run f867d648 (2026-07-24). '
+    'Direct read of /home/leo/src/solar-challenge/review/briefing.yaml on the '
+    'MAIN checkout (non-worktree path) shows the intended fix already present '
+    '(POSTURE header re-dated 2026-07-22, third-recurrence hedge language). '
+    'However, /home/leo/src/solar-challenge/.git/logs/HEAD shows main HEAD has '
+    'NOT advanced past commit af4911565ed76a81fa1a02641aebdd1653ce20b0 — no '
+    'later commit appears in the reflog. Conclusion: do NOT close task 96 via '
+    'set_task_status/done_provenance without a verified commit SHA — there is '
+    'none to cite.'
+)
+
+_LIVENESS_REVERIFY_94_96_JUL26 = (
+    'Point-in-time liveness check performed 2026-07-26 during reconciliation '
+    'run e3eaa351-5173-41a9-b187-801fb05400bf (Stage 2, task_knowledge_sync) '
+    'on task 94 ("Point orchestrator config references at canonical '
+    'dark-factory-orchestrator.yaml and drop the transitional symlink"): '
+    'get_task reports status="in-progress" but claimant_run_id=null and '
+    'heartbeat_at=null, and this cycle\'s Live-Workflow Signals section does '
+    'NOT list task/94 — matching the same stranded pattern first recorded in '
+    'prior investigation 6b245659 (run 4b262e10). A fresh grep of .envrc at '
+    'this timestamp still found lines 5-6 referencing the legacy top-level '
+    '"orchestrator.yaml" path.\n\n'
+    'Separately, point-in-time check on task 96 ("Fix stale briefing.yaml '
+    'POSTURE header + deferred-task tally"): get_task reports '
+    'status="in-progress" but claimant_run_id=null and heartbeat_at=null, '
+    'matching the same stranded pattern. A fresh read of review/briefing.yaml '
+    'at this timestamp found the POSTURE header already carrying task 96\'s '
+    'intended fix text as a working-tree state only — no corresponding commit '
+    'was observed advancing main HEAD. New supplementary detail for whoever '
+    "resolves task 99's commit-vs-discard decision: the diff's own embedded "
+    'snapshot numbers were already one cycle old at authoring time.'
+)
+
+# The core fact all three snapshots re-assert, in the canonical rendering:
+# distinct `field=value` pairs, values lowercased and unquoted, sorted by
+# field name, joined on '|'.
+_CORE_FACT_STRANDED = 'claimant_run_id=null|heartbeat_at=null|status=in-progress'
+
+# The real created_at values, kept so first_seen/last_seen/span_days are
+# exercised against real elapsed time rather than round numbers.
+_TS_94_JUL24 = '2026-07-24T13:14:03.534125+00:00'
+_TS_96_JUL24 = '2026-07-24T09:23:28.354341+00:00'
+_TS_NOTE_96 = '2026-07-24T17:26:17.120293+00:00'
+_TS_REVERIFY = '2026-07-26T05:52:25.057487+00:00'
+
+
+class TestExtractLivenessSnapshotFact:
+    """A repeated core FACT, keyed exactly -- not a similarity score.
+
+    Two snapshots taken days apart share one clause verbatim and differ
+    everywhere else, so the equivalence relation here is "asserts the same
+    live fields", not "reads alike". Exact string equality on a canonical key
+    means there is no threshold to tune and no false cluster to delete.
+    """
+
+    def test_all_three_real_snapshots_yield_the_same_key(self):
+        keys = [
+            extract_liveness_snapshot_fact(
+                _memory('6b245659', _LIVENESS_SNAPSHOT_94_JUL24, category=_OS),
+            ),
+            extract_liveness_snapshot_fact(
+                _memory('08aa0017', _LIVENESS_SNAPSHOT_96_JUL24, category=_OS),
+            ),
+            extract_liveness_snapshot_fact(
+                _memory('1eef7df7', _LIVENESS_REVERIFY_94_96_JUL26, category=_OS),
+            ),
+        ]
+
+        assert all(k is not None for k in keys), 'each is a recognised snapshot'
+        assert len(set(keys)) == 1, 'the repeated core fact is one key, not three'
+        assert keys[0] == _CORE_FACT_STRANDED
+
+    def test_prose_only_investigation_note_is_not_a_snapshot(self):
+        """No `<field>=<value>` assignment -> genuinely unique content, preserved."""
+        assert extract_liveness_snapshot_fact(
+            _memory('68dd5f93', _INVESTIGATION_NOTE_96, category=_OS),
+        ) is None
+
+    def test_a_different_status_is_a_different_key(self):
+        """Distinct facts must never collapse into one group."""
+        done = _LIVENESS_SNAPSHOT_94_JUL24.replace(
+            'status="in-progress"', 'status="done"',
+        )
+        key = extract_liveness_snapshot_fact(_memory('x', done, category=_OS))
+
+        assert key == 'claimant_run_id=null|heartbeat_at=null|status=done'
+        assert key != _CORE_FACT_STRANDED
+
+    def test_live_fields_without_point_in_time_framing_are_not_a_snapshot(self):
+        """Incidental prose carrying `status=` is not a liveness observation.
+
+        Gate 2628 BLOCKS the bare current-fact framing in the gated
+        categories, so every liveness observation written since it landed
+        necessarily carries the point-in-time form. Requiring it costs no
+        recall on the swept corpus.
+        """
+        assert extract_liveness_snapshot_fact(_memory(
+            'x',
+            'The dispatcher rejected the claim because status=in-progress and '
+            'claimant_run_id=null are inconsistent for a queued task.',
+            category=_OS,
+        )) is None
+
+    def test_paraphrase_without_an_assignment_is_not_a_snapshot(self):
+        """A LIVE_TASK_STATUS_RE paraphrase alone yields no readable fields."""
+        assert extract_liveness_snapshot_fact(_memory(
+            'x',
+            'Point-in-time liveness check performed 2026-07-24 on task 94: '
+            'the task is actively driven by an orchestrator process holding '
+            'the project lock, so Stage 2 did not write.',
+            category=_OS,
+        )) is None
