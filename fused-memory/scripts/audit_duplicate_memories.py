@@ -472,7 +472,10 @@ _ANN_DISCLOSURE_KEYS: tuple[str, ...] = (
 # rather than folded into either, so each generator's disclosure contract stays
 # its own. Same contract as its siblings: every key always present, always an
 # int, always zero-filled on a clean run.
-_LIVENESS_DISCLOSURE_KEYS: tuple[str, ...] = ()
+_LIVENESS_DISCLOSURE_KEYS: tuple[str, ...] = (
+    'liveness_snapshot_untasked',
+    'liveness_snapshot_unfielded',
+)
 
 
 def find_liveness_snapshot_recurrences(
@@ -515,6 +518,13 @@ def find_liveness_snapshot_recurrences(
         Groups are sorted by ``(category, subject_task_id, first member id)``
         so two identical runs serialise byte-identically. Does not mutate
         *memories* or its dicts.
+
+        *disclosure* carries every ``_LIVENESS_DISCLOSURE_KEYS`` counter —
+        ``liveness_snapshot_untasked`` (a recognised snapshot that resolves to
+        no subject, so no bucket can hold it) and
+        ``liveness_snapshot_unfielded`` (point-in-time framing plus a
+        ``LIVE_TASK_STATUS_RE`` paraphrase whose fields could not be read).
+        Both are always present, always ints, always 0 on a clean run.
     """
     swept = set(categories)
     disclosure = dict.fromkeys(_LIVENESS_DISCLOSURE_KEYS, 0)
@@ -526,8 +536,21 @@ def find_liveness_snapshot_recurrences(
             continue
         core_fact = extract_liveness_snapshot_fact(record)
         if core_fact is None:
+            # "Not a snapshot at all" and "a snapshot whose fields could not be
+            # read" are different outcomes, and only the second is a loss. The
+            # discrimination lives HERE rather than inside the extractor, which
+            # keeps its single None/key contract.
+            content = record.get('content') or ''
+            if (POINT_IN_TIME_CHECK_RE.search(content)
+                    and LIVE_TASK_STATUS_RE.search(content)):
+                disclosure['liveness_snapshot_unfielded'] += 1
             continue
-        for subject in liveness_snapshot_subject_task_ids(record):
+        subjects = liveness_snapshot_subject_task_ids(record)
+        if not subjects:
+            # A recognised snapshot no bucket can hold: real recall, counted
+            # rather than invisible.
+            disclosure['liveness_snapshot_untasked'] += 1
+        for subject in subjects:
             buckets.setdefault((category, subject, core_fact), []).append(record)
 
     groups: list[dict[str, Any]] = []
