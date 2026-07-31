@@ -720,3 +720,95 @@ class TestFailureExamplesAreCapped:
         assert failures['examples_truncated'] is False
         assert failures['examples_omitted'] == 0
         assert len(failures['examples']) == 2
+
+
+# ===========================================================================
+# step-13 — THE INV-2/INV-4 DISTINGUISHABILITY TEST
+# ===========================================================================
+
+
+def _coverage(found: int, read: int, failed: int = 0, searches: int = 0) -> dict:
+    coverage = _mod._new_coverage()
+    coverage['transcripts_found'] = found
+    coverage['transcripts_read'] = read
+    coverage['searches_extracted'] = searches
+    coverage['parse_failures']['count'] = failed
+    return coverage
+
+
+class TestCoverageStatus:
+    """The task's headline requirement.
+
+    "0 searches extracted" must not read the same way for an empty archive and
+    for a run where every transcript failed. A count alone cannot carry that —
+    both are 0. So the status STRING makes it legible to a human reading the
+    report, and the EXIT CODE makes it legible to a scheduler or wrapper that
+    never opens the artifact.
+    """
+
+    def test_all_read_no_failures_is_ok(self):
+        assert _mod.coverage_status(_coverage(found=3, read=3, searches=7)) == 'ok'
+
+    def test_partial_failure_is_degraded(self):
+        assert _mod.coverage_status(_coverage(found=3, read=2, failed=1, searches=5)) == 'degraded'
+
+    def test_missing_or_empty_archive_is_no_input(self):
+        assert _mod.coverage_status(_coverage(found=0, read=0)) == 'no_input'
+
+    def test_everything_failed_is_total_failure(self):
+        assert _mod.coverage_status(_coverage(found=3, read=0, failed=3)) == 'total_failure'
+
+    def test_exit_codes(self):
+        assert _mod.EXIT_CODES == {
+            'ok': 0, 'degraded': 0, 'no_input': 2, 'total_failure': 3,
+        }
+
+    def test_degraded_is_still_a_usable_corpus(self):
+        # Exit 0 on purpose: a partial failure that is FULLY disclosed (count
+        # plus a bounded, self-disclosing example list) still yields a corpus
+        # worth having. A wholesale failure does not.
+        assert _mod.EXIT_CODES[_mod.coverage_status(_coverage(3, 2, failed=1))] == 0
+
+    def test_status_is_stamped_into_the_coverage_mapping(self):
+        # The artifact must carry it, not only the process exit code — a
+        # coverage file read later has no exit code attached.
+        coverage = _coverage(found=3, read=0, failed=3)
+        assert _mod.stamp_status(coverage) is coverage
+        assert coverage['status'] == 'total_failure'
+
+    def test_zero_search_cases_are_distinguishable(self):
+        # THE property, asserted directly rather than inferred from the four
+        # tests above. An empty archive and an every-transcript-failed run BOTH
+        # extract zero searches; if they agreed on status or exit code, a
+        # silently broken extractor could masquerade as a clean empty result.
+        empty = _coverage(found=0, read=0, searches=0)
+        all_failed = _coverage(found=5, read=0, failed=5, searches=0)
+
+        assert empty['searches_extracted'] == all_failed['searches_extracted'] == 0
+
+        empty_status = _mod.coverage_status(empty)
+        failed_status = _mod.coverage_status(all_failed)
+        assert empty_status != failed_status
+        assert _mod.EXIT_CODES[empty_status] != _mod.EXIT_CODES[failed_status]
+        assert _mod.EXIT_CODES[empty_status] != 0
+        assert _mod.EXIT_CODES[failed_status] != 0
+
+    def test_a_real_archive_holding_no_searches_is_a_third_outcome(self):
+        # Read everything, found nothing to extract. That is a measurement
+        # ('this archive has no searches'), not a failure — and it must be
+        # separately identifiable from both cases above.
+        healthy_but_empty = _coverage(found=5, read=5, searches=0)
+        status = _mod.coverage_status(healthy_but_empty)
+        assert status == 'ok'
+        assert _mod.EXIT_CODES[status] == 0
+        assert status not in {
+            _mod.coverage_status(_coverage(0, 0)),
+            _mod.coverage_status(_coverage(5, 0, failed=5)),
+        }
+
+    def test_status_vocabulary_matches_the_exit_code_table(self):
+        # No status can exist without a declared exit code, and vice versa —
+        # otherwise a new status would KeyError at the worst moment, on the
+        # failure path.
+        for found, read, failed in [(3, 3, 0), (3, 2, 1), (0, 0, 0), (3, 0, 3)]:
+            assert _mod.coverage_status(_coverage(found, read, failed)) in _mod.EXIT_CODES
