@@ -38,7 +38,8 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import TypedDict
+from collections.abc import Mapping
+from typing import Any, NotRequired, TypedDict
 
 from shared.cli_invoke import read_transcript_records
 
@@ -80,8 +81,21 @@ _TREE_KINDS = frozenset({'file', 'dir', 'symlink', 'vanished'})
 CREDENTIAL_FILENAMES = frozenset({'.credentials.json'})
 
 
-class StartupCompletionRow(TypedDict, total=False):
-    """One curated observation of a config dir at a point in startup."""
+class StartupCompletionRow(TypedDict):
+    """One curated observation of a config dir at a point in startup.
+
+    Totality mirrors :data:`_REQUIRED_KEYS`, which :func:`validate_row` enforces
+    at load time: every key below is present on a validated row, so a consumer
+    (3326's tests included) can subscript it without a ``.get()`` dance.  The two
+    genuinely-optional key is ``NotRequired``:
+
+    - ``transcript_raw_lines`` — present only on the truncated/unparseable
+      degrade rows, which express their transcript as literal lines rather than
+      as parsed records.
+
+    ``source_path`` is required because it describes a LOADED row:
+    :func:`load_startup_completion_corpus` stamps it on every row it returns.
+    """
 
     id: str
     regime: str
@@ -91,12 +105,12 @@ class StartupCompletionRow(TypedDict, total=False):
     config_dir_tree: list[dict]
     transcript_relpath: str | None
     transcript_records: list[dict] | None
-    transcript_raw_lines: list[str]
     proc: dict
     expected_startup_complete: bool | None
     substrate_returns: dict
     provenance: dict
     source_path: str
+    transcript_raw_lines: NotRequired[list[str]]
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +178,7 @@ _REQUIRED_KEYS: tuple[str, ...] = (
 )
 
 
-def validate_row(row: dict) -> None:
+def validate_row(row: Mapping[str, Any]) -> None:
     """Raise ``AssertionError`` if *row* violates the documented schema.
 
     The single schema gate — `fixtures/startup_completion/README.md` documents
@@ -354,8 +368,14 @@ def snapshot_config_dir(
     return entries
 
 
-def materialize_config_dir(row: dict, dest: Path) -> tuple[Path, str]:
+def materialize_config_dir(row: Mapping[str, Any], dest: Path) -> tuple[Path, str]:
     """Rebuild *row*'s observed config dir under *dest*; return ``(dir, session_id)``.
+
+    *row* is any mapping carrying the observation keys — a curated
+    :class:`StartupCompletionRow` from the corpus, or a raw observation object
+    straight out of ``startup_completion_probe.py``'s JSONL.  Accepting both is
+    what lets the live drift guard materialize a FRESH probe sample through the
+    exact same path 3326's tests use for committed rows.
 
     The entry point 3326's tests call.  The rebuilt tree is a real filesystem, so
     a production predicate — and the real ``_run_subprocess`` watchdog — can be

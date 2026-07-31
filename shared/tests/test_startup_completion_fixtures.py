@@ -320,10 +320,12 @@ class TestWedgeShapeCoverage:
 
     @pytest.mark.parametrize('shape', _REQUIRED_WEDGE_SHAPES)
     def test_every_required_wedge_shape_has_a_row(self, shape):
+        # `wedge_shape is not None` is guaranteed for wedge rows by validate_row;
+        # restating it here keeps the failure message's sort well-typed.
         shapes = [
             row['wedge_shape']
             for row in scf.load_startup_completion_corpus()
-            if row['regime'] == 'wedge'
+            if row['regime'] == 'wedge' and row['wedge_shape'] is not None
         ]
         assert shape in shapes, (
             f'wedge corpus has no row for {shape!r}; observed {sorted(set(shapes))}'
@@ -582,7 +584,12 @@ class TestLiveReprobe:
         # is the earliest signal that the CLI's record vocabulary moved, which
         # is worth knowing before something that IS load-bearing follows.
         committed = self._committed_pre_first_token_row()
-        expected = [r.get('type') for r in committed['transcript_records']]
+        committed_records = committed['transcript_records']
+        assert committed_records is not None, (
+            f'{committed["id"]}: a healthy pre-first-token row must carry parsed '
+            'transcript_records to diff a fresh probe against'
+        )
+        expected = [r.get('type') for r in committed_records]
 
         sample = [
             o for o in fresh_observations if o['sample_kind'] == 'pre_first_token'
