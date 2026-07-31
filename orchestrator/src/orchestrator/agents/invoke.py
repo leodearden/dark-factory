@@ -1171,6 +1171,21 @@ async def _run_subprocess_local(
             duration_ms=duration_ms,
             timed_out=True,
         )
+    except asyncio.CancelledError:
+        # Orchestrator shutdown / steward-stop path: the awaiting task was
+        # cancelled.  Without this, proc.communicate() is cancelled but the
+        # child process GROUP is never signalled and the agent survives as an
+        # orphan still editing/committing in its worktree.  Mirrors the
+        # already-blessed handler in shared/src/shared/cli_invoke.py (:2433)
+        # and orchestrator/src/orchestrator/steward.py (:405).
+        # No comm_task to reap: asyncio.wait_for already cancels and awaits
+        # its inner task before propagating CancelledError.
+        if proc.returncode is None:
+            logger.warning(
+                f'Subprocess cancelled — terminating process group for pid {proc.pid}'
+            )
+            await terminate_process_group(proc, pgid, grace_secs=5.0)
+        raise
 
     duration_ms = int(time.monotonic() * 1000) - start_ms
 
