@@ -648,10 +648,13 @@ def build_embed_fn(config: Any) -> Any:
     from openai import OpenAI  # noqa: PLC0415
 
     embedder = config.embedder
-    api_key = embedder.providers.get('openai', {}).get('api_key') if isinstance(
-        getattr(embedder, 'providers', None), dict,
-    ) else None
-    client = OpenAI(api_key=api_key) if api_key else OpenAI()
+    openai_provider = embedder.providers.openai
+    api_key = openai_provider.api_key if openai_provider is not None else None
+    client = (
+        OpenAI(api_key=api_key, base_url=openai_provider.api_url)
+        if openai_provider is not None
+        else OpenAI()
+    )
 
     def embed(memory_id: str, content: str) -> list[float]:
         response = client.embeddings.create(model=embedder.model, input=content)
