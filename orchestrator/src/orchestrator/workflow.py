@@ -6117,9 +6117,41 @@ class TaskWorkflow:
         """Sync done-callback for an architect-desync MergeRequest.
 
         Fires on the loop when the MergeRequest future resolves.  Derives the
-        terminal :class:`MergeOutcome` — a cancelled or raising future is
-        treated as a durable failure, never as a silent success — and schedules
+        terminal :class:`MergeOutcome` — a RAISING future is treated as a
+        durable failure, never as a silent success — and schedules
         :meth:`_on_architect_merge_done` as a tracked background task.
+
+        A CANCELLED future is handled here instead, and is deliberately NOT a
+        durable failure — it is recorded as ``decision='merge_abandoned'`` and
+        goes no further.  This mirrors the sibling reaper callback
+        (``Harness._on_stranded_merge_done``: ``if fut.cancelled(): return  #
+        abandoned/superseded``) and the queue's own canonical classification
+        (``enqueue_merge_request._on_finalized`` maps a cancelled future to
+        state ``'abandoned'``, distinct from ``'error'``).  Both callers that
+        cancel one of these futures are benign:
+
+        * ``merge_cancel`` — a deliberate operator cancellation (the human is
+          already in the loop; paging them for their own action is backwards);
+        * ``InFlightMergeRegistry.release(detach_waiters=True)`` — the
+          stale-reap path, which cancels the stale primary and immediately
+          re-acquires the slot for a FRESH request on the same branch.  That
+          successor lands the branch and the found_on_main reconciler flips
+          the task done.
+
+        Routing cancellation into the durable branch would file a born-at-L2
+        ``stranded_merge_failed`` (critical, human-routed) for both of those,
+        so it is a spurious page.  It is also not needed to avoid a strand: a
+        task left ``blocked`` / no-escalation / branch EXISTS_OFF_MAIN is
+        picked up by the harness sweep's EXISTS_OFF_MAIN upgrade
+        (``harness.py`` — ``_only_merge_remediable([])`` is vacuously true, so
+        LEAVE is upgraded to ``RE_FILE_ESCALATION``), which files a
+        ``stranded_blocked`` L1 that the watcher auto-resolves into a re-pend.
+        The task is re-dispatched, the architect re-reports the desync, and
+        the (now stale) marker lets it re-submit.  Abandonment self-heals; a
+        durable FAILURE must not take that path, which is exactly why
+        ``stranded_merge_failed`` is excluded from
+        ``MERGE_REMEDIABLE_ESC_CATEGORIES`` — it blocks the upgrade and stops
+        a failed branch being re-submitted into the same failure.
 
         Wrapped fail-safe: any error is logged and never propagated (mirrors
         ``enqueue_merge_request._on_finalized`` and the reaper's
@@ -6131,10 +6163,26 @@ class TaskWorkflow:
             from orchestrator.merge_types import MergeOutcome  # noqa: PLC0415
 
             if fut.cancelled():
-                outcome = MergeOutcome(
-                    status='error', reason='merge future cancelled',
+                logger.info(
+                    'Task %s: architect-desync merge future was cancelled at '
+                    'tip %s (abandoned/superseded, not a failure) — no '
+                    'escalation; the stranded-blocked sweep re-drives',
+                    self.task_id, tip[:12],
                 )
-            elif (exc := fut.exception()) is not None:
+                if self.event_store:
+                    self.event_store.emit(
+                        EventType.architect_desync_merge,
+                        task_id=self.task_id,
+                        phase='merge',
+                        data={
+                            'decision': 'merge_abandoned',
+                            'status': 'cancelled',
+                            'tip': tip,
+                            'reason': 'merge future cancelled',
+                        },
+                    )
+                return
+            if (exc := fut.exception()) is not None:
                 outcome = MergeOutcome(
                     status='error', reason=f'merge future raised: {exc}',
                 )

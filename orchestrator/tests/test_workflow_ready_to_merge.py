@@ -49,6 +49,7 @@ class _Fixture:
     git_ops: MagicMock
     mark_blocked: AsyncMock
     outcome: WorkflowOutcome | None = None
+    escalations: Any = None  # the _FakeEscalationQueue, when one is wired
 
     def marker_stamps(self) -> list[dict]:
         """Every ``architect_merge_request`` payload written via update_task."""
@@ -756,6 +757,85 @@ class TestArchitectMergeDurableFailureEscalates:
         )  # must not raise
 
     _fire = staticmethod(_fire_merge_done)
+
+
+@pytest.mark.asyncio
+class TestCancelledMergeFutureIsNotAFailure:
+    """A CANCELLED merge future is abandonment/supersession, not a failure.
+
+    Both callers that cancel one of these futures are benign — ``merge_cancel``
+    (a deliberate operator action) and the registry's stale-reap
+    ``release(detach_waiters=True)`` (which immediately re-acquires the slot for
+    a fresh request on the same branch).  The queue's own classification agrees:
+    ``enqueue_merge_request._on_finalized`` maps a cancelled future to state
+    ``'abandoned'``, distinct from ``'error'``.  Routing cancellation into the
+    durable branch would file a critical human-routed L2 for both.
+    """
+
+    async def _cancel(self, tmp_path: Path) -> _Fixture:
+        """Drive the REAL registered callback with a cancelled future."""
+        q = _FakeEscalationQueue()
+        f = _make(tmp_path=tmp_path)
+        f.wf.escalation_queue = q  # type: ignore[assignment]
+        f.artifacts.write_ready_to_merge(commit=_TIP, evidence='ev')
+        await f.wf._handle_ready_to_merge_report()
+        req = f.merge_queue.get_nowait()
+
+        req.result.cancel()
+        await asyncio.sleep(0)
+        if f.wf._background_tasks:
+            await asyncio.gather(*list(f.wf._background_tasks))
+        f.escalations = q
+        return f
+
+    async def test_cancellation_files_no_escalation(self, tmp_path: Path):
+        f = await self._cancel(tmp_path)
+
+        assert f.escalations.submitted == [], (
+            'a cancelled (abandoned/superseded) merge paged a human'
+        )
+
+    async def test_cancellation_does_not_mark_done(self, tmp_path: Path):
+        """Never a silent success either — the merge did not land."""
+        f = await self._cancel(tmp_path)
+
+        f.scheduler.mark_done.assert_not_awaited()
+
+    async def test_cancellation_is_recorded_structurally(self, tmp_path: Path):
+        """Not silent: the abandonment lands on the event as its own decision,
+        distinct from 'merge_failed' (INV-2 structured-facts-at-failure)."""
+        f = await self._cancel(tmp_path)
+
+        rows = f.event_store.fetch_events_by_type_all_runs(
+            EventType.architect_desync_merge, task_id=_TASK_ID,
+        )
+        decisions = [(r.get('data') or {}).get('decision') for r in rows]
+        assert 'merge_abandoned' in decisions
+        assert 'merge_failed' not in decisions
+        abandoned = next(
+            (r.get('data') or {}) for r in rows
+            if (r.get('data') or {}).get('decision') == 'merge_abandoned'
+        )
+        assert abandoned['tip'] == _TIP
+
+    async def test_raising_future_is_still_a_durable_failure(
+        self, tmp_path: Path,
+    ):
+        """Only CANCELLATION is reclassified — an exception still pages."""
+        q = _FakeEscalationQueue()
+        f = _make(tmp_path=tmp_path)
+        f.wf.escalation_queue = q  # type: ignore[assignment]
+        f.artifacts.write_ready_to_merge(commit=_TIP, evidence='ev')
+        await f.wf._handle_ready_to_merge_report()
+        req = f.merge_queue.get_nowait()
+
+        req.result.set_exception(RuntimeError('merge worker died'))
+        await asyncio.sleep(0)
+        await asyncio.gather(*list(f.wf._background_tasks))
+
+        assert len(q.submitted) == 1
+        assert q.submitted[0].category == 'stranded_merge_failed'
+        assert q.submitted[0].level == 2
 
 
 @pytest.mark.asyncio
