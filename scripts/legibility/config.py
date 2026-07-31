@@ -16,10 +16,16 @@ Task β of the confusion-reduction PRD (plans/confusion-reduction-prd.md
 """
 from __future__ import annotations
 
+import logging
+import os
+import sys
 from pathlib import Path
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
+
+LOG_LEVEL_ENV_VAR = 'LEGIBILITY_LOG_LEVEL'
+LOG_FORMAT = '%(asctime)s %(levelname)s %(name)s: %(message)s'
 
 
 class Budgets(BaseModel):
@@ -147,3 +153,60 @@ def load_config(path: Path | str) -> LegibilityConfig:
     with open(path, encoding='utf-8') as f:
         raw = yaml.safe_load(f) or {}
     return LegibilityConfig(**raw)
+
+
+def configure_logging(default_level: str = 'INFO') -> None:
+    """Point the legibility CLIs' log output at stderr, at a visible level.
+
+    Shared by ``nightly.main()`` and ``census.main()`` so the env-var name,
+    the default level and the log format are single-sourced across both
+    entrypoints (INV-5 no-lockstep-duplication) rather than drifting in two
+    inline copies — which is the drift class that produced this fix's
+    occasion in the first place.
+
+    WHY THIS EXISTS: nothing under ``scripts/legibility/`` used to call
+    ``logging.basicConfig`` at all, so under the systemd ``ExecStart`` root
+    stayed at its WARNING default and every INFO line both CLIs emit — the
+    nightly sampler summary, the no-change-night line, the empty-codebook
+    line — was discarded before it ever reached the journal. That is half of
+    why the 14 budget-suppressed nights of 2026-07-16..29 were indis-
+    tinguishable from genuine no-change nights.
+
+    ``LEGIBILITY_LOG_LEVEL`` overrides *default_level* (matching the
+    ``LEGIBILITY_SEARCH_ROOTS`` / ``LEGIBILITY_CLAUDE_BIN`` env convention
+    already used across these modules). An unparseable value degrades to
+    *default_level* and logs one warning — it must never raise, because a
+    typo in a unit file's ``Environment=`` must not take the nightly timer
+    down.
+
+    Call from ``main()``, NEVER at import: ``basicConfig`` is a documented
+    no-op when root already has handlers, so an import-time call would be a
+    silent no-op under pytest (whose logging plugin owns root) while an
+    import-time call from a library context would hijack the importer's
+    logging setup.
+    """
+    raw = os.environ.get(LOG_LEVEL_ENV_VAR)
+    level = logging.getLevelName(default_level)
+    unparseable = None
+    if raw is not None and raw.strip():
+        candidate = logging.getLevelName(raw.strip().upper())
+        # getLevelName returns the int for a known name, else the string
+        # 'Level <name>' — an int is the only success signal.
+        if isinstance(candidate, int):
+            level = candidate
+        else:
+            unparseable = raw
+
+    logging.basicConfig(level=level, format=LOG_FORMAT, stream=sys.stderr)
+
+    # Emitted AFTER basicConfig, deliberately. Module-level logging.warning()
+    # calls basicConfig() ITSELF (with no level and the default format) when
+    # root has no handlers, which would leave root at WARNING and turn the
+    # explicit call above into a no-op — silently defeating the whole point of
+    # this helper on precisely the runs that already have a misconfiguration.
+    if unparseable is not None:
+        logging.getLogger('legibility.config').warning(
+            '%s=%r is not a valid log level; falling back to %s. '
+            'Valid values: CRITICAL, ERROR, WARNING, INFO, DEBUG.',
+            LOG_LEVEL_ENV_VAR, unparseable, default_level,
+        )

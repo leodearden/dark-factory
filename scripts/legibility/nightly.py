@@ -38,7 +38,7 @@ if __name__ == '__main__':
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from legibility import census_trigger, codebook, coder, digest, inventory, sampling  # noqa: E402
-from legibility.config import LegibilityConfig, load_config  # noqa: E402
+from legibility.config import LegibilityConfig, configure_logging, load_config  # noqa: E402
 
 logger = logging.getLogger('legibility.nightly')
 
@@ -911,7 +911,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     ``legibility.yaml`` path (via :func:`resolve_config_path`) and return
     0, or print an error to stderr and return 1 if no project matches --
     this is what ``install-trickle-timer.sh`` shells out to.
+
+    Configures logging FIRST, before arg parsing, so the summary line and
+    every other INFO line this module emits is actually visible in the
+    journal (see :func:`legibility.config.configure_logging` — without it
+    root sits at WARNING under the systemd ExecStart and they are all
+    dropped). Doing it here rather than at import keeps pytest/caplog and
+    any library importer untouched.
     """
+    configure_logging()
+
     parser = argparse.ArgumentParser(
         prog='nightly.py', description='Legibility nightly trickle pipeline (PRD task ε).',
     )
