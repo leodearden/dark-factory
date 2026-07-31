@@ -677,6 +677,46 @@ def create_mcp_server(
             return verdict.to_error_dict()
         return None
 
+    def _halt_payload(project_id: str | None = None) -> dict[str, Any] | None:
+        """The single ``reconciliation_halt`` shape shared by every tool that
+        reports halt state (task 3050).
+
+        Returns None when no harness/judge is wired — callers then omit the
+        field entirely, which keeps the legacy payloads byte-identical (the
+        same gate task 2920 used for ``reconciliation_backlog``) and means an
+        unwired deployment never has a trigger blocked by missing
+        observability.
+
+        Always carries ``halted_projects`` (the fleet view — a halt nobody
+        knew to look for). When ``project_id`` is supplied, the per-project
+        snapshot is merged in: halted / halt_reason / halted_at /
+        cooldown_until / cooldown_expired / unhalt_grace_remaining, keyed by
+        the CANONICAL project_id (see below). One builder, so the same fact
+        never grows two shapes across three tools — that divergence is what
+        made the durable-write-queue counts and the reconciliation backlog
+        confusable in the first place.
+        """
+        if reconciliation_harness is None or reconciliation_harness.judge is None:
+            return None
+        judge = reconciliation_harness.judge
+        payload: dict[str, Any] = {'halted_projects': judge.halted_projects()}
+        if project_id is not None:
+            # Canonicalize HERE rather than trusting each caller: get_queue_stats
+            # canonicalizes its argument but get_status and trigger_reconciliation
+            # do not, so a hyphen-spelled id ('know-live' — a live spelling, see
+            # dashboard/tests/test_redux_api.py) would look up a key the judge
+            # never records under and answer `halted: False, halt_reason: None`
+            # right beside `halted_projects: ['know_live']` in the SAME payload.
+            # A self-contradicting false negative is worse than the silence this
+            # feature replaced, so all three consumers get one canonical lookup.
+            # canonicalize_project_id is idempotent, so an already-canonical id
+            # is unchanged; a path-shaped id keeps its raw spelling (the adapter
+            # refuses to normalize a mangled path into a new, wrong key) and
+            # simply matches nothing — halt_snapshot never raises.
+            canonical_id, _ = _canonicalize_project_id_arg(project_id)
+            payload.update(judge.halt_snapshot(canonical_id))
+        return payload
+
     # WP-E (task 1549): reject write-tool calls whose project_id is absent from
     # the known_projects registry.  Mirrors _backlog_gate but is synchronous and
     # fires BEFORE _backlog_gate so an unknown id never touches downstream state.
@@ -2821,6 +2861,24 @@ def create_mcp_server(
     ) -> dict[str, Any]:
         """Health check and statistics for both backends.
 
+        Emits a top-level ``reconciliation_halt`` field when a reconciliation
+        harness is wired (task 3050). It always carries ``halted_projects``
+        (every currently-halted project id), plus — when ``project_id`` is
+        supplied — ``halted``, ``halt_reason``, ``halted_at``,
+        ``cooldown_until``, ``cooldown_expired`` and
+        ``unhalt_grace_remaining``.
+
+        Read it whenever ``get_queue_stats``' ``reconciliation_backlog`` looks
+        large: that one number has two causes with OPPOSITE remedies — the
+        project is HALTED (remedy: ``unhalt_reconciliation``) or the pipeline
+        cannot keep up (remedy: capacity, task 3049). Before this field
+        existed a halt was observable only in harness logs, and one ran
+        unnoticed for 48h.
+
+        The field is deliberately top-level rather than inside ``queue``:
+        ``queue`` is the durable-write-queue subsystem, and conflating it with
+        reconciliation state is the exact mis-triage task 2920 fixed.
+
         Args:
             project_id: Get stats for a specific project (optional)
         """
@@ -2865,6 +2923,20 @@ def create_mcp_server(
                 'event_queue': event_dead,
                 'total': durable_dead + event_dead,
             }
+
+        # task 3050 (A): surface reconciliation halt state so an operator can
+        # tell a HALTED project from one that merely cannot keep up. Top-level,
+        # not under `queue` — see the docstring.
+        #
+        # `'error' not in result` matches the two enrichment sites above and in
+        # get_queue_stats: grafting stats onto an error-shaped payload produces
+        # a mixed error/stats result whose consumers must then handle both.
+        if (
+            isinstance(result, dict)
+            and 'error' not in result
+            and (halt := _halt_payload(project_id)) is not None
+        ):
+            result['reconciliation_halt'] = halt
 
         return result
 
@@ -2918,6 +2990,16 @@ def create_mcp_server(
           This is the metric that governs backlog escalations and the one a
           watcher MUST probe to confirm a drain. It is per-project, so the
           global (``project_id``-less) call omits it — probe per-project.
+        * ``reconciliation_halt`` (per-project, and gated on a wired
+          reconciliation harness — INDEPENDENT of ``backlog_policy``, so this
+          field can appear without ``reconciliation_backlog`` — task 3050)
+          tells you WHICH of that backlog's two
+          opposite-remedy causes you are looking at: the project is HALTED
+          (``halted: True`` — remedy ``unhalt_reconciliation``, and
+          ``halt_reason``/``halted_at`` say why and since when) or it simply
+          cannot keep up (``halted: False`` — remedy capacity, task 3049).
+          2920's number alone could not separate them, and the ambiguity cost
+          two days of mis-triage.
 
         Args:
             project_id: Scope counts to a specific project (optional). When
@@ -2959,6 +3041,16 @@ def create_mcp_server(
             stats['reconciliation_backlog'] = await backlog_policy.current_backlog(
                 project_id,
             )
+        # task 3050 (A): say WHICH cause that backlog has. Per-project only,
+        # mirroring reconciliation_backlog's gating so the global call's shape
+        # is unchanged.
+        if (
+            project_id is not None
+            and isinstance(stats, dict)
+            and 'error' not in stats
+            and (halt := _halt_payload(project_id)) is not None
+        ):
+            stats['reconciliation_halt'] = halt
         return stats
 
     @mcp.tool()
@@ -3265,6 +3357,29 @@ def create_mcp_server(
         Bypasses normal threshold/staleness logic. The reconciliation harness
         will pick this up on its next loop iteration (~5 seconds).
 
+        HALTED PROJECTS (task 3050): when the judge has halted the project the
+        harness skips every cycle, so this tool answers ``status='halted'``
+        rather than ``'requested'`` — it previously reported success while
+        nothing ran, which is how an operator who had finally spotted the
+        2026-07-20 backlog was told reconciliation would run and then waited.
+        The halted payload carries ``halted``, ``halt_reason``, ``halted_at``,
+        ``cooldown_until``, ``cooldown_expired``, ``trigger_requested`` and a
+        ``remedy`` naming ``unhalt_reconciliation``.
+
+        This is a truthful OUTCOME, not a tool failure, so it is a normal
+        result payload — ``error``/``error_type`` here stay reserved for
+        configuration/validation failures.
+
+        One nuance, kept honest in both directions: when the halt's cooldown
+        has expired AND ``auto_unhalt_after_cooldown`` is enabled, the next
+        loop tick auto-unhalts and then RUNS the cycle, so a manual trigger
+        genuinely is consumed. That case still forwards the request and
+        reports ``trigger_requested: True`` — refusing it would replace "lies
+        about success" with the mirror-image lie "claims nothing will run when
+        something will". That call is delegated to
+        ``ReconciliationHarness.auto_resume_pending`` — the very predicate the
+        loop uses — so the two can never drift apart.
+
         Args:
             project_id: Project to trigger reconciliation for
         """
@@ -3274,6 +3389,51 @@ def create_mcp_server(
             return {
                 'error': 'Taskmaster is not configured. Cannot trigger reconciliation.',
                 'error_type': 'ConfigurationError',
+            }
+        halt = _halt_payload(project_id)
+        if halt is not None and halt['halted']:
+            # The halt was looked up under the CANONICAL project_id, so use
+            # that same spelling for the predicate and for the remedy we name —
+            # `unhalt_reconciliation` does not canonicalize, so handing back the
+            # caller's hyphen spelling would name a remedy that no-ops.
+            canonical_id = halt['project_id']
+            # ONE predicate, owned by the harness that enacts it
+            # (ReconciliationHarness.auto_resume_pending, also called by
+            # _project_loop). Re-deriving `cooldown_expired and
+            # auto_unhalt_after_cooldown` here would let this tool keep
+            # promising trigger_requested: True after the loop's rule gained a
+            # condition — the same false-success this tool was fixed to stop.
+            auto_resume_pending = reconciliation_harness.auto_resume_pending(  # type: ignore[union-attr]
+                canonical_id,
+            )
+            if auto_resume_pending:
+                # The next tick unhalts and falls through to run the cycle, so
+                # this request will actually be consumed.
+                await task_interceptor.buffer.request_trigger(project_id)  # type: ignore[union-attr]
+                tail = (
+                    'Its cooldown has expired and auto_unhalt_after_cooldown is '
+                    'enabled, so the halt auto-clears on the next ~5s tick and '
+                    'this trigger will be consumed by that cycle.'
+                )
+            else:
+                tail = (
+                    'Nothing was triggered, and nothing will run until the halt '
+                    'is cleared.'
+                )
+            return {
+                'status': 'halted',
+                'project_id': project_id,
+                **halt,
+                'trigger_requested': auto_resume_pending,
+                'remedy': (
+                    f'unhalt_reconciliation(project_id={canonical_id!r}) — clears the '
+                    'halt and resumes cycles.'
+                ),
+                'message': (
+                    f'Reconciliation is HALTED for {canonical_id} '
+                    f'(reason: {halt["halt_reason"] or "unknown"}; '
+                    f'since: {halt["halted_at"] or "unknown"}). {tail}'
+                ),
             }
         await task_interceptor.buffer.request_trigger(project_id)  # type: ignore[union-attr]
         return {
