@@ -14,6 +14,10 @@ summarise and for the named predicate they pin.
 
 from __future__ import annotations
 
+from pathlib import Path
+
+import pytest
+
 import startup_completion_fixtures as scf
 
 # The closed sets the schema validates against, restated here so a silent
@@ -108,3 +112,75 @@ class TestCorpusLoads:
     def test_row_ids_are_unique_across_both_files(self):
         ids = [row['id'] for row in scf.load_startup_completion_corpus()]
         assert len(ids) == len(set(ids)), f'duplicate row ids: {sorted(ids)}'
+
+
+class TestCorpusSecretHygiene:
+    """The committed artifacts must not carry credential material.
+
+    Load-bearing, not theatre: the healthy observation is captured from a real
+    ``CLAUDE_CONFIG_DIR`` whose ``.credentials.json`` holds a live OAuth access
+    token (``TaskConfigDir.write_credentials``).  The probe redacts at capture
+    time; this asserts over what is actually committed, so a later hand-edit
+    cannot reintroduce a token.
+    """
+
+    # Synthetic, obviously-fake stand-ins for each real credential shape.
+    _CREDENTIAL_SHAPED = (
+        ('anthropic-key', 'sk-ant-oat01-FAKEFAKEFAKE'),
+        (
+            'oauth-blob',
+            '{"claudeAiOauth": {"accessToken": "FAKE-not-a-real-token"}}',
+        ),
+        ('bearer-jwt', 'Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.FAKE'),
+        ('refresh-token', '{"refreshToken": "FAKE-refresh"}'),
+    )
+
+    @pytest.mark.parametrize(
+        ('label', 'payload'),
+        _CREDENTIAL_SHAPED,
+        ids=[label for label, _ in _CREDENTIAL_SHAPED],
+    )
+    def test_guard_raises_on_credential_shaped_input(self, label, payload):
+        with pytest.raises(AssertionError) as excinfo:
+            scf.assert_no_credential_material(payload, source=f'synthetic:{label}')
+        # The failure must be legible — naming the source and where it matched,
+        # not just "assertion failed".
+        assert f'synthetic:{label}' in str(excinfo.value)
+
+    def test_guard_passes_on_clean_text(self):
+        scf.assert_no_credential_material(
+            'projects/-home-leo-src-dark-factory/<uuid>.jsonl', source='synthetic:clean'
+        )
+
+    @pytest.mark.parametrize(
+        'path_attr',
+        ['HEALTHY_CORPUS_PATH', 'WEDGE_CORPUS_PATH', 'RAW_CAPTURE_PATH'],
+    )
+    def test_committed_artifacts_are_clean(self, path_attr):
+        path: Path = getattr(scf, path_attr)
+        scf.assert_no_credential_material(
+            path.read_text(encoding='utf-8'), source=str(path)
+        )
+
+    def test_credential_files_are_recorded_by_metadata_only(self):
+        for row in scf.load_startup_completion_corpus():
+            for entry in row['config_dir_tree']:
+                if Path(entry['relpath']).name in scf.CREDENTIAL_FILENAMES:
+                    assert 'content' not in entry, (
+                        f'{row["id"]}: {entry["relpath"]} must be recorded by '
+                        f'presence/size only, never inlined content'
+                    )
+                    # Presence/size metadata is exactly what the matrix needs.
+                    assert entry['kind'] == 'file'
+                    assert isinstance(entry['size'], int)
+
+    def test_at_least_one_row_actually_observed_a_credentials_file(self):
+        # Guards the guard: if no committed row carried .credentials.json at all,
+        # the metadata-only assertion above would pass vacuously.
+        observed = [
+            row['id']
+            for row in scf.load_startup_completion_corpus()
+            for entry in row['config_dir_tree']
+            if Path(entry['relpath']).name in scf.CREDENTIAL_FILENAMES
+        ]
+        assert observed, 'no committed row observed a .credentials.json entry'
