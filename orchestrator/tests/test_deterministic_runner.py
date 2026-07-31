@@ -1005,6 +1005,87 @@ class TestHumanCuratorGateAdjudicationGuard:
 
         scheduler.set_task_status.assert_any_await('3181', 'blocked')
 
+    async def test_curator_gate_with_zero_records_still_refiles_milestone_gate(
+        self, tmp_path: Path,
+    ):
+        """ORDERING PIN: the task-2954 strand check must run BEFORE the curator guard.
+
+        A curator gate with a TOTALLY EMPTY queue (no pending, no archived) has
+        no established gate at all — nobody has ever been asked. Re-establishing
+        the ORIGINAL ``milestone_gate`` is the correct recovery; demanding an
+        adjudication stamp for a gate nobody has yet seen would be incoherent
+        (and would present the human with a remediation for a review they were
+        never asked to perform).
+
+        This pins the ordering against a future refactor innocently swapping the
+        two branches, which a comment alone cannot prevent.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _curator_gate_task(
+            task_id='3181',
+            gate_escalated_at='2026-07-30T16:30:28.993178+00:00',
+        )
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)  # ZERO records anywhere
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        done_calls = [
+            c for c in scheduler.set_task_status.await_args_list
+            if len(c.args) >= 2 and c.args[1] == 'done'
+        ]
+        assert not done_calls
+
+        pending = queue.get_by_task(
+            '3181', status='pending', agent_role='orchestrator-deterministic',
+        )
+        assert len(pending) == 1
+        assert pending[0].category == 'milestone_gate', (
+            'zero records ⇒ the gate was never established ⇒ re-file the ORIGINAL '
+            'milestone_gate; the curator-adjudication guard must not pre-empt it'
+        )
+        assert pending[0].level == 2
+
+    async def test_plain_pure_gate_resume_provenance_is_byte_unchanged(
+        self, tmp_path: Path,
+    ):
+        """REGRESSION PIN: a pure gate WITHOUT the curator marker is untouched.
+
+        Deliberately redundant with
+        ``TestPureGateResumeHardening.test_pure_gate_resume_with_resolved_record_drives_to_done``.
+        It lives HERE, in the curator-guard class, so that a future edit widening
+        the curator provenance branch cannot silently leak new keys or a changed
+        note onto every plain deterministic gate in the fleet — the reviewer of
+        such an edit sees this fence in the same file region they are editing.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _gate_task(task_id='99', gate_escalated_at='2026-06-23T12:00:00+00:00')
+        assert 'human_curator_gate' not in task['metadata']
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        _seed_resolved_gate(queue, '99')
+        scheduler = _mock_scheduler(task)
+
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.DONE
+        scheduler.set_task_status.assert_awaited_once_with(
+            '99',
+            'done',
+            done_provenance={
+                'kind': 'deterministic-gate',
+                'note': 'pure gate resolved',
+            },
+        )
+
 
 # ---------------------------------------------------------------------------
 # Step-1: cross-unit deploy success (B6)
