@@ -550,7 +550,32 @@ def test_compute_tasks_landed_empty_project_computes_a_real_zero_delta(caplog):
     assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
 
 
-def test_default_status_fetcher_raises_status_fetch_unavailable_when_unreachable(tmp_path):
+def test_default_status_fetcher_raises_status_fetch_unavailable_when_unreachable(
+    tmp_path, monkeypatch
+):
+    """An unreachable endpoint must surface as StatusFetchUnavailable, never
+    as a raw transport exception.
+
+    The transport failure is INJECTED rather than relied upon. This test
+    originally passed on two ambient premises, both of which are now false:
+    that httpx was not importable here (so the lazy-import ImportError branch
+    fired), and that nothing listened on the default FUSED_MEMORY_MCP_URL
+    (http://localhost:8002). httpx is installed today, and a real fused-memory
+    MCP server listens on :8002 on any machine running the stack -- so the
+    test flapped pass/fail with that live server's connection state instead of
+    testing this module. Injecting a failing `httpx` module (the same
+    sys.modules convention used by
+    test_default_status_fetcher_sends_streamable_http_accept_headers below)
+    makes the "unreachable" premise true by construction.
+    """
+    fake_httpx = type(sys)("httpx")
+
+    def _fake_post(url, **kwargs):
+        raise OSError("[Errno 111] Connection refused")
+
+    fake_httpx.post = _fake_post
+    monkeypatch.setitem(sys.modules, "httpx", fake_httpx)
+
     fetcher = ct.default_status_fetcher(tmp_path)
 
     with pytest.raises(ct.StatusFetchUnavailable):
@@ -574,8 +599,9 @@ def test_default_status_fetcher_sends_streamable_http_accept_headers(tmp_path, m
     POST whose Accept header doesn't include both application/json and
     text/event-stream -- verified live against a local MCP /mcp endpoint.
     default_status_fetcher's httpx import is lazy (httpx is not a scripts/
-    dependency and is not importable in this test env), so a fake `httpx`
-    module is injected into sys.modules for the duration of this test."""
+    dependency, though it is importable in this test env as a transitive
+    one), so a fake `httpx` module is injected into sys.modules for the
+    duration of this test to capture the outbound call without a network."""
     captured_kwargs = {}
     rpc_response = {
         "jsonrpc": "2.0",
@@ -664,11 +690,11 @@ def test_default_status_fetcher_sends_absolute_project_root_for_relative_subdir(
 
 # ---------------------------------------------------------------------------
 # amendment pass (review findings #1/#2): _extract_tool_result() unwraps the
-# real MCP tools/call JSON-RPC envelope. httpx is not installed in this test
-# env (see test_default_status_fetcher_raises_status_fetch_unavailable_when_unreachable
-# above -- default_status_fetcher's ImportError branch is the only reachable
-# path here), so default_status_fetcher's HTTP round-trip itself cannot be
-# driven end-to-end; these tests instead exercise the envelope parser
+# real MCP tools/call JSON-RPC envelope. default_status_fetcher's HTTP
+# round-trip is never driven against a real endpoint here -- the tests above
+# inject a fake `httpx` module instead, since anything else makes them depend
+# on whether a live fused-memory MCP server happens to be listening on the
+# default URL; these tests instead exercise the envelope parser
 # directly against realistic tools/call response shapes, and then bridge its
 # output into compute_tasks_landed to pin the exact contract between them.
 # ---------------------------------------------------------------------------
