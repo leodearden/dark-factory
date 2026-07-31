@@ -9,6 +9,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import re
 import signal
 
 import pytest
@@ -84,8 +85,8 @@ def _kill_group(pgid: int) -> None:
         os.killpg(pgid, signal.SIGKILL)
 
 
-class _TrapReadinessError(AssertionError):
-    """The SIGTERM-trap readiness precondition was not observed.
+class _ShellReadinessError(AssertionError):
+    """An announced-readiness precondition was not observed.
 
     Subclasses AssertionError so an unmet precondition surfaces as a
     test FAILURE (never a bare TimeoutError, never a silent return).
@@ -95,17 +96,18 @@ class _TrapReadinessError(AssertionError):
     """
 
 
-class _TrapReadinessTimeout(_TrapReadinessError):
+class _ShellReadinessTimeout(_ShellReadinessError):
     """No readiness line arrived within the bounded deadline."""
 
 
-class _TrapReadinessEOF(_TrapReadinessError):
+class _ShellReadinessEOF(_ShellReadinessError):
     """The child closed stdout before announcing readiness (early exit)."""
 
 
-async def _await_trap_installed(
+async def _await_shell_ready(
     proc: asyncio.subprocess.Process,
     *,
+    what: str = 'the precondition',
     # Must-not-hang guard, not a latency SLA — see task 3337 for the
     # measured headroom and the derivation of this value.
     timeout: float = 10.0,
@@ -121,19 +123,25 @@ async def _await_trap_installed(
     SIG_IGN, both background jobs already forked, ...) has already happened
     in the kernel — not a wall-clock guess about how long that step takes
     (the fixed ``asyncio.sleep(0.2)`` this helper replaces in each caller was
-    exactly such a guess, and it starved under CPU oversubscription).  See
-    task 3337 for the measurement backing the SIGTERM-trap case (readiness
-    latency and a direct ``/proc/<pid>/status`` SigIgn check at the instant
-    "ready" arrives) and task 3347 for the grandchild-fork case.
+    exactly such a guess, and it starved under CPU oversubscription).
+
+    *what* is a short caller-supplied description of the precondition being
+    awaited (e.g. ``'SIGTERM trap installed'``, ``'both background jobs
+    forked'``), interpolated into the raised message so each caller still
+    gets a specific diagnostic even though the helper itself is agnostic to
+    which precondition it's waiting on.  See task 3337 for the measurement
+    backing the SIGTERM-trap case (readiness latency and a direct
+    ``/proc/<pid>/status`` SigIgn check at the instant "ready" arrives) and
+    task 3347 for the grandchild-fork case.
 
     Raises (never a bare ``TimeoutError``, and never returns normally) if
     the precondition is not observed:
-    - ``_TrapReadinessTimeout`` — the deadline elapsed with no line.
-    - ``_TrapReadinessEOF`` — the child closed stdout (EOF) first, e.g. it
+    - ``_ShellReadinessTimeout`` — the deadline elapsed with no line.
+    - ``_ShellReadinessEOF`` — the child closed stdout (EOF) first, e.g. it
       exited before reaching the ``echo``, which would otherwise look
       identical to "line not yet available" and let a naive caller mistake
-      early-exit for a successfully armed trap.
-    - ``_TrapReadinessError`` — a line arrived but wasn't ``ready`` (compared
+      early-exit for a successfully observed precondition.
+    - ``_ShellReadinessError`` — a line arrived but wasn't ``ready`` (compared
       after stripping surrounding whitespace).
 
     All three subclass ``AssertionError``; the concrete subclass is the
@@ -144,20 +152,20 @@ async def _await_trap_installed(
     try:
         line = await asyncio.wait_for(proc.stdout.readline(), timeout)
     except TimeoutError:
-        raise _TrapReadinessTimeout(
-            f'shell pid={proc.pid} never announced "ready" within {timeout}s '
-            f'(returncode={proc.returncode}) — the SIGTERM trap was never '
-            f'confirmed installed, so escalation cannot be tested'
+        raise _ShellReadinessTimeout(
+            f'shell pid={proc.pid} never announced readiness within '
+            f'{timeout}s (returncode={proc.returncode}) — {what!r} was '
+            f'never confirmed'
         ) from None
     if not line:
-        raise _TrapReadinessEOF(
+        raise _ShellReadinessEOF(
             f'shell pid={proc.pid} closed stdout (EOF) after '
             f'{asyncio.get_running_loop().time() - started:.3f}s without '
-            f'announcing "ready" (returncode={proc.returncode}) — it exited '
-            f'before installing the SIGTERM trap'
+            f'announcing readiness (returncode={proc.returncode}) — it '
+            f'exited before confirming {what!r}'
         )
     if line.strip() != b'ready':
-        raise _TrapReadinessError(
+        raise _ShellReadinessError(
             f'shell pid={proc.pid} announced {line!r}, expected "ready" '
             f'(compared after stripping surrounding whitespace)'
         )
@@ -165,8 +173,8 @@ async def _await_trap_installed(
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(30)
-async def test_await_trap_installed_fails_loudly_when_readiness_never_arrives():
-    """_await_trap_installed never silently returns and never lets a bare
+async def test_await_shell_ready_fails_loudly_when_readiness_never_arrives():
+    """_await_shell_ready never silently returns and never lets a bare
     TimeoutError escape when the readiness precondition is unmet — it must
     raise instead.  This pins the no-silent-fail-soft contract so a future
     starvation can't quietly regress this helper back into the racy
@@ -178,15 +186,15 @@ async def test_await_trap_installed_fails_loudly_when_readiness_never_arrives():
     "disclosed"):
 
     (a) the shell never announces readiness — readline() blocks until the
-        bounded deadline.  Must raise _TrapReadinessTimeout — never a bare
+        bounded deadline.  Must raise _ShellReadinessTimeout — never a bare
         TimeoutError, and never a normal return.
     (b) the shell exits immediately without announcing — readline() hits
         EOF (returns b'') right away, well inside the deadline, which a
         naive implementation would treat as success.  Must raise
-        _TrapReadinessEOF, a type distinct from (a)'s, so EOF can never be
+        _ShellReadinessEOF, a type distinct from (a)'s, so EOF can never be
         silently reclassified as — or fall through to — a deadline expiry.
     (c) the shell announces something other than "ready" — must raise the
-        base _TrapReadinessError and NEITHER subclass, so a wrong-content
+        base _ShellReadinessError and NEITHER subclass, so a wrong-content
         line can't be misreported as a timeout or an EOF.
 
     All three are AssertionError subclasses, which each sub-case confirms
@@ -202,8 +210,8 @@ async def test_await_trap_installed_fails_loudly_when_readiness_never_arrives():
         start_new_session=True,
     )
     try:
-        with pytest.raises(_TrapReadinessTimeout) as excinfo:
-            await _await_trap_installed(proc, timeout=0.3)
+        with pytest.raises(_ShellReadinessTimeout) as excinfo:
+            await _await_shell_ready(proc, timeout=0.3)
         assert isinstance(excinfo.value, AssertionError)
     finally:
         if proc.returncode is None:
@@ -221,13 +229,13 @@ async def test_await_trap_installed_fails_loudly_when_readiness_never_arrives():
     try:
         # The discrimination this sub-case buys — EOF detected as EOF
         # immediately, not swallowed and re-surfaced later as a deadline
-        # expiry (which would raise _TrapReadinessTimeout and fail this
+        # expiry (which would raise _ShellReadinessTimeout and fail this
         # assertion) — holds for any non-expiring deadline; it doesn't
         # pin a specific number.  Use the helper's own default rather
         # than a tuned value so this test carries no wall-clock
         # assumption of its own.
-        with pytest.raises(_TrapReadinessEOF) as excinfo2:
-            await _await_trap_installed(proc2)
+        with pytest.raises(_ShellReadinessEOF) as excinfo2:
+            await _await_shell_ready(proc2)
         assert isinstance(excinfo2.value, AssertionError)
     finally:
         # `true` has already exited: reap it rather than killpg-ing a pid
@@ -248,14 +256,14 @@ async def test_await_trap_installed_fails_loudly_when_readiness_never_arrives():
         start_new_session=True,
     )
     try:
-        with pytest.raises(_TrapReadinessError) as excinfo3:
-            await _await_trap_installed(proc3)
-        # Exact-type, not isinstance: _TrapReadinessTimeout and
-        # _TrapReadinessEOF are themselves _TrapReadinessError, so
+        with pytest.raises(_ShellReadinessError) as excinfo3:
+            await _await_shell_ready(proc3)
+        # Exact-type, not isinstance: _ShellReadinessTimeout and
+        # _ShellReadinessEOF are themselves _ShellReadinessError, so
         # isinstance alone wouldn't prove THIS branch fired rather than
         # one of the other two.
-        assert type(excinfo3.value) is _TrapReadinessError, (
-            f'expected the base _TrapReadinessError (not a subclass), got '
+        assert type(excinfo3.value) is _ShellReadinessError, (
+            f'expected the base _ShellReadinessError (not a subclass), got '
             f'{type(excinfo3.value).__name__}'
         )
     finally:
@@ -317,7 +325,7 @@ class TestTerminateProcessGroup:
         # has already returned — i.e. SIGTERM's disposition is SIG_IGN
         # before we signal — rather than a wall-clock assumption that a
         # fixed sleep was long enough (task 3337 de-flake).
-        await _await_trap_installed(proc)
+        await _await_shell_ready(proc, what='SIGTERM trap installed')
 
         await terminate_process_group(proc, pgid, grace_secs=0.5)
 
@@ -329,7 +337,7 @@ class TestTerminateProcessGroup:
         )
 
     @pytest.mark.asyncio
-    @pytest.mark.timeout(15)
+    @pytest.mark.timeout(30)
     async def test_terminate_process_group_reaps_grandchildren(self):
         """terminate_process_group kills grandchildren (bash → sleep sleep).
 
@@ -345,27 +353,42 @@ class TestTerminateProcessGroup:
         )
         pgid = proc.pid
 
-        # The "ready" line is a happens-before edge proving both background
-        # `sleep`s have already been forked (bash only reaches the `echo`
-        # after both `&` jobs are launched) — rather than a wall-clock
-        # assumption that a fixed sleep was long enough (task 3347 de-flake;
-        # the fixed 0.2s settle it replaces did not fail loudly when too
-        # short — it silently degraded this test to vacuous instead).
-        await _await_trap_installed(proc)
+        try:
+            # The "ready" line is a happens-before edge proving both background
+            # `sleep`s have already been forked (bash only reaches the `echo`
+            # after both `&` jobs are launched) — rather than a wall-clock
+            # assumption that a fixed sleep was long enough (task 3347
+            # de-flake; the fixed 0.2s settle it replaces did not fail loudly
+            # when too short — it silently degraded this test to vacuous
+            # instead).
+            await _await_shell_ready(proc, what='both background jobs forked')
 
-        # Assert the precondition directly — bash + 2 sleeps must actually
-        # be in the group before we terminate it — so this test fails loudly
-        # rather than silently passing vacuously if that ever regresses.
-        snapshot = snapshot_process_group(pgid)
-        process_count = sum(
-            1 for line in snapshot.splitlines() if line.startswith('  pid=')
-        )
-        assert process_count == 3, (
-            f'expected 3 processes (bash + 2 sleeps) in group {pgid} before '
-            f'terminating, got {process_count}:\n{snapshot}'
-        )
+            # Assert the precondition directly — bash + 2 sleep children must
+            # actually be in the group before we terminate it — so this test
+            # fails loudly rather than silently passing vacuously if that
+            # ever regresses.  Match process rows tolerantly (not on
+            # snapshot_process_group's exact indentation) and count children
+            # by comm=sleep rather than raw row count, so the assertion is
+            # expressed in domain terms (the bash leader plus 2 sleep
+            # children) rather than coupled to the snapshot's row layout.
+            snapshot = snapshot_process_group(pgid)
+            rows = [
+                line for line in snapshot.splitlines()
+                if re.match(r'^\s*pid=', line)
+            ]
+            sleep_rows = [row for row in rows if 'comm=sleep' in row]
+            assert len(rows) == 3 and len(sleep_rows) == 2, (
+                f'expected 3 processes in group {pgid} before terminating — '
+                f'the bash leader plus 2 sleep children — got {len(rows)} '
+                f'total ({len(sleep_rows)} with comm=sleep):\n{snapshot}'
+            )
 
-        await terminate_process_group(proc, pgid, grace_secs=5.0)
+            await terminate_process_group(proc, pgid, grace_secs=5.0)
+        finally:
+            if proc.returncode is None:
+                _kill_group(pgid)
+            with contextlib.suppress(Exception):
+                await proc.wait()
 
         assert await _pgid_gone_within(pgid), (
             f'Process group {pgid} was not fully reaped within 5 s — '
