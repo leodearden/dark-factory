@@ -884,6 +884,129 @@ class TestPureGateResumeHardening:
 
 
 # ---------------------------------------------------------------------------
+# task 3341: human-curator-gate content-adjudication guard.
+#
+# Task 2954's hardening (above) proves a gate RECORD exists and is no longer
+# pending.  For a `human_curator_gate` task that is NOT the same proposition as
+# "the human actually did the content review" — and task 3181 is the incident
+# where the two diverged.  See the class docstring below.
+# ---------------------------------------------------------------------------
+
+def _curator_gate_task(
+    task_id: str = '3181',
+    title: str = 'Adjudicate the Mem0 corpus entries',
+    description: str = 'Human curator must review each entry before this closes',
+    deps: list | None = None,
+    gate_options: list | None = None,
+    gate_escalated_at: str | None = None,
+    curator_adjudicated_at: object = None,
+    marker: object = True,
+) -> dict:
+    """Build a deterministic pure-gate task dict carrying the curator marker.
+
+    Composes ``_gate_task`` the way ``_llm_gate_task`` does (delegate, then
+    stamp the marker key) rather than duplicating the task-dict literal.
+    Byte-matches task 3181's real shape: ``before_done`` None,
+    ``always_escalates=True``, ``task_kind='deterministic'``, plus
+    ``metadata['human_curator_gate']``.
+
+    *marker* is deliberately parameterisable (and not typed ``bool``) so the
+    fail-closed tests can pass a truthy-but-not-``True`` value such as the
+    string ``'true'``.  *curator_adjudicated_at* is stamped only when not
+    ``None``, so the default task is an UNADJUDICATED curator gate.
+    """
+    task = _gate_task(
+        task_id=task_id,
+        title=title,
+        description=description,
+        deps=deps,
+        gate_options=gate_options,
+        gate_escalated_at=gate_escalated_at,
+    )
+    task['metadata']['human_curator_gate'] = marker
+    if curator_adjudicated_at is not None:
+        task['metadata']['curator_adjudicated_at'] = curator_adjudicated_at
+    return task
+
+
+@pytest.mark.asyncio
+class TestHumanCuratorGateAdjudicationGuard:
+    """DeterministicRunner — a curator gate needs CONTENT proof, not just a closed record.
+
+    Incident (task 3181): a ``human_curator_gate=true`` pure deterministic gate.
+    Its born-at-L2 gate escalation ``esc-3181-1`` was resolved by the automated
+    ``escalation-watcher`` with ``action='resume'`` on 2026-07-30T19:41Z — and
+    that resolution's OWN text says the curator content work was deliberately
+    skipped: *"RECOMMENDED REMEDIATION (curator action, deliberately NOT
+    executed here)"* and *"I did not touch the ~13 Mem0 entries: a 13-entry
+    corpus edit is curator disposition with irreversible flavour, and this gate
+    asked the FACT question."*
+
+    The harness then flipped 3181 blocked -> pending, the pure-gate resume's
+    archive-inclusive proof check (task 2954) passed on the archived record, and
+    the runner drove the task to ``done`` with the generic
+    ``note='pure gate resolved'`` — contradicting the task's own
+    ``consolidation_note``, which said the status must remain pending.
+
+    The gap: "a record of my own gate escalation exists and is no longer
+    pending" is being equated with "the human curator reviewed the content".
+    For a curator gate those are different propositions.
+    """
+
+    async def test_curator_gate_resume_without_adjudication_stamp_does_not_drive_to_done(
+        self, tmp_path: Path,
+    ):
+        """The task-3181 incident, reproduced: curator gate + resolved-and-archived
+        record + NO ``curator_adjudicated_at`` stamp must NOT drive to done.
+
+        It files a born-at-L2 ``curator_adjudication_missing`` escalation naming
+        the remediation and stays BLOCKED.
+        """
+        from orchestrator.deterministic_runner import DeterministicRunner
+        from orchestrator.workflow import WorkflowOutcome
+
+        task = _curator_gate_task(
+            task_id='3181',
+            gate_escalated_at='2026-07-30T16:30:28.993178+00:00',
+        )
+        assert 'curator_adjudicated_at' not in task['metadata']  # unadjudicated
+        assignment = _make_assignment(task)
+        queue = EscalationQueue(tmp_path)
+        _seed_resolved_gate(queue, '3181')  # the exact esc-3181-1 shape
+
+        # Sanity: the task-2954 archive-inclusive proof check DOES pass here —
+        # which is precisely WHY the bug fires.  The record is archived (not
+        # pending) but archive-visible, so record-closure alone looks like proof.
+        assert queue.get_by_task('3181', status='pending') == []
+        assert len(queue.get_by_task('3181', agent_role='orchestrator-deterministic')) == 1
+
+        scheduler = _mock_scheduler(task)
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
+        outcome = await runner.run(assignment)
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        done_calls = [
+            c for c in scheduler.set_task_status.await_args_list
+            if len(c.args) >= 2 and c.args[1] == 'done'
+        ]
+        assert not done_calls, (
+            'curator gate must not drive to done without a content-adjudication stamp'
+        )
+
+        pending = queue.get_by_task(
+            '3181', status='pending', agent_role='orchestrator-deterministic',
+        )
+        assert len(pending) == 1
+        assert pending[0].category == 'curator_adjudication_missing'
+        assert pending[0].level == 2
+        assert pending[0].agent_role == 'orchestrator-deterministic'
+        # The detail must name the remediation the human has to perform.
+        assert 'curator_adjudicated_at' in pending[0].detail
+
+        scheduler.set_task_status.assert_any_await('3181', 'blocked')
+
+
+# ---------------------------------------------------------------------------
 # Step-1: cross-unit deploy success (B6)
 # (RED until step-2 adds the before_done execution path)
 # ---------------------------------------------------------------------------
