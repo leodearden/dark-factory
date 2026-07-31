@@ -527,6 +527,17 @@ class TestReadyToMergeIdempotency:
 _LANDED = '1234abcd5678ef901234abcd5678ef901234abcd'
 
 
+async def _fire_merge_done(
+    tmp_path: Path, outcome: Any, *, escalation_queue: object = None,
+) -> _Fixture:
+    """Drive ``_on_architect_merge_done`` with a terminal *outcome*."""
+    f = _make(tmp_path=tmp_path)
+    if escalation_queue is not None:
+        f.wf.escalation_queue = escalation_queue  # type: ignore[assignment]
+    await f.wf._on_architect_merge_done(outcome, tip=_TIP, evidence='ev')
+    return f
+
+
 @pytest.mark.asyncio
 class TestOnArchitectMergeDone:
     """``_on_architect_merge_done`` — the FAST done flip.
@@ -537,12 +548,7 @@ class TestOnArchitectMergeDone:
     reconciler is the restart-safe DURABLE backstop for a lost callback.
     """
 
-    async def _fire(self, tmp_path: Path, outcome) -> _Fixture:
-        from orchestrator.merge_types import MergeOutcome  # noqa: F401
-
-        f = _make(tmp_path=tmp_path)
-        await f.wf._on_architect_merge_done(outcome, tip=_TIP, evidence='ev')
-        return f
+    _fire = staticmethod(_fire_merge_done)
 
     async def test_success_marks_done_via_found_on_main(self, tmp_path: Path):
         from orchestrator.merge_types import MergeOutcome
@@ -621,6 +627,135 @@ class TestOnArchitectMergeDone:
         f = await self._fire(tmp_path, MergeOutcome(status='done'))
 
         f.scheduler.mark_done.assert_not_awaited()
+
+
+class _FakeEscalationQueue:
+    """Minimal stand-in for ``EscalationQueue`` (submit / get_by_task / make_id)."""
+
+    def __init__(self) -> None:
+        self.submitted: list[Any] = []
+        self._n = 0
+
+    def make_id(self, task_id: str) -> str:
+        self._n += 1
+        return f'esc-{task_id}-{self._n}'
+
+    def submit(self, escalation: Any) -> str:
+        self.submitted.append(escalation)
+        return escalation.id
+
+    def get_by_task(
+        self, task_id: str, status: str | None = None,
+        level: int | None = None, agent_role: str | None = None,
+    ) -> list[Any]:
+        return [
+            e for e in self.submitted
+            if e.task_id == task_id
+            and (level is None or e.level == level)
+            and (agent_role is None or e.agent_role == agent_role)
+        ]
+
+
+@pytest.mark.asyncio
+class TestArchitectMergeDurableFailureEscalates:
+    """A durable merge failure must reach a HUMAN, not just a log line.
+
+    The enqueue exit deliberately leaves the task ``blocked`` with no open
+    escalation — LEAVE-shaped for the recovery sweep — and the verified-green
+    stranded reaper cannot re-drive it either (``detect_verified_green``
+    requires an assigned lane AND an all-steps-done plan.json; this exit fires
+    precisely when the architect wrote no plan).  So on a durable failure the
+    born-at-L2 is the ONLY operator signal; without it the exit that exists to
+    un-strand a branch would itself strand the task forever.
+    """
+
+    @pytest.mark.parametrize('status', ['conflict', 'error', 'unmerged_state'])
+    async def test_durable_failure_files_a_born_at_l2(
+        self, tmp_path: Path, status: str,
+    ):
+        from orchestrator.merge_types import MergeOutcome
+
+        q = _FakeEscalationQueue()
+        f = await self._fire(
+            tmp_path, MergeOutcome(status=cast(Any, status), reason='boom'),
+            escalation_queue=q,
+        )
+
+        assert len(q.submitted) == 1, 'durable failure filed no escalation'
+        esc = q.submitted[0]
+        assert esc.task_id == _TASK_ID
+        assert esc.category == 'stranded_merge_failed'
+        assert esc.severity == 'critical'
+        assert esc.level == 2  # born-at-L2: bypasses the auto-watcher
+        assert esc.agent_role.startswith('orchestrator-')
+        assert status in esc.summary
+        assert 'boom' in esc.detail and _TIP in esc.detail
+        f.scheduler.mark_done.assert_not_awaited()
+
+    async def test_unclassified_status_also_files_the_l2(self, tmp_path: Path):
+        """'Loud' for an unclassified outcome means an escalation too — the
+        shared DURABLE_MERGE_FAILURE_STATUSES docstring promises exactly this
+        of BOTH submit paths."""
+        from orchestrator.merge_types import MergeOutcome
+
+        q = _FakeEscalationQueue()
+        await self._fire(
+            tmp_path, MergeOutcome(status=cast(Any, 'brand_new_status')),
+            escalation_queue=q,
+        )
+
+        assert len(q.submitted) == 1
+        assert q.submitted[0].category == 'stranded_merge_failed'
+
+    @pytest.mark.parametrize('status', ['done', 'already_merged', 'superseded'])
+    async def test_success_or_transient_files_nothing(
+        self, tmp_path: Path, status: str,
+    ):
+        from orchestrator.merge_types import MergeOutcome
+
+        q = _FakeEscalationQueue()
+        await self._fire(
+            tmp_path, MergeOutcome(status=cast(Any, status), merge_sha=_LANDED),
+            escalation_queue=q,
+        )
+
+        assert q.submitted == []
+
+    async def test_second_durable_failure_is_deduped(self, tmp_path: Path):
+        from orchestrator.merge_types import MergeOutcome
+
+        q = _FakeEscalationQueue()
+        f = _make(tmp_path=tmp_path)
+        f.wf.escalation_queue = q  # type: ignore[assignment]
+        for _ in range(2):
+            await f.wf._on_architect_merge_done(
+                MergeOutcome(status='error'), tip=_TIP, evidence='ev',
+            )
+
+        assert len(q.submitted) == 1
+
+    async def test_missing_queue_does_not_raise(self, tmp_path: Path):
+        """Fail-safe: a done-callback must never propagate a bookkeeping error.
+        The structured failure event is still emitted."""
+        from orchestrator.merge_types import MergeOutcome
+
+        f = await self._fire(tmp_path, MergeOutcome(status='error'))
+
+        rows = f.event_store.fetch_events_by_type_all_runs(
+            EventType.architect_desync_merge, task_id=_TASK_ID,
+        )
+        assert (rows[0].get('data') or {})['decision'] == 'merge_failed'
+
+    async def test_submit_failure_is_swallowed(self, tmp_path: Path):
+        from orchestrator.merge_types import MergeOutcome
+
+        q = _FakeEscalationQueue()
+        q.submit = MagicMock(side_effect=RuntimeError('disk full'))  # type: ignore[method-assign]
+        await self._fire(
+            tmp_path, MergeOutcome(status='error'), escalation_queue=q,
+        )  # must not raise
+
+    _fire = staticmethod(_fire_merge_done)
 
 
 @pytest.mark.asyncio

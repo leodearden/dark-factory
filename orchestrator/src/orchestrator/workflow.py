@@ -6169,9 +6169,21 @@ class TaskWorkflow:
           reconciler rather than stamping a bogus one;
         - transient / superseded → a strict no-op, re-driven by a later sweep;
         - durable failure, or any status in NEITHER classification set →
-          leave the task blocked and emit a structured failure event.  Loud
-          over silent: an unclassified outcome must not no-op into a stranded
-          task with no operator signal.
+          leave the task blocked, emit a structured failure event AND file a
+          born-at-L2 ``stranded_merge_failed`` (:meth:`_file_architect_merge_failed`).
+          Loud over silent: an unclassified outcome must not no-op into a
+          stranded task with no operator signal.
+
+        The L2 on the durable path is LOAD-BEARING, not decoration.  The
+        enqueue exit deliberately leaves the task ``blocked`` with NO open
+        escalation — which is LEAVE-shaped for the recovery sweep — and the
+        stranded reaper cannot re-drive it either (``detect_verified_green``
+        requires an assigned lane AND an all-steps-done plan.json, and this
+        exit fires precisely when the architect wrote no plan).  So on a
+        durable merge failure nothing else re-drives the task and nothing else
+        signals a human: without this escalation the exit that exists to stop
+        a branch sitting stranded would itself strand the task forever, worse
+        than the pre-change ``report_unactionable_task`` L1 it replaced.
         """
         status = outcome.status
         landed = outcome.merge_sha
@@ -6234,6 +6246,119 @@ class TaskWorkflow:
                     'classified': status in DURABLE_MERGE_FAILURE_STATUSES,
                 },
             )
+        self._file_architect_merge_failed(outcome, tip=tip)
+
+    def _file_architect_merge_failed(
+        self, outcome: MergeOutcome, *, tip: str,
+    ) -> None:
+        """File a BORN-AT-L2 ``stranded_merge_failed`` for a durably-failed
+        architect-desync merge.
+
+        The sibling of :meth:`Harness._file_stranded_merge_failed`
+        (harness.py) for the byte-identical outcome: a branch that was
+        submitted straight to the merge queue on a verified-green claim and
+        then failed the queue's own verify/merge durably.  Same category on
+        purpose — ``stranded_merge_failed`` is deliberately EXCLUDED from
+        ``Harness.MERGE_REMEDIABLE_ESC_CATEGORIES`` (see the comment at
+        harness.py:4668), so re-using it also buys the invariant that a branch
+        which already failed the merge is never auto-re-submitted into the same
+        failure.
+
+        ``agent_role='orchestrator-architect-desync-merge'`` (a harness-sentinel
+        role) + ``severity='critical'`` + ``level=2`` make the record BORN AT
+        L2 — it bypasses the auto-watcher and routes straight to a human.
+
+        Does NOT touch task status, the lane, or the branch: the task is
+        already ``blocked`` and the branch is preserved for inspection
+        (preservation by omission).  Deduped via a scoped pending/L2/role read.
+        Fail-safe: a missing queue logs loudly and returns; any submit failure
+        is logged and swallowed so a bookkeeping error never propagates out of
+        a done-callback.
+        """
+        status = getattr(outcome, 'status', 'unknown')
+        reason = getattr(outcome, 'reason', '') or ''
+        if self.escalation_queue is None:
+            logger.error(
+                'Task %s: architect-desync merge failed durably (status=%s, '
+                'reason=%r) at tip %s but NO escalation queue is attached — '
+                'the task is blocked with no operator signal',
+                self.task_id, status, reason, tip[:12],
+            )
+            return
+
+        role = 'orchestrator-architect-desync-merge'
+        try:
+            existing = self.escalation_queue.get_by_task(
+                self.task_id, status='pending', level=2, agent_role=role,
+            )
+            if any(e.category == 'stranded_merge_failed' for e in existing):
+                logger.warning(
+                    'Task %s: stranded_merge_failed L2 already open for the '
+                    'architect-desync merge — suppressing duplicate',
+                    self.task_id,
+                )
+                return
+
+            from escalation.models import Escalation  # noqa: PLC0415
+
+            esc = Escalation(
+                id=self.escalation_queue.make_id(self.task_id),
+                task_id=self.task_id,
+                agent_role=role,
+                severity='critical',
+                category='stranded_merge_failed',
+                summary=(
+                    f'Architect-desync merge FAILED for task {self.task_id} '
+                    f'(status={status}) — manual intervention.'
+                )[:200],
+                detail=(
+                    f'The architect reported a merge-landing desync for task '
+                    f'{self.task_id} and the handler enqueued its branch tip '
+                    f'{tip} directly to the merge queue '
+                    f"(source='architect-desync'), but the merge/verify failed "
+                    f'durably: status={status}, reason={reason!r}.  The task '
+                    f'remains blocked and the branch is preserved (untouched) '
+                    f'for inspection.  Nothing re-drives this task on its own: '
+                    f'the exit files no other escalation by design, and the '
+                    f'verified-green stranded reaper cannot pick it up (it '
+                    f'requires an assigned lane AND an all-steps-done '
+                    f'plan.json, and this exit fires when the architect wrote '
+                    f'no plan).  A branch whose verified-green claim does not '
+                    f"survive the merge queue's own full verify lands here — "
+                    f'the exit never bypasses that gate.  Investigate and '
+                    f're-drive or triage manually.'
+                ),
+                suggested_action='manual_intervention',
+                level=2,
+            )
+            self.escalation_queue.submit(esc)
+        except Exception:
+            logger.error(
+                'Task %s: FAILED to file the architect-desync '
+                'stranded_merge_failed L2 (status=%s) — the task is blocked '
+                'with no operator signal',
+                self.task_id, status, exc_info=True,
+            )
+            return
+
+        if self.event_store:
+            self.event_store.emit(
+                EventType.escalation_created,
+                task_id=self.task_id,
+                data={
+                    'escalation_id': esc.id,
+                    'category': 'stranded_merge_failed',
+                    'severity': 'critical',
+                    'level': 2,
+                    'reason': f'architect-desync-merge-{status}',
+                },
+            )
+        logger.warning(
+            'Task %s: filed born-at-L2 stranded_merge_failed %s for the '
+            'architect-desync merge (status=%s) — task stays blocked, branch '
+            'preserved',
+            self.task_id, esc.id, status,
+        )
 
     async def _handle_unactionable_task_report(self) -> WorkflowOutcome:
         """Process a ``.task/unactionable_task.json`` report from the architect.

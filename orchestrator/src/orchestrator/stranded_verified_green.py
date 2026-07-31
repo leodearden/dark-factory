@@ -68,6 +68,12 @@ architect-desync exit) classify their terminal outcome against these sets, and
 BOTH treat a status found in NEITHER set LOUDLY as a durable failure, so a
 new/unclassified outcome can never silently no-op into a stranded task with no
 operator signal.
+
+"Loudly" is specifically a born-at-L2 ``stranded_merge_failed`` escalation on
+both paths (``Harness._file_stranded_merge_failed`` /
+``TaskWorkflow._file_architect_merge_failed``), not merely a log line or an
+event row — a durable failure on either path leaves the task blocked with
+nothing else able to re-drive it, so a human signal is the only exit.
 """
 
 SUCCESS_TRANSIENT_MERGE_STATUSES: frozenset[str] = frozenset({
