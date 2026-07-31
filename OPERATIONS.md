@@ -1069,9 +1069,25 @@ directly, not just interactive sessions. Treat it accordingly:
 - For a direct-to-main commit under contention, use
   `git commit --only <path>` (not a bare `git commit`) so you don't sweep
   up unrelated staged or dirty state from a concurrent process.
-- `pre-commit` runs pyright three times — pass a generous timeout (five
+- `pre-commit` path-filters its pyright stage (since task 2551 — see
+  `hooks/project-checks` for the authoritative logic), so what a commit
+  costs depends on what it stages:
+  - **No staged `.py` files** — pyright is skipped entirely; the hook
+    prints `pre-commit: pyright skipped (no Python changes)` and the
+    commit completes in seconds. A docs/plans-only commit needs no
+    bumped timeout: reach for a plain gated `git commit --only <paths>`
+    first.
+  - **Staged `.py` under `shared/` or `escalation/`** — every dependent
+    package imports them, so the hook runs a full sweep across all three
+    `PYRIGHT_PACKAGES` (`fused-memory`, `orchestrator`, `dashboard`).
+    This is the 3x worst case and can comfortably exceed two minutes.
+  - **Staged `.py` under exactly one of `fused-memory`, `orchestrator`,
+    or `dashboard`** — pyright runs once, for that package only.
+
+  When the commit stages Python changes, pass a generous timeout (five
   minutes or more) to whatever you use to run commit commands, or run it
-  detached and poll, rather than letting a default timeout kill it mid-hook.
+  detached and poll, rather than letting a default timeout kill it
+  mid-hook.
 - **Never run `git stash`** in the main checkout: the stash stack is
   consumed by the merge worker's own advance path, so a stash you push can
   be popped out from under you by an unrelated process. Park work-in-progress
@@ -1079,7 +1095,10 @@ directly, not just interactive sessions. Treat it accordingly:
 - A pure docs-only commit landing under contention (index lock held by a
   concurrent process) may use `--no-verify` — docs changes don't need the
   code-quality hooks, and retrying past a lock contest is safe for a
-  no-code change. Reach for `--only` first regardless.
+  no-code change. Reach for `--only` first regardless. Since task 2551 a
+  docs-only commit passes the hook cheaply anyway (pyright is skipped),
+  so this is a last resort for genuine index-lock contention — not a way
+  to dodge a slow hook.
 
 ---
 
