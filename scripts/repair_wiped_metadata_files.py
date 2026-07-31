@@ -41,12 +41,17 @@ Usage:
 """
 from __future__ import annotations
 
+import argparse
+import asyncio
 import json
+import sqlite3
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NamedTuple, Protocol
 
 from audit_wiped_metadata_files import (
+    discover_project_roots,
     CONTRADICTED_REAL_MERGE_SHA,
     FIDELITY_FILE_LEVEL,
     AuditCoverage,
@@ -697,3 +702,158 @@ def format_json_summary(results: list["RepairResult"]) -> str:
             ]
         }
     )
+
+
+# ---------------------------------------------------------------------------
+# CLI.
+# ---------------------------------------------------------------------------
+
+DEFAULT_SERVER = "http://127.0.0.1:8002"
+
+# WHY THIS NAME IS LOAD-BEARING, not cosmetic. fused_memory/server/tools.py:524
+# derives a write's `agent_id` from ctx.session.client_params.clientInfo.name.
+# Inheriting the migrate script's 'migrate-metadata' would file every one of
+# these repair writes in the journal and the event stream under an unrelated,
+# long-finished migration — making the backfill unattributable exactly when
+# someone is trying to work out who touched a historical record.
+CLIENT_NAME = "repair-wiped-metadata-files-3329"
+
+
+def _make_client(server_url: str):
+    """Construct the MCP client. Imported LAZILY, on the apply path only.
+
+    ``migrate_metadata_modules_to_files`` imports httpx at module scope, so
+    importing it at the top of this module would make a dry run depend on a
+    transport library it never uses. Subclassed rather than edited: that file
+    is outside this task's lock scope, and the migrate script's update_task
+    recipe is the proven one — only the mode differs (merge, not replace).
+    """
+    from migrate_metadata_modules_to_files import FusedMemoryClient
+
+    class RepairFusedMemoryClient(FusedMemoryClient):
+        """FusedMemoryClient with an attributable clientInfo.name."""
+
+        async def _initialize(self) -> None:
+            await self._post({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "clientInfo": {"name": CLIENT_NAME, "version": "1.0"},
+                    "capabilities": {},
+                },
+            })
+            await self._post({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+                "params": {},
+            })
+
+    return RepairFusedMemoryClient(server_url)
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Repair metadata.files wiped by the DONE path. DRY RUN BY DEFAULT: "
+            "without --apply nothing is written and the MCP server is never "
+            "even dialled. Re-runs the read-only audit in-process on every "
+            "invocation -- it never consumes a stale candidate list."
+        ),
+        epilog=(
+            "exit codes: 0 = ran, nothing failed; 1 = at least one candidate "
+            "FAILED to write; 2 = no project root resolved to a readable "
+            "tasks.db (nothing was examined -- never read 2 as a clean run)."
+        ),
+    )
+    parser.add_argument(
+        "--project-root", dest="project_roots", action="append",
+        help=(
+            "Project root to repair (resolves <root>/.taskmaster/tasks/tasks.db, "
+            "<root>/data/orchestrator/runs.db and <root>/.worktrees). "
+            "May be repeated."
+        ),
+    )
+    parser.add_argument(
+        "--apply", action="store_true",
+        help=(
+            "Actually write. Without this the run is inert: no MCP client is "
+            "constructed and no task is touched."
+        ),
+    )
+    parser.add_argument(
+        "--json", action="store_true",
+        help="Emit a JSON object (dispositions + coverage) instead of a report.",
+    )
+    parser.add_argument(
+        "--server-url", default=DEFAULT_SERVER,
+        help=f"Fused-memory MCP server URL (default: {DEFAULT_SERVER}).",
+    )
+    return parser
+
+
+async def main_async(args: argparse.Namespace) -> int:
+    roots = discover_project_roots(project_roots=args.project_roots)
+    if not roots:
+        print(
+            "no project root resolvable with a readable tasks.db (checked "
+            "--project-root / DASHBOARD_KNOWN_PROJECT_ROOTS / the "
+            "dark-factory default); NOTHING was examined",
+            file=sys.stderr,
+        )
+        return 2
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    results: list[RepairResult] = []
+
+    if args.apply:
+        # The client is constructed ONLY here, so a dry run genuinely never
+        # dials — that inertness is what makes an accidental bare invocation
+        # safe, and it is asserted by pointing --server-url at a closed port.
+        async with _make_client(args.server_url) as client:
+            for root in roots:
+                results.append(
+                    await repair_project(client, root, apply=True, now_iso=now_iso)
+                )
+    else:
+        for root in roots:
+            results.append(
+                await repair_project(None, root, apply=False, now_iso=now_iso)
+            )
+
+    if args.json:
+        print(format_json_summary(results))
+    else:
+        print("\n".join(format_summary(result) for result in results))
+
+    failed = sum(
+        1
+        for result in results
+        for outcome in result.outcomes
+        if outcome.disposition == FAILED
+    )
+    return 1 if failed else 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point.
+
+    Exit codes: 0 = ran, nothing failed; 1 = at least one candidate FAILED to
+    write; 2 = no project root resolved to a readable tasks.db.
+
+    2 is distinct from 0 for the same reason the audit distinguishes them: 0
+    would otherwise be returned both for "examined everything, nothing to do"
+    and for "examined nothing at all", and a consumer reading only the exit
+    code would take a total no-op for a clean run.
+    """
+    args = _build_parser().parse_args(argv)
+    try:
+        return asyncio.run(main_async(args))
+    except sqlite3.Error as exc:
+        print(f"error: could not read a project database: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
