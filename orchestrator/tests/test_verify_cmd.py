@@ -15,6 +15,12 @@ import dataclasses
 import shlex
 
 import pytest
+from _verify_config_corpus import (
+    FM_LINT_COMMAND,
+    ROOT_LINT_COMMAND,
+    ROOT_TEST_COMMAND,
+    ROOT_TYPE_CHECK_COMMAND,
+)
 
 from orchestrator.verify_cmd import (
     ToolKind,
@@ -33,45 +39,10 @@ from orchestrator.verify_cmd import (
     with_junitxml,
 )
 
-# ---------------------------------------------------------------------------
-# Real config command strings, verbatim from the repo's orchestrator configs.
-# These are the corpus `split_chain_tail`'s gate must classify correctly: the
-# lint chains are SIBLING-CHECKER chains (accept, preserve the tail); the root
-# type/test chains are cwd-sequenced same-tool fan-outs (reject, keep today's
-# truncation).
-# ---------------------------------------------------------------------------
-
-# fused-memory/orchestrator.yaml:11
-_FM_LINT_COMMAND = (
-    'uv run --project fused-memory --directory fused-memory ruff check src/ tests/'
-    ' && python3 fused-memory/scripts/check_bare_magicmock_config.py fused-memory/tests'
-    ' && python3 fused-memory/scripts/check_asyncmock_assertion_style.py fused-memory/tests'
-)
-
-# dark-factory-orchestrator.yaml:50
-_ROOT_LINT_COMMAND = (
-    'uv run ruff check shared escalation fused-memory orchestrator dashboard'
-    ' && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests'
-    ' escalation/tests fused-memory/tests orchestrator/tests dashboard/tests'
-)
-
-# dark-factory-orchestrator.yaml:51
-_ROOT_TYPE_CHECK_COMMAND = (
-    'cd fused-memory && npx pyright && cd ../orchestrator && npx pyright'
-    ' && cd ../dashboard && npx pyright'
-)
-
-# dark-factory-orchestrator.yaml:41
-_ROOT_TEST_COMMAND = (
-    'cd shared && uv run pytest tests/ --timeout=300'
-    ' && cd ../escalation && uv run pytest tests/ --timeout=300'
-    ' && cd ../orchestrator && uv run pytest tests/ --timeout=300'
-    ' && cd ../fused-memory && uv run pytest tests/ --timeout=300'
-    ' && cd ../dashboard && uv run pytest tests/ --timeout=300'
-    ' && cd ../sampler && uv run pytest tests/ --timeout=300'
-    ' && cd .. && ( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/ --timeout=300 )'
-    ' && uv run --project shared pytest tests/scripts/ --timeout=300'
-)
+# The real config command strings this suite exercises live in
+# `_verify_config_corpus.py` (one definition site, shared with test_verify_plan.py
+# and test_verify_scope_kappa.py); `test_verify_config_corpus.py` checks them
+# against the live YAML.
 
 
 class TestToolKind:
@@ -978,10 +949,10 @@ class TestSplitTopLevelAnd:
             'ruff check "x && y"',
             'ruff check src/ --select E',
             '',
-            _FM_LINT_COMMAND,
-            _ROOT_LINT_COMMAND,
-            _ROOT_TYPE_CHECK_COMMAND,
-            _ROOT_TEST_COMMAND,
+            FM_LINT_COMMAND,
+            ROOT_LINT_COMMAND,
+            ROOT_TYPE_CHECK_COMMAND,
+            ROOT_TEST_COMMAND,
         ],
         ids=[
             'three-segments',
@@ -1024,16 +995,16 @@ class TestSplitChainTail:
     @pytest.mark.parametrize(
         ('raw', 'keyword'),
         [
-            (_FM_LINT_COMMAND, 'ruff check'),
-            (_ROOT_LINT_COMMAND, 'ruff check'),
+            (FM_LINT_COMMAND, 'ruff check'),
+            (ROOT_LINT_COMMAND, 'ruff check'),
             ('ruff check src/ --select E', 'ruff check'),
-            (_ROOT_TYPE_CHECK_COMMAND, 'pyright'),
+            (ROOT_TYPE_CHECK_COMMAND, 'pyright'),
             (
                 'uv run --project a ruff check src/ && uv run --project b ruff check src/',
                 'ruff check',
             ),
             ('echo hi && ruff check src/ && python3 x.py', 'ruff check'),
-            (_ROOT_TEST_COMMAND, 'pytest'),
+            (ROOT_TEST_COMMAND, 'pytest'),
             ('ruff check "unterminated && python3 x.py', 'ruff check'),
             ("ruff check -k 'a && b' src/ && python3 x.py", 'ruff check'),
         ],
@@ -1061,7 +1032,7 @@ class TestSplitChainTail:
         `python3 .../check_*.py` sibling clauses live in the preserved tail,
         byte-identical to their slice of the config string.
         """
-        prefix, tail = split_chain_tail(_FM_LINT_COMMAND, 'ruff check')
+        prefix, tail = split_chain_tail(FM_LINT_COMMAND, 'ruff check')
         assert prefix == (
             'uv run --project fused-memory --directory fused-memory ruff check src/ tests/ '
         )
@@ -1069,11 +1040,11 @@ class TestSplitChainTail:
             '&& python3 fused-memory/scripts/check_bare_magicmock_config.py fused-memory/tests'
             ' && python3 fused-memory/scripts/check_asyncmock_assertion_style.py fused-memory/tests'
         )
-        assert tail == _FM_LINT_COMMAND[len(prefix):]
+        assert tail == FM_LINT_COMMAND[len(prefix):]
 
     def test_accepts_root_lint_chain(self):
         """dark-factory-orchestrator.yaml:50 — one sibling checker clause."""
-        prefix, tail = split_chain_tail(_ROOT_LINT_COMMAND, 'ruff check')
+        prefix, tail = split_chain_tail(ROOT_LINT_COMMAND, 'ruff check')
         assert prefix == 'uv run ruff check shared escalation fused-memory orchestrator dashboard '
         assert tail == (
             '&& python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests'
@@ -1084,13 +1055,13 @@ class TestSplitChainTail:
         ('raw', 'keyword'),
         [
             ('ruff check src/ --select E', 'ruff check'),
-            (_ROOT_TYPE_CHECK_COMMAND, 'pyright'),
+            (ROOT_TYPE_CHECK_COMMAND, 'pyright'),
             (
                 'uv run --project a ruff check src/ && uv run --project b ruff check src/',
                 'ruff check',
             ),
             ('echo hi && ruff check src/ && python3 x.py', 'ruff check'),
-            (_ROOT_TEST_COMMAND, 'pytest'),
+            (ROOT_TEST_COMMAND, 'pytest'),
             ('ruff check "unterminated && python3 x.py', 'ruff check'),
             ('mypy src/', 'ruff check'),
             ('true', 'ruff check'),
