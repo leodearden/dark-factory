@@ -3,6 +3,7 @@ const { Sparkline: SP, LineChart: LC, StackedAreaChart: SA, BarChart: BC, HBarCh
 const { Glyph: GL, ProjectGroup, Segmented, ChipGroup } = window.DF_SHELL;
 const DF = window.DF_DATA;
 const { rtCell, rtAge } = window.DF_RUNTIME_FMT;
+const { orchEmptyLabel } = window.DF_ORCH_FILTER;
 const { useState: uS, useEffect: uE } = React;
 
 // shared open-state helper for furl/unfurl, persisted to localStorage by key
@@ -275,7 +276,7 @@ function OrchTab({ projectFilter, search }) {
                       <th>Status</th>
                     </tr></thead>
                     <tbody>
-                      {filtered.length === 0 && <tr><td colSpan={12} className="empty" style={{ padding: 20 }}>No {filter === 'all' ? '' : filter + ' '}tasks</td></tr>}
+                      {filtered.length === 0 && <tr><td colSpan={12} className="empty" style={{ padding: 20 }}>{orchEmptyLabel(filter)}</td></tr>}
                       {filtered.map(t => {
                         const isDone = t.status === 'done';
                         const isPending = t.status === 'pending';
