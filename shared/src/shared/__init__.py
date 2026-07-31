@@ -43,7 +43,7 @@ from shared.locking import (
     strip_directory_locks,
 )
 from shared.mcp_idempotency import MUTATING_TASK_TOOLS, maybe_inject_client_op_id
-from shared.safe_io import load_json_or_warn
+from shared.safe_io import atomic_write_text, load_json_or_warn
 from shared.sqlite_sync_base import apply_full_durability_pragmas_sync
 from shared.usage_gate import (
     AccountPhase,
@@ -105,4 +105,5 @@ __all__ = [
     'MUTATING_TASK_TOOLS',
     'maybe_inject_client_op_id',
     'load_json_or_warn',
+    'atomic_write_text',
 ]

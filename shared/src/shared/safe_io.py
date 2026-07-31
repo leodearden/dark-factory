@@ -187,6 +187,21 @@ def atomic_write_text(
 ) -> None:
     """Write *text* to *path* atomically via the tmp+rename pattern.
 
+    The guarantee a concurrent reader may rely on: it observes either the
+    complete OLD contents of *path* or the complete NEW contents — never a
+    truncated or interleaved partial write, and never a missing file.  The
+    text is written to a temp file that is exclusively created in *path*'s own
+    directory and only then ``os.replace``-d into place, which rename(2)
+    defines as atomic within a filesystem.
+
+    The temp name is unique per writer (see :func:`_create_temp`), so two
+    concurrent writers to the same destination cannot collide on one temp and
+    tear each other's content — the specific latent race in the fixed
+    ``<dest>.json.tmp`` sites this helper consolidates.
+
+    No temp residue survives either outcome: the temp is renamed away on
+    success and unlinked on any failure, including ``KeyboardInterrupt``.
+
     Parameters
     ----------
     path:
