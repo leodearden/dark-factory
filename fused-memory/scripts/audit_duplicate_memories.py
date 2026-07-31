@@ -2251,6 +2251,11 @@ async def _run(args: argparse.Namespace) -> int:
                 split_plan_by_category(plan, categories),
                 {
                     **disclosures,
+                    # Plain ints, so the existing branch emits them at
+                    # _GLOBAL_SCOPE (`<name>.all`) with no new emission path:
+                    # they are properties of ONE pass over the whole scanned
+                    # set, not of a category.
+                    **(plan['liveness_snapshot_disclosure'] or {}),
                     'scan_truncated': {
                         c: int(scan_stats.get(c, {}).get('truncated', 0))
                         for c in categories
