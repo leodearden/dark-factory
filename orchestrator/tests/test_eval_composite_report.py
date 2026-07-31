@@ -221,11 +221,17 @@ class TestBuildPairwisePriceTable:
 def _mresult(
     task_id, config_name, trial, *, quality, cost_usd, duration_ms,
     tests_pass: bool | None = True, cost_source='price_table', recovery_score=None,
-    plan_quality=None, role_under_test='implementer',
+    plan_quality=None, role_under_test='implementer', plan_steps=0,
     judge_invocations=0, judge_cost_usd=0.0,
     cap_tainted=False, invocation_error=None,
 ):
-    """Build a synthetic EvalResult with a production-shaped metrics dict."""
+    """Build a synthetic EvalResult with a production-shaped metrics dict.
+
+    ``plan_steps`` is threaded explicitly (task 3302) because it is the
+    PLAN-PRODUCTION predicate the report layer reads: a fixture that declares a
+    ``plan_quality`` without the step count it came from is itself the
+    self-contradictory shape this task removes.
+    """
     from orchestrator.evals.metrics import EvalMetrics
     from orchestrator.evals.runner import EvalResult
 
@@ -238,6 +244,7 @@ def _mresult(
         recovery_score=recovery_score,
         plan_quality=plan_quality,
         role_under_test=role_under_test,
+        plan_steps=plan_steps,
         judge_invocations=judge_invocations,
         judge_cost_usd=judge_cost_usd,
         cap_tainted=cap_tainted,
@@ -279,7 +286,7 @@ def _union_dataset():
     for tr in (1, 2, 3):
         results.append(_mresult(
             'f1', 'C', tr, quality=1.0, cost_usd=1.0, duration_ms=1000,
-            role_under_test='architect', plan_quality=0.9,
+            role_under_test='architect', plan_quality=0.9, plan_steps=6,
         ))
     for tr in (1, 2, 3):
         results.append(_mresult(
@@ -380,10 +387,10 @@ class TestBuildCompositeReport:
                      invocation_error='architect:cap_hit: session limit'),
             _mresult('f1', 'capped-first', 2, quality=1.0, cost_usd=1.0,
                      duration_ms=1000, role_under_test='architect',
-                     plan_quality=0.82),
+                     plan_quality=0.82, plan_steps=6),
             _mresult('f1', 'healthy', 1, quality=1.0, cost_usd=1.0,
                      duration_ms=1000, role_under_test='architect',
-                     plan_quality=0.55),
+                     plan_quality=0.55, plan_steps=6),
         ]
         rows = {r['config']: r for r in build_composite_report(results)['configs']}
 
@@ -415,7 +422,7 @@ class TestBuildCompositeReport:
                      invocation_error='architect:cap_hit: session limit'),
             _mresult('f1', 'mixed', 3, quality=1.0, cost_usd=1.0,
                      duration_ms=1000, role_under_test='architect',
-                     plan_quality=0.6),
+                     plan_quality=0.6, plan_steps=6),
         ]
         rows = {r['config']: r for r in build_composite_report(results)['configs']}
         plan_report = build_plan_quality_report(results)
@@ -494,15 +501,22 @@ class TestBuildCompositeReport:
 # ---------------------------------------------------------------------------
 
 def _arch(task_id, config_name, trial, *, plan_quality, cost_usd, duration_ms,
-          cap_tainted=False):
+          cap_tainted=False, plan_steps=6):
     """A plan-only architect cell, shaped as run_architect_eval writes it:
-    tests_pass=None (no test signal) and quality carried by plan_quality."""
+    tests_pass=None (no test signal) and quality carried by plan_quality.
+
+    ``plan_steps`` defaults NONZERO (task 3302): the ordinary architect cell
+    these tests describe DID produce a plan, and its ``plan_quality`` is a score
+    over that plan's steps. A ``plan_steps=0`` cell is the distinct no-plan
+    shape, requested explicitly by the tests that exercise it.
+    """
     return _mresult(
         task_id, config_name, trial,
         quality=0.0,                 # composite_score is never set on this path
         cost_usd=cost_usd, duration_ms=duration_ms,
         tests_pass=None, role_under_test='architect',
-        plan_quality=plan_quality, cap_tainted=cap_tainted,
+        plan_quality=plan_quality, plan_steps=plan_steps,
+        cap_tainted=cap_tainted,
         invocation_error='architect:cap_hit: session limit' if cap_tainted else None,
     )
 
