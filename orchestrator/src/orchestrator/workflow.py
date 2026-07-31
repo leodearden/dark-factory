@@ -5867,8 +5867,12 @@ class TaskWorkflow:
         3. verify PASSED on this exact tip
            (:func:`last_verified_green_tip`, read cross-run);
         4. review returned a non-blocking verdict on this exact committed tree
+           AND that verdict was minted under the CURRENT reviewer config
            (``record_review_verdict`` only ever caches PASS / suggestions_only,
-           so a cache hit on the current tree hash is proof).
+           so a cache hit whose ``reviewer_fingerprint`` positively matches
+           :meth:`_reviewer_config_fingerprint` is proof — a bare hit is not,
+           per the same positive-match contract the canonical cache reader in
+           ``_execute_verify_review_loop`` enforces).
 
         On a match: enqueue a ``MergeRequest`` tagged ``source=
         'architect-desync'`` and leave the task BLOCKED with NO open human
@@ -5973,12 +5977,34 @@ class TaskWorkflow:
         cached = (
             self.artifacts.get_cached_verdict(tree_hash) if tree_hash else None
         )
-        if not cached:
+        # POSITIVE fingerprint match required — the same contract the canonical
+        # verdict-cache reader enforces (`_execute_verify_review_loop`) and that
+        # `record_review_verdict` documents: a verdict minted under a different
+        # reviewer roster / per-role model config (or with no computable
+        # fingerprint at all) is NOT proof that the CURRENT reviewers would
+        # pass this tree.  Accepting a bare cache hit here would be strictly
+        # weaker than the interactive path — on an UNATTENDED auto-merge lane
+        # whose only downstream gate (the merge worker's scoped re-verify)
+        # covers tests, not review.  Fail-safe: reject → blocked, never a
+        # silent stale-verdict merge.
+        expected_fingerprint = self._reviewer_config_fingerprint()
+        recorded_fingerprint = (
+            cached.get('reviewer_fingerprint')
+            if isinstance(cached, dict) else None
+        )
+        if (
+            not cached
+            or expected_fingerprint is None
+            or recorded_fingerprint != expected_fingerprint
+        ):
             return await _reject(
                 'review_pass',
-                'review has not passed on the branch tree',
+                'review has not passed on the branch tree under the current '
+                'reviewer config',
                 {'tip': tip, 'tree_hash': tree_hash,
-                 'cached_verdict': cached},
+                 'cached_verdict': cached,
+                 'expected_reviewer_fingerprint': expected_fingerprint,
+                 'recorded_reviewer_fingerprint': recorded_fingerprint},
             )
 
         # INV-4 storm-escape: a re-invoked architect on the SAME tip must not

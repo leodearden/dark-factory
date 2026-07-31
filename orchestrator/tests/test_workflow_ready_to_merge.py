@@ -38,6 +38,11 @@ _TIP = 'aaaa111122223333444455556666777788889999'
 _MAIN = 'bbbb1111222233334444555566667777888899aa'
 _TREE = 'cccc1111222233334444555566667777888899bb'
 
+# Sentinel for "record the verdict under the fingerprint the workflow itself
+# computes" — the happy-path default.  Tests that need a stale/absent
+# fingerprint pass an explicit str or ``None`` instead.
+_MATCHING_FINGERPRINT = object()
+
 
 @dataclass
 class _Fixture:
@@ -88,6 +93,7 @@ def _make(
     verified_tip: str | None = _TIP,
     tree_hash: str | None = _TREE,
     review_verdict: str | None = 'PASS',
+    review_fingerprint: Any = _MATCHING_FINGERPRINT,
     metadata: dict | None = None,
     with_merge_queue: bool = True,
     set_task_status_side_effect: object = None,
@@ -152,7 +158,15 @@ def _make(
     artifacts = TaskArtifacts(worktree)
     artifacts.init(task_id, 'T', 'd', base_commit='oldbase')
     if review_verdict is not None and tree_hash is not None:
-        artifacts.record_review_verdict(tree_hash, review_verdict, False)
+        fingerprint = (
+            wf._reviewer_config_fingerprint()
+            if review_fingerprint is _MATCHING_FINGERPRINT
+            else review_fingerprint
+        )
+        artifacts.record_review_verdict(
+            tree_hash, review_verdict, False,
+            reviewer_fingerprint=cast(Any, fingerprint),
+        )
     wf.artifacts = artifacts
     wf.worktree = worktree
 
@@ -337,6 +351,20 @@ _BROKEN_PREDICATES = [
     pytest.param(
         {'tree_hash': None}, 'review_pass', id='tree-hash-unresolvable',
     ),
+    # A verdict minted under a DIFFERENT reviewer roster / model config is not
+    # proof the current reviewers would pass this tree — and this lane merges
+    # unattended, so a bare cache hit must not be enough.
+    pytest.param(
+        {'review_fingerprint': 'stale-roster-digest'}, 'review_pass',
+        id='review-fingerprint-mismatch',
+    ),
+    # A verdict recorded with no computable fingerprint can never satisfy the
+    # canonical reader's positive-match rule (artifacts.py record_review_verdict
+    # docstring); this handler must honour the same contract.
+    pytest.param(
+        {'review_fingerprint': None}, 'review_pass',
+        id='review-fingerprint-absent',
+    ),
     pytest.param(
         {'tip': 'e' * 40, 'verified_tip': 'e' * 40}, 'cited_commit',
         id='cited-commit-is-not-the-tip',
@@ -407,6 +435,70 @@ class TestReadyToMergeRejects:
         detail = f.mark_blocked.await_args.kwargs.get('detail') or ''
         assert predicate in reason
         assert detail
+
+
+@pytest.mark.asyncio
+class TestReadyToMergeReviewFingerprintGate:
+    """The review-PASS predicate honours the verdict cache's POSITIVE-match
+    contract, not a bare cache hit.
+
+    This lane merges to main UNATTENDED and the merge worker's scoped re-verify
+    covers tests, not review — so a verdict minted under a different reviewer
+    roster / per-role model config (or with no computable fingerprint at all)
+    must not be laundered into a merge.  Same rule as the canonical reader in
+    ``_execute_verify_review_loop`` and as documented on
+    ``TaskArtifacts.record_review_verdict``.
+    """
+
+    async def _run(self, tmp_path: Path, **kw) -> _Fixture:
+        f = _make(tmp_path=tmp_path, **kw)
+        f.artifacts.write_ready_to_merge(commit=_TIP, evidence='ev')
+        f.outcome = await f.wf._handle_ready_to_merge_report()
+        return f
+
+    def _measured(self, f: _Fixture) -> dict:
+        rows = f.event_store.fetch_events_by_type_all_runs(
+            EventType.architect_desync_merge, task_id=_TASK_ID,
+        )
+        return (rows[0].get('data') or {}).get('measured') or {}
+
+    async def test_matching_fingerprint_still_enqueues(self, tmp_path: Path):
+        """The gate is not vacuous — a current-config verdict still passes."""
+        f = await self._run(tmp_path)
+
+        assert f.merge_queue.qsize() == 1
+        f.mark_blocked.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        'recorded', ['stale-roster-digest', None],
+        ids=['mismatch', 'absent'],
+    )
+    async def test_non_matching_fingerprint_enqueues_no_merge(
+        self, tmp_path: Path, recorded: str | None,
+    ):
+        f = await self._run(tmp_path, review_fingerprint=recorded)
+
+        assert f.outcome == WorkflowOutcome.BLOCKED
+        assert f.merge_queue.qsize() == 0
+        assert f.marker_stamps() == []
+        assert f.mark_blocked.await_args.kwargs.get('escalate_to_human') is not True
+
+    @pytest.mark.parametrize(
+        'recorded', ['stale-roster-digest', None],
+        ids=['mismatch', 'absent'],
+    )
+    async def test_reject_reports_expected_and_recorded_fingerprints(
+        self, tmp_path: Path, recorded: str | None,
+    ):
+        """INV-2 structured-facts-at-failure: BOTH sides of the comparison land
+        on the event so the mismatch is legible without re-deriving anything."""
+        f = await self._run(tmp_path, review_fingerprint=recorded)
+
+        measured = self._measured(f)
+        expected = f.wf._reviewer_config_fingerprint()
+        assert expected is not None  # the fixture config is fingerprintable
+        assert measured['expected_reviewer_fingerprint'] == expected
+        assert measured['recorded_reviewer_fingerprint'] == recorded
 
 
 @pytest.mark.asyncio
