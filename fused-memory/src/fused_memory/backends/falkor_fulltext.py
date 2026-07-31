@@ -68,3 +68,40 @@ def is_searchable_term(token: str) -> bool:
     against token classes we failed to enumerate.
     """
     return any(ch.isalnum() for ch in token)
+
+
+def escape_group_id(group_id: str) -> str:
+    r"""Escape a group_id for use inside RediSearch's ``(@group_id:"...")`` filter.
+
+    Upstream emits ``f'(@group_id:"{gid}")'`` with a comment asserting the
+    quoting "prevents RediSearch syntax errors with reserved words like 'main'
+    or special characters like hyphens".  **The hyphen half of that claim is
+    wrong.**  Measured against a live FalkorDB (module v41800, 5/5 both
+    directions):
+
+    * ``(@group_id:"a-b") (alpha)``   → ``Syntax error``
+    * ``(@group_id:"a\-b") (alpha)``  → parses
+    * ``(@group_id:"q"uote") (alpha)``  → ``Syntax error`` (the bare ``"``
+      terminates the quoted filter early — a latent query-injection seam, since
+      the remainder of the group_id is then parsed as query syntax)
+    * ``(@group_id:"q\"uote") (alpha)`` → parses
+
+    Backslash is escaped **first** so a literal backslash in the input is not
+    confused with an escape this function itself introduced by the ``-``/``"``
+    rules.
+
+    Ordinary group_ids are unaffected: ``canonicalize_project_id`` folds ``-`` to
+    ``_`` at every backend entry (CGL seam S4 / task 2269), so no hyphenated or
+    quote-bearing group_id can reach the driver today.  This is therefore
+    defense-in-depth on the same code path, not a live bug fix — and
+    ``'dark_factory'`` round-trips byte-identically, so search behaviour for
+    every existing query is unchanged.
+
+    KNOWN NOT HANDLED (deliberate): a degenerate group_id containing no
+    alphanumeric character at all (e.g. literally ``_``) stays unparseable even
+    once escaped.  No such project_id exists.  Silently dropping the group
+    filter to rescue it would trade one loud, diagnosable failure for silently
+    unscoped cross-project search results — the exact trade the project's
+    loud-over-silent-degradation norm forbids.
+    """
+    return group_id.replace('\\', '\\\\').replace('"', '\\"').replace('-', '\\-')
