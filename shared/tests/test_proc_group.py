@@ -70,9 +70,195 @@ async def _spawn_sleeper_in(cwd) -> asyncio.subprocess.Process:
 
 
 def _kill_group(pgid: int) -> None:
-    """Best-effort SIGKILL of an entire process group (test cleanup)."""
+    """Best-effort SIGKILL of an entire process group (test cleanup).
+
+    Precondition: *pgid* must belong to a process known to be ALIVE
+    (not yet reaped).  os.killpg on a reaped pid can land on a
+    recycled, unrelated process group — the task 845 incident class
+    that shared.proc_group guards against with its
+    ``returncode is not None`` short-circuit.  For a child that exits
+    on its own, ``await proc.wait()`` is the correct cleanup; do not
+    reach for this helper.
+    """
     with contextlib.suppress(ProcessLookupError, OSError):
         os.killpg(pgid, signal.SIGKILL)
+
+
+class _TrapReadinessError(AssertionError):
+    """The SIGTERM-trap readiness precondition was not observed.
+
+    Subclasses AssertionError so an unmet precondition surfaces as a
+    test FAILURE (never a bare TimeoutError, never a silent return).
+    The concrete subclass — not the message text — is the contract:
+    callers/tests discriminate failure modes by type, so the
+    human-readable message stays free to change.
+    """
+
+
+class _TrapReadinessTimeout(_TrapReadinessError):
+    """No readiness line arrived within the bounded deadline."""
+
+
+class _TrapReadinessEOF(_TrapReadinessError):
+    """The child closed stdout before announcing readiness (early exit)."""
+
+
+async def _await_trap_installed(
+    proc: asyncio.subprocess.Process,
+    *,
+    # Must-not-hang guard, not a latency SLA — see task 3337 for the
+    # measured headroom and the derivation of this value.
+    timeout: float = 10.0,
+) -> None:
+    """Wait for a shell child to announce that its SIGTERM trap is armed.
+
+    Callers spawn a shell whose command starts with ``trap '' TERM; echo
+    ready; ...``.  Bash only reaches the ``echo`` once the preceding `trap`
+    builtin has returned, so observing the ``ready`` line on stdout is a
+    happens-before edge proving SIGTERM's disposition is already SIG_IGN in
+    the kernel — not a wall-clock guess about how long installation takes
+    (the fixed ``asyncio.sleep(0.2)`` this helper replaces was exactly such
+    a guess, and it starved under CPU oversubscription).  See task 3337 for
+    the measurement backing this claim (readiness latency and a direct
+    ``/proc/<pid>/status`` SigIgn check at the instant "ready" arrives).
+
+    Raises (never a bare ``TimeoutError``, and never returns normally) if
+    the precondition is not observed:
+    - ``_TrapReadinessTimeout`` — the deadline elapsed with no line.
+    - ``_TrapReadinessEOF`` — the child closed stdout (EOF) first, e.g. it
+      exited before reaching the ``echo``, which would otherwise look
+      identical to "line not yet available" and let a naive caller mistake
+      early-exit for a successfully armed trap.
+    - ``_TrapReadinessError`` — a line arrived but wasn't ``ready`` (compared
+      after stripping surrounding whitespace).
+
+    All three subclass ``AssertionError``; the concrete subclass is the
+    contract callers discriminate on, not the message text.
+    """
+    assert proc.stdout is not None
+    started = asyncio.get_running_loop().time()
+    try:
+        line = await asyncio.wait_for(proc.stdout.readline(), timeout)
+    except TimeoutError:
+        raise _TrapReadinessTimeout(
+            f'shell pid={proc.pid} never announced "ready" within {timeout}s '
+            f'(returncode={proc.returncode}) — the SIGTERM trap was never '
+            f'confirmed installed, so escalation cannot be tested'
+        ) from None
+    if not line:
+        raise _TrapReadinessEOF(
+            f'shell pid={proc.pid} closed stdout (EOF) after '
+            f'{asyncio.get_running_loop().time() - started:.3f}s without '
+            f'announcing "ready" (returncode={proc.returncode}) — it exited '
+            f'before installing the SIGTERM trap'
+        )
+    if line.strip() != b'ready':
+        raise _TrapReadinessError(
+            f'shell pid={proc.pid} announced {line!r}, expected "ready" '
+            f'(compared after stripping surrounding whitespace)'
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_await_trap_installed_fails_loudly_when_readiness_never_arrives():
+    """_await_trap_installed never silently returns and never lets a bare
+    TimeoutError escape when the readiness precondition is unmet — it must
+    raise instead.  This pins the no-silent-fail-soft contract so a future
+    starvation can't quietly regress this helper back into the racy
+    "signal anyway" behaviour this task removes.
+
+    Three sub-cases, discriminated by exception TYPE rather than message
+    prose (substring checks on wording are lock-in with false positives —
+    e.g. 'ready' also matches "already", 'closed' also matches
+    "disclosed"):
+
+    (a) the shell never announces readiness — readline() blocks until the
+        bounded deadline.  Must raise _TrapReadinessTimeout — never a bare
+        TimeoutError, and never a normal return.
+    (b) the shell exits immediately without announcing — readline() hits
+        EOF (returns b'') right away, well inside the deadline, which a
+        naive implementation would treat as success.  Must raise
+        _TrapReadinessEOF, a type distinct from (a)'s, so EOF can never be
+        silently reclassified as — or fall through to — a deadline expiry.
+    (c) the shell announces something other than "ready" — must raise the
+        base _TrapReadinessError and NEITHER subclass, so a wrong-content
+        line can't be misreported as a timeout or an EOF.
+
+    All three are AssertionError subclasses, which each sub-case confirms
+    directly: pytest.raises is keyed on the concrete type (the real
+    discrimination), and an accompanying check pins the cross-cutting
+    guarantee that these are test FAILUREs, never a leaked TimeoutError.
+    """
+    # (a) Never announces.
+    proc = await asyncio.create_subprocess_shell(
+        'exec sleep 30',
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        with pytest.raises(_TrapReadinessTimeout) as excinfo:
+            await _await_trap_installed(proc, timeout=0.3)
+        assert isinstance(excinfo.value, AssertionError)
+    finally:
+        if proc.returncode is None:
+            _kill_group(proc.pid)
+        with contextlib.suppress(Exception):
+            await proc.wait()
+
+    # (b) Dies before announcing.
+    proc2 = await asyncio.create_subprocess_shell(
+        'true',
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        # The discrimination this sub-case buys — EOF detected as EOF
+        # immediately, not swallowed and re-surfaced later as a deadline
+        # expiry (which would raise _TrapReadinessTimeout and fail this
+        # assertion) — holds for any non-expiring deadline; it doesn't
+        # pin a specific number.  Use the helper's own default rather
+        # than a tuned value so this test carries no wall-clock
+        # assumption of its own.
+        with pytest.raises(_TrapReadinessEOF) as excinfo2:
+            await _await_trap_installed(proc2)
+        assert isinstance(excinfo2.value, AssertionError)
+    finally:
+        # `true` has already exited: reap it rather than killpg-ing a pid
+        # the kernel may have recycled (task 845 incident class — see the
+        # shared.proc_group module docstring and
+        # test_no_killpg_after_explicit_reap below).  Measured: at the
+        # instant readline() returns b'', returncode is still None in
+        # ~1/3 of spawns, so a `returncode is None` gate would not close
+        # this window — only not signalling does.
+        with contextlib.suppress(Exception):
+            await proc2.wait()
+
+    # (c) Announces something other than "ready".
+    proc3 = await asyncio.create_subprocess_shell(
+        'echo nope; sleep 30',
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        with pytest.raises(_TrapReadinessError) as excinfo3:
+            await _await_trap_installed(proc3)
+        # Exact-type, not isinstance: _TrapReadinessTimeout and
+        # _TrapReadinessEOF are themselves _TrapReadinessError, so
+        # isinstance alone wouldn't prove THIS branch fired rather than
+        # one of the other two.
+        assert type(excinfo3.value) is _TrapReadinessError, (
+            f'expected the base _TrapReadinessError (not a subclass), got '
+            f'{type(excinfo3.value).__name__}'
+        )
+    finally:
+        if proc3.returncode is None:
+            _kill_group(proc3.pid)
+        with contextlib.suppress(Exception):
+            await proc3.wait()
 
 
 class TestTerminateProcessGroup:
@@ -108,7 +294,7 @@ class TestTerminateProcessGroup:
         )
 
     @pytest.mark.asyncio
-    @pytest.mark.timeout(10)
+    @pytest.mark.timeout(30)
     async def test_terminate_process_group_escalates_to_sigkill(self):
         """When the child ignores SIGTERM, SIGKILL fires after grace_secs.
 
@@ -116,17 +302,18 @@ class TestTerminateProcessGroup:
         SIGKILL should kill the group. proc.returncode == -9 (SIGKILL).
         """
         proc = await asyncio.create_subprocess_shell(
-            "trap '' TERM; sleep 30",
+            "trap '' TERM; echo ready; sleep 30",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
         )
         pgid = proc.pid
 
-        # Let the shell install the trap before we send SIGTERM; otherwise
-        # the signal may arrive during shell parsing and kill the shell
-        # directly (rc=-15) instead of being ignored.
-        await asyncio.sleep(0.2)
+        # The "ready" line is a happens-before edge proving `trap '' TERM`
+        # has already returned — i.e. SIGTERM's disposition is SIG_IGN
+        # before we signal — rather than a wall-clock assumption that a
+        # fixed sleep was long enough (task 3337 de-flake).
+        await _await_trap_installed(proc)
 
         await terminate_process_group(proc, pgid, grace_secs=0.5)
 
