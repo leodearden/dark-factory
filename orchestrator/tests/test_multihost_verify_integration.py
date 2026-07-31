@@ -1980,3 +1980,173 @@ class TestTwoHostFalseGreenCapstone:
 
         # (b4) distinct mismatch telemetry emitted through the real caller.
         assert es.events_of(EventType.verify_cross_check_mismatch)
+
+
+# ===========================================================================
+# task 3173 step-9: THE HEADLINE REGRESSION.
+#
+# The cross-check compares only `.passed` — a two-value comparison with no
+# INDETERMINATE arm.  So a local trust-anchor leg that was SIGKILLed at 0.31s
+# having emitted zero diagnostics is indistinguishable from a completed FAIL:
+# it takes the fail-CLOSED arm, quarantines the remote, files a blocking L1,
+# and ADOPTS the killed verdict — discarding host A's completed 1097s PASS
+# behind an already-built, already-verified merge commit (the measured case:
+# merge_sha b1ac2c7f).
+#
+# The block already holds two fail-SAFE precedents that do exactly the right
+# thing (RunnerUnavailable, MergeVerifyLeaseContended): both emit
+# verify_cross_check_inconclusive and keep the remote green.  An infra-killed
+# leg reaches neither, because it returns NORMALLY with passed=False.
+#
+# INVARIANT: only a COMPLETED failing verdict may veto a completed PASS.
+#
+# RED until step-10.
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+class TestIndeterminateLocalLegDoesNotVeto(TestPerLandCrossCheck):
+    """Inherits TestPerLandCrossCheck so the task-2822 fail-CLOSED contract is
+    re-run verbatim alongside the new arm — the two must coexist."""
+
+    @staticmethod
+    async def _drive(tmp_path, *, local_category: str, merge_sha: str):
+        """Remote PASS + local FAIL(*local_category*) through the real callee."""
+        from unittest.mock import patch
+
+        from orchestrator.merge_queue import _run_post_merge_verify
+
+        config = _xcheck_config(cross_check=True)
+        req = _xcheck_req(config, worktree=tmp_path)
+        git_ops = _xcheck_git_ops()
+
+        remote = _remote_stub(_make_result(True), name='laptop')
+        # Host B's leg: signal-killed at 0.31s, zero diagnostics on any leg.
+        local_fail = _make_result(False, category=local_category)
+        local_fail.test_output = ''
+        local_fail.lint_output = ''
+        local_fail.type_output = ''
+        local_fail.summary = (
+            'Failures: lint leg killed by signal 9 after 0.31s; '
+            'no diagnostics produced; verdict indeterminate'
+        )
+        eq = _FakeEscalationQueue()
+        es = _RecordingEventStore()
+        quarantine: set[str] = set()
+
+        lr_calls: list = []
+        with patch('orchestrator.merge_queue.LocalRunner',
+                   _local_runner_patch(result=local_fail, calls=lr_calls)), \
+             patch('orchestrator.merge_queue._classify_main_health_red',
+                   new=AsyncMock(return_value=None)):
+            outcome = await _run_post_merge_verify(
+                git_ops, req, tmp_path,
+                timeouts={}, enospc_retries={},
+                max_timeouts=2, max_enospc=1,
+                event_store=es,  # type: ignore[arg-type]
+                merge_sha=merge_sha,
+                runner=remote,
+                escalation_queue=eq,
+                quarantine=quarantine,
+            )
+        return outcome, git_ops, eq, es, quarantine, lr_calls
+
+    # -- the new INDETERMINATE arm ----------------------------------------
+
+    async def test_indeterminate_local_leg_does_not_veto_completed_remote_pass(self, tmp_path):
+        """THE MEASURED CASE: a killed local leg must not discard host A's
+        completed PASS, and must not blame the branch for it."""
+        outcome, git_ops, eq, es, quarantine, lr_calls = await self._drive(
+            tmp_path, local_category='infra_kill', merge_sha='b1ac2c7f',
+        )
+
+        # (1) the land PROCEEDS — the killed leg produced no verdict to veto with.
+        assert outcome is None, (
+            f'a leg that produced NO verdict must not block the land; got {outcome}'
+        )
+
+        # (2) the already-built, already-verified merge commit is NOT discarded.
+        git_ops.cleanup_merge_worktree.assert_not_awaited()
+
+        # (3) the remote host is not punished for the local host's kill.
+        assert quarantine == set()
+
+        # (4) no blocking escalation — nothing here needs a human.
+        assert eq.submitted == []
+
+        # (5) the cross-check DID run; it is recorded as inconclusive, not a mismatch.
+        assert len(lr_calls) == 1
+        inconclusive = es.events_of(EventType.verify_cross_check_inconclusive)
+        assert len(inconclusive) == 1, (
+            f'expected exactly one inconclusive event, got {es.events}'
+        )
+        data = inconclusive[0][2]
+        assert data['merge_sha'] == 'b1ac2c7f'
+        assert data['remote_runner'] == 'laptop'
+        assert 'infra_kill' in repr(data), (
+            f'the event must name the indeterminate category; got {data}'
+        )
+        assert es.events_of(EventType.verify_cross_check_mismatch) == []
+
+    async def test_arm_keys_off_the_registry_not_a_hardcoded_infra_kill(self, tmp_path):
+        """disk_full is equally verdict-less: the arm must read
+        INDETERMINATE_VERDICT_CATEGORIES, not a literal."""
+        outcome, git_ops, eq, es, quarantine, _ = await self._drive(
+            tmp_path, local_category='disk_full', merge_sha='deadbeef',
+        )
+        assert outcome is None
+        git_ops.cleanup_merge_worktree.assert_not_awaited()
+        assert quarantine == set()
+        assert eq.submitted == []
+        assert len(es.events_of(EventType.verify_cross_check_inconclusive)) == 1
+        assert es.events_of(EventType.verify_cross_check_mismatch) == []
+
+    async def test_every_indeterminate_category_is_covered(self, tmp_path):
+        """Whatever the registry holds, the arm honours it — so a future row
+        cannot be added to the registry and silently miss this path."""
+        from orchestrator.verify_categories import INDETERMINATE_VERDICT_CATEGORIES
+
+        assert INDETERMINATE_VERDICT_CATEGORIES, 'registry must not be empty'
+        for i, category in enumerate(sorted(INDETERMINATE_VERDICT_CATEGORIES)):
+            outcome, _, eq, es, quarantine, _ = await self._drive(
+                tmp_path, local_category=str(category), merge_sha=f'sha{i:04d}',
+            )
+            assert outcome is None, f'{category} must not veto a completed PASS'
+            assert quarantine == set(), f'{category} must not quarantine the remote'
+            assert eq.submitted == [], f'{category} must not escalate'
+            assert es.events_of(EventType.verify_cross_check_mismatch) == [], category
+
+    # -- CONTROLS: the task-2822 fail-CLOSED contract is fully intact -------
+
+    @pytest.mark.parametrize('category', ['test_failure', 'infra_timeout'])
+    async def test_completed_fail_and_local_timeout_still_veto(self, tmp_path, category):
+        """A genuine completed FAIL still vetoes — and so does a local TIMEOUT,
+        which is deliberately EXCLUDED from the registry because a hang is one
+        of the few non-completions a branch can genuinely cause."""
+        outcome, git_ops, eq, es, quarantine, _ = await self._drive(
+            tmp_path, local_category=category, merge_sha='ctrl0001',
+        )
+        assert outcome is not None, f'{category} must still withhold the land'
+        assert outcome.status == 'blocked'
+        git_ops.cleanup_merge_worktree.assert_awaited()
+        assert 'laptop' in quarantine
+        mismatch = [
+            e for e in eq.submitted
+            if getattr(e, 'category', None) == 'verify_cross_check_mismatch'
+        ]
+        assert len(mismatch) == 1, f'expected 1 mismatch escalation, got {eq.submitted}'
+        assert mismatch[0].severity == 'blocking'
+        assert mismatch[0].level == 1
+        assert es.events_of(EventType.verify_cross_check_mismatch)
+        assert es.events_of(EventType.verify_cross_check_inconclusive) == []
+
+    async def test_uncategorised_local_fail_still_vetoes(self, tmp_path):
+        """An empty category is not a licence to land: fail CLOSED."""
+        outcome, _, eq, es, quarantine, _ = await self._drive(
+            tmp_path, local_category='', merge_sha='ctrl0002',
+        )
+        assert outcome is not None
+        assert outcome.status == 'blocked'
+        assert 'laptop' in quarantine
+        assert len(eq.submitted) == 1
+        assert es.events_of(EventType.verify_cross_check_mismatch)
