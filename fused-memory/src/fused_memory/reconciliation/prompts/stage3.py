@@ -29,13 +29,16 @@ Your findings will be addressed in the next reconciliation cycle's Stage 1 and S
   get_tasks, ~62 KB vs ~600 KB). **Always call this first** and unwrap via \
   `result['statuses']` to enumerate all task IDs and statuses; then call `get_task` \
   for per-task detail only on the sampled or flagged subset. \
-  **Paginate on large projects:** pass `page_size` and `offset` — \
+  **Always paginate:** pass `page_size` and `offset` on every call — \
   `get_statuses(project_root=..., page_size=1000, offset=0)` — then increment offset \
   by page_size until `pagination['has_more']` is False, merging the pages into one \
-  status map before enumerating. If you call it WITHOUT `page_size` on a project above \
-  the auto-page limit, you get back only a FIRST PAGE plus a `pagination` dict with \
-  `auto_paginated: true` and `has_more: true` — that is NOT the full census, so keep \
-  paging. The ABSENCE of a `pagination` key means the response is complete.
+  status map before enumerating. Do NOT rely on an un-paginated call: it does not \
+  truncate for you, so on a large project the whole response can exceed the transport \
+  limit and you get back NOTHING at all. If you cannot know the project size in \
+  advance, `auto_paginate=true` is an opt-in one-shot fallback — it returns a FIRST \
+  PAGE plus a `pagination` dict with `auto_paginated: true` and `has_more: true`, \
+  which is NOT the full census, so you must keep paging from there anyway. Prefer the \
+  loop. The ABSENCE of a `pagination` key means the response is complete.
 - `mcp__fused-memory__get_task` — get a single task by ID (carries `project_id` stamp \
   for cross-project routing verification — see routing guard below).
 - `mcp__fused-memory__get_tasks` — **Full-scan fallback only.** Returns the full task \

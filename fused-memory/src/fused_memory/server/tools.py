@@ -371,7 +371,7 @@ Read operations:
 
 Task operations (when Taskmaster is connected):
 - get_tasks / get_task: Read task tree
-- get_statuses: Compact {id: status} mapping (~95% smaller than get_tasks) for status-only callers; pass page_size/offset to paginate (large projects are auto-paged — see the tool docstring)
+- get_statuses: Compact {id: status} mapping (~95% smaller than get_tasks) for status-only callers; pass page_size/offset to paginate, with auto_paginate=True as an opt-in first-page fallback (never automatic — see the tool docstring)
 - search_tasks: Semantic search over already-filed tasks (ranked by similarity, enriched with current status) — use to check if a task like X was already filed
 - set_task_status: Update status (triggers reconciliation for done/blocked/cancelled)
 - update_task / remove_task: Task CRUD
