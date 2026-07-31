@@ -169,20 +169,28 @@ async def test_await_trap_installed_returns_once_shell_armed():
 async def test_await_trap_installed_fails_loudly_when_readiness_never_arrives():
     """_await_trap_installed never silently returns and never lets a bare
     TimeoutError escape when the readiness precondition is unmet — it must
-    raise a diagnostic AssertionError instead.  This pins the
-    no-silent-fail-soft contract so a future starvation can't quietly
-    regress this helper back into the racy "signal anyway" behaviour this
-    task removes.
+    raise instead.  This pins the no-silent-fail-soft contract so a future
+    starvation can't quietly regress this helper back into the racy
+    "signal anyway" behaviour this task removes.
 
-    Two sub-cases:
+    Two sub-cases, discriminated by exception TYPE rather than message
+    prose (substring checks on wording are lock-in with false positives —
+    e.g. 'ready' also matches "already", 'closed' also matches
+    "disclosed"):
+
     (a) the shell never announces readiness — readline() blocks until the
-        bounded deadline.  Must raise AssertionError (NOT a bare
-        TimeoutError) naming the pid and the unmet "ready" precondition.
+        bounded deadline.  Must raise _TrapReadinessTimeout — never a bare
+        TimeoutError, and never a normal return.
     (b) the shell exits immediately without announcing — readline() hits
         EOF (returns b'') right away, well inside the deadline, which a
         naive implementation would treat as success.  Must raise
-        AssertionError whose message distinguishes EOF/early-exit from a
-        timeout.
+        _TrapReadinessEOF, a type distinct from (a)'s, so EOF can never be
+        silently reclassified as — or fall through to — a deadline expiry.
+
+    Both are AssertionError subclasses, which each sub-case confirms
+    directly: pytest.raises is keyed on the concrete subclass (the real
+    discrimination), and the isinstance check pins the cross-cutting
+    guarantee that these are test FAILUREs, not a leaked TimeoutError.
     """
     # (a) Never announces.
     proc = await asyncio.create_subprocess_shell(
@@ -192,13 +200,9 @@ async def test_await_trap_installed_fails_loudly_when_readiness_never_arrives():
         start_new_session=True,
     )
     try:
-        with pytest.raises(AssertionError) as excinfo:
+        with pytest.raises(_TrapReadinessTimeout) as excinfo:
             await _await_trap_installed(proc, timeout=0.3)
-        msg = str(excinfo.value)
-        assert 'ready' in msg and str(proc.pid) in msg, (
-            f'expected message to name the unmet "ready" precondition and '
-            f'pid {proc.pid}; got: {msg!r}'
-        )
+        assert isinstance(excinfo.value, AssertionError)
     finally:
         _kill_group(proc.pid)
         with contextlib.suppress(Exception):
@@ -212,13 +216,14 @@ async def test_await_trap_installed_fails_loudly_when_readiness_never_arrives():
         start_new_session=True,
     )
     try:
-        with pytest.raises(AssertionError) as excinfo2:
+        # timeout=5.0 is load-bearing, not arbitrary: it proves EOF is
+        # detected as EOF immediately rather than being swallowed and
+        # re-surfacing later as a deadline expiry — an implementation that
+        # fell through to the timeout path would raise
+        # _TrapReadinessTimeout here and fail this assertion.
+        with pytest.raises(_TrapReadinessEOF) as excinfo2:
             await _await_trap_installed(proc2, timeout=5.0)
-        msg2 = str(excinfo2.value)
-        assert any(word in msg2.lower() for word in ('eof', 'exited', 'closed')), (
-            f'expected message to distinguish EOF/early-exit from a plain '
-            f'timeout; got: {msg2!r}'
-        )
+        assert isinstance(excinfo2.value, AssertionError)
     finally:
         _kill_group(proc2.pid)
         with contextlib.suppress(Exception):
