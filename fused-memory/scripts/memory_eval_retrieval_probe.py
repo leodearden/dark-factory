@@ -1589,6 +1589,17 @@ def _disclosure_counts(observations: ProbeObservations) -> dict[str, int]:
     reads the JSON — which is all of them. ``corpus.counts`` is free-form
     category -> size by design (its docstring: the bucket vocabulary is not
     this schema's to own), so it is where a per-run disclosure belongs.
+
+    **Every per-observation key names its depth.** Each query produces one
+    observation per ``k``, so on the default ``(5, 10)`` run an unsuffixed
+    tally counted every query twice — against a ``canonical-in-top-5`` whose
+    ``n`` counts it once. Worse, ``stores_served`` is computed over
+    ``results[:k]``, so a store appearing only at ranks 6-10 was credited in
+    the k=10 tally and not the k=5 one: the two numbers under one key came
+    from different slice depths. A consumer comparing them to a rate's
+    denominator got a 2x mismatch with nothing in the artifact saying why,
+    which is the uninterpretable-rate hazard this disclosure exists to
+    prevent. Suffixing makes each number comparable to exactly one metric.
     """
     counts = {
         'contamination_scored_results': sum(
@@ -1600,19 +1611,23 @@ def _disclosure_counts(observations: ProbeObservations) -> dict[str, int]:
         'claim_queries_unscorable': sum(
             1 for c in observations.claims if not c.degraded and not c.scorable
         ),
-        'degraded_observations': sum(
-            1 for o in observations.phrasings if o.degraded
-        ),
+        # Per QUERY, not per observation: a degraded search is one event
+        # whatever depth it is later scored at, and this is the number the
+        # degraded-queries report section enumerates.
+        'degraded_queries': len(observations.degraded_queries),
     }
-    # Which store answered, per observation. An observation served by a store
-    # the canonical does not live in cannot hit however healthy retrieval is,
-    # so a canonical-in-top-k rate is uninterpretable without this — and a
-    # consumer reading only the JSON would never see it said in prose.
+    # Which store answered, and how many observations degraded, at each depth.
+    # An observation served by a store the canonical does not live in cannot
+    # hit however healthy retrieval is, so a canonical-in-top-k rate is
+    # uninterpretable without this — and a consumer reading only the JSON
+    # would never see it said in prose.
     for observation in observations.phrasings:
         if observation.degraded:
+            key = f'degraded_observations_at_k{observation.k}'
+            counts[key] = counts.get(key, 0) + 1
             continue
         for store in observation.stores_served:
-            key = f'observations_served_by_{store}'
+            key = f'observations_served_by_{store}_at_k{observation.k}'
             counts[key] = counts.get(key, 0) + 1
     return counts
 

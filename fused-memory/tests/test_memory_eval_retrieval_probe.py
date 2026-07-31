@@ -2214,7 +2214,8 @@ class TestDegradedSearchDisclosure:
         metrics_path, _ = m.emit_series(series, tmp_path)
 
         assert load_metric_series(metrics_path) == series
-        assert series.corpus.counts['degraded_observations'] > 0
+        assert series.corpus.counts['degraded_queries'] > 0
+        assert series.corpus.counts['degraded_observations_at_k5'] > 0
 
     @pytest.mark.asyncio
     async def test_the_report_names_the_failed_stores_and_the_not_measured_topics(self):
@@ -3020,7 +3021,7 @@ class TestCorpusCounting:
         _, outcome = self._run_counts(tmp_path, {})
 
         assert 'contamination_untopiced_results' in outcome.series.corpus.counts
-        assert 'degraded_observations' in outcome.series.corpus.counts
+        assert 'degraded_queries' in outcome.series.corpus.counts
 
 
 class TestArgparseBand:
@@ -3697,8 +3698,78 @@ class TestStoresServedDisclosure:
         ])
         counts = _build(observations).corpus.counts
 
-        assert counts['observations_served_by_mem0'] == 1
-        assert counts['observations_served_by_graphiti'] == 1
+        assert counts['observations_served_by_mem0_at_k5'] == 1
+        assert counts['observations_served_by_graphiti_at_k5'] == 1
+
+    def test_the_served_store_tally_is_comparable_to_one_rates_denominator(self):
+        """Each query yields one observation per k, so an unsuffixed tally
+        double-counted on the default (5, 10) run — against a
+        canonical-in-top-5 whose n counts each query once. A consumer
+        comparing the two got a 2x mismatch with nothing in the artifact
+        saying why, which is the uninterpretable-rate hazard the disclosure
+        exists to prevent."""
+        m = _mod()
+        # Two queries, each served by exactly one store, each scored at both
+        # depths — the shape where the tally and the denominator SHOULD agree.
+        observations = m.ProbeObservations(phrasings=[
+            m.PhrasingObservation(
+                topic='a', phrasing=phrasing, held_out=held_out, k=k, hit=True,
+                rank=1, matched_by=m.MATCHED_BY_CONTENT_HASH,
+                stores_served=('mem0',),
+            )
+            for phrasing, held_out in (('tuned', False), ('held out', True))
+            for k in (5, 10)
+        ])
+        series = _build(observations)
+        counts = series.corpus.counts
+        by_id = {metric.metric_id: metric for metric in series.metrics}
+
+        for k in (5, 10):
+            served = sum(
+                value for key, value in counts.items()
+                if key.startswith('observations_served_by_')
+                and key.endswith(f'_at_k{k}')
+            )
+            assert served == by_id[f'canonical-in-top-{k}'].n == 2
+
+    def test_a_store_seen_only_below_k_five_is_credited_at_the_right_depth(self):
+        """stores_served is computed over results[:k], so the SAME query can
+        report different served sets at different depths. Under one key those
+        two facts were indistinguishable."""
+        m = _mod()
+        observations = m.ProbeObservations(phrasings=[
+            m.PhrasingObservation(
+                topic='a', phrasing='h', held_out=True, k=5, hit=True, rank=1,
+                matched_by=m.MATCHED_BY_CONTENT_HASH, stores_served=('mem0',),
+            ),
+            m.PhrasingObservation(
+                topic='a', phrasing='h', held_out=True, k=10, hit=True, rank=1,
+                matched_by=m.MATCHED_BY_CONTENT_HASH,
+                stores_served=('graphiti', 'mem0'),
+            ),
+        ])
+        counts = _build(observations).corpus.counts
+
+        assert 'observations_served_by_graphiti_at_k5' not in counts
+        assert counts['observations_served_by_graphiti_at_k10'] == 1
+
+    def test_a_degraded_query_is_counted_once_whatever_depth_it_is_scored_at(self):
+        """A store outage is one event, not one per k."""
+        m = _mod()
+        observations = m.ProbeObservations(
+            phrasings=[
+                _phrasing_obs('a', 'h', k=k, held_out=True, degraded=True)
+                for k in (5, 10)
+            ],
+            degraded_queries=[m.DegradedQuery(
+                topic='a', query='h', failed_stores=('mem0',),
+            )],
+        )
+        counts = _build(observations).corpus.counts
+
+        assert counts['degraded_queries'] == 1
+        assert counts['degraded_observations_at_k5'] == 1
+        assert counts['degraded_observations_at_k10'] == 1
 
     def test_the_probe_band_records_both_exposures_distinctly(self):
         """Registered pairs and comparable pairs are different facts.
