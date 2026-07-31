@@ -1802,6 +1802,337 @@ _KNOWN_BAD_ROUTING_CAVEAT = (
 )
 
 
+SECTION_METRIC_TABLE = 'metric-table'
+SECTION_INITIAL_STATE = 'initial-state'
+SECTION_KNOWN_BAD_ROUTING_CAVEAT = 'initial-state-routing-caveat'
+SECTION_KNOWN_BAD_ITEMS = 'initial-state-known-bad-items'
+SECTION_DEGRADED_QUERIES = 'degraded-queries'
+SECTION_TOPICS_NOT_MEASURED = 'topics-not-measured'
+SECTION_UNMATCHED_CANONICALS = 'canonicals-matched-by-neither-key'
+SECTION_HASH_REPAIRS = 'canonicals-matched-by-last-known-id-only'
+SECTION_CLAIMS_NOT_RECALLED = 'claims-not-recalled'
+SECTION_MATCHED_BY = 'matched-by-breakdown'
+SECTION_STORES_SERVED = 'stores-served-breakdown'
+SECTION_CONTAMINATION = 'contamination-classification'
+SECTION_CORPUS_COUNT_SCOPE = 'corpus-count-scope'
+SECTION_MEASUREMENT_DEPTH = 'measurement-depth'
+SECTION_TOPICS_NOT_PROBED = 'topics-not-probed'
+SECTION_REGISTRY_COMPOSITION = 'registry-composition'
+SECTION_SUPERSEDED_INVERSIONS = 'superseded-inversions'
+
+
+@dataclass(frozen=True)
+class ReportSection:
+    """One block of the human report, under a STABLE machine key.
+
+    The key is never rendered — it exists so a caller can ask WHICH blocks a
+    report carries and in what order without matching on the English inside
+    them. Prose is the part of this module expected to be reworded, and a
+    check that keys on prose constrains wording rather than behaviour; this
+    file already deleted one banned-substring sweep for that reason, and the
+    positive form of the same check has no better claim. Keying on the
+    structure keeps the disclosure guarantees falsifiable: a section that
+    stops being emitted, or is emitted on the wrong run, or lands below the
+    thing it qualifies, fails — and a copy edit does not.
+    """
+
+    key: str
+    lines: tuple[str, ...]
+
+    @property
+    def text(self) -> str:
+        return '\n'.join(self.lines)
+
+
+def probe_report_sections(
+    series,
+    observations: ProbeObservations,
+    *,
+    is_initial_run: bool = False,
+    registry: TopicRegistry | None = None,
+    skipped_topics: tuple[str, ...] = (),
+    requested_ks: tuple[int, ...] = (),
+    measured_ks: tuple[int, ...] = (),
+) -> tuple[ReportSection, ...]:
+    """The report, decomposed — see :func:`render_probe_report` for the prose.
+
+    THE single source of both: :func:`render_probe_report` joins what this
+    returns, so a section present here is present there by construction and
+    the two cannot drift into disagreeing about what the run disclosed.
+    """
+    from shared.memory_eval_metrics import render_report  # noqa: PLC0415
+
+    sections: list[ReportSection] = []
+
+    def emit(key: str, lines: list[str]) -> None:
+        sections.append(ReportSection(key=key, lines=tuple(lines)))
+
+    emit(SECTION_METRIC_TABLE, [render_report(series).rstrip('\n')])
+
+    if is_initial_run:
+        failing = [
+            item.item_key
+            for metric in series.metrics
+            if metric.metric_id == METRIC_TOPIC_CANONICAL_PRESENT
+            for item in (metric.items or [])
+            if not item.passed
+        ]
+        header = ['']
+        header.append(f'INITIAL STATE — known-bad items ({len(failing)}):')
+        for chunk in _wrap(_KNOWN_BAD_PREAMBLE):
+            header.append(f'  {chunk}')
+        emit(SECTION_INITIAL_STATE, header)
+
+        # The routing caveat is repeated HERE, not left to the store breakdown
+        # ~150 lines below, because this is the section an operator reads on the
+        # one run it matters for. The first live baseline came back 72/78
+        # observations served by Graphiti and 72/78 unmatched; a reader who
+        # stops at the headline rate takes a router property for a corpus-wide
+        # findability collapse (esc-3208-1). It is its OWN section so that
+        # placement — above the item list it qualifies — is a structural fact a
+        # caller can check, rather than something only a prose search can see.
+        caveat = ['']
+        for chunk in _wrap(_KNOWN_BAD_ROUTING_CAVEAT):
+            caveat.append(f'  {chunk}')
+        emit(SECTION_KNOWN_BAD_ROUTING_CAVEAT, caveat)
+
+        items = ['']
+        items.extend(f'  - {key}' for key in failing)
+        if not failing:
+            items.append('  (no tripwire item is failing in this initial run)')
+        emit(SECTION_KNOWN_BAD_ITEMS, items)
+
+    if observations.degraded_queries:
+        lines = ['']
+        lines.append(f'degraded queries ({len(observations.degraded_queries)}):')
+        lines.append(
+            '  These searches reported a failed store. Their observations are '
+            'EXCLUDED from every denominator above — an outage is not a '
+            'retrieval regression.'
+        )
+        for record in observations.degraded_queries:
+            stores = ', '.join(record.failed_stores) or 'unnamed store'
+            lines.append(f'  - [{record.topic}] {record.query!r}: failed stores: {stores}')
+            for diagnostic in record.diagnostics:
+                rendered = ', '.join(
+                    f'{k}={v}' for k, v in sorted(diagnostic.items())
+                )
+                lines.append(f'      {rendered}')
+        emit(SECTION_DEGRADED_QUERIES, lines)
+
+    unmeasured = not_measured_topics(observations)
+    if unmeasured:
+        lines = ['']
+        lines.append(f'topics NOT MEASURED this run ({len(unmeasured)}):')
+        lines.append(
+            '  Every phrasing degraded, so these topics carry no tripwire item. '
+            'They are not passing and not failing — they were not measured.'
+        )
+        lines.extend(f'  - {topic}' for topic in unmeasured)
+        emit(SECTION_TOPICS_NOT_MEASURED, lines)
+
+    unmatched_stores: dict[str, set[str]] = {}
+    for obs in observations.phrasings:
+        if obs.degraded or not obs.unmatched:
+            continue
+        unmatched_stores.setdefault(obs.topic, set()).update(obs.stores_served)
+    unmatched = sorted(unmatched_stores)
+    if unmatched:
+        lines = ['']
+        lines.append(f'canonicals matched by NEITHER key ({len(unmatched)}):')
+        for chunk in _wrap(
+            'Neither the content hash nor last_known_id matched anything '
+            'returned. Either the entry is genuinely unfindable, the query '
+            'was routed to a store the entry does not live in, or the '
+            'registry fixture has decayed past both keys — the serving store '
+            'is named per topic so an operator can tell those apart rather '
+            'than guessing between them.'
+        ):
+            lines.append(f'  {chunk}')
+        lines.extend(
+            f'  - {topic} (served by: {", ".join(sorted(unmatched_stores[topic])) or "nothing"})'
+            for topic in unmatched
+        )
+        emit(SECTION_UNMATCHED_CANONICALS, lines)
+
+    repairs = sorted({
+        obs.topic for obs in observations.phrasings
+        if not obs.degraded and obs.needs_hash_repair
+    })
+    if repairs:
+        lines = ['']
+        lines.append(f'canonicals matched by last_known_id only ({len(repairs)}):')
+        lines.append(
+            '  The content hash missed but the id hit: the stored text changed. '
+            'Counted as a hit (the entry IS findable) and reported so the '
+            'fixture can be re-hashed — a probe that silently rewrote its own '
+            'expectations could never fail.'
+        )
+        lines.extend(f'  - {topic}' for topic in repairs)
+        emit(SECTION_HASH_REPAIRS, lines)
+
+    missing_claims = [
+        obs for obs in observations.claims
+        if not obs.degraded and obs.scorable and not obs.recalled
+    ]
+    if missing_claims:
+        lines = ['']
+        lines.append(f'claims not recalled ({len(missing_claims)}):')
+        for obs in missing_claims:
+            needles = ', '.join(repr(n) for n in obs.missing_needles)
+            lines.append(f'  - [{obs.topic}] {obs.query!r}: missing {needles}')
+        emit(SECTION_CLAIMS_NOT_RECALLED, lines)
+
+    scored = [obs for obs in observations.phrasings if not obs.degraded]
+    if scored:
+        by_matcher: dict[str, int] = {
+            MATCHED_BY_CONTENT_HASH: 0, MATCHED_BY_LAST_KNOWN_ID: 0, 'unmatched': 0,
+        }
+        for obs in scored:
+            by_matcher[obs.matched_by or 'unmatched'] += 1
+        lines = ['']
+        lines.append('how the canonical was matched (observations):')
+        for chunk in _wrap(
+            'The registry keys a canonical by content hash first because memory '
+            'UUIDs rot on re-consolidation, with last_known_id as a disclosed '
+            'fallback. Which matcher fired is a fixture-health signal: a run '
+            'drifting toward last_known_id needs re-hashing, and unmatched '
+            'entries are either genuinely gone or keyed past both.'
+        ):
+            lines.append(f'  {chunk}')
+        for matcher, count in by_matcher.items():
+            lines.append(f'  {matcher}: {count}')
+        emit(SECTION_MATCHED_BY, lines)
+
+        by_store: dict[str, int] = {}
+        for obs in scored:
+            for store in obs.stores_served:
+                by_store[store] = by_store.get(store, 0) + 1
+        lines = ['']
+        lines.append('which store served the query (observations):')
+        for chunk in _wrap(
+            'MemoryService.search routes: the read router picks a store set '
+            'per query, and the lists come back homogeneous. A phrasing served '
+            'entirely by Graphiti cannot contain a Mem0 entry\'s raw content — '
+            'Graphiti returns LLM-extracted edge facts — so its canonical is '
+            'unfindable there however healthy retrieval is. The probe does not '
+            'pin stores, because an agent\'s search is routed too; it reports '
+            'the routing instead, so a rate is never read as a corpus finding '
+            'when it is a routing one.'
+        ):
+            lines.append(f'  {chunk}')
+        for store, count in sorted(by_store.items()):
+            lines.append(f'  {store}: {count}')
+        emit(SECTION_STORES_SERVED, lines)
+
+    contamination = [c for c in observations.contamination if not c.degraded]
+    if contamination:
+        untopiced = sum(c.untopiced_count for c in contamination)
+        total = sum(c.scored_total for c in contamination)
+        foreign = sum(c.foreign_count for c in contamination)
+        lines = ['']
+        lines.append('contamination classification:')
+        lines.append(f'  scored results: {total}')
+        lines.append(f'  foreign (a DIFFERENT registered topic): {foreign}')
+        lines.append(f'  untopiced (no topic, or one this registry does not know): {untopiced}')
+        for chunk in _wrap(
+            'Untopiced results are NOT counted as contamination. The census '
+            'measured 491 of 49,628 entries carrying a topic at all, so '
+            'treating an unstamped result as foreign would measure stamping '
+            'coverage while claiming to measure contamination. As 3195/3201 '
+            'widen the vocabulary this remainder shrinks and the share reaches '
+            'further, with no change to how it is computed.'
+        ):
+            lines.append(f'  {chunk}')
+        emit(SECTION_CONTAMINATION, lines)
+
+    graphiti_primary = ', '.join(graphiti_primary_categories())
+    lines = ['']
+    lines.append('what the corpus counts cover:')
+    for chunk in _wrap(
+        'The per-category sizes above come from count_memories_by_metadata, '
+        'which is an exact Qdrant payload count — a MEM0-SIDE count. The '
+        f'Graphiti-primary categories ({graphiti_primary}) therefore read near '
+        'zero here even when the graph holds thousands: the number is honest '
+        'about what was counted and would be misleading about what exists, so '
+        'it says which it is. The metrics above are unaffected — they are '
+        'computed over what search returned, not over these counts.'
+    ):
+        lines.append(f'  {chunk}')
+    emit(SECTION_CORPUS_COUNT_SCOPE, lines)
+
+    if measured_ks and tuple(requested_ks) != tuple(measured_ks):
+        added = ', '.join(
+            str(k) for k in measured_ks if k not in set(requested_ks)
+        )
+        lines = ['']
+        lines.append(
+            'measurement depth '
+            f'(requested {", ".join(str(k) for k in requested_ks) or "nothing"}; '
+            f'measured {", ".join(str(k) for k in measured_ks)}):'
+        )
+        for chunk in _wrap(
+            f'--k selects the depths canonical-in-top-k is scored at. k={added} '
+            'was added to this run because two metrics are DEFINED at it and '
+            'cannot be computed without it: the '
+            f'{METRIC_TOPIC_CANONICAL_PRESENT} tripwire and '
+            f'{METRIC_CANONICAL_IN_TOP_K_HELD_OUT.format(k=TRIPWIRE_K)}. A run '
+            'that dropped them would not fail — leaf α joins a run to its '
+            'baseline window by metric_id, so they would simply stop being '
+            'trended. Measuring a depth nobody asked for is a narrowing like '
+            'any other, so it is said here rather than left to be inferred '
+            'from which metrics happen to be present.'
+        ):
+            lines.append(f'  {chunk}')
+        emit(SECTION_MEASUREMENT_DEPTH, lines)
+
+    if skipped_topics:
+        lines = ['']
+        lines.append(f'topics NOT PROBED this run ({len(skipped_topics)}):')
+        for chunk in _wrap(
+            'These registry entries belong to a project this run did not '
+            'select with --project-id. They are absent from every metric '
+            'above. Said out loud because a narrowed run and a shrunken '
+            'registry produce the same numbers, and only one of them is a '
+            'measurement problem.'
+        ):
+            lines.append(f'  {chunk}')
+        lines.extend(f'  - {topic}' for topic in skipped_topics)
+        emit(SECTION_TOPICS_NOT_PROBED, lines)
+
+    if registry is not None:
+        composition: dict[str, int] = {}
+        for entry in registry.entries:
+            composition[entry.derived_from] = composition.get(entry.derived_from, 0) + 1
+        lines = ['']
+        lines.append(f'registry composition ({len(registry.entries)} topics):')
+        for source, count in sorted(composition.items()):
+            lines.append(f'  {source}: {count}')
+        if registry.disclosures:
+            lines.append('  what derivation left out:')
+            for key, value in sorted(registry.disclosures.items()):
+                lines.append(f'    {key}: {value}')
+        emit(SECTION_REGISTRY_COMPOSITION, lines)
+
+    inversion_records = [
+        record
+        for obs in observations.inversions if not obs.degraded
+        for record in obs.inversions
+    ]
+    if inversion_records:
+        lines = ['']
+        lines.append(f'superseded entries outranking their successor ({len(inversion_records)}):')
+        for record in inversion_records:
+            lines.append(
+                f'  - [{record.topic}] {record.phrasing!r}: '
+                f'{record.superseded_hash} (rank {record.superseded_rank}) above '
+                f'{record.successor_hash} (rank {record.successor_rank})'
+            )
+        emit(SECTION_SUPERSEDED_INVERSIONS, lines)
+
+    return tuple(sections)
+
+
 def render_probe_report(
     series,
     observations: ProbeObservations,
@@ -1828,253 +2159,29 @@ def render_probe_report(
     Nothing here adjudicates. No bound, no ratchet and no pass/fail verdict
     appears in this output, because all of that belongs to leaf α's evaluator
     (G6/D1) and a second home for it would drift from the first.
+
+    A pure join of :func:`probe_report_sections` — which sections exist, and
+    under what conditions, lives there and only there.
     """
-    from shared.memory_eval_metrics import render_report  # noqa: PLC0415
+    return join_report_sections(probe_report_sections(
+        series,
+        observations,
+        is_initial_run=is_initial_run,
+        registry=registry,
+        skipped_topics=skipped_topics,
+        requested_ks=requested_ks,
+        measured_ks=measured_ks,
+    ))
 
-    lines = [render_report(series).rstrip('\n')]
 
-    if is_initial_run:
-        failing = [
-            item.item_key
-            for metric in series.metrics
-            if metric.metric_id == METRIC_TOPIC_CANONICAL_PRESENT
-            for item in (metric.items or [])
-            if not item.passed
-        ]
-        lines.append('')
-        lines.append(f'INITIAL STATE — known-bad items ({len(failing)}):')
-        for chunk in _wrap(_KNOWN_BAD_PREAMBLE):
-            lines.append(f'  {chunk}')
-        # The routing caveat is repeated HERE, not left to the store breakdown
-        # ~150 lines below, because this is the section an operator reads on the
-        # one run it matters for. The first live baseline came back 72/78
-        # observations served by Graphiti and 72/78 unmatched; a reader who
-        # stops at the headline rate takes a router property for a corpus-wide
-        # findability collapse (esc-3208-1).
-        lines.append('')
-        for chunk in _wrap(_KNOWN_BAD_ROUTING_CAVEAT):
-            lines.append(f'  {chunk}')
-        lines.append('')
-        lines.extend(f'  - {key}' for key in failing)
-        if not failing:
-            lines.append('  (no tripwire item is failing in this initial run)')
+def join_report_sections(sections: tuple[ReportSection, ...]) -> str:
+    """Render *sections* to the report text an operator reads.
 
-    if observations.degraded_queries:
-        lines.append('')
-        lines.append(f'degraded queries ({len(observations.degraded_queries)}):')
-        lines.append(
-            '  These searches reported a failed store. Their observations are '
-            'EXCLUDED from every denominator above — an outage is not a '
-            'retrieval regression.'
-        )
-        for record in observations.degraded_queries:
-            stores = ', '.join(record.failed_stores) or 'unnamed store'
-            lines.append(f'  - [{record.topic}] {record.query!r}: failed stores: {stores}')
-            for diagnostic in record.diagnostics:
-                rendered = ', '.join(
-                    f'{k}={v}' for k, v in sorted(diagnostic.items())
-                )
-                lines.append(f'      {rendered}')
-
-    unmeasured = not_measured_topics(observations)
-    if unmeasured:
-        lines.append('')
-        lines.append(f'topics NOT MEASURED this run ({len(unmeasured)}):')
-        lines.append(
-            '  Every phrasing degraded, so these topics carry no tripwire item. '
-            'They are not passing and not failing — they were not measured.'
-        )
-        lines.extend(f'  - {topic}' for topic in unmeasured)
-
-    unmatched_stores: dict[str, set[str]] = {}
-    for obs in observations.phrasings:
-        if obs.degraded or not obs.unmatched:
-            continue
-        unmatched_stores.setdefault(obs.topic, set()).update(obs.stores_served)
-    unmatched = sorted(unmatched_stores)
-    if unmatched:
-        lines.append('')
-        lines.append(f'canonicals matched by NEITHER key ({len(unmatched)}):')
-        for chunk in _wrap(
-            'Neither the content hash nor last_known_id matched anything '
-            'returned. Either the entry is genuinely unfindable, the query '
-            'was routed to a store the entry does not live in, or the '
-            'registry fixture has decayed past both keys — the serving store '
-            'is named per topic so an operator can tell those apart rather '
-            'than guessing between them.'
-        ):
-            lines.append(f'  {chunk}')
-        lines.extend(
-            f'  - {topic} (served by: {", ".join(sorted(unmatched_stores[topic])) or "nothing"})'
-            for topic in unmatched
-        )
-
-    repairs = sorted({
-        obs.topic for obs in observations.phrasings
-        if not obs.degraded and obs.needs_hash_repair
-    })
-    if repairs:
-        lines.append('')
-        lines.append(f'canonicals matched by last_known_id only ({len(repairs)}):')
-        lines.append(
-            '  The content hash missed but the id hit: the stored text changed. '
-            'Counted as a hit (the entry IS findable) and reported so the '
-            'fixture can be re-hashed — a probe that silently rewrote its own '
-            'expectations could never fail.'
-        )
-        lines.extend(f'  - {topic}' for topic in repairs)
-
-    missing_claims = [
-        obs for obs in observations.claims
-        if not obs.degraded and obs.scorable and not obs.recalled
-    ]
-    if missing_claims:
-        lines.append('')
-        lines.append(f'claims not recalled ({len(missing_claims)}):')
-        for obs in missing_claims:
-            needles = ', '.join(repr(n) for n in obs.missing_needles)
-            lines.append(f'  - [{obs.topic}] {obs.query!r}: missing {needles}')
-
-    scored = [obs for obs in observations.phrasings if not obs.degraded]
-    if scored:
-        by_matcher: dict[str, int] = {
-            MATCHED_BY_CONTENT_HASH: 0, MATCHED_BY_LAST_KNOWN_ID: 0, 'unmatched': 0,
-        }
-        for obs in scored:
-            by_matcher[obs.matched_by or 'unmatched'] += 1
-        lines.append('')
-        lines.append('how the canonical was matched (observations):')
-        for chunk in _wrap(
-            'The registry keys a canonical by content hash first because memory '
-            'UUIDs rot on re-consolidation, with last_known_id as a disclosed '
-            'fallback. Which matcher fired is a fixture-health signal: a run '
-            'drifting toward last_known_id needs re-hashing, and unmatched '
-            'entries are either genuinely gone or keyed past both.'
-        ):
-            lines.append(f'  {chunk}')
-        for matcher, count in by_matcher.items():
-            lines.append(f'  {matcher}: {count}')
-
-        by_store: dict[str, int] = {}
-        for obs in scored:
-            for store in obs.stores_served:
-                by_store[store] = by_store.get(store, 0) + 1
-        lines.append('')
-        lines.append('which store served the query (observations):')
-        for chunk in _wrap(
-            'MemoryService.search routes: the read router picks a store set '
-            'per query, and the lists come back homogeneous. A phrasing served '
-            'entirely by Graphiti cannot contain a Mem0 entry\'s raw content — '
-            'Graphiti returns LLM-extracted edge facts — so its canonical is '
-            'unfindable there however healthy retrieval is. The probe does not '
-            'pin stores, because an agent\'s search is routed too; it reports '
-            'the routing instead, so a rate is never read as a corpus finding '
-            'when it is a routing one.'
-        ):
-            lines.append(f'  {chunk}')
-        for store, count in sorted(by_store.items()):
-            lines.append(f'  {store}: {count}')
-
-    contamination = [c for c in observations.contamination if not c.degraded]
-    if contamination:
-        untopiced = sum(c.untopiced_count for c in contamination)
-        total = sum(c.scored_total for c in contamination)
-        foreign = sum(c.foreign_count for c in contamination)
-        lines.append('')
-        lines.append('contamination classification:')
-        lines.append(f'  scored results: {total}')
-        lines.append(f'  foreign (a DIFFERENT registered topic): {foreign}')
-        lines.append(f'  untopiced (no topic, or one this registry does not know): {untopiced}')
-        for chunk in _wrap(
-            'Untopiced results are NOT counted as contamination. The census '
-            'measured 491 of 49,628 entries carrying a topic at all, so '
-            'treating an unstamped result as foreign would measure stamping '
-            'coverage while claiming to measure contamination. As 3195/3201 '
-            'widen the vocabulary this remainder shrinks and the share reaches '
-            'further, with no change to how it is computed.'
-        ):
-            lines.append(f'  {chunk}')
-
-    graphiti_primary = ', '.join(graphiti_primary_categories())
-    lines.append('')
-    lines.append('what the corpus counts cover:')
-    for chunk in _wrap(
-        'The per-category sizes above come from count_memories_by_metadata, '
-        'which is an exact Qdrant payload count — a MEM0-SIDE count. The '
-        f'Graphiti-primary categories ({graphiti_primary}) therefore read near '
-        'zero here even when the graph holds thousands: the number is honest '
-        'about what was counted and would be misleading about what exists, so '
-        'it says which it is. The metrics above are unaffected — they are '
-        'computed over what search returned, not over these counts.'
-    ):
-        lines.append(f'  {chunk}')
-
-    if measured_ks and tuple(requested_ks) != tuple(measured_ks):
-        added = ', '.join(
-            str(k) for k in measured_ks if k not in set(requested_ks)
-        )
-        lines.append('')
-        lines.append(
-            'measurement depth '
-            f'(requested {", ".join(str(k) for k in requested_ks) or "nothing"}; '
-            f'measured {", ".join(str(k) for k in measured_ks)}):'
-        )
-        for chunk in _wrap(
-            f'--k selects the depths canonical-in-top-k is scored at. k={added} '
-            'was added to this run because two metrics are DEFINED at it and '
-            'cannot be computed without it: the '
-            f'{METRIC_TOPIC_CANONICAL_PRESENT} tripwire and '
-            f'{METRIC_CANONICAL_IN_TOP_K_HELD_OUT.format(k=TRIPWIRE_K)}. A run '
-            'that dropped them would not fail — leaf α joins a run to its '
-            'baseline window by metric_id, so they would simply stop being '
-            'trended. Measuring a depth nobody asked for is a narrowing like '
-            'any other, so it is said here rather than left to be inferred '
-            'from which metrics happen to be present.'
-        ):
-            lines.append(f'  {chunk}')
-
-    if skipped_topics:
-        lines.append('')
-        lines.append(f'topics NOT PROBED this run ({len(skipped_topics)}):')
-        for chunk in _wrap(
-            'These registry entries belong to a project this run did not '
-            'select with --project-id. They are absent from every metric '
-            'above. Said out loud because a narrowed run and a shrunken '
-            'registry produce the same numbers, and only one of them is a '
-            'measurement problem.'
-        ):
-            lines.append(f'  {chunk}')
-        lines.extend(f'  - {topic}' for topic in skipped_topics)
-
-    if registry is not None:
-        composition: dict[str, int] = {}
-        for entry in registry.entries:
-            composition[entry.derived_from] = composition.get(entry.derived_from, 0) + 1
-        lines.append('')
-        lines.append(f'registry composition ({len(registry.entries)} topics):')
-        for source, count in sorted(composition.items()):
-            lines.append(f'  {source}: {count}')
-        if registry.disclosures:
-            lines.append('  what derivation left out:')
-            for key, value in sorted(registry.disclosures.items()):
-                lines.append(f'    {key}: {value}')
-
-    inversion_records = [
-        record
-        for obs in observations.inversions if not obs.degraded
-        for record in obs.inversions
-    ]
-    if inversion_records:
-        lines.append('')
-        lines.append(f'superseded entries outranking their successor ({len(inversion_records)}):')
-        for record in inversion_records:
-            lines.append(
-                f'  - [{record.topic}] {record.phrasing!r}: '
-                f'{record.superseded_hash} (rank {record.superseded_rank}) above '
-                f'{record.successor_hash} (rank {record.successor_rank})'
-            )
-
-    return '\n'.join(lines) + '\n'
+    Each section carries its own leading blank line, so the join is a plain
+    concatenation — there is no separator policy here that could disagree
+    with what a section believes its own shape is.
+    """
+    return '\n'.join(line for section in sections for line in section.lines) + '\n'
 
 
 def emit_series(series, root: str | Path, *, stamp: str | None = None) -> tuple[Path, Path]:
@@ -2218,6 +2325,13 @@ class ProbeOutcome:
     metrics_path: Path
     report_path: Path
     report: str
+    sections: tuple[ReportSection, ...]
+    """The report's blocks under their machine keys — ``report`` is their join.
+
+    Carried so a caller can ask what this run DISCLOSED (was the added depth
+    said out loud? did the initial-state snapshot fire?) without pattern
+    matching English out of the rendered text.
+    """
     is_initial_run: bool
     skipped_topics: tuple[str, ...]
     corpus_counts: dict[str, int]
@@ -2295,7 +2409,7 @@ async def run_probe(
     # with the extended one. The shared write still happens first, so emit-time
     # validation continues to gate whether any artifact is created at all — the
     # report is only ever widened over a series that already validated.
-    report = render_probe_report(
+    sections = probe_report_sections(
         series,
         observations,
         is_initial_run=initial,
@@ -2310,6 +2424,7 @@ async def run_probe(
         requested_ks=tuple(ks),
         measured_ks=measured_ks,
     )
+    report = join_report_sections(sections)
     report_path.write_text(report, encoding='utf-8')
 
     return ProbeOutcome(
@@ -2318,6 +2433,7 @@ async def run_probe(
         metrics_path=metrics_path,
         report_path=report_path,
         report=report,
+        sections=sections,
         is_initial_run=initial,
         skipped_topics=skipped,
         corpus_counts=counts,

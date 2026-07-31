@@ -1899,7 +1899,11 @@ class TestDegradedSearchDisclosure:
         assert 'qdrant' in report
         assert 'ConnectionRefusedError' in report
         assert 'alpha-topic' in report
-        assert 'not measured' in report.lower()
+        # The topic is not-measured rather than failing, and the report says
+        # so as its own block — asserted on the block, not on its wording.
+        sections = _sections(series, observations)
+        assert m.SECTION_TOPICS_NOT_MEASURED in sections
+        assert 'alpha-topic' in sections[m.SECTION_TOPICS_NOT_MEASURED].text
 
     @pytest.mark.asyncio
     async def test_a_healthy_run_produces_observations_for_every_family(self):
@@ -2044,6 +2048,23 @@ class TestInitialRunDetection:
         assert _mod().is_initial_run(tmp_path)
 
 
+def _sections(*args, **kwargs) -> dict:
+    """`{section_key: ReportSection}` for a render of the same arguments.
+
+    The structural handle these tests assert against. `render_probe_report`
+    is a pure join of this, so a section present here is present in the
+    operator's report by construction — and neither assertion depends on the
+    English prose inside the block, which is the part expected to be
+    reworded (the file already deleted one banned-substring sweep for
+    exactly that reason; the positive form has no better claim).
+    """
+    return {s.key: s for s in _mod().probe_report_sections(*args, **kwargs)}
+
+
+def _section_keys(*args, **kwargs) -> list:
+    return [s.key for s in _mod().probe_report_sections(*args, **kwargs)]
+
+
 def _count_line(report: str, label: str) -> str:
     """The single `  <label>...: <n>` line of a report breakdown.
 
@@ -2059,29 +2080,20 @@ def _count_line(report: str, label: str) -> str:
     return matches[0]
 
 
-def _caveat_anchor():
-    """The routing caveat AS RENDERED, derived from the module's own constant.
-
-    Deriving the needle instead of hand-copying a phrase is what keeps these
-    tests about placement and scoping rather than about wording: rewording
-    `_KNOWN_BAD_ROUTING_CAVEAT` moves the anchor with it.
-    """
-    m = _mod()
-    return m._wrap(m._KNOWN_BAD_ROUTING_CAVEAT)[0]
-
-
 class TestProbeReport:
     """`render_probe_report(series, observations, *, is_initial_run)`."""
 
     def test_the_initial_run_enumerates_known_bad_items(self):
         """(a) Every failing tripwire item key is named in the section."""
-        report = _mod().render_probe_report(
+        m = _mod()
+        sections = _sections(
             _report_series(), _report_observations(), is_initial_run=True,
         )
 
-        assert 'initial state' in report.lower()
-        assert 't-alpha-topic' in report
-        assert 't-beta-topic' in report
+        assert m.SECTION_INITIAL_STATE in sections
+        items = sections[m.SECTION_KNOWN_BAD_ITEMS].text
+        assert '  - t-alpha-topic' in items
+        assert '  - t-beta-topic' in items
 
     def test_the_known_bad_list_carries_the_routing_caveat_inline(self):
         """(a) esc-3208-1: the misreading happens at the headline, so the
@@ -2090,48 +2102,46 @@ class TestProbeReport:
         served by Graphiti against 72/78 unmatched — a reader who stops at the
         rate takes a router property for a findability collapse.
 
-        The assertion is on POSITION: the caveat precedes the item keys it
+        The assertion is on POSITION, read off the section order: the caveat
+        sits inside the initial-state block and above the item list it
         qualifies, so a reader cannot reach the list without passing it.
         """
         m = _mod()
-        report = m.render_probe_report(
+        keys = _section_keys(
             _report_series(), _report_observations(), is_initial_run=True,
         )
 
-        anchor = _caveat_anchor()
-        preamble = m._wrap(m._KNOWN_BAD_PREAMBLE)[0]
-        assert anchor in report
-
-        # Inside the initial-state section (after its preamble), and above the
-        # item keys it qualifies — the item keys also appear in the per-metric
-        # block far above, so the check is on what follows the caveat.
-        assert report.index(preamble) < report.index(anchor)
-        after_caveat = report[report.index(anchor):]
-        assert '  - t-alpha-topic' in after_caveat
-        assert '  - t-beta-topic' in after_caveat
+        assert (
+            keys.index(m.SECTION_INITIAL_STATE)
+            < keys.index(m.SECTION_KNOWN_BAD_ROUTING_CAVEAT)
+            < keys.index(m.SECTION_KNOWN_BAD_ITEMS)
+        )
 
     def test_the_routing_caveat_is_scoped_to_the_initial_run(self):
         """It explains an inherited snapshot; on run fifty it would be noise."""
-        report = _mod().render_probe_report(
+        m = _mod()
+        keys = _section_keys(
             _report_series(), _report_observations(), is_initial_run=False,
         )
 
-        assert _caveat_anchor() not in report
+        assert m.SECTION_KNOWN_BAD_ROUTING_CAVEAT not in keys
 
     def test_a_later_run_has_no_initial_state_section(self):
         """(b) Inherited state is only inherited once."""
-        report = _mod().render_probe_report(
+        m = _mod()
+        keys = _section_keys(
             _report_series(), _report_observations(), is_initial_run=False,
         )
 
-        assert 'initial state' not in report.lower()
-        assert 'known-bad' not in report.lower()
+        assert m.SECTION_INITIAL_STATE not in keys
+        assert m.SECTION_KNOWN_BAD_ITEMS not in keys
 
     def test_initial_state_defaults_off(self):
         """A caller that forgot the flag must not fabricate a first run."""
-        report = _mod().render_probe_report(_report_series(), _report_observations())
+        m = _mod()
+        keys = _section_keys(_report_series(), _report_observations())
 
-        assert 'initial state' not in report.lower()
+        assert m.SECTION_INITIAL_STATE not in keys
 
     def test_the_report_carries_the_matched_by_breakdown(self):
         """(d) step-7's dual matcher, made visible — with its COUNTS.
@@ -3215,10 +3225,12 @@ class TestStoresServedDisclosure:
             topic='alpha-topic', phrasing='routed away', held_out=False, k=5,
             hit=False, rank=None, matched_by=None, stores_served=('graphiti',),
         ))
-        report = m.render_probe_report(_report_series(observations), observations)
+        sections = _sections(_report_series(observations), observations)
 
-        assert 'which store served' in report.lower()
-        assert 'graphiti' in report
+        # The breakdown exists AND counts the routed-away phrasing: the added
+        # observation is the only Graphiti one, so the tally is 1.
+        served = sections[m.SECTION_STORES_SERVED]
+        assert _count_line(served.text, 'graphiti').endswith(': 1')
 
     def test_the_unmatched_section_names_the_stores_that_answered(self):
         """An operator must not have to guess whether the canonical could
@@ -3234,11 +3246,14 @@ class TestStoresServedDisclosure:
                 hit=False, rank=None, matched_by=None, stores_served=('graphiti',),
             ),
         ])
-        report = m.render_probe_report(_build(observations), observations)
+        sections = _sections(_build(observations), observations)
 
-        section = report.split('canonicals matched by NEITHER key')[1]
+        # Read the block off its key rather than splitting the report on an
+        # English header — the split form turns a copy edit into an IndexError
+        # instead of a failure that says what broke.
+        section = sections[m.SECTION_UNMATCHED_CANONICALS].text
         assert 'routed-away-topic' in section
-        assert 'graphiti' in section.split('\n\n')[0]
+        assert 'graphiti' in section
 
     def test_the_serving_store_counts_ride_in_the_machine_readable_artifact(self):
         """Prose-only disclosure is invisible to every consumer that reads JSON."""
@@ -3457,18 +3472,20 @@ class TestNonDefaultKKeepsThePinnedMetrics:
         """Measuring a depth the operator did not ask for is a narrowing like
         any other: it gets said out loud, not left to be reverse-engineered
         from the metric list."""
+        m = _mod()
         _, outcome = self._run(tmp_path, (7,))
+        keys = [section.key for section in outcome.sections]
 
-        assert 'measurement depth' in outcome.report.lower()
-        assert 'requested 7' in outcome.report
-        assert 'measured 7, 5' in outcome.report
+        assert m.SECTION_MEASUREMENT_DEPTH in keys
 
     def test_the_disclosure_says_why_the_pin_was_added(self, tmp_path):
         """A depth appearing unbidden is only legible if the reason is beside
-        it: both pinned metrics are DEFINED at k=5."""
+        it: both pinned metrics are DEFINED at k=5, and the block names them."""
         m = _mod()
         _, outcome = self._run(tmp_path, (7,))
-        section = outcome.report.lower().split('measurement depth', 1)[1]
+        section = next(
+            s for s in outcome.sections if s.key == m.SECTION_MEASUREMENT_DEPTH
+        ).text
 
         assert m.METRIC_TOPIC_CANONICAL_PRESENT in section
         assert m.METRIC_CANONICAL_IN_TOP_K_HELD_OUT.format(k=m.TRIPWIRE_K) in section
@@ -3476,9 +3493,10 @@ class TestNonDefaultKKeepsThePinnedMetrics:
     def test_the_default_run_discloses_no_added_depth(self, tmp_path):
         """Nothing was added, so there is nothing to disclose — a section that
         fired every run would train an operator to skip it."""
+        m = _mod()
         _, outcome = self._run(tmp_path, (5, 10))
 
-        assert 'measurement depth' not in outcome.report.lower()
+        assert m.SECTION_MEASUREMENT_DEPTH not in [s.key for s in outcome.sections]
 
 
 class TestObservationDepthIsHonest:
