@@ -39,9 +39,11 @@ that let a suppressed night read like a quiet one for 14 nights
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import tempfile
+from datetime import date, datetime
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -197,3 +199,179 @@ def trickle_state_path(project_id: str) -> Path:
             base = Path(tempfile.gettempdir())
 
     return base / 'dark-factory' / 'legibility' / project_id / STATE_FILENAME
+
+
+# ---------------------------------------------------------------------------
+# load_state — three-valued reader (mirrors census_trigger.load_census_state)
+# ---------------------------------------------------------------------------
+
+def load_state(path: str | Path) -> tuple[str, dict | None]:
+    """Read a trickle run-state file. Three-valued, never raises.
+
+    - path does not exist -> ``("missing", None)``, NO warning logged. A
+      project that has never recorded a run is a normal, expected state,
+      not a degradation.
+    - unreadable / invalid JSON / non-dict top level / unknown
+      ``schema_version`` -> ``("malformed", None)`` + exactly ONE WARNING.
+      An unknown schema version is malformed rather than best-effort
+      parsed: a reader that silently accepts a shape it does not
+      understand reintroduces exactly the silent degradation this module
+      exists to close.
+    - otherwise -> ``("ok", data)``.
+
+    Shape AND vocabulary mirror the sibling reader in this same package,
+    :func:`census_trigger.load_census_state` (census_trigger.py:239),
+    VERBATIM — same tuple shape, same literal status strings
+    (``'malformed'``, never ``'invalid'``), same fail-safe posture — so
+    the two state readers in ``scripts/legibility/`` cannot drift into two
+    vocabularies for one concept.
+    """
+    path = Path(path)
+    if not path.exists():
+        return 'missing', None
+
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning('trickle state at %s is malformed: %s', path, exc)
+        return 'malformed', None
+
+    if not isinstance(data, dict):
+        logger.warning(
+            'trickle state at %s is malformed: expected a JSON object, got %s',
+            path,
+            type(data).__name__,
+        )
+        return 'malformed', None
+
+    schema_version = data.get('schema_version')
+    if schema_version != STATE_SCHEMA_VERSION:
+        logger.warning(
+            'trickle state at %s is malformed: unknown schema_version %r '
+            '(this module writes %d)',
+            path,
+            schema_version,
+            STATE_SCHEMA_VERSION,
+        )
+        return 'malformed', None
+
+    return 'ok', data
+
+
+# ---------------------------------------------------------------------------
+# record_run — the writer
+# ---------------------------------------------------------------------------
+
+def record_run(
+    project_id: str,
+    *,
+    target_date: date,
+    recorded_at: datetime,
+    exit_code: int,
+    total_records: int,
+    zero_signal_dropped: int,
+    dedupe_collapsed: int,
+    below_sampling_cut: int,
+    budget_skipped: int,
+    selected_count: int,
+    applied: int = 0,
+    commit_made: bool = False,
+    budget_suppressed: bool = False,
+) -> dict:
+    """Classify this run, fold it into the running streak, and write the
+    state file atomically. Returns the document it wrote.
+
+    ``recorded_at`` is an INJECTED parameter, not a ``datetime.now()``
+    inside this function, so the whole module stays clock-injectable and
+    streak/freshness tests need no time faking — mirroring
+    ``nightly.run_nightly``'s existing ``now=`` seam and
+    ``census_trigger.evaluate_census_step``'s clock seam.
+
+    Streak semantics: ``consecutive_barren_runs`` is the previous value
+    plus one when this run is barren, and 0 otherwise. BOTH ``productive``
+    and ``quiet`` reset it — a legitimately quiet night is not evidence of
+    breakage, which is PRD decision 7's no-false-alarm guarantee expressed
+    in the streak rather than only in the classifier.
+
+    ``last_productive_at`` is stamped with ``recorded_at`` on a productive
+    run and carried forward UNCHANGED across barren and quiet runs. It is
+    the field an operator reads to answer "when did this pipeline last
+    actually do anything".
+
+    A ``missing`` or ``malformed`` predecessor simply starts the streak at
+    this run (and drops ``last_productive_at``): losing streak history
+    degrades to UNDER-reporting, never to a crash inside the nightly run.
+
+    The write is atomic: the payload goes to a ``.tmp`` sibling in the
+    SAME directory and is then ``os.replace``d onto the final path.
+    Same-directory is required — ``os.replace`` is only atomic within one
+    filesystem — and the tmp file is removed on any failure, so a crashed
+    write can never leave a partial document that ``load_state`` would
+    report as ``malformed``.
+    """
+    path = trickle_state_path(project_id)
+
+    prev_status, prev = load_state(path)
+    prev_streak = 0
+    last_productive_at = None
+    if prev_status == 'ok' and prev is not None:
+        raw_streak = prev.get('consecutive_barren_runs')
+        if isinstance(raw_streak, int) and raw_streak >= 0:
+            prev_streak = raw_streak
+        raw_last = prev.get('last_productive_at')
+        if isinstance(raw_last, str):
+            last_productive_at = raw_last
+
+    outcome = classify_run(
+        total_records=total_records,
+        zero_signal_dropped=zero_signal_dropped,
+        dedupe_collapsed=dedupe_collapsed,
+        below_sampling_cut=below_sampling_cut,
+        budget_skipped=budget_skipped,
+        selected_count=selected_count,
+    )
+
+    recorded_at_iso = recorded_at.isoformat()
+    if outcome == OUTCOME_PRODUCTIVE:
+        last_productive_at = recorded_at_iso
+
+    doc = {
+        'schema_version': STATE_SCHEMA_VERSION,
+        'project_id': project_id,
+        'target_date': target_date.isoformat(),
+        'recorded_at': recorded_at_iso,
+        'exit_code': exit_code,
+        'outcome': outcome,
+        'applied': applied,
+        'commit_made': bool(commit_made),
+        'budget_suppressed': bool(budget_suppressed),
+        'consecutive_barren_runs': (
+            prev_streak + 1 if outcome == OUTCOME_BARREN else 0
+        ),
+        'last_productive_at': last_productive_at,
+        'counters': {
+            'total_records': total_records,
+            'zero_signal_dropped': zero_signal_dropped,
+            'dedupe_collapsed': dedupe_collapsed,
+            'below_sampling_cut': below_sampling_cut,
+            'budget_skipped': budget_skipped,
+            'selected_count': selected_count,
+        },
+    }
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(path.name + '.tmp')
+    try:
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            json.dump(doc, f, indent=2, sort_keys=True)
+            f.write('\n')
+        os.replace(tmp_path, path)
+    except OSError:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+
+    return doc
