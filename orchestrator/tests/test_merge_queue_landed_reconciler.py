@@ -31,6 +31,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from escalation.queue import EscalationQueue
 
+from orchestrator.config import DeliveredChecksConfig
 from orchestrator.delivered_checks import DeliveredChecksBlock
 from orchestrator.git_ops import AdvanceOutcome
 from orchestrator.harness import Harness
@@ -388,17 +389,23 @@ class TestHarnessReconcileLandedOutboxWiring:
 
         When a merge worker with a bound LandedOutbox is present, the
         harness delegates to the module-level reconcile_landed_outbox with
-        the worker's outbox plus the harness's own git_ops/scheduler, and
-        (task 2677) the harness's shared ProvenanceConflictSink.
+        the worker's outbox plus the harness's own git_ops/scheduler,
+        (task 2677) the harness's shared ProvenanceConflictSink, and
+        (task 3057) the three params that ARM the RC-2 delivered-checks
+        guard from live config.
         """
         h = _build_harness(mock_orch_config)
+        h.config.delivered_checks = DeliveredChecksConfig(
+            enabled=True, check_timeout_secs=11.0,
+        )
         worker = MagicMock()
         worker._landed_outbox = MagicMock()
         h._merge_worker = worker
 
         empty_report = {
             'pruned_not_landed': 0, 'marked_done': 0,
-            'already_done_pruned': 0, 'skipped': 0, 'stale_conflict': 0, 'errors': 0,
+            'already_done_pruned': 0, 'skipped': 0, 'stale_conflict': 0,
+            'delivered_checks_withheld': 0, 'errors': 0,
         }
         with patch(
             'orchestrator.harness.reconcile_landed_outbox',
@@ -409,6 +416,9 @@ class TestHarnessReconcileLandedOutboxWiring:
         mock_reconcile.assert_awaited_once_with(
             worker._landed_outbox, h.git_ops, h.scheduler,
             provenance_conflict_sink=h._provenance_conflict_sink,
+            project_root=str(h.config.project_root),
+            check_timeout_secs=11.0,
+            delivered_checks_enabled=True,
         )
 
 

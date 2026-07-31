@@ -9760,21 +9760,40 @@ class Harness:
         merge worker is absent (disabled / not yet constructed) or has no
         bound ``LandedOutbox``, mirroring
         :meth:`_reap_orphaned_merge_worktrees`'s None-guard.
+
+        ARMS the RC-2 delivered-capability guard (task 3057) by forwarding
+        this harness's live ``delivered_checks`` config. Git ancestry alone
+        proves only that a branch tip reached ``main``; it never proves the
+        task's declared capability rode along with it, so a crash-recovered
+        landing whose ``metadata.delivered_checks`` are absent from main is
+        now WITHHELD rather than stamped ``kind='merged'``. A withheld row
+        stays UNCONSUMED and its task stays DISPATCHABLE, so the capability
+        gets actually delivered instead of a hollow done being written from
+        the crash-recovery path. The count is surfaced in the INFO summary
+        below — a withholding is an operator-visible disposition, never
+        silently absorbed into ``skipped``.
         """
         if self._merge_worker is None or self._merge_worker._landed_outbox is None:
             return
         report = await reconcile_landed_outbox(
             self._merge_worker._landed_outbox, self.git_ops, self.scheduler,
             provenance_conflict_sink=self._provenance_conflict_sink,
+            project_root=str(self.config.project_root),
+            check_timeout_secs=self.config.delivered_checks.check_timeout_secs,
+            delivered_checks_enabled=self.config.delivered_checks.enabled,
         )
         logger.info(
             '_reconcile_landed_outbox: pruned_not_landed=%d marked_done=%d '
-            'already_done_pruned=%d skipped=%d stale_conflict=%d errors=%d',
+            'already_done_pruned=%d skipped=%d stale_conflict=%d '
+            'delivered_checks_withheld=%d errors=%d',
             report.get('pruned_not_landed', 0),
             report.get('marked_done', 0),
             report.get('already_done_pruned', 0),
             report.get('skipped', 0),
             report.get('stale_conflict', 0),
+            # .get(..., 0) like its siblings: a report dict from an older or
+            # foreign reconciler must not abort startup over a telemetry field.
+            report.get('delivered_checks_withheld', 0),
             report.get('errors', 0),
         )
 
@@ -9805,6 +9824,16 @@ class Harness:
         rather than propagating, and ``reconcile_landed_task`` maps that
         disposition to ``True`` too — a contested task must not dispatch
         while under arbitration, same as an already-landed one.
+
+        ARMS the RC-2 delivered-capability guard (task 3057) from live
+        config, exactly as :meth:`_reconcile_landed_outbox` does — the two
+        callers must stay in lockstep or the guard would apply on the startup
+        sweep but not the hot dispatch consult. Note the asymmetry with
+        ``'stale_conflict'`` above: a ``'delivered_checks_withheld'``
+        disposition maps to ``False`` (DO dispatch). The done-write was
+        refused precisely because the declared capability is not on main, so
+        dispatching is the recovery — gating would wedge the task forever and
+        turn a would-be misattribution into a permanent strand.
         """
         if self._merge_worker is None or self._merge_worker._landed_outbox is None:
             return False
@@ -9814,6 +9843,9 @@ class Harness:
             scheduler=self.scheduler,
             outbox=self._merge_worker._landed_outbox,
             provenance_conflict_sink=self._provenance_conflict_sink,
+            project_root=str(self.config.project_root),
+            check_timeout_secs=self.config.delivered_checks.check_timeout_secs,
+            delivered_checks_enabled=self.config.delivered_checks.enabled,
         )
 
     async def _already_landed_dispatch_gate(self, task_id: str) -> bool:
