@@ -1,6 +1,7 @@
 """Tests for the memory service — unit tests with mocked backends."""
 
 import asyncio
+import json
 import logging
 import types
 from datetime import UTC, datetime, timedelta, timezone
@@ -8697,3 +8698,195 @@ class TestGetMemoryById:
 
         with pytest.raises(TimeoutError):
             await service.get_memory_by_id(project_id='dark_factory', memory_id='u')
+
+
+def _tombstone_row(payload_json, created_at='2026-07-20T00:00:00+00:00'):
+    """A ReconLedgerRecord as ReconLedgerStore.get_mem0_tombstone would return it."""
+    from fused_memory.reconciliation.recon_ledger import (
+        RECORD_KIND_MEM0_TOMBSTONE,
+        ReconLedgerRecord,
+    )
+
+    return ReconLedgerRecord(
+        project_id='dark_factory',
+        record_kind=RECORD_KIND_MEM0_TOMBSTONE,
+        task_id='mem-victim',
+        payload_json=payload_json,
+        state='deleted',
+        created_at=created_at,
+        expires_at='2026-08-19T00:00:00+00:00',
+    )
+
+
+class TestGetMem0DeletionTombstone:
+    """MemoryService.get_mem0_deletion_tombstone: why a recon-deleted memory is gone.
+
+    A strictly ADDITIVE sibling of get_memory_by_id (task 3041). It answers the
+    question recon gate 165 dead-ended on: `get_memory_by_id` said
+    {found: false} and there was no reachable path from a memory uuid to "who
+    deleted it and why". get_memory_by_id's own None-on-miss contract is
+    load-bearing for citation_verifier, reconciliation stage1 and recon_report's
+    cite_memory, so it is deliberately NOT widened — see the last test here.
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_decoded_payload_with_row_timestamps(self, service):
+        """The decoded payload, plus the row's own created_at/expires_at.
+
+        The row's timestamps are exposed under tombstone_-prefixed keys rather
+        than merged bare: the payload's own 'created_at' is the VICTIM's (how
+        old the evicted record was), while the row's created_at is when the
+        tombstone was written. Merging them flat would silently clobber the
+        former with the latter — precisely the deleting-run vs victim-run
+        conflation that made the original finding unreadable.
+        """
+        payload = {
+            'deleter': 'stage1_cycle_summary_trim',
+            'deleting_run_id': 'run-deleter',
+            'deleted_at': '2026-07-20T00:00:00+00:00',
+            'created_at': '2026-07-01T00:00:00+00:00', # the VICTIM's
+            'kind': 'cycle_summary',
+            'record_type': 'ledger_stamp',
+            'source': 'cycle_summary_mirror',
+            'recon_pool': 'stage1_cycle_summary',
+            'run_id': 'run-victim', # the VICTIM's, distinct from deleting_run_id
+        }
+        service.recon_ledger = MagicMock()
+        service.recon_ledger.get_mem0_tombstone = AsyncMock(
+            return_value=_tombstone_row(json.dumps(payload))
+        )
+
+        result = await service.get_mem0_deletion_tombstone('dark_factory', 'mem-victim')
+
+        assert result is not None
+        for key, value in payload.items():
+            assert result[key] == value, f'payload field {key} not surfaced'
+        assert result['tombstone_created_at'] == '2026-07-20T00:00:00+00:00'
+        assert result['tombstone_expires_at'] == '2026-08-19T00:00:00+00:00'
+        # The victim's created_at must survive the merge unclobbered.
+        assert result['created_at'] == '2026-07-01T00:00:00+00:00'
+        service.recon_ledger.get_mem0_tombstone.assert_awaited_once_with(
+            'dark_factory', 'mem-victim'
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_row_returns_none(self, service):
+        """No tombstone for this uuid → None (the ordinary never-deleted case)."""
+        service.recon_ledger = MagicMock()
+        service.recon_ledger.get_mem0_tombstone = AsyncMock(return_value=None)
+
+        assert await service.get_mem0_deletion_tombstone('dark_factory', 'm') is None
+
+    @pytest.mark.asyncio
+    async def test_no_ledger_wired_returns_none_without_raising(self, service):
+        """A deployment running recon_ledger_enabled=False degrades to None.
+
+        Same getattr(self, 'recon_ledger', None) optional-store precedent as
+        get_cycle_summary_presence and summary_pool.write_cycle_summary.
+        """
+        assert getattr(service, 'recon_ledger', None) is None
+        assert await service.get_mem0_deletion_tombstone('dark_factory', 'm') is None
+
+    @pytest.mark.asyncio
+    async def test_malformed_payload_returns_none_and_warns(self, service, caplog):
+        """Undecodable payload_json → None plus one WARNING, never a raise.
+
+        A corrupt tombstone must not break the read of the record it documents:
+        the auditor still gets a clean not-found rather than a stack trace.
+        """
+        service.recon_ledger = MagicMock()
+        service.recon_ledger.get_mem0_tombstone = AsyncMock(
+            return_value=_tombstone_row('{not json at all')
+        )
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            result = await service.get_mem0_deletion_tombstone('dark_factory', 'mem-victim')
+
+        assert result is None
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1, f'expected exactly one WARNING, got {warnings!r}'
+        assert 'mem-victim' in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_raising_store_returns_none_and_warns(self, service, caplog):
+        """A raising ledger read → None plus one WARNING with exc_info.
+
+        The docstring promises "fail-safe throughout", so the guard belongs
+        HERE and not only at the MCP boundary — otherwise any future
+        in-process caller without its own try/except eats the raise. And it
+        must be LOUD: a broken tombstone store returning a bare None is
+        indistinguishable from "never deliberately deleted", which is exactly
+        the undiscoverability class task 3041 was filed to fix (reviewer
+        finding robustness, amendment pass).
+        """
+        service.recon_ledger = MagicMock()
+        service.recon_ledger.get_mem0_tombstone = AsyncMock(
+            side_effect=RuntimeError('database is locked')
+        )
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            result = await service.get_mem0_deletion_tombstone('dark_factory', 'mem-victim')
+
+        assert result is None
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1, f'expected exactly one WARNING, got {warnings!r}'
+        assert 'mem-victim' in caplog.text
+        assert warnings[0].exc_info is not None, (
+            'the WARNING must carry exc_info — the fault type is the diagnostic'
+        )
+
+    @pytest.mark.asyncio
+    async def test_ordinary_absence_is_silent(self, service, caplog):
+        """No ledger and no row are ordinary STATES, not faults — neither logs.
+
+        The other half of the loud-over-silent split: if every never-deleted
+        lookup warned, the fault WARNING above would drown in noise and stop
+        meaning "the tombstone store is broken".
+        """
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            assert await service.get_mem0_deletion_tombstone('dark_factory', 'm') is None
+
+            service.recon_ledger = MagicMock()
+            service.recon_ledger.get_mem0_tombstone = AsyncMock(return_value=None)
+            assert await service.get_mem0_deletion_tombstone('dark_factory', 'm') is None
+
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
+            f'ordinary absence must be silent: {caplog.text!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_object_payload_returns_none_and_warns(self, service, caplog):
+        """Valid JSON that isn't an object (e.g. a list) is treated as malformed."""
+        service.recon_ledger = MagicMock()
+        service.recon_ledger.get_mem0_tombstone = AsyncMock(
+            return_value=_tombstone_row('[1, 2, 3]')
+        )
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            result = await service.get_mem0_deletion_tombstone('dark_factory', 'mem-victim')
+
+        assert result is None
+        assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
+
+    @pytest.mark.asyncio
+    async def test_get_memory_by_id_contract_unchanged_by_a_present_tombstone(self, service):
+        """LOAD-BEARING: get_memory_by_id still returns plain None on a miss, and
+        still PROPAGATES a backend TimeoutError, even when a tombstone exists.
+
+        Three in-process callers (reconciliation/citation_verifier.py,
+        reconciliation stage1, server/recon_report.py's cite_memory) branch on
+        `is None`; widening this return to a dict-with-tombstone would silently
+        flip every one of them. The tombstone is surfaced at the MCP tool
+        boundary instead (server/tools.py), not here.
+        """
+        service.recon_ledger = MagicMock()
+        service.recon_ledger.get_mem0_tombstone = AsyncMock(
+            return_value=_tombstone_row('{"deleter": "stage1_cycle_summary_trim"}')
+        )
+
+        service.mem0.get_point_by_id = AsyncMock(return_value=None)
+        assert await service.get_memory_by_id(project_id='dark_factory', memory_id='mem-victim') is None
+
+        service.mem0.get_point_by_id = AsyncMock(side_effect=TimeoutError('qdrant timed out'))
+        with pytest.raises(TimeoutError):
+            await service.get_memory_by_id(project_id='dark_factory', memory_id='mem-victim')

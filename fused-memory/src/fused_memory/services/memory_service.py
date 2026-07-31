@@ -3374,6 +3374,105 @@ class MemoryService:
                 break
         return {'id': memory_id, 'content': content, 'metadata': payload}
 
+    async def get_mem0_deletion_tombstone(
+        self,
+        project_id: str,
+        memory_id: str,
+    ) -> dict | None:
+        """Why a recon sweep deleted Mem0 record *memory_id*, or ``None``.
+
+        Reads the ``mem0_tombstone`` ledger row written by
+        :func:`~fused_memory.reconciliation.mem0_tombstone.record_mem0_deletion_tombstone`
+        after every confirmed recon-initiated Mem0 delete, and returns its
+        decoded payload: which sweep took the record (``deleter``), which run
+        performed the deletion (``deleting_run_id``), when (``deleted_at``),
+        and the victim's identifying metadata (``kind``, ``record_type``,
+        ``source``, ``recon_pool``, ``run_id``, ``created_at``).
+
+        The row's own timestamps are added as ``tombstone_created_at`` /
+        ``tombstone_expires_at`` rather than merged bare, because the payload
+        already carries a ``created_at`` — the VICTIM's, i.e. how old the
+        evicted record was — while the row's is when the tombstone was
+        written. Flattening them together would clobber the former with the
+        latter, reproducing exactly the kind of run/timestamp conflation that
+        made the original recon-gate-165 report unreadable.
+
+        **Strictly additive** (task 3041): this is a sibling of
+        :meth:`get_memory_by_id`, which is deliberately left untouched. Its
+        ``None``-on-miss contract is load-bearing for at least three
+        in-process callers (``reconciliation/citation_verifier.py``,
+        reconciliation stage1, and ``server/recon_report.py``'s
+        ``cite_memory``), all of which branch on ``is None``; widening it to
+        return a dict-with-tombstone would silently flip every one of them.
+        The tombstone is instead surfaced at the MCP boundary, on
+        ``server/tools.py``'s ``get_memory_by_id`` not-found branch, so the
+        exact query that dead-ended for the audit now self-explains.
+
+        Fail-safe throughout — a tombstone is diagnostic, so a problem
+        reading one must never be worse than not having it. No ledger wired
+        (``recon_ledger_enabled=False``, same
+        ``getattr(self, 'recon_ledger', None)`` precedent as
+        :meth:`get_cycle_summary_presence`), no row, a payload that is
+        undecodable or not a JSON object, and a *raising* store read (ledger
+        not initialized, SQLite locked/corrupt, aiosqlite thread error) all
+        return ``None``.
+
+        The two FAULT cases — malformed payload and a raising store read —
+        each log one WARNING (the latter with ``exc_info``); the two ordinary
+        states (no ledger, no row) log nothing. That split is the point: a
+        broken tombstone store must not be indistinguishable from "no
+        tombstone exists", which is the same undiscoverability class task 3041
+        was filed to fix (loud-over-silent / no-silent-fail-soft, see
+        ``docs/legibility/design-invariants.md``). The store guard lives HERE
+        rather than only at the MCP boundary so that "fail-safe throughout"
+        holds for every caller, not just the one that happens to wrap it
+        (reviewer finding robustness, task 3041 amendment pass).
+
+        ``None`` therefore means "no readable tombstone", which covers both
+        "never deliberately deleted" and "the tombstone expired past
+        :data:`~fused_memory.reconciliation.mem0_tombstone.MEM0_TOMBSTONE_TTL_DAYS`".
+        A tombstone proves deliberate deletion; its absence does not prove
+        the converse.
+        """
+        ledger = getattr(self, 'recon_ledger', None)
+        if ledger is None:
+            return None
+        try:
+            record = await ledger.get_mem0_tombstone(project_id, memory_id)
+        except Exception:
+            # A FAULT, not an ordinary state — the caller cannot tell this
+            # apart from "no tombstone exists" by the return value alone, so
+            # it must be loud in the log even though the return degrades.
+            logger.warning(
+                'get_mem0_deletion_tombstone: tombstone store read FAILED for '
+                'memory_id=%s in project=%s; reporting no tombstone',
+                memory_id,
+                project_id,
+                exc_info=True,
+                extra={'project_id': project_id, 'memory_id': memory_id},
+            )
+            return None
+        if record is None:
+            return None
+        try:
+            payload = json.loads(record.payload_json)
+        except (TypeError, ValueError):
+            payload = None
+        if not isinstance(payload, dict):
+            logger.warning(
+                'get_mem0_deletion_tombstone: unreadable tombstone payload for '
+                'memory_id=%s in project=%s; reporting no tombstone',
+                memory_id,
+                project_id,
+                extra={'project_id': project_id, 'memory_id': memory_id},
+            )
+            return None
+        return {
+            **payload,
+            'tombstone_created_at': record.created_at,
+            'tombstone_expires_at': record.expires_at,
+        }
+
     # ------------------------------------------------------------------
     # Read: cycle_summary ledger presence (task 2436, τ1)
     # ------------------------------------------------------------------

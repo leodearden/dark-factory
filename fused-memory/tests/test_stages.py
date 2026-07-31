@@ -13474,3 +13474,298 @@ class TestGcReconMarkers:
 
         assert result == 3
         ledger.gc.assert_awaited_once_with(scope.project_id, ANY, [])
+
+
+class TestSweepStaleMem0PoolProtectsMirrorRecords:
+    """_sweep_stale_mem0_pool never deletes a cycle_summary ledger mirror (task 3041).
+
+    Recon gate 165 (esc-165-1) reported cycle_summary Mem0 anchors vanishing
+    with no audit trail. The adjacent precision defect the finding asked us to
+    audit is real and structurally reachable: _FLAG_FOR_STAGE2_ENUM_FILTERS is
+    ``{'flag_for_stage2': True}`` with NO kind/source/record_type
+    discriminator, and ``flag_for_stage2`` is an LLM-supplied metadata key that
+    nothing at the add_memory boundary stops a cycle_summary write from also
+    carrying. No amount of payload-filter tightening fixes that, so the guard
+    lives at the ONE choke point all three marker sweeps already funnel
+    through — this skeleton — and every current and future caller inherits it.
+
+    A skipped mirror logs a WARNING rather than being silently kept: an
+    over-broad filter must become VISIBLE, per the project's
+    loud-over-silent-degradation / no-silent-fail-soft invariant.
+    """
+
+    @pytest.mark.asyncio
+    async def test_protected_mirror_skipped_ordinary_marker_still_deleted(self, caplog):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_pool,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        stale = (fixed_now - timedelta(days=20)).isoformat()
+        members = [
+            {
+                'id': 'ordinary-marker',
+                'created_at': stale,
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': 't1'},
+            },
+            {
+                'id': 'protected-mirror',
+                'created_at': stale,
+                'metadata': {
+                    'kind': 'cycle_summary',
+                    'record_type': 'ledger_stamp',
+                    'run_id': 'r-victim',
+                },
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            result = await _sweep_stale_mem0_pool(
+                memory_service,
+                'dark_factory',
+                'r1',
+                source='stage1_flag_marker',
+                gc_sweep_source='stage1_flag_marker_gc_sweep',
+                max_age_days=14,
+                log_name='_sweep_stale_mem0_flag_markers',
+                now=fixed_now,
+            )
+
+        deleted_ids = {
+            call.kwargs.get('memory_id')
+            for call in memory_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'ordinary-marker'}
+        assert 'protected-mirror' not in deleted_ids
+        # The skip is EXCLUDED from the count, not silently counted as a delete.
+        assert result == 1
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert 'protected-mirror' in message
+        assert 'cycle_summary' in message
+        assert 'ledger_stamp' in message
+        assert '_sweep_stale_mem0_flag_markers' in message
+
+    @pytest.mark.asyncio
+    async def test_mirror_protected_even_when_only_kind_is_present(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_pool,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {
+                'id': 'kind-only-mirror',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'kind': 'cycle_summary', 'source': 'stage1_flag_marker'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_mem0_pool(
+            memory_service,
+            'dark_factory',
+            'r1',
+            source='stage1_flag_marker',
+            gc_sweep_source='stage1_flag_marker_gc_sweep',
+            max_age_days=14,
+            log_name='_sweep_stale_mem0_flag_markers',
+            now=fixed_now,
+        )
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_over_broad_flag_for_stage2_sweep_cannot_take_a_mirror(self):
+        """The concrete over-broad predicate this task was asked to audit.
+
+        _FLAG_FOR_STAGE2_ENUM_FILTERS matches ANY record carrying
+        flag_for_stage2=True — including a cycle_summary mirror, since stage
+        metadata is LLM-supplied and nothing constrains extra keys.
+        """
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_for_stage2_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        stale = (fixed_now - timedelta(days=20)).isoformat()
+        members = [
+            {
+                'id': 'ordinary-relay-marker',
+                'created_at': stale,
+                'metadata': {'flag_for_stage2': True, 'task_id': 't1'},
+            },
+            {
+                'id': 'protected-mirror',
+                'created_at': stale,
+                'metadata': {
+                    'kind': 'cycle_summary',
+                    'record_type': 'ledger_stamp',
+                    'run_id': 'r-victim',
+                    'flag_for_stage2': True,
+                },
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=2)
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_mem0_flag_for_stage2_markers(
+            memory_service, 'dark_factory', run_id='r1', now=fixed_now,
+        )
+
+        deleted_ids = {
+            call.kwargs.get('memory_id')
+            for call in memory_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'ordinary-relay-marker'}
+        assert result == 1
+
+
+class TestSweepStaleMem0PoolTombstones:
+    """Every recon-initiated Mem0 delete leaves a queryable tombstone (task 3041).
+
+    The defining signature of the recon-gate-165 / esc-165-1 finding was "no
+    audit trail": an auditor holding a memory uuid had no reachable path to
+    "who deleted it and why", so a designed eviction was indistinguishable
+    from silent data loss. The tombstone is written from the SUCCESS branch
+    only, so a tombstone always means "really gone".
+    """
+
+    @staticmethod
+    def _stale_members(fixed_now):
+        stale = (fixed_now - timedelta(days=20)).isoformat()
+        return [
+            {
+                'id': 'deleted-ok',
+                'created_at': stale,
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': 't1',
+                             'run_id': 'run-victim'},
+            },
+            {
+                'id': 'delete-fails',
+                'created_at': stale,
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': 't2',
+                             'run_id': 'run-victim'},
+            },
+        ]
+
+    @staticmethod
+    def _service(members):
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+
+        async def _delete(**kwargs):
+            if kwargs.get('memory_id') == 'delete-fails':
+                raise RuntimeError('mem0 delete exploded')
+            return None
+
+        memory_service.delete_memory = AsyncMock(side_effect=_delete)
+        return memory_service
+
+    @pytest.mark.asyncio
+    async def test_tombstone_written_only_for_the_successful_delete(self):
+        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = self._stale_members(fixed_now)
+        memory_service = self._service(members)
+
+        with patch.object(
+            tks, 'record_mem0_deletion_tombstones', new=AsyncMock(return_value=1)
+        ) as tombstone:
+            result = await tks._sweep_stale_mem0_pool(
+                memory_service,
+                'dark_factory',
+                'run-deleter',
+                source='stage1_flag_marker',
+                gc_sweep_source='stage1_flag_marker_gc_sweep',
+                max_age_days=14,
+                log_name='_sweep_stale_mem0_flag_markers',
+                now=fixed_now,
+            )
+
+        # ONE batch call for the whole sweep — not one fsync'd ledger commit
+        # per victim (task 3041 amendment pass).
+        assert tombstone.await_count == 1
+        call = tombstone.await_args
+        assert call is not None
+        assert call.args[1] == 'dark_factory'
+        # A tombstone must never claim a record that is still alive: the
+        # failed delete is absent from the batch.
+        assert call.args[2] == [members[0]]
+        assert call.kwargs['deleter'] == 'stage1_flag_marker_gc_sweep'
+        assert call.kwargs['deleting_run_id'] == 'run-deleter'
+
+        # Tombstone writing does not perturb the existing accounting.
+        assert result == 1
+
+    @pytest.mark.asyncio
+    async def test_a_raising_tombstone_helper_cannot_propagate_or_change_the_count(self):
+        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        memory_service = self._service(self._stale_members(fixed_now))
+
+        with patch.object(
+            tks,
+            'record_mem0_deletion_tombstones',
+            new=AsyncMock(side_effect=RuntimeError('ledger db locked')),
+        ):
+            result = await tks._sweep_stale_mem0_pool(
+                memory_service,
+                'dark_factory',
+                'run-deleter',
+                source='stage1_flag_marker',
+                gc_sweep_source='stage1_flag_marker_gc_sweep',
+                max_age_days=14,
+                log_name='_sweep_stale_mem0_flag_markers',
+                now=fixed_now,
+            )
+
+        assert result == 1
+
+    @pytest.mark.asyncio
+    async def test_no_tombstone_when_nothing_was_deleted(self):
+        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {
+                'id': 'fresh',
+                'created_at': (fixed_now - timedelta(days=1)).isoformat(),
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': 't1'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with patch.object(
+            tks, 'record_mem0_deletion_tombstones', new=AsyncMock(return_value=0)
+        ) as tombstone:
+            result = await tks._sweep_stale_mem0_pool(
+                memory_service,
+                'dark_factory',
+                'run-deleter',
+                source='stage1_flag_marker',
+                gc_sweep_source='stage1_flag_marker_gc_sweep',
+                max_age_days=14,
+                log_name='_sweep_stale_mem0_flag_markers',
+                now=fixed_now,
+            )
+
+        assert result == 0
+        tombstone.assert_not_awaited()
