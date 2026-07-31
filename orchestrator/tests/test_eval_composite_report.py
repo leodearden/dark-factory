@@ -1098,9 +1098,13 @@ class TestNoPlanCellScoresZeroNotTheJudgesNumber:
         # meanPQ_all: the cell produced nothing, so it is worth 0 — never 0.95.
         assert row['plan_quality'] == pytest.approx(0.0, abs=1e-9)
         assert row['quality'] == pytest.approx(0.0, abs=1e-9)
-        # Sole config on the fixture → both efficiency axes 1.0.
-        # 0.6*0.0 + 0.2 + 0.2 == 0.4.
-        assert row['composite'] == pytest.approx(0.4, abs=1e-4)
+        # A no-plan cell scores 0.0 on the quality axis AND on the composite —
+        # not 0.0 on quality with full marks on efficiency. The 0.4 this once
+        # asserted WAS the 0.2 cost + 0.2 latency credit a cell earned for
+        # failing to plan (it is the sole config on its fixture, so the *_all
+        # fallback baseline hands it ratios of 1.0 on both axes); the
+        # blend_composite(no_plan=True) hard gate removes it.
+        assert row['composite'] == 0.0
 
     def test_no_plan_cell_is_floored_not_excluded(self):
         """A cap-tainted cell is EXCLUDED (we never asked the model); a no-plan
@@ -1492,6 +1496,92 @@ class TestNoPlanCellCannotSetTheEfficiencyFloor:
         assert select_survivors(report, top_k=1, roles=['architect']) == {
             'architect': ['arch-real'],
         }
+
+
+class TestNoPlanCellCannotOutrankAPlanProducingConfig:
+    """The CROSS-FIXTURE route to the same defect (task 3302 review).
+
+    Barring a no-plan cell from SEEDING its group's efficiency floor closes
+    only the INTRA-group route. Flooring its quality axis bounds 0.6 of the
+    composite weight; the remaining 0.2 cost + 0.2 latency is still collected,
+    and a cell that is the sole member of its ``(fixture, 'plan_only')`` group
+    takes the ``*_all`` fallback baseline — earning ratios of 1.0 on both axes
+    and banking the full 0.40 for having produced NOTHING.
+
+    Measured on the pre-fix HEAD: A = 0.40 outranked B = 0.26 (a real 6-step
+    plan) and ``select_survivors(top_k=2)`` returned ``['C', 'A']`` — the
+    config that produced NO PLAN AT ALL survived and the one that produced a
+    real (if mediocre) plan was cut. That is precisely the "schedule-independent
+    2x cheaper, 2x faster bonus to the candidate that FAILED to plan" this task
+    exists to remove.
+    """
+
+    @staticmethod
+    def _counterexample():
+        return [
+            # Fixture p1: the sole config there, so its group's floor is its
+            # OWN cost/latency via the *_all fallback → ratios 1.0 / 1.0.
+            *(_arch('p1', 'A', tr, plan_steps=0, plan_quality=0.95,
+                    cost_usd=0.3, duration_ms=60000)
+              for tr in (1, 2, 3)),
+            # Fixture p2: a real but mediocre plan, expensive and slow …
+            *(_arch('p2', 'B', tr, plan_steps=6, plan_quality=0.35,
+                    cost_usd=4.0, duration_ms=400000)
+              for tr in (1, 2, 3)),
+            # … against a real, good, cheap and fast plan (its group's floor).
+            *(_arch('p2', 'C', tr, plan_steps=6, plan_quality=0.90,
+                    cost_usd=0.5, duration_ms=50000)
+              for tr in (1, 2, 3)),
+        ]
+
+    def _rows(self):
+        from orchestrator.evals.report import build_composite_report
+
+        report = build_composite_report(self._counterexample())
+        return report, {r['config']: r for r in report['configs']}
+
+    def test_the_no_plan_config_banks_no_efficiency_credit(self):
+        """Hard-gated: a cell that produced nothing scores 0.0, not 0.40."""
+        _, rows = self._rows()
+
+        assert rows['A']['composite'] == 0.0
+
+    def test_the_fix_touches_only_the_no_plan_cell(self):
+        """Both plan-producing composites are exact DEFAULT_COMPOSITE_WEIGHTS
+        identities, unchanged before and after the gate."""
+        _, rows = self._rows()
+
+        # 0.6*0.35 + 0.2*(0.5/4.0) + 0.2*(50/400) == 0.21 + 0.025 + 0.025
+        assert rows['B']['composite'] == pytest.approx(0.26, abs=1e-4)
+        # 0.6*0.90 + 0.2*1.0 + 0.2*1.0 — C is its own group's floor.
+        assert rows['C']['composite'] == pytest.approx(0.94, abs=1e-4)
+
+    def test_survivor_selection_cuts_the_config_that_produced_nothing(self):
+        """The end-to-end consequence, through the real ranking path.
+
+        Today this returns ``['C', 'A']``: the no-plan config survives and B —
+        which produced a real plan — is cut.
+        """
+        from orchestrator.evals.report import select_survivors
+
+        report, _ = self._rows()
+        assert select_survivors(report, top_k=2, roles=['architect']) == {
+            'architect': ['C', 'B'],
+        }
+        assert select_survivors(report, top_k=1, roles=['architect']) == {
+            'architect': ['C'],
+        }
+
+    def test_the_no_plan_cell_is_gated_not_excluded(self):
+        """Its real spend is still reported: it stays in `trials`, in the
+        cost/latency pools, and is counted — only the composite is gated."""
+        _, rows = self._rows()
+
+        assert rows['A']['trials'] == 3
+        assert rows['A']['cost_usd'] == pytest.approx(0.3)
+        assert rows['A']['latency_secs'] == pytest.approx(60.0)
+        assert rows['A']['plan_quality_no_plan'] == 3
+        assert rows['A']['composite'] is not None
 
 
 # ---------------------------------------------------------------------------

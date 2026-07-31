@@ -503,6 +503,54 @@ class TestBlendComposite:
             -5.0, 0.0, 0.0, tests_pass=None, plan_only=True,
         ) == 0.0
 
+    # -- task 3302: the NO-PLAN hard gate ---------------------------------
+    # The exact analogue of ``test_tests_fail_hard_gates_to_zero``, for the
+    # one quality signal a plan-only cell ALWAYS has. Flooring the quality
+    # axis to 0.0 bounds only 0.6 of the weight: the remaining 0.2 cost +
+    # 0.2 latency is still collected, so a no-plan cell caps at 0.40 — and a
+    # cell that is the sole member of its (fixture, plan_only) group takes
+    # the *_all fallback baseline and earns ratios of 1.0 on both axes,
+    # banking the full 0.40 for having FAILED. Measured on the pre-fix HEAD
+    # (task 3302 review): A (plan_steps=0, $0.3/60s) = 0.40 outranked B (a
+    # real 6-step plan, plan_quality=0.35, $4.0/400s) = 0.26 and survived
+    # top_k=2. That is the same "cheap+fast WRONG answer outranks a correct
+    # one" the tests_pass gate exists to prevent.
+
+    def test_no_plan_hard_gates_to_zero(self):
+        """The HARD GATE: no_plan → 0.0 regardless of the efficiency axes."""
+        from orchestrator.evals.metrics import blend_composite
+
+        # Perfect efficiency ratios, but the architect produced nothing.
+        assert blend_composite(
+            0.0, 1.0, 1.0, tests_pass=None, plan_only=True, no_plan=True,
+        ) == 0.0
+
+    def test_no_plan_gate_ignores_a_fabricated_quality_axis(self):
+        """Even the ungated LLM judge's number for a stepless artifact — the
+        `plan_steps=0` beside `plan_quality=0.95` shape — cannot buy credit."""
+        from orchestrator.evals.metrics import blend_composite
+
+        assert blend_composite(
+            0.95, 1.0, 1.0, tests_pass=None, plan_only=True, no_plan=True,
+        ) == 0.0
+
+    def test_no_plan_defaults_false_so_every_existing_blend_is_identical(self):
+        """Additive: the default leaves the plan-only path byte-identical."""
+        from orchestrator.evals.metrics import blend_composite
+
+        # 0.6*0.9 + 0.2 + 0.2 == 0.94, exactly as before the gate existed.
+        assert blend_composite(
+            0.9, 1.0, 1.0, tests_pass=None, plan_only=True,
+        ) == pytest.approx(0.94, abs=1e-4)
+
+    def test_explicit_no_plan_false_is_unchanged(self):
+        """Passing the flag off must be identical to omitting it."""
+        from orchestrator.evals.metrics import blend_composite
+
+        assert blend_composite(
+            0.9, 1.0, 1.0, tests_pass=None, plan_only=True, no_plan=False,
+        ) == pytest.approx(0.94, abs=1e-4)
+
 
 # ---------------------------------------------------------------------------
 # Amendment (reviewer: code-reuse) — the cost primitives (_FALLBACK_PRICE / _rate)
