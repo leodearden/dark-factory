@@ -488,6 +488,42 @@ class TestSampleResultAccounting:
                 f'max_bytes={max_bytes}'
             )
 
+    def test_the_sampling_cut_never_hides_a_night_from_the_predicate(self):
+        """``below_sampling_cut`` must not open a NEW silent-suppression hole.
+
+        The failure this task exists to end is "real signal found, nothing
+        digested, night looks quiet". A third drop bucket is a fresh chance
+        to reintroduce it: if the cut could swallow an entire night's
+        survivors, the run would report ``selected=0 budget_skipped=0`` --
+        exactly what a genuine no-change night reports -- and
+        ``nightly._report_sample_outcome`` would stay silent.
+
+        It cannot, structurally: ``candidate_count`` is floored at
+        ``min(per_stratum_min, len(survivors))``, so ANY survivor yields at
+        least one candidate, and every candidate lands in ``selected`` or
+        ``budget_skipped``. Swept rather than argued, over stratum sizes
+        0..17 x eight budget regimes including 0.
+        """
+        base = self._build_narrowed_records()
+        for size in range(len(base) + 1):
+            for max_bytes in (0, 1, 999, 1_000, 1_001, 2_000, 3_000, 300_000):
+                result = mod.stratified_sample(
+                    base[:size], self._config(max_bytes), cost_fn=self._COST,
+                )
+                looks_like_nothing_to_sample = (
+                    not result.selected and result.budget_skipped == 0
+                )
+                had_real_signal = (
+                    result.total_records
+                    - result.zero_signal_dropped
+                    - result.dedupe_collapsed
+                ) > 0
+                assert not (looks_like_nothing_to_sample and had_real_signal), (
+                    f'n={size} max_bytes={max_bytes}: {result.below_sampling_cut} '
+                    f'record(s) of real signal, yet the night reads as a genuine '
+                    f'no-change night'
+                )
+
     def test_the_operator_line_reports_the_sampling_cut(self):
         """The counter is worthless if it never reaches the operator."""
         result = mod.stratified_sample(
