@@ -22,7 +22,23 @@ These are small, single-purpose helpers in the ``reconciliation/`` convention
 
 from __future__ import annotations
 
+import re
 from typing import Any
+
+# Canonical 36-char UUID, the ONLY shape accepted as a forwarding pointer.
+# Anchored end-to-end so a uuid embedded in prose does not qualify: a
+# replacement value must BE an id, not merely mention one.
+_CANONICAL_UUID_RE = re.compile(
+    r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-'
+    r'[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+)
+
+# Tier-C (``x_``) metadata key holding the old->new forwarding records. The
+# ``x_`` namespace is silently admitted by ``shared.task_metadata.parse_metadata``
+# (task_metadata.py:933) with no registration and no SchemaWarning, and
+# ``recon_write_policy.is_terminal_annotation_add`` already blesses ``x_``
+# annotation adds, so no blessed-key change is needed.
+X_CITATION_TOMBSTONE_KEY = 'x_memory_citation_tombstones'
 
 
 async def verify_cited_memories(
@@ -242,3 +258,59 @@ def repoint_metadata(
         return (_rewrite(metadata) if isinstance(metadata, dict) else metadata), 0
 
     return _rewrite(metadata), count
+
+
+def is_concrete_memory_id(value: Any) -> bool:
+    """Return True only for a well-formed canonical 36-char memory UUID.
+
+    This is the mechanical guard against **incident failure mode (2)**. During
+    the incident Stage 2 wrote a "correction" instructing dispatch to re-derive
+    the canonical entry via ``search(query=...)``. Running that query live
+    returned only superseded cluster members, routing dispatch straight back
+    into the contradictory advice that consolidation existed to collapse. A
+    forwarding pointer is only a pointer if it is a concrete id; prose that
+    describes how to *find* an id is not one.
+
+    Making UUID-shape a hard precondition — of both
+    :func:`build_citation_tombstone` and the delete-side guard — turns "never
+    emit a re-derive-via-search instruction" from a prose rule into a checkable
+    one. The full-36-char requirement also aligns with the truncated-UUID
+    hazard ``prompts/stage1.py:99-113`` already warns about: an 8-char prefix
+    is not a valid delete id and is not a valid forwarding pointer either.
+    """
+    return isinstance(value, str) and bool(_CANONICAL_UUID_RE.match(value))
+
+
+def build_citation_tombstone(
+    superseded_id: str,
+    replacement_id: str,
+    paths: list[str],
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    """Build the old->new forwarding record for ``X_CITATION_TOMBSTONE_KEY``.
+
+    Written in the SAME ``update_task`` call as the repoint itself, so a task
+    can never end up rewritten-but-unlabelled. It preserves the provenance the
+    repoint would otherwise destroy — which id used to be cited, which id
+    replaced it, exactly where, and in which run — while confining every
+    remaining occurrence of the dead id to one explicitly-labelled field.
+
+    Raises ``ValueError`` when ``replacement_id`` is not concrete
+    (see :func:`is_concrete_memory_id`). This refusal is the point: a tombstone
+    whose replacement is a search instruction would preserve the dangling
+    pointer under a new name rather than close it.
+    """
+    if not is_concrete_memory_id(replacement_id):
+        raise ValueError(
+            'replacement_memory_id must be a concrete 36-char UUID, got '
+            f'{replacement_id!r}. A search instruction (e.g. '
+            "'re-derive ... via search(query=...)') is never an acceptable "
+            'forwarding pointer — it re-derives to the superseded entries the '
+            'consolidation was collapsing.'
+        )
+    return {
+        'superseded_memory_id': superseded_id,
+        'replacement_memory_id': replacement_id,
+        'paths': list(paths),
+        'run_id': run_id,
+    }
