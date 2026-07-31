@@ -110,17 +110,21 @@ async def _await_trap_installed(
     # measured headroom and the derivation of this value.
     timeout: float = 10.0,
 ) -> None:
-    """Wait for a shell child to announce that its SIGTERM trap is armed.
+    """Wait for a shell child to announce a readiness precondition via stdout.
 
-    Callers spawn a shell whose command starts with ``trap '' TERM; echo
-    ready; ...``.  Bash only reaches the ``echo`` once the preceding `trap`
-    builtin has returned, so observing the ``ready`` line on stdout is a
-    happens-before edge proving SIGTERM's disposition is already SIG_IGN in
-    the kernel — not a wall-clock guess about how long installation takes
-    (the fixed ``asyncio.sleep(0.2)`` this helper replaces was exactly such
-    a guess, and it starved under CPU oversubscription).  See task 3337 for
-    the measurement backing this claim (readiness latency and a direct
-    ``/proc/<pid>/status`` SigIgn check at the instant "ready" arrives).
+    Callers spawn a shell whose command ends each preceding step with
+    ``echo ready`` before continuing (e.g. ``trap '' TERM; echo ready;
+    sleep 30``, or ``sleep 60 & sleep 60 & echo ready; wait``).  Bash only
+    reaches the ``echo`` once every preceding builtin/job-control step has
+    completed, so observing the ``ready`` line on stdout is a happens-before
+    edge proving whatever precondition it was placed after (SIGTERM already
+    SIG_IGN, both background jobs already forked, ...) has already happened
+    in the kernel — not a wall-clock guess about how long that step takes
+    (the fixed ``asyncio.sleep(0.2)`` this helper replaces in each caller was
+    exactly such a guess, and it starved under CPU oversubscription).  See
+    task 3337 for the measurement backing the SIGTERM-trap case (readiness
+    latency and a direct ``/proc/<pid>/status`` SigIgn check at the instant
+    "ready" arrives) and task 3347 for the grandchild-fork case.
 
     Raises (never a bare ``TimeoutError``, and never returns normally) if
     the precondition is not observed:
@@ -334,15 +338,32 @@ class TestTerminateProcessGroup:
         pgrep must report no processes in the group.
         """
         proc = await asyncio.create_subprocess_shell(
-            'sleep 60 & sleep 60 & wait',
+            'sleep 60 & sleep 60 & echo ready; wait',
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
         )
         pgid = proc.pid
 
-        # Brief settle so grandchildren actually start.
-        await asyncio.sleep(0.2)
+        # The "ready" line is a happens-before edge proving both background
+        # `sleep`s have already been forked (bash only reaches the `echo`
+        # after both `&` jobs are launched) — rather than a wall-clock
+        # assumption that a fixed sleep was long enough (task 3347 de-flake;
+        # the fixed 0.2s settle it replaces did not fail loudly when too
+        # short — it silently degraded this test to vacuous instead).
+        await _await_trap_installed(proc)
+
+        # Assert the precondition directly — bash + 2 sleeps must actually
+        # be in the group before we terminate it — so this test fails loudly
+        # rather than silently passing vacuously if that ever regresses.
+        snapshot = snapshot_process_group(pgid)
+        process_count = sum(
+            1 for line in snapshot.splitlines() if line.startswith('  pid=')
+        )
+        assert process_count == 3, (
+            f'expected 3 processes (bash + 2 sleeps) in group {pgid} before '
+            f'terminating, got {process_count}:\n{snapshot}'
+        )
 
         await terminate_process_group(proc, pgid, grace_secs=5.0)
 
