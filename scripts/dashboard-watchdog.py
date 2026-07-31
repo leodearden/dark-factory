@@ -781,8 +781,26 @@ def tick() -> None:
 
 
 def main() -> int:
-    """Entry point for the oneshot unit."""
-    tick()
+    """Entry point for the oneshot unit. ALWAYS exits 0.
+
+    Mirrors orchestrator-watchdog.main()'s isolation. A watchdog that exits
+    non-zero puts its oneshot into `failed`, where it supervises nothing, is
+    silently skipped by some restart tooling, and shows up as a red unit an
+    operator must clear by hand before supervision resumes. That is a far
+    worse outcome than one skipped tick 30 seconds before the next one.
+
+    Swallowing here is safe precisely because it cannot cause an actuation:
+    an exception unwinding out of tick() means the tick did NOT reach the
+    restart branch (invariant I5 — never act on a probe that was not run).
+    Failing quietly therefore always fails toward doing nothing.
+    """
+    try:
+        tick()
+    except Exception as exc:  # noqa: BLE001 -- a wedged tick must not fail the unit
+        logger.warning(
+            f"tick() raised {type(exc).__name__}: {exc}; skipping this tick. "
+            "The unit still exits 0 so the timer keeps firing."
+        )
     return 0
 
 
