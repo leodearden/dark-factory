@@ -19,13 +19,17 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
-# Real (non-TYPE_CHECKING) import: is_zero_output_timeout is CALLED by the
-# ZeroOutputWedge tier below, not just referenced as a type annotation. This
-# keeps the transcript-authoritative + legacy-fallback wedge definition
-# single-sourced (cli_invoke.py:357) so it cannot drift from this module's
-# copy. Safe: shared.cli_invoke does not import shared.invocation_outcome, so
+# Real (non-TYPE_CHECKING) imports: BOTH predicates are CALLED by tiers below,
+# not just referenced as type annotations, and both stay single-sourced in
+# cli_invoke.py so this module's tiers cannot drift from the definitions their
+# other consumers use — is_zero_output_timeout keeps the
+# transcript-authoritative + legacy-fallback wedge definition, and
+# is_server_error_status keeps the 5xx band (task 3314 / INV-5: the ServerError
+# tier, classify_agent_failure's 5xx rule and the orchestrator consumers all
+# call the same function). Safe: shared.cli_invoke does not import
+# shared.invocation_outcome at module top (only lazily inside functions), so
 # this introduces no import cycle.
-from shared.cli_invoke import is_zero_output_timeout
+from shared.cli_invoke import is_server_error_status, is_zero_output_timeout
 
 if TYPE_CHECKING:
     from shared.cli_invoke import AgentResult
@@ -38,6 +42,7 @@ __all__ = [
     'AuthFailed',
     'CliLocalError',
     'ModelNotFound',
+    'ServerError',
     'ZeroOutputWedge',
     'Failure',
     'classify_invocation',
@@ -98,6 +103,26 @@ class ModelNotFound(InvocationOutcome):
     """
 
     reason: str
+
+
+@dataclass(frozen=True)
+class ServerError(InvocationOutcome):
+    """A server-side (HTTP 5xx, including 529 Overloaded) API failure
+    (task 3314, plans/server-side-api-error-handling-prd.md).
+
+    NOT account-scoped (PRD decision 4): the 2026-07-29 incident data showed
+    the FRESHEST account carrying the highest failure rate, i.e. the provider
+    was degraded, not any one account's quota.  So ``invoke_with_cap_retry``
+    must neither fail over to another account nor mutate account state on
+    this outcome — failing over only multiplies load on an already-degraded
+    provider.  It is transient: the caller (workflow/scheduler) owns the
+    requeue, with pacing.
+
+    Declared between ``ModelNotFound`` and ``ZeroOutputWedge`` so declaration
+    order tracks classification precedence.
+    """
+
+    status: int
 
 
 @dataclass(frozen=True)
@@ -370,7 +395,8 @@ def classify_invocation(
 
     Total and pure: every ``AgentResult`` maps to exactly one variant, in
     precedence order AuthFailed > ModelNotFound (404) > OK > ModelNotFound
-    (marker) > CliLocalError > CapHit/NearCap > ZeroOutputWedge > Failure.
+    (marker) > CliLocalError > CapHit/NearCap > ServerError > ZeroOutputWedge
+    > Failure.
     Reads only ``result`` (and ``backend`` / ``strict_confirm``) — no I/O,
     no gate mutation.
     """
@@ -477,6 +503,25 @@ def classify_invocation(
             if prefix.lower() in combined_lower:
                 reason = _extract_cap_message(combined, prefix) or f'Near-cap warning: {prefix}'
                 return NearCap(reason=reason)
+
+    # ServerError — a server-side (HTTP 5xx, incl. 529 Overloaded) API failure.
+    # Both sides of this placement are load-bearing (task 3314):
+    #
+    # BELOW CapHit/NearCap, because a 5xx body never carries cap prefixes of
+    # its own, and 429-body semantics must not move: a 429 is not in the 5xx
+    # band, so it still reaches the cap tier above and keeps driving cap
+    # accounting / AllAccountsCappedException exactly as before. A 5xx that
+    # DOES carry a real cap body is a cap (corpus row
+    # server_error_5xx_with_cap_body_is_cap).
+    #
+    # ABOVE ZeroOutputWedge, because a SIGTERM-flushed 529 on a
+    # watchdog-killed CLI is a PROVIDER outage, not a local wedge — that is
+    # the 2026-07-29 incident this tier exists for. Ranking the wedge first
+    # discarded the 5xx evidence and sent a provider outage down the
+    # local-recovery path instead of the transient-requeue lane. That
+    # ordering is the whole point of the tier.
+    if is_server_error_status(result.api_error_status):
+        return ServerError(status=result.api_error_status)
 
     # ZeroOutputWedge — a full-timeout invocation that produced no transcript
     # progress. Delegates to is_zero_output_timeout (cli_invoke.py:357) so the

@@ -20,7 +20,7 @@ every record and asserts `classify_invocation` produces the recorded
   "cost_usd": <optional float, default 0.0>,
   "success": <optional bool, default false>,
   "strict_confirm": <bool, required>,
-  "expected": "OK" | "CapHit" | "NearCap" | "AuthFailed" | "CliLocalError" | "ZeroOutputWedge" | "Failure",
+  "expected": "OK" | "CapHit" | "NearCap" | "AuthFailed" | "CliLocalError" | "ServerError" | "ZeroOutputWedge" | "Failure",
   "resets_at": "set" | "none" (optional; only meaningful when expected == "CapHit"),
   "provenance": "<fix-commit sha(s) and/or source test, free text>"
 }

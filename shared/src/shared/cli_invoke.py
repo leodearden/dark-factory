@@ -16,7 +16,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeGuard
 
 # VllmBridge depends on aiohttp, which is not installed in every consumer
 # environment (e.g. dashboard's venv).  Tolerate ImportError so that callers
@@ -148,6 +148,7 @@ __all__ = [
     'ended_awaiting_background_for_session',
     'invoke_claude_agent',
     'invoke_with_cap_retry',
+    'is_server_error_status',
     'is_timed_out_with_progress',
     'is_zero_output_timeout',
     'read_transcript_records',
@@ -546,6 +547,43 @@ def is_timed_out_with_progress(result: AgentResult) -> bool:
     return result.timed_out and (result.transcript_turns or 0) > 0
 
 
+def is_server_error_status(status: int | None) -> TypeGuard[int]:
+    """Return True when *status* is a server-side HTTP error (5xx).
+
+    PRD contract C1 (plans/server-side-api-error-handling-prd.md): a 5xx —
+    including 529 "Overloaded" — is a PROVIDER-side failure.  It is not
+    account-scoped and not caused by anything local, so it must be routed to
+    the transient-requeue lane rather than to cap/auth accounting.
+
+    This is the single canonical definition (INV-5) shared by:
+
+    - The ``ServerError`` tier in ``shared.invocation_outcome.
+      classify_invocation`` (ranked below CapHit/NearCap, above
+      ZeroOutputWedge).
+    - ``classify_agent_failure``'s 5xx rule, which emits the verbatim
+      ``agent API error: HTTP <status>`` marker.
+    - Via ``shared``'s re-export, the orchestrator scheduler / workflow
+      consumers landing in PRD tasks beta/gamma/delta.
+
+    Every one of those callers must call THIS function rather than inline a
+    ``500 <= n <= 599`` check, so the band has exactly one definition.
+
+    ``None`` means "no structured status was reported" and is False — the
+    absence of evidence is never evidence of a server error.
+
+    4xx statuses deliberately fall OUTSIDE this band so the existing routing is
+    untouched: 401/403 stay with ``AuthFailed``, 404 with ``ModelNotFound``,
+    and 429 keeps its cap carve-out.
+
+    Typed as a ``TypeGuard`` (a plain ``bool`` at runtime) so a True result
+    also narrows ``int | None`` to ``int`` for the caller — the same narrowing
+    the inline ``== 404`` / ``in (401, 403)`` status checks in
+    ``classify_invocation`` already give, which is what lets the ``ServerError``
+    tier pass ``result.api_error_status`` straight to ``ServerError(status=...)``.
+    """
+    return status is not None and 500 <= status <= 599
+
+
 class AgentFailureKind(enum.StrEnum):
     """Classification of an AgentResult.  SUCCESS is the non-failure case."""
 
@@ -590,28 +628,60 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
        shadow a genuine success — and above the timeout rule, which it cannot
        shadow either since the two flags are mutually exclusive by
        construction: the timeout path never sets this flag).
-    3. ``result.timed_out`` → ``TIMED_OUT`` (summary distinguishes a
+    3. ``is_server_error_status(result.api_error_status)`` → ``API_ERROR``
+       (task 3314, plans/server-side-api-error-handling-prd.md). Placed
+       ABOVE the timeout rule: a watchdog SIGTERM kill flushes the CLI's
+       result JSON with ``api_error_status`` set (2026-07-29 incident), so
+       ranking ``timed_out`` first discarded the 5xx evidence and misfiled a
+       provider outage as a zero-output wedge — and the
+       ``agent API error: HTTP <status>`` marker the scheduler's transient
+       requeue lane keys on was never produced. The summary's prefix is that
+       verbatim marker; a free-form kill-context suffix is appended only when
+       ``result.timed_out``, so the non-timed-out summary is unchanged.
+       This rule outranks rule 4 ONLY — three negative guards keep it from
+       shadowing the rules that sit below rule 4 in source order but ABOVE
+       it in precedence, i.e. it behaves as rule "3.5":
+       ``is_timed_out_with_progress`` (defers to rule 4's productive-kill
+       branch), ``subtype == 'error_max_turns'`` (defers to rule 5) and
+       ``ModelNotFound`` (defers to rule 6, matching
+       ``classify_invocation``'s ModelNotFound > ServerError ranking —
+       INV-5).
+    4. ``result.timed_out`` → ``TIMED_OUT`` (summary distinguishes a
        PRODUCTIVE kill — ``transcript_turns > 0`` — from a no-progress wedge;
-       see ``is_timed_out_with_progress``/reify-4827).
-    4. ``result.subtype == 'error_max_turns'`` → ``MAX_TURNS``
+       see ``is_timed_out_with_progress``/reify-4827). A productive kill
+       keeps this kind even when a 5xx status rode along (rule 3's first
+       guard): the wall-clock ceiling, not the provider, is what ended a run
+       that did real agentic work, and downstream consumers key on
+       ``TIMED_OUT`` for that (``dry_run_unblock``'s infra-failure kinds,
+       the scheduler's genuine — not transient — requeue lane).
+    5. ``result.subtype == 'error_max_turns'`` → ``MAX_TURNS``
        (high ``turns`` + non-zero ``output_tokens`` but empty ``output``).
-    5. the outcome is ``ModelNotFound`` → ``MODEL_NOT_FOUND`` (TERMINAL —
+       Rule 3 defers to this so a saturated run carrying an incidental 5xx
+       is still detectable as saturation (workflow ``_stamp_simple_saturated``).
+    6. the outcome is ``ModelNotFound`` → ``MODEL_NOT_FOUND`` (TERMINAL —
        no cross-account retry; placed ABOVE the ``api_error_status`` rule
        below because a 404 also sets ``api_error_status`` and would
-       otherwise be mis-tagged as transient ``API_ERROR``).
-    6. ``result.api_error_status`` set, OR the outcome is ``AuthFailed`` →
+       otherwise be mis-tagged as transient ``API_ERROR``. Rule 3 defers to
+       this for the same reason: a ModelNotFound marker alongside a 5xx
+       status is terminal for ``invoke_with_cap_retry``, so emitting the
+       transient marker for it would tell the scheduler to requeue a run
+       the retry loop already gave up on).
+    7. ``result.api_error_status`` set, OR the outcome is ``AuthFailed`` →
        ``API_ERROR`` (includes status code in the summary; transient — worth
        retrying against another account). ``AuthFailed`` ({401, 403}) is a
        strict subset of "api_error_status is not None", so the ``OR`` never
        changes the verdict — it keeps this rule visibly tied to the
        InvocationOutcome contract without narrowing API_ERROR away from
-       429/5xx, which InvocationOutcome does not model.
-    7. ``result.subtype == 'error_empty_output'`` → ``EMPTY_OUTPUT``
+       429, which InvocationOutcome does not model. Since rule 3 landed, only
+       NON-5xx statuses ever reach here (a 5xx is claimed above), so this
+       rule now covers 4xx/429 exclusively — its verdict for those is
+       unchanged.
+    8. ``result.subtype == 'error_empty_output'`` → ``EMPTY_OUTPUT``
        (may be transient).
-    8. ``result.schema_salvaged`` → ``STRUCTURAL`` (schema-salvage: the
+    9. ``result.schema_salvaged`` → ``STRUCTURAL`` (schema-salvage: the
        subtype looked like an error but a valid structured output was
        recovered; callers usually treat as success).
-    9. otherwise → ``UNKNOWN``.
+    10. otherwise → ``UNKNOWN``.
 
     ``diagnostic_detail`` always includes: subtype, turns, cost_usd,
     duration_ms, timed_out, transcript_turns, api_error_status, output
@@ -652,6 +722,64 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
                 'agent ended its turn awaiting a still-pending backgrounded '
                 'task (work abandoned mid-turn)'
             ),
+            diagnostic_detail=diagnostic_detail,
+        )
+    # Server-side (5xx) API failure — ranked ABOVE the timeout rule below.
+    # A watchdog SIGTERM kill flushes the CLI's result JSON on the way out, so
+    # a timed-out result can still carry hard 5xx evidence; ranking timed_out
+    # first threw that evidence away and reported a provider outage as a local
+    # zero-output wedge (2026-07-29 incident). Reads is_server_error_status
+    # rather than an inline range check so the 5xx band has exactly one
+    # definition (INV-5) shared with invocation_outcome's ServerError tier.
+    #
+    # The `agent API error: HTTP <status>` PREFIX is a cross-module contract:
+    # orchestrator scheduler.py's _API_ERROR_REASON_RE searches block_reason
+    # for it and reads the status out to route the transient requeue lane, so
+    # it must stay verbatim and leading. The kill-context SUFFIX is free-form
+    # operator forensics (PRD open question 5) and is emitted only on the
+    # timed-out path, which keeps the non-timed-out summary byte-identical to
+    # what callers already assert on.
+    #
+    # The three guards make this rule outrank the timeout rule ONLY. Source
+    # order alone would also put it above max_turns and ModelNotFound, which
+    # sit BELOW the timeout rule but ABOVE this one in precedence:
+    # - is_timed_out_with_progress: a PRODUCTIVE kill (transcript_turns > 0)
+    #   is a wall-clock timeout that happened to carry a 5xx, not a
+    #   pre-first-token outage. Claiming otherwise both mis-phrases the
+    #   summary and routes a productive kill into the transient-requeue lane
+    #   / out of dry_run_unblock's infra-failure kinds. The 5xx is still in
+    #   diagnostic_detail. NOTE this is a deliberate, benign divergence from
+    #   classify_invocation, which still returns ServerError for that shape:
+    #   in invoke_with_cap_retry the ServerError branch and the
+    #   progress-timeout guard below it both confirm the slot and break, so
+    #   the retry loop's behaviour is identical either way.
+    # - error_max_turns: saturation detection (workflow's
+    #   _stamp_simple_saturated) must survive an incidental 5xx.
+    # - ModelNotFound: classify_invocation ranks ModelNotFound ABOVE
+    #   ServerError, and the cap-retry loop treats it as TERMINAL. Emitting
+    #   the transient marker here would have the scheduler requeue a run the
+    #   retry loop already gave up on — the exact mis-tagging rule 6's
+    #   placement exists to prevent (INV-5: the two classifiers agree).
+    if (
+        is_server_error_status(result.api_error_status)
+        and not is_timed_out_with_progress(result)
+        and result.subtype != 'error_max_turns'
+        and not isinstance(outcome, ModelNotFound)
+    ):
+        summary = f'agent API error: HTTP {result.api_error_status}'
+        if result.timed_out:
+            # Guarded above, so transcript_turns is 0 or None here — never a
+            # positive count. Only the 0 case can truthfully claim the kill
+            # landed before the first token; None means the transcript was
+            # never read, which is not evidence of either.
+            elapsed_secs = result.duration_ms // 1000
+            if result.transcript_turns == 0:
+                summary += f' (killed at {elapsed_secs}s pre-first-token; transcript_turns=0)'
+            else:
+                summary += f' (killed at {elapsed_secs}s; transcript_turns=unknown)'
+        return AgentFailureClass(
+            kind=AgentFailureKind.API_ERROR,
+            summary=summary,
             diagnostic_detail=diagnostic_detail,
         )
     if result.timed_out:
@@ -1154,6 +1282,7 @@ async def invoke_with_cap_retry(
                     CapHit,
                     CliLocalError,
                     ModelNotFound,
+                    ServerError,
                     ZeroOutputWedge,
                     classify_invocation,
                 )
@@ -1310,16 +1439,37 @@ async def invoke_with_cap_retry(
                     and result.turns <= 1
                     and result.duration_ms < 5000
                 ):
-                    if isinstance(outcome, CliLocalError):
-                        # A recognised local CLI/usage error (e.g. --session-id
-                        # collision) exits zero-cost and instantly, but it is NOT a
-                        # usage cap.  Counting it as a cap loops forever (reify-3604).
-                        # Fall through: Branch C retries fresh when resuming, else the
-                        # failed result is returned for normal verify/steward handling.
-                        logger.warning(
-                            f'{label}: zero-cost instant exit is a CLI error, not a cap '
-                            f'(stderr={result.stderr[:160]!r}) — not counting as cap hit',
-                        )
+                    if isinstance(outcome, (CliLocalError, ServerError)):
+                        # Two different causes, one mechanism: a zero-cost instant
+                        # exit that we can POSITIVELY attribute to something other
+                        # than a cap must not be counted as a cap.
+                        #
+                        # CliLocalError — a recognised local CLI/usage error (e.g.
+                        # --session-id collision) exits zero-cost and instantly, but
+                        # it is NOT a usage cap.  Counting it as a cap loops forever
+                        # (reify-3604).  Falls through: Branch C retries fresh when
+                        # resuming, else the failed result is returned for normal
+                        # verify/steward handling.
+                        #
+                        # ServerError — a fast 5xx (e.g. 529 Overloaded) has exactly
+                        # the same zero-cost / <=1-turn / sub-5s shape, so without
+                        # this escape the net marks a perfectly HEALTHY account
+                        # CAPPED and fails over pointlessly (2026-07-29 incident).
+                        # This escape is what prevents that.  It does NOT fall
+                        # through to Branch C: the terminal ServerError branch
+                        # immediately below exits the loop first, so a 5xx never
+                        # reaches the resume-fresh fallback.
+                        if isinstance(outcome, ServerError):
+                            logger.warning(
+                                f'{label}: zero-cost instant exit is a server-side API '
+                                f'error (HTTP {outcome.status}), not a cap — not '
+                                f'counting as cap hit, not mutating account state',
+                            )
+                        else:
+                            logger.warning(
+                                f'{label}: zero-cost instant exit is a CLI error, not a cap '
+                                f'(stderr={result.stderr[:160]!r}) — not counting as cap hit',
+                            )
                     else:
                         logger.warning(
                             f'{label}: suspicious zero-cost instant exit (turns={result.turns}, '
@@ -1369,6 +1519,59 @@ async def invoke_with_cap_retry(
 
                             await asyncio.sleep(cooldown)
                             continue
+
+                # Server-side API error is TERMINAL for this loop (task 3314,
+                # PRD decision 4).  Server errors are NOT account-scoped — the
+                # 2026-07-29 incident data showed the FRESHEST account carrying
+                # the HIGHEST failure rate — so cross-account failover only
+                # multiplies load on an already-degraded provider without ever
+                # finding a healthy account.  The failed result goes straight
+                # back to the caller, and the workflow/scheduler (PRD tasks
+                # γ/β) owns the requeue, with pacing.
+                #
+                # `slot.confirm` (mirroring the ModelNotFound terminal branch
+                # above) settles the slot as a normal completion WITHOUT any
+                # cap/auth transition: "no account mutation" means no phase
+                # change, not an unsettled slot.
+                #
+                # Placement is load-bearing in three directions:
+                # - AFTER slot.detect_cap_hit, so the loop's control flow
+                #   mirrors the sum type's CapHit > ServerError precedence
+                #   exactly and a 429/cap-body result keeps today's cap-and-
+                #   failover path byte-for-byte.
+                # - AFTER the heuristic net, which keeps that net's ServerError
+                #   escape live as defence-in-depth (it, not this break, is
+                #   what stops a fast 529 from marking a healthy account
+                #   CAPPED).
+                # - BEFORE the "resume failed → retry fresh" fallback below,
+                #   which would otherwise restart the invocation on a new slot
+                #   — an implicit failover the PRD forbids.
+                #
+                # Note: because ServerError now outranks ZeroOutputWedge, the
+                # wedge resume-guard above no longer fires for a timed-out 5xx.
+                # This branch exits the loop instead, so the orphaned provider
+                # session is still never re-resumed (PRD decision 2's intent) —
+                # which is why is_zero_output_timeout itself stays deliberately
+                # shape-based and untouched.
+                #
+                # RESIDUAL GAP (deliberately not closed here): the result this
+                # branch returns still satisfies is_zero_output_timeout(), so
+                # workflow.py's zero-output hang circuit breaker — which keys on
+                # that predicate — still counts a 5xx-caused timeout toward
+                # consecutive_zero_output and can block the task as an
+                # infra_issue.  Making that consumer cause-aware is PRD task γ's
+                # job, not this loop's; the hazard is closed at the cap-retry
+                # layer only.
+                if isinstance(outcome, ServerError):
+                    logger.warning(
+                        f'{label}: server-side API error (HTTP {outcome.status}) on '
+                        f'account {account_name} — not account-scoped, no '
+                        f'cross-account failover; returning result to caller for '
+                        f'transient requeue',
+                    )
+                    if not unattributed_cap:
+                        slot.confirm(result.cost_usd)
+                    break
 
                 # Progress-timeout guard (reify-4827, task 2360 fix #2): a
                 # RESUMED invocation that hit the working-regime ceiling but
