@@ -120,5 +120,130 @@ def test_constants_are_not_accidentally_aliased():
     assert "FAIL_STREAK = MAX_RESTARTS" not in source
 
 
+# ---------------------------------------------------------------------------
+# probe_health()
+# ---------------------------------------------------------------------------
+
+
+class _FakeResponse:
+    """Minimal context-manager stand-in for urllib.request.urlopen's return value."""
+
+    def __init__(self, status: int = 200) -> None:
+        self.status = status
+
+    def __enter__(self) -> "_FakeResponse":
+        return self
+
+    def __exit__(self, *exc_info: object) -> bool:
+        return False
+
+
+def _patch_urlopen(monkeypatch, mod, outcome):
+    """Point *mod*'s urlopen at a fake; return the list of (args, kwargs) calls.
+
+    *outcome* is either a response object to return or an exception to raise.
+    """
+    calls: list[tuple[tuple, dict]] = []
+
+    def fake_urlopen(*args, **kwargs):
+        calls.append((args, kwargs))
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
+    return calls
+
+
+def test_probe_health_true_on_200(monkeypatch):
+    mod = _load_watchdog()
+    _patch_urlopen(monkeypatch, mod, _FakeResponse(200))
+    assert mod.probe_health() is True
+
+
+def test_probe_health_false_on_503(monkeypatch):
+    """A 503 is a FAILURE here — the DELIBERATE inversion of
+    scripts/orchestrator-watchdog.py's probe_health, which returns True on 503.
+
+    That probe guards fused-memory, a shared server whose /health returns 503
+    when a backing STORE is degraded: restarting the process would not fix a
+    down store, so any HTTP response there means "the event loop is alive".
+
+    This probe targets a bare ``{'status': 'ok'}`` handler that performs no
+    I/O at all. If it answers anything other than 200, the app router itself
+    is broken — which a restart CAN fix. The two scripts sit side by side in
+    scripts/ and look almost identical, so do NOT "fix" one to match the other.
+    """
+    mod = _load_watchdog()
+    import urllib.error
+
+    err = urllib.error.HTTPError(mod.PROBE_URL, 503, "Service Unavailable", {}, None)  # type: ignore[arg-type]
+    _patch_urlopen(monkeypatch, mod, err)
+    assert mod.probe_health() is False
+
+
+def test_probe_health_false_on_404_httperror(monkeypatch):
+    """A 404 (the shallow route missing entirely) is a failure."""
+    mod = _load_watchdog()
+    import urllib.error
+
+    err = urllib.error.HTTPError(mod.PROBE_URL, 404, "Not Found", {}, None)  # type: ignore[arg-type]
+    _patch_urlopen(monkeypatch, mod, err)
+    assert mod.probe_health() is False
+
+
+def test_probe_health_false_on_non_200_response_object(monkeypatch):
+    """A non-200 delivered as a RESPONSE rather than an exception is also a
+    failure — pins the ``status == 200`` check itself, not just the except
+    branches. (A custom opener, or a redirect handler that returned a 3xx,
+    reaches probe_health this way.)"""
+    mod = _load_watchdog()
+    _patch_urlopen(monkeypatch, mod, _FakeResponse(204))
+    assert mod.probe_health() is False
+
+
+def test_probe_health_false_on_urlerror(monkeypatch):
+    """Connection refused — the dashboard process is not listening at all."""
+    mod = _load_watchdog()
+    import urllib.error
+
+    _patch_urlopen(monkeypatch, mod, urllib.error.URLError(ConnectionRefusedError(111)))
+    assert mod.probe_health() is False
+
+
+def test_probe_health_false_on_timeout(monkeypatch):
+    """A probe that never returns within PROBE_TIMEOUT is a failure.
+
+    ``socket.timeout`` is an alias of the builtin TimeoutError on 3.10+; both
+    spellings are exercised so neither regresses.
+    """
+    import socket
+
+    mod = _load_watchdog()
+    _patch_urlopen(monkeypatch, mod, socket.timeout("timed out"))
+    assert mod.probe_health() is False
+
+    mod2 = _load_watchdog()
+    _patch_urlopen(monkeypatch, mod2, TimeoutError("timed out"))
+    assert mod2.probe_health() is False
+
+
+def test_probe_health_requests_exactly_probe_url_with_probe_timeout(monkeypatch):
+    """The probe must hit PROBE_URL with an explicit bounded timeout.
+
+    Without ``timeout=`` urlopen inherits the (unbounded) global default socket
+    timeout, so a hung dashboard would stall the oneshot past the next tick.
+    """
+    mod = _load_watchdog()
+    calls = _patch_urlopen(monkeypatch, mod, _FakeResponse(200))
+    mod.probe_health()
+
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    requested = args[0] if args else kwargs.get("url")
+    assert requested == mod.PROBE_URL
+    assert kwargs.get("timeout") == mod.PROBE_TIMEOUT
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))
