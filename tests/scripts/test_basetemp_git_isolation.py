@@ -24,9 +24,11 @@ here is shaped identically to 3182's and the two read as one defence.
 
 from __future__ import annotations
 
+import ast
 import os
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -401,3 +403,269 @@ class TestCeilingIsLiveInThisRun:
         entries = os.environ[_CEILING_KEY].split(':')
 
         assert len(entries) == len(set(entries)), f'duplicate entries: {entries}'
+
+
+# ── Anti-drift: every test-root conftest is wired ─────────────────────────────
+#
+# The verify lane runs `cd <subproject> && uv run pytest tests/` per segment,
+# which makes rootdir the SUBPROJECT — so the repo-root conftest.py is not
+# loaded for 7 of the 8 segments.  A defence wired only at the root would be
+# dead in exactly the suite (orchestrator, 155 git-invoking test files) that
+# needs it most.  This guard is what makes the coverage uniform and keeps it
+# that way, rather than trusting the next person to remember.
+
+_WIRING_SNIPPET = (
+    'REPO_ROOT = Path(__file__).resolve().parents[2]\n'
+    'if str(REPO_ROOT) not in sys.path:\n'
+    '    sys.path.append(str(REPO_ROOT))   # APPEND — never insert(0, ...)\n'
+    'from df_pytest_isolation import (\n'
+    '    _df_git_ceiling_at_basetemp,  # noqa: F401\n'
+    '    reject_unsafe_basetemp,\n'
+    ')\n'
+    'def pytest_configure(config):\n'
+    '    reject_unsafe_basetemp(config)\n'
+)
+
+
+def _test_root_conftests() -> list[Path]:
+    """Every test-root conftest, enumerated DYNAMICALLY.
+
+    A hard-coded list is how a future subproject silently opts out.  Only ONE
+    level is globbed: nested conftests (cockpit/tests/smoke/conftest.py) inherit
+    from their test root hierarchically and need no wiring of their own.
+    """
+    return sorted([REPO_ROOT / 'conftest.py', *REPO_ROOT.glob('*/tests/conftest.py')])
+
+
+def _file_based_path(node: ast.expr, conftest: Path) -> Path | None:
+    """Statically evaluate a ``__file__``-derived path expression, or None.
+
+    Handles the two idioms in use: ``Path(__file__).parent`` (root conftest) and
+    ``Path(__file__).resolve().parents[N]`` (subproject conftests).
+    """
+    if isinstance(node, ast.Call):
+        if isinstance(node.func, ast.Name) and node.func.id == 'Path':
+            if len(node.args) == 1 and isinstance(node.args[0], ast.Name) \
+                    and node.args[0].id == '__file__':
+                return conftest
+            return None
+        if isinstance(node.func, ast.Attribute) and node.func.attr == 'resolve':
+            base = _file_based_path(node.func.value, conftest)
+            return base.resolve() if base is not None else None
+        return None
+    if isinstance(node, ast.Attribute) and node.attr == 'parent':
+        base = _file_based_path(node.value, conftest)
+        return base.parent if base is not None else None
+    if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Attribute) \
+            and node.value.attr == 'parents':
+        base = _file_based_path(node.value.value, conftest)
+        index = node.slice
+        if base is not None and isinstance(index, ast.Constant) and isinstance(index.value, int):
+            return base.parents[index.value]
+    return None
+
+
+def _repo_root_names(tree: ast.Module, conftest: Path) -> set[str]:
+    """Names bound to a path expression that evaluates to the repo root."""
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Name):
+            continue
+        value = _file_based_path(node.value, conftest)
+        if value is not None and value.resolve() == REPO_ROOT:
+            names.add(target.id)
+    return names
+
+
+def _sys_path_calls(tree: ast.Module, method: str) -> list[ast.Call]:
+    return [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == method
+        and isinstance(node.func.value, ast.Attribute)
+        and node.func.value.attr == 'path'
+        and isinstance(node.func.value.value, ast.Name)
+        and node.func.value.value.id == 'sys'
+    ]
+
+
+def _mentions(call: ast.Call, names: set[str]) -> bool:
+    return any(
+        isinstance(inner, ast.Name) and inner.id in names
+        for arg in call.args for inner in ast.walk(arg)
+    )
+
+
+def _wiring_defects(source: str, conftest: Path) -> list[str]:
+    """Everything wrong with *source* as a wired test-root conftest.
+
+    Empty list == correctly wired.  Takes the source and its path separately so
+    the self-tests below can feed synthetic sources at a real conftest location.
+    """
+    tree = ast.parse(source)
+    defects: list[str] = []
+
+    imported = {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module == 'df_pytest_isolation'
+        for alias in node.names
+    }
+    if '_df_git_ceiling_at_basetemp' not in imported:
+        defects.append(
+            'does not import _df_git_ceiling_at_basetemp from df_pytest_isolation '
+            '(pytest only collects fixtures bound into the conftest namespace, so '
+            'the import IS the wiring)'
+        )
+    if 'reject_unsafe_basetemp' not in imported:
+        defects.append('does not import reject_unsafe_basetemp from df_pytest_isolation')
+
+    configures = [
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == 'pytest_configure'
+    ]
+    if not configures:
+        defects.append('defines no pytest_configure hook')
+    elif not any(
+        isinstance(inner, ast.Call)
+        and isinstance(inner.func, ast.Name)
+        and inner.func.id == 'reject_unsafe_basetemp'
+        for node in configures for inner in ast.walk(node)
+    ):
+        defects.append('pytest_configure does not call reject_unsafe_basetemp(config)')
+
+    root_names = _repo_root_names(tree, conftest)
+    if not root_names:
+        defects.append('binds no name to the repo root')
+    else:
+        if not any(_mentions(c, root_names) for c in _sys_path_calls(tree, 'append')):
+            defects.append('does not sys.path.append the repo root')
+        if any(_mentions(c, root_names) for c in _sys_path_calls(tree, 'insert')):
+            defects.append(
+                'sys.path.insert()s the repo root — this makes orchestrator/, shared/, '
+                'dashboard/ etc. resolve as namespace packages pointing at the project '
+                'folder instead of src/<pkg>/. APPEND so the repo root stays LAST'
+            )
+    return defects
+
+
+class TestEveryTestRootConftestIsWired:
+    """The defence is uniform across subprojects, and stays that way."""
+
+    def test_all_test_root_conftests_are_wired(self) -> None:
+        offenders = {
+            str(conftest.relative_to(REPO_ROOT)): defects
+            for conftest in _test_root_conftests()
+            if (defects := _wiring_defects(conftest.read_text(encoding='utf-8'), conftest))
+        }
+
+        assert not offenders, (
+            'Unwired test-root conftest(s). The verify lane runs '
+            '`cd <subproject> && uv run pytest tests/`, so rootdir is the '
+            'SUBPROJECT and the repo-root conftest.py is never loaded — a '
+            'conftest missing this wiring runs its whole suite with no basetemp '
+            'git ceiling (esc-3072-3).\n'
+            f'Offenders: {offenders}\n'
+            f'Add:\n{_WIRING_SNIPPET}'
+        )
+
+    def test_every_workspace_member_with_tests_has_a_conftest(self) -> None:
+        """Closes the "new subproject with no conftest at all" hole.
+
+        The wiring guard above can only inspect files that exist; without this,
+        a new member could opt out simply by never adding a conftest.
+        """
+        pyproject = tomllib.loads((REPO_ROOT / 'pyproject.toml').read_text(encoding='utf-8'))
+        members = pyproject['tool']['uv']['workspace']['members']
+
+        missing = [
+            m for m in members
+            if (REPO_ROOT / m / 'tests').is_dir()
+            and not (REPO_ROOT / m / 'tests' / 'conftest.py').exists()
+        ]
+
+        assert not missing, (
+            f'Workspace member(s) with a tests/ dir but no tests/conftest.py: {missing}. '
+            f'The verify lane runs their suites, so they need the wiring too:\n'
+            f'{_WIRING_SNIPPET}'
+        )
+
+    def test_the_detector_flags_an_unwired_conftest(self) -> None:
+        """Self-test: the detector is not vacuously green.
+
+        A structural guard that silently matches nothing is worse than no guard,
+        because it reads as coverage.
+        """
+        sample = 'import sys\nfrom pathlib import Path\n'
+
+        assert _wiring_defects(sample, REPO_ROOT / 'orchestrator' / 'tests' / 'conftest.py')
+
+    def test_the_detector_clears_a_correctly_wired_conftest(self) -> None:
+        sample = (
+            'import sys\n'
+            'from pathlib import Path\n'
+            'REPO_ROOT = Path(__file__).resolve().parents[2]\n'
+            'if str(REPO_ROOT) not in sys.path:\n'
+            '    sys.path.append(str(REPO_ROOT))\n'
+            'from df_pytest_isolation import (\n'
+            '    _df_git_ceiling_at_basetemp,\n'
+            '    reject_unsafe_basetemp,\n'
+            ')\n'
+            'def pytest_configure(config):\n'
+            '    reject_unsafe_basetemp(config)\n'
+        )
+
+        assert _wiring_defects(sample, REPO_ROOT / 'orchestrator' / 'tests' / 'conftest.py') == []
+
+    def test_the_detector_flags_an_insert_of_the_repo_root(self) -> None:
+        """Self-test: the namespace-package hazard is pinned STRUCTURALLY.
+
+        insert(0, ...) is invisible in review and only bites much later, far
+        from this change, as confusing import breakage.
+        """
+        sample = (
+            'import sys\n'
+            'from pathlib import Path\n'
+            'REPO_ROOT = Path(__file__).resolve().parents[2]\n'
+            'sys.path.insert(0, str(REPO_ROOT))\n'
+            'from df_pytest_isolation import (\n'
+            '    _df_git_ceiling_at_basetemp,\n'
+            '    reject_unsafe_basetemp,\n'
+            ')\n'
+            'def pytest_configure(config):\n'
+            '    reject_unsafe_basetemp(config)\n'
+        )
+
+        defects = _wiring_defects(sample, REPO_ROOT / 'orchestrator' / 'tests' / 'conftest.py')
+
+        assert any('insert' in d for d in defects)
+
+    def test_the_detector_flags_a_pytest_configure_that_does_not_call_the_check(self) -> None:
+        """Self-test: presence of the hook is not enough — the CALL is the point."""
+        sample = (
+            'import sys\n'
+            'from pathlib import Path\n'
+            'REPO_ROOT = Path(__file__).resolve().parents[2]\n'
+            'sys.path.append(str(REPO_ROOT))\n'
+            'from df_pytest_isolation import (\n'
+            '    _df_git_ceiling_at_basetemp,\n'
+            '    reject_unsafe_basetemp,\n'
+            ')\n'
+            'def pytest_configure(config):\n'
+            "    config.addinivalue_line('markers', 'slow: ...')\n"
+        )
+
+        defects = _wiring_defects(sample, REPO_ROOT / 'orchestrator' / 'tests' / 'conftest.py')
+
+        assert any('reject_unsafe_basetemp' in d for d in defects)
+
+    def test_the_root_conftest_is_included_in_the_enumeration(self) -> None:
+        """Self-test: the enumeration is not silently empty or root-only."""
+        conftests = _test_root_conftests()
+
+        assert REPO_ROOT / 'conftest.py' in conftests
+        assert len(conftests) > 1
