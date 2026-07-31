@@ -734,3 +734,193 @@ class TestAtomicWriteRaceSafety:
         assert all(w in payloads for w in seen), 'reader saw a payload no writer wrote'
         assert p.read_text(encoding='utf-8') in payloads.values()
         assert sorted(q.name for q in tmp_path.iterdir()) == ['state.json']
+
+
+# ---------------------------------------------------------------------------
+# Anti-regrowth guard (task 3223)
+# ---------------------------------------------------------------------------
+#
+# Task 3223 consolidated ten hand-rolled tmp+rename writers into
+# ``atomic_write_text`` above.  Nothing stops the eleventh from being written
+# by hand next month — the pattern is short enough to look harmless, which is
+# exactly how the first ten accumulated (two of them carried a docstring
+# saying they were copied because "there is no atomic writer in shared/ to
+# reuse").  These tests are the fence: a NEW rename-into-place anywhere in the
+# three source trees fails loudly and points the author at this module.
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_SRC_TREES = ('shared/src', 'orchestrator/src', 'escalation/src')
+
+# Every (module, function) in the three trees that renames a path into place,
+# with the reason it is not calling atomic_write_text.  Adding an entry is a
+# deliberate act that needs a reason; growing this set silently is the failure
+# mode the guard exists to prevent.
+_ALLOWED_RENAMERS = {
+    ('shared/src/shared/safe_io.py', 'atomic_write_text'):
+        'THE consolidated implementation — the one blessed home for this pattern.',
+    ('shared/src/shared/safe_io.py', 'load_json_or_warn'):
+        'Quarantine rename of a corrupt file (<name>.corrupt); not a write path.',
+    ('orchestrator/src/orchestrator/session_hooks.py', '_run_install'):
+        'Out of task 3223 enumerated scope; left alone deliberately.',
+    ('orchestrator/src/orchestrator/verify_cancel.py', 'write_pgid_file'):
+        'Out of task 3223 enumerated scope; left alone deliberately.',
+    ('escalation/src/escalation/queue.py', 'EscalationQueue._atomic_write_path'):
+        'Out of task 3223 enumerated scope. This is the helper 3223 was MODELLED '
+        'on (its durable= flag became fsync=); a follow-up may migrate it.',
+    ('escalation/src/escalation/queue.py', 'EscalationQueue._archive_resolved'):
+        'Moves a resolved file into the dated archive dir; not a write path.',
+    ('escalation/src/escalation/sweep.py', '_atomic_move'):
+        'Out of task 3223 enumerated scope; moves an existing file, does not write.',
+}
+
+
+def _find_renamers(source: str) -> list[str]:
+    """Return the qualified names of functions in *source* that rename a path.
+
+    Detects ``os.replace(...)`` and ``os.rename(...)`` calls — both halves
+    matter: ``escalation.queue._atomic_write_path`` uses ``os.rename`` while
+    every other site uses ``os.replace``, so scanning for only one of them
+    would miss half the pattern.
+
+    AST-based rather than a text grep on purpose: six of the migrated modules
+    still *mention* ``os.replace`` in a docstring describing what
+    ``atomic_write_text`` does for them, and a text scan would flag all six as
+    false positives.
+
+    Limitation, stated rather than papered over: this finds the rename, which
+    is the half of the pattern that cannot be omitted.  A copy that factored
+    its rename out into a helper would be attributed to that helper instead.
+    """
+    import ast
+
+    found: list[str] = []
+
+    def visit(node, prefix: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.ClassDef):
+                visit(child, f'{prefix}{child.name}.')
+            elif isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef):
+                qualname = f'{prefix}{child.name}'
+                for sub in ast.walk(child):
+                    if (
+                        isinstance(sub, ast.Call)
+                        and isinstance(sub.func, ast.Attribute)
+                        and sub.func.attr in ('replace', 'rename')
+                        and isinstance(sub.func.value, ast.Name)
+                        and sub.func.value.id == 'os'
+                    ):
+                        found.append(qualname)
+                        break
+                visit(child, f'{qualname}.')
+            else:
+                visit(child, prefix)
+
+    visit(ast.parse(source), '')
+    return found
+
+
+def _iter_source_files():
+    """Yield (repo-relative posix path, source text) for the three src trees."""
+    for tree in _SRC_TREES:
+        root = _REPO_ROOT / tree
+        assert root.is_dir(), (
+            f'{tree} not found under {_REPO_ROOT} — this guard walks fixed tree '
+            f'names, so a moved/renamed package must update _SRC_TREES rather '
+            f'than let the guard silently scan nothing.'
+        )
+        for py in sorted(root.rglob('*.py')):
+            yield py.relative_to(_REPO_ROOT).as_posix(), py.read_text(encoding='utf-8')
+
+
+class TestNoRegrownAtomicWriters:
+    """The consolidated pattern cannot silently re-duplicate."""
+
+    def test_detector_fires_on_a_regrown_copy(self):
+        """The detector has teeth: it flags a re-inlined tmp+rename block.
+
+        Without this, a detector that silently matched nothing would make
+        every other test in this class pass vacuously.  The sample below is
+        the exact shape task 3223 removed from five call sites.
+        """
+        regrown = (
+            'import json, os\n'
+            'def _save_raw(self, state):\n'
+            '    tmp = self._path.with_suffix(".json.tmp")\n'
+            '    tmp.write_text(json.dumps(state), encoding="utf-8")\n'
+            '    os.replace(str(tmp), str(self._path))\n'
+        )
+        assert _find_renamers(regrown) == ['_save_raw']
+
+        os_rename_variant = (
+            'import os\n'
+            'class S:\n'
+            '    def _write(self, path, text):\n'
+            '        os.rename(tmp, path)\n'
+        )
+        assert _find_renamers(os_rename_variant) == ['S._write']
+
+    def test_detector_ignores_docstring_mentions(self):
+        """A docstring describing the pattern is not an implementation of it.
+
+        Six migrated modules still reference ``os.replace`` in prose; flagging
+        those would make the guard unusable and train people to disable it.
+        """
+        prose_only = (
+            'def _save_raw(self, state):\n'
+            '    """Delegates to safe_io.atomic_write_text (tmp + os.replace)."""\n'
+            '    safe_io.atomic_write_text(self._path, state)\n'
+        )
+        assert _find_renamers(prose_only) == []
+
+    def test_no_unapproved_renamers_in_source_trees(self):
+        """Every rename-into-place in the three trees is a known, reasoned survivor."""
+        actual = {
+            (relpath, qualname)
+            for relpath, source in _iter_source_files()
+            for qualname in _find_renamers(source)
+        }
+
+        unapproved = actual - set(_ALLOWED_RENAMERS)
+        assert not unapproved, (
+            'New hand-rolled rename-into-place found:\n  '
+            + '\n  '.join(f'{f}::{q}' for f, q in sorted(unapproved))
+            + '\nUse shared.safe_io.atomic_write_text instead. If this site '
+            'genuinely cannot (it moves an existing file rather than writing '
+            'one, say), add it to _ALLOWED_RENAMERS with the reason.'
+        )
+
+        stale = set(_ALLOWED_RENAMERS) - actual
+        assert not stale, (
+            'Stale _ALLOWED_RENAMERS entries (site is gone or no longer '
+            f'renames): {sorted(stale)}. Remove them so the allowlist keeps '
+            'describing reality.'
+        )
+
+    def test_atomic_write_text_helpers_only_delegate(self):
+        """The four surviving ``_atomic_write_text`` names must stay one-liners.
+
+        Task 3223 kept these module-level names (test_prompt_artifact.py
+        monkeypatches one at five sites) but emptied their bodies down to a
+        delegation.  Re-inlining a real implementation under the old name is
+        the most likely way the duplication comes back, because the name would
+        still look consolidated from every call site.
+        """
+        import ast
+
+        offenders = []
+        for relpath, source in _iter_source_files():
+            if relpath == 'shared/src/shared/safe_io.py':
+                continue  # the blessed implementation lives here
+            for node in ast.walk(ast.parse(source)):
+                if (
+                    isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+                    and node.name in ('_atomic_write_text', 'atomic_write_text')
+                ):
+                    body = ast.get_source_segment(source, node) or ''
+                    if 'safe_io.atomic_write_text(' not in body:
+                        offenders.append(f'{relpath}::{node.name} does not delegate')
+
+        assert not offenders, (
+            'These helpers stopped delegating to shared.safe_io.atomic_write_text '
+            'and re-inlined their own implementation:\n  ' + '\n  '.join(offenders)
+        )
