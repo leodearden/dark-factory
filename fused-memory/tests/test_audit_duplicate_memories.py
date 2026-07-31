@@ -46,6 +46,9 @@ _ANN_DISCLOSURE_KEYS = _mod._ANN_DISCLOSURE_KEYS
 find_near_duplicate_memory_groups = _mod.find_near_duplicate_memory_groups
 pick_survivor = _mod.pick_survivor
 build_sweep_plan = _mod.build_sweep_plan
+restrict_delete_candidates_for_apply = _mod.restrict_delete_candidates_for_apply
+_PLAN_DISCLOSURE_KEYS = _mod._PLAN_DISCLOSURE_KEYS
+_MAX_LEXICAL_RATIO_MEMBERS = _mod._MAX_LEXICAL_RATIO_MEMBERS
 partition_topic_carveout = _mod.partition_topic_carveout
 fetch_procedural_memories = _mod.fetch_procedural_memories
 fetch_memories = _mod.fetch_memories
@@ -1667,6 +1670,104 @@ class TestBuildSweepPlanAllCategories:
         assert plan['delete_candidates'] == []
 
 
+class TestBuildSweepPlanRemapDisclosure:
+    """A dropped ANN pair is COUNTED — the remap is not a silent loss path.
+
+    Every other way the ANN path can lose a candidate is a metric; a pair
+    naming two real records that the per-category remap refuses must be too,
+    or a candidate that consumed a top_k slot vanishes with no accounting.
+    """
+
+    def test_cross_category_pair_is_dropped_and_counted(self):
+        memories = [
+            _memory('a', 'alpha text', category=_PK),
+            _memory('b', 'beta text', category=_PN),
+        ]
+        plan = build_sweep_plan(
+            memories, threshold=_THRESHOLD, ann_pairs=[(0, 1)],
+            ann_disclosure=dict.fromkeys(_ANN_DISCLOSURE_KEYS, 0),
+        )
+        assert plan['clusters_total'] == 0
+        assert plan['ann_disclosure']['cross_category_dropped'] == 1
+        assert plan['ann_disclosure']['unswept_category_dropped'] == 0
+
+    def test_unswept_category_endpoint_is_counted_separately(self):
+        """A pair reaching outside the swept set is a different loss."""
+        memories = [
+            _memory('a', 'alpha text', category=_PK),
+            _memory('b', 'beta text', category='entities_and_relations'),
+        ]
+        plan = build_sweep_plan(
+            memories, threshold=_THRESHOLD, ann_pairs=[(0, 1)],
+            ann_disclosure=dict.fromkeys(_ANN_DISCLOSURE_KEYS, 0),
+        )
+        assert plan['ann_disclosure']['unswept_category_dropped'] == 1
+        assert plan['ann_disclosure']['cross_category_dropped'] == 0
+
+    def test_a_dropped_pair_is_counted_once_not_once_per_category(self):
+        """The remap loop visits every category; the count must not multiply."""
+        memories = [
+            _memory('a', 'alpha text', category=_PK),
+            _memory('b', 'beta text', category=_PN),
+        ]
+        plan = build_sweep_plan(
+            memories, threshold=_THRESHOLD, ann_pairs=[(0, 1)],
+            categories=_ALL_CATEGORIES,
+            ann_disclosure=dict.fromkeys(_ANN_DISCLOSURE_KEYS, 0),
+        )
+        assert plan['ann_disclosure']['cross_category_dropped'] == 1
+
+    def test_mirrored_duplicates_of_one_pair_count_once(self):
+        memories = [
+            _memory('a', 'alpha text', category=_PK),
+            _memory('b', 'beta text', category=_PN),
+        ]
+        plan = build_sweep_plan(
+            memories, threshold=_THRESHOLD, ann_pairs=[(0, 1), (1, 0), (0, 1)],
+            ann_disclosure=dict.fromkeys(_ANN_DISCLOSURE_KEYS, 0),
+        )
+        assert plan['ann_disclosure']['cross_category_dropped'] == 1
+
+    def test_same_category_pair_is_not_counted_as_a_drop(self):
+        memories = [
+            _memory('a', _VENV_GOTCHA_A, category=_PK),
+            _memory('b', _DISTRACTOR, category=_PK),
+        ]
+        plan = build_sweep_plan(
+            memories, threshold=0.99, ann_pairs=[(0, 1)],
+            ann_disclosure=dict.fromkeys(_ANN_DISCLOSURE_KEYS, 0),
+        )
+        assert plan['clusters_total'] == 1, 'the ANN pair clustered it'
+        assert plan['ann_disclosure']['cross_category_dropped'] == 0
+        assert plan['ann_disclosure']['unswept_category_dropped'] == 0
+
+    def test_out_of_range_index_is_counted_not_raised(self):
+        """A caller bug degrades to a counted drop, never an IndexError."""
+        memories = [_memory('a', 'alpha text', category=_PK)]
+        plan = build_sweep_plan(
+            memories, threshold=_THRESHOLD, ann_pairs=[(0, 99)],
+            ann_disclosure=dict.fromkeys(_ANN_DISCLOSURE_KEYS, 0),
+        )
+        assert plan['ann_disclosure']['unswept_category_dropped'] == 1
+
+    def test_the_callers_disclosure_dict_is_not_mutated(self):
+        caller = dict.fromkeys(_ANN_DISCLOSURE_KEYS, 0)
+        memories = [
+            _memory('a', 'alpha text', category=_PK),
+            _memory('b', 'beta text', category=_PN),
+        ]
+        build_sweep_plan(
+            memories, threshold=_THRESHOLD, ann_pairs=[(0, 1)],
+            ann_disclosure=caller,
+        )
+        assert caller == dict.fromkeys(_ANN_DISCLOSURE_KEYS, 0)
+
+    def test_no_ann_input_at_all_keeps_the_disclosure_absent(self):
+        """A caller that never used the ANN path still reports None."""
+        plan = build_sweep_plan([_memory('a', 'x')], threshold=_THRESHOLD)
+        assert plan['ann_disclosure'] is None
+
+
 # ===========================================================================
 # Option-C topic carve-out (task 3136's rule, honored as input filtering)
 # ===========================================================================
@@ -1788,6 +1889,251 @@ class TestBuildSweepPlanTopicCarveout:
             _topic_memory('m2', _VENV_GOTCHA_B, 'venv'),
         ]
         json.dumps(build_sweep_plan(memories, threshold=_THRESHOLD), default=str)
+
+
+# ===========================================================================
+# The --apply gate: only chain-free evidence may DELETE
+# ===========================================================================
+
+def _grp(member_ids: list[str], losers: list[str], **flags) -> dict:
+    """A near_duplicate_groups entry, only the keys the gate reads."""
+    return {
+        'member_ids': member_ids,
+        'delete_candidate_ids': losers,
+        'category': _PK,
+        'lexical_spanning': False,
+        'ann_clique': False,
+        **flags,
+    }
+
+
+class TestRestrictDeleteCandidatesForApply:
+    """The pure gate: what --apply may act on, and what it must withhold."""
+
+    def test_a_lexically_spanning_cluster_is_actionable(self):
+        groups = [_grp(['a', 'b'], ['b'], lexical_spanning=True)]
+        actionable, withheld = restrict_delete_candidates_for_apply(groups)
+        assert actionable == ['b']
+        assert withheld == []
+
+    def test_an_ann_clique_is_actionable(self):
+        """Every member pair cleared the cutoff — no member is in by chaining."""
+        groups = [_grp(['a', 'b'], ['b'], ann_clique=True)]
+        actionable, withheld = restrict_delete_candidates_for_apply(groups)
+        assert actionable == ['b']
+        assert withheld == []
+
+    def test_an_ann_chain_is_withheld_with_its_ids_and_a_reason(self):
+        groups = [_grp(['a', 'b', 'c'], ['b', 'c'])]
+        actionable, withheld = restrict_delete_candidates_for_apply(groups)
+
+        assert actionable == [], 'membership rests on transitivity — never delete'
+        assert len(withheld) == 1
+        assert withheld[0]['withheld_ids'] == ['b', 'c']
+        assert withheld[0]['member_ids'] == ['a', 'b', 'c']
+        assert withheld[0]['reason'], 'the withholding must say why'
+
+    def test_a_single_lexical_pair_does_not_unlock_an_ann_merged_cluster(self):
+        """The exact case a naive `lexical_clustered` check would wave through.
+
+        ANN merged two halves; one half happens to contain a lexical pair. The
+        MERGE still rests entirely on ANN, so the cluster is not actionable.
+        """
+        groups = [_grp(['a', 'b', 'c', 'd'], ['b', 'c', 'd'],
+                       lexical_clustered=True)]
+        actionable, withheld = restrict_delete_candidates_for_apply(groups)
+        assert actionable == []
+        assert len(withheld) == 1
+
+    def test_groups_with_no_losers_are_neither_actioned_nor_withheld(self):
+        actionable, withheld = restrict_delete_candidates_for_apply(
+            [_grp(['a'], [])],
+        )
+        assert actionable == []
+        assert withheld == []
+
+    def test_mixed_groups_partition_independently(self):
+        groups = [
+            _grp(['a', 'b'], ['b'], lexical_spanning=True),
+            _grp(['c', 'd', 'e'], ['d', 'e']),
+        ]
+        actionable, withheld = restrict_delete_candidates_for_apply(groups)
+        assert actionable == ['b']
+        assert [g['member_ids'] for g in withheld] == [['c', 'd', 'e']]
+
+    def test_empty_input(self):
+        assert restrict_delete_candidates_for_apply([]) == ([], [])
+
+
+class TestBuildSweepPlanApplyGateFlags:
+    """build_sweep_plan measures the evidence the gate then judges."""
+
+    def test_a_lexical_cluster_is_spanning_and_fully_actionable(self):
+        memories = [
+            _memory('m1', _VENV_GOTCHA_A, created_at='2026-01-01T00:00:00+00:00'),
+            _memory('m2', _VENV_GOTCHA_B, created_at='2026-01-02T00:00:00+00:00'),
+            _memory('m3', _VENV_GOTCHA_C, created_at='2026-01-03T00:00:00+00:00'),
+        ]
+        plan = build_sweep_plan(memories, threshold=_THRESHOLD)
+        group = plan['near_duplicate_groups'][0]
+
+        assert group['lexical_spanning'] is True
+        assert plan['apply_delete_candidates'] == plan['delete_candidates']
+        assert plan['apply_withheld_clusters'] == 0
+
+    def test_a_two_member_ann_only_cluster_is_a_clique(self):
+        memories = [
+            _memory('a', 'alpha one', created_at='2026-01-01T00:00:00+00:00'),
+            _memory('b', 'beta two', created_at='2026-01-02T00:00:00+00:00'),
+        ]
+        plan = build_sweep_plan(
+            memories, threshold=0.99, ann_pairs=[(0, 1)], ann_threshold=0.9,
+        )
+        group = plan['near_duplicate_groups'][0]
+
+        assert group['found_by'] == ['ann']
+        assert group['lexical_spanning'] is False
+        assert group['ann_clique'] is True
+        assert plan['apply_delete_candidates'] == ['b']
+
+    def test_a_chained_ann_cluster_is_not_a_clique_and_is_withheld(self):
+        """A~B and B~C above the cutoff; A~C never was. Report yes, delete no."""
+        memories = [
+            _memory('a', 'alpha one', created_at='2026-01-01T00:00:00+00:00'),
+            _memory('b', 'beta two', created_at='2026-01-02T00:00:00+00:00'),
+            _memory('c', 'gamma three', created_at='2026-01-03T00:00:00+00:00'),
+        ]
+        plan = build_sweep_plan(
+            memories, threshold=0.99, ann_pairs=[(0, 1), (1, 2)], ann_threshold=0.9,
+        )
+        group = plan['near_duplicate_groups'][0]
+
+        assert set(group['member_ids']) == {'a', 'b', 'c'}
+        assert group['ann_clique'] is False
+        assert plan['delete_candidates'] == ['b', 'c'], 'still reported'
+        assert plan['apply_delete_candidates'] == [], 'but never deleted'
+        assert plan['apply_withheld_clusters'] == 1
+
+    def test_a_fully_connected_ann_triangle_is_a_clique(self):
+        memories = [
+            _memory('a', 'alpha one', created_at='2026-01-01T00:00:00+00:00'),
+            _memory('b', 'beta two', created_at='2026-01-02T00:00:00+00:00'),
+            _memory('c', 'gamma three', created_at='2026-01-03T00:00:00+00:00'),
+        ]
+        plan = build_sweep_plan(
+            memories, threshold=0.99, ann_pairs=[(0, 1), (1, 2), (0, 2)],
+            ann_threshold=0.9,
+        )
+        assert plan['near_duplicate_groups'][0]['ann_clique'] is True
+        assert plan['apply_delete_candidates'] == ['b', 'c']
+
+    def test_an_ann_merge_of_two_lexical_pairs_is_withheld(self):
+        """The compound risk: ANN welds two real lexical clusters into one."""
+        memories = [
+            _memory('a1', _VENV_GOTCHA_A, created_at='2026-01-01T00:00:00+00:00'),
+            _memory('a2', _VENV_GOTCHA_B, created_at='2026-01-02T00:00:00+00:00'),
+            _memory('b1', _DISTRACTOR, created_at='2026-01-03T00:00:00+00:00'),
+            _memory('b2', _DISTRACTOR + ' Rerun nightly.',
+                    created_at='2026-01-04T00:00:00+00:00'),
+        ]
+        plan = build_sweep_plan(
+            memories, threshold=_THRESHOLD, ann_pairs=[(1, 2)], ann_threshold=0.9,
+        )
+        group = plan['near_duplicate_groups'][0]
+
+        assert set(group['member_ids']) == {'a1', 'a2', 'b1', 'b2'}
+        assert group['lexical_clustered'] is True, 'lexical pairs exist inside it'
+        assert group['lexical_spanning'] is False, 'but they do not span the merge'
+        assert group['ann_clique'] is False
+        assert plan['apply_delete_candidates'] == []
+        assert plan['apply_withheld_clusters'] == 1
+
+    def test_delete_candidate_ids_are_reported_per_group(self):
+        memories = [
+            _memory('m1', _VENV_GOTCHA_A, created_at='2026-01-01T00:00:00+00:00'),
+            _memory('m2', _VENV_GOTCHA_B, created_at='2026-01-02T00:00:00+00:00'),
+        ]
+        group = build_sweep_plan(memories, threshold=_THRESHOLD)['near_duplicate_groups'][0]
+        assert group['delete_candidate_ids'] == ['m2']
+
+    def test_plan_stays_json_serializable_with_the_gate_keys(self):
+        memories = [
+            _memory('a', 'alpha one', created_at='2026-01-01T00:00:00+00:00'),
+            _memory('b', 'beta two', created_at='2026-01-02T00:00:00+00:00'),
+            _memory('c', 'gamma three', created_at='2026-01-03T00:00:00+00:00'),
+        ]
+        plan = build_sweep_plan(
+            memories, threshold=0.99, ann_pairs=[(0, 1), (1, 2)], ann_threshold=0.9,
+        )
+        json.dumps(plan, default=str)
+
+
+class TestLexicalMaxRatioReuseAndBound:
+    """lexical_max_ratio is exact when it can be, and says so when it is not."""
+
+    def test_reported_ratio_matches_an_exhaustive_recomputation(self):
+        """The prefilter + seeded maximum must not change the answer."""
+        import difflib  # noqa: PLC0415
+
+        memories = [
+            _memory('m1', _VENV_GOTCHA_A, created_at='2026-01-01T00:00:00+00:00'),
+            _memory('m2', _VENV_GOTCHA_B, created_at='2026-01-02T00:00:00+00:00'),
+            _memory('m3', _VENV_GOTCHA_C, created_at='2026-01-03T00:00:00+00:00'),
+        ]
+        group = build_sweep_plan(memories, threshold=_THRESHOLD)['near_duplicate_groups'][0]
+
+        contents = [(m['content'] or '').strip().lower() for m in memories]
+        expected = max(
+            difflib.SequenceMatcher(None, contents[a], contents[b]).ratio()
+            for a in range(len(contents))
+            for b in range(a + 1, len(contents))
+        )
+        assert group['lexical_max_ratio'] == pytest.approx(expected)
+        assert group['lexical_max_ratio_sampled'] is False
+
+    def test_an_ann_only_cluster_still_reports_the_losing_paths_ratio(self):
+        memories = [
+            _memory('a', 'alpha one', created_at='2026-01-01T00:00:00+00:00'),
+            _memory('b', 'beta two', created_at='2026-01-02T00:00:00+00:00'),
+        ]
+        group = build_sweep_plan(
+            memories, threshold=0.99, ann_pairs=[(0, 1)], ann_threshold=0.9,
+        )['near_duplicate_groups'][0]
+
+        assert group['lexical_max_ratio'] is not None, (
+            'the disagreement between the two detectors is the point'
+        )
+        assert group['lexical_max_ratio'] < 0.99
+
+    def test_an_oversized_cluster_bounds_the_scan_and_discloses_it(self):
+        """A chained ANN cluster must not make a report-only field dominate."""
+        size = _MAX_LEXICAL_RATIO_MEMBERS + 5
+        memories = [
+            _memory(f'm{i:03d}', f'record number {i} about venv setup',
+                    created_at=f'2026-01-01T00:00:{i:02d}+00:00')
+            for i in range(size)
+        ]
+        # A chain, not a clique: consecutive ANN pairs only.
+        pairs = [(i, i + 1) for i in range(size - 1)]
+        group = build_sweep_plan(
+            memories, threshold=0.99, ann_pairs=pairs, ann_threshold=0.9,
+        )['near_duplicate_groups'][0]
+
+        assert len(group['member_ids']) == size
+        assert group['lexical_max_ratio_sampled'] is True, (
+            'a bounded maximum must never be read as an exhaustive one'
+        )
+        assert group['lexical_max_ratio'] is not None
+
+    def test_a_cluster_of_empty_content_reports_no_ratio(self):
+        memories = [
+            _memory('a', '', created_at='2026-01-01T00:00:00+00:00'),
+            _memory('b', '', created_at='2026-01-02T00:00:00+00:00'),
+        ]
+        group = build_sweep_plan(
+            memories, threshold=0.99, ann_pairs=[(0, 1)], ann_threshold=0.9,
+        )['near_duplicate_groups'][0]
+        assert group['lexical_max_ratio'] is None
 
 
 # ===========================================================================
@@ -1973,6 +2319,170 @@ class TestFetchAnnNeighbors:
         assert query_points.await_count == 0
         assert neighbors == {}
         assert disclosure['ann_query_errors'] == 0
+
+
+@pytest.mark.asyncio
+class TestFetchAnnNeighborsCategoryFilter:
+    """The record's category is pushed DOWN, so top_k is not spent off-category.
+
+    The collection holds every category. Unfiltered, a record's nearest
+    ``top_k`` can be filled entirely by records this sweep will discard, and
+    the same-category candidates below them are cut off — recall the ANN path
+    exists to add. Filtering also makes a cross-category pair structurally
+    impossible instead of merely dropped downstream.
+    """
+
+    def _service(self, query_points):
+        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+
+        client = MagicMock()
+        client.query_points = query_points
+        service = MagicMock()
+        service.config.mem0.collection_prefix = 'mem0'
+        service.mem0._get_async_qdrant = AsyncMock(return_value=client)
+        return service
+
+    def _empty(self):
+        return types.SimpleNamespace(points=[])
+
+    async def test_the_records_category_becomes_a_payload_equality_filter(self):
+        from unittest.mock import AsyncMock  # noqa: PLC0415
+
+        from qdrant_client.http import models as qmodels  # noqa: PLC0415
+
+        query_points = AsyncMock(return_value=self._empty())
+        records = [{'id': 'a', 'vector': [0.1], 'category': _PK}]
+
+        await fetch_ann_neighbors(
+            self._service(query_points), 'dark_factory', records,
+            top_k=5, score_threshold=0.88,
+        )
+
+        assert query_points.await_args_list[0].kwargs['query_filter'] == qmodels.Filter(
+            must=[qmodels.FieldCondition(
+                key='category', match=qmodels.MatchValue(value=_PK),
+            )],
+        ), 'same Filter/FieldCondition/MatchValue shape scroll_by_metadata builds'
+
+    async def test_each_record_is_filtered_to_its_own_category(self):
+        from unittest.mock import AsyncMock  # noqa: PLC0415
+
+        query_points = AsyncMock(return_value=self._empty())
+        records = [
+            {'id': 'a', 'vector': [0.1], 'category': _PK},
+            {'id': 'b', 'vector': [0.2], 'category': _OS},
+        ]
+
+        await fetch_ann_neighbors(
+            self._service(query_points), 'dark_factory', records,
+            top_k=5, score_threshold=0.88,
+        )
+
+        values = [
+            call.kwargs['query_filter'].must[0].match.value
+            for call in query_points.await_args_list
+        ]
+        assert values == [_PK, _OS]
+
+    async def test_a_categoryless_record_is_queried_unfiltered(self):
+        """It cannot be clustered at all, so the query shape is unchanged."""
+        from unittest.mock import AsyncMock  # noqa: PLC0415
+
+        query_points = AsyncMock(return_value=self._empty())
+        records = [{'id': 'a', 'vector': [0.1]}]
+
+        await fetch_ann_neighbors(
+            self._service(query_points), 'dark_factory', records,
+            top_k=5, score_threshold=0.88,
+        )
+
+        assert query_points.await_args_list[0].kwargs['query_filter'] is None
+
+
+@pytest.mark.asyncio
+class TestFetchAnnNeighborsConcurrency:
+    """Queries fan out under a bound — never one blocking round-trip at a time."""
+
+    def _service(self, query_points):
+        from unittest.mock import AsyncMock, MagicMock  # noqa: PLC0415
+
+        client = MagicMock()
+        client.query_points = query_points
+        service = MagicMock()
+        service.config.mem0.collection_prefix = 'mem0'
+        service.mem0._get_async_qdrant = AsyncMock(return_value=client)
+        return service
+
+    async def test_in_flight_queries_are_concurrent_and_capped(self):
+        import asyncio  # noqa: PLC0415
+        from unittest.mock import AsyncMock  # noqa: PLC0415
+
+        in_flight = 0
+        peak = 0
+
+        async def _side_effect(**_kwargs):
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0)  # yield, so overlap is observable
+            in_flight -= 1
+            return types.SimpleNamespace(points=[])
+
+        query_points = AsyncMock(side_effect=_side_effect)
+        records = [{'id': f'r{i}', 'vector': [float(i)]} for i in range(10)]
+
+        await fetch_ann_neighbors(
+            self._service(query_points), 'dark_factory', records,
+            top_k=5, score_threshold=0.88, concurrency=3,
+        )
+
+        assert query_points.await_count == 10, 'every record is still queried'
+        assert peak > 1, 'sequential issue would serialise 15k round-trips'
+        assert peak <= 3, 'the bound protects the Qdrant the live path shares'
+
+    async def test_results_are_keyed_in_input_order_despite_the_fan_out(self):
+        """Two identical runs must serialise identically."""
+        import asyncio  # noqa: PLC0415
+        from unittest.mock import AsyncMock  # noqa: PLC0415
+
+        async def _side_effect(**kwargs):
+            # Later records finish FIRST, so insertion order cannot be
+            # completion order.
+            await asyncio.sleep(0.01 * (3 - kwargs['query'][0]))
+            return types.SimpleNamespace(points=[])
+
+        query_points = AsyncMock(side_effect=_side_effect)
+        records = [{'id': f'r{i}', 'vector': [float(i)]} for i in range(3)]
+
+        neighbors, _disclosure = await fetch_ann_neighbors(
+            self._service(query_points), 'dark_factory', records,
+            top_k=5, score_threshold=0.88,
+        )
+
+        assert list(neighbors) == ['r0', 'r1', 'r2']
+
+    async def test_one_failure_is_counted_without_losing_the_rest(self):
+        """Per-record error accounting survives the fan-out."""
+        from unittest.mock import AsyncMock  # noqa: PLC0415
+
+        async def _side_effect(**kwargs):
+            if kwargs['query'] == [1.0]:
+                raise RuntimeError('Qdrant blew up')
+            return types.SimpleNamespace(
+                points=[types.SimpleNamespace(id='z', score=0.95)],
+            )
+
+        query_points = AsyncMock(side_effect=_side_effect)
+        records = [{'id': f'r{i}', 'vector': [float(i)]} for i in range(3)]
+
+        neighbors, disclosure = await fetch_ann_neighbors(
+            self._service(query_points), 'dark_factory', records,
+            top_k=5, score_threshold=0.88, concurrency=3,
+        )
+
+        assert disclosure['ann_query_errors'] == 1
+        assert 'r1' not in neighbors
+        assert set(neighbors) == {'r0', 'r2'}
 
 
 # ===========================================================================
@@ -2573,6 +3083,40 @@ class TestEmitMetricsArtifact:
         assert not (tmp_path / _EVAL_ID).exists(), 'no directory may survive a rejected series'
         assert list(tmp_path.iterdir()) == []
 
+    def test_no_temp_file_survives_a_successful_write(self, tmp_path):
+        """All three files go through the same temp-in-dir + os.replace writer."""
+        emit_metrics_artifact(_series(), {'categories': {}}, tmp_path, _STAMP)
+        written = sorted(p.name for p in (tmp_path / _EVAL_ID).iterdir())
+        assert written == [
+            f'details-{_STAMP}.json', f'metrics-{_STAMP}.json', f'report-{_STAMP}.txt',
+        ]
+
+    def test_a_details_write_failure_is_loud_and_leaves_nothing_behind(
+        self, tmp_path, caplog,
+    ):
+        """Every metric names the details file; a half-written one is unreadable.
+
+        A plain write_text could leave a truncated JSON document that a reader
+        of cluster_size_max would follow and fail to parse. The atomic writer
+        leaves the details file absent instead — diagnosable — and the failure
+        is logged and re-raised rather than leaving a dangling details_path
+        silently behind a successful-looking run.
+        """
+        import logging  # noqa: PLC0415
+
+        artifact_dir = tmp_path / _EVAL_ID
+        artifact_dir.mkdir(parents=True)
+        # os.replace onto a directory raises IsADirectoryError (an OSError).
+        (artifact_dir / details_artifact_path(_STAMP)).mkdir()
+
+        with caplog.at_level(logging.ERROR), pytest.raises(OSError):
+            emit_metrics_artifact(_series(), {'categories': {}}, tmp_path, _STAMP)
+
+        assert 'FAILED to write its companion' in caplog.text
+        assert [p.name for p in artifact_dir.iterdir() if p.suffix == '.tmp'] == [], (
+            'a failed atomic write unlinks its temp file'
+        )
+
 
 class TestCliBackCompat:
     """Task 3136 schedules this script; today's invocation must keep working."""
@@ -2730,12 +3274,16 @@ def _fake_config(t_high: float | None = 0.9):
 
 
 class _FakeQdrant:
-    def __init__(self):
+    def __init__(self, hits_by_vector: dict[tuple, list[tuple]] | None = None):
         self.calls = []
+        self._hits = hits_by_vector or {}
 
     async def query_points(self, **kwargs):
         self.calls.append(kwargs)
-        return types.SimpleNamespace(points=[])
+        hits = self._hits.get(tuple(kwargs.get('query') or ()), [])
+        return types.SimpleNamespace(
+            points=[types.SimpleNamespace(id=i, score=s) for i, s in hits],
+        )
 
 
 class _FakeMem0:
@@ -2758,10 +3306,13 @@ class _FakeMemoryService:
 
     instances: list = []
     raw_by_category: dict[str, list[dict]] = {}
+    ann_hits: dict[tuple, list[tuple]] = {}
 
     def __init__(self, config):
         self.config = config
-        self.mem0 = _FakeMem0(type(self).raw_by_category, _FakeQdrant())
+        self.mem0 = _FakeMem0(
+            type(self).raw_by_category, _FakeQdrant(type(self).ann_hits),
+        )
         self.deleted: list = []
         self.closed = False
         type(self).instances.append(self)
@@ -2776,24 +3327,27 @@ class _FakeMemoryService:
         self.deleted.append(memory_id)
 
 
-def _install_run_doubles(monkeypatch, raw_by_category, *, t_high: float | None = 0.9):
+def _install_run_doubles(monkeypatch, raw_by_category, *, t_high: float | None = 0.9,
+                         ann_hits: dict[tuple, list[tuple]] | None = None):
     import fused_memory.config.schema as schema_mod  # noqa: PLC0415
     import fused_memory.services.memory_service as service_mod  # noqa: PLC0415
 
     _FakeMemoryService.instances = []
     _FakeMemoryService.raw_by_category = raw_by_category
+    _FakeMemoryService.ann_hits = ann_hits or {}
     monkeypatch.setattr(schema_mod, 'FusedMemoryConfig', lambda: _fake_config(t_high))
     monkeypatch.setattr(service_mod, 'MemoryService', _FakeMemoryService)
     return _FakeMemoryService
 
 
 def _raw(id: str, content: str, created_at: str = '2026-01-01T00:00:00+00:00',
-         category: str = _PK, extra: dict | None = None) -> dict:
+         category: str = _PK, extra: dict | None = None,
+         vector: list[float] | None = None) -> dict:
     return {
         'id': id,
         'created_at': created_at,
         'metadata': {'data': content, 'category': category, **(extra or {})},
-        'vector': [0.1, 0.2],
+        'vector': [0.1, 0.2] if vector is None else vector,
     }
 
 
@@ -2801,8 +3355,8 @@ def _raw(id: str, content: str, created_at: str = '2026-01-01T00:00:00+00:00',
 class TestRunApplyGuards:
     """--apply never fires against a scan that cannot be trusted."""
 
-    async def _invoke(self, monkeypatch, raw, argv, tmp_path):
-        _install_run_doubles(monkeypatch, raw)
+    async def _invoke(self, monkeypatch, raw, argv, tmp_path, ann_hits=None):
+        _install_run_doubles(monkeypatch, raw, ann_hits=ann_hits)
         args = _build_parser().parse_args(
             [*argv, '--metrics-root', str(tmp_path)],
         )
@@ -2866,6 +3420,137 @@ class TestRunApplyGuards:
         )
         assert rc == 1, 'nothing actionable remains, so the empty-plan guard holds'
         assert service.deleted == []
+
+
+@pytest.mark.asyncio
+class TestRunApplyAnnOnlyClusters:
+    """End-to-end: what --apply does with deletions the ANN path alone produced.
+
+    The riskiest behaviour this detector gained — records the lexical path
+    would never have touched now reach an irreversible delete. These pin which
+    ids actually reach delete_memory.
+    """
+
+    _OLD = '2026-01-01T00:00:00+00:00'
+    _MID = '2026-01-02T00:00:00+00:00'
+    _NEW = '2026-01-03T00:00:00+00:00'
+
+    async def _invoke(self, monkeypatch, raw, ann_hits, tmp_path, *argv):
+        _install_run_doubles(monkeypatch, raw, ann_hits=ann_hits)
+        args = _build_parser().parse_args([
+            '--project-id', 'p', '--metrics-root', str(tmp_path), '--apply',
+            '--threshold', '0.99', *argv,
+        ])
+        return await _run(args), _FakeMemoryService.instances[-1]
+
+    async def test_an_ann_only_clique_deletes_its_losers_and_keeps_the_survivor(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        """Paraphrase, not rewrite: lexical cannot cluster it, ANN can."""
+        raw = {_PK: [
+            _raw('m1', 'alpha one', self._OLD, vector=[1.0, 0.0]),
+            _raw('m2', 'beta two', self._MID, vector=[0.0, 1.0]),
+        ]}
+        ann_hits = {
+            (1.0, 0.0): [('m2', 0.95)],
+            (0.0, 1.0): [('m1', 0.95)],
+        }
+        rc, service = await self._invoke(monkeypatch, raw, ann_hits, tmp_path)
+        plan = json.loads(capsys.readouterr().out)
+
+        assert plan['near_duplicate_groups'][0]['found_by'] == ['ann'], (
+            'the lexical threshold of 0.99 cannot have clustered these'
+        )
+        assert rc == 0
+        assert service.deleted == ['m2'], 'the oldest survives; only the loser goes'
+
+    async def test_an_ann_chained_cluster_is_reported_but_never_deleted(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        """m1~m2 and m2~m3 cleared the cutoff; m1~m3 never did.
+
+        m3 is in the cluster purely by transitivity, so 'delete the losers'
+        would irreversibly delete a record no measurement ever tied to the
+        survivor.
+        """
+        raw = {_PK: [
+            _raw('m1', 'alpha one', self._OLD, vector=[1.0, 0.0, 0.0]),
+            _raw('m2', 'beta two', self._MID, vector=[0.0, 1.0, 0.0]),
+            _raw('m3', 'gamma three', self._NEW, vector=[0.0, 0.0, 1.0]),
+        ]}
+        ann_hits = {
+            (1.0, 0.0, 0.0): [('m2', 0.95)],
+            (0.0, 1.0, 0.0): [('m1', 0.95), ('m3', 0.95)],
+            (0.0, 0.0, 1.0): [('m2', 0.95)],
+        }
+        rc, service = await self._invoke(monkeypatch, raw, ann_hits, tmp_path)
+        plan = json.loads(capsys.readouterr().out)
+
+        assert set(plan['near_duplicate_groups'][0]['member_ids']) == {'m1', 'm2', 'm3'}
+        assert plan['delete_candidates'] == ['m2', 'm3'], 'still reported'
+        assert plan['apply_withheld_clusters'] == 1
+        assert service.deleted == [], 'the chain never reaches delete_memory'
+        assert rc == 1, 'nothing applicable remains, so the empty-plan guard holds'
+
+    async def test_a_fully_connected_ann_cluster_is_deleted_down_to_the_survivor(
+        self, monkeypatch, tmp_path,
+    ):
+        """Every member pair independently cleared the cutoff — no transitivity."""
+        raw = {_PK: [
+            _raw('m1', 'alpha one', self._OLD, vector=[1.0, 0.0, 0.0]),
+            _raw('m2', 'beta two', self._MID, vector=[0.0, 1.0, 0.0]),
+            _raw('m3', 'gamma three', self._NEW, vector=[0.0, 0.0, 1.0]),
+        ]}
+        ann_hits = {
+            (1.0, 0.0, 0.0): [('m2', 0.95), ('m3', 0.94)],
+            (0.0, 1.0, 0.0): [('m1', 0.95), ('m3', 0.93)],
+            (0.0, 0.0, 1.0): [('m1', 0.94), ('m2', 0.93)],
+        }
+        rc, service = await self._invoke(monkeypatch, raw, ann_hits, tmp_path)
+
+        assert rc == 0
+        assert service.deleted == ['m2', 'm3']
+
+    async def test_an_ann_merge_of_two_lexical_clusters_is_withheld(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        """The compound risk: one ANN pair welds two real clusters into one."""
+        raw = {_PK: [
+            _raw('a1', _VENV_GOTCHA_A, self._OLD, vector=[1.0, 0.0]),
+            _raw('a2', _VENV_GOTCHA_B, self._MID, vector=[0.9, 0.1]),
+            _raw('b1', _DISTRACTOR, self._NEW, vector=[0.0, 1.0]),
+            _raw('b2', _DISTRACTOR + ' Rerun nightly.', '2026-01-04T00:00:00+00:00',
+                 vector=[0.1, 0.9]),
+        ]}
+        # a2 <-> b1: the single cross-cluster ANN pair.
+        ann_hits = {(0.9, 0.1): [('b1', 0.95)], (0.0, 1.0): [('a2', 0.95)]}
+        rc, service = await self._invoke(
+            monkeypatch, raw, ann_hits, tmp_path, '--threshold', '0.75',
+        )
+        plan = json.loads(capsys.readouterr().out)
+
+        assert len(plan['near_duplicate_groups']) == 1, 'ANN merged the two halves'
+        assert plan['apply_withheld_clusters'] == 1
+        assert service.deleted == [], (
+            'a lexical pair inside the merge does not corroborate the merge'
+        )
+        assert rc == 1
+
+    async def test_a_lexical_cluster_still_applies_when_ann_agrees(
+        self, monkeypatch, tmp_path,
+    ):
+        """The pre-existing path is unchanged by the gate."""
+        raw = {_PK: [
+            _raw('m1', _VENV_GOTCHA_A, self._OLD, vector=[1.0, 0.0]),
+            _raw('m2', _VENV_GOTCHA_B, self._MID, vector=[0.9, 0.1]),
+        ]}
+        ann_hits = {(1.0, 0.0): [('m2', 0.95)], (0.9, 0.1): [('m1', 0.95)]}
+        rc, service = await self._invoke(
+            monkeypatch, raw, ann_hits, tmp_path, '--threshold', '0.75',
+        )
+
+        assert rc == 0
+        assert service.deleted == ['m2']
 
 
 @pytest.mark.asyncio
@@ -2960,7 +3645,8 @@ class TestRunWiring:
 
         ids = {m.metric_id for m in series.metrics}
         assert f'near_duplicate_clusters.{_PK}' in ids
-        for key in (*_ANN_DISCLOSURE_KEYS, 'ann_query_errors', 'ann_disabled_uncalibrated'):
+        for key in (*_ANN_DISCLOSURE_KEYS, *_PLAN_DISCLOSURE_KEYS,
+                    'ann_query_errors', 'ann_disabled_uncalibrated'):
             assert f'{key}.{_GLOBAL_SCOPE}' in ids, f'{key} must be disclosed'
         assert f'scan_truncated.{_PK}' in ids
 

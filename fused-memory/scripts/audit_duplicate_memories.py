@@ -46,8 +46,19 @@ Every cap is counted
 The ANN path can lose candidates where a full scan cannot, so each loss is a
 metric rather than invisible recall: ``top_k_saturated``,
 ``below_threshold_dropped``, ``unknown_neighbor_dropped``, ``missing_vector``,
-``ann_query_errors``, per-category ``scan_truncated``, and
-``ann_disabled_uncalibrated``.
+``cross_category_dropped``, ``unswept_category_dropped``, ``ann_query_errors``,
+per-category ``scan_truncated``, and ``ann_disabled_uncalibrated``.
+
+Only chain-free evidence may DELETE
+-----------------------------------
+The report shows every cluster both detectors found; ``--apply`` acts on a
+strict subset. A cluster contributes deletions only when its lexical pairs
+SPAN it (what this detector actioned before the ANN path existed) or its ANN
+sub-graph is a CLIQUE. Otherwise a member could be in the cluster purely by
+transitivity — A~B and B~C above the cutoff while A~C is far below it — and
+under ``--apply`` every non-survivor of that chain is an irreversible delete.
+Withheld clusters are reported (``apply_withheld_groups``), never silently
+dropped. See ``restrict_delete_candidates_for_apply``.
 
 Scope: all three Mem0 categories (``procedural_knowledge``,
 ``preferences_and_norms``, ``observations_and_summaries``). Clustering runs
@@ -86,10 +97,12 @@ Safety carve-outs:
   - Only near-duplicate CLUSTERS above a high similarity threshold are
     actioned; a survivor (canonical-flagged, else oldest) is always retained
     per cluster.
-  - ``--apply`` refuses on an empty scan, on a plan with nothing to delete,
-    and when ANY category's scan looks truncated -- a capped window may have
-    the survivor just outside it, so "delete the losers" could delete the
-    last copy.
+  - ``--apply`` refuses on an empty scan, on a plan with nothing left to
+    delete after the gate, and when ANY category's scan looks truncated -- a
+    capped window may have the survivor just outside it, so "delete the
+    losers" could delete the last copy.
+  - Clusters held together only by an ANN chain are withheld from ``--apply``
+    (see "Only chain-free evidence may DELETE" above).
   - A cluster whose members all share one ``metadata.topic`` is task 3136's
     Option-C carve-out: an expected shape, never a delete candidate.
   - Missing/unextractable content degrades to ``''``, which never clusters
@@ -229,10 +242,23 @@ def find_near_duplicate_memory_groups(
     if n < 2:
         return []
 
-    normalized = [(m.get('content') or '').strip().lower() for m in memories]
     return cluster_memories_by_pairs(
-        memories, _lexical_pairs(normalized, threshold),
+        memories, _lexical_pairs(_normalized_contents(memories), threshold),
     )
+
+
+def _normalized_contents(memories: list[dict]) -> list[str]:
+    """The exact text the lexical path compares — ONE definition.
+
+    Both lexical entry points (``find_near_duplicate_memory_groups`` and
+    ``build_sweep_plan``) normalise here rather than each inlining the
+    expression. ``_lexical_pairs``' empty-content guard and
+    ``_max_lexical_ratio``'s reporting both key off this precise
+    normalisation, and the plan prints the two paths' verdicts side by side —
+    so a change made at one of two copies would silently desynchronise
+    numbers a reader is invited to compare.
+    """
+    return [(m.get('content') or '').strip().lower() for m in memories]
 
 
 def _lexical_pairs(
@@ -241,10 +267,28 @@ def _lexical_pairs(
 ) -> Iterator[tuple[int, int]]:
     """Yield index pairs whose normalised contents are >= *threshold* similar.
 
+    The scores are discarded — see :func:`_lexical_pairs_scored`, which is the
+    single implementation both share.
+    """
+    for i, j, _ratio in _lexical_pairs_scored(normalized, threshold):
+        yield (i, j)
+
+
+def _lexical_pairs_scored(
+    normalized: list[str],
+    threshold: float,
+) -> Iterator[tuple[int, int, float]]:
+    """Yield ``(i, j, ratio)`` for pairs >= *threshold* similar.
+
     The lexical candidate GENERATOR, split out from the clustering core it
     feeds (``cluster_memories_by_pairs``). Behaviour is unchanged from when
     this loop was inline: same O(n^2) scan, same ``quick_ratio`` pre-filter,
     same empty-content guard.
+
+    The exact ``ratio()`` is yielded rather than thrown away because
+    ``build_sweep_plan`` reports a per-cluster ``lexical_max_ratio``: without
+    it, ``_max_lexical_ratio`` would recompute from scratch precisely the
+    comparisons this scan already paid for.
     """
     n = len(normalized)
     for i in range(n):
@@ -270,8 +314,9 @@ def _lexical_pairs(
             # which pairs end up unioned — only cheaper on obvious misses.
             if matcher.real_quick_ratio() < threshold or matcher.quick_ratio() < threshold:
                 continue
-            if matcher.ratio() >= threshold:
-                yield (i, j)
+            ratio = matcher.ratio()
+            if ratio >= threshold:
+                yield (i, j, ratio)
 
 
 # The three Mem0-backed categories, enumerated ONCE. Graphiti-backed
@@ -538,7 +583,28 @@ def partition_topic_carveout(
     return actionable, carved_out
 
 
-def _max_lexical_ratio(normalized: list[str], member_indices: list[int]) -> float | None:
+_MAX_LEXICAL_RATIO_MEMBERS = 40
+"""Members of one cluster scanned exhaustively for ``lexical_max_ratio``.
+
+A WORK bound on a report-only field, never a similarity decision — nothing is
+clustered, kept or deleted because of it. It exists because ANN candidates now
+feed the same transitive closure, so cluster size is no longer bounded by
+near-verbatim similarity: a chained ANN cluster of a few hundred members would
+otherwise make this O(k^2) exact-``ratio()`` loop the dominant cost of the
+whole run. 40 members = 780 pairs, the same order as the per-record ANN query
+cost the run already pays. When it binds, the run SAYS so
+(``lexical_max_ratio_sampled``) rather than quietly reporting a sampled maximum
+as an exhaustive one.
+"""
+
+
+def _max_lexical_ratio(
+    normalized: list[str],
+    member_indices: list[int],
+    *,
+    known: float | None = None,
+    max_members: int = _MAX_LEXICAL_RATIO_MEMBERS,
+) -> tuple[float | None, bool]:
     """Highest pairwise ``ratio()`` among a cluster's members, ignoring thresholds.
 
     Reported even when the lexical path LOST (scored below threshold and
@@ -546,16 +612,193 @@ def _max_lexical_ratio(normalized: list[str], member_indices: list[int]) -> floa
     see how the other detector scored it — "ANN 0.905, lexical 0.095" is the
     auditable form of a path disagreement; omitting the loser's score would
     hide exactly the number that explains why the paths differed.
+
+    Args:
+        normalized: Normalised contents (see :func:`_normalized_contents`).
+        member_indices: The cluster's indices into *normalized*.
+        known: The best ratio the lexical scan ALREADY measured for this
+            cluster's pairs (see :func:`_lexical_pairs_scored`). Seeding it
+            here is free accuracy and free speed: those pairs are a subset of
+            the ones scanned below, so the exhaustive maximum is unchanged,
+            while the running best starts high enough to prune immediately.
+        max_members: Exhaustive-scan bound (see
+            :data:`_MAX_LEXICAL_RATIO_MEMBERS`).
+
+    Returns:
+        ``(best, sampled)``. *best* is None when no pair could be compared
+        (every member's content is empty). *sampled* is True when the cluster
+        exceeded *max_members* and the maximum is over a subset — the caller
+        publishes it as ``lexical_max_ratio_sampled`` so a bounded number is
+        never read as an exhaustive one.
     """
-    best: float | None = None
-    for a in range(len(member_indices)):
-        for b in range(a + 1, len(member_indices)):
-            left, right = normalized[member_indices[a]], normalized[member_indices[b]]
-            if not left or not right:
+    scanned = member_indices[:max_members]
+    sampled = len(scanned) < len(member_indices)
+
+    best = known
+    matcher = difflib.SequenceMatcher()
+    for a in range(len(scanned)):
+        left = normalized[scanned[a]]
+        if not left:
+            continue
+        matcher.set_seq1(left)
+        for b in range(a + 1, len(scanned)):
+            right = normalized[scanned[b]]
+            if not right:
                 continue
-            ratio = difflib.SequenceMatcher(None, left, right).ratio()
+            matcher.set_seq2(right)
+            # real_quick_ratio()/quick_ratio() are documented UPPER BOUNDS on
+            # ratio(), so a pair that cannot even reach the running best
+            # cannot be the maximum — skipping it leaves the answer identical
+            # while avoiding the expensive exact comparison. Same prefilter
+            # _lexical_pairs_scored applies, against `best` instead of a
+            # fixed threshold.
+            if best is not None and (
+                matcher.real_quick_ratio() <= best or matcher.quick_ratio() <= best
+            ):
+                continue
+            ratio = matcher.ratio()
             best = ratio if best is None else max(best, ratio)
-    return best
+    return best, sampled
+
+
+# Losses that happen when ANN pairs are REMAPPED onto the per-category sweep,
+# owned by build_sweep_plan rather than by ann_pairs_from_neighbors (which has
+# no category awareness). Kept as a separate tuple from
+# _ANN_DISCLOSURE_KEYS so each generator's disclosure contract stays its own.
+_PLAN_DISCLOSURE_KEYS: tuple[str, ...] = (
+    'cross_category_dropped',
+    'unswept_category_dropped',
+)
+
+
+def _count_ann_pair_drops(
+    memories: list[dict],
+    ann_pairs: Iterable[tuple[int, int]],
+    categories: Iterable[str],
+) -> dict[str, int]:
+    """Count ANN pairs the per-category sweep will refuse to cluster.
+
+    A pair whose endpoints land in different swept categories, or outside the
+    swept set entirely, is dropped by ``build_sweep_plan``'s remap. It
+    consumed a ``top_k`` slot and named two real records, so it is a genuine
+    recall loss — and it is NOT covered by ``unknown_neighbor_dropped``, which
+    only fires for a hit outside the scanned set. Counting it here completes
+    the ANN path's loss accounting: every drop is a metric the M2 limits
+    evaluator can alarm on, never invisible recall.
+
+    Counted ONCE per canonical pair, deliberately not inside the per-category
+    loop: that loop visits the same dropped pair once per swept category, so
+    incrementing there would multiply the count by the number of categories.
+
+    An out-of-range index (a caller bug, silently dropped by the remap today)
+    reads as an absent category, so it lands in ``unswept_category_dropped``
+    rather than raising.
+    """
+    swept = set(categories)
+    counts = dict.fromkeys(_PLAN_DISCLOSURE_KEYS, 0)
+
+    def _category_at(index: int) -> Any:
+        return memories[index].get('category') if 0 <= index < len(memories) else None
+
+    seen: set[tuple[int, int]] = set()
+    for left, right in ann_pairs:
+        key = (left, right) if left < right else (right, left)
+        if key in seen:
+            continue
+        seen.add(key)
+        left_category, right_category = _category_at(key[0]), _category_at(key[1])
+        if left_category not in swept or right_category not in swept:
+            counts['unswept_category_dropped'] += 1
+        elif left_category != right_category:
+            counts['cross_category_dropped'] += 1
+    return counts
+
+
+def _pairs_span_members(
+    member_indices: list[int],
+    pairs: Iterable[tuple[int, int]],
+) -> bool:
+    """Do *pairs* alone connect every member into ONE component?
+
+    "The lexical path found this cluster too" is only true if the lexical
+    pairs SPAN it. A single lexical pair inside a cluster that ANN otherwise
+    merged out of two unrelated halves would satisfy a naive
+    "lexical_clustered" check while the merge itself rests entirely on ANN —
+    which is exactly the evidence the apply gate must not accept.
+    """
+    if len(member_indices) < 2:
+        return False
+    parent = {i: i for i in member_indices}
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for left, right in pairs:
+        root_left, root_right = find(left), find(right)
+        if root_left != root_right:
+            parent[root_left] = root_right
+    return len({find(i) for i in member_indices}) == 1
+
+
+def restrict_delete_candidates_for_apply(
+    groups: Iterable[dict[str, Any]],
+) -> tuple[list[Any], list[dict[str, Any]]]:
+    """Narrow the reported delete candidates to the ones ``--apply`` may act on.
+
+    The REPORT is unchanged — every cluster both detectors found still appears
+    in ``near_duplicate_groups``/``delete_candidates``, because the dry-run
+    report is the right place for a lower-confidence signal. This gates only
+    the IRREVERSIBLE path.
+
+    Two facts make the ANN path riskier than the lexical one it joins, and
+    only on deletion:
+
+      1. Its cutoff (``config.write_triage.t_high``) was calibrated for the
+         write-triage decision on a corpus that is overwhelmingly
+         ``procedural_knowledge``. Its pairwise precision on the two
+         newly-swept categories is thinly evidenced by comparison.
+      2. Pairwise precision does not imply CLUSTER precision. The transitive
+         closure chains A~B and B~C into one cluster even when A~C is far
+         below the cutoff, and under ``--apply`` every non-survivor of that
+         chain becomes an irreversible delete.
+
+    So a cluster may contribute deletions only when its evidence is
+    chain-free:
+
+      - ``lexical_spanning`` — the lexical pairs alone connect every member,
+        i.e. the cluster is one this detector would have actioned before the
+        ANN path existed. Pre-existing behaviour, unchanged.
+      - ``ann_clique`` — EVERY member pair independently cleared the ANN
+        cutoff, so no member is in the cluster by transitivity alone.
+
+    Anything else is withheld, with its ids and the reason reported so the
+    withholding is legible rather than a silent shortfall.
+
+    Args:
+        groups: The plan's ``near_duplicate_groups`` entries.
+
+    Returns:
+        ``(delete_candidates, withheld_groups)``.
+    """
+    actionable: list[Any] = []
+    withheld: list[dict[str, Any]] = []
+    for group in groups:
+        losers = list(group.get('delete_candidate_ids') or ())
+        if not losers:
+            continue
+        if group.get('lexical_spanning') or group.get('ann_clique'):
+            actionable.extend(losers)
+            continue
+        withheld.append({
+            'member_ids': list(group.get('member_ids') or ()),
+            'category': group.get('category'),
+            'withheld_ids': losers,
+            'reason': 'ann_chained_without_lexical_span_or_ann_clique',
+        })
+    return actionable, withheld
 
 
 def build_sweep_plan(
@@ -594,6 +837,9 @@ def build_sweep_plan(
             index space, surfaced per cluster as ``ann_max_score``.
         ann_disclosure: Optional counter dict from the ANN path, echoed into
             the report so cap/loss counts travel with the plan they shaped.
+            The remap-owned counters in ``_PLAN_DISCLOSURE_KEYS`` are MERGED
+            into the echoed copy (the caller's dict is never mutated), so the
+            plan carries the ANN path's complete loss accounting.
         ann_threshold: The ANN cutoff actually in effect, echoed so a reader
             of the report never has to guess which number produced it.
 
@@ -604,11 +850,15 @@ def build_sweep_plan(
         ``delete_candidates`` flattened across clusters), so existing
         consumers are unaffected. Each group additionally carries
         ``found_by`` (``['ann']``, ``['lexical']`` or both),
-        ``lexical_clustered``, ``ann_max_score`` and ``lexical_max_ratio``;
-        the plan additionally carries ``threshold``, ``ann_threshold``,
+        ``lexical_clustered``, ``lexical_spanning``, ``ann_clique``,
+        ``ann_max_score``, ``lexical_max_ratio``,
+        ``lexical_max_ratio_sampled`` and ``delete_candidate_ids``; the plan
+        additionally carries ``threshold``, ``ann_threshold``,
         ``ann_disclosure``, ``topic_carveout_clusters`` /
-        ``topic_carveout_groups`` (see ``partition_topic_carveout``) and
-        ``path_verdicts``
+        ``topic_carveout_groups`` (see ``partition_topic_carveout``),
+        ``apply_delete_candidates`` / ``apply_withheld_clusters`` /
+        ``apply_withheld_groups`` (see
+        ``restrict_delete_candidates_for_apply``) and ``path_verdicts``
         (``lexical_only_clusters`` / ``ann_only_clusters`` /
         ``both_paths_clusters``).
     """
@@ -637,8 +887,14 @@ def build_sweep_plan(
         # the unfiltered scan still address the right records after filtering.
         candidate_index = {orig: new for new, orig in enumerate(candidate_indices)}
 
-        normalized = [(m.get('content') or '').strip().lower() for m in candidates]
-        lexical_pairs = set(_lexical_pairs(normalized, threshold))
+        normalized = _normalized_contents(candidates)
+        # Keep the exact ratios the scan already computed: _max_lexical_ratio
+        # seeds its running maximum from them instead of re-measuring pairs
+        # this loop just measured.
+        lexical_ratio_by_pair = {
+            (i, j): ratio for i, j, ratio in _lexical_pairs_scored(normalized, threshold)
+        }
+        lexical_pairs = set(lexical_ratio_by_pair)
 
         remapped_ann: set[tuple[int, int]] = set()
         ann_score_by_pair: dict[tuple[int, int], float] = {}
@@ -670,18 +926,30 @@ def build_sweep_plan(
         # cluster_memories_by_pairs passes member dicts through by identity,
         # so this recovers each cluster's indices for per-path attribution.
         index_by_identity = {id(m): i for i, m in enumerate(candidates)}
+        # Bucket the pair SETS by cluster in one pass over each set, rather
+        # than enumerating every cluster's O(k^2) in-group pairs and testing
+        # membership: clusters partition the members, so a pair is in-group
+        # exactly when both endpoints share a component. Carved-out clusters
+        # are absent from `component_of`, so their pairs fall out here.
+        component_of: dict[int, int] = {}
+        for position, group in enumerate(groups):
+            for member in group:
+                component_of[index_by_identity[id(member)]] = position
+        lexical_by_group: dict[int, list[tuple[int, int]]] = {}
+        ann_by_group: dict[int, list[tuple[int, int]]] = {}
+        for pair_set, bucket in ((lexical_pairs, lexical_by_group),
+                                 (remapped_ann, ann_by_group)):
+            for pair in pair_set:
+                position = component_of.get(pair[0])
+                if position is not None and position == component_of.get(pair[1]):
+                    bucket.setdefault(position, []).append(pair)
 
-        for group in groups:
+        for position, group in enumerate(groups):
             member_indices = [index_by_identity[id(m)] for m in group]
-            member_set = set(member_indices)
-            in_group = [
-                (a, b)
-                for a in member_set
-                for b in member_set
-                if a < b
-            ]
-            group_lexical = [p for p in in_group if p in lexical_pairs]
-            group_ann = [p for p in in_group if p in remapped_ann]
+            # Every distinct member pair: the denominator a clique must fill.
+            in_group_count = len(member_indices) * (len(member_indices) - 1) // 2
+            group_lexical = lexical_by_group.get(position, [])
+            group_ann = ann_by_group.get(position, [])
 
             found_by = []
             if group_ann:
@@ -696,8 +964,17 @@ def build_sweep_plan(
                 lexical_only += 1
 
             scores = [ann_score_by_pair[p] for p in group_ann if p in ann_score_by_pair]
+            known_ratio = max(
+                (lexical_ratio_by_pair[p] for p in group_lexical
+                 if p in lexical_ratio_by_pair),
+                default=None,
+            )
+            max_ratio, ratio_sampled = _max_lexical_ratio(
+                normalized, member_indices, known=known_ratio,
+            )
 
             survivor, losers = pick_survivor(group)
+            loser_ids = [m.get('id') for m in losers]
             near_duplicate_groups.append({
                 'survivor_id': survivor.get('id'),
                 'survivor_content': survivor.get('content'),
@@ -705,10 +982,27 @@ def build_sweep_plan(
                 'category': category,
                 'found_by': found_by,
                 'lexical_clustered': bool(group_lexical),
+                # Chain-free-evidence flags; see
+                # restrict_delete_candidates_for_apply for why --apply needs
+                # them and the report does not.
+                'lexical_spanning': _pairs_span_members(member_indices, group_lexical),
+                'ann_clique': bool(group_ann) and len(group_ann) == in_group_count,
                 'ann_max_score': max(scores) if scores else None,
-                'lexical_max_ratio': _max_lexical_ratio(normalized, member_indices),
+                'lexical_max_ratio': max_ratio,
+                'lexical_max_ratio_sampled': ratio_sampled,
+                'delete_candidate_ids': loser_ids,
             })
-            delete_candidates.extend(m.get('id') for m in losers)
+            delete_candidates.extend(loser_ids)
+
+    apply_candidates, apply_withheld = restrict_delete_candidates_for_apply(
+        near_duplicate_groups,
+    )
+    echoed_disclosure: dict[str, int] | None = None
+    if ann_disclosure is not None or ann_pairs is not None:
+        echoed_disclosure = {
+            **dict(ann_disclosure or {}),
+            **_count_ann_pair_drops(memories, ann_pairs or (), categories),
+        }
 
     return {
         'clusters_total': clusters_total,
@@ -716,9 +1010,12 @@ def build_sweep_plan(
         'delete_candidates': delete_candidates,
         'threshold': threshold,
         'ann_threshold': ann_threshold,
-        'ann_disclosure': dict(ann_disclosure) if ann_disclosure is not None else None,
+        'ann_disclosure': echoed_disclosure,
         'topic_carveout_clusters': len(topic_carveout_groups),
         'topic_carveout_groups': topic_carveout_groups,
+        'apply_delete_candidates': apply_candidates,
+        'apply_withheld_clusters': len(apply_withheld),
+        'apply_withheld_groups': apply_withheld,
         'path_verdicts': {
             'lexical_only_clusters': lexical_only,
             'ann_only_clusters': ann_only,
@@ -869,6 +1166,11 @@ def _consolidation_events(
 
     A negative delta means consolidation is winning; a positive one means the
     topic is re-accreting faster than the consolidation absorbed.
+
+    Every record's timestamp and topic are parsed ONCE per run, and the peer
+    sets are pre-bucketed, so this is O(records + sum of peer-set sizes)
+    rather than O(events x records) with a fresh ``datetime.fromisoformat``
+    inside the inner loop.
     """
     cluster_by_id: dict[Any, frozenset] = {}
     for group in groups:
@@ -876,26 +1178,42 @@ def _consolidation_events(
         for member_id in members:
             cluster_by_id[member_id] = members
 
+    ts_by_index = [_parsed_timestamp(r.get('created_at')) for r in records]
+    topic_by_index = [_topic_of(r) for r in records]
+    indices_by_topic: dict[str, list[int]] = {}
+    indices_by_cluster: dict[frozenset, list[int]] = {}
+    for index, record in enumerate(records):
+        topic = topic_by_index[index]
+        if topic is not None:
+            indices_by_topic.setdefault(topic, []).append(index)
+        members = cluster_by_id.get(record.get('id'))
+        if members is not None:
+            indices_by_cluster.setdefault(members, []).append(index)
+
     events: list[dict[str, Any]] = []
-    for record in records:
+    for index, record in enumerate(records):
         metadata = record.get('metadata') or {}
         if not (metadata.get('canonical') or metadata.get('supersedes')):
             continue
-        topic = _topic_of(record)
-        event_ts = _parsed_timestamp(record.get('created_at'))
+        topic = topic_by_index[index]
+        event_ts = ts_by_index[index]
         peers = cluster_by_id.get(record.get('id'))
 
         accreted = 0
         if event_ts is not None:
-            for other in records:
-                if other is record:
+            # Peer set: the shared topic when there is one, else the cluster;
+            # an event with neither has no identifiable peers, so nothing is
+            # attributed to it rather than charging it with the whole category.
+            if topic is not None:
+                peer_indices: list[int] = indices_by_topic.get(topic, [])
+            elif peers is not None:
+                peer_indices = indices_by_cluster.get(peers, [])
+            else:
+                peer_indices = []
+            for other in peer_indices:
+                if records[other] is record:
                     continue
-                if topic is not None:
-                    if _topic_of(other) != topic:
-                        continue
-                elif peers is None or other.get('id') not in peers:
-                    continue
-                other_ts = _parsed_timestamp(other.get('created_at'))
+                other_ts = ts_by_index[other]
                 if other_ts is not None and other_ts > event_ts:
                     accreted += 1
 
@@ -1084,17 +1402,39 @@ def emit_metrics_artifact(
     a run whose metrics file went missing, which is strictly worse than the run
     never having written at all.
 
+    All THREE files go through the same ``_atomic_write_text``
+    (temp-in-dir + ``os.replace``). Reusing the metrics writer's own helper
+    rather than a plain ``write_text`` is the point: every emitted metric
+    carries a ``details_path``, and a reader that follows it must never land on
+    a half-written JSON document. A crash mid-write leaves the temp file
+    unlinked and no details file at all — visibly absent, which is diagnosable,
+    rather than present and truncated, which is not. A failure to write it is
+    logged and RE-RAISED: the series' ``details_path`` would otherwise dangle,
+    and a silently incomplete artifact set is exactly what M1 rejects at emit
+    time.
+
     Returns:
         ``(metrics_path, report_path, details_path)``.
     """
-    from shared.memory_eval_metrics import write_metric_series  # noqa: PLC0415
+    from shared.memory_eval_metrics import (  # noqa: PLC0415
+        _atomic_write_text,
+        write_metric_series,
+    )
 
     metrics_path, report_path = write_metric_series(series, root, stamp=stamp)
     details_path = metrics_path.parent / details_artifact_path(stamp)
-    details_path.write_text(
-        json.dumps(details, indent=2, sort_keys=True, default=str) + '\n',
-        encoding='utf-8',
-    )
+    try:
+        _atomic_write_text(
+            details_path,
+            json.dumps(details, indent=2, sort_keys=True, default=str) + '\n',
+        )
+    except OSError:
+        logger.exception(
+            'Wrote %s but FAILED to write its companion %s — every metric in '
+            'that series names a details file that does not exist.',
+            metrics_path, details_path,
+        )
+        raise
     return metrics_path, report_path, details_path
 
 
@@ -1333,6 +1673,19 @@ def resolve_ann_threshold(
     return None, {'ann_disabled_uncalibrated': 1}
 
 
+_ANN_QUERY_CONCURRENCY = 16
+"""ANN queries in flight at once.
+
+A resource knob, not a similarity decision: it changes only how fast the same
+queries are issued, never which hits come back. Sequential issue would put a
+``--scan-limit``-sized scan across three categories at up to 15,000 SERIALISED
+round-trips — minutes of pure latency for a detector task 3136 schedules
+periodically. Bounded rather than unbounded because the same Qdrant instance
+serves the live memory path, and an unbounded fan-out over a whole corpus
+would be a self-inflicted load spike.
+"""
+
+
 async def fetch_ann_neighbors(
     memory: Any,
     project_id: str,
@@ -1340,6 +1693,7 @@ async def fetch_ann_neighbors(
     *,
     top_k: int,
     score_threshold: float,
+    concurrency: int = _ANN_QUERY_CONCURRENCY,
 ) -> tuple[dict[Any, list[dict[str, Any]]], dict[str, int]]:
     """ANN neighbours for each record, queried with the record's OWN vector.
 
@@ -1350,6 +1704,17 @@ async def fetch_ann_neighbors(
     string: the detector therefore makes zero embedding API calls at runtime
     and cannot drift into a second metric space.
 
+    The record's CATEGORY is pushed into the query as a payload filter (the
+    same ``Filter``/``FieldCondition``/``MatchValue`` shape
+    ``Mem0Backend.scroll_by_metadata`` and ``count_by_metadata`` build). The
+    collection holds every category, so an unfiltered ``top_k`` could be spent
+    entirely on records the per-category sweep will discard — the genuine
+    same-category candidates cut off below them would be lost recall the ANN
+    path exists to add. Filtering ALSO makes a cross-category pair structurally
+    impossible rather than merely dropped later. A record with no category
+    cannot be clustered by ``build_sweep_plan`` at all, so it is queried
+    unfiltered exactly as before.
+
     Args:
         memory: Live (or mock) MemoryService instance.
         project_id: Project scope to query.
@@ -1357,47 +1722,75 @@ async def fetch_ann_neighbors(
         top_k: Neighbours wanted per record. The query asks for ``top_k + 1``
             so the record's own guaranteed self-hit does not consume a slot.
         score_threshold: Cutoff pushed down into Qdrant.
+        concurrency: Max queries in flight (see
+            :data:`_ANN_QUERY_CONCURRENCY`).
 
     Returns:
-        ``({memory_id: [{'id', 'score'}, ...]}, disclosure)``. A record with
-        no vector is skipped (``ann_pairs_from_neighbors`` counts it as
+        ``({memory_id: [{'id', 'score'}, ...]}, disclosure)``, with records in
+        input order so two identical runs produce identical output. A record
+        with no vector is skipped (``ann_pairs_from_neighbors`` counts it as
         ``missing_vector``). *disclosure* carries ``ann_query_errors``: a
         failure on one record is logged and counted, and the sweep continues,
         so one bad point never costs the whole scan.
     """
+    from qdrant_client.http import models as qmodels  # noqa: PLC0415
+
     from fused_memory.models.scope import Scope  # noqa: PLC0415
 
     neighbors: dict[Any, list[dict[str, Any]]] = {}
     disclosure = {'ann_query_errors': 0}
-    if not records:
+    queryable = [r for r in records if r.get('vector') is not None]
+    if not queryable:
         return neighbors, disclosure
 
     scope = Scope(project_id=project_id)
     collection_name = scope.mem0_collection_name(memory.config.mem0.collection_prefix)
     client = await memory.mem0._get_async_qdrant()  # noqa: SLF001
 
-    for record in records:
-        vector = record.get('vector')
-        if vector is None:
-            continue  # never queried; counted as missing_vector downstream
+    filter_by_category: dict[Any, Any] = {}
+
+    def _category_filter(category: Any) -> Any:
+        if not category:
+            return None
+        if category not in filter_by_category:
+            filter_by_category[category] = qmodels.Filter(must=[
+                qmodels.FieldCondition(
+                    key='category', match=qmodels.MatchValue(value=category),
+                ),
+            ])
+        return filter_by_category[category]
+
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def _query(record: dict[str, Any]) -> tuple[Any, list[dict[str, Any]] | None]:
         record_id = record.get('id')
-        try:
-            result = await client.query_points(
-                collection_name=collection_name,
-                query=vector,
-                limit=top_k + 1,  # +1 absorbs the guaranteed self-hit
-                score_threshold=score_threshold,
-                with_payload=False,
-            )
-        except Exception as exc:
-            logger.error('ANN query failed for memory %s: %s', record_id, exc)
-            disclosure['ann_query_errors'] += 1
-            continue
-        neighbors[record_id] = [
+        async with semaphore:
+            try:
+                result = await client.query_points(
+                    collection_name=collection_name,
+                    query=record.get('vector'),
+                    limit=top_k + 1,  # +1 absorbs the guaranteed self-hit
+                    score_threshold=score_threshold,
+                    query_filter=_category_filter(record.get('category')),
+                    with_payload=False,
+                )
+            except Exception as exc:
+                # Per-record, so one bad point is counted rather than fatal.
+                logger.error('ANN query failed for memory %s: %s', record_id, exc)
+                return record_id, None
+        return record_id, [
             {'id': point.id, 'score': point.score}
             for point in result.points
             if point.id != record_id
         ]
+
+    # gather preserves argument order, so `neighbors` is populated in input
+    # order regardless of which query finished first.
+    for record_id, hits in await asyncio.gather(*(_query(r) for r in queryable)):
+        if hits is None:
+            disclosure['ann_query_errors'] += 1
+            continue
+        neighbors[record_id] = hits
 
     return neighbors, disclosure
 
@@ -1412,6 +1805,7 @@ async def apply_deletions(
     plan: dict[str, Any],
     *,
     dry_run: bool,
+    candidates: Iterable[Any] | None = None,
 ) -> dict[str, int]:
     """Delete the plan's ``delete_candidates`` from Mem0 (best-effort).
 
@@ -1419,6 +1813,12 @@ async def apply_deletions(
     Otherwise, each candidate is deleted individually in a try/except so a
     single failure does not abort the remaining deletes (best-effort partial
     progress) — mirrors ``audit_duplicate_tasks.apply_changes``.
+
+    Args:
+        candidates: Explicit ids to delete, overriding the plan's own
+            ``delete_candidates``. ``_run`` passes the apply-gated subset
+            (see ``restrict_delete_candidates_for_apply``); the default keeps
+            every pre-existing caller's behaviour byte-for-byte.
 
     Returns:
         Dict with ``deleted`` and ``delete_errors`` counts.
@@ -1428,7 +1828,8 @@ async def apply_deletions(
 
     deleted = 0
     delete_errors = 0
-    for memory_id in plan.get('delete_candidates', []):
+    targets = plan.get('delete_candidates', []) if candidates is None else candidates
+    for memory_id in targets:
         try:
             await memory.delete_memory(memory_id, store='mem0', project_id=project_id)
             logger.info('Deleted near-duplicate memory %s', memory_id)
@@ -1536,6 +1937,11 @@ async def _run(args: argparse.Namespace) -> int:
         # stdout is task 3136's report contract — unchanged shape, one JSON doc.
         print(json.dumps(plan, indent=2, default=str))
 
+        # build_sweep_plan owns the remap-stage losses (a cross-category or
+        # unswept-category ANN pair), so the plan's echoed copy — not the dict
+        # handed to it — is the complete accounting the metrics must carry.
+        disclosures = plan['ann_disclosure'] or disclosures
+
         if not args.no_metrics:
             records_by_category = {
                 category: [m for m in records if m.get('category') == category]
@@ -1571,14 +1977,34 @@ async def _run(args: argparse.Namespace) -> int:
         if refusal:
             logger.error('ABORT: %s.', refusal)
             return 1
-        if not plan['delete_candidates']:
-            logger.error('ABORT: plan has 0 delete candidates — nothing to apply.')
+
+        # The apply gate: clusters whose only evidence is an ANN CHAIN stay in
+        # the report but never reach an irreversible delete.
+        apply_candidates = plan['apply_delete_candidates']
+        withheld = plan['apply_withheld_groups']
+        if withheld:
+            logger.warning(
+                '%d cluster(s) withheld from --apply: neither lexically '
+                'spanning nor an ANN clique, so membership rests on '
+                'transitivity across the ANN cutoff. Still reported, NOT '
+                'deleted: %s',
+                len(withheld), [g['member_ids'] for g in withheld],
+            )
+        if not apply_candidates:
+            logger.error(
+                'ABORT: 0 applicable delete candidates (%d reported, %d '
+                'cluster(s) withheld by the apply gate) — nothing to apply.',
+                len(plan['delete_candidates']), len(withheld),
+            )
             return 1
 
-        result = await apply_deletions(memory, args.project_id, plan, dry_run=False)
+        result = await apply_deletions(
+            memory, args.project_id, plan, dry_run=False,
+            candidates=apply_candidates,
+        )
         logger.info(
             'Applied: deleted %d/%d memory/memories; %d error(s)',
-            result['deleted'], len(plan['delete_candidates']), result['delete_errors'],
+            result['deleted'], len(apply_candidates), result['delete_errors'],
         )
         return 1 if result['delete_errors'] > 0 else 0
     finally:
