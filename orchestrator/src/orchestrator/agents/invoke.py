@@ -1156,21 +1156,44 @@ async def _run_subprocess_local(
     # Capture pgid at spawn; start_new_session guarantees pgid == pid.
     pgid = proc.pid
 
+    # Outer try: a cancel landing *inside* the TimeoutError handler's
+    # terminate_process_group await (SIGTERM already sent, SIGKILL escalation
+    # pending) must still be caught here too — an exception raised inside an
+    # except block is not caught by a sibling handler of the same try, so a
+    # CancelledError handler that was only a sibling of `except TimeoutError:`
+    # would let that escalation be abandoned with a SIGTERM-ignoring child
+    # left alive.
     try:
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(input=stdin_data),
-            timeout=timeout_seconds,
-        )
-    except TimeoutError:
-        await terminate_process_group(proc, pgid)
-        duration_ms = int(time.monotonic() * 1000) - start_ms
-        return _SubprocessResult(
-            stdout='',
-            stderr=f'Process killed after {timeout_seconds}s timeout (SIGTERM+SIGKILL)',
-            returncode=1,
-            duration_ms=duration_ms,
-            timed_out=True,
-        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(input=stdin_data),
+                timeout=timeout_seconds,
+            )
+        except TimeoutError:
+            await terminate_process_group(proc, pgid)
+            duration_ms = int(time.monotonic() * 1000) - start_ms
+            return _SubprocessResult(
+                stdout='',
+                stderr=f'Process killed after {timeout_seconds}s timeout (SIGTERM+SIGKILL)',
+                returncode=1,
+                duration_ms=duration_ms,
+                timed_out=True,
+            )
+    except asyncio.CancelledError:
+        # Orchestrator shutdown / steward-stop path: the awaiting task was
+        # cancelled.  Without this, proc.communicate() is cancelled but the
+        # child process GROUP is never signalled and the agent survives as an
+        # orphan still editing/committing in its worktree.  Mirrors the
+        # already-blessed handler in shared/src/shared/cli_invoke.py (:2433)
+        # and orchestrator/src/orchestrator/steward.py (:405).
+        # No comm_task to reap: asyncio.wait_for already cancels and awaits
+        # its inner task before propagating CancelledError.
+        if proc.returncode is None:
+            logger.warning(
+                f'Subprocess cancelled — terminating process group for pid {proc.pid}'
+            )
+            await terminate_process_group(proc, pgid, grace_secs=5.0)
+        raise
 
     duration_ms = int(time.monotonic() * 1000) - start_ms
 
