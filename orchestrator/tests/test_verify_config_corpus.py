@@ -35,6 +35,7 @@ from _verify_config_corpus import (
     DF_CONFIG_PATH,
     FM_CONFIG_PATH,
     FM_LINT_COMMAND,
+    MODULE_LINT_COMMANDS,
     REPO_ROOT,
     ROOT_LINT_COMMAND,
     ROOT_TEST_COMMAND,
@@ -73,4 +74,34 @@ class TestRootScalarsMatchLiveYaml:
             f'this command\'s shape and may need updating too. Do NOT loosen this comparison '
             f'to a substring or normalised match: the whole point is that the scoper suites '
             f'exercise the exact command the fleet actually runs.'
+        )
+
+
+class TestModuleLintCommandsMatchLiveYaml:
+    """Each per-module ``lint_command`` is byte-identical to its live YAML value.
+
+    These six share one 2-segment shape — ``uv run --project M --directory M
+    ruff check src/ tests/ && python3
+    fused-memory/scripts/check_bare_magicmock_config.py M/tests`` — which is
+    why the corpus can generate them from the module name. ``fused-memory`` is
+    the lone 3-segment chain (it runs a second sibling checker), so it does not
+    fit the comprehension and lives in ``FM_LINT_COMMAND`` instead, covered by
+    ``TestRootScalarsMatchLiveYaml`` above.
+    """
+
+    @pytest.mark.parametrize('module', sorted(MODULE_LINT_COMMANDS))
+    def test_module_lint_command_equals_live_value(self, module):
+        config_path = REPO_ROOT / module / 'orchestrator.yaml'
+        live = load_config_scalar(config_path, 'lint_command')
+        assert MODULE_LINT_COMMANDS[module] == live, (
+            f'_verify_config_corpus.MODULE_LINT_COMMANDS[{module!r}] has drifted from the '
+            f'live config.\n'
+            f'  source: {config_path.relative_to(REPO_ROOT)}::lint_command\n'
+            f'  corpus: {MODULE_LINT_COMMANDS[module]!r}\n'
+            f'  live:   {live!r}\n'
+            f'FIX: if {module} still shares the common 2-segment shape, the comprehension in '
+            f'_verify_config_corpus.py needs updating; if its chain shape has diverged, give '
+            f'it a dedicated constant the way fused-memory has FM_LINT_COMMAND, and drop it '
+            f'from MODULE_LINT_COMMANDS. Either way also check test_verify_plan.py\'s goldens, '
+            f'which iterate this dict. Do NOT loosen this comparison to a substring match.'
         )
