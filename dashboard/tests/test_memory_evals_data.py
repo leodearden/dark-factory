@@ -1655,6 +1655,116 @@ class TestStalenessAndDegradedStates:
         assert payload['issues'][0]['kind'] == 'malformed_verdict_entry'
         assert 'str' in payload['issues'][0]['detail']
 
+    def test_unkeyable_verdict_entries_are_counted_not_dropped(self, tmp_path: Path) -> None:
+        """An entry that IS an object but carries no usable key is still a discard.
+
+        ``malformed_verdict_entry`` covers a non-object element.  An element
+        that IS an object but whose ``eval_id``/``metric_id`` is not a string
+        can never be keyed either, and was dropped by a bare ``continue`` — the
+        record-level form of the same silent discard the artifact-level guards
+        above exist to prevent.  Milder in blast radius (one unjudged row
+        rather than a wholly unjudged tree) but the same class: the row renders
+        ``verdict: None``, which is indistinguishable from "no entry was ever
+        written for it".
+
+        Counted once per file rather than one issue apiece, mirroring
+        ``unidentified_metrics`` — a systematically broken artifact should
+        degrade one row of the issues list, not flood it.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _healthy_tree(tmp_path)
+        good = _verdict('eval-a', 'dangling-pointers', 'alarm', fingerprint='opaque-fp-1')
+        _write_verdicts(root, [
+            good,
+            {'eval_id': 'eval-a', 'metric_id': None, 'verdict': 'alarm', 'fingerprint': 'fp-x'},
+            {'eval_id': 42, 'metric_id': 'dangling-pointers', 'verdict': 'alarm', 'fingerprint': 'fp-y'},
+        ])
+
+        payload = build_memory_evals(root, esc_dir)
+
+        # The keyable sibling is still read — bad records cost only themselves.
+        assert _only(payload['evals'][0]['metrics'], 'dangling-pointers')['verdict'] == 'alarm'
+
+        assert payload['issue_count'] == len(payload['issues'])
+        unidentified = [i for i in payload['issues'] if i['kind'] == 'unidentified_verdicts']
+        assert len(unidentified) == 1, [i['kind'] for i in payload['issues']]
+        # The COUNT is what makes the issue actionable: two records vanished.
+        assert '2' in unidentified[0]['detail']
+        assert unidentified[0]['path'] == str(root / 'verdicts-current.json')
+
+    def test_unkeyable_limits_verdict_records_are_counted_not_dropped(self, tmp_path: Path) -> None:
+        """The same record-level discard sits in the limits reader.
+
+        A non-object record, or one whose ``metric_id`` is not a string, is
+        skipped when indexing the limits artifact's embedded ``verdicts[]``.
+        The cost is the metric's ``rule_kind`` — the rule that governs it —
+        silently reading as ``None``, which is indistinguishable from a limits
+        artifact that simply never mentioned that metric.
+
+        Carries an ``eval_id`` (unlike the root-scoped verdicts issue) because
+        the limits artifact is per-eval, matching its sibling issues.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _healthy_tree(tmp_path)
+        limits_path = _write_limits(root, 'eval-a', run_stamp=_AGE_RUN, verdicts=[
+            {'metric_id': 'dangling-pointers', 'rule_kind': 'count'},
+            'not-an-object',
+            {'metric_id': None, 'rule_kind': 'count'},
+        ])
+
+        payload = build_memory_evals(root, esc_dir)
+
+        # Provenance survives — one bad record must not cost the whole block.
+        assert payload['evals'][0]['limits'] is not None
+        assert _only(payload['evals'][0]['metrics'], 'dangling-pointers')['rule_kind'] == 'count'
+
+        assert payload['issue_count'] == len(payload['issues'])
+        unidentified = [i for i in payload['issues'] if i['kind'] == 'unidentified_limits_verdicts']
+        assert len(unidentified) == 1, [i['kind'] for i in payload['issues']]
+        assert unidentified[0]['eval_id'] == 'eval-a'
+        assert unidentified[0]['path'] == str(limits_path)
+        assert '2' in unidentified[0]['detail']
+
+    def test_wrong_type_limits_verdicts_field_is_named(self, tmp_path: Path) -> None:
+        """A non-list ``verdicts`` field loses every ``rule_kind`` at once.
+
+        ``body.get('verdicts') or []`` iterates a dict's KEYS (or a string's
+        characters), so every record check below fails and the index comes back
+        empty with no signal — the artifact-level analogue of the ``entries``
+        defect, one function earlier.
+
+        Distinct from ``malformed_limits``: the body IS an object here, so the
+        alpha/baseline/grandfather provenance is perfectly usable and must
+        still be returned.  Only ``rule_kind`` is lost, so the issue is scoped
+        to that rather than discarding a block that parsed fine.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _healthy_tree(tmp_path)
+        limits_path = _write_limits(root, 'eval-a', run_stamp=_AGE_RUN)
+        body = json.loads(limits_path.read_text())
+        body['verdicts'] = {'dangling-pointers': 'count'}
+        _dump(limits_path, body)
+
+        payload = build_memory_evals(root, esc_dir)
+
+        # The provenance block is NOT discarded — the body parsed and is an object.
+        assert payload['evals'][0]['limits'] is not None
+        assert payload['evals'][0]['limits']['alpha'] == 0.002777777777777778
+        # But the rule this metric is governed by is genuinely gone.
+        assert _only(payload['evals'][0]['metrics'], 'dangling-pointers')['rule_kind'] is None
+
+        assert payload['issue_count'] == len(payload['issues'])
+        malformed = [i for i in payload['issues'] if i['kind'] == 'malformed_limits_verdicts']
+        assert len(malformed) == 1, [i['kind'] for i in payload['issues']]
+        assert malformed[0]['eval_id'] == 'eval-a'
+        assert malformed[0]['path'] == str(limits_path)
+        assert 'dict' in malformed[0]['detail']
+        # A body that IS an object must not also be reported as the wrong type.
+        assert not [i for i in payload['issues'] if i['kind'] == 'malformed_limits']
+
     def test_malformed_entries_does_not_suppress_the_storm_block(self, tmp_path: Path) -> None:
         """One named degradation must not become a second silent one.
 
