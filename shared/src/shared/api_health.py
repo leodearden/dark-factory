@@ -279,6 +279,18 @@ class ApiHealthGate:
     ) -> None:
         """Record one ``api_error`` account event for forensics.
 
+        Best-effort by contract.  These rows are evidence, never control
+        state: the in-memory state machine is authoritative, so a full disk or
+        a locked database must never fail the invocation that reported the 5xx
+        and must never suppress a trip — which would hide the very outage the
+        gate exists to surface.  Mirrors ``UsageGate._write_cost_event``
+        (usage_gate.py:1663-1680).
+
+        The failure is swallowed but LOGGED at WARNING: losing forensics is
+        worth an operator's attention even though it is not worth an
+        exception.  (Logging at WARN+ is also what keeps this handler off the
+        silent-fallthrough gate's signature (b).)
+
         A gate with no cost store is fully functional — xi can wire the state
         machine before the store, and the tests drive it without one.
         """
@@ -296,13 +308,23 @@ class ApiHealthGate:
                 'failure_rate': stats.failure_rate,
             }
         )
-        await self._cost_store.save_api_error_event(
-            account_name=account,
-            project_id=self._project_id,
-            run_id=self._run_id,
-            details=details,
-            created_at=self._wall_clock().isoformat(),
-        )
+        try:
+            await self._cost_store.save_api_error_event(
+                account_name=account,
+                project_id=self._project_id,
+                run_id=self._run_id,
+                details=details,
+                created_at=self._wall_clock().isoformat(),
+            )
+        except Exception as exc:
+            logger.warning(
+                'ApiHealthGate forensics write failed for %s (status %d, task %s) — '
+                'gate state is unaffected: %s',
+                account,
+                outcome.status,
+                task_id,
+                exc,
+            )
 
     @staticmethod
     def _classify(outcome: InvocationOutcome) -> _Signal:
