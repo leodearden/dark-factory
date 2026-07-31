@@ -53,6 +53,7 @@ prompt-pinning tests and the drift test.
 from __future__ import annotations
 
 import re
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
@@ -70,6 +71,7 @@ __all__ = [
     'TOPIC_SLUG_RE',
     'classify_unknown_keys',
     'normalize_supersedes',
+    'validate_memory_metadata',
 ]
 
 #: Prefix marking a deliberately-unvalidated experimental key (Tier-C).
@@ -672,3 +674,204 @@ class MemoryMetadataValidationError(Exception):
             f'{detail} -- the metadata vocabulary is defined in '
             f'{self.REGISTRY_LOCATION}'
         )
+
+
+# ---------------------------------------------------------------------------
+# The shape validator
+# ---------------------------------------------------------------------------
+
+#: Appended to every violation message so
+#: :class:`MemoryMetadataValidationError`'s V1 hint obligation ("name the
+#: rule AND where the registry lives") is satisfied BY CONSTRUCTION rather
+#: than by each call site remembering to add it.
+_REGISTRY_HINT = f'(vocabulary: {MemoryMetadataValidationError.REGISTRY_LOCATION})'
+
+
+def _violation(key: str, code: str, rule: str, *, fatal: bool) -> MetadataViolation:
+    """Build a violation whose message names the rule and the registry."""
+    return MetadataViolation(
+        key=key, code=code, message=f'{rule} {_REGISTRY_HINT}', fatal=fatal
+    )
+
+
+def _is_full_uuid(value: Any) -> bool:
+    """True iff *value* is a canonical full-UUID string.
+
+    Deliberately stricter than a bare ``uuid.UUID(value)`` call, which also
+    accepts the 32-char undashed form, braced forms and ``urn:uuid:``
+    prefixes.  Requiring the canonical 36-char dashed rendering is what
+    rejects the ``short_hex`` shape the census counted (3 live ``supersedes``
+    members) and truncated hex generally — a bare parse would let a
+    32-hex-digit string through as "well formed" while no store would
+    resolve it in that spelling.
+
+    Case is tolerated (``str(uuid.UUID(x))`` is lowercase) because casing is
+    a rendering choice, not a different identifier.
+    """
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = uuid.UUID(value)
+    except (ValueError, AttributeError, TypeError):
+        return False
+    return str(parsed) == value.lower()
+
+
+def validate_memory_metadata(
+    meta: dict[str, Any], *, enforce_kind_registry: bool
+) -> list[MetadataViolation]:
+    """Shape-check the reserved Mem0 metadata vocabulary (PRD V1, leaf β).
+
+    Returns **every** violation found — it never short-circuits at the first
+    failure, because a validator that stopped early would make an operator
+    fix one violation per write attempt.  Returning violations rather than
+    raising mirrors ``parse_metadata``'s ``(value, warnings)`` contract
+    (``shared/src/shared/task_metadata.py``): the CALLER owns the
+    warn-vs-reject decision, driven by ``memory_metadata.enforce``.
+
+    *meta* is mutated in place in exactly one way: a ``supersedes`` value is
+    normalized to a list (PRD D2).  See
+    :func:`normalize_supersedes` and the β-before-γ note below.
+
+    SCOPE — SHAPE ONLY.  This is a pure synchronous function taking only a
+    dict, so it structurally **cannot** perform a store lookup.  That is
+    deliberate, not an oversight:
+
+    * ``parent_id`` **liveness** (does the parent still exist?) is leaf δ's,
+    * ``canonical`` per-(project, topic) **uniqueness** is leaf ε's.
+
+    Making the boundary structural rather than a comment means a later leaf
+    must add liveness at the seam and cannot accidentally grow a second
+    implementation of it in here (INV-5).
+
+    Ordering inside the function is load-bearing:
+
+    1. normalize ``supersedes`` first, so the member checks below see a
+       uniform list regardless of which live shape arrived;
+    2. shape-check each reserved key that is PRESENT — absence is never a
+       violation, since none of V1's five keys is required;
+    3. classify unknown top-level keys (census-only, never fatal).
+
+    :param enforce_kind_registry: whether an unknown ``kind`` is fatal.  The
+        violation is emitted either way — this flag only decides whether it
+        can reject.  It exists because leaf α measured PRD D3's stated
+        premise ("kind writers are in-repo code + prompts, enumerated and
+        grandfathered") FALSE: 242 of the 329 live ``kind`` values are
+        singletons, i.e. the population is agent-invented free text and open
+        in practice.  Day-one strict rejection would convert every newly
+        invented kind into a hard memory-write failure on the live fleet.
+        See PRD §10 open question 1.
+    """
+    violations: list[MetadataViolation] = []
+
+    # 1. supersedes — NORMALIZE, never reject the container shape.
+    #
+    # The β-before-γ hazard: PRD §9 sequences γ after β, and
+    # `reconciliation/harness.py:1167` writes a SCALAR `supersedes` today
+    # (81 live records).  Rejecting the scalar form here would break the
+    # recon harness's own writes for the entire window until γ migrates it.
+    # Coercing at the write boundary mirrors `_normalize_task_id_metadata`,
+    # which already does exactly this for the same class of problem in the
+    # same two functions, and is compatible with V1's "legacy scalar
+    # tolerated on read".  Only malformed MEMBERS are rejected.
+    if 'supersedes' in meta:
+        members = normalize_supersedes(meta['supersedes'])
+        meta['supersedes'] = members
+        for member in members:
+            if not _is_full_uuid(member):
+                violations.append(_violation(
+                    'supersedes',
+                    'invalid_supersedes_member',
+                    f'supersedes member {member!r} must be a canonical full-UUID '
+                    f'string; the census counts 3 live short-hex and 8 live '
+                    f'non-string members',
+                    fatal=True,
+                ))
+
+    # 2a. topic — the shared slug namespace (PRD D4).
+    if 'topic' in meta:
+        topic = meta['topic']
+        if not isinstance(topic, str):
+            violations.append(_violation(
+                'topic',
+                'invalid_topic_type',
+                f'topic must be a str, got {type(topic).__name__}',
+                fatal=True,
+            ))
+        elif not TOPIC_SLUG_RE.match(topic) or len(topic) > TOPIC_SLUG_MAX_LEN:
+            violations.append(_violation(
+                'topic',
+                'invalid_topic_slug',
+                f'topic {topic!r} must match TOPIC_SLUG_RE '
+                f'{TOPIC_SLUG_RE.pattern!r} and be at most '
+                f'{TOPIC_SLUG_MAX_LEN} chars',
+                fatal=True,
+            ))
+
+    # 2b. canonical — bools only.
+    if 'canonical' in meta:
+        canonical = meta['canonical']
+        # isinstance(..., bool), NOT truthiness: `1 == True` in Python, so a
+        # truthiness check would silently accept the int form.  The census
+        # counts exactly 1 live non-bool value — the record this rule exists
+        # to surface.
+        if not isinstance(canonical, bool):
+            violations.append(_violation(
+                'canonical',
+                'invalid_canonical_type',
+                f'canonical must be a bool, got {type(canonical).__name__} '
+                f'({canonical!r}); the check is isinstance(x, bool), not '
+                f'truthiness, so 1/0 do not pass as True/False',
+                fatal=True,
+            ))
+
+    # 2c. kind — registry membership, NOT slug shape.
+    #
+    # 321 of the 329 live `kind` values are snake_case, so applying
+    # TOPIC_SLUG_RE here would reject essentially the whole live population.
+    if 'kind' in meta:
+        kind = meta['kind']
+        if not isinstance(kind, str):
+            violations.append(_violation(
+                'kind',
+                'invalid_kind_type',
+                f'kind must be a str, got {type(kind).__name__}',
+                fatal=True,
+            ))
+        elif kind not in KIND_REGISTRY:
+            violations.append(_violation(
+                'kind',
+                'unknown_kind',
+                f'kind {kind!r} is not in KIND_REGISTRY '
+                f'({len(KIND_REGISTRY)} grandfathered values)',
+                fatal=enforce_kind_registry,
+            ))
+
+    # 2d. parent_id — SHAPE only; liveness is leaf δ's (see the docstring).
+    if 'parent_id' in meta:
+        parent_id = meta['parent_id']
+        if not _is_full_uuid(parent_id):
+            violations.append(_violation(
+                'parent_id',
+                'invalid_parent_id_shape',
+                f'parent_id {parent_id!r} must be a canonical full-UUID string '
+                f'(shape only — liveness resolution is leaf δ\'s)',
+                fatal=True,
+            ))
+
+    # 3. Unknown top-level keys — census-only, never fatal.
+    #
+    # 1,627 distinct live keys, 715 of them singletons.  This axis exists to
+    # PRODUCE a drift signal, not to reject; making it fatal would turn the
+    # long tail into an outage the moment `enforce` flipped.
+    for key in classify_unknown_keys(meta):
+        violations.append(_violation(
+            key,
+            'unknown_key',
+            f'metadata key {key!r} belongs to no known layer '
+            f'(mem0-managed / server-stamped / reserved / blessed) and lacks '
+            f'the {EXPERIMENTAL_KEY_PREFIX!r} experimental prefix',
+            fatal=False,
+        ))
+
+    return violations
