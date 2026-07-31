@@ -380,37 +380,93 @@ _LIVE_FIELD_NAMES: tuple[str, ...] = (
     'pid',
 )
 
-# ``<field> = <value>`` with optional surrounding quotes. The value class stops
-# at the punctuation these observations wrap their fields in, so `null,` and
-# `null)` read as `null` rather than carrying the delimiter into the key; the
-# characters it does admit (`-`, `.`, `/`, `:`, `+`) are the ones real values
-# need — `in-progress`, a path, an ISO timestamp.
+# ``<field> = <value>``, as EITHER a fully-quoted value or a bare token — never
+# a half-read mixture of the two.
+#
+# The quoted branch is deliberately all-or-nothing. An earlier single-branch
+# form (``"?([A-Za-z0-9_./:+-]+)"?``) let the value class terminate INSIDE a
+# quoted string, so `status="in progress"` silently truncated to the key
+# `status=in` — a key that groups with nothing real, would group with any other
+# value truncating to the same prefix, and fires NEITHER disclosure counter.
+# That is exactly the invisible recall loss the disclosure design in this file
+# exists to prevent. Requiring the closing quote makes a value that cannot be
+# read whole fail to match at all, so it falls through to the counted
+# ``liveness_snapshot_unfielded`` branch instead of becoming a bad key.
+#
+# `|` is excluded from the quoted branch because it is the key's own pair
+# delimiter: admitting it would let one value forge two pairs. Such a value
+# also reads as unfielded rather than silently corrupting the key.
+#
+# The bare branch's class stops at the punctuation these observations wrap
+# their fields in, so `null,` and `null)` read as `null` rather than carrying
+# the delimiter into the key; the characters it does admit (`-`, `.`, `/`,
+# `:`, `+`) are the ones real values need — `in-progress`, a path, an ISO
+# timestamp.
 _LIVE_FIELD_ASSIGNMENT_RE = re.compile(
-    r'\b(' + '|'.join(_LIVE_FIELD_NAMES) + r')\s*=\s*"?([A-Za-z0-9_./:+-]+)"?',
+    r'\b(' + '|'.join(_LIVE_FIELD_NAMES) + r')\s*=\s*'
+    r'(?:"([^"|\n]+)"|([A-Za-z0-9_./:+-]+))',
     re.IGNORECASE,
 )
 
 
-def _liveness_snapshot_fact(content: str, *, point_in_time: bool) -> str | None:
-    """Canonical key for *content*, given an already-evaluated point-in-time verdict.
+def _classify_liveness_snapshot(content: str) -> tuple[bool, str | None]:
+    """The ONE liveness-snapshot classifier. Both call sites route through here.
 
-    Split out of ``extract_liveness_snapshot_fact`` so the expensive
-    ``POINT_IN_TIME_CHECK_RE`` verdict is computed ONCE per record by the
-    caller and then reused, instead of being re-derived at every place that
-    needs it. Takes the predicate rather than evaluating it; the key
-    construction below is unchanged.
+    Deliberately single-copy. The extractor below and
+    ``find_liveness_snapshot_recurrences`` need the same two gates but consume
+    different parts of the verdict, and an earlier shape had each re-apply the
+    gates itself — so the extractor's tests could keep passing while the
+    shipped detector diverged. One function means those tests exercise the
+    code production actually runs.
+
+    Args:
+        content: Raw memory content. Never None — callers coalesce.
+
+    Returns:
+        ``(framed, core_fact)``:
+
+        * ``(False, None)`` — not a liveness snapshot, and not a loss either:
+          the content never entered this detector's scope.
+        * ``(True, None)`` — point-in-time framing over a live-status marker
+          whose fields could not be read whole. THE counted
+          ``liveness_snapshot_unfielded`` loss; the caller owns that counter,
+          so this function stays a pure classifier.
+        * ``(True, key)`` — a snapshot, with its canonical key.
+
+        ``POINT_IN_TIME_CHECK_RE`` is consulted AT MOST ONCE per call, and not
+        at all when the cheap prefilter rejects — the budget
+        ``TestLivenessDetectorRegexBudget`` pins.
     """
-    if not point_in_time:
-        return None
+    # Cheap gate FIRST. ``POINT_IN_TIME_CHECK_RE``'s two ``(?=.*...)``
+    # lookaheads under ``re.DOTALL`` make it quadratic in content length —
+    # measured 2.2 ms at 424 chars rising to 794 ms at 4240 on NON-matching
+    # input, versus 0.015-0.35 ms for the lookahead-free
+    # ``LIVE_TASK_STATUS_RE`` — and a non-match is the overwhelmingly common
+    # case: this detector always runs, with no flag to disable it, over a
+    # default 5000-records-per-category scan of mostly ordinary prose.
+    # The gate is SOUND because ``_LIVE_FIELD_ASSIGNMENT_RE`` is
+    # ``LIVE_TASK_STATUS_RE``'s first alternative plus extra obligations, so
+    # an assignment hit implies a live-status hit: a record failing this check
+    # could never have yielded a key anyway. A record it rejects reports
+    # ``framed=False`` even if the point-in-time framing would have matched —
+    # which is the intended contract, since such a record is out of scope
+    # rather than a loss.
+    if not LIVE_TASK_STATUS_RE.search(content):
+        return False, None
+    if not POINT_IN_TIME_CHECK_RE.search(content):
+        return False, None
 
     pairs: set[str] = set()
-    for field, value in _LIVE_FIELD_ASSIGNMENT_RE.findall(content):
-        cleaned = value.rstrip('./:+-').lower()
+    for field, quoted, bare in _LIVE_FIELD_ASSIGNMENT_RE.findall(content):
+        # Exactly one branch ever participates; `' '.join(split())` normalises
+        # the whitespace a quoted value may now legitimately carry (and is a
+        # no-op on a bare token).
+        cleaned = ' '.join((quoted or bare).split()).rstrip('./:+-').lower()
         if cleaned:
             pairs.add(f'{field.lower()}={cleaned}')
     if not pairs:
-        return None
-    return '|'.join(sorted(pairs))
+        return True, None
+    return True, '|'.join(sorted(pairs))
 
 
 def extract_liveness_snapshot_fact(record: dict) -> str | None:
@@ -424,6 +480,10 @@ def extract_liveness_snapshot_fact(record: dict) -> str | None:
     irreversible delete. Keying on an exact repeated fact instead introduces
     no tunable at all.
 
+    A thin projection of ``_classify_liveness_snapshot`` — the shared
+    classifier ``find_liveness_snapshot_recurrences`` also runs — so this
+    public entry point cannot drift from the shipped detector.
+
     Classification requires BOTH markers:
 
     * ``POINT_IN_TIME_CHECK_RE`` — the timestamped "liveness check performed
@@ -432,11 +492,21 @@ def extract_liveness_snapshot_fact(record: dict) -> str | None:
       bare current-fact framing in the four gated categories, so every
       liveness observation written since it landed necessarily carries this
       framing. Requiring it therefore costs no recall on the corpus this
-      detector sweeps, while excluding incidental prose that merely happens to
-      contain ``status=``.
+      detector sweeps.
     * At least one extractable ``<live_field>=<value>`` assignment. A
       ``LIVE_TASK_STATUS_RE`` paraphrase ("actively driven by") names no
       readable fields, so there is no fact to key on.
+
+    What the framing requirement does NOT do is exclude every non-liveness
+    use of ``status=``. ``POINT_IN_TIME_CHECK_RE``'s cheapest alternative is a
+    bare ``as of <digit>``, which ordinary prose satisfies routinely, so a
+    config note like "As of 2026-07-24 the dispatcher config has
+    status=enabled for task 12" DOES classify here (pinned by
+    ``test_as_of_prose_with_an_incidental_assignment_still_classifies``). The
+    gate is a recall-preserving filter, not a precision guarantee. Over-firing
+    is bounded by construction rather than by the pattern: this class is
+    report-only, and a subject needs >= 2 records sharing an IDENTICAL key
+    before anything is emitted, so an incidental hit falls out as a singleton.
 
     Returns:
         The canonical key — distinct ``field=value`` pairs, values lowercased
@@ -446,23 +516,7 @@ def extract_liveness_snapshot_fact(record: dict) -> str | None:
         equality downstream: a snapshot reporting a different status produces
         a different key and never groups with this one.
     """
-    content = record.get('content') or ''
-    # Cheap gate FIRST. ``POINT_IN_TIME_CHECK_RE``'s two ``(?=.*...)``
-    # lookaheads under ``re.DOTALL`` make it quadratic in content length —
-    # measured 2.2 ms at 424 chars rising to 794 ms at 4240 on NON-matching
-    # input, versus 0.015-0.35 ms for the lookahead-free
-    # ``LIVE_TASK_STATUS_RE`` — and a non-match is the overwhelmingly common
-    # case: this detector always runs, with no flag to disable it, over a
-    # default 5000-records-per-category scan of mostly ordinary prose.
-    # The gate is SOUND because ``_LIVE_FIELD_ASSIGNMENT_RE`` is
-    # ``LIVE_TASK_STATUS_RE``'s first alternative plus extra obligations, so
-    # an assignment hit implies a live-status hit: a record failing this check
-    # could never have yielded a key anyway.
-    if not LIVE_TASK_STATUS_RE.search(content):
-        return None
-    return _liveness_snapshot_fact(
-        content, point_in_time=bool(POINT_IN_TIME_CHECK_RE.search(content)),
-    )
+    return _classify_liveness_snapshot(record.get('content') or '')[1]
 
 
 def liveness_snapshot_subject_task_ids(record: dict) -> set[str]:
@@ -571,6 +625,28 @@ def find_liveness_snapshot_recurrences(
     re-verification covering two tasks joins both their groups — which is
     exactly how memory 1eef7df7 links to the earlier 94 and 96 snapshots.
 
+    KNOWN LIMITATION, deliberate: the core fact is built ONCE PER RECORD by
+    unioning every assignment in its content, then attributed to every subject
+    that record names. When a multi-task re-verification reports DIVERGENT
+    values per task, that merged key matches neither single-task snapshot and
+    the recurrence goes unreported — pinned, so the behaviour is visible
+    rather than discovered later, by
+    ``test_divergent_per_task_statuses_do_not_group``. The real motivating
+    record (1eef7df7) reports identical values for both its subjects, so the
+    detector fires on the corpus that motivated it; a future divergent one
+    would be a RECALL gap in a report-only path, never a wrong delete.
+
+    Per-subject key scoping was tried and rejected on evidence, not taste.
+    Splitting content into per-task clauses with
+    ``task_filter._CLAUSE_SPLIT_RE`` and keying each subject on its own clause
+    (the technique ``task_filter.find_conflicting_task_status_ids`` uses)
+    yields the EMPTY SET on all four real records: ``_CLAUSE_SPLIT_RE`` splits
+    on ``.``, which shatters ``dark-factory-orchestrator.yaml`` and
+    ``CLAUDE.md:95`` mid-sentence, and the nearby reference is written
+    ``task/94``, which ``TASK_REF_RE``'s ``\\s*#?\\s*`` separator does not
+    match. Adopting it would trade a bounded, pinned recall gap for a detector
+    inert on its own motivating corpus.
+
     Args:
         memories: Raw memory list (any/all categories).
         categories: Categories to sweep. Records outside the set are ignored
@@ -592,8 +668,10 @@ def find_liveness_snapshot_recurrences(
         *disclosure* carries every ``_LIVENESS_DISCLOSURE_KEYS`` counter —
         ``liveness_snapshot_untasked`` (a recognised snapshot that resolves to
         no subject, so no bucket can hold it) and
-        ``liveness_snapshot_unfielded`` (point-in-time framing plus a
-        ``LIVE_TASK_STATUS_RE`` paraphrase whose fields could not be read).
+        ``liveness_snapshot_unfielded`` (point-in-time framing over a
+        ``LIVE_TASK_STATUS_RE`` marker whose fields could not be read — a
+        paraphrase naming no fields, or a value ``_LIVE_FIELD_ASSIGNMENT_RE``
+        declines to read half-way, such as an unterminated quote).
         Both are always present, always ints, always 0 on a clean run.
     """
     swept = set(categories)
@@ -604,28 +682,16 @@ def find_liveness_snapshot_recurrences(
         category = record.get('category')
         if category not in swept:
             continue
-        content = record.get('content') or ''
-        # The same cheap prefilter `extract_liveness_snapshot_fact` applies,
-        # hoisted here so the quadratic `POINT_IN_TIME_CHECK_RE` is consulted
-        # AT MOST ONCE per record instead of once by the extractor and again
-        # by the disclosure branch below. Deliberately `LIVE_TASK_STATUS_RE`
-        # and NOT the narrower `_LIVE_FIELD_ASSIGNMENT_RE`:
-        # `liveness_snapshot_unfielded` counts exactly the paraphrase records
-        # the narrower pattern would discard, so prefiltering on it would
-        # drive that counter to a permanent zero — turning a counted loss back
-        # into an invisible one.
-        if not LIVE_TASK_STATUS_RE.search(content):
-            continue
-        point_in_time = bool(POINT_IN_TIME_CHECK_RE.search(content))
-        core_fact = _liveness_snapshot_fact(content, point_in_time=point_in_time)
+        # THE classifier — the same call `extract_liveness_snapshot_fact`
+        # makes, so the two can never diverge, and one consult of the
+        # quadratic `POINT_IN_TIME_CHECK_RE` per record at most.
+        framed, core_fact = _classify_liveness_snapshot(record.get('content') or '')
         if core_fact is None:
             # "Not a snapshot at all" and "a snapshot whose fields could not be
             # read" are different outcomes, and only the second is a loss. The
-            # discrimination lives HERE rather than inside the extractor, which
-            # keeps its single None/key contract. The `LIVE_TASK_STATUS_RE`
-            # half of this condition is already guaranteed by the prefilter
-            # above, so only the point-in-time verdict is left to test.
-            if point_in_time:
+            # discrimination lives HERE rather than inside the classifier,
+            # which stays pure; `framed` is precisely the distinction.
+            if framed:
                 disclosure['liveness_snapshot_unfielded'] += 1
             continue
         subjects = liveness_snapshot_subject_task_ids(record)
@@ -1401,6 +1467,7 @@ _DETAILED_METRICS: tuple[str, ...] = (
     'cluster_size_mean',
     'topic_accretion_rate_mean',
     'consolidation_net_delta',
+    'liveness_snapshot_recurrences',
 )
 
 
@@ -1697,10 +1764,17 @@ def compute_cluster_metrics(
         # indefinite accretion this detector exists to surface. Emitted for
         # every swept category, empty ones included — an absent metric is
         # indistinguishable from "not measured".
+        #
+        # Carries `details_path` like every other metric whose full shape
+        # lives in the companion file: the scalar says HOW MANY groups, but
+        # the per-group `subject_task_id`/`core_fact`/`member_ids` table
+        # written below is the one artifact that tells a human WHICH memories
+        # to consolidate. Without the pointer a consumer reading only the
+        # metric series cannot discover it.
         metrics.append(Metric(
             metric_id=_metric_id('liveness_snapshot_recurrences', category),
             kind='count', value=float(len(recurrences)), n=corpus_size,
-            direction='higher_is_worse',
+            direction='higher_is_worse', details_path=details_path,
         ))
         metrics.append(Metric(
             metric_id=_metric_id('topic_accretion_rate_mean', category),
