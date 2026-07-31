@@ -7052,7 +7052,15 @@ async def test_run_loop_resumes_interrupted_runs_at_startup_before_reaper(
 ):
     """run_loop() must invoke _resume_interrupted_runs() once at startup, before
     the periodic _recover_stale_runs reaper ticks — and a raised exception from
-    it must not crash run_loop (mirrors the predecessor-pass startup contract)."""
+    it must not crash run_loop (mirrors the predecessor-pass startup contract).
+
+    Drives run_loop as a background task and waits on the OBSERVABLE EVENTS the
+    assertions below actually check (resume ran; stale ticked twice) under a
+    generous 10s deadlock-backstop, rather than budgeting the whole startup path
+    (several SQLite awaits) inside a fixed wall-clock wait_for. Mirrors the
+    _drive_halt_notify precedent (commit 6dabee331f) — under full-suite xdist
+    load a hardcoded 0.2s budget can starve before _resume_interrupted_runs is
+    even reached, making the call_count assertion flake at 0 instead of 1."""
     real_sleep = asyncio.sleep
 
     async def fast_sleep(seconds: float) -> None:
@@ -7063,13 +7071,18 @@ async def test_run_loop_resumes_interrupted_runs_at_startup_before_reaper(
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
 
     call_order: list[str] = []
+    resume_event = asyncio.Event()
+    stale_event = asyncio.Event()
 
     async def resume_side_effect():
         call_order.append('resume')
+        resume_event.set()
         raise RuntimeError('boom — simulated resume failure')
 
     async def stale_runs_side_effect():
         call_order.append('stale')
+        if harness._recover_stale_runs.call_count >= 2:
+            stale_event.set()
 
     harness._resume_interrupted_runs = AsyncMock(side_effect=resume_side_effect)
     harness._recover_predecessor_runs = AsyncMock(return_value=None)
@@ -7080,8 +7093,17 @@ async def test_run_loop_resumes_interrupted_runs_at_startup_before_reaper(
     if harness.judge is not None:
         harness.judge.initialize = AsyncMock()
 
-    with contextlib.suppress(TimeoutError):
-        await asyncio.wait_for(harness.run_loop(), timeout=0.2)
+    loop_task = asyncio.create_task(harness.run_loop())
+    try:
+        # TimeoutError → fall through and let the assertions below report it.
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(10.0):
+                await resume_event.wait()
+                await stale_event.wait()
+    finally:
+        loop_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await loop_task
 
     # Ran exactly once at startup despite raising — not once per iteration.
     assert harness._resume_interrupted_runs.call_count == 1
