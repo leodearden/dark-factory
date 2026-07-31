@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import shlex
 import subprocess
+import tomllib
 from pathlib import Path
 
 from orchestrator.agents.roles import MANDATED_STAGING_COMMAND, ROLES
@@ -66,7 +67,10 @@ def _init_repo_with_gitignored_task_dir(repo: Path) -> None:
     subprocess.run(
         ['git', 'add', '.gitignore', 'src/mod.py'], cwd=repo, check=True, capture_output=True,
     )
-    subprocess.run(['git', 'commit', '-m', 'initial'], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ['git', '-c', 'commit.gpgsign=false', 'commit', '-m', 'initial'],
+        cwd=repo, check=True, capture_output=True,
+    )
 
     task_dir = repo / '.task'
     task_dir.mkdir()
@@ -86,16 +90,24 @@ def _staged_paths(repo: Path) -> list[str]:
     return [line for line in result.stdout.splitlines() if line]
 
 
-def _init_repo_with_pytest_scratch(repo: Path, *, embedded_has_commit: bool) -> None:
+def _init_repo_with_pytest_scratch(
+    repo: Path, *, embedded_has_commit: bool, gitignore_text: str | None = None,
+) -> None:
     """Create a throwaway repo seeded with real `pytest --basetemp` scratch debris.
 
     Mirrors `_init_repo_with_gitignored_task_dir`'s shape (git init, a
     tracked `src/mod.py` committed, then a real pending edit) but writes the
-    REAL repo-root `.gitignore` verbatim -- so this is a genuine test of the
-    artifact task 3222 changes, not a synthetic stand-in for it -- and
-    additionally plants `.pytest-tmp/test_x0` as an embedded git repo (the
-    shape a fixture's own `git init` leaves behind under an agent-supplied
-    `--basetemp=.pytest-tmp`) plus a `.pytest_cache/v/cache/lastfailed` file.
+    REAL repo-root `.gitignore` verbatim by default -- so callers that rely
+    on that default get a genuine test of the artifact task 3222 changes,
+    not a synthetic stand-in for it -- and additionally plants
+    `.pytest-tmp/test_x0` as an embedded git repo (the shape a fixture's own
+    `git init` leaves behind under an agent-supplied `--basetemp=.pytest-tmp`)
+    plus a `.pytest_cache/v/cache/lastfailed` file.
+
+    `gitignore_text` overrides the `.gitignore` body written into the repo --
+    used by the root-cause test to characterise the UNFIXED state (a
+    `.gitignore` lacking the entry) without duplicating this whole fixture.
+    Defaults to the real repo-root `.gitignore` when omitted.
 
     When `embedded_has_commit` is False, the embedded repo is left
     commit-less (a bare `git init`, nothing else) -- this is the shape that
@@ -109,7 +121,9 @@ def _init_repo_with_pytest_scratch(repo: Path, *, embedded_has_commit: bool) -> 
     )
     subprocess.run(['git', 'config', 'user.name', 'Test'], cwd=repo, check=True, capture_output=True)
 
-    (repo / '.gitignore').write_text(_ROOT_GITIGNORE.read_text())
+    if gitignore_text is None:
+        gitignore_text = _ROOT_GITIGNORE.read_text()
+    (repo / '.gitignore').write_text(gitignore_text)
     src_dir = repo / 'src'
     src_dir.mkdir()
     (src_dir / 'mod.py').write_text("print('initial')\n")
@@ -290,28 +304,7 @@ def test_missing_gitignore_entry_reproduces_embedded_repo_exit_128(tmp_path: Pat
     """
     repo = tmp_path / 'repo'
     repo.mkdir()
-    subprocess.run(['git', 'init', '-b', 'main'], cwd=repo, check=True, capture_output=True)
-    subprocess.run(
-        ['git', 'config', 'user.email', 'test@test.com'], cwd=repo, check=True, capture_output=True,
-    )
-    subprocess.run(['git', 'config', 'user.name', 'Test'], cwd=repo, check=True, capture_output=True)
-
-    (repo / '.gitignore').write_text('.task/\n')
-    src_dir = repo / 'src'
-    src_dir.mkdir()
-    (src_dir / 'mod.py').write_text("print('initial')\n")
-    subprocess.run(
-        ['git', 'add', '.gitignore', 'src/mod.py'], cwd=repo, check=True, capture_output=True,
-    )
-    subprocess.run(
-        ['git', '-c', 'commit.gpgsign=false', 'commit', '-m', 'initial'],
-        cwd=repo, check=True, capture_output=True,
-    )
-    (src_dir / 'mod.py').write_text("print('changed')\n")
-
-    scratch_dir = repo / '.pytest-tmp' / 'test_x0'
-    scratch_dir.mkdir(parents=True)
-    subprocess.run(['git', 'init', '-b', 'main'], cwd=scratch_dir, check=True, capture_output=True)
+    _init_repo_with_pytest_scratch(repo, embedded_has_commit=False, gitignore_text='.task/\n')
 
     result = subprocess.run(
         shlex.split(MANDATED_STAGING_COMMAND), cwd=repo, capture_output=True, text=True,
@@ -325,7 +318,7 @@ def test_missing_gitignore_entry_reproduces_embedded_repo_exit_128(tmp_path: Pat
 
 
 def test_no_pyproject_pins_pytest_basetemp_in_addopts() -> None:
-    """Guard: no pyproject.toml may hard-code --basetemp in addopts.
+    """Guard: no repo pyproject.toml may hard-code --basetemp in addopts.
 
     pytest exposes no `basetemp` ini key -- `addopts = "--basetemp=..."` is
     the only way to pin one from pyproject.toml. Doing so would be
@@ -335,8 +328,27 @@ def test_no_pyproject_pins_pytest_basetemp_in_addopts() -> None:
     would have concurrent/successive suites deleting each other's scratch.
     The fix for pytest scratch debris belongs in .gitignore, not in pinning
     where the debris lands.
+
+    Globs every subproject pyproject.toml (root + one level down, skipping
+    hidden dirs like .venv/.worktrees) instead of hard-coding just the root
+    and orchestrator files -- the repo has 8 pyproject.toml files today and
+    5 of them declare addopts (including fused-memory, which also runs
+    `-n auto` like orchestrator does), so a fixed pair would silently stop
+    covering the other subprojects the moment one of them added a
+    --basetemp pin. Parses the `[tool.pytest.ini_options].addopts` value via
+    tomllib rather than scanning the raw file text, so a `--basetemp`
+    mention inside a TOML comment can't produce a false positive on an
+    otherwise-compliant file.
     """
-    for candidate in (_REPO_ROOT / 'pyproject.toml', _REPO_ROOT / 'orchestrator' / 'pyproject.toml'):
-        assert '--basetemp' not in candidate.read_text(), (
+    candidates = [_REPO_ROOT / 'pyproject.toml'] + sorted(
+        path for path in _REPO_ROOT.glob('*/pyproject.toml') if not path.parent.name.startswith('.')
+    )
+    assert len(candidates) >= 2, f'expected to find multiple repo pyproject.toml files, got {candidates}'
+
+    for candidate in candidates:
+        with candidate.open('rb') as f:
+            config = tomllib.load(f)
+        addopts = config.get('tool', {}).get('pytest', {}).get('ini_options', {}).get('addopts', '')
+        assert '--basetemp' not in addopts, (
             f'{candidate} must not pin --basetemp in addopts -- see task 3222 design decision'
         )
