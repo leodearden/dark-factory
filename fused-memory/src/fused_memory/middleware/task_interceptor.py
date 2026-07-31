@@ -1566,7 +1566,7 @@ class TaskInterceptor:
         Attribution wants the opposite bias: MAXIMUM positive evidence that
         the filer declared local work, so the union is right here.  The
         widening is provably safe in one direction only — this list feeds
-        ONLY :meth:`_local_deliverable_attested`, consulted solely after
+        ONLY :meth:`_local_attesting_signals`, consulted solely after
         ``check_files_for_scope`` already returned ``ok``, so a wider signal
         set can only ever suppress an ADVISORY, never weaken a REJECTION.
         """
@@ -1691,20 +1691,27 @@ class TaskInterceptor:
         )
         return all_files_foreign_owner(files, project_id, registry)
 
-    def _local_deliverable_attested(
+    def _local_attesting_signals(
         self,
         kwargs: dict[str, Any],
         project_id: str,
-    ) -> bool:
-        """Return True iff the submission DECLARES a deliverable owned by *project_id*.
+    ) -> list[str]:
+        """Return the declared deliverable signals OWNED by *project_id*.
 
+        Truthy (non-empty) exactly when the submission attests local work.
         Positive-attribution counterpart to :meth:`_all_files_foreign_owner`
-        (task 3106), with the same thin-wrapper shape: registry guard here,
-        registry-only logic in the pure :func:`local_deliverable_attested`.
-        The two are exact logical complements — that one needs EVERY owned
-        file foreign under ONE owner, this needs at least ONE local — so the
-        cross-repo allow-and-tag branch and the prose-advisory suppression
-        can never both fire.
+        (task 3106), with the same thin-wrapper shape — registry guard here,
+        registry-only logic in the pure :func:`local_deliverable_attested` —
+        and, like it, returning the WITNESS rather than a bare bool so the
+        caller can name it in the log without recomputing.  The two are exact
+        logical complements — that one needs EVERY owned file foreign under
+        ONE owner, this needs at least ONE local — so the cross-repo
+        allow-and-tag branch and the prose-advisory suppression can never
+        both fire.
+
+        The pure predicate stays the gate: the attesting subset is filtered
+        out only AFTER it returns True, i.e. only on the suppression path,
+        never on the hot path of an ordinary submission.
 
         Reads ``kwargs`` directly rather than ``candidate.files_to_modify``:
         the candidate's list has already been narrowed by
@@ -1713,16 +1720,17 @@ class TaskInterceptor:
         it is the wrong signal for attribution, which wants the UNION (see
         :meth:`_extract_deliverable_signals_from_meta`).
 
-        Returns False when no :attr:`_prefix_registry` is configured — with
+        Returns ``[]`` when no :attr:`_prefix_registry` is configured — with
         no owner map nothing can attest, so the caller falls through to the
         unchanged advisory.
         """
         registry = self._prefix_registry
         if registry is None:
-            return False
-        return local_deliverable_attested(
-            self._extract_deliverable_signals(kwargs), project_id, registry,
-        )
+            return []
+        signals = self._extract_deliverable_signals(kwargs)
+        if not local_deliverable_attested(signals, project_id, registry):
+            return []
+        return [s for s in signals if registry.project_for_path(s) == project_id]
 
     def _path_guard_check(
         self,
@@ -1861,7 +1869,7 @@ class TaskInterceptor:
           task 2208), so this is the ONLY path — the pre-task-2208
           hard-reject-on-prose back-compat branch has been retired.
         * PROSE-hit SUPPRESSED BY LOCAL ATTRIBUTION
-          (:meth:`_local_deliverable_attested`, task 3106) — the prose hit
+          (:meth:`_local_attesting_signals`, task 3106) — the prose hit
           above is discarded, with NEITHER the stamp NOR the escalation, when
           the submission declares at least one deliverable
           (``metadata.files`` ∪ ``files_to_modify`` ∪ ``modules``) OWNED by
@@ -1884,6 +1892,12 @@ class TaskInterceptor:
           with only UNOWNED entries (``README.md``, ``docs/x.md``), has no
           positive attribution and fires the advisory exactly as before —
           which is where the guard's real protection lives.
+
+          NOT SILENT: the suppression emits one structured INFO record
+          carrying the matched prose prefixes, the prose-suggested owner,
+          the filing project and the attesting signals, so the branch stays
+          auditable without putting a non-actionable item in the operator
+          queue.
 
         The inline Stage-2 LLM adjudicator (task 1822) is no longer
         consulted here: FILES-certain rejects have nothing to adjudicate,
@@ -1958,7 +1972,26 @@ class TaskInterceptor:
         # cannot tell "modifies X" from "mentions X"; a declared deliverable
         # can, so the better signal wins and neither the stamp nor the
         # escalation fires.
-        if self._local_deliverable_attested(kwargs, project_id):
+        #
+        # INFO, not WARNING, and deliberately not an escalation: this is a
+        # CORRECT attribution decision replacing operator-queue noise, so it
+        # belongs in the log trail rather than in a queue an operator has to
+        # triage. But it is never SILENT — the guard's most consequential
+        # branch has to stay auditable by anyone asking why a task was not
+        # flagged, so the record carries every fact the decision turned on.
+        attesting_signals = self._local_attesting_signals(kwargs, project_id)
+        if attesting_signals:
+            logger.info(
+                'path-guard PROSE ADVISORY SUPPRESSED: declared deliverable '
+                'attests local work, so the prose citation is incidental — '
+                'no possible_scope_mismatch stamp and no escalation. '
+                'project_id=%s matched_paths=%s suggested_project=%s '
+                'attested_by=%s',
+                project_id,
+                list(verdict.matched_paths),
+                verdict.suggested_project,
+                attesting_signals,
+            )
             return None
 
         # PROSE-ADVISORY: a heuristic hit never blocks creation — the
