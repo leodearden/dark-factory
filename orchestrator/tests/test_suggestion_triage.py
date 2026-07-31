@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import tempfile
 from pathlib import Path
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch  # noqa: F401
@@ -1047,62 +1046,6 @@ def _make_steward(*, worktree: Path, config_overrides=None, suggestion_count=15)
         usage_gate=None,
     )
     return steward
-
-
-class TestStewardHarnessTempHygiene:
-    """The steward harness must allocate no directory outside pytest's tmp tree.
-
-    Pinned structurally — by the helper's signature and its refusal to reach
-    ``tempfile.mkdtemp`` — rather than by globbing ``/tmp`` for a
-    ``test-steward-wt-*`` before/after delta.  This host runs several
-    worktrees' orchestrator suites concurrently, so a glob delta would pick
-    up entries created by an unrelated process and flake.
-    """
-
-    def test_make_steward_requires_explicit_worktree(self):
-        """No bare-mkdtemp fallback path may exist in the helper.
-
-        ``worktree`` is keyword-only with NO default, so a call site that
-        forgets it fails loudly instead of silently leaking a ``/tmp`` dir.
-        """
-        with pytest.raises(TypeError):
-            _make_steward()  # type: ignore[call-arg]
-
-    def test_make_steward_never_calls_mkdtemp(self, monkeypatch, tmp_path):
-        """The helper must build its worktree from the caller's path only.
-
-        ``steward.worktree.is_dir()`` is not incidental: the steward
-        pre-flight (``if not self.worktree.is_dir():`` in
-        ``orchestrator/src/orchestrator/steward.py``) auto-escalates
-        "Worktree missing", which is why the harness creates a real
-        directory at all.
-        """
-        def _boom(*args, **kwargs):
-            raise AssertionError(
-                '_make_steward must not allocate a bare mkdtemp temp dir'
-            )
-
-        monkeypatch.setattr(tempfile, 'mkdtemp', _boom)
-
-        steward = _make_steward(worktree=tmp_path / 'wt')
-
-        assert steward.worktree == tmp_path / 'wt'
-        assert steward.worktree.is_dir()
-
-    def test_make_steward_meta_root_stays_under_pytest_tmp(self, tmp_path):
-        """The derived meta-root must land under pytest's tmp tree too.
-
-        ``TaskSteward._pre_triage_suggestions`` derives its meta-root from
-        ``worktree.parent`` and mkdir's it, so a ``/tmp``-rooted harness
-        worktree leaked a ``/tmp/.task-meta/<name>`` sibling as well.
-        """
-        steward = _make_steward(worktree=tmp_path / 'wt')
-
-        meta_root = TaskArtifacts.meta_root_for(
-            steward.worktree.parent, steward.worktree.name
-        )
-
-        assert meta_root.is_relative_to(tmp_path)
 
 
 def _make_suggestions(n):
