@@ -227,3 +227,108 @@ class TestTrip:
         gate, _mono, _wall = _gate()
         await _report_failures(gate, 8)
         assert gate.is_degraded is True
+
+
+class TestPartialDegradationStaysClosed:
+    """step-11: decision 10 — throttle, not halt; never strand the healthy fraction.
+
+    Each case breaches two of the three trip conditions and misses the third.
+    The gate must stay Closed: a partial degradation is not a provider outage,
+    and tripping on one would halt a fleet that is still mostly succeeding.
+    """
+
+    async def test_count_below_min_failures_does_not_trip(self) -> None:
+        """7 failures across 3 tasks at 100% — breadth and rate met, count short."""
+        gate, _mono, _wall = _gate()
+        state = await _report_failures(gate, 7)
+        assert isinstance(state, Closed)
+        assert gate.is_degraded is False
+
+    async def test_breadth_below_min_distinct_tasks_does_not_trip(self) -> None:
+        """8 failures all on t1 — one pathological task retrying is not an outage."""
+        gate, _mono, _wall = _gate()
+        state = await _report_failures(gate, 8, task_ids=['t1'])
+        assert isinstance(state, Closed)
+        assert gate.is_degraded is False
+
+    async def test_rate_below_threshold_does_not_trip(self) -> None:
+        """8 failures / 20 completions = 40% — the healthy 60% must not be stranded.
+
+        Count (8) and breadth (3) are both met; only the rate is short.  The
+        12 successes land first so the running rate never crosses 0.5 at any
+        intermediate report — see
+        :meth:`test_transiently_crossing_the_rate_does_trip` for why that
+        ordering is load-bearing rather than a rigged setup.
+        """
+        gate, _mono, _wall = _gate()
+        await _report_ok(gate, 12)
+        state = await _report_failures(gate, 8)
+        assert isinstance(state, Closed)
+        assert gate.is_degraded is False
+        assert state is gate.state()
+
+    async def test_rate_case_trips_once_the_rate_crosses(self) -> None:
+        """Positive control for the case above: same window, more failures, does trip.
+
+        Proves the 40% case stayed Closed because of the RATE specifically, not
+        because the gate is inert or the harness never reaches a trip.
+        """
+        gate, _mono, _wall = _gate()
+        await _report_ok(gate, 12)
+        await _report_failures(gate, 8)
+        assert isinstance(gate.state(), Closed)
+        # 8F/20 = 40%.  (8+k)/(20+k) >= 0.5 first holds at k=4 -> 12/24 = 50%.
+        state = await _report_failures(gate, 3)
+        assert isinstance(state, Closed), '11/23 = 48% is still below threshold'
+        state = await _report_failures(gate, 1)
+        assert isinstance(state, Open)
+        assert state.stats == GateStats(
+            failures=12,
+            completions=24,
+            distinct_tasks=3,
+            failure_rate=0.5,
+            window_secs=600.0,
+        )
+
+    async def test_transiently_crossing_the_rate_does_trip(self) -> None:
+        """The predicate is evaluated on EVERY report, not on a settled window.
+
+        The same 8 failures and 12 successes, interleaved failure-first, put
+        the window at 8/15 = 53% before the trailing successes arrive — and
+        the gate trips there.  That is correct: at that instant the provider
+        really had failed 8 of the last 15 calls across 3 tasks.  Pinning it
+        stops a later refactor from "fixing" the ordering sensitivity by
+        deferring evaluation, which would delay every real trip.
+        """
+        gate, _mono, _wall = _gate()
+        for i in range(7):
+            state = await _report_failures(gate, 1, task_ids=[f't{i % 3 + 1}'])
+            assert isinstance(state, Closed), f'tripped early at failure {i + 1}'
+            await _report_ok(gate, 1)
+        # 7F/14 = 50%, but count is short.  The 8th failure meets all three.
+        state = await _report_failures(gate, 1, task_ids=['t2'])
+        assert isinstance(state, Open)
+        assert state.stats.failures == 8
+        assert state.stats.completions == 15
+        assert state.stats.failure_rate == pytest.approx(8 / 15)
+
+    async def test_none_task_ids_cannot_attest_breadth(self) -> None:
+        """8 task-less failures — no breadth attestable, so no trip."""
+        gate, _mono, _wall = _gate()
+        state = await _report_failures(gate, 8, task_ids=[None])
+        assert isinstance(state, Closed)
+        assert gate.is_degraded is False
+
+    async def test_none_task_id_failures_still_count_toward_the_numerator(self) -> None:
+        """They cannot attest breadth, but dropping them would under-report an outage.
+
+        6 task-less failures + 2 task-bearing ones across 3 distinct tasks
+        would be only 2 failures if Nones were discarded — it trips because
+        all 8 are counted.
+        """
+        gate, _mono, _wall = _gate()
+        await _report_failures(gate, 5, task_ids=[None])
+        state = await _report_failures(gate, 3, task_ids=['t1', 't2', 't3'])
+        assert isinstance(state, Open)
+        assert state.stats.failures == 8
+        assert state.stats.distinct_tasks == 3
