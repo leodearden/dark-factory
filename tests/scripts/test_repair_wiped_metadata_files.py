@@ -26,6 +26,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
+import subprocess
+import sys
+from pathlib import Path
 
 from audit_wiped_metadata_files import (
     CLEAN_MERGE_SHA,
@@ -666,6 +670,297 @@ def test_format_summary_reports_the_exclusions_as_decisions():
 
     assert "3086" in summary
     assert "3087" in summary
+
+
+# ---------------------------------------------------------------------------
+# main() / the CLI — by subprocess, mirroring the audit test's pattern.
+#
+# Every fixture below is a SYNTHETIC temp project root. Not one test points at
+# /home/leo/src/dark-factory: those databases mutate continuously, so an
+# assertion derived from them would be a guessed threshold.
+# ---------------------------------------------------------------------------
+
+_TASKS_SCHEMA = """
+CREATE TABLE tasks (
+    tag           TEXT NOT NULL DEFAULT 'master',
+    id            INTEGER NOT NULL,
+    title         TEXT NOT NULL,
+    description   TEXT,
+    details       TEXT,
+    test_strategy TEXT,
+    status        TEXT NOT NULL,
+    priority      TEXT,
+    metadata      TEXT,
+    updated_at    TEXT NOT NULL,
+    PRIMARY KEY (tag, id)
+);
+"""
+
+_EVENTS_SCHEMA = """
+CREATE TABLE events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp   TEXT    NOT NULL,
+    run_id      TEXT    NOT NULL,
+    task_id     TEXT,
+    event_type  TEXT    NOT NULL,
+    phase       TEXT,
+    role        TEXT,
+    data        TEXT    DEFAULT '{}',
+    cost_usd    REAL,
+    duration_ms INTEGER
+);
+"""
+
+
+def _make_tasks_db(dir_path: Path, rows: list[dict]) -> Path:
+    """Copied from scripts/tests/test_audit_wiped_metadata_files.py — the two
+    test directories cannot share imports (same note as
+    orchestrator/tests/test_deterministic_runner.py:31-32). Schemas mirror the
+    live ones so the audit exercises real column shapes."""
+    db_path = dir_path / "tasks.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(_TASKS_SCHEMA)
+        for row in rows:
+            metadata = row.get("metadata")
+            if metadata is not None and not isinstance(metadata, str):
+                metadata = json.dumps(metadata)
+            conn.execute(
+                "INSERT INTO tasks (tag, id, title, description, details, "
+                "test_strategy, status, priority, metadata, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    row.get("tag", "master"),
+                    row["id"],
+                    row.get("title", f"task {row['id']}"),
+                    None,
+                    None,
+                    None,
+                    row.get("status", "done"),
+                    "medium",
+                    metadata,
+                    "2026-08-01T00:00:00+00:00",
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return db_path
+
+
+def _make_runs_db(dir_path: Path, events: list[dict]) -> Path:
+    db_path = dir_path / "runs.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(_EVENTS_SCHEMA)
+        for i, event in enumerate(events):
+            data = event.get("data")
+            if data is not None and not isinstance(data, str):
+                data = json.dumps(data)
+            conn.execute(
+                "INSERT INTO events (timestamp, run_id, task_id, event_type, "
+                "phase, role, data, cost_usd, duration_ms) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    f"2026-08-01T00:00:{i:02d}+00:00",
+                    "run-1",
+                    None if event.get("task_id") is None else str(event["task_id"]),
+                    event["event_type"],
+                    None,
+                    None,
+                    data,
+                    None,
+                    None,
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return db_path
+
+
+def _make_project(tmp_path, tasks=(), events=(), plans=(), name="proj") -> Path:
+    """Build a whole synthetic project root with the three inputs audit_project
+    reads. *plans* is a list of (worktree_name, plan_dict)."""
+    root = tmp_path / name
+    tasks_dir = root / ".taskmaster" / "tasks"
+    tasks_dir.mkdir(parents=True)
+    _make_tasks_db(tasks_dir, list(tasks))
+
+    runs_dir = root / "data" / "orchestrator"
+    runs_dir.mkdir(parents=True)
+    _make_runs_db(runs_dir, list(events))
+
+    worktrees = root / ".worktrees"
+    worktrees.mkdir(parents=True)
+    for wt_name, plan in plans:
+        path = worktrees / ".task-meta" / wt_name / "plan.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(plan))
+    return root
+
+
+def _wiped_project(tmp_path, name="proj", task_id=2464):
+    """A project with exactly one repairable candidate: a done task whose
+    metadata.files is empty but whose plan declared a file-level scope."""
+    return _make_project(
+        tmp_path,
+        tasks=[{"id": task_id, "status": "done", "metadata": {"files": []}}],
+        plans=[(str(task_id), {"task_id": task_id, "files": ["a.py", "b.py"]})],
+        name=name,
+    )
+
+
+_SCRIPT = str(Path(__file__).parent.parent.parent / "scripts" / "repair_wiped_metadata_files.py")
+
+# A port nothing listens on. Pointing --server-url here PROVES the dry run
+# never dials: if it did, the process would fail to connect rather than exit 0.
+_CLOSED_PORT_URL = "http://127.0.0.1:9"
+
+
+def _run_cli(*args):
+    return subprocess.run(
+        [sys.executable, _SCRIPT, *args], capture_output=True, text=True
+    )
+
+
+def test_main_dry_run_is_the_default_and_never_dials_the_server(tmp_path):
+    """(a) THE SAFETY PROPERTY. No --apply, an unreachable server URL, and a
+    project that HAS a repairable candidate: the process must still exit 0
+    having made zero MCP calls. An accidental bare invocation must be inert."""
+    root = _wiped_project(tmp_path)
+
+    result = _run_cli("--project-root", str(root), "--server-url", _CLOSED_PORT_URL)
+
+    assert result.returncode == 0, result.stderr
+    assert "DRY RUN" in result.stdout
+    assert "2464" in result.stdout
+
+
+def test_main_dry_run_summary_states_no_write_was_attempted(tmp_path):
+    root = _wiped_project(tmp_path)
+
+    result = _run_cli("--project-root", str(root))
+
+    assert "NO WRITE WAS ATTEMPTED" in result.stdout
+
+
+def test_main_json_emits_an_object_with_both_outcomes_and_coverage(tmp_path):
+    """(c) parseable, and coverage travels with the results."""
+    root = _wiped_project(tmp_path)
+
+    result = _run_cli("--project-root", str(root), "--json")
+
+    payload = json.loads(result.stdout)
+    project = payload["projects"][0]
+    assert project["project_root"] == str(root)
+    assert project["applied"] is False
+    assert project["coverage"]["total_tasks"] == 1
+    assert [o["task_id"] for o in project["outcomes"]] == [2464]
+    assert project["counts"][REPAIR] == 1
+    # Every disposition is present in the machine-readable counts too.
+    assert set(project["counts"]) == set(ALL_DISPOSITIONS)
+
+
+def test_main_json_carries_the_observable_subset_caveat(tmp_path):
+    """The honesty caveat is not a human-only decoration — a JSON consumer
+    must receive it too, or the machine path silently loses the disclaimer."""
+    root = _wiped_project(tmp_path)
+
+    payload = json.loads(_run_cli("--project-root", str(root), "--json").stdout)
+
+    caveat = payload["projects"][0]["observable_subset_caveat"].lower()
+    assert "observable subset" in caveat
+    assert "neither clean nor damaged" in caveat
+
+
+def test_main_exit_0_on_a_clean_project_and_still_prints_coverage(tmp_path):
+    """(d) exit 0 = ran, nothing failed — including when there is nothing to do.
+    The coverage block prints anyway."""
+    root = _make_project(tmp_path, tasks=[{"id": 1, "metadata": {"files": ["a.py"]}}])
+
+    result = _run_cli("--project-root", str(root))
+
+    assert result.returncode == 0
+    assert "COVERAGE" in result.stdout
+    assert "OBSERVABLE SUBSET" in result.stdout
+
+
+def test_main_exit_2_when_no_project_root_resolves(tmp_path):
+    """(d) 2 = no project root resolved to a readable tasks.db. Reusing the
+    audit's discover_project_roots, which already drops roots with none."""
+    result = _run_cli("--project-root", str(tmp_path / "no-such-project"))
+
+    assert result.returncode == 2
+    assert "no project root" in result.stderr.lower()
+
+
+def test_main_apply_is_the_only_way_to_write(tmp_path):
+    """(b) --apply on an unreachable server must FAIL rather than quietly
+    succeed: the dry-run path's inertness comes from not dialling at all, so
+    an apply run that also never dialled would be indistinguishable from a
+    successful repair."""
+    root = _wiped_project(tmp_path)
+
+    result = _run_cli(
+        "--project-root", str(root), "--apply", "--server-url", _CLOSED_PORT_URL
+    )
+
+    assert result.returncode != 0
+    combined = (result.stdout + result.stderr).lower()
+    assert "apply" in combined or "connect" in combined or "error" in combined
+
+
+def test_main_project_root_is_repeatable(tmp_path):
+    a = _wiped_project(tmp_path, name="a", task_id=11)
+    b = _wiped_project(tmp_path, name="b", task_id=22)
+
+    result = _run_cli(
+        "--project-root", str(a), "--project-root", str(b), "--json"
+    )
+
+    payload = json.loads(result.stdout)
+    assert [p["project_root"] for p in payload["projects"]] == [str(a), str(b)]
+
+
+def test_main_does_not_repair_a_contradicted_candidate(tmp_path):
+    """End-to-end proof of constraint 2 through the CLI: a task with both a
+    null-sha row and a real merge sha lands in skip_contradicted, never in the
+    repair list."""
+    root = _make_project(
+        tmp_path,
+        tasks=[{"id": 3086, "status": "done", "metadata": {"files": []}}],
+        plans=[("3086", {"task_id": 3086, "files": ["a.py"]})],
+        events=[
+            {
+                "event_type": "merge_finalized",
+                "task_id": 3086,
+                "data": {"state": "blocked", "merge_sha": None},
+            },
+            {
+                "event_type": "merge_finalized",
+                "task_id": 3086,
+                "data": {"state": "done", "merge_sha": "abc123"},
+            },
+        ],
+    )
+
+    payload = json.loads(_run_cli("--project-root", str(root), "--json").stdout)
+
+    counts = payload["projects"][0]["counts"]
+    assert counts[SKIP_CONTRADICTED] == 1
+    assert counts[REPAIR] == 0
+
+
+def test_main_help_documents_the_exit_codes():
+    """The audit CLI's convention: exit codes live in the argparse epilog, not
+    only in a docstring the operator will not see."""
+    result = _run_cli("--help")
+
+    assert result.returncode == 0
+    assert "exit codes" in result.stdout.lower()
+    for code in ("0", "1", "2"):
+        assert code in result.stdout
 
 
 def test_classify_live_task_treats_a_non_dict_metadata_as_no_files():
