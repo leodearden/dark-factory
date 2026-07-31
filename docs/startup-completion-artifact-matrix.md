@@ -84,7 +84,12 @@ run at ~$0.002, matching `shared/tests/test_cli_invoke_integration.py`'s stated 
 
 **Sample schedule.** Monotonic offsets ≈ 0.25 s, 1 s, 2 s, 5 s, 15 s, 30 s, 60 s, plus three
 event-anchored samples: `pre_first_token` (the last sample before an `assistant` record appears),
-`first_token`, and `after_exit`. Per sample the probe records the content-free config-dir tree
+`first_token`, and `after_exit`. The pre-first-token candidate is re-taken only when the watched
+transcript's size/mtime moves — an unchanged transcript yields an identical observation, and
+re-sampling it on every 0.2 s tick made the probe's own filesystem churn compete with the CLI
+startup it is timing. A run that never reaches session init therefore carries its candidate at
+t≈0; its late state is the `deadline` / `after_exit` sample. Per sample the probe records the
+content-free config-dir tree
 (relpath / kind / size / mtime-delta), whether `projects/*/<sid>.jsonl` resolves, a safe field
 projection of the transcript records, the three already-committed `shared.cli_invoke` substrate
 returns, and `/proc/<pid>` state (`stat` state char, cmdline, direct children `comm`).

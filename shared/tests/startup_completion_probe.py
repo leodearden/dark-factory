@@ -78,7 +78,6 @@ from shared.cli_invoke import (  # noqa: E402
     _resolve_transcript_path,
     count_transcript_turns,
     read_transcript_records,
-    transcript_exists,
 )
 from shared.config_dir import TaskConfigDir  # noqa: E402
 
@@ -114,6 +113,9 @@ DEFAULT_PRUNE_PREFIXES: tuple[str, ...] = ('plugins/marketplaces', 'backups')
 #: Max scrubbed stderr characters retained per observation (provenance only).
 _STDERR_TAIL_CHARS = 600
 
+#: "Never sampled" sentinel, distinct from a real ``None`` observation.
+_UNSET = object()
+
 # ---------------------------------------------------------------------------
 # Redaction (capture-time gate)
 # ---------------------------------------------------------------------------
@@ -129,34 +131,92 @@ _RECORD_TYPE_KEYS = ('type', 'subtype', 'operation', 'isMeta', 'isSidechain')
 #: imported here so the CAPTURE-time gate and the COMMIT-time assertion can
 #: never drift apart.  Widening one automatically widens the other.
 _CREDENTIAL_PATTERNS = _scf._CREDENTIAL_PATTERNS
+_NAMED_CREDENTIAL_PATTERNS = _scf.NAMED_CREDENTIAL_PATTERNS
+_GENERIC_CREDENTIAL_PATTERNS = _scf.GENERIC_CREDENTIAL_PATTERNS
 CREDENTIAL_FILENAMES = _scf.CREDENTIAL_FILENAMES
 
 
-def scan_for_credential_material(text: str) -> tuple[str, int] | None:
+def scan_for_credential_material(
+    text: str, patterns: tuple[tuple[str, str], ...] = _CREDENTIAL_PATTERNS
+) -> tuple[str, int] | None:
     """Return ``(pattern_name, offset)`` of the first credential-shaped match, else None.
 
     The non-raising form of ``startup_completion_fixtures.assert_no_credential_material``
     over the same pattern set, for call sites that need to substitute rather than
-    fail (see :func:`scrub_credential_material`).
+    fail (see :func:`scrub_credential_material`).  *patterns* narrows the scan to
+    one pattern class; it defaults to all of them.
     """
-    for name, pattern in _CREDENTIAL_PATTERNS:
+    for name, pattern in patterns:
         match = re.search(pattern, text)
         if match is not None:
             return (name, match.start())
     return None
 
 
+def _scrub_value(value: Any, patterns: tuple[tuple[str, str], ...]) -> Any:
+    """Return *value* with every string leaf scrubbed against *patterns*."""
+    if isinstance(value, str):
+        out = value
+        for _name, pattern in patterns:
+            out = re.sub(pattern + r'\S*', '<redacted>', out)
+        return out
+    if isinstance(value, dict):
+        return {key: _scrub_value(item, patterns) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_scrub_value(item, patterns) for item in value]
+    return value
+
+
 def _gate(observation: dict[str, Any]) -> dict[str, Any]:
-    """Raise if a fully-assembled observation carries credential material.
+    """Refuse — or scrub — an assembled observation carrying credential material.
 
     The capture-time half of the two-sided guard: unredacted material never
     reaches disk, so a probe run cannot produce a raw capture that the committed
     ``TestCorpusSecretHygiene`` assertion would later have to catch.
+
+    The two pattern classes are handled DIFFERENTLY, because their failure modes
+    are different:
+
+    - a NAMED hit (``sk-ant-``, ``accessToken``, ...) is unambiguously a secret,
+      so it raises and the run is abandoned;
+    - the GENERIC long-run backstop is a heuristic that can fire on a long
+      non-path identifier, so it substitutes and WARNS instead.  ``_gate`` is
+      called from the sampling loop, and raising there propagates out through
+      ``finally`` and destroys the entire live capture — including the
+      real-money ``healthy`` / ``mcp_wedge`` runs — for a harness whose whole
+      purpose is to be re-run after a CLI bump.  Either way the matched run
+      never reaches disk; only the blast radius differs.
     """
-    _scf.assert_no_credential_material(
-        json.dumps(observation), source='startup_completion_probe:observation'
+    encoded = json.dumps(observation)
+
+    named = scan_for_credential_material(encoded, _NAMED_CREDENTIAL_PATTERNS)
+    if named is not None:
+        name, offset = named
+        raise AssertionError(
+            f'credential material in startup_completion_probe:observation: '
+            f'pattern {name!r} matched at offset {offset} (match text withheld). '
+            f'Redact it — record credential-bearing paths by presence/size only.'
+        )
+
+    generic = scan_for_credential_material(encoded, _GENERIC_CREDENTIAL_PATTERNS)
+    if generic is None:
+        return observation
+
+    name, offset = generic
+    print(
+        f'startup_completion_probe: WARNING — heuristic pattern {name!r} matched at '
+        f'offset {offset} in sample {observation.get("sample_index")} '
+        f'({observation.get("sample_kind")}). Scrubbing the matching run rather than '
+        f'discarding the capture. Check the emitted observation: if this was a long '
+        f'identifier rather than a secret, widen the lookarounds in '
+        f'startup_completion_fixtures.GENERIC_CREDENTIAL_PATTERNS.',
+        file=sys.stderr,
     )
-    return observation
+    scrubbed = _scrub_value(observation, _GENERIC_CREDENTIAL_PATTERNS)
+    _scf.assert_no_credential_material(
+        json.dumps(scrubbed), source='startup_completion_probe:observation(scrubbed)'
+    )
+    return scrubbed
 
 
 def scrub_credential_material(text: str) -> str:
@@ -275,19 +335,38 @@ def sample_proc(pid: int | None) -> dict:
     return out
 
 
-def sample_substrate(config_dir: Path, session_id: str) -> dict:
-    """Evaluate the already-committed ``shared.cli_invoke`` transcript readers.
+def sample_substrate(
+    transcript_path: Path | None, records: list[dict] | None
+) -> dict:
+    """Project the already-committed ``shared.cli_invoke`` reader returns.
 
     This is the whole point of the probe: the predicate 3326 ports into production
     must be expressible over substrate that exists on main TODAY.  Recording these
     three returns per sample proves the discrimination without new production code.
+
+    Takes what :func:`observe` has ALREADY read — the resolved path and the parsed
+    records — rather than re-globbing and re-reading the transcript three more
+    times.  Correctness, not just cost: `transcript_exists` IS
+    ``_resolve_transcript_path(...) is not None`` and `count_transcript_turns` IS
+    the count of ``type == "assistant"`` records, by their one-line definitions
+    in `shared.cli_invoke`, so re-calling them adds no information — but it does
+    add three more sample points, and a transcript that lands BETWEEN them yields
+    an internally inconsistent observation (``transcript_relpath: null`` beside
+    ``transcript_exists: true``).  One read, one instant, one consistent row.
+
+    The equivalence is pinned in the other direction by the committed
+    ``TestPredicateDiscrimination::test_committed_substrate_returns_match_the_row``,
+    which calls the real committed functions against every materialized row.
     """
-    records = read_transcript_records(config_dir, session_id)
     return {
-        'transcript_exists': transcript_exists(config_dir, session_id),
+        'transcript_exists': transcript_path is not None,
         'read_transcript_records_is_none': records is None,
         'record_count': None if records is None else len(records),
-        'count_transcript_turns': count_transcript_turns(config_dir, session_id),
+        'count_transcript_turns': (
+            None
+            if records is None
+            else sum(1 for record in records if record.get('type') == 'assistant')
+        ),
     }
 
 
@@ -327,7 +406,7 @@ def observe(
         'transcript_records': (
             None if records is None else [redact_record(r) for r in records]
         ),
-        'substrate_returns': sample_substrate(config_dir, session_id),
+        'substrate_returns': sample_substrate(transcript_path, records),
         'proc': sample_proc(pid),
     }
     if extra:
@@ -483,8 +562,23 @@ def _spawn_env(config_dir: Path, oauth_token: str | None) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
-def _drain_exit(proc: subprocess.Popen, *, mode: str) -> dict:
-    """Kill (if still running), drain stdout/stderr, and return exit provenance.
+def _drain_exit(
+    proc: subprocess.Popen,
+    *,
+    mode: str,
+    stdout_path: Path,
+    stderr_path: Path,
+) -> dict:
+    """Kill (if still running), reap, and return exit provenance from the capture files.
+
+    Reads the child's output from the temp files it was spawned against, NOT from
+    pipes.  That is load-bearing rather than incidental: a ``PIPE`` the parent
+    does not read fills at ~64 KB and blocks the child on write, and the parent
+    here is busy sampling for up to ``--max-secs`` before it could drain.  A
+    chatty startup — ``mcp_wedge``, the shape most likely to log connection
+    failures, and the run finding F3 rests on — would then wedge *because the
+    probe measured it*.  Files cannot backpressure, so the child never blocks and
+    the capture is drained once, after the sampling window closes.
 
     The stderr tail is SCRUBBED (patterns substituted, not raised on) and
     truncated — it is provenance for the report, e.g. whether the CLI logged an
@@ -494,17 +588,19 @@ def _drain_exit(proc: subprocess.Popen, *, mode: str) -> dict:
     if still_running:
         proc.kill()
     try:
-        stdout, stderr = proc.communicate(timeout=15)
+        proc.wait(timeout=15)
     except subprocess.TimeoutExpired:
         proc.kill()
-        stdout, stderr = proc.communicate()
-    text = (stderr or b'').decode('utf-8', 'replace')
+        proc.wait()
+    stdout = stdout_path.read_bytes() if stdout_path.exists() else b''
+    stderr = stderr_path.read_bytes() if stderr_path.exists() else b''
+    text = stderr.decode('utf-8', 'replace')
     # Scalar-only projection of the CLI's --output-format json envelope: enough
     # to explain a non-zero exit (e.g. `error_max_turns` vs a startup failure)
     # without capturing the model's `result` text.
     envelope: dict[str, Any] = {}
     with contextlib.suppress(ValueError, AttributeError):
-        parsed = json.loads((stdout or b'').decode('utf-8', 'replace'))
+        parsed = json.loads(stdout.decode('utf-8', 'replace'))
         if isinstance(parsed, dict):
             envelope = {
                 k: parsed[k]
@@ -555,6 +651,14 @@ def run_live_probe(
     )
     env = _spawn_env(config_dir, token_pair[1] if token_pair else None)
 
+    # Capture files, NOT pipes — see _drain_exit: an undrained PIPE blocks the
+    # child once ~64 KB of startup chatter fills it, and this parent does not
+    # drain until the sampling window closes.
+    stdout_path = stub_dir / 'probe-stdout.bin'
+    stderr_path = stub_dir / 'probe-stderr.bin'
+    stdout_fh = stdout_path.open('wb')
+    stderr_fh = stderr_path.open('wb')
+
     observations: list[dict] = []
     proc: subprocess.Popen | None = None
     epoch = time.time()
@@ -566,8 +670,8 @@ def run_live_probe(
             argv,
             cwd=str(cwd),
             env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=stdout_fh,
+            stderr=stderr_fh,
             start_new_session=True,
         )
 
@@ -597,6 +701,31 @@ def run_live_probe(
             sample_index += 1
             return observation
 
+        def _transcript_state_key() -> tuple[str, int, int] | None:
+            """Cheap change-detector for the watched transcript: one glob + one stat.
+
+            ``_take`` costs a full ``rglob('*')`` of the config dir (which walks
+            the several-hundred-file ``plugins/marketplaces`` clone before
+            pruning it), plus a transcript read and a JSON credential scan.  At
+            the 0.2 s tick that was ~5 tree walks a second, every result but the
+            last discarded — and the probe's own FS churn competing, on the same
+            filesystem, with the CLI startup whose timing it is measuring.  So
+            re-take the candidate only when this key moves.
+            """
+            path = _resolve_transcript_path(config_dir, session_id)
+            if path is None:
+                return None
+            try:
+                stat = path.stat()
+            except OSError:
+                return None
+            return (str(path), stat.st_size, stat.st_mtime_ns)
+
+        # _UNSET, not None: None is the real "no transcript yet" key, and the
+        # first tick must always produce a candidate so a run that never reaches
+        # session init still carries one.
+        candidate_key: Any = _UNSET
+
         while True:
             elapsed = time.monotonic() - start
             if pending and elapsed >= pending[0]:
@@ -613,6 +742,12 @@ def run_live_probe(
                 else:
                     # Keep only the most recent pre-turn-1 sample; it is the
                     # incident-shape observation the whole two-regime grace is for.
+                    # Re-taken only when the transcript actually changed, so an
+                    # unchanging one is not re-sampled ~5x/second for a result
+                    # that is discarded.  Nothing is lost: an identical key means
+                    # an identical observation, and the late state of a run that
+                    # never starts is still captured by the `deadline` /
+                    # `after_exit` samples below.
                     #
                     # The turn can land BETWEEN the check above and this sample, so
                     # re-read the candidate's OWN recorded turn count and discard it
@@ -620,10 +755,13 @@ def run_live_probe(
                     # labelled `pre_first_token` while carrying an assistant record,
                     # which is exactly the mislabel that would let a curated corpus
                     # row lie about the regime it came from.
-                    candidate = _take('pre_first_token_candidate')
-                    observed = candidate['substrate_returns']['count_transcript_turns']
-                    if observed is None or observed < 1:
-                        pre_first_token = candidate
+                    key = _transcript_state_key()
+                    if key != candidate_key:
+                        candidate_key = key
+                        candidate = _take('pre_first_token_candidate')
+                        observed = candidate['substrate_returns']['count_transcript_turns']
+                        if observed is None or observed < 1:
+                            pre_first_token = candidate
             if proc.poll() is not None:
                 observations.append(_take('after_exit'))
                 break
@@ -638,13 +776,16 @@ def run_live_probe(
             pre_first_token['sample_kind'] = 'pre_first_token'
             observations.append(pre_first_token)
 
-        # Drain the pipes and stamp exit provenance onto every observation of this
-        # run.  Draining matters: an undrained PIPE can block the child, which
-        # would make the probe itself the cause of the wedge it is measuring.
-        exit_provenance = _gate(_drain_exit(proc, mode=mode))
+        # Reap the child, read its capture files, and stamp exit provenance onto
+        # every observation of this run.
+        exit_provenance = _gate(
+            _drain_exit(proc, mode=mode, stdout_path=stdout_path, stderr_path=stderr_path)
+        )
         for observation in observations:
             observation['run_exit'] = exit_provenance
     finally:
+        stdout_fh.close()
+        stderr_fh.close()
         if proc is not None and proc.poll() is None:
             proc.kill()
             with contextlib.suppress(subprocess.TimeoutExpired):
