@@ -1102,6 +1102,94 @@ def test_run_nightly_happy_path_end_to_end(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# task 3270: run_nightly emits the sampler accounting on EVERY run
+# ---------------------------------------------------------------------------
+
+_SUMMARY_KEYS = ('enumerated=', 'zero_signal_dropped=', 'budget_skipped=',
+                 'selected=', 'bytes_used=')
+
+
+def _summary_lines(caplog):
+    """Every captured record carrying the sampler summary line's keys."""
+    return [
+        r.getMessage() for r in caplog.records
+        if all(key in r.getMessage() for key in _SUMMARY_KEYS)
+    ]
+
+
+def test_run_nightly_logs_the_sampler_summary_on_a_healthy_night(tmp_path, caplog):
+    """The operator's grep anchor is emitted on EVERY run, healthy included.
+
+    Without it, the only trace a night leaves in the journal is whether it
+    committed — so a night that sampled real signal and a night that sampled
+    nothing at all are the same observation.
+    """
+    work_cwd = str(tmp_path / 'work')
+    repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+    projects_root = tmp_path / 'projects'
+    _write_transcript(
+        projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl',
+        cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id='session-1',
+    )
+
+    with caplog.at_level('INFO', logger='legibility.nightly'):
+        result = nightly.run_nightly(
+            config_path=config_path,
+            projects_root=projects_root,
+            target_date=date(2026, 7, 13),
+            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc),
+            invoke=_fake_invoke_known_cause,
+            status_fetcher=None,
+            poster=lambda url, envelope: None,
+        )
+
+    assert result.exit_code == 0
+    lines = _summary_lines(caplog)
+    assert len(lines) == 1, f'expected exactly one summary line, got {lines}'
+    line = lines[0]
+
+    # The REAL numbers, not a zeros template: one session enumerated, one
+    # affordable and selected.
+    assert 'enumerated=1' in line
+    assert 'selected=1' in line
+    assert 'budget_skipped=0' in line
+    assert f'/{load_config(config_path).budgets.max_daily_digest_bytes}' in line
+
+    # One journal interleaves every project's timer, so the line has to say
+    # which project and which night it is describing.
+    assert 'testproj' in line
+    assert '2026-07-13' in line
+
+
+def test_run_nightly_logs_the_sampler_summary_when_there_are_no_sessions(tmp_path, caplog):
+    """A night with nothing to sample reports zeros — not silence."""
+    work_cwd = str(tmp_path / 'work')
+    repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+    projects_root = tmp_path / 'projects'  # never populated
+
+    with caplog.at_level('INFO', logger='legibility.nightly'):
+        result = nightly.run_nightly(
+            config_path=config_path,
+            projects_root=projects_root,
+            target_date=date(2026, 7, 13),
+            now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=timezone.utc),
+            invoke=_fake_invoke_known_cause,
+            status_fetcher=None,
+            poster=lambda url, envelope: None,
+        )
+
+    assert result.exit_code == 0
+    lines = _summary_lines(caplog)
+    assert len(lines) == 1, f'expected exactly one summary line, got {lines}'
+    line = lines[0]
+    assert 'enumerated=0' in line
+    assert 'selected=0' in line
+    assert 'budget_skipped=0' in line
+    assert 'testproj' in line
+    assert '2026-07-13' in line
+
+
+# ---------------------------------------------------------------------------
 # step-15/16: run_nightly -- fail-loud on coder storm (decision 8, §8.6)
 # ---------------------------------------------------------------------------
 
