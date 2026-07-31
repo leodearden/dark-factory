@@ -81,13 +81,28 @@ test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q --tim
 lint_command: "uv run --project shared ruff check tests/scripts/"
 type_check_command: "npx pyright tests/scripts/"
 
-# Per-module verify budget. MEASUREMENT PROVENANCE: this suite measured
-# 105-127s across four independent runs on the fallback path (task 3062,
-# escalation esc-3062-3), so 600s is ~4.7x the worst logged figure — generous
-# enough to absorb host-oversubscription variance (the same day showed the
-# orchestrator segment swing 1157.62s -> 1366.23s, ~18%), tight enough to
-# surface a genuine hang in minutes rather than in the ~50 minutes the
-# whole-fleet ceiling permits.
+# Per-module verify budget. MEASUREMENT PROVENANCE, two independent sources:
+#
+#   105-127s         four runs on the fallback path (task 3062, esc-3062-3)
+#   233.50s, 167.73s  two runs of this VERBATIM command, 369 passed / 1
+#                     skipped each, on the task 3350 worktree at HEAD
+#                     9d6af5289f
+#
+# Size against 233.50s — the largest figure, and measured on the same command
+# this file declares. 600s is ~2.6x it. The 233.50s / 167.73s spread (~39%)
+# between two runs of an identical command on one host is itself the reason
+# for that much headroom: this box is oversubscribed by concurrent orchestrator
+# work, exactly as the same day esc-3062-3 was logged showed the orchestrator
+# segment swing 1157.62s -> 1366.23s (~18%). Still tight enough to surface a
+# genuine hang in minutes rather than in the ~50 the whole-fleet ceiling
+# permits.
+#
+# Both figures are recorded rather than only the convenient one: task 3350
+# exists because a single unrecorded estimate ("Full warm verify here is
+# ~2 min") was left standing in the root yaml until it was off by an order of
+# magnitude. If this suite grows enough to approach 600s, re-measure and raise
+# BOTH this value and the >= 300s floor asserted in
+# test_tests_scripts_module_config.py — do not quietly widen one.
 #
 # This is where the root yaml's "tight timeouts surface hangs" intent actually
 # lives now. It could never hold at the whole-fleet level, because a ceiling

@@ -33,6 +33,8 @@ import re
 
 import yaml
 
+from orchestrator.config import ModuleConfig, _discover_module_configs
+
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 DF_CONFIG_PATH = REPO_ROOT / "dark-factory-orchestrator.yaml"
 
@@ -42,13 +44,17 @@ DF_CONFIG_PATH = REPO_ROOT / "dark-factory-orchestrator.yaml"
 # hardcode the list — which silently fails to cover a NEW subproject that
 # later adds its own orchestrator.yaml + test_command (reviewer drift
 # concern, task 2769 amendment) — the guard below DISCOVERS them at runtime
-# via ``_discover_per_module_configs``: every ``REPO_ROOT/<subproject>/
-# orchestrator.yaml`` that defines a ``test_command``. A newly-added
-# subproject is therefore auto-covered and cannot regress to the flaky 60s
-# pyproject default without failing this test.
+# via ``_discover_per_module_configs``: every module config the orchestrator
+# itself registers, at ANY depth, that defines a ``test_command``. A
+# newly-added subproject is therefore auto-covered and cannot regress to the
+# flaky 60s pyproject default without failing this test.
 #
-# The known-7 names below are retained only as a *floor* (proof the glob
-# still resolves them), NOT as the authoritative list.
+# The known names below are retained only as a *floor* (proof discovery still
+# resolves them), NOT as the authoritative list. Entries are repo-relative
+# module PREFIXES, not bare directory names — task 3350, so the depth-2
+# ``tests/scripts`` config cannot collide with the depth-1 ``scripts`` one.
+# Depth-1 prefixes are identical to their bare names, so the pre-existing
+# entries are unchanged.
 KNOWN_PER_MODULE_CONFIG_NAMES = frozenset(
     {
         "shared",
@@ -58,6 +64,7 @@ KNOWN_PER_MODULE_CONFIG_NAMES = frozenset(
         "dashboard",
         "sampler",
         "scripts",
+        "tests/scripts",
     }
 )
 
@@ -75,29 +82,42 @@ def _fleet_test_command() -> str:
     return yaml.safe_load(DF_CONFIG_PATH.read_text(encoding="utf-8"))["test_command"]
 
 
-def _module_test_command(config_path: pathlib.Path) -> str:
-    return yaml.safe_load(config_path.read_text(encoding="utf-8"))["test_command"]
+def _discover_per_module_configs() -> dict[str, ModuleConfig]:
+    """Every discovered module config (ANY depth) that defines a ``test_command``.
 
+    Keyed by repo-relative module prefix (``shared``, ``tests/scripts``), which
+    is what the orchestrator itself registers configs under.
 
-def _discover_per_module_configs() -> list[pathlib.Path]:
-    """Every immediate-subdir orchestrator.yaml that defines a ``test_command``.
+    Delegates to the PRODUCTION walk ``config._discover_module_configs`` rather
+    than globbing (task 3350). The previous ``REPO_ROOT/*/orchestrator.yaml``
+    glob looked ONE level deep, so a config like ``tests/scripts/
+    orchestrator.yaml`` silently escaped the per-test timeout guard below —
+    breaking this helper's own promise that "a newly-added subproject is
+    auto-covered ... and cannot silently regress to the 60s default". It also
+    keyed on ``path.parent.name``, colliding ``scripts`` with ``tests/scripts``.
 
-    Dynamic (glob ``REPO_ROOT/*/orchestrator.yaml`` filtered to configs that
-    define a ``test_command``) so a newly-added subproject is auto-covered by
-    the per-test timeout guard below (task 2769 amendment). Naturally excludes
-    the repo-root ``dark-factory-orchestrator.yaml`` (different filename, at
-    the root rather than a subdir — checked separately by the FALLBACK tests
-    above) and any subdir whose orchestrator.yaml has no ``test_command``.
+    Delegating closes both by construction: the guard now checks exactly the set
+    the orchestrator registers, at any depth, and inherits the production
+    pruning of ``.worktrees``, ``.venv``, ``node_modules``, ``build``, ``target``,
+    ``.claude`` and any nested ``.git`` checkout. A hand-rolled
+    ``**/orchestrator.yaml`` was rejected: run from the main checkout it would
+    descend ``.worktrees/`` and ``.venv/``, and it would remain free to drift
+    from what discovery actually does.
+
+    Still naturally excludes the repo-root ``dark-factory-orchestrator.yaml``
+    (different filename; the production walk also skips a root-level
+    ``orchestrator.yaml`` at prefix ``"."``) — that file is checked by the
+    FALLBACK tests above.
+
+    Importing ``orchestrator.config`` from this suite follows the precedent set
+    by ``test_orchestrator_restart_config_drift.py`` and
+    ``test_offline_lane_qdrant_config.py`` in this same directory.
     """
-    found: list[pathlib.Path] = []
-    for path in sorted(REPO_ROOT.glob("*/orchestrator.yaml")):
-        try:
-            data = yaml.safe_load(path.read_text(encoding="utf-8"))
-        except (OSError, yaml.YAMLError):
-            continue
-        if isinstance(data, dict) and "test_command" in data:
-            found.append(path)
-    return found
+    return {
+        prefix: mc
+        for prefix, mc in _discover_module_configs(REPO_ROOT).items()
+        if mc.test_command
+    }
 
 
 def _pytest_segments(cmd: str) -> list[str]:
@@ -269,54 +289,62 @@ def test_per_module_merge_verify_raises_per_test_timeout() -> None:
     amendment) rather than hardcoded, so a future subproject that adds its
     own orchestrator.yaml + pytest test_command is auto-covered and cannot
     silently regress to the 60s default — the exact class of drift this
-    guard exists to prevent. See ``TIMEOUT_GUARD_EXCLUSIONS`` for the single
-    documented, out-of-scope carve-out.
+    guard exists to prevent. Task 3350 widened that discovery from an
+    immediate-subdir glob to the production walk, so configs at ANY depth
+    (e.g. ``tests/scripts``) are covered too. See
+    ``TIMEOUT_GUARD_EXCLUSIONS`` for the single documented, out-of-scope
+    carve-out.
     """
     discovered = _discover_per_module_configs()
-    discovered_names = {p.parent.name for p in discovered}
 
-    # Floor: the known-7 must still be resolved by the glob. If any is
+    # Floor: the known configs must still be resolved by discovery. If any is
     # missing, discovery itself has silently broken and the loop below would
     # vacuously pass on a shrunken set — fail loudly instead.
-    missing = KNOWN_PER_MODULE_CONFIG_NAMES - discovered_names
+    missing = KNOWN_PER_MODULE_CONFIG_NAMES - set(discovered)
     assert not missing, (
-        "dynamic discovery (REPO_ROOT/*/orchestrator.yaml defining a "
-        f"test_command) failed to resolve known per-module config(s) "
-        f"{sorted(missing)} (task 2769) — the glob/filter has regressed; "
-        f"discovered: {sorted(discovered_names)}"
+        "dynamic discovery (config._discover_module_configs, filtered to "
+        f"configs defining a test_command) failed to resolve known per-module "
+        f"config(s) {sorted(missing)} (task 2769) — discovery has regressed; "
+        f"discovered: {sorted(discovered)}"
     )
 
-    for config_path in discovered:
-        name = config_path.parent.name
-        if name in TIMEOUT_GUARD_EXCLUSIONS:
+    for prefix, module_config in sorted(discovered.items()):
+        if prefix in TIMEOUT_GUARD_EXCLUSIONS:
             # Documented out-of-scope carve-out (see TIMEOUT_GUARD_EXCLUSIONS).
             continue
-        cmd = _module_test_command(config_path)
+        cmd = module_config.test_command
+        # Non-None by construction: _discover_per_module_configs filters on
+        # ``mc.test_command``. Asserted so the narrowing is checkable rather
+        # than implicit — ModuleConfig.test_command is typed ``str | None``.
+        assert cmd is not None
         segments = _pytest_segments(cmd)
         if not segments:
             # A non-pytest subproject has no xdist worker to starve, so the
-            # --timeout concern doesn't apply — skip it. The known-7 are
+            # --timeout concern doesn't apply — skip it. The known configs are
             # contractually pytest-based, so an empty segment set there is a
             # real regression, not a legitimate non-pytest config.
-            assert name not in KNOWN_PER_MODULE_CONFIG_NAMES, (
-                f"{config_path} test_command (per-module merge verify) has no "
-                f"pytest segments to check (task 2769); got: {cmd!r}"
+            assert prefix not in KNOWN_PER_MODULE_CONFIG_NAMES, (
+                f"{prefix}/orchestrator.yaml test_command (per-module merge "
+                f"verify) has no pytest segments to check (task 2769); got: "
+                f"{cmd!r}"
             )
             continue
         for seg in segments:
             match = re.search(r"--timeout[=\s](\d+)", seg)
             assert match, (
-                f"pytest segment {seg!r} in {config_path} test_command "
-                "(per-module merge verify) has no --timeout override (task "
-                "2769) — the flaky 60s pyproject default is left in place, "
-                "so xdist worker starvation under host oversubscription can "
-                "still manufacture a false 'node down' failure"
+                f"pytest segment {seg!r} in {prefix}/orchestrator.yaml "
+                "test_command (per-module merge verify) has no --timeout "
+                "override (task 2769) — the flaky 60s pyproject default is "
+                "left in place, so xdist worker starvation under host "
+                "oversubscription can still manufacture a false 'node down' "
+                "failure"
             )
             timeout_value = int(match.group(1))
             assert timeout_value >= 300, (
-                f"pytest segment {seg!r} in {config_path} test_command sets "
-                f"--timeout={timeout_value}, which is below the 300s floor "
-                "(task 2769) mirroring the FALLBACK chain's own convention"
+                f"pytest segment {seg!r} in {prefix}/orchestrator.yaml "
+                f"test_command sets --timeout={timeout_value}, which is below "
+                "the 300s floor (task 2769) mirroring the FALLBACK chain's own "
+                "convention"
             )
 
 
