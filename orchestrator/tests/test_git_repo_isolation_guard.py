@@ -601,7 +601,7 @@ class TestNoUnguardedGitWritersInTestGitOps:
                 f'_SELF_INITIALISING_HELPERS names {name}, which no longer '
                 f'exists in test_git_ops.py — drop the stale entry'
             )
-            creators = {
+            creators: set[str] = {
                 node.args[0].elts[1].value
                 for node in ast.walk(func)
                 if isinstance(node, ast.Call)
@@ -613,6 +613,7 @@ class TestNoUnguardedGitWritersInTestGitOps:
                 and isinstance(node.args[0].elts[0], ast.Constant)
                 and node.args[0].elts[0].value == 'git'
                 and isinstance(node.args[0].elts[1], ast.Constant)
+                and isinstance(node.args[0].elts[1].value, str)
             }
             assert creators & {'init', 'clone'}, (
                 f'{name} is exempted as self-initialising but no longer runs '
