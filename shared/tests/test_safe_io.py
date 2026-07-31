@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 
 import pytest
 
@@ -303,3 +304,112 @@ class TestAtomicWriteText:
         import shared.safe_io as _safe_io
 
         assert 'atomic_write_text' in _safe_io.__all__
+
+
+class TestAtomicWriteFailurePaths:
+    """On failure the destination is untouched and no temp residue survives."""
+
+    def test_write_failure_propagates_unchanged(self, tmp_path, monkeypatch):
+        """An exception raised mid-write reaches the caller — never swallowed."""
+        import shared.safe_io as _safe_io
+
+        p = tmp_path / 'state.json'
+        p.write_text('ORIGINAL', encoding='utf-8')
+
+        boom = RuntimeError('disk on fire')
+
+        real_fdopen = os.fdopen
+
+        def exploding_fdopen(fd, *a, **kw):
+            f = real_fdopen(fd, *a, **kw)
+            f.write = lambda _text: (_ for _ in ()).throw(boom)  # type: ignore[method-assign]
+            return f
+
+        monkeypatch.setattr(_safe_io.os, 'fdopen', exploding_fdopen)
+
+        with pytest.raises(RuntimeError) as excinfo:
+            _safe_io.atomic_write_text(p, 'NEW')
+
+        assert excinfo.value is boom
+
+    def test_write_failure_leaves_destination_intact(self, tmp_path, monkeypatch):
+        """The pre-existing destination is byte-for-byte unchanged after a failure."""
+        import shared.safe_io as _safe_io
+
+        p = tmp_path / 'state.json'
+        p.write_bytes(b'ORIGINAL-BYTES')
+
+        real_fdopen = os.fdopen
+
+        def exploding_fdopen(fd, *a, **kw):
+            f = real_fdopen(fd, *a, **kw)
+            f.write = lambda _text: (_ for _ in ()).throw(RuntimeError('boom'))  # type: ignore[method-assign]
+            return f
+
+        monkeypatch.setattr(_safe_io.os, 'fdopen', exploding_fdopen)
+
+        with pytest.raises(RuntimeError):
+            _safe_io.atomic_write_text(p, 'NEW')
+
+        assert p.read_bytes() == b'ORIGINAL-BYTES'
+
+    def test_write_failure_leaves_no_temp_file(self, tmp_path, monkeypatch):
+        """A failed write cleans up its temp — the parent dir holds only the dest."""
+        import shared.safe_io as _safe_io
+
+        p = tmp_path / 'state.json'
+        p.write_text('ORIGINAL', encoding='utf-8')
+
+        real_fdopen = os.fdopen
+
+        def exploding_fdopen(fd, *a, **kw):
+            f = real_fdopen(fd, *a, **kw)
+            f.write = lambda _text: (_ for _ in ()).throw(RuntimeError('boom'))  # type: ignore[method-assign]
+            return f
+
+        monkeypatch.setattr(_safe_io.os, 'fdopen', exploding_fdopen)
+
+        with pytest.raises(RuntimeError):
+            _safe_io.atomic_write_text(p, 'NEW')
+
+        assert sorted(q.name for q in tmp_path.iterdir()) == ['state.json']
+
+    def test_replace_failure_cleans_up_temp(self, tmp_path, monkeypatch):
+        """An os.replace failure also unlinks the temp and re-raises."""
+        import shared.safe_io as _safe_io
+
+        p = tmp_path / 'state.json'
+        p.write_text('ORIGINAL', encoding='utf-8')
+
+        def exploding_replace(_src, _dst):
+            raise OSError('rename failed')
+
+        monkeypatch.setattr(_safe_io.os, 'replace', exploding_replace)
+
+        with pytest.raises(OSError, match='rename failed'):
+            _safe_io.atomic_write_text(p, 'NEW')
+
+        assert p.read_text(encoding='utf-8') == 'ORIGINAL'
+        assert sorted(q.name for q in tmp_path.iterdir()) == ['state.json']
+
+    def test_base_exception_mid_write_also_cleans_up(self, tmp_path, monkeypatch):
+        """A KeyboardInterrupt (BaseException) mid-write still removes the temp."""
+        import shared.safe_io as _safe_io
+
+        p = tmp_path / 'state.json'
+        p.write_text('ORIGINAL', encoding='utf-8')
+
+        real_fdopen = os.fdopen
+
+        def exploding_fdopen(fd, *a, **kw):
+            f = real_fdopen(fd, *a, **kw)
+            f.write = lambda _text: (_ for _ in ()).throw(KeyboardInterrupt())  # type: ignore[method-assign]
+            return f
+
+        monkeypatch.setattr(_safe_io.os, 'fdopen', exploding_fdopen)
+
+        with pytest.raises(KeyboardInterrupt):
+            _safe_io.atomic_write_text(p, 'NEW')
+
+        assert p.read_text(encoding='utf-8') == 'ORIGINAL'
+        assert sorted(q.name for q in tmp_path.iterdir()) == ['state.json']
