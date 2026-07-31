@@ -25,6 +25,8 @@ from datetime import date as dt_date
 from functools import lru_cache
 from pathlib import Path
 
+import pytest
+
 from legibility import digest, inventory as mod
 from orchestrator import session_registry
 
@@ -346,6 +348,78 @@ class TestGzAwareReader:
         corrupt = tmp_path / 'corrupt.jsonl.gz'
         corrupt.write_bytes(b'this is not gzip\n{"cwd": "/x", "timestamp": "2026-07-13T10:00:00Z"}\n')
         assert mod.session_cwd(corrupt) is None
+
+
+class TestPublicIterJsonLines:
+    """``iter_json_lines`` is PUBLIC — the single low-level transcript reader.
+
+    Promoted from ``_iter_json_lines`` for task 3214: the memory-eval retro
+    corpus extractor (``fused-memory/scripts/memory_eval_transcript_corpus.py``)
+    consumes it from a DIFFERENT package, and a cross-package consumer of an
+    underscore name is a standing invitation for the next author to copy the
+    function instead — the outcome the reuse invariant exists to prevent.
+
+    The underscore name is retained as an alias so the existing in-package
+    callers (``sampling.py``, ``check_transcript_persistence.py``) need no edit;
+    these tests pin that they are the SAME object, so the alias cannot silently
+    drift into a second implementation.
+    """
+
+    RECORDS = [
+        {'type': 'user', 'cwd': MAIN_CWD, 'seq': 1},
+        {'type': 'assistant', 'seq': 2},
+    ]
+
+    def _lines(self) -> str:
+        # A blank line and a syntactically-corrupt line interleaved between the
+        # two good records: both are LINE-level degradations a fire-and-forget
+        # writer really produces, and neither may abort the read.
+        return (
+            json.dumps(self.RECORDS[0])
+            + '\n\n'
+            + '{"type": "user", "message": {broken\n'
+            + json.dumps(self.RECORDS[1])
+            + '\n'
+        )
+
+    def test_public_name_exists(self):
+        assert callable(mod.iter_json_lines)
+
+    def test_legacy_private_name_is_the_same_object(self):
+        # Not merely "both work" — the SAME function object, so the three
+        # existing callers keep the exact behaviour the public name is tested
+        # for, and no second copy can appear behind the old name.
+        assert mod._iter_json_lines is mod.iter_json_lines
+
+    def test_plain_jsonl_skips_blank_and_corrupt_lines(self, tmp_path):
+        path = tmp_path / 'session.jsonl'
+        path.write_text(self._lines(), encoding='utf-8')
+        assert list(mod.iter_json_lines(path)) == self.RECORDS
+
+    def test_gz_round_trips_identically(self, tmp_path):
+        gz_path = tmp_path / 'session.jsonl.gz'
+        with gzip.open(gz_path, 'wt', encoding='utf-8') as f:
+            f.write(self._lines())
+        assert list(mod.iter_json_lines(gz_path)) == self.RECORDS
+
+    def test_plain_and_gz_yield_the_same_records(self, tmp_path):
+        plain = tmp_path / 'session.jsonl'
+        plain.write_text(self._lines(), encoding='utf-8')
+        gz_path = tmp_path / 'session.jsonl.gz'
+        with gzip.open(gz_path, 'wt', encoding='utf-8') as f:
+            f.write(self._lines())
+        assert list(mod.iter_json_lines(plain)) == list(mod.iter_json_lines(gz_path))
+
+    def test_corrupt_gz_raises_oserror(self, tmp_path):
+        # The documented file-level contract the corpus extractor's coverage
+        # accounting depends on: an unreadable FILE raises OSError
+        # (gzip.BadGzipFile subclasses it), so `except OSError` counts one
+        # parse failure — as distinct from the corrupt LINES above, which are
+        # skipped silently and must NOT inflate that count.
+        corrupt = tmp_path / 'corrupt.jsonl.gz'
+        corrupt.write_bytes(b'this is not gzip at all\n')
+        with pytest.raises(OSError):
+            list(mod.iter_json_lines(corrupt))
 
 
 class TestResolveAgentTranscriptRoots:
