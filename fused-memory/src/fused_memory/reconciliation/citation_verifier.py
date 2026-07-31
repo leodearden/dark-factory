@@ -193,3 +193,52 @@ def find_citation_occurrences(metadata: Any, memory_id: str) -> list[str]:
 
     _walk(metadata, '')
     return paths
+
+
+def repoint_metadata(
+    metadata: Any,
+    old_id: str,
+    new_id: str,
+) -> tuple[Any, int]:
+    """Rewrite every occurrence of ``old_id`` to ``new_id``; return ``(blob, count)``.
+
+    Pure: the input is deep-copied, never mutated, so a caller whose
+    subsequent write fails is left holding its original object rather than a
+    half-rewritten one.
+
+    Rewrite rules mirror :func:`find_citation_occurrences`'s match rules
+    exactly, and the count is computed on the SAME traversal, so the two
+    functions cannot drift apart:
+
+    - a string equal to ``old_id`` becomes ``new_id``;
+    - any other string gets ``str.replace(old_id, new_id)``, so an id embedded
+      in free prose is repointed with the surrounding text preserved verbatim;
+    - dicts and lists are descended; every other scalar is returned as-is.
+
+    A string containing ``old_id`` more than once counts as ONE occurrence, to
+    stay path-for-path consistent with the scanner (which reports one path per
+    string, not one per byte offset).
+    """
+    count = 0
+
+    def _rewrite(node: Any) -> Any:
+        nonlocal count
+        if isinstance(node, str):
+            if old_id in node:
+                count += 1
+                return node.replace(old_id, new_id)
+            return node
+        if isinstance(node, dict):
+            return {key: _rewrite(value) for key, value in node.items()}
+        if isinstance(node, list):
+            return [_rewrite(value) for value in node]
+        if isinstance(node, tuple):
+            return tuple(_rewrite(value) for value in node)
+        return node
+
+    if not old_id or not isinstance(old_id, str) or not isinstance(metadata, dict):
+        # Nothing addressable to rewrite. Still deep-copy dict input so the
+        # return value is never an alias of the caller's object.
+        return (_rewrite(metadata) if isinstance(metadata, dict) else metadata), 0
+
+    return _rewrite(metadata), count
