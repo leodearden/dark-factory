@@ -420,6 +420,24 @@ def _healthz_db_targets(config: DashboardConfig) -> list[tuple[str, Path]]:
     ]
 
 
+async def _probe_db(pool: DbPool, db_path: Path, budget: float) -> str:
+    """Probe one database under a single deadline covering acquire + execute + fetch.
+
+    Returns 'ok' | 'failed' | 'timeout' | 'unavailable'. Never raises: a
+    /healthz probe must always yield a verdict for its DB.
+    """
+    try:
+        async with asyncio.timeout(budget):
+            conn = await pool.get(db_path)
+            if conn is None:
+                return 'unavailable'
+            async with conn.execute('SELECT 1') as cursor:
+                row = await cursor.fetchone()
+            return 'ok' if row is not None else 'failed'
+    except Exception:
+        return 'timeout'
+
+
 @app.get('/healthz')
 async def healthz(request: Request) -> JSONResponse:
     """Deep health check — detects thread leaks and unresponsive DB connections."""
@@ -444,23 +462,13 @@ async def healthz(request: Request) -> JSONResponse:
             checks[f'db_{name}'] = 'deadline_exceeded'
             healthy = False
             continue
-        conn = await pool.get(db_path)  # still outside the deadline — step-6 moves it in
-        if conn is None:
-            checks[f'db_{name}'] = 'unavailable'
-            continue
-        try:
-            # The deadline wraps the WHOLE async-with block (execute AND
-            # fetch), not just fetchone() — that narrower scope was the bug:
-            # conn.execute(...)'s own __aenter__ (where aiosqlite's real query
-            # execution happens) previously carried no deadline at all.
-            async with asyncio.timeout(min(remaining, _DB_PROBE_TIMEOUT)):
-                async with conn.execute('SELECT 1') as cursor:
-                    row = await cursor.fetchone()
-            checks[f'db_{name}'] = 'ok' if row is not None else 'failed'
-            if row is None:
-                healthy = False
-        except Exception:
-            checks[f'db_{name}'] = 'timeout'
+        # _probe_db covers acquire + execute + fetch under ONE deadline, so a
+        # stalled pool.get() (per-path open-lock contention, a slow
+        # aiosqlite.connect()) can't hang the handler any more than a slow
+        # query can.
+        status = await _probe_db(pool, db_path, min(remaining, _DB_PROBE_TIMEOUT))
+        checks[f'db_{name}'] = status
+        if status not in ('ok', 'unavailable'):
             healthy = False
 
     checks['uptime_seconds'] = round(time.monotonic() - request.app.state.start_time, 1)
