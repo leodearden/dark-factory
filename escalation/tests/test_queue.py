@@ -1794,6 +1794,71 @@ class TestMakeIdCounter:
         queue2 = EscalationQueue(queue_dir)
         assert queue2.make_id('1-2') == 'esc-1-2-6'
 
+    def test_make_id_corrupt_counter_reconciles_instead_of_colliding(
+        self, tmp_path: Path, caplog,
+    ):
+        """An UNPARSEABLE counter reconciles from disk rather than restarting at 1.
+
+        Same acceptance criterion as the lost-counter case, applied to the
+        corrupt-counter path: resetting to 0 mints 'esc-cnt-1', which
+        ``get()`` resolves to the live root record. Recovery spans BOTH
+        halves of the namespace (root esc-cnt-1 + archived esc-cnt-2), so
+        the next id is 3.
+
+        RED after step-2: the ``except ValueError`` branch still hard-sets
+        current = 0, so make_id returns 'esc-cnt-1' and the counter is
+        repaired to 1, not 3.
+        """
+        queue_dir = tmp_path / 'queue'
+        queue = EscalationQueue(queue_dir)
+        queue.submit(_make_escalation('esc-cnt-1', task_id='cnt'))
+
+        archive_dir = queue_dir / 'archive' / '2026-01-02'
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        archived = _make_escalation('esc-cnt-2', task_id='cnt', status='resolved')
+        (archive_dir / f'{archived.id}.json').write_text(archived.to_json())
+
+        (queue_dir / 'esc-cnt.seq').write_text('not-an-int')
+
+        with caplog.at_level(logging.ERROR, logger='escalation.queue'):
+            result = queue.make_id('cnt')
+
+        assert result == 'esc-cnt-3', (
+            f'Expected max observed across root (1) and archive (2), +1; got {result!r}'
+        )
+        assert queue.get('esc-cnt-3') is None, (
+            'the minted id must resolve to no pre-existing record, root or archive'
+        )
+
+        error_records = [
+            r for r in caplog.records
+            if r.name == 'escalation.queue' and r.levelno >= logging.ERROR
+        ]
+        assert error_records, (
+            f"Expected an ERROR at logger 'escalation.queue'; got records: {caplog.records}"
+        )
+        assert any(
+            'could not parse counter file' in r.message
+            and 'highest observed sequence 2' in r.message
+            for r in error_records
+        ), (
+            "Expected an ERROR retaining 'could not parse counter file' and naming "
+            f'the recovered maximum (2); got: {[r.message for r in error_records]}'
+        )
+
+        # The corrupt contents were durably repaired, so a restart continues
+        # from the reconciled value with no further archive scan.
+        assert (queue_dir / 'esc-cnt.seq').read_text().strip() == '3'
+        queue2 = EscalationQueue(queue_dir)
+        with patch.object(
+            queue2, '_iter_archive_paths', wraps=queue2._iter_archive_paths,
+        ) as spy:
+            assert queue2.make_id('cnt') == 'esc-cnt-4'
+        assert spy.call_count == 0, (
+            f'The repaired counter must make the next mint scan-free; '
+            f'_iter_archive_paths called {spy.call_count}x'
+        )
+
     def test_make_id_recovery_scan_is_one_shot_then_steady_state_is_scan_free(
         self, tmp_path: Path,
     ):
