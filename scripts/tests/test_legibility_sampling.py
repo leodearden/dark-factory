@@ -1258,3 +1258,104 @@ class TestMainCLI:
         )
         assert expected == [Path('/home/leo/src/dark-factory') / 'data/orchestrator/agent-transcripts']
         assert captured[0]['agent_transcript_roots'] == expected
+
+
+class TestFormatSampleSummaryLine:
+    """``format_sample_summary_line`` is the ONE greppable accounting line,
+    shared by this module's CLI stderr block and the nightly trickle's
+    journal INFO line (task 3270).
+
+    One source for both, so the diagnostic an operator runs by hand and the
+    line the systemd timer writes to the journal can never disagree about
+    what the budget was spent on — the drift that let a budget-suppressed
+    night look exactly like a genuine no-change night for 14 nights.
+    """
+
+    def _result(self):
+        """Every field a DISTINCT non-zero value, so a field wired to the
+        wrong attribute is caught (an all-zeros fixture would not be)."""
+        return mod.SampleResult(
+            selected=[
+                _scored('sess-a', 'recon', mod.SignalCounts(tool_error=5), 'text a'),
+                _scored('sess-b', 'interactive', mod.SignalCounts(not_found=3), 'text b'),
+            ],
+            per_stratum_counts={'recon': 1, 'interactive': 1},
+            zero_signal_dropped=3,
+            bytes_used=6,
+            dedupe_collapsed=4,
+            budget_skipped=5,
+            total_records=11,
+        )
+
+    def test_carries_every_field_in_stable_key_value_form(self):
+        line = mod.format_sample_summary_line(self._result(), max_bytes=7)
+        assert 'enumerated=11' in line
+        assert 'zero_signal_dropped=3' in line
+        assert 'dedupe_collapsed=4' in line
+        assert 'budget_skipped=5' in line
+        assert 'selected=2' in line
+        assert 'bytes_used=6/7' in line
+
+    def test_is_a_single_line_an_operator_can_grep(self):
+        # It is what `journalctl | grep` and a `grep` over the CLI's stderr
+        # both have to return as ONE unit, so it must carry no newline of
+        # its own (callers own their prefix and their line terminator).
+        line = mod.format_sample_summary_line(self._result(), max_bytes=7)
+        assert '\n' not in line
+        assert line == line.strip()
+
+    def test_main_stderr_carries_that_exact_line_verbatim(self, tmp_path, capsys, monkeypatch):
+        """The CLI's summary block and the shared formatter are ONE source.
+
+        Spies on the real sampler rather than replacing it, so the line is
+        asserted against the numbers a genuine two-session run produced.
+        """
+        projects_root = tmp_path / 'projects'
+        main_dir = projects_root / '-home-leo-src-dark-factory'
+        for session_id, first_turn in (
+            ('sess-1', 'Please help with X'), ('sess-2', 'Please help with Y'),
+        ):
+            _write_full_session(
+                main_dir, session_id, MAIN_CWD, '2026-07-13T09:00:00.000Z',
+                first_turn, include_tool_error=True,
+            )
+
+        config_path = tmp_path / 'legibility.yaml'
+        config_path.write_text(textwrap.dedent(f"""\
+            project_id: dark_factory
+            project_root: /home/leo/src/dark-factory
+            escalation_port: 8103
+            cwd_prefixes: [{MAIN_CWD}]
+            budgets: {{max_daily_digest_bytes: 300000}}
+            sampling: {{top_fraction: 0.12, per_stratum_min: 2}}
+            """))
+
+        seen = []
+        real_sample = mod.stratified_sample
+
+        def spy_stratified_sample(records, config, *, cost_fn=None):
+            result = real_sample(records, config, cost_fn=cost_fn)
+            seen.append((result, config.budgets.max_daily_digest_bytes))
+            return result
+
+        monkeypatch.setattr(mod, 'stratified_sample', spy_stratified_sample)
+
+        ret = mod.main([
+            '--config', str(config_path),
+            '--projects-root', str(projects_root),
+            '--date', '2026-07-13',
+        ])
+        assert ret == 0
+        assert len(seen) == 1
+
+        result, max_bytes = seen[0]
+        expected = mod.format_sample_summary_line(result, max_bytes=max_bytes)
+        err_lines = capsys.readouterr().err.splitlines()
+        assert expected in err_lines, (
+            'the CLI must emit the shared summary line verbatim, on its own line'
+        )
+        # Real numbers, not a zeros template: both fixture sessions were
+        # enumerated and both were affordable.
+        assert 'enumerated=2' in expected
+        assert 'selected=2' in expected
+        assert 'budget_skipped=0' in expected
