@@ -676,31 +676,77 @@ class TestReadyToMergeDispatch:
     submit beats a re-looping dependency report).
     """
 
-    async def test_both_sites_have_the_same_exit_chain(self):
-        """The SIMPLE_TASK escape hatch reuses the same artifacts, so its exit
-        chain must stay in lockstep with the architect path's — including
-        ready_to_merge's slot between already_done and blocking_dependency.
+    async def _drive(
+        self, tmp_path: Path, *, site: str, with_already_done: bool,
+    ) -> tuple[AsyncMock, AsyncMock, WorkflowOutcome]:
+        """Drive the REAL dispatch site with exit artifacts a stub agent wrote.
 
-        Structural at BOTH sites: each dispatch sits behind a live agent
-        invocation, so the cheap, non-flaky check is that the artifact reads
-        appear in the same order in both — the handler's own behaviour is
-        covered exhaustively above, and run()'s honouring of its terminal
-        outcome below.
+        Both handlers are stubbed, so what is observed is purely which branch
+        of the live exit chain fired — not either handler's behaviour (covered
+        exhaustively above).
         """
-        import inspect
+        from shared.cli_invoke import AgentResult
 
-        from orchestrator import workflow as wf_mod
+        f = _make(tmp_path=tmp_path)
+        worktree = f.wf.worktree
+        assert worktree is not None
 
-        for fn in (wf_mod.TaskWorkflow._plan, wf_mod.TaskWorkflow._run_simple_task):
-            src = inspect.getsource(fn)
-            order = [
-                src.index(f'read_{name}()')
-                for name in (
-                    'unactionable_task', 'false_premise', 'already_done',
-                    'ready_to_merge', 'blocking_dependency',
-                )
-            ]
-            assert order == sorted(order), f'{fn.__name__} exit chain out of order'
+        already_done = AsyncMock(return_value=WorkflowOutcome.DONE)
+        ready_to_merge = AsyncMock(return_value=WorkflowOutcome.BLOCKED)
+        f.wf._handle_already_done_report = already_done  # type: ignore[method-assign]
+        f.wf._handle_ready_to_merge_report = ready_to_merge  # type: ignore[method-assign]
+
+        def _invoke_writes_the_exits(*args, **kwargs):
+            if with_already_done:
+                f.artifacts.write_already_done(commit=_MAIN, evidence='on main')
+            f.artifacts.write_ready_to_merge(commit=_TIP, evidence='ev')
+            return AgentResult(success=True, output='', cost_usd=0.5, turns=3)
+
+        f.wf._invoke = AsyncMock(side_effect=_invoke_writes_the_exits)  # type: ignore[method-assign]
+
+        if site == 'architect':
+            f.wf.briefing.build_architect_prompt = AsyncMock(return_value='P')
+            # No plan.json / plan.lock / _old_plan_base ⇒ revalidation skipped.
+            (worktree / 'plan.json').unlink(missing_ok=True)
+            (worktree / 'plan.lock').unlink(missing_ok=True)
+            if hasattr(f.wf, '_old_plan_base'):
+                del f.wf._old_plan_base
+            outcome = await f.wf._plan()
+        else:
+            f.wf.briefing.build_simple_task_prompt = AsyncMock(return_value='P')
+            outcome = await f.wf._run_simple_task()
+        return already_done, ready_to_merge, outcome
+
+    @pytest.mark.parametrize('site', ['architect', 'simple'])
+    async def test_already_done_wins_when_both_artifacts_are_written(
+        self, tmp_path: Path, site: str,
+    ):
+        """ready_to_merge sits AFTER already_done, so a co-present clean DONE
+        wins — landing on main is more decisive than submitting a merge for a
+        branch, and honouring ready_to_merge first would queue a merge for work
+        that is already there."""
+        already_done, ready_to_merge, outcome = await self._drive(
+            tmp_path, site=site, with_already_done=True,
+        )
+
+        already_done.assert_awaited_once()
+        ready_to_merge.assert_not_called()
+        assert outcome == WorkflowOutcome.DONE
+
+    @pytest.mark.parametrize('site', ['architect', 'simple'])
+    async def test_ready_to_merge_alone_routes_to_its_handler(
+        self, tmp_path: Path, site: str,
+    ):
+        """The other branch of the same ordering: with no already_done to lose
+        to, ready_to_merge is honoured at BOTH sites — the SIMPLE_TASK escape
+        hatch reuses the same artifacts, so its chain must stay in lockstep."""
+        already_done, ready_to_merge, outcome = await self._drive(
+            tmp_path, site=site, with_already_done=False,
+        )
+
+        ready_to_merge.assert_awaited_once()
+        already_done.assert_not_called()
+        assert outcome == WorkflowOutcome.BLOCKED
 
     async def test_run_does_not_enter_execute_or_double_enqueue(
         self, tmp_path: Path,
