@@ -420,6 +420,22 @@ def tick() -> None:
         save_state(state)
         return
 
+    # Failed probe. Advance the streak and persist it — the next tick is a
+    # different PROCESS, so this write is the only thing that carries the
+    # count forward.
+    state["streak"] += 1
+    save_state(state)
+
+    if state["streak"] < FAIL_STREAK:
+        # §Contract "hysteresis". Below the gate nothing is actuated: this is
+        # precisely where the retired inline shell restarted, and where the
+        # 2026-07-30 storm began.
+        logger.warning(
+            f"{DASHBOARD_UNIT} probe failed ({state['streak']}/{FAIL_STREAK} "
+            "consecutive); below the streak gate, taking no action"
+        )
+        return
+
 
 def main() -> int:
     """Entry point for the oneshot unit."""
