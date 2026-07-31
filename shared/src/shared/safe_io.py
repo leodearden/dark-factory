@@ -205,7 +205,11 @@ def atomic_write_text(
         (typically 0664).  Silently narrowing the latter to 0600 would be a
         latent cross-uid breakage for the state files other processes read.
     fsync:
-        Reserved — see later steps.
+        When True, fsync the temp file before the rename AND the containing
+        directory after it.  Default False, because plain tmp+rename already
+        guarantees the rename is *atomic*; the fsyncs additionally make it
+        *durable* across a crash immediately after this call returns, which
+        only ``landed_outbox`` requires.
     mkdir:
         When True, create ``path.parent`` (and any missing ancestors) before
         writing.  Default False, so a missing parent surfaces as
@@ -226,6 +230,13 @@ def atomic_write_text(
     try:
         with os.fdopen(fd, 'w', encoding=encoding) as f:
             f.write(text)
+            if fsync:
+                # Inside the `with`, so the buffered text reaches the kernel
+                # (flush) and then the platter (fsync) BEFORE the rename makes
+                # it reachable — otherwise a crash could expose a renamed but
+                # empty file.
+                f.flush()
+                os.fsync(f.fileno())
         os.replace(tmp_str, str(p))
     except BaseException:
         # BaseException, not Exception: a KeyboardInterrupt landing mid-write
@@ -236,3 +247,15 @@ def atomic_write_text(
         with contextlib.suppress(OSError):
             os.unlink(tmp_str)
         raise
+
+    if fsync:
+        # The directory entry created by the rename is a separate durability
+        # domain from the file's contents on most filesystems: without this,
+        # a crash can leave the fully-synced data unreachable because the new
+        # name was never persisted.  Must run AFTER the replace — syncing the
+        # directory beforehand would not cover the rename at all.
+        dir_fd = os.open(str(p.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
