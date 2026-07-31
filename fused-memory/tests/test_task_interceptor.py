@@ -6452,10 +6452,13 @@ class TestSubmitTaskGuardrailMultiProject:
         interceptor_with_store._prefix_registry = self._two_project_registry(tmp_path)
 
         try:
+            # Task 3120: the multi-segment spelling is deliberate — this test
+            # exercises ticket PERSISTENCE of the advisory marker, not the
+            # single-bare-segment lexer shape.
             result = await interceptor_with_store.submit_task(
                 project_root=str(tmp_path / 'reify'),
-                title='Investigate fused-memory/harness deadlock',
-                description='See fused-memory/ for context',
+                title='Investigate fused-memory/src/harness.py deadlock',
+                description='See fused-memory/src/ for context',
                 metadata={'files': ['crates/widget.rs']},
             )
         finally:
@@ -6807,6 +6810,172 @@ class TestSubmitTaskCrossRepoDeliverable:
         row = await cursor.fetchone()
         assert row[0] == 0, f'Expected 0 tickets (rejected), found {row[0]}'
         taskmaster.add_task.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Task 3120: right-boundary contract, at the USER-OBSERVABLE end
+# ---------------------------------------------------------------------------
+
+
+class TestProseRightBoundarySignal:
+    """Task 3120: the right-boundary assertion, observed end-to-end through
+    the real ``submit_task`` persistence path rather than at ``find_paths``.
+
+    Both directions are required, and the pair is the point: the negative
+    alone would be satisfied by a guard that never fires at all, and the
+    positive alone would be satisfied by the pre-3120 over-matching guard.
+    Together they pin that the narrowing removed the English-punctuation
+    false positives *without* removing genuine cross-project detection.
+    """
+
+    @staticmethod
+    def _three_project_registry(tmp_path):
+        """Reify (crates/) + dark-factory (fused-memory/) + webapp (backend/).
+
+        'backend/' must be a GENUINELY registered prefix owned by a project
+        other than the filer, otherwise the negative test below would pass
+        vacuously — an unregistered prefix is never even a candidate, so no
+        assertion about the right-boundary would be exercised.
+        """
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        (tmp_path / 'dark-factory').mkdir()
+        (tmp_path / 'dark-factory' / 'fused-memory').mkdir()
+        (tmp_path / 'webapp').mkdir()
+        (tmp_path / 'webapp' / 'backend').mkdir()
+        return ProjectPrefixRegistry.from_roots(
+            [
+                str(tmp_path / 'reify'),
+                str(tmp_path / 'dark-factory'),
+                str(tmp_path / 'webapp'),
+            ]
+        )
+
+    @pytest.mark.asyncio
+    async def test_english_slash_construction_is_not_flagged(
+        self,
+        interceptor_with_store,
+        ticket_store,
+        taskmaster,
+        tmp_path,
+    ):
+        """NEGATIVE — the measured false positive this task exists to remove.
+
+        'not a backend/timeout error' is English punctuation, not a path.
+        'backend/' IS a registered prefix owned by 'webapp' (asserted inline
+        below against the built registry, which is the anti-vacuity guard),
+        and metadata.files are all in-project, so before task 3120 this
+        submission was stamped with possible_scope_mismatch and fired a
+        scope_violation escalation. It must now do neither.
+        """
+        registry = self._three_project_registry(tmp_path)
+        interceptor_with_store._prefix_registry = registry
+
+        # Anti-vacuity: the prefix really is registered, and to another project.
+        assert registry.project_for_prefix('backend/') == 'webapp', (
+            'Expected backend/ registered to webapp; the negative assertion '
+            'below would otherwise pass vacuously'
+        )
+
+        escalator_calls: list = []
+
+        class SpyEscalator:
+            def report_rejection(self, **kwargs):
+                escalator_calls.append(kwargs)
+
+        interceptor_with_store._scope_violation_escalator = SpyEscalator()
+
+        try:
+            result = await interceptor_with_store.submit_task(
+                project_root=str(tmp_path / 'reify'),
+                title='get_memory_by_id returns found=false',
+                description=(
+                    'get_memory_by_id returned found=false, '
+                    'not a backend/timeout error'
+                ),
+                metadata={'files': ['crates/widget.rs']},
+            )
+        finally:
+            await _cancel_interceptor_workers(interceptor_with_store)
+
+        assert isinstance(result, dict)
+        assert 'error_type' not in result, f'Expected no error, got: {result}'
+        ticket_id = result.get('ticket', '')
+        assert ticket_id.startswith('tkt_'), (
+            f'Expected the ticket to still be created, got: {result}'
+        )
+
+        db = ticket_store._db
+        assert db is not None
+        cursor = await db.execute(
+            'SELECT candidate_json FROM tickets WHERE ticket_id = ?',
+            (ticket_id,),
+        )
+        row = await cursor.fetchone()
+        assert row is not None, f'Expected persisted row for {ticket_id!r}'
+
+        blob = json.loads(row['candidate_json'])
+        meta = blob.get('metadata') or {}
+        assert 'possible_scope_mismatch' not in meta, (
+            'English slash-construction must not be stamped as a scope '
+            f'mismatch: {meta!r}'
+        )
+        assert escalator_calls == [], (
+            f'Expected no scope_violation escalation, got: {escalator_calls!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_genuine_foreign_path_is_still_flagged(
+        self,
+        interceptor_with_store,
+        ticket_store,
+        taskmaster,
+        tmp_path,
+    ):
+        """POSITIVE — the retained half: a real foreign path still stamps.
+
+        The narrowing must not be a silent disabling of the guard. A genuine
+        multi-segment citation of another project's tree still produces the
+        advisory marker with the correct routing.
+        """
+        interceptor_with_store._prefix_registry = self._three_project_registry(tmp_path)
+
+        try:
+            result = await interceptor_with_store.submit_task(
+                project_root=str(tmp_path / 'dark-factory'),
+                title='Port the engine edit path',
+                description='Mirror the logic in crates/reify-eval/src/engine_edit.rs',
+                metadata={'files': ['fused-memory/src/x.py']},
+            )
+        finally:
+            await _cancel_interceptor_workers(interceptor_with_store)
+
+        assert isinstance(result, dict)
+        assert 'error_type' not in result, f'Expected no error, got: {result}'
+        ticket_id = result.get('ticket', '')
+        assert ticket_id.startswith('tkt_'), f'Expected tkt_-prefixed ticket, got: {result}'
+
+        db = ticket_store._db
+        assert db is not None
+        cursor = await db.execute(
+            'SELECT candidate_json FROM tickets WHERE ticket_id = ?',
+            (ticket_id,),
+        )
+        row = await cursor.fetchone()
+        assert row is not None, f'Expected persisted row for {ticket_id!r}'
+
+        blob = json.loads(row['candidate_json'])
+        meta = blob.get('metadata') or {}
+        marker = meta.get('possible_scope_mismatch')
+        assert marker is not None, (
+            f'Expected possible_scope_mismatch to STILL fire: {blob!r}'
+        )
+        assert marker['matched_paths'] == ['crates/']
+        assert marker['suggested_project'] == 'reify'
 
 
 # ---------------------------------------------------------------------------
@@ -7436,8 +7605,11 @@ class TestPathGuardCheckProseOnly:
         )
         interceptor._prefix_registry = registry
 
+        # Task 3120: the multi-segment spelling is deliberate — this test
+        # exercises the prose-vs-files ROUTING split, not the
+        # single-bare-segment lexer shape.
         candidate = CandidateTask(
-            title='Edit fused-memory/X',
+            title='Edit fused-memory/src/x.py',
             description='',
             details='',
             files_to_modify=[],
@@ -7489,9 +7661,12 @@ class TestPathGuardOrSkipProseAdvisory:
         fake_adjudicator.adjudicate = AsyncMock()
         interceptor._path_scope_adjudicator = fake_adjudicator
 
+        # Task 3120: the multi-segment spelling is deliberate — this test
+        # exercises the ADVISORY/escalation machinery, not the
+        # single-bare-segment lexer shape.
         kwargs: dict[str, Any] = {
-            'title': 'Investigate fused-memory/harness deadlock',
-            'description': 'See fused-memory/ for context',
+            'title': 'Investigate fused-memory/src/harness.py deadlock',
+            'description': 'See fused-memory/src/ for context',
         }
         result = await interceptor._path_guard_or_skip(
             kwargs,
@@ -7541,10 +7716,13 @@ class TestPathGuardOrSkipProseAdvisory:
 
         interceptor._scope_violation_escalator = SpyEscalator()
 
+        # Task 3120: the multi-segment spelling is deliberate — this test
+        # exercises the ADVISORY flag passed to the escalator, not the
+        # single-bare-segment lexer shape.
         result = await interceptor._path_guard_or_skip(
             {
-                'title': 'Investigate fused-memory/harness deadlock',
-                'description': 'See fused-memory/ for context',
+                'title': 'Investigate fused-memory/src/harness.py deadlock',
+                'description': 'See fused-memory/src/ for context',
             },
             str(tmp_path / 'reify'),
             'reify',
@@ -8014,9 +8192,12 @@ class TestPathGuardEscalationWordingEndToEnd:
         interceptor._prefix_registry = self._registry(tmp_path)
         interceptor._scope_violation_escalator = ScopeViolationEscalator()
 
+        # Task 3120: the multi-segment spelling is deliberate — this test
+        # exercises the persisted advisory WORDING, not the
+        # single-bare-segment lexer shape.
         kwargs: dict[str, Any] = {
-            'title': 'Investigate fused-memory/harness deadlock',
-            'description': 'See fused-memory/ for context',
+            'title': 'Investigate fused-memory/src/harness.py deadlock',
+            'description': 'See fused-memory/src/ for context',
         }
         result = await interceptor._path_guard_or_skip(
             kwargs,

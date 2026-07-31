@@ -5,8 +5,12 @@ re-export shim module was retired in task 2208 / PRD D2) to a per-project
 prefix registry built from configured ``known_project_roots``.
 
 A candidate is rejected when its title / description / details / files
-mention a path prefix owned by a project other than the one being filed
-into.  The verdict's ``suggested_project`` field carries the owning
+cite a path prefix owned by a project other than the one being filed
+into.  "Cite" is two-sided (task 3120): the prefix must sit at a left word
+boundary AND be followed by something that looks like a path segment, so a
+bare MENTION ("see ``fused-memory/``") or an English slash-construction
+("not a ``backend/``timeout error") is not a hit.  The verdict's
+``suggested_project`` field carries the owning
 project_id of the first mismatched prefix so the caller can resubmit (or
 the LLM can re-route under the multi-project Stage 2 prompt).
 
@@ -36,15 +40,29 @@ if TYPE_CHECKING:
 
 _PATTERN_CACHE: dict[tuple[str, ...], re.Pattern[str]] = {}
 
+# One path segment: the chars that may legally appear in a single path
+# component (no '/').  Used only inside the right-context lookahead.
+_SEG: str = r'[A-Za-z0-9_.\-]+'
+
+# Right-context assertion (task 3120): the token after '<prefix>/' must
+# look like a path segment — either another '/' follows, or it carries a
+# file extension.  NOTE: the interval quantifier is written {{1,6}} here
+# because this is an f-string; braces in the RENDERED value are not
+# re-processed when it is interpolated into _build_pattern below.
+_RIGHT_CONTEXT: str = rf'(?={_SEG}/|[A-Za-z0-9_\-]*\.[A-Za-z0-9]{{1,6}}(?![A-Za-z0-9]))'
+
 
 def _build_pattern(prefixes: tuple[str, ...]) -> re.Pattern[str]:
     """Build (and cache) a compiled regex for the given prefix tuple.
 
-    Each prefix is anchored by a leading word boundary: start-of-string OR
-    a character that is NOT ``[A-Za-z0-9_\\-/.]``.  This means a prefix
-    matches ONLY as a *leading* path component — at start-of-string or after
-    whitespace, punctuation, quotes, colons, etc. — but NOT when preceded by a
-    path separator (``/``) or a dot (``.``).
+    Each prefix is anchored on BOTH sides: a left word boundary, and a right
+    context that must look like a path segment.
+
+    LEFT boundary — start-of-string OR a character that is NOT
+    ``[A-Za-z0-9_\\-/.]``.  This means a prefix matches ONLY as a *leading*
+    path component — at start-of-string or after whitespace, punctuation,
+    quotes, colons, etc. — but NOT when preceded by a path separator (``/``)
+    or a dot (``.``).
 
     Excluding ``/`` and ``.`` from the boundary class ensures that mid-path
     occurrences like ``vendor/corpus/expr.txt`` or ``x.corpus/foo`` do NOT
@@ -54,14 +72,63 @@ def _build_pattern(prefixes: tuple[str, ...]) -> re.Pattern[str]:
     Note: ``\\-`` is kept escaped (literal hyphen, no range); ``/`` and ``.``
     are plain literals inside the class.
 
+    RIGHT boundary (task 3120) — the token following ``<prefix>/`` must look
+    like a path segment: either another ``/`` follows (``crates/reify/src.rs``)
+    or the token carries a file extension (``gui/package.json``).  Without
+    this, any English slash-construction whose left half happens to name a
+    registered top-level directory lexed as a path — "not a ``backend/``
+    timeout error", "``tools/``call", "``archive/``pause".
+
+    A bare trailing ``<prefix>/`` at end-of-token deliberately does NOT match,
+    because that is the bare-MENTION class ("see ``fused-memory/``", "the
+    'corpus/' dir") and admitting it would re-admit almost all of the noise
+    this assertion exists to remove.  For the ``submit_task`` path this loses
+    no real protection: the interceptor classifies ``metadata.files`` through
+    the FILES-certain check (:func:`check_files_for_scope` ->
+    ``registry.project_for_path``), which still hard-rejects a genuinely
+    DECLARED foreign file and is untouched by this change.
+
+    That backstop is specific to that path, and the guarantee is NOT blanket:
+    :func:`check_candidate_for_scope` folds ``files_to_modify`` into this same
+    prose scan with no certain-check fallback, so a declared *directory* entry
+    (``files_to_modify=['fused-memory/src']``) now goes undetected there —
+    measured: that call returns ``ok`` where :func:`check_files_for_scope`
+    returns ``rejection``.  Harmless today because that function has no
+    production caller (the interceptor imports only ``check_files_for_scope``
+    and ``check_text_for_scope``), but any future caller must route concrete
+    file entries through :func:`check_files_for_scope` rather than rely on
+    this heuristic scan.
+
+    KNOWN FAIL-OPEN residue, deliberately not closed (each is pinned by a
+    test so the gap stays visible rather than implied covered):
+
+    - extensionless right context — ``<prefix>/<dir>`` and extensionless
+      filenames (``fused-memory/src``, ``crates/reify-eval``,
+      ``crates/README``) satisfy neither alternative.  This is the LARGEST
+      miss class, since bare directory references are a common prose
+      spelling; it is accepted anyway because admitting it would mean
+      accepting any ``<word>/<word>``, which is exactly the English-
+      punctuation shape this assertion exists to reject;
+    - extensions longer than 6 chars (the ``{1,6}`` cap) — ``docs/.gitignore``,
+      ``crates/x.markdown``, ``crates/x.properties`` fail the extension
+      alternative.  The mechanism is the LENGTH cap, NOT the leading dot: a
+      short-extension dotfile such as ``docs/.env`` still matches;
+    - glob spellings — the metacharacter in ``plans/*.md`` is in neither the
+      segment class nor the extension class.
+
+    All three are MISSED detections, never false ones — the same conservative
+    direction ``project_prefix_registry`` already takes for
+    ``../other-repo/x.py`` and ``~user/...``.  Widening the character classes
+    to admit them would start re-admitting the punctuation shapes above.
+
     Cache note: ``_PATTERN_CACHE`` is keyed by the prefix tuple; the boundary
-    class is a compile-time constant (not a runtime variable), so no cache
-    invalidation or versioning is needed when the pattern template changes —
-    only new prefixes cause a new compile.
+    class and the right-context assertion are both compile-time constants
+    (not runtime variables), so no cache invalidation or versioning is needed
+    when the pattern template changes — only new prefixes cause a new compile.
     """
     if prefixes not in _PATTERN_CACHE:
         alts = '|'.join(re.escape(p) for p in prefixes)
-        pattern = re.compile(rf'(?:^|(?<=[^A-Za-z0-9_\-/.]))({alts})')
+        pattern = re.compile(rf'(?:^|(?<=[^A-Za-z0-9_\-/.]))({alts}){_RIGHT_CONTEXT}')
         _PATTERN_CACHE[prefixes] = pattern
     return _PATTERN_CACHE[prefixes]
 
@@ -226,6 +293,15 @@ def check_candidate_for_scope(
     Scans ``title``, ``description``, ``details``, and
     ``files_to_modify``.  Returns ``ok`` when the registry is empty, when
     no prefixes match, or when every match is owned by ``project_id``.
+
+    CAVEAT (task 3120): ``files_to_modify`` entries are folded into the same
+    heuristic prose scan as the free text, so they inherit :func:`find_paths`'
+    right-boundary requirement — a declared *directory* entry such as
+    ``['fused-memory/src']`` is NOT detected here, and unlike the
+    interceptor's ``submit_task`` path there is no FILES-certain backstop
+    behind this function.  A caller that needs concrete file entries
+    classified with certainty must call :func:`check_files_for_scope` on them
+    as well; this function alone is a heuristic.
     """
     if not registry:
         return PathGuardVerdict(outcome='ok', project_id=project_id)
