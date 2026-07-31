@@ -188,6 +188,21 @@ class RegistryError(ValueError):
     """
 
 
+class EmptySelectionError(ValueError):
+    """No registry entry matched the requested ``--project-id`` selection.
+
+    The same hazard :class:`RegistryError` guards, entered by a different door:
+    a mistyped project id selects nothing, every metric family measures zero
+    topics, and the run emits an artifact whose ``metrics`` list is empty. That
+    artifact is not inert — the evaluator joins runs by ``metric_id`` and simply
+    stops trending the seven pinned metrics, and :func:`is_initial_run` counts
+    the file, permanently suppressing the D1 initial-state snapshot for the next
+    genuine first run. So the selection miss aborts BEFORE emission, exactly as
+    a failed registry load does, and the message names both what was asked for
+    and what the registry actually carries.
+    """
+
+
 @dataclass(frozen=True)
 class Canonical:
     """The entry a topic's queries are expected to return.
@@ -2205,6 +2220,19 @@ async def run_probe(
     probed = tuple(e for e in registry.entries if e.project_id in wanted)
     skipped = tuple(e.topic for e in registry.entries if e.project_id not in wanted)
 
+    # Before any store access, and before any artifact: a selection that matched
+    # nothing would otherwise emit `"metrics": []` and exit 0 — silence the
+    # evaluator cannot distinguish from a clean run, and a file is_initial_run
+    # counts. Same abort as a failed registry load, different door in.
+    if registry.entries and not probed:
+        available = sorted({e.project_id for e in registry.entries})
+        raise EmptySelectionError(
+            f'no topic registry entry matches project_id(s) {list(selected)!r}; '
+            f'the registry carries {available!r} across {len(registry.entries)} '
+            'entries. Emitting nothing: an artifact with zero metrics is '
+            'indistinguishable downstream from a healthy run.',
+        )
+
     observations = ProbeObservations()
     for entry in probed:
         async def search(query: str, limit: int, _project_id: str = entry.project_id):
@@ -2376,6 +2404,9 @@ async def _run(args: argparse.Namespace) -> int:
             ks=tuple(args.k),
             out_root=args.out_root,
         )
+    except EmptySelectionError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     finally:
         await memory.close()
 

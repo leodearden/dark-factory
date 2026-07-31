@@ -1960,13 +1960,15 @@ class TestDegradedSearchDisclosure:
 # either would put the limits in two places.
 # ---------------------------------------------------------------------------
 
-FORBIDDEN_REPORT_WORDS = ('alarm', 'threshold', 'grandfather', 'verdict', 'tolerance')
-"""Words whose presence would mean this runner had started adjudicating.
-
-Not stylistic. The moment a report says a run "passed a threshold" there are
-two homes for that judgement — this script and leaf alpha's evaluator — and
-they will disagree the first time one of them changes.
-"""
+# The "this runner adjudicates nothing" invariant is STRUCTURAL and is pinned
+# structurally: `test_it_carries_exactly_the_seven_metric_ids_this_leaf_owns`
+# fixes the emitted vocabulary by equality, and
+# `test_the_pinned_metric_set_is_a_superset_on_every_run` holds it across every
+# --k. A banned-substring sweep over report prose was tried here and removed:
+# it constrained wording rather than behaviour (it would have failed the very
+# sentence "limits are set by leaf alpha, not here", which DISCLAIMS
+# adjudication) while a report computing a pass rate under any other name would
+# have sailed through it. Do not reintroduce it as a tightened list or a regex.
 
 
 def _report_observations():
@@ -2061,15 +2063,6 @@ class TestProbeReport:
         report = _mod().render_probe_report(_report_series(), _report_observations())
 
         assert 'initial state' not in report.lower()
-
-    @pytest.mark.parametrize('word', FORBIDDEN_REPORT_WORDS)
-    def test_the_report_adjudicates_nothing(self, word):
-        """(c) D1/G6: limits, ratchets and verdicts all live in other leaves."""
-        for initial in (True, False):
-            report = _mod().render_probe_report(
-                _report_series(), _report_observations(), is_initial_run=initial,
-            )
-            assert word not in report.lower()
 
     def test_the_report_carries_the_matched_by_breakdown(self):
         """(d) step-7's dual matcher, made visible."""
@@ -2626,6 +2619,99 @@ class TestRegistryLoadFailureIsFatal:
         assert not double.initialized
 
 
+class TestEmptyProjectSelectionIsFatal:
+    """(d) The same hazard as an unloadable registry, entered via --project-id.
+
+    A mistyped project id selects no entry, so every metric family measures
+    nothing and the run would emit ``"metrics": []`` at exit 0. Downstream that
+    is not inert: leaf alpha's evaluator joins by metric_id and would simply
+    stop trending the seven pinned metrics, and the junk file counts for
+    `is_initial_run`, permanently suppressing the D1 initial-state snapshot for
+    the next genuine first run. So it aborts before emission, like a bad load.
+    """
+
+    def _registry_file(self, tmp_path):
+        registry = _probe_registry()
+        path = tmp_path / 'registry.json'
+        path.write_text(json.dumps(_as_payload(registry)), encoding='utf-8')
+        return registry, path
+
+    def test_run_probe_raises_rather_than_measuring_nothing(self, tmp_path):
+        import asyncio  # noqa: PLC0415
+
+        m = _mod()
+        registry = _probe_registry()
+
+        with pytest.raises(m.EmptySelectionError):
+            asyncio.run(m.run_probe(
+                _ServiceDouble(), registry,
+                project_ids=('typo_project',),
+                ks=m.DEFAULT_KS,
+                out_root=tmp_path,
+            ))
+
+    def test_the_message_names_what_was_asked_and_what_exists(self, tmp_path):
+        import asyncio  # noqa: PLC0415
+
+        m = _mod()
+
+        with pytest.raises(m.EmptySelectionError) as excinfo:
+            asyncio.run(m.run_probe(
+                _ServiceDouble(), _probe_registry(),
+                project_ids=('typo_project',),
+                ks=m.DEFAULT_KS,
+                out_root=tmp_path,
+            ))
+
+        message = str(excinfo.value)
+        assert 'typo_project' in message
+        assert 'dark_factory' in message
+
+    def test_an_unmatched_project_id_exits_non_zero(self, monkeypatch, tmp_path, capsys):
+        m = _mod()
+        _, path = self._registry_file(tmp_path)
+        _install_double(monkeypatch, _ServiceDouble())
+
+        code = m.main([
+            '--registry', str(path), '--out-root', str(tmp_path / 'out'),
+            '--project-id', 'typo_project',
+        ])
+
+        assert code != 0
+        assert 'typo_project' in capsys.readouterr().err
+
+    def test_an_unmatched_project_id_emits_no_artifact(self, monkeypatch, tmp_path):
+        """The junk artifact would suppress the D1 snapshot forever."""
+        m = _mod()
+        _, path = self._registry_file(tmp_path)
+        _install_double(monkeypatch, _ServiceDouble())
+        out_root = tmp_path / 'out'
+
+        code = m.main([
+            '--registry', str(path), '--out-root', str(out_root),
+            '--project-id', 'typo_project',
+        ])
+
+        assert code != 0
+        assert not list(out_root.rglob('metrics-*.json'))
+        assert m.is_initial_run(out_root), 'the next genuine run is still the first'
+
+    def test_a_matching_project_id_still_runs(self, monkeypatch, tmp_path):
+        """The guard fires on an EMPTY selection only — not on any selection."""
+        m = _mod()
+        registry, path = self._registry_file(tmp_path)
+        _install_double(monkeypatch, _ServiceDouble(by_query=_canned_hits(registry)))
+        out_root = tmp_path / 'out'
+
+        code = m.main([
+            '--registry', str(path), '--out-root', str(out_root),
+            '--project-id', 'dark_factory',
+        ])
+
+        assert code == 0
+        assert list(out_root.rglob('metrics-*.json'))
+
+
 class TestRunStampOverride:
     """(e) MEMORY_EVAL_RUN_STAMP gives deterministic filenames, no frozen clock."""
 
@@ -2809,20 +2895,37 @@ class TestSeededInducedRegression:
     """Delete the canonical; the tripwire item must flip. That is the signal."""
 
     def test_the_ephemeral_collection_is_one_the_reaper_can_reclaim(
-        self, clean_probe_collection,
+        self, monkeypatch, probe_config, probe_project_id,
     ):
-        """A leaked collection under the default prefix would live forever."""
+        """A leaked collection under the default prefix would live forever.
+
+        Deliberately NOT via ``clean_probe_collection``: that fixture opens a
+        real ``QdrantClient``, and this assertion is about a NAME. Taking the
+        fixture would have dragged the one pure test in this class onto the
+        network — two 10s timeouts on a machine with no Qdrant — contradicting
+        this module's docstring and the merge lane's ``-m 'not integration'``
+        selection. ``mem0_collection_name`` is pure, so ask it directly.
+        """
         import importlib.util as _ilu  # noqa: PLC0415
         import sys as _sys  # noqa: PLC0415
+
+        from fused_memory.models.scope import Scope  # noqa: PLC0415
+
+        collection = Scope(project_id=probe_project_id).mem0_collection_name(
+            probe_config.mem0.collection_prefix,
+        )
 
         path = SCRIPT_PATH.parent / 'cleanup_test_collections.py'
         spec = _ilu.spec_from_file_location('cleanup_test_collections', path)
         assert spec is not None and spec.loader is not None
         cleanup = _ilu.module_from_spec(spec)
-        _sys.modules['cleanup_test_collections'] = cleanup
+        # setitem, not a bare assignment: exec_module needs the module visible
+        # in sys.modules, but leaving it there leaks into the rest of the
+        # session. monkeypatch undoes it at teardown.
+        monkeypatch.setitem(_sys.modules, 'cleanup_test_collections', cleanup)
         spec.loader.exec_module(cleanup)
 
-        assert clean_probe_collection.startswith(cleanup.PREFIX)
+        assert collection.startswith(cleanup.PREFIX)
 
     @pytest.mark.integration
     @pytest.mark.timeout(300)
