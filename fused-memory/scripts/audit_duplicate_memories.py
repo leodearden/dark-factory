@@ -134,6 +134,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from fused_memory.reconciliation.task_filter import (
+    LIVE_TASK_STATUS_RE,
+    POINT_IN_TIME_CHECK_RE,
+    TASK_REF_RE,
+)
+
 logger = logging.getLogger('audit_duplicate_memories')
 
 
