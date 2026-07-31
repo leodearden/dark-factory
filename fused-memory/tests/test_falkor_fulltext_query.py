@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, cast
 import pytest
 from graphiti_core.driver.falkordb_driver import STOPWORDS, FalkorDriver
 from graphiti_core.search import search_utils
+from graphiti_core.search.search_filters import SearchFilters
 
 from fused_memory.backends import graphiti_client
 from fused_memory.backends.falkor_fulltext import (
@@ -430,6 +431,14 @@ EMPTY_TERM_CORPUS: list[str] = [
 ]
 
 
+class _QueryIssued(Exception):
+    """Raised by the recording driver the instant a query reaches the database.
+
+    Makes "a query was issued" observable in BOTH directions: the negative test
+    asserts it never fires, the positive control asserts it does.
+    """
+
+
 class TestEmptyTermListShortCircuits:
     """The second failure mode: an empty operand group ``()`` is also unparseable.
 
@@ -438,6 +447,24 @@ class TestEmptyTermListShortCircuits:
     ``(@group_id:"dark_factory") ()`` and RediSearch rejects that too.  So the
     repair has to short-circuit, not merely filter.
     """
+
+    @staticmethod
+    def _recording_driver() -> tuple[_MultiTenantFalkorDriver, list[str]]:
+        """A hardened driver that records-and-raises instead of querying.
+
+        Returns the driver and the list its query method appends the built
+        RediSearch query to.  No connection is opened and nothing is stubbed
+        except ``execute_query``, so the assembly path under test is the real one.
+        """
+        driver = object.__new__(_MultiTenantFalkorDriver)
+        issued: list[str] = []
+
+        async def _record(*_args: object, **kwargs: object):
+            issued.append(cast('str', kwargs.get('query')))
+            raise _QueryIssued
+
+        driver.execute_query = _record  # pyright: ignore[reportAttributeAccessIssue]
+        return driver, issued
 
     @pytest.mark.parametrize('text', EMPTY_TERM_CORPUS)
     def test_empty_term_list_returns_the_no_query_sentinel(self, text: str) -> None:
@@ -461,23 +488,62 @@ class TestEmptyTermListShortCircuits:
             result = build_query(text, group_ids, 128)
             assert '()' not in result, f'empty operand group for {text!r}: {result!r}'
 
-    def test_empty_string_is_graphitis_documented_no_query_sentinel(self) -> None:
-        """Pin the CALLER contract this short-circuit depends on.
+    @pytest.mark.asyncio
+    async def test_empty_query_short_circuits_before_any_query_is_issued(self) -> None:
+        """Pin the CALLER contract this short-circuit depends on, BEHAVIOURALLY.
 
         Returning ``''`` is only safe because graphiti already treats it as "no
-        query" — upstream's own over-length guard returns ``''``, and
-        ``node_fulltext_search`` short-circuits on it before touching the driver.
+        query": ``node_fulltext_search`` bails out with ``[]`` *before* touching
+        the driver.  This drives that real caller and observes the outcome, so a
+        graphiti-core upgrade that drops the sentinel fails loudly HERE — rather
+        than silently turning every all-stopword episode into a malformed (or
+        unfiltered) search.
 
-        Asserting it against live source means a graphiti-core upgrade that drops
-        the sentinel fails loudly HERE, instead of silently turning every
-        all-stopword episode into an unfiltered or malformed search.
+        Deliberately behavioural, not a source grep: matching the literal text
+        ``fuzzy_query == ''`` in upstream's source would false-FAIL on a harmless
+        refactor to ``if not fuzzy_query:`` and false-PASS if the substring
+        survived somewhere the short-circuit no longer runs.
+
+        No connection is opened.  ``provider`` and ``search_interface`` are class
+        attributes (measured: ``GraphProvider.FALKORDB`` and ``None``), so
+        ``object.__new__`` is enough for ``fulltext_query()`` to route through our
+        hardened ``build_fulltext_query`` and for the non-``search_interface``
+        branch to execute.
         """
-        source = inspect.getsource(search_utils.node_fulltext_search)
-        assert "fuzzy_query == ''" in source, (
-            'graphiti-core no longer short-circuits on the empty-query sentinel; '
-            'build_query returning \'\' is no longer safe — re-verify the caller '
-            'contract before shipping.'
+        driver, issued = self._recording_driver()
+
+        result = await search_utils.node_fulltext_search(
+            driver, 'the and of', SearchFilters(), ['dark_factory']
         )
+
+        assert result == []
+        assert issued == [], (
+            'graphiti-core issued a query for content that builds to the empty '
+            "sentinel; build_query returning '' is no longer safe — re-verify "
+            'the caller contract before shipping.'
+        )
+
+    @pytest.mark.asyncio
+    async def test_positive_control_searchable_content_does_reach_query_issuance(
+        self,
+    ) -> None:
+        """Mandatory control: without it the negative assertion above is vacuous.
+
+        "``execute_query`` was not called" is satisfied just as well by a
+        mis-stubbed driver, an import-time change, or an early raise that never
+        reaches the short-circuit at all.  Proving the *same* driver DOES reach
+        query issuance for searchable content is what makes the zero-call
+        assertion mean "the sentinel short-circuited" rather than "nothing ran".
+        """
+        driver, issued = self._recording_driver()
+
+        with pytest.raises(_QueryIssued):
+            await search_utils.node_fulltext_search(
+                driver, 'note RediSearch 3334', SearchFilters(), ['dark_factory']
+            )
+
+        assert len(issued) == 1
+        assert issued[0] == '(@group_id:"dark_factory") (note | RediSearch | 3334)'
 
     def test_upstream_by_contrast_emits_the_unparseable_empty_group(self) -> None:
         """Baseline proving the short-circuit is load-bearing, not decorative.
