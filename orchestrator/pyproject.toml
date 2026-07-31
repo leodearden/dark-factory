@@ -30,7 +30,9 @@ orchestrator = "orchestrator.cli:main"
 
 [tool.pyright]
 include = ["src", "tests"]
-extraPaths = ["src", "tests", "../shared/src", "../escalation/src", "../fused-memory/src"]
+# ".." LAST (mirrors tests/conftest.py's sys.path.append): resolves the repo-root
+# df_pytest_isolation module without letting project dirs shadow their own src/.
+extraPaths = ["src", "tests", "../shared/src", "../escalation/src", "../fused-memory/src", ".."]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
 # Task 3367 / esc-3359-1: pins pyright's interpreter to THIS worktree's own

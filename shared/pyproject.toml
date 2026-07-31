@@ -58,7 +58,9 @@ timeout_method = "signal"
 
 [tool.pyright]
 include = ["src", "tests"]
-extraPaths = ["src", "tests"]
+# ".." LAST (mirrors tests/conftest.py's sys.path.append): resolves the repo-root
+# df_pytest_isolation module without letting project dirs shadow their own src/.
+extraPaths = ["src", "tests", ".."]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
 # Task 3367 / esc-3359-1: pins pyright's interpreter to THIS worktree's own
