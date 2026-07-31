@@ -6008,6 +6008,9 @@ class TaskWorkflow:
                         'marker': marker,
                     },
                 )
+            await self._persist_blocked_row(
+                why=f'architect-desync merge already in flight for {tip[:12]}',
+            )
             self._enter_phase(WorkflowState.BLOCKED)
             return WorkflowOutcome.BLOCKED
 
@@ -6054,8 +6057,59 @@ class TaskWorkflow:
         # human, and an empty escalation set keeps the found_on_main MARK_DONE
         # backstop unvetoed if the in-memory merge callback is lost to a
         # restart.
+        #
+        # The durable row write is LOAD-BEARING, precisely BECAUSE no escalation
+        # is filed: an in-progress row with no live claimant, a branch off main
+        # and no open escalation is exactly the recovery table's
+        # REVERT_TO_PENDING shape (task_ground_truth.py rows (c)/(d)), so the
+        # sweep would set the task back to 'pending' (harness.py:5564) and
+        # replan it while this MergeRequest is still queued.  'blocked' with no
+        # escalation is instead LEAVE-shaped, and the merge callback (or the
+        # found_on_main reconciler) flips it done once main actually moves.
+        await self._persist_blocked_row(
+            why=f'architect-desync merge enqueued for {tip[:12]}',
+        )
         self._enter_phase(WorkflowState.BLOCKED)
         return WorkflowOutcome.BLOCKED
+
+    async def _persist_blocked_row(self, *, why: str) -> None:
+        """Durably write ``status='blocked'`` for a non-escalating terminal exit.
+
+        ``_handle_ready_to_merge_report``'s two success-shaped exits (merge
+        enqueued / duplicate skipped) deliberately do NOT route through
+        :meth:`_mark_blocked`: its ``if not merge_phase:`` block calls
+        :meth:`_spawn_dry_run_unblock` regardless of ``skip_escalation``, which
+        would launch a "why is this stuck?" investigation against a task that is
+        merely waiting on its own queued merge.  They still owe the durable row
+        write that ``_mark_blocked`` would otherwise have done — see the
+        REVERT_TO_PENDING note at the enqueue exit.
+
+        Fail-safe in both directions, because the merge is ALREADY enqueued by
+        the time this runs and must never be undone by a bookkeeping failure:
+
+        * :class:`TerminalExitRejection` is the BENIGN already-terminal race —
+          the merge done-callback or the found_on_main reconciler beat us to
+          ``mark_done``.  That row is correct; log at info and leave it
+          terminal.  Never reopen, never retry (unlike ``_mark_blocked``'s
+          bypass trip-wire, a terminal row here is the EXPECTED good outcome).
+        * Any other exception is logged at warning and swallowed; the
+          found_on_main reconciler remains the durable backstop.
+        """
+        try:
+            await self.scheduler.set_task_status(self.task_id, 'blocked')
+        except TerminalExitRejection as exc:
+            logger.info(
+                'Task %s: blocked-row write skipped, row is already terminal '
+                '(%s) — the merge callback or found_on_main got there first; '
+                'leaving it (%s)',
+                self.task_id, exc.old_status, why,
+            )
+        except Exception as exc:
+            logger.warning(
+                'Task %s: blocked-row write failed (%s): %s — continuing; the '
+                'found_on_main reconciler is the durable backstop',
+                self.task_id, why, exc,
+            )
 
     def _schedule_architect_merge_done(
         self, fut: asyncio.Future, *, tip: str, evidence: str,
