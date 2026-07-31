@@ -257,11 +257,31 @@ def test_scaffold_helpers_are_importable(tmp_path: Path):
     Guards the scaffold itself — every class in this module builds on
     ``foreign_lane_lock_holder`` observably owning the lock, so a broken helper
     would silently make downstream assertions vacuous rather than red.
+
+    ``wait_until`` is smoked on BOTH arms.  The satisfied arm alone is
+    tautological — a constantly-true predicate cannot fail, so it pins nothing
+    about the timeout it is supposedly exercising.  The timeout arm is the one
+    the downstream orphan-settle assertions actually depend on: they read the
+    RETURN value, so a helper that raised or looped forever on a predicate that
+    never holds would hang the suite instead of failing it.
     """
     lock_path = lane_lock_path(tmp_path / 'lane')
     with foreign_lane_lock_holder(lock_path):
         assert acquire_merge_verify_flock(lock_path, 0.0) is None
-    assert asyncio.run(wait_until(lambda: True, timeout=0.1)) is True
+
+    async def _both_arms() -> tuple[bool, bool]:
+        return (
+            await wait_until(lambda: True, timeout=0.1),
+            await wait_until(lambda: False, timeout=0.05, interval=0.01),
+        )
+
+    became_true, timed_out = asyncio.run(_both_arms())
+    assert became_true is True, 'a predicate that already holds must report True'
+    assert timed_out is False, (
+        'wait_until must RETURN False once the timeout elapses rather than '
+        'raise or spin — the orphan-settle assertions below assert on that '
+        'return value, and a non-terminating helper would hang the suite'
+    )
 
 
 @pytest.mark.asyncio
@@ -327,16 +347,29 @@ class TestSelfOwnedLaneLockLeak:
             with pytest.raises(LaneLockSelfOwnedLeak) as excinfo:
                 await real_git_ops.reset_persistent_merge_worktree(commit_b)
 
-            msg = str(excinfo.value)
-            assert str(os.getpid()) in msg, (
+            exc = excinfo.value
+            msg = str(exc)
+            # Structured payload FIRST.  A bare `str(pid) in msg` containment
+            # check can be satisfied by the wrong field entirely — a pgid of
+            # 123 "passes" against a message that merely happens to name pid
+            # 1234 — so the field identities are asserted where they are
+            # unambiguous, and the message is then checked in DELIMITED form.
+            assert exc.self_pid == os.getpid(), (
                 f'the fault must name the leaking pid — OUR pid — so an '
                 f'operator is not left doing the incident\'s manual '
-                f'/proc/locks forensics again; got {msg!r}'
+                f'/proc/locks forensics again; got {exc.self_pid!r}'
             )
-            assert str(os.getpgrp()) in msg, (
-                f'the fault must name our pgid, the corroborating fact the '
+            assert exc.self_pgid == os.getpgrp(), (
+                f'the fault must carry our pgid, the corroborating fact the '
                 f'holder-pgid rendezvous would have carried had the acquire '
-                f'ever completed; got {msg!r}'
+                f'ever completed; got {exc.self_pgid!r}'
+            )
+            assert f'pid={os.getpid()}' in msg, (
+                f'the RENDERED message is what reaches the operator, so it '
+                f'must state the leaking pid, not merely carry it; got {msg!r}'
+            )
+            assert f'pgid={os.getpgrp()}' in msg, (
+                f'…and our pgid alongside it; got {msg!r}'
             )
             assert str(lock_path) in msg, (
                 f'the fault must name the leaked lock inode; got {msg!r}'
