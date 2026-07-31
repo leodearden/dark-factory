@@ -31,13 +31,23 @@ from legibility.config import load_config
 
 def _write_config(
     root: Path, *, project_id: str, escalation_port: int = 8199, cwd_prefixes=None,
-    agent_transcript_roots=None,
+    agent_transcript_roots=None, max_daily_digest_bytes: int | None = None,
 ) -> Path:
     """Write a minimal valid docs/legibility/legibility.yaml under *root*.
 
     When *agent_transcript_roots* is given, an ``agent_transcript_roots:``
     block is appended so the loaded cfg opts into archive-root enumeration
     (resolved against *root* by ``inventory.resolve_agent_transcript_roots``).
+
+    When *max_daily_digest_bytes* is given, a ``budgets:`` block is appended
+    so the loaded cfg carries a NON-stock daily byte budget. Omitted by
+    default, so every existing caller keeps the stock 300_000 (the
+    ``budgets`` block's own pydantic default) and its assertions stay
+    valid. Squeezing this is how the totally-budget-suppressed night of
+    2026-07-16..29 is replayed as sampler STATE (``selected == []`` with
+    ``budget_skipped > 0``) through the supported config seam, rather than
+    by resurrecting task 3268's already-fixed raw-transcript-bytes cost
+    basis.
     """
     cwd_prefixes = cwd_prefixes if cwd_prefixes is not None else [str(root / "work")]
     legibility_dir = root / "docs" / "legibility"
@@ -53,6 +63,9 @@ def _write_config(
     if agent_transcript_roots is not None:
         lines.append("agent_transcript_roots:")
         lines += [f"  - {r}" for r in agent_transcript_roots]
+    if max_daily_digest_bytes is not None:
+        lines.append("budgets:")
+        lines.append(f"  max_daily_digest_bytes: {max_daily_digest_bytes}")
     config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return config_path
 
@@ -103,6 +116,62 @@ def _write_transcript(
                 'content': [
                     {'type': 'tool_result', 'tool_use_id': 'tool-1', 'is_error': True,
                      'content': 'No such file or directory'},
+                ],
+            },
+        },
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('\n'.join(json.dumps(line) for line in lines) + '\n', encoding='utf-8')
+
+
+def _write_quiet_transcript(
+    path: Path, *, cwd: str, timestamp: str, session_id: str = 'session-quiet',
+) -> None:
+    """A sibling of :func:`_write_transcript` that carries NO confusion signal.
+
+    Same JSONL shape — a user turn, an assistant ``tool_use``, a user
+    ``tool_result`` — but the exchange SUCCEEDS: no ``is_error``, no
+    ``sampling._NOT_FOUND_PATTERNS`` text ('no such file' / 'not found' /
+    'does not exist' / 'command not found'), no
+    ``_SELF_CORRECT_PATTERNS`` in the assistant's text blocks, no
+    ``_DF_GUARD_TEXT_PATTERNS`` / ``_DF_GUARD_TOOL_NAMES``, and no
+    ``_INTERRUPT_PATTERNS``. So the record scores 0 and the sampler drops it
+    as zero-signal BEFORE the budget phase — a genuinely quiet night, never
+    a budget-skipped candidate. The score-0 claim is asserted (not assumed)
+    in ``test_run_nightly_quiet_night_is_not_reported_as_suppressed``.
+    """
+    lines = [
+        {
+            'type': 'user',
+            'cwd': cwd,
+            'timestamp': timestamp,
+            'sessionId': session_id,
+            'message': {'role': 'user', 'content': 'please add a docstring to the helper'},
+        },
+        {
+            'type': 'assistant',
+            'cwd': cwd,
+            'timestamp': timestamp,
+            'sessionId': session_id,
+            'message': {
+                'role': 'assistant',
+                'content': [
+                    {'type': 'text', 'text': 'Adding the docstring now.'},
+                    {'type': 'tool_use', 'id': 'tool-1', 'name': 'Read',
+                     'input': {'file_path': '/tmp/helper.py'}},
+                ],
+            },
+        },
+        {
+            'type': 'user',
+            'cwd': cwd,
+            'timestamp': timestamp,
+            'sessionId': session_id,
+            'message': {
+                'role': 'user',
+                'content': [
+                    {'type': 'tool_result', 'tool_use_id': 'tool-1',
+                     'content': 'def helper():\n    return 1\n'},
                 ],
             },
         },
