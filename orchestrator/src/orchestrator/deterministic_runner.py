@@ -2256,6 +2256,12 @@ class DeterministicRunner:
                     )
                     return await self._run_predicate(task_id, before_done, description)
 
+                # Task 3341: bound here rather than only inside the pure-gate
+                # branch below, so the symmetric `if before_done is not None:`
+                # at the done write has a definite assignment to read.  Stays
+                # empty on the act-then-ask path, which never consults it.
+                own_records: list = []
+
                 # γ: if before_done is set, the action must have already ran (I1) for us
                 # to safely drive to done here.  Check before_done_ran_at as proof.
                 if before_done is not None:
@@ -2289,9 +2295,15 @@ class DeterministicRunner:
                     # record ever landed, re-establish the gate via
                     # _file_milestone_gate_and_block and stay BLOCKED rather than
                     # phantom-completing.
-                    own_escalation_resolved = bool(self.escalation_queue.get_by_task(
+                    # Task 3341: keep the RECORDS, not just the boolean — the
+                    # curator-gate done write below cites the newest one as
+                    # rung-one evidence via done_provenance.escalation_id.  The
+                    # `bool(...)` semantics below are byte-identical to task
+                    # 2954's original expression.
+                    own_records = self.escalation_queue.get_by_task(
                         task_id, agent_role=DETERMINISTIC_AGENT_ROLE,
-                    ))
+                    )
+                    own_escalation_resolved = bool(own_records)
                     if not own_escalation_resolved:
                         logger.warning(
                             'DeterministicRunner: task %s pure-gate resume — '
@@ -2359,6 +2371,59 @@ class DeterministicRunner:
                             'deterministic-deploy',
                             unit=_ata_unit,
                             note='resumed after gate resolution',
+                        ),
+                    )
+                elif _is_human_curator_gate(metadata):
+                    # Curator gate closing legitimately (task 3341).  Reaching
+                    # here means BOTH rungs of the proof ladder held: a closed
+                    # own-role escalation record exists (rung one, task 2954)
+                    # AND `curator_adjudicated_at` carries a non-empty string
+                    # (rung two, checked above) — otherwise the guard returned
+                    # BLOCKED and never got here.
+                    #
+                    # The note deliberately differs from the generic
+                    # 'pure gate resolved' below: that string is what made task
+                    # 3181's phantom closure indistinguishable from a genuine
+                    # one in the audit trail.  A curator gate that closes must
+                    # name the evidence it closed on — the adjudication stamp
+                    # here, plus the gate record via `escalation_id`.
+                    #
+                    # BOUND THE STAMP (task 3286's finding): this note is
+                    # memory-ingested — fused-memory's `_format_outcome_echo`
+                    # appends it to the "Task '<title>' completed." Mem0 write
+                    # under a 500-char cap — and the stamp is an externally-
+                    # supplied metadata value that `_curator_adjudication_confirmed`
+                    # validates for TYPE only, never length.  So truncate here,
+                    # at construction, where over-length degrades the audit
+                    # string but never the safety decision.  `_summarize_predicate_output`
+                    # is deliberately NOT reused: it strips log noise from raw
+                    # subprocess output, a different threat model, and borrowing
+                    # it would imply a sanitization guarantee this single
+                    # structured field does not need.
+                    _raw_stamp = str(metadata.get(CURATOR_ADJUDICATED_AT_KEY, ''))
+                    _stamp_for_note = (
+                        _raw_stamp
+                        if len(_raw_stamp) <= _CURATOR_STAMP_NOTE_MAX_CHARS
+                        else _raw_stamp[:_CURATOR_STAMP_NOTE_MAX_CHARS] + '…'
+                    )
+                    # Newest own record is the gate that was resolved.  Defensive
+                    # `if own_records` — unreachable empty (the strand branch
+                    # already returned), but an empty list must never be indexed;
+                    # `exclude_none=True` then simply omits the key.
+                    _gate_esc_id = (
+                        sorted(own_records, key=lambda e: e.timestamp)[-1].id
+                        if own_records else None
+                    )
+                    await self.scheduler.set_task_status(
+                        task_id,
+                        'done',
+                        done_provenance=_build_done_provenance(
+                            'deterministic-gate',
+                            note=(
+                                'human curator gate: per-entry content '
+                                f'adjudication confirmed at {_stamp_for_note}'
+                            ),
+                            escalation_id=_gate_esc_id,
                         ),
                     )
                 else:
