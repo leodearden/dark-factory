@@ -168,10 +168,22 @@ drift fails a test instead of silently mis-charging the budget."""
 def select_digest_sessions(
     cfg: LegibilityConfig, projects_root: Path | str, target_date: date,
     *, rendered: dict[tuple, str] | None = None,
-) -> list[sampling.ScoredRecord]:
-    """The budget-bounded, stratified subset of *target_date*'s sessions to
+) -> sampling.SampleResult:
+    """The budget-bounded, stratified sample of *target_date*'s sessions to
     digest -- :func:`select_scored_records` narrowed by
     ``sampling.stratified_sample``.
+
+    Returns the WHOLE :class:`~legibility.sampling.SampleResult` (the
+    selection is ``.selected``), not just the selection. That is deliberate
+    and load-bearing: this function used to end in ``.selected`` and throw
+    the accounting away, so a night that enumerated real signal and then
+    discarded ALL of it on the byte budget (``selected == []`` with
+    ``budget_skipped > 0``) was indistinguishable from a night with nothing
+    to sample -- which is exactly what happened, unobserved, every night
+    from 2026-07-16 to 2026-07-29 (task 2573 computed ``budget_skipped``;
+    task 2581's consumer here dropped it; task 3270 carries it through).
+    There is deliberately NO ``.selected``-only sibling: leaving the lossy
+    accessor available is the mechanism that produced the incident.
 
     The byte budget (``cfg.budgets.max_daily_digest_bytes``) is charged
     against each candidate's ACTUAL rendered digest size, at exactly the
@@ -213,7 +225,7 @@ def select_digest_sessions(
         cost_fn=sampling.digest_byte_cost_fn(
             max_bytes=DEFAULT_MAX_DIGEST_BYTES, rendered=rendered,
         ),
-    ).selected
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -654,8 +666,8 @@ def run_nightly(
     # that render instead of paying for it twice. Rendering is super-linear in
     # signal-item count, so this is roughly a 2x on the job's dominant cost.
     rendered: dict[tuple, str] = {}
-    selected = select_digest_sessions(cfg, projects_root, target_date, rendered=rendered)
-    digests, extractor_failures = build_digests(selected, rendered=rendered)
+    sample = select_digest_sessions(cfg, projects_root, target_date, rendered=rendered)
+    digests, extractor_failures = build_digests(sample.selected, rendered=rendered)
 
     if extractor_failures:
         # A digest builder raise is exceptional (build_digests already

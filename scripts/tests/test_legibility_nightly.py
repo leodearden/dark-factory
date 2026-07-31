@@ -399,7 +399,7 @@ def test_select_digest_sessions_costs_at_the_max_bytes_build_digests_renders_wit
     # COST side: select_digest_sessions -> digest_byte_cost_fn, which
     # resolves digest.build_digest at call time.
     monkeypatch.setattr(nightly.sampling.digest, 'build_digest', recording_build)
-    selected = nightly.select_digest_sessions(cfg, projects_root, date(2026, 7, 13))
+    sample = nightly.select_digest_sessions(cfg, projects_root, date(2026, 7, 13))
     assert caps == [nightly.DEFAULT_MAX_DIGEST_BYTES], (
         'the sampler must charge at the nightly cap, not at build_digest\'s own default'
     )
@@ -407,7 +407,7 @@ def test_select_digest_sessions_costs_at_the_max_bytes_build_digests_renders_wit
     # RENDER side: build_digests, called by run_nightly with no max_bytes
     # override, must reach the renderer with that SAME cap.
     caps.clear()
-    nightly.build_digests(selected, build=recording_build)
+    nightly.build_digests(sample.selected, build=recording_build)
     assert caps == [nightly.DEFAULT_MAX_DIGEST_BYTES]
 
 
@@ -419,8 +419,8 @@ def test_select_digest_sessions_selects_multi_mb_session_under_stock_budget(tmp_
     15,123-byte digest, so it costs ~5% of the 300_000-byte budget rather
     than 293% of it. Charged at raw transcript size the single reserve
     group here is skipped whole, the greedy leftover fill has nothing to
-    add, and select_digest_sessions returns [] — which is exactly what the
-    live nightly run did every night from 2026-07-16 to 2026-07-29.
+    add, and select_digest_sessions selects nothing — which is exactly what
+    the live nightly run did every night from 2026-07-16 to 2026-07-29.
     """
     work_cwd = str(tmp_path / 'work')
     cfg = load_config(_write_config(tmp_path, project_id='proj_a', cwd_prefixes=[work_cwd]))
@@ -434,9 +434,9 @@ def test_select_digest_sessions_selects_multi_mb_session_under_stock_budget(tmp_
     raw_size = session_path.stat().st_size
     assert raw_size > 300000, f'fixture must exceed the whole budget; got {raw_size}'
 
-    selected = nightly.select_digest_sessions(cfg, projects_root, date(2026, 7, 13))
+    sample = nightly.select_digest_sessions(cfg, projects_root, date(2026, 7, 13))
 
-    assert [r.path for r in selected] == [session_path]
+    assert [r.path for r in sample.selected] == [session_path]
 
 
 def test_select_digest_sessions_returns_the_whole_sample_result(tmp_path):
@@ -521,13 +521,13 @@ def test_build_digests_reuses_the_costing_render(tmp_path):
     digest.build_digest = counting_build
     try:
         rendered: dict = {}
-        selected = nightly.select_digest_sessions(
+        sample = nightly.select_digest_sessions(
             cfg, projects_root, date(2026, 7, 13), rendered=rendered,
         )
         assert renders == [session_path], 'costing must render exactly once'
 
         digests, extractor_failures = nightly.build_digests(
-            selected, build=counting_build, rendered=rendered,
+            sample.selected, build=counting_build, rendered=rendered,
         )
     finally:
         digest.build_digest = real_build
@@ -537,7 +537,7 @@ def test_build_digests_reuses_the_costing_render(tmp_path):
     assert extractor_failures == []
     assert digests == [
         digest.build_digest(
-            session_path, agent_class_override=selected[0].stratum,
+            session_path, agent_class_override=sample.selected[0].stratum,
             max_bytes=nightly.DEFAULT_MAX_DIGEST_BYTES,
         )
     ], 'the cached digest must be byte-identical to a fresh render'
@@ -552,8 +552,8 @@ def test_build_digests_re_renders_when_no_cache_is_shared(tmp_path):
     session_path = projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl'
     _write_transcript(session_path, cwd=work_cwd, timestamp='2026-07-13T10:00:00Z')
 
-    selected = nightly.select_digest_sessions(cfg, projects_root, date(2026, 7, 13))
-    digests, extractor_failures = nightly.build_digests(selected)
+    sample = nightly.select_digest_sessions(cfg, projects_root, date(2026, 7, 13))
+    digests, extractor_failures = nightly.build_digests(sample.selected)
 
     assert extractor_failures == []
     assert len(digests) == 1
