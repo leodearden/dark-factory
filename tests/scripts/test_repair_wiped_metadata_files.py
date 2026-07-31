@@ -24,6 +24,8 @@ gets subprocess coverage.
 """
 from __future__ import annotations
 
+import json
+
 from audit_wiped_metadata_files import (
     CLEAN_MERGE_SHA,
     CONFIRMED_NULL_SHA_DONE_PATH,
@@ -36,6 +38,9 @@ from audit_wiped_metadata_files import (
 )
 
 from repair_wiped_metadata_files import (
+    PROVENANCE_KEY,
+    REPAIR_TASK_ID,
+    build_repair_payload,
     plan_files_rejection_reason,
     select_repairable_candidates,
 )
@@ -211,3 +216,94 @@ def test_plan_files_rejection_reason_rejects_a_list_of_only_blanks():
 
     assert reason
     assert "empty" in reason.lower()
+
+
+# ---------------------------------------------------------------------------
+# build_repair_payload — a MINIMAL ADDITIVE PATCH, never a lifecycle write.
+#
+# now_iso is INJECTED rather than stamped inside, so these tests pin an exact
+# value instead of matching a regex against a clock.
+# ---------------------------------------------------------------------------
+
+_NOW = "2026-08-01T00:00:00+00:00"
+
+
+def test_build_repair_payload_has_exactly_two_top_level_keys():
+    payload = build_repair_payload(_candidate(5), now_iso=_NOW)
+
+    assert set(payload) == {"files", PROVENANCE_KEY}
+
+
+def test_build_repair_payload_files_is_a_plain_list_in_plan_order():
+    """(a) plan_files is a TUPLE on the candidate; the payload must carry a
+    JSON-serialisable list, in the plan's own order."""
+    files = (
+        "orchestrator/src/orchestrator/workflow.py",
+        "shared/src/shared/locking.py",
+        "scripts/audit_wiped_metadata_files.py",
+    )
+    payload = build_repair_payload(_candidate(6, plan_files=files), now_iso=_NOW)
+
+    assert payload["files"] == list(files)
+    assert isinstance(payload["files"], list)
+
+
+def test_build_repair_payload_provenance_carries_this_tasks_id_and_the_audit_fields():
+    """(b) the record says WHO wrote it, from WHICH recovered source, under
+    WHICH wipe signature and fidelity, and WHEN — everything a later reader
+    needs to judge the backfill without re-deriving the audit."""
+    candidate = _candidate(
+        7,
+        plan_files_source="phase_skipped_event",
+        wipe_signature=NO_MERGE_EVENT,
+        plan_files_fidelity=FIDELITY_FILE_LEVEL,
+    )
+
+    provenance = build_repair_payload(candidate, now_iso=_NOW)[PROVENANCE_KEY]
+
+    assert provenance["task"] == REPAIR_TASK_ID == "3329"
+    assert provenance["src"] == "phase_skipped_event"
+    assert provenance["sig"] == NO_MERGE_EVENT
+    assert provenance["fidelity"] == FIDELITY_FILE_LEVEL
+    assert provenance["at"] == _NOW
+
+
+def test_build_repair_payload_never_carries_done_provenance():
+    """(c) DoneProvenanceWriteAuthorityError floor: update_task rejects any
+    metadata write carrying done_provenance (set_task_status is its only
+    sanctioned writer). Checked at the top level AND nested."""
+    payload = build_repair_payload(_candidate(8), now_iso=_NOW)
+
+    assert "done_provenance" not in payload
+    for value in payload.values():
+        if isinstance(value, dict):
+            assert "done_provenance" not in value
+
+
+def test_build_repair_payload_is_never_a_lifecycle_or_tagger_write():
+    """(d) no status (StatusWriteAuthorityError floor), and no modules /
+    files_tagged_at — this patch restores scope, it does not re-run the tagger
+    or move the task through its lifecycle."""
+    payload = build_repair_payload(_candidate(9), now_iso=_NOW)
+
+    for forbidden in ("status", "modules", "files_tagged_at"):
+        assert forbidden not in payload
+
+
+def test_build_repair_payload_round_trips_through_json():
+    """(e) the payload is handed to json.dumps by the write path, so anything
+    non-serialisable here becomes a mid-batch TypeError instead of a write."""
+    payload = build_repair_payload(_candidate(11), now_iso=_NOW)
+
+    assert json.loads(json.dumps(payload)) == payload
+
+
+def test_build_repair_payload_provenance_key_uses_the_x_namespace():
+    """docs/task-authoring.md Tier-C: a one-off annotation key must live in the
+    x_ forward-compat namespace, which shared/src/shared/task_metadata.py:933
+    exempts from the unknown_key census warning. A bare
+    `files_backfill_provenance` is not in _BLESSED_METADATA_KEYS and would emit
+    one schema_warning line per repaired task — 35+ lines of exactly the drift
+    noise that census exists to surface."""
+    assert PROVENANCE_KEY.startswith("x_")
+    assert PROVENANCE_KEY == "x_files_backfill_provenance"
