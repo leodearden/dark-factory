@@ -16,6 +16,7 @@ import logging
 import threading
 import time
 from collections.abc import Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock
 
@@ -910,3 +911,110 @@ def assert_update_wire_mode(
         f"'append' key must not appear on the wire; got: {arguments}"
     )
     return arguments
+
+
+# ===========================================================================
+# Git repository isolation (esc-3072-3)
+# ===========================================================================
+
+
+class NonIsolatedGitRepoError(AssertionError):
+    """A test helper was asked to run git against a directory that is not a
+    git repository root, so git's upward discovery would have retargeted an
+    enclosing repository.
+
+    Subclasses ``AssertionError`` deliberately: an unguarded call is the test
+    suite breaking its own isolation contract, not a product error.  Raised by
+    :func:`assert_isolated_git_repo`.
+    """
+
+
+def _enclosing_git_repo(start: Path) -> Path | None:
+    """Best-effort: the repo root git's upward walk would resolve from *start*.
+
+    Returns ``None`` when no ancestor carries a ``.git`` entry.  Used only to
+    make :class:`NonIsolatedGitRepoError` self-diagnosing — never to decide
+    whether a call is permitted.
+    """
+    try:
+        resolved = Path(start).resolve()
+    except OSError:  # pragma: no cover - resolve() on a pathological path
+        return None
+    for parent in resolved.parents:
+        if (parent / '.git').exists():
+            return parent
+    return None
+
+
+def assert_isolated_git_repo(cwd: Path) -> None:
+    """Refuse *cwd* unless it is ITSELF a git repository root.
+
+    Incident esc-3072-3.  Git repository discovery walks UP the directory tree.
+    A test helper that shells out to git with a caller-supplied ``cwd`` does not
+    operate on "the directory the caller named" — it operates on *whatever repo
+    encloses that directory*.  When pytest's basetemp lives inside a live task
+    worktree (``.worktrees/<task>/.pytest-tmp/``), a helper handed a bare
+    ``tmp_path`` silently retargets production state: ``_inject_uu_state``
+    wrote three blobs into a live worktree's object store and staged ``foo.py``
+    at stages 1/2/3, leaving ``UU foo.py`` in a real task's index.
+
+    This is a PURE-FILESYSTEM pre-flight — it spawns no child process, so it can
+    be called before the first subprocess and thereby guarantee that a rejected
+    call writes NOTHING anywhere.  That property is exactly what a mid-sequence
+    git failure cannot provide: ``git hash-object -w`` writes its blobs before a
+    later ``git update-index`` has any chance to fail, so "git errors out in a
+    non-repo directory" is not a defence.
+
+    The predicate is ``(cwd / '.git').exists()``, which matches BOTH shapes a
+    legitimate caller passes — a normal checkout (``.git`` is a directory) and a
+    linked worktree (``.git`` is a gitdir FILE).  The same idiom is documented
+    on ``conftest.py``'s ``repo_root`` fixture.  This is deliberately NOT a
+    "reject anything under ``.worktrees/``" rule: two legitimate
+    ``_inject_uu_state`` call sites target ``<tmp repo>/.worktrees/<task>``
+    roots produced by ``git_ops.create_worktree(...)``, and such a rule would
+    reject them while still permitting every other escape path.
+
+    Pair with :func:`git_env_with_ceiling` for defence in depth: the pre-flight
+    guarantees zero writes, the ceiling makes escape physically impossible at
+    the git level even if the pre-flight is refactored away.
+
+    Raises:
+        NonIsolatedGitRepoError: if *cwd* is missing, is not a directory, or
+            carries no ``.git`` entry of its own.
+    """
+    path = Path(cwd)
+
+    if (path / '.git').exists():
+        return
+
+    if not path.exists():
+        problem = 'it does not exist'
+    elif not path.is_dir():
+        problem = 'it is not a directory'
+    else:
+        problem = "it has no '.git' entry of its own, so it is not a repo root"
+
+    enclosing = _enclosing_git_repo(path)
+    if enclosing is not None:
+        victim = (
+            f'git discovery walks UP the directory tree, so this call would '
+            f'instead have operated on the enclosing repository:\n'
+            f'    {enclosing}\n'
+        )
+    else:
+        victim = (
+            'No enclosing repository is reachable from here right now — but '
+            'that is a property of where this test run happens to live, not a '
+            'guarantee. Under a basetemp nested inside a live task worktree '
+            'the very same call reaches production state.\n'
+        )
+
+    raise NonIsolatedGitRepoError(
+        f'Refusing to run git with cwd={path} — {problem}.\n'
+        f'{victim}'
+        f'Remedy: pass a repo root this test created itself, e.g. the '
+        f'`git_repo` fixture, `git_ops.project_root`, or a worktree root from '
+        f'`git_ops.create_worktree(...)`.\n'
+        f'See esc-3072-3: an unguarded helper wrote blobs into a live task '
+        f'worktree and left it with an unmerged index.'
+    )
