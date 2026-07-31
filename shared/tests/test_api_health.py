@@ -332,3 +332,61 @@ class TestPartialDegradationStaysClosed:
         assert isinstance(state, Open)
         assert state.stats.failures == 8
         assert state.stats.distinct_tasks == 3
+
+
+class TestWindowEviction:
+    """step-13: the window is aged out by monotonic timestamp, not reset wholesale."""
+
+    async def test_stale_failures_do_not_accumulate_into_a_trip(self) -> None:
+        """7 failures, then a gap longer than the window, then 1 more.
+
+        The 8th failure is a lone failure in a fresh window, not the 8th of a
+        burst — an outage an hour ago must not add itself to one failure now.
+        """
+        gate, mono, _wall = _gate()
+        await _report_failures(gate, 7)
+        mono.advance(601.0)
+        state = await _report_failures(gate, 1)
+        assert isinstance(state, Closed)
+        assert gate.is_degraded is False
+
+    async def test_eviction_is_by_age_not_a_blanket_reset(self) -> None:
+        """4 failures, half a window later 4 more — all 8 are still in window, so it trips.
+
+        Guards against "any gap clears everything", which would make a slow
+        provider bleed forever without ever tripping.
+        """
+        gate, mono, _wall = _gate()
+        await _report_failures(gate, 4, task_ids=['t1', 't2'])
+        mono.advance(300.0)
+        state = await _report_failures(gate, 4, task_ids=['t3', 't4'])
+        assert isinstance(state, Open)
+        assert state.stats.failures == 8
+
+    async def test_reported_stats_count_only_in_window_samples(self) -> None:
+        """The evidence on the Open state must describe the window, not all history."""
+        gate, mono, _wall = _gate()
+        await _report_ok(gate, 5)
+        await _report_failures(gate, 3)
+        mono.advance(601.0)
+        state = await _report_failures(gate, 8)
+        assert isinstance(state, Open)
+        assert state.stats == GateStats(
+            failures=8,
+            completions=8,
+            distinct_tasks=3,
+            failure_rate=1.0,
+            window_secs=600.0,
+        )
+
+    async def test_sample_exactly_at_the_window_edge_is_retained(self) -> None:
+        """Eviction is strict (`< cutoff`), so a sample exactly window_secs old still counts.
+
+        Pinned because an off-by-one here silently shortens every window.
+        """
+        gate, mono, _wall = _gate()
+        await _report_failures(gate, 7)
+        mono.advance(600.0)
+        state = await _report_failures(gate, 1)
+        assert isinstance(state, Open)
+        assert state.stats.failures == 8
