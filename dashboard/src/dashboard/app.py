@@ -436,14 +436,26 @@ async def healthz(request: Request) -> JSONResponse:
     config: DashboardConfig = request.app.state.config
     checks['connections'] = {'open': pool.open_count}
 
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _HEALTHZ_TOTAL_BUDGET
     for name, db_path in _healthz_db_targets(config):
-        conn = await pool.get(db_path)
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            checks[f'db_{name}'] = 'deadline_exceeded'
+            healthy = False
+            continue
+        conn = await pool.get(db_path)  # still outside the deadline — step-6 moves it in
         if conn is None:
             checks[f'db_{name}'] = 'unavailable'
             continue
         try:
-            async with conn.execute('SELECT 1') as cursor:
-                row = await asyncio.wait_for(cursor.fetchone(), timeout=_DB_PROBE_TIMEOUT)
+            # The deadline wraps the WHOLE async-with block (execute AND
+            # fetch), not just fetchone() — that narrower scope was the bug:
+            # conn.execute(...)'s own __aenter__ (where aiosqlite's real query
+            # execution happens) previously carried no deadline at all.
+            async with asyncio.timeout(min(remaining, _DB_PROBE_TIMEOUT)):
+                async with conn.execute('SELECT 1') as cursor:
+                    row = await cursor.fetchone()
             checks[f'db_{name}'] = 'ok' if row is not None else 'failed'
             if row is None:
                 healthy = False
