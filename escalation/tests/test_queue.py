@@ -1416,7 +1416,10 @@ class TestMakeIdCounter:
     """make_id() is backed by a single durable per-task_id counter file —
     NOT a directory/archive scan (PRD task-status-authority-prd.md contract
     C9 / finding 10.4).  These tests encode PRD boundary test D1: strictly
-    increasing, no collision, no rescan dependence.
+    increasing, no collision, and no directory-rescan dependence *in steady
+    state* (task 3238 added a one-shot bounded reconciliation that fires only
+    when the counter is absent or unparseable; the sibling gate statement is
+    escalation/tests/test_status_authority_gate.py::TestD1MakeIdCounter).
     """
 
     def test_make_id_is_durable_across_restart(self, tmp_path: Path):
@@ -1527,16 +1530,22 @@ class TestMakeIdCounter:
             f'{first_id!r}, {second_id!r}'
         )
 
-    def test_make_id_corrupt_counter_logs_error_and_resets_to_one(
+    def test_make_id_corrupt_counter_with_no_disk_evidence_starts_at_one(
         self, tmp_path: Path, caplog,
     ):
-        """A corrupt/unparseable counter file is treated as 0 and logged as an ERROR.
+        """A corrupt counter with NOTHING to recover from reconciles to 0, minting 1.
 
-        The counter is authoritative with no archive-scan fallback (PRD C9):
-        losing it is unrecoverable data loss, not a routine, self-healing
-        event, so it must be loud (ERROR) rather than a WARNING — a lost
-        counter silently re-mints ids from 1, colliding with any escalations
-        already issued for this task_id.
+        This pins the nothing-to-recover sub-case of the corrupt-counter
+        path: an unparseable counter is reconciled from the one-shot bounded
+        root+archive scan (``test_make_id_corrupt_counter_reconciles_instead_of_colliding``
+        covers the case where that scan finds records), and for a genuinely
+        fresh task_id — empty queue root, no archive at all — the scan yields
+        0, so the mint is legitimately 'esc-cnt-1'.
+
+        The ERROR is still unconditional here, unlike the absent-counter
+        branch: an unparseable counter is unrecoverable data loss an operator
+        must see even when it happens to be self-healing, whereas an absent
+        counter is the ordinary first-mint state of every new task_id.
         """
         queue_dir = tmp_path / 'queue'
         queue = EscalationQueue(queue_dir)
@@ -1545,7 +1554,10 @@ class TestMakeIdCounter:
         with caplog.at_level(logging.ERROR, logger='escalation.queue'):
             result = queue.make_id('cnt')
 
-        assert result == 'esc-cnt-1'
+        assert result == 'esc-cnt-1', (
+            'with no root or archive records to recover from, reconciliation '
+            f'yields 0 and the mint is 1; got {result!r}'
+        )
 
         error_records = [
             r for r in caplog.records
@@ -1643,9 +1655,10 @@ class TestMakeIdCounter:
     ):
         """An absent counter file for a genuinely-new task_id logs nothing.
 
-        Complements the previous test: the ERROR is conditional on finding
-        pre-existing root evidence, not fired on every absent counter (which
-        would make the common brand-new-task_id path noisy).
+        Complements the previous test: the ERROR is conditional on
+        reconciliation actually recovering something — pre-existing root OR
+        archive evidence — not fired on every absent counter (which would
+        make the common brand-new-task_id path noisy).
         """
         queue_dir = tmp_path / 'queue'
         queue = EscalationQueue(queue_dir)
@@ -1744,6 +1757,44 @@ class TestMakeIdCounter:
         ), (
             'Expected an ERROR naming the recovered maximum (3) and the '
             f'reconciliation; got: {[r.message for r in error_records]}'
+        )
+
+    def test_make_id_recovery_max_is_numeric_not_lexicographic(
+        self, tmp_path: Path,
+    ):
+        """Recovery takes the NUMERIC maximum, not the lexicographic one.
+
+        Every other recovery fixture uses single-digit sequences, where
+        ``max(int(...))`` and ``max(str)`` agree — so a regression from an
+        integer comparison to a raw-stem-suffix string comparison would pass
+        all of them. It would NOT be benign: for a task_id that accumulated
+        ten escalations, '9' > '10' lexicographically, so recovery would come
+        back as 9 and mint 'esc-cnt-10' — an id the seeded archive already
+        holds, which is exactly the collision task 3238 exists to prevent.
+        The multi-digit case is also the realistic one: a task_id whose
+        counter was lost has usually issued more than nine escalations.
+        """
+        queue_dir = tmp_path / 'queue'
+        archive_dir = queue_dir / 'archive' / '2026-01-02'
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        for seq in (9, 10):
+            seeded = _make_escalation(f'esc-cnt-{seq}', task_id='cnt', status='resolved')
+            (archive_dir / f'{seeded.id}.json').write_text(seeded.to_json())
+
+        assert not (queue_dir / 'esc-cnt.seq').exists()
+
+        queue = EscalationQueue(queue_dir)
+        # Fixture guard: the record a lexicographic max would collide with is
+        # genuinely resolvable, so the assertion below is not vacuous.
+        assert queue.get('esc-cnt-10') is not None
+
+        minted = queue.make_id('cnt')
+        assert minted == 'esc-cnt-11', (
+            f"Expected the numeric max (10) + 1; got {minted!r} — 'esc-cnt-10' "
+            f'means recovery compared stem suffixes as strings and recovered 9'
+        )
+        assert queue.get(minted) is None, (
+            f'{minted} resolves to a pre-existing archived record'
         )
 
     def test_make_id_recovery_is_prefix_anchored_for_hyphenated_task_ids(
