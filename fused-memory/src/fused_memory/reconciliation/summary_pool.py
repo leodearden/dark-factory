@@ -27,7 +27,7 @@ import json
 import logging
 from datetime import UTC, datetime, timedelta
 
-from fused_memory.reconciliation.mem0_tombstone import record_mem0_deletion_tombstone
+from fused_memory.reconciliation.mem0_tombstone import record_mem0_deletion_tombstones
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord
 from fused_memory.reconciliation.recon_pool_map import (
     CYCLE_SUMMARY_KIND,
@@ -235,7 +235,7 @@ async def enforce_summary_pool_cap(
     - Individual delete failure → logs WARNING, excluded from count.
 
     Every CONFIRMED-successful eviction leaves a queryable tombstone via
-    :func:`~fused_memory.reconciliation.mem0_tombstone.record_mem0_deletion_tombstone`
+    :func:`~fused_memory.reconciliation.mem0_tombstone.record_mem0_deletion_tombstones`
     (task 3041), naming *trim_source* as the deleter and *run_id* as the
     deleting run — deliberately distinct from the victim's own
     ``metadata['run_id']``, which is also recorded. Written from the success
@@ -405,7 +405,7 @@ async def enforce_summary_pool_cap(
     )
 
     success_count = 0
-    tombstone_writes = []
+    tombstone_victims = []
     for m, result in zip(to_delete, results, strict=True):
         if isinstance(result, Exception):
             logger.warning(
@@ -430,24 +430,41 @@ async def enforce_summary_pool_cap(
             # eviction itself was correct and stays.
             #
             # Success branch ONLY: a tombstone must never claim a record that
-            # is still alive. record_mem0_deletion_tombstone is internally
-            # fail-safe (returns False, never raises); gathering the writes
-            # through gather_collect is a second belt so nothing here can
-            # raise out of, or alter the count of, this trim.
-            tombstone_writes.append(
-                record_mem0_deletion_tombstone(
-                    memory_service,
-                    project_id,
-                    m['id'],
-                    victim_metadata=m.get('metadata'),
-                    victim_created_at=m.get('created_at'),
-                    deleter=trim_source,
-                    deleting_run_id=run_id,
-                )
-            )
+            # is still alive.
+            tombstone_victims.append(m)
 
-    if tombstone_writes:
-        await gather_collect(tombstone_writes)
+    if tombstone_victims:
+        # ONE ledger transaction for the whole trim, not one per eviction —
+        # each upsert is its own fsync'd commit on the single aiosqlite
+        # connection the rest of the cycle shares (reviewer finding
+        # efficiency, task 3041 amendment pass).
+        #
+        # record_mem0_deletion_tombstones is internally fail-safe (returns 0,
+        # never raises); this try/except is a second belt so nothing here can
+        # raise out of, or alter the count of, this trim — while still saying
+        # so out loud.
+        try:
+            await record_mem0_deletion_tombstones(
+                memory_service,
+                project_id,
+                tombstone_victims,
+                deleter=trim_source,
+                deleting_run_id=run_id,
+            )
+        except Exception:
+            logger.warning(
+                'reconciliation.enforce_summary_pool_cap: '
+                'tombstone batch raised for %d evicted record(s) in recon_pool=%s; '
+                'the evictions themselves succeeded and are counted',
+                len(tombstone_victims),
+                recon_pool,
+                exc_info=True,
+                extra={
+                    'project_id': project_id,
+                    'run_id': run_id,
+                    'recon_pool': recon_pool,
+                },
+            )
 
     return success_count
 

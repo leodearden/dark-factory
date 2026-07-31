@@ -13684,7 +13684,7 @@ class TestSweepStaleMem0PoolTombstones:
         memory_service = self._service(members)
 
         with patch.object(
-            tks, 'record_mem0_deletion_tombstone', new=AsyncMock(return_value=True)
+            tks, 'record_mem0_deletion_tombstones', new=AsyncMock(return_value=1)
         ) as tombstone:
             result = await tks._sweep_stale_mem0_pool(
                 memory_service,
@@ -13697,16 +13697,17 @@ class TestSweepStaleMem0PoolTombstones:
                 now=fixed_now,
             )
 
-        # A tombstone must never claim a record that is still alive.
+        # ONE batch call for the whole sweep — not one fsync'd ledger commit
+        # per victim (task 3041 amendment pass).
         assert tombstone.await_count == 1
         call = tombstone.await_args
         assert call is not None
         assert call.args[1] == 'dark_factory'
-        assert call.args[2] == 'deleted-ok'
+        # A tombstone must never claim a record that is still alive: the
+        # failed delete is absent from the batch.
+        assert call.args[2] == [members[0]]
         assert call.kwargs['deleter'] == 'stage1_flag_marker_gc_sweep'
         assert call.kwargs['deleting_run_id'] == 'run-deleter'
-        assert call.kwargs['victim_metadata'] == members[0]['metadata']
-        assert call.kwargs['victim_created_at'] == members[0]['created_at']
 
         # Tombstone writing does not perturb the existing accounting.
         assert result == 1
@@ -13720,7 +13721,7 @@ class TestSweepStaleMem0PoolTombstones:
 
         with patch.object(
             tks,
-            'record_mem0_deletion_tombstone',
+            'record_mem0_deletion_tombstones',
             new=AsyncMock(side_effect=RuntimeError('ledger db locked')),
         ):
             result = await tks._sweep_stale_mem0_pool(
@@ -13753,7 +13754,7 @@ class TestSweepStaleMem0PoolTombstones:
         memory_service.delete_memory = AsyncMock(return_value=None)
 
         with patch.object(
-            tks, 'record_mem0_deletion_tombstone', new=AsyncMock(return_value=True)
+            tks, 'record_mem0_deletion_tombstones', new=AsyncMock(return_value=0)
         ) as tombstone:
             result = await tks._sweep_stale_mem0_pool(
                 memory_service,

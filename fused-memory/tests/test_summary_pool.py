@@ -1022,7 +1022,7 @@ class TestEnforceSummaryPoolCapTombstones:
         memory_service = self._service(members)
 
         with patch.object(
-            sp, 'record_mem0_deletion_tombstone', new=AsyncMock(return_value=True)
+            sp, 'record_mem0_deletion_tombstones', new=AsyncMock(return_value=1)
         ) as tombstone:
             result = await enforce_summary_pool_cap(
                 memory_service,
@@ -1033,21 +1033,27 @@ class TestEnforceSummaryPoolCapTombstones:
                 cap=1,
             )
 
+        # ONE batch call for the whole trim — not one fsync'd ledger commit
+        # per eviction (task 3041 amendment pass).
         assert tombstone.await_count == 1
         call = tombstone.await_args
         assert call is not None
         assert call.args[1] == 'dark_factory'
-        assert call.args[2] == 'trimmed-ok'
         assert call.kwargs['deleter'] == 'stage1_cycle_summary_trim'
         # The DELETING run, explicitly distinct from the victim's own
         # metadata['run_id'] — the precise ambiguity that made the original
         # finding unreadable.
         assert call.kwargs['deleting_run_id'] == 'run-deleter'
-        assert call.kwargs['victim_metadata']['run_id'] == 'run-victim'
-        assert call.kwargs['victim_metadata']['kind'] == 'cycle_summary'
-        assert call.kwargs['victim_metadata']['record_type'] == 'narrative'
-        assert call.kwargs['victim_metadata']['recon_pool'] == 'stage1_cycle_summary'
-        assert call.kwargs['victim_created_at'] == '2026-01-01T00:00:00+00:00'
+
+        # Exactly the successfully-evicted member, carrying the victim
+        # identity the tombstone payload is built from.
+        victims = call.args[2]
+        assert [v['id'] for v in victims] == ['trimmed-ok']
+        assert victims[0]['metadata']['run_id'] == 'run-victim'
+        assert victims[0]['metadata']['kind'] == 'cycle_summary'
+        assert victims[0]['metadata']['record_type'] == 'narrative'
+        assert victims[0]['metadata']['recon_pool'] == 'stage1_cycle_summary'
+        assert victims[0]['created_at'] == '2026-01-01T00:00:00+00:00'
 
         # A tombstone must never claim a record that is still alive, and
         # tombstone writing must not perturb the existing accounting.
@@ -1061,7 +1067,7 @@ class TestEnforceSummaryPoolCapTombstones:
 
         with patch.object(
             sp,
-            'record_mem0_deletion_tombstone',
+            'record_mem0_deletion_tombstones',
             new=AsyncMock(side_effect=RuntimeError('ledger db locked')),
         ):
             result = await enforce_summary_pool_cap(
@@ -1087,7 +1093,7 @@ class TestEnforceSummaryPoolCapTombstones:
         memory_service.delete_memory = AsyncMock(return_value=None)
 
         with patch.object(
-            sp, 'record_mem0_deletion_tombstone', new=AsyncMock(return_value=True)
+            sp, 'record_mem0_deletion_tombstones', new=AsyncMock(return_value=0)
         ) as tombstone:
             result = await enforce_summary_pool_cap(
                 memory_service,

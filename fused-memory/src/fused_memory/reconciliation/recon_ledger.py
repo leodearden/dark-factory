@@ -24,6 +24,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -96,6 +97,23 @@ MARKER_KINDS = ('stage1_flag_marker', 'stage2_persistence_marker', 'flag_for_sta
 # standing_decision_constants' INV-5 forbids. mem0_tombstone re-exports it, so
 # `from ...mem0_tombstone import RECORD_KIND_MEM0_TOMBSTONE` still resolves.
 RECORD_KIND_MEM0_TOMBSTONE = 'mem0_tombstone'
+
+# Single-sourced INSERT ... ON CONFLICT used by BOTH upsert() and
+# upsert_many(). Hoisted to module scope so the two write paths cannot drift
+# apart in their conflict semantics — a batched write that resolved conflicts
+# differently from the single-row one would be a silent correctness bug.
+_UPSERT_SQL = """
+    INSERT INTO recon_ledger
+        (project_id, record_kind, task_id, flag_type, run_id,
+         payload_json, state, created_at, expires_at, entity_uuid)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(project_id, record_kind, task_id, flag_type, run_id) DO UPDATE SET
+        payload_json = excluded.payload_json,
+        state = excluded.state,
+        created_at = excluded.created_at,
+        expires_at = excluded.expires_at,
+        entity_uuid = excluded.entity_uuid
+"""
 
 
 @dataclass(frozen=True)
@@ -233,6 +251,22 @@ class ReconLedgerStore:
                 await db.rollback()
             raise
 
+    @staticmethod
+    def _upsert_params(record: ReconLedgerRecord) -> tuple:
+        """Bind parameters for :data:`_UPSERT_SQL`, in column order."""
+        return (
+            record.project_id,
+            record.record_kind,
+            record.task_id,
+            record.flag_type,
+            record.run_id,
+            record.payload_json,
+            record.state,
+            record.created_at,
+            record.expires_at,
+            record.entity_uuid,
+        )
+
     async def upsert(self, record: ReconLedgerRecord) -> None:
         """Insert or update a ledger record.
 
@@ -240,34 +274,44 @@ class ReconLedgerStore:
         overwrites ``payload_json``/``state``/``created_at``/``expires_at``
         with the new values (last-write-wins) — guarantees exactly one row
         per identity (journal.py's ``update_watermark`` precedent).
+
+        Use :meth:`upsert_many` when writing a batch: each call here is its own
+        transaction, hence its own commit and its own fsync.
         """
         async with self._txn() as db:
-            await db.execute(
-                """
-                INSERT INTO recon_ledger
-                    (project_id, record_kind, task_id, flag_type, run_id,
-                     payload_json, state, created_at, expires_at, entity_uuid)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(project_id, record_kind, task_id, flag_type, run_id) DO UPDATE SET
-                    payload_json = excluded.payload_json,
-                    state = excluded.state,
-                    created_at = excluded.created_at,
-                    expires_at = excluded.expires_at,
-                    entity_uuid = excluded.entity_uuid
-                """,
-                (
-                    record.project_id,
-                    record.record_kind,
-                    record.task_id,
-                    record.flag_type,
-                    record.run_id,
-                    record.payload_json,
-                    record.state,
-                    record.created_at,
-                    record.expires_at,
-                    record.entity_uuid,
-                ),
-            )
+            await db.execute(_UPSERT_SQL, self._upsert_params(record))
+
+    async def upsert_many(self, records: Sequence[ReconLedgerRecord]) -> int:
+        """Insert or update many records in ONE transaction (task 3041 amendment).
+
+        Identical ``ON CONFLICT`` semantics to :meth:`upsert`, batched through
+        ``executemany`` so N rows cost ONE commit instead of N. That matters
+        because this store opens its connection with full-durability pragmas:
+        every commit is an fsync, aiosqlite serializes all of them onto a
+        single worker thread, and the connection is shared with the rest of
+        the reconciliation cycle — so a per-row loop over a backlog sweep
+        (e.g. a marker pool that grew during a trim outage) turns into N
+        sequential fsyncs on the cycle's critical path.
+
+        Rows within a batch are applied in the given order, so if two records
+        share the same five-part identity the LAST one wins — the same
+        last-write-wins rule a sequence of :meth:`upsert` calls would produce.
+
+        An empty sequence is a no-op: no transaction is opened at all, so a
+        caller with nothing to write pays nothing.
+
+        Args:
+            records: The rows to write.
+
+        Returns:
+            The number of records submitted (``len(records)``).
+        """
+        params = [self._upsert_params(record) for record in records]
+        if not params:
+            return 0
+        async with self._txn() as db:
+            await db.executemany(_UPSERT_SQL, params)
+        return len(params)
 
     async def get_by_identity(
         self,

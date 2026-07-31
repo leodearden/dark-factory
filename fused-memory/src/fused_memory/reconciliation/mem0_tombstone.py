@@ -73,8 +73,10 @@ DOWN-import from both readers, never duplicated across the summary_pool edge.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 
 from fused_memory.reconciliation.recon_ledger import (
@@ -104,6 +106,7 @@ __all__ = [
     'RECORD_KIND_MEM0_TOMBSTONE',
     'is_protected_mirror_record',
     'record_mem0_deletion_tombstone',
+    'record_mem0_deletion_tombstones',
 ]
 
 # Retention window for tombstone rows. Follows the same rationale already
@@ -179,6 +182,48 @@ def is_protected_mirror_record(metadata) -> bool:
     return (
         metadata.get('kind') == _KIND_CYCLE_SUMMARY
         or metadata.get('record_type') == _RECORD_TYPE_LEDGER_STAMP
+    )
+
+
+def _build_tombstone_record(
+    project_id: str,
+    memory_id: str,
+    *,
+    victim_metadata: dict | None,
+    victim_created_at: str | None,
+    deleter: str,
+    deleting_run_id: str,
+    now_dt: datetime,
+) -> ReconLedgerRecord:
+    """Build the one ledger row describing a single confirmed deletion.
+
+    Pure and synchronous, and the SINGLE definition of a tombstone's shape —
+    both the one-victim and the batched writer below build through it, so the
+    row an auditor reads is identical no matter which path reaped the record.
+
+    ``task_id`` carries the victim's memory uuid while ``flag_type``/``run_id``
+    stay at their ``''`` defaults, so a later lookup needs only the one thing
+    an auditor actually knows. ``expires_at`` hands retention to the ``gc()``
+    pass ``_gc_recon_markers`` already runs every cycle.
+    """
+    metadata = victim_metadata if isinstance(victim_metadata, dict) else {}
+    payload = {
+        'deleter': deleter,
+        'deleting_run_id': deleting_run_id,
+        'deleted_at': now_dt.isoformat(),
+        'created_at': victim_created_at,
+        **{key: metadata.get(key) for key in _VICTIM_IDENTITY_KEYS},
+    }
+    return ReconLedgerRecord(
+        project_id=project_id,
+        record_kind=RECORD_KIND_MEM0_TOMBSTONE,
+        task_id=memory_id,
+        flag_type='',
+        run_id='',
+        payload_json=json.dumps(payload, default=str),
+        state='deleted',
+        created_at=now_dt.isoformat(),
+        expires_at=(now_dt + timedelta(days=MEM0_TOMBSTONE_TTL_DAYS)).isoformat(),
     )
 
 
@@ -260,28 +305,15 @@ async def record_mem0_deletion_tombstone(
         if ledger is None:
             return False
 
-        now_dt = _assume_utc(now or datetime.now(UTC))
-        metadata = victim_metadata if isinstance(victim_metadata, dict) else {}
-        payload = {
-            'deleter': deleter,
-            'deleting_run_id': deleting_run_id,
-            'deleted_at': now_dt.isoformat(),
-            'created_at': victim_created_at,
-            **{key: metadata.get(key) for key in _VICTIM_IDENTITY_KEYS},
-        }
         await ledger.upsert(
-            ReconLedgerRecord(
-                project_id=project_id,
-                record_kind=RECORD_KIND_MEM0_TOMBSTONE,
-                task_id=memory_id,
-                flag_type='',
-                run_id='',
-                payload_json=json.dumps(payload, default=str),
-                state='deleted',
-                created_at=now_dt.isoformat(),
-                expires_at=(
-                    now_dt + timedelta(days=MEM0_TOMBSTONE_TTL_DAYS)
-                ).isoformat(),
+            _build_tombstone_record(
+                project_id,
+                memory_id,
+                victim_metadata=victim_metadata,
+                victim_created_at=victim_created_at,
+                deleter=deleter,
+                deleting_run_id=deleting_run_id,
+                now_dt=_assume_utc(now or datetime.now(UTC)),
             )
         )
         return True
@@ -301,3 +333,100 @@ async def record_mem0_deletion_tombstone(
             },
         )
         return False
+
+
+async def record_mem0_deletion_tombstones(
+    memory_service,
+    project_id: str,
+    victims: Sequence[Mapping],
+    *,
+    deleter: str,
+    deleting_run_id: str,
+    now: datetime | None = None,
+) -> int:
+    """Tombstone a whole sweep's worth of deletions in ONE ledger transaction.
+
+    The batch form of :func:`record_mem0_deletion_tombstone`, and the form both
+    recon delete paths actually use (``_sweep_stale_mem0_pool`` and
+    ``summary_pool.enforce_summary_pool_cap``). Same row shape, same ordering
+    contract — call it only with victims whose delete is CONFIRMED successful.
+
+    Why batched (task 3041 amendment pass): a per-victim loop issued one
+    ``ReconLedgerStore.upsert`` per reaped record, and each upsert is its own
+    transaction committed on a single aiosqlite connection opened with
+    full-durability pragmas — one fsync per row, serialized on one worker
+    thread, on the connection the rest of the cycle is using. Marker pools are
+    normally small, but the cost scales linearly with a backlog sweep (a pool
+    that grew during a trim outage), so the fan-out belongs in ONE
+    ``upsert_many``: N rows, one commit, one fsync.
+
+    Fail-safe, like the singular form: no ``recon_ledger`` wired, an empty
+    victim list, or a raising batch write all degrade to one WARNING (none at
+    all for the two ordinary states) and a ``0`` return. It can never raise
+    into a delete sweep and never alters a sweep's returned count.
+
+    Note the batch failure mode is all-or-nothing by construction: the single
+    transaction means a mid-batch error rolls back every tombstone in it, so a
+    sweep either gets the whole audit trail or none of it (plus a WARNING
+    naming the count). That is strictly better than a partial trail nothing
+    reports, and the underlying deletes remain journaled by
+    ``WriteJournal.log_write_op`` either way.
+
+    Args:
+        memory_service: Service that may expose a ``recon_ledger`` attribute
+            (see the singular form for the optional-store precedent).
+        project_id: Project scope for the tombstone rows.
+        victims: The deleted members, in the shape both sweeps already hold —
+            mappings with ``'id'`` (the Mem0 uuid), ``'metadata'`` and
+            ``'created_at'``. A victim with no usable ``'id'`` is skipped.
+        deleter: The delete's ``_source`` audit tag — WHICH sweep took them.
+        deleting_run_id: The run that performed the deletions.
+        now: Reference "current time" for all rows in the batch (they share
+            one timestamp, which is accurate: one sweep, one instant).
+
+    Returns:
+        The number of tombstone rows written (``0`` when nothing was written).
+    """
+    try:
+        ledger = getattr(memory_service, 'recon_ledger', None)
+        if ledger is None:
+            return 0
+
+        now_dt = _assume_utc(now or datetime.now(UTC))
+        records = [
+            _build_tombstone_record(
+                project_id,
+                victim['id'],
+                victim_metadata=victim.get('metadata'),
+                victim_created_at=victim.get('created_at'),
+                deleter=deleter,
+                deleting_run_id=deleting_run_id,
+                now_dt=now_dt,
+            )
+            for victim in victims
+            if victim.get('id')
+        ]
+        if not records:
+            return 0
+
+        await ledger.upsert_many(records)
+        return len(records)
+    except Exception:
+        memory_ids = []
+        with contextlib.suppress(Exception):
+            memory_ids = [v.get('id') for v in victims]
+        logger.warning(
+            'reconciliation.record_mem0_deletion_tombstones: '
+            'batch tombstone write failed for %d victim(s) deleter=%s; '
+            'the deletes themselves still succeeded and remain journaled',
+            len(memory_ids),
+            deleter,
+            exc_info=True,
+            extra={
+                'project_id': project_id,
+                'memory_ids': memory_ids,
+                'deleter': deleter,
+                'run_id': deleting_run_id,
+            },
+        )
+        return 0

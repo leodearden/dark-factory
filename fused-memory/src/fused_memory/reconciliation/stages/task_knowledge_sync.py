@@ -43,7 +43,7 @@ from fused_memory.reconciliation.flag_dedup import (
 )
 from fused_memory.reconciliation.mem0_tombstone import (
     is_protected_mirror_record,
-    record_mem0_deletion_tombstone,
+    record_mem0_deletion_tombstones,
 )
 from fused_memory.reconciliation.policies import is_snapshot_write_blocked
 from fused_memory.reconciliation.prompts import (
@@ -999,11 +999,12 @@ async def _sweep_stale_mem0_pool(
     count.
 
     Every CONFIRMED-successful delete leaves a queryable tombstone via
-    :func:`~fused_memory.reconciliation.mem0_tombstone.record_mem0_deletion_tombstone`
+    :func:`~fused_memory.reconciliation.mem0_tombstone.record_mem0_deletion_tombstones`
     (task 3041), naming *gc_sweep_source* as the deleter and *run_id* as the
     deleting run — so an auditor holding only the memory uuid can find out who
     reaped it and why. Written from the success branch ONLY: a tombstone must
-    never claim a record that is still alive.
+    never claim a record that is still alive, and written for the whole sweep
+    in ONE ledger transaction rather than one commit (one fsync) per victim.
 
     Args:
         memory_service: Service with ``get_memories_by_metadata`` and
@@ -1154,7 +1155,7 @@ async def _sweep_stale_mem0_pool(
     )
 
     success_count = 0
-    tombstone_writes = []
+    tombstone_victims = []
     for member, result in zip(stale_members, results, strict=True):
         mid = member['id']
         if isinstance(result, Exception):
@@ -1167,25 +1168,37 @@ async def _sweep_stale_mem0_pool(
             success_count += 1
             # Success branch ONLY (task 3041): a tombstone must never claim a
             # record that is still alive, so the failed-delete branch above is
-            # deliberately left untouched. record_mem0_deletion_tombstone is
-            # internally fail-safe (returns False, never raises), and the
-            # gather_collect below is a second belt so even a helper that is
-            # patched/broken cannot raise out of, or alter the count of, this
-            # sweep.
-            tombstone_writes.append(
-                record_mem0_deletion_tombstone(
-                    memory_service,
-                    project_id,
-                    mid,
-                    victim_metadata=member.get('metadata'),
-                    victim_created_at=member.get('created_at'),
-                    deleter=gc_sweep_source,
-                    deleting_run_id=run_id,
-                )
-            )
+            # deliberately left untouched.
+            tombstone_victims.append(member)
 
-    if tombstone_writes:
-        await gather_collect(tombstone_writes)
+    if tombstone_victims:
+        # ONE ledger transaction for the whole sweep, not one per victim: each
+        # upsert is its own commit — hence its own fsync, serialized on the
+        # single aiosqlite worker thread the rest of the cycle shares — so a
+        # per-victim loop made a backlog sweep cost N sequential fsyncs on the
+        # cycle's critical path (reviewer finding efficiency, task 3041
+        # amendment pass).
+        #
+        # record_mem0_deletion_tombstones is internally fail-safe (returns 0,
+        # never raises); this try/except is a second belt so even a helper that
+        # is patched/broken cannot raise out of, or alter the count of, this
+        # sweep — while still saying so out loud.
+        try:
+            await record_mem0_deletion_tombstones(
+                memory_service,
+                project_id,
+                tombstone_victims,
+                deleter=gc_sweep_source,
+                deleting_run_id=run_id,
+            )
+        except Exception:
+            logger.warning(
+                'reconciliation.%s: tombstone batch raised for %d deleted record(s); '
+                'the deletes themselves succeeded and are counted',
+                log_name, len(tombstone_victims),
+                exc_info=True,
+                extra={'project_id': project_id, 'run_id': run_id},
+            )
 
     return success_count
 
