@@ -977,9 +977,15 @@ def _write_perf_archive(esc_dir: Path, now: datetime, n: int) -> int:
 
 
 class TestBuildEscalationAnalyticsPerf:
-    """PRD boundary row 7: a cold ~10k-record archive walk completes in < 5s."""
+    """PRD boundary row 7: a cold ~10k-record archive walk stays within a
+    CPU-time budget.
 
-    def test_cold_10k_archive_under_5_seconds(self, tmp_path):
+    This is an O(n^2) archive-walk regression guard, not a wall-clock SLA
+    — see the in-body comment on the assertion for why the measure is
+    CPU time rather than wall-clock, and how the budget was derived.
+    """
+
+    def test_cold_10k_archive_cpu_budget(self, tmp_path):
         import time
 
         from dashboard.data.escalation_analytics import build_escalation_analytics
@@ -1008,14 +1014,23 @@ class TestBuildEscalationAnalyticsPerf:
         # process — it excludes time spent waiting for a CPU slot or for
         # disk I/O while other processes (xdist workers, sibling worktree
         # verifies) are scheduled, so it stays stable regardless of host
-        # contention while still catching a real O(n^2) blowup (which would
-        # burn far more than 15s of actual CPU at 10k records). No
+        # contention while still catching a real O(n^2) blowup. No
         # single-worker gate is needed: the measure itself is
         # contention-insensitive. The correctness assertions below always
         # run, including under xdist.
-        assert cpu_elapsed < 15.0, (
+        #
+        # Budget derivation (task 3344 amendment): observed 0.81-1.09s CPU
+        # across 4 repeated runs on this dev host, taken *while* it was
+        # itself under heavy contention (32 cores, loadavg 150+) — if
+        # anything an overestimate of a quiet-host baseline, since
+        # process_time is expected to be stable regardless of load. Budget
+        # is 5.0s, ~5x that observed baseline: enough slack for slower or
+        # differently-provisioned CI hardware, tight enough that a real
+        # O(n^2) blowup at 10k records — which would cost orders of
+        # magnitude more CPU, not a small multiple — still trips it.
+        assert cpu_elapsed < 5.0, (
             f'cold build_escalation_analytics used {cpu_elapsed:.2f}s of CPU time '
-            '(budget 15.0s)'
+            '(budget 5.0s)'
         )
 
         # Well-formed at scale: parse_failures==0 (every fixture record is
