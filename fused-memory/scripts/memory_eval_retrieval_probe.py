@@ -1021,7 +1021,33 @@ def stores_served(results: list, k: int) -> tuple[str, ...]:
     return tuple(sorted(seen))
 
 
-def canonical_hit(results: list, entry: RegistryEntry, k: int) -> MatchOutcome:
+def rank_index(results: list) -> dict[str, int]:
+    """``{content_hash: first rank}`` over the WHOLE of *results*, hashed once.
+
+    One search's list is read by three separate metric families — canonical
+    presence at every ``k``, superseded inversions, and the comparable-pair
+    exposure that inversion count is per — and each of them wants the same
+    question answered: at what rank did this content hash come back. Computing
+    it here means the list is sha256'd once per query rather than once per
+    consumer.
+
+    ``setdefault`` keeps the FIRST rank: a store that returned the same content
+    twice has still returned it at its best rank, and taking the later one
+    would report a ranking problem that is really a duplication one.
+    """
+    first_rank: dict[str, int] = {}
+    for index, result in enumerate(results, start=1):
+        first_rank.setdefault(content_key(_result_content(result)), index)
+    return first_rank
+
+
+def canonical_hit(
+    results: list,
+    entry: RegistryEntry,
+    k: int,
+    *,
+    ranks: dict[str, int] | None = None,
+) -> MatchOutcome:
     """Find *entry*'s canonical in *results*, honouring the top-*k* cut.
 
     Content hash first, ``last_known_id`` second (D5): memory UUIDs rot on
@@ -1033,22 +1059,25 @@ def canonical_hit(results: list, entry: RegistryEntry, k: int) -> MatchOutcome:
     The whole list is scanned, not just its first *k*, so a canonical that came
     back at rank k+3 is reported at its true rank instead of as "absent" — a
     ranking problem and an absence problem need different fixes.
+
+    *ranks* is :func:`rank_index` of the same list, threaded in by a caller
+    that already built it (the probe band calls this once per ``k``). Optional
+    rather than required so every direct caller and test keeps the one-argument
+    shape; computed here when absent, and the answer is identical either way.
     """
     canonical = entry.canonical
-    hash_rank: int | None = None
+    if ranks is None:
+        ranks = rank_index(results)
+    hash_rank = ranks.get(canonical.content_hash)
     id_rank: int | None = None
 
-    for index, result in enumerate(results, start=1):
-        if hash_rank is None and content_key(_result_content(result)) == canonical.content_hash:
-            hash_rank = index
-        if (
-            id_rank is None
-            and canonical.last_known_id
-            and _result_id(result) == canonical.last_known_id
-        ):
-            id_rank = index
-        if hash_rank is not None and id_rank is not None:
-            break
+    # Only when the primary matcher missed: the id is the FALLBACK, and its
+    # rank is never read when the hash has one.
+    if hash_rank is None and canonical.last_known_id:
+        for index, result in enumerate(results, start=1):
+            if _result_id(result) == canonical.last_known_id:
+                id_rank = index
+                break
 
     if hash_rank is not None:
         return MatchOutcome(
@@ -1068,9 +1097,13 @@ def observe_phrasing(
     k: int,
     *,
     degraded: bool = False,
+    ranks: dict[str, int] | None = None,
 ) -> PhrasingObservation:
-    """Build the (topic, phrasing, k) observation the metrics aggregate over."""
-    outcome = canonical_hit(results, entry, k)
+    """Build the (topic, phrasing, k) observation the metrics aggregate over.
+
+    *ranks* is passed straight through to :func:`canonical_hit` — see there.
+    """
+    outcome = canonical_hit(results, entry, k, ranks=ranks)
     return PhrasingObservation(
         topic=entry.topic,
         phrasing=phrasing.text,
@@ -1106,11 +1139,37 @@ class InversionRecord:
     successor_rank: int
 
 
+def comparable_pairs(
+    entry: RegistryEntry, ranks: dict[str, int] | None = None, results: list | None = None,
+) -> int:
+    """Registry pairs with BOTH members in the returned list — the real exposure.
+
+    This is the count metric's ``n``, and it is deliberately not
+    ``len(entry.supersedes_pairs)``. :func:`superseded_inversions` can only
+    ever fire on a both-present pair, so a pair with one member missing
+    contributes no possibility of an event. Charging it to the denominator
+    anyway makes the rate move for the wrong reason: if retrieval improves so
+    that 40 pairs come back both-present instead of 4, the event count can rise
+    while a registered-pair ``n`` stays pinned — and leaf α's Poisson tail test
+    reads a retrieval IMPROVEMENT as a rate regression.
+
+    Pass *ranks* (:func:`rank_index` of the same list) when the caller already
+    has it; *results* is the fallback for a direct caller that does not.
+    """
+    if ranks is None:
+        ranks = rank_index(results or [])
+    return sum(
+        1 for pair in entry.supersedes_pairs
+        if pair.superseded_hash in ranks and pair.successor_hash in ranks
+    )
+
+
 def superseded_inversions(
     results: list,
     entry: RegistryEntry,
     *,
     phrasing: str = '',
+    ranks: dict[str, int] | None = None,
 ) -> list[InversionRecord]:
     """Registry-recorded pairs where the superseded entry outranks its successor.
 
@@ -1118,6 +1177,8 @@ def superseded_inversions(
     An absent successor is a findability question ``canonical-in-top-k`` already
     measures, and counting it here as well would charge one defect against two
     metrics — inflating any downstream trend by double-weighting a single fix.
+    :func:`comparable_pairs` counts the same both-present population, which is
+    why it — and not the registered-pair count — is the metric's exposure.
 
     Rank is the position in the list the store returned, so equal
     ``relevance_score`` values resolve by that order rather than by an unstable
@@ -1130,10 +1191,7 @@ def superseded_inversions(
     if not entry.supersedes_pairs:
         return []
 
-    first_rank: dict[str, int] = {}
-    for index, result in enumerate(results, start=1):
-        key = content_key(_result_content(result))
-        first_rank.setdefault(key, index)
+    first_rank = rank_index(results) if ranks is None else ranks
 
     inversions: list[InversionRecord] = []
     for pair in entry.supersedes_pairs:
@@ -1411,15 +1469,29 @@ class ContaminationObservation:
 class InversionObservation:
     """The inversions found in one (topic, phrasing) probe, plus its exposure.
 
-    ``pairs_examined`` is the count metric's ``n``. A Poisson tail test needs
-    the exposure the rate is per: 2 inversions out of 4 registry pairs probed
-    and 2 out of 400 are not the same observation, and a bare event count would
-    make a run that probed more pairs look like a regression.
+    TWO exposure numbers, deliberately. A Poisson tail test needs the exposure
+    the rate is per — 2 inversions out of 4 pairs and 2 out of 400 are not the
+    same observation — but it needs the exposure that could actually have
+    produced an event.
+
+    ``pairs_registered`` is every pair the registry recorded for this topic.
+    ``pairs_comparable`` is the subset with BOTH members in the returned list,
+    which is the only population :func:`superseded_inversions` can fire on, and
+    therefore the one that becomes the metric's ``n``. Using the registered
+    count instead makes a retrieval IMPROVEMENT (more pairs coming back
+    both-present, so more events observable) read to the evaluator as a rate
+    regression against an ``n`` that never moved.
+
+    The registered count rides along because the ratio between the two is
+    itself the signal: comparable ≪ registered means most pairs are not being
+    returned at all, which is a findability fact ``canonical-in-top-k``
+    measures and this metric must not be read as if it had.
     """
 
     topic: str
     phrasing: str
-    pairs_examined: int
+    pairs_registered: int
+    pairs_comparable: int
     inversions: tuple[InversionRecord, ...] = ()
     degraded: bool = False
 
@@ -1470,8 +1542,9 @@ def _proportion(
     non-positive denominator, and rightly — a proportion over zero trials is
     not a measurement of anything, and emitting one would put a fabricated
     trial into the baseline window the evaluator computes limits from. An
-    absent metric is the honest signal, and the report says which family went
-    unmeasured (a metric that vanishes without explanation reads as healthy).
+    absent metric is the honest signal, and
+    :func:`metric_families_not_measured` puts the absence in the report (a
+    metric that vanishes without explanation reads as healthy).
     """
     from shared.memory_eval_metrics import Metric  # noqa: PLC0415
 
@@ -1641,13 +1714,21 @@ def build_series(
     if metric is not None:
         metrics.append(metric)
 
+    # Exposure, not observation count. `if inversions:` emitted a value=0 / n=0
+    # count metric for any selection whose entries record no supersedes pair —
+    # a fabricated "no inversions here" datapoint entering leaf α's baseline
+    # window. That is the same hazard `_proportion` refuses a 0/0 proportion
+    # for, and a count kind has no more claim to a zero-trial measurement than
+    # a proportion does. Absent is the honest signal, and the report names the
+    # family so the absence cannot read as health.
     inversions = [i for i in observations.inversions if not i.degraded]
-    if inversions:
+    exposure = sum(i.pairs_comparable for i in inversions)
+    if exposure > 0:
         metrics.append(Metric(
             metric_id=METRIC_SUPERSEDED_ABOVE_SUCCESSOR,
             kind='count',
             value=float(sum(len(i.inversions) for i in inversions)),
-            n=sum(i.pairs_examined for i in inversions),
+            n=exposure,
             direction='higher_is_worse',
             details_path=details_path,
         ))
@@ -1671,6 +1752,40 @@ def build_series(
     )
     validate_metric_series(series)
     return series
+
+
+def pinned_metric_ids(ks: tuple[int, ...]) -> tuple[str, ...]:
+    """Every metric_id a run at *ks* is expected to emit.
+
+    THE list this leaf owns, in one place, so "which family went unmeasured"
+    is answerable by comparing against it rather than by remembering what
+    :func:`build_series` can emit. ``ks`` goes through :func:`normalise_ks`
+    for the same reason the run does: the tripwire's depth is always measured.
+    """
+    return (
+        METRIC_TOPIC_CANONICAL_PRESENT,
+        *(METRIC_CANONICAL_IN_TOP_K.format(k=k) for k in normalise_ks(tuple(ks))),
+        METRIC_CANONICAL_IN_TOP_K_HELD_OUT.format(k=TRIPWIRE_K),
+        METRIC_CLAIM_RECALL,
+        METRIC_CONTAMINATION_SHARE,
+        METRIC_SUPERSEDED_ABOVE_SUCCESSOR,
+    )
+
+
+def metric_families_not_measured(series, ks: tuple[int, ...]) -> list[str]:
+    """Pinned metric ids *series* does not carry, in the pinned order.
+
+    Every family in this runner declines to emit rather than emit a
+    zero-trial datapoint: ``_proportion`` refuses a 0/0 proportion, and the
+    count metric refuses a zero-exposure count, because a fabricated trial in
+    leaf α's baseline window is worse than a gap in it. But an absent metric
+    is not an error to the evaluator either — it joins by metric_id and simply
+    stops trending what is missing. So the absence is named HERE, in the run's
+    own report, where the alternative is a metric that silently stops existing
+    and reads to a human as one that had nothing to report.
+    """
+    present = {metric.metric_id for metric in series.metrics}
+    return [metric_id for metric_id in pinned_metric_ids(ks) if metric_id not in present]
 
 
 def not_measured_topics(
@@ -1786,9 +1901,12 @@ async def probe_topic(
                 failed_stores=info.failed_stores,
                 diagnostics=info.diagnostics,
             ))
+        # Hashed ONCE per search, then read by every consumer below: canonical
+        # presence at each k, the inversions, and their comparable exposure.
+        ranks = rank_index(info.results)
         for k in ks:
             observations.phrasings.append(observe_phrasing(
-                info.results, entry, phrasing, k, degraded=info.degraded,
+                info.results, entry, phrasing, k, degraded=info.degraded, ranks=ranks,
             ))
         outcome = classify_contamination(info.results, entry, registry, scored_k)
         observations.contamination.append(ContaminationObservation(
@@ -1804,9 +1922,12 @@ async def probe_topic(
         observations.inversions.append(InversionObservation(
             topic=entry.topic,
             phrasing=phrasing.text,
-            pairs_examined=len(entry.supersedes_pairs),
+            pairs_registered=len(entry.supersedes_pairs),
+            pairs_comparable=comparable_pairs(entry, ranks),
             inversions=tuple(
-                superseded_inversions(info.results, entry, phrasing=phrasing.text),
+                superseded_inversions(
+                    info.results, entry, phrasing=phrasing.text, ranks=ranks,
+                ),
             ),
             degraded=info.degraded,
         ))
@@ -1890,6 +2011,7 @@ _KNOWN_BAD_ROUTING_CAVEAT = (
 
 
 SECTION_METRIC_TABLE = 'metric-table'
+SECTION_FAMILIES_NOT_MEASURED = 'metric-families-not-measured'
 SECTION_INITIAL_STATE = 'initial-state'
 SECTION_KNOWN_BAD_ROUTING_CAVEAT = 'initial-state-routing-caveat'
 SECTION_KNOWN_BAD_ITEMS = 'initial-state-known-bad-items'
@@ -1955,6 +2077,33 @@ def probe_report_sections(
         sections.append(ReportSection(key=key, lines=tuple(lines)))
 
     emit(SECTION_METRIC_TABLE, [render_report(series).rstrip('\n')])
+
+    # Directly under the table it qualifies: a family missing from the rows
+    # above is the one absence a reader cannot see by reading them.
+    absent_families = metric_families_not_measured(
+        series,
+        # The depths this run actually scored, when the caller did not say.
+        # Assuming DEFAULT_KS instead would name canonical-in-top-10 as
+        # unmeasured on a run that never asked for k=10 — a false narrowing
+        # report is no better than a hidden one.
+        tuple(measured_ks) or tuple(dict.fromkeys(o.k for o in observations.phrasings)),
+    )
+    if absent_families:
+        lines = ['']
+        lines.append(f'metric families NOT MEASURED this run ({len(absent_families)}):')
+        for chunk in _wrap(
+            'These metrics had no scored trial, so they were not emitted — a '
+            'proportion over zero trials and a count over zero exposure are '
+            'not measurements, and emitting either would put a fabricated '
+            'datapoint into the baseline window the limits evaluator computes '
+            'from. Their absence is NOT a pass: the evaluator joins a run to '
+            'its baseline BY metric_id and simply stops trending what is '
+            'missing, so the gap is said here rather than left to be inferred '
+            'from which rows happen to be present.'
+        ):
+            lines.append(f'  {chunk}')
+        lines.extend(f'  - {metric_id}' for metric_id in absent_families)
+        emit(SECTION_FAMILIES_NOT_MEASURED, lines)
 
     if is_initial_run:
         failing = [

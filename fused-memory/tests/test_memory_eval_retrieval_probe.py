@@ -944,6 +944,23 @@ class TestCanonicalHit:
         assert not outcome.hit
         assert outcome.unmatched
 
+    @pytest.mark.parametrize('content', [CANON, 'a reworded canonical', 'unrelated'])
+    def test_a_threaded_rank_index_gives_the_same_outcome(self, content):
+        """The hash-once refactor must not be a behaviour change.
+
+        Parameterised across all three matcher outcomes — hash hit, id
+        fallback, unmatched — because the threaded index short-circuits the
+        hash arm and only the fallback still walks the list.
+        """
+        m = _mod()
+        entry = _entry(content=CANON, last_known_id='ID-1')
+        results = [*_filler(2), _R(content=content, id='ID-1')]
+
+        assert (
+            m.canonical_hit(results, entry, 5, ranks=m.rank_index(results))
+            == m.canonical_hit(results, entry, 5)
+        )
+
 
 class TestObservationBuilder:
     def test_records_topic_phrasing_and_k(self):
@@ -1085,6 +1102,110 @@ class TestSupersededInversions:
 
     def test_entry_without_pairs_yields_nothing(self):
         assert _mod().superseded_inversions(_filler(3), _entry()) == []
+
+    def test_a_threaded_rank_index_gives_the_same_answer(self):
+        """The hash-once refactor must not be a behaviour change.
+
+        `probe_topic` builds the index once per search and hands it to every
+        consumer; a direct caller passes nothing. Both paths read the same
+        list, so both must produce the same records.
+        """
+        m = _mod()
+        entry = _pair_entry()
+        results = [_R(content='old text', id='A'), _R(content='new text', id='B')]
+
+        assert (
+            m.superseded_inversions(results, entry, ranks=m.rank_index(results))
+            == m.superseded_inversions(results, entry)
+        )
+
+
+class TestComparablePairs:
+    """`comparable_pairs(entry, ranks)` — the exposure the count metric is per.
+
+    Only a pair with BOTH members in the returned list can produce an event,
+    so only such a pair belongs in the denominator. A registered-pair count
+    would make a retrieval improvement read as a rate regression.
+    """
+
+    def test_both_members_present_is_one_comparable_pair(self):
+        m = _mod()
+        entry = _pair_entry()
+        results = [_R(content='old text'), _R(content='new text')]
+
+        assert m.comparable_pairs(entry, m.rank_index(results)) == 1
+
+    @pytest.mark.parametrize('present', ['old text', 'new text'])
+    def test_one_member_present_is_no_exposure(self, present):
+        m = _mod()
+        results = [*_filler(2), _R(content=present)]
+
+        assert m.comparable_pairs(_pair_entry(), m.rank_index(results)) == 0
+
+    def test_neither_member_present_is_no_exposure(self):
+        m = _mod()
+
+        assert m.comparable_pairs(_pair_entry(), m.rank_index(_filler(3))) == 0
+
+    def test_it_counts_the_same_population_the_inversions_come_from(self):
+        """The invariant that makes it a valid denominator: events <= exposure."""
+        m = _mod()
+        base = _entry(topic='multi', content='c1')
+        entry = m.RegistryEntry(
+            topic=base.topic, project_id=base.project_id,
+            derived_from=base.derived_from, canonical=base.canonical,
+            phrasings=base.phrasings,
+            supersedes_pairs=(
+                m.SupersedesPair(m.content_key('o1'), m.content_key('c1')),
+                m.SupersedesPair(m.content_key('o2'), m.content_key('c2')),
+                m.SupersedesPair(m.content_key('o3'), m.content_key('c3')),
+            ),
+        )
+        results = [_R(content='o1'), _R(content='c1'), _R(content='o2'), _R(content='c2')]
+        ranks = m.rank_index(results)
+
+        assert m.comparable_pairs(entry, ranks) == 2, 'the o3/c3 pair never came back'
+        assert len(m.superseded_inversions(results, entry, ranks=ranks)) <= 2
+
+    def test_an_entry_without_pairs_has_no_exposure(self):
+        m = _mod()
+
+        assert m.comparable_pairs(_entry(), m.rank_index(_filler(3))) == 0
+
+    def test_results_are_accepted_when_no_index_was_built(self):
+        """The direct-caller shape, for a caller that has the list only."""
+        m = _mod()
+        results = [_R(content='old text'), _R(content='new text')]
+
+        assert m.comparable_pairs(_pair_entry(), None, results) == 1
+
+
+class TestRankIndex:
+    """`rank_index(results)` — one hash pass per search, read by three families."""
+
+    def test_it_maps_each_content_hash_to_its_rank(self):
+        m = _mod()
+        ranks = m.rank_index([_R(content='first'), _R(content='second')])
+
+        assert ranks[m.content_key('first')] == 1
+        assert ranks[m.content_key('second')] == 2
+
+    def test_a_repeated_entry_keeps_its_best_rank(self):
+        """Taking the later position would report a duplication as a ranking
+        problem."""
+        m = _mod()
+        ranks = m.rank_index([_R(content='dup'), *_filler(2), _R(content='dup')])
+
+        assert ranks[m.content_key('dup')] == 1
+
+    def test_it_normalises_whitespace_exactly_as_content_key_does(self):
+        m = _mod()
+        ranks = m.rank_index([_R(content='  the   canonical\n text  ')])
+
+        assert ranks[m.content_key('the canonical text')] == 1
+
+    def test_an_empty_list_indexes_nothing(self):
+        assert _mod().rank_index([]) == {}
 
 
 class TestContentKey:
@@ -1554,12 +1675,15 @@ def _contam_obs(topic, *, foreign=0, untopiced=0, scored=5, degraded=False):
     )
 
 
-def _inversion_obs(topic, *, pairs=2, inversions=0, degraded=False):
+def _inversion_obs(topic, *, pairs=2, comparable=None, inversions=0, degraded=False):
     m = _mod()
     return m.InversionObservation(
         topic=topic,
         phrasing='q',
-        pairs_examined=pairs,
+        pairs_registered=pairs,
+        # Default: every registered pair came back both-present. Tests that
+        # care about the exposure gap set it explicitly.
+        pairs_comparable=pairs if comparable is None else comparable,
         inversions=tuple(
             m.InversionRecord(
                 topic=topic, phrasing='q',
@@ -1738,6 +1862,55 @@ class TestBuildSeries:
 
         assert count.value == 2
         assert count.n == 4, 'n is the pairs examined — the exposure the rate is per'
+
+    def test_n_is_the_comparable_pairs_not_every_registered_one(self):
+        """The exposure has to be the population that could produce an event.
+
+        `superseded_inversions` only ever fires on a pair with BOTH members in
+        the returned list. Counting every registered pair means that when
+        retrieval IMPROVES — 4 pairs coming back both-present instead of 1 —
+        the event count can rise while n stays pinned, and leaf alpha's
+        Poisson tail test reads the improvement as a rate regression.
+        """
+        series = _build(_mod().ProbeObservations(
+            phrasings=[_phrasing_obs('alpha-topic', 'h', held_out=True)],
+            inversions=[
+                _inversion_obs('alpha-topic', pairs=50, comparable=3, inversions=1),
+                _inversion_obs('beta-topic', pairs=50, comparable=1, inversions=0),
+            ],
+        ))
+        count = {m.metric_id: m for m in series.metrics}['superseded-above-successor']
+
+        assert count.value == 1
+        assert count.n == 4, 'n counts both-present pairs, not the 100 registered'
+
+    def test_a_count_over_zero_exposure_is_absent_not_zero(self):
+        """The count kind gets the same refusal `_proportion` gives.
+
+        Reachable today via any --registry/--project-id selection whose
+        entries record no supersedes pair: the observations exist (one per
+        phrasing), so `if inversions:` was true, and the run emitted
+        value=0 / n=0 — a fabricated 'no inversions here' datapoint entering
+        leaf alpha's baseline window.
+        """
+        series = _build(_mod().ProbeObservations(
+            phrasings=[_phrasing_obs('alpha-topic', 'h', held_out=True)],
+            inversions=[
+                _inversion_obs('alpha-topic', pairs=0, inversions=0),
+                _inversion_obs('beta-topic', pairs=0, inversions=0),
+            ],
+        ))
+
+        assert 'superseded-above-successor' not in {m.metric_id for m in series.metrics}
+
+    def test_no_comparable_pair_is_also_zero_exposure(self):
+        """Registered pairs that never both came back measure nothing either."""
+        series = _build(_mod().ProbeObservations(
+            phrasings=[_phrasing_obs('alpha-topic', 'h', held_out=True)],
+            inversions=[_inversion_obs('alpha-topic', pairs=12, comparable=0)],
+        ))
+
+        assert 'superseded-above-successor' not in {m.metric_id for m in series.metrics}
 
     def test_corpus_carries_the_project_and_the_counts(self):
         """(f) The per-category mapping, passed through."""
@@ -2170,7 +2343,8 @@ def _report_observations():
         claims=[_claim_obs('alpha-topic', 'a claim', recalled=False)],
         contamination=[_contam_obs('alpha-topic', foreign=1, untopiced=3, scored=5)],
         inversions=[m.InversionObservation(
-            topic='alpha-topic', phrasing='tuned', pairs_examined=1,
+            topic='alpha-topic', phrasing='tuned',
+            pairs_registered=1, pairs_comparable=1,
             inversions=(m.InversionRecord(
                 topic='alpha-topic', phrasing='tuned',
                 superseded_hash='dead' * 4, successor_hash='beef' * 4,
@@ -2307,6 +2481,72 @@ class TestProbeReport:
         keys = _section_keys(_report_series(), _report_observations())
 
         assert m.SECTION_INITIAL_STATE not in keys
+
+    def test_an_unmeasured_metric_family_is_named_not_left_to_be_inferred(self):
+        """A metric that silently stops existing reads to a human as one with
+        nothing to report, and to the evaluator as nothing at all.
+
+        Every family here declines to emit over zero trials rather than
+        fabricate a datapoint. That refusal is only honest if the gap is
+        stated: leaf alpha joins by metric_id and simply stops trending what
+        is missing, so nothing downstream would ever say so.
+        """
+        m = _mod()
+        observations = m.ProbeObservations(
+            phrasings=[_phrasing_obs('alpha-topic', 'h', held_out=True)],
+        )
+        sections = _sections(_build(observations), observations)
+
+        block = sections[m.SECTION_FAMILIES_NOT_MEASURED].text
+        assert m.METRIC_CLAIM_RECALL in block
+        assert m.METRIC_CONTAMINATION_SHARE in block
+        assert m.METRIC_SUPERSEDED_ABOVE_SUCCESSOR in block
+        assert m.METRIC_CANONICAL_IN_TOP_K.format(k=5) not in block
+
+    def test_the_unmeasured_family_block_sits_under_the_table_it_qualifies(self):
+        """A reader cannot see the gap by reading the rows — so it goes at
+        the rows."""
+        m = _mod()
+        observations = m.ProbeObservations(
+            phrasings=[_phrasing_obs('alpha-topic', 'h', held_out=True)],
+        )
+        keys = _section_keys(_build(observations), observations)
+
+        assert (
+            keys.index(m.SECTION_METRIC_TABLE)
+            < keys.index(m.SECTION_FAMILIES_NOT_MEASURED)
+        )
+
+    def test_a_fully_measured_run_carries_no_such_block(self):
+        """Silence is right when there is nothing to disclose."""
+        m = _mod()
+        keys = _section_keys(_build(), _observations())
+
+        assert m.SECTION_FAMILIES_NOT_MEASURED not in keys
+
+    def test_a_depth_the_run_never_scored_is_not_reported_as_a_gap(self):
+        """A false narrowing report is no better than a hidden one.
+
+        With no measured_ks the block reads the depths off the observations,
+        so a run that only ever scored k=5 must not name canonical-in-top-10
+        (which nobody asked for) as unmeasured.
+        """
+        m = _mod()
+        observations = _observations(ks=(5,))
+        sections = _sections(_build(observations, ks=(5,)), observations)
+
+        assert m.SECTION_FAMILIES_NOT_MEASURED not in sections
+
+    def test_a_requested_depth_that_produced_nothing_is_named(self):
+        """The other half: a depth the caller DID ask for and did not get."""
+        m = _mod()
+        observations = _observations(ks=(5,))
+        sections = _sections(
+            _build(observations, ks=(5,)), observations, measured_ks=(5, 10),
+        )
+
+        block = sections[m.SECTION_FAMILIES_NOT_MEASURED].text
+        assert m.METRIC_CANONICAL_IN_TOP_K.format(k=10) in block
 
     def test_the_report_carries_the_matched_by_breakdown(self):
         """(d) step-7's dual matcher, made visible — with its COUNTS.
@@ -2514,6 +2754,12 @@ def _scoped_entry(topic, *, project_id='dark_factory'):
     The step-17 helpers deliberately share query strings across topics; here
     they must not, because these tests assert WHICH project each individual
     query was scoped to.
+
+    It records ONE supersedes pair, and `_canned_hits` returns both members,
+    so `superseded-above-successor` has real exposure. Without it the metric
+    is correctly absent (a count over zero comparable pairs is not a
+    measurement), and these tests would be asserting the pinned metric set
+    against a run that legitimately cannot produce all of it.
     """
     m = _mod()
     content = f'the {topic} canonical text'
@@ -2531,7 +2777,16 @@ def _scoped_entry(topic, *, project_id='dark_factory'):
             m.Phrasing(f'{topic} held out', True),
         ),
         claim_queries=(m.ClaimQuery(query=f'{topic} claim', needles=('canonical text',)),),
+        supersedes_pairs=(m.SupersedesPair(
+            superseded_hash=m.content_key(_superseded_text(topic)),
+            successor_hash=m.content_key(content),
+        ),),
     )
+
+
+def _superseded_text(topic: str) -> str:
+    """The entry `_scoped_entry`'s canonical replaced."""
+    return f'the {topic} superseded text'
 
 
 def _probe_registry(*, project_id='dark_factory'):
@@ -2544,14 +2799,21 @@ def _probe_registry(*, project_id='dark_factory'):
 
 
 def _canned_hits(registry):
-    """Canned SearchResults returning each topic's canonical for every query."""
+    """Canned SearchResults returning each topic's canonical for every query.
+
+    The superseded member rides along BELOW the canonical: the pair is then
+    comparable (both members returned, so the count metric has exposure) and
+    correctly ordered (no inversion). Zero events over positive exposure is a
+    real measurement; zero events over zero exposure is not one.
+    """
     by_query = {}
     for entry in registry.entries:
         hit = _R(content=entry.canonical.content_prefix, id=entry.canonical.last_known_id)
+        old = _R(content=_superseded_text(entry.topic), id=f'OLD-{entry.topic}')
         for phrasing in entry.phrasings:
-            by_query[phrasing.text] = _canned(hit, *_filler(4))
+            by_query[phrasing.text] = _canned(hit, old, *_filler(3))
         for claim in entry.claim_queries:
-            by_query[claim.query] = _canned(hit, *_filler(4))
+            by_query[claim.query] = _canned(hit, old, *_filler(3))
     return by_query
 
 
@@ -3437,6 +3699,42 @@ class TestStoresServedDisclosure:
 
         assert counts['observations_served_by_mem0'] == 1
         assert counts['observations_served_by_graphiti'] == 1
+
+    def test_the_probe_band_records_both_exposures_distinctly(self):
+        """Registered pairs and comparable pairs are different facts.
+
+        The entry records two pairs; the canned list returns both members of
+        one and neither of the other. `n` is built from the comparable count,
+        and the registered count rides along because comparable << registered
+        is itself the signal that most pairs are not coming back at all.
+        """
+        import asyncio  # noqa: PLC0415
+
+        m = _mod()
+        base = _probe_entry()
+        entry = m.RegistryEntry(
+            topic=base.topic, project_id=base.project_id,
+            derived_from=base.derived_from, canonical=base.canonical,
+            phrasings=(m.Phrasing('tuned query', False), m.Phrasing('held out query', True)),
+            supersedes_pairs=(
+                m.SupersedesPair(m.content_key('came back'), m.content_key(CANON)),
+                m.SupersedesPair(m.content_key('never returned'), m.content_key('nor this')),
+            ),
+        )
+        registry = m.TopicRegistry(schema_version=1, entries=(entry,))
+        observations = m.ProbeObservations()
+        search = _search_returning(
+            {},
+            default_factory=lambda: _healthy([
+                _R(content=CANON, id='ID-1'), _R(content='came back', id='OLD'),
+            ]),
+        )
+
+        asyncio.run(m.probe_topic(search, entry, registry, (5,), observations))
+
+        for obs in observations.inversions:
+            assert obs.pairs_registered == 2
+            assert obs.pairs_comparable == 1, 'only one pair had both members back'
 
     def test_the_probe_band_threads_the_served_stores_through(self):
         """The wiring, not just the dataclass field."""
