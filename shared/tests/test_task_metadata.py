@@ -1490,6 +1490,34 @@ class TestParseMetadataFailurePolicy:
             f'Expected no unknown_key warning for cross_repo_project; got: {sorted(unknown_key_fields)}'
         )
 
+    def test_human_curator_gate_metadata_keys_are_blessed(self):
+        """The human-curator-gate contract must not census-warn (task 3341).
+
+        human_curator_gate marks a deterministic pure gate whose resolution
+        requires human CONTENT adjudication, not merely a closed escalation
+        record; curator_adjudicated_at is the ISO-8601 stamp proving the
+        per-entry review happened. Both are read by DeterministicRunner's
+        pure-gate resume guard, which refuses to drive such a task to done
+        without the stamp — so both are load-bearing Tier-A conventions.
+        Unblessed, every real human-curator-gate task would manufacture a
+        code=unknown_key census line. RED until both are added to
+        _BLESSED_METADATA_KEYS.
+        """
+        _, warnings = parse_metadata(
+            {
+                'human_curator_gate': True,
+                'curator_adjudicated_at': '2026-07-31T09:00:00+00:00',
+            },
+            direction='read',
+        )
+        unknown_key_fields = {w.field for w in warnings if w.code == 'unknown_key'}
+        assert 'human_curator_gate' not in unknown_key_fields, (
+            f'Expected no unknown_key warning for human_curator_gate; got: {sorted(unknown_key_fields)}'
+        )
+        assert 'curator_adjudicated_at' not in unknown_key_fields, (
+            f'Expected no unknown_key warning for curator_adjudicated_at; got: {sorted(unknown_key_fields)}'
+        )
+
     def test_deterministic_invariant_violation_write_enforce_raises(self):
         with pytest.raises(ValidationError):
             parse_metadata({'task_kind': 'deterministic'}, direction='write', enforce=True)
