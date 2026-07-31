@@ -366,8 +366,16 @@ The merge procedure is iterative — don't assume one pass will be enough:
              return True          # request_id names exactly this in-flight entry — always submission-scoped
          # branch and task_id arms: both unscoped, both gated identically.
          if poll["state"] == "done":
-             # shell: git merge-base --is-ancestor task/<TASK_ID> main  → True iff exit 0
-             return branch_is_ancestor_of_main()   # unconfirmed `done` is stale → keep polling
+             if poll.get("kind") == "found_on_main":
+                 # Tier-3.5 git-authority response — a LIVE probe of main, reached only
+                 # because the durable tiers MISSED. Structurally cannot be a stale
+                 # prior-round record, so it is not what this guard defends against.
+                 # Accept it directly: re-gating it on ancestry is what deadlocks a
+                 # merged-and-cleaned-up branch (see the rc=128 case below).
+                 return True
+             # Durable-tier `done` (retention ring / event store: no `kind`, no
+             # `merge_sha`) — this is the stale-record case. Confirm with git.
+             return branch_on_main()   # canonical check below; not-landed → keep polling
          return True              # non-done terminal: exit the loop, but treat as UNCONFIRMED
 
      loop:
@@ -381,8 +389,23 @@ The merge procedure is iterative — don't assume one pass will be enough:
          eta = poll.get("eta_seconds") or poll_interval * 2  # eta_seconds may be None
          poll_interval = min(max(eta, 15), 60)
      ```
+
+     <a id="branch-on-main"></a>**The canonical ancestry check (`branch_on_main`) — three outcomes, not two.** Every "is it on main?" confirmation in this skill means *this* check. **Never use the two-way idiom `git merge-base --is-ancestor ... && echo "on main" || echo "not on main"`**: a deleted branch ref exits **128**, which that idiom silently reports as "not on main" — inverting the truth for the single most common post-merge state, since the merge lane deletes task branches on cleanup (`_delete_branch_if_on_main`, `orchestrator/src/orchestrator/git_ops.py:7538-7574`), and on the `branch` arm a *foreign* merger's cleanup deletes it out from under you.
+     ```bash
+     git merge-base --is-ancestor task/<TASK_ID> main; rc=$?
+     # rc=0   → landed. Accept as done/found_on_main.
+     # rc=1   → genuinely not on main. Keep polling / resubmit, per the arm.
+     # rc=128 → branch ref is GONE ("fatal: Not a valid object name"). This is the
+     #          normal state AFTER a successful merge + cleanup — it is NOT "not on
+     #          main". Search main for the merge commit instead:
+     git log main --oneline --merges | head -5      # or: git log main --grep="task/<TASK_ID>"
+     #          A hit → the merge landed; treat as done/found_on_main with that SHA.
+     #          No hit → only then treat it as not-landed.
+     ```
+     `branch_on_main()` above returns True for rc=0 and for a matched rc=128 marker, False only for rc=1 or an unmatched rc=128.
+
      After the loop exits:
-     - `timed_out` (either unscoped arm's 20-minute deadline reached without an accepted terminal state — i.e. the only `done` on offer never became an ancestor of main) → do NOT resubmit and do NOT direct-merge; run `git merge-base --is-ancestor task/<TASK_ID> main` one final time, and on exit 1 stop and report to the human, per *Polled terminal failures*'s `unknown` bullet below.
+     - `timed_out` (either unscoped arm's 20-minute deadline reached without an accepted terminal state — i.e. the only `done` on offer never became an ancestor of main) → do NOT resubmit and do NOT direct-merge; run the [canonical ancestry check](#branch-on-main) one final time — **including its rc=128 merge-marker search**, since a branch deleted by a successful merge is the likeliest reason you got here — and stop-and-report to the human only if that too comes back not-landed, per *Polled terminal failures*'s `unknown` bullet below.
      - `poll["state"] == "done"` → **if the response carries `merge_sha`** (the git-authority tier's `kind: "found_on_main"` shape), thread it as `done_provenance={"kind": "found_on_main", "commit": "<merge_sha>", "note": "<explanation>"}` — **not** a bare `commit`. `merge_sha` is not always the merge commit: on the live-branch resolution path it's the *branch tip* SHA, a distinct commit from the actual merge commit for a `--no-ff` merge; only the deleted-branch path's `merge_sha` is the true merge-commit SHA (`_found_on_main_response`'s docstring, `escalation/server.py:2290-2305`). **Otherwise** — including on either unscoped arm (`poll_by` `"branch"` or `"task_id"`), where a durable retention-ring/event-store record resolves `done` with only `state`/`request_id`/`generation`/`outcome`/`finished_at` and *no* `merge_sha` (`escalation/server.py:2404-2420`) — `merge_status` gives you no commit hash (`poll["outcome"]` is the raw state string `"done"`), so re-derive the true merge commit from git:
        ```
        git log main --oneline | head -5
@@ -415,13 +438,17 @@ The merge procedure is iterative — don't assume one pass will be enough:
 - `poll["state"] == "conflict"`, `poll["state"] == "blocked"`, or `poll["state"] == "abandoned"` → same fix-and-resubmit loop: fix in worktree, rebase on main, loop back to step 7. (For `abandoned`, also verify the cancellation was not intentional before resubmitting.)
 - `poll["state"] == "unknown"` (orchestrator restarted or retention ring expired) → `merge_status` now self-resolves a landed merge via its git-authority tier and returns `state: "done"` with `kind: "found_on_main"` and `merge_sha` when the branch is provably on main. If `merge_status` still returns `unknown`, confirm deterministically:
   ```bash
-  git merge-base --is-ancestor task/<TASK_ID> main && echo "on main" || echo "not on main"
-  # exit 0 (on main): proceed to step 8 with done_provenance kind='found_on_main',
+  git merge-base --is-ancestor task/<TASK_ID> main; rc=$?
+  # rc=0 (on main): proceed to step 8 with done_provenance kind='found_on_main',
   #   commit=<landing sha: git log --format=%H -1 main>
   #   (git log gives the merge commit; git merge-base gives the common ancestor, NOT the merge commit)
-  # exit 1 (not on main) AND queue healthy: loop back to step 7 (resubmit).
+  # rc=128 (branch ref gone — already cleaned up after a successful merge): do NOT read
+  #   this as "not on main". Run the merge-marker search from the canonical check above
+  #   (git log main --oneline --merges | head -5), and on a hit proceed to step 8 with
+  #   that SHA as kind='found_on_main'. Only an unmatched search means not-landed.
+  # rc=1 (genuinely not on main) AND queue healthy: loop back to step 7 (resubmit).
   ```
-  **Never fall back to direct merge in response to `unknown`** — `unknown` means the server lost its record, not that the merge failed. **This block's `resubmit` line does not apply to the `poll_by == "branch"` arm** — there nothing was ever enqueued, so `unknown` is that arm's expected live state, not a lost record; that arm never reaches this bullet as a terminal state (it's excluded from step 7's terminal set) — it arrives here only via the branch arm's 20-minute deadline, and the action there is to run the same ancestry check once more and, on exit 1, STOP and report to the human rather than resubmitting.
+  **Never fall back to direct merge in response to `unknown`** — `unknown` means the server lost its record, not that the merge failed. **This block's `resubmit` line does not apply to the `poll_by == "branch"` arm** — there nothing was ever enqueued, so `unknown` is that arm's expected live state, not a lost record; that arm never reaches this bullet as a terminal state (it's excluded from step 7's terminal set) — it arrives here only via the branch arm's 20-minute deadline, and the action there is to run the same [canonical ancestry check](#branch-on-main) once more (rc=128 marker search included) and STOP and report to the human only if it still comes back not-landed, rather than resubmitting.
 
 *Abandonment (`merge_cancel`):*
 
@@ -433,9 +460,11 @@ Whether the `request_id` you received cancels the in-flight entry depends on how
 
 If `merge_cancel` returns `{state: "unknown"}` on the `request_id` handle (or after the re-check above still leaves it unresolved), the entry has no live waiter in this server instance (restarted or finalized) — poll `mcp__escalation__merge_status(request_id)` first (it now self-resolves via the git-authority tier and returns `state: "done"` / `kind: "found_on_main"` / `merge_sha` when the branch is provably on main). If `merge_status` still returns `unknown`, confirm deterministically:
 ```bash
-git merge-base --is-ancestor task/<TASK_ID> main && echo "on main" || echo "not on main"
-# exit 0 (on main): treat as done; proceed to step 8 with done_provenance kind='found_on_main'
-# exit 1 (not on main): the merge did not land; decide whether to resubmit or discard
+git merge-base --is-ancestor task/<TASK_ID> main; rc=$?
+# rc=0 (on main): treat as done; proceed to step 8 with done_provenance kind='found_on_main'
+# rc=128 (branch ref gone after a successful merge + cleanup): NOT the same as rc=1 —
+#   run the merge-marker search from the canonical check above before concluding anything
+# rc=1 (not on main): the merge did not land; decide whether to resubmit or discard
 ```
 Never fall back to direct merge in response to `unknown` — `unknown` means the server lost its record, not that the merge failed.
 
