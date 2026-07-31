@@ -6280,6 +6280,16 @@ class TaskWorkflow:
         - success WITH a landed sha → ``mark_done(kind='found_on_main')``;
         - success without a sha → no provenance to write, so degrade to the
           reconciler rather than stamping a bogus one;
+        - success WITH a landed sha but the task's declared
+          ``metadata.delivered_checks`` absent from main (task 3057, seam 6 of
+          eleven) → withhold the stamp and degrade to the reconciler, exactly
+          like the success-without-a-sha case above it. The parallel is
+          deliberate: this method ALREADY holds the precedent that we may land
+          and still be unable to write HONEST provenance, in which case we
+          degrade rather than stamp a bogus one. The guard applies that same
+          judgement to capability evidence rather than SHA evidence. A landed
+          merge sha proves main advanced — never that THIS task's declared
+          capability rode along;
         - transient / superseded → a strict no-op, re-driven by a later sweep;
         - durable failure, or any status in NEITHER classification set →
           leave the task blocked, emit a structured failure event AND file a
@@ -6297,11 +6307,32 @@ class TaskWorkflow:
         signals a human: without this escalation the exit that exists to stop
         a branch sitting stranded would itself strand the task forever, worse
         than the pre-change ``report_unactionable_task`` L1 it replaced.
+
+        A delivered-checks withholding is deliberately NOT routed into that L2
+        (:meth:`_file_architect_merge_failed`): it is not a durable merge
+        failure — the merge genuinely landed — so misrouting it would both
+        misclassify the condition and erode a signal operators must keep
+        trusting. The durable backstop for a withheld flip is instead the
+        found_on_main reconciler, which is itself guarded by the same shared
+        decision, so this degradation closes a loop rather than opening one.
         """
         status = outcome.status
         landed = outcome.merge_sha
         if status in SUCCESS_TRANSIENT_MERGE_STATUSES:
             if status == 'done' and landed:
+                block = await self._delivered_checks_block(
+                    self.task_id, (self.task.get('metadata') or {}),
+                    site='architect-desync-merge-landed',
+                )
+                if block is not None:
+                    logger.warning(
+                        'Task %s: architect-desync merge landed at %s but '
+                        'delivered_checks are not verifiably present on main '
+                        '(%s) — NOT stamping found_on_main; leaving blocked '
+                        'for the reconciler backstop',
+                        self.task_id, landed[:12], block.reason,
+                    )
+                    return
                 logger.info(
                     'Task %s: architect-desync merge landed at %s — marking '
                     'done (found_on_main)',
