@@ -189,7 +189,7 @@ class TestLandedOutboxFsyncDurability:
             captured_modes.append(os_module.fstat(fd).st_mode)
             real_fsync(fd)
 
-        monkeypatch.setattr('orchestrator.landed_outbox.os.fsync', _spy_fsync)
+        monkeypatch.setattr('shared.safe_io.os.fsync', _spy_fsync)
 
         path = tmp_path / 'data' / 'orchestrator' / 'landed_outbox.json'
         outbox = LandedOutbox(path)
@@ -434,7 +434,7 @@ class TestLandedOutboxFailOpenBranches:
         def _boom(*_args: object, **_kwargs: object) -> None:
             raise OSError('disk full simulated failure')
 
-        monkeypatch.setattr('orchestrator.landed_outbox.os.replace', _boom)
+        monkeypatch.setattr('shared.safe_io.os.replace', _boom)
 
         outbox.record(row)  # must not raise, despite the durable flush failing
 
@@ -454,7 +454,7 @@ class TestLandedOutboxFailOpenBranches:
         def _boom(*_args: object, **_kwargs: object) -> None:
             raise OSError('disk full simulated failure')
 
-        monkeypatch.setattr('orchestrator.landed_outbox.os.replace', _boom)
+        monkeypatch.setattr('shared.safe_io.os.replace', _boom)
 
         outbox.record(LandedRow(task_id='1', branch_tip_sha='a', advanced_sha='b', landed_at=1.0))
         outbox.record(LandedRow(task_id='2', branch_tip_sha='c', advanced_sha='d', landed_at=2.0))
@@ -474,18 +474,21 @@ class TestLandedOutboxTmpFileCleanup:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         path = tmp_path / 'landed_outbox.json'
-        tmp_sibling = path.with_suffix('.json.tmp')
         outbox = LandedOutbox(path)
 
         def _boom(*_args: object, **_kwargs: object) -> None:
             raise OSError('disk full simulated failure')
 
-        monkeypatch.setattr('orchestrator.landed_outbox.os.replace', _boom)
+        monkeypatch.setattr('shared.safe_io.os.replace', _boom)
 
         outbox.record(LandedRow(task_id='1', branch_tip_sha='a', advanced_sha='b', landed_at=1.0))
 
-        assert not tmp_sibling.exists(), (
-            f'Expected no orphaned tmp file after a failed save; found {tmp_sibling}'
+        # Asserts NO residue at all rather than the absence of one specific
+        # name: since task 3223 the temp is uniquely named per writer, so
+        # checking only for a '<dest>.json.tmp' sibling would pass vacuously.
+        leftovers = sorted(q.name for q in tmp_path.iterdir())
+        assert leftovers == [], (
+            f'Expected no orphaned temp file after a failed save; found {leftovers}'
         )
 
 
