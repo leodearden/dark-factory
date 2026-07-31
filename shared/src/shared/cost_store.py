@@ -61,6 +61,9 @@ CREATE TABLE IF NOT EXISTS account_events (
 
 CREATE INDEX IF NOT EXISTS idx_acct_evt_account
     ON account_events(account_name);
+
+CREATE INDEX IF NOT EXISTS idx_acct_evt_type_created
+    ON account_events(event_type, created_at);
 """
 
 
@@ -214,6 +217,70 @@ class CostStore(AsyncSqliteBase):
         if row is None:
             return 0.0
         return float(row[0])
+
+    async def account_events_in_window(
+        self,
+        start_iso: str,
+        end_iso: str,
+        *,
+        event_type: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return account_events created in ``[start_iso, end_iso]``, oldest first.
+
+        The read path for ``api_error`` forensics
+        (``plans/server-side-api-error-handling-prd.md`` C4): the dashboard
+        provider-health strip reconstructs an outage from this row stream, so
+        ordering is by ``created_at`` ascending rather than insertion order.
+
+        The window is **inclusive** at both ends (SQLite ``BETWEEN``), matching
+        :meth:`cost_totals_in_window` and :meth:`model_cost_in_window`.
+
+        Args:
+            start_iso: Inclusive lower bound on ``created_at``.
+            end_iso: Inclusive upper bound on ``created_at``.
+            event_type: When given, restrict to that one type (e.g.
+                ``'api_error'``).  When None, every type in the window is
+                returned — the pre-existing ``cap_hit``/``switch``/``resume``
+                rows share this reader rather than needing a second method.
+
+        Returns:
+            One dict per row, keyed by column name (``account_name``,
+            ``event_type``, ``project_id``, ``run_id``, ``details``,
+            ``created_at``); ``[]`` when the window contains no rows.
+            ``details`` is returned as the raw stored string — decoding the
+            JSON is the caller's business.
+
+        Raises:
+            RuntimeError: if the store has not been opened (via ``_require_conn()``).
+                A closed store must not read as a quiet empty window: that would
+                render a healthy dashboard strip during an outage.
+        """
+        conn = self._require_conn()
+        sql = (
+            'SELECT account_name, event_type, project_id, run_id, details, created_at '
+            'FROM account_events '
+            'WHERE created_at BETWEEN ? AND ?'
+        )
+        params: tuple[Any, ...] = (start_iso, end_iso)
+        if event_type is not None:
+            sql += ' AND event_type = ?'
+            params += (event_type,)
+        sql += ' ORDER BY created_at ASC'
+        async with conn.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        return [
+            {
+                'account_name': row[0],
+                'event_type': row[1],
+                'project_id': row[2],
+                'run_id': row[3],
+                'details': row[4],
+                'created_at': row[5],
+            }
+            for row in rows
+        ]
+
+    # -- public write API: account events --------------------------------------
 
     async def save_account_event(
         self,
