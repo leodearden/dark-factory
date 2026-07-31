@@ -1292,3 +1292,164 @@ class TestTailPreservationAllowlist:
         assert prefix == _SIBLING_CHECKER_TEST_COMMAND_UNNAMED
         assert tail == ''
         assert prefix != split_top_level_and(_SIBLING_CHECKER_TEST_COMMAND_UNNAMED)[0]
+
+
+class TestGateMatchesToolAtArgvHead:
+    """A later segment only counts as the same tool when it INVOKES it (task 3218 part 2).
+
+    The pre-3218 test was ``keyword in segment`` — a plain substring. A
+    sibling checker whose SCRIPT PATH happens to name the tool
+    (``check_pyright_config.py``, ``check_pytest_markers.py``) therefore read
+    as a same-tool fan-out and had its clause dropped, so a real check never
+    ran: an over-rejection, and the possible-false-GREEN direction.
+
+    Argv-head matching can only UNDER-reject, and only behind a wrapper the
+    module does not recognise (``poetry run ruff check b/``) — the
+    consequence there is that clause running UNSCOPED, a superset of the
+    checks that would otherwise run, never a false GREEN. It also cannot
+    misresolve relative paths, because condition 4 already rejects any chain
+    containing a ``cd`` token. That asymmetry is what licenses replacing the
+    over-conservative test with a precise one.
+    """
+
+    # --- ACCEPT: the tool name appears, but nothing invokes the tool --------
+
+    def test_sibling_checker_script_named_after_the_tool_keeps_its_tail(self):
+        """The task's headline part-2 case: `check_pyright_config.py`.
+
+        Segment 1's argv head is ``python3`` (no ``-m``), so nothing there
+        invokes pyright — the substring inside the script's filename is not
+        an invocation.
+        """
+        raw = 'npx pyright && python3 scripts/check_pyright_config.py src'
+        prefix, tail = split_chain_tail(raw, 'pyright')
+        assert prefix == 'npx pyright '
+        assert tail == '&& python3 scripts/check_pyright_config.py src'
+        assert prefix + tail == raw
+
+    def test_ruff_sibling_checker_keeps_its_tail(self):
+        raw = 'uv run ruff check src/ && python3 scripts/check_ruff_noqa.py src'
+        prefix, tail = split_chain_tail(raw, 'ruff check')
+        assert prefix == 'uv run ruff check src/ '
+        assert tail == '&& python3 scripts/check_ruff_noqa.py src'
+        assert prefix + tail == raw
+
+    def test_tool_name_as_a_flag_value_keeps_its_tail(self):
+        """A quoted flag VALUE spelling the keyword is not an invocation either."""
+        raw = 'ruff check src/ && python3 lint.py --tool "ruff check"'
+        prefix, tail = split_chain_tail(raw, 'ruff check')
+        assert prefix == 'ruff check src/ '
+        assert tail == '&& python3 lint.py --tool "ruff check"'
+        assert prefix + tail == raw
+
+    # --- REJECT: a genuine same-tool fan-out must keep being truncated ------
+
+    @pytest.mark.parametrize(
+        ('raw', 'keyword'),
+        [
+            (
+                'uv run --project a ruff check src/ && uv run --project b ruff check src/',
+                'ruff check',
+            ),
+            ('npx pyright && npx pyright other/', 'pyright'),
+            ('ruff check src/ && python3 -m ruff check other/', 'ruff check'),
+            (
+                'uv run --directory a ruff check src/ && uv run --directory b ruff check src/',
+                'ruff check',
+            ),
+            ('ruff check src/ && python3 x.py "unterminated', 'ruff check'),
+        ],
+        ids=[
+            'uv-run-project-peel',
+            'npx-peel',
+            'python-dash-m-peel',
+            'uv-run-directory-peel',
+            'unbalanced-quote-is-conservative',
+        ],
+    )
+    def test_same_tool_fan_out_behind_a_known_wrapper_still_rejects(self, raw, keyword):
+        """Each recognised wrapper prefix must still expose the tool at an argv head."""
+        assert split_chain_tail(raw, keyword) == (raw, '')
+
+    # --- The helper's own contract -----------------------------------------
+
+    @pytest.mark.parametrize(
+        ('segment', 'keyword', 'expected'),
+        [
+            ('ruff check src/', 'ruff check', True),
+            ('uv run ruff check src/', 'ruff check', True),
+            ('uv run --project a --directory a ruff check src/', 'ruff check', True),
+            ('uv run --directory a --project a ruff check src/', 'ruff check', True),
+            ('npx pyright src/', 'pyright', True),
+            ('python3 -m ruff check other/', 'ruff check', True),
+            ('python -m pytest tests/', 'pytest', True),
+            ('uv run ruff check src/', 'uv run', True),
+            ('python3 scripts/check_pyright_config.py src', 'pyright', False),
+            ('python3 lint.py --tool "ruff check"', 'ruff check', False),
+            ('poetry run ruff check b/', 'ruff check', False),
+            ('python3 -m coverage run -m pytest', 'pytest', False),
+            ('echo "unterminated', 'pytest', True),
+        ],
+        ids=[
+            'bare-head',
+            'uv-run-head',
+            'uv-run-project-then-directory',
+            'uv-run-directory-then-project',
+            'npx-head',
+            'python3-dash-m',
+            'python-dash-m',
+            'keyword-at-index-0-before-any-peel',
+            'tool-named-in-a-script-path',
+            'tool-named-in-a-flag-value',
+            'unrecognised-wrapper-under-rejects',
+            'not-at-a-head-position',
+            'undecodable-segment-is-conservative',
+        ],
+    )
+    def test_segment_invokes_tool(self, segment, keyword, expected):
+        """``_segment_invokes_tool`` decides argv-head occupancy, nothing else.
+
+        ``'poetry run ruff check b/'`` is the documented UNDER-rejection: an
+        unrecognised wrapper, so the clause is preserved and runs unscoped —
+        wasteful, never a false GREEN.
+
+        ``'echo "unterminated'`` is the conservative direction: an
+        undecodable segment counts as a MATCH, so the gate rejects and the
+        pre-3218 disposition is restored.
+        """
+        from orchestrator.verify_cmd import _segment_invokes_tool
+
+        assert _segment_invokes_tool(segment, keyword) is expected
+
+    def test_index_zero_is_tested_before_any_wrapper_is_peeled(self):
+        """The ``'uv run'`` keyword (verify._reproject_str) must match segment 0.
+
+        Peeling ``uv run`` first and only then looking for the keyword would
+        make ``'uv run'`` unmatchable — silently changing ``_reproject_str``'s
+        gate disposition on every chained lint command.
+        """
+        from orchestrator.verify_cmd import _segment_invokes_tool
+
+        assert _segment_invokes_tool('uv run --project a ruff check src/', 'uv run') is True
+
+    # --- Corpus non-regression ---------------------------------------------
+
+    @pytest.mark.parametrize(
+        ('raw', 'keyword', 'preserves'),
+        [
+            (_FM_LINT_COMMAND, 'ruff check', True),
+            (_ROOT_LINT_COMMAND, 'ruff check', True),
+            (_ROOT_TYPE_CHECK_COMMAND, 'pyright', False),
+            (_ROOT_TEST_COMMAND, 'pytest', False),
+        ],
+        ids=['fm-lint', 'root-lint', 'root-type-check', 'root-test'],
+    )
+    def test_real_config_corpus_keeps_its_exact_disposition(self, raw, keyword, preserves):
+        """No command in this repo's configs changes disposition — the tightening
+        is purely additive capability for the sibling spelling task 3218 predicts.
+        """
+        prefix, tail = split_chain_tail(raw, keyword)
+        assert bool(tail) is preserves
+        assert prefix + tail == raw
+        if not preserves:
+            assert prefix == raw, 'a REJECT returns the whole untouched original'
