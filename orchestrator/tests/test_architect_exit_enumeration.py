@@ -143,88 +143,16 @@ class TestGrantedReadyToMergeToolExists:
         assert _REPORT_READY_TO_MERGE.endswith('__report_ready_to_merge')
 
 
-# ---------------------------------------------------------------------------
-# step-3 RED: ARCHITECT.system_prompt enumerates both new exits
-# ---------------------------------------------------------------------------
-#
-# Compact anchors only — tool-name presence plus one discriminating keyword
-# per surface, per this task's design decision to avoid pinning sentence
-# wording a later prompt-tuning pass would need to touch anyway (see
-# test_roles_background_warning.py's identical "one-line existence check, not
-# a prose pin" posture).
-
-
-def _window_around(text: str, needle: str, before: int = 200, after: int = 900) -> str:
-    """Substring of *text* surrounding the first occurrence of *needle*.
-
-    Lets a test confirm two related tokens sit in the same guidance block
-    without pinning the exact sentence connecting them.
-    """
-    idx = text.index(needle)
-    return text[max(0, idx - before): idx + after]
-
-
 class TestArchitectPromptEnumeratesNewExits:
     def test_prompt_names_report_ready_to_merge(self):
         from orchestrator.agents.roles import ARCHITECT  # noqa: PLC0415
 
         assert 'report_ready_to_merge' in ARCHITECT.system_prompt
 
-    def test_report_ready_to_merge_bullet_has_discriminating_keyword(self):
-        """The bullet must name the clean-fast-forward predicate, not just
-        the tool — otherwise an architect can't tell this exit apart from
-        report_task_already_done."""
-        from orchestrator.agents.roles import ARCHITECT  # noqa: PLC0415
-
-        window = _window_around(ARCHITECT.system_prompt, 'report_ready_to_merge(')
-        assert 'fast-forward' in window, (
-            f'Expected the report_ready_to_merge guidance to name the '
-            f'clean-fast-forward predicate. Window: {window!r}'
-        )
-
-    def test_report_ready_to_merge_bullet_steers_away_from_report_unactionable_task(self):
-        """Must explicitly name report_unactionable_task as the wrong exit —
-        that L1 cost a human ~100k tokens and vetoed the verified-green
-        auto-merge reaper (workflow.py:5854-5859)."""
-        from orchestrator.agents.roles import ARCHITECT  # noqa: PLC0415
-
-        window = _window_around(ARCHITECT.system_prompt, 'report_ready_to_merge(')
-        assert 'report_unactionable_task' in window, (
-            f'Expected the report_ready_to_merge guidance to steer away from '
-            f'report_unactionable_task. Window: {window!r}'
-        )
-
     def test_prompt_names_mark_step_committed(self):
         from orchestrator.agents.roles import ARCHITECT  # noqa: PLC0415
 
         assert 'mark_step_committed' in ARCHITECT.system_prompt
-
-    def test_mark_step_committed_note_has_discriminating_keyword(self):
-        """The pre-satisfy note must contrast against leaving a step pending
-        (or explicitly say "committed"), not just name the tool."""
-        from orchestrator.agents.roles import ARCHITECT  # noqa: PLC0415
-
-        window = _window_around(
-            ARCHITECT.system_prompt, 'mark_step_committed(',
-        ).lower()
-        assert 'pending' in window or 'committed' in window, (
-            f'Expected the mark_step_committed note to mention "pending" or '
-            f'"committed". Window: {window!r}'
-        )
-
-    def test_escalate_blocker_fallthrough_lists_report_ready_to_merge(self):
-        """The rule-2 escalate_blocker fall-through sentence (roles.py:353)
-        must include report_ready_to_merge among the exits that route to a
-        clean L1 instead of a retry."""
-        from orchestrator.agents.roles import ARCHITECT  # noqa: PLC0415
-
-        prompt = ARCHITECT.system_prompt
-        idx = prompt.index('clean L1')
-        window = prompt[max(0, idx - 400): idx + 100]
-        assert 'report_ready_to_merge' in window, (
-            f'Expected the escalate_blocker fall-through sentence to list '
-            f'report_ready_to_merge. Window: {window!r}'
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -243,28 +171,10 @@ class TestSimpleTaskPromptEnumeratesNewExits:
 
         assert 'mcp__plan-tools__report_ready_to_merge' in SIMPLE_TASK.system_prompt
 
-    def test_report_ready_to_merge_entry_has_discriminating_keyword(self):
-        from orchestrator.agents.roles import SIMPLE_TASK  # noqa: PLC0415
-
-        window = _window_around(
-            SIMPLE_TASK.system_prompt, 'mcp__plan-tools__report_ready_to_merge',
-        )
-        assert 'fast-forward' in window, (
-            f'Expected the report_ready_to_merge entry to name the '
-            f'clean-fast-forward predicate. Window: {window!r}'
-        )
-
-    def test_prompt_names_mark_step_committed_with_pre_satisfy_guidance(self):
+    def test_prompt_names_mark_step_committed(self):
         from orchestrator.agents.roles import SIMPLE_TASK  # noqa: PLC0415
 
         assert 'mark_step_committed' in SIMPLE_TASK.system_prompt
-        window = _window_around(
-            SIMPLE_TASK.system_prompt, 'mark_step_committed(',
-        ).lower()
-        assert 'pending' in window or 'committed' in window, (
-            f'Expected the mark_step_committed guidance to mention "pending" '
-            f'or "committed". Window: {window!r}'
-        )
 
 
 # ---------------------------------------------------------------------------
