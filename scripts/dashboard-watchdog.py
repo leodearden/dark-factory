@@ -531,6 +531,116 @@ def restart_unit(unit: str = DASHBOARD_UNIT) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Storm escape (INV-4)
+# ---------------------------------------------------------------------------
+
+
+def _prune_restarts(restarts: list[int], now: int) -> list[int]:
+    """Return the epochs in *restarts* that fall inside the rolling window.
+
+    The window is ROLLING, not a lifetime counter: without the prune, a
+    service that misbehaves once a month would eventually accumulate
+    MAX_RESTARTS epochs, trip the ceiling, stop being supervised, and file an
+    L2 about a problem that had already gone away years earlier.
+    """
+    return [epoch for epoch in restarts if now - epoch < RATE_WINDOW_SECS]
+
+
+def file_ceiling_escalation(restart_count: int, window_secs: int) -> None:
+    """File ONE born-at-L2 escalation reporting the restart ceiling.
+
+    Shells out to ``escalation submit`` through ``uv run --project`` rather
+    than importing it: this script is stdlib-only by design (it must run as a
+    bare ``Type=oneshot`` with no environment of its own), and ``escalation``
+    is not on its import path.
+
+    The argv is built against submit.py's ENFORCED argparse boundary, not
+    against convenience. That CLI constructs ``Escalation(level=2, ...)``
+    directly — bypassing the escalation server's severity chokepoint — so it
+    restricts ``--severity`` to BORN_AT_L2_SEVERITIES and REJECTS an
+    ``--agent-role`` without a ``harness-``/``orchestrator-`` sentinel prefix.
+    Both are satisfied by ESCALATION_SEVERITY and ESCALATION_AGENT_ROLE, and
+    pinned by tests, because a rejected submit would leave the watchdog quiet
+    at the ceiling with nobody told: the worst of both behaviours.
+
+    ``--task`` is a STRING SENTINEL rather than a numeric task id, following
+    the ``pipeline-landing-tripwire-{sha12}`` precedent in
+    orchestrator/src/orchestrator/merge_skew_tripwire.py — there is no owning
+    task for an infra failure, and attaching one would misattribute the L2.
+
+    DEDUP is keyed on the watchdog's own persisted ``ceiling_open`` flag, NOT
+    on a ``queue.get_by_task(..., status='pending')`` query the way the merge
+    tripwire does, precisely because this script cannot import escalation to
+    run that query. The caller sets the flag in the same tick, so at most one
+    L2 is filed per ceiling EPISODE; without it the storm escape would trade a
+    restart storm for an escalation storm at two L2s a minute, forever.
+
+    Fail-soft: a missing uv, a non-zero exit, or a timeout is warn-logged and
+    swallowed. A failed submit must not leave the watchdog restarting again —
+    the ceiling stays tripped either way, which fails toward "quiet and
+    logged" rather than toward resuming the flap.
+    """
+    summary = (
+        f"{DASHBOARD_UNIT} hit the watchdog restart ceiling: {restart_count} "
+        f"restarts in the last {window_secs}s. Restarting is not fixing it; "
+        "the watchdog has STOPPED restarting and needs a human."
+    )
+    detail = (
+        f"scripts/dashboard-watchdog.py restarted {DASHBOARD_UNIT} "
+        f"{restart_count} times within the rolling {window_secs}s window "
+        f"(MAX_RESTARTS={MAX_RESTARTS}), each after {FAIL_STREAK} consecutive "
+        f"failed probes of {PROBE_URL}. Reaching the ceiling is evidence that "
+        "a restart does not repair the fault, so per INV-4 the watchdog has "
+        "stopped actuating rather than adding downtime (the 2026-07-30 "
+        "incident was 192 restarts in 3h, ~27% downtime). It keeps probing: "
+        "if the dashboard recovers on its own the episode ends and normal "
+        "supervision resumes. Investigate with `journalctl --user -t "
+        f"{LOG_TAG}` and `journalctl --user -u {DASHBOARD_UNIT}`. State file: "
+        f"{STATE_PATH}."
+    )
+
+    argv = [
+        UV_BIN,
+        "run",
+        "--project",
+        os.path.join(REPO_DIR, "escalation"),
+        "escalation",
+        "submit",
+        "--queue-dir",
+        ESCALATION_QUEUE_DIR,
+        "--task",
+        ESCALATION_TASK_SENTINEL,
+        "--severity",
+        ESCALATION_SEVERITY,
+        "--category",
+        ESCALATION_CATEGORY,
+        "--summary",
+        summary,
+        "--detail",
+        detail,
+        "--agent-role",
+        ESCALATION_AGENT_ROLE,
+    ]
+
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=120)
+        if result.returncode != 0:
+            logger.warning(
+                f"file_ceiling_escalation: `escalation submit` exited "
+                f"{result.returncode}: {result.stderr.strip()[:500]!r}. The "
+                "ceiling stays tripped (no further restarts) regardless."
+            )
+            return
+        log(f"filed born-at-L2 restart-ceiling escalation for {DASHBOARD_UNIT}")
+    except Exception as exc:  # noqa: BLE001 -- a failed submit must not resume the flap
+        logger.warning(
+            f"file_ceiling_escalation: could not run `escalation submit` "
+            f"({type(exc).__name__}: {exc}). The ceiling stays tripped, so the "
+            "watchdog is quiet but the L2 was NOT filed — check the journal."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Tick
 # ---------------------------------------------------------------------------
 
@@ -543,6 +653,17 @@ def tick() -> None:
     atomic write every 30 seconds and actuates nothing.
     """
     state = load_state()
+
+    # §Contract "ceiling", tripped state. INV-4: once the ceiling has been
+    # reached, no further restarts happen until the episode ends. Returning
+    # here also enforces the dedup — the L2 is filed exactly once, when the
+    # flag is first set, never re-filed while it remains set.
+    if state["ceiling_open"]:
+        logger.warning(
+            f"{DASHBOARD_UNIT} restart ceiling is OPEN (an L2 is on file); "
+            "not restarting and not re-filing"
+        )
+        return
 
     # §Contract "grace". A unit that activated less than GRACE_SECS ago is not
     # probed AT ALL (invariant I5 — never act on a probe that was not run, so
@@ -589,6 +710,28 @@ def tick() -> None:
         )
         return
 
+    # §Contract "ceiling". The streak is complete, so a restart is warranted —
+    # but first check whether restarting is actually WORKING. Prune the rolling
+    # window, then compare what remains against MAX_RESTARTS.
+    now = int(time.time())
+    state["restarts"] = _prune_restarts(state["restarts"], now)
+
+    if len(state["restarts"]) >= MAX_RESTARTS:
+        # INV-4, the storm escape. MAX_RESTARTS restarts inside one window is
+        # evidence that a restart does not repair this fault, so continuing
+        # would only add downtime — which is exactly what 2026-07-30 was.
+        # File ONE L2 and stop actuating.
+        logger.warning(
+            f"{DASHBOARD_UNIT} hit the restart ceiling "
+            f"({len(state['restarts'])} restarts in {RATE_WINDOW_SECS}s >= "
+            f"MAX_RESTARTS={MAX_RESTARTS}); escalating and NOT restarting"
+        )
+        file_ceiling_escalation(len(state["restarts"]), RATE_WINDOW_SECS)
+        state["ceiling_open"] = True
+        state["streak"] = 0
+        save_state(state)
+        return
+
     # §Contract "hysteresis", gate reached: FAIL_STREAK consecutive failed
     # probes. Actuation is per COMPLETED STREAK, never per tick (invariant
     # I3) — the streak is reset to 0 below, so the NEXT restart needs another
@@ -603,7 +746,7 @@ def tick() -> None:
     # systemctl misbehaved: the rolling window that feeds the storm escape is
     # measured against these epochs, so an unrecorded restart would make the
     # ceiling unreachable and re-open the flap the escape exists to stop.
-    state["restarts"].append(int(time.time()))
+    state["restarts"].append(now)
     state["streak"] = 0
     save_state(state)
 
