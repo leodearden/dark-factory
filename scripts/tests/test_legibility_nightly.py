@@ -1718,6 +1718,13 @@ def _isolated_root_logging():
     Restoring both the level and the exact handler list matters: this file and
     test_legibility_census.py both run many ``caplog.at_level(...)`` blocks,
     and leaked root state would silently perturb them.
+
+    DUPLICATED verbatim in test_legibility_census.py, which is a known wart,
+    not a norm: its proper home is scripts/tests/conftest.py (today only
+    sys.path plumbing, no fixtures yet), which task 3270 holds no lock on --
+    so the move is deferred to the next review cycle rather than smuggled in.
+    Until then, a fix here (e.g. also restoring ``logging.root.filters``, or
+    closing handlers) has to be applied in BOTH copies.
     """
     root = logging.getLogger()
     saved_level = root.level

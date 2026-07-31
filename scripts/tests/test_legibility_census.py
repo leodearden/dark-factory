@@ -2283,8 +2283,12 @@ def test_main_without_force_no_fire_noops_with_exit_zero(tmp_path, monkeypatch, 
 # root sat at its WARNING default and every INFO line this module emits --
 # notably "census: no codebook at ... yet, starting from an empty v2
 # document" -- was discarded before it reached the journal. Mirrors
-# test_legibility_nightly.py's step-11 trio (that file owns its own copy of
-# this scaffolding, per this repo's each-test-file-owns-its-fixtures norm).
+# test_legibility_nightly.py's step-11 trio.
+#
+# The _isolated_root_logging helper below is DUPLICATED verbatim from that
+# file. Its proper home is scripts/tests/conftest.py -- which task 3270 holds
+# no lock on, so the move is deferred to the next review cycle rather than
+# smuggled in. Not a norm, a known wart: keep the two copies in step.
 # ---------------------------------------------------------------------------
 
 @contextlib.contextmanager
@@ -2300,6 +2304,9 @@ def _isolated_root_logging():
     file runs ~10 ``caplog.at_level(logging.WARNING)`` blocks (lines 1318,
     1520, 1650, 1817, 1938, 2018, ...) that leaked root state would silently
     perturb.
+
+    Keep in step with the copy in test_legibility_nightly.py until one of
+    them moves to conftest.py -- see the section comment above.
     """
     root = logging.getLogger()
     saved_level = root.level
