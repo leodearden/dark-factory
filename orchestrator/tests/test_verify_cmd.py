@@ -1173,11 +1173,23 @@ class TestChainOperatorTokenCoverage:
     the definition became.
     """
 
-    _CHAIN = 'ruff check src/ {op} python3 check.py dir/'
+    # The FIXED `&&` is load-bearing: it guarantees a multi-segment chain for
+    # every operator, so `split_chain_tail` reaches the `_NON_AND_CHAIN_TOKENS`
+    # membership test instead of short-circuiting on its `len(segments) < 2`
+    # guard. Without it the refusal cases below pass no matter what the refusal
+    # set holds. `test_every_other_operator_is_refused` asserts this invariant
+    # rather than trusting the template to keep it.
+    _CHAIN = 'ruff check src/ && python3 check.py dir/ {op} echo x'
     _KEYWORD = 'ruff check'
 
     def test_and_chain_carries_its_tail(self):
-        """`&&`: a sibling-checker chain — head scoped, tail preserved verbatim."""
+        """`&&`: a sibling-checker chain — head scoped, tail preserved verbatim.
+
+        With the template's fixed `&&` this is a THREE-segment chain, so the
+        preserved tail spans both trailing checkers (`&& python3 check.py dir/
+        && echo x`) — the tail is everything after segment 0, however many
+        `&&`-joined siblings follow.
+        """
         raw = self._CHAIN.format(op='&&')
         prefix, tail = split_chain_tail(raw, self._KEYWORD)
         assert tail, 'a plain `&&` sibling-checker chain must have its tail preserved'
@@ -1193,6 +1205,11 @@ class TestChainOperatorTokenCoverage:
         fed by the head, so lifting it out of the chain changes what runs.
         """
         raw = self._CHAIN.format(op=operator)
+        assert len(split_top_level_and(raw)) >= 2, (
+            'the template must keep a FIXED top-level `&&`: with a single segment '
+            'split_chain_tail rejects at the len(segments) < 2 guard and never reaches '
+            'the _NON_AND_CHAIN_TOKENS test, making this case vacuous'
+        )
         assert split_chain_tail(raw, self._KEYWORD) == (raw, ''), (
             f'{operator!r} is a recognised chain operator, so split_chain_tail must refuse '
             f'to carry a tail across it'
