@@ -662,8 +662,11 @@ def _maybe_kwargs(sentinel: object, **pairs: object) -> dict:
 # the longest status string, 'in-progress') it is ~46 KB.  Both sit inside the
 # 62 KB safe envelope, while keeping a 5,845-task project to three pages.
 #
-# test_get_statuses_pagination.py pins this with a json.dumps assertion against
-# the 62,000-char bound, so raising this limit cannot silently re-cross the wall.
+# MEASURED (task 3064 step-10): a worst-case full page of 2,000 entries
+# serialises to 46,137 chars — 23.1 chars/entry, 15,863 chars of margin under the
+# 62,000-char bound.  test_get_statuses_pagination.py pins this with a json.dumps
+# assertion, so raising this limit cannot silently re-cross the wall (at 3,000 the
+# page reaches 69,137 chars and that test fails).
 _STATUSES_AUTO_PAGE_LIMIT = 2000
 
 
