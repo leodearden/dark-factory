@@ -522,6 +522,18 @@ def load_topic_registry(path: str | Path) -> TopicRegistry:
         raise RegistryError(
             f'topic registry {str(path)!r} is missing its "entries" list.'
         )
+    # A stale, truncated, or half-written registry decodes as a well-formed
+    # object carrying zero entries. Loading it would emit `"metrics": []` and
+    # exit 0 — silence leaf alpha cannot distinguish from a healthy run, and a
+    # file `is_initial_run` counts, which would burn the D1 initial-state
+    # snapshot on an empty artifact. Fail at the door instead.
+    if not raw_entries:
+        raise RegistryError(
+            f'topic registry {str(path)!r} carries zero entries. An artifact '
+            'reporting zero topics is indistinguishable downstream from a '
+            'healthy run, and it would consume the one-shot initial-state '
+            'snapshot.'
+        )
 
     entries = [_parse_entry(raw, i) for i, raw in enumerate(raw_entries)]
 
@@ -2243,7 +2255,7 @@ async def run_probe(
     # nothing would otherwise emit `"metrics": []` and exit 0 — silence the
     # evaluator cannot distinguish from a clean run, and a file is_initial_run
     # counts. Same abort as a failed registry load, different door in.
-    if registry.entries and not probed:
+    if not probed:
         available = sorted({e.project_id for e in registry.entries})
         raise EmptySelectionError(
             f'no topic registry entry matches project_id(s) {list(selected)!r}; '

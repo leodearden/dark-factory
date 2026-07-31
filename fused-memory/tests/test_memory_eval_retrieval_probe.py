@@ -89,7 +89,18 @@ def _entry_payload(topic: str = 'sample-topic', **overrides) -> dict:
     return payload
 
 
-def _registry_payload(*entries: dict) -> dict:
+_UNSET = object()
+
+
+def _registry_payload(*entries: dict, entries_override=_UNSET) -> dict:
+    """Build a registry payload.
+
+    ``entries_override`` is the door to shapes the varargs form cannot
+    express — notably an explicitly EMPTY entries list, which the default
+    (substitute one entry when none is passed) would otherwise hide.
+    """
+    if entries_override is not _UNSET:
+        return {'schema_version': 1, 'entries': entries_override}
     return {
         'schema_version': 1,
         'entries': list(entries) or [_entry_payload()],
@@ -2033,14 +2044,37 @@ class TestInitialRunDetection:
         assert _mod().is_initial_run(tmp_path)
 
 
-_STORE_SECTION_HEADER = 'which store served the query (observations):'
+def _count_line(report: str, label: str) -> str:
+    """The single `  <label>...: <n>` line of a report breakdown.
+
+    Keys on the metric term (`foreign`, `untopiced`) and reads the NUMBER off
+    the end, so the assertion is about the count rather than the sentence the
+    count sits in.
+    """
+    matches = [
+        line.rstrip() for line in report.splitlines()
+        if line.strip().startswith(label) and line.rstrip()[-1].isdigit()
+    ]
+    assert len(matches) == 1, f'expected one {label!r} count line, got {matches!r}'
+    return matches[0]
+
+
+def _caveat_anchor():
+    """The routing caveat AS RENDERED, derived from the module's own constant.
+
+    Deriving the needle instead of hand-copying a phrase is what keeps these
+    tests about placement and scoping rather than about wording: rewording
+    `_KNOWN_BAD_ROUTING_CAVEAT` moves the anchor with it.
+    """
+    m = _mod()
+    return m._wrap(m._KNOWN_BAD_ROUTING_CAVEAT)[0]
 
 
 class TestProbeReport:
     """`render_probe_report(series, observations, *, is_initial_run)`."""
 
     def test_the_initial_run_enumerates_known_bad_items(self):
-        """(a) Attributed to the lineage, and labelled not-a-finding."""
+        """(a) Every failing tripwire item key is named in the section."""
         report = _mod().render_probe_report(
             _report_series(), _report_observations(), is_initial_run=True,
         )
@@ -2048,27 +2082,33 @@ class TestProbeReport:
         assert 'initial state' in report.lower()
         assert 't-alpha-topic' in report
         assert 't-beta-topic' in report
-        assert '3111' in report
-        assert '3112' in report
-        assert 'not a finding' in report.lower()
 
     def test_the_known_bad_list_carries_the_routing_caveat_inline(self):
         """(a) esc-3208-1: the misreading happens at the headline, so the
         caveat has to be AT the known-bad list, not only in the store
         breakdown far below it. The first live baseline was 72/78 observations
         served by Graphiti against 72/78 unmatched — a reader who stops at the
-        rate takes a router property for a findability collapse."""
+        rate takes a router property for a findability collapse.
+
+        The assertion is on POSITION: the caveat precedes the item keys it
+        qualifies, so a reader cannot reach the list without passing it.
+        """
         m = _mod()
         report = m.render_probe_report(
             _report_series(), _report_observations(), is_initial_run=True,
         )
 
-        # Anchor on the section HEADER, not the bare phrase: the caveat itself
-        # names the section it points at, so slicing on the phrase would cut
-        # the report inside the very sentence under test.
-        head = report[:report.index(_STORE_SECTION_HEADER)]
-        assert 'router' in head.lower()
-        assert 'routing' in head.lower()
+        anchor = _caveat_anchor()
+        preamble = m._wrap(m._KNOWN_BAD_PREAMBLE)[0]
+        assert anchor in report
+
+        # Inside the initial-state section (after its preamble), and above the
+        # item keys it qualifies — the item keys also appear in the per-metric
+        # block far above, so the check is on what follows the caveat.
+        assert report.index(preamble) < report.index(anchor)
+        after_caveat = report[report.index(anchor):]
+        assert '  - t-alpha-topic' in after_caveat
+        assert '  - t-beta-topic' in after_caveat
 
     def test_the_routing_caveat_is_scoped_to_the_initial_run(self):
         """It explains an inherited snapshot; on run fifty it would be noise."""
@@ -2076,8 +2116,7 @@ class TestProbeReport:
             _report_series(), _report_observations(), is_initial_run=False,
         )
 
-        head = report[:report.index(_STORE_SECTION_HEADER)]
-        assert 'router' not in head.lower()
+        assert _caveat_anchor() not in report
 
     def test_a_later_run_has_no_initial_state_section(self):
         """(b) Inherited state is only inherited once."""
@@ -2095,19 +2134,34 @@ class TestProbeReport:
         assert 'initial state' not in report.lower()
 
     def test_the_report_carries_the_matched_by_breakdown(self):
-        """(d) step-7's dual matcher, made visible."""
+        """(d) step-7's dual matcher, made visible — with its COUNTS.
+
+        The fixture scores four phrasings: one matched by content_hash, one by
+        last_known_id, two unmatched. Asserting the tallies is what makes this
+        cover the breakdown; the header alone renders whatever the numbers say.
+        """
         report = _mod().render_probe_report(_report_series(), _report_observations())
 
-        assert 'content_hash' in report
-        assert 'last_known_id' in report
-        assert 'unmatched' in report.lower()
-        assert 'beta-topic' in report
+        assert 'content_hash: 1' in report
+        assert 'last_known_id: 1' in report
+        assert 'unmatched: 2' in report
 
     def test_the_report_carries_the_untopiced_disclosure(self):
-        """(d) step-13: the share's unclassifiable remainder, in prose too."""
+        """(d) step-13: the share's unclassifiable remainder, with its counts.
+
+        The fixture's single contamination observation scored 5 results: 1
+        foreign, 3 untopiced. Untopiced is reported SEPARATELY from foreign —
+        folding it in would measure stamping coverage, not contamination — so
+        the two numbers have to come back distinct.
+        """
         report = _mod().render_probe_report(_report_series(), _report_observations())
 
-        assert 'untopiced' in report.lower()
+        assert 'scored results: 5' in report
+        foreign_line = _count_line(report, 'foreign')
+        untopiced_line = _count_line(report, 'untopiced')
+
+        assert foreign_line.endswith(': 1')
+        assert untopiced_line.endswith(': 3')
 
     def test_the_report_carries_the_registry_composition(self):
         """(d) step-5: what derivation covered, and what it left out."""
@@ -2623,6 +2677,34 @@ class TestRegistryLoadFailureIsFatal:
         assert code != 0
         assert not list(out_root.rglob('metrics-*.json'))
 
+    def test_an_empty_entries_list_fails_the_load(self, tmp_path):
+        """A well-formed object carrying zero entries is still unloadable.
+
+        A stale, truncated, or half-written fixture decodes cleanly as
+        ``{"entries": []}``. Accepting it produces `"metrics": []` at exit 0 —
+        the exact silent artifact RegistryError exists to prevent.
+        """
+        m = _mod()
+        path = _write_registry(tmp_path, _registry_payload(entries_override=[]))
+
+        with pytest.raises(m.RegistryError) as exc:
+            m.load_topic_registry(path)
+
+        assert 'zero entries' in str(exc.value)
+
+    def test_an_empty_registry_emits_no_artifact(self, monkeypatch, tmp_path):
+        """And it burns no initial-state snapshot on the way out."""
+        m = _mod()
+        _install_double(monkeypatch, _ServiceDouble())
+        path = _write_registry(tmp_path, _registry_payload(entries_override=[]))
+        out_root = tmp_path / 'out'
+
+        code = m.main(['--registry', str(path), '--out-root', str(out_root)])
+
+        assert code != 0
+        assert not list(out_root.rglob('metrics-*.json'))
+        assert m.is_initial_run(out_root)
+
     def test_a_missing_registry_exits_non_zero(self, monkeypatch, tmp_path):
         m = _mod()
         _install_double(monkeypatch, _ServiceDouble())
@@ -2679,6 +2761,29 @@ class TestEmptyProjectSelectionIsFatal:
                 ks=m.DEFAULT_KS,
                 out_root=tmp_path,
             ))
+
+    def test_a_hand_built_empty_registry_aborts_too(self, tmp_path):
+        """Both doors converge on one abort.
+
+        ``load_topic_registry`` rejects an empty entries list, but a caller
+        constructing a TopicRegistry directly bypasses it — so the run_probe
+        guard keys on "nothing to probe", not on "a selection filtered
+        everything out".
+        """
+        import asyncio  # noqa: PLC0415
+
+        m = _mod()
+        empty = m.TopicRegistry(schema_version=1, entries=())
+
+        with pytest.raises(m.EmptySelectionError):
+            asyncio.run(m.run_probe(
+                _ServiceDouble(), empty,
+                project_ids=('dark_factory',),
+                ks=m.DEFAULT_KS,
+                out_root=tmp_path,
+            ))
+
+        assert not list(tmp_path.rglob('metrics-*.json'))
 
     def test_the_message_names_what_was_asked_and_what_exists(self, tmp_path):
         import asyncio  # noqa: PLC0415
@@ -3176,15 +3281,21 @@ class TestStoresServedDisclosure:
 class TestCorpusCountScopeIsDisclosed:
     """count_memories_by_metadata is a Mem0 count; the report must say so."""
 
-    def test_the_report_states_that_the_counts_are_mem0_side(self):
+    def test_the_disclosure_names_every_graphiti_primary_category(self):
         """The live run reported entities_and_relations: 0 against a graph
         holding thousands. The zero is honest about what was counted and
-        misleading about what exists, so the report says which it is."""
+        misleading about what exists — so the disclosure has to NAME the
+        categories whose zero is an artifact of a Mem0-side count, not just
+        say the counts are Mem0-side. The expected names are read off the
+        module's own helper, so adding a Graphiti-primary category fails here
+        until the report covers it."""
         m = _mod()
         report = m.render_probe_report(_report_series(), _report_observations())
 
-        assert 'corpus counts' in report.lower()
-        assert 'mem0' in report.lower()
+        categories = m.graphiti_primary_categories()
+        assert categories
+        for category in categories:
+            assert category in report
 
 
 # ---------------------------------------------------------------------------
