@@ -33,19 +33,51 @@ Derived from leaf α's census
 ``kind`` values are snake_case, so applying this regex to ``kind`` would
 reject essentially the entire live population.  ``kind`` is
 registry-membership-validated instead, exactly as V1 specifies.
+
+Layering note
+-------------
+This module imports **downward** into :mod:`fused_memory.backends.mem0_client`
+for :data:`MEM0_MANAGED_METADATA_KEYS`.  That direction is deliberate, not
+accidental: PRD D12 / task 3055 §6 name ``backends/mem0_client.py`` as the
+decided home for that set, and INV-5 forbids a second copy.  The name is
+re-exported here (bound to the *same object*) so callers classifying keys
+have one import site.
+
+The observability half of V1 — the census log line, the unknown-key storm
+detector and the escalation filer — deliberately lives in
+:mod:`fused_memory.services.memory_metadata_census`, not here, so this
+module stays a cheap, dependency-light vocabulary import for leaf ι's
+prompt-pinning tests and the drift test.
 """
 
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import Any
 
+from fused_memory.backends.mem0_client import MEM0_MANAGED_METADATA_KEYS
+
 __all__ = [
+    'BLESSED_METADATA_KEYS',
     'KIND_REGISTRY',
+    'MEM0_MANAGED_METADATA_KEYS',
+    'MemoryMetadataValidationError',
+    'MetadataViolation',
+    'RESERVED_VOCABULARY_KEYS',
+    'SERVER_STAMPED_KEYS',
     'TOPIC_SLUG_MAX_LEN',
     'TOPIC_SLUG_RE',
+    'classify_unknown_keys',
     'normalize_supersedes',
 ]
+
+#: Prefix marking a deliberately-unvalidated experimental key (Tier-C).
+#: Ported from the task-metadata boundary (``shared/src/shared/task_metadata.py``),
+#: which uses the same escape hatch for the same reason: a writer that knows
+#: it is experimenting should be able to say so without manufacturing census
+#: noise.
+EXPERIMENTAL_KEY_PREFIX = 'x_'
 
 
 #: Shared ``topic`` slug shape (PRD D4 — one namespace for
@@ -484,3 +516,159 @@ KIND_REGISTRY: frozenset[str] = frozenset({
     'amendment',
     'sighting',
 })
+
+
+# ---------------------------------------------------------------------------
+# Top-level metadata key layers
+#
+# Four deliberately DISJOINT layers.  A key classified twice would make the
+# census line ambiguous about who owns it, so
+# ``tests/test_memory_metadata.py::TestKeyLayers`` asserts pairwise
+# disjointness.  ``run_id`` is the live trap: it is server-stamped AND
+# measures 4,518 live occurrences, so it is exactly the key that would
+# otherwise land in both the server-stamped and blessed tiers.
+# ---------------------------------------------------------------------------
+
+#: Keys this server stamps onto metadata itself.  They are NOT all stamped at
+#: the same layer, and a reviewer must not read these as four write-seam
+#: stamps:
+#:
+#: * ``category``   -- stamped at the write seam:
+#:                     ``memory_service.py:2193`` (``add_memory``) and
+#:                     ``:2542`` (``add_system_record``).
+#: * ``recon_pool`` -- stamped inside ``_apply_cycle_summary_metadata_tagging``
+#:                     (``memory_service.py:389``), cycle-summary writes only.
+#: * ``run_id``     -- stamped by the same helper (``memory_service.py:389``).
+#: * ``planned``    -- NOT a write-seam stamp at all.  It is a server-owned
+#:                     SEARCH-RESULT annotation (``memory_service.py:1932``,
+#:                     ``:2921``, read back at ``:2962``).  It is listed here
+#:                     so that a round-tripped search result re-written as
+#:                     metadata does not census-warn on the server's own field.
+SERVER_STAMPED_KEYS: frozenset[str] = frozenset({
+    'category',
+    'recon_pool',
+    'run_id',
+    'planned',
+})
+
+#: The five keys this PRD reserves and gives shape rules to (V1).  Every one
+#: is OPTIONAL: absence is never a violation.
+RESERVED_VOCABULARY_KEYS: frozenset[str] = frozenset({
+    'topic',
+    'canonical',
+    'kind',
+    'parent_id',
+    'supersedes',
+})
+
+#: Tier-A: conventional keys that are deliberate, documented and high-volume,
+#: and so must NOT manufacture census noise.  Ported from the task-metadata
+#: boundary's ``_BLESSED_METADATA_KEYS``.
+#:
+#: Seeded from leaf α's census at a stated **count >= 1000** cut, excluding
+#: anything already mem0-managed, server-stamped or reserved (counts inline,
+#: from plans/memory-metadata-census-report.json @ b5af3e4b03).
+#:
+#: WHY THIS TIER IS MANDATORY: the corpus carries 1,627 distinct top-level
+#: keys, 715 of them singletons.  Without a blessed tier, essentially every
+#: write emits an unknown-key census line -- which drowns the signal the
+#: census line exists to produce and makes the storm detector fire
+#: permanently against normal traffic, i.e. the warn path logged into
+#: oblivion (precisely what INV-4 exists to prevent).
+#:
+#: Everything BELOW the cut keeps warning.  That is the intended Tier-B/C
+#: drift signal, not noise: the 715 singleton keys are what a census is for.
+BLESSED_METADATA_KEYS: frozenset[str] = frozenset({
+    'task_id',               # 18,850
+    'source',                # 16,364
+    'transition',            # 15,529
+    '_deferred',             #  8,263
+    '_causation_id',         #  8,262
+    'stage',                 #  2,865
+    'stage2_suppress',       #  1,588
+    'echo_used_provenance',  #  1,284
+})
+
+#: Union of every known layer, precomputed for the unknown-key scan.
+_KNOWN_METADATA_KEYS: frozenset[str] = (
+    MEM0_MANAGED_METADATA_KEYS
+    | SERVER_STAMPED_KEYS
+    | RESERVED_VOCABULARY_KEYS
+    | BLESSED_METADATA_KEYS
+)
+
+
+def classify_unknown_keys(meta: dict[str, Any]) -> list[str]:
+    """Return the top-level keys of *meta* that belong to no known layer.
+
+    A key is known if it is mem0-managed, server-stamped, reserved
+    vocabulary, blessed conventional, or carries the ``x_`` experimental
+    prefix.  Structurally identical to the task-metadata boundary's
+    unknown-key scan (``shared/src/shared/task_metadata.py:912-920``).
+
+    Returns a list (not a set) in the caller's key order so the census line
+    and any escalation summary are stable and readable.
+    """
+    return [
+        key
+        for key in meta
+        if key not in _KNOWN_METADATA_KEYS
+        and not key.startswith(EXPERIMENTAL_KEY_PREFIX)
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Violations and the strict-mode error
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class MetadataViolation:
+    """A single metadata shape/vocabulary violation.
+
+    Modelled on the task-metadata boundary's ``SchemaWarning``
+    (``shared/src/shared/task_metadata.py:680``) plus the ``fatal`` flag
+    this domain needs: an unknown KEY only ever censuses, while a
+    malformed reserved key is rejectable once ``memory_metadata.enforce``
+    is on.  Frozen so violations are hashable and directly assertable.
+
+    :param key:     the offending top-level metadata key.
+    :param code:    stable machine code, e.g. ``invalid_topic_slug``.  This
+                    is what the census line reports and what operators grep.
+    :param message: human-readable text naming the violated RULE and the
+                    registry location (see
+                    :class:`MemoryMetadataValidationError`).
+    :param fatal:   whether this violation would reject the write under
+                    ``enforce``.  Non-fatal violations always still census.
+    """
+
+    key: str
+    code: str
+    message: str
+    fatal: bool
+
+
+class MemoryMetadataValidationError(Exception):
+    """Raised at the write seam when ``memory_metadata.enforce`` is on and at
+    least one violation is fatal.
+
+    V1 requires the rejection hint to name BOTH the violated rule and where
+    the registry lives, so an agent that trips it can find the vocabulary
+    rather than guessing.  That is satisfied *by construction* here: every
+    violation ``message`` produced by :func:`validate_memory_metadata`
+    already names its rule, and this class appends the registry location, so
+    the guarantee does not depend on each call site remembering to add it.
+    """
+
+    #: Where the vocabulary lives.  Named in every rejection message.
+    REGISTRY_LOCATION = 'fused_memory.memory_metadata'
+
+    def __init__(self, violations: list[MetadataViolation]) -> None:
+        self.violations = list(violations)
+        detail = '; '.join(
+            f'{v.code}: {v.message}' for v in self.violations
+        )
+        super().__init__(
+            f'memory metadata rejected ({len(self.violations)} violation(s)): '
+            f'{detail} -- the metadata vocabulary is defined in '
+            f'{self.REGISTRY_LOCATION}'
+        )
