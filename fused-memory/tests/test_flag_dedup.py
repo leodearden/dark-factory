@@ -6429,6 +6429,73 @@ class TestDedupFlagsLedgerMarkerPath:
             assert flag.get('last_seen_run_id') == 'r1'
             assert 'persisted_from_run' not in flag
 
+    @pytest.mark.asyncio
+    async def test_large_batch_writes_a_marker_for_every_flag_with_no_mem0_io(
+        self, ledger_memory_service
+    ):
+        """A 60-flag batch writes a ledger marker for EVERY flag and touches no Mem0.
+
+        Behavioral replacement (task 3351) for the deleted
+        ``inspect.getsource(fd.dedup_flags)`` scan that banned the source tokens
+        ``confirmation_disabled``, ``consecutive_confirmation_misses`` and ``limit=50``.
+        That scan asserted on source TEXT, so it was brittle (any comment or docstring in
+        dedup_flags mentioning a banned token tripped it) and incomplete (a circuit
+        breaker spelled with different local names, or a bounded search issued as
+        ``limit=LIMIT``/``limit = 50``, kept it green).
+
+        The two runtime properties it was standing in for are asserted here directly:
+
+        1. **No per-invocation circuit breaker.**  The retired Mem0 compensation chain
+           disabled itself partway through a batch after N confirmation misses.  Nothing
+           may silently stop marker writes mid-batch: all 60 markers must exist, and the
+           missing task_ids are reported rather than a bare count, so a partial write is
+           diagnosable at a glance.
+        2. **No bounded Mem0 reclamation search.**  60 deliberately exceeds the old
+           ``limit=50`` reclamation bound, so a reappearing bounded search would have to
+           either drop flags past 50 or issue Mem0 I/O — both observable here.
+
+        The sibling ``test_recurring_marker_path_never_touches_mem0_search_or_delete``
+        covers the same no-Mem0-I/O property across recurring cycles of ONE signature;
+        this one covers it across a single oversized batch of DISTINCT signatures.
+        """
+        from fused_memory.reconciliation.flag_dedup import dedup_flags
+
+        n_flags = 60
+        flags = [
+            {
+                'task_id': tid,
+                'flag_type': 'missing_deliverable',
+                'description': f'finding {tid}',
+            }
+            for tid in range(1, n_flags + 1)
+        ]
+
+        result = await dedup_flags(ledger_memory_service, 'p', 'r1', flags)
+
+        assert len(result) == n_flags, (
+            f'dedup_flags returned {len(result)} flags for a {n_flags}-flag batch; '
+            'no flag may be dropped by the marker path.'
+        )
+
+        missing = [
+            tid
+            for tid in range(1, n_flags + 1)
+            if await _get_marker(
+                ledger_memory_service.recon_ledger, 'p', str(tid), 'missing_deliverable'
+            )
+            is None
+        ]
+        assert not missing, (
+            f'No stage1_flag_marker row was written for task_ids {missing} out of '
+            f'{n_flags}. dedup_flags must write a marker for every stage2 flag in the '
+            'batch — a per-invocation circuit breaker that stops writing partway '
+            'through (the retired Mem0 confirmation-miss compensation) is exactly the '
+            'regression this pins.'
+        )
+
+        ledger_memory_service.search.assert_not_called()
+        ledger_memory_service.delete_memory.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # module-surface contract — dead compensation code removed (task 2227 step-11)
