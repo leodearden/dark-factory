@@ -31,7 +31,6 @@ import subprocess
 import types
 
 import pytest
-
 from escalation.models import BORN_AT_L2_SEVERITIES
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
