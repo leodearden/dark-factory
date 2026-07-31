@@ -73,6 +73,24 @@ entries:
     origin_phase: unknown
     manifested_phase: verify
     note: 'Recon verification agent attempted to call grep_search and glob_search tools per verification contract, but these tools do not exist in its runtime (fatal ''No such tool available'' errors in 3 separate attempts, turns 11, 13, 15). Matches codebook pattern exactly: verifier prompts describe tool shims (grep_search specifically named) that the harness doesn''t provide.'
+  - date: '2026-07-25'
+    project: dark_factory
+    session: 1fa6dc1d-0286-4196-9d91-d21c8bec0c24
+    origin_phase: unknown
+    manifested_phase: verify
+    note: 'Claim-verification subagent tasked with investigating a ''task completed'' claim called glob_search twice (turns 10, 12) and got ''No such tool available: glob_search'' both times — the verifier''s prose contract implies a tool surface (paired with ''call verification_complete'') that the actual one-shot runtime doesn''t provide, matching the known claim-verification prose/runtime tool mismatch.'
+  - date: '2026-07-25'
+    project: dark_factory
+    session: bdac61aa-800b-4ee7-a073-36f12eb921ad
+    origin_phase: verify
+    manifested_phase: verify
+    note: 'Interactive claim-verification session (checking whether the helix()-wire 3D-curve task was truly done) invoked grep_search twice, both failing ''No such tool available: grep_search'' — this is exactly the phantom JSON tool shim (read_file/grep_search/verification_complete) the one-shot-subagent-contract entry documents; here it recurs in an interactive claim-verification flow rather than a one-shot CLI subagent, suggesting the same stale tool-shim prose leaks into human-facing verification prompts too.'
+  - date: '2026-07-30'
+    project: dark_factory
+    session: 4df44a65-6ebb-4024-9aa1-a27b335de6ae
+    origin_phase: implement
+    manifested_phase: implement
+    note: Agent tried to sed-read orchestrator/tests/test_harness_config_reload.py expecting existing harness-config-reload test precedent to exist, but the file was not found — an unverified premise about test-suite structure rather than a runtime contract issue; low-confidence match, closer fit may be unverified-task-premises.
 - id: watcher-capability-envelope
   title: Autonomous watcher rotations never told their capability envelope — level-{0,1} cap, disabled Write/Edit, and git-write denials rediscovered by failure every rotation
   severity: high
@@ -304,6 +322,12 @@ entries:
     origin_phase: decompose
     manifested_phase: implement
     note: Guard trip explicitly cites 'known-false premise about recon internals'; cascades to modulenotfounderror and repeated not-found errors across turns 19, 50, 52, 81
+  - date: '2026-07-31'
+    project: dark_factory
+    session: 2a1b1a46-b053-4ade-b36e-c823ffa49faa
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Guard flagged a 'known-false premise about recon internals' twice (turns 3 and 10) — matches the entry's 'recon-invented code models' pattern of acting on unverified beliefs about recon mechanics.
 - id: warm-lane-cache-incoherence
   title: Warm-lane warmth transfer and shared caches violate source coherence; no disk GC — phantom compile errors and recurring ENOSPC
   severity: high
@@ -376,6 +400,12 @@ entries:
     origin_phase: merge
     manifested_phase: merge
     note: Task 2763's pre-merge 'Plan Tightening — Architect Narrowing Pass' asserts, for all 8 files in the current plan.json, that each was 'declared but not touched on the branch' — a flat conclusion presented to the architect with no diff/evidence shown, forcing a binary choice (narrow via update_plan_metadata or confirm-and-escalate) on trust alone. 100% of declared files flagged as untouched at a merge gate is itself an unusual rate, consistent with the guard computing 'touched-on-branch' from a source that isn't corroborated/shown rather than a verified live diff.
+  - date: '2026-07-29'
+    project: dark_factory
+    session: d189bf82-105b-4034-9cca-cd1ec3bfaf45
+    origin_phase: merge
+    manifested_phase: merge
+    note: 'Session extends dark_factory task 2918''s census: the merge-gate integration_skew directive renders causal fix-citations (i.e., states ''this commit fixed the failure'') from evidence that, in the weak-evidence regime (SkewEvidence.failing_tests==() because the failing check is a shell/infra guard yielding zero parsed test ids, leaving file-token-only implication), was 6/7 times unable to have caused the failure. New datum: task 5566''s failing check (tests/infra/test_reify_audit_ptodo.sh) is a second, unrelated shell/infra guard reproducing the same zero-parsed-test-ids weak-evidence failure mode as the test_harness_kloc_cap.sh guard 2918''s original census was built on -- confirming the discriminator is a property of the evidence regime, not one file.'
 - id: merge-state-not-git-corroborated
   title: Merge-lane state answers come from run-scoped caches and persisted snapshots that diverge from git truth
   severity: high
@@ -671,6 +701,12 @@ entries:
     origin_phase: recon
     manifested_phase: recon
     note: Reconciliation run's MCP Actions ledger records operation/source/created_at but leaves target:"?" for several write_journal-sourced add/delete entries (while sibling add_system_record entries resolve a real UUID), so the audit trail can't say what was actually added/deleted without cross-referencing stage stats — matches the entry's 'payloads omit identifying info, no rendered self-model' pattern for recon harness lifecycle state.
+  - date: '2026-07-30'
+    project: dark_factory
+    session: b641f56e-ecb2-4655-8725-ace6b37c82b1
+    origin_phase: recon
+    manifested_phase: recon
+    note: task_knowledge_sync reports stale_missing_run_id_markers=1, evidencing run_id-scoped markers going stale/orphaned as described in this entry.
 - id: fused-memory-api-traps
   title: 'fused-memory tool contracts lie or under-inform: destructive-by-default writes, envelope asymmetry, silent filters, unusable oversized outputs'
   severity: medium
@@ -983,6 +1019,18 @@ entries:
     manifested_phase: review
     invariant_violated: StructuredOutput schema validation contract
     note: 'Double-wrap error: output `{"decisions": {"decisions": [...]}}` violates schema expecting `/decisions` to be array. Matches the documented pattern where StructuredOutput parameter name collides with top-level schema key.'
+  - date: '2026-07-29'
+    project: dark_factory
+    session: a3af9382-c03b-4ca7-9abc-ed8f0206be4b
+    origin_phase: ops
+    manifested_phase: ops
+    note: Module-tagger-style file-prediction session (predicting task file-touch sets for concurrency locks) hit six consecutive 'interrupted by a usage limit, continue where you left off' resumes across turns 16/28/37/46/55/65 — direct reinforcement of the 'usage-limit resume storms' pattern already named in this entry's description.
+  - date: '2026-07-29'
+    project: dark_factory
+    session: 5132d6d0-e9cc-48d2-8ba7-38fe693bb9a7
+    origin_phase: implement
+    manifested_phase: implement
+    note: Turn 163 carries the standard 'Your previous run was interrupted by a usage limit. Continue where you left off...' resume boilerplate — a single instance consistent with this entry's usage-limit-resume evidence class, though this digest alone doesn't show a resume storm or a directly attributable failure.
 - id: prose-routing-intent
   title: Execution-routing intent lives only in description prose — no-code deploys, gates, operator actions, and design decisions dispatch into the TDD architect pipeline
   severity: medium
@@ -1042,6 +1090,30 @@ entries:
     origin_phase: unknown
     manifested_phase: implement
     note: darkfactorypathscopeviolation guard trip; known over-firing on prose-token matching pattern
+  - date: '2026-07-28'
+    project: dark_factory
+    session: 56fe65e0-2bbd-41c4-9833-68d185770232
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: darkfactorypathscopeviolation guard fired at turn 3 on a Read of a file inside the task's own worktree (.worktrees/3109/fused-memory/src/fused_memory/middleware/project_prefix_registry.py) — an in-scope path triggering the guard, matching the known over-firing pattern (fix task 2434).
+  - date: '2026-07-31'
+    project: dark_factory
+    session: 2a1b1a46-b053-4ade-b36e-c823ffa49faa
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: darkfactorypathscopeviolation guard tripped twice (turns 3 and 10), consistent with the documented path-scope guard over-firing pattern.
+  - date: '2026-07-31'
+    project: dark_factory
+    session: bda65a03-a3c6-42cd-b601-1c4d306947f9
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Interactive session tripped darkfactorypathscopeviolation twice (turns 3 and 10) with no other signal noise (0 tool_error/self_correct/not_found/interrupt) — consistent with the known path-scope guard prose-token over-firing pattern; digest lacks enough detail (no tool args/paths shown) to attribute a specific phase.
+  - date: '2026-07-28'
+    project: dark_factory
+    session: 0d3468ff-e562-4da1-a556-7e809095c9a4
+    origin_phase: unknown
+    manifested_phase: implement
+    note: 3 darkfactorypathscopeviolation guard trips (turns 30, 62, 67) in a task worktree session with no other signal — consistent with the known path-scope guard over-firing pattern (prose-token matching false positives).
 - id: oneoff-2026-07-02
   title: 'Implementer twice re-built the explicitly forbidden _xdist_resilience custom scheduler (task 1907) — model negative-instruction attractor; mitigate mechanically: lead descriptions '
   severity: low
@@ -1189,6 +1261,18 @@ entries:
     origin_phase: unknown
     manifested_phase: implement
     note: 'MCP tool ''add_design_decision'' called with keyword arguments not in actual schema (validation error: unexpected keyword argument for ''decision'' and ''how''). Symptom matches deferred-tool discovery gaps or schema-contract drift.'
+  - date: '2026-07-30'
+    project: dark_factory
+    session: 277c3010-b192-499d-8150-6317a31aa0fc
+    origin_phase: implement
+    manifested_phase: implement
+    note: mcp__plan-tools__add_design_decision (missing 'rationale') and mcp__plan-tools__add_reuse_item (missing 'where') both failed pydantic validation on first call in the same session — consistent with the agent guessing the tool's argument shape rather than fetching its schema via ToolSearch before calling a deferred/unloaded tool.
+  - date: '2026-07-28'
+    project: dark_factory
+    session: 76a5db9c-8243-44d0-b45b-125e253dfa30
+    origin_phase: architect
+    manifested_phase: architect
+    note: 'Turn 112: mcp__plan-tools__add_design_decision called with guessed keyword args (''where'', ''how'') that the tool''s pydantic schema doesn''t accept -> ''Unexpected keyword argument'' validation errors on both fields. Matches the deferred-tool-called-before-ToolSearch-discovery pattern: params guessed from assumed shape rather than fetched schema.'
 - id: entry-cand-20260719-2
   title: Graphiti memory search returns self-referential summaries stripped of the actual fact
   severity: medium
@@ -1215,6 +1299,12 @@ entries:
     origin_phase: implement
     manifested_phase: implement
     evidence_quote: 'Bash({"command": "cat .task/iterations.jsonl 2>/dev/null"}) -> Exit code 1'
+  - date: '2026-07-30'
+    project: dark_factory
+    session: 4c5bf231-6dc8-484a-b142-5b1c4b59374c
+    origin_phase: implement
+    manifested_phase: implement
+    note: Task 3306 worktree session hit FileNotFoundError reading /home/leo/src/dark-factory/.worktrees/.task-meta/3306/iterations.jsonl — same class of defect as the existing candidate (code assumes a task's iterations.jsonl always exists under its meta dir), just at a different path (.task-meta vs .task).
 - id: entry-cand-20260718-1
   title: Reconciliation stage cost telemetry (tokens_used) always zero despite nonzero llm_calls
   severity: medium
@@ -1261,6 +1351,60 @@ entries:
     origin_phase: recon
     manifested_phase: recon
     note: memory_consolidator stage reports llm_calls=17 with tokens_used=0; telemetry bug in cost instrumentation
+  - date: '2026-07-27'
+    project: dark_factory
+    session: 192e48c8-3dae-4470-8195-f742f8795b1c
+    origin_phase: recon
+    manifested_phase: recon
+    note: memory_consolidator stage report shows llm_calls=15 but tokens_used=0, reproducing the known zero-cost-telemetry defect in reconciliation stage reports.
+  - date: '2026-07-31'
+    project: dark_factory
+    session: 5871ae29-c870-47be-a72b-074f82b1558a
+    origin_phase: recon
+    manifested_phase: recon
+    note: 'memory_consolidator stage report shows llm_calls: 44 but tokens_used: 0, reproducing the known zero-telemetry-despite-nonzero-calls pattern.'
+  - date: '2026-07-26'
+    project: dark_factory
+    session: 7bd5fdf5-a583-4d96-af99-f39ddc5dfa95
+    origin_phase: recon
+    manifested_phase: recon
+    note: duplicate evidence of the same tokens_used=0 despite nonzero llm_calls telemetry gap
+  - date: '2026-07-24'
+    project: dark_factory
+    session: 7fa098be-12c2-4d92-92c6-2e87ddca4da9
+    origin_phase: unknown
+    manifested_phase: recon
+    note: memory_consolidator stage report shows llm_calls=35 but tokens_used=0 in the same run (run 063f3e99), reconfirming cost telemetry is always zero regardless of actual LLM usage.
+  - date: '2026-07-26'
+    project: dark_factory
+    session: 7d7b14e8-d452-4a9c-ae5e-0774881e3c08
+    origin_phase: recon
+    manifested_phase: recon
+    note: Same tokens_used=0/llm_calls=17 divergence in the memory_consolidator stage report — recurrence of the cost-telemetry-always-zero pattern.
+  - date: '2026-07-25'
+    project: dark_factory
+    session: c21e0145-c806-4fc1-864c-c0f03d50cfdc
+    origin_phase: recon
+    manifested_phase: recon
+    note: memory_consolidator stage report shows llm_calls=39 but tokens_used=0 in a reify remediation run (96fb51f5), reproducing the known cost-telemetry defect.
+  - date: '2026-07-25'
+    project: dark_factory
+    session: 36fd066f-5ef0-4af9-9be7-a14bf9e0f440
+    origin_phase: recon
+    manifested_phase: recon
+    note: memory_consolidator stage report shows llm_calls=39 but tokens_used=0 in the same reconciliation run review, confirming cost telemetry is always zeroed regardless of actual LLM usage.
+  - date: '2026-07-30'
+    project: dark_factory
+    session: b641f56e-ecb2-4655-8725-ace6b37c82b1
+    origin_phase: recon
+    manifested_phase: recon
+    note: Same tokens_used=0/llm_calls=27 gap in the memory_consolidator stage report; matches the 'always zero' cost-telemetry finding.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: b6b1ec9b-be13-49c3-8138-0304fdd4a0f8
+    origin_phase: recon
+    manifested_phase: recon
+    note: 'memory_consolidator stage report shows llm_calls: 18 but tokens_used: 0 in the same run review.'
 - id: entry-cand-20260722-3
   title: watcher-rearm.sh requires undocumented DARK_FACTORY_ROOT env var not set by rotation launch context
   severity: medium
@@ -1311,6 +1455,12 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: 'Session-start memory search returns high-scored (1.0, 0.95, 0.9, 0.85) but generic/task-irrelevant results: tasks 1470, 2531, 841, and plan-resume context'
+  - date: '2026-07-30'
+    project: dark_factory
+    session: b90b9d91-caa9-4909-88d5-1387b07ca382
+    origin_phase: ops
+    manifested_phase: ops
+    note: 'Turn 3''s injected ''# Context / Project Context'' memory search block returns four disparate items (task 1470, reify 2531, task #841, a deferred architect-resume task) all scored 0.85-1.0 relevance with no apparent connection to each other or to a discernible task focus for worktree 3208 — generically high-scored, likely task-irrelevant context.'
 - id: entry-cand-20260722-5
   title: Periodic-census verifier can't read other sessions' transcripts — sandboxed to the current project's working directory
   severity: medium
@@ -1324,6 +1474,12 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     evidence_quote: 'ls in ''/home/leo/.claude/projects'' was blocked. For security, Claude Code may only list files in the allowed working directories for this session: ''/home/leo/src/dark-factory''.'
+  - date: '2026-07-24'
+    project: dark_factory
+    session: 50282bc3-d913-486f-aabf-3f4f440661dc
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'Verifier told to confirm cross-session claim via reads of ''.'', but locating the flagged session''s transcript requires listing ~/.claude/projects/, which is outside the session''s allowed working directory (''/home/leo/src/dark-factory'') and is hard-blocked by the sandbox (turn 24: ''may only list files in the allowed working directories for this session'').'
 - id: entry-cand-20260722-6
   title: Bash tool's static-analysis pre-check rejects multi-line heredoc/multi-command scripts outright, conflating with the 'flattening' bug it was sent to reproduce
   severity: medium
@@ -1450,6 +1606,30 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: Digest captured trickle-coder's '# Context' header and memory-search JSON scaffolding under 'User Corrections' section, consistent with recursive ingestion of injected prompt structure.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: 9c5129d4-30ae-4bf3-9e87-70a0c279d7db
+    origin_phase: unknown
+    manifested_phase: recon
+    note: 'Generalizes the known trickle-coder self-recursion pattern beyond self-ingestion: here the digest''s ''## User Corrections'' section captures not the trickle-coder''s own prompt but a recon session''s own reconciliation-run-review tool output (a large stage-report JSON dump, turn 3) verbatim, despite zero actual signal counts (tool_error/self_correct/not_found/df_guard/interrupt all 0). Confirms the digest extractor''s ''User Corrections'' heuristic naively harvests any user-role turn (including tool_result/report payloads) across session types, not only trickle-coder self-recursion.'
+  - date: '2026-07-25'
+    project: dark_factory
+    session: c83a6086-54df-4017-9e13-01cda0b95c29
+    origin_phase: ops
+    manifested_phase: recon
+    note: 'Same digest-pipeline defect class (non-correction content dumped into the ''User Corrections'' bucket), but a distinct manifestation: turn 3 here is not the trickle-coder''s own recursively-ingested prompt/meta-session — it''s a genuine recon session''s own tool-output/stage-report text (''## Reconciliation Run Review'' + full stage JSON) captured verbatim and mislabeled as a User Correction. Confirms the extraction heuristic doesn''t discriminate human-authored corrections from arbitrary large-text turns at all, regardless of source.'
+  - date: '2026-07-30'
+    project: dark_factory
+    session: 836fe71a-27e3-4d26-8117-00a141250e6b
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Turn 3's 'User Corrections' entry is actually the injected task-briefing '# Context' / '## Project Context' block (a verbatim memory-search JSON dump), not user pushback — same digest-extractor misclassification family as prior entries, but here the miscaptured text is an ordinary orchestrated-task's dispatch context block rather than the trickle-coder's own recursive prompt, indicating the extractor over-fires on any large injected header/JSON block near session start, not just self-referential trickle-coder content.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: d5493bc4-2c58-4024-b304-0ebdc05975ab
+    origin_phase: ops
+    manifested_phase: recon
+    note: Digest pipeline's 'User Corrections' extractor mislabeled a plain recon 'Reconciliation Run Review' stage-report JSON dump (turn 3) as a User Correction. signal_counts are all 0 (tool_error/self_correct/not_found/df_guard/interrupt) yet score=5.0 — the labeled turn is just a stats dump, not a correction. Same 'non-correction report content misclassified as User Correction' defect as the trickle-coder self-ingestion cluster, here sourced from a recon session's own stage-report output rather than the trickle-coder's own recursive prompt.
 - id: entry-cand-20260722-11
   title: Read tool's undocumented 256KB cap blocks whole-file architect exploration of large modules
   severity: medium
@@ -1502,6 +1682,168 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     evidence_quote: "signal_counts:\n  tool_error: 1\n  self_correct: 0\n  not_found: 2\n  df_guard: 0\n  interrupt: 0\n---\n\nsystem<system-reminder>\nThe following deferred tools are now available via ToolSearch..."
+  - date: '2026-07-31'
+    project: dark_factory
+    session: 4a143f20-5454-4193-b5a2-5bff0cff8125
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Digest for session 4a143f20 (score 0.0, signal_counts all 0, size_bytes 299) contains no actual dialogue — the entire captured 'session content' is the harness's own system-reminder boilerplate (deferred-tools list, MCP server instructions, available-skills list). Extraction produced a scored-but-substance-free digest, matching the pattern of collapsing to system-reminder text and discarding whatever real interaction (if any) occurred.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: 6eeb86f7-4388-436e-9f29-7cbf03b6f64d
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Digest for a watcher session (2026-07-24, 295 bytes, score 0.0, all signal_counts 0) contains no actual session transcript — the entire body is system-reminder boilerplate (deferred-tool listing, agent-type roster, MCP server instructions, skill catalog) instead of extracted session substance, matching the known digest-collapses-to-boilerplate pattern.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: a1a5708d-9cfd-49dc-82a2-eac4ea41ed43
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Digest metadata declares size_bytes=299, score=0.0, all signal_counts=0 (i.e. a near-empty, low-signal session) yet the '=== SESSION DIGEST ===' body actually delivered is thousands of bytes of unrelated system-reminder boilerplate (deferred-tool manifest, agent-type roster, MCP server instructions, full skill listing) — not session substance. Matches the established pattern of digest extraction substituting system-reminder boilerplate for the real evidence behind a session's signal counts.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: 7e0c17ae-d9d5-4c54-9adb-6f9f53d19a14
+    origin_phase: recon
+    manifested_phase: recon
+    note: Session 7e0c17ae (recon, 2026-07-24) digest is 293 bytes, score 0.0, all signal_counts 0; the entire captured body is injected system-reminder boilerplate (deferred-tools list, agent-type roster, MCP server instructions, skills catalog) with zero actual session dialogue/content — exact recurrence of the 'digest collapses to system-reminder boilerplate' pattern.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: 9a60f2a1-5652-4104-9cc3-05cafc29aaf0
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Digest for session 9a60f2a1 (size_bytes=299, score=0.0, all signal_counts=0) contains nothing but injected system-reminder boilerplate — deferred-tool list, agent-type roster, MCP server instructions, skill catalogue — with zero actual session conversation captured, reconfirming the digest-extraction-collapses-to-boilerplate failure mode.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: e95214c3-bf98-4fbe-bcec-4589495a41cb
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Session e95214c3 digest is only 299 bytes, score 0.0, all signal_counts 0 — the rendered 'session content' is entirely system-reminder boilerplate (deferred-tool list, agent-type list, MCP server instructions, skill listing) with zero actual conversation/task substance, matching the known digest-extraction failure that collapses a scored session down to boilerplate.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: 1f2de086-ff61-4378-8822-ca8160e4ebb5
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: size_bytes=299, score=0.0, all signal_counts=0; the entire 'session' body is just the injected deferred-tools/agents/skills system-reminder boilerplate with no actual user/assistant dialogue — same collapse-to-boilerplate failure as the indexed candidate, discarding whatever substance (if any) underlies the zeroed signal counts.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: 11d95de7-3c28-4bf2-8594-8e22d5cccd16
+    origin_phase: ops
+    manifested_phase: ops
+    note: Score 7.0 session's entire 'User Corrections' digest is a raw dump of the orchestrated task's injected `# Context` block (memory-search JSON results for tasks 1470/2531/841/etc.), truncated mid-object — system-reminder-style boilerplate substituted for actual correction substance, not a real human correction.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: 5a2bdc94-2358-41f5-b5f1-4ebafc461ac0
+    origin_phase: ops
+    manifested_phase: ops
+    note: Digest for session 5a2bdc94 is 299 bytes, score 0.0, all signal_counts 0, and its entire body is verbatim system-reminder boilerplate (deferred-tools list, agent-type list, MCP server instructions, skills list) with zero actual session narrative — the extraction pipeline captured only front-matter boilerplate and discarded/never reached real session substance, matching the cataloged 'collapses to system-reminder boilerplate' pattern.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: d1bca179-6ce3-44e9-8099-898efbd27fcc
+    origin_phase: ops
+    manifested_phase: ops
+    note: Digest for this session (299 bytes, score 0.0, all signal_counts 0) contains no actual conversational content — only the standard system-reminder boilerplate (deferred-tool list, agent-type list, MCP server instructions, skills list) that gets attached to every session start. The trickle-coder pipeline captured this boilerplate as the 'session digest' with zero substantive evidence, matching the known pattern of digest extraction collapsing to system-reminder text.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: 49afec80-d2ab-4647-b89c-6423f8615592
+    origin_phase: recon
+    manifested_phase: ops
+    note: 'Session 49afec80 (recon agent_class, 2026-07-24): digest is 293 bytes, score 0.0, all signal_counts zero, and the body contains no actual session transcript excerpt — only the auto-appended system-reminder boilerplate (deferred-tool list, agent-type roster, MCP server instructions, skill catalog). Matches the known pattern of digest extraction collapsing a zero-signal session down to reminder scaffolding instead of surfacing whatever substance the session actually had.'
+  - date: '2026-07-24'
+    project: dark_factory
+    session: a8c6f81b-2d90-49ae-9d39-5f67a10dba97
+    origin_phase: ops
+    manifested_phase: ops
+    note: Session digest for a8c6f81b (299 bytes, score 0.0, all signal_counts 0) contains no actual dialogue substance — only the injected system-reminder boilerplate (deferred-tools listing, agent-types listing, MCP server instructions, skills listing). Matches the known digest-extraction failure mode where the pipeline collapses a session to system-reminder boilerplate instead of surfacing real conversational content.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: b5438584-de17-41c4-bee1-ef41c5d07fed
+    origin_phase: ops
+    manifested_phase: ops
+    note: Digest body is entirely the standard session-start system-reminder boilerplate (deferred-tools list, agent-type roster, MCP server instructions, skills catalogue) with zero actual user/assistant conversation captured — size_bytes=299, score=0.0, all signal_counts=0. Matches the established pattern of the trickle-coder digest pipeline collapsing a session to injected preamble text instead of substantive content, though here it self-reports the null signal (score 0) rather than mis-scoring it.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: 44fe3a9e-a775-440a-b657-0c0e8df70c8f
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Digest has score=0.0, all signal_counts=0, size_bytes=299, and the only 'session content' rendered is the injected system-reminder boilerplate (deferred-tool list, agent-type list, skill list) — no actual user/assistant conversation substance survived extraction, matching the known 'digest collapses to system-reminder boilerplate' pattern.
+  - date: '2026-07-29'
+    project: dark_factory
+    session: 7d1ff9a0-e04d-46e6-958c-af54c8a5c63e
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Digest's sole 'User Corrections' entry (turn 3) is the raw injected '# Context' / 'Project Context' memory-search JSON dump handed to the dispatched orchestrated-task session, not an actual human correction — the digest collapsed to this system-injected boilerplate while all signal_counts (tool_error/self_correct/not_found/df_guard/interrupt) read 0, discarding whatever real session substance existed.
+  - date: '2026-07-31'
+    project: dark_factory
+    session: 7af26e76-d5f2-4837-9cb4-c578f3139153
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Digest for session 7af26e76 is score=0.0, all signal_counts=0, size_bytes=299, and the entire rendered body is just injected system-reminder boilerplate (deferred-tool list, agent-type list, skill list) with zero actual session transcript/substance — the same 'scored session collapses to boilerplate, substance discarded' failure this entry already documents.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: 9a7fc91c-f32e-4458-a4b8-ee2ccccbfc11
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Digest body is 299 bytes of pure system-reminder boilerplate (deferred-tool list, agent-type list, skill list) with zero signal_counts and score 0.0 — no actual session content survived extraction, matching the established 'digest collapses to system-reminder boilerplate' pattern.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: 8d53f665-54c1-486a-b380-6a3b80a42141
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Session 8d53f665 digest is 299 bytes, score 0.0, all signal_counts zero, and the only content surfaced is the injected system-reminder boilerplate (deferred-tool list, agent-type roster, skill index, MCP server instructions) — no actual user/assistant exchange. Matches the known pattern of digest extraction collapsing a scored session down to system-reminder text and discarding whatever substance (or lack thereof) the signal counts should reflect.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: 5298a33d-9c43-4ddb-96d5-af60707e70b2
+    origin_phase: ops
+    manifested_phase: ops
+    note: Session digest (299 bytes, score 0.0, all signal_counts 0) contains no actual session content — only the standard system-reminder boilerplate (deferred-tool list, agent-type list, MCP server instructions, skill list) that gets injected at session start. The digest extractor collapsed this near-empty/no-op session into raw injected boilerplate rather than any real transcript substance, matching the already-logged pattern of the digest pipeline discarding substance behind its signal counts.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: abde3f24-31a9-4d5a-9e97-33b0fbab0a4f
+    origin_phase: recon
+    manifested_phase: ops
+    note: Digest for a recon-class session (score 0.0, signal_counts all zero, size_bytes 293) contains no actual transcript content — the entire 'session digest' payload is generic system-reminder boilerplate (deferred-tool list, agent-type list, skill catalog) injected at session start, with zero mined substance behind the score/signal counts.
+  - date: '2026-07-30'
+    project: dark_factory
+    session: b63f170b-09bc-41ac-91a6-c8eebfc50297
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Digest for session b63f170b (worktree 3148) is only 298 bytes and consists entirely of injected system-reminder boilerplate — deferred-tool list, agent-type descriptions, MCP server instructions, skill catalog — with score 0.0 and all signal_counts at 0; no actual user/assistant session content survived extraction, matching the known 'collapses to system-reminder boilerplate' failure mode.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: 310d67de-6152-4884-9783-3ea7cde8a4a5
+    origin_phase: unknown
+    manifested_phase: ops
+    note: 'Session 310d67de scored 0.0 with all signal_counts at 0, size_bytes only 299 — the entire digest body is injected system-reminder boilerplate (deferred-tool list, agent-type roster, MCP server instructions, skill listings) with zero actual user/assistant dialogue. Same defect as the indexed candidate: the trickle pipeline captured/scored a session whose ''content'' is just the harness''s own injected context, discarding whatever real substance (if any) existed.'
+  - date: '2026-07-24'
+    project: dark_factory
+    session: e25d827b-45bb-4b63-806b-f1a440e2f03e
+    origin_phase: ops
+    manifested_phase: ops
+    note: Session e25d827b (score 0.0, size_bytes=299, all signal_counts 0) — the digest body captured for this session is not dialogue but the generic Claude Code startup system-reminder boilerplate verbatim (deferred-tools ToolSearch list, Agent-tool subagent roster, fused-memory MCP server instructions, full skills catalogue). No actual user/assistant substance survived extraction, matching the known pattern of digest extraction collapsing to system-reminder text and discarding whatever real content the session had.
+  - date: '2026-07-28'
+    project: dark_factory
+    session: 1dee832a-4f98-4518-9f66-05f612b47e32
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Digest handed to the trickle coder for this scored session (298 bytes, score 0.0, all signal_counts 0) contains zero actual conversation — only the standard auto-injected system-reminder boilerplate (deferred-tool list, agent-type list, MCP server instructions, skill list). No user turn, assistant turn, or tool call is present, so the digest pipeline collapsed whatever the session actually contained into pure boilerplate, matching the documented 'discards the substance behind its signal counts' failure.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: bf0a35f4-75ec-460c-a1f0-d2aa7973a264
+    origin_phase: unknown
+    manifested_phase: ops
+    note: Session bf0a35f4 digest is 299 bytes, score 0.0, all signal_counts 0, and its entire captured content is the generic session-start system-reminder boilerplate (deferred-tool list, agent-type list, skill list) with zero actual dialogue or task content preserved — the digest pipeline collapsed a session down to boilerplate, discarding whatever substance (if any) occurred, matching the documented 'collapses a scored session to system-reminder boilerplate' failure mode.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: ff5dfd40-197c-4ebf-b33f-48f074fae3e3
+    origin_phase: ops
+    manifested_phase: ops
+    note: 'Digest for this session (score 0.0, size_bytes 299) contains no actual session content — only injected system-reminder boilerplate (deferred-tool list, agent-type list, skill list, MCP server instructions). Same failure mode as the indexed candidate: digest extraction collapses to system-reminder text, discarding whatever substance the signal counts were meant to summarize.'
+  - date: '2026-07-24'
+    project: dark_factory
+    session: dd48de1f-d6ab-4a07-80e3-aaea2a4b62ad
+    origin_phase: unknown
+    manifested_phase: ops
+    note: Digest header shows score 0.0, size_bytes=299, all signal_counts=0, and the only 'content' present is generic per-session-start system-reminder boilerplate (deferred-tool list, agent-type list, skills list) — the same boilerplate injected into every session. No actual transcript substance survived extraction, matching the known digest-collapses-to-boilerplate pattern.
 - id: entry-cand-20260720-7
   title: Recon stage self-reported counters diverge from computed pipeline stats, with mismatched field names between the two
   severity: medium
@@ -1515,6 +1857,78 @@ entries:
     origin_phase: recon
     manifested_phase: recon
     evidence_quote: '"memories_deleted": 0 ... "_reported": {"memories_added": 0.0, "memories_deleted": 3.0}'
+  - date: '2026-07-29'
+    project: dark_factory
+    session: b38fece8-2f7d-44f2-bd63-a65b823487b2
+    origin_phase: recon
+    manifested_phase: recon
+    note: memory_consolidator's nested stats._reported reports 'memories_written':1.0 while the top-level stats dict has no such key (only 'memories_added':1) — the self-reported subtotal uses a different field name than the computed counter it's meant to mirror, matching the prior field-name-mismatch finding.
+  - date: '2026-07-26'
+    project: dark_factory
+    session: aca1af6e-8178-4c75-94f3-e251213814b8
+    origin_phase: recon
+    manifested_phase: recon
+    note: memory_consolidator stage report shows top-level items_flagged=2 while its own nested stats dict reports a differently-named counter, flags_emitted=1.0 — same underlying signal, mismatched field name and diverging value between the two self-reported layers of the same stage report.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: 7fa098be-12c2-4d92-92c6-2e87ddca4da9
+    origin_phase: unknown
+    manifested_phase: recon
+    note: 'memory_consolidator''s nested _reported dict introduces ''memories_written'': 1.0 as a synonym for top-level stats.memories_added: 1 — self-reported counters use a different field name than the computed stat they mirror.'
+  - date: '2026-07-27'
+    project: dark_factory
+    session: b95bba74-0344-496d-9d3c-f515157d5852
+    origin_phase: recon
+    manifested_phase: recon
+    note: 'Run metadata reports ''Events processed: 0'' while stage stats (findings_investigated: 1.0, tasks_created: 1.0, memories_added: 1) show a finding was actually processed end-to-end — self-reported run-level counter diverges from computed per-stage stats.'
+  - date: '2026-07-28'
+    project: dark_factory
+    session: 2977f473-8805-4c50-8f75-f6a934157132
+    origin_phase: recon
+    manifested_phase: recon
+    note: 'Run-level ''Events processed: 0'' contradicts the run''s own Trigger (integrity_findings:2) and the task_knowledge_sync stage''s self-reported stage1_analytical_findings_processed:2/tasks_created:1 — self-reported counters diverging from actual pipeline activity, with mismatched field naming between ''memories_added'' and ''_reported.memories_written''.'
+  - date: '2026-07-27'
+    project: dark_factory
+    session: 09c19aaa-7b7e-4c05-bbe0-c5da7ca2aabb
+    origin_phase: recon
+    manifested_phase: recon
+    note: 'Stage report shows top-level ''items_flagged'': 2 alongside nested stats.flags_filed: 2.0 for the same memory_consolidator quantity — same field-name-mismatch pattern already logged (values agree here, but the naming inconsistency between self-reported top-level counters and nested stats persists).'
+  - date: '2026-07-26'
+    project: dark_factory
+    session: 7d7b14e8-d452-4a9c-ae5e-0774881e3c08
+    origin_phase: recon
+    manifested_phase: recon
+    note: 'Field-name mismatch between self-reported and top-level counters: _reported.memories_written (1.0) has no matching top-level field — top level only has memories_added — matching the ''mismatched field names between the two'' pattern.'
+  - date: '2026-07-26'
+    project: dark_factory
+    session: 9eae918a-9f02-4b86-b424-4c6344188917
+    origin_phase: recon
+    manifested_phase: recon
+    note: memory_consolidator stage report shows top-level items_flagged=1 alongside nested stats.flags_emitted=1.0 — same underlying count exposed under two different field names, reproducing the self-reported-counter/field-mismatch pattern already logged for recon stage reports.
+  - date: '2026-07-25'
+    project: dark_factory
+    session: 36fd066f-5ef0-4af9-9be7-a14bf9e0f440
+    origin_phase: recon
+    manifested_phase: recon
+    note: the nested '_reported' dict introduces 'memories_written' with no corresponding top-level field name (top level uses 'memories_added'/'memories_deleted' only), showing the self-reported and computed counters use divergent field vocabularies.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: b6b1ec9b-be13-49c3-8138-0304fdd4a0f8
+    origin_phase: recon
+    manifested_phase: recon
+    note: the nested `_reported` block uses the field name `memories_written` which never appears at the top level (only `memories_added` does) — mismatched field naming between self-reported and computed counters, consistent with this entry's pattern.
+  - date: '2026-07-27'
+    project: dark_factory
+    session: f7323719-1fd8-417a-9843-450e9eda6a39
+    origin_phase: recon
+    manifested_phase: recon
+    note: the nested _reported dict's 'memories_written' key has no corresponding top-level stats field (top level has memories_added/memories_deleted instead) — mismatched field naming between self-reported and computed counters.
+  - date: '2026-07-28'
+    project: dark_factory
+    session: ccfbd8d2-86d1-4404-a10e-fe1444d91adb
+    origin_phase: unknown
+    manifested_phase: recon
+    note: Turn 3 shows memory_consolidator stage report with top-level items_flagged=1 vs nested stats.flagged_items=1.0 — same value, different field name, matching the recurring top-level/nested stage-report field-name mismatch pattern.
 - id: entry-cand-20260724-1
   title: Session-start context search injects generic, task-irrelevant memories scored as highly relevant
   severity: medium
@@ -1559,6 +1973,18 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: Session-start memory search results injected with high relevance scores (1.0, 0.95, 0.9, 0.85) returning generic facts about unrelated tasks (1470, 2531, 841) and deferred plan-resume work. Scores suggest high relevance despite topical distance from task context.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: e4dac837-a9d2-494e-ade8-7372ae613b2a
+    origin_phase: recon
+    manifested_phase: implement
+    note: 'Task 3017''s worktree briefing (turn 3) injects a ''# Context''/''Project Context'' block of Graphiti search results scored 1.0/0.95/0.9/0.85 that read as generic, decontextualized facts (e.g. ''Task #841 was kept scoped to the four still-single-project views'', ''dark_factory project has a deferred task related to Architect plan-resume'') with no visible tie to whatever task 3017 actually implements — same pattern as prior session-start context-injection findings.'
+  - date: '2026-07-29'
+    project: dark_factory
+    session: 5132d6d0-e9cc-48d2-8ba7-38fe693bb9a7
+    origin_phase: implement
+    manifested_phase: implement
+    note: Turn 3's injected '# Context / Project Context' block returns four high-relevance-scored (0.85-1.0) Graphiti facts (task 1470 /audit wiring, reify 2531 plan.json sufficiency, task 841 scoping, a deferred architect plan-resume task) with no apparent tie to this session's actual work — generic session-start memory injection.
 - id: entry-cand-20260717-2
   title: Rotation-hour budget invisible during long blocking re-arm waits
   severity: medium
@@ -1585,6 +2011,18 @@ entries:
     origin_phase: review
     manifested_phase: review
     evidence_quote: Some were acted on, but others were merely DEFERRED (routed to a follow-up task) and are still OPEN and unaddressed. A current suggestion that matches only a DEFERRED, still-open prior concern has NOT been settled and must still be emitted.
+  - date: '2026-07-31'
+    project: dark_factory
+    session: 3dde02c6-72cd-4215-81af-c8641db4e897
+    origin_phase: review
+    manifested_phase: review
+    note: Same underlying confusion as entry-cand-20260723-2 — the review-round adjudication list itself conflates 'previously raised' with 'resolved' unless the prompt explicitly overrides that reading each time, as it does here ('never merely because it resembles something raised before').
+  - date: '2026-07-30'
+    project: dark_factory
+    session: 3c226ea2-65d2-4b88-8ec5-a946809b6730
+    origin_phase: review
+    manifested_phase: review
+    note: 'Same underlying failure mode as the settled/deferred candidate: without the explicit correction, an adjudicator would conflate ''previously raised'' (appears in the prior-round list) with ''resolved'', wrongly suppressing still-open deferred concerns like the census_memory_metadata.py coverage.complete truncation item shown in the digest.'
 - id: entry-cand-20260722-16
   title: Trickle-coder digest pipeline ingests its own meta-sessions as source material
   severity: medium
@@ -1650,6 +2088,30 @@ entries:
     origin_phase: ops
     manifested_phase: verify
     evidence_quote: 'Bash({"command": "grep -rn \"ensure_eval_verify_deps\" /home/leo/src/dark-factory/orchestrator/src 2>/dev/null"}) -> This command requires approval'
+  - date: '2026-07-24'
+    project: dark_factory
+    session: 50282bc3-d913-486f-aabf-3f4f440661dc
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Two of the five rejected attempts (turns 14, 17) were per-command interactive approval prompts on read-only forensic Bash/Read calls, before the final hard sandbox denial at turn 24.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: 19fa9a8a-c33f-4a56-a50e-26febcac899c
+    origin_phase: unknown
+    manifested_phase: ops
+    note: 'Periodic-census verifier session for the confusion codebook: 15/15 tool_error signals are ''This command requires approval'' on read-only grep/find commands probing fused_memory/reconciliation source for items_flagged usage, with two 3x retry loops on the identical command. Confirms the recurring pattern of per-command interactive Bash approval blocking read-only forensic verification work.'
+  - date: '2026-07-24'
+    project: dark_factory
+    session: b5b924cf-a182-4ade-84e1-d28baa7e95ab
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Census-verifier's sub-agent hit 'This command requires approval' 3x in a row on the identical read-only grep ('grep -rn "def add_episode" /home/leo/src/dark-factory/fused-memory/src/') while forensically confirming a trickle-miner cluster — same per-command interactive Bash approval friction on read-only forensic commands already captured by this entry.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: 3519e3b9-31af-45da-8f5b-b08e7cfe0a26
+    origin_phase: ops
+    manifested_phase: ops
+    note: 9 tool_error entries are all Bash 'requires approval' blocks on read-only find/grep forensic commands (turns 13,18,19,31,44,54,73,77,90) issued by this periodic-census verifier while trying to locate a nested session's transcript.
 - id: entry-cand-20260719-5
   title: Graphiti search returns decontextualized single-sentence fragments — high relevance score, zero actionable content
   severity: medium
@@ -1731,6 +2193,42 @@ entries:
     manifested_phase: recon
     invariant_violated: score_assigned ∧ signal_counts_all_zero
     note: Recon session assigned score=35.0 despite all signal counters at zero (tool_error=0, self_correct=0, not_found=0, df_guard=0, interrupt=0) and minimal content (294 bytes); score generation decoupled from signal capture
+  - date: '2026-07-31'
+    project: dark_factory
+    session: 5871ae29-c870-47be-a72b-074f82b1558a
+    origin_phase: recon
+    manifested_phase: recon
+    note: Digest signal_counts are all zero (tool_error/self_correct/not_found/df_guard/interrupt) yet the session scored 5.0 — score not derived from the counted evidence.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: d6e1f291-ae62-4b54-ba1b-9de81247511f
+    origin_phase: ops
+    manifested_phase: ops
+    note: score=5.0 while all signal_counts (tool_error/self_correct/not_found/df_guard/interrupt) are 0 and the sole 'evidence' is boilerplate JSON search results, not session substance — score assigned independent of any real signal in the digest body.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: f6e4adfe-ba3c-4868-aba4-a77088ca1578
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Digest carries score=2.0 and size_bytes=333 but the only rendered evidence (the turn-3 guard trip) is an empty template stub — severity score present with essentially no substantive digest body.
+  - date: '2026-07-29'
+    project: dark_factory
+    session: 5c1174a4-9deb-4068-bac5-86d3b35f4d2c
+    origin_phase: unknown
+    manifested_phase: recon
+    note: Digest scored 5.0 with all signal_counts (tool_error/self_correct/not_found/df_guard/interrupt) at zero; the 'User Corrections' section is actually a Reconciliation Run Review data dump for project autopilot_video, not an actual user correction, so the score isn't explained by any counted signal.
+  - date: '2026-07-29'
+    project: dark_factory
+    session: 7d1ff9a0-e04d-46e6-958c-af54c8a5c63e
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'score=5.0 is fully decoupled from the evidence: every tallied signal_count is 0 and the ''User Correction'' captured is just an injected memory-search context block, not a genuine correction — the score has no visible basis in the counted signals.'
+  - date: '2026-07-29'
+    project: dark_factory
+    session: 72cc7c28-d01a-410f-b97e-48b62db56d86
+    origin_phase: ops
+    manifested_phase: recon
+    note: Session scored 5.0 with signal_counts entirely zero (tool_error/self_correct/not_found/df_guard/interrupt all 0), yet the digest body holds a full Reconciliation Run Review report (run metadata + stage_reports JSON) — score is decoupled from the counted-signal evidence that supposedly drives it.
 - id: entry-cand-20260722-21
   title: Digest-extraction pipeline embeds recursive/self-referential trickle-coder prompt content as a session's own 'User Correction'
   severity: medium
@@ -1765,6 +2263,96 @@ entries:
     origin_phase: recon
     manifested_phase: recon
     note: 'All three reconciliation stages report tokens_used=0 despite nonzero llm_calls (memory_consolidator: 38 calls, task_knowledge_sync: 33 calls, integrity_check: 33 calls)'
+  - date: '2026-07-27'
+    project: dark_factory
+    session: 192e48c8-3dae-4470-8195-f742f8795b1c
+    origin_phase: recon
+    manifested_phase: recon
+    note: Same tokens_used=0/llm_calls=15 mismatch for memory_consolidator in run 2702ffa4-d0e1-4937-bc3b-5ec925e4c441, duplicate instance of this already-tracked candidate.
+  - date: '2026-07-29'
+    project: dark_factory
+    session: b38fece8-2f7d-44f2-bd63-a65b823487b2
+    origin_phase: recon
+    manifested_phase: recon
+    note: memory_consolidator stage report for run fa0e5fec (solar_challenge remediation) shows tokens_used=0 despite llm_calls=27 — same broken cost-telemetry pattern already catalogued.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: ef1359c7-799a-4d43-bc86-bb807f909937
+    origin_phase: recon
+    manifested_phase: recon
+    note: 'memory_consolidator stage report shows llm_calls: 34 but tokens_used: 0 in the same reconciliation run review (run fcfce071-3f67-4ad3-a910-6c9e36b677b9), reconfirming the known cost-telemetry-always-zero defect.'
+  - date: '2026-07-26'
+    project: dark_factory
+    session: 7bd5fdf5-a583-4d96-af99-f39ddc5dfa95
+    origin_phase: recon
+    manifested_phase: recon
+    note: memory_consolidator stage report shows llm_calls=24 but tokens_used=0 in this reconciliation run review
+  - date: '2026-07-27'
+    project: dark_factory
+    session: b95bba74-0344-496d-9d3c-f515157d5852
+    origin_phase: recon
+    manifested_phase: recon
+    note: 'memory_consolidator stage report shows llm_calls: 25 but tokens_used: 0 in the same run review, reproducing the known zero-telemetry defect.'
+  - date: '2026-07-25'
+    project: dark_factory
+    session: 080f0f5d-f693-4e25-a81b-6bbdc341c081
+    origin_phase: recon
+    manifested_phase: recon
+    note: memory_consolidator stage report shows llm_calls=41 but tokens_used=0, reproducing the known dead cost-telemetry field in reconciliation stage reports.
+  - date: '2026-07-28'
+    project: dark_factory
+    session: 2977f473-8805-4c50-8f75-f6a934157132
+    origin_phase: recon
+    manifested_phase: recon
+    note: 'memory_consolidator stage report shows llm_calls: 42 but tokens_used: 0 in the same reconciliation run review — repeats the known zero-cost-telemetry-despite-nonzero-llm_calls pattern.'
+  - date: '2026-07-26'
+    project: dark_factory
+    session: fedb1f6d-116b-4503-8267-d8b0d6ddf24a
+    origin_phase: recon
+    manifested_phase: recon
+    note: memory_consolidator stage report shows llm_calls=13 but tokens_used=0 in this remediation run's stage report, reproducing the known zero-cost-telemetry defect.
+  - date: '2026-07-26'
+    project: dark_factory
+    session: 7d7b14e8-d452-4a9c-ae5e-0774881e3c08
+    origin_phase: recon
+    manifested_phase: recon
+    note: 'memory_consolidator stage report shows llm_calls: 17 but tokens_used: 0 in the same reconciliation run review (run d1784759, project reify).'
+  - date: '2026-07-30'
+    project: dark_factory
+    session: a8869a01-5f02-438e-b6ce-ec047299ccce
+    origin_phase: recon
+    manifested_phase: recon
+    note: memory_consolidator stage report shows llm_calls=21 but tokens_used=0 — same always-zero cost telemetry defect.
+  - date: '2026-07-26'
+    project: dark_factory
+    session: e7986141-62f6-40c4-8d3f-5603e94dd2ee
+    origin_phase: recon
+    manifested_phase: recon
+    note: 'memory_consolidator stage report shows llm_calls: 32 but tokens_used: 0 in the same run review.'
+  - date: '2026-07-26'
+    project: dark_factory
+    session: 288e0897-7528-47ab-9642-3eabaeae78b1
+    origin_phase: recon
+    manifested_phase: recon
+    note: 'memory_consolidator stage report shows llm_calls: 30 but tokens_used: 0, the same zero-cost-telemetry-despite-real-LLM-activity pattern.'
+  - date: '2026-07-30'
+    project: dark_factory
+    session: b641f56e-ecb2-4655-8725-ace6b37c82b1
+    origin_phase: recon
+    manifested_phase: recon
+    note: memory_consolidator stage report shows llm_calls=27 but tokens_used=0, recurring instance of the known cost-telemetry defect.
+  - date: '2026-07-27'
+    project: dark_factory
+    session: f7323719-1fd8-417a-9843-450e9eda6a39
+    origin_phase: recon
+    manifested_phase: recon
+    note: 'memory_consolidator stage report: llm_calls=49 but tokens_used=0, same telemetry-always-zero pattern.'
+  - date: '2026-07-24'
+    project: dark_factory
+    session: da3ea2d6-c65b-4b27-a755-c9e5f6237d90
+    origin_phase: unknown
+    manifested_phase: recon
+    note: 'memory_consolidator stage report shows llm_calls: 15 but tokens_used: 0, reproducing the known zero-telemetry-despite-nonzero-calls pattern.'
 - id: entry-cand-20260713-2
   title: Stage report carries a nested '_reported' stats dict that disagrees with its own top-level actual stats
   severity: medium
@@ -1791,6 +2379,54 @@ entries:
     origin_phase: recon
     manifested_phase: recon
     note: 'memory_consolidator: top-level items_flagged=1 with edges_updated=1 at top level but nested ''_reported'' shows edges_updated=1.0; asymmetry in how counts are reported'
+  - date: '2026-07-24'
+    project: dark_factory
+    session: ef1359c7-799a-4d43-bc86-bb807f909937
+    origin_phase: recon
+    manifested_phase: recon
+    note: memory_consolidator stats carry a nested '_reported' sub-dict (memories_added, memories_written, edges_updated, graphiti_writes_queued) alongside top-level fields of overlapping but not identical name/shape, reconfirming the duplicated/inconsistent self-reporting pattern.
+  - date: '2026-07-26'
+    project: dark_factory
+    session: 7bd5fdf5-a583-4d96-af99-f39ddc5dfa95
+    origin_phase: recon
+    manifested_phase: recon
+    note: memory_consolidator stats carries a nested '_reported' subdict (memories_deleted, edges_updated, graphiti_writes_queued, memories_added, memories_written) duplicating top-level counters
+  - date: '2026-07-26'
+    project: dark_factory
+    session: 11c43d38-ae9e-428b-9c9e-62ee77dcf53e
+    origin_phase: recon
+    manifested_phase: recon
+    note: Reconciliation run review (run 73d4ebfa, project reify) shows the memory_consolidator stage carrying a nested '_reported' stats dict alongside top-level stats fields for the same counters (memories_deleted, memories_added) — the duplicate-bookkeeping shape this entry tracks, even though values happen to agree in this instance.
+  - date: '2026-07-28'
+    project: dark_factory
+    session: 2977f473-8805-4c50-8f75-f6a934157132
+    origin_phase: recon
+    manifested_phase: recon
+    note: memory_consolidator stats nests a '_reported' dict (memories_added, graphiti_writes_queued, memories_written, edges_updated) that includes 'memories_written' — a field absent from the top-level stats, which only has 'memories_added' — disagreeing on naming with the actual top-level counters.
+  - date: '2026-07-26'
+    project: dark_factory
+    session: 7d7b14e8-d452-4a9c-ae5e-0774881e3c08
+    origin_phase: recon
+    manifested_phase: recon
+    note: 'memory_consolidator stats carries a nested "_reported": {memories_deleted, edges_updated, memories_added, memories_written} subtotal alongside the top-level stats dict; "memories_written" has no corresponding top-level key at all, so the nested subtotal both duplicates and diverges from the actual stats.'
+  - date: '2026-07-26'
+    project: dark_factory
+    session: e7986141-62f6-40c4-8d3f-5603e94dd2ee
+    origin_phase: recon
+    manifested_phase: recon
+    note: memory_consolidator stats nests a '_reported' dict {memories_added:1, graphiti_writes_queued:1, edges_updated:5, entity_summaries_refreshed:1, memories_written:1} that both drops most top-level counters and introduces 'memories_written' as a field name not present at top level (which uses 'memories_added') — disagreement between nested and top-level self-reporting.
+  - date: '2026-07-30'
+    project: dark_factory
+    session: b641f56e-ecb2-4655-8725-ace6b37c82b1
+    origin_phase: recon
+    manifested_phase: recon
+    note: Nested stats._reported block coexists with disjoint top-level stats fields in the same stage report, the structural pattern behind this entry (values happen to agree at zero this cycle).
+  - date: '2026-07-24'
+    project: dark_factory
+    session: b6b1ec9b-be13-49c3-8138-0304fdd4a0f8
+    origin_phase: recon
+    manifested_phase: recon
+    note: 'memory_consolidator stats carries a nested `_reported: {memories_written: 1.0, memories_added: 1.0}` subdict alongside top-level memories_added: 1 — the report duplicates itself through a second nested counter block.'
 - id: entry-cand-20260722-23
   title: Recon stage report's top-level items_flagged contradicts its own nested stats.items_flagged
   severity: medium
@@ -1804,6 +2440,18 @@ entries:
     origin_phase: unknown
     manifested_phase: recon
     evidence_quote: '"memory_consolidator": {"items_flagged": 1, "stats": {"items_flagged": 0.0, "entity_summary_snapshot_lines_stripped": 0, ...}}'
+  - date: '2026-07-30'
+    project: dark_factory
+    session: 489c2554-aafb-463d-bc18-ba074753e138
+    origin_phase: recon
+    manifested_phase: recon
+    note: memory_consolidator stage report shows top-level items_flagged=3 while nested stats.items_flagged=1.0 in the same reconciliation run (21b8bcbf), reproducing the counter-mismatch pattern exactly.
+  - date: '2026-07-25'
+    project: dark_factory
+    session: 8133a15d-cbb7-4aa7-8c6a-e3ae2ce2a2be
+    origin_phase: recon
+    manifested_phase: recon
+    note: Reconciliation run review for autopilot_video shows memory_consolidator stage report with top-level items_flagged=1 while the nested stats.items_flagged=0.0, reproducing the exact top-level-vs-nested-counter contradiction this entry documents.
 - id: entry-cand-20260722-24
   title: Session digest generator self-embeds the trickle-coder's own recursive prompt as fabricated 'session content'
   severity: medium
@@ -1836,6 +2484,18 @@ entries:
     origin_phase: review
     manifested_phase: review
     note: User correction explicitly teaches review adjudicator that resemblance-to-prior-round ≠ verified resolution; distinguishes 'settled' (actually fixed/reverted-intentionally) from 'deferred' (still-open, routed to follow-up task) — direct pedagogical match to candidate premise
+  - date: '2026-07-31'
+    project: dark_factory
+    session: 3dde02c6-72cd-4215-81af-c8641db4e897
+    origin_phase: review
+    manifested_phase: review
+    note: Adjudicator prompt for task 3086's review round explicitly warns that a current suggestion matching a PRIOR-ROUND item is not automatically settled — PRIOR-ROUND block lists everything raised, not confirmed resolutions; some were merely DEFERRED to a follow-up task and remain open. This is the same recurring need to hand-correct the settled/deferred adjudicator against conflating resemblance with verified resolution.
+  - date: '2026-07-30'
+    project: dark_factory
+    session: 3c226ea2-65d2-4b88-8ec5-a946809b6730
+    origin_phase: review
+    manifested_phase: review
+    note: Session's turn-3 instruction to the review-adjudicator explicitly warns that a current suggestion resembling a PRIOR-ROUND item is not necessarily 'settled' — some prior items were only DEFERRED (routed to a follow-up task) and remain open; classify settled only when confident it was actually resolved, never merely on resemblance. This is the exact confusion this candidate names.
 - id: entry-cand-20260715-4
   title: watcher-rearm.sh requires DARK_FACTORY_ROOT, unset by the rotation's injected supervisor prompt
   severity: medium
@@ -1849,6 +2509,12 @@ entries:
     origin_phase: ops
     manifested_phase: ops
     evidence_quote: 'watcher-rearm.sh: DARK_FACTORY_ROOT must be set to a valid directory'
+  - date: '2026-07-29'
+    project: dark_factory
+    session: a189558e-3f7c-414b-bfb1-1d82f01a700a
+    origin_phase: ops
+    manifested_phase: ops
+    note: Rotation's injected supervisor prompt (turn 3) gives ROTATION_ESCALATIONS/ROTATION_HOURS/project root/queue path but never DARK_FACTORY_ROOT; watcher-rearm.sh fails at turn 70 with 'DARK_FACTORY_ROOT must be set to a valid directory' (exit 2), forcing the agent to discover and export it manually before the bounded-wait loop could proceed — same recurring gap as entry-cand-20260722-3 / entry-cand-20260722-35.
 - id: entry-cand-20260722-26
   title: Digest-capture pipeline recursively embeds the trickle-coder's own meta-prompt as a zero-signal 'User Correction', risking self-pollution of the codebook corpus
   severity: medium
@@ -1934,6 +2600,96 @@ entries:
     origin_phase: recon
     manifested_phase: recon
     note: memory_consolidator stats nest a redundant '_reported' dict (memories_written=1, memories_added=1) duplicating top-level counters
+  - date: '2026-07-31'
+    project: dark_factory
+    session: 5871ae29-c870-47be-a72b-074f82b1558a
+    origin_phase: recon
+    manifested_phase: recon
+    note: memory_consolidator's stats block carries a nested '_reported' dict (graphiti_writes_queued, memories_written, memories_added, edges_updated) that redundantly restates a subset of the top-level counters.
+  - date: '2026-07-26'
+    project: dark_factory
+    session: 7bd5fdf5-a583-4d96-af99-f39ddc5dfa95
+    origin_phase: recon
+    manifested_phase: recon
+    note: same redundant '_reported' subtotal pattern nested inside stage stats
+  - date: '2026-07-26'
+    project: dark_factory
+    session: 11c43d38-ae9e-428b-9c9e-62ee77dcf53e
+    origin_phase: recon
+    manifested_phase: recon
+    note: 'memory_consolidator stage report nests a ''_reported'': {memories_deleted, memories_added} sub-dict inside stats that duplicates fields already present at the top level of stats — same redundant self-reported subtotal pattern.'
+  - date: '2026-07-24'
+    project: dark_factory
+    session: 7fa098be-12c2-4d92-92c6-2e87ddca4da9
+    origin_phase: unknown
+    manifested_phase: recon
+    note: stats._reported duplicates graphiti_writes_queued, entity_summaries_refreshed, memories_added, and edges_updated already present at the top level of the same stage's stats block — a redundant nested subtotal adding no new information.
+  - date: '2026-07-27'
+    project: dark_factory
+    session: b95bba74-0344-496d-9d3c-f515157d5852
+    origin_phase: recon
+    manifested_phase: recon
+    note: memory_consolidator.stats nests a '_reported' sub-dict (memories_written/edges_updated/memories_added/memories_deleted) duplicating top-level counters of the same names, the redundant-subtotal pattern already catalogued.
+  - date: '2026-07-25'
+    project: dark_factory
+    session: 080f0f5d-f693-4e25-a81b-6bbdc341c081
+    origin_phase: recon
+    manifested_phase: recon
+    note: memory_consolidator stats carries a redundant nested '_reported' subtotal (graphiti_writes_queued, edges_updated, memories_written/added/deleted) duplicating top-level counters of the same names.
+  - date: '2026-07-28'
+    project: dark_factory
+    session: 2977f473-8805-4c50-8f75-f6a934157132
+    origin_phase: recon
+    manifested_phase: recon
+    note: graphiti_writes_queued and edges_updated are duplicated verbatim inside memory_consolidator's '_reported' subtotal and again at top-level stats, matching the redundant-subtotal pattern.
+  - date: '2026-07-26'
+    project: dark_factory
+    session: 7d7b14e8-d452-4a9c-ae5e-0774881e3c08
+    origin_phase: recon
+    manifested_phase: recon
+    note: Same redundant "_reported" nested subtotal pattern observed in the memory_consolidator stage of this run review.
+  - date: '2026-07-25'
+    project: dark_factory
+    session: c21e0145-c806-4fc1-864c-c0f03d50cfdc
+    origin_phase: recon
+    manifested_phase: recon
+    note: memory_consolidator stats nests a redundant '_reported' subtotal (graphiti_writes_queued, edges_updated, memories_added) duplicating the same top-level counters, matching the known redundant-_reported-subtotal pattern.
+  - date: '2026-07-30'
+    project: dark_factory
+    session: a8869a01-5f02-438e-b6ce-ec047299ccce
+    origin_phase: recon
+    manifested_phase: recon
+    note: memory_consolidator.stats nests a redundant '_reported' sub-dict (memories_written/deleted/added=1.0 each) that duplicates the top-level memories_deleted/memories_added counters and adds an untracked 'memories_written' field never present at top level.
+  - date: '2026-07-25'
+    project: dark_factory
+    session: 36fd066f-5ef0-4af9-9be7-a14bf9e0f440
+    origin_phase: recon
+    manifested_phase: recon
+    note: memory_consolidator stats nests a '_reported' sub-dict (graphiti_writes_queued, edges_updated, memories_added, memories_deleted) that redundantly restates fields already present at the top level of the same stats object.
+  - date: '2026-07-26'
+    project: dark_factory
+    session: 288e0897-7528-47ab-9642-3eabaeae78b1
+    origin_phase: recon
+    manifested_phase: recon
+    note: 'memory_consolidator stats dict nests a redundant "_reported": {"entity_summaries_refreshed": 2.0} subtotal duplicating the top-level "entity_summaries_refreshed": 2 counter.'
+  - date: '2026-07-30'
+    project: dark_factory
+    session: b641f56e-ecb2-4655-8725-ace6b37c82b1
+    origin_phase: recon
+    manifested_phase: recon
+    note: memory_consolidator.stats carries a nested '_reported' subdict (memories_written/memories_added) duplicating top-level counters of the same name.
+  - date: '2026-07-27'
+    project: dark_factory
+    session: f7323719-1fd8-417a-9843-450e9eda6a39
+    origin_phase: recon
+    manifested_phase: recon
+    note: memory_consolidator's stats._reported nests memories_deleted/memories_added/edges_updated/graphiti_writes_queued values that numerically duplicate the top-level stats fields of the same names.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: da3ea2d6-c65b-4b27-a755-c9e5f6237d90
+    origin_phase: unknown
+    manifested_phase: recon
+    note: 'memory_consolidator stats dict nests a ''_reported'' subtotal ({''graphiti_writes_queued'': 1.0, ''memories_added'': 0.0}) that merely duplicates the same top-level counters already present in stats, matching the known redundant-nested-subtotal pattern.'
 - id: entry-cand-20260722-27
   title: Trickle-coder digest pipeline ingests its own prior invocations as session digests
   severity: medium
@@ -1978,6 +2734,18 @@ entries:
     origin_phase: architect
     manifested_phase: unknown
     note: 'ModuleNotFoundError at turn 28 plus four file-not-found errors (turns 39, 45, 62) in orchestrated-task worktree .worktrees/3075. Confirms existing candidate: architect/explore-phase module resolution failures in worktree context. Manifested phase (architect/implement/verify) unclear from digest signals alone.'
+  - date: '2026-07-29'
+    project: dark_factory
+    session: c1b95d2c-a18a-4392-9f68-180831dcde6f
+    origin_phase: unknown
+    manifested_phase: implement
+    note: In worktree .worktrees/2998, `pwd` shows the shell cwd'd into the fused-memory subpackage; subsequent relative-path commands (cp to tests/t2998_probe_test.py, sed/grep on escalation/src/escalation/queue.py and models.py) all fail 'No such file or directory', and a separate call trips ModuleNotFoundError — sibling-package relative paths resolved against the wrong subdirectory of a multi-package worktree.
+  - date: '2026-07-29'
+    project: dark_factory
+    session: 5132d6d0-e9cc-48d2-8ba7-38fe693bb9a7
+    origin_phase: implement
+    manifested_phase: implement
+    note: Orchestrated-task session in worktree .worktrees/3118 racks up 9 'no such file/no such directory/not found' hits and 2 Bash tool_errors (turns 37-168) while exploring for code (invocation_outcome.py, orchestrator/tests/test_eval_architect.py) — same explore-phase not-found pattern in a task worktree.
 - id: entry-cand-20260720-10
   title: Architect overrides explicit in-task dependency-coordination branching instructions instead of following them
   severity: medium
@@ -2010,6 +2778,30 @@ entries:
     origin_phase: unknown
     manifested_phase: architect
     note: '## User Corrections section shows ''(turn 3) # Context'' — trickle-coder''s own task-framing prompt injected as session content and mislabeled as user correction'
+  - date: '2026-07-28'
+    project: dark_factory
+    session: 56fe65e0-2bbd-41c4-9833-68d185770232
+    origin_phase: ops
+    manifested_phase: ops
+    note: Digest's 'User Corrections' section captures the orchestrator-injected '# Context / Project Context' briefing (memory search results delivered as a user-role turn at session start) rather than an actual human correction — same task-framing-prompt mislabeling pattern.
+  - date: '2026-07-30'
+    project: dark_factory
+    session: c00a9000-ba68-4094-97b8-870895203f0e
+    origin_phase: ops
+    manifested_phase: ops
+    note: Confirms the recurring pattern of task-framing/context-injection prose being mislabeled as a 'User Correction' by the trickle-coder digest pipeline; here the injected content is a Project Context memory-search dump rather than the task prompt itself, but the misclassification mechanism is identical.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: 0f85b7b3-0f7a-4311-84f5-297c6b0ff9cc
+    origin_phase: ops
+    manifested_phase: ops
+    note: 'Digest''s ''User Correction'' (turn 3) is verbatim the periodic-census-verifier''s own injected task-framing prompt (''You are the periodic-census verifier for the dark-factory agent-confusion codebook...''), not real user/session content — another recurrence of the digest pipeline mislabeling an injected agent prompt as a User Correction. Session also has a near-empty ''Not Found'' signal (turn 19: "does not exist") with no surrounding context, consistent with the thin/self-referential capture pattern rather than new evidence.'
+  - date: '2026-07-24'
+    project: dark_factory
+    session: 3519e3b9-31af-45da-8f5b-b08e7cfe0a26
+    origin_phase: ops
+    manifested_phase: ops
+    note: This session's own digest captures its turn-3 injected task-framing prompt ('You are the periodic-census verifier for the dark-factory agent-confusion codebook...') verbatim under 'User Corrections' — the same recursive self-ingestion mislabeling already documented for other trickle-coder/census digests.
 - id: entry-cand-20260713-3
   title: Recon category labels applied by surface keyword match, not guard definition
   severity: medium
@@ -2068,6 +2860,114 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: Session digest 'User Corrections' section contains auto-injected memory search results (Project Context with structured results). Injected system content mislabeled as user-provided correction.
+  - date: '2026-07-29'
+    project: dark_factory
+    session: e88e6b1e-6fed-4179-9fac-bc6da8fcd721
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'Turn 3 of a regular orchestrated-task session (task 3207, not a trickle-coder self-session) shows the digest pipeline''s ''User Corrections'' extractor grabbing the injected task-briefing ''# Context / ## Project Context'' memory-search JSON blob and mislabeling it as a User Correction. Same mechanism as the entry (naive first-text-block heuristic misclassifying injected task/system content), but evidences it generalizes beyond trickle-coder self-ingestion to any dispatched task''s own briefing context.'
+  - date: '2026-07-24'
+    project: dark_factory
+    session: 2534774a-7d5d-43d0-a254-4de68dc37326
+    origin_phase: ops
+    manifested_phase: ops
+    note: Session is a periodic-census-verifier run (plans/confusion-reduction-prd.md §5.7), not the trickle-coder itself, but turn 3 'User Corrections' is the injected verifier system prompt (task framing + cluster-to-verify JSON), not an actual human correction. Same digest-generation defect (naive first-turn-as-User-Correction heuristic) recurring in a different harness role than the trickle-coder sessions this entry was originally logged against — confirms the bug is pipeline-wide, not trickle-coder-specific.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: a4abc386-b64a-4dda-a324-a56146e9dbe4
+    origin_phase: ops
+    manifested_phase: ops
+    note: The injected task-dispatch '# Context' block (memory-search JSON results, per CLAUDE.md's documented briefing context) is mislabeled as a 'User Correction' — and this occurs in an ordinary orchestrated-task session (worktree 2945), not a trickle-coder self-ingestion case, showing the digest tool's mislabeling heuristic fires on any early large injected/system block, not just its own recursive prompts.
+  - date: '2026-07-30'
+    project: dark_factory
+    session: 1edaed89-bb59-4e3b-9cf9-33f683a1f59c
+    origin_phase: ops
+    manifested_phase: ops
+    note: Digest's entire 'User Corrections' section is verbatim the task's own injected system/framing prompt for a review-round adjudication task (task 3141, 'You are adjudicating whether each CURRENT review suggestion...'), not an actual human correction — signal_counts are all zero yet score=5.0, consistent with the digest-extraction pipeline mislabeling directive-style injected prompts as 'User Corrections'. Notably this instance is NOT trickle-coder self-recursion (source is a distinct orchestrated-task session, not the trickle-coder's own invocation), showing the mislabeling defect is a general property of the digest pipeline's heuristic, not limited to trickle-coder self-ingestion.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: 74d18cd4-ac6d-4fa8-9b38-d6821cb9ba32
+    origin_phase: ops
+    manifested_phase: ops
+    note: Digest's 'User Corrections' section for this orchestrated-task session (task 3018 worktree) captures the turn-3 injected task-briefing '# Context' block (fused-memory Project Context / graphiti search results) verbatim and labels it a User Correction, even though it is system-injected dispatch context, not human feedback — same digest-extraction mislabeling bug as the cataloged entry, here manifesting on a regular task session's briefing rather than trickle-coder's own recursive prompt.
+  - date: '2026-07-30'
+    project: dark_factory
+    session: c00a9000-ba68-4094-97b8-870895203f0e
+    origin_phase: ops
+    manifested_phase: ops
+    note: 'Turn 3 of this orchestrated-task session''s digest is the injected ''# Context / ## Project Context'' briefing block (raw memory-search JSON results, not user text), captured under ''User Corrections'' — same defect as the named entry: digest generator can''t distinguish system/orchestrator-injected briefing content from an actual user correction.'
+  - date: '2026-07-30'
+    project: dark_factory
+    session: 63330a99-3969-4eb2-9918-26ed81a911e7
+    origin_phase: ops
+    manifested_phase: ops
+    note: Digest's only 'User Correction' (turn 3) is actually the injected task/system prompt for a review-suggestion adjudicator (settled-vs-deferred classification instructions), not an actual human correction — same recurring trickle-coder digest-extraction mislabeling bug already cataloged across many prior oneoff entries. All signal_counts are 0, so no genuine session signal was present beyond this self-referential artifact.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: d6e1f291-ae62-4b54-ba1b-9de81247511f
+    origin_phase: ops
+    manifested_phase: ops
+    note: Digest's 'User Corrections' section is actually the dispatched task's injected '# Context / Project Context' memory-search block (search results for tasks 1470/2531/841/etc.) verbatim, not anything the user said. Session is a real orchestrated-task (3019) implement session, not a trickle-coder self-session — shows the mislabel-as-User-Correction bug fires on any injected context block, not just trickle-coder's own recursive prompt.
+  - date: '2026-07-29'
+    project: dark_factory
+    session: c1b95d2c-a18a-4392-9f68-180831dcde6f
+    origin_phase: ops
+    manifested_phase: ops
+    note: Digest's 'User Corrections' section labels the turn-3 injected '# Context / Project Context' memory-search block (task-dispatch context, not anything the user typed) as a User Correction — same injected-system-content mislabeling pattern as the other entries in this cluster.
+  - date: '2026-07-30'
+    project: dark_factory
+    session: d021df8a-cc1d-4e38-b599-2a41ac213500
+    origin_phase: ops
+    manifested_phase: ops
+    note: 'Digest''s ''User Corrections'' section captures two injected/boilerplate blocks, not actual corrections: turn 3 is the orchestrated task''s injected ''# Context / ## Project Context'' memory-search dump, and turn 48 is the harness''s stock ''Your previous run was interrupted by a usage limit. Continue where you left off...'' resume boilerplate. Neither is user-authored correction content.'
+  - date: '2026-07-30'
+    project: dark_factory
+    session: 045c3fbc-787e-4356-80bf-bf69dbc5a351
+    origin_phase: ops
+    manifested_phase: ops
+    note: 'Same digest-mislabels-injected-content-as-User-Correction defect, but this instance is NOT the trickle-coder''s own recursive prompt: it''s an ordinary orchestrated-task session (agent_class=orchestrated-task, worktree 3141) whose briefing''s injected ''# Context'' block (memory search results / Project Context list, per CLAUDE.md''s memory_hints-to-briefing-Context-block mechanism) got captured verbatim as turn-3 ''User Corrections''. Confirms the digest generator''s heuristic is generic to any injected system/context content appearing early in a transcript, not scoped to trickle-coder self-ingestion as the prior candidate cluster (entry-cand-20260722-{10,13,16,17,19,21,24,26,27,30,31}) implied.'
+  - date: '2026-07-29'
+    project: dark_factory
+    session: a7ea21e7-4199-4bdd-961a-dbbe7dd3830d
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The digest's 'User Corrections' section (turn 3) is actually the injected task briefing's '# Context' / 'Project Context' block (memory-search JSON results), not anything a user said — the digest generator mislabeled the injected task/system prompt as a 'User Correction', matching this entry rather than the trickle-coder-self-recursion cluster since the source here is a normal dispatched task's briefing, not the trickle-coder's own meta-prompt.
+  - date: '2026-07-29'
+    project: dark_factory
+    session: 26c337e5-9b8b-4d5d-9e23-595ea8cc41e6
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'Session 26c337e5 is a regular orchestrated-task session (worktree 3082), not the trickle-coder itself. The digest''s ''User Corrections'' section (turn 3) is actually the task-dispatch briefing''s injected ''# Context / ## Project Context'' memory-search JSON block — not a user correction. Same digest-generator mislabeling mechanism as the existing entry, but corroborates it applies to any injected task/system prompt content, not only the trickle-coder''s own recursive prompt.'
+  - date: '2026-07-28'
+    project: dark_factory
+    session: 2dd16c71-352f-4418-86c2-43bee10c4947
+    origin_phase: unknown
+    manifested_phase: ops
+    note: Turn 3 of this orchestrated-task session (not a trickle-coder self-session) shows the digest extractor's 'User Corrections' section capturing the dispatched task's injected '# Context'/'Project Context' memory-search briefing block verbatim — that's orchestrator-assembled context handed to the agent at dispatch, not a user correction. Confirms the mislabeling heuristic misfires on any early user-role turn containing injected briefing content, not just the trickle-coder's own recursive prompt.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: 18602959-1682-42a2-b8c5-02dffea4bb1a
+    origin_phase: ops
+    manifested_phase: ops
+    note: 'Digest for session 18602959 (task 2928 worktree) captured the orchestrator''s injected ''# Context'' / ''Project Context'' memory-search JSON blob (Graphiti results for task 1470, task 2531, task #841, etc.) verbatim as a turn-3 ''User Correction''. This is system-injected task-briefing context, not user dialogue — same mislabeling pattern as the existing entry, just with ordinary task-briefing context rather than the trickle-coder''s own recurring prompt as the injected material.'
+  - date: '2026-07-30'
+    project: dark_factory
+    session: 53546522-a9b2-42a1-a8b3-8dc73a65a218
+    origin_phase: ops
+    manifested_phase: ops
+    note: Digest for orchestrated-task session 3032 (turn 3) labels the injected '# Context' / Project Context memory-search JSON block as a 'User Correction' — same digest-generator misattribution mechanism as the known trickle-coder-self-prompt cases, but the injected content here is a regular task's briefing Context block (per CLAUDE.md, dispatched agents get memory context via this block) rather than the trickle-coder's own recursive prompt, showing the heuristic mis-fires on any large injected system/task text, not just self-ingestion.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: 57573056-6244-450c-a460-7ca7c9021659
+    origin_phase: ops
+    manifested_phase: ops
+    note: 'Same defect class (digest generator''s ''User Correction'' extractor grabs injected non-dialogue system content) but a broader manifestation than the prior trickle-coder-self-ingestion instances: this session is agent_class=''orchestrated-task'' (task 2790 worktree), not a trickle-coder session, and the captured content is the orchestrator''s dispatch ''# Context'' / memory-search Project Context block (per CLAUDE.md, the mechanism dispatched agents use to get memory context) rather than the trickle-coder''s own recursive meta-prompt. Confirms the digest heuristic is content-blind across ALL session types, not just trickle-coder recursion — worth noting for whoever consolidates this cluster, since it implies broader corpus-pollution risk than the trickle-coder-specific framing suggests.'
+  - date: '2026-07-29'
+    project: dark_factory
+    session: 72cc7c28-d01a-410f-b97e-48b62db56d86
+    origin_phase: ops
+    manifested_phase: recon
+    note: The sole 'User Correction' (turn 3) is a Reconciliation Run Review report — run metadata plus memory_consolidator stage stats truncated mid-JSON — not anything a human corrected; matches the pattern of the digest extractor mislabeling injected task/context content as a 'User Correction'.
 - id: entry-cand-20260723-5
   title: Recon terminal-task write guard's corrective_path covers only done_provenance, leaving other terminal-task string fields permanently unrepairable and silently re-diagnosed each recurrence
   severity: medium
@@ -2100,6 +3000,108 @@ entries:
     origin_phase: unknown
     manifested_phase: ops
     note: 'Digest rendering shows truncated ''not found'' signals: ''(turn 26) does not exist'' and ''(turn 41) not found in'' with context dropped mid-sentence'
+  - date: '2026-07-31'
+    project: dark_factory
+    session: dff747b2-87e6-4dd6-afda-db28a053e0b8
+    origin_phase: ops
+    manifested_phase: ops
+    note: Digest shows two 'Guard Trips' lines rendered as bare '(turn N) blocked:' with nothing after the colon — the matched substring/detail was dropped from the template, exact recurrence of the known bare-template rendering defect.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: a4abc386-b64a-4dda-a324-a56146e9dbe4
+    origin_phase: ops
+    manifested_phase: ops
+    note: The 'Not Found' section renders as a bare template '(turn 42) does not exist' with the actual matched substring (what entity/task/file doesn't exist) stripped out, leaving a contentless signal.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: 3cf3f5b9-82b3-46e6-b1bd-9e0d063c9ec1
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Digest's only content is 'Guard Trips - (turn 3) blocked:' with nothing following — signal_counts shows df_guard:1 but the rendered template drops whatever substring/message actually tripped the guard, leaving the digest content-free despite a nonzero score.
+  - date: '2026-07-30'
+    project: dark_factory
+    session: 2ddbe35f-94a8-4543-9000-df2146f66b25
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'Third sighting: digest''s Not Found line reads ''(turn 87) does not exist'' with the matched subject dropped, same bare-template truncation as the 07-22 and 07-30 sightings already on this entry. Session digest is too thin (337 bytes, single signal) to support any phase attribution.'
+  - date: '2026-07-30'
+    project: dark_factory
+    session: 16ca1b18-9b67-477e-b687-4b3f3c8f8c71
+    origin_phase: ops
+    manifested_phase: ops
+    note: Digest's 'Not Found' section renders four bare templated fragments ('does not exist', 'no such file or directory', 'not found in' x2) with no matched substring or surrounding context, making the signal uninterpretable on its own — matches the known bare-template rendering defect in the digest generator.
+  - date: '2026-07-30'
+    project: dark_factory
+    session: 87ba82bc-5c9b-40ce-adaf-090ec1aafe68
+    origin_phase: implement
+    manifested_phase: ops
+    note: Digest for orchestrated-task session in .worktrees/3010 reduces three not-found tool errors (turns 42, 47, 107) to bare templates — 'does not exist', 'not found in', 'no such file or directory' — with the actual missing file/path/entity stripped out, leaving nothing actionable for the trickle coder to act on.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: 11d95de7-3c28-4bf2-8594-8e22d5cccd16
+    origin_phase: ops
+    manifested_phase: ops
+    note: Both 'Not Found' entries render as the bare literal 'no such file or directory' with no filename, command, or turn context attached — the matched substring/detail behind the template is dropped, same as the prior finding.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: 19d9be69-67d3-4d21-a423-32903570e2a1
+    origin_phase: unknown
+    manifested_phase: ops
+    note: Digest's Guard Trips section renders '(turn 38) blocked:' with nothing after the colon — the df_guard signal fired (signal_counts.df_guard=1) but the matched guard message/substring was dropped, leaving a bare template instead of the actual block reason.
+  - date: '2026-07-28'
+    project: dark_factory
+    session: 71d65511-3c0d-4959-abd5-04731aada5ec
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Digest's sole signal is a bare not-found template — '(turn 115) does not exist' — with the matched substring (what doesn't exist) dropped, matching the known bare-template rendering defect. Session itself (task 3154 worktree) gives no further context to support a specific phase.
+  - date: '2026-07-28'
+    project: dark_factory
+    session: f8eb0622-e9ab-4b15-a76d-4b9dd1f21edd
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Digest's sole Guard Trips line reads '(turn 121) blocked:' with nothing after the colon — the guard/block reason substring is dropped, leaving a bare template exactly as described in this candidate. Session too thin (334 bytes) to support any phase attribution beyond 'unknown'.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: abad7cee-7a59-4c0e-a3a3-2323d60cf8fc
+    origin_phase: recon
+    manifested_phase: ops
+    note: Digest's Guard Trips section shows '(turn 3) blocked:' with nothing after the colon — the digest generator rendered the guard-trip template but dropped the matched substring/reason text, leaving a content-free stub exactly matching the known bare-template rendering defect.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: f6e4adfe-ba3c-4868-aba4-a77088ca1578
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Guard Trips section renders '(turn 3) blocked:' with nothing after the colon — the matched guard/substring text was dropped by the digest template, leaving a contentless trip line despite df_guard:1 being counted.
+  - date: '2026-07-30'
+    project: dark_factory
+    session: d021df8a-cc1d-4e38-b599-2a41ac213500
+    origin_phase: ops
+    manifested_phase: ops
+    note: Guard Trips entry for turn 24 renders as the bare template 'blocked:' with the matched substring/detail dropped, leaving no information about what was actually blocked.
+  - date: '2026-07-29'
+    project: dark_factory
+    session: a7ea21e7-4199-4bdd-961a-dbbe7dd3830d
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 'Digest''s ''Not Found'' section renders bare templates with no subject: ''(turn 13) does not exist'' and ''(turn 16) does not exist'' give no indication of what didn''t exist, dropping the matched substring exactly as this entry describes.'
+  - date: '2026-07-30'
+    project: dark_factory
+    session: b90b9d91-caa9-4909-88d5-1387b07ca382
+    origin_phase: ops
+    manifested_phase: ops
+    note: Digest's 'Not Found' section renders as a bare '(turn 86) does not exist' template with no matched substring or surrounding context, matching the not_found:1 signal count but conveying zero information about what was not found.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: 5b432775-ecda-45dc-ac1b-c9a8f24f68b6
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Digest's Guard Trips section renders '(turn 3) blocked:' with no matched substring/detail following it (333-byte digest, df_guard=1) — the underlying guard/block content was dropped, reproducing the bare-template rendering already logged in entry-cand-20260722-33.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: 44308b18-8f5d-4396-8d3b-7c29c6b6dca2
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Digest's only content is a 'Guard Trips' entry '(turn 3) blocked:' with nothing after the colon — the df_guard signal fired (signal_counts.df_guard=1) but the template dropped the matched substring/guard message entirely, leaving zero actionable evidence despite a score of 2.0. Directly reproduces the bare-template guard-rendering defect.
 - id: entry-cand-20260722-34
   title: Census-verifier agent doesn't know the transcript storage path convention, so it blind-searches the filesystem and repeatedly hits approval gates
   severity: medium
@@ -2119,6 +3121,18 @@ entries:
     origin_phase: unknown
     manifested_phase: implement
     note: Census-verifier session conducted 12 tool_errors and repeated Bash approval-gated filesystem probes (ls, find, stat) while attempting to locate plan-state files, matching documented pattern of verifier blind-searching without path conventions
+  - date: '2026-07-24'
+    project: dark_factory
+    session: 50282bc3-d913-486f-aabf-3f4f440661dc
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Agent had no knowledge of the transcript storage path convention, so it blind-searched via repeated find/ls guesses across turns 12-26 (five consecutive attempts) before giving up and trying to reproduce the bug empirically instead.
+  - date: '2026-07-24'
+    project: dark_factory
+    session: 3519e3b9-31af-45da-8f5b-b08e7cfe0a26
+    origin_phase: ops
+    manifested_phase: ops
+    note: Verifier didn't know the transcript storage path convention and blind-searched multiple locations for session id 0a92e754/3b1cd07f (find /, find /home/leo, find /home/leo/src/dark-factory, ls+find /home/leo/.claude/projects), each hitting an approval gate rather than going straight to the known path.
 - id: entry-cand-20260722-35
   title: watcher-rearm.sh's required DARK_FACTORY_ROOT env var absent from the rotation prompt's vocabulary
   severity: medium
@@ -2144,6 +3158,247 @@ entries:
     origin_phase: ops
     manifested_phase: ops
     note: 'watcher-rearm.sh invocation in turn 32 failed with ''DARK_FACTORY_ROOT must be set''; three variant entries (3, 15-4, 35) all flag same root cause: rotation''s injected context omits required env var'
+- id: entry-cand-20260729-2
+  title: Digest signal-scorer counts watcher-rearm.sh's designed bounded-wait ceiling (exit 124) as a tool_error
+  severity: medium
+  status: open
+  origin_phase: unknown
+  manifested_phase: unknown
+  sightings:
+  - date: '2026-07-29'
+    project: dark_factory
+    session: a189558e-3f7c-414b-bfb1-1d82f01a700a
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: 'WATCHER_REARM_OUTCOME: CEILING exit=124'
+- id: entry-cand-20260730-25
+  title: Digest generator mislabels an ordinary task-dispatch '# Context' briefing block as a 'User Correction'
+  severity: medium
+  status: open
+  origin_phase: ops
+  manifested_phase: ops
+  sightings:
+  - date: '2026-07-30'
+    project: dark_factory
+    session: 8860621c-c89f-4aed-83ca-ce0ef03d0c94
+    origin_phase: ops
+    manifested_phase: ops
+    evidence_quote: '(turn 3) # Context
+
+
+      ## Project Context
+
+
+      { "results": [ { "id": "ccf73ca4-8240-4f9a-8abf-32b210e5b35b", "content": "Task 1470 wired /audit into /review Phase-2 Architectural Coherence.", ... } ] }'
+- id: entry-cand-20260725-3
+  title: Digest 'User Corrections' bucket captures pasted non-corrective report/log content
+  severity: medium
+  status: open
+  origin_phase: recon
+  manifested_phase: unknown
+  sightings:
+  - date: '2026-07-25'
+    project: dark_factory
+    session: 2b93092c-07a1-4a4f-9044-ab269656a41e
+    origin_phase: recon
+    manifested_phase: unknown
+    evidence_quote: '## User Corrections
+
+      - (turn 3) ## Reconciliation Run Review
+
+
+      ### Run Metadata
+
+      - Run ID: 84e6ce03-115b-46c0-ac2a-53f4c62cc4c4
+
+      ... "e... [item truncated]'
+- id: entry-cand-20260728-1
+  title: Digest pipeline mislabels an ordinary task's injected '# Context' project-briefing block as a 'User Correction'
+  severity: medium
+  status: open
+  origin_phase: ops
+  manifested_phase: ops
+  sightings:
+  - date: '2026-07-28'
+    project: dark_factory
+    session: a7805e53-975a-4b2a-84c1-3776bd409288
+    origin_phase: ops
+    manifested_phase: ops
+    evidence_quote: "(turn 3) # Context\n\n## Project Context\n\n{\n  \"results\": [\n    {\n      \"id\": \"ccf73ca4-8240-4f9a-8abf-32b210e5b35b\",\n      \"content\": \"Task 1470 wired /audit into /review Phase-2 Architectural Coherence.\""
+- id: entry-cand-20260731-1
+  title: Digest 'User Corrections' bucket captures a raw reconciliation run-review JSON dump as if it were corrective user feedback
+  severity: medium
+  status: open
+  origin_phase: recon
+  manifested_phase: recon
+  sightings:
+  - date: '2026-07-31'
+    project: dark_factory
+    session: 5871ae29-c870-47be-a72b-074f82b1558a
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: '(turn 3) ## Reconciliation Run Review
+
+
+      ### Run Metadata
+
+      - Run ID: f0dccecd-d648-41f6-a7bc-696daa673caf
+
+      - Project: reify
+
+      - Type: remediation
+
+      ...'
+- id: entry-cand-20260728-2
+  title: Digest score and 'User Corrections' label are decoupled from the session's own signal_counts
+  severity: medium
+  status: open
+  origin_phase: unknown
+  manifested_phase: unknown
+  sightings:
+  - date: '2026-07-28'
+    project: dark_factory
+    session: 47c7fd98-5843-4b9d-bf63-e813328ea35c
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: 'signal_counts: tool_error: 0, self_correct: 0, not_found: 0, df_guard: 0, interrupt: 0 / score: 5.0 -- ## User Corrections
+
+      - (turn 3) ## Reconciliation Run Review ... Stage Reports { "memory_consolidator": { "items_flagged": 1, "stats": {...} } }'
+- id: entry-cand-20260729-3
+  title: Digest generator files a recon stage's reconciliation run-review report under 'User Corrections' despite zero fired signal counters
+  severity: medium
+  status: open
+  origin_phase: unknown
+  manifested_phase: recon
+  sightings:
+  - date: '2026-07-29'
+    project: dark_factory
+    session: ccf68b39-3c3b-4242-858b-c802cdb435ba
+    origin_phase: unknown
+    manifested_phase: recon
+    evidence_quote: '## User Corrections
+
+      - (turn 3) ## Reconciliation Run Review
+
+
+      ### Run Metadata
+
+      - Run ID: 8cb3251f-e13e-4096-bb67-c049fdec4c9b ... [signal_counts: tool_error:0 self_correct:0 not_found:0 df_guard:0 interrupt:0]'
+- id: entry-cand-20260730-30
+  title: Digest severity score assigned despite every individual signal_count reading zero
+  severity: medium
+  status: open
+  origin_phase: ops
+  manifested_phase: ops
+  sightings:
+  - date: '2026-07-30'
+    project: dark_factory
+    session: fffb63d4-4d9c-4bf3-9a07-44220b3046ef
+    origin_phase: ops
+    manifested_phase: ops
+    evidence_quote: "score: 5.0\nsignal_counts:\n  tool_error: 0\n  self_correct: 0\n  not_found: 0\n  df_guard: 0\n  interrupt: 0"
+- id: entry-cand-20260729-4
+  title: Bash cwd persists across turns, causing relative-path git commit --only pathspec failures on PRD doc commits
+  severity: medium
+  status: open
+  origin_phase: prd
+  manifested_phase: prd
+  sightings:
+  - date: '2026-07-29'
+    project: dark_factory
+    session: c7b3e5de-c51e-40d1-a924-ec6e6bb63d28
+    origin_phase: prd
+    manifested_phase: prd
+    evidence_quote: 'warning: could not open directory ''shared/docs/prds/'': No such file or directory
+
+      fatal: pathspec ''docs/prds/memory-eval-dashboard.capability-manifest.md'' did not match any files'
+- id: entry-cand-20260730-31
+  title: Digest 'User Corrections' extraction mislabels an orchestrated-task session's injected memory-search context block as a correction
+  severity: medium
+  status: open
+  origin_phase: ops
+  manifested_phase: implement
+  sightings:
+  - date: '2026-07-30'
+    project: dark_factory
+    session: 4c5bf231-6dc8-484a-b142-5b1c4b59374c
+    origin_phase: ops
+    manifested_phase: implement
+    evidence_quote: "(turn 3) # Context\n\n## Project Context\n\n{\n  \"results\": [\n    {\n      \"id\": \"ccf73ca4-8240-4f9a-8abf-32b210e5b35b\",\n      \"content\": \"Task 1470 wired /audit into /review Phase-2 Architectural Coherence.\","
+- id: entry-cand-20260729-5
+  title: Sibling planning sessions race on a shared in-progress design doc
+  severity: medium
+  status: open
+  origin_phase: prd
+  manifested_phase: prd
+  sightings:
+  - date: '2026-07-29'
+    project: dark_factory
+    session: 7a2fed96-6cc7-4e46-ba42-cf961f8c0be6
+    origin_phase: prd
+    manifested_phase: prd
+    evidence_quote: A sibling session read your report before you added section 10 and wrote docs/prds/memory-metadata-vocabulary.md (mandating at least one of your measures).
+- id: entry-cand-20260729-6
+  title: Auto-memory MEMORY.md index write rejected as stale by a concurrent writer
+  severity: medium
+  status: open
+  origin_phase: unknown
+  manifested_phase: unknown
+  sightings:
+  - date: '2026-07-29'
+    project: dark_factory
+    session: 7a2fed96-6cc7-4e46-ba42-cf961f8c0be6
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: 'Edit({"file_path": "/home/leo/.claude/projects/-home-leo-src-dark-factory/memory/MEMORY.md", ...}) -> <tool_use_error>File has been modified since read, either by the user or by a linter. Read it again before attempting to write it.</tool_use_error>'
+- id: entry-cand-20260726-1
+  title: Trickle-coder digest labels a pasted recon stage-report dump as a 'User Correction' despite all signal_counts reading zero
+  severity: medium
+  status: open
+  origin_phase: recon
+  manifested_phase: recon
+  sightings:
+  - date: '2026-07-26'
+    project: dark_factory
+    session: 47e690d3-d712-4fef-826a-84765fc58546
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: '(turn 3) ## Reconciliation Run Review
+
+
+      ### Run Metadata
+
+      - Run ID: b1bba7ce-eb81-481e-a45d-5f0aa4d7b81d ... captured verbatim as the sole ''User Correction'' with signal_counts all 0 and score=5.0'
+- id: entry-cand-20260730-32
+  title: Digest generator mislabels a dispatched task's injected '# Context' briefing block as a 'User Correction'
+  severity: medium
+  status: open
+  origin_phase: ops
+  manifested_phase: ops
+  sightings:
+  - date: '2026-07-30'
+    project: dark_factory
+    session: b90b9d91-caa9-4909-88d5-1387b07ca382
+    origin_phase: ops
+    manifested_phase: ops
+    evidence_quote: "## User Corrections\n- (turn 3) # Context\n\n## Project Context\n\n{\n  \"results\": [\n    {\n      \"id\": \"ccf73ca4-8240-4f9a-8abf-32b210e5b35b\",\n      \"content\": \"Task 1470 wired /audit into /review Phase-2 Architectural Coherence.\","
+- id: entry-cand-20260728-3
+  title: Orchestrated worktree task fires repeated 'no such file or directory' with no other diagnostic signal
+  severity: medium
+  status: open
+  origin_phase: implement
+  manifested_phase: implement
+  sightings:
+  - date: '2026-07-28'
+    project: dark_factory
+    session: 4541215f-6fdc-4941-8bc4-670a90a53217
+    origin_phase: implement
+    manifested_phase: implement
+    evidence_quote: '(turn 15) no such file or directory
+
+      - (turn 28) no such file or directory
+
+      - (turn 117) no such file or directory'
 candidates:
 - id: cand-20260715-1
   title: Recon remediation cycles timeout on fused-memory I/O
@@ -3667,3 +4922,348 @@ candidates:
     origin_phase: review
     manifested_phase: review
     evidence_quote: The advisory branch fixes only the closing prose + summary + suggested_action, but the structured detail lines it keeps still label the filer as `rejecting_project_id=` and `rejecting_project_root=`... The test pins the misleading label in place by asserting `'rejecting_project_id='` is present in the advisory detail, so a later cleanup... is permanently blocked by the test
+- id: cand-20260729-2
+  title: Digest signal-scorer counts watcher-rearm.sh's designed bounded-wait ceiling (exit 124) as a tool_error
+  cause: 'watcher-rearm.sh''s own stdout declares reaching its --timeout slice with no new escalation as a normal loop-continuation outcome (''WATCHER_REARM_OUTCOME: CEILING exit=124''), but the trickle-coder digest extraction appears to flag any nonzero Bash exit code as tool_error indiscriminately: 3 of the session''s 4 tool_error signals (turns 111, 163, 315) are this benign ceiling hit, identical in kind to the one real failure (turn 70''s exit 2), inflating the error signal 4x and burying the genuine DARK_FACTORY_ROOT bug among false positives.'
+  area: trickle-coder / digest-signal-extraction
+  first_seen: '2026-07-29'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-29'
+    project: dark_factory
+    session: a189558e-3f7c-414b-bfb1-1d82f01a700a
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: 'WATCHER_REARM_OUTCOME: CEILING exit=124'
+  promoted_to: entry-cand-20260729-2
+- id: cand-20260730-25
+  title: Digest generator mislabels an ordinary task-dispatch '# Context' briefing block as a 'User Correction'
+  cause: 'The digest pipeline''s ''User Corrections'' extraction heuristic is not source-aware: it flags any early-turn block that looks like injected/structured text rather than actual user input. Here the flagged content is turn 3''s standard orchestrated-task briefing ''# Context'' / ''Project Context'' memory-search JSON dump — not a correction from anyone. Prior codebook candidates (e.g. entry-cand-20260722-10/13/16/17/19/21/24/26/27/30/31) document this same mislabeling but only ever as the trickle-coder recursively re-ingesting its OWN prompt. This session is agent_class ''orchestrated-task'' running task 3075 in its worktree, not a trickle-coder session — confirming the misclassification is a general defect in the digest classifier itself (fires on any injected context block regardless of source), not a phenomenon confined to trickle-coder self-recursion. That widens the blast radius: every dispatched task''s digest is at risk of fabricated ''User Corrections'', not just the trickle-coder''s own meta-sessions.'
+  area: trickle-coder digest pipeline / codebook tooling
+  first_seen: '2026-07-30'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-30'
+    project: dark_factory
+    session: 8860621c-c89f-4aed-83ca-ce0ef03d0c94
+    origin_phase: ops
+    manifested_phase: ops
+    evidence_quote: '(turn 3) # Context
+
+
+      ## Project Context
+
+
+      { "results": [ { "id": "ccf73ca4-8240-4f9a-8abf-32b210e5b35b", "content": "Task 1470 wired /audit into /review Phase-2 Architectural Coherence.", ... } ] }'
+  promoted_to: entry-cand-20260730-25
+- id: cand-20260725-3
+  title: Digest 'User Corrections' bucket captures pasted non-corrective report/log content
+  cause: The digest miner's heuristic for populating 'User Corrections' grabs large chunks of raw user-turn text without verifying it is actually corrective feedback about assistant behavior. Here the sole 'User Correction' entry is a full Reconciliation Run Review (Run ID, stage-report JSON) pasted for reference/discussion, not a correction of anything the assistant said or did — yet it inflates the digest score to 5.0 while every behavioral signal_count (tool_error, self_correct, not_found, df_guard, interrupt) is 0, and the JSON payload itself is truncated mid-field ('...[item truncated]'), discarding whatever the actual substance was.
+  area: trickle-coder digest mining pipeline
+  first_seen: '2026-07-25'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-25'
+    project: dark_factory
+    session: 2b93092c-07a1-4a4f-9044-ab269656a41e
+    origin_phase: recon
+    manifested_phase: unknown
+    evidence_quote: '## User Corrections
+
+      - (turn 3) ## Reconciliation Run Review
+
+
+      ### Run Metadata
+
+      - Run ID: 84e6ce03-115b-46c0-ac2a-53f4c62cc4c4
+
+      ... "e... [item truncated]'
+  promoted_to: entry-cand-20260725-3
+- id: cand-20260728-1
+  title: Digest pipeline mislabels an ordinary task's injected '# Context' project-briefing block as a 'User Correction'
+  cause: The digest generator's 'User Corrections' extraction heuristic captures large early-turn blocks verbatim without distinguishing system/task-injected context (the standard '# Context' -> '## Project Context' memory-search briefing every dispatched task receives at session start) from actual human dialogue corrections. Unlike the already-catalogued cases where the trickle-coder ingests its own recursive meta-prompt, this session is an ordinary orchestrated-task (worktree 2989), so the misfired content is the task's normal memory-search briefing JSON, not trickle-coder text -- showing the underlying heuristic defect is broader than trickle-coder self-review.
+  area: digest-generation / trickle-coder tooling
+  first_seen: '2026-07-28'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-28'
+    project: dark_factory
+    session: a7805e53-975a-4b2a-84c1-3776bd409288
+    origin_phase: ops
+    manifested_phase: ops
+    evidence_quote: "(turn 3) # Context\n\n## Project Context\n\n{\n  \"results\": [\n    {\n      \"id\": \"ccf73ca4-8240-4f9a-8abf-32b210e5b35b\",\n      \"content\": \"Task 1470 wired /audit into /review Phase-2 Architectural Coherence.\""
+  promoted_to: entry-cand-20260728-1
+- id: cand-20260730-26
+  title: Digest pipeline mislabels an ordinary orchestrated-task's injected '# Context' dispatch briefing as a 'User Correction'
+  cause: 'The digest-extraction heuristic that populates the ''User Corrections'' section appears to grab early-turn text blocks structurally rather than discriminating actual human feedback from system/orchestrator-injected content. Here the source session is a regular orchestrated-task (not a trickle-coder meta-session), and the mislabeled content is the CLAUDE.md-documented ''# Context'' memory-search briefing block that the orchestrator injects for dispatched agents (per ''Dispatched agents get their memory context from the briefing''s `# Context` block''). This generalizes the previously-catalogued trickle-coder self-ingestion bug (many entries, e.g. entry-cand-20260722-10/13/16/17/19/21/24/26/27/30/31, entry-cand-20260721-5) beyond trickle-coder-on-trickle-coder recursion: the same mislabeling classifier also fires on plain task-dispatch briefings for non-meta sessions, meaning the defect is in the general ''is this turn a user correction'' heuristic, not specific to trickle-coder self-reference.'
+  area: trickle-coder digest pipeline / digest extraction classifier
+  first_seen: '2026-07-30'
+  disposition: rejected
+  sightings:
+  - date: '2026-07-30'
+    project: dark_factory
+    session: 16ca1b18-9b67-477e-b687-4b3f3c8f8c71
+    origin_phase: ops
+    manifested_phase: ops
+    evidence_quote: "## User Corrections\n- (turn 3) # Context\n\n## Project Context\n\n{\n  \"results\": [\n    {\n      \"id\": \"ccf73ca4-8240-4f9a-8abf-32b210e5b35b\",\n      \"content\": \"Task 1470 wired /audit into /review Phase-2 Architectural Coherence.\","
+- id: cand-20260731-1
+  title: Digest 'User Corrections' bucket captures a raw reconciliation run-review JSON dump as if it were corrective user feedback
+  cause: The digest extractor appears to label substantial non-assistant turn content as a 'User Correction' without checking whether it's actually corrective feedback versus a pasted report/log artifact — here turn 3 is a full 'Reconciliation Run Review' (run metadata + per-stage stats JSON), not a human correcting the agent.
+  area: trickle-coder digest pipeline / session classification
+  first_seen: '2026-07-31'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-31'
+    project: dark_factory
+    session: 5871ae29-c870-47be-a72b-074f82b1558a
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: '(turn 3) ## Reconciliation Run Review
+
+
+      ### Run Metadata
+
+      - Run ID: f0dccecd-d648-41f6-a7bc-696daa673caf
+
+      - Project: reify
+
+      - Type: remediation
+
+      ...'
+  promoted_to: entry-cand-20260731-1
+- id: cand-20260730-27
+  title: plan-tools add_design_decision rejects calls missing an undocumented required 'rationale' argument
+  cause: The architect/plan-stage tool mcp__plan-tools__add_design_decision requires a 'rationale' parameter that the agent omitted when recording a design decision, producing a pydantic validation error ('1 validation error for call[add_design_decision] rationale Missing required argument') instead of succeeding or clearly signaling the expected call shape in advance — the agent had already composed a long 'decision' string but had no rendered schema showing rationale was mandatory.
+  area: tool-contract
+  first_seen: '2026-07-30'
+  disposition: rejected
+  sightings:
+  - date: '2026-07-30'
+    project: dark_factory
+    session: 9d534405-3507-4940-b098-0bcf5dd695cf
+    origin_phase: architect
+    manifested_phase: architect
+    evidence_quote: "mcp__plan-tools__add_design_decision({\"decision\": \"Every artifact reader in `memory_evals.py` distinguishes three disposal paths...\"}) -> 1 validation error for call[add_design_decision]\nrationale\n  Missing required argument [type=missing_argument, input_value={'decision': 'Every artif...ationale>\\n</invoke>\\n'}, input_type=dict]"
+- id: cand-20260730-28
+  title: Shared 'identical for all three stages' prompt constant embeds a Stage-2-only escalation license, contradicting Stage 3's read-only contract
+  cause: ESCALATION_BOUNDARY_NOTE in reconciliation/prompts/__init__.py is authored once with a comment asserting it is 'Identical for all three stages — no per-stage parameters', but its final sentence names a Stage-2-only mechanism (FIX D / Stale Flag Escalation) as 'the one sanctioned escalation action in this stage'. Rendered verbatim into STAGE3_SYSTEM_PROMPT, it lands ~2 lines after 'You do NOT have write or mutation tools' and — because mcp__escalation__escalate_blocker is absent from STAGE3_DISALLOWED — positively (and falsely) licenses the read-only integrity stage to make a durable write to the escalation queue; Stage 1 gets the same false license. The false-uniformity assumption in the constant's own authoring comment is what hid the per-stage mismatch from whoever wrote it.
+  area: reconciliation prompt authoring / stage capability boundaries (fused-memory/src/fused_memory/reconciliation/prompts)
+  first_seen: '2026-07-30'
+  disposition: rejected
+  sightings:
+  - date: '2026-07-30'
+    project: dark_factory
+    session: 277c3010-b192-499d-8150-6317a31aa0fc
+    origin_phase: unknown
+    manifested_phase: review
+    evidence_quote: The final sentence of ESCALATION_BOUNDARY_NOTE ... is stage-specific content shipped in a stage-agnostic constant, and it is false (and harmful) for two of its three consumers ... the tool really is callable, so the prompt now positively licenses the read-only integrity stage to make a durable write to the reconciliation escalation queue ... The constant's own comment asserts it is 'Identical for all three stages — no per-stage parameters', which is what hid the mismatch.
+- id: cand-20260728-2
+  title: Digest score and 'User Corrections' label are decoupled from the session's own signal_counts
+  cause: The trickle-coder digest pipeline assigned score=5.0 and filed a 'User Corrections' excerpt for a recon session whose signal_counts are entirely zero (tool_error, self_correct, not_found, df_guard, interrupt all 0). The excerpt itself is not a user correction at all — it is a verbatim raw stage-report/JSON dump ('## Reconciliation Run Review' ... Stage Reports {...}) from a different project's recon run, i.e. assistant/tool output, not user-authored corrective text. This indicates the scorer and the 'User Corrections' extractor both run on a heuristic independent of (and inconsistent with) the tallied signal_counts, so a session with no recorded confusion signals still surfaces as significant and gets non-corrective tool output mislabeled as a correction.
+  area: trickle-coder digest pipeline / severity scoring
+  first_seen: '2026-07-28'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-28'
+    project: dark_factory
+    session: 47c7fd98-5843-4b9d-bf63-e813328ea35c
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: 'signal_counts: tool_error: 0, self_correct: 0, not_found: 0, df_guard: 0, interrupt: 0 / score: 5.0 -- ## User Corrections
+
+      - (turn 3) ## Reconciliation Run Review ... Stage Reports { "memory_consolidator": { "items_flagged": 1, "stats": {...} } }'
+  promoted_to: entry-cand-20260728-2
+- id: cand-20260729-3
+  title: Digest generator files a recon stage's reconciliation run-review report under 'User Corrections' despite zero fired signal counters
+  cause: 'The digest-extraction classifier buckets transcript turns by position/heuristic rather than by actual signal content: a markdown-formatted ''Reconciliation Run Review'' stage-report dump (mcp__fused-memory reconciliation output, not user-authored text) was filed under the ''User Corrections'' heading even though signal_counts (tool_error, self_correct, not_found, df_guard, interrupt) are all 0 — nothing in the session actually signals a correction, yet the digest presents raw stage-report JSON as if a user corrected the agent.'
+  area: trickle-coder digest pipeline / confusion-codebook tooling
+  first_seen: '2026-07-29'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-29'
+    project: dark_factory
+    session: ccf68b39-3c3b-4242-858b-c802cdb435ba
+    origin_phase: unknown
+    manifested_phase: recon
+    evidence_quote: '## User Corrections
+
+      - (turn 3) ## Reconciliation Run Review
+
+
+      ### Run Metadata
+
+      - Run ID: 8cb3251f-e13e-4096-bb67-c049fdec4c9b ... [signal_counts: tool_error:0 self_correct:0 not_found:0 df_guard:0 interrupt:0]'
+  promoted_to: entry-cand-20260729-3
+- id: cand-20260730-29
+  title: Digest pipeline mislabels a recon session's own generated run-review report as a 'User Correction'
+  cause: 'The digest/trickle-coding capture step attributes substantial non-user content (a reconciliation-run stage-report JSON dump the session itself produced/received) to the ''User Corrections'' section, tagged ''(turn 3)''. This broadens the known trickle-coder self-ingestion mislabeling defect beyond the trickle-coder''s own meta-prompt: here the source session is a plain recon run (agent_class: recon, project solar_challenge), and the misattributed content is a reconciliation run review with nested stage stats — not any trickle-coder prompt text. The digest-generation step appears to have no notion of ''who authored this turn'', so any large structured block ends up bucketed as a ''User Correction''.'
+  area: trickle-coder digest / confusion-codebook pipeline
+  first_seen: '2026-07-30'
+  disposition: rejected
+  sightings:
+  - date: '2026-07-30'
+    project: dark_factory
+    session: fffb63d4-4d9c-4bf3-9a07-44220b3046ef
+    origin_phase: recon
+    manifested_phase: ops
+    evidence_quote: '## User Corrections
+
+      - (turn 3) ## Reconciliation Run Review
+
+
+      ### Run Metadata
+
+      - Run ID: d93b4a27-78e6-4780-8638-16ff89dd0609
+
+      - Project: solar_challenge
+
+      - Type: full'
+- id: cand-20260730-30
+  title: Digest severity score assigned despite every individual signal_count reading zero
+  cause: The session is scored 5.0 while signal_counts.tool_error, self_correct, not_found, df_guard, and interrupt are all 0 — none of the enumerated evidence categories justify a nonzero score. Either the scoring function weighs something outside the rendered signal_counts (e.g. raw content length or presence of a 'User Corrections' section) without exposing it, or the score and signal_counts are computed by divergent code paths that can disagree. Either way, a reviewer using signal_counts as a proxy for 'how much evidence backs this score' is misled here.
+  area: trickle-coder digest scoring
+  first_seen: '2026-07-30'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-30'
+    project: dark_factory
+    session: fffb63d4-4d9c-4bf3-9a07-44220b3046ef
+    origin_phase: ops
+    manifested_phase: ops
+    evidence_quote: "score: 5.0\nsignal_counts:\n  tool_error: 0\n  self_correct: 0\n  not_found: 0\n  df_guard: 0\n  interrupt: 0"
+  promoted_to: entry-cand-20260730-30
+- id: cand-20260729-4
+  title: Bash cwd persists across turns, causing relative-path git commit --only pathspec failures on PRD doc commits
+  cause: The Bash tool's working directory persists between commands within a session (unlike shell env vars). An earlier command apparently left cwd inside a package subdirectory (shared/) rather than repo root. A later `git commit --only docs/prds/<file>` — following CLAUDE.md's guidance to use `--only` for direct-to-main commits — resolved the relative pathspec against the stale cwd, producing 'could not open directory shared/docs/prds/' and 'pathspec did not match any files' on two consecutive attempts to land the memory-eval-dashboard PRD and its capability-manifest files.
+  area: tooling/git
+  first_seen: '2026-07-29'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-29'
+    project: dark_factory
+    session: c7b3e5de-c51e-40d1-a924-ec6e6bb63d28
+    origin_phase: prd
+    manifested_phase: prd
+    evidence_quote: 'warning: could not open directory ''shared/docs/prds/'': No such file or directory
+
+      fatal: pathspec ''docs/prds/memory-eval-dashboard.capability-manifest.md'' did not match any files'
+  promoted_to: entry-cand-20260729-4
+- id: cand-20260730-31
+  title: Digest 'User Corrections' extraction mislabels an orchestrated-task session's injected memory-search context block as a correction
+  cause: The digest generator's heuristic for the 'User Corrections' section grabs early-turn content indiscriminately; here turn 3 is the standard '# Context / Project Context' memory-search injection (Graphiti search results) for an ordinary orchestrated-task session, not a trickle-coder self-prompt and not an actual user correction. This broadens the known digest-mislabeling defect cluster (previously evidenced only in trickle-coder meta-sessions) to plain task-implementation sessions.
+  area: trickle-coder digest generation
+  first_seen: '2026-07-30'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-30'
+    project: dark_factory
+    session: 4c5bf231-6dc8-484a-b142-5b1c4b59374c
+    origin_phase: ops
+    manifested_phase: implement
+    evidence_quote: "(turn 3) # Context\n\n## Project Context\n\n{\n  \"results\": [\n    {\n      \"id\": \"ccf73ca4-8240-4f9a-8abf-32b210e5b35b\",\n      \"content\": \"Task 1470 wired /audit into /review Phase-2 Architectural Coherence.\","
+  promoted_to: entry-cand-20260730-31
+- id: cand-20260729-5
+  title: Sibling planning sessions race on a shared in-progress design doc
+  cause: 'No coordination or versioning exists between concurrently running interactive sessions authoring related documents: a sibling session read this session''s eval-design report before a later addendum (§10, stopping criteria) was appended, and wrote a separate PRD (memory-metadata-vocabulary.md) that mandated one of the measures based on the stale/incomplete version — surfaced only because the user happened to notice and mention it.'
+  area: cross-session-coordination
+  first_seen: '2026-07-29'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-29'
+    project: dark_factory
+    session: 7a2fed96-6cc7-4e46-ba42-cf961f8c0be6
+    origin_phase: prd
+    manifested_phase: prd
+    evidence_quote: A sibling session read your report before you added section 10 and wrote docs/prds/memory-metadata-vocabulary.md (mandating at least one of your measures).
+  promoted_to: entry-cand-20260729-5
+- id: cand-20260729-6
+  title: Auto-memory MEMORY.md index write rejected as stale by a concurrent writer
+  cause: MEMORY.md is live-co-authored by multiple concurrent sessions/processes with no documented ownership or locking protocol; an Edit built from a previously-Read snapshot fails when another writer touched the file first, forcing an unplanned re-read-and-retry with no guidance on how to reconcile the two edits.
+  area: memory-infra
+  first_seen: '2026-07-29'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-29'
+    project: dark_factory
+    session: 7a2fed96-6cc7-4e46-ba42-cf961f8c0be6
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: 'Edit({"file_path": "/home/leo/.claude/projects/-home-leo-src-dark-factory/memory/MEMORY.md", ...}) -> <tool_use_error>File has been modified since read, either by the user or by a linter. Read it again before attempting to write it.</tool_use_error>'
+  promoted_to: entry-cand-20260729-6
+- id: cand-20260726-1
+  title: Trickle-coder digest labels a pasted recon stage-report dump as a 'User Correction' despite all signal_counts reading zero
+  cause: The digest pipeline's User-Correction extractor fires on any long structured user-turn text (here, a pasted 'Reconciliation Run Review' with raw stage-report JSON) rather than on actual corrective/feedback semantics, and the severity scorer assigns a nonzero score (5.0) even though every constituent signal_counts category (tool_error, self_correct, not_found, df_guard, interrupt) is 0 — the score is decoupled from the categorized evidence it's supposed to summarize.
+  area: trickle-coder digest pipeline / severity scoring
+  first_seen: '2026-07-26'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-26'
+    project: dark_factory
+    session: 47e690d3-d712-4fef-826a-84765fc58546
+    origin_phase: recon
+    manifested_phase: recon
+    evidence_quote: '(turn 3) ## Reconciliation Run Review
+
+
+      ### Run Metadata
+
+      - Run ID: b1bba7ce-eb81-481e-a45d-5f0aa4d7b81d ... captured verbatim as the sole ''User Correction'' with signal_counts all 0 and score=5.0'
+  promoted_to: entry-cand-20260726-1
+- id: cand-20260730-32
+  title: Digest generator mislabels a dispatched task's injected '# Context' briefing block as a 'User Correction'
+  cause: 'The digest-extraction pipeline''s turn-classification heuristic appears to flag any large, early, substantial-looking message as a ''User Correction'' regardless of its actual source. Here the session is an orchestrated-task worker (agent_class: orchestrated-task, cwd in .worktrees/3208) rather than the trickle-coder itself, and the misclassified content is the standard task-briefing ''# Context'' memory-search injection (not a trickle-coder self-prompt). This shows the same mislabeling defect reaches ordinary dispatched task sessions, not just trickle-coder self-referential runs as the existing candidates (e.g. entry-cand-20260722-10/-13/-16/-17/-19/-21/-24/-26/-27/-30/-31) describe.'
+  area: trickle-coder digest pipeline
+  first_seen: '2026-07-30'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-30'
+    project: dark_factory
+    session: b90b9d91-caa9-4909-88d5-1387b07ca382
+    origin_phase: ops
+    manifested_phase: ops
+    evidence_quote: "## User Corrections\n- (turn 3) # Context\n\n## Project Context\n\n{\n  \"results\": [\n    {\n      \"id\": \"ccf73ca4-8240-4f9a-8abf-32b210e5b35b\",\n      \"content\": \"Task 1470 wired /audit into /review Phase-2 Architectural Coherence.\","
+  promoted_to: entry-cand-20260730-32
+- id: cand-20260728-3
+  title: Orchestrated worktree task fires repeated 'no such file or directory' with no other diagnostic signal
+  cause: The digest for this orchestrated task session shows three separate 'no such file or directory' events (turns 15, 28, 117) with no accompanying tool_error, df_guard, or self_correct signals, and no captured command/path context — the digest format strips the actual failing path/command, leaving only a bare not-found template repeated across a long session.
+  area: implement
+  first_seen: '2026-07-28'
+  disposition: promoted
+  sightings:
+  - date: '2026-07-28'
+    project: dark_factory
+    session: 4541215f-6fdc-4941-8bc4-670a90a53217
+    origin_phase: implement
+    manifested_phase: implement
+    evidence_quote: '(turn 15) no such file or directory
+
+      - (turn 28) no such file or directory
+
+      - (turn 117) no such file or directory'
+  promoted_to: entry-cand-20260728-3
+- id: cand-20260731-2
+  title: done_gate_missing_files guard re-trips identically after prior block, no adaptation between attempts
+  cause: A task-completion 'done gate' checking for missing referenced files fired at turn 3, blocking the action; the session then repeated the same set of guard trips (path-scope, done-gate, false recon premise) at turn 10 with no apparent change in approach, suggesting guard block messages don't carry enough rationale for the agent to avoid re-attempting the same disallowed action.
+  area: task-completion-gates
+  first_seen: '2026-07-31'
+  disposition: rejected
+  sightings:
+  - date: '2026-07-31'
+    project: dark_factory
+    session: 2a1b1a46-b053-4ade-b36e-c823ffa49faa
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: (turn 3) done_gate_missing_files ... (turn 10) done_gate_missing_files
+- id: cand-20260729-7
+  title: Digest 'User Corrections' extraction conflates API role=user with human correction, capturing raw recon tool-result JSON verbatim
+  cause: The digest pipeline's heuristic for populating a session's 'User Corrections' section appears to key off the Claude API's role='user' field rather than semantic authorship. Tool_result blocks (e.g. a trigger_reconciliation/get_status call's JSON output) are delivered as role='user' turns, so a recon session's own stage-report dump ('## Reconciliation Run Review', nested per-stage stats JSON) gets filed as if a human had issued a correction, when no human text or correction is present at all.
+  area: trickle-coder digest pipeline
+  first_seen: '2026-07-29'
+  disposition: rejected
+  sightings:
+  - date: '2026-07-29'
+    project: dark_factory
+    session: 4a5ac282-6f6b-4914-baa4-e8162f029317
+    origin_phase: recon
+    manifested_phase: ops
+    evidence_quote: "(turn 3) ## Reconciliation Run Review\n\n### Run Metadata\n- Run ID: cd163af0-b7bd-4f2e-a2b2-2ef8cb17a18a\n...\n### Stage Reports\n{\n  \"memory_consolidator\": {\n    \"items_flagged\": 1,\n    \"stats\": { ... }"
