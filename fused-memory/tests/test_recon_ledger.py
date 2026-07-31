@@ -1441,7 +1441,7 @@ async def test_upsert_many_is_atomic(store):
         expires_at=None,
     )
 
-    with pytest.raises(Exception):
+    with pytest.raises(aiosqlite.IntegrityError):
         await store.upsert_many([_row('mem-1'), _row('mem-2'), bad])
 
     assert await store.get_mem0_tombstone('proj-p', 'mem-1') is None
