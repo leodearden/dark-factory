@@ -13,6 +13,7 @@ import gc
 import inspect
 import json
 import logging
+import os
 import threading
 import time
 from collections.abc import Sequence
@@ -1018,3 +1019,40 @@ def assert_isolated_git_repo(cwd: Path) -> None:
         f'See esc-3072-3: an unguarded helper wrote blobs into a live task '
         f'worktree and left it with an unmerged index.'
     )
+
+
+def git_env_with_ceiling(cwd: Path) -> dict[str, str]:
+    """Environment for a git child process whose repo discovery cannot leave *cwd*.
+
+    Layer 2 of the esc-3072-3 defence, behind :func:`assert_isolated_git_repo`.
+    The two are complementary and neither is sufficient alone:
+
+    * The pre-flight guarantees ZERO writes, because it runs before any child
+      process exists.  A ceiling alone only makes git *fail*, and it fails
+      mid-sequence — ``git hash-object -w`` writes its blobs first, so a
+      ceiling-only fix would still have leaked objects into the victim's object
+      store before ``git update-index`` errored out.
+    * The ceiling makes escape physically impossible at the git level regardless
+      of whether a future refactor drops, bypasses or forgets the pre-flight.
+
+    ``GIT_CEILING_DIRECTORIES`` is set to *cwd*'s parent, so git's upward walk
+    may inspect ``cwd`` itself and then stops.  Both normalizations applied here
+    are load-bearing, not cosmetic: git ignores ceiling entries that are not
+    absolute, and compares the remainder against the symlink-resolved path — so
+    a relative or unresolved entry silently never matches and the containment
+    would be inert.  ``os.environ`` is COPIED (not replaced) because a git child
+    spawned with a blank environment loses ``PATH``, ``HOME`` and its config
+    discovery.
+
+    A normal repo root and a linked-worktree root both still resolve under this
+    ceiling; only a directory that reaches a repo purely by the upward walk is
+    refused.
+
+    In-repo precedent for the same containment applied via ``monkeypatch.setenv``
+    (the right seam when the git call is made by production code rather than by
+    a subprocess this test spawns): test_warm_base_coherence.py:409-415,
+    test_session_hooks.py:1491, test_warm_lane_scripts_shipped.py:250.
+    """
+    env = os.environ.copy()
+    env['GIT_CEILING_DIRECTORIES'] = str(Path(cwd).resolve().parent)
+    return env

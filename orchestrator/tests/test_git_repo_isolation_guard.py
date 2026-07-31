@@ -264,7 +264,7 @@ class TestGitEnvWithCeiling:
         An unresolved entry silently never matches, so the containment would be
         inert — a fail-open no-one would notice.
         """
-        repo = _init_repo(tmp_path / 'real' / 'repo')
+        _init_repo(tmp_path / 'real' / 'repo')
         link_dir = tmp_path / 'link'
         link_dir.symlink_to(tmp_path / 'real', target_is_directory=True)
 
