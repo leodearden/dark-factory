@@ -155,3 +155,76 @@ async def test_get_statuses_explicit_pagination_slices_and_reports_metadata(
     assert result3.get('statuses') == {}, f'Expected empty map, got: {result3.get("statuses")}'
     assert result3['pagination']['returned'] == 0
     assert result3['pagination']['has_more'] is False
+
+
+@pytest.mark.asyncio
+async def test_get_statuses_pagination_validation_and_backward_compat(
+    paging_server, paging_task_interceptor
+):
+    """get_statuses pagination: backward-compat + input validation.
+
+    The get_statuses analogue of
+    test_task_tools.py::test_get_tasks_pagination_validation_and_backward_compat.
+
+    (a) Backward-compat: no page_size, no ids → full map, keys == {'statuses'}.
+    (b) page_size=0    → ValidationError, interceptor NOT called.
+    (c) page_size=-1   → ValidationError, interceptor NOT called.
+    (d) page_size=True → ValidationError (bool is an int subclass), NOT called.
+    (e) offset=-1 with page_size=2 → ValidationError, interceptor NOT called.
+
+    Every invalid case must early-exit BEFORE the interceptor is touched.
+    """
+    population = _set_population(_make_statuses(5))
+
+    # (a) Backward-compat: default call (no page_size, no ids).  This pins,
+    # inside this file, the single-keyed envelope invariant that
+    # test_status_envelope_contract.py:110 depends on.
+    result = await paging_server._tool_manager.call_tool(
+        'get_statuses',
+        {'project_root': '/project'},
+    )
+    assert result.get('statuses') == population, (
+        f'Backward-compat: full map expected, got: {result.get("statuses")}'
+    )
+    assert set(result.keys()) == {'statuses'}, (
+        f'Backward-compat: pagination key must be absent, got: {result}'
+    )
+
+    # (b) page_size=0 → ValidationError
+    paging_task_interceptor.get_statuses.reset_mock()
+    bad0 = await paging_server._tool_manager.call_tool(
+        'get_statuses',
+        {'project_root': '/project', 'page_size': 0},
+    )
+    assert bad0.get('error_type') == 'ValidationError', f'Expected ValidationError for page_size=0, got: {bad0}'
+    assert 'page_size' in bad0.get('error', '').lower(), f'Error message should mention page_size: {bad0}'
+    paging_task_interceptor.get_statuses.assert_not_awaited()
+
+    # (c) page_size=-1 → ValidationError
+    paging_task_interceptor.get_statuses.reset_mock()
+    bad_neg = await paging_server._tool_manager.call_tool(
+        'get_statuses',
+        {'project_root': '/project', 'page_size': -1},
+    )
+    assert bad_neg.get('error_type') == 'ValidationError', f'Expected ValidationError for page_size=-1, got: {bad_neg}'
+    paging_task_interceptor.get_statuses.assert_not_awaited()
+
+    # (d) page_size=True → ValidationError (bool is an int subclass; a caller
+    # that passes a flag by mistake must not silently get a 1-entry page)
+    paging_task_interceptor.get_statuses.reset_mock()
+    bad_bool = await paging_server._tool_manager.call_tool(
+        'get_statuses',
+        {'project_root': '/project', 'page_size': True},
+    )
+    assert bad_bool.get('error_type') == 'ValidationError', f'Expected ValidationError for page_size=True, got: {bad_bool}'
+    paging_task_interceptor.get_statuses.assert_not_awaited()
+
+    # (e) offset=-1 with page_size=2 → ValidationError
+    paging_task_interceptor.get_statuses.reset_mock()
+    bad_off = await paging_server._tool_manager.call_tool(
+        'get_statuses',
+        {'project_root': '/project', 'page_size': 2, 'offset': -1},
+    )
+    assert bad_off.get('error_type') == 'ValidationError', f'Expected ValidationError for offset=-1, got: {bad_off}'
+    assert 'offset' in bad_off.get('error', '').lower(), f'Error message should mention offset: {bad_off}'
+    paging_task_interceptor.get_statuses.assert_not_awaited()
