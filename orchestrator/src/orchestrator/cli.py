@@ -1188,9 +1188,16 @@ def _run_single_eval(
                     f' unmeasurable: {result.metrics.get("invocation_error")}'
                     if result.metrics.get('cap_tainted') else ''
                 )
+                # `steps=` is echoed BESIDE the score (task 3302) because it is
+                # the plan-production predicate the whole pipeline now keys on:
+                # `steps=0` beside any plan_quality means the architect produced
+                # nothing, which the final table floors to 0.0. Showing it live
+                # is what stops a no-plan candidate from looking healthy for the
+                # length of a campaign.
                 click.echo(
                     f'{result.task_id} × {result.config_name}: '
-                    f'{result.outcome} plan_quality={plan_quality}{taint} '
+                    f'{result.outcome} plan_quality={plan_quality} '
+                    f'steps={result.metrics.get("plan_steps")}{taint} '
                     f'({result.wall_clock_ms / 1000:.1f}s)'
                 )
             else:
