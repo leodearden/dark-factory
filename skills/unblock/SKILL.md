@@ -345,10 +345,28 @@ The merge procedure is iterative — don't assume one pass will be enough:
      deadline = now() + 1200 if poll_by == "branch" else None  # 20-min hard ceiling; branch arm only — it alone lost its unknown exit
      timed_out = False
      poll_interval = 15  # seconds; ramp up to 60 s
+
+     # BRANCH-ARM STALENESS GUARD. A branch-keyed poll resolves the most-recent
+     # *finalized* record for that branch (retention ring `get_by_branch` → event store
+     # `latest_merge_finalized(branch=...)`, escalation/server.py:2251-2286) — nothing ties
+     # that record to *this* submission, and the event store is durable across restarts.
+     # Task branches are reused verbatim across resubmissions (this skill's own retry loop
+     # is "fix in worktree, resubmit" on the same `task/<TASK_ID>`), so a previous round's
+     # done/conflict/blocked/abandoned record can satisfy the terminal test on the very
+     # FIRST tick, before the foreign merger has done anything. Only git ancestry proves
+     # that *this* attempt landed.
+     def accept_terminal(poll):
+         if poll_by != "branch":
+             return True          # request_id / task_id arms are submission-scoped already
+         if poll["state"] == "done":
+             # shell: git merge-base --is-ancestor task/<TASK_ID> main  → True iff exit 0
+             return branch_is_ancestor_of_main()   # unconfirmed `done` is stale → keep polling
+         return True              # non-done terminal: exit the loop, but treat as UNCONFIRMED
+
      loop:
          sleep(poll_interval)
          poll = mcp__escalation__merge_status(**poll_kwargs)
-         if poll["state"] in terminal:
+         if poll["state"] in terminal and accept_terminal(poll):
              break
          if deadline is not None and now() >= deadline:
              timed_out = True
@@ -357,13 +375,13 @@ The merge procedure is iterative — don't assume one pass will be enough:
          poll_interval = min(max(eta, 15), 60)
      ```
      After the loop exits:
-     - `timed_out` (branch-arm 20-minute deadline reached without a terminal state) → do NOT resubmit and do NOT direct-merge; go to *Polled terminal failures*'s `unknown` bullet below and follow its branch-arm carve-out (stop-and-report, not resubmit).
-     - `poll["state"] == "done"` → `merge_status` returns **no merge SHA** (`poll["outcome"]` is the raw state string `"done"`, not a commit hash) — except on the `poll_by == "branch"` arm, where `"done"` comes from the git-authority tier and carries `merge_sha` directly. Otherwise re-derive the merge commit from git:
+     - `timed_out` (branch-arm 20-minute deadline reached without an accepted terminal state) → do NOT resubmit and do NOT direct-merge; go to *Polled terminal failures*'s `unknown` bullet below and follow its branch-arm carve-out (stop-and-report, not resubmit).
+     - `poll["state"] == "done"` → **if the response carries `merge_sha`** (the git-authority tier's `kind: "found_on_main"` shape), thread that SHA directly. **Otherwise** — including on the `poll_by == "branch"` arm, where a durable retention-ring/event-store record resolves `done` with only `state`/`request_id`/`generation`/`outcome`/`finished_at` and *no* `merge_sha` (`escalation/server.py:2404-2420`) — `merge_status` gives you no commit hash (`poll["outcome"]` is the raw state string `"done"`), so re-derive the merge commit from git:
        ```
        git log main --oneline | head -5
        ```
-       Thread the first commit SHA into `done_provenance={"commit": "<sha>"}`. If no single commit is recoverable, fall back to `{"note": "<explanation>"}`. Then proceed to step 8.
-     - `poll["state"] in ("conflict", "blocked", "abandoned", "unknown")` → see *Polled terminal failures* below.
+       Thread the SHA into `done_provenance={"commit": "<sha>"}`. If no single commit is recoverable, fall back to `{"note": "<explanation>"}`. Then proceed to step 8.
+     - `poll["state"] in ("conflict", "blocked", "abandoned", "unknown")` → see *Polled terminal failures* below. **On the `poll_by == "branch"` arm these are UNCONFIRMED** — per the staleness guard above they may be a prior round's record for this same branch rather than this submission's outcome. Before acting on one, re-check `mcp__escalation__get_merge_queue()` and who owns the worktree; if this branch is still in flight, keep polling to the 20-minute ceiling instead of resubmitting on a stale failure.
 
    *(Immediate-response failure edges — `conflict`, `blocked`, `unknown_branch`, `failed`, orchestrator-down — and cancellation are covered below.)*
 

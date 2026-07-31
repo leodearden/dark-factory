@@ -90,6 +90,8 @@ The call returns with **either** a **terminal** status **or** a **non-terminal**
   ```
   mcp__escalation__merge_status(branch="task/<TASK_ID>")
   ```
+  **Terminal states on this arm are UNCONFIRMED.** A branch-keyed poll resolves the most-recent *finalized* record for that branch (retention ring `get_by_branch` → event store `latest_merge_finalized(branch=...)`, `escalation/server.py:2251-2286`) — nothing ties that record to *your* submission, and the event store survives restarts. Task branches are reused verbatim across resubmissions, so a prior round's `done`/`conflict`/`blocked`/`abandoned` can satisfy the terminal test on the very first tick. Accept `done` only once `git merge-base --is-ancestor task/<TASK_ID> main` exits 0 — otherwise it is stale, so keep polling. On a `conflict`/`blocked`/`abandoned` from this arm, treat it as possibly predating this submission: re-check `get_merge_queue()` and who owns the worktree before resolving or resubmitting.
+
   Cross-check `get_merge_queue()` for queue-wide context if useful. On this arm `unknown` is the **live** state, not a first-tick fluke — it persists for as long as the foreign merger is still working, since the git-authority tier can only resolve once the branch tip is provably an ancestor of main (`escalation/server.py:2422-2461`). Do NOT read it as a terminal failure or as licence to direct-merge, and do NOT resubmit on it (the `state: "unknown"` resubmit rule below is scoped to the other two arms). **Exception to "same for all three arms" below: this arm alone is bounded by a 20-minute wall-clock ceiling** (matching `skills/unblock/SKILL.md` and `skills/unblock-low-risk/SKILL.md:177-189`) — past it, run the ancestry check under `state: "unknown"` below one final time and, if still not on main, stop and report rather than resubmitting or direct-merging.
 
 Whichever handle you poll, the cadence and state handling below are the same for all three arms:
@@ -124,7 +126,8 @@ The outcome arrives from either the submit call (terminal at submit time) or the
 
 **`done`** — Merge succeeded. Main has been advanced atomically.
 - Update the task: `set_task_status(id="<TASK_ID>", status="done", project_root="<PROJECT_ROOT>", done_provenance={"kind": "merged", "commit": "<merge-commit-sha>"})`
-  - Use `{"kind": "merged", "commit": "<sha>"}` when this branch's merge commit landed on main (the normal case — the merge tool's return value has the merge SHA). The server backstops with `git merge-base --is-ancestor <sha> main`.
+  - Use `{"kind": "merged", "commit": "<sha>"}` when this branch's merge commit landed on main (the normal case). The server backstops with `git merge-base --is-ancestor <sha> main`.
+  - **Where the SHA comes from depends on which call produced the `done`.** A terminal-at-submit-time `merge_request` response carries the merge SHA in `commit`. A *polled* `done` does not, unless the response carries `merge_sha` (the git-authority tier's `kind: "found_on_main"` shape) — the durable retention-ring/event-store tiers return only `state`/`request_id`/`generation`/`outcome`/`finished_at` (`escalation/server.py:2404-2420`), and `outcome` is the raw state string `"done"`, not a commit hash. So: if the response has `commit` or `merge_sha`, use it; otherwise — including on the `poll_by == "branch"` arm, where a durable record can resolve `done` with no `merge_sha` — re-derive the merge commit with `git log main --oneline | head -5`. Never fabricate a SHA; if none is recoverable, fall back to `{"kind": "found_on_main", "commit": "<landing sha>", "note": "<explanation>"}` only with a SHA you actually verified is on main.
   - Use `{"kind": "found_on_main", "commit": "<landing sha>", "note": "<one-sentence explanation>"}` when the implementation is already on main from a sibling task / prior orchestrator run; the server runs the same git merge-base --is-ancestor backstop as for kind="merged".
 - Clean up worktree and branch:
   ```bash
@@ -214,7 +217,8 @@ After a successful direct merge:
 | Orchestrator running | Submit via `merge_request(wait_secs=100, verified_green=...)` — `True` only when verification actually passed, `False` otherwise — then poll `merge_status` |
 | Orchestrator not running | Direct `git merge --no-ff` |
 | Submit returns `queued` or `attached` | Durable intent confirmed; poll the handle `poll_by` names (`request_id` for `queued` and the `poll_by=="request_id"` arm; `task_id`/`branch` when `attached` discloses them) with 15 s→60 s backoff |
-| `merge_status` returns `state: "unknown"` | Check `git merge-base --is-ancestor task/<TASK_ID> main` (exit 0 → done/found_on_main; exit 1 + healthy queue → resubmit). Never direct-merge in response to `unknown`. |
+| `merge_status` returns `state: "unknown"` | `request_id`/`task_id` arms: check `git merge-base --is-ancestor task/<TASK_ID> main` (exit 0 → done/found_on_main; exit 1 + healthy queue → resubmit). `poll_by == "branch"` arm: `unknown` is that arm's live state — keep polling to the 20-min ceiling, then stop and report, never resubmit. Never direct-merge in response to `unknown`. |
+| Terminal state arrived on the `poll_by == "branch"` arm | Unconfirmed — a branch-keyed poll can match a *prior* round's record on the same reused branch. Accept `done` only when `git merge-base --is-ancestor task/<TASK_ID> main` exits 0; re-check `get_merge_queue()` before acting on a `conflict`/`blocked`/`abandoned`. |
 | Outcome `conflict` | Fix in worktree, resubmit |
 | Outcome `blocked` | Read reason, fix, resubmit |
 | Outcome `done` or `already_merged` | Update task status, clean up |
