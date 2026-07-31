@@ -128,6 +128,67 @@ async def test_await_trap_installed_returns_once_shell_armed():
             await proc.wait()
 
 
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_await_trap_installed_fails_loudly_when_readiness_never_arrives():
+    """_await_trap_installed never silently returns and never lets a bare
+    TimeoutError escape when the readiness precondition is unmet — it must
+    raise a diagnostic AssertionError instead.  This pins the
+    no-silent-fail-soft contract so a future starvation can't quietly
+    regress this helper back into the racy "signal anyway" behaviour this
+    task removes.
+
+    Two sub-cases:
+    (a) the shell never announces readiness — readline() blocks until the
+        bounded deadline.  Must raise AssertionError (NOT a bare
+        TimeoutError) naming the pid and the unmet "ready" precondition.
+    (b) the shell exits immediately without announcing — readline() hits
+        EOF (returns b'') right away, well inside the deadline, which a
+        naive implementation would treat as success.  Must raise
+        AssertionError whose message distinguishes EOF/early-exit from a
+        timeout.
+    """
+    # (a) Never announces.
+    proc = await asyncio.create_subprocess_shell(
+        'exec sleep 30',
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        with pytest.raises(AssertionError) as excinfo:
+            await _await_trap_installed(proc, timeout=0.3)
+        msg = str(excinfo.value)
+        assert 'ready' in msg and str(proc.pid) in msg, (
+            f'expected message to name the unmet "ready" precondition and '
+            f'pid {proc.pid}; got: {msg!r}'
+        )
+    finally:
+        _kill_group(proc.pid)
+        with contextlib.suppress(Exception):
+            await proc.wait()
+
+    # (b) Dies before announcing.
+    proc2 = await asyncio.create_subprocess_shell(
+        'true',
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        with pytest.raises(AssertionError) as excinfo2:
+            await _await_trap_installed(proc2, timeout=5.0)
+        msg2 = str(excinfo2.value)
+        assert any(word in msg2.lower() for word in ('eof', 'exited', 'closed')), (
+            f'expected message to distinguish EOF/early-exit from a plain '
+            f'timeout; got: {msg2!r}'
+        )
+    finally:
+        _kill_group(proc2.pid)
+        with contextlib.suppress(Exception):
+            await proc2.wait()
+
+
 class TestTerminateProcessGroup:
     """Unit/integration tests for terminate_process_group."""
 
