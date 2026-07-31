@@ -23,7 +23,7 @@ import contextlib
 import json
 import logging
 import os
-import tempfile
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +33,11 @@ logger = logging.getLogger(__name__)
 # Bounded by the number of distinct paths that go corrupt in a process lifetime.
 # A restart re-enables the warning (mirrors sqlite_task_backend._warned_malformed_task_ids:51).
 _warned_corrupt_paths: set[str] = set()
+
+# Retry bound for the exclusive temp-file create in _create_temp.  A uuid4
+# collision is astronomically unlikely; this exists so a pathological
+# environment fails loudly with an OSError rather than spinning forever.
+_TEMP_CREATE_ATTEMPTS = 10
 
 __all__ = ['atomic_write_text', 'load_json_or_warn']
 
@@ -133,6 +138,44 @@ def load_json_or_warn(
     return (parsed, True)
 
 
+def _create_temp(p: Path, mode: int | None) -> tuple[int, str]:
+    """Exclusively create a temp file next to *p*; return ``(fd, path_str)``.
+
+    The temp lives in ``p.parent`` — the same directory, hence the same
+    filesystem — so the ``os.replace`` that follows is atomic per rename(2).
+
+    ``O_CREAT | O_EXCL`` gives the two properties this helper is built on:
+
+    * **Uniqueness per writer.**  The name carries a ``uuid4``, and O_EXCL makes
+      the kernel reject a collision outright, so two concurrent writers to the
+      same destination can never share a temp.  This is what a fixed
+      ``<dest>.json.tmp`` name cannot provide, and it is the race the
+      consolidated sites had.
+    * **Umask semantics for free.**  Creating with 0o666 lets the kernel apply
+      the process umask exactly as ``open()``/``Path.write_text`` do, avoiding
+      the non-thread-safe ``os.umask(os.umask(0))`` read-back.  When *mode* is
+      an explicit int, an ``fchmod`` then sets it exactly — on the still-open
+      fd, so the bits are already correct at the instant ``os.replace`` makes
+      the file visible, leaving no window where a reader sees the wrong mode.
+    """
+    for _ in range(_TEMP_CREATE_ATTEMPTS):
+        tmp_str = str(p.parent / f'.{p.name}.{uuid.uuid4().hex}.tmp')
+        try:
+            fd = os.open(tmp_str, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
+        except FileExistsError:
+            continue  # uuid4 collision — astronomically unlikely; retry anyway
+        if mode is not None:
+            try:
+                os.fchmod(fd, mode)
+            except BaseException:
+                os.close(fd)
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp_str)
+                raise
+        return (fd, tmp_str)
+    raise OSError(f'could not create a unique temp file next to {p}')
+
+
 def atomic_write_text(
     path: str | os.PathLike[str],
     text: str,
@@ -153,12 +196,20 @@ def atomic_write_text(
     encoding:
         Text encoding for the write.  Defaults to ``'utf-8'``.
     mode:
-        Permission bits for the destination.  ``None`` (default) applies the
-        process umask exactly as ``open()``/``Path.write_text`` would.
+        Exact permission bits for the destination.  ``None`` (default) applies
+        the process umask exactly as ``open()``/``Path.write_text`` would.
+
+        This is explicit per call rather than a single hard-coded default
+        because the sites consolidated here disagree: the ``mkstemp``-based
+        ones produce 0600, the ``write_text``-based ones produce 0o666 & ~umask
+        (typically 0664).  Silently narrowing the latter to 0600 would be a
+        latent cross-uid breakage for the state files other processes read.
     fsync:
         Reserved — see later steps.
     mkdir:
-        Reserved — see later steps.
+        When True, create ``path.parent`` (and any missing ancestors) before
+        writing.  Default False, so a missing parent surfaces as
+        ``FileNotFoundError`` rather than being silently conjured.
 
     Raises
     ------
@@ -168,9 +219,10 @@ def atomic_write_text(
     """
     p = Path(path)
 
-    # The temp lives in the destination's own directory so the rename stays on
-    # one filesystem — required for os.replace to be atomic per rename(2).
-    fd, tmp_str = tempfile.mkstemp(suffix='.tmp', prefix=p.name, dir=str(p.parent))
+    if mkdir:
+        p.parent.mkdir(parents=True, exist_ok=True)
+
+    fd, tmp_str = _create_temp(p, mode)
     try:
         with os.fdopen(fd, 'w', encoding=encoding) as f:
             f.write(text)
