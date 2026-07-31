@@ -20,17 +20,22 @@ merge-verify time.
 from __future__ import annotations
 
 import dataclasses
+import os
 import re
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from shared.cli_invoke import (
     AgentFailureKind,
     AgentResult,
+    AllAccountsCappedException,
     classify_agent_failure,
+    invoke_with_cap_retry,
     is_server_error_status,
     is_zero_output_timeout,
 )
+from shared.config_models import AccountConfig, UsageCapConfig
 from shared.invocation_outcome import (
     OK,
     AuthFailed,
@@ -43,6 +48,7 @@ from shared.invocation_outcome import (
     ZeroOutputWedge,
     classify_invocation,
 )
+from shared.usage_gate import AccountPhase, UsageGate
 
 # The 529 "Overloaded" body the provider returns during a server-side outage.
 OVERLOADED_BODY = (
@@ -373,3 +379,285 @@ class TestClassifyAgentFailureServerErrorPrecedence:
     def test_success_with_5xx_status_stays_success(self):
         result = AgentResult(success=True, output='done', api_error_status=529)
         assert classify_agent_failure(result).kind is AgentFailureKind.SUCCESS
+
+
+# ---------------------------------------------------------------------------
+# invoke_with_cap_retry drives (PRD boundary rows 9, 1 cap-retry half, 10).
+#
+# Every drive runs a REAL multi-account UsageGate (never a mock) with a
+# scripted fake invoke_fn, so "account NOT capped, no failover" is observed
+# through genuine AccountPhase transitions rather than asserted against a mock.
+# Replicated module-locally from test_model_not_found.py:153-206 per this
+# task's design decision (no cross-test-module import, no conftest.py edit).
+# ---------------------------------------------------------------------------
+
+
+def _make_gate(names: list[str]) -> UsageGate:
+    """Build a REAL, minimal multi-account UsageGate for the drives below.
+
+    Fake per-account env tokens so ``UsageGate._init_accounts`` resolves real
+    ``AccountState`` objects; ``gate._run_probe`` AsyncMock'd so no real
+    ``claude`` subprocess is ever spawned; ``_start_account_resume_probe`` /
+    ``_start_auth_reprobe`` neutralized (instance-level no-op ``MagicMock``s)
+    so entering CAPPED/AUTH_FAILED via ``_transition`` never schedules a real
+    background asyncio task — every transition stays synchronous and
+    deterministic, and ``before_invoke`` can never block waiting for a resume
+    probe that will never run.
+    """
+    acct_cfgs = []
+    env_vars: dict[str, str] = {}
+    for name in names:
+        env_key = f'TEST_TOKEN_{name.upper().replace("-", "_")}'
+        env_vars[env_key] = f'fake-token-{name}'
+        acct_cfgs.append(AccountConfig(name=name, oauth_token_env=env_key))
+
+    config = UsageCapConfig(accounts=acct_cfgs)
+    with patch.dict(os.environ, env_vars):
+        gate = UsageGate(config)
+
+    gate._run_probe = AsyncMock(return_value=True)
+    gate._start_account_resume_probe = MagicMock()
+    gate._start_auth_reprobe = MagicMock()
+    return gate
+
+
+class _CountingCli:
+    """Scripted ``invoke_fn`` that always returns the SAME ``AgentResult``,
+    counting its calls.
+
+    Deliberately tolerates being called more than once (rather than raising
+    once "exhausted"): under the CURRENT pre-fix implementation the heuristic
+    cap net misclassifies a fast zero-cost 529 as a cap hit and fails over
+    across the whole pool, and this test must OBSERVE that churn as a call
+    count rather than mask it behind a harness exception.
+    """
+
+    def __init__(self, result: AgentResult) -> None:
+        self._result = result
+        self.calls = 0
+
+    async def __call__(self, **kwargs: object) -> AgentResult:
+        self.calls += 1
+        return self._result
+
+
+class _ScriptedCli:
+    """Scripted ``invoke_fn`` returning each queued result in order, repeating
+    the last one once the script is exhausted (so a regressed loop shows up as
+    a call count, not a harness error)."""
+
+    def __init__(self, *results: AgentResult) -> None:
+        self._results = list(results)
+        self.calls = 0
+
+    async def __call__(self, **kwargs: object) -> AgentResult:
+        idx = min(self.calls, len(self._results) - 1)
+        self.calls += 1
+        return self._results[idx]
+
+
+class _SpyCostStore:
+    """Records ``save_invocation`` / ``save_account_event`` kwargs so the
+    drives can assert that NO ``cap_hit`` account event is written for a
+    server error (PRD decision 4: no account mutation)."""
+
+    def __init__(self) -> None:
+        self.invocations: list[dict] = []
+        self.account_events: list[dict] = []
+
+    async def save_invocation(self, **kwargs: object) -> None:
+        self.invocations.append(dict(kwargs))
+
+    async def save_account_event(self, **kwargs: object) -> None:
+        self.account_events.append(dict(kwargs))
+
+
+def _cap_hit_events(store: _SpyCostStore) -> list[dict]:
+    return [e for e in store.account_events if e.get('event_type') == 'cap_hit']
+
+
+@pytest.mark.asyncio
+class TestInvokeWithCapRetryServerError:
+    """PRD decision 4: a server error is NOT account-scoped — the 2026-07-29
+    incident data showed the FRESHEST account carrying the highest failure
+    rate, i.e. the provider was degraded, not any one account's quota.  So the
+    retry loop must neither fail over nor mutate account state on it; the
+    failed result goes back to the caller, which owns the transient requeue.
+    """
+
+    async def test_row9_fast_zero_cost_529_does_not_cap_or_failover(self):
+        """PRD boundary row 9. Currently RED: the heuristic cap net
+        (zero-cost / <=1 turn / <5s) marks a healthy acct-0 CAPPED and fails
+        over pointlessly."""
+        gate = _make_gate(['acct-0', 'acct-1'])
+        result = AgentResult(
+            success=False,
+            output=OVERLOADED_BODY,
+            api_error_status=529,
+            cost_usd=0.0,
+            turns=0,
+            duration_ms=1200,
+        )
+        cli = _CountingCli(result)
+        store = _SpyCostStore()
+
+        with patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock):
+            try:
+                returned = await invoke_with_cap_retry(
+                    gate, 'server-error[row9]',
+                    invoke_fn=cli,
+                    max_cap_retries=2,
+                    backend='claude',
+                    cost_store=store,  # type: ignore[arg-type]
+                    prompt='hi',
+                )
+            except AllAccountsCappedException as exc:
+                pytest.fail(
+                    f'invoke_with_cap_retry raised AllAccountsCappedException after '
+                    f'{cli.calls} call(s) for a server-side 529 — expected the result '
+                    f'returned directly with no cross-account failover: {exc}'
+                )
+
+        assert cli.calls == 1, (
+            f'expected exactly one invocation (no cross-account failover on a '
+            f'not-account-scoped server error), the retry loop made {cli.calls}'
+        )
+        assert returned is result
+        assert returned.success is False
+
+        for acct in gate._accounts:
+            assert acct.phase not in (AccountPhase.CAPPED, AccountPhase.AUTH_FAILED), (
+                f'expected no account mutated by a server error, got '
+                f'{acct.name}={acct.phase}'
+            )
+        assert _cap_hit_events(store) == [], (
+            f'a server error must not write a cap_hit account event, got '
+            f'{_cap_hit_events(store)}'
+        )
+
+    async def test_row1_timed_out_529_on_resume_is_terminal_no_fresh_retry(self):
+        """PRD boundary row 1 (cap-retry half). The ServerError branch exits the
+        loop, so the wedge guard's fresh-retry churn never happens — and the
+        orphaned provider session is still never re-resumed (decision 2's
+        intent, preserved by exiting rather than by widening the guard)."""
+        gate = _make_gate(['acct-0', 'acct-1'])
+        result = dataclasses.replace(_incident_result(), session_id='sess-wedged-529')
+        cli = _CountingCli(result)
+        store = _SpyCostStore()
+
+        with patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock):
+            try:
+                returned = await invoke_with_cap_retry(
+                    gate, 'server-error[row1]',
+                    invoke_fn=cli,
+                    max_cap_retries=2,
+                    backend='claude',
+                    cost_store=store,  # type: ignore[arg-type]
+                    prompt='hi',
+                    resume_session_id='sess-wedged-529',
+                )
+            except AllAccountsCappedException as exc:
+                pytest.fail(
+                    f'invoke_with_cap_retry raised AllAccountsCappedException after '
+                    f'{cli.calls} call(s) for a timed-out 529: {exc}'
+                )
+
+        assert cli.calls == 1, (
+            f'expected exactly one invocation (no fresh-retry churn), the retry '
+            f'loop made {cli.calls}'
+        )
+        assert returned is result
+
+        for acct in gate._accounts:
+            assert acct.phase not in (AccountPhase.CAPPED, AccountPhase.AUTH_FAILED), (
+                f'expected no account mutated by a timed-out server error, got '
+                f'{acct.name}={acct.phase}'
+            )
+        assert _cap_hit_events(store) == []
+
+
+@pytest.mark.asyncio
+class TestInvokeWithCapRetryNonServerErrorUnchanged:
+    """PRD boundary row 10 — the 'did not move' locks. These are GREEN both
+    before and after the fix; they exist so a regression in the cap/auth
+    failover paths is caught by this module rather than only by test_cap_retry.
+    """
+
+    async def test_429_cap_body_still_caps_and_fails_over(self):
+        gate = _make_gate(['acct-0', 'acct-1'])
+        capped = gate._accounts[0]
+        cap_result = AgentResult(
+            success=False,
+            output=CAP_BODY,
+            api_error_status=429,
+            cost_usd=0.01,  # blocks the heuristic net — exercise the real detector
+        )
+        ok_result = AgentResult(success=True, output='done', cost_usd=0.01)
+        cli = _ScriptedCli(cap_result, ok_result)
+
+        with patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock):
+            returned = await invoke_with_cap_retry(
+                gate, 'server-error[row10-cap]',
+                invoke_fn=cli,
+                backend='claude',
+                prompt='hi',
+            )
+
+        assert returned.success is True
+        assert cli.calls == 2, f'expected cap-then-failover (2 calls), got {cli.calls}'
+        assert capped.phase == AccountPhase.CAPPED
+
+    async def test_401_still_auth_fails_and_fails_over(self):
+        gate = _make_gate(['acct-0', 'acct-1'])
+        auth_acct = gate._accounts[0]
+        auth_result = AgentResult(
+            success=False,
+            output='Unauthorized',
+            api_error_status=401,
+            cost_usd=0.01,
+        )
+        ok_result = AgentResult(success=True, output='done', cost_usd=0.01)
+        cli = _ScriptedCli(auth_result, ok_result)
+
+        with patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock):
+            returned = await invoke_with_cap_retry(
+                gate, 'server-error[row10-auth]',
+                invoke_fn=cli,
+                backend='claude',
+                prompt='hi',
+            )
+
+        assert returned.success is True
+        assert cli.calls == 2, f'expected auth-then-failover (2 calls), got {cli.calls}'
+        assert auth_acct.phase == AccountPhase.AUTH_FAILED
+
+    async def test_non_5xx_zero_cost_instant_failure_still_trips_the_heuristic_net(self):
+        """Pins that the cap-net guard is NARROWED to ServerError, not a blanket
+        disable: a zero-cost instant 499 with no recognisable body still reaches
+        the heuristic net and caps the account exactly as it does today."""
+        gate = _make_gate(['acct-0', 'acct-1'])
+        capped = gate._accounts[0]
+        result = AgentResult(
+            success=False,
+            output='client closed request',
+            api_error_status=499,
+            cost_usd=0.0,
+            turns=0,
+            duration_ms=100,
+        )
+        ok_result = AgentResult(success=True, output='done', cost_usd=0.01)
+        cli = _ScriptedCli(result, ok_result)
+
+        with patch('shared.cli_invoke.asyncio.sleep', new_callable=AsyncMock):
+            returned = await invoke_with_cap_retry(
+                gate, 'server-error[non-5xx-net]',
+                invoke_fn=cli,
+                backend='claude',
+                prompt='hi',
+            )
+
+        assert returned.success is True
+        assert capped.phase == AccountPhase.CAPPED, (
+            'the heuristic cap net must still fire for a non-5xx zero-cost '
+            'instant failure'
+        )
