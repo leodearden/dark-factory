@@ -1544,6 +1544,63 @@ class TaskInterceptor:
         return TaskInterceptor._extract_meta_files_from_meta(meta)
 
     @staticmethod
+    def _extract_deliverable_signals_from_meta(meta: dict) -> list[str]:
+        """Extract the UNION of declared deliverable signals from *meta*.
+
+        Reads ``files``, ``files_to_modify`` and ``modules`` in that order,
+        coercing a scalar string to a one-element list, ``str()``-coercing
+        each entry, dropping falsy ones, and deduplicating while preserving
+        first-occurrence order.
+
+        SEPARATE HELPER, NOT A WIDENING of
+        :meth:`_extract_meta_files_from_meta` — deliberately (task 3106).
+        That helper feeds the FILES-CERTAIN hard reject
+        (:func:`check_files_for_scope`) and the cross-repo tagger
+        (:func:`all_files_foreign_owner`), where its ``files``-over-
+        ``files_to_modify`` PRECEDENCE is correct because those callers need
+        ONE authoritative declared file list, and where admitting ``modules``
+        would mean a foreign lock-key entry starts hard-REJECTING
+        submissions — a behaviour change well outside this task.
+
+        Attribution wants the opposite bias: MAXIMUM positive evidence that
+        the filer declared local work, so the union is right here.  The
+        widening is provably safe in one direction only — this list feeds
+        ONLY :meth:`_local_deliverable_attested`, consulted solely after
+        ``check_files_for_scope`` already returned ``ok``, so a wider signal
+        set can only ever suppress an ADVISORY, never weaken a REJECTION.
+        """
+        out: list[str] = []
+        seen: set[str] = set()
+        for key in ('files', 'files_to_modify', 'modules'):
+            values = meta.get(key) or []
+            if isinstance(values, str):
+                values = [values]
+            for value in values:
+                if not value:
+                    continue
+                entry = str(value)
+                if entry in seen:
+                    continue
+                seen.add(entry)
+                out.append(entry)
+        return out
+
+    @staticmethod
+    def _extract_deliverable_signals(kwargs: dict[str, Any]) -> list[str]:
+        """Extract declared deliverable signals from add_task kwargs.
+
+        Thin wrapper around :meth:`_extract_deliverable_signals_from_meta`
+        that handles the ``kwargs → meta`` parsing step via
+        :meth:`_parse_metadata` — the SAME parsing path
+        :meth:`_extract_meta_files` uses, so JSON-string metadata is
+        normalised identically with no new parsing branch.  Only the
+        key-selection policy differs (union of three keys vs. precedence
+        over two); see that method's docstring for why.
+        """
+        meta = TaskInterceptor._parse_metadata(kwargs)
+        return TaskInterceptor._extract_deliverable_signals_from_meta(meta)
+
+    @staticmethod
     def _build_candidate(kwargs: dict[str, Any]) -> CandidateTask | None:
         """Extract a CandidateTask from add_task kwargs.
 
