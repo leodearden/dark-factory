@@ -7716,10 +7716,13 @@ class TestPathGuardOrSkipProseAdvisory:
 
         interceptor._scope_violation_escalator = SpyEscalator()
 
+        # Task 3120: the multi-segment spelling is deliberate — this test
+        # exercises the ADVISORY flag passed to the escalator, not the
+        # single-bare-segment lexer shape.
         result = await interceptor._path_guard_or_skip(
             {
-                'title': 'Investigate fused-memory/harness deadlock',
-                'description': 'See fused-memory/ for context',
+                'title': 'Investigate fused-memory/src/harness.py deadlock',
+                'description': 'See fused-memory/src/ for context',
             },
             str(tmp_path / 'reify'),
             'reify',
@@ -8189,9 +8192,12 @@ class TestPathGuardEscalationWordingEndToEnd:
         interceptor._prefix_registry = self._registry(tmp_path)
         interceptor._scope_violation_escalator = ScopeViolationEscalator()
 
+        # Task 3120: the multi-segment spelling is deliberate — this test
+        # exercises the persisted advisory WORDING, not the
+        # single-bare-segment lexer shape.
         kwargs: dict[str, Any] = {
-            'title': 'Investigate fused-memory/harness deadlock',
-            'description': 'See fused-memory/ for context',
+            'title': 'Investigate fused-memory/src/harness.py deadlock',
+            'description': 'See fused-memory/src/ for context',
         }
         result = await interceptor._path_guard_or_skip(
             kwargs,
