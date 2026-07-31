@@ -68,3 +68,52 @@ class TestGateSurface:
         stats = _stats()
         with pytest.raises(dataclasses.FrozenInstanceError):
             stats.failures = 99  # type: ignore[misc]
+
+
+class TestConstructorValidation:
+    """step-7: threshold misconfiguration fails loud at construction.
+
+    A gate built with `min_failures=0` or `failure_rate_threshold=0` would be
+    permanently tripped and would throttle the entire fleet with no signal —
+    the exact silent degradation the loud-over-silent norm forbids.
+    """
+
+    @pytest.mark.parametrize(
+        ('kwargs', 'param'),
+        [
+            ({'window_secs': 0.0}, 'window_secs'),
+            ({'window_secs': -1.0}, 'window_secs'),
+            ({'min_failures': 0}, 'min_failures'),
+            ({'min_failures': -1}, 'min_failures'),
+            ({'min_distinct_tasks': 0}, 'min_distinct_tasks'),
+            ({'min_distinct_tasks': -1}, 'min_distinct_tasks'),
+            ({'failure_rate_threshold': 0.0}, 'failure_rate_threshold'),
+            ({'failure_rate_threshold': -0.1}, 'failure_rate_threshold'),
+            ({'failure_rate_threshold': 1.01}, 'failure_rate_threshold'),
+            ({'close_after_successes': 0}, 'close_after_successes'),
+            ({'close_after_successes': -1}, 'close_after_successes'),
+        ],
+    )
+    def test_rejects_out_of_range_threshold(self, kwargs: dict, param: str) -> None:
+        """The message names the offending parameter — an operator must not have to guess."""
+        with pytest.raises(ValueError, match=param):
+            ApiHealthGate(**kwargs)
+
+    def test_error_message_reports_received_value(self) -> None:
+        with pytest.raises(ValueError, match='-1'):
+            ApiHealthGate(min_failures=-1)
+
+    @pytest.mark.parametrize(
+        'kwargs',
+        [
+            {'failure_rate_threshold': 1.0},
+            {'min_failures': 1},
+            {'min_distinct_tasks': 1},
+            {'close_after_successes': 1},
+            {'window_secs': 0.001},
+        ],
+    )
+    def test_boundary_valid_values_construct(self, kwargs: dict) -> None:
+        """A 100%-failure-rate or single-failure gate is strict, not invalid."""
+        gate = ApiHealthGate(**kwargs)
+        assert isinstance(gate.state(), Closed)
