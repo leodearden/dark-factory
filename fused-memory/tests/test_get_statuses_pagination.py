@@ -249,7 +249,7 @@ async def test_get_statuses_pagination_validation_and_backward_compat(
 
 @pytest.mark.asyncio
 async def test_get_statuses_auto_paginates_oversized_full_population(paging_server):
-    """An un-paginated full-population call DEGRADES to a first page.
+    """An OPT-IN oversized full-population call DEGRADES to a first page.
 
     This is the defect: on reify (5,603 / 5,680 / 5,845 tasks) the full map
     exceeded the MCP tool-response transport limit and the call failed CLOSED —
@@ -260,6 +260,15 @@ async def test_get_statuses_auto_paginates_oversized_full_population(paging_serv
     marker (``auto_paginated: True``, ``has_more: True``), never silent
     truncation that would look like a complete census.
 
+    The degradation is OPT-IN (``auto_paginate=True``) rather than automatic.
+    Passing the flag IS the caller's assertion that it inspects
+    ``pagination['has_more']`` and will page to completion.  Callers that cannot
+    see a ``pagination`` marker must keep the complete map they have always
+    received — see
+    test_full_population_census_complete_for_programmatic_callers for the two
+    live consumers that depend on that, and why truncating them by default
+    would be a correctness regression rather than a fix.
+
     Asserted against the real ``_STATUSES_AUTO_PAGE_LIMIT`` constant, never a
     hard-coded magic number, so the test tracks the implementation's own bound.
     """
@@ -269,7 +278,7 @@ async def test_get_statuses_auto_paginates_oversized_full_population(paging_serv
 
     result = await paging_server._tool_manager.call_tool(
         'get_statuses',
-        {'project_root': '/project'},
+        {'project_root': '/project', 'auto_paginate': True},
     )
 
     # (a) Non-empty (the fail-closed regression) and not the whole population.
@@ -354,6 +363,95 @@ async def test_get_statuses_ids_path_not_auto_capped_but_paginable(
         f'ids must reach the interceptor unchanged, got: {forwarded["ids"]!r}'
     )
 
+    # (d) The two gates are INDEPENDENT: opting into auto-pagination must not be
+    # a back-door that caps the caller-bounded ids path.  ``auto_paginate=True``
+    # says "I can handle a page if you must truncate the unbounded
+    # enumeration" — it does not license dropping ids the caller explicitly
+    # named and is depending on an answer for.
+    result3 = await paging_server._tool_manager.call_tool(
+        'get_statuses',
+        {'project_root': '/project', 'ids': all_ids, 'auto_paginate': True},
+    )
+    assert 'pagination' not in result3, (
+        f'auto_paginate must not cap the ids path, got: {result3.get("pagination")}'
+    )
+    assert len(result3['statuses']) == LIMIT + 5, (
+        f'ids path must stay complete under auto_paginate=True, got '
+        f'{len(result3["statuses"])} of {LIMIT + 5}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_full_population_census_complete_for_programmatic_callers(paging_server):
+    """A >LIMIT population still yields a COMPLETE census by default.
+
+    Auto-pagination is opt-in precisely because of the two live out-of-process
+    programmatic consumers below.  Both call this MCP tool over plain HTTP with
+    ``{'project_root': ...}`` and nothing else, both read ONLY the ``statuses``
+    key, and neither can see a ``pagination`` marker.  Neither crosses the
+    token-limited LLM tool-response channel that produced the original
+    incident, so truncating them buys nothing and costs correctness.
+
+    Invariant pinned here: **never make truncation the default for a caller that
+    did not ask for it.**
+
+    The argument shape asserted against is the exact one those consumers send —
+    if a future change makes the auto branch fire without ``auto_paginate``,
+    this test fails before the damage below can ship.
+    """
+    from fused_memory.server.tools import _STATUSES_AUTO_PAGE_LIMIT as LIMIT
+
+    population = _set_population(_make_statuses(LIMIT + 500))
+
+    # The EXACT argument shape both programmatic consumers send: project_root
+    # only — no ids, no page_size, no auto_paginate.
+    result = await paging_server._tool_manager.call_tool(
+        'get_statuses',
+        {'project_root': '/project'},
+    )
+
+    # (a) The COMPLETE population, not a first page.
+    assert len(result['statuses']) == LIMIT + 500, (
+        f'Default (non-opted-in) call must return the complete census, got '
+        f'{len(result["statuses"])} of {LIMIT + 500} — silent truncation'
+    )
+
+    # (b) The response shape stays byte-identical to what these callers have
+    # always received: a single-keyed envelope with no pagination marker.
+    assert set(result.keys()) == {'statuses'}, (
+        f'Expected a bare {{\'statuses\'}} envelope, got keys: {sorted(result.keys())}'
+    )
+
+    # (c) Simulate Scheduler.get_statuses (orchestrator/src/orchestrator/
+    # scheduler.py:2523 → parse_tool_result(result, 'statuses', dict) at :2545,
+    # dispatched with NO ids from harness.py 2106/2111/2214/2326/3568/3738/4330).
+    # It extracts the 'statuses' key alone and treats it as a COMPLETE census.
+    #
+    # Concrete damage a truncated page would cause: harness.py:3636 reads
+    # `elif bare_id not in live:` as "task deleted" and calls
+    # detach_lane_checkout (harness.py:3643) — it would detach the lane
+    # checkouts of LIVE tasks.  The fail-safe does NOT cover this: the
+    # `degraded` guard at harness.py:3569 is resolver_failed(statuses, err),
+    # and a truncated page is non-empty with err is None, so degraded is False
+    # and the guard never fires.
+    scheduler_view = result['statuses']
+    missing = set(population) - set(scheduler_view)
+    assert missing == set(), (
+        f'{len(missing)} live task ids absent from the scheduler view — '
+        f'harness.py:3636 would misread these as deleted and detach their lane '
+        f'checkouts (sample: {sorted(missing, key=int)[:5]})'
+    )
+
+    # (d) Simulate dashboard.data.tasks.fetch_statuses (dashboard/src/dashboard/
+    # data/tasks.py:220, which rebuilds {int(id): status} at :239-244 and also
+    # ignores 'pagination').  A truncated map permanently under-counts every
+    # burndown snapshot.
+    dashboard_view = {int(k): v for k, v in result.get('statuses', {}).items()}
+    assert len(dashboard_view) == len(population), (
+        f'Burndown under-count: dashboard view has {len(dashboard_view)} of '
+        f'{len(population)} tasks'
+    )
+
 
 @pytest.mark.asyncio
 async def test_auto_page_limit_fits_documented_safe_envelope(paging_server):
@@ -384,7 +482,7 @@ async def test_auto_page_limit_fits_documented_safe_envelope(paging_server):
 
     result = await paging_server._tool_manager.call_tool(
         'get_statuses',
-        {'project_root': '/project'},
+        {'project_root': '/project', 'auto_paginate': True},
     )
     # Precondition: this really is a full auto-page, not a short one.
     assert result['pagination']['auto_paginated'] is True
