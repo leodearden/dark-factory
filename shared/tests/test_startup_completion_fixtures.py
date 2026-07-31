@@ -14,6 +14,7 @@ summarise and for the named predicate they pin.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -183,3 +184,105 @@ class TestCorpusSecretHygiene:
             if Path(entry['relpath']).name in scf.CREDENTIAL_FILENAMES
         ]
         assert observed, 'no committed row observed a .credentials.json entry'
+
+
+def _corpus_rows():
+    return scf.load_startup_completion_corpus()
+
+
+def _row_ids():
+    return [row['id'] for row in _corpus_rows()]
+
+
+class TestMaterialization:
+    """Rows rebuild into a real filesystem 3326's predicate can be pointed at.
+
+    This is the exact entry point 3326's tests call, so it is asserted HERE
+    rather than left to the consumer.  A corpus of recorded verdicts alone would
+    let a downstream test pass against a predicate that never touches the
+    filesystem — defeating the point of validating substrate.
+    """
+
+    @pytest.mark.parametrize('row', _corpus_rows(), ids=_row_ids())
+    def test_every_tree_entry_is_materialized_with_its_kind(self, row, tmp_path):
+        config_dir, session_id = scf.materialize_config_dir(row, tmp_path)
+
+        assert isinstance(config_dir, Path)
+        assert session_id == row['session_id']
+        assert config_dir.exists()
+
+        for entry in row['config_dir_tree']:
+            if entry['kind'] == 'vanished':
+                continue
+            path = config_dir / entry['relpath']
+            if entry['kind'] == 'symlink':
+                assert path.is_symlink(), f'{row["id"]}: {entry["relpath"]} not a symlink'
+            elif entry['kind'] == 'dir':
+                assert path.is_dir(), f'{row["id"]}: {entry["relpath"]} not a dir'
+            else:
+                assert path.is_file(), f'{row["id"]}: {entry["relpath"]} not a file'
+
+    @pytest.mark.parametrize('row', _corpus_rows(), ids=_row_ids())
+    def test_transcript_presence_matches_the_row(self, row, tmp_path):
+        config_dir, session_id = scf.materialize_config_dir(row, tmp_path)
+        resolved = sorted(config_dir.glob(f'projects/*/{session_id}.jsonl'))
+
+        if row['transcript_relpath'] is None:
+            # The build/uv wedges never reached session init, so nothing may
+            # resolve — this is what makes read_transcript_records return None.
+            assert not resolved, (
+                f'{row["id"]}: no transcript should resolve, found {resolved}'
+            )
+            return
+
+        assert (config_dir / row['transcript_relpath']).is_file()
+        assert resolved, f'{row["id"]}: the projects/*/<sid>.jsonl glob must resolve'
+
+    @pytest.mark.parametrize('row', _corpus_rows(), ids=_row_ids())
+    def test_materialized_record_types_match_in_order(self, row, tmp_path):
+        if row['transcript_relpath'] is None or row.get('transcript_raw_lines'):
+            pytest.skip('no parseable transcript for this row')
+        config_dir, _session_id = scf.materialize_config_dir(row, tmp_path)
+
+        written = []
+        for line in (config_dir / row['transcript_relpath']).read_text().splitlines():
+            if line.strip():
+                written.append(json.loads(line))
+
+        assert [r.get('type') for r in written] == [
+            r.get('type') for r in row['transcript_records']
+        ], f'{row["id"]}: materialized record type sequence differs from the row'
+
+    @pytest.mark.parametrize('row', _corpus_rows(), ids=_row_ids())
+    def test_snapshot_round_trips_the_tree(self, row, tmp_path):
+        # snapshot_config_dir is the SAME sampler the probe used, so a round trip
+        # proves probe output and materialized trees are describable by one
+        # function — if they diverged, 3326 would be testing against a shape the
+        # watchdog never actually sees.
+        config_dir, _session_id = scf.materialize_config_dir(row, tmp_path)
+        observed = scf.snapshot_config_dir(config_dir)
+
+        expected_paths = [
+            e['relpath'] for e in row['config_dir_tree'] if e['kind'] != 'vanished'
+        ]
+        observed_paths = [e['relpath'] for e in observed]
+        assert observed_paths == sorted(expected_paths), (
+            f'{row["id"]}: round-tripped tree differs from the recorded tree'
+        )
+        observed_kinds = {e['relpath']: e['kind'] for e in observed}
+        for entry in row['config_dir_tree']:
+            if entry['kind'] == 'vanished':
+                continue
+            assert observed_kinds[entry['relpath']] == entry['kind'], (
+                f'{row["id"]}: {entry["relpath"]} round-tripped as '
+                f'{observed_kinds[entry["relpath"]]!r}, recorded {entry["kind"]!r}'
+            )
+
+    def test_materialize_is_isolated_per_destination(self, tmp_path):
+        # 3326 materializes many rows into one tmp_path-derived tree; two rows
+        # must not collide.
+        rows = _corpus_rows()
+        first, _ = scf.materialize_config_dir(rows[0], tmp_path / 'a')
+        second, _ = scf.materialize_config_dir(rows[-1], tmp_path / 'b')
+        assert first != second
+        assert first.exists() and second.exists()
