@@ -34,7 +34,8 @@ whack-a-mole commit history (10× cap-message fixes, 4× probe-slot-leak fixes).
 - The steward inherits the zero-output wedge guard, auth routing, and marker exclusions
   it silently lacks today (a wedged steward is no longer re-resumed forever).
 - Probe credentials no longer race a single shared `/tmp/claude-config-usage-gate-probe/
-  .credentials.json` across the fleet.
+  .credentials.json` across the fleet. *(Follow-up: that per-(account,pid) naming traded
+  the race for an unbounded `/tmp` population — see the note on finding 6 in §3.)*
 
 ## 2. Background
 
@@ -92,6 +93,20 @@ Six mechanisms, one seam:
 6. **Probe-dir isolation (F5 cheap-now half)** — `TaskConfigDir(f'usage-gate-probe-
    {acct.name}-{os.getpid()}')` so concurrent probes stop racing one shared
    `.credentials.json`; plus a regression test pinning env-token precedence.
+
+   **Completed trade (task 3086).** Making the dir per-(account, pid) fixed the race
+   but made the population unbounded: nothing reclaimed a dir once its owner was
+   SIGKILLed (the fleet restarts every unit ~8-hourly), and `orchestrator/evals/
+   runner.py` and `fused_memory/reconciliation/harness.py` construct a gate without
+   ever calling `shutdown()`. Measured on the reify host 2026-07-27: **433,384 dirs /
+   ~1.3M inodes, 77% of top-level `/tmp`**. Task 3086 bounds it at
+   (live processes × accounts) from both ends — `shared.config_dir.sweep_stale_pid_dirs`
+   reclaims dead-PID leftovers at gate construction (the half that survives SIGKILL,
+   which no teardown hook does), and `TaskConfigDir(cleanup_at_exit=True)` covers clean
+   exits including the two constructors above. Deletion is gated on a parseable trailing
+   `-<pid>` **and** a dead PID **and** a 300s mtime floor, scoped strictly to the
+   `claude-config-usage-gate-probe-` prefix, and assumes a shared PID namespace (true
+   under the `landlock` backend; a future container backend must revisit it).
 
 Plus one lifecycle invariant surfaced in `cross_system_notes`:
 **`UsageGate.shutdown()` refuses to spawn new probe tasks once shutting down** (enforced

@@ -14,9 +14,10 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from test_config_dir import PROBE_PREFIX, find_dead_pid, plant
 
 from shared.cli_invoke import AgentResult
-from shared.config_dir import TaskConfigDir
+from shared.config_dir import CONFIG_DIR_PREFIX, TaskConfigDir
 from shared.config_models import AccountConfig, UsageCapConfig
 from shared.invocation_outcome import CapHit, NearCap, classify_invocation
 from shared.usage_gate import (
@@ -71,6 +72,36 @@ def make_mock_cost_store() -> AsyncMock:
     store = AsyncMock()
     store.save_account_event = AsyncMock(return_value=None)
     return store
+
+
+@pytest.fixture
+def real_probe_dir_sweep():
+    """Opt out of the module-wide sweep neutralizer below (task 3086).
+
+    Request this from any test that must exercise the real sweep. Such a test
+    is responsible for redirecting the sweep away from the real /tmp — e.g.
+    ``patch('shared.config_dir.tempfile.gettempdir', return_value=str(tmp_path))``.
+    """
+    return True
+
+
+@pytest.fixture(autouse=True)
+def _keep_gates_off_the_real_tmp(request):
+    """Neutralize the probe-dir sweep for every gate built in this module.
+
+    ``UsageGate.__init__`` sweeps ``tempfile.gettempdir()`` (task 3086), so
+    the first real gate constructed in a pytest process would scandir the
+    developer's actual /tmp and delete real dead-PID probe dirs — a
+    multi-second stall inside a unit test, and a mutation no test asked for.
+    Defaulting it off also removes the ordering coupling that the process-wide
+    ``_probe_dir_sweep_done`` guard would otherwise create between test
+    classes. Tests that want the real thing request ``real_probe_dir_sweep``.
+    """
+    if 'real_probe_dir_sweep' in request.fixturenames:
+        yield
+        return
+    with patch('shared.usage_gate.sweep_stale_pid_dirs', return_value=0):
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -789,6 +820,198 @@ class TestProbeConfigDirIsolation:
 
         mocks['work'].cleanup.assert_called_once()
         mocks['personal'].cleanup.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Probe-dir leak sweep (task 3086). The per-(account, pid) naming above fixed
+# the credential race but traded it for an unbounded /tmp population: nothing
+# reclaimed a dir once its owner was SIGKILLed, and the evals runner and the
+# recon harness never call shutdown() at all. 433,384 dirs / ~1.3M inodes were
+# measured on the reify host on 2026-07-27. A dead-PID sweep at gate
+# construction is the bound that survives SIGKILL.
+# ---------------------------------------------------------------------------
+
+# The prefix and the dead-PID / dir-planting helpers are defined once, in the
+# suite that owns the sweep primitive itself. Two copies would let the two
+# suites drift apart about what "stale" means — e.g. one picking up an aging
+# tweak when min_age_secs changes and the other not. Cross-test-module imports
+# are the established pattern here (shared/tests is on sys.path via conftest).
+PROBE_DIR_PREFIX = PROBE_PREFIX
+
+
+class TestProbeConfigDirLeakSweep:
+    """Stale probe-dir reclamation wired into UsageGate (task 3086)."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_sweep_guard(self, monkeypatch):
+        """Start every case as if this were a fresh process."""
+        monkeypatch.setattr('shared.usage_gate._probe_dir_sweep_done', False)
+
+    def test_gate_construction_sweeps_stale_probe_dirs(self):
+        with patch('shared.usage_gate.sweep_stale_pid_dirs', return_value=0) as sweep:
+            make_gate(['work'])
+
+        sweep.assert_called_once()
+
+    def test_sweep_prefix_covers_both_leaked_dir_shapes(self):
+        """The prefix must be the shared stem of both naming shapes.
+
+        Built from CONFIG_DIR_PREFIX rather than hard-coded, so it cannot
+        drift from the construction template.
+        """
+        with patch('shared.usage_gate.sweep_stale_pid_dirs', return_value=0) as sweep:
+            make_gate(['work'])
+
+        prefix = sweep.call_args.args[0]
+        assert prefix == PROBE_DIR_PREFIX
+        # Both shapes the gate actually creates start with it: the
+        # per-account dir and the no-accounts alias.
+        pid = os.getpid()
+        assert f'{CONFIG_DIR_PREFIX}usage-gate-probe-work-{pid}'.startswith(prefix)
+        assert f'{CONFIG_DIR_PREFIX}usage-gate-probe-{pid}'.startswith(prefix)
+
+    def test_sweep_runs_at_most_once_per_process(self):
+        """A make_gate-heavy run or an evals loop must not re-scan /tmp.
+
+        The pathological /tmp this bounds has a 40 MB directory inode, so a
+        per-gate readdir would be a real startup cost.
+        """
+        with patch('shared.usage_gate.sweep_stale_pid_dirs', return_value=0) as sweep:
+            make_gate(['work'])
+            make_gate(['personal'])
+            make_gate(['work', 'personal'])
+
+        sweep.assert_called_once()
+
+    def test_sweep_failure_cannot_break_gate_construction(self, caplog):
+        """Tmp hygiene must never be able to fail orchestrator startup."""
+        with caplog.at_level(logging.WARNING, logger='shared.usage_gate'), \
+                patch('shared.usage_gate.sweep_stale_pid_dirs', side_effect=OSError('boom')):
+            gate = make_gate(['work'])
+
+        assert gate._accounts
+        assert gate._probe_config_dirs['work'].path.exists()
+        assert any(r.levelno >= logging.WARNING for r in caplog.records)
+
+    def test_non_oserror_sweep_failure_cannot_break_gate_construction(self, caplog):
+        """The realistic escapee is NOT an OSError.
+
+        sweep_stale_pid_dirs already contains OSError internally, so anything
+        that actually reaches UsageGate's guard is an unforeseen failure — a
+        future bug, a pathological tree, a mocked side effect in a sibling
+        suite. Letting one escape would fail orchestrator and recon-harness
+        startup, which is strictly worse than a leaked /tmp dir.
+        """
+        with caplog.at_level(logging.WARNING, logger='shared.usage_gate'), \
+                patch('shared.usage_gate.sweep_stale_pid_dirs',
+                      side_effect=RuntimeError('unforeseen')):
+            gate = make_gate(['work'])
+
+        assert gate._accounts
+        assert gate._probe_config_dirs['work'].path.exists()
+        assert any(r.levelno >= logging.WARNING for r in caplog.records)
+
+    def test_guard_is_set_even_when_the_sweep_raises(self):
+        """A raising sweep must not re-run on every subsequent gate."""
+        with patch('shared.usage_gate.sweep_stale_pid_dirs',
+                   side_effect=OSError('boom')) as sweep:
+            make_gate(['work'])
+            make_gate(['personal'])
+
+        sweep.assert_called_once()
+
+    # -- clean-exit half: both construction sites opt into atexit teardown --
+
+    def test_every_per_account_probe_dir_opts_into_atexit_cleanup(self):
+        """The per-account dict comprehension must pass cleanup_at_exit."""
+        with patch('shared.usage_gate.sweep_stale_pid_dirs', return_value=0), \
+                patch('shared.usage_gate.TaskConfigDir') as ctor:
+            make_gate(['work', 'personal'])
+
+        assert ctor.call_count == 2
+        for call in ctor.call_args_list:
+            assert call.kwargs.get('cleanup_at_exit') is True
+
+    def test_no_accounts_alias_probe_dir_opts_into_atexit_cleanup(self):
+        """The `or TaskConfigDir(...)` fallback leaks too — cover it.
+
+        With no configured accounts and no default credential, _init_accounts
+        returns [], so the dict comprehension creates nothing and the
+        no-accounts alias branch is the only construction site.
+        """
+        config = UsageCapConfig(accounts=[])
+
+        with patch('shared.usage_gate.sweep_stale_pid_dirs', return_value=0), \
+                patch('shared.usage_gate._read_oauth_token', return_value=None), \
+                patch('shared.usage_gate.TaskConfigDir') as ctor:
+            gate = UsageGate(config)
+
+        assert not gate._accounts
+        assert ctor.call_count == 1
+        assert ctor.call_args.args[0] == f'usage-gate-probe-{os.getpid()}'
+        assert ctor.call_args.kwargs.get('cleanup_at_exit') is True
+
+    def test_atexit_optin_does_not_perturb_the_per_account_dir_naming(self):
+        """The isolation fix (task 2139) must survive the new kwarg.
+
+        Re-asserts the exact contract pinned by
+        TestProbeConfigDirIsolation::test_config_dir_name_contains_account_name_and_pid
+        against a real, unpatched gate.
+        """
+        with patch('shared.usage_gate.sweep_stale_pid_dirs', return_value=0):
+            gate = make_gate(['work', 'personal'])
+
+        pid = os.getpid()
+        for acct in gate._accounts:
+            config_dir = gate._config_dir_for(acct)
+            assert config_dir.path.name == f'{PROBE_DIR_PREFIX}{acct.name}-{pid}'
+            assert config_dir.path.exists()
+
+    # -- end to end: the plateau cannot rebuild --
+
+    def test_gate_construction_reclaims_real_ghost_dirs(
+        self, tmp_path, caplog, real_probe_dir_sweep,
+    ):
+        """The whole fix, exercised against a real (redirected) tmp dir.
+
+        Requests `real_probe_dir_sweep` to opt out of the module-wide
+        neutralizer. Patching shared.config_dir.tempfile.gettempdir then
+        redirects BOTH TaskConfigDir and the sweep's default base to tmp_path,
+        so this never touches the real /tmp.
+        """
+        dead = find_dead_pid()
+        ghosts = [
+            plant(tmp_path, f'{PROBE_DIR_PREFIX}ghost-{dead}'),
+            plant(tmp_path, f'{PROBE_DIR_PREFIX}{dead}'),
+        ]
+        live_sibling = plant(tmp_path, f'{PROBE_DIR_PREFIX}alive-{os.getpid()}')
+        unrelated = plant(tmp_path, f'{CONFIG_DIR_PREFIX}3086')
+
+        with caplog.at_level(logging.INFO, logger='shared.usage_gate'), \
+                patch('shared.config_dir.tempfile.gettempdir', return_value=str(tmp_path)):
+            gate = make_gate(['work', 'personal'])
+
+        # Dead-PID leftovers reclaimed.
+        for ghost in ghosts:
+            assert not ghost.exists(), f'{ghost.name} should have been reclaimed'
+        # A live peer's dir and anything outside the probe prefix survive.
+        assert live_sibling.exists()
+        assert (live_sibling / '.credentials.json').exists()
+        assert unrelated.exists()
+        # This process's own fresh dirs are never sweep candidates.
+        for acct in gate._accounts:
+            assert gate._config_dir_for(acct).path.exists()
+
+        # Operator-visible: the drain must show up in fleet logs rather than
+        # being silent housekeeping.
+        reclaim_logs = [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.INFO and 'reclaim' in r.getMessage().lower()
+        ]
+        assert reclaim_logs, 'reclamation must be observable at INFO'
+        # Exact count, not a bare '2' substring — a loose match would pass on
+        # any unrelated digit a future message happens to carry.
+        assert any('reclaimed 2 stale probe config dir(s)' in msg for msg in reclaim_logs)
 
 
 # ---------------------------------------------------------------------------
