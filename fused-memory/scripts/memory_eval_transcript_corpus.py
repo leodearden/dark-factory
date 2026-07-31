@@ -562,3 +562,67 @@ def scan_archive(
         1 for record in records if record['result_status'] != 'ok'
     )
     return records, coverage
+
+
+# ---------------------------------------------------------------------------
+# Run status — the INV-2 / INV-4 seam
+# ---------------------------------------------------------------------------
+
+EXIT_CODES = {'ok': 0, 'degraded': 0, 'no_input': 2, 'total_failure': 3}
+"""Process exit code per run status.
+
+Distinct non-zero codes for the two zero-search cases, because a scheduler or
+wrapper reads the exit code and never opens the artifact. ``degraded`` is 0
+deliberately: a partial failure that is fully disclosed (a count plus a
+bounded, self-disclosing example list) still yields a usable corpus, while a
+wholesale failure does not.
+"""
+
+
+def coverage_status(coverage: Mapping[str, Any]) -> str:
+    """Resolve a coverage mapping to one of :data:`EXIT_CODES`' statuses.
+
+    WHY four statuses rather than a search count plus a failure tally:
+
+    An extraction run that produces zero searches has at least three very
+    different causes — the archive is empty, every transcript failed to read,
+    or the archive is fine and genuinely contains no searches. All three
+    report ``searches_extracted == 0``, so a count cannot tell them apart, and
+    a consumer looking only at the count would read a totally broken run as a
+    clean empty result. That is precisely the failure this script exists to
+    make impossible (design-invariants INV-2 structured-facts-at-failure,
+    INV-4 no-silent-fail-soft).
+
+    So the cause is resolved here into a status that a human reads in the
+    report and a wrapper reads as an exit code:
+
+    - no transcripts found at all -> ``no_input`` (nothing to measure)
+    - transcripts found, none readable -> ``total_failure`` (the instrument
+      is broken; whatever the archive holds, we did not see it)
+    - some readable, some not -> ``degraded`` (usable, with disclosed gaps)
+    - all readable -> ``ok`` (whatever count it reports is a measurement)
+
+    Note ``ok`` says nothing about how many searches were found: an archive
+    that was fully read and holds none is a legitimate measurement.
+    """
+    found = coverage.get('transcripts_found', 0)
+    read = coverage.get('transcripts_read', 0)
+    if not found:
+        return 'no_input'
+    if not read:
+        return 'total_failure'
+    if read < found:
+        return 'degraded'
+    return 'ok'
+
+
+def stamp_status(coverage: dict[str, Any]) -> dict[str, Any]:
+    """Resolve and stamp ``coverage['status']`` in place, returning *coverage*.
+
+    The artifact must carry the status, not only the process exit code: a
+    coverage file read a week later has no exit code attached to it, and
+    re-deriving one from the counters is exactly the guesswork the status
+    exists to remove.
+    """
+    coverage['status'] = coverage_status(coverage)
+    return coverage
