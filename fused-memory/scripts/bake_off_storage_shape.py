@@ -1408,3 +1408,253 @@ def select_probing_write(cluster: CalibrationCluster) -> dict[str, Any] | None:
         duplicates,
         key=lambda record: (record.get('created_at') or '', record.get('memory_id') or ''),
     )
+
+
+# ---------------------------------------------------------------------------
+# PRD D10 — audit-recall over alpha/3130's labeled fixture
+# ---------------------------------------------------------------------------
+#
+# "ζ also delivers the audit-recall measurement — run
+# audit_duplicate_memories.py against α/3130's labeled fixture and report
+# recall on the paraphrase class — the number that decides how much to trust
+# the κ report."
+#
+# The REAL detector and the REAL partition are loaded and run.  A
+# reimplementation of either would measure this file's idea of the audit
+# script, which is the one number nobody wants.  Both live in
+# ``fused-memory/scripts/`` as standalone scripts rather than importable
+# package modules, so they are loaded by path — package-relative, never
+# against an absolute checkout path (the lesson pinned at
+# tests/test_calibrate_write_triage.py:1267).
+#
+# NO THRESHOLD IS ASSERTED ANYWHERE ON THE RESULT (gate G6): the measurement
+# informs a judgement about how far to trust the κ sweep; it does not gate a
+# build.
+
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+
+#: How many nearest-miss paraphrase pairs the payload shows.  Enough to audit
+#: the band split by hand, few enough that the artifact stays readable.
+_PARAPHRASE_EXEMPLAR_COUNT = 5
+
+
+def _load_sibling_script(name: str) -> Any:
+    """Load a sibling script in ``scripts/`` by path.
+
+    Registered in ``sys.modules`` under its bare name: ``@dataclass`` and
+    other reflection-based decorators look the defining module up there, so
+    a module loaded without registering breaks on the way in.
+    """
+    import importlib.util  # noqa: PLC0415
+    import sys  # noqa: PLC0415
+
+    if name in sys.modules:
+        return sys.modules[name]
+    path = _SCRIPTS_DIR / f'{name}.py'
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise FixtureError(f'cannot load sibling script {path}')
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(name, None)
+        raise
+    return module
+
+
+def load_audit_script() -> Any:
+    """``scripts/audit_duplicate_memories.py`` — the detector under measure."""
+    return _load_sibling_script('audit_duplicate_memories')
+
+
+def load_calibration_script() -> Any:
+    """``scripts/calibrate_write_triage.py`` — the labeled-pair partition."""
+    return _load_sibling_script('calibrate_write_triage')
+
+
+def load_labeled_fixture(path: str | Path = DEFAULT_ALPHA_FIXTURE_PATH) -> list[dict[str, Any]]:
+    """The alpha fixture as a flat record list, via its own strict loader.
+
+    Delegates to ``calibrate_write_triage.load_fixture`` rather than reusing
+    this module's :func:`_read_jsonl`: D10's whole claim is that it measures
+    the real detector over the real partition, and the partition builder is
+    fed by that loader.  Reading the fixture through a second parser would
+    leave room for the two to disagree about what the population even is.
+    """
+    return load_calibration_script().load_fixture(Path(path))
+
+
+def resolve_audit_threshold() -> float:
+    """The lexical threshold the audit script itself defaults to.
+
+    Read from the detector's own signature rather than restated here — that
+    script carries the value in three places already, and a fourth copy in a
+    measurement script would go on reporting the old number for months after
+    a retune.  A stale threshold in the artifact is worse than none: it makes
+    the recall look like a fact about a detector nobody is running.
+    """
+    import inspect  # noqa: PLC0415
+
+    detector = load_audit_script().find_near_duplicate_memory_groups
+    return float(inspect.signature(detector).parameters['threshold'].default)
+
+
+def max_lexical_ratio(left: str, right: str) -> float | None:
+    """Best ``SequenceMatcher.ratio()`` over BOTH argument orders, or ``None``.
+
+    ``ratio()`` is order-sensitive — the known exemplar pair scores 0.0948
+    one way and 0.2279 the other on normalised content (pinned at
+    ``test_audit_duplicate_memories.py:1116-1119``).  A one-directional ruler
+    would place a pair in the paraphrase band depending on which id happened
+    to sort first, which is not a property of the pair.  Taking the max can
+    only under-claim the paraphrase band, never over-claim it.
+
+    Normalisation and the ratio computation are both the detector's own
+    (``_normalized_contents`` / ``_max_lexical_ratio``), so the band split
+    describes the detector that is actually running.  Crossing those helpers'
+    leading underscore is deliberate: ``_normalized_contents``' own docstring
+    asks callers to share it precisely because a second copy would
+    "silently desynchronise numbers a reader is invited to compare" — and
+    this report prints the band split beside the detector's verdict.
+
+    ``None`` when either side normalises to empty: the detector refuses to
+    cluster empty content (an unextractable memory must never be deleted as
+    a duplicate), so there is no ratio to report.  ``SequenceMatcher`` would
+    answer 1.0, which is exactly the wrong answer.
+    """
+    audit = load_audit_script()
+    normalized = audit._normalized_contents([{'content': left}, {'content': right}])
+    if not normalized[0] or not normalized[1]:
+        return None
+    forward, _ = audit._max_lexical_ratio(normalized, [0, 1])
+    backward, _ = audit._max_lexical_ratio(normalized, [1, 0])
+    candidates = [r for r in (forward, backward) if r is not None]
+    return max(candidates) if candidates else None
+
+
+def _rate(numerator: int, denominator: int) -> float | None:
+    """A fraction, or ``None`` when nothing was measured.
+
+    An empty denominator is NO measurement, not a measured zero — a 0.0
+    false-grouping rate for a class with no members reads as a perfect score
+    for something never tested.  Same rule ``calibrate_write_triage``'s own
+    recall helper applies.
+    """
+    if denominator == 0:
+        return None
+    return numerator / denominator
+
+
+def audit_recall_over_labeled_fixture(
+    records: list[dict[str, Any]],
+    threshold: float | None = None,
+) -> dict[str, Any]:
+    """Replay the real lexical audit detector over a labeled corpus (D10).
+
+    Runs ``audit_duplicate_memories.find_near_duplicate_memory_groups`` and
+    scores the grouping it recovers against
+    ``calibrate_write_triage.build_pair_sets``' three-class partition: recall
+    over the curator-confirmed positives, and false-grouping counts over the
+    hard negatives (same cluster, curator-ruled NOT duplicates) and the
+    unrelated pairs.  Recall alone would be unreadable — a detector that
+    groups everything scores 1.0.
+
+    The positive class is split into two bands by :func:`max_lexical_ratio`
+    against *threshold*:
+
+      ``lexical_band``
+          The detector could reach these.  "Did it?" is a fair question about
+          the detector.
+      ``paraphrase_band``
+          Structurally unreachable by a character-level threshold at any
+          tuning short of changing kind.  Counting these as plain misses
+          would read as "the audit script is broken" rather than "this class
+          is invisible to it" — and the second is what D10 asks about.
+
+    Emits the nearest-miss paraphrase pairs so the split can be audited by
+    hand: a band assignment nobody can check is a number to be believed
+    rather than read.
+
+    No threshold, bound or rate is asserted on the result anywhere (G6).
+    """
+    if threshold is None:
+        threshold = resolve_audit_threshold()
+
+    audit = load_audit_script()
+    calibration = load_calibration_script()
+
+    groups = audit.find_near_duplicate_memory_groups(
+        [{'id': r['memory_id'], 'content': r['content']} for r in records],
+        threshold,
+    )
+    # Which group each record landed in; absent means it was never grouped.
+    group_of: dict[str, int] = {}
+    for index, group in enumerate(groups):
+        for member in group:
+            group_of[member['id']] = index
+
+    def _grouped_together(pair: dict[str, str]) -> bool:
+        left = group_of.get(pair['a'])
+        return left is not None and left == group_of.get(pair['b'])
+
+    pair_sets = calibration.build_pair_sets(records)
+    contents = {r['memory_id']: r.get('content') or '' for r in records}
+
+    lexical: list[dict[str, Any]] = []
+    paraphrase: list[dict[str, Any]] = []
+    for pair in pair_sets['true_dup_pairs']:
+        ratio = max_lexical_ratio(contents[pair['a']], contents[pair['b']])
+        entry = {'a': pair['a'], 'b': pair['b'], 'max_ratio': ratio}
+        # An unmeasurable ratio (empty content) is unreachable by definition:
+        # the detector declines to cluster it at ANY threshold.
+        if ratio is not None and ratio >= threshold:
+            lexical.append(entry)
+        else:
+            paraphrase.append(entry)
+
+    def _band(entries: list[dict[str, Any]]) -> dict[str, Any]:
+        recovered = sum(1 for e in entries if _grouped_together(e))
+        return {
+            'pairs': len(entries),
+            'recovered': recovered,
+            'recall': _rate(recovered, len(entries)),
+        }
+
+    def _negatives(pairs: list[dict[str, str]]) -> dict[str, Any]:
+        false_groupings = sum(1 for p in pairs if _grouped_together(p))
+        return {
+            'pairs': len(pairs),
+            'falsely_grouped': false_groupings,
+            'rate': _rate(false_groupings, len(pairs)),
+        }
+
+    positives = pair_sets['true_dup_pairs']
+    recovered = sum(1 for p in positives if _grouped_together(p))
+
+    # Nearest misses first: "how far would the threshold have to fall to
+    # reach this class at all?" is the decision-relevant end of the band.
+    # Ratio is sorted descending with an id tiebreak so a rerun's diff is
+    # signal rather than iteration-order noise; None sorts last (-1.0).
+    exemplars = sorted(
+        paraphrase,
+        key=lambda e: (-(e['max_ratio'] if e['max_ratio'] is not None else -1.0),
+                       e['a'], e['b']),
+    )[:_PARAPHRASE_EXEMPLAR_COUNT]
+
+    return {
+        'detector': 'audit_duplicate_memories.find_near_duplicate_memory_groups',
+        'threshold': threshold,
+        'groups_found': len(groups),
+        'true_dup': {
+            'pairs': len(positives),
+            'recovered': recovered,
+            'recall': _rate(recovered, len(positives)),
+            'lexical_band': _band(lexical),
+            'paraphrase_band': _band(paraphrase),
+        },
+        'hard_negative': _negatives(pair_sets['hard_negative_pairs']),
+        'unrelated': _negatives(pair_sets['unrelated_pairs']),
+        'paraphrase_exemplars': exemplars,
+    }
