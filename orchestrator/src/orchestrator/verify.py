@@ -173,11 +173,12 @@ def _scope_to_keyword(cmd: str | None, keyword: str, files: list[str]) -> str | 
     per-test timeout floor. The dropped clauses are not silent: a
     multi-clause command whose tail the gate rejects is reported by
     ``verify_plan.log_dropped_chain_clauses`` below, naming the keyword and
-    the dropped-clause count — at DEBUG for an intended same-tool fan-out
-    truncation, at INFO for the pytest slot, where the dropped clause is a
-    sibling check that will now never run. The record is emitted only on the
-    rewriting path: both bail-outs below return *cmd* with its chain intact,
-    so nothing is dropped there and nothing is reported.
+    the dropped-clause count — at DEBUG when a dropped clause re-invokes the
+    tool (an intended same-tool fan-out truncation), at INFO when none does (a
+    sibling check that will now never run), independent of which slot is
+    running. The record is emitted only on the rewriting path: both bail-outs
+    below return *cmd* with its chain intact, so nothing is dropped there and
+    nothing is reported.
 
     Lockstep with ``verify_plan._scope_prefix_to_keyword`` (the ``VerifyCmd``-
     layer counterpart) is now STRUCTURAL rather than a convention: both route

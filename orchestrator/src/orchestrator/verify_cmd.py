@@ -26,8 +26,14 @@ is excluded and truncates instead. Because a keyword allowlist cannot express
 a SLOT-scoped rule on its own — ``'uv run'`` is a wrapper phrase, and is
 allowlisted for ``verify._reproject_str`` — the gate independently refuses a
 tail to any first clause that INVOKES pytest, whatever keyword it was called
-with. ``has_unpreserved_chain_clauses`` is the diagnostic-only companion that
-lets a caller log what a REJECT discarded.
+with. ``has_unpreserved_chain_clauses`` and ``describe_dropped_clauses`` are
+the diagnostic-only companions that let a caller log what a REJECT discarded —
+the first answering whether anything was dropped at all, the second which
+clauses and whether they re-invoke the tool. Both are pure: they gate and
+populate one log record and feed no control-flow decision, which is what keeps
+this module logging-free. The classification reuses the gate's own
+``_segment_invokes_tool``, so "the same tool again" means exactly the same
+thing to the record as it did to the decision the record reports on.
 """
 
 from __future__ import annotations

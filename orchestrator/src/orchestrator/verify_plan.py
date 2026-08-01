@@ -388,13 +388,14 @@ def _scope_prefix_to_keyword(raw: str, keyword: str, files: list[str]) -> Verify
     per-test timeout floor. The dropped clauses are not silent: a
     multi-clause command whose tail the gate rejects is reported by
     :func:`log_dropped_chain_clauses` below, naming the keyword and the
-    dropped-clause count — at DEBUG for an intended same-tool fan-out
-    truncation, at INFO for the pytest slot, where the dropped clause is a
-    sibling check that will now never run. ``verify._scope_to_keyword`` emits
-    that same record through that same shared helper, since STRUCTURAL
-    lockstep is this pair's documented property. It is emitted only on the
-    rewriting path: both bail-outs below return *raw* with its chain intact,
-    so nothing is dropped there and nothing is reported.
+    dropped-clause count — at DEBUG when a dropped clause re-invokes the tool
+    (an intended same-tool fan-out truncation), at INFO when none does (a
+    sibling check that will now never run), independent of which slot is
+    running. ``verify._scope_to_keyword`` emits that same record through that
+    same shared helper, since STRUCTURAL lockstep is this pair's documented
+    property. It is emitted only on the rewriting path: both bail-outs below
+    return *raw* with its chain intact, so nothing is dropped there and
+    nothing is reported.
 
     If the *keyword*-prefix parses into a structured, non-OPAQUE command, it
     is scoped to *files*. When a tail was preserved the result is returned

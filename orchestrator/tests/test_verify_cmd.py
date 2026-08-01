@@ -1551,7 +1551,13 @@ class TestHasUnpreservedChainClauses:
         assert has_unpreserved_chain_clauses(raw, '') is False
 
     def test_true_for_a_gate_rejected_and_chain(self):
-        """The root type-check fan-out — five clauses dropped, silently, today."""
+        """The root type-check fan-out — four clauses dropped, silently, today.
+
+        (Four, not five: the retained prefix is ``'cd fused-memory && npx
+        pyright'``, two of the six segments. This predicate only answers
+        WHETHER anything was dropped — ``describe_dropped_clauses`` does the
+        counting — but the prose should not repeat the count that was wrong.)
+        """
         assert has_unpreserved_chain_clauses(_ROOT_TYPE_CHECK_COMMAND, '') is True
 
     def test_true_for_the_unspaced_and_form(self):
