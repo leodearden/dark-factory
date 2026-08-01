@@ -1758,3 +1758,344 @@ class TestTokenEstimatorInvariants:
 
         assert 'estimate_tokens' in source  # reuses context_assembler's proxy
         assert mod.character_proxy_tokens('x' * 400) > 0
+
+
+# ===========================================================================
+# step-13 — near-dup-guard candidate adequacy
+# ===========================================================================
+#
+# eval-doc :324-326's question: "would the write that became duplicate N+1
+# have been matched?"  This is the ONE metric in the program that cannot be
+# made purely rank-based without ceasing to measure the real thing —
+# `find_near_duplicate_memory` IS an absolute-threshold selector in
+# production — so it is reported SPLIT IN TWO rather than quietly violating
+# eval-design §1:
+#
+#   part 1  candidate_present  — rank/set-based and score-free: is a true
+#           cluster sibling in the arm's top-5 AT ALL?  Drift-proof, and the
+#           part that actually discriminates between storage shapes.
+#   part 2  guard_matched      — the production selector's verdict at its
+#           configured threshold, carrying `threshold_replay: True` so no
+#           reader trends it across embedding-config changes as if it were
+#           stable.
+#
+# The two must be INDEPENDENT: a corpus can put the right sibling in front of
+# the guard and still score below threshold. A metric that collapsed them
+# would report "the guard would not have fired" for a shape that did its job
+# perfectly, and the decision table would blame the shape for the threshold.
+#
+# Part 2 calls the REAL selector — not a reimplementation. Re-deriving its
+# defensive category/source_store filter here would measure THIS file's idea
+# of the guard, which is exactly the number nobody wants.
+
+
+def _scored(record_id, score, *, category='procedural_knowledge', content='body',
+            cluster_id='c1'):
+    """One ranked hit with the score the store returned for it."""
+    mod = _mod()
+    return mod.ScoredHit(
+        record=mod.ArmRecord(
+            record_id=record_id,
+            content=content,
+            metadata={'category': category},
+            cluster_id=cluster_id,
+            claim_ids=[],
+            role='peer',
+        ),
+        relevance_score=score,
+    )
+
+
+def _top5(*scores, category='procedural_knowledge'):
+    """A five-hit window: `scores[i]` for record id `s{i}`."""
+    return [
+        _scored(f's{i}', score, category=category) for i, score in enumerate(scores)
+    ]
+
+
+class TestGuardAdequacyPartOneCandidatePresent:
+    """Rank/set-based and score-free: is a sibling in front of the guard?"""
+
+    def test_a_sibling_in_the_window_is_present(self):
+        result = _mod().guard_adequacy(_top5(0.9, 0.8), {'s1'}, threshold=0.92)
+
+        assert result['candidate_present'] is True
+
+    def test_no_sibling_in_the_window_is_not_present(self):
+        result = _mod().guard_adequacy(_top5(0.99, 0.99), {'elsewhere'}, threshold=0.5)
+
+        assert result['candidate_present'] is False
+        # ...even though the guard itself matched something. The two parts
+        # answer different questions and must not be read as one.
+        assert result['guard_matched'] is True
+
+    def test_presence_is_independent_of_score(self):
+        """The point of splitting the metric: a shape that put the right
+        sibling at rank 1 did its job even if the cosine came in low. Scoring
+        that as a shape failure would blame the storage shape for the
+        threshold."""
+        mod = _mod()
+
+        low = mod.guard_adequacy(_top5(0.50, 0.50, 0.50, 0.50, 0.50), {'s2'}, 0.92)
+
+        assert low['candidate_present'] is True
+        assert low['guard_matched'] is False
+        assert low['guard_matched_id'] is None
+
+    def test_presence_ignores_the_category_filter_the_selector_applies(self):
+        """Part 1 asks about the CORPUS, not about the guard's remit."""
+        result = _mod().guard_adequacy(
+            _top5(0.99, category='observations_and_summaries'), {'s0'}, 0.92,
+        )
+
+        assert result['candidate_present'] is True
+        assert result['guard_matched'] is False  # part 2 still filters
+
+    def test_an_empty_window_has_no_candidate(self):
+        result = _mod().guard_adequacy([], {'s0'}, 0.92)
+
+        assert result['candidate_present'] is False
+        assert result['guard_matched_id'] is None
+
+
+class TestGuardAdequacyPartTwoThresholdReplay:
+    """The production selector's verdict, flagged as a threshold replay."""
+
+    def test_a_high_scoring_sibling_matches_at_the_configured_threshold(self):
+        result = _mod().guard_adequacy(
+            _top5(0.40, 0.95, 0.30), {'s1'}, threshold=0.92,
+        )
+
+        assert result['guard_matched_id'] == 's1'
+        assert result['guard_matched'] is True
+
+    def test_the_same_window_at_low_scores_does_not_match(self):
+        """Same records, same ranks, same everything but the scores — which is
+        precisely what embedding-config drift moves."""
+        result = _mod().guard_adequacy(
+            _top5(0.50, 0.50, 0.50), {'s1'}, threshold=0.92,
+        )
+
+        assert result['guard_matched_id'] is None
+        assert result['guard_matched'] is False
+
+    def test_a_high_scoring_result_of_the_wrong_category_does_not_match(self):
+        """The real selector defensively filters mismatched categories even at
+        a high score, because callers may pass unfiltered results. Production
+        guards `procedural_knowledge` writes only."""
+        result = _mod().guard_adequacy(
+            _top5(0.99, category='observations_and_summaries'), {'s0'}, 0.92,
+        )
+
+        assert result['guard_matched_id'] is None
+
+    def test_the_best_scoring_qualifying_candidate_wins(self):
+        result = _mod().guard_adequacy(
+            _top5(0.93, 0.99, 0.94), {'s0', 's1', 's2'}, 0.92,
+        )
+
+        assert result['guard_matched_id'] == 's1'
+
+    def test_the_payload_flags_itself_as_a_threshold_replay(self):
+        """Without this flag the number reads as a stable measurement, and
+        somebody trends it across an embedder change."""
+        result = _mod().guard_adequacy(_top5(0.95), {'s0'}, threshold=0.92)
+
+        assert result['threshold_replay'] is True
+        assert result['threshold'] == 0.92
+
+    def test_only_the_top_five_are_replayed(self):
+        """Production searches with `limit=5`; a caller handing over ten hits
+        must not accidentally measure a more generous guard."""
+        window = _top5(0.10, 0.10, 0.10, 0.10, 0.10) + _top5(0.99)
+
+        result = _mod().guard_adequacy(window, {'s0'}, 0.92)
+
+        assert result['guard_matched_id'] is None
+
+
+class TestGuardAdequacyUsesTheRealSelector:
+    """A reimplemented selector would measure this file, not the guard."""
+
+    def test_it_delegates_to_near_duplicate_guard(self, monkeypatch):
+        from fused_memory.server import near_duplicate_guard  # noqa: PLC0415
+
+        seen = {}
+
+        def _spy(results, threshold, **kwargs):
+            seen['results'] = results
+            seen['threshold'] = threshold
+            seen['kwargs'] = kwargs
+            return None
+
+        monkeypatch.setattr(near_duplicate_guard, 'find_near_duplicate_memory', _spy)
+
+        _mod().guard_adequacy(_top5(0.95), {'s0'}, threshold=0.93)
+
+        assert seen['threshold'] == 0.93
+        assert len(seen['results']) == 1
+
+    def test_it_hands_the_selector_real_memory_result_objects(self, monkeypatch):
+        """The selector reads `.category` / `.source_store` as ENUMS and
+        `.relevance_score`; dicts would raise, and dicts-with-strings would
+        silently fail every comparison and report "guard never fires"."""
+        from fused_memory.models.enums import MemoryCategory, SourceStore  # noqa: PLC0415
+        from fused_memory.models.memory import MemoryResult  # noqa: PLC0415
+        from fused_memory.server import near_duplicate_guard  # noqa: PLC0415
+
+        captured = []
+        monkeypatch.setattr(
+            near_duplicate_guard,
+            'find_near_duplicate_memory',
+            lambda results, threshold, **kw: captured.extend(results) or None,
+        )
+
+        _mod().guard_adequacy(_top5(0.95, 0.10), {'s0'}, 0.92)
+
+        assert all(isinstance(r, MemoryResult) for r in captured)
+        assert captured[0].category is MemoryCategory.procedural_knowledge
+        assert captured[0].source_store is SourceStore.mem0
+        assert captured[0].relevance_score == 0.95
+        assert captured[0].id == 's0'
+
+    def test_the_adapter_preserves_rank_order(self):
+        """The selector takes the max by score, but the report quotes the
+        matched id back against the ranked window — a reordering adapter would
+        make that evidence point at the wrong record."""
+        mod = _mod()
+
+        results = mod.as_memory_results(_top5(0.10, 0.95, 0.50))
+
+        assert [r.id for r in results] == ['s0', 's1', 's2']
+
+    def test_the_adapter_passes_an_unknown_category_through_as_none(self):
+        """Rather than inventing one: a record whose category the enum does
+        not know is exactly what the selector's defensive filter exists to
+        drop, and a guessed category would defeat it."""
+        mod = _mod()
+        hit = _scored('s0', 0.99, category='not_a_real_category')
+
+        results = mod.as_memory_results([hit])
+
+        assert results[0].category is None
+
+
+class TestGuardThresholdIsNotHardcodedTwice:
+    """0.92 lives in near_duplicate_guard. A copy here would drift silently."""
+
+    def test_the_default_threshold_comes_from_the_guard_module(self):
+        from fused_memory.server.near_duplicate_guard import (  # noqa: PLC0415
+            _DEFAULT_NEAR_DUP_THRESHOLD,
+        )
+
+        result = _mod().guard_adequacy(_top5(0.95), {'s0'})
+
+        assert result['threshold'] == _DEFAULT_NEAR_DUP_THRESHOLD
+
+    def test_the_script_never_restates_the_threshold_value(self):
+        import inspect  # noqa: PLC0415
+
+        source = inspect.getsource(_mod())
+
+        assert '0.92' not in source
+
+    def test_a_configured_threshold_is_read_from_the_memory_service(self):
+        """The live driver has a MemoryService; the replay must use ITS
+        threshold, or the report describes a guard nobody is running."""
+        ns = types.SimpleNamespace
+        service = ns(config=ns(reconciliation=ns(
+            procedural_knowledge_near_dup_threshold=0.77,
+        )))
+
+        assert _mod().resolve_guard_threshold(service) == 0.77
+
+    def test_no_memory_service_falls_back_to_the_module_default(self):
+        from fused_memory.server.near_duplicate_guard import (  # noqa: PLC0415
+            _DEFAULT_NEAR_DUP_THRESHOLD,
+        )
+
+        assert _mod().resolve_guard_threshold(None) == _DEFAULT_NEAR_DUP_THRESHOLD
+
+
+class TestSelectProbingWrite:
+    """Which write IS "the one that became duplicate N+1"?"""
+
+    def test_it_is_the_chronologically_last_duplicate(self):
+        mod = _mod()
+        cluster = mod.CalibrationCluster(
+            cluster_id='c1',
+            canonical={'memory_id': 'canon', 'label': 'canonical', 'created_at': None},
+            members=[
+                {'memory_id': 'early', 'label': 'duplicate',
+                 'created_at': '2026-07-16T22:16:18.712577+00:00'},
+                {'memory_id': 'late', 'label': 'duplicate',
+                 'created_at': '2026-07-26T23:58:00.802949+00:00'},
+                {'memory_id': 'mid', 'label': 'duplicate',
+                 'created_at': '2026-07-26T13:43:01.911185+00:00'},
+            ],
+        )
+
+        assert mod.select_probing_write(cluster)['memory_id'] == 'late'
+
+    def test_only_duplicate_labelled_records_are_eligible(self):
+        """A `distinct` or `pseudo_contradiction` member is by definition NOT
+        the write that became duplicate N+1 — probing with one would measure
+        whether the guard fires on content it is supposed to let through."""
+        mod = _mod()
+        cluster = mod.CalibrationCluster(
+            cluster_id='c1',
+            canonical={'memory_id': 'canon', 'label': 'canonical', 'created_at': None},
+            members=[
+                {'memory_id': 'dup', 'label': 'duplicate',
+                 'created_at': '2026-07-01T00:00:00+00:00'},
+                {'memory_id': 'contra', 'label': 'pseudo_contradiction',
+                 'created_at': '2026-07-30T00:00:00+00:00'},
+                {'memory_id': 'other', 'label': 'distinct',
+                 'created_at': '2026-07-31T00:00:00+00:00'},
+            ],
+        )
+
+        assert mod.select_probing_write(cluster)['memory_id'] == 'dup'
+
+    def test_a_cluster_with_no_duplicate_has_no_probing_write(self):
+        """None, not a substituted canonical: 5 of the committed fixture's 20
+        clusters really are duplicate-free, and probing them with SOMETHING
+        would manufacture 5 fake measurements."""
+        mod = _mod()
+        cluster = mod.CalibrationCluster(
+            cluster_id='c1',
+            canonical={'memory_id': 'canon', 'label': 'canonical', 'created_at': None},
+            members=[{'memory_id': 'd', 'label': 'distinct', 'created_at': 'x'}],
+        )
+
+        assert mod.select_probing_write(cluster) is None
+
+    def test_equal_timestamps_break_deterministically_on_memory_id(self):
+        """The 20 canonicals carry `created_at: null` and nothing forbids two
+        duplicates sharing a stamp — an unstable tiebreak would make the probe
+        query, and therefore the whole arm's guard column, move between runs."""
+        mod = _mod()
+        same = '2026-07-26T13:43:01.911185+00:00'
+        cluster = mod.CalibrationCluster(
+            cluster_id='c1',
+            canonical={'memory_id': 'canon', 'label': 'canonical', 'created_at': None},
+            members=[
+                {'memory_id': 'bbb', 'label': 'duplicate', 'created_at': same},
+                {'memory_id': 'aaa', 'label': 'duplicate', 'created_at': same},
+            ],
+        )
+
+        assert mod.select_probing_write(cluster)['memory_id'] == 'bbb'  # max id
+
+    def test_over_the_committed_fixture_every_probe_is_a_duplicate(self):
+        mod = _mod()
+        clusters = mod.load_calibration_clusters(ALPHA_FIXTURE_PATH)
+
+        probes = {c.cluster_id: mod.select_probing_write(c) for c in clusters}
+        measurable = {cid: p for cid, p in probes.items() if p is not None}
+
+        assert len(probes) == 20
+        assert all(p['label'] == 'duplicate' for p in measurable.values())
+        # 5 duplicate-free clusters are unmeasurable BY CONSTRUCTION, and the
+        # report must show 15 measurements rather than 20 with 5 invented.
+        assert len(measurable) == 15
