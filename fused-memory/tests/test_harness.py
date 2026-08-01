@@ -2300,7 +2300,6 @@ async def test_halted_project_skips_cycle(journal, event_buffer, mock_memory_ser
     is observed (see _halt_skip_event) and confirms run_full_cycle is never
     called for a halted project.
     """
-    import asyncio
     from unittest.mock import AsyncMock, patch
 
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
