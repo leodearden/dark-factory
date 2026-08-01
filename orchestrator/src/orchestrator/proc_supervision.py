@@ -792,7 +792,10 @@ class RestartPlan:
             # prove the invariant here for free (find_spec on an
             # already-imported package is a dict lookup, and this branch runs
             # at most once per scheduled restart) and say so while a human is
-            # still watching the deploy.
+            # still watching the deploy.  The test suite preflights the same
+            # invariant one layer out, against a real child interpreter, in
+            # test_deterministic_runner.py::_assert_submit_cli_invokable
+            # (task 3404).
             try:
                 submit_spec = importlib.util.find_spec('escalation.submit')
             except (ImportError, AttributeError, ValueError) as exc:

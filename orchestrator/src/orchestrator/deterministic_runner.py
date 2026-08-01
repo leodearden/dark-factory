@@ -962,6 +962,15 @@ class DeterministicRunner:
         #   <sys.executable> -c "import escalation"
         # before deploying.  A marker-file fallback is intentionally not
         # implemented here to keep the failure path auditable via journald.
+        #
+        # End-to-end coverage of this branch lives in
+        # test_deterministic_runner.py's TestDefaultScheduleDetachedRestart,
+        # which fires the deferred wrapper for real.  Those tests now preflight
+        # interpreter importability via `_assert_submit_cli_invokable` and hand
+        # the child the repo src roots on PYTHONPATH — a fresh interpreter
+        # inherits none of conftest.py's in-process sys.path injection, so
+        # without that the branch silently filed nothing in a venv lacking the
+        # `escalation` editable install (task 3404).
         escalation_spec = EscalationSpec(
             queue_dir=str(self.escalation_queue.queue_dir),
             task_id=task_id,
