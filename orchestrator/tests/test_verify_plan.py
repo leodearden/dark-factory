@@ -17,13 +17,20 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 from pathlib import Path
 
 import pytest
 
 from orchestrator import verify
 from orchestrator.config import ModuleConfig, OrchestratorConfig
-from orchestrator.verify_cmd import parse_config_command, render
+from orchestrator.verify_cmd import (
+    ToolKind,
+    parse_config_command,
+    render,
+    with_junitxml,
+    with_pytest_timeout,
+)
 from orchestrator.verify_plan import (
     FileKind,
     PlannedRun,
@@ -86,6 +93,28 @@ _ROOT_TEST_COMMAND = (
     ' && cd ../sampler && uv run pytest tests/ --timeout=300'
     ' && cd .. && ( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/ --timeout=300 )'
     ' && uv run --project shared pytest tests/scripts/ --timeout=300'
+)
+
+# Task 3218: not a config in this repo (yet), but the shape the pytest slot
+# must never tail-preserve. Mirrors test_verify_cmd.py's pair — the sibling
+# script path is the only difference, and it is what decides which of the two
+# degradations fires before this task lands (see that module's comment).
+_SIBLING_CHECKER_TEST_COMMAND = (
+    'uv run pytest tests/ && python3 scripts/check_pytest_markers.py tests'
+)
+_SIBLING_CHECKER_TEST_COMMAND_UNNAMED = (
+    'uv run pytest tests/ && python3 scripts/check_markers.py tests'
+)
+
+# Task 3218 step-10: the mirror image of the two above — a genuine SIBLING
+# CHECK in a slot that is NOT pytest. The gate rejects it on condition 4 (the
+# `cd` token), the caller retains `'cd x && npx pyright'`, and the single
+# dropped clause does not invoke pyright at an argv head. It is the case that
+# proves the record's level is decided by WHAT WAS DROPPED and not by the
+# keyword: keyed on `keyword == 'pytest'` this reads DEBUG with fan-out prose,
+# when it is the possible-false-GREEN direction the INFO level exists for.
+_SIBLING_CHECKER_TYPE_CHECK_COMMAND = (
+    'cd x && npx pyright && python3 scripts/check_pyright_config.py src'
 )
 
 
@@ -1052,6 +1081,307 @@ class TestScoperTrailingClausePreservation:
 
 # ---------------------------------------------------------------------------
 # verify._reproject_str: &&-chain tail awareness (task 3061)
+# ---------------------------------------------------------------------------
+# Tail-preservation keyword allowlist: the pytest slot stays junit-injectable
+# ---------------------------------------------------------------------------
+
+
+class TestTailPreservationAllowlist:
+    """Both scopers must return a STRUCTURED command for a chained pytest slot.
+
+    Task 3218 part 1. ``split_chain_tail``'s ACCEPT makes
+    ``_scope_prefix_to_keyword`` return ``VerifyCmd(tool=PYTEST, raw=...)``
+    and ``verify._scope_to_keyword`` return a multi-clause string that
+    re-parses the same way. ``with_junitxml`` and ``with_pytest_timeout`` are
+    documented no-ops on ``raw is not None``, so the merge leg's
+    ``--junitxml`` report — which drives
+    ``_extract_failing_test_ids_from_junit``, flake confirmation and the
+    per-test timeout floor — is silently never collected.
+
+    Excluding ``'pytest'`` from the gate's keyword allowlist closes this at
+    all five pytest-slot consumers at once, because both scopers route
+    through that one shared gate.
+    """
+
+    _FILES = ['a/test_x.py']
+
+    @pytest.mark.parametrize(
+        'raw',
+        [_SIBLING_CHECKER_TEST_COMMAND, _SIBLING_CHECKER_TEST_COMMAND_UNNAMED],
+        ids=['sibling-names-the-tool', 'sibling-does-not-name-the-tool'],
+    )
+    def test_plan_scoper_yields_structured_junit_injectable_pytest(self, raw):
+        """_scope_prefix_to_keyword: raw-retained is the failure mode; assert against it."""
+        scoped = _scope_prefix_to_keyword(raw, 'pytest', self._FILES)
+        assert scoped.tool is ToolKind.PYTEST
+        assert scoped.raw is None, 'a raw-retained pytest cmd silently loses --junitxml'
+
+        injected = with_junitxml(scoped, '/tmp/j.xml')
+        assert injected is not scoped
+        assert '--junitxml /tmp/j.xml' in render(injected)
+
+        timed = with_pytest_timeout(scoped, 300)
+        assert timed is not scoped
+        assert '--timeout 300' in render(timed)
+
+    @pytest.mark.parametrize(
+        'raw',
+        [_SIBLING_CHECKER_TEST_COMMAND, _SIBLING_CHECKER_TEST_COMMAND_UNNAMED],
+        ids=['sibling-names-the-tool', 'sibling-does-not-name-the-tool'],
+    )
+    def test_string_scoper_yields_structured_junit_injectable_pytest(self, raw):
+        """verify._scope_to_keyword's output must re-parse structured at the injection site.
+
+        The junit injection at ``run_verification`` re-parses the scoped
+        string, so what matters there is the string's PARSE, not the scoper's
+        internal shape.
+        """
+        scoped = verify._scope_to_keyword(raw, 'pytest', self._FILES)
+        assert scoped is not None
+        parsed = parse_config_command(scoped)
+        assert parsed.tool is ToolKind.PYTEST
+        assert parsed.raw is None
+
+        injected = with_junitxml(parsed, '/tmp/j.xml')
+        assert injected is not parsed
+        assert '--junitxml /tmp/j.xml' in render(injected)
+
+    def test_lint_slot_still_preserves_its_sibling_checker(self):
+        """Non-regression: the allowlisted lint keyword keeps task 3061's behaviour."""
+        scoped = verify._scope_to_keyword(_FM_LINT_COMMAND, 'ruff check', self._FILES)
+        assert scoped is not None
+        assert (
+            '&& python3 fused-memory/scripts/check_bare_magicmock_config.py'
+            ' fused-memory/tests'
+        ) in scoped
+
+    @pytest.mark.parametrize(
+        'raw',
+        [_SIBLING_CHECKER_TEST_COMMAND, _SIBLING_CHECKER_TEST_COMMAND_UNNAMED],
+        ids=['sibling-names-the-tool', 'sibling-does-not-name-the-tool'],
+    )
+    def test_lockstep_holds_on_the_rejected_pytest_chains(self, raw):
+        """The two scopers must agree here too — the gate is shared, so this is structural."""
+        assert verify._scope_to_keyword(raw, 'pytest', self._FILES) == render(
+            _scope_prefix_to_keyword(raw, 'pytest', self._FILES)
+        )
+
+
+# ---------------------------------------------------------------------------
+# A gate-rejected multi-clause command must SAY what it dropped
+# ---------------------------------------------------------------------------
+
+
+class TestDroppedChainClausesAreLogged:
+    """Both scopers log the clauses a gate REJECT silently discards (task 3218 2b).
+
+    ``split_chain_tail`` returns ``(raw, '')`` for both "single-segment,
+    nothing to preserve" and "multi-segment, rejected", so today a caller
+    cannot tell them apart and the drop leaves no trace anywhere.
+
+    LEVEL is decided by WHAT WAS DROPPED, not by which slot is running. If any
+    dropped clause re-invokes the tool at an argv-head position the truncation
+    is an intended SAME-TOOL FAN-OUT — DEBUG, not the WARNING used by the
+    reverse-dependency widening's no-op, because both of this repo's root
+    configs hit it on every fallback verify and a WARNING there would be steady
+    noise that trains operators to ignore the record. If NO dropped clause
+    invokes the tool it is a genuine SIBLING CHECK that will now never run —
+    INFO, the possible-false-GREEN direction, as loud as the missing junit
+    report ``verify._with_junitxml_str`` reports at INFO.
+
+    That rule replaces an earlier "the PYTEST slot reads at INFO" one, which
+    conflated which slot is running with what kind of chain got truncated.
+    They come apart in both directions on real configs, and ``_DROP_CASES``
+    now pins both: the root ``test_command`` is a pytest-slot FAN-OUT, and
+    ``_SIBLING_CHECKER_TYPE_CHECK_COMMAND`` is a pyright-slot SIBLING check.
+
+    COUNT is the top-level `&&` segment delta across the retained prefix — see
+    ``test_verify_cmd.py::TestDescribeDroppedClauses`` for why neither the
+    whole-original count nor a re-split of the dropped text is right.
+    """
+
+    _FILES = ['a.py']
+
+    # The two mutually-exclusive explanations the record ends with. Level and
+    # prose must move together, so they are asserted from the same cases.
+    _FAN_OUT_PHRASE = 'an intended same-tool fan-out truncation'
+    _SIBLING_PHRASE = 'a sibling check chained onto this command will NOT run'
+
+    @staticmethod
+    def _records(
+        caplog: pytest.LogCaptureFixture, logger_name: str, level: int | None = None,
+    ) -> list[str]:
+        return [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == logger_name and (level is None or r.levelno == level)
+        ]
+
+    # (raw, keyword, dropped-clause count, expected level)
+    #
+    # The two root configs are the regression cases, and their counts are the
+    # SEGMENT DELTA across the retained prefix (measured, not assumed): the
+    # type-check chain is 6 segments retaining 2, the test chain 16 retaining
+    # 2. Both were over-reported by one when the count was taken over the whole
+    # original. The root `test_command` was additionally absent from this list
+    # entirely, which is exactly what let it emit at INFO claiming a dropped
+    # sibling check when every clause it drops is a pytest fan-out.
+    _DROP_CASES = [
+        (_ROOT_TYPE_CHECK_COMMAND, 'pyright', 4, logging.DEBUG),
+        (_ROOT_TEST_COMMAND, 'pytest', 14, logging.DEBUG),
+        (_SIBLING_CHECKER_TEST_COMMAND, 'pytest', 1, logging.INFO),
+        (_SIBLING_CHECKER_TEST_COMMAND_UNNAMED, 'pytest', 1, logging.INFO),
+        (_SIBLING_CHECKER_TYPE_CHECK_COMMAND, 'pyright', 1, logging.INFO),
+    ]
+    _DROP_IDS = [
+        'root-type-check-fan-out',
+        'root-test-fan-out',
+        'pytest-named-sibling',
+        'pytest-unnamed-sibling',
+        'pyright-sibling',
+    ]
+
+    @pytest.mark.parametrize(('raw', 'keyword', 'dropped', 'level'), _DROP_CASES, ids=_DROP_IDS)
+    def test_plan_scoper_logs_the_drop(
+        self, raw, keyword, dropped, level, caplog: pytest.LogCaptureFixture,
+    ):
+        """The sibling cases are the record that makes part 1's deliberate
+        truncation non-silent: the gate rejects them, and this is where that
+        says so — at INFO, because a sibling check that never runs is the
+        possible-false-GREEN direction. The two fan-out cases are the live
+        configs, and stay at DEBUG.
+        """
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.verify_plan'):
+            result = _scope_prefix_to_keyword(raw, keyword, self._FILES)
+
+        messages = self._records(caplog, 'orchestrator.verify_plan', level)
+        assert len(messages) == 1, f'expected exactly one record, got {messages}'
+        assert keyword in messages[0]
+        # The EXACT rendered phrase, not a bare `str(dropped) in message`: the
+        # message also embeds the whole raw command, so a substring test passes
+        # on a wrong count that happens to appear in it. That looseness is why
+        # the over-count survived review-by-test.
+        assert f'dropped {dropped} trailing' in messages[0]
+        assert result is not None
+        # ...and NOTHING at any other level, so the split is exact.
+        assert self._records(caplog, 'orchestrator.verify_plan') == messages
+
+    @pytest.mark.parametrize(('raw', 'keyword', 'dropped', 'level'), _DROP_CASES, ids=_DROP_IDS)
+    def test_string_scoper_logs_the_equivalent_record(
+        self, raw, keyword, dropped, level, caplog: pytest.LogCaptureFixture,
+    ):
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.verify'):
+            result = verify._scope_to_keyword(raw, keyword, self._FILES)
+
+        messages = self._records(caplog, 'orchestrator.verify', level)
+        assert len(messages) == 1, f'expected exactly one record, got {messages}'
+        assert keyword in messages[0]
+        assert f'dropped {dropped} trailing' in messages[0]
+        assert result is not None
+        assert self._records(caplog, 'orchestrator.verify') == messages
+
+    @pytest.mark.parametrize(('raw', 'keyword', 'dropped', 'level'), _DROP_CASES, ids=_DROP_IDS)
+    def test_wording_matches_the_level(
+        self, raw, keyword, dropped, level, caplog: pytest.LogCaptureFixture,
+    ):
+        """Level and prose are two renderings of ONE classification.
+
+        A DEBUG record that says a sibling check will not run is worse than no
+        record: it is the false claim the keyword-keyed branch emitted on this
+        repo's own root ``test_command``, on every fallback verify.
+        """
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.verify_plan'):
+            _scope_prefix_to_keyword(raw, keyword, self._FILES)
+
+        messages = self._records(caplog, 'orchestrator.verify_plan', level)
+        assert len(messages) == 1, f'expected exactly one record, got {messages}'
+        if level == logging.DEBUG:
+            assert self._FAN_OUT_PHRASE in messages[0]
+            assert self._SIBLING_PHRASE not in messages[0]
+        else:
+            assert self._SIBLING_PHRASE in messages[0]
+            assert self._FAN_OUT_PHRASE not in messages[0]
+
+    @pytest.mark.parametrize(
+        ('raw', 'keyword'),
+        [
+            (_FM_LINT_COMMAND, 'ruff check'),
+            ('ruff check src/ --select E', 'ruff check'),
+            ('mypy src/ && python3 x.py', 'ruff check'),
+            ('true && python3 x.py', 'pytest'),
+            ('echo pytest && python3 x.py', 'pytest'),
+        ],
+        ids=[
+            'tail-preserved',
+            'single-clause',
+            'multi-clause-keyword-absent',
+            'multi-clause-keyword-absent-opaque',
+            'multi-clause-opaque-prefix',
+        ],
+    )
+    def test_silent_when_nothing_was_dropped(
+        self, raw, keyword, caplog: pytest.LogCaptureFixture,
+    ):
+        """Neither an ACCEPT nor an unchained command may produce a record —
+        and neither may either BAIL-OUT.
+
+        The last three cases are the bail-outs, and they are the point. The
+        gate REJECTS all three (``'ruff check'``/``'pytest'`` is absent from
+        or unparseable in segment 0), so ``has_unpreserved_chain_clauses`` is
+        true for each — but ``_scope_to_keyword`` then returns the command
+        COMPLETELY UNCHANGED via ``idx == -1`` (keyword absent) or via the
+        OPAQUE-prefix guard (``'echo pytest'`` parses OPAQUE), chain and all.
+        Nothing was dropped, so nothing may be reported: a record that does
+        not correspond to a real drop is exactly the "trains operators to
+        ignore it" failure this log exists to avoid. A ``mypy``- or
+        ``true``-based lint/type slot chained with a sibling checker is an
+        ordinary config, so this is reachable in practice.
+        """
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.verify_plan'):
+            plan_result = _scope_prefix_to_keyword(raw, keyword, self._FILES)
+        assert self._records(caplog, 'orchestrator.verify_plan') == []
+
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.verify'):
+            string_result = verify._scope_to_keyword(raw, keyword, self._FILES)
+        assert self._records(caplog, 'orchestrator.verify') == []
+
+        # Pin the premise the silence rests on: these really do come back with
+        # every clause intact, so there was genuinely nothing to report.
+        if 'x.py' in raw:
+            assert string_result == raw
+            assert render(plan_result) == raw
+
+    @pytest.mark.parametrize(
+        ('raw', 'keyword'),
+        [
+            (_ROOT_TYPE_CHECK_COMMAND, 'pyright'),
+            (_ROOT_TEST_COMMAND, 'pytest'),
+            (_SIBLING_CHECKER_TEST_COMMAND, 'pytest'),
+            (_SIBLING_CHECKER_TEST_COMMAND_UNNAMED, 'pytest'),
+            (_FM_LINT_COMMAND, 'ruff check'),
+            ('ruff check src/ --select E', 'ruff check'),
+            ('mypy src/', 'ruff check'),
+            ('true', 'pytest'),
+            ('mypy src/ && python3 x.py', 'ruff check'),
+            ('true && python3 x.py', 'pytest'),
+            ('echo pytest && python3 x.py', 'pytest'),
+            ('uv run pytest tests/ && python3 scripts/check_markers.py tests', 'uv run'),
+        ],
+        ids=[
+            'root-type-check', 'root-test', 'pytest-named-sibling',
+            'pytest-unnamed-sibling', 'fm-lint', 'single-clause', 'opaque-mypy', 'no-op-true',
+            'multi-clause-keyword-absent', 'multi-clause-keyword-absent-opaque',
+            'multi-clause-opaque-prefix', 'uv-run-keyword-over-a-pytest-clause',
+        ],
+    )
+    def test_logging_is_the_only_observable_change(self, raw, keyword):
+        """Both scopers' returned commands stay byte-identical, and in lockstep."""
+        string_scoped = verify._scope_to_keyword(raw, keyword, self._FILES)
+        plan_scoped = render(_scope_prefix_to_keyword(raw, keyword, self._FILES))
+        assert string_scoped == plan_scoped
+
+
 # ---------------------------------------------------------------------------
 
 

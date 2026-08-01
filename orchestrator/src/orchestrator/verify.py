@@ -53,6 +53,7 @@ from orchestrator.verify_cmd import (
     apply_pytest_numprocesses,
     cargo_scope,
     govern_cpu,
+    has_unpreserved_chain_clauses,
     parse_config_command,
     render,
     reproject,
@@ -162,6 +163,23 @@ def _scope_to_keyword(cmd: str | None, keyword: str, files: list[str]) -> str | 
     two more subprojects unscoped AND leave a ``cd ../orchestrator`` that
     misresolves once ``strip_cwd`` has removed the leading ``cd``.
 
+    The PYTEST slot is excluded from tail preservation outright (task 3218):
+    ``'pytest'`` is off the gate's ``_TAIL_PRESERVING_KEYWORDS``, so a
+    chained ``test_command`` always truncates and the scoped result stays
+    STRUCTURED — which is what keeps ``with_junitxml`` and
+    ``with_pytest_timeout`` live on it. A preserved tail there would have
+    silently cost the junit report that drives
+    ``_extract_failing_test_ids_from_junit``, flake confirmation and the
+    per-test timeout floor. The dropped clauses are not silent: a
+    multi-clause command whose tail the gate rejects is reported by
+    ``verify_plan.log_dropped_chain_clauses`` below, naming the keyword and
+    the dropped-clause count — at DEBUG when a dropped clause re-invokes the
+    tool (an intended same-tool fan-out truncation), at INFO when none does (a
+    sibling check that will now never run), independent of which slot is
+    running. The record is emitted only on the rewriting path: both bail-outs
+    below return *cmd* with its chain intact, so nothing is dropped there and
+    nothing is reported.
+
     Lockstep with ``verify_plan._scope_prefix_to_keyword`` (the ``VerifyCmd``-
     layer counterpart) is now STRUCTURAL rather than a convention: both route
     through that one shared ``split_chain_tail`` gate. When the gate rejects,
@@ -176,9 +194,40 @@ def _scope_to_keyword(cmd: str | None, keyword: str, files: list[str]) -> str | 
     idx = head.find(keyword)
     if idx == -1:
         return cmd
-    parsed = parse_config_command(head[: idx + len(keyword)])
+    retained = head[: idx + len(keyword)]
+    parsed = parse_config_command(retained)
     if parsed.tool is ToolKind.OPAQUE or parsed.raw is not None:
         return cmd
+    # Sited AFTER both bail-outs on purpose: each of them returns *cmd* — the
+    # whole original, chain and all — so a gate REJECT costs nothing there and
+    # a record would name clauses that in fact still run. Only the rewriting
+    # path below actually discards them. A record that does not correspond to
+    # a real drop is the same failure mode this log exists to avoid.
+    #
+    # The LEVEL follows what was actually dropped, not which slot is running.
+    # A dropped clause that re-invokes the tool at an argv head is an intended
+    # same-tool fan-out -> DEBUG, not the WARNING the reverse-dependency
+    # widening's no-op uses further down this module: BOTH root configs are
+    # that case and hit it on every fallback verify, so a louder level would be
+    # steady noise that trains operators to ignore the record. A dropped clause
+    # that does NOT invoke the tool is a sibling check that will now never run
+    # -> INFO, the possible-false-GREEN direction, the same level
+    # `_with_junitxml_str` uses for the missing junit report.
+    #
+    # Keying that on `keyword == 'pytest'` instead — the first spelling of this
+    # record — got it backwards on the live config: this repo's root
+    # `test_command` is a pure pytest fan-out with no sibling checker anywhere,
+    # and was reported at INFO as a dropped sibling check on every fallback
+    # verify that scopes it.
+    #
+    # The record itself is `verify_plan`'s, emitted onto THIS module's logger.
+    # Sharing the one implementation is what makes the two scopers' records
+    # read alike structurally rather than by hand-mirroring — the same
+    # argument that put the tail-preservation policy in one shared gate.
+    # `retained` is the truncation point, so the clauses past it are exactly
+    # the ones this call discards — which is what makes the count right.
+    if has_unpreserved_chain_clauses(cmd, tail):
+        verify_plan.log_dropped_chain_clauses(logger, cmd, keyword, retained)
     rendered = render(strip_cwd(scope_to(parsed, files)))
     return f'{rendered} {tail}' if tail else rendered
 
@@ -202,8 +251,26 @@ def _reproject_str(cmd: str | None, project: str) -> str | None:
 
     The gate is driven with the keyword ``'uv run'`` because that is exactly
     the head phrase ``reproject`` rewrites: "the thing I am about to rewrite
-    lives in segment 0, appears in no later segment, and there is no ``cd``
-    sequencing" is precisely the right admission test here too. When the gate
+    lives in segment 0, no later segment invokes it, and there is no ``cd``
+    sequencing" is precisely the right admission test here too. ``'uv run'``
+    is therefore one of the three keywords on the gate's
+    ``_TAIL_PRESERVING_KEYWORDS`` allowlist, and it is there because
+    preservation here is LOAD-BEARING rather than merely desirable — see the
+    exit-127 paragraph above. (``split_chain_tail`` tests index 0 as an
+    argv-head position BEFORE peeling any wrapper, which is what keeps this
+    two-token keyword matchable at the front of a ``uv run ... ruff check``
+    segment 0.)
+
+    This helper is only ever called on a ``lint_command`` /
+    ``type_check_command`` (the fallback path's three call sites), never on a
+    ``test_command``. That is a convention, though, not something the gate can
+    check — and ``'uv run'`` is a WRAPPER phrase, so a caller who did point it
+    at ``'uv run pytest tests/ && python3 check.py tests'`` would clear the
+    keyword allowlist and hand the pytest slot a preserved tail, resurrecting
+    the exact no-op task 3218 closed. The gate therefore does not rely on the
+    convention: its condition 0b independently refuses a tail to any first
+    clause that INVOKES pytest, whatever keyword it was called with, so this
+    entry is closed against that misuse structurally. When the gate
     rejects, ``head is cmd`` and ``tail == ''``, so the body below collapses
     to its pre-gate form byte-for-byte. All three bail-outs return *cmd* —
     the full original, never ``head`` — so a rejected command can never be
@@ -1260,6 +1327,62 @@ def _with_pytest_timeout_str(cmd: str | None, secs: int) -> str | None:
     parsed = parse_config_command(cmd)
     rewritten = with_pytest_timeout(parsed, secs)
     if rewritten is parsed:
+        return cmd
+    return render(rewritten)
+
+
+def _with_junitxml_str(cmd: str | None, junit_path: str) -> str | None:
+    """Inject ``--junitxml <junit_path>`` into a structured ``pytest`` command, via VerifyCmd.
+
+    Thin string-level wrapper around ``parse_config_command`` ->
+    ``with_junitxml`` -> ``render`` (mirrors ``_with_pytest_timeout_str``).
+    Returns *cmd* unchanged — BYTE-identically, via the ``is`` identity check,
+    since a from-scratch render is only argv-equivalent — when it is ``None``
+    or does not parse into a structured PYTEST command.
+
+    **Why this logs (task 3218).** The no-op is not always benign. The caller
+    only injects when ``role=='merge'`` and ``breadth=='full'``, i.e. exactly
+    when a junit report WAS expected: it drives
+    ``_extract_failing_test_ids_from_junit``, the α flake-confirmation gate
+    and the per-test timeout floor. Silently skipping it there degrades those
+    downstream capabilities with no record anywhere — the failure mode the
+    reverse-dependency widening already avoids by logging its own no-op
+    (see the ``logger.warning`` in ``reverse_dependent_test_targets``'s
+    caller). So a suppressed injection on a command that IS pytest is
+    reported at INFO, naming the path that will not be written.
+
+    The INFO is gated on ``parsed.tool is ToolKind.PYTEST`` deliberately: a
+    lint/type/OPAQUE command was never eligible to produce junit, and logging
+    those would fire on legs that were never going to collect a report,
+    training operators to ignore the record.
+
+    Siting the log HERE rather than in ``split_chain_tail`` covers every
+    cause of the no-op — a raw-retained ``&&``-chain, an OPAQUE command, a
+    non-pytest tool — rather than only the tail-preservation one. As of task
+    3218 step-2 the tail-preservation cause is no longer reachable through
+    the two scopers at all (``'pytest'`` is off ``_TAIL_PRESERVING_KEYWORDS``,
+    so a chained pytest slot now comes back structured); this remains as
+    defence in depth for a hand-written multi-clause ``test_command`` that
+    reaches the injection site directly.
+
+    *junit_path* should be absolute: the rendered command may run with a
+    shifted cwd (a structured command's own ``cd <cwd_rel> &&``), so a
+    relative value would land in the wrong directory.
+    """
+    if cmd is None:
+        return None
+    parsed = parse_config_command(cmd)
+    rewritten = with_junitxml(parsed, junit_path)
+    if rewritten is parsed:
+        if parsed.tool is ToolKind.PYTEST:
+            logger.info(
+                'junitxml injection suppressed: %s is pytest but not structured '
+                '(raw-retained &&-chain or unparseable), so no junit report will be '
+                'collected at %s for this run — junit-driven failing-test extraction, '
+                'flake confirmation and the per-test timeout floor are unavailable',
+                cmd,
+                junit_path,
+            )
         return cmd
     return render(rewritten)
 
@@ -4209,17 +4332,19 @@ async def run_verification(
         config_cmd = cmd
         # junitxml injection (task μ, verify-scope-inversion-prd.md): only
         # the 'test' leg, only when junit_path was computed above (role
-        # =='merge' and breadth=='full'). Identity-check mirrors the
-        # apply_pytest_numprocesses guard further below — with_junitxml
-        # no-ops for OPAQUE/raw-retained/non-pytest commands, so skip the
-        # parse->render round-trip when nothing was actually touched. MUST
-        # run before the cpu-governance wrap immediately below: once
-        # governed, cmd is an opaque outer `<exec> -- /bin/bash -c '...'`
-        # string that parse_config_command can no longer see as pytest.
+        # =='merge' and breadth=='full'). _with_junitxml_str keeps the
+        # identity-check semantics this site always had — with_junitxml
+        # no-ops for OPAQUE/raw-retained/non-pytest commands, so the
+        # parse->render round-trip is skipped and a no-op stays
+        # byte-identical — and additionally reports a suppressed injection
+        # on a pytest command at INFO (task 3218), since reaching here means
+        # a junit report was expected and will not be written. MUST run
+        # before the cpu-governance wrap immediately below: once governed,
+        # cmd is an opaque outer `<exec> -- /bin/bash -c '...'` string that
+        # parse_config_command can no longer see as pytest.
         if junit_path is not None and label == 'test':
-            _parsed_for_junit = parse_config_command(cmd)
-            _mutated_for_junit = with_junitxml(_parsed_for_junit, str(junit_path))
-            cmd = cmd if _mutated_for_junit is _parsed_for_junit else render(_mutated_for_junit)
+            cmd = _with_junitxml_str(cmd, str(junit_path))
+            assert cmd is not None  # None only when the input is None; guarded above
         # Wrap the command in cpu-governed-exec.sh when role=='merge' and
         # cpu_governance is enabled + exec resolves.  Fail-open: returns cmd
         # unchanged when governance is disabled or the path is non-executable,

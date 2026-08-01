@@ -15,6 +15,25 @@ Replaces verify.py's raw-shell-string find/replace-surgery command model
 
 ``ToolKind`` is a ``StrEnum`` — mirrors verify_categories.FailureCategory
 (task α) so tool identity is JSON-serialisable and ``str(ToolKind.X) == 'x'``.
+
+``split_chain_tail`` decides whether a scoper may carry an ``&&``-chained
+sibling clause past its truncation point. Which SLOTS may do so is a keyword
+ALLOWLIST (``_TAIL_PRESERVING_KEYWORDS``), because the preserved-tail return
+shape is precisely the RECOGNISED-BUT-UNSTRUCTURABLE one described above, on
+which several mutators are documented no-ops: buying a tail in the pytest
+slot would mean paying for it with ``--junitxml``/``--timeout``, so that slot
+is excluded and truncates instead. Because a keyword allowlist cannot express
+a SLOT-scoped rule on its own — ``'uv run'`` is a wrapper phrase, and is
+allowlisted for ``verify._reproject_str`` — the gate independently refuses a
+tail to any first clause that INVOKES pytest, whatever keyword it was called
+with. ``has_unpreserved_chain_clauses`` and ``describe_dropped_clauses`` are
+the diagnostic-only companions that let a caller log what a REJECT discarded —
+the first answering whether anything was dropped at all, the second which
+clauses and whether they re-invoke the tool. Both are pure: they gate and
+populate one log record and feed no control-flow decision, which is what keeps
+this module logging-free. The classification reuses the gate's own
+``_segment_invokes_tool``, so "the same tool again" means exactly the same
+thing to the record as it did to the decision the record reports on.
 """
 
 from __future__ import annotations
@@ -258,6 +277,112 @@ def split_top_level_and(raw: str) -> list[str]:
     return segments
 
 
+# Keywords whose slot may carry a preserved `&&` tail. An ALLOWLIST, not a
+# denylist, and that direction is the point (task 3218).
+#
+# `'pytest'` is deliberately ABSENT. A preserved tail makes the caller's
+# result RECOGNISED-BUT-UNSTRUCTURABLE (``VerifyCmd.raw is not None``), and
+# both `with_junitxml` and `with_pytest_timeout` are documented no-ops on
+# that shape — so the tail would be bought at the price of SILENTLY dropping
+# the `--junitxml` report that drives `_extract_failing_test_ids_from_junit`,
+# flake confirmation and the per-test timeout floor. An unscoped sibling
+# checker is not worth that trade in the test slot; in the lint/type slots
+# there is nothing to lose, since neither mutator applies there.
+#
+# The DEFAULT for an unlisted keyword is therefore NO preservation — exactly
+# the pre-task-3061 truncate-at-keyword behaviour. A verify slot added later
+# cannot silently acquire this degradation by existing: it has to opt in
+# here, explicitly, which is the fail-safe direction.
+#
+# `'uv run'` is listed for `verify._reproject_str`, whose tail preservation
+# is load-bearing rather than merely nice: without it a chained lint command
+# re-parses OPAQUE and the `--project` injection is silently dropped, which
+# the depless workspace-root project turns into exit 127 (task 2036).
+_TAIL_PRESERVING_KEYWORDS = frozenset({'ruff check', 'pyright', 'uv run'})
+
+# The exclusion above is really a property of the SLOT, not of the keyword,
+# and `'uv run'` is the seam where the two come apart: it is a WRAPPER phrase,
+# so `'uv run pytest tests/ && python3 check.py tests'` clears the allowlist
+# on the keyword alone and the pytest slot would regain a preserved tail — the
+# exact junitxml/timeout no-op the allowlist exists to prevent. The safety of
+# that entry otherwise rests on a comment-level convention (`_reproject_str`
+# is only ever handed a lint/type command), which is not a property the gate
+# can check.
+#
+# So the gate ALSO asks what segment 0 actually invokes, and refuses a tail to
+# any first clause that runs pytest at an argv-head position, whatever keyword
+# it was called with. That makes "a pytest command never carries a preserved
+# tail" structural rather than conventional, and closes the entry against a
+# future `split_chain_tail(raw, 'uv run')` caller pointed at a `test_command`.
+_TAIL_FORBIDDING_TOOL_KEYWORD = 'pytest'
+
+
+def _segment_invokes_tool(segment: str, keyword: str) -> bool:
+    """True if *segment* actually INVOKES *keyword*'s tool at an argv-head position.
+
+    ``split_chain_tail``'s later-segment check (task 3218 part 2). Replaces a
+    plain ``keyword in segment`` substring test, which could not tell a real
+    invocation from the tool's name merely OCCURRING in the segment — as it
+    does inside a sibling checker's script path
+    (``python3 scripts/check_pyright_config.py``) or a quoted flag value
+    (``--tool "ruff check"``).
+
+    An argv-head position is index 0, or the index just past a recognised
+    wrapper prefix:
+
+    * ``uv run`` followed by any run of ``--project X`` / ``--directory X``
+      pairs, in either order, both optional — mirroring
+      ``_parse_single_segment``'s peel loop, so the gate's notion of "where a
+      tool head can begin" is the same as the parser's;
+    * ``npx``;
+    * ``python`` / ``python3`` followed by ``-m``.
+
+    Index 0 is a head position BEFORE any wrapper is peeled, which is what
+    keeps the ``'uv run'`` keyword (``verify._reproject_str``'s) matching
+    segment 0 of a ``uv run ... ruff check ...`` command.
+
+    ``shlex.split`` raising ``ValueError`` returns True: an undecodable
+    segment counts as a MATCH, so the gate rejects and the pre-3218
+    disposition is restored. Conservative by construction.
+
+    **Why tightening this is safe — the two error directions are not
+    symmetric.** The old substring test OVER-rejects: a legitimate sibling
+    checker is dropped, so a real check never runs, which is a possible false
+    GREEN — the bug class the tail-preservation gate exists to close.
+    Argv-head matching can only UNDER-reject, and only for a same-tool
+    fan-out behind a wrapper this module does not recognise (``poetry run
+    ruff check b/``); the consequence there is that clause running UNSCOPED,
+    which is a SUPERSET of the checks that would otherwise have run and can
+    never produce a false GREEN. It also cannot misresolve relative paths,
+    because ``split_chain_tail``'s condition 4 already rejects any chain
+    containing a ``cd`` token — the property that makes an unscoped tail safe
+    in the first place. Under-rejection is the strictly safer failure
+    direction, which is what licenses the precise test over the blunt one.
+    """
+    try:
+        tokens = shlex.split(segment)
+    except ValueError:
+        return True
+
+    head_positions = {0}
+    idx = 0
+    if tokens[idx : idx + 2] == ['uv', 'run']:
+        idx += 2
+        while True:
+            if tokens[idx : idx + 1] in (['--project'], ['--directory']) and len(tokens) > idx + 1:
+                idx += 2
+            else:
+                break
+        head_positions.add(idx)
+    elif tokens[idx : idx + 1] == ['npx']:
+        head_positions.add(idx + 1)
+    elif tokens[idx : idx + 1] in (['python'], ['python3']) and tokens[idx + 1 : idx + 2] == ['-m']:
+        head_positions.add(idx + 2)
+
+    kw_tokens = keyword.split()
+    return any(tokens[i : i + len(kw_tokens)] == kw_tokens for i in head_positions)
+
+
 def split_chain_tail(raw: str, keyword: str) -> tuple[str, str]:
     """Split *raw* into a *keyword*-bearing head and a preservable trailing chain.
 
@@ -283,6 +408,25 @@ def split_chain_tail(raw: str, keyword: str) -> tuple[str, str]:
 
     The gate, cheapest condition first — ACCEPT requires ALL of:
 
+    0. *keyword* is in ``_TAIL_PRESERVING_KEYWORDS``. An ALLOWLIST, so the
+       DEFAULT for any keyword not named there is no preservation — exactly
+       the pre-task-3061 truncate-at-*keyword* behaviour. ``'pytest'`` is
+       deliberately excluded (task 3218): a preserved tail makes the caller's
+       result raw-retained, and ``with_junitxml``/``with_pytest_timeout`` are
+       documented no-ops on that shape, so the tail would cost the junit
+       report that drives failing-test extraction, flake confirmation and the
+       per-test timeout floor. See that constant for the full rationale;
+    0b. ``segments[0]`` does not itself INVOKE ``pytest`` at an argv-head
+       position, WHATEVER *keyword* the caller passed. Condition 0 keys on the
+       keyword, but the invariant it protects is a property of the SLOT, and
+       ``'uv run'`` is a wrapper phrase where the two come apart: ``'uv run
+       pytest tests/ && python3 check.py tests'`` clears the allowlist under
+       the ``'uv run'`` keyword, so without this the pytest slot could regain
+       a preserved tail through ``verify._reproject_str``'s keyword. This
+       makes "a pytest first clause never carries a preserved tail"
+       structural instead of resting on the convention that ``_reproject_str``
+       is only ever handed a lint/type command. Evaluated after (5)/(6) rather
+       than beside (0) only because it needs ``segments``;
     1. ``shlex.split(raw)`` succeeds (an unbalanced quote means the string is
        not safely decomposable at all);
     2. no token in ``_NON_AND_CHAIN_TOKENS`` — the chain is plain `&&`, with
@@ -302,12 +446,30 @@ def split_chain_tail(raw: str, keyword: str) -> tuple[str, str]:
        substitution: both sides count the nested `&&` alike, so condition 3
        is the only thing standing between that input and a mangled command.);
     6. at least two segments (nothing to preserve otherwise);
-    7. *keyword* occurs in ``segments[0]`` and in NO later segment.
+    7. *keyword* occurs in ``segments[0]`` — a plain substring test, kept
+       deliberately, so a keyword reachable only mid-segment stays consistent
+       with the caller's ``head.find(keyword)`` truncation — and NO later
+       segment INVOKES the tool at an ARGV-HEAD position
+       (``_segment_invokes_tool``).
 
     Conditions 4 and 7 are what distinguish a SIBLING-CHECKER chain (a
     different tool, no cwd sequencing — safe and desirable to preserve) from
     a SAME-TOOL FAN-OUT (which must keep being truncated), and both are load-
-    bearing against real configs:
+    bearing against real configs.
+
+    Condition 7's later-segment half is an argv-head test rather than a
+    substring one (task 3218) because the tool's NAME occurring in a segment
+    is not the same as that segment invoking it. The motivating case is the
+    sibling checker named after what it checks — ``python3
+    scripts/check_pyright_config.py src`` in a ``pyright`` chain, ``python3
+    scripts/check_pytest_markers.py tests`` in a ``pytest`` one: a substring
+    test reads those as a fan-out and drops the clause, so a real check never
+    runs. That is an over-rejection, i.e. the possible-false-GREEN direction;
+    argv-head matching can only under-reject, and only behind an unrecognised
+    wrapper, which merely runs that clause unscoped. See
+    ``_segment_invokes_tool`` for the full error-direction argument.
+
+    The real configs this gate was built against:
 
     * ``dark-factory-orchestrator.yaml:51`` is ``cd fused-memory && npx
       pyright && cd ../orchestrator && npx pyright && cd ../dashboard && npx
@@ -319,8 +481,13 @@ def split_chain_tail(raw: str, keyword: str) -> tuple[str, str]:
       ``cd``-token rejection (4) stops it; the duplicate-``pyright``
       rejection (7) independently stops it too.
     * ``dark-factory-orchestrator.yaml:41`` is an 8-segment ``cd X && uv run
-      pytest`` fan-out with a ``( ... )`` subshell — rejected by (2), (3),
-      (4) and (7) alike.
+      pytest`` fan-out with a ``( ... )`` subshell — rejected by (0), (2),
+      (3), (4) and (7) alike.
+
+    The CONSTRAINT — every REJECT returns ``(raw, '')``, the whole untouched
+    original — holds for the three reject paths added by task 3218 (conditions
+    0 and 0b, and condition 7's tightened later-segment test) exactly as it
+    does for the rest, since all three take the same ``return raw, ''``.
 
     A ``cd`` token anywhere is disqualifying rather than only in the tail:
     once any segment shifts the shell's cwd, every later segment's relative
@@ -335,6 +502,8 @@ def split_chain_tail(raw: str, keyword: str) -> tuple[str, str]:
     the only such caller. The two scopers apply ``strip_cwd``, so their
     ``cwd_rel`` is always ``None`` by render time.
     """
+    if keyword not in _TAIL_PRESERVING_KEYWORDS:
+        return raw, ''
     try:
         tokens = shlex.split(raw)
     except ValueError:
@@ -350,11 +519,117 @@ def split_chain_tail(raw: str, keyword: str) -> tuple[str, str]:
         return raw, ''
     if len(segments) < 2:
         return raw, ''
+    # Condition 0b — deferred to here only because it needs `segments`.
+    if _segment_invokes_tool(segments[0], _TAIL_FORBIDDING_TOOL_KEYWORD):
+        return raw, ''
     if keyword not in segments[0]:
         return raw, ''
-    if any(keyword in segment for segment in segments[1:]):
+    if any(_segment_invokes_tool(segment, keyword) for segment in segments[1:]):
         return raw, ''
     return segments[0], raw[len(segments[0]) :]
+
+
+def has_unpreserved_chain_clauses(raw: str, tail: str) -> bool:
+    """True if *raw* carried chain clauses that ``split_chain_tail`` dropped.
+
+    DIAGNOSTIC-ONLY and best-effort. It gates a log record and NOTHING else —
+    it deliberately feeds no control-flow decision anywhere, which is what
+    makes best-effort acceptable: a miss on an exotic spelling costs a
+    missing log line, never a behaviour change. Keeping it a pure predicate
+    is also what keeps this module logging-free, as it is today.
+
+    It exists because ``split_chain_tail`` returns ``(raw, '')`` for BOTH
+    "single-segment, nothing to preserve" and "multi-segment, gate rejected".
+    The caller cannot distinguish them, so a genuinely dropped clause is
+    indistinguishable from a command that never had one — and a same-tool
+    fan-out's tail therefore disappears with no record anywhere.
+
+    False as soon as *tail* is non-empty (the gate ACCEPTED — nothing was
+    dropped). Otherwise *raw* is scanned two ways, because neither alone is
+    sufficient:
+
+    * any token in ``_CHAIN_OPERATOR_TOKENS`` — note this is the WIDE set,
+      which includes ``&&``, not ``split_chain_tail``'s narrower
+      ``_NON_AND_CHAIN_TOKENS`` (which deliberately excludes it);
+    * ``len(split_top_level_and(raw)) > 1`` — token equality only sees an
+      operator ``shlex`` isolates as its own whitespace-separated token, so
+      the unspaced ``a&&b`` form (one token, ``'a&&b'``) slips past it while
+      the quote-aware splitter still finds the split point.
+
+    An unbalanced quote returns True: undecodable, so report it loudly rather
+    than stay silent.
+    """
+    if tail:
+        return False
+    try:
+        tokens = shlex.split(raw)
+    except ValueError:
+        return True
+    if any(tok in _CHAIN_OPERATOR_TOKENS for tok in tokens):
+        return True
+    return len(split_top_level_and(raw)) > 1
+
+
+def describe_dropped_clauses(
+    raw: str, retained: str, keyword: str,
+) -> tuple[tuple[str, ...], bool]:
+    """The clauses a gate REJECT dropped from *raw*, and whether they re-invoke the tool.
+
+    The companion to ``has_unpreserved_chain_clauses``, and DIAGNOSTIC-ONLY in
+    exactly the same sense: between them they supply the count, the text and
+    the classification for one log record (``verify_plan.log_dropped_chain_
+    clauses``) and feed no control-flow decision anywhere. Pure, so this module
+    stays logging-free.
+
+    *retained* is the CALLER'S truncation point — ``head[: idx + len(keyword)]``
+    — and must be a prefix of *raw*. Passing it in rather than re-deriving it
+    is deliberate: both scopers already compute that exact slice as the
+    argument to ``parse_config_command``, and re-deriving it here would fork
+    the truncation rule into a second place free to drift from the first.
+
+    The count is the top-level `&&` SEGMENT DELTA across *retained*, and both
+    halves of that are load-bearing:
+
+    * NOT ``len(split_top_level_and(raw)) - 1`` (the whole original's clause
+      count), which silently assumes the keyword sits in segment 0. Both of
+      this repo's root configs put it in segment 1 — ``cd fused-memory && npx
+      pyright ...``, ``cd shared && uv run pytest ...`` — so that form
+      over-reports by one for each of them;
+    * NOT a re-split of the dropped TEXT ``raw[len(retained):]`` either,
+      because *retained* normally ends MID-segment: for ``'uv run pytest
+      tests/ && python3 check.py tests'`` the remainder is ``' tests/ &&
+      python3 check.py tests'``, which re-splits to two — but the leftover
+      ``tests/`` is a truncated ARGUMENT of a retained clause, not a dropped
+      clause.
+
+    A 0 delta with a non-empty remainder falls back to reporting that
+    remainder as ONE clause, guarded on the remainder actually carrying a
+    chain operator. That is the non-`&&` chain — ``'ruff check src/ ||
+    python3 x.py'`` is a single top-level `&&` segment — which the segment
+    view cannot see at all, and where the record would otherwise read "dropped
+    0 trailing chain clause(s)" on a path reached only because
+    ``has_unpreserved_chain_clauses`` reported a real drop. The chain-operator
+    guard is what keeps a plain ``'ruff check src/'`` (remainder ``'src/'``,
+    an argument) reporting nothing dropped.
+
+    The bool is True when ANY dropped clause invokes *keyword*'s tool at an
+    argv-head position, i.e. the truncation is an intended SAME-TOOL FAN-OUT
+    rather than a SIBLING CHECK that will now never run. It reuses the gate's
+    own ``_segment_invokes_tool``, so the record's notion of "the same tool
+    again" is by construction identical to the notion condition 7 decided the
+    REJECT with — rather than a parallel rule free to disagree with it. Its
+    ``ValueError -> True`` carries over too: an undecodable clause is reported
+    as the quiet fan-out case rather than as a sibling-check claim that may be
+    false.
+    """
+    segments = split_top_level_and(raw)
+    retained_segments = split_top_level_and(retained)
+    dropped = tuple(s.strip() for s in segments[len(retained_segments) :] if s.strip())
+    if not dropped and raw.startswith(retained):
+        remainder = raw[len(retained) :].strip()
+        if remainder and has_unpreserved_chain_clauses(remainder, ''):
+            dropped = (remainder,)
+    return dropped, any(_segment_invokes_tool(clause, keyword) for clause in dropped)
 
 
 def parse_config_command(raw: str) -> VerifyCmd:
@@ -848,9 +1123,17 @@ def with_junitxml(cmd: VerifyCmd, junit_path: str) -> VerifyCmd:
     covers a raw-retained pytest chain (``cmd.raw is not None``): there is no
     regex-rewrite branch here, so a recognised-but-unstructurable
     ``&&``-chained pytest command is left byte-identical rather than
-    rewritten. Callers degrade gracefully (no junit collected for that run —
-    B3) rather than risk a mis-scoped injection into an unstructured shell
-    string.
+    rewritten, rather than risking a mis-scoped injection into an
+    unstructured shell string.
+
+    That no-op used to be reachable from the two scopers, which would hand
+    back a raw-retained chain whenever ``split_chain_tail`` preserved a tail
+    — so the run simply collected no junit (B3), silently. Task 3218 closed
+    that route: ``'pytest'`` is off ``_TAIL_PRESERVING_KEYWORDS``, so a
+    chained pytest slot now comes back structured and injectable. The
+    raw-retained no-op remains reachable only for a hand-written
+    multi-clause command that reaches the injection site directly, and
+    ``verify._with_junitxml_str`` reports it at INFO when it happens.
 
     *junit_path* should be an absolute path: the rendered command may run
     with a shifted cwd (a structured command's own ``cd <cwd_rel> &&``), so a
@@ -873,7 +1156,9 @@ def with_pytest_timeout(cmd: VerifyCmd, secs: int) -> VerifyCmd:
     raw-retained pytest chain (``cmd.raw is not None``): there is no
     regex-rewrite branch here, so a recognised-but-unstructurable
     ``&&``-chained pytest command is left byte-identical rather than
-    rewritten.
+    rewritten. As with ``with_junitxml``, task 3218 made that no-op
+    unreachable via the two scopers — the pytest slot is off the gate's
+    tail-preservation allowlist, so it now yields a structured command.
 
     The α confirm gate injects this AFTER ``serial_pytest``'s
     ``-p no:xdist -o addopts=`` recovery form: the pyproject per-test
