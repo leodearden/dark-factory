@@ -3718,7 +3718,10 @@ async def _run_segmented(
       number the shell's `&&` chain would have returned, so every downstream rc
       consumer keeps reading what it read before. Running the later segments
       buys information, never leniency.
-    * ``timed_out`` is true if any segment timed out.
+    * ``timed_out`` is true if any segment ACTUALLY timed out, or — only when
+      no segment produced a genuine red — if the shared budget left some
+      segment unrun. Synthesising it on top of a real failure would relabel
+      that failure `infra_timeout`; see the comment on the return statement.
     * ``segments`` is one flat JSON-native dict per segment
       (index/label/cwd/cmd/status/rc/timed_out/duration_secs/skip_reason),
       which rides to ``.task/verify/attempt-N.json`` on ``CheckRun.segments``.
@@ -3791,11 +3794,46 @@ async def _run_segmented(
     # green-so-far run with unrun segments is NEVER green — reporting 0 would
     # claim a fleet-wide pass on the strength of whatever happened to fit.
     rc_total = first_nonzero or (1 if any_not_run else 0)
-    # `timed_out` covers not-run too, so the run classifies as `infra_timeout`
-    # (retryable) exactly as a single-chain timeout does today, leaving
-    # run_verification's retry/env-recovery machinery untouched.
+    # The SYNTHETIC not-run timeout flag is raised only when there is no genuine
+    # red to report. `verify_classify.classify_failure`'s guard 2 (`if
+    # timed_out: return INFRA_TIMEOUT`) wins over EVERY output pattern, so
+    # raising it unconditionally on budget exhaustion would relabel a real test
+    # failure as a timeout — and `VerifyAttempt.pure_timeout_failure` (whose
+    # `all(c.rc == 0 or c.timed_out ...)` clause a rc!=0 + timed_out=True check
+    # satisfies) would then re-run the whole thing `max_retries` times at a full
+    # budget each and route it to infra-hold instead of to the debugger.
+    #
+    #   * A genuine non-timeout failure keeps its `test_failure` classification.
+    #     Nothing is silently greened by dropping the flag: the unrun segments
+    #     stay fully visible via `CheckRun.segments` (`status='not_run'`,
+    #     `rc=None`, non-empty `skip_reason`), via the NOT RUN output blocks and
+    #     roster lines, and via run_verification's `| segments not run: <labels>`
+    #     cause_hint suffix. Only the CLASSIFICATION changes, and only toward
+    #     the truth.
+    #   * A green-so-far-but-truncated run still reports rc!=0 AND
+    #     timed_out=True — that is the case this synthetic flag exists for, and
+    #     it classifies as `infra_timeout` (retryable) exactly as a single-chain
+    #     timeout does today, leaving the retry/env-recovery machinery untouched.
+    #   * A segment that ACTUALLY hit its wall clock still forces
+    #     `timed_out=True` unconditionally through `any_timed_out`. That is a
+    #     real timeout and is deliberately unchanged; only the SYNTHETIC flag is
+    #     conditional.
+    #
+    # Load-bearing, not an edge case: removing the `&&` short-circuit (the whole
+    # point of task 3338) makes budget exhaustion strictly MORE likely, since
+    # all 8 segments now always run where the shell previously stopped at the
+    # first red — and the committed config's own measured table already records
+    # five of seven segments costing 1838.60s. So red-plus-exhausted is the
+    # COMMON shape of a red fallback verify. Under the old `&&` chain the shell
+    # short-circuited at the red and the check finished fast with
+    # rc=1/timed_out=False/`test_failure`; without this conditional, segmenting
+    # would be a regression against that baseline. Pinned as a pair by
+    # test_verify_segmented_fallback's
+    # `test_a_red_segment_before_the_deadline_still_wins_the_rc` and
+    # `test_a_green_so_far_run_whose_tail_is_unrun_still_reports_timed_out`.
+    timed_out_total = any_timed_out or (any_not_run and first_nonzero == 0)
     output = '\n'.join(_segment_roster(results) + blocks)
-    return rc_total, output, any_timed_out or any_not_run, results
+    return rc_total, output, timed_out_total, results
 
 
 # Roster status words, chosen to be INERT to `_extract_cause_hint`'s ladder and
