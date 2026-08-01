@@ -95,8 +95,41 @@ function verdictBadge(metric) {
   return { cls: 'badge muted', label: 'no verdict' };
 }
 
+// ── Escalation link ──
+//
+// A real <button>, not an <a href="#esc/...">.  The SPA has no router and no
+// anchors anywhere in static/redux — tab state is React state in app.jsx and
+// rows are selected with onClick handlers — so a fragment href would be a dead
+// affordance.  `onNavigate` is threaded down from app.jsx (step-18); when it is
+// absent the control renders disabled with a title saying so, never silently
+// inert.
+//
+// Built from `escalation.id` alone: the projection carries exactly id, summary,
+// severity, level, created_at and dedupe_fingerprint — there is no url.
+function EscalationLink({ escalation, onNavigate }) {
+  const wired = !!onNavigate;
+  return (
+    <button
+      type="button"
+      className="chip esc-link"
+      data-testid="memory-eval-escalation-link"
+      disabled={!wired}
+      title={wired
+        ? `open escalation ${escalation.id} in the Escalations tab`
+        : 'navigation unavailable — this section was rendered without an onNavigate handler'}
+      onClick={() => { if (onNavigate) onNavigate('esc', escalation.id); }}
+    >
+      <span className="mono">{escalation.id}</span>
+      <span style={{ color: 'var(--fg-2)' }}>{escalation.summary}</span>
+      <span style={{ color: 'var(--fg-3)' }}>
+        L{escalation.level} · {escalation.severity}
+      </span>
+    </button>
+  );
+}
+
 // ── One metric row ──
-function MemoryEvalMetricRow({ metric }) {
+function MemoryEvalMetricRow({ metric, onNavigate }) {
   const m = metric;
   const trend = m.trend || { labels: [], values: [] };
   const Chart = chartForKind(m.kind);
@@ -118,6 +151,27 @@ function MemoryEvalMetricRow({ metric }) {
         {m.limit_ref && (
           <div className="mono" style={{ fontSize: 10, color: 'var(--fg-3)' }}>
             {m.limit_ref}
+          </div>
+        )}
+        {/* Under storm the per-metric escalations were deliberately collapsed
+            into the one aggregate, so the absence of a link here is explained
+            rather than left looking like a missing link. */}
+        {m.parity === 'storm_collapsed'
+          ? (
+            <div className="mono" style={{ fontSize: 10, color: 'var(--fg-3)' }}>
+              link suppressed — storm aggregate
+            </div>
+          )
+          : m.escalation && (
+            <div style={{ marginTop: 4 }}>
+              <EscalationLink escalation={m.escalation} onNavigate={onNavigate} />
+            </div>
+          )}
+        {/* Fingerprints are rendered whole — never parsed. They are the
+            producer's private construction (memory_evals.py:576-579). */}
+        {m.fingerprint && (
+          <div className="mono" style={{ fontSize: 10, color: 'var(--fg-3)' }}>
+            fp {m.fingerprint}
           </div>
         )}
       </td>
@@ -151,8 +205,77 @@ function MemoryEvalMetricRow({ metric }) {
   );
 }
 
+// ── Storm aggregate banner ──
+//
+// Reads the TOP-LEVEL storm_escape block (memory_evals.py:958-964), never the
+// copy repeated on an eval row: the top-level block is the single banner
+// source, so the UI never has to elect a row to read it from and the banner
+// survives a root with zero eval dirs.
+function StormBanner({ storm, onNavigate }) {
+  if (!storm) return null;
+  return (
+    <div
+      className="badge bad"
+      data-testid="memory-eval-storm-banner"
+      style={{ width: '100%', justifyContent: 'flex-start', padding: '6px 10px', gap: 8, flexWrap: 'wrap' }}
+    >
+      <span>
+        storm escape — {storm.alarm_count} alarms collapsed into one aggregate
+        escalation
+      </span>
+      {storm.aggregate_fingerprint && (
+        <span className="mono" style={{ color: 'var(--fg-3)' }}>
+          fp {storm.aggregate_fingerprint}
+        </span>
+      )}
+      {storm.escalation
+        ? <EscalationLink escalation={storm.escalation} onNavigate={onNavigate} />
+        : (
+          <span className="mono" style={{ color: 'var(--fg-3)' }}>
+            no open escalation carries this aggregate_fingerprint
+          </span>
+        )}
+    </div>
+  );
+}
+
+// ── Unmatched escalations ──
+//
+// Branched on `reason`, with distinct wording per value.  Collapsing the three
+// into one undifferentiated "unexplained" list would fire on escalations that
+// are in fact fully explained and train operators to ignore the one signal
+// that catches a real parity orphan (memory_evals.py:530-534).
+function unmatchedReasonText(reason) {
+  if (reason === 'no_matching_verdict') return 'no metric row explains this';
+  if (reason === 'storm_suppressed') return "explained, but this run's links are collapsed into the aggregate";
+  if (reason === 'no_fingerprint') return 'producer emitted no dedupe_fingerprint';
+  return `unrecognised reason: ${String(reason)}`;
+}
+
+function UnmatchedEscalations({ rows, onNavigate }) {
+  if (!rows || rows.length === 0) return null;
+  return (
+    <div className="panel">
+      <div className="panel-head">
+        <span className="title">Escalations with no matching metric row</span>
+        <span className="meta">{rows.length}</span>
+      </div>
+      <div className="panel-body" style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        {rows.map(row => (
+          <div key={row.id} style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <EscalationLink escalation={row} onNavigate={onNavigate} />
+            <span className="mono" style={{ fontSize: 10, color: 'var(--fg-3)' }}>
+              {row.reason} — {unmatchedReasonText(row.reason)}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 // ── One eval card ──
-function MemoryEvalCard({ ev }) {
+function MemoryEvalCard({ ev, onNavigate }) {
   const metrics = ev.metrics || [];
   const corpus = ev.corpus;
   return (
@@ -192,7 +315,7 @@ function MemoryEvalCard({ ev }) {
           </thead>
           <tbody>
             {metrics.map(m => (
-              <MemoryEvalMetricRow key={m.metric_id} metric={m} />
+              <MemoryEvalMetricRow key={m.metric_id} metric={m} onNavigate={onNavigate} />
             ))}
           </tbody>
         </table>
@@ -202,7 +325,7 @@ function MemoryEvalCard({ ev }) {
 }
 
 // ── The section ──
-function MemoryEvalsSection() {
+function MemoryEvalsSection({ onNavigate }) {
   const payload = MEDF.MEMORY_EVALS;
   const evals = payload.evals || [];
   return (
@@ -212,11 +335,19 @@ function MemoryEvalsSection() {
           memory evals
         </span>
       </div>
+      {payload.storm_escape && (
+        <div className="col-span-12">
+          <StormBanner storm={payload.storm_escape} onNavigate={onNavigate} />
+        </div>
+      )}
       {evals.map(ev => (
         <div className="col-span-12" key={ev.eval_id}>
-          <MemoryEvalCard ev={ev} />
+          <MemoryEvalCard ev={ev} onNavigate={onNavigate} />
         </div>
       ))}
+      <div className="col-span-12">
+        <UnmatchedEscalations rows={payload.unmatched_escalations} onNavigate={onNavigate} />
+      </div>
     </div>
   );
 }
