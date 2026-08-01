@@ -7413,6 +7413,53 @@ class TestExtractMetaFiles:
         result = TaskInterceptor._extract_meta_files(kwargs)
         assert result == ['42', 'src/foo.py']
 
+    def test_scalar_non_string_value_is_discarded_not_raised(self):
+        """A non-iterable ``files`` value degrades to no signal — it never raises.
+
+        Task 3407 (found while applying task 3106's review amendments):
+        ``metadata`` is unvalidated caller kwargs at this seam and
+        ``_parse_metadata`` warns-and-continues rather than raising, so this
+        helper must too — a malformed submission is a graceful degrade (the
+        FILES-certain hard reject and the cross-repo tagger both see ``[]``),
+        not a ``TypeError`` escaping ``submit_task`` as an unstructured crash.
+        Mirrors task 3106's guard in the sibling
+        ``_extract_deliverable_signals_from_meta``.
+        """
+        assert TaskInterceptor._extract_meta_files({'metadata': {'files': 5}}) == []
+
+    def test_dict_value_is_discarded_rather_than_iterated_as_keys(self):
+        """The quiet variant: a dict must not silently drive the hard reject off its KEYS.
+
+        Plain iteration would yield ``'a/b.py'`` here and could silently
+        trigger the FILES-certain hard reject / cross-repo tagging off
+        metadata the author never meant as a path list.
+        """
+        result = TaskInterceptor._extract_meta_files({'metadata': {'files': {'a/b.py': 1}}})
+        assert result == []
+
+    def test_malformed_files_falls_through_to_files_to_modify(self):
+        """A malformed ``files`` value is discarded like an absent one — the
+        precedence cascade still falls through to ``files_to_modify``."""
+        kwargs = {'metadata': {'files': 5, 'files_to_modify': ['legacy.py']}}
+        result = TaskInterceptor._extract_meta_files(kwargs)
+        assert result == ['legacy.py']
+
+    def test_malformed_files_to_modify_alone_returns_empty(self):
+        """A malformed ``files_to_modify`` with no ``files`` key → []."""
+        kwargs = {'metadata': {'files_to_modify': {'a/b.py': 1}}}
+        result = TaskInterceptor._extract_meta_files(kwargs)
+        assert result == []
+
+    def test_tuple_and_set_values_are_accepted(self):
+        """Sequence shapes other than list still carry signal (matches the
+        sibling ``_extract_deliverable_signals_from_meta`` helper)."""
+        assert TaskInterceptor._extract_meta_files(
+            {'metadata': {'files': ('a/x.py', 'b/y.py')}},
+        ) == ['a/x.py', 'b/y.py']
+        assert TaskInterceptor._extract_meta_files(
+            {'metadata': {'files_to_modify': {'c/z'}}},
+        ) == ['c/z']
+
     def test_build_candidate_parses_metadata_once(self, monkeypatch):
         """_build_candidate must call _parse_metadata at most once per invocation.
 

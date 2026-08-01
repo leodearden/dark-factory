@@ -1514,14 +1514,47 @@ class TaskInterceptor:
         Priority: ``files`` (canonical orchestrator field) →
         ``files_to_modify`` (legacy curator-internal name). Coerces the
         result to a list of non-empty strings, and returns ``[]`` when
-        neither key is present or the value is empty / falsy.
+        neither key is present, both values are empty / falsy, or both
+        values are malformed (see below).
+
+        Malformed-value guard (task 3407): mirrors
+        :meth:`_extract_deliverable_signals_from_meta`'s guard (task 3106).
+        ``metadata`` is unvalidated caller kwargs at this seam and
+        :meth:`_parse_metadata` deliberately warns-and-continues rather than
+        raising, so a value that is neither a string nor a list/tuple/set
+        (e.g. ``files: 5``) is discarded the same way instead of raising
+        ``TypeError`` out of :func:`check_files_for_scope` /
+        :func:`all_files_foreign_owner` as an unstructured crash — a
+        discarded ``files`` falls through to ``files_to_modify``, same as
+        an absent/falsy one. A dict value (e.g. ``files: {'a/b.py': 1}``)
+        is the quiet variant: plain iteration would walk its KEYS and could
+        silently drive the FILES-certain hard reject off metadata the
+        author never meant as a path list, so it is discarded too rather
+        than iterated.
 
         Callers that have not yet parsed metadata should use the kwargs-taking
         entry point :meth:`_extract_meta_files` instead.
         """
-        files = meta.get('files') or meta.get('files_to_modify') or []
-        if isinstance(files, str):
-            files = [files]
+        files: list | tuple | set | None = None
+        for key in ('files', 'files_to_modify'):
+            value = meta.get(key)
+            if not value:
+                continue
+            if isinstance(value, str):
+                value = [value]
+            if not isinstance(value, (list, tuple, set)):
+                logger.warning(
+                    'task_metadata.schema_warning source=%s error=%s '
+                    '(type=%s); meta-files key discarded',
+                    'TaskInterceptor._extract_meta_files_from_meta',
+                    f'metadata.{key} is not a list/tuple/set of paths',
+                    type(value).__name__,
+                )
+                continue
+            files = value
+            break
+        if files is None:
+            files = []
         return [str(f) for f in files if f]
 
     @staticmethod
