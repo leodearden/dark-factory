@@ -93,6 +93,73 @@ def is_member(cwd: str, cwd_prefixes: Sequence[str]) -> bool:
     return any(cwd_path.is_relative_to(Path(prefix)) for prefix in cwd_prefixes)
 
 
+UNREADABLE_FILE_ERRORS = (EOFError, zlib.error, UnicodeDecodeError)
+"""The non-``OSError`` exceptions that mean "this transcript is unreadable".
+
+The catch tuple for :func:`as_unreadable_file_error`, named here so the two
+transcript readers cannot drift apart in WHICH shapes they normalize (see
+that function for WHY each one is on the list). ``gzip.BadGzipFile`` is
+absent deliberately: it is already an ``OSError``, so it needs no
+normalization and propagates untouched.
+
+Public, for the same reason :func:`iter_json_lines` is: it crosses a module
+boundary (``digest.load_transcript`` catches on it), and a consumer reaching
+for an underscore name across that boundary is how a second, quietly
+different answer to "which exceptions mean an unreadable file" gets written.
+"""
+
+
+def as_unreadable_file_error(exc: BaseException) -> OSError:
+    """Normalize an unreadable-transcript exception to one ``OSError``.
+
+    THE single answer to "which exceptions mean this transcript cannot be
+    read, and what does that read as to a caller". Both transcript readers —
+    :func:`iter_json_lines` and its slurping sibling ``digest.load_transcript``
+    — funnel through here, so the normalization is structurally shared rather
+    than copy-pasted and test-pinned in sync (reviewer_comprehensive
+    /duplication, task 3214 amendment pass).
+
+    Why normalization is needed at all: an unreadable transcript surfaces as
+    FOUR different exception types, only the first of which is already an
+    ``OSError``::
+
+        bad magic         -> gzip.BadGzipFile     (an OSError subclass)
+        truncated stream  -> EOFError             (not an OSError)
+        corrupt body      -> zlib.error           (not an OSError)
+        undecodable byte  -> UnicodeDecodeError   (a ValueError, not an OSError)
+
+    The last three are exactly what a fire-and-forget writer produces when a
+    unit is killed mid-write, a file is read while still being compressed, or
+    a stored byte flips; the archived fleet transcripts these readers walk are
+    live runtime state, so all three are expected shapes, not theoretical
+    ones. The decode shape is the odd one out in two ways worth stating: it is
+    the only shape reachable on a PLAIN ``.jsonl`` path as well as a ``.gz``
+    one (both are opened under strict ``encoding='utf-8'``), and it arrives as
+    a ``ValueError`` subclass, so an ``except OSError``-only handler misses it
+    however the gzip shapes are handled. Left un-normalized, any of them
+    escapes every consumer's degrade path and aborts a whole-archive walk over
+    one bad file.
+
+    ``OSError`` is the normalized type because it is what ``sampling``,
+    ``check_transcript_persistence`` and the cross-package
+    ``memory_eval_transcript_corpus`` extractor already code against. The
+    original message is preserved in the text, so a coverage report can still
+    tell a half-written transcript from a corrupted one from an undecodable
+    one — the decode shape gets its own wording rather than being labelled a
+    "gzip stream" failure, which would misdirect an operator reading a
+    disclosed reason for a plain ``.jsonl`` file.
+
+    Total and idempotent: an exception that is ALREADY an ``OSError`` (the bad
+    magic shape) is returned unchanged rather than double-wrapped, so a caller
+    can hand it anything it caught without first classifying it.
+    """
+    if isinstance(exc, OSError):
+        return exc
+    if isinstance(exc, UnicodeDecodeError):
+        return OSError(f'undecodable transcript bytes: {exc}')
+    return OSError(f'corrupt or truncated gzip stream: {exc}')
+
+
 def iter_json_lines(path: Path) -> Iterator[dict[str, Any]]:
     """Yield parsed dict records from a JSONL file, skipping blank/malformed lines.
 
@@ -129,32 +196,12 @@ def iter_json_lines(path: Path) -> Iterator[dict[str, Any]]:
     coverage rely on it to count unreadable files without inflating the
     count with truncated trailing lines.
 
-    Making that ``OSError`` promise true takes explicit normalization,
-    because an unreadable file surfaces as FOUR different exception types —
-    only the first of which is already an ``OSError``::
-
-        bad magic         -> gzip.BadGzipFile     (an OSError subclass)
-        truncated stream  -> EOFError             (not an OSError)
-        corrupt body      -> zlib.error           (not an OSError)
-        undecodable byte  -> UnicodeDecodeError   (a ValueError, not an OSError)
-
-    The last three are exactly what a fire-and-forget writer produces when a
-    unit is killed mid-write, a file is read while still being compressed, or
-    a stored byte flips; the archived fleet transcripts this reader walks are
-    live runtime state, so all three are expected shapes, not theoretical
-    ones. The decode shape is the odd one out in two ways worth stating: it
-    is the only shape reachable on a PLAIN ``.jsonl`` path as well as a
-    ``.gz`` one (both are opened under strict ``encoding='utf-8'``), and it
-    arrives as a ``ValueError`` subclass, so an ``except OSError``-only
-    handler misses it however the gzip shapes are handled. Left
-    un-normalized any of them escapes every consumer's degrade path and
-    aborts a whole-archive walk over one bad file. This reader therefore
-    re-raises all of them as ``OSError`` (preserving the original message, so
-    a coverage report can still tell a half-written transcript from a
-    corrupted one from an undecodable one), which is the single contract
-    ``sampling``, ``check_transcript_persistence`` and the cross-package
-    ``memory_eval_transcript_corpus`` extractor all already code against with
-    ``except OSError``.
+    Making that ``OSError`` promise true takes explicit normalization: an
+    unreadable file surfaces as four different exception types, only one of
+    which is already an ``OSError``. :func:`as_unreadable_file_error` is the
+    single place that says which ones and why, and ``digest.load_transcript``
+    funnels through the same helper, so the two readers are interchangeable
+    at this boundary by construction rather than by matching copies.
 
     Note the decode shape is normalized at the FILE level, not degraded at
     the line level: a bad byte aborts the underlying text-IO read, so there
@@ -171,10 +218,11 @@ def iter_json_lines(path: Path) -> Iterator[dict[str, Any]]:
         # The wrap covers only the read/decompress iteration — decompression
         # happens lazily HERE, per chunk, not at open() — while the
         # JSONDecodeError skip stays inside the loop, so the file-level vs
-        # line-level split above is preserved. Deliberately not `except
-        # Exception`: the point is to normalize three known unreadable-file
-        # failures, not to swallow errors from the caller's consumption of
-        # this generator.
+        # line-level split above is preserved. The catch tuple is the shared
+        # UNREADABLE_FILE_ERRORS rather than a local literal, deliberately:
+        # `except Exception` would swallow errors from the caller's
+        # consumption of this generator, and a local tuple would be a second
+        # answer that could drift from digest.load_transcript's.
         try:
             for line in f:
                 line = line.strip()
@@ -186,25 +234,31 @@ def iter_json_lines(path: Path) -> Iterator[dict[str, Any]]:
                     continue
                 if isinstance(record, dict):
                     yield record
-        except (EOFError, zlib.error) as exc:
-            raise OSError(f'corrupt or truncated gzip stream: {exc}') from exc
-        except UnicodeDecodeError as exc:
-            # Separate clause, not a third member of the tuple above: this
-            # shape is reachable on a plain `.jsonl` path too, so labelling
-            # it a "gzip stream" failure would misdirect an operator reading
-            # the disclosed reason. The original message (byte and offset) is
-            # preserved either way.
-            raise OSError(f'undecodable transcript bytes: {exc}') from exc
+        except UNREADABLE_FILE_ERRORS as exc:
+            raise as_unreadable_file_error(exc) from exc
 
 
 _iter_json_lines = iter_json_lines
-"""Retained alias for the pre-promotion private name.
+"""DEPRECATED alias for the pre-promotion private name. New code must not use it.
 
-The same object as :func:`iter_json_lines` (asserted in
-``test_legibility_inventory.TestPublicIterJsonLines``), kept so the existing
-callers — ``sampling``, ``check_transcript_persistence`` — need no edit and
-the several docstrings citing the old name stay accurate. New code should
-use the public name.
+The same object as :func:`iter_json_lines`, not a second implementation
+(asserted in ``test_legibility_inventory.TestPublicIterJsonLines``).
+
+**This alias is transitional and has a named removal condition**, so it does
+not become a permanent second name with no owner
+(reviewer_comprehensive/architecture, task 3214 amendment pass). It exists
+solely for two remaining in-package call sites that task 3214 could not edit
+— they are outside the modules that task holds locks for, so touching them
+would have widened its concurrency footprint:
+
+- ``sampling.py`` — ``from legibility.inventory import _iter_json_lines``
+  (plus docstring citations of the old name)
+- ``check_transcript_persistence.py`` — ``inventory._iter_json_lines(path)``
+
+Remove this alias once those two lines are switched to
+:func:`iter_json_lines`. Both are one-line changes in this repo; there are
+NO known out-of-repo callers, so nothing else gates the removal. Filed as a
+follow-up task rather than left implicit.
 """
 
 

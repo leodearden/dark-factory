@@ -405,6 +405,65 @@ class TestLoadTranscriptCorruptionShapes:
 
         assert [r['message']['content'] for r in loaded] == ['one', 'two']
 
+    def test_the_two_readers_share_one_normalization(self):
+        # The agreement assertions above verify the two readers BEHAVE the
+        # same; this one verifies they cannot stop. Before task 3214's
+        # amendment pass the normalization was copy-pasted into both readers
+        # and only these tests held the copies in sync — a reviewer-flagged
+        # duplication smell (a test pinning two copies together is not the
+        # same as there being one). Now digest re-exports inventory's names
+        # rather than defining its own, so an edit to one reader's failure
+        # contract is an edit to both by construction.
+        assert mod.as_unreadable_file_error is inventory_mod.as_unreadable_file_error
+        assert mod.UNREADABLE_FILE_ERRORS is inventory_mod.UNREADABLE_FILE_ERRORS
+
+
+class TestAsUnreadableFileError:
+    """The one place that answers 'which exceptions mean an unreadable file'."""
+
+    def test_normalizes_the_gzip_stream_shapes(self):
+        for exc in (EOFError('ended early'), zlib.error('bad block')):
+            normalized = inventory_mod.as_unreadable_file_error(exc)
+
+            assert isinstance(normalized, OSError)
+            assert 'corrupt or truncated gzip stream' in str(normalized)
+            assert str(exc) in str(normalized)
+
+    def test_decode_shape_gets_its_own_wording(self):
+        # Not a "gzip stream" failure: this shape is reachable on a plain
+        # .jsonl path too, so that label would misdirect an operator reading
+        # a disclosed coverage reason.
+        exc = UnicodeDecodeError('utf-8', b'\xff', 0, 1, 'invalid start byte')
+
+        normalized = inventory_mod.as_unreadable_file_error(exc)
+
+        assert isinstance(normalized, OSError)
+        assert 'undecodable transcript bytes' in str(normalized)
+        assert 'gzip stream' not in str(normalized)
+
+    def test_an_oserror_passes_through_unwrapped(self):
+        # gzip.BadGzipFile is ALREADY an OSError, so it needs no
+        # normalization. Returning it unchanged keeps the helper idempotent —
+        # a caller can hand it anything it caught without first classifying
+        # it, and a bad-magic message never acquires a misleading second
+        # "corrupt or truncated gzip stream" prefix.
+        original = gzip.BadGzipFile('Not a gzipped file')
+
+        assert inventory_mod.as_unreadable_file_error(original) is original
+
+    def test_the_catch_tuple_omits_oserror_shapes(self):
+        # UNREADABLE_FILE_ERRORS is exactly the set that is NOT already an
+        # OSError. A shape wrongly added here would be caught and re-wrapped
+        # rather than propagating, and gzip.BadGzipFile in particular must
+        # keep reaching callers by its own inheritance.
+        assert inventory_mod.UNREADABLE_FILE_ERRORS == (
+            EOFError, zlib.error, UnicodeDecodeError,
+        )
+        assert not any(
+            issubclass(exc_type, OSError)
+            for exc_type in inventory_mod.UNREADABLE_FILE_ERRORS
+        )
+
 
 # ---------------------------------------------------------------------------
 # iter_user_turns — genuine non-sidechain, non-meta human turns only.
