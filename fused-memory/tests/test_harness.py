@@ -2841,6 +2841,26 @@ async def test_project_loop_consumes_unhalt_grace(journal, event_buffer, mock_me
     # The journal mock should return decremented values
     harness.journal.decrement_unhalt_grace = AsyncMock(return_value=1)
 
+    # Witness for the drive below. It MUST hang off consume_grace_cycle rather
+    # than the journal.decrement_unhalt_grace mock above: consume_grace_cycle
+    # assigns self._unhalt_grace_remaining[project_id] AFTER awaiting the
+    # journal (judge.py:1083), and the drive cancels run_loop as soon as the
+    # event fires — so an event set from inside the journal mock would leave a
+    # window where the loop is cancelled between the journal await and that
+    # assignment, making the `== 1` assertion below a coin flip. Setting it in
+    # a finally AFTER the real callee returns is what makes that state
+    # committed by the time the drive returns. Do not "simplify" this inward.
+    consumed = asyncio.Event()
+    real_consume = harness.judge.consume_grace_cycle
+
+    async def _signal_consume(*a, **k):
+        try:
+            return await real_consume(*a, **k)
+        finally:
+            consumed.set()
+
+    harness.judge.consume_grace_cycle = AsyncMock(side_effect=_signal_consume)
+
     for _ in range(3):
         await event_buffer.push(_make_event())
 
