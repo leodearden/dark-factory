@@ -306,7 +306,7 @@ STRATA: tuple[str, ...] = (
 _WORKTREE_DIR_MARKERS: tuple[str, ...] = (
     '--worktrees-', '--claude-worktrees-',
     # reify's warm-lane and build-worktree encoded-dir shapes (task 2612):
-    # encode_cwd (inventory.py) maps both '/' and '.' to '-', so
+    # encode_cwd (inventory.py) maps '/', '.' and '_' all to '-', so
     # /home/leo/src/reify/.warm-lanes/worktrees/<id> and
     # .../reify/build-worktrees/<id> never produce the double-dash
     # '--worktrees-'/'--claude-worktrees-' form above.

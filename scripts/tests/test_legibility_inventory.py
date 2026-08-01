@@ -1,8 +1,9 @@
 """Tests for scripts/legibility/inventory.py — session enumeration (PRD §5.2 point 2).
 
-``inventory.encode_cwd`` mirrors
-``orchestrator.session_registry.transcript_path_for_cwd``'s cwd encoding
-(both ``/`` and ``.`` map to ``-``). A project's agents span many encoded
+``inventory.encode_cwd`` mirrors ``orchestrator.session_registry.encode_cwd``,
+the canonical cwd encoding (``/``, ``.`` and ``_`` all map to ``-``, and case
+is preserved); ``TestEncoderLockstep`` below holds every in-repo copy of that
+rule to the canonical AND to real on-disk dir names. A project's agents span many encoded
 dirs (57 for dark-factory today: main checkout + ``.worktrees``/
 ``.claude-worktrees`` children), so membership is resolved from the
 session's REAL ``cwd`` (read from a transcript line) via path-component
@@ -71,7 +72,9 @@ class TestEncodeCwd:
         assert mod.encode_cwd(MAIN_CWD) == '-home-leo-src-dark-factory'
 
     def test_worktrees_child_maps_slash_and_dot(self):
-        # Both '/' and '.' -> '-', mirroring transcript_path_for_cwd exactly.
+        # Two of the three characters; see test_underscore_maps_to_dash for
+        # the third. A leading '.' on a path component yields a doubled '--'
+        # (one dash from the preceding '/', one from the '.').
         assert mod.encode_cwd(WORKTREE_CWD) == '-home-leo-src-dark-factory--worktrees-2573'
 
     def test_underscore_maps_to_dash(self):
@@ -142,6 +145,15 @@ class TestEncoderLockstep:
     encoder under test, so the fixtures tracked the bug. Only literals read
     off a real ``~/.claude/projects`` tree can detect an encoder that is
     self-consistently wrong.
+
+    SCOPE — what this does NOT cover. There is a fifth copy of the rule in
+    bash, ``skills/spawn/spawn-claude.sh``'s ``_encode_cwd``, which no Python
+    test can import. It is still on the two-character rule and is out of
+    scope for task 3272 (filed as follow-up; see that task for the
+    measurement). Adding a Python mirror here is only ever the DEFAULT
+    place to put a copy of this rule — if you add one elsewhere, add it to
+    :meth:`_mirrors` too, and if you add one in another language, say so
+    here rather than letting this docstring imply coverage it lacks.
     """
 
     def _mirrors(self):
