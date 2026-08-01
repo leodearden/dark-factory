@@ -60,7 +60,6 @@ from orchestrator.verify_cmd import (
     scope_to,
     serial_pytest,
     split_chain_tail,
-    split_top_level_and,
     strip_cwd,
     with_junitxml,
     with_pytest_timeout,
@@ -172,8 +171,13 @@ def _scope_to_keyword(cmd: str | None, keyword: str, files: list[str]) -> str | 
     silently cost the junit report that drives
     ``_extract_failing_test_ids_from_junit``, flake confirmation and the
     per-test timeout floor. The dropped clauses are not silent: a
-    multi-clause command whose tail the gate rejects is reported at DEBUG
-    below, naming the keyword and the dropped-clause count.
+    multi-clause command whose tail the gate rejects is reported by
+    ``verify_plan.log_dropped_chain_clauses`` below, naming the keyword and
+    the dropped-clause count — at DEBUG for an intended same-tool fan-out
+    truncation, at INFO for the pytest slot, where the dropped clause is a
+    sibling check that will now never run. The record is emitted only on the
+    rewriting path: both bail-outs below return *cmd* with its chain intact,
+    so nothing is dropped there and nothing is reported.
 
     Lockstep with ``verify_plan._scope_prefix_to_keyword`` (the ``VerifyCmd``-
     layer counterpart) is now STRUCTURAL rather than a convention: both route
@@ -186,26 +190,34 @@ def _scope_to_keyword(cmd: str | None, keyword: str, files: list[str]) -> str | 
     if cmd is None:
         return None
     head, tail = split_chain_tail(cmd, keyword)
-    # DEBUG, not the WARNING the reverse-dependency widening's no-op uses
-    # further down this module: dropping a same-tool fan-out tail is INTENDED
-    # behaviour, and the root `type_check_command` hits it on every fallback
-    # verify — a WARNING there would be steady noise that trains operators to
-    # ignore the record. The genuine capability loss (a junit report expected
-    # but not collected) is reported at INFO by `_with_junitxml_str`.
-    if has_unpreserved_chain_clauses(cmd, tail):
-        logger.debug(
-            'scope-to-keyword %r dropped %d trailing chain clause(s) from %r '
-            '(gate rejected tail preservation)',
-            keyword,
-            len(split_top_level_and(cmd)) - 1,
-            cmd,
-        )
     idx = head.find(keyword)
     if idx == -1:
         return cmd
     parsed = parse_config_command(head[: idx + len(keyword)])
     if parsed.tool is ToolKind.OPAQUE or parsed.raw is not None:
         return cmd
+    # Sited AFTER both bail-outs on purpose: each of them returns *cmd* — the
+    # whole original, chain and all — so a gate REJECT costs nothing there and
+    # a record would name clauses that in fact still run. Only the rewriting
+    # path below actually discards them. A record that does not correspond to
+    # a real drop is the same failure mode this log exists to avoid.
+    #
+    # DEBUG for an intended same-tool fan-out truncation, not the WARNING the
+    # reverse-dependency widening's no-op uses further down this module: the
+    # root `type_check_command` hits it on every fallback verify, and a
+    # WARNING there would be steady noise that trains operators to ignore the
+    # record. The PYTEST slot is the exception and reads at INFO: there the
+    # dropped clause is a SIBLING CHECK that will now never run, which is the
+    # possible-false-GREEN direction — strictly worse than the missing junit
+    # report `_with_junitxml_str` already reports at INFO, so it is reported
+    # at the same level and in the same shape.
+    #
+    # The record itself is `verify_plan`'s, emitted onto THIS module's logger.
+    # Sharing the one implementation is what makes the two scopers' records
+    # read alike structurally rather than by hand-mirroring — the same
+    # argument that put the tail-preservation policy in one shared gate.
+    if has_unpreserved_chain_clauses(cmd, tail):
+        verify_plan.log_dropped_chain_clauses(logger, cmd, keyword)
     rendered = render(strip_cwd(scope_to(parsed, files)))
     return f'{rendered} {tail}' if tail else rendered
 
@@ -241,9 +253,14 @@ def _reproject_str(cmd: str | None, project: str) -> str | None:
 
     This helper is only ever called on a ``lint_command`` /
     ``type_check_command`` (the fallback path's three call sites), never on a
-    ``test_command`` — so its preserved tail can never reach the junitxml
-    injection site and the ``'uv run'`` allowlist entry cannot resurrect the
-    no-op task 3218 closed for the pytest slot. When the gate
+    ``test_command``. That is a convention, though, not something the gate can
+    check — and ``'uv run'`` is a WRAPPER phrase, so a caller who did point it
+    at ``'uv run pytest tests/ && python3 check.py tests'`` would clear the
+    keyword allowlist and hand the pytest slot a preserved tail, resurrecting
+    the exact no-op task 3218 closed. The gate therefore does not rely on the
+    convention: its condition 0b independently refuses a tail to any first
+    clause that INVOKES pytest, whatever keyword it was called with, so this
+    entry is closed against that misuse structurally. When the gate
     rejects, ``head is cmd`` and ``tail == ''``, so the body below collapses
     to its pre-gate form byte-for-byte. All three bail-outs return *cmd* —
     the full original, never ``head`` — so a rejected command can never be

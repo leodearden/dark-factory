@@ -274,6 +274,54 @@ class VerifyPlan:
         }
 
 
+def log_dropped_chain_clauses(log: logging.Logger, raw: str, keyword: str) -> None:
+    """Report onto *log* the trailing chain clauses a gate REJECT discarded from *raw*.
+
+    Shared by BOTH scopers — ``_scope_prefix_to_keyword`` below and
+    ``verify._scope_to_keyword``, which passes its own module logger — so the
+    two records read alike structurally rather than by hand-mirroring. Same
+    argument that put the tail-preservation policy in one shared
+    ``split_chain_tail`` gate: lockstep the pair cannot drift out of. It lives
+    here rather than in ``verify_cmd`` because ``verify`` already imports this
+    module (not the reverse), and because keeping ``verify_cmd`` logging-free
+    is what lets ``has_unpreserved_chain_clauses`` stay a pure predicate.
+
+    Callers MUST gate this on ``has_unpreserved_chain_clauses(raw, tail)`` and
+    MUST call it only on the path that actually rewrites the command: both
+    scopers' bail-outs return the whole original, chain and all, so a record
+    emitted before them would name clauses that in fact still run.
+
+    LEVEL is split by slot. The ordinary case is an intended SAME-TOOL FAN-OUT
+    truncation — the root ``type_check_command`` hits it on every fallback
+    verify — so it is DEBUG rather than the WARNING the reverse-dependency
+    widening's no-op uses, which at that frequency would just train operators
+    to ignore the record. The PYTEST slot is the exception and reads at INFO:
+    ``'pytest'`` is off ``_TAIL_PRESERVING_KEYWORDS``, so what gets dropped
+    there is a SIBLING CHECK that will now never run. That is the
+    possible-false-GREEN direction — the bug class the tail-preservation gate
+    exists to close — and therefore strictly worse than the missing junit
+    report ``verify._with_junitxml_str`` already reports at INFO, whose shape
+    this record mirrors.
+    """
+    pytest_slot = keyword == 'pytest'
+    log.log(
+        logging.INFO if pytest_slot else logging.DEBUG,
+        'scope-to-keyword %r dropped %d trailing chain clause(s) from %r '
+        '(gate rejected tail preservation) — %s',
+        keyword,
+        len(split_top_level_and(raw)) - 1,
+        raw,
+        'a sibling check chained onto the test command will NOT run for this '
+        'verify'
+        if pytest_slot
+        else 'an intended same-tool fan-out truncation',
+        # Attribute the record to the CALLING scoper, not to this shared
+        # helper — otherwise every record, from either scoper, points at the
+        # same line here and the file/line is useless for telling them apart.
+        stacklevel=2,
+    )
+
+
 def _scope_prefix_to_keyword(raw: str, keyword: str, files: list[str]) -> VerifyCmd:
     """Scope *raw* to *files*, first-clause-scoping a raw-retained chain.
 
@@ -312,10 +360,15 @@ def _scope_prefix_to_keyword(raw: str, keyword: str, files: list[str]) -> Verify
     tail there would have silently cost the junit report that drives
     ``_extract_failing_test_ids_from_junit``, flake confirmation and the
     per-test timeout floor. The dropped clauses are not silent: a
-    multi-clause command whose tail the gate rejects is reported at DEBUG
-    below, naming the keyword and the dropped-clause count — the same record
-    ``verify._scope_to_keyword`` emits, since STRUCTURAL lockstep is this
-    pair's documented property.
+    multi-clause command whose tail the gate rejects is reported by
+    :func:`log_dropped_chain_clauses` below, naming the keyword and the
+    dropped-clause count — at DEBUG for an intended same-tool fan-out
+    truncation, at INFO for the pytest slot, where the dropped clause is a
+    sibling check that will now never run. ``verify._scope_to_keyword`` emits
+    that same record through that same shared helper, since STRUCTURAL
+    lockstep is this pair's documented property. It is emitted only on the
+    rewriting path: both bail-outs below return *raw* with its chain intact,
+    so nothing is dropped there and nothing is reported.
 
     If the *keyword*-prefix parses into a structured, non-OPAQUE command, it
     is scoped to *files*. When a tail was preserved the result is returned
@@ -342,22 +395,19 @@ def _scope_prefix_to_keyword(raw: str, keyword: str, files: list[str]) -> Verify
     unscoped = parsed if parsed.raw is not None else VerifyCmd(tool=parsed.tool, raw=raw)
 
     head, tail = split_chain_tail(raw, keyword)
-    # Mirrors verify._scope_to_keyword's record verbatim in substance — see
-    # there for why this is DEBUG rather than the widening site's WARNING.
-    if has_unpreserved_chain_clauses(raw, tail):
-        logger.debug(
-            'scope-to-keyword %r dropped %d trailing chain clause(s) from %r '
-            '(gate rejected tail preservation)',
-            keyword,
-            len(split_top_level_and(raw)) - 1,
-            raw,
-        )
     idx = head.find(keyword)
     if idx == -1:
         return unscoped
     prefix_parsed = parse_config_command(head[: idx + len(keyword)])
     if prefix_parsed.tool is ToolKind.OPAQUE or prefix_parsed.raw is not None:
         return unscoped
+    # Sited AFTER both bail-outs on purpose — each returns *unscoped*, i.e.
+    # *raw* in full with its chain intact, so nothing is dropped there and a
+    # record would name clauses that in fact still run. Only the rewriting
+    # path below actually discards them. Same record and same level policy as
+    # verify._scope_to_keyword's, because it is literally the same call.
+    if has_unpreserved_chain_clauses(raw, tail):
+        log_dropped_chain_clauses(logger, raw, keyword)
     scoped = strip_cwd(scope_to(prefix_parsed, files))
     if not tail:
         return scoped

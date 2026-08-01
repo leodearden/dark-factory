@@ -8947,16 +8947,34 @@ class TestWithJunitxmlStr:
         assert _with_junitxml_str(None, self._JUNIT) is None
 
     @pytest.mark.parametrize(
-        'cmd', ['ruff check src/', 'true'], ids=['non-pytest-ruff', 'opaque-true'],
+        'cmd',
+        [
+            'ruff check src/',
+            'true',
+            'uv run --directory orchestrator ruff check src/',
+        ],
+        ids=['non-pytest-ruff', 'opaque-true', 'non-round-tripping-directory'],
     )
     def test_noop_is_byte_identical(self, cmd: str):
         """The parse->render round-trip must be SKIPPED, not merely produce
         an equal string: a from-scratch render is only argv-equivalent, so
         the identity-check guard is what keeps a no-op byte-identical.
+
+        Asserted with ``is``, not ``==``. Equality cannot pin this: the first
+        two inputs happen to round-trip byte-identically, so an ``==`` version
+        of this test still passes with the ``rewritten is parsed`` guard
+        DELETED and the function always re-rendering. Identity is the only
+        assertion that distinguishes "returned the caller's own string" from
+        "rebuilt an equal one".
+
+        The third input is the case where the two come apart even under
+        ``==``: ``render`` re-emits a uv ``--directory X`` as a leading ``cd X
+        &&``, so a re-render would return ``'cd orchestrator && uv run ruff
+        check src/'`` — a different string for the same argv.
         """
         from orchestrator.verify import _with_junitxml_str
 
-        assert _with_junitxml_str(cmd, self._JUNIT) == cmd
+        assert _with_junitxml_str(cmd, self._JUNIT) is cmd
 
     def test_suppressed_injection_on_a_pytest_chain_is_logged(
         self, caplog: pytest.LogCaptureFixture,
@@ -8974,7 +8992,7 @@ class TestWithJunitxmlStr:
         with caplog.at_level(logging.INFO, logger='orchestrator.verify'):
             result = _with_junitxml_str(cmd, self._JUNIT)
 
-        assert result == cmd, 'the no-op must still be byte-identical'
+        assert result is cmd, "the no-op must still return the caller's own string"
         records = [r for r in caplog.records if r.name == 'orchestrator.verify']
         assert len(records) == 1, f'expected exactly one record, got {[r.message for r in records]}'
         assert records[0].levelno == logging.INFO

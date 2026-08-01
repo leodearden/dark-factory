@@ -1294,6 +1294,64 @@ class TestTailPreservationAllowlist:
         assert tail == ''
         assert prefix != split_top_level_and(_SIBLING_CHECKER_TEST_COMMAND_UNNAMED)[0]
 
+    @pytest.mark.parametrize(
+        'raw',
+        [
+            _SIBLING_CHECKER_TEST_COMMAND,
+            _SIBLING_CHECKER_TEST_COMMAND_UNNAMED,
+            'uv run --project orchestrator pytest tests/ && python3 x.py',
+            'python3 -m pytest tests/ && python3 x.py',
+        ],
+        ids=[
+            'sibling-names-the-tool',
+            'sibling-does-not-name-the-tool',
+            'uv-project-wrapper',
+            'python-dash-m-wrapper',
+        ],
+    )
+    def test_an_allowlisted_keyword_cannot_smuggle_a_tail_onto_a_pytest_clause(self, raw):
+        """Condition 0b — the allowlist is keyed on the KEYWORD, the invariant
+        it protects is a property of the SLOT, and ``'uv run'`` is where the
+        two come apart.
+
+        ``'uv run'`` is allowlisted for ``verify._reproject_str``, but it is a
+        WRAPPER phrase: called with that keyword, every command here clears
+        condition 0 even though segment 0 runs pytest. Nothing in the gate
+        could stop it except the convention that ``_reproject_str`` is only
+        ever handed a lint/type command — which is a comment, not a check, and
+        would hand the pytest slot back the exact junitxml/timeout no-op task
+        3218 closed. So the gate asks what segment 0 actually INVOKES and
+        refuses, whatever keyword it was called with.
+
+        Note each input clears the keyword-level allowlist for real — the
+        assertion below is not vacuous — because ``'uv run'`` / ``'python3'``
+        do occur in segment 0 and no later segment invokes them.
+        """
+        assert split_chain_tail(raw, 'uv run') == (raw, '')
+
+    @pytest.mark.parametrize(
+        ('raw', 'keyword'),
+        [
+            (_FM_LINT_COMMAND, 'uv run'),
+            ('uv run ruff check src/ && python3 scripts/check_noqa.py src', 'uv run'),
+            ('uv run --project orchestrator pyright src/ && python3 x.py', 'uv run'),
+        ],
+        ids=['fm-lint', 'uv-run-ruff', 'uv-run-pyright'],
+    )
+    def test_condition_0b_leaves_the_reproject_path_untouched(self, raw, keyword):
+        """Condition 0b must cost ``_reproject_str`` nothing: its real inputs
+        are lint/type commands, whose segment 0 invokes ruff/pyright — never
+        pytest — so every one still preserves its tail.
+
+        This is the load-bearing half. Losing preservation here would drop the
+        ``--project`` injection and turn a clean tree RED at exit 127 (task
+        2036), so the new condition has to be narrower than "no tails for
+        ``'uv run'``".
+        """
+        prefix, tail = split_chain_tail(raw, keyword)
+        assert tail, 'the reproject path must keep preserving its sibling checker'
+        assert prefix + tail == raw
+
 
 class TestGateMatchesToolAtArgvHead:
     """A later segment only counts as the same tool when it INVOKES it (task 3218 part 2).

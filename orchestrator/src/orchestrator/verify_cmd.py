@@ -22,8 +22,12 @@ ALLOWLIST (``_TAIL_PRESERVING_KEYWORDS``), because the preserved-tail return
 shape is precisely the RECOGNISED-BUT-UNSTRUCTURABLE one described above, on
 which several mutators are documented no-ops: buying a tail in the pytest
 slot would mean paying for it with ``--junitxml``/``--timeout``, so that slot
-is excluded and truncates instead. ``has_unpreserved_chain_clauses`` is the
-diagnostic-only companion that lets a caller log what a REJECT discarded.
+is excluded and truncates instead. Because a keyword allowlist cannot express
+a SLOT-scoped rule on its own — ``'uv run'`` is a wrapper phrase, and is
+allowlisted for ``verify._reproject_str`` — the gate independently refuses a
+tail to any first clause that INVOKES pytest, whatever keyword it was called
+with. ``has_unpreserved_chain_clauses`` is the diagnostic-only companion that
+lets a caller log what a REJECT discarded.
 """
 
 from __future__ import annotations
@@ -290,6 +294,22 @@ def split_top_level_and(raw: str) -> list[str]:
 # the depless workspace-root project turns into exit 127 (task 2036).
 _TAIL_PRESERVING_KEYWORDS = frozenset({'ruff check', 'pyright', 'uv run'})
 
+# The exclusion above is really a property of the SLOT, not of the keyword,
+# and `'uv run'` is the seam where the two come apart: it is a WRAPPER phrase,
+# so `'uv run pytest tests/ && python3 check.py tests'` clears the allowlist
+# on the keyword alone and the pytest slot would regain a preserved tail — the
+# exact junitxml/timeout no-op the allowlist exists to prevent. The safety of
+# that entry otherwise rests on a comment-level convention (`_reproject_str`
+# is only ever handed a lint/type command), which is not a property the gate
+# can check.
+#
+# So the gate ALSO asks what segment 0 actually invokes, and refuses a tail to
+# any first clause that runs pytest at an argv-head position, whatever keyword
+# it was called with. That makes "a pytest command never carries a preserved
+# tail" structural rather than conventional, and closes the entry against a
+# future `split_chain_tail(raw, 'uv run')` caller pointed at a `test_command`.
+_TAIL_FORBIDDING_TOOL_KEYWORD = 'pytest'
+
 
 def _segment_invokes_tool(segment: str, keyword: str) -> bool:
     """True if *segment* actually INVOKES *keyword*'s tool at an argv-head position.
@@ -390,6 +410,17 @@ def split_chain_tail(raw: str, keyword: str) -> tuple[str, str]:
        documented no-ops on that shape, so the tail would cost the junit
        report that drives failing-test extraction, flake confirmation and the
        per-test timeout floor. See that constant for the full rationale;
+    0b. ``segments[0]`` does not itself INVOKE ``pytest`` at an argv-head
+       position, WHATEVER *keyword* the caller passed. Condition 0 keys on the
+       keyword, but the invariant it protects is a property of the SLOT, and
+       ``'uv run'`` is a wrapper phrase where the two come apart: ``'uv run
+       pytest tests/ && python3 check.py tests'`` clears the allowlist under
+       the ``'uv run'`` keyword, so without this the pytest slot could regain
+       a preserved tail through ``verify._reproject_str``'s keyword. This
+       makes "a pytest first clause never carries a preserved tail"
+       structural instead of resting on the convention that ``_reproject_str``
+       is only ever handed a lint/type command. Evaluated after (5)/(6) rather
+       than beside (0) only because it needs ``segments``;
     1. ``shlex.split(raw)`` succeeds (an unbalanced quote means the string is
        not safely decomposable at all);
     2. no token in ``_NON_AND_CHAIN_TOKENS`` — the chain is plain `&&`, with
@@ -448,9 +479,9 @@ def split_chain_tail(raw: str, keyword: str) -> tuple[str, str]:
       (3), (4) and (7) alike.
 
     The CONSTRAINT — every REJECT returns ``(raw, '')``, the whole untouched
-    original — holds for the two reject paths added by task 3218 (condition
-    0, and condition 7's tightened later-segment test) exactly as it does for
-    the rest, since both take the same ``return raw, ''``.
+    original — holds for the three reject paths added by task 3218 (conditions
+    0 and 0b, and condition 7's tightened later-segment test) exactly as it
+    does for the rest, since all three take the same ``return raw, ''``.
 
     A ``cd`` token anywhere is disqualifying rather than only in the tail:
     once any segment shifts the shell's cwd, every later segment's relative
@@ -481,6 +512,9 @@ def split_chain_tail(raw: str, keyword: str) -> tuple[str, str]:
     if len(segments) - 1 != tokens.count('&&'):
         return raw, ''
     if len(segments) < 2:
+        return raw, ''
+    # Condition 0b — deferred to here only because it needs `segments`.
+    if _segment_invokes_tool(segments[0], _TAIL_FORBIDDING_TOOL_KEYWORD):
         return raw, ''
     if keyword not in segments[0]:
         return raw, ''
