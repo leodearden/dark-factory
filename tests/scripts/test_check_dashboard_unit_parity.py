@@ -454,6 +454,68 @@ def test_environment_allowlisted_variable_may_diverge_in_value():
     )
 
 
+def test_environment_multi_assignment_line_equals_the_one_per_line_spelling():
+    """systemd accepts several assignments on one Environment= line; so must this.
+
+    Measured against the pre-shlex parser: ``Environment=A=1 B=2`` parsed as
+    the single variable ``A`` with value ``1 B=2``, so comparing it against the
+    one-per-line spelling reported TWO bogus drifts (a value difference on A,
+    plus B as installed-only). A pure reformat is not drift, and an
+    unexplainable red is how a warn-only gate loses the credibility that is
+    its whole value.
+    """
+    mod = _load_checker()
+    spec = _env_spec(mod)
+
+    drifts = mod.compare_unit(
+        spec,
+        "[Service]\nEnvironment=A=1 B=2\n",
+        "[Service]\nEnvironment=A=1\nEnvironment=B=2\n",
+    )
+
+    assert drifts == [], (
+        "Both spellings declare A=1 and B=2; systemd reads them identically. "
+        f"Got: {drifts}"
+    )
+
+
+def test_environment_quoted_assignments_parse_as_their_unquoted_form():
+    """Quoted values are unwrapped, not folded into the variable NAME.
+
+    Measured against the pre-shlex parser: ``Environment="A=1"`` produced a
+    variable literally named ``"A`` — which then compared unequal to ``A`` on
+    the other side, inventing drift in both directions at once.
+    """
+    mod = _load_checker()
+    spec = _env_spec(mod)
+
+    drifts = mod.compare_unit(
+        spec,
+        '[Service]\nEnvironment="A=1" "B=2"\n',
+        "[Service]\nEnvironment=A=1\nEnvironment=B=2\n",
+    )
+
+    assert drifts == [], f"Quoting must not change what is declared. Got: {drifts}"
+
+
+def test_environment_multi_assignment_still_detects_a_real_difference():
+    """TEETH: the forgiving parse must not forgive an actual value change.
+
+    Without this, the two tests above would be satisfied by a parser that
+    returned nothing at all for multi-assignment lines.
+    """
+    mod = _load_checker()
+    spec = _env_spec(mod)
+
+    drifts = mod.compare_unit(
+        spec,
+        "[Service]\nEnvironment=A=1 B=2\n",
+        "[Service]\nEnvironment=A=1 B=99\n",
+    )
+
+    assert [d.key for d in drifts] == ["Environment=B"], drifts
+
+
 def test_environment_allowlist_does_not_bless_the_variable_disappearing():
     """Allowlisting a VALUE must not allowlist the variable vanishing.
 
@@ -929,6 +991,196 @@ def test_template_staleness_guard_has_teeth():
     drifts = mod.compare_unit(spec, committed, mutated)
 
     assert [d.key for d in drifts] == ["TimeoutStopSec"], drifts
+
+
+# ---------------------------------------------------------------------------
+# Override mechanisms: the unit file is not necessarily what takes effect
+# ---------------------------------------------------------------------------
+#
+# Comparing directives only proves something if the installed unit FILE is what
+# systemd actually runs. Two standard mechanisms make that false without
+# touching a single compared byte:
+#
+#   EnvironmentFile=  — pulls values from a file off this tree
+#   <unit>.d/*.conf   — merged OVER the unit at load time; what
+#                       `systemctl --user edit` writes
+#
+# Neither is present for the dashboard units today, so neither can misfire; the
+# tests below are what keeps the blind spot closed. Drop-ins are NOT
+# hypothetical in this environment — ~/.config/systemd/user/
+# orchestrator-reify.service.d/ exists, so the mechanism is already in live use
+# on this host, just not on these units.
+
+
+def _override_spec(mod: types.ModuleType):
+    """A minimal UnitSpec registering EnvironmentFile= as an override directive."""
+    return mod.UnitSpec(
+        name="fixture.service",
+        repo_relpath="dashboard/fixture.service",
+        compared=(("Service", "Type"),),
+        override_directives=(("Service", "EnvironmentFile"),),
+    )
+
+
+def test_environment_file_added_only_to_the_installed_copy_is_drift():
+    """The reviewer's measured hole: every compared directive matches, yet drift.
+
+    An EnvironmentFile= on the installed side alone can set anything at all
+    from a path off this tree. Before it was registered, this exact input
+    produced zero drifts and exit 0 — "parity" over a unit whose effective
+    configuration was unknown.
+    """
+    mod = _load_checker()
+    spec = _override_spec(mod)
+
+    drifts = mod.compare_unit(
+        spec,
+        "[Service]\nType=simple\n",
+        "[Service]\nType=simple\nEnvironmentFile=/tmp/evil.env\n",
+    )
+
+    assert [d.key for d in drifts] == ["EnvironmentFile"], drifts
+    assert drifts[0].installed_value == "/tmp/evil.env"
+    assert drifts[0].repo_value == mod._ABSENT
+
+
+def test_environment_file_on_both_copies_is_not_drift():
+    """Registered as presence-SYMMETRIC, so a legitimately adopted one agrees.
+
+    This is why the field needs no staleness guard of its own: if the committed
+    unit ever gains an EnvironmentFile, the installed copy gains it too and the
+    pair simply matches.
+    """
+    mod = _load_checker()
+    spec = _override_spec(mod)
+
+    unit = "[Service]\nType=simple\nEnvironmentFile=/etc/dashboard.env\n"
+
+    assert mod.compare_unit(spec, unit, unit) == []
+
+
+def test_environment_file_dropped_from_the_installed_copy_is_drift():
+    """Symmetric in the other direction: a committed one that never landed."""
+    mod = _load_checker()
+    spec = _override_spec(mod)
+
+    drifts = mod.compare_unit(
+        spec,
+        "[Service]\nType=simple\nEnvironmentFile=/etc/dashboard.env\n",
+        "[Service]\nType=simple\n",
+    )
+
+    assert [d.key for d in drifts] == ["EnvironmentFile"], drifts
+
+
+def test_registry_registers_environment_file_on_both_service_units():
+    """The two service units must actually carry the override registration.
+
+    A helper-only test would pass while the real registry left the hole open —
+    the same rot the key-staleness tests exist to prevent one level down.
+    """
+    mod = _load_checker()
+
+    for name in (_DASHBOARD_SERVICE, _WATCHDOG_SERVICE):
+        assert ("Service", "EnvironmentFile") in mod.UNITS[name].override_directives, (
+            f"{name} does not register EnvironmentFile=, so one added locally "
+            "would leave the checker reporting parity over an unknown "
+            "effective configuration."
+        )
+
+
+def test_find_dropins_returns_nothing_when_no_dropin_dir_exists(tmp_path: pathlib.Path):
+    """The overwhelmingly common case must be silent."""
+    mod = _load_checker()
+    installed = tmp_path / "installed"
+    installed.mkdir()
+    (installed / _DASHBOARD_SERVICE).write_text("[Service]\n", encoding="utf-8")
+
+    assert mod.find_dropins(installed, _DASHBOARD_SERVICE) == []
+
+
+def test_find_dropins_reports_conf_files_and_ignores_the_rest(tmp_path: pathlib.Path):
+    """Counts exactly what systemd would load: *.conf, nothing else.
+
+    systemd ignores non-.conf files in a drop-in directory, so reporting them
+    would raise an alarm over a stray editor backup — a false positive on the
+    one gate whose value is being believed when it fires.
+    """
+    mod = _load_checker()
+    installed = tmp_path / "installed"
+    installed.mkdir()
+    dropin_dir = installed / f"{_DASHBOARD_SERVICE}.d"
+    dropin_dir.mkdir()
+    (dropin_dir / "override.conf").write_text("[Service]\nRestart=always\n")
+    (dropin_dir / "10-limits.conf").write_text("[Service]\nTimeoutStopSec=90\n")
+    (dropin_dir / "override.conf.bak").write_text("ignored\n")
+
+    found = mod.find_dropins(installed, _DASHBOARD_SERVICE)
+
+    assert [p.name for p in found] == ["10-limits.conf", "override.conf"], found
+
+
+def test_main_reports_a_dropin_and_refuses_to_call_it_parity(
+    tmp_path: pathlib.Path, capsys
+):
+    """Unit files identical + a drop-in present → exit 1, not 0.
+
+    The drop-in sets TimeoutStopSec=90 over a committed 15. Every compared
+    directive still matches character for character, because the drop-in is a
+    separate file systemd merges at load time — so before this, the run
+    reported "[ok] parity" over a unit whose effective shutdown bound was six
+    times the committed one.
+    """
+    mod = _load_checker()
+    repo = _fake_repo(tmp_path, mod)
+    installed = _installed_from(tmp_path, mod, repo)
+    dropin_dir = installed / f"{_DASHBOARD_SERVICE}.d"
+    dropin_dir.mkdir()
+    (dropin_dir / "override.conf").write_text(
+        "[Service]\nTimeoutStopSec=90\n", encoding="utf-8"
+    )
+
+    rc = mod.main(["--repo-root", str(repo), "--installed-dir", str(installed)])
+    out = capsys.readouterr().out
+
+    assert rc == 1, f"A drop-in leaves the effective config unverified. Got {rc}:\n{out}"
+    assert "[override]" in out, out
+    assert str(dropin_dir / "override.conf") in out, (
+        f"The report must name the drop-in file, or the operator cannot find "
+        f"it. Got:\n{out}"
+    )
+    assert "[ok] parity" not in out, (
+        f"A run that could not verify the effective config must not claim "
+        f"parity. Got:\n{out}"
+    )
+
+
+def test_main_dropin_report_is_worded_apart_from_drift(tmp_path: pathlib.Path, capsys):
+    """Same exit code as drift, DIFFERENT wording — they need different actions.
+
+    A drift is a directive diff to propagate with setup-host.sh; a drop-in is a
+    separate file to inspect or remove. Collapsing them would send the operator
+    hunting for a diff that does not exist, which is the same care the
+    [vanished] block takes.
+    """
+    mod = _load_checker()
+    repo = _fake_repo(tmp_path, mod)
+    installed = _installed_from(tmp_path, mod, repo)
+    dropin_dir = installed / f"{_WATCHDOG_TIMER}.d"
+    dropin_dir.mkdir()
+    (dropin_dir / "override.conf").write_text(
+        "[Timer]\nOnUnitActiveSec=600\n", encoding="utf-8"
+    )
+
+    mod.main(["--repo-root", str(repo), "--installed-dir", str(installed)])
+    out = capsys.readouterr().out
+
+    assert "[drift]" not in out, (
+        f"No compared directive differs; only a drop-in exists. Got:\n{out}"
+    )
+    assert "systemctl --user cat" in out, (
+        f"The override block must name how to inspect the merged unit. Got:\n{out}"
+    )
 
 
 # ---------------------------------------------------------------------------

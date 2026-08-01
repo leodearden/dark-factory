@@ -17,10 +17,12 @@ nothing reported that until this check existed.
 
 Exit codes
 ----------
-0 — parity (every compared directive agrees, and at least one unit was
-    actually compared)
-1 — drift (one or more compared directives disagree) OR a committed unit
-    VANISHED (no committed copy found, so nothing could be verified for it)
+0 — parity (every compared directive agrees, at least one unit was actually
+    compared, and nothing overrides the units that were)
+1 — drift (one or more compared directives disagree), OR a committed unit
+    VANISHED (no committed copy found, so nothing could be verified for it),
+    OR an installed unit carries a drop-in override (so the unit file was
+    compared but the EFFECTIVE configuration was not)
 2 — installed unit absent (no installed copy found for one or more units)
 
 PRECEDENCE: drift (1) DOMINATES absence (2).  With three units a single run can
@@ -29,11 +31,13 @@ mask an actionable finding — ``setup-host.sh`` treats 2 as a benign "not
 installed on this host, skipping" and only 1 as something to act on.
 
 A run that compared ZERO units can NEVER report parity.  A vanished committed
-unit shares exit 1 with drift rather than minting a third code, for the same
-reason: the committed copy is this checker's source of truth, so its absence
-means the gate verified nothing — the opposite of the benign "not installed
-here" that 2 denotes, and ``setup-host.sh`` already branches on this 0/1/2
-vocabulary.  Before that was true, ``--repo-root`` naming a tree with no units
+unit and a drop-in override share exit 1 with drift rather than minting new
+codes, for the same reason: both mean the gate could not make its claim, which
+is the opposite of the benign "not installed here" that 2 denotes, and
+``setup-host.sh`` already branches on this 0/1/2 vocabulary.  Exit 1 therefore
+means "drift or unverifiable", and the three cases are worded APART in the
+report ([drift] / [vanished] / [override]) so an operator is sent to the right
+place.  Before that was true, ``--repo-root`` naming a tree with no units
 compared nothing and still printed "parity — 3 unit(s) match", so a typo'd
 path, a renamed unit or a ``git mv`` of ``dashboard/*.service`` silently
 disarmed the whole check.  The success line therefore reports the number of
@@ -85,6 +89,18 @@ are split by CLASS, because one rule cannot fit all of them:
   accidental drift it exists to catch with it.  Allowlisting is scoped to a
   variable NAME, not to Environment= as a whole, so blessing the nine-root
   value does not also bless the variable disappearing.
+- **Override mechanisms** — a directive comparison only means anything if the
+  installed unit FILE is what actually takes effect, and systemd offers two
+  standard ways for it not to be.  A drop-in (``<unit>.d/*.conf``, what
+  ``systemctl --user edit`` writes) is merged OVER the unit at load time; an
+  ``EnvironmentFile=`` pulls values from a file off this tree.  Either lets
+  every compared directive match character for character while the running
+  configuration differs — the exact claim this gate exists to make checkable.
+  Drop-ins are detected in ``--installed-dir`` and reported as ``[override]``;
+  ``EnvironmentFile=`` is registered per unit
+  (``UnitSpec.override_directives``) and fires when one copy declares it and
+  the other does not.  Neither is present for these units today, so neither
+  can misfire now.
 
 One unit has THREE sites, not two: ``setup-host.sh`` installs
 ``dark-factory-dashboard.service`` by RENDERING
@@ -92,8 +108,10 @@ One unit has THREE sites, not two: ``setup-host.sh`` installs
 substitution), and only ``cp``s the two watchdog units verbatim — so the
 committed ``dashboard/dark-factory-dashboard.service`` this checker treats as
 truth is not the source of the copy it compares against.  The two repo-side
-files are held in lockstep by a staleness test in
-``tests/scripts/test_check_dashboard_unit_parity.py`` (see the comment on that
+files are held in lockstep by
+``tests/scripts/test_dashboard_service_template.py::test_template_renders_to_hardcoded_file``,
+which renders the template with setup-host.sh's own substitutions and asserts
+BYTE-FOR-BYTE equality with the committed unit (see the comment on that
 registry entry for why ``repo_relpath`` was not simply retargeted at the
 template).  Editing one without the other would otherwise leave this checker
 reporting drift whose stated remediation — run ``setup-host.sh`` — reinstalls
@@ -131,6 +149,7 @@ import argparse
 import dataclasses
 import pathlib
 import re
+import shlex
 import sys
 from typing import Sequence
 
@@ -328,6 +347,23 @@ class UnitSpec:
     # meaningful content checked: the host-specific `uv` path and repo-root
     # prefix are ignored, while a stale --timeout-graceful-shutdown is not.
     exec_start_flags: tuple[str, ...] = ()
+    # (section, key) pairs that must be present on BOTH sides or NEITHER,
+    # registered because their presence on the installed side alone redirects
+    # the effective configuration somewhere this checker never reads.
+    # EnvironmentFile= is the case in point: it pulls variables from a file on
+    # disk, so an installed copy that declares one can set anything at all
+    # while every compared directive still matches character for character.
+    #
+    # This is presence-symmetric like present_only, but it is a SEPARATE field
+    # because the two have opposite expectations of the committed unit. A
+    # present_only key is asserted to exist in the committed unit (the
+    # registry staleness test enforces it, so a typo cannot rot into a no-op);
+    # an override directive is expected to exist in NEITHER copy, and fires
+    # precisely when one appears. Putting it on present_only would fail that
+    # staleness test on arrival. It needs no staleness guard of its own: if the
+    # committed unit ever legitimately gains an EnvironmentFile, the installed
+    # copy gains it too and the pair simply agrees.
+    override_directives: tuple[tuple[str, str], ...] = ()
 
 
 def _render(values: list[str] | None) -> str:
@@ -413,16 +449,43 @@ def _environment_map(
 ) -> dict[str, str]:
     """Return ``{VAR: value}`` for every ``Environment=`` line in *section*.
 
-    Each value is split on its FIRST ``=`` — ``Environment=A=b=c`` sets A to
+    Each LINE is split the way systemd reads it, not the way the simplest
+    parser would: ``Environment=`` accepts SEVERAL space-separated assignments
+    on one line, and values may be quoted.  ``shlex.split`` handles both, so
+    these three spellings all yield ``{A: 1, B: 2}``::
+
+        Environment=A=1 B=2
+        Environment="A=1" "B=2"
+        Environment=A=1
+        Environment=B=2
+
+    Before this used shlex, ``Environment=A=1 B=2`` parsed as the single
+    variable ``A`` with value ``1 B=2``, and ``Environment="A=1"`` produced a
+    variable literally named ``"A``.  Compared against a copy using the
+    one-per-line spelling, either mis-parse invented drift out of a pure
+    reformat — and an unexplainable red on a warn-only gate is exactly how the
+    gate loses the credibility it exists to have.  Neither committed unit uses
+    those forms today; the point is that reformatting one must not fire.
+
+    Each assignment is then split on its FIRST ``=`` — ``A=b=c`` sets A to
     ``b=c``.  A later occurrence of the same variable wins, matching systemd,
-    which applies the directives in file order.
+    which applies the directives in file order.  A token carrying no ``=`` at
+    all is skipped rather than guessed at.
     """
     env: dict[str, str] = {}
-    for assignment in directives.get(section, {}).get("Environment", []):
-        name, sep, value = assignment.partition("=")
-        if not sep:
-            continue
-        env[name.strip()] = value
+    for line in directives.get(section, {}).get("Environment", []):
+        try:
+            tokens = shlex.split(line)
+        except ValueError:
+            # Unbalanced quotes: systemd would reject the line too. Fall back
+            # to the whole line as one token so a malformed value still shows
+            # up as a variable rather than vanishing into silent parity.
+            tokens = [line]
+        for assignment in tokens:
+            name, sep, value = assignment.partition("=")
+            if not sep:
+                continue
+            env[name.strip()] = value
     return env
 
 
@@ -547,10 +610,58 @@ def compare_unit(
             )
         )
 
+    for section, key in spec.override_directives:
+        repo_present = key in repo.get(section, {})
+        installed_present = key in installed.get(section, {})
+        if repo_present == installed_present:
+            continue
+        drifts.append(
+            Drift(
+                unit=spec.name,
+                section=section,
+                key=key,
+                repo_value=_render(repo.get(section, {}).get(key)),
+                installed_value=_render(installed.get(section, {}).get(key)),
+                reason=(
+                    f"{key} declared in the installed copy only — it redirects "
+                    "configuration to a file this checker does not read, so "
+                    "every compared directive can match while the effective "
+                    "setting differs"
+                    if installed_present
+                    else f"{key} declared in the repo copy, absent from the installed copy"
+                ),
+            )
+        )
+
     drifts.extend(_compare_exec_start_flags(spec, repo, installed))
     drifts.extend(_compare_environment(spec, repo, installed))
 
     return drifts
+
+
+def find_dropins(installed_dir: pathlib.Path, unit_name: str) -> list[pathlib.Path]:
+    """Return the ``.conf`` drop-ins systemd would layer over *unit_name*.
+
+    ``systemctl --user edit`` does not modify the unit file; it writes
+    ``<unit>.d/override.conf`` beside it, and systemd merges that over the
+    unit at load time.  Reading only ``<installed-dir>/<unit>`` is therefore
+    blind to it: a drop-in setting ``Restart=always`` or ``TimeoutStopSec=90``
+    leaves every compared directive matching while the RUNNING configuration
+    is not the committed one — the precise claim this gate exists to make
+    checkable.
+
+    Not hypothetical on this host: no dashboard unit has a drop-in today, but
+    ``~/.config/systemd/user/orchestrator-reify.service.d/`` exists, so the
+    mechanism is already in live use here.
+
+    Returns the sorted ``.conf`` files, or ``[]`` when the directory is absent
+    or holds none (systemd ignores non-``.conf`` files there, so this counts
+    exactly what would take effect).
+    """
+    dropin_dir = installed_dir / f"{unit_name}.d"
+    if not dropin_dir.is_dir():
+        return []
+    return sorted(p for p in dropin_dir.glob("*.conf") if p.is_file())
 
 
 # ---------------------------------------------------------------------------
@@ -580,9 +691,12 @@ UNITS: dict[str, UnitSpec] = {
         # the source of the copy this checker compares against. Edit one of
         # the two repo-side files and you must edit the other; they are held
         # in lockstep by
-        # tests/scripts/test_check_dashboard_unit_parity.py::
-        # test_committed_dashboard_unit_agrees_with_the_installed_template,
-        # which fails the moment they diverge.
+        # tests/scripts/test_dashboard_service_template.py::
+        # test_template_renders_to_hardcoded_file, which renders the template
+        # with setup-host.sh's substitutions and asserts BYTE-FOR-BYTE
+        # equality with the committed unit — strictly stronger than anything
+        # scoped to this registry, since it also catches a divergence in a key
+        # nobody thought to register.
         #
         # WHY repo_relpath still points at the committed unit rather than at
         # the template: every value-compared key here is a host-invariant
@@ -617,6 +731,10 @@ UNITS: dict[str, UnitSpec] = {
             ("Service", "ExecStart"),
             ("Service", "WorkingDirectory"),
         ),
+        # Neither copy declares one today. Registered so that a locally added
+        # EnvironmentFile= is VISIBLE: it could override any Environment= the
+        # name-set comparison below just checked, from a file off this tree.
+        override_directives=(("Service", "EnvironmentFile"),),
         environment_section="Service",
         exec_start_flags=(
             # The two flags task 3306 added. Comparing them is what makes
@@ -652,6 +770,7 @@ UNITS: dict[str, UnitSpec] = {
         # No [Install] entry: this unit deliberately has no [Install] section
         # (it is activated by the timer, never enabled directly).
         present_only=(("Service", "ExecStart"),),
+        override_directives=(("Service", "EnvironmentFile"),),
     ),
     "dark-factory-dashboard-watchdog.timer": UnitSpec(
         name="dark-factory-dashboard-watchdog.timer",
@@ -682,7 +801,7 @@ def main(argv: Sequence[str]) -> int:
 
     Returns:
         0 — parity (and at least one unit was actually compared)
-        1 — drift, OR a committed unit vanished
+        1 — drift, OR a committed unit vanished, OR a drop-in override
         2 — one or more installed units absent
 
     Drift DOMINATES absence: a run that hits both returns 1.  An absent unit
@@ -724,6 +843,7 @@ def main(argv: Sequence[str]) -> int:
     drifts: list[tuple[Drift, pathlib.Path, pathlib.Path]] = []
     missing: list[pathlib.Path] = []
     vanished: list[tuple[str, pathlib.Path]] = []
+    overridden: list[tuple[str, list[pathlib.Path]]] = []
     # Units that actually reached compare_unit. The success line reports THIS
     # count, not len(selected): a report may only claim what it verified.
     compared: list[str] = []
@@ -742,6 +862,13 @@ def main(argv: Sequence[str]) -> int:
         if not installed_path.is_file():
             missing.append(installed_path)
             continue
+
+        # Checked even when the unit itself is at parity: a drop-in is layered
+        # OVER a matching unit file, so it is invisible to every text
+        # comparison below.
+        dropins = find_dropins(installed_dir, name)
+        if dropins:
+            overridden.append((name, dropins))
 
         compared.append(name)
         for drift in compare_unit(
@@ -772,6 +899,29 @@ def main(argv: Sequence[str]) -> int:
             "(the paths live in UNITS in this script)."
         )
 
+    if overridden:
+        # Worded apart from [drift] for the same reason [vanished] is: this is
+        # not a directive diff to propagate. The unit files may match exactly;
+        # what the run could not establish is that the EFFECTIVE configuration
+        # matches, because systemd merges these over the unit at load time.
+        # It shares exit 1 because "I could not verify" belongs with "I found
+        # a difference", not with the benign "not installed here" that 2
+        # denotes — reporting parity here would overstate what was checked.
+        _log(
+            f"[override] {len(overridden)} unit(s) have drop-in overrides — "
+            "the unit files were compared, but the EFFECTIVE configuration "
+            "was NOT verified:"
+        )
+        for name, dropins in overridden:
+            for dropin in dropins:
+                _log(f"  {name}: {dropin}")
+        _log(
+            "[override] systemd merges these over the unit at load time, so a "
+            "directive set here silently wins over the committed value. "
+            "Inspect with: systemctl --user cat <unit>  (and remove the "
+            "drop-in, or move the setting into the committed unit)."
+        )
+
     if drifts:
         _log(f"[drift] {len(drifts)} directive(s) differ between repo and installed units:")
         for drift, repo_path, installed_path in drifts:
@@ -785,18 +935,22 @@ def main(argv: Sequence[str]) -> int:
             "see the module docstring for why there is no --fix)"
         )
 
-    if drifts or vanished:
+    if drifts or vanished or overridden:
         return 1
 
     if missing:
         return 2
 
     if not compared:
-        # Belt and braces on the return-0 path ONLY: every path that compared
-        # nothing for a KNOWN reason has already returned above (1 for a
-        # vanished committed unit, 2 for "not installed on this host"), so
-        # reaching here means we compared nothing for no stated reason. A run
-        # that verified nothing must not report parity.
+        # UNREACHABLE BY CONSTRUCTION, kept as defence — not a tested path.
+        # Every unit that was not compared took an earlier `continue` into
+        # `vanished` or `missing`, and both return above, so reaching here
+        # requires `selected` itself to be empty: impossible while UNITS is
+        # non-empty (`args.unit or sorted(UNITS)`) and argparse `choices`
+        # rejects an unknown --unit. It stays because the invariant it
+        # enforces — a run that verified nothing must never report parity — is
+        # one a future early-`continue` could quietly break, and the cost of
+        # holding it is three lines.
         _log("[error] no units were compared — nothing was verified.")
         return 1
 
