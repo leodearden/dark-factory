@@ -12,6 +12,7 @@ import json
 import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 from starlette.testclient import TestClient
@@ -320,8 +321,15 @@ class TestEscalationAnalyticsRoute:
             'matching the ESCALATIONS/CURATOR_STATE/SCHEDULER envelope precedent.'
         )
         analytics = body['ESCALATION_ANALYTICS']
-        assert set(analytics) == {'generated_at', 'parse_failures', 'regime_markers', 'per_project'}
+        assert set(analytics) == {
+            'generated_at', 'parse_failures', 'regime_markers', 'per_project',
+            # Whether the scan reached every configured archive at all — the
+            # route's cacheability signal, and the only field that can tell an
+            # absent archive from an empty one.
+            'archives_present',
+        }
         assert isinstance(analytics['generated_at'], str) and analytics['generated_at']
+        assert analytics['archives_present'] is True
         assert analytics['parse_failures'] == 0
         assert isinstance(analytics['regime_markers'], list)
         assert len(analytics['per_project']) == 1
@@ -373,6 +381,101 @@ class TestEscalationAnalyticsRoute:
         resp2 = client.get('/api/v2/dashboard/escalation-analytics')
         assert resp2.status_code == 200
         assert resp2.json()['ESCALATION_ANALYTICS']['parse_failures'] >= 1
+
+
+def _analytics_payload(**overrides):
+    """A builder-shaped analytics payload, overridable one key at a time.
+
+    Shaped exactly as ``build_escalation_analytics`` returns it, so a stub
+    standing in for the builder cannot hand the route something the real
+    builder never would.
+    """
+    payload = {
+        'generated_at': '2026-07-16T18:00:00+00:00',
+        'parse_failures': 0,
+        'regime_markers': [],
+        'per_project': [],
+        'archives_present': True,
+    }
+    payload.update(overrides)
+    return payload
+
+
+class TestEscalationAnalyticsCacheability:
+    """A scan that never reached the archive must not be pinned for the TTL.
+
+    Same rule the memory-evals route follows, applied here because the two
+    routes are written as one idiom and a fix to only one of them would leave
+    them silently divergent.  The signal differs — memory-evals already
+    carried ``root_present``, analytics needed ``archives_present`` added —
+    but the reasoning is identical: an absent archive is O(1) to re-check
+    (one ``is_dir`` stat per project), so re-checking every poll costs
+    nothing, while caching it keeps the tab reporting an empty archive for a
+    full TTL window after the volume mounts.
+
+    Accepted, LOUD trade-off: a multi-project config where one root
+    legitimately has no ``data/escalations`` dir makes this payload
+    permanently uncacheable.  ``TTLCache``'s per-key lock serializes cold
+    callers, so that degrades to one walk at a time rather than N in
+    parallel — and ``archives_present: false`` sits in the payload, so the
+    misconfiguration is visible and fixable instead of being a silent perf
+    cliff nobody can see.
+    """
+
+    def test_a_reached_archive_is_served_from_cache(self, client, monkeypatch, tmp_path):
+        """Gating the cache must not disable it — the ordinary payload still caches."""
+        import dashboard.app as app_module
+        from dashboard.app import _analytics_cache_clear
+
+        client.app.state.config = _make_config(tmp_path)
+        _analytics_cache_clear()
+        # SYNC, not AsyncMock: the route calls the builder through
+        # asyncio.to_thread, which hands it a plain callable.
+        build = MagicMock(return_value=_analytics_payload())
+        monkeypatch.setattr(app_module, 'build_escalation_analytics', build)
+
+        assert client.get('/api/v2/dashboard/escalation-analytics').status_code == 200
+        assert client.get('/api/v2/dashboard/escalation-analytics').status_code == 200
+
+        assert build.call_count == 1, f'expected 1 build call, got {build.call_count}'
+
+    def test_an_unreached_archive_is_not_pinned_for_the_ttl(self, client, monkeypatch, tmp_path):
+        """``archives_present: False`` is re-checked every poll."""
+        import dashboard.app as app_module
+        from dashboard.app import _analytics_cache_clear
+
+        client.app.state.config = _make_config(tmp_path)
+        _analytics_cache_clear()
+        build = MagicMock(return_value=_analytics_payload(archives_present=False))
+        monkeypatch.setattr(app_module, 'build_escalation_analytics', build)
+
+        r1 = client.get('/api/v2/dashboard/escalation-analytics')
+        r2 = client.get('/api/v2/dashboard/escalation-analytics')
+
+        assert r1.status_code == r2.status_code == 200
+        assert r2.json()['ESCALATION_ANALYTICS']['archives_present'] is False
+        assert build.call_count == 2, f'expected 2 build calls, got {build.call_count}'
+
+    def test_parse_failures_alone_never_defeats_the_cache(self, client, monkeypatch, tmp_path):
+        """The whole reason the predicate is not keyed on ``parse_failures``.
+
+        A corrupt record is permanent, so gating on it would re-run a ~10k
+        record walk on every poll, forever, to rediscover the same bad file.
+        The archive WAS reached; that is the question the cache asks.
+        """
+        import dashboard.app as app_module
+        from dashboard.app import _analytics_cache_clear
+
+        client.app.state.config = _make_config(tmp_path)
+        _analytics_cache_clear()
+        build = MagicMock(return_value=_analytics_payload(parse_failures=7))
+        monkeypatch.setattr(app_module, 'build_escalation_analytics', build)
+
+        assert client.get('/api/v2/dashboard/escalation-analytics').status_code == 200
+        r2 = client.get('/api/v2/dashboard/escalation-analytics')
+
+        assert r2.json()['ESCALATION_ANALYTICS']['parse_failures'] == 7
+        assert build.call_count == 1, f'expected 1 build call, got {build.call_count}'
 
 
 # ---------------------------------------------------------------------------

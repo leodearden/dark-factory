@@ -935,6 +935,128 @@ class TestSamplesDownsampling:
 
 
 # ---------------------------------------------------------------------------
+# archives_present — the payload's own "did this scan reach the archive?" signal
+# ---------------------------------------------------------------------------
+
+_ANALYTICS_KEYS = {'generated_at', 'parse_failures', 'regime_markers', 'per_project',
+                   'archives_present'}
+
+
+class TestArchivesPresent:
+    """Did every configured project's escalation archive actually exist?
+
+    The route caches this payload for ~60s in front of a walk that can cross
+    ~10k records, and must decline to cache a scan that never reached the
+    archive at all — which first requires the payload to SAY so.  Nothing
+    already in it can: ``iter_all_escalation_paths`` returns silently on a
+    missing dir and ``Path.glob`` swallows ``PermissionError``, so an absent
+    archive, an unreadable one and a genuinely empty one are otherwise
+    byte-identical — zero filings, zero parse failures, same shape.
+
+    Deliberately NOT derived from ``parse_failures``.  That counts unparseable
+    RECORDS and is a permanent property of a corrupt file, so a cache keyed on
+    it would be defeated forever by one bad record sitting in front of the
+    expensive walk.  The two fields answer different questions, and the last
+    test here pins that they stay independent in both directions.
+    """
+
+    def test_a_present_archive_reports_true(self, tmp_path):
+        from dashboard.data.escalation_analytics import build_escalation_analytics
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        esc_dir.mkdir(parents=True)
+        runs_db = _make_runs_db(tmp_path, [])
+
+        result = build_escalation_analytics([('dark_factory', esc_dir, runs_db)], now=now)
+
+        assert result['archives_present'] is True
+
+    def test_an_absent_archive_reports_false(self, tmp_path):
+        """The dir was never created — the walk had nothing to reach.
+
+        Indistinguishable from an empty archive in every other field, which is
+        exactly why this key has to exist.
+        """
+        from dashboard.data.escalation_analytics import build_escalation_analytics
+
+        now = golden_now()
+        never_created = tmp_path / 'nope' / 'data' / 'escalations'
+        runs_db = _make_runs_db(tmp_path, [])
+
+        result = build_escalation_analytics([('dark_factory', never_created, runs_db)], now=now)
+
+        assert result['archives_present'] is False
+        # The rest of the payload is unchanged: still a well-formed, empty,
+        # NON-erroring entry.  This signal reports on the scan, it does not
+        # degrade the answer.
+        assert result['parse_failures'] == 0
+        assert len(result['per_project']) == 1
+        assert result['per_project'][0]['project'] == 'dark_factory'
+
+    def test_one_absent_project_of_two_reports_false(self, tmp_path):
+        """It is ``all()``, not ``any()``.
+
+        A multi-project payload where one root's archive is missing is a
+        partial scan, and a partial scan must not be pinned as if it were the
+        whole picture — the missing root is the one most likely to appear.
+        """
+        from dashboard.data.escalation_analytics import build_escalation_analytics
+
+        now = golden_now()
+        present = tmp_path / 'primary' / 'data' / 'escalations'
+        present.mkdir(parents=True)
+        absent = tmp_path / 'secondary' / 'data' / 'escalations'
+        runs_db = _make_runs_db(tmp_path, [])
+
+        result = build_escalation_analytics(
+            [('primary', present, runs_db), ('secondary', absent, runs_db)], now=now,
+        )
+
+        assert result['archives_present'] is False
+        assert [p['project'] for p in result['per_project']] == ['primary', 'secondary']
+
+    def test_the_existing_contract_keys_are_untouched(self, tmp_path):
+        """Additive: the four Seam-2 keys keep their names, values and shapes."""
+        from dashboard.data.escalation_analytics import build_escalation_analytics
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        build_golden_archive(esc_dir, now)
+        runs_db = _make_runs_db(tmp_path, [])
+
+        result = build_escalation_analytics([('dark_factory', esc_dir, runs_db)], now=now)
+
+        assert set(result) == _ANALYTICS_KEYS
+        assert result['generated_at'] == now.isoformat()
+        assert isinstance(result['regime_markers'], list)
+        entry = result['per_project'][0]
+        assert {'project', 'origin', 'lifespan', 'workflow'} <= set(entry)
+
+    def test_a_corrupt_record_does_not_flip_archives_present(self, tmp_path):
+        """The two signals are independent, and this is the load-bearing case.
+
+        ``build_golden_archive`` plants one non-JSON file, so ``parse_failures``
+        is >= 1 permanently.  If ``archives_present`` tracked it, the route's
+        cache would be permanently defeated by a single corrupt record — the
+        exact failure the reviewer's suggestion was NOT asking for.  The
+        archive dir exists and was walked; that a record inside it is garbage
+        is a different fact, reported by a different field.
+        """
+        from dashboard.data.escalation_analytics import build_escalation_analytics
+
+        now = golden_now()
+        esc_dir = tmp_path / 'escalations'
+        build_golden_archive(esc_dir, now)
+        runs_db = _make_runs_db(tmp_path, [])
+
+        result = build_escalation_analytics([('dark_factory', esc_dir, runs_db)], now=now)
+
+        assert result['parse_failures'] >= 1
+        assert result['archives_present'] is True
+
+
+# ---------------------------------------------------------------------------
 # step-16: row 7 — perf: cold ~10k-record build_escalation_analytics() < 5s
 # ---------------------------------------------------------------------------
 
