@@ -3793,7 +3793,46 @@ async def _run_segmented(
     # `timed_out` covers not-run too, so the run classifies as `infra_timeout`
     # (retryable) exactly as a single-chain timeout does today, leaving
     # run_verification's retry/env-recovery machinery untouched.
-    return rc_total, '\n'.join(blocks), any_timed_out or any_not_run, results
+    output = '\n'.join(_segment_roster(results) + blocks)
+    return rc_total, output, any_timed_out or any_not_run, results
+
+
+# Roster status words, chosen to be INERT to `_extract_cause_hint`'s ladder and
+# `verify_classify.classify_failure`'s scanners: no `FAILED`, no `ERROR`, no
+# `error:`, no tool-specific token. Paired with the `#` line prefix, that is
+# what stops the roster from shadowing the genuine failing segment's hint.
+# `test_verify_segmented_fallback.TestRunSegmentedRoster` pins it — an edit
+# that "improves" this wording MUST re-run
+# `test_roster_is_inert_to_the_cause_hint_and_category_scanners`.
+_ROSTER_STATUS_WORDS = {
+    'passed': 'ok',
+    'failed': 'RED',
+    'timed_out': 'TIMED OUT',
+    'not_run': 'NOT RUN',
+}
+
+
+def _segment_roster(results: 'list[dict]') -> 'list[str]':
+    """One `#`-prefixed line per segment: index, label, status, rc, duration.
+
+    Leads the combined output so a reader hits the whole picture FIRST, rather
+    than after scrolling six subprojects of pytest chatter. This is what turns
+    the triaging agent's job from "prove this unrelated red is unrelated" into
+    "read your own segment's line" — the human-time cost esc-3062-2 is about.
+    """
+    total = len(results)
+    lines = []
+    for entry in results:
+        word = _ROSTER_STATUS_WORDS.get(entry['status'], entry['status'])
+        if entry['status'] == 'not_run':
+            detail = f' — {entry["skip_reason"]}'
+        else:
+            detail = f' (rc={entry["rc"]}, {entry["duration_secs"]:.1f}s)'
+        lines.append(
+            f'# [{entry["index"]}/{total}] {entry["label"]}  cwd={entry["cwd"]}  '
+            f'{word}{detail}',
+        )
+    return lines
 
 
 def _segment_output_block(entry: dict, total: int, out: str) -> str:

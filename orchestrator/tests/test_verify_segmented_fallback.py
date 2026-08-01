@@ -418,12 +418,13 @@ class TestRunSegmentedRoster:
         segments = _fleet_segments()
         from orchestrator.verify import _run_segmented  # noqa: PLC0415
 
-        # 8 segments at 5s each needs 40s; 36s leaves the last one unrun.
+        # 8 segments at 5s each needs 40s; a 35s budget is exhausted exactly as
+        # the 8th is reached, leaving it unrun.
         return await _run_segmented(
             segments,
             run_one=run_one,
             worktree=tmp_path,
-            budget_secs=36.0,
+            budget_secs=35.0,
             now=clock,
         )
 
