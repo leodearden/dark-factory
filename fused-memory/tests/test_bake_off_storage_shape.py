@@ -2771,3 +2771,550 @@ class TestFixtureProvenance:
         provenance = _mod().fixture_provenance([ARM_CLAIMS_PATH])
 
         assert not provenance[0]['path'].startswith('/')
+
+
+# ===========================================================================
+# step-19 — the live driver's wiring, exercised WITHOUT a network
+# ===========================================================================
+#
+# The driver is the only part of this script that touches Qdrant or an
+# embedder, so it is the only part the pure tests cannot reach directly.
+# What CAN be reached — and is what actually goes wrong — is its WIRING:
+# which collections it creates, whose config it mutates, how many queries it
+# issues, and whether it cleans up when a run dies halfway.  All of that is
+# asserted here against a `_FakeMem0`/`_FakeMemoryService` pair, in the
+# `_install_run_doubles` spirit of test_audit_duplicate_memories.py:3296-3376,
+# with `build_parser()` / `main(argv)` driven directly — never via subprocess,
+# which would put the assertions on the far side of a process boundary and
+# reduce them to an exit code.
+#
+# The single LIVE end-to-end test lives in the next section and carries its
+# markers PER-TEST.  Everything here runs in the merge lane.
+
+import asyncio  # noqa: E402
+import copy  # noqa: E402
+
+
+class _FakeConfig(types.SimpleNamespace):
+    """A config with the four leaves the driver reads, plus ``model_copy``.
+
+    ``model_copy(deep=True)`` is the seam that keeps the driver from mutating
+    the caller's config in place — so the double has to implement it for real
+    rather than returning ``self``, or the test that asserts non-mutation
+    would pass against a driver that mutates.
+    """
+
+    def model_copy(self, *, deep: bool = False) -> _FakeConfig:
+        return copy.deepcopy(self) if deep else copy.copy(self)
+
+
+def _driver_config() -> _FakeConfig:
+    return _FakeConfig(
+        mem0=types.SimpleNamespace(
+            collection_prefix='fused',  # the DEFAULT — nothing under it is reapable
+            qdrant_url='http://localhost:6333',
+        ),
+        embedder=types.SimpleNamespace(
+            model='text-embedding-3-small',
+            providers=types.SimpleNamespace(
+                openai=types.SimpleNamespace(api_key='sk-fake-must-be-cleared'),
+            ),
+        ),
+    )
+
+
+class _FakeInstance:
+    """What ``Mem0Backend._get_instance`` returns; only ``db`` is touched."""
+
+    def __init__(self):
+        # A sentinel, not None: the driver must REPLACE it with its no-op, and
+        # `is not sentinel` is how the test proves the stub actually landed.
+        self.db = types.SimpleNamespace(add_history=_FakeInstance._SENTINEL)
+
+    _SENTINEL = object()
+
+
+class _FakeMem0:
+    """The Mem0Backend surface the driver touches, and nothing else."""
+
+    def __init__(self, *, search_raises_on: int | None = None):
+        self.added: list[tuple[str, str]] = []            # (project_id, content)
+        self.searches: list[tuple[str, str, int]] = []    # (project_id, query, limit)
+        self.instances: dict[str, _FakeInstance] = {}
+        self.inflight = 0
+        self.max_inflight = 0
+        self._search_raises_on = search_raises_on
+        self._stored: dict[str, list[dict]] = {}
+
+    async def _get_instance(self, scope):
+        return self.instances.setdefault(scope.project_id, _FakeInstance())
+
+    async def add(self, content, scope, metadata=None):
+        self.inflight += 1
+        self.max_inflight = max(self.max_inflight, self.inflight)
+        try:
+            # A REAL suspension point.  Without one, every scheduling policy
+            # looks bounded because nothing ever overlaps; with it, an
+            # unbounded gather parks all N tasks here at once and
+            # `max_inflight` reaches N.
+            await asyncio.sleep(0)
+            bucket = self._stored.setdefault(scope.project_id, [])
+            stored_id = f'{scope.project_id}-{len(bucket):04d}'
+            bucket.append({'id': stored_id, 'memory': content,
+                           'metadata': dict(metadata or {})})
+            self.added.append((scope.project_id, content))
+            return {'results': [{'id': stored_id, 'memory': content, 'event': 'ADD'}]}
+        finally:
+            self.inflight -= 1
+
+    async def search(self, query, scope, limit=10, categories=None):
+        self.searches.append((scope.project_id, query, limit))
+        if (self._search_raises_on is not None
+                and len(self.searches) >= self._search_raises_on):
+            raise RuntimeError('qdrant went away mid-run')
+        await asyncio.sleep(0)
+        bucket = self._stored.get(scope.project_id, [])
+        return {'results': [
+            {'id': item['id'], 'memory': item['memory'],
+             'metadata': item['metadata'], 'score': round(0.99 - 0.01 * rank, 4)}
+            for rank, item in enumerate(bucket[:limit])
+        ]}
+
+
+class _FakeMemoryService:
+    """Stand-in for MemoryService with the surface the driver actually uses."""
+
+    instances: list = []
+    search_raises_on: int | None = None
+
+    def __init__(self, config):
+        self.config = config
+        self.mem0 = _FakeMem0(search_raises_on=type(self).search_raises_on)
+        self.initialized = False
+        self.closed = False
+        type(self).instances.append(self)
+
+    async def initialize(self):
+        self.initialized = True
+
+    async def close(self):
+        self.closed = True
+
+
+class _DropRecorder:
+    """Records every collection-drop the driver asks for, in order."""
+
+    def __init__(self):
+        self.calls: list[list[str]] = []
+
+    def __call__(self, names, **kwargs):
+        self.calls.append(list(names))
+
+    @property
+    def dropped(self) -> set[str]:
+        return {name for call in self.calls for name in call}
+
+
+def _install_driver_doubles(monkeypatch, *, search_raises_on: int | None = None):
+    """Patch the three seams the driver reaches through, at their source.
+
+    The driver imports ``FusedMemoryConfig`` and ``MemoryService``
+    function-locally, so patching the defining module (never a name already
+    bound into this script) is what actually intercepts them.
+    ``drop_collections`` is patched on the script itself because it is the
+    script's OWN qdrant seam — the alternative, a fake QdrantClient, would
+    test qdrant_client's import machinery rather than the driver's teardown.
+    """
+    import fused_memory.config.schema as schema_mod  # noqa: PLC0415
+    import fused_memory.services.memory_service as service_mod  # noqa: PLC0415
+
+    _FakeMemoryService.instances = []
+    _FakeMemoryService.search_raises_on = search_raises_on
+    monkeypatch.setattr(schema_mod, 'FusedMemoryConfig', _driver_config)
+    monkeypatch.setattr(service_mod, 'MemoryService', _FakeMemoryService)
+    drops = _DropRecorder()
+    monkeypatch.setattr(_mod(), 'drop_collections', drops)
+    return drops
+
+
+#: A deliberately small run: two clusters and a twelve-record slab.  The
+#: wiring assertions below are about counts and identities, none of which
+#: depend on corpus size — and a 20-cluster/300-distractor run through the
+#: doubles would spend seconds proving nothing extra.
+_SMALL_RUN = {'cluster_limit': 2, 'distractor_limit': 12, 'project_suffix': 'utest'}
+
+
+class TestEphemeralCollectionIdentity:
+    """A collection nobody can reap is a leak, so its NAME is a contract."""
+
+    def test_the_prefix_is_the_reapers_own_constant_not_a_restated_string(self):
+        """A rename in one file must not orphan collections named in another."""
+        mod = _mod()
+        cleanup = mod.load_cleanup_script()
+
+        assert mod.ephemeral_collection_prefix() == cleanup.E2_BAKEOFF_PREFIX
+
+    def test_the_prefix_string_appears_nowhere_in_this_script(self):
+        """Asserting equality is not enough — a second literal that happens to
+        agree today is exactly how the two drift apart tomorrow."""
+        prefix = _mod().load_cleanup_script().E2_BAKEOFF_PREFIX
+
+        assert prefix not in SCRIPT_PATH.read_text(encoding='utf-8')
+
+    def test_every_arm_collection_starts_with_the_reapable_prefix(self):
+        mod = _mod()
+        prefix = mod.load_cleanup_script().E2_BAKEOFF_PREFIX
+
+        collections = mod.ephemeral_collections(suffix='utest')
+
+        assert set(collections) == set(mod.ARM_SHAPES)
+        for name in collections.values():
+            assert name.startswith(prefix)
+
+    def test_the_six_variants_map_onto_exactly_three_collections(self):
+        """The pin is a READ-side transform: its variants reuse their shape's
+        collection, so pin-on and pin-off compare identical stored state."""
+        mod = _mod()
+
+        collections = mod.ephemeral_collections(suffix='utest')
+
+        assert len(mod.ARM_VARIANTS) == 6
+        assert len(set(collections.values())) == 3
+
+    def test_the_project_id_is_scoped_per_xdist_worker(self, monkeypatch):
+        """Two workers sharing a collection would seed each other's arms."""
+        mod = _mod()
+
+        monkeypatch.setenv('PYTEST_XDIST_WORKER', 'gw7')
+        assert mod.worker_suffix() == 'gw7'
+        assert 'gw7' in mod.arm_project_id('c_peers')
+
+        monkeypatch.delenv('PYTEST_XDIST_WORKER')
+        assert mod.worker_suffix()  # never empty — an unsuffixed id would collide
+
+    def test_the_collection_name_is_what_scope_would_really_build(self):
+        """Derived through Scope, not string-formatted here: Scope canonicalizes
+        the project_id (lowercase, '-'->'_'), so a hand-built name would differ
+        from the collection mem0 actually writes to and the reap would miss."""
+        from fused_memory.models.scope import Scope  # noqa: PLC0415
+
+        mod = _mod()
+
+        expected = Scope(
+            project_id=mod.arm_project_id('b_grouped', suffix='utest'),
+        ).mem0_collection_name(mod.ephemeral_collection_prefix())
+
+        assert mod.ephemeral_collections(suffix='utest')['b_grouped'] == expected
+
+
+@pytest.mark.asyncio
+class TestRunBakeOffWiring:
+    """What the driver does to the world, measured through doubles."""
+
+    async def test_it_seeds_exactly_three_collections_for_six_arms(self, monkeypatch):
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+
+        report = await mod.run_bake_off(**_SMALL_RUN)
+
+        service = _FakeMemoryService.instances[-1]
+        assert len(_FakeMemoryService.instances) == 1
+        assert sorted(service.mem0._stored) == sorted(
+            mod.arm_project_id(shape, suffix='utest') for shape in mod.ARM_SHAPES
+        )
+        assert list(report['arms']) == list(mod.ARM_VARIANTS)
+
+    async def test_the_ephemeral_prefix_is_set_on_the_config_not_just_the_project_id(
+        self, monkeypatch,
+    ):
+        """Collections are f'{collection_prefix}_{project_id}'.  A driver that
+        scoped only the project_id would write under the default 'fused'
+        prefix, which the reaper does not match — a permanent leak."""
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+
+        await mod.run_bake_off(**_SMALL_RUN)
+
+        config = _FakeMemoryService.instances[-1].config
+        assert config.mem0.collection_prefix == mod.ephemeral_collection_prefix()
+
+    async def test_it_clears_the_api_key_so_a_real_embedder_is_used(self, monkeypatch):
+        """A stub constant vector would make every ranking in the report
+        meaningless; nulling the config key makes mem0 fall back to the real
+        OPENAI_API_KEY (the probe_config recipe)."""
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+
+        await mod.run_bake_off(**_SMALL_RUN)
+
+        config = _FakeMemoryService.instances[-1].config
+        assert config.embedder.providers.openai.api_key is None
+
+    async def test_it_copies_the_config_rather_than_mutating_the_callers(
+        self, monkeypatch,
+    ):
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+        caller_config = _driver_config()
+
+        await mod.run_bake_off(config=caller_config, **_SMALL_RUN)
+
+        assert caller_config.mem0.collection_prefix == 'fused'
+        assert caller_config.embedder.providers.openai.api_key == 'sk-fake-must-be-cleared'
+
+    async def test_it_stubs_the_xdist_contended_history_writer(self, monkeypatch):
+        """mem0's SQLite history writer is process-shared and contended (and
+        read-only in the sandbox).  It is not the question under test, and its
+        failure would mask the one that is."""
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+
+        await mod.run_bake_off(**_SMALL_RUN)
+
+        instances = _FakeMemoryService.instances[-1].mem0.instances
+        assert len(instances) == 3
+        for instance in instances.values():
+            assert instance.db.add_history is not _FakeInstance._SENTINEL
+            assert instance.db.add_history('anything', keyword=1) is None
+
+    async def test_the_distractor_slab_is_seeded_into_every_arm(self, monkeypatch):
+        """The contamination floor is a controlled variable: an arm that got a
+        smaller slab would be ranking against a thinner field and would win for
+        a reason the decision table does not name."""
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+        slab = mod.load_distractor_slab()[:_SMALL_RUN['distractor_limit']]
+        slab_contents = {d.content for d in slab}
+
+        await mod.run_bake_off(**_SMALL_RUN)
+
+        added = _FakeMemoryService.instances[-1].mem0.added
+        by_project: dict[str, set[str]] = {}
+        for project_id, content in added:
+            by_project.setdefault(project_id, set()).add(content)
+
+        assert len(by_project) == 3
+        for contents in by_project.values():
+            assert slab_contents <= contents
+
+    async def test_seeding_is_bounded_rather_than_one_unbounded_gather(
+        self, monkeypatch,
+    ):
+        """A gather over the whole slab opens hundreds of concurrent embedding
+        requests at once — rate-limited into retries at best, and a run whose
+        wall clock is set by the throttler rather than the experiment."""
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+
+        await mod.run_bake_off(**_SMALL_RUN)
+
+        mem0 = _FakeMemoryService.instances[-1].mem0
+        smallest_arm = min(
+            len(bucket) for bucket in mem0._stored.values()
+        )
+        assert smallest_arm > mod.SEED_CONCURRENCY  # the bound has to actually bite
+        assert mem0.max_inflight <= mod.SEED_CONCURRENCY
+
+    async def test_the_pin_variants_reuse_their_shapes_hits_instead_of_requerying(
+        self, monkeypatch,
+    ):
+        """Pin-on and pin-off must run over the SAME ranked list, or the
+        comparison is two ANN draws rather than a controlled A/B — and the run
+        pays for six arms' worth of embeddings to answer a four-arm question."""
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+
+        await mod.run_bake_off(**_SMALL_RUN)
+
+        searches = _FakeMemoryService.instances[-1].mem0.searches
+        issued = [(project_id, query) for project_id, query, _ in searches]
+        assert len(issued) == len(set(issued))          # no query issued twice
+        assert len({project_id for project_id, _ in issued}) == 3
+
+    async def test_the_guard_probe_is_fetched_at_the_window_production_uses(
+        self, monkeypatch,
+    ):
+        """server/tools.py:1556 runs the pre-check search at limit=5.  A wider
+        replay would measure a more generous guard than the one running."""
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+
+        await mod.run_bake_off(**_SMALL_RUN)
+
+        limits = {limit for _, _, limit in _FakeMemoryService.instances[-1].mem0.searches}
+        assert mod.GUARD_TOP_K in limits
+        assert limits == {mod.GUARD_TOP_K, mod.DEFAULT_SEARCH_LIMIT}
+
+    async def test_every_collection_is_dropped_before_and_after_the_run(
+        self, monkeypatch,
+    ):
+        """Before AND after: a swallowed teardown then self-heals on the next
+        run instead of poisoning it with a half-seeded arm."""
+        mod = _mod()
+        drops = _install_driver_doubles(monkeypatch)
+        expected = set(mod.ephemeral_collections(suffix='utest').values())
+
+        await mod.run_bake_off(**_SMALL_RUN)
+
+        assert len(drops.calls) == 2
+        assert set(drops.calls[0]) == expected
+        assert set(drops.calls[-1]) == expected
+
+    async def test_the_collections_are_dropped_even_when_a_query_raises(
+        self, monkeypatch,
+    ):
+        """The failure that leaks is the mid-run one; a `finally` is the only
+        thing that reaches it."""
+        mod = _mod()
+        drops = _install_driver_doubles(monkeypatch, search_raises_on=2)
+        expected = set(mod.ephemeral_collections(suffix='utest').values())
+
+        with pytest.raises(RuntimeError, match='qdrant went away'):
+            await mod.run_bake_off(**_SMALL_RUN)
+
+        assert set(drops.calls[-1]) == expected
+        assert _FakeMemoryService.instances[-1].closed is True
+
+    async def test_the_report_it_returns_is_the_one_build_report_validated(
+        self, monkeypatch,
+    ):
+        """Not a second, looser assembly path: the completeness check that
+        refuses to publish a partial decision table has to be on THIS road."""
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+
+        report = await mod.run_bake_off(**_SMALL_RUN)
+
+        assert report['schema_version'] == mod.REPORT_SCHEMA_VERSION
+        assert set(report) == {'schema_version', 'protocol', 'arms', 'audit_recall'}
+        for arm in mod.ARM_VARIANTS:
+            for metric in mod._REQUIRED_ARM_METRICS:
+                assert metric in report['arms'][arm]
+        assert report['protocol']['distractor_slab_size'] == 12
+        assert report['protocol']['embedder_model'] == 'text-embedding-3-small'
+
+
+class TestBuildParser:
+    """The CLI surface, pinned by equality."""
+
+    def test_the_flag_set_is_pinned_flag_for_flag(self):
+        """By equality, not by membership: this script writes to a COMMITTED
+        artifact and reaps live collections, so a flag that changes what it
+        does must not be addable without a test saying so out loud."""
+        parser = _mod().build_parser()
+
+        flags = {
+            option
+            for action in parser._actions
+            for option in action.option_strings
+        }
+
+        assert flags == {
+            '-h', '--help',
+            '--alpha-fixture', '--registry', '--arm-claims', '--query-set',
+            '--distractor-slab',
+            '--clusters', '--distractors', '--limit', '--seed-concurrency',
+            '--project-suffix',
+            '--json-out', '--md-out',
+        }
+
+    def test_the_defaults_are_the_committed_fixtures_and_artifact_paths(self):
+        mod = _mod()
+
+        args = mod.build_parser().parse_args([])
+
+        assert Path(args.arm_claims) == mod.DEFAULT_ARM_CLAIMS_PATH
+        assert Path(args.query_set) == mod.DEFAULT_QUERY_SET_PATH
+        assert Path(args.distractor_slab) == mod.DEFAULT_DISTRACTOR_SLAB_PATH
+        assert Path(args.json_out) == mod.DEFAULT_REPORT_JSON
+        assert Path(args.md_out) == mod.DEFAULT_REPORT_MD
+
+    def test_the_default_run_is_the_whole_fixture_not_a_sample(self):
+        """A silently-sampled default would publish a decision table over a
+        subset while reading as a full run."""
+        args = _mod().build_parser().parse_args([])
+
+        assert args.clusters is None
+        assert args.distractors is None
+        assert args.limit == _mod().DEFAULT_SEARCH_LIMIT
+
+
+class TestMain:
+    """`main(argv)` driven directly — no subprocess."""
+
+    def test_a_successful_run_writes_both_artifacts_and_returns_zero(
+        self, monkeypatch, tmp_path,
+    ):
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+        json_out, md_out = tmp_path / 'report.json', tmp_path / 'report.md'
+
+        code = mod.main([
+            '--clusters', '2', '--distractors', '12', '--project-suffix', 'utest',
+            '--json-out', str(json_out), '--md-out', str(md_out),
+        ])
+
+        assert code == 0
+        assert list(json.loads(json_out.read_text())['arms']) == list(mod.ARM_VARIANTS)
+        assert md_out.read_text().startswith('# E2 storage-shape bake-off')
+
+    def test_a_missing_fixture_exits_2_before_a_single_collection_exists(
+        self, monkeypatch, tmp_path,
+    ):
+        """Ordering matters as much as the code: a fixture checked AFTER
+        seeding would leave three live collections behind on every typo."""
+        mod = _mod()
+        drops = _install_driver_doubles(monkeypatch)
+        json_out, md_out = tmp_path / 'report.json', tmp_path / 'report.md'
+
+        code = mod.main([
+            '--arm-claims', str(tmp_path / 'does-not-exist.jsonl'),
+            '--project-suffix', 'utest',
+            '--json-out', str(json_out), '--md-out', str(md_out),
+        ])
+
+        assert code == 2
+        assert drops.calls == []
+        assert _FakeMemoryService.instances == []
+        assert not json_out.exists()
+        assert not md_out.exists()
+
+    def test_an_inconsistent_fixture_set_exits_2_with_no_artifact(
+        self, monkeypatch, tmp_path,
+    ):
+        """Cross-validation is part of the pre-flight, not a later surprise:
+        a claim pointing at a missing cluster surfaces deep in the metrics as
+        a silently-zero recall indistinguishable from a retrieval miss."""
+        mod = _mod()
+        drops = _install_driver_doubles(monkeypatch)
+        bad_claims = tmp_path / 'claims.jsonl'
+        bad_claims.write_text(json.dumps({
+            'claim_id': 'ghost-01', 'cluster_id': 'no-such-cluster',
+            'topic': 'ghost', 'text': 'a claim about a cluster that is not there',
+            'source_memory_id': 'nobody', 'canonical': True,
+            'b_arm_role': 'canonical', 'contested': False,
+        }) + '\n', encoding='utf-8')
+        json_out = tmp_path / 'report.json'
+
+        code = mod.main([
+            '--arm-claims', str(bad_claims), '--project-suffix', 'utest',
+            '--json-out', str(json_out), '--md-out', str(tmp_path / 'report.md'),
+        ])
+
+        assert code == 2
+        assert drops.calls == []
+        assert not json_out.exists()
+
+    def test_it_reports_the_fixture_failure_on_stderr_not_silently(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        mod = _mod()
+        _install_driver_doubles(monkeypatch)
+
+        mod.main([
+            '--query-set', str(tmp_path / 'absent.jsonl'),
+            '--project-suffix', 'utest',
+            '--json-out', str(tmp_path / 'r.json'), '--md-out', str(tmp_path / 'r.md'),
+        ])
+
+        assert 'absent.jsonl' in capsys.readouterr().err
