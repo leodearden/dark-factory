@@ -895,6 +895,30 @@ def test_repair_project_re_reads_the_candidates_own_tag_not_the_default(tmp_path
     assert calls["get_task"]["tag"] == "feature-x"
 
 
+def test_repair_project_with_a_live_client_and_apply_false_issues_no_write(tmp_path):
+    """THE DRY-RUN GUARANTEE, asserted where it actually lives.
+
+    The subprocess dry-run test below proves today's CLI never dials. This is
+    its companion one layer down: dry-run-ness must be a property of
+    ``repair_project`` itself, not of the caller remembering to withhold the
+    client. With a LIVE client and ``apply=False`` the candidate must still be
+    reported as a would-be REPAIR (the selection is the dry run's whole
+    output), the live re-read may happen, but ``update_task`` must never be
+    called. Without the guard at the write site this records a real write and
+    ``format_summary`` then prints ``NO WRITE WAS ATTEMPTED`` over the top of
+    it.
+    """
+    root = _wiped_project(tmp_path)
+    client = _FakeClient(returns={"id": "2464", "status": "done", "metadata": {"files": []}})
+
+    result = asyncio.run(repair_project(client, str(root), apply=False, now_iso=_NOW))
+
+    assert [o.disposition for o in result.outcomes] == [REPAIR]
+    assert result.applied is False
+    called = [name for name, _ in client.calls]
+    assert "update_task" not in called, f"a dry run issued a write: {client.calls}"
+
+
 _SCRIPT = str(Path(__file__).parent.parent.parent / "scripts" / "repair_wiped_metadata_files.py")
 
 # A port nothing listens on. Pointing --server-url here PROVES the dry run

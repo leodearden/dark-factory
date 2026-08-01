@@ -589,7 +589,29 @@ async def repair_project(
             )
             continue
 
-        # (5) Write.
+        # (5) Write — AND ONLY WHEN *apply* IS TRUE.
+        #
+        # The dry-run guarantee must not rest on `client is None` alone. That
+        # holds for today's CLI, which passes no client without --apply, but it
+        # is an invariant of the CALLER, not of this function: a caller that
+        # hands in a live client with apply=False (a harness exercising gate 3,
+        # say) would otherwise mutate task metadata while `format_summary`
+        # stamps the report `[DRY RUN] ... NO WRITE WAS ATTEMPTED`. Reporting a
+        # write as a non-write is the exact silent-mislabelling this module's
+        # docstring claims to prevent, so `apply` is checked HERE, at the write
+        # site, where the docstring's step 5 says it is checked.
+        if not apply:
+            outcomes.append(
+                RepairOutcome(
+                    task_id=candidate.task_id,
+                    tag=candidate.tag,
+                    disposition=REPAIR,
+                    files=candidate.plan_files,
+                    detail="dry run: gate 3 passed on a live re-read; no write issued",
+                )
+            )
+            continue
+
         outcomes.append(await repair_one(client, project_root, candidate, now_iso=now_iso))
 
     return RepairResult(
