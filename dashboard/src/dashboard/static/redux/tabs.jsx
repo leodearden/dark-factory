@@ -562,7 +562,7 @@ function PerfTab({ projectFilter }) {
 }
 
 // ── Memory ──
-function MemoryTab({ projectFilter }) {
+function MemoryTab({ projectFilter, onNavigate }) {
   const projects = Object.entries(DF.MEMORY_STATUS.projects).filter(([pid]) => projectFilter.length === 0 || projectFilter.includes(pid));
   const ts = DF.MEMORY_TIMESERIES;
   return (
@@ -671,7 +671,7 @@ function MemoryTab({ projectFilter }) {
       {/* Memory-eval monitoring (PRD DD3: a section here, not a new tab).
           Placed last so the existing memory KPIs stay above the fold. */}
       <div className="col-span-12">
-        <MemoryEvalsSection />
+        <MemoryEvalsSection onNavigate={onNavigate} />
       </div>
     </div>
   );

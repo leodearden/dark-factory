@@ -25,6 +25,11 @@ const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
 
 function App() {
   const [tab, setTab] = uS('overview');
+  // Cross-tab handoff for the memory-eval escalation links. The SPA has no
+  // router, so navigation is a state lift: record which escalation to focus,
+  // switch tabs, and let EscalationsTab clear the focus once it has consumed it.
+  const [escFocus, setEscFocus] = uS(null);
+  const navigate = (t, focusId = null) => { setTab(t); setEscFocus(focusId); };
   const [tw, setTw] = useTweaks ? useTweaks(TWEAK_DEFAULTS) : [TWEAK_DEFAULTS, () => {}];
 
   // Filter state — per tab
@@ -117,12 +122,12 @@ function App() {
       case 'scheduler': return <SchedulerTab />;
       case 'curator':  return <CuratorTab projectFilter={projects} />;
       case 'perf':     return <PerfTab projectFilter={projects} />;
-      case 'memory':   return <MemoryTab projectFilter={projects} />;
+      case 'memory':   return <MemoryTab projectFilter={projects} onNavigate={navigate} />;
       case 'recon':    return <ReconTab projectFilter={projects} search={search} />;
       case 'merge':    return <MergeTab projectFilter={projects} />;
       case 'cost':     return <CostsTab projectFilter={projects} />;
       case 'burn':     return <BurnTab projectFilter={projects} displayWindow={win} />;
-      case 'esc':      return <EscalationsTab projectFilter={projects} />;
+      case 'esc':      return <EscalationsTab projectFilter={projects} focusId={escFocus} onFocusConsumed={() => setEscFocus(null)} />;
       case 'esc-analytics': return <EscalationAnalyticsTab projectFilter={projects} />;
       default: return null;
     }
