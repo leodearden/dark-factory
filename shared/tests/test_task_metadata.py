@@ -13,13 +13,11 @@ Built bottom-up in TDD order (see plans/task-metadata-schema-prd.md §5):
 
 from __future__ import annotations
 
-import ast
 import copy
 import json
-from pathlib import Path
 
 import pytest
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ValidationError
 
 import shared.task_metadata as task_metadata_module
 from shared.task_metadata import (
@@ -39,40 +37,27 @@ from shared.task_metadata import (
     validate_model_overrides,
 )
 
-# Registry keys that PRODUCTION modules in OTHER import graphs register as an
-# import side effect: shared/deploy_state.py ('deploy_state') and
-# shared/capability_manifest.py ('delivered_checks'). Task 3352: a cross-package
-# pytest co-run (e.g. `pytest orchestrator/tests/... shared/tests/...`) imports
-# those modules first, so the REAL model already occupies the key and every stub
-# registration here raised
-# `ValueError: metadata sub-model already registered for 'deploy_state'`.
-# The fixture below installs a local sentinel under each of these keys so that
-# collision reproduces in an ISOLATED run of this file, instead of only in a
-# combined selection. Tests in this file MUST register test-owned keys only
-# (see _DEPLOY_STATE_STUB_KEY / TestListValuedSubmodelSlice._KEY).
-_FOREIGN_REGISTRANT_KEYS = ('deploy_state', 'delivered_checks')
 
+def _assert_only_test_owned_registry_keys(added: set[str]) -> None:
+    """Fail if a test registered a metadata key it does not own.
 
-class _ForeignRegistrantSentinel(BaseModel):
-    """Stands in for a real out-of-module W10 registrant (never a test's model).
-
-    Carries a REQUIRED marker field and forbids extras, so it can never
-    silently accept a real ``deploy_state`` / ``delivered_checks`` slice. A
-    permissive ``extra='allow'`` shape with no declared fields validates any
-    mapping, which would let a future test in this file that means to
-    exercise the production slice through ``parse_metadata`` pass vacuously
-    against the sentinel instead of against the production schema. With the
-    marker field, such a test fails loudly on ``df_test_sentinel_marker``.
+    Registry keys are OWNED by the module that registers them (see
+    `register_metadata_submodel` in shared/src/shared/task_metadata.py).
+    Tests in this file must register `<name>_stub` keys only: registering a
+    production key collides with the real registrant in a cross-package
+    pytest co-run (task 3352), where that module was already imported and the
+    key is already bound to the real model.
     """
-
-    model_config = ConfigDict(extra='forbid')
-
-    df_test_sentinel_marker: str
+    assert all(key.endswith('_stub') for key in added), (
+        'tests in this file must register test-owned <name>_stub keys; got '
+        f'{sorted(added)} (registering a production key collides in a '
+        'cross-package pytest co-run — task 3352)'
+    )
 
 
 @pytest.fixture(autouse=True)
 def _reset_metadata_registry_state():
-    """Snapshot and restore task_metadata's module-global registry/migrations.
+    """Snapshot/restore task_metadata's module-global registry/migrations.
 
     register_metadata_submodel and the migration registry mutate module-global
     dicts; without this, TestSubmodelRegistry / TestMigrations / the registry
@@ -80,37 +65,31 @@ def _reset_metadata_registry_state():
     tests. Uses getattr/hasattr defensively since _SUBMODEL_REGISTRY and
     _MIGRATIONS are added incrementally by later steps in this file's own
     TDD sequence.
+
+    Teardown does two things: it restores the snapshot, AND it enforces key
+    ownership (task 3352) — every key a test ADDED to the registry must be a
+    test-owned `<name>_stub` key, never one a production module registers.
+    See _assert_only_test_owned_registry_keys.
     """
     had_registry = hasattr(task_metadata_module, '_SUBMODEL_REGISTRY')
     registry_snapshot = dict(getattr(task_metadata_module, '_SUBMODEL_REGISTRY', {}))
     had_migrations = hasattr(task_metadata_module, '_MIGRATIONS')
     migrations_snapshot = dict(getattr(task_metadata_module, '_MIGRATIONS', {}))
-    # Task 3352: simulate the cross-package co-run inside a single-file run by
-    # pre-occupying every foreign registrant key with a file-local sentinel, so
-    # a test in this file that registers a production key fails immediately
-    # rather than only in a combined selection. Assign directly rather than
-    # calling register_metadata_submodel — the helper would itself raise once a
-    # real registrant is present from a co-run, turning this guard into an error
-    # inside fixture setup. The teardown restore below keeps the sentinels from
-    # escaping this file.
-    #
-    # Consequence, by design: while the sentinel is installed the PRODUCTION
-    # 'deploy_state' / 'delivered_checks' slices CANNOT be exercised through
-    # parse_metadata from this file — they would validate against the sentinel,
-    # not against DeployState / DeliveredCheckMeta. The sentinel's required
-    # marker field makes that fail loudly rather than pass vacuously. Test the
-    # real slices from their owning package's suite instead (e.g.
-    # fused-memory/tests/test_deploy_state_registration.py).
-    if had_registry:
-        for _key in _FOREIGN_REGISTRANT_KEYS:
-            task_metadata_module._SUBMODEL_REGISTRY[_key] = _ForeignRegistrantSentinel
     yield
+    # Ordering is load-bearing in BOTH directions: `added` must be diffed
+    # BEFORE any restore (a post-restore diff is always empty, i.e. a silently
+    # vacuous guard), and the assertion must fire AFTER both restores (an
+    # assertion raised before the _MIGRATIONS restore would skip it and leak
+    # migrations into later tests).
+    added = set(getattr(task_metadata_module, '_SUBMODEL_REGISTRY', {})) - set(registry_snapshot)
     if had_registry:
         task_metadata_module._SUBMODEL_REGISTRY.clear()
         task_metadata_module._SUBMODEL_REGISTRY.update(registry_snapshot)
     if had_migrations:
         task_metadata_module._MIGRATIONS.clear()
         task_metadata_module._MIGRATIONS.update(migrations_snapshot)
+    if had_registry:
+        _assert_only_test_owned_registry_keys(added)
 
 
 class TestBeforeDone:
@@ -897,7 +876,7 @@ class _DeployStateStub(BaseModel):
 # Test-owned registry key. Deliberately NOT the production 'deploy_state'
 # (registered by shared/deploy_state.py) — mirrors
 # TestListValuedSubmodelSlice._KEY = 'delivered_checks_stub'. See
-# _FOREIGN_REGISTRANT_KEYS above and task 3352.
+# _assert_only_test_owned_registry_keys above and task 3352.
 _DEPLOY_STATE_STUB_KEY = 'deploy_state_stub'
 
 
@@ -1745,78 +1724,3 @@ class TestRegistryKeyOwnershipGuard:
         _assert_only_test_owned_registry_keys(
             {_DEPLOY_STATE_STUB_KEY, TestListValuedSubmodelSlice._KEY}
         )
-
-
-class TestRegistryCoRunIsolation:
-    """Task 3352: keep _FOREIGN_REGISTRANT_KEYS honest.
-
-    The autouse fixture's sentinel guard only protects the keys it lists. If a
-    future `shared/` module adds a `register_metadata_submodel(...)` call and
-    the constant is not updated, the constant goes stale and the co-run
-    collision class silently returns.
-
-    The guard is a STATIC scan of the `shared` package's own source, which is
-    what makes a brand-new registrant module detectable. The two alternatives
-    were both rejected: a same-process import would leave shared.deploy_state /
-    shared.capability_manifest in sys.modules, and since their module bodies
-    never re-run, the autouse fixture's teardown restore would leave the key
-    unregistered for the rest of the process and turn
-    fused-memory/tests/test_deploy_state_registration.py red in a co-run; a
-    subprocess avoids that but inherits neither this suite's sys.path pinning
-    (shared/tests/conftest.py, which exists because the venv's editable install
-    may point at the MAIN tree rather than this worktree) nor its rootdir, so
-    it could scan a different `shared` than the rest of this file tests.
-    """
-
-    def test_foreign_registrant_keys_match_the_real_shared_registrants(self):
-        # Anchor on the module actually imported by this file, so the scan
-        # always covers the same `shared` package the rest of the suite tests.
-        shared_pkg_dir = Path(task_metadata_module.__file__).parent
-        sources = sorted(shared_pkg_dir.rglob('*.py'))
-        assert sources, f'no sources found under {shared_pkg_dir} — scan is vacuous'
-
-        foreign: dict[str, str] = {}
-        for path in sources:
-            # task_metadata.py owns the CORE keys (milestone / routing /
-            # merge_retry_pending); they are registered by importing the module
-            # under test itself and are never a co-run collision source.
-            if path.name == 'task_metadata.py':
-                continue
-            for node in ast.walk(ast.parse(path.read_text(), filename=str(path))):
-                if not isinstance(node, ast.Call):
-                    continue
-                func = node.func
-                name = (
-                    func.id
-                    if isinstance(func, ast.Name)
-                    else func.attr
-                    if isinstance(func, ast.Attribute)
-                    else None
-                )
-                if name != 'register_metadata_submodel' or not node.args:
-                    continue
-                key_node = node.args[0]
-                assert isinstance(key_node, ast.Constant) and isinstance(key_node.value, str), (
-                    f'{path.name}:{node.lineno} registers a non-literal metadata key; '
-                    'this drift guard can only track string-literal keys — either use a '
-                    'literal or extend the guard'
-                )
-                foreign[key_node.value] = f'{path.name}:{node.lineno}'
-
-        assert sorted(foreign) == sorted(_FOREIGN_REGISTRANT_KEYS), (
-            '_FOREIGN_REGISTRANT_KEYS is stale. shared/ registers these metadata '
-            f'keys outside task_metadata.py: {foreign}. Update the constant so the '
-            'autouse fixture pre-occupies every production key, or the cross-package '
-            'co-run collision (task 3352) silently returns for the new key.'
-        )
-
-    def test_registry_key_constants_are_test_owned(self):
-        # Constant-level check ONLY. The real enforcement is the autouse
-        # fixture's sentinel: a test in this file that registers a production
-        # key raises ValueError at its own register_metadata_submodel call, at
-        # the point of violation — a third such test would be invisible here.
-        # What this pins is the pair of key constants this file registers
-        # under, so renaming one back onto a production key fails with a
-        # legible message rather than only as a wall of ValueErrors.
-        assert _DEPLOY_STATE_STUB_KEY not in _FOREIGN_REGISTRANT_KEYS
-        assert TestListValuedSubmodelSlice._KEY not in _FOREIGN_REGISTRANT_KEYS
