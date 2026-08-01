@@ -694,6 +694,13 @@ def split_and_chain_segments(raw: str) -> list[ChainSegment] | None:
     ``cd ../escalation`` -> 'escalation'; ``cd ..`` from 'sampler' -> '.'), so
     each emitted segment carries the cwd the shell would have been in when it
     ran. Segment commands are ``strip()``ed byte-slices of *raw*.
+
+    REFUSES (``None``) on: an unbalanced quote or paren; a depth-0 `;`, `|`,
+    `||`, lone `&` or backtick; a ``cd`` whose target is not a literal relative
+    path (``$VAR``, ``$(...)``, a glob, a quoted or absolute path, or the wrong
+    argument count); an accumulated cwd normalising above the worktree root;
+    and any chain yielding fewer than 2 runnable clauses — there is no
+    short-circuit to fix in a single command.
     """
     segments: list[ChainSegment] = []
     cwd_rel = '.'
@@ -701,7 +708,12 @@ def split_and_chain_segments(raw: str) -> list[ChainSegment] | None:
         stripped = clause.strip()
         if not stripped:
             return None
-        cd_target = _cd_clause_target(stripped)
+        is_cd, cd_target = _cd_clause_target(stripped)
+        if is_cd and cd_target is None:
+            # A `cd` whose target this cannot resolve LITERALLY. Refusing is
+            # the only safe disposition: guessing would run every LATER segment
+            # in the wrong directory — silently green, or spuriously red.
+            return None
         if cd_target is not None:
             cwd_rel = posixpath.normpath(posixpath.join(cwd_rel, cd_target))
             if cwd_rel.startswith('..'):
@@ -719,24 +731,44 @@ def split_and_chain_segments(raw: str) -> list[ChainSegment] | None:
     return segments
 
 
-def _cd_clause_target(clause: str) -> str | None:
-    """The literal relative target of a ``cd X`` clause, else ``None``.
+# Characters that make a `cd` argument non-LITERAL: parameter expansion,
+# command substitution, globbing, or quoting. Any of them and the directory
+# this helper would compute is not necessarily the one the shell would enter.
+_CD_HAZARD_CHARS = frozenset('$`*?"\'')
 
-    ``None`` means "not a cd clause" — the caller emits it as a runnable
-    segment. A cd clause this cannot resolve LITERALLY is not reported here;
-    ``_split_top_level_and_chain``'s guards refuse the whole chain instead
-    (step-4), because a mis-resolved cwd would run a segment in the wrong
-    directory rather than merely decline to segment.
+# A clause whose first word is exactly `cd`. Requires a word boundary so
+# `cdk deploy` is a runnable segment, not a mis-read directory change.
+_CD_CLAUSE_RE = re.compile(r'\s*cd(?:\s|$)')
+
+
+def _cd_clause_target(clause: str) -> tuple[bool, str | None]:
+    """``(is_cd_clause, literal_relative_target)`` for one chain clause.
+
+    ``(False, None)`` — not a `cd` at all; the caller emits it as a runnable
+    segment. ``(True, <target>)`` — a `cd` the caller folds into the running
+    cwd. ``(True, None)`` — a `cd` whose target cannot be resolved LITERALLY,
+    on which the caller REFUSES the whole chain: a mis-resolved cwd would run
+    later segments in the WRONG directory, which is worse than not segmenting.
     """
+    if not _CD_CLAUSE_RE.match(clause):
+        return False, None
+    argument = clause.strip()[len('cd') :].strip()
+    if _CD_HAZARD_CHARS & set(argument):
+        # $VAR / $(...) / `...` / globs / quotes — not a literal path.
+        return True, None
     try:
         tokens = shlex.split(clause)
     except ValueError:
-        return None
-    if not tokens or tokens[0] != 'cd':
-        return None
+        # Unbalanced quoting inside the clause; nothing to resolve.
+        return True, None
     if len(tokens) != 2:
-        return None
-    return tokens[1]
+        # A bare `cd` goes $HOME and `cd a b` is bash's substitution form —
+        # neither is a foldable relative directory change.
+        return True, None
+    if tokens[1].startswith('/'):
+        # Segments run under `worktree / cwd_rel`; an absolute cwd escapes it.
+        return True, None
+    return True, tokens[1]
 
 
 def _split_top_level_and_chain(raw: str) -> list[str] | None:
@@ -745,6 +777,14 @@ def _split_top_level_and_chain(raw: str) -> list[str] | None:
     Splits on `&&` only at quote depth 0 AND paren depth 0, keeping every other
     byte, so the segments are verbatim slices exactly as
     ``split_top_level_and``'s are.
+
+    Refuses on a depth-0 control operator — `;`, `|`, `||`, a lone `&`, a
+    backtick — because each one means a clause's exit status is no longer the
+    clause's OWN, so running it as an independent segment would attribute the
+    wrong rc. Same reject vocabulary ``_NON_AND_CHAIN_TOKENS`` supplies to
+    ``split_chain_tail``, minus its `(`/`)` entries: this helper PROMOTES a
+    balanced paren group from "refuse" to "one atomic segment", which is what
+    keeps the committed fleet chain's cockpit clause intact.
     """
     clauses: list[str] = []
     start = 0
@@ -774,12 +814,22 @@ def _split_top_level_and_chain(raw: str) -> list[str] | None:
                     return None
                 i += 1
                 continue
+            if ch == '`':
+                # Backtick substitution: this scanner does not track its
+                # interior, so an `&&` inside one could become a bogus split.
+                return None
             if ch == '&' and raw[i + 1 : i + 2] == '&':
                 if depth == 0:
                     clauses.append(raw[start:i])
                     start = i + 2
                 i += 2
                 continue
+            if depth == 0 and ch in ('&', ';', '|'):
+                # A lone `&` backgrounds the clause (its rc is the shell's, not
+                # the command's); `;` runs the next clause unconditionally; `|`
+                # and `||` reassign the clause's exit status. All three break
+                # per-segment rc attribution, which is the whole product here.
+                return None
             i += 1
             continue
         # Inside quotes: only a double-quote context honours backslash escapes.
