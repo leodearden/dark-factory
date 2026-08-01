@@ -47,6 +47,7 @@ from fused_memory.reconciliation.stages.task_knowledge_sync import (
 )
 from fused_memory.reconciliation.task_count_snapshot_cadence import (
     ESCALATION_CATEGORY,
+    LEGACY_SNAPSHOT_WRITTEN_STAT_KEY,
     SNAPSHOT_PRUNE_ENUMERATED_STAT_KEY,
     SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY,
     SNAPSHOT_PRUNE_TRUNCATED_STAT_KEY,
@@ -93,13 +94,30 @@ class TestConstants:
         assert TASK_COUNT_SNAPSHOT_KIND == 'task_count_snapshot'
 
     def test_stat_key_value(self):
-        assert SNAPSHOT_WRITTEN_STAT_KEY == 'task_count_snapshot_written'
+        assert SNAPSHOT_WRITTEN_STAT_KEY == 'task_count_snapshot_mem0_written'
 
     def test_prune_enumerated_stat_key_value(self):
         assert SNAPSHOT_PRUNE_ENUMERATED_STAT_KEY == 'task_count_snapshot_prune_enumerated'
 
     def test_pruned_stat_key_value(self):
-        assert SNAPSHOT_PRUNED_STAT_KEY == 'task_count_snapshot_pruned'
+        assert SNAPSHOT_PRUNED_STAT_KEY == 'task_count_snapshot_mem0_pruned'
+
+    def test_legacy_written_stat_key_value(self):
+        assert LEGACY_SNAPSHOT_WRITTEN_STAT_KEY == 'task_count_snapshot_written'
+
+    def test_renamed_keys_are_mem0_namespaced(self):
+        """Anti-regression pin (task 3045).
+
+        The un-namespaced spellings read as a persistence claim about
+        Graphiti, which is what drove Stage 3 / the judge to report a
+        "rejected write" for a snapshot that is Mem0-only BY DESIGN (see
+        Snapshot Discipline, prompts/stage1.py). This is the assertion
+        that stops a future edit from quietly restoring a
+        Graphiti-implying spelling.
+        """
+        assert 'mem0' in SNAPSHOT_WRITTEN_STAT_KEY
+        assert 'mem0' in SNAPSHOT_PRUNED_STAT_KEY
+        assert SNAPSHOT_WRITTEN_STAT_KEY != LEGACY_SNAPSHOT_WRITTEN_STAT_KEY
 
     def test_prune_enumeration_ok_stat_key_value(self):
         assert SNAPSHOT_PRUNE_ENUMERATION_OK_STAT_KEY == 'task_count_snapshot_prune_enumeration_ok'
