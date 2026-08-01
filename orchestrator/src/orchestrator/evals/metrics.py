@@ -19,6 +19,7 @@ from shared.invocation_outcome import (
     AuthFailed,
     CapHit,
     ModelNotFound,
+    ServerError,
     ZeroOutputWedge,
     classify_invocation,
 )
@@ -327,6 +328,14 @@ def detect_invocation_error(
         return None
     if getattr(result, 'api_error_status', None) == 429:
         return 'api_error: HTTP 429'
+    # ServerError sits BELOW the 429 fallback, because a 5xx is never a 429
+    # and 429-body semantics must not move; it sits ABOVE the wedge branch so
+    # this ladder's order tracks classify_invocation's own CapHit/NearCap >
+    # ServerError > ZeroOutputWedge precedence (shared/src/shared/
+    # invocation_outcome.py:398, :523) — a SIGTERM-flushed 5xx on a
+    # watchdog-killed CLI is a provider outage, not a local wedge.
+    if isinstance(outcome, ServerError):
+        return f'server_error: HTTP {outcome.status}'
     if isinstance(outcome, ZeroOutputWedge):
         return 'wedge: zero-output timeout (no transcript turns)'
     return None
