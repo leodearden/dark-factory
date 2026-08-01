@@ -229,6 +229,59 @@ class TestExtractSnapshotEdgeTaskIds:
         """
         assert extract_snapshot_edge_task_ids('Task 9 unblocked the merge queue') == set()
 
+    @pytest.mark.parametrize(
+        'fact',
+        [
+            'Task 5 blocked the merge queue',
+            'Task 142 blocked the release',
+            'Task 2885 blocked task 3001 for three days',
+            'Task 9 blocked the merge queue',
+        ],
+    )
+    def test_blocked_as_bare_transitive_verb_excluded(self, fact):
+        """'Task N blocked <object>' -> set().
+
+        Regression guard (reviewer_comprehensive correctness-precision
+        finding, task 3042). Unlike the adjective-only markers
+        ('active'/'pending'/'in progress'), 'blocked' is also a common
+        transitive past-tense verb. INDIVIDUAL_SNAPSHOT_RE's copula is
+        optional for the adjective arm, so before the split alternation the
+        bare-verb reading bound and every fact below wrongly yielded an id.
+
+        These are permanently-true HISTORICAL facts ('task 5 blocked the
+        merge queue' stays true forever), not status snapshots — the sweep
+        would have retired them the moment task 5/142/2885 went done or
+        cancelled, the over-selection direction the module docstring
+        forbids. Same hazard, and the same copula-only remedy, as task
+        2824's transitive-verb caveat on
+        task_filter.PRESENT_TENSE_COMPLETION_RE.
+
+        Note the last case is the false-positive twin of
+        test_unblocked_is_not_a_blocked_marker: that test only exercises
+        the \\b-protected 'unblocked' spelling, so it never covered the
+        bare-verb 'blocked' reading of the same sentence shape.
+        """
+        assert extract_snapshot_edge_task_ids(fact) == set()
+
+    @pytest.mark.parametrize(
+        ('fact', 'expected'),
+        [
+            ('Task 2885 is blocked.', {2885}),
+            ('Task 2885 was blocked', {2885}),
+            ('Task 2885 remains blocked', {2885}),
+            ('Task 2885 is a blocked task', {2885}),
+        ],
+    )
+    def test_blocked_in_copula_form_still_selected(self, fact, expected):
+        """The copula/article forms of 'blocked' must keep matching.
+
+        Pins the recall side of the transitive-verb split: restricting
+        'blocked' to a mandatory copula/article connective must not cost
+        any genuine blocked-status assertion, which is the whole point of
+        task 3042.
+        """
+        assert extract_snapshot_edge_task_ids(fact) == expected
+
     def test_status_phrase_does_not_cross_clause_boundary(self):
         """'Task 5 is done. Task 9 is in blocked status' -> {9}.
 

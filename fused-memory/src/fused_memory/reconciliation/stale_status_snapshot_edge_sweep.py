@@ -55,6 +55,13 @@ Design decisions (captured in plan.json):
   again be narrower than the anchored matchers — that drift (a marker
   present in one but not the other) is the exact bug class task 3042
   fixes. (amendment, task 3042)
+- 'blocked' is matched only in copula/article form by the anchored
+  individual matcher, because unlike the adjective-only markers it is
+  also a common transitive verb ('Task 5 blocked the merge queue' is a
+  permanently-true historical fact, not a status snapshot). Same hazard
+  and same remedy as task 2824's transitive-verb caveat on
+  ``task_filter.PRESENT_TENSE_COMPLETION_RE``. (amendment,
+  reviewer_comprehensive precision finding, task 3042)
 - Two anchoring paths with an explicit precision contract: closed-class
   connective only (copula / article — NOT the preposition 'in', which
   would let the marker bind to a noun the task is merely located in) for
@@ -92,14 +99,45 @@ logger = logging.getLogger(__name__)
 # extract_snapshot_edge_task_ids — pure lexical extraction
 # --------------------------------------------------------------------------- #
 
-# Status markers this sweep treats as non-terminal snapshot assertions.
-# Hoisted into a single constant so the gate (SNAPSHOT_STATUS_RE) and the
-# anchored individual-form regex (INDIVIDUAL_SNAPSHOT_RE) can never drift
-# apart again — before task 3042 they were hand-copied duplicates, and a
-# marker present in one but not the other silently suppressed a whole class
-# of edges (the gate short-circuits below, before the INACTIVE_TASK_STATUSES
-# cross-reference in select_stale_status_snapshot_edges ever runs).
-_STATUS_MARKER_ALT = r'(?:active|pending|blocked|in[-\s]?progress)'
+# Status markers this sweep treats as non-terminal snapshot assertions,
+# split by part of speech.
+#
+# Transitive-verb caveat (amendment, reviewer_comprehensive
+# correctness-precision finding, task 3042 — the same hazard task 2824
+# documented on task_filter.PRESENT_TENSE_COMPLETION_RE, and solved the same
+# way). 'active'/'pending'/'in progress' are adjectives only: the bare
+# adjacency 'Task 5 pending' can only be read as a status assertion about
+# task 5, so INDIVIDUAL_SNAPSHOT_RE may match them with an OPTIONAL copula.
+# 'blocked' is different — it is also a common transitive past-tense verb,
+# so under an optional copula the bare-verb reading binds and 'Task 5
+# blocked the merge queue' wrongly yields {5}. Those are permanently-true
+# historical facts, not status snapshots; retiring them once task 5 goes
+# done is the over-selection direction this module's docstring forbids.
+# Hence 'blocked' is reachable from INDIVIDUAL_SNAPSHOT_RE only through a
+# MANDATORY copula/article connective ('Task 5 is blocked', 'Task 5 is a
+# blocked task'), never as a bare verb. This trades a little under-firing
+# for many fewer false positives, matching the fail-safe direction stated
+# in the module docstring.
+_ADJECTIVE_MARKER_ALT = r'(?:active|pending|in[-\s]?progress)'
+_TRANSITIVE_MARKER_ALT = r'(?:blocked)'
+
+# Copula/linking verbs admitted as a closed-class connective. Shared by both
+# arms of INDIVIDUAL_SNAPSHOT_RE — optional for the adjective arm, mandatory
+# for the transitive-capable arm.
+_COPULA_ALT = r'(?:is|are|was|were|remains?)'
+
+# The union of both marker classes. Derived from the two constants above
+# rather than hand-written, so the gate (SNAPSHOT_STATUS_RE) and the
+# anchored matchers can never drift apart again — before task 3042 they were
+# hand-copied duplicates, and a marker present in one but not the other
+# silently suppressed a whole class of edges (the gate short-circuits below,
+# before the INACTIVE_TASK_STATUSES cross-reference in
+# select_stale_status_snapshot_edges ever runs). Used ONLY by the gate and
+# by the status-noun-anchored SNAPSHOT_STATUS_PHRASE_RE — both of which are
+# safe against the transitive-verb reading (the gate merely admits the fact
+# for consideration; the phrase form requires the literal noun 'status'
+# after the marker).
+_STATUS_MARKER_ALT = r'(?:' + _ADJECTIVE_MARKER_ALT + r'|' + _TRANSITIVE_MARKER_ALT + r')'
 
 # Gate: a status-snapshot edge must assert one of these non-terminal
 # statuses somewhere in its fact text, else it is not a status-snapshot edge
@@ -171,10 +209,22 @@ COUNT_QUANTITY_RE: re.Pattern[str] = re.compile(
 #     the reference and the marker — never an open-class verb or noun, and
 #     never a preposition introducing a noun phrase. So 'Task 142 landed on
 #     the blocked branch' still yields set().
+# (d) Two arms, split by the marker's part of speech (see the
+#     transitive-verb caveat on _TRANSITIVE_MARKER_ALT above). The
+#     adjective arm keeps the task-2613 OPTIONAL copula, so the verb-less
+#     'Task 5 pending' still matches. The transitive-capable arm
+#     ('blocked') requires a MANDATORY copula or article, so 'Task 5 is
+#     blocked' matches while the bare-verb 'Task 5 blocked the merge
+#     queue' does not.
 INDIVIDUAL_SNAPSHOT_RE: re.Pattern[str] = re.compile(
     TASK_REF_RE.pattern
-    + r'\s*(?:is|are|was|were)?\s*(?:an?\s+)?'
-    + _STATUS_MARKER_ALT + r'\b',
+    + r'(?:'
+    # adjective arm — optional copula (task 2613 behaviour, unchanged)
+    + r'\s*' + _COPULA_ALT + r'?\s*(?:an?\s+)?' + _ADJECTIVE_MARKER_ALT
+    + r'|'
+    # transitive-capable arm — copula or article is MANDATORY
+    + r'\s+(?:' + _COPULA_ALT + r'\s+(?:an?\s+)?|an?\s+)' + _TRANSITIVE_MARKER_ALT
+    + r')\b',
     re.IGNORECASE,
 )
 
