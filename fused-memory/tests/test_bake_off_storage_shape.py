@@ -1462,3 +1462,299 @@ class TestMetricsAreRankBasedNotScoreBased:
         assert mod.topic_discoverability(hits, 'alpha', 'r1', 5) == (
             mod.topic_discoverability(rewritten, 'alpha', 'r1', 5)
         )
+
+
+# ===========================================================================
+# step-11 — the D4 cost metric: tokens returned per query
+# ===========================================================================
+#
+# The question D4 asks is a COST question: "a grouped read returns one long
+# document; N peers return N short ones — which costs the reader more?"  So
+# the metric sums the payloads a query actually returns within top-k, which
+# puts one long document and N short ones on the same footing (a hit-count
+# metric would answer a different, useless question).
+#
+# NOTHING BELOW PINS AN ABSOLUTE TOKEN NUMBER, and nothing pins a
+# proxy-vs-tiktoken ratio.  The metric is COMPARATIVE across arms: the report
+# reads "arm (a) costs 3.1x arm (c)", never "arm (a) costs 812 tokens".  An
+# absolute assertion here would pin this file to one tokenizer build and
+# would be asserting a property of tiktoken, not of the bake-off.  Where an
+# exact sum IS asserted it is against an explicitly INJECTED estimator whose
+# arithmetic is trivially known (word count), which tests the summation
+# without pretending to know what a real tokenizer returns.
+#
+# tiktoken is NOT installed in this venv, so the character proxy is the live
+# path today.  The selection logic is still tested in both directions by
+# injecting a fake `tiktoken` into sys.modules — a branch that only runs on
+# somebody else's machine is a branch nobody has tested.
+
+
+def _payload(content: str, *, record_id: str = 'r', **metadata):
+    """One ranked hit carrying `content` as its returned payload."""
+    return _mod().ArmRecord(
+        record_id=record_id,
+        content=content,
+        metadata={'category': 'procedural_knowledge', **metadata},
+        cluster_id='c1',
+        claim_ids=[],
+        role='peer',
+    )
+
+
+#: An injected estimator with trivially-known arithmetic, so a test can assert
+#: an exact SUM without asserting anything about a real tokenizer.
+_WORDS = ('injected:words', lambda text: len(text.split()))
+
+
+def _fake_tiktoken(encode=None, *, get_encoding_raises: Exception | None = None):
+    """A stand-in `tiktoken` module for testing the selection branch."""
+    module = types.ModuleType('tiktoken')
+
+    class _Encoding:
+        def encode(self, text):
+            return (encode or (lambda t: t.split()))(text)
+
+    def _get_encoding(name):
+        if get_encoding_raises is not None:
+            raise get_encoding_raises
+        return _Encoding()
+
+    module.get_encoding = _get_encoding  # type: ignore[attr-defined]
+    return module
+
+
+def _available_estimators():
+    """Every estimator that can actually run here, resolved by name.
+
+    tiktoken is absent from this venv, so this is normally a one-element list
+    — but the shared-invariant tests below must cover it wherever it IS
+    installed rather than silently testing half of what they claim to.
+
+    Called from inside test BODIES, never from a `parametrize` decorator:
+    the latter would load the script at collection time and break this
+    module's documented lazy-`_mod()` discipline.
+    """
+    mod = _mod()
+    estimators = [(mod.CHAR_PROXY_ESTIMATOR_NAME, mod.character_proxy_tokens)]
+    try:
+        import tiktoken  # noqa: PLC0415
+
+        encoding = tiktoken.get_encoding('cl100k_base')
+    except Exception:  # noqa: BLE001 — absent OR unable to fetch its BPE file
+        return estimators
+    estimators.append(
+        (mod.TIKTOKEN_ESTIMATOR_NAME, lambda text: len(encoding.encode(text)))
+    )
+    return estimators
+
+
+class TestResolveTokenEstimator:
+    """Which tokenizer ran must be a REPORTED FACT, never an assumption."""
+
+    def test_returns_a_name_and_a_callable_pair(self):
+        name, encode = _mod().resolve_token_estimator()
+
+        assert isinstance(name, str) and name
+        assert callable(encode)
+        assert isinstance(encode('some text'), int)
+
+    def test_names_tiktoken_when_tiktoken_is_importable(self, monkeypatch):
+        import sys  # noqa: PLC0415
+
+        mod = _mod()
+        monkeypatch.setitem(sys.modules, 'tiktoken', _fake_tiktoken())
+
+        name, encode = mod.resolve_token_estimator()
+
+        assert name == mod.TIKTOKEN_ESTIMATOR_NAME == 'tiktoken:cl100k_base'
+        # ...and it really delegates to the encoding rather than just renaming
+        # the proxy: the fake tokenizes on whitespace, which no character
+        # proxy would ever agree with on this input.
+        assert encode('a bb ccc dddd eeeee ffffff') == 6
+
+    def test_falls_back_to_the_character_proxy_when_tiktoken_is_absent(
+        self, monkeypatch
+    ):
+        import sys  # noqa: PLC0415
+
+        mod = _mod()
+        monkeypatch.setitem(sys.modules, 'tiktoken', None)  # forces ImportError
+
+        name, encode = mod.resolve_token_estimator()
+
+        assert name == mod.CHAR_PROXY_ESTIMATOR_NAME
+        assert encode('x' * 40) == mod.character_proxy_tokens('x' * 40)
+
+    def test_the_fallback_name_never_claims_tiktoken(self, monkeypatch):
+        """The whole point of returning a name: a substitution that reported
+        itself as tiktoken would put un-flagged proxy numbers in the report,
+        and nobody reading the artifact could tell."""
+        import sys  # noqa: PLC0415
+
+        mod = _mod()
+        monkeypatch.setitem(sys.modules, 'tiktoken', None)
+
+        name, _ = mod.resolve_token_estimator()
+
+        assert 'tiktoken' not in name
+        assert name != mod.TIKTOKEN_ESTIMATOR_NAME
+        # The name must say WHAT it is, not merely that it is not tiktoken.
+        assert 'char' in name
+
+    def test_an_unusable_tiktoken_falls_back_instead_of_exploding(
+        self, monkeypatch
+    ):
+        """tiktoken imports fine but fetches its BPE file from the network on
+        first `get_encoding`. On an offline box that raises — and a cost
+        metric must not take the whole bake-off down with it."""
+        import sys  # noqa: PLC0415
+
+        mod = _mod()
+        monkeypatch.setitem(
+            sys.modules,
+            'tiktoken',
+            _fake_tiktoken(get_encoding_raises=OSError('no network')),
+        )
+
+        name, encode = mod.resolve_token_estimator()
+
+        assert name == mod.CHAR_PROXY_ESTIMATOR_NAME  # honest about what ran
+        assert encode('x' * 40) == mod.character_proxy_tokens('x' * 40)
+
+    def test_resolution_is_not_cached_across_calls(self, monkeypatch):
+        """A cached resolution would make the report state whichever
+        estimator the FIRST caller in the process happened to get."""
+        import sys  # noqa: PLC0415
+
+        mod = _mod()
+        monkeypatch.setitem(sys.modules, 'tiktoken', _fake_tiktoken())
+        assert mod.resolve_token_estimator()[0] == mod.TIKTOKEN_ESTIMATOR_NAME
+
+        monkeypatch.setitem(sys.modules, 'tiktoken', None)
+        assert mod.resolve_token_estimator()[0] == mod.CHAR_PROXY_ESTIMATOR_NAME
+
+
+class TestTokensReturned:
+    """Sum over the top-k payloads — one long document vs N short ones."""
+
+    def test_sums_the_payloads_of_the_top_k_hits(self):
+        mod = _mod()
+        hits = [_payload('a b c', record_id='r0'), _payload('d e', record_id='r1')]
+
+        assert mod.tokens_returned(hits, 5, _WORDS)['tokens'] == 5
+
+    def test_only_the_top_k_payloads_are_counted(self):
+        mod = _mod()
+        hits = [_payload('a b c', record_id='r0'), _payload('d e', record_id='r1')]
+
+        assert mod.tokens_returned(hits, 1, _WORDS)['tokens'] == 3
+        assert mod.tokens_returned(hits, 1, _WORDS)['payloads_counted'] == 1
+
+    def test_one_grouped_document_and_n_peers_are_weighed_on_equal_footing(self):
+        """The D4 question itself: identical knowledge, two shapes. The metric
+        must be blind to how many hits carried it — otherwise it answers "how
+        many results?" rather than "how much must the reader read?"."""
+        mod = _mod()
+        peers = [
+            _payload('claim one body', record_id='p0'),
+            _payload('claim two body', record_id='p1'),
+            _payload('claim three body', record_id='p2'),
+        ]
+        grouped = [_payload('claim one body claim two body claim three body')]
+
+        assert (
+            mod.tokens_returned(grouped, 5, _WORDS)['tokens']
+            == mod.tokens_returned(peers, 5, _WORDS)['tokens']
+            == 9
+        )
+
+    def test_the_estimator_name_is_carried_into_the_result(self):
+        """So the report can state which tokenizer produced its numbers.
+        Without this the artifact is un-interpretable a month later."""
+        mod = _mod()
+
+        result = mod.tokens_returned([_payload('a b')], 5, _WORDS)
+
+        assert result['estimator'] == 'injected:words'
+
+    def test_the_default_estimator_is_the_resolved_one_and_is_named(self):
+        mod = _mod()
+        expected_name, expected_encode = mod.resolve_token_estimator()
+
+        result = mod.tokens_returned([_payload('x' * 400)], 5)
+
+        assert result['estimator'] == expected_name
+        assert result['tokens'] == expected_encode('x' * 400)
+
+    def test_only_the_knowledge_payload_is_counted_not_the_metadata(self):
+        """Metadata rendering is a transport/formatting choice η is NOT
+        deciding. Folding it in would make the arm comparison move with how
+        the server happens to render a result dict — and would charge the
+        shapes that carry β vocabulary keys for carrying them, which is a
+        real but SEPARATE question from D4's payload cost."""
+        mod = _mod()
+        bare = [_payload('a b c')]
+        adorned = [
+            _payload(
+                'a b c',
+                topic='a-very-long-topic-slug-indeed',
+                canonical=True,
+                kind='amendment',
+            )
+        ]
+
+        assert (
+            mod.tokens_returned(adorned, 5, _WORDS)['tokens']
+            == mod.tokens_returned(bare, 5, _WORDS)['tokens']
+        )
+
+    def test_a_k_larger_than_the_hit_list_counts_what_is_there(self):
+        result = _mod().tokens_returned([_payload('a b')], 50, _WORDS)
+
+        assert result['tokens'] == 2
+        assert result['payloads_counted'] == 1
+
+
+class TestTokenEstimatorInvariants:
+    """Properties that must hold for EVERY estimator, or arms stop comparing."""
+
+    def test_every_estimator_is_monotone_in_content_length(self):
+        """Non-decreasing, not strictly increasing: the proxy floors, so two
+        near-identical lengths can legitimately tie. What must NEVER happen is
+        a longer payload costing less — that would let the verbose arm win."""
+        bodies = ['', 'w', 'word ' * 10, 'word ' * 100, 'word ' * 1000]
+
+        for name, encode in _available_estimators():
+            estimates = [encode(body) for body in bodies]
+
+            assert estimates == sorted(estimates), f'{name} is not monotone'
+            assert estimates[-1] > estimates[1], f'{name} does not grow at all'
+
+    def test_every_estimator_agrees_that_nothing_returned_costs_nothing(self):
+        mod = _mod()
+
+        for name, encode in _available_estimators():
+            assert encode('') == 0, f'{name} charges for an empty payload'
+            assert mod.tokens_returned([], 5, (name, encode)) == {
+                'tokens': 0,
+                'estimator': name,
+                'payloads_counted': 0,
+            }
+
+    def test_every_estimator_is_deterministic(self):
+        """A rerun must produce a diffable report, not a moving number."""
+        body = 'the quick brown fox jumps over the lazy dog ' * 20
+
+        for name, encode in _available_estimators():
+            assert encode(body) == encode(body), f'{name} is not deterministic'
+
+    def test_the_character_proxy_documents_its_derivation(self):
+        """A magic divisor nobody can trace is how a proxy silently becomes a
+        different proxy. It reuses the repo's ONE chars-per-token constant."""
+        import inspect  # noqa: PLC0415
+
+        mod = _mod()
+        source = inspect.getsource(mod.character_proxy_tokens)
+
+        assert 'estimate_tokens' in source  # reuses context_assembler's proxy
+        assert mod.character_proxy_tokens('x' * 400) > 0
