@@ -1484,14 +1484,31 @@ def test_normal_spawn_exit0_not_flagged(tmp_path: pathlib.Path) -> None:
     watchdog is running concurrently in the background. Already green after
     step-2 (the sentinel check alone satisfies it) -- this pins the contract
     before step-4 adds more evidence probes.
+
+    Task 3451: fixes a load-sensitive flake from pinning
+    SPAWN_STARTED_GRACE_SECS to a fixed "2" against a 90s production
+    default. Under merge-verify contention the parent's own
+    launcher->claude->sentinel chain outran the fixed 2s window while all
+    three watchdog probes (sentinel, transcript, live claude descendant)
+    were still empty, so the watchdog overwrote the registry record with
+    failed-to-start AFTER the parent had already written exited, and
+    _cleanup (skills/spawn/spawn-claude.sh:107) then killed the watchdog
+    before its stderr echo -- which is exactly why the reported failure
+    showed registry=failed-to-start with a CLEAN stderr: it passed the
+    "failed-to-start" not in stderr assertion below and failed only the
+    final registry-status assertion. Now uses _set_started_grace, the same
+    load-adaptive policy as the sibling must-not-be-flagged tests, with a
+    grace-relative _run_spawn timeout so the same load that enlarges the
+    grace cannot convert this into a subprocess.TimeoutExpired flake
+    instead.
     """
     bin_dir = _make_bin_dir(tmp_path)
     _write_fake_claude(bin_dir, exit_code=0)
     _write_foreground_terminal(bin_dir, "xterm")
     env = _base_env(bin_dir, "xterm")
-    env["SPAWN_STARTED_GRACE_SECS"] = "2"
+    grace = _set_started_grace(env)
 
-    result = _run_spawn(env, tmp_path)
+    result = _run_spawn(env, tmp_path, timeout=grace + 20)
 
     stderr = result.stderr.decode()
     assert result.returncode == 0, (
