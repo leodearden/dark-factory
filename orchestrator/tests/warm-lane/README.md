@@ -263,8 +263,8 @@ Measured on an unloaded host, each `.sh` run directly and sequentially:
 | `test_provision_warm_lane_fs.sh` | 111 | 1.49s |
 | `test_warm_lane_gc_sweep.sh` | 86 | 6.73s |
 | `test_warm_lane_audit.sh` | 228 | 12.93s |
-| `test_warm_lane_gc.sh` | 198 | 16.95s (stale — see below) |
-| **total** | **865** | **≈42s (stale)** |
+| `test_warm_lane_gc.sh` | 214 | 16.95s (stale — timed at 198 asserts; see below) |
+| **total** | **881** | **≈42s (stale)** |
 
 `test_warm_lane_gc.sh` dominates: 34 `git worktree add` calls, 33 `flock`
 acquisitions and `/proc/<pid>/{exe,cwd,fd,maps}` liveness walks. Under
@@ -298,16 +298,65 @@ arithmetic is recorded on `SUBPROC_TIMEOUT` in the driver. Note the ranking
 inversion this table's unloaded column does not predict: under fleet load
 `test_warm_lane_audit.sh`, not `test_warm_lane_gc.sh`, is the binding suite.
 
-**The `test_warm_lane_gc.sh` wall-clock is OWED a re-measurement (task 3075).**
+### The registry-render bridge, and why its cost could not be measured here
+
+Task 3292 wired `warm-lane-gc.sh`'s `PROTECT_GLOB` default to
+`lib_lane_state.sh`'s `lane_protect_glob`, which starts a python3 and imports
+pydantic **once per gc.sh invocation**. Both suites mitigate that, and the
+mitigation is the reason no `SUBPROC_TIMEOUT` change was needed:
+
+- `run_helper` (gc suite) and `run_sweep` (gc-sweep suite) pin
+  `REIFY_WARM_LANE_GC_PROTECT_GLOB` to the shipped `$LANE_PROTECT_GLOB_FALLBACK`,
+  which gc.sh's `[ -n "$PROTECT_GLOB" ] ||` default short-circuits *before* the
+  bridge runs. It is gc.sh's own documented knob, not a test-only opt-out.
+- The blocks that assert what the **DEFAULT** protects opt back out through
+  `run_helper_live_default`: **M, N-default, O** (both sub-cases) and **X-band**.
+  5 of the gc suite's 37 invocations pay a render; the gc-sweep suite's four
+  real-gc sites (G4, G5, two U) pay none, and nothing there inspects the glob.
+- **A future block that asserts default content must use
+  `run_helper_live_default`, or it silently tests the pin instead of the
+  default.**
+
+**The mitigation's wall-clock saving is NOT stated here, because this host could
+not measure it.** A three-run sandwich (mitigated / unmitigated / mitigated) was
+run back-to-back on 2026-08-01 at commit `04b2dd82d5` specifically to isolate it,
+with the unmitigated leg produced by a throwaway copy of the suite whose pin
+branch was made dead. All three reported **214 passed, 0 failed**:
+
+| leg | wall-clock | loadavg before → after |
+|---|---|---|
+| mitigated | 213.8s | 229.75 → 281.67 |
+| **un**mitigated | **203.3s** | 281.67 → 113.75 |
+| mitigated | 298.3s | 113.75 → 212.09 |
+
+The unmitigated leg is the **fastest** of the three, which no amount of removed
+work can explain — the fleet load collapsed from ~282 to ~114 during it. The two
+*identical* mitigated legs differ by **84.5s**, an order of magnitude more than
+the ~18 elided renders could account for at the per-render cost measured minutes
+later at loadavg 189: **1.49 / 1.48 / 0.97 / 3.75 / 3.43s** over five samples.
+Between-run variance here swamps the effect being measured, so any figure
+derived from this A/B would be an estimate dressed as a measurement — exactly
+what the rule below forbids. The elided-render **count** is exact and the
+per-render **cost** is measured; their product is a derivation, not a
+wall-clock, and is deliberately not written into the table as one.
+
+The `test_warm_lane_gc_sweep.sh` pair from the same session, for the record:
+**59.5s / 86 passed** at loadavg 203.61→183.87 before the change (commit
+`e1c04cf316`), **124.0s / 86 passed** at loadavg 212.09→189.41 after. Same
+caveat, same reason.
+
+**The `test_warm_lane_gc.sh` wall-clock is OWED a re-measurement (task 3075,
+re-attributed to task 3292 and still open).**
 Its assert count moved 170 → 198 when leaf γ added Block S and A10 (four new
 `run_helper reclaim` invocations, shaped to keep at most two `/proc`-walking
-lanes each). Two measurements exist, both on a heavily loaded host and so
-neither comparable to this table's unloaded baseline: **79.3s at loadavg
-109.67** and **128.3s at loadavg 124** (the latter with `test_warm_lane_audit.sh`
-running concurrently). They are recorded here as observations and deliberately
-NOT promoted into the table — and their spread, 79.3s to 128.3s for the same
-198 asserts at a nominally similar load, is itself the reason a loaded figure
-cannot stand in for an unloaded one. Writing either in as the new unloaded figure, or writing
+lanes each), then **198 → 214** when task 3292 added Block X. Four measurements
+now exist, all on a heavily loaded host and so none comparable to this table's
+unloaded baseline: **79.3s at loadavg 109.67**, **128.3s at loadavg 124** (the
+latter with `test_warm_lane_audit.sh` running concurrently), and the 213.8s /
+298.3s sandwich pair above. They are recorded here as observations and
+deliberately NOT promoted into the table — and their spread, 79.3s to 298.3s
+for a suite that grew by 16 asserts, is itself the reason a loaded figure
+cannot stand in for an unloaded one. Writing any of them in as the new unloaded figure, or writing
 in an estimate dressed as a measurement, would put a false number on main —
 which is what this table exists to prevent, since its stated purpose is that
 the *measured* cost is what justified answering PRD §11 q4 with "the default
