@@ -44,13 +44,52 @@ max_concurrent_tasks: 24
 # trickle / codebook / worktree-lifecycle tooling, e.g. test_census_trigger.py
 # and test_legibility_census.py). Neither the 5 subprojects' own tests/ dirs
 # nor tests/scripts/ ever collect scripts/tests/ (it is not a workspace
-# member and sits outside every subproject prefix), so a task editing
-# scripts/legibility/* could pass verify with this suite broken or never
-# executed. Also fanned out via ``--project shared`` for the same reason as
-# tests/scripts/ (scripts/tests/ imports no first-party package, and shared
-# is the member declaring pytest). Measured green: 1184 passed in ~113s
-# (lowest of local runs), which comfortably clears verify_command_timeout_secs
-# below — see the fleet-chain budget accounting above.
+# member and sits outside every subproject prefix). Also fanned out via
+# ``--project shared`` for the same reason as tests/scripts/ (scripts/tests/
+# imports no first-party package, and shared is the member declaring
+# pytest). Measured green: 1184 passed in ~113s (lowest of local runs),
+# which comfortably clears verify_command_timeout_secs below — see the
+# fleet-chain budget accounting above.
+#
+# CORRECTION: an earlier version of this comment claimed this segment stops
+# a scripts/legibility/* diff from passing verify with scripts/tests/ broken
+# or never executed. That is false — this chain is built by
+# ``_build_fallback_config``, which ``run_scoped_verification``
+# (orchestrator/verify.py) reaches only past its ``if module_configs:``
+# check; that branch always returns, so ``_build_fallback_config`` runs only
+# when NO module config is discovered at all. ``_discover_module_configs``
+# DOES register a ``scripts`` module config, and ``derive_modules`` ->
+# ``OrchestratorConfig.for_module``'s longest-prefix walk resolves
+# scripts/legibility/digest.py, scripts/census_trigger.py AND
+# scripts/tests/test_codebook.py all to prefix ``scripts`` (verified against
+# this worktree's routing functions, lock_depth=4). So every scripts/** diff
+# routes to scripts/orchestrator.yaml's own test_command instead, and this
+# segment never executes for it — it is DEFENCE-IN-DEPTH for the
+# module-config-less fallback path only, not a gate on scripts/legibility/*
+# or any other scripts/** path.
+#
+# THE REAL GATE, and its open gap: scripts/orchestrator.yaml's test_command
+# still targets only tests/scripts/, and no full-suite command anywhere
+# runs scripts/tests/ under FULL_SUITE or merge-role
+# merge_verify_breadth="full". FILE_SCOPED pytest DOES narrow correctly for
+# a touched scripts/tests/ file today (measured: a diff of just
+# scripts/tests/test_codebook.py plans a file-scoped ``uv run --project
+# shared pytest scripts/tests/test_codebook.py``), so the open gap is
+# specifically the FULL_SUITE / merge full-verify path, not every
+# scripts/** diff. Task 3460 ("scripts/tests/ (40 test modules) never runs
+# under FULL_SUITE or merge full-verify — no full-suite command targets
+# it") owns closing it in scripts/orchestrator.yaml — do not re-close it
+# here.
+#
+# Measured for 3460's benefit: both directories together (``uv run
+# --project shared pytest scripts/tests/ tests/scripts/ --tb=line -q
+# --timeout=300``) are green at 1825 passed, 1 skipped in 288.65s (~294s
+# wall) on this worktree. Running BOTH — not swapping one for the other —
+# is the recommended shape: tests/scripts/ holds distinct coverage of
+# scripts/*.py (e.g. test_orchestrator_watchdog.py,
+# test_dashboard_watchdog.py, test_spawn_claude.py have no scripts/tests/
+# counterpart) that a straight swap would close one gap only to open
+# another.
 test_command: "cd shared && uv run pytest tests/ --timeout=300 && cd ../escalation && uv run pytest tests/ --timeout=300 && cd ../orchestrator && uv run pytest tests/ --timeout=300 && cd ../fused-memory && uv run pytest tests/ --timeout=300 && cd ../dashboard && uv run pytest tests/ --timeout=300 && cd ../sampler && uv run pytest tests/ --timeout=300 && cd .. && ( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/ --timeout=300 ) && uv run --project shared pytest tests/scripts/ --timeout=300 && uv run --project shared pytest scripts/tests/ --timeout=300"
 # ``uv run`` prefix is load-bearing: ruff is not on PATH at the worktree root
 # (only inside each member venv). Without it the fallback scoper (which narrows
