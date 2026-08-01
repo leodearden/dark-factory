@@ -297,6 +297,23 @@ def repoint_tombstone_chain(
     return out
 
 
+def _deep_copy(node: Any) -> Any:
+    """Structural deep copy over the same node kinds :func:`repoint_metadata`
+    traverses, with no dependence on any id.
+
+    Kept as its own walker rather than ``copy.deepcopy`` so the degenerate-input
+    path shares the rewrite path's traversal shape exactly and cannot raise on
+    an exotic leaf (leaves are returned as-is, never copied).
+    """
+    if isinstance(node, dict):
+        return {key: _deep_copy(value) for key, value in node.items()}
+    if isinstance(node, list):
+        return [_deep_copy(value) for value in node]
+    if isinstance(node, tuple):
+        return tuple(_deep_copy(value) for value in node)
+    return node
+
+
 def repoint_metadata(
     metadata: Any,
     old_id: str,
@@ -320,7 +337,19 @@ def repoint_metadata(
     A string containing ``old_id`` more than once counts as ONE occurrence, to
     stay path-for-path consistent with the scanner (which reports one path per
     string, not one per byte offset).
+
+    Degenerate input is returned unchanged (deep-copied) with ``count == 0``,
+    never raised on and never rewritten — matching
+    :func:`find_citation_occurrences`, which returns ``[]`` rather than raising
+    on a malformed id. In particular an empty ``old_id`` must NOT reach the
+    rewrite path: ``''.replace('', x)`` inserts ``x`` between every character,
+    which would silently corrupt every string in the blob.
     """
+    if not isinstance(old_id, str) or not old_id or not isinstance(metadata, dict):
+        # Nothing addressable to rewrite. Still deep-copy dict input so the
+        # return value is never an alias of the caller's object.
+        return (_deep_copy(metadata) if isinstance(metadata, dict) else metadata), 0
+
     count = 0
 
     def _rewrite(node: Any) -> Any:
@@ -337,11 +366,6 @@ def repoint_metadata(
         if isinstance(node, tuple):
             return tuple(_rewrite(value) for value in node)
         return node
-
-    if not old_id or not isinstance(old_id, str) or not isinstance(metadata, dict):
-        # Nothing addressable to rewrite. Still deep-copy dict input so the
-        # return value is never an alias of the caller's object.
-        return (_rewrite(metadata) if isinstance(metadata, dict) else metadata), 0
 
     return _rewrite(metadata), count
 

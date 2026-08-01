@@ -458,6 +458,47 @@ class TestRepointMetadata:
         # The prefix twin is emphatically not collateral damage.
         assert repointed['nested']['twin'] == _PREFIX_TWIN
 
+    def test_empty_old_id_copies_without_corrupting_any_string(self):
+        """(h) An empty ``old_id`` must short-circuit BEFORE the rewrite path.
+
+        ``''.replace('', x)`` inserts ``x`` between every character, so routing
+        a degenerate id into the rewrite would silently mangle every string in
+        the blob while still reporting ``count == 0`` — a caller trusting the
+        count would write the corrupted blob back. This is the silent
+        corruption the guard exists to prevent.
+        """
+        metadata: dict[str, Any] = {'a': 'hello', 'b': {'c': 'world'}, 'd': ['e', 7]}
+        original = {'a': 'hello', 'b': {'c': 'world'}, 'd': ['e', 7]}
+
+        repointed, count = repoint_metadata(metadata, '', _SURVIVOR)
+
+        assert count == 0
+        assert repointed == original
+        assert metadata == original
+        # Equal but not an alias — the deep-copy contract still holds.
+        assert repointed is not metadata
+        assert repointed['b'] is not metadata['b']
+        assert repointed['d'] is not metadata['d']
+
+    def test_non_str_old_id_returns_copy_rather_than_raising(self):
+        """(i) A non-string ``old_id`` returns a copy with a zero count.
+
+        Matches ``find_citation_occurrences``, which returns ``[]`` rather than
+        raising on a malformed id; previously this leaked a bare ``TypeError``
+        from ``None in node``.
+        """
+        metadata: dict[str, Any] = {'a': 'hello', 'b': {'c': 'world'}}
+        original = {'a': 'hello', 'b': {'c': 'world'}}
+
+        for bad_id in (None, 42, ['not', 'an', 'id']):
+            repointed, count = repoint_metadata(metadata, bad_id, _SURVIVOR)
+
+            assert count == 0
+            assert repointed == original
+            assert repointed is not metadata
+            assert repointed['b'] is not metadata['b']
+        assert metadata == original
+
 
 # The literal string Stage 2 wrote as a "correction" during the incident.
 # Running that query live returned only superseded cluster members and routed
