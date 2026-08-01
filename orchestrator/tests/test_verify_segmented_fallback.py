@@ -374,10 +374,28 @@ class TestRunSegmentedSharedDeadline:
 
     @pytest.mark.asyncio
     async def test_a_red_segment_before_the_deadline_still_wins_the_rc(self, tmp_path):
-        """A real failure outranks the synthetic not-run rc.
+        """A real failure outranks the synthetic not-run rc — AND its flag.
 
         The cause_hint a triaging agent needs is the genuine red, so a
         budget-exhausted tail must not overwrite it.
+
+        The same now holds for the timeout FLAG, and it has to:
+        ``verify_classify.classify_failure``'s guard 2 (``if timed_out: return
+        FailureCategory.INFRA_TIMEOUT``) wins over EVERY output pattern, so a
+        SYNTHESISED ``timed_out`` relabels a genuine red as a timeout no matter
+        what the output says. Downstream that also makes
+        ``VerifyAttempt.pure_timeout_failure`` true (the test check has rc!=0
+        AND timed_out=True, satisfying its ``all(c.rc == 0 or c.timed_out ...)``
+        clause), so the run is re-run ``max_retries`` times at a full budget
+        each and routed to infra-hold instead of the debugger.
+
+        That would be a REGRESSION against the pre-change baseline: under the
+        `&&` chain the shell short-circuited at the red, so the check finished
+        fast with rc=1, timed_out=False and a clean `test_failure`. Nothing is
+        hidden by dropping the flag — the unrun tail stays visible via the
+        segment dicts (`rc=None`, non-empty `skip_reason`), the NOT RUN output
+        blocks and roster lines, and the `| segments not run:` cause_hint
+        suffix. Only the CLASSIFICATION moves, and only toward the truth.
         """
         clock = _Clock(cost_per_segment=5.0)
         run_one = _RecordingRunOne(clock, results={1: (7, 'escalation red', False)})
@@ -393,10 +411,40 @@ class TestRunSegmentedSharedDeadline:
         )
 
         assert rc == 7
-        assert timed_out is True
+        assert timed_out is False
         assert [d['status'] for d in seg_dicts] == (
             ['passed', 'failed'] + ['not_run'] * 6
         )
+
+    @pytest.mark.asyncio
+    async def test_a_green_so_far_run_whose_tail_is_unrun_still_reports_timed_out(
+        self, tmp_path,
+    ):
+        """The contrasting half of the rule the test above states.
+
+        Making the synthetic flag conditional must NOT weaken the not-run
+        contract — it only stops it firing when a REAL red is already there to
+        report. With no red anywhere, a truncated chain is exactly the case the
+        synthetic flag exists for: rc!=0 AND timed_out=True, so it classifies
+        as `infra_timeout` (retryable) precisely as a single-chain timeout does
+        today. Read this and the test above as one rule, not two.
+        """
+        clock = _Clock(cost_per_segment=5.0)
+        run_one = _RecordingRunOne(clock)  # every executed segment passes
+        segments = _fleet_segments()
+        from orchestrator.verify import _run_segmented  # noqa: PLC0415
+
+        rc, _output, timed_out, seg_dicts = await _run_segmented(
+            segments,
+            run_one=run_one,
+            worktree=tmp_path,
+            budget_secs=10.0,
+            now=clock,
+        )
+
+        assert [d['status'] for d in seg_dicts] == ['passed'] * 2 + ['not_run'] * 6
+        assert rc != 0
+        assert timed_out is True
 
 
 _PYTEST_RED = (
@@ -848,8 +896,64 @@ class TestRunVerificationSegmentedAcceptance:
         Forcing it is what keeps a budget-exhausted chain classified as
         `infra_timeout` (retryable) exactly as a single-chain timeout is today,
         leaving run_verification's retry/env-recovery machinery untouched.
+
+        Pinned as an explicit PAIR with
+        ``test_a_genuine_red_survives_budget_exhaustion_as_a_test_failure``
+        below: with no red present the run IS a timeout, and with one present it
+        is not. Asserting the category on both sides keeps the two outcomes
+        stated rather than one asserted and the other assumed.
         """
         result, _calls, runs = await self._run(tmp_path, blow_budget_after=2)
 
         assert any(s['status'] == 'not_run' for s in _test_run_entry(runs)['segments'])
         assert result.timed_out is True
+        assert result.category == 'infra_timeout'
+
+    @pytest.mark.asyncio
+    async def test_a_genuine_red_survives_budget_exhaustion_as_a_test_failure(self, tmp_path):
+        """A real red plus an exhausted budget is a `test_failure`, not a timeout.
+
+        This is the COMMON shape of a red fallback verify, not a corner case:
+        removing the `&&` short-circuit — the whole point of task 3338 — makes
+        budget exhaustion strictly MORE likely, because all 8 segments now
+        always run where the shell previously stopped at the first red. The
+        committed config's own measured table already records five of seven
+        segments costing 1838.60s.
+
+        Synthesising `timed_out` on exhaustion would relabel this genuine red as
+        an `infra_timeout` (``classify_failure`` guard 2 wins over every output
+        pattern), making ``VerifyAttempt.pure_timeout_failure`` true and routing
+        the run to infra-hold — re-run ``max_retries`` times at a full budget
+        each — instead of to the debugger. Under the old `&&` chain the shell
+        short-circuited at the red and the check finished fast with
+        rc=1/timed_out=False/`test_failure`, so without this the segmentation
+        would be a regression against its own baseline.
+
+        And no information is lost in exchange: the hint must still carry BOTH
+        the genuine failure line AND the names of every segment with no result.
+        """
+        result, _calls, runs = await self._run(
+            tmp_path, red_labels={'escalation-2'}, blow_budget_after=3,
+        )
+
+        segments = _test_run_entry(runs)['segments']
+        assert [s['status'] for s in segments] == (
+            ['passed', 'failed', 'passed'] + ['not_run'] * 5
+        )
+
+        assert result.passed is False
+        assert result.timed_out is False, 'a genuine red is not a timeout'
+        assert result.category == 'test_failure', (
+            'the run must reach the debugger/test_failure path, not infra-hold; '
+            f'got {result.category!r} with cause_hint {result.cause_hint!r}'
+        )
+        # Nothing is silently greened: the genuine red AND every unrun segment
+        # are both still named in the one line a triaging agent reads.
+        assert 'FAILED tests/test_thing.py::test_thing in escalation-2' in result.cause_hint
+        assert 'segments not run:' in result.cause_hint
+        for entry in segments:
+            if entry['status'] == 'not_run':
+                assert entry['label'] in result.cause_hint, (
+                    f'cause_hint must still NAME the unrun segment {entry["label"]!r}; '
+                    f'got {result.cause_hint!r}'
+                )
