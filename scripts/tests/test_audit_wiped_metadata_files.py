@@ -67,21 +67,11 @@ from audit_wiped_metadata_files import (
 # ones it must satisfy to insert a realistic row.
 # ---------------------------------------------------------------------------
 
-_TASKS_SCHEMA = """
-CREATE TABLE tasks (
-    tag           TEXT NOT NULL DEFAULT 'master',
-    id            INTEGER NOT NULL,
-    title         TEXT NOT NULL,
-    description   TEXT,
-    details       TEXT,
-    test_strategy TEXT,
-    status        TEXT NOT NULL,
-    priority      TEXT,
-    metadata      TEXT,
-    updated_at    TEXT NOT NULL,
-    PRIMARY KEY (tag, id)
-);
-"""
+# The tasks-table schema and the tasks.db builder live in scripts/tests/
+# conftest.py as the `tasks_table_schema` / `make_tasks_db` fixtures (task
+# 3336) — they were previously copied near-identically into all three
+# sweep-script test files. The events schema below stays local: runs.db is
+# audit-specific and is NOT duplicated in the two scanners.
 
 _EVENTS_SCHEMA = """
 CREATE TABLE events (
@@ -97,46 +87,6 @@ CREATE TABLE events (
     duration_ms INTEGER
 );
 """
-
-
-def _make_tasks_db(tmp_path: Path, rows: list[dict], name: str = "tasks.db") -> Path:
-    """Build a temp tasks.db mirroring the live schema and insert *rows*.
-
-    Each row dict may carry: ``id`` (required), ``tag`` (default 'master'),
-    ``title``, ``status`` (default 'done'), ``priority``, ``updated_at``, and
-    ``metadata``. ``metadata`` is passed through VERBATIM when it is a str or
-    None — so a test can insert deliberately malformed JSON — and json-encoded
-    when it is a dict/list.
-    """
-    db_path = tmp_path / name
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.executescript(_TASKS_SCHEMA)
-        for row in rows:
-            metadata = row.get("metadata")
-            if metadata is not None and not isinstance(metadata, str):
-                metadata = json.dumps(metadata)
-            conn.execute(
-                "INSERT INTO tasks (tag, id, title, description, details, "
-                "test_strategy, status, priority, metadata, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    row.get("tag", "master"),
-                    row["id"],
-                    row.get("title", f"task {row['id']}"),
-                    row.get("description"),
-                    row.get("details"),
-                    row.get("test_strategy"),
-                    row.get("status", "done"),
-                    row.get("priority", "medium"),
-                    metadata,
-                    row.get("updated_at", "2026-07-30T00:00:00+00:00"),
-                ),
-            )
-        conn.commit()
-    finally:
-        conn.close()
-    return db_path
 
 
 def _make_runs_db(tmp_path: Path, events: list[dict], name: str = "runs.db") -> Path:
@@ -186,9 +136,8 @@ def _make_runs_db(tmp_path: Path, events: list[dict], name: str = "runs.db") -> 
 # ---------------------------------------------------------------------------
 
 
-def test_make_tasks_db_roundtrips_rows(tmp_path):
-    db_path = _make_tasks_db(
-        tmp_path,
+def test_make_tasks_db_roundtrips_rows(tmp_path, make_tasks_db):
+    db_path = make_tasks_db(
         [
             {"id": 1, "status": "done", "metadata": {"files": ["a.py"]}},
             {"id": 2, "tag": "other", "status": "cancelled", "metadata": None},
@@ -237,9 +186,8 @@ def test_make_runs_db_assigns_ascending_ids_in_list_order(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_load_task_records_carries_tag_id_status_and_files(tmp_path):
-    db_path = _make_tasks_db(
-        tmp_path,
+def test_load_task_records_carries_tag_id_status_and_files(tmp_path, make_tasks_db):
+    db_path = make_tasks_db(
         [{"id": 42, "status": "done", "metadata": {"files": ["a.py", "b.py"]}}],
     )
     records = load_task_records(str(db_path))
@@ -254,11 +202,10 @@ def test_load_task_records_carries_tag_id_status_and_files(tmp_path):
     assert record.metadata_files == ("a.py", "b.py")
 
 
-def test_load_task_records_degrades_every_unusable_metadata_shape_to_empty(tmp_path):
+def test_load_task_records_degrades_every_unusable_metadata_shape_to_empty(tmp_path, make_tasks_db):
     """(c) + (d): empty list, absent key, NULL, malformed JSON, and a
     wrong-typed `files` all yield an empty tuple WITHOUT raising."""
-    db_path = _make_tasks_db(
-        tmp_path,
+    db_path = make_tasks_db(
         [
             {"id": 1, "metadata": {"files": []}},
             {"id": 2, "metadata": {}},
@@ -279,10 +226,9 @@ def test_load_task_records_degrades_every_unusable_metadata_shape_to_empty(tmp_p
         assert records[("master", task_id)].metadata_files == (), f"task {task_id}"
 
 
-def test_load_task_records_keys_by_tag_and_id_so_tags_do_not_collide(tmp_path):
+def test_load_task_records_keys_by_tag_and_id_so_tags_do_not_collide(tmp_path, make_tasks_db):
     """(e) the same numeric id under two tags must not collide."""
-    db_path = _make_tasks_db(
-        tmp_path,
+    db_path = make_tasks_db(
         [
             {"id": 9, "tag": "master", "status": "done", "metadata": {"files": []}},
             {"id": 9, "tag": "feature", "status": "pending", "metadata": {"files": ["x.py"]}},
@@ -297,18 +243,16 @@ def test_load_task_records_keys_by_tag_and_id_so_tags_do_not_collide(tmp_path):
     assert records[("feature", 9)].status == "pending"
 
 
-def test_load_task_records_coerces_non_string_file_entries(tmp_path):
+def test_load_task_records_coerces_non_string_file_entries(tmp_path, make_tasks_db):
     """A files list carrying non-string junk is coerced/filtered rather than
     crashing a downstream str-formatting consumer."""
-    db_path = _make_tasks_db(
-        tmp_path, [{"id": 1, "metadata": {"files": ["a.py", None, 3, ""]}}]
-    )
+    db_path = make_tasks_db([{"id": 1, "metadata": {"files": ["a.py", None, 3, ""]}}])
     records = load_task_records(str(db_path))
     assert records[("master", 1)].metadata_files == ("a.py",)
 
 
-def test_load_task_records_on_empty_db_returns_empty_mapping(tmp_path):
-    db_path = _make_tasks_db(tmp_path, [])
+def test_load_task_records_on_empty_db_returns_empty_mapping(tmp_path, make_tasks_db):
+    db_path = make_tasks_db([])
     assert load_task_records(str(db_path)) == {}
 
 
@@ -918,7 +862,7 @@ def test_load_merge_signatures_skips_malformed_and_ignores_other_event_types(tmp
     assert [p["state"] for p in signatures["7"]] == ["conflict"]
 
 
-def test_load_merge_signatures_on_empty_db_returns_empty(tmp_path):
+def test_load_merge_signatures_on_empty_db_returns_empty(tmp_path, make_tasks_db):
     assert load_merge_signatures(str(_make_runs_db(tmp_path, []))) == {}
 
 
@@ -930,7 +874,7 @@ def test_load_merge_signatures_on_empty_db_returns_empty(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def _make_project(tmp_path, tasks=(), events=(), plans=(), name="proj"):
+def _make_project(tmp_path, make_tasks_db, tasks=(), events=(), plans=(), name="proj"):
     """Build a whole project root with the three inputs audit_project reads.
 
     *plans* is a list of ``(worktree_name, plan_dict)`` written to the
@@ -939,7 +883,7 @@ def _make_project(tmp_path, tasks=(), events=(), plans=(), name="proj"):
     root = tmp_path / name
     tasks_dir = root / ".taskmaster" / "tasks"
     tasks_dir.mkdir(parents=True)
-    _make_tasks_db(tasks_dir, list(tasks))
+    make_tasks_db(list(tasks), directory=tasks_dir)
 
     runs_dir = root / "data" / "orchestrator"
     runs_dir.mkdir(parents=True)
@@ -952,11 +896,11 @@ def _make_project(tmp_path, tasks=(), events=(), plans=(), name="proj"):
     return root
 
 
-def test_audit_project_reports_a_wiped_task_with_full_provenance(tmp_path):
+def test_audit_project_reports_a_wiped_task_with_full_provenance(tmp_path, make_tasks_db):
     """(a) non-empty plan scope + empty metadata.files IS reported, carrying
     every field a downstream repair would need."""
     root = _make_project(
-        tmp_path,
+        tmp_path, make_tasks_db,
         tasks=[{"id": 2464, "status": "done", "metadata": {"files": []}}],
         events=[
             {
@@ -981,10 +925,10 @@ def test_audit_project_reports_a_wiped_task_with_full_provenance(tmp_path):
     assert candidate.wipe_signature == CONFIRMED_NULL_SHA_DONE_PATH
 
 
-def test_audit_project_does_not_report_a_task_whose_files_survived(tmp_path):
+def test_audit_project_does_not_report_a_task_whose_files_survived(tmp_path, make_tasks_db):
     """(b) non-empty metadata.files means nothing was wiped."""
     root = _make_project(
-        tmp_path,
+        tmp_path, make_tasks_db,
         tasks=[{"id": 1, "status": "done", "metadata": {"files": ["a.py"]}}],
         plans=[("1", {"task_id": 1, "files": ["a.py"]})],
     )
@@ -995,11 +939,11 @@ def test_audit_project_does_not_report_a_task_whose_files_survived(tmp_path):
     assert audit.coverage.tasks_with_file_level_signal == 1
 
 
-def test_audit_project_does_not_report_a_task_whose_plan_declared_no_scope(tmp_path):
+def test_audit_project_does_not_report_a_task_whose_plan_declared_no_scope(tmp_path, make_tasks_db):
     """(c) an empty plan file list is not a declared scope, so an empty
     metadata.files is not evidence of a wipe."""
     root = _make_project(
-        tmp_path,
+        tmp_path, make_tasks_db,
         tasks=[{"id": 1, "status": "done", "metadata": {"files": []}}],
         plans=[("1", {"task_id": 1, "files": []})],
     )
@@ -1011,11 +955,11 @@ def test_audit_project_does_not_report_a_task_whose_plan_declared_no_scope(tmp_p
     assert audit.coverage.tasks_with_file_level_signal == 0
 
 
-def test_audit_project_counts_plan_records_with_no_matching_task(tmp_path):
+def test_audit_project_counts_plan_records_with_no_matching_task(tmp_path, make_tasks_db):
     """(d) a plan/event signal for a task absent from tasks.db is counted
     separately rather than crashing or being silently dropped."""
     root = _make_project(
-        tmp_path,
+        tmp_path, make_tasks_db,
         tasks=[{"id": 1, "status": "done", "metadata": {"files": []}}],
         plans=[
             ("1", {"task_id": 1, "files": ["a.py"]}),
@@ -1028,11 +972,11 @@ def test_audit_project_counts_plan_records_with_no_matching_task(tmp_path):
     assert audit.coverage.plan_records_without_task == 1
 
 
-def test_audit_project_orders_candidates_by_tag_then_numeric_id(tmp_path):
+def test_audit_project_orders_candidates_by_tag_then_numeric_id(tmp_path, make_tasks_db):
     """(e) deterministic ordering — numeric, so 100 sorts after 20."""
     ids = [100, 20, 3]
     root = _make_project(
-        tmp_path,
+        tmp_path, make_tasks_db,
         tasks=(
             [{"id": i, "tag": "master", "metadata": {"files": []}} for i in ids]
             + [{"id": 50, "tag": "alpha", "metadata": {"files": []}}]
@@ -1049,11 +993,11 @@ def test_audit_project_orders_candidates_by_tag_then_numeric_id(tmp_path):
     ]
 
 
-def test_audit_project_coverage_counts_every_tier(tmp_path):
+def test_audit_project_coverage_counts_every_tier(tmp_path, make_tasks_db):
     """(f) total, file-level, lock-level-only, and no-signal counts, where
     no-signal includes tasks with no plan record at all."""
     root = _make_project(
-        tmp_path,
+        tmp_path, make_tasks_db,
         tasks=[
             {"id": 1, "metadata": {"files": []}},   # file-level signal
             {"id": 2, "metadata": {"files": []}},   # lock-level signal only
@@ -1080,7 +1024,7 @@ def test_audit_project_coverage_counts_every_tier(tmp_path):
     assert lock_candidates[0].plan_files == ("orchestrator",)
 
 
-def test_audit_project_coverage_tiers_partition_tasks_even_across_tags(tmp_path):
+def test_audit_project_coverage_tiers_partition_tasks_even_across_tags(tmp_path, make_tasks_db):
     """The coverage tiers count TASKS, not plan records.
 
     A plan record is keyed by a BARE task id, so the same numeric id under two
@@ -1092,7 +1036,7 @@ def test_audit_project_coverage_tiers_partition_tasks_even_across_tags(tmp_path)
     total_tasks exactly.
     """
     root = _make_project(
-        tmp_path,
+        tmp_path, make_tasks_db,
         tasks=[
             {"id": 42, "tag": "master", "metadata": {"files": []}},
             {"id": 42, "tag": "alpha", "metadata": {"files": ["kept.py"]}},
@@ -1118,10 +1062,10 @@ def test_audit_project_coverage_tiers_partition_tasks_even_across_tags(tmp_path)
     ] == [("master", 42)]
 
 
-def test_audit_project_degrades_to_no_merge_event_without_a_runs_db(tmp_path):
+def test_audit_project_degrades_to_no_merge_event_without_a_runs_db(tmp_path, make_tasks_db):
     """A project with no runs.db still audits; every signature is UNKNOWN."""
     root = _make_project(
-        tmp_path,
+        tmp_path, make_tasks_db,
         tasks=[{"id": 1, "metadata": {"files": []}}],
         plans=[("1", {"task_id": 1, "files": ["a.py"]})],
     )
@@ -1132,8 +1076,8 @@ def test_audit_project_degrades_to_no_merge_event_without_a_runs_db(tmp_path):
     assert [c.wipe_signature for c in audit.candidates] == [NO_MERGE_EVENT]
 
 
-def test_audit_project_on_an_empty_project_reports_zero_and_does_not_crash(tmp_path):
-    root = _make_project(tmp_path)
+def test_audit_project_on_an_empty_project_reports_zero_and_does_not_crash(tmp_path, make_tasks_db):
+    root = _make_project(tmp_path, make_tasks_db)
     audit = audit_project(str(root))
 
     assert audit.candidates == []
@@ -1374,11 +1318,11 @@ def _run_cli(*args):
     )
 
 
-def test_discover_project_roots_precedence_and_missing_db_drop(tmp_path):
+def test_discover_project_roots_precedence_and_missing_db_drop(tmp_path, make_tasks_db):
     """(a) explicit --project-root > DASHBOARD_KNOWN_PROJECT_ROOTS > the
     dark-factory default; a root with no tasks.db is silently dropped."""
-    real = _make_project(tmp_path, name="real")
-    other = _make_project(tmp_path, name="other")
+    real = _make_project(tmp_path, make_tasks_db, name="real")
+    other = _make_project(tmp_path, make_tasks_db, name="other")
     env = {"DASHBOARD_KNOWN_PROJECT_ROOTS": f"{other},{tmp_path / 'nonexistent'}"}
 
     # Explicit wins outright.
@@ -1395,19 +1339,19 @@ def test_discover_project_roots_precedence_and_missing_db_drop(tmp_path):
     assert isinstance(discover_project_roots(None, env={}), list)
 
 
-def test_main_exit_0_when_no_candidates(tmp_path):
+def test_main_exit_0_when_no_candidates(tmp_path, make_tasks_db):
     """(b) clean project -> exit 0, and the coverage block still prints."""
-    root = _make_project(tmp_path, tasks=[{"id": 1, "metadata": {"files": ["a.py"]}}])
+    root = _make_project(tmp_path, make_tasks_db, tasks=[{"id": 1, "metadata": {"files": ["a.py"]}}])
     result = _run_cli("--project-root", str(root))
 
     assert result.returncode == 0
     assert "COVERAGE" in result.stdout
 
 
-def test_main_exit_1_when_a_candidate_is_found(tmp_path):
+def test_main_exit_1_when_a_candidate_is_found(tmp_path, make_tasks_db):
     """(b) at least one candidate -> exit 1."""
     root = _make_project(
-        tmp_path,
+        tmp_path, make_tasks_db,
         tasks=[{"id": 2464, "metadata": {"files": []}}],
         plans=[("2464", {"task_id": 2464, "files": ["a.py"]})],
     )
@@ -1426,10 +1370,10 @@ def test_main_exit_2_when_no_project_root_resolves(tmp_path):
     assert "no project root" in result.stderr.lower()
 
 
-def test_main_json_flag_emits_parseable_json(tmp_path):
+def test_main_json_flag_emits_parseable_json(tmp_path, make_tasks_db):
     """(c) --json emits parseable JSON on stdout."""
     root = _make_project(
-        tmp_path,
+        tmp_path, make_tasks_db,
         tasks=[{"id": 7, "metadata": {"files": []}}],
         plans=[("7", {"task_id": 7, "files": ["a.py"]})],
     )
@@ -1440,15 +1384,15 @@ def test_main_json_flag_emits_parseable_json(tmp_path):
     assert payload["projects"][0]["candidates"][0]["task_id"] == 7
 
 
-def test_main_project_root_is_repeatable(tmp_path):
+def test_main_project_root_is_repeatable(tmp_path, make_tasks_db):
     """(d) --project-root repeats; both projects appear in the output."""
     a = _make_project(
-        tmp_path,
+        tmp_path, make_tasks_db,
         tasks=[{"id": 1, "metadata": {"files": []}}],
         plans=[("1", {"task_id": 1, "files": ["a.py"]})],
         name="a",
     )
-    b = _make_project(tmp_path, tasks=[{"id": 2, "metadata": {"files": ["k.py"]}}], name="b")
+    b = _make_project(tmp_path, make_tasks_db, tasks=[{"id": 2, "metadata": {"files": ["k.py"]}}], name="b")
 
     result = _run_cli("--project-root", str(a), "--project-root", str(b), "--json")
 
@@ -1456,17 +1400,17 @@ def test_main_project_root_is_repeatable(tmp_path):
     assert [p["project_root"] for p in payload["projects"]] == [str(a), str(b)]
 
 
-def test_main_skips_a_corrupt_project_and_warns_that_results_are_incomplete(tmp_path):
+def test_main_skips_a_corrupt_project_and_warns_that_results_are_incomplete(tmp_path, make_tasks_db):
     """(e) a corrupt tasks.db is warned about on stderr and SKIPPED without
     aborting the sweep; the other project's results still print, together
     with an explicit incompleteness warning."""
     good = _make_project(
-        tmp_path,
+        tmp_path, make_tasks_db,
         tasks=[{"id": 5, "metadata": {"files": []}}],
         plans=[("5", {"task_id": 5, "files": ["a.py"]})],
         name="good",
     )
-    bad = _make_project(tmp_path, name="bad")
+    bad = _make_project(tmp_path, make_tasks_db, name="bad")
     (bad / ".taskmaster" / "tasks" / "tasks.db").write_text("this is not a database")
 
     result = _run_cli("--project-root", str(bad), "--project-root", str(good))
@@ -1480,12 +1424,12 @@ def test_main_skips_a_corrupt_project_and_warns_that_results_are_incomplete(tmp_
     assert "incomplete" in stderr
 
 
-def test_main_exit_code_and_summary_agree_on_a_contradicted_only_project(tmp_path):
+def test_main_exit_code_and_summary_agree_on_a_contradicted_only_project(tmp_path, make_tasks_db):
     """A project whose ONLY candidate is contradicted still exits 1 (there IS
     a row to look at), so the summary line must not claim zero candidates —
     an operator or CI reading both would otherwise get two answers."""
     root = _make_project(
-        tmp_path,
+        tmp_path, make_tasks_db,
         tasks=[{"id": 9, "metadata": {"files": []}}],
         plans=[("9", {"task_id": 9, "files": ["a.py"]})],
         events=[
@@ -1503,12 +1447,12 @@ def test_main_exit_code_and_summary_agree_on_a_contradicted_only_project(tmp_pat
     assert "0 reportable" in summary and "1 contradicted" in summary
 
 
-def test_main_exits_3_when_every_resolved_project_was_unreadable(tmp_path):
+def test_main_exits_3_when_every_resolved_project_was_unreadable(tmp_path, make_tasks_db):
     """Nothing was audited at all — that must NOT share exit 0 with 'audited
     everything, found nothing'. A cron/CI consumer reading only the exit code
     would otherwise record a total failure as a clean sweep."""
-    bad_a = _make_project(tmp_path, name="bad-a")
-    bad_b = _make_project(tmp_path, name="bad-b")
+    bad_a = _make_project(tmp_path, make_tasks_db, name="bad-a")
+    bad_b = _make_project(tmp_path, make_tasks_db, name="bad-b")
     for bad in (bad_a, bad_b):
         (bad / ".taskmaster" / "tasks" / "tasks.db").write_text("not a database")
 
@@ -1520,7 +1464,7 @@ def test_main_exits_3_when_every_resolved_project_was_unreadable(tmp_path):
     assert "incomplete" in stderr
     # And the mixed case is still exit 1, not 3 — one readable project audited.
     good = _make_project(
-        tmp_path,
+        tmp_path, make_tasks_db,
         tasks=[{"id": 5, "metadata": {"files": []}}],
         plans=[("5", {"task_id": 5, "files": ["a.py"]})],
         name="good",
@@ -1529,11 +1473,11 @@ def test_main_exits_3_when_every_resolved_project_was_unreadable(tmp_path):
     assert mixed.returncode == 1
 
 
-def test_main_audits_a_project_whose_runs_db_is_missing(tmp_path):
+def test_main_audits_a_project_whose_runs_db_is_missing(tmp_path, make_tasks_db):
     """(f) a readable tasks.db with no runs.db still audits, degrading every
     signature to NO_MERGE_EVENT rather than crashing."""
     root = _make_project(
-        tmp_path,
+        tmp_path, make_tasks_db,
         tasks=[{"id": 3, "metadata": {"files": []}}],
         plans=[("3", {"task_id": 3, "files": ["a.py"]})],
     )
@@ -1546,11 +1490,11 @@ def test_main_audits_a_project_whose_runs_db_is_missing(tmp_path):
     assert payload["projects"][0]["candidates"][0]["wipe_signature"] == NO_MERGE_EVENT
 
 
-def test_main_min_fidelity_defaults_to_file_level(tmp_path):
+def test_main_min_fidelity_defaults_to_file_level(tmp_path, make_tasks_db):
     """--min-fidelity defaults to file-level, so lock-level-only candidates
     are OPT-IN — a module path must not silently enter a repair feed."""
     root = _make_project(
-        tmp_path,
+        tmp_path, make_tasks_db,
         tasks=[{"id": 4, "metadata": {"files": []}}],
         events=[{"event_type": "set_to_plan", "task_id": 4, "data": {"files": ["orchestrator"]}}],
     )
