@@ -158,3 +158,135 @@ def test_parse_unit_directives_splits_on_first_equals_only():
     parsed = mod.parse_unit_directives("[Service]\nEnvironment=DASH_ROOTS=/a,/b\n")
 
     assert parsed["Service"]["Environment"] == ["DASH_ROOTS=/a,/b"]
+
+
+# ---------------------------------------------------------------------------
+# compare_unit — value-compared directives  (step-3 / step-4)
+# ---------------------------------------------------------------------------
+
+
+def _value_spec(mod: types.ModuleType, *compared: tuple[str, str]):
+    """A minimal UnitSpec that value-compares exactly *compared*."""
+    return mod.UnitSpec(
+        name="fixture.service",
+        repo_relpath="dashboard/fixture.service",
+        compared=compared,
+    )
+
+
+def test_compare_unit_identical_values_yield_no_drift():
+    """Equal values on a compared directive are parity."""
+    mod = _load_checker()
+    spec = _value_spec(mod, ("Service", "TimeoutStopSec"))
+    text = "[Service]\nTimeoutStopSec=15\n"
+
+    assert mod.compare_unit(spec, text, text) == []
+
+
+def test_compare_unit_differing_value_yields_one_drift():
+    """A compared directive whose values disagree yields exactly one Drift."""
+    mod = _load_checker()
+    spec = _value_spec(mod, ("Service", "TimeoutStopSec"))
+
+    drifts = mod.compare_unit(
+        spec,
+        "[Service]\nTimeoutStopSec=15\n",
+        "[Service]\nTimeoutStopSec=30\n",
+    )
+
+    assert len(drifts) == 1, drifts
+    (drift,) = drifts
+    assert drift.unit == "fixture.service"
+    assert drift.section == "Service"
+    assert drift.key == "TimeoutStopSec"
+    assert "15" in drift.repo_value
+    assert "30" in drift.installed_value
+    assert drift.reason, "Every Drift must carry a non-empty reason."
+
+
+def test_compare_unit_directive_missing_from_installed_is_drift():
+    """Declared in the repo copy, absent from the installed copy → drift."""
+    mod = _load_checker()
+    spec = _value_spec(mod, ("Service", "Restart"))
+
+    drifts = mod.compare_unit(
+        spec,
+        "[Service]\nRestart=on-failure\n",
+        "[Service]\nType=simple\n",
+    )
+
+    assert len(drifts) == 1, drifts
+    (drift,) = drifts
+    assert drift.key == "Restart"
+    assert drift.installed_value == mod._ABSENT
+    assert "on-failure" in drift.repo_value
+
+
+def test_compare_unit_comparison_is_symmetric():
+    """A directive present ONLY on the installed side is drift too.
+
+    Asymmetric comparison would silently bless anything hand-added to the
+    installed unit — e.g. an installed `Restart=always` overriding the repo's
+    deliberate on-failure policy would read as parity, which is precisely the
+    class of divergence this checker exists to surface.
+    """
+    mod = _load_checker()
+    spec = _value_spec(mod, ("Service", "Restart"))
+
+    drifts = mod.compare_unit(
+        spec,
+        "[Service]\nType=simple\n",
+        "[Service]\nRestart=always\n",
+    )
+
+    assert len(drifts) == 1, drifts
+    (drift,) = drifts
+    assert drift.key == "Restart"
+    assert drift.repo_value == mod._ABSENT
+    assert "always" in drift.installed_value
+
+
+def test_compare_unit_ignores_keys_not_on_the_spec():
+    """A differing directive NOT on the compared list is ignored.
+
+    The check is deliberately BOUNDED to a curated registry. An unbounded diff
+    would fire on Description, After and every comment reflow, and a gate that
+    cries wolf gets disabled within a week.
+    """
+    mod = _load_checker()
+    spec = _value_spec(mod, ("Service", "TimeoutStopSec"))
+
+    drifts = mod.compare_unit(
+        spec,
+        "[Unit]\nDescription=Repo wording\n[Service]\nTimeoutStopSec=15\n",
+        "[Unit]\nDescription=Totally different wording\n[Service]\nTimeoutStopSec=15\n",
+    )
+
+    assert drifts == []
+
+
+def test_compare_unit_compares_the_whole_values_list():
+    """A repeated compared directive that gained an occurrence is drift.
+
+    Comparing only the first value would miss a second, contradicting
+    occurrence — systemd applies both, so the checker must see both.
+    """
+    mod = _load_checker()
+    spec = _value_spec(mod, ("Service", "ExecStartPre"))
+
+    drifts = mod.compare_unit(
+        spec,
+        "[Service]\nExecStartPre=/bin/true\n",
+        "[Service]\nExecStartPre=/bin/true\nExecStartPre=/bin/false\n",
+    )
+
+    assert len(drifts) == 1, drifts
+    assert "/bin/false" in drifts[0].installed_value
+
+
+def test_compare_unit_key_absent_from_both_sides_is_not_drift():
+    """A compared key neither copy declares is parity, not a phantom drift."""
+    mod = _load_checker()
+    spec = _value_spec(mod, ("Service", "RestartMaxDelaySec"))
+
+    assert mod.compare_unit(spec, "[Service]\nType=simple\n", "[Service]\nType=simple\n") == []
