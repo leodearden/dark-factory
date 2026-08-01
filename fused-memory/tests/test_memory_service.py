@@ -9233,6 +9233,41 @@ class TestMemoryMetadataValidationAtSeam:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
+    async def test_storm_escalation_is_filed_off_the_event_loop(
+        self, service, entry_point, tmp_path
+    ):
+        """The filer does blocking FS I/O; it must not run ON the loop.
+
+        `file_unknown_key_storm_escalation` constructs an EscalationQueue,
+        scans the queue directory and does a durable fsync-flushed write.
+        Called inline from these coroutines that I/O would stall every other
+        concurrent memory write for its duration. Pinned behaviourally by
+        thread identity rather than by a comment, so a later leaf that
+        re-inlines the call fails here instead of silently reintroducing the
+        stall.
+        """
+        import threading
+
+        _mm_configure_project_root(service, tmp_path)
+        loop_thread = threading.get_ident()
+        filer_threads = []
+
+        def _fake_filer(project_root, *, project_id, agent_id, keys):
+            filer_threads.append(threading.get_ident())
+            return 'esc-x-1'
+
+        crossing = MagicMock()
+        crossing.record = MagicMock(return_value=True)
+        service._metadata_storm_detector = crossing
+
+        with patch.object(memory_service, 'file_unknown_key_storm_escalation', _fake_filer):
+            await _mm_write(service, entry_point, metadata={'drifting_key': 1})
+
+        assert filer_threads, 'the filer must still be called'
+        assert filer_threads[0] != loop_thread
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_ENTRY_POINTS)
     async def test_no_storm_no_escalation(self, service, entry_point, tmp_path):
         # Configured root, so this pins the DETECTOR gate rather than passing
         # vacuously on the unconfigured-project_root branch (see the helper).

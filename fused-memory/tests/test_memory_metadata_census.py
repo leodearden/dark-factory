@@ -202,6 +202,64 @@ class TestUnknownKeyStormDetector:
         detector = self._detector(clock, threshold=1)
         assert detector.record('p', 'a', []) is False
 
+    def test_a_writer_that_falls_silent_leaves_no_residue(self):
+        """Process-lifetime state must not grow without bound.
+
+        A writer's stale timestamps are pruned only when that SAME writer
+        records again, so without a sweep every distinct writer that ever
+        drifted keeps a dict entry (plus a window of floats) for the life of
+        the process. agent_id is free-form per-task text in this fleet, so
+        that key space is effectively unbounded in a long-lived MCP server.
+        """
+        clock = _FakeClock()
+        detector = self._detector(clock, threshold=3, window_seconds=300)
+        detector._sweep_every = 2
+
+        detector.record('p', 'transient-writer', ['k'])
+        assert ('p', 'transient-writer') in detector._warns
+
+        clock.advance(301)
+        # Two records by a DIFFERENT writer, so the sweep is what evicts the
+        # silent one — not its own prune loop, which never runs again.
+        detector.record('p', 'steady-writer', ['k'])
+        detector.record('p', 'steady-writer', ['k'])
+
+        assert ('p', 'transient-writer') not in detector._warns
+        assert ('p', 'steady-writer') in detector._warns, 'the live writer must survive'
+
+    def test_the_sweep_never_evicts_the_writer_that_triggered_it(self):
+        """Its deque was appended at `now`, so it is never stale."""
+        clock = _FakeClock()
+        detector = self._detector(clock, threshold=3, window_seconds=300)
+        detector._sweep_every = 1
+
+        detector.record('p', 'a', ['k'])
+        detector.record('p', 'a', ['k'])
+        assert len(detector._warns[('p', 'a')]) == 2
+        # And the counting contract still holds across the sweep.
+        assert detector.record('p', 'a', ['k']) is True
+
+    def test_eviction_clears_the_firing_latch_so_a_recurrence_is_heard(self):
+        """A drained writer is no longer over the line.
+
+        Leaving it in `_firing` after evicting it from `_warns` would create a
+        latch nothing can ever clear, permanently silencing a writer that
+        drifts, is fixed, and later drifts again.
+        """
+        clock = _FakeClock()
+        detector = self._detector(clock, threshold=2, window_seconds=300)
+        detector._sweep_every = 2
+
+        assert detector.record('p', 'a', ['k', 'k2']) is True
+        assert ('p', 'a') in detector._firing
+
+        clock.advance(301)
+        detector.record('p', 'other', ['k'])
+        detector.record('p', 'other', ['k'])
+        assert ('p', 'a') not in detector._firing
+
+        assert detector.record('p', 'a', ['k', 'k2']) is True, 'must fire again'
+
     def test_defaults_to_monotonic_not_wall_clock(self):
         """Wall-clock would let an NTP step corrupt the window."""
         import time
@@ -294,7 +352,13 @@ class TestFileUnknownKeyStormEscalation:
         assert submitted == []
         assert esc_id == _Existing.id
 
-    def test_uses_a_stable_greppable_anchor(self, tmp_path, monkeypatch):
+    def test_uses_a_stable_greppable_per_writer_anchor(self, tmp_path, monkeypatch):
+        """One greppable family prefix, scoped down to the writer.
+
+        The three call sites (dedup query / id mint / stored task_id) must
+        agree — a mismatch would make the dedup query look for an anchor
+        nothing is ever filed under, silently disabling it.
+        """
         import fused_memory.services.memory_metadata_census as census
 
         seen = {}
@@ -318,10 +382,82 @@ class TestFileUnknownKeyStormEscalation:
         monkeypatch.setattr(census, 'HAS_ESCALATION', True)
         monkeypatch.setattr(census, 'EscalationQueue', _Queue)
 
-        self._file(tmp_path)
-        assert seen['queried'] == 'memory-metadata-unknown-key-storm'
-        assert seen['minted'] == 'memory-metadata-unknown-key-storm'
-        assert seen['task_id'] == 'memory-metadata-unknown-key-storm'
+        self._file(tmp_path, project_id='dark_factory', agent_id='claude-x')
+        expected = 'memory-metadata-unknown-key-storm-dark-factory-claude-x'
+        assert seen['queried'] == expected
+        assert seen['minted'] == expected
+        assert seen['task_id'] == expected
+        # The family prefix stays intact, so one grep still finds the series.
+        assert expected.startswith('memory-metadata-unknown-key-storm')
+
+    def test_two_different_writers_get_two_escalations(self, tmp_path, monkeypatch):
+        """A global anchor would mask every writer after the first.
+
+        The escalation's whole job is to name WHICH writer is drifting. With
+        one shared anchor, writer A's still-open escalation absorbs writer
+        B's crossing and B survives only in an INFO log line — the operator
+        sees one culprit named and no signal that anyone else crossed.
+        """
+        import fused_memory.services.memory_metadata_census as census
+
+        open_by_task = {}
+
+        class _Existing:
+            def __init__(self, esc_id):
+                self.id = esc_id
+
+        class _Queue:
+            def __init__(self, path):
+                pass
+
+            def get_by_task(self, task_id, status=None):
+                found = open_by_task.get(task_id)
+                return [found] if found else []
+
+            def make_id(self, task_id):
+                return f'esc-{task_id}-1'
+
+            def submit(self, esc):
+                open_by_task[esc.task_id] = _Existing(esc.id)
+                return esc.id
+
+        monkeypatch.setattr(census, 'HAS_ESCALATION', True)
+        monkeypatch.setattr(census, 'EscalationQueue', _Queue)
+
+        first = self._file(tmp_path, agent_id='claude-drifter-a')
+        second = self._file(tmp_path, agent_id='claude-drifter-b')
+
+        assert first != second, 'the second writer must not be folded into the first'
+        assert len(open_by_task) == 2
+        assert 'claude-drifter-a' in first
+        assert 'claude-drifter-b' in second
+
+        # ...while a REPEAT from the same writer still dedups, so one writer
+        # cannot flood the queue.
+        assert self._file(tmp_path, agent_id='claude-drifter-a') == first
+        assert len(open_by_task) == 2
+
+    def test_anchor_slugs_unsafe_writer_ids(self):
+        """The anchor becomes a `.seq` FILENAME via `make_id`.
+
+        agent_id is free-form text, so path separators, spaces and unbounded
+        length all have to be neutralised before it names a file.
+        """
+        from fused_memory.services.memory_metadata_census import writer_anchor_task_id
+
+        anchor = writer_anchor_task_id('Proj/Ect', 'agent id/../etc')
+        assert '/' not in anchor
+        assert ' ' not in anchor
+        assert anchor == 'memory-metadata-unknown-key-storm-proj-ect-agent-id-etc'
+
+        long_anchor = writer_anchor_task_id('p', 'a' * 500)
+        assert len(long_anchor) < 150
+
+    def test_absent_agent_id_gets_its_own_anchor(self):
+        """`None` must not collide with a writer literally named 'unknown'."""
+        from fused_memory.services.memory_metadata_census import writer_anchor_task_id
+
+        assert writer_anchor_task_id('p', None).endswith('-unset')
 
     def test_returns_none_and_never_raises_without_the_escalation_package(
         self, tmp_path, monkeypatch, caplog

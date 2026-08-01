@@ -396,7 +396,7 @@ def _normalize_task_id_metadata(meta: dict) -> None:
         meta['task_id'] = str(meta['task_id'])
 
 
-def _apply_memory_metadata_validation(
+async def _apply_memory_metadata_validation(
     meta: dict,
     *,
     project_id: str,
@@ -434,6 +434,20 @@ def _apply_memory_metadata_validation(
     is strictly best-effort and structurally cannot raise, because it runs on
     the live memory write path where a raise would fail the write because the
     *complaint about* the write failed.
+
+    ASYNC ON PURPOSE — do not re-inline the escalation hop.  Validation,
+    census and detection are pure CPU and stay inline, but
+    ``file_unknown_key_storm_escalation`` does blocking filesystem I/O
+    (``EscalationQueue`` construction, a queue-directory scan, a durable
+    fsync-flushed write).  Called directly from these coroutines it would run
+    that I/O ON the event loop and stall every other concurrent memory write
+    for its duration.  The ported precedent
+    (``middleware/candidate_key_escalation``) is invoked from a synchronous
+    SQLite-migration path, so its never-raises contract transfers but its
+    sync-context assumption does not.  ``asyncio.to_thread`` is awaited rather
+    than fire-and-forgotten so the call can never outlive the write or be
+    dropped by task GC; it yields the loop, which is the property that
+    matters.
     """
     violations = validate_memory_metadata(
         meta, enforce_kind_registry=config.enforce_kind_registry
@@ -446,7 +460,8 @@ def _apply_memory_metadata_validation(
     unknown_keys = [v.key for v in violations if v.code == 'unknown_key']
     if unknown_keys and storm_detector.record(project_id, agent_id, unknown_keys):
         if project_root:
-            file_unknown_key_storm_escalation(
+            await asyncio.to_thread(
+                file_unknown_key_storm_escalation,
                 project_root,
                 project_id=project_id,
                 agent_id=agent_id,
@@ -2321,7 +2336,7 @@ class MemoryService:
         #   or a half-written Graphiti twin. Being before the branching is also
         #   what makes this cover Graphiti-primary writes, which never reach
         #   Mem0 at all — V1 covers the seam, not just the Mem0 branch.
-        _apply_memory_metadata_validation(
+        await _apply_memory_metadata_validation(
             meta,
             project_id=project_id,
             agent_id=agent_id,
@@ -2687,7 +2702,7 @@ class MemoryService:
         # drift. Placed after the tagging helpers and before the
         # _journaled_backend_call below, for the reasons spelled out at
         # add_memory's call site.
-        _apply_memory_metadata_validation(
+        await _apply_memory_metadata_validation(
             meta,
             project_id=project_id,
             agent_id=agent_id,
