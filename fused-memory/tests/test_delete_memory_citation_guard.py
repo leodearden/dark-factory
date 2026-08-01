@@ -25,6 +25,7 @@ MCP-tool test): ``create_mcp_server`` + ``_tool_manager.call_tool`` +
 from __future__ import annotations
 
 import json
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -540,7 +541,9 @@ class TestTombstonedTaskIsNotALiveCiter:
             c[1]['metadata'] for c in interceptor_1.update_task.call_args_list
             if c[1]['task_id'] == '911'
         ))
-        after_911 = {'cited': DOOMED}
+        # ``dict[str, Any]``: post-merge the blob is heterogeneous — the
+        # tombstone ledger is a ``list[dict]``, not a ``str``.
+        after_911: dict[str, Any] = {'cited': DOOMED}
         after_911.update(payload_911)  # shallow merge, as the backend applies it
 
         # ---- Pass 2: retry against the post-pass-1 snapshot. ----

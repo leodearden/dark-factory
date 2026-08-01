@@ -11,6 +11,7 @@ plan for the full three-way contract (keep / drop+mark / keep+mark).
 from __future__ import annotations
 
 import json
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
@@ -880,13 +881,19 @@ class TestRepointTaskCitations:
 # --------------------------------------------------------------------------- #
 
 
-def _apply_merge(original, payload):
+def _apply_merge(
+    original: dict[str, Any], payload: dict[str, Any]
+) -> dict[str, Any]:
     """Simulate the backend's SHALLOW last-write-wins ``metadata_mode='merge'``.
 
     Supplied top-level keys overwrite wholesale; omitted keys are preserved
     (``tools.py:4982-5002``). Used to build the "metadata as it exists on the
     second pass" fixture without inventing a different merge semantics than the
     one the sweep actually writes against.
+
+    Annotated ``dict[str, Any]`` because a merged blob is heterogeneous: the
+    tombstone ledger under ``X_CITATION_TOMBSTONE_KEY`` is a ``list[dict]``,
+    not the ``str`` an all-string caller literal would otherwise infer.
     """
     merged = dict(original)
     merged.update(payload)
