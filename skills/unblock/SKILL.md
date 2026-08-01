@@ -339,9 +339,10 @@ The merge procedure is iterative — don't assume one pass will be enough:
              poll_kwargs = {"branch": "task/<TASK_ID>"}
 
      # unknown is terminal only when the polled id was actually enqueued — on the branch arm
-     # nothing was, so unknown is that arm's live state until the git-authority tier resolves it
-     terminal = ("done", "conflict", "blocked", "abandoned") if poll_by == "branch" \
-         else ("done", "conflict", "blocked", "abandoned", "unknown")
+     # nothing was, so unknown is that arm's live state until the git-authority tier resolves it.
+     # superseded means this request was absorbed into a coalesced train — terminal on every arm.
+     terminal = ("done", "conflict", "blocked", "abandoned", "superseded") if poll_by == "branch" \
+         else ("done", "conflict", "blocked", "abandoned", "unknown", "superseded")
      # 20-min hard ceiling on BOTH unscoped arms (branch and task_id): each can reject a
      # terminal `done` (see accept_terminal), and a durable tier re-serves the same stale
      # record every tick, so without a floor the loop would spin forever. request_id is
@@ -425,6 +426,7 @@ The merge procedure is iterative — don't assume one pass will be enough:
        ```
        Thread that SHA into `done_provenance={"commit": "<sha>"}`. **Do not fall back to eyeballing `git log main --oneline | head -5`** — it is not scoped to this task, so any SHA you pick from it is likely an unrelated task's merge, and the server's only provenance backstop (`git merge-base --is-ancestor <sha> main`) passes for every recent commit on main and would not catch it. If the search comes back empty, fall back to `{"note": "<explanation>"}`. Then proceed to step 8.
      - `poll["state"] in ("conflict", "blocked", "abandoned", "unknown")` → see *Polled terminal failures* below. **On the unscoped arms (`poll_by` `"branch"` or `"task_id"`) these are UNCONFIRMED** — per the staleness guard above they may be a prior round's record for this same reused branch/task_id rather than this submission's outcome. Before acting on one, re-check `mcp__escalation__get_merge_queue()` and who owns the worktree; if this branch is still in flight, keep polling to the 20-minute ceiling instead of resubmitting on a stale failure.
+     - `poll["state"] == "superseded"` → see *Polled terminal failures* below — follow the train, never resubmit or direct-merge.
 
    *(Immediate-response failure edges — `conflict`, `blocked`, `unknown_branch`, `failed`, orchestrator-down — and cancellation are covered below.)*
 
@@ -469,6 +471,12 @@ The merge procedure is iterative — don't assume one pass will be enough:
   # rc=1 (genuinely not on main) AND queue healthy: loop back to step 7 (resubmit).
   ```
   **Never fall back to direct merge in response to `unknown`** — `unknown` means the server lost its record, not that the merge failed. **This block's `resubmit` line does not apply to the `poll_by == "branch"` arm** — there nothing was ever enqueued, so `unknown` is that arm's expected live state, not a lost record; that arm never reaches this bullet as a terminal state (it's excluded from step 7's terminal set) — it arrives here only via the branch arm's 20-minute deadline, and the action there is to run the same [canonical ancestry check](#branch-on-main) once more (rc=128 marker search included) and STOP and report to the human only if it still comes back not-landed, rather than resubmitting.
+
+- `poll["state"] == "superseded"` (this submission was absorbed into a coalesced train; the response carries `superseded_by: "<train_request_id>"`) → **follow the train, on every `poll_by` arm — never resubmit and never direct-merge**, since the train is already in flight and either would race it:
+  ```
+  mcp__escalation__merge_status(request_id="<superseded_by value>")
+  ```
+  Poll the train request with the same 15 s→60 s backoff until it reaches a terminal state (`done`, `conflict`, `blocked`, `abandoned`), then handle that state exactly as you would for your own request per this section. Your absorbed branch lands when the train lands.
 
 *Abandonment (`merge_cancel`):*
 
