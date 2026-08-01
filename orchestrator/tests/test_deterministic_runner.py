@@ -6,6 +6,7 @@ Step-7: RED — idempotent resume + quiescence (I2/B3/B4/B11)
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -328,6 +329,32 @@ def _seed_escalation(
     if resolved:
         queue.resolve(esc.id, 'resolved for test setup')
     return esc
+
+
+async def _run_wrapper_payload(wrapped: str) -> tuple[int, str]:
+    """Execute a deferred RP-4 ``/bin/sh -c`` wrapper the way systemd would.
+
+    *wrapped* is the payload `systemd-run` was asked to defer — i.e. the
+    `{payload}; __rc=$?; if [ "$__rc" -ne 0 ]; then {on_failure}; fi;
+    exit "$__rc"` shell built by
+    ``RestartPlan``/``EscalationSpec.to_submit_argv``.  Running it for real is
+    what makes the wrapper-exec tests higher-fidelity than argv assertions.
+
+    Returns ``(returncode, combined_output)``.  The output half is returned
+    **specifically so assertion failures can quote it**: the wrapper swallows
+    its on-failure branch's exit status (it ends in `exit "$__rc"`, the
+    payload's own code), so when the branch dies the ONLY evidence of why is
+    the text the child printed.  The pre-3404 inline pattern called
+    ``await proc.communicate()`` and discarded the result, leaving a failure to
+    report itself as a bare "got 0" with the real diagnosis unread.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        '/bin/sh', '-c', wrapped,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    out, _ = await proc.communicate()
+    return proc.returncode, out.decode(errors='replace')
 
 
 # ---------------------------------------------------------------------------
