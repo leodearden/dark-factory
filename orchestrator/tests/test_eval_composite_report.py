@@ -1466,6 +1466,90 @@ class TestPlanRateIsTheReliabilityColumn:
         assert row['plan_rate'] is None
 
 
+class TestBothSurfacesReportTheSamePlanRate:
+    """The θ aggregate carries ``plan_rate`` too — through THE SAME reducer.
+
+    The CLI prints ``format_composite_table`` and ``format_plan_quality_table``
+    adjacently, and ``plan_rate`` is derivable from counts BOTH surfaces already
+    hold (``n`` / ``no_plan``). Deriving it twice would leave two tables free to
+    answer the reliability question differently — the "two exclusion surfaces
+    that disagree are worse than one" hazard this module repeatedly closes, most
+    recently by :func:`_mean_plan_quality` (task 3099) and
+    :func:`_plan_quality_score` (task 3302).
+    """
+
+    def test_the_theta_aggregate_carries_the_same_hand_computed_rate(self):
+        from orchestrator.evals.report import build_plan_quality_report
+
+        theta = build_plan_quality_report(
+            TestPlanRateIsTheReliabilityColumn._one_no_plan_among_three()
+        )['configs'][0]
+
+        # The SAME hand-computed (3 - 1) / 3 the composite row reports.
+        assert theta['plan_rate'] == pytest.approx(0.6667, abs=1e-4)
+
+    def test_agrees_bit_identically_with_the_composite_row(self):
+        """``==``, not ``approx``: the point is not that the two surfaces round
+        to the same place but that they are the same computation."""
+        from orchestrator.evals.report import (
+            build_composite_report,
+            build_plan_quality_report,
+        )
+
+        results = TestPlanRateIsTheReliabilityColumn._one_no_plan_among_three()
+        row = build_composite_report(results)['configs'][0]
+        theta = build_plan_quality_report(results)['configs'][0]
+
+        assert row['plan_rate'] == theta['plan_rate']
+
+    def test_agrees_bit_identically_on_the_cap_tainted_dataset(self):
+        """…and agrees where the DENOMINATOR is the interesting part.
+
+        The composite row's exposed denominator IS the θ table's ``n``: a
+        reader who checks the rate against either table's sample gets the same
+        answer, which is the whole reason ``plan_quality_n`` is on the row.
+        """
+        from orchestrator.evals.report import (
+            build_composite_report,
+            build_plan_quality_report,
+        )
+
+        results = (
+            TestPlanRateIsTheReliabilityColumn
+            ._one_tainted_one_no_plan_one_planned()
+        )
+        row = build_composite_report(results)['configs'][0]
+        theta = build_plan_quality_report(results)['configs'][0]
+
+        assert row['plan_rate'] == theta['plan_rate']
+        assert theta['n'] == row['plan_quality_n'] == 2
+
+    def test_an_empty_admitted_pool_is_None_on_the_theta_surface_too(self):
+        """Every cell refused → nothing measured → no rate, on both surfaces.
+
+        ``mean_plan_quality`` is already ``None`` here; a ``plan_rate`` of 0.0
+        beside it would assert a reliability failure the transport layer never
+        let us observe.
+        """
+        from orchestrator.evals.report import (
+            build_composite_report,
+            build_plan_quality_report,
+        )
+
+        results = [
+            _arch('p1', 'arch-refused', tr, plan_steps=0, plan_quality=None,
+                  cost_usd=0.0, duration_ms=0, cap_tainted=True)
+            for tr in (1, 2, 3)
+        ]
+        theta = build_plan_quality_report(results)['configs'][0]
+        row = build_composite_report(results)['configs'][0]
+
+        assert theta['n'] == 0
+        assert theta['mean_plan_quality'] is None
+        assert theta['plan_rate'] is None
+        assert row['plan_rate'] is None
+
+
 class TestTheDiscardedJudgeScoreIsLoggedNotSwallowed:
     """The floor DISCARDS a persisted LLM-judge score — loudly, or not at all.
 
