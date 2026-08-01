@@ -5544,15 +5544,22 @@ async def test_run_loop_recovers_predecessor_runs_once_at_startup_before_reaper_
     """run_loop() must invoke _recover_predecessor_runs() exactly once at
     startup, before the periodic _recover_stale_runs ticks — and a raised
     exception from it must not crash run_loop (task 2711 / E6).
+
+    Drives run_loop via _drive_run_loop_until, waiting on the OBSERVABLE EVENTS
+    the assertions below actually check (the predecessor pass ran; stale ticked
+    twice) rather than budgeting the whole startup path inside a fixed
+    wall-clock wait_for — see that helper's docstring for the full rationale.
     """
     real_sleep = asyncio.sleep
 
     async def fast_sleep(seconds: float) -> None:
         await real_sleep(0)
 
-    # Patch the module-local _sleep binding so many loop iterations execute
-    # within the wait_for() window below (same technique as
-    # test_main_loop_does_not_emit_drain_progress_after_idle_drain).
+    # Patch the module-local _sleep binding: _drive_run_loop_until removes the
+    # wall-clock BUDGET but not the real ~5s _sleep ending each run_loop
+    # iteration. The _recover_stale_runs.call_count >= 2 assertion below needs
+    # multiple iterations, so without fast_sleep the two-tick witness would
+    # take ~10s and collide with the helper's 10s deadlock backstop.
     monkeypatch.setattr('fused_memory.reconciliation.harness._sleep', fast_sleep)
 
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
@@ -5586,8 +5593,7 @@ async def test_run_loop_recovers_predecessor_runs_once_at_startup_before_reaper_
     if harness.judge is not None:
         harness.judge.initialize = AsyncMock()
 
-    with contextlib.suppress(TimeoutError):
-        await asyncio.wait_for(harness.run_loop(), timeout=0.2)
+    await _drive_run_loop_until(harness, predecessor_event, stale_event)
 
     # Startup pass ran exactly once, despite raising — not once per iteration.
     assert harness._recover_predecessor_runs.call_count == 1, (
