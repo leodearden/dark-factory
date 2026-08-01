@@ -213,13 +213,37 @@ FM_STALENESS_REDEPLOY_UNIT = "fm-staleness-redeploy.service"
 
 
 def log(msg: str) -> None:
-    """Write *msg* to the systemd journal tagged as ``orchestrator-watchdog``."""
-    subprocess.run(
-        ["systemd-cat", "-t", "orchestrator-watchdog"],
-        input=msg,
-        text=True,
-        check=False,
-    )
+    """Write *msg* to the systemd journal tagged as ``orchestrator-watchdog``.
+
+    Falls back to stderr when ``systemd-cat`` is unavailable (e.g. a test
+    environment, or a systemd-less host) or wedged. That is not a silent
+    swallow: the unit sets ``StandardError=journal``, so the message still
+    reaches the same journal by the other route.
+
+    BOUNDED, like every other subprocess in this file (probe/show 5s,
+    reset-failed 10s, restart 45s, the ``systemd-run --no-block`` delegations
+    10s) — this one matters MORE than it looks. ``orchestrator-watchdog.timer``
+    is ``OnUnitActiveSec=60``, measured from this unit's last activation, and
+    systemd disables ``TimeoutStartSec`` for ``Type=oneshot`` by default — so
+    a systemd-cat blocked on a stuck journald or a full /run would hang the
+    tick forever, the timer would never re-trigger, and supervision would stop
+    entirely with no signal. That is precisely the silent degradation this
+    watchdog exists to catch elsewhere, arriving through its own LOGGING path
+    (same defect fixed for scripts/dashboard-watchdog.py in 87ff5d1870).
+    ``TimeoutStartSec`` in the unit file is the belt-and-braces second bound.
+    """
+    try:
+        subprocess.run(
+            ["systemd-cat", "-t", "orchestrator-watchdog"],
+            input=msg,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        # systemd-cat missing/unexecutable (OSError) or wedged past the bound
+        # (TimeoutExpired, a SubprocessError) — still emit, just via stderr.
+        print(f"orchestrator-watchdog: {msg} [systemd-cat unusable: {exc!r}]", file=sys.stderr)
 
 
 class _JournalLog:
