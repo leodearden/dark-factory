@@ -1879,6 +1879,91 @@ class TestValidateUvFallback:
             f'{excinfo.value!r}'
         )
 
+    def test_uv_binary_missing_still_skips(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A genuinely absent uv binary is a legitimate environment gap: skip.
+
+        GREEN GUARD: this is the one case where skipping is the right
+        answer, and it must survive step-6's narrowing of the blanket
+        handler. _REPO_ROOT is left untouched (this worktree's real repo
+        root, which does have a fused-memory/ dir), so the step-4 guard
+        passes and execution reaches the subprocess call.
+        """
+        def _stub(argv, **kwargs):
+            raise FileNotFoundError(2, 'No such file or directory', 'uv')
+
+        _force_uv_fallback(monkeypatch, _stub)
+
+        with pytest.raises(pytest.skip.Exception) as excinfo:
+            _validate(
+                task_kind='deterministic',
+                metadata={
+                    'task_kind': 'deterministic',
+                    'always_escalates': True,
+                    'before_done': None,
+                },
+                project_root=str(tmp_path),
+            )
+
+        message = str(excinfo.value)
+        assert 'uv' in message, f'Expected the skip message to mention uv, got: {message!r}'
+        assert 'available' in message, (
+            f'Expected the skip message to mention availability, got: {message!r}'
+        )
+
+    def test_uv_subprocess_failure_fails_loudly(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A uv that runs and fails must fail loudly, not be masked as skipped."""
+        argv = ['uv', 'run', '--project', '/x', 'python', '-c', '...']
+
+        def _stub(_argv, **kwargs):
+            raise subprocess.CalledProcessError(
+                1, argv, output='', stderr='ImportError: boom'
+            )
+
+        _force_uv_fallback(monkeypatch, _stub)
+
+        with pytest.raises(pytest.fail.Exception) as excinfo:
+            _validate(
+                task_kind='deterministic',
+                metadata={
+                    'task_kind': 'deterministic',
+                    'always_escalates': True,
+                    'before_done': None,
+                },
+                project_root=str(tmp_path),
+            )
+
+        message = str(excinfo.value)
+        assert 'returncode: 1' in message, (
+            f'Expected the returncode in the failure message, got: {message!r}'
+        )
+        assert 'ImportError: boom' in message, (
+            f'Expected the captured stderr in the failure message, got: {message!r}'
+        )
+
+    def test_uv_subprocess_timeout_fails_loudly(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A hung uv (TimeoutExpired, also a SubprocessError) fails loudly too."""
+        def _stub(argv, **kwargs):
+            raise subprocess.TimeoutExpired(['uv'], 30)
+
+        _force_uv_fallback(monkeypatch, _stub)
+
+        with pytest.raises(pytest.fail.Exception):
+            _validate(
+                task_kind='deterministic',
+                metadata={
+                    'task_kind': 'deterministic',
+                    'always_escalates': True,
+                    'before_done': None,
+                },
+                project_root=str(tmp_path),
+            )
+
 
 # ---------------------------------------------------------------------------
 # Reaper scaffolding (step-14)
