@@ -348,6 +348,91 @@ class TaskMetadataConfig(BaseModel):
     )
 
 
+# --- Mem0 metadata write-boundary validation (task 3195, leaf β) ---
+
+class MemoryMetadataConfig(BaseModel):
+    """Governs ``MemoryService``'s write-boundary validation of Mem0 ``metadata``.
+
+    Backed by ``fused_memory.memory_metadata`` (the single normative home for
+    the Mem0 metadata vocabulary — PRD ``docs/prds/memory-metadata-vocabulary.md``
+    V1 / INV-5). This is a top-level config section — NOT nested under
+    ``reconciliation`` or ``taskmaster`` — because it governs a vocabulary
+    shared beyond any one backend or caller, mirroring ``TaskMetadataConfig``
+    directly above. PRD D3 names that section as its precedent for
+    "census first, tiers later", so this follows it rather than inventing a
+    second shape.
+
+    ``extra='forbid'`` so a mistyped leaf fails loud at config load/reload
+    rather than silently doing nothing: under ``extra='ignore'`` an operator
+    who typed ``enforce_kind_regsitry`` would get a silently-dropped key and
+    believe enforcement was on.
+
+    Reload tier: ``reload.py``'s ``RELOADABLE_FIELDS`` is an opt-IN allowlist,
+    so every leaf here is restart-required by default and none is listed. That
+    is correct for BOTH pairs, not just the enforce flags — the storm-tuning
+    leaves are read once when ``MemoryService.__init__`` constructs the
+    ``UnknownKeyStormDetector``, so they are captured by value and a hot
+    reload genuinely would not take effect. Allowlisting them would advertise
+    a reload that silently does nothing.
+    """
+
+    model_config = ConfigDict(extra='forbid')
+
+    enforce: bool = Field(
+        default=False,
+        description=(
+            'RED-TIER / restart-only: warn-mode when False (default) — '
+            'validation violations emit a memory_metadata.schema_warning log '
+            'line and the write proceeds; True rejects the write with '
+            'MemoryMetadataValidationError. Not hot-reloadable.'
+        ),
+    )
+    enforce_kind_registry: bool = Field(
+        default=False,
+        description=(
+            'RED-TIER / restart-only: whether an unknown metadata.kind is '
+            'FATAL (rejectable) rather than census-only. Carved out from '
+            "`enforce` and left OFF even after `enforce` flips, because it is "
+            'specifically this check whose safety premise leaf α measured '
+            'FALSE: PRD D3 assumed kind writers are in-repo code + prompts, '
+            'but 242 of the 329 live kind values are singletons, i.e. the '
+            'population is agent-invented free text and open in practice. '
+            'Flipping this on day one would turn every newly invented kind '
+            'into a hard memory-write failure on the live fleet. See PRD §10 '
+            'open question 1. Not hot-reloadable.'
+        ),
+    )
+    unknown_key_storm_threshold: int = Field(
+        default=50,
+        ge=1,
+        description=(
+            'Unknown-key census warnings from ONE (project_id, agent_id) '
+            'within the window before an escalation is filed. Per-writer, not '
+            'global: a storm is a DRIFTING WRITER, and a global counter would '
+            'fire on healthy fleet traffic given the 1,627-key baseline while '
+            'never identifying the culprit. Calibrated from leaf α\'s census '
+            '(plans/memory-metadata-census-report.json, grand_total.keys.'
+            'entries, excluding the mem0-managed / server-stamped / reserved '
+            '/ blessed layers and x_ keys): the unknown tail is 1,604 '
+            'distinct keys totalling 17,261 occurrences across the whole '
+            'corpus lifetime, and its BUSIEST single key totals 545. Since '
+            'this threshold is keyed per-writer-per-window, 50 from one '
+            'writer in 5 minutes is far above any legitimate rate. '
+            'Restart-only: read once when MemoryService builds the detector.'
+        ),
+    )
+    unknown_key_storm_window_seconds: int = Field(
+        default=300,
+        ge=1,
+        description=(
+            'Rolling window for unknown_key_storm_threshold. Warns older than '
+            'this are dropped, so a slow trickle never accumulates into a '
+            'false storm. Restart-only: read once when MemoryService builds '
+            'the detector.'
+        ),
+    )
+
+
 # --- Task status transition authority (task 2175, rho1b) ---
 
 class TaskStatusConfig(BaseModel):
@@ -1494,6 +1579,7 @@ class FusedMemoryConfig(BaseSettings):
     queue: QueueConfig = Field(default_factory=QueueConfig)
     taskmaster: TaskmasterConfig | None = Field(default=None)
     task_metadata: TaskMetadataConfig = Field(default_factory=TaskMetadataConfig)
+    memory_metadata: MemoryMetadataConfig = Field(default_factory=MemoryMetadataConfig)
     task_status: TaskStatusConfig = Field(default_factory=TaskStatusConfig)
     reconciliation: ReconciliationConfig = Field(default_factory=ReconciliationConfig)
     # Bare (non-Optional) submodel on purpose — see WriteTriageConfig's docstring:

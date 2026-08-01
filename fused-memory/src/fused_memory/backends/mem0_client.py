@@ -12,6 +12,32 @@ from fused_memory.models.scope import Scope
 logger = logging.getLogger(__name__)
 
 
+#: Keys mem0's ``AsyncMemory._update_memory``
+#: (site-packages/mem0/memory/main.py, ~line 2449) never trusts from a
+#: forwarded metadata dict: ``data``/``hash``/``created_at``/``updated_at``
+#: are unconditionally recomputed from the update call's own arguments and
+#: the existing stored point, and
+#: ``user_id``/``agent_id``/``run_id``/``actor_id``/``role`` are restored
+#: from the *currently stored* payload (unconditionally for ``actor_id``;
+#: whenever absent from what was forwarded for the rest).  Forwarding stale
+#: copies of these works only because mem0 keeps overwriting/re-deriving
+#: them -- an implicit coupling to mem0 internals.  Stripping them makes
+#: the intent explicit: preserve only a record's CUSTOM provenance keys.
+#:
+#: DEFENSIVE NOTE (PRD D12 / task 3055 §6, extracted here by task 3195):
+#: this module is the DECIDED HOME for this set.  ``memory_metadata.py``
+#: and ``scripts/tag_cgl_eta_rehome_scope.py`` bind this same object rather
+#: than rebuilding it; whoever of task 3195 / task 3088 lands second
+#: imports rather than re-extracts.  Never two copies (INV-5) -- a second
+#: definition that drifts from this one is exactly the failure D12 exists
+#: to prevent, and is asserted against by object identity in
+#: ``tests/test_memory_metadata.py::TestKeyLayers``.
+MEM0_MANAGED_METADATA_KEYS = frozenset({
+    'data', 'hash', 'created_at', 'updated_at',
+    'user_id', 'agent_id', 'run_id', 'actor_id', 'role',
+})
+
+
 class Mem0Backend:
     """Lazily creates AsyncMemory instances keyed by project_id."""
 
