@@ -19429,6 +19429,15 @@ class TestSMWGenerationChain:
 
         queue: asyncio.Queue = asyncio.Queue()
         git_ops = MagicMock()
+        # A REAL path, not the auto-specced child mock.  _finalize_advanced_merge
+        # reads `getattr(git_ops, 'project_root', None)` (merge_queue.py:8186) —
+        # a None-guard that MagicMock defeats, since getattr on a mock always
+        # returns a child mock — and builds a LandedOutbox under it (:8199).
+        # LandedOutbox._save_raw hands that to safe_io.atomic_write_text(...,
+        # mkdir=True), which coerces it with Path(); os.fspath() of a MagicMock
+        # is a genuine repr-derived str, so the mock's own name becomes a real
+        # directory tree under the CWD (task 3223).
+        git_ops.project_root = tmp_path
         git_ops.advance_main = AsyncMock(
             return_value=AdvanceOutcome('advanced', advanced_sha='merge-commit-smw')
         )
