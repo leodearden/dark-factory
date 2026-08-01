@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sqlite3
 import subprocess
 import sys
@@ -49,6 +50,11 @@ from audit_wiped_metadata_files import (  # pyright: ignore[reportMissingImports
 )
 
 from repair_wiped_metadata_files import (  # pyright: ignore[reportMissingImports]
+    CLIENT_NAME,
+    EXIT_NOTHING_SCANNED,
+    EXIT_NO_ROOT,
+    EXIT_OK,
+    EXIT_SERVER_UNREACHABLE,
     PROVENANCE_KEY,
     REPAIR,
     REPAIR_TASK_ID,
@@ -69,6 +75,7 @@ from repair_wiped_metadata_files import (  # pyright: ignore[reportMissingImport
     repair_one,
     repair_project,
     select_repairable_candidates,
+    writable_plan_files,
 )
 
 # ---------------------------------------------------------------------------
@@ -242,6 +249,38 @@ def test_plan_files_rejection_reason_rejects_a_list_of_only_blanks():
 
     assert reason
     assert "empty" in reason.lower()
+
+
+def test_the_gate_and_the_payload_read_one_sanitised_list(tmp_path):
+    """VALIDATE-THEN-WRITE DIVERGENCE — the MIXED case, which is the one that
+    actually reaches a write.
+
+    The all-blank list above is rejected outright, so the divergence never
+    shows there. ``("a.py", "   ")`` is the dangerous shape: the gate passes it
+    on the filtered ``["a.py"]``, and a payload built from the RAW tuple would
+    then ship ``["a.py", "   "]``. Nothing downstream catches that —
+    ``shared.locking.directory_locks`` skips blanks, so the interceptor accepts
+    the junk entry and it lands in metadata.files verbatim. The audit's
+    ``_coerce_file_list`` KEEPS whitespace-only entries by design (see
+    test_classify_live_task_agrees_with_the_audit_on_a_whitespace_only_entry),
+    so this is a real reachable input, not a hypothetical.
+
+    Asserted at all three layers that must agree: the helper, the payload, and
+    the bytes actually handed to update_task.
+    """
+    candidate = _candidate(40, plan_files=("a.py", "   ", "", "b.py"))
+
+    assert plan_files_rejection_reason(candidate) is None
+    assert writable_plan_files(candidate) == ("a.py", "b.py")
+    assert build_repair_payload(candidate, now_iso=_NOW)["files"] == ["a.py", "b.py"]
+
+    client = _FakeClient()
+    outcome = asyncio.run(repair_one(client, _ROOT, candidate, now_iso=_NOW))
+
+    _, arguments = client.calls[0]
+    assert json.loads(arguments["metadata"])["files"] == ["a.py", "b.py"]
+    # And the report cannot claim a wider scope than the write carried.
+    assert outcome.files == ("a.py", "b.py")
 
 
 # ---------------------------------------------------------------------------
@@ -609,16 +648,34 @@ def _result(outcomes=(), *, applied=True):
     )
 
 
+def _disposition_counts(summary: str) -> dict[str, int]:
+    """Parse the rendered '-- dispositions --' block back into {name: count}.
+
+    Asserting on the PARSED COUNT is the whole point. `disposition in summary`
+    is satisfied by the itemised sections and by the disposition strings alone,
+    so it would still pass if format_summary stopped printing zero buckets
+    entirely — which is the exact regression the caller below exists to catch.
+    """
+    lines = summary.splitlines()
+    counts: dict[str, int] = {}
+    for line in lines[lines.index("  -- dispositions --") + 1:]:
+        parts = line.split()
+        if len(parts) != 2 or not parts[1].isdigit():
+            break
+        counts[parts[0]] = int(parts[1])
+    return counts
+
+
 def test_format_summary_prints_every_disposition_including_the_zero_ones():
     """(a) a bucket that is merely ABSENT reads as 'did not happen' when it may
-    mean 'was never evaluated'. Every disposition gets a line with its count."""
+    mean 'was never evaluated'. Every disposition gets a line WITH ITS COUNT,
+    and the zeros are rendered as zeros rather than omitted."""
     summary = format_summary(_result([_outcome(1, REPAIR)]))
 
-    for disposition in ALL_DISPOSITIONS:
-        assert disposition in summary, disposition
-    # The zero buckets are printed as zero, not omitted.
-    assert f"{FAILED}" in summary
-    assert "0" in summary
+    assert _disposition_counts(summary) == {
+        disposition: (1 if disposition == REPAIR else 0)
+        for disposition in ALL_DISPOSITIONS
+    }
 
 
 def test_format_summary_lists_each_failure_individually_with_its_error():
@@ -895,6 +952,102 @@ def test_repair_project_re_reads_the_candidates_own_tag_not_the_default(tmp_path
     assert calls["get_task"]["tag"] == "feature-x"
 
 
+def test_repair_project_declines_to_write_when_the_live_task_is_not_terminal(tmp_path):
+    """GATE 3'S ENFORCEMENT, not just its classifier.
+
+    ``classify_live_task`` has thorough unit coverage above, but a unit test of
+    a pure classifier proves nothing about whether repair_project ACTS on its
+    verdict: a refactor that dropped the ``continue`` after the disposition
+    check would leave every one of those tests green while writing to a live
+    task. This is the single most safety-critical branch in the script — the
+    whole "repairing underneath a live workflow is guaranteed to be undone"
+    argument rests on it — so the wiring is asserted end-to-end, on the absence
+    of the update_task call.
+    """
+    root = _wiped_project(tmp_path)
+    client = _FakeClient(
+        returns={"id": "2464", "status": "in-progress", "metadata": {"files": []}}
+    )
+
+    result = asyncio.run(repair_project(client, str(root), apply=True, now_iso=_NOW))
+
+    assert [o.disposition for o in result.outcomes] == [SKIP_NOT_TERMINAL]
+    called = [name for name, _ in client.calls]
+    assert called == ["get_task"], f"gate 3 did not stop the write: {client.calls}"
+
+
+def test_repair_project_declines_to_write_when_the_live_task_already_has_files(tmp_path):
+    """The idempotency arm of gate 3, enforced rather than merely classified.
+    A second pass (the one expected once 3113 lands) must re-read cheaply and
+    touch only what is still empty — so the write must not be issued here."""
+    root = _wiped_project(tmp_path)
+    client = _FakeClient(
+        returns={"id": "2464", "status": "done", "metadata": {"files": ["a.py"]}}
+    )
+
+    result = asyncio.run(repair_project(client, str(root), apply=True, now_iso=_NOW))
+
+    assert [o.disposition for o in result.outcomes] == [SKIP_FILES_PRESENT]
+    called = [name for name, _ in client.calls]
+    assert called == ["get_task"], f"an already-repaired task was rewritten: {client.calls}"
+
+
+def test_repair_project_short_circuits_a_lock_charter_reject_before_any_mcp_call(tmp_path):
+    """GATE 2 IS A PRE-CHECK, and its whole value is being one.
+
+    The interceptor would reject a directory-carrying files list with an opaque
+    lock_charter_error on task N of a batch. Catching it locally is only worth
+    anything if it happens BEFORE the wire — so this asserts not merely that no
+    write went out, but that the client was never called AT ALL.
+    """
+    root = _make_project(
+        tmp_path,
+        tasks=[{"id": 2464, "status": "done", "metadata": {"files": []}}],
+        plans=[("2464", {"task_id": 2464, "files": ["orchestrator/src/orchestrator"]})],
+    )
+    client = _FakeClient(
+        returns={"id": "2464", "status": "done", "metadata": {"files": []}}
+    )
+
+    result = asyncio.run(repair_project(client, str(root), apply=True, now_iso=_NOW))
+
+    assert [o.disposition for o in result.outcomes] == [SKIP_LOCK_CHARTER]
+    assert client.calls == [], f"the pre-check dialled the server: {client.calls}"
+    assert "orchestrator/src/orchestrator" in (result.outcomes[0].detail or "")
+
+
+def test_repair_project_reports_the_servers_own_reason_for_a_missing_task(tmp_path):
+    """AN ERROR REPLY IS NOT AN EXCEPTION, and its text must not be discarded.
+
+    fused-memory's tool layer never raises across the wire: ``@mcp_tool_errors``
+    (fused-memory/src/fused_memory/server/tool_errors.py:44-59) turns every
+    exception into an ordinary reply dict. A get_task for a task that no longer
+    exists therefore arrives as a normal reply carrying
+    ``error``/``error_type``, sails past the ``except`` arm, and — having no
+    ``status`` key — would land in SKIP_MISSING with the generic detail 'live
+    re-read immediately before the write'.
+
+    ``RepairOutcome.detail``'s docstring promises the operator-actionable
+    reason for EVERY non-REPAIR disposition, so the server's own explanation is
+    read off the reply and carried through.
+    """
+    root = _wiped_project(tmp_path)
+    client = _FakeClient(
+        returns={
+            "error": "No tasks found for ID(s): 2464",
+            "error_type": "TaskNotFoundError",
+        }
+    )
+
+    result = asyncio.run(repair_project(client, str(root), apply=True, now_iso=_NOW))
+
+    assert [o.disposition for o in result.outcomes] == [SKIP_MISSING]
+    detail = result.outcomes[0].detail or ""
+    assert "TaskNotFoundError" in detail
+    assert "No tasks found for ID(s): 2464" in detail
+    assert "update_task" not in [name for name, _ in client.calls]
+
+
 def test_repair_project_with_a_live_client_and_apply_false_issues_no_write(tmp_path):
     """THE DRY-RUN GUARANTEE, asserted where it actually lives.
 
@@ -999,7 +1152,7 @@ def test_main_exit_2_when_no_project_root_resolves(tmp_path):
     audit's discover_project_roots, which already drops roots with none."""
     result = _run_cli("--project-root", str(tmp_path / "no-such-project"))
 
-    assert result.returncode == 2
+    assert result.returncode == EXIT_NO_ROOT
     assert "no project root" in result.stderr.lower()
 
 
@@ -1007,16 +1160,120 @@ def test_main_apply_is_the_only_way_to_write(tmp_path):
     """(b) --apply on an unreachable server must FAIL rather than quietly
     succeed: the dry-run path's inertness comes from not dialling at all, so
     an apply run that also never dialled would be indistinguishable from a
-    successful repair."""
+    successful repair.
+
+    A DOWN SERVER IS A NAMED OUTCOME, NOT A TRACEBACK. `returncode != 0` is not
+    good enough for a script whose exit codes are an advertised contract: an
+    unhandled httpx.ConnectError also exits non-zero, and it exits with 1 —
+    which this CLI's own epilog defines as "at least one candidate FAILED to
+    write", sending an operator hunting for a rejected write that was never
+    attempted. So the code AND the message are pinned.
+    """
     root = _wiped_project(tmp_path)
 
     result = _run_cli(
         "--project-root", str(root), "--apply", "--server-url", _CLOSED_PORT_URL
     )
 
-    assert result.returncode != 0
-    combined = (result.stdout + result.stderr).lower()
-    assert "apply" in combined or "connect" in combined or "error" in combined
+    assert result.returncode == EXIT_SERVER_UNREACHABLE, result.stderr
+    assert "could not reach the fused-memory MCP server" in result.stderr
+    assert _CLOSED_PORT_URL in result.stderr
+    assert "NOTHING was written" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def _unreadable_project(tmp_path, name="corrupt"):
+    """A project whose tasks.db EXISTS (so discovery keeps it) but is not a
+    sqlite database, so audit_project raises sqlite3.DatabaseError on it."""
+    root = _wiped_project(tmp_path, name=name, task_id=99)
+    (root / ".taskmaster" / "tasks" / "tasks.db").write_bytes(b"not a database at all")
+    return root
+
+
+def test_main_one_unreadable_root_does_not_abort_the_other_roots(tmp_path):
+    """A single sqlite3.Error must not eat the whole run.
+
+    Without a per-root guard the exception escapes main_async, the summary is
+    NEVER PRINTED, and on --apply the record of the writes already applied to
+    the earlier roots is lost — precisely the reporting-honesty failure this
+    module's docstring claims to prevent. The sibling audit CLI already handles
+    this case (audit_wiped_metadata_files.py:899-933); this asserts the repair
+    inherits the resilience along with the exit-code philosophy.
+    """
+    bad = _unreadable_project(tmp_path)
+    good = _wiped_project(tmp_path, name="good", task_id=11)
+
+    result = _run_cli(
+        "--project-root", str(bad), "--project-root", str(good), "--json"
+    )
+
+    assert result.returncode == EXIT_OK, result.stderr
+    payload = json.loads(result.stdout)
+    assert [p["project_root"] for p in payload["projects"]] == [str(good)]
+    assert [o["task_id"] for o in payload["projects"][0]["outcomes"]] == [11]
+    # The skipped root is warned about, never silently dropped.
+    assert "skipping unreadable project" in result.stderr
+    assert str(bad) in result.stderr
+    assert "incomplete" in result.stderr
+
+
+def test_main_exit_3_when_every_resolved_root_is_unreadable(tmp_path):
+    """NOTHING SCANNED IS NOT A CLEAN RUN — and it is not a failed write either.
+
+    Exit 1 is the operator's signal that a write was attempted and rejected.
+    Mapping an unreadable database onto it would make that signal ambiguous, so
+    'roots resolved but every one failed' gets its own code, mirroring the
+    audit's 3.
+    """
+    bad = _unreadable_project(tmp_path)
+
+    result = _run_cli("--project-root", str(bad))
+
+    assert result.returncode == EXIT_NOTHING_SCANNED, result.stdout
+    assert "NOTHING was examined" in result.stderr
+    assert "not a clean result" in result.stderr
+
+
+_MIGRATE_SCRIPT = Path(__file__).parent.parent.parent / "scripts" / "migrate_metadata_modules_to_files.py"
+
+
+def _protocol_versions(path: Path) -> set[str]:
+    return set(
+        re.findall(r"""protocolVersion["']\s*:\s*["']([^"']+)["']""", path.read_text())
+    )
+
+
+def test_repair_client_handshake_has_not_drifted_from_its_parent():
+    """A DRIFT GUARD FOR A KNOWING CLONE.
+
+    RepairFusedMemoryClient._initialize restates its parent's whole handshake —
+    both JSON-RPC posts, the protocolVersion, the capabilities block — solely to
+    change clientInfo.name, because the parent bakes that name into the middle
+    of the procedure. scripts/migrate_metadata_modules_to_files.py is outside
+    task 3329's lock scope, so the parent cannot be given a
+    ``getattr(self, '_client_name', ...)`` seam here; the ``_client_name``
+    attribute is set on the subclass ready for that change, and the override
+    can be deleted the day it lands.
+
+    Until then this is what stops the clone drifting silently: bump the
+    parent's protocolVersion and the repair client would keep handshaking with
+    the stale one, with nothing in the repo noticing. Asserted on the source
+    text rather than by importing the client, so the check costs no httpx
+    import and no server.
+    """
+    parent = _protocol_versions(_MIGRATE_SCRIPT)
+    child = _protocol_versions(Path(_SCRIPT))
+
+    assert len(parent) == 1, f"ambiguous parent protocolVersion: {parent}"
+    assert len(child) == 1, f"ambiguous repair protocolVersion: {child}"
+    assert parent == child, (
+        "the repair client's handshake has drifted from FusedMemoryClient's: "
+        f"parent={parent}, repair={child}"
+    )
+    # The one thing the override is FOR: an attributable clientInfo.name, so
+    # these repair writes are not filed under the migration's agent_id.
+    assert CLIENT_NAME not in _MIGRATE_SCRIPT.read_text()
+    assert "'migrate-metadata'" in _MIGRATE_SCRIPT.read_text()
 
 
 def test_main_project_root_is_repeatable(tmp_path):
@@ -1062,13 +1319,23 @@ def test_main_does_not_repair_a_contradicted_candidate(tmp_path):
 
 def test_main_help_documents_the_exit_codes():
     """The audit CLI's convention: exit codes live in the argparse epilog, not
-    only in a docstring the operator will not see."""
+    only in a docstring the operator will not see.
+
+    EVERY advertised code, including 3 (nothing scanned) and 4 (server
+    unreachable). Those two exist so that 1 keeps its single documented meaning
+    — 'a write was attempted and failed' — so an epilog that omitted them would
+    leave an operator mapping them back onto 1 by guesswork. Distinctness is
+    asserted here too: two outcomes sharing a code is the same ambiguity.
+    """
     result = _run_cli("--help")
 
     assert result.returncode == 0
     assert "exit codes" in result.stdout.lower()
-    for code in ("0", "1", "2"):
-        assert code in result.stdout
+
+    codes = (EXIT_OK, 1, EXIT_NO_ROOT, EXIT_NOTHING_SCANNED, EXIT_SERVER_UNREACHABLE)
+    assert len(set(codes)) == len(codes), codes
+    for code in codes:
+        assert str(code) in result.stdout, code
 
 
 def test_classify_live_task_treats_a_non_dict_metadata_as_no_files():

@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import sqlite3
 import sys
@@ -113,6 +114,27 @@ def select_repairable_candidates(
     ]
 
 
+def writable_plan_files(candidate: WipeCandidate) -> tuple[str, ...]:
+    """Return EXACTLY the ``files`` entries a repair write may carry.
+
+    ONE sanitiser, read by both the gate (:func:`plan_files_rejection_reason`)
+    and the payload (:func:`build_repair_payload`), because a gate that
+    validates a different list from the one that ships is not a gate. Without
+    it a candidate whose plan_files is ``("a.py", "   ")`` passes the charter
+    check on the filtered ``["a.py"]`` and then writes ``["a.py", "   "]``.
+
+    The audit's ``_coerce_file_list`` deliberately KEEPS a whitespace-only
+    entry (``"  "`` is a truthy ``str``) and it is right to: for the audit's
+    purpose that entry is evidence the task HAD a scope. For a WRITE it is
+    junk, and nothing downstream would catch it —
+    ``shared.locking.directory_locks`` skips blanks, so the interceptor accepts
+    it and it lands in ``metadata.files`` verbatim. The divergence is resolved
+    here, in the one place both callers read, rather than by making the two
+    predicates agree by inspection.
+    """
+    return tuple(f for f in candidate.plan_files if isinstance(f, str) and f.strip())
+
+
 def plan_files_rejection_reason(candidate: WipeCandidate) -> str | None:
     """Return why *candidate*'s plan_files cannot be written, or None if they can.
 
@@ -138,8 +160,11 @@ def plan_files_rejection_reason(candidate: WipeCandidate) -> str | None:
     Measured against today's population: 0 of the 140 repairable path entries
     trip the directory arm. This gate exists because the candidate population
     drifts under a live wiper, not because it currently fires.
+
+    Judged on :func:`writable_plan_files` — the SAME list ``build_repair_payload``
+    ships, so this validates the exact bytes that get written.
     """
-    files = [f for f in candidate.plan_files if isinstance(f, str) and f.strip()]
+    files = writable_plan_files(candidate)
     if not files:
         return (
             "recovered plan_files is empty — nothing to restore (a write "
@@ -204,9 +229,14 @@ def build_repair_payload(candidate: WipeCandidate, *, now_iso: str) -> dict:
     ``now_iso`` is INJECTED rather than stamped from the clock inside, so the
     caller decides the batch timestamp (one value for a whole run) and tests
     can assert an exact string.
+
+    ``files`` is :func:`writable_plan_files`, NOT ``candidate.plan_files``. The
+    two differ on blank/whitespace-only entries, and shipping the raw tuple
+    while the lock-charter gate judged the filtered one would mean validating
+    different bytes from the ones written — see that function.
     """
     return {
-        "files": list(candidate.plan_files),
+        "files": list(writable_plan_files(candidate)),
         PROVENANCE_KEY: {
             "task": REPAIR_TASK_ID,
             "src": candidate.plan_files_source,
@@ -334,17 +364,26 @@ class RepairOutcome(NamedTuple):
 def _error_detail(result: object) -> str | None:
     """Return an error description if *result* is an error-shaped reply, else None.
 
-    The server can report a rejection by ANSWERING rather than raising — an
-    ``{"error": ...}`` body, or a ``{"success": False}`` flag. A bare truthiness
-    check on the reply would count both as a repair that never happened, which
-    is the silent fail-soft this script exists to avoid. Anything else
-    (including an empty dict, or a plain echoed task) is a success: the
-    ABSENCE of an error marker is not itself an error marker.
+    The server ALWAYS reports a rejection by ANSWERING rather than raising:
+    ``@mcp_tool_errors`` (fused-memory/src/fused_memory/server/tool_errors.py:44-59)
+    converts every exception into an ordinary reply dict, so nothing ever
+    crosses the wire as an exception. A bare truthiness check on the reply
+    would count an ``{"error": ...}`` body or a ``{"success": False}`` flag as a
+    repair that never happened, which is the silent fail-soft this script
+    exists to avoid. Anything else (including an empty dict, or a plain echoed
+    task) is a success: the ABSENCE of an error marker is not itself an error
+    marker.
+
+    ``error_type`` is included when present — it is the machine-readable half
+    of the reply (``TaskNotFoundError``, ``DuplicateCandidateKeyError``) and is
+    what an operator greps for.
     """
     if not isinstance(result, dict):
         return None
     if result.get("error"):
-        return f"server returned an error: {result['error']}"
+        error_type = result.get("error_type")
+        named = f"{error_type}: " if error_type else ""
+        return f"server returned an error: {named}{result['error']}"
     if result.get("success") is False:
         detail = result.get("error_type") or result.get("message") or result
         return f"server reported failure: {detail}"
@@ -408,7 +447,7 @@ async def repair_one(
             task_id=candidate.task_id,
             tag=candidate.tag,
             disposition=FAILED,
-            files=candidate.plan_files,
+            files=writable_plan_files(candidate),
             detail=f"{type(exc).__name__}: {exc}",
         )
 
@@ -418,14 +457,17 @@ async def repair_one(
             task_id=candidate.task_id,
             tag=candidate.tag,
             disposition=FAILED,
-            files=candidate.plan_files,
+            files=writable_plan_files(candidate),
             detail=detail,
         )
+    # `files` is what was WRITTEN, not what was recovered — the summary prints
+    # its length, and reporting a count the payload did not carry would be the
+    # same validate-then-write divergence writable_plan_files exists to close.
     return RepairOutcome(
         task_id=candidate.task_id,
         tag=candidate.tag,
         disposition=REPAIR,
-        files=candidate.plan_files,
+        files=writable_plan_files(candidate),
     )
 
 
@@ -538,7 +580,7 @@ async def repair_project(
                     task_id=candidate.task_id,
                     tag=candidate.tag,
                     disposition=REPAIR,
-                    files=candidate.plan_files,
+                    files=writable_plan_files(candidate),
                     detail=(
                         "dry run: live status not re-read (no MCP call made); "
                         "the terminal/files-present gate is evaluated at write time"
@@ -576,6 +618,28 @@ async def repair_project(
             )
             continue
 
+        # The server NEVER raises across the wire — @mcp_tool_errors
+        # (fused-memory/src/fused_memory/server/tool_errors.py:44-59) turns every
+        # exception into an ordinary reply dict. A get_task for a task that no
+        # longer exists therefore arrives as
+        # {"error": "No tasks found for ID(s): 77", "error_type": "TaskNotFoundError"},
+        # sails past the `except` arm above, and — having no "status" key —
+        # lands in SKIP_MISSING with a detail that explains nothing. Read the
+        # reply's own explanation FIRST so the disposition carries the server's
+        # reason, as RepairOutcome.detail's docstring promises it does.
+        live_error = _error_detail(live)
+        if live_error is not None:
+            outcomes.append(
+                RepairOutcome(
+                    task_id=candidate.task_id,
+                    tag=candidate.tag,
+                    disposition=SKIP_MISSING,
+                    files=candidate.plan_files,
+                    detail=f"live re-read: {live_error}",
+                )
+            )
+            continue
+
         disposition = classify_live_task(_unwrap_task(live), candidate)
         if disposition != REPAIR:
             outcomes.append(
@@ -606,7 +670,7 @@ async def repair_project(
                     task_id=candidate.task_id,
                     tag=candidate.tag,
                     disposition=REPAIR,
-                    files=candidate.plan_files,
+                    files=writable_plan_files(candidate),
                     detail="dry run: gate 3 passed on a live re-read; no write issued",
                 )
             )
@@ -769,6 +833,36 @@ DEFAULT_SERVER = "http://127.0.0.1:8002"
 # someone is trying to work out who touched a historical record.
 CLIENT_NAME = "repair-wiped-metadata-files-3329"
 
+# Exit codes, named rather than spelled inline so the epilog, main()'s
+# docstring and the returns can never drift into disagreeing about what a
+# number means. Each one denotes EXACTLY ONE outcome — that is the whole
+# reason 3 and 4 exist rather than being folded into 1.
+EXIT_OK = 0                    # ran; nothing failed to write
+EXIT_WRITE_FAILED = 1          # at least one candidate FAILED to write
+EXIT_NO_ROOT = 2               # no project root resolved to a readable tasks.db
+EXIT_NOTHING_SCANNED = 3       # roots resolved but EVERY one was unreadable
+EXIT_SERVER_UNREACHABLE = 4    # --apply, but the MCP server never handshook
+
+
+def _transport_error_types() -> tuple[type[BaseException], ...]:
+    """Exception types meaning "the server was not reachable / would not talk".
+
+    httpx is imported LAZILY, for the same reason :func:`_make_client` imports
+    the client lazily: a dry run must not depend on a transport library it
+    never uses.
+
+    ``httpx.HTTPError`` is the common base of ``ConnectError`` (nothing
+    listening on the port), the timeouts, and ``HTTPStatusError`` (raised by the
+    handshake's ``raise_for_status``). ``OSError`` covers the socket-level
+    failures that never reach an httpx wrapper, and ``RuntimeError`` is what
+    ``FusedMemoryClient._post`` itself raises when the reply is not a shape it
+    can parse — a server that answers but will not handshake is, for this
+    script's purposes, exactly as unusable as one that refuses the socket.
+    """
+    import httpx
+
+    return (httpx.HTTPError, OSError, RuntimeError)
+
 
 def _make_client(server_url: str):
     """Construct the MCP client. Imported LAZILY, on the apply path only.
@@ -782,7 +876,26 @@ def _make_client(server_url: str):
     from migrate_metadata_modules_to_files import FusedMemoryClient
 
     class RepairFusedMemoryClient(FusedMemoryClient):
-        """FusedMemoryClient with an attributable clientInfo.name."""
+        """FusedMemoryClient with an attributable clientInfo.name.
+
+        THE OVERRIDE BELOW IS A CLONE, AND KNOWINGLY SO. Only ``clientInfo.name``
+        varies, but the parent bakes that string into the middle of its
+        ``_initialize``, so the whole procedure — both JSON-RPC posts, the
+        ``protocolVersion``, the capabilities block — has to be restated to
+        change one leaf. That is a silent-drift clone: bump the parent's
+        protocolVersion and this client keeps handshaking with the stale one.
+
+        :attr:`_client_name` is the seam that retires it. ``scripts/`` is
+        outside this task's lock scope, so the parent cannot be edited here;
+        when it next comes into scope, change its ``_initialize`` to read
+        ``getattr(self, '_client_name', 'migrate-metadata')`` and DELETE this
+        override entirely — the attribute alone will then do the job. Until
+        then ``test_repair_client_handshake_has_not_drifted_from_its_parent``
+        fails the moment the two bodies disagree, so the drift is caught by CI
+        rather than shipped.
+        """
+
+        _client_name = CLIENT_NAME
 
         async def _initialize(self) -> None:
             await self._post({
@@ -791,7 +904,7 @@ def _make_client(server_url: str):
                 "method": "initialize",
                 "params": {
                     "protocolVersion": "2024-11-05",
-                    "clientInfo": {"name": CLIENT_NAME, "version": "1.0"},
+                    "clientInfo": {"name": self._client_name, "version": "1.0"},
                     "capabilities": {},
                 },
             })
@@ -815,7 +928,11 @@ def _build_parser() -> argparse.ArgumentParser:
         epilog=(
             "exit codes: 0 = ran, nothing failed; 1 = at least one candidate "
             "FAILED to write; 2 = no project root resolved to a readable "
-            "tasks.db (nothing was examined -- never read 2 as a clean run)."
+            "tasks.db; 3 = roots resolved but EVERY one was unreadable, so "
+            "nothing was examined; 4 = --apply, but the fused-memory MCP "
+            "server could not be reached (nothing was written). Never read 2, "
+            "3 or 4 as a clean run -- and note that only 1 ever means a write "
+            "was attempted and failed."
         ),
     )
     parser.add_argument(
@@ -845,6 +962,19 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 async def main_async(args: argparse.Namespace) -> int:
+    """Repair every resolved root, and never let one bad root eat the run.
+
+    ONE UNREADABLE ROOT IS NOT A FAILED RUN. Mirroring the audit's main()
+    (audit_wiped_metadata_files.py:899-933), a ``sqlite3.Error`` from root N is
+    warned to stderr, recorded, and skipped so the remaining roots still run.
+    On ``--apply`` that resilience is not a nicety: without it, an unreadable
+    root aborts before the summary prints, and the record of the writes already
+    applied to roots 1..N-1 is LOST — the reporting-honesty failure this
+    module's docstring claims to prevent. Every root that completed is
+    summarised, and only "EVERY root was unreadable" is an error
+    (:data:`EXIT_NOTHING_SCANNED`), so :data:`EXIT_WRITE_FAILED` keeps its one
+    documented meaning.
+    """
     roots = discover_project_roots(project_roots=args.project_roots)
     if not roots:
         print(
@@ -853,30 +983,75 @@ async def main_async(args: argparse.Namespace) -> int:
             "dark-factory default); NOTHING was examined",
             file=sys.stderr,
         )
-        return 2
+        return EXIT_NO_ROOT
 
     now_iso = datetime.now(timezone.utc).isoformat()
     results: list[RepairResult] = []
+    unreadable: list[str] = []
+
+    async def _repair_root(root: str, client: _ToolClient | None) -> None:
+        try:
+            results.append(
+                await repair_project(client, root, apply=args.apply, now_iso=now_iso)
+            )
+        except sqlite3.Error as exc:
+            # Same wording as the audit's warning, deliberately: one phrasing
+            # for one condition, so the two tools cannot describe the same
+            # unreadable database differently.
+            print(
+                f"warning: skipping unreadable project {root}: {exc}",
+                file=sys.stderr,
+            )
+            unreadable.append(root)
 
     if args.apply:
         # The client is constructed ONLY here, so a dry run genuinely never
         # dials — that inertness is what makes an accidental bare invocation
         # safe, and it is asserted by pointing --server-url at a closed port.
-        async with _make_client(args.server_url) as client:
-            for root in roots:
-                results.append(
-                    await repair_project(client, root, apply=True, now_iso=now_iso)
+        transport_errors = _transport_error_types()
+        async with contextlib.AsyncExitStack() as stack:
+            try:
+                client = await stack.enter_async_context(_make_client(args.server_url))
+            except transport_errors as exc:
+                # A down server is a NAMED outcome, not a traceback. The catch
+                # is scoped to the handshake alone — a transport failure
+                # mid-batch is already a per-task FAILED/SKIP_MISSING inside
+                # repair_project — so this code can only ever mean "never
+                # connected", i.e. nothing was written.
+                print(
+                    "error: could not reach the fused-memory MCP server at "
+                    f"{args.server_url}: {type(exc).__name__}: {exc}; NOTHING "
+                    "was written",
+                    file=sys.stderr,
                 )
+                return EXIT_SERVER_UNREACHABLE
+            for root in roots:
+                await _repair_root(root, client)
     else:
         for root in roots:
-            results.append(
-                await repair_project(None, root, apply=False, now_iso=now_iso)
-            )
+            await _repair_root(root, None)
+
+    if unreadable:
+        print(
+            f"warning: {len(unreadable)} project(s) skipped due to read errors "
+            "(see warnings above); results below are incomplete",
+            file=sys.stderr,
+        )
 
     if args.json:
         print(format_json_summary(results))
-    else:
+    elif results:
         print("\n".join(format_summary(result) for result in results))
+
+    if unreadable and not results:
+        # Nothing was scanned at all — never report that as a clean sweep, and
+        # never as a write failure either.
+        print(
+            "error: every resolved project was unreadable; NOTHING was "
+            "examined or written (this is not a clean result)",
+            file=sys.stderr,
+        )
+        return EXIT_NOTHING_SCANNED
 
     failed = sum(
         1
@@ -884,26 +1059,38 @@ async def main_async(args: argparse.Namespace) -> int:
         for outcome in result.outcomes
         if outcome.disposition == FAILED
     )
-    return 1 if failed else 0
+    return EXIT_WRITE_FAILED if failed else EXIT_OK
 
 
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point.
 
     Exit codes: 0 = ran, nothing failed; 1 = at least one candidate FAILED to
-    write; 2 = no project root resolved to a readable tasks.db.
+    write; 2 = no project root resolved to a readable tasks.db; 3 = roots
+    resolved but every one was unreadable; 4 = ``--apply`` could not reach the
+    MCP server.
 
-    2 is distinct from 0 for the same reason the audit distinguishes them: 0
-    would otherwise be returned both for "examined everything, nothing to do"
-    and for "examined nothing at all", and a consumer reading only the exit
-    code would take a total no-op for a clean run.
+    EACH CODE DENOTES EXACTLY ONE OUTCOME. 2, 3 and 4 are distinct from 0 for
+    the reason the audit distinguishes them: 0 would otherwise cover both
+    "examined everything, nothing to do" and "examined nothing at all", and a
+    consumer reading only the exit code would take a total no-op for a clean
+    run. They are distinct from 1 for the mirror-image reason — 1 is the
+    operator's signal that a WRITE was attempted and rejected, and folding an
+    unreadable database or a down server into it would send them hunting for a
+    failed write that never happened.
     """
     args = _build_parser().parse_args(argv)
     try:
         return asyncio.run(main_async(args))
     except sqlite3.Error as exc:
-        print(f"error: could not read a project database: {exc}", file=sys.stderr)
-        return 1
+        # Only root DISCOVERY can still reach here; per-root read errors are
+        # handled in main_async. Nothing was examined, so this is 3, not 1.
+        print(
+            f"error: could not read a project database: {exc}; NOTHING was "
+            "examined",
+            file=sys.stderr,
+        )
+        return EXIT_NOTHING_SCANNED
 
 
 if __name__ == "__main__":
