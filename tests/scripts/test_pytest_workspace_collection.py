@@ -271,7 +271,25 @@ def test_root_pyproject_omits_norecursedirs() -> None:
 
 # Matches a marker name used as a `not <name>` term inside a pytest -m
 # expression: "not smoke and not integration" -> ['smoke', 'integration'].
+# Only ever applied to an expression already accepted by _FLAT_DESELECT_RE.
 _NOT_MARKER_RE = re.compile(r'\bnot\s+([A-Za-z_]\w*)')
+
+# The ONLY -m expression shape this guard claims to understand: a pure flat
+# conjunction of deselects -- `not X`, `not X and not Y`, ...
+#
+# Deliberately narrow. A pytest -m expression is a full boolean expression, and
+# regexing `not <name>` out of a richer one silently gives the WRONG answer in
+# both directions, which is the one outcome a vacuity-sensitive guard must not
+# have:
+#   * `-m 'not (smoke or integration)'` in a MEMBER yields no `not <name>`
+#     matches at all -- the member's deselect becomes invisible to `owners` and
+#     this guard passes on the exact config it exists to catch;
+#   * the same expression in the ROOT empties `root_deselected` and fails the
+#     guard on a config that is semantically correct;
+#   * a selecting expression like `smoke and not slow` would be misread as a
+#     deselect of `slow`.
+# So anything but the flat form is REJECTED LOUDLY at parse time instead.
+_FLAT_DESELECT_RE = re.compile(r'^not\s+[A-Za-z_]\w*(?:\s+and\s+not\s+[A-Za-z_]\w*)*$')
 
 
 def _pytest_ini_options(pyproject: Path) -> dict:
@@ -306,9 +324,34 @@ def _effective_marker_expression(addopts: str) -> str:
     return expression
 
 
-def _deselected_markers(addopts: str) -> list[str]:
-    """Marker names deselected by *addopts*, in the order they appear."""
-    return _NOT_MARKER_RE.findall(_effective_marker_expression(addopts))
+def _deselected_markers(addopts: str, source: str) -> list[str]:
+    """Marker names deselected by *addopts*, in the order they appear.
+
+    *source* names the pyproject.toml the addopts came from; it appears in the
+    failure message raised when the -m expression is not the flat deselect form
+    (see _FLAT_DESELECT_RE for why anything else is rejected rather than
+    approximated).
+    """
+    expression = _effective_marker_expression(addopts)
+    if not expression:
+        return []
+
+    assert _FLAT_DESELECT_RE.match(expression), (
+        f'the pytest -m expression in {source} is {expression!r}, which this guard '
+        f'cannot parse.\n\n'
+        f'Use the flat deselect form — "not X", or "not X and not Y and ..." — so '
+        f'the root-vs-member mirroring invariant stays mechanically checkable.\n\n'
+        f'Anything richer is rejected ON PURPOSE, not for style: this guard finds '
+        f'deselects by matching `not <name>`, and on a parenthesised expression '
+        f'(e.g. "not (smoke or integration)") that match returns NOTHING — which '
+        f'would hide a member\'s deselect from the guard entirely (a silent pass on '
+        f'the very config it exists to catch) or empty the root\'s deselect set (a '
+        f'failure on a correct config). A selecting expression such as '
+        f'"smoke and not slow" would likewise be misread as deselecting `slow`.\n\n'
+        f'If a richer expression is genuinely needed, replace this shape check with '
+        f'a real boolean parse of the -m expression. Do NOT loosen the regex.'
+    )
+    return _NOT_MARKER_RE.findall(expression)
 
 
 def _registered_marker_names(ini_options: dict) -> set[str]:
@@ -378,6 +421,10 @@ def test_root_pyproject_mirrors_member_marker_deselections() -> None:
     that coverage.  Keying on the member's own explicit `-m 'not X'` keeps the
     invariant true by construction and the guard non-brittle.
 
+    Every `-m` expression involved — root and member alike — must be the flat
+    deselect form (`not X and not Y`); anything richer fails loudly here rather
+    than being approximated by a regex.  See _FLAT_DESELECT_RE.
+
     Sibling behavioural guards for the same bug class (this one is the static,
     member-agnostic generalisation — it covers a NEW member with no edit):
       - cockpit/tests/test_root_config_smoke_deselection.py
@@ -390,7 +437,7 @@ def test_root_pyproject_mirrors_member_marker_deselections() -> None:
     root_ini = root_data.get('tool', {}).get('pytest', {}).get('ini_options', {})
     root_addopts = root_ini.get('addopts', '')
     root_registered = _registered_marker_names(root_ini)
-    root_deselected = _deselected_markers(root_addopts)
+    root_deselected = _deselected_markers(root_addopts, 'the ROOT pyproject.toml')
 
     members = root_data.get('tool', {}).get('uv', {}).get('workspace', {}).get('members', [])
     # Anti-vacuity: a typo'd key here would make the loop below iterate nothing
@@ -407,7 +454,7 @@ def test_root_pyproject_mirrors_member_marker_deselections() -> None:
         addopts = _pytest_ini_options(REPO_ROOT / member / 'pyproject.toml').get('addopts')
         if not addopts:
             continue
-        for marker in _deselected_markers(addopts):
+        for marker in _deselected_markers(addopts, f'{member}/pyproject.toml'):
             owners.setdefault(marker, []).append(member)
 
     unregistered = [m for m in owners if m not in root_registered]
