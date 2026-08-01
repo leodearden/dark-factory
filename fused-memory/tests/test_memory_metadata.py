@@ -551,18 +551,21 @@ class TestValidateMemoryMetadata:
     def test_validator_is_a_pure_sync_dict_function(self):
         """`parent_id` LIVENESS (leaf delta) is structurally out of reach.
 
-        The validator takes only a dict and is not a coroutine, so it
-        CANNOT perform a store lookup. That makes the beta/delta scope
+        The validator is SYNCHRONOUS, so it cannot await the store lookup
+        that `parent_id` liveness requires. That makes the beta/delta scope
         boundary structural rather than a comment a later leaf could
         overlook and duplicate.
+
+        Deliberately the only introspection here. The parameter NAMES are
+        not pinned: they are cosmetic, every other test in this file and
+        the seam helper in `memory_service.py` call through the real
+        signature, so a signature change already fails on its own merits.
         """
         import inspect
 
         from fused_memory.memory_metadata import validate_memory_metadata
 
         assert not inspect.iscoroutinefunction(validate_memory_metadata)
-        params = inspect.signature(validate_memory_metadata).parameters
-        assert list(params) == ['meta', 'enforce_kind_registry']
 
     # -- supersedes ------------------------------------------------------
 
