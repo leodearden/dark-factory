@@ -6857,6 +6857,37 @@ class TestDefaultScheduleDetachedRestart:
 
 
 # ---------------------------------------------------------------------------
+# Task 3404: the wrapper-payload exec harness.
+#
+# `TestDefaultScheduleDetachedRestart`'s two higher-fidelity tests capture the
+# deferred `/bin/sh -c` wrapper and then execute it for REAL.  That exec left
+# the in-process world: the child interpreter inherits none of conftest.py's
+# sys.path surgery, and the child's output was discarded outright.  These tests
+# pin the harness that fixes both — it must return the child's exit code AND
+# its combined output, and it must hand the child the repo's src roots.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestWrapperPayloadHarness:
+    """The shared `_run_wrapper_payload` harness used by the wrapper-exec tests."""
+
+    async def test_run_wrapper_payload_returns_rc_and_captured_output(self):
+        """The harness must surface the child's rc AND its combined output.
+
+        The pre-3404 inline pattern threw `await proc.communicate()`'s result
+        away, so a wrapper whose on-failure branch died printed its own precise
+        diagnosis into a pipe nobody read.  Both halves are returned now.
+        """
+        rc, out = await _run_wrapper_payload(
+            "printf 'MARKER-3404\\n' >&2; exit 7"
+        )
+        assert rc == 7, f'harness must return the child exit code, got {rc!r} (output: {out!r})'
+        assert 'MARKER-3404' in out, (
+            f'harness must return the child combined stdout/stderr, got {out!r}'
+        )
+
+
+# ---------------------------------------------------------------------------
 # Task 2105: _default_schedule_detached_restart must consume before_done.cwd
 # (systemd-run --working-directory + absolutized payload script) so relative
 # deploy scripts stop failing 127 when the transient unit fires from the
