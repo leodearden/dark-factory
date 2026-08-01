@@ -28,22 +28,45 @@ from systemd_unit_invariants import (
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
-# Files that declare the cap but are deliberately NOT fixed.
+# What discovery refuses to treat as a unit, excluded by CATEGORY rather than
+# by naming individual paths.  Both categories are files that CONTAIN a unit as
+# quoted text rather than files systemd can load, and both break the invariant
+# the same way: restart_directive is last-occurrence-wins FILE-WIDE, so on a
+# file holding more than one embedded unit it splices a directive out of one and
+# a directive out of another and reports a verdict about neither.
 #
-# plans/ holds design docs and PRDs for past work (CLAUDE.md "Repo Map"), and
-# afk-C1-systemd.md is an as-built record of what was deployed at the time.  It
-# has already diverged from the live fleet in three visible ways — it still
-# shows `Requires=fused-memory.service`, which the real units deliberately
-# reject and test_orchestrator_service_files.py explicitly asserts is ABSENT,
-# plus an obsolete `--config orchestrator/config.yaml` path and no `--frozen`.
-# It is manifestly not a copy-source (unlike
-# skills/factory-init/references/supervised-unit.md, which IS fixed and is
-# guarded unconditionally below).  Editing one directive inside it would
-# falsify the record without making any unit correct.
+#   **/tests/**  — parity suites embed whole units as column-0 triple-quoted
+#     fixtures.  Measured: tests/scripts/test_check_fused_memory_unit_parity.py
+#     was swept as a 13th "unit" and PASSED by accident, splicing a cap out of
+#     the NEGATIVE fixture (which deliberately models the defect) together with
+#     RestartSteps= out of an unrelated POSITIVE one.  The glob form is
+#     load-bearing: a plain `:!tests/` excludes only the top-level directory and
+#     leaves fused-memory/tests/, orchestrator/tests/, scripts/tests/ and
+#     dashboard/tests/ swept — and fused-memory/tests/test_systemd_unit_config.py
+#     already parses systemd units, so one fixture there gaining a column-0 cap
+#     would drag a .py file back in.
 #
-# The exclusion is named and tested rather than silent: see
-# test_historical_record_exclusions_are_live.
-_HISTORICAL_RECORD_EXCLUSIONS = ("plans/afk-C1-systemd.md",)
+#   **/*.md — prose.  A doc may legitimately show the DEFECT: a PRD or
+#     postmortem for this very task would carry a "before" fence (cap, no steps)
+#     next to an "after" fence, and no mechanical rule distinguishes a
+#     cautionary example from a prescription.  plans/afk-C1-systemd.md is the
+#     live instance — an as-built record of what was deployed, already diverged
+#     from the fleet in three visible ways (`Requires=fused-memory.service`,
+#     which the real units reject and test_orchestrator_service_files.py asserts
+#     is ABSENT; an obsolete `--config orchestrator/config.yaml`; no `--frozen`).
+#     Editing a directive inside it would falsify the record without making any
+#     unit correct.  Excluding the category rather than the path means the next
+#     doc quoting a unit does not turn CI red and does not have to be
+#     hand-added to a constant in a test file.
+#
+# The cost is that a doc which IS a copy-source for real units must opt back in
+# explicitly.  Exactly one does — skills/factory-init/references/supervised-unit
+# .md — and its guard below is UNCONDITIONAL, i.e. strictly stronger than the
+# sweep, not a weaker substitute for it.
+_NON_UNIT_PATHSPECS = (
+    ":(exclude,glob)**/tests/**",
+    ":(exclude,glob)**/*.md",
+)
 
 # Every path the sweep is known to cover today.  Guards against a discovery
 # that silently returns fewer files than it should — see
@@ -61,7 +84,6 @@ _EXPECTED_SWEPT_PATHS = frozenset(
         "scripts/orchestrator-my-solar-challenge.service",
         "scripts/orchestrator-reify.service",
         "scripts/orchestrator-solar-challenge-platform.service",
-        "skills/factory-init/references/supervised-unit.md",
     }
 )
 
@@ -91,23 +113,28 @@ def discover_units_declaring_a_restart_cap() -> list[str]:
     to prevent for the sibling glob, except a subprocess can fail in more ways
     than a glob can.
 
-    ``tests/`` is excluded from the pathspec, and that exclusion is not
-    cosmetic.  Unit-parity suites embed whole systemd units as column-0
-    triple-quoted fixture strings, so ``^RestartMaxDelaySec=`` matches the test
-    MODULE — measured: tests/scripts/test_check_fused_memory_unit_parity.py was
-    swept as a 13th "unit".  Sweeping a .py file is wrong in both directions.
-    It passed only by accident, because restart_directive is last-occurrence-
-    wins across the whole file and happened to splice a cap out of the NEGATIVE
-    fixture (which deliberately models the defect) together with RestartSteps=
-    out of an unrelated POSITIVE one — so the fixture written to violate the
-    invariant was reported as satisfying it.  And the moment a fixture ordering
-    changed, or a `RestartSteps=0` negative case was appended, the sweep would
-    fail pointing an operator at a Python test file as though it were a
-    misconfigured unit.  Fixtures are the parity suites' own business; this
-    sweep's subject is committed units.
+    Test directories at any depth and markdown files are excluded via
+    _NON_UNIT_PATHSPECS — see the rationale on that constant.  Both hold units
+    as quoted text rather than as files systemd loads, and the file-wide
+    last-wins read splices their embedded units together.
+
+    The grep pattern tolerates leading whitespace and whitespace around the
+    separator, matching both systemd.syntax and restart_directive's own anchor.
+    A column-0-only pattern would leave a valid ``  RestartMaxDelaySec = 60``
+    undiscovered, so the file would never be swept, the pairing never checked,
+    and the sweep would report green — a silent skip in a guard whose whole
+    purpose is catching a silently-ignored directive.
     """
     proc = subprocess.run(
-        ["git", "grep", "-lE", "^RestartMaxDelaySec=", "--", ".", ":!tests/"],
+        [
+            "git",
+            "grep",
+            "-lE",
+            r"^[ \t]*RestartMaxDelaySec[ \t]*=",
+            "--",
+            ".",
+            *_NON_UNIT_PATHSPECS,
+        ],
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
@@ -121,18 +148,18 @@ def discover_units_declaring_a_restart_cap() -> list[str]:
         f"report this whole sweep green while checking nothing. stderr: "
         f"{proc.stderr.strip()!r}"
     )
-    paths = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
-    return sorted(p for p in paths if p not in _HISTORICAL_RECORD_EXCLUSIONS)
+    return sorted(line.strip() for line in proc.stdout.splitlines() if line.strip())
 
 
 # Filename shapes a systemd unit definition is allowed to take in this repo.
 # Used to police what discovery drags IN, not what it must contain — see
-# test_discovery_sweeps_only_systemd_units.
+# test_discovery_sweeps_only_systemd_units.  `.md` is deliberately NOT here:
+# markdown is prose that quotes units, never a unit, and _NON_UNIT_PATHSPECS
+# keeps it out of discovery in the first place.
 _UNIT_FILE_SUFFIXES = (
     ".service",
     ".service.template",
     ".example-systemd-config",
-    ".md",  # a fenced ini block inside a reference doc
 )
 
 
@@ -172,48 +199,31 @@ def test_discovery_sweeps_only_systemd_units() -> None:
     Constraining extras by SHAPE keeps the auto-coverage property intact (a new
     .service file is swept the day it lands, with no constant to update) while
     refusing anything that is not a unit definition.  A Python module, a JSON
-    fixture or a shell script matching this directive means discovery has
-    escaped its subject, and the failure names the path rather than misreporting
-    it as a misconfigured unit several assertions later.
+    fixture, a markdown doc or a shell script matching this directive means
+    discovery has escaped its subject, and the failure names the path rather
+    than misreporting it as a misconfigured unit several assertions later.
+
+    The test-directory check is by path SEGMENT, not by prefix, so a unit-shaped
+    fixture parked at fused-memory/tests/fixtures/whatever.service is caught too
+    — the same depth blindness that a prefix-matching `:!tests/` pathspec has,
+    which is why _NON_UNIT_PATHSPECS uses the glob form.
     """
     discovered = discover_units_declaring_a_restart_cap()
     strays = [
         p
         for p in discovered
-        if not p.endswith(_UNIT_FILE_SUFFIXES) or p.startswith("tests/")
+        if not p.endswith(_UNIT_FILE_SUFFIXES) or "/tests/" in f"/{p}"
     ]
     assert not strays, (
         f"discovery swept files that are not systemd unit definitions: {strays}. "
-        "Something other than a unit declares RestartMaxDelaySec= at column 0 — "
-        "most likely a test fixture embedding a unit as a triple-quoted string. "
-        "Such a file must be excluded from the pathspec, not checked: the "
-        "invariant reads the LAST occurrence of each directive file-wide, so on "
-        "a multi-fixture module it splices values from unrelated fixtures "
-        "together and reports a nonsense verdict about a file that is not a unit."
+        "Something other than a unit declares RestartMaxDelaySec= — most likely "
+        "a test fixture embedding a unit as a triple-quoted string, or a doc "
+        "quoting one inside a fence. Such a file must be excluded from the "
+        "pathspec, not checked: the invariant reads the LAST occurrence of each "
+        "directive file-wide, so on a file holding more than one embedded unit "
+        "it splices values from unrelated ones together and reports a nonsense "
+        "verdict about a file that is not a unit."
     )
-
-
-def test_historical_record_exclusions_are_live() -> None:
-    """Every excluded path must still exist AND still declare the cap.
-
-    A stale exclusion is a silent change of scope in either direction: if the
-    file were renamed or deleted, the constant would quietly protect nothing;
-    if the directive were removed from it, the exclusion would no longer be
-    describing a real conflict and should be dropped.  Either way the sweep's
-    coverage would have drifted from what the constant claims, so assert the
-    exclusion is still load-bearing rather than trusting it forever.
-    """
-    for rel in _HISTORICAL_RECORD_EXCLUSIONS:
-        path = REPO_ROOT / rel
-        assert path.exists(), (
-            f"excluded path {rel} no longer exists; the exclusion in "
-            "_HISTORICAL_RECORD_EXCLUSIONS is stale and should be removed."
-        )
-        assert restart_directive(path, "RestartMaxDelaySec") is not None, (
-            f"excluded path {rel} no longer declares RestartMaxDelaySec=, so "
-            "the sweep would not have picked it up anyway; the exclusion in "
-            "_HISTORICAL_RECORD_EXCLUSIONS is stale and should be removed."
-        )
 
 
 @pytest.mark.parametrize(
@@ -235,8 +245,10 @@ def test_every_unit_declaring_a_restart_cap_pairs_it_with_steps(rel_path: str) -
 def test_factory_init_reference_unit_ships_effective_backoff() -> None:
     """The factory-init reference unit must declare the full backoff triple.
 
-    This guard is UNCONDITIONAL where the sweep above is conditional, and
-    deliberately so — it is a strictly stronger invariant for this one file.
+    This file is markdown, so _NON_UNIT_PATHSPECS keeps it OUT of the sweep and
+    this guard is its only coverage.  That is not a downgrade: the guard is
+    UNCONDITIONAL where the sweep is conditional, i.e. strictly stronger for
+    this one file, so nothing was traded away by excluding the category.
 
     The sweep's contract is "IF you declare a cap, pair it with steps", which
     correctly lets a unit opt out of backoff entirely by declaring no cap.  But
@@ -251,7 +263,12 @@ def test_factory_init_reference_unit_ships_effective_backoff() -> None:
 
     restart_directive reads raw text with ^-anchored MULTILINE regexes, so it
     works on the fenced ini block as-is: the directives sit at column 0 inside
-    the fence.
+    the fence.  That read is only sound while the doc carries ONE unit block —
+    the directive lookup is last-occurrence-wins file-wide, so a second fence
+    showing a "before"/broken variant would splice the two.  If this reference
+    ever grows a second unit block, this guard must gain block scoping rather
+    than keep trusting a file-wide read; the same hazard is why markdown is
+    excluded from discovery wholesale.
     """
     path = REPO_ROOT / _FACTORY_INIT_REFERENCE
     assert path.exists(), (

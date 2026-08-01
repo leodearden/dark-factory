@@ -892,6 +892,30 @@ def test_restart_backoff_guard_rejects_ineffective_units(
     with pytest.raises(AssertionError, match="but no RestartSteps="):
         _assert_restart_backoff_effective(suffixed_no_steps)
 
+    # Bad: the same inert cap, spelled with the leading and around-separator
+    # whitespace systemd.syntax permits.  This is a VALID unit whose cap systemd
+    # parses and discards, so it must be caught — a column-0-only anchor reads
+    # it as declaring no cap at all and returns early, skipping the invariant
+    # without a word.  That is the one failure direction this guard cannot
+    # afford: it masks the very defect the helper exists to surface, unlike the
+    # opaque-value capture above, which errs toward checking MORE.
+    spaced_no_steps = _write_restart_unit(
+        tmp_path / "spaced_no_steps.service",
+        "Restart=on-failure\n  RestartSec = 5\n\tRestartMaxDelaySec\t=\t60",
+    )
+    with pytest.raises(AssertionError, match="but no RestartSteps="):
+        _assert_restart_backoff_effective(spaced_no_steps)
+    assert _restart_directive(spaced_no_steps, "RestartMaxDelaySec") == "60"
+
+    # Good: the whitespace-tolerant read is complete, not just detection-only —
+    # a properly paired unit in that same spelling must not raise.
+    spaced_good = _write_restart_unit(
+        tmp_path / "spaced_good.service",
+        "Restart=on-failure\n  RestartSec = 5\n  RestartSteps = 4\n"
+        "  RestartMaxDelaySec = 60",
+    )
+    _assert_restart_backoff_effective(spaced_good)
+
 
 def test_restart_backoff_is_effective_in_both_unit_files() -> None:
     """Both unit files must pair RestartMaxDelaySec= with a usable RestartSteps=.

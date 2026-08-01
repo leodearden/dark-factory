@@ -62,9 +62,19 @@ def restart_directive(path: pathlib.Path, name: str) -> str | None:
     backoff systemd has in fact discarded.  Repeats are not hypothetical: a
     drop-in under <unit>.d/ is merged by appending, so an override that pins one
     of these values lands as exactly this shape.
+
+    The anchor tolerates leading whitespace and whitespace around the separator
+    (``^[ \t]*Name[ \t]*=``) because systemd.syntax does: ``    RestartMaxDelaySec
+    = 60`` is a perfectly valid assignment that a column-0 anchor reads as no
+    directive at all.  That mis-read degrades in the FAILURE-MASKING direction —
+    the pairing invariant below returns early, the unit is blessed, and a guard
+    written to catch a silently-ignored directive silently ignores it in turn.
+    Contrast the opaque ``(.*)`` capture above, which is deliberately loose for
+    the opposite reason: it degrades LOUDLY, reporting an unexpected spelling as
+    the present directive it is rather than skipping the check.
     """
     matches = re.findall(
-        rf"^{re.escape(name)}=(.*)$",
+        rf"^[ \t]*{re.escape(name)}[ \t]*=(.*)$",
         path.read_text(encoding="utf-8"),
         re.MULTILINE,
     )
