@@ -54,6 +54,97 @@ async def _pgid_gone_within(pgid: int, timeout: float = 5.0, step: float = 0.1) 
     return False
 
 
+async def _await_group_membership(
+    pgid: int,
+    *,
+    total: int,
+    comm: str,
+    comm_count: int,
+    # Must-not-hang guard, not a latency SLA — matches the 5.0s budget
+    # already justified for _pgid_gone_within above.
+    timeout: float = 5.0,
+    # A single snapshot_process_group walk (all of /proc: stat/wchan/comm/
+    # cmdline per pid) measured median 448ms idle / 911ms loaded, p95
+    # ~2.4-2.6s, max 3.95s on a 32-core host (task 3347). A deadline-only
+    # bound could therefore admit just ONE attempt on a slower or larger-
+    # /proc host, silently degrading back into the single-observation race
+    # this helper exists to remove. The attempt floor makes the guarantee
+    # independent of walk cost, at zero cost in the happy path (1 attempt
+    # sufficed in ~97% of measured runs).
+    min_attempts: int = 3,
+    step: float = 0.05,
+) -> str:
+    """Poll snapshot_process_group(pgid) until it reaches an expected shape.
+
+    A readiness line observed via ``_await_shell_ready`` proves only that
+    bash's ``fork()`` calls for a background job returned in the PARENT —
+    not that the child has finished ``execve()`` into its target binary.
+    Between fork and exec a child still reports the parent's comm/cmdline
+    (e.g. ``comm=sh`` instead of ``comm=sleep``), so judging group
+    membership from a single post-readiness snapshot races the fork->exec
+    window: measured at a 4.5% hit rate over 200 idle iterations on a
+    32-core host (task 3347 review round 2). This helper absorbs that
+    window by polling for the full expected shape instead of trusting a
+    single observation.
+
+    Bounded by BOTH *timeout* (wall-clock) AND *min_attempts* — exhaustion
+    requires both to be exceeded, whichever is more generous. *timeout*
+    defaults to 5.0s, matching the budget already justified for
+    ``_pgid_gone_within`` above. *min_attempts* defaults to 3 because a
+    single ``snapshot_process_group`` walk measured median 448ms idle /
+    911ms loaded, p95 ~2.4-2.6s, max 3.95s — a deadline-only bound could
+    admit just ONE attempt on a slower or larger-/proc host, silently
+    degrading back into the single-observation race this helper exists to
+    remove. This is a must-not-hang guard, not a latency SLA: measured 0
+    convergence failures in 180 runs (60 idle + 120 loaded) with these
+    defaults, attempts actually needed maxing at 4.
+
+    Returns the converged snapshot (str) once the group contains exactly
+    *total* processes, of which exactly *comm_count* have ``comm={comm}``.
+
+    Raises ``_GroupMembershipTimeout`` (never a bare TimeoutError, never a
+    silent return) if that shape is never reached. The deadline is only
+    ever checked after a completed attempt, so a slow /proc walk alone can
+    never produce a zero-retry failure. The message reports
+    expected-vs-observed for both clauses separately (naming which was
+    unmet), the attempt count, elapsed time, and the last snapshot
+    verbatim.
+    """
+    started = asyncio.get_running_loop().time()
+    attempts = 0
+    while True:
+        snapshot = snapshot_process_group(pgid)
+        rows = [
+            line for line in snapshot.splitlines()
+            if re.match(r'^\s*pid=', line)
+        ]
+        matching = [row for row in rows if f'comm={comm}' in row]
+        attempts += 1
+        if len(rows) == total and len(matching) == comm_count:
+            return snapshot
+
+        elapsed = asyncio.get_running_loop().time() - started
+        if attempts >= min_attempts and elapsed >= timeout:
+            unmet = []
+            if len(rows) != total:
+                unmet.append(f'total (expected {total}, observed {len(rows)})')
+            if len(matching) != comm_count:
+                unmet.append(
+                    f'comm={comm!r} count (expected {comm_count}, '
+                    f'observed {len(matching)})'
+                )
+            raise _GroupMembershipTimeout(
+                f'group {pgid} did not reach the expected shape after '
+                f'{attempts} attempt(s) / {elapsed:.3f}s elapsed (timeout='
+                f'{timeout}s, min_attempts={min_attempts}) — unmet: '
+                f'{"; ".join(unmet)}. total processes: expected {total}, '
+                f'observed {len(rows)}. comm={comm!r} processes: expected '
+                f'{comm_count}, observed {len(matching)}. last snapshot:\n'
+                f'{snapshot}'
+            )
+        await asyncio.sleep(step)
+
+
 async def _spawn_sleeper_in(cwd) -> asyncio.subprocess.Process:
     """Spawn a real ``sleep 30`` leading its own process group, with cwd *cwd*.
 
@@ -102,6 +193,19 @@ class _ShellReadinessTimeout(_ShellReadinessError):
 
 class _ShellReadinessEOF(_ShellReadinessError):
     """The child closed stdout before announcing readiness (early exit)."""
+
+
+class _GroupMembershipTimeout(AssertionError):
+    """A process group did not reach an expected membership shape in time.
+
+    Subclasses AssertionError — like the _ShellReadinessError family above
+    — so an unmet precondition surfaces as a test FAILURE, never a bare
+    TimeoutError and never a silent return. One class, not a hierarchy:
+    there is genuinely only one failure mode here (the poll exhausted its
+    budget). As with _ShellReadinessError, the concrete TYPE is the
+    contract; the message stays free to carry the full last-observed
+    snapshot for diagnosis.
+    """
 
 
 async def _await_shell_ready(
@@ -457,7 +561,7 @@ class TestTerminateProcessGroup:
         )
 
     @pytest.mark.asyncio
-    @pytest.mark.timeout(30)
+    @pytest.mark.timeout(60)
     async def test_terminate_process_group_reaps_grandchildren(self):
         """terminate_process_group kills grandchildren (bash → sleep sleep).
 
@@ -486,22 +590,18 @@ class TestTerminateProcessGroup:
             # Assert the precondition directly — bash + 2 sleep children must
             # actually be in the group before we terminate it — so this test
             # fails loudly rather than silently passing vacuously if that
-            # ever regresses.  Match process rows tolerantly (not on
-            # snapshot_process_group's exact indentation) and count children
-            # by comm=sleep rather than raw row count, so the assertion is
-            # expressed in domain terms (the bash leader plus 2 sleep
-            # children) rather than coupled to the snapshot's row layout.
-            snapshot = snapshot_process_group(pgid)
-            rows = [
-                line for line in snapshot.splitlines()
-                if re.match(r'^\s*pid=', line)
-            ]
-            sleep_rows = [row for row in rows if 'comm=sleep' in row]
-            assert len(rows) == 3 and len(sleep_rows) == 2, (
-                f'expected 3 processes in group {pgid} before terminating — '
-                f'the bash leader plus 2 sleep children — got {len(rows)} '
-                f'total ({len(sleep_rows)} with comm=sleep):\n{snapshot}'
-            )
+            # ever regresses.  `total == 3` IS proven by the readiness edge
+            # above: fork membership is inherited at fork (non-interactive
+            # sh means no job control and no setpgid), observed true on the
+            # first snapshot in 730/730 measured runs.  The 2 comm=sleep
+            # children are only EVENTUALLY true — between fork and exec a
+            # child still reports comm=sh, so _await_group_membership polls
+            # to absorb exactly that fork->exec window (task 3347 review
+            # round 2).  Do not weaken this to `>= 1 sleep`: the
+            # sleep-children clause is what actually proves grandchildren
+            # exist to be reaped, which is the anti-vacuity point of this
+            # test.
+            await _await_group_membership(pgid, total=3, comm='sleep', comm_count=2)
 
             await terminate_process_group(proc, pgid, grace_secs=5.0)
         finally:
