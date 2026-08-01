@@ -12,6 +12,8 @@ Exercises the full integration of the deterministic task kind over the landed
 from __future__ import annotations
 
 import asyncio
+import subprocess
+import sys
 import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1734,6 +1736,101 @@ class TestB10Validation:
         assert result is None, (
             f'Expected None (no error) for valid deterministic gate, got: {result!r}'
         )
+
+
+def _force_uv_fallback(monkeypatch: pytest.MonkeyPatch, stub) -> None:
+    """Force ``_validate`` down its ``uv run`` subprocess fallback path.
+
+    Under this repo's own conftest.py, ``fused_memory`` imports in-process
+    and the fallback arm is dead. Simulate an orchestrator-only venv by
+    sentinel-injecting ``None`` into ``sys.modules`` for the target module:
+    CPython's import system raises ``ModuleNotFoundError: import of X
+    halted; None in sys.modules`` for a ``from X import Y`` against a
+    ``None`` entry, which is exactly the exception ``_validate`` catches to
+    enter the fallback. ``monkeypatch`` restores the real module (or absence
+    of one) at teardown, so this is safe even if an earlier test already
+    imported the module in this process.
+
+    ``stub`` replaces ``subprocess.check_output`` so no real ``uv`` process
+    is spawned. ``_validate``'s fallback does ``import subprocess`` locally,
+    which binds the same module object as the top-level ``subprocess``
+    import here, so patching the top-level module's attribute takes effect.
+    """
+    monkeypatch.setitem(
+        sys.modules, 'fused_memory.middleware.deterministic_task_guard', None
+    )
+    monkeypatch.setattr(subprocess, 'check_output', stub)
+
+
+class TestValidateUvFallback:
+    """Exercises `_validate`'s ``uv run`` subprocess fallback arm directly.
+
+    The fallback is unreached in the normal test run (see
+    `_force_uv_fallback`), so these tests force entry into it to pin its
+    behaviour independently of whichever venv happens to be active.
+    """
+
+    def test_fallback_targets_repo_root_fused_memory_project(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The ``--project`` argv element must point at repo-root fused-memory.
+
+        Derives the expectation independently (not via any implementation
+        constant) so this pins the layout invariant itself: the repo root of
+        *this* worktree, two parents up from this test file.
+        """
+        captured_argv: list[str] = []
+
+        def _stub(argv, **kwargs):
+            captured_argv.extend(argv)
+            return 'null'
+
+        _force_uv_fallback(monkeypatch, _stub)
+
+        _validate(
+            task_kind='deterministic',
+            metadata={
+                'task_kind': 'deterministic',
+                'always_escalates': True,
+                'before_done': None,
+            },
+            project_root=str(tmp_path),
+        )
+
+        assert '--project' in captured_argv, (
+            f'Expected --project in argv, got: {captured_argv!r}'
+        )
+        project_arg = captured_argv[captured_argv.index('--project') + 1]
+        expected = Path(__file__).resolve().parents[2] / 'fused-memory'
+        assert project_arg == str(expected), (
+            f'Expected --project to point at repo-root fused-memory '
+            f'({expected}), got: {project_arg!r}'
+        )
+        assert Path(project_arg).is_dir(), (
+            f'Computed --project dir does not exist: {project_arg!r}'
+        )
+
+    def test_fallback_parses_subprocess_json_result(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A JSON error object printed by the subprocess round-trips as a dict."""
+
+        def _stub(argv, **kwargs):
+            return '{"error": "sentinel-err"}'
+
+        _force_uv_fallback(monkeypatch, _stub)
+
+        result = _validate(
+            task_kind='deterministic',
+            metadata={
+                'task_kind': 'deterministic',
+                'always_escalates': False,
+                'before_done': None,
+            },
+            project_root=str(tmp_path),
+        )
+
+        assert result == {'error': 'sentinel-err'}
 
 
 # ---------------------------------------------------------------------------
