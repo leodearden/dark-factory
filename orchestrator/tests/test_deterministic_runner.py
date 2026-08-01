@@ -7,6 +7,7 @@ Step-7: RED — idempotent resume + quiescence (I2/B3/B4/B11)
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -331,6 +332,17 @@ def _seed_escalation(
     return esc
 
 
+# Repo root of this worktree, derived exactly as orchestrator/tests/conftest.py
+# derives _SRC / _SHARED_SRC / _ESCALATION_SRC (conftest.py:20-27) — same source
+# of truth, same idiom, no new constant to drift.
+_REPO_ROOT = Path(__file__).parent.parent.parent
+_CHILD_SRC_ROOTS = (
+    _REPO_ROOT / 'escalation' / 'src',
+    _REPO_ROOT / 'shared' / 'src',
+    _REPO_ROOT / 'orchestrator' / 'src',
+)
+
+
 async def _run_wrapper_payload(wrapped: str) -> tuple[int, str]:
     """Execute a deferred RP-4 ``/bin/sh -c`` wrapper the way systemd would.
 
@@ -347,11 +359,36 @@ async def _run_wrapper_payload(wrapped: str) -> tuple[int, str]:
     the text the child printed.  The pre-3404 inline pattern called
     ``await proc.communicate()`` and discarded the result, leaving a failure to
     report itself as a bare "got 0" with the real diagnosis unread.
+
+    The child is given the repo's src roots on ``PYTHONPATH``.  WHY (measured,
+    task 3404): the wrapper's on-failure branch is
+    ``EscalationSpec.to_submit_argv(sys.executable)`` =>
+    ``[sys.executable, '-m', 'escalation', 'submit', ...]``, and that is a
+    FRESH interpreter — it inherits none of root conftest.py's in-process
+    ``sys.path`` injection, only site-packages plus cwd.  In a venv whose
+    site-packages lacks the `escalation` editable install (`.worktrees/3352`
+    had ONLY `_editable_impl_dark_factory_shared.pth`), the child resolves the
+    repo's `escalation/` directory as an implicit NAMESPACE package with no
+    `__main__`, exits non-zero, and files nothing — while the wrapper's
+    trailing `exit "$__rc"` still returns the payload script's own code.  So
+    the test saw rc==7 and zero escalations and blamed production filing logic.
+    Injecting the roots fixes it for real:
+    ``PYTHONPATH=<roots> <that stripped venv>/bin/python3 -m escalation submit
+    --help`` exits 0.  This supplements the venv, it does not replace it —
+    escalation's third-party deps still resolve from site-packages (a bare
+    /usr/bin/python3 + PYTHONPATH still fails), so a genuinely unsynced
+    environment still fails, just loudly and specifically.
     """
+    env = {**os.environ}
+    inherited = env.get('PYTHONPATH')
+    env['PYTHONPATH'] = os.pathsep.join(
+        [*(str(p) for p in _CHILD_SRC_ROOTS), *([inherited] if inherited else [])]
+    )
     proc = await asyncio.create_subprocess_exec(
         '/bin/sh', '-c', wrapped,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
+        env=env,
     )
     out, _ = await proc.communicate()
     return proc.returncode, out.decode(errors='replace')
