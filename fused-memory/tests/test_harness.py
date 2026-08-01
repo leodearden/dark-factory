@@ -3088,10 +3088,15 @@ async def test_auto_unhalt_seeds_grace_and_rehalt_reescalates(
     # assert above) so the closure captures them already-narrowed.
     real_unhalt = harness.judge.unhalt
     grace_remaining = harness.judge.unhalt_grace_remaining
+    unhalted = asyncio.Event()
 
     async def _capture_grace(pid):
         await real_unhalt(pid)  # real unhalt seeds grace + clears _halt_escalated
         grace_at_unhalt[pid] = grace_remaining(pid)
+        # Witness LAST, strictly after the capture above is recorded: the drive
+        # cancels run_loop as soon as this fires, so setting it any earlier
+        # would race assertion (1) against the capture.
+        unhalted.set()
 
     unhalt_mock = AsyncMock(side_effect=_capture_grace)
     harness.judge.unhalt = unhalt_mock
