@@ -407,3 +407,155 @@ class TestCitationGateScopingAndFailures:
         assert result['status'] == 'deleted'
         mock_service.delete_memory.assert_awaited_once()
         interceptor.get_tasks.assert_not_awaited()
+
+
+TOMBSTONE_KEY = 'x_memory_citation_tombstones'
+
+
+def _repointed_metadata(run_id='run-1'):
+    """Metadata exactly as a completed repoint pass leaves it.
+
+    ``cited`` now addresses the survivor; the only remaining mention of the
+    doomed id lives in the labelled provenance ledger, whose
+    ``superseded_memory_id`` names it BY DESIGN.
+    """
+    return {
+        'cited': SURVIVOR,
+        TOMBSTONE_KEY: [
+            {
+                'superseded_memory_id': DOOMED,
+                'replacement_memory_id': SURVIVOR,
+                'paths': ['cited'],
+                'run_id': run_id,
+            },
+        ],
+    }
+
+
+class TestTombstonedTaskIsNotALiveCiter:
+    """The gate and the sweep must agree that a tombstone is not a citation.
+
+    ``_scan_task_citations`` feeds the gate's ``live_citers`` list. If it counts
+    a tombstone's ``superseded_memory_id`` — which exists precisely to name the
+    deleted id — then an already-repointed task looks like an outstanding one
+    forever, the gate demands a repoint the sweep reports zero work for, and the
+    retry ``_CITATION_REPOINT_FAILED_HINT`` instructs the caller to perform
+    never terminates.
+    """
+
+    @pytest.fixture
+    def mock_service(self):
+        return _make_service()
+
+    @pytest.mark.asyncio
+    async def test_fully_repointed_task_does_not_require_a_replacement(
+        self, mock_service,
+    ):
+        """(a) Nothing LIVE points at the doomed id, so the delete proceeds even
+        with no replacement_memory_id supplied."""
+        interceptor = _make_interceptor([
+            _task('901', 'pending', _repointed_metadata()),
+        ])
+        mcp_server = create_mcp_server(
+            mock_service,
+            task_interceptor=interceptor,
+            known_projects=KNOWN_PROJECTS,
+        )
+
+        result = await _call_delete(mcp_server)
+
+        assert result.get('error_type') != 'CitationRepointRequired'
+        assert result['status'] == 'deleted'
+        mock_service.delete_memory.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_fully_repointed_task_is_never_rewritten_again(
+        self, mock_service,
+    ):
+        """(b) The same shape WITH a valid replacement issues no redundant
+        write — a second rewrite would clobber superseded_memory_id and destroy
+        the forwarding provenance."""
+        interceptor = _make_interceptor([
+            _task('902', 'pending', _repointed_metadata()),
+        ])
+        mcp_server = create_mcp_server(
+            mock_service,
+            task_interceptor=interceptor,
+            known_projects=KNOWN_PROJECTS,
+        )
+
+        result = await _call_delete(mcp_server, replacement_memory_id=SURVIVOR)
+
+        assert result['status'] == 'deleted'
+        interceptor.update_task.assert_not_awaited()
+        mock_service.delete_memory.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_retry_after_a_partial_failure_completes_the_delete(
+        self, mock_service,
+    ):
+        """(c) END-TO-END RETRY — the exact sequence the failure hint prescribes.
+
+        Pass 1: two pending citers, the second's write REJECTED -> the delete is
+        refused. Pass 2: task one now carries pass-1's output (so it is no
+        longer a citer) and task two's write lands -> only task two is written
+        and the delete proceeds.
+        """
+        # ---- Pass 1: task 912's repoint write is rejected. ----
+        interceptor_1 = MagicMock()
+        interceptor_1.get_tasks = AsyncMock(return_value={'tasks': [
+            _task('911', 'pending', {'cited': DOOMED}),
+            _task('912', 'pending', {'cited': DOOMED}),
+        ]})
+
+        async def _reject_912(**kwargs):
+            if kwargs['task_id'] == '912':
+                return {'success': False, 'error': 'write lock contention'}
+            return {'success': True}
+
+        interceptor_1.update_task = AsyncMock(side_effect=_reject_912)
+        server_1 = create_mcp_server(
+            mock_service,
+            task_interceptor=interceptor_1,
+            known_projects=KNOWN_PROJECTS,
+        )
+
+        result_1 = await _call_delete(server_1, replacement_memory_id=SURVIVOR)
+
+        assert result_1['error_type'] == 'CitationRepointFailed'
+        mock_service.delete_memory.assert_not_awaited()
+
+        # Task 911's write DID land; capture the metadata it now holds.
+        payload_911 = json.loads(next(
+            c[1]['metadata'] for c in interceptor_1.update_task.call_args_list
+            if c[1]['task_id'] == '911'
+        ))
+        after_911 = {'cited': DOOMED}
+        after_911.update(payload_911)  # shallow merge, as the backend applies it
+
+        # ---- Pass 2: retry against the post-pass-1 snapshot. ----
+        interceptor_2 = _make_interceptor([
+            _task('911', 'pending', after_911),
+            _task('912', 'pending', {'cited': DOOMED}),
+        ])
+        server_2 = create_mcp_server(
+            mock_service,
+            task_interceptor=interceptor_2,
+            known_projects=KNOWN_PROJECTS,
+        )
+
+        result_2 = await _call_delete(server_2, replacement_memory_id=SURVIVOR)
+
+        assert result_2['status'] == 'deleted'
+        mock_service.delete_memory.assert_awaited_once()
+
+        # Only the still-outstanding task was written on the retry.
+        written = [c[1]['task_id'] for c in interceptor_2.update_task.call_args_list]
+        assert written == ['912']
+
+        # And task 911's provenance survived the second pass intact.
+        assert after_911['cited'] == SURVIVOR
+        ledger = after_911[TOMBSTONE_KEY]
+        assert len(ledger) == 1
+        assert ledger[0]['superseded_memory_id'] == DOOMED
+        assert ledger[0]['replacement_memory_id'] == SURVIVOR
