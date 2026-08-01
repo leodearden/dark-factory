@@ -46,8 +46,11 @@ Environment=LANG=en_US.UTF-8
 Environment=ORCH_UNIT=orchestrator-autopilot-video.service
 
 # Auto-restart on crash; back off up to 60s.
+# RestartSteps makes RestartMaxDelaySec effective (without it systemd warns and
+# ignores the cap): backoff 10s -> 60s over 4 steps.
 Restart=on-failure
 RestartSec=10
+RestartSteps=4
 RestartMaxDelaySec=60
 
 # Orchestrator shutdown cancels in-flight tasks, reaps agent subprocesses, and
