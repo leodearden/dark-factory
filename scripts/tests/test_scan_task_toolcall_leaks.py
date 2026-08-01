@@ -23,6 +23,8 @@ import sqlite3
 import subprocess
 from pathlib import Path
 
+import _task_db_scan
+import scan_task_toolcall_leaks
 from scan_task_toolcall_leaks import (
     LeakMatch,
     detect_leak,
@@ -480,3 +482,29 @@ def test_cli_continues_past_unreadable_db_and_warns_on_stderr(tmp_path):
     assert result.returncode == 1, f"stdout={result.stdout!r} stderr={result.stderr!r}"
     assert "992" in result.stdout
     assert str(corrupt_db) in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Shared-plumbing adoption contract (task 3336).
+# ---------------------------------------------------------------------------
+
+def test_module_sources_its_discovery_and_json_from_the_shared_module():
+    """Task 3286's finding is that a PARTIAL extraction defeats the point: a
+    private copy left behind keeps drifting while every other test still
+    passes. So "this script sources its plumbing from _task_db_scan" is itself
+    a behaviour worth pinning.
+
+    Identity (`is`), not a source grep or a docstring match — a re-pasted copy
+    with a byte-identical body satisfies every other assertion in this file but
+    cannot satisfy this one.
+    """
+    assert scan_task_toolcall_leaks.discover_db_paths is _task_db_scan.discover_db_paths
+    assert scan_task_toolcall_leaks.format_json is _task_db_scan.format_json
+
+
+def test_the_private_discovery_copies_are_gone_not_merely_shadowed():
+    """Catches the halfway state where the shared import lands on top of a
+    still-present private copy: the module attribute would look right while
+    the dead code sits underneath waiting to be re-wired."""
+    assert not hasattr(scan_task_toolcall_leaks, "_DEFAULT_PROJECT_ROOTS")
+    assert not hasattr(scan_task_toolcall_leaks, "_tasks_db_path")
