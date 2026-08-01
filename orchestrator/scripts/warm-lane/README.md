@@ -700,6 +700,14 @@ report on — the reading task 3074 already relied on.
   the ordering pin — that the `lib_lane_state.sh` message is absent from that
   run. `--help` is the invocation because it normally exits 0, so an rc of 2
   additionally proves the guard fires before argv parsing.
+* A second case in that class restores `lib_portable.sh` and withholds only
+  `lib_lane_state.sh`, asserting the SECOND guard still fires and still names
+  itself. It is the positive half of the ordering pin: without it the negative
+  assertion above would be satisfied just as well by a lane-state guard that
+  had been deleted or softened to a silent degrade, so the pair would read as
+  an ordering contract while only pinning "one guard exists". The lane-state
+  guard's own primary coverage stays where task 3074 put it,
+  `orchestrator/tests/test_lane_state_lib.py::TestAuditReadsThroughTheLib`.
 * The amended `FAIL_LOUD_FRAGMENTS` entry `lib_portable.sh not found next to`,
   which replaces `lib_portable.sh: No such file`. That old fragment pinned a
   shape this delta makes unreachable for the only script that sources
