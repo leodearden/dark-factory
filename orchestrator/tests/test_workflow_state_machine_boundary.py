@@ -1227,14 +1227,14 @@ class TestBlockDispositionOneClassifierAndCompleteness:
     # own rows-8-9 `_make_steward`/`_make_escalation` module-level names.)
 
     @pytest.mark.asyncio
-    async def test_row10_steward_pre_triage_consults_shared_classifier(self, caplog):
+    async def test_row10_steward_pre_triage_consults_shared_classifier(self, caplog, tmp_path):
         import json
         import logging
 
         from shared.cli_invoke import AllAccountsCappedException
         from test_suggestion_triage import _make_escalation, _make_steward, _make_suggestions
 
-        steward = _make_steward()
+        steward = _make_steward(worktree=tmp_path / 'wt')
         suggestions = _make_suggestions(15)
         escalation = _make_escalation(detail=json.dumps(suggestions))
         cap_exc = AllAccountsCappedException(
