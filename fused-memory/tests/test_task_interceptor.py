@@ -6417,25 +6417,55 @@ class TestSubmitTaskGuardrail:
 # ---------------------------------------------------------------------------
 
 
+def _two_project_registry(tmp_path):
+    """Reify (``crates/``) + dark-factory (``fused-memory/``).
+
+    ONE builder shared by every class below, so the prefix layout their
+    assertions assume cannot drift between copies.  ``exist_ok=True`` so a
+    test may build the registry once for an inline anti-vacuity assertion
+    and let a helper build it again.
+    """
+    from fused_memory.middleware.project_prefix_registry import (
+        ProjectPrefixRegistry,
+    )
+
+    (tmp_path / 'reify').mkdir(exist_ok=True)
+    (tmp_path / 'reify' / 'crates').mkdir(exist_ok=True)
+    (tmp_path / 'dark-factory').mkdir(exist_ok=True)
+    (tmp_path / 'dark-factory' / 'fused-memory').mkdir(exist_ok=True)
+    return ProjectPrefixRegistry.from_roots(
+        [str(tmp_path / 'reify'), str(tmp_path / 'dark-factory')]
+    )
+
+
+async def _persisted_candidate_metadata(ticket_store, result):
+    """Read the persisted candidate blob's metadata back out of the store.
+
+    Asserts the submission actually produced a ticket first, so a caller
+    checking for the ABSENCE of an annotation cannot pass vacuously on a
+    submission that was rejected outright.
+    """
+    assert isinstance(result, dict)
+    assert 'error_type' not in result, f'Expected no error, got: {result}'
+    ticket_id = result.get('ticket', '')
+    assert ticket_id.startswith('tkt_'), f'Expected tkt_-prefixed ticket: {result}'
+
+    db = ticket_store._db
+    assert db is not None
+    cursor = await db.execute(
+        'SELECT candidate_json FROM tickets WHERE ticket_id = ?',
+        (ticket_id,),
+    )
+    row = await cursor.fetchone()
+    assert row is not None, f'Expected persisted row for {ticket_id!r}'
+    return json.loads(row['candidate_json']).get('metadata') or {}
+
+
 class TestSubmitTaskGuardrailMultiProject:
     """End-to-end coverage of the FILES-certain / PROSE-advisory split
     through the real ``submit_task`` persistence path (not just
     ``_path_guard_or_skip`` in isolation).
     """
-
-    @staticmethod
-    def _two_project_registry(tmp_path):
-        from fused_memory.middleware.project_prefix_registry import (
-            ProjectPrefixRegistry,
-        )
-
-        (tmp_path / 'reify').mkdir()
-        (tmp_path / 'reify' / 'crates').mkdir()
-        (tmp_path / 'dark-factory').mkdir()
-        (tmp_path / 'dark-factory' / 'fused-memory').mkdir()
-        return ProjectPrefixRegistry.from_roots(
-            [str(tmp_path / 'reify'), str(tmp_path / 'dark-factory')]
-        )
 
     @pytest.mark.asyncio
     async def test_prose_hit_with_registry_persists_ticket_with_advisory_metadata(
@@ -6457,7 +6487,7 @@ class TestSubmitTaskGuardrailMultiProject:
         here is ticket PERSISTENCE of the marker, so the metadata was dropped
         rather than the assertions inverted.
         """
-        interceptor_with_store._prefix_registry = self._two_project_registry(tmp_path)
+        interceptor_with_store._prefix_registry = _two_project_registry(tmp_path)
 
         try:
             # Task 3120: the multi-segment spelling is deliberate — this test
@@ -6471,25 +6501,10 @@ class TestSubmitTaskGuardrailMultiProject:
         finally:
             await _cancel_interceptor_workers(interceptor_with_store)
 
-        assert isinstance(result, dict)
-        assert 'error_type' not in result, f'Expected no error, got: {result}'
-        ticket_id = result.get('ticket', '')
-        assert ticket_id.startswith('tkt_'), f'Expected tkt_-prefixed ticket, got: {result}'
-
-        db = ticket_store._db
-        assert db is not None
-        cursor = await db.execute(
-            'SELECT candidate_json FROM tickets WHERE ticket_id = ?',
-            (ticket_id,),
-        )
-        row = await cursor.fetchone()
-        assert row is not None, f'Expected persisted row for {ticket_id!r}'
-
-        blob = json.loads(row['candidate_json'])
-        meta = blob.get('metadata') or {}
+        meta = await _persisted_candidate_metadata(ticket_store, result)
         marker = meta.get('possible_scope_mismatch')
         assert marker is not None, (
-            f'Expected possible_scope_mismatch in blob metadata: {blob!r}'
+            f'Expected possible_scope_mismatch in blob metadata: {meta!r}'
         )
         assert marker['matched_paths'] == ['fused-memory/']
         assert marker['suggested_project'] == 'dark_factory'
@@ -6514,7 +6529,7 @@ class TestSubmitTaskGuardrailMultiProject:
         dark_factory file), which is NOT all-foreign and stays a hard reject.
         The offending foreign path is still the only entry in matched_paths.
         """
-        interceptor_with_store._prefix_registry = self._two_project_registry(tmp_path)
+        interceptor_with_store._prefix_registry = _two_project_registry(tmp_path)
 
         try:
             result = await interceptor_with_store.submit_task(
@@ -6564,7 +6579,7 @@ class TestSubmitTaskGuardrailMultiProject:
         so this is a FILES-certain hard reject and not the task-3004 cross-repo
         allow-and-tag path, matching the sibling test's documented rationale.
         """
-        registry = self._two_project_registry(tmp_path)
+        registry = _two_project_registry(tmp_path)
         interceptor_with_store._prefix_registry = registry
         df_root = registry.root_for_project('dark_factory')
         assert df_root is not None
@@ -7005,12 +7020,9 @@ class TestProseRightBoundarySignal:
 # signals, not on incidental prose path tokens.
 #
 # Prose lexing cannot distinguish "modifies X" from "merely cites X"; a
-# declared deliverable can. When a submission declares at least one
-# file/module owned by the FILING project, a foreign path in its prose is an
-# incidental citation, so BOTH the possible_scope_mismatch stamp and the
-# advisory escalation are suppressed. With no declared deliverable, or only
-# UNOWNED ones, there is no positive attribution and the advisory fires
-# exactly as before — that is where the guard's real protection lives.
+# declared deliverable can, so it is the better signal and wins. The exact
+# rule lives with the code — see path_scope_guard's module docstring
+# (outcome 3 of the canonical taxonomy) and local_attesting_signals.
 # ---------------------------------------------------------------------------
 
 
@@ -7028,28 +7040,9 @@ class TestProseAdvisoryDeliverableAttribution:
     # is the declared deliverable.
     _FOREIGN_PROSE = 'Mirror the logic in crates/reify-eval/src/engine_edit.rs'
 
-    @staticmethod
-    def _two_project_registry(tmp_path):
-        """Reify (crates/) + dark-factory (fused-memory/).
-
-        ``exist_ok=True`` so a test may build the registry once for an
-        inline anti-vacuity assertion and let ``_submit`` build it again.
-        """
-        from fused_memory.middleware.project_prefix_registry import (
-            ProjectPrefixRegistry,
-        )
-
-        (tmp_path / 'reify').mkdir(exist_ok=True)
-        (tmp_path / 'reify' / 'crates').mkdir(exist_ok=True)
-        (tmp_path / 'dark-factory').mkdir(exist_ok=True)
-        (tmp_path / 'dark-factory' / 'fused-memory').mkdir(exist_ok=True)
-        return ProjectPrefixRegistry.from_roots(
-            [str(tmp_path / 'reify'), str(tmp_path / 'dark-factory')]
-        )
-
     async def _submit(self, interceptor, tmp_path, metadata=None):
         """Submit the foreign-prose task under dark_factory; return (result, calls)."""
-        registry = self._two_project_registry(tmp_path)
+        registry = _two_project_registry(tmp_path)
         interceptor._prefix_registry = registry
 
         # Anti-vacuity: the prose really does still lex as a foreign-path hit.
@@ -7085,24 +7078,6 @@ class TestProseAdvisoryDeliverableAttribution:
             await _cancel_interceptor_workers(interceptor)
         return result, calls
 
-    @staticmethod
-    async def _persisted_meta(ticket_store, result):
-        """Read the persisted candidate blob's metadata back out of the store."""
-        assert isinstance(result, dict)
-        assert 'error_type' not in result, f'Expected no error, got: {result}'
-        ticket_id = result.get('ticket', '')
-        assert ticket_id.startswith('tkt_'), f'Expected tkt_-prefixed ticket: {result}'
-
-        db = ticket_store._db
-        assert db is not None
-        cursor = await db.execute(
-            'SELECT candidate_json FROM tickets WHERE ticket_id = ?',
-            (ticket_id,),
-        )
-        row = await cursor.fetchone()
-        assert row is not None, f'Expected persisted row for {ticket_id!r}'
-        return json.loads(row['candidate_json']).get('metadata') or {}
-
     # -- SUPPRESSION: a locally-owned declared deliverable attests ----------
 
     @pytest.mark.asyncio
@@ -7116,7 +7091,7 @@ class TestProseAdvisoryDeliverableAttribution:
             metadata={'files': ['fused-memory/src/x.py']},
         )
 
-        meta = await self._persisted_meta(ticket_store, result)
+        meta = await _persisted_candidate_metadata(ticket_store, result)
         assert 'possible_scope_mismatch' not in meta, (
             f'A declared filer-owned deliverable must suppress the stamp: {meta!r}'
         )
@@ -7137,7 +7112,7 @@ class TestProseAdvisoryDeliverableAttribution:
             metadata={'modules': ['fused-memory/src/fused_memory/middleware']},
         )
 
-        meta = await self._persisted_meta(ticket_store, result)
+        meta = await _persisted_candidate_metadata(ticket_store, result)
         assert 'possible_scope_mismatch' not in meta, f'got: {meta!r}'
         assert calls == [], f'got: {calls!r}'
 
@@ -7151,7 +7126,7 @@ class TestProseAdvisoryDeliverableAttribution:
             metadata={'files_to_modify': ['fused-memory/src/x.py']},
         )
 
-        meta = await self._persisted_meta(ticket_store, result)
+        meta = await _persisted_candidate_metadata(ticket_store, result)
         assert 'possible_scope_mismatch' not in meta, f'got: {meta!r}'
         assert calls == [], f'got: {calls!r}'
 
@@ -7167,7 +7142,7 @@ class TestProseAdvisoryDeliverableAttribution:
         declared' must not be enough, or a genuinely misrouted task can buy
         silence with a README.md.
         """
-        registry = self._two_project_registry(tmp_path)
+        registry = _two_project_registry(tmp_path)
         assert registry.project_for_path('README.md') is None, (
             'README.md must be UNOWNED or this test proves nothing'
         )
@@ -7176,7 +7151,7 @@ class TestProseAdvisoryDeliverableAttribution:
             interceptor_with_store, tmp_path, metadata={'files': ['README.md']},
         )
 
-        meta = await self._persisted_meta(ticket_store, result)
+        meta = await _persisted_candidate_metadata(ticket_store, result)
         marker = meta.get('possible_scope_mismatch')
         assert marker is not None, f'Expected the advisory stamp to fire: {meta!r}'
         assert marker['matched_paths'] == ['crates/']
@@ -7201,7 +7176,7 @@ class TestProseAdvisoryDeliverableAttribution:
         foreign work would get neither the reject nor the advisory it used to
         get.
         """
-        registry = self._two_project_registry(tmp_path)
+        registry = _two_project_registry(tmp_path)
         # Anti-vacuity: the foreign entry IS classified to the other project,
         # and the hard reject demonstrably does NOT see it (files shadows it).
         assert registry.project_for_path('crates/widget.rs') == 'reify'
@@ -7220,7 +7195,7 @@ class TestProseAdvisoryDeliverableAttribution:
         # Still CREATED — the veto only declines to suppress; it never
         # promotes the advisory into a rejection (task 2206 blast radius
         # unchanged).
-        meta = await self._persisted_meta(ticket_store, result)
+        meta = await _persisted_candidate_metadata(ticket_store, result)
         marker = meta.get('possible_scope_mismatch')
         assert marker is not None, (
             f'A foreign {foreign_key} entry must veto the suppression: {meta!r}'
@@ -7237,7 +7212,7 @@ class TestProseAdvisoryDeliverableAttribution:
         """No metadata at all → no attribution → the advisory is unchanged."""
         result, calls = await self._submit(interceptor_with_store, tmp_path)
 
-        meta = await self._persisted_meta(ticket_store, result)
+        meta = await _persisted_candidate_metadata(ticket_store, result)
         marker = meta.get('possible_scope_mismatch')
         assert marker is not None, f'Expected the advisory stamp to fire: {meta!r}'
         assert marker['matched_paths'] == ['crates/']
@@ -7282,7 +7257,7 @@ class TestProseAdvisoryDeliverableAttribution:
                 metadata={'files': ['fused-memory/src/x.py']},
             )
 
-        meta = await self._persisted_meta(ticket_store, result)
+        meta = await _persisted_candidate_metadata(ticket_store, result)
         assert 'possible_scope_mismatch' not in meta
         assert calls == []
 
@@ -7319,7 +7294,7 @@ class TestProseAdvisoryDeliverableAttribution:
                 interceptor_with_store, tmp_path, metadata={'files': ['README.md']},
             )
 
-        meta = await self._persisted_meta(ticket_store, result)
+        meta = await _persisted_candidate_metadata(ticket_store, result)
         assert meta.get('possible_scope_mismatch') is not None
         assert len(calls) == 1
 
@@ -7507,17 +7482,11 @@ class TestExtractDeliverableSignals:
 
     Deliberately DIVERGES from _extract_meta_files: it takes the UNION of
     ``files`` ∪ ``files_to_modify`` ∪ ``modules`` rather than the
-    files-over-files_to_modify PRECEDENCE, and it is a separate helper
-    rather than a widening of _extract_meta_files_from_meta.
-
-    Why the divergence is safe in one direction only: _extract_meta_files
-    feeds the FILES-CERTAIN hard reject (check_files_for_scope) and the
-    cross-repo tagger (all_files_foreign_owner), where ONE authoritative
-    declared list is wanted and where admitting ``modules`` would make a
-    foreign lock-key entry start hard-REJECTING submissions.  This union
-    feeds ONLY the prose-advisory attribution suppression, reached solely
-    after the hard reject already returned ``ok`` — so a wider signal set
-    here can only ever suppress an advisory, never weaken a rejection.
+    files-over-files_to_modify PRECEDENCE, and is a separate helper rather
+    than a widening of it — the helper's own docstring carries why, and
+    local_attesting_signals carries how the extra keys are then treated.
+    These tests pin the union shape, the coercion rules, and the
+    warn-and-discard degrade on malformed values.
     """
 
     def test_files_key_only(self):

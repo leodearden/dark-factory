@@ -804,15 +804,10 @@ class TestAllFilesForeignOwner:
 class TestLocalDeliverableAttested:
     """Unit tests for local_deliverable_attested — the POSITIVE attribution.
 
-    Structural mirror of all_files_foreign_owner and its exact logical
-    complement: that function asks "is EVERY owned entry foreign under ONE
-    owner", this asks "is ANY entry local".  The two can therefore never
-    both fire on the same signal set.
-
-    Classification goes through the CERTAIN ``project_for_path`` lookup (not
-    the heuristic ``find_paths``), so bare directory entries and absolute
-    spellings attest correctly where the prose scanner's right-boundary
-    assertion (task 3120) would miss them.
+    Gate for outcome (3) of the taxonomy in this module's docstring, which
+    is the canonical statement of it; the function's own docstring carries
+    the two conditions attestation requires.  These tests pin the boundaries
+    of each: which entries attest, which are neutral, and which veto.
     """
 
     def test_one_locally_owned_entry_attests(self, tmp_path):
