@@ -721,3 +721,139 @@ def test_exec_start_flag_helper_reads_the_parsed_value():
     assert mod._exec_start_flag(parsed, "timeout-keep-alive") == "5"
     assert mod._exec_start_flag(parsed, "workers") is None
     assert mod._exec_start_flag({}, "host") is None
+
+
+# ---------------------------------------------------------------------------
+# The UNITS registry and its staleness guard  (step-11 / step-12)
+# ---------------------------------------------------------------------------
+#
+# These read REPO-side files only — never ~/.config/systemd/user/ — so they
+# stay green on a host whose installed units are drifted (which this one is,
+# deliberately, until task 3289 lands) and on CI, which has no installed units
+# at all.
+
+_DASHBOARD_SERVICE = "dark-factory-dashboard.service"
+_WATCHDOG_SERVICE = "dark-factory-dashboard-watchdog.service"
+_WATCHDOG_TIMER = "dark-factory-dashboard-watchdog.timer"
+
+
+def test_units_registry_covers_exactly_the_three_dashboard_units():
+    """The registry names the three units the task enumerates, and no others."""
+    mod = _load_checker()
+
+    assert set(mod.UNITS) == {_DASHBOARD_SERVICE, _WATCHDOG_SERVICE, _WATCHDOG_TIMER}
+    for name, spec in mod.UNITS.items():
+        assert spec.name == name, f"UNITS key {name!r} disagrees with spec.name {spec.name!r}"
+
+
+def test_units_registry_repo_paths_all_exist():
+    """Every repo_relpath resolves to a real committed file."""
+    mod = _load_checker()
+
+    for name, spec in mod.UNITS.items():
+        path = REPO_ROOT / spec.repo_relpath
+        assert path.is_file(), f"{name}: repo_relpath {spec.repo_relpath} does not exist"
+
+
+def test_registry_keys_are_all_declared_in_the_committed_units():
+    """STALENESS GUARD: every registered key really exists in the repo unit.
+
+    Without this, a typo'd or obsoleted key silently checks NOTHING — the
+    directive is absent from both copies, so it compares equal forever and the
+    gate rots into a no-op that still reports green. That failure mode is
+    invisible by construction, which is exactly why it needs its own test.
+
+    Note this guards KEYS, not values. Expected values are read from the repo
+    unit at run time by design, so there is no third copy of them to go stale.
+    """
+    mod = _load_checker()
+
+    for name, spec in mod.UNITS.items():
+        parsed = mod.parse_unit_directives(
+            (REPO_ROOT / spec.repo_relpath).read_text(encoding="utf-8")
+        )
+        for section, key in tuple(spec.compared) + tuple(spec.present_only):
+            assert key in parsed.get(section, {}), (
+                f"{name}: registry lists [{section}] {key}, but the committed "
+                f"unit {spec.repo_relpath} does not declare it — the entry "
+                "checks nothing. Fix the registry or the unit."
+            )
+
+
+def test_registry_exec_start_flags_are_really_on_the_committed_command():
+    """STALENESS GUARD, flag edition: each registered flag is on the real command."""
+    mod = _load_checker()
+
+    for name, spec in mod.UNITS.items():
+        if not spec.exec_start_flags:
+            continue
+        parsed = mod.parse_unit_directives(
+            (REPO_ROOT / spec.repo_relpath).read_text(encoding="utf-8")
+        )
+        for flag in spec.exec_start_flags:
+            assert mod._exec_start_flag(parsed.get("Service", {}), flag) is not None, (
+                f"{name}: registry compares --{flag}, but it is absent from the "
+                f"committed ExecStart in {spec.repo_relpath} — the entry checks nothing."
+            )
+
+
+def test_registry_environment_sections_really_declare_environment():
+    """STALENESS GUARD, Environment edition."""
+    mod = _load_checker()
+
+    for name, spec in mod.UNITS.items():
+        if spec.environment_section is None:
+            continue
+        parsed = mod.parse_unit_directives(
+            (REPO_ROOT / spec.repo_relpath).read_text(encoding="utf-8")
+        )
+        assert "Environment" in parsed.get(spec.environment_section, {}), (
+            f"{name}: registry compares Environment= in "
+            f"[{spec.environment_section}], but the committed unit declares none."
+        )
+
+
+def test_dashboard_service_spec_pins_the_tasks_minimum_coverage():
+    """The dashboard service compares the restart directives and 3306's flags."""
+    mod = _load_checker()
+    spec = mod.UNITS[_DASHBOARD_SERVICE]
+
+    compared_keys = {key for _section, key in spec.compared}
+    assert {"Restart", "RestartSec", "TimeoutStopSec"} <= compared_keys, compared_keys
+    assert {"timeout-graceful-shutdown", "timeout-keep-alive"} <= set(spec.exec_start_flags)
+
+
+def test_watchdog_service_spec_compares_the_whole_tick_bound():
+    """TimeoutStartSec is 3308's bound on the whole watchdog tick."""
+    mod = _load_checker()
+    spec = mod.UNITS[_WATCHDOG_SERVICE]
+
+    assert ("Service", "TimeoutStartSec") in spec.compared
+
+
+def test_watchdog_timer_spec_compares_the_cadence():
+    """The timer cadence is load-bearing, not a free knob.
+
+    The watchdog requires FAIL_STREAK (=3) consecutive failed probes, so
+    3 x OnUnitActiveSec sets the ~90s sustained-outage detection latency. An
+    installed timer that drifted to a different interval would silently change
+    that latency in the same proportion.
+    """
+    mod = _load_checker()
+    spec = mod.UNITS[_WATCHDOG_TIMER]
+
+    compared_keys = {key for _section, key in spec.compared}
+    assert {"OnBootSec", "OnUnitActiveSec"} <= compared_keys, compared_keys
+
+
+def test_repo_units_are_at_parity_with_themselves():
+    """Every spec compares a unit to itself with zero drift.
+
+    A sanity check on the registry as a whole: if any branch mis-handled a
+    real unit's shape, comparing a file to itself would still report drift.
+    """
+    mod = _load_checker()
+
+    for name, spec in mod.UNITS.items():
+        text = (REPO_ROOT / spec.repo_relpath).read_text(encoding="utf-8")
+        assert mod.compare_unit(spec, text, text) == [], f"{name} drifts against itself"
