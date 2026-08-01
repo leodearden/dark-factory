@@ -434,7 +434,7 @@ PLAN_QUALITY_SCHEMA = {
 
 
 async def judge_plan_quality(
-    plan: dict,
+    plan: dict | None,
     reference_diff: str,
     task: dict,
     rubric: dict[str, Any] = PLAN_QUALITY_RUBRIC,
@@ -450,6 +450,34 @@ async def judge_plan_quality(
     semantic judge scores the SAME named structural signals
     :func:`score_plan_structure` weights deterministically.
 
+    THE ANTI-FABRICATION FLOOR APPLIES UNIFORMLY, WHICHEVER SCORING PATH RUNS
+    (task 3303). An artifact that is not :func:`is_scorable_plan` carries
+    nothing to judge, so this function refuses it up front — before a prompt is
+    built, before ``invoke_agent`` — and returns the deterministic floor
+    instead. The guard is the SAME predicate :func:`score_plan_structure`
+    short-circuits on and ``run_architect_eval`` gates on, so the three cannot
+    drift; and the refusal's score is DERIVED by calling
+    :func:`score_plan_structure` — with THIS call's own *rubric*, not the module
+    default — rather than hardcoding ``0.0``, so a future change to the floor's
+    semantics (including a rubric-sensitive one) carries this path with it
+    structurally rather than by convention. Without it, this instrument's
+    coherence rested entirely on its ONE caller remembering to gate, and any
+    second caller (a backfill/re-scoring script, a new eval path, ``prompt_opt``,
+    a resume wave) silently re-opened the reported defect: the 2026-07-29 cell
+    ``reify_task_12__architect-opus-high__52c66767.json`` records
+    ``plan_steps=0`` alongside ``plan_quality=0.31`` — a value the floor cannot
+    even express (its outputs are multiples of ``0.125``), so it can only have
+    come from an ungated judge scoring an empty artifact.
+
+    That refusal is ``plan_quality=0.0``-not-``None`` DELIBERATELY: ``None``
+    means "no judgement available, degrade to the floor" (parse failure /
+    transport refusal), whereas here the judgement is definite and no infra
+    failure occurred. ``invocation_error`` stays ``None`` for the same reason —
+    nothing was refused at the transport layer. Keeping the two apart preserves
+    the content-failure / infra-failure distinction tasks 3118 and 3302 turn on:
+    a stepless plan from a healthy architect is a real reliability signal worth
+    ``0.0``, never a cap-tainted exclusion.
+
     On any parse failure the verdict's ``plan_quality`` is ``None`` (the
     sentinel :func:`run_architect_eval` degrades on), never a crash. When the
     judge's OWN invocation was refused at the transport layer (a 429 cap hit /
@@ -458,6 +486,47 @@ async def judge_plan_quality(
     still degrades to the deterministic structural floor, which remains a
     legitimate content-derived score whenever a real plan exists.
     """
+    if not is_scorable_plan(plan):
+        # THIS call's rubric, not the module default. Today the floor
+        # short-circuits on ``is_scorable_plan`` before it ever reads a rubric,
+        # so every rubric yields 0.0 here and the argument is inert — but
+        # dropping it would make "the score is DERIVED from the floor" true of
+        # only ONE of the floor's two arguments, and would silently re-open the
+        # two-instrument disagreement 3303 closes the day that short-circuit
+        # becomes rubric-sensitive (a rubric-defined minimum, or criteria that
+        # change what "unscorable" means).
+        floor = score_plan_structure(plan, rubric=rubric)
+        # Name WHICH cell to go look at, whichever key the caller populated:
+        # ``run_architect_eval`` passes ``id``, but a second caller — precisely
+        # the scenario this guard defends against — may carry only ``name``
+        # (``run_judge`` and the prompt builder below both key off ``name``
+        # first). Falling through absent AND empty values means a malformed
+        # task dict degrades the log line rather than turning an
+        # anti-fabrication guard into a crash.
+        cell = task.get('id') or task.get('name') or 'unknown'
+        # LOUD, not a silent 0.0: reaching here means a caller did NOT gate,
+        # which is exactly how the reported cell was written. WARNING matches
+        # ``run_architect_eval``'s own no-scorable-plan log and the
+        # transport-refusal log below — an expected-but-notable degradation,
+        # not an error. It cannot double-log through the normal path because
+        # the runner's own ``is_scorable_plan`` gate short-circuits before the
+        # judge is ever awaited.
+        logger.warning(
+            f'Plan judge asked to score an UNJUDGEABLE artifact for {cell}: '
+            f'the plan carries no steps '
+            f'(is_scorable_plan=False) — LLM judge SKIPPED, scored on the '
+            f'deterministic structural floor ({floor}). The caller did not '
+            f'gate; run_architect_eval does (task 3302/3303).'
+        )
+        return PlanQualityVerdict(
+            plan_quality=floor,
+            per_criterion={},
+            reasoning=(
+                'plan carries no steps — not a judgeable artifact; scored on '
+                f'the deterministic structural floor ({floor})'
+            ),
+        )
+
     task_name = task.get('name', task.get('id', 'unknown'))
     task_desc = task.get('task_definition', {}).get('description', '')
 

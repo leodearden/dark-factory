@@ -497,11 +497,13 @@ async def run_architect_eval(
     ground truth since ζ fixtures frequently carry ``plan: null``), degrading to
     the deterministic :func:`score_plan_structure` floor on ANY judge failure.
     The judge is reached only for a plan that is
-    :func:`~orchestrator.evals.judge.is_scorable_plan` (task 3302): it has no
-    scorability guard of its own, so on a stepless artifact it can return a
-    confident nonzero score for the very shape ``score_plan_structure``
-    short-circuits to 0.0 — persisting a cell whose ``plan_steps=0``
-    contradicts its own ``plan_quality``.
+    :func:`~orchestrator.evals.judge.is_scorable_plan` (task 3302), and the
+    judge REFUSES such an artifact itself (task 3303) — defense in depth around
+    one predicate. Left ungated, an LLM judge returns a confident nonzero score
+    for the very shape ``score_plan_structure`` short-circuits to 0.0,
+    persisting a cell whose ``plan_steps=0`` contradicts its own
+    ``plan_quality``; with both the call site and the instrument consulting
+    ``is_scorable_plan``, no caller can write that cell.
 
     ``plan_quality`` is therefore a non-sentinel float whenever the architect
     was actually ASKED — with ONE deliberate exception (task 3118): when the
@@ -542,7 +544,9 @@ async def run_architect_eval(
       real reliability signal, not an infra failure. When the plan is stepless
       the LLM judge is SKIPPED and the structural floor (0.0) is persisted
       directly, so the score can never be the judge's opinion of an artifact
-      that carries nothing to judge (task 3302).
+      that carries nothing to judge (task 3302 gates here; task 3303 makes
+      :func:`~orchestrator.evals.judge.judge_plan_quality` refuse it too, so
+      the guarantee no longer depends on this call site alone).
     - **Refusal of the JUDGE alone** → recorded in ``invocation_error``
       (prefixed ``judge:``) but does NOT taint: the structural floor is still
       derived from a real produced plan.
@@ -755,20 +759,28 @@ async def run_architect_eval(
             f'scored on the structural floor ({plan_quality}), NOT tainted'
         )
     elif not is_scorable_plan(plan):
-        # The architect ran FINE and produced nothing worth scoring. The LLM
-        # judge has no scorability guard of its own — it returns whatever the
-        # model says in [0, 1] — while score_plan_structure short-circuits a
-        # stepless artifact to 0.0 as a deliberate ANTI-FABRICATION guard
-        # (Graphiti e2066ec6). Trusting the judge here writes a cell whose own
-        # plan_steps=0 CONTRADICTS its score, which is the shape the report-layer
-        # floor (metrics.produced_a_plan, task 3302) has to defend the existing
-        # corpus against. Gating at the source keeps plan_steps and the persisted
-        # plan_quality consistent for every NEW cell.
+        # The architect ran FINE and produced nothing worth scoring, so the
+        # deterministic ANTI-FABRICATION floor (Graphiti e2066ec6) applies:
+        # score_plan_structure short-circuits a stepless artifact to 0.0, and an
+        # LLM opinion of that artifact would write a cell whose own plan_steps=0
+        # CONTRADICTS its score — the shape the report-layer floor
+        # (metrics.produced_a_plan, task 3302) has to defend the existing corpus
+        # against.
         #
-        # The judge is skipped rather than invoked-and-discarded, on the
-        # arch_unmeasurable branch's own justification: it has nothing to judge,
-        # inside a cap window it would 429 anyway, and an opus call on an
-        # unjudgeable artifact is pure waste.
+        # judge_plan_quality now refuses such an artifact ITSELF and returns the
+        # same floor (task 3303), so this gate is no longer the sole correctness
+        # guarantee — but it remains LOAD-BEARING, for three things the
+        # instrument-level guard cannot do from where it stands:
+        #   1. the taint decision below (NOT tainted: a content failure, not the
+        #      3118 "we never got to ask" exclusion),
+        #   2. the log line naming task_id × config.name, which the judge cannot
+        #      see, and
+        #   3. skipping the async call and the reference-diff-bearing prompt
+        #      entirely, on the arch_unmeasurable branch's own justification:
+        #      nothing to judge, a 429 inside a cap window anyway, and an opus
+        #      call on an unjudgeable artifact is pure waste.
+        # Both gates consult the ONE is_scorable_plan predicate, which is the
+        # point: they cannot drift into disagreeing about what a plan is.
         #
         # NOT tainted: no infra failure occurred. This is a CONTENT failure and
         # must keep scoring on content — a genuine 0.0, distinct from the

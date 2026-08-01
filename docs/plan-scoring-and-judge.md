@@ -731,14 +731,23 @@ conservative or the insertion point is wrong. Debug before expanding.
 an architect actually produced a plan, that is the question it asks, via
 `metrics.produced_a_plan(metrics_dict)`.
 
-**Why not `plan_quality > 0`.** The two plan scorers disagree exactly on a
+**Why not `plan_quality > 0`.** The two plan scorers *disagreed* exactly on a
 stepless artifact. `judge.score_plan_structure` returns `0.0` for one as a
 deliberate anti-fabrication guard (through `judge.is_scorable_plan`, which also
-catches the truthy header-only stub `create_plan` writes). The LLM plan judge
-has no such guard and can score the same artifact `0.95`. So `plan_quality` is
-the number being *decided*, not evidence for the decision — using it as the
-predicate makes a no-plan cell certify itself. Recorded in Graphiti episode
-`e2066ec6` (edges `23d9c24f` / `8092af24`).
+catches the truthy header-only stub `create_plan` writes); the LLM plan judge
+had no such guard and scored the same artifact confidently. Observed in the
+2026-07-29 corpus cell
+`reify_task_12__architect-opus-high__52c66767.json`: `plan_steps=0` alongside
+`plan_quality=0.31`. That number cannot have come from the floor at all —
+`PLAN_QUALITY_RUBRIC`'s weights sum to `8.0` and the floor returns
+`round(satisfied_weight / 8, 4)`, so its outputs are multiples of `0.125` and
+`0.31` is not one. It came from the ungated judge.
+
+**That disagreement is now closed at the instrument (task 3303)** — see below —
+but the rule stands regardless, and for a reason independent of the fix:
+`plan_quality` is the number being *decided*, so it can never be evidence for
+the decision. Using it as the predicate makes a no-plan cell certify itself.
+Recorded in Graphiti episode `e2066ec6` (edges `23d9c24f` / `8092af24`).
 
 **Why not `outcome == 'done'`.** Done-without-a-plan and blocked-with-a-good-plan
 cells both occur — task 2863 AMENDMENT §1.
@@ -766,10 +775,54 @@ outranked a config that produced a real 6-step plan at `0.26`, and survived
 composite hard gate — the plan-only analogue of the workflow `tests_pass` gate,
 closing the cross-group route.
 
-**Fixed at both ends.** `run_architect_eval` gates the LLM judge on
-`is_scorable_plan` so no new incoherent cell is written; `report._plan_quality_score`
-floors at read time because the whole 2026-07-27 corpus is already on disk
-carrying the old shape.
+**Fixed at all three points.**
+
+| Point | Fix | Task |
+|---|---|---|
+| The **instrument** | `judge_plan_quality` refuses a non-`is_scorable_plan` artifact up front — before a prompt is built, before `invoke_agent` — and returns the floor's own value | 3303 |
+| The **writer** | `run_architect_eval` gates the judge call site on `is_scorable_plan`, so no new incoherent cell is written | 3302 |
+| The **reader** | `report._plan_quality_score` floors a no-plan cell at read time, because the 2026-07-27 / 07-29 corpus is already on disk carrying the old shape | 3302 |
+
+### The anti-fabrication floor applies uniformly (task 3303)
+
+Gating only the writer left the instrument's coherence resting entirely on its
+ONE caller remembering to gate — so a second caller (a backfill/re-scoring
+script, a new eval path, `prompt_opt`, a resume wave) would silently re-open the
+defect above. **The floor therefore applies to whichever scoring path runs, and
+is enforced AT the instrument**, using the same `is_scorable_plan` predicate the
+floor short-circuits on and the runner gates on. Three call sites, one
+predicate: they cannot drift into disagreeing about what a plan is, which is the
+argument `is_scorable_plan`'s own docstring records for the level below.
+
+Three details are load-bearing:
+
+- **The refusal's score is DERIVED**, `score_plan_structure(plan)`, never a
+  hardcoded `0.0`. A literal would be a third independent statement of what an
+  unjudgeable artifact is worth, free to diverge if the floor's semantics ever
+  change. Deriving it is what lets the test assert the identity
+  `verdict.plan_quality == score_plan_structure(plan)` rather than a magic
+  number.
+- **`0.0`, not the `None` sentinel.** `None` means "no judgement available,
+  degrade to the floor" — the parse-failure / transport-refusal signal.  A
+  stepless plan from a healthy architect is a definite content verdict worth
+  `0.0`, so `invocation_error` stays `None` too; conflating the two would
+  collapse the content-failure / infra-failure distinction tasks 3118 and 3302
+  both turn on.
+- **The refusal is logged at WARNING.** Reaching it means a caller did not gate.
+  It cannot double-log through the normal path (the runner's gate
+  short-circuits first), so the record stays rare and means exactly one thing.
+
+The runner-side gate is *not* redundant now: it still owns the taint decision,
+the `task_id × config.name` log line, and the skipped opus call — it simply
+stops being the sole correctness guarantee.
+
+**Known remaining asymmetry, filed as follow-up:** `judge_plan_quality` does
+`float(raw_quality)` with no clamp, while `score_plan_structure` returns
+`round(min(max(score, 0.0), 1.0), 4)`. `PLAN_QUALITY_SCHEMA` declares
+`minimum`/`maximum`, but the `json.loads(result.output)` fallback path bypasses
+schema enforcement, so an out-of-range judge score would persist verbatim. That
+is a *range* invariant rather than the anti-fabrication floor, deliberately left
+out of 3303's scope rather than overlooked.
 
 **Prior art in-repo — this makes the pipeline agree with surfaces that already
 got it right:** `scripts/eval_bootstrap_smoke.sh` gates its smoke on

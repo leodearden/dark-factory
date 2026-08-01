@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -699,6 +700,188 @@ class TestJudgePlanQuality:
 
 
 # ---------------------------------------------------------------------------
+# The plan judge REFUSES an unjudgeable artifact (task 3303)
+#
+# The reported defect, from the 2026-07-29 corpus cell
+# ``reify_task_12__architect-opus-high__52c66767.json``: ``plan_steps=0``
+# alongside ``plan_quality=0.31`` — an artifact carrying NOTHING to judge,
+# scored a confident-looking third of a point. That number cannot have come
+# from the deterministic floor at all: PLAN_QUALITY_RUBRIC's weights sum to
+# 8.0 and score_plan_structure returns ``round(satisfied_weight / 8, 4)``, so
+# its outputs are multiples of 0.125 and 0.31 is not one. It came from the LLM
+# judge, which scored an empty artifact because it had no scorability guard of
+# its own — its coherence rested ENTIRELY on its one caller remembering to gate.
+#
+# Task 3302 closed the two OUTER halves: the CALL SITE (run_architect_eval
+# gates on is_scorable_plan) and the READER (report._plan_quality_score floors
+# an on-disk no-plan cell). This class pins the INSTRUMENT itself, so a second
+# caller — a backfill/re-scoring script, a new eval path, prompt_opt, a resume
+# wave — cannot silently re-open the same defect.
+#
+# Parametrized over the SHARED _UNSCORABLE_PLAN_SHAPES corpus (line 103), the
+# same list TestIsScorablePlan uses: any shape added to the predicate's corpus
+# automatically extends the judge path's coverage, so the two instruments can
+# never be tested out of step with each other.
+#
+# ONE call per shape pins every property of the refusal, because they are four
+# independent facts about a single return value from a single code path — and
+# the CONTROL carries the only falsifiable half of the coherence identity
+# ``plan_quality == score_plan_structure(plan)``: over the unscorable corpus
+# both sides are 0.0 by construction (score_plan_structure short-circuits on
+# the very predicate the guard consults), so it is only on a SCORABLE plan,
+# where the judge is consulted and the floor is not, that the two instruments
+# have a degree of freedom to disagree at all.
+# ---------------------------------------------------------------------------
+
+def _confident_judge_result() -> MagicMock:
+    """What the UNGATED judge really does with an artifact carrying no content.
+
+    A high, confident-looking score with per-criterion detail — at the call
+    site indistinguishable from a real judgement of a real plan. This is the
+    payload the guard must never let through.
+    """
+    payload = {
+        'plan_quality': 0.95,
+        'per_criterion': {'has_steps': 1.0},
+        'reasoning': 'looks fine',
+    }
+    fake = MagicMock()
+    fake.structured_output = payload
+    fake.output = json.dumps(payload)
+    return fake
+
+
+async def _judge_with_a_confident_llm(plan, task=None):
+    """Await ``judge_plan_quality`` on *plan* with the ungated judge mocked.
+
+    The fixture lives HERE, once: every test below differs only in the plan (or
+    task) it passes, so a future change to the judge's call signature is a
+    one-place edit rather than one per test. Returns the ``invoke_agent`` mock
+    alongside the verdict, since "was the LLM consulted at all?" is half of
+    what these tests pin.
+    """
+    from orchestrator.evals.judge import judge_plan_quality
+
+    with patch(
+        'orchestrator.evals.judge.invoke_agent',
+        AsyncMock(return_value=_confident_judge_result()),
+    ) as mock_invoke:
+        verdict = await judge_plan_quality(
+            plan, 'diff', _judge_task() if task is None else task,
+        )
+    return verdict, mock_invoke
+
+
+def _judge_warnings(caplog) -> list[str]:
+    """Every WARNING-or-worse message the judge module emitted, in order."""
+    return [
+        r.getMessage() for r in caplog.records
+        if r.name == 'orchestrator.evals.judge' and r.levelno >= logging.WARNING
+    ]
+
+
+@pytest.mark.asyncio
+class TestJudgePlanQualityRefusesAnUnjudgeableArtifact:
+    @pytest.mark.parametrize('plan', _UNSCORABLE_PLAN_SHAPES)
+    async def test_an_unjudgeable_artifact_is_refused_and_floored(self, plan, caplog):
+        """Every property of the refusal, on ONE judge call per artifact shape.
+
+        Deliberately one test rather than one per property: these are four
+        independent facts about a single return value from a single code path,
+        so splitting them would buy four copies of the fixture and four times
+        the invocations without covering anything more.
+        """
+        from orchestrator.evals.judge import score_plan_structure
+
+        caplog.set_level(logging.WARNING, logger='orchestrator.evals.judge')
+        verdict, mock_invoke = await _judge_with_a_confident_llm(plan)
+        floor = score_plan_structure(plan)
+
+        # The floor's own value, DERIVED — never the judge's confident 0.95.
+        assert verdict.plan_quality == floor == 0.0
+        # Nothing to judge, so no spend: the refusal happens BEFORE the prompt
+        # is built and before invoke_agent is awaited.
+        mock_invoke.assert_not_awaited()
+        # A definite CONTENT verdict: never the None sentinel (parse failure /
+        # transport refusal) and never the cap-tainted exclusion shape — the
+        # content-failure vs infra-failure distinction tasks 3118 and 3302 both
+        # turn on. A stepless plan from a healthy judge call is a REAL 0.0.
+        assert verdict.invocation_error is None
+        assert verdict.per_criterion == {}
+        # ``reasoning`` is the only part of this verdict a human reads off a
+        # persisted cell, so it must EXPLAIN the 0.0 rather than leave the cell
+        # indistinguishable from a judge that genuinely scored zero. Substance,
+        # not a prose pin.
+        assert 'no steps' in verdict.reasoning
+        assert str(floor) in verdict.reasoning
+        # LOUD, never a silent floor: reaching the guard means a caller did NOT
+        # gate — the precise situation that produced the reported artifact — so
+        # per the repo's loud-over-silent / structured-facts-at-failure
+        # invariant (docs/legibility/design-invariants.md) it leaves exactly one
+        # WARNING behind. Substance again, not exact prose: a wording-brittle
+        # pin would fail on any rephrase without indicating a behaviour change.
+        warnings = _judge_warnings(caplog)
+        assert len(warnings) == 1
+        assert 'df_task_2605' in warnings[0]       # WHICH cell to go look at
+        assert str(floor) in warnings[0]           # what was substituted
+        # The LLM was never consulted — distinguishing this record from a judge
+        # that answered and happened to say 0.0.
+        assert 'skip' in warnings[0].lower()
+
+    @pytest.mark.parametrize('plan', [
+        pytest.param(_well_formed_plan(), id='CONTROL-well-formed'),
+        pytest.param(_degenerate_plan(), id='CONTROL-degenerate-but-scorable'),
+    ])
+    async def test_a_scorable_plan_still_reaches_the_judge(self, plan, caplog):
+        """CONTROL — and the falsifiable half of the coherence identity.
+
+        The guard keys on scorability, never on quality: it asks "is there
+        content to judge?", so a DEGENERATE plan (one lonely impl step — poor,
+        but real) keeps earning its low score from the judge rather than being
+        laundered into a floor.
+
+        This is also the only place the two instruments have a degree of
+        freedom to disagree. Over _UNSCORABLE_PLAN_SHAPES, asserting
+        ``verdict.plan_quality == score_plan_structure(plan)`` is unfalsifiable
+        — the floor short-circuits on the very predicate the guard consults, so
+        both sides are unconditionally 0.0. Here the floor and the judge return
+        genuinely different numbers, and the assertion that the JUDGE's stands
+        is what pins the floor as a refusal value rather than a universal
+        substitute.
+        """
+        from orchestrator.evals.judge import is_scorable_plan, score_plan_structure
+
+        caplog.set_level(logging.WARNING, logger='orchestrator.evals.judge')
+        assert is_scorable_plan(plan)
+        verdict, mock_invoke = await _judge_with_a_confident_llm(plan)
+
+        mock_invoke.assert_awaited_once()
+        assert verdict.plan_quality == 0.95
+        assert score_plan_structure(plan) > 0.0
+        assert verdict.plan_quality != score_plan_structure(plan)
+        # The signal stays rare and meaningful: the normal path emits no
+        # refusal warning, or the warning stops meaning "a caller did not gate".
+        assert _judge_warnings(caplog) == []
+
+    async def test_the_refusal_names_the_cell_even_without_a_task_id(self, caplog):
+        """A second caller may key its task dict by ``name`` alone.
+
+        That caller is precisely who this guard exists to defend against, so
+        reading ``id`` alone would print "unknown" exactly when the log's whole
+        purpose — telling the reader WHICH cell to go look at — matters most.
+        (``run_judge`` and the plan-judge prompt builder both key off ``name``
+        first, so a name-only task dict is a shape the module already accepts.)
+        """
+        caplog.set_level(logging.WARNING, logger='orchestrator.evals.judge')
+        await _judge_with_a_confident_llm({}, task={'name': 'the widget task'})
+
+        warnings = _judge_warnings(caplog)
+        assert len(warnings) == 1
+        assert 'the widget task' in warnings[0]
+        assert 'unknown' not in warnings[0]
+
+
+# ---------------------------------------------------------------------------
 # Architect-role candidate in configs.py (step-7/8)
 #
 # EvalConfig gains role (default 'implementer' → every existing EVAL_CONFIGS
@@ -1267,13 +1450,26 @@ class TestRunArchitectEval:
 # Task 3302: gate the LLM plan judge at the SOURCE.
 #
 # run_architect_eval's healthy branch called judge_plan_quality with no
-# scorability gate, and judge_plan_quality has no guard of its own — it returns
-# whatever the LLM says in [0, 1]. So a HEALTHY architect that produced a
+# scorability gate, and judge_plan_quality had no guard of its own — it returned
+# whatever the LLM said in [0, 1]. So a HEALTHY architect that produced a
 # stepless artifact persisted the self-contradictory cell
 # `cap_tainted=False, plan_steps=0, plan_quality=0.9`, which is exactly the
 # two-scorer disagreement score_plan_structure's anti-fabrication short-circuit
 # exists to prevent (Graphiti e2066ec6). Gating here keeps plan_steps and the
 # persisted plan_quality consistent for every NEW cell.
+#
+# Task 3303 then closed the other half — the INSTRUMENT refuses such an artifact
+# itself, pinned by TestJudgePlanQualityRefusesAnUnjudgeableArtifact above — so
+# the two blocks are one story: 3302 gated the CALL SITE, 3303 gated the
+# INSTRUMENT, and both consult the one is_scorable_plan predicate. This class
+# stays load-bearing regardless: it pins the runner-side consequences the
+# instrument cannot reach from where it stands — the taint decision, the
+# task_id × config.name log line, and that no opus call is made at all.
+#
+# _STEPLESS_PLANS is deliberately the narrower dict-only subset of
+# _UNSCORABLE_PLAN_SHAPES (line 103): run_architect_eval does
+# `plan = artifacts.read_plan() or {}`, so it can only ever pass a dict, whereas
+# the instrument's own corpus must also cover None / [] / 'x'.
 # ---------------------------------------------------------------------------
 
 _STEPLESS_PLANS = [
