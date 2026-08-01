@@ -472,11 +472,40 @@ The merge procedure is iterative — don't assume one pass will be enough:
   ```
   **Never fall back to direct merge in response to `unknown`** — `unknown` means the server lost its record, not that the merge failed. **This block's `resubmit` line does not apply to the `poll_by == "branch"` arm** — there nothing was ever enqueued, so `unknown` is that arm's expected live state, not a lost record; that arm never reaches this bullet as a terminal state (it's excluded from step 7's terminal set) — it arrives here only via the branch arm's 20-minute deadline, and the action there is to run the same [canonical ancestry check](#branch-on-main) once more (rc=128 marker search included) and STOP and report to the human only if it still comes back not-landed, rather than resubmitting.
 
-- `poll["state"] == "superseded"` (this submission was absorbed into a coalesced train; the response carries `superseded_by: "<train_request_id>"`) → **follow the train, on every `poll_by` arm — never resubmit and never direct-merge**, since the train is already in flight and either would race it:
+- `poll["state"] == "superseded"` (this submission was absorbed into a coalesced train) → **follow
+  the train, on every `poll_by` arm — never resubmit and never direct-merge**, since the train is
+  already in flight and either would race it. `superseded_by` does not always name something you
+  can poll, though — check which shape you have first:
+
+  - **`mr-*` id** (generation-advance path) — a real request id. Poll it:
+    ```
+    mcp__escalation__merge_status(request_id="<superseded_by value>")
+    ```
+    with the same 15 s→60 s backoff, **bounded by the same 20-minute wall-clock ceiling** the
+    unscoped arms use above (see the `deadline` note). On a terminal `done`/`conflict`/`blocked`/
+    `abandoned`, handle it exactly as you would for your own request per this section — your
+    absorbed branch lands when the train lands.
+  - **`coalesce-*` id** (coalesce-train path) — this names the *train*, not a request. It
+    resolves through none of `merge_status`'s tiers (no retention-ring alias is ever recorded
+    for a train id, no event-store finalized row is keyed on one, and Tier 3.5's git-authority
+    probe is skipped when only `request_id` is passed) — polling it by `request_id` returns an
+    honest `state: "unknown"` that will never resolve to anything else. Do not poll it by
+    `request_id`.
+  - **absent** — the live-snapshot tier can emit a bare `superseded` with no `superseded_by`
+    key at all.
+
+  For the `coalesce-*` case, the absent case, or an `mr-*` poll that is still `unknown` at its
+  20-minute ceiling: **do not fall through to step 7's plain `unknown` rule** — that rule
+  resubmits, which is exactly the race this bullet exists to forbid. Instead stop polling by
+  `request_id` and fall back to the `branch` handle plus the
+  [canonical ancestry check](#branch-on-main) — rc=128 exact-subject merge-marker search
+  included:
   ```
-  mcp__escalation__merge_status(request_id="<superseded_by value>")
+  mcp__escalation__merge_status(branch="task/<TASK_ID>")
   ```
-  Poll the train request with the same 15 s→60 s backoff until it reaches a terminal state (`done`, `conflict`, `blocked`, `abandoned`), then handle that state exactly as you would for your own request per this section. Your absorbed branch lands when the train lands.
+  If still in flight, keep polling the branch handle with the same backoff. Never resubmit and
+  never direct-merge. Stop-and-report to the human only if the final ancestry check also comes
+  back not-landed.
 
 *Abandonment (`merge_cancel`):*
 
