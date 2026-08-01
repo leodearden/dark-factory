@@ -2196,3 +2196,51 @@ class TestRunSurfacesPruneObservability:
 
         mock_verify.assert_awaited_once()
         assert report.stats[SNAPSHOT_WRITTEN_STAT_KEY] == 1
+
+
+# ---------------------------------------------------------------------------
+# Stage-3 prompt coupling — the stat-vs-edge guidance names the LIVE keys
+# (task 3045 step-7/8)
+# ---------------------------------------------------------------------------
+
+
+class TestStage3PromptNamesMem0SnapshotStats:
+    """STAGE3_SYSTEM_PROMPT must name the stat keys Stage 3 actually receives.
+
+    _format_report dumps the WHOLE stats dict verbatim
+    (``json.dumps(report.stats)``) into Stage 3's payload, so the renamed
+    keys land in front of the model unfiltered. The rename fixes the NAME;
+    the model still has to be told the invariant, or it can reconstruct the
+    same "stat claims a write but there is no Graphiti edge" false positive
+    from a differently-spelled key.
+
+    Deliberately a COUPLING test, not a prose pin, following the established
+    assembled-prompt drift-guard convention (tests/test_recon_report_guidance_drift.py,
+    tests/test_standing_decision_prompt_drift.py): every assertion is keyed
+    off the imported constants, so a future rename cannot orphan the
+    guidance — leaving the prompt warning about a key the model never sees
+    while the false positive quietly returns. No assertion is made about
+    wording, sentence structure, or section ordering.
+    """
+
+    def test_prompt_names_the_written_stat_key(self):
+        from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
+
+        assert SNAPSHOT_WRITTEN_STAT_KEY in STAGE3_SYSTEM_PROMPT
+
+    def test_prompt_names_the_pruned_stat_key(self):
+        from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
+
+        assert SNAPSHOT_PRUNED_STAT_KEY in STAGE3_SYSTEM_PROMPT
+
+    def test_prompt_does_not_name_the_legacy_spelling(self):
+        """No producer emits the legacy key, so guidance about it would be
+        dead text pointing the model at a stat it can never observe.
+
+        Safe as a plain substring check: the legacy spelling is NOT a
+        substring of the new one ('task_count_snapshot_written' vs
+        'task_count_snapshot_mem0_written').
+        """
+        from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
+
+        assert LEGACY_SNAPSHOT_WRITTEN_STAT_KEY not in STAGE3_SYSTEM_PROMPT
