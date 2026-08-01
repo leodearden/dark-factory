@@ -558,12 +558,22 @@ def _derive_module_runs(
             mc.prefix, None, ScopeKind.SKIPPED, 'pyright: no type_check_command configured',
         ))
 
-    # -- pytest: FULL_SUITE (unscoped) when CONFTEST or TEST_DATA is present
-    # (D1) — a conftest's fixtures/hooks affect the whole subtree, and a data
-    # module under tests/ is consumed by tests we can't enumerate from the
-    # path alone — else FILE_SCOPED to collectable tests, else an explicit
-    # reasoned SKIPPED (the task-1852 "not silent" requirement: never a
-    # dropped command). --
+    # -- pytest: a five-arm cascade, in this order --
+    #   1. CONFTEST touched      -> FULL_SUITE (D1: fixtures/hooks affect the
+    #      whole subtree)
+    #   2. TEST_DATA touched     -> FULL_SUITE (D1: consumed by tests we can't
+    #      enumerate from the path alone)
+    #   3. role='task' AND a production (SOURCE ∪ STRUCTURAL) file touched
+    #      -> FULL_SUITE, the task-3294 floor. It sits HERE, above arm 4, so
+    #      that coverage is monotone in the diff: co-committing a test must
+    #      not narrow a run the production file alone would have widened.
+    #   4. collectable tests     -> FILE_SCOPED to them
+    #   5. otherwise             -> an explicit reasoned SKIPPED (the task-1852
+    #      "not silent" requirement: never a dropped command)
+    # Arm 5 is reachable only at role='merge'. At role='task' every
+    # non-conftest, non-test-data .py file under the prefix is either a
+    # COLLECTABLE_TEST or SOURCE/STRUCTURAL, and `scoped` is non-empty by the
+    # guard above — so arm 3 or arm 4 always fires first. --
     if mc.test_command:
         if conftest_trigger is not None:
             test_cmd = parse_config_command(mc.test_command)
