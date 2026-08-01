@@ -10335,6 +10335,211 @@ class TestMultiProjectRoutingWiring:
             f'No override supplied — no override record may be filed: {override_calls}'
         )
 
+    # -- Residual seam cases (task 3123 step-7) ---------------------------
+
+    async def test_override_with_clean_verdicts_still_escalates(
+        self,
+        interceptor,
+        tmp_path,
+    ):
+        """THE CORE CENSUS CASE.
+
+        The defect being fixed is "a bypass leaves no operator-visible
+        record", not "a bypass that MATTERED leaves no record".  An override
+        whose verdicts both came back clean is precisely the evidence that the
+        parameter was reached for unnecessarily — the measured data any later
+        tightening of it has to stand on — so it must still be recorded.
+        """
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'dark-factory').mkdir()
+        (tmp_path / 'dark-factory' / 'fused-memory').mkdir()
+        registry = ProjectPrefixRegistry.from_roots([str(tmp_path / 'dark-factory')])
+        interceptor._prefix_registry = registry
+
+        escalator_calls: list = []
+        override_calls: list = []
+
+        class SpyEscalator:
+            def report_rejection(self, **kwargs):
+                escalator_calls.append(kwargs)
+
+            def report_routing_override(self, **kwargs):
+                override_calls.append(kwargs)
+
+        interceptor._scope_violation_escalator = SpyEscalator()
+
+        result = await interceptor._path_guard_or_skip(
+            {
+                # Nothing foreign anywhere: the file is owned by the FILING
+                # project, and the prose cites no other project's paths.
+                'title': 'Tidy up the local helper',
+                'metadata': {'files': ['fused-memory/src/x.py']},
+            },
+            str(tmp_path / 'dark-factory'),
+            'dark_factory',
+            routing_override_reason='belt and braces',
+        )
+
+        assert result is None
+        assert escalator_calls == []
+        assert len(override_calls) == 1, (
+            f'A clean-verdict override must STILL be recorded: {override_calls}'
+        )
+        assert override_calls[0]['matched_paths'] == ()
+        assert override_calls[0]['suggested_project'] is None
+
+    async def test_override_escalator_failure_does_not_break_submission(
+        self,
+        interceptor,
+        tmp_path,
+    ):
+        """A raising escalator must not convert an ALLOWED submission into an
+        exception — the submission has already been permitted at this point."""
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        registry = ProjectPrefixRegistry.from_roots([str(tmp_path / 'reify')])
+        interceptor._prefix_registry = registry
+
+        class BoomEscalator:
+            def report_rejection(self, **kwargs):
+                raise RuntimeError('boom')
+
+            def report_routing_override(self, **kwargs):
+                raise RuntimeError('boom')
+
+        interceptor._scope_violation_escalator = BoomEscalator()
+
+        # Must not raise.
+        result = await interceptor._path_guard_or_skip(
+            {
+                'title': 'generic title',
+                'metadata': {'files': ['crates/widget.rs']},
+            },
+            '/foo',
+            'other',
+            routing_override_reason='deliberate',
+        )
+        assert result is None, f'submission must stay allowed, got: {result!r}'
+
+    async def test_override_with_no_escalator_configured_is_a_noop(
+        self,
+        interceptor,
+        tmp_path,
+        caplog,
+    ):
+        """With no escalator wired the WARNING is the LAST-RESORT record.
+
+        Minimal environments without the escalation package still need the
+        bypass to leave a trace, so the audit log fires independently of the
+        escalation attempt.
+        """
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        registry = ProjectPrefixRegistry.from_roots([str(tmp_path / 'reify')])
+        interceptor._prefix_registry = registry
+        interceptor._scope_violation_escalator = None
+
+        with caplog.at_level(logging.WARNING):
+            result = await interceptor._path_guard_or_skip(
+                {
+                    'title': 'generic title',
+                    'metadata': {'files': ['crates/widget.rs']},
+                },
+                '/foo',
+                'other',
+                routing_override_reason='deliberate',
+            )
+
+        assert result is None
+        assert any(
+            'ROUTING OVERRIDE' in r.message and 'deliberate' in r.message
+            for r in caplog.records if r.levelno >= logging.WARNING
+        ), f'audit WARNING must still fire: {[r.message for r in caplog.records]}'
+
+    async def test_override_with_no_registry_still_escalates(
+        self,
+        interceptor,
+    ):
+        """A None registry must not reach root_for_project — and must not
+        suppress the record either."""
+        interceptor._prefix_registry = None
+
+        override_calls: list = []
+
+        class SpyEscalator:
+            def report_rejection(self, **kwargs):
+                raise AssertionError('report_rejection must not fire on an override')
+
+            def report_routing_override(self, **kwargs):
+                override_calls.append(kwargs)
+
+        interceptor._scope_violation_escalator = SpyEscalator()
+
+        result = await interceptor._path_guard_or_skip(
+            {
+                'title': 'Investigate orchestrator/harness.py deadlock',
+                'metadata': {'files': ['crates/widget.rs']},
+            },
+            '/foo',
+            'other',
+            routing_override_reason='deliberate',
+        )
+
+        assert result is None
+        assert len(override_calls) == 1, override_calls
+        assert override_calls[0]['matched_paths'] == ()
+        assert override_calls[0]['suggested_root'] is None
+
+    async def test_override_prompt_only_submission_escalates(
+        self,
+        interceptor,
+        tmp_path,
+    ):
+        """Prompt-only kwargs (no title, so _build_candidate returns None)
+        still produce a record with a usable candidate_title."""
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'dark-factory').mkdir()
+        (tmp_path / 'dark-factory' / 'orchestrator').mkdir()
+        registry = ProjectPrefixRegistry.from_roots([str(tmp_path / 'dark-factory')])
+        interceptor._prefix_registry = registry
+
+        override_calls: list = []
+
+        class SpyEscalator:
+            def report_rejection(self, **kwargs):
+                raise AssertionError('report_rejection must not fire on an override')
+
+            def report_routing_override(self, **kwargs):
+                override_calls.append(kwargs)
+
+        interceptor._scope_violation_escalator = SpyEscalator()
+
+        result = await interceptor._path_guard_or_skip(
+            {'prompt': 'Investigate the orchestrator/harness.py deadlock'},
+            '/foo',
+            'some_other_project',
+            routing_override_reason='deliberate',
+        )
+
+        assert result is None
+        assert len(override_calls) == 1, override_calls
+        assert override_calls[0]['candidate_title'], 'candidate_title must not be empty'
+        assert 'orchestrator' in override_calls[0]['candidate_title']
+
     @pytest.mark.asyncio
     async def test_no_hit_adjudicator_not_consulted(
         self,
