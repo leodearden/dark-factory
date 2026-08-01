@@ -290,3 +290,112 @@ def test_compare_unit_key_absent_from_both_sides_is_not_drift():
     spec = _value_spec(mod, ("Service", "RestartMaxDelaySec"))
 
     assert mod.compare_unit(spec, "[Service]\nType=simple\n", "[Service]\nType=simple\n") == []
+
+
+# ---------------------------------------------------------------------------
+# compare_unit — presence-only directives  (step-5 / step-6)
+# ---------------------------------------------------------------------------
+
+
+def _presence_spec(mod: types.ModuleType, *present_only: tuple[str, str]):
+    """A minimal UnitSpec that presence-checks exactly *present_only*."""
+    return mod.UnitSpec(
+        name="fixture.service",
+        repo_relpath="dashboard/fixture.service",
+        present_only=present_only,
+    )
+
+
+def test_presence_only_ignores_differing_host_paths():
+    """A host-specific value difference is NOT drift.
+
+    WorkingDirectory carries an absolute path that legitimately differs per
+    machine. Value-comparing it would make the checker fire on every host that
+    is not this one — the fastest possible route to the gate being disabled.
+    """
+    mod = _load_checker()
+    spec = _presence_spec(mod, ("Service", "WorkingDirectory"))
+
+    drifts = mod.compare_unit(
+        spec,
+        "[Service]\nWorkingDirectory=/home/leo/src/dark-factory\n",
+        "[Service]\nWorkingDirectory=/opt/df\n",
+    )
+
+    assert drifts == []
+
+
+def test_presence_only_missing_from_installed_is_drift():
+    """A presence-only directive absent from the installed copy IS drift."""
+    mod = _load_checker()
+    spec = _presence_spec(mod, ("Service", "ExecStart"))
+
+    drifts = mod.compare_unit(
+        spec,
+        "[Service]\nExecStart=/usr/bin/true\n",
+        "[Service]\nType=oneshot\n",
+    )
+
+    assert len(drifts) == 1, drifts
+    (drift,) = drifts
+    assert drift.key == "ExecStart"
+    assert drift.installed_value == mod._ABSENT
+    assert "absent" in drift.reason, (
+        "The reason must distinguish 'required directive absent' from a value "
+        f"mismatch; got {drift.reason!r}"
+    )
+
+
+def test_presence_only_missing_from_repo_is_drift():
+    """Presence checking is symmetric too."""
+    mod = _load_checker()
+    spec = _presence_spec(mod, ("Service", "ExecStart"))
+
+    drifts = mod.compare_unit(
+        spec,
+        "[Service]\nType=oneshot\n",
+        "[Service]\nExecStart=/usr/bin/true\n",
+    )
+
+    assert len(drifts) == 1, drifts
+    assert drifts[0].repo_value == mod._ABSENT
+
+
+def test_presence_only_absent_from_both_is_not_drift():
+    """A presence-only key neither copy declares is parity — nothing to propagate."""
+    mod = _load_checker()
+    spec = _presence_spec(mod, ("Service", "Documentation"))
+
+    drifts = mod.compare_unit(
+        spec,
+        "[Service]\nType=oneshot\n",
+        "[Service]\nType=oneshot\n",
+    )
+
+    assert drifts == []
+
+
+def test_presence_only_and_value_compared_reasons_differ():
+    """The two drift classes are distinguishable in the report.
+
+    An operator reading 'value differs' reaches for a diff; one reading
+    'absent from the installed copy' reaches for the installer. Collapsing
+    both into one message costs that distinction.
+    """
+    mod = _load_checker()
+    spec = mod.UnitSpec(
+        name="fixture.service",
+        repo_relpath="dashboard/fixture.service",
+        compared=(("Service", "TimeoutStopSec"),),
+        present_only=(("Service", "ExecStart"),),
+    )
+
+    drifts = mod.compare_unit(
+        spec,
+        "[Service]\nTimeoutStopSec=15\nExecStart=/usr/bin/true\n",
+        "[Service]\nTimeoutStopSec=30\n",
+    )
+
+    by_key = {d.key: d for d in drifts}
+    assert set(by_key) == {"TimeoutStopSec", "ExecStart"}, drifts
+    assert by_key["TimeoutStopSec"].reason != by_key["ExecStart"].reason
