@@ -1323,6 +1323,14 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
     ``no_plan``. Conflating them would either let the candidate that failed to
     plan escape the pool entirely or penalise the one that merely hit a cap.
 
+    That ``no_plan`` count now also drives a per-config ``plan_rate`` (task
+    3379) — the fraction of admitted cells that emitted a plan at all, reduced
+    by THE shared :func:`_plan_rate` that :func:`build_composite_report`'s row
+    calls, over the SAME admitted ``n`` ``mean_plan_quality`` averages. So the
+    reliability figure and the quality figure describe the same pool, and the
+    two tables the CLI prints adjacently cannot disagree about either. No new
+    per-ROW field: the aggregate reads counts it already holds.
+
     ``cap_excluded_by_cause`` breaks that total out by CAUSE
     (``{'cap_hit': 2, 'model_not_found': 1}``, key-sorted for determinism)
     because the causes are not interchangeable: a cap hit is transient and
@@ -1408,6 +1416,11 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
             # cells are not in ``n`` at all.
             'no_plan': no_plan[cfg],
             'total': totals[cfg],
+            # The RELIABILITY figure over the very same admitted pool ``n``
+            # counts and ``mean_plan_quality`` averages (task 3379), through THE
+            # shared :func:`_plan_rate` build_composite_report's row also calls —
+            # no re-derived arithmetic, so the two adjacent tables cannot drift.
+            'plan_rate': _plan_rate(len(scored[cfg]), no_plan[cfg]),
             # THE ONE reduction, shared with build_composite_report's row so the
             # two surfaces cannot drift (task 3099, :func:`_mean_plan_quality`).
             'mean_plan_quality': _mean_plan_quality(scored[cfg]),
