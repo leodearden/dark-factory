@@ -27,6 +27,12 @@ from orchestrator.harness import Harness
 from orchestrator.scheduler import ProvenanceValidationRejection, Scheduler, TaskAssignment
 from orchestrator.workflow import WorkflowOutcome
 
+# Repo root of this worktree: <root>/orchestrator/tests/<this file> -> <root>.
+# Layout-independent — holds in both the main checkout and a .worktrees/<id>/
+# checkout. Matches the parents[2] convention used by conftest.py and the
+# other orchestrator tests.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
 # ---------------------------------------------------------------------------
 # Task-dict builders
 # ---------------------------------------------------------------------------
@@ -1658,8 +1664,6 @@ def _validate(task_kind: str, metadata: dict, project_root: str) -> dict | None:
     except ModuleNotFoundError:
         import json
         import subprocess
-        from pathlib import Path as _Path
-        repo_root = _Path(__file__).parents[3]  # .worktrees/1903/
         # Embed metadata as a JSON string literal and parse it back to a dict
         # inside the subprocess — both paths therefore pass a dict to
         # deterministic_task_error, not a string.
@@ -1675,7 +1679,7 @@ def _validate(task_kind: str, metadata: dict, project_root: str) -> dict | None:
         try:
             out = subprocess.check_output(
                 ['uv', 'run', '--project',
-                 str(repo_root / 'fused-memory'), 'python', '-c', code],
+                 str(_REPO_ROOT / 'fused-memory'), 'python', '-c', code],
                 text=True,
                 timeout=30,
             )
