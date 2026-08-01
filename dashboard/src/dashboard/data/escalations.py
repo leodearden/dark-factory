@@ -3,7 +3,8 @@
 Provides three public functions:
 
 - ``load_queue_escalations`` — root-only *.json reader for a single escalation
-  queue directory (no archive traversal).
+  queue directory (no archive traversal), with an opt-in ``skipped``
+  accumulator so a caller can learn which files it dropped and why.
 - ``resolve_owning_project`` — maps a reconciliation escalation back to its
   owning project via worktree-prefix matching or task-map probe.
 - ``build_escalation_queues`` — enumerates per-project escalation dirs plus the
@@ -16,11 +17,16 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 
-def load_queue_escalations(esc_dir: Path) -> list[dict]:
+def load_queue_escalations(
+    esc_dir: Path,
+    *,
+    skipped: list[dict[str, Any]] | None = None,
+) -> list[dict]:
     """Load all escalation JSON files from *esc_dir* (root only, no archive).
 
     Only ``*.json`` files directly inside *esc_dir* are read — subdirectories
@@ -36,13 +42,33 @@ def load_queue_escalations(esc_dir: Path) -> list[dict]:
     unchanged — an acceptable trade-off given the controlled write environment.
 
     A missing or non-directory *esc_dir* returns ``[]`` without raising.
-    A file that cannot be parsed as JSON is skipped with a ``WARNING`` log.
+    A file that cannot be read or parsed as JSON is skipped with a ``WARNING``
+    log — and, if the caller opted in, recorded in *skipped*.
+
+    Skipping is the right behaviour (one corrupt file must not fail a whole
+    queue scan), but a skip with no return channel is a silent discard: the
+    caller cannot tell "this queue holds nothing" from "this queue holds
+    something I could not read".  *skipped* is that channel, and it is what
+    lets a consumer report the loss as structured payload rather than leaving
+    it in a log line only a human tailing stderr will ever see (INV-2,
+    ``structured-facts-at-failure``).
 
     Args:
         esc_dir: Path to the escalation queue root directory.
+        skipped: Optional accumulator for the files this call dropped.  When a
+            list is passed, one record per skipped file is **appended** to it
+            as ``{'path': Path, 'error': str}`` — appended, not assigned, so a
+            single list can span several queue dirs across several calls.
+            ``path`` stays a ``Path`` (the caller may want ``.name`` or a retry
+            read); stringify at the payload boundary, not here.  The default
+            ``None`` leaves behaviour verbatim as it was before this parameter
+            existed, which is what every non-opted-in caller relies on.  The
+            ``WARNING`` log is emitted either way, so it remains the signal for
+            callers that do not opt in (``build_escalation_queues`` today).
 
     Returns:
-        List of escalation dicts (fields passed through unchanged).
+        List of escalation dicts (fields passed through unchanged).  Unaffected
+        by *skipped*: opting in adds a report, it never changes what is read.
     """
     if not esc_dir.is_dir():
         return []
@@ -53,6 +79,8 @@ def load_queue_escalations(esc_dir: Path) -> list[dict]:
             results.append(json.loads(path.read_text()))
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning('Failed to load escalation %s: %s', path, exc)
+            if skipped is not None:
+                skipped.append({'path': path, 'error': str(exc)})
             continue
     return results
 
