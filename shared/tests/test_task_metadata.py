@@ -874,25 +874,36 @@ class _DeployStateStub(BaseModel):
     phase: str
 
 
+# Test-owned registry key. Deliberately NOT the production 'deploy_state'
+# (registered by shared/deploy_state.py) — mirrors
+# TestListValuedSubmodelSlice._KEY = 'delivered_checks_stub'. See
+# _FOREIGN_REGISTRANT_KEYS above and task 3352.
+_DEPLOY_STATE_STUB_KEY = 'deploy_state_stub'
+
+
 class TestSubmodelRegistry:
     """The W10 extension point: register_metadata_submodel + _SUBMODEL_REGISTRY."""
 
     def test_register_new_key_stored_in_registry(self):
-        register_metadata_submodel('deploy_state', _DeployStateStub)
-        assert task_metadata_module._SUBMODEL_REGISTRY['deploy_state'] is _DeployStateStub
+        register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)
+        assert (
+            task_metadata_module._SUBMODEL_REGISTRY[_DEPLOY_STATE_STUB_KEY] is _DeployStateStub
+        )
 
     def test_register_same_model_twice_is_idempotent(self):
-        register_metadata_submodel('deploy_state', _DeployStateStub)
-        register_metadata_submodel('deploy_state', _DeployStateStub)  # no raise
-        assert task_metadata_module._SUBMODEL_REGISTRY['deploy_state'] is _DeployStateStub
+        register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)
+        register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)  # no raise
+        assert (
+            task_metadata_module._SUBMODEL_REGISTRY[_DEPLOY_STATE_STUB_KEY] is _DeployStateStub
+        )
 
     def test_register_different_model_same_key_raises(self):
         class _OtherDeployStateStub(BaseModel):
             phase: str
 
-        register_metadata_submodel('deploy_state', _DeployStateStub)
+        register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)
         with pytest.raises(ValueError):
-            register_metadata_submodel('deploy_state', _OtherDeployStateStub)
+            register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _OtherDeployStateStub)
 
 
 class TestMilestoneRegistration:
@@ -1213,24 +1224,29 @@ class TestParseMetadataCore:
         assert warnings == []
 
     def test_registered_submodel_slice_validated_and_attached_no_warnings(self):
-        register_metadata_submodel('deploy_state', _DeployStateStub)
-        model, warnings = parse_metadata({'deploy_state': {'phase': 'rollout'}}, direction='write')
-        assert isinstance(model.deploy_state, _DeployStateStub)  # type: ignore[attr-defined]
-        assert model.deploy_state.phase == 'rollout'  # type: ignore[attr-defined]
+        register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)
+        model, warnings = parse_metadata(
+            {_DEPLOY_STATE_STUB_KEY: {'phase': 'rollout'}}, direction='write'
+        )
+        slice_value = getattr(model, _DEPLOY_STATE_STUB_KEY)
+        assert isinstance(slice_value, _DeployStateStub)
+        assert slice_value.phase == 'rollout'
         assert warnings == []
 
     def test_registered_submodel_round_trips_as_plain_dict_via_model_dump(self):
-        # model.deploy_state is a _DeployStateStub instance (asserted above),
-        # stored in TaskMetadata.__pydantic_extra__ since 'deploy_state' is
+        # model.deploy_state_stub is a _DeployStateStub instance (asserted
+        # above), stored in TaskMetadata.__pydantic_extra__ since the key is
         # not a declared TaskMetadata field. I1 round-trip preservation
         # requires model_dump() to re-emit it as a plain dict — not leave a
         # BaseModel instance sitting in the "JSON-serializable blob" output.
-        register_metadata_submodel('deploy_state', _DeployStateStub)
-        model, warnings = parse_metadata({'deploy_state': {'phase': 'rollout'}}, direction='write')
+        register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)
+        model, warnings = parse_metadata(
+            {_DEPLOY_STATE_STUB_KEY: {'phase': 'rollout'}}, direction='write'
+        )
         assert warnings == []
         dumped = model.model_dump()
-        assert dumped['deploy_state'] == {'phase': 'rollout'}
-        assert not isinstance(dumped['deploy_state'], BaseModel)
+        assert dumped[_DEPLOY_STATE_STUB_KEY] == {'phase': 'rollout'}
+        assert not isinstance(dumped[_DEPLOY_STATE_STUB_KEY], BaseModel)
 
     def test_unknown_top_level_key_survives_round_trip(self):
         # x_-prefixed is the sanctioned silent namespace regardless of the
@@ -1363,42 +1379,46 @@ class TestParseMetadataFailurePolicy:
             parse_metadata(blob, direction='write', enforce=True)
 
     def test_invalid_registered_submodel_slice_write_enforce_raises(self):
-        register_metadata_submodel('deploy_state', _DeployStateStub)
+        register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)
         with pytest.raises(ValidationError):
-            parse_metadata({'deploy_state': {}}, direction='write', enforce=True)
+            parse_metadata({_DEPLOY_STATE_STUB_KEY: {}}, direction='write', enforce=True)
 
     def test_invalid_registered_submodel_slice_warn_mode_accepts_raw(self):
-        register_metadata_submodel('deploy_state', _DeployStateStub)
-        model, warnings = parse_metadata({'deploy_state': {}}, direction='write', enforce=False)
+        register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)
+        model, warnings = parse_metadata(
+            {_DEPLOY_STATE_STUB_KEY: {}}, direction='write', enforce=False
+        )
         assert len(warnings) == 1
         assert warnings[0].code == 'invalid_submodel'
-        assert warnings[0].field == 'deploy_state'
-        assert model.model_dump()['deploy_state'] == {}
+        assert warnings[0].field == _DEPLOY_STATE_STUB_KEY
+        assert model.model_dump()[_DEPLOY_STATE_STUB_KEY] == {}
 
     # A registered slice whose *value* isn't a mapping at all (list/str/etc.)
     # can't be splatted as `submodel(**value)` — that raises TypeError, not
     # ValidationError. parse_metadata must absorb this the same way as any
     # other malformed sub-model, never raising outside write+enforce=True.
     def test_registered_submodel_slice_non_mapping_value_read_warns_never_raises(self):
-        register_metadata_submodel('deploy_state', _DeployStateStub)
-        model, warnings = parse_metadata({'deploy_state': [1, 2]}, direction='read')
+        register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)
+        model, warnings = parse_metadata({_DEPLOY_STATE_STUB_KEY: [1, 2]}, direction='read')
         assert len(warnings) == 1
         assert warnings[0].code == 'invalid_submodel'
-        assert warnings[0].field == 'deploy_state'
-        assert model.model_dump()['deploy_state'] == [1, 2]
+        assert warnings[0].field == _DEPLOY_STATE_STUB_KEY
+        assert model.model_dump()[_DEPLOY_STATE_STUB_KEY] == [1, 2]
 
     def test_registered_submodel_slice_non_mapping_value_write_warn_mode_accepts(self):
-        register_metadata_submodel('deploy_state', _DeployStateStub)
-        model, warnings = parse_metadata({'deploy_state': 'x'}, direction='write', enforce=False)
+        register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)
+        model, warnings = parse_metadata(
+            {_DEPLOY_STATE_STUB_KEY: 'x'}, direction='write', enforce=False
+        )
         assert len(warnings) == 1
         assert warnings[0].code == 'invalid_submodel'
-        assert warnings[0].field == 'deploy_state'
-        assert model.model_dump()['deploy_state'] == 'x'
+        assert warnings[0].field == _DEPLOY_STATE_STUB_KEY
+        assert model.model_dump()[_DEPLOY_STATE_STUB_KEY] == 'x'
 
     def test_registered_submodel_slice_non_mapping_value_write_enforce_raises(self):
-        register_metadata_submodel('deploy_state', _DeployStateStub)
+        register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)
         with pytest.raises((ValidationError, TypeError)):
-            parse_metadata({'deploy_state': [1, 2]}, direction='write', enforce=True)
+            parse_metadata({_DEPLOY_STATE_STUB_KEY: [1, 2]}, direction='write', enforce=True)
 
     def test_x_prefixed_unknown_key_silent_zero_warnings(self):
         model, warnings = parse_metadata({'x_experimental': 'v'}, direction='write')
