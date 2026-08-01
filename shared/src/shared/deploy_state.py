@@ -119,6 +119,8 @@ class DeployState(BaseModel):
 # DeployState class into shared.task_metadata's per-process
 # _SUBMODEL_REGISTRY, so parse_metadata validates a `deploy_state` slice and
 # never emits an `unknown_key` SchemaWarning for it (W3 θ2 gate, task 2184).
-# Deliberately NOT done at shared.task_metadata import time — see this
-# module's docstring for why (would break dep 2158's TestSubmodelRegistry).
+# Deliberately NOT done at shared.task_metadata import time — see this module's
+# docstring for the reason that holds (registration must be per-process, driven
+# by each consumer's own import chain). The old reason cited here — that it
+# would break dep 2158's TestSubmodelRegistry — was superseded by task 3352.
 register_metadata_submodel('deploy_state', DeployState)
