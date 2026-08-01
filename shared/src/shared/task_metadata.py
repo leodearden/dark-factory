@@ -529,6 +529,11 @@ def register_metadata_submodel(key: str, model: type[BaseModel]) -> None:
     key (e.g. a module reloaded/imported twice). Raises ``ValueError`` when a
     *different* model is registered for a key that already has one — this is
     a loud, fail-fast conflict intended to surface at import time.
+
+    Registry keys are OWNED by the module that registers them. Tests must
+    register test-only keys (``<name>_stub``) — never a key a production
+    module registers — or a cross-package pytest co-run pre-registers the real
+    model and the conflict raise below fires spuriously (task 3352).
     """
 
     existing = _SUBMODEL_REGISTRY.get(key)

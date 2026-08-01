@@ -15,8 +15,9 @@ This module also registers the ``metadata.delivered_checks`` sub-model with
 :data:`DeliveredCheckMeta`'s registration call at the bottom of this module.
 Registration is a side-effect of importing *this* module, mirroring
 ``shared/src/shared/deploy_state.py`` (not done at ``shared.task_metadata``
-import time, so ``shared/tests/test_task_metadata.py``'s
-``TestSubmodelRegistry`` stub registrations are undisturbed).
+import time, because this module imports ``shared.task_metadata`` and moving
+the call there would be a circular import — see the registration call's own
+comment at the bottom of this module).
 """
 
 from __future__ import annotations
@@ -292,9 +293,15 @@ class DeliveredCheckMeta(_CheckFieldsBase):
 # importing this module registers DeliveredCheckMeta into
 # shared.task_metadata's per-process _SUBMODEL_REGISTRY, so parse_metadata
 # validates and types a `delivered_checks` slice and never emits an
-# `unknown_key` SchemaWarning for it. Deliberately NOT done at
-# shared.task_metadata import time — would collide with
-# shared/tests/test_task_metadata.py's TestSubmodelRegistry stub
-# registrations (see this module's docstring, and deploy_state.py's own
-# docstring for the same reasoning).
+# `unknown_key` SchemaWarning for it.
+#
+# Deliberately NOT done at shared.task_metadata import time: this module
+# imports shared.task_metadata, so moving this call into task_metadata.py
+# would create a CIRCULAR IMPORT. Registration is also per-process and driven
+# by each consumer's own import chain (see deploy_state.py's docstring).
+#
+# (The former rationale — avoiding a collision with
+# shared/tests/test_task_metadata.py's TestSubmodelRegistry stub registrations
+# — no longer applies: task 3352 moved those tests onto test-owned `_stub`
+# keys. The circular-import reason above is the one that is load-bearing.)
 register_metadata_submodel('delivered_checks', DeliveredCheckMeta)

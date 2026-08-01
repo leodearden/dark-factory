@@ -13,16 +13,20 @@ state machine (``_LEGAL`` transition table + ``enforce_transition``) stays in
 that module re-exports the schema defined here.
 
 Registration is a side-effect of importing *this* module — not of importing
-``shared.task_metadata`` itself. Auto-registering at ``shared.task_metadata``
-import time would break dep 2158's ``TestSubmodelRegistry``
-(``shared/tests/test_task_metadata.py``): those tests register a stub
-``DeployState`` under ``'deploy_state'`` and their autouse fixture
-snapshots-but-does-not-clear the registry, so a pre-registered real
-``DeployState`` would make their stub registration raise a conflict
-``ValueError``. Each process instead registers the real model by importing
-this module (the orchestrator via ``orchestrator.deploy_state``;
-fused-memory via a side-effect import in
-``fused_memory.middleware.task_interceptor``).
+``shared.task_metadata`` itself. Registration must be per-process and driven by
+each consumer's OWN import chain: the orchestrator registers by importing
+``orchestrator.deploy_state``, and fused-memory by the side-effect import in
+``fused_memory.middleware.task_interceptor``. That per-process property is what
+``fused-memory/tests/test_deploy_state_registration.py`` asserts — it
+deliberately does not import this module, so its assertion proves the
+interceptor import chain performs the registration.
+
+(The former rationale — avoiding a collision with
+``shared/tests/test_task_metadata.py``'s stub registrations — no longer
+applies: task 3352 moved those tests onto test-owned ``_stub`` keys, and their
+autouse fixture now deliberately pre-installs a foreign sentinel under
+``'deploy_state'`` so any future test that registers this production key fails
+immediately rather than only in a cross-package pytest co-run.)
 """
 
 from __future__ import annotations
