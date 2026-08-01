@@ -6737,7 +6737,6 @@ class TestDefaultScheduleDetachedRestart:
         it for real with a SUCCEEDING restart script.  No escalation must be
         filed (the bug was that registration itself filed one eagerly).
         """
-        import asyncio as _asyncio
         from unittest.mock import patch
 
         from orchestrator.deterministic_runner import DeterministicRunner
@@ -6755,7 +6754,6 @@ class TestDefaultScheduleDetachedRestart:
         }
 
         captured: dict = {}
-        real_exec = _asyncio.create_subprocess_exec
 
         async def fake_exec(*argv, **kwargs):
             captured['argv'] = argv
@@ -6777,15 +6775,14 @@ class TestDefaultScheduleDetachedRestart:
         wrapped = argv[-1]
 
         # Fire the wrapped payload as systemd would (real shell, real CLI path).
-        proc = await real_exec(
-            '/bin/sh', '-c', wrapped,
-            stdout=_asyncio.subprocess.PIPE,
-            stderr=_asyncio.subprocess.STDOUT,
-        )
-        await proc.communicate()
-        assert proc.returncode == 0, 'success-script wrapper must exit 0'
+        wrapper_rc, out = await _run_wrapper_payload(wrapped)
+        assert wrapper_rc == 0, f'success-script wrapper must exit 0; wrapper output: {out!r}'
+        # Preflight: a CLI the interpreter cannot invoke would make the
+        # queue assertion below pass for the WRONG reason (nothing filed
+        # because nothing could run).  Name that failure instead.
+        _assert_submit_cli_invokable(sys.executable)
         assert queue.get_by_task('900') == [], (
-            'no escalation may be filed on the success path'
+            f'no escalation may be filed on the success path; wrapper output: {out!r}'
         )
 
     async def test_handler_executes_on_failure_path(self, tmp_path: Path):
@@ -6794,7 +6791,6 @@ class TestDefaultScheduleDetachedRestart:
         Confirms the failure branch still reaches δ's escalation-submit CLI and
         preserves the non-zero exit code.
         """
-        import asyncio as _asyncio
         from unittest.mock import patch
 
         from orchestrator.deterministic_runner import DeterministicRunner
@@ -6812,7 +6808,6 @@ class TestDefaultScheduleDetachedRestart:
         }
 
         captured: dict = {}
-        real_exec = _asyncio.create_subprocess_exec
 
         async def fake_exec(*argv, **kwargs):
             captured['argv'] = argv
@@ -6827,18 +6822,27 @@ class TestDefaultScheduleDetachedRestart:
             )
 
         wrapped = captured['argv'][-1]
-        proc = await real_exec(
-            '/bin/sh', '-c', wrapped,
-            stdout=_asyncio.subprocess.PIPE,
-            stderr=_asyncio.subprocess.STDOUT,
+        wrapper_rc, out = await _run_wrapper_payload(wrapped)
+        assert wrapper_rc == 7, (
+            f'failure-script wrapper must preserve the exit code; '
+            f'wrapper output: {out!r}'
         )
-        await proc.communicate()
-        assert proc.returncode == 7, 'failure-script wrapper must preserve the exit code'
+
+        # Preflight: the wrapper ends in `exit "$__rc"`, so a dead on-failure
+        # branch still exits 7 and the assertions below would report "got 0"
+        # while the real cause (an interpreter that cannot import escalation)
+        # went unnamed.  Fail on the actual cause instead.
+        _assert_submit_cli_invokable(sys.executable)
 
         filed = queue.get_by_task('901')
-        assert len(filed) == 1, f'exactly one L2 must be filed on failure, got {len(filed)}'
-        assert filed[0].category == 'infra_issue'
-        assert filed[0].level == 2
+        assert len(filed) == 1, (
+            f'exactly one L2 must be filed on failure, got {len(filed)}; '
+            f'wrapper output: {out!r}'
+        )
+        assert filed[0].category == 'infra_issue', (
+            f'wrapper output: {out!r}'
+        )
+        assert filed[0].level == 2, f'wrapper output: {out!r}'
 
     async def test_argv_contains_escalation_submit_cli(self, tmp_path: Path):
         """escalation submit CLI must appear in the spawn argv for OnFailure handling."""
