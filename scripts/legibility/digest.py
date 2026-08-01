@@ -697,12 +697,19 @@ def _derive_date(records: list[dict[str, Any]]) -> str:
 def _encode_cwd(cwd: str) -> str:
     """Mirror Claude Code's own ``~/.claude/projects/<enc>`` encoding.
 
-    Both '/' and '.' map to '-' (same rule as
-    orchestrator/src/orchestrator/session_registry.py:transcript_path_for_cwd,
-    reused here as the fallback when the real transcript path isn't
-    available to read the ground-truth encoded dir name off disk).
+    '/', '.' AND '_' all map to '-', and case is preserved — same rule as
+    orchestrator.session_registry.encode_cwd, the canonical implementation,
+    which carries the authoritative statement of the rule and the record of
+    the 738 real (encoded-dir, decoded-cwd) pairs it was validated against.
+    Reused here as the fallback when the real transcript path isn't
+    available to read the ground-truth encoded dir name off disk.
+
+    Agreement with the canonical is not left to goodwill: it is asserted
+    row-for-row against real on-disk dir names by
+    ``scripts/tests/test_legibility_inventory.py``'s ``TestEncoderLockstep``
+    (task 3272, which found this copy and three others all missing '_').
     """
-    return cwd.replace('/', '-').replace('.', '-')
+    return cwd.replace('/', '-').replace('.', '-').replace('_', '-')
 
 
 def _derive_encoded_dir(records: list[dict[str, Any]], cwd: str, path: Any) -> str:
