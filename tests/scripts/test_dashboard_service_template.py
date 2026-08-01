@@ -777,10 +777,17 @@ def test_keep_alive_timeout_is_pinned_above_poll_interval() -> None:
 # imported at the top of this module under the private aliases this file has
 # always used.  They were lifted out of here by task 3408 so that the
 # fleet-wide sweep in test_systemd_restart_backoff.py applies the SAME
-# assertion rather than a second copy of it — see that module's docstring, and
-# test_restart_backoff_helper_is_shared_not_duplicated, which pins the sharing
-# by object identity.  The negative-case guard for the helper stays here,
-# below, next to the drain-bound guard it is modelled on.
+# assertion rather than a second copy of it — see that module's docstring.
+#
+# Nothing asserts that the sharing holds, deliberately: the `from
+# systemd_unit_invariants import (...)` at the top of this module IS the
+# sharing, structurally, and a drifted private copy would be caught by that
+# fleet sweep failing on whichever unit the copy stopped checking.  An earlier
+# meta-test pinning it by object identity was dropped as testing the shape of
+# the refactor rather than any behaviour of a systemd unit.
+#
+# The negative-case guard for the helper stays here, below, next to the
+# drain-bound guard it is modelled on.
 # ---------------------------------------------------------------------------
 
 
