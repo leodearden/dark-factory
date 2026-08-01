@@ -1086,6 +1086,37 @@ def _join_tree(tmp_path: Path) -> tuple[Path, Path]:
     return root, esc_dir
 
 
+def _unjudged_open_tree(tmp_path: Path) -> tuple[Path, Path]:
+    """One metric whose verdict entry keys and fingerprints but judges nothing.
+
+    The ONE reachable way a row can be both unjudged and linked: the join only
+    runs when the verdict ENTRY carries a fingerprint, so a metric with no
+    entry at all can never link.
+    """
+    root = tmp_path / 'memory-evals'
+    esc_dir = tmp_path / 'escalations'
+    esc_dir.mkdir(parents=True, exist_ok=True)
+    _write_metrics(root, 'eval-a', _JOIN_RUN, [
+        _metric('unjudged-open', 'count', 3.0, direction='higher_is_worse'),
+    ])
+    _write_limits(root, 'eval-a', run_stamp=_JOIN_RUN)
+    # Written out literally: ``_verdict()`` always sets a ``verdict``, and the
+    # artifact is unvalidated JSON, so an entry missing that one field is a
+    # shape the reader has to answer for.
+    _write_verdicts(root, [{
+        'eval_id': 'eval-a',
+        'metric_id': 'unjudged-open',
+        'fingerprint': _FP_UNJUDGED_OPEN,
+        'run_stamp': _JOIN_RUN,
+    }], run_stamp=_JOIN_RUN)
+    _write_escalation(
+        esc_dir, 'esc-unjudged-open',
+        dedupe_fingerprint=_FP_UNJUDGED_OPEN,
+        summary='unjudged-open regressed', timestamp=_JOIN_ESC_TIMESTAMP,
+    )
+    return root, esc_dir
+
+
 class TestEscalationJoin:
     """Verdict/escalation parity, joined on the whole fingerprint string.
 
@@ -1245,27 +1276,7 @@ class TestEscalationJoin:
         """
         from dashboard.data.memory_evals import build_memory_evals
 
-        root = tmp_path / 'memory-evals'
-        esc_dir = tmp_path / 'escalations'
-        esc_dir.mkdir(parents=True, exist_ok=True)
-        _write_metrics(root, 'eval-a', _JOIN_RUN, [
-            _metric('unjudged-open', 'count', 3.0, direction='higher_is_worse'),
-        ])
-        _write_limits(root, 'eval-a', run_stamp=_JOIN_RUN)
-        # Written out literally: ``_verdict()`` always sets a ``verdict``, and
-        # the artifact is unvalidated JSON, so an entry missing that one field
-        # is a shape the reader has to answer for.
-        _write_verdicts(root, [{
-            'eval_id': 'eval-a',
-            'metric_id': 'unjudged-open',
-            'fingerprint': _FP_UNJUDGED_OPEN,
-            'run_stamp': _JOIN_RUN,
-        }], run_stamp=_JOIN_RUN)
-        _write_escalation(
-            esc_dir, 'esc-unjudged-open',
-            dedupe_fingerprint=_FP_UNJUDGED_OPEN,
-            summary='unjudged-open regressed', timestamp=_JOIN_ESC_TIMESTAMP,
-        )
+        root, esc_dir = _unjudged_open_tree(tmp_path)
 
         row = _only(build_memory_evals(root, esc_dir)['evals'][0]['metrics'], 'unjudged-open')
 
@@ -1502,6 +1513,27 @@ class TestEscalationJoin:
 
 _FP_UNKNOWN_VERDICT = '9876543210fedcba9876543210fedcba'
 
+# The parity vocabulary in full — the closed set the UI switches on, mirroring
+# the `_VERDICT_VALUES` contract test one level down.  Deriving parity
+# server-side only buys the frontend anything if the output set is CLOSED and
+# knowable; an open-ended one would force every consumer to re-derive from
+# `verdict`, which is the exact drift this field exists to prevent.
+_PARITY_VALUES = (
+    'alarmed_open',
+    'alarmed_unlinked',
+    'recovered_open',
+    'clear',
+    'insufficient_data',
+    'insufficient_data_open',
+    'grandfathered',
+    'grandfathered_open',
+    'unjudged',
+    'unjudged_open',
+    'unknown_verdict',
+    'unknown_verdict_open',
+    'storm_collapsed',
+)
+
 
 def _unknown_verdict_tree(tmp_path: Path, verdict: Any, *, linked: bool) -> tuple[Path, Path]:
     """One metric whose verdict value is outside the M2 vocabulary.
@@ -1625,6 +1657,58 @@ class TestUnknownVerdict:
 
         assert _only(payload['evals'][0]['metrics'], 'unjudged-metric')['parity'] == 'unjudged'
         assert [i for i in payload['issues'] if i['kind'] == 'unknown_verdict'] == []
+
+
+class TestParityVocabularyIsClosedAndExported:
+    """``PARITY_STATES`` is the single source of truth for the badge vocabulary.
+
+    Deriving parity server-side only buys the frontend anything if the output
+    set is CLOSED and knowable — otherwise every consumer has to re-derive
+    badge state from ``verdict``, which is the drift this field exists to
+    prevent.  Exporting the set gives the two known consumers (the dashboard
+    tab, task 3216; the parity gate, task 3217) something to assert against the
+    PRODUCER instead of hardcoding a subset in their own test files, where it
+    rots silently the moment a state is added.
+    """
+
+    def test_the_module_exports_the_vocabulary(self) -> None:
+        from dashboard.data import memory_evals
+
+        assert memory_evals.PARITY_STATES == set(_PARITY_VALUES)
+
+    def test_the_literal_and_the_builder_agree(self, tmp_path: Path) -> None:
+        """Every state the builder emits is a member, and every member is reachable.
+
+        Both directions matter and neither implies the other.  A state escaping
+        the set means a consumer switching on ``PARITY_STATES`` silently drops
+        a row; a member no fixture can produce is either dead vocabulary or an
+        untested state, and the literal set cannot tell those apart on its own.
+        This is what keeps the hand-written literal honest.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        trees = [
+            _join_tree(tmp_path / 'join'),
+            _storm_tree(
+                tmp_path / 'storm',
+                storm={'triggered': True, 'alarm_count': 2, 'aggregate_fingerprint': _FP_AGGREGATE},
+            ),
+            _unjudged_open_tree(tmp_path / 'unjudged-open'),
+            _unknown_verdict_tree(tmp_path / 'unknown', 'improved', linked=False),
+            _unknown_verdict_tree(tmp_path / 'unknown-open', 'improved', linked=True),
+        ]
+
+        observed = {
+            metric['parity']
+            for root, esc_dir in trees
+            for row in build_memory_evals(root, esc_dir)['evals']
+            for metric in row['metrics']
+        }
+
+        from dashboard.data import memory_evals
+
+        assert observed - memory_evals.PARITY_STATES == set(), 'a parity escaped the exported set'
+        assert memory_evals.PARITY_STATES - observed == set(), 'an exported parity is unreachable'
 
 
 # ---------------------------------------------------------------------------
