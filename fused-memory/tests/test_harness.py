@@ -6,7 +6,7 @@ import json
 import logging
 import uuid
 from datetime import UTC, datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import DEFAULT, AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
@@ -2537,41 +2537,74 @@ class TestHarnessUnhaltClosesEscalation:
         assert harness.take_resolved_halt_escalations('test-project') == []
 
 
+async def _drive_run_loop_until(harness, *events, timeout: float = 10.0):
+    """Drive harness.run_loop() as a background task until every
+    ``asyncio.Event`` in *events* is set, then cancel the loop and return.
+
+    Waits on the OBSERVABLE EVENTS the caller's assertions actually check,
+    rather than budgeting run_loop's startup path (release_stale_claims,
+    predecessor/resume passes, judge init — several SQLite awaits) inside a
+    fixed wall-clock ``wait_for``. Under ``pytest -n 16`` on a loaded box a
+    hardcoded budget can starve before the awaited condition is even
+    reached, flaking an assertion that has nothing to do with the behaviour
+    under test (precedent: commit 6dabee331f). ``timeout`` is a deadlock
+    backstop only — the happy path exits as soon as every event fires.
+
+    Also races the events against ``loop_task`` itself completing: if
+    run_loop dies early (raises past its own startup guard, or returns)
+    before every event fires, waiting stops immediately instead of burning
+    the full backstop. The teardown then must not let that exception
+    re-raise past this helper — it suppresses it so a real regression
+    surfaces through the caller's own (descriptive) assertions instead of an
+    opaque exception out of this helper's teardown.
+    """
+    loop_task = asyncio.create_task(harness.run_loop())
+    waiters = [asyncio.ensure_future(event.wait()) for event in events]
+    try:
+        # TimeoutError → fall through and let the caller's assertions report it.
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(timeout):
+                pending = {*waiters, loop_task}
+                while pending - {loop_task}:
+                    done, pending = await asyncio.wait(
+                        pending, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    if loop_task in done:
+                        break  # dead loop — stop waiting, let assertions explain it
+    finally:
+        for waiter in waiters:
+            waiter.cancel()
+        if not loop_task.done():
+            loop_task.cancel()
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await loop_task
+
+
 async def _drive_halt_notify(harness, event_buffer, timeout: float = 10.0):
     """Drive run_loop for a pre-halted project until the halt-check branch
     (which calls _notify_judge_halt) has fired, then cancel the loop. Mirrors
     test_halted_project_skips_cycle's run_loop-driving setup.
 
-    Waits on the OBSERVABLE EVENT (on_judge_halt was called), not on a fixed
-    wall-clock budget. The path to the halt check crosses run_loop's whole
-    startup sequence plus several SQLite awaits (should_trigger,
-    mark_run_active), and under ``pytest -n 16`` on a loaded box the previous
-    hardcoded 0.3s budget was not reliably enough — an intermittent
-    'on_judge_halt called 0 times' failure that had nothing to do with the
-    behaviour under test. The generous ``timeout`` is a deadlock backstop
-    only: the happy path exits within ~10ms of the call, well before run_loop's
-    5s tick could respawn the project loop and call the mock a second time.
+    Delegates to _drive_run_loop_until, waiting on the OBSERVABLE EVENT
+    (on_judge_halt was called) rather than a fixed wall-clock budget — see
+    that helper's docstring for the full rationale.
     """
-    import asyncio
-    import contextlib
-
     harness._recover_stale_runs = AsyncMock(return_value=None)
     harness._start_escalation_server = AsyncMock()
     harness._stop_escalation_server = AsyncMock()
     for _ in range(3):
         await event_buffer.push(_make_event())
 
-    loop_task = asyncio.create_task(harness.run_loop())
-    try:
-        # TimeoutError → fall through and let the caller's assertion report it.
-        with contextlib.suppress(TimeoutError):
-            async with asyncio.timeout(timeout):
-                while not harness._backlog_policy.on_judge_halt.called:
-                    await asyncio.sleep(0.01)
-    finally:
-        loop_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await loop_task
+    halted = asyncio.Event()
+    on_judge_halt = harness._backlog_policy.on_judge_halt
+
+    def _signal_halt(*_args, **_kwargs):
+        halted.set()
+        return DEFAULT  # preserve whatever return_value/behavior was configured
+
+    on_judge_halt.side_effect = _signal_halt
+
+    await _drive_run_loop_until(harness, halted, timeout=timeout)
 
 
 @pytest.mark.asyncio
@@ -7052,7 +7085,13 @@ async def test_run_loop_resumes_interrupted_runs_at_startup_before_reaper(
 ):
     """run_loop() must invoke _resume_interrupted_runs() once at startup, before
     the periodic _recover_stale_runs reaper ticks — and a raised exception from
-    it must not crash run_loop (mirrors the predecessor-pass startup contract)."""
+    it must not crash run_loop (mirrors the predecessor-pass startup contract).
+
+    Drives run_loop via _drive_run_loop_until, waiting on the OBSERVABLE EVENTS
+    the assertions below actually check (resume ran; stale ticked twice) rather
+    than budgeting the whole startup path (several SQLite awaits) inside a fixed
+    wall-clock wait_for — see that helper's docstring for why (commit
+    6dabee331f precedent) that flaked under full-suite xdist load."""
     real_sleep = asyncio.sleep
 
     async def fast_sleep(seconds: float) -> None:
@@ -7063,13 +7102,18 @@ async def test_run_loop_resumes_interrupted_runs_at_startup_before_reaper(
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
 
     call_order: list[str] = []
+    resume_event = asyncio.Event()
+    stale_event = asyncio.Event()
 
     async def resume_side_effect():
         call_order.append('resume')
+        resume_event.set()
         raise RuntimeError('boom — simulated resume failure')
 
     async def stale_runs_side_effect():
         call_order.append('stale')
+        if call_order.count('stale') >= 2:
+            stale_event.set()
 
     harness._resume_interrupted_runs = AsyncMock(side_effect=resume_side_effect)
     harness._recover_predecessor_runs = AsyncMock(return_value=None)
@@ -7080,8 +7124,7 @@ async def test_run_loop_resumes_interrupted_runs_at_startup_before_reaper(
     if harness.judge is not None:
         harness.judge.initialize = AsyncMock()
 
-    with contextlib.suppress(TimeoutError):
-        await asyncio.wait_for(harness.run_loop(), timeout=0.2)
+    await _drive_run_loop_until(harness, resume_event, stale_event)
 
     # Ran exactly once at startup despite raising — not once per iteration.
     assert harness._resume_interrupted_runs.call_count == 1
