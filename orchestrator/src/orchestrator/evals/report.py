@@ -877,31 +877,55 @@ def select_survivors(
        rule on the secondary axis);
     4. DESCENDING ``plan_quality`` — the meaningful secondary signal for a
        PLAN-ONLY architect row;
-    5. ASCENDING ``config`` name, surviving ONLY as the final byte-stability
+    5. rows with a ``plan_rate`` before rows without (the same ``None``-last
+       rule again, on the tertiary axis);
+    6. DESCENDING ``plan_rate`` (task 3379) — HOW OFTEN the config emitted a
+       plan at all, breaking a tie of both means above;
+    7. ASCENDING ``config`` name, surviving ONLY as the final byte-stability
        guarantee.
 
     Why 3-4 exist at all: with every architect composite hard-gated to 0.0 (the
-    bug this task fixes), step 5 had silently become the ENTIRE selection
-    mechanism for the architect role — ``architect-fable-high`` was "selected"
-    for sorting first, not for planning best (plans/eval-architect-effort-
-    verdict-2026-07-27.md, defect 2). Fixing the composite alone would leave the
-    same trap armed for the next pair of genuinely-tied real composites, so the
-    alphabet is demoted below every axis that carries signal. A workflow row
-    carries no ``plan_quality``, so steps 3-4 are inert for it and the existing
-    implementer ordering is unchanged.
+    bug task 3099 fixed), the name tiebreak had silently become the ENTIRE
+    selection mechanism for the architect role — ``architect-fable-high`` was
+    "selected" for sorting first, not for planning best (plans/eval-architect-
+    effort-verdict-2026-07-27.md, defect 2). Fixing the composite alone would
+    leave the same trap armed for the next pair of genuinely-tied real
+    composites, so the alphabet is demoted below every axis that carries signal.
+    A workflow row carries no ``plan_quality``, so steps 3-4 are inert for it and
+    the existing implementer ordering is unchanged.
+
+    Why 5-6 sit BELOW ``plan_quality`` rather than above it: task 3302 already
+    folds every no-plan cell's zero into BOTH ``plan_quality`` (floored to 0.0
+    by :func:`_plan_quality_score` and KEPT in the mean) and ``composite``
+    (hard-gated by ``blend_composite(no_plan=True)``), so an unreliable
+    candidate is penalised on both primary axes already; ranking on reliability
+    PRIMARILY would charge it a third time for the same cells. Its residual —
+    and real — value is breaking a genuine tie of both means: one cell at 0.0
+    beside one at 1.0 yields the SAME mean as two cells at 0.5 while the two
+    configs differ sharply in how often they plan at all, and without this axis
+    that tie falls through to the alphabet — the very defect step 7 exists to
+    be a last resort against. A workflow row carries no ``plan_rate`` either, so
+    steps 5-6 are likewise inert for it.
     """
     by_role: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in composite_report.get('configs', []):
         by_role[row.get('role_under_test')].append(row)
 
-    def _rank_key(r: dict[str, Any]) -> tuple[bool, float, bool, float, str]:
+    def _rank_key(
+        r: dict[str, Any],
+    ) -> tuple[bool, float, bool, float, bool, float, str]:
         composite = r.get('composite')
         plan_quality = r.get('plan_quality')
+        # ``.get`` like its siblings: a partially-populated row dict (several
+        # consumers build one) degrades to None-last rather than raising.
+        plan_rate = r.get('plan_rate')
         return (
             composite is None,
             -float(composite or 0.0),
             plan_quality is None,
             -float(plan_quality or 0.0),
+            plan_rate is None,
+            -float(plan_rate or 0.0),
             str(r.get('config', '')),
         )
 
