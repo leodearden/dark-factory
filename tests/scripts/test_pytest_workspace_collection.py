@@ -20,6 +20,7 @@ See also:
 from __future__ import annotations
 
 import re
+import shlex
 import tomllib
 from pathlib import Path
 
@@ -261,4 +262,157 @@ def test_root_pyproject_omits_norecursedirs() -> None:
         'This workaround was needed when subprojects had tests/__init__.py files '
         'causing a tests.conftest namespace collision. Now that those files are '
         'removed, delete the norecursedirs line and its associated comment.'
+    )
+
+
+# ---------------------------------------------------------------------------
+# Root-vs-member marker deselection mirroring (task 3444)
+# ---------------------------------------------------------------------------
+
+# Matches a marker name used as a `not <name>` term inside a pytest -m
+# expression: "not smoke and not integration" -> ['smoke', 'integration'].
+_NOT_MARKER_RE = re.compile(r'\bnot\s+([A-Za-z_]\w*)')
+
+
+def _pytest_ini_options(pyproject: Path) -> dict:
+    """Return [tool.pytest.ini_options] for *pyproject*, or {} if absent."""
+    if not pyproject.exists():
+        return {}
+    data = tomllib.loads(pyproject.read_text(encoding='utf-8'))
+    return data.get('tool', {}).get('pytest', {}).get('ini_options', {})
+
+
+def _effective_marker_expression(addopts: str) -> str:
+    """Return the -m expression pytest would actually apply for *addopts*.
+
+    `-m` is a single argparse option, so a LATER `-m` silently REPLACES an
+    earlier one — this returns the last occurrence, matching pytest's real
+    behaviour (and so catching a two-`-m`-flags config that drops a deselect).
+    shlex.split handles the quoted form actually in use, e.g.
+    `-n auto --dist loadgroup -m 'not integration'`.
+    """
+    expression = ''
+    tokens = shlex.split(addopts)
+    for i, token in enumerate(tokens):
+        if token.startswith('--'):
+            continue
+        if token == '-m':
+            if i + 1 < len(tokens):
+                expression = tokens[i + 1]
+        elif token.startswith('-m='):
+            expression = token[3:]
+        elif token.startswith('-m'):
+            expression = token[2:]
+    return expression
+
+
+def _deselected_markers(addopts: str) -> list[str]:
+    """Marker names deselected by *addopts*, in the order they appear."""
+    return _NOT_MARKER_RE.findall(_effective_marker_expression(addopts))
+
+
+def _registered_marker_names(ini_options: dict) -> set[str]:
+    """Marker NAMES from a `markers` list whose entries are "<name>: <description>"."""
+    return {str(entry).split(':', 1)[0].strip() for entry in ini_options.get('markers', [])}
+
+
+def _mirroring_failure_message(
+    unregistered: list[str],
+    undeselected: list[str],
+    owners: dict[str, list[str]],
+    root_deselected: list[str],
+    root_addopts: str,
+) -> str:
+    """Render the assertion message for a root config that ignores a member deselect."""
+    # Keep the root's existing order and append what is missing, so the
+    # suggested expression is the literal edit to make.
+    expected = root_deselected + [m for m in owners if m not in root_deselected]
+    sections = [
+        'The ROOT pyproject.toml does not honour marker deselections declared by '
+        'workspace members.',
+        '',
+        "pytest reads exactly ONE [tool.pytest.ini_options] — the rootdir's inifile — and "
+        "never merges addopts/markers across pyproject.toml files. A member's `-m 'not X'` "
+        'is therefore SILENTLY IGNORED whenever rootdir resolves to the repo root (an '
+        'explicit `-c pyproject.toml`, a bare `pytest` from the repo root, or any arg set '
+        'spanning two subprojects) — and those tests RUN.',
+        '',
+    ]
+    if unregistered:
+        sections.append('NOT REGISTERED in the root `markers` list:')
+        sections += [f'  {m}  (deselected by: {", ".join(owners[m])})' for m in unregistered]
+        sections.append('')
+    if undeselected:
+        sections.append('NOT DESELECTED by the root `addopts` -m expression:')
+        sections += [f'  {m}  (deselected by: {", ".join(owners[m])})' for m in undeselected]
+        sections.append('')
+    sections += [
+        'Required edit to the ROOT pyproject.toml [tool.pytest.ini_options]:',
+        '  1. register each missing marker in `markers`:',
+        '       "<name>: <description>; deselect: -m \'not <name>\'",',
+        '  2. use ONE combined -m expression in `addopts`:',
+        f"       -m '{' and '.join(f'not {m}' for m in expected)}'",
+        '     The single -m flag is load-bearing: -m is one argparse option, so a second',
+        '     -m would silently REPLACE the first and drop the earlier deselect.',
+        '',
+        f'root addopts today: {root_addopts!r}',
+    ]
+    return '\n'.join(sections)
+
+
+def test_root_pyproject_mirrors_member_marker_deselections() -> None:
+    """Every marker a workspace member DESELECTS must also be gated at the root.
+
+    If a member decided a marker's tests must not run by default, a root-bound
+    run has to honour that too — pytest will never merge the member's decision
+    up.  Otherwise those tests run on any invocation whose rootdir resolves to
+    the repo root, which is how 9 live-CLI/OAuth tests in shared/tests/ came to
+    run (and go red) on ordinary runs before task 3444.
+
+    Keyed on what a member DESELECTS, never on what it merely REGISTERS.
+    orchestrator/pyproject.toml registers six markers and deliberately
+    deselects none — its `warm_lane_bash` entry is documented there as
+    "deliberately NOT deselected in addopts, because ... needs this coverage
+    actually running on its verify leg".  A blanket "root must mirror every
+    member marker" rule would demand deselecting it at root and silently drop
+    that coverage.  Keying on the member's own explicit `-m 'not X'` keeps the
+    invariant true by construction and the guard non-brittle.
+
+    Sibling behavioural guards for the same bug class (this one is the static,
+    member-agnostic generalisation — it covers a NEW member with no edit):
+      - cockpit/tests/test_root_config_smoke_deselection.py
+      - shared/tests/test_root_config_integration_deselection.py
+      - fused-memory/tests/test_integration_marker_config.py
+    """
+    root_pyproject = REPO_ROOT / 'pyproject.toml'
+    root_data = tomllib.loads(root_pyproject.read_text(encoding='utf-8'))
+
+    root_ini = root_data.get('tool', {}).get('pytest', {}).get('ini_options', {})
+    root_addopts = root_ini.get('addopts', '')
+    root_registered = _registered_marker_names(root_ini)
+    root_deselected = _deselected_markers(root_addopts)
+
+    members = root_data.get('tool', {}).get('uv', {}).get('workspace', {}).get('members', [])
+    # Anti-vacuity: a typo'd key here would make the loop below iterate nothing
+    # and turn this guard into a silent pass.
+    assert members, (
+        '[tool.uv.workspace].members is empty or missing in the root pyproject.toml — '
+        'this guard reads it to discover which subprojects to check, so it would '
+        'otherwise pass vacuously.'
+    )
+
+    # marker name -> members that deselect it, in workspace order.
+    owners: dict[str, list[str]] = {}
+    for member in members:
+        addopts = _pytest_ini_options(REPO_ROOT / member / 'pyproject.toml').get('addopts')
+        if not addopts:
+            continue
+        for marker in _deselected_markers(addopts):
+            owners.setdefault(marker, []).append(member)
+
+    unregistered = [m for m in owners if m not in root_registered]
+    undeselected = [m for m in owners if m not in root_deselected]
+
+    assert not unregistered and not undeselected, _mirroring_failure_message(
+        unregistered, undeselected, owners, root_deselected, root_addopts
     )
