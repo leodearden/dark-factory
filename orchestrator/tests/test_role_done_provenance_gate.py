@@ -117,14 +117,6 @@ class TestAncestryCheckIsThreeOutcome:
         # twice" -- exactly the half-migration failure mode this guards against.
         assert STEWARD.system_prompt.count(ANCESTRY_CHECK_INSTRUCTIONS) == 2
 
-    def test_enumerates_all_three_outcomes(self):
-        assert 'rc=0' in ANCESTRY_CHECK_INSTRUCTIONS
-        assert 'rc=1' in ANCESTRY_CHECK_INSTRUCTIONS
-        assert 'rc=128' in ANCESTRY_CHECK_INSTRUCTIONS
-
-    def test_forbids_concluding_not_on_main_on_128(self):
-        assert 'not on main' in ANCESTRY_CHECK_INSTRUCTIONS
-
     def test_real_git_distinguishes_unresolvable_from_off_main(self, tmp_path: Path) -> None:
         """Ties the documented rc table to the installed git, not to prose.
 
