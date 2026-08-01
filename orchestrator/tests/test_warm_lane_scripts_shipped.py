@@ -546,40 +546,24 @@ class TestProvisionRepoRootParity:
     ) -> None:
         """A ``PATH`` lacking ``dirname`` must not change the advertised mount.
 
-        The sixth repo-root failure mode, and the only one that is silent end
-        to end.  ``dirname`` and ``basename`` are EXTERNAL BINARIES: under a
-        ``PATH`` without them ``$(dirname ...)`` yields the empty string,
-        ``cd ""`` SUCCEEDS as a no-op, and the resolution lands on the caller's
-        CWD — no error, no warning, exit 0.  A systemd unit's ``PATH`` need not
-        carry coreutils, and this script is run on a fresh host to provision
-        the pool substrate, which is exactly where a minimal ``PATH`` is
-        likeliest.
-
-        MEASURED RED on base HEAD 8d276d3c5f: control ``/tmp/<...>/warm-lanes``,
-        hidden-``dirname`` ``/warm-lanes`` — the bare FILESYSTEM ROOT,
-        advertised to an operator about to provision a multi-terabyte XFS
-        volume, at rc=0 with no diagnostic of any kind.  Unlike the three
-        lib-sourcing scripts this one has NO ``[ ! -f ]`` check anywhere on the
-        path, so a mis-resolution has nothing at all to trip over.
+        See README.md "Delta 7" for the failure mechanism and the base
+        measurement (the mount silently became the bare filesystem root).
 
         Asserted as PARITY against a same-run control rather than a literal
         expected path: the synthetic repo lives under ``tmp_path``, so a
         hardcoded mount would encode the harness's layout and rot the moment
-        ``_stage_provision_script`` changes.  "the answer with ``dirname``
-        hidden equals the answer with ``dirname`` present" IS the contract.
-        The second assertion pins the specific regression so the case cannot
-        pass by both sides being equally broken.
+        ``_stage_provision_script`` changes.  The second assertion pins the
+        specific regression, so the case cannot pass by both sides being
+        equally broken.
 
         All three nestings are exercised because ``_default_mount()`` reaches a
-        DIFFERENT fork in each: the plain repo uses only the ``dirname
-        "$REPO_ROOT"`` at the top, while a repo inside a worktrees dir also
-        takes the ascend branch's second ``dirname``.  ``.worktrees`` is
-        dark-factory's own spelling (README Delta 2), i.e. the shape an agent
-        or operator in THIS repo actually runs from.
+        DIFFERENT derivation in each: the plain repo uses only the parent-of
+        ``REPO_ROOT`` at the top, while a repo inside a worktrees dir also
+        takes the ascend branch's second one.
 
         No assertion on the ``Usage:`` program-name line: ``basename "$0"``
-        there is deliberately left forking (README Delta 7), so that line
-        renders blank under this ``PATH`` by design.
+        there is deliberately left forking, so that line renders blank under
+        this ``PATH`` by design.
         """
         repo = tmp_path.joinpath(*nesting)
         repo.mkdir(parents=True)
@@ -619,31 +603,11 @@ class TestSiblingResolutionIgnoresTheCallersCwd:
 
     ``TestSiblingLibsTravelledWithTheScripts`` above pins that the libs
     travelled with the relocation.  This class pins the other half: that the
-    right COPY of them is the one loaded.  Under a ``PATH`` without ``dirname``
-    the ``$(dirname "${BASH_SOURCE[0]}")`` fork yields the empty string,
-    ``cd ""`` succeeds as a no-op, and ``SCRIPT_DIR`` silently becomes the
-    caller's CWD — so the script sources whatever files with those names happen
-    to be sitting there.
+    right COPY of them is the one loaded.
 
-    The realistic, non-adversarial trigger is not an attacker: it is invoking
-    one of these from reify's own ``scripts/`` dir, or from another
-    dark-factory checkout's ``warm-lane/`` dir.  Both carry precisely these
-    filenames, at a different (possibly older) version.
-
-    This REFUTES the hypothesis these scripts were filed under — that a
-    mis-resolution would land on their existing fail-loud wiring guards and
-    ``exit 2``.  The guards are ``[ ! -f "$SCRIPT_DIR/lib_*.sh" ]``, which test
-    the MIS-RESOLVED path, so any CWD holding a same-named file satisfies them.
-    The loud degrade is therefore contingent on the caller's CWD being empty,
-    and cannot detect this class at all.
-
-    MEASURED RED on base HEAD 8d276d3c5f, from a decoy CWD under a
-    ``dirname``-less ``PATH``: ``warm-lane-gc.sh`` exit 0 having sourced BOTH
-    the decoy ``lib_live_refs.sh`` and the decoy ``lib_lane_state.sh``;
-    ``warm-lane-gc-sweep.sh`` exit 0 having sourced the decoy
-    ``lib_live_refs.sh``; ``warm-lane-audit.sh`` exit 0 having sourced both the
-    decoy ``lib_portable.sh`` and the decoy ``lib_lane_state.sh``.  These are
-    scripts whose job is deleting worktrees and reporting pool state.
+    See README.md "Delta 7" — "The corrected hypothesis" — for the mechanism,
+    the per-script base measurements, and why these scripts' existing
+    ``[ ! -f "$SCRIPT_DIR/lib_*.sh" ]`` guards cannot detect this class.
 
     Deliberately NO exit-code assertion: the decoys make the run SUCCEED, and
     the defect is *which files were sourced*, not how the process ended.  The
@@ -709,29 +673,18 @@ class TestSiblingResolutionIgnoresTheCallersCwd:
     def test_a_bare_hostile_cwd_does_not_reach_lib_portable_from_the_cwd(
         self, tmp_path: Path,
     ) -> None:
-        """``warm-lane-audit.sh`` from an EMPTY hostile CWD, and the exit code it uses.
+        """``warm-lane-audit.sh`` resolves its libs beside ITSELF from an EMPTY CWD.
 
-        The audit-specific half, recorded because it corrects the filed
-        expectation twice over.  The hypothesis said audit "would land on its
-        existing fail-loud ``source`` guard and exit 2".  It does not:
-
-        * The ``[ ! -f ]`` guard task 3074 added covers only
-          ``lib_lane_state.sh``, and sits AFTER the ``lib_portable.sh``
-          ``source``, which has no guard at all.
-        * So with nothing to pick up in the CWD, audit dies on bash's own bare
-          ``source`` failure at exit **1** — the RUNTIME code, not the exit-2
-          wiring sentinel the exit-code taxonomy assigns this class.  MEASURED
-          on base with CWD=/: ``warm-lane-audit.sh: line 145:
-          //lib_portable.sh: No such file or directory``, exit 1.  A
-          triage-misleading exit code on top of a wrong path.
+        The audit-specific half: with nothing to pick up in the CWD there is no
+        decoy to detect, so the assertion is that no resolved path lies under
+        the caller's CWD at all.
 
         Asserted on the RESOLVED PATH, not the exit code, for the reason in the
-        class docstring: the exit code here is whatever the caller's CWD makes
-        it.  The unguarded-``lib_portable.sh`` gap is real and separately
-        actionable, but it is a behaviour change to a reify byte-copy that this
-        task's Delta does not cover — and with ``SCRIPT_DIR`` resolved
-        correctly the bare ``source`` failure is unreachable in every case
-        measured here.
+        class docstring.  README.md "Delta 7" records what the exit code
+        actually was on base and why it did not match the filed expectation;
+        the unguarded-``lib_portable.sh`` gap it names is real and separately
+        actionable, but it is a behaviour change this task's Delta does not
+        make.
         """
         proc = self._help_under_a_hidden_dirname(
             'warm-lane-audit.sh', cwd=tmp_path, tmp_path=tmp_path,
@@ -755,26 +708,15 @@ class TestSiblingResolutionIgnoresTheCallersCwd:
         """``thin-warm-lane.sh --reseed`` EXECUTES what it resolves.
 
         The other three scripts here merely *source* the mis-resolved path;
-        this one runs it as a program, with the lane dir as an argument.
+        this one runs it as a program, with the lane dir as an argument — on
+        base it ran the decoy and reported ``[ok] Re-seeded``.
 
-        MEASURED RED on base HEAD 8d276d3c5f: the decoy ran — stderr carries
-        the marker followed by ``[ok] Re-seeded: <lane>/target``, i.e.
-        thin-warm-lane reported SUCCESS for a reseed performed by an arbitrary
-        file picked up off the caller's CWD.
-
-        Reachability, recorded honestly because it is what makes this
-        low-priority rather than urgent: ``_script_dir`` is computed only when
-        ``--seed-script`` was NOT passed, and README "Delta 3" states
-        dark-factory's own caller never passes ``--reseed`` at all.  The
-        exposure is a future caller — and the warning Delta 3 already carries
-        ("any future caller that does pass --reseed must also pass
-        --seed-script") is exactly the one this closes properly.
-
-        Note also what hiding ``dirname`` CONVERTS: with a full ``PATH`` the
-        default seed script resolves to a sibling that deliberately does not
-        exist here (``seed-warm-lane.sh`` stayed project-owned, PRD §5), so the
-        reseed fails harmlessly and says so.  Hiding ``dirname`` turns that
-        safe no-op into an execution.
+        See README.md "Sibling-seed defaults, and who resolves them" (reached
+        from "Delta 3") for the reachability caveat: ``_script_dir`` is
+        computed only when ``--seed-script`` was not passed, and dark-factory's
+        own caller never passes ``--reseed``.  That is what makes this
+        low-priority rather than urgent — and the warning recorded there for a
+        future caller is what this closes properly.
         """
         lane = tmp_path / 'lane'
         (lane / 'target').mkdir(parents=True)
@@ -809,34 +751,18 @@ class TestSiblingResolutionIgnoresTheCallersCwd:
 class TestThinSelfClobberGuardDoesNotDependOnPath:
     """``thin-warm-lane.sh``'s self-clobber guard must fire without ``basename``.
 
-    A DIFFERENT failure mechanism from every case above, and the reason this
-    class exists separately rather than as one more parametrization of
-    ``TestSiblingResolutionIgnoresTheCallersCwd``:
+    A DIFFERENT failure mechanism from every case above, which is why this is
+    its own class rather than one more parametrization of
+    ``TestSiblingResolutionIgnoresTheCallersCwd``: a failed substitution inside
+    ``[ ... ]`` compares FALSE and execution continues, where the same failure
+    in an assignment propagates 127 and ``set -e`` aborts.  Same missing
+    binary, opposite blast radius.  See README.md "Delta 7" — "The ``[ ... ]``
+    vs assignment asymmetry" — for the rule and the measurements.
 
-    **A ``$(...)`` substitution that fails with 127 inside ``[ ... ]`` does not
-    abort under ``set -e``.**  ``[ "$(basename "$X")" = "base" ]`` sees only the
-    empty string, compares FALSE, and execution continues — whereas the same
-    failure in an ASSIGNMENT (``name="$(basename "$X")"``) propagates 127 and
-    ``set -e`` kills the script.  Same missing binary, opposite blast radius:
-    the assignment sites in ``warm-lane-gc.sh`` / ``warm-lane-audit.sh`` are
-    loud-and-non-destructive by that accident (both measured; see
-    ``test_only_cosmetic_program_name_forks_remain``), while this one degrades
-    SILENTLY and destructively.
-
-    The site is ``thin-warm-lane.sh``'s ``[ "$(basename "$_rp_lane_dir")" =
-    "base" ]``, the load-bearing half of the self-clobber guard and the ONLY
-    half that fires when ``REIFY_WARM_LANE_MOUNT`` is unset (the two
-    mount-relative checks above it are inside ``if [ -n
-    "${REIFY_WARM_LANE_MOUNT:-}" ]``).  It sits 33 lines above
-    ``rm -rf "$LANE_DIR/target"``.
-
-    MEASURED RED on branch HEAD 27fbfb4ea5 with ``basename`` shimmed to exit
-    127, ``REIFY_WARM_LANE_MOUNT`` unset and ``lane_dir=<pool>/base``: the
-    guard is silently defeated and the script prints ``[ok] Freed
-    <pool>/base/target`` / ``[ok] Thinned lane`` at **rc=0**, deleting the
-    pool's seed source.  Control (``basename`` present): ``Precondition guard:
-    lane_dir resolves to (or is named) the base dir ... refusing to thin``,
-    rc=1, tree intact.
+    The site is ``thin-warm-lane.sh``'s self-clobber guard, the ONLY half that
+    fires when ``REIFY_WARM_LANE_MOUNT`` is unset (the two mount-relative
+    checks above it are inside ``if [ -n "${REIFY_WARM_LANE_MOUNT:-}" ]``), 33
+    lines above ``rm -rf "$LANE_DIR/target"``.
 
     ``REIFY_WARM_LANE_MOUNT`` is deliberately left UNSET here (``_sanitized_env``
     strips it) — that is the branch under test.  Setting it would let the
@@ -886,11 +812,11 @@ class TestThinSelfClobberGuardDoesNotDependOnPath:
         # (a) the actual safety property.
         assert sentinel.is_file(), (
             'thin-warm-lane.sh DELETED the pool seed source under a PATH '
-            'without `basename`: the self-clobber guard tests '
-            '`[ "$(basename "$_rp_lane_dir")" = "base" ]`, and a 127 '
-            'substitution inside `[ ... ]` yields the empty string WITHOUT '
-            'tripping `set -e`, so the guard silently compares false '
-            f'(README.md "Delta 7").\noutput:\n{combined}'
+            'without `basename`.  If the guard has gone back to comparing a '
+            '`$(basename ...)` substitution, that is why: a 127 substitution '
+            'inside `[ ... ]` yields the empty string WITHOUT tripping '
+            '`set -e`, so the guard silently compares false (README.md '
+            f'"Delta 7").\noutput:\n{combined}'
         )
         # (b) it must FAIL, not succeed-having-done-nothing.
         assert proc.returncode != 0, (
@@ -910,9 +836,7 @@ class TestThinSelfClobberGuardDoesNotDependOnPath:
 
         A guard that fires on every input satisfies the case above while
         breaking the script, so the fix has to be shown to be a CORRECTION of
-        the comparison rather than a widening of it.  MEASURED against the
-        prototype fix: ``<pool>/_lane-1`` still thins to rc=0 with its
-        ``target/`` removed under the same hidden-``basename`` PATH.
+        the comparison rather than a widening of it.
         """
         pool = tmp_path / 'pool'
         lane = pool / '_lane-1'
