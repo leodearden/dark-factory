@@ -427,6 +427,11 @@ class TestFileUnknownKeyStormEscalation:
         first = self._file(tmp_path, agent_id='claude-drifter-a')
         second = self._file(tmp_path, agent_id='claude-drifter-b')
 
+        # Both writers must actually get an id: a `None` here would mean the
+        # filing degraded to a log line, and the per-writer assertions below
+        # would then be vacuous rather than failing.
+        assert first is not None
+        assert second is not None
         assert first != second, 'the second writer must not be folded into the first'
         assert len(open_by_task) == 2
         assert 'claude-drifter-a' in first
