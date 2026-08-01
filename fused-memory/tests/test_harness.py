@@ -5419,6 +5419,11 @@ async def test_run_loop_releases_stale_claims_on_startup(
     released unconditionally.  The per-project reconciliation lock guarantees
     at most one active replayer per project, so there is nothing to race with at
     startup before any project loop has spawned.
+
+    Drives run_loop via _drive_run_loop_until, waiting on the OBSERVABLE EVENT
+    the assertion below checks (the startup release ran) rather than budgeting
+    run_loop's startup path inside a fixed wall-clock wait_for — see that
+    helper's docstring for the full rationale.
     """
     import asyncio
     from unittest.mock import AsyncMock
@@ -5452,8 +5457,7 @@ async def test_run_loop_releases_stale_claims_on_startup(
 
     harness.buffer.release_stale_claims = AsyncMock(side_effect=_signal_release)
 
-    with contextlib.suppress(TimeoutError):
-        await asyncio.wait_for(harness.run_loop(), timeout=0.2)
+    await _drive_run_loop_until(harness, released)
 
     # Must be called exactly once (startup, not per loop iteration)
     # Cutoff must be 0 so even a freshly-claimed row is re-queued on fast restart.
