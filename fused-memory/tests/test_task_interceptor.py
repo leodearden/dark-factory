@@ -10255,6 +10255,7 @@ class TestMultiProjectRoutingWiring:
 
         (tmp_path / 'reify').mkdir()
         (tmp_path / 'reify' / 'crates').mkdir()
+        (tmp_path / 'reify' / 'orchestrator').mkdir()
         registry = ProjectPrefixRegistry.from_roots([str(tmp_path / 'reify')])
         interceptor._prefix_registry = registry
 
@@ -10270,7 +10271,9 @@ class TestMultiProjectRoutingWiring:
         interceptor._scope_violation_escalator = SpyEscalator()
 
         kwargs = {
-            'title': 'Mirror the crates/ logic',
+            # Foreign FILES entry (exact owner lookup) AND foreign prose (regex
+            # prefix hit) — two independent signals, one audit record.
+            'title': 'Mirror the orchestrator/harness.py logic',
             'metadata': {'files': ['crates/widget.rs']},
         }
         result = await interceptor._path_guard_or_skip(
@@ -10284,7 +10287,7 @@ class TestMultiProjectRoutingWiring:
         assert len(override_calls) == 1, override_calls
         paths = override_calls[0]['matched_paths']
         assert paths[0] == 'crates/widget.rs', f'files-certain paths come first: {paths}'
-        assert 'crates/' in paths, f'prose prefix must be unioned in: {paths}'
+        assert 'orchestrator/' in paths, f'prose prefix must be unioned in: {paths}'
         assert len(paths) == len(set(paths)), f'matched_paths must be deduped: {paths}'
 
     async def test_no_override_leaves_enforcement_unchanged(

@@ -2292,6 +2292,88 @@ class TaskInterceptor:
                 'continuing with rejection error',
             )
 
+    @staticmethod
+    def _override_matched_paths(
+        files_verdict: PathGuardVerdict,
+        prose_verdict: PathGuardVerdict,
+    ) -> tuple[str, ...]:
+        """Union the two REPORTING-ONLY verdicts' paths for the audit record.
+
+        Files-certain paths first (they are exact owner lookups), then any
+        prose prefixes not already present.  Order-stable and deduplicated so
+        the recorded list is reproducible — the record's whole value is that
+        it can be checked against the guard's behaviour after the fact.
+        """
+        paths: list[str] = []
+        for verdict in (files_verdict, prose_verdict):
+            for path in verdict.matched_paths:
+                if path not in paths:
+                    paths.append(path)
+        return tuple(paths)
+
+    def _emit_routing_override_escalation(
+        self,
+        *,
+        reason: str,
+        candidate: CandidateTask | None,
+        kwargs: dict[str, Any],
+        project_root: str,
+        project_id: str,
+        files_verdict: PathGuardVerdict,
+        prose_verdict: PathGuardVerdict,
+    ) -> None:
+        """File the AUDIT record for a routing-override bypass.
+
+        Pure side-effect helper modelled on
+        :meth:`_emit_scope_violation_escalation`, with the same never-raise
+        contract — and here it matters MORE, not less: the submission this
+        describes has already been allowed, so a queue failure must not
+        convert an allowed submission into an exception.  No-ops when no
+        escalator is configured.
+
+        *files_verdict* / *prose_verdict* are computed for REPORTING ONLY by
+        the caller; nothing is enforced from them.  ``suggested_project`` is
+        the files verdict's suggestion when it rejected, else the prose
+        verdict's, else ``None``.
+        """
+        if self._scope_violation_escalator is None:
+            return
+        matched_paths = self._override_matched_paths(files_verdict, prose_verdict)
+        if not matched_paths:
+            # Provisional (task 3123 step-6): removed in step-8, which makes
+            # the record unconditional.
+            return
+        suggested_project = (
+            files_verdict.suggested_project
+            if files_verdict.is_rejection
+            else prose_verdict.suggested_project
+        )
+        registry = self._prefix_registry
+        suggested_root: str | None = None
+        # Same defensive `registry is not None` check as
+        # :meth:`_emit_scope_violation_escalation` — root_for_project must
+        # never be reached on a None registry.
+        if suggested_project and registry is not None:
+            suggested_root = registry.root_for_project(suggested_project)
+        candidate_title = (candidate.title if candidate else '') or str(
+            kwargs.get('title') or kwargs.get('prompt') or '<unknown>',
+        )[:200]
+        try:
+            self._scope_violation_escalator.report_routing_override(
+                project_root=project_root,
+                project_id=project_id,
+                candidate_title=candidate_title,
+                reason=reason,
+                matched_paths=matched_paths,
+                suggested_project=suggested_project,
+                suggested_root=suggested_root,
+            )
+        except Exception:  # pragma: no cover — defensive only
+            logger.exception(
+                'task_interceptor: scope_violation_escalator raised on the '
+                'routing-override audit path; the submission stays allowed',
+            )
+
     async def _path_guard_or_skip(
         self,
         kwargs: dict[str, Any],
@@ -2312,6 +2394,18 @@ class TaskInterceptor:
         describes — read it there rather than re-deriving it here; only the
         facts specific to this seam are recorded below.
 
+        * Outcome (0), AUDITED BYPASS — a non-blank *routing_override_reason*.
+          Checked FIRST, and deliberately so: it makes "no enforcement
+          side-effect fires on the override path" a STRUCTURAL property of
+          this method rather than one every future branch would have to
+          re-establish.  Since task 3123 the verdicts ARE computed inside
+          this branch, purely to populate an audit record — they are pure
+          functions returning frozen verdicts, and NONE of the enforcement
+          side-effects (the reject dict, the ``possible_scope_mismatch``
+          stamp, the ``cross_repo`` tag, ``report_rejection``) is reachable
+          from it.  A ``scope_violation`` override record is filed via
+          :meth:`_emit_routing_override_escalation` so the bypass is visible
+          in the operator queue and not only in a ``logger.warning``.
         * Outcome (1), FILES-CERTAIN reject — :meth:`_files_scope_check`.  No
           LLM adjudication: the file's owner is either known and different,
           or it isn't, so there is nothing to adjudicate.
@@ -2365,15 +2459,39 @@ class TaskInterceptor:
         Call-site pattern:
             ``if err := await self._path_guard_or_skip(kwargs, project_root, project_id): return err``
         """
-        # Routing override: deliberate bypass of BOTH the FILES-certain
-        # reject and the PROSE-advisory.  Must be the FIRST action so no
-        # verdict computation or escalation fires.
+        # Routing override, outcome (0) — AUDITED BYPASS.  Deliberate bypass
+        # of BOTH the FILES-certain reject and the PROSE-advisory.  Stays the
+        # FIRST action so that "no enforcement side-effect fires here" is
+        # STRUCTURAL rather than a property every future branch would have to
+        # re-establish independently.
+        #
+        # Since task 3123 the verdicts ARE computed inside this branch — for
+        # REPORTING ONLY.  check_files_for_scope / check_text_for_scope are
+        # pure and return frozen PathGuardVerdicts, so this cannot leak an
+        # enforcement action: no reject dict, no possible_scope_mismatch
+        # stamp, no cross_repo tag and no report_rejection is reachable from
+        # here.  It buys the audit record its paths.
         if is_routing_override(routing_override_reason):
+            if candidate is None:
+                candidate = self._build_candidate(kwargs)
+            files_verdict = self._files_scope_check(candidate, kwargs, project_id)
+            prose_verdict = self._path_guard_check(candidate, kwargs, project_id)
+            override_paths = self._override_matched_paths(files_verdict, prose_verdict)
             logger.warning(
                 'path-guard ROUTING OVERRIDE: skipping path guards for '
-                'project_id=%s reason=%r',
+                'project_id=%s reason=%r would_have_matched=%s',
                 project_id,
                 routing_override_reason.strip(),
+                list(override_paths),
+            )
+            self._emit_routing_override_escalation(
+                reason=routing_override_reason,
+                candidate=candidate,
+                kwargs=kwargs,
+                project_root=project_root,
+                project_id=project_id,
+                files_verdict=files_verdict,
+                prose_verdict=prose_verdict,
             )
             return None
 
