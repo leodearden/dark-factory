@@ -67,6 +67,7 @@ from repair_wiped_metadata_files import (  # pyright: ignore[reportMissingImport
     format_summary,
     plan_files_rejection_reason,
     repair_one,
+    repair_project,
     select_repairable_candidates,
 )
 
@@ -538,6 +539,38 @@ def test_repair_one_accepts_a_plain_success_shape():
         assert result.disposition == REPAIR, payload
 
 
+def test_repair_one_carries_the_candidates_tag_verbatim():
+    """(f) THE TAG IS HALF THE PRIMARY KEY, AND OMITTING IT IS A SILENT RETARGET.
+
+    ``WipeCandidate.tag`` is the FIRST field of the audit's NamedTuple
+    (scripts/audit_wiped_metadata_files.py:501) because the audit nominates
+    candidates under ``(tag, id)``: ``load_task_records``'s docstring (:460-465)
+    states the schema "permits the same numeric id under two tags and collapsing
+    them would silently merge two distinct tasks", and the coverage comment
+    (:609-612) states one plan record "matches two DISTINCT tasks" in that case.
+
+    ``update_task`` accepts an optional ``tag``, and when it is absent the
+    backend does not error — it substitutes ``DEFAULT_TAG = 'master'``
+    (fused-memory/src/fused_memory/backends/sqlite_task_backend.py:127, applied
+    on the update_task path at :2612). So dropping the tag writes the recovered
+    scope onto a DIFFERENT task that merely shares the id, which is exactly the
+    failure the four-gate model exists to prevent.
+
+    Asserted with a NON-master tag so a hardcoded or defaulted ``'master'``
+    cannot pass, and on the exact value — never merely ``"tag" in arguments``.
+    """
+    client = _FakeClient()
+    candidate = _candidate(77, tag="feature-x")
+
+    result = asyncio.run(repair_one(client, _ROOT, candidate, now_iso=_NOW))
+
+    assert result.disposition == REPAIR
+    assert len(client.calls) == 1
+    name, arguments = client.calls[0]
+    assert name == "update_task"
+    assert arguments["tag"] == "feature-x"
+
+
 # ---------------------------------------------------------------------------
 # format_summary — THE HONESTY ARTIFACT.
 #
@@ -814,6 +847,52 @@ def _wiped_project(tmp_path, name="proj", task_id=2464):
         plans=[(str(task_id), {"task_id": task_id, "files": ["a.py", "b.py"]})],
         name=name,
     )
+
+
+# ---------------------------------------------------------------------------
+# repair_project END-TO-END on the LIVE RE-READ path — gate 3 must interrogate
+# the candidate's OWN task, not the master-tag row that happens to share its id.
+# ---------------------------------------------------------------------------
+
+
+def test_repair_project_re_reads_the_candidates_own_tag_not_the_default(tmp_path):
+    """The companion to the repair_one assertion above, on the OTHER MCP call.
+
+    ``get_task`` takes the same optional ``tag``
+    (fused-memory/src/fused_memory/server/tools.py:4182-4186) and defaults it
+    the same silent way. Dropped there, gate 3 (``classify_live_task``) judges
+    the WRONG task's live status — and idempotency dies with it, because
+    SKIP_FILES_PRESENT would be evaluated against the master-tag row, so a
+    re-run would re-write.
+
+    The whole project is synthetic and the task row carries ``tag="feature-x"``
+    (``_make_tasks_db`` already honours ``row.get("tag", "master")``), so the
+    tag travels the real path: tasks.db column -> audit -> WipeCandidate -> wire.
+    """
+    root = _make_project(
+        tmp_path,
+        tasks=[
+            {
+                "id": 77,
+                "tag": "feature-x",
+                "status": "done",
+                "metadata": {"files": []},
+            }
+        ],
+        plans=[("77", {"task_id": 77, "files": ["a.py", "b.py"]})],
+    )
+    # One payload serves both calls: get_task reads it as a terminal task with
+    # empty files (so gate 3 says REPAIR and the run reaches the write), and
+    # update_task reads it as a plain non-error success.
+    client = _FakeClient(returns={"id": "77", "status": "done", "metadata": {"files": []}})
+
+    result = asyncio.run(repair_project(client, str(root), apply=True, now_iso=_NOW))
+
+    assert [o.disposition for o in result.outcomes] == [REPAIR]
+    assert [o.tag for o in result.outcomes] == ["feature-x"]
+    calls = dict(client.calls)
+    assert set(calls) == {"get_task", "update_task"}
+    assert calls["get_task"]["tag"] == "feature-x"
 
 
 _SCRIPT = str(Path(__file__).parent.parent.parent / "scripts" / "repair_wiped_metadata_files.py")
