@@ -324,3 +324,158 @@ class TestForceWorkspaceBreadthExecutionGoldens:
             f'expected the train-tip call to widen to every registered module; '
             f'got {set(executed)!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# task 3294: the mixed-diff widening, end-to-end through the plan→execution bridge
+# ---------------------------------------------------------------------------
+
+# orchestrator/orchestrator.yaml:5/7/8, verbatim. The REAL config the task-3033
+# incident ran under — using the synthetic 'uv run --directory moda pytest
+# tests/' shape here would not show that the widened command targets the whole
+# tests/ package that statically contains the regressed module.
+_ORCH_TEST_COMMAND: str = (
+    'uv run --project orchestrator --directory orchestrator pytest tests/ '
+    '--tb=short -q --timeout=300'
+)
+_ORCH_LINT_COMMAND: str = (
+    'uv run --project orchestrator --directory orchestrator ruff check src/ tests/'
+    ' && python3 fused-memory/scripts/check_bare_magicmock_config.py orchestrator/tests'
+)
+_ORCH_TYPE_CHECK_COMMAND: str = (
+    'uv run --project orchestrator --directory orchestrator pyright src/ tests/'
+)
+
+# The task-3033 attempt-1 diff shape: the module's hottest production file plus
+# a co-committed test file. Pre-3294 the plan file-scoped this to the test file
+# alone (36 items instead of ~13188) and the regression in a DIFFERENT consumer
+# of workflow.py was structurally invisible.
+_MIXED_3033_DIFF: list[str] = [
+    'orchestrator/src/orchestrator/workflow.py',
+    'orchestrator/tests/test_new_thing.py',
+]
+
+# The module whose regression reached a debugger in task 3033 — a consumer of
+# workflow.py that the narrowed leg never collected.
+_REGRESSED_TEST_MODULE: str = 'orchestrator/tests/test_workflow_resume_on_progress.py'
+
+
+def _orchestrator_registry(tmp_path: Path) -> tuple[ModuleConfig, OrchestratorConfig]:
+    """A single-module registry carrying orchestrator.yaml's REAL commands."""
+    mc = ModuleConfig(
+        prefix='orchestrator',
+        test_command=_ORCH_TEST_COMMAND,
+        lint_command=_ORCH_LINT_COMMAND,
+        type_check_command=_ORCH_TYPE_CHECK_COMMAND,
+    )
+    config = OrchestratorConfig(project_root=tmp_path)
+    config._module_configs = {'orchestrator': mc}
+    return mc, config
+
+
+def _write_3033_diff(tmp_path: Path) -> None:
+    """Materialise the mixed diff under *tmp_path* so the existence filter keeps it.
+
+    workflow.py's content carries a ``Protocol`` subclass so it classifies
+    STRUCTURAL exactly as the real file does (it defines ``class
+    _McpLike(Protocol)``) — the case a SOURCE-only widening predicate would
+    miss.
+    """
+    src = tmp_path / 'orchestrator' / 'src' / 'orchestrator'
+    src.mkdir(parents=True, exist_ok=True)
+    (src / 'workflow.py').write_text(
+        'from typing import Protocol\n\n\n'
+        'class _McpLike(Protocol):\n'
+        '    def call(self) -> None: ...\n',
+    )
+    tests = tmp_path / 'orchestrator' / 'tests'
+    tests.mkdir(parents=True, exist_ok=True)
+    (tests / 'test_new_thing.py').write_text('def test_new_thing(): pass\n')
+
+
+class TestTaskRoleMixedDiffFullSuiteExecution:
+    """Task 3294, END-TO-END: the mixed-diff widening survives the bridge.
+
+    ``test_verify_plan.py``'s ``TestDeriveVerifyPlanTaskRoleFloorMixedDiff``
+    pins the decision at the pure ``derive_verify_plan`` layer. Task κ made
+    the ``VerifyPlan`` authoritative, but
+    ``_executed_module_configs_from_plan`` is what actually renders it into
+    the ``ModuleConfig``(s) handed to ``run_verification`` — so the pure-layer
+    widening is only real if it survives that mapping. This class drives the
+    REAL ``run_scoped_verification`` with the task-3033-shaped diff and pins
+    what actually executes.
+    """
+
+    @pytest.mark.asyncio
+    async def test_task_3033_shaped_mixed_diff_executes_owning_module_full_suite(
+        self, tmp_path: Path,
+    ):
+        """(a) The EXECUTED ModuleConfig carries the module's verbatim
+        full-suite test_command — not a narrowed one — and the command never
+        names the co-committed test file."""
+        mc, config = _orchestrator_registry(tmp_path)
+        _write_3033_diff(tmp_path)
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            result = await run_scoped_verification(
+                tmp_path, config, [mc], task_files=_MIXED_3033_DIFF, role='task',
+            )
+
+        assert result.passed
+        executed = _executed_module_configs(mock_run_verification)
+        assert len(executed) == 1
+        executed_mc = executed[0]
+        assert executed_mc.prefix == 'orchestrator'
+        # The verbatim full-suite command, byte-for-byte — a FULL_SUITE slot
+        # is rendered by _executed_module_configs_from_plan as getattr(mc, attr).
+        assert executed_mc.test_command == _ORCH_TEST_COMMAND
+        assert executed_mc.test_command is not None
+        assert 'test_new_thing.py' not in executed_mc.test_command
+
+    @pytest.mark.asyncio
+    async def test_result_plan_records_full_suite_for_the_mixed_diff(
+        self, tmp_path: Path,
+    ):
+        """(b) PRD A1: the record an operator reads matches what ran. The
+        plan's orchestrator pytest run is 'full_suite' with no
+        scoped_targets, and its reason explains that the co-committed test
+        did not narrow it."""
+        mc, config = _orchestrator_registry(tmp_path)
+        _write_3033_diff(tmp_path)
+
+        mock_run_verification = _run_verification_spy()
+        with patch.object(verify, 'run_verification', new=mock_run_verification):
+            result = await run_scoped_verification(
+                tmp_path, config, [mc], task_files=_MIXED_3033_DIFF, role='task',
+            )
+
+        assert result.plan is not None
+        pytest_runs = [
+            r for r in result.plan['runs']
+            if r['module_prefix'] == 'orchestrator' and r['reason'].startswith('pytest:')
+        ]
+        assert len(pytest_runs) == 1
+        pytest_run = pytest_runs[0]
+        assert pytest_run['scope_kind'] == 'full_suite'
+        assert pytest_run['scoped_targets'] == []
+        assert 'narrow' in pytest_run['reason'].lower()
+
+    def test_full_suite_target_statically_contains_the_regressed_test_module(self):
+        """(c) The point of the widening, asserted without running anything:
+        the module whose regression reached a debugger in task 3033 lives
+        under the ``tests/`` directory the FULL_SUITE command targets, so the
+        widened scope demonstrably collects it. Pure path/existence check
+        against the repo root — no pytest collection, no subprocess."""
+        repo_root = Path(__file__).resolve().parents[2]
+        regressed = repo_root / _REGRESSED_TEST_MODULE
+        assert regressed.is_file(), (
+            f'{_REGRESSED_TEST_MODULE} is the task-3033 regression golden this '
+            f'task exists to make collectable; it must stay tracked at this path'
+        )
+        # The verbatim command runs with cwd=orchestrator/ and targets 'tests/'.
+        assert '--directory orchestrator' in _ORCH_TEST_COMMAND
+        assert ' pytest tests/ ' in _ORCH_TEST_COMMAND
+        targeted_dir = repo_root / 'orchestrator' / 'tests'
+        assert targeted_dir.is_dir()
+        assert targeted_dir in regressed.parents
