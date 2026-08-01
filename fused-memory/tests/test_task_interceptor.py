@@ -13,6 +13,8 @@ import pytest_asyncio
 from _fm_helpers import _init_git_repo, make_8df8_scenario
 from _fm_helpers import submit_and_resolve as _submit_and_resolve
 
+from fused_memory.backends.sqlite_task_backend import _merge_metadata, _resolve_metadata_mode
+from fused_memory.backends.task_backend_errors import TaskmasterError
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
 from fused_memory.middleware import scope_violation_escalator as sve_mod
 from fused_memory.middleware.task_curator import CandidateTask, CuratorDecision, RewrittenTask
@@ -718,12 +720,22 @@ async def test_curator_combine_updates_target_and_returns_id(
     assert call.kwargs['title'] == 'Harden parser'
     assert call.kwargs['priority'] == 'high'
     assert 'line 42' in call.kwargs['details']  # specifics preserved verbatim
-    # Combine is a whole-blob overwrite — it must use the explicit
-    # metadata_mode='replace' co-signal, NOT a bare append=False (which the
-    # task-2180 metadata-wipe guard now rejects). Lock both: the co-signal is
-    # present, and no bare append=False is forwarded.
-    assert call.kwargs.get('metadata_mode') == 'replace', (
-        f"combine must pass metadata_mode='replace'; got {call.kwargs.get('metadata_mode')!r}"
+    # Combine MERGES its three marker keys into the target's existing metadata
+    # blob — it is NOT a whole-blob overwrite (task 3446). Under 'replace' the
+    # write deleted every pre-existing key on the target: the escalation-gate
+    # markers (execution_class / operational_mode / task_kind /
+    # always_escalates / gate_escalated_at) plus source, spawned_from,
+    # candidate_key, milestone, model_overrides, … A "Human gate:" task lost
+    # always_escalates=True this way and was then dispatched to an architect.
+    # Do NOT "restore" 'replace': it was never chosen, it was inherited from a
+    # legacy bare append=False by commit bc4344db10 (task 2751 step-6),
+    # annotated "Behaviour-preserving".
+    #
+    # The bare append=False assertion below is separate and still load-bearing:
+    # the task-2180 metadata-wipe guard rejects that signal outright, so
+    # combine must state its intent through metadata_mode only.
+    assert call.kwargs.get('metadata_mode') == 'merge', (
+        f"combine must pass metadata_mode='merge'; got {call.kwargs.get('metadata_mode')!r}"
     )
     assert call.kwargs.get('append') is not False, (
         f'combine must not pass a bare append=False; got {call.kwargs.get("append")!r}'
@@ -1031,6 +1043,193 @@ async def test_curator_combine_fingerprint_normalization(
 
     assert result['action'] == 'combine'
     taskmaster.update_task.assert_called_once()
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Task 3446: combine MERGES metadata — it must never wipe the target blob
+# ─────────────────────────────────────────────────────────────────────
+
+# The escalation-gate stamp as written at the submit boundary by
+# operational_routing_guard.inject_operational_routing /
+# TaskInterceptor._inject_deterministic_pure_gate, plus two ordinary
+# submit-time keys that the 'replace' write destroyed just as thoroughly.
+_GATE_TARGET_METADATA = {
+    'execution_class': 'operational',
+    'operational_mode': 'gate',
+    'task_kind': 'deterministic',
+    'always_escalates': True,
+    'gate_escalated_at': '2026-08-01T08:00:00+00:00',
+    'source': 'recon-stage2',
+}
+
+
+def _record_merged_metadata(taskmaster, existing_raw: str | None) -> dict:
+    """Make ``tm.update_task`` compute the blob the real backend would store.
+
+    The interceptor only hands the backend an *incoming* blob plus a mode; the
+    destructive-vs-preserving question is settled inside
+    ``sqlite_task_backend._merge_metadata``.  Asserting on the incoming blob
+    alone would pass identically under 'replace' and 'merge' and so prove
+    nothing — this helper resolves the mode exactly as the backend does and
+    runs the real merge against *existing_raw* (the target's stored blob),
+    recording the resulting stored metadata for the test to assert on.
+    """
+    recorded: dict[str, Any] = {}
+
+    async def _update(**kwargs):
+        incoming = kwargs.get('metadata')
+        recorded['mode'] = _resolve_metadata_mode(
+            kwargs.get('metadata_mode'),
+            kwargs.get('append'),
+            metadata_present=incoming is not None,
+        )
+        recorded['stored'] = json.loads(
+            _merge_metadata(existing_raw, incoming, mode=recorded['mode'])
+        )
+        return {'success': True}
+
+    taskmaster.update_task = AsyncMock(side_effect=_update)
+    return recorded
+
+
+def _combine_decision(justification: str, *, fingerprint: str = 'Test Task') -> CuratorDecision:
+    """A well-formed combine decision aimed at target 50."""
+    return CuratorDecision(
+        action='combine',
+        target_id='50',
+        target_fingerprint=fingerprint,
+        rewritten_task=RewrittenTask(
+            title='Test Task',
+            description='Combined',
+            details='d',
+            files_to_modify=[],
+            priority='medium',
+        ),
+        justification=justification,
+    )
+
+
+@pytest.mark.asyncio
+async def test_curator_combine_preserves_target_gate_markers(
+    curator_interceptor,
+    taskmaster,
+    audit_dir,
+):
+    """Combining into a gated target leaves its gate markers intact (task 3446).
+
+    The behavioural assertion for the whole fix: task 3426 ("Human gate: …")
+    went through combine, lost always_escalates=True, and was then dispatched
+    to an architect. The stored blob must keep every pre-existing key AND gain
+    the three combine markers.
+    """
+    existing_raw = json.dumps(_GATE_TARGET_METADATA)
+    taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': '50',
+            'status': 'blocked',
+            'title': 'Test Task',
+            'metadata': existing_raw,
+        }
+    )
+    recorded = _record_merged_metadata(taskmaster, existing_raw)
+    curator_interceptor._curator = _mock_curator(_combine_decision('same human gate'))
+
+    result = await _submit_and_resolve(curator_interceptor, '/project', title='dup gate')
+
+    assert result['action'] == 'combine'
+    stored = recorded['stored']
+    for key, value in _GATE_TARGET_METADATA.items():
+        assert stored.get(key) == value, (
+            f'combine destroyed target metadata key {key!r}: '
+            f'expected {value!r}, stored blob is {stored!r}'
+        )
+    # …and the combine markers are still authoritative on top.
+    assert stored['curator_action'] == 'combine'
+    assert stored['curator_justification'] == 'same human gate'
+    assert stored['combined_at']
+
+
+@pytest.mark.asyncio
+async def test_curator_combine_uses_merge_not_replace(
+    curator_interceptor,
+    taskmaster,
+    audit_dir,
+):
+    """The call-args pin for task 3446: combine writes with metadata_mode='merge'.
+
+    Companion to the behavioural test above — this one fails loudly at the
+    exact call site if the mode is ever reverted, without needing a gated
+    target to reproduce the loss.
+    """
+    curator_interceptor._curator = _mock_curator(_combine_decision('mode pin'))
+
+    result = await _submit_and_resolve(curator_interceptor, '/project', title='dup')
+
+    assert result['action'] == 'combine'
+    call = taskmaster.update_task.call_args
+    assert call.kwargs.get('metadata_mode') == 'merge', (
+        f"combine must pass metadata_mode='merge'; got {call.kwargs.get('metadata_mode')!r}"
+    )
+    # Still not a bare append=False — the task-2180 metadata-wipe guard
+    # rejects that signal outright.
+    assert call.kwargs.get('append') is not False, (
+        f'combine must not pass a bare append=False; got {call.kwargs.get("append")!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_curator_combine_corrupt_target_metadata_aborts(
+    curator_interceptor,
+    taskmaster,
+    audit_dir,
+    caplog,
+):
+    """A corrupt target metadata blob aborts the combine instead of clobbering it.
+
+    'replace' deliberately bypasses ``_merge_metadata``'s corrupt-existing-blob
+    guard (it is the sanctioned path to repair a corrupt row); 'merge' does
+    not. A curator combine is not a corrupt-row repair, so the raise is the
+    desired behaviour: loud refusal + degrade to create, per
+    docs/legibility/design-invariants.md no-silent-fail-soft.
+    """
+    taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': '50',
+            'status': 'pending',
+            'title': 'Test Task',
+            'metadata': '{not json',
+        }
+    )
+
+    async def _update(**kwargs):
+        mode = _resolve_metadata_mode(
+            kwargs.get('metadata_mode'),
+            kwargs.get('append'),
+            metadata_present=kwargs.get('metadata') is not None,
+        )
+        if mode != 'replace':
+            # Mirrors _merge_metadata's refusal for merge/additive.
+            raise TaskmasterError(
+                'TASKMASTER_TOOL_ERROR',
+                'Task 50 has a corrupt metadata blob; refusing to overwrite it '
+                '(original bytes preserved).',
+            )
+        return {'success': True}
+
+    taskmaster.update_task = AsyncMock(side_effect=_update)
+    curator_interceptor._curator = _mock_curator(_combine_decision('corrupt target'))
+
+    with caplog.at_level(logging.WARNING):
+        result = await _submit_and_resolve(curator_interceptor, '/project', title='dup')
+
+    # Degraded to the create path rather than silently overwriting the row.
+    assert result == {'id': '2', 'title': 'New Task'}
+    taskmaster.add_task.assert_called_once()
+    assert any(
+        'combine update failed for target=50' in rec.getMessage()
+        for rec in caplog.records
+        if rec.levelno >= logging.WARNING
+    ), f'expected a WARNING naming target 50; got {[r.getMessage() for r in caplog.records]}'
 
 
 @pytest.mark.asyncio
