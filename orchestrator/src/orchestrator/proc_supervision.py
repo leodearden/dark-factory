@@ -57,7 +57,9 @@ test_proc_supervision.py pending that conversion landing.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import logging
+import os
 import shlex
 import sys
 from dataclasses import dataclass, replace
@@ -72,6 +74,74 @@ if TYPE_CHECKING:
     from escalation.queue import EscalationQueue
 
 logger = logging.getLogger(__name__)
+
+
+# The packages the deferred RP-4 ``python -m escalation submit`` child must be
+# able to import.  MEASURED import chain (both are load-bearing, neither is
+# speculative): ``escalation.__main__`` -> ``escalation.submit`` ->
+# ``escalation.queue`` -> ``shared.timestamps`` -> ``shared/__init__.py``.
+_SUBMIT_CHILD_PACKAGES: tuple[str, ...] = ('escalation', 'shared')
+
+
+def _submit_child_pythonpath() -> str:
+    """Build the PYTHONPATH value for the deferred submit child.
+
+    Derived entirely from THIS process's own import resolution and its own
+    environment — never from anything the child might inherit, because
+    (MEASURED) ``systemd-run --user`` propagates NONE of the caller's
+    environment to a transient unit.
+
+    Order, deduped order-preserving:
+
+    1. Every non-empty entry of this process's ``PYTHONPATH``, first — this
+       explicitly re-supplies exactly what systemd-run drops, preserving the
+       parent's own ``sys.path`` precedence.  Correct even if a future
+       deployment sets PYTHONPATH on the orchestrator unit (today it sets
+       none).
+    2. The resolved import root of each :data:`_SUBMIT_CHILD_PACKAGES` entry,
+       via ``importlib.util.find_spec(pkg).submodule_search_locations`` ->
+       ``Path(loc).resolve().parent``, as a floor.  Resolving rather than
+       hardcoding a repo layout keeps this correct under both the editable
+       install used in the deployed venv and a real wheel install.
+
+    NOTE this is only ONE of the two legs of the child's importability: it
+    covers the workspace src roots.  The third-party dependency floor
+    (``aiosqlite``, reached via ``shared/__init__.py`` ->
+    ``shared.async_sqlite_base``) lives in site-packages and is guaranteed
+    instead by the child running the SAME interpreter as this process — see
+    :meth:`EscalationSpec.to_submit_argv`.
+    """
+    roots: list[str] = []
+    seen: set[str] = set()
+
+    def _add(root: str) -> None:
+        if root and root not in seen:
+            seen.add(root)
+            roots.append(root)
+
+    for entry in os.environ.get('PYTHONPATH', '').split(os.pathsep):
+        _add(entry)
+
+    for pkg in _SUBMIT_CHILD_PACKAGES:
+        spec = importlib.util.find_spec(pkg)
+        locations = spec.submodule_search_locations if spec is not None else None
+        for loc in locations or ():
+            _add(str(Path(loc).resolve().parent))
+
+    return os.pathsep.join(roots)
+
+
+def _submit_child_setenv_args() -> list[str]:
+    """The ``--setenv=PYTHONPATH=...`` systemd-run args for the submit child.
+
+    Returns a single-element list, or an empty list when there is nothing to
+    supply (in which case the child keeps the empty PYTHONPATH systemd-run
+    would have given it anyway — no behaviour is lost by omitting the token).
+    """
+    pythonpath = _submit_child_pythonpath()
+    if not pythonpath:
+        return []
+    return [f'--setenv=PYTHONPATH={pythonpath}']
 
 
 @dataclass(frozen=True)
@@ -644,6 +714,28 @@ class RestartPlan:
         ``on_failure_escalation`` is None the payload is left unbranched (no
         wrapper) — still a valid ``/bin/sh -c`` invocation, just with no
         on-failure reporting.
+
+        ``--setenv=PYTHONPATH=<roots>`` is the same shape of guard as
+        ``--working-directory``, one environment dimension over: cwd was
+        silently DEFAULTED to $HOME, PYTHONPATH is silently DROPPED. MEASURED
+        against the live user manager:
+
+        - ``systemd-run --user`` propagates NO environment from its caller — a
+          caller exporting ``PYTHONPATH=/tmp/sentinel-df`` produced a transient
+          unit whose ``$PYTHONPATH`` was ``[]``. (Its PATH is the systemd user
+          manager's, not the orchestrator unit's ``Environment=PATH=``.)
+        - ``--setenv`` DOES reach the DEFERRED ``--on-active`` unit at fire
+          time, not just an immediate one: an ``--on-active=5
+          --setenv=PYTHONPATH=/tmp/x`` unit printed
+          ``ONACTIVE PYTHONPATH=[/tmp/x]`` when it fired.
+
+        So the token is emitted GATED on ``on_failure_escalation`` — it exists
+        solely so the RP-4 ``python -m escalation submit`` child can import,
+        and a plan with no escalation spec has no submit token in its payload,
+        keeping that argv byte-identical. See :func:`_submit_child_pythonpath`
+        for how the value is built, and :meth:`EscalationSpec.to_submit_argv`
+        for the OTHER leg of the child's importability (interpreter identity,
+        which PYTHONPATH cannot cover).
         """
         on_active_secs = max(int(self.on_active_secs), 5)
         payload = ' '.join(shlex.quote(p) for p in [str(self.script), *self.args])
@@ -672,8 +764,10 @@ class RestartPlan:
                 f'if [ "$__rc" -ne 0 ]; then {on_failure}; fi; '
                 f'exit "$__rc"'
             )
+            setenv_args = _submit_child_setenv_args()
         else:
             wrapped = payload
+            setenv_args = []
 
         argv = [
             'systemd-run', '--user',
@@ -681,6 +775,7 @@ class RestartPlan:
             f'--unit={self.transient_unit}',
             '--collect',
             f'--working-directory={self.cwd}',
+            *setenv_args,
             '/bin/sh', '-c', wrapped,
         ]
         proc = await runner(

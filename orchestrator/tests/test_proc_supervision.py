@@ -251,17 +251,20 @@ class TestSelfRestartSystemdRunArgv:
 
         assert len(runner.calls) == 1
         argv, _kwargs = runner.calls[0]
-        assert argv[:7] == (
+        assert argv[:6] == (
             'systemd-run', '--user',
             '--on-active=10',
             '--unit=orch-redeploy-restart-99.service',
             '--collect',
             '--working-directory=/proj',
-            '/bin/sh',
         )
-        assert argv[7] == '-c'
-        assert len(argv) == 9
-        wrapped = argv[8]
+        # Index-derived, not a re-hardcoded length: `--setenv=` options (task
+        # 3453) are spliced between --working-directory and /bin/sh, so pin
+        # the COMMAND's shape relative to /bin/sh rather than at fixed offsets.
+        sh_at = argv.index('/bin/sh')
+        assert argv[sh_at + 1] == '-c'
+        assert len(argv) == sh_at + 3, 'the /bin/sh -c payload must be the final token'
+        wrapped = argv[sh_at + 2]
 
         expected_payload = ' '.join(
             shlex.quote(p) for p in ['/proj/scripts/restart-orchestrator.sh', '--foo']
