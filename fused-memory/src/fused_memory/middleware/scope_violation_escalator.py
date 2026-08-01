@@ -564,7 +564,8 @@ class ScopeViolationEscalator:
                 category=_CATEGORY,
                 summary=(
                     f'Path-guard ROUTING OVERRIDE used in {project_id}: '
-                    f'guards skipped (would have flagged: {paths_str})'
+                    f'guards skipped (would have flagged: {paths_str}) '
+                    f'— reason: {summary_reason!r}'
                 ),
                 detail=detail,
                 suggested_action=_OVERRIDE_SUGGESTED_ACTION,

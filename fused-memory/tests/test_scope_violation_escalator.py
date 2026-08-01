@@ -1017,6 +1017,49 @@ class TestRoutingOverrideEscalation:
         assert '<nothing>' in payloads[0]['summary']
         assert 'would_have_matched_paths=[]' in payloads[0]['detail']
 
+    def test_unbounded_reason_is_capped_in_summary_but_verbatim_in_detail(self, tmp_path):
+        """``reason`` is unbounded caller-supplied free text arriving over a
+        public MCP surface, and ``summary`` is the one-line field every
+        operator view and agent briefing renders.  Cap it there; ``detail`` is
+        the field the audit actually needs, so it keeps the full string.
+        """
+        esc = ScopeViolationEscalator()
+        reason = 'x' * 5000
+        esc_id = esc.report_routing_override(
+            project_root=str(tmp_path),
+            project_id='reify',
+            candidate_title='huge reason',
+            reason=reason,
+            matched_paths=('corpus/',),
+            suggested_project='know_live',
+        )
+        assert esc_id is not None
+        payload = self._payloads(tmp_path)[0]
+        assert len(payload['summary']) < 500, (
+            f'summary must stay bounded, got {len(payload["summary"])} chars'
+        )
+        # The summary still SHOWS the justification (an operator scanning the
+        # queue needs it) — just a bounded prefix of it.
+        assert 'x' * 100 in payload['summary']
+        assert reason in payload['detail'], 'detail must keep the full reason verbatim'
+
+    def test_reason_normalisation_is_identical_across_entry_points(self, tmp_path):
+        """``submit_task`` strips the reason before the guard sees it, but
+        ``_path_guard_or_skip`` is also callable directly with an unstripped
+        one.  The escalator strips it itself, so which entry point supplied it
+        cannot change whether two otherwise-identical overrides fold — a
+        reproducibility bug that would only show up across entry points.
+        """
+        esc = ScopeViolationEscalator()
+        stripped = self._override(esc, tmp_path, reason='incidental mention only')
+        unstripped = self._override(esc, tmp_path, reason='\n  incidental mention only \t')
+
+        assert stripped is not None
+        assert unstripped == stripped
+        payloads = self._payloads(tmp_path)
+        assert len(payloads) == 1
+        assert "routing_override_reason='incidental mention only'" in payloads[0]['detail']
+
     def test_dedupe_disabled_escape_hatch(self, tmp_path):
         """Reuses report_rejection's existing knob — no second flag."""
         esc = ScopeViolationEscalator(scope_violation_dedupe_enabled=False)
