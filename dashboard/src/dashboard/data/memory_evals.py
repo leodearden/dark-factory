@@ -60,6 +60,17 @@ and a live alarm must never be absent from both.  The openness test is positive
 status vocabulary that grows a new terminal state fails toward "not shown as
 open" rather than toward a closed alarm rendered as live.
 
+The derived ``parity`` badge answers to the same rule.  A verdict outside the
+closed M2 set has no badge, so it is NAMED (``unknown_verdict``) instead of
+falling through to the healthy one — the third instance of the idiom, beside
+``unknown_kind`` and ``unknown_escalation_status``.  For the same reason no
+verdict class borrows another's label: ``clear`` means "judged, and not
+alarming", so an unjudged, an unjudgeable (``insufficient_data``) and a
+deliberately-exempted (``grandfathered``) metric each get their own state
+rather than all three reading as healthy.  The raw ``verdict`` string is still
+passed through the payload unmapped in every case: the reader names the value
+it cannot render, it never rewrites it.
+
 **Same-host file reads (DD1).**  The dashboard and the eval runner share a
 filesystem; there is no RPC in this path.
 """
@@ -1003,6 +1014,27 @@ def _build_eval(
         # exactly one place.
         verdict = judged.get('verdict')
         verdict_class = _verdict_class(verdict)
+        if verdict_class == 'unknown_verdict':
+            # A verdict outside the closed M2 set has no badge, so it is named
+            # rather than folded into the healthy label — the same standing as
+            # ``unknown_kind`` (no chart primitive) and
+            # ``unknown_escalation_status`` (unclassifiable).  An ABSENT
+            # verdict is deliberately NOT named: "nothing judged this metric"
+            # is a legitimate state the payload already models as ``unjudged``
+            # parity, and at the artifact level as
+            # ``missing_verdicts``/``orphan_verdict``.
+            #
+            # ``eval_dir.parent`` IS the memory-evals root, which is where
+            # ``_read_verdicts`` locates the sole verdicts artifact — this
+            # value came out of that file, not out of the eval's own dir.
+            _issue(
+                issues, 'unknown_verdict', eval_id=eval_id,
+                path=eval_dir.parent / 'verdicts-current.json',
+                detail=(
+                    f'metric {metric_id!r} has verdict {verdict!r}, which is outside the '
+                    'M2 vocabulary and has no parity badge'
+                ),
+            )
 
         metrics.append({
             'metric_id': metric_id,
