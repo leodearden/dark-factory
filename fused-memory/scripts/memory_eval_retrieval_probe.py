@@ -1997,18 +1997,18 @@ async def probe_topic(
 def is_initial_run(root: str | Path, eval_id: str = EVAL_ID) -> bool:
     """True when no prior metrics artifact for *eval_id* exists under *root*.
 
-    Globs ``metrics-*.json`` in the directory the shared
-    :func:`metrics_artifact_path` defines, so the layout is not restated here.
-    Scoped to this eval's own subdirectory because leaves β/γ/δ share one
-    artifact root — a γ run must not make β's first run look like its second.
+    Globs ``metrics-*.json`` in the directory the shared :func:`eval_dir`
+    defines, so the layout is not restated here. Scoped to this eval's own
+    subdirectory because leaves β/γ/δ share one artifact root — a γ run must
+    not make β's first run look like its second.
 
     Only the metrics artifact counts. A stray report with no series beside it
     is not a prior measurement, and treating it as one would silently suppress
     the initial-state snapshot D1 requires.
     """
-    from shared.memory_eval_metrics import metrics_artifact_path  # noqa: PLC0415
+    from shared.memory_eval_metrics import eval_dir  # noqa: PLC0415
 
-    directory = metrics_artifact_path(root, eval_id, 'ignored').parent
+    directory = eval_dir(root, eval_id)
     return not any(directory.glob('metrics-*.json'))
 
 

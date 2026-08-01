@@ -84,6 +84,7 @@ __all__ = [
     'MetricSeries',
     'TripwireItem',
     'canonical_json_text',
+    'eval_dir',
     'load_metric_series',
     'load_series_window',
     'metrics_artifact_path',
@@ -125,7 +126,8 @@ BEFORE every ``2026…`` one, so a caller who supplies it gets an empty or
 contaminated baseline window and no error at all — a declared invariant nothing
 checks is exactly the silent degradation this module argues against everywhere
 else. So it is checked at each boundary a stamp can enter from: the schema
-field, the env override, the write-time override and the window cutoff.
+field, the env override, the write-time override, the window cutoff, and the
+two artifact path helpers themselves.
 
 ``[0-9]`` rather than ``\\d``: ``\\d`` also matches non-ASCII digits, which
 render as a plausible stamp and sort nowhere near their ASCII equivalents.
@@ -449,9 +451,22 @@ def run_stamp(*, env_var: str = RUN_STAMP_ENV_VAR) -> str:
     return datetime.now(UTC).strftime(_STAMP_FORMAT)
 
 
+def eval_dir(root: str | Path, eval_id: str) -> Path:
+    """``<root>/<eval_id>`` — the directory an eval's artifacts live under.
+
+    Factored out so a caller that only needs the directory (e.g. globbing for
+    "has this eval ever run") does not have to route through
+    :func:`metrics_artifact_path` with a throwaway stamp just to reach
+    ``.parent`` — which used to be the one caller these path helpers left
+    stamp-unvalidated for (see :func:`_validate_stamp`).
+    """
+    return Path(root) / eval_id
+
+
 def metrics_artifact_path(root: str | Path, eval_id: str, stamp: str) -> Path:
     """``<root>/<eval_id>/metrics-<STAMP>.json`` (M1 §3)."""
-    return Path(root) / eval_id / f'metrics-{stamp}.json'
+    _validate_stamp(stamp, what='stamp')
+    return eval_dir(root, eval_id) / f'metrics-{stamp}.json'
 
 
 def report_artifact_path(root: str | Path, eval_id: str, stamp: str) -> Path:
@@ -461,7 +476,8 @@ def report_artifact_path(root: str | Path, eval_id: str, stamp: str) -> Path:
     evaluator and dashboard read, this is what an operator reads when an
     escalation points them at a run.
     """
-    return Path(root) / eval_id / f'report-{stamp}.txt'
+    _validate_stamp(stamp, what='stamp')
+    return eval_dir(root, eval_id) / f'report-{stamp}.txt'
 
 
 def canonical_json_text(payload: object) -> str:

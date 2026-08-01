@@ -22,6 +22,7 @@ from shared.memory_eval_metrics import (
     MetricSchemaError,
     MetricSeries,
     TripwireItem,
+    eval_dir,
     load_metric_series,
     load_series_window,
     metrics_artifact_path,
@@ -302,6 +303,28 @@ class TestArtifactWriter:
         report = report_artifact_path(tmp_path, 'e1-retrieval-health', '20260701T031500Z')
         assert report.parent == metrics.parent
         assert report.name == 'report-20260701T031500Z.txt'
+
+    def test_eval_dir_is_the_parent_of_both_artifact_paths(self, tmp_path):
+        directory = eval_dir(tmp_path, 'e1-retrieval-health')
+        assert directory == tmp_path / 'e1-retrieval-health'
+        metrics = metrics_artifact_path(tmp_path, 'e1-retrieval-health', '20260701T031500Z')
+        report = report_artifact_path(tmp_path, 'e1-retrieval-health', '20260701T031500Z')
+        assert directory == metrics.parent == report.parent
+
+    def test_eval_dir_does_not_validate_a_stamp_because_it_takes_none(self, tmp_path):
+        # Unlike the two path helpers below, eval_dir has no stamp argument at
+        # all — it is the helper a caller reaches for instead of threading a
+        # throwaway placeholder stamp through metrics_artifact_path just to
+        # discard it via .parent.
+        assert eval_dir(tmp_path, 'e1-retrieval-health') == tmp_path / 'e1-retrieval-health'
+
+    def test_metrics_artifact_path_rejects_a_malformed_stamp(self, tmp_path):
+        with pytest.raises(MetricSchemaError):
+            metrics_artifact_path(tmp_path, 'e1-retrieval-health', '2026-07-04T03:15:00Z')
+
+    def test_report_artifact_path_rejects_a_malformed_stamp(self, tmp_path):
+        with pytest.raises(MetricSchemaError):
+            report_artifact_path(tmp_path, 'e1-retrieval-health', '2026-07-04T03:15:00Z')
 
     def test_run_stamp_honours_env_override(self, monkeypatch):
         monkeypatch.setenv('MEMORY_EVAL_RUN_STAMP', '20260704T031500Z')
