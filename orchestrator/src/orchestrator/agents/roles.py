@@ -329,7 +329,14 @@ leaving a half-done tree that is falsely recorded as a completed, successful run
 # branch-ref subject: no rc=128 merge-marker search here, since that arm only
 # makes sense for a ref that merge-lane cleanup can delete out from under you.
 ANCESTRY_CHECK_INSTRUCTIONS = """\
-    git -C <project_root> merge-base --is-ancestor <sha> main; rc=$?
+    git -C <project_root> merge-base --is-ancestor <sha> main; rc=$?; echo "ancestry rc=$rc"
+    # The trailing `echo` is REQUIRED, not decoration. `--is-ancestor` prints
+    # nothing on rc=0 OR rc=1, and the `rc=$?` assignment itself exits 0, so
+    # without it the tool reports exit 0 and identical empty output for "on
+    # main" and "NOT on main" -- silence you would have to guess at. Echoing the
+    # numeric rc is NOT the two-outcome `&& echo` idiom banned below: it prints
+    # on every path and keeps all three outcomes distinguishable. Do not "tidy"
+    # it away.
     # rc=0   -> <sha> IS on main. Proceed with the set_task_status call.
     # rc=1   -> <sha> resolves here but is NOT reachable from main (it is only on a
     #           feature branch). The SHA is wrong -- re-derive the landing commit.
