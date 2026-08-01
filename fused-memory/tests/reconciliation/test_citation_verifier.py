@@ -490,7 +490,13 @@ class TestRepointMetadata:
         metadata: dict[str, Any] = {'a': 'hello', 'b': {'c': 'world'}}
         original = {'a': 'hello', 'b': {'c': 'world'}}
 
-        for bad_id in (None, 42, ['not', 'an', 'id']):
+        # Annotated ``list[Any]`` because these deliberately violate the
+        # ``old_id: str`` signature: the guard is a RUNTIME defence against a
+        # malformed id reaching the sweep from unvalidated task metadata, so
+        # the test must pass exactly the values the annotation forbids.
+        bad_ids: list[Any] = [None, 42, ['not', 'an', 'id']]
+
+        for bad_id in bad_ids:
             repointed, count = repoint_metadata(metadata, bad_id, _SURVIVOR)
 
             assert count == 0
