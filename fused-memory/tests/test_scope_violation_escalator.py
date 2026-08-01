@@ -930,6 +930,104 @@ class TestRoutingOverrideEscalation:
         assert 'WAS created' in detail
         assert 'no resubmission is needed' in detail
 
+    # --- fold behaviour ---------------------------------------------------
+    # The record fires on EVERY override, so an automated filer looping on one
+    # justification would flood the operator queue without a fold.
+
+    def _override(self, esc, tmp_path, *, reason, paths=('corpus/',), suggested='know_live'):
+        return esc.report_routing_override(
+            project_root=str(tmp_path),
+            project_id='reify',
+            candidate_title='Human gate: consolidate tree-sitter cluster',
+            reason=reason,
+            matched_paths=paths,
+            suggested_project=suggested,
+        )
+
+    def test_identical_override_folds_into_one_parent(self, tmp_path):
+        esc = ScopeViolationEscalator()
+        first = self._override(esc, tmp_path, reason='incidental mention only')
+        second = self._override(esc, tmp_path, reason='incidental mention only')
+
+        assert first is not None
+        assert second == first, 'an identical repeated override must fold into the first'
+        payloads = self._payloads(tmp_path)
+        assert len(payloads) == 1, f'expected one surviving escalation, found: {payloads}'
+        assert payloads[0]['dedupe_count'] == 1
+
+    def test_distinct_reason_files_a_new_escalation(self, tmp_path):
+        """A genuinely new justification is a new auditable claim."""
+        esc = ScopeViolationEscalator()
+        first = self._override(esc, tmp_path, reason='incidental mention only')
+        second = self._override(esc, tmp_path, reason='self-referential: task is about the guard')
+
+        assert first is not None
+        assert second is not None
+        assert second != first
+        assert len(self._payloads(tmp_path)) == 2
+
+    def test_reason_folding_is_whitespace_insensitive(self, tmp_path):
+        """The fingerprint uses the STRIPPED reason, so entry point can't change the fold."""
+        esc = ScopeViolationEscalator()
+        first = self._override(esc, tmp_path, reason='  incidental mention only  ')
+        second = self._override(esc, tmp_path, reason='incidental mention only')
+
+        assert first is not None
+        assert second == first
+        assert len(self._payloads(tmp_path)) == 1
+
+    def test_override_never_folds_with_rejection_or_advisory(self, tmp_path):
+        """The three modes fold INDEPENDENTLY.
+
+        A pending record of one mode must never absorb another and describe it
+        with the wrong outcome — the task-3119 failure shape, now three-way.
+        """
+        esc = ScopeViolationEscalator()
+        common = dict(
+            project_root=str(tmp_path),
+            project_id='reify',
+            candidate_title='Human gate: consolidate tree-sitter cluster',
+            matched_paths=('corpus/',),
+            suggested_project='know_live',
+        )
+        rejection = esc.report_rejection(**common, advisory=False)
+        advisory = esc.report_rejection(**common, advisory=True)
+        override = esc.report_routing_override(**common, reason='incidental mention only')
+
+        ids = {rejection, advisory, override}
+        assert None not in ids
+        assert len(ids) == 3, f'the three modes must not fold together: {ids}'
+        assert len(self._payloads(tmp_path)) == 3
+
+    def test_empty_matched_paths_still_files(self, tmp_path):
+        """The census case: an override that turned out unnecessary is the
+        evidence any later tightening of the parameter has to be based on."""
+        esc = ScopeViolationEscalator()
+        esc_id = esc.report_routing_override(
+            project_root=str(tmp_path),
+            project_id='dark_factory',
+            candidate_title='A task citing nothing foreign',
+            reason='belt and braces',
+            matched_paths=(),
+            suggested_project=None,
+        )
+        assert esc_id is not None
+        payloads = self._payloads(tmp_path)
+        assert len(payloads) == 1
+        assert '<nothing>' in payloads[0]['summary']
+        assert 'would_have_matched_paths=[]' in payloads[0]['detail']
+
+    def test_dedupe_disabled_escape_hatch(self, tmp_path):
+        """Reuses report_rejection's existing knob — no second flag."""
+        esc = ScopeViolationEscalator(scope_violation_dedupe_enabled=False)
+        first = self._override(esc, tmp_path, reason='incidental mention only')
+        second = self._override(esc, tmp_path, reason='incidental mention only')
+
+        assert first is not None
+        assert second is not None
+        assert second != first, 'dedup disabled: each call must file its own escalation'
+        assert len(self._payloads(tmp_path)) == 2
+
 
 class TestEscalationDisabled:
     def test_no_op_when_escalation_pkg_unavailable(self, tmp_path, monkeypatch):
