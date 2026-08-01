@@ -78,6 +78,7 @@ __all__ = [
     'MEM0_MANAGED_METADATA_KEYS',
     'MemoryMetadataValidationError',
     'MetadataViolation',
+    'ParentHasChildrenError',
     'RESERVED_VOCABULARY_KEYS',
     'SERVER_STAMPED_KEYS',
     'TOPIC_SLUG_MAX_LEN',
@@ -695,6 +696,68 @@ class MemoryMetadataValidationError(Exception):
             f'memory metadata rejected ({len(self.violations)} violation(s)): '
             f'{detail} -- the metadata vocabulary is defined in '
             f'{self.REGISTRY_LOCATION}'
+        )
+
+
+class ParentHasChildrenError(Exception):
+    """Raised by ``delete_memory`` when the target still has children.
+
+    PRD V3's lifecycle contract — "no operation may silently orphan a child
+    or dangle a pointer it could have seen" — has two halves.  The
+    *enforcement* half (the live child re-check, INV-3) belongs at the
+    delete seam in ``services/memory_service.py``, where the store lives.
+    The *contract-fixed* half is this error, and it belongs HERE for the
+    same reason :class:`MemoryMetadataValidationError` does: this module is
+    deliberately pure — no process-lifetime state, no queue writer, no
+    dependency on the optional ``escalation`` package — so an
+    out-of-process consumer, a lint sweep or a test can import the refusal
+    contract without pulling in a running ``MemoryService``.  Keeping both
+    contract-fixed errors side by side is also what makes them read
+    identically to a caller.
+
+    The message is the whole user-observable signal: at the MCP wire
+    ``@mcp_tool_errors`` renders the exception as
+    ``{'error': str(e), 'error_type': 'ParentHasChildrenError'}``, so an
+    agent that trips the refusal has ``str(err)`` and nothing else.  It
+    therefore names the parent, every listed child id, the count, the
+    ``cascade=true`` way out, and where the vocabulary lives.
+
+    :param parent_id:  the id whose deletion was refused.
+    :param child_ids:  ids of records whose ``metadata.parent_id`` points at
+                       *parent_id*.  Copied, never aliased, so a later
+                       mutation of the caller's scroll buffer cannot
+                       retroactively rewrite what the refusal claimed.
+    :param truncated:  True when the listing is known to be PARTIAL (the id
+                       scroll returned fewer rows than the live child count
+                       — a bounded scroll or a concurrent write).  The
+                       message then says "at least N", because a bounded
+                       listing that reads as exhaustive would understate
+                       what a subsequent ``cascade`` is about to delete.
+    """
+
+    def __init__(
+        self,
+        *,
+        parent_id: str,
+        child_ids: list[str],
+        truncated: bool = False,
+    ) -> None:
+        self.parent_id = parent_id
+        self.child_ids = list(child_ids)
+        self.truncated = truncated
+        count = (
+            f'at least {len(self.child_ids)}'
+            if truncated
+            else str(len(self.child_ids))
+        )
+        listed = ', '.join(self.child_ids)
+        super().__init__(
+            f'refusing to delete memory {parent_id}: it has {count} child '
+            f'record(s) whose metadata.parent_id points at it '
+            f'({listed}); deleting it would orphan them. Pass cascade=true '
+            f'to delete the children too, or reparent them first -- the '
+            f'metadata vocabulary is defined in '
+            f'{MemoryMetadataValidationError.REGISTRY_LOCATION}'
         )
 
 
