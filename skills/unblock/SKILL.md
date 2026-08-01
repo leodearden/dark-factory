@@ -503,9 +503,20 @@ The merge procedure is iterative — don't assume one pass will be enough:
     mcp__escalation__merge_status(request_id="<superseded_by value>")
     ```
     with the same 15 s→60 s backoff, **bounded by the same 20-minute wall-clock ceiling** the
-    unscoped arms use above (see the `deadline` note). On a terminal `done`/`conflict`/`blocked`/
-    `abandoned`, handle it exactly as you would for your own request per this section — your
-    absorbed branch lands when the train lands.
+    unscoped arms use above (see the `deadline` note). Do **not** route the train's terminal
+    state back through this section's own-request rules: those say *resubmit*, which the
+    never-resubmit rule above forbids, and their per-task marker search is *expected* to come
+    back empty for an absorbed member (see the rc=128 paragraph below). Dispatch here instead:
+    - train `done` → your absorbed branch landed with the train. **Skip the per-task marker
+      search entirely** and use the train-landing procedure in the rc=128 paragraph below.
+    - train `conflict` or `blocked` → the train derailed. The orchestrator re-drives the
+      absorbed members itself — on any non-`done` train outcome it re-pends each still-unlanded
+      member for a fresh solo merge (`_redrive_coalesce_members`,
+      `orchestrator/src/orchestrator/merge_queue.py:12264`) — so **do not resubmit**: resume
+      polling the `branch` handle (`merge_status(branch="task/<TASK_ID>")`) to the 20-minute
+      ceiling, and stop-and-report to the human only if it still has not landed at that ceiling.
+    - train `abandoned` → stop and report to the human. Do not resubmit; the train may have been
+      cancelled deliberately.
   - **`coalesce-*` id** (coalesce-train path) — this names the *train*, not a request. It
     resolves through none of `merge_status`'s tiers (no retention-ring alias is ever recorded
     for a train id, no event-store finalized row is keyed on one, and Tier 3.5's git-authority
@@ -536,18 +547,28 @@ The merge procedure is iterative — don't assume one pass will be enough:
   serves; taking it as "not landed" would report a successful merge to the human as a failure and
   leave the task un-flipped. So:
   - Ancestry `rc=0` is authoritative — landed — while the ref still exists.
-  - On rc=128-with-empty-marker, do not conclude anything yet. Check **the train's** landing —
-    the tip's marker (`git log main --fixed-strings --grep="Merge task/<TIP_ID> into main"
-    --max-count=1 --format=%H`; with a `coalesce-<TIP_ID>-<hex>` id the tip id is readable straight
-    off it), or `get_merge_queue()` no longer showing the train — and **this task's own status**,
-    which the orchestrator flips to `done` for every absorbed member once the train lands
-    (`mark_member_done`, `orchestrator/src/orchestrator/harness.py:1011`).
+  - On rc=128-with-empty-marker, do not conclude anything yet. There are exactly **two**
+    affirmative landing signals, and only these two:
+    **(a)** the **tip's** merge marker on main — `git log main --fixed-strings
+    --grep="Merge task/<TIP_ID> into main" --max-count=1 --format=%H` (with a
+    `coalesce-<TIP_ID>-<hex>` id the tip id is readable straight off it); and
+    **(b)** **this task's own scheduler status** having been flipped to `done`, which the
+    orchestrator does for every absorbed member once the train lands (`mark_member_done`,
+    `orchestrator/src/orchestrator/harness.py:1011`).
   - Either one saying landed → the merge succeeded; proceed to step 8 with the train's advanced SHA
     as `done_provenance={"kind": "found_on_main", "commit": "<sha>", "note": "absorbed into train
     <train_id>"}`. If the task is already `done`, the flip happened for you — no write needed.
+  - **`get_merge_queue()` no longer showing the train is NOT a landing signal.** It means only
+    "stop waiting on the train," and is equally consistent with a **derail**: on any non-`done`
+    train outcome the orchestrator re-pends the still-unlanded members for solo re-merge
+    (`_redrive_coalesce_members`, `orchestrator/src/orchestrator/merge_queue.py:12264`), which
+    also removes the train from the queue with nothing of yours on main. On queue-absence with
+    neither (a) nor (b), the correct action is to **resume polling the `branch` handle** to the
+    20-minute ceiling — the orchestrator's re-drive lands it — never to flip the task.
 
-  Stop-and-report to the human only if the ancestry check, the train check, **and** the task's own
-  status all come back not-landed.
+  Stop-and-report to the human only if ancestry, signal (a), and signal (b) all come back
+  not-landed *after* the branch-handle polling above has reached its ceiling. A not-landed
+  ancestry result is never overridden by queue-absence.
 
 *Abandonment (`merge_cancel`):*
 
