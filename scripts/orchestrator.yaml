@@ -69,20 +69,26 @@ test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q --tim
 # verify.py's _FALLBACK_UV_PROJECT = 'shared' encodes the same pairing. No
 # --directory, so cwd stays at the worktree root and scripts/ resolves.
 #
-# RULE-SET SURPRISE, recorded so it is not rediscovered (follow-up 3457).
+# RULE SET (resolved by task 3457; this block previously recorded the gap).
 # --project shared selects the ENVIRONMENT ruff runs from; it does NOT make
-# shared's ruff config apply to files outside shared/. There is no [tool.ruff]
-# table in the repo-root pyproject.toml and no ruff.toml anywhere in the repo,
-# and ruff resolves config hierarchically per file, SKIPPING a pyproject.toml
-# with no [tool.ruff] section. So files under scripts/ are checked against
-# ruff's BUILT-IN defaults (E4/E7/E9 + F), not the members'
-# select = ["E","F","UP","B","SIM","I"]. Verified with `ruff check
-# --show-settings`: a scripts/ file enables E401/E402/E7xx/E9/F only, while a
-# shared/ file additionally enables the B/SIM/UP/I families. tests/scripts/ is
-# in the identical position, so this command inherits exactly the same rule set
-# as its sibling — consistent, but weaker than a workspace member's. Widening
-# it would retroactively change tests/scripts/ gating and surface an unmeasured
-# finding set there, which is outside this task's locks.
+# shared's ruff config apply to files outside shared/. ruff resolves config
+# hierarchically per file, SKIPPING a pyproject.toml with no [tool.ruff]
+# section — so while the repo root declared none, files under scripts/ were
+# checked against ruff's BUILT-IN defaults (E401/E402/E7xx/E9 + F) rather than
+# the members' set, and this gate passed against a rule set nobody chose.
+#
+# The repo-root pyproject.toml NOW declares [tool.ruff], so files under scripts/
+# resolve select = ["E","F","UP","B","SIM","I"], ignore = ["E501"],
+# line-length = 100 — byte-identical to every workspace member's. Widening
+# surfaced 125 findings here (150 across scripts/ + tests/scripts/), all FIXED
+# in the same branch as the config change, never excluded.
+#
+# The full rationale — why a root table and not a scripts/pyproject.toml, the
+# per-rule measurement, the un-gated residue — lives in the [tool.ruff] comment
+# block in the repo-root pyproject.toml. Read it there rather than duplicating
+# it here, so the two cannot drift apart.
+# tests/scripts/ is in the identical position and resolves the identical set;
+# tests/scripts/test_nonmember_ruff_config.py holds both directories to it.
 lint_command: "uv run --project shared ruff check scripts/"
 
 # TYPE IS DELIBERATELY NOT DECLARED YET — the gap is measured, not overlooked
