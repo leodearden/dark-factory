@@ -1080,3 +1080,93 @@ def test_tabs_jsx_memory_tab_renders_evals_section(
             f'shell.jsx gained a Rail entry {rail_id} — PRD DD3 places this as '
             'a section in the existing Memory tab, with no new rail item.'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-17 test: the escalation link actually navigates
+# ---------------------------------------------------------------------------
+
+
+def test_escalation_link_navigation_is_wired(
+    app_jsx_body: str,
+    tabs_jsx_body: str,
+    tab_escalations_jsx_body: str,
+    tab_memory_evals_jsx_body: str,
+) -> None:
+    """The link from step-10 must navigate for real.
+
+    The SPA has no router — zero `location.hash` and zero `href=` uses across
+    static/redux, and tab state is plain React state in app.jsx.  So without
+    this plumbing the control would be a dead affordance, which is exactly the
+    synthetic-UI failure feedback_redux_no_synthetic_data forbids.  The handoff
+    therefore rides the existing state-lift idiom: app.jsx owns the focus state
+    and threads a handler down.
+    """
+    # (a) app.jsx holds an escalation-focus state beside its tab state, and a
+    #     navigate handler that sets both.
+    assert re.search(r'const\s*\[\s*escFocus\s*,\s*setEscFocus\s*\]\s*=\s*uS\(', app_jsx_body), (
+        'app.jsx must hold an escalation-focus state beside `const [tab, setTab] '
+        "= uS('overview')`."
+    )
+    nav = re.search(r'const\s+navigate\s*=\s*\([^)]*\)\s*=>\s*\{([\s\S]{0,300}?)\}', app_jsx_body)
+    assert nav is not None, (
+        'app.jsx must define a `navigate` handler.'
+    )
+    assert 'setTab(' in nav.group(1) and 'setEscFocus(' in nav.group(1), (
+        'the navigate handler must both switch the tab and record the focus id; '
+        f'body was: {nav.group(1)!r}'
+    )
+
+    # (b)/(c) the handler reaches MemoryTab and the focus id reaches EscalationsTab.
+    assert re.search(r'<MemoryTab[^>]*onNavigate=\{', app_jsx_body), (
+        'app.jsx must pass onNavigate to <MemoryTab at the `case \'memory\':` '
+        'branch — otherwise the section renders its link disabled.'
+    )
+    assert re.search(r'<EscalationsTab[^>]*focusId=\{', app_jsx_body), (
+        'app.jsx must pass the focus id into <EscalationsTab.'
+    )
+    assert re.search(r'<EscalationsTab[^>]*onFocusConsumed=\{', app_jsx_body), (
+        'app.jsx must pass onFocusConsumed into <EscalationsTab so the focus '
+        'clears after it is used.'
+    )
+
+    # (d) tabs.jsx forwards it.
+    assert re.search(r'function\s+MemoryTab\s*\(\s*\{[^}]*\bonNavigate\b', tabs_jsx_body), (
+        'MemoryTab must accept `onNavigate` in its props destructure.'
+    )
+    assert re.search(r'<MemoryEvalsSection[^>]*onNavigate=\{', tabs_jsx_body), (
+        'MemoryTab must forward onNavigate to <MemoryEvalsSection.'
+    )
+
+    # (e) tab_escalations.jsx consumes the focus and clears it.
+    assert re.search(
+        r'function\s+EscalationsTab\s*\(\s*\{[^}]*\bfocusId\b', tab_escalations_jsx_body
+    ), 'EscalationsTab must accept a `focusId` prop.'
+    assert re.search(
+        r'function\s+EscalationsTab\s*\(\s*\{[^}]*\bonFocusConsumed\b',
+        tab_escalations_jsx_body,
+    ), 'EscalationsTab must accept an `onFocusConsumed` prop.'
+    effect = re.search(
+        r'uE\(\(\)\s*=>\s*\{([\s\S]{0,900}?)\n\s*\},\s*\[[^\]]*focusId[^\]]*\]\)',
+        tab_escalations_jsx_body,
+    )
+    assert effect is not None, (
+        'EscalationsTab must run a `uE` effect keyed on `focusId`.'
+    )
+    eff = effect.group(1)
+    assert 'setSelected(' in eff, (
+        'the focus effect must call the existing `setSelected(row)` to open the '
+        'detail sidebar — reusing the tab\'s own selection mechanism rather '
+        'than inventing a second one.'
+    )
+    assert 'onFocusConsumed' in eff, (
+        'the focus effect must call onFocusConsumed() — including when no row '
+        'matches (the escalation may have closed between poll and click). '
+        'Leaving the focus set would reopen a stale drawer on every later '
+        'visit to the tab.'
+    )
+
+    # (f) the producer end of the contract, re-asserted here.
+    assert re.search(r"onNavigate\(\s*'esc'\s*,\s*escalation\.id\s*\)", tab_memory_evals_jsx_body), (
+        "tab_memory_evals.jsx's link must call onNavigate('esc', escalation.id)."
+    )
