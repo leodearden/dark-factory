@@ -1,4 +1,4 @@
-"""Corpus discovery for checked-in capability-manifest sidecars.
+"""Corpus discovery + file-attributed checker for capability-manifest sidecars.
 
 Test-support module — NOT production code; nothing under ``shared/src/``
 changes for this. Consumed by ``shared/tests/test_capability_manifest.py``'s
@@ -28,6 +28,11 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+
+import yaml
+from pydantic import ValidationError
+
+from shared.capability_manifest import load_capability_manifest
 
 #: Mirrors fused_memory.server.manifest_stamping._SIDECAR_SUFFIX. Deliberately
 #: re-declared rather than imported — shared/tests must not depend on
@@ -60,3 +65,38 @@ def discover_manifests(repo_root: Path = REPO_ROOT) -> list[Path] | None:
         return None
     rel_paths = sorted({p for p in result.stdout.split('\0') if p})
     return [repo_root / rel for rel in rel_paths]
+
+
+def check_manifest(path: Path) -> str | None:
+    """Validate one sidecar, returning ``None`` on success or one actionable line.
+
+    A thin file-attribution wrapper around
+    :func:`shared.capability_manifest.load_capability_manifest`, which already
+    recurses into every task and capability and never swallows errors — this
+    adds the one thing it can't: WHICH of the many checked-in sidecars a given
+    failure came from. A bare ``pydantic.ValidationError`` names a field path
+    (e.g. ``tasks.3.capabilities.2.delivered_check.pattern``) but never the
+    file, so a caller sweeping many sidecars (``TestCheckedInManifestCorpus``)
+    would otherwise get an unattributed error.
+
+    Catches exactly ``yaml.YAMLError`` and ``pydantic.ValidationError`` and
+    converts each into a single grep-able line (embedded newlines collapsed)
+    prefixed with *path* relative to :data:`REPO_ROOT` (falling back to the
+    absolute path if the relative computation fails, e.g. *path* lies outside
+    the repo). Every other exception — notably ``FileNotFoundError`` —
+    propagates untouched: a missing file is a caller bug, not manifest drift,
+    and must never be silently re-reported as a check failure.
+    """
+    try:
+        display_path: Path | str = path.relative_to(REPO_ROOT)
+    except ValueError:
+        display_path = path
+    try:
+        load_capability_manifest(path)
+    except yaml.YAMLError as exc:
+        detail = ' '.join(str(exc).split())
+        return f'{display_path}: YAML syntax error: {detail}'
+    except ValidationError as exc:
+        detail = ' '.join(str(exc).split())
+        return f'{display_path}: schema validation failed: {detail}'
+    return None
