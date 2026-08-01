@@ -39,11 +39,28 @@ function chartForKind(kind) {
 }
 
 // Count the deliberate holes in a trend series.  A `null` in `trend.values`
-// means that run produced no sample; the array is handed to the chart
-// UNMODIFIED (dropping a hole would shift this metric's points against every
-// other metric's, since all series share the run_stamps x-axis), but the
-// sparkline plots a hole at the baseline, so the gap count is disclosed in
-// text beside it rather than left to read as a measured zero.
+// means that run produced no sample.
+//
+// The array is handed on UNMODIFIED — dropping a hole would shift this
+// metric's points against every other metric's, since all series share the
+// run_stamps x-axis.  But charts.jsx's primitives cannot REPRESENT a hole:
+// `Sparkline` (:42-53) and `StepSpark` (:66-90) have no null handling at all —
+// `Math.max(...values, 1)`, `Math.min(...values, 0)` and
+// `y = height - ((v - min) / range) * height` all coerce `null` to 0 — so a
+// hole would be drawn as a real data point at value 0, connected by a line
+// segment to its neighbours.  For a `proportion` metric sitting at 0.95 that
+// is a plunge to the chart floor and back, visually identical to a genuine
+// regression to zero.  Nor is "the baseline" even a safe place for it: 0 is
+// the floor only when `min` happens to be 0; with any negative value in the
+// series the fabricated point lands mid-chart.
+//
+// So a holed series is NOT DRAWN (see `plottable` below) and the gap count is
+// disclosed in text instead.  This is the same invariant `dash()` states for
+// scalars — a synthetic zero reads as a measured zero — applied to the trend
+// column.  Teaching the shared primitives to skip nulls is the systemically
+// better fix, but it is untestable in this toolchain (JSX, CDN Babel, no
+// node_modules) and they are on five other tabs' render paths; that repair is
+// filed as a separate follow-up.
 function trendGaps(values) {
   if (!values) return 0;
   let gaps = 0;
@@ -152,6 +169,10 @@ function MemoryEvalMetricRow({ metric, onNavigate }) {
   const trend = m.trend || { labels: [], values: [] };
   const Chart = chartForKind(m.kind);
   const gaps = trendGaps(trend.values);
+  // A series with a hole cannot be drawn honestly by charts.jsx (see
+  // trendGaps).  Equality, not an ordering comparison: nothing here re-derives
+  // anything from a threshold.
+  const plottable = Chart && gaps === 0;
   const labels = trend.labels || [];
   const span = labels.length
     ? `${labels[0]} → ${labels[labels.length - 1]}`
@@ -205,21 +226,34 @@ function MemoryEvalMetricRow({ metric, onNavigate }) {
       <td className="num">{dash(m.denominator)}</td>
       <td className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>{dash(m.direction)}</td>
       <td style={{ width: 160 }}>
-        {Chart
+        {/* Two DISTINCTLY worded suppression states, both reusing the
+            "no chart, value only" shape chartForKind already establishes:
+            an unknown kind is a rendering gap the payload files an
+            `unknown_kind` issue for, whereas a hole is normal, fully-explained
+            missing data.  Either way the row still shows value, current_value,
+            n, denominator, direction and the verdict badge — the operator
+            loses a 160px sparkline, never the signal. */}
+        {plottable
           ? (
             <div style={{ height: 26 }} title={span}>
               {/* values passed through verbatim — never filtered or compacted */}
               <Chart values={trend.values} color={MEC.accent} />
             </div>
           )
-          : (
-            <span className="mono" style={{ fontSize: 10, color: 'var(--fg-3)' }}>
-              no chart for kind {String(m.kind)}
-            </span>
-          )}
+          : !Chart
+            ? (
+              <span className="mono" style={{ fontSize: 10, color: 'var(--fg-3)' }}>
+                no chart for kind {String(m.kind)}
+              </span>
+            )
+            : (
+              <span className="mono" style={{ fontSize: 10, color: 'var(--fg-3)' }}>
+                no chart — {gaps} of {labels.length} runs produced no sample
+              </span>
+            )}
         <div className="mono" style={{ fontSize: 10, color: 'var(--fg-3)' }}>
           {trend.labels ? trend.labels.length : 0} pts
-          {gaps ? ` · ${gaps} gap(s) plotted at baseline` : ''}
+          {gaps ? ` · ${gaps} gap(s) — no chart drawn` : ''}
         </div>
       </td>
     </tr>
