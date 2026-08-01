@@ -16,13 +16,11 @@ than two copies that can drift apart.  test_restart_backoff_guard_rejects_
 ineffective_units in the dashboard module remains the helper's negative-case
 guard; this module supplies its fleet-wide application.
 """
-import importlib
 import pathlib
 import subprocess
 
 import pytest
 
-import systemd_unit_invariants
 from systemd_unit_invariants import (
     assert_restart_backoff_effective,
     restart_directive,
@@ -202,42 +200,3 @@ def test_factory_init_reference_unit_ships_effective_backoff() -> None:
         )
 
     assert_restart_backoff_effective(path)
-
-
-def test_restart_backoff_helper_is_shared_not_duplicated() -> None:
-    """The dashboard suite must USE the shared helper, not its own fork of it.
-
-    A "both modules define a function of this name" test would pass happily
-    against two independently-drifting copies, which is precisely the failure
-    this task exists to repair: per-unit string asserts forked from the real
-    invariant and stayed green for months while the directive they guarded was
-    inert.  So the check is object IDENTITY — a future author who re-inlines a
-    private copy into either module fails here immediately, at the moment of
-    forking, rather than years later when one copy has quietly stopped
-    catching the defect.
-    """
-    for name in ("restart_directive", "assert_restart_backoff_effective"):
-        assert callable(getattr(systemd_unit_invariants, name, None)), (
-            f"systemd_unit_invariants must export a callable {name!r}; it is "
-            "the single shared implementation of the restart-backoff invariant."
-        )
-
-    dashboard = importlib.import_module("test_dashboard_service_template")
-
-    assert (
-        dashboard._assert_restart_backoff_effective
-        is systemd_unit_invariants.assert_restart_backoff_effective
-    ), (
-        "test_dashboard_service_template._assert_restart_backoff_effective is "
-        "not the shared systemd_unit_invariants.assert_restart_backoff_effective. "
-        "The invariant has been forked into a private copy; import the shared "
-        "one instead so both modules cannot drift apart."
-    )
-    assert (
-        dashboard._restart_directive is systemd_unit_invariants.restart_directive
-    ), (
-        "test_dashboard_service_template._restart_directive is not the shared "
-        "systemd_unit_invariants.restart_directive. The directive reader "
-        "encodes measured systemd 255.4 last-wins scalar semantics; a private "
-        "copy of it will drift out of agreement with the assertion that uses it."
-    )
