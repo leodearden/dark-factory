@@ -104,6 +104,7 @@ WatchdogSec=120
 ExecStartPre=/usr/bin/docker compose -f /repo/fused-memory/docker/docker-compose.yml up -d falkordb qdrant
 Restart=on-failure
 RestartSec=5
+RestartSteps=4
 TimeoutStartSec=300
 TimeoutStopSec=90
 
@@ -383,6 +384,7 @@ Environment=MEM0_TELEMETRY=false
 WatchdogSec=120
 Restart=on-failure
 RestartSec=5
+RestartSteps=4
 TimeoutStartSec=300
 TimeoutStopSec=90
 
