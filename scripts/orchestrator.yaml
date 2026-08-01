@@ -32,11 +32,18 @@ test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q --tim
 # LINT IS DECLARED DELIBERATELY (task 3445).
 #
 # Omitting lint_command would NOT leave ruff running as some fallback — it
-# DELETES the gate, silently and green. verify_plan.py:394-403 emits an
-# explicit ScopeKind.SKIPPED PlannedRun with cmd=None for a falsy
-# lint_command; _executed_module_configs_from_plan renders SKIPPED back to
-# None (verify.py:4897); _run_or_skip_timed turns a None command into a
-# CheckRun.skipped that is VACUOUSLY PASSING at rc=0 (verify.py:4202-4203).
+# DELETES the gate, silently and green. verify_plan._derive_module_runs emits
+# an explicit ScopeKind.SKIPPED PlannedRun with cmd=None for a falsy
+# lint_command; verify._executed_module_configs_from_plan renders that SKIPPED
+# slot back to None; verify._run_or_skip_timed turns a None command into a
+# CheckRun.skipped that is VACUOUSLY PASSING at rc=0.
+#
+# Those are SYMBOL citations, deliberately not file:line. This block first
+# shipped with line pins adapted from tests/scripts/orchestrator.yaml's own
+# (334-363 / 4892) and every one of them was already stale at HEAD — the
+# cited verify.py line for _executed_module_configs_from_plan had drifted
+# ~125 lines onto an unrelated statement. The rot was compounding by being
+# copied forward. Symbols are greppable; keep it that way when editing.
 # Until this line existed, every diff confined to scripts/ cleared the LINT
 # check without ruff ever running — 71 tracked .py files, including operator
 # tooling and the scripts/legibility/ monitors, gated by nothing. The
@@ -51,8 +58,8 @@ test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q --tim
 # scripts/tests/test_enable_laptop_persistent_worktree.py. All three were
 # FIXED in the same commit that added this line, rather than the command
 # being weakened with an exclude or a narrowed target (task 3350's precedent).
-# Fix-and-declare must stay atomic: run_full_verification (verify.py:~4735)
-# gathers over ALL module_configs.values(), not just those a diff touches, and
+# Fix-and-declare must stay atomic: verify.run_full_verification asyncio-gathers
+# over ALL module_configs.values(), not just those a diff touches, and
 # the repo root sets merge_verify_breadth: "full" — so a red lint_command here
 # blocks every merge, review checkpoint and main-tip sweep repo-wide, on
 # branches with no defect.
@@ -82,9 +89,11 @@ lint_command: "uv run --project shared ruff check scripts/"
 # (task 3445; follow-up 3456 carries the burn-down).
 #
 # The same vacuous-pass mechanism described above applies to
-# type_check_command (verify_plan.py:422-425), so TYPE currently passes at
-# rc=0 for every scripts/-confined diff without pyright running. That is a
-# real, open gap. It is stated here rather than left as a silent absence.
+# type_check_command — verify_plan._derive_module_runs emits the identical
+# reasoned SKIPPED for a falsy type_check_command a few lines below the lint
+# one — so TYPE currently passes at rc=0 for every scripts/-confined diff
+# without pyright running. That is a real, open gap. It is stated here rather
+# than left as a silent absence.
 #
 # It was not closed in the same task because the debt is roughly 50x task
 # 3350's 4-fix precedent: `npx pyright scripts/` returns 206 errors across 14

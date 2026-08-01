@@ -6,13 +6,22 @@ running — 71 tracked ``.py`` files (operator tooling, the ``scripts/legibility
 monitors, 40 test modules) gated by nothing.
 
 Omitting ``lint_command`` does not leave a fallback in place, it DELETES the
-gate: ``verify_plan.py:394-403`` emits an explicit ``ScopeKind.SKIPPED``
-PlannedRun with ``cmd=None`` for a falsy ``lint_command``,
-``_executed_module_configs_from_plan`` (``verify.py:4897``) renders SKIPPED
-back to ``None``, and ``_run_or_skip_timed`` (``verify.py:4202-4203``) turns a
-None command into a ``CheckRun.skipped`` that is VACUOUSLY PASSING at rc=0.
-This is the same gap task 3350 closed for ``tests/scripts/``, against whose
-comment block ``scripts/`` was measured.
+gate: ``verify_plan._derive_module_runs`` emits an explicit
+``ScopeKind.SKIPPED`` PlannedRun with ``cmd=None`` for a falsy
+``lint_command``; ``verify._executed_module_configs_from_plan`` renders that
+SKIPPED slot back to ``None``; ``verify._run_or_skip_timed`` turns a None
+command into a ``CheckRun.skipped`` that is VACUOUSLY PASSING at rc=0. This is
+the same gap task 3350 closed for ``tests/scripts/``, against whose comment
+block ``scripts/`` was measured.
+
+Cited by SYMBOL, deliberately never by file:line. This guard's first draft
+pinned line numbers — adapted from the sibling guard's own pins, which had
+already rotted — and every single one was wrong at HEAD, so the failure
+messages sent an operator to unrelated code (the cited ``verify.py`` line for
+``_executed_module_configs_from_plan`` had drifted ~125 lines and landed on an
+unrelated assignment). Symbols are greppable and survive edits above them;
+line numbers in prose this long cannot be kept true, and a stale pin is worse
+than no pin because it reads as authoritative.
 
 Asserted STRUCTURALLY — through the production ``derive_verify_plan`` ->
 ``_executed_module_configs_from_plan`` bridge — rather than by shelling out to
@@ -39,7 +48,7 @@ from __future__ import annotations
 import pathlib
 import shlex
 
-from orchestrator import verify, verify_plan
+from orchestrator import verify, verify_cmd, verify_plan
 from orchestrator.config import OrchestratorConfig, _discover_module_configs
 from orchestrator.module_charter import derive_modules
 
@@ -50,20 +59,23 @@ MODULE_PREFIX = 'scripts'
 # The near-homograph sibling. `scripts/orchestrator.yaml`'s test_command is
 # already byte-identical to this module's (a fact tests/scripts/orchestrator.yaml
 # documents about itself), so a copy-pasted lint_command left pointing here is
-# the realistic wrong fix — see the anti-copy-paste assertions below.
+# the realistic wrong fix — see assertion (5), which is the ONLY place that
+# copy-paste is detectable (assertion (4) cannot see it; the reason is recorded
+# there).
 SIBLING_PREFIX = 'tests/scripts'
 
 # A real tracked file under scripts/, used as the representative touched-file
 # for the derive_modules -> for_module routing assertions below.
 SAMPLE_TOUCHED_FILE = 'scripts/tests/test_census_trigger.py'
 
-# The mechanism, restated once so each failure message can point at it.
+# The mechanism, restated once so each failure message can point at it. By
+# SYMBOL, not file:line — see the module docstring: the line pins this string
+# originally carried were all stale at HEAD and sent readers to unrelated code.
 _VACUOUS_PASS = (
-    'verify_plan.py:394-403 emits a SKIPPED PlannedRun with cmd=None for a '
-    'falsy lint_command, _executed_module_configs_from_plan renders that back '
-    'to None (verify.py:4897), and _run_or_skip_timed turns a None command '
-    'into a CheckRun.skipped that is VACUOUSLY PASSING at rc=0 '
-    '(verify.py:4202-4203)'
+    'verify_plan._derive_module_runs emits a SKIPPED PlannedRun with cmd=None '
+    'for a falsy lint_command, verify._executed_module_configs_from_plan '
+    'renders that back to None, and verify._run_or_skip_timed turns a None '
+    'command into a CheckRun.skipped that is VACUOUSLY PASSING at rc=0'
 )
 
 
@@ -93,18 +105,51 @@ def _executed_for_touched(files: list[str]):
     return executed[0]
 
 
+def _ruff_segment(cmd: str) -> str:
+    """The ``&&``-chained segment of *cmd* that actually invokes ``ruff check``.
+
+    Reuses the production splitter (``verify_cmd.split_top_level_and``, which
+    is quote-aware) rather than a naive ``str.split('&&')``.
+
+    Chaining is an ESTABLISHED pattern here, not a hypothetical:
+    ``verify_plan._scope_prefix_to_keyword``'s own docstring records that
+    "every subproject's lint_command chains a ``python3 .../check_*.py <dir>``
+    gate after ``ruff check``". Extracting the ruff segment first is what lets
+    the target assertions below stay true if this module later adopts that
+    shape — tokenising the whole chain would otherwise read ``&&``, ``python3``
+    and the checker's own arguments as ruff lint targets.
+    """
+    segments = verify_cmd.split_top_level_and(cmd)
+    ruff_segments = [s for s in segments if 'ruff check' in s]
+    assert len(ruff_segments) == 1, (
+        f'expected exactly one `ruff check` segment in {cmd!r}, got '
+        f'{ruff_segments!r}'
+    )
+    return ruff_segments[0]
+
+
 def _ruff_targets(cmd: str) -> list[str]:
-    """The positional path arguments a ``ruff check`` command lints.
+    """The positional path arguments the ``ruff check`` segment of *cmd* lints.
 
     Substring checks alone cannot carry assertion (5): ``'scripts/'`` is a
     substring of ``'tests/scripts/'``, so a copy-pasted sibling command would
-    satisfy a naive ``'scripts/' in cmd``. Splitting out the actual targets is
-    what makes the anti-copy-paste assertion real.
+    satisfy a naive ``'scripts/' in cmd``. Splitting out the actual targets and
+    testing LIST MEMBERSHIP (exact-element, so ``'tests/scripts/'`` does not
+    match) is what makes the anti-copy-paste assertion real.
     """
-    tokens = shlex.split(cmd)
+    tokens = shlex.split(_ruff_segment(cmd))
     assert 'check' in tokens, f'no ruff `check` subcommand in {cmd!r}'
     tail = tokens[tokens.index('check') + 1:]
     return [t for t in tail if not t.startswith('-')]
+
+
+def _ruff_exclude_flags(cmd: str) -> list[str]:
+    """Any ``--exclude`` / ``--extend-exclude`` / ``--force-exclude`` flags.
+
+    Both spellings are caught: ``--exclude foo`` and ``--exclude=foo``.
+    """
+    prefixes = ('--exclude', '--extend-exclude', '--force-exclude')
+    return [t for t in shlex.split(_ruff_segment(cmd)) if t.startswith(prefixes)]
 
 
 def test_scripts_diff_is_lint_gated() -> None:
@@ -148,15 +193,18 @@ def test_scripts_diff_is_lint_gated() -> None:
     # verify. A prefix deeper than lock_depth is honoured by
     # run_full_verification (which iterates module_configs.values() directly)
     # but unreachable via scheduler/workflow, which pass normalize_lock-
-    # truncated keys; config.py:4712-4725 warns, it does not fail.
+    # truncated keys; config._discover_module_configs only WARNS, it does not
+    # fail, so nothing but this assertion would surface the mismatch.
     cfg = OrchestratorConfig(project_root=REPO_ROOT)
     prefix_depth = len(MODULE_PREFIX.split('/'))
     assert prefix_depth <= cfg.lock_depth, (
         f'module config prefix {MODULE_PREFIX!r} has depth {prefix_depth} but '
-        f'lock_depth={cfg.lock_depth}; the scheduler (_limit_for) and workflow '
-        '(_resolve_module_configs) truncate module paths to lock_depth '
-        'components via normalize_lock, so this config would be unreachable '
-        'through the path that dispatches verify (config.py:4712-4725)'
+        f'lock_depth={cfg.lock_depth}; scheduler._limit_for and '
+        'workflow._resolve_module_configs truncate module paths to lock_depth '
+        'components via shared.locking.normalize_lock, so this config would be '
+        'unreachable through the path that dispatches verify — '
+        'config._discover_module_configs logs a warning for exactly this case '
+        'and carries on'
     )
 
     cfg._module_configs = discovered
@@ -190,44 +238,68 @@ def test_scripts_diff_is_lint_gated() -> None:
         'targets only shared/escalation/fused-memory/orchestrator/dashboard'
     )
 
-    # (4) ANTI-COPY-PASTE, on the FILE_SCOPED render. `scripts/` and
-    # `tests/scripts/` are near-homographs and this module's test_command is
-    # already byte-identical to the sibling's, so a lint_command left pointing
-    # at tests/scripts/ is the single most likely wrong fix — it would present
-    # as fully green while leaving every file under scripts/ unlinted,
-    # reproducing the original defect behind a config that now looks correct.
+    # (4) SCOPING, on the FILE_SCOPED render: the executed command must lint
+    # the file that actually changed.
+    #
+    # This assertion deliberately does NOT claim to catch the tests/scripts/
+    # copy-paste, and an earlier draft that did was WRONG. Measured against the
+    # production bridge: _scope_prefix_to_keyword REPLACES the declared targets
+    # with the touched-file list, so a config carrying the copy-pasted
+    # `ruff check tests/scripts/` renders to
+    # 'uv run --project shared ruff check scripts/tests/test_census_trigger.py'
+    # — byte-identical to what the correct config renders. A
+    # `SIBLING_PREFIX not in executed.lint_command` check here is therefore
+    # unfalsifiable: it passes for the right config and the wrong one alike.
+    # The copy-paste is only detectable on the DECLARED value — see (5), which
+    # is where that claim now lives, and where it is genuinely falsifiable.
     assert SAMPLE_TOUCHED_FILE in executed.lint_command, (
         f'executed lint_command {executed.lint_command!r} does not target the '
         f'touched file {SAMPLE_TOUCHED_FILE!r} (task 3445) — '
-        '_scope_prefix_to_keyword rewrites the declared directory target to the '
-        'touched file list, so a command that does not mention it is linting '
-        'some other tree than the one that changed'
-    )
-    assert SIBLING_PREFIX not in executed.lint_command, (
-        f'executed lint_command {executed.lint_command!r} targets '
-        f'{SIBLING_PREFIX}/ for a {MODULE_PREFIX}/-only diff (task 3445) — this '
-        f'is the copy-paste failure: {SIBLING_PREFIX}/ has its own module config '
-        f'and its own lint_command, so this one would report green while every '
-        f'file under {MODULE_PREFIX}/ stays unlinted'
+        'verify_plan._scope_prefix_to_keyword rewrites the declared directory '
+        'target to the touched file list, so a command that does not mention it '
+        'is linting some other tree than the one that changed'
     )
 
-    # (5) The FULL_SUITE / merge-role form. Under merge_verify_breadth=full and
-    # on STRUCTURAL diffs the DECLARED command runs verbatim and unscoped, so
-    # the raw value has to be right on its own terms, not merely after scoping.
+    # (5) The FULL_SUITE / merge-role form, and the ONLY falsifiable
+    # anti-copy-paste coverage in this file (see (4)). Under
+    # merge_verify_breadth=full and on STRUCTURAL diffs the DECLARED command
+    # runs verbatim and unscoped, so the raw value has to be right on its own
+    # terms, not merely after scoping.
     assert mc.lint_command is not None and 'ruff check' in mc.lint_command, (
         f'{MODULE_PREFIX}/orchestrator.yaml declares lint_command='
         f'{mc.lint_command!r} (task 3445). Under merge-role '
         f'merge_verify_breadth=full this value runs VERBATIM, so an absent or '
         f'non-ruff command leaves the merge path ungated too: {_VACUOUS_PASS}'
     )
-    assert _ruff_targets(mc.lint_command) == [f'{MODULE_PREFIX}/'], (
+
+    # Membership, not list equality: equality would also reject a LEGITIMATE
+    # strengthening — `ruff check scripts/ && python3 scripts/check_x.py
+    # scripts`, the chained-sibling-gate shape _scope_prefix_to_keyword's
+    # docstring says every subproject's lint_command already uses — and would
+    # do so with a message accusing the author of narrowing the gate. What must
+    # hold is narrower and exact: the directory itself is a ruff target
+    # (exact-element, so the copy-pasted 'tests/scripts/' does NOT satisfy it).
+    targets = _ruff_targets(mc.lint_command)
+    assert f'{MODULE_PREFIX}/' in targets, (
         f'{MODULE_PREFIX}/orchestrator.yaml declares lint_command='
-        f'{mc.lint_command!r}, whose ruff targets are '
-        f'{_ruff_targets(mc.lint_command)!r} rather than [{MODULE_PREFIX + "/"!r}] '
-        f'(task 3445). The gate must be the directory-wide form — narrowing it '
-        f'to a file list or carving out an exclude would leave part of '
-        f'{MODULE_PREFIX}/ ungated under merge full-verify, which is the defect '
-        'this guard exists to prevent'
+        f'{mc.lint_command!r}, whose ruff targets are {targets!r} — '
+        f'{MODULE_PREFIX + "/"!r} is not among them (task 3445). The gate must '
+        f'be the DIRECTORY-WIDE form: narrowing it to a file list, or leaving a '
+        f'copy-pasted {SIBLING_PREFIX}/ target in place, leaves {MODULE_PREFIX}/ '
+        f'ungated under merge full-verify behind a check that reports green — '
+        'the exact defect this guard exists to prevent. Chaining an additional '
+        '&&-joined gate after ruff is fine and does NOT trip this assertion'
+    )
+
+    # The other half of "directory-wide": nothing carved back out of it.
+    excludes = _ruff_exclude_flags(mc.lint_command)
+    assert not excludes, (
+        f'{MODULE_PREFIX}/orchestrator.yaml declares lint_command='
+        f'{mc.lint_command!r}, which carves files back out with {excludes!r} '
+        f'(task 3445). The three findings measured at declaration time were '
+        f'FIXED rather than excluded, per the task-3350 precedent; an exclude here '
+        f'silently un-gates whatever it names while the check still reports '
+        'green'
     )
 
     sibling = discovered.get(SIBLING_PREFIX)
