@@ -219,7 +219,7 @@ sole pin on that behaviour.
 The driver's `test_bash_suite_passes` applies the same predicate reify's own
 runner (`tests/infra/run_all_ambient_isolation_lib.sh`) does: **exit 0 AND a
 `Results: N passed, 0 failed` line AND `N` at or above a per-suite floor**
-(`ASSERT_FLOORS`). Exit status alone cannot tell "all 837 asserts ran and
+(`ASSERT_FLOORS`). Exit status alone cannot tell "all 865 asserts ran and
 passed" from "a block skipped and the rest passed", and leaf **κ** deletes
 reify's originals on the strength of these items being green — so the weaker
 predicate would have been the single weak link in that chain.

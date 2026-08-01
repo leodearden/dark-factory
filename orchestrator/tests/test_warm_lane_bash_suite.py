@@ -23,7 +23,7 @@ reify's originals on the strength of this suite being green:
   ``N`` at or above a per-suite floor — the same strictly-stronger predicate
   reify's own runner (``tests/infra/run_all_ambient_isolation_lib.sh``) applies.
   Exit-status-only would be the weak link in κ's chain: a block that skips or
-  short-circuits still exits 0 while its share of the 837 asserts never runs.
+  short-circuits still exits 0 while its share of the 865 asserts never runs.
   See ``ASSERT_FLOORS``.
 
 See ``orchestrator/tests/warm-lane/README.md`` for provenance, the enumerated
@@ -404,7 +404,7 @@ def test_bash_suite_passes(name: str) -> None:
     """Each ported bash suite must be green by reify's own greenness predicate.
 
     ``exit 0`` AND a ``Results: N passed, 0 failed`` line AND ``N`` at or above
-    ``ASSERT_FLOORS[name]``.  Exit status alone cannot distinguish "all 837
+    ``ASSERT_FLOORS[name]``.  Exit status alone cannot distinguish "all 865
     asserts ran and passed" from "a block skipped and the rest passed", and leaf
     κ deletes reify's originals on the strength of this item being green.
     """
