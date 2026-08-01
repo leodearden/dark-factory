@@ -26,6 +26,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import _task_db_scan
+import audit_wiped_metadata_files
 from audit_wiped_metadata_files import (
     _LOCK_LEVEL_CAVEAT,
     _SOURCE_PRECEDENCE,
@@ -1562,3 +1564,44 @@ def test_main_min_fidelity_defaults_to_file_level(tmp_path):
     candidate = json.loads(opted_in.stdout)["projects"][0]["candidates"][0]
     assert candidate["task_id"] == 4
     assert candidate["plan_files_fidelity"] == FIDELITY_LOCK_LEVEL
+
+
+# ---------------------------------------------------------------------------
+# Shared-plumbing adoption contract (task 3336).
+# ---------------------------------------------------------------------------
+
+def test_module_sources_its_discovery_from_the_shared_module():
+    """Task 3286's finding is that a PARTIAL extraction defeats the point: a
+    private copy left behind keeps drifting while every other test still
+    passes. Identity (`is`), not a source grep — a re-pasted copy with a
+    byte-identical body satisfies every other assertion in this file but
+    cannot satisfy this one.
+    """
+    assert (
+        audit_wiped_metadata_files.discover_project_roots
+        is _task_db_scan.discover_project_roots
+    )
+    assert audit_wiped_metadata_files.tasks_db_path is _task_db_scan.tasks_db_path
+
+
+def test_the_private_discovery_copy_is_gone_not_merely_shadowed():
+    """Catches the halfway state where the shared import lands on top of a
+    still-present private copy: the module attribute would look right while
+    the dead code sits underneath waiting to be re-wired."""
+    assert not hasattr(audit_wiped_metadata_files, "_DEFAULT_PROJECT_ROOTS")
+
+
+def test_audit_does_not_adopt_the_leak_scanner_cli_tier():
+    """The Tier-1-only boundary, pinned in the OTHER direction.
+
+    This audit's format_json emits an OBJECT over ProjectAudits, and its main()
+    carries a fourth exit code (3 = roots resolved but every one failed, kept
+    distinct from 0 per docs/legibility/design-invariants.md's no-silent-fail-
+    soft rule). The shared helper is an array-shaped format_json paired with a
+    three-code run_scan_cli. Collapsing this file onto it would silently delete
+    the exit-3 semantics — a fail-soft regression that no other test here would
+    catch, because a run that audits nothing successfully still prints a
+    well-formed empty report. So "audit deliberately keeps its own CLI layer"
+    is pinned as a contract, not left to a comment.
+    """
+    assert audit_wiped_metadata_files.format_json is not _task_db_scan.format_json
