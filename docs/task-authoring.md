@@ -484,14 +484,17 @@ action); task goes `blocked` until resolved.
 | `before_done` | `always_escalates` | Behaviour | Use for |
 |---|---|---|---|
 | present | `false` | run action; escalate only on failure; else `done` | **auto-deploy** |
-| present | `true` | run action; then escalate born-at-L2; `done` after `resume` | act-then-ask |
+| present | `true` | run action; then escalate born-at-L2; `done` after `resume` | act-then-ask (incompatible with `human_curator_gate`) |
 | absent | `true` | escalate born-at-L2 immediately; `done` after `resume` | **pure gate** |
 | absent | `false` | **rejected** at `submit_task` (ill-formed no-op) | — |
 
 **Validation (enforced at `submit_task`):** `task_kind='deterministic'`
 with `before_done=None` and `always_escalates=false` is **rejected**
 ("ill-formed no-op"). `before_done` set on a `normal` task is also
-**rejected** ("before_done is only valid on deterministic tasks").
+**rejected** ("before_done is only valid on deterministic tasks"). A truthy
+`human_curator_gate` together with a non-null `before_done` is likewise
+**rejected** ("human_curator_gate is only valid on a pure gate") — see
+[The human-curator-gate contract](#the-human-curator-gate-contract).
 
 **Born-at-L2 escalations:** all filed with `severity ∈ {critical, urgent}`
 and sentinel `agent_role='orchestrator-deterministic'`; the server retains
@@ -808,6 +811,20 @@ machine step that closes the task, which contradicts "only a human's content
 judgement closes this" — a task carrying both takes the act-then-ask path
 with the marker unread, and `DeterministicRunner` logs a warning naming the
 authoring defect on every dispatch. Do not combine them.
+
+The combination is **rejected at `submit_task`/`update_task`** by
+`shared.task_metadata`'s cross-field validator whenever `task_metadata.enforce`
+is true (its production setting), so the contradiction cannot land in the first
+place. In warn-mode it degrades to a single `task_metadata.schema_warning`
+census line (whole-blob field `<metadata>`, code `invalid_metadata`) and the
+write proceeds. Note the write boundary treats that whole-blob field as
+*always* fatal regardless of which keys the delta names — so an `update_task`
+supplying only `human_curator_gate` is rejected even when `before_done` is an
+untouched legacy field. The `DeterministicRunner` warning above is deliberately
+**retained** as a defence-in-depth backstop for records that did not pass
+through that boundary: `task_metadata.enforce` is a red-tier restart-only flag,
+records predate the validator, and not every writer goes through
+`SqliteTaskBackend`.
 
 **`metadata.human_curator_adjudicated_at`** (ISO-8601 string) is the required
 content-adjudication signal, stamped via `update_task` (with
