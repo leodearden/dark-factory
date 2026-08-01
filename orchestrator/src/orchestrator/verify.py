@@ -3684,6 +3684,9 @@ async def _run_cmd(
         return 1, f'Command failed: {e}', False
 
 
+_CHAIN_BUDGET_EXHAUSTED = 'chain wall-clock budget exhausted before this segment started'
+
+
 async def _run_segmented(
     segments: 'list[ChainSegment]',
     *,
@@ -3727,14 +3730,36 @@ async def _run_segmented(
     results: list[dict] = []
     first_nonzero = 0
     any_timed_out = False
+    any_not_run = False
     blocks: list[str] = []
+    deadline = now() + budget_secs
 
     for index, segment in enumerate(segments, start=1):
+        remaining = deadline - now()
+        if remaining <= 0:
+            # Budget gone. Record this segment and every one after it as
+            # NOT RUN without spawning anything: `rc=None` (never 0) is the
+            # unconflatable encoding — a segment that never ran must be
+            # structurally impossible to read as a pass.
+            any_not_run = True
+            results.append({
+                'index': index,
+                'label': segment.label,
+                'cwd': segment.cwd_rel,
+                'cmd': segment.command,
+                'status': 'not_run',
+                'rc': None,
+                'timed_out': False,
+                'duration_secs': 0.0,
+                'skip_reason': _CHAIN_BUDGET_EXHAUSTED,
+            })
+            blocks.append(_segment_output_block(results[-1], len(segments), ''))
+            continue
         started = now()
         rc, out, seg_timed_out = await run_one(
             segment.command,
             worktree / segment.cwd_rel,
-            budget_secs,
+            remaining,
             segment.label,
         )
         duration = now() - started
@@ -3760,7 +3785,15 @@ async def _run_segmented(
         })
         blocks.append(_segment_output_block(results[-1], len(segments), out))
 
-    return first_nonzero, '\n'.join(blocks), any_timed_out, results
+    # A genuine red outranks the synthetic not-run rc: the cause_hint a
+    # triaging agent needs is the real failure, not the budget. But a
+    # green-so-far run with unrun segments is NEVER green — reporting 0 would
+    # claim a fleet-wide pass on the strength of whatever happened to fit.
+    rc_total = first_nonzero or (1 if any_not_run else 0)
+    # `timed_out` covers not-run too, so the run classifies as `infra_timeout`
+    # (retryable) exactly as a single-chain timeout does today, leaving
+    # run_verification's retry/env-recovery machinery untouched.
+    return rc_total, '\n'.join(blocks), any_timed_out or any_not_run, results
 
 
 def _segment_output_block(entry: dict, total: int, out: str) -> str:
@@ -3769,12 +3802,25 @@ def _segment_output_block(entry: dict, total: int, out: str) -> str:
     The header names index/label/cwd/rc so a reader scrolling a concatenated
     multi-subproject log can always tell which subproject the surrounding lines
     came from — the thing a single `&&`-chained blob cannot say.
+
+    A `not_run` segment gets an explicit NOT RUN body saying its result is
+    UNKNOWN — not a pass. Its wording is deliberately inert to
+    ``_extract_cause_hint``'s ladder and ``classify_failure``'s scanners (no
+    `FAILED`, no `^error: `, no `^ERROR: `), so it can never shadow the real
+    failing segment's hint.
     """
     header = (
         f'===== segment {entry["index"]}/{total} [{entry["label"]}] '
         f'cwd={entry["cwd"]} rc={entry["rc"]} status={entry["status"]} '
         f'({entry["duration_secs"]:.1f}s) ====='
     )
+    if entry['status'] == 'not_run':
+        body = (
+            f'  NOT RUN: {entry["skip_reason"]}.\n'
+            '  This segment produced no result. Its outcome is unknown — '
+            'unknown is not a pass.'
+        )
+        return f'{header}\n{body}'
     return f'{header}\n{out}'
 
 
