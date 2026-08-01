@@ -340,7 +340,11 @@ The merge procedure is iterative — don't assume one pass will be enough:
 
      # unknown is terminal only when the polled id was actually enqueued — on the branch arm
      # nothing was, so unknown is that arm's live state until the git-authority tier resolves it.
-     # superseded means this request was absorbed into a coalesced train — terminal on every arm.
+     # superseded means this request was absorbed into a coalesced train. It stays terminal on
+     # every arm (dropping it here would resurrect the spin-forever bug this tuple exists to
+     # fix), but it is submission-scoped ONLY on the request_id arm — on branch/task_id it is
+     # subject to the same UNSCOPED-HANDLE STALENESS GUARD as every other non-done terminal
+     # below (see accept_terminal and the post-loop dispatch).
      terminal = ("done", "conflict", "blocked", "abandoned", "superseded") if poll_by == "branch" \
          else ("done", "conflict", "blocked", "abandoned", "unknown", "superseded")
      # 20-min hard ceiling on BOTH unscoped arms (branch and task_id): each can reject a
@@ -377,7 +381,20 @@ The merge procedure is iterative — don't assume one pass will be enough:
              # Durable-tier `done` (retention ring / event store: no `kind`, no
              # `merge_sha`) — this is the stale-record case. Confirm with git.
              return branch_on_main()   # canonical check below; not-landed → keep polling
-         return True              # non-done terminal: exit the loop, but treat as UNCONFIRMED
+         if poll["state"] == "superseded":
+             # _durable_terminal_state resolves branch/task_id via the non-run-scoped
+             # get_by_branch/get_by_task (then event-store latest_merge_finalized), and
+             # re-emits superseded_by regardless of which round set it — so this may be a
+             # PRIOR round's superseded record for this same reused branch/task_id, not
+             # this submission's outcome. Exit the loop (True) same as any other non-done
+             # terminal, but the post-loop dispatch below MUST treat it as UNCONFIRMED —
+             # re-check get_merge_queue() and git ancestry, and keep polling to the
+             # 20-minute ceiling if this branch is still in flight — before following the
+             # train. Without that gate, a long-since-finished train gets misread as this
+             # round's outcome (the false-done this guard exists to prevent).
+             return True
+         return True              # remaining non-done terminals (conflict/blocked/abandoned/
+                                   # unknown): exit the loop, but treat as UNCONFIRMED
 
      loop:
          sleep(poll_interval)
@@ -426,7 +443,7 @@ The merge procedure is iterative — don't assume one pass will be enough:
        ```
        Thread that SHA into `done_provenance={"commit": "<sha>"}`. **Do not fall back to eyeballing `git log main --oneline | head -5`** — it is not scoped to this task, so any SHA you pick from it is likely an unrelated task's merge, and the server's only provenance backstop (`git merge-base --is-ancestor <sha> main`) passes for every recent commit on main and would not catch it. If the search comes back empty, fall back to `{"note": "<explanation>"}`. Then proceed to step 8.
      - `poll["state"] in ("conflict", "blocked", "abandoned", "unknown")` → see *Polled terminal failures* below. **On the unscoped arms (`poll_by` `"branch"` or `"task_id"`) these are UNCONFIRMED** — per the staleness guard above they may be a prior round's record for this same reused branch/task_id rather than this submission's outcome. Before acting on one, re-check `mcp__escalation__get_merge_queue()` and who owns the worktree; if this branch is still in flight, keep polling to the 20-minute ceiling instead of resubmitting on a stale failure.
-     - `poll["state"] == "superseded"` → see *Polled terminal failures* below — follow the train, never resubmit or direct-merge.
+     - `poll["state"] == "superseded"` → see *Polled terminal failures* below for the full follow-the-train procedure. **On the `request_id` arm** (always submission-scoped) follow the train directly — never resubmit or direct-merge. **On the unscoped arms (`poll_by` `"branch"` or `"task_id"`) this is UNCONFIRMED, exactly like the states above** — it may be a prior round's `superseded` record for this same reused branch/task_id, not this submission's outcome. Before following the train, re-check `mcp__escalation__get_merge_queue()` and who owns the worktree; if this branch is still in flight, keep polling to the 20-minute ceiling instead of chasing a stale train.
 
    *(Immediate-response failure edges — `conflict`, `blocked`, `unknown_branch`, `failed`, orchestrator-down — and cancellation are covered below.)*
 
@@ -472,10 +489,14 @@ The merge procedure is iterative — don't assume one pass will be enough:
   ```
   **Never fall back to direct merge in response to `unknown`** — `unknown` means the server lost its record, not that the merge failed. **This block's `resubmit` line does not apply to the `poll_by == "branch"` arm** — there nothing was ever enqueued, so `unknown` is that arm's expected live state, not a lost record; that arm never reaches this bullet as a terminal state (it's excluded from step 7's terminal set) — it arrives here only via the branch arm's 20-minute deadline, and the action there is to run the same [canonical ancestry check](#branch-on-main) once more (rc=128 marker search included) and STOP and report to the human only if it still comes back not-landed, rather than resubmitting.
 
-- `poll["state"] == "superseded"` (this submission was absorbed into a coalesced train) → **follow
-  the train, on every `poll_by` arm — never resubmit and never direct-merge**, since the train is
-  already in flight and either would race it. `superseded_by` does not always name something you
-  can poll, though — check which shape you have first:
+- `poll["state"] == "superseded"` (this submission was absorbed into a coalesced train) → follow
+  the train: **on the `request_id` arm** directly; **on the `branch`/`task_id` arms**, only after
+  the UNCONFIRMED gate above confirms it (re-check `get_merge_queue()` and git ancestry; keep
+  polling to the 20-minute ceiling if this branch is still in flight) — it may be a prior round's
+  `superseded` record rather than this submission's outcome. Once you are following the train,
+  **never resubmit and never direct-merge, on any arm** — the train is already in flight and
+  either would race it. `superseded_by` does not always name something you can poll, though —
+  check which shape you have first:
 
   - **`mr-*` id** (generation-advance path) — a real request id. Poll it:
     ```
