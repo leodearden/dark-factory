@@ -139,7 +139,17 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# dirname by PARAMETER EXPANSION, not a fork: a PATH without dirname yields an
+# EMPTY substitution, `cd ""` succeeds as a no-op, and SCRIPT_DIR silently becomes
+# the CALLER'S CWD. See README.md "Delta 7".
+_src="${BASH_SOURCE[0]}"
+_dir='.'
+case "$_src" in
+    */*) _dir="${_src%/*}"
+         [ -n "$_dir" ] || _dir='/' ;;
+esac
+SCRIPT_DIR="$(cd "$_dir" && pwd)"
+unset _src _dir
 
 # shellcheck source=scripts/lib_portable.sh
 source "$SCRIPT_DIR/lib_portable.sh"
@@ -812,7 +822,7 @@ if [ -n "$MOUNT" ] && [ -d "$MOUNT" ]; then
     for entry in "$MOUNT"/*/; do
         entry="${entry%/}"
         [ -d "$entry" ] || continue
-        name="$(basename "$entry")"
+        name="${entry##*/}"
         _is_git_worktree "$entry" || continue
 
         RESIDENT=$((RESIDENT + 1))
