@@ -328,6 +328,12 @@ leaving a half-done tree that is falsely recorded as a completed, successful run
 # skills/unblock/SKILL.md, adapted for a commit-SHA subject rather than a
 # branch-ref subject: no rc=128 merge-marker search here, since that arm only
 # makes sense for a ref that merge-lane cleanup can delete out from under you.
+# It also diverges by echoing the captured rc (`echo "ancestry rc=$rc"`), which
+# the SKILL.md blocks' `cmd; rc=$?` form does not: a compound command's own
+# exit status is that of its LAST statement, so `cmd; rc=$?` always reports
+# exit 0 to the calling tool no matter what `cmd` did. The SKILL.md blocks
+# carry this identical silent-rc gap (confirmed against real git during task
+# 3406's step-8 amendment) but fixing them is outside this task's file scope.
 ANCESTRY_CHECK_INSTRUCTIONS = """\
     git -C <project_root> merge-base --is-ancestor <sha> main; rc=$?; echo "ancestry rc=$rc"
     # The trailing `echo` is REQUIRED, not decoration. `--is-ancestor` prints
@@ -338,8 +344,13 @@ ANCESTRY_CHECK_INSTRUCTIONS = """\
     # on every path and keeps all three outcomes distinguishable. Do not "tidy"
     # it away.
     # rc=0   -> <sha> IS on main. Proceed with the set_task_status call.
-    # rc=1   -> <sha> resolves here but is NOT reachable from main (it is only on a
-    #           feature branch). The SHA is wrong -- re-derive the landing commit.
+    # rc=1   -> <sha> resolves here but is NOT reachable from the `main` ref as it
+    #           stands in THIS checkout. Usually the SHA is wrong (it is only on a
+    #           feature branch) -- but this checkout's `main` can also simply be
+    #           behind (a just-submitted merge, an unfetched <project_root>). If
+    #           that is plausible, run `git -C <project_root> fetch --all` and
+    #           re-run once before concluding. Still rc=1 after that -> the SHA
+    #           really is off main; re-derive the landing commit.
     # rc=128 -> git cannot resolve <sha> (or `main`) in this checkout: "fatal: Not a
     #           valid object name". This is NOT "not on main" -- it is "not yet
     #           confirmed". Usually a stale/unfetched <project_root>, a wrong -C path,
@@ -352,12 +363,15 @@ ANCESTRY_CHECK_INSTRUCTIONS = """\
 
 
 # How the server-side backstop in fused-memory's task_interceptor actually
-# reports failure, spliced into both STEWARD "Marking tasks done" call sites
-# alongside ANCESTRY_CHECK_INSTRUCTIONS. Kept factual rather than aspirational:
-# `_validate_done_provenance` rev-parses BEFORE it merge-bases, and it wraps
-# every `_verify_commit_on_main` failure -- rc=1 and non-rc=1 alike -- in one
-# "is not on main" prefix. Documenting the prefix as trustworthy would recreate
-# the exact rc=1/rc=128 conflation this whole section exists to prevent.
+# reports failure. Spliced ONCE, at the kind="merged" call site immediately
+# after ANCESTRY_CHECK_INSTRUCTIONS -- the backstop is identical for both
+# `done_provenance` kinds, so the kind="found_on_main" site just references it
+# by name instead of repeating ~1.1 kB of prose a second time. Kept factual
+# rather than aspirational: `_validate_done_provenance` rev-parses BEFORE it
+# merge-bases, and it wraps every `_verify_commit_on_main` failure -- rc=1 and
+# non-rc=1 alike -- in one "is not on main" prefix. Documenting the prefix as
+# trustworthy would recreate the exact rc=1/rc=128 conflation this whole
+# section exists to prevent.
 SERVER_BACKSTOP_NOTE = """\
 The server runs the same checks as a backstop, in this order. Read the TRAILING
 DETAIL of a rejection, never the leading prefix:
@@ -1302,10 +1316,8 @@ impl-providing commit and verify it is on main:
     git -C <project_root> log main --oneline -- <relevant_paths>
 """ + ANCESTRY_CHECK_INSTRUCTIONS + """
 Cite the commit and the providing-task id (when known) in `note`. The same
-server-side backstop applies to this kind too (post-3092 phantom-done hardening,
-2026-05-09):
-
-""" + SERVER_BACKSTOP_NOTE + """
+server-side backstop described above applies to this kind too (post-3092
+phantom-done hardening, 2026-05-09).
 
 ### Forbidden
 
