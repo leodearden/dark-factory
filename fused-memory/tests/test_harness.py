@@ -8336,8 +8336,10 @@ class TestHarnessDrainIdleShortCircuit:
         active).
 
         We patch the module-local _sleep to yield immediately so the loop body runs
-        many iterations within the 0.2 s window, maximising the chance of catching
-        spurious emissions.
+        many iterations quickly, maximising the chance of catching spurious
+        emissions.  The loop is driven by _drive_run_loop_until, waiting on the
+        OBSERVABLE EVENT the non-vacuity guard below checks (three reaper ticks)
+        rather than a fixed wall-clock window — see that helper's docstring.
         """
         real_sleep = asyncio.sleep
 
@@ -8376,14 +8378,16 @@ class TestHarnessDrainIdleShortCircuit:
         with caplog.at_level(logging.INFO, logger='fused_memory.reconciliation.harness'):
             # Idle path: drain() fires the marker synchronously; _drain_complete_logged=True
             harness.drain()
-            # Run the main loop; with fast_sleep many iterations execute in 0.2 s.
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(harness.run_loop(), timeout=0.2)
+            # Drive the main loop until three iterations have actually run. Stays
+            # INSIDE caplog.at_level so the absence-assertions below still see
+            # every record emitted while the loop was running.
+            await _drive_run_loop_until(harness, ticked)
 
         # Guard: ensure the loop body actually ran enough iterations to make the
-        # absence-assertions below meaningful.  On a heavily-loaded CI host the 0.2 s
-        # window could expire before any iteration runs, making the absence-assertions
-        # pass vacuously.  This fails loudly with a diagnostic when that happens.
+        # absence-assertions below meaningful.  Retained after the migration: the
+        # drive above waits on exactly this condition, but _drive_run_loop_until
+        # deliberately suppresses its own deadlock backstop and falls through to
+        # caller assertions, so this is the descriptive assertion that reports it.
         #
         # Why _recover_stale_runs.call_count is a reliable iteration proxy:
         # `await self._recover_stale_runs()` is the FIRST awaited call inside the
