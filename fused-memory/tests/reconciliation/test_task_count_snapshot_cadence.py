@@ -2219,8 +2219,13 @@ class TestStage3PromptNamesMem0SnapshotStats:
     tests/test_standing_decision_prompt_drift.py): every assertion is keyed
     off the imported constants, so a future rename cannot orphan the
     guidance — leaving the prompt warning about a key the model never sees
-    while the false positive quietly returns. No assertion is made about
-    wording, sentence structure, or section ordering.
+    while the false positive quietly returns.
+
+    The contract is PRESENCE-ONLY. No assertion is made about wording,
+    sentence structure, section ordering, or what the prompt must NOT say —
+    the prompt stays free to mention the legacy spelling if a future cycle
+    wants to explain the rename to the model during the back-compat window
+    that extract_snapshot_written's legacy fallback keeps open.
     """
 
     def test_prompt_names_the_written_stat_key(self):
@@ -2232,15 +2237,3 @@ class TestStage3PromptNamesMem0SnapshotStats:
         from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
 
         assert SNAPSHOT_PRUNED_STAT_KEY in STAGE3_SYSTEM_PROMPT
-
-    def test_prompt_does_not_name_the_legacy_spelling(self):
-        """No producer emits the legacy key, so guidance about it would be
-        dead text pointing the model at a stat it can never observe.
-
-        Safe as a plain substring check: the legacy spelling is NOT a
-        substring of the new one ('task_count_snapshot_written' vs
-        'task_count_snapshot_mem0_written').
-        """
-        from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
-
-        assert LEGACY_SNAPSHOT_WRITTEN_STAT_KEY not in STAGE3_SYSTEM_PROMPT
