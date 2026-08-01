@@ -175,6 +175,51 @@ class TestExtractSnapshotWritten:
     def test_none_report_is_none(self):
         assert extract_snapshot_written(None) is None
 
+    # --- legacy-key back-compat (task 3045) ---------------------------------
+    #
+    # harness._maybe_escalate_stale_task_count_snapshot recomputes its
+    # consecutive-miss streak from journal.get_recent_runs -- i.e. from
+    # stage_reports blobs persisted by cycles that ran BEFORE the rename.
+    # Without a fallback every such row reads as None,
+    # compute_snapshot_miss_streak stops at the first one, and the
+    # recon_stale_task_count_snapshot escalation goes silently dead instead
+    # of loudly wrong.
+
+    def test_legacy_key_1_is_true_on_stage_report(self):
+        report = _stage_report({LEGACY_SNAPSHOT_WRITTEN_STAT_KEY: 1})
+        assert extract_snapshot_written(report) is True
+
+    def test_legacy_key_0_is_false_on_stage_report(self):
+        report = _stage_report({LEGACY_SNAPSHOT_WRITTEN_STAT_KEY: 0})
+        assert extract_snapshot_written(report) is False
+
+    def test_legacy_key_1_is_true_on_raw_dict(self):
+        report = {'stats': {LEGACY_SNAPSHOT_WRITTEN_STAT_KEY: 1}}
+        assert extract_snapshot_written(report) is True
+
+    def test_legacy_key_0_is_false_on_raw_dict(self):
+        report = {'stats': {LEGACY_SNAPSHOT_WRITTEN_STAT_KEY: 0}}
+        assert extract_snapshot_written(report) is False
+
+    def test_new_key_wins_over_legacy_when_both_present_new_0(self):
+        """Precedence is deterministic: the new key wins, both directions."""
+        report = _stage_report({
+            SNAPSHOT_WRITTEN_STAT_KEY: 0,
+            LEGACY_SNAPSHOT_WRITTEN_STAT_KEY: 1,
+        })
+        assert extract_snapshot_written(report) is False
+
+    def test_new_key_wins_over_legacy_when_both_present_new_1(self):
+        report = _stage_report({
+            SNAPSHOT_WRITTEN_STAT_KEY: 1,
+            LEGACY_SNAPSHOT_WRITTEN_STAT_KEY: 0,
+        })
+        assert extract_snapshot_written(report) is True
+
+    def test_neither_key_present_is_still_none(self):
+        report = _stage_report({'some_unrelated_stat': 1})
+        assert extract_snapshot_written(report) is None
+
 
 # ---------------------------------------------------------------------------
 # compute_snapshot_miss_streak
