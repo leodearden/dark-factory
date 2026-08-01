@@ -552,3 +552,172 @@ def test_environment_not_compared_when_spec_omits_the_section():
     )
 
     assert drifts == []
+
+
+# ---------------------------------------------------------------------------
+# compare_unit — uvicorn ExecStart flag comparison  (step-9 / step-10)
+# ---------------------------------------------------------------------------
+
+
+def _exec_unit(uv_bin: str, repo_root: str, tail: str) -> str:
+    """A dashboard-service fixture whose ExecStart is a real 4-line continuation.
+
+    The explanatory comment above ExecStart names --timeout-keep-alive in
+    prose, exactly as both real dashboard units do — see the case (e) test.
+    """
+    return f"""\
+[Service]
+Type=simple
+WorkingDirectory={repo_root}
+# --timeout-keep-alive 5 is uvicorn's own default, pinned deliberately.
+# --timeout-graceful-shutdown 8 bounds the connection drain.
+ExecStart={uv_bin} run --project dashboard \\
+  python -m uvicorn dashboard.app:app \\
+  --host 127.0.0.1 --port 8080 \\
+  {tail}
+"""
+
+
+def _flag_spec(mod: types.ModuleType, *flags: str):
+    """A minimal UnitSpec that compares exactly *flags* inside ExecStart."""
+    return mod.UnitSpec(
+        name="fixture.service",
+        repo_relpath="dashboard/fixture.service",
+        exec_start_flags=flags,
+    )
+
+
+_BOTH_FLAGS = "--timeout-graceful-shutdown 8 \\\n  --timeout-keep-alive 5"
+
+
+def test_exec_start_flags_ignore_host_specific_prefixes():
+    """Differing uv path and repo root are NOT drift when the flags agree.
+
+    ExecStart is presence-only precisely because of these prefixes; the flags
+    are how its meaningful content is still compared.
+    """
+    mod = _load_checker()
+    spec = _flag_spec(mod, "timeout-graceful-shutdown", "timeout-keep-alive")
+
+    drifts = mod.compare_unit(
+        spec,
+        _exec_unit("/home/leo/.local/bin/uv", "/home/leo/src/dark-factory", _BOTH_FLAGS),
+        _exec_unit("/usr/local/bin/uv", "/opt/df", _BOTH_FLAGS),
+    )
+
+    assert drifts == [], f"Host prefixes must be ignored by construction; got {drifts}"
+
+
+def test_exec_start_flag_value_difference_is_drift():
+    """A flag whose value differs yields one Drift naming that flag."""
+    mod = _load_checker()
+    spec = _flag_spec(mod, "timeout-graceful-shutdown", "timeout-keep-alive")
+
+    drifts = mod.compare_unit(
+        spec,
+        _exec_unit("/usr/bin/uv", "/opt/df", _BOTH_FLAGS),
+        _exec_unit(
+            "/usr/bin/uv",
+            "/opt/df",
+            "--timeout-graceful-shutdown 20 \\\n  --timeout-keep-alive 5",
+        ),
+    )
+
+    assert len(drifts) == 1, drifts
+    (drift,) = drifts
+    assert "timeout-graceful-shutdown" in drift.key
+    assert drift.repo_value == "8"
+    assert drift.installed_value == "20"
+
+
+def test_exec_start_flag_missing_from_installed_is_drift():
+    """The exact pre-3306 shape: the installed command lacks the flag entirely."""
+    mod = _load_checker()
+    spec = _flag_spec(mod, "timeout-graceful-shutdown", "timeout-keep-alive")
+
+    drifts = mod.compare_unit(
+        spec,
+        _exec_unit("/usr/bin/uv", "/opt/df", _BOTH_FLAGS),
+        _exec_unit("/usr/bin/uv", "/opt/df", "--timeout-graceful-shutdown 8"),
+    )
+
+    assert len(drifts) == 1, drifts
+    (drift,) = drifts
+    assert "timeout-keep-alive" in drift.key
+    assert drift.installed_value == mod._ABSENT
+    assert drift.repo_value == "5"
+
+
+def test_exec_start_flag_accepts_the_equals_spelling():
+    """`--flag=value` equals `--flag value`.
+
+    uvicorn's parser is click-based, so both spellings behave identically.
+    Accepting only the space-separated form would report an '=' -form edit as
+    a missing flag while the flag is plainly there.
+    """
+    mod = _load_checker()
+    spec = _flag_spec(mod, "timeout-keep-alive")
+
+    drifts = mod.compare_unit(
+        spec,
+        _exec_unit("/usr/bin/uv", "/opt/df", "--timeout-keep-alive 5"),
+        _exec_unit("/usr/bin/uv", "/opt/df", "--timeout-keep-alive=5"),
+    )
+
+    assert drifts == []
+
+
+def test_exec_start_flag_lookup_ignores_the_comment_block():
+    """A flag named only in the comment above ExecStart is NOT on the command.
+
+    Both real dashboard units discuss these flags in prose right above
+    ExecStart, so a whole-file regex would keep reporting a value after the
+    flag had actually been deleted from the command — reporting parity on a
+    unit that lost the very flag being checked. The lookup is scoped to the
+    parsed ExecStart value, from which comments are already gone.
+    """
+    mod = _load_checker()
+    spec = _flag_spec(mod, "timeout-keep-alive")
+
+    # The repo copy really runs the flag; the installed copy only MENTIONS it
+    # in the comment block, having dropped it from the command.
+    installed = _exec_unit("/usr/bin/uv", "/opt/df", "--log-level info")
+    assert "--timeout-keep-alive" in installed, "fixture must retain the prose mention"
+
+    drifts = mod.compare_unit(
+        spec,
+        _exec_unit("/usr/bin/uv", "/opt/df", "--timeout-keep-alive 5"),
+        installed,
+    )
+
+    assert len(drifts) == 1, (
+        "The comment's mention of --timeout-keep-alive must not be mistaken "
+        f"for the flag being present on the command. Got: {drifts}"
+    )
+    assert drifts[0].installed_value == mod._ABSENT
+
+
+def test_exec_start_flags_absent_from_both_is_not_drift():
+    """A compared flag neither command carries is parity, not a phantom drift."""
+    mod = _load_checker()
+    spec = _flag_spec(mod, "workers")
+
+    text = _exec_unit("/usr/bin/uv", "/opt/df", _BOTH_FLAGS)
+    assert mod.compare_unit(spec, text, text) == []
+
+
+def test_exec_start_flag_helper_reads_the_parsed_value():
+    """_exec_start_flag returns the raw token, or None when the flag is absent.
+
+    Raw token, not int: --host 127.0.0.1 must work as well as --port 8080.
+    """
+    mod = _load_checker()
+    parsed = mod.parse_unit_directives(
+        _exec_unit("/usr/bin/uv", "/opt/df", _BOTH_FLAGS)
+    )["Service"]
+
+    assert mod._exec_start_flag(parsed, "host") == "127.0.0.1"
+    assert mod._exec_start_flag(parsed, "port") == "8080"
+    assert mod._exec_start_flag(parsed, "timeout-keep-alive") == "5"
+    assert mod._exec_start_flag(parsed, "workers") is None
+    assert mod._exec_start_flag({}, "host") is None
