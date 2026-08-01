@@ -96,8 +96,10 @@ cannot execute:
   (reify 5572 made that fail-loud so a silently-missing liveness guard cannot
   recur).
 - `warm-lane-audit.sh` sources **two**: `$SCRIPT_DIR/lib_portable.sh`, and —
-  since task 3074 — `$SCRIPT_DIR/lib_lane_state.sh` behind a guard copied in
-  shape from `warm-lane-gc.sh`'s. See Delta 4.
+  since task 3074 — `$SCRIPT_DIR/lib_lane_state.sh`. Both sit behind a guard
+  copied in shape from `warm-lane-gc.sh`'s; `lib_portable.sh`'s was added by
+  task 3370 and is ordered **first**, so a copy carrying neither sibling
+  reports it. See Delta 4 and Delta 8.
 
 `orchestrator/tests/test_warm_lane_scripts_shipped.py` pins this as executable
 behaviour: every file above is checked for presence, the owner-execute bit and
@@ -493,6 +495,12 @@ sentinel. That gap is real and separately actionable, but it is a behaviour
 change this delta does not make: with `SCRIPT_DIR` resolved correctly the bare
 `source` failure is unreachable in every case measured.
 
+**Closed since.** Task 3370 added the missing `lib_portable.sh` guard — see
+**Delta 8**. The finding above stands as the historical record of how it was
+found (and the `rc=1` row in the table above remains a dated measurement of
+base behaviour, not a live claim); what changed is only that the gap it
+declares open is now shut.
+
 #### The `[ ... ]` vs assignment asymmetry — the rule for judging any future fork
 
 The generalisable lesson, and the reason the first pass of this delta got the
@@ -638,6 +646,82 @@ All in `orchestrator/tests/test_warm_lane_scripts_shipped.py`:
   deliberately not load-bearing: the two `warm-lane-gc.sh` header blocks that
   documented `BASE_TARGET=$(dirname "$MOUNT")/base/target` were reworded to
   describe the parent-of-`MOUNT` derivation without the fork spelling.
+
+### Delta 8 — `warm-lane-audit.sh` guards its `lib_portable.sh` source
+
+**`warm-lane-audit.sh` is no longer byte-identical to reify** (already true via
+Deltas 4 and 7; this adds to the divergence). Added by **task 3370**, filed by
+task 3279's architect pass as out of scope for it — and taking the Delta number
+Delta 7 reserved by exclusion when it declined to split ("same divergence class,
+same files, same task"). This change fails that rule's **same-task** limb, and
+Delta 4's **same-class** one: it is a different sibling, a different task, and
+not about lane state, so folding it into Delta 4 would make Delta 4's title
+false.
+
+**The defect.** The script sources three siblings and guarded only two. On main
+HEAD `8d276d3c5f`, re-measured on `5828d94734`, a copy with no sibling
+`lib_portable.sh` run with `--help` exited **1**:
+
+```
+warm-lane-audit.sh: line 155: <dir>/lib_portable.sh: No such file or directory
+```
+
+That is bash's own bare-`source` failure under `set -e` — the **runtime** code —
+where this file's taxonomy and Delta 4's rationale both assign **2** to
+"incomplete deployment, nothing about the invocation could have avoided it and
+no retry fixes it". Two consequences worth naming: an operator or timer triaging
+an exit 1 goes hunting for a data problem that is not there, and the failure is
+attributed to **bash** rather than to the script.
+
+**The fix.** A `[ ! -f "$SCRIPT_DIR/lib_portable.sh" ]` guard in Delta 4's
+shape (same message template, same `exit 2`), ordered **FIRST** — above the
+`source` it protects, and therefore above the `lib_lane_state.sh` guard — so a
+copy carrying neither sibling reports `lib_portable.sh`. That is the same rule
+`warm-lane-gc.sh` applies to `lib_live_refs.sh` before `lib_lane_state.sh`.
+Both guards' comments now state the ordering and what reversing it would break,
+so the position cannot be swapped silently.
+
+**Also in this delta:** the script's own header and `_usage()` exit-code tables
+now read **usage/WIRING** and name both sibling libs. They had never been
+amended for task 3074's exit-2 path, so they already understated reality — and
+shipping a guard whose exit code the script's own table does not describe would
+have reproduced this delta's defect one layer up. Wording mirrors
+`warm-lane-gc.sh`'s. The `0 — Always, on every valid invocation` line is
+untouched: the advisory/never-gates contract (PRD §9.5 inv.12) binds every
+*valid* invocation, and a wiring abort means there was no valid invocation to
+report on — the reading task 3074 already relied on.
+
+**Pinned by** `orchestrator/tests/test_warm_lane_scripts_shipped.py`:
+
+* `TestAuditFailsLoudOnAMissingLibPortable` — stages the shipped bytes into a
+  tmp dir withholding **both** siblings (the fixture is asserted first, so the
+  case cannot pass vacuously) and asserts `rc == 2`, the script's own `ERROR`
+  line naming the sibling, the **absence** of bash's bare-`source` shape, and —
+  the ordering pin — that the `lib_lane_state.sh` message is absent from that
+  run. `--help` is the invocation because it normally exits 0, so an rc of 2
+  additionally proves the guard fires before argv parsing.
+* A second case in that class restores `lib_portable.sh` and withholds only
+  `lib_lane_state.sh`, asserting the SECOND guard still fires and still names
+  itself. It is the positive half of the ordering pin: without it the negative
+  assertion above would be satisfied just as well by a lane-state guard that
+  had been deleted or softened to a silent degrade, so the pair would read as
+  an ordering contract while only pinning "one guard exists". The lane-state
+  guard's own primary coverage stays where task 3074 put it,
+  `orchestrator/tests/test_lane_state_lib.py::TestAuditReadsThroughTheLib`.
+* The amended `FAIL_LOUD_FRAGMENTS` entry `lib_portable.sh not found next to`,
+  which replaces `lib_portable.sh: No such file`. That old fragment pinned a
+  shape this delta makes unreachable for the only script that sources
+  `lib_portable.sh` (`warm-lane-audit.sh`, the sole consumer repo-wide), so it
+  would have become a pin that can never fire. The bare shape stays covered
+  generically by the per-line scan, which trips on any sourced-lib name
+  appearing with `No such file` **or** `not found`.
+
+**Reachability, stated honestly.** After Delta 7 resolved `SCRIPT_DIR`
+correctly, this branch is unreachable in every case measured: it needs a
+genuinely missing `lib_portable.sh` — an incomplete deployment, or a
+hand-assembled project-override copy under `<project_root>/scripts/`. That is
+what makes this a **taxonomy** fix rather than a bug fix, and why it was filed
+low priority.
 
 ## Sibling-seed defaults, and who resolves them
 

@@ -91,8 +91,15 @@
 #        script must never gate anything; PRD §9.5 inv.12). A status-lookup
 #        failure, a df/du measurement failure, or a nonexistent/empty mount
 #        all degrade gracefully rather than aborting.
-#   2  — Usage error: unknown flag, missing flag value, invalid --format/
-#        --stale-age-min/--safety.
+#   2  — Usage/WIRING error: unknown flag, missing flag value, invalid
+#        --format/--stale-age-min/--safety, or a missing sibling library
+#        (scripts/lib_portable.sh, scripts/lib_lane_state.sh). The library
+#        case is a wiring error, not a runtime one: nothing about the
+#        invocation could have avoided it and no retry will fix it — the
+#        deployment is incomplete. Same class as an unknown flag, hence 2.
+#        It does not weaken the exit-0 rule above, which binds every VALID
+#        invocation; a wiring abort means there was no valid invocation to
+#        report on.
 #
 # Invariants:
 #   A1 — read-only: never mutates a lane (no reset/rm/reclaim). This binds
@@ -151,12 +158,35 @@ esac
 SCRIPT_DIR="$(cd "$_dir" && pwd)"
 unset _src _dir
 
+# reify's portable shims (portable_mtime et al.), called unconditionally on
+# every lane -- see _age_min below. Fail LOUDLY if the lib is missing: an absent
+# sibling is an incomplete DEPLOYMENT, never a data problem -- exit 2
+# (usage/WIRING), not the 1 bash's own bare `source` failure produces under
+# `set -e`.
+#
+# Ordered FIRST, above the lib_lane_state.sh guard below, deliberately: a copy
+# carrying NEITHER sibling must report this one, mirroring warm-lane-gc.sh's
+# live-refs-before-lane-state ordering. The measurement that prompted this guard
+# and the full rationale live in README.md "Delta 8" -- one home, so they cannot
+# drift apart.
+if [ ! -f "$SCRIPT_DIR/lib_portable.sh" ]; then
+    echo "warm-lane-audit.sh: ERROR — scripts/lib_portable.sh not found next to warm-lane-audit.sh" >&2
+    exit 2
+fi
 # shellcheck source=scripts/lib_portable.sh
 source "$SCRIPT_DIR/lib_portable.sh"
 
 # dark-factory's lane-state reader (lane_state_read + lane_state_class), the
 # one definition of the record parse and of the raw-state -> column table this
 # script's `assigned` column reports. Fail LOUDLY if it is missing.
+#
+# Ordered SECOND, after the lib_portable.sh guard above, deliberately:
+# reordering the pair would flip which message a copy carrying NEITHER sibling
+# emits. test_warm_lane_scripts_shipped.py's
+# TestAuditFailsLoudOnAMissingLibPortable pins BOTH directions -- THIS message
+# absent when neither sibling is present, and THIS message emitted when only
+# lib_lane_state.sh is -- so the pair's order is a contract, not a line
+# accident.
 #
 # Exit 2 (usage/WIRING), not a degrade-to-UNKNOWN, and not 1 (runtime): this
 # script's "never abort" rule is about lane-level DATA problems -- an unreadable
@@ -229,7 +259,8 @@ Usage: $(basename "$0") [--mount DIR] [--format table|json] [--status-cmd CMD]
 
   Exit codes:
     0  — Always, on every valid invocation (advisory-only; never gates).
-    2  — Usage error.
+    2  — Usage/wiring error (incl. a missing sibling scripts/lib_portable.sh
+         or scripts/lib_lane_state.sh).
 EOF
 }
 
