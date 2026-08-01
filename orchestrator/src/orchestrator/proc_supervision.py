@@ -215,6 +215,24 @@ class EscalationSpec:
         Mirrors ``DeterministicRunner._default_schedule_detached_restart``'s
         ``escalation_cmd`` list (deterministic_runner.py:414-427) exactly, so
         the two restart mechanisms produce byte-identical submit invocations.
+
+        *python_exe* is load-bearing, not incidental. The child's ability to
+        ``import escalation`` rests on TWO independent legs (task 3453, both
+        MEASURED):
+
+        1. **Interpreter identity — this argument.** Callers pass
+           ``sys.executable``, so the child runs the SAME interpreter as the
+           orchestrator process and therefore the same site-packages. This leg
+           cannot be substituted by PYTHONPATH: ``python -S -m escalation
+           submit`` with the workspace src roots on PYTHONPATH still dies at
+           ``shared.async_sqlite_base`` -> ``import aiosqlite``, a
+           site-packages-only wheel. An absolute path also keeps this immune to
+           PATH, which a systemd-run child inherits from the user manager
+           rather than from the orchestrator unit.
+        2. **Workspace src roots** — supplied explicitly by the
+           ``--setenv=PYTHONPATH=`` token on the detached argv (see
+           :func:`_submit_child_pythonpath`), because ``systemd-run --user``
+           propagates none of the caller's environment.
         """
         return [
             python_exe, '-m', 'escalation', 'submit',
