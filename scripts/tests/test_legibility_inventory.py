@@ -20,7 +20,9 @@ from __future__ import annotations
 import gzip
 import importlib.util
 import json
+from collections.abc import Callable
 from datetime import date as dt_date
+from functools import lru_cache
 from pathlib import Path
 
 from legibility import digest, inventory as mod
@@ -121,6 +123,28 @@ def _load_sibling_test_module(name: str):
     return module
 
 
+@lru_cache(maxsize=1)
+def _mirrors() -> tuple[tuple[str, Callable[[str], str]], ...]:
+    """(label, callable) for every in-repo PYTHON copy of the cwd encoding.
+
+    Cached, and resolved ONCE per session rather than per assertion row:
+    naming the nightly mirror requires exec'ing that whole test module, which
+    is not written to be executed repeatedly, and an uncached call inside the
+    ``REAL_ENCODED_DIR_PAIRS`` loop re-exec'd it once per row (growing with
+    the table). Any future module-scope side effect there now costs one
+    execution, not N.
+
+    See :class:`TestEncoderLockstep`'s SCOPE note for the copies deliberately
+    NOT listed here.
+    """
+    nightly_tests = _load_sibling_test_module('test_legibility_nightly')
+    return (
+        ('legibility.inventory.encode_cwd', mod.encode_cwd),
+        ('legibility.digest._encode_cwd', digest._encode_cwd),
+        ('test_legibility_nightly._encode_cwd', nightly_tests._encode_cwd),
+    )
+
+
 class TestEncoderLockstep:
     """Every in-repo copy of the cwd encoding must agree with the canonical (task 3272).
 
@@ -146,31 +170,39 @@ class TestEncoderLockstep:
     off a real ``~/.claude/projects`` tree can detect an encoder that is
     self-consistently wrong.
 
-    SCOPE — what this does NOT cover. There is a fifth copy of the rule in
-    bash, ``skills/spawn/spawn-claude.sh``'s ``_encode_cwd``, which no Python
-    test can import. It is still on the two-character rule and is out of
-    scope for task 3272 (filed as follow-up; see that task for the
-    measurement). Adding a Python mirror here is only ever the DEFAULT
-    place to put a copy of this rule — if you add one elsewhere, add it to
-    :meth:`_mirrors` too, and if you add one in another language, say so
-    here rather than letting this docstring imply coverage it lacks.
-    """
+    SCOPE — what this does NOT cover. TWO copies of the rule sit outside
+    this guard, and as of task 3272 both are still on the old two-character
+    (``/`` + ``.``) rule. Neither is in 3272's file scope, so neither was
+    changed here:
 
-    def _mirrors(self):
-        """(label, callable) for every in-repo copy of the rule."""
-        nightly_tests = _load_sibling_test_module('test_legibility_nightly')
-        return (
-            ('legibility.inventory.encode_cwd', mod.encode_cwd),
-            ('legibility.digest._encode_cwd', digest._encode_cwd),
-            ('test_legibility_nightly._encode_cwd', nightly_tests._encode_cwd),
-        )
+      - ``skills/spawn/spawn-claude.sh``'s ``_encode_cwd`` (bash) — no
+        Python test can import it. Filed as a follow-up.
+      - ``tests/scripts/test_spawn_claude.py``'s inline
+        ``str(tmp_path).replace("/", "-").replace(".", "-")``. This one IS
+        Python and IS importable, but it is deliberately pinned to the BASH
+        copy rather than to the canonical: it names the dir a fake ``claude``
+        creates so that spawn-claude.sh's own started-evidence probe (which
+        computes the lookup key with its ``_encode_cwd``) finds it. Listing
+        it among the mirrors would therefore assert the wrong thing. It must
+        instead move in the SAME commit as the bash fix — pytest ``tmp_path``
+        names routinely contain underscores, so the moment bash starts
+        collapsing ``_`` the fixture's dir name and the probe's lookup key
+        stop agreeing and that test fails.
+
+    Adding a Python mirror here is only ever the DEFAULT place to put a copy
+    of this rule — if you add one elsewhere, add it to :func:`_mirrors` too,
+    and if you add one that is pinned to something OTHER than the canonical
+    (another language, or a fixture mirroring a not-yet-fixed copy), say so
+    in this list rather than letting this docstring imply coverage it lacks.
+    """
 
     def test_every_mirror_agrees_with_canonical_and_with_reality(self):
         canonical = session_registry.encode_cwd
+        mirrors = _mirrors()
         for cwd, expected_dir in REAL_ENCODED_DIR_PAIRS:
             # The canonical itself must match the real on-disk dir name.
             assert canonical(cwd) == expected_dir, f'canonical drifted from reality: {cwd}'
-            for label, mirror in self._mirrors():
+            for label, mirror in mirrors:
                 got = mirror(cwd)
                 assert got == canonical(cwd), f'{label} drifted from canonical: {cwd}'
                 assert got == expected_dir, f'{label} drifted from reality: {cwd}'
