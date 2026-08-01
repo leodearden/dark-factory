@@ -7,6 +7,10 @@ convention (see plans/capability-delivered-checks-prd.md §Contract):
   - TestCapabilityManifestDoc: the doc-level label uniqueness invariant.
   - TestLoader: load_capability_manifest / parse_capability_manifest, including
     the committed exemplar sidecar as a CI fixture.
+  - TestManifestCorpusDiscovery / TestCheckManifest / TestCheckedInManifestCorpus:
+    a corpus-wide guard validating every checked-in sidecar (not just the one
+    committed exemplar TestLoader covers), built on the sibling test-support
+    module shared/tests/capability_manifest_corpus.py (task 3362).
   - TestDeliveredCheckMeta / TestMetadataRegistration: the
     metadata.delivered_checks registered sub-model.
 """
@@ -17,6 +21,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from capability_manifest_corpus import REPO_ROOT, discover_manifests
 from pydantic import BaseModel, ValidationError
 
 import shared.task_metadata as task_metadata_module
@@ -454,6 +459,69 @@ tasks:
         manual_check = manual_caps[0].delivered_check
         assert manual_check is not None
         assert manual_check.reason
+
+
+class TestManifestCorpusDiscovery:
+    """discover_manifests() — git-ls-files-based corpus discovery.
+
+    Not Path.rglob: see capability_manifest_corpus.py's module docstring for
+    the measurement (30 tracked sidecars via git ls-files, 0 of them under
+    .worktrees/, vs 3793 extra sidecars an rglob from the main checkout would
+    sweep in from other in-flight tasks' gitignored worktree checkouts).
+    """
+
+    def test_returns_nonempty_list_for_a_git_checkout(self):
+        paths = discover_manifests()
+        assert paths is not None
+        assert paths != []
+
+    def test_returns_none_for_a_non_checkout_directory(self, tmp_path):
+        assert discover_manifests(tmp_path) is None
+
+    def test_every_path_ends_with_the_manifest_suffix_and_exists(self):
+        paths = discover_manifests()
+        assert paths is not None
+        for path in paths:
+            assert path.name.endswith('.capability-manifest.yaml')
+            assert path.exists()
+
+    def test_every_path_is_absolute(self):
+        paths = discover_manifests()
+        assert paths is not None
+        for path in paths:
+            assert path.is_absolute()
+
+    def test_paths_are_sorted_with_no_duplicates(self):
+        paths = discover_manifests()
+        assert paths is not None
+        assert paths == sorted(paths)
+        assert len(paths) == len(set(paths))
+
+    def test_no_path_is_under_worktrees(self):
+        # Load-bearing anti-rglob assertion — see class docstring. Checked
+        # relative to REPO_ROOT, not as an absolute-path substring: when this
+        # suite itself runs from inside a worktree, REPO_ROOT (this file's
+        # own parents[2]) legitimately resolves to .../.worktrees/<n>, so the
+        # absolute path always contains that segment. What must never happen
+        # is a *nested* .worktrees segment relative to REPO_ROOT — that would
+        # mean discovery walked into another task's checkout.
+        paths = discover_manifests()
+        assert paths is not None
+        for path in paths:
+            assert '.worktrees' not in path.relative_to(REPO_ROOT).parts
+
+    def test_known_stable_anchor_is_present(self):
+        paths = discover_manifests()
+        assert paths is not None
+        names = {path.name for path in paths}
+        assert 'capability-delivered-checks-prd.capability-manifest.yaml' in names
+
+    def test_both_known_directories_are_represented(self):
+        paths = discover_manifests()
+        assert paths is not None
+        rels = [str(path.relative_to(REPO_ROOT)) for path in paths]
+        assert any(rel.startswith('docs/prds/') for rel in rels)
+        assert any(rel.startswith('plans/') for rel in rels)
 
 
 class TestDeliveredCheckMeta:
