@@ -478,6 +478,47 @@ class TestSandboxEnforcementMatrix:
         assert 'data_denied' in result.stdout, result.stdout
         assert not data_marker.exists()
 
+    def test_row08b_tree_sitter_cache_writable_cache_sibling_ro(
+        self, landlock_matrix_scaffold,
+    ):
+        # Task 3382: ~/.cache/tree-sitter is granted so sandboxed roles can
+        # populate tree-sitter's grammar cache instead of hitting EACCES. Not
+        # one of the PRD's frozen twelve — an extension of the uv-cache group,
+        # same $HOME/.cache boundary shape (hence the 08b suffix).
+        scaffold = landlock_matrix_scaffold
+        # Pin the carve-out boundary independently of kernel enforcement (the
+        # row05 pattern): a regression that widened the grant to the whole
+        # ~/.cache parent would pass the ALLOWED half below just as readily as
+        # a correctly-scoped one, so the allowed assertion alone cannot detect
+        # it. This keeps the boundary meaningful even on a kernel where the
+        # class skips.
+        write_set = compute_write_set(scaffold.worktree, home=scaffold.home)
+        writable = [str(p) for p in write_set.writable_paths()]
+        assert str(scaffold.tree_sitter_cache) in writable
+        assert str(scaffold.cache_sibling) not in writable
+
+        probe = uuid.uuid4().hex
+        ts_marker = scaffold.tree_sitter_cache / probe
+        sibling_marker = scaffold.cache_sibling / probe
+        inner = [
+            '/bin/sh', '-c',
+            (
+                f'(touch {ts_marker} 2>/dev/null && echo ts_cache_ok || echo ts_cache_denied) && '
+                f'(touch {sibling_marker} 2>/dev/null && echo sibling_ok || echo sibling_denied) && '
+                'echo end'
+            ),
+        ]
+        result = _run_sandboxed(scaffold, inner)
+        assert result.returncode == 0, result.stderr
+        assert 'end' in result.stdout
+        assert 'ts_cache_ok' in result.stdout, result.stdout
+        assert ts_marker.exists()
+        # The load-bearing half: a second ~/.cache/<tool> peer must stay
+        # read-only, proving the fix granted the tree-sitter SUBDIR and did
+        # not silently hand sandboxed roles every other tool cache.
+        assert 'sibling_denied' in result.stdout, result.stdout
+        assert not sibling_marker.exists()
+
     # -- Group 5: ~/.claude narrowing (rows 9/10) -------------------------
 
     def test_row09_claude_settings_denied(self, landlock_matrix_scaffold):
