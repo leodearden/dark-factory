@@ -857,3 +857,223 @@ def test_repo_units_are_at_parity_with_themselves():
     for name, spec in mod.UNITS.items():
         text = (REPO_ROOT / spec.repo_relpath).read_text(encoding="utf-8")
         assert mod.compare_unit(spec, text, text) == [], f"{name} drifts against itself"
+
+
+# ---------------------------------------------------------------------------
+# main(argv) exit codes and the report  (step-13 / step-14)
+# ---------------------------------------------------------------------------
+#
+# BOTH sides are tmp_path fixtures — the repo root as well as the installed
+# dir. Pointing --repo-root at the real tree would work today but would couple
+# these assertions to the committed units' current contents.
+
+
+def _fake_repo(tmp_path: pathlib.Path, mod: types.ModuleType) -> pathlib.Path:
+    """Build a fake repo root holding a copy of each committed unit."""
+    root = tmp_path / "repo"
+    for spec in mod.UNITS.values():
+        dest = root / spec.repo_relpath
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(
+            (REPO_ROOT / spec.repo_relpath).read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+    return root
+
+
+def _installed_from(
+    tmp_path: pathlib.Path,
+    mod: types.ModuleType,
+    repo_root: pathlib.Path,
+    *,
+    omit: tuple[str, ...] = (),
+    edits: dict[str, tuple[str, str]] | None = None,
+) -> pathlib.Path:
+    """Build a fake installed dir from *repo_root*, optionally omitting/editing units."""
+    installed = tmp_path / "installed"
+    installed.mkdir(parents=True, exist_ok=True)
+    for name, spec in mod.UNITS.items():
+        if name in omit:
+            continue
+        text = (repo_root / spec.repo_relpath).read_text(encoding="utf-8")
+        if edits and name in edits:
+            old, new = edits[name]
+            assert old in text, f"fixture edit target {old!r} not found in {name}"
+            text = text.replace(old, new)
+        (installed / name).write_text(text, encoding="utf-8")
+    return installed
+
+
+def test_main_returns_0_on_full_parity(tmp_path: pathlib.Path, capsys):
+    """All three installed copies match their repo copies → exit 0."""
+    mod = _load_checker()
+    repo = _fake_repo(tmp_path, mod)
+    installed = _installed_from(tmp_path, mod, repo)
+
+    rc = mod.main(["--repo-root", str(repo), "--installed-dir", str(installed)])
+
+    assert rc == 0, capsys.readouterr().out
+
+
+def test_main_returns_1_and_names_the_directive_and_path(tmp_path: pathlib.Path, capsys):
+    """Drift → exit 1, and the report names the directive AND the file.
+
+    A report that says only "drift detected" forces a hand diff, which is the
+    work the checker exists to remove.
+    """
+    mod = _load_checker()
+    repo = _fake_repo(tmp_path, mod)
+    installed = _installed_from(
+        tmp_path,
+        mod,
+        repo,
+        edits={_DASHBOARD_SERVICE: ("TimeoutStopSec=15", "TimeoutStopSec=30")},
+    )
+
+    rc = mod.main(["--repo-root", str(repo), "--installed-dir", str(installed)])
+    out = capsys.readouterr().out
+
+    assert rc == 1, out
+    assert "TimeoutStopSec" in out
+    assert "15" in out and "30" in out
+    assert str(installed / _DASHBOARD_SERVICE) in out, (
+        f"The report must name the offending installed file path. Got:\n{out}"
+    )
+
+
+def test_main_returns_2_when_an_installed_unit_is_absent(tmp_path: pathlib.Path, capsys):
+    """Missing installed unit, nothing else drifting → exit 2, naming the path."""
+    mod = _load_checker()
+    repo = _fake_repo(tmp_path, mod)
+    installed = _installed_from(tmp_path, mod, repo, omit=(_WATCHDOG_TIMER,))
+
+    rc = mod.main(["--repo-root", str(repo), "--installed-dir", str(installed)])
+    out = capsys.readouterr().out
+
+    assert rc == 2, out
+    assert str(installed / _WATCHDOG_TIMER) in out
+
+
+def test_main_drift_dominates_absence(tmp_path: pathlib.Path, capsys):
+    """PRECEDENCE: one unit absent AND another drifting → exit 1, not 2.
+
+    setup-host.sh treats 2 as a benign "not installed here, skipping" and only
+    1 as something to act on, so reporting 2 would downgrade a real finding to
+    a shrug and let an unrelated uninstalled unit mask it.
+    """
+    mod = _load_checker()
+    repo = _fake_repo(tmp_path, mod)
+    installed = _installed_from(
+        tmp_path,
+        mod,
+        repo,
+        omit=(_WATCHDOG_TIMER,),
+        edits={_DASHBOARD_SERVICE: ("TimeoutStopSec=15", "TimeoutStopSec=30")},
+    )
+
+    rc = mod.main(["--repo-root", str(repo), "--installed-dir", str(installed)])
+    out = capsys.readouterr().out
+
+    assert rc == 1, f"Drift must dominate absence. Got {rc}:\n{out}"
+    # The absent unit is still REPORTED — dominated, not hidden.
+    assert str(installed / _WATCHDOG_TIMER) in out
+
+
+def test_main_unit_flag_restricts_the_run(tmp_path: pathlib.Path, capsys):
+    """--unit narrows the run; a drifting unit outside the selection is not reported."""
+    mod = _load_checker()
+    repo = _fake_repo(tmp_path, mod)
+    installed = _installed_from(
+        tmp_path,
+        mod,
+        repo,
+        edits={_DASHBOARD_SERVICE: ("TimeoutStopSec=15", "TimeoutStopSec=30")},
+    )
+
+    rc = mod.main(
+        [
+            "--repo-root",
+            str(repo),
+            "--installed-dir",
+            str(installed),
+            "--unit",
+            _WATCHDOG_TIMER,
+        ]
+    )
+    out = capsys.readouterr().out
+
+    assert rc == 0, out
+    assert "TimeoutStopSec" not in out
+    assert _DASHBOARD_SERVICE not in out
+
+
+def test_main_every_emitted_line_carries_the_log_tag(tmp_path: pathlib.Path, capsys):
+    """Every printed line is prefixed with the log tag, so the report is greppable."""
+    mod = _load_checker()
+    repo = _fake_repo(tmp_path, mod)
+    installed = _installed_from(
+        tmp_path,
+        mod,
+        repo,
+        omit=(_WATCHDOG_TIMER,),
+        edits={_DASHBOARD_SERVICE: ("TimeoutStopSec=15", "TimeoutStopSec=30")},
+    )
+
+    mod.main(["--repo-root", str(repo), "--installed-dir", str(installed)])
+    captured = capsys.readouterr()
+
+    assert captured.out.strip(), "The checker must report something."
+    for line in (captured.out + captured.err).splitlines():
+        if not line.strip():
+            continue
+        assert line.startswith(f"[{mod.LOG_TAG}]"), f"Untagged output line: {line!r}"
+
+
+def test_main_report_points_at_the_remediation_command(tmp_path: pathlib.Path, capsys):
+    """The drift report names how to fix it, since there is no --fix."""
+    mod = _load_checker()
+    repo = _fake_repo(tmp_path, mod)
+    installed = _installed_from(
+        tmp_path,
+        mod,
+        repo,
+        edits={_DASHBOARD_SERVICE: ("TimeoutStopSec=15", "TimeoutStopSec=30")},
+    )
+
+    mod.main(["--repo-root", str(repo), "--installed-dir", str(installed)])
+    out = capsys.readouterr().out
+
+    assert "setup-host.sh" in out, (
+        f"A checker with no --fix must say what to run instead. Got:\n{out}"
+    )
+
+
+def test_main_reports_the_watchdog_pre_incident_drift(tmp_path: pathlib.Path, capsys):
+    """The real measured host drift: the pre-incident inline-shell watchdog.
+
+    Reproduced as a FIXTURE rather than read from ~/.config/systemd/user/, so
+    the assertion survives task 3289 installing the post-3308 units.
+    """
+    mod = _load_checker()
+    repo = _fake_repo(tmp_path, mod)
+    installed = _installed_from(tmp_path, mod, repo, omit=(_WATCHDOG_SERVICE,))
+    (installed / _WATCHDOG_SERVICE).write_text(
+        "[Unit]\n"
+        "Description=Dashboard availability watchdog\n"
+        "\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        "ExecStart=/bin/sh -c 'curl -sf --max-time 5 "
+        "http://127.0.0.1:8080/healthz "
+        "|| systemctl --user restart dark-factory-dashboard.service'\n",
+        encoding="utf-8",
+    )
+
+    rc = mod.main(["--repo-root", str(repo), "--installed-dir", str(installed)])
+    out = capsys.readouterr().out
+
+    assert rc == 1, out
+    assert "TimeoutStartSec" in out, (
+        f"3308's whole-tick bound is missing from the installed copy: {out}"
+    )
+    assert _WATCHDOG_SERVICE in out
