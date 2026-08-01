@@ -231,6 +231,14 @@ def log(msg: str) -> None:
     watchdog exists to catch elsewhere, arriving through its own LOGGING path
     (same defect fixed for scripts/dashboard-watchdog.py in 87ff5d1870).
     ``TimeoutStartSec`` in the unit file is the belt-and-braces second bound.
+
+    NEVER raises from either journal route. A tooling failure in the logging
+    path must not become a control-flow event at a call site — main()'s
+    per-unit ``except Exception`` handler calls log() from INSIDE the except
+    block, so an exception escaping here would abort the for-loop and leave
+    the remaining WATCHED units unprobed for that tick. (An unrelated
+    non-tooling exception type is still deliberately propagated — see the
+    narrow except clause below.)
     """
     try:
         subprocess.run(
@@ -243,7 +251,20 @@ def log(msg: str) -> None:
     except (OSError, subprocess.SubprocessError) as exc:
         # systemd-cat missing/unexecutable (OSError) or wedged past the bound
         # (TimeoutExpired, a SubprocessError) — still emit, just via stderr.
-        print(f"orchestrator-watchdog: {msg} [systemd-cat unusable: {exc!r}]", file=sys.stderr)
+        try:
+            print(
+                f"orchestrator-watchdog: {msg} [systemd-cat unusable: {exc!r}]",
+                file=sys.stderr,
+            )
+        except OSError:
+            # The fallback is itself best-effort: writing to stderr raises on a
+            # broken pipe or a full/failing journal socket, and that OSError
+            # would otherwise escape log() and abort a caller's tick (see the
+            # never-raises contract in the docstring). Both journal routes are
+            # gone at this point, so there is nothing left to report WITH —
+            # dropping the message is the only remaining option, and it is
+            # strictly better than dropping the rest of the tick with it.
+            pass
 
 
 class _JournalLog:

@@ -5584,33 +5584,63 @@ def test_log_swallows_only_os_and_subprocess_errors(
         wdog.log("hello")
 
 
+def test_log_never_raises_when_the_stderr_fallback_itself_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fallback print is best-effort too: stderr can be a broken pipe or a
+    full/failing journal socket, and that OSError must not escape log().
+
+    main()'s per-unit handler calls log() from inside its ``except Exception``
+    block, so an exception escaping log() there aborts the for-loop and leaves
+    the remaining WATCHED units unprobed for that tick.
+    """
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        raise FileNotFoundError("systemd-cat not found")
+
+    class _BrokenStderr:
+        def write(self, _s: str) -> int:
+            raise BrokenPipeError("stderr is gone too")
+
+        def flush(self) -> None:
+            raise BrokenPipeError("stderr is gone too")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog.sys, "stderr", _BrokenStderr())
+
+    wdog.log("hello")  # must not raise — both journal routes are gone
+
+
 # ---------------------------------------------------------------------------
 # orchestrator-watchdog.service TimeoutStartSec pin (task 3392)
 # ---------------------------------------------------------------------------
 
-SERVICE_PATH = REPO_ROOT / "scripts" / "orchestrator-watchdog.service"
 
+def _unit_sections(content: str) -> dict[str, list[str]]:
+    """Split unit-file text into {section_name: [lines]} (header line excluded).
 
-def test_service_is_type_oneshot_with_a_timer_driven_by_last_activation() -> None:
-    """Confirms the premise the TimeoutStartSec fix depends on: this unit is
-    Type=oneshot (which disables systemd's TimeoutStartSec by default) and its
-    sibling .timer uses OnUnitActiveSec (measured from THIS unit's last
-    activation, not wall-clock) — the combination under which an unbounded
-    child can permanently stop supervision, with no other signal.
+    Local copy of tests/scripts/test_orchestrator_service_files.py's
+    ``_parse_sections``: that module holds the other orchestrator-watchdog.service
+    pins and is where this assertion ultimately belongs, but pytest runs here with
+    ``--import-mode=importlib`` and tests/scripts/ is not a package, so a sibling
+    test module cannot be imported. Fold this back into ``_parse_sections`` if the
+    pin ever moves next to ``test_watchdog_service_structure``.
     """
-    unit = SERVICE_PATH.read_text(encoding="utf-8")
-    assert "Type=oneshot" in unit, "expected Type=oneshot in orchestrator-watchdog.service"
-
-    timer_path = REPO_ROOT / "scripts" / "orchestrator-watchdog.timer"
-    timer = timer_path.read_text(encoding="utf-8")
-    assert "OnUnitActiveSec=" in timer, (
-        "expected OnUnitActiveSec= in orchestrator-watchdog.timer"
-    )
+    sections: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in content.splitlines():
+        if line.startswith("[") and line.endswith("]"):
+            current = line[1:-1]
+            sections[current] = []
+        elif current is not None:
+            sections[current].append(line)
+    return sections
 
 
 def test_service_bounds_the_whole_tick() -> None:
-    """TimeoutStartSec must be present, finite, and above the script's own
-    worst-case sequential subprocess bound.
+    """TimeoutStartSec must be present under [Service], finite, and above the
+    script's own worst-case sequential subprocess bound.
 
     systemd disables TimeoutStartSec for Type=oneshot by default, and the
     timer's OnUnitActiveSec measures from the unit's last activation — so a
@@ -5621,15 +5651,37 @@ def test_service_bounds_the_whole_tick() -> None:
     each unit's own children already individually bounded) — roughly 1100s —
     or the whole-tick kill could land mid-way through a legitimate multi-unit
     restart rather than only on a genuine wedge.
-    """
-    unit = SERVICE_PATH.read_text(encoding="utf-8")
-    values = [
-        ln.split("=", 1)[1].strip()
-        for ln in unit.splitlines()
-        if ln.startswith("TimeoutStartSec=")
-    ]
 
-    assert len(values) == 1, f"expected exactly one TimeoutStartSec=: {values}"
+    systemd honours TimeoutStartSec= only in [Service]; under [Unit] or
+    [Install] it is silently ignored, which would leave the tick unbounded
+    again while a presence-only check still passed — so the section is
+    asserted, not just the line.
+    """
+    service_path = REPO_ROOT / "scripts" / "orchestrator-watchdog.service"
+    unit = service_path.read_text(encoding="utf-8")
+    sections = _unit_sections(unit)
+
+    def _values(lines: list[str]) -> list[str]:
+        return [
+            ln.split("=", 1)[1].strip()
+            for ln in lines
+            if ln.startswith("TimeoutStartSec=")
+        ]
+
+    misplaced = {
+        name: _values(lines)
+        for name, lines in sections.items()
+        if name != "Service" and _values(lines)
+    }
+    assert not misplaced, (
+        f"TimeoutStartSec= outside [Service] is silently ignored by systemd, "
+        f"leaving the tick unbounded: {misplaced}"
+    )
+
+    values = _values(sections.get("Service", []))
+    assert len(values) == 1, (
+        f"expected exactly one TimeoutStartSec= under [Service]: {values}"
+    )
     assert values[0].isdigit(), (
         f"TimeoutStartSec={values[0]!r} is not a plain seconds count; "
         "'infinity' would leave the tick unbounded and a unit suffix is not "
