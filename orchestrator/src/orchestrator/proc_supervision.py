@@ -123,9 +123,28 @@ def _submit_child_pythonpath() -> str:
         _add(entry)
 
     for pkg in _SUBMIT_CHILD_PACKAGES:
-        spec = importlib.util.find_spec(pkg)
-        locations = spec.submodule_search_locations if spec is not None else None
-        for loc in locations or ():
+        try:
+            spec = importlib.util.find_spec(pkg)
+            locations = spec.submodule_search_locations if spec is not None else None
+        except (ImportError, AttributeError, ValueError) as exc:
+            locations = None
+            reason = f'{type(exc).__name__}: {exc}'
+        else:
+            reason = 'find_spec returned no import root'
+        if not locations:
+            # Loud-over-silent (docs/legibility/design-invariants.md,
+            # no-silent-fail-soft): a narrowed PYTHONPATH still produces a
+            # plausible-looking argv, so the narrowing must be reported by
+            # name or it is indistinguishable from a healthy one.
+            logger.warning(
+                'proc_supervision: cannot resolve the import root of package %r '
+                '(%s) — the deferred systemd-run child will NOT carry it on '
+                'PYTHONPATH, so the RP-4 on-failure `python -m escalation '
+                'submit` may be unable to import and file no L2 at fire time',
+                pkg, reason,
+            )
+            continue
+        for loc in locations:
             _add(str(Path(loc).resolve().parent))
 
     return os.pathsep.join(roots)
@@ -140,6 +159,12 @@ def _submit_child_setenv_args() -> list[str]:
     """
     pythonpath = _submit_child_pythonpath()
     if not pythonpath:
+        logger.warning(
+            'proc_supervision: no PYTHONPATH roots resolved — the detached '
+            'systemd-run argv carries NO --setenv=PYTHONPATH guarantee, so the '
+            'RP-4 submit child runs with the empty PYTHONPATH systemd-run '
+            'gives it (per-package causes logged above)',
+        )
         return []
     return [f'--setenv=PYTHONPATH={pythonpath}']
 
