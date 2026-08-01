@@ -95,7 +95,14 @@ from orchestrator.service_restart import (
     StaleServiceRestartCoordinator,
     schedule_detached_systemd_restart,
 )
-from orchestrator.stranded_verified_green import detect_verified_green
+from orchestrator.stranded_verified_green import (
+    DURABLE_MERGE_FAILURE_STATUSES,
+    MERGE_REQUEST_RESUBMIT_GRACE_S,
+    SUCCESS_TRANSIENT_MERGE_STATUSES,
+    detect_verified_green,
+    merge_request_marker_is_fresh,
+    submit_verified_green_merge_request,
+)
 from orchestrator.systemd_inspect import (
     _INSPECT_TIMEOUT_SECS,
     _deterministic_deploy_health_verdict,
@@ -230,7 +237,9 @@ _WARM_LANE_RECLAIM_PROTECTED_STATUSES: frozenset[str] = frozenset(
 # tick.  Once the window elapses (or the lane tip advances past the marker),
 # a fresh submit re-drives (self-healing).  Sized to comfortably cover an
 # in-flight merge+verify while still re-driving a genuinely lost/hung one.
-_STRANDED_MERGE_RESUBMIT_GRACE_S: float = 30 * 60.0  # 30 minutes
+# Aliases the shared window so the reaper and the architect-desync exit
+# (task 3031 β) cannot drift apart.
+_STRANDED_MERGE_RESUBMIT_GRACE_S: float = MERGE_REQUEST_RESUBMIT_GRACE_S
 
 # Prior auto-eval redo siblings (task 2075) are only safe to silently
 # supersede (cancel) when they are still idle and unclaimed by anyone.
@@ -714,6 +723,60 @@ def _is_scope_divergence_orphan(esc: Escalation) -> bool:
     )
 
 
+def _has_fresh_stamp(
+    task: dict | None, now: datetime, grace_secs: float, *path: str,
+) -> bool:
+    """Return True iff ``task['metadata']`` carries an ISO-8601 timestamp at
+    *path* that is within *grace_secs* of *now*.
+
+    Shared implementation behind the orphan-L0 reaper's two liveness gates,
+    :func:`_has_fresh_dispatch` (``routing.latest.decided_at``, task 2931)
+    and :func:`_has_fresh_merge_phase` (``merge_phase_liveness.entered_at``,
+    task 2991). They differ ONLY in that key path, so keeping ONE
+    implementation keeps their fail-safe semantics — and any future
+    refinement of them (e.g. assuming UTC for a tz-naive stamp instead of
+    failing open, or clamping negative deltas) — from silently applying to
+    one gate but not the other.
+
+    Args:
+        task: The task dict as returned by ``scheduler.get_task`` (or
+            ``None`` when it could not be read).
+        now: The sweep snapshot instant to measure staleness against.
+        grace_secs: Freshness window; a stamp younger than this is "fresh".
+        path: Key path INSIDE ``task['metadata']``, ending at the timestamp
+            leaf — e.g. ``('routing', 'latest', 'decided_at')``.
+
+    Fail-safe (mirrors :func:`_is_terminal_merged`): a ``None`` *task*, a
+    missing/non-dict ``metadata`` or intermediate path segment, an
+    absent/non-str leaf, and an unparseable or tz-mismatched timestamp are
+    all treated as "not fresh" (return False) rather than raising — the
+    caller then promotes (surfaces) instead of silently suppressing whenever
+    liveness cannot be positively confirmed, preserving task 2878's boundary
+    guard and the loud-over-silent-degradation norm. A stamp NEWER than *now*
+    (written after the sweep snapshot) yields a negative delta
+    ``< grace_secs`` -> True (fresh), matching the "newer than the sweep
+    snapshot" wording.
+    """
+    if task is None or not path:
+        return False
+    node: object = task.get('metadata')
+    for key in path[:-1]:
+        if not isinstance(node, dict):
+            return False
+        node = node.get(key)
+    if not isinstance(node, dict):
+        return False
+    stamped_at = node.get(path[-1])
+    if not isinstance(stamped_at, str):
+        return False
+    try:
+        stamped_dt = datetime.fromisoformat(stamped_at)
+        delta_secs = (now - stamped_dt).total_seconds()
+    except (ValueError, TypeError):
+        return False
+    return delta_secs < grace_secs
+
+
 def _has_fresh_dispatch(
     task: dict | None, now: datetime, grace_secs: float,
 ) -> bool:
@@ -728,37 +791,51 @@ def _has_fresh_dispatch(
     lacks, to defer (not drop) the divergence class while a dispatch is
     genuinely live.
 
-    Fail-safe (mirrors :func:`_is_terminal_merged`): a ``None`` *task*, a
-    missing/non-dict ``metadata``/``routing``/``latest``, an absent/non-str
-    ``decided_at``, and an unparseable or tz-mismatched timestamp are all
-    treated as "not fresh" (return False) rather than raising — the caller
-    then promotes (surfaces) instead of silently suppressing whenever
-    liveness cannot be positively confirmed, preserving task 2878's boundary
-    guard and the loud-over-silent-degradation norm. A ``decided_at`` newer
-    than *now* (a dispatch that landed after the sweep snapshot) yields a
-    negative delta ``< grace_secs`` -> True (fresh), matching the "newer than
-    the sweep snapshot" wording.
+    Fail-safe: shared with :func:`_has_fresh_merge_phase` via
+    :func:`_has_fresh_stamp` — a ``None`` *task*, a missing/non-dict
+    ``metadata``/``routing``/``latest``, an absent/non-str ``decided_at``,
+    and an unparseable or tz-mismatched timestamp are all treated as "not
+    fresh" (return False) rather than raising, so the caller promotes
+    (surfaces) whenever liveness cannot be positively confirmed. See
+    :func:`_has_fresh_stamp` for the full contract.
     """
-    if task is None:
-        return False
-    metadata = task.get('metadata')
-    if not isinstance(metadata, dict):
-        return False
-    routing = metadata.get('routing')
-    if not isinstance(routing, dict):
-        return False
-    latest = routing.get('latest')
-    if not isinstance(latest, dict):
-        return False
-    decided_at = latest.get('decided_at')
-    if not isinstance(decided_at, str):
-        return False
-    try:
-        decided_dt = datetime.fromisoformat(decided_at)
-        delta_secs = (now - decided_dt).total_seconds()
-    except (ValueError, TypeError):
-        return False
-    return delta_secs < grace_secs
+    return _has_fresh_stamp(
+        task, now, grace_secs, 'routing', 'latest', 'decided_at',
+    )
+
+
+def _has_fresh_merge_phase(
+    task: dict | None, now: datetime, grace_secs: float,
+) -> bool:
+    """Return True iff *task* entered the pre-enqueue MERGE phase within
+    *grace_secs* of *now* — i.e. a live merge-stage workflow.
+
+    Task 2991 (successor to task 2931's :func:`_has_fresh_dispatch`): the
+    pre-enqueue MERGE loop (rebase + scoped verify + queue submit) makes NO
+    LLM calls, so it never refreshes ``metadata.routing.latest.decided_at`` —
+    a legitimately-live merge-stage task therefore fails the
+    ``_has_fresh_dispatch`` gate and is false-promoted exactly like the
+    pre-2931 divergence bug (cluster esc-2789-22: esc-2789-21, esc-2885-7,
+    both ``workflow_state='merge'``). The durable liveness signal a merge
+    phase DOES leave is ``metadata.merge_phase_liveness.entered_at``, stamped
+    at merge entry (``TaskWorkflow._stamp_merge_phase_entered``) before the
+    scope-invariant escalation is filed and refreshed on every merge
+    (re-)entry. This is the restart-survivable analog of ``routing.latest``:
+    read from durable task metadata, it defers a live merge-stage divergence
+    L0 even immediately after an orchestrator restart, when the per-process
+    ``Scheduler._merge_phase_at`` is still empty.
+
+    Fail-safe: shared with :func:`_has_fresh_dispatch` via
+    :func:`_has_fresh_stamp` — a ``None`` *task*, a missing/non-dict
+    ``metadata``/``merge_phase_liveness``, an absent/non-str ``entered_at``,
+    and an unparseable or tz-mismatched timestamp are all treated as "not
+    fresh" (return False) rather than raising, so the caller promotes
+    (surfaces) whenever merge-phase liveness cannot be positively confirmed.
+    See :func:`_has_fresh_stamp` for the full contract.
+    """
+    return _has_fresh_stamp(
+        task, now, grace_secs, 'merge_phase_liveness', 'entered_at',
+    )
 
 
 def _acquire_project_lock(project_root: Path) -> IO:
@@ -4374,24 +4451,14 @@ class Harness:
         marker (or a mismatched tip / stale timestamp) returns False, so the
         caller falls through to a fresh submit rather than a wedged skip — a
         lost marker must never permanently strand the task.
+
+        Delegates to the shared :func:`merge_request_marker_is_fresh` — the
+        architect-desync exit's ``metadata.architect_merge_request`` guard
+        (task 3031 β) is the second caller of the same predicate.
         """
-        if not isinstance(marker, dict):
-            return False
-        if marker.get('tip_sha') != tip_sha:
-            return False
-        submitted_at = marker.get('submitted_at')
-        if not isinstance(submitted_at, str) or not submitted_at:
-            return False
-        try:
-            ts = datetime.fromisoformat(submitted_at)
-        except (ValueError, TypeError):
-            return False
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=UTC)
-        # A future timestamp (clock skew) yields a negative age < grace → treated
-        # as fresh (skip), which is the safe side: never a duplicate submit.
-        age_s = (datetime.now(UTC) - ts).total_seconds()
-        return age_s < _STRANDED_MERGE_RESUBMIT_GRACE_S
+        return merge_request_marker_is_fresh(
+            marker, tip_sha, grace_s=_STRANDED_MERGE_RESUBMIT_GRACE_S,
+        )
 
     async def _maybe_submit_stranded_verified_green(
         self, tid: str, metadata: dict[str, Any],
@@ -4459,60 +4526,34 @@ class Harness:
             )
             return True
 
-        from orchestrator.merge_queue import enqueue_merge_request
-        from orchestrator.merge_types import (
-            MergeOutcome,
-            MergeRequest,
-            QueuedBranch,
-        )
+        from orchestrator.merge_types import QueuedBranch  # noqa: PLC0415
 
-        future: asyncio.Future[MergeOutcome] = (
-            asyncio.get_running_loop().create_future()
-        )
-        req = MergeRequest(
+        # Build + enqueue + stamp the durable race-guard marker (PRD leaf α §7)
+        # via the shared submit primitive — the architect-desync exit (task
+        # 3031 β) is its second caller, and the two differ ONLY in the source
+        # tag, the marker key, and the terminal done-callback.  The marker
+        # stamp is best-effort inside the helper: a lost marker only means a
+        # benign re-submit next sweep, so a failed write must never abort the
+        # remediation.  It lives in metadata so the found_on_main MARK_DONE
+        # path ignores it entirely (non-interference).
+        #
+        # Durable merge/verify FAILURE → born-at-L2 stranded_merge_failed; the
+        # callback is a strict no-op for success / transient outcomes, so the
+        # branch + lane are preserved by omission.
+        req = await submit_verified_green_merge_request(
             task_id=tid,
             branch=QueuedBranch.parse(tid, self.config.git.branch_prefix),
             worktree=match.worktree,
-            pre_rebased=False,
-            task_files=None,
-            module_configs=list(self.config.module_configs_or_empty.values()),
+            tip_sha=match.tip_sha,
             config=self.config,
-            result=future,
-            snapshot_tip=match.tip_sha,
+            module_configs=list(self.config.module_configs_or_empty.values()),
+            merge_queue=self._merge_queue,
+            event_store=self.event_store,
+            source='stranded-reaper',
+            marker_key='stranded_merge_request',
+            done_callback=lambda fut: self._on_stranded_merge_done(fut, tid=tid),
+            update_task=self.scheduler.update_task,
         )
-        # Durable merge/verify FAILURE → born-at-L2 stranded_merge_failed; the
-        # callback body is wired in step-14 (a strict no-op for success /
-        # transient outcomes, so the branch + lane are preserved by omission).
-        req.result.add_done_callback(
-            lambda fut: self._on_stranded_merge_done(fut, tid=tid),
-        )
-        await enqueue_merge_request(
-            self._merge_queue, req, self.event_store, source='stranded-reaper',
-        )
-
-        # Stamp the durable race-guard marker (PRD leaf α §7).  Best-effort:
-        # a lost marker only means a benign re-submit next sweep, so a failed
-        # write must never abort the remediation.  Merge-mode write (the
-        # scheduler default) touches ONLY this key, preserving siblings; the
-        # marker lives in metadata so the found_on_main MARK_DONE path ignores
-        # it entirely (non-interference).
-        try:
-            await self.scheduler.update_task(
-                tid,
-                {
-                    'stranded_merge_request': {
-                        'tip_sha': match.tip_sha,
-                        'request_id': req.request_id,
-                        'submitted_at': datetime.now(UTC).isoformat(),
-                    },
-                },
-            )
-        except Exception:
-            logger.warning(
-                'Reconcile: task %s — failed to stamp stranded_merge_request '
-                'marker (benign; only risks a re-submit next sweep)',
-                tid, exc_info=True,
-            )
 
         # Record the action (PRD §2.1): file a stranded_blocked escalation and
         # IMMEDIATELY auto-resolve it with a close_only/dismiss disposition.
@@ -4598,21 +4639,20 @@ class Harness:
     # new/unclassified outcome can never silently no-op into a stranded task
     # with no operator signal (the exact silent-strand class PRD leaf α fixes).
     #
+    # Both sets are ALIASES of the shared vocabulary in
+    # stranded_verified_green — the architect-desync exit (task 3031 β)
+    # classifies its own merge outcome against the same partition, and two
+    # copies would drift.
+    #
     # Durable merge/verify failure outcomes for a stranded-reaper submission —
     # a stale-green branch failing the merge queue's own verify lands here and
     # warrants a born-at-L2 (PRD leaf α §2.2).
-    _DURABLE_MERGE_FAILURE_STATUSES: frozenset[str] = frozenset({
-        'conflict', 'blocked', 'error', 'unknown_branch',
-        'unmerged_state', 'stash_failed', 'wip_recovery_no_advance',
-    })
+    _DURABLE_MERGE_FAILURE_STATUSES: frozenset[str] = DURABLE_MERGE_FAILURE_STATUSES
     # Success / transient outcomes — a strict no-op: the happy 'done' is
     # delivered by the existing found_on_main path, and a transient/superseded
     # outcome is re-driven by a later sweep.  The branch + lane are preserved
     # by omission (the callback never touches them).
-    _SUCCESS_TRANSIENT_MERGE_STATUSES: frozenset[str] = frozenset({
-        'done', 'already_merged', 'done_wip_recovery', 'superseded',
-        'wip_halted',
-    })
+    _SUCCESS_TRANSIENT_MERGE_STATUSES: frozenset[str] = SUCCESS_TRANSIENT_MERGE_STATUSES
 
     # Escalation categories a MERGE can itself remediate (PRD leaf δ §2.2).
     #
@@ -10059,6 +10099,33 @@ class Harness:
                         'stage); next sweep re-checks',
                         esc.task_id,
                         self.config.orphan_l0_dispatch_freshness_secs,
+                    )
+                    continue
+                # Task 2991: also defer — don't promote — a divergence orphan
+                # whose task is live in the pre-enqueue MERGE phase. That loop
+                # (rebase + scoped verify + queue submit) makes NO LLM calls,
+                # so it never refreshes routing.latest and the
+                # _has_fresh_dispatch gate above cannot see it — but it stamps
+                # a durable metadata.merge_phase_liveness.entered_at at merge
+                # entry. A stamp within orphan_l0_merge_phase_freshness_secs of
+                # this sweep's `now` means the task is live mid-merge: defer,
+                # and the next sweep re-checks once it ages out. Reuses the
+                # SAME get_task already fetched above (no extra RPC); durable
+                # metadata makes the gate restart-survivable (unlike the
+                # per-process Scheduler._merge_phase_at). A stranded task has a
+                # stale/absent stamp -> _has_fresh_merge_phase False -> still
+                # promoted (preserves task 2878/2931's boundary guard).
+                if _has_fresh_merge_phase(
+                    task, now,
+                    self.config.orphan_l0_merge_phase_freshness_secs,
+                ):
+                    logger.info(
+                        'Orphan L0 reaper: deferred divergence orphan for '
+                        'task_id=%s — fresh merge_phase_liveness stamp within '
+                        '%.0fs grace (live pre-enqueue merge phase); next '
+                        'sweep re-checks',
+                        esc.task_id,
+                        self.config.orphan_l0_merge_phase_freshness_secs,
                     )
                     continue
 

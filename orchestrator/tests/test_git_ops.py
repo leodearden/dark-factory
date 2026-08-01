@@ -11,6 +11,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from _orch_helpers import (
+    NonIsolatedGitRepoError,
+    assert_isolated_git_repo,
+    git_env_with_ceiling,
+)
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig
@@ -83,10 +88,32 @@ async def _inject_uu_state(cwd: Path, path: str, tag: str = '') -> None:
 
     *tag* is interpolated into the blob content so that multiple calls in the
     same repository produce distinct shas even for different paths.
+
+    ISOLATION INVARIANT (esc-3072-3): *cwd* must BE a git repository root, so
+    this helper can only ever mutate the repo rooted exactly there.  Git's
+    repository discovery walks UP the directory tree, so a *cwd* that is merely
+    *inside* some repo silently retargets whatever encloses it — and when
+    pytest's basetemp lives inside a live task worktree
+    (``.worktrees/<task>/.pytest-tmp/``) that is production state.  This helper
+    once wrote three blobs into a live worktree's object store and staged
+    ``foo.py`` at stages 1/2/3, leaving a real task's index unmerged.
+
+    Two layers enforce that invariant, and neither is redundant:
+
+    * :func:`assert_isolated_git_repo` runs FIRST, before any subprocess, so a
+      rejected call writes nothing anywhere.  Nothing weaker suffices —
+      ``git hash-object -w`` below writes its blobs before ``git update-index``
+      can fail, so a guard that only makes git error out mid-sequence still
+      leaves objects behind in the victim.
+    * :func:`git_env_with_ceiling` caps git's upward walk at *cwd*, so escape is
+      impossible at the git level even if the pre-flight is ever refactored away.
     """
+    assert_isolated_git_repo(cwd)
+    env = git_env_with_ceiling(cwd)
+
     def _run_sync(cmd, **kwargs):
         return subprocess.run(
-            cmd, cwd=str(cwd), capture_output=True, check=True, **kwargs,
+            cmd, cwd=str(cwd), capture_output=True, check=True, env=env, **kwargs,
         )
 
     h1 = _run_sync(
@@ -3397,15 +3424,101 @@ class TestUnmergedDetection:
     async def test_inject_uu_state_raises_on_non_git_cwd(
         self, tmp_path: Path,
     ):
-        """_inject_uu_state raises CalledProcessError when cwd is not a git repo.
+        """_inject_uu_state refuses a cwd that is not a git repository root.
 
-        git hash-object exits with rc != 0 in a non-git directory; without
-        check=True the helper silently builds an invalid payload.  With
-        check=True it raises immediately, turning silent corruption into an
-        actionable CalledProcessError that includes stderr.
+        This expectation used to be ``pytest.raises(CalledProcessError)``, on
+        the premise that "git fails in a non-git directory".  That premise was
+        CONDITIONAL, and the condition was invisible: it holds only while
+        pytest's basetemp is not itself nested inside a git repo.  Under a
+        basetemp inside a live task worktree the bare ``tmp_path`` below IS
+        inside a repo, git's upward walk resolves it, the injection SUCCEEDS,
+        and the test then reports a puzzling "DID NOT RAISE" — long after the
+        blobs have already landed in the victim's object store (esc-3072-3).
+
+        ``NonIsolatedGitRepoError`` holds unconditionally, because the guard
+        decides from the filesystem shape of *cwd* alone rather than from
+        whatever git happens to find above it.  It is also unambiguous: a bare
+        ``CalledProcessError`` can arise from any incidental git failure,
+        whereas this type proves the isolation guard specifically fired.
         """
-        with pytest.raises(subprocess.CalledProcessError):
+        with pytest.raises(NonIsolatedGitRepoError):
             await _inject_uu_state(tmp_path, 'foo.py')
+
+    async def test_inject_uu_state_cannot_mutate_an_enclosing_repo(
+        self, tmp_path: Path,
+    ):
+        """esc-3072-3 regression: a nested non-repo cwd must not reach its parent.
+
+        Reconstructs the incident layout — a live task worktree with a pytest
+        basetemp nested inside it (``.worktrees/3072/.pytest-tmp/``).  git's
+        repository discovery walks UP, so ``_inject_uu_state`` handed that bare
+        nested directory resolved the enclosing worktree and injected stages
+        1/2/3 into a REAL task's index, leaving ``UU foo.py`` behind.
+
+        Both halves are asserted, and the second is the load-bearing one.
+        "The helper raised" is exactly what
+        ``test_inject_uu_state_raises_on_non_git_cwd`` already claimed, and it
+        did not prevent the incident: ``git hash-object -w`` writes its blobs
+        BEFORE ``git update-index`` runs, so the corruption was complete before
+        ``pytest.raises`` could report anything.  The property that actually
+        matters — and the only assertion that would have caught this — is that
+        no bytes reached the enclosing repo at all.
+        """
+        # Sentinel standing in for the live task worktree that was corrupted.
+        sentinel = tmp_path / 'live-worktree'
+        sentinel.mkdir()
+        await _setup_repo(sentinel)
+
+        # Stand-in for a pytest basetemp nested INSIDE that worktree.
+        nested = sentinel / '.pytest-tmp' / 'test_x0'
+        nested.mkdir(parents=True)
+
+        # Pre-compute the three payload blob shas WITHOUT -w, so this probe
+        # cannot itself write the very objects it is about to look for.
+        payload_shas: list[str] = []
+        for content in ('version base\n', 'version ours\n', 'version theirs\n'):
+            rc, out, err = await _run(
+                ['git', 'hash-object', '--stdin'], cwd=sentinel, input_text=content,
+            )
+            assert rc == 0, f'sha probe failed: {err}'
+            payload_shas.append(out.strip())
+
+        # Baseline: the untracked .pytest-tmp/ is expected to show up here, so
+        # compare before/after rather than asserting a bare-clean tree.
+        rc, status_before, err = await _run(
+            ['git', 'status', '--porcelain'], cwd=sentinel,
+        )
+        assert rc == 0, err
+
+        with pytest.raises(NonIsolatedGitRepoError):
+            await _inject_uu_state(nested, 'foo.py')
+
+        rc, unmerged, err = await _run(['git', 'ls-files', '-u'], cwd=sentinel)
+        assert rc == 0, err
+        assert unmerged.strip() == '', (
+            f'esc-3072-3 recurrence: unmerged entries injected into the '
+            f'enclosing repo: {unmerged!r}'
+        )
+
+        rc, status_after, err = await _run(
+            ['git', 'status', '--porcelain'], cwd=sentinel,
+        )
+        assert rc == 0, err
+        assert status_after == status_before, (
+            f'enclosing repo state changed: {status_before!r} -> {status_after!r}'
+        )
+
+        assert not (sentinel / 'foo.py').exists(), (
+            'the injected path materialised in the enclosing worktree'
+        )
+
+        for sha in payload_shas:
+            rc, _, _ = await _run(['git', 'cat-file', '-e', sha], cwd=sentinel)
+            assert rc != 0, (
+                f'payload blob {sha} leaked into the enclosing object store — '
+                f'a guard that only makes git fail mid-sequence is not enough; '
+                f'the refusal must happen before the first subprocess'
+            )
 
 
 @pytest.mark.asyncio
@@ -7929,6 +8042,13 @@ class TestRecoverRedMain:
 
 async def _add_warm_lane_scripts(repo: Path, port: int = 39411) -> None:
     """Commit stub seed-warm-lane.sh + setup-worktree-debug-port.sh into repo."""
+    # esc-3072-3: git discovery walks UP, so a *repo* that is not itself a
+    # repository root sends the `git add -A` + `git commit` below into whatever
+    # repo encloses it — a real COMMIT into a live task worktree, sweeping up
+    # whatever uncommitted work it was holding. FIRST statement deliberately:
+    # ahead of the mkdir and write_text calls too, so a rejected call leaves no
+    # stub-script litter in the wrong directory either.
+    assert_isolated_git_repo(repo)
     scripts_dir = repo / 'scripts'
     scripts_dir.mkdir(parents=True, exist_ok=True)
     seed_script = scripts_dir / 'seed-warm-lane.sh'
@@ -7941,6 +8061,60 @@ async def _add_warm_lane_scripts(repo: Path, port: int = 39411) -> None:
     debug_script.chmod(0o755)
     await _run(['git', 'add', '-A'], cwd=repo)
     await _run(['git', 'commit', '-m', 'add warm-lane scripts'], cwd=repo)
+
+
+@pytest.mark.asyncio
+class TestWarmLaneScriptsHelperIsolation:
+    """_add_warm_lane_scripts cannot commit into a repo it was not handed.
+
+    Same defect class as esc-3072-3 and the more dangerous shape of the two:
+    ``_inject_uu_state`` leaked index entries, whereas this helper runs
+    ``git add -A`` + ``git commit``, so an escaping call would write a real
+    COMMIT into a live task worktree — sweeping up whatever uncommitted work
+    that worktree happened to be holding.  Before this guard it was safe only
+    by call-site discipline across ~33 callers.
+    """
+
+    async def test_cannot_commit_into_an_enclosing_repo(self, tmp_path: Path):
+        sentinel = tmp_path / 'live-worktree'
+        sentinel.mkdir()
+        await _setup_repo(sentinel)
+
+        # Stand-in for a pytest basetemp nested inside that live worktree.
+        nested = sentinel / '.pytest-tmp' / 'test_x0'
+        nested.mkdir(parents=True)
+
+        rc, head_before, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=sentinel)
+        assert rc == 0, err
+        rc, status_before, err = await _run(
+            ['git', 'status', '--porcelain'], cwd=sentinel,
+        )
+        assert rc == 0, err
+
+        with pytest.raises(NonIsolatedGitRepoError):
+            await _add_warm_lane_scripts(nested)
+
+        rc, head_after, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=sentinel)
+        assert rc == 0, err
+        assert head_after == head_before, (
+            f'a commit landed in the enclosing repo: {head_before.strip()} -> '
+            f'{head_after.strip()}'
+        )
+
+        rc, status_after, err = await _run(
+            ['git', 'status', '--porcelain'], cwd=sentinel,
+        )
+        assert rc == 0, err
+        assert status_after == status_before, (
+            f'enclosing repo state changed: {status_before!r} -> {status_after!r}'
+        )
+
+        # No filesystem litter either: the guard must run BEFORE the mkdir and
+        # the two write_text calls, not merely before the git commands.
+        assert not (nested / 'scripts').exists(), (
+            'stub scripts were written into the rejected directory; the guard '
+            'must be the first statement in the helper'
+        )
 
 
 @pytest.mark.asyncio
@@ -11588,11 +11762,40 @@ class TestGetHeadTreeHash:
         assert after  # non-empty
 
     async def test_non_git_dir_returns_none(
-        self, git_ops: GitOps, tmp_path: Path
+        self, git_ops: GitOps, git_repo: Path, monkeypatch
     ):
-        not_a_repo = tmp_path / 'not-a-repo'
+        """Fail-safe: a non-git directory yields None, never raises.
+
+        The non-repo directory is placed INSIDE a live repo on purpose.  The
+        old version used a bare ``tmp_path / 'not-a-repo'``, whose "this is not
+        a git directory" premise was only ever true by accident of where
+        pytest's basetemp happened to live: under a basetemp nested inside a
+        git checkout, ``git rev-parse HEAD^{tree}`` walks UP, resolves the
+        enclosing repo and returns a real tree hash, so the ``is None``
+        assertion silently stops testing what it claims (esc-3072-3, same
+        defect class as ``_inject_uu_state``).
+
+        Nesting it makes the hazard the DEFAULT case rather than an
+        environmental accident, so the contract is asserted where it is hard
+        rather than where it is easy.
+        """
+        not_a_repo = git_repo / 'not-a-repo'
         not_a_repo.mkdir()
-        # Fail-safe: a non-git directory yields None, never raises.
+
+        # Cap git's upward walk at not_a_repo so the fail-soft contract holds by
+        # construction rather than by luck of directory layout.  ``_run`` spawns
+        # its child with ``{**os.environ, ...}``, so setenv is the right seam
+        # here (the git call is made by production code, not by a subprocess
+        # this test spawns).  Same pattern as test_warm_base_coherence.py:409,
+        # test_session_hooks.py:1491 and _orch_helpers.git_env_with_ceiling.
+        #
+        # NOTE: this pins the TEST's hermeticity ONLY.  Whether production
+        # get_head_tree_hash should itself refuse to fail-soft into an enclosing
+        # repo when handed a non-repo path is a separate production-behaviour
+        # question, with its own callers and blast radius, tracked as a
+        # follow-up — do not read this ceiling as a production guarantee.
+        monkeypatch.setenv('GIT_CEILING_DIRECTORIES', str(not_a_repo.resolve().parent))
+
         assert await git_ops.get_head_tree_hash(not_a_repo) is None
 
 

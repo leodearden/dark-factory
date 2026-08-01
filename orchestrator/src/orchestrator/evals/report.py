@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from itertools import combinations
 from math import sqrt
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeAlias
 
 from .elo import (
     INDISTINGUISHABLE_THRESHOLD,
@@ -18,7 +18,7 @@ from .elo import (
     TaskPool,
     _pair_key,
 )
-from .metrics import _rate, blend_composite
+from .metrics import _rate, blend_composite, produced_a_plan
 
 if TYPE_CHECKING:
     from .runner import EvalResult
@@ -163,18 +163,170 @@ def build_pairwise_price_table(
 def _summarize_cost_source(sources: set[str]) -> str:
     """Collapse a config's per-trial cost sources to ONE row-level label.
 
-    A config's ``cost_usd`` is a mean across all its trials; when those trials
-    carry more than one distinct ``cost_source`` (e.g. ``price_table`` on one
-    fixture, ``unpriced_proxy`` on another) reporting just the first trial's
+    A config's ``cost_usd`` is a mean across its MEASURED trials; when those
+    trials carry more than one distinct ``cost_source`` (e.g. ``price_table`` on
+    one fixture, ``unpriced_proxy`` on another) reporting just the first trial's
     source would mislabel the cross-source mean, so surface ``'mixed'`` instead
-    (reviewer: robustness). Exactly one distinct source → that source; none (a
-    config with no trials, unreachable here) → ``'cli'`` for back-compat.
+    (reviewer: robustness). A trial dropped from that mean
+    (:func:`_is_unmeasurable`) drops its source with it, for the same reason:
+    the label must describe the figure actually taken. Exactly one distinct
+    source → that source; none (a config whose every trial was unmeasurable, so
+    ``cost_usd`` is ``None``) → ``'cli'`` for back-compat.
     """
     if not sources:
         return 'cli'
     if len(sources) == 1:
         return next(iter(sources))
     return 'mixed'
+
+
+def _is_plan_only(metrics: dict[str, Any]) -> bool:
+    """Is this trial a PLAN-ONLY cell (task 3099)?
+
+    ``run_architect_eval`` is the only producer of ``role_under_test ==
+    'architect'`` and is plan-only BY CONSTRUCTION — it freezes
+    implementer/debugger/reviewer/verify, so the cell never runs a test and
+    carries its quality in ``plan_quality`` rather than ``composite_score``.
+
+    Keyed on the EXISTING ``role_under_test`` stamp rather than a new persisted
+    ``plan_only`` field for two reasons: ``build_composite_report`` already keys
+    ``plan_quality_cap_excluded`` on exactly this test (a second field could
+    drift from the first), and a new field would read back as its default on
+    every result JSON written before this task — silently mis-classifying the
+    whole existing corpus, including the campaign this fix exists to make
+    readable.
+    """
+    return metrics.get('role_under_test') == 'architect'
+
+
+def _has_plan_quality_score(metrics: dict[str, Any]) -> bool:
+    """THE plan-quality admission cascade: architect / not tainted / scored.
+
+    One function, so every surface that admits or refuses a plan-only cell asks
+    the SAME question (task 3099, reviewer amendment).
+    :func:`build_plan_quality_report` and :func:`build_composite_report` both
+    call it, and the two clauses used to coincide only by COUPLING —
+    ``run_architect_eval`` happens to taint exactly when it has no score, so a
+    ``cap_tainted``-only test and a ``plan_quality is None``-only test agreed by
+    accident. A hand-edited result, a legacy JSON, or a future taint cause that
+    preserves the structural floor would break that coincidence and feed a score
+    the θ pool REFUSES into the composite pool ``select_survivors`` ranks on.
+    """
+    return (
+        _is_plan_only(metrics)
+        and not metrics.get('cap_tainted')
+        and metrics.get('plan_quality') is not None
+    )
+
+
+def _plan_quality_score(
+    metrics: dict[str, Any], *, where: str = '?',
+) -> float | None:
+    """THE θ score of one plan-only cell — ``None`` when it must be EXCLUDED.
+
+    ONE accessor, called by both :func:`build_composite_report` and
+    :func:`build_plan_quality_report`, so ``mean_plan_quality`` and the composite
+    row's ``plan_quality`` cannot drift (task 3302, extending the
+    :func:`_mean_plan_quality` discipline from the reduction to the value being
+    reduced). It COMPOSES with :func:`_has_plan_quality_score` rather than
+    re-deriving its cascade.
+
+    Three outcomes, two of them deliberately distinct:
+
+    - ``None`` — UNMEASURABLE. Not an admissible plan-only cell at all
+      (:func:`_has_plan_quality_score`: not an architect run, cap-tainted, or no
+      persisted score). The transport layer refused us, so every number would be
+      fabricated: the cell leaves the pool entirely (task 3118, unchanged here).
+    - ``0.0`` — NO PLAN WAS PRODUCED (``not produced_a_plan``). A healthy
+      architect that emitted a stepless artifact is the OPPOSITE of unmeasurable:
+      it is a genuine CONTENT measurement worth exactly 0.0, which is what
+      :func:`judge.score_plan_structure` already returns for that artifact. This
+      reproduces the 2026-07-27 campaign's own hand-computed ``meanPQ_all``
+      ("scores a no-plan cell as 0") on the automated table.
+    - the persisted float — a plan with steps, scored on its content.
+
+    The persisted score is DISCARDED on the ``0.0`` path, and loudly: a nonzero
+    ``plan_quality`` beside ``plan_steps=0`` IS the two-scorer disagreement
+    (Graphiti e2066ec6 — ``score_plan_structure`` floors a stepless plan to 0.0
+    as an anti-fabrication guard while the LLM judge has no such guard), and
+    correcting it silently would hide the very cells an operator needs to see.
+
+    *where* names the cell (``"fixture x config"``) for that warning; the metrics
+    dict carries neither, so the caller — which holds the ``EvalResult`` — passes
+    it. Purely diagnostic: it never changes the returned score.
+
+    A floored cell therefore warns ONCE PER REPORT BUILD, and the CLI builds both
+    surfaces over the same results, so it appears twice per run. Deliberate: the
+    accessor stays PURE, and the alternative — remembering which cells have
+    already been warned about — is either module-level state that goes quiet on
+    the second campaign of a long-lived process or a per-build set threaded
+    through both builders. Two identical, cell-named lines are the cheaper
+    failure mode; both name their ``where``, so neither reads as a second cell.
+    """
+    if not _has_plan_quality_score(metrics):
+        return None
+    if not produced_a_plan(metrics):
+        persisted = metrics.get('plan_quality')
+        if persisted:
+            logger.warning(
+                'Plan-quality floor applied to %s: persisted plan_quality=%s '
+                'with plan_steps=0 — a stepless artifact is not a plan, so this '
+                "cell scores 0.0 (score_plan_structure's anti-fabrication "
+                "answer), NOT the LLM judge's number. Two scorers disagreed "
+                'here; the deterministic one wins.',
+                where, persisted,
+            )
+        return 0.0
+    return float(metrics['plan_quality'])
+
+
+def _is_unmeasurable(metrics: dict[str, Any]) -> bool:
+    """Did this trial measure NOTHING — so it must leave EVERY pool?
+
+    True only for a PLAN-ONLY cell with no admissible θ score
+    (:func:`_has_plan_quality_score`): the architect was refused, so the cell has
+    no quality, and its recorded ``cost_usd`` / ``workflow_duration_ms`` are the
+    $0.00 / 0 ms of a run that never happened rather than a measurement.
+
+    Averaging those zeros into the row's cost/latency means was the MIRROR IMAGE
+    of the defect task 3118 removed from ``mean_plan_quality``: it handed a
+    schedule-attributable "2x cheaper, 2x faster" bonus to whichever candidate
+    happened to be scheduled inside a cap window — on the very table task 3099
+    makes the operator's ranking surface. A WORKFLOW trial is never unmeasurable
+    here: a failing run really did burn its cost and latency.
+    """
+    return _is_plan_only(metrics) and not _has_plan_quality_score(metrics)
+
+
+def _mean_plan_quality(scores: list[float]) -> float | None:
+    """Reduce a pool of θ-rubric plan-quality scores to its mean (4 dp).
+
+    THE ONE reduction, called by BOTH :func:`build_composite_report`'s row and
+    :func:`build_plan_quality_report`'s per-config aggregate (task 3099). The
+    composite row's ``plan_quality`` used to be a first-untainted-TRIAL
+    passthrough — a harmless diagnostic echo until this task promoted the field
+    to a DECISION surface (:func:`select_survivors` ranks on it and
+    :func:`format_composite_table` renders it beside the composite). A trial-1
+    score sitting next to a mean would let the two tables the CLI now prints
+    ADJACENTLY — and the ``quality`` / ``plan_quality`` cells of one row — give
+    contradictory answers about the same quantity, reintroducing the "two
+    exclusion surfaces that disagree are worse than one" hazard on the very
+    surface this task exists to make trustworthy. Sharing the reduction (rather
+    than duplicating the arithmetic and asserting the two agree) makes that drift
+    structurally impossible.
+
+    An EMPTY pool is ``None``, never ``0.0``: "we measured nothing" must not read
+    as "it scored nothing".
+    """
+    if not scores:
+        return None
+    return round(sum(scores) / len(scores), 4)
+
+
+# ``(fixture, role_group)`` — the key of every efficiency baseline map in
+# :func:`build_composite_report` (task 3099). Module-level, not function-local:
+# a name bound inside a function body is not usable in a type expression.
+_BaselineKey: TypeAlias = tuple[str, str]
 
 
 def build_composite_report(
@@ -191,12 +343,18 @@ def build_composite_report(
     Aggregation (Open-Q3 / decision 10) is per-fixture NORMALIZED composite →
     mean with a small-sample CI:
 
-    1. For each fixture, ``best_cost`` / ``best_latency`` = the minimum POSITIVE
-       cost / latency across the PASSING (``tests_pass`` truthy) trials of all
-       configs on that fixture. A cheap-but-WRONG run (which itself hard-gates
-       to 0) must not set the efficiency floor and deflate the correct configs'
-       cost/latency scores (reviewer: correctness); a fixture with NO passing
-       trial falls back to all trials so its baseline stays defined.
+    1. For each ``(fixture, role_group)`` — ``role_group`` being ``'plan_only'``
+       for an architect trial and ``'workflow'`` otherwise (task 3099) —
+       ``best_cost`` / ``best_latency`` = the minimum POSITIVE cost / latency
+       across that group's MEASURED trials: ``tests_pass`` truthy for a workflow
+       trial, :func:`_has_plan_quality_score` for a plan-only one. A
+       cheap-but-WRONG
+       (or cheap-but-UNMEASURABLE) run must not set the efficiency floor and
+       deflate the runs that were actually measured (reviewer: correctness); a
+       group with NO such trial falls back to all its trials so its baseline
+       stays defined. Scoping by role is what keeps a ~$0.30/60s plan-only cell
+       from becoming the floor for the ~$5/900s full-workflow cells that
+       ``ofat_candidates()`` puts over the same fixtures.
     2. For each trial, the efficiency-adjusted composite is
        ``blend_composite(quality=composite_score,
        cost_score=_ratio_score(cost, best_cost),
@@ -209,26 +367,71 @@ def build_composite_report(
 
     ``latency_secs`` is ``workflow_duration_ms / 1000`` (the workflow's own
     working time, not wall-clock, so eval/scheduler overhead is not charged to
-    the config). ``recovery_score`` / ``plan_quality`` / ``role_under_test`` are
-    passthroughs of any trial's metrics (η/θ surfaces) — except that
-    ``plan_quality`` deliberately skips CAP-TAINTED trials (task 3118) so an
-    infra refusal landing on the first trial cannot blank out a config that has
-    healthy trials; ``plan_quality_cap_excluded`` reports how many were skipped,
-    counted over ARCHITECT trials only so it agrees exactly with
-    :func:`build_plan_quality_report`'s architect-scoped ``cap_excluded``
-    (reviewer: docs-accuracy — two exclusion surfaces that disagree are worse
-    than one).
+    the config). ``recovery_score`` / ``role_under_test`` are passthroughs of any
+    trial's metrics (η surfaces). ``plan_quality`` (θ) is NOT a passthrough: it is
+    the config's POOLED MEAN over its scored plan-only cells, reduced by
+    :func:`_mean_plan_quality` — the SAME function
+    :func:`build_plan_quality_report` reduces ``mean_plan_quality`` with, so the
+    two surfaces the CLI prints adjacently are structurally incapable of
+    disagreeing (task 3099; it was a first-untainted-TRIAL passthrough while it
+    was only a diagnostic echo, which is not defensible once
+    :func:`select_survivors` RANKS on it). Its pool admits a cell on the
+    byte-identical cascade that surface applies — architect-only, skip
+    CAP-TAINTED (task 3118), score not ``None`` — so an infra refusal is never
+    averaged in as a zero; ``plan_quality_cap_excluded`` reports how many were
+    skipped, counted over ARCHITECT trials only so it agrees exactly with that
+    surface's architect-scoped ``cap_excluded`` (reviewer: docs-accuracy — two
+    exclusion surfaces that disagree are worse than one).
 
-    SCOPE of the taint exclusion, stated explicitly because it is narrow: only
-    the ``plan_quality`` passthrough skips tainted trials. The composite /
-    quality / cost / latency pools and the ``trials`` + ``tests_pass_rate``
-    denominators still COUNT them, deliberately — those pools measure the
-    implementer-path gates, which a tainted architect cell reports as an honest
-    failure rather than a fabricated score, and silently dropping trials from
-    the denominator ``select_survivors`` ranks on would shrink the sample
-    without saying so. ``cost_source`` (P5) is
-    the config's single distinct per-trial source, or ``'mixed'`` when its
-    trials span more than one — since ``cost_usd`` is a cross-trial mean,
+    THE PLAN-PRODUCTION INVARIANT (task 3302): the θ score of every admitted cell
+    comes from :func:`_plan_quality_score`, so a cell whose architect ran fine
+    but produced NO PLAN (``not metrics.produced_a_plan`` — ``plan_steps == 0``)
+    is FLOORED to ``0.0`` rather than reported at whatever the LLM plan judge
+    said, and is counted as ``plan_quality_no_plan``. A no-plan cell is also
+    barred from SETTING its ``(fixture, 'plan_only')`` cost/latency baseline
+    (step 1 below), though its real spend still enters the row's pools. The two
+    treatments are deliberately different because the causes are: a cap-tainted
+    cell is EXCLUDED and counted (we never asked the model, so any number would
+    be fabricated); a no-plan cell is FLOORED and counted (we asked, and the
+    answer was nothing — which is worth exactly 0.0, the same answer
+    :func:`judge.score_plan_structure` gives that artifact). Neither is silent.
+
+    SCOPE of the taint exclusion (REVISED by task 3099): an UNMEASURABLE
+    plan-only trial (:func:`_is_unmeasurable`) leaves EVERY measured pool —
+    ``plan_quality``, ``composite``, ``quality``, ``cost``, ``latency``, the
+    efficiency baselines and the ``cost_source`` label — on ONE admission
+    decision, so no two surfaces can disagree about the same cell.
+
+    The earlier scope kept tainted trials in the composite pool on the grounds
+    that it measured the implementer-path gates, which a tainted architect cell
+    reports as an honest failure; once the composite is DERIVED from
+    ``plan_quality`` that justification no longer holds, and a fabricated ``0.0``
+    there would penalise whichever candidate was scheduled inside a cap window —
+    the defect task 3118 removed from ``mean_plan_quality``, reintroduced one
+    layer up in the number ``select_survivors`` actually ranks on. Keeping such a
+    trial in the ``cost`` / ``latency`` pools was that defect's MIRROR IMAGE: the
+    cell reports the $0.00 / 0 ms of a run that never happened, so averaging it
+    in REWARDED the cap window instead — reporting a config as "2x cheaper and 2x
+    faster" than an identically-priced sibling purely because one of its trials
+    was refused (reviewer: correctness).
+
+    The ``trials`` denominator, ``fixtures``, and the ``judge`` spend totals do
+    still COUNT every trial, and ``plan_quality_cap_excluded`` reports how many
+    were skipped — so the sample is reported honestly by the columns that exist
+    to report it, never by silently averaging a zero into a price. A config with
+    NO measured trial reports ``composite`` / ``quality`` / ``cost_usd`` /
+    ``latency_secs`` and all three ``ci95`` intervals as ``None`` rather than
+    ``0.0`` — "we measured nothing" must never read as "it scored nothing, for
+    free, instantly, and we are confident".
+
+    PLAN-ONLY rows (task 3099, :func:`_is_plan_only`): a trial whose
+    ``role_under_test`` is ``'architect'`` ran no test at all, so it is blended
+    with ``quality=plan_quality, plan_only=True`` instead of being hard-gated to
+    ``0.0`` by its absent ``tests_pass``, and ``quality`` reports the axis that
+    actually fed the composite. Such a config's ``tests_pass_rate`` is ``None``:
+    no test ran, so there is no pass rate — not a 0% one. ``cost_source`` (P5) is
+    the config's single distinct per-trial source over its MEASURED trials, or
+    ``'mixed'`` when they span more than one — since ``cost_usd`` is a mean,
     labelling it with just the first trial's source would mislabel a blended
     figure (reviewer: robustness).
     Rows are emitted sorted by ``config`` so the surface is byte-deterministic;
@@ -240,84 +443,197 @@ def build_composite_report(
     #    floor and deflate the correct configs (reviewer: correctness). The
     #    ``*_all`` maps mirror the same minima over ALL trials and seed the
     #    fallback for a fixture where nothing passed.
-    best_cost: dict[str, float] = {}
-    best_latency: dict[str, float] = {}
-    best_cost_all: dict[str, float] = {}
-    best_latency_all: dict[str, float] = {}
+    #    Keyed on ``(fixture, role_group)`` — NOT on fixture alone (task 3099).
+    #    A plan-only cell's cost is ONE architect invocation (~$0.30/60s); a
+    #    workflow cell's is a full run (~$5/900s), and ``ofat_candidates()`` puts
+    #    both over the SAME fixtures in one result set. A shared floor would
+    #    therefore deflate every workflow row by ~16x AND clamp every plan-only
+    #    row's efficiency axes to 1.0, so the same architect campaign would rank
+    #    differently depending on whether unrelated implementer rows happened to
+    #    be present. Scoping makes the plan-only composite a well-defined
+    #    quantity rather than an artifact of who else was in the run.
+    best_cost: dict[_BaselineKey, float] = {}
+    best_latency: dict[_BaselineKey, float] = {}
+    best_cost_all: dict[_BaselineKey, float] = {}
+    best_latency_all: dict[_BaselineKey, float] = {}
+
+    def _baseline_key(result: EvalResult) -> _BaselineKey:
+        return (
+            result.task_id,
+            'plan_only' if _is_plan_only(result.metrics) else 'workflow',
+        )
+
     for r in results:
-        fixture = r.task_id
+        # A cell that measured nothing is not a data point about cost or
+        # latency, so it seeds NEITHER baseline map — not even the ``*_all``
+        # fallback, whose whole job is to keep the denominator defined for
+        # trials that ARE scored. (Every trial it would have contributed is
+        # itself excluded from the composite pool below, so a group left with an
+        # empty fallback is never divided by.)
+        if _is_unmeasurable(r.metrics):
+            continue
+        key = _baseline_key(r)
         cost = float(r.metrics.get('cost_usd', 0.0) or 0.0)
         latency = float(r.metrics.get('workflow_duration_ms', 0) or 0) / 1000.0
-        passed = bool(r.metrics.get('tests_pass'))
+        # A plan-only trial has no tests_pass to consult, so its admission test
+        # is the shared θ cascade — preserving the same rule the workflow group
+        # applies: a cheap-but-UNMEASURABLE run cannot set the floor and deflate
+        # the runs that were actually measured.
+        #
+        # …AND it must actually have produced a plan (task 3302). A no-plan cell
+        # is measurable — it stays in every pool at 0.0 — but it is cheap and
+        # fast precisely BECAUSE it returned nothing:
+        # plans/eval-architect-effort-verdict-2026-07-27.md measured one at
+        # $0.5-$3 against a real plan's ~$3.7. Letting it seed the floor hands a
+        # schedule-independent "2x cheaper, 2x faster" bonus to the candidate
+        # that FAILED to plan and deflates every candidate that succeeded. This
+        # is the plan-only spelling of the rule the workflow group already
+        # applies to a failing trial, not a new one.
+        passed = (
+            (
+                _has_plan_quality_score(r.metrics)
+                and produced_a_plan(r.metrics)
+            ) if _is_plan_only(r.metrics)
+            else bool(r.metrics.get('tests_pass'))
+        )
         if cost > 0:
-            best_cost_all[fixture] = min(best_cost_all.get(fixture, cost), cost)
+            best_cost_all[key] = min(best_cost_all.get(key, cost), cost)
             if passed:
-                best_cost[fixture] = min(best_cost.get(fixture, cost), cost)
+                best_cost[key] = min(best_cost.get(key, cost), cost)
         if latency > 0:
-            best_latency_all[fixture] = min(best_latency_all.get(fixture, latency), latency)
+            best_latency_all[key] = min(best_latency_all.get(key, latency), latency)
             if passed:
-                best_latency[fixture] = min(best_latency.get(fixture, latency), latency)
-    # Fixtures with no passing trial fall back to the all-trials baseline so the
-    # normalization denominator stays defined (every such trial hard-gates to 0
-    # regardless, so this only keeps the baseline non-empty).
-    for fixture, v in best_cost_all.items():
-        best_cost.setdefault(fixture, v)
-    for fixture, v in best_latency_all.items():
-        best_latency.setdefault(fixture, v)
+                best_latency[key] = min(best_latency.get(key, latency), latency)
+    # Groups with no passing trial fall back to the all-trials baseline so the
+    # normalization denominator stays defined (every such workflow trial
+    # hard-gates to 0 regardless, so this only keeps the baseline non-empty).
+    # The same holds for a plan-only group in which NOTHING produced a plan: the
+    # fallback still admits those cells, so the denominator exists — which means
+    # a no-plan cell that is the SOLE member of its (fixture, 'plan_only') group
+    # DOES earn ratios of 1.0 on both efficiency axes here. That is exactly why
+    # its composite is hard-gated to 0.0 by blend_composite(no_plan=True) below:
+    # flooring its quality axis bounds only the 0.6 quality weight, leaving 0.4
+    # of pure efficiency credit earned by FAILING to plan (task 3302 review —
+    # measured: a no-plan cell at 0.40 outranked a real 6-step plan at 0.26 and
+    # survived top_k=2). BOTH closures are needed and they close different
+    # routes: barring the cell from SEEDING the floor (above) closes the
+    # INTRA-group route, where it would deflate its plan-producing siblings; the
+    # gate closes the CROSS-group route, where it would outrank a plan-producing
+    # config normalized against a different fixture's floor.
+    for key, v in best_cost_all.items():
+        best_cost.setdefault(key, v)
+    for key, v in best_latency_all.items():
+        best_latency.setdefault(key, v)
 
     # 2/3. Accumulate per-trial normalized composites, pooled per config.
     def _acc() -> dict[str, Any]:
         return {
             'composite': [], 'cost': [], 'latency': [], 'quality': [],
-            'passes': 0, 'trials': 0, 'fixtures': set(),
+            'passes': 0, 'trials': 0, 'plan_only_trials': 0, 'fixtures': set(),
             'judge_invocations': 0, 'judge_cost_usd': 0.0,
             'cost_sources': set(),
             'first_metrics': None,
-            'first_untainted_metrics': None,
+            'plan_quality_scores': [],
             'plan_quality_cap_excluded': 0,
+            'plan_quality_no_plan': 0,
         }
 
     by_config: dict[str, dict[str, Any]] = defaultdict(_acc)
     for r in results:
         fixture = r.task_id
         m = r.metrics
-        quality = float(m.get('composite_score', 0.0) or 0.0)
         cost = float(m.get('cost_usd', 0.0) or 0.0)
         latency = float(m.get('workflow_duration_ms', 0) or 0) / 1000.0
         tests_pass = m.get('tests_pass')
-        composite_trial = blend_composite(
-            quality,
-            _ratio_score(cost, best_cost.get(fixture, 0.0)),
-            _ratio_score(latency, best_latency.get(fixture, 0.0)),
-            tests_pass=tests_pass,
-        )
+        plan_only = _is_plan_only(m)
         acc = by_config[r.config_name]
-        acc['composite'].append(composite_trial)
-        acc['cost'].append(cost)
-        acc['latency'].append(latency)
-        acc['quality'].append(quality)
+        # A plan-only cell's quality axis is its θ-rubric plan_quality; a
+        # workflow cell's is the pure compute_composite score. Accumulating the
+        # axis that ACTUALLY fed the composite is what keeps the row internally
+        # consistent — otherwise every architect row renders quality=0.0000
+        # beside a non-zero composite (task 3099).
+        #
+        # The θ score comes from THE shared accessor (task 3302), never a raw
+        # ``m['plan_quality']`` read: a cell whose architect produced NO plan is
+        # floored to 0.0 there, so the judge's number for a stepless artifact
+        # cannot reach the quality axis, the composite, or select_survivors.
+        scored_pq = _plan_quality_score(m, where=f'{fixture} x {r.config_name}')
+        quality = (
+            scored_pq if plan_only and scored_pq is not None
+            else float(m.get('composite_score', 0.0) or 0.0)
+        )
+        # THE no-plan predicate, evaluated ONCE and reused by both the
+        # blend_composite hard gate below and the plan_quality_no_plan counter
+        # further down — so the gate and the count can never disagree about
+        # which cells produced no plan (task 3302).
+        #
+        # Scoped by _has_plan_quality_score, not by plan_only alone: a
+        # cap-tainted cell is UNMEASURABLE (we never got to ask), so it is
+        # counted by plan_quality_cap_excluded and must not also be counted as
+        # a content failure — the two causes are disjoint by construction. At
+        # the gate site the two spellings coincide exactly, because
+        # _is_unmeasurable is precisely "plan-only and not
+        # _has_plan_quality_score", so an inadmissible cell never reaches
+        # blend_composite at all.
+        no_plan = _has_plan_quality_score(m) and not produced_a_plan(m)
+        # ONE admission decision (:func:`_is_unmeasurable`), applied to EVERY
+        # measured pool. An unmeasurable plan-only trial is excluded from the
+        # composite/quality pools rather than scored 0.0 — task 3118's invariant,
+        # now applied to the number that drives survivor selection — AND from the
+        # cost/latency pools, whose $0.00 / 0 ms it never actually spent. Its
+        # cost_source is dropped with it, so the row-level label describes the
+        # mean that was actually taken. It is still counted in `trials` and in
+        # `plan_quality_cap_excluded` below, so nothing is dropped silently.
+        if not _is_unmeasurable(m):
+            # Each trial normalizes against its OWN (fixture, role_group) floor.
+            bkey = _baseline_key(r)
+            acc['composite'].append(blend_composite(
+                quality,
+                _ratio_score(cost, best_cost.get(bkey, 0.0)),
+                _ratio_score(latency, best_latency.get(bkey, 0.0)),
+                tests_pass=tests_pass,
+                plan_only=plan_only,
+                no_plan=no_plan,
+            ))
+            acc['quality'].append(quality)
+            acc['cost'].append(cost)
+            acc['latency'].append(latency)
+            acc['cost_sources'].add(str(m.get('cost_source', 'cli')))
         acc['passes'] += 1 if tests_pass else 0
+        acc['plan_only_trials'] += 1 if plan_only else 0
         acc['trials'] += 1
         acc['fixtures'].add(fixture)
         acc['judge_invocations'] += int(m.get('judge_invocations', 0) or 0)
         acc['judge_cost_usd'] += float(m.get('judge_cost_usd', 0.0) or 0.0)
-        acc['cost_sources'].add(str(m.get('cost_source', 'cli')))
         if acc['first_metrics'] is None:
             acc['first_metrics'] = m
-        # The plan-quality passthrough deliberately skips cap-tainted trials, so
-        # an infra refusal that happened to land on the FIRST trial cannot blank
-        # out a config that has healthy ones (task 3118).
-        if m.get('cap_tainted'):
-            # Counted over ARCHITECT trials only, matching
-            # build_plan_quality_report's architect-scoped cap_excluded — the two
-            # exclusion surfaces describe the same cells and must not disagree.
-            # (A tainted non-architect trial has no plan_quality to exclude in
-            # the first place, so it is skipped as a passthrough source here and
-            # counted by neither surface.)
-            if m.get('role_under_test') == 'architect':
-                acc['plan_quality_cap_excluded'] += 1
-        elif acc['first_untainted_metrics'] is None:
-            acc['first_untainted_metrics'] = m
+        # The plan-quality POOL admits a cell on THE shared accessor
+        # (:func:`_plan_quality_score`, which composes _has_plan_quality_score:
+        # architect-only / skip cap_tainted / score is not None, then floors a
+        # no-plan cell to 0.0), so a cap-tainted cell is counted-and-excluded
+        # here exactly as build_plan_quality_report excludes it (task 3118) and
+        # is never averaged in as a zero, while a no-plan cell is floored on both
+        # surfaces identically (task 3302). Reusing the accessor's return rather
+        # than re-reading the metrics dict keeps the two sourced from one place.
+        if scored_pq is not None:
+            acc['plan_quality_scores'].append(scored_pq)
+        # Counted over ARCHITECT trials only, matching
+        # build_plan_quality_report's architect-scoped cap_excluded — the two
+        # exclusion surfaces describe the same cells and must not disagree. (A
+        # tainted non-architect trial has no plan_quality to exclude in the first
+        # place, so it is counted by neither surface.)
+        if m.get('cap_tainted') and plan_only:
+            acc['plan_quality_cap_excluded'] += 1
+        # …and the FLOOR gets its own count, parallel to the exclusion but
+        # describing a DISJOINT cause (task 3302): this cell was admissible and
+        # measured — a healthy architect that produced nothing — so it stays in
+        # every pool (at 0.0 on quality, at its real spend on cost/latency, and
+        # hard-gated to 0.0 on the composite) rather than leaving them. Counting
+        # it is what keeps a mean that absorbed zeros from reading identically to
+        # a mean over cells that all planned badly
+        # (loud-over-silent-degradation). Reuses the SAME local the gate used.
+        if no_plan:
+            acc['plan_quality_no_plan'] += 1
 
     rows: list[dict[str, Any]] = []
     for cfg in sorted(by_config):
@@ -328,32 +644,52 @@ def build_composite_report(
         latency_ci = mean_ci95(acc['latency'])
         quality_ci = mean_ci95(acc['quality'])
         trials = acc['trials']
+        # An EMPTY pool means every trial was unmeasurable. mean_ci95([]) returns
+        # mean 0.0 with a zero-width [0.0, 0.0] interval, which would read as
+        # "it scored nothing, for free, instantly, and we are confident" — so
+        # every derived cell reports None (rendered '-'), following the
+        # mean_plan_quality=None precedent. ONE flag, because the composite,
+        # quality, cost and latency pools now share ONE admission decision
+        # (:func:`_is_unmeasurable`) and so are empty together or not at all.
+        measured = bool(acc['composite'])
+        # A plan-only config ran no test at all, so it has no pass RATE — not a
+        # 0% one. Fabricating 0% there would report a failure that never happened.
+        all_plan_only = acc['plan_only_trials'] == trials and trials > 0
         rows.append({
             'config': cfg,
             'role_under_test': fm.get('role_under_test'),
-            'composite': composite_ci['mean'],
-            'quality': quality_ci['mean'],
-            'tests_pass_rate': (acc['passes'] / trials) if trials else 0.0,
-            'cost_usd': cost_ci['mean'],
+            'composite': composite_ci['mean'] if measured else None,
+            'quality': quality_ci['mean'] if measured else None,
+            'tests_pass_rate': (
+                None if all_plan_only
+                else (acc['passes'] / trials) if trials else 0.0
+            ),
+            'cost_usd': cost_ci['mean'] if measured else None,
             'cost_source': _summarize_cost_source(acc['cost_sources']),
-            'latency_secs': latency_ci['mean'],
+            'latency_secs': latency_ci['mean'] if measured else None,
             'trials': trials,
             'fixtures': len(acc['fixtures']),
             'ci95': {
-                'composite': composite_ci,
-                'cost': cost_ci,
-                'latency': latency_ci,
+                'composite': composite_ci if measured else None,
+                'cost': cost_ci if measured else None,
+                'latency': latency_ci if measured else None,
             },
             'judge': {
                 'invocations': acc['judge_invocations'],
                 'cost_usd': acc['judge_cost_usd'],
             },
             'recovery_score': fm.get('recovery_score'),
-            # Falls back to fm only when EVERY trial was tainted — there is no
-            # untainted measurement to report, and the accompanying
-            # plan_quality_cap_excluded count says why.
-            'plan_quality': (acc['first_untainted_metrics'] or fm).get('plan_quality'),
+            # The config's POOLED MEAN over its scored plan-only cells, through
+            # the SAME reduction build_plan_quality_report uses. An empty pool
+            # (every cell unmeasurable, or a workflow config with no plan-only
+            # cell at all) is None → rendered '-', with the accompanying
+            # plan_quality_cap_excluded count saying why.
+            'plan_quality': _mean_plan_quality(acc['plan_quality_scores']),
             'plan_quality_cap_excluded': acc['plan_quality_cap_excluded'],
+            # How many of the cells that pool DID admit produced no plan at all
+            # and were scored 0.0 — the content-failure counterpart of the
+            # transport-failure count above.
+            'plan_quality_no_plan': acc['plan_quality_no_plan'],
         })
 
     return {
@@ -385,23 +721,55 @@ def select_survivors(
     """The top-K config names per ``role_under_test`` — the μ OFAT survivor gate.
 
     Groups the λ :func:`build_composite_report` ``'configs'`` rows by
-    ``role_under_test``, ranks each requested role's group by DESCENDING
-    ``composite`` mean (ties broken deterministically by ascending ``config``
-    name, so the surface is byte-stable), and returns the top-``top_k`` config
-    names per role. A role with fewer than ``top_k`` rows returns all it has; a
-    requested role with no rows returns ``[]``. Pure over the report dict — the
-    OFAT screen feeds these survivors into :func:`run_matrix_stage`.
+    ``role_under_test``, ranks each requested role's group, and returns the
+    top-``top_k`` config names per role. A role with fewer than ``top_k`` rows
+    returns all it has; a requested role with no rows returns ``[]``. Pure over
+    the report dict — the OFAT screen feeds these survivors into
+    :func:`run_matrix_stage`.
+
+    RANKING (task 3099), in order:
+
+    1. rows with a measured ``composite`` before rows with ``composite is None``
+       — ``None`` means "we measured nothing", which must never outrank a config
+       that genuinely scored zero. A bare ``or 0.0`` coercion would silently tie
+       the two and then hand the win to whichever sorted first by name,
+       promoting the candidate we know LEAST about;
+    2. DESCENDING ``composite`` mean;
+    3. rows with a ``plan_quality`` before rows without (same ``None``-last
+       rule on the secondary axis);
+    4. DESCENDING ``plan_quality`` — the meaningful secondary signal for a
+       PLAN-ONLY architect row;
+    5. ASCENDING ``config`` name, surviving ONLY as the final byte-stability
+       guarantee.
+
+    Why 3-4 exist at all: with every architect composite hard-gated to 0.0 (the
+    bug this task fixes), step 5 had silently become the ENTIRE selection
+    mechanism for the architect role — ``architect-fable-high`` was "selected"
+    for sorting first, not for planning best (plans/eval-architect-effort-
+    verdict-2026-07-27.md, defect 2). Fixing the composite alone would leave the
+    same trap armed for the next pair of genuinely-tied real composites, so the
+    alphabet is demoted below every axis that carries signal. A workflow row
+    carries no ``plan_quality``, so steps 3-4 are inert for it and the existing
+    implementer ordering is unchanged.
     """
     by_role: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in composite_report.get('configs', []):
         by_role[row.get('role_under_test')].append(row)
 
+    def _rank_key(r: dict[str, Any]) -> tuple[bool, float, bool, float, str]:
+        composite = r.get('composite')
+        plan_quality = r.get('plan_quality')
+        return (
+            composite is None,
+            -float(composite or 0.0),
+            plan_quality is None,
+            -float(plan_quality or 0.0),
+            str(r.get('config', '')),
+        )
+
     survivors: dict[str, list[str]] = {}
     for role in roles:
-        ranked = sorted(
-            by_role.get(role, []),
-            key=lambda r: (-float(r.get('composite', 0.0) or 0.0), str(r.get('config', ''))),
-        )
+        ranked = sorted(by_role.get(role, []), key=_rank_key)
         survivors[role] = [str(r['config']) for r in ranked[:top_k]]
     return survivors
 
@@ -805,7 +1173,7 @@ _PLAN_QUALITY_COLUMNS = (
     'invocation_error',
 )
 _PLAN_QUALITY_MEAN_COLUMNS = (
-    'config_name', 'n', 'cap_excluded', 'mean_plan_quality',
+    'config_name', 'n', 'cap_excluded', 'no_plan', 'mean_plan_quality',
 )
 # The plan_quality cell of a cap-tainted row. Deliberately NOT a number and NOT
 # the bare '-' null sentinel (which already means "not an architect run"): a
@@ -814,11 +1182,12 @@ _PLAN_QUALITY_MEAN_COLUMNS = (
 #
 # Spelled 'excluded', not 'cap-excluded' (reviewer: design-coherence): the
 # ``cap_tainted`` flag covers every unmeasurable cause — cap hit, auth failure,
-# model-not-found, zero-output wedge, harness error — and a PERMANENT config
-# error ("this candidate can never run") must not render as a TRANSIENT one
-# ("rerun after the cap window"). The cause is always carried in the adjacent
-# ``invocation_error`` column and broken out by cause in the summary line, so
-# the marker itself stays cause-neutral rather than asserting a cap.
+# model-not-found, server error (5xx), zero-output wedge, harness error — and a
+# PERMANENT config error ("this candidate can never run") must not render as a
+# TRANSIENT one ("rerun after the cap window"). The cause is always carried in
+# the adjacent ``invocation_error`` column and broken out by cause in the
+# summary line, so the marker itself stays cause-neutral rather than asserting
+# a cap.
 _CAP_EXCLUDED_CELL = 'excluded'
 _PLAN_QUALITY_MEAN_HEADER = 'plan_quality by config:'
 
@@ -873,6 +1242,15 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
     reports ``mean_plan_quality=None`` rather than ``0.0``, so "we measured
     nothing" can never read as "it scored nothing".
 
+    ITS COUNTERPART (task 3302): a cell whose architect ran fine but produced NO
+    PLAN (``not metrics.produced_a_plan``) is the opposite case — a genuine
+    content measurement — so it is FLOORED to ``0.0`` by
+    :func:`_plan_quality_score`, KEPT in the mean, and counted separately as
+    ``no_plan``. Two causes, two treatments, two counts, neither silent:
+    transport refusal → excluded + ``cap_excluded``; content failure → floored +
+    ``no_plan``. Conflating them would either let the candidate that failed to
+    plan escape the pool entirely or penalise the one that merely hit a cap.
+
     ``cap_excluded_by_cause`` breaks that total out by CAUSE
     (``{'cap_hit': 2, 'model_not_found': 1}``, key-sorted for determinism)
     because the causes are not interchangeable: a cap hit is transient and
@@ -888,8 +1266,33 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
             'config_name': result.config_name,
             'role_under_test': result.metrics.get('role_under_test'),
             'plan_quality': result.metrics.get('plan_quality'),
+            # The PLAN-PRODUCTION predicate's input (task 3302), carried
+            # verbatim so the row is self-describing: a reader can see the step
+            # count the adjacent plan_quality was — or was not — scored over.
+            'plan_steps': result.metrics.get('plan_steps'),
             'cap_tainted': bool(result.metrics.get('cap_tainted')),
             'invocation_error': result.metrics.get('invocation_error'),
+            # The θ score this cell contributes to the aggregate, through THE
+            # shared accessor (task 3302): the persisted float for a real plan,
+            # a floored 0.0 for a cell that produced none, None when the cell is
+            # excluded outright. Kept beside the RAW persisted ``plan_quality``
+            # rather than replacing it — the per-row table reports what was
+            # persisted, and an operator must still be able to see the judge's
+            # number that the floor overrode.
+            'scored_plan_quality': _plan_quality_score(
+                result.metrics,
+                where=f'{result.task_id} x {result.config_name}',
+            ),
+            # The predicate's ANSWER, computed here from the metrics dict its
+            # contract is written against — never re-derived downstream from the
+            # row (reviewer: robustness). ``plan_steps`` above is carried for the
+            # READER; asking ``produced_a_plan(row)`` instead would work only
+            # while the row happens to spell that key identically to the metrics
+            # dict, and a rename would silently answer False for EVERY row —
+            # flooring every scored cell to 0.0 with no exception, no log and no
+            # failing test. Sourced beside ``scored_plan_quality`` so the count
+            # below and the score above can never describe different cells.
+            'produced_a_plan': produced_a_plan(result.metrics),
         })
     rows.sort(key=lambda r: (r['task_id'], r['config_name']))
 
@@ -898,6 +1301,7 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
     # and must not dilute the architect mean.
     scored: dict[str, list[float]] = defaultdict(list)
     excluded: dict[str, int] = defaultdict(int)
+    no_plan: dict[str, int] = defaultdict(int)
     totals: dict[str, int] = defaultdict(int)
     by_cause: dict[str, int] = defaultdict(int)
     for row in rows:
@@ -908,19 +1312,33 @@ def build_plan_quality_report(results: list[EvalResult]) -> dict[str, Any]:
         if row['cap_tainted']:
             excluded[cfg] += 1
             by_cause[_taint_cause(row['invocation_error'])] += 1
-        elif row['plan_quality'] is not None:
-            scored[cfg].append(float(row['plan_quality']))
+        elif row['scored_plan_quality'] is not None:
+            # Subscript, not ``.get``: the answer was computed from the metrics
+            # dict when the row was built, so a dropped key must raise here
+            # rather than read back as "no config produced a plan".
+            if not row['produced_a_plan']:
+                # DISJOINT from the exclusion above: this cell was measured and
+                # kept, at the 0.0 the accessor floored it to (task 3302).
+                no_plan[cfg] += 1
+            # THE shared accessor's answer (task 3302), not the raw persisted
+            # score: a cell whose architect produced no plan lands here as a
+            # floored 0.0, identically to build_composite_report's pool, so
+            # mean_plan_quality and the composite row cannot drift.
+            scored[cfg].append(row['scored_plan_quality'])
 
     configs = [
         {
             'config_name': cfg,
             'n': len(scored[cfg]),
             'cap_excluded': excluded[cfg],
+            # How many of those ``n`` scored cells produced NO plan and were
+            # floored to 0.0 (task 3302). Disjoint from ``cap_excluded``: those
+            # cells are not in ``n`` at all.
+            'no_plan': no_plan[cfg],
             'total': totals[cfg],
-            'mean_plan_quality': (
-                round(sum(scored[cfg]) / len(scored[cfg]), 4)
-                if scored[cfg] else None
-            ),
+            # THE ONE reduction, shared with build_composite_report's row so the
+            # two surfaces cannot drift (task 3099, :func:`_mean_plan_quality`).
+            'mean_plan_quality': _mean_plan_quality(scored[cfg]),
         }
         for cfg in sorted(totals)
     ]
@@ -936,10 +1354,11 @@ def _format_plan_quality_mean_section(report: dict[str, Any]) -> list[str]:
     """Render the per-config mean block: how many cells actually scored.
 
     The point of the block is that ``mean_plan_quality`` is reported ALONGSIDE
-    the ``n`` it was computed over and the ``cap_excluded`` count it left out,
-    so a mean over 19 of 22 cells reads as exactly that instead of looking like
-    a mean over all of them. A config with nothing scored renders ``-``, never
-    ``0.0000``.
+    the ``n`` it was computed over, the ``cap_excluded`` count it left out and
+    the ``no_plan`` count it scored as zeros, so a mean over 19 of 22 cells —
+    four of which produced no plan at all — reads as exactly that instead of
+    looking like a mean over 22 comparable plans. A config with nothing scored
+    renders ``-``, never ``0.0000``.
     """
     configs = report.get('configs', [])
     rendered = [
@@ -947,6 +1366,7 @@ def _format_plan_quality_mean_section(report: dict[str, Any]) -> list[str]:
             'config_name': str(c['config_name']),
             'n': str(c['n']),
             'cap_excluded': str(c['cap_excluded']),
+            'no_plan': str(c['no_plan']),
             'mean_plan_quality': (
                 '-' if c['mean_plan_quality'] is None
                 else f'{float(c["mean_plan_quality"]):.4f}'
@@ -1024,15 +1444,31 @@ def format_plan_quality_table(report: dict[str, Any]) -> str:
 #
 # The deterministic table surface for :func:`build_composite_report`, mirroring
 # the width-computed ljust idiom of format_recovery_table / format_plan_quality_
-# table above. Emits a per-config table (composite / quality / cost / cost_source
-# / latency / CI95 / trials / fixtures) followed by a DISTINCT price-table
-# section (config → role → input/output per-1M). Byte-stable: rows and sections
-# are sorted, floats fixed-precision, and no wall-clock is rendered.
+# table above. Emits a per-config table (composite / quality / plan_quality /
+# pq_excluded / cost / cost_source / latency / CI95 / trials / fixtures) followed
+# by a DISTINCT price-table section (config → role → input/output per-1M).
+# Byte-stable: rows and sections are sorted, floats fixed-precision, and no
+# wall-clock is rendered.
+#
+# ``plan_quality`` / ``pq_excluded`` (task 3099) make an architect campaign
+# rankable from the table alone. ``pq_excluded`` is a COUNT of that config's
+# unmeasurable (cap-tainted) architect cells; the per-CAUSE breakdown — which is
+# what separates a transient cap window from a permanent model-not-found — lives
+# only in :func:`format_plan_quality_table`, so the CLI emits both for an
+# architect result set.
+#
+# ``pq_no_plan`` (task 3302) is the COUNT beside it, and both belong on THIS
+# table because this is the surface ``select_survivors`` ranks on: the two
+# treatments of a zero-scoring cell — transport refusal EXCLUDED, no-plan
+# FLOORED — are otherwise indistinguishable here, and a column of
+# ``plan_quality 0.0000`` would read as "these candidates all planned badly"
+# when it means "these candidates produced no plan at all".
 # ---------------------------------------------------------------------------
 
 _COMPOSITE_COLUMNS = (
-    'config', 'composite', 'quality', 'cost_usd', 'cost_source',
-    'latency_secs', 'ci95_composite', 'trials', 'fixtures',
+    'config', 'composite', 'quality', 'plan_quality', 'pq_excluded',
+    'pq_no_plan', 'cost_usd', 'cost_source', 'latency_secs', 'ci95_composite',
+    'trials', 'fixtures',
 )
 _PRICE_TABLE_COLUMNS = ('config', 'role', 'input_per_1m', 'output_per_1m')
 
@@ -1042,6 +1478,18 @@ def _ci_cell(ci: dict[str, Any] | None) -> str:
     if not ci:
         return '-'
     return f'[{float(ci.get("lo", 0.0)):.4f}, {float(ci.get("hi", 0.0)):.4f}]'
+
+
+def _optional_float_cell(value: Any, *, precision: int = 4) -> str:
+    """Render an OPTIONAL float cell: fixed precision, or ``-`` when unmeasured.
+
+    The same `-`-not-``0.0000`` idiom as ``_ci_cell`` above and
+    :func:`format_plan_quality_table`'s ``_score_cell``: a cell that measured
+    NOTHING (``None``) must never render as one that scored zero. Task 3099
+    extends the idiom to ``composite`` / ``quality``, which now report ``None``
+    for a config whose every trial was unmeasurable.
+    """
+    return '-' if value is None else f'{float(value):.{precision}f}'
 
 
 def _format_price_table_section(price_table: dict[str, Any]) -> list[str]:
@@ -1074,24 +1522,54 @@ def _format_price_table_section(price_table: dict[str, Any]) -> list[str]:
 def format_composite_table(report: dict[str, Any]) -> str:
     """Render :func:`build_composite_report` output as a deterministic table.
 
-    A per-config table carries composite / quality / cost_usd / cost_source /
-    latency_secs, a ``[lo, hi]`` CI95 rendering of the composite, and trial /
-    fixture counts, followed by a distinct ``price table`` section. The same
-    report always renders byte-identically (rows sorted by config, price-table
-    sections sorted, fixed float precision, no wall-clock/dict-order dependence).
-    An unpriced config's ``cost_source`` shows the explicit marker (e.g.
-    ``unpriced_proxy``), never a blank.
+    A per-config table carries composite / quality / plan_quality / pq_excluded /
+    cost_usd / cost_source / latency_secs, a ``[lo, hi]`` CI95 rendering of the
+    composite, and trial / fixture counts, followed by a distinct ``price table``
+    section. The same report always renders byte-identically (rows sorted by
+    config, price-table sections sorted, fixed float precision, no
+    wall-clock/dict-order dependence). An unpriced config's ``cost_source`` shows
+    the explicit marker (e.g. ``unpriced_proxy``), never a blank.
+
+    ``plan_quality`` (task 3099) is a PLAN-ONLY architect config's MEAN θ-rubric
+    score over its scored cells — not one trial's — and ``-`` for a workflow row
+    that never invoked the plan judge. Being the config-level mean is exactly what
+    makes an architect campaign rankable from this table alone instead of
+    recomputing from the per-cell result JSONs, and is why it renders the same
+    number as the ``plan_quality by config:`` block of the
+    :func:`format_plan_quality_table` the CLI prints directly beneath it
+    (:func:`_mean_plan_quality` is shared). ``pq_excluded`` is that config's
+    COUNT of unmeasurable (cap-tainted) architect cells; the per-CAUSE breakdown
+    that distinguishes a transient cap window from a permanent model-not-found is
+    deliberately NOT duplicated here — it lives in
+    :func:`format_plan_quality_table`, which the CLI emits alongside this table
+    for an architect result set.
+
+    ``pq_no_plan`` (task 3302) is its counterpart: how many of that config's
+    architect cells were FLOORED to 0.0 because they produced no plan. Rendered
+    here and not only on the θ table because ranking happens on THIS surface —
+    without it a row reads ``plan_quality 0.0000`` beside ``pq_excluded 0`` and
+    an operator cannot tell a config that planned badly from one that did not
+    plan at all. Two causes, two treatments, two counts, neither silent.
+
+    ``composite`` / ``quality`` / ``plan_quality`` all render ``-`` when the row
+    measured nothing (:func:`_optional_float_cell`): "we measured nothing" must
+    never read as "it scored nothing".
     """
     configs = sorted(report.get('configs', []), key=lambda r: str(r.get('config', '')))
 
     rendered = [
         {
             'config': str(r.get('config', '')),
-            'composite': f'{float(r.get("composite", 0.0)):.4f}',
-            'quality': f'{float(r.get("quality", 0.0)):.4f}',
-            'cost_usd': f'{float(r.get("cost_usd", 0.0)):.4f}',
+            'composite': _optional_float_cell(r.get('composite')),
+            'quality': _optional_float_cell(r.get('quality')),
+            'plan_quality': _optional_float_cell(r.get('plan_quality')),
+            'pq_excluded': str(int(r.get('plan_quality_cap_excluded', 0) or 0)),
+            'pq_no_plan': str(int(r.get('plan_quality_no_plan', 0) or 0)),
+            'cost_usd': _optional_float_cell(r.get('cost_usd', 0.0)),
             'cost_source': str(r.get('cost_source', '')),
-            'latency_secs': f'{float(r.get("latency_secs", 0.0)):.2f}',
+            'latency_secs': _optional_float_cell(
+                r.get('latency_secs', 0.0), precision=2,
+            ),
             'ci95_composite': _ci_cell((r.get('ci95') or {}).get('composite')),
             'trials': str(r.get('trials', 0)),
             'fixtures': str(r.get('fixtures', 0)),

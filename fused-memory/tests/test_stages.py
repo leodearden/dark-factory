@@ -2835,29 +2835,19 @@ class TestTaskKnowledgeSyncUsesFilterTaskTree:
     async def test_stage_does_not_apply_second_slice_on_done_tasks(
         self, mock_deps, watermark
     ):
-        """Stage must NOT apply a second done_tasks slice on top of filter_task_tree's cap.
+        """Exactly MAX_DONE_TASKS_RETAINED done tasks must ALL appear in Recently Completed.
 
-        Two assertions:
-        (1) Source-level guard: assemble_payload source must not contain a slice on
-            done_tasks (e.g. ``done_tasks[:30]``).  This is a tripwire — it fires the
-            moment someone re-introduces a hardcoded re-slice that duplicates the cap
-            already enforced by filter_task_tree.
-        (2) Behavioral guard: exactly MAX_DONE_TASKS_RETAINED done tasks must ALL appear
-            in the Recently Completed section — the stage must not silently trim them.
+        At the cap boundary the stage must not silently trim: filter_task_tree has already
+        enforced MAX_DONE_TASKS_RETAINED, so every task it hands over has to survive
+        assemble_payload's rendering.
+
+        Scope note: this feeds *exactly* MAX_DONE_TASKS_RETAINED tasks, so a re-introduced
+        ``done_tasks[:30]`` re-slice passes all 30 through unchanged and would keep this
+        test green.  The oversized-tree case that actually detects a redundant re-slice
+        lives in ``test_assemble_payload_does_not_re_slice_an_oversized_done_tasks_tree``
+        (which also replaced the inspect.getsource source-text tripwire this test used to
+        carry as its first assertion — see task 3351).
         """
-        import inspect
-        import re
-
-        # (1) Source-level tripwire: assemble_payload must not slice done_tasks.
-        source = inspect.getsource(TaskKnowledgeSync.assemble_payload)
-        assert not re.search(r'done_tasks\[.*:.*\]', source), (
-            "assemble_payload contains a slice on done_tasks (e.g. done_tasks[:30]). "
-            "This is dead code — filter_task_tree already caps done_tasks at "
-            f"MAX_DONE_TASKS_RETAINED={MAX_DONE_TASKS_RETAINED}. "
-            "Remove the slice; filter_task_tree is the single source of truth."
-        )
-
-        # (2) Behavioral guard: all MAX_DONE_TASKS_RETAINED tasks pass through uncut.
         stage = make_configured_task_knowledge_sync_stage(mock_deps, project_id='test_project', project_root='/tmp/test_project')
         mock_deps['taskmaster'].get_tasks.return_value = {
             'tasks': [
@@ -2881,6 +2871,59 @@ class TestTaskKnowledgeSyncUsesFilterTaskTree:
             f"Tasks {missing} missing from Recently Completed section. "
             f"The stage may be applying a redundant slice that trims "
             f"filter_task_tree's already-capped output.\n"
+            f"Section content:\n{section}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_assemble_payload_does_not_re_slice_an_oversized_done_tasks_tree(
+        self, mock_deps, watermark
+    ):
+        """assemble_payload must render EVERY done task it is handed — no second truncation.
+
+        Asserts on RENDERED OUTPUT (the '### Recently Completed Tasks' section), not on
+        source text.  The tree is deliberately OVERSIZED
+        (``MAX_DONE_TASKS_RETAINED + 5`` — a state ``filter_task_tree`` can never produce)
+        and injected through the ``stage.filtered_task_tree`` seam that ``assemble_payload``
+        honours ahead of its ``filter_task_tree`` fallback, because the sibling
+        ``test_stage_does_not_apply_second_slice_on_done_tasks`` sits exactly at the cap
+        where a re-introduced ``done_tasks[:30]`` passes all 30 through and stays green.
+
+        The size of ``done_tasks`` is the ONLY deliberate anomaly: every other field of the
+        injected tree is populated consistently with it.
+        """
+        n_done = MAX_DONE_TASKS_RETAINED + 5
+        stage = make_configured_task_knowledge_sync_stage(
+            mock_deps, project_id='test_project', project_root='/tmp/test_project'
+        )
+        done_tasks = [self._make_task(i, 'done') for i in range(1, n_done + 1)]
+        # done_count == len(done_tasks) keeps _check_filtered_tree_invariant quiet;
+        # all_done_tasks (read by the since-boundary completion-memory audit) and
+        # max_task_id are populated to match, so the oversized done_tasks list is the
+        # only way this tree differs from a filter_task_tree output.
+        stage.filtered_task_tree = FilteredTaskTree(
+            active_tasks=[],
+            done_tasks=done_tasks,
+            all_done_tasks=list(done_tasks),
+            done_count=n_done,
+            cancelled_tasks=[],
+            cancelled_count=0,
+            other_count=0,
+            total_count=n_done,
+            max_task_id=n_done,
+        )
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        section = _extract_section(payload, '### Recently Completed Tasks')
+        assert section, "Payload missing '### Recently Completed Tasks' section"
+
+        missing = [tid for tid in range(1, n_done + 1) if f'- [{tid}] ' not in section]
+        assert not missing, (
+            f"Task ids {missing} were dropped from the Recently Completed section. "
+            f"assemble_payload was handed {n_done} done tasks and must render all of them. "
+            f"filter_task_tree is the single source of truth for the "
+            f"MAX_DONE_TASKS_RETAINED={MAX_DONE_TASKS_RETAINED} cap, so any truncation "
+            f"inside the stage is a redundant re-slice — remove it.\n"
             f"Section content:\n{section}"
         )
 
@@ -13474,3 +13517,298 @@ class TestGcReconMarkers:
 
         assert result == 3
         ledger.gc.assert_awaited_once_with(scope.project_id, ANY, [])
+
+
+class TestSweepStaleMem0PoolProtectsMirrorRecords:
+    """_sweep_stale_mem0_pool never deletes a cycle_summary ledger mirror (task 3041).
+
+    Recon gate 165 (esc-165-1) reported cycle_summary Mem0 anchors vanishing
+    with no audit trail. The adjacent precision defect the finding asked us to
+    audit is real and structurally reachable: _FLAG_FOR_STAGE2_ENUM_FILTERS is
+    ``{'flag_for_stage2': True}`` with NO kind/source/record_type
+    discriminator, and ``flag_for_stage2`` is an LLM-supplied metadata key that
+    nothing at the add_memory boundary stops a cycle_summary write from also
+    carrying. No amount of payload-filter tightening fixes that, so the guard
+    lives at the ONE choke point all three marker sweeps already funnel
+    through — this skeleton — and every current and future caller inherits it.
+
+    A skipped mirror logs a WARNING rather than being silently kept: an
+    over-broad filter must become VISIBLE, per the project's
+    loud-over-silent-degradation / no-silent-fail-soft invariant.
+    """
+
+    @pytest.mark.asyncio
+    async def test_protected_mirror_skipped_ordinary_marker_still_deleted(self, caplog):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_pool,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        stale = (fixed_now - timedelta(days=20)).isoformat()
+        members = [
+            {
+                'id': 'ordinary-marker',
+                'created_at': stale,
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': 't1'},
+            },
+            {
+                'id': 'protected-mirror',
+                'created_at': stale,
+                'metadata': {
+                    'kind': 'cycle_summary',
+                    'record_type': 'ledger_stamp',
+                    'run_id': 'r-victim',
+                },
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger='fused_memory.reconciliation.stages.task_knowledge_sync',
+        ):
+            result = await _sweep_stale_mem0_pool(
+                memory_service,
+                'dark_factory',
+                'r1',
+                source='stage1_flag_marker',
+                gc_sweep_source='stage1_flag_marker_gc_sweep',
+                max_age_days=14,
+                log_name='_sweep_stale_mem0_flag_markers',
+                now=fixed_now,
+            )
+
+        deleted_ids = {
+            call.kwargs.get('memory_id')
+            for call in memory_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'ordinary-marker'}
+        assert 'protected-mirror' not in deleted_ids
+        # The skip is EXCLUDED from the count, not silently counted as a delete.
+        assert result == 1
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert 'protected-mirror' in message
+        assert 'cycle_summary' in message
+        assert 'ledger_stamp' in message
+        assert '_sweep_stale_mem0_flag_markers' in message
+
+    @pytest.mark.asyncio
+    async def test_mirror_protected_even_when_only_kind_is_present(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_pool,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {
+                'id': 'kind-only-mirror',
+                'created_at': (fixed_now - timedelta(days=20)).isoformat(),
+                'metadata': {'kind': 'cycle_summary', 'source': 'stage1_flag_marker'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_mem0_pool(
+            memory_service,
+            'dark_factory',
+            'r1',
+            source='stage1_flag_marker',
+            gc_sweep_source='stage1_flag_marker_gc_sweep',
+            max_age_days=14,
+            log_name='_sweep_stale_mem0_flag_markers',
+            now=fixed_now,
+        )
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_over_broad_flag_for_stage2_sweep_cannot_take_a_mirror(self):
+        """The concrete over-broad predicate this task was asked to audit.
+
+        _FLAG_FOR_STAGE2_ENUM_FILTERS matches ANY record carrying
+        flag_for_stage2=True — including a cycle_summary mirror, since stage
+        metadata is LLM-supplied and nothing constrains extra keys.
+        """
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_for_stage2_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        stale = (fixed_now - timedelta(days=20)).isoformat()
+        members = [
+            {
+                'id': 'ordinary-relay-marker',
+                'created_at': stale,
+                'metadata': {'flag_for_stage2': True, 'task_id': 't1'},
+            },
+            {
+                'id': 'protected-mirror',
+                'created_at': stale,
+                'metadata': {
+                    'kind': 'cycle_summary',
+                    'record_type': 'ledger_stamp',
+                    'run_id': 'r-victim',
+                    'flag_for_stage2': True,
+                },
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=2)
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_mem0_flag_for_stage2_markers(
+            memory_service, 'dark_factory', run_id='r1', now=fixed_now,
+        )
+
+        deleted_ids = {
+            call.kwargs.get('memory_id')
+            for call in memory_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'ordinary-relay-marker'}
+        assert result == 1
+
+
+class TestSweepStaleMem0PoolTombstones:
+    """Every recon-initiated Mem0 delete leaves a queryable tombstone (task 3041).
+
+    The defining signature of the recon-gate-165 / esc-165-1 finding was "no
+    audit trail": an auditor holding a memory uuid had no reachable path to
+    "who deleted it and why", so a designed eviction was indistinguishable
+    from silent data loss. The tombstone is written from the SUCCESS branch
+    only, so a tombstone always means "really gone".
+    """
+
+    @staticmethod
+    def _stale_members(fixed_now):
+        stale = (fixed_now - timedelta(days=20)).isoformat()
+        return [
+            {
+                'id': 'deleted-ok',
+                'created_at': stale,
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': 't1',
+                             'run_id': 'run-victim'},
+            },
+            {
+                'id': 'delete-fails',
+                'created_at': stale,
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': 't2',
+                             'run_id': 'run-victim'},
+            },
+        ]
+
+    @staticmethod
+    def _service(members):
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+
+        async def _delete(**kwargs):
+            if kwargs.get('memory_id') == 'delete-fails':
+                raise RuntimeError('mem0 delete exploded')
+            return None
+
+        memory_service.delete_memory = AsyncMock(side_effect=_delete)
+        return memory_service
+
+    @pytest.mark.asyncio
+    async def test_tombstone_written_only_for_the_successful_delete(self):
+        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = self._stale_members(fixed_now)
+        memory_service = self._service(members)
+
+        with patch.object(
+            tks, 'record_mem0_deletion_tombstones', new=AsyncMock(return_value=1)
+        ) as tombstone:
+            result = await tks._sweep_stale_mem0_pool(
+                memory_service,
+                'dark_factory',
+                'run-deleter',
+                source='stage1_flag_marker',
+                gc_sweep_source='stage1_flag_marker_gc_sweep',
+                max_age_days=14,
+                log_name='_sweep_stale_mem0_flag_markers',
+                now=fixed_now,
+            )
+
+        # ONE batch call for the whole sweep — not one fsync'd ledger commit
+        # per victim (task 3041 amendment pass).
+        assert tombstone.await_count == 1
+        call = tombstone.await_args
+        assert call is not None
+        assert call.args[1] == 'dark_factory'
+        # A tombstone must never claim a record that is still alive: the
+        # failed delete is absent from the batch.
+        assert call.args[2] == [members[0]]
+        assert call.kwargs['deleter'] == 'stage1_flag_marker_gc_sweep'
+        assert call.kwargs['deleting_run_id'] == 'run-deleter'
+
+        # Tombstone writing does not perturb the existing accounting.
+        assert result == 1
+
+    @pytest.mark.asyncio
+    async def test_a_raising_tombstone_helper_cannot_propagate_or_change_the_count(self):
+        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        memory_service = self._service(self._stale_members(fixed_now))
+
+        with patch.object(
+            tks,
+            'record_mem0_deletion_tombstones',
+            new=AsyncMock(side_effect=RuntimeError('ledger db locked')),
+        ):
+            result = await tks._sweep_stale_mem0_pool(
+                memory_service,
+                'dark_factory',
+                'run-deleter',
+                source='stage1_flag_marker',
+                gc_sweep_source='stage1_flag_marker_gc_sweep',
+                max_age_days=14,
+                log_name='_sweep_stale_mem0_flag_markers',
+                now=fixed_now,
+            )
+
+        assert result == 1
+
+    @pytest.mark.asyncio
+    async def test_no_tombstone_when_nothing_was_deleted(self):
+        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {
+                'id': 'fresh',
+                'created_at': (fixed_now - timedelta(days=1)).isoformat(),
+                'metadata': {'source': 'stage1_flag_marker', 'task_id': 't1'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with patch.object(
+            tks, 'record_mem0_deletion_tombstones', new=AsyncMock(return_value=0)
+        ) as tombstone:
+            result = await tks._sweep_stale_mem0_pool(
+                memory_service,
+                'dark_factory',
+                'run-deleter',
+                source='stage1_flag_marker',
+                gc_sweep_source='stage1_flag_marker_gc_sweep',
+                max_age_days=14,
+                log_name='_sweep_stale_mem0_flag_markers',
+                now=fixed_now,
+            )
+
+        assert result == 0
+        tombstone.assert_not_awaited()

@@ -16,24 +16,29 @@ logger = logging.getLogger(__name__)
 # mem0-owned metadata keys
 # ---------------------------------------------------------------------------
 
-# Keys mem0's AsyncMemory._update_memory (site-packages/mem0/memory/main.py,
-# ~line 2449) never trusts from a forwarded metadata dict: 'data'/'hash'/
-# 'created_at'/'updated_at' are unconditionally recomputed from the update
-# call's own arguments and the existing stored point, and 'user_id'/
-# 'agent_id'/'run_id'/'actor_id'/'role' are restored from the *currently
-# stored* payload (unconditionally for 'actor_id'; whenever absent from what
-# was forwarded for the rest). Forwarding stale copies of these currently
-# works only because mem0 keeps overwriting/re-deriving them -- an implicit
-# coupling to mem0 internals. Stripping them makes the intent explicit:
-# preserve only a record's CUSTOM provenance keys (kind/src_project/
-# dst_project/src_entity/dst_entity/source_migration/topic/...).
-#
-# This is the SINGLE home for the key set (INV-5). It lives here, beside
-# Mem0Backend.update whose docstring documents the very constraint it
-# encodes, per plans/mem0-in-place-update-decision.md §6. Consumers:
-# scripts/tag_cgl_eta_rehome_scope.py (which defined it first) and the
-# in-place update_memory tool (task 3088).
-_MEM0_MANAGED_METADATA_KEYS = frozenset({
+#: Keys mem0's ``AsyncMemory._update_memory``
+#: (site-packages/mem0/memory/main.py, ~line 2449) never trusts from a
+#: forwarded metadata dict: ``data``/``hash``/``created_at``/``updated_at``
+#: are unconditionally recomputed from the update call's own arguments and
+#: the existing stored point, and
+#: ``user_id``/``agent_id``/``run_id``/``actor_id``/``role`` are restored
+#: from the *currently stored* payload (unconditionally for ``actor_id``;
+#: whenever absent from what was forwarded for the rest).  Forwarding stale
+#: copies of these works only because mem0 keeps overwriting/re-deriving
+#: them -- an implicit coupling to mem0 internals.  Stripping them makes
+#: the intent explicit: preserve only a record's CUSTOM provenance keys.
+#:
+#: DEFENSIVE NOTE (PRD D12 / task 3055 §6, extracted here by task 3195):
+#: this module is the DECIDED HOME for this set.  ``memory_metadata.py``,
+#: ``scripts/tag_cgl_eta_rehome_scope.py`` (which defined it first) and the
+#: in-place ``update_memory`` tool (task 3088, via
+#: :func:`split_managed_metadata` below and ``server/tools.py``) bind this
+#: same object rather than rebuilding it; task 3195 landed first and task
+#: 3088 imports rather than re-extracts.  Never two copies (INV-5) -- a
+#: second definition that drifts from this one is exactly the failure D12
+#: exists to prevent, and is asserted against by object identity in
+#: ``tests/test_memory_metadata.py::TestKeyLayers``.
+MEM0_MANAGED_METADATA_KEYS = frozenset({
     'data', 'hash', 'created_at', 'updated_at',
     'user_id', 'agent_id', 'run_id', 'actor_id', 'role',
 })
@@ -79,7 +84,7 @@ def split_managed_metadata(
     managed: dict[str, Any] = {}
     custom: dict[str, Any] = {}
     for key, value in payload.items():
-        if key in _MEM0_MANAGED_METADATA_KEYS:
+        if key in MEM0_MANAGED_METADATA_KEYS:
             managed[key] = value
         else:
             custom[key] = value
@@ -505,6 +510,8 @@ class Mem0Backend:
         scope: Scope,
         filters: dict[str, Any],
         limit: int = 1000,
+        *,
+        with_vectors: bool = False,
     ) -> list[dict[str, Any]]:
         """Deterministic enumeration of memories whose payload matches all *filters*.
 
@@ -527,11 +534,26 @@ class Mem0Backend:
                 count_by_metadata).  Empty dict is rejected to avoid silently
                 enumerating every memory in the collection.
             limit: Maximum number of points to return (default 1000).
+            with_vectors: When False (default) only the payload is fetched,
+                preserving the payload-only contract every existing caller
+                relies on and paying no bandwidth for vectors nobody reads.
+                When True, each point's stored vector is fetched and lifted
+                onto its result dict under ``'vector'``.  This exists for ANN
+                candidate generation (``scripts/audit_duplicate_memories.py``):
+                re-using the vector Mem0 already wrote means the caller can
+                query Qdrant for neighbours without making a single embedding
+                API call, and without risking a second metric space.
 
         Returns:
             List of dicts ``{'id': ..., 'created_at': ..., 'metadata': {...}}``
             where ``created_at`` is the raw string from the Qdrant payload (or
             ``None`` if absent) and ``metadata`` is the full payload dict.
+            When *with_vectors* is True each dict additionally carries
+            ``'vector'`` — the stored embedding, or ``None`` if Qdrant
+            returned that point without one.  A vector-less point is still
+            returned (degraded, not dropped) so the caller can count and
+            report it rather than losing it silently; the ``'vector'`` key is
+            absent entirely when *with_vectors* is False.
 
         Raises:
             ValueError: If *filters* is empty.
@@ -559,6 +581,7 @@ class Mem0Backend:
                 collection_name=collection_name,
                 scroll_filter=qdrant_filter,
                 with_payload=True,
+                with_vectors=with_vectors,
                 limit=limit,
             ),
             timeout=self._read_timeout,
@@ -567,11 +590,18 @@ class Mem0Backend:
         result = []
         for point in points:
             payload: dict[str, Any] = dict(point.payload) if point.payload else {}
-            result.append({
+            record: dict[str, Any] = {
                 'id': point.id,
                 'created_at': payload.get('created_at'),
                 'metadata': payload,
-            })
+            }
+            if with_vectors:
+                # getattr-with-default, not point.vector: Qdrant can return a
+                # point carrying no vector at all.  Degrade to None so the
+                # caller can count it as a disclosure — raising here would
+                # discard an entire otherwise-good scan over one bad point.
+                record['vector'] = getattr(point, 'vector', None)
+            result.append(record)
 
         if len(points) == limit:
             logger.warning(

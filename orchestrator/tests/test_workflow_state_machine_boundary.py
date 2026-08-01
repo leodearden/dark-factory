@@ -1077,13 +1077,13 @@ class TestStewardOutcomeRouting:
     # -- Row 9 producer: steward attempt-cap branch, wip=True ---------------
 
     async def test_row9_steward_attempt_cap_wip_true_publishes_directly_skips_l1(
-        self, tmp_path: Path,
+        self, steward_worktree: Path,
     ):
         """When the per-escalation retry cap fires with WIP present, the
         steward publishes the wip-gated ``StewardInterrupted`` DIRECTLY —
         ``_auto_escalate_to_human`` (and therefore any L1 filing) is skipped
         entirely (task-2060 fix)."""
-        steward = _make_steward(worktree=tmp_path / 'wt')
+        steward = _make_steward(worktree=steward_worktree)
         channel = asyncio.Queue()
         steward.set_outcome_channel(channel)
         steward.set_wip_probe(AsyncMock(return_value=True))
@@ -1227,14 +1227,14 @@ class TestBlockDispositionOneClassifierAndCompleteness:
     # own rows-8-9 `_make_steward`/`_make_escalation` module-level names.)
 
     @pytest.mark.asyncio
-    async def test_row10_steward_pre_triage_consults_shared_classifier(self, caplog):
+    async def test_row10_steward_pre_triage_consults_shared_classifier(self, caplog, steward_worktree):
         import json
         import logging
 
         from shared.cli_invoke import AllAccountsCappedException
         from test_suggestion_triage import _make_escalation, _make_steward, _make_suggestions
 
-        steward = _make_steward()
+        steward = _make_steward(worktree=steward_worktree)
         suggestions = _make_suggestions(15)
         escalation = _make_escalation(detail=json.dumps(suggestions))
         cap_exc = AllAccountsCappedException(

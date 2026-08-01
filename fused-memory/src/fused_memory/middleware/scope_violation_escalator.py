@@ -1,37 +1,59 @@
-"""Route path-scope-guard rejections to the project's escalation queue.
+"""Route path-scope-guard outcomes to the project's escalation queue.
 
-When :mod:`fused_memory.middleware.path_scope_guard` rejects a candidate
-task because it cites paths owned by another project, the structured
-``DarkFactoryPathScopeViolation`` error dict is returned to the caller —
-but historically that's the end of the line.  An MCP caller may or may
-not surface the rejection; an LLM agent may not retry; and the operator
-never sees that a misroute was attempted.
+When :mod:`fused_memory.middleware.path_scope_guard` finds that a candidate
+task cites paths owned by another project, whatever happens next is easy for
+everyone to miss: an MCP caller may or may not surface it; an LLM agent may
+not retry; and the operator never sees that a misroute was attempted.  This
+escalator writes a parallel ``scope_violation`` escalation so the operator's
+queue surfaces the misroute even when the calling agent never reports it.
 
-This escalator writes a parallel ``scope_violation`` escalation alongside
-the rejection so the operator's queue surfaces the misroute even when
-the calling agent never reports it.
+Since task 2206 (commit 0204e25fa5) the guard produces TWO outcomes, and
+:meth:`ScopeViolationEscalator.report_rejection` files an escalation for both
+— the ``advisory=`` keyword selects which one the record describes:
+
+* **FILES-certain rejection** (``advisory=False``) — an exact
+  ``metadata.files`` owner mismatch.  Hard reject: NO task is created and the
+  structured ``DarkFactoryPathScopeViolation`` error dict is returned to the
+  caller.
+* **PROSE-only advisory** (``advisory=True``) — a regex-over-prose heuristic
+  hit with no files-level mismatch.  Nothing is blocked: the task IS created
+  and stamped with ``metadata.possible_scope_mismatch``.
+
+The distinction is load-bearing rather than cosmetic (task 3119): this
+escalation is read by operators and rendered into agent briefings, so an
+advisory described in rejection wording reports that a task was rejected when
+it in fact exists — and tells the reader to resubmit work that already
+landed.  Both outcomes are severity ``info`` — the FLOOR of the
+``blocking|info|critical|urgent`` vocabulary in ``escalation.models``, so the
+wording is what distinguishes them, not the severity.
 
 Design mirrors :class:`fused_memory.middleware.curator_escalator.CuratorEscalator`:
 
 * Defensive import of the optional ``escalation`` workspace package.  When
   the package is missing (minimal envs, tests without escalation infra),
-  ``report_rejection`` becomes a logged no-op — the rejection error dict
-  is still returned by the guard, escalation is purely additive.
+  ``report_rejection`` becomes a logged no-op — the guard's own outcome is
+  unaffected (on the FILES-certain path the error dict is still returned;
+  on the advisory path the task is still created and stamped), so
+  escalation is purely additive.
 * Per-project ``EscalationQueue`` cache keyed by ``project_root``.
-* Escalations land in ``{project_root}/data/escalations`` — the *rejecting*
-  project's queue (the place the agent was operating against).  This
-  matches the existing esc-2240-series scope_violation pattern referenced
-  in task 1088.
+* Escalations land in ``{project_root}/data/escalations`` — the *filing*
+  project's queue (the place the agent was operating against), regardless
+  of outcome.  This matches the existing esc-2240-series scope_violation
+  pattern referenced in task 1088.
 
 Burst control: :meth:`report_budget_misconfig` applies a per-project dedup
 window (``_BUDGET_MISCONFIG_DEDUP_WINDOW_SECS``) so a sustained per-call
 budget exhaustion files ONE escalation per window rather than flooding the
-operator queue.  :meth:`report_rejection` folds repeated identical misroutes
-(same rejecting project + matched paths + suggested owner) into a single
-on-disk pending parent via ``escalation.dedupe.submit_or_dedupe`` — the
+operator queue.  :meth:`report_rejection` folds recurring identical events
+(same filing project + matched paths + suggested owner + outcome mode) into a
+single on-disk pending parent via ``escalation.dedupe.submit_or_dedupe`` — the
 first occurrence still escalates, but re-proposals of the same misroute
 (e.g. a daily reconciliation consolidation round) increment the parent's
-``dedupe_count`` instead of filing a fresh escalation (task 2946).
+``dedupe_count`` instead of filing a fresh escalation (task 2946).  The two
+outcome modes fold INDEPENDENTLY so a pending record of one can never absorb
+the other and report it with the wrong outcome — see
+``_ADVISORY_FINGERPRINT_TOKEN`` for how, and why only one mode contributes a
+token.
 """
 
 from __future__ import annotations
@@ -72,6 +94,25 @@ _ANCHOR_TASK_ID: str = 'task-path-guard'
 _AGENT_ROLE: str = 'fused-memory/path-guard'
 _CATEGORY: str = 'scope_violation'
 
+# Dedup discriminator putting the outcome mode into the content fingerprint, so
+# an advisory and a FILES-certain rejection over the same paths never fold into
+# one parent whose wording would then mislabel the other (task 3119).
+#
+# Appended on the advisory branch ONLY, and the asymmetry is the whole point:
+# compute_content_fingerprint sorts and \x1f-joins affected_ids before hashing,
+# so a 'mode:rejection' counterpart would change the REJECTION digest too and
+# stop any parent that is still pending across this change from folding.  The
+# rejection composition is therefore left byte-identical to pre-task-3119, and
+# only the newly-introduced mode carries a token.
+_ADVISORY_FINGERPRINT_TOKEN: str = 'mode:advisory'
+
+# ``suggested_action`` for the PROSE-only advisory.  Deliberately NOT
+# ``resubmit_to_<project>``: ``orchestrator/agents/briefing.py`` renders
+# suggested_action verbatim into an agent's briefing, so a resubmit
+# instruction on a submission that was never blocked reads as a directive to
+# redo work that already landed (task 3119).
+_ADVISORY_SUGGESTED_ACTION: str = 'no_action_advisory_only'
+
 # Budget-misconfig escalation constants — deliberately distinct from the
 # scope_violation family so operators can immediately tell these apart.
 _BUDGET_MISCONFIG_ANCHOR_TASK_ID: str = 'adjudicator-budget-defect'
@@ -90,12 +131,14 @@ class ScopeViolationEscalator:
 
     Handles two distinct categories:
 
-    * **scope_violation** (:meth:`report_rejection`) — filed for every rejected
-      task-creation misroute detected by the path-scope guard.  Repeated
-      identical misroutes fold into one pending parent (content-fingerprint
-      dedup, unbounded window); the first occurrence always escalates.
-      Disable via the ``scope_violation_dedupe_enabled=False`` constructor
-      escape hatch to restore legacy one-escalation-per-call behavior.
+    * **scope_violation** (:meth:`report_rejection`) — filed for BOTH
+      task-creation outcomes the path-scope guard produces (module docstring has
+      the taxonomy); the ``advisory=`` keyword selects which one the record
+      describes.  Recurring identical events fold into one pending parent
+      (content-fingerprint dedup, unbounded window), the two modes folding
+      independently.  Disable via the ``scope_violation_dedupe_enabled=False``
+      constructor escape hatch to restore legacy one-escalation-per-call
+      behavior.
     * **adjudicator_config_defect** (:meth:`report_budget_misconfig`) — filed
       when the path-scope adjudicator's LLM call returns ``error_max_budget_usd``
       with ``cost_usd > 0``, indicating the per-call budget is too low for the
@@ -147,23 +190,33 @@ class ScopeViolationEscalator:
         suggested_project: str | None,
         suggested_root: str | None = None,
         llm_reason: str | None = None,
+        advisory: bool = False,
     ) -> str | None:
-        """File a ``scope_violation`` escalation for a guard rejection.
+        """File a ``scope_violation`` escalation for EITHER guard outcome.
+
+        Despite the name (kept for call-site/test-double back-compat), this
+        method covers BOTH outcomes described in the module docstring, selected
+        by *advisory*: a FILES-certain hard rejection (default — wording tells
+        the operator to resubmit to the owner) or a PROSE-only advisory (the
+        task WAS created and stamped, so the wording says so and
+        ``suggested_action`` is ``no_action_advisory_only``).
 
         Returns the escalation id when one was filed, ``None`` otherwise
         (escalation package missing, queue write failed, etc.).  Never
-        raises — escalation is additive to the existing rejection error
-        dict, so a queue write failure must not turn a guard rejection
-        into a guard exception.
+        raises — escalation is additive to the guard's own outcome, so a
+        queue write failure must not turn a guard rejection into a guard
+        exception (nor break creation on the advisory path).
 
         Routes through :func:`escalation.dedupe.submit_or_dedupe` keyed on a
-        content fingerprint over the misroute *shape* (rejecting project_id +
-        sorted matched_paths + suggested_project), with an unbounded dedup
-        window.  A recurring identical misroute (e.g. the same reconciliation
-        consolidation candidate re-proposed every round) therefore folds into
-        the first pending escalation — this method then returns the EXISTING
-        parent id, not a freshly-minted one — until a human resolves it, at
-        which point a later recurrence re-escalates.
+        content fingerprint over the misroute *shape* (filing project_id +
+        sorted matched_paths + suggested_project + the *advisory* mode), with
+        an unbounded dedup window.  A recurring identical misroute (e.g. the
+        same reconciliation consolidation candidate re-proposed every round)
+        therefore folds into the first pending escalation — this method then
+        returns the EXISTING parent id, not a freshly-minted one — until a
+        human resolves it, at which point a later recurrence re-escalates.
+        Advisories and rejections fold INDEPENDENTLY, so a pending record of one
+        can never swallow the other and report it with the wrong outcome.
 
         Sync because :meth:`escalation.queue.EscalationQueue.submit` is a
         synchronous filesystem write (atomic ``rename``); no await needed,
@@ -178,26 +231,37 @@ class ScopeViolationEscalator:
                 operator can see why the LLM judged this a genuine/uncertain
                 misroute.  None (default) preserves the existing detail format
                 for callers that don't use the Stage-2 adjudicator.
+            advisory: Select the PROSE-only advisory wording (see above).
+                Default ``False`` — the FILES-certain rejection wording,
+                byte-identical to the pre-task-3119 output.
         """
         queue = self._queue_for(project_root)
         if queue is None:
             logger.debug(
                 'scope_violation_escalator: escalation package unavailable; '
-                'rejection of %r in project %r will not be escalated',
+                '%s of %r in project %r will not be escalated',
+                'advisory' if advisory else 'rejection',
                 candidate_title[:80], project_id,
             )
             return None
 
         paths_str = ', '.join(matched_paths) or '<none>'
         target = suggested_project or '<unknown — multiple or no owner>'
-        suggested_action = (
-            f'resubmit_to_{suggested_project}' if suggested_project else 'manual_route'
-        )
+        if advisory:
+            suggested_action = _ADVISORY_SUGGESTED_ACTION
+        else:
+            suggested_action = (
+                f'resubmit_to_{suggested_project}' if suggested_project else 'manual_route'
+            )
 
+        # Labels are outcome-NEUTRAL ('filing_*', not 'rejecting_*'): detail is
+        # rendered verbatim into agent briefings, and on the advisory path
+        # nothing was rejected (task 3119).  Safe to relabel — detail is not an
+        # input to the dedup fingerprint.
         detail_lines = [
             f'candidate_title={candidate_title!r}',
-            f'rejecting_project_id={project_id!r}',
-            f'rejecting_project_root={project_root!r}',
+            f'filing_project_id={project_id!r}',
+            f'filing_project_root={project_root!r}',
             f'matched_paths={list(matched_paths)}',
             f'suggested_project={suggested_project!r}',
         ]
@@ -205,13 +269,29 @@ class ScopeViolationEscalator:
             detail_lines.append(f'suggested_project_root={suggested_root!r}')
         if llm_reason is not None:
             detail_lines.append(f'llm_adjudicator_reason={llm_reason!r}')
+        # Only the CLOSING PROSE differs between the two modes — the
+        # structured routing context above is what the operator acts on and is
+        # identical either way.
         detail_lines.append('')
-        detail_lines.append(
-            'A task creation request was rejected because its text or files '
-            'reference paths owned by another project.  See suggested_project '
-            'above for the intended target; resubmit there or, if no clear '
-            'owner is known, route the task manually.',
-        )
+        if advisory:
+            detail_lines.append(
+                'A task creation request cited paths that look like they belong '
+                'to another project, based on a heuristic scan of its prose '
+                '(title/description/details) only.  The submission was NOT '
+                'blocked: the task WAS created, and the match is recorded on it '
+                'as metadata.possible_scope_mismatch so async triage can see it '
+                'too.  suggested_project above is a POSSIBLE owner, not a '
+                'verdict — no resubmission is needed and nothing was lost.  '
+                'Review and reroute the created task ONLY if the attribution '
+                'above is actually correct and the task is in the wrong place.',
+            )
+        else:
+            detail_lines.append(
+                'A task creation request was rejected because its text or files '
+                'reference paths owned by another project.  See suggested_project '
+                'above for the intended target; resubmit there or, if no clear '
+                'owner is known, route the task manually.',
+            )
         detail = '\n'.join(detail_lines)
 
         try:
@@ -219,9 +299,13 @@ class ScopeViolationEscalator:
                 id=queue.make_id(_ANCHOR_TASK_ID),
                 task_id=_ANCHOR_TASK_ID,
                 agent_role=_AGENT_ROLE,
+                # 'info' for BOTH modes: already the severity floor (module docstring).
                 severity='info',
                 category=_CATEGORY,
                 summary=(
+                    f'Path-scope ADVISORY: task CREATED and stamped, '
+                    f'cites {paths_str} (possible owner: {target})'
+                    if advisory else
                     f'Misrouted task rejected: cites {paths_str} '
                     f'(suggested target: {target})'
                 ),
@@ -235,6 +319,8 @@ class ScopeViolationEscalator:
                         *matched_paths,
                         f'suggested:{suggested_project or "none"}',
                         f'project:{project_id}',
+                        # Advisory-only by design — see _ADVISORY_FINGERPRINT_TOKEN.
+                        *([_ADVISORY_FINGERPRINT_TOKEN] if advisory else []),
                     ]),
                 ),
             )
@@ -246,10 +332,10 @@ class ScopeViolationEscalator:
             )
             esc_id = submit_or_dedupe(queue, esc, config)['id']  # type: ignore[possibly-unbound]
         except Exception:
-            # Queue I/O failure must not propagate — the rejection error
-            # dict is still returned by the guard, the operator just
-            # doesn't get the heads-up.  Mirror curator_escalator's
-            # tolerance so a broken filesystem can't break task creation.
+            # Queue I/O failure must not propagate — the guard's own outcome
+            # stands either way, the operator just doesn't get the heads-up.
+            # Mirrors curator_escalator's tolerance so a broken filesystem
+            # can't break task creation.
             logger.exception(
                 'scope_violation_escalator: failed to submit escalation '
                 'for project %s (candidate=%r)',

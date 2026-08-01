@@ -438,6 +438,98 @@ def release_merge_verify_flock(fd: int) -> None:
         os.close(fd)
 
 
+#: Default kernel lock table.  Injectable at the call site purely so tests can
+#: drive the parser from a fixture file.
+PROC_LOCKS_PATH: Path = Path('/proc/locks')
+
+
+def lane_lock_holder_pids(
+    path: Path,
+    *,
+    locks_path: Path = PROC_LOCKS_PATH,
+) -> list[int]:
+    """Return the pids currently holding an ``flock(2)`` on *path*, per the kernel.
+
+    Reads the kernel lock table (``/proc/locks``) and returns every pid holding
+    a ``FLOCK`` record whose device+inode match ``os.stat(path)``.  Matching on
+    (dev, inode) rather than on a pathname is what makes this correct: the lock
+    table records inodes, and ``flock(2)``/``flock(1)`` interoperate on the same
+    inode regardless of which path string each caller opened.
+
+    Row shape, verified empirically on this host::
+
+        82: FLOCK  ADVISORY  WRITE 1553455 103:08:14958524 0 EOF
+        <id>: <TYPE> <MODE> <RW> <PID> <MAJ:MIN:INO> <START> <END>
+
+    with three properties that the parse depends on:
+
+    * **MAJ and MIN are HEX; the inode is DECIMAL.** (259, 8 renders ``103:08``.)
+    * A process *blocked waiting* on the lock appears as a separate row whose
+      first token after the id is ``->``::
+
+          82: -> FLOCK  ADVISORY  WRITE 1555037 103:08:14958524 0 EOF
+
+      A waiter is not a holder and is skipped — counting one would libel every
+      process merely contending for the lane.
+    * A flock taken on a worker **thread** is reported against the process
+      **tgid**, not the thread's ``native_id``.  This is the decisive property
+      for the caller: the D8/B13 leak this probe exists to detect is acquired
+      inside ``asyncio.to_thread``, so were the thread id reported instead the
+      leak would be invisible here.
+
+    ``POSIX``/``OFDLCK`` records on the same inode are ignored: they are a
+    different lock class and do not conflict with ``flock(2)``.
+
+    Why kernel truth rather than the holder-pgid rendezvous below: an orphaned
+    acquire never reaches :func:`write_lock_holder_pgid` (callers record the
+    pgid only *after* the acquire returns), so the rendezvous is empty in
+    exactly the leak case.  ``/proc/locks`` is also what the incident anchor
+    itself used — reify ``esc-5548-5`` inode-matched
+    ``FLOCK ADVISORY WRITE 588232 07:1d:4300647613`` against
+    ``_merge-verify.lock`` by hand.
+
+    Fail-safe, mirroring :func:`read_lock_holder_pgid`: a missing lock file, a
+    missing or unreadable lock table (a non-Linux host has no ``/proc/locks``),
+    and any unparseable row all yield "no known holders" rather than raising.
+    Callers invoke this from inside acquire-timeout paths, where an exception
+    would convert a diagnosable stall into a broken merge.
+
+    Returns the matching pids de-duplicated, in first-seen order.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return []
+    target = (os.major(st.st_dev), os.minor(st.st_dev), st.st_ino)
+
+    try:
+        raw = locks_path.read_text()
+    except OSError:
+        return []
+
+    pids: list[int] = []
+    seen: set[int] = set()
+    for line in raw.splitlines():
+        fields = line.split()
+        if len(fields) < 2:
+            continue
+        fields = fields[1:]  # drop the leading '<id>:' token
+        if fields[0] == '->':
+            continue  # a blocked waiter, not a holder
+        if len(fields) < 5 or fields[0] != 'FLOCK':
+            continue
+        try:
+            pid = int(fields[3])
+            maj, minor, ino = fields[4].split(':')
+            record = (int(maj, 16), int(minor, 16), int(ino, 10))
+        except (ValueError, IndexError):
+            continue  # tolerate an unexpected row shape rather than raise
+        if record == target and pid not in seen:
+            seen.add(pid)
+            pids.append(pid)
+    return pids
+
+
 # ---------------------------------------------------------------------------
 # Holder-pgid rendezvous — fixed key (task 2306 α)
 #

@@ -979,11 +979,16 @@ class TestReviewLoopRouting:
 # ---------------------------------------------------------------------------
 
 
-def _make_steward(*, config_overrides=None, suggestion_count=15):
-    """Build a minimal TaskSteward with mocked dependencies."""
-    import tempfile
-    from pathlib import Path
+def _make_steward(*, worktree: Path, config_overrides=None, suggestion_count=15):
+    """Build a minimal TaskSteward with mocked dependencies.
 
+    *worktree* must be a pytest ``tmp_path``-rooted directory, so that
+    pytest's own retention policy reclaims it; it is keyword-only with no
+    default so no caller can fall back to an unmanaged temp dir.  The
+    helper creates the directory itself — the steward's pre-flight
+    auto-escalates "Worktree missing" on a path that is not a directory —
+    and nothing else inside it needs to exist.
+    """
     from orchestrator.steward import TaskSteward
 
     config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
@@ -1020,11 +1025,7 @@ def _make_steward(*, config_overrides=None, suggestion_count=15):
     mcp.mcp_config_json.return_value = {}
 
     task = {'id': '42', 'title': 'Test Task', 'description': 'desc'}
-    # Create a real tmp worktree so the steward's pre-flight (added in the
-    # zombie-escalation fix) does not auto-escalate before the test gets a
-    # chance to assert.  Tests mock invoke_agent so nothing actually runs
-    # against this directory.
-    worktree = Path(tempfile.mkdtemp(prefix='test-steward-wt-'))
+    worktree.mkdir(parents=True, exist_ok=True)
     steward = TaskSteward(
         task_id='42',
         task=task,
@@ -1106,8 +1107,8 @@ def _invoke_writing_verdict(worktree: Path, triage_output: dict, **result_kwargs
 
 class TestPreTriageSuggestions:
     @pytest.mark.asyncio
-    async def test_pre_triage_invoked_above_threshold(self):
-        steward = _make_steward()
+    async def test_pre_triage_invoked_above_threshold(self, steward_worktree):
+        steward = _make_steward(worktree=steward_worktree)
         suggestions = _make_suggestions(15)
 
         triage_output = {
@@ -1143,9 +1144,9 @@ class TestPreTriageSuggestions:
         assert '5 skipped' in result.summary
 
     @pytest.mark.asyncio
-    async def test_pre_triage_not_invoked_below_threshold(self):
+    async def test_pre_triage_not_invoked_below_threshold(self, steward_worktree):
         """Small suggestion sets should skip pre-triage in _handle_escalation."""
-        steward = _make_steward()
+        steward = _make_steward(worktree=steward_worktree)
         suggestions = _make_suggestions(5)
         esc = _make_escalation(detail=json.dumps(suggestions))
 
@@ -1162,8 +1163,8 @@ class TestPreTriageSuggestions:
         assert call_kwargs.kwargs.get('model') or 'opus' in str(call_kwargs)
 
     @pytest.mark.asyncio
-    async def test_pre_triage_failure_falls_back(self):
-        steward = _make_steward()
+    async def test_pre_triage_failure_falls_back(self, steward_worktree):
+        steward = _make_steward(worktree=steward_worktree)
         suggestions = _make_suggestions(15)
         esc = _make_escalation(detail=json.dumps(suggestions))
 
@@ -1178,7 +1179,7 @@ class TestPreTriageSuggestions:
         assert result.summary == esc.summary
 
     @pytest.mark.asyncio
-    async def test_pre_triage_clears_stale_verdict_before_spawn(self):
+    async def test_pre_triage_clears_stale_verdict_before_spawn(self, steward_worktree):
         """I-FRESH: a stale verdicts/triage.json from a prior run must not be
         consumed by a run whose invocation never calls submit_triage.
 
@@ -1189,7 +1190,7 @@ class TestPreTriageSuggestions:
         this stale verdict would be read back and returned as a bogus
         pre-triaged escalation instead of falling back to the original.
         """
-        steward = _make_steward()
+        steward = _make_steward(worktree=steward_worktree)
         suggestions = _make_suggestions(15)
         esc = _make_escalation(detail=json.dumps(suggestions))
 
@@ -1219,8 +1220,8 @@ class TestPreTriageSuggestions:
         assert result.summary == esc.summary
 
     @pytest.mark.asyncio
-    async def test_pre_triage_cost_tracked_in_metrics(self):
-        steward = _make_steward()
+    async def test_pre_triage_cost_tracked_in_metrics(self, steward_worktree):
+        steward = _make_steward(worktree=steward_worktree)
         assert steward.metrics.total_cost_usd == 0.0
 
         suggestions = _make_suggestions(15)
@@ -1239,8 +1240,8 @@ class TestPreTriageSuggestions:
         assert steward.metrics.invocations == 1
 
     @pytest.mark.asyncio
-    async def test_pre_triage_replaces_escalation_detail(self):
-        steward = _make_steward()
+    async def test_pre_triage_replaces_escalation_detail(self, steward_worktree):
+        steward = _make_steward(worktree=steward_worktree)
         suggestions = _make_suggestions(12)
         esc = _make_escalation(detail=json.dumps(suggestions))
 
@@ -1272,13 +1273,13 @@ class TestPreTriageSuggestions:
         assert 'Original Suggestions' in result.detail
 
     @pytest.mark.asyncio
-    async def test_pre_triage_malformed_item_falls_back(self):
+    async def test_pre_triage_malformed_item_falls_back(self, steward_worktree):
         """A malformed per-item shape (a proposed_task_groups entry missing
         'title') must degrade to the original escalation unchanged, not
         raise KeyError out of format_pretriaged_detail's unguarded
         g["title"] indexing (steward.py:766, outside the try/except).
         """
-        steward = _make_steward()
+        steward = _make_steward(worktree=steward_worktree)
         suggestions = _make_suggestions(15)
         esc = _make_escalation(detail=json.dumps(suggestions))
 
@@ -1334,14 +1335,14 @@ class TestPreTriageSuggestions:
         ],
         ids=['accepted-files-non-list', 'group-accepted-indices-non-int-element'],
     )
-    async def test_pre_triage_wrong_value_type_falls_back(self, triage_output):
+    async def test_pre_triage_wrong_value_type_falls_back(self, triage_output, steward_worktree):
         """A well-shaped-but-mistyped verdict (all required keys present, but
         `files` or `accepted_indices` has the wrong value type) must degrade
         to the original escalation unchanged, not raise TypeError out of
         format_pretriaged_detail's extend(int) / `0 <= '0'` comparison
         (steward.py:766, outside the try/except).
         """
-        steward = _make_steward()
+        steward = _make_steward(worktree=steward_worktree)
         suggestions = _make_suggestions(15)
         esc = _make_escalation(detail=json.dumps(suggestions))
 
@@ -1365,7 +1366,7 @@ class TestPreTriageSuggestions:
 class TestPreTriageCapHandling:
     @pytest.mark.asyncio
     async def test_pre_triage_returns_original_escalation_on_cap(
-        self, caplog
+        self, caplog, steward_worktree
     ):
         """_pre_triage_suggestions must return the original escalation unchanged on cap.
 
@@ -1373,7 +1374,7 @@ class TestPreTriageCapHandling:
         _pre_triage_suggestions, crashing the steward.
         After step-8 impl: exception is caught, original escalation returned.
         """
-        steward = _make_steward()
+        steward = _make_steward(worktree=steward_worktree)
         suggestions = _make_suggestions(15)
         escalation = _make_escalation(detail=json.dumps(suggestions))
 

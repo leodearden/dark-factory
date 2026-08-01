@@ -1188,9 +1188,16 @@ def _run_single_eval(
                     f' unmeasurable: {result.metrics.get("invocation_error")}'
                     if result.metrics.get('cap_tainted') else ''
                 )
+                # `steps=` is echoed BESIDE the score (task 3302) because it is
+                # the plan-production predicate the whole pipeline now keys on:
+                # `steps=0` beside any plan_quality means the architect produced
+                # nothing, which the final table floors to 0.0. Showing it live
+                # is what stops a no-plan candidate from looking healthy for the
+                # length of a campaign.
                 click.echo(
                     f'{result.task_id} × {result.config_name}: '
-                    f'{result.outcome} plan_quality={plan_quality}{taint} '
+                    f'{result.outcome} plan_quality={plan_quality} '
+                    f'steps={result.metrics.get("plan_steps")}{taint} '
                     f'({result.wall_clock_ms / 1000:.1f}s)'
                 )
             else:
@@ -1278,14 +1285,31 @@ def _emit_composite_report(results, price_table) -> None:
     composite/cost/latency/CI95/judge report and prints
     :func:`format_composite_table`. The quality figure is single-sourced in λ's
     ``compute_composite`` — the driver never re-derives a score.
+
+    When *results* contain any PLAN-ONLY architect run, the θ plan-quality table
+    is emitted after it (task 3099), mirroring the precedent already in
+    :func:`_run_single_eval` rather than inventing a second rendering path. The
+    two tables are complementary, not redundant: the composite row reports the
+    cap-exclusion as a COUNT, while only the plan-quality table breaks it out BY
+    CAUSE — and that is what tells an operator reading an OFAT run whether a
+    missing architect cell is a transient cap window (rerun it) or a permanent
+    model-not-found (that candidate can never run at all). A result set with no
+    architect rows emits the composite table alone, so the existing
+    ``eval-matrix`` / ``eval-confirm`` end-to-end surfaces are unchanged.
     """
     from orchestrator.evals.report import (
         build_composite_report,
+        build_plan_quality_report,
         format_composite_table,
+        format_plan_quality_table,
     )
 
     report = build_composite_report(results, price_table=price_table)
     click.echo(format_composite_table(report))
+
+    if any(r.metrics.get('role_under_test') == 'architect' for r in results):
+        click.echo('')
+        click.echo(format_plan_quality_table(build_plan_quality_report(results)))
 
 
 def _run_ofat_driver(

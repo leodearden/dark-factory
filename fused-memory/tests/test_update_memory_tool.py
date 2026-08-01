@@ -21,7 +21,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from fused_memory.backends.mem0_client import _MEM0_MANAGED_METADATA_KEYS
+from fused_memory.backends.mem0_client import MEM0_MANAGED_METADATA_KEYS
 from fused_memory.config.schema import Mem0UpdateConfig
 from fused_memory.models.enums import MemoryCategory
 
@@ -161,14 +161,14 @@ class TestReservedKeys:
     """(d) mem0-owned keys are rejected at the boundary, never silently dropped."""
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize('key', sorted(_MEM0_MANAGED_METADATA_KEYS))
+    @pytest.mark.parametrize('key', sorted(MEM0_MANAGED_METADATA_KEYS))
     async def test_reserved_key_in_patch_is_rejected_naming_it(self, key):
         mock_service = _mock_service()
         result = await _call_tool(mock_service, metadata_patch={key: 'x', 'topic': 'ok'})
         _assert_rejected(result, mock_service, key)
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize('key', sorted(_MEM0_MANAGED_METADATA_KEYS))
+    @pytest.mark.parametrize('key', sorted(MEM0_MANAGED_METADATA_KEYS))
     async def test_reserved_key_in_delete_keys_is_rejected_naming_it(self, key):
         """Deleting a mem0-owned key is the more destructive direction: mem0's
         own get/search read those keys, so a successful deletion would make the

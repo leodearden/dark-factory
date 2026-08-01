@@ -27,7 +27,17 @@ import json
 import logging
 from datetime import UTC, datetime, timedelta
 
+from fused_memory.reconciliation.mem0_tombstone import record_mem0_deletion_tombstones
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord
+from fused_memory.reconciliation.recon_pool_map import (
+    CYCLE_SUMMARY_KIND,
+)
+from fused_memory.reconciliation.recon_pool_map import (
+    CYCLE_SUMMARY_RECORD_TYPE_LEDGER_STAMP as _CYCLE_SUMMARY_RECORD_TYPE_LEDGER_STAMP,
+)
+from fused_memory.reconciliation.recon_pool_map import (
+    CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE as _CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE,
+)
 from fused_memory.utils.async_utils import gather_collect
 
 logger = logging.getLogger(__name__)
@@ -47,33 +57,46 @@ CYCLE_SUMMARY_TTL_DAYS: int = 30
 # reconstruction/self-heal cycle_summary write in
 # ``reconciliation.prompts.stage2`` (NARRATIVE).
 #
-# Only LEDGER_STAMP is actually single-sourced today: it is imported by this
-# module's own write_cycle_summary below, so changing its value here changes
-# the real write. NARRATIVE has no Python consumer yet — prompts/stage2.py
-# and recon_self_model.py hardcode the literal 'narrative' in prose/f-string
-# text instead of importing it, because those prompt modules are deliberately
-# import-light (prompt-import path) and must not pull in this module's
-# recon_ledger -> aiosqlite import chain just to read a string constant (see
-# recon_self_model.py's module docstring). NARRATIVE is therefore a reserved
-# placeholder documenting the intended value for a future Python consumer
-# (e.g. near-duplicate/dedup tooling) that sits on the same import side as
-# this module; until such a consumer exists, keeping the prompt-side literal
-# in sync with this value is a manual, reviewed invariant rather than an
-# enforced one. Both literal values are frozen by convention — plain string
-# discriminators with no anticipated reason to ever change. There is no
-# automated pin test guarding them; if either constant is ever edited, also
-# check that the prompt-side literal (prompts/stage2.py, recon_self_model.py)
-# stays in sync, since that invariant is reviewed rather than enforced.
+# record_type was write-only as of task 2468: no reader (dedup/near-duplicate
+# tooling, Path-2 verification, pool-cap trim) filtered on it — the fix that
+# actually stopped the double-write was the removed normal-flow LLM
+# instruction (recon_self_model.py), not this discriminator.
 #
-# record_type is write-only as of task 2468: no reader (dedup/near-duplicate
-# tooling, Path-2 verification, pool-cap trim) filters on it yet — the fix
-# that actually stops the double-write is the removed normal-flow LLM
-# instruction (recon_self_model.py), not this discriminator. That is
-# reviewed and accepted as cheap, well-documented forward-compat metadata;
-# per YAGNI, no consumer is added here speculatively — one lands alongside
-# the dedup/near-duplicate tooling that needs it.
-CYCLE_SUMMARY_RECORD_TYPE_LEDGER_STAMP: str = 'ledger_stamp'
-CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE: str = 'narrative'
+# Task 3041 gives LEDGER_STAMP its first two real readers: this module's own
+# record_type-aware eviction order in enforce_summary_pool_cap below, and
+# reconciliation.mem0_tombstone.is_protected_mirror_record. Because
+# mem0_tombstone is imported BY this module (for the trim-path tombstone
+# write), it cannot import back — so the literals now live in the leaf
+# recon_pool_map alongside the pool names, single-sourced for both readers,
+# and are re-exported here under their historical names. See that module for
+# why (task 3041 amendment pass: they were previously duplicated with nothing
+# pinning the copies equal, so an edit to one side would silently disable half
+# the protected-mirror guard).
+#
+# NARRATIVE still has no Python consumer; keeping the prompt-side literal
+# (prompts/stage2.py, recon_self_model.py) in sync remains a reviewed
+# invariant rather than an enforced one.
+CYCLE_SUMMARY_RECORD_TYPE_LEDGER_STAMP: str = _CYCLE_SUMMARY_RECORD_TYPE_LEDGER_STAMP
+CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE: str = _CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE
+
+# metadata.kind identifying a cycle_summary record. Written by
+# write_cycle_summary's mirror below, keyed on by
+# services.memory_service._apply_cycle_summary_metadata_tagging, and now also
+# the enumeration constraint for enforce_summary_pool_cap (task 3041).
+# Single-sourced in recon_pool_map for the same reason as the record_types
+# above — mem0_tombstone.is_protected_mirror_record needs the same literal.
+_KIND_CYCLE_SUMMARY: str = CYCLE_SUMMARY_KIND
+
+# Explicit scroll bound for the pool enumeration below (task 3041). Same value
+# as get_memories_by_metadata's own default, which this previously relied on
+# implicitly. Named and passed explicitly because it is a CORRECTNESS bound,
+# not a performance knob: a pool that reached this size would enumerate as a
+# partial view, and Qdrant scroll order is not guaranteed oldest-first, so the
+# trim would then keep an arbitrary subset while still reporting success.
+# Reaching it is not expected — this trim is what holds the pool at `cap`
+# every cycle — so hitting it means something upstream is already wrong, and
+# enforce_summary_pool_cap says so out loud rather than degrading silently.
+SUMMARY_POOL_SCROLL_LIMIT: int = 1000
 
 
 def _assume_utc(dt: datetime) -> datetime:
@@ -88,6 +111,99 @@ def _assume_utc(dt: datetime) -> datetime:
     return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt
 
 
+async def _warn_on_untrimmable_pool_residue(
+    memory_service,
+    project_id: str,
+    run_id: str,
+    *,
+    recon_pool: str,
+    trimmable: int,
+) -> int | None:
+    """Warn when the pool holds records this trim can no longer see.
+
+    :func:`enforce_summary_pool_cap` enumerates on
+    ``{'recon_pool': ..., 'kind': 'cycle_summary'}``. The ``kind`` constraint
+    is what stops a mis-tagged record from evicting a real mirror — but it
+    also means a record carrying ``recon_pool`` WITHOUT
+    ``kind='cycle_summary'`` is no longer enumerated, so it is never evicted
+    either. It is not covered by the protected-mirror guard, and no other
+    collector claims it. Before the ``kind`` constraint such a record was
+    trimmed; after it, it would accumulate with ZERO signal — which is the
+    unbounded pool growth tasks 1657/1831/2229 built this trim to prevent,
+    reintroduced in a shape nothing reports (reviewer finding robustness,
+    task 3041 amendment pass).
+
+    That shape is realistic, not theoretical: cycle_summary metadata is
+    LLM-supplied on the narrative write path, and
+    ``_apply_cycle_summary_metadata_tagging`` backfills ``run_id`` precisely
+    BECAUSE prompt compliance is not guaranteed — a write that lands
+    ``recon_pool`` (or has it auto-stamped from ``metadata.stage``) while
+    dropping ``kind`` produces exactly this residue.
+
+    So the narrowed delete filter stays and the pool gets an observability
+    backstop instead: one ``count_memories_by_metadata`` on the ``recon_pool``
+    tag ALONE. Anything in that count beyond what the narrowed enumeration
+    returned is untrimmable residue, and gets one WARNING naming the size.
+
+    Diagnostic-only and fully fail-safe — this must never change what the trim
+    does, only what it says:
+
+    - a ``memory_service`` without ``count_memories_by_metadata`` (the shape
+      several inline test fakes have) is skipped silently;
+    - a non-int result (an unspecced mock) is skipped silently;
+    - a raising count logs one WARNING and returns, since a blind backstop is
+      itself worth knowing about, but the trim proceeds regardless.
+
+    Returns:
+        The residue size when one was computed, ``0`` when the pool is clean,
+        or ``None`` when the check could not run.
+    """
+    counter = getattr(memory_service, 'count_memories_by_metadata', None)
+    if counter is None:
+        return None
+    try:
+        total = await counter(project_id=project_id, filters={'recon_pool': recon_pool})
+    except Exception:
+        logger.warning(
+            'reconciliation.enforce_summary_pool_cap: '
+            'untrimmable-residue count failed for project_id=%s recon_pool=%s; '
+            'the trim itself is unaffected, but mis-tagged pool residue is now unreported',
+            project_id,
+            recon_pool,
+            exc_info=True,
+            extra={'project_id': project_id, 'run_id': run_id, 'recon_pool': recon_pool},
+        )
+        return None
+    if not isinstance(total, int) or isinstance(total, bool):
+        return None
+
+    residue = total - trimmable
+    if residue <= 0:
+        return 0
+
+    logger.warning(
+        'reconciliation.enforce_summary_pool_cap: '
+        '%d record(s) tagged recon_pool=%s are NOT kind=%s in project_id=%s — '
+        'they are invisible to this trim and no other collector reaps them; '
+        'pool total=%d, trimmable=%d',
+        residue,
+        recon_pool,
+        _KIND_CYCLE_SUMMARY,
+        project_id,
+        total,
+        trimmable,
+        extra={
+            'project_id': project_id,
+            'run_id': run_id,
+            'recon_pool': recon_pool,
+            'pool_total': total,
+            'trimmable': trimmable,
+            'untrimmable_residue': residue,
+        },
+    )
+    return residue
+
+
 async def enforce_summary_pool_cap(
     memory_service,
     project_id: str,
@@ -97,22 +213,79 @@ async def enforce_summary_pool_cap(
     trim_source: str,
     cap: int,
 ) -> int:
-    """Trim the *recon_pool* pool to at most *cap* members.
+    """Trim the ``kind='cycle_summary'`` members of the *recon_pool* pool to at most *cap*.
 
-    Enumerates all Mem0 memories tagged ``{'recon_pool': recon_pool}`` via
+    Enumerates all Mem0 memories tagged
+    ``{'recon_pool': recon_pool, 'kind': 'cycle_summary'}`` via
     ``get_memories_by_metadata`` (deterministic Qdrant scroll — NOT semantic
-    search), sorts oldest-first by ``created_at``, then deletes the oldest
-    ``len - cap`` via parallel ``delete_memory`` calls.
+    search), sorts eviction-order-first, then deletes the first ``len - cap``
+    via parallel ``delete_memory`` calls.
+
+    **Scope note (task 3041):** despite the generic name this is
+    cycle-summary-specific — the ``kind`` constraint below means a record
+    tagged with this ``recon_pool`` but NOT ``kind='cycle_summary'`` is
+    neither enumerated nor evicted here. Nothing else collects such a record
+    either, so it would accumulate silently; instead it is counted and
+    reported by :func:`_warn_on_untrimmable_pool_residue`, which runs on every
+    call and is diagnostic-only.
 
     Best-effort posture (mirrors the original Stage 2
     ``_enforce_stage2_summary_pool_cap``):
     - Enumeration failure → logs WARNING, returns 0, does NOT raise.
     - Individual delete failure → logs WARNING, excluded from count.
 
-    Created_at ordering: uses the ``_assume_utc`` + ``datetime.fromisoformat``
-    convention. Members with missing/unparseable ``created_at`` sort LAST
-    (treated as newest/kept) so an undatable summary is never preferentially
-    deleted.
+    Every CONFIRMED-successful eviction leaves a queryable tombstone via
+    :func:`~fused_memory.reconciliation.mem0_tombstone.record_mem0_deletion_tombstones`
+    (task 3041), naming *trim_source* as the deleter and *run_id* as the
+    deleting run — deliberately distinct from the victim's own
+    ``metadata['run_id']``, which is also recorded. Written from the success
+    branch ONLY: a tombstone must never claim a record that is still alive.
+
+    **Retention contract (task 3041).** Eviction order is
+    ``(is_ledger_stamp, has_parseable_created_at, created_at)``:
+
+    1. ``record_type='narrative'`` records are evicted BEFORE any
+       ``record_type='ledger_stamp'`` record. The ledger_stamp mirror is the
+       deterministic copy an auditor correlates against
+       :meth:`~fused_memory.services.memory_service.MemoryService.get_cycle_summary_presence`;
+       the narrative is the disposable LLM-authored duplicate that task 2468
+       already tried to suppress. Letting a narrative evict a ledger_stamp is
+       what made all three of run 84eae9bd's anchors vanish together (recon
+       gate 165 / esc-165-1).
+    2. Within a class, oldest-first by ``created_at`` (``_assume_utc`` +
+       ``datetime.fromisoformat``).
+    3. Members with missing/unparseable ``created_at`` sort LAST *within their
+       own class* (treated as newest/kept), preserving the pre-existing
+       invariant that an undatable summary is never preferentially deleted.
+    ``record_type`` is read defensively from ``item.get('metadata', {})`` — a
+    member dict with no metadata must not raise.
+
+    Enumeration is bounded by :data:`SUMMARY_POOL_SCROLL_LIMIT`, passed
+    explicitly rather than inherited from ``get_memories_by_metadata``'s
+    default. With a cap of 2 the bound is unreachable in normal operation —
+    this trim is what holds the pool at ``cap`` every cycle — but it is a
+    correctness bound rather than a performance knob: at the limit the view is
+    potentially PARTIAL, Qdrant scroll order is not guaranteed oldest-first,
+    and the survivors would then be an arbitrary subset rather than the newest
+    ``cap``. Reaching it therefore logs a WARNING and still trims, instead of
+    silently returning a count that reads as "pool trimmed to cap".
+
+    The ``kind`` filter constraint is load-bearing, not decorative:
+    ``_apply_cycle_summary_metadata_tagging`` is additive-only and never
+    strips a caller-supplied ``recon_pool``, so filtering on ``recon_pool``
+    alone would let a mis-tagged non-summary record join this pool and either
+    be trimmed by it or evict a real mirror.
+
+    **This pool is cap-bounded BY DESIGN, and that is not a bug.** A mirror
+    older than the newest *cap* ledger_stamps IS expected to be evicted — the
+    Mem0 mirror is documented as a best-effort searchable copy, and the
+    AUTHORITATIVE record is the ``ReconLedgerStore`` ``cycle_summary`` row
+    (read via ``get_cycle_summary_presence``), which survives untouched. What
+    was actually broken was DISCOVERABILITY: a designed eviction was
+    indistinguishable from silent data loss. From task 3041 on, every
+    eviction leaves a queryable tombstone. Raising the cap would only move
+    the cliff and trade a bounded pool for the unbounded growth tasks
+    1657/1831/2229 built this trim to prevent — so do NOT raise it.
 
     Args:
         memory_service: Service with ``get_memories_by_metadata`` and
@@ -133,7 +306,13 @@ async def enforce_summary_pool_cap(
     try:
         members = await memory_service.get_memories_by_metadata(
             project_id=project_id,
-            filters={'recon_pool': recon_pool},
+            # kind is load-bearing, not decorative (task 3041):
+            # _apply_cycle_summary_metadata_tagging is ADDITIVE-only and never
+            # strips a caller-supplied recon_pool, so filtering on recon_pool
+            # alone would let a mis-tagged non-summary record join this cap-2
+            # pool — and then either be trimmed by it or evict a real mirror.
+            filters={'recon_pool': recon_pool, 'kind': _KIND_CYCLE_SUMMARY},
+            limit=SUMMARY_POOL_SCROLL_LIMIT,
         )
     except Exception:
         logger.warning(
@@ -145,18 +324,65 @@ async def enforce_summary_pool_cap(
         )
         return 0
 
+    # Diagnostic only — never changes what is deleted, and deliberately runs
+    # BEFORE the under-cap early return: mis-tagged residue accumulates
+    # whether or not this cycle has anything to trim.
+    await _warn_on_untrimmable_pool_residue(
+        memory_service,
+        project_id,
+        run_id,
+        recon_pool=recon_pool,
+        trimmable=len(members),
+    )
+
+    if len(members) >= SUMMARY_POOL_SCROLL_LIMIT:
+        # The enumeration may be a PARTIAL view of the pool, so the members
+        # this trim is about to sort are not necessarily the whole set and the
+        # survivors are not necessarily the newest `cap`. The trim still runs
+        # (bounding a runaway pool beats doing nothing), but a pool this size
+        # means something upstream is already broken — say so rather than
+        # returning a success count that reads as "pool trimmed to cap".
+        logger.warning(
+            'reconciliation.enforce_summary_pool_cap: '
+            'enumeration returned %d members at the scroll limit for '
+            'project_id=%s recon_pool=%s — the pool view may be PARTIAL and '
+            'the retained members may not be the newest %d; trimming anyway',
+            len(members),
+            project_id,
+            recon_pool,
+            cap,
+            extra={
+                'project_id': project_id,
+                'run_id': run_id,
+                'recon_pool': recon_pool,
+                'member_count': len(members),
+            },
+        )
+
     if len(members) <= cap:
         return 0
 
     def _sort_key(item: dict) -> tuple:
+        """Eviction order: narratives first, then oldest-first within a class.
+
+        Three-part key ``(is_ledger_stamp, has_parseable_created_at,
+        created_at)`` — ``sorted`` is ascending and the head of the list is
+        deleted, so ``False``/``0`` sorts first == is evicted first.
+        """
+        metadata = item.get('metadata')
+        record_type = (
+            metadata.get('record_type') if isinstance(metadata, dict) else None
+        )
+        is_ledger_stamp = record_type == CYCLE_SUMMARY_RECORD_TYPE_LEDGER_STAMP
+
         raw = item.get('created_at')
         if raw is None:
-            return (1, 0)
+            return (is_ledger_stamp, 1, 0)
         try:
             dt = _assume_utc(datetime.fromisoformat(raw))
-            return (0, dt)
+            return (is_ledger_stamp, 0, dt)
         except (ValueError, TypeError):
-            return (1, 0)
+            return (is_ledger_stamp, 1, 0)
 
     sorted_members = sorted(members, key=_sort_key)
     to_delete = sorted_members[: len(sorted_members) - cap]
@@ -179,6 +405,7 @@ async def enforce_summary_pool_cap(
     )
 
     success_count = 0
+    tombstone_victims = []
     for m, result in zip(to_delete, results, strict=True):
         if isinstance(result, Exception):
             logger.warning(
@@ -195,6 +422,50 @@ async def enforce_summary_pool_cap(
             )
         else:
             success_count += 1
+            # THIS is the path that consumed the three run-84eae9bd
+            # cycle_summary anchors reported by recon gate 165 / esc-165-1 —
+            # a designed cap-2 eviction that left no trace linking the
+            # deletion to its victim. The tombstone, NOT a retention change,
+            # is the fix for that finding's "no audit trail" signature: the
+            # eviction itself was correct and stays.
+            #
+            # Success branch ONLY: a tombstone must never claim a record that
+            # is still alive.
+            tombstone_victims.append(m)
+
+    if tombstone_victims:
+        # ONE ledger transaction for the whole trim, not one per eviction —
+        # each upsert is its own fsync'd commit on the single aiosqlite
+        # connection the rest of the cycle shares (reviewer finding
+        # efficiency, task 3041 amendment pass).
+        #
+        # record_mem0_deletion_tombstones is internally fail-safe (returns 0,
+        # never raises); this try/except is a second belt so nothing here can
+        # raise out of, or alter the count of, this trim — while still saying
+        # so out loud.
+        try:
+            await record_mem0_deletion_tombstones(
+                memory_service,
+                project_id,
+                tombstone_victims,
+                deleter=trim_source,
+                deleting_run_id=run_id,
+            )
+        except Exception:
+            logger.warning(
+                'reconciliation.enforce_summary_pool_cap: '
+                'tombstone batch raised for %d evicted record(s) in recon_pool=%s; '
+                'the evictions themselves succeeded and are counted',
+                len(tombstone_victims),
+                recon_pool,
+                exc_info=True,
+                extra={
+                    'project_id': project_id,
+                    'run_id': run_id,
+                    'recon_pool': recon_pool,
+                },
+            )
+
     return success_count
 
 

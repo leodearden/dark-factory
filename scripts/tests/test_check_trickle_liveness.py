@@ -4,6 +4,13 @@ plans/confusion-reduction-prd.md (PRD task epsilon, decision 7: quiet
 nights commit nothing, so liveness must probe systemd UNIT STATE, never
 git history).
 
+SCOPE: this probe answers "did the unit run" only. Whether the pipeline
+actually PRODUCED anything is a separate question answered by
+check_trickle_progress.py (see scripts/tests/test_check_trickle_progress.py,
+task 3340). This file is deliberately unchanged in substance: its passing
+unchanged is the proof that task 3340 altered no liveness semantics, which
+tasks 2587/2615 already depend on.
+
 Drives the script via subprocess with a FAKE `systemctl` shimmed onto PATH
 (answers `show -p ...` property lines from a JSON state file — mirrors
 scripts/tests/test_deploy_w5_recon_reliability.py /

@@ -396,6 +396,255 @@ class TestAcquireReleaseMergeVerifyFlock:
 
 
 # ---------------------------------------------------------------------------
+# Task 3081 step-1 (D8 / B13): lane_lock_holder_pids — kernel flock-holder probe.
+#
+# PRD: plans/warm-lane-infra-repatriation-prd.md §D8.  Incident anchor: reify
+# esc-5548-5, whose forensics read /proc/locks and inode-matched
+# `FLOCK ADVISORY WRITE 588232 07:1d:4300647613` against `_merge-verify.lock`.
+#
+# The holder-pgid rendezvous below CANNOT see that incident: an orphaned acquire
+# never reaches write_lock_holder_pgid (git_ops.py calls it only AFTER the
+# acquire returns), so the rendezvous is empty in exactly the leak case.  Kernel
+# truth is the only evidence available, hence this probe.
+#
+# Row shape verified live on this host:
+#     '82: FLOCK  ADVISORY  WRITE 1553455 103:08:14958524 0 EOF'
+# i.e. `<id>: <TYPE> <MODE> <RW> <PID> <MAJ:MIN:INO> <START> <END>`, where
+# MAJ/MIN are HEX and the inode is DECIMAL.  A process BLOCKED waiting on the
+# same inode appears as a distinct `-> FLOCK` row and is NOT a holder:
+#     '82: -> FLOCK  ADVISORY  WRITE 1555037 103:08:14958524 0 EOF'
+# ---------------------------------------------------------------------------
+
+
+def _locks_row(
+    lock_path: Path,
+    pid: int,
+    *,
+    row_id: int = 308,
+    kind: str = 'FLOCK',
+    waiter: bool = False,
+) -> str:
+    """Render one /proc/locks row for *lock_path*'s real device+inode.
+
+    Deriving MAJ:MIN:INO from a genuine ``os.stat`` (rather than hardcoding a
+    triple) is what makes the synthetic fixtures test the SAME matching the
+    kernel-truth cases exercise — a parser that mis-reads the hex/decimal split
+    cannot pass both.
+    """
+    import os as _os
+
+    st = _os.stat(lock_path)
+    triple = f'{_os.major(st.st_dev):02x}:{_os.minor(st.st_dev):02x}:{st.st_ino}'
+    arrow = '-> ' if waiter else ''
+    return f'{row_id}: {arrow}{kind}  ADVISORY  WRITE {pid} {triple} 0 EOF'
+
+
+class TestLaneLockHolderPids:
+    """lane_lock_holder_pids reports the pids holding an flock on a lock file."""
+
+    def test_synthetic_row_reports_holder_pid(self, tmp_path: Path):
+        """The verified real row shape parses to its pid, matched by dev+inode."""
+        from orchestrator.verify_cancel import lane_lock_holder_pids
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+        locks = tmp_path / 'locks'
+        locks.write_text(_locks_row(lock_path, 4242) + '\n')
+
+        assert lane_lock_holder_pids(lock_path, locks_path=locks) == [4242]
+
+    def test_blocked_waiter_rows_are_not_holders(self, tmp_path: Path):
+        """A `-> FLOCK` row is a process BLOCKED on the lock, not an owner.
+
+        Reporting a waiter as a holder would libel every process merely
+        contending for the lane lock — including, on the leak path, ourselves.
+        """
+        from orchestrator.verify_cancel import lane_lock_holder_pids
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+        locks = tmp_path / 'locks'
+        locks.write_text(
+            _locks_row(lock_path, 4242)
+            + '\n'
+            + _locks_row(lock_path, 4243, waiter=True)
+            + '\n'
+        )
+
+        assert lane_lock_holder_pids(lock_path, locks_path=locks) == [4242]
+
+    def test_non_flock_rows_on_same_inode_ignored(self, tmp_path: Path):
+        """POSIX/OFDLCK records do not conflict with flock(2), so they are not holders."""
+        from orchestrator.verify_cancel import lane_lock_holder_pids
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+        locks = tmp_path / 'locks'
+        locks.write_text(
+            _locks_row(lock_path, 5150, kind='POSIX')
+            + '\n'
+            + _locks_row(lock_path, 5151, kind='OFDLCK')
+            + '\n'
+            + _locks_row(lock_path, 4242)
+            + '\n'
+        )
+
+        assert lane_lock_holder_pids(lock_path, locks_path=locks) == [4242]
+
+    def test_rows_on_other_inodes_and_devices_ignored(self, tmp_path: Path):
+        """Only the probed file's own (dev, inode) counts — never another lane's."""
+        from orchestrator.verify_cancel import lane_lock_holder_pids
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+        other = tmp_path / 'other.lock'
+        other.write_text('x')  # distinct inode on the same device
+        locks = tmp_path / 'locks'
+
+        import os as _os
+
+        st = _os.stat(lock_path)
+        other_device = (
+            f'{_os.major(st.st_dev) + 1:02x}:{_os.minor(st.st_dev):02x}:{st.st_ino}'
+        )
+        locks.write_text(
+            _locks_row(other, 6001)
+            + '\n'
+            + f'310: FLOCK  ADVISORY  WRITE 6002 {other_device} 0 EOF\n'
+            + _locks_row(lock_path, 4242)
+            + '\n'
+        )
+
+        assert lane_lock_holder_pids(lock_path, locks_path=locks) == [4242]
+
+    def test_malformed_rows_are_tolerated(self, tmp_path: Path):
+        """A row this parser cannot understand is skipped, never raised on.
+
+        This probe runs inside acquire-timeout paths; a procfs shape change must
+        degrade to "no known holders", not break a merge.
+        """
+        from orchestrator.verify_cancel import lane_lock_holder_pids
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+        locks = tmp_path / 'locks'
+        locks.write_text(
+            '\n'
+            'garbage\n'
+            '311: FLOCK  ADVISORY  WRITE notapid 103:08:zzz 0 EOF\n'
+            '312: FLOCK\n'
+            + _locks_row(lock_path, 4242)
+            + '\n'
+        )
+
+        assert lane_lock_holder_pids(lock_path, locks_path=locks) == [4242]
+
+    def test_missing_locks_path_returns_empty(self, tmp_path: Path):
+        """A non-Linux host (no /proc/locks) yields no known holders, not an error."""
+        from orchestrator.verify_cancel import lane_lock_holder_pids
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+
+        assert lane_lock_holder_pids(lock_path, locks_path=tmp_path / 'nope') == []
+
+    def test_missing_lock_file_returns_empty(self, tmp_path: Path):
+        """A lock file that does not exist has no inode to match, hence no holders."""
+        from orchestrator.verify_cancel import lane_lock_holder_pids
+
+        locks = tmp_path / 'locks'
+        locks.write_text('313: FLOCK  ADVISORY  WRITE 4242 103:08:1 0 EOF\n')
+
+        assert lane_lock_holder_pids(tmp_path / 'absent.lock', locks_path=locks) == []
+
+    def test_duplicate_holder_pids_deduplicated_in_first_seen_order(self, tmp_path: Path):
+        """Repeated pids collapse; order is first-seen so the message reads stably."""
+        from orchestrator.verify_cancel import lane_lock_holder_pids
+
+        lock_path = tmp_path / 'lane.lock'
+        lock_path.touch()
+        locks = tmp_path / 'locks'
+        locks.write_text(
+            _locks_row(lock_path, 4242)
+            + '\n'
+            + _locks_row(lock_path, 4243, row_id=309)
+            + '\n'
+            + _locks_row(lock_path, 4242, row_id=310)
+            + '\n'
+        )
+
+        assert lane_lock_holder_pids(lock_path, locks_path=locks) == [4242, 4243]
+
+    def test_kernel_truth_real_flock_reports_this_process(self, tmp_path: Path):
+        """KERNEL TRUTH: against the DEFAULT /proc/locks, a real flock names us.
+
+        The synthetic cases above pin the parse; this one pins that the parse
+        actually agrees with the running kernel — the property the whole B13
+        detector rests on.
+        """
+        import fcntl
+        import os
+
+        from orchestrator.verify_cancel import lane_lock_holder_pids
+
+        lock_path = tmp_path / 'lane.lock'
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            assert os.getpid() in lane_lock_holder_pids(lock_path)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+        assert os.getpid() not in lane_lock_holder_pids(lock_path)
+
+    def test_kernel_truth_thread_taken_flock_reports_the_process_tgid(
+        self, tmp_path: Path
+    ):
+        """A flock taken on a WORKER THREAD is reported against the process tgid.
+
+        This is the decisive property: the B12 orphan is acquired inside
+        ``asyncio.to_thread``, i.e. on a worker thread whose ``native_id`` is
+        NOT ``os.getpid()``.  If /proc/locks reported the thread id instead, the
+        leak would be invisible to this probe and B13 would be unimplementable.
+        """
+        import fcntl
+        import os
+        import threading
+
+        from orchestrator.verify_cancel import lane_lock_holder_pids
+
+        lock_path = tmp_path / 'lane.lock'
+        observed: dict[str, object] = {}
+        holding = threading.Event()
+        release = threading.Event()
+
+        def _hold() -> None:
+            fd = os.open(lock_path, os.O_RDWR | os.O_CREAT)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                observed['native_id'] = threading.get_native_id()
+                holding.set()
+                release.wait(timeout=10)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+        worker = threading.Thread(target=_hold)
+        worker.start()
+        try:
+            assert holding.wait(timeout=10), 'worker thread never took the flock'
+            assert observed['native_id'] != os.getpid(), (
+                'the worker ran on the main thread, so this test would prove '
+                'nothing about thread-taken flocks'
+            )
+            assert os.getpid() in lane_lock_holder_pids(lock_path)
+        finally:
+            release.set()
+            worker.join(timeout=10)
+
+
+# ---------------------------------------------------------------------------
 # Task 2306 step-7: LOCK_HOLDER_PGID_KEY + write/read/remove_lock_holder_pgid —
 # fixed-key holder-pgid rendezvous.  A waiter cannot know the holder's
 # per-dispatch --request-id, so this uses a request-id-independent fixed key

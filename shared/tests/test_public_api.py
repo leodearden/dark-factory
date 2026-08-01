@@ -87,6 +87,7 @@ class TestModuleLevelAll:
             'ended_awaiting_background_for_session',
             'invoke_claude_agent',
             'invoke_with_cap_retry',
+            'is_server_error_status',
             'is_timed_out_with_progress',
             'is_zero_output_timeout',
             'read_transcript_records',

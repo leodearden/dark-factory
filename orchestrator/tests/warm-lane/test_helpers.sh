@@ -183,6 +183,62 @@ make_isolated_lane() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Lane-state record fixture factories
+#
+# Promoted here verbatim from test_warm_lane_audit.sh by task 3075 (PRD leaf γ)
+# so the gc suite builds records through the SAME factory the audit suite uses
+# rather than hand-copying a third mirror (INV-5, single-source-of-truth).
+#
+# The <mount> argument is the directory the state dir sits directly under:
+# warm-lane-audit.sh computes it as $MOUNT/.lane-state, and warm-lane-gc.sh
+# derives the same path from --worktrees-dir — so a gc-suite caller passes its
+# $X_WORKTREES and the record lands at $X_WORKTREES/.lane-state/<lane>.json.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# make_lane_state <mount> <lane> <state> [task_id] [branch]
+# Writes <mount>/.lane-state/<lane>.json in the EXACT byte shape dark-factory's
+# LaneRecord.to_json() emits (orchestrator/src/orchestrator/lane_lifecycle.py:
+# json.dumps(to_dict(), indent=2) -- dataclass field order state/task_id/title/
+# branch/seeded_from_sha/updated_at, unquoted `null` for a None field, and NO
+# trailing newline). Creates the state dir on first use.
+#
+# An omitted/empty task_id or branch is emitted as JSON `null`, not `""` --
+# that is the real producer's shape for an unassigned lane, and it is the
+# fixture the record-vs-branch pin fallback is asserted against.
+#
+# updated_at is a FIXED timestamp, not `date`: no fixture in this suite may
+# depend on wall-clock (DD5); the audit never reads this field.
+make_lane_state() {
+    local mount="$1" lane="$2" state="$3" task_id="${4:-}" branch="${5:-}"
+    local state_dir="$mount/.lane-state"
+    mkdir -p "$state_dir"
+    # Plain `if`, not `[ -n .. ] && ..`: an AND-list whose left side fails
+    # yields a non-zero list status, which `set -e` may treat as a function
+    # failure at the call site. Never worth the subtlety in fixture code.
+    local task_json='null' branch_json='null' title_json='null'
+    if [ -n "$task_id" ]; then
+        task_json="\"$task_id\""
+        title_json="\"lane fixture task $task_id\""
+    fi
+    if [ -n "$branch" ]; then
+        branch_json="\"$branch\""
+    fi
+    printf '{\n  "state": "%s",\n  "task_id": %s,\n  "title": %s,\n  "branch": %s,\n  "seeded_from_sha": null,\n  "updated_at": "2026-07-26T12:43:10.704531+00:00"\n}' \
+        "$state" "$task_json" "$title_json" "$branch_json" \
+        > "$state_dir/$lane.json"
+}
+
+# make_lane_state_raw <mount> <lane> <text>
+# Writes arbitrary bytes to <mount>/.lane-state/<lane>.json -- the corrupt- and
+# compact-record cases, which by construction cannot go through make_lane_state.
+make_lane_state_raw() {
+    local mount="$1" lane="$2" text="$3"
+    local state_dir="$mount/.lane-state"
+    mkdir -p "$state_dir"
+    printf '%s' "$text" > "$state_dir/$lane.json"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Shared-trash runtime detector
 #
 # _note_shared_trash_use is the RECORDER: a warm-lane suite calls it from inside

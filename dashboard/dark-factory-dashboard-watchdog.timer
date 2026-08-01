@@ -1,9 +1,21 @@
 [Unit]
-Description=Dashboard health check timer
+Description=Dashboard availability watchdog timer
 
 [Timer]
 OnBootSec=30
+# The tick cadence is load-bearing, not a free knob. The watchdog requires
+# FAIL_STREAK (=3) CONSECUTIVE failed probes before it restarts anything, so
+# 3 × 30s sets the sustained-outage detection latency at ~90s. Changing this
+# interval silently changes that latency in the same proportion; the pairing
+# is pinned by tests/scripts/test_dashboard_watchdog.py::
+# test_b6_timer_cadence_is_thirty_seconds.
 OnUnitActiveSec=30
 
+# RE-ARMING the installed timer is task 3289's job, NOT this file's. The
+# change that introduced scripts/dashboard-watchdog.py is repo-side only: no
+# `systemctl --user enable`/`start` was performed, so the running system still
+# reflects whatever state the 2026-07-30 incident left it in until 3289 lands.
+# This [Install] stanza is left exactly as it was — dropping it would disarm
+# the watchdog and leave the dashboard unsupervised while looking like a fix.
 [Install]
 WantedBy=timers.target

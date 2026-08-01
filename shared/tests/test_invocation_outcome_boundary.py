@@ -50,6 +50,7 @@ from shared.invocation_outcome import (
     Failure,
     InvocationOutcome,
     NearCap,
+    ServerError,
     ZeroOutputWedge,
     classify_invocation,
 )
@@ -196,6 +197,7 @@ _VARIANT_CLASSES: dict[str, type[InvocationOutcome]] = {
     'NearCap': NearCap,
     'AuthFailed': AuthFailed,
     'CliLocalError': CliLocalError,
+    'ServerError': ServerError,
     'ZeroOutputWedge': ZeroOutputWedge,
     'Failure': Failure,
 }

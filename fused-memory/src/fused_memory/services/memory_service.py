@@ -7,6 +7,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import os
 import re
 import time
 import uuid as uuid_mod
@@ -23,7 +24,11 @@ from fused_memory.backends.mem0_client import (
     Mem0Backend,
     split_managed_metadata,
 )
-from fused_memory.config.schema import FusedMemoryConfig
+from fused_memory.config.schema import FusedMemoryConfig, MemoryMetadataConfig
+from fused_memory.memory_metadata import (
+    MemoryMetadataValidationError,
+    validate_memory_metadata,
+)
 from fused_memory.middleware.mem0_update_storm_escalator import Mem0UpdateStormEscalator
 from fused_memory.models.enums import (
     GRAPHITI_PRIMARY,
@@ -58,6 +63,11 @@ from fused_memory.routing.classifier import WriteClassifier
 from fused_memory.routing.router import ReadRouter
 from fused_memory.server.storm_counter import StormCounter
 from fused_memory.services.durable_queue import DurableWriteQueue
+from fused_memory.services.memory_metadata_census import (
+    UnknownKeyStormDetector,
+    emit_schema_warnings,
+    file_unknown_key_storm_escalation,
+)
 from fused_memory.utils.async_utils import gather_collect, gather_or_raise
 from fused_memory.utils.task_naming import canonicalize_task_node_name
 
@@ -391,6 +401,91 @@ def _normalize_task_id_metadata(meta: dict) -> None:
     """
     if 'task_id' in meta and meta['task_id'] is not None:
         meta['task_id'] = str(meta['task_id'])
+
+
+async def _apply_memory_metadata_validation(
+    meta: dict,
+    *,
+    project_id: str,
+    agent_id: str | None,
+    config: MemoryMetadataConfig,
+    storm_detector: UnknownKeyStormDetector,
+    project_root: str,
+) -> None:
+    """Validate the Mem0 metadata vocabulary at the write boundary, in place.
+
+    Task 3195 (leaf β of ``docs/prds/memory-metadata-vocabulary.md``).  The
+    third of this module's shared in-place metadata helpers, alongside
+    :func:`_normalize_task_id_metadata` and
+    :func:`_apply_cycle_summary_metadata_tagging`, and shared by
+    ``add_memory`` and ``add_system_record`` for the same reason the
+    task-2222 amendment made the cycle-summary tagging shared: PRD D8/§2 pin
+    enforcement at the SERVICE seam precisely because ``add_system_record``
+    is a second write path that a tools-layer validator would leak past.
+    Two call sites with drifting behaviour would reopen that hole.
+
+    Discharges three obligations:
+
+    1. **Normalize + shape-check** via ``validate_memory_metadata`` (the only
+       in-place mutation is ``supersedes`` scalar→list, PRD D2).
+    2. **Census** every violation, fatal or not, so warn-mode leaves a trace.
+    3. **Reject** — but ONLY when ``enforce`` is on AND at least one
+       violation is fatal.  Unknown keys are never fatal, so flipping
+       ``enforce`` cannot turn the 1,627-key long tail into an outage.
+
+    The enforce flags are read PER CALL off the shared config object rather
+    than captured, so a config edit takes effect on the next write.
+
+    Raises :class:`MemoryMetadataValidationError` when enforcing.  Everything
+    else here — the census line, the storm detector, the escalation filing —
+    is strictly best-effort and structurally cannot raise, because it runs on
+    the live memory write path where a raise would fail the write because the
+    *complaint about* the write failed.
+
+    ASYNC ON PURPOSE — do not re-inline the escalation hop.  Validation,
+    census and detection are pure CPU and stay inline, but
+    ``file_unknown_key_storm_escalation`` does blocking filesystem I/O
+    (``EscalationQueue`` construction, a queue-directory scan, a durable
+    fsync-flushed write).  Called directly from these coroutines it would run
+    that I/O ON the event loop and stall every other concurrent memory write
+    for its duration.  The ported precedent
+    (``middleware/candidate_key_escalation``) is invoked from a synchronous
+    SQLite-migration path, so its never-raises contract transfers but its
+    sync-context assumption does not.  ``asyncio.to_thread`` is awaited rather
+    than fire-and-forgotten so the call can never outlive the write or be
+    dropped by task GC; it yields the loop, which is the property that
+    matters.
+    """
+    violations = validate_memory_metadata(
+        meta, enforce_kind_registry=config.enforce_kind_registry
+    )
+    if not violations:
+        return
+
+    emit_schema_warnings(violations, project_id=project_id, agent_id=agent_id)
+
+    unknown_keys = [v.key for v in violations if v.code == 'unknown_key']
+    if unknown_keys and storm_detector.record(project_id, agent_id, unknown_keys):
+        if project_root:
+            await asyncio.to_thread(
+                file_unknown_key_storm_escalation,
+                project_root,
+                project_id=project_id,
+                agent_id=agent_id,
+                keys=unknown_keys,
+            )
+        else:
+            # No configured taskmaster.project_root means no project queue to
+            # file into. The census lines are already out, so the signal is
+            # not lost — only the escalation.
+            logger.debug(
+                'memory_metadata: unknown-key storm from project_id=%r '
+                'agent_id=%r but no project_root is configured; not escalating',
+                project_id, agent_id,
+            )
+
+    if config.enforce and any(v.fatal for v in violations):
+        raise MemoryMetadataValidationError([v for v in violations if v.fatal])
 
 
 def _apply_cycle_summary_metadata_tagging(
@@ -795,6 +890,29 @@ class MemoryService:
         # Process-start baselines for uptime reporting
         self._started_at: datetime = datetime.now(UTC)
         self._start_monotonic: float = time.monotonic()
+        # Mem0 metadata unknown-key storm detector (task 3195, leaf β).
+        # Constructed ONCE so warn counts survive across writes but never leak
+        # between processes; a per-write detector would reset its window every
+        # time and could never reach the threshold, leaving the escape hatch
+        # as dead code that still looked wired up. This is also why the two
+        # storm-tuning config leaves are restart-only rather than
+        # hot-reloadable — see MemoryMetadataConfig's docstring.
+        self._metadata_storm_detector = UnknownKeyStormDetector(
+            threshold=config.memory_metadata.unknown_key_storm_threshold,
+            window_seconds=config.memory_metadata.unknown_key_storm_window_seconds,
+        )
+
+    def _memory_metadata_project_root(self) -> str:
+        """Project root the unknown-key storm escalation would be filed into.
+
+        Reuses the established resolution (``config.taskmaster.project_root``
+        or empty, see ``reconciliation/harness.py`` and ``server/main.py``)
+        rather than introducing a second notion of "this project's root".
+        Returns ``''`` when unconfigured, which the caller treats as
+        "census only, do not escalate" — there is no queue to file into.
+        """
+        raw = self.config.taskmaster.project_root if self.config.taskmaster else ''
+        return os.path.expanduser(raw) if raw else ''
 
     def set_event_buffer(self, buffer: EventBuffer) -> None:
         """Wire the reconciliation event buffer into the service."""
@@ -2250,6 +2368,27 @@ class MemoryService:
         # treatment. See _apply_cycle_summary_metadata_tagging's docstring.
         _apply_cycle_summary_metadata_tagging(meta, causation_id, project_id=project_id)
 
+        # Mem0 metadata vocabulary validation (task 3195, leaf β). Placement is
+        # load-bearing at BOTH ends:
+        #   AFTER the two tagging helpers above, so category/recon_pool/run_id
+        #   are already in `meta` and get classified as server-stamped rather
+        #   than censused as unknown keys (the alternative is a second copy of
+        #   the server-stamped key list — an INV-5 violation);
+        #   BEFORE the write_graphiti/write_mem0 branching below, the
+        #   write-ahead mem0 intent, and every backend call, so a rejection can
+        #   never leave a pending intent for recover_mem0_intents to reconcile
+        #   or a half-written Graphiti twin. Being before the branching is also
+        #   what makes this cover Graphiti-primary writes, which never reach
+        #   Mem0 at all — V1 covers the seam, not just the Mem0 branch.
+        await _apply_memory_metadata_validation(
+            meta,
+            project_id=project_id,
+            agent_id=agent_id,
+            config=self.config.memory_metadata,
+            storm_detector=self._metadata_storm_detector,
+            project_root=self._memory_metadata_project_root(),
+        )
+
         write_graphiti = (
             resolved_category in GRAPHITI_PRIMARY or dual_write
         )
@@ -2599,6 +2738,22 @@ class MemoryService:
         # system-record cycle_summary must not go untagged just because it
         # bypassed add_memory.
         _apply_cycle_summary_metadata_tagging(meta, causation_id, project_id=project_id)
+
+        # Same vocabulary validation add_memory applies (task 3195, leaf β).
+        # PRD D8/§2 name add_system_record as the second unguarded write path
+        # that a tools-layer validator would leak past, so it shares the very
+        # same helper rather than getting a parallel implementation that could
+        # drift. Placed after the tagging helpers and before the
+        # _journaled_backend_call below, for the reasons spelled out at
+        # add_memory's call site.
+        await _apply_memory_metadata_validation(
+            meta,
+            project_id=project_id,
+            agent_id=agent_id,
+            config=self.config.memory_metadata,
+            storm_detector=self._metadata_storm_detector,
+            project_root=self._memory_metadata_project_root(),
+        )
 
         mem0_result = None
         mem0_ids: list[str] = []
@@ -3417,6 +3572,105 @@ class MemoryService:
                 content = value
                 break
         return {'id': memory_id, 'content': content, 'metadata': payload}
+
+    async def get_mem0_deletion_tombstone(
+        self,
+        project_id: str,
+        memory_id: str,
+    ) -> dict | None:
+        """Why a recon sweep deleted Mem0 record *memory_id*, or ``None``.
+
+        Reads the ``mem0_tombstone`` ledger row written by
+        :func:`~fused_memory.reconciliation.mem0_tombstone.record_mem0_deletion_tombstone`
+        after every confirmed recon-initiated Mem0 delete, and returns its
+        decoded payload: which sweep took the record (``deleter``), which run
+        performed the deletion (``deleting_run_id``), when (``deleted_at``),
+        and the victim's identifying metadata (``kind``, ``record_type``,
+        ``source``, ``recon_pool``, ``run_id``, ``created_at``).
+
+        The row's own timestamps are added as ``tombstone_created_at`` /
+        ``tombstone_expires_at`` rather than merged bare, because the payload
+        already carries a ``created_at`` — the VICTIM's, i.e. how old the
+        evicted record was — while the row's is when the tombstone was
+        written. Flattening them together would clobber the former with the
+        latter, reproducing exactly the kind of run/timestamp conflation that
+        made the original recon-gate-165 report unreadable.
+
+        **Strictly additive** (task 3041): this is a sibling of
+        :meth:`get_memory_by_id`, which is deliberately left untouched. Its
+        ``None``-on-miss contract is load-bearing for at least three
+        in-process callers (``reconciliation/citation_verifier.py``,
+        reconciliation stage1, and ``server/recon_report.py``'s
+        ``cite_memory``), all of which branch on ``is None``; widening it to
+        return a dict-with-tombstone would silently flip every one of them.
+        The tombstone is instead surfaced at the MCP boundary, on
+        ``server/tools.py``'s ``get_memory_by_id`` not-found branch, so the
+        exact query that dead-ended for the audit now self-explains.
+
+        Fail-safe throughout — a tombstone is diagnostic, so a problem
+        reading one must never be worse than not having it. No ledger wired
+        (``recon_ledger_enabled=False``, same
+        ``getattr(self, 'recon_ledger', None)`` precedent as
+        :meth:`get_cycle_summary_presence`), no row, a payload that is
+        undecodable or not a JSON object, and a *raising* store read (ledger
+        not initialized, SQLite locked/corrupt, aiosqlite thread error) all
+        return ``None``.
+
+        The two FAULT cases — malformed payload and a raising store read —
+        each log one WARNING (the latter with ``exc_info``); the two ordinary
+        states (no ledger, no row) log nothing. That split is the point: a
+        broken tombstone store must not be indistinguishable from "no
+        tombstone exists", which is the same undiscoverability class task 3041
+        was filed to fix (loud-over-silent / no-silent-fail-soft, see
+        ``docs/legibility/design-invariants.md``). The store guard lives HERE
+        rather than only at the MCP boundary so that "fail-safe throughout"
+        holds for every caller, not just the one that happens to wrap it
+        (reviewer finding robustness, task 3041 amendment pass).
+
+        ``None`` therefore means "no readable tombstone", which covers both
+        "never deliberately deleted" and "the tombstone expired past
+        :data:`~fused_memory.reconciliation.mem0_tombstone.MEM0_TOMBSTONE_TTL_DAYS`".
+        A tombstone proves deliberate deletion; its absence does not prove
+        the converse.
+        """
+        ledger = getattr(self, 'recon_ledger', None)
+        if ledger is None:
+            return None
+        try:
+            record = await ledger.get_mem0_tombstone(project_id, memory_id)
+        except Exception:
+            # A FAULT, not an ordinary state — the caller cannot tell this
+            # apart from "no tombstone exists" by the return value alone, so
+            # it must be loud in the log even though the return degrades.
+            logger.warning(
+                'get_mem0_deletion_tombstone: tombstone store read FAILED for '
+                'memory_id=%s in project=%s; reporting no tombstone',
+                memory_id,
+                project_id,
+                exc_info=True,
+                extra={'project_id': project_id, 'memory_id': memory_id},
+            )
+            return None
+        if record is None:
+            return None
+        try:
+            payload = json.loads(record.payload_json)
+        except (TypeError, ValueError):
+            payload = None
+        if not isinstance(payload, dict):
+            logger.warning(
+                'get_mem0_deletion_tombstone: unreadable tombstone payload for '
+                'memory_id=%s in project=%s; reporting no tombstone',
+                memory_id,
+                project_id,
+                extra={'project_id': project_id, 'memory_id': memory_id},
+            )
+            return None
+        return {
+            **payload,
+            'tombstone_created_at': record.created_at,
+            'tombstone_expires_at': record.expires_at,
+        }
 
     # ------------------------------------------------------------------
     # Read: cycle_summary ledger presence (task 2436, τ1)

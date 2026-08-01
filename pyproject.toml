@@ -16,7 +16,7 @@ members = [
 ]
 
 [tool.pyright]
-include = ["conftest.py"]
+include = ["conftest.py", "df_pytest_isolation.py"]
 extraPaths = [
     "cockpit/src",
     "dashboard/src",

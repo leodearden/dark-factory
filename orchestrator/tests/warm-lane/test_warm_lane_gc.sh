@@ -17,7 +17,10 @@
 #       reclaim missing --worktrees-dir or --base-target; --status-cmd is now
 #       an unknown flag (A8) — the Tier-3 machinery was removed (task 5326);
 #       a MISSING sibling scripts/lib_live_refs.sh fails LOUD with exit 2
-#       (wiring error) before argv is parsed (A9, task 5572 review)
+#       (wiring error) before argv is parsed (A9, task 5572 review); the same
+#       contract for the new sibling scripts/lib_lane_state.sh, with
+#       lib_live_refs.sh PRESENT so A9's guard cannot account for it
+#       (A10, task 3075)
 #   B — reset a divergent FREE lane (seed-script invoked with resolved gen path)
 #   C — remove an orphaned-landed clean worktree
 #   D — always-reclaim (task 5326): a DIRTY POOL LANE is now RECLAIMED (reset),
@@ -25,8 +28,10 @@
 #   E — always-reclaim (task 5326): an AHEAD-OF-MAIN POOL LANE is now RECLAIMED
 #       (no --status-cmd wired — terminality- AND ahead-independent), while an
 #       AHEAD-OF-MAIN ORPHAN stays preserved by Pass-2 _is_reclaimable
-#   F — preserve a lane with a live-consumer lock — the SOLE remaining Pass-1
-#       preserve gate, holding even for a lane that is ALSO dirty+ahead (5326)
+#   F — preserve a lane with a live-consumer lock — ONE of Pass 1's preserve
+#       gates, holding even for a lane that is ALSO dirty+ahead (5326). It was
+#       the SOLE gate when 5326 collapsed the Tier-3 machinery; 5572 added the
+#       /proc live-reference gate and 3075 the durable-record gate (Block S)
 #   G — combined PRD δ signal: pool lanes (clean + dirty) reset, orphan removed,
 #       ahead orphan + live-consumer lane + protect-glob preserved + summary line
 #   K — disk-pressure fast-path: rm -rf target/ instead of an alpha reseed clone
@@ -71,6 +76,20 @@
 #       basename is merely a name-prefix of it. Lives here now because the
 #       boundary matcher is called by gc.sh directly; GREEN on arrival — its
 #       job is to keep the regression pinned at the right layer, not to go red
+#   S — the DURABLE LANE RECORD is Pass 1's reclaimability gate (task 3075,
+#       reify esc-5334-6): a lane whose <worktrees-dir>/.lane-state/<lane>.json
+#       reads `assigned`/`in_use` is preserved, with a FREE flock and NO
+#       --extra-protect-glob — the dark-factory ε shape. S-basic pins the
+#       preserve and that a `released` lane still reclaims; S-reasons pins the
+#       reason vocabulary (the raw state stays visible; a null task_id never
+#       renders a dangling id), the GATE ORDER (record before the /proc walk),
+#       and the appended preserved_assigned= counter; S-fallback pins that the
+#       task-5572 /proc scan is INHERITED as the recordless fallback (PRD D7),
+#       that released/quarantined/corrupt all fall OPEN, and that a corrupt
+#       record is loud while the ordinary recordless case stays quiet;
+#       S-toctou pins PLACEMENT — a lane assigned MID-PASS is still preserved,
+#       so the read cannot be hoisted into an up-front classification pass
+#       without going RED (GREEN on arrival, like Block R)
 #
 # The former Tier-3 blocks I/J/L (terminal-task reclaim + Pass-2 boundary,
 # task 5167) were deleted when task 5326 collapsed the Pass-1 gate to the
@@ -304,6 +323,36 @@ assert "A9: missing sibling lib_live_refs.sh exits 2 (wiring error, not runtime 
     test "$A9_RC" -eq 2
 assert "A9: stderr names the missing library (fail LOUD, not silent)" \
     bash -c 'printf "%s\n" "$1" | grep -qF "lib_live_refs.sh not found"' _ "$A9_ERR"
+
+# A10: the SAME contract for the new sibling scripts/lib_lane_state.sh (task
+# 3075). A silently-absent lane-state reader degrades reclaim back to exactly
+# the `FREE ≈ flock-free` approximation this leaf removes — invisible, and the
+# defect reify esc-5334-6 exists to close — so the guard that enforces its
+# presence cannot itself be untested.
+#
+# The fixture copies BOTH gc.sh AND lib_live_refs.sh, deliberately withholding
+# only lib_lane_state.sh. Copying lib_live_refs.sh is what makes the assertion
+# SPECIFIC: without it, A9's guard would fire first and A10 would prove nothing
+# about the new dependency.
+A10_DIR="$(mktemp -d /tmp/test-gc-a10-XXXXXX)"
+_TMPDIRS+=("$A10_DIR")
+cp "$SCRIPT" "$A10_DIR/warm-lane-gc.sh"
+cp "$WARM_LANE_SCRIPTS_DIR/lib_live_refs.sh" "$A10_DIR/lib_live_refs.sh"
+assert "A10: fixture — the copy HAS lib_live_refs.sh and has NO lib_lane_state.sh" \
+    bash -c '[ -f "$1/lib_live_refs.sh" ] && [ ! -e "$1/lib_lane_state.sh" ]' _ "$A10_DIR"
+A10_RC=0
+A10_ERR="$(bash "$A10_DIR/warm-lane-gc.sh" --help 2>&1 >/dev/null)" || A10_RC=$?
+# --help normally exits 0, so a 2 here also pins that the guard fires BEFORE
+# argv is parsed — the same ordering property A9 asserts.
+assert "A10a: missing sibling lib_lane_state.sh exits 2 (wiring error, not runtime 1)" \
+    test "$A10_RC" -eq 2
+# The VERBATIM fragment already registered in
+# orchestrator/tests/test_warm_lane_scripts_shipped.py FAIL_LOUD_FRAGMENTS,
+# established by warm-lane-audit.sh's guard in task 3074 — so the
+# shipped-and-wired contract test covers gc.sh's new guard with no change to its
+# assertion data.
+assert "A10b: stderr names the missing library with the registered fragment" \
+    bash -c 'printf "%s\n" "$1" | grep -qF "lib_lane_state.sh not found next to"' _ "$A10_ERR"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Block B — reset a divergent FREE lane
@@ -571,15 +620,19 @@ assert "E5: stderr mentions unlanded/ahead-of-main preservation (orphan)" \
     bash -c 'printf "%s\n" "$1" | grep -qiE "unlanded|ahead|preserving"' _ "$ERR_OUT"
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Block F — live-consumer flock is the SOLE remaining Pass-1 preserve gate
+# Block F — the live-consumer flock is Pass 1's FIRST preserve gate
 # _lane-4: clean+landed, but a live consumer holds its flock — preserved.
 # _lane-5: dirty AND ahead-of-main AND a live consumer holds its flock — STILL
 # preserved. Under always-reclaim (task 5326) a dirty+ahead lane WOULD be
 # reclaimed if its flock were free (Blocks D/E); the flock alone keeps _lane-5,
-# isolating the live-consumer flock as the only Pass-1 preserve gate that survives.
+# isolating it from the dirty/ahead predicates this block's fixtures also carry.
+# It is no longer the SOLE Pass-1 gate — task 5572 added the /proc
+# live-reference gate (Block P) and task 3075 the durable lane-record gate
+# (Block S). Every lane here is recordless, so those two fall open and this
+# block still isolates the flock.
 # ──────────────────────────────────────────────────────────────────────────────
 echo ""
-echo "--- Block F: live-consumer flock is the sole Pass-1 preserve gate ---"
+echo "--- Block F: live-consumer flock is Pass 1's first preserve gate ---"
 
 F_ROOT="$(mktemp -d /tmp/test-gc-f-XXXXXX)"
 _TMPDIRS+=("$F_ROOT")
@@ -652,7 +705,8 @@ assert "F3: live-consumer lane _lane-4 divergent marker intact" \
     test -f "$F_WORKTREES/_lane-4/target/DIVERGENT_MARKER"
 assert "F4: stderr mentions live consumer preservation" \
     bash -c 'printf "%s\n" "$1" | grep -qiE "live.consumer|locked|preserving|consumer"' _ "$ERR_OUT"
-# _lane-5 (dirty+ahead, locked) STILL NOT reset — the flock is the sole gate.
+# _lane-5 (dirty+ahead, locked) STILL NOT reset — the flock alone accounts for
+# it (both other Pass-1 gates fall open: no record, no process reference).
 assert "F5: dirty+ahead live-consumer lane _lane-5 seed-script NOT invoked (flock wins)" \
     bash -c '[ ! -f "$1" ] || ! grep -q "_lane-5" "$1"' _ "$F_SEED_LOG"
 assert "F6: dirty+ahead live-consumer lane _lane-5 divergent marker intact" \
@@ -1923,6 +1977,354 @@ assert "R6: stderr does NOT claim a process reference for _lane-1" \
 kill "$R_HELPER_PID" 2>/dev/null || true
 wait "$R_HELPER_PID" 2>/dev/null || true
 _BGPIDS=()  # clear so EXIT cleanup does not re-kill a possibly-reused PID
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Block S — the durable lane record is the Pass-1 reclaimability gate (task 3075)
+# ──────────────────────────────────────────────────────────────────────────────
+# ROOT CAUSE (reify esc-5334-6): gc.sh's header claimed "FREE/idle ≈ no live
+# consumer holding the lane flock". That approximation is FALSE for most of an
+# ASSIGNED lane's life — the inv.2 flock is held only across the acquire reseed
+# and across run_scoped_verification, never across the implement phase — so task
+# 5326's always-reclaim, written for "a FREE pool lane", fires on lanes that
+# dark-factory has assigned to a live task.
+#
+# FIX: consult dark-factory's OWN durable lane record —
+# <worktrees-dir>/.lane-state/<lane>.json, read per lane through
+# lib_lane_state.sh — inside the Pass-1 loop, under the flock the loop already
+# holds. Every sub-case below is invoked DF-FAITHFULLY: no --extra-protect-glob,
+# and every <lane>.lock FREE, so neither the wrapper CSV nor the flock gate can
+# account for any preservation observed.
+#
+# The state dir is DOT-PREFIXED and gc.sh's candidate loop is
+# `"$WORKTREES_DIR"/*/` with no `shopt -s dotglob` anywhere, so `.lane-state/`
+# is never enumerated as a candidate and cannot inflate `preserved=`.
+echo ""
+echo "--- Block S: the durable lane record gates Pass-1 reclaim (task 3075) ---"
+
+# ── S-basic: an ASSIGNED lane is preserved from the dark-factory entry point ──
+# _lane-5 carries an `assigned` record naming task 5334 (the esc-5334-6 lane);
+# _lane-1 carries a `released` record. Both are clean+landed with a FREE flock,
+# so under the pre-γ rule BOTH would be reset. Discrimination, not blanket
+# over-preserve.
+S_ROOT="$(mktemp -d /tmp/test-gc-s-XXXXXX)"
+_TMPDIRS+=("$S_ROOT")
+
+S_REPO="$S_ROOT/repo"
+S_WORKTREES="$S_ROOT/worktrees"
+S_BASE="$S_ROOT/base"
+mkdir -p "$S_WORKTREES" "$S_BASE"
+
+make_repo "$S_REPO"
+
+mkdir -p "$S_BASE/target.gen.1"
+touch "$S_BASE/target.gen.1.lock"
+ln -sfn "$S_BASE/target.gen.1" "$S_BASE/target"
+
+for _s_name in _lane-1 _lane-5; do
+    git -C "$S_REPO" worktree add -q "$S_WORKTREES/$_s_name"
+    mkdir -p "$S_WORKTREES/$_s_name/target"
+    touch "$S_WORKTREES/$_s_name/target/DIVERGENT_MARKER"
+done
+
+# Records built through the SHARED factory (tests/warm-lane/test_helpers.sh),
+# the same one warm-lane-audit.sh's suite uses — no third hand-copied mirror.
+make_lane_state "$S_WORKTREES" _lane-5 assigned 5334
+make_lane_state "$S_WORKTREES" _lane-1 released
+
+S_SEED_LOG="$S_ROOT/seed_calls.log"
+S_SEED_STUB="$S_ROOT/seed_stub.sh"
+_seed_stub_body > "$S_SEED_STUB"
+chmod +x "$S_SEED_STUB"
+export SEED_LOG="$S_SEED_LOG"
+
+run_helper reclaim \
+    --worktrees-dir "$S_WORKTREES" \
+    --base-target "$S_BASE/target" \
+    --seed-script "$S_SEED_STUB" \
+    --main-ref main
+
+assert "S1: exit 0" test "$RC" -eq 0
+assert "S2: assigned _lane-5 seed-script NOT invoked (preserved, not reset)" \
+    bash -c '[ ! -f "$1" ] || ! grep -q "_lane-5" "$1"' _ "$S_SEED_LOG"
+assert "S3: assigned _lane-5 divergent marker INTACT (FREE flock, no --extra-protect-glob)" \
+    test -f "$S_WORKTREES/_lane-5/target/DIVERGENT_MARKER"
+# The PRD/task-pinned reason string. Asserted with grep -F on the exact prefix so
+# a later suffix (the raw state, step-3) keeps this substring match green.
+assert "S4: stderr names the record-driven preserve reason for _lane-5" \
+    bash -c 'printf "%s\n" "$1" | grep -qF "preserving _lane-5: assigned to task 5334"' _ "$ERR_OUT"
+assert "S5: released _lane-1 still reset (fail-open on a non-assigned record)" \
+    bash -c 'test -f "$1" && grep -q "_lane-1" "$1" && [ ! -f "$2" ]' _ \
+    "$S_SEED_LOG" "$S_WORKTREES/_lane-1/target/DIVERGENT_MARKER"
+assert "S6: summary reports reset=1 (only the released lane was reclaimed)" \
+    bash -c 'printf "%s\n" "$1" | grep -qE "reset=1"' _ "$OUT"
+
+# ── S-reasons: the reason vocabulary, the gate ORDER, and the counter ─────────
+# Three preserved lanes in ONE pass:
+#   _lane-6  state `in_use` — leaf δ has no writer yet, so the record is
+#            hand-written here; this is what makes the raw state's visibility
+#            testable NOW rather than after δ lands.
+#   _lane-7  state `assigned` with task_id JSON `null` — the record must never
+#            render a dangling "assigned to task " with an empty id.
+#   _lane-8  state `assigned` AND a live process reference. It would be
+#            preserved either way, so the assertion is about ATTRIBUTION: the
+#            RECORD must be the gate that fired, which is what pins the ~1ms
+#            read ahead of the ~1.9s /proc walk.
+SR_ROOT="$(mktemp -d /tmp/test-gc-sr-XXXXXX)"
+_TMPDIRS+=("$SR_ROOT")
+
+SR_REPO="$SR_ROOT/repo"
+SR_WORKTREES="$SR_ROOT/worktrees"
+SR_BASE="$SR_ROOT/base"
+mkdir -p "$SR_WORKTREES" "$SR_BASE"
+
+make_repo "$SR_REPO"
+
+mkdir -p "$SR_BASE/target.gen.1"
+touch "$SR_BASE/target.gen.1.lock"
+ln -sfn "$SR_BASE/target.gen.1" "$SR_BASE/target"
+
+for _sr_name in _lane-6 _lane-7 _lane-8; do
+    git -C "$SR_REPO" worktree add -q "$SR_WORKTREES/$_sr_name"
+    mkdir -p "$SR_WORKTREES/$_sr_name/target"
+    touch "$SR_WORKTREES/$_sr_name/target/DIVERGENT_MARKER"
+done
+
+make_lane_state "$SR_WORKTREES" _lane-6 in_use 5551
+make_lane_state "$SR_WORKTREES" _lane-7 assigned
+make_lane_state "$SR_WORKTREES" _lane-8 assigned 5416
+
+# Live cwd holder under _lane-8/target, established causally (technique R — no
+# wall-clock sleep), exactly as P-basic does.
+SR_READY="$SR_ROOT/lane8-holder.ready"
+( cd "$SR_WORKTREES/_lane-8/target" && touch "$SR_READY" && exec sleep 300 ) &
+SR_HELPER_PID=$!
+_BGPIDS+=("$SR_HELPER_PID")
+_wait_for_reader_lock "$SR_READY" 30
+
+SR_SEED_LOG="$SR_ROOT/seed_calls.log"
+SR_SEED_STUB="$SR_ROOT/seed_stub.sh"
+_seed_stub_body > "$SR_SEED_STUB"
+chmod +x "$SR_SEED_STUB"
+export SEED_LOG="$SR_SEED_LOG"
+
+run_helper reclaim \
+    --worktrees-dir "$SR_WORKTREES" \
+    --base-target "$SR_BASE/target" \
+    --seed-script "$SR_SEED_STUB" \
+    --main-ref main
+
+assert "S7: in_use _lane-6 preserved (seed NOT invoked, marker intact)" \
+    bash -c '([ ! -f "$1" ] || ! grep -q "_lane-6" "$1") && [ -f "$2" ]' _ \
+    "$SR_SEED_LOG" "$SR_WORKTREES/_lane-6/target/DIVERGENT_MARKER"
+# The RAW state stays visible in the reason, so `assigned` and `in_use` are
+# distinguishable in dark-factory's logs the moment leaf δ starts writing the
+# latter — leaf ε depends on that distinction.
+assert "S8: stderr surfaces the RAW state for _lane-6 (in_use, not flattened to assigned)" \
+    bash -c 'printf "%s\n" "$1" | grep -qF "preserving _lane-6: assigned to task 5551 (state=in_use)"' _ "$ERR_OUT"
+assert "S9: a null task_id gets its own wording for _lane-7" \
+    bash -c 'printf "%s\n" "$1" | grep -qF "preserving _lane-7: assigned, no task id in record"' _ "$ERR_OUT"
+assert "S9b: ...and NEVER renders a dangling 'assigned to task ' with an empty id" \
+    bash -c '! printf "%s\n" "$1" | grep -qE "preserving _lane-7: assigned to task( |$)"' _ "$ERR_OUT"
+# GATE ORDER. _lane-8 is both assigned AND live-referenced; the record must be
+# the gate that fires, ahead of the walk.
+assert "S10: _lane-8 preserved by the RECORD gate" \
+    bash -c 'printf "%s\n" "$1" | grep -qF "preserving _lane-8: assigned to task 5416"' _ "$ERR_OUT"
+assert "S10b: ...and NOT attributed to the /proc live-reference gate (record is checked first)" \
+    bash -c '! printf "%s\n" "$1" | grep -qF "preserving _lane-8: live consumer (process reference)"' _ "$ERR_OUT"
+# The full adjacent triple pins BOTH the new field's value AND that it was
+# APPENDED after preserved_live_ref rather than interposed — the header's stated
+# rule, and what keeps K5's and P-fd8's `preserved=1 preserved_live_ref=1` greps
+# green.
+assert "S11: summary APPENDS preserved_assigned=3 after preserved_live_ref (never interposed)" \
+    bash -c 'printf "%s\n" "$1" | grep -qE "preserved=3 preserved_live_ref=0 preserved_assigned=3"' _ "$OUT"
+
+kill "$SR_HELPER_PID" 2>/dev/null || true
+wait "$SR_HELPER_PID" 2>/dev/null || true
+_BGPIDS=()  # clear so EXIT cleanup does not re-kill a possibly-reused PID
+
+# ── S-fallback: the /proc gate is INHERITED, and every other class falls open ─
+# The state dir EXISTS here and only _lane-2's record is missing — sharper than
+# "no .lane-state at all", and the real shape of an `_iact-*` or manual operator
+# worktree living alongside pool lanes.
+#   _lane-1  released      — control, must reset.
+#   _lane-2  NO record + a live process reference — reaches the /proc gate via
+#            the recordless fall-through, proving the 5572 scan is SUPERSEDED,
+#            not deleted (PRD D7).
+#   _lane-3  quarantined   — falls open. Reset touches only target/, never the
+#            source tree or branch (sizing-lifecycle T1), so a quarantined
+#            lane's forensic state survives; only its disk is reclaimed.
+#   _lane-4  present, readable, but carrying no `state` string —
+#            LANE_STATE_CAUSE=unparseable-record. Must be LOUD and must still
+#            fall open: failing closed on a corrupt record would let one bad
+#            write freeze a lane out of reclaim forever.
+SF_ROOT="$(mktemp -d /tmp/test-gc-sf-XXXXXX)"
+_TMPDIRS+=("$SF_ROOT")
+
+SF_REPO="$SF_ROOT/repo"
+SF_WORKTREES="$SF_ROOT/worktrees"
+SF_BASE="$SF_ROOT/base"
+mkdir -p "$SF_WORKTREES" "$SF_BASE"
+
+make_repo "$SF_REPO"
+
+mkdir -p "$SF_BASE/target.gen.1"
+touch "$SF_BASE/target.gen.1.lock"
+ln -sfn "$SF_BASE/target.gen.1" "$SF_BASE/target"
+
+for _sf_name in _lane-1 _lane-2 _lane-3 _lane-4; do
+    git -C "$SF_REPO" worktree add -q "$SF_WORKTREES/$_sf_name"
+    mkdir -p "$SF_WORKTREES/$_sf_name/target"
+    touch "$SF_WORKTREES/$_sf_name/target/DIVERGENT_MARKER"
+done
+
+make_lane_state "$SF_WORKTREES" _lane-1 released
+# _lane-2: deliberately NO record — the state dir exists (make_lane_state above
+# created it), only this lane's entry is absent.
+make_lane_state "$SF_WORKTREES" _lane-3 quarantined
+make_lane_state_raw "$SF_WORKTREES" _lane-4 '{"lane": "_lane-4", "note": "truncated write'
+
+SF_READY="$SF_ROOT/lane2-holder.ready"
+( cd "$SF_WORKTREES/_lane-2/target" && touch "$SF_READY" && exec sleep 300 ) &
+SF_HELPER_PID=$!
+_BGPIDS+=("$SF_HELPER_PID")
+_wait_for_reader_lock "$SF_READY" 30
+
+SF_SEED_LOG="$SF_ROOT/seed_calls.log"
+SF_SEED_STUB="$SF_ROOT/seed_stub.sh"
+_seed_stub_body > "$SF_SEED_STUB"
+chmod +x "$SF_SEED_STUB"
+export SEED_LOG="$SF_SEED_LOG"
+
+run_helper reclaim \
+    --worktrees-dir "$SF_WORKTREES" \
+    --base-target "$SF_BASE/target" \
+    --seed-script "$SF_SEED_STUB" \
+    --main-ref main
+
+assert "S12: recordless _lane-2 reaches the INHERITED /proc gate (PRD D7)" \
+    bash -c 'printf "%s\n" "$1" | grep -qF "preserving _lane-2: live consumer (process reference)"' _ "$ERR_OUT"
+assert "S13: recordless _lane-2 preserved (marker intact, seed NOT invoked)" \
+    bash -c '[ -f "$1" ] && ([ ! -f "$2" ] || ! grep -q "_lane-2" "$2")' _ \
+    "$SF_WORKTREES/_lane-2/target/DIVERGENT_MARKER" "$SF_SEED_LOG"
+assert "S14: released _lane-1 reset (fail open on RELEASED)" \
+    bash -c 'grep -q "_lane-1" "$1" && [ ! -f "$2" ]' _ \
+    "$SF_SEED_LOG" "$SF_WORKTREES/_lane-1/target/DIVERGENT_MARKER"
+assert "S15: quarantined _lane-3 reset (QUARANTINED does not preserve)" \
+    bash -c 'grep -q "_lane-3" "$1" && [ ! -f "$2" ]' _ \
+    "$SF_SEED_LOG" "$SF_WORKTREES/_lane-3/target/DIVERGENT_MARKER"
+# INV-2, structured-facts-at-failure: a record that IS there and is wrong means
+# an assigned lane has silently degraded back to the pre-γ FREE≈flock-free
+# regime. That has to be visible AND attributable to the lane.
+assert "S16: a corrupt record is LOUD and names both the lane and the cause" \
+    bash -c 'printf "%s\n" "$1" | grep -qE "_lane-4.*unparseable-record"' _ "$ERR_OUT"
+assert "S17: ...and still falls open — _lane-4 is reset (one bad write cannot freeze a lane)" \
+    bash -c 'grep -q "_lane-4" "$1" && [ ! -f "$2" ]' _ \
+    "$SF_SEED_LOG" "$SF_WORKTREES/_lane-4/target/DIVERGENT_MARKER"
+# The asymmetry is the point: no-readable-record is the ORDINARY reading for
+# every recordless _iact-*/manual worktree, so warning on it would emit a line
+# per entry per pass and train operators to ignore the channel S16 exists to
+# raise.
+assert "S18: the ordinary recordless case stays QUIET (no no-readable-record spam)" \
+    bash -c '! printf "%s\n" "$1" | grep -qF "no-readable-record"' _ "$ERR_OUT"
+assert "S19: summary reset=3 with the preserve attributed to the /proc gate, not the record" \
+    bash -c 'printf "%s\n" "$1" | grep -qE "reset=3 .*preserved_live_ref=1 preserved_assigned=0"' _ "$OUT"
+
+kill "$SF_HELPER_PID" 2>/dev/null || true
+wait "$SF_HELPER_PID" 2>/dev/null || true
+_BGPIDS=()  # clear so EXIT cleanup does not re-kill a possibly-reused PID
+
+# ── S-toctou: the up-front-snapshot TOCTOU (B2, INV-3) ───────────────────────
+# PLACEMENT test, not a record-reading test. BOTH lanes read `released` when the
+# pass starts, so ANY implementation that snapshots the state dir up front — a
+# precomputed map, an `--assigned-lanes CSV`, a hoisted read — classifies both
+# as reclaimable and resets both. It goes GREEN only when the read runs per
+# lane, from THIS lane's own path, immediately before that lane's reset.
+#
+# That is not a theoretical failure mode: it is exactly what
+# warm-lane-gc-sweep.sh's protect CSV did. It was computed once and consumed
+# across a sweep that ran 06:32-06:59 BST while _lane-5 dropped out of the
+# protect set at 06:32 (PRD §2).
+#
+# Mechanism, mirroring P-toctou: gc.sh invokes --seed-script SYNCHRONOUSLY
+# inside the Pass-1 loop, and bash `*/` glob expansion is LC_COLLATE-sorted, so
+# _lane-1 is ALWAYS visited before _lane-2. The ordering is RELIED UPON, not
+# incidental. _lane-1's stub therefore overwrites _lane-2's record — the only
+# place in a hermetic bash test that provably runs between one lane's reset and
+# the next lane's gate.
+#
+# Expected disposition: GREEN ON ARRIVAL, because step-2 already placed the read
+# inside the loop — recorded here the way Block R records its own. Its job is to
+# go RED against any LATER optimisation that hoists the read into an up-front
+# classification pass, which is precisely what PRD D5 forbids.
+ST_ROOT="$(mktemp -d /tmp/test-gc-st-XXXXXX)"
+_TMPDIRS+=("$ST_ROOT")
+
+ST_REPO="$ST_ROOT/repo"
+ST_WORKTREES="$ST_ROOT/worktrees"
+ST_BASE="$ST_ROOT/base"
+mkdir -p "$ST_WORKTREES" "$ST_BASE"
+
+make_repo "$ST_REPO"
+
+mkdir -p "$ST_BASE/target.gen.1"
+touch "$ST_BASE/target.gen.1.lock"
+ln -sfn "$ST_BASE/target.gen.1" "$ST_BASE/target"
+
+for _st_name in _lane-1 _lane-2; do
+    git -C "$ST_REPO" worktree add -q "$ST_WORKTREES/$_st_name"
+    mkdir -p "$ST_WORKTREES/$_st_name/target"
+    touch "$ST_WORKTREES/$_st_name/target/DIVERGENT_MARKER"
+done
+
+# Both FREE at pass start.
+make_lane_state "$ST_WORKTREES" _lane-1 released
+make_lane_state "$ST_WORKTREES" _lane-2 released
+
+ST_SEED_LOG="$ST_ROOT/seed_calls.log"
+ST_SEED_STUB="$ST_ROOT/seed_stub.sh"
+
+# The trigger stub: behaves like _seed_stub_body for every lane, and
+# ADDITIONALLY, when invoked for _lane-1, reassigns _lane-2 before returning.
+# The record is written in the SAME byte shape make_lane_state emits, so the
+# fixture and the mid-pass mutation cannot disagree about the record format.
+cat > "$ST_SEED_STUB" << 'STUB_EOF'
+#!/usr/bin/env bash
+echo "$*" >> "$SEED_LOG"
+LANE_DIR="$2"
+rm -rf "$LANE_DIR/target/DIVERGENT_MARKER" 2>/dev/null || true
+if [ "${LANE_DIR##*/}" = "_lane-1" ]; then
+    printf '{\n  "state": "assigned",\n  "task_id": "%s",\n  "title": "lane fixture task %s",\n  "branch": null,\n  "seeded_from_sha": null,\n  "updated_at": "2026-07-26T12:43:10.704531+00:00"\n}' \
+        "$TOCTOU_TASK_ID" "$TOCTOU_TASK_ID" \
+        > "$TOCTOU_STATE_DIR/_lane-2.json"
+fi
+exit 0
+STUB_EOF
+chmod +x "$ST_SEED_STUB"
+
+export SEED_LOG="$ST_SEED_LOG"
+export TOCTOU_STATE_DIR="$ST_WORKTREES/.lane-state"
+export TOCTOU_TASK_ID="5334"
+
+run_helper reclaim \
+    --worktrees-dir "$ST_WORKTREES" \
+    --base-target "$ST_BASE/target" \
+    --seed-script "$ST_SEED_STUB" \
+    --main-ref main
+
+unset TOCTOU_STATE_DIR TOCTOU_TASK_ID
+
+# Non-vacuity: without S20 the whole sub-case could pass because the stub never
+# ran and the mutation never fired.
+assert "S20: trigger lane _lane-1 WAS reset (the stub ran, so the mutation fired)" \
+    bash -c 'grep -q "_lane-1" "$1" && [ ! -f "$2" ]' _ \
+    "$ST_SEED_LOG" "$ST_WORKTREES/_lane-1/target/DIVERGENT_MARKER"
+assert "S21: _lane-2 assigned MID-PASS is still preserved (no up-front snapshot)" \
+    bash -c '[ -f "$1" ] && ([ ! -f "$2" ] || ! grep -q "_lane-2" "$2")' _ \
+    "$ST_WORKTREES/_lane-2/target/DIVERGENT_MARKER" "$ST_SEED_LOG"
+assert "S22: ...and preserved for the RIGHT reason (the record, read at gate time)" \
+    bash -c 'printf "%s\n" "$1" | grep -qF "preserving _lane-2: assigned to task 5334"' _ "$ERR_OUT"
+assert "S23: summary reset=1 with the preserve attributed to the record gate" \
+    bash -c 'printf "%s\n" "$1" | grep -qE "reset=1 .*preserved_assigned=1"' _ "$OUT"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Block TRASH: shared-trash litter guard (task 5612). Two asserts, deliberately

@@ -16,7 +16,7 @@ dispatch gate.
 | α M1/M2 schema + evaluator | (stamped) | `shared/` single-home metric schema + limits evaluator; wrong-direction `orchestrator.evals` import absent (D2/INV-5); budget-derived α with no a-priori threshold (G6) | PASS |
 | β E1 retrieval probe | (stamped) | read-only probe runner (D8 `_run` pattern); committed topic registry keyed off the vocabulary namespace, no dep on gate 3200 (D5); held-out-phrasing Goodhart guard; seeded-ephemeral fixtures, never the live store | PASS |
 | γ E4 staleness sweep | (stamped) | `normalize_supersedes()` imported from **3196 upstream** (D7/INV-5 — never a second parser); three metric families in one M1 artifact; live `get_memory_by_id` dangling resolution (INV-3) | PASS |
-| δ E6 detector + series | (stamped) | `with_vectors` widened on `scroll_by_metadata`; `query_points` ANN feeding the **existing** union-find; 3130's labeled fixture already on main; measured-not-asserted similarity (G6); detector CLI path stable for 3136; dropped-candidate disclosure (INV-2/4) | PASS |
+| δ E6 detector + series | (stamped) | `with_vectors` introduced on `scroll_by_metadata`; `query_points` ANN feeding the **existing** union-find; 3130's labeled fixture already on main; measured-not-asserted similarity (G6); detector CLI path stable for 3136; dropped-candidate disclosure (INV-2/4) | PASS |
 | ε scheduled runner + M3 | (stamped) | flag-marker systemd quadruple; direct `EscalationQueue` filing (D4); dedup reusing `has_open_l1` (INV-5); `eval_regression` in the `CATEGORIES` doc list + the watcher's SKILL.md triage row (INV-1); storm escape + runner-failure self-escalation (INV-4/INV-2); first-run grandfather snapshot (D1/INV-3) | PASS |
 | ζ E7 telemetry | (stamped) | `caller_agent_id`/`caller_task_id` declared as first-class search params distinct from the `agent_id` **filter** (INV-1); briefing threading; `_MEMORY_INSTRUCTIONS` pinned to the real param names (INV-5); hint-execution journaling; `prune_write_ops` retention; journal-drop visibility counter (INV-4) | PASS |
 | η write-after-miss | (stamped) | ζ's ids+scores+caller rows upstream; **replays** the production pure guard `find_near_duplicate_memory` rather than re-implementing similarity (INV-5); metric wired into ε's evaluation; structured incident evidence (INV-2) | PASS |
@@ -65,14 +65,24 @@ sidecar capability rows updated in the same commit):
 Both rows carry mechanical `delivered_check`s and were mirrored into 3211's
 `metadata.delivered_checks` via `update_task(metadata_mode='additive')`.
 
-## Substrate drift found at the re-walk
+## Re-walk spot-check: §6 row confirmed clean
 
-One §6 row is imprecise (conclusion unchanged, work strictly smaller than stated):
+One §6 row was re-checked at the re-walk and found accurate — no drift:
 
 - **`with_vectors` on `scroll_by_metadata`.** §6 reads "`with_vectors` not yet passed —
-  δ adds it". It *is* passed, hardcoded `with_vectors=False` at
-  `backends/mem0_client.py:454`. δ's job is to make it settable, not to introduce it.
-  Recorded on δ's binding and in δ's task text.
+  δ adds it". Confirmed on main: `scroll_by_metadata` (`backends/mem0_client.py:341-424`)
+  passes no `with_vectors` argument to `client.scroll` at all, so δ genuinely
+  introduces the parameter rather than widening an existing literal. The module's only
+  `with_vectors=False` literal belongs to a different method — `get_point_by_id`'s
+  `client.retrieve` at `backends/mem0_client.py:454` — which δ does not touch. An
+  earlier pass had it backwards, claiming §6 was imprecise; that claim has been
+  corrected on δ's binding in this manifest (task 3359). Task 3210's own description
+  (WORK item 1) still carried the identical wrong claim as of this writing, and the
+  capability's `delivered_check` (a whole-file `with_vectors: bool` grep) cannot by
+  itself distinguish `scroll_by_metadata`'s signature from `get_point_by_id`'s.
+  Editing in-progress task 3210 directly was judged out of scope for task 3359 (it
+  held locks only on this manifest pair, and 3210 was actively claimed), so both
+  gaps are filed as follow-up ticket `tkt_0RRX6GAXW40S49J2BACDGRGP98` instead.
 
 All other spot-checked rows verified clean on main: unvalidated `category: str`
 (`escalation/models.py:93`) ⇒ `eval_regression` filable; direct `EscalationQueue`

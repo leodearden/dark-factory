@@ -112,6 +112,29 @@ def _get_merge_worker(harness: Any | None) -> Any | None:
     return getattr(harness, '_merge_worker', None)
 
 
+def _get_terminal_retention(harness: Any | None) -> Any | None:
+    """Return the harness-mounted TerminalOutcomeRetention ring, or None.
+
+    Centralises the ``getattr(harness, '_terminal_retention', None)`` probe so
+    the private attribute name lives in exactly one place, shared by the
+    merge_request write side (records dispatch outcomes and coalesce
+    aliases) and the merge_status / merge_cancel read sides
+    (``_durable_terminal_state``'s Tier 2, ``retire_cancelled_merge_request``).
+    Returns None — rather than raising — when *harness* is None (standalone
+    mode / unit tests that wire no harness) or the attribute is absent, so a
+    future rename degrades gracefully.
+
+    No production code path currently constructs a TerminalOutcomeRetention
+    and assigns it to ``harness._terminal_retention`` (task 3149 tracks
+    deciding whether to wire it or delete the ring); until then this always
+    resolves to None outside tests, and every call site keeps behaving
+    exactly as it did before this accessor existed.
+    """
+    if harness is None:
+        return None
+    return getattr(harness, '_terminal_retention', None)
+
+
 def _require_matching_project_root(harness: Any, project_root: str) -> str | None:
     """Return an error message if *project_root* doesn't match this server's project.
 
@@ -1342,10 +1365,36 @@ def create_server(
           position, queue_depth, eta_seconds}``.  Branch was freshly dispatched
           (or wait_secs timeout expired).
         - Attached: ``{status='attached', request_id, snapshot_tip, generation,
-          position, queue_depth, eta_seconds, inflight_task_id}``.  Branch is
+          position, queue_depth, eta_seconds, inflight_task_id, source,
+          inflight_request_id, poll_by, pollable}``.  Branch is
           already in-flight; request_id is the *existing* entry's id (D8), not
           the submitting call's id.  ``inflight_task_id`` is the authoritative
           poll handle (merge_status accepts task_id per D10).
+          ``source`` names which coalesce arm attached (``'registry'`` /
+          ``'worktree'``).  ``inflight_request_id`` is the in-flight entry's id
+          when one is known, else None.  ``poll_by`` (task 3148) names WHICH
+          handle to poll, so the caller never has to re-derive the remedy:
+
+          * ``'request_id'`` — poll ``merge_status(request_id)``; the returned
+            ``request_id`` IS the in-flight entry's id.
+          * ``'task_id'`` — no in-flight request_id is known (e.g. a legacy
+            registry entry predating the field), so the returned ``request_id``
+            fell back to the *submitting* call's id and is NOT a handle; poll
+            ``merge_status(task_id=inflight_task_id)`` instead (D10).
+          * ``'branch'`` — NEITHER handle is known (the disk-scan/worktree
+            arm: a foreign or pre-restart merger owns the tree, so there is no
+            in-process entry, no retention alias, and no waiter).  The returned
+            ``request_id`` was never enqueued and ``merge_status`` on it
+            resolves ``'unknown'`` — poll by branch / ``get_merge_queue``, and
+            do NOT read a first-tick ``'unknown'`` as a terminal failure.
+
+          ``pollable`` is the boolean shorthand ``poll_by != 'branch'`` — i.e.
+          "this response carries a handle naming the in-flight merge".  Caller-
+          side doc updates (skills/unblock/SKILL.md step 7, skills/merge-queue/
+          SKILL.md §5, which still say to submit-then-poll and to merge_cancel
+          on the attached request_id unconditionally) are tracked by follow-up
+          ticket ``tkt_0RRWDD1N3YS9NQTZ8NNEGWHKT8`` — those files are outside
+          task 3148's lock set.
         - Duplicate-in-verify reject (C3/D3): ``{error, code='duplicate_in_verify',
           existing_mr, existing_sha, verify_age_secs, hint='merge_cancel then
           resubmit'}``.  Returned when a *newer* SHA for the branch is submitted
@@ -1520,6 +1569,14 @@ def create_server(
         # between req.snapshot_tip and the in-flight entry's snapshot_tip.  When
         # git_ops_for_scan is None (standalone / tests without orchestrator) the
         # classifier is also None and the recency check is a no-op (back-compat).
+        # retention: write-side counterpart of the Tier-2 reads in
+        # _durable_terminal_state (merge_status) and the
+        # retire_cancelled_merge_request call in merge_cancel — populates the
+        # ring via enqueue_merge_request's _on_finalized callback (dispatch
+        # arm) and registers a record_alias entry for coalesced ids.  Always
+        # None today (no production path yet assigns
+        # harness._terminal_retention — see task 3149), so this call keeps
+        # behaving exactly as before until that ring is actually mounted.
         dispatch = await coalesce_or_enqueue_merge_request(
             merge_queue,
             merge_req,
@@ -1528,6 +1585,7 @@ def create_server(
             git_ops=git_ops_for_scan,
             live_snapshot=live_snapshot,
             classifier_git_ops=git_ops_for_scan,
+            retention=_get_terminal_retention(harness),
         )
 
         def _nonblocking_state_response(
@@ -1607,6 +1665,30 @@ def create_server(
                 req_id_override=dispatch.inflight_request_id,
             )
             base['inflight_task_id'] = dispatch.inflight_task_id
+            # task 3148: disclose WHICH handle this attach can be polled by,
+            # rather than leaving the caller to re-derive it from prose.  The
+            # disk-scan (source='worktree') arm registers no retention alias and
+            # no waiter — the _waiters registration below is AFTER this early
+            # return — so on that arm `request_id` is the submitting request's
+            # own never-enqueued id and merge_status on it resolves 'unknown'.
+            # Derived from the handles actually present rather than from
+            # `source`, so this stays correct if a future arm gains or loses
+            # alias registration, and so the legacy registry entry (no
+            # request_id, but a perfectly good task_id) is routed to the handle
+            # it does have instead of being written off as unpollable.
+            base['source'] = dispatch.source
+            base['inflight_request_id'] = dispatch.inflight_request_id
+            if dispatch.inflight_request_id is not None:
+                # req_id_override above already put this id in base['request_id'].
+                base['poll_by'] = 'request_id'
+            elif dispatch.inflight_task_id is not None:
+                # merge_status accepts task_id (D10); base['request_id'] here is
+                # the submitting call's own id and is NOT a handle.
+                base['poll_by'] = 'task_id'
+            else:
+                base['poll_by'] = 'branch'
+            # Shorthand: "some handle naming the in-flight merge is present".
+            base['pollable'] = base['poll_by'] != 'branch'
             return base
 
         # Register durable-intent waiter record (β1 D2/I5).
@@ -2162,7 +2244,7 @@ def create_server(
         # (e.g. coalesced ids that never get their own terminal record).
         # finished_at is stored as epoch float; normalise to ISO-8601 so the
         # same logical merge returns the same type regardless of which tier serves it.
-        ring = getattr(harness, '_terminal_retention', None) if harness is not None else None
+        ring = _get_terminal_retention(harness)
         if ring is not None:
             if request_id is not None:
                 rec = ring.get(request_id)
@@ -2502,7 +2584,7 @@ def create_server(
             branch=rec.branch,
             task_id=rec.task_id,
             registry=_registry,
-            retention=getattr(harness, '_terminal_retention', None),
+            retention=_get_terminal_retention(harness),
             git_ops=getattr(harness, 'git_ops', None),
             event_store=event_store,
         )

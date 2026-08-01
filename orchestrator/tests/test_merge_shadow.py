@@ -416,6 +416,481 @@ def test_did_not_pass_subset_all_pass_is_empty() -> None:
     assert did_not_pass_subset({'a::x': 'pass', 'a::y': 'pass'}) == []
 
 
+# ---------------------------------------------------------------------------
+# nextest filter-id mapping (task 3059).
+#
+# DF's internal key space ("<binary-id> <test-name>", the parse_per_test_results
+# key) is NOT the domain cargo-nextest's `test(=...)` matcher accepts.  Resolved
+# EMPIRICALLY against cargo-nextest 0.9.136 — the exact version reify's merge
+# gate runs — not from documentation:
+#
+#     cargo nextest list -E 'test(=mymod::mytest)'          -> MATCHES
+#     cargo nextest list -E 'test(=nxprobe mymod::mytest)'  -> MATCHES NOTHING
+#
+# reify wraps each filter-file line as `test(=<line>)` (verify.sh
+# emit_nextest_pass), so shipping full parse keys yields a file that is
+# non-empty — reify's "retry refused: no subset" loud fallback therefore never
+# fires — and that matches ZERO tests: a narrowed retry that runs nothing and
+# reports PASS.  A latent FALSE GREEN, not mere inertness.
+# ---------------------------------------------------------------------------
+
+
+def test_nextest_filter_ids_strips_binary_id_prefix() -> None:
+    """A "<binary-id> <test-name>" parse key maps to the bare test name.
+
+    Empirical basis (cargo-nextest 0.9.136): `test(=some::mod::test_a)` matches,
+    `test(=reify-core::lib some::mod::test_a)` matches nothing.
+    """
+    from orchestrator.merge_shadow import nextest_filter_ids
+
+    assert nextest_filter_ids(['reify-core::lib some::mod::test_a']) == [
+        'some::mod::test_a'
+    ]
+
+
+def test_nextest_filter_ids_passes_through_unqualified_keys() -> None:
+    """A key with NO space (parse_per_test_results' libtest branch) is unchanged.
+
+    The libtest branch of parse_per_test_results keys on the bare test path
+    already, so there is no binary-id prefix to strip.
+    """
+    from orchestrator.merge_shadow import nextest_filter_ids
+
+    assert nextest_filter_ids(['some::mod::test_b']) == ['some::mod::test_b']
+
+
+def test_nextest_filter_ids_splits_on_first_space_only() -> None:
+    """The split is on the FIRST space, so a spaced test name keeps its remainder.
+
+    nextest permits spaces in test names for some harnesses; splitting on every
+    space would truncate such a name and silently drop it from the retry subset.
+    """
+    from orchestrator.merge_shadow import nextest_filter_ids
+
+    assert nextest_filter_ids(['pkg::bin my test with spaces']) == [
+        'my test with spaces'
+    ]
+
+
+def test_nextest_filter_ids_preserves_order_and_collapses_duplicates() -> None:
+    """Input order is preserved; exact duplicates collapse to one entry.
+
+    Two binaries running the same test name yield ONE `test(=name)` term — the
+    unqualified term already matches the name in every binary.
+    """
+    from orchestrator.merge_shadow import nextest_filter_ids
+
+    assert nextest_filter_ids(
+        [
+            'crate-b::lib zeta::test_last',
+            'crate-a::lib alpha::test_first',
+            'crate-c::lib alpha::test_first',  # same bare name, different binary
+            'crate-b::lib zeta::test_last',  # exact duplicate key
+        ]
+    ) == ['zeta::test_last', 'alpha::test_first']
+
+
+def test_nextest_filter_ids_empty_input_is_empty_list() -> None:
+    """Empty input yields [] — the caller decides what an empty subset means."""
+    from orchestrator.merge_shadow import nextest_filter_ids
+
+    assert nextest_filter_ids([]) == []
+
+
+# ---------------------------------------------------------------------------
+# `cargo nextest list --message-format json` planned-set parsing (task 3059).
+#
+# The happy path is driven from CHECKED-IN REAL BYTES
+# (fixtures/reify_verify_retry/nextest-list.json — unmodified cargo-nextest
+# 0.9.136 output), never a hand-written inline copy.  If one of these fails the
+# producer's JSON shape has drifted: RE-CAPTURE the fixture and fix the parser.
+# Do NOT edit the fixture to make the test pass.  See the fixture dir's
+# PROVENANCE.md.
+# ---------------------------------------------------------------------------
+
+_FIXTURE_DIR = Path(__file__).parent / 'fixtures' / 'reify_verify_retry'
+
+
+def test_parse_nextest_list_planned_real_bytes() -> None:
+    """Real cargo-nextest 0.9.136 JSON parses to "<binary-id> <test-name>" ids.
+
+    Asserts against the fixture's OWN self-declared totals rather than a
+    transcribed constant, so a re-capture with a different crate still holds.
+    """
+    import json
+
+    from orchestrator.merge_shadow import parse_nextest_list_planned
+
+    raw = (_FIXTURE_DIR / 'nextest-list.json').read_text()
+    doc = json.loads(raw)
+
+    planned = parse_nextest_list_planned(raw)
+    assert planned is not None
+
+    expected = sorted(
+        f'{suite.get("binary-id")} {case}'
+        for suite in doc['rust-suites'].values()
+        for case in suite['testcases']
+    )
+    assert planned == expected
+    # The document's own test-count corroborates that nothing was dropped.
+    assert len(planned) == doc['test-count']
+    # Ids are in parse_per_test_results' key space: "<binary-id> <test-name>".
+    assert all(' ' in test_id for test_id in planned)
+
+
+def test_parse_nextest_list_planned_unparseable_stdout_is_none() -> None:
+    """Non-JSON stdout -> None (a probe FAILURE, routing to a full verify)."""
+    from orchestrator.merge_shadow import parse_nextest_list_planned
+
+    assert parse_nextest_list_planned('error: no such command: `nextest`') is None
+    assert parse_nextest_list_planned('') is None
+
+
+def test_parse_nextest_list_planned_wrong_shape_is_none() -> None:
+    """Well-formed JSON of the wrong shape -> None, never a silent empty plan."""
+    from orchestrator.merge_shadow import parse_nextest_list_planned
+
+    assert parse_nextest_list_planned('[]') is None  # not an object
+    assert parse_nextest_list_planned('"a string"') is None
+    assert parse_nextest_list_planned('{"test-count": 0}') is None  # no rust-suites
+    assert parse_nextest_list_planned('{"rust-suites": []}') is None  # not an object
+
+
+def test_parse_nextest_list_planned_zero_testcases_is_empty_list() -> None:
+    """A well-formed doc whose suites carry zero testcases -> [], NOT None.
+
+    The None-vs-[] distinction is load-bearing: [] is a genuinely test-free
+    workspace (a real, if unusual, answer), whereas None means "the probe
+    failed, do not narrow anything".
+    """
+    from orchestrator.merge_shadow import parse_nextest_list_planned
+
+    doc = '{"rust-suites": {"crate-a": {"binary-id": "crate-a", "testcases": {}}}}'
+    assert parse_nextest_list_planned(doc) == []
+
+
+def test_parse_nextest_list_planned_missing_binary_id_falls_back_to_key() -> None:
+    """A suite entry missing `binary-id` falls back to the rust-suites map key.
+
+    nextest keys the rust-suites map by the binary id, so the key is the same
+    value and a schema change that drops the field stays parseable.
+    """
+    from orchestrator.merge_shadow import parse_nextest_list_planned
+
+    doc = '{"rust-suites": {"crate-z::lib": {"testcases": {"m::t": {}}}}}'
+    assert parse_nextest_list_planned(doc) == ['crate-z::lib m::t']
+
+
+def test_parse_nextest_list_planned_excludes_ignored_and_filtered_out() -> None:
+    """`#[ignore]`d and filterset-excluded testcases are NOT planned.
+
+    Driven by REAL cargo-nextest 0.9.136 bytes
+    (``nextest-list-ignored.json``, captured with a `-E` expression so BOTH
+    exclusion shapes appear — ``reason: "ignored"`` and ``reason:
+    "expression"``).  See PROVENANCE.md.
+
+    Why it matters: `parse_per_test_results` deliberately drops SKIP/ignored
+    result lines, so a skipped test NEVER gets a verdict, is annotated
+    'not-started' by `build_fail_fast_map`, and therefore lands in the
+    {did-not-pass} subset of EVERY narrowed retry.  Never unsafe (nextest still
+    refuses to run it) — but it inflates every filter file toward reify's
+    REIFY_VERIFY_RETRY_MAX_SUBSET ceiling, and tripping that ceiling makes reify
+    refuse narrowing for the whole profile.  An ignore-heavy workspace would
+    silently lose the capability.
+    """
+    import json
+
+    from orchestrator.merge_shadow import parse_nextest_list_planned
+
+    raw = (_FIXTURE_DIR / 'nextest-list-ignored.json').read_text()
+    doc = json.loads(raw)
+
+    planned = parse_nextest_list_planned(raw)
+    assert planned is not None
+    assert planned == ['crate-a alpha::test_one', 'crate-a beta::test_three']
+
+    # The fixture really does carry all three shapes — otherwise this test
+    # would pass vacuously against a re-capture that lost them.
+    cases = {
+        f'{suite["binary-id"]} {case}': meta
+        for suite in doc['rust-suites'].values()
+        for case, meta in suite['testcases'].items()
+    }
+    assert cases['crate-a alpha::test_ignored']['ignored'] is True
+    assert cases['crate-a alpha::test_ignored']['filter-match'] == {
+        'status': 'mismatch', 'reason': 'ignored',
+    }
+    assert cases['crate-b gamma::test_one']['ignored'] is False
+    assert cases['crate-b gamma::test_one']['filter-match'] == {
+        'status': 'mismatch', 'reason': 'expression',
+    }
+    # The document's own `test-count` counts the EXCLUDED cases too, so it is
+    # NOT the planned count — pinned here so nobody re-derives the plan from it.
+    assert doc['test-count'] == 5
+    assert len(planned) == 2
+
+
+def test_parse_nextest_list_planned_unknown_case_shape_is_included() -> None:
+    """An unrecognised testcase shape is treated as PLANNED (superset bias).
+
+    The whole module errs toward re-running MORE tests, never fewer: a probe
+    that cannot be understood returns None (full verify), and a testcase that
+    cannot be understood stays in the plan.  A future nextest schema change must
+    not silently start SKIPPING tests on the retry.
+    """
+    from orchestrator.merge_shadow import parse_nextest_list_planned
+
+    doc = (
+        '{"rust-suites": {"crate-a": {"binary-id": "crate-a", "testcases": {'
+        '"m::no_meta": {},'                                     # no fields at all
+        '"m::not_a_dict": "surprise",'                          # wrong type
+        '"m::odd_status": {"filter-match": {"status": 7}},'     # non-string status
+        '"m::odd_filter_match": {"filter-match": "matches"},'   # non-dict filter-match
+        '"m::ignored_false": {"ignored": false}'
+        '}}}}'
+    )
+    assert parse_nextest_list_planned(doc) == [
+        'crate-a m::ignored_false',
+        'crate-a m::no_meta',
+        'crate-a m::not_a_dict',
+        'crate-a m::odd_filter_match',
+        'crate-a m::odd_status',
+    ]
+
+
+def test_parse_nextest_list_planned_all_cases_excluded_is_empty_not_none() -> None:
+    """A doc whose every testcase is ignored -> [], not None.
+
+    [] is a real answer the caller turns into "nothing to narrow" (and therefore
+    a full verify via the material-narrowing gate); None means "the probe
+    failed".  Conflating them would be the false-green this module guards.
+    """
+    from orchestrator.merge_shadow import parse_nextest_list_planned
+
+    doc = (
+        '{"rust-suites": {"crate-a": {"binary-id": "crate-a", "testcases": {'
+        '"m::t": {"ignored": true, "filter-match": {"status": "mismatch", '
+        '"reason": "ignored"}}}}}}'
+    )
+    assert parse_nextest_list_planned(doc) == []
+
+
+# ---------------------------------------------------------------------------
+# run_all {failed}-member extraction (task 3059).
+#
+# Producer contract: reify tests/infra/run_all.sh:26-36 (documented) and
+# :1839-1841 (emitted).  Two lines follow the Summary line when anything failed:
+#
+#   "=== FAILED: <space-separated names> ==="   human-readable summary
+#   "FAILED <space-separated names>"            bare classifier marker
+#
+# The bare marker is the one DF's own verify.py already regexes as `^FAILED\\s`
+# (pattern #7b), so this parser consumes an established, source-verified line —
+# not an invented format.  Driven from the checked-in fixture; see PROVENANCE.md
+# (that fixture is contract-derived-from-source, weaker grounding than a
+# captured run).
+# ---------------------------------------------------------------------------
+
+
+def test_parse_failed_run_all_members_real_contract_bytes() -> None:
+    """The bare `FAILED <names>` marker yields exactly those names, in order.
+
+    Reads the checked-in fixture whole — including the verbatim contract
+    excerpt, whose lines are '#'-commented and so must NOT match.
+    """
+    from orchestrator.merge_shadow import parse_failed_run_all_members
+
+    text = (_FIXTURE_DIR / 'run_all-failed-marker.txt').read_text()
+    assert parse_failed_run_all_members(text) == [
+        'test_worktree_lifecycle.sh',
+        'test_skip_ledger.sh',
+    ]
+
+
+def test_parse_failed_run_all_members_human_summary_not_double_counted() -> None:
+    """The `=== FAILED: ... ===` human summary is not counted alongside the marker.
+
+    Both lines are emitted together by run_all.sh:1839-1841; counting both would
+    double every member and (with the '===' token) inject a bogus name.
+    """
+    from orchestrator.merge_shadow import parse_failed_run_all_members
+
+    log = (
+        '=== Summary: 2 discovered, 1 failed ===\n'
+        '=== FAILED: test_a.sh ===\n'
+        'FAILED test_a.sh\n'
+    )
+    assert parse_failed_run_all_members(log) == ['test_a.sh']
+
+
+def test_parse_failed_run_all_members_no_marker_is_empty() -> None:
+    """No marker line -> [] — NOT an error.
+
+    An empty subset means reify runs the FULL run_all suite
+    (verify.sh:2545 gates on `[ -n "${REIFY_RUN_ALL_MEMBER_SUBSET:-}" ]`), which
+    is the safe direction.
+    """
+    from orchestrator.merge_shadow import parse_failed_run_all_members
+
+    assert parse_failed_run_all_members('=== Summary: 3 discovered, 0 failed ===') == []
+    assert parse_failed_run_all_members('') == []
+
+
+def test_parse_failed_run_all_members_marker_without_names_is_empty() -> None:
+    """A marker with no names after it -> [] (full run_all, the safe direction)."""
+    from orchestrator.merge_shadow import parse_failed_run_all_members
+
+    assert parse_failed_run_all_members('FAILED \nnext line\n') == []
+
+
+def test_parse_failed_run_all_members_last_marker_wins() -> None:
+    """If the log somehow carries two markers, only the LAST one governs.
+
+    A merge-gate log can concatenate output from more than one run_all
+    invocation; the most recent marker is the one describing the final state.
+    """
+    from orchestrator.merge_shadow import parse_failed_run_all_members
+
+    log = 'FAILED test_old.sh\nmore output\nFAILED test_new_a.sh test_new_b.sh\n'
+    assert parse_failed_run_all_members(log) == ['test_new_a.sh', 'test_new_b.sh']
+
+
+def test_parse_failed_run_all_members_deduplicates_preserving_order() -> None:
+    """Repeated names within one marker collapse, first-seen order preserved."""
+    from orchestrator.merge_shadow import parse_failed_run_all_members
+
+    assert parse_failed_run_all_members('FAILED b.sh a.sh b.sh\n') == ['b.sh', 'a.sh']
+
+
+# ---------------------------------------------------------------------------
+# The SECOND marker producer: `_ra_on_term`'s `(partial)` outer-timeout line
+# (reify tests/infra/run_all.sh:683-685).
+#
+# Both forms below are matched by the same `^FAILED\s` marker regex as the
+# clean producer, so the parser sees them whether or not it was written with
+# them in mind.  Every line fed to the parser here is READ OUT OF THE CHECKED-IN
+# FIXTURE, where it was recorded by executing the producer statements (see
+# PROVENANCE.md) — never hand-authored from prose, which is the drift class this
+# leaf exists to correct (PRD §12 root cause (a)).
+# ---------------------------------------------------------------------------
+
+
+def _run_all_fixture_line(exact: str) -> str:
+    """Return `exact` as a one-line log, sourced from the checked-in fixture.
+
+    Asserts the fixture carries the line EXACTLY once, so a future fixture edit
+    that drops or reworders these producer bytes fails loudly here instead of
+    silently turning the assertions below into no-ops against a literal that
+    nothing grounds.
+    """
+    lines = (_FIXTURE_DIR / 'run_all-failed-marker.txt').read_text().splitlines()
+    hits = [ln for ln in lines if ln == exact]
+    assert len(hits) == 1, (
+        f'fixture run_all-failed-marker.txt must carry exactly one {exact!r} '
+        f'line (producer bytes); found {len(hits)}'
+    )
+    return hits[0] + '\n'
+
+
+def test_parse_failed_run_all_members_partial_marker_without_names_refuses() -> None:
+    """`FAILED (partial)` -> [] — the empty-`_names` outer-timeout marker.
+
+    This is the FALSE-GREEN case, and the whole chain runs on a non-empty result:
+
+    1. `_ra_on_term` (run_all.sh:683-685) fires on an outer-timeout SIGTERM
+       before any member recorded a nonzero exit, so `${_names:+$_names }`
+       expands to nothing and the bare line is `FAILED (partial)`.
+    2. A parser that returns the sentinel as a member name yields
+       `['(partial)']` — NON-EMPTY.
+    3. DF then sets `REIFY_RUN_ALL_MEMBER_SUBSET='(partial)'`, so verify.sh's
+       `[ -n "${REIFY_RUN_ALL_MEMBER_SUBSET:-}" ]` gate PASSES and the safe
+       full-suite fallback never fires.
+    4. run_all.sh:1327 warns `REIFY_RUN_ALL_MEMBER_SUBSET member '(partial)' not
+       found in $INFRA_DIR (ignored)` and runs ZERO members — reporting green
+       with no coverage at all.
+
+    So `[]` here is not a nicety: it is the difference between a full retry and
+    a green that tested nothing.
+    """
+    from orchestrator.merge_shadow import parse_failed_run_all_members
+
+    log = _run_all_fixture_line('FAILED (partial)')
+    got = parse_failed_run_all_members(log)
+    assert got != ['(partial)'], (
+        'the (partial) sentinel must never be emitted as a member name — '
+        'a non-empty subset suppresses the full-suite fallback and runs zero members'
+    )
+    assert got == []
+
+
+def test_parse_failed_run_all_members_partial_marker_with_names_refuses() -> None:
+    """`FAILED a.sh b.sh (partial)` -> [] as well.
+
+    An INTERRUPTED run's failed-set is not a complete failed-set: members that
+    had not yet executed when the SIGTERM landed are neither passed nor failed,
+    so narrowing to the named failures would silently SKIP them on the retry —
+    the same coverage hole as the empty-names case, merely smaller.  Never
+    narrow on an incomplete plan.
+    """
+    from orchestrator.merge_shadow import parse_failed_run_all_members
+
+    log = _run_all_fixture_line('FAILED a.sh b.sh (partial)')
+    assert parse_failed_run_all_members(log) == []
+
+
+def test_parse_failed_run_all_members_clean_marker_unaffected_by_partial_rule() -> None:
+    """No regression: a clean marker still narrows to exactly its names."""
+    from orchestrator.merge_shadow import parse_failed_run_all_members
+
+    log = _run_all_fixture_line('FAILED test_worktree_lifecycle.sh test_skip_ledger.sh')
+    assert parse_failed_run_all_members(log) == [
+        'test_worktree_lifecycle.sh',
+        'test_skip_ledger.sh',
+    ]
+
+
+def test_parse_failed_run_all_members_last_marker_wins_across_producers() -> None:
+    """Last-marker-wins is unchanged when the two producers are interleaved.
+
+    A merge-gate log can concatenate more than one run_all invocation, and the
+    two producers can therefore appear in either order.  The refusal is a
+    property of the LAST marker only — it neither poisons an earlier clean
+    marker's result nor rescues a later partial one.
+    """
+    from orchestrator.merge_shadow import parse_failed_run_all_members
+
+    clean = _run_all_fixture_line('FAILED test_worktree_lifecycle.sh test_skip_ledger.sh')
+    partial = _run_all_fixture_line('FAILED a.sh b.sh (partial)')
+
+    # clean -> partial: the interrupted run is the final state, so refuse.
+    assert parse_failed_run_all_members(clean + 'more output\n' + partial) == []
+    # partial -> clean: a completed run superseded it, so its names govern.
+    assert parse_failed_run_all_members(partial + 'more output\n' + clean) == [
+        'test_worktree_lifecycle.sh',
+        'test_skip_ledger.sh',
+    ]
+
+
+def test_parse_failed_run_all_members_human_partial_summary_alone_is_empty() -> None:
+    """The `=== FAILED: ... (partial) ===` human summary alone still yields [].
+
+    `_ra_on_term` emits it on the line before the bare marker.  The `^FAILED`
+    anchor excludes it, so it is neither matched on its own nor double-counted
+    beside the bare marker.  Both rendered forms are covered — note the empty-
+    `_names` one carries the producer's DOUBLE space after the colon.
+    """
+    from orchestrator.merge_shadow import parse_failed_run_all_members
+
+    assert parse_failed_run_all_members(_run_all_fixture_line('=== FAILED:  (partial) ===')) == []
+    assert (
+        parse_failed_run_all_members(
+            _run_all_fixture_line('=== FAILED: a.sh b.sh (partial) ===')
+        )
+        == []
+    )
+
+
 def test_build_fail_fast_map_marks_cancelled_tests_not_started() -> None:
     """build_fail_fast_map annotates the authoritative plan with attempt-0 verdicts.
 

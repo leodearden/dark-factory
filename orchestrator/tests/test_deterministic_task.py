@@ -12,6 +12,8 @@ Exercises the full integration of the deterministic task kind over the landed
 from __future__ import annotations
 
 import asyncio
+import subprocess
+import sys
 import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -24,6 +26,12 @@ from orchestrator.deterministic_runner import DeterministicRunner
 from orchestrator.harness import Harness
 from orchestrator.scheduler import ProvenanceValidationRejection, Scheduler, TaskAssignment
 from orchestrator.workflow import WorkflowOutcome
+
+# Repo root of this worktree: <root>/orchestrator/tests/<this file> -> <root>.
+# Layout-independent — holds in both the main checkout and a .worktrees/<id>/
+# checkout. Matches the parents[2] convention used by conftest.py and the
+# other orchestrator tests.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # ---------------------------------------------------------------------------
 # Task-dict builders
@@ -1627,34 +1635,43 @@ class TestB9SubmitCli:
 # B10 — submit_task validation rejects ill-formed corners (step-13)
 # ---------------------------------------------------------------------------
 
-def _validate(task_kind: str, metadata: dict, project_root: str | None = None) -> dict | None:
+def _validate(task_kind: str, metadata: dict, project_root: str) -> dict | None:
     """Invoke α's deterministic_task_error validator.
 
-    Tries in-process import first (succeeds in workspace-root venv).
-    Falls back to ``uv run --project fused-memory`` subprocess if
-    ModuleNotFoundError (e.g. orchestrator-only venv).
+    Tries in-process import first (succeeds in workspace-root venv). Falls
+    back to ``uv run --project fused-memory`` subprocess on
+    ModuleNotFoundError (e.g. an orchestrator-only venv) — dead under this
+    repo's own conftest.py, where the in-process import always succeeds.
 
     Returns the error dict or None (valid).
+
+    ``project_root`` is required: the helper used to fall back to a bare
+    ``tempfile.mkdtemp()`` with no prefix and no teardown, leaking an
+    unreclaimed ``/tmp/tmp<random>`` dir on any call that omitted it. Every
+    call site passes a pytest ``tmp_path``-rooted path, so the fallback was
+    already dead; having no default keeps it structurally unreachable.
 
     Subprocess fallback notes:
     - metadata is serialised as JSON and re-parsed inside the child process
       with ``json.loads(...)`` so both paths receive a ``dict``, not a string.
     - ``uv`` is invoked as a standalone binary (``['uv', 'run', ...]``), NOT
       via ``python -m uv`` (uv is not an importable Python module).
+    - Failure policy: a missing ``uv`` binary (``FileNotFoundError``) is a
+      legitimate environment gap and is skipped. A mis-wired ``--project``
+      dir, a uv that runs and returns non-zero, a uv that hangs past
+      ``timeout=30`` (all ``subprocess.SubprocessError``), or stdout that
+      fails to parse as JSON (e.g. a uv warning printed ahead of the
+      result) all fail loudly via ``pytest.fail`` carrying the computed
+      path/returncode/stderr/stdout — none of those are skips, since
+      masking a failing validator as SKIPPED would silently drop real
+      coverage.
     """
-    if project_root is None:
-        import tempfile
-        project_root = tempfile.mkdtemp()
     try:
         from fused_memory.middleware.deterministic_task_guard import (  # type: ignore[reportMissingImports]
             deterministic_task_error,
         )
-        return deterministic_task_error(task_kind, metadata, project_root)
     except ModuleNotFoundError:
         import json
-        import subprocess
-        from pathlib import Path as _Path
-        repo_root = _Path(__file__).parents[3]  # .worktrees/1903/
         # Embed metadata as a JSON string literal and parse it back to a dict
         # inside the subprocess — both paths therefore pass a dict to
         # deterministic_task_error, not a string.
@@ -1667,18 +1684,50 @@ def _validate(task_kind: str, metadata: dict, project_root: str | None = None) -
             f'{task_kind!r}, metadata, {project_root!r});'
             'print(json.dumps(result))'
         )
+        fm_project = _REPO_ROOT / 'fused-memory'
+        if not fm_project.is_dir():
+            pytest.fail(
+                'uv fallback mis-wired: computed --project dir does not exist.\n'
+                f'  --project:  {fm_project}\n'
+                f'  _REPO_ROOT: {_REPO_ROOT}\n'
+                f'  __file__:   {__file__}\n'
+                'Expected <repo root>/fused-memory, where repo root is '
+                'Path(__file__).resolve().parents[2].'
+            )
         try:
             out = subprocess.check_output(
-                ['uv', 'run', '--project',
-                 str(repo_root / 'fused-memory'), 'python', '-c', code],
+                ['uv', 'run', '--project', str(fm_project), 'python', '-c', code],
                 text=True,
                 timeout=30,
+                stderr=subprocess.PIPE,
             )
-            return json.loads(out.strip()) if out.strip() != 'null' else None
-        except (subprocess.SubprocessError, FileNotFoundError) as exc:
-            import pytest
-            pytest.skip(f'fused_memory not importable and uv fallback unavailable: {exc}')
-            return None  # unreachable but satisfies type checker
+        except FileNotFoundError as exc:
+            pytest.skip(f'uv binary not available, cannot run fused_memory fallback: {exc}')
+        except subprocess.SubprocessError as exc:
+            pytest.fail(
+                'fused_memory uv fallback ran and failed — not skipping (a failing '
+                'validator must not be masked as SKIPPED).\n'
+                f'  error:      {type(exc).__name__}: {exc}\n'
+                f'  returncode: {getattr(exc, "returncode", None)}\n'
+                f'  stderr:     {getattr(exc, "stderr", None)}\n'
+                f'  --project:  {fm_project}'
+            )
+
+        stripped = out.strip()
+        if stripped == 'null':
+            return None
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            pytest.fail(
+                'fused_memory uv fallback produced unparseable stdout — not '
+                'skipping (a failing validator must not be masked as SKIPPED).\n'
+                f'  error:      {exc}\n'
+                f'  stdout:     {out!r}\n'
+                f'  --project:  {fm_project}'
+            )
+    else:
+        return deterministic_task_error(task_kind, metadata, project_root)
 
 
 class TestB10Validation:
@@ -1730,6 +1779,273 @@ class TestB10Validation:
         )
         assert result is None, (
             f'Expected None (no error) for valid deterministic gate, got: {result!r}'
+        )
+
+
+def _force_uv_fallback(monkeypatch: pytest.MonkeyPatch, stub) -> None:
+    """Force ``_validate`` down its ``uv run`` subprocess fallback path.
+
+    Under this repo's own conftest.py, ``fused_memory`` imports in-process
+    and the fallback arm is dead. Simulate an orchestrator-only venv by
+    sentinel-injecting ``None`` into ``sys.modules`` for the target module:
+    CPython's import system raises ``ModuleNotFoundError: import of X
+    halted; None in sys.modules`` for a ``from X import Y`` against a
+    ``None`` entry, which is exactly the exception ``_validate`` catches to
+    enter the fallback. ``monkeypatch`` restores the real module (or absence
+    of one) at teardown, so this is safe even if an earlier test already
+    imported the module in this process.
+
+    ``stub`` replaces ``subprocess.check_output`` so no real ``uv`` process
+    is spawned. ``_validate``'s fallback does ``import subprocess`` locally,
+    which binds the same module object as the top-level ``subprocess``
+    import here, so patching the top-level module's attribute takes effect.
+    """
+    monkeypatch.setitem(
+        sys.modules, 'fused_memory.middleware.deterministic_task_guard', None
+    )
+    monkeypatch.setattr(subprocess, 'check_output', stub)
+
+
+class TestValidateUvFallback:
+    """Exercises `_validate`'s ``uv run`` subprocess fallback arm directly.
+
+    The fallback is unreached in the normal test run (see
+    `_force_uv_fallback`), so these tests force entry into it to pin its
+    behaviour independently of whichever venv happens to be active.
+    """
+
+    def test_fallback_targets_repo_root_fused_memory_project(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The ``--project`` argv element must point at repo-root fused-memory.
+
+        Derives the expectation independently (not via any implementation
+        constant) so this pins the layout invariant itself: the repo root of
+        *this* worktree, two parents up from this test file.
+        """
+        captured_argv: list[str] = []
+
+        def _stub(argv, **kwargs):
+            captured_argv.extend(argv)
+            # Leading/trailing whitespace, as uv's own stdout may include —
+            # pins the `.strip()` handling alongside the null-sentinel
+            # mapping this test already checks.
+            return ' null\n'
+
+        _force_uv_fallback(monkeypatch, _stub)
+
+        result = _validate(
+            task_kind='deterministic',
+            metadata={
+                'task_kind': 'deterministic',
+                'always_escalates': True,
+                'before_done': None,
+            },
+            project_root=str(tmp_path),
+        )
+
+        assert result is None, f'null sentinel must map to None, got: {result!r}'
+        assert '--project' in captured_argv, (
+            f'Expected --project in argv, got: {captured_argv!r}'
+        )
+        project_arg = captured_argv[captured_argv.index('--project') + 1]
+        expected = Path(__file__).resolve().parents[2] / 'fused-memory'
+        assert project_arg == str(expected), (
+            f'Expected --project to point at repo-root fused-memory '
+            f'({expected}), got: {project_arg!r}'
+        )
+        assert Path(project_arg).is_dir(), (
+            f'Computed --project dir does not exist: {project_arg!r}'
+        )
+
+    def test_fallback_parses_subprocess_json_result(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A JSON error object printed by the subprocess round-trips as a dict."""
+
+        def _stub(argv, **kwargs):
+            return '{"error": "sentinel-err"}'
+
+        _force_uv_fallback(monkeypatch, _stub)
+
+        result = _validate(
+            task_kind='deterministic',
+            metadata={
+                'task_kind': 'deterministic',
+                'always_escalates': False,
+                'before_done': None,
+            },
+            project_root=str(tmp_path),
+        )
+
+        assert result == {'error': 'sentinel-err'}
+
+    def test_missing_fused_memory_project_dir_fails_loudly(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A mis-wired repo root (no fused-memory/ subdir) must fail loudly.
+
+        Pins the pre-flight ``is_dir()`` guard in ``_validate``: a wrong
+        ``--project`` path must never be laundered into a skip (or anything
+        else) by whatever uv happens to report, because the guard must
+        reject it *before* uv is ever spawned. Simulates a regressed
+        ``_REPO_ROOT`` by pointing it at an empty ``tmp_path``. The stub
+        would raise what real uv reports against a nonexistent --project
+        dir if it were ever called — the `not calls` assertion below pins
+        that it is not, i.e. that the guard actually short-circuits rather
+        than merely happening to produce the same failure via the
+        subprocess path.
+        """
+        calls: list[list[str]] = []
+
+        def _stub(argv, **kwargs):
+            calls.append(list(argv))
+            raise subprocess.CalledProcessError(
+                2, argv, output='', stderr='error: No `pyproject.toml` found'
+            )
+
+        _force_uv_fallback(monkeypatch, _stub)
+        monkeypatch.setattr(sys.modules[__name__], '_REPO_ROOT', tmp_path)
+
+        with pytest.raises(pytest.fail.Exception) as excinfo:
+            _validate(
+                task_kind='deterministic',
+                metadata={
+                    'task_kind': 'deterministic',
+                    'always_escalates': True,
+                    'before_done': None,
+                },
+                project_root=str(tmp_path),
+            )
+
+        assert not calls, (
+            f'guard must short-circuit before spawning uv, got calls: {calls!r}'
+        )
+        assert not isinstance(excinfo.value, pytest.skip.Exception)
+        assert str(tmp_path / 'fused-memory') in str(excinfo.value), (
+            f'Expected the missing project dir in the failure message, got: '
+            f'{excinfo.value!r}'
+        )
+
+    def test_uv_binary_missing_still_skips(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A genuinely absent uv binary is a legitimate environment gap: skip.
+
+        GREEN GUARD: this is the one case where skipping is the right
+        answer, and it must survive step-6's narrowing of the blanket
+        handler. _REPO_ROOT is left untouched (this worktree's real repo
+        root, which does have a fused-memory/ dir), so the step-4 guard
+        passes and execution reaches the subprocess call.
+        """
+        def _stub(argv, **kwargs):
+            raise FileNotFoundError(2, 'No such file or directory', 'uv')
+
+        _force_uv_fallback(monkeypatch, _stub)
+
+        with pytest.raises(pytest.skip.Exception) as excinfo:
+            _validate(
+                task_kind='deterministic',
+                metadata={
+                    'task_kind': 'deterministic',
+                    'always_escalates': True,
+                    'before_done': None,
+                },
+                project_root=str(tmp_path),
+            )
+
+        message = str(excinfo.value)
+        assert 'uv' in message, f'Expected the skip message to mention uv, got: {message!r}'
+        assert 'No such file or directory' in message, (
+            f'Expected the propagated OSError detail in the skip message, got: {message!r}'
+        )
+
+    def test_uv_subprocess_failure_fails_loudly(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A uv that runs and fails must fail loudly, not be masked as skipped."""
+        argv = ['uv', 'run', '--project', '/x', 'python', '-c', '...']
+
+        def _stub(_argv, **kwargs):
+            raise subprocess.CalledProcessError(
+                1, argv, output='', stderr='ImportError: boom'
+            )
+
+        _force_uv_fallback(monkeypatch, _stub)
+
+        with pytest.raises(pytest.fail.Exception) as excinfo:
+            _validate(
+                task_kind='deterministic',
+                metadata={
+                    'task_kind': 'deterministic',
+                    'always_escalates': True,
+                    'before_done': None,
+                },
+                project_root=str(tmp_path),
+            )
+
+        message = str(excinfo.value)
+        assert 'returncode: 1' in message, (
+            f'Expected the returncode in the failure message, got: {message!r}'
+        )
+        assert 'ImportError: boom' in message, (
+            f'Expected the captured stderr in the failure message, got: {message!r}'
+        )
+
+    def test_uv_subprocess_timeout_fails_loudly(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A hung uv (TimeoutExpired, also a SubprocessError) fails loudly too."""
+        def _stub(argv, **kwargs):
+            raise subprocess.TimeoutExpired(['uv'], 30)
+
+        _force_uv_fallback(monkeypatch, _stub)
+
+        with pytest.raises(pytest.fail.Exception):
+            _validate(
+                task_kind='deterministic',
+                metadata={
+                    'task_kind': 'deterministic',
+                    'always_escalates': True,
+                    'before_done': None,
+                },
+                project_root=str(tmp_path),
+            )
+
+    def test_uv_non_json_stdout_fails_loudly(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Stdout that doesn't parse as JSON must fail loudly, not crash uninformatively.
+
+        Realistic uv behaviour: a warning or resolver line can precede the
+        printed JSON result on stdout (e.g. ``warning: VIRTUAL_ENV=... does
+        not match``). Without this guard that surfaces as a bare
+        json.JSONDecodeError with no --project path, no stdout, and no
+        indication the uv fallback was even in play.
+        """
+        def _stub(argv, **kwargs):
+            return (
+                'warning: VIRTUAL_ENV=/x does not match project environment\n'
+                '{"error": "sentinel-err"}'
+            )
+
+        _force_uv_fallback(monkeypatch, _stub)
+
+        with pytest.raises(pytest.fail.Exception) as excinfo:
+            _validate(
+                task_kind='deterministic',
+                metadata={
+                    'task_kind': 'deterministic',
+                    'always_escalates': True,
+                    'before_done': None,
+                },
+                project_root=str(tmp_path),
+            )
+
+        message = str(excinfo.value)
+        assert not isinstance(excinfo.value, pytest.skip.Exception)
+        assert 'warning: VIRTUAL_ENV' in message, (
+            f'Expected the unparseable stdout in the failure message, got: {message!r}'
         )
 
 

@@ -141,10 +141,12 @@ tasks:
     three Mem0 categories, cluster metrics'
   capabilities:
   - name: qdrant-vector-access-for-ann
-    binding: 'capability→producer — scroll_by_metadata today hardcodes with_vectors=False
-      (mem0_client.py:454 on main); delta widens it to a settable parameter. NOTE:
-      PRD §6 says "with_vectors not yet passed" — it IS passed, as a literal False,
-      so the change is strictly smaller than the substrate row implies'
+    binding: 'capability→producer — scroll_by_metadata (mem0_client.py:341-424)
+      does not pass with_vectors to client.scroll at all on main; delta introduces
+      the parameter rather than widening an existing literal. PRD §6 states "with_vectors
+      not yet passed — delta adds it", which is correct as written. The only with_vectors
+      literal in the module is with_vectors=False inside get_point_by_id (client.retrieve,
+      mem0_client.py:454), a different call site that delta does not touch'
     verdict: PASS
     delivered_check:
       kind: grep

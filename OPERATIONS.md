@@ -2,7 +2,8 @@
 
 The operator's runbook for running Dark Factory day-to-day: starting and
 stopping a project, watching a run, unblocking stuck work, merging, config
-reload, model routing, fleet redeploy, and troubleshooting.
+reload, model routing, fleet redeploy, nightly maintenance timers, and
+troubleshooting.
 
 This document assumes the factory is already installed and at least one
 project has been onboarded. For first-time setup see [README.md](README.md)
@@ -293,6 +294,30 @@ session:
 | `mcp__escalation__get_task_runtime_state` | Live per-task phase/loop/attempt projection (what a task is doing *right now*) |
 | `mcp__fused-memory__get_tasks` / `get_task` | Full task tree, or one task's full record |
 | `mcp__fused-memory__get_statuses` | Compact `{id: status}` map — cheap when you only need status, not full records |
+| `mcp__fused-memory__get_status` | Backend health, plus `reconciliation_halt` — whether reconciliation is halted, why, since when, and whether the cooldown has expired. Pass no `project_id` for the fleet-wide `halted_projects` list |
+| `mcp__fused-memory__get_queue_stats` | Durable-write-queue counts, plus (per-project) `reconciliation_backlog` **and** `reconciliation_halt` — read both together, see below |
+
+### Is reconciliation halted, or just behind?
+
+A large `reconciliation_backlog` has two causes with **opposite remedies**,
+and they look identical from the number alone — that ambiguity cost two days
+of mis-triage on 2026-07-20.
+
+- Read `reconciliation_halt.halted` from the **same** `get_queue_stats` /
+  `get_status` probe; `halt_reason` and `halted_at` say why and since when.
+- **Halted** → `mcp__fused-memory__unhalt_reconciliation(project_id=...)`.
+- **Not halted** → it's capacity; the backlog is draining too slowly (task 3049).
+
+`trigger_reconciliation` on a halted project now answers `status='halted'`
+(with the reason and remedy) instead of `'requested'` — it used to report
+success while the harness skipped every cycle.
+
+This deployment runs `reconciliation.auto_unhalt_after_cooldown: true`
+(`fused-memory/config/config.yaml`, where the rationale sits next to the
+knob): a halt auto-resumes once its cooldown expires, and the judge re-halts
+if the pipeline is still sick. So a halt you find with an already-expired
+cooldown is about to clear itself on the next ~5s tick — in that one window a
+manual trigger IS consumed, and the tool says so.
 
 ---
 
@@ -876,6 +901,185 @@ an operator must call `mcp__escalation__resume_scheduler` once the
 underlying cause is understood and addressed. Check `get_pending_escalations`
 first — a park-and-stop trip is usually accompanied by a cluster of related
 escalations worth triaging before you resume, not just resuming blind.
+
+---
+
+## 12. Nightly maintenance timers
+
+Recurring maintenance runs as systemd **user** timers, not as orchestrator
+work. Each job is the same four files — a committed wrapper `.sh` (all the
+logic, so it is testable and runnable by hand), a thin `Type=oneshot`
+`.service` whose `ExecStart` is that wrapper, a `.timer` carrying the
+cadence, and an idempotent self-verifying `install-*-timer.sh`.
+
+The cadence lives in the unit's `OnCalendar` — **not** in
+`dark-factory-orchestrator.yaml`. The orchestrator process is not the thing
+being scheduled, and that file loads once at startup with no hot-reload, so
+a re-cadence there would cost a cross-repo commit plus a fleet redeploy
+instead of a one-line unit edit and a re-run of the installer.
+
+### The nightly ladder
+
+Slots are staggered deliberately: these jobs share one machine and, in two
+cases, the same backing stores. **Check this table before adding a job** —
+04:00 is already double-booked.
+
+| Slot | Job | Units |
+|---|---|---|
+| 03:00 | Legibility trickle coder | `legibility-trickle@.timer` |
+| 03:30 | fused-memory flag-marker drain | `fused-memory-flag-marker-sweep.timer` |
+| 04:00 | Orphaned-worktree reclaim | `reclaim-orphaned-worktrees.timer` |
+| 04:00 | Legibility transcript check | `legibility-transcript-check@.timer` |
+| 04:30 | reify closure-staleness sweep + drain | `reify-closure-staleness-sweep.timer` |
+
+All timers carry `Persistent=true` (a night missed to a sleeping laptop is
+caught up on next boot/login rather than silently skipped) and
+`RandomizedDelaySec=300`.
+
+Per-job docs: [docs/flag-marker-sweep-recurring.md](docs/flag-marker-sweep-recurring.md)
+for the 03:30 job; the section below for the 04:30 one.
+
+### Nightly reify closure-staleness sweep (04:30)
+
+**What it does.** Runs reify's deterministic-gate closure-staleness sweep,
+then drains the re-dispatch requests that sweep emitted — one job, in
+sequence, so the consumer always reads a directory the sweep has just
+refreshed.
+
+This is a **cross-repo seam**: reify ships the primitive, dark-factory wires
+the invocation. reify's
+`scripts/deterministic-gate-closure-staleness-sweep.sh` is read-only on all
+task state by design (its invariant L6); it adjudicates stranded rows and
+writes one request file per confirmed hit into
+`/home/leo/src/reify/data/redispatch-requests/`. dark-factory's
+`scripts/consume_redispatch_requests.py` performs the actual writes through
+the fused-memory MCP server, so every transition goes through the
+reconciliation-triggering path.
+
+**The normative contract is the reify script itself** — its
+`--emit-requests consumer contract` header block and `_write_request`. Not
+this section, and not reify's
+`docs/notes/deterministic-gate-closure-staleness-sweep.md` digest. Read the
+script before changing either half.
+
+| File | Role |
+|---|---|
+| `scripts/reify-closure-staleness-sweep.sh` | Wrapper: sweep, then consume |
+| `scripts/reify-closure-staleness-sweep.service` | `Type=oneshot` around the wrapper |
+| `scripts/reify-closure-staleness-sweep.timer` | `OnCalendar=*-*-* 04:30:00` |
+| `scripts/install-reify-closure-staleness-sweep-timer.sh` | Installer |
+| `scripts/consume_redispatch_requests.py` | The consumer |
+
+**The three actions**, fixed by the sweep's class of finding:
+
+| Class | Action | Write | Legal row status |
+|---|---|---|---|
+| `gate_closure` | `close` | `set_task_status('cancelled')` | `blocked` only |
+| `merge_verify_red` | `reverify` | clear claimant, then `set_task_status('pending')` | `blocked`, `in-progress` |
+| `unmet_dependency` | `redispatch` | clear claimant, then `set_task_status('pending')` | `blocked` only |
+
+The claimant clear goes **first**: once the row reads `pending` a competing
+dispatcher may stamp a fresh claimant that a late-landing clear would
+clobber (same ordering, and same reason, as the orchestrator's own
+stranded-blocked re-dispatch path in `scheduler.py`).
+
+**The guards.** Before each write the consumer re-reads the row and skips
+when it is already at the target status (an already-applied request is a
+no-op, not a second transition), when its status is outside the class's
+legal scope above, or when its `updatedAt`/`heartbeat_at` post-dates the
+request file's mtime — the row moved after the sweep observed it, so the
+next sweep re-adjudicates. The request body deliberately carries no
+wall-clock field (re-emission is byte-idempotent), which is why mtime is the
+recency signal. Every uncertainty skips: the fail-safe direction is always
+do-nothing.
+
+`--max-writes` (default 5) caps the blast radius. It counts write-bearing
+**attempts** — applied *plus* failed — not successes: the re-dispatch path
+clears the claimant before it flips the status, so a run whose flips are all
+being rejected still mutates every row it touches, and a cap keyed on
+successes alone would never engage on exactly that run. The remainder is
+reported as deferred and picked up next run.
+
+Applied requests are archived into a `consumed/` subdirectory —
+retraction-safe, since the sweep's retraction globs `redispatch-*.json` at
+the top level only. A failed apply leaves its file in place so the retry is
+immediate rather than waiting on re-emission. If the archive move itself
+fails the write still counts as applied and says so loudly; the next run's
+guard then skips the file as already-applied rather than re-transitioning
+the row.
+
+**Two things the consumer deliberately will not do.**
+
+1. **Re-derive the sweep's predicates.** None of the L1 heartbeat/claimant
+   liveness guard, the escalation terminal-allowlist oracle, merge-verify
+   ancestry, the dependency roll-up, or the corruption signatures is
+   reproduced on this side. There is one implementation of the
+   adjudication, in reify, where the evidence lives.
+2. **Act on a `CORRUPT-HOLD` row.** The sweep emits only on
+   `verdict=STALE` (its invariant L5), so a corrupt-hold row produces no
+   file at all — declining to read the sweep's stdout report is sufficient
+   to honour it. Those rows need the human git-history adjudication in
+   reify's `docs/notes/offline-lane-red-corruption-remediation.md` §4.
+
+**First run: dry-run before arming.** The installer deliberately does *not*
+kick an immediate run — unlike its two siblings, this job mutates the live
+reify task store. Read the planned writes first:
+
+```bash
+python3 scripts/consume_redispatch_requests.py --dry-run \
+    --requests-dir /home/leo/src/reify/data/redispatch-requests
+```
+
+Then arm the timer:
+
+```bash
+scripts/install-reify-closure-staleness-sweep-timer.sh
+```
+
+No `dark-factory-orchestrator.yaml` change and no orchestrator redeploy is
+involved in either step.
+
+**Reading the output.** Every line is prefixed
+`consume_redispatch_requests:` and the run ends with exactly one summary
+line — on **every** exit path, including a night that could not reach the
+server at all:
+
+```
+consume_redispatch_requests: task 5321 (gate_closure): close applied -> cancelled [escalation esc-5321-1 resolved 2026-07-29T04:11Z]
+consume_redispatch_requests: SUMMARY applied=2 skipped=7 failed=0 deferred=0 planned=0
+```
+
+The bracketed tail on an applied (or `--dry-run` `WOULD`) line is the
+sweep's own `evidence` string — the only statement of *why* that travels
+with a request, and worth reading before undoing anything, since the file
+itself is archived out of the way the moment the write lands.
+
+- `applied` — writes that landed (checked against the tool response, not
+  assumed from the absence of an exception: a JSON-RPC `error` envelope, a
+  FastMCP `isError` result, and an embedded `success: False` all count as
+  failures)
+- `skipped` — a guard declined, or the file failed validation; the reason is
+  on its own line above
+- `failed` — a write was attempted and did not land; the file stays put
+- `deferred` — `--max-writes` was reached
+- `planned` — `--dry-run` only: writes that *would* have been made
+
+```bash
+journalctl --user -u reify-closure-staleness-sweep.service -n 100
+systemctl --user list-timers reify-closure-staleness-sweep.timer
+```
+
+The service always exits 0 on a valid invocation: a recurring `oneshot` that
+can fail enters systemd `failed` state and stays there, silently stopping
+the whole nightly job. Per-request failures are reported and counted
+instead, so a red run is found by reading the summary line, not the unit
+state.
+
+A night that could not run at all logs a `RUN FAILED` line ahead of its
+(zeroed) summary, and distinguishes the two cases it could be — `could not
+reach the MCP server` (a transport problem: check the fused-memory unit) vs
+`aborted on an unexpected error` (a bug in the consumer: read the exception
+type on that line). Requests are left in place either way.
 
 ---
 

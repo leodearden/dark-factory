@@ -48,6 +48,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 import uuid
 from collections.abc import (
@@ -83,6 +84,7 @@ from orchestrator.lane_lifecycle import (
 )
 from orchestrator.verify_cancel import (
     acquire_merge_verify_flock,
+    lane_lock_holder_pids,
     lane_lock_path,
     read_lock_holder_pgid,
     release_merge_verify_flock,
@@ -1408,6 +1410,15 @@ class MergeVerifyLeaseContended(RuntimeError):
             "refusing to mutate {warm_path} unprotected"; this keeps that one
             piece of context — WHICH tree was being guarded — which the lock
             path alone does not convey.
+        holder_facts: Optional already-rendered kernel-holder attribution
+            (task 3081), appended verbatim.  Attributing reify ``esc-5548-5``
+            took manual ``/proc/locks`` + ``stat -c %i`` forensics across a
+            roughly three-hour fleet stall; naming the holder costs nothing once
+            :func:`~orchestrator.verify_cancel.lane_lock_holder_pids` exists and
+            honours the structured-facts-at-failure invariant.  Rendered by the
+            raise site rather than here so this class stays a pure carrier and
+            performs no I/O in a constructor.  Still ONE template: the facts are
+            an appended clause, not a second message.
     """
 
     def __init__(
@@ -1417,19 +1428,299 @@ class MergeVerifyLeaseContended(RuntimeError):
         *,
         operation: str = 'the merge-verify lease acquire',
         protected_path: Path | None = None,
+        holder_facts: str | None = None,
     ):
         self.lock_path = lock_path
         self.wait_secs = wait_secs
         self.operation = operation
         self.protected_path = protected_path
+        self.holder_facts = holder_facts
         _protecting = (
             f' (protecting {protected_path})' if protected_path is not None else ''
         )
+        _facts = f'; {holder_facts}' if holder_facts else ''
         super().__init__(
             f'merge-verify lane lock {lock_path} still contended after a '
             f'{wait_secs}s bounded wait during {operation}{_protecting} — '
-            f'refusing to proceed unprotected'
+            f'refusing to proceed unprotected{_facts}'
         )
+
+
+class LaneLockSelfOwnedLeak(MergeVerifyLeaseContended):
+    """Raised when the contended ``<lane_dir>.lock`` is held by an fd in THIS
+    process that nothing will ever release — a SELF-OWNED LEAK, not contention
+    (task 3081; PRD ``plans/warm-lane-infra-repatriation-prd.md`` §D8/B13).
+
+    Incident anchor: reify ``esc-5548-5``.  A cancelled
+    :func:`asyncio.to_thread` acquire won the flock after its awaiting coroutine
+    had already gone away, so the fd was discarded unreleased and the lane lock
+    stayed held until process exit.  Three tasks then blocked behind one
+    identical ``merge_outcome_signature``, and because the symptom was
+    indistinguishable from ordinary contention nothing surfaced until an
+    unattended restart roughly three hours later.  Kernel forensics — by hand,
+    at the time — read ``/proc/locks`` and inode-matched
+    ``FLOCK ADVISORY WRITE 588232 07:1d:4300647613`` against
+    ``_merge-verify.lock``.  This class is that diagnosis, made automatic.
+
+    Explicitly NOT either neighbouring case:
+
+    * NOT foreign contention.  A reify ``flock(1)``, a ``verify-merge`` CLI
+      subprocess, or another orchestrator holding the lane is healthy, and stays
+      on the plain :class:`MergeVerifyLeaseContended` fail-closed path.
+    * NOT DF 3003's long-holder case.  A genuine live verify holding the lane
+      past the bounded wait is contention too; it defers quietly rather than
+      raising this.
+
+    IS-A :class:`MergeVerifyLeaseContended`, and payload-compatible with it.
+    That is load-bearing, not taxonomy: both merge-worker consumers
+    (``merge_queue.py``'s cross-check fail-safe and its bounded contended-defer
+    arm) are isinstance-based on the parent, so a standalone type would fall
+    through to the generic ``except Exception`` → ``MergeOutcome('blocked')``
+    with a DETERMINISTIC reason string — an identical
+    ``merge_outcome_signature`` on every attempt, tripping ``workflow.py``'s
+    ``consecutive_merge_thrash`` ladder into precisely the false-positive human
+    escalation DF 3003 was chartered to stop.  ``operation`` and
+    ``protected_path`` are forwarded, and the message keeps both of the parent's
+    contractual properties (it names the protected tree; it never says
+    "deferring", since this raise also reaches ``cli.py``'s ``verify-merge``
+    where it is a TERMINAL bail).
+
+    Detection is REPORT-ONLY — the leaked fd is deliberately not released.  B12
+    (the shielded acquire) is the mechanism that guarantees the hold ends; this
+    is the backstop diagnosis for any residual path.  Blind-releasing an fd
+    whose true owner we could not identify would risk yanking the lock out from
+    under a live in-process span whose registration we failed to observe,
+    converting a diagnosable stall into a silent tree clobber — the exact
+    failure class the lane lock exists to prevent.
+
+    Args:
+        lock_path: The leaked ``<lane_dir>.lock``.
+        wait_secs: The bounded wait that elapsed before giving up.
+        holder_pids: Kernel-reported FLOCK holders of that lock's inode; our own
+            pid is among them, which is what makes this a leak.
+        self_pid: This process's pid.
+        self_pgid: This process's pgid — the corroborating fact the holder-pgid
+            rendezvous would have carried had the orphaned acquire ever
+            completed (it writes the rendezvous only AFTER the acquire returns,
+            which is exactly why a pgid-only check cannot see this fault).
+        operation: Forwarded to the parent — WHICH acquire hit the leak.
+        protected_path: Forwarded to the parent — the tree being guarded.
+        holder_pgid: The recorded rendezvous pgid at detection time, or ``None``
+            when unset.  ``None`` is the expected reading for a genuine leak and
+            is stated in the message so an operator can tell "nothing recorded"
+            from "recorded but dead".
+    """
+
+    def __init__(
+        self,
+        lock_path: Path,
+        wait_secs: float,
+        *,
+        holder_pids: Iterable[int],
+        self_pid: int,
+        self_pgid: int,
+        operation: str = 'the merge-verify lease acquire',
+        protected_path: Path | None = None,
+        holder_pgid: int | None = None,
+    ):
+        self.holder_pids = list(holder_pids)
+        self.self_pid = self_pid
+        self.self_pgid = self_pgid
+        self.holder_pgid = holder_pgid
+        super().__init__(
+            lock_path,
+            wait_secs,
+            operation=operation,
+            protected_path=protected_path,
+            holder_facts=(
+                f'SELF-OWNED LEAK — this process (pid={self_pid}, pgid={self_pgid}) '
+                f'is itself among the kernel FLOCK holders {self.holder_pids} of '
+                f'that lock, with no in-process hold registered and no live '
+                f'merge-verify lease (recorded holder pgid={holder_pgid}): an '
+                f'earlier acquire in this process leaked its fd, and nothing will '
+                f'release it before process exit'
+            ),
+        )
+
+
+# ---------------------------------------------------------------------------
+# In-process held-lane-lock registry (task 3081, D8/B13 layer 2)
+#
+# Layer (1) of the leak predicate — "is our pid among the kernel's FLOCK
+# holders" — cannot tell a LEAKED fd from a LIVE one, because both are held by
+# this process.  This registry is the discriminator: every in-process lane-lock
+# acquire records its fd here and every release forgets it, so a lock the kernel
+# attributes to us with NO entry here is held by an fd no code path owns.
+#
+# Keyed on ``(st_dev, st_ino)``, NOT on a path string, so that layers (1) and
+# (2) agree on what "the same lock" means.  Layer (1) inode-matches /proc/locks
+# against os.stat(lock_path) (see lane_lock_holder_pids, which explains why the
+# kernel's lock table leaves no other choice), while a lane lock FILE can be
+# unlinked and recreated at the same path while an fd still holds the OLD inode
+# — remove_merge_worktree_guarded does exactly that on every tree-gone outcome,
+# unlinking the lock path inside its finally while the fd is still registered.
+# A path-keyed registration could then be consulted for a DIFFERENT inode now
+# living at that path, masking a genuine leak.  The registered identity is read
+# from os.fstat(fd) — the inode the fd actually holds — which no later
+# unlink/recreate can invalidate.
+#
+# Completeness is what makes layer (2) sound, so all three in-process acquire
+# sites register: both leases (via _acquire_lane_flock_off_thread) and
+# remove_merge_worktree_guarded's sub-millisecond sync acquire.  That last one
+# is ephemeral-lane-only and would almost never overlap — but
+# merge_verify_lease(lane_dir=...) can be handed an ephemeral lane (the DF 2822
+# per-land cross-check), so the inodes CAN coincide, and a false leak report is
+# a loud human escalation that must not be reachable from a legitimate hold.
+#
+# Asymmetric by design: a MISSED forget can only mask a real leak (a false
+# negative, degrading to today's behaviour), whereas a missed register would
+# libel a healthy hold.  When in doubt, register — hence the ``None`` identity
+# below, which reads as "a hold whose inode could not be determined" and
+# suppresses detection rather than risking the accusation.
+# ---------------------------------------------------------------------------
+
+#: fd -> ``(st_dev, st_ino)`` of the lane lock it holds, for every lane lock
+#: currently held by this process.  A ``None`` value means "held, but its inode
+#: could not be read"; see :func:`_lane_lock_held_in_process` for why that masks
+#: rather than accuses.
+_HELD_LANE_LOCK_FDS: dict[int, tuple[int, int] | None] = {}
+
+#: Guards :data:`_HELD_LANE_LOCK_FDS`.  A plain ``threading.Lock`` and not an
+#: asyncio primitive: registration happens on ``asyncio.to_thread`` WORKER
+#: THREADS (that is the whole point of the off-thread acquire), so the mutation
+#: is genuinely cross-thread, not merely cross-coroutine.
+_HELD_LANE_LOCK_FDS_LOCK = threading.Lock()
+
+
+def _lane_lock_identity(lock_path: Path) -> tuple[int, int] | None:
+    """``(st_dev, st_ino)`` of *lock_path*, or ``None`` if it cannot be stat'ed.
+
+    The SAME identity :func:`~orchestrator.verify_cancel.lane_lock_holder_pids`
+    inode-matches ``/proc/locks`` against, so layers (1) and (2) of the leak
+    predicate cannot disagree about which lock is under discussion.  Matching on
+    the inode also subsumes what the old resolved-path comparison bought (a lane
+    reached through a symlinked ``worktree_base`` and the same lane reached
+    directly stat to one inode) without the per-call ``Path.resolve()``.
+    """
+    try:
+        st = os.stat(lock_path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino)
+
+
+def _register_held_lane_lock(fd: int, lock_path: Path) -> None:
+    """Record *fd* as a LIVE in-process hold of *lock_path*'s inode.
+
+    The identity is read from the FD (``os.fstat``) rather than from
+    *lock_path*, so a later unlink/recreate at that path cannot silently
+    re-point this registration at an inode the fd does not hold.  *lock_path* is
+    only the fallback for the (practically unreachable) case of an fd that
+    cannot be fstat'ed; when neither can be read the hold is registered with an
+    unknown identity, which masks rather than accuses.
+    """
+    try:
+        st = os.fstat(fd)
+        identity: tuple[int, int] | None = (st.st_dev, st.st_ino)
+    except OSError:
+        identity = _lane_lock_identity(lock_path)
+    with _HELD_LANE_LOCK_FDS_LOCK:
+        _HELD_LANE_LOCK_FDS[fd] = identity
+
+
+def _release_and_forget_held_lane_lock(fd: int) -> None:
+    """Drop *fd*'s kernel flock and its registration ATOMICALLY.
+
+    Atomicity is the point, because BOTH orderings are wrong on their own:
+
+    * **forget, then release** leaves a window in which the kernel still
+      attributes the flock to this pid (layer 1 true) while the registry no
+      longer records it (layer 2 false).  A concurrent same-process acquire
+      whose bounded wait has just expired — e.g.
+      :meth:`GitOps.reset_persistent_merge_worktree`, which proceeds past
+      :meth:`GitOps._merge_verify_lease_active` when the holder shares our pgid
+      — would then report a FALSE self-owned leak against a perfectly healthy
+      hold.  That is a loud, human-escalating event.
+    * **release, then forget** closes the fd first, and the fd NUMBER can be
+      handed straight back out by another thread's ``open`` before the pop
+      lands; the pop would then erase a different, LIVE registration — the same
+      libel, one step removed.
+
+    Holding :data:`_HELD_LANE_LOCK_FDS_LOCK` across both closes each window:
+    :func:`_lane_lock_held_in_process` and :func:`_register_held_lane_lock` take
+    the same lock, so an observer sees either "registered and the kernel holds
+    it" or "not registered and the kernel does not" — never the inconsistent
+    middle, and no reused fd can be registered inside the critical section.
+    Both operations are non-blocking syscalls (``LOCK_UN`` + ``close``), so the
+    section stays sub-millisecond.
+
+    Idempotent, so a double release is harmless.  Must run on EVERY release,
+    including the orphan-callback release, or a reused fd number could later be
+    mistaken for a live hold.
+    """
+    with _HELD_LANE_LOCK_FDS_LOCK:
+        release_merge_verify_flock(fd)
+        _HELD_LANE_LOCK_FDS.pop(fd, None)
+
+
+def _lane_lock_held_in_process(lock_path: Path) -> bool:
+    """True iff some live in-process hold is registered for *lock_path*'s inode.
+
+    Compares ``(st_dev, st_ino)`` rather than path strings, so this agrees with
+    both the kernel-side matching in :func:`lane_lock_holder_pids` and the
+    identity captured at register time.
+
+    Answers ``True`` whenever the truth is genuinely UNKNOWN — the path cannot
+    be stat'ed, or some registered hold's inode could not be read.  This
+    function exists only to VETO leak reports, and the module's asymmetry says
+    an unidentifiable hold must mask a report, never provoke one.  An EMPTY
+    registry is unambiguous and still answers ``False``, which is the reading
+    the genuine-leak case depends on.
+    """
+    target = _lane_lock_identity(lock_path)
+    with _HELD_LANE_LOCK_FDS_LOCK:
+        held = set(_HELD_LANE_LOCK_FDS.values())
+    if not held:
+        return False  # nothing at all is held in-process — unambiguous
+    if target is None or None in held:
+        return True  # unidentifiable: refuse to accuse a possibly-live hold
+    return target in held
+
+
+def _lane_lock_holder_facts(
+    lock_path: Path, holder_pids: list[int] | None = None,
+) -> str:
+    """Render the kernel's view of who holds *lock_path*, for a failure message.
+
+    Names each holder pid and its pgid, flagging any that shares ours — the two
+    facts the incident's manual ``/proc/locks`` + ``stat -c %i`` forensics had to
+    reconstruct by hand.  Fail-safe throughout: an unreadable procfs or a holder
+    that exits mid-render degrades the clause, never the raise it decorates.
+
+    *holder_pids* lets a caller that has ALREADY read the kernel lock table pass
+    that snapshot in (both acquire-timeout sites do, task 3081).  Besides
+    halving the procfs I/O on the ordinary-contention path, it guarantees the
+    rendered clause describes the very holder set the leak predicate evaluated;
+    a second independent read could observe a different one and quietly
+    misdescribe the decision during exactly the forensics this exists for.
+    """
+    pids = lane_lock_holder_pids(lock_path) if holder_pids is None else holder_pids
+    if not pids:
+        return (
+            'the kernel reports no FLOCK holder of that lock (it was likely '
+            'released between the timeout and this probe)'
+        )
+    ours = os.getpgrp()
+    rendered = []
+    for pid in pids:
+        try:
+            pgid = os.getpgid(pid)
+        except OSError:
+            # Exited between the /proc/locks read and here, or not ours to see.
+            rendered.append(f'pid {pid} (pgid unknown)')
+            continue
+        rendered.append(f'pid {pid} (pgid {pgid}{", ours" if pgid == ours else ""})')
+    return 'kernel FLOCK holders: ' + ', '.join(rendered)
 
 
 async def _run(
@@ -2428,6 +2719,82 @@ class GitOps:
             return False  # any other signal failure — fail-open, not held
         return True
 
+    def _lane_lock_self_owned_leak(
+        self,
+        lock_path: Path,
+        wait_secs: float,
+        *,
+        holder_pids: list[int] | None = None,
+        **ctx,
+    ) -> LaneLockSelfOwnedLeak | None:
+        """Return a :class:`LaneLockSelfOwnedLeak` iff *lock_path* is leaked BY
+        US, else ``None`` (task 3081, D8/B13).
+
+        Called only after a bounded-wait acquire has already timed out, to ask
+        the one question that timeout cannot answer on its own: is somebody else
+        legitimately busy, or did WE leak this lock?
+
+        Three layers, ALL required — each alone yields a false positive, and a
+        leak report is a LOUD, human-escalating event:
+
+        1. **Kernel** — our pid is among the FLOCK holders of the lock's inode
+           (:func:`~orchestrator.verify_cancel.lane_lock_holder_pids`).  Any
+           other holder — reify's ``flock(1)``, a ``verify-merge`` CLI
+           subprocess, another orchestrator — is foreign contention and stays on
+           the fail-closed path where it belongs.
+        2. **Registry** — no fd is registered for that path
+           (:func:`_lane_lock_held_in_process`).  Without this, every legitimate
+           concurrent in-process holder would be libelled, most sharply
+           :meth:`task_verify_lease`, which by design never writes the
+           rendezvous layer 3 reads.  This layer gets strictly more important
+           as in-process holds widen.
+        3. **Liveness** — no live recorded verify
+           (:meth:`_merge_verify_lease_active`, reused unchanged with its
+           fail-OPEN semantics).  A genuine long verify holding the lane past
+           the bounded wait is DF 3003's case: contention, to be deferred
+           quietly, not a leak.
+
+        The ``logger.error`` here is the LOUD first-occurrence signal, and is
+        deliberately independent of whatever the caller does with the returned
+        fault.  On the merge path this exception IS-A
+        :class:`MergeVerifyLeaseContended` and so is caught by DF 3003's bounded
+        contended-defer arm BEFORE the block-disposition table is ever
+        consulted — relying on that row's ``escalate_to_human`` alone would let
+        a permanent-until-process-exit leak defer quietly for up to four hours,
+        the same outage shape as the incident (~3h to an unattended restart).
+
+        *holder_pids* accepts an ALREADY-READ kernel snapshot, which both
+        acquire-timeout callers pass so that one ``/proc/locks`` read drives
+        both this decision and the ``holder_facts`` clause rendered beside it
+        (:func:`_lane_lock_holder_facts`).  Two independent reads could observe
+        different holder sets, leaving the message describing a set the
+        predicate never evaluated.  ``None`` reads the table here instead,
+        keeping direct callers (and the tests) two-argument.
+
+        *ctx* forwards ``operation``/``protected_path`` to the fault so it keeps
+        the parent's full payload contract.
+        """
+        if holder_pids is None:
+            holder_pids = lane_lock_holder_pids(lock_path)
+        self_pid = os.getpid()
+        if self_pid not in holder_pids:
+            return None  # layer 1: somebody else holds it — foreign contention
+        if _lane_lock_held_in_process(lock_path):
+            return None  # layer 2: a registered in-process hold is LIVE
+        if self._merge_verify_lease_active():
+            return None  # layer 3: a live recorded verify — DF 3003's case
+        leak = LaneLockSelfOwnedLeak(
+            lock_path,
+            wait_secs,
+            holder_pids=holder_pids,
+            self_pid=self_pid,
+            self_pgid=os.getpgrp(),
+            holder_pgid=read_lock_holder_pgid(self.worktree_base),
+            **ctx,
+        )
+        logger.error('%s', leak)
+        return leak
+
     @staticmethod
     async def _acquire_lane_flock_off_thread(
         lock_path: Path, wait_secs: float,
@@ -2451,10 +2818,91 @@ class GitOps:
         (contended). Each lease encodes its OWN policy on that ``None``:
         :meth:`merge_verify_lease` RAISES :class:`MergeVerifyLeaseContended`;
         :meth:`task_verify_lease` fails OPEN (WARNING + proceed).
+
+        A won fd is registered as a LIVE in-process hold (task 3081) before it
+        is returned, so :meth:`GitOps._lane_lock_self_owned_leak` can tell this
+        legitimate hold from a leaked one — at kernel level the two are
+        identical, both being flocks attributed to our pid.
+
+        CANCELLATION (task 3081, D8/B12) — a cancelled acquire can NEVER orphan
+        the fd. The worker thread is uninterruptible BY DESIGN: cancelling the
+        awaiter does not stop the acquire, it only stops anyone from seeing what
+        the acquire wins. So the contract cannot be "don't win"; it must be
+        "ownership of a late win TRANSFERS to the canceller's cleanup path",
+        which is what :meth:`_release_orphaned_lane_flock` implements.
+
+        The :func:`asyncio.shield` is LOAD-BEARING, not defensive styling —
+        verified empirically. Under a plain ``await``, cancelling the awaiter
+        cancels the inner future too; ``asyncio.futures._copy_future_state``
+        then bails on ``dest.cancelled()`` and DISCARDS the thread's return
+        value, so the fd is unreachable and no code path can ever release it —
+        the lane stays locked until process exit (reify ``esc-5548-5``: three
+        tasks blocked behind one lane, diagnosed only by hand from
+        ``/proc/locks``). Shielded, the inner future stays uncancelled and still
+        delivers the fd to the done-callback, which releases it.
+
+        The module-global :func:`acquire_merge_verify_flock` is deliberately
+        resolved at CALL time (inside the :func:`asyncio.to_thread` argument
+        list) rather than bound earlier, keeping the suite's
+        ``monkeypatch.setattr('orchestrator.git_ops.acquire_merge_verify_flock',
+        ...)`` seam — and its off-the-event-loop-thread pin — intact.
         """
-        return await asyncio.to_thread(
-            acquire_merge_verify_flock, lock_path, wait_secs,
+        inner = asyncio.ensure_future(
+            asyncio.to_thread(acquire_merge_verify_flock, lock_path, wait_secs)
         )
+        try:
+            fd = await asyncio.shield(inner)
+        except asyncio.CancelledError:
+            # We are gone, but the acquire is not: hand whatever it wins to the
+            # orphan-release callback rather than dropping it on the floor.
+            inner.add_done_callback(
+                functools.partial(GitOps._release_orphaned_lane_flock, lock_path)
+            )
+            raise
+        if fd is not None:
+            _register_held_lane_lock(fd, lock_path)
+        return fd
+
+    @staticmethod
+    def _release_orphaned_lane_flock(lock_path: Path, fut: asyncio.Future) -> None:
+        """Release a lane flock won by an acquire whose awaiter was CANCELLED
+        (task 3081, D8/B12).
+
+        Runs as the shielded acquire's done-callback, i.e. on the event loop
+        AFTER the cancelling coroutine has already resumed — the only place that
+        can still see the late-won fd.
+
+        Three outcomes, all handled: the acquire itself was cancelled or raised
+        (nothing was won — return, and note that calling ``fut.exception()``
+        also marks it retrieved so asyncio does not log it as unhandled); it
+        timed out and returned ``None`` (nothing is held —
+        :meth:`_release_lane_flock`'s existing ``None`` guard makes this a
+        silent no-op rather than a ``TypeError`` from ``fcntl.flock(None, ...)``
+        surfacing through the loop exception handler); or it won an fd, which is
+        released here.
+
+        Logged at WARNING because a lane lock won by nobody is worth seeing in
+        the record even though it is now handled: it means a verify/reset was
+        cancelled mid-acquire, and the frequency of that is a real signal.
+        Released through :meth:`_release_lane_flock` so the in-process held-fd
+        registry stays consistent — the fd was never registered (registration
+        happens only on the success path above), and the registry pop is a
+        harmless no-op that keeps the one release path single.
+        """
+        if fut.cancelled():
+            return
+        if fut.exception() is not None:
+            return
+        fd = fut.result()
+        if fd is None:
+            return
+        logger.warning(
+            'lane flock for %s was won AFTER its acquire was cancelled; '
+            'releasing the orphaned fd rather than leaking the lane '
+            '(task 3081, D8/B12)',
+            lock_path,
+        )
+        GitOps._release_lane_flock(fd)
 
     @staticmethod
     def _release_lane_flock(fd: int | None) -> None:
@@ -2468,9 +2916,17 @@ class GitOps:
         never reaches its finally with a ``None`` fd (it raises on contention
         first), so the guard is a harmless no-op there — a shared release that
         is safe for both leases.
+
+        Also drops *fd*'s in-process hold registration (task 3081), keeping the
+        registry symmetric with :meth:`_acquire_lane_flock_off_thread`.  The
+        kernel release and the registry pop happen ATOMICALLY, via
+        :func:`_release_and_forget_held_lane_lock` — not merely adjacently:
+        either order taken alone leaves a window in which a concurrent
+        same-process acquire could libel this healthy hold as a leak.  See that
+        function for both windows.
         """
         if fd is not None:
-            release_merge_verify_flock(fd)
+            _release_and_forget_held_lane_lock(fd)
 
     @contextlib.asynccontextmanager
     async def merge_verify_lease(self, lane_dir: Path | None = None):
@@ -2526,7 +2982,12 @@ class GitOps:
         :class:`MergeVerifyLeaseContended` so the caller DEFERS/requeues the
         dispatch rather than running the verify unprotected (task 2828, limb
         2) — the old behaviour yielded without a lease, letting a 1--2h verify
-        race a concurrent reseed/thin/gc clobber. The acquire runs OFF the
+        race a concurrent reseed/thin/gc clobber. When the kernel attributes
+        that contended lock to THIS process with no registered in-process hold
+        and no live verify, the raise is instead the
+        :class:`LaneLockSelfOwnedLeak` subclass naming our pid/pgid (task 3081,
+        D8/B13) — a leaked fd is not contention, and the two were previously
+        indistinguishable. The acquire runs OFF the
         event loop via :func:`asyncio.to_thread`, because the now-minutes-long
         synchronous poll would otherwise freeze the orchestrator (mirroring
         :meth:`reset_persistent_merge_worktree`'s off-thread acquire). The
@@ -2544,11 +3005,30 @@ class GitOps:
             lock_path, _MERGE_VERIFY_LEASE_WAIT_SECS,
         )
         if fd is None:
+            # ONE kernel snapshot drives both the decision and the message
+            # (task 3081): a second, independent /proc/locks read for the
+            # render could observe a different holder set than the predicate
+            # evaluated, misdescribing the very decision an operator is trying
+            # to reconstruct.
+            holder_pids = lane_lock_holder_pids(lock_path)
+            # Is this OUR OWN leaked lock rather than somebody else's live
+            # hold?  Asked first, because the answer changes the diagnosis
+            # entirely (task 3081) — and only ever REPORTS: the refusal below
+            # is unchanged either way.
+            leak = self._lane_lock_self_owned_leak(
+                lock_path, _MERGE_VERIFY_LEASE_WAIT_SECS, holder_pids=holder_pids,
+            )
+            if leak is not None:
+                raise leak
             # Contended past the bounded wait: RAISE so the dispatch is
             # DEFERRED/requeued rather than run unprotected (task 2828, limb
             # 2). The old path yielded without a lease here, letting a 1--2h
             # verify race a concurrent reseed/thin/gc clobber.
-            raise MergeVerifyLeaseContended(lock_path, _MERGE_VERIFY_LEASE_WAIT_SECS)
+            raise MergeVerifyLeaseContended(
+                lock_path,
+                _MERGE_VERIFY_LEASE_WAIT_SECS,
+                holder_facts=_lane_lock_holder_facts(lock_path, holder_pids),
+            )
         write_lock_holder_pgid(self.worktree_base, os.getpgrp())
         try:
             yield
@@ -8932,6 +9412,15 @@ class GitOps:
 
         lock_path = lane_lock_path(path)
         fd = acquire_merge_verify_flock(lock_path, 0.0)
+        if fd is not None:
+            # Registered like every other in-process lane-lock hold (task 3081):
+            # this acquire is sub-millisecond and ephemeral-lane-only, but
+            # merge_verify_lease(lane_dir=...) can be handed an ephemeral lane
+            # (the DF 2822 per-land cross-check), so the inodes CAN coincide.
+            # Layer (2) of the leak predicate is only sound if the registry is
+            # COMPLETE, and a leak report is a loud human escalation that must
+            # never be reachable from a legitimate hold.
+            _register_held_lane_lock(fd, lock_path)
         if fd is None:
             holder = read_lock_holder_pgid(self.worktree_base)
             logger.warning(
@@ -8978,7 +9467,11 @@ class GitOps:
             if unlink_lock:
                 with contextlib.suppress(Exception):
                     os.unlink(lock_path)
-            release_merge_verify_flock(fd)
+            # Kernel release + registry pop, atomically (task 3081).  The
+            # registration above captured the fd's INODE, so the unlink just
+            # performed cannot re-point it at whatever a contender may since
+            # have created at this path.
+            _release_and_forget_held_lane_lock(fd)
 
     async def cleanup_merge_worktree(self, merge_wt: Path) -> None:
         """Remove a temporary merge worktree, crash-safely (task 2922).
@@ -9432,6 +9925,16 @@ class GitOps:
         The raise is deliberately SITE-LOCAL to the acquire — the git
         failures inside the body below stay plain ``RuntimeError`` so a
         genuine git fault still classifies as blocked.
+        Raises :exc:`LaneLockSelfOwnedLeak` (task 3081, D8/B13) — a SUBCLASS
+        of the above, so every caller keeps working unchanged — when that
+        same timeout is caused by a lane lock the kernel attributes to THIS
+        process with no registered in-process hold and no live verify.  That
+        is a leaked fd, not contention: nothing will release it before process
+        exit, so deferring will never succeed.  The two were previously
+        indistinguishable, which is why reify ``esc-5548-5`` took roughly
+        three hours and manual ``/proc/locks`` forensics to attribute.  The
+        tree is left untouched either way — this changes the DIAGNOSIS, not
+        the refusal.
         Raises :exc:`MergeVerifyLeaseHeld` (task 2315, BUG 1) BEFORE
         touching the tree at all when a DIFFERENT live process holds the
         merge-verify lease — self pgid is excluded so the normal
@@ -9452,19 +9955,15 @@ class GitOps:
         acquire runs off the event loop (:func:`asyncio.to_thread`) so a
         contended wait never stalls other in-process coroutines.
 
-        Cancellation caveat: :func:`asyncio.to_thread` cannot stop the
-        worker thread mid-wait — if this coroutine is cancelled while the
-        thread is still polling for the flock, the ``await`` raises
-        ``CancelledError`` immediately, but the thread keeps running to
-        completion. If it goes on to acquire the flock, the returned fd is
-        never seen by this (already-cancelled) coroutine, so
-        :func:`release_merge_verify_flock` never runs for it and the lane
-        lock stays held until process exit. This window requires
-        cancellation to race the acquire and is bounded by
-        ``_RESET_WARM_LANE_LOCK_WAIT_SECS``, so it is treated as an accepted,
-        documented edge case here rather than guarded — a shielded-cleanup
-        fix would add async-ownership complexity out of proportion to this
-        task's scope.
+        Cancellation (task 3081, D8/B12): the acquire goes through the SHARED
+        cancellation-guarded seam :meth:`_acquire_lane_flock_off_thread`, so a
+        cancelled reset can never orphan the lane lock. The worker thread is
+        uninterruptible by design — cancelling this coroutine does not stop the
+        acquire — but ownership of any late-won fd transfers to that seam's
+        orphan-release callback instead of being discarded. This method
+        previously hand-rolled its own :func:`asyncio.to_thread` acquire and so
+        opted out of the guarantee: a cancellation racing the acquire left the
+        lane locked until process exit, which is reify ``esc-5548-5``.
         """
         warm_path = self.persistent_merge_worktree_path
 
@@ -9473,13 +9972,30 @@ class GitOps:
             raise MergeVerifyLeaseHeld(warm_path, holder_pgid)
 
         lock_path = lane_lock_path(warm_path)
-        # See the cancellation caveat in this method's docstring: cancelling
-        # this await cannot stop the to_thread worker, so a fd acquired
-        # after cancellation has already propagated is discarded unreleased.
-        fd = await asyncio.to_thread(
-            acquire_merge_verify_flock, lock_path, _RESET_WARM_LANE_LOCK_WAIT_SECS,
+        # The ONE cancellation-guarded acquire seam, shared with both leases
+        # (task 3081): a fd won after this await is cancelled is released by the
+        # seam's orphan callback rather than leaked until process exit.
+        fd = await self._acquire_lane_flock_off_thread(
+            lock_path, _RESET_WARM_LANE_LOCK_WAIT_SECS,
         )
         if fd is None:
+            # ONE kernel snapshot for both the decision and the message
+            # (task 3081) — see merge_verify_lease's identical read.
+            holder_pids = lane_lock_holder_pids(lock_path)
+            # Is this OUR OWN leaked lock rather than a live foreign hold?
+            # Asked FIRST (task 3081): the incident's symptom was exactly this
+            # timeout, and the leak is invisible unless something asks.  It
+            # only ever REPORTS — the fail-CLOSED refusal below is unchanged
+            # either way, so the tree is untouched in both cases.
+            leak = self._lane_lock_self_owned_leak(
+                lock_path,
+                _RESET_WARM_LANE_LOCK_WAIT_SECS,
+                holder_pids=holder_pids,
+                operation='the warm merge-worktree reset',
+                protected_path=warm_path,
+            )
+            if leak is not None:
+                raise leak
             # SITE-LOCAL raise (task 3003): scoped to the lock ACQUIRE alone.
             # A live reify/DF actor still holds the lane lock, so the tree is
             # left completely untouched (fail-CLOSED) and the caller must
@@ -9495,6 +10011,7 @@ class GitOps:
                 # RuntimeError carried ('refusing to mutate {warm_path}
                 # unprotected'): WHICH tree this refusal is protecting.
                 protected_path=warm_path,
+                holder_facts=_lane_lock_holder_facts(lock_path, holder_pids),
             )
         try:
             if not await self._is_registered_worktree(warm_path):
@@ -9549,7 +10066,11 @@ class GitOps:
                     warm_path, merge_commit[:8],
                 )
         finally:
-            release_merge_verify_flock(fd)
+            # Paired with the guarded acquire above (task 3081) so the
+            # in-process held-fd registry stays symmetric — a hold this method
+            # forgot to deregister would look like a leaked lane lock forever
+            # after, and a leak report is a loud, human-escalating event.
+            self._release_lane_flock(fd)
 
         return warm_path
 

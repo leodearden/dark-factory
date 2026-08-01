@@ -29,6 +29,7 @@ Test coverage:
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -39,7 +40,12 @@ import pytest
 # Cross-module reuse (task 2610 precedent — see test_workflow_terminal_report.py
 # for the same import shape): these factories live in _workflow_helpers.py, not
 # in any single test module's private namespace.
-from _orch_helpers import _init_harness_state_for_test, wire_scheduler_liveness_mock
+from _orch_helpers import (
+    CANCEL_SCOPE_BARRIER_TIMEOUT,
+    CANCEL_SCOPE_PURE_UNIT_TIMEOUT,
+    _init_harness_state_for_test,
+    wire_scheduler_liveness_mock,
+)
 from _workflow_helpers import (
     AgentStub,
     _build_workflow,
@@ -240,6 +246,11 @@ class TestCancellationScopeSoftCancel:
 class TestCancellationScopeHardCancel:
     """No real ``TaskWorkflow`` involved — pure asyncio.Task cancellation +
     recording on_terminal list, per the plan's step-05 spec.
+
+    task 3307: barriers below use the small, pure-in-memory
+    ``CANCEL_SCOPE_PURE_UNIT_TIMEOUT`` — NOT the real-I/O-sized
+    ``CANCEL_SCOPE_BARRIER_TIMEOUT`` — so this class keeps pytest's 60s
+    default hang detector. See _orch_helpers for the rationale.
     """
 
     @pytest.mark.asyncio
@@ -260,7 +271,7 @@ class TestCancellationScopeHardCancel:
         outer.cancel()
         # asyncio.wait (unlike a bare `await outer`) never itself raises,
         # even if outer ends up CANCELLED — lets us inspect the outcome.
-        await asyncio.wait({outer}, timeout=5.0)
+        await asyncio.wait({outer}, timeout=CANCEL_SCOPE_PURE_UNIT_TIMEOUT)
 
         assert outer.done()
         assert not outer.cancelled(), (
@@ -316,7 +327,7 @@ class TestCancellationScopeHardCancel:
         await asyncio.sleep(0.02)  # land mid-sleep inside the first on_terminal entry
         outer.cancel()  # 2nd cancel: must not truncate the still-running cleanup
 
-        await asyncio.wait({outer}, timeout=5.0)
+        await asyncio.wait({outer}, timeout=CANCEL_SCOPE_PURE_UNIT_TIMEOUT)
 
         assert outer.done()
         assert not outer.cancelled(), (
@@ -388,6 +399,7 @@ def task_assignment() -> TaskAssignment:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(180)  # task 3307: must exceed 2x CANCEL_SCOPE_BARRIER_TIMEOUT (45s) below
 class TestRunSingleCatchHardCancel:
     """Boundary row 14: ``run()`` must RETURN a ``TerminalReport`` on a
     harness-style hard-cancel, never let ``CancelledError`` escape — and
@@ -398,6 +410,9 @@ class TestRunSingleCatchHardCancel:
     RED until step-8 wires the ``CancellationScope`` into ``run()``: today
     ``run()`` is a bare ``await self._drive()`` with no catch, so cancelling
     the run()-task leaves that task itself CANCELLED instead of returning.
+
+    task 3307: barriers below use ``CANCEL_SCOPE_BARRIER_TIMEOUT`` — see
+    _orch_helpers for the measurement basis and never-narrow rule.
     """
 
     async def test_hard_cancel_mid_verify_returns_cancelled_report(
@@ -420,15 +435,17 @@ class TestRunSingleCatchHardCancel:
         workflow._verify_debugfix_loop = _wedge_verify  # type: ignore[method-assign]
 
         run_task = asyncio.create_task(workflow.run())
-        await asyncio.wait_for(wedged.wait(), timeout=5.0)
+        await asyncio.wait_for(wedged.wait(), timeout=CANCEL_SCOPE_BARRIER_TIMEOUT)
         assert workflow.machine.state == WorkflowState.VERIFY
 
         # Harness-style hard-cancel: cancel the task running run() directly
         # (mirrors harness.hard_cancel_workflow's task.cancel() on the
         # registered slot task).
         run_task.cancel()
-        done, _pending = await asyncio.wait({run_task}, timeout=5.0)
-        assert run_task in done, 'run() task did not finish within 5s'
+        done, _pending = await asyncio.wait({run_task}, timeout=CANCEL_SCOPE_BARRIER_TIMEOUT)
+        assert run_task in done, (
+            f'run() task did not finish within {CANCEL_SCOPE_BARRIER_TIMEOUT}s'
+        )
 
         assert not run_task.cancelled(), (
             'CancelledError escaped run() instead of being translated into '
@@ -708,11 +725,16 @@ class TestOnTerminalCleanups:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(180)  # task 3307: must exceed 2x CANCEL_SCOPE_BARRIER_TIMEOUT (45s) below
 class TestSoftCancelCoversNewAwait:
     """Boundary row 15(a): a soft-cancel during a long await NOT wrapped by
     ``_await_cancellable`` is still caught by the ``CancellationScope``'s own
     body-task race — ``run()`` returns ``TerminalReport(SOFT_CANCELLED)``,
-    ``machine.state == CANCELLED``, and the lane is released (kind='soft')."""
+    ``machine.state == CANCELLED``, and the lane is released (kind='soft').
+
+    task 3307: barriers below use ``CANCEL_SCOPE_BARRIER_TIMEOUT`` — see
+    _orch_helpers for the measurement basis and never-narrow rule.
+    """
 
     async def test_soft_cancel_during_unwrapped_await_returns_soft_cancelled_report(
         self, config, git_ops, task_assignment, monkeypatch,
@@ -739,15 +761,17 @@ class TestSoftCancelCoversNewAwait:
         workflow.git_ops.release_lane_for_terminal_task = _spy_release_lane  # type: ignore[method-assign]
 
         run_task = asyncio.create_task(workflow.run())
-        await asyncio.wait_for(wedged.wait(), timeout=5.0)
+        await asyncio.wait_for(wedged.wait(), timeout=CANCEL_SCOPE_BARRIER_TIMEOUT)
         assert workflow.machine.state == WorkflowState.VERIFY
 
         # Soft-cancel: set the event directly — no task.cancel() involved.
         # Mirrors a human release_workflow / watcher-triggered soft-cancel
         # arriving while wedged on a wait _await_cancellable never sees.
         workflow._cancel_event.set()
-        done, _pending = await asyncio.wait({run_task}, timeout=5.0)
-        assert run_task in done, 'run() task did not finish within 5s'
+        done, _pending = await asyncio.wait({run_task}, timeout=CANCEL_SCOPE_BARRIER_TIMEOUT)
+        assert run_task in done, (
+            f'run() task did not finish within {CANCEL_SCOPE_BARRIER_TIMEOUT}s'
+        )
         assert not run_task.cancelled(), (
             'CancelledError escaped run() on a soft-cancel'
         )
@@ -760,6 +784,38 @@ class TestSoftCancelCoversNewAwait:
         assert release_calls == ['42'], (
             'kind=soft must release the lane even from a still-working state'
         )
+
+
+# ---------------------------------------------------------------------------
+# task 3307 (reviewer follow-up): never-narrow guards for the two barrier
+# constants
+# ---------------------------------------------------------------------------
+#
+# An earlier version of this amendment drove a full real TaskWorkflow
+# through an injected 6s-slow prologue (TestCancelBarrierToleratesSlowPrologue)
+# to prove CANCEL_SCOPE_BARRIER_TIMEOUT > 6.0. Review found that too weak
+# (it passes for any value >~7, so a narrowing 45 -> 10 would still sail
+# through green) and too expensive (~14s of unconditional asyncio.sleep,
+# the two slowest tests in this module by ~5x) for what it actually pinned
+# beyond TestRunSingleCatchHardCancel / TestSoftCancelCoversNewAwait above
+# — those already fully cover the cancel -> TerminalReport contract this
+# class re-asserted under a slow prologue. These two zero-cost assertions
+# pin the same never-narrow invariant directly, so a future edit that
+# quietly shrinks either constant back toward its retired literal fails
+# instantly instead of surfacing as an intermittent multi-second timeout.
+
+
+def test_cancel_scope_barrier_timeout_never_narrowed():
+    """See _orch_helpers.CANCEL_SCOPE_BARRIER_TIMEOUT: must stay large
+    enough to safely replace every retired literal <=15 it was introduced
+    to cover."""
+    assert CANCEL_SCOPE_BARRIER_TIMEOUT >= 15
+
+
+def test_cancel_scope_pure_unit_timeout_never_narrowed():
+    """See _orch_helpers.CANCEL_SCOPE_PURE_UNIT_TIMEOUT: must stay >= the
+    retired 5.0s literal it replaces in TestCancellationScopeHardCancel."""
+    assert CANCEL_SCOPE_PURE_UNIT_TIMEOUT >= 5
 
 
 @pytest.mark.asyncio
@@ -888,12 +944,17 @@ def _make_harness_for_run_slot() -> Harness:
     return h
 
 
+@pytest.mark.timeout(180)  # task 3307: must exceed 2x CANCEL_SCOPE_BARRIER_TIMEOUT (45s) below
 class TestHarnessSyntheticCancelRetirement:
     """RED (step-13): ``TaskReport`` sheds ``synthetic_cancel`` — it can no
     longer be constructed with the field, and the harness's hard-cancel
     safety-net report carries no such attribute (field + B2 release block
     retired); the ``except asyncio.CancelledError`` safety net keeps
-    returning a CANCELLED report with cleanup/sem intact."""
+    returning a CANCELLED report with cleanup/sem intact.
+
+    task 3307: the poll and the wait below use ``CANCEL_SCOPE_BARRIER_TIMEOUT``
+    — see _orch_helpers for the measurement basis and never-narrow rule.
+    """
 
     def test_task_report_construction_rejects_synthetic_cancel_kwarg(self):
         with pytest.raises(TypeError):
@@ -930,18 +991,25 @@ class TestHarnessSyntheticCancelRetirement:
             wrapper_task = asyncio.create_task(h._run_slot(assignment, sem))
 
             # Poll until _run_slot registers itself in _workflow_slot_tasks.
-            for _ in range(50):
-                if tid in h._workflow_slot_tasks:
-                    break
+            # task 3307: monotonic-deadline poll (house idiom, e.g.
+            # test_merge_queue.py:5512-5522) replacing the old fixed 50 x
+            # 0.01s = 0.5s iteration budget — a synchronization barrier on
+            # real scheduling latency, not a timing assertion.
+            deadline = time.monotonic() + CANCEL_SCOPE_BARRIER_TIMEOUT
+            while tid not in h._workflow_slot_tasks:
+                if time.monotonic() >= deadline:
+                    pytest.fail(
+                        f'_run_slot did not register itself in _workflow_slot_tasks '
+                        f'within {CANCEL_SCOPE_BARRIER_TIMEOUT}s'
+                    )
                 await asyncio.sleep(0.01)
-            assert tid in h._workflow_slot_tasks, (
-                '_run_slot did not register itself in _workflow_slot_tasks'
-            )
 
             h.hard_cancel_workflow(tid)
 
-            done, _pending = await asyncio.wait({wrapper_task}, timeout=5.0)
-            assert wrapper_task in done, 'wrapper_task did not finish within 5s'
+            done, _pending = await asyncio.wait({wrapper_task}, timeout=CANCEL_SCOPE_BARRIER_TIMEOUT)
+            assert wrapper_task in done, (
+                f'wrapper_task did not finish within {CANCEL_SCOPE_BARRIER_TIMEOUT}s'
+            )
 
         assert not wrapper_task.cancelled(), (
             'Expected _run_slot to return a synthetic CANCELLED TaskReport, '

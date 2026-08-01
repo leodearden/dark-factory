@@ -36,9 +36,13 @@ logger = logging.getLogger(__name__)
 
 # --- Priority-tier constants (value/h scheduler) ---
 #
-# Canonical 5-tier priority order.  Lower rank = higher priority.  Unknown
-# priority strings coerce to DEFAULT_TIER so legacy tasks and typos never crash
-# the scheduler.
+# Canonical 5-tier priority order.  Lower rank = higher priority.  An unset
+# (None) priority silently coerces to DEFAULT_TIER — that is a normal,
+# expected state (e.g. subtasks in this repo's tasks.json routinely carry no
+# priority), not an anomaly.  An unrecognized non-None value (a typo or a
+# stale tier string) also coerces to DEFAULT_TIER so it never crashes the
+# scheduler, but that path is logged loudly instead, since it means some
+# upstream caller passed something the config layer doesn't understand.
 PRIORITY_TIERS: tuple[str, ...] = ('critical', 'high', 'medium', 'low', 'polish')
 PRIORITY_RANK: dict[str, int] = {tier: i for i, tier in enumerate(PRIORITY_TIERS)}
 DEFAULT_TIER: str = 'medium'
@@ -54,11 +58,79 @@ TIER_BASE: dict[str, int] = {
     'polish': 1000,
 }
 
+# Per-process warn-once dedup for coerce_tier()'s unrecognized-value WARNING
+# below, keyed by a length-capped repr(value) (safe for unhashable/non-str
+# inputs) — mirrors the b3_gate._warned_description_read_failures /
+# sqlite_task_backend._warned_malformed_task_ids house pattern for
+# module-level dedup sets. A process restart clears the memo and
+# re-enables the warning.
+#
+# Bounded in two dimensions because orchestrator.config is imported into
+# the scheduler's multi-day daemon process:
+#   - entry COUNT: an unbounded stream of distinct bad priority values (an
+#     adversarial or corrupt tasks.json) would otherwise grow this set
+#     forever. Once the cap is reached, coerce_tier() emits exactly one
+#     final WARNING noting the cap and then suppresses further
+#     unrecognized-priority warnings entirely (rather than either leaking
+#     memory or re-flooding the log on every call past the cap).
+#   - entry SIZE: the same adversarial/corrupt tasks.json could hand a
+#     large nested blob as a "priority", so both the memo key and the
+#     logged value are truncated to _MAX_PRIORITY_VALUE_REPR_LEN instead
+#     of retaining/logging the full repr().
+_warned_priority_values: set[str] = set()
+_MAX_WARNED_PRIORITY_VALUES = 1000
+_MAX_PRIORITY_VALUE_REPR_LEN = 200
+
 
 def coerce_tier(value: Any) -> str:
-    """Normalize a priority value (possibly None/unknown) to a canonical tier."""
+    """Normalize a priority value (possibly None/unknown) to a canonical tier.
+
+    An unset (None) priority is a NORMAL expected state — not an anomaly —
+    so it falls back to DEFAULT_TIER silently; it is a default, not a
+    fail-soft fallback, and the repo's no-silent-fail-soft invariant does
+    not apply to it. An unrecognized non-None value (a typo or a stale tier
+    string) still falls back to DEFAULT_TIER so legacy tasks and typos never
+    crash the scheduler, but that fallback IS logged loudly (rather than
+    silently): it means some upstream caller passed something the config
+    layer doesn't understand, and that should be observable.
+    ``stacklevel=2`` attributes the log record to the caller's file/line
+    (the actual call site) rather than to this helper. To avoid flooding a
+    hot path (e.g. the scheduler re-coercing the same raw values every
+    tick), each distinct unrecognized value is only warned about once per
+    process — see ``_warned_priority_values`` above.
+    """
     if isinstance(value, str) and value in PRIORITY_RANK:
         return value
+    if value is None:
+        return DEFAULT_TIER
+
+    key = repr(value)[:_MAX_PRIORITY_VALUE_REPR_LEN]
+    # Cap not yet reached and this value hasn't been warned about before —
+    # if the memo is already full, or this value was already warned about,
+    # fall straight through and suppress silently (the cap-reached notice
+    # below fires exactly once, on the call that fills the last slot).
+    if (
+        key not in _warned_priority_values
+        and len(_warned_priority_values) < _MAX_WARNED_PRIORITY_VALUES
+    ):
+        _warned_priority_values.add(key)
+        # Log the (already-truncated) key rather than %r-formatting the raw
+        # value again — for a large/adversarial value that second repr()
+        # would blow the log-line-size bound the truncation above exists
+        # to enforce.
+        logger.warning(
+            'coerce_tier: unrecognized priority %s, falling back to %r',
+            key,
+            DEFAULT_TIER,
+            stacklevel=2,
+        )
+        if len(_warned_priority_values) >= _MAX_WARNED_PRIORITY_VALUES:
+            logger.warning(
+                'coerce_tier: unrecognized-priority warning memo reached '
+                'its cap of %d distinct values; suppressing further '
+                'unrecognized-priority warnings until process restart',
+                _MAX_WARNED_PRIORITY_VALUES,
+            )
     return DEFAULT_TIER
 
 
@@ -3376,6 +3448,20 @@ class OrchestratorConfig(BaseSettings):
     # genuinely stranded task's stale decision still ages out and promotes.
     # Green-tier hot-reloadable (see RELOADABLE_FIELDS).
     orphan_l0_dispatch_freshness_secs: float = Field(default=300.0)
+    # Task 2991: freshness grace (seconds) for the merge-phase-liveness gate in
+    # the orphan-L0 divergence reaper. The divergence false positive recurred
+    # for MERGE-stage tasks (successor to task 2931): the pre-enqueue merge
+    # loop (rebase + scoped verify + queue submit) makes NO LLM calls, so it
+    # never refreshes ``metadata.routing.latest.decided_at`` — a legitimately
+    # live merge-stage task therefore fails the ``_has_fresh_dispatch`` gate
+    # and gets false-promoted. A durable ``metadata.merge_phase_liveness.
+    # entered_at`` stamp (restart-survivable, written at merge entry) is read
+    # by ``_has_fresh_merge_phase``; if within this grace of the sweep ``now``
+    # the divergence L0 is deferred (not promoted). Default 600.0 anchored to
+    # ``orchestrator_restart_merge_phase_grace_secs`` (the existing legitimate
+    # pre-enqueue merge-phase duration bound), not a guessed threshold.
+    # Green-tier hot-reloadable (see RELOADABLE_FIELDS).
+    orphan_l0_merge_phase_freshness_secs: float = Field(default=600.0)
 
     # Terminal-status watcher — periodically polls fused-memory for active
     # workflow tasks whose status has gone terminal out-of-band (typical
@@ -3460,6 +3546,23 @@ class OrchestratorConfig(BaseSettings):
     # kill-switch convention; set to False to restore legacy single-observation
     # filing (tip arm disabled — byte-identical post-2370 behavior).
     main_tip_sweep_rerun_confirm_enabled: bool = Field(default=True)
+
+    # Isolated PRE-FILTER gating the main-tip sweep's full-suite retry (task
+    # 3095).  When a first-pass sweep fails, run_main_tip_sweep used to
+    # unconditionally re-run the WHOLE suite a second time in the same
+    # worktree — minutes of background CPU that itself worsens the contention
+    # it is trying to measure.  With this on, the sweep first re-runs just the
+    # first-pass failing node-ids, scoped + forced-serial + generous-timeout,
+    # in the already-pinned worktree: a deterministic reproduction SKIPS the
+    # expensive full retry, while a non-reproduction (or any unconfirmable
+    # outcome) still pays for it, so a genuine full-verify PASS remains the
+    # precondition for the harness's escalation self-heal.  The pre-filter is
+    # a COST gate only and never suppresses — the harness's fresh-worktree
+    # confirm_main_tip_failure_is_real gate remains the sole suppression
+    # authority.  Default-on, mirrors main_tip_sweep_rerun_confirm_enabled's
+    # operator kill-switch convention; set to False to restore byte-identical
+    # pre-3095 behavior (unconditional full retry).
+    main_tip_sweep_isolated_prefilter_enabled: bool = Field(default=True)
 
     # Category allowlist narrowing the terminal-subject auto-close (task 2724).
     # The subject-terminal Source-C close (criterion a above) used to fire for
@@ -4853,6 +4956,11 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # the divergence-class routing.latest liveness gate; hot-reloadable so
         # the FP-suppression window can be tuned without a redeploy.
         'orphan_l0_dispatch_freshness_secs',
+        # Task 2991: sibling of orphan_l0_dispatch_freshness_secs — freshness
+        # grace for the merge-phase-liveness gate in the divergence reaper;
+        # hot-reloadable so the merge-phase FP-suppression window can be tuned
+        # without a redeploy.
+        'orphan_l0_merge_phase_freshness_secs',
         'watcher_rotation_escalations',
         'watcher_rotation_hours',
         'watcher_max_crashloop_restarts',

@@ -12646,6 +12646,232 @@ class TestCoalesceSnapshotReconcile:
 
 
 # ---------------------------------------------------------------------------
+# TestInflightWorktreeIsStale — the disk-scan arm's staleness predicate (3148)
+# ---------------------------------------------------------------------------
+
+
+class TestInflightWorktreeIsStale:
+    """Contract for `_inflight_worktree_is_stale`, the §2 disk-scan companion
+    to `_inflight_entry_is_stale` (merge_queue.py:4043-4080).
+
+    Polarity matches the sibling predicate: **True = corpse (reap)**,
+    **False = keep coalescing**.
+
+    Why the predicate exists at all: §2's liveness test reads the merge
+    worktree's ROOT inode mtime, but `_touch_owned_merge_worktrees` os.utime's
+    the root inode of every OWNED `_merge-*` worktree on every heartbeat tick
+    (~30 s).  So for an owned worktree, root mtime measures OWNER-process
+    liveness, not MERGE liveness — the same hazard `merge_liveness.
+    newest_content_mtime` documents for the in-flight verify budget.
+
+    Why OWNERSHIP gates the verdict: §2 exists for cross-process /
+    post-restart crash-safety (merge_queue.py:4146-4150), so a foreign or
+    pre-restart merger's worktree — which is BY CONSTRUCTION absent from this
+    worker's snapshot entries — must still coalesce.  Ownership is the precise
+    discriminator: only for a worktree in `_owned_merge_worktrees` is the
+    mtime known-contaminated, and only there does "no live entry for the
+    branch" prove the owning request already finalized.
+
+    Pure-function tests: no event loop, no git, no worker construction.
+    """
+
+    def test_a_no_snapshot_provider_is_not_stale(self, tmp_path: Path):
+        """(a) live_snapshot is None → False (back-compat default)."""
+        from orchestrator.merge_queue import _inflight_worktree_is_stale
+
+        wt = tmp_path / '_merge-a'
+        wt.mkdir()
+        assert _inflight_worktree_is_stale(wt, 'br-a', None) is False
+
+    def test_b_snapshot_raises_is_not_stale(self, tmp_path: Path):
+        """(b) live_snapshot() raises → fail-safe False.
+
+        Mirrors test_snapshot_provider_raises_trusts_registry's `_raising_snap`.
+        """
+        from orchestrator.merge_queue import _inflight_worktree_is_stale
+
+        wt = tmp_path / '_merge-b'
+        wt.mkdir()
+
+        def _raising_snap():
+            raise RuntimeError('worker unavailable')
+
+        assert _inflight_worktree_is_stale(wt, 'br-b', _raising_snap) is False
+
+    def test_c_malformed_snapshot_is_not_stale(self, tmp_path: Path):
+        """(c) non-dict snapshot, and dict lacking 'entries' → fail-safe False.
+
+        Mirrors test_snapshot_malformed_trusts_registry: a snapshot that cannot
+        be trusted must never be read as "empty queue" (which would reap a live
+        merge and double-dispatch onto the branch).
+        """
+        from orchestrator.merge_queue import _inflight_worktree_is_stale
+
+        wt = tmp_path / '_merge-c'
+        wt.mkdir()
+
+        def _non_dict_snap():
+            return ['not', 'a', 'dict']  # type: ignore[return-value]
+
+        def _no_entries_key() -> dict:
+            return {'depth': 0, 'owned_merge_worktrees': [str(wt.resolve())]}
+
+        assert _inflight_worktree_is_stale(wt, 'br-c', _non_dict_snap) is False  # type: ignore[arg-type]
+        assert _inflight_worktree_is_stale(wt, 'br-c', _no_entries_key) is False
+
+    def test_d_missing_owned_key_is_not_stale(self, tmp_path: Path):
+        """(d) snapshot has 'entries' but NO 'owned_merge_worktrees' key → False.
+
+        Back-compat with any snapshot producer that predates the additive key
+        (a test double, or a rolling deploy where the escalation server sees an
+        older worker).  Wiring order can never turn the gate destructive.
+        """
+        from orchestrator.merge_queue import _inflight_worktree_is_stale
+
+        wt = tmp_path / '_merge-d'
+        wt.mkdir()
+        assert _inflight_worktree_is_stale(wt, 'br-d', lambda: {'entries': []}) is False
+
+    def test_e_unowned_worktree_is_not_stale(self, tmp_path: Path):
+        """(e) 'owned_merge_worktrees' present but does NOT contain wt → False.
+
+        THE CROSS-PROCESS CRASH-SAFETY CASE (merge_queue.py:4146-4150): "even
+        if the in-memory registry was cleared by a process restart, an
+        in-progress merger's `_merge-*` worktree persists on disk and is
+        correctly detected here."  A foreign / pre-restart merger's worktree is
+        by construction absent from THIS worker's `entries`, so a bare
+        branch-absence test would reap a genuinely live foreign merge and
+        double-dispatch onto main.  Not-owned ⇒ mtime is real evidence ⇒ keep
+        today's behaviour.
+        """
+        from orchestrator.merge_queue import _inflight_worktree_is_stale
+
+        wt = tmp_path / '_merge-e'
+        wt.mkdir()
+        other = tmp_path / '_merge-e-other'
+        other.mkdir()
+
+        def _snap() -> dict:
+            return {'entries': [], 'owned_merge_worktrees': [str(other.resolve())]}
+
+        assert _inflight_worktree_is_stale(wt, 'br-e', _snap) is False
+
+    def test_f_owned_with_live_branch_entry_is_not_stale(self, tmp_path: Path):
+        """(f) owned AND some entry carries this branch → False (genuinely in flight)."""
+        from orchestrator.merge_queue import _inflight_worktree_is_stale
+
+        wt = tmp_path / '_merge-f'
+        wt.mkdir()
+
+        def _snap() -> dict:
+            return {
+                'entries': [
+                    {'branch': 'other-branch', 'request_id': 'mr-other'},
+                    {'branch': 'br-f', 'request_id': 'mr-live'},
+                ],
+                'owned_merge_worktrees': [str(wt.resolve())],
+            }
+
+        assert _inflight_worktree_is_stale(wt, 'br-f', _snap) is False
+
+    def test_g_owned_without_branch_entry_is_stale(self, tmp_path: Path):
+        """(g) owned AND no entry carries the branch → **True** — THE INCIDENT.
+
+        The owning request already finalized (e.g. as `blocked`) but its
+        `_merge-*` worktree is still in this worker's liveness ledger, so
+        `_touch_owned_merge_worktrees` pins its root mtime fresh forever and
+        §2's `age <= liveness_secs` test is permanently true.  Only the live
+        snapshot can tell that the corpse's owner is gone.
+        """
+        from orchestrator.merge_queue import _inflight_worktree_is_stale
+
+        wt = tmp_path / '_merge-g'
+        wt.mkdir()
+
+        def _snap() -> dict:
+            return {
+                'entries': [{'branch': 'unrelated', 'request_id': 'mr-unrelated'}],
+                'owned_merge_worktrees': [str(wt.resolve())],
+            }
+
+        assert _inflight_worktree_is_stale(wt, 'br-g', _snap) is True
+
+        # An EMPTY owned list from a live worker is NOT the same as a missing
+        # key: empty ledger + on-disk worktree is the unowned case (e), while a
+        # present-but-empty ledger must still permit the decisive check for any
+        # path it does list.  Guard the "owned is None, not falsy" distinction.
+        def _empty_owned() -> dict:
+            return {'entries': [], 'owned_merge_worktrees': []}
+
+        assert _inflight_worktree_is_stale(wt, 'br-g', _empty_owned) is False
+
+    def test_h_ownership_is_compared_on_resolved_paths(self, tmp_path: Path):
+        """(h) Membership is compared on `Path.resolve()`, so an equivalent but
+        non-normalised spelling of an owned path is still recognised as owned.
+
+        Matches how `worktree_ledger_violations` already normalises ownership
+        (merge_queue.py:9556 `owned = {p.resolve() for p in ...}` and 9569
+        `path = Path(entry.path).resolve()`), so the two ownership tests can
+        never disagree about the same worktree.
+        """
+        from orchestrator.merge_queue import _inflight_worktree_is_stale
+
+        real = tmp_path / '_merge-h'
+        real.mkdir()
+        # Same directory, spelled with a '..' round-trip through a sibling.
+        sibling = tmp_path / 'sib'
+        sibling.mkdir()
+        unnormalised = sibling / '..' / '_merge-h'
+        assert unnormalised.resolve() == real.resolve()
+
+        def _snap() -> dict:
+            return {'entries': [], 'owned_merge_worktrees': [str(real.resolve())]}
+
+        # (g)'s verdict must be unchanged by the spelling of the path.
+        assert _inflight_worktree_is_stale(unnormalised, 'br-h', _snap) is True
+
+        # And symmetrically when the LEDGER holds the odd spelling.
+        def _snap_odd_ledger() -> dict:
+            return {'entries': [], 'owned_merge_worktrees': [str(unnormalised)]}
+
+        assert _inflight_worktree_is_stale(real, 'br-h', _snap_odd_ledger) is True
+
+    def test_i_wrong_typed_snapshot_members_are_not_stale(self, tmp_path: Path):
+        """(i) A wrong-TYPED ledger/entries degrades to False, never raises.
+
+        The predicate is reached from the `merge_request` MCP tool, so an
+        exception escaping it fails the caller's SUBMISSION outright rather than
+        falling back to today's coalesce behaviour.  Case (c) covers a
+        wrong-shaped snapshot (not a dict / no 'entries'); this covers the
+        wrong-TYPED members that survive that shape check:
+
+          - `owned_merge_worktrees` not iterable (an int) → TypeError
+          - `owned_merge_worktrees` holding a non-path element → TypeError
+          - `entries` not iterable, or holding non-dicts → TypeError/AttributeError
+
+        These are the realistically-triggerable malformed inputs; the enumerated
+        OSError case is near-unreachable because `Path.resolve()` is non-strict.
+        """
+        from orchestrator.merge_queue import _inflight_worktree_is_stale
+
+        wt = tmp_path / '_merge-i'
+        wt.mkdir()
+        owned_ok = [str(wt.resolve())]
+
+        cases: list[dict] = [
+            {'entries': [], 'owned_merge_worktrees': 7},            # not iterable
+            {'entries': [], 'owned_merge_worktrees': [123]},        # non-path element
+            {'entries': [], 'owned_merge_worktrees': [None]},       # non-path element
+            {'entries': 7, 'owned_merge_worktrees': owned_ok},      # entries not iterable
+            {'entries': ['nope'], 'owned_merge_worktrees': owned_ok},   # non-dict entry
+        ]
+        for snap in cases:
+            assert _inflight_worktree_is_stale(wt, 'br-i', lambda s=snap: s) is False, (
+                f'malformed snapshot must degrade to coalesce, not raise: {snap}'
+            )
+
+
+# ---------------------------------------------------------------------------
 # TestCoalesceOrEnqueueWorktreePath — disk-scan coalesces alive worktrees
 # ---------------------------------------------------------------------------
 
@@ -12776,6 +13002,270 @@ class TestCoalesceOrEnqueueStaleWorktreeReap:
         assert queue.qsize() == 1, f'Expected queue size 1, got {queue.qsize()}'
         # Registry now holds the new request
         assert registry.is_inflight(branch) is True
+
+
+# ---------------------------------------------------------------------------
+# TestCoalesceWorktreeCorpseReconcile — the 3148 incident regression
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCoalesceWorktreeCorpseReconcile:
+    """Disk-scan arm reconciles a HEARTBEAT-PINNED corpse against the snapshot.
+
+    THE INCIDENT: a merge request finalized (as `blocked`) but its `_merge-*`
+    worktree stayed in the worker's liveness ledger.  `_touch_owned_merge_
+    worktrees` then os.utime'd that worktree's ROOT inode every heartbeat tick,
+    so the disk-scan arm's `age <= liveness_secs` test was permanently true and
+    every resubmit for the branch coalesced onto the corpse.  Because the
+    disk-scan arm registers no retention alias and no waiter, the caller got a
+    documented-durable `attached` response with `inflight_task_id=null` and an
+    unpollable handle — the branch was wedged out of the merge queue until the
+    orchestrator restarted.
+
+    CRITICAL INVERSION vs. TestCoalesceOrEnqueueStaleWorktreeReap: that class
+    forces `os.utime(merge_wt, (0, 0))` with `liveness_secs=1` so the MTIME arm
+    fires.  Here the mtime is left FRESH and `liveness_secs` is the DEFAULT —
+    reproducing the heartbeat-pinned state, in which mtime says "alive" and the
+    live snapshot is the only signal that the owner has finalized.
+    """
+
+    def _make_event_store(self, tmp_path: Path) -> EventStore:
+        db = tmp_path / 'corpse_reconcile_events.db'
+        return EventStore(db_path=db, run_id='corpse-reconcile-test')
+
+    @staticmethod
+    def _reap_events(db_path) -> list[dict]:
+        """Return the `data` dict of every worktree_reaped event, in insert order."""
+        import json
+        import sqlite3
+
+        conn = sqlite3.connect(str(db_path))
+        try:
+            rows = conn.execute(
+                "SELECT data FROM events WHERE event_type = 'worktree_reaped'"
+                ' ORDER BY rowid'
+            ).fetchall()
+        finally:
+            conn.close()
+        return [json.loads(r[0]) for r in rows]
+
+    @classmethod
+    def _reap_reasons(cls, db_path) -> list[str | None]:
+        """Return the `reason` of every worktree_reaped event, in insert order.
+
+        `str | None`, not `str`: an event whose data carries no `reason` must
+        surface as None here rather than be silently coerced to a reason-shaped
+        string.
+        """
+        return [d.get('reason') for d in cls._reap_events(db_path)]
+
+    async def test_a_owned_corpse_is_reaped_and_dispatched(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """Owned worktree + no live entry for its branch → reap + fresh dispatch.
+
+        `dispatched=True` at this seam IS the assertion "the resubmission
+        appears in get_merge_queue().entries": dispatch means
+        `enqueue_merge_request` ran and `snapshot()` reads that queue.
+        """
+        branch = 'corpse-owned-branch'
+        wt = await _make_branch_with_file(
+            git_ops, branch, 'corpse_owned.py', 'x = 1\n',
+        )
+        merge_result = await git_ops.merge_to_main(wt, branch)
+        assert merge_result.success, f'merge_to_main failed: {merge_result}'
+        merge_wt = merge_result.merge_worktree
+        assert merge_wt is not None
+
+        try:
+            queue: asyncio.Queue = asyncio.Queue()
+            registry = InFlightMergeRegistry()
+            event_store = self._make_event_store(tmp_path)
+            req = _make_request('corpse-owned', branch, tmp_path, config)
+
+            # Owned by this worker, but the pipeline carries NO entry for the
+            # branch — its request already finalized (e.g. as `blocked`).
+            def _snap() -> dict:
+                return {
+                    'entries': [],
+                    'owned_merge_worktrees': [str(merge_wt.resolve())],
+                }
+
+            result = await coalesce_or_enqueue_merge_request(
+                queue, req, event_store, registry,
+                git_ops=git_ops,
+                live_snapshot=_snap,
+            )
+
+            # The wedge is gone: a fresh merger is dispatched.
+            assert result.dispatched is True, f'Expected dispatched=True, got {result}'
+            assert result.in_flight is False
+            assert queue.qsize() == 1, f'Expected queue size 1, got {queue.qsize()}'
+            assert registry.is_inflight(branch) is True
+
+            # The caller must NOT receive the misleading attached shape at all.
+            assert result.source != 'worktree', (
+                f'coalesced onto a corpse instead of dispatching: {result}'
+            )
+
+            # The corpse is reaped from disk and from git's worktree list.
+            assert not merge_wt.exists(), (
+                f'Corpse worktree {merge_wt} should have been removed'
+            )
+            found = await git_ops.find_inflight_merge_worktree(branch)
+            assert found is None, f'Worktree still registered after reap: {found}'
+
+            # Distinct reason: a live worker heartbeating a finalized request's
+            # worktree is a LEDGER LEAK in progress, operationally different
+            # from 'stale_inflight' (an owner that died long ago).  Collapsing
+            # the two would make the leak invisible in the event stream exactly
+            # when it is happening.
+            assert _count_events(event_store.db_path, 'worktree_reaped') == 1
+            assert self._reap_reasons(event_store.db_path) == ['finalized_owner']
+
+            # The reap records its OBSERVED outcome, so a removal that was
+            # skipped (a live verify still holding the lane's flock — the reap
+            # routes through the lease-guarded primitive) or that failed is
+            # visible in the event stream rather than silently indistinguishable
+            # from a successful reap.
+            assert self._reap_events(event_store.db_path)[0].get('removed') is True, (
+                f'reap event must record the observed removal: '
+                f'{self._reap_events(event_store.db_path)}'
+            )
+
+        finally:
+            if merge_wt is not None and merge_wt.exists():
+                await git_ops.cleanup_merge_worktree(merge_wt)
+
+    async def test_b_foreign_worktree_still_coalesces(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """NOT owned by this worker → coalesce, untouched (crash-safety rail).
+
+        The disk-scan arm exists so an in-progress merger's worktree is detected
+        even when the in-memory registry was cleared by a process restart
+        (merge_queue.py:4146-4150, git_ops.py:9401-9404).  A foreign or
+        pre-restart merger is BY CONSTRUCTION absent from this worker's
+        `entries`, so ownership — not branch absence — has to gate the reap, or
+        this test would double-dispatch onto a live merge.
+        """
+        branch = 'corpse-foreign-branch'
+        wt = await _make_branch_with_file(
+            git_ops, branch, 'corpse_foreign.py', 'x = 2\n',
+        )
+        merge_result = await git_ops.merge_to_main(wt, branch)
+        assert merge_result.success, f'merge_to_main failed: {merge_result}'
+        merge_wt = merge_result.merge_worktree
+        assert merge_wt is not None
+
+        try:
+            queue: asyncio.Queue = asyncio.Queue()
+            registry = InFlightMergeRegistry()
+            event_store = self._make_event_store(tmp_path)
+            req = _make_request('corpse-foreign', branch, tmp_path, config)
+
+            def _snap() -> dict:
+                return {'entries': [], 'owned_merge_worktrees': []}
+
+            result = await coalesce_or_enqueue_merge_request(
+                queue, req, event_store, registry,
+                git_ops=git_ops,
+                live_snapshot=_snap,
+            )
+
+            assert result.in_flight is True, f'Expected in_flight=True, got {result}'
+            assert result.dispatched is False
+            assert result.source == 'worktree'
+            assert queue.qsize() == 0
+            assert merge_wt.exists(), (
+                f'Foreign worktree {merge_wt} must NOT be reaped — a live '
+                'cross-process merge would be destroyed and main double-merged'
+            )
+            assert _count_events(event_store.db_path, 'worktree_reaped') == 0
+
+        finally:
+            if merge_wt is not None and merge_wt.exists():
+                await git_ops.cleanup_merge_worktree(merge_wt)
+
+    async def test_c_live_branch_still_coalesces(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """Owned AND the snapshot carries an entry for the branch → coalesce."""
+        branch = 'corpse-live-branch'
+        wt = await _make_branch_with_file(
+            git_ops, branch, 'corpse_live.py', 'x = 3\n',
+        )
+        merge_result = await git_ops.merge_to_main(wt, branch)
+        assert merge_result.success, f'merge_to_main failed: {merge_result}'
+        merge_wt = merge_result.merge_worktree
+        assert merge_wt is not None
+
+        try:
+            queue: asyncio.Queue = asyncio.Queue()
+            registry = InFlightMergeRegistry()
+            event_store = self._make_event_store(tmp_path)
+            req = _make_request('corpse-live', branch, tmp_path, config)
+
+            def _snap() -> dict:
+                return {
+                    'entries': [{'branch': branch, 'request_id': 'mr-live'}],
+                    'owned_merge_worktrees': [str(merge_wt.resolve())],
+                }
+
+            result = await coalesce_or_enqueue_merge_request(
+                queue, req, event_store, registry,
+                git_ops=git_ops,
+                live_snapshot=_snap,
+            )
+
+            assert result.in_flight is True, f'Expected in_flight=True, got {result}'
+            assert result.dispatched is False
+            assert result.source == 'worktree'
+            assert queue.qsize() == 0
+            assert merge_wt.exists(), 'a genuinely in-flight merge must not be reaped'
+            assert _count_events(event_store.db_path, 'worktree_reaped') == 0
+
+        finally:
+            if merge_wt is not None and merge_wt.exists():
+                await git_ops.cleanup_merge_worktree(merge_wt)
+
+    async def test_d_no_snapshot_preserves_legacy(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """No live_snapshot (default None) → fresh-mtime worktree coalesces as today.
+
+        Back-compat for every caller that does not wire a worker.
+        """
+        branch = 'corpse-legacy-branch'
+        wt = await _make_branch_with_file(
+            git_ops, branch, 'corpse_legacy.py', 'x = 4\n',
+        )
+        merge_result = await git_ops.merge_to_main(wt, branch)
+        assert merge_result.success, f'merge_to_main failed: {merge_result}'
+        merge_wt = merge_result.merge_worktree
+        assert merge_wt is not None
+
+        try:
+            queue: asyncio.Queue = asyncio.Queue()
+            registry = InFlightMergeRegistry()
+            event_store = self._make_event_store(tmp_path)
+            req = _make_request('corpse-legacy', branch, tmp_path, config)
+
+            result = await coalesce_or_enqueue_merge_request(
+                queue, req, event_store, registry, git_ops=git_ops,
+            )
+
+            assert result.in_flight is True, f'Expected in_flight=True, got {result}'
+            assert result.dispatched is False
+            assert result.source == 'worktree'
+            assert queue.qsize() == 0
+            assert merge_wt.exists()
+            assert _count_events(event_store.db_path, 'worktree_reaped') == 0
+
+        finally:
+            if merge_wt is not None and merge_wt.exists():
+                await git_ops.cleanup_merge_worktree(merge_wt)
 
 
 # ---------------------------------------------------------------------------
@@ -14442,9 +14932,13 @@ class TestRunPostMergeVerify:
 
         with (
             patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            # task 3059: the payload is now BUILT from attempt-0's own result
+            # inside the retry branch, not read from a pre-dispatch sidecar.
+            # These budget tests only care that narrowing SUCCEEDED, so the
+            # builder is stubbed with an opaque non-None payload.
             patch(
-                'orchestrator.merge_queue._load_attempt0_sidecar',
-                MagicMock(return_value=object()),
+                'orchestrator.merge_queue._build_attempt0_payload',
+                AsyncMock(return_value=object()),
             ),
             patch(
                 'orchestrator.merge_queue._assemble_retry_verify_env',
@@ -14506,9 +15000,13 @@ class TestRunPostMergeVerify:
 
         with (
             patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            # task 3059: the payload is now BUILT from attempt-0's own result
+            # inside the retry branch, not read from a pre-dispatch sidecar.
+            # These budget tests only care that narrowing SUCCEEDED, so the
+            # builder is stubbed with an opaque non-None payload.
             patch(
-                'orchestrator.merge_queue._load_attempt0_sidecar',
-                MagicMock(return_value=object()),
+                'orchestrator.merge_queue._build_attempt0_payload',
+                AsyncMock(return_value=object()),
             ),
             patch(
                 'orchestrator.merge_queue._assemble_retry_verify_env',
@@ -14568,9 +15066,13 @@ class TestRunPostMergeVerify:
 
         with (
             patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            # task 3059: the payload is now BUILT from attempt-0's own result
+            # inside the retry branch, not read from a pre-dispatch sidecar.
+            # These budget tests only care that narrowing SUCCEEDED, so the
+            # builder is stubbed with an opaque non-None payload.
             patch(
-                'orchestrator.merge_queue._load_attempt0_sidecar',
-                MagicMock(return_value=object()),
+                'orchestrator.merge_queue._build_attempt0_payload',
+                AsyncMock(return_value=object()),
             ),
             patch(
                 'orchestrator.merge_queue._assemble_retry_verify_env',
@@ -14606,23 +15108,28 @@ class TestRunPostMergeVerify:
             f'not the transient-infra hold: {result.reason!r}'
         )
 
-    async def test_flag_on_without_narrowing_keeps_legacy_enospc_budget(self) -> None:
-        """(task 2835 step-7) RED — locks the "strict no-op until reify
+    async def test_flag_on_without_narrowing_keeps_legacy_enospc_budget(
+        self, tmp_path: Path,
+    ) -> None:
+        """(task 2835 step-7) RED — locks the "narrowing must actually happen"
 
-        lands" invariant: the larger narrowed budget is gated on ACTUAL
-        narrowing (the D2 producer applying retry_env), not on the raw
-        req.retry_failed_only flag. With the flag on but NO sidecar written
-        (the real tolerant _load_attempt0_sidecar returns None against a
-        bare MagicMock merge_wt), narrowed stays False and the retry must
-        still use the small legacy enospc_retries/max_enospc budget even
-        though a generous max_narrowed=5 is supplied.
+        invariant: the larger narrowed budget is gated on ACTUAL narrowing
+        (the D2 producer applying retry_env), not on the raw
+        req.retry_failed_only flag. With the flag on but NO sidecar present
+        in merge_wt, the real (unstubbed) _build_attempt0_payload returns
+        None (task 3059), narrowed stays False, and the retry must still use
+        the small legacy enospc_retries/max_enospc budget even though a
+        generous max_narrowed=5 is supplied.
+
+        merge_wt is a REAL empty directory, not a MagicMock: the production
+        payload builder resolves the sidecar path under it.
         """
         from orchestrator.merge_queue import _run_post_merge_verify
 
         git_ops = self._make_git_ops()
         req = self._make_req()
         req.retry_failed_only = True
-        merge_wt = MagicMock()
+        merge_wt = tmp_path
 
         infra_result = _infra_category_verify_result('semaphore_timeout')
 
@@ -14674,9 +15181,13 @@ class TestRunPostMergeVerify:
 
         with (
             patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            # task 3059: the payload is now BUILT from attempt-0's own result
+            # inside the retry branch, not read from a pre-dispatch sidecar.
+            # These budget tests only care that narrowing SUCCEEDED, so the
+            # builder is stubbed with an opaque non-None payload.
             patch(
-                'orchestrator.merge_queue._load_attempt0_sidecar',
-                MagicMock(return_value=object()),
+                'orchestrator.merge_queue._build_attempt0_payload',
+                AsyncMock(return_value=object()),
             ),
             patch(
                 'orchestrator.merge_queue._assemble_retry_verify_env',
@@ -14732,9 +15243,13 @@ class TestRunPostMergeVerify:
 
         with (
             patch('orchestrator.merge_queue._ensure_verify_disk_space', AsyncMock(return_value=None)),
+            # task 3059: the payload is now BUILT from attempt-0's own result
+            # inside the retry branch, not read from a pre-dispatch sidecar.
+            # These budget tests only care that narrowing SUCCEEDED, so the
+            # builder is stubbed with an opaque non-None payload.
             patch(
-                'orchestrator.merge_queue._load_attempt0_sidecar',
-                MagicMock(return_value=object()),
+                'orchestrator.merge_queue._build_attempt0_payload',
+                AsyncMock(return_value=object()),
             ),
             patch(
                 'orchestrator.merge_queue._assemble_retry_verify_env',
@@ -17441,6 +17956,170 @@ class TestSnapshotEntryRequestId:
         assert entry['request_id'] == req.request_id, (
             f"entry['request_id']={entry['request_id']!r} != req.request_id={req.request_id!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# TestSnapshotOwnedMergeWorktrees — additive liveness-ledger key (task 3148)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSnapshotOwnedMergeWorktrees:
+    """`snapshot()` must expose this worker's merge-worktree liveness ledger.
+
+    `live_snapshot` is the established, deliberately-narrow channel by which
+    the module-level `coalesce_or_enqueue_merge_request` gate learns about
+    worker state, so `_inflight_worktree_is_stale` reads ownership from an
+    additive snapshot key rather than a second worker-coupling parameter.
+
+    Values are RESOLVED absolute path STRINGS: the snapshot crosses the MCP
+    boundary via `get_merge_queue`, so it must stay JSON-serialisable, and
+    `.resolve()` matches how `worktree_ledger_violations` already normalises
+    the same ledger (merge_queue.py:9556 / 9569).
+    """
+
+    def _make_worker(self, tmp_path: Path) -> SpeculativeMergeWorker:
+        import types
+
+        mq: asyncio.Queue = asyncio.Queue()
+        return SpeculativeMergeWorker(
+            git_ops=types.SimpleNamespace(),  # type: ignore[reportArgumentType]
+            queue=mq,
+        )
+
+    async def test_a_fresh_worker_exposes_empty_ledger(self, tmp_path: Path) -> None:
+        """(a) A freshly constructed worker's snapshot carries the key, empty."""
+        worker = self._make_worker(tmp_path)
+        snap = worker.snapshot()
+
+        assert 'owned_merge_worktrees' in snap, (
+            f"'owned_merge_worktrees' key missing from snapshot: {sorted(snap)}"
+        )
+        assert snap['owned_merge_worktrees'] == []
+
+    async def test_b_registered_worktrees_are_resolved_strings(self, tmp_path: Path) -> None:
+        """(b) Registered paths appear as resolved absolute strings.
+
+        NB: p1/p2 must NOT be named '_merge-verify' —
+        `_register_owned_merge_worktree` deliberately no-ops for
+        PERSISTENT_MERGE_WORKTREE_NAME.
+        """
+        worker = self._make_worker(tmp_path)
+        p1 = tmp_path / '_merge-owned-1'
+        p2 = tmp_path / '_merge-owned-2'
+        p1.mkdir()
+        p2.mkdir()
+
+        worker._register_owned_merge_worktree(p1)
+        worker._register_owned_merge_worktree(p2)
+
+        owned = worker.snapshot()['owned_merge_worktrees']
+        assert set(owned) == {str(p1.resolve()), str(p2.resolve())}
+        assert all(isinstance(v, str) for v in owned), (
+            f'values must be JSON-serialisable strings (MCP hop), got: {owned}'
+        )
+
+    async def test_c_deregister_removes_only_that_path(self, tmp_path: Path) -> None:
+        """(c) After deregistering p1, only p2's resolved string remains."""
+        worker = self._make_worker(tmp_path)
+        p1 = tmp_path / '_merge-owned-1'
+        p2 = tmp_path / '_merge-owned-2'
+        p1.mkdir()
+        p2.mkdir()
+        worker._register_owned_merge_worktree(p1)
+        worker._register_owned_merge_worktree(p2)
+
+        worker._deregister_owned_merge_worktree(p1)
+
+        assert worker.snapshot()['owned_merge_worktrees'] == [str(p2.resolve())]
+
+    async def test_d_no_collision_with_existing_keys(self, tmp_path: Path) -> None:
+        """(d) The new key does not displace any pre-existing snapshot key.
+
+        Asserted as a SUPERSET, deliberately not an equality on the key set:
+        this snapshot follows an additive-key convention and keeps growing, so
+        an exact key list here would turn every future additive key into a
+        spurious failure in an unrelated test.
+        """
+        worker = self._make_worker(tmp_path)
+        snap = worker.snapshot()
+
+        assert set(snap) >= {
+            'entries', 'depth', 'head_of_line', 'verify_in_progress',
+            'is_wip_halted', 'halt_owner_esc_id', 'occupancy',
+            'suffix_conflict_graph', 'metrics', 'frozen_prefix',
+            'two_layer_invariants', 'speculation', 'resource_audit',
+            'owned_merge_worktrees',
+        }
+
+    async def test_e_key_is_a_pure_synchronous_read(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """(e) Producing the key performs NO filesystem I/O, and is stable.
+
+        Honors snapshot()'s documented contract: "Safe to call from any context
+        (no await, no lock)" — snapshot() is called on every heartbeat tick
+        (before the interval gate), from `_check_request_liveness`, and from the
+        `get_merge_queue` MCP tool, so a per-entry `Path.resolve()` would put a
+        blocking lstat/readlink chain on the event loop.
+
+        The assertion is REAL, not a stability characterization: `Path.resolve`
+        is monkeypatched to raise for the duration of the snapshot() calls, so
+        the test fails if the key is ever computed by resolving at read time.
+        Registration (which legitimately resolves, once) happens BEFORE the
+        patch is installed.
+
+        NB the worker is not running, so `worktree_ledger_violations` — the one
+        other ledger consumer inside snapshot() — short-circuits to [] before
+        its own scandir/resolve, keeping this patch scoped to the key under test.
+        """
+        worker = self._make_worker(tmp_path)
+        p1 = tmp_path / '_merge-owned-1'
+        p1.mkdir()
+        worker._register_owned_merge_worktree(p1)  # resolve happens HERE, once
+
+        def _explode(self, *a, **kw):  # noqa: ANN001, ANN002, ANN003, ARG001
+            raise AssertionError(
+                'snapshot() resolved a ledger path at read time — the resolve '
+                'must be memoised at _register_owned_merge_worktree time'
+            )
+
+        monkeypatch.setattr(Path, 'resolve', _explode)
+
+        first = worker.snapshot()['owned_merge_worktrees']
+        second = worker.snapshot()['owned_merge_worktrees']
+
+        monkeypatch.undo()
+        assert first == second == [str(p1.resolve())]
+
+    async def test_f_unregistered_path_falls_back_to_its_literal_string(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """(f) A path added to the ledger set directly still appears, I/O-free.
+
+        Several call sites and tests manipulate `_owned_merge_worktrees`
+        directly (e.g. `worker._owned_merge_worktrees = {p1, p2}` at
+        test_merge_queue.py:9792), bypassing the registrar that memoises the
+        resolved key.  Such a path must still be reported — dropping it would
+        make the ledger silently under-report exactly what the coalesce gate
+        reads for ownership — and must still cost no I/O.  The consumer
+        (`_inflight_worktree_is_stale`) re-normalises, so the unresolved
+        fallback spelling still matches (pinned by
+        TestInflightWorktreeIsStale.test_h).
+        """
+        worker = self._make_worker(tmp_path)
+        direct = tmp_path / '_merge-direct'
+        direct.mkdir()
+        worker._owned_merge_worktrees.add(direct)  # NO memo entry
+
+        def _explode(self, *a, **kw):  # noqa: ANN001, ANN002, ANN003, ARG001
+            raise AssertionError('fallback path must not resolve at read time')
+
+        monkeypatch.setattr(Path, 'resolve', _explode)
+        owned = worker.snapshot()['owned_merge_worktrees']
+        monkeypatch.undo()
+
+        assert owned == [str(direct)]
 
 
 # ---------------------------------------------------------------------------
@@ -22831,6 +23510,128 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
             await worker.stop()
             with contextlib.suppress(asyncio.CancelledError):
                 await worker_task
+
+
+# ---------------------------------------------------------------------------
+# TestReleaseOrCleanupDeregisters — the ledger invariant (task 3148)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestReleaseOrCleanupDeregisters:
+    """`_release_or_cleanup` must NEVER return with its path still in the ledger.
+
+    The invariant, and why it is worth pinning: the `spec_warm=True` branch
+    hands the lane back to the pool via `release_spec_lane` and returns without
+    deregistering, while the `spec_warm=False` branch deregisters via
+    `_cleanup_owned_merge_worktree`.  Any path that stays in
+    `_owned_merge_worktrees` after its request finalizes is os.utime'd forever
+    by `_touch_owned_merge_worktrees`, which pins the ROOT-inode mtime the
+    disk-scan coalesce arm reads — manufacturing exactly the immortal corpse
+    that arm now has to reap.  Such an entry is also permanently exempt from
+    reaping, because the worker passes
+    `keep_worktrees=set(self._owned_merge_worktrees)` into post-merge verify.
+
+    SCOPE HONESTY — this is defence-in-depth, NOT a demonstrated live leak.
+    On the dominant path the warm branch receives a `_spec-` POOL LANE, not a
+    `_merge-*` worktree: `spec_warm_lane_pool` is constructed with
+    `name_prefix='_spec-'` (git_ops.py:1655-1658), the
+    `_register_owned_merge_worktree` sites register `_merge-*` worktrees, and
+    the warm-acquire swap already deregisters the displaced `item.merge_wt`.  A
+    `_spec-` lane is additionally invisible to `find_inflight_merge_worktree`,
+    which enumerates only `_merge-*`, so it cannot be the disk-scan corpse.  So
+    today's warm branch is usually deregistering nothing.
+
+    The invariant is pinned anyway because the failure it forecloses is
+    silently unrecoverable: `release_spec_lane` no-ops on a path the pool does
+    not own, a retained ledger entry is both heartbeat-pinned and reaper-exempt,
+    and `worktree_ledger_violations` flags only worktrees ABSENT from the ledger
+    (`if path in owned: continue`), so a RETAINED entry is invisible to the
+    existing I6 audit.  One idempotent `.discard()` removes the whole class.
+    """
+
+    def _make_worker(self, tmp_path: Path):
+        """Return (worker, calls) with a recording stub git_ops."""
+        import types
+
+        calls: dict[str, list] = {'release_spec_lane': [], 'cleanup_merge_worktree': []}
+
+        async def _release_spec_lane(lane, *, warm):
+            calls['release_spec_lane'].append((lane, warm))
+
+        async def _cleanup_merge_worktree(wt):
+            calls['cleanup_merge_worktree'].append(wt)
+
+        stub = types.SimpleNamespace(
+            release_spec_lane=_release_spec_lane,
+            cleanup_merge_worktree=_cleanup_merge_worktree,
+        )
+        mq: asyncio.Queue = asyncio.Queue()
+        worker = SpeculativeMergeWorker(
+            git_ops=stub,  # type: ignore[reportArgumentType]
+            queue=mq,
+        )
+        return worker, calls
+
+    async def test_a_warm_spec_release_deregisters(self, tmp_path: Path) -> None:
+        """spec_warm=True → lane RELEASED to the pool AND dropped from the ledger.
+
+        `p` is deliberately not named '_merge-verify':
+        `_register_owned_merge_worktree` no-ops for PERSISTENT_MERGE_WORKTREE_NAME,
+        which would make this pass/fail for the wrong reason.
+        """
+        worker, calls = self._make_worker(tmp_path)
+        p = tmp_path / '_spec-lane-1'
+        p.mkdir()
+        worker._register_owned_merge_worktree(p)
+        assert p in worker._owned_merge_worktrees, 'pre-condition: registered'
+
+        await worker._release_or_cleanup(p, spec_warm=True)
+
+        assert p not in worker._owned_merge_worktrees, (
+            'a retained ledger entry is heartbeat-pinned, reaper-exempt, and '
+            'invisible to worktree_ledger_violations — unrecoverable short of restart'
+        )
+        # The warm-lane contract must NOT regress: the lane goes back to the
+        # pool as FREE, it is not removed from disk.
+        assert calls['release_spec_lane'] == [(p, True)]
+        assert calls['cleanup_merge_worktree'] == []
+
+    async def test_b_cold_path_still_deregisters(self, tmp_path: Path) -> None:
+        """spec_warm=False → characterization: existing branch is left alone."""
+        worker, calls = self._make_worker(tmp_path)
+        p = tmp_path / '_merge-cold-1'
+        p.mkdir()
+        worker._register_owned_merge_worktree(p)
+
+        await worker._release_or_cleanup(p, spec_warm=False)
+
+        assert p not in worker._owned_merge_worktrees
+        assert calls['cleanup_merge_worktree'] == [p]
+        assert calls['release_spec_lane'] == []
+
+    async def test_c_none_worktree_is_safe(self, tmp_path: Path) -> None:
+        """merge_wt=None no-ops on both branches without raising."""
+        worker, calls = self._make_worker(tmp_path)
+
+        await worker._release_or_cleanup(None, spec_warm=True)
+        await worker._release_or_cleanup(None, spec_warm=False)
+
+        assert calls['release_spec_lane'] == []
+        assert calls['cleanup_merge_worktree'] == []
+
+    async def test_d_idempotent(self, tmp_path: Path) -> None:
+        """Calling twice does not raise and leaves p deregistered (.discard())."""
+        worker, calls = self._make_worker(tmp_path)
+        p = tmp_path / '_spec-lane-1'
+        p.mkdir()
+        worker._register_owned_merge_worktree(p)
+
+        await worker._release_or_cleanup(p, spec_warm=True)
+        await worker._release_or_cleanup(p, spec_warm=True)
+
+        assert p not in worker._owned_merge_worktrees
+        assert calls['release_spec_lane'] == [(p, True), (p, True)]
 
 
 # ---------------------------------------------------------------------------

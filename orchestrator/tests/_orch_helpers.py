@@ -13,9 +13,11 @@ import gc
 import inspect
 import json
 import logging
+import os
 import threading
 import time
 from collections.abc import Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock
 
@@ -95,6 +97,38 @@ def wire_scheduler_liveness_mock(scheduler_mock: MagicMock) -> None:
 # test_merge_queue_permit_conservation.py,
 # test_merge_queue_invariant_integration_gate.py).
 MERGE_RESULT_TIMEOUT = 45
+
+# task 3307: generous synchronization-barrier ceiling for the workflow
+# CancellationScope tests (test_workflow_cancellation.py).  These barriers
+# wait for REAL work — git worktree creation, artifact writes, stubbed
+# agent round-trips — to reach a known point; they assert nothing about
+# cancellation latency, so a slow-but-correct host must never fail them.
+# Measured on a 32-core host at load avg ~100: the same two tests span
+# 0.26s-3.09s green and were observed failing at exactly 5.01s (the
+# retired inline 5.0s literal), i.e. a >=19x wall-clock tail — which is
+# why 5.0s was inside the distribution rather than above it.  45s is 16x
+# the worst green observation and matches the value already established
+# for this exact shape (task 2350's `wait_for(<event>.wait(), timeout=45.0)`
+# in test_merge_queue_concurrent_verify.py, and MERGE_RESULT_TIMEOUT above).
+# Never-narrow: only replaces literals <=15 in test_workflow_cancellation.py.
+# Any class using it MUST also carry @pytest.mark.timeout(180) — two of
+# these barriers exceed the 60s pyproject default, which pytest-timeout's
+# thread method answers by os._exit()ing the xdist worker.
+CANCEL_SCOPE_BARRIER_TIMEOUT = 45
+
+# task 3307 (reviewer follow-up): small ceiling for the two PURE in-memory
+# CancellationScope barriers in TestCancellationScopeHardCancel — asyncio
+# Task cancellation + on_terminal recording only, no git worktree, no
+# artifact writes, no agent round-trip.  Pairing those with the much larger
+# CANCEL_SCOPE_BARRIER_TIMEOUT above bought no green-path benefit (they
+# resolve in microseconds) while making a genuine CancellationScope
+# regression there take 45s — or up to 180s under a paired
+# @pytest.mark.timeout — to report red instead of pytest's 60s default.
+# Kept above the retired 5.0s literal (never-narrow) for headroom against
+# scheduler jitter under host oversubscription, without borrowing the
+# I/O-sized budget above.  Do NOT use this for a test that drives a real
+# TaskWorkflow — use CANCEL_SCOPE_BARRIER_TIMEOUT for those.
+CANCEL_SCOPE_PURE_UNIT_TIMEOUT = 10
 
 # Constants for the process lifetime — lifted out of pydantic_spec (task 1426)
 # to avoid re-computing BaseModel reflection on every call.
@@ -910,3 +944,147 @@ def assert_update_wire_mode(
         f"'append' key must not appear on the wire; got: {arguments}"
     )
     return arguments
+
+
+# ===========================================================================
+# Git repository isolation (esc-3072-3)
+# ===========================================================================
+
+
+class NonIsolatedGitRepoError(AssertionError):
+    """A test helper was asked to run git against a directory that is not a
+    git repository root, so git's upward discovery would have retargeted an
+    enclosing repository.
+
+    Subclasses ``AssertionError`` deliberately: an unguarded call is the test
+    suite breaking its own isolation contract, not a product error.  Raised by
+    :func:`assert_isolated_git_repo`.
+    """
+
+
+def _enclosing_git_repo(start: Path) -> Path | None:
+    """Best-effort: the repo root git's upward walk would resolve from *start*.
+
+    Returns ``None`` when no ancestor carries a ``.git`` entry.  Used only to
+    make :class:`NonIsolatedGitRepoError` self-diagnosing — never to decide
+    whether a call is permitted.
+    """
+    try:
+        resolved = Path(start).resolve()
+    except OSError:  # pragma: no cover - resolve() on a pathological path
+        return None
+    for parent in resolved.parents:
+        if (parent / '.git').exists():
+            return parent
+    return None
+
+
+def assert_isolated_git_repo(cwd: Path) -> None:
+    """Refuse *cwd* unless it is ITSELF a git repository root.
+
+    Incident esc-3072-3.  Git repository discovery walks UP the directory tree.
+    A test helper that shells out to git with a caller-supplied ``cwd`` does not
+    operate on "the directory the caller named" — it operates on *whatever repo
+    encloses that directory*.  When pytest's basetemp lives inside a live task
+    worktree (``.worktrees/<task>/.pytest-tmp/``), a helper handed a bare
+    ``tmp_path`` silently retargets production state: ``_inject_uu_state``
+    wrote three blobs into a live worktree's object store and staged ``foo.py``
+    at stages 1/2/3, leaving ``UU foo.py`` in a real task's index.
+
+    This is a PURE-FILESYSTEM pre-flight — it spawns no child process, so it can
+    be called before the first subprocess and thereby guarantee that a rejected
+    call writes NOTHING anywhere.  That property is exactly what a mid-sequence
+    git failure cannot provide: ``git hash-object -w`` writes its blobs before a
+    later ``git update-index`` has any chance to fail, so "git errors out in a
+    non-repo directory" is not a defence.
+
+    The predicate is ``(cwd / '.git').exists()``, which matches BOTH shapes a
+    legitimate caller passes — a normal checkout (``.git`` is a directory) and a
+    linked worktree (``.git`` is a gitdir FILE).  The same idiom is documented
+    on ``conftest.py``'s ``repo_root`` fixture.  This is deliberately NOT a
+    "reject anything under ``.worktrees/``" rule: two legitimate
+    ``_inject_uu_state`` call sites target ``<tmp repo>/.worktrees/<task>``
+    roots produced by ``git_ops.create_worktree(...)``, and such a rule would
+    reject them while still permitting every other escape path.
+
+    Pair with :func:`git_env_with_ceiling` for defence in depth: the pre-flight
+    guarantees zero writes, the ceiling makes escape physically impossible at
+    the git level even if the pre-flight is refactored away.
+
+    Raises:
+        NonIsolatedGitRepoError: if *cwd* is missing, is not a directory, or
+            carries no ``.git`` entry of its own.
+    """
+    path = Path(cwd)
+
+    if (path / '.git').exists():
+        return
+
+    if not path.exists():
+        problem = 'it does not exist'
+    elif not path.is_dir():
+        problem = 'it is not a directory'
+    else:
+        problem = "it has no '.git' entry of its own, so it is not a repo root"
+
+    enclosing = _enclosing_git_repo(path)
+    if enclosing is not None:
+        victim = (
+            f'git discovery walks UP the directory tree, so this call would '
+            f'instead have operated on the enclosing repository:\n'
+            f'    {enclosing}\n'
+        )
+    else:
+        victim = (
+            'No enclosing repository is reachable from here right now — but '
+            'that is a property of where this test run happens to live, not a '
+            'guarantee. Under a basetemp nested inside a live task worktree '
+            'the very same call reaches production state.\n'
+        )
+
+    raise NonIsolatedGitRepoError(
+        f'Refusing to run git with cwd={path} — {problem}.\n'
+        f'{victim}'
+        f'Remedy: pass a repo root this test created itself, e.g. the '
+        f'`git_repo` fixture, `git_ops.project_root`, or a worktree root from '
+        f'`git_ops.create_worktree(...)`.\n'
+        f'See esc-3072-3: an unguarded helper wrote blobs into a live task '
+        f'worktree and left it with an unmerged index.'
+    )
+
+
+def git_env_with_ceiling(cwd: Path) -> dict[str, str]:
+    """Environment for a git child process whose repo discovery cannot leave *cwd*.
+
+    Layer 2 of the esc-3072-3 defence, behind :func:`assert_isolated_git_repo`.
+    The two are complementary and neither is sufficient alone:
+
+    * The pre-flight guarantees ZERO writes, because it runs before any child
+      process exists.  A ceiling alone only makes git *fail*, and it fails
+      mid-sequence — ``git hash-object -w`` writes its blobs first, so a
+      ceiling-only fix would still have leaked objects into the victim's object
+      store before ``git update-index`` errored out.
+    * The ceiling makes escape physically impossible at the git level regardless
+      of whether a future refactor drops, bypasses or forgets the pre-flight.
+
+    ``GIT_CEILING_DIRECTORIES`` is set to *cwd*'s parent, so git's upward walk
+    may inspect ``cwd`` itself and then stops.  Both normalizations applied here
+    are load-bearing, not cosmetic: git ignores ceiling entries that are not
+    absolute, and compares the remainder against the symlink-resolved path — so
+    a relative or unresolved entry silently never matches and the containment
+    would be inert.  ``os.environ`` is COPIED (not replaced) because a git child
+    spawned with a blank environment loses ``PATH``, ``HOME`` and its config
+    discovery.
+
+    A normal repo root and a linked-worktree root both still resolve under this
+    ceiling; only a directory that reaches a repo purely by the upward walk is
+    refused.
+
+    In-repo precedent for the same containment applied via ``monkeypatch.setenv``
+    (the right seam when the git call is made by production code rather than by
+    a subprocess this test spawns): test_warm_base_coherence.py:409-415,
+    test_session_hooks.py:1491, test_warm_lane_scripts_shipped.py:250.
+    """
+    env = os.environ.copy()
+    env['GIT_CEILING_DIRECTORIES'] = str(Path(cwd).resolve().parent)
+    return env

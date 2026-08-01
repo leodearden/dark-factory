@@ -5485,3 +5485,212 @@ def test_fused_memory_staleness_pass_e2e_converges(monkeypatch: pytest.MonkeyPat
     wdog.fused_memory_staleness_pass()
     assert delegated == [], f"a refreshed unit must self-clear; got {len(delegated)} delegation(s)"
 
+
+# ---------------------------------------------------------------------------
+# log() bounding tests (task 3392 — follow-up from task 3308 / commit
+# 87ff5d1870, which fixed the identical unbounded-systemd-cat shape in
+# scripts/dashboard-watchdog.py). log() was the one subprocess call in this
+# file with no timeout and no exception handling at all: a systemd-cat
+# blocked on a stuck journald or a full /run would hang the tick forever,
+# and since orchestrator-watchdog.service is Type=oneshot (TimeoutStartSec
+# disabled by default for that type) driven by a timer whose OnUnitActiveSec
+# is measured from this unit's LAST ACTIVATION, that hang would never let the
+# timer fire again — supervision stops with no signal, arriving through the
+# LOGGING path.
+# ---------------------------------------------------------------------------
+
+
+def test_log_bounds_systemd_cat_with_a_five_second_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """log() must pass an explicit timeout=5 to its systemd-cat subprocess call.
+
+    Without it, systemd-cat inherits no bound at all and a wedged journald or
+    a full /run hangs the oneshot tick forever.
+    """
+    wdog = _load_watchdog()
+    seen_kwargs: list[dict] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        seen_kwargs.append(kwargs)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    wdog.log("hello")
+
+    assert len(seen_kwargs) == 1, f"expected exactly one subprocess.run call: {seen_kwargs}"
+    assert seen_kwargs[0].get("timeout") == 5, (
+        f"log() must bound systemd-cat with timeout=5, got {seen_kwargs[0]!r}"
+    )
+
+
+def test_log_falls_through_to_stderr_on_missing_binary(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A missing systemd-cat binary (OSError) must not raise — log() must fall
+    back to printing on stderr, which StandardError=journal routes to the same
+    journal.
+    """
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        raise FileNotFoundError(2, "No such file or directory", "systemd-cat")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    wdog.log("hello")  # must not raise
+
+    captured = capsys.readouterr()
+    assert "hello" in captured.err, f"expected the message on stderr, got: {captured!r}"
+
+
+def test_log_falls_through_to_stderr_on_timeout(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A systemd-cat call that exceeds its bound (TimeoutExpired, a
+    subprocess.SubprocessError) must not raise — this is the exact wedge
+    the whole-tick TimeoutStartSec backstop exists to catch, and this handler
+    is the first line of defense: the tick continues instead of hanging here.
+    """
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        raise subprocess.TimeoutExpired(cmd, 5)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    wdog.log("hello")  # must not raise
+
+    captured = capsys.readouterr()
+    assert "hello" in captured.err, f"expected the message on stderr, got: {captured!r}"
+
+
+def test_log_swallows_only_os_and_subprocess_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """log() must not widen its except clause into a bare `except Exception`:
+    an unrelated bug (e.g. a TypeError from a bad call site) must still
+    surface rather than being silently swallowed alongside the two
+    tooling-failure cases it is meant to catch.
+    """
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        raise ValueError("not a systemd-cat failure at all")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(ValueError):
+        wdog.log("hello")
+
+
+def test_log_never_raises_when_the_stderr_fallback_itself_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fallback print is best-effort too: stderr can be a broken pipe or a
+    full/failing journal socket, and that OSError must not escape log().
+
+    main()'s per-unit handler calls log() from inside its ``except Exception``
+    block, so an exception escaping log() there aborts the for-loop and leaves
+    the remaining WATCHED units unprobed for that tick.
+    """
+    wdog = _load_watchdog()
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        raise FileNotFoundError("systemd-cat not found")
+
+    class _BrokenStderr:
+        def write(self, _s: str) -> int:
+            raise BrokenPipeError("stderr is gone too")
+
+        def flush(self) -> None:
+            raise BrokenPipeError("stderr is gone too")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(wdog.sys, "stderr", _BrokenStderr())
+
+    wdog.log("hello")  # must not raise — both journal routes are gone
+
+
+# ---------------------------------------------------------------------------
+# orchestrator-watchdog.service TimeoutStartSec pin (task 3392)
+# ---------------------------------------------------------------------------
+
+
+def _unit_sections(content: str) -> dict[str, list[str]]:
+    """Split unit-file text into {section_name: [lines]} (header line excluded).
+
+    Local copy of tests/scripts/test_orchestrator_service_files.py's
+    ``_parse_sections``: that module holds the other orchestrator-watchdog.service
+    pins and is where this assertion ultimately belongs, but pytest runs here with
+    ``--import-mode=importlib`` and tests/scripts/ is not a package, so a sibling
+    test module cannot be imported. Fold this back into ``_parse_sections`` if the
+    pin ever moves next to ``test_watchdog_service_structure``.
+    """
+    sections: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in content.splitlines():
+        if line.startswith("[") and line.endswith("]"):
+            current = line[1:-1]
+            sections[current] = []
+        elif current is not None:
+            sections[current].append(line)
+    return sections
+
+
+def test_service_bounds_the_whole_tick() -> None:
+    """TimeoutStartSec must be present under [Service], finite, and above the
+    script's own worst-case sequential subprocess bound.
+
+    systemd disables TimeoutStartSec for Type=oneshot by default, and the
+    timer's OnUnitActiveSec measures from the unit's last activation — so a
+    tick that never returns does not merely run late, it ENDS supervision:
+    the timer never re-triggers and nothing reports it. The bound must clear
+    the script's own worst realistic sequential path (main() walking all 7
+    WATCHED units plus fused_memory_liveness_pass plus the staleness passes,
+    each unit's own children already individually bounded) — roughly 1100s —
+    or the whole-tick kill could land mid-way through a legitimate multi-unit
+    restart rather than only on a genuine wedge.
+
+    systemd honours TimeoutStartSec= only in [Service]; under [Unit] or
+    [Install] it is silently ignored, which would leave the tick unbounded
+    again while a presence-only check still passed — so the section is
+    asserted, not just the line.
+    """
+    service_path = REPO_ROOT / "scripts" / "orchestrator-watchdog.service"
+    unit = service_path.read_text(encoding="utf-8")
+    sections = _unit_sections(unit)
+
+    def _values(lines: list[str]) -> list[str]:
+        return [
+            ln.split("=", 1)[1].strip()
+            for ln in lines
+            if ln.startswith("TimeoutStartSec=")
+        ]
+
+    misplaced = {
+        name: _values(lines)
+        for name, lines in sections.items()
+        if name != "Service" and _values(lines)
+    }
+    assert not misplaced, (
+        f"TimeoutStartSec= outside [Service] is silently ignored by systemd, "
+        f"leaving the tick unbounded: {misplaced}"
+    )
+
+    values = _values(sections.get("Service", []))
+    assert len(values) == 1, (
+        f"expected exactly one TimeoutStartSec= under [Service]: {values}"
+    )
+    assert values[0].isdigit(), (
+        f"TimeoutStartSec={values[0]!r} is not a plain seconds count; "
+        "'infinity' would leave the tick unbounded and a unit suffix is not "
+        "parsed here — keep it a bare integer"
+    )
+    assert int(values[0]) > 1100, (
+        f"TimeoutStartSec={values[0]} does not clear the script's own "
+        "~1100s worst-case sequential path (7 WATCHED units + fm liveness + "
+        "the staleness passes), so the whole-tick kill could land on a "
+        "legitimate multi-unit restart tick instead of only a genuine wedge"
+    )
+

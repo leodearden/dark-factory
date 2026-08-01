@@ -1604,3 +1604,130 @@ class TestWriteTriageConfig:
         assert isinstance(annotation, type) and issubclass(annotation, WriteTriageConfig), (
             f'write_triage must be annotated as a bare submodel, got {annotation!r}'
         )
+
+
+class TestMemoryMetadataConfig:
+    """`memory_metadata` — the Mem0 metadata write-boundary section (task 3195, leaf β).
+
+    A direct sibling of ``TaskMetadataConfig``: same top-level placement, same
+    warn-by-default posture, same RED-TIER/restart-only wording on the enforce
+    flags. PRD D3 names that precedent explicitly ("census first, tiers later"),
+    so this section follows it rather than inventing a second shape.
+    """
+
+    def _cls(self):
+        from fused_memory.config.schema import MemoryMetadataConfig  # noqa: PLC0415
+
+        return MemoryMetadataConfig
+
+    def test_section_is_top_level_not_nested(self):
+        """Top-level, NOT under ``taskmaster``/``reconciliation``.
+
+        It governs a vocabulary shared beyond any one backend (the registry
+        lives in ``fused_memory.memory_metadata`` and leaf ι's prompt tests
+        import it), exactly the rationale ``TaskMetadataConfig`` records for
+        its own placement.
+        """
+        from fused_memory.config.schema import (  # noqa: PLC0415
+            MemoryMetadataConfig,
+            ReconciliationConfig,
+            TaskmasterConfig,
+        )
+
+        assert 'memory_metadata' in FusedMemoryConfig.model_fields
+        annotation = FusedMemoryConfig.model_fields['memory_metadata'].annotation
+        assert isinstance(annotation, type) and issubclass(annotation, MemoryMetadataConfig)
+        assert 'memory_metadata' not in TaskmasterConfig.model_fields
+        assert 'memory_metadata' not in ReconciliationConfig.model_fields
+
+    def test_defaults_are_warn_mode(self):
+        """Both enforce flags default OFF.
+
+        This is the census-refuted-premise safety default, not timidity: leaf
+        α measured 242 of 329 live `kind` values as singletons, so a day-one
+        strict reject would turn every newly invented kind into a hard
+        memory-write failure on the live fleet.
+        """
+        cfg = FusedMemoryConfig().memory_metadata
+        assert cfg.enforce is False
+        assert cfg.enforce_kind_registry is False
+        assert cfg.unknown_key_storm_threshold == 50
+        assert cfg.unknown_key_storm_window_seconds == 300
+
+    def test_extra_keys_are_forbidden(self):
+        """A mistyped leaf must fail LOUD at config load/reload.
+
+        With ``extra='ignore'`` an operator who typed ``enforce_kind_regsitry``
+        would get a silently-ignored key and believe enforcement was on — the
+        no-silent-fail-soft invariant applied to the config surface.
+        """
+        assert self._cls().model_config.get('extra') == 'forbid'
+        with pytest.raises(ValidationError):
+            # Splatted rather than written as a literal keyword: the typo is
+            # the POINT of the test, and pyright rejects a misspelled keyword
+            # statically, which would fail the type gate before the runtime
+            # assertion could ever run.
+            self._cls()(**{'enfroce': True})
+
+    @pytest.mark.parametrize('bad', [0, -1, -50])
+    def test_storm_threshold_rejects_non_positive(self, bad):
+        with pytest.raises(ValidationError):
+            self._cls()(unknown_key_storm_threshold=bad)
+
+    @pytest.mark.parametrize('bad', [0, -1, -300])
+    def test_storm_window_rejects_non_positive(self, bad):
+        with pytest.raises(ValidationError):
+            self._cls()(unknown_key_storm_window_seconds=bad)
+
+    def test_round_trips_from_a_config_dict(self):
+        # `model_validate` rather than a splatted `__init__`: this is how a
+        # loaded config.yaml actually reaches the model, and a splat makes
+        # pyright widen every sibling field's type to the dict's value type,
+        # producing a type error per section of FusedMemoryConfig.
+        cfg = FusedMemoryConfig.model_validate(
+            {'memory_metadata': {'enforce': True, 'enforce_kind_registry': True}}
+        )
+        assert cfg.memory_metadata.enforce is True
+        assert cfg.memory_metadata.enforce_kind_registry is True
+
+    @pytest.mark.parametrize('field', ['enforce', 'enforce_kind_registry'])
+    def test_enforce_flags_are_restart_only(self, field):
+        """RED TIER, asserted behaviourally rather than as a doc blurb.
+
+        The operator-facing promise is not that some `description=` string
+        contains the letters "restart" — it is that `reload_config` REPORTS
+        this leaf as ``restart_required`` and does not silently no-op it.
+        That is a property of the reload allowlist and of `diff_config`, so
+        this pins both: the section has no hot-reloadable leaf, and a real
+        diff over a flipped flag buckets red, not green.
+
+        The step-11 ``description=`` strings are retained as operator
+        documentation; they are simply no longer test-pinned. Prose is
+        reviewed by humans and enforced by neither pyright nor pytest, and a
+        substring check over it fails open anyway (``'restarting is not
+        required'`` would have passed the check this replaces).
+        """
+        from fused_memory.config.reload import (  # noqa: PLC0415
+            RELOADABLE_FIELDS,
+            diff_config,
+        )
+
+        # 1. No leaf of this section is hot-reloadable. An added-and-
+        #    unreviewed allowlist entry fails here, loudly.
+        assert not any(f.startswith('memory_metadata.') for f in RELOADABLE_FIELDS)
+
+        # 2. Observable bucketing through the real diff path, mirroring the
+        #    red-tier precedent `TestDiffConfig.
+        #    test_non_allowlisted_leaf_lands_in_restart_required`.
+        live = FusedMemoryConfig()
+        fresh = FusedMemoryConfig()
+        old = getattr(live.memory_metadata, field)
+        # `object.__setattr__` is the established idiom in test_config_reload:
+        # it bypasses the validation/assignment wrapper so the diff sees a raw
+        # differing leaf.
+        object.__setattr__(fresh.memory_metadata, field, not old)
+
+        d = diff_config(live, fresh)
+
+        assert d.restart_required[f'memory_metadata.{field}'] == {'old': old, 'new': not old}
+        assert f'memory_metadata.{field}' not in d.applied_candidates

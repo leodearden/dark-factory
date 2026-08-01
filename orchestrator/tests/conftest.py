@@ -37,6 +37,16 @@ if str(_TESTS_DIR) not in sys.path:
 # ``Path('config.yaml')`` fallback no longer resolves to the operational config).
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
+# Suite-wide git isolation (task 3355, incident esc-3072-3).  The verify lane
+# runs `cd orchestrator && uv run pytest tests/`, which makes rootdir the
+# SUBPROJECT — the repo-root conftest.py is never loaded, so this suite wires
+# the defence itself.  APPEND the repo root, never insert(0, ...): at sys.path[0]
+# it would make orchestrator/, shared/ etc. resolve as namespace packages
+# pointing at the project folder instead of src/<pkg>/, and the src dirs
+# inserted above would lose.
+if str(REPO_ROOT) not in sys.path:
+    sys.path.append(str(REPO_ROOT))
+
 # Suite-wide single-writer debug asserts (task 1999 / MQ-invariants ξ, I7).
 # Must be set BEFORE any `orchestrator.merge_queue` import so the module-level
 # `_DEBUG_ASSERTS = os.environ.get(...)` seed picks it up.
@@ -48,6 +58,10 @@ from _orch_helpers import (  # noqa: E402
     pydantic_spec,
     reap_leaked_aiosqlite_connections,
     reap_leaked_claimant_heartbeats,
+)
+from df_pytest_isolation import (  # noqa: E402
+    _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
+    reject_unsafe_basetemp,
 )
 from shared.config_models import UsageCapConfig  # noqa: E402
 
@@ -368,7 +382,12 @@ def df_warm_lane_script_dir(monkeypatch, tmp_path: Path):
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    """Register the ``real_psi_reader`` opt-out marker (task 2418).
+    """Refuse an unsafe ``--basetemp``, then register ``real_psi_reader`` (task 2418).
+
+    The ``reject_unsafe_basetemp`` call comes FIRST and is unrelated to the
+    marker below: it aborts collection when ``--basetemp`` points inside a live
+    task worktree, where every git command this suite runs would resolve against
+    the enclosing worktree's repo (task 3355, incident esc-3072-3).
 
     ``orchestrator/pyproject.toml``'s ``[tool.pytest.ini_options] markers``
     list is outside this task's locked scope, so the marker used by the
@@ -380,6 +399,7 @@ def pytest_configure(config: pytest.Config) -> None:
     ``addopts`` doesn't set that flag, so this is precautionary rather than
     load-bearing yet.
     """
+    reject_unsafe_basetemp(config)
     config.addinivalue_line(
         'markers',
         'real_psi_reader: opt a test OUT of the autouse `_hermetic_psi_reader` '
@@ -717,6 +737,20 @@ def _drain_async_mock_coroutines():
     """
     yield
     drain_async_mock_coroutines()
+
+
+@pytest.fixture
+def steward_worktree(tmp_path: Path) -> Path:
+    """Single-source the ``tmp_path``-rooted worktree dir for the ``_make_steward`` helpers.
+
+    This single-sources the literal; it is a convention, not an enforced
+    invariant — a test can still build its own path and pass that instead.
+    Lives in conftest.py because that is the only module every call-site file
+    reaches without a cross-module import, which would collide with their
+    function-local-import convention.  Does NOT create the directory —
+    ``_make_steward`` mkdir's it.
+    """
+    return tmp_path / 'wt'
 
 
 @pytest.fixture

@@ -821,10 +821,20 @@ class MergeRequest:
     Threaded from ``merge_request(retry_failed_only=...)`` (escalation server)
     onto the ``MergeRequest`` the merge worker dequeues, so it is visible on
     ``req`` inside the worker's post-merge verify retry path
-    (:func:`orchestrator.merge_queue._run_post_merge_verify`).  Default
-    ``False`` is a strict no-op — the retry-set primitive that consumes this
-    flag ships separately (reify, PRD task D2); until then every retry path
-    behaves byte-identically regardless of this value."""
+    (:func:`orchestrator.merge_queue._run_post_merge_verify`).
+
+    When set, DF BUILDS THE SUBSET ITSELF (task 3059): on a classified
+    infra-transient attempt-0 red it derives the {did-not-pass} set from that
+    attempt's own per-test results plus a ``cargo nextest list`` planned probe,
+    corroborates the content-tree OID against reify's
+    ``target/reify-verify-attempt.json`` stamp, and ships the resulting
+    ``REIFY_VERIFY_RETRY_*`` contract in the retry's ``verify_env``.  reify's
+    ``verify.sh`` is the CONSUMER of that contract, not the producer of the
+    subset.  Every fail-safe route (no sidecar, no plan, a rebased tree) falls
+    back to a FULL re-verify.
+
+    Default ``False`` remains a strict no-op: no payload is built, no probe is
+    run, and every retry path behaves byte-identically."""
 
 
 @dataclass(frozen=True)

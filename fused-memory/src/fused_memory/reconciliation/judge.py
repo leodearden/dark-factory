@@ -175,6 +175,10 @@ class Judge:
         # thread the REAL reason into the on_judge_halt escalation instead of a
         # hardcoded generic string. Set in _apply_halt, cleared in unhalt.
         self._halt_reason: dict[str, str] = {}
+        # When each halted project was halted (task 3050). Persisted by
+        # journal.set_halt and rehydrated by initialize(), so "since when" is
+        # answerable across restarts — both observed incidents spanned one.
+        self._halted_at: dict[str, datetime] = {}
         self._usage_gate = usage_gate
         self._on_unhalt_cb = on_unhalt_cb
 
@@ -197,12 +201,25 @@ class Judge:
                 self._halted_projects.add(pid)
                 if row['cooldown_until'] is not None:
                     self._halt_cooldown_until[pid] = row['cooldown_until']
+                # Restore WHY and SINCE WHEN too (task 3050): the row already
+                # carries both, and without them the operator read surface
+                # would report a halt with no reason after every restart.
+                # A stored empty reason means "unknown" — keep it None rather
+                # than dressing '' up as an answer.
+                if row['halted_at'] is not None:
+                    self._halted_at[pid] = row['halted_at']
+                if row['reason']:
+                    self._halt_reason[pid] = row['reason']
             if (row['unhalt_grace_remaining'] or 0) > 0:
                 self._unhalt_grace_remaining[pid] = row['unhalt_grace_remaining']
         if self._halted_projects or self._unhalt_grace_remaining:
+            reasons = {
+                pid: self._halt_reason.get(pid) or 'unknown'
+                for pid in sorted(self._halted_projects)
+            }
             logger.info(
                 f'Judge: rehydrated halt state — halted={sorted(self._halted_projects)} '
-                f'grace={dict(self._unhalt_grace_remaining)}'
+                f'grace={dict(self._unhalt_grace_remaining)} reasons={reasons}'
             )
 
     async def review_run(self, run_id: str) -> JudgeVerdict | None:
@@ -954,6 +971,7 @@ Review this run and provide your verdict as JSON.
         # Remember the reason in-memory so the harness can thread the REAL reason
         # into the on_judge_halt escalation (task 2947 ask b).
         self._halt_reason[project_id] = reason
+        self._halted_at[project_id] = now
         try:
             await self.journal.set_halt(
                 project_id,
@@ -997,6 +1015,52 @@ Review this run and provide your verdict as JSON.
     def unhalt_grace_remaining(self, project_id: str) -> int:
         return self._unhalt_grace_remaining.get(project_id, 0)
 
+    def halt_snapshot(self, project_id: str) -> dict[str, Any]:
+        """Everything an operator/watcher needs to triage one project's halt.
+
+        This is the READ surface behind the ``reconciliation_halt`` field on
+        ``get_status`` / ``get_queue_stats`` / ``trigger_reconciliation``
+        (task 3050 deliverable A). Before it existed, halt state was only
+        observable by grepping harness logs, so a large
+        ``reconciliation_backlog`` was ambiguous between its two causes — the
+        project is HALTED (remedy: ``unhalt_reconciliation``) versus the
+        pipeline cannot keep up (remedy: capacity) — and one real halt went
+        unnoticed for 48h.
+
+        ``halted_at``/``cooldown_until`` render as ISO-8601 strings (None when
+        absent) because every consumer is a JSON MCP payload; serializing here
+        keeps one canonical rendering across all three tools. Precedent:
+        ``get_curator_state``'s ``soonest_open_at``. Internal callers needing
+        real datetimes use :meth:`cooldown_expired`, which this delegates to
+        rather than re-deriving any clock logic.
+
+        Never raises: an unknown or never-halted project reports
+        ``halted: False`` with None halt fields.
+        """
+        halted_at = self._halted_at.get(project_id)
+        cooldown_until = self._halt_cooldown_until.get(project_id)
+        return {
+            'project_id': project_id,
+            'halted': project_id in self._halted_projects,
+            'halt_reason': self._halt_reason.get(project_id),
+            'halted_at': halted_at.isoformat() if halted_at is not None else None,
+            'cooldown_until': (
+                cooldown_until.isoformat() if cooldown_until is not None else None
+            ),
+            'cooldown_expired': self.cooldown_expired(project_id),
+            'unhalt_grace_remaining': self.unhalt_grace_remaining(project_id),
+        }
+
+    def halted_projects(self) -> list[str]:
+        """Sorted ids of every currently-halted project.
+
+        The fleet-wide half of the task 3050 read surface: a global probe
+        surfaces a halt nobody knew to go looking for, which is how both
+        observed incidents stayed invisible — nothing named the halted project,
+        so nobody queried it.
+        """
+        return sorted(self._halted_projects)
+
     async def consume_grace_cycle(self, project_id: str) -> int:
         """Decrement post-unhalt grace counter by one cycle.
 
@@ -1037,6 +1101,7 @@ Review this run and provide your verdict as JSON.
         self._halted_projects.discard(project_id)
         self._halt_cooldown_until.pop(project_id, None)
         self._halt_reason.pop(project_id, None)
+        self._halted_at.pop(project_id, None)
 
         grace = max(int(self.config.halt_grace_cycles), 0)
         if grace > 0:

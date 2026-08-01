@@ -426,8 +426,11 @@ class TestB3ServerParkKeepsL2Open:
 class TestD1MakeIdCounter:
     """D1: make_id() ids are backed by a single durable per-task_id counter
     (PRD contract C9 / finding 10.4) — strictly increasing with no
-    collisions, durable across a fresh EscalationQueue instance, and never
-    dependent on scanning the archive directory."""
+    collisions, durable across a fresh EscalationQueue instance, and with no
+    directory-rescan dependence *in steady state* (task 3238 added a
+    one-shot bounded reconciliation that fires only when the counter is
+    absent or unparseable; see
+    escalation/tests/test_queue.py::TestMakeIdCounter)."""
 
     def test_rapid_make_id_and_submit_strictly_increasing_no_collision(
         self, tmp_path: Path,
@@ -476,6 +479,15 @@ class TestD1MakeIdCounter:
     def test_make_id_does_not_scan_archive_even_when_archive_present(
         self, tmp_path: Path,
     ) -> None:
+        """Steady state (counter present + archive present): zero archive scans.
+
+        The fixture seeds a counter alongside the archive record so it
+        expresses the STEADY state rather than a lost counter — an archive
+        record with no counter behind it is the repair case, covered by
+        escalation/tests/test_queue.py::TestMakeIdCounter. The anti-regression
+        value is unchanged: reintroducing a per-mint archive derivation still
+        fails this test.
+        """
         queue_dir = tmp_path / 'esc'
         archive_dir = queue_dir / 'archive' / '2026-01-01'
         archive_dir.mkdir(parents=True, exist_ok=True)
@@ -485,10 +497,11 @@ class TestD1MakeIdCounter:
             agent_role='implementer',
             severity='blocking',
             category='scope_violation',
-            summary='hand-seeded archive record (no counter behind it)',
+            summary='hand-seeded archive record (counter seeded alongside it)',
         )
         seeded.status = 'resolved'
         (archive_dir / f'{seeded.id}.json').write_text(seeded.to_json())
+        (queue_dir / 'esc-t-d1-archived.seq').write_text('9')
 
         queue = EscalationQueue(queue_dir)
         with patch.object(
@@ -498,15 +511,16 @@ class TestD1MakeIdCounter:
             second_id = queue.make_id('t-d1-archived')
 
         assert spy.call_count == 0, (
-            f'make_id() must not scan the archive even with an archive file '
-            f'present; _iter_archive_paths called {spy.call_count}x'
+            f'make_id() must not scan the archive while the counter is intact, '
+            f'even with an archive file present; _iter_archive_paths called '
+            f'{spy.call_count}x'
         )
-        assert first_id == 'esc-t-d1-archived-1', (
+        assert first_id == 'esc-t-d1-archived-10', (
             f'Counter is authoritative (no archive-derived catch-up); expected '
-            f'esc-t-d1-archived-1, got {first_id!r}'
+            f'esc-t-d1-archived-10, got {first_id!r}'
         )
-        assert second_id == 'esc-t-d1-archived-2', (
-            f'Expected esc-t-d1-archived-2; got {second_id!r}'
+        assert second_id == 'esc-t-d1-archived-11', (
+            f'Expected esc-t-d1-archived-11; got {second_id!r}'
         )
 
 
