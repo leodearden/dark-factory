@@ -567,10 +567,16 @@ class TaskMetadata(BaseModel):
         # blob that is also malformed more fundamentally (e.g. task_kind
         # 'normal' with a before_done) still reports that error instead of
         # this narrower one.
-        if (
-            self.before_done is not None
-            and (self.model_extra or {}).get(HUMAN_CURATOR_GATE_KEY) is True
-        ):
+        #
+        # Plain TRUTHINESS, not `is True` — same fail-CLOSED posture as
+        # orchestrator.deterministic_runner._is_human_curator_gate, and for the
+        # same reason: this is a SAFETY marker whose false NEGATIVE is the
+        # expensive direction. A truthy-but-not-True value (the string 'true'
+        # from a hand edit or a JSON round-trip) must still be rejected here,
+        # because the runner's own guard structurally cannot catch it on the
+        # act-then-ask path.
+        # Pinned by test_truthy_but_not_true_curator_marker_still_rejected.
+        if self.before_done is not None and (self.model_extra or {}).get(HUMAN_CURATOR_GATE_KEY):
             raise ValueError(
                 'human_curator_gate is only valid on a pure gate: a curator gate '
                 'declares that only a human content judgement closes this task, '
