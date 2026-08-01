@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import builtins
 import json
+import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
@@ -1944,6 +1945,158 @@ def _corrupt(path: Path) -> Path:
     """Make *path* syntactically unparseable (it is still a file that exists)."""
     path.write_text('{"metrics": [ this is not json')
     return path
+
+
+def _raiser(exc: Exception) -> Any:
+    """A stand-in for a module-level reader that raises *exc* however it is called."""
+    def _boom(*_args: Any, **_kwargs: Any) -> Any:
+        raise exc
+    return _boom
+
+
+class TestCodeBugsAreNotArtifactDegradation:
+    """A bug in this module must not be reported to the operator as a bad file.
+
+    The narrow tuple and the outermost guard are two halves of one contract.
+    ``_ARTIFACT_ERRORS`` says what READING AND PARSING one artifact off disk
+    can raise — nothing more — so a ``TypeError`` or ``AttributeError`` out of
+    a typo in ``_read_limits`` can no longer masquerade as ``unreadable_limits``
+    and send the operator to inspect a file that is perfectly fine.
+
+    The module's never-raises contract is unchanged and still load-bearing: a
+    degraded tree yields a degraded payload, never a 500.  It is now delivered
+    by ONE named boundary rather than by four broad per-artifact catches, and
+    a bug that reaches it is reported AS a bug (``internal_error``) with a real
+    traceback in the dashboard log, instead of being silently relabelled.
+    """
+
+    def test_artifact_errors_is_narrowed_to_io_and_parse(self) -> None:
+        """Pinned structurally so the tuple cannot silently widen back.
+
+        ``json.JSONDecodeError`` is dropped as a redundant ``ValueError``
+        subclass; ``TypeError``/``AttributeError`` are dropped because they are
+        what a code bug raises, not what a bad file raises.
+        """
+        from dashboard.data import memory_evals
+
+        assert memory_evals._ARTIFACT_ERRORS == (OSError, ValueError)
+
+    def test_a_bug_in_read_limits_is_an_internal_error(self, tmp_path: Path, monkeypatch) -> None:
+        from dashboard.data import memory_evals as memory_evals_mod
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _healthy_tree(tmp_path)
+        monkeypatch.setattr(
+            memory_evals_mod, '_read_limits', _raiser(AttributeError("no attribute 'alpah'")),
+        )
+
+        payload = build_memory_evals(root, esc_dir)
+
+        # The never-500 contract still holds.
+        assert set(payload) == _PAYLOAD_KEYS
+        assert payload['issue_count'] == len(payload['issues']) == 1
+        # Named as what it is — NOT as an unreadable limits artifact.
+        assert payload['issues'][0]['kind'] == 'internal_error'
+        # The exception type is in the detail so an operator can tell a
+        # dashboard bug from a broken artifact without reading the log.
+        assert 'AttributeError' in payload['issues'][0]['detail']
+
+    def test_a_bug_in_read_verdicts_is_an_internal_error(self, tmp_path: Path, monkeypatch) -> None:
+        from dashboard.data import memory_evals as memory_evals_mod
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _healthy_tree(tmp_path)
+        monkeypatch.setattr(
+            memory_evals_mod, '_read_verdicts', _raiser(TypeError('unhashable type: dict')),
+        )
+
+        payload = build_memory_evals(root, esc_dir)
+
+        assert set(payload) == _PAYLOAD_KEYS
+        assert payload['issue_count'] == len(payload['issues']) == 1
+        assert payload['issues'][0]['kind'] == 'internal_error'
+        assert 'TypeError' in payload['issues'][0]['detail']
+
+    def test_a_bug_in_index_escalations_is_an_internal_error(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        from dashboard.data import memory_evals as memory_evals_mod
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _healthy_tree(tmp_path)
+        monkeypatch.setattr(
+            memory_evals_mod, '_index_escalations',
+            _raiser(AttributeError("'list' object has no attribute 'get'")),
+        )
+
+        payload = build_memory_evals(root, esc_dir)
+
+        assert set(payload) == _PAYLOAD_KEYS
+        assert payload['issue_count'] == len(payload['issues']) == 1
+        assert payload['issues'][0]['kind'] == 'internal_error'
+        assert 'AttributeError' in payload['issues'][0]['detail']
+
+    def test_the_traceback_reaches_the_log(self, tmp_path: Path, monkeypatch, caplog) -> None:
+        """A swallowed code bug must not be invisible.
+
+        The payload names the bug for the operator; the log carries the
+        traceback for whoever has to fix it.  Without the second half, keeping
+        the never-500 contract would mean a bug that silently degrades the
+        dashboard forever with nothing to debug from.
+        """
+        from dashboard.data import memory_evals as memory_evals_mod
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root, esc_dir = _healthy_tree(tmp_path)
+        monkeypatch.setattr(
+            memory_evals_mod, '_read_verdicts', _raiser(TypeError('unhashable type: dict')),
+        )
+
+        with caplog.at_level(logging.ERROR, logger='dashboard.data.memory_evals'):
+            build_memory_evals(root, esc_dir)
+
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert len(errors) == 1
+        assert errors[0].exc_info is not None
+
+    def test_io_failures_keep_their_granular_kinds(self, tmp_path: Path, monkeypatch) -> None:
+        """The outer guard must not swallow what the narrow catches still handle.
+
+        A parse failure is a ``ValueError`` and a permission failure is an
+        ``OSError``, so both stay inside ``_ARTIFACT_ERRORS`` and keep degrading
+        one artifact at a time.  If any of these started reading
+        ``internal_error``, the narrowing would have gone too far and the
+        operator would lose the pointer to the actual broken file.
+        """
+        from dashboard.data import memory_evals as memory_evals_mod
+        from dashboard.data.memory_evals import build_memory_evals
+
+        # Every tree is built BEFORE any monkeypatch, so the patched Path
+        # method can never affect the fixture that exercises it.
+        root, esc_dir = _healthy_tree(tmp_path)
+        root2, esc_dir2 = _healthy_tree(tmp_path / 'second')
+        root3, esc_dir3 = _healthy_tree(tmp_path / 'third')
+        _corrupt(root / 'eval-a' / 'limits-current.json')
+        _corrupt(root / 'verdicts-current.json')
+
+        # Two ValueError-induced boundaries (a corrupt file is a parse error).
+        assert {i['kind'] for i in build_memory_evals(root, esc_dir)['issues']} == {
+            'unreadable_limits', 'unreadable_verdicts',
+        }
+
+        # And the two OSError-induced boundaries, one at a time.
+        monkeypatch.setattr(
+            memory_evals_mod, 'load_queue_escalations',
+            _raiser(PermissionError(13, 'Permission denied')),
+        )
+        assert [i['kind'] for i in build_memory_evals(root2, esc_dir2)['issues']] == [
+            'unreadable_escalations',
+        ]
+
+        monkeypatch.setattr(Path, 'iterdir', _raiser(PermissionError(13, 'Permission denied')))
+        assert [i['kind'] for i in build_memory_evals(root3, esc_dir3)['issues']] == [
+            'unreadable_root',
+        ]
 
 
 class TestStalenessAndDegradedStates:
