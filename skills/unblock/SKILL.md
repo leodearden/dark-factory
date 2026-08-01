@@ -513,22 +513,27 @@ The merge procedure is iterative — don't assume one pass will be enough:
     mcp__escalation__merge_status(request_id="<superseded_by value>")
     ```
     with the same 15 s→60 s backoff. This successor is not your own submission, so bound the
-    poll with its own 20-minute wall-clock ceiling rather than waiting unbounded. Do **not**
-    route the outcome back through this section's own-request rules: those say *resubmit*,
-    which the never-resubmit rule above forbids while the successor is still unresolved.
-    Dispatch on its outcome instead:
+    poll with its own 20-minute wall-clock ceiling rather than waiting unbounded. While it is
+    still unresolved the never-resubmit rule above holds — do not act on a non-terminal poll.
+    Once it reaches a terminal state, dispatch on that outcome:
     - `done` → landed. This successor merges the same single branch (no tip/train distinction),
       so the standard polled-done procedure applies directly: thread `merge_sha` if present,
       else re-derive via the exact-subject marker search for `task/<TASK_ID>` above.
-    - `blocked` (a conflicting outcome is also reported as `blocked`; `conflict` does not occur
-      here) → the successor has now failed on its own terms, and nothing auto-retries it —
-      `_redrive_coalesce_members` is gated on `isinstance(req, GroupMergeRequest)` and the train
-      id starting with `coalesce-` (`orchestrator/src/orchestrator/merge_queue.py:12914, 12928`),
-      neither of which holds for a generation-advance successor. Fix the conflict in the
-      worktree, rebase on main, and resubmit — the standard *Polled terminal failures* `blocked`
-      remediation, loop back to step 7.
+    - `conflict` or `blocked` → the successor has now failed on its own terms, and nothing
+      auto-retries it — `_redrive_coalesce_members` is gated on
+      `isinstance(req, GroupMergeRequest)` and the train id starting with `coalesce-`
+      (`orchestrator/src/orchestrator/merge_queue.py:12914, 12928`), neither of which holds for
+      a generation-advance successor. Fix in the worktree, rebase on main, and resubmit — the
+      standard *Polled terminal failures* remediation, loop back to step 7. (Both states are
+      reachable here: this successor is an ordinary solo merge through `classify_and_merge`,
+      which returns `conflict` (`merge_queue.py:5746`) and which `_map_terminal_state` passes
+      through unchanged (`escalation/server.py:2194-2195`). The conflict→`blocked` collapse
+      (`merge_queue.py:6339, 6357`) is inside `_do_train_merge` — train path only.)
     - `abandoned` → stop and report to the human. Do not resubmit; the resubmission may have
       been cancelled deliberately.
+    - `superseded` → the successor was itself superseded (a further generation advance, or
+      absorption into a train). Re-read its `superseded_by` and re-enter this bullet from the
+      top against that value; the 20-minute ceiling is shared across the whole chain.
   - **`coalesce-*` id** (coalesce-train path) — this names the *train*, not a request. It
     resolves through none of `merge_status`'s tiers (no retention-ring alias is ever recorded
     for a train id, no event-store finalized row is keyed on one, and Tier 3.5's git-authority
