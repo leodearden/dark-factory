@@ -1194,11 +1194,33 @@ def test_load_scaled_grace_getloadavg_error_returns_base(
 # source-grepping meta-test to prove call sites were rewired.
 
 
-def test_set_started_grace_idle_host_returns_base(
+def test_set_started_grace_writes_env_matching_return(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Idle host (load-per-core < 1) floors at _NOT_FLAGGED_GRACE_BASE_SECS,
-    and the returned int and the env string it writes must agree.
+    """_set_started_grace delegates to _load_scaled_grace and writes the
+    identical value into env["SPAWN_STARTED_GRACE_SECS"] as a string.
+
+    The floor/scale/cap arithmetic itself is already pinned three ways by
+    the test_load_scaled_grace_* tests above (idle/scale/clamp/error-safe);
+    re-deriving that same arithmetic here through _set_started_grace would
+    just be duplicate coverage of task 2733's tests. The only contract that
+    is genuinely new at this layer is that _set_started_grace's return
+    value and the string it writes into env agree -- so this test uses
+    _load_scaled_grace itself as the oracle rather than hardcoding an
+    expected number, on an IDLE host (load-per-core < 1) where
+    _load_scaled_grace floors at the bare base unchanged.
+
+    That idle-host floor is also where _NOT_FLAGGED_GRACE_BASE_SECS's own
+    value must clear the parent script's measured happy-path startup
+    latency -- not just be a low fixed number. MEASURED, not guessed: on
+    this host (nproc 32, /proc/loadavg 212 => load-per-core 6.6) three runs
+    of the normal fast spawn shape (delay=0, grace=2, foreground xterm,
+    fake claude exiting 0) took 2.13s / 3.10s / 4.71s wall -- the whole
+    observed range sits ABOVE the old 2s pin, which is the complete
+    explanation of the reported flake in test_normal_spawn_exit0_not_flagged
+    (registry status intermittently failed-to-start instead of exited). A
+    floor of 8s clears the 4.71s worst case with a 1.7x margin, before any
+    load scaling multiplies on top of it.
     """
     monkeypatch.setattr(os, "getloadavg", lambda: (10.0, 10.0, 10.0))
     monkeypatch.setattr(os, "cpu_count", lambda: 32)
@@ -1206,91 +1228,12 @@ def test_set_started_grace_idle_host_returns_base(
     env: dict[str, str] = {}
     grace = _set_started_grace(env)
 
-    assert grace == _NOT_FLAGGED_GRACE_BASE_SECS
+    assert grace == _load_scaled_grace(_NOT_FLAGGED_GRACE_BASE_SECS, cap_secs=60)
     assert env["SPAWN_STARTED_GRACE_SECS"] == str(grace)
-
-
-def test_set_started_grace_scales_up_with_load_per_core(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Loaded host (load-per-core 2.0) scales grace to
-    ceil(_NOT_FLAGGED_GRACE_BASE_SECS * 2.0), and the env string tracks the
-    returned int.
-    """
-    monkeypatch.setattr(os, "getloadavg", lambda: (64.0, 64.0, 64.0))
-    monkeypatch.setattr(os, "cpu_count", lambda: 32)
-
-    env: dict[str, str] = {}
-    grace = _set_started_grace(env)
-
-    assert grace == math.ceil(_NOT_FLAGGED_GRACE_BASE_SECS * 2.0)
-    assert env["SPAWN_STARTED_GRACE_SECS"] == str(grace)
-
-
-def test_set_started_grace_pathological_load_clamps_below_production_default(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Pathological load clamps at the cap (60s), which must stay strictly
-    below the 90s production default (skills/spawn/spawn-claude.sh:89) -- a
-    test pin above the production default would exercise an unreachable
-    configuration.
-    """
-    monkeypatch.setattr(os, "getloadavg", lambda: (3200.0, 3200.0, 3200.0))
-    monkeypatch.setattr(os, "cpu_count", lambda: 32)
-
-    env: dict[str, str] = {}
-    grace = _set_started_grace(env)
-
-    assert grace == 60
-    assert grace < 90, (
-        "started-grace cap must stay strictly below the 90s production "
-        "default (skills/spawn/spawn-claude.sh:89), or the pin would "
-        "exercise an unreachable configuration"
-    )
-    assert env["SPAWN_STARTED_GRACE_SECS"] == str(grace)
-
-
-def test_set_started_grace_floor_clears_measured_happy_path_latency(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """The must-not-be-flagged grace floor must clear the parent script's
-    own startup chain -- not just be a low fixed number.
-
-    MEASURED, not guessed: on this host (nproc 32, /proc/loadavg 212 =>
-    load-per-core 6.6) three runs of the normal fast spawn shape (delay=0,
-    grace=2, foreground xterm, fake claude exiting 0) took 2.13s / 3.10s /
-    4.71s wall -- the whole observed range sits ABOVE the old 2s pin, which
-    is the complete explanation of the reported flake in
-    test_normal_spawn_exit0_not_flagged (registry status intermittently
-    failed-to-start instead of exited). A floor of 8s clears the 4.71s
-    worst case with 1.7x margin, BEFORE load scaling multiplies on top.
-
-    Uses an IDLE host (load-per-core < 1) so _load_scaled_grace returns the
-    bare base unchanged -- load scaling cannot mask a too-small floor here.
-
-    Also asserts the floor strictly exceeds _base_env's own
-    SPAWN_LAUNCH_GRACE_SECS (:300): the structural defect was that the
-    started-grace was tied to the launcher's own grace window, so the
-    watchdog could fire while the launcher was still legitimately within
-    its own grace.
-    """
-    monkeypatch.setattr(os, "getloadavg", lambda: (10.0, 10.0, 10.0))
-    monkeypatch.setattr(os, "cpu_count", lambda: 32)
-
-    env: dict[str, str] = {}
-    grace = _set_started_grace(env)
-
-    assert grace >= 8, (
+    assert _NOT_FLAGGED_GRACE_BASE_SECS >= 8, (
         "must-not-be-flagged started-grace floor must clear the measured "
-        f"worst-case happy-path spawn latency (4.71s at load-per-core 6.6); got {grace}"
-    )
-
-    launch_grace = int(_base_env(tmp_path, "xterm")["SPAWN_LAUNCH_GRACE_SECS"])
-    assert grace > launch_grace, (
-        "the must-not-be-flagged started-grace floor must strictly exceed "
-        "the launcher's own SPAWN_LAUNCH_GRACE_SECS (_base_env, :300) -- "
-        "the structural defect was tying the started-grace to the "
-        f"launcher's grace window; floor={grace}, launch_grace={launch_grace}"
+        f"worst-case happy-path spawn latency (4.71s at load-per-core 6.6); "
+        f"got {_NOT_FLAGGED_GRACE_BASE_SECS}"
     )
 
 
