@@ -15,7 +15,7 @@ import shutil
 import time
 import uuid
 import xml.etree.ElementTree as ET
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -48,6 +48,7 @@ from orchestrator.verify_classify import (
     unresolved_top_level_modules,
 )
 from orchestrator.verify_cmd import (
+    ChainSegment,
     ToolKind,
     VerifyCmd,
     apply_pytest_numprocesses,
@@ -3681,6 +3682,100 @@ async def _run_cmd(
         raise
     except Exception as e:
         return 1, f'Command failed: {e}', False
+
+
+async def _run_segmented(
+    segments: 'list[ChainSegment]',
+    *,
+    run_one: 'Callable[[str, Path, float, str], Awaitable[tuple[int, str, bool]]]',
+    worktree: Path,
+    budget_secs: float,
+    now: 'Callable[[], float]' = time.monotonic,
+) -> 'tuple[int, str, bool, list[dict]]':
+    """Run EVERY segment of a decomposed `&&` chain — no short-circuit.
+
+    **Running every segment, rather than stopping at the first red, is the
+    whole point of task 3338.** A later "optimisation" that reintroduces the
+    short-circuit is not a speed-up; it is a reintroduction of the defect
+    esc-3062-2 reports, and
+    ``test_verify_segmented_fallback.TestRunSegmentedRunsEverySegment`` is what
+    should catch it.
+
+    The defect: the fallback verify runs the fleet-wide `&&` chain as one
+    ``/bin/bash -c`` string, so an unrelated earlier subproject's red makes the
+    SHELL skip every later clause — including the one a task's own assigned
+    files live in. The orchestrator sees a single rc and cannot tell "skipped"
+    from "passed", so the triaging agent's job becomes proving an unrelated
+    red is unrelated instead of reading its own result.
+
+    Returns ``(rc, output, timed_out, segments)`` where:
+
+    * ``rc`` is the FIRST non-zero segment rc, else 0 — deliberately the same
+      number the shell's `&&` chain would have returned, so every downstream rc
+      consumer keeps reading what it read before. Running the later segments
+      buys information, never leniency.
+    * ``timed_out`` is true if any segment timed out.
+    * ``segments`` is one flat JSON-native dict per segment
+      (index/label/cwd/cmd/status/rc/timed_out/duration_secs/skip_reason),
+      which rides to ``.task/verify/attempt-N.json`` on ``CheckRun.segments``.
+
+    *run_one* is INJECTED rather than calling ``_run_cmd`` directly, so this
+    aggregator is unit-testable with a recording fake and spawns no
+    subprocesses. Its production binding wraps ``_run_cmd`` with the caller's
+    per-segment cpu-governance, nice prefix and streamed log path.
+    """
+    results: list[dict] = []
+    first_nonzero = 0
+    any_timed_out = False
+    blocks: list[str] = []
+
+    for index, segment in enumerate(segments, start=1):
+        started = now()
+        rc, out, seg_timed_out = await run_one(
+            segment.command,
+            worktree / segment.cwd_rel,
+            budget_secs,
+            segment.label,
+        )
+        duration = now() - started
+        if seg_timed_out:
+            status = 'timed_out'
+        elif rc != 0:
+            status = 'failed'
+        else:
+            status = 'passed'
+        any_timed_out = any_timed_out or seg_timed_out
+        if rc != 0 and first_nonzero == 0:
+            first_nonzero = rc
+        results.append({
+            'index': index,
+            'label': segment.label,
+            'cwd': segment.cwd_rel,
+            'cmd': segment.command,
+            'status': status,
+            'rc': rc,
+            'timed_out': seg_timed_out,
+            'duration_secs': duration,
+            'skip_reason': None,
+        })
+        blocks.append(_segment_output_block(results[-1], len(segments), out))
+
+    return first_nonzero, '\n'.join(blocks), any_timed_out, results
+
+
+def _segment_output_block(entry: dict, total: int, out: str) -> str:
+    """One delimited output block for a segment, headed by its own facts.
+
+    The header names index/label/cwd/rc so a reader scrolling a concatenated
+    multi-subproject log can always tell which subproject the surrounding lines
+    came from — the thing a single `&&`-chained blob cannot say.
+    """
+    header = (
+        f'===== segment {entry["index"]}/{total} [{entry["label"]}] '
+        f'cwd={entry["cwd"]} rc={entry["rc"]} status={entry["status"]} '
+        f'({entry["duration_secs"]:.1f}s) ====='
+    )
+    return f'{header}\n{out}'
 
 
 # Marker file that records a worktree has completed at least one non-timeout verify.
