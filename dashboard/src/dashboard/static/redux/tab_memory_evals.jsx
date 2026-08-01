@@ -18,7 +18,7 @@
    contract.  This file CONSUMES the server's judgments; it never re-derives
    them.  In particular nothing here compares a metric value against a limit.
 
-   Exports: window.DF_MEMORY_EVALS = { MemoryEvalsSection, chartForKind }
+   Exports: window.DF_MEMORY_EVALS = { MemoryEvalsSection, chartForKind, verdictBadge }
 */
 const { Sparkline: MESpark, StepSpark: MEStep, PALETTE: MEC } = window.DF_CHARTS;
 const MEDF = window.DF_DATA;
@@ -53,6 +53,48 @@ function trendGaps(values) {
   return gaps;
 }
 
+// ── Verdict badge ──
+//
+// `verdict` and `parity` are the ONLY badge inputs.  Re-deriving alarm state
+// from value-vs-limit in the browser is forbidden by PRD section 8 (G6/INV-5):
+// memory_evals.py:660-661 says `parity` exists precisely so the UI does not
+// re-derive badge state "out of three separate fields, which is where the two
+// sides would drift apart".  This function therefore performs string equality
+// only — no arithmetic, no ordering comparison, no limits.
+//
+// The parity dimension REFINES the verdict; it never replaces it.  Where the
+// two agree there is nothing extra to say, so `alarmed_open` and `clear` fall
+// through to the plain verdict badge.
+function verdictBadge(metric) {
+  const verdict = metric.verdict;
+  const parity = metric.parity;
+
+  // Parity states that carry information the verdict alone does not.
+  if (parity === 'recovered_open') {
+    return { cls: 'badge warn', label: 'recovered · escalation open' };
+  }
+  if (parity === 'alarmed_unlinked') {
+    return { cls: 'badge bad', label: 'alarm · no escalation' };
+  }
+  if (parity === 'storm_collapsed') {
+    return { cls: 'badge bad', label: 'alarm · storm-collapsed' };
+  }
+  // parity 'alarmed_open' / 'clear' agree with the verdict — plain badge.
+
+  if (verdict === 'alarm') return { cls: 'badge bad', label: 'alarm' };
+  if (verdict === 'no_alarm') return { cls: 'badge ok', label: 'no_alarm' };
+  if (verdict === 'grandfathered') {
+    return { cls: 'badge info', label: 'grandfathered' };
+  }
+  if (verdict === 'insufficient_data') {
+    return { cls: 'badge muted', label: 'insufficient_data' };
+  }
+  // Absent is absent.  A null/unrecognised verdict is NEVER defaulted to
+  // no_alarm — that would report "we did not measure" as "we measured and it
+  // is fine" (mirrors memory_evals.py:847-849).
+  return { cls: 'badge muted', label: 'no verdict' };
+}
+
 // ── One metric row ──
 function MemoryEvalMetricRow({ metric }) {
   const m = metric;
@@ -63,10 +105,22 @@ function MemoryEvalMetricRow({ metric }) {
   const span = labels.length
     ? `${labels[0]} → ${labels[labels.length - 1]}`
     : 'no runs';
+  const badge = verdictBadge(m);
   return (
     <tr>
       <td className="mono" style={{ color: 'var(--fg-1)' }}>{m.metric_id}</td>
       <td className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>{m.kind}</td>
+      <td>
+        {/* verdict_detail carries the evaluator's own words, untranslated. */}
+        <span className={badge.cls} title={m.verdict_detail || undefined}>
+          {badge.label}
+        </span>
+        {m.limit_ref && (
+          <div className="mono" style={{ fontSize: 10, color: 'var(--fg-3)' }}>
+            {m.limit_ref}
+          </div>
+        )}
+      </td>
       {/* `value` is what the evaluator judged; `current_value` is what the
           metrics artifact says.  Two separate labelled fields — never
           conflated into one "the number". */}
@@ -127,6 +181,7 @@ function MemoryEvalCard({ ev }) {
             <tr>
               <th>Metric</th>
               <th>Kind</th>
+              <th>Verdict</th>
               <th className="num">Judged</th>
               <th className="num">Artifact</th>
               <th className="num">n</th>
@@ -166,4 +221,4 @@ function MemoryEvalsSection() {
   );
 }
 
-window.DF_MEMORY_EVALS = { MemoryEvalsSection, chartForKind };
+window.DF_MEMORY_EVALS = { MemoryEvalsSection, chartForKind, verdictBadge };
