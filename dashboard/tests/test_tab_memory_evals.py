@@ -544,15 +544,31 @@ def test_tab_memory_evals_renders_eval_cards_and_trends(
     assert 'trend.values' in body, (
         'the trend must be rendered from `trend.values`.'
     )
-    for hostile in (
-        r'trend\.values[^\n]{0,40}\.filter\(',
-        r'trend\.labels[^\n]{0,40}\.filter\(',
+    # The invariant is NO SILENT DROPPING, not "no null handling".  DETECTING
+    # holes — counting them, testing `=== null`, gating the chart on the count —
+    # is explicitly permitted and in fact required (see
+    # test_trend_holes_are_never_handed_to_a_chart_primitive below).  What is
+    # forbidden is COMPACTION: a hole REMOVED from the series.
+    for hostile, what in (
+        # a chart fed a transformed series rather than the payload array itself
+        (r'values\s*=\s*\{[^}\n]*\.\s*(?:filter|flatMap|reduce)\(', 'a chart is fed a transformed series'),
+        # `.filter(Boolean)` drops nulls AND legitimate zeroes
+        (r'trend\.(?:values|labels)\s*\.\s*(?:filter|flatMap)\(\s*Boolean\s*\)', '.filter(Boolean) drops holes'),
+        # a keep-the-non-nulls predicate — the dropping shape.  Note `!==`, not
+        # `===`: `.filter(v => v === null).length` COUNTS holes and is fine.
+        (
+            r'trend\.(?:values|labels)\s*\.\s*filter\([^)\n]*!==?\s*(?:null|undefined)',
+            'a null-dropping filter predicate',
+        ),
+        (r'trend\.(?:values|labels)\s*\.\s*flatMap\(', 'flatMap can drop elements'),
     ):
         assert not re.search(hostile, body), (
-            'trend values/labels must be passed through UNFILTERED. A `null` '
+            f'trend values/labels must never be COMPACTED ({what}). A `null` '
             'in `values` is a deliberate hole (that run produced no sample); '
             'dropping it would shift this metric\'s points against every '
-            "other metric's, since all series share the run_stamps x-axis."
+            "other metric's, since all series share the run_stamps x-axis. "
+            'Counting holes and suppressing the chart is the correct response; '
+            'removing them is not.'
         )
 
     # (g) charts.jsx primitives only — no new chart library
@@ -608,14 +624,22 @@ def test_tab_memory_evals_renders_eval_cards_and_trends(
 # The four persisted verdict strings, passed through unmapped by the builder.
 _VERDICTS = ('alarm', 'no_alarm', 'insufficient_data', 'grandfathered')
 
-# The five server-derived display states.  memory_evals.py:660-661: `parity`
-# "keeps the UI from re-deriving badge state out of three separate fields,
-# which is where the two sides would drift apart".
+# The server-derived display states that verdictBadge actually BRANCHES on.
+# memory_evals.py:660-661: `parity` "keeps the UI from re-deriving badge state
+# out of three separate fields, which is where the two sides would drift apart".
+#
+# `alarmed_open` and `clear` are deliberately absent.  verdictBadge has no
+# branch for them by design — they agree with the verdict, so they fall through
+# to the plain verdict badge.  Asserting their string appears in the source
+# only ever matched the explanatory COMMENTS (tab_memory_evals.jsx:84 and :100);
+# the strings occur nowhere in code.  That pinned comment wording in place —
+# rewording it would fail this suite with nothing functionally changed — while
+# giving zero coverage of how those states render.  "Falls through to the plain
+# badge" is a claim about which branch does NOT execute, which a source-
+# substring test structurally cannot make; only a DOM/render test could.
 _PARITIES = (
-    'alarmed_open',
     'alarmed_unlinked',
     'recovered_open',
-    'clear',
     'storm_collapsed',
 )
 
@@ -743,6 +767,94 @@ def test_no_client_side_alarm_derivation(
             'statistics — the eval runner computed the verdict and the '
             'dashboard displays it.'
         )
+
+
+def test_trend_holes_are_never_handed_to_a_chart_primitive(
+    tab_memory_evals_jsx_body: str,
+) -> None:
+    """A series containing a hole must NOT be drawn — charts.jsx cannot
+    represent one, so drawing it fabricates a measurement.
+
+    The defect: charts.jsx's `Sparkline` (:42-53) and `StepSpark` (:66-90) do
+    plain arithmetic with no null handling — `Math.max(...values, 1)`,
+    `Math.min(...values, 0)`, `y = height - ((v - min) / range) * height` — in
+    which a `null` coerces to 0.  A hole handed to them is therefore drawn as a
+    REAL point at the chart floor, joined by a line segment to its neighbours
+    and indistinguishable from a measured regression to zero.  For a
+    `proportion` metric sitting at 0.95 that reads as a plunge and recovery
+    that never happened.
+
+    That directly contradicts this file's own `dash()` invariant — "Missing
+    scalars render an em-dash, never `|| 0`: a synthetic zero reads as a
+    measured zero".  The trend column was the one place it was violated.
+
+    The fix is suppression, not compaction: the array is still passed through
+    verbatim (guarded above), but a series the primitive cannot represent is
+    not drawn at all.
+    """
+    body = tab_memory_evals_jsx_body
+
+    # (i) the false claim must not survive anywhere in the file
+    assert 'plotted at baseline' not in body, (
+        'tab_memory_evals.jsx still claims gaps are "plotted at baseline". '
+        'That is false of both primitives: a `null` coerces to 0 in '
+        'charts.jsx\'s arithmetic, so the hole is drawn as a real point at '
+        'value 0 — and "baseline" is only 0 when `min` happens to be 0; with '
+        'any negative value in the series the fabricated point lands '
+        'mid-chart. Disclose what actually happens.'
+    )
+
+    # (iv) hole DETECTION must still exist and still run — the fix is to act on
+    #      the count, not to stop counting.
+    assert re.search(r'\bfunction\s+trendGaps\s*\(', body), (
+        'tab_memory_evals.jsx must still define `trendGaps(values)` — hole '
+        'detection is required, not optional.'
+    )
+    assert len(re.findall(r'\btrendGaps\s*\(', body)) >= 2, (
+        '`trendGaps` is defined but never called. Detecting holes and then '
+        'ignoring the count is the defect this test exists to prevent.'
+    )
+
+    # (ii) the gap count must participate in the guard on the <Chart render
+    #      site.  Two spellings are accepted — an inline `Chart && !gaps`, or a
+    #      named local (`plottable` / `hasGaps` / ...) combining both — because
+    #      the invariant is "the count gates the chart", not one exact phrasing.
+    inline = re.search(r'\{\s*Chart\s*&&[^\n]*\bgaps\b', body)
+    via_local = None
+    for decl in re.finditer(
+        r'const\s+(\w+)\s*=\s*[^;\n]*\bChart\b[^;\n]*\bgaps\b[^;\n]*;', body
+    ):
+        if re.search(r'\{\s*' + re.escape(decl.group(1)) + r'\b', body):
+            via_local = decl.group(1)
+            break
+    assert inline or via_local, (
+        'the `<Chart ...>` render site is not gated on the gap count. A holed '
+        'series must not reach a charts.jsx primitive: declare e.g. '
+        '`const plottable = Chart && gaps === 0;` and render the chart only '
+        'when it holds.'
+    )
+
+    # ...and the bare `Chart` guard must be gone, so no path reaches the
+    # primitive without the gap check.
+    bare = re.search(r'\{\s*Chart\s*(?:\?|&&)(?![^\n]*\bgaps\b)', body)
+    assert bare is None, (
+        f'a chart render site is still guarded by `Chart` alone: '
+        f'{bare.group(0)!r} — a holed series would reach the primitive '
+        'through it.'
+    )
+
+    # (iii) a suppressed series must still disclose its gap count AND say that
+    #       no chart was drawn.  Both on one line: a count without the
+    #       no-chart statement reads as "drawn, with N gaps".
+    assert re.search(
+        r'(?:\$\{gaps\}|\{gaps\})[^\n]*no chart|no chart[^\n]*(?:\$\{gaps\}|\{gaps\})',
+        body,
+    ), (
+        'a holed series must disclose BOTH its gap count and the fact that no '
+        'chart is drawn. The operator still gets value, current_value, n, '
+        'denominator, direction and the verdict badge — only the sparkline is '
+        'withheld, and silently withholding it would look like a render bug.'
+    )
 
 
 # ---------------------------------------------------------------------------
