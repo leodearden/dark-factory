@@ -632,11 +632,97 @@ UNITS: dict[str, UnitSpec] = {
 
 
 def main(argv: Sequence[str]) -> int:
-    """Parse args and run the parity check.  See the module exit-code table."""
+    """Parse args and run the parity check.
+
+    Returns:
+        0 — parity
+        1 — drift
+        2 — one or more installed units absent
+
+    Drift DOMINATES absence: a run that hits both returns 1.  An absent unit
+    is still reported in that case — dominated, not hidden.
+    """
     parser = argparse.ArgumentParser(
         description="Verify parity between the in-repo and installed dashboard units."
     )
-    parser.parse_args(argv)
+    parser.add_argument(
+        "--installed-dir",
+        type=pathlib.Path,
+        default=_DEFAULT_INSTALLED_DIR,
+        help="Directory holding the installed units (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--repo-root",
+        type=pathlib.Path,
+        default=_REPO_ROOT,
+        help="Repo root holding the committed units (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--unit",
+        action="append",
+        choices=sorted(UNITS),
+        metavar="UNIT",
+        help=(
+            "Restrict the run to this unit (repeatable). "
+            "Default: all of " + ", ".join(sorted(UNITS))
+        ),
+    )
+    args = parser.parse_args(argv)
+
+    installed_dir: pathlib.Path = args.installed_dir
+    repo_root: pathlib.Path = args.repo_root
+    selected = args.unit or sorted(UNITS)
+
+    drifts: list[tuple[Drift, pathlib.Path, pathlib.Path]] = []
+    missing: list[pathlib.Path] = []
+
+    for name in selected:
+        spec = UNITS[name]
+        repo_path = repo_root / spec.repo_relpath
+        installed_path = installed_dir / name
+
+        if not repo_path.is_file():
+            # The committed unit is the source of truth; without it there is
+            # nothing to compare against. Report loudly rather than skipping
+            # silently — a vanished repo unit is itself a finding.
+            _log(
+                f"[skip] {name}: committed unit not found at {repo_path}",
+                stream=sys.stderr,
+            )
+            continue
+
+        if not installed_path.is_file():
+            missing.append(installed_path)
+            continue
+
+        for drift in compare_unit(
+            spec,
+            repo_path.read_text(encoding="utf-8"),
+            installed_path.read_text(encoding="utf-8"),
+        ):
+            drifts.append((drift, repo_path, installed_path))
+
+    for path in missing:
+        _log(f"[skip] installed unit not found: {path} (not installed on this host)")
+
+    if drifts:
+        _log(f"[drift] {len(drifts)} directive(s) differ between repo and installed units:")
+        for drift, repo_path, installed_path in drifts:
+            _log(f"  {drift.unit} [{drift.section}] {drift.key}")
+            _log(f"      {drift.reason}")
+            _log(f"      repo      {repo_path}: {drift.repo_value}")
+            _log(f"      installed {installed_path}: {drift.installed_value}")
+        _log(
+            "[drift] To propagate the committed units to this host, run: "
+            "scripts/setup-host.sh  (this checker is read-only by design — "
+            "see the module docstring for why there is no --fix)"
+        )
+        return 1
+
+    if missing:
+        return 2
+
+    _log(f"[ok] parity — {len(selected)} unit(s) match their committed copies.")
     return 0
 
 
