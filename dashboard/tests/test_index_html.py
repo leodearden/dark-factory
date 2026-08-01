@@ -586,24 +586,75 @@ def test_orch_filter_js_loads_before_tabs(index_html_body: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Regression guard: spark_path.js must load BEFORE charts.jsx (task 3436)
+# ---------------------------------------------------------------------------
+
+_SPARK_PATH_PREFIX = '/static/redux/spark_path.js'
+
+
+def test_spark_path_js_is_served(client) -> None:
+    """GET /static/redux/spark_path.js returns 200.
+
+    The load-order guard below only inspects the <script> tag's position in
+    index.html, so a file that exists in git but is not actually served (a
+    packaging or StaticFiles-mount regression) would keep CI green while
+    charts.jsx dies in the browser. That failure is NOT quiet: charts.jsx
+    destructures window.DF_SPARK_PATH with no fallback, so the module throws at
+    load and nearly every tab blanks. Worth its own assertion precisely because
+    the blast radius is so wide.
+    """
+    resp = client.get(_SPARK_PATH_PREFIX)
+    assert resp.status_code == 200, (
+        f'expected 200 for {_SPARK_PATH_PREFIX}, got {resp.status_code} — the '
+        'module is registered in index.html but not reachable at runtime.'
+    )
+
+
+def test_spark_path_js_loads_before_charts(index_html_body: str) -> None:
+    """spark_path.js must load as a classic synchronous script BEFORE charts.jsx.
+
+    charts.jsx destructures {sparkPaths, stepPaths} from window.DF_SPARK_PATH
+    at top-level execution time, with no `|| {}` fallback — a later (or
+    missing) tag therefore makes charts.jsx throw at load, taking down every
+    tab that imports a chart primitive. The destructure is deliberate
+    (loud-over-silent degradation); this ordering guard is what keeps that
+    loudness from ever reaching a browser.
+    """
+    _assert_script_loads_before(
+        index_html_body,
+        _SPARK_PATH_PREFIX,
+        _CHARTS_PREFIX,
+        before_label='spark_path.js',
+        after_label='charts.jsx',
+        consumer_note=(
+            'charts.jsx (Sparkline/StepSpark) destructures window.DF_SPARK_PATH '
+            'at top level; spark_path.js must define it first.'
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Regression guard: all /static/redux/* cache-busters share one bumped version
 # ---------------------------------------------------------------------------
 
 
 def test_redux_cache_buster_bumped(index_html_body: str) -> None:
-    """All /static/redux/*?v= cache-busters must share a single version >= 37,
+    """All /static/redux/*?v= cache-busters must share a single version >= 39,
     and graph_layout.js / prd_grouping.js / runtime_format.js / orch_filter.js /
-    esc_flow_layout.js must all be among the versioned assets.
+    esc_flow_layout.js / spark_path.js must all be among the versioned assets.
 
     Mirrors the existing single-shared-version guards in test_tab_escalations.py,
     test_tab_scheduler.py, and test_scheduler_page.py. Floor provenance: 30
     proved the uniform bump from 29 alongside task 2637's runtime_format.js
-    addition; 37 proves the bump for task 3332's `const API` collision fix
+    addition; 37 proved the bump for task 3332's `const API` collision fix
     (esc_flow_layout.js / graph_layout.js renamed to ESC_FLOW_LAYOUT_API /
-    GRAPH_LAYOUT_API). That bump matters more than a usual one: before the fix,
-    an already-open browser had cached an esc_flow_layout.js that dies on load,
-    leaving window.DF_ESC_FLOW_LAYOUT undefined, so without a new ?v= the fix
-    would not reach it.
+    GRAPH_LAYOUT_API); 38 was task 3216's memory-evals floor; 39 proves the
+    bump for task 3436's null-sample fix.
+
+    Each of those raises matter more than a usual bump, for the same reason:
+    an already-open browser holds a cached copy of the BROKEN file, so without
+    a new ?v= the fix never reaches it. For 3436 the cached charts.jsx?v=38
+    keeps drawing missing samples as measured zeros at the chart floor.
     """
     versions = set(re.findall(r'/static/redux/[^"?]+\?v=(\d+)', index_html_body))
     assert len(versions) == 1, (
@@ -611,12 +662,13 @@ def test_redux_cache_buster_bumped(index_html_body: str) -> None:
         'bump all of them uniformly to the same value.'
     )
     v = int(next(iter(versions)))
-    assert v >= 37, (
-        f'index.html cache-buster version is {v}, expected >= 37 (proves the '
-        "uniform bump for task 3332's `const API` collision fix actually "
-        'reaches already-open browsers holding the broken esc_flow_layout.js; '
-        'the previous floor, 30, proved the bump from 29 alongside task 2637\'s '
-        'runtime_format.js addition).'
+    assert v >= 39, (
+        f'index.html cache-buster version is {v}, expected >= 39 (proves the '
+        "uniform bump for task 3436's null-sample fix actually reaches "
+        'already-open browsers, which otherwise keep the cached charts.jsx?v=38 '
+        'that draws MISSING samples as measured zeros at the chart floor; the '
+        "previous floors were 38 for task 3216's memory-evals work and 37 for "
+        "task 3332's `const API` collision fix)."
     )
     assert re.search(r'/static/redux/graph_layout\.js\?v=\d+', index_html_body), (
         'graph_layout.js is not present among the versioned /static/redux/* '
@@ -643,4 +695,12 @@ def test_redux_cache_buster_bumped(index_html_body: str) -> None:
         'unversioned tag here would both miss an already-open browser (still '
         'holding the copy that dies on load) and break the single-shared-version '
         'invariant unnoticed.'
+    )
+    assert re.search(r'/static/redux/spark_path\.js\?v=\d+', index_html_body), (
+        'spark_path.js is not present among the versioned /static/redux/* '
+        'assets in index.html — charts.jsx destructures window.DF_SPARK_PATH at '
+        'top level with no fallback, so a missing tag blanks nearly every tab, '
+        'and an unversioned one would both miss an already-open browser and '
+        'break the single-shared-version invariant this test and four other '
+        'modules assert.'
     )
