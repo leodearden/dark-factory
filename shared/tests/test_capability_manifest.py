@@ -21,7 +21,12 @@ from pathlib import Path
 
 import pytest
 import yaml
-from capability_manifest_corpus import REPO_ROOT, check_manifest, discover_manifests
+from capability_manifest_corpus import (
+    MANIFEST_SUFFIX,
+    REPO_ROOT,
+    check_manifest,
+    discover_manifests,
+)
 from pydantic import BaseModel, ValidationError
 
 import shared.task_metadata as task_metadata_module
@@ -642,6 +647,84 @@ tasks: []
         # must not silently absorb it into a reported "problem" string.
         with pytest.raises(FileNotFoundError):
             check_manifest(tmp_path / 'does-not-exist.capability-manifest.yaml')
+
+
+_MANIFEST_PATHS = discover_manifests() or []
+_MANIFEST_IDS = [str(p.relative_to(REPO_ROOT)) for p in _MANIFEST_PATHS]
+
+
+class TestCheckedInManifestCorpus:
+    """Every checked-in capability-manifest sidecar validates against the schema.
+
+    This is the guard the task was filed for: TestLoader above covers exactly
+    one committed exemplar; this class sweeps all of them (measured at
+    planning time: 30 files under docs/prds/ and plans/, 447 capabilities,
+    0 failures — see task 3362's plan.json for the full measurement). It is
+    GREEN on arrival, which is inherent to a preventative guard, not a
+    reason to trust it unverified — so the RED signal was proven by mutation
+    instead of relying on a naturally-failing first run:
+
+        1. Inserted an unknown key (`verdcit: PASS`) into one real capability
+           entry of plans/capability-delivered-checks-prd.capability-manifest.yaml
+           (the "sidecar-loader-models-exist" capability under task α).
+        2. Ran this class: all three parametrized cases keyed to that one
+           file failed (test_checked_in_manifest_validates,
+           _capabilities_round_trip, and _prd_field_matches_its_own_filename
+           — each loads the same mutated file), while every other file's
+           cases across all three methods stayed green. The
+           test_checked_in_manifest_validates failure carried the exact
+           assertion message: "plans/capability-delivered-checks-prd.
+           capability-manifest.yaml: schema validation failed: 1 validation
+           error for CapabilityManifestDoc tasks.0.capabilities.1.verdcit
+           Extra inputs are not permitted [...]" — naming both the mutated
+           file and the offending `verdcit` key, exactly as check_manifest's
+           docstring promises.
+        3. Reverted the sidecar (`git checkout --`) and reran: full class
+           green again, all 30 files (181 tests across the whole module).
+
+    Does NOT assert delivered_check `script:` targets exist on disk —
+    deliberately out of scope (n=1 in the corpus at planning time, and it
+    would couple this authoring guard to script lifecycle rather than
+    manifest shape).
+    """
+
+    def test_corpus_discovery_is_not_vacuous(self):
+        # An empty parametrize list below would collect ZERO test cases and
+        # pass silently — exactly the fail-soft this guard exists to
+        # prevent. Skip (not fail) when the tree genuinely isn't a git
+        # checkout, mirroring test_lock_charter_guard.py's own split.
+        if discover_manifests() is None:
+            pytest.skip('not a git checkout (git ls-files failed)')
+        assert _MANIFEST_PATHS, 'discover_manifests() returned an empty corpus'
+
+    @pytest.mark.parametrize('manifest_path', _MANIFEST_PATHS, ids=_MANIFEST_IDS)
+    def test_checked_in_manifest_validates(self, manifest_path):
+        message = check_manifest(manifest_path)
+        assert message is None, message
+
+    @pytest.mark.parametrize('manifest_path', _MANIFEST_PATHS, ids=_MANIFEST_IDS)
+    def test_checked_in_manifest_capabilities_round_trip(self, manifest_path):
+        # Explicit "every capability validates against ManifestCapability"
+        # signal, exercising extra='forbid' per-capability on top of what
+        # load_capability_manifest already recursed into.
+        doc = load_capability_manifest(manifest_path)
+        for task in doc.tasks:
+            for cap in task.capabilities:
+                assert ManifestCapability.model_validate(cap.model_dump()) == cap
+
+    @pytest.mark.parametrize('manifest_path', _MANIFEST_PATHS, ids=_MANIFEST_IDS)
+    def test_checked_in_manifest_prd_field_matches_its_own_filename(self, manifest_path):
+        # manifest_stamping.py derives the sidecar path as
+        # re.sub(r'\.md$', '', prd_path) + MANIFEST_SUFFIX, so a doc.prd that
+        # disagrees with its own sidecar's filename means commit_planning
+        # looks for a sidecar that isn't there and silently no-ops (its
+        # documented "no sidecar on disk is a complete no-op" contract) —
+        # the drift is invisible at exactly the moment it matters.
+        doc = load_capability_manifest(manifest_path)
+        rel = str(manifest_path.relative_to(REPO_ROOT))
+        expected_prd = rel[: -len(MANIFEST_SUFFIX)] + '.md'
+        assert doc.prd == expected_prd
+        assert (REPO_ROOT / doc.prd).is_file()
 
 
 class TestDeliveredCheckMeta:
