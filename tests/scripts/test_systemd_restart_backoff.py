@@ -165,6 +165,45 @@ def test_every_unit_declaring_a_restart_cap_pairs_it_with_steps(rel_path: str) -
     assert_restart_backoff_effective(REPO_ROOT / rel_path)
 
 
+def test_factory_init_reference_unit_ships_effective_backoff() -> None:
+    """The factory-init reference unit must declare the full backoff triple.
+
+    This guard is UNCONDITIONAL where the sweep above is conditional, and
+    deliberately so — it is a strictly stronger invariant for this one file.
+
+    The sweep's contract is "IF you declare a cap, pair it with steps", which
+    correctly lets a unit opt out of backoff entirely by declaring no cap.  But
+    this file is not a unit; it is the template new supervised units are
+    modelled on (its own prose says the scripts/orchestrator-*.service files
+    are cp'd verbatim by setup-host.sh and points at orchestrator-reify.service
+    as the model).  A reference that simply DROPPED RestartMaxDelaySec= would
+    satisfy the conditional invariant while still failing to teach the pairing,
+    and every unit minted from it thereafter would need this same fix applied
+    by hand.  So require all three directives to be present here, not merely
+    consistent with each other.
+
+    restart_directive reads raw text with ^-anchored MULTILINE regexes, so it
+    works on the fenced ini block as-is: the directives sit at column 0 inside
+    the fence.
+    """
+    path = REPO_ROOT / _FACTORY_INIT_REFERENCE
+    assert path.exists(), (
+        f"{_FACTORY_INIT_REFERENCE} does not exist. New supervised units are "
+        "modelled on it, so if it moved this guard must follow it rather than "
+        "silently stop checking anything."
+    )
+
+    for directive in ("RestartSec", "RestartSteps", "RestartMaxDelaySec"):
+        assert restart_directive(path, directive) is not None, (
+            f"{_FACTORY_INIT_REFERENCE} does not declare {directive}=. This is "
+            "the block new supervised units are copied from, so every unit "
+            "minted from it inherits the omission — the whole backoff triple "
+            "(floor, steps, cap) has to be present to be taught."
+        )
+
+    assert_restart_backoff_effective(path)
+
+
 def test_restart_backoff_helper_is_shared_not_duplicated() -> None:
     """The dashboard suite must USE the shared helper, not its own fork of it.
 
