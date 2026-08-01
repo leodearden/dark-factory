@@ -40,6 +40,39 @@ Usage
   python3 scripts/check_dashboard_unit_parity.py \\
       --unit dark-factory-dashboard-watchdog.timer
 
+What is compared (PRD open question 4, resolved here)
+-----------------------------------------------------
+Comparison is BOUNDED to a curated per-unit key registry (``UNITS``), with the
+committed repo copy as the source of truth.  An unbounded diff would fire on
+Description, After and every comment reflow — a false-positive machine, and a
+gate nobody believes is worse than no gate.  Within that registry, directives
+are split by CLASS, because one rule cannot fit all of them:
+
+- **Value-compared** — host-INVARIANT literals carrying no paths (Type,
+  Restart, RestartSec, RestartMaxDelaySec, TimeoutStopSec, TimeoutStartSec,
+  StandardOutput/Error, OnBootSec, OnUnitActiveSec, WantedBy).  These can be
+  value-compared with no false-positive risk, and value comparison is what
+  catches present-but-WRONG — an installed ``TimeoutStopSec=90`` against a
+  committed 15 is exactly the failure mode a presence check would wave through.
+- **Presence-only** — directives whose value embeds a host path (ExecStart,
+  WorkingDirectory, Documentation).  Value-comparing them would report drift
+  on every machine that is not this one.  Their meaningful content is reached
+  instead through per-flag ExecStart comparison.
+- **ExecStart flags** — the uvicorn flags are extracted from the
+  continuation-JOINED logical ExecStart of both copies and compared
+  individually, so the ``uv`` binary path and repo root are ignored while a
+  stale ``--timeout-graceful-shutdown`` is not.
+- **Environment=** — compared by variable-NAME set (a dropped variable is
+  always drift), with values compared only for names off
+  ``DIVERGENCE_ALLOWLIST``.  That allowlist exists because the one measured
+  divergence on this host — DASHBOARD_KNOWN_PROJECT_ROOTS, 9 installed roots
+  vs 1 committed — is DELIBERATE and documented in the committed unit itself.
+  Value-comparing it would fire on every run of a correctly-configured host,
+  and a permanently-red gate gets disabled within a week, taking the
+  accidental drift it exists to catch with it.  Allowlisting is scoped to a
+  variable NAME, not to Environment= as a whole, so blessing the nine-root
+  value does not also bless the variable disappearing.
+
 Design notes
 ------------
 - Stdlib-only (argparse, dataclasses, pathlib, re, sys) — runs under plain
@@ -83,6 +116,27 @@ from typing import Sequence
 # decisions greppable.  This is also the token `metadata.delivered_checks`
 # greps for over scripts/ (dashboard_unit_parity|DASHBOARD_UNIT_PARITY).
 LOG_TAG = "dashboard_unit_parity"
+
+# Environment variable NAMES whose VALUE is permitted to differ between the
+# committed unit and the installed one, each with the documented reason it is
+# blessed.  Presence is still required — see the Environment= branch of
+# compare_unit: allowlisting a value must never bless the variable vanishing.
+#
+# THIS IS A HOLE IN THE GATE.  Keep it small, and keep every entry's reason
+# specific enough that a reviewer can check it.  The gate's whole value comes
+# from being believable when it fires.
+DIVERGENCE_ALLOWLIST: dict[str, str] = {
+    "DASHBOARD_KNOWN_PROJECT_ROOTS": (
+        "Cost/burndown aggregation roots. The committed unit's own comment "
+        "declares the divergence deliberate: 'additional project roots are "
+        "LOCAL settings, added to the installed unit, not committed here'. "
+        "Measured 2026-08-01: the installed unit carries 9 roots, the "
+        "committed one carries this repo only. Value-comparing it would "
+        "therefore report drift on every run of a correctly-configured host, "
+        "and a gate that is always red gets switched off — taking the "
+        "accidental drift it exists to catch with it."
+    ),
+}
 
 _SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 _REPO_ROOT = _SCRIPT_DIR.parent
@@ -237,6 +291,11 @@ class UnitSpec:
     # string equality: exec_start_flags compares the uvicorn flags inside
     # ExecStart individually, ignoring the host-specific prefix.
     present_only: tuple[tuple[str, str], ...] = ()
+    # Section whose Environment= directives are compared by variable-NAME set
+    # (values compared only for names off DIVERGENCE_ALLOWLIST). None disables
+    # the branch entirely, which is right for the two watchdog units — they
+    # declare no Environment= at all.
+    environment_section: str | None = None
 
 
 def _render(values: list[str] | None) -> str:
@@ -246,6 +305,80 @@ def _render(values: list[str] | None) -> str:
     if len(values) == 1:
         return values[0]
     return " | ".join(values)
+
+
+def _environment_map(
+    directives: dict[str, dict[str, list[str]]],
+    section: str,
+) -> dict[str, str]:
+    """Return ``{VAR: value}`` for every ``Environment=`` line in *section*.
+
+    Each value is split on its FIRST ``=`` — ``Environment=A=b=c`` sets A to
+    ``b=c``.  A later occurrence of the same variable wins, matching systemd,
+    which applies the directives in file order.
+    """
+    env: dict[str, str] = {}
+    for assignment in directives.get(section, {}).get("Environment", []):
+        name, sep, value = assignment.partition("=")
+        if not sep:
+            continue
+        env[name.strip()] = value
+    return env
+
+
+def _compare_environment(
+    spec: UnitSpec,
+    repo: dict[str, dict[str, list[str]]],
+    installed: dict[str, dict[str, list[str]]],
+) -> list[Drift]:
+    """Compare ``Environment=`` by variable-NAME set, then by value.
+
+    Two rules, and the split between them is the whole point:
+
+    - The SET of variable names must agree.  A variable declared on one side
+      and not the other is drift regardless of the allowlist — the allowlist
+      says "this variable's VALUE is a local setting", never "this variable is
+      optional".  An installed unit that dropped
+      DASHBOARD_KNOWN_PROJECT_ROOTS entirely would silently lose every
+      aggregation root, which is a real regression, not a local preference.
+    - For names present in BOTH, values must agree unless the name is on
+      DIVERGENCE_ALLOWLIST.
+
+    Drifts are keyed ``Environment=<VAR>`` so the report names the offending
+    variable rather than the directive class — with several Environment= lines
+    in a unit, "Environment differs" would send the operator back to a diff.
+    """
+    section = spec.environment_section
+    if section is None:
+        return []
+
+    repo_env = _environment_map(repo, section)
+    installed_env = _environment_map(installed, section)
+    drifts: list[Drift] = []
+
+    for name in sorted(set(repo_env) | set(installed_env)):
+        in_repo = name in repo_env
+        in_installed = name in installed_env
+        if in_repo and in_installed:
+            if name in DIVERGENCE_ALLOWLIST or repo_env[name] == installed_env[name]:
+                continue
+            reason = "environment variable value differs (not on DIVERGENCE_ALLOWLIST)"
+        elif in_repo:
+            reason = "environment variable declared in the repo copy, absent from the installed copy"
+        else:
+            reason = "environment variable declared in the installed copy, absent from the repo copy"
+        drifts.append(
+            Drift(
+                unit=spec.name,
+                section=section,
+                key=f"Environment={name}",
+                repo_value=repo_env.get(name, _ABSENT),
+                installed_value=installed_env.get(name, _ABSENT),
+                reason=reason,
+            )
+        )
+
+    return drifts
 
 
 def compare_unit(
@@ -313,6 +446,8 @@ def compare_unit(
                 ),
             )
         )
+
+    drifts.extend(_compare_environment(spec, repo, installed))
 
     return drifts
 
