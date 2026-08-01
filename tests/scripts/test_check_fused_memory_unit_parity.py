@@ -182,6 +182,29 @@ ExecStartPre=/usr/bin/docker compose -f /repo/fused-memory/docker/docker-compose
 WantedBy=default.target
 """
 
+# The pre-fix restart shape: a backoff cap declared with a floor but no steps.
+# systemd parses RestartMaxDelaySec=, logs "Service has RestartMaxDelaySec= but
+# no RestartSteps= setting. Ignoring." at unit load, and discards the cap — so
+# this unit's backoff never grows past RestartSec. Nothing in its text says so.
+_MISSING_RESTART_STEPS_UNIT = """\
+[Unit]
+Description=Installed Fused Memory (cap declared, no steps)
+
+[Service]
+Type=notify
+Environment=MEM0_TELEMETRY=false
+WatchdogSec=120
+ExecStartPre=/usr/bin/docker compose -f /repo/fused-memory/docker/docker-compose.yml up -d falkordb qdrant
+Restart=on-failure
+RestartSec=5
+RestartMaxDelaySec=60
+TimeoutStartSec=300
+TimeoutStopSec=90
+
+[Install]
+WantedBy=default.target
+"""
+
 # A fully-populated [Service] except an injected divergence: TimeoutStopSec=45
 # instead of the required TimeoutStopSec=90. Exact-match semantics mean a
 # *different* value for the same key still counts as the required directive
@@ -218,6 +241,35 @@ def test_find_drift_detects_missing_restart_directives():
     assert "RestartSec=5" in drift
     assert "TimeoutStartSec=300" in drift
     assert "TimeoutStopSec=90" in drift
+
+
+def test_find_drift_detects_missing_restart_steps():
+    """find_drift must flag a missing RestartSteps= on the INSTALLED host unit.
+
+    Why the CHECKER has to know this directive, not just the template:
+    scripts/setup-host.sh runs this checker against
+    ~/.config/systemd/user/fused-memory.service, and --fix appends whatever it
+    reports missing.  Fixing only scripts/fused-memory.service.template would
+    leave the LIVE unit's RestartMaxDelaySec= inert — systemd parses the cap,
+    warns, and discards it — while the drift check reported green.  That is the
+    same silently-ignored-directive failure class this task exists to kill,
+    merely relocated from the unit file to the installer.
+
+    The fixture below is exactly the pre-fix shape: a cap declared with a floor
+    and no steps to interpolate over.
+
+    RED until REQUIRED_SERVICE_DIRECTIVES includes RestartSteps=4 — today the
+    checker does not know the directive exists, so find_drift reports it
+    nowhere.
+    """
+    mod = _load_checker()
+    drift = mod.find_drift(_MISSING_RESTART_STEPS_UNIT)
+    assert "RestartSteps=4" in drift, (
+        "find_drift did not flag the absent RestartSteps=4 on a unit that "
+        "declares RestartMaxDelaySec=60. setup-host.sh relies on this checker "
+        "to carry the directive to the installed unit; without it the host's "
+        "backoff cap stays inert while the drift check reports clean."
+    )
 
 
 def test_find_drift_detects_injected_timeout_stop_sec_divergence():
