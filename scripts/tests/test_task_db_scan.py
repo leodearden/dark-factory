@@ -39,15 +39,6 @@ from _task_db_scan import (
 )
 
 
-def _touch_tasks_db(project_root: Path) -> Path:
-    """Create an (empty-content) tasks.db under project_root/.taskmaster/tasks/."""
-    db_dir = project_root / ".taskmaster" / "tasks"
-    db_dir.mkdir(parents=True, exist_ok=True)
-    db_file = db_dir / "tasks.db"
-    db_file.write_text("")
-    return db_file
-
-
 # ---------------------------------------------------------------------------
 # tasks_db_path(project_root) -> Path
 # ---------------------------------------------------------------------------
@@ -118,30 +109,32 @@ def test_resolve_project_roots_default_is_the_dark_factory_root(monkeypatch):
 # discover_project_roots(project_roots, env) -> list[str]  (ROOTS, not dbs)
 # ---------------------------------------------------------------------------
 
-def test_discover_project_roots_returns_roots_not_db_paths(tmp_path):
+def test_discover_project_roots_returns_roots_not_db_paths(tmp_path, project_root_with_tasks_db):
     root = tmp_path / "proj"
     root.mkdir()
-    _touch_tasks_db(root)
+    project_root_with_tasks_db(root)
 
     assert discover_project_roots(project_roots=[str(root)]) == [str(root)]
 
 
-def test_discover_project_roots_drops_root_whose_tasks_db_is_absent(tmp_path):
+def test_discover_project_roots_drops_root_whose_tasks_db_is_absent(
+    tmp_path, project_root_with_tasks_db
+):
     with_db = tmp_path / "with_db"
     without_db = tmp_path / "without_db"
     with_db.mkdir()
     without_db.mkdir()
-    _touch_tasks_db(with_db)
+    project_root_with_tasks_db(with_db)
 
     result = discover_project_roots(project_roots=[str(with_db), str(without_db)])
 
     assert result == [str(with_db)]
 
 
-def test_discover_project_roots_reads_env_when_no_kwargs(tmp_path):
+def test_discover_project_roots_reads_env_when_no_kwargs(tmp_path, project_root_with_tasks_db):
     root = tmp_path / "envproj"
     root.mkdir()
-    _touch_tasks_db(root)
+    project_root_with_tasks_db(root)
 
     env = {"DASHBOARD_KNOWN_PROJECT_ROOTS": f" {root} ,, "}
 
@@ -152,10 +145,10 @@ def test_discover_project_roots_reads_env_when_no_kwargs(tmp_path):
 # discover_db_paths(explicit_dbs, project_roots, env) -> list[str]  (db STRINGS)
 # ---------------------------------------------------------------------------
 
-def test_discover_db_paths_returns_db_path_strings(tmp_path):
+def test_discover_db_paths_returns_db_path_strings(tmp_path, project_root_with_tasks_db):
     root = tmp_path / "proj"
     root.mkdir()
-    db_file = _touch_tasks_db(root)
+    db_file = project_root_with_tasks_db(root)
 
     result = discover_db_paths(project_roots=[str(root)])
 
@@ -163,38 +156,40 @@ def test_discover_db_paths_returns_db_path_strings(tmp_path):
     assert all(isinstance(p, str) for p in result)
 
 
-def test_discover_db_paths_explicit_dbs_win_over_project_roots(tmp_path):
+def test_discover_db_paths_explicit_dbs_win_over_project_roots(
+    tmp_path, project_root_with_tasks_db
+):
     explicit = tmp_path / "explicit.db"
     explicit.write_text("")
     root = tmp_path / "proj"
     root.mkdir()
-    _touch_tasks_db(root)
+    project_root_with_tasks_db(root)
 
     result = discover_db_paths(explicit_dbs=[str(explicit)], project_roots=[str(root)])
 
     assert result == [str(explicit)]
 
 
-def test_discover_db_paths_project_roots_win_over_env(tmp_path):
+def test_discover_db_paths_project_roots_win_over_env(tmp_path, project_root_with_tasks_db):
     arg_root = tmp_path / "arg"
     env_root = tmp_path / "env"
     arg_root.mkdir()
     env_root.mkdir()
-    arg_db = _touch_tasks_db(arg_root)
-    _touch_tasks_db(env_root)
+    arg_db = project_root_with_tasks_db(arg_root)
+    project_root_with_tasks_db(env_root)
 
     env = {"DASHBOARD_KNOWN_PROJECT_ROOTS": str(env_root)}
 
     assert discover_db_paths(project_roots=[str(arg_root)], env=env) == [str(arg_db)]
 
 
-def test_discover_db_paths_env_used_when_no_explicit_kwargs(tmp_path):
+def test_discover_db_paths_env_used_when_no_explicit_kwargs(tmp_path, project_root_with_tasks_db):
     root_a = tmp_path / "a"
     root_b = tmp_path / "b"
     root_a.mkdir()
     root_b.mkdir()
-    db_a = _touch_tasks_db(root_a)
-    db_b = _touch_tasks_db(root_b)
+    db_a = project_root_with_tasks_db(root_a)
+    db_b = project_root_with_tasks_db(root_b)
 
     env = {"DASHBOARD_KNOWN_PROJECT_ROOTS": f" {root_a} , {root_b} ,, "}
 
@@ -528,3 +523,29 @@ def test_project_root_with_tasks_db_is_idempotent(project_root_with_tasks_db, tm
     second = project_root_with_tasks_db(root)
 
     assert first == second
+
+
+def test_project_root_with_tasks_db_does_not_truncate_a_seeded_db(
+    project_root_with_tasks_db, make_tasks_db, tmp_path
+):
+    """Idempotent must also mean NON-DESTRUCTIVE.
+
+    ``mkdir(exist_ok=True)`` only makes the directory half idempotent; an
+    unconditional ``write_text('')`` would blank an already-seeded tasks.db.
+    Seed-then-make-discoverable is the natural call ordering, and because this
+    fixture auto-resolves for every file in ``scripts/tests/`` the failure mode
+    would be silent: the rows vanish and a downstream ``scan_db(...) == []``
+    passes vacuously.
+    """
+    tasks_dir = tmp_path / "proj" / ".taskmaster" / "tasks"
+    tasks_dir.mkdir(parents=True)
+    seeded = make_tasks_db([{"id": 1, "description": "keep me"}], directory=tasks_dir)
+
+    db_path = project_root_with_tasks_db(tmp_path / "proj")
+
+    assert db_path == seeded
+    conn = sqlite3.connect(db_path)
+    try:
+        assert conn.execute("SELECT description FROM tasks").fetchall() == [("keep me",)]
+    finally:
+        conn.close()

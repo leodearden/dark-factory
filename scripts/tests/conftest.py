@@ -144,13 +144,24 @@ def project_root_with_tasks_db():
     """Factory: create ``<root>/.taskmaster/tasks/tasks.db``, return its Path.
 
     The file is created empty — callers that need real rows use
-    :func:`make_tasks_db` with ``directory=``. Idempotent (``exist_ok=True``),
-    because a test may build a root and then re-touch it.
+    :func:`make_tasks_db` with ``directory=``.
+
+    Idempotent AND non-destructive: an EXISTING tasks.db is left untouched.
+    Both halves matter. A test may build a root and then re-touch it (hence
+    ``exist_ok=True``), but ``exist_ok`` only makes the *mkdir* idempotent — an
+    unconditional ``write_text('')`` would silently truncate a real database to
+    zero bytes. Since this fixture auto-resolves for every file in
+    ``scripts/tests/``, the natural ordering ``make_tasks_db(rows,
+    directory=root / '.taskmaster' / 'tasks')`` then
+    ``project_root_with_tasks_db(root)`` (reading as "now make this root
+    discoverable") would otherwise blank the seeded rows and leave the
+    downstream assertion passing vacuously.
     """
     def _make(root):
         db = Path(root) / '.taskmaster' / 'tasks' / 'tasks.db'
         db.parent.mkdir(parents=True, exist_ok=True)
-        db.write_text('')
+        if not db.exists():
+            db.write_text('')
         return db
 
     return _make
