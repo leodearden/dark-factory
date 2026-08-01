@@ -239,6 +239,22 @@ def _wedged_agent_result():
     )
 
 
+def _flushed_server_error_result(status: int = 529):
+    """The 2026-07-29 incident shape: the watchdog SIGTERM-killed a wedged CLI
+    and the CLI flushed its result JSON on the way out with api_error_status
+    set, so ``timed_out`` and a 5xx status are BOTH true. Mirrors
+    shared/tests/test_server_error.py:61-77 (``_incident_result``), which is the
+    source of truth for what a flushed 5xx looks like.
+    """
+    from shared.cli_invoke import AgentResult
+
+    return AgentResult(
+        success=False, output='', subtype='error_empty_output',
+        timed_out=True, transcript_turns=0, duration_ms=127_000,
+        api_error_status=status,
+    )
+
+
 def _cli_local_error_result(marker: str):
     """A local CLI/usage fault — explicitly NOT a cap (the reify-3604 fix)."""
     from shared.cli_invoke import AgentResult
@@ -250,6 +266,20 @@ def _cli_local_error_result(marker: str):
         duration_ms=300,
         turns=0,
         subtype='error',
+    )
+
+
+def _server_error_result(status: int = 529):
+    """A fast, zero-cost server-side (5xx) refusal — the provider was degraded,
+    the model never answered. Deliberately NOT timed out and carrying no cap
+    body, so the ONLY route to a marker is classify_invocation's ServerError
+    tier (shared/src/shared/invocation_outcome.py:523).
+    """
+    from shared.cli_invoke import AgentResult
+
+    return AgentResult(
+        success=False, output='', cost_usd=0.0,
+        duration_ms=1100, turns=0, subtype='error', api_error_status=status,
     )
 
 
@@ -283,6 +313,11 @@ class TestDetectInvocationError:
         # The marker quotes the REASON, so a human reading the result JSON sees
         # the forensic evidence, not just a boolean.
         assert 'session limit' in marker
+        # A bodied 429 is a cap hit, never the new 5xx bucket — regression pin
+        # for the server_error tier, folded in here rather than as a parallel
+        # test (reviewer: duplication).
+        assert marker.partition(':')[0] == 'cap_hit'
+        assert 'server_error' not in marker
 
     def test_body_less_429_yields_marker_via_structured_fallback(self):
         # 429 is deliberately EXCLUDED from AuthFailed (it routes to the cap-text
@@ -299,6 +334,12 @@ class TestDetectInvocationError:
         marker = detect_invocation_error(bare)
         assert isinstance(marker, str) and marker
         assert '429' in marker
+        # 429 sits below the 5xx band, so a body-less 429 must keep reaching
+        # this raw-status fallback rather than drifting into the server_error
+        # bucket a bodied 5xx gets — folded in here rather than as a parallel
+        # test (reviewer: duplication).
+        assert marker.partition(':')[0] == 'api_error'
+        assert 'server_error' not in marker
 
     def test_auth_failure_yields_auth_marker(self):
         from shared.cli_invoke import AgentResult
@@ -408,6 +449,89 @@ class TestDetectInvocationError:
         # consulted and no claude cap prefix matches, so it is not an infra
         # refusal at all.
         assert detect_invocation_error(codex_capped) is None
+
+    # -- 5xx (ServerError) attribution --------------------------------------
+
+    def test_server_error_5xx_yields_server_error_marker(self):
+        from orchestrator.evals.metrics import detect_invocation_error
+
+        marker = detect_invocation_error(_server_error_result(529))
+        assert isinstance(marker, str)
+        # report._taint_cause (report.py:1194-1216) reduces the stage-prefixed
+        # marker to this first colon-delimited token as the report's by-cause
+        # exclusion key (accumulated at report.py:1313) — the prefix is a
+        # behavioural contract, not cosmetics, hence the exact-token assert
+        # rather than a loose `in`.
+        assert marker.partition(':')[0] == 'server_error'
+        assert '529' in marker
+
+    @pytest.mark.parametrize('status', [500, 502, 503, 529, 599])
+    def test_every_5xx_status_in_the_band_is_attributed(self, status: int):
+        # Mirrors the band shared/tests/test_server_error.py::TestIsServerErrorStatus
+        # pins, so the eval layer cannot drift into a 529-only special case.
+        from orchestrator.evals.metrics import detect_invocation_error
+
+        marker = detect_invocation_error(_server_error_result(status))
+        assert isinstance(marker, str)
+        assert marker.partition(':')[0] == 'server_error'
+        assert str(status) in marker
+
+    # -- timed-out-but-actually-5xx: the shape 3314 regressed to None -------
+
+    def test_timed_out_flushed_5xx_is_attributed_as_a_server_error_not_dropped(self):
+        # The headline regression case: a watchdog-SIGTERM-flushed result
+        # carrying BOTH timed_out=True and a 5xx api_error_status. Before
+        # 3314's ServerError tier existed this classified ZeroOutputWedge and
+        # was marked; afterwards it fell through to None until this task.
+        from orchestrator.evals.metrics import detect_invocation_error
+
+        marker = detect_invocation_error(_flushed_server_error_result(529))
+        assert marker is not None
+        assert marker.partition(':')[0] == 'server_error'
+        assert '529' in marker
+
+    def test_timed_out_flushed_5xx_outranks_the_wedge_tier(self):
+        # A SIGTERM-flushed 5xx is a PROVIDER outage, not a local wedge; the
+        # upstream ServerError tier exists precisely because ranking the
+        # wedge first discarded the 5xx evidence, so the eval marker must not
+        # re-flatten it. Mirrors test_body_less_429_outranks_the_wedge_tier.
+        from orchestrator.evals.metrics import detect_invocation_error
+
+        marker = detect_invocation_error(_flushed_server_error_result(529))
+        assert marker is not None
+        assert 'wedge' not in marker.lower()
+
+    def test_plain_wedge_without_api_error_status_is_still_a_wedge(self):
+        # The converse guard: stops the new arm from swallowing the genuine
+        # local-wedge signal when there is no api_error_status at all.
+        from orchestrator.evals.metrics import detect_invocation_error
+
+        marker = detect_invocation_error(_wedged_agent_result())
+        assert marker is not None
+        assert marker.partition(':')[0] == 'wedge'
+        assert 'server_error' not in marker
+
+    def test_near_cap_warning_outranks_the_server_error_tier(self):
+        # classify_invocation ranks NearCap ABOVE ServerError (invocation_
+        # outcome.py:502-505 vs :523): a real 5xx whose body ALSO carries a
+        # near-cap warning classifies NearCap, not ServerError, so this must
+        # still return None — deliberately, not a gap. This is the genuinely
+        # interesting boundary the 5xx arm introduced (reviewer:
+        # test-coverage): a provider-refused invocation (api_error_status=529)
+        # whose body happens to warn of an imminent cap is scored on content,
+        # not excluded as infra, because the near-cap text is the more
+        # specific, actionable signal.
+        from shared.cli_invoke import AgentResult
+
+        from orchestrator.evals.metrics import detect_invocation_error
+
+        near_with_5xx = AgentResult(
+            success=False,
+            output="You're close to your usage limit for this session",
+            cost_usd=0.9, duration_ms=30_000, turns=6,
+            api_error_status=529,
+        )
+        assert detect_invocation_error(near_with_5xx) is None
 
 
 # ---------------------------------------------------------------------------
@@ -1810,10 +1934,19 @@ class TestPlanQualityReport:
                 task_id='t3', config_name='b',
                 invocation_error='architect:model_not_found: no such model',
             ),
+            # An end-to-end pin (reviewer: test-coverage) that a server_error
+            # marker survives the FULL report pipeline — not just
+            # detect_invocation_error's unit-level token — and lands in its
+            # own cap_excluded_by_cause bucket rather than being folded into
+            # 'unknown' by a marker-shape change.
+            _cap_tainted_result(
+                task_id='t4', config_name='b',
+                invocation_error='architect:server_error: HTTP 529',
+            ),
         ])
-        assert report['cap_excluded'] == 3
+        assert report['cap_excluded'] == 4
         assert report['cap_excluded_by_cause'] == {
-            'cap_hit': 2, 'model_not_found': 1,
+            'cap_hit': 2, 'model_not_found': 1, 'server_error': 1,
         }
         # Key-sorted, so the dict renders byte-deterministically.
         causes = list(report['cap_excluded_by_cause'])
