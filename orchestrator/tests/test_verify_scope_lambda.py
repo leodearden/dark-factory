@@ -332,10 +332,16 @@ class TestForceWorkspaceBreadthExecutionGoldens:
 # task 3294: the mixed-diff widening, end-to-end through the plan→execution bridge
 # ---------------------------------------------------------------------------
 
-# orchestrator/orchestrator.yaml:5/7/8, verbatim. The REAL config the task-3033
-# incident ran under — using the synthetic 'uv run --directory moda pytest
-# tests/' shape here would not show that the widened command targets the whole
-# tests/ package that statically contains the regressed module.
+# orchestrator/orchestrator.yaml:5/7/8, verbatim. The REAL config, not the
+# synthetic 'uv run --directory moda pytest tests/' shape the rest of this
+# module uses: the widening has to be exercised against the config the
+# task-3033 incident actually ran under, or these goldens would only show that
+# SOME command widens rather than that THE command the incident narrowed does.
+#
+# These are hand-copied, so they can drift.
+# ``test_module_command_constants_are_the_live_orchestrator_yaml`` is what
+# keeps them honest — it pins all three byte-identically to the live yaml. If
+# you edit one of these, that test is where the pin lives.
 _ORCH_TEST_COMMAND: str = (
     'uv run --project orchestrator --directory orchestrator pytest tests/ '
     '--tb=short -q --timeout=300'
@@ -412,16 +418,37 @@ def _write_3033_diff(tmp_path: Path) -> None:
 
 
 class TestTaskRoleMixedDiffFullSuiteExecution:
-    """Task 3294, END-TO-END: the mixed-diff widening survives the bridge.
+    """Task 3294: the mixed-diff widening, against the real orchestrator config.
 
-    ``test_verify_plan.py``'s ``TestDeriveVerifyPlanTaskRoleFloorMixedDiff``
-    pins the decision at the pure ``derive_verify_plan`` layer. Task κ made
-    the ``VerifyPlan`` authoritative, but
-    ``_executed_module_configs_from_plan`` is what actually renders it into
-    the ``ModuleConfig``(s) handed to ``run_verification`` — so the pure-layer
-    widening is only real if it survives that mapping. This class drives the
-    REAL ``run_scoped_verification`` with the task-3033-shaped diff and pins
-    what actually executes.
+    WHY THIS CLASS EXISTS. Task 3033's attempt-1 diff touched
+    ``workflow.py`` plus a co-committed test file. Pre-3294 the plan took the
+    collectable-tests branch and narrowed the TEST leg to that one file — 36
+    items instead of the module's ~13188 — so a regression in a DIFFERENT
+    consumer of ``workflow.py`` was structurally invisible and reached a
+    debugger. The fix is a decision-layer reorder; this class pins that the
+    fix is real all the way out to what runs.
+
+    Three things are pinned here, and they are deliberately different kinds
+    of assertion:
+
+    - (a)/(b) THE BRIDGE. ``test_verify_plan.py``'s
+      ``TestDeriveVerifyPlanTaskRoleFloorMixedDiff`` pins the decision at the
+      pure ``derive_verify_plan`` layer; task κ made the ``VerifyPlan``
+      authoritative, but ``_executed_module_configs_from_plan`` is what
+      actually renders it into the ``ModuleConfig``(s) handed to
+      ``run_verification``. So these drive the REAL
+      ``run_scoped_verification`` with the task-3033-shaped diff and pin what
+      EXECUTES, plus that ``result.plan`` records the same thing an operator
+      reads (PRD A1).
+    - (c1) PROVENANCE. (a)/(b) assert against the hand-copied command
+      constants above, so a pin ties those constants byte-identically to the
+      live ``orchestrator/orchestrator.yaml``. Without it the suite could
+      stay green against a copy that no longer matches the config.
+    - (c2) GRANULARITY. The widened plan reproduces the owning module's own
+      ``test_command`` UNNARROWED and targets its whole test PACKAGE (PRD
+      Resolved decision 3) — derived from the plan and asserted path-free
+      (every target a directory, none a file), so the claim does not rest on
+      any individual test module's filename.
     """
 
     @pytest.mark.asyncio
