@@ -386,6 +386,18 @@ async def repair_one(
                 # the StatusWriteAuthorityError / DoneProvenanceWriteAuthorityError
                 # floors (sqlite_task_backend.py:2575+).
                 "id": str(candidate.task_id),
+                # LOAD-BEARING, and passed VERBATIM — never coalesced to
+                # 'master', never made conditional on being non-default. `tag`
+                # is half the `(tag, id)` primary key the audit nominates
+                # candidates under, and the audit read it straight out of the
+                # tasks.db `tag` column, so it is always a real tag. Omitting it
+                # would not raise: the MCP layer substitutes
+                # DEFAULT_TAG = 'master' (sqlite_task_backend.py:127, applied on
+                # the update_task path at :2612), silently writing the recovered
+                # scope onto a DIFFERENT task that merely shares the id. Any
+                # coalescing here just re-introduces that defaulting bug one
+                # layer up.
+                "tag": candidate.tag,
                 "project_root": project_root,
                 "metadata": json.dumps(payload),
                 "metadata_mode": "merge",
@@ -537,7 +549,20 @@ async def repair_project(
 
         try:
             live = await client.call_tool(
-                "get_task", {"id": str(candidate.task_id), "project_root": project_root}
+                "get_task",
+                {
+                    "id": str(candidate.task_id),
+                    # VERBATIM, for the same reason as the update_task call in
+                    # repair_one: `tag` is half the `(tag, id)` key this
+                    # candidate was nominated under, and get_task defaults a
+                    # missing tag to DEFAULT_TAG = 'master' rather than erroring.
+                    # Dropped here, THIS gate judges the wrong task's live status
+                    # — and idempotency dies with it, because SKIP_FILES_PRESENT
+                    # would be evaluated against the master-tag row, so a re-run
+                    # would re-write.
+                    "tag": candidate.tag,
+                    "project_root": project_root,
+                },
             )
         except Exception as exc:  # noqa: BLE001 — one unreadable task, not a batch abort
             outcomes.append(
