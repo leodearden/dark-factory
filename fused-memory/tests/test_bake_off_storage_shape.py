@@ -2101,3 +2101,308 @@ class TestSelectProbingWrite:
         # 5 duplicate-free clusters are unmeasurable BY CONSTRUCTION, and the
         # report must show 15 measurements rather than 20 with 5 invented.
         assert len(measurable) == 15
+
+
+# ===========================================================================
+# step-15 — PRD D10: audit-recall over alpha/3130's labeled fixture
+# ===========================================================================
+#
+# D10 (3136's deferral item 3): "ζ also delivers the audit-recall measurement
+# — run audit_duplicate_memories.py against α/3130's labeled fixture and
+# report recall on the paraphrase class — the number that decides how much to
+# trust the κ report."
+#
+# NO RATE, BOUND OR TOLERANCE IS ASSERTED AGAINST THE REAL FIXTURE (gate G6).
+# The measurement informs a judgement; it does not gate a build. Asserting
+# today's recall would also freeze it: a detector improvement would read as a
+# test failure, which is the precise opposite of what the number is for.
+# So correctness is proven on hand-built corpora with exactly-derivable
+# answers, and the real fixture is asserted for STRUCTURE only.
+#
+# The positive class is split into two bands by each pair's max
+# SequenceMatcher ratio against the threshold:
+#
+#   lexical band     — the detector COULD reach it. "Did it?" is a fair
+#                      question about the detector.
+#   paraphrase band  — by construction unreachable by a character-level
+#                      threshold, no matter how the detector is tuned short
+#                      of changing kind. Counting these as detector misses
+#                      without saying so would read as "the audit script is
+#                      broken" rather than "this class is invisible to it".
+#
+# GOTCHA (pinned at test_audit_duplicate_memories.py:1116-1119):
+# SequenceMatcher.ratio() is ORDER-SENSITIVE — the known exemplar pair scores
+# 0.0948 one way and 0.2279 the other on normalised content. The band split
+# therefore takes the MAX over both orderings: a pair is only called
+# unreachable if NEITHER ordering reaches the threshold, which can never
+# over-claim the paraphrase band.
+
+#: Exactly-derivable corpus: one byte-similar positive pair, one paraphrase
+#: positive pair, and the four cross-cluster negatives they imply.
+_SYNTHETIC_CORPUS = [
+    {'memory_id': 'a1', 'cluster_id': 'c1', 'label': 'canonical',
+     'content': 'The merge worker retries a failed rebase exactly twice.'},
+    {'memory_id': 'a2', 'cluster_id': 'c1', 'label': 'duplicate',
+     'content': 'The merge worker retries a failed rebase exactly twice!'},
+    {'memory_id': 'b1', 'cluster_id': 'c2', 'label': 'canonical',
+     'content': 'Qdrant collections are named by project id.'},
+    {'memory_id': 'b2', 'cluster_id': 'c2', 'label': 'duplicate',
+     'content': 'Vector store namespaces derive from the canonicalised '
+                'project identifier.'},
+]
+
+#: Same cluster, but the third record is curator-ruled NOT a duplicate while
+#: being byte-similar — the hardest negative there is.
+_HARD_NEGATIVE_CORPUS = [
+    {'memory_id': 'a1', 'cluster_id': 'c1', 'label': 'canonical',
+     'content': 'The merge worker retries a failed rebase exactly twice.'},
+    {'memory_id': 'a2', 'cluster_id': 'c1', 'label': 'duplicate',
+     'content': 'The merge worker retries a failed rebase exactly twice!'},
+    {'memory_id': 'a3', 'cluster_id': 'c1', 'label': 'distinct',
+     'content': 'The merge worker retries a failed rebase exactly twice?'},
+]
+
+
+@functools.cache
+def _synthetic_audit():
+    return _mod().audit_recall_over_labeled_fixture(_SYNTHETIC_CORPUS, 0.85)
+
+
+@functools.cache
+def _fixture_audit():
+    """The real measurement. Cached — it is an O(n^2) difflib sweep."""
+    mod = _mod()
+    return mod.audit_recall_over_labeled_fixture(
+        mod.load_labeled_fixture(ALPHA_FIXTURE_PATH), 0.85,
+    )
+
+
+class TestAuditRecallOnAnExactlyDerivableCorpus:
+    """Four records, one detectable pair, one paraphrase pair. No tolerances."""
+
+    def test_recall_over_the_positive_class(self):
+        result = _synthetic_audit()
+
+        assert result['true_dup']['pairs'] == 2
+        assert result['true_dup']['recovered'] == 1  # only the byte-similar one
+        assert result['true_dup']['recall'] == 0.5
+
+    def test_the_positive_class_splits_into_two_bands(self):
+        result = _synthetic_audit()
+
+        assert result['true_dup']['lexical_band']['pairs'] == 1
+        assert result['true_dup']['paraphrase_band']['pairs'] == 1
+
+    def test_per_band_recall_isolates_what_the_detector_could_reach(self):
+        """The headline number and the fair number, side by side: 0.5 overall
+        reads as a mediocre detector; 1.0 of what it could reach plus 0.0 of
+        what it structurally cannot reads as a detector working exactly as
+        designed on a corpus that is mostly out of its reach."""
+        result = _synthetic_audit()
+
+        assert result['true_dup']['lexical_band']['recall'] == 1.0
+        assert result['true_dup']['paraphrase_band']['recall'] == 0.0
+
+    def test_the_bands_partition_the_positive_class_exactly(self):
+        result = _synthetic_audit()['true_dup']
+
+        assert (
+            result['lexical_band']['pairs'] + result['paraphrase_band']['pairs']
+            == result['pairs']
+        )
+        assert (
+            result['lexical_band']['recovered']
+            + result['paraphrase_band']['recovered'] == result['recovered']
+        )
+
+    def test_a_clean_corpus_reports_no_false_groupings(self):
+        result = _synthetic_audit()
+
+        assert result['unrelated']['pairs'] == 4
+        assert result['unrelated']['falsely_grouped'] == 0
+        assert result['unrelated']['rate'] == 0.0
+
+    def test_an_empty_negative_class_reports_none_not_a_measured_zero(self):
+        """This corpus has no hard negatives at all. Reporting 0.0 would put
+        a perfect score in the table for something never measured."""
+        result = _synthetic_audit()
+
+        assert result['hard_negative']['pairs'] == 0
+        assert result['hard_negative']['rate'] is None
+
+    def test_false_groupings_are_counted_when_they_happen(self):
+        """Byte-similar but curator-ruled NOT duplicates: the detector unions
+        all three transitively, so both hard-negative pairs are false."""
+        result = _mod().audit_recall_over_labeled_fixture(
+            _HARD_NEGATIVE_CORPUS, 0.85,
+        )
+
+        assert result['hard_negative']['pairs'] == 2
+        assert result['hard_negative']['falsely_grouped'] == 2
+        assert result['hard_negative']['rate'] == 1.0
+        # ...and the true positive in the same corpus is still recovered:
+        # a false-grouping count is not a recall penalty.
+        assert result['true_dup']['recall'] == 1.0
+
+    def test_a_corpus_too_small_to_pair_reports_no_measurement(self):
+        result = _mod().audit_recall_over_labeled_fixture(
+            _SYNTHETIC_CORPUS[:1], 0.85,
+        )
+
+        assert result['true_dup']['pairs'] == 0
+        assert result['true_dup']['recall'] is None
+        assert result['groups_found'] == 0
+
+
+class TestMaxLexicalRatio:
+    """The band split's ruler — order-insensitive by construction."""
+
+    def test_it_takes_the_max_over_both_argument_orders(self):
+        """SequenceMatcher is order-sensitive; a one-directional ruler would
+        put a pair in the paraphrase band or not depending on which id sorted
+        first, which is not a property of the pair."""
+        import difflib  # noqa: PLC0415
+
+        mod = _mod()
+        left, right = 'the merge worker retries twice', 'retries twice worker'
+        forward = difflib.SequenceMatcher(None, left, right).ratio()
+        backward = difflib.SequenceMatcher(None, right, left).ratio()
+
+        measured = mod.max_lexical_ratio(left, right)
+
+        assert measured == max(forward, backward)
+        assert measured == mod.max_lexical_ratio(right, left)  # symmetric
+
+    def test_it_normalises_the_way_the_detector_does(self):
+        """`(content or '').strip().lower()` — if the ruler and the detector
+        disagreed on normalisation, the band split would describe a detector
+        nobody is running."""
+        mod = _mod()
+
+        assert mod.max_lexical_ratio('  Merge Worker ', 'merge worker') == 1.0
+
+    def test_empty_content_has_no_measurable_ratio(self):
+        """The detector explicitly refuses to cluster empty content (an
+        unextractable memory must not be deleted as a duplicate), so there is
+        no ratio to report — None, not the 1.0 SequenceMatcher would give."""
+        assert _mod().max_lexical_ratio('', '') is None
+        assert _mod().max_lexical_ratio('body', '   ') is None
+
+
+@pytest.mark.xdist_group('e2_audit_recall')
+class TestAuditRecallOverTheCommittedFixture:
+    """STRUCTURE ONLY. G6/D10: the number is reported, never asserted.
+
+    Grouped onto one xdist worker so the O(n^2) difflib sweep over the 104
+    committed records is paid ONCE (via the `_fixture_audit` cache) rather
+    than once per worker the class happens to be scattered across.
+    """
+
+    def test_the_pair_counts_match_the_labeled_partition(self):
+        """Fixture facts, not detector rates: `build_pair_sets` produces these
+        exact class sizes for the committed 104 records."""
+        result = _fixture_audit()
+
+        assert result['true_dup']['pairs'] == 301
+        assert result['hard_negative']['pairs'] == 18
+        assert result['unrelated']['pairs'] == 5037
+
+    def test_the_bands_sum_to_the_positive_class(self):
+        result = _fixture_audit()['true_dup']
+
+        assert (
+            result['lexical_band']['pairs'] + result['paraphrase_band']['pairs']
+            == 301
+        )
+
+    def test_every_reported_rate_is_a_fraction_or_no_measurement(self):
+        result = _fixture_audit()
+        rates = [
+            result['true_dup']['recall'],
+            result['true_dup']['lexical_band']['recall'],
+            result['true_dup']['paraphrase_band']['recall'],
+            result['hard_negative']['rate'],
+            result['unrelated']['rate'],
+        ]
+
+        for rate in rates:
+            assert rate is None or 0.0 <= rate <= 1.0
+
+    def test_the_payload_names_the_detector_it_replayed(self):
+        """The report is read months later by somebody deciding how much to
+        trust the κ sweep. "Recall was X" is unreadable without "of what"."""
+        result = _fixture_audit()
+
+        assert 'find_near_duplicate_memory_groups' in result['detector']
+        assert result['threshold'] == 0.85
+
+    def test_the_known_paraphrase_exemplar_is_not_lexically_reachable(self):
+        """The independently-measured exemplar (cluster e0a41fcd, cosine
+        0.905 at difflib 0.102) proves the paraphrase class is real and
+        structurally invisible to the character threshold — asserted as band
+        membership, not as a pinned ratio."""
+        mod = _mod()
+        records = {
+            r['memory_id']: r
+            for r in mod.load_labeled_fixture(ALPHA_FIXTURE_PATH)
+        }
+        left = records['243b6dec-f0ce-4123-bb09-16d834b7e9c8']
+        right = records['c315352b-6d4e-467d-9a3f-360bc2d53229']
+
+        ratio = mod.max_lexical_ratio(left['content'], right['content'])
+
+        assert left['cluster_id'] == right['cluster_id']  # a true-dup pair
+        assert ratio < 0.85
+
+    def test_paraphrase_exemplars_are_emitted_for_hand_auditing(self):
+        """A band split nobody can check by hand is a number to be believed
+        rather than read. The exemplars are the nearest misses — how far the
+        threshold would have to fall to reach the class at all."""
+        result = _fixture_audit()
+        exemplars = result['paraphrase_exemplars']
+
+        assert exemplars, 'the paraphrase band is non-empty; show some of it'
+        for exemplar in exemplars:
+            assert exemplar['max_ratio'] < result['threshold']
+        # Deterministic order (descending ratio), so a rerun's diff is signal.
+        assert [e['max_ratio'] for e in exemplars] == sorted(
+            (e['max_ratio'] for e in exemplars), reverse=True,
+        )
+
+    def test_the_measurement_is_deterministic(self):
+        """No sampling, no set iteration order leaking into the numbers."""
+        mod = _mod()
+        records = mod.load_labeled_fixture(ALPHA_FIXTURE_PATH)
+
+        first = mod.audit_recall_over_labeled_fixture(records[:30], 0.85)
+        second = mod.audit_recall_over_labeled_fixture(records[:30], 0.85)
+
+        assert first == second
+
+
+class TestAuditRecallReusesTheRealImplementations:
+    """A reimplemented detector or partition would measure this file."""
+
+    def test_it_reuses_both_sibling_scripts(self):
+        import inspect  # noqa: PLC0415
+
+        source = inspect.getsource(_mod())
+
+        assert 'find_near_duplicate_memory_groups' in source
+        assert 'build_pair_sets' in source
+
+    def test_the_default_threshold_is_the_detectors_own_signature_default(self):
+        """Not a copy: if the audit script retunes, this measurement follows
+        it instead of reporting a threshold nobody runs."""
+        import inspect  # noqa: PLC0415
+
+        mod = _mod()
+        detector = mod.load_audit_script().find_near_duplicate_memory_groups
+        expected = inspect.signature(detector).parameters['threshold'].default
+
+        assert mod.resolve_audit_threshold() == expected
+
+    def test_the_script_never_restates_the_lexical_threshold(self):
+        import inspect  # noqa: PLC0415
+
+        assert '0.85' not in inspect.getsource(_mod())
