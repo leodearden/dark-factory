@@ -784,7 +784,7 @@ def test_keep_alive_timeout_is_pinned_above_poll_interval() -> None:
 
 
 def _restart_directive(path: pathlib.Path, name: str) -> str | None:
-    r"""Return the value of the ``<name>=`` directive in *path*, or None if absent.
+    r"""Return the effective value of ``<name>=`` in *path*, or None if absent.
 
     Mirrors the opaque-token-then-parse style of _timeout_stop_sec: the value is
     captured as ``(.*)`` and interpreted by the caller, so a valid-but-unexpected
@@ -793,13 +793,27 @@ def _restart_directive(path: pathlib.Path, name: str) -> str | None:
     ``(\d+)`` here would read ``RestartMaxDelaySec=60s`` as no cap at all and
     skip the pairing invariant silently — the worst possible failure for a guard
     whose entire job is to notice a directive that is being ignored.
+
+    LAST occurrence wins, not the first, which is why this uses ``findall`` and
+    not ``search`` (the same reasoning _success_exit_statuses below applies to
+    repeated directives, reaching the opposite conclusion only because
+    SuccessExitStatus= is one of the few systemd directives that ACCUMULATES).
+    These restart directives are scalars, and systemd overwrites on each repeat.
+    Measured on this host (systemd 255.4): a unit carrying ``RestartSteps=4``
+    followed by ``RestartSteps=0`` draws the pairing warning "Service has
+    RestartMaxDelaySec= but no RestartSteps= setting. Ignoring." — i.e. systemd
+    applied the trailing 0 — while the reverse order (0 then 4) is silent.  A
+    first-match read would report 4, and this guard would bless a unit whose
+    backoff systemd has in fact discarded.  Repeats are not hypothetical: a
+    drop-in under <unit>.d/ is merged by appending, so an override that pins one
+    of these values lands as exactly this shape.
     """
-    match = re.search(
+    matches = re.findall(
         rf"^{re.escape(name)}=(.*)$",
         path.read_text(encoding="utf-8"),
         re.MULTILINE,
     )
-    return match.group(1).strip() if match is not None else None
+    return matches[-1].strip() if matches else None
 
 
 def _assert_restart_backoff_effective(path: pathlib.Path) -> None:
@@ -887,6 +901,22 @@ def test_restart_backoff_guard_rejects_ineffective_units(
     with pytest.raises(AssertionError, match="produces no backoff curve"):
         _assert_restart_backoff_effective(zero_steps)
 
+    # Bad: overridden to zero by a later repeat.  systemd is LAST-WINS for these
+    # scalars, so this unit's effective RestartSteps is 0 and its cap is
+    # discarded — measured on systemd 255.4, which emits the pairing warning for
+    # exactly this file while staying silent on the reverse order (0 then 4).
+    # A first-match read of the directive would report 4 and pass, so this case
+    # pins _restart_directive's last-wins semantics through the guard that
+    # depends on them.
+    overridden_steps = _write_restart_unit(
+        tmp_path / "overridden_steps.service",
+        "Restart=on-failure\nRestartSec=5\nRestartSteps=4\n"
+        "RestartSteps=0\nRestartMaxDelaySec=60",
+    )
+    with pytest.raises(AssertionError, match="produces no backoff curve"):
+        _assert_restart_backoff_effective(overridden_steps)
+    assert _restart_directive(overridden_steps, "RestartSteps") == "0"
+
     # Bad: cap and steps, but no floor to interpolate up FROM.
     no_floor = _write_restart_unit(
         tmp_path / "no_floor.service",
@@ -942,6 +972,78 @@ def test_restart_backoff_is_effective_in_both_unit_files() -> None:
         _assert_restart_backoff_effective(path)
 
 
+def _ignored_directive_lines(output: str, unit: pathlib.Path) -> list[str]:
+    """Return systemd-analyze lines reporting a discarded directive in *unit*.
+
+    Split out of the test below so it can be exercised against captured
+    systemd-analyze output WITHOUT a systemd runtime — the filter is the part
+    that can silently no-op, and a guard that only runs where systemd is
+    installed is no guard at all.  See
+    test_ignored_directive_filter_matches_both_systemd_spellings for the
+    negatives; the measured samples it pins are quoted there verbatim.
+    """
+    return [
+        line
+        for line in output.splitlines()
+        # Case-insensitive: systemd writes "Ignoring." for a semantic discard
+        # and "ignoring." for an unknown key, and on systemd < 254 the latter is
+        # the ONLY form this unit's backoff directives can produce.
+        if "ignoring." in line.lower()
+        # Scoped to the unit under test: verify also loads dependencies, and
+        # each warning names the unit it belongs to.  A semantic warning is
+        # prefixed with the bare unit name, a parse warning with the full path
+        # and line number.
+        and (line.startswith(f"{unit.name}:") or str(unit) in line)
+    ]
+
+
+def test_ignored_directive_filter_matches_both_systemd_spellings() -> None:
+    """_ignored_directive_lines must catch both casings and only this unit.
+
+    The samples below are real ``systemd-analyze verify`` output captured on
+    2026-08-01 (systemd 255.4), not invented strings: the capital-I form from a
+    unit with RestartMaxDelaySec= and no RestartSteps=, the lowercase form from
+    a deliberately misspelled ``RestartStepz=``, and the dependency noise from
+    ``systemd-analyze verify --user`` on the real dashboard unit.
+
+    This is the guard that keeps the systemd test below honest.  Both of its
+    ways of degrading into a silent pass — wrong casing, or another unit's
+    warning counted as this one's — are pinned here, and they are pinned
+    without needing systemd, so they hold on every host.
+    """
+    semantic = (
+        f"{HARDCODED.name}: Service has RestartMaxDelaySec= but no "
+        "RestartSteps= setting. Ignoring."
+    )
+    parse = (
+        f"{HARDCODED}:42: Unknown key name 'RestartStepz' in section "
+        "'Service', ignoring."
+    )
+    # Another unit's identical defect, plus genuinely unrelated noise.
+    foreign = (
+        "orchestrator-dark-factory.service: Service has RestartMaxDelaySec= "
+        "but no RestartSteps= setting. Ignoring."
+    )
+    noise = "Failed to bind private socket: Address already in use"
+
+    # Caught: the capital-I semantic warning...
+    assert _ignored_directive_lines(semantic, HARDCODED) == [semantic]
+    # ...and the lowercase parse warning, which is the ONLY signal available on
+    # systemd < 254, where both backoff directives degrade to unknown keys.
+    assert _ignored_directive_lines(parse, HARDCODED) == [parse]
+
+    # Ignored: a warning that belongs to a different unit must not be blamed on
+    # this file, and non-warning chatter must not trip the assertion.
+    assert _ignored_directive_lines(f"{foreign}\n{noise}", HARDCODED) == []
+
+    # Mixed stream: exactly the two lines that name this unit, in order.
+    combined = "\n".join([noise, foreign, semantic, parse])
+    assert _ignored_directive_lines(combined, HARDCODED) == [semantic, parse]
+
+    # A clean run reports nothing.
+    assert _ignored_directive_lines("", HARDCODED) == []
+
+
 @pytest.mark.skipif(
     shutil.which("systemd-analyze") is None,
     reason=(
@@ -956,7 +1058,7 @@ def test_systemd_analyze_verify_reports_no_ignored_directives() -> None:
     skippable so the module keeps the "no systemd runtime is required" contract
     stated in its docstring.
 
-    Three details here are load-bearing, each verified by measurement rather
+    Five details here are load-bearing, each verified by measurement rather
     than assumed (2026-08-01, systemd 255.4):
 
     1. stderr is captured, not just stdout.  The warning goes to stderr while
@@ -966,27 +1068,59 @@ def test_systemd_analyze_verify_reports_no_ignored_directives() -> None:
        ``systemd-analyze verify`` exits 1 when the ExecStart binary does not
        exist ("Command /... is not executable"), and this unit bakes in
        /home/leo/.local/bin/uv — so a returncode check would fail on any other
-       host for a reason entirely unrelated to this invariant.
+       host for a reason entirely unrelated to this invariant.  (It exits 0 even
+       while emitting the warnings this test hunts, so the code carries no
+       signal in either direction.)
     3. It runs against HARDCODED only.  The raw template cannot be verified at
        all: its ``__REPO_ROOT__`` sentinel trips a fatal "WorkingDirectory= path
        is not absolute" error.  test_template_renders_to_hardcoded_file already
        asserts the two files are byte-identical modulo the sentinels, so the
        property carries across without verifying the same bytes twice.
+    4. The match is CASE-INSENSITIVE, because systemd spells its two discard
+       paths differently and only one of them is the pairing warning:
+         - ``t1.service: Service has RestartMaxDelaySec= but no RestartSteps=
+           setting. Ignoring.``           (capital I)
+         - ``/path/t2.service:8: Unknown key name 'RestartStepz' in section
+           'Service', ignoring.``          (lowercase)
+       This matters precisely where the guard is needed most.  RestartSteps= AND
+       RestartMaxDelaySec= both landed in systemd v254, so on any host below
+       that — and scripts/setup-host.sh renders this template onto arbitrary
+       machines — the whole backoff fix degrades to two unknown keys, systemd
+       emits only the lowercase form, and a capital-I filter would report green
+       on a unit doing no backoff at all.  Matching one casing would blind this
+       test to its single most important failure mode.
+    5. Warnings are SCOPED to the unit under test.  ``systemd-analyze verify``
+       loads the unit's dependencies too and prefixes each warning with the
+       offending unit's own name, so an unscoped filter blames this file for
+       another unit's defect.  Measured: ``--user`` verification of this unit
+       emits eight such lines for orchestrator-*.service and fused-memory.service
+       (which genuinely lack RestartSteps=) and zero for the dashboard unit.
+       Both prefix forms above are covered — bare unit name for a semantic
+       warning, full path plus line number for a parse warning.
+
+    Scoping is what makes ``--user`` safe to pass, and passing it is the point:
+    this is a --user unit (WantedBy=default.target, installed under
+    ~/.config/systemd/user), so system-scope verification checks it in a manager
+    scope it never runs in and silently fails to resolve its user-scope
+    dependencies.
     """
     result = subprocess.run(
-        ["systemd-analyze", "verify", str(HARDCODED)],
+        ["systemd-analyze", "verify", "--user", str(HARDCODED)],
         capture_output=True,
         text=True,
         timeout=60,
         check=False,
     )
     combined = f"{result.stdout}{result.stderr}"
-    ignored = [line for line in combined.splitlines() if "Ignoring." in line]
+    ignored = _ignored_directive_lines(combined, HARDCODED)
     assert not ignored, (
         f"systemd-analyze verify reports directives it is IGNORING in {HARDCODED}:\n"
         + "\n".join(f"  {line}" for line in ignored)
         + "\nEach such line is a directive systemd parsed, warned about, and then "
-        "discarded — the unit does not do what its text says it does."
+        "discarded — the unit does not do what its text says it does. An "
+        "'Unknown key name' line means this host's systemd predates the "
+        "directive (RestartSteps= and RestartMaxDelaySec= both require v254), "
+        "so the backoff is inert here even though the file reads correctly."
     )
 
 
