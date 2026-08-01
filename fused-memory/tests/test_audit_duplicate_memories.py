@@ -8,6 +8,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import types
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -53,6 +54,18 @@ partition_topic_carveout = _mod.partition_topic_carveout
 fetch_procedural_memories = _mod.fetch_procedural_memories
 fetch_memories = _mod.fetch_memories
 _ALL_CATEGORIES = _mod._ALL_CATEGORIES
+extract_liveness_snapshot_fact = _mod.extract_liveness_snapshot_fact
+_classify_liveness_snapshot = _mod._classify_liveness_snapshot
+liveness_snapshot_subject_task_ids = _mod.liveness_snapshot_subject_task_ids
+find_liveness_snapshot_recurrences = _mod.find_liveness_snapshot_recurrences
+_LIVENESS_DISCLOSURE_KEYS = _mod._LIVENESS_DISCLOSURE_KEYS
+# Bound here, off the module, so the regex-budget class below can delegate to
+# the REAL compiled patterns while a counting proxy stands in their place on
+# `_mod`. Captured once at import, so a monkeypatched module global can never
+# make these aliases stale.
+POINT_IN_TIME_CHECK_RE = _mod.POINT_IN_TIME_CHECK_RE
+LIVE_TASK_STATUS_RE = _mod.LIVE_TASK_STATUS_RE
+_LIVE_FIELD_NAMES = _mod._LIVE_FIELD_NAMES
 apply_deletions = _mod.apply_deletions
 resolve_ann_threshold = _mod.resolve_ann_threshold
 fetch_ann_neighbors = _mod.fetch_ann_neighbors
@@ -2496,11 +2509,13 @@ def _dated(id: str, content: str, created_at: str | None, *,
 
 
 def _plan_slice(groups: list[dict] | None = None,
-                carveouts: list[dict] | None = None) -> dict:
+                carveouts: list[dict] | None = None,
+                liveness: list[dict] | None = None) -> dict:
     """A per-category plan slice, as produced by split_plan_by_category."""
     return {
         'near_duplicate_groups': groups or [],
         'topic_carveout_groups': carveouts or [],
+        'liveness_snapshot_recurrence_groups': liveness or [],
     }
 
 
@@ -2538,7 +2553,7 @@ class TestSplitPlanByCategory:
         """An empty slice, not a missing key — every requested category reports."""
         by_cat = split_plan_by_category({'near_duplicate_groups': []}, (_PK, _OS))
         assert set(by_cat) == {_PK, _OS}
-        assert by_cat[_OS] == {'near_duplicate_groups': [], 'topic_carveout_groups': []}
+        assert by_cat[_OS] == _plan_slice()
 
 
 class TestComputeClusterMetricsPerCategory:
@@ -2896,8 +2911,13 @@ class TestComputeClusterMetricsDetailsPath:
         )
         by_id = _by_id(metrics)
 
-        for name in ('cluster_size_max', 'cluster_size_mean',
-                     'topic_accretion_rate_mean', 'consolidation_net_delta'):
+        # Driven by the vocabulary constant rather than a hand-copied tuple:
+        # `_DETAILED_METRICS` is the file's own statement of which metrics have
+        # a companion table, so a name added there without the matching
+        # `details_path=` argument fails HERE instead of shipping a metric
+        # whose table no consumer can discover.
+        assert _mod._DETAILED_METRICS, 'the vocabulary must not be empty'
+        for name in _mod._DETAILED_METRICS:
             assert by_id[f'{name}.{_PK}'].details_path == 'details-20260730T000000Z.json', name
 
     def test_details_path_defaults_to_absent(self):
@@ -3659,3 +3679,1147 @@ class TestRunWiring:
         _install_run_doubles(monkeypatch, {_PK: [_raw('m1', 'x')]})
         await _run(await self._parse(tmp_path))
         assert _FakeMemoryService.instances[-1].closed is True
+
+
+# ---------------------------------------------------------------------------
+# Liveness-snapshot recurrence fixtures (task 3098)
+# ---------------------------------------------------------------------------
+#
+# Real-world fixture basis: four solar_challenge observations_and_summaries
+# memories written by agent_id `recon-stage-task_knowledge_sync`, surfaced by
+# Stage-1 finding 724e7be4 (run e149def2). Provenance by memory id:
+#
+#   6b245659  metadata.task_id="94"  kind=stranded_task_investigation
+#   08aa0017  metadata.task_id="96"  kind=live_workflow_deferral_note
+#   68dd5f93  metadata.task_id="96"  kind=investigation_note
+#   1eef7df7  metadata.task_id="99", related_task_ids=["94","96"]
+#                                    kind=task_lifecycle_reverification
+#
+# Contents below are the real ones, abbreviated in the tail but VERBATIM
+# through the status-bearing clause. `metadata.kind` differs across all four,
+# so keying on it is not viable; the repeated CORE FACT is.
+#
+# Why a third detector class is needed: the pairwise difflib.SequenceMatcher
+# ratios between the three liveness snapshots are 0.1173 / 0.2328 / 0.1770 on
+# the full records (measured and recorded in task 3098's plan) and
+# 0.1648 / 0.2882 / 0.2687 on the abbreviated fixture text below (measured
+# before authoring this fixture) -- against a production LEXICAL threshold of
+# 0.85. The unique investigative payload is several times the length of the
+# repeated core status fact and swamps every similarity metric, so the lexical
+# path structurally cannot reach these records. Following the discipline of
+# the _VENV_GOTCHA_* block above, no assertion pins those ratio values.
+_LIVENESS_SNAPSHOT_94_JUL24 = (
+    'Point-in-time liveness check performed 2026-07-24 during reconciliation '
+    'run 4b262e10-3624-44e5-b420-4dbedfd2bb8b (Stage 2, task_knowledge_sync) '
+    'on task 94 ("Point orchestrator config references at canonical '
+    'dark-factory-orchestrator.yaml and drop the transitional symlink"): '
+    'get_task reports status="in-progress" but claimant_run_id=null and '
+    'heartbeat_at=null, and this cycle\'s Live-Workflow Signals section does '
+    'NOT list task/94 (no registered worktree signal, no recent-commit '
+    'signal, no active-orchestrator signal) — even though a worktree '
+    'directory with a populated .venv exists on disk at .worktrees/94/. '
+    'Direct file reads this cycle confirm the task\'s SCOPE item 1 has NOT '
+    'landed on the main checkout: CLAUDE.md:95 still reads "orchestrator.yaml" '
+    'and .envrc:5-6 still reference the legacy '
+    '/home/leo/src/solar-challenge/orchestrator.yaml path, both of which task '
+    '94 is supposed to retarget to dark-factory-orchestrator.yaml.'
+)
+
+_LIVENESS_SNAPSHOT_96_JUL24 = (
+    'Point-in-time liveness check performed 2026-07-24 during reconciliation '
+    'run dcd89ed9-8df5-404a-8e33-caa296a0a73c (Stage 2, task_knowledge_sync) '
+    'on task 96 ("Fix stale briefing.yaml POSTURE header + deferred-task '
+    'tally — third recurrence"): get_task at that timestamp reported '
+    'status="in-progress" (claimant_run_id=null, heartbeat_at=null), and the '
+    'reconciliation payload\'s Live-Workflow Signals section at that same '
+    'timestamp listed task/96 as having a registered git worktree AND an '
+    'active orchestrator process holding the project lock. Stage 1 had '
+    'separately confirmed via direct file read that '
+    '/home/leo/src/solar-challenge/review/briefing.yaml already contained the '
+    'corrected POSTURE header + deferred-task tally content matching task '
+    "96's acceptance criteria."
+)
+
+# The "genuinely unique investigative content" the task says to preserve: it
+# reports task 96 as in-progress in PROSE, with no <field>=<value> assignment
+# and no point-in-time framing at all. It must never be grouped.
+_INVESTIGATION_NOTE_96 = (
+    'Task 96 ("Fix stale briefing.yaml POSTURE header + deferred-task tally — '
+    'third recurrence") remains in-progress as of run f867d648 (2026-07-24). '
+    'Direct read of /home/leo/src/solar-challenge/review/briefing.yaml on the '
+    'MAIN checkout (non-worktree path) shows the intended fix already present '
+    '(POSTURE header re-dated 2026-07-22, third-recurrence hedge language). '
+    'However, /home/leo/src/solar-challenge/.git/logs/HEAD shows main HEAD has '
+    'NOT advanced past commit af4911565ed76a81fa1a02641aebdd1653ce20b0 — no '
+    'later commit appears in the reflog. Conclusion: do NOT close task 96 via '
+    'set_task_status/done_provenance without a verified commit SHA — there is '
+    'none to cite.'
+)
+
+_LIVENESS_REVERIFY_94_96_JUL26 = (
+    'Point-in-time liveness check performed 2026-07-26 during reconciliation '
+    'run e3eaa351-5173-41a9-b187-801fb05400bf (Stage 2, task_knowledge_sync) '
+    'on task 94 ("Point orchestrator config references at canonical '
+    'dark-factory-orchestrator.yaml and drop the transitional symlink"): '
+    'get_task reports status="in-progress" but claimant_run_id=null and '
+    'heartbeat_at=null, and this cycle\'s Live-Workflow Signals section does '
+    'NOT list task/94 — matching the same stranded pattern first recorded in '
+    'prior investigation 6b245659 (run 4b262e10). A fresh grep of .envrc at '
+    'this timestamp still found lines 5-6 referencing the legacy top-level '
+    '"orchestrator.yaml" path.\n\n'
+    'Separately, point-in-time check on task 96 ("Fix stale briefing.yaml '
+    'POSTURE header + deferred-task tally"): get_task reports '
+    'status="in-progress" but claimant_run_id=null and heartbeat_at=null, '
+    'matching the same stranded pattern. A fresh read of review/briefing.yaml '
+    'at this timestamp found the POSTURE header already carrying task 96\'s '
+    'intended fix text as a working-tree state only — no corresponding commit '
+    'was observed advancing main HEAD. New supplementary detail for whoever '
+    "resolves task 99's commit-vs-discard decision: the diff's own embedded "
+    'snapshot numbers were already one cycle old at authoring time.'
+)
+
+# The core fact all three snapshots re-assert, in the canonical rendering:
+# distinct `field=value` pairs, values lowercased and unquoted, sorted by
+# field name, joined on '|'.
+_CORE_FACT_STRANDED = 'claimant_run_id=null|heartbeat_at=null|status=in-progress'
+
+# The real created_at values, kept so first_seen/last_seen/span_days are
+# exercised against real elapsed time rather than round numbers.
+_TS_94_JUL24 = '2026-07-24T13:14:03.534125+00:00'
+_TS_96_JUL24 = '2026-07-24T09:23:28.354341+00:00'
+_TS_NOTE_96 = '2026-07-24T17:26:17.120293+00:00'
+_TS_REVERIFY = '2026-07-26T05:52:25.057487+00:00'
+
+
+class TestExtractLivenessSnapshotFact:
+    """A repeated core FACT, keyed exactly -- not a similarity score.
+
+    Two snapshots taken days apart share one clause verbatim and differ
+    everywhere else, so the equivalence relation here is "asserts the same
+    live fields", not "reads alike". Exact string equality on a canonical key
+    means there is no threshold to tune and no false cluster to delete.
+    """
+
+    def test_all_three_real_snapshots_yield_the_same_key(self):
+        keys = [
+            extract_liveness_snapshot_fact(
+                _memory('6b245659', _LIVENESS_SNAPSHOT_94_JUL24, category=_OS),
+            ),
+            extract_liveness_snapshot_fact(
+                _memory('08aa0017', _LIVENESS_SNAPSHOT_96_JUL24, category=_OS),
+            ),
+            extract_liveness_snapshot_fact(
+                _memory('1eef7df7', _LIVENESS_REVERIFY_94_96_JUL26, category=_OS),
+            ),
+        ]
+
+        assert all(k is not None for k in keys), 'each is a recognised snapshot'
+        assert len(set(keys)) == 1, 'the repeated core fact is one key, not three'
+        assert keys[0] == _CORE_FACT_STRANDED
+
+    def test_prose_only_investigation_note_is_not_a_snapshot(self):
+        """No `<field>=<value>` assignment -> genuinely unique content, preserved."""
+        assert extract_liveness_snapshot_fact(
+            _memory('68dd5f93', _INVESTIGATION_NOTE_96, category=_OS),
+        ) is None
+
+    def test_a_different_status_is_a_different_key(self):
+        """Distinct facts must never collapse into one group."""
+        done = _LIVENESS_SNAPSHOT_94_JUL24.replace(
+            'status="in-progress"', 'status="done"',
+        )
+        key = extract_liveness_snapshot_fact(_memory('x', done, category=_OS))
+
+        assert key == 'claimant_run_id=null|heartbeat_at=null|status=done'
+        assert key != _CORE_FACT_STRANDED
+
+    def test_live_fields_without_point_in_time_framing_are_not_a_snapshot(self):
+        """Incidental prose carrying `status=` is not a liveness observation.
+
+        Gate 2628 BLOCKS the bare current-fact framing in the gated
+        categories, so every liveness observation written since it landed
+        necessarily carries the point-in-time form. Requiring it costs no
+        recall on the swept corpus.
+        """
+        assert extract_liveness_snapshot_fact(_memory(
+            'x',
+            'The dispatcher rejected the claim because status=in-progress and '
+            'claimant_run_id=null are inconsistent for a queued task.',
+            category=_OS,
+        )) is None
+
+    def test_paraphrase_without_an_assignment_is_not_a_snapshot(self):
+        """A LIVE_TASK_STATUS_RE paraphrase alone yields no readable fields."""
+        assert extract_liveness_snapshot_fact(_memory(
+            'x',
+            'Point-in-time liveness check performed 2026-07-24 on task 94: '
+            'the task is actively driven by an orchestrator process holding '
+            'the project lock, so Stage 2 did not write.',
+            category=_OS,
+        )) is None
+
+    def test_as_of_prose_with_an_incidental_assignment_still_classifies(self):
+        """The framing gate is a recall filter, NOT a precision guarantee.
+
+        `POINT_IN_TIME_CHECK_RE`'s cheapest alternative is a bare
+        `\\bas\\s+of\\s+(?=\\d)`, which ordinary prose satisfies routinely — so
+        a config note carrying an incidental `status=` DOES classify here. The
+        sibling test above uses a sentence with no temporal framing at all and
+        therefore never probed this boundary.
+
+        Recorded rather than fixed because the over-firing is bounded by
+        CONSTRUCTION, not by the pattern: this class is report-only, and the
+        note below needs a SECOND record asserting `status=enabled` about task
+        12 before any group is emitted (asserted here, so the bound is pinned
+        and not merely claimed). Tightening the pattern instead would risk the
+        recall the whole detector rests on.
+        """
+        note = ('As of 2026-07-24 the dispatcher config has status=enabled '
+                'for task 12.')
+
+        assert extract_liveness_snapshot_fact(
+            _memory('cfg', note, category=_OS),
+        ) == 'status=enabled', 'a config note, not a task-liveness observation'
+
+        groups, _ = find_liveness_snapshot_recurrences(
+            [_dated('cfg', note, _TS_94_JUL24, category=_OS)],
+        )
+        assert groups == [], 'over-firing falls out as a singleton'
+
+    def test_a_quoted_value_containing_a_space_is_read_whole(self):
+        """All-or-nothing quoting: never a silently TRUNCATED key.
+
+        An earlier single-branch pattern let the value class terminate inside
+        the quotes, so this content keyed as `status=in` — a key that groups
+        with nothing real and would group with any other value truncating to
+        the same prefix, while firing neither disclosure counter.
+        """
+        key = extract_liveness_snapshot_fact(_memory(
+            'x',
+            'Point-in-time liveness check performed 2026-07-24 on task 94: '
+            'status="in progress", claimant_run_id=null.',
+            category=_OS,
+        ))
+
+        assert key == 'claimant_run_id=null|status=in progress'
+        assert 'status=in|' not in f'{key}|', 'the truncation regression'
+
+    @pytest.mark.parametrize('value', [
+        '"in progress and nothing closed the quote',
+        '"a|b"',
+    ])
+    def test_a_value_that_cannot_be_read_whole_is_not_a_snapshot(self, value):
+        """Unreadable -> no key at all, so the loss reaches a COUNTER.
+
+        An unterminated quote cannot be bounded, and `|` is the key's own pair
+        delimiter, so admitting it would let one value forge two pairs. Both
+        fall through to `liveness_snapshot_unfielded` (pinned in the
+        disclosure class) rather than becoming a plausible-looking bad key.
+        """
+        content = (
+            'Point-in-time liveness check performed 2026-07-24 on task 94: '
+            f'status={value}'
+        )
+
+        assert extract_liveness_snapshot_fact(
+            _memory('x', content, category=_OS),
+        ) is None
+
+
+class TestLivenessClassifierIsSingleCopy:
+    """One classifier, two callers -- so the extractor's tests test production.
+
+    An earlier shape had `find_liveness_snapshot_recurrences` re-implement the
+    prefilter/point-in-time/key-build sequence inline instead of calling the
+    extractor's helper. Every test in `TestExtractLivenessSnapshotFact` then
+    exercised a path production never ran, so a one-sided edit to either copy
+    would have left the whole suite green while the shipped detector diverged.
+    """
+
+    def test_both_entry_points_route_through_the_one_classifier(self, monkeypatch):
+        """A stub installed on the module reaches BOTH callers, or this fails."""
+        seen: list[str] = []
+
+        def _stub(content: str) -> tuple[bool, str | None]:
+            seen.append(content)
+            return True, 'sentinel=fact'
+
+        monkeypatch.setattr(_mod, '_classify_liveness_snapshot', _stub)
+
+        assert extract_liveness_snapshot_fact(
+            _memory('a', 'anything at all', category=_OS),
+        ) == 'sentinel=fact', 'the extractor is a projection of the classifier'
+
+        groups, _ = find_liveness_snapshot_recurrences([
+            _dated('a', 'first', _TS_94_JUL24, category=_OS,
+                   metadata={'task_id': '94'}),
+            _dated('b', 'second', _TS_REVERIFY, category=_OS,
+                   metadata={'task_id': '94'}),
+        ])
+
+        assert [g['core_fact'] for g in groups] == ['sentinel=fact'], (
+            'the detector consults the same classifier, not a private copy'
+        )
+        assert seen == ['anything at all', 'first', 'second']
+
+    def test_the_extractor_agrees_with_the_detector_on_every_real_record(self):
+        """The property the single copy buys, checked against the real corpus."""
+        for record in _liveness_corpus():
+            direct = extract_liveness_snapshot_fact(record)
+            _framed, via_classifier = _classify_liveness_snapshot(
+                record.get('content') or '',
+            )
+
+            assert direct == via_classifier, record['id']
+
+
+class TestLivenessSnapshotSubjectTaskIds:
+    """Which task(s) a snapshot is ABOUT -- a union, not `metadata.task_id`.
+
+    The task description phrases the pattern as "sharing the same task_id",
+    but the live corpus disproves the strict reading: 1eef7df7 is filed under
+    task_id='99' while being a re-verification of tasks 94 AND 96. Under a
+    strict grouping every bucket in the motivating corpus is a singleton and
+    the detector emits nothing on the exact pattern it was built for.
+    """
+
+    def test_metadata_task_id_alone(self):
+        assert liveness_snapshot_subject_task_ids(
+            _memory('m', 'no task refs here', metadata={'task_id': '94'}),
+        ) == {'94'}
+
+    def test_int_task_id_is_coerced_to_str(self):
+        """The project-wide convention `_normalize_task_id_metadata` enforces."""
+        assert liveness_snapshot_subject_task_ids(
+            _memory('m', 'no task refs here', metadata={'task_id': 94}),
+        ) == {'94'}
+
+    def test_related_task_ids_and_content_refs_union_in(self):
+        """The real 1eef7df7 shape: filed under 99, about 94 and 96."""
+        subjects = liveness_snapshot_subject_task_ids(_memory(
+            '1eef7df7', _LIVENESS_REVERIFY_94_96_JUL26, category=_OS,
+            metadata={'task_id': '99', 'related_task_ids': ['94', '96']},
+        ))
+
+        assert {'94', '96', '99'} <= subjects
+
+    def test_content_ref_alone_still_groups_a_snapshot(self):
+        """Absent/blank metadata must not make a snapshot ungroupable."""
+        assert liveness_snapshot_subject_task_ids(
+            _memory('6b245659', _LIVENESS_SNAPSHOT_94_JUL24, category=_OS),
+        ) == {'94'}
+
+    def test_no_metadata_id_and_no_content_ref_is_empty(self):
+        assert liveness_snapshot_subject_task_ids(
+            _memory('m', 'a note that names no task at all'),
+        ) == set()
+
+    @pytest.mark.parametrize('related', ['77', None, 12, {'nested': 'dict'}])
+    def test_non_list_related_task_ids_degrades_without_raising(self, related):
+        subjects = liveness_snapshot_subject_task_ids(
+            _memory('m', 'no task refs here',
+                    metadata={'task_id': '94', 'related_task_ids': related}),
+        )
+
+        assert '94' in subjects, 'the metadata task id survives regardless'
+        assert all(isinstance(s, str) for s in subjects)
+
+    def test_the_record_is_not_mutated(self):
+        record = _memory(
+            '1eef7df7', _LIVENESS_REVERIFY_94_96_JUL26, category=_OS,
+            metadata={'task_id': '99', 'related_task_ids': ['94', '96']},
+        )
+        before = json.dumps(record, sort_keys=True, default=str)
+
+        liveness_snapshot_subject_task_ids(record)
+
+        assert json.dumps(record, sort_keys=True, default=str) == before
+
+
+def _liveness_corpus() -> list[dict]:
+    """The four real solar_challenge records, in their real shapes."""
+    return [
+        _dated('6b245659', _LIVENESS_SNAPSHOT_94_JUL24, _TS_94_JUL24,
+               category=_OS, metadata={'task_id': '94',
+                                       'kind': 'stranded_task_investigation'}),
+        _dated('08aa0017', _LIVENESS_SNAPSHOT_96_JUL24, _TS_96_JUL24,
+               category=_OS, metadata={'task_id': '96',
+                                       'kind': 'live_workflow_deferral_note'}),
+        _dated('68dd5f93', _INVESTIGATION_NOTE_96, _TS_NOTE_96,
+               category=_OS, metadata={'task_id': '96',
+                                       'kind': 'investigation_note'}),
+        _dated('1eef7df7', _LIVENESS_REVERIFY_94_96_JUL26, _TS_REVERIFY,
+               category=_OS, metadata={'task_id': '99',
+                                       'related_task_ids': ['94', '96'],
+                                       'kind': 'task_lifecycle_reverification'}),
+    ]
+
+
+def _span_days(earlier: str, later: str) -> float:
+    return (datetime.fromisoformat(later).timestamp()
+            - datetime.fromisoformat(earlier).timestamp()) / 86400.0
+
+
+class TestFindLivenessSnapshotRecurrences:
+    """The two groups the real corpus contains -- and nothing else.
+
+    `metadata.kind` differs across all four records, so the grouping key is
+    (category, subject_task_id, core_fact). Subject 99 is a singleton and
+    68dd5f93 is not a snapshot at all: both fall out, which is the
+    "preserve genuinely unique investigative content" requirement.
+    """
+
+    def test_exactly_the_two_real_groups(self):
+        groups, _ = find_liveness_snapshot_recurrences(_liveness_corpus())
+
+        assert [(g['subject_task_id'], g['member_ids']) for g in groups] == [
+            ('94', ['1eef7df7', '6b245659']),
+            ('96', ['08aa0017', '1eef7df7']),
+        ]
+        assert all(g['snapshot_count'] == 2 for g in groups)
+        assert all(g['category'] == _OS for g in groups)
+        assert all(g['core_fact'] == _CORE_FACT_STRANDED for g in groups)
+
+    def test_singleton_subject_and_non_snapshot_are_absent(self):
+        groups, _ = find_liveness_snapshot_recurrences(_liveness_corpus())
+
+        assert '99' not in {g['subject_task_id'] for g in groups}, (
+            'one snapshot about task 99 is a singleton, not a recurrence'
+        )
+        assert all('68dd5f93' not in g['member_ids'] for g in groups), (
+            'the prose-only investigation note carries no repeated core fact'
+        )
+
+    def test_first_seen_last_seen_and_span_days(self):
+        groups, _ = find_liveness_snapshot_recurrences(_liveness_corpus())
+        by_subject = {g['subject_task_id']: g for g in groups}
+
+        assert by_subject['94']['first_seen'] == _TS_94_JUL24
+        assert by_subject['94']['last_seen'] == _TS_REVERIFY
+        assert by_subject['94']['span_days'] == _span_days(_TS_94_JUL24, _TS_REVERIFY)
+        assert by_subject['96']['first_seen'] == _TS_96_JUL24
+        assert by_subject['96']['last_seen'] == _TS_REVERIFY
+        assert by_subject['96']['span_days'] == _span_days(_TS_96_JUL24, _TS_REVERIFY)
+
+    def test_no_parseable_timestamp_reports_none_not_a_fabricated_span(self):
+        undated = [
+            _dated('a', _LIVENESS_SNAPSHOT_94_JUL24, None,
+                   category=_OS, metadata={'task_id': '94'}),
+            _dated('b', _LIVENESS_REVERIFY_94_96_JUL26, 'not-a-timestamp',
+                   category=_OS, metadata={'task_id': '94'}),
+        ]
+        groups, _ = find_liveness_snapshot_recurrences(undated)
+
+        assert len(groups) == 1
+        assert groups[0]['first_seen'] is None
+        assert groups[0]['last_seen'] is None
+        assert groups[0]['span_days'] is None
+
+    def test_input_order_does_not_change_the_result(self):
+        corpus = _liveness_corpus()
+        shuffled = [corpus[3], corpus[1], corpus[0], corpus[2]]
+
+        assert (find_liveness_snapshot_recurrences(shuffled)[0]
+                == find_liveness_snapshot_recurrences(corpus)[0])
+
+    def test_input_is_not_mutated(self):
+        corpus = _liveness_corpus()
+        before = json.dumps(corpus, sort_keys=True, default=str)
+
+        find_liveness_snapshot_recurrences(corpus)
+
+        assert json.dumps(corpus, sort_keys=True, default=str) == before
+
+    def test_grouping_never_unions_across_categories(self):
+        """A preference and an observation reporting the same live fields are
+        different kinds of knowledge -- the same invariant build_sweep_plan
+        enforces by clustering per category."""
+        corpus = _liveness_corpus()
+        corpus[0]['category'] = _PN  # 6b245659, the other half of subject 94
+
+        groups, _ = find_liveness_snapshot_recurrences(corpus)
+
+        assert [g['subject_task_id'] for g in groups] == ['96'], (
+            'subject 94 is now one snapshot per category -- two singletons'
+        )
+
+    def test_unswept_categories_are_ignored(self):
+        corpus = _liveness_corpus()
+
+        groups, _ = find_liveness_snapshot_recurrences(corpus, categories=(_PK,))
+
+        assert groups == []
+
+    def test_divergent_per_task_statuses_do_not_group(self):
+        """The KNOWN LIMITATION of the whole-record key, pinned not hidden.
+
+        The core fact is built ONCE PER RECORD by unioning every assignment in
+        its content, then attributed to every subject the record names. When a
+        multi-task re-verification reports DIFFERENT values per task, that
+        merged key matches neither single-task snapshot and both stay
+        singletons.
+
+        The real motivating record (1eef7df7) reports identical values for
+        both its subjects, so the detector fires on the corpus that motivated
+        it. Per-subject clause scoping was tried and rejected on evidence:
+        `_CLAUSE_SPLIT_RE` splits on `.`, shattering filenames mid-sentence,
+        and the real content writes `task/94`, which `TASK_REF_RE` does not
+        match -- it yields the EMPTY SET on all four real records. This is a
+        RECALL gap in a report-only path, never a wrong delete.
+        """
+        divergent = (
+            'Point-in-time liveness check performed 2026-07-26 on task 94: '
+            'status="in-progress", claimant_run_id=null. Separately on task '
+            '96: status="done", claimant_run_id=null.'
+        )
+        corpus = [
+            _dated('6b245659', _LIVENESS_SNAPSHOT_94_JUL24, _TS_94_JUL24,
+                   category=_OS, metadata={'task_id': '94'}),
+            _dated('divergent', divergent, _TS_REVERIFY,
+                   category=_OS, metadata={'task_id': '99'}),
+        ]
+
+        groups, disclosure = find_liveness_snapshot_recurrences(corpus)
+
+        assert extract_liveness_snapshot_fact(corpus[1]) == (
+            'claimant_run_id=null|status=done|status=in-progress'
+        ), 'one merged key per record, carrying BOTH statuses'
+        assert groups == [], (
+            'the merged key matches neither single-task snapshot, so the '
+            'recurrence goes unreported -- a recall gap, not a bad delete'
+        )
+        assert set(disclosure.values()) == {0}, (
+            'and it is NOT a counted loss: both records classified fine'
+        )
+
+
+# A recognised snapshot that names no task anywhere -- no metadata.task_id, no
+# related_task_ids, and no TASK_REF_RE match in the content ("get_task" is not
+# a task reference). It cannot be grouped, so it is a genuine recall loss.
+_LIVENESS_SNAPSHOT_UNTASKED = (
+    'Point-in-time liveness check performed 2026-07-24 during reconciliation '
+    'run 4b262e10-3624-44e5-b420-4dbedfd2bb8b (Stage 2, task_knowledge_sync): '
+    'get_task reports status="in-progress" but claimant_run_id=null and '
+    'heartbeat_at=null for the item under investigation.'
+)
+
+# Point-in-time framing plus a LIVE_TASK_STATUS_RE PARAPHRASE, with no
+# <field>=<value> assignment anywhere: a snapshot whose fields could not be
+# read, which is a different loss from "not a snapshot at all".
+_LIVENESS_SNAPSHOT_UNFIELDED = (
+    'Point-in-time liveness check performed 2026-07-24 on task 94: the task '
+    'is actively driven by an orchestrator process holding the project lock, '
+    'so Stage 2 did not write.'
+)
+
+# Point-in-time framing and NOTHING live-status-shaped: never a snapshot, so
+# neither counter may fire on it.
+_POINT_IN_TIME_NON_STATUS = (
+    'Point-in-time liveness check performed 2026-07-24 on the config sweep: '
+    'nothing of note was observed this cycle.'
+)
+
+
+class TestFindLivenessSnapshotRecurrencesDisclosure:
+    """Every way this path can lose a candidate is a counted, alarmable int.
+
+    An absent key downstream is indistinguishable from "not measured", so the
+    counters are always all present, always ints, always zero-filled on a
+    clean run -- the same contract _ANN_DISCLOSURE_KEYS carries.
+    """
+
+    def test_clean_run_zero_fills_every_key(self):
+        _, disclosure = find_liveness_snapshot_recurrences(_liveness_corpus())
+
+        assert set(disclosure) == set(_LIVENESS_DISCLOSURE_KEYS)
+        assert all(type(v) is int for v in disclosure.values()), 'ints, not bools'
+        assert set(disclosure.values()) == {0}
+
+    def test_untasked_snapshot_is_counted_not_silently_dropped(self):
+        _, disclosure = find_liveness_snapshot_recurrences([
+            _dated('u', _LIVENESS_SNAPSHOT_UNTASKED, _TS_94_JUL24, category=_OS),
+        ])
+
+        assert disclosure['liveness_snapshot_untasked'] == 1
+        assert disclosure['liveness_snapshot_unfielded'] == 0, (
+            'its fields read fine — it is only the subject that is missing'
+        )
+
+    def test_unfielded_snapshot_is_counted(self):
+        _, disclosure = find_liveness_snapshot_recurrences([
+            _dated('p', _LIVENESS_SNAPSHOT_UNFIELDED, _TS_94_JUL24,
+                   category=_OS, metadata={'task_id': '94'}),
+        ])
+
+        assert disclosure['liveness_snapshot_unfielded'] == 1
+        assert disclosure['liveness_snapshot_untasked'] == 0, (
+            'it names task 94 — it is only the fields that could not be read'
+        )
+
+    def test_a_value_that_cannot_be_read_whole_is_counted_not_truncated(self):
+        """The truncation regression, seen from the disclosure side.
+
+        Under the earlier single-branch pattern this content keyed as
+        `status=in` and fired NO counter -- exactly the invisible recall loss
+        this disclosure design exists to prevent. Now the value is either read
+        whole or not read at all, and "not read" is an int a human can alarm on.
+        """
+        _, disclosure = find_liveness_snapshot_recurrences([
+            _dated(
+                'q',
+                'Point-in-time liveness check performed 2026-07-24 on task 94: '
+                'status="in progress and nothing closed the quote',
+                _TS_94_JUL24, category=_OS, metadata={'task_id': '94'},
+            ),
+        ])
+
+        assert disclosure['liveness_snapshot_unfielded'] == 1
+        assert disclosure['liveness_snapshot_untasked'] == 0, (
+            'it names task 94 — it is only the value that could not be read'
+        )
+
+    def test_point_in_time_prose_with_no_live_status_counts_as_neither(self):
+        """"Not a snapshot at all" is not a loss — nothing was ever in hand."""
+        _, disclosure = find_liveness_snapshot_recurrences([
+            _dated('n', _POINT_IN_TIME_NON_STATUS, _TS_94_JUL24,
+                   category=_OS, metadata={'task_id': '94'}),
+        ])
+
+        assert set(disclosure.values()) == {0}
+
+    def test_unswept_category_counts_neither(self):
+        """It was never in scope, so it is not a recall loss."""
+        _, disclosure = find_liveness_snapshot_recurrences(
+            [
+                _dated('u', _LIVENESS_SNAPSHOT_UNTASKED, _TS_94_JUL24, category=_OS),
+                _dated('p', _LIVENESS_SNAPSHOT_UNFIELDED, _TS_94_JUL24, category=_OS),
+            ],
+            categories=(_PK,),
+        )
+
+        assert set(disclosure.values()) == {0}
+
+
+# The plan keys that existed before task 3098. Pinned so an additive change
+# stays additive: no pre-existing key may be dropped or renamed.
+_PRE_3098_PLAN_KEYS = frozenset({
+    'clusters_total', 'near_duplicate_groups', 'delete_candidates',
+    'threshold', 'ann_threshold', 'ann_disclosure',
+    'topic_carveout_clusters', 'topic_carveout_groups',
+    'apply_delete_candidates', 'apply_withheld_clusters',
+    'apply_withheld_groups', 'path_verdicts',
+})
+
+_LIVENESS_PLAN_KEYS = frozenset({
+    'liveness_snapshot_recurrence_groups',
+    'liveness_snapshot_recurrence_clusters',
+    'liveness_snapshot_disclosure',
+})
+
+
+class TestBuildSweepPlanLivenessRecurrences:
+    """The third class reaches the plan -- and never reaches a delete."""
+
+    def test_the_two_real_groups_are_reported(self):
+        plan = build_sweep_plan(_liveness_corpus())
+
+        assert plan['liveness_snapshot_recurrence_clusters'] == 2
+        assert [(g['subject_task_id'], g['member_ids'])
+                for g in plan['liveness_snapshot_recurrence_groups']] == [
+            ('94', ['1eef7df7', '6b245659']),
+            ('96', ['08aa0017', '1eef7df7']),
+        ]
+        assert plan['liveness_snapshot_disclosure'] == dict.fromkeys(
+            _LIVENESS_DISCLOSURE_KEYS, 0,
+        )
+
+    def test_no_liveness_member_is_ever_a_delete_candidate(self):
+        """Task 3098 authorizes DETECTION only.
+
+        Disposition of these specific solar_challenge entries is a separate
+        human-gated decision on solar_challenge task 99. If these groups fed
+        `delete_candidates`, a routine --apply run would delete them and
+        silently override that gate.
+        """
+        plan = build_sweep_plan(_liveness_corpus())
+
+        for member_id in ('6b245659', '08aa0017', '1eef7df7', '68dd5f93'):
+            assert member_id not in plan['delete_candidates']
+            assert member_id not in plan['apply_delete_candidates']
+        assert plan['delete_candidates'] == []
+        assert plan['apply_delete_candidates'] == []
+
+    def test_the_apply_gate_is_never_handed_a_liveness_group(self, monkeypatch):
+        """Report-only by CONSTRUCTION, not by a downstream filter.
+
+        A filter can be dropped by a later refactor; never handing the gate
+        these groups in the first place cannot be.
+        """
+        seen: list[list[dict]] = []
+        real = _mod.restrict_delete_candidates_for_apply
+
+        def _spy(groups):
+            seen.append(groups)
+            return real(groups)
+
+        monkeypatch.setattr(_mod, 'restrict_delete_candidates_for_apply', _spy)
+        build_sweep_plan(_liveness_corpus())
+
+        assert seen, 'the apply gate still runs'
+        assert all(
+            'core_fact' not in g and 'subject_task_id' not in g
+            for handed in seen for g in handed
+        )
+
+    def test_pre_existing_keys_are_untouched_and_new_keys_are_never_absent(self):
+        """A corpus with no liveness snapshots reports empty, not missing."""
+        plan = build_sweep_plan(
+            [
+                _memory('m1', _VENV_GOTCHA_A, created_at='2026-07-13T00:00:00+00:00'),
+                _memory('m2', _VENV_GOTCHA_B, created_at='2026-07-12T00:00:00+00:00'),
+                _memory('m4', _DISTRACTOR),
+            ],
+            threshold=_THRESHOLD,
+        )
+
+        assert set(plan) == _PRE_3098_PLAN_KEYS | _LIVENESS_PLAN_KEYS
+        assert plan['clusters_total'] == 1, 'the lexical path is unaffected'
+        assert plan['delete_candidates'] == (
+            plan['near_duplicate_groups'][0]['delete_candidate_ids']
+        )
+        assert plan['liveness_snapshot_recurrence_groups'] == []
+        assert plan['liveness_snapshot_recurrence_clusters'] == 0
+        assert plan['liveness_snapshot_disclosure'] == dict.fromkeys(
+            _LIVENESS_DISCLOSURE_KEYS, 0,
+        )
+
+    def test_plan_is_still_json_serializable(self):
+        """stdout is task 3136's report contract."""
+        assert isinstance(
+            json.dumps(build_sweep_plan(_liveness_corpus()), default=str), str,
+        )
+
+
+class TestLivenessRecurrenceMetrics:
+    """The recurrence count is an ARMED, directional metric -- not a scalar.
+
+    `topic_carveout_clusters` is a scalar because more carve-outs is the
+    EXPECTED Option-C shape, so alarming on it would alarm on the feature
+    working. Indefinite accretion of the same status fact is the opposite:
+    it IS the pathology this detector exists to surface.
+    """
+
+    def _fixture(self):
+        plan = build_sweep_plan(_liveness_corpus())
+        records = {_OS: _liveness_corpus(), _PK: [_dated('x', 'unrelated', None)]}
+        return records, split_plan_by_category(plan, (_OS, _PK))
+
+    def test_split_plan_projects_the_groups_into_their_category(self):
+        plan = build_sweep_plan(_liveness_corpus())
+
+        by_cat = split_plan_by_category(plan, (_OS, _PK, _PN))
+
+        assert [g['subject_task_id']
+                for g in by_cat[_OS]['liveness_snapshot_recurrence_groups']] == ['94', '96']
+        assert by_cat[_PK]['liveness_snapshot_recurrence_groups'] == []
+        assert by_cat[_PN]['liveness_snapshot_recurrence_groups'] == [], (
+            'an absent key downstream would read as "not measured"'
+        )
+
+    def test_metric_is_an_armed_directional_count_per_category(self):
+        records, plans = self._fixture()
+
+        metrics, _details = compute_cluster_metrics(records, plans, {})
+        by_id = _by_id(metrics)
+
+        metric = by_id[f'liveness_snapshot_recurrences.{_OS}']
+        assert metric.kind == 'count'
+        assert metric.direction == 'higher_is_worse'
+        assert metric.value == 2.0
+        assert metric.n == 4, 'n is the exposure: the category corpus size'
+
+    def test_a_category_with_none_still_reports_zero(self):
+        records, plans = self._fixture()
+
+        metrics, _details = compute_cluster_metrics(records, plans, {})
+
+        assert _by_id(metrics)[f'liveness_snapshot_recurrences.{_PK}'].value == 0.0
+
+    def test_details_carry_the_per_group_table(self):
+        records, plans = self._fixture()
+
+        _metrics, details = compute_cluster_metrics(records, plans, {})
+        table = details['categories'][_OS]['liveness_snapshot_recurrences']
+
+        assert [row['subject_task_id'] for row in table] == ['94', '96']
+        assert all(set(row) == {'subject_task_id', 'core_fact', 'member_ids',
+                                'snapshot_count', 'span_days'} for row in table)
+        assert table[0]['member_ids'] == ['1eef7df7', '6b245659']
+        assert table[0]['snapshot_count'] == 2
+        assert table[0]['core_fact'] == _CORE_FACT_STRANDED
+        assert table[0]['span_days'] == _span_days(_TS_94_JUL24, _TS_REVERIFY)
+        assert details['categories'][_PK]['liveness_snapshot_recurrences'] == []
+
+    def test_the_metric_points_at_the_table_that_names_the_memories(self):
+        """A scalar count is not actionable on its own.
+
+        The metric says HOW MANY groups; the companion table says WHICH
+        memories to consolidate, and that table is the whole point of the
+        detector. Every other metric in this function whose full shape lives
+        in the details file carries the pointer, so a consumer reading only
+        the metric series can find it -- this one must too.
+        """
+        records, plans = self._fixture()
+        details_path = details_artifact_path(_STAMP)
+
+        metrics, _details = compute_cluster_metrics(
+            records, plans, {}, details_path=details_path,
+        )
+        by_id = _by_id(metrics)
+
+        assert by_id[f'liveness_snapshot_recurrences.{_OS}'].details_path == (
+            details_path
+        )
+        assert by_id[f'liveness_snapshot_recurrences.{_PK}'].details_path == (
+            details_path
+        ), 'an empty category still has a table to point at'
+        assert 'liveness_snapshot_recurrences' in _mod._DETAILED_METRICS, (
+            'the vocabulary that documents which metrics have a companion table'
+        )
+        assert by_id[f'cluster_size_max.{_OS}'].details_path == details_path, (
+            'the sibling convention this follows'
+        )
+
+    def test_series_still_validates_and_metrics_stay_sorted(self):
+        from shared.memory_eval_metrics import validate_metric_series  # noqa: PLC0415
+
+        records, plans = self._fixture()
+        metrics, _details = compute_cluster_metrics(records, plans, {})
+
+        ids = [m.metric_id for m in metrics]
+        assert ids == sorted(ids)
+        assert len(ids) == len(set(ids)), 'no duplicate metric_id'
+        validate_metric_series(build_metric_series(
+            'dark_factory', metrics,
+            corpus_counts={c: len(v) for c, v in records.items()},
+            run_stamp='20260731T000000Z',
+        ))
+
+
+def _liveness_raw_corpus() -> dict[str, list[dict]]:
+    """The real four records in scroll_by_metadata's raw payload shape."""
+    return {_OS: [
+        _raw('6b245659', _LIVENESS_SNAPSHOT_94_JUL24, _TS_94_JUL24, _OS,
+             {'task_id': '94', 'kind': 'stranded_task_investigation'}),
+        _raw('08aa0017', _LIVENESS_SNAPSHOT_96_JUL24, _TS_96_JUL24, _OS,
+             {'task_id': '96', 'kind': 'live_workflow_deferral_note'}),
+        _raw('68dd5f93', _INVESTIGATION_NOTE_96, _TS_NOTE_96, _OS,
+             {'task_id': '96', 'kind': 'investigation_note'}),
+        _raw('1eef7df7', _LIVENESS_REVERIFY_94_96_JUL26, _TS_REVERIFY, _OS,
+             {'task_id': '99', 'related_task_ids': ['94', '96'],
+              'kind': 'task_lifecycle_reverification'}),
+    ]}
+
+
+@pytest.mark.asyncio
+class TestRunLivenessRecurrenceWiring:
+    """End to end on the real corpus: the report and the metrics both carry it."""
+
+    async def _parse(self, tmp_path, *argv):
+        return _build_parser().parse_args(
+            ['--project-id', 'p', '--metrics-root', str(tmp_path), *argv],
+        )
+
+    async def test_stdout_report_carries_the_recurrences(
+        self, monkeypatch, tmp_path, capsys,
+    ):
+        _install_run_doubles(monkeypatch, _liveness_raw_corpus())
+
+        rc = await _run(await self._parse(tmp_path))
+        plan = json.loads(capsys.readouterr().out)
+
+        assert rc == 0
+        assert plan['liveness_snapshot_recurrence_clusters'] == 2
+        assert [g['subject_task_id']
+                for g in plan['liveness_snapshot_recurrence_groups']] == ['94', '96']
+        assert plan['liveness_snapshot_disclosure'] == dict.fromkeys(
+            _LIVENESS_DISCLOSURE_KEYS, 0,
+        )
+        assert plan['delete_candidates'] == [], 'detection only — never a delete'
+
+    async def test_metric_series_carries_the_count_and_both_disclosures(
+        self, monkeypatch, tmp_path,
+    ):
+        from shared.memory_eval_metrics import (  # noqa: PLC0415
+            RUN_STAMP_ENV_VAR,
+            load_metric_series,
+        )
+
+        monkeypatch.setenv(RUN_STAMP_ENV_VAR, _STAMP)
+        _install_run_doubles(monkeypatch, _liveness_raw_corpus())
+        await _run(await self._parse(tmp_path))
+
+        series = load_metric_series(tmp_path / _EVAL_ID / f'metrics-{_STAMP}.json')
+        by_id = _by_id(series.metrics)
+
+        assert by_id[f'liveness_snapshot_recurrences.{_OS}'].value == 2.0
+        # Run-global scope: these are properties of ONE pass over the whole
+        # scanned set, not of a category, so a per-category split would be a
+        # fabricated attribution.
+        for key in _LIVENESS_DISCLOSURE_KEYS:
+            assert f'{key}.{_GLOBAL_SCOPE}' in by_id, f'{key} must be disclosed'
+        for key in (*_ANN_DISCLOSURE_KEYS, *_PLAN_DISCLOSURE_KEYS):
+            assert f'{key}.{_GLOBAL_SCOPE}' in by_id, 'the ANN disclosures survive'
+
+    async def test_no_metrics_still_writes_no_artifact(self, monkeypatch, tmp_path):
+        _install_run_doubles(monkeypatch, _liveness_raw_corpus())
+        await _run(await self._parse(tmp_path, '--no-metrics'))
+
+        assert list(tmp_path.iterdir()) == []
+
+
+# Every option the parser exposed before task 3098, by `dest`. Pinned as a set
+# so a flag ADDED (not merely one removed) fails too -- an optional flag would
+# leave the two parse_args cases below perfectly green while still growing the
+# surface this class exists to hold flat.
+_PRE_3098_PARSER_DESTS = frozenset({
+    'help', 'project_id', 'threshold', 'scan_limit', 'apply', 'config',
+    'categories', 'ann_top_k', 'ann_threshold', 'metrics_root', 'eval_id',
+    'no_metrics',
+})
+
+
+class TestLivenessDetectorAddsNoCliSurface:
+    """The detector is O(n), always runs and never deletes -- so no knob."""
+
+    def test_no_flag_was_added_to_the_parser(self):
+        """The claim the sibling test cannot make: the surface is UNCHANGED.
+
+        Parsing `--project-id X [--apply]` still succeeding proves only that
+        no REQUIRED flag appeared; any optional one would slip through. This
+        pins the option surface itself.
+        """
+        dests = {action.dest for action in _build_parser()._actions}
+
+        assert dests == _PRE_3098_PARSER_DESTS
+
+    def test_the_scheduled_invocation_still_parses(self):
+        """Task 3136 schedules `--project-id X [--apply]`; both keep parsing."""
+        dry = _build_parser().parse_args(['--project-id', 'X'])
+        applied = _build_parser().parse_args(['--project-id', 'X', '--apply'])
+
+        assert (dry.project_id, dry.apply) == ('X', False)
+        assert (applied.project_id, applied.apply) == ('X', True)
+
+
+# An ordinary reconciliation observation at the size real ones run (~2 KB),
+# carrying NO LIVE_TASK_STATUS_RE marker and no point-in-time framing: the
+# overwhelming majority of what a default 5000-records-per-category scan walks,
+# and precisely the non-matching input on which POINT_IN_TIME_CHECK_RE's two
+# `(?=.*...)` lookaheads are at their quadratic worst.
+_LONG_PROSE_NO_MARKER = (
+    'Stage 1 walked the merge lane for reconciliation cycle 812 and traced '
+    'every handoff between the coordinator, the merge worker and the pooled '
+    'worktree lanes. The coordinator picked up three queued branches in the '
+    'order they were enqueued and rebased each one onto the tip of main '
+    'before handing it to the worker; two landed cleanly and the third came '
+    'back with a conflict in the shared fixture module, which the worker '
+    'parked on the retry shelf rather than forcing. A direct read of the lane '
+    'pool directory shows all four pooled lanes present with populated '
+    'virtualenvs, and the reflog for each lane advances monotonically with no '
+    'rewind. The pre-merge-commit hook fired on every landing and its pyright '
+    'pass took just under two minutes per invocation, which is the dominant '
+    'cost of a landing and the reason the queue drains slowly whenever three '
+    'or more branches arrive together. Nothing in the worker log suggests a '
+    'wedged unit: the watchdog probe answered on its first attempt each cycle '
+    'and the fleet-deploy clock was never consulted. The one thing worth '
+    'carrying forward is that the conflicted branch has now been parked twice '
+    'for the same fixture hunk, so whoever picks it up should rebase it by '
+    'hand instead of re-queueing it and expecting a different outcome. Two '
+    'further branches sit behind it in the queue and will inherit the same '
+    'conflict if that fixture is not reconciled first. The lane that carried '
+    'the conflicted branch was released back to the pool without a reset, so '
+    'its working tree still holds the half-applied rebase; a future claimant '
+    'will find a dirty tree and should reset it before starting rather than '
+    'committing over the leftovers. No escalation was filed during this pass '
+    'and no task changed state, so this note is a pure observation of the '
+    'lane mechanics and carries no disposition of its own.'
+)
+
+
+class _CountingPattern:
+    """A delegating stand-in for a compiled pattern that counts `.search`.
+
+    Delegates to the real pattern rather than stubbing it, so behaviour is
+    unchanged and the class below measures COST, not semantics. It exposes
+    `search` and nothing else on purpose: if the implementation ever reaches
+    for `.match`/`.findall`/`.finditer` on this pattern, the AttributeError
+    surfaces that here instead of letting an uncounted consult pass as free.
+    """
+
+    def __init__(self, pattern):
+        self._pattern = pattern
+        self.searches = 0
+
+    def search(self, string, *args, **kwargs):
+        self.searches += 1
+        return self._pattern.search(string, *args, **kwargs)
+
+
+class TestLivenessDetectorRegexBudget:
+    """How many times the QUADRATIC pattern may be consulted, per record.
+
+    `POINT_IN_TIME_CHECK_RE` carries two `(?=.*...)` lookaheads under
+    `re.DOTALL`, so on non-matching input its cost grows with the square of
+    the content length, while the lookahead-free `LIVE_TASK_STATUS_RE` stays
+    linear. It is currently the FIRST gate applied to every swept record, and
+    the disclosure branch re-evaluates it — so ordinary prose, which cannot
+    produce a group at all, pays the worst case twice per record across a
+    detector that always runs and has no flag to disable it.
+
+    Consult COUNTS, never wall-clock timings: a timing assertion would pin the
+    machine and the CI load of the day rather than the algorithm.
+    """
+
+    @pytest.fixture
+    def consults(self, monkeypatch):
+        """Install the counter as the script's module global.
+
+        The script looks `POINT_IN_TIME_CHECK_RE` up on its own module at call
+        time, so patching `_mod` reaches every call site at once.
+        """
+        counter = _CountingPattern(POINT_IN_TIME_CHECK_RE)
+        monkeypatch.setattr(_mod, 'POINT_IN_TIME_CHECK_RE', counter)
+        return counter
+
+    def test_the_prose_fixture_really_is_marker_free_and_long(self):
+        """Fixture guard: a marker creeping in would make the headline case vacuous."""
+        assert not LIVE_TASK_STATUS_RE.search(_LONG_PROSE_NO_MARKER)
+        assert not POINT_IN_TIME_CHECK_RE.search(_LONG_PROSE_NO_MARKER)
+        assert len(_LONG_PROSE_NO_MARKER) > 1500, 'the size real observations run'
+
+    def test_long_prose_without_a_live_marker_is_never_consulted(self, consults):
+        """The headline failure, and the dominant corpus cost."""
+        groups, disclosure = find_liveness_snapshot_recurrences(
+            [_dated('prose', _LONG_PROSE_NO_MARKER, _TS_94_JUL24, category=_OS)],
+        )
+
+        assert consults.searches == 0, (
+            'a non-matching string is the quadratic worst case, and ordinary '
+            'prose is most of the corpus'
+        )
+        assert groups == []
+        assert disclosure == dict.fromkeys(_LIVENESS_DISCLOSURE_KEYS, 0)
+
+    def test_a_recognised_snapshot_is_consulted_exactly_once(self, consults):
+        """Pins that the fix does not regress the case the detector exists for."""
+        groups, _ = find_liveness_snapshot_recurrences(
+            [_dated('6b245659', _LIVENESS_SNAPSHOT_94_JUL24, _TS_94_JUL24,
+                    category=_OS, metadata={'task_id': '94'})],
+        )
+
+        assert consults.searches == 1, 'the classification itself, and nothing more'
+        assert groups == [], 'one snapshot is a singleton, not a recurrence'
+
+    def test_an_unfielded_paraphrase_is_consulted_once_and_still_counted(
+        self, consults,
+    ):
+        """The load-bearing case for choosing the BROADER prefilter.
+
+        This is the one record class that matches `LIVE_TASK_STATUS_RE` (via
+        the "actively driven by" paraphrase) but NOT
+        `_LIVE_FIELD_ASSIGNMENT_RE`. Prefiltering on the narrower assignment
+        pattern would read as one consult here too, while silently driving
+        `liveness_snapshot_unfielded` to a permanent zero — turning a counted
+        loss back into an invisible one.
+        """
+        _, disclosure = find_liveness_snapshot_recurrences(
+            [_dated('p', _LIVENESS_SNAPSHOT_UNFIELDED, _TS_94_JUL24,
+                    category=_OS, metadata={'task_id': '94'})],
+        )
+
+        assert consults.searches == 1, 'consulted for the classification, not twice'
+        assert disclosure['liveness_snapshot_unfielded'] == 1, (
+            'the disclosure must survive the prefilter'
+        )
+
+    def test_an_unswept_category_does_no_content_work(self, consults):
+        """The category check stays ahead of anything that reads content."""
+        find_liveness_snapshot_recurrences(
+            [_dated('6b245659', _LIVENESS_SNAPSHOT_94_JUL24, _TS_94_JUL24,
+                    category=_OS, metadata={'task_id': '94'})],
+            categories=(_PK,),
+        )
+
+        assert consults.searches == 0
+
+    def test_consults_do_not_scale_with_corpus_size(self, consults):
+        """Fifty marker-free records in ONE call still cost nothing."""
+        corpus = [
+            _dated(f'prose-{i}', f'{_LONG_PROSE_NO_MARKER} Lane {i}.',
+                   _TS_94_JUL24, category=_OS)
+            for i in range(50)
+        ]
+
+        groups, disclosure = find_liveness_snapshot_recurrences(corpus)
+
+        assert consults.searches == 0, 'the expensive pattern must not scale with n'
+        assert groups == []
+        assert disclosure == dict.fromkeys(_LIVENESS_DISCLOSURE_KEYS, 0)
+
+    def test_a_mixed_corpus_consults_only_records_that_could_be_snapshots(
+        self, consults,
+    ):
+        """The real four buried in bulk prose: same groups, three consults."""
+        corpus = _liveness_corpus() + [
+            _dated(f'prose-{i}', f'{_LONG_PROSE_NO_MARKER} Lane {i}.',
+                   _TS_94_JUL24, category=_OS)
+            for i in range(50)
+        ]
+
+        groups, disclosure = find_liveness_snapshot_recurrences(corpus)
+
+        assert consults.searches == 3, (
+            'only the three records carrying a live-status marker — the '
+            'prose-only investigation note and the 50 fillers never reach it'
+        )
+        assert [(g['subject_task_id'], g['member_ids']) for g in groups] == [
+            ('94', ['1eef7df7', '6b245659']),
+            ('96', ['08aa0017', '1eef7df7']),
+        ]
+        assert disclosure == dict.fromkeys(_LIVENESS_DISCLOSURE_KEYS, 0)
+
+    def test_the_public_extractor_keeps_its_single_arg_contract(self, consults):
+        """Still one argument, still None/key — and free on a marker-free record."""
+        no_marker = _memory('prose', _LONG_PROSE_NO_MARKER, category=_OS)
+        snapshot = _memory('6b245659', _LIVENESS_SNAPSHOT_94_JUL24, category=_OS)
+
+        assert extract_liveness_snapshot_fact(no_marker) is None
+        assert consults.searches == 0, 'no marker -> the expensive pattern is skipped'
+
+        assert extract_liveness_snapshot_fact(snapshot) == _CORE_FACT_STRANDED
+        assert consults.searches <= 1, 'at most one consult for a real snapshot'
+
+    @pytest.mark.parametrize('field', _LIVE_FIELD_NAMES)
+    def test_every_local_field_name_is_one_the_imported_gate_recognises(self, field):
+        """The premise that makes the cheap prefilter SOUND.
+
+        The prefilter is only semantics-preserving while every name in
+        `_LIVE_FIELD_NAMES` is one `LIVE_TASK_STATUS_RE` also matches in
+        assignment form. A later edit adding a field here without a matching
+        `task_filter` change would otherwise start silently DROPPING real
+        snapshots instead of merely counting them.
+        """
+        assert LIVE_TASK_STATUS_RE.search(f'{field}=x'), (
+            f'{field}= must be visible to the gate the prefilter delegates to'
+        )
+
+    def test_the_motivating_corpus_is_output_identical(self):
+        """Refactor equivalence: the optimization changes cost, never output."""
+        groups, disclosure = find_liveness_snapshot_recurrences(_liveness_corpus())
+
+        assert [(g['subject_task_id'], g['member_ids']) for g in groups] == [
+            ('94', ['1eef7df7', '6b245659']),
+            ('96', ['08aa0017', '1eef7df7']),
+        ]
+        assert disclosure == dict.fromkeys(_LIVENESS_DISCLOSURE_KEYS, 0)

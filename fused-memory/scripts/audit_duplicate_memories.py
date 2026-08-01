@@ -9,8 +9,8 @@ agents write the gotcha ad hoc without first ``search()``-ing Mem0 for
 existing coverage, so it recurs faster than any single consolidation pass
 absorbs it. This script is the automated backstop.
 
-Two detectors, both reported
-----------------------------
+Three detectors, all reported -- only two may DELETE
+----------------------------------------------------
 Candidate generation is dual-path; the transitive closure
 (``cluster_memories_by_pairs``) is shared, so the two can never disagree
 about what a cluster IS -- only about which pairs are candidates.
@@ -28,6 +28,30 @@ The ANN path is NOT a replacement -- swapping one detector for the other
 would lose signal, so the actioned plan clusters over the UNION and every
 emitted cluster records which path(s) found it (``found_by``,
 ``lexical_clustered``, ``ann_max_score``, ``lexical_max_ratio``).
+
+  - LIVENESS-SNAPSHOT RECURRENCE: point-in-time liveness observations that
+    re-assert one identical core FACT about the same task, grouped by
+    ``(category, subject_task_id, core_fact)``. Keyed on EXACT equality of
+    that fact, not on similarity -- there is no threshold to tune. It is
+    REPORT-ONLY: its groups feed neither ``delete_candidates`` nor
+    ``apply_delete_candidates`` and are never handed to the apply gate, so
+    ``--apply`` can never act on them.
+
+Why a third class rather than a lower threshold: measured on the four
+solar_challenge records that motivated it (tasks 94/96, Stage-1 finding
+724e7be4, run e149def2), the pairwise lexical ratios between the three
+liveness snapshots are 0.117-0.233 against a 0.85 threshold. The repeated
+core status fact is a single clause; the unique investigative payload
+(file/symlink checks, git-HEAD/reflog analysis, per-cycle grep/glob results)
+is several times longer and swamps every similarity metric. No cutoff those
+records could reach is settable without flooding the corpus with false
+clusters -- and under ``--apply`` a false cluster is an irreversible delete.
+This is not near-duplicate CONTENT; it is one FACT re-asserted at different
+timestamps, a different equivalence relation needing its own detector.
+
+Ownership seam: task 3098 authorizes DETECTION of this pattern only. The
+disposition of the specific existing solar_challenge entries is a separate
+human-gated decision on solar_challenge task 99.
 
 The ANN cutoff is READ, never invented
 --------------------------------------
@@ -47,7 +71,11 @@ The ANN path can lose candidates where a full scan cannot, so each loss is a
 metric rather than invisible recall: ``top_k_saturated``,
 ``below_threshold_dropped``, ``unknown_neighbor_dropped``, ``missing_vector``,
 ``cross_category_dropped``, ``unswept_category_dropped``, ``ann_query_errors``,
-per-category ``scan_truncated``, and ``ann_disabled_uncalibrated``.
+per-category ``scan_truncated``, and ``ann_disabled_uncalibrated``. The
+liveness path adds ``liveness_snapshot_untasked`` (a recognised snapshot that
+resolves to no subject task, so no group can hold it) and
+``liveness_snapshot_unfielded`` (point-in-time framing whose live fields could
+not be read).
 
 Only chain-free evidence may DELETE
 -----------------------------------
@@ -71,9 +99,13 @@ Artifacts: one M1 metric series per run at
 ``<--metrics-root>/<eval_id>/metrics-<STAMP>.json`` (default root
 ``fused-memory/data/memory-evals/``, eval_id ``e6-corpus-health``), with a
 human-readable ``report-<STAMP>.txt`` and a ``details-<STAMP>.json`` carrying
-the cluster-size histogram, per-topic accretion table and per-event
-consolidation table. Schema lives in ``shared.memory_eval_metrics`` and is
-never restated here. Suppress with ``--no-metrics``.
+the cluster-size histogram, per-topic accretion table, per-event
+consolidation table and per-group liveness-recurrence table. Schema lives in
+``shared.memory_eval_metrics`` and is never restated here. The stdout plan
+additionally carries ``liveness_snapshot_recurrence_groups``,
+``liveness_snapshot_recurrence_clusters`` and ``liveness_snapshot_disclosure``
+alongside the pre-existing keys, which keep their exact meaning and shape.
+Suppress the artifacts with ``--no-metrics``.
 
 ORDERING NOTE -- scheduling and gate-filing belong to task 3136, not here.
 This script is a detector with a stable CLI and a stable stdout contract;
@@ -105,6 +137,9 @@ Safety carve-outs:
     (see "Only chain-free evidence may DELETE" above).
   - A cluster whose members all share one ``metadata.topic`` is task 3136's
     Option-C carve-out: an expected shape, never a delete candidate.
+  - Liveness-snapshot recurrence groups are report-only BY CONSTRUCTION --
+    they are never added to the delete lists, rather than filtered out of
+    them downstream where a later refactor could drop the filter.
   - Missing/unextractable content degrades to ``''``, which never clusters
     and is never deleted.
 
@@ -128,11 +163,18 @@ import asyncio
 import difflib
 import json
 import logging
+import re
 import sys
 from collections.abc import Iterable, Iterator
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from fused_memory.reconciliation.task_filter import (
+    LIVE_TASK_STATUS_RE,
+    POINT_IN_TIME_CHECK_RE,
+    TASK_REF_RE,
+)
 
 logger = logging.getLogger('audit_duplicate_memories')
 
@@ -319,6 +361,212 @@ def _lexical_pairs_scored(
                 yield (i, j, ratio)
 
 
+# The live task-table fields a liveness snapshot reports, enumerated ONCE and
+# deliberately the SAME four `task_filter.LIVE_TASK_STATUS_RE` gates on, so
+# "what counts as a live field" keeps one definition shared with the gate that
+# forces these observations into their durable point-in-time form.
+#
+# That alignment is now LOAD-BEARING, not merely tidy: both call sites below
+# prefilter on `LIVE_TASK_STATUS_RE`, which is only semantics-preserving while
+# every name here is one the imported gate also recognises in assignment form.
+# Adding a field here without the matching `task_filter` change would silently
+# start DROPPING real snapshots rather than counting them — the parametrized
+# premise guard in `TestLivenessDetectorRegexBudget` exists to catch exactly
+# that edit.
+_LIVE_FIELD_NAMES: tuple[str, ...] = (
+    'status',
+    'claimant_run_id',
+    'heartbeat_at',
+    'pid',
+)
+
+# ``<field> = <value>``, as EITHER a fully-quoted value or a bare token — never
+# a half-read mixture of the two.
+#
+# The quoted branch is deliberately all-or-nothing. An earlier single-branch
+# form (``"?([A-Za-z0-9_./:+-]+)"?``) let the value class terminate INSIDE a
+# quoted string, so `status="in progress"` silently truncated to the key
+# `status=in` — a key that groups with nothing real, would group with any other
+# value truncating to the same prefix, and fires NEITHER disclosure counter.
+# That is exactly the invisible recall loss the disclosure design in this file
+# exists to prevent. Requiring the closing quote makes a value that cannot be
+# read whole fail to match at all, so it falls through to the counted
+# ``liveness_snapshot_unfielded`` branch instead of becoming a bad key.
+#
+# `|` is excluded from the quoted branch because it is the key's own pair
+# delimiter: admitting it would let one value forge two pairs. Such a value
+# also reads as unfielded rather than silently corrupting the key.
+#
+# The bare branch's class stops at the punctuation these observations wrap
+# their fields in, so `null,` and `null)` read as `null` rather than carrying
+# the delimiter into the key; the characters it does admit (`-`, `.`, `/`,
+# `:`, `+`) are the ones real values need — `in-progress`, a path, an ISO
+# timestamp.
+_LIVE_FIELD_ASSIGNMENT_RE = re.compile(
+    r'\b(' + '|'.join(_LIVE_FIELD_NAMES) + r')\s*=\s*'
+    r'(?:"([^"|\n]+)"|([A-Za-z0-9_./:+-]+))',
+    re.IGNORECASE,
+)
+
+
+def _classify_liveness_snapshot(content: str) -> tuple[bool, str | None]:
+    """The ONE liveness-snapshot classifier. Both call sites route through here.
+
+    Deliberately single-copy. The extractor below and
+    ``find_liveness_snapshot_recurrences`` need the same two gates but consume
+    different parts of the verdict, and an earlier shape had each re-apply the
+    gates itself — so the extractor's tests could keep passing while the
+    shipped detector diverged. One function means those tests exercise the
+    code production actually runs.
+
+    Args:
+        content: Raw memory content. Never None — callers coalesce.
+
+    Returns:
+        ``(framed, core_fact)``:
+
+        * ``(False, None)`` — not a liveness snapshot, and not a loss either:
+          the content never entered this detector's scope.
+        * ``(True, None)`` — point-in-time framing over a live-status marker
+          whose fields could not be read whole. THE counted
+          ``liveness_snapshot_unfielded`` loss; the caller owns that counter,
+          so this function stays a pure classifier.
+        * ``(True, key)`` — a snapshot, with its canonical key.
+
+        ``POINT_IN_TIME_CHECK_RE`` is consulted AT MOST ONCE per call, and not
+        at all when the cheap prefilter rejects — the budget
+        ``TestLivenessDetectorRegexBudget`` pins.
+    """
+    # Cheap gate FIRST. ``POINT_IN_TIME_CHECK_RE``'s two ``(?=.*...)``
+    # lookaheads under ``re.DOTALL`` make it quadratic in content length —
+    # measured 2.2 ms at 424 chars rising to 794 ms at 4240 on NON-matching
+    # input, versus 0.015-0.35 ms for the lookahead-free
+    # ``LIVE_TASK_STATUS_RE`` — and a non-match is the overwhelmingly common
+    # case: this detector always runs, with no flag to disable it, over a
+    # default 5000-records-per-category scan of mostly ordinary prose.
+    # The gate is SOUND because ``_LIVE_FIELD_ASSIGNMENT_RE`` is
+    # ``LIVE_TASK_STATUS_RE``'s first alternative plus extra obligations, so
+    # an assignment hit implies a live-status hit: a record failing this check
+    # could never have yielded a key anyway. A record it rejects reports
+    # ``framed=False`` even if the point-in-time framing would have matched —
+    # which is the intended contract, since such a record is out of scope
+    # rather than a loss.
+    if not LIVE_TASK_STATUS_RE.search(content):
+        return False, None
+    if not POINT_IN_TIME_CHECK_RE.search(content):
+        return False, None
+
+    pairs: set[str] = set()
+    for field, quoted, bare in _LIVE_FIELD_ASSIGNMENT_RE.findall(content):
+        # Exactly one branch ever participates; `' '.join(split())` normalises
+        # the whitespace a quoted value may now legitimately carry (and is a
+        # no-op on a bare token).
+        cleaned = ' '.join((quoted or bare).split()).rstrip('./:+-').lower()
+        if cleaned:
+            pairs.add(f'{field.lower()}={cleaned}')
+    if not pairs:
+        return True, None
+    return True, '|'.join(sorted(pairs))
+
+
+def extract_liveness_snapshot_fact(record: dict) -> str | None:
+    """Canonical key for the core FACT a point-in-time liveness snapshot asserts.
+
+    A third equivalence relation, alongside the lexical and ANN paths: not
+    "reads alike" but "asserts the same live fields". Two snapshots taken days
+    apart share one clause verbatim and differ everywhere else, so no
+    similarity threshold reachable by them could be set without flooding the
+    corpus with false clusters — and under ``--apply`` a false cluster is an
+    irreversible delete. Keying on an exact repeated fact instead introduces
+    no tunable at all.
+
+    A thin projection of ``_classify_liveness_snapshot`` — the shared
+    classifier ``find_liveness_snapshot_recurrences`` also runs — so this
+    public entry point cannot drift from the shipped detector.
+
+    Classification requires BOTH markers:
+
+    * ``POINT_IN_TIME_CHECK_RE`` — the timestamped "liveness check performed
+      <date>" framing. Requiring it is not incidental: gate 2628
+      (``task_filter.frames_live_task_status_as_current_fact``) BLOCKS the
+      bare current-fact framing in the four gated categories, so every
+      liveness observation written since it landed necessarily carries this
+      framing. Requiring it therefore costs no recall on the corpus this
+      detector sweeps.
+    * At least one extractable ``<live_field>=<value>`` assignment. A
+      ``LIVE_TASK_STATUS_RE`` paraphrase ("actively driven by") names no
+      readable fields, so there is no fact to key on.
+
+    What the framing requirement does NOT do is exclude every non-liveness
+    use of ``status=``. ``POINT_IN_TIME_CHECK_RE``'s cheapest alternative is a
+    bare ``as of <digit>``, which ordinary prose satisfies routinely, so a
+    config note like "As of 2026-07-24 the dispatcher config has
+    status=enabled for task 12" DOES classify here (pinned by
+    ``test_as_of_prose_with_an_incidental_assignment_still_classifies``). The
+    gate is a recall-preserving filter, not a precision guarantee. Over-firing
+    is bounded by construction rather than by the pattern: this class is
+    report-only, and a subject needs >= 2 records sharing an IDENTICAL key
+    before anything is emitted, so an incidental hit falls out as a singleton.
+
+    Returns:
+        The canonical key — distinct ``field=value`` pairs, values lowercased
+        with the delimiter and any trailing punctuation stripped, sorted (by
+        field name, then value) and joined on ``|`` — or None when *record* is
+        not a point-in-time liveness snapshot. Compared by EXACT string
+        equality downstream: a snapshot reporting a different status produces
+        a different key and never groups with this one.
+    """
+    return _classify_liveness_snapshot(record.get('content') or '')[1]
+
+
+def liveness_snapshot_subject_task_ids(record: dict) -> set[str]:
+    """Which task(s) a liveness snapshot is ABOUT, as a set of ``str`` ids.
+
+    The union of three sources, not ``metadata.task_id`` alone, despite the
+    pattern reading as "repeated snapshots of the same task". Measured against
+    the live corpus: memory 1eef7df7 is filed under ``task_id='99'`` while its
+    content re-verifies tasks 94 AND 96 (it carries
+    ``related_task_ids=['94', '96']``). Under a strict ``metadata.task_id``
+    grouping the buckets are 94={6b245659}, 96={08aa0017}, 99={1eef7df7} —
+    every one a singleton, leaving the detector inert on the exact corpus that
+    motivated it.
+
+    Risk posture: a content ref can over-attribute an incidental mention. That
+    is acceptable ONLY because this class is report-only and a subject needs
+    >= 2 records sharing an IDENTICAL core fact before anything is emitted, so
+    an over-attributed single mention falls out as a singleton. Over-firing
+    costs a reviewer one glance, never data.
+
+    Every id is coerced to ``str`` and blanks are dropped — the project-wide
+    convention ``memory_service._normalize_task_id_metadata`` enforces at every
+    write boundary, so an int ``94`` and the string ``'94'`` are one subject
+    rather than two. A ``related_task_ids`` that is not a collection degrades
+    without raising: a scalar contributes itself, anything else contributes
+    nothing. Does not mutate *record*.
+    """
+    metadata = record.get('metadata') or {}
+    subjects: set[str] = set()
+
+    def _add(value: Any) -> None:
+        text = str(value).strip() if value is not None else ''
+        if text:
+            subjects.add(text)
+
+    _add(metadata.get('task_id'))
+
+    related = metadata.get('related_task_ids')
+    if isinstance(related, list | tuple | set):
+        for item in related:
+            _add(item)
+    elif isinstance(related, str | int):
+        _add(related)
+
+    for ref in TASK_REF_RE.findall(record.get('content') or ''):
+        _add(ref)
+
+    return subjects
+
+
 # The three Mem0-backed categories, enumerated ONCE. Graphiti-backed
 # categories (entities_and_relations, temporal_facts, decisions_and_rationale)
 # are deliberately absent: this detector reads the Mem0/Qdrant collection, and
@@ -341,6 +589,152 @@ _ANN_DISCLOSURE_KEYS: tuple[str, ...] = (
     'unknown_neighbor_dropped',
     'missing_vector',
 )
+
+
+# Every way the liveness-recurrence path can lose a candidate, enumerated ONCE.
+# Kept as a THIRD sibling of _ANN_DISCLOSURE_KEYS / _PLAN_DISCLOSURE_KEYS
+# rather than folded into either, so each generator's disclosure contract stays
+# its own. Same contract as its siblings: every key always present, always an
+# int, always zero-filled on a clean run.
+_LIVENESS_DISCLOSURE_KEYS: tuple[str, ...] = (
+    'liveness_snapshot_untasked',
+    'liveness_snapshot_unfielded',
+)
+
+
+def find_liveness_snapshot_recurrences(
+    memories: list[dict],
+    *,
+    categories: Iterable[str] = _ALL_CATEGORIES,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Group point-in-time liveness snapshots that re-assert one core FACT.
+
+    The third candidate class, and the only one that is REPORT-ONLY: its
+    groups never reach ``delete_candidates``. Task 3098 authorizes DETECTION
+    of this pattern, not disposition of the records that exhibit it.
+
+    Buckets by ``(category, subject_task_id, core_fact)`` and emits every
+    bucket with >= 2 members — the same >= 2 rule ``cluster_memories_by_pairs``
+    already applies, so "what counts as a group" does not acquire a second
+    meaning. Grouping is PER CATEGORY for the same reason ``build_sweep_plan``
+    clusters per category: a preference and an observation that happen to
+    report the same live fields are different kinds of knowledge, and unioning
+    them would be cross-store conflation rather than deduplication.
+
+    A record contributes to one bucket per subject it names, so a
+    re-verification covering two tasks joins both their groups — which is
+    exactly how memory 1eef7df7 links to the earlier 94 and 96 snapshots.
+
+    KNOWN LIMITATION, deliberate: the core fact is built ONCE PER RECORD by
+    unioning every assignment in its content, then attributed to every subject
+    that record names. When a multi-task re-verification reports DIVERGENT
+    values per task, that merged key matches neither single-task snapshot and
+    the recurrence goes unreported — pinned, so the behaviour is visible
+    rather than discovered later, by
+    ``test_divergent_per_task_statuses_do_not_group``. The real motivating
+    record (1eef7df7) reports identical values for both its subjects, so the
+    detector fires on the corpus that motivated it; a future divergent one
+    would be a RECALL gap in a report-only path, never a wrong delete.
+
+    Per-subject key scoping was tried and rejected on evidence, not taste.
+    Splitting content into per-task clauses with
+    ``task_filter._CLAUSE_SPLIT_RE`` and keying each subject on its own clause
+    (the technique ``task_filter.find_conflicting_task_status_ids`` uses)
+    yields the EMPTY SET on all four real records: ``_CLAUSE_SPLIT_RE`` splits
+    on ``.``, which shatters ``dark-factory-orchestrator.yaml`` and
+    ``CLAUDE.md:95`` mid-sentence, and the nearby reference is written
+    ``task/94``, which ``TASK_REF_RE``'s ``\\s*#?\\s*`` separator does not
+    match. Adopting it would trade a bounded, pinned recall gap for a detector
+    inert on its own motivating corpus.
+
+    Args:
+        memories: Raw memory list (any/all categories).
+        categories: Categories to sweep. Records outside the set are ignored
+            entirely — they were never in scope, so they are not a loss.
+
+    Returns:
+        ``(groups, disclosure)``. Each group carries ``subject_task_id``,
+        ``category``, ``core_fact``, ``member_ids`` (sorted by ``str`` id),
+        ``snapshot_count``, ``first_seen``/``last_seen`` (the min/max member
+        ``created_at``) and ``span_days``. Timestamps go through
+        ``_parsed_timestamp``/``_created_at_sort_key`` so "what counts as a
+        usable timestamp" keeps the one definition it shares with
+        ``pick_survivor``; a group whose members ALL lack a parseable
+        timestamp reports None for all three rather than fabricating a span.
+        Groups are sorted by ``(category, subject_task_id, first member id)``
+        so two identical runs serialise byte-identically. Does not mutate
+        *memories* or its dicts.
+
+        *disclosure* carries every ``_LIVENESS_DISCLOSURE_KEYS`` counter —
+        ``liveness_snapshot_untasked`` (a recognised snapshot that resolves to
+        no subject, so no bucket can hold it) and
+        ``liveness_snapshot_unfielded`` (point-in-time framing over a
+        ``LIVE_TASK_STATUS_RE`` marker whose fields could not be read — a
+        paraphrase naming no fields, or a value ``_LIVE_FIELD_ASSIGNMENT_RE``
+        declines to read half-way, such as an unterminated quote).
+        Both are always present, always ints, always 0 on a clean run.
+    """
+    swept = set(categories)
+    disclosure = dict.fromkeys(_LIVENESS_DISCLOSURE_KEYS, 0)
+    buckets: dict[tuple[str, str, str], list[dict]] = {}
+
+    for record in memories:
+        category = record.get('category')
+        if category not in swept:
+            continue
+        # THE classifier — the same call `extract_liveness_snapshot_fact`
+        # makes, so the two can never diverge, and one consult of the
+        # quadratic `POINT_IN_TIME_CHECK_RE` per record at most.
+        framed, core_fact = _classify_liveness_snapshot(record.get('content') or '')
+        if core_fact is None:
+            # "Not a snapshot at all" and "a snapshot whose fields could not be
+            # read" are different outcomes, and only the second is a loss. The
+            # discrimination lives HERE rather than inside the classifier,
+            # which stays pure; `framed` is precisely the distinction.
+            if framed:
+                disclosure['liveness_snapshot_unfielded'] += 1
+            continue
+        subjects = liveness_snapshot_subject_task_ids(record)
+        if not subjects:
+            # A recognised snapshot no bucket can hold: real recall, counted
+            # rather than invisible.
+            disclosure['liveness_snapshot_untasked'] += 1
+        for subject in subjects:
+            buckets.setdefault((category, subject, core_fact), []).append(record)
+
+    groups: list[dict[str, Any]] = []
+    for (category, subject, core_fact), members in buckets.items():
+        if len(members) < 2:
+            continue
+        # (epoch seconds, the raw created_at it came from), parsed ONCE per
+        # member. Members whose timestamp does not parse are absent, so an
+        # all-unparseable group leaves the span undefined rather than 0.0.
+        stamped = [
+            (ts, m.get('created_at'))
+            for m in members
+            if (ts := _parsed_timestamp(m.get('created_at'))) is not None
+        ]
+        first_seen = last_seen = span_days = None
+        if stamped:
+            stamped.sort(key=lambda pair: pair[0])
+            first_seen = stamped[0][1]
+            last_seen = stamped[-1][1]
+            span_days = (stamped[-1][0] - stamped[0][0]) / _SECONDS_PER_DAY
+        groups.append({
+            'subject_task_id': subject,
+            'category': category,
+            'core_fact': core_fact,
+            'member_ids': sorted((m.get('id') for m in members), key=str),
+            'snapshot_count': len(members),
+            'first_seen': first_seen,
+            'last_seen': last_seen,
+            'span_days': span_days,
+        })
+
+    groups.sort(key=lambda g: (
+        str(g['category']), g['subject_task_id'], str(g['member_ids'][0]),
+    ))
+    return groups, disclosure
 
 
 def ann_pairs_from_neighbors(
@@ -861,6 +1255,16 @@ def build_sweep_plan(
         ``restrict_delete_candidates_for_apply``) and ``path_verdicts``
         (``lexical_only_clusters`` / ``ann_only_clusters`` /
         ``both_paths_clusters``).
+
+        It also carries ``liveness_snapshot_recurrence_groups`` /
+        ``liveness_snapshot_recurrence_clusters`` /
+        ``liveness_snapshot_disclosure`` (see
+        ``find_liveness_snapshot_recurrences``). That class is REPORT-ONLY: it
+        never contributes to ``delete_candidates`` or
+        ``apply_delete_candidates``, and its groups are never handed to the
+        apply gate — it is surfaced for human review and consolidation only.
+        Task 3098 authorizes detection of the pattern, not disposition of the
+        records that exhibit it.
     """
     near_duplicate_groups: list[dict[str, Any]] = []
     # Mem0/Qdrant point ids can be int or str (ExtendedPointId), so this is
@@ -994,6 +1398,17 @@ def build_sweep_plan(
             })
             delete_candidates.extend(loser_ids)
 
+    # The THIRD candidate class, run ONCE over the whole list rather than
+    # inside the per-category loop above: it does its own
+    # (category, subject, core_fact) bucketing, so the per-category isolation
+    # comes from the key. Running it inside the loop would be O(n x
+    # categories) and would multiply its disclosure counters by the number of
+    # categories — the same double-counting reason _count_ann_pair_drops is
+    # called once, outside.
+    liveness_groups, liveness_disclosure = find_liveness_snapshot_recurrences(
+        memories, categories=categories,
+    )
+
     apply_candidates, apply_withheld = restrict_delete_candidates_for_apply(
         near_duplicate_groups,
     )
@@ -1013,6 +1428,9 @@ def build_sweep_plan(
         'ann_disclosure': echoed_disclosure,
         'topic_carveout_clusters': len(topic_carveout_groups),
         'topic_carveout_groups': topic_carveout_groups,
+        'liveness_snapshot_recurrence_clusters': len(liveness_groups),
+        'liveness_snapshot_recurrence_groups': liveness_groups,
+        'liveness_snapshot_disclosure': liveness_disclosure,
         'apply_delete_candidates': apply_candidates,
         'apply_withheld_clusters': len(apply_withheld),
         'apply_withheld_groups': apply_withheld,
@@ -1049,6 +1467,7 @@ _DETAILED_METRICS: tuple[str, ...] = (
     'cluster_size_mean',
     'topic_accretion_rate_mean',
     'consolidation_net_delta',
+    'liveness_snapshot_recurrences',
 )
 
 
@@ -1072,10 +1491,15 @@ def split_plan_by_category(
     nothing".
     """
     slices: dict[str, dict[str, list[dict]]] = {
-        category: {'near_duplicate_groups': [], 'topic_carveout_groups': []}
+        category: {
+            'near_duplicate_groups': [],
+            'topic_carveout_groups': [],
+            'liveness_snapshot_recurrence_groups': [],
+        }
         for category in categories
     }
-    for key in ('near_duplicate_groups', 'topic_carveout_groups'):
+    for key in ('near_duplicate_groups', 'topic_carveout_groups',
+                'liveness_snapshot_recurrence_groups'):
         for group in plan.get(key) or []:
             slot = slices.get(group.get('category'))
             if slot is not None:
@@ -1252,7 +1676,8 @@ def compute_cluster_metrics(
         records_by_category: ``{category: [record, ...]}`` — the scanned
             corpus. Its per-category lengths are the metric denominators.
         plan_by_category: ``{category: {'near_duplicate_groups': [...],
-            'topic_carveout_groups': [...]}}`` (see
+            'topic_carveout_groups': [...],
+            'liveness_snapshot_recurrence_groups': [...]}}`` (see
             :func:`split_plan_by_category`).
         disclosures: ``{counter_name: int | {category: int}}``. An int is a
             run-global counter (emitted as ``<name>.all``); a mapping is
@@ -1286,6 +1711,7 @@ def compute_cluster_metrics(
         slice_ = plan_by_category.get(category) or {}
         groups = slice_.get('near_duplicate_groups') or []
         carveouts = slice_.get('topic_carveout_groups') or []
+        recurrences = slice_.get('liveness_snapshot_recurrence_groups') or []
         corpus_size = len(records)
 
         sizes = [len(g.get('member_ids') or ()) for g in groups]
@@ -1330,6 +1756,26 @@ def compute_cluster_metrics(
             metric_id=_metric_id('topic_carveout_clusters', category),
             kind='scalar', value=float(len(carveouts)), n=len(carveouts),
         ))
+        # A `count`/`higher_is_worse`, unlike the `scalar` used for the topic
+        # carve-out immediately above. M2's rule is that an ARMED kind is for
+        # a regression that is well-defined and directional: more carve-outs
+        # is the EXPECTED Option-C shape, so alarming on it would alarm on the
+        # feature working, whereas more liveness recurrence groups IS the
+        # indefinite accretion this detector exists to surface. Emitted for
+        # every swept category, empty ones included — an absent metric is
+        # indistinguishable from "not measured".
+        #
+        # Carries `details_path` like every other metric whose full shape
+        # lives in the companion file: the scalar says HOW MANY groups, but
+        # the per-group `subject_task_id`/`core_fact`/`member_ids` table
+        # written below is the one artifact that tells a human WHICH memories
+        # to consolidate. Without the pointer a consumer reading only the
+        # metric series cannot discover it.
+        metrics.append(Metric(
+            metric_id=_metric_id('liveness_snapshot_recurrences', category),
+            kind='count', value=float(len(recurrences)), n=corpus_size,
+            direction='higher_is_worse', details_path=details_path,
+        ))
         metrics.append(Metric(
             metric_id=_metric_id('topic_accretion_rate_mean', category),
             kind='scalar', value=(sum(rates) / len(rates)) if rates else 0.0,
@@ -1352,6 +1798,16 @@ def compute_cluster_metrics(
             'cluster_size_histogram': histogram,
             'topic_accretion': accretion,
             'consolidation_events': events,
+            'liveness_snapshot_recurrences': [
+                {
+                    'subject_task_id': g.get('subject_task_id'),
+                    'core_fact': g.get('core_fact'),
+                    'member_ids': g.get('member_ids'),
+                    'snapshot_count': g.get('snapshot_count'),
+                    'span_days': g.get('span_days'),
+                }
+                for g in recurrences
+            ],
             'undefined_metrics': undefined,
         }
 
@@ -1952,6 +2408,11 @@ async def _run(args: argparse.Namespace) -> int:
                 split_plan_by_category(plan, categories),
                 {
                     **disclosures,
+                    # Plain ints, so the existing branch emits them at
+                    # _GLOBAL_SCOPE (`<name>.all`) with no new emission path:
+                    # they are properties of ONE pass over the whole scanned
+                    # set, not of a category.
+                    **(plan['liveness_snapshot_disclosure'] or {}),
                     'scan_truncated': {
                         c: int(scan_stats.get(c, {}).get('truncated', 0))
                         for c in categories
