@@ -424,41 +424,17 @@ def test_run_scan_cli_prints_exactly_the_render_output(tmp_path, capsys):
 # ---------------------------------------------------------------------------
 # Shared test fixtures (scripts/tests/conftest.py).
 #
-# Self-checks for the three fixtures that replace helpers previously copied
-# across the three sweep-script test files: _TASKS_SCHEMA (3 copies), the
-# fake-db builder (3 copies under two names and two return types) and the
-# project-root toucher (2 copies). A fixture used by ~30 tests deserves its
-# own direct coverage — otherwise a bug in it surfaces as a confusing failure
-# somewhere downstream rather than here.
+# Self-checks for the two fixtures that replace helpers previously copied
+# across the three sweep-script test files: the fake-db builder (3 copies
+# under two names and two return types) and the project-root toucher (2
+# copies). A fixture used by ~30 tests deserves its own direct coverage —
+# otherwise a bug in it surfaces as a confusing failure somewhere downstream
+# rather than here.
+#
+# The DDL itself (`_TASKS_SCHEMA`, private to conftest.py) gets no separate
+# test: `make_tasks_db` executes it on every use, so a dropped column fails
+# loudly at INSERT time in ~30 places already.
 # ---------------------------------------------------------------------------
-
-_SCANNER_COLUMNS = (
-    "tag", "id", "title", "description", "details",
-    "test_strategy", "status", "metadata", "updated_at",
-)
-
-
-def test_tasks_table_schema_is_the_union_of_all_three_files_columns(tasks_table_schema):
-    """The schema is the SUPERSET, not the intersection.
-
-    audit_wiped_metadata_files' copy adds `priority TEXT`; the two scanners'
-    copies do not have it. A superset is inert for the scanners (neither
-    inserts nor selects priority, and scan_db uses an explicit column list)
-    while being required by audit — so one shared schema can serve all three
-    without either file losing a column it depends on.
-    """
-    for column in _SCANNER_COLUMNS:
-        assert column in tasks_table_schema, column
-    assert "priority" in tasks_table_schema
-    # It must be executable DDL, not just a string that mentions the names.
-    conn = sqlite3.connect(":memory:")
-    try:
-        conn.executescript(tasks_table_schema)
-        cols = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
-    finally:
-        conn.close()
-    assert cols == set(_SCANNER_COLUMNS) | {"priority"}
-
 
 def test_make_tasks_db_roundtrips_rows_through_a_plain_sqlite_read(make_tasks_db):
     db_path = make_tasks_db([

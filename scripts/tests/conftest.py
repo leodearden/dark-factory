@@ -13,9 +13,9 @@ modules do. Without this, scripts/ on sys.path alone only makes
 scripts/legibility/ importable as a namespace package (`import legibility`),
 not its contents as bare top-level names.
 
-Also home to the shared tasks.db test fixtures (`tasks_table_schema`,
-`make_tasks_db`, `project_root_with_tasks_db`). Each previously existed as
-three near-identical private copies across the sweep-script test files, under
+Also home to the shared tasks.db test fixtures (`make_tasks_db`,
+`project_root_with_tasks_db`). Each previously existed as three
+near-identical private copies across the sweep-script test files, under
 two different names and with two different return types (task 3336). They are
 real pytest fixtures rather than importable helpers because fixtures
 auto-resolve for every file in this directory, whereas a `from conftest import
@@ -60,6 +60,11 @@ def pytest_configure(config):
 # ---------------------------------------------------------------------------
 # Shared tasks.db fixtures (task 3336).
 #
+# _TASKS_SCHEMA mirrors fused-memory's sqlite_task_backend.py _SCHEMA_SQL so
+# tests exercise real column shapes and NOT NULL constraints rather than
+# invented ones. It stays private to `make_tasks_db`, which executes it on
+# every use — that is the executable check, so no test asserts on the literal.
+#
 # The schema is the SUPERSET of what the three sweep-script test files used
 # privately: audit_wiped_metadata_files' copy carries `priority TEXT`, the two
 # scanners' copies do not. A superset is inert for the scanners — neither
@@ -82,17 +87,6 @@ CREATE TABLE tasks (
     PRIMARY KEY (tag, id)
 );
 """
-
-
-@pytest.fixture
-def tasks_table_schema():
-    """The live tasks-table DDL (columns + NOT NULL constraints only).
-
-    Mirrors fused-memory's sqlite_task_backend.py _SCHEMA_SQL so tests
-    exercise real column shapes and NOT NULL constraints rather than invented
-    ones.
-    """
-    return _TASKS_SCHEMA
 
 
 @pytest.fixture

@@ -36,7 +36,7 @@ from scan_task_toolcall_leaks import (
 )
 
 # The tasks-table schema and the fake-db builder live in scripts/tests/
-# conftest.py as the `tasks_table_schema` / `make_tasks_db` fixtures (task
+# conftest.py, behind the `make_tasks_db` fixture (task
 # 3336) — they were previously copied near-identically into all three
 # sweep-script test files.
 
