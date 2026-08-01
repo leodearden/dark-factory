@@ -999,29 +999,54 @@ def build_train_callback_factory(
     main, only this member's declared deliverable is unverifiable — and
     raising would misclassify it and could bounce an otherwise-healthy train.
     Returning matches the shape the existing "member has no scheduler task"
-    guard already uses, so the loop's contract is unchanged. The un-flipped
-    member is then left for the 2794-guarded stranded sweep, which
-    re-evaluates it against the SAME shared helper and either stamps (now
-    delivered) or reverts to pending — a closed self-healing loop.
+    guard already uses, so the loop's contract is unchanged.
+
+    The withheld member is then REVERTED TO PENDING by
+    ``_revert_withheld_member`` and recovered by the scheduler's normal
+    dispatch. It is explicitly NOT left parked for the stranded sweep: a
+    member sits at ``'merge-deferred'`` here, which
+    :data:`_RECONCILE_SWEEP_STATUSES` excludes and
+    :meth:`Harness._reconcile_one_stranded` early-returns on, so the sweep
+    can never reach it — and :data:`_WARM_LANE_RECLAIM_PROTECTED_STATUSES`
+    contains that status too, so leaving it there would strand its warm lane
+    as well. The revert is safe precisely BECAUSE this seam fires after the
+    merge advanced main, so PRD § 9.8's "the worktree must survive for the
+    train-merge worker" rationale for the park has expired by this point.
+    Termination is guaranteed rather than assumed: a re-dispatched member
+    that re-implements and merges completes through
+    ``TaskWorkflow._finalise_merged_done``, which task 3057 design decision 2
+    deliberately leaves unguarded, so even a permanently-ERRORing check
+    descriptor cannot produce an infinite withhold/revert cycle.
     """
     from orchestrator.merge_queue import TrainCallbacks
 
-    async def _delivered_checks_withhold(mid: str, *, site: str) -> bool:
-        """True => do NOT stamp *mid* done at this seam.
+    async def _delivered_checks_withhold(
+        mid: str, *, site: str,
+    ) -> DeliveredChecksBlock | None:
+        """Non-``None`` => do NOT stamp *mid* done at this seam.
+
+        Returns the :class:`DeliveredChecksBlock` rather than a bool so the
+        caller's recovery log can name the REASON — an operator seeing a
+        member bounced back to pending needs to know whether a check FAILED
+        (the capability is genuinely absent) or the guard ERRORED (it could
+        not tell), because those call for very different responses.
 
         Fail-safe in ALL directions: unknown metadata or an errored guard
         withholds rather than stamps, and this never propagates an exception
         to the train-flip loop (see the factory docstring on
-        ``TRAIN_PARTIAL_FLIP``).
+        ``TRAIN_PARTIAL_FLIP``). Those fail-safe arms synthesise
+        ``reason='errored'`` — accurate for all three (they ARE errors), and
+        each already emits its own distinct WARNING naming the specific cause
+        just above, so no diagnostic detail is lost by the collapse.
         """
         if config is None:
-            return False
+            return None
         if git_ops is None:
             logger.debug(
                 'Train callbacks: git_ops unbound — delivered-checks guard '
                 'inert for member %s (%s)', mid, site,
             )
-            return False
+            return None
         try:
             member = await scheduler.get_task(mid)
         except Exception:
@@ -1029,13 +1054,13 @@ def build_train_callback_factory(
                 'Train callbacks: member %s metadata unreadable — withholding '
                 'the done flip (fail-safe)', mid, exc_info=True,
             )
-            return True
+            return DeliveredChecksBlock(reason='errored')
         if member is None:
             logger.warning(
                 'Train callbacks: member %s has no scheduler task — '
                 'withholding the done flip (fail-safe)', mid,
             )
-            return True
+            return DeliveredChecksBlock(reason='errored')
         try:
             return await gate_mark_done_on_delivered_checks(
                 mid,
@@ -1046,13 +1071,46 @@ def build_train_callback_factory(
                 enabled=config.delivered_checks.enabled,
                 site=site,
                 log=logger,
-            ) is not None
+            )
         except Exception:
             logger.warning(
                 'Train callbacks: delivered-checks guard errored for member '
                 '%s — withholding the done flip (fail-safe)', mid, exc_info=True,
             )
-            return True
+            return DeliveredChecksBlock(reason='errored')
+
+    async def _revert_withheld_member(
+        mid: str, *, train_id: str, site: str, reason: str,
+    ) -> None:
+        """Hand a withheld train member back to the scheduler (task 3057).
+
+        The member's ONLY recovery edge. Shared by both stamping closures so
+        the two seams cannot drift apart, and mirroring
+        ``TaskWorkflow._revert_withheld_member`` so the four train seams
+        across both modules stay one behaviour.
+
+        NEVER raises: a failed recovery edge must not reach
+        ``_do_train_merge``'s post-advance flip loop as a false
+        ``TRAIN_PARTIAL_FLIP``. When the revert itself fails the member stays
+        merge-deferred — no worse than before this edge existed — and that is
+        logged rather than escalated.
+        """
+        try:
+            await scheduler.set_task_status(mid, 'pending')
+        except Exception:
+            logger.warning(
+                'train %s: member %s (%s) — delivered-checks withheld but the '
+                'revert to pending FAILED; member remains merge-deferred and '
+                'will need operator attention',
+                train_id, mid, site, exc_info=True,
+            )
+            return
+        logger.warning(
+            'train %s: member %s (%s) — delivered_checks not verifiably on '
+            'main (%s); NOT stamping done, reverted to pending for '
+            're-dispatch (LandedRow retained for the reconciler)',
+            train_id, mid, site, reason,
+        )
 
     def factory(train_id: str) -> TrainCallbacks:
         async def status_check(ids: list[str]) -> dict[str, str]:
@@ -1122,13 +1180,14 @@ def build_train_callback_factory(
             # without check work) and structurally IMMEDIATELY before the
             # stamp, so the mark_done / consume / lane-release trio below stays
             # on the fall-through and cannot drift behind an upstream boolean.
-            # RETURNS rather than raises — see the factory docstring.
-            if await _delivered_checks_withhold(mid, site='train-member-merged'):
-                logger.warning(
-                    'train %s: member %s — delivered_checks not verifiably on '
-                    'main; NOT flipping to done (LandedRow retained for the '
-                    'reconciler; member left for the stranded sweep)',
-                    train_id, mid,
+            # RETURNS rather than raises — see the factory docstring — and
+            # reverts the member to pending, which is its ONLY recovery edge
+            # (the stranded sweep provably cannot reach a merge-deferred task).
+            block = await _delivered_checks_withhold(mid, site='train-member-merged')
+            if block is not None:
+                await _revert_withheld_member(
+                    mid, train_id=train_id, site='train-member-merged',
+                    reason=block.reason,
                 )
                 return
             await scheduler.mark_done(mid, kind='merged', sha=sha, note=f'train {train_id}')
@@ -1168,19 +1227,18 @@ def build_train_callback_factory(
                 # mark_member_done above (see the factory docstring): the
                 # partner's landing brought SOMETHING of this branch to main,
                 # never a proof that this member's declared capability is in
-                # it. Withhold by RETURNING; the member is then picked up by
-                # the 2794-guarded stranded sweep. NOT applied to the else
-                # (not-on-main -> pending re-drive) branch, which stamps
-                # nothing.
-                if await _delivered_checks_withhold(
+                # it. Withhold by RETURNING and revert the member to pending —
+                # the same recovery edge the else (not-on-main) arm below
+                # already takes, and the member's only one. NOT applied to
+                # that else branch, which stamps nothing.
+                block = await _delivered_checks_withhold(
                     mid, site='coalesce-derail-found-on-main',
-                ):
-                    logger.warning(
-                        'train %s: member %s — coalesce-derail re-drive found '
-                        'the branch on main but delivered_checks are not '
-                        'verifiably present; NOT stamping found_on_main '
-                        '(LandedRow retained; left for the stranded sweep)',
-                        train_id, mid,
+                )
+                if block is not None:
+                    await _revert_withheld_member(
+                        mid, train_id=train_id,
+                        site='coalesce-derail-found-on-main',
+                        reason=block.reason,
                     )
                     return
                 # Double-landing guard: a partner's merge already brought this

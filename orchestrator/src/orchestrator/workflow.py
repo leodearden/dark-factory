@@ -1613,17 +1613,18 @@ class TaskWorkflow:
             # TRAIN_PARTIAL_FLIP, and this is NOT a partial flip — the merge
             # genuinely advanced main; only this member's declared deliverable
             # is unverifiable.  The write-ahead LandedRow is deliberately NOT
-            # consumed (it is the only record of the crash-window intent), the
-            # member's status is left untouched, and the un-flipped member
-            # self-heals through the 2794-guarded stranded sweep.
-            if await self._member_delivered_checks_withhold(
+            # consumed (it is the only record of the crash-window intent), and
+            # the member is REVERTED TO PENDING — its only recovery edge, since
+            # the stranded sweep provably cannot reach a merge-deferred task
+            # (see _revert_withheld_member).
+            block = await self._member_delivered_checks_withhold(
                 mid, site='workflow-train-member-merged',
-            ):
-                logger.warning(
-                    'Task %s: train %r member %s — delivered_checks not '
-                    'verifiably on main; NOT flipping to done (LandedRow '
-                    'retained for the reconciler)',
-                    self.task_id, train_id, mid,
+            )
+            if block is not None:
+                await self._revert_withheld_member(
+                    mid, train_id=train_id,
+                    site='workflow-train-member-merged',
+                    reason=block.reason,
                 )
                 return
             await self.scheduler.mark_done(
@@ -10691,10 +10692,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
           ``continue``\\ s — never raises — WITHOUT appending to ``landed_ids``
           and WITHOUT emitting ``train_merged``, so it is never REPORTED as
           attributed.  Its write-ahead ``LandedRow`` stays unconsumed (the only
-          record of the crash-window intent) and its status is left untouched,
-          so the 2794-guarded stranded sweep re-evaluates it — the withholding
-          closes a self-healing loop rather than opening a new one.  The
-          decision is per-member: a blocked member never aborts its siblings.
+          record of the crash-window intent) and the passer is REVERTED TO
+          PENDING via :meth:`_revert_withheld_member` for the scheduler to
+          re-dispatch — NOT left parked for the stranded sweep, which provably
+          cannot reach a ``'merge-deferred'`` task (see that method).  The
+          decision is per-member: a blocked member never aborts its siblings,
+          and neither does a failed revert.
         """
         # Sort members by their metadata train 'order' (root→tip) so that the
         # predecessor_ref computation is correct regardless of caller-side ordering.
@@ -10857,17 +10860,18 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 # whose capability is unverifiable is never REPORTED as
                 # attributed.  Per-member by construction: a blocked member
                 # never aborts its siblings' attribution.  The write-ahead
-                # LandedRow is left unconsumed and the member's status is left
-                # untouched, so the 2794-guarded stranded sweep re-evaluates it.
-                if await self._member_delivered_checks_withhold(
+                # LandedRow is left unconsumed, and the passer is REVERTED TO
+                # PENDING — its only recovery edge, since the stranded sweep
+                # provably cannot reach a merge-deferred task (see
+                # _revert_withheld_member).
+                block = await self._member_delivered_checks_withhold(
                     r.member_id, site='train-attribution-solo-passer',
-                ):
-                    logger.warning(
-                        'Task %s: train %r member %s passed solo and advanced '
-                        'main to %s, but delivered_checks are not verifiably '
-                        'on main — NOT flipping to done (left for the '
-                        'stranded sweep)',
-                        self.task_id, train_id, r.member_id, landed_sha,
+                )
+                if block is not None:
+                    await self._revert_withheld_member(
+                        r.member_id, train_id=train_id,
+                        site='train-attribution-solo-passer',
+                        reason=block.reason,
                     )
                     continue
                 await self.scheduler.mark_done(
@@ -12600,10 +12604,60 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             log=logger,
         )
 
+    async def _revert_withheld_member(
+        self, mid: str, *, train_id: str, site: str, reason: str,
+    ) -> None:
+        """Hand a withheld train member back to the scheduler (task 3057).
+
+        The withheld member's ONLY recovery edge, shared by the two workflow
+        seams that stamp OTHER members (the inline ``_mark_member_done``
+        closure and :meth:`_attribute_train_failure`'s solo-passer arm) so
+        they cannot drift apart, and mirroring
+        ``harness.build_train_callback_factory``'s identically-named inner
+        coroutine so all four train seams stay one behaviour.
+
+        A withheld member sits at ``'merge-deferred'``, which is unreachable
+        by every recovery path: the harness's stranded sweep excludes that
+        status (``_RECONCILE_SWEEP_STATUSES``) and ``_reconcile_one_stranded``
+        early-returns on it, the train already advanced main so the merge
+        worker will not re-drive it, and ``_WARM_LANE_RECLAIM_PROTECTED_STATUSES``
+        contains it so even the leaked warm lane cannot be reclaimed. The
+        revert is safe precisely BECAUSE this seam fires AFTER the merge
+        advanced main, so PRD § 9.8's "the worktree must survive for the
+        train-merge worker" rationale for the park has expired. Termination is
+        guaranteed rather than assumed: a re-dispatched member that
+        re-implements and merges completes through :meth:`_finalise_merged_done`,
+        which task 3057 design decision 2 deliberately leaves unguarded, so
+        even a permanently-ERRORing check descriptor cannot produce an
+        infinite withhold/revert cycle.
+
+        NEVER raises: a failed recovery edge must not reach the merge worker's
+        post-advance flip loop as a false ``TRAIN_PARTIAL_FLIP``, nor abort
+        the attribution loop before its remaining members. When the revert
+        itself fails the member stays merge-deferred — no worse than before
+        this edge existed — and that is logged rather than escalated.
+        """
+        try:
+            await self.scheduler.set_task_status(mid, 'pending')
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                'Task %s: train %r member %s (%s) — delivered-checks withheld '
+                'but the revert to pending FAILED; member remains '
+                'merge-deferred and will need operator attention',
+                self.task_id, train_id, mid, site, exc_info=True,
+            )
+            return
+        logger.warning(
+            'Task %s: train %r member %s (%s) — delivered_checks not '
+            'verifiably on main (%s); NOT stamping done, reverted to pending '
+            'for re-dispatch (LandedRow retained for the reconciler)',
+            self.task_id, train_id, mid, site, reason,
+        )
+
     async def _member_delivered_checks_withhold(
         self, mid: str, *, site: str,
-    ) -> bool:
-        """``True`` => do NOT stamp train member *mid* done here (task 3057).
+    ) -> DeliveredChecksBlock | None:
+        """Non-``None`` => do NOT stamp train member *mid* done here (task 3057).
 
         The shared binding for the two workflow seams that stamp OTHER
         members' rows (the inline ``_mark_member_done`` closure and
@@ -12618,13 +12672,22 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         :func:`~orchestrator.delivered_checks.gate_mark_done_on_delivered_checks`
         with zero I/O beyond that read).
 
+        Returns the :class:`DeliveredChecksBlock` rather than a bool so the
+        caller's recovery log can name the REASON — an operator seeing a
+        member bounced back to pending needs to know whether a check FAILED
+        (the capability is genuinely absent) or the guard ERRORED (it could
+        not tell), because those call for very different responses.
+
         Fail-safe in ALL directions, and it NEVER propagates an exception to
         the caller: an unreadable member row, an absent member, or an errored
         guard all WITHHOLD. Stamping done on unknown metadata is the exact
         failure this task exists to close, and a raise escaping a train-flip
         callback would be misread by the merge worker's post-advance loop as a
         ``TRAIN_PARTIAL_FLIP`` — a capability check must never be ABLE to
-        fabricate one.
+        fabricate one. Those fail-safe arms synthesise ``reason='errored'`` —
+        accurate for all three (they ARE errors), and each already emits its
+        own distinct WARNING naming the specific cause, so no diagnostic
+        detail is lost by the collapse.
         """
         try:
             member = await self.scheduler.get_task(mid)
@@ -12634,25 +12697,25 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 'delivered-checks guard (%s) — withholding the done-stamp',
                 self.task_id, mid, site, exc_info=True,
             )
-            return True
+            return DeliveredChecksBlock(reason='errored')
         if member is None:
             logger.warning(
                 'Task %s: member %s has no scheduler task row (%s) — '
                 'withholding the done-stamp',
                 self.task_id, mid, site,
             )
-            return True
+            return DeliveredChecksBlock(reason='errored')
         try:
             return await self._delivered_checks_block(
                 mid, (member.get('metadata') or {}), site=site,
-            ) is not None
+            )
         except Exception:  # noqa: BLE001
             logger.warning(
                 'Task %s: delivered-checks guard errored for member %s (%s) '
                 '— withholding the done-stamp',
                 self.task_id, mid, site, exc_info=True,
             )
-            return True
+            return DeliveredChecksBlock(reason='errored')
 
     async def _finalise_recovery_done(
         self, *, basis: str, sha: str, kind: str, note: str,

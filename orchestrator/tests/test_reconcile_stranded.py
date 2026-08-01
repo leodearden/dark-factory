@@ -4020,7 +4020,7 @@ class TestWithheldTrainMemberHasRecoveryEdge:
             return_value=({branch: sched.status}, None),
         )
 
-        admitted = await harness._warm_lane_reclaim_candidates({branch})
+        admitted = await harness._warm_lane_reclaim_candidates([branch])
 
         assert admitted == {branch}, (
             f'status {sched.status!r} must un-leak the lane, got {admitted!r}'
