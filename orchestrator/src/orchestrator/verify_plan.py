@@ -467,15 +467,35 @@ def _derive_module_runs(
     (``'lint:'``/``'pyright:'``/``'pytest:'``) so a caller can recover tool
     identity even for a SKIPPED slot, whose ``cmd`` is ``None``.
 
-    *role* (λ, task 2589, R3) is the task-role pytest floor's policy fork:
-    when the pytest branch would otherwise fall through to the "no
-    collectable test files touched" SKIPPED (a source-only or
-    structural-only diff — no conftest, no test-data, no collectable test),
-    ``role == 'task'`` runs the owning module's full ``test_command`` instead
-    — a source-only diff at task verify pre-λ produced ZERO pytest signal.
-    ``role == 'merge'`` keeps the legacy SKIPPED shape (R4): the broad merge
-    gate is a separate, knob-gated widening (see
-    ``_derive_full_suite_runs``/``merge_verify_breadth``), not this floor.
+    *role* (λ, task 2589, R3; widened by task 3294) is the task-role pytest
+    floor's policy fork. At ``role == 'task'``, ANY touched SOURCE/STRUCTURAL
+    file under the prefix runs the owning module's full ``test_command`` —
+    whether or not collectable test files were touched in the same diff.
+    Only a test-tree-ONLY diff keeps FILE_SCOPED selection (R3's
+    "touched-test-only diffs keep file-scoped selection"). ``role ==
+    'merge'`` is unchanged in every cell (R4): it keeps the legacy
+    FILE_SCOPED/SKIPPED shape, because the broad merge gate is a separate,
+    knob-gated widening (see ``_derive_full_suite_runs``/
+    ``merge_verify_breadth``), not this floor.
+
+    WHY the floor sits ABOVE the collectable-test branch (task 3294):
+    coverage must be MONOTONE in the diff. λ placed it below, so it only
+    fired when the module's touched files contained no collectable test at
+    all — a source-only diff paid the owning module's full suite, but that
+    same diff plus a test file narrowed to just that test file. Adding a test
+    REMOVED coverage. Task 3033 is the incident: its diff touched
+    ``workflow.py`` plus tests, the plan file-scoped to 36 items instead of
+    the module's ~13188, and a regression in
+    ``test_workflow_resume_on_progress.py`` — a DIFFERENT consumer of
+    ``workflow.py`` — was structurally invisible and reached a debugger.
+
+    The predicate covers SOURCE ∪ STRUCTURAL, never SOURCE alone, because
+    :func:`classify_file` returns STRUCTURAL for a Protocol/TypedDict-defining
+    production file only when content is read — and content is read only when
+    ``mc.type_check_command`` is set (see the ``need_structural`` guard
+    above). ``workflow.py`` is exactly such a file. A SOURCE-only predicate
+    would therefore make pytest breadth silently depend on whether a module
+    happens to configure a type checker.
     """
     prefix = mc.prefix + '/'
     scoped = [f for f in existing_files if f.startswith(prefix) and f.endswith('.py')]
@@ -496,8 +516,8 @@ def _derive_module_runs(
     collectable_tests = [f for f, k in kinds.items() if k is FileKind.COLLECTABLE_TEST]
     # Task 3294: SOURCE ∪ STRUCTURAL, never SOURCE alone — see the *role*
     # paragraph in this function's docstring for why the union is load-bearing.
-    production_touched = any(
-        k in (FileKind.SOURCE, FileKind.STRUCTURAL) for k in kinds.values()
+    production_trigger = next(
+        (f for f, k in kinds.items() if k in (FileKind.SOURCE, FileKind.STRUCTURAL)), None,
     )
 
     runs: list[PlannedRun] = []
@@ -557,13 +577,25 @@ def _derive_module_runs(
                 mc.prefix, test_cmd, ScopeKind.FULL_SUITE,
                 f'pytest: test-data module touched ({test_data_trigger}) — full suite required',
             ))
-        elif role == 'task' and production_touched:
+        elif role == 'task' and production_trigger is not None:
             test_cmd = parse_config_command(mc.test_command)
-            runs.append(PlannedRun(
-                mc.prefix, test_cmd, ScopeKind.FULL_SUITE,
-                'pytest: source-only diff — owning-module full suite (task role); '
-                'sibling modules NOT run',
-            ))
+            # The reason is the operator-facing record of WHY this widened.
+            # A mixed diff (production + co-committed tests) must not be
+            # described as "source-only" — and must say that the touched
+            # tests did NOT narrow it, or the widened run reads as a scoper
+            # bug rather than the deliberate task-3294 policy.
+            if collectable_tests:
+                reason = (
+                    f'pytest: production module touched ({production_trigger}) — '
+                    'owning-module full suite (task role); co-committed test file(s) '
+                    'do NOT narrow it; sibling modules NOT run'
+                )
+            else:
+                reason = (
+                    'pytest: source-only diff — owning-module full suite (task role); '
+                    'sibling modules NOT run'
+                )
+            runs.append(PlannedRun(mc.prefix, test_cmd, ScopeKind.FULL_SUITE, reason))
         elif collectable_tests:
             test_cmd = _scope_prefix_to_keyword(mc.test_command, 'pytest', collectable_tests)
             runs.append(PlannedRun(
