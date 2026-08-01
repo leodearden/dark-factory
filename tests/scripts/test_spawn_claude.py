@@ -1082,10 +1082,27 @@ def _load_scaled_grace(base_secs: int, *, cap_secs: int = 30) -> int:
     return max(base_secs, min(cap_secs, math.ceil(base_secs * factor)))
 
 
-# _NOT_FLAGGED_GRACE_BASE_SECS is deliberately the CURRENT value (2) here --
-# this is a pure, behaviour-preserving refactor. Task 3451 step-4 raises it
-# to 8 once the RED test for the achievability floor is in place.
-_NOT_FLAGGED_GRACE_BASE_SECS = 2
+# _NOT_FLAGGED_GRACE_BASE_SECS: raised from 2 to 8 (task 3451). Derived, not
+# tuned -- on this host (nproc 32, /proc/loadavg 212 => load-per-core 6.6),
+# n=3 runs of the normal fast spawn shape (delay=0, grace=2, foreground
+# xterm, fake claude exiting 0) took 2.13s / 3.10s / 4.71s wall. The old 2s
+# pin sat BELOW that entire observed range -- the complete explanation of
+# the flake. 8 > 4.71 gives 1.7x margin from the floor alone, before load
+# scaling multiplies on top: at that same load the full policy yields
+# min(60, ceil(8 * 6.6)) = 53s, ~11x the worst measured happy path.
+#
+# The larger grace is free: measured wall-clock is NOT proportional to
+# grace (grace=2 -> 2.13-4.71s vs grace=90 (unpinned) -> 2.54-7.28s,
+# overlapping ranges) because _cleanup (skills/spawn/spawn-claude.sh:107)
+# kills the backgrounded watchdog at parent exit, so the grace is only an
+# upper bound the watchdog polls to, never a wait the happy path pays.
+#
+# cap_secs=60 (below, unchanged from step-2) is above _load_scaled_grace's
+# own default cap of 30 -- which already binds at load-per-core 6.6, since
+# ceil(8*6.6)=53 -- while staying strictly below the 90s production default
+# (skills/spawn/spawn-claude.sh:89), so this pin never tests an unreachable
+# configuration.
+_NOT_FLAGGED_GRACE_BASE_SECS = 8
 
 
 def _set_started_grace(env: dict[str, str]) -> int:
