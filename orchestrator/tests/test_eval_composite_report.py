@@ -1550,6 +1550,112 @@ class TestBothSurfacesReportTheSamePlanRate:
         assert row['plan_rate'] is None
 
 
+class TestCostPerUsablePlan:
+    """``cost_per_plan`` — what a config charges per plan you can actually USE.
+
+    The asymmetry IS the column: the numerator keeps the spend of cells that
+    produced NOTHING, the denominator counts only the cells that produced
+    something. A no-plan cell burns real budget and returns nothing
+    (``plans/eval-architect-effort-verdict-2026-07-27.md`` measured $0.5–$3
+    against a real plan's ~$3.7), so a cheap-but-unreliable candidate's
+    per-fixture cost advantage is partly ILLUSORY — the doc's own arithmetic put
+    fable at $3.456/fixture but $4.731 per usable plan, i.e. no cheaper than the
+    opus-max incumbent while failing to plan 5x as often. Netting the failed
+    attempts out of the numerator would report exactly the illusion this column
+    exists to remove.
+    """
+
+    @staticmethod
+    def _three_at_30c_one_planless():
+        return [
+            _arch('p1', 'arch-mixed', 1, plan_steps=0, plan_quality=0.9,
+                  cost_usd=0.30, duration_ms=60000),
+            _arch('p1', 'arch-mixed', 2, plan_steps=6, plan_quality=0.6,
+                  cost_usd=0.30, duration_ms=60000),
+            _arch('p1', 'arch-mixed', 3, plan_steps=6, plan_quality=0.6,
+                  cost_usd=0.30, duration_ms=60000),
+        ]
+
+    def test_the_failed_attempts_spend_stays_in_the_numerator(self):
+        from orchestrator.evals.report import build_composite_report
+
+        row = build_composite_report(self._three_at_30c_one_planless())['configs'][0]
+
+        # Hand-computed: (0.30 * 3 admitted) / 2 that planned. You paid for the
+        # failed attempt; that is the entire content of "$ per USABLE plan".
+        assert row['cost_per_plan'] == pytest.approx(0.45, abs=1e-9)
+
+    def test_it_exceeds_the_plain_cost_mean_whenever_a_cell_failed_to_plan(self):
+        """The illusory-cheapness signal, stated as a relation.
+
+        Reading ``cost_usd`` alone, this config looks like a $0.30 candidate.
+        Two thirds of the time that is what a plan costs; the other third bought
+        nothing, and the gap between the two cells is what an operator comparing
+        candidates needs to see.
+        """
+        from orchestrator.evals.report import build_composite_report
+
+        row = build_composite_report(self._three_at_30c_one_planless())['configs'][0]
+
+        assert row['cost_usd'] == pytest.approx(0.30, abs=1e-9)
+        assert row['cost_per_plan'] > row['cost_usd']
+
+    def test_a_cap_tainted_cell_contributes_to_NEITHER_side(self):
+        """One admission decision sources both numerator and denominator.
+
+        A refused cell's recorded $0.00 is the price of a run that never
+        happened, not a measurement — the same reason ``_is_unmeasurable`` keeps
+        it out of the ``cost`` pool. Letting it into the numerator would DILUTE
+        $/plan with a free run, reporting the cap window as a discount.
+        """
+        from orchestrator.evals.report import build_composite_report
+
+        results = [
+            _arch('p1', 'arch-both', 1, plan_steps=0, plan_quality=None,
+                  cost_usd=0.0, duration_ms=0, cap_tainted=True),
+            _arch('p1', 'arch-both', 2, plan_steps=0, plan_quality=0.9,
+                  cost_usd=0.30, duration_ms=60000),
+            _arch('p1', 'arch-both', 3, plan_steps=6, plan_quality=0.6,
+                  cost_usd=0.30, duration_ms=60000),
+        ]
+        row = build_composite_report(results)['configs'][0]
+
+        # (0.30 + 0.30) / 1 planned — NOT (0.00 + 0.30 + 0.30) / 1.
+        assert row['cost_per_plan'] == pytest.approx(0.60, abs=1e-9)
+
+    def test_a_config_that_never_planned_reports_None_not_zero(self):
+        """"We got no plan at any price" must not render as "plans were free".
+
+        Nor may it raise: a config that failed to plan on every cell is a real
+        campaign outcome, and it is the one whose row an operator most needs.
+        """
+        from orchestrator.evals.report import build_composite_report
+
+        results = [
+            _arch('p1', 'arch-planless', tr, plan_steps=0, plan_quality=0.9,
+                  cost_usd=0.30, duration_ms=60000)
+            for tr in (1, 2, 3)
+        ]
+        row = build_composite_report(results)['configs'][0]
+
+        assert row['plan_quality_n'] == 3
+        assert row['plan_rate'] == pytest.approx(0.0, abs=1e-9)
+        assert row['cost_per_plan'] is None
+
+    def test_a_workflow_config_reports_None(self):
+        """No plan-only cell at all → no $/plan, rather than a fabricated 0.0."""
+        from orchestrator.evals.report import build_composite_report
+
+        results = [
+            _mresult('w1', 'impl-only', tr, quality=0.8, cost_usd=5.0,
+                     duration_ms=900000)
+            for tr in (1, 2, 3)
+        ]
+        row = build_composite_report(results)['configs'][0]
+
+        assert row['cost_per_plan'] is None
+
+
 class TestTheDiscardedJudgeScoreIsLoggedNotSwallowed:
     """The floor DISCARDS a persisted LLM-judge score — loudly, or not at all.
 
