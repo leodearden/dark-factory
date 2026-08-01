@@ -1812,11 +1812,14 @@ class TestValidateUvFallback:
 
         def _stub(argv, **kwargs):
             captured_argv.extend(argv)
-            return 'null'
+            # Leading/trailing whitespace, as uv's own stdout may include —
+            # pins the `.strip()` handling alongside the null-sentinel
+            # mapping this test already checks.
+            return ' null\n'
 
         _force_uv_fallback(monkeypatch, _stub)
 
-        _validate(
+        result = _validate(
             task_kind='deterministic',
             metadata={
                 'task_kind': 'deterministic',
@@ -1826,6 +1829,7 @@ class TestValidateUvFallback:
             project_root=str(tmp_path),
         )
 
+        assert result is None, f'null sentinel must map to None, got: {result!r}'
         assert '--project' in captured_argv, (
             f'Expected --project in argv, got: {captured_argv!r}'
         )
@@ -1866,12 +1870,21 @@ class TestValidateUvFallback:
     ) -> None:
         """A mis-wired repo root (no fused-memory/ subdir) must fail loudly.
 
-        A wrong --project path must never be laundered into a skip by
-        whatever uv happens to report. Simulates a regressed _REPO_ROOT by
-        pointing it at an empty tmp_path, and stubs subprocess.check_output
-        to raise what real uv reports against a nonexistent --project dir.
+        Pins the pre-flight ``is_dir()`` guard in ``_validate``: a wrong
+        ``--project`` path must never be laundered into a skip (or anything
+        else) by whatever uv happens to report, because the guard must
+        reject it *before* uv is ever spawned. Simulates a regressed
+        ``_REPO_ROOT`` by pointing it at an empty ``tmp_path``. The stub
+        would raise what real uv reports against a nonexistent --project
+        dir if it were ever called — the `not calls` assertion below pins
+        that it is not, i.e. that the guard actually short-circuits rather
+        than merely happening to produce the same failure via the
+        subprocess path.
         """
+        calls: list[list[str]] = []
+
         def _stub(argv, **kwargs):
+            calls.append(list(argv))
             raise subprocess.CalledProcessError(
                 2, argv, output='', stderr='error: No `pyproject.toml` found'
             )
@@ -1890,6 +1903,9 @@ class TestValidateUvFallback:
                 project_root=str(tmp_path),
             )
 
+        assert not calls, (
+            f'guard must short-circuit before spawning uv, got calls: {calls!r}'
+        )
         assert not isinstance(excinfo.value, pytest.skip.Exception)
         assert str(tmp_path / 'fused-memory') in str(excinfo.value), (
             f'Expected the missing project dir in the failure message, got: '
@@ -1925,8 +1941,8 @@ class TestValidateUvFallback:
 
         message = str(excinfo.value)
         assert 'uv' in message, f'Expected the skip message to mention uv, got: {message!r}'
-        assert 'available' in message, (
-            f'Expected the skip message to mention availability, got: {message!r}'
+        assert 'No such file or directory' in message, (
+            f'Expected the propagated OSError detail in the skip message, got: {message!r}'
         )
 
     def test_uv_subprocess_failure_fails_loudly(
