@@ -323,13 +323,15 @@ class TestEscalationAnalyticsRoute:
         analytics = body['ESCALATION_ANALYTICS']
         assert set(analytics) == {
             'generated_at', 'parse_failures', 'regime_markers', 'per_project',
-            # Whether the scan reached every configured archive at all — the
-            # route's cacheability signal, and the only field that can tell an
-            # absent archive from an empty one.
-            'archives_present',
+            # The two archive-reach signals, and the only fields that can tell
+            # an absent archive from an empty one: ``archives_present`` (all)
+            # is the completeness diagnostic, ``archives_reached`` (any) is the
+            # route's cacheability predicate.
+            'archives_present', 'archives_reached',
         }
         assert isinstance(analytics['generated_at'], str) and analytics['generated_at']
         assert analytics['archives_present'] is True
+        assert analytics['archives_reached'] is True
         assert analytics['parse_failures'] == 0
         assert isinstance(analytics['regime_markers'], list)
         assert len(analytics['per_project']) == 1
@@ -396,6 +398,7 @@ def _analytics_payload(**overrides):
         'regime_markers': [],
         'per_project': [],
         'archives_present': True,
+        'archives_reached': True,
     }
     payload.update(overrides)
     return payload
