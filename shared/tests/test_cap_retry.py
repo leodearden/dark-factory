@@ -793,6 +793,75 @@ class TestCapRetryTranscriptReachability:
         assert second.kwargs.get('prompt') == CAP_HIT_RESUME_PROMPT
         rebuild.assert_not_awaited()
 
+    async def test_log_states_reason_resumed_transcript_present(self, tmp_path, caplog):
+        """The cap-hit line must say WHY it resumed, not just 'resuming'."""
+        gate = _mock_gate(
+            account_count=2,
+            before_invoke=AsyncMock(side_effect=['tok-a', 'tok-b']),
+            detect_cap_hit=MagicMock(side_effect=[True, False]),
+            active_account_name='acct-b',
+        )
+        config_dir = TaskConfigDir('3454-reason-present', base_dir=tmp_path)
+        _write_transcript(config_dir.path, 'sess-42')
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock,
+                  side_effect=[make_result(session_id='sess-42'), make_result()]),
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            caplog.at_level(logging.WARNING, logger='shared.cli_invoke'),
+        ):
+            await invoke_with_cap_retry(
+                gate, 'lbl', config_dir=config_dir, prompt='do stuff',
+            )
+        assert any('transcript present' in r.message for r in caplog.records), (
+            'cap-hit log must name the reason it resumed, so a lost-context '
+            f'incident is diagnosable from logs alone. Got: {caplog.text!r}'
+        )
+
+    async def test_log_states_reason_fresh_no_session_id(self, caplog):
+        """Fresh because there was no session_id at all -> say so."""
+        gate = _mock_gate(
+            account_count=2,
+            before_invoke=AsyncMock(side_effect=['tok-a', 'tok-b']),
+            detect_cap_hit=MagicMock(side_effect=[True, False]),
+            active_account_name='acct-b',
+        )
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock,
+                  side_effect=[make_result(session_id=''), make_result()]),
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            caplog.at_level(logging.WARNING, logger='shared.cli_invoke'),
+        ):
+            await invoke_with_cap_retry(gate, 'lbl', prompt='do stuff')
+        assert any('no session_id' in r.message for r in caplog.records), (
+            f'Got: {caplog.text!r}'
+        )
+
+    async def test_log_states_reason_fresh_transcript_unreachable(self, tmp_path, caplog):
+        """Fresh because the guard vetoed an unreachable session -> say so.
+
+        This is the case an operator most needs to distinguish: context WAS
+        dropped, unlike the no-session_id case where there was none to keep.
+        """
+        gate = _mock_gate(
+            account_count=2,
+            before_invoke=AsyncMock(side_effect=['tok-a', 'tok-b']),
+            detect_cap_hit=MagicMock(side_effect=[True, False]),
+            active_account_name='acct-b',
+        )
+        config_dir = TaskConfigDir('3454-reason-unreachable', base_dir=tmp_path)
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock,
+                  side_effect=[make_result(session_id='sess-42'), make_result()]),
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+            caplog.at_level(logging.WARNING, logger='shared.cli_invoke'),
+        ):
+            await invoke_with_cap_retry(
+                gate, 'lbl', config_dir=config_dir, prompt='do stuff',
+            )
+        assert any('transcript unreachable' in r.message for r in caplog.records), (
+            f'Got: {caplog.text!r}'
+        )
+
     async def test_no_config_dir_resumes_unconditionally(self):
         """Regression pin: config_dir=None -> resume as today.
 
