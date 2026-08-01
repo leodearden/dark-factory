@@ -1082,6 +1082,31 @@ def _load_scaled_grace(base_secs: int, *, cap_secs: int = 30) -> int:
     return max(base_secs, min(cap_secs, math.ceil(base_secs * factor)))
 
 
+# _NOT_FLAGGED_GRACE_BASE_SECS is deliberately the CURRENT value (2) here --
+# this is a pure, behaviour-preserving refactor. Task 3451 step-4 raises it
+# to 8 once the RED test for the achievability floor is in place.
+_NOT_FLAGGED_GRACE_BASE_SECS = 2
+
+
+def _set_started_grace(env: dict[str, str]) -> int:
+    """Compute and write the load-adaptive started-grace for tests that
+    assert the failed-to-start flag must NOT fire.
+
+    Delegates entirely to _load_scaled_grace so such tests inherit the
+    load-adaptive policy by default instead of each hand-picking a fixed
+    number (the third recurrence of a started-grace flake in this file:
+    task 2367 bumped 1s/2s -> 3s/8s, task 2733 added _load_scaled_grace, and
+    2733 missed this site). Writing the env var is part of the contract, not
+    a side effect a caller must remember to do -- it is what makes the
+    policy deterministically unit-testable (assert the returned int and the
+    string that landed in env) without a source-grepping meta-test to prove
+    call sites were rewired.
+    """
+    grace = _load_scaled_grace(_NOT_FLAGGED_GRACE_BASE_SECS, cap_secs=60)
+    env["SPAWN_STARTED_GRACE_SECS"] = str(grace)
+    return grace
+
+
 def test_load_scaled_grace_idle_host_returns_base_unchanged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
