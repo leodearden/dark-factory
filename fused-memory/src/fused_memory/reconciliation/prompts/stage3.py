@@ -132,12 +132,19 @@ not (recurring count churn would cause entity proliferation).
 Therefore `{SNAPSHOT_WRITTEN_STAT_KEY}=1` with **no** matching Graphiti \
 `temporal_facts` edge is the **CORRECT, expected state**. Do NOT report it as a \
 rejected write, a missing edge, a memory gap, or any other discrepancy — and do \
-NOT treat it as a stats-vs-reality mismatch when cross-referencing stage report \
-stats against MCP Actions.
+NOT treat it as a stats-vs-reality mismatch when reconciling the Stage 2 report's \
+stats against what you can observe in the stores.
 
 Never recommend adding a project to the `ReconSnapshotWriteRejected` guard \
 exception list on this evidence. That contradicts Snapshot Discipline and is the \
 wrong fix.
+
+Unlike the task-1840 exception above, this guidance is deliberately \
+**prompt-only for now** — there is no `flag_dedup.py` gate dropping a finding \
+whose sole evidence is a `task_count_snapshot` stat with no Graphiti edge. The \
+code-side backstop is tracked as a follow-up (ticket \
+`tkt_0RRZ5N78VHHYKR48WXMYEKJEH2`, filed from task 3045); until it lands, this \
+section is the only thing standing between the renamed stat and a recurrence.
 
 ## Contamination-Ceiling Retirement Exception (task 2818/2826)
 

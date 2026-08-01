@@ -87,6 +87,15 @@ docstring for why the harness's miss-streak recomputation depends on it).
 write-only observability with no reader anywhere in the tree (not in
 ``_COMPUTED_STAT_KEYS``, not in ``journal.get_stats()``, no ``.get(...)``
 call site), so an alias for it would be dead code.
+
+RETIREMENT — tracked as ticket ``tkt_0RRZ5NT1FH3001CPGTHW5NAV57`` (filed
+from task 3045). Nothing in this module can observe when the alias stops
+being load-bearing, and it is deliberately kept that way: this module is
+pure and dependency-free, so it has no logger and no journal access. The
+follow-up carries the check (query the journal's ``stage_reports`` blobs
+for the pre-rename literal across every reconciled project) and the full
+deletion checklist, so a future reader can tell "still needed" from "safe
+to delete" without re-deriving either.
 """
 
 SNAPSHOT_PRUNE_ENUMERATED_STAT_KEY: str = 'task_count_snapshot_prune_enumerated'
@@ -205,7 +214,8 @@ def extract_snapshot_written(stage_report: object) -> bool | None:
     first, and :data:`LEGACY_SNAPSHOT_WRITTEN_STAT_KEY` is consulted ONLY
     when the new key is ABSENT — not merely falsy. A legitimate ``0`` under
     the new key is a CONFIRMED miss and must never be re-read from the
-    legacy key, hence the absence sentinel rather than a truthiness check.
+    legacy key, hence the ``in stats`` membership test rather than a
+    truthiness check or a ``.get(...) or ...`` chain.
 
     The fallback exists because ``harness._maybe_escalate_stale_task_count_snapshot``
     recomputes its consecutive-miss streak from ``journal.get_recent_runs``
@@ -231,9 +241,9 @@ def extract_snapshot_written(stage_report: object) -> bool | None:
         stats = stage_report.get('stats') or {}
     else:
         stats = getattr(stage_report, 'stats', None) or {}
-    _ABSENT = object()
-    value = stats.get(SNAPSHOT_WRITTEN_STAT_KEY, _ABSENT)
-    if value is _ABSENT:
+    if SNAPSHOT_WRITTEN_STAT_KEY in stats:
+        value = stats[SNAPSHOT_WRITTEN_STAT_KEY]
+    else:
         value = stats.get(LEGACY_SNAPSHOT_WRITTEN_STAT_KEY)
     if value == 1:
         return True
