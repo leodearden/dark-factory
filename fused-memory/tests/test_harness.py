@@ -8350,8 +8350,25 @@ class TestHarnessDrainIdleShortCircuit:
 
         harness = _make_test_harness(journal, event_buffer, mock_memory_service)
 
-        # Stub side-effect dependencies so the loop body runs without network calls
-        harness._recover_stale_runs = AsyncMock(return_value=None)
+        # Stub side-effect dependencies so the loop body runs without network calls.
+        # _recover_stale_runs doubles as the iteration witness: the sync side_effect
+        # counts ticks and sets `ticked` at the same literal 3 the guard below
+        # asserts, then returns DEFAULT so the configured return_value=None is
+        # preserved (the _drive_halt_notify pattern). See the guard's REFACTOR NOTE
+        # below for why this call is a reliable per-iteration proxy.
+        ticked = asyncio.Event()
+        stale_ticks = 0
+
+        def _count_stale_tick(*_args, **_kwargs):
+            nonlocal stale_ticks
+            stale_ticks += 1
+            if stale_ticks >= 3:
+                ticked.set()
+            return DEFAULT  # preserve the configured return_value
+
+        harness._recover_stale_runs = AsyncMock(
+            return_value=None, side_effect=_count_stale_tick
+        )
         harness._start_escalation_server = AsyncMock()
         harness._stop_escalation_server = AsyncMock()
         harness.buffer.get_active_projects = AsyncMock(return_value=[])
