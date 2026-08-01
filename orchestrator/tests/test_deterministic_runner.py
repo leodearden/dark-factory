@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -344,6 +345,65 @@ _CHILD_SRC_ROOTS = (
 )
 
 
+def _child_env() -> dict[str, str]:
+    """os.environ plus the repo src roots prepended to PYTHONPATH.
+
+    One definition, shared by `_run_wrapper_payload` and
+    `_assert_submit_cli_invokable`, so the preflight probes a child
+    environment identical to the one the wrapper actually runs in.  The
+    injected roots take precedence; any inherited PYTHONPATH is appended
+    rather than dropped.  See `_run_wrapper_payload` for why the injection is
+    needed at all.
+    """
+    env = {**os.environ}
+    inherited = env.get('PYTHONPATH')
+    env['PYTHONPATH'] = os.pathsep.join(
+        [*(str(p) for p in _CHILD_SRC_ROOTS), *([inherited] if inherited else [])]
+    )
+    return env
+
+
+def _assert_submit_cli_invokable(python_exe: str) -> None:
+    """Fail loudly, and specifically, if *python_exe* cannot run the submit CLI.
+
+    The probe argv is taken from ``EscalationSpec.to_submit_argv``
+    (proc_supervision.py:117-133) — the very function the RP-4 wrapper's
+    on-failure branch uses — truncated to its interpreter/module prefix and
+    given ``--help``, so the preflight cannot drift from the real invocation.
+
+    Raises ``AssertionError`` naming the interpreter and quoting the child's
+    output.  Without this preflight a non-invokable CLI surfaces only as
+    "exactly one L2 must be filed on failure, got 0" — a message that
+    misdirects the reader at production filing logic (task 3404).
+    """
+    from orchestrator.proc_supervision import EscalationSpec
+
+    argv = EscalationSpec(
+        queue_dir='', task_id='0', summary='preflight',
+    ).to_submit_argv(python_exe)
+    # [python_exe, '-m', 'escalation', 'submit'] + '--help' — the option list
+    # is dropped so the probe stays side-effect-free (files nothing).
+    probe = [*argv[:4], '--help']
+
+    result = subprocess.run(
+        probe,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=_child_env(),
+    )
+    if result.returncode != 0:
+        raise AssertionError(
+            f'the escalation submit CLI is not invokable by {python_exe!r} '
+            f'(exit {result.returncode}): '
+            f'{result.stdout.decode(errors="replace").strip()!r}. '
+            f'The RP-4 wrapper files its on-failure L2 by exec-ing '
+            f'{" ".join(probe[:4])!r}, so this environment would file NOTHING '
+            f'while the wrapper still exits with the payload\'s own code. '
+            f'Remedy: this venv most likely lacks the `escalation` editable '
+            f'install — run `uv sync` at the repo root.'
+        )
+
+
 async def _run_wrapper_payload(wrapped: str) -> tuple[int, str]:
     """Execute a deferred RP-4 ``/bin/sh -c`` wrapper the way systemd would.
 
@@ -380,16 +440,11 @@ async def _run_wrapper_payload(wrapped: str) -> tuple[int, str]:
     /usr/bin/python3 + PYTHONPATH still fails), so a genuinely unsynced
     environment still fails, just loudly and specifically.
     """
-    env = {**os.environ}
-    inherited = env.get('PYTHONPATH')
-    env['PYTHONPATH'] = os.pathsep.join(
-        [*(str(p) for p in _CHILD_SRC_ROOTS), *([inherited] if inherited else [])]
-    )
     proc = await asyncio.create_subprocess_exec(
         '/bin/sh', '-c', wrapped,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
-        env=env,
+        env=_child_env(),
     )
     out, _ = await proc.communicate()
     return proc.returncode, out.decode(errors='replace')
