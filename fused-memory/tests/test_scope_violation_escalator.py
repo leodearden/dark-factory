@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import Any
 
 import pytest
 
@@ -983,7 +984,10 @@ class TestRoutingOverrideEscalation:
         with the wrong outcome — the task-3119 failure shape, now three-way.
         """
         esc = ScopeViolationEscalator()
-        common = dict(
+        # dict[str, Any]: a heterogeneous kwargs bundle unpacked into three
+        # differently-typed signatures — without the annotation pyright widens
+        # every value to the union and rejects each `**common` parameter.
+        common: dict[str, Any] = dict(
             project_root=str(tmp_path),
             project_id='reify',
             candidate_title='Human gate: consolidate tree-sitter cluster',
