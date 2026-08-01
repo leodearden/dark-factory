@@ -106,6 +106,17 @@ _TREND_RUN_CAP = 90
 # reject at emit time and are passed through verbatim here.
 _KNOWN_KINDS = frozenset({'tripwire', 'proportion', 'count', 'scalar'})
 
+# The closed M2 verdict vocabulary.  Like ``_KNOWN_KINDS`` this is a RENDERING
+# vocabulary — one badge per state — and NOT a translation table: the raw
+# ``verdict`` string is still passed through the payload unmapped, and this set
+# is consulted only to decide which parity badge the row earns.  A verdict
+# outside it has no badge, so it is named (``unknown_verdict``) rather than
+# folded into the healthy label.  Keeping the set closed is what makes the
+# pass-through sound: without it, the parity vocabulary would be unbounded and
+# the UI would have no single set to switch on — which is the whole reason
+# parity is derived here rather than re-derived in the frontend.
+_KNOWN_VERDICTS = frozenset({'alarm', 'no_alarm', 'insufficient_data', 'grandfathered'})
+
 # An eval whose newest run is older than this is DISPLAYED as stale.  It is
 # never alarmed on: the runner-failure tripwire belongs to the eval program,
 # and this module files nothing.  36h gives a nightly cadence one full missed
@@ -704,35 +715,73 @@ def _index_escalations(
     return index, unfingerprinted
 
 
-def _parity(verdict: Any, escalation: dict[str, Any] | None) -> str:
+def _verdict_class(verdict: Any) -> str:
+    """Bucket a raw verdict value into the closed rendering vocabulary.
+
+    Returns one of ``alarm``, ``no_alarm``, ``insufficient_data``,
+    ``grandfathered``, ``unjudged`` (the value was absent) or
+    ``unknown_verdict`` (the value is present but outside the M2 vocabulary,
+    including a value that is not a string at all).
+
+    ``isinstance`` FIRST, exactly as the metric-kind loop does: ``verdict`` is
+    an unvalidated JSON value, so an unhashable one (``[]``, ``{}``) would make
+    ``in _KNOWN_VERDICTS`` raise ``TypeError``.
+    """
+    if verdict is None:
+        return 'unjudged'
+    if isinstance(verdict, str) and verdict in _KNOWN_VERDICTS:
+        return verdict
+    return 'unknown_verdict'
+
+
+def _parity(verdict_class: str, escalation: dict[str, Any] | None) -> str:
     """The derived display state for one metric row.
 
-    A pure, TOTAL ``(verdict, linked?)`` lookup — not a statistic.  Deriving it
-    once here keeps the UI from re-deriving badge state out of three separate
-    fields, which is where the two sides would drift apart.
+    A pure, TOTAL ``(verdict class, linked?)`` lookup — not a statistic.
+    Deriving it once here keeps the UI from re-deriving badge state out of
+    three separate fields, which is where the two sides would drift apart.
+    The full closed output vocabulary is :data:`PARITY_STATES`.
 
-    An ABSENT verdict is its own state (``unjudged``), never folded into
-    ``clear``.  ``clear`` means "the evaluator judged this metric and found no
-    regression"; a metric nothing has judged is a materially different fact,
-    and lending it the healthy badge is the module's own stated failure mode —
-    fail toward "visibly unrenderable", never toward the healthy label.
+    Every verdict class gets its OWN pair of states rather than being collapsed
+    into ``recovered_open``/``clear``.  The collapsed mapping made three
+    distinct facts render as one:
 
-    Reachability of the linked variant, which is not obvious: the row-level
-    join only runs when the verdict ENTRY carries a fingerprint (see
-    ``_build_eval``), so a metric with NO entry at all can never be
-    ``unjudged_open``.  The linked variant is reached only by an entry that has
-    a ``fingerprint`` and no ``verdict`` field — which is exactly the case that
-    used to claim a recovery that never happened.  The function stays total
-    over both axes anyway, so no future call site can fall into an unhandled
-    corner.
+    * ``insufficient_data`` — the evaluator lacked the samples to judge at all.
+      With a live escalation that is not a recovery; nothing was shown to have
+      improved.
+    * ``grandfathered`` — a known-bad measurement the ratchet deliberately
+      exempts.  It is an outstanding exception, not a healthy metric.
+    * an ABSENT verdict — nothing judged this metric.  ``clear`` means "judged,
+      and not alarming", which is a materially stronger claim.
+
+    Lending any of them the healthy label is the module's own stated failure
+    mode: fail toward "visibly unrenderable", never toward the healthy label.
+
+    The naming asymmetry is deliberate and load-bearing.  For an ``alarm`` the
+    UNLINKED state is the notable one — a filed alarm with no escalation behind
+    it is the parity violation — so it is the one that gets the distinguishing
+    name (``alarmed_unlinked``).  For every other class the LINKED state is the
+    notable one, so that is the one carrying the ``_open`` suffix.
+
+    Every pre-existing name is preserved verbatim; the change is purely
+    additive for existing consumers.  ``recovered_open`` and ``clear`` are
+    NARROWED to the ``no_alarm`` verdict, which only makes them truer:
+    ``recovered_open`` now means an escalation filed on a prior alarm with the
+    metric reading ``no_alarm`` today, which IS a recovery.
+
+    Reachability of ``unjudged_open``, which is not obvious: the row-level join
+    only runs when the verdict ENTRY carries a fingerprint (see
+    ``_build_eval``), so a metric with NO entry at all can never link.  The
+    linked variant is reached only by an entry that has a ``fingerprint`` and
+    no ``verdict`` field — exactly the case that used to claim a recovery that
+    never happened.  The function stays total over both axes anyway, so no
+    future call site can fall into an unhandled corner.
     """
-    if verdict == 'alarm':
-        # For an alarm the UNLINKED state is the notable one: a filed alarm
-        # with no escalation behind it is the parity violation.
+    if verdict_class == 'alarm':
         return 'alarmed_open' if escalation else 'alarmed_unlinked'
-    if verdict is None:
-        return 'unjudged_open' if escalation else 'unjudged'
-    return 'recovered_open' if escalation else 'clear'
+    if verdict_class == 'no_alarm':
+        return 'recovered_open' if escalation else 'clear'
+    return f'{verdict_class}_open' if escalation else verdict_class
 
 
 def _build_eval(
@@ -949,6 +998,12 @@ def _build_eval(
                 storm_suppressed.add(fingerprint)
         escalation = _escalation_projection(matched) if matched is not None else None
 
+        # Classified ONCE and reused for both the parity badge and the
+        # unrenderable-value check below, so the membership rule lives in
+        # exactly one place.
+        verdict = judged.get('verdict')
+        verdict_class = _verdict_class(verdict)
+
         metrics.append({
             'metric_id': metric_id,
             'kind': kind,
@@ -974,8 +1029,8 @@ def _build_eval(
             'escalation': escalation,
             'parity': (
                 'storm_collapsed'
-                if storm is not None and judged.get('verdict') == 'alarm'
-                else _parity(judged.get('verdict'), escalation)
+                if storm is not None and verdict == 'alarm'
+                else _parity(verdict_class, escalation)
             ),
         })
 
