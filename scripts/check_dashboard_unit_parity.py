@@ -528,6 +528,105 @@ def compare_unit(
 
 
 # ---------------------------------------------------------------------------
+# The unit registry
+# ---------------------------------------------------------------------------
+
+# Every entry names WHY a key is on its list. Description= and After= are
+# deliberately absent from all three: they are cosmetic, they legitimately
+# differ (the installed timer's Description predates the incident rewrite),
+# and comparing them would spend the gate's credibility on nothing.
+#
+# Registry KEYS are curated; expected VALUES are not — they are read from the
+# committed unit at run time. See UnitSpec's docstring for why. The keys are
+# guarded against rot by the staleness tests in
+# tests/scripts/test_check_dashboard_unit_parity.py, which assert every key
+# listed here is genuinely declared in the committed unit; a key that is not
+# would compare absent-to-absent and check nothing, forever, while still
+# reporting green.
+UNITS: dict[str, UnitSpec] = {
+    "dark-factory-dashboard.service": UnitSpec(
+        name="dark-factory-dashboard.service",
+        repo_relpath="dashboard/dark-factory-dashboard.service",
+        compared=(
+            # Restart policy — the task's named minimum coverage. All
+            # host-invariant literals: an installed copy that drifted here
+            # would change availability behaviour with nothing reporting it.
+            ("Service", "Type"),
+            ("Service", "Restart"),
+            ("Service", "RestartSec"),
+            ("Service", "RestartMaxDelaySec"),
+            # 15 is sized against uvicorn's own 8s drain bound (see the unit's
+            # comment); a drifted value silently re-opens the SIGKILL window
+            # that produced the ~16s dead restarts.
+            ("Service", "TimeoutStopSec"),
+            # Without these, `journalctl --user -u dark-factory-dashboard`
+            # goes quiet — the failure is invisible rather than absent.
+            ("Service", "StandardOutput"),
+            ("Service", "StandardError"),
+            ("Install", "WantedBy"),
+        ),
+        present_only=(
+            # Both carry absolute host paths (/home/leo/.local/bin/uv, the
+            # repo root). Presence only; content reached via exec_start_flags.
+            ("Service", "ExecStart"),
+            ("Service", "WorkingDirectory"),
+        ),
+        environment_section="Service",
+        exec_start_flags=(
+            # The two flags task 3306 added. Comparing them is what makes
+            # "the unit change reached the running system" a checkable claim.
+            "timeout-graceful-shutdown",
+            "timeout-keep-alive",
+            # The bind address is a contract with the watchdog probe and the
+            # reverse proxy; a drifted port means a healthy dashboard nothing
+            # can reach.
+            "host",
+            "port",
+        ),
+    ),
+    "dark-factory-dashboard-watchdog.service": UnitSpec(
+        name="dark-factory-dashboard-watchdog.service",
+        repo_relpath="dashboard/dark-factory-dashboard-watchdog.service",
+        compared=(
+            # oneshot is load-bearing: every timer tick must be a FRESH
+            # process, which is why the failure streak is persisted to disk
+            # rather than held in memory.
+            ("Service", "Type"),
+            # 3308's bound on the WHOLE tick. systemd disables TimeoutStartSec
+            # for Type=oneshot by default, and the timer's OnUnitActiveSec
+            # measures from this unit's last activation — so a tick that never
+            # returns is not a slow tick, it is the END of supervision, with
+            # nothing saying so. Its absence from the installed copy is
+            # precisely the drift measured on this host.
+            ("Service", "TimeoutStartSec"),
+            ("Service", "StandardOutput"),
+            ("Service", "StandardError"),
+        ),
+        # Absolute path to scripts/dashboard-watchdog.py — host-specific.
+        # No [Install] entry: this unit deliberately has no [Install] section
+        # (it is activated by the timer, never enabled directly).
+        present_only=(("Service", "ExecStart"),),
+    ),
+    "dark-factory-dashboard-watchdog.timer": UnitSpec(
+        name="dark-factory-dashboard-watchdog.timer",
+        repo_relpath="dashboard/dark-factory-dashboard-watchdog.timer",
+        compared=(
+            ("Timer", "OnBootSec"),
+            # The cadence is load-bearing, not a free knob: the watchdog needs
+            # FAIL_STREAK (=3) consecutive failed probes, so 3 x 30s sets the
+            # ~90s sustained-outage detection latency. A drifted interval
+            # changes that latency in the same proportion, silently.
+            ("Timer", "OnUnitActiveSec"),
+            # Dropping [Install] would disarm the watchdog while looking like
+            # a fix — the exact hazard the committed unit's own comment warns
+            # about.
+            ("Install", "WantedBy"),
+        ),
+    ),
+}
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
