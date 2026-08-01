@@ -142,7 +142,10 @@ function MemoryEvalMetricRow({ metric, onNavigate }) {
   return (
     <tr>
       <td className="mono" style={{ color: 'var(--fg-1)' }}>{m.metric_id}</td>
-      <td className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>{m.kind}</td>
+      <td className="mono" style={{ fontSize: 11, color: 'var(--fg-2)' }}>
+        {m.kind}
+        <div style={{ fontSize: 10, color: 'var(--fg-3)' }}>{m.rule_kind}</div>
+      </td>
       <td>
         {/* verdict_detail carries the evaluator's own words, untranslated. */}
         <span className={badge.cls} title={m.verdict_detail || undefined}>
@@ -202,6 +205,92 @@ function MemoryEvalMetricRow({ metric, onNavigate }) {
         </div>
       </td>
     </tr>
+  );
+}
+
+// ── Limits provenance ──
+//
+// Collapsed by default (a <details>, open state persisted under
+// 'df.memevals.prov' in the useOpenSet/usePersistedState idiom of
+// tab_escalations.jsx:286) so provenance does not dominate the card.
+//
+// Everything here is DISPLAYED verbatim.  Nothing is compared, rounded into a
+// verdict, or re-derived — see the verdictBadge comment (PRD section 8,
+// G6/INV-5).  The label/value pairs are built as data rather than as JSX text
+// so the field names live in quoted strings, which also keeps the
+// no-comparison guard's member-access regex unambiguous.
+const ME_PROV_OPEN_KEY = 'df.memevals.prov';
+
+function readProvOpen() {
+  try {
+    return localStorage.getItem(ME_PROV_OPEN_KEY) === '1';
+  } catch (e) {
+    return false;
+  }
+}
+
+function writeProvOpen(open) {
+  try {
+    localStorage.setItem(ME_PROV_OPEN_KEY, open ? '1' : '0');
+  } catch (e) { /* private mode — the toggle simply does not persist */ }
+}
+
+function LimitsProvenance({ ev }) {
+  const lim = ev.limits;
+  if (!lim) {
+    return (
+      <div className="mono" style={{ fontSize: 10, color: 'var(--fg-3)' }}>
+        no limits artifact for this eval — see the artifact issues notice above
+      </div>
+    );
+  }
+  const stamps = lim.baseline_run_stamps || [];
+  const stampText = stamps.length
+    ? `${stamps.slice(0, 3).join(', ')}${stamps.length > 3 ? ` … (${stamps.length} total)` : ''}`
+    : '—';
+  const rows = [
+    ['alpha', lim.alpha],
+    ['false_alarm_budget', lim.false_alarm_budget],
+    ['runs_per_quarter', lim.runs_per_quarter],
+    ['min_samples', lim.min_samples],
+    ['baseline_window', lim.baseline_window],
+    ['baseline_run_stamps', stampText],
+    ['grandfather_set_hash', lim.grandfather_set_hash],
+    ['run_stamp', lim.run_stamp],
+    ['generator', lim.generator],
+  ];
+  return (
+    <details open={readProvOpen()} onToggle={e => writeProvOpen(e.target.open)}>
+      <summary className="mono" style={{ fontSize: 10, color: 'var(--fg-3)', cursor: 'pointer' }}>
+        limits provenance
+      </summary>
+      {/* The provenance may have been stamped at an earlier run than the one
+          on screen.  Saying so is not optional: listed flatly, an older alpha
+          reads as governing the newer displayed run
+          (memory_evals.py:237-241). */}
+      {lim.stale_for_latest_run && (
+        <div className="badge warn" style={{ margin: '4px 0' }}>
+          provenance stamped at {lim.run_stamp} — does not govern{' '}
+          {ev.latest_run_stamp}
+        </div>
+      )}
+      <div
+        className="mono"
+        style={{
+          display: 'grid',
+          gridTemplateColumns: 'auto 1fr',
+          gap: '2px 10px',
+          fontSize: 10,
+          color: 'var(--fg-3)',
+          marginTop: 4,
+        }}
+      >
+        {rows.map(r => [
+          <span key={`${r[0]}-k`}>{r[0]}</span>,
+          <span key={`${r[0]}-v`} style={{ color: 'var(--fg-2)' }}>{String(r[1])}</span>,
+        ])}
+      </div>
+    </details>
   );
 }
 
@@ -319,6 +408,7 @@ function MemoryEvalCard({ ev, onNavigate }) {
             ))}
           </tbody>
         </table>
+        <LimitsProvenance ev={ev} />
       </div>
     </div>
   );
