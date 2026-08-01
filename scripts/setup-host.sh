@@ -508,6 +508,27 @@ else
   fi
 fi
 
+# Dashboard unit parity check — guard that repo-side unit edits actually reached
+# the running system.  A unit change that stays repo-side is indistinguishable
+# from no change at all, which is how the pre-incident watchdog kept running
+# after its replacement had already landed in git.
+#
+# Warn-only: drift never aborts the install.  There is deliberately no --fix
+# (see the checker's module docstring) — re-running this installer is the
+# propagation path, and re-ARMING the watchdog timer belongs to task 3289.
+if python3 "$REPO_ROOT/scripts/check_dashboard_unit_parity.py" \
+     --installed-dir "$UNIT_DIR" \
+     --repo-root     "$REPO_ROOT"; then
+  ok "Dashboard units: parity with the committed copies"
+else
+  _dash_parity_exit=$?
+  if [ "$_dash_parity_exit" -eq 2 ]; then
+    warn "Dashboard units: not installed in $UNIT_DIR (skipping parity check)"
+  else
+    warn "Dashboard units: DRIFT detected — run: python3 $REPO_ROOT/scripts/check_dashboard_unit_parity.py"
+  fi
+fi
+
 # jCodeMunch watcher
 if systemctl --user is-active jcodemunch-watcher &>/dev/null; then
   ok "jCodeMunch watcher: running"
