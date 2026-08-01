@@ -721,21 +721,58 @@ def test_verdict_badges_driven_by_persisted_verdict(
     # A null/absent verdict renders its own state, not a defaulted one.
     badge_body = _extract_function_body(code, 'verdictBadge')
     assert badge_body, 'could not extract the verdictBadge body.'
-    # Asserted as a FALL-THROUGH BRANCH, not as exact badge copy: after every
-    # recognised verdict is matched, the function must still return a badge of
-    # its own (a muted/info class), so an unrecognised verdict renders a
-    # distinct visible state.  Pinning the literal words "no verdict" would
-    # fail on any rewording without testing the branch.
-    tail = badge_body[badge_body.rfind('insufficient_data'):]
-    assert re.search(r"return\s*\{[^}]*\bcls\s*:\s*'badge (muted|info)'", tail), (
-        'verdictBadge must END with an unconditional return of a muted/info '
-        'badge — the fall-through for a null/unrecognised verdict. Absent is '
-        'absent: it needs its own visible state, never a silent default.'
+    # (i) THE PARITY SHORT-CIRCUIT. Every parity branch must COMPOSE with the
+    #     verdict-derived label, never replace it.
+    #
+    #     memory_evals.py:706-715 `_parity()` is a two-case lookup: alarm ->
+    #     alarmed_open/alarmed_unlinked, and everything else ->
+    #     `'recovered_open' if escalation else 'clear'`. So `recovered_open` is
+    #     derived for EVERY non-alarm verdict carrying a linked escalation —
+    #     `insufficient_data`, `grandfathered` and a NULL verdict included. A
+    #     parity branch that returned a hard-coded 'recovered ...' label would
+    #     therefore show a metric that was never measured as having recovered.
+    #
+    #     The previous version of this test could not see that: it inspected
+    #     only `badge_body[badge_body.rfind('insufficient_data'):]` — the tail,
+    #     which begins AFTER the parity branches — so a parity short-circuit
+    #     ahead of the verdict branches was structurally invisible to it.
+    #     Anchored per-branch instead, with no reliance on statement order.
+    for parity in _PARITIES:
+        m = re.search(
+            rf"parity\s*===\s*'{parity}'\s*\)\s*\{{\s*return\s*\{{([^}}]*)\}}",
+            badge_body,
+        )
+        assert m, (
+            f"could not locate the '{parity}' parity branch's return in "
+            'verdictBadge.'
+        )
+        label = re.search(r'label\s*:\s*([^,}]+)', m.group(1))
+        assert label, f"the '{parity}' branch's return has no `label`."
+        expr = label.group(1).strip()
+        assert not re.fullmatch(r"'[^']*'|\"[^\"]*\"|`[^`$]*`", expr), (
+            f"the '{parity}' parity branch returns the hard-coded label {expr} "
+            'and discards the verdict. `_parity()` derives this state from '
+            '(verdict, linked?) — for recovered_open that includes '
+            'insufficient_data, grandfathered and a NULL verdict — so a fixed '
+            'label reports a state the payload never asserted. Compose the '
+            'branch label with the verdict-derived base instead.'
+        )
+
+    # (ii) the base label is derived from `verdict`, and an unrecognised
+    #      verdict gets its own state rather than a defaulted one.
+    base_m = re.search(r'\b(?:let|const|var)\s+(\w+)\s*=\s*(.+?);', badge_body)
+    assert base_m, 'verdictBadge must compute a verdict-derived base label.'
+    assert not re.search(
+        r"\b(?:let|const|var)\s+\w+\s*=\s*'(no_alarm|alarm)'\s*;", badge_body
+    ), (
+        'the base label must not be INITIALISED to a real verdict — an '
+        'unrecognised verdict would then inherit it. Absent is absent: seed '
+        'the not-measured state and overwrite it only on a recognised verdict.'
     )
-    assert not re.search(r"return\s*\{[^}]*\bcls\s*:\s*'badge ok'", tail), (
-        'the fall-through badge for an unrecognised verdict must NOT reuse the '
-        "no_alarm 'badge ok' styling — that renders \"we did not measure\" as "
-        '"we measured and it is fine".'
+    assert not re.search(r"return\s*\{[^}]*\bcls\s*:\s*'badge ok'\s*,", badge_body) or \
+        re.search(r"verdict\s*===\s*'no_alarm'", badge_body), (
+        "the 'badge ok' styling may only be reached via an explicit "
+        "`verdict === 'no_alarm'` test — never as a fall-through."
     )
     assert not re.search(
         r"verdict\s*(\|\||\?\?)\s*['\"]no_alarm['\"]", body
@@ -747,6 +784,7 @@ def test_verdict_badges_driven_by_persisted_verdict(
 
 def test_no_client_side_alarm_derivation(
     tab_memory_evals_jsx_body: str,
+    tab_memory_evals_jsx_code: str,
 ) -> None:
     """THE load-bearing exclusion (PRD section 8 / G6 / INV-5).
 
@@ -759,9 +797,14 @@ def test_no_client_side_alarm_derivation(
     Displaying `limits.alpha` is legal.  Comparing against it is the violation.
     """
     body = tab_memory_evals_jsx_body
+    code = tab_memory_evals_jsx_code
 
     # (1) The badge helper reads verdict/parity and performs NO comparison.
-    badge_body = _extract_function_body(body, 'verdictBadge')
+    #     Extracted from COMMENT-STRIPPED source: the operator-facing `<`/`>`
+    #     characters that appear in prose (an `->` arrow, a "<Chart" reference)
+    #     are not comparisons, and failing on them would push the next author
+    #     to reword a correct comment rather than fix real code.
+    badge_body = _extract_function_body(code, 'verdictBadge')
     assert badge_body, 'could not extract the verdictBadge body.'
     assert 'parity' in badge_body, (
         'verdictBadge must read `parity` — the server-derived display state.'
@@ -994,13 +1037,44 @@ def test_escalation_links_and_storm_aggregate_banner(
             'parity orphan (memory_evals.py:530-534).'
         )
     # Distinct wording, not three branches sharing one string.
-    wordings = re.findall(r"reason\s*===\s*'(\w+)'\s*\?\s*'([^']+)'", body)
-    if wordings:
-        texts = [w[1] for w in wordings]
-        assert len(set(texts)) == len(texts), (
-            'each unmatched-escalation reason must get DISTINCT wording; '
-            f'found duplicates in {texts}.'
+    #
+    # Asserted UNCONDITIONALLY over the extracted function body. The previous
+    # form — `re.findall(r"reason === '(\w+)' \? '([^']+)'", body)` behind an
+    # `if wordings:` guard — matched only single-quoted TERNARY expressions,
+    # while unmatchedReasonText is written as sequential `if (...) return ...;`
+    # statements and one branch returns a DOUBLE-quoted string. It yielded zero
+    # matches against the real source, so the guard skipped the assertion in
+    # silence and the suite reported coverage it did not have: collapsing all
+    # three reasons onto one shared string — the exact regression this block
+    # exists to prevent — would have stayed green. A vacuous assertion is worse
+    # than no assertion, because it also stops anyone adding a real one.
+    fn_body = _extract_function_body(code, 'unmatchedReasonText')
+    assert fn_body, (
+        'could not extract `unmatchedReasonText` — the per-reason wording must '
+        'live in a named function so this contract is checkable.'
+    )
+    texts = [
+        a or b
+        for a, b in re.findall(
+            r'return\s+(?:\'([^\']*)\'|"([^"]*)")', fn_body
         )
+    ]
+    assert len(texts) >= 3, (
+        'unmatchedReasonText must return a distinct literal string for each of '
+        f'the three reasons; found {len(texts)}: {texts}. Asserted with a '
+        'floor so a refactor that DROPS branches fails loudly here rather '
+        'than passing vacuously on an empty match list.'
+    )
+    assert len(set(texts)) == len(texts), (
+        'each unmatched-escalation reason must get DISTINCT wording; '
+        f'found duplicates in {texts}. Collapsing them into one '
+        'undifferentiated "unexplained" list would fire on escalations that '
+        'are in fact fully explained and train operators to ignore the one '
+        'signal that catches a real parity orphan (memory_evals.py:530-534).'
+    )
+    assert all(t.strip() for t in texts), (
+        f'every reason wording must be non-empty; found a blank in {texts}.'
+    )
 
 
 # ---------------------------------------------------------------------------

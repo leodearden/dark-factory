@@ -104,30 +104,54 @@ function verdictBadge(metric) {
   const verdict = metric.verdict;
   const parity = metric.parity;
 
-  // Parity states that carry information the verdict alone does not.
+  // The plain verdict label is computed FIRST, so that no parity branch below
+  // can discard it.
+  //
+  // This ordering is load-bearing.  memory_evals.py:706-715 `_parity()` is a
+  // two-case lookup — `if verdict == 'alarm': ...; return 'recovered_open' if
+  // escalation else 'clear'` — so `recovered_open` is derived for EVERY
+  // non-alarm verdict that carries a linked escalation, not just `no_alarm`.
+  // `insufficient_data`, `grandfathered` and a null verdict all reach it.  A
+  // parity branch returning a bare 'recovered' label would therefore tell the
+  // operator that a metric which was never measured had recovered — the same
+  // "we did not measure" -> "we measured and it is fine" substitution the
+  // absent-verdict fall-through exists to prevent, and worse, because it
+  // asserts a recovery rather than merely a clean bill of health.
+  //
+  // Absent is absent: a null/unrecognised verdict labels itself, and is NEVER
+  // defaulted to no_alarm (mirrors memory_evals.py:847-849).
+  let base = 'no verdict';
+  let cls = 'badge muted';
+  if (verdict === 'alarm') {
+    base = 'alarm';
+    cls = 'badge bad';
+  } else if (verdict === 'no_alarm') {
+    base = 'no_alarm';
+    cls = 'badge ok';
+  } else if (verdict === 'grandfathered') {
+    base = 'grandfathered';
+    cls = 'badge info';
+  } else if (verdict === 'insufficient_data') {
+    base = 'insufficient_data';
+    cls = 'badge muted';
+  }
+
+  // Parity states that carry information the verdict alone does not.  Each
+  // REFINES the base label by suffixing it; none replaces it.  `alarmed_unlinked`
+  // and `storm_collapsed` are only reachable when verdict === 'alarm', so those
+  // read as "alarm · ..." as before — composing rather than hard-coding just
+  // keeps them honest if the producer's derivation ever widens.
   if (parity === 'recovered_open') {
-    return { cls: 'badge warn', label: 'recovered · escalation open' };
+    return { cls: 'badge warn', label: base + ' · escalation open' };
   }
   if (parity === 'alarmed_unlinked') {
-    return { cls: 'badge bad', label: 'alarm · no escalation' };
+    return { cls: 'badge bad', label: base + ' · no escalation' };
   }
   if (parity === 'storm_collapsed') {
-    return { cls: 'badge bad', label: 'alarm · storm-collapsed' };
+    return { cls: 'badge bad', label: base + ' · storm-collapsed' };
   }
   // parity 'alarmed_open' / 'clear' agree with the verdict — plain badge.
-
-  if (verdict === 'alarm') return { cls: 'badge bad', label: 'alarm' };
-  if (verdict === 'no_alarm') return { cls: 'badge ok', label: 'no_alarm' };
-  if (verdict === 'grandfathered') {
-    return { cls: 'badge info', label: 'grandfathered' };
-  }
-  if (verdict === 'insufficient_data') {
-    return { cls: 'badge muted', label: 'insufficient_data' };
-  }
-  // Absent is absent.  A null/unrecognised verdict is NEVER defaulted to
-  // no_alarm — that would report "we did not measure" as "we measured and it
-  // is fine" (mirrors memory_evals.py:847-849).
-  return { cls: 'badge muted', label: 'no verdict' };
+  return { cls: cls, label: base };
 }
 
 // ── Escalation link ──
