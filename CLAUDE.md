@@ -190,13 +190,18 @@ directly, not just interactive agents.
 - For a direct-to-main commit under contention, use `git commit --only <path>`
   (not a bare `git commit`) so you don't sweep up unrelated staged/dirty state
   from a concurrent process.
-- `pre-commit` runs pyright 3x — pass `timeout: 300000` (or higher) to `Bash`
-  for commit commands, or run detached via `setsid` and poll, rather than
-  letting the default timeout kill it mid-hook.
-- **Never** run `git stash` in `project_root`: the stash stack is consumed by
-  the merge worker's advance path (incident `13674d3c68`), so a stash you push
-  can be popped out from under you by an unrelated process. Park WIP as
-  commits on a branch instead.
+- `pre-commit` runs pyright **only for packages with staged `.py` changes**
+  (`hooks/project-checks`, task 2551): a docs-only commit prints
+  `pyright skipped (no Python changes)` and is quick. When a commit does stage
+  Python, pass `timeout: 300000` (or higher) to `Bash`, or run detached via
+  `setsid` and poll, rather than letting the default timeout kill it mid-hook.
+- **Never** run `git stash` in **any** dark-factory checkout — `project_root`
+  or a `.worktrees/<id>` task worktree. `refs/stash` is a single ref in the
+  shared `.git` dir and is *not* per-worktree, so every checkout pushes onto
+  the same stack, which the merge worker's advance path also consumes
+  (incident `13674d3c68`). A stash you push can be popped out from under you
+  by an unrelated process, and a `stash pop` on a clean tree can apply another
+  task's WIP into yours. Park WIP as commits on a branch instead.
 
 ## Reference
 
