@@ -1083,6 +1083,157 @@ def test_main_reports_the_watchdog_pre_incident_drift(tmp_path: pathlib.Path, ca
 
 
 # ---------------------------------------------------------------------------
+# The vanished committed unit  (step-19 / step-20)
+# ---------------------------------------------------------------------------
+#
+# The committed unit is this checker's source of truth. When it is absent the
+# run verified NOTHING for that unit, so "parity" is the one verdict that must
+# be impossible. Reproduced against the checker as it stood before these tests:
+#
+#     $ python3 scripts/check_dashboard_unit_parity.py \
+#           --repo-root /tmp/emptyrepo --installed-dir /tmp/emptyrepo
+#     [dashboard_unit_parity] [skip] dark-factory-dashboard.service: committed
+#         unit not found at /tmp/emptyrepo/dashboard/dark-factory-dashboard.service
+#     ... (x3)
+#     [dashboard_unit_parity] [ok] parity — 3 unit(s) match their committed copies.
+#     $ echo $?
+#     0
+#
+# Zero units compared, a count of three reported, exit 0 — so setup-host.sh
+# printed `ok`. A typo'd --repo-root, a renamed unit file, or a `git mv` of
+# dashboard/*.service silently disarmed the entire gate. That is the same
+# failure class the checker itself exists to expose: green while verifying
+# nothing.
+#
+# A vanished committed unit reuses exit 1 rather than minting a new code:
+# setup-host.sh already branches on the 0/1/2 vocabulary and reads 2 as the
+# benign "not installed on this host". A missing source of truth is the
+# opposite of benign, so it belongs with drift.
+
+
+def test_main_no_committed_units_is_not_parity(tmp_path: pathlib.Path, capsys):
+    """A --repo-root holding no committed units must not report parity.
+
+    The typo'd-path case, reproduced: the installed copies are all present and
+    correct, but the tree we are comparing them AGAINST is empty.
+    """
+    mod = _load_checker()
+    repo = _fake_repo(tmp_path, mod)
+    installed = _installed_from(tmp_path, mod, repo)
+    typo_root = tmp_path / "typo-repo-root"
+    typo_root.mkdir()
+
+    rc = mod.main(["--repo-root", str(typo_root), "--installed-dir", str(installed)])
+    out = capsys.readouterr().out
+
+    assert rc != 0, (
+        "A run that compared zero units has proved nothing and must never "
+        f"report parity. Got {rc}:\n{out}"
+    )
+
+
+def test_main_success_line_counts_only_units_actually_compared(
+    tmp_path: pathlib.Path, capsys
+):
+    """COUNT HONESTY: the report names what was compared, not what was selected.
+
+    Asserted in BOTH directions — otherwise deleting the count entirely would
+    satisfy the negative half while telling the operator even less.
+    """
+    mod = _load_checker()
+    repo = _fake_repo(tmp_path, mod)
+    installed = _installed_from(tmp_path, mod, repo)
+
+    assert mod.main(["--repo-root", str(repo), "--installed-dir", str(installed)]) == 0
+    full_out = capsys.readouterr().out
+    assert "3 unit(s)" in full_out, (
+        f"With all three compared, the count must say so. Got:\n{full_out}"
+    )
+
+    (repo / mod.UNITS[_WATCHDOG_TIMER].repo_relpath).unlink()
+
+    mod.main(["--repo-root", str(repo), "--installed-dir", str(installed)])
+    partial_out = capsys.readouterr().out
+
+    assert "3 unit(s)" not in partial_out, (
+        "Only two units could be compared; claiming three overstates what the "
+        f"gate verified. Got:\n{partial_out}"
+    )
+
+
+def test_main_names_the_vanished_committed_unit(tmp_path: pathlib.Path, capsys):
+    """The report names the vanished committed path, distinctly from a drift.
+
+    An operator who reads setup-host.sh's warn line must not be sent hunting
+    for a directive diff that does not exist.
+    """
+    mod = _load_checker()
+    repo = _fake_repo(tmp_path, mod)
+    installed = _installed_from(tmp_path, mod, repo)
+    vanished = repo / mod.UNITS[_WATCHDOG_TIMER].repo_relpath
+    vanished.unlink()
+
+    rc = mod.main(["--repo-root", str(repo), "--installed-dir", str(installed)])
+    out = capsys.readouterr().out
+
+    assert rc == 1, out
+    assert str(vanished) in out, (
+        f"The report must name the committed path that vanished. Got:\n{out}"
+    )
+    assert _WATCHDOG_TIMER in out
+    assert "directive(s) differ" not in out, (
+        "Nothing drifted — the two other units are at parity. Reporting a "
+        f"directive diff would misdirect the operator. Got:\n{out}"
+    )
+
+
+def test_main_vanished_committed_unit_does_not_mask_drift(
+    tmp_path: pathlib.Path, capsys
+):
+    """PRECEDENCE: a vanished committed unit AND a drifting one → still 1, both reported.
+
+    Both findings are actionable and neither may mask the other.
+    """
+    mod = _load_checker()
+    repo = _fake_repo(tmp_path, mod)
+    installed = _installed_from(
+        tmp_path,
+        mod,
+        repo,
+        edits={_DASHBOARD_SERVICE: ("TimeoutStopSec=15", "TimeoutStopSec=30")},
+    )
+    vanished = repo / mod.UNITS[_WATCHDOG_TIMER].repo_relpath
+    vanished.unlink()
+
+    rc = mod.main(["--repo-root", str(repo), "--installed-dir", str(installed)])
+    out = capsys.readouterr().out
+
+    assert rc == 1, out
+    assert "TimeoutStopSec" in out, f"The drift must still be reported:\n{out}"
+    assert str(vanished) in out, f"The vanished unit must still be reported:\n{out}"
+
+
+def test_main_empty_installed_dir_still_returns_exactly_2(
+    tmp_path: pathlib.Path, capsys
+):
+    """REGRESSION FLOOR: committed units present, nothing installed → still exactly 2.
+
+    setup-host.sh reads 2 as "not installed on this host, skipping" — a benign
+    state on any machine that does not run the dashboard. The zero-compared
+    guard must not upgrade it to an alarm.
+    """
+    mod = _load_checker()
+    repo = _fake_repo(tmp_path, mod)
+    installed = tmp_path / "installed-empty"
+    installed.mkdir()
+
+    rc = mod.main(["--repo-root", str(repo), "--installed-dir", str(installed)])
+    out = capsys.readouterr().out
+
+    assert rc == 2, f"Expected exactly 2 (benign, not installed here). Got {rc}:\n{out}"
+
+
+# ---------------------------------------------------------------------------
 # CLI subprocess boundary  (step-15 / step-16)
 # ---------------------------------------------------------------------------
 
