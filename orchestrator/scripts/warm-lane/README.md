@@ -540,11 +540,13 @@ nothing here to act on.
 
 What makes the claim safe to make now is that it is **enforced rather than
 asserted**: `test_only_cosmetic_program_name_forks_remain` fails on *any*
-`$(basename ` or `$(dirname ` on a non-comment line in `warm-lane/*.sh` except
-that one spelling — matched literally, so a future `$(basename "$0" .sh)` or
-`$(dirname "$0")` is caught rather than waved through. Cosmetic-only is now true
-by construction, and a regression is caught mechanically instead of by the next
-reader trusting this paragraph.
+`dirname`/`basename` substitution on a non-comment line in `warm-lane/*.sh`
+except that one spelling. The offender scan is a regex covering both `$( … )`
+and backtick syntax with leading whitespace tolerated; the waiver is matched
+**literally**, so a future `$(basename "$0" .sh)` or `$(dirname "$0")` is caught
+rather than waved through. Cosmetic-only is now true by construction, and a
+regression is caught mechanically instead of by the next reader trusting this
+paragraph.
 
 #### Pinned by
 
@@ -585,29 +587,36 @@ All in `orchestrator/tests/test_warm_lane_scripts_shipped.py`:
   normally-named `<pool>/_lane-1` still thins under the same `PATH`, so the fix
   is shown to be a **correction** of the comparison rather than a widening of
   it.
-* `TestNoShippedScriptResolvesItsOwnDirectoryByForking` — the directory-wide
-  drift gate, now two tests. Because a script's own directory is what tells it
-  where its libs are, this idiom cannot be extracted into a sourceable helper
-  without depending on the thing it resolves (`lib_lane_state.sh` carries its
-  own copy for exactly that reason), so the five copies are deliberate. The
-  gate is the inverse of Delta 4's single-definition-site guard: instead of
-  "this idiom appears exactly once", it asserts **the forking spelling appears
-  zero times**.
-  * `test_no_shipped_script_resolves_its_own_directory_by_forking_dirname` —
-    the original, scoped to `$(dirname "${BASH_SOURCE` / `$(dirname "$0"`. Kept
-    as the specific, well-named self-directory gate; it names the distinct
-    `cd ""` failure mode in its message.
-  * `test_only_cosmetic_program_name_forks_remain` — the superset, added
-    because that scope is **exactly why nothing here flagged the `thin`
-    self-clobber guard**: a `basename` fork on a variable is neither spelling.
-    A gate that cannot see the class it guards is itself a defect, so the
-    widening is part of this delta rather than a follow-up.
+* `TestNoShippedScriptDerivesAPathByForking::test_only_cosmetic_program_name_forks_remain`
+  — the directory-wide drift gate. Because a script's own directory is what
+  tells it where its libs are, this idiom cannot be extracted into a sourceable
+  helper without depending on the thing it resolves (`lib_lane_state.sh`
+  carries its own copy for exactly that reason), so the five copies are
+  deliberate. The gate is the inverse of Delta 4's single-definition-site
+  guard: instead of "this idiom appears exactly once", it asserts **the forking
+  spelling appears zero times**.
 
-  Both skip whole-line comments, so the libs' usage headers and `warm-lane-gc.sh`'s
-  prose do not false-trip them. That exclusion is deliberately not load-bearing:
-  the two `warm-lane-gc.sh` header blocks that documented
-  `BASE_TARGET=$(dirname "$MOUNT")/base/target` were reworded to describe the
-  parent-of-`MOUNT` derivation without the fork spelling.
+  **ONE gate, not two.** It began as a narrow scan for `$(dirname
+  "${BASH_SOURCE` / `$(dirname "$0"`, and that scope is *exactly why nothing
+  here flagged the `thin` self-clobber guard*: a `basename` fork on a variable
+  is neither spelling. A gate that cannot see the class it guards is itself a
+  defect, so it was widened to **any** `dirname`/`basename` substitution —
+  which strictly subsumes the narrow scan, making a second test pure
+  maintenance cost (every future exception encoded twice). The narrow scan's
+  one distinctive contribution, the `cd ""` diagnosis, survives as an
+  annotation appended to any offender matching the self-directory spellings.
+
+  The offender scan is a **regex** tolerating whitespace and backticks
+  (`$( dirname`, `` `dirname `` are both valid bash); the cosmetic waiver and
+  the self-directory sub-classification are matched **literally**. That
+  asymmetry is deliberate — the scan decides what is caught and must be
+  generous, the waiver decides what is let through and must be exact.
+
+  Whole-line comments are skipped, so the libs' usage headers and
+  `warm-lane-gc.sh`'s prose do not false-trip it. That exclusion is
+  deliberately not load-bearing: the two `warm-lane-gc.sh` header blocks that
+  documented `BASE_TARGET=$(dirname "$MOUNT")/base/target` were reworded to
+  describe the parent-of-`MOUNT` derivation without the fork spelling.
 
 ## Sibling-seed defaults, and who resolves them
 
