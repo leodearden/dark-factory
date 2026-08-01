@@ -530,3 +530,129 @@ async def test_census_code_token_and_vocabulary_reconciliation_end_to_end(
     assert len(census) == 1, f'Expected exactly one census line; got {census}'
     assert 'code=unknown_key' in census[0], f'Expected code=unknown_key token; got: {census[0]!r}'
     assert 'mystery_zzz' in census[0]
+
+
+# ── Row 8 — curator-gate contradiction reaches the real write boundary ──
+
+
+class TestCuratorGateContradictionAtWriteBoundary:
+    """``human_curator_gate`` + ``before_done`` is rejected at the REAL boundary (task 3369).
+
+    The unit tests in ``shared/tests/test_task_metadata.py`` exercise
+    ``TaskMetadata`` and ``parse_metadata``; neither proves that
+    :meth:`SqliteTaskBackend._validate_metadata_on_write` routes THIS finding
+    to a raise. That routing is non-obvious and load-bearing: the method
+    re-raises only when a warning's ``field`` is in ``incoming_keys`` OR is the
+    whole-blob sentinel :data:`_WHOLE_METADATA_FIELD`, and only when the code
+    is not in ``_NON_FATAL_WRITE_WARNING_CODES``. This invariant is a
+    whole-model validator, so it produces ``loc == ()`` -> the sentinel ->
+    unconditionally fatal. Row (c) is what that asymmetry buys: an
+    ``update_task`` supplying ONLY ``human_curator_gate`` is still rejected
+    even though ``before_done`` is an untouched legacy field never named in
+    ``incoming_keys``.
+
+    Per this module's docstring these rows are an INTEGRATION gate, not a
+    synthetic-input unit test: they may well be GREEN the moment the shared
+    validator lands, because the generic policy already routes the sentinel
+    correctly. That is the expected and desired outcome — a RED here would
+    mean a genuine integration gap between the new invariant and the write
+    boundary, which is exactly what this row exists to detect.
+    """
+
+    _BEFORE_DONE = {'script': 'scripts/deploy.sh', 'timeout_secs': 60}
+
+    # A pure gate's marker on a task that also carries a machine step that
+    # closes it — the self-contradiction the validator rejects.
+    _CONTRADICTION = {
+        'task_kind': 'deterministic',
+        'always_escalates': True,
+        'before_done': _BEFORE_DONE,
+        'human_curator_gate': True,
+    }
+
+    # A legitimate deterministic deploy task: before_done, no marker. One of
+    # the 33 shapes that exist on the live store today.
+    _VALID_DEPLOY = {
+        'task_kind': 'deterministic',
+        'always_escalates': False,
+        'before_done': _BEFORE_DONE,
+    }
+
+    @pytest.mark.asyncio
+    async def test_add_task_with_both_keys_rejected_and_rolled_back(
+        self, make_backend, tmp_path,
+    ):
+        """(a) enforce-mode add_task raises and leaves no row behind."""
+        backend = await make_backend(enforce=True)
+        project_root = str(tmp_path / 'enforce')
+
+        with pytest.raises(ValidationError):
+            await backend.add_task(
+                project_root=project_root, title='t',
+                metadata=json.dumps(self._CONTRADICTION),
+            )
+
+        # The rejected INSERT never landed — the _txn rolled back.
+        tasks = (await backend.get_tasks(project_root=project_root))['tasks']
+        assert tasks == []
+
+    @pytest.mark.asyncio
+    async def test_add_task_with_both_keys_warn_mode_writes_and_censuses(
+        self, make_backend, tmp_path, caplog,
+    ):
+        """(b) warn-mode accepts the write and emits exactly one census line.
+
+        The staged-rollout half of the contract, mirroring rows 5-6:
+        ``task_metadata.enforce`` is a RED-TIER restart-only flag, so a
+        deployment running in warn-mode must still surface the finding rather
+        than swallowing it.
+        """
+        backend = await make_backend(enforce=False)
+        project_root = str(tmp_path / 'warn')
+
+        with caplog.at_level(
+            logging.WARNING, logger='fused_memory.backends.sqlite_task_backend'
+        ):
+            # Scope the census to exactly this write.
+            caplog.clear()
+            dto = await backend.add_task(
+                project_root=project_root, title='t',
+                metadata=json.dumps(self._CONTRADICTION),
+            )
+
+        census = _schema_warning_messages(caplog)
+        assert len(census) == 1, f'Expected exactly one census line; got {census}'
+        assert '<metadata>' in census[0]
+        assert 'human_curator_gate' in census[0]
+
+        # The write proceeded, and I1 held through the durable round-trip.
+        task = await backend.get_task(dto['id'], project_root=project_root)
+        assert task['metadata'] == self._CONTRADICTION
+
+    @pytest.mark.asyncio
+    async def test_update_task_adding_only_the_marker_rejected(self, make_backend, tmp_path):
+        """(c) the realistic reconciliation-Stage-2 write that motivated 3369.
+
+        A VALID deterministic deploy task already exists; a later writer adds
+        only ``human_curator_gate``. ``update_task`` shallow-merges and
+        validates the merged WHOLE, and the whole-model sentinel bypasses
+        ``incoming_keys`` scoping — so this is rejected even though the
+        offending ``before_done`` is an untouched legacy field.
+        """
+        backend = await make_backend(enforce=True)
+        project_root = str(tmp_path / 'enforce')
+
+        dto = await backend.add_task(
+            project_root=project_root, title='t',
+            metadata=json.dumps(self._VALID_DEPLOY),
+        )
+
+        with pytest.raises(ValidationError):
+            await backend.update_task(
+                dto['id'], project_root=project_root,
+                metadata=json.dumps({'human_curator_gate': True}),
+            )
+
+        # Rolled back — the marker never landed on the deploy task.
+        task = await backend.get_task(dto['id'], project_root=project_root)
+        assert task['metadata'] == self._VALID_DEPLOY
