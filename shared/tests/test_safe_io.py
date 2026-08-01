@@ -515,6 +515,91 @@ class TestAtomicWriteMkdir:
 
         assert not p.parent.exists()
 
+    # ------------------------------------------------------------------
+    # Blast-radius pins (task 3223 review, BLOCKER 2).
+    #
+    # ``mkdir=True`` really creates directories, so how far that creation can
+    # reach is part of the helper's contract and not merely an implementation
+    # detail.  These three are REGRESSION PINS on already-correct behaviour
+    # rather than a red-then-green pair; the RED for the originating blocker is
+    # the autouse guard in ``orchestrator/tests/conftest.py``.
+    # ------------------------------------------------------------------
+
+    def test_mkdir_creates_only_the_destination_ancestor_chain(self, tmp_path):
+        """mkdir=True creates the destination's ancestors and NOTHING else.
+
+        Bounds the blast radius: a caller asking for ``a/b/c/state.json`` gets
+        exactly ``a``, ``a/b`` and ``a/b/c`` — no siblings, no directories
+        above the chain.
+        """
+        from shared.safe_io import atomic_write_text
+
+        p = tmp_path / 'a' / 'b' / 'c' / 'state.json'
+
+        atomic_write_text(p, 'payload', mkdir=True)
+
+        created = {d.relative_to(tmp_path) for d in tmp_path.rglob('*') if d.is_dir()}
+        assert created == {Path('a'), Path('a/b'), Path('a/b/c')}
+        # ...and the only file is the destination itself — no temp residue.
+        files = {f.relative_to(tmp_path) for f in tmp_path.rglob('*') if f.is_file()}
+        assert files == {Path('a/b/c/state.json')}
+
+    def test_mkdir_with_relative_path_stays_under_cwd(self, tmp_path, monkeypatch):
+        """A RELATIVE destination resolves against the process CWD, and nothing
+        is created outside it.
+
+        This is the property the task-3223 pollution violated in spirit: the
+        stray tree landed under the *suite's* CWD precisely because the path was
+        relative.  The helper's job is to stay inside that CWD, which it does;
+        keeping the caller's path meaningful is the caller's job.
+        """
+        from shared.safe_io import atomic_write_text
+
+        outside = tmp_path.parent / f'{tmp_path.name}-sibling-canary'
+        monkeypatch.chdir(tmp_path)
+
+        atomic_write_text(Path('rel') / 'deep' / 'state.json', 'payload', mkdir=True)
+
+        assert (tmp_path / 'rel' / 'deep' / 'state.json').read_text(
+            encoding='utf-8'
+        ) == 'payload'
+        created = {d.relative_to(tmp_path) for d in tmp_path.rglob('*') if d.is_dir()}
+        assert created == {Path('rel'), Path('rel/deep')}
+        assert not outside.exists()
+
+    def test_path_is_coerced_via_os_fspath_so_any_pathlike_becomes_real(
+        self, tmp_path, monkeypatch
+    ):
+        """CHARACTERISATION: ``path`` is resolved through ``os.fspath``/``Path``,
+        so ANY ``os.PathLike[str]`` becomes a REAL filesystem path.
+
+        Stated positively because it is the contract, not a bug: the helper
+        accepts duck-typed paths and cannot distinguish a test double from a
+        genuine relative path.  ``unittest.mock.MagicMock`` supports
+        ``__fspath__`` with a genuine ``str`` default return, so a MagicMock is
+        a *valid* ``PathLike`` — ``isinstance(os.fspath(mock), str)`` is True
+        and ``Path(mock)`` yields a legitimate relative path.  There is no
+        type-level signal separating the two, which is why task 3223's review
+        fix landed in the polluting TEST and in an autouse conftest guard
+        rather than in this write primitive.  Callers must pass a genuine path.
+        """
+        from unittest.mock import MagicMock
+
+        from shared.safe_io import atomic_write_text
+
+        mock_path = MagicMock().project_root / 'data' / 'state.json'
+        # A MagicMock really does satisfy the PathLike[str] protocol...
+        assert isinstance(os.fspath(mock_path), str)
+        assert Path(mock_path).parts[0] == 'MagicMock'
+
+        monkeypatch.chdir(tmp_path)
+        atomic_write_text(mock_path, 'payload', mkdir=True)
+
+        # ...so the repr-derived name is materialised as a real tree.
+        landed = Path(os.fspath(mock_path))
+        assert landed.read_text(encoding='utf-8') == 'payload'
+        assert (tmp_path / 'MagicMock').is_dir()
+
 
 class TestAtomicWriteDurability:
     """``fsync`` opt-in — the durability contract ``landed_outbox`` depends on.
