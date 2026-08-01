@@ -364,6 +364,38 @@ def _plan_rate(n_admitted: int, no_plan: int) -> float | None:
     return round((n_admitted - no_plan) / n_admitted, 4)
 
 
+def _cost_per_plan(total_cost: float, n_planned: int) -> float | None:
+    """The spend per USABLE plan (4 dp) — a deliberately ASYMMETRIC ratio.
+
+    *total_cost* is the spend over every ADMITTED plan-only cell INCLUDING the
+    ones that produced nothing; *n_planned* counts only the cells that actually
+    emitted a plan (``n_admitted - no_plan``). That asymmetry is the entire
+    content of "$ per USABLE plan": a no-plan cell burns real budget and returns
+    nothing (``plans/eval-architect-effort-verdict-2026-07-27.md`` measured
+    $0.5–$3 against a real plan's ~$3.7), so a cheap-but-unreliable candidate's
+    per-fixture cost advantage is partly ILLUSORY — the doc's own arithmetic put
+    fable at $3.456/fixture but $4.731 per usable plan, i.e. no cheaper than the
+    opus-max incumbent while failing to plan 5x as often. Netting the failed
+    attempts out of the numerator would report exactly that illusion instead of
+    removing it.
+
+    What the numerator does NOT include is an UNMEASURABLE cell's $0.00: the
+    caller accumulates it under the same admission decision that fills the θ
+    pool, so a cap-tainted cell's price-of-a-run-that-never-happened stays out
+    for the same reason :func:`_is_unmeasurable` keeps it out of the ``cost``
+    pool. Letting it in would DILUTE $/plan with a free run — reporting a
+    session-cap window as a discount.
+
+    An empty denominator is ``None``, never ``0.0`` and never a
+    ``ZeroDivisionError``: a config that failed to plan on every cell is a real
+    campaign outcome and the one whose row an operator most needs to read, and
+    "we got no plan at any price" must not render as "plans were free".
+    """
+    if n_planned <= 0:
+        return None
+    return round(total_cost / n_planned, 4)
+
+
 # ``(fixture, role_group)`` — the key of every efficiency baseline map in
 # :func:`build_composite_report` (task 3099). Module-level, not function-local:
 # a name bound inside a function body is not usable in a type expression.
@@ -453,6 +485,19 @@ def build_composite_report(
     both numerator and denominator, so a candidate is never reported as less
     reliable for a question a session-cap window stopped it from answering (see
     :func:`_plan_rate`). An empty pool is ``None``, never ``0.0`` or ``1.0``.
+
+    ``cost_per_plan`` is that axis priced: the spend over the config's ADMITTED
+    plan-only cells — INCLUDING the ones that produced nothing — over only the
+    cells that DID produce a plan (:func:`_cost_per_plan`). The asymmetry is
+    deliberate and is the whole figure: a no-plan cell burns real budget and
+    returns nothing, so a cheap-but-unreliable candidate's per-fixture
+    ``cost_usd`` advantage is partly illusory, and netting the failed attempts
+    out of the numerator would report that illusion rather than remove it. Its
+    numerator accumulates under the SAME admission decision that fills the θ
+    pool, so an unmeasurable cell's $0.00 dilutes neither side. It lives on
+    THIS row only: :func:`build_plan_quality_report` carries no cost data, and
+    threading some there would create a SECOND cost surface free to drift from
+    ``cost_usd``. ``None`` when no admitted cell planned.
 
     SCOPE of the taint exclusion (REVISED by task 3099): an UNMEASURABLE
     plan-only trial (:func:`_is_unmeasurable`) leaves EVERY measured pool —
@@ -594,6 +639,10 @@ def build_composite_report(
             'plan_quality_scores': [],
             'plan_quality_cap_excluded': 0,
             'plan_quality_no_plan': 0,
+            # The $/usable-plan NUMERATOR (task 3379): spend over admitted
+            # plan-only cells, summed under the SAME condition that fills
+            # plan_quality_scores — see the accumulation site.
+            'plan_cost_usd': 0.0,
         }
 
     by_config: dict[str, dict[str, Any]] = defaultdict(_acc)
@@ -675,6 +724,16 @@ def build_composite_report(
         # than re-reading the metrics dict keeps the two sourced from one place.
         if scored_pq is not None:
             acc['plan_quality_scores'].append(scored_pq)
+            # …and the cell's REAL spend joins the $/usable-plan numerator under
+            # exactly that one condition (task 3379), so numerator and
+            # denominator are sourced from ONE admission decision and cannot
+            # describe different cells. An unmeasurable/cap-tainted cell is
+            # excluded here for the same reason _is_unmeasurable keeps its
+            # $0.00 out of the `cost` pool: it is the price of a run that never
+            # happened, and averaging it in would report the cap window as a
+            # discount. A no-plan cell's spend DOES land here — that is what
+            # makes the figure $/usable plan rather than $/cell.
+            acc['plan_cost_usd'] += cost
         # Counted over ARCHITECT trials only, matching
         # build_plan_quality_report's architect-scoped cap_excluded — the two
         # exclusion surfaces describe the same cells and must not disagree. (A
@@ -762,6 +821,13 @@ def build_composite_report(
             # all, over what was actually measured. Through THE shared reducer,
             # which build_plan_quality_report's aggregate also calls.
             'plan_rate': _plan_rate(n_admitted, acc['plan_quality_no_plan']),
+            # $ per USABLE plan (task 3379): the admitted cells' full spend —
+            # including what the planless ones burned — over only the cells
+            # that produced a plan. Same n_admitted local, so it describes the
+            # same pool plan_rate does.
+            'cost_per_plan': _cost_per_plan(
+                acc['plan_cost_usd'], n_admitted - acc['plan_quality_no_plan'],
+            ),
         })
 
     return {
