@@ -1446,3 +1446,114 @@ class TestSubmitChildPythonPathIsExplicit:
             '--working-directory=/proj',
             '/bin/sh', '-c', expected_payload,
         )
+
+
+# ---------------------------------------------------------------------------
+# task 3453 step-3: RED — an unresolvable import root degrades the escalation
+# guarantee LOUDLY (docs/legibility/design-invariants.md: no-silent-fail-soft)
+# and NEVER blocks the restart itself.
+# ---------------------------------------------------------------------------
+
+
+def _stub_find_spec(monkeypatch: pytest.MonkeyPatch, unresolvable: set[str]) -> None:
+    """Make ``importlib.util.find_spec`` return None for *unresolvable* names.
+
+    Every other name delegates to the real resolver, so this isolates the
+    package under test without disturbing unrelated imports.
+    """
+    import importlib.util
+
+    real = importlib.util.find_spec
+
+    def _fake(name: str, package: str | None = None):
+        if name in unresolvable:
+            return None
+        return real(name, package)
+
+    monkeypatch.setattr(importlib.util, 'find_spec', _fake)
+
+
+@pytest.mark.asyncio
+class TestSubmitChildPythonPathDegradesLoudly:
+    """A package whose import root cannot be resolved must produce a WARNING
+    naming it — never a silently narrowed PYTHONPATH, and never a failed
+    restart. The escalation is a REPORTING mechanism for the restart; degrading
+    the report must not turn a recoverable deploy into a wedged one."""
+
+    async def test_unresolvable_package_warns_and_omits_setenv(
+        self,
+        tmp_queue_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        import logging
+
+        from orchestrator.proc_supervision import (
+            _SUBMIT_CHILD_PACKAGES,
+            RestartDisposition,
+        )
+
+        monkeypatch.delenv('PYTHONPATH', raising=False)
+        _stub_find_spec(monkeypatch, set(_SUBMIT_CHILD_PACKAGES))
+
+        runner = FakeRunner(returncode=0)
+        plan = _detached_plan_with_spec(tmp_queue_dir, _make_spec(tmp_queue_dir))
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.proc_supervision'):
+            outcome = await plan.execute(runner=runner)
+
+        argv, _kwargs = runner.calls[0]
+        assert not [t for t in argv if isinstance(t, str) and t.startswith('--setenv=')], (
+            'nothing resolved, so no PYTHONPATH guarantee may be claimed on the argv'
+        )
+
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(
+            'escalation' in r.getMessage() and 'PYTHONPATH' in r.getMessage()
+            for r in warnings
+        ), (
+            'an unresolvable submit-child package must be reported by name '
+            f'alongside the PYTHONPATH consequence: {[r.getMessage() for r in warnings]!r}'
+        )
+
+        assert outcome.disposition == RestartDisposition.SCHEDULED, (
+            'a degraded escalation guarantee must NEVER block the restart'
+        )
+
+    async def test_partial_resolution_still_emits_what_resolved(
+        self,
+        tmp_queue_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The degrade is per-package and reported — not all-or-nothing."""
+        import logging
+
+        from orchestrator.proc_supervision import RestartDisposition
+
+        monkeypatch.delenv('PYTHONPATH', raising=False)
+        _stub_find_spec(monkeypatch, {'shared'})
+
+        runner = FakeRunner(returncode=0)
+        plan = _detached_plan_with_spec(tmp_queue_dir, _make_spec(tmp_queue_dir))
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.proc_supervision'):
+            outcome = await plan.execute(runner=runner)
+
+        argv, _kwargs = runner.calls[0]
+        roots = _pythonpath_roots(argv)
+        assert any((Path(r) / 'escalation' / '__init__.py').exists() for r in roots), (
+            'the root that DID resolve must still be supplied to the child: '
+            f'{roots!r}'
+        )
+        assert not any((Path(r) / 'shared' / '__init__.py').exists() for r in roots), (
+            'the stubbed-unresolvable root must not appear (guards the stub itself)'
+        )
+
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('shared' in r.getMessage() for r in warnings), (
+            'the package that failed to resolve must be named in a WARNING: '
+            f'{[r.getMessage() for r in warnings]!r}'
+        )
+
+        assert outcome.disposition == RestartDisposition.SCHEDULED
