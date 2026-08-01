@@ -24,12 +24,15 @@ ship three scripts that cannot execute:
   the durable ``.lane-state`` record, and a silently-absent reader would
   degrade reclaim back to the ``FREE ≈ flock-free`` approximation γ removed.
 * ``warm-lane-audit.sh`` sources TWO: ``$SCRIPT_DIR/lib_portable.sh``, and —
-  since dark-factory task 3074 (leaf β) — ``$SCRIPT_DIR/lib_lane_state.sh``,
-  behind a guard copied in shape from ``warm-lane-gc.sh``'s.  Unlike the other
-  two libs ``lib_lane_state.sh`` is dark-factory-NATIVE rather than a reify
-  relocation: it holds the facts only dark-factory owns (the ``.lane-state``
-  record format and ``PROTECTED_PREFIXES``), which is why the audit's
-  ``assigned`` column can no longer be produced without it.
+  since dark-factory task 3074 (leaf β) — ``$SCRIPT_DIR/lib_lane_state.sh``.
+  Both now sit behind the same ``exit 2`` guard shape copied from
+  ``warm-lane-gc.sh``'s; ``lib_portable.sh``'s was added by task 3370 (README
+  "Delta 8") and is ordered FIRST, so a copy carrying neither sibling reports
+  it rather than the lane-state one.  Unlike the other two libs
+  ``lib_lane_state.sh`` is dark-factory-NATIVE rather than a reify relocation:
+  it holds the facts only dark-factory owns (the ``.lane-state`` record format
+  and ``PROTECTED_PREFIXES``), which is why the audit's ``assigned`` column can
+  no longer be produced without it.
 
 Running each with ``--help`` from the new directory is the executable proof
 that all three libs actually travelled along.
@@ -121,11 +124,10 @@ class TestSiblingLibsTravelledWithTheScripts:
     """The three lib-sourcing scripts actually run from the new directory.
 
     Each is invoked with ``--help`` (read-only, no mount, no subprocess side
-    effects) from ``orchestrator/scripts/warm-lane/``.  A missing sibling lib
-    surfaces in one of two shapes, and both are asserted against: the script's
-    own fail-loud wiring message + ``exit 2`` (``lib_live_refs.sh`` in the gc
-    scripts, ``lib_lane_state.sh`` in the audit), or bash's bare ``source``
-    failure (``lib_portable.sh``, which has no explicit guard).
+    effects) from ``orchestrator/scripts/warm-lane/``.  Since task 3370 closed
+    the last gap there is ONE shape for a missing sibling, and it is what these
+    cases assert against: the script's own fail-loud wiring message + ``exit
+    2``, for all three libs.
     """
 
     #: Exit 2 is the wiring/usage sentinel both gc scripts use for
@@ -135,7 +137,14 @@ class TestSiblingLibsTravelledWithTheScripts:
     #: The verbatim fail-loud fragments emitted by the sourcing scripts' guards.
     FAIL_LOUD_FRAGMENTS = (
         'lib_live_refs.sh not found next to',
-        'lib_portable.sh: No such file',
+        # Task 3370 gave lib_portable.sh an explicit guard, so bash's bare
+        # ``source`` shape ('lib_portable.sh: No such file') is no longer
+        # reachable for the only script that sources it — warm-lane-audit.sh,
+        # the sole consumer repo-wide — and the old fragment would now be a pin
+        # that can never fire.  The bare shape stays covered generically by the
+        # per-line scan below, which trips on any SOURCED_LIBS name appearing
+        # with 'No such file' OR 'not found'.
+        'lib_portable.sh not found next to',
         # The guard for dark-factory's own lane-state lib, shared VERBATIM by
         # warm-lane-audit.sh (task 3074, which established it) and
         # warm-lane-gc.sh (task 3075, which reused the exact string so this
@@ -768,9 +777,10 @@ class TestSiblingResolutionIgnoresTheCallersCwd:
         Asserted on the RESOLVED PATH, not the exit code, for the reason in the
         class docstring.  README.md "Delta 7" records what the exit code
         actually was on base and why it did not match the filed expectation;
-        the unguarded-``lib_portable.sh`` gap it names is real and separately
-        actionable, but it is a behaviour change this task's Delta does not
-        make.
+        the unguarded-``lib_portable.sh`` gap it names was closed separately by
+        task 3370 (README "Delta 8").  That does not change what this case
+        asserts: the exit code here is a function of the CALLER'S CWD rather
+        than of the defect, which is why the resolved path remains the subject.
         """
         proc = self._help_under_a_hidden_dirname(
             'warm-lane-audit.sh', cwd=tmp_path, tmp_path=tmp_path,
