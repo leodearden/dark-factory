@@ -4266,15 +4266,22 @@ def test_print_fused_memory_liveness_row(
     for verdict_token, ss_stdout, health_outcome in scenarios:
         recorded_calls: list[list[str]] = []
 
-        def fake_run(cmd, **kwargs):  # noqa: ANN001
-            recorded_calls.append(list(cmd))
+        # The loop variables are bound explicitly as KEYWORD-ONLY defaults (so no
+        # positional caller can ever reach them). A closure defined in a loop
+        # otherwise reads whatever the name holds when it is CALLED, not when it
+        # was defined (B023) — benign only while every call stays inside the same
+        # iteration, which nothing here enforces. `_recorded` is the same list
+        # object `recorded_calls` names, so the assertion below still sees the
+        # appends.
+        def fake_run(cmd, *, _recorded=recorded_calls, _ss=ss_stdout, **kwargs):  # noqa: ANN001
+            _recorded.append(list(cmd))
             assert cmd[0] == "ss", f"unexpected subprocess.run call: {cmd}"
-            return subprocess.CompletedProcess(cmd, 0, stdout=ss_stdout, stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout=_ss, stderr="")
 
-        def fake_urlopen(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
-            if isinstance(health_outcome, Exception):
-                raise health_outcome
-            return _FakeHealthResponse(health_outcome)
+        def fake_urlopen(*args, _outcome=health_outcome, **kwargs):  # noqa: ANN001, ANN002, ANN003
+            if isinstance(_outcome, Exception):
+                raise _outcome
+            return _FakeHealthResponse(_outcome)
 
         monkeypatch.setattr(subprocess, "run", fake_run)
         monkeypatch.setattr(wdog.urllib.request, "urlopen", fake_urlopen)

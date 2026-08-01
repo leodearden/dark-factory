@@ -341,8 +341,8 @@ class TestLoadState:
     def test_well_formed_is_ok(self, tmp_path):
         path = tmp_path / 'trickle-state.json'
         path.write_text(
-            '{"schema_version": %d, "project_id": "dark_factory", '
-            '"outcome": "quiet"}' % trickle_state.STATE_SCHEMA_VERSION
+            f'{{"schema_version": {trickle_state.STATE_SCHEMA_VERSION}, '
+            f'"project_id": "dark_factory", "outcome": "quiet"}}'
         )
 
         status, data = trickle_state.load_state(path)

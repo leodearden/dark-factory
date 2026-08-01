@@ -201,7 +201,7 @@ def test_reify_and_df_differ_only_in_config_and_description() -> None:
     )
 
     diff_lines: list[tuple[int, str, str]] = []
-    for i, (dl, rl) in enumerate(zip(df_lines, reify_lines)):
+    for i, (dl, rl) in enumerate(zip(df_lines, reify_lines, strict=True)):
         if dl != rl:
             diff_lines.append((i + 1, dl, rl))
 

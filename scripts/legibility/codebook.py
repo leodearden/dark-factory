@@ -11,6 +11,7 @@ append-only, never-delete.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import json
 import os
@@ -574,10 +575,8 @@ def dump(codebook: dict, path: str | os.PathLike) -> None:
             f.write(body)
         os.replace(tmp_file, path)
     except BaseException:
-        try:
+        with contextlib.suppress(OSError):
             os.remove(tmp_file)
-        except OSError:
-            pass
         raise
 
 

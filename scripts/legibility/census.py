@@ -43,6 +43,7 @@ and ``codebook.assert_no_deletion()`` confirm the write is safe.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import functools
 import json
@@ -630,10 +631,8 @@ def advance_census_state(
             json.dump(state, f)
         os.replace(tmp_file, path)
     except BaseException:
-        try:
+        with contextlib.suppress(OSError):
             os.remove(tmp_file)
-        except OSError:
-            pass
         raise
 
 

@@ -39,6 +39,7 @@ that let a suppressed night read like a quiet one for 14 nights
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -368,10 +369,8 @@ def record_run(
             f.write('\n')
         os.replace(tmp_path, path)
     except OSError:
-        try:
+        with contextlib.suppress(OSError):
             tmp_path.unlink()
-        except OSError:
-            pass
         raise
 
     return doc

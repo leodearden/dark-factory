@@ -97,10 +97,14 @@ def _iter_json_lines(path: Path) -> Iterator[dict[str, Any]]:
     ``gzip.BadGzipFile`` (a corrupt ``.gz``) is an ``OSError`` subclass, so
     the caller's existing ``except OSError`` degrade path already covers it.
     """
+    # noqa SIM115 x2: the branch only PICKS the opener; the handle is closed by
+    # the `with f:` two lines down. Collapsing it into the `with` would mean
+    # duplicating the loop body, and the plain-path call is kept verbatim for
+    # the byte-parity this docstring pins.
     if str(path).endswith('.gz'):
-        f = gzip.open(path, 'rt', encoding='utf-8')
+        f = gzip.open(path, 'rt', encoding='utf-8')  # noqa: SIM115
     else:
-        f = open(path, encoding='utf-8')
+        f = open(path, encoding='utf-8')  # noqa: SIM115
     with f:
         for line in f:
             line = line.strip()
