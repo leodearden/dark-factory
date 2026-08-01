@@ -534,6 +534,12 @@ The merge procedure is iterative — don't assume one pass will be enough:
     - `superseded` → the successor was itself superseded (a further generation advance, or
       absorption into a train). Re-read its `superseded_by` and re-enter this bullet from the
       top against that value; the 20-minute ceiling is shared across the whole chain.
+    - `unknown` → the successor's record is gone (orchestrator restarted, or the retention ring
+      expired). This is terminal on the `request_id` arm from the **very first tick** — it does
+      not wait for the 20-minute ceiling. Do **not** fall through to *Polled terminal failures*'
+      plain `unknown` rule: that ends in "loop back to step 7 (resubmit)", and the successor may
+      still be in flight, which is the double-merge race this bullet exists to forbid. Go
+      straight to the branch-handle fallback below.
   - **`coalesce-*` id** (coalesce-train path) — this names the *train*, not a request. It
     resolves through none of `merge_status`'s tiers (no retention-ring alias is ever recorded
     for a train id, no event-store finalized row is keyed on one, and Tier 3.5's git-authority
@@ -541,10 +547,10 @@ The merge procedure is iterative — don't assume one pass will be enough:
     honest `state: "unknown"` that will never resolve to anything else. Do not poll it by
     `request_id`.
 
-  For the `coalesce-*` case, or an `mr-*` poll that is still `unknown` at its
-  20-minute ceiling: **do not fall through to step 7's plain `unknown` rule** — that rule
-  resubmits, which is exactly the race this bullet exists to forbid. Instead stop polling by
-  `request_id` and fall back to the `branch` handle plus the
+  For the `coalesce-*` case, or an `mr-*` poll that returns `unknown` on **any** tick (including
+  the first) or is still unresolved at its 20-minute ceiling: **do not fall through to step 7's
+  plain `unknown` rule** — that rule resubmits, which is exactly the race this bullet exists to
+  forbid. Instead stop polling by `request_id` and fall back to the `branch` handle plus the
   [canonical ancestry check](#branch-on-main) — rc=128 exact-subject merge-marker search
   included:
   ```
@@ -562,17 +568,28 @@ The merge procedure is iterative — don't assume one pass will be enough:
   serves; taking it as "not landed" would report a successful merge to the human as a failure and
   leave the task un-flipped. So:
   - Ancestry `rc=0` is authoritative — landed — while the ref still exists.
-  - On rc=128-with-empty-marker, do not conclude anything yet. There are exactly **two**
-    affirmative landing signals, and only these two:
+  - Ancestry `rc=1` (the branch ref **exists** and its commits are genuinely not on main) is
+    equally authoritative the other way, and on these unscoped arms it is the affirmative
+    **stale-record tell**: this attempt's commits are demonstrably not on main, so the
+    `superseded` hit belongs to an *earlier round* for this same reused branch/task_id. Do
+    **not** consult signals (a) or (b) here — both are round-1 artifacts that still read
+    "landed" (that train really did land, and `mark_member_done` really did flip this task
+    then), so consulting them would flip the task `done` with the old tip's SHA while this
+    round's commits sit unmerged. Disregard the `superseded` hit, resume branch-handle polling
+    to the 20-minute ceiling, and stop-and-report if it never lands. Never resubmit here.
+  - **Only under rc=128-with-empty-marker**, do not conclude anything yet — and only here are
+    signals (a) and (b) consultable at all. There are exactly **two** affirmative landing
+    signals, and only these two:
     **(a)** the **tip's** merge marker on main — `git log main --fixed-strings
     --grep="Merge task/<TIP_ID> into main" --max-count=1 --format=%H` (with a
     `coalesce-<TIP_ID>-<hex>` id the tip id is readable straight off it); and
     **(b)** **this task's own scheduler status** having been flipped to `done`, which the
     orchestrator does for every absorbed member once the train lands (`mark_member_done`,
     `orchestrator/src/orchestrator/harness.py:1011`).
-  - Either one saying landed → the merge succeeded; proceed to step 8 with the train's advanced SHA
-    as `done_provenance={"kind": "found_on_main", "commit": "<sha>", "note": "absorbed into train
-    <train_id>"}`. If the task is already `done`, the flip happened for you — no write needed.
+  - Under rc=128-with-empty-marker only, either one saying landed → the merge succeeded; proceed
+    to step 8 with the train's advanced SHA as `done_provenance={"kind": "found_on_main",
+    "commit": "<sha>", "note": "absorbed into train <train_id>"}`. If the task is already `done`,
+    the flip happened for you — no write needed.
   - **`get_merge_queue()` no longer showing the train is NOT a landing signal.** It means only
     "stop waiting on the train," and is equally consistent with a **derail**: on any non-`done`
     train outcome the orchestrator re-pends the still-unlanded members for solo re-merge
@@ -581,9 +598,11 @@ The merge procedure is iterative — don't assume one pass will be enough:
     neither (a) nor (b), the correct action is to **resume polling the `branch` handle** to the
     20-minute ceiling — the orchestrator's re-drive lands it — never to flip the task.
 
-  Stop-and-report to the human only if ancestry, signal (a), and signal (b) all come back
-  not-landed *after* the branch-handle polling above has reached its ceiling. A not-landed
-  ancestry result is never overridden by queue-absence.
+  Stop-and-report to the human in exactly two cases: under rc=128-with-empty-marker once both
+  signal (a) and signal (b) come back not-landed, or under rc=1 once the branch-handle polling
+  above has reached its ceiling. An rc=1 ancestry result is never overridden by signal (a),
+  signal (b), or queue-absence — signals (a)/(b) are consultable **only** under
+  rc=128-with-empty-marker.
 
 *Abandonment (`merge_cancel`):*
 
