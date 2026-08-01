@@ -28,6 +28,8 @@ import asyncio
 import collections
 import contextlib
 import dataclasses
+import logging
+import traceback
 from pathlib import Path
 from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -4608,11 +4610,17 @@ class TestRedispatchSpeculativeConservation:
         self,
         git_ops: GitOps,
         config: OrchestratorConfig,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """The I4 speculation-slot identity holds at every heartbeat-observable
         point while a genuinely speculative item sits parked on
         ``_redispatch``, and no ``merge_resource_leak`` escalation ever fires.
+
+        Also (task 3477): the disposition classifier must not silently
+        degrade to its fail-open path while processing this test's failing
+        VerifyResult double — see the caplog guard at the end of this test.
         """
+        caplog.set_level(logging.WARNING, logger='orchestrator.merge_disposition')
         gate_a_release = asyncio.Event()
         gate_a_entered = asyncio.Event()
         _local_calls: list[int] = [0]
@@ -4796,6 +4804,30 @@ class TestRedispatchSpeculativeConservation:
         )
         assert 'rc_b.py' in main_files, 'B (rc_b.py) must land on main after remerge'
         assert 'rc_a.py' not in main_files, 'A (rc_a.py) must NOT land (verify failed)'
+
+        # task 3477: A's VerifyResult double (passed=False) reaches
+        # classify_merge_failure_disposition via the real post-merge-verify
+        # path. That classifier must complete honestly, not silently degrade
+        # to its fail-open path (merge_disposition.py:710-719) because the
+        # double's cause_hint/test_output shape confused
+        # _extract_failing_tests_and_candidate_files. This guard is what
+        # proves the (b) fidelity fix actually reached this call site — any
+        # future double built without a real cause_hint re-trips it.
+        fail_open_records = [
+            r for r in caplog.records
+            if 'internal error; degrading to INDETERMINATE (fail-open, I3)' in r.message
+        ]
+        assert fail_open_records == [], (
+            'classify_merge_failure_disposition degraded to the silent '
+            'fail-open path while classifying A\'s failing verify — the '
+            'VerifyResult double reached _extract_failing_tests_and_'
+            'candidate_files and raised instead of returning a real '
+            'disposition. Offending record(s):\n' + '\n'.join(
+                ''.join(traceback.format_exception(*r.exc_info))
+                if r.exc_info else r.message
+                for r in fail_open_records
+            )
+        )
 
 
 # ---------------------------------------------------------------------------
