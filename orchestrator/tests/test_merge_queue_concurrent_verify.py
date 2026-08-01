@@ -4902,3 +4902,72 @@ class TestFinalizeHeadSpeculativeAccountingThroughout:
             'speculation-slot identity must hold after the finalizing head '
             'releases its permit in the finally clause.'
         )
+
+
+# ---------------------------------------------------------------------------
+# task 3477 step-1 RED: _fake_verify_result factory contract
+# ---------------------------------------------------------------------------
+#
+# None of the 18 inline VerifyResult-shaped `MagicMock(passed=..., summary=...,
+# test_output=..., ...)` doubles in this file set `cause_hint`, so an
+# unconfigured attribute read on a bare MagicMock auto-vivifies a truthy
+# child Mock instead of a real string. Every FAILING double reaches
+# merge_disposition.py:218-221's
+# `'\n'.join(part for part in (verify_result.cause_hint, verify_result.test_output) if part)`,
+# which raises `TypeError: sequence item 0: expected str instance, MagicMock
+# found`. classify_merge_failure_disposition (merge_disposition.py:710-719)
+# swallows that into a silent fail-open — WARNING
+# "classify_merge_failure_disposition: internal error; degrading to
+# INDETERMINATE (fail-open, I3)" — so the affected tests only APPEAR to
+# exercise disposition classification. `_fake_verify_result` (GREEN:
+# task 3477 step-2, added beside `_mock_verify_result` above) fixes this at
+# the source: a `MagicMock(spec=VerifyResult)` seeded from a REAL
+# VerifyResult's field defaults, so `cause_hint` (and every other field) is
+# authoritative and future fields are picked up automatically.
+# ---------------------------------------------------------------------------
+
+
+class TestFakeVerifyResultFidelity:
+    """`_fake_verify_result` doubles must survive the real disposition-
+    classification extraction path, unlike a bare `MagicMock(passed=...)`.
+    """
+
+    def test_failing_double_survives_disposition_extraction(self) -> None:
+        """A failing `_fake_verify_result` double must not TypeError inside
+        `_extract_failing_tests_and_candidate_files`.
+
+        RED (pre task-3477 step-2): NameError: name '_fake_verify_result' is
+        not defined.
+        """
+        from orchestrator.merge_disposition import (
+            _extract_failing_tests_and_candidate_files,
+        )
+
+        double = _fake_verify_result(
+            passed=False,
+            summary='test_failure',
+            test_output='FAILED',
+            category='test_failure',
+        )
+
+        failing_tests, candidate_files = _extract_failing_tests_and_candidate_files(
+            double,
+        )
+        assert (failing_tests, candidate_files) == ((), ()), (
+            f'Expected an uninformative failing double to degrade to the '
+            f'honest empty-candidate-set return, not raise or manufacture a '
+            f'false candidate; got {(failing_tests, candidate_files)!r}.'
+        )
+
+        # Root-cause pin: a bare MagicMock auto-vivifies `.cause_hint` as a
+        # truthy child Mock (not a str) — that is the whole bug. The factory
+        # must seed a real string default (VerifyResult's own default: '')
+        # instead.
+        assert isinstance(double.cause_hint, str), (
+            f'Expected double.cause_hint to be a real str (the VerifyResult '
+            f'default is \'\'), not an auto-vivified MagicMock child; got '
+            f'{double.cause_hint!r} ({type(double.cause_hint)!r}). This is '
+            f'the root cause of the file-wide fail-open: '
+            f'_extract_failing_tests_and_candidate_files joins '
+            f'(cause_hint, test_output) and str.join rejects a non-str item.'
+        )
