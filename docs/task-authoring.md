@@ -272,6 +272,45 @@ branch) rather than the false "implementation has not delivered". The
 orchestrator additionally honors an explicitly-set `metadata.cross_repo` for
 the absolute-path-foreign shape it can classify without the registry.
 
+**Merely CITING another project's paths in prose is not a scope error.** A
+task whose description references `orchestrator/src/foo.py` as evidence, as
+a thing to mirror, or as prior art is created normally — the citation never
+blocks anything. It can, however, attract the advisory annotation
+`metadata.possible_scope_mismatch` (plus a non-blocking `scope_violation`
+escalation an operator then has to read), because a prose scan cannot tell
+"modifies X" from "mentions X".
+
+A **declared deliverable** can, so it is what the advisory is attributed on.
+The annotation is suppressed when your declared deliverables attest local
+work — meaning **both** of:
+
+- at least one entry across `metadata.files`, `metadata.files_to_modify` or
+  `metadata.modules` is owned by the project you are filing into, **and**
+- **no** entry across those three keys is owned by a *different* project.
+
+When both hold, the prose citation is treated as incidental and neither the
+annotation nor the escalation fires. **Supplying accurate deliverable
+metadata is therefore the supported way to keep a legitimately
+cross-repo-*referencing* task quiet** — and it is worth doing regardless,
+since the same fields drive scope assignment and the pre-merge delivery
+gate. Declaring only *unowned* paths (`README.md`, `docs/x.md`) does **not**
+count: that is no evidence of local work, so the advisory still fires.
+
+For the residual case — a task that genuinely belongs here but can declare
+no filer-owned deliverable at all — pass `metadata.routing_override_reason`
+(a non-empty string). It is the pre-existing explicit bypass and skips the
+path-scope guards entirely, both the advisory **and** the hard reject, so
+use it only when you are sure the task belongs to the submitting project.
+
+None of this relaxes the rule above. A submission whose **`metadata.files`**
+mix local and foreign entries is still a hard reject — attribution is
+consulted only after that check has already passed, so a locally-owned entry
+can never buy a mixed `files` list past it. A foreign entry that the reject
+never classified (one in `metadata.modules`, or in `metadata.files_to_modify`
+when `metadata.files` is also present and takes precedence) does not reject,
+but it *does* fail the second condition above, so such a submission keeps the
+annotation and the escalation rather than being silently suppressed.
+
 ### 3.3 Delivered-check dependency gate (`metadata.delivered_checks`)
 
 A **local** (same-project) dependency can additionally carry

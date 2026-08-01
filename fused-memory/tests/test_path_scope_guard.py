@@ -792,6 +792,215 @@ class TestAllFilesForeignOwner:
 
 
 # ---------------------------------------------------------------------------
+# Task 3106: POSITIVE local attribution — local_deliverable_attested
+#
+# The prose scanner cannot distinguish "modifies X" from "merely cites X".  A
+# DECLARED deliverable can: a submission that names at least one file/module
+# owned by the FILING project has positively attested local work, so a foreign
+# path appearing in its prose is an incidental citation, not a misrouting.
+# ---------------------------------------------------------------------------
+
+
+class TestLocalDeliverableAttested:
+    """Unit tests for local_deliverable_attested — the POSITIVE attribution.
+
+    Gate for outcome (3) of the taxonomy in this module's docstring, which
+    is the canonical statement of it; the function's own docstring carries
+    the two conditions attestation requires.  These tests pin the boundaries
+    of each: which entries attest, which are neutral, and which veto.
+    """
+
+    def test_one_locally_owned_entry_attests(self, tmp_path):
+        from fused_memory.middleware.path_scope_guard import local_deliverable_attested
+
+        registry = _two_project_registry(tmp_path)
+        assert local_deliverable_attested(
+            ['fused-memory/src/x.py'], 'dark_factory', registry,
+        ) is True
+
+    def test_mixed_local_and_unowned_attests(self, tmp_path):
+        """One local entry is enough — an unowned sibling never cancels it."""
+        from fused_memory.middleware.path_scope_guard import local_deliverable_attested
+
+        registry = _two_project_registry(tmp_path)
+        # Anti-vacuity: README.md really is unowned, so the True below can
+        # only come from the fused-memory/ entry.
+        assert registry.project_for_path('README.md') is None
+        assert local_deliverable_attested(
+            ['fused-memory/src/x.py', 'README.md'], 'dark_factory', registry,
+        ) is True
+
+    def test_only_unowned_entries_do_not_attest(self, tmp_path):
+        """Unowned entries are NEUTRAL — they never establish attribution.
+
+        This is the retained-protection boundary: declaring only unowned
+        files is no evidence of local work, so the prose advisory still
+        fires.  Matches _aggregate_owner_mismatches' conservative direction.
+        """
+        from fused_memory.middleware.path_scope_guard import local_deliverable_attested
+
+        registry = _two_project_registry(tmp_path)
+        assert registry.project_for_path('README.md') is None
+        assert registry.project_for_path('docs/plan.md') is None  # docs/ is generic
+        assert local_deliverable_attested(
+            ['README.md', 'docs/plan.md'], 'dark_factory', registry,
+        ) is False
+
+    def test_only_foreign_entries_do_not_attest(self, tmp_path):
+        from fused_memory.middleware.path_scope_guard import local_deliverable_attested
+
+        registry = _two_project_registry(tmp_path)
+        # Anti-vacuity: the entry IS classified, and to the OTHER project —
+        # so False below means "foreign", not "unclassifiable".
+        assert registry.project_for_path('crates/widget.rs') == 'reify'
+        assert local_deliverable_attested(
+            ['crates/widget.rs'], 'dark_factory', registry,
+        ) is False
+
+    def test_empty_or_none_signals_do_not_attest(self, tmp_path):
+        from fused_memory.middleware.path_scope_guard import local_deliverable_attested
+
+        registry = _two_project_registry(tmp_path)
+        assert local_deliverable_attested([], 'dark_factory', registry) is False
+        assert local_deliverable_attested(None, 'dark_factory', registry) is False
+
+    def test_empty_registry_does_not_attest(self, tmp_path):
+        """A falsy registry can classify nothing, so nothing attests."""
+        from fused_memory.middleware.path_scope_guard import local_deliverable_attested
+
+        empty = ProjectPrefixRegistry()
+        assert not empty
+        assert local_deliverable_attested(
+            ['fused-memory/src/x.py'], 'dark_factory', empty,
+        ) is False
+
+    def test_absolute_path_under_own_root_attests(self, tmp_path):
+        """Inherits project_for_path's ABSOLUTE root-authoritative regime.
+
+        The relative spelling 'README.md' is unowned (asserted above), but
+        the SAME file named absolutely under the filing project's own root is
+        owned by it — proof the function delegates rather than re-implementing
+        prefix matching.
+        """
+        from fused_memory.middleware.path_scope_guard import local_deliverable_attested
+
+        registry = _two_project_registry(tmp_path)
+        df_root = registry.root_for_project('dark_factory')
+        assert df_root is not None
+        assert local_deliverable_attested(
+            [f'{df_root}/README.md'], 'dark_factory', registry,
+        ) is True
+
+    def test_bare_directory_entry_attests(self, tmp_path):
+        """A declared DIRECTORY attests — no right-boundary requirement.
+
+        'fused-memory' (no trailing slash, no file after it) is exactly the
+        shape find_paths deliberately does NOT lex as a path (task 3120's
+        two-sided anchoring).  Attribution uses the certain project_for_path
+        lookup instead, so metadata.modules-style directory entries count.
+        """
+        from fused_memory.middleware.path_scope_guard import local_deliverable_attested
+
+        registry = _two_project_registry(tmp_path)
+        assert find_paths('fused-memory', registry.all_prefixes()) == []
+        assert local_deliverable_attested(
+            ['fused-memory'], 'dark_factory', registry,
+        ) is True
+
+    def test_mixed_local_and_foreign_does_not_attest(self, tmp_path):
+        """A FOREIGN entry anywhere in the union vetoes attestation.
+
+        The caller's upstream check_files_for_scope classifies a NARROWER
+        list — only ``files``, or (when absent) ``files_to_modify``, never
+        ``modules`` — so a foreign entry in the union's non-overlapping
+        remainder was never seen by the hard reject. Declining to attest
+        keeps such a mixed declaration on the unchanged advisory path
+        instead of letting one local entry buy silence for it.
+        """
+        from fused_memory.middleware.path_scope_guard import local_deliverable_attested
+
+        registry = _two_project_registry(tmp_path)
+        # Anti-vacuity: both entries really are classified, to DIFFERENT
+        # projects — so False below is the foreign VETO, not a lookup miss.
+        assert registry.project_for_path('fused-memory/src/x.py') == 'dark_factory'
+        assert registry.project_for_path('crates/widget.rs') == 'reify'
+
+        assert local_deliverable_attested(
+            ['fused-memory/src/x.py', 'crates/widget.rs'], 'dark_factory', registry,
+        ) is False
+        # Order-independent: the veto does not depend on which entry is first.
+        assert local_deliverable_attested(
+            ['crates/widget.rs', 'fused-memory/src/x.py'], 'dark_factory', registry,
+        ) is False
+
+
+class TestLocalAttestingSignals:
+    """Unit tests for local_attesting_signals — the WITNESS-returning form.
+
+    local_deliverable_attested is bool() of this, so the predicate and the
+    witness the interceptor logs cannot drift, and every signal is
+    classified exactly once per submission.
+    """
+
+    def test_returns_only_the_locally_owned_entries(self, tmp_path):
+        from fused_memory.middleware.path_scope_guard import local_attesting_signals
+
+        registry = _two_project_registry(tmp_path)
+        assert registry.project_for_path('README.md') is None
+
+        assert local_attesting_signals(
+            ['README.md', 'fused-memory/src/x.py', 'fused-memory'],
+            'dark_factory',
+            registry,
+        ) == ['fused-memory/src/x.py', 'fused-memory']
+
+    def test_foreign_entry_returns_empty_witness(self, tmp_path):
+        """The veto returns [] — never a partial witness naming local entries.
+
+        A partial witness would log an attestation the interceptor did not
+        act on, which is worse than no record at all.
+        """
+        from fused_memory.middleware.path_scope_guard import local_attesting_signals
+
+        registry = _two_project_registry(tmp_path)
+        assert local_attesting_signals(
+            ['fused-memory/src/x.py', 'crates/widget.rs'], 'dark_factory', registry,
+        ) == []
+
+    def test_predicate_is_bool_of_the_witness(self, tmp_path):
+        """Pin the no-drift relationship the two functions are built on."""
+        from fused_memory.middleware.path_scope_guard import (
+            local_attesting_signals,
+            local_deliverable_attested,
+        )
+
+        registry = _two_project_registry(tmp_path)
+        for signals in (
+            None,
+            [],
+            ['README.md'],
+            ['fused-memory/src/x.py'],
+            ['crates/widget.rs'],
+            ['fused-memory/src/x.py', 'crates/widget.rs'],
+            ['fused-memory/src/x.py', 'README.md'],
+        ):
+            assert local_deliverable_attested(
+                signals, 'dark_factory', registry,
+            ) is bool(local_attesting_signals(signals, 'dark_factory', registry)), (
+                f'predicate/witness disagreement for {signals!r}'
+            )
+
+    def test_empty_registry_returns_empty_witness(self, tmp_path):
+        from fused_memory.middleware.path_scope_guard import local_attesting_signals
+
+        empty = ProjectPrefixRegistry()
+        assert not empty
+        assert local_attesting_signals(
+            ['fused-memory/src/x.py'], 'dark_factory', empty,
+        ) == []
+
+
+# ---------------------------------------------------------------------------
 # Task 3109: ABSOLUTE metadata.files entries are classified identically to
 # their repo-relative spelling.
 #
