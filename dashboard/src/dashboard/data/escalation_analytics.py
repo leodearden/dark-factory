@@ -731,6 +731,25 @@ def build_escalation_analytics(
 
     ``downsample_threshold`` bounds each project's ``lifespan.samples`` —
     see :func:`_lifespan_block` and :func:`_downsample_stratified`.
+
+    ``archives_present`` reports whether this scan actually REACHED every
+    configured archive: True iff each *escalations_dir* is an extant
+    directory.  It exists because nothing else in the payload can answer that
+    — :func:`iter_all_escalation_paths` returns silently on a missing dir and
+    :meth:`Path.glob` swallows ``PermissionError``, so an absent archive, an
+    unreadable one and a genuinely empty one otherwise produce byte-identical
+    entries.  The route uses it as its cache predicate: a payload built
+    without reaching the archive is served but not pinned for the TTL window.
+
+    Its LIMIT, stated because a signal is only useful if its blind spot is
+    known: this is ONE ``is_dir`` stat per project.  It distinguishes the
+    ABSENT/unmounted case, not every permission flap — a directory that
+    exists but whose own mode is stripped still passes ``is_dir`` and then
+    globs empty.  It is deliberately not ``parse_failures``, which counts
+    unparseable RECORDS: that count is a permanent property of a corrupt
+    file, so a cache keyed on it would be defeated forever in front of the
+    ~10k-record walk the cache exists to prevent.  The two fields answer
+    different questions and neither is derived from the other.
     """
     resolved_now = resolve_now(now)
 
@@ -752,4 +771,10 @@ def build_escalation_analytics(
         'parse_failures': parse_failures,
         'regime_markers': markers,
         'per_project': per_project,
+        # ``all``, not ``any``: a payload missing one root's archive is a
+        # PARTIAL scan, and the missing root is the one most likely to appear
+        # on the next poll.
+        'archives_present': all(
+            Path(escalations_dir).is_dir() for _label, escalations_dir, _runs_db in project_dirs
+        ),
     }

@@ -1518,6 +1518,22 @@ async def api_escalation_analytics(request: Request) -> JSONResponse:
     within the TTL window are free. No clock read here — the aggregator
     resolves `now` once internally via resolve_now (clock-discipline guard
     scans dashboard/data/*.py + app.py; resolve_now is the sanctioned site).
+
+    A scan that never REACHED an archive is served but NOT cached
+    (archives_present), matching api_memory_evals' root_scan_succeeded gate —
+    the two routes are one idiom and are kept so deliberately. Re-checking
+    costs one is_dir stat per project, while caching it keeps the tab
+    reporting an empty archive for a full TTL window after the volume mounts.
+    Deliberately NOT keyed on parse_failures: that counts unparseable records
+    and is permanent for a corrupt file, so gating on it would defeat the
+    cache forever in front of the very walk it protects.
+
+    Accepted, LOUD trade-off: a multi-project config with a root that
+    legitimately has no data/escalations dir makes this payload permanently
+    uncacheable. TTLCache's per-key lock serializes cold callers, so that
+    degrades to one walk at a time rather than N in parallel — and
+    archives_present: false sits in the payload, so the misconfiguration is
+    visible and fixable rather than a silent perf cliff.
     """
     config: DashboardConfig = request.app.state.config
     project_dirs = _analytics_project_dirs(config)
@@ -1526,7 +1542,9 @@ async def api_escalation_analytics(request: Request) -> JSONResponse:
     async def _refresh() -> dict:
         return await asyncio.to_thread(build_escalation_analytics, project_dirs)
 
-    result = await _analytics_cache.get_or_refresh(key, _refresh)
+    result = await _analytics_cache.get_or_refresh(
+        key, _refresh, cache_ok=lambda v: bool(v.get('archives_present')),
+    )
     return JSONResponse({'ESCALATION_ANALYTICS': result})
 
 
