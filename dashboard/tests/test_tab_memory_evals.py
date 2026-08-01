@@ -534,8 +534,8 @@ def test_tab_memory_evals_renders_eval_cards_and_trends(
     # SPELLED, not what the code does, and any junk alias satisfied it while a
     # safe unaliased import failed it.  The real invariant (no global
     # collision at in-browser-Babel load time) is enforced structurally by
-    # test_index_html_registers_tab_memory_evals_load_order and by the
-    # `const API` collision guard at line 467.
+    # test_index_html_registers_tab_memory_evals_load_order, which pins this
+    # file's script tag ahead of tabs.jsx.
     charts_pos = charts_destructure.start()
     fn_pos = body.index('function MemoryEvalsSection')
     assert charts_pos < fn_pos, (
