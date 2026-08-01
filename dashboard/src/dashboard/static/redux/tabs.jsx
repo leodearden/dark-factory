@@ -3,6 +3,10 @@ const { Sparkline: SP, LineChart: LC, StackedAreaChart: SA, BarChart: BC, HBarCh
 const { Glyph: GL, ProjectGroup, Segmented, ChipGroup } = window.DF_SHELL;
 const DF = window.DF_DATA;
 const { rtCell, rtAge } = window.DF_RUNTIME_FMT;
+// Unguarded, like the DF_* destructures above: index.html loads
+// tab_memory_evals.jsx BEFORE this file (guarded by test_tab_memory_evals.py),
+// which is the contract — the tab_scheduler.jsx:15 / DF_SCHED_HEATMAP idiom.
+const { MemoryEvalsSection } = window.DF_MEMORY_EVALS;
 // Guarded, unlike the DF_* destructures above: those globals gate real
 // rendering, but orchEmptyLabel only supplies one cosmetic empty-state label.
 // A 404'd / mis-ordered orch_filter.js must not throw here and blank every tab
@@ -662,6 +666,12 @@ function MemoryTab({ projectFilter }) {
             </tbody>
           </table>
         </div>
+      </div>
+
+      {/* Memory-eval monitoring (PRD DD3: a section here, not a new tab).
+          Placed last so the existing memory KPIs stay above the fold. */}
+      <div className="col-span-12">
+        <MemoryEvalsSection />
       </div>
     </div>
   );
