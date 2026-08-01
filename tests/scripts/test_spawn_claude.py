@@ -1104,11 +1104,13 @@ def _load_scaled_grace(base_secs: int, *, cap_secs: int = 30) -> int:
 # kills the backgrounded watchdog at parent exit, so the grace is only an
 # upper bound the watchdog polls to, never a wait the happy path pays.
 #
-# cap_secs=60 (below, unchanged from step-2) is above _load_scaled_grace's
-# own default cap of 30 -- which already binds at load-per-core 6.6, since
-# ceil(8*6.6)=53 -- while staying strictly below the 90s production default
-# (skills/spawn/spawn-claude.sh:89), so this pin never tests an unreachable
-# configuration.
+# cap_secs=60 (below) is RAISED by this change from _load_scaled_grace's
+# own default cap of 30 -- not unchanged. The raise is load-bearing, not
+# cosmetic: at load-per-core 6.6, ceil(8*6.6)=53 would otherwise be
+# clamped down to 30, discarding most of the load headroom the base bump
+# from 2 to 8 was meant to buy. 60 stays strictly below the 90s production
+# default (skills/spawn/spawn-claude.sh:89), so this pin never tests an
+# unreachable configuration.
 _NOT_FLAGGED_GRACE_BASE_SECS = 8
 
 
