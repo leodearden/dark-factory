@@ -153,11 +153,34 @@ _OVERRIDE_ANCHOR_TASK_ID: str = 'task-path-guard-override'
 # agent briefing (task 3119) and read as an order to redo landed work.
 _OVERRIDE_SUGGESTED_ACTION: str = 'review_override_justification'
 
-# Dedup discriminator for the override mode.  Same asymmetry rule as
-# _ADVISORY_FINGERPRINT_TOKEN: compute_content_fingerprint sorts and
-# \x1f-joins affected_ids before hashing, so adding a token to THIS mode alone
-# leaves the rejection and advisory digests byte-identical and keeps any of
-# their still-pending parents folding across this change.
+# Dedup discriminator for the override mode.  TWO composition points, both
+# load-bearing:
+#
+# 1. INDEPENDENCE.  Same asymmetry rule as _ADVISORY_FINGERPRINT_TOKEN:
+#    compute_content_fingerprint sorts and \x1f-joins affected_ids before
+#    hashing, so adding a token to THIS mode alone leaves the rejection and
+#    advisory digests byte-identical and keeps any of their still-pending
+#    parents folding across this change.  The three modes therefore cannot
+#    fold into each other, so a pending record of one can never absorb another
+#    and describe it with the wrong outcome (task 3119, now three-way).
+#
+# 2. THE REASON IS IN THE FINGERPRINT — unlike report_rejection, which folds on
+#    matched paths alone.  There the reason is the GUARD's own verdict, so the
+#    paths fully identify the event.  Here the reason is CALLER-SUPPLIED and is
+#    the very thing being audited: two overrides over the same paths with
+#    different justifications are two different claims an operator may judge
+#    differently.  Including it gets both ends right — an automated filer
+#    looping on one fixed justification files ONE record whose dedupe_count
+#    climbs (the flood shape that would otherwise get this reverted), while a
+#    genuinely new justification surfaces as a new record.  The reason is
+#    STRIPPED before hashing so the fold is stable across entry points
+#    (submit_task strips at task_interceptor.py; direct _path_guard_or_skip
+#    callers do not).
+#
+#    Residual, deliberately accepted: a filer that varies its reason string on
+#    every call defeats the fold by design.  That produces a visible burst of
+#    distinct records, which is itself the signal — the failure mode being
+#    fixed here is silence, not volume.
 _OVERRIDE_FINGERPRINT_TOKEN: str = 'mode:routing_override'
 
 # ``summary`` is the one-line field every operator view and agent briefing
@@ -546,8 +569,31 @@ class ScopeViolationEscalator:
                 detail=detail,
                 suggested_action=_OVERRIDE_SUGGESTED_ACTION,
                 level=1,
+                dedupe_fingerprint=compute_content_fingerprint(  # type: ignore[possibly-unbound]
+                    'scope_violation',
+                    'path_guard_misroute',
+                    affected_ids=sorted([
+                        *matched_paths,
+                        f'suggested:{suggested_project or "none"}',
+                        f'project:{project_id}',
+                        # Keeps this mode's digest disjoint from the rejection
+                        # and advisory digests — see _OVERRIDE_FINGERPRINT_TOKEN.
+                        _OVERRIDE_FINGERPRINT_TOKEN,
+                        # Unlike report_rejection, the CALLER's reason is part
+                        # of the fingerprint — see _OVERRIDE_FINGERPRINT_TOKEN
+                        # for why.  Already stripped above, so the fold is
+                        # identical whichever entry point supplied it.
+                        f'reason:{reason}',
+                    ]),
+                ),
             )
-            esc_id = queue.submit(esc)
+            config = DedupeConfig(  # type: ignore[possibly-unbound]
+                infra_dedupe_enabled=self._scope_violation_dedupe_enabled,
+                infra_dedupe_window_secs=float('inf'),
+                infra_dedupe_categories=(_CATEGORY,),
+                key_fn=content_fingerprint_key,  # type: ignore[possibly-unbound]
+            )
+            esc_id = submit_or_dedupe(queue, esc, config)['id']  # type: ignore[possibly-unbound]
         except Exception:
             logger.exception(
                 'scope_violation_escalator: failed to submit routing-override '
