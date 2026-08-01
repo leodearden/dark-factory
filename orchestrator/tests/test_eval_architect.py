@@ -1461,13 +1461,26 @@ class TestRunArchitectEval:
 # Task 3302: gate the LLM plan judge at the SOURCE.
 #
 # run_architect_eval's healthy branch called judge_plan_quality with no
-# scorability gate, and judge_plan_quality has no guard of its own — it returns
-# whatever the LLM says in [0, 1]. So a HEALTHY architect that produced a
+# scorability gate, and judge_plan_quality had no guard of its own — it returned
+# whatever the LLM said in [0, 1]. So a HEALTHY architect that produced a
 # stepless artifact persisted the self-contradictory cell
 # `cap_tainted=False, plan_steps=0, plan_quality=0.9`, which is exactly the
 # two-scorer disagreement score_plan_structure's anti-fabrication short-circuit
 # exists to prevent (Graphiti e2066ec6). Gating here keeps plan_steps and the
 # persisted plan_quality consistent for every NEW cell.
+#
+# Task 3303 then closed the other half — the INSTRUMENT refuses such an artifact
+# itself, pinned by TestJudgePlanQualityRefusesAnUnjudgeableArtifact above — so
+# the two blocks are one story: 3302 gated the CALL SITE, 3303 gated the
+# INSTRUMENT, and both consult the one is_scorable_plan predicate. This class
+# stays load-bearing regardless: it pins the runner-side consequences the
+# instrument cannot reach from where it stands — the taint decision, the
+# task_id × config.name log line, and that no opus call is made at all.
+#
+# _STEPLESS_PLANS is deliberately the narrower dict-only subset of
+# _UNSCORABLE_PLAN_SHAPES (line 103): run_architect_eval does
+# `plan = artifacts.read_plan() or {}`, so it can only ever pass a dict, whereas
+# the instrument's own corpus must also cover None / [] / 'x'.
 # ---------------------------------------------------------------------------
 
 _STEPLESS_PLANS = [
