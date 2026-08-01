@@ -17,7 +17,7 @@ import copy
 import json
 
 import pytest
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 import shared.task_metadata as task_metadata_module
 from shared.task_metadata import (
@@ -38,6 +38,26 @@ from shared.task_metadata import (
 )
 
 
+# Registry keys that PRODUCTION modules in OTHER import graphs register as an
+# import side effect: shared/deploy_state.py ('deploy_state') and
+# shared/capability_manifest.py ('delivered_checks'). Task 3352: a cross-package
+# pytest co-run (e.g. `pytest orchestrator/tests/... shared/tests/...`) imports
+# those modules first, so the REAL model already occupies the key and every stub
+# registration here raised
+# `ValueError: metadata sub-model already registered for 'deploy_state'`.
+# The fixture below installs a local sentinel under each of these keys so that
+# collision reproduces in an ISOLATED run of this file, instead of only in a
+# combined selection. Tests in this file MUST register test-owned keys only
+# (see _DEPLOY_STATE_STUB_KEY / TestListValuedSubmodelSlice._KEY).
+_FOREIGN_REGISTRANT_KEYS = ('deploy_state', 'delivered_checks')
+
+
+class _ForeignRegistrantSentinel(BaseModel):
+    """Stands in for a real out-of-module W10 registrant (never a test's model)."""
+
+    model_config = ConfigDict(extra='allow')
+
+
 @pytest.fixture(autouse=True)
 def _reset_metadata_registry_state():
     """Snapshot and restore task_metadata's module-global registry/migrations.
@@ -53,6 +73,17 @@ def _reset_metadata_registry_state():
     registry_snapshot = dict(getattr(task_metadata_module, '_SUBMODEL_REGISTRY', {}))
     had_migrations = hasattr(task_metadata_module, '_MIGRATIONS')
     migrations_snapshot = dict(getattr(task_metadata_module, '_MIGRATIONS', {}))
+    # Task 3352: simulate the cross-package co-run inside a single-file run by
+    # pre-occupying every foreign registrant key with a file-local sentinel, so
+    # a test in this file that registers a production key fails immediately
+    # rather than only in a combined selection. Assign directly rather than
+    # calling register_metadata_submodel — the helper would itself raise once a
+    # real registrant is present from a co-run, turning this guard into an error
+    # inside fixture setup. The teardown restore below keeps the sentinels from
+    # escaping this file.
+    if had_registry:
+        for _key in _FOREIGN_REGISTRANT_KEYS:
+            task_metadata_module._SUBMODEL_REGISTRY[_key] = _ForeignRegistrantSentinel
     yield
     if had_registry:
         task_metadata_module._SUBMODEL_REGISTRY.clear()
