@@ -465,7 +465,7 @@ def eval_dir(root: str | Path, eval_id: str) -> Path:
 
 def metrics_artifact_path(root: str | Path, eval_id: str, stamp: str) -> Path:
     """``<root>/<eval_id>/metrics-<STAMP>.json`` (M1 §3)."""
-    _validate_stamp(stamp, what='stamp')
+    _validate_stamp(stamp, what='metrics_artifact_path stamp')
     return eval_dir(root, eval_id) / f'metrics-{stamp}.json'
 
 
@@ -476,7 +476,7 @@ def report_artifact_path(root: str | Path, eval_id: str, stamp: str) -> Path:
     evaluator and dashboard read, this is what an operator reads when an
     escalation points them at a run.
     """
-    _validate_stamp(stamp, what='stamp')
+    _validate_stamp(stamp, what='report_artifact_path stamp')
     return eval_dir(root, eval_id) / f'report-{stamp}.txt'
 
 
@@ -658,10 +658,10 @@ def load_series_window(
     # second would report it.
     if before_stamp is not None:
         _validate_stamp(before_stamp, what='before_stamp')
-    eval_dir = Path(root) / eval_id
-    if not eval_dir.is_dir():
+    directory = eval_dir(root, eval_id)
+    if not directory.is_dir():
         return []
-    paths = sorted(eval_dir.glob('metrics-*.json'))
+    paths = sorted(directory.glob('metrics-*.json'))
     if before_stamp is not None:
         # Compare rendered filenames rather than re-parsing the stamp: the
         # zero-padded-UTC invariant this function already relies on to order the

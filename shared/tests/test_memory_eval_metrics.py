@@ -311,20 +311,18 @@ class TestArtifactWriter:
         report = report_artifact_path(tmp_path, 'e1-retrieval-health', '20260701T031500Z')
         assert directory == metrics.parent == report.parent
 
-    def test_eval_dir_does_not_validate_a_stamp_because_it_takes_none(self, tmp_path):
-        # Unlike the two path helpers below, eval_dir has no stamp argument at
-        # all — it is the helper a caller reaches for instead of threading a
-        # throwaway placeholder stamp through metrics_artifact_path just to
-        # discard it via .parent.
-        assert eval_dir(tmp_path, 'e1-retrieval-health') == tmp_path / 'e1-retrieval-health'
-
     def test_metrics_artifact_path_rejects_a_malformed_stamp(self, tmp_path):
-        with pytest.raises(MetricSchemaError):
+        # The message names the helper that rejected it, like every other stamp
+        # boundary in the module ($MEMORY_EVAL_RUN_STAMP, before_stamp, ...), so
+        # an operator reading it out of an escalation can locate the call site.
+        with pytest.raises(MetricSchemaError) as exc_info:
             metrics_artifact_path(tmp_path, 'e1-retrieval-health', '2026-07-04T03:15:00Z')
+        assert 'metrics_artifact_path' in str(exc_info.value)
 
     def test_report_artifact_path_rejects_a_malformed_stamp(self, tmp_path):
-        with pytest.raises(MetricSchemaError):
+        with pytest.raises(MetricSchemaError) as exc_info:
             report_artifact_path(tmp_path, 'e1-retrieval-health', '2026-07-04T03:15:00Z')
+        assert 'report_artifact_path' in str(exc_info.value)
 
     def test_run_stamp_honours_env_override(self, monkeypatch):
         monkeypatch.setenv('MEMORY_EVAL_RUN_STAMP', '20260704T031500Z')
@@ -383,10 +381,10 @@ class TestArtifactWriter:
         payload = _make_series(metrics=[_make_metric(value=1.4)])
         with pytest.raises(MetricSchemaError):
             write_metric_series(payload, tmp_path)
-        eval_dir = tmp_path / 'e1-retrieval-health'
+        directory = eval_dir(tmp_path, 'e1-retrieval-health')
         # Not even a partial or temp file: validate-then-write ordering, and the
         # atomic writer unlinks its mkstemp temp on any failure.
-        leftovers = list(eval_dir.rglob('*')) if eval_dir.exists() else []
+        leftovers = list(directory.rglob('*')) if directory.exists() else []
         assert leftovers == []
 
     def test_malformed_series_does_not_corrupt_an_existing_artifact(self, tmp_path):
@@ -431,8 +429,8 @@ class TestSeriesWindowLoader:
 
     def test_window_excludes_non_metric_files(self, tmp_path):
         self._seed(tmp_path, ['20260701T031500Z'])
-        eval_dir = tmp_path / 'e1-retrieval-health'
-        (eval_dir / 'limits-current.json').write_text('{}', encoding='utf-8')
+        directory = eval_dir(tmp_path, 'e1-retrieval-health')
+        (directory / 'limits-current.json').write_text('{}', encoding='utf-8')
         window = load_series_window(tmp_path, 'e1-retrieval-health', limit=5, before_stamp=None)
         assert [s.run_stamp for s in window] == ['20260701T031500Z']
 
