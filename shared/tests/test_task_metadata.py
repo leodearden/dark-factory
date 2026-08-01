@@ -40,7 +40,6 @@ from shared.task_metadata import (
     validate_model_overrides,
 )
 
-
 # Registry keys that PRODUCTION modules in OTHER import graphs register as an
 # import side effect: shared/deploy_state.py ('deploy_state') and
 # shared/capability_manifest.py ('delivered_checks'). Task 3352: a cross-package
