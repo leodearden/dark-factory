@@ -315,7 +315,7 @@ The merge procedure is iterative — don't assume one pass will be enough:
 
    - `status: "done"` or `status: "already_merged"` → **terminal success.** Thread the merge commit SHA:
      - Normal `done`: SHA is in `result["commit"]`.
-     - `already_merged`: SHA is in `result["commit"]` for the fast-path case. The worker-path `already_merged` may carry `commit=None`; when `result["commit"]` is falsy, re-derive from `git log main --oneline | head -5` or fall back to `done_provenance={"note": "merge already present on main"}`.
+     - `already_merged`: SHA is in `result["commit"]` for the fast-path case. The worker-path `already_merged` may carry `commit=None`; when `result["commit"]` is falsy, re-derive with the same exact-subject search the canonical check uses — `git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" --max-count=1 --format=%H` — or, if that comes back empty, fall back to `done_provenance={"note": "merge already present on main"}`. **Do not eyeball `git log main --oneline | head -5` and pick a SHA**: it is not scoped to this task and you would record an unrelated task's merge as this one's provenance.
 
      Go directly to step 8.
 
@@ -397,20 +397,26 @@ The merge procedure is iterative — don't assume one pass will be enough:
      # rc=1   → genuinely not on main. Keep polling / resubmit, per the arm.
      # rc=128 → branch ref is GONE ("fatal: Not a valid object name"). This is the
      #          normal state AFTER a successful merge + cleanup — it is NOT "not on
-     #          main". Search main for the merge commit instead:
-     git log main --oneline --merges | head -5      # or: git log main --grep="task/<TASK_ID>"
-     #          A hit → the merge landed; treat as done/found_on_main with that SHA.
-     #          No hit → only then treat it as not-landed.
+     #          main". Search main for THIS branch's merge commit (see below):
+     git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" \
+         --max-count=1 --format=%H
+     #          Non-empty output → that SHA IS the true merge commit; landed.
+     #          Empty output    → not landed (branch never existed, or never merged).
      ```
-     `branch_on_main()` above returns True for rc=0 and for a matched rc=128 marker, False only for rc=1 or an unmatched rc=128.
+     **The rc=128 search must be the exact-subject one above — never an unfiltered `git log main --merges | head -5`.** An unfiltered listing takes no task argument, so on any repo with merge history it always prints something; "a hit" would be unconditionally true, "no hit" unreachable, and every rc=128 — *including a typo'd branch name, the wrong worktree, or a branch that was never pushed*, which all exit 128 too — would be recorded as landed with some unrelated task's merge SHA. The server's `done_provenance` backstop is only `git merge-base --is-ancestor <sha> main`, which any recent merge on main passes, so nothing downstream would catch it.
+
+     This is the shape the in-repo authority uses — `GitOps.find_merge_marker` (`orchestrator/src/orchestrator/git_ops.py:7862-7905`), the same function `merge_status`'s git-authority tier calls on the deleted-branch path. `--fixed-strings` against the exact subject from `_merge_subject(branch, main_branch)` (`git_ops.py:1874`, canonical form `Merge <full-branch> into <main-branch>`) is what makes it substring-safe: `Merge task/1 into main` cannot match inside `Merge task/10 into main`, because the `0` falls where the pattern has a space. Do **not** substitute a bare `--grep="task/<TASK_ID>"` — that is BRE, unrestricted to merge commits, matches any commit merely *mentioning* the task, and re-opens the `task/1`/`task/10` collision. If a project overrides `git.branch_prefix` (default `task/`) or `git.main_branch`, build the subject from `_merge_subject` rather than hardcoding.
+
+     `branch_on_main()` above returns True for rc=0 and for a *non-empty* rc=128 marker search, False for rc=1 or an empty rc=128 search.
 
      After the loop exits:
      - `timed_out` (either unscoped arm's 20-minute deadline reached without an accepted terminal state — i.e. the only `done` on offer never became an ancestor of main) → do NOT resubmit and do NOT direct-merge; run the [canonical ancestry check](#branch-on-main) one final time — **including its rc=128 merge-marker search**, since a branch deleted by a successful merge is the likeliest reason you got here — and stop-and-report to the human only if that too comes back not-landed, per *Polled terminal failures*'s `unknown` bullet below.
      - `poll["state"] == "done"` → **if the response carries `merge_sha`** (the git-authority tier's `kind: "found_on_main"` shape), thread it as `done_provenance={"kind": "found_on_main", "commit": "<merge_sha>", "note": "<explanation>"}` — **not** a bare `commit`. `merge_sha` is not always the merge commit: on the live-branch resolution path it's the *branch tip* SHA, a distinct commit from the actual merge commit for a `--no-ff` merge; only the deleted-branch path's `merge_sha` is the true merge-commit SHA (`_found_on_main_response`'s docstring, `escalation/server.py:2290-2305`). **Otherwise** — including on either unscoped arm (`poll_by` `"branch"` or `"task_id"`), where a durable retention-ring/event-store record resolves `done` with only `state`/`request_id`/`generation`/`outcome`/`finished_at` and *no* `merge_sha` (`escalation/server.py:2404-2420`) — `merge_status` gives you no commit hash (`poll["outcome"]` is the raw state string `"done"`), so re-derive the true merge commit from git:
+       ```bash
+       git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" \
+           --max-count=1 --format=%H
        ```
-       git log main --oneline | head -5
-       ```
-       Thread the SHA into `done_provenance={"commit": "<sha>"}`. If no single commit is recoverable, fall back to `{"note": "<explanation>"}`. Then proceed to step 8.
+       Thread that SHA into `done_provenance={"commit": "<sha>"}`. **Do not fall back to eyeballing `git log main --oneline | head -5`** — it is not scoped to this task, so any SHA you pick from it is likely an unrelated task's merge, and the server's only provenance backstop (`git merge-base --is-ancestor <sha> main`) passes for every recent commit on main and would not catch it. If the search comes back empty, fall back to `{"note": "<explanation>"}`. Then proceed to step 8.
      - `poll["state"] in ("conflict", "blocked", "abandoned", "unknown")` → see *Polled terminal failures* below. **On the unscoped arms (`poll_by` `"branch"` or `"task_id"`) these are UNCONFIRMED** — per the staleness guard above they may be a prior round's record for this same reused branch/task_id rather than this submission's outcome. Before acting on one, re-check `mcp__escalation__get_merge_queue()` and who owns the worktree; if this branch is still in flight, keep polling to the 20-minute ceiling instead of resubmitting on a stale failure.
 
    *(Immediate-response failure edges — `conflict`, `blocked`, `unknown_branch`, `failed`, orchestrator-down — and cancellation are covered below.)*
@@ -443,9 +449,13 @@ The merge procedure is iterative — don't assume one pass will be enough:
   #   commit=<landing sha: git log --format=%H -1 main>
   #   (git log gives the merge commit; git merge-base gives the common ancestor, NOT the merge commit)
   # rc=128 (branch ref gone — already cleaned up after a successful merge): do NOT read
-  #   this as "not on main". Run the merge-marker search from the canonical check above
-  #   (git log main --oneline --merges | head -5), and on a hit proceed to step 8 with
-  #   that SHA as kind='found_on_main'. Only an unmatched search means not-landed.
+  #   this as "not on main". Run the exact-subject merge-marker search from the canonical
+  #   check above:
+  #     git log main --fixed-strings --grep="Merge task/<TASK_ID> into main" \
+  #         --max-count=1 --format=%H
+  #   Non-empty → proceed to step 8 with that SHA as kind='found_on_main'.
+  #   Empty     → not landed. (Do NOT substitute an unfiltered `git log main --merges`:
+  #                it takes no task argument and would report "landed" for every rc=128.)
   # rc=1 (genuinely not on main) AND queue healthy: loop back to step 7 (resubmit).
   ```
   **Never fall back to direct merge in response to `unknown`** — `unknown` means the server lost its record, not that the merge failed. **This block's `resubmit` line does not apply to the `poll_by == "branch"` arm** — there nothing was ever enqueued, so `unknown` is that arm's expected live state, not a lost record; that arm never reaches this bullet as a terminal state (it's excluded from step 7's terminal set) — it arrives here only via the branch arm's 20-minute deadline, and the action there is to run the same [canonical ancestry check](#branch-on-main) once more (rc=128 marker search included) and STOP and report to the human only if it still comes back not-landed, rather than resubmitting.
