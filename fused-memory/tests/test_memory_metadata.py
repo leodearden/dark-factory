@@ -454,6 +454,93 @@ class TestErrorTypes:
 
 _UUID = '3f2504e0-4f89-11d3-9a0c-0305e82c3301'
 _UUID2 = '7c9e6679-7425-40de-944b-e07fc1f90ae7'
+_UUID3 = 'b1e0f2c4-5a6d-4e8f-9b0a-1c2d3e4f5a6b'
+
+
+class TestParentHasChildrenError:
+    """`ParentHasChildrenError` — the delete-time refusal (leaf δ, task 3197).
+
+    The contract-fixed half of PRD V3's lifecycle rule ("no operation may
+    silently orphan a child"). It lives in the registry module, next to
+    `MemoryMetadataValidationError`, so both contract-fixed errors read
+    identically to a caller and an out-of-process consumer can import the
+    error without pulling in `MemoryService`.
+    """
+
+    def test_is_exported_and_subclasses_exception(self):
+        import fused_memory.memory_metadata as mm
+        from fused_memory.memory_metadata import ParentHasChildrenError
+
+        assert issubclass(ParentHasChildrenError, Exception)
+        assert 'ParentHasChildrenError' in mm.__all__
+
+    def test_exposes_parent_id_and_child_ids(self):
+        from fused_memory.memory_metadata import ParentHasChildrenError
+
+        err = ParentHasChildrenError(parent_id=_UUID, child_ids=[_UUID2, _UUID3])
+        assert err.parent_id == _UUID
+        assert err.child_ids == [_UUID2, _UUID3]
+        assert err.truncated is False
+
+    def test_child_ids_is_a_defensive_copy(self):
+        """Mirrors `MemoryMetadataValidationError.__init__`'s `list(violations)`.
+
+        The caller builds the id list from a live scroll; if the error
+        aliased it, a later mutation of that list would retroactively
+        rewrite what the refusal claimed.
+        """
+        from fused_memory.memory_metadata import ParentHasChildrenError
+
+        children = [_UUID2]
+        err = ParentHasChildrenError(parent_id=_UUID, child_ids=children)
+        children.append(_UUID3)
+        assert err.child_ids == [_UUID2]
+
+    def test_str_names_parent_every_child_the_count_cascade_and_registry(self):
+        """The refusal must be actionable from the message alone.
+
+        This is the user-observable signal the task exists to produce: an
+        agent that hits the refusal at the MCP wire gets `str(err)` and
+        nothing else, so it has to carry the ids, the way out (`cascade`)
+        and where the vocabulary lives.
+        """
+        from fused_memory.memory_metadata import (
+            MemoryMetadataValidationError,
+            ParentHasChildrenError,
+        )
+
+        err = ParentHasChildrenError(parent_id=_UUID, child_ids=[_UUID2, _UUID3])
+        text = str(err)
+        assert _UUID in text
+        assert _UUID2 in text
+        assert _UUID3 in text
+        assert '2' in text
+        assert 'cascade' in text
+        assert MemoryMetadataValidationError.REGISTRY_LOCATION in text
+
+    def test_untruncated_message_does_not_imply_a_partial_listing(self):
+        from fused_memory.memory_metadata import ParentHasChildrenError
+
+        err = ParentHasChildrenError(parent_id=_UUID, child_ids=[_UUID2])
+        assert 'at least' not in str(err)
+
+    def test_truncated_message_says_the_listing_is_partial(self):
+        """A bounded scroll must never read as an exhaustive listing.
+
+        `truncated=True` is set when the id scroll returned fewer rows than
+        the live child count (limit or race); saying "2 children" there
+        would understate the damage a cascade is about to do.
+        """
+        from fused_memory.memory_metadata import ParentHasChildrenError
+
+        err = ParentHasChildrenError(
+            parent_id=_UUID, child_ids=[_UUID2, _UUID3], truncated=True
+        )
+        assert err.truncated is True
+        text = str(err)
+        assert 'at least' in text
+        assert _UUID2 in text
+        assert _UUID3 in text
 
 
 def _codes(violations):
