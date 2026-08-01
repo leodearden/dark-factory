@@ -247,6 +247,43 @@ class TestExtractSnapshotEdgeTaskIds:
         )
         assert result == set()
 
+    @pytest.mark.parametrize(
+        'fact',
+        [
+            'Task 5 is in the active branch',
+            'Task 7 is in the pending merge queue',
+            'Task 5 is in a blocked directory',
+            'Task 5 is the pending review owner',
+            'Task 142 is in the active sprint retrospective',
+        ],
+    )
+    def test_prepositional_noun_phrase_is_not_a_status_assertion(self, fact):
+        """'Task N is in the <marker> <noun>' -> set().
+
+        Regression guard (reviewer_comprehensive correctness-precision
+        finding, task 3042). An interim revision of this task widened
+        INDIVIDUAL_SNAPSHOT_RE's connective to admit the preposition 'in'
+        and the article 'the' so it could reach the repro fact 'Task 2885
+        is in a blocked status ...'. That made the connective span a full
+        prepositional noun phrase, so the marker bound to a NOUN the task
+        is merely located in (the active BRANCH, the pending merge QUEUE,
+        a blocked DIRECTORY, the pending review OWNER) rather than to the
+        task's own status — every fact below wrongly yielded an id.
+
+        This is the over-selection direction the module docstring forbids:
+        'Task 142 is in the active sprint retrospective' stays true
+        forever, but the sweep would retire it the moment 142 went done.
+        The repro facts are reached instead by SNAPSHOT_STATUS_PHRASE_RE,
+        whose 'in' path requires the literal noun 'status' after the
+        marker — so these must all stay empty while the two
+        task-2885-repro tests above keep passing.
+
+        Distinct from test_open_class_gap_without_status_noun_excluded,
+        which is blocked by the open-class verb 'landed' and never
+        exercises the connective path at all.
+        """
+        assert extract_snapshot_edge_task_ids(fact) == set()
+
 
 # --------------------------------------------------------------------------- #
 # flatten_dedup_edges

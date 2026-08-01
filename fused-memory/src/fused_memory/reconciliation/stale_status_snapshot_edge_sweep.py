@@ -56,10 +56,15 @@ Design decisions (captured in plan.json):
   present in one but not the other) is the exact bug class task 3042
   fixes. (amendment, task 3042)
 - Two anchoring paths with an explicit precision contract: closed-class
-  connective only (copula / 'in' / article) for the general individual
-  form (``INDIVIDUAL_SNAPSHOT_RE``); a lazy ``{0,3}``-word open-class gap
-  permitted ONLY when the marker is immediately followed by the literal
-  noun 'status' (``SNAPSHOT_STATUS_PHRASE_RE``). (amendment, task 3042)
+  connective only (copula / article — NOT the preposition 'in', which
+  would let the marker bind to a noun the task is merely located in) for
+  the general individual form (``INDIVIDUAL_SNAPSHOT_RE``); a lazy
+  ``{0,3}``-word open-class gap and an 'in' preposition permitted ONLY
+  when the marker is immediately followed by the literal noun 'status'
+  (``SNAPSHOT_STATUS_PHRASE_RE``). That status-noun requirement is what
+  keeps 'Task N is in the active branch' / 'is in the pending merge
+  queue' out while still reaching 'Task N is in a blocked status ...'.
+  (amendment, task 3042)
 - 'blocked' is deliberately NOT added to ``INACTIVE_TASK_STATUSES`` — that
   frozenset stays ``{done, cancelled}`` — which is what preserves
   invalidate-only-on-positively-terminal (a genuinely-still-blocked task is
@@ -145,19 +150,30 @@ COUNT_QUANTITY_RE: re.Pattern[str] = re.compile(
 #     sweep regardless of the referenced task's real status: the gate
 #     (SNAPSHOT_STATUS_RE) short-circuits before the INACTIVE_TASK_STATUSES
 #     cross-reference in select_stale_status_snapshot_edges ever runs.
-# (b) The connective between the task reference and the marker now also
-#     admits the preposition 'in' and the article 'the', in addition to the
-#     existing copula and 'a'/'an' — because the real repro fact 'Task N is
-#     in a blocked status ...' places "in a" between the copula and the
-#     marker. A marker-only fix (just adding 'blocked' to the alternation)
-#     does NOT match that fact: 'in' was not a permitted connective.
-# (c) The precision invariant task 2613 established is unchanged: ONLY
-#     closed-class function words (copula / 'in' / article) may sit between
-#     the reference and the marker — never an open-class verb or noun. So
-#     'Task 142 landed on the blocked branch' still yields set().
+# (b) The connective here is DELIBERATELY still the task-2613 closed-class
+#     form — copula and/or 'a'/'an' only. An earlier revision of this task
+#     also admitted the preposition 'in' and the article 'the' here, to
+#     reach the repro fact 'Task N is in a blocked status ...'. That was
+#     reverted (amendment, reviewer_comprehensive correctness-precision
+#     finding, task 3042): 'in'/'the' turn the connective into a full
+#     prepositional noun phrase, so the marker binds to a NOUN the task is
+#     merely located in rather than to the task's status — empirically
+#     'Task 5 is in the active branch', 'Task 7 is in the pending merge
+#     queue', 'Task 5 is in a blocked directory' and 'Task 5 is the pending
+#     review owner' all wrongly yielded an id. That is the over-selection
+#     direction the module docstring forbids (a fact like 'Task 142 is in
+#     the active sprint retrospective' stays true forever, yet the sweep
+#     would retire it once 142 went done). The repro facts are reached
+#     instead by SNAPSHOT_STATUS_PHRASE_RE below, whose 'in' path requires
+#     the literal noun 'status' after the marker.
+# (c) The precision invariant task 2613 established is therefore unchanged:
+#     ONLY closed-class function words (copula / article) may sit between
+#     the reference and the marker — never an open-class verb or noun, and
+#     never a preposition introducing a noun phrase. So 'Task 142 landed on
+#     the blocked branch' still yields set().
 INDIVIDUAL_SNAPSHOT_RE: re.Pattern[str] = re.compile(
     TASK_REF_RE.pattern
-    + r'\s*(?:is|are|was|were)?\s*(?:in\s+)?(?:an?\s+|the\s+)?'
+    + r'\s*(?:is|are|was|were)?\s*(?:an?\s+)?'
     + _STATUS_MARKER_ALT + r'\b',
     re.IGNORECASE,
 )
@@ -241,10 +257,10 @@ def extract_snapshot_edge_task_ids(fact: str) -> set[int]:
          to the empty set when absent.
       2. Individual form: extract ids via INDIVIDUAL_SNAPSHOT_RE, which
          anchors 'task N' / '#N' / 'df N' (TASK_REF_RE's own grammar)
-         directly to an adjacent status marker (only an optional copula/
-         preposition/article may sit in between) — so an incidental status
-         word elsewhere in the fact is never wrongly attributed to the
-         reference.
+         directly to an adjacent status marker (only an optional copula
+         and/or article may sit in between — deliberately NOT the
+         preposition 'in') — so an incidental status word elsewhere in
+         the fact is never wrongly attributed to the reference.
       3. Status-phrase form: extract ids via SNAPSHOT_STATUS_PHRASE_RE,
          which additionally admits a bounded open-class gap (e.g. 'is
          deliberately parked in ...') between the reference and the
