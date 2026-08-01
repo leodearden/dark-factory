@@ -707,12 +707,31 @@ def _index_escalations(
 def _parity(verdict: Any, escalation: dict[str, Any] | None) -> str:
     """The derived display state for one metric row.
 
-    A pure ``(verdict, linked?)`` lookup — not a statistic.  Deriving it once
-    here keeps the UI from re-deriving badge state out of three separate
+    A pure, TOTAL ``(verdict, linked?)`` lookup — not a statistic.  Deriving it
+    once here keeps the UI from re-deriving badge state out of three separate
     fields, which is where the two sides would drift apart.
+
+    An ABSENT verdict is its own state (``unjudged``), never folded into
+    ``clear``.  ``clear`` means "the evaluator judged this metric and found no
+    regression"; a metric nothing has judged is a materially different fact,
+    and lending it the healthy badge is the module's own stated failure mode —
+    fail toward "visibly unrenderable", never toward the healthy label.
+
+    Reachability of the linked variant, which is not obvious: the row-level
+    join only runs when the verdict ENTRY carries a fingerprint (see
+    ``_build_eval``), so a metric with NO entry at all can never be
+    ``unjudged_open``.  The linked variant is reached only by an entry that has
+    a ``fingerprint`` and no ``verdict`` field — which is exactly the case that
+    used to claim a recovery that never happened.  The function stays total
+    over both axes anyway, so no future call site can fall into an unhandled
+    corner.
     """
     if verdict == 'alarm':
+        # For an alarm the UNLINKED state is the notable one: a filed alarm
+        # with no escalation behind it is the parity violation.
         return 'alarmed_open' if escalation else 'alarmed_unlinked'
+    if verdict is None:
+        return 'unjudged_open' if escalation else 'unjudged'
     return 'recovered_open' if escalation else 'clear'
 
 
