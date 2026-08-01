@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 import yaml
-from capability_manifest_corpus import REPO_ROOT, discover_manifests
+from capability_manifest_corpus import REPO_ROOT, check_manifest, discover_manifests
 from pydantic import BaseModel, ValidationError
 
 import shared.task_metadata as task_metadata_module
@@ -522,6 +522,126 @@ class TestManifestCorpusDiscovery:
         rels = [str(path.relative_to(REPO_ROOT)) for path in paths]
         assert any(rel.startswith('docs/prds/') for rel in rels)
         assert any(rel.startswith('plans/') for rel in rels)
+
+
+class TestCheckManifest:
+    """check_manifest(path) — the file-attributed reporting wrapper.
+
+    Each case writes a single inline sidecar to tmp_path (matching
+    TestLoader._VALID_YAML / _MALFORMED_YAML_DUP_LABEL's convention — no
+    committed bad-fixture files) and drives one of check_manifest's failure
+    modes. This is the mutation proof TestCheckedInManifestCorpus rests its
+    corpus sweep on.
+    """
+
+    _VALID_YAML = """\
+prd: plans/example-prd.md
+schema_version: 1
+tasks:
+  - label: "alpha"
+    capabilities:
+      - name: "cap-one"
+        binding: "capability→producer (wired)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "foo"
+          expect: present
+"""
+
+    def test_valid_sidecar_returns_none(self, tmp_path):
+        sidecar = tmp_path / 'ok.capability-manifest.yaml'
+        sidecar.write_text(self._VALID_YAML)
+        assert check_manifest(sidecar) is None
+
+    def test_unknown_capability_key_names_file_and_key(self, tmp_path):
+        sidecar = tmp_path / 'bad-cap-key.capability-manifest.yaml'
+        sidecar.write_text(
+            """\
+prd: plans/example-prd.md
+schema_version: 1
+tasks:
+  - label: "alpha"
+    capabilities:
+      - name: "cap-one"
+        binding: "b"
+        verdict: PASS
+        verdcit: PASS
+"""
+        )
+        message = check_manifest(sidecar)
+        assert message is not None
+        assert 'bad-cap-key.capability-manifest.yaml' in message
+        assert 'verdcit' in message
+
+    def test_unknown_delivered_check_key_names_file_and_key(self, tmp_path):
+        sidecar = tmp_path / 'bad-check-key.capability-manifest.yaml'
+        sidecar.write_text(
+            """\
+prd: plans/example-prd.md
+schema_version: 1
+tasks:
+  - label: "alpha"
+    capabilities:
+      - name: "cap-one"
+        binding: "b"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "foo"
+          expect: present
+          bogus_field: x
+"""
+        )
+        message = check_manifest(sidecar)
+        assert message is not None
+        assert 'bad-check-key.capability-manifest.yaml' in message
+        assert 'bogus_field' in message
+
+    def test_broken_yaml_syntax_names_file_and_is_a_yaml_error(self, tmp_path):
+        sidecar = tmp_path / 'bad-syntax.capability-manifest.yaml'
+        sidecar.write_text('prd: [unterminated')
+        message = check_manifest(sidecar)
+        assert message is not None
+        assert 'bad-syntax.capability-manifest.yaml' in message
+        assert 'YAML' in message
+
+    def test_duplicate_task_label_names_file_and_label(self, tmp_path):
+        sidecar = tmp_path / 'bad-dup-label.capability-manifest.yaml'
+        sidecar.write_text(
+            """\
+prd: plans/example-prd.md
+schema_version: 1
+tasks:
+  - label: "alpha"
+    capabilities: []
+  - label: "alpha"
+    capabilities: []
+"""
+        )
+        message = check_manifest(sidecar)
+        assert message is not None
+        assert 'bad-dup-label.capability-manifest.yaml' in message
+        assert 'alpha' in message
+
+    def test_unsupported_schema_version_names_file(self, tmp_path):
+        sidecar = tmp_path / 'bad-schema-version.capability-manifest.yaml'
+        sidecar.write_text(
+            """\
+prd: plans/example-prd.md
+schema_version: 2
+tasks: []
+"""
+        )
+        message = check_manifest(sidecar)
+        assert message is not None
+        assert 'bad-schema-version.capability-manifest.yaml' in message
+
+    def test_missing_file_propagates_file_not_found(self, tmp_path):
+        # A missing file is a caller bug, not manifest drift — check_manifest
+        # must not silently absorb it into a reported "problem" string.
+        with pytest.raises(FileNotFoundError):
+            check_manifest(tmp_path / 'does-not-exist.capability-manifest.yaml')
 
 
 class TestDeliveredCheckMeta:
