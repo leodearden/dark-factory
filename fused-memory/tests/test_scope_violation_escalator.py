@@ -927,9 +927,19 @@ class TestRoutingOverrideEscalation:
         assert str(tmp_path) in detail
         assert 'crates/widget.rs' in detail
         assert 'reify' in detail
-        # Prose must state plainly that nothing was blocked.
-        assert 'WAS created' in detail
-        assert 'no resubmission is needed' in detail
+        # Prose must state plainly that nothing was blocked...
+        assert 'did NOT block' in detail
+        assert 'AUDIT TRAIL, not a rejection' in detail
+        assert 'nothing here asks for a resubmission' in detail.lower()
+        # ...but must NOT assert the outcome of a stage it never observes.
+        # This record is filed from _path_guard_or_skip, which runs BEFORE
+        # task creation: submit_task can still fail validation, the ticket
+        # write can fail, and the curator can later merge or discard the
+        # candidate.  A briefing-rendered claim that "the task WAS created"
+        # would be flatly false in each of those cases.
+        assert 'WAS created' not in detail, (
+            f'the guard must not claim an outcome it cannot see: {detail!r}'
+        )
 
     # --- fold behaviour ---------------------------------------------------
     # The record fires on EVERY override, so an automated filer looping on one
@@ -1021,14 +1031,41 @@ class TestRoutingOverrideEscalation:
         assert '<nothing>' in payloads[0]['summary']
         assert 'would_have_matched_paths=[]' in payloads[0]['detail']
 
-    def test_unbounded_reason_is_capped_in_summary_but_verbatim_in_detail(self, tmp_path):
-        """``reason`` is unbounded caller-supplied free text arriving over a
-        public MCP surface, and ``summary`` is the one-line field every
-        operator view and agent briefing renders.  Cap it there; ``detail`` is
-        the field the audit actually needs, so it keeps the full string.
+    def test_reason_under_the_detail_cap_survives_verbatim(self, tmp_path):
+        """``detail`` is the field the audit actually needs, so any reason of
+        a plausible human length reaches it byte-for-byte — the cap below is a
+        backstop against abuse, not a routine clip.
         """
         esc = ScopeViolationEscalator()
-        reason = 'x' * 5000
+        # .strip()ed in the fixture: the escalator strips the reason itself
+        # (see test_reason_normalisation_is_identical_across_entry_points), so
+        # a trailing-space fixture would fail for the wrong reason.
+        reason = ('self-referential: ' + 'the guard matches its own tokens. ' * 50).strip()
+        assert len(reason) < 4000, 'fixture must sit under the detail cap'
+        esc_id = esc.report_routing_override(
+            project_root=str(tmp_path),
+            project_id='reify',
+            candidate_title='long but honest reason',
+            reason=reason,
+            matched_paths=('corpus/',),
+            suggested_project='know_live',
+        )
+        assert esc_id is not None
+        payload = self._payloads(tmp_path)[0]
+        assert reason in payload['detail'], 'detail must keep the full reason verbatim'
+        assert 'truncated' not in payload['detail']
+
+    def test_unbounded_reason_is_capped_in_both_summary_and_detail(self, tmp_path):
+        """``reason`` is unbounded caller-supplied free text arriving over a
+        public MCP surface, and BOTH rendered fields are bounded because BOTH
+        are rendered verbatim into operator views and agent briefings
+        (``orchestrator/agents/briefing.py``).  ``summary`` is the one-line
+        field, so it clips hard; ``detail`` clips generously — and says so,
+        naming the length it dropped, so the audit never quietly
+        misrepresents the very text it exists to audit.
+        """
+        esc = ScopeViolationEscalator()
+        reason = 'x' * 50_000
         esc_id = esc.report_routing_override(
             project_root=str(tmp_path),
             project_id='reify',
@@ -1045,7 +1082,95 @@ class TestRoutingOverrideEscalation:
         # The summary still SHOWS the justification (an operator scanning the
         # queue needs it) — just a bounded prefix of it.
         assert 'x' * 100 in payload['summary']
-        assert reason in payload['detail'], 'detail must keep the full reason verbatim'
+
+        detail = payload['detail']
+        assert reason not in detail, 'detail must not carry 50k chars of caller text'
+        assert len(detail) < 6000, (
+            f'detail must stay bounded too, got {len(detail)} chars'
+        )
+        # LOUD, not silent: the record names what it dropped.
+        assert 'truncated' in detail
+        assert '50000' in detail, 'the truncation marker must name the original length'
+        # Still enough of the claim to judge it by.
+        assert 'x' * 1000 in detail
+
+    def test_many_matched_paths_stay_bounded_in_summary_and_whole_in_detail(self, tmp_path):
+        """``matched_paths`` is caller-supplied too — on the FILES-certain side
+        it comes straight from ``metadata.files`` — so the same one-line-field
+        rationale that bounds the reason has to bound the path list.  A
+        submission declaring 500 foreign files must not render a
+        multi-kilobyte summary; ``detail`` still carries every path.
+        """
+        esc = ScopeViolationEscalator()
+        paths = tuple(f'other-project/src/module_{i}.py' for i in range(500))
+        esc_id = esc.report_routing_override(
+            project_root=str(tmp_path),
+            project_id='reify',
+            candidate_title='500 declared files',
+            reason='cross-cutting by design',
+            matched_paths=paths,
+            suggested_project='know_live',
+        )
+        assert esc_id is not None
+        payload = self._payloads(tmp_path)[0]
+        assert len(payload['summary']) < 500, (
+            f'summary must stay bounded, got {len(payload["summary"])} chars'
+        )
+        # Elided LOUDLY — the summary says what it dropped rather than
+        # reading as a complete list.
+        assert 'other-project/src/module_0.py' in payload['summary']
+        assert '+495 more' in payload['summary']
+        # detail is the field the audit needs: nothing is dropped there.
+        assert 'other-project/src/module_499.py' in payload['detail']
+
+    def test_many_matched_paths_stay_bounded_in_rejection_summary(self, tmp_path):
+        """Same bound on the rejection/advisory summaries — same rationale,
+        and this is the mode whose paths come from ``metadata.files``.
+        """
+        esc = ScopeViolationEscalator()
+        paths = tuple(f'other-project/src/module_{i}.py' for i in range(500))
+        esc_id = esc.report_rejection(
+            project_root=str(tmp_path),
+            project_id='reify',
+            candidate_title='500 declared files',
+            matched_paths=paths,
+            suggested_project='know_live',
+        )
+        assert esc_id is not None
+        payload = self._payloads(tmp_path)[0]
+        assert len(payload['summary']) < 500, (
+            f'summary must stay bounded, got {len(payload["summary"])} chars'
+        )
+        assert '+495 more' in payload['summary']
+        assert 'other-project/src/module_499.py' in payload['detail']
+
+    def test_summary_path_cap_does_not_change_the_fold(self, tmp_path):
+        """The fingerprint hashes ``matched_paths`` directly, not the elided
+        rendering, so two over-cap path lists that differ only PAST the cap
+        must still fold apart.  Capping a rendered field must never collapse
+        two distinct events into one record.
+        """
+        esc = ScopeViolationEscalator()
+        head = tuple(
+            f'other/src/module_{i}.py'
+            for i in range(sve_mod._SUMMARY_PATHS_MAX + 2)
+        )
+        first = esc.report_routing_override(
+            project_root=str(tmp_path), project_id='reify',
+            candidate_title='t', reason='same reason',
+            matched_paths=head, suggested_project='know_live',
+        )
+        second = esc.report_routing_override(
+            project_root=str(tmp_path), project_id='reify',
+            candidate_title='t', reason='same reason',
+            matched_paths=(*head[:-1], 'other/src/DIFFERENT.py'),
+            suggested_project='know_live',
+        )
+        assert first is not None
+        assert second is not None
+        assert second != first, (
+            'lists differing only past the summary cap must not fold together'
+        )
 
     def test_reason_normalisation_is_identical_across_entry_points(self, tmp_path):
         """``submit_task`` strips the reason before the guard sees it, but
@@ -1090,5 +1215,27 @@ class TestEscalationDisabled:
         )
         assert result is None
         # No file is written.
+        queue_dir = tmp_path / 'data' / 'escalations'
+        assert not queue_dir.exists() or not list(queue_dir.glob('*.json'))
+
+    def test_routing_override_no_ops_when_escalation_pkg_unavailable(
+        self, tmp_path, monkeypatch,
+    ):
+        """Same contract for the override audit record, and it matters MORE
+        here: the submission it describes has ALREADY been allowed, so a
+        minimal env without the escalation package must degrade to "no audit
+        record", never to an exception out of an allowed submit_task.
+        """
+        monkeypatch.setattr(sve_mod, 'HAS_ESCALATION', False)
+        esc = ScopeViolationEscalator()
+        result = esc.report_routing_override(
+            project_root=str(tmp_path),
+            project_id='reify',
+            candidate_title='whatever',
+            reason='incidental mention only',
+            matched_paths=('fused-memory/',),
+            suggested_project='dark_factory',
+        )
+        assert result is None
         queue_dir = tmp_path / 'data' / 'escalations'
         assert not queue_dir.exists() or not list(queue_dir.glob('*.json'))

@@ -185,9 +185,49 @@ _OVERRIDE_FINGERPRINT_TOKEN: str = 'mode:routing_override'
 
 # ``summary`` is the one-line field every operator view and agent briefing
 # renders, and ``reason`` is unbounded caller-supplied free text arriving over
-# a public MCP surface.  Cap it there; ``detail`` keeps the full string, and
-# detail is the field the audit actually needs.
+# a public MCP surface.  Cap it there; ``detail`` keeps the (generously
+# bounded — see below) string, and detail is the field the audit actually
+# needs.
 _OVERRIDE_SUMMARY_REASON_MAX: int = 120
+
+# ``detail`` is ALSO rendered verbatim into agent briefings
+# (orchestrator/agents/briefing.py) and lands on disk, so "detail keeps the
+# full reason" cannot mean UNBOUNDED — that would let a caller push arbitrary
+# free text over a public MCP surface straight into a briefing.  Generous
+# enough that no honest justification is ever clipped, finite enough that a
+# runaway one cannot bloat a briefing; and when it DOES clip it says so, with
+# the original length, rather than silently truncating the very text being
+# audited.  The dedup fingerprint keeps hashing the FULL reason, so two claims
+# that differ only past the cap still fold apart.
+_OVERRIDE_DETAIL_REASON_MAX: int = 4000
+
+# ``matched_paths`` is caller-supplied too — on the FILES-certain side it is
+# derived directly from ``metadata.files`` — so the same "summary is a
+# ONE-LINE field" rationale that bounds the reason has to bound the path list:
+# a submission declaring 500 foreign files must not render a multi-kilobyte
+# summary.  Shared by every scope_violation-family record.  ``detail`` always
+# carries the full list, and the dedup fingerprint hashes ``matched_paths``
+# directly rather than this rendering, so capping it cannot change how
+# anything folds.
+_SUMMARY_PATHS_MAX: int = 5
+
+
+def _summary_paths(matched_paths: tuple[str, ...]) -> str:
+    """Render *matched_paths* bounded, for a one-line escalation ``summary``.
+
+    Returns ``''`` for an empty tuple so each call site can pick its own
+    placeholder wording.  Over-cap lists are elided with an explicit
+    ``(+K more)`` marker — the summary says what it dropped rather than
+    reading as a complete list.
+    """
+    if not matched_paths:
+        return ''
+    head = matched_paths[:_SUMMARY_PATHS_MAX]
+    rendered = ', '.join(head)
+    remaining = len(matched_paths) - len(head)
+    if remaining > 0:
+        rendered += f' (+{remaining} more)'
+    return rendered
 
 # Budget-misconfig escalation constants — deliberately distinct from the
 # scope_violation family so operators can immediately tell these apart.
@@ -263,6 +303,84 @@ class ScopeViolationEscalator:
             q = EscalationQueue(Path(project_root) / _QUEUE_DIRNAME)
             self._queues[project_root] = q
         return q
+
+    def _submit(
+        self,
+        queue,
+        *,
+        anchor_task_id: str,
+        project_id: str,
+        candidate_title: str,
+        summary: str,
+        detail: str,
+        suggested_action: str,
+        fingerprint_ids: list[str],
+    ) -> str | None:
+        """Build and file ONE ``scope_violation``-family record; never raises.
+
+        Owns everything the family's three modes (FILES-certain rejection,
+        PROSE advisory, routing-override audit) share and must NOT diverge on:
+        the ``Escalation`` envelope (``severity='info'`` — the family's floor,
+        module docstring — plus ``agent_role``, ``category`` and ``level``),
+        the content fingerprint, the unbounded-window ``DedupeConfig``, and the
+        swallow-and-log contract.
+
+        Keeping the dedup policy in ONE place is load-bearing rather than
+        tidy: the modes stay disjoint only because each contributes its own
+        discriminator token to an OTHERWISE IDENTICAL composition (see
+        :data:`_ADVISORY_FINGERPRINT_TOKEN`), and three hand-maintained copies
+        of that composition could drift into folding each other's records —
+        exactly the mislabelling defect task 3119 fixed.
+
+        Callers pass only what genuinely differs per mode: the anchor, the
+        operator-facing wording, the ``suggested_action``, and the
+        pre-discriminated fingerprint ids (sorted here, so call sites need not
+        remember to).
+
+        ``Escalation`` construction is INSIDE the guarded block deliberately:
+        every mode is additive to an outcome that already stands (a rejection
+        already rejected, a submission already allowed), so a malformed
+        payload must degrade to "no escalation", never to an exception out of
+        the guard.
+
+        Returns the escalation id — which on a fold is the EXISTING parent's,
+        not a freshly-minted one — or ``None`` if anything failed.
+        """
+        try:
+            esc = Escalation(  # type: ignore[possibly-unbound]
+                id=queue.make_id(anchor_task_id),
+                task_id=anchor_task_id,
+                agent_role=_AGENT_ROLE,
+                severity='info',
+                category=_CATEGORY,
+                summary=summary,
+                detail=detail,
+                suggested_action=suggested_action,
+                level=1,
+                dedupe_fingerprint=compute_content_fingerprint(  # type: ignore[possibly-unbound]
+                    'scope_violation',
+                    'path_guard_misroute',
+                    affected_ids=sorted(fingerprint_ids),
+                ),
+            )
+            config = DedupeConfig(  # type: ignore[possibly-unbound]
+                infra_dedupe_enabled=self._scope_violation_dedupe_enabled,
+                infra_dedupe_window_secs=float('inf'),
+                infra_dedupe_categories=(_CATEGORY,),
+                key_fn=content_fingerprint_key,  # type: ignore[possibly-unbound]
+            )
+            return submit_or_dedupe(queue, esc, config)['id']  # type: ignore[possibly-unbound]
+        except Exception:
+            # Queue I/O failure must not propagate — the guard's own outcome
+            # stands either way, the operator just doesn't get the heads-up.
+            # Mirrors curator_escalator's tolerance so a broken filesystem
+            # can't break task creation.
+            logger.exception(
+                'scope_violation_escalator: failed to submit escalation '
+                'for project %s (anchor=%s, candidate=%r)',
+                project_id, anchor_task_id, candidate_title[:80],
+            )
+            return None
 
     def report_rejection(
         self,
@@ -342,7 +460,9 @@ class ScopeViolationEscalator:
             )
             return None
 
-        paths_str = ', '.join(matched_paths) or '<none>'
+        # Bounded rendering — matched_paths is caller-supplied and summary is a
+        # one-line field (see _summary_paths).  detail below keeps the full list.
+        paths_str = _summary_paths(matched_paths) or '<none>'
         target = suggested_project or '<unknown — multiple or no owner>'
         if advisory:
             suggested_action = _ADVISORY_SUGGESTED_ACTION
@@ -412,59 +532,35 @@ class ScopeViolationEscalator:
             )
         detail = '\n'.join(detail_lines)
 
-        try:
-            esc = Escalation(  # type: ignore[possibly-unbound]
-                id=queue.make_id(_ANCHOR_TASK_ID),
-                task_id=_ANCHOR_TASK_ID,
-                agent_role=_AGENT_ROLE,
-                # 'info' for BOTH modes: already the severity floor (module docstring).
-                severity='info',
-                category=_CATEGORY,
-                summary=(
-                    # No creation claim: this is written in submit_task
-                    # phase-1, before the curator resolves the submission
-                    # (task 4159).  briefing.py renders summary verbatim into
-                    # an agent briefing, so an unverified claim here misleads
-                    # exactly as the detail's did.
-                    f'Path-scope ADVISORY: submission not blocked, outcome '
-                    f'not yet resolved, cites {paths_str} '
-                    f'(possible owner: {target})'
-                    if advisory else
-                    f'Misrouted task rejected: cites {paths_str} '
-                    f'(suggested target: {target})'
-                ),
-                detail=detail,
-                suggested_action=suggested_action,
-                level=1,
-                dedupe_fingerprint=compute_content_fingerprint(  # type: ignore[possibly-unbound]
-                    'scope_violation',
-                    'path_guard_misroute',
-                    affected_ids=sorted([
-                        *matched_paths,
-                        f'suggested:{suggested_project or "none"}',
-                        f'project:{project_id}',
-                        # Advisory-only by design — see _ADVISORY_FINGERPRINT_TOKEN.
-                        *([_ADVISORY_FINGERPRINT_TOKEN] if advisory else []),
-                    ]),
-                ),
-            )
-            config = DedupeConfig(  # type: ignore[possibly-unbound]
-                infra_dedupe_enabled=self._scope_violation_dedupe_enabled,
-                infra_dedupe_window_secs=float('inf'),
-                infra_dedupe_categories=(_CATEGORY,),
-                key_fn=content_fingerprint_key,  # type: ignore[possibly-unbound]
-            )
-            esc_id = submit_or_dedupe(queue, esc, config)['id']  # type: ignore[possibly-unbound]
-        except Exception:
-            # Queue I/O failure must not propagate — the guard's own outcome
-            # stands either way, the operator just doesn't get the heads-up.
-            # Mirrors curator_escalator's tolerance so a broken filesystem
-            # can't break task creation.
-            logger.exception(
-                'scope_violation_escalator: failed to submit escalation '
-                'for project %s (candidate=%r)',
-                project_id, candidate_title[:80],
-            )
+        esc_id = self._submit(
+            queue,
+            anchor_task_id=_ANCHOR_TASK_ID,
+            project_id=project_id,
+            candidate_title=candidate_title,
+            summary=(
+                # No creation claim: this is written in submit_task
+                # phase-1, before the submission has been resolved
+                # (task 4159).  briefing.py renders summary verbatim into
+                # an agent briefing, so an unverified claim here misleads
+                # exactly as the detail's did.
+                f'Path-scope ADVISORY: submission not blocked, outcome '
+                f'not yet resolved, cites {paths_str} '
+                f'(possible owner: {target})'
+                if advisory else
+                f'Misrouted task rejected: cites {paths_str} '
+                f'(suggested target: {target})'
+            ),
+            detail=detail,
+            suggested_action=suggested_action,
+            fingerprint_ids=[
+                *matched_paths,
+                f'suggested:{suggested_project or "none"}',
+                f'project:{project_id}',
+                # Advisory-only by design — see _ADVISORY_FINGERPRINT_TOKEN.
+                *([_ADVISORY_FINGERPRINT_TOKEN] if advisory else []),
+            ],
+        )
+        if esc_id is None:
             return None
 
         # Mode is interpolated into the EXISTING single line, after the id:
@@ -505,6 +601,16 @@ class ScopeViolationEscalator:
         still recorded (it is the evidence that the parameter was reached for
         unnecessarily).
 
+        Both caller-supplied free-text inputs are BOUNDED before rendering,
+        because ``summary`` and ``detail`` are each rendered verbatim into
+        operator views and agent briefings: *reason* is clipped hard in the
+        summary (:data:`_OVERRIDE_SUMMARY_REASON_MAX`) and generously in the
+        detail (:data:`_OVERRIDE_DETAIL_REASON_MAX`, with an explicit
+        truncation marker naming the original length), and *matched_paths* is
+        elided in the summary (:func:`_summary_paths`) while the detail keeps
+        the full list.  The dedup fingerprint hashes the UNCLIPPED values, so
+        no cap can make two distinct claims fold together.
+
         Returns the escalation id when one was filed, ``None`` otherwise
         (escalation package missing, queue write failed).  Never raises — the
         submission it describes has already been allowed, so a queue failure
@@ -520,11 +626,23 @@ class ScopeViolationEscalator:
             return None
 
         reason = (reason or '').strip()
-        paths_str = ', '.join(matched_paths) or '<nothing>'
+        # Bounded rendering for the one-line summary; detail keeps the full
+        # list (and, up to a generous cap, the full reason).
+        paths_str = _summary_paths(matched_paths) or '<nothing>'
+
+        # detail is rendered verbatim into agent briefings too, so "verbatim"
+        # is bounded — loudly, with the dropped length named, so the audit
+        # never quietly misrepresents the text it is auditing.
+        detail_reason = reason
+        if len(reason) > _OVERRIDE_DETAIL_REASON_MAX:
+            detail_reason = (
+                reason[:_OVERRIDE_DETAIL_REASON_MAX]
+                + f'…[truncated: reason was {len(reason)} chars]'
+            )
 
         detail_lines = [
             'routing_override=True',
-            f'routing_override_reason={reason!r}',
+            f'routing_override_reason={detail_reason!r}',
             f'candidate_title={candidate_title!r}',
             f'filing_project_id={project_id!r}',
             f'filing_project_root={project_root!r}',
@@ -537,8 +655,11 @@ class ScopeViolationEscalator:
         detail_lines.append(
             'The path-scope guards were DELIBERATELY BYPASSED by a '
             'caller-supplied routing_override_reason on this submission.  '
-            'Nothing was blocked: the task WAS created, no error was returned '
-            'to the caller, and no resubmission is needed.  The paths listed '
+            'The guards did NOT block it: it proceeded to task creation, and '
+            'this record is an AUDIT TRAIL, not a rejection — nothing here '
+            'asks for a resubmission.  (Deliberately not a claim that the '
+            'task now exists: this record is filed from the guard, which runs '
+            'BEFORE creation and never observes its outcome.)  The paths listed '
             'above are what the guard WOULD have flagged had the override been '
             'absent (an empty list means the guard would have allowed the '
             'submission anyway).  The reason above is the CALLER\'S OWN '
@@ -552,55 +673,40 @@ class ScopeViolationEscalator:
         if len(reason) > _OVERRIDE_SUMMARY_REASON_MAX:
             summary_reason += '…'
 
-        try:
-            esc = Escalation(  # type: ignore[possibly-unbound]
-                id=queue.make_id(_OVERRIDE_ANCHOR_TASK_ID),
-                task_id=_OVERRIDE_ANCHOR_TASK_ID,
-                agent_role=_AGENT_ROLE,
-                # 'info' like the rest of the scope_violation family — this is
-                # an audit trail, not a page.  The legitimate self-referential
-                # filings this exists to record must not wake an operator.
-                severity='info',
-                category=_CATEGORY,
-                summary=(
-                    f'Path-guard ROUTING OVERRIDE used in {project_id}: '
-                    f'guards skipped (would have flagged: {paths_str}) '
-                    f'— reason: {summary_reason!r}'
-                ),
-                detail=detail,
-                suggested_action=_OVERRIDE_SUGGESTED_ACTION,
-                level=1,
-                dedupe_fingerprint=compute_content_fingerprint(  # type: ignore[possibly-unbound]
-                    'scope_violation',
-                    'path_guard_misroute',
-                    affected_ids=sorted([
-                        *matched_paths,
-                        f'suggested:{suggested_project or "none"}',
-                        f'project:{project_id}',
-                        # Keeps this mode's digest disjoint from the rejection
-                        # and advisory digests — see _OVERRIDE_FINGERPRINT_TOKEN.
-                        _OVERRIDE_FINGERPRINT_TOKEN,
-                        # Unlike report_rejection, the CALLER's reason is part
-                        # of the fingerprint — see _OVERRIDE_FINGERPRINT_TOKEN
-                        # for why.  Already stripped above, so the fold is
-                        # identical whichever entry point supplied it.
-                        f'reason:{reason}',
-                    ]),
-                ),
-            )
-            config = DedupeConfig(  # type: ignore[possibly-unbound]
-                infra_dedupe_enabled=self._scope_violation_dedupe_enabled,
-                infra_dedupe_window_secs=float('inf'),
-                infra_dedupe_categories=(_CATEGORY,),
-                key_fn=content_fingerprint_key,  # type: ignore[possibly-unbound]
-            )
-            esc_id = submit_or_dedupe(queue, esc, config)['id']  # type: ignore[possibly-unbound]
-        except Exception:
-            logger.exception(
-                'scope_violation_escalator: failed to submit routing-override '
-                'escalation for project %s (candidate=%r)',
-                project_id, candidate_title[:80],
-            )
+        # severity/level/category/agent_role and the whole dedup policy live in
+        # _submit — shared with report_rejection so the three modes cannot
+        # drift into folding each other's records.  'info' like the rest of the
+        # family: this is an audit trail, not a page, and the legitimate
+        # self-referential filings it exists to record must not wake an operator.
+        esc_id = self._submit(
+            queue,
+            anchor_task_id=_OVERRIDE_ANCHOR_TASK_ID,
+            project_id=project_id,
+            candidate_title=candidate_title,
+            summary=(
+                f'Path-guard ROUTING OVERRIDE used in {project_id}: '
+                f'guards skipped (would have flagged: {paths_str}) '
+                f'— reason: {summary_reason!r}'
+            ),
+            detail=detail,
+            suggested_action=_OVERRIDE_SUGGESTED_ACTION,
+            fingerprint_ids=[
+                *matched_paths,
+                f'suggested:{suggested_project or "none"}',
+                f'project:{project_id}',
+                # Keeps this mode's digest disjoint from the rejection
+                # and advisory digests — see _OVERRIDE_FINGERPRINT_TOKEN.
+                _OVERRIDE_FINGERPRINT_TOKEN,
+                # Unlike report_rejection, the CALLER's reason is part
+                # of the fingerprint — see _OVERRIDE_FINGERPRINT_TOKEN
+                # for why.  Already stripped above, so the fold is
+                # identical whichever entry point supplied it.  The FULL
+                # reason, not the detail-truncated one: two distinct claims
+                # sharing a 4000-char prefix are still two distinct claims.
+                f'reason:{reason}',
+            ],
+        )
+        if esc_id is None:
             return None
 
         logger.warning(
