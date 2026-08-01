@@ -449,13 +449,13 @@ async def test_drain_for_test_drains_enqueued_events(real_buffer, tmp_path):
     """_drain_for_test() waits until every enqueued event has been processed.
 
     Constructs an EventQueue wired to a real SQLite buffer, enqueues 5 events,
-    then awaits q._drain_for_test(timeout=5.0).  After the call returns the
-    buffer must contain exactly 5 committed events (stats['size'] == 5).
+    then awaits q._drain_for_test() (its default timeout).  After the call
+    returns the buffer must contain exactly 5 committed events
+    (stats['size'] == 5).
 
-    5.0s (rather than a tighter ceiling) matches the sibling
-    `_drain_for_test(timeout=5.0)` calls elsewhere in this file and keeps the
-    guard tolerant of a starved event loop under full-suite xdist load while
-    still failing loudly if the drainer genuinely never runs.
+    Relies on _drain_for_test's default 5.0s ceiling, which keeps the guard
+    tolerant of a starved event loop under full-suite xdist load while still
+    failing loudly if the drainer genuinely never runs.
     """
     q = EventQueue(
         real_buffer,
@@ -469,7 +469,7 @@ async def test_drain_for_test_drains_enqueued_events(real_buffer, tmp_path):
     try:
         for _ in range(5):
             q.enqueue(_make_event())
-        await q._drain_for_test(timeout=5.0)
+        await q._drain_for_test()
         stats = await real_buffer.get_buffer_stats('test-project')
         assert stats['size'] == 5, (
             f"Expected 5 events in buffer after _drain_for_test, got {stats['size']}"
