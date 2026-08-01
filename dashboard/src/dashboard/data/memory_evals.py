@@ -550,8 +550,34 @@ def _index_escalations(
     Reuses :func:`dashboard.data.escalations.load_queue_escalations` (INV-5 —
     a call site, never a second reader).  Its existing contracts carry most of
     this join: a missing dir returns ``[]`` so the no-queue case needs no
-    guard, and unparseable files are skipped and logged so a corrupt
-    escalation cannot crash the join.
+    guard, and unparseable files are skipped so a corrupt escalation cannot
+    crash the join.  Those skips are also NAMED here
+    (``unreadable_escalation_file``, one issue per file) via the reader's
+    opt-in ``skipped`` accumulator.  That is the one discard this function
+    makes that it cannot see directly — it happens a frame down — and it is
+    the one that matters most: a corrupt file holding an open alarm is
+    precisely what makes ``unmatched_escalations`` non-exhaustive, and left
+    unnamed the parity view reports "nothing unexplained" in exactly the case
+    it exists to catch.
+
+    The issue's ``detail`` is deliberately CONDITIONAL ("if it held an open
+    ``eval_regression`` escalation…").  The queue is shared across every
+    escalation category and both open and closed statuses, and this join keeps
+    only open ``eval_regression`` records — so the likeliest corrupt file is
+    one this function would have filtered out anyway.  The file is unreadable,
+    which means its category and status are exactly what is NOT known; stating
+    the loss as fact would make the payload assert something it cannot see, and
+    "degrade loudly, never lie" is the whole point of the parity view.  The
+    uncertainty is the reason to name it, not a reason to overstate it.  The
+    corollary is that ``issue_count`` here can be non-zero for corruption with
+    no bearing on memory evals; a named maybe-loss beats an unnamed one.
+
+    The issue's ``path`` is the FILE, unlike the
+    record-level issues below which name the queue dir: those describe records
+    inside a file that DID parse, so the dir is the most specific location
+    available, whereas here the reader knows exactly which file to go repair.
+    The kind is singular to stay separable from ``unreadable_escalations``
+    (plural), which means the whole join blew up.
 
     Openness is filtered EXPLICITLY on ``status``, not inferred from the fact
     that ``load_queue_escalations`` skips the archive subtree.  That inference
@@ -598,7 +624,32 @@ def _index_escalations(
     """
     index: dict[str, dict[str, Any]] = {}
     unfingerprinted: list[dict[str, Any]] = []
-    for record in load_queue_escalations(escalations_dir):
+    skipped: list[dict[str, Any]] = []
+    # Drained in ``finally`` and BEFORE the join loop, for two distinct reasons.
+    # ``finally``: the reader can raise mid-scan (``is_dir`` or the ``glob``
+    # iterator hitting a mode change or an NFS hiccup — the very case
+    # ``build_memory_evals``'s ``_ARTIFACT_ERRORS`` wrapper exists for) AFTER it
+    # has already recorded some skips, and dropping those on the way out would
+    # be this change's own silent discard reappearing one frame up.  The
+    # exception still propagates untouched — this is a drain, not a catch — so
+    # the coarse ``unreadable_escalations`` issue is added on top, and the two
+    # kinds read together as "the scan died, and here is what it had found".
+    # BEFORE the loop: ``issues`` is the caller's list object, so entries
+    # appended here also survive a failure inside the join loop below.
+    try:
+        records = load_queue_escalations(escalations_dir, skipped=skipped)
+    finally:
+        for entry in skipped:
+            _issue(
+                issues, 'unreadable_escalation_file', path=entry['path'],
+                detail=(
+                    f'escalation queue file could not be read ({entry["error"]}); '
+                    'if it held an open eval_regression escalation it is missing '
+                    'from this payload, so unmatched_escalations cannot be read '
+                    'as exhaustive'
+                ),
+            )
+    for record in records:
         if not isinstance(record, dict):
             continue
         if record.get('category') != _EVAL_REGRESSION_CATEGORY:
