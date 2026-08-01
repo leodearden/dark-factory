@@ -56,7 +56,6 @@ from fused_memory.middleware.task_interceptor import (
     _is_ticket_id,
     _looks_like_task_id,
 )
-from fused_memory.middleware.toolcall_xml_guard import toolcall_xml_error
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.scope import resolve_main_checkout, resolve_project_id
 from fused_memory.reconciliation.task_filter import (
@@ -950,14 +949,6 @@ def create_mcp_server(
             return err
         if err := await _backlog_gate(project_id):
             return err
-        # Tool-call XML leak guard (task 3083) — see middleware/toolcall_xml_guard.py.
-        # Ahead of every content-derived branch below (is_batch_plan_framing,
-        # is_proposed_resolution_framing): an episode's content is fed to
-        # Graphiti's extractor, so a truncated body does not just sit in one
-        # payload — it seeds edges derived from text the harness already cut.
-        _xml_err = toolcall_xml_error(metadata=metadata, agent_id=agent_id, content=content)
-        if _xml_err is not None:
-            return _xml_err
         if temporal_context is not None and temporal_context not in _VALID_TEMPORAL_CONTEXTS:
             return {
                 'error': (
