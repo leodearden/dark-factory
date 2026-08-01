@@ -323,6 +323,47 @@ def _mean_plan_quality(scores: list[float]) -> float | None:
     return round(sum(scores) / len(scores), 4)
 
 
+def _plan_rate(n_admitted: int, no_plan: int) -> float | None:
+    """The fraction of ADMITTED plan-only cells that emitted a plan at all (4 dp).
+
+    THE ONE reduction, called by BOTH :func:`build_composite_report`'s row and
+    :func:`build_plan_quality_report`'s per-config aggregate — the
+    :func:`_mean_plan_quality` precedent, and for the same reason: the CLI
+    prints those two tables ADJACENTLY, so a reliability figure derived twice
+    from separately-maintained arithmetic is a pair of surfaces free to give
+    contradictory answers about the same quantity. Sharing the reduction makes
+    that drift structurally impossible rather than merely tested-against.
+
+    THE DENOMINATOR is *n_admitted* — the ADMITTED θ pool
+    (``len(plan_quality_scores)`` on the composite row, ``n`` on the θ
+    aggregate) — deliberately NOT the config's ``trials``. A cap-tainted cell
+    is a transport refusal (:func:`_has_plan_quality_score`): we never got to
+    ask the model, so it is neither a cell that planned nor a cell that failed
+    to plan, and it leaves BOTH the numerator and the denominator. Ranging over
+    ``trials`` instead would report a candidate as LESS RELIABLE for a question
+    it never got to answer, purely because it happened to be scheduled inside a
+    session-cap window — the schedule-attributable penalty tasks 3118 and 3099
+    spent two rounds removing, reintroduced on the surface
+    :func:`select_survivors` ranks on. It also matches the campaign this
+    automates: ``plans/eval-architect-effort-verdict-2026-07-27.md`` computes
+    its own planRate over 19 fixtures, dropping the 3 cap-contaminated ones from
+    the denominator, not over all 22.
+
+    *no_plan* is the count of those admitted cells that produced NO plan
+    (``plan_quality_no_plan`` / ``no_plan``) — floored to 0.0 by
+    :func:`_plan_quality_score` and KEPT in the pool, which is exactly why they
+    belong in this denominator while a refused cell does not.
+
+    An EMPTY pool is ``None``, never ``0.0`` — and never ``1.0``: here the
+    fabrication is TWO-SIDED, since a workflow config with no plan-only cell at
+    all would be slandered by a 0.0 ("it never planned") and flattered by a 1.0
+    ("it always planned"). Only ``None`` says the true thing.
+    """
+    if n_admitted <= 0:
+        return None
+    return round((n_admitted - no_plan) / n_admitted, 4)
+
+
 # ``(fixture, role_group)`` — the key of every efficiency baseline map in
 # :func:`build_composite_report` (task 3099). Module-level, not function-local:
 # a name bound inside a function body is not usable in a type expression.
@@ -395,6 +436,23 @@ def build_composite_report(
     be fabricated); a no-plan cell is FLOORED and counted (we asked, and the
     answer was nothing — which is worth exactly 0.0, the same answer
     :func:`judge.score_plan_structure` gives that artifact). Neither is silent.
+
+    THE RELIABILITY AXIS (task 3379): ``plan_rate`` is the fraction of that
+    config's ADMITTED plan-only cells that emitted a plan at all —
+    ``(plan_quality_n - plan_quality_no_plan) / plan_quality_n`` through THE
+    shared :func:`_plan_rate` reducer, with ``plan_quality_n`` (the admitted
+    pool's size, identical to the θ table's ``n``) carried beside it so the
+    ratio is verifiable from the row alone. It is DERIVED entirely from counts
+    task 3302 already collects: no new collection, no new predicate. It exists
+    because the 2026-07-27 architect campaign
+    (``plans/eval-architect-effort-verdict-2026-07-27.md``) found that what
+    separates the candidates is not how WELL they plan but how OFTEN they plan
+    at all, and its operator had to hand-compute that figure from the per-cell
+    result JSONs because no report surface exposed it. The denominator is the
+    ADMITTED pool and deliberately NOT ``trials``: a cap-tainted cell leaves
+    both numerator and denominator, so a candidate is never reported as less
+    reliable for a question a session-cap window stopped it from answering (see
+    :func:`_plan_rate`). An empty pool is ``None``, never ``0.0`` or ``1.0``.
 
     SCOPE of the taint exclusion (REVISED by task 3099): an UNMEASURABLE
     plan-only trial (:func:`_is_unmeasurable`) leaves EVERY measured pool —
@@ -655,6 +713,10 @@ def build_composite_report(
         # A plan-only config ran no test at all, so it has no pass RATE — not a
         # 0% one. Fabricating 0% there would report a failure that never happened.
         all_plan_only = acc['plan_only_trials'] == trials and trials > 0
+        # The size of the ADMITTED θ pool, bound ONCE and reused by both
+        # plan_quality_n and plan_rate below (task 3379) — so the rate and the
+        # denominator it is reported beside can never describe different pools.
+        n_admitted = len(acc['plan_quality_scores'])
         rows.append({
             'config': cfg,
             'role_under_test': fm.get('role_under_test'),
@@ -690,6 +752,16 @@ def build_composite_report(
             # and were scored 0.0 — the content-failure counterpart of the
             # transport-failure count above.
             'plan_quality_no_plan': acc['plan_quality_no_plan'],
+            # The ADMITTED θ pool's size — the denominator both derived figures
+            # below are taken over, carried on the row so each is verifiable
+            # from the row ALONE rather than by re-deriving it from the θ
+            # table (the module's report-a-rate-beside-its-n norm). It is the
+            # same number build_plan_quality_report reports as ``n``.
+            'plan_quality_n': n_admitted,
+            # RELIABILITY (task 3379): how often this config emitted a plan at
+            # all, over what was actually measured. Through THE shared reducer,
+            # which build_plan_quality_report's aggregate also calls.
+            'plan_rate': _plan_rate(n_admitted, acc['plan_quality_no_plan']),
         })
 
     return {
