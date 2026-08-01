@@ -3840,6 +3840,60 @@ class MemoryService:
     # Delete
     # ------------------------------------------------------------------
 
+    #: How many child ids :meth:`delete_memory` lists in one scroll.
+    #:
+    #: The refusal message has to be READABLE — an unbounded listing of a
+    #: pathological fan-out would produce an error string no agent or
+    #: operator can act on, and the scroll fetches full payloads.  When the
+    #: live count exceeds what the scroll returned, the listing is marked
+    #: ``truncated`` ("at least N") rather than silently reading as
+    #: exhaustive.  A CASCADE is not bounded by this: it re-scrolls until a
+    #: pass yields no unvisited children.
+    _CHILD_SCAN_LIMIT = 100
+
+    async def _count_children(self, memory_id: str, *, project_id: str) -> int:
+        """Live count of records whose ``metadata.parent_id`` is *memory_id*.
+
+        The cheap exact primitive (Qdrant's count API), read fresh at every
+        call — INV-3: corroborate against the store, never against
+        remembered state.  A child can be written between two deletes, so a
+        gate trusting a cached "childless" answer would be checking history.
+        """
+        return await self.count_memories_by_metadata(
+            project_id, {'parent_id': memory_id}
+        )
+
+    async def _list_children(self, memory_id: str, *, project_id: str) -> list[str]:
+        """Ids of *memory_id*'s children, bounded by ``_CHILD_SCAN_LIMIT``."""
+        rows = await self.get_memories_by_metadata(
+            project_id, {'parent_id': memory_id}, limit=self._CHILD_SCAN_LIMIT
+        )
+        return [row['id'] for row in rows]
+
+    async def _refuse_if_children(self, memory_id: str, *, project_id: str) -> None:
+        """Raise ``ParentHasChildrenError`` if *memory_id* still has children.
+
+        Count FIRST, scroll only on a non-zero count: the count is exact and
+        cheap while the scroll fetches full payloads, and ``delete_memory``
+        has six in-repo recon callers (including bulk pool GC) that would
+        otherwise pay for a listing nobody reads.
+
+        A scroll returning FEWER ids than the count — the bound above, or a
+        concurrent write between the two reads — still refuses, marked
+        ``truncated``.  Downgrading a disagreement to "no children" would be
+        precisely the silent orphan this gate exists to prevent; presenting
+        a partial list as exhaustive would understate it.
+        """
+        child_count = await self._count_children(memory_id, project_id=project_id)
+        if child_count == 0:
+            return
+        child_ids = await self._list_children(memory_id, project_id=project_id)
+        raise ParentHasChildrenError(
+            parent_id=memory_id,
+            child_ids=child_ids,
+            truncated=len(child_ids) < child_count,
+        )
+
     async def delete_memory(
         self,
         memory_id: str,
@@ -3850,7 +3904,40 @@ class MemoryService:
         causation_id: str | None = None,
         _source: str = 'mcp_tool',
     ) -> dict:
-        """Delete a memory from the specified store."""
+        """Delete a memory from the specified store.
+
+        REFUSES to orphan children (task 3197, leaf δ; PRD V3's lifecycle
+        contract — "no operation may silently orphan a child or dangle a
+        pointer it could have seen").  Deleting a Mem0 record that other
+        records point at via ``metadata.parent_id`` raises
+        :class:`~fused_memory.memory_metadata.ParentHasChildrenError`
+        listing the child ids, BEFORE any backend call, journal row or
+        reconciliation event — so a refused delete leaves nothing claiming a
+        deletion happened.  The caller's explicit way out is
+        ``cascade=True``.
+
+        The gate is UNCONDITIONAL — deliberately not behind
+        ``memory_metadata.enforce``, unlike the V1 shape checks.  It is a
+        lifecycle safety gate, not a vocabulary check: behind a default-off
+        flag the orphan hole would stay open exactly as long as the flag
+        stayed off, i.e. the machinery would ship and none of the
+        protection.  Shipping it on is safe because leaf α measured
+        ``metadata.parent_id`` at zero live corpus footprint — there are no
+        existing children, so no live delete (including the six in-repo
+        recon callers) can regress.
+
+        The child check is a LIVE re-read per INV-3, never cached state, and
+        it is charged only where the relationship can exist: ``parent_id``
+        is a Mem0 payload key, so the graphiti arm keeps its current
+        zero-extra-round-trip cost.  On the common childless path the cost
+        is ONE exact Qdrant count and ZERO scrolls; the payload scroll is
+        paid only when there is something to list, because the error
+        contract needs the child *ids* and a count cannot supply them.
+
+        Raises:
+            ParentHasChildrenError: the target still has children and
+                ``cascade`` was not requested.
+        """
         scope = Scope(project_id=project_id)
         source = SourceStore(store)
         write_op_id = str(uuid_mod.uuid4())
@@ -3866,6 +3953,12 @@ class MemoryService:
             )
             result = {'status': 'deleted', 'store': 'graphiti', 'id': memory_id}
         else:
+            # Child gate — BEFORE the backend call, the journal row and the
+            # event, so a refused delete leaves no trace claiming a
+            # deletion. `parent_id` is a Mem0 payload key, which is why this
+            # is in the mem0 arm only.
+            await self._refuse_if_children(memory_id, project_id=project_id)
+
             del_result = await self._journaled_backend_call(
                 write_op_id=write_op_id,
                 causation_id=causation_id,
