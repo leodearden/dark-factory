@@ -971,6 +971,7 @@ _FP_ALARMED_UNLINKED = 'ffeeddccbbaa99887766554433221100'
 _FP_CLEAR = '00112233445566778899aabbccddeeff'
 _FP_WRONG_CATEGORY = 'deadbeefdeadbeefdeadbeefdeadbeef'
 _FP_UNMATCHED = 'cafebabecafebabecafebabecafebabe'
+_FP_UNJUDGED_OPEN = '13579bdf02468ace13579bdf02468ace'
 
 # The escalation projection carried onto a metric row (and into
 # `unmatched_escalations`).  `created_at` is sourced from the queue record's
@@ -1093,16 +1094,70 @@ class TestEscalationJoin:
         assert row['escalation'] is None
         assert row['parity'] == 'alarmed_unlinked'
 
-    def test_quiet_metrics_are_clear(self, tmp_path: Path) -> None:
+    def test_quiet_and_unjudged_metrics_are_distinguishable(self, tmp_path: Path) -> None:
+        """``clear`` means "judged, and not alarming" — nothing weaker.
+
+        A metric NOTHING has judged is materially different from one the
+        evaluator looked at and passed: the first says the evaluator never
+        reached this metric, the second says it did and found no regression.
+        Folding the two into one label makes an un-run judgement render with
+        the healthy badge, which is the module's own stated failure mode
+        (fail toward "visibly unrenderable", never toward the healthy label).
+        """
         from dashboard.data.memory_evals import build_memory_evals
 
         root, esc_dir = _join_tree(tmp_path)
         rows = build_memory_evals(root, esc_dir)['evals'][0]['metrics']
 
+        assert _only(rows, 'clear-metric')['verdict'] == 'no_alarm'
         assert _only(rows, 'clear-metric')['parity'] == 'clear'
         assert _only(rows, 'clear-metric')['escalation'] is None
-        # No verdict at all is also not an alarm.
-        assert _only(rows, 'unjudged-metric')['parity'] == 'clear'
+        # No verdict entry at all: not an alarm, but not "clear" either.
+        assert _only(rows, 'unjudged-metric')['verdict'] is None
+        assert _only(rows, 'unjudged-metric')['parity'] == 'unjudged'
+        assert _only(rows, 'unjudged-metric')['escalation'] is None
+
+    def test_fingerprinted_entry_with_no_verdict_is_unjudged_open(self, tmp_path: Path) -> None:
+        """A link with no judgement behind it must not claim a recovery.
+
+        An entry that keys and fingerprints fine but carries no ``verdict``
+        field is the ONE reachable way a row can be both unjudged and linked:
+        the join only runs when the verdict ENTRY carries a fingerprint, so a
+        metric with no entry at all can never link.  Reporting this as
+        ``recovered_open`` asserts a recovery that never happened — the
+        evaluator did not judge this metric, so nothing recovered.
+        """
+        from dashboard.data.memory_evals import build_memory_evals
+
+        root = tmp_path / 'memory-evals'
+        esc_dir = tmp_path / 'escalations'
+        esc_dir.mkdir(parents=True, exist_ok=True)
+        _write_metrics(root, 'eval-a', _JOIN_RUN, [
+            _metric('unjudged-open', 'count', 3.0, direction='higher_is_worse'),
+        ])
+        _write_limits(root, 'eval-a', run_stamp=_JOIN_RUN)
+        # Written out literally: ``_verdict()`` always sets a ``verdict``, and
+        # the artifact is unvalidated JSON, so an entry missing that one field
+        # is a shape the reader has to answer for.
+        _write_verdicts(root, [{
+            'eval_id': 'eval-a',
+            'metric_id': 'unjudged-open',
+            'fingerprint': _FP_UNJUDGED_OPEN,
+            'run_stamp': _JOIN_RUN,
+        }], run_stamp=_JOIN_RUN)
+        _write_escalation(
+            esc_dir, 'esc-unjudged-open',
+            dedupe_fingerprint=_FP_UNJUDGED_OPEN,
+            summary='unjudged-open regressed', timestamp=_JOIN_ESC_TIMESTAMP,
+        )
+
+        row = _only(build_memory_evals(root, esc_dir)['evals'][0]['metrics'], 'unjudged-open')
+
+        assert row['verdict'] is None
+        assert row['parity'] == 'unjudged_open'
+        # The link is still surfaced — the escalation is real and open, and
+        # hiding it would make it look orphaned.
+        assert row['escalation']['id'] == 'esc-unjudged-open'
 
     def test_matching_fingerprint_in_another_category_is_not_joined(self, tmp_path: Path) -> None:
         """Only ``eval_regression`` escalations participate in this join."""
@@ -2984,12 +3039,13 @@ class TestCommittedExemplarBoundary:
 
         assert len([i for i in payload['issues'] if i['kind'] == 'missing_verdicts']) == 1
 
-        # No verdicts artifact means no verdict — never a defaulted "no_alarm".
+        # No verdicts artifact means no verdict — never a defaulted "no_alarm",
+        # and never the healthy ``clear`` badge either: nothing judged these.
         for row in payload['evals']:
             for metric in row['metrics']:
                 assert metric['verdict'] is None, (row['eval_id'], metric['metric_id'])
                 assert metric['escalation'] is None
-                assert metric['parity'] == 'clear'
+                assert metric['parity'] == 'unjudged'
             assert row['storm_escape'] is None
 
     def test_negative_exemplars_split_rendering_from_producer_validation(self, tmp_path: Path) -> None:
