@@ -435,6 +435,27 @@ default is *still* `/warm-lanes`, because `_default_mount()` re-forks `dirname`
 on its own. A fix stopping at the assignment would pass a naive `SCRIPT_DIR`
 check while changing nothing an operator ever sees.
 
+Its two `_default_mount()` sites share **one `_parent_of()` definition**. The
+duplication argument above covers only the five **self-directory** resolutions
+— a script's own directory cannot be resolved via something it has not located
+yet — and does not extend to a derivation running after bootstrap. Sharing was
+not cosmetic: the two copies lacked the `%/` trim `warm-lane-gc.sh`'s copy
+needed, so "the same idiom" had already drifted into three variants, and the
+shared definition carries the canonical guarded shape (verified byte-equal to
+`dirname` over the same nine inputs). `_SCRIPT_DIR` deliberately stays
+open-coded — it is the bootstrap everything else depends on and must not
+acquire a dependency of its own, not even on a function definition a later edit
+could move below it. The refactor is behaviour-preserving by measurement: the
+advertised default mount is identical across the plain / `worktrees` /
+`.worktrees` nestings under both a full and a `dirname`-less `PATH` (6/6), and
+the full usage text is byte-identical.
+
+`warm-lane-gc.sh`'s `BASE_TARGET` copy is **not** folded in with them: the only
+place both scripts could share is `lib_lane_state.sh`, which
+`provision-warm-lane-fs.sh` does not source at all (and which task 3279 holds
+no lock on). Left as the third copy, named here rather than left to look
+overlooked.
+
 #### What was measured
 
 Harness: a stub `PATH` entry whose `dirname` shim exits 127 (observationally

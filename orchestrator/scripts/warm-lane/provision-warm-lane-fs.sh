@@ -100,21 +100,46 @@ _SCRIPT_DIR="$(cd "$_dir" && pwd)"
 unset _src _dir
 REPO_ROOT="$(cd "$_SCRIPT_DIR/../../.." && pwd)"
 
+# ── parent-of-a-path, by parameter expansion ──────────────────────────────────
+# `dirname "$1"` without forking `dirname`, for the same reason and by the same
+# measurement as the _SCRIPT_DIR resolution above (README.md "Delta 7"): a fork
+# HERE re-empties the result no matter how correctly REPO_ROOT resolved, so the
+# advertised default mount would still be the bare filesystem root
+# `/warm-lanes` — the whole operator-facing symptom. Fixing only the
+# _SCRIPT_DIR assignment changes nothing an operator sees.
+#
+# ONE definition, called from both sites in _default_mount(). The README's
+# argument for duplicating this idiom covers only the five SELF-directory
+# resolutions — a script's own directory cannot be resolved via something it
+# has not located yet — and does not extend to derivations that run after
+# bootstrap. It had already cost: these two copies lacked the `%/` trim that
+# warm-lane-gc.sh's copy needed, so "the same idiom" had silently drifted.
+# _SCRIPT_DIR above deliberately stays open-coded: it is the bootstrap
+# everything else depends on, and it must not acquire a dependency of its own
+# (not even on a function definition a later edit could move below it) — the
+# same reason lib_lane_state.sh carries its own copy.
+#
+# Canonical guarded shape, byte-equal to `dirname` over /worktrees, worktrees,
+# /a/b/wt, /a/b/wt/, /, ., ./x and a/ — each guard load-bearing on a different
+# one of those. The `%/` trim is a no-op on every input reachable here (both
+# callers pass a `cd … && pwd` result, which carries no trailing slash), and is
+# kept so the shared definition matches warm-lane-gc.sh's rather than being a
+# subtly weaker variant of it.
+_parent_of() {
+    local _t="${1%/}" _p='.'
+    [ -n "$_t" ] || _t='/'
+    case "$_t" in
+        */*) _p="${_t%/*}"
+             [ -n "$_p" ] || _p='/' ;;
+    esac
+    printf '%s' "$_p"
+}
+
 # ── default mount dir: ascend past the worktrees dir if present ────────────────
 _default_mount() {
     local root parent leaf
-    # Same parameter-expansion dirname/basename as the repo-root resolution
-    # above, for the same reason and by the same measurement (README.md
-    # "Delta 7"): a fork HERE re-empties `parent` no matter how correctly
-    # REPO_ROOT resolved above, so the advertised default mount is still the
-    # bare filesystem root `/warm-lanes` — the whole operator-facing symptom.
-    # Fixing only the _SCRIPT_DIR assignment changes nothing an operator sees.
     root="$REPO_ROOT"
-    parent='.'
-    case "$root" in
-        */*) parent="${root%/*}"
-             [ -n "$parent" ] || parent='/' ;;
-    esac
+    parent="$(_parent_of "$root")"
     # If the repo root is inside a worktrees directory, surface one level higher
     # so the warm-lanes dir lives beside the worktrees tree, not inside a worktree.
     #
@@ -129,11 +154,7 @@ _default_mount() {
     case "$leaf" in
         worktrees|.worktrees)
             root="$parent"
-            parent='.'
-            case "$root" in
-                */*) parent="${root%/*}"
-                     [ -n "$parent" ] || parent='/' ;;
-            esac ;;
+            parent="$(_parent_of "$root")" ;;
     esac
     echo "$parent/warm-lanes"
 }
