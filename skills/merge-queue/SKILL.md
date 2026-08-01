@@ -114,7 +114,14 @@ Poll the train request with the same 15 s→60 s backoff until it reaches a term
 **`state: "unknown"`** — for the `request_id`/`task_id` poll arms, this means the orchestrator restarted and the retention ring no longer holds this request (a record that *was* enqueued). `merge_status` now self-resolves a landed merge via its git-authority tier: if the branch is provably on `main` it returns `state: "done"` with `kind: "found_on_main"` and `merge_sha` directly. If `merge_status` still returns `unknown`, confirm deterministically:
 <a id="canonical-ancestry-check"></a>**The canonical ancestry check — three outcomes, not two.** Every "is it on main?" confirmation in this skill means this check. **Never use the two-way idiom `git merge-base --is-ancestor ... && echo "on main" || echo "not on main"`**: a deleted branch ref exits **128**, which that idiom silently reports as "not on main" — inverting the truth for the normal post-merge state, since the merge lane deletes task branches on cleanup (`_delete_branch_if_on_main`, `orchestrator/src/orchestrator/git_ops.py:7538-7574`), and on the `branch` arm a *foreign* merger's cleanup deletes it out from under you.
 ```bash
-git merge-base --is-ancestor task/<TASK_ID> main; rc=$?
+git merge-base --is-ancestor task/<TASK_ID> main; rc=$?; echo "ancestry rc=$rc"
+# The trailing `echo` is REQUIRED, not decoration. `--is-ancestor` prints
+# nothing on rc=0 OR rc=1, and the `rc=$?` assignment itself exits 0, so
+# without it the tool reports exit 0 and identical empty output for "on
+# main" and "NOT on main" -- silence you would have to guess at. Echoing the
+# numeric rc is NOT the two-outcome `&& echo` idiom banned above: it prints
+# on every path and keeps all three outcomes distinguishable. Do not "tidy"
+# it away.
 # rc=0   → on main. Treat as done/found_on_main — done_provenance kind='found_on_main',
 #          commit=<landing sha: git log --format=%H -1 main>
 #          (git log gives the merge commit; git merge-base gives the common ancestor, NOT it)

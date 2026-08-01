@@ -392,7 +392,14 @@ The merge procedure is iterative — don't assume one pass will be enough:
 
      <a id="branch-on-main"></a>**The canonical ancestry check (`branch_on_main`) — three outcomes, not two.** Every "is it on main?" confirmation in this skill means *this* check. **Never use the two-way idiom `git merge-base --is-ancestor ... && echo "on main" || echo "not on main"`**: a deleted branch ref exits **128**, which that idiom silently reports as "not on main" — inverting the truth for the single most common post-merge state, since the merge lane deletes task branches on cleanup (`_delete_branch_if_on_main`, `orchestrator/src/orchestrator/git_ops.py:7538-7574`), and on the `branch` arm a *foreign* merger's cleanup deletes it out from under you.
      ```bash
-     git merge-base --is-ancestor task/<TASK_ID> main; rc=$?
+     git merge-base --is-ancestor task/<TASK_ID> main; rc=$?; echo "ancestry rc=$rc"
+     # The trailing `echo` is REQUIRED, not decoration. `--is-ancestor` prints
+     # nothing on rc=0 OR rc=1, and the `rc=$?` assignment itself exits 0, so
+     # without it the tool reports exit 0 and identical empty output for "on
+     # main" and "NOT on main" -- silence you would have to guess at. Echoing
+     # the numeric rc is NOT the two-outcome `&& echo` idiom banned above: it
+     # prints on every path and keeps all three outcomes distinguishable. Do
+     # not "tidy" it away.
      # rc=0   → landed. Accept as done/found_on_main.
      # rc=1   → genuinely not on main. Keep polling / resubmit, per the arm.
      # rc=128 → branch ref is GONE ("fatal: Not a valid object name"). This is the
@@ -444,7 +451,10 @@ The merge procedure is iterative — don't assume one pass will be enough:
 - `poll["state"] == "conflict"`, `poll["state"] == "blocked"`, or `poll["state"] == "abandoned"` → same fix-and-resubmit loop: fix in worktree, rebase on main, loop back to step 7. (For `abandoned`, also verify the cancellation was not intentional before resubmitting.)
 - `poll["state"] == "unknown"` (orchestrator restarted or retention ring expired) → `merge_status` now self-resolves a landed merge via its git-authority tier and returns `state: "done"` with `kind: "found_on_main"` and `merge_sha` when the branch is provably on main. If `merge_status` still returns `unknown`, confirm deterministically:
   ```bash
-  git merge-base --is-ancestor task/<TASK_ID> main; rc=$?
+  git merge-base --is-ancestor task/<TASK_ID> main; rc=$?; echo "ancestry rc=$rc"
+  # The trailing `echo` is REQUIRED -- see the [canonical ancestry
+  # check](#branch-on-main) above for why: without it, "on main" and "NOT on
+  # main" print identical empty output and exit 0, indistinguishable.
   # rc=0 (on main): proceed to step 8 with done_provenance kind='found_on_main',
   #   commit=<landing sha: git log --format=%H -1 main>
   #   (git log gives the merge commit; git merge-base gives the common ancestor, NOT the merge commit)
@@ -470,7 +480,10 @@ Whether the `request_id` you received cancels the in-flight entry depends on how
 
 If `merge_cancel` returns `{state: "unknown"}` on the `request_id` handle (or after the re-check above still leaves it unresolved), the entry has no live waiter in this server instance (restarted or finalized) — poll `mcp__escalation__merge_status(request_id)` first (it now self-resolves via the git-authority tier and returns `state: "done"` / `kind: "found_on_main"` / `merge_sha` when the branch is provably on main). If `merge_status` still returns `unknown`, confirm deterministically:
 ```bash
-git merge-base --is-ancestor task/<TASK_ID> main; rc=$?
+git merge-base --is-ancestor task/<TASK_ID> main; rc=$?; echo "ancestry rc=$rc"
+# The trailing `echo` is REQUIRED -- see the [canonical ancestry
+# check](#branch-on-main) above for why: without it, "on main" and "NOT on
+# main" print identical empty output and exit 0, indistinguishable.
 # rc=0 (on main): treat as done; proceed to step 8 with done_provenance kind='found_on_main'
 # rc=128 (branch ref gone after a successful merge + cleanup): NOT the same as rc=1 —
 #   run the merge-marker search from the canonical check above before concluding anything
