@@ -1668,10 +1668,8 @@ def _validate(task_kind: str, metadata: dict, project_root: str) -> dict | None:
         from fused_memory.middleware.deterministic_task_guard import (  # type: ignore[reportMissingImports]
             deterministic_task_error,
         )
-        return deterministic_task_error(task_kind, metadata, project_root)
     except ModuleNotFoundError:
         import json
-        import subprocess
         # Embed metadata as a JSON string literal and parse it back to a dict
         # inside the subprocess — both paths therefore pass a dict to
         # deterministic_task_error, not a string.
@@ -1713,6 +1711,8 @@ def _validate(task_kind: str, metadata: dict, project_root: str) -> dict | None:
                 f'  stderr:     {getattr(exc, "stderr", None)}\n'
                 f'  --project:  {fm_project}'
             )
+    else:
+        return deterministic_task_error(task_kind, metadata, project_root)
 
 
 class TestB10Validation:
