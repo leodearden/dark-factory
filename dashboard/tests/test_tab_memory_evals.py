@@ -845,3 +845,77 @@ def test_escalation_links_and_storm_aggregate_banner(
             'each unmatched-escalation reason must get DISTINCT wording; '
             f'found duplicates in {texts}.'
         )
+
+
+# ---------------------------------------------------------------------------
+# step-11 test: the limits provenance block
+# ---------------------------------------------------------------------------
+
+
+_LIMITS_KEYS = (
+    'alpha',
+    'false_alarm_budget',
+    'runs_per_quarter',
+    'min_samples',
+    'baseline_window',
+    'baseline_run_stamps',
+    'grandfather_set_hash',
+    'run_stamp',
+    'generator',
+    'stale_for_latest_run',
+)
+
+
+def test_limits_provenance_rendered(tab_memory_evals_jsx_body: str) -> None:
+    """Every limits-provenance key must be rendered, the staleness of the
+    provenance itself must be disclosed, and a null limits artifact must say so.
+    """
+    body = tab_memory_evals_jsx_body
+
+    for key in _LIMITS_KEYS:
+        assert key in body, (
+            f"the limits provenance block must render '{key}' — the whole point "
+            'of shipping provenance is that the operator can see which alpha / '
+            'baseline the verdict was judged against.'
+        )
+    assert 'rule_kind' in body, (
+        "the per-metric `rule_kind` must be rendered alongside the eval-level "
+        'limits provenance.'
+    )
+
+    # stale_for_latest_run gates a VISIBLE disclosure — provenance stamped at an
+    # older run must never be presented as governing a newer displayed run
+    # (memory_evals.py:237-241).
+    assert re.search(r'stale_for_latest_run\s*&&', body), (
+        '`limits.stale_for_latest_run` must GATE a visible disclosure, not just '
+        'be printed as one more field. Otherwise alpha/baseline provenance '
+        'reads as governing the newer run actually on screen.'
+    )
+
+    # A null limits artifact renders an explicit state, not a blank block.
+    assert 'no limits artifact' in body, (
+        'a null `ev.limits` must render an explicit "no limits artifact" state '
+        'rather than an empty block — a blank provenance section is '
+        'indistinguishable from a rendering bug.'
+    )
+
+    # Compact / expandable so provenance does not dominate the card.
+    assert re.search(r'<details|useOpenSet|usePersistedState|localStorage', body), (
+        'the provenance block must be collapsed-by-default and expandable '
+        '(a <details> element or a persisted open-state key), so it does not '
+        'dominate the eval card.'
+    )
+
+    # Local re-assertion of the step-7 guard: alpha and min_samples appear only
+    # in render position, never as an operand of a comparison.
+    for field in ('alpha', 'min_samples'):
+        assert not re.search(rf'\.\s*{field}\b\s*(<=|>=|<|>)', body), (
+            f'`{field}` is compared somewhere in tab_memory_evals.jsx. '
+            'Provenance is DISPLAYED, never used to re-derive a verdict '
+            '(PRD section 8, G6/INV-5).'
+        )
+        assert not re.search(rf'(<=|>=|<|>)\s*\w*\.\s*{field}\b', body), (
+            f'`{field}` is compared somewhere in tab_memory_evals.jsx. '
+            'Provenance is DISPLAYED, never used to re-derive a verdict '
+            '(PRD section 8, G6/INV-5).'
+        )
