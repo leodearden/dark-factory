@@ -2340,12 +2340,20 @@ async def test_halted_project_skips_cycle(journal, event_buffer, mock_memory_ser
     harness._start_escalation_server = AsyncMock()
     harness._stop_escalation_server = AsyncMock()
 
+    # Positive witness for the halt-SKIP branch — see _halt_skip_event.
+    skipped = _halt_skip_event(harness)
+
     with (
         patch.object(harness, 'run_full_cycle', side_effect=spy_rfc),
         contextlib.suppress(TimeoutError),
     ):
         # Run loop for one sleep cycle (loop sleeps 5s; we wait 0.2s — enough for 1 iteration)
         await asyncio.wait_for(harness.run_loop(), timeout=0.2)
+
+    assert skipped.is_set(), (
+        'halt check never reached — the run_full_cycle absence assertion below '
+        'would pass vacuously'
+    )
 
     # For a halted project, run_full_cycle must NOT have been called
     assert len(run_full_cycle_called) == 0, (
@@ -2605,6 +2613,40 @@ async def _drive_halt_notify(harness, event_buffer, timeout: float = 10.0):
     on_judge_halt.side_effect = _signal_halt
 
     await _drive_run_loop_until(harness, halted, timeout=timeout)
+
+
+def _halt_skip_event(harness) -> asyncio.Event:
+    """Spy on harness._notify_judge_halt and return an Event set once the
+    halt-SKIP branch has actually fired.
+
+    _notify_judge_halt is that branch's observable signature: _project_loop
+    awaits it immediately before returning on the skip path
+    (harness.py:2366-2378), and it is still CALLED when _backlog_policy is
+    None — it early-returns internally (harness.py:612-613). So it is a valid
+    witness for the pure-negative halt tests, none of which wire a backlog
+    policy.
+
+    Those tests assert only ABSENCES (run_full_cycle not called, unhalt not
+    awaited). An absence assertion is satisfied both by "the code correctly
+    declined" and by "the loop never got there" — so each caller pairs this
+    witness with an explicit `assert skipped.is_set()`. Without it, driving via
+    _drive_run_loop_until with no events would return immediately with nothing
+    to wait on, making that vacuity permanent and silent. It is also exactly
+    the descriptive caller-side assertion _drive_run_loop_until's docstring
+    anticipates, since that helper suppresses its own backstop TimeoutError and
+    falls through to the caller.
+    """
+    skipped = asyncio.Event()
+    real_notify = harness._notify_judge_halt
+
+    async def _signal_skip(*a, **k):
+        try:
+            return await real_notify(*a, **k)
+        finally:
+            skipped.set()
+
+    harness._notify_judge_halt = AsyncMock(side_effect=_signal_skip)
+    return skipped
 
 
 @pytest.mark.asyncio
