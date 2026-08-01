@@ -65,7 +65,6 @@ from typing import NamedTuple
 
 from _task_db_scan import (
     add_db_discovery_args,
-    discover_db_paths,
     format_json,
     group_matches_by_db,
     run_scan_cli,

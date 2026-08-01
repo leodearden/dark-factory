@@ -22,10 +22,14 @@ import json
 import subprocess
 from pathlib import Path
 
+# discover_db_paths is imported from its DEFINING module rather than re-exported
+# through the scanner: the scanner itself never calls it (run_scan_cli resolves it
+# from _task_db_scan's own namespace), so re-exporting it would be a dead import.
+# Same function object either way — these tests exercise an identical callable.
+from _task_db_scan import discover_db_paths
 from scan_task_toolcall_leaks import (
     LeakMatch,
     detect_leak,
-    discover_db_paths,
     format_json,
     format_report,
     scan_db,
