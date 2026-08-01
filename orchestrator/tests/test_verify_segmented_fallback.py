@@ -655,3 +655,201 @@ class TestRunVerificationSegmentChainedTestWiring:
 
         assert len([c for c in calls if 'ruff check' in c['cmd']]) == 1
         assert len([c for c in calls if 'pyright' in c['cmd']]) == 1
+
+
+class _SegmentedBudgetClock:
+    """A monotonic clock that blows ``_run_segmented``'s budget after N segments.
+
+    The budget is whatever ``_resolve_verify_timeout`` resolves for this config
+    — deliberately NOT hard-coded here. The clock reads it off
+    ``_run_segmented``'s own ``budget_secs`` argument and sizes each tick as a
+    fraction of it, so "segments 3..8 never ran" holds whatever the configured
+    ceiling happens to be (it has already moved 1800 -> 3600 -> 5400 across
+    tasks 3348/3350; a hard-coded number here would rot on the next bump).
+
+    ``blow_after=None`` means "never exhaust" — the clock stays frozen at 0 and
+    every segment gets the full remaining budget.
+    """
+
+    def __init__(self, blow_after: int | None = None) -> None:
+        self.t = 0.0
+        self.blow_after = blow_after
+        self.per_tick = 0.0
+
+    def arm(self, budget_secs: float) -> None:
+        if self.blow_after is not None:
+            # After exactly `blow_after` ticks the elapsed time must EXCEED the
+            # budget: `blow_after` segments run, every later one is not_run.
+            self.per_tick = budget_secs / self.blow_after * 1.01
+
+    def __call__(self) -> float:
+        return self.t
+
+    def tick(self) -> None:
+        self.t += self.per_tick
+
+
+class TestRunVerificationSegmentedAcceptance:
+    """End-to-end through ``run_verification`` — the acceptance test for esc-3062-2.
+
+    REVALIDATION NOTE. Task 3350 landed ``tests/scripts/orchestrator.yaml``, so
+    a diff confined to ``tests/scripts/`` NO LONGER reaches the fallback:
+    ``_build_fallback_config`` is consulted only when ``module_configs`` is
+    EMPTY, so that diff now takes the module-config path. Reproducing the
+    incident by scoping a ``tests/scripts/``-only diff would therefore take a
+    path that has nothing to do with the defect and assert nothing about it —
+    a green test proving the wrong thing. These tests construct the fallback
+    ``ModuleConfig`` DIRECTLY instead.
+
+    3350 removed one TRIGGER of the defect, not the defect: any diff that still
+    falls through to ``__fallback__`` (repo-root files, ``plans/``, ``hooks/``,
+    ``.github/``, mixes with no single subproject) short-circuits exactly as
+    reported.
+    """
+
+    @staticmethod
+    async def _run(tmp_path, *, red_labels=(), blow_budget_after=None):
+        """Drive the fallback path with per-segment rc scripted by label.
+
+        ``_run_cmd`` is stubbed and segments are identified by their streamed
+        log path (``attempt-1.__fallback__.test.<label>.log``), which is the
+        same per-segment namespacing production uses — so the script keys are
+        the real labels rather than a positional index that would silently
+        re-target if the committed chain gained a clause.
+        """
+        from unittest.mock import patch  # noqa: PLC0415
+
+        from orchestrator import verify as verify_mod  # noqa: PLC0415
+        from orchestrator.config import OrchestratorConfig  # noqa: PLC0415
+
+        (tmp_path / '.task').mkdir(parents=True, exist_ok=True)
+        calls: list[dict] = []
+        clock = _SegmentedBudgetClock(blow_budget_after)
+
+        def _segment_label(log_path) -> str | None:
+            if log_path is None or '.test.' not in log_path.name:
+                return None
+            return log_path.name.split('.test.', 1)[1].removesuffix('.log')
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **_kw):
+            label = _segment_label(log_path)
+            calls.append({
+                'cmd': cmd, 'cwd': cwd, 'timeout': timeout,
+                'log_path': log_path, 'segment': label,
+            })
+            if label is None:  # the unsegmented lint / type legs
+                return 0, 'ok', False
+            clock.tick()
+            if label in red_labels:
+                return 1, f'FAILED tests/test_thing.py::test_thing in {label}', False
+            return 0, f'ok {label}', False
+
+        real_run_segmented = verify_mod._run_segmented
+
+        async def clocked_run_segmented(*args, **kwargs):
+            # `now` exists on _run_segmented precisely so the shared deadline is
+            # controllable; injecting it here keeps the REAL aggregator (and the
+            # real run_verification wiring) under test and fakes only the clock.
+            clock.arm(kwargs['budget_secs'])
+            kwargs['now'] = clock
+            return await real_run_segmented(*args, **kwargs)
+
+        config = OrchestratorConfig(project_root=tmp_path, verify_admission_enabled=False)
+        runs_capture: list = []
+
+        def spy_persist(*args, **kwargs):
+            for candidate in (*args, *kwargs.values()):
+                if isinstance(candidate, list) and candidate and isinstance(candidate[0], dict):
+                    runs_capture.append(candidate)
+            return []
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd), \
+             patch('orchestrator.verify._run_segmented', side_effect=clocked_run_segmented), \
+             patch('orchestrator.verify._persist_attempt_logs', side_effect=spy_persist):
+            result = await verify_mod.run_verification(
+                tmp_path,
+                config,
+                TestRunVerificationSegmentChainedTestWiring._fallback_config(
+                    _FLEET_TEST_COMMAND,
+                ),
+                attempt_id=1,
+                task_id='3338',
+                max_retries=0,
+                segment_chained_test=True,
+            )
+        return result, calls, runs_capture
+
+    @pytest.mark.asyncio
+    async def test_an_unrelated_red_no_longer_skips_the_last_segment(self, tmp_path):
+        """THE acceptance test for esc-3062-2.
+
+        `orchestrator` goes red three clauses in. Under the old single-shell
+        `&&` chain the shell short-circuited there and `tests/scripts/` — the
+        clause a task's OWN assigned files can live in — was never executed,
+        with one rc that could not say so. Here it runs, and is recorded
+        `passed` on its own evidence.
+        """
+        result, _calls, runs = await self._run(tmp_path, red_labels={'orchestrator-3'})
+
+        test_run = _test_run_entry(runs)
+        assert test_run['cmd'] == _FLEET_TEST_COMMAND, 'the persisted cmd is still the whole chain'
+        segments = test_run['segments']
+        assert segments is not None
+        assert len(segments) == 8
+
+        by_label = {s['label']: s for s in segments}
+        # The fact the old &&-chain could NEVER produce.
+        assert by_label['root-8']['status'] == 'passed'
+        assert by_label['root-8']['rc'] == 0
+        assert by_label['root-8']['cmd'].endswith('pytest tests/scripts/ --timeout=300')
+        # Nothing after the red was skipped.
+        assert [s['status'] for s in segments] == [
+            'passed', 'passed', 'failed', 'passed', 'passed', 'passed', 'passed', 'passed',
+        ]
+        # ...and the unrelated red is still a red overall. Running the later
+        # segments buys information, never leniency.
+        assert by_label['orchestrator-3']['status'] == 'failed'
+        assert result.passed is False
+
+    @pytest.mark.asyncio
+    async def test_a_not_run_segment_is_never_green_and_never_silent(self, tmp_path):
+        """Every segment that RAN passed — and the verdict still names the rest.
+
+        A green-so-far run with unrun segments must not report green, and the
+        one-line verdict a triaging agent reads must SAY which segments have no
+        result, not merely be non-green.
+        """
+        result, _calls, runs = await self._run(tmp_path, blow_budget_after=2)
+
+        segments = _test_run_entry(runs)['segments']
+        not_run = [s for s in segments if s['status'] == 'not_run']
+        assert [s['label'] for s in not_run] == [
+            'orchestrator-3', 'fused-memory-4', 'dashboard-5',
+            'sampler-6', 'root-7', 'root-8',
+        ]
+        # Every segment that actually executed passed...
+        assert all(s['status'] == 'passed' for s in segments if s['status'] != 'not_run')
+        # ...and `rc is None`, never 0, is what makes "no result" unconflatable
+        # with "passed" for every downstream consumer.
+        assert all(s['rc'] is None for s in not_run)
+        assert all(s['skip_reason'] for s in not_run)
+
+        assert result.passed is False, 'a run with unrun segments is never green'
+        for segment in not_run:
+            assert segment['label'] in result.cause_hint, (
+                f'cause_hint must NAME the unrun segment {segment["label"]!r}; '
+                f'got {result.cause_hint!r}'
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_not_run_segment_keeps_the_existing_timeout_classification(self, tmp_path):
+        """`timed_out` stays True so the timeout-retry path is reached unchanged.
+
+        Forcing it is what keeps a budget-exhausted chain classified as
+        `infra_timeout` (retryable) exactly as a single-chain timeout is today,
+        leaving run_verification's retry/env-recovery machinery untouched.
+        """
+        result, _calls, runs = await self._run(tmp_path, blow_budget_after=2)
+
+        assert any(s['status'] == 'not_run' for s in _test_run_entry(runs)['segments'])
+        assert result.timed_out is True
