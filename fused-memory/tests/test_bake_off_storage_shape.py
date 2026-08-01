@@ -1258,3 +1258,208 @@ class TestTopicAnchorIsArmLocalAndPure:
 
         assert [(r.record_id, dict(r.metadata)) for r in hits] == before
         assert len(hits) == 1  # not appended to in place
+
+
+# ===========================================================================
+# step-9 — the two rank/set-based retrieval metrics
+# ===========================================================================
+#
+# eval-design §1 states the program-wide discipline verbatim: "every
+# retrieval metric in this program must be rank-based, never
+# absolute-score-based. Re-running 3111's probe today on the canonical's own
+# topic phrase returned scores of 0.44-0.51 for the same corpus where the
+# task record measured 0.72-0.90 — wording and embedding/config drift move
+# the score scale wholesale. Ranks and set-membership (present-in-top-k)
+# survive that; thresholds on raw cosine do not."
+#
+# So these two functions take an ALREADY-RANKED hit list and read only rank
+# and set membership. Every hit list below is hand-built, so every expected
+# value is exact by construction — no embeddings, no tolerances.
+
+
+def _ranked(*claim_id_groups, topic=None):
+    """A ranked hit list where hit i realizes `claim_id_groups[i]`."""
+    mod = _mod()
+    hits = []
+    for position, claim_ids in enumerate(claim_id_groups):
+        metadata: dict = {'category': 'procedural_knowledge'}
+        if topic is not None:
+            metadata['topic'] = topic
+        hits.append(mod.ArmRecord(
+            record_id=f'r{position}',
+            content='body',
+            metadata=metadata,
+            cluster_id='c1',
+            claim_ids=list(claim_ids),
+            role='peer',
+        ))
+    return hits
+
+
+class TestClaimRecallAtK:
+    """Does the SPECIFIC claim a query targets surface within top-k?"""
+
+    def test_a_claim_at_rank_three_is_recalled_at_k5_but_not_k2(self):
+        mod = _mod()
+        hits = _ranked([], [], ['target'], [])
+
+        assert mod.claim_recall_at_k(hits, ['target'], 5) == 1.0
+        assert mod.claim_recall_at_k(hits, ['target'], 2) == 0.0
+
+    def test_a_claim_exactly_at_k_is_inside_the_window(self):
+        """Off-by-one guard: k is inclusive, so rank 5 counts at k=5."""
+        mod = _mod()
+        hits = _ranked([], [], [], [], ['target'])
+
+        assert mod.claim_recall_at_k(hits, ['target'], 5) == 1.0
+        assert mod.claim_recall_at_k(hits, ['target'], 4) == 0.0
+
+    def test_a_grouped_document_realizes_every_claim_it_absorbed(self):
+        """Otherwise arm (b) is penalised precisely FOR grouping correctly —
+        the metric would punish the shape for doing the thing under test."""
+        mod = _mod()
+        grouped = _ranked(['k1', 'k2', 'k3'])
+
+        for claim_id in ('k1', 'k2', 'k3'):
+            assert mod.claim_recall_at_k(grouped, [claim_id], 5) == 1.0
+
+    def test_recall_over_several_expected_claims_is_the_realized_fraction(self):
+        mod = _mod()
+        hits = _ranked(['k1'], ['k2'])
+
+        assert mod.claim_recall_at_k(hits, ['k1', 'k2'], 5) == 1.0
+        assert mod.claim_recall_at_k(hits, ['k1', 'k2', 'k3'], 5) == pytest.approx(2 / 3)
+        assert mod.claim_recall_at_k(hits, ['k3', 'k4'], 5) == 0.0
+
+    def test_a_claim_realized_twice_is_not_double_counted(self):
+        mod = _mod()
+        hits = _ranked(['k1'], ['k1'], ['k2'])
+
+        assert mod.claim_recall_at_k(hits, ['k1', 'k2'], 5) == 1.0
+
+    def test_no_expected_claims_reports_none_not_a_measured_zero(self):
+        """`calibrate_write_triage.compute_recall_at_k`'s own rule: an empty
+        denominator is NO measurement, which is not the same as a measured 0.0
+        and must not average into the report as one."""
+        assert _mod().claim_recall_at_k(_ranked(['k1']), [], 5) is None
+
+    def test_an_empty_hit_list_is_a_genuine_zero(self):
+        """Distinct from the case above: the query WAS scorable and returned
+        nothing, which is a real miss."""
+        assert _mod().claim_recall_at_k([], ['k1'], 5) == 0.0
+
+
+class TestTopicDiscoverability:
+    """Can the topic's canonical be found, and how much of the topic surfaced?"""
+
+    def test_reports_a_one_based_rank_for_a_present_canonical(self):
+        mod = _mod()
+        hits = _ranked([], [], [], topic='alpha')
+
+        result = mod.topic_discoverability(hits, 'alpha', 'r1', 5)
+
+        assert result['canonical_in_top_k'] is True
+        assert result['canonical_rank'] == 2  # r1 is the SECOND hit
+
+    def test_the_first_hit_is_rank_one_not_rank_zero(self):
+        result = _mod().topic_discoverability(
+            _ranked([], topic='alpha'), 'alpha', 'r0', 5,
+        )
+
+        assert result['canonical_rank'] == 1
+
+    def test_an_absent_canonical_reports_rank_none_never_zero(self):
+        """0 would collide with a real rank under any 0-based reading and
+        would silently average as "very good" in a mean-rank summary."""
+        mod = _mod()
+        hits = _ranked([], [], topic='alpha')
+
+        result = mod.topic_discoverability(hits, 'alpha', 'missing', 5)
+
+        assert result['canonical_in_top_k'] is False
+        assert result['canonical_rank'] is None
+
+    def test_a_canonical_ranked_beyond_k_is_out_of_the_window(self):
+        mod = _mod()
+        hits = _ranked([], [], [], [], [], [], topic='alpha')
+
+        result = mod.topic_discoverability(hits, 'alpha', 'r5', 5)
+
+        assert result['canonical_in_top_k'] is False
+        # Its true rank is still reported — "absent from top-5" and "absent
+        # entirely" are different findings and the report must tell them apart.
+        assert result['canonical_rank'] == 6
+
+    def test_member_count_counts_only_records_carrying_the_asked_topic(self):
+        mod = _mod()
+        alpha_hits = _ranked([], [], topic='alpha')
+        beta_hit = _ranked([], topic='beta')[0]
+        beta_hit = beta_hit.__class__(**{**vars(beta_hit), 'record_id': 'beta-0'})
+
+        result = mod.topic_discoverability([*alpha_hits, beta_hit], 'alpha', 'r0', 5)
+
+        assert result['topic_member_count'] == 2  # the beta hit is not a member
+
+    def test_member_count_respects_the_k_window(self):
+        mod = _mod()
+        hits = _ranked([], [], [], [], [], [], topic='alpha')
+
+        assert mod.topic_discoverability(hits, 'alpha', 'r0', 5)['topic_member_count'] == 5
+        assert mod.topic_discoverability(hits, 'alpha', 'r0', 2)['topic_member_count'] == 2
+
+    def test_an_empty_hit_list_reports_zeroes_and_no_rank(self):
+        result = _mod().topic_discoverability([], 'alpha', 'r0', 5)
+
+        assert result == {
+            'canonical_in_top_k': False,
+            'canonical_rank': None,
+            'topic_member_count': 0,
+        }
+
+
+class TestMetricsAreRankBasedNotScoreBased:
+    """eval-design §1's discipline, enforced by the metric's own signature.
+
+    This is asserted structurally rather than trusted to convention, because
+    the failure mode is invisible: a score-reading metric produces perfectly
+    plausible numbers that silently stop being comparable the moment the
+    embedding config drifts — which is exactly how the 0.72-0.90 figure in
+    the task record became 0.44-0.51 on re-measurement.
+    """
+
+    def test_neither_metric_reads_a_score_field(self):
+        import inspect  # noqa: PLC0415
+
+        mod = _mod()
+        for function in (mod.claim_recall_at_k, mod.topic_discoverability):
+            source = inspect.getsource(function)
+            assert 'relevance_score' not in source
+            assert '.score' not in source
+            assert 'threshold' not in source
+
+    def test_arm_records_carry_no_score_field_at_all(self):
+        """The strongest form: the metrics COULD NOT read a score if they
+        tried, because the type they consume does not have one."""
+        import dataclasses  # noqa: PLC0415
+
+        fields = {f.name for f in dataclasses.fields(_mod().ArmRecord)}
+
+        assert 'score' not in fields
+        assert 'relevance_score' not in fields
+
+    def test_shuffling_the_payloads_without_changing_order_changes_nothing(self):
+        """Rank is the only input that matters: rewriting every content body
+        must not move a rank-based metric."""
+        mod = _mod()
+        hits = _ranked(['k1'], ['k2'], ['k3'], topic='alpha')
+        rewritten = [
+            r.__class__(**{**vars(r), 'content': f'COMPLETELY DIFFERENT {i}'})
+            for i, r in enumerate(hits)
+        ]
+
+        assert mod.claim_recall_at_k(hits, ['k2'], 5) == mod.claim_recall_at_k(
+            rewritten, ['k2'], 5
+        )
+        assert mod.topic_discoverability(hits, 'alpha', 'r1', 5) == (
+            mod.topic_discoverability(rewritten, 'alpha', 'r1', 5)
+        )
