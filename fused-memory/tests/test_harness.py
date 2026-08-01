@@ -5558,15 +5558,23 @@ async def test_run_loop_recovers_predecessor_runs_once_at_startup_before_reaper_
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
 
     call_order = []
+    predecessor_event = asyncio.Event()
+    stale_event = asyncio.Event()
 
     async def predecessor_side_effect():
         call_order.append('predecessor')
+        predecessor_event.set()
         # Raise on every call (there should only ever be one) to prove the
-        # startup try/except guard keeps run_loop alive.
+        # startup try/except guard keeps run_loop alive. The event is set
+        # BEFORE the raise so the deliberate startup exception still exercises
+        # the try/except guard rather than stalling the drive below.
         raise RuntimeError('boom — simulated predecessor-recovery failure')
 
     async def stale_runs_side_effect():
         call_order.append('stale')
+        # Gate on >= 2 to match the reaper-tick assertion at the bottom exactly.
+        if call_order.count('stale') >= 2:
+            stale_event.set()
 
     harness._recover_predecessor_runs = AsyncMock(side_effect=predecessor_side_effect)
     harness._recover_stale_runs = AsyncMock(side_effect=stale_runs_side_effect)
