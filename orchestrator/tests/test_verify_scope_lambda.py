@@ -30,7 +30,7 @@ implementation.
 
 from __future__ import annotations
 
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Literal
 from unittest.mock import patch
 
@@ -332,28 +332,6 @@ class TestForceWorkspaceBreadthExecutionGoldens:
 # task 3294: the mixed-diff widening, end-to-end through the plan→execution bridge
 # ---------------------------------------------------------------------------
 
-# orchestrator/orchestrator.yaml:5/7/8, verbatim. The REAL config, not the
-# synthetic 'uv run --directory moda pytest tests/' shape the rest of this
-# module uses: the widening has to be exercised against the config the
-# task-3033 incident actually ran under, or these goldens would only show that
-# SOME command widens rather than that THE command the incident narrowed does.
-#
-# These are hand-copied, so they can drift.
-# ``test_module_command_constants_are_the_live_orchestrator_yaml`` is what
-# keeps them honest — it pins all three byte-identically to the live yaml. If
-# you edit one of these, that test is where the pin lives.
-_ORCH_TEST_COMMAND: str = (
-    'uv run --project orchestrator --directory orchestrator pytest tests/ '
-    '--tb=short -q --timeout=300'
-)
-_ORCH_LINT_COMMAND: str = (
-    'uv run --project orchestrator --directory orchestrator ruff check src/ tests/'
-    ' && python3 fused-memory/scripts/check_bare_magicmock_config.py orchestrator/tests'
-)
-_ORCH_TYPE_CHECK_COMMAND: str = (
-    'uv run --project orchestrator --directory orchestrator pyright src/ tests/'
-)
-
 # The task-3033 attempt-1 diff shape: the module's hottest production file plus
 # a co-committed test file. Pre-3294 the plan file-scoped this to the test file
 # alone (36 items instead of ~13188) and the regression in a DIFFERENT consumer
@@ -388,14 +366,41 @@ def _live_orchestrator_yaml() -> dict[str, object]:
     )
 
 
+def _orchestrator_module_config() -> ModuleConfig:
+    """A ModuleConfig carrying orchestrator.yaml's REAL, LIVE commands.
+
+    Loaded from the yaml rather than hand-copied into constants here: the
+    provenance these tests need ("the widening is exercised against the config
+    the task-3033 incident actually ran under") then holds BY CONSTRUCTION,
+    with no drift pin to maintain and no coupling to command values — such as
+    the lint chain's members or pytest's --timeout — that this suite does not
+    care about and that routinely, harmlessly change.
+
+    The REAL commands, not the synthetic 'uv run --directory moda pytest
+    tests/' shape the rest of this module uses: against a toy command these
+    goldens would only show that SOME command widens, not that THE command the
+    incident narrowed does.
+    """
+    data = _live_orchestrator_yaml()
+    test_command = data['test_command']
+    lint_command = data['lint_command']
+    type_check_command = data['type_check_command']
+    assert isinstance(test_command, str)
+    assert isinstance(lint_command, str)
+    assert isinstance(type_check_command, str)
+    return ModuleConfig(
+        prefix='orchestrator',
+        test_command=test_command,
+        lint_command=lint_command,
+        # Load-bearing only in being NON-EMPTY: content is read (so workflow.py
+        # can classify STRUCTURAL) exactly when a type_check_command is set.
+        type_check_command=type_check_command,
+    )
+
+
 def _orchestrator_registry(tmp_path: Path) -> tuple[ModuleConfig, OrchestratorConfig]:
     """A single-module registry carrying orchestrator.yaml's REAL commands."""
-    mc = ModuleConfig(
-        prefix='orchestrator',
-        test_command=_ORCH_TEST_COMMAND,
-        lint_command=_ORCH_LINT_COMMAND,
-        type_check_command=_ORCH_TYPE_CHECK_COMMAND,
-    )
+    mc = _orchestrator_module_config()
     config = OrchestratorConfig(project_root=tmp_path)
     config._module_configs = {'orchestrator': mc}
     return mc, config
@@ -428,8 +433,8 @@ class TestTaskRoleMixedDiffFullSuiteExecution:
     debugger. The fix is a decision-layer reorder; this class pins that the
     fix is real all the way out to what runs.
 
-    Three things are pinned here, and they are deliberately different kinds
-    of assertion:
+    Two things are pinned here, and they are deliberately different kinds of
+    assertion:
 
     - (a)/(b) THE BRIDGE. ``test_verify_plan.py``'s
       ``TestDeriveVerifyPlanTaskRoleFloorMixedDiff`` pins the decision at the
@@ -440,15 +445,17 @@ class TestTaskRoleMixedDiffFullSuiteExecution:
       ``run_scoped_verification`` with the task-3033-shaped diff and pin what
       EXECUTES, plus that ``result.plan`` records the same thing an operator
       reads (PRD A1).
-    - (c1) PROVENANCE. (a)/(b) assert against the hand-copied command
-      constants above, so a pin ties those constants byte-identically to the
-      live ``orchestrator/orchestrator.yaml``. Without it the suite could
-      stay green against a copy that no longer matches the config.
-    - (c2) GRANULARITY. The widened plan reproduces the owning module's own
+    - (c) GRANULARITY. The widened plan reproduces the owning module's own
       ``test_command`` UNNARROWED and targets its whole test PACKAGE (PRD
-      Resolved decision 3) — derived from the plan and asserted path-free
-      (every target a directory, none a file), so the claim does not rest on
-      any individual test module's filename.
+      Resolved decision 3) — derived from the plan and asserted path-free (no
+      target is a file), so the claim does not rest on any individual test
+      module's filename.
+
+    Every case runs against the LIVE ``orchestrator/orchestrator.yaml``
+    commands (``_orchestrator_module_config``), so the provenance the
+    task-3033 story needs — the widening exercised against the config the
+    incident actually ran under — holds by construction rather than by a
+    hand-copied literal and a drift pin.
     """
 
     @pytest.mark.asyncio
@@ -459,6 +466,9 @@ class TestTaskRoleMixedDiffFullSuiteExecution:
         full-suite test_command — not a narrowed one — and the command never
         names the co-committed test file."""
         mc, config = _orchestrator_registry(tmp_path)
+        # Precondition for the STRUCTURAL half of the story: content is read,
+        # so workflow.py can classify STRUCTURAL, exactly when this is set.
+        assert mc.type_check_command
         _write_3033_diff(tmp_path)
 
         mock_run_verification = _run_verification_spy()
@@ -472,9 +482,10 @@ class TestTaskRoleMixedDiffFullSuiteExecution:
         assert len(executed) == 1
         executed_mc = executed[0]
         assert executed_mc.prefix == 'orchestrator'
-        # The verbatim full-suite command, byte-for-byte — a FULL_SUITE slot
-        # is rendered by _executed_module_configs_from_plan as getattr(mc, attr).
-        assert executed_mc.test_command == _ORCH_TEST_COMMAND
+        # The module's OWN command, byte-for-byte — a FULL_SUITE slot is
+        # rendered by _executed_module_configs_from_plan as getattr(mc, attr),
+        # where a FILE_SCOPED one would have narrowed it to the touched test.
+        assert executed_mc.test_command == mc.test_command
         assert executed_mc.test_command is not None
         assert 'test_new_thing.py' not in executed_mc.test_command
 
@@ -506,45 +517,12 @@ class TestTaskRoleMixedDiffFullSuiteExecution:
         assert pytest_run['scoped_targets'] == []
         assert 'narrow' in pytest_run['reason'].lower()
 
-    def test_module_command_constants_are_the_live_orchestrator_yaml(self):
-        """(c1) PROVENANCE. The three module-command constants above are
-        hand-copied; this is what keeps them honest.
-
-        (a) and (b) drive the widening from ``_ORCH_TEST_COMMAND`` and assert
-        the executed command against it — which is only worth anything if that
-        literal really is the command the task-3033 incident ran under. Without
-        this pin, the live ``test_command`` could be narrowed (an ``--ignore``,
-        a single-file target) and the widened FULL_SUITE run would silently
-        stop collecting the regressed module while this suite stayed green.
-        A drift guard, so GREEN on arrival by construction.
-        """
-        data = _live_orchestrator_yaml()
-        yaml_ref = 'orchestrator/orchestrator.yaml'
-        assert data['test_command'] == _ORCH_TEST_COMMAND, (
-            f'_ORCH_TEST_COMMAND has drifted from {yaml_ref}:test_command. This '
-            f"suite's whole task-3033 story depends on driving the widening with "
-            f'the command the incident actually ran under — re-copy it verbatim '
-            f'and re-check that the widened run still targets the whole tests/ '
-            f'package'
-        )
-        assert data['lint_command'] == _ORCH_LINT_COMMAND, (
-            f'_ORCH_LINT_COMMAND has drifted from {yaml_ref}:lint_command; '
-            f're-copy it verbatim'
-        )
-        assert data['type_check_command'] == _ORCH_TYPE_CHECK_COMMAND, (
-            f'_ORCH_TYPE_CHECK_COMMAND has drifted from {yaml_ref}:'
-            f'type_check_command — it is what makes workflow.py classify '
-            f'STRUCTURAL here (content is only read when type_check_command is '
-            f'set); re-copy it verbatim'
-        )
-
     def test_widened_plan_targets_the_owning_modules_whole_test_package(self):
-        """(c2) The widened run reproduces the owning module's OWN command,
+        """(c) The widened run reproduces the owning module's OWN command,
         unnarrowed, and targets its whole test PACKAGE.
 
-        Derived from the plan, not from a local literal: the ``ModuleConfig``
-        is built from the yaml-LOADED commands, so these assertions track the
-        live config rather than this module's copy of it. Pure — the
+        Derived from the plan and from the live yaml, never from a local
+        literal, so these assertions track the real config. Pure — the
         ``worktree_reader`` seam makes it a straight ``derive_verify_plan``
         call with no tmp_path, no subprocess, no mocking.
 
@@ -552,23 +530,12 @@ class TestTaskRoleMixedDiffFullSuiteExecution:
         branch and the cmd was scoped to ``orchestrator/tests/test_new_thing.py``,
         so ``cmd == parse_config_command(<live test_command>)`` genuinely
         discriminates. Package granularity (PRD Resolved decision 3) is
-        asserted path-free — every target is a directory, none is a file — so
-        the claim survives any legitimate rename in the targeted package.
+        asserted path-free — no target is a FILE — so the claim survives any
+        legitimate rename in the targeted package, and does not pin the
+        config's cosmetic choice of a trailing slash.
         """
-        data = _live_orchestrator_yaml()
-        yaml_test_command = data['test_command']
-        yaml_lint_command = data['lint_command']
-        yaml_type_check_command = data['type_check_command']
-        assert isinstance(yaml_test_command, str)
-        assert isinstance(yaml_lint_command, str)
-        assert isinstance(yaml_type_check_command, str)
-
-        mc = ModuleConfig(
-            prefix='orchestrator',
-            test_command=yaml_test_command,
-            lint_command=yaml_lint_command,
-            type_check_command=yaml_type_check_command,
-        )
+        mc = _orchestrator_module_config()
+        assert mc.test_command is not None
 
         def reader(path: str) -> str | None:
             if path == 'orchestrator/src/orchestrator/workflow.py':
@@ -589,17 +556,19 @@ class TestTaskRoleMixedDiffFullSuiteExecution:
         # parse_config_command, never render() — render normalises --directory
         # into a leading `cd`, so a render-based comparison would fail against
         # a --directory-form input even when the behaviour is correct.
-        assert run.cmd == parse_config_command(yaml_test_command), (
+        assert run.cmd == parse_config_command(mc.test_command), (
             f"the widened slot must reproduce the owning module's own "
             f'test_command UNNARROWED; got {run.cmd!r}'
         )
         assert run.cmd.targets, 'a FULL_SUITE pytest run must still name its package'
         for target in run.cmd.targets:
-            assert target.endswith('/'), (
-                f'{target!r} is not a directory-style target — the widened run '
-                f'must select the whole test PACKAGE (PRD Resolved decision 3), '
-                f'not individual files'
+            # Package, not file. Asserted as "has no file extension" rather
+            # than "ends with /": `pytest tests` and `pytest tests/` are the
+            # same selection to pytest, and the trailing slash is a cosmetic
+            # property of how the config happens to be spelled.
+            assert '.' not in PurePosixPath(target.rstrip('/')).name, (
+                f'{target!r} names a FILE — the widened run must select the '
+                f'whole test PACKAGE (PRD Resolved decision 3)'
             )
-            assert not target.endswith('.py')
         assert not any('test_new_thing.py' in t for t in run.cmd.targets)
         assert run.scoped_targets == ()

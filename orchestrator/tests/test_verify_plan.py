@@ -866,15 +866,22 @@ class TestDeriveVerifyPlanTaskRoleFloorMixedDiff:
         assert 'orchestrator/tests/test_new_thing.py' in run.cmd.targets
         assert 'orchestrator/tests/test_other.py' in run.cmd.targets
 
-    # -- the operator-facing record of WHY the run widened -------------------
+    # -- WHY the run widened, and how far it did NOT reach -------------------
 
     def test_mixed_diff_reason_names_the_production_trigger(self):
         """(e) VerifyResult.plan is the operator-facing record of WHY a scope
         decision was made, and this codebase already names the trigger in its
         widening reasons (``pytest: conftest touched ({conftest_trigger})``).
-        The mixed case must do the same — and must NOT claim the diff was
-        "source-only", which is factually false about a diff that touched
-        tests."""
+        The mixed case must do the same: name the production file that
+        triggered the widening, say the co-committed tests did NOT narrow it
+        (otherwise the widened run reads as a scoper bug), and NOT claim the
+        diff was "source-only" — factually false about a diff that touched
+        tests, and the pre-3294 floor's wording.
+
+        Only these are asserted. The role gating is pinned structurally by
+        ``test_mixed_diff_stays_file_scoped_at_merge_role``, and a substring
+        check for a word as common as "task" would discriminate nearly
+        nothing."""
         mc = ModuleConfig(
             prefix='orchestrator',
             test_command='uv run --directory orchestrator pytest tests/',
@@ -887,49 +894,60 @@ class TestDeriveVerifyPlanTaskRoleFloorMixedDiff:
         assert run is not None
         assert run.scope_kind is ScopeKind.FULL_SUITE
         assert 'orchestrator/src/orchestrator/some_module.py' in run.reason
+        assert 'narrow' in run.reason.lower()
         assert 'source-only' not in run.reason.lower()
 
-    def test_mixed_diff_reason_states_touched_tests_did_not_narrow_it(self):
-        """(f) An operator reading the plan must be able to tell WHY a suite
-        ran full despite the diff touching tests — otherwise the widened run
-        looks like a scoper bug. The reason records that the co-committed
-        collectable test file(s) did not narrow it, alongside the existing
-        role and coverage-boundary signposts."""
-        mc = ModuleConfig(
-            prefix='orchestrator',
-            test_command='uv run --directory orchestrator pytest tests/',
-            lint_command='uv run --directory orchestrator ruff check src/',
-        )
-        plan = derive_verify_plan(
-            MIXED_SOURCE_DIFF, [mc], None, fake_worktree_reader, role='task',
-        )
-        run = _run_for(plan, 'orchestrator', 'pytest:')
-        assert run is not None
-        reason = run.reason.lower()
-        assert 'narrow' in reason
-        assert 'task' in reason
-        assert 'not run' in reason
+    def test_mixed_diff_in_one_module_never_widens_a_sibling(self):
+        """(f) PRD R1, asserted rather than merely claimed in a reason string:
+        the widening changes each module's own BREADTH, never the SET of
+        modules. Three registered modules, one diff — 'orchestrator' mixed
+        (production + test), 'shared' test-ONLY, 'escalation' untouched.
 
-    def test_source_only_reason_is_unchanged(self):
-        """(g) The λ golden is provably untouched by task 3294: a source-ONLY
-        diff at role='task' still carries the pre-existing reason string
-        BYTE-IDENTICALLY, so any future change there is a real regression
-        rather than expected churn from this task."""
-        mc = ModuleConfig(
+        This is the case the single-module tests structurally cannot fail on.
+        If the production predicate were computed over the whole
+        *existing_files* list instead of the prefix-filtered ``scoped`` one,
+        'shared' would widen to its full suite off ORCHESTRATOR's production
+        file — and every other test in this class would still pass, because
+        no sibling module is in their plan at all."""
+        mc_orch = ModuleConfig(
             prefix='orchestrator',
             test_command='uv run --directory orchestrator pytest tests/',
             lint_command='uv run --directory orchestrator ruff check src/',
         )
+        mc_shared = ModuleConfig(
+            prefix='shared',
+            test_command='uv run --directory shared pytest tests/',
+            lint_command='uv run --directory shared ruff check src/',
+        )
+        mc_esc = ModuleConfig(
+            prefix='escalation',
+            test_command='uv run --directory escalation pytest tests/',
+            lint_command='uv run --directory escalation ruff check src/',
+        )
         plan = derive_verify_plan(
-            SOURCE_ONLY_DIFF, [mc], None, fake_worktree_reader, role='task',
+            [*MIXED_SOURCE_DIFF, 'shared/tests/test_sibling.py'],
+            [mc_orch, mc_shared, mc_esc], None, fake_worktree_reader, role='task',
         )
-        run = _run_for(plan, 'orchestrator', 'pytest:')
-        assert run is not None
-        assert run.scope_kind is ScopeKind.FULL_SUITE
-        assert run.reason == (
-            'pytest: source-only diff — owning-module full suite (task role); '
-            'sibling modules NOT run'
+
+        # The touched-production module widens...
+        orch_run = _run_for(plan, 'orchestrator', 'pytest:')
+        assert orch_run is not None
+        assert orch_run.scope_kind is ScopeKind.FULL_SUITE
+
+        # ...its test-ONLY sibling does not: FILE_SCOPED to its own test file.
+        shared_run = _run_for(plan, 'shared', 'pytest:')
+        assert shared_run is not None
+        assert shared_run.scope_kind is ScopeKind.FILE_SCOPED, (
+            f"'shared' has no touched production file — a mixed diff in "
+            f'orchestrator must not widen it; got {shared_run.reason!r}'
         )
+        assert shared_run.scoped_targets == ('shared/tests/test_sibling.py',)
+
+        # ...and the untouched module contributes no pytest run at all.
+        assert _run_for(plan, 'escalation', 'pytest:') is None
+        esc_runs = [r for r in plan.runs if r.module_prefix == 'escalation']
+        assert [r.scope_kind for r in esc_runs] == [ScopeKind.SKIPPED]
+        assert esc_runs[0].reason == 'no files under prefix'
 
 
 # ---------------------------------------------------------------------------
