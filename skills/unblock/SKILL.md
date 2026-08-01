@@ -525,8 +525,29 @@ The merge procedure is iterative — don't assume one pass will be enough:
   mcp__escalation__merge_status(branch="task/<TASK_ID>")
   ```
   If still in flight, keep polling the branch handle with the same backoff. Never resubmit and
-  never direct-merge. Stop-and-report to the human only if the final ancestry check also comes
-  back not-landed.
+  never direct-merge.
+
+  **Here an empty rc=128 marker search does NOT mean "not landed."** A coalesce train stacks its
+  members linearly and merges only the **tip** branch into main (`tip_branch=tip_req.branch`,
+  `orchestrator/src/orchestrator/merge_queue.py:12673`), so a non-tip absorbed member gets its
+  commits onto main with **no `Merge task/<TASK_ID> into main` marker of its own** — and its branch
+  is still deleted by cleanup, because it genuinely *is* an ancestor of main. rc=128-with-empty-marker
+  is thus the *expected* reading for a non-tip member, which is precisely the caller this bullet
+  serves; taking it as "not landed" would report a successful merge to the human as a failure and
+  leave the task un-flipped. So:
+  - Ancestry `rc=0` is authoritative — landed — while the ref still exists.
+  - On rc=128-with-empty-marker, do not conclude anything yet. Check **the train's** landing —
+    the tip's marker (`git log main --fixed-strings --grep="Merge task/<TIP_ID> into main"
+    --max-count=1 --format=%H`; with a `coalesce-<TIP_ID>-<hex>` id the tip id is readable straight
+    off it), or `get_merge_queue()` no longer showing the train — and **this task's own status**,
+    which the orchestrator flips to `done` for every absorbed member once the train lands
+    (`mark_member_done`, `orchestrator/src/orchestrator/harness.py:1011`).
+  - Either one saying landed → the merge succeeded; proceed to step 8 with the train's advanced SHA
+    as `done_provenance={"kind": "found_on_main", "commit": "<sha>", "note": "absorbed into train
+    <train_id>"}`. If the task is already `done`, the flip happened for you — no write needed.
+
+  Stop-and-report to the human only if the ancestry check, the train check, **and** the task's own
+  status all come back not-landed.
 
 *Abandonment (`merge_cancel`):*
 
