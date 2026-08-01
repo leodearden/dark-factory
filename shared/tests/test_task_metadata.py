@@ -15,6 +15,9 @@ from __future__ import annotations
 
 import copy
 import json
+import subprocess
+import sys
+import textwrap
 
 import pytest
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -1707,3 +1710,53 @@ class TestListValuedSubmodelSlice:
             'at': None,
             'after_secs': 604800,
         }
+
+
+class TestRegistryCoRunIsolation:
+    """Task 3352: keep _FOREIGN_REGISTRANT_KEYS honest.
+
+    The autouse fixture's sentinel guard only protects the keys it lists. If a
+    future `shared/` module adds a `register_metadata_submodel(...)` call and
+    the constant is not updated, the constant goes stale and the co-run
+    collision class silently returns.
+
+    Known limitation: the subprocess check below covers drift WITHIN
+    `shared.deploy_state` / `shared.capability_manifest`, not a brand-new
+    registrant module. That residual is accepted — a new module would have to
+    also add a colliding test here to reproduce the bug, and
+    `test_this_module_never_shadows_a_foreign_registrant` catches the
+    test-side half.
+    """
+
+    def test_foreign_registrant_keys_match_the_real_shared_registrants(self):
+        # Run the imports in a SUBPROCESS. A same-process import would leave
+        # shared.deploy_state / shared.capability_manifest in sys.modules; their
+        # module bodies never re-run, so the autouse fixture's teardown restore
+        # would leave the key unregistered for the rest of the process and turn
+        # fused-memory/tests/test_deploy_state_registration.py red in a co-run.
+        code = textwrap.dedent('''
+            import json
+            import shared.task_metadata as t
+            core = set(t._SUBMODEL_REGISTRY)
+            import shared.deploy_state          # noqa: F401
+            import shared.capability_manifest   # noqa: F401
+            print(json.dumps(sorted(set(t._SUBMODEL_REGISTRY) - core)))
+        ''')
+        proc = subprocess.run(
+            [sys.executable, '-c', code],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert sorted(json.loads(proc.stdout)) == sorted(_FOREIGN_REGISTRANT_KEYS)
+
+    def test_this_module_never_shadows_a_foreign_registrant(self):
+        # The sentinel installed by the autouse fixture must still be intact
+        # after this file's own registrations run: proves every register call
+        # in this module targets a test-owned key.
+        register_metadata_submodel(_DEPLOY_STATE_STUB_KEY, _DeployStateStub)
+        register_metadata_submodel(TestListValuedSubmodelSlice._KEY, _CheckStub)
+        for key in _FOREIGN_REGISTRANT_KEYS:
+            assert (
+                task_metadata_module._SUBMODEL_REGISTRY[key] is _ForeignRegistrantSentinel
+            ), f'test registered production key {key!r}'
