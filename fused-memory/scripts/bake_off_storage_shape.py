@@ -1658,3 +1658,380 @@ def audit_recall_over_labeled_fixture(
         'unrelated': _negatives(pair_sets['unrelated_pairs']),
         'paraphrase_exemplars': exemplars,
     }
+
+
+# ---------------------------------------------------------------------------
+# The report — the artifact gate η reads
+# ---------------------------------------------------------------------------
+
+#: The six rows of the decision table: three storage shapes x pin on/off.
+#:
+#: The pin is a READ-side transform, so its variants reuse their shape's
+#: seeded collection — pin-on and pin-off run over identical stored state,
+#: making that comparison an exactly-controlled A/B rather than two corpora
+#: that could rank differently under ANN nondeterminism.  They are still
+#: separate ROWS: "does the pin help *this shape*?" is a question the table
+#: has to answer per shape, not once globally.
+ARM_VARIANTS: tuple[str, ...] = tuple(
+    variant for shape in ARM_SHAPES for variant in (shape, f'{shape}+pin')
+)
+
+#: Metrics every arm must carry, and the nested keys within them that a
+#: shallow ``in`` check would miss.  Enumerated ONCE and used by both the
+#: completeness check and the renderer, so a metric cannot be validated into
+#: the JSON and then quietly dropped from the table.
+_REQUIRED_ARM_METRICS: dict[str, tuple[str, ...]] = {
+    'claim_recall': ('at_5', 'at_10'),
+    'discoverability': ('canonical_in_top_5_rate',),
+    'tokens_per_query': ('mean', 'estimator'),
+    # Both halves, always: the rank-based one and the threshold replay.
+    'guard_adequacy': ('candidate_present_rate', 'guard_matched_rate',
+                       'threshold_replay', 'threshold'),
+}
+
+#: What the artifact must say about how it was produced.  An arbitration
+#: artifact whose provenance is not in it cannot be re-read six months later
+#: by somebody who was not in the room.
+_REQUIRED_PROTOCOL_KEYS: tuple[str, ...] = (
+    'blind_authoring', 'fixtures', 'token_estimator', 'guard_threshold',
+    'distractor_slab_size', 'embedder_model',
+)
+
+#: The decision table's columns, pinned in one place.  A column quietly
+#: dropped from a decision table is a metric quietly dropped from the
+#: decision, so the test asserts this by equality rather than substring.
+DECISION_TABLE_COLUMNS: tuple[str, ...] = (
+    'arm',
+    'claim recall@5',
+    'claim recall@10',
+    'canonical in top-5',
+    'median canonical rank',
+    'tokens/query',
+    'guard candidate present',
+    'guard matched (replay)',
+)
+
+#: Rendered for a measurement that is None.  Deliberately NOT '0.00': the
+#: whole point of carrying None through the pipeline is that "no measurement"
+#: and "measured zero" are different findings, and a table that prints them
+#: identically throws that away at the last step.
+_NO_MEASUREMENT = '—'
+
+DEFAULT_REPORT_JSON = _PACKAGE_ROOT.parent / 'plans' / 'e2-storage-shape-bakeoff-report.json'
+DEFAULT_REPORT_MD = _PACKAGE_ROOT.parent / 'plans' / 'e2-storage-shape-bakeoff-report.md'
+
+#: Bumped when the JSON's shape changes, so a reader of an old artifact is
+#: never silently comparing two different schemas.
+REPORT_SCHEMA_VERSION = 1
+
+
+class IncompleteReportError(RuntimeError):
+    """A measurement is missing, so no table is emitted.
+
+    Named rather than a bare ValueError because the failure mode it guards is
+    specific: a decision table with a blank cell reads as "measured, and equal
+    to its neighbour", and the reader has no way to tell that from "never
+    measured".  Refusing to emit is the loud alternative.
+    """
+
+
+def fixture_provenance(paths: list[str | Path]) -> list[dict[str, Any]]:
+    """Repo-relative path + last-touching commit for each fixture.
+
+    Git history IS the blind-authoring audit trail: the arm decomposition and
+    query set were committed BEFORE any metric function existed in the tree,
+    and these SHAs are what lets a reader verify that rather than take it on
+    trust.
+
+    Paths are reported repo-relative — an artifact naming somebody's absolute
+    home-directory checkout is neither reproducible nor readable by anyone
+    else, and it leaks the worktree the run happened in.  (Stated without an
+    example literal on purpose: the fixture-path test forbids any absolute
+    path in this file's source, docstrings included.)
+
+    ``commit`` is ``None`` for a path git does not track.  Reporting None
+    rather than falling back to HEAD is the point: a wrong SHA in an audit
+    trail is worse than an absent one, because it looks checkable.
+    """
+    import subprocess  # noqa: PLC0415
+
+    repo_root = _PACKAGE_ROOT.parent
+    provenance: list[dict[str, Any]] = []
+    for raw in paths:
+        path = Path(raw).resolve()
+        try:
+            relative = str(path.relative_to(repo_root))
+        except ValueError:
+            relative = path.name
+        commit: str | None = None
+        try:
+            completed = subprocess.run(
+                ['git', 'log', '-1', '--format=%H', '--', str(path)],
+                cwd=str(repo_root), capture_output=True, text=True, timeout=30,
+                check=False,
+            )
+            commit = completed.stdout.strip() or None
+        except (OSError, subprocess.SubprocessError):
+            # No git, or no repo: the report says so rather than inventing a
+            # SHA. Provenance that cannot be verified must not look verified.
+            commit = None
+        provenance.append({'path': relative, 'commit': commit})
+    return provenance
+
+
+def _check_arms(arms: dict[str, Any]) -> None:
+    """Every variant present, every metric present, or raise."""
+    missing = [arm for arm in ARM_VARIANTS if arm not in arms]
+    unknown = [arm for arm in arms if arm not in ARM_VARIANTS]
+    if missing or unknown:
+        # Reported TOGETHER, never missing-first: a misspelled arm name
+        # produces both at once, and the unknown name is the actionable half
+        # — it is the difference between "the run broke" and "you typed
+        # c_peers_pin". An error that named only the absence would send a
+        # reader looking for a failed arm that ran perfectly well.
+        problems = []
+        if missing:
+            problems.append(f'no measurement for {missing}')
+        if unknown:
+            problems.append(f'unknown arm(s) {unknown}')
+        raise IncompleteReportError(
+            f'{"; ".join(problems)}. Expected exactly {list(ARM_VARIANTS)}. '
+            f'Refusing to emit a decision table with a missing row: a reader '
+            f'cannot tell an absent arm from one that scored the same as its '
+            f'neighbour.'
+        )
+
+    for arm in ARM_VARIANTS:
+        measurement = arms[arm]
+        for metric, required_keys in _REQUIRED_ARM_METRICS.items():
+            if metric not in measurement:
+                raise IncompleteReportError(
+                    f"arm '{arm}' is missing metric '{metric}'"
+                )
+            for key in required_keys:
+                if key not in measurement[metric]:
+                    raise IncompleteReportError(
+                        f"arm '{arm}' metric '{metric}' is missing '{key}'"
+                    )
+
+
+def build_report(
+    *,
+    arms: dict[str, Any],
+    audit_recall: dict[str, Any],
+    protocol: dict[str, Any],
+) -> dict[str, Any]:
+    """Assemble the E2 decision table + D10 measurement into one artifact.
+
+    Raises :class:`IncompleteReportError` rather than emitting a partial
+    table.  A ``None`` VALUE is fine and survives to the artifact — "measured,
+    no denominator" is a legitimate result — but an ABSENT key means the run
+    broke, and a broken run must not be published as a decision.
+
+    Arms are ordered by :data:`ARM_VARIANTS`, not by the caller's dict order,
+    so two runs produce diffable artifacts.
+    """
+    _check_arms(arms)
+    missing_protocol = [k for k in _REQUIRED_PROTOCOL_KEYS if k not in protocol]
+    if missing_protocol:
+        raise IncompleteReportError(
+            f'protocol block is missing {missing_protocol}. The artifact has '
+            f'to say how it was produced or it cannot be re-read later.'
+        )
+
+    return {
+        'schema_version': REPORT_SCHEMA_VERSION,
+        'protocol': dict(protocol),
+        'arms': {arm: arms[arm] for arm in ARM_VARIANTS},
+        'audit_recall': audit_recall,
+    }
+
+
+def _cell(value: Any, *, precision: int = 2) -> str:
+    """Format one measurement, keeping "no measurement" distinguishable."""
+    if value is None:
+        return _NO_MEASUREMENT
+    if isinstance(value, float):
+        return f'{value:.{precision}f}'
+    return str(value)
+
+
+def render_markdown(report: dict[str, Any]) -> str:
+    """The operator-facing artifact: prose, decision table, D10, provenance.
+
+    Byte-deterministic for identical input — every float goes through
+    :func:`_cell` at a fixed precision and every collection is emitted in a
+    pinned order — because the whole value of rerunning this experiment is
+    that the diff between two artifacts is signal rather than formatting
+    noise.
+    """
+    protocol = report['protocol']
+    audit = report['audit_recall']
+    true_dup = audit['true_dup']
+
+    lines: list[str] = [
+        '# E2 storage-shape bake-off',
+        '',
+        'Arbitration experiment for `docs/prds/memory-metadata-vocabulary.md` '
+        'D9/D10 (task 3199, PRD leaf ζ), implementing '
+        '`plans/memory-subsystem-eval-design.md` §5 E2.  This artifact is the '
+        'signal gate leaf **η** reads: the choice between δ-as-default and '
+        'peers-as-default is made from the table below.',
+        '',
+        '## How to read this table',
+        '',
+        'Every metric here is **rank/set-based** — ranks and set membership '
+        '(present-in-top-k), never absolute cosine — per eval-design §1: '
+        'wording and embedding-config drift move the score scale wholesale, '
+        'so thresholds on raw cosine do not survive a re-measurement while '
+        'ranks do.',
+        '',
+        'The ONE exception is the last column.  `guard matched (replay)` is a '
+        '**threshold replay**: the production near-duplicate selector *is* an '
+        'absolute-threshold selector, so replaying it is the only way to '
+        'answer "would the guard have fired?".  Do not trend that column '
+        'across an embedder or config change — trend '
+        '`guard candidate present`, which is rank-based and asks the '
+        'discriminating question (was a true cluster sibling in front of the '
+        'guard at all?).',
+        '',
+        'A `—` cell is **no measurement**, not a measured zero.',
+        '',
+        '## Decision table',
+        '',
+        '| ' + ' | '.join(DECISION_TABLE_COLUMNS) + ' |',
+        '| ' + ' | '.join('---' for _ in DECISION_TABLE_COLUMNS) + ' |',
+    ]
+
+    for arm in ARM_VARIANTS:
+        measurement = report['arms'][arm]
+        guard = measurement['guard_adequacy']
+        lines.append('| ' + ' | '.join([
+            arm,
+            _cell(measurement['claim_recall']['at_5']),
+            _cell(measurement['claim_recall']['at_10']),
+            _cell(measurement['discoverability']['canonical_in_top_5_rate']),
+            _cell(measurement['discoverability'].get('median_canonical_rank')),
+            _cell(measurement['tokens_per_query']['mean'], precision=1),
+            _cell(guard['candidate_present_rate']),
+            _cell(guard['guard_matched_rate']),
+        ]) + ' |')
+
+    lines += [
+        '',
+        f"Token counts come from the `{protocol['token_estimator']}` "
+        f'estimator (recorded because a substituted estimator would otherwise '
+        f'be indistinguishable from a measured one).  '
+        f"Guard threshold: {_cell(protocol['guard_threshold'])}.  "
+        f"Distractor slab: {protocol['distractor_slab_size']} records, "
+        f'identical in every arm.',
+        '',
+        '## D10 — audit-recall over the labeled fixture',
+        '',
+        f"Replay of `{audit['detector']}` at threshold "
+        f"{_cell(audit['threshold'])} over α/3130's curator-labeled fixture, "
+        f'scored against `calibrate_write_triage.build_pair_sets`.  '
+        f'**No threshold is asserted on this number** (gate G6): it informs '
+        f'how far to trust the κ duplicate sweep, it does not gate a build.',
+        '',
+        '| class | pairs | recovered | rate |',
+        '| --- | --- | --- | --- |',
+        f"| true duplicates | {true_dup['pairs']} | {true_dup['recovered']} | "
+        f"{_cell(true_dup['recall'])} |",
+        f"| — lexical band (reachable) | {true_dup['lexical_band']['pairs']} | "
+        f"{true_dup['lexical_band']['recovered']} | "
+        f"{_cell(true_dup['lexical_band']['recall'])} |",
+        f"| — paraphrase band (unreachable) | "
+        f"{true_dup['paraphrase_band']['pairs']} | "
+        f"{true_dup['paraphrase_band']['recovered']} | "
+        f"{_cell(true_dup['paraphrase_band']['recall'])} |",
+        f"| hard negatives (falsely grouped) | {audit['hard_negative']['pairs']} | "
+        f"{audit['hard_negative']['falsely_grouped']} | "
+        f"{_cell(audit['hard_negative']['rate'])} |",
+        f"| unrelated (falsely grouped) | {audit['unrelated']['pairs']} | "
+        f"{audit['unrelated']['falsely_grouped']} | "
+        f"{_cell(audit['unrelated']['rate'])} |",
+        '',
+        'The **paraphrase band** is the positive pairs no character-level '
+        'threshold can reach at any tuning short of changing kind (split by '
+        'max `SequenceMatcher` ratio over both argument orders, since '
+        '`ratio()` is order-sensitive).  Counting those as plain detector '
+        'misses would read as "the audit script is broken" rather than "this '
+        'class is invisible to it".  Nearest misses, for hand-auditing the '
+        'split:',
+        '',
+    ]
+    for exemplar in audit['paraphrase_exemplars']:
+        lines.append(
+            f"- `{exemplar['a']}` / `{exemplar['b']}` — max ratio "
+            f"{_cell(exemplar['max_ratio'], precision=4)}"
+        )
+
+    lines += [
+        '',
+        '## Protocol',
+        '',
+        f"**Blind authoring**: {protocol['blind_authoring']}.  The arm "
+        f'decomposition and query set were committed BEFORE any metric '
+        f'function existed in this tree; the commits below are the audit '
+        f'trail, and the anti-laziness floor is claim-coverage parity (every '
+        f'claim id realizable in every arm), deliberately not length parity — '
+        f"arm (a)'s long originals versus arm (c)'s short peers differ by "
+        f'construction, and that difference IS the tokens/query column.',
+        '',
+        f"**Embedder**: {protocol['embedder_model']}.",
+        '',
+        '| fixture | commit |',
+        '| --- | --- |',
+    ]
+    for fixture in protocol['fixtures']:
+        lines.append(
+            f"| `{fixture['path']}` | "
+            f"{fixture.get('commit') or _NO_MEASUREMENT} |"
+        )
+
+    lines.append('')
+    return '\n'.join(lines)
+
+
+def write_artifacts(
+    report: dict[str, Any],
+    json_out: str | Path = DEFAULT_REPORT_JSON,
+    md_out: str | Path = DEFAULT_REPORT_MD,
+) -> tuple[Path, Path]:
+    """Write the JSON and markdown artifacts atomically.
+
+    Mirrors ``memory_eval_retrieval_probe.write_report_text``: a plain
+    ``write_text`` truncates first, so a crash, an ENOSPC or a concurrent
+    reader mid-write leaves a half-written decision table on disk that still
+    parses as markdown.  :func:`tempfile.mkstemp` gives an OS-guaranteed
+    fresh, exclusively-created sibling — not a pid-derived name two writers
+    could collide on — and ``os.replace`` is atomic within a filesystem, so a
+    reader sees either the old artifact or the complete new one.
+
+    The mechanism is copied rather than imported because the original is a
+    module-private helper of another standalone script.
+    """
+    json_path, md_path = Path(json_out), Path(md_out)
+    _atomic_write_text(json_path, json.dumps(report, indent=2) + '\n')
+    _atomic_write_text(md_path, render_markdown(report))
+    return json_path, md_path
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    import contextlib  # noqa: PLC0415
+    import os  # noqa: PLC0415
+    import tempfile  # noqa: PLC0415
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        suffix='.tmp', prefix=f'{path.name}.', dir=str(path.parent),
+    )
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            handle.write(text)
+        os.replace(tmp_name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise

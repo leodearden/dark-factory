@@ -2659,20 +2659,30 @@ class TestBuildReportRefusesAPartialTable:
         assert report['arms']['status_quo']['claim_recall']['at_10'] is None
 
 
+def _decision_table_rows(rendered: str) -> list[str]:
+    """The decision table's data rows — header and separator excluded."""
+    lines = rendered.splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith('| arm '))
+    rows = []
+    for line in lines[start + 2:]:  # skip the header and its `| --- |`
+        if not line.startswith('| '):
+            break
+        rows.append(line)
+    return rows
+
+
 class TestRenderMarkdown:
     """The operator-facing decision table."""
 
     def test_it_renders_exactly_one_row_per_arm_in_the_json(self):
+        """Sliced out of the decision table specifically — the artifact holds
+        several tables, and "every row somewhere in the document" would pass
+        even if an arm rendered into the D10 block by mistake."""
         report = _report()
 
-        rendered = _mod().render_markdown(report)
+        rows = _decision_table_rows(_mod().render_markdown(report))
 
-        rows = [
-            line for line in rendered.splitlines()
-            if line.startswith('| ') and not line.startswith('| ---')
-        ]
-        # header + one row per arm
-        assert len(rows) == 1 + len(report['arms'])
+        assert len(rows) == len(report['arms'])
         for arm in report['arms']:
             assert sum(1 for row in rows if row.startswith(f'| {arm} |')) == 1
 
