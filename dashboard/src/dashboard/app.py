@@ -63,7 +63,7 @@ from dashboard.data.escalation_analytics import build_escalation_analytics
 from dashboard.data.escalations import build_escalation_queues
 from dashboard.data.load import get_load_metrics
 from dashboard.data.mcp_fanout import TTLCache, first_success
-from dashboard.data.memory_evals import build_memory_evals
+from dashboard.data.memory_evals import build_memory_evals, root_scan_succeeded
 from dashboard.data.merge_halt import get_merge_halt_status
 from dashboard.data.merge_queue import (
     build_per_project_merge_queue,
@@ -1555,6 +1555,15 @@ async def api_memory_evals(request: Request) -> JSONResponse:
     resolve_now (clock-discipline guard scans dashboard/data/*.py + app.py;
     resolve_now is the sanctioned site).
 
+    A scan that never REACHED the tree is served but NOT cached (cache_ok=
+    root_scan_succeeded), mirroring how _load_task_cards declines to cache an
+    offline marker: an absent root and an unwalkable one are both O(1) to
+    re-derive, so re-checking each poll costs nothing, while caching them
+    would keep reporting "no evals have ever run" for a full TTL window after
+    the tree lands. A degraded ROW (a corrupt metrics file, an unknown kind)
+    IS still cached — the walk happened, re-running it would not fix it, and
+    that walk is the expensive thing this cache exists to prevent.
+
     The escalation source is config.reconciliation_escalations_dir: memory-eval
     regressions are filed onto the 8103 recon queue (memory-eval-program.md
     M3), which is the same queue the Escalations tab renders — so a linked
@@ -1568,7 +1577,7 @@ async def api_memory_evals(request: Request) -> JSONResponse:
     async def _refresh() -> dict:
         return await asyncio.to_thread(build_memory_evals, memory_evals_dir, escalations_dir)
 
-    result = await _memory_evals_cache.get_or_refresh(key, _refresh)
+    result = await _memory_evals_cache.get_or_refresh(key, _refresh, cache_ok=root_scan_succeeded)
     return JSONResponse(redux_api.shape_memory_evals(**result))
 
 

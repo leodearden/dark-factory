@@ -1206,6 +1206,43 @@ def build_memory_evals(
     return payload
 
 
+def root_scan_succeeded(payload: dict[str, Any]) -> bool:
+    """Did this scan actually reach the artifact tree?
+
+    The cacheability predicate for the route's TTL cache
+    (``cache_ok=root_scan_succeeded``).  False for exactly the two payloads
+    produced WITHOUT walking anything:
+
+    * ``root_present`` is falsy — :meth:`Path.is_dir` said no and
+      :func:`_build_payload` returned before enumerating.
+    * an ``unreadable_root`` issue is present — the root exists but
+      :meth:`Path.iterdir` raised, so again nothing was walked.
+
+    Both are O(1) to recompute — one ``stat``, or one immediately-raising
+    ``iterdir`` — so re-deriving them on every poll costs nothing and there is
+    no expensive walk behind them to stampede onto.  Caching them, by
+    contrast, pins a "there is no data here" view for the full TTL window past
+    the moment the tree appears: a volume finishing its mount, a mode being
+    fixed, the first eval run landing.
+
+    A degraded ROW is deliberately still cacheable.  An unreadable metrics
+    run, an unknown metric kind or an orphan verdict all mean the scan reached
+    the tree and did its work; re-running it would rediscover the same
+    degradation at the cost of the full walk this cache exists to prevent.
+    The predicate keys on the ROOT, never on ``issue_count``.
+
+    Reads every field through ``.get`` because it runs inside the cache write
+    path: a partially-built payload must degrade to "don't cache" rather than
+    raise where a raise would surface as a 500 on the dashboard poll.
+    """
+    if not payload.get('root_present'):
+        return False
+    return not any(
+        issue.get('kind') == 'unreadable_root'
+        for issue in payload.get('issues') or ()
+    )
+
+
 def _empty_payload(resolved_now: datetime, issues: list[dict[str, Any]]) -> dict[str, Any]:
     """The payload skeleton, with every key present on every return path."""
     return {
