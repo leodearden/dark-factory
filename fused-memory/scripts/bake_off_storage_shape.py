@@ -1226,3 +1226,185 @@ def tokens_returned(
         'estimator': name,
         'payloads_counted': len(window),
     }
+
+
+# ---------------------------------------------------------------------------
+# Near-dup-guard candidate adequacy
+# ---------------------------------------------------------------------------
+#
+# eval-doc :324-326: "would the write that became duplicate N+1 have been
+# matched?"  Reported SPLIT IN TWO — see this module's docstring for why the
+# threshold half cannot be made rank-based without ceasing to measure the
+# real guard, and why it is flagged rather than dropped.
+
+#: How many results the guard sees.  Production's pre-check search runs with
+#: ``limit=5`` (``server/tools.py:1556``), so a replay over a wider window
+#: would measure a more generous guard than the one that is running.
+GUARD_TOP_K = 5
+
+
+@dataclass(frozen=True)
+class ScoredHit:
+    """An :class:`ArmRecord` plus the score the store returned for it.
+
+    A deliberately SEPARATE type rather than a score field on ``ArmRecord``:
+    eval-design §1 bans absolute-score metrics, and the threshold replay is
+    the single sanctioned exception.  Quarantining the score in a wrapper
+    only this metric consumes makes that structural — the rank-based metrics
+    could not read a score even by accident, because the type they take does
+    not have one.
+    """
+
+    record: ArmRecord
+    relevance_score: float
+
+
+def as_memory_results(hits: list[ScoredHit]) -> list[Any]:
+    """Adapt arm hits to the ``MemoryResult`` objects the selector takes.
+
+    ``find_near_duplicate_memory`` reads ``.category`` and ``.source_store``
+    as ENUMS and ``.relevance_score`` as a float.  Dicts would raise; dicts
+    of plain strings would be worse — every enum comparison would silently
+    fail and the report would state "the guard never fires" for every arm.
+
+    Rank order is preserved: the selector takes the max by score, but the
+    report quotes the matched id back against the ranked window, and a
+    reordering adapter would make that evidence point at the wrong record.
+
+    A category the enum does not know becomes ``None`` rather than a guess —
+    that record is exactly what the selector's defensive filter exists to
+    drop, and inventing a category would defeat it.
+
+    ``source_store`` is ``mem0`` for every hit: the arms are seeded into
+    mem0/Qdrant and production's pre-check searches ``stores=['mem0']``.
+    """
+    from fused_memory.models.enums import MemoryCategory, SourceStore  # noqa: PLC0415
+    from fused_memory.models.memory import MemoryResult  # noqa: PLC0415
+
+    results = []
+    for hit in hits:
+        raw_category = hit.record.metadata.get('category')
+        try:
+            category = MemoryCategory(raw_category)
+        except ValueError:
+            category = None
+        results.append(MemoryResult(
+            id=hit.record.record_id,
+            content=hit.record.content,
+            category=category,
+            source_store=SourceStore.mem0,
+            relevance_score=hit.relevance_score,
+        ))
+    return results
+
+
+def resolve_guard_threshold(memory_service: Any = None) -> float:
+    """The threshold the guard would really run at.
+
+    Delegates to ``near_duplicate_guard.resolve_near_dup_threshold``, which
+    navigates the config defensively and falls back to that module's
+    ``_DEFAULT_NEAR_DUP_THRESHOLD``.  The value is NOT restated here — not
+    even in this docstring — because a copy in this script would keep
+    reporting the old number for months after production moved, and a report
+    that names a threshold nobody is running is worse than one that does not
+    name it at all.
+
+    ``None`` is accepted for the pure tests and for a dry run — the delegate
+    already treats every missing hop as "use the default", so no separate
+    branch is needed.
+    """
+    from fused_memory.server.near_duplicate_guard import (  # noqa: PLC0415
+        resolve_near_dup_threshold,
+    )
+
+    return resolve_near_dup_threshold(memory_service)
+
+
+def guard_adequacy(
+    top5_hits: list[ScoredHit],
+    sibling_record_ids: set[str],
+    threshold: float | None = None,
+) -> dict[str, Any]:
+    """Would the guard have caught the write that became duplicate N+1?
+
+    Returns both halves of the answer, which are independent by design:
+
+    ``candidate_present``
+        Rank/set-based and score-free: is any record from the probing write's
+        own cluster in the arm's top-5 at all?  This is the drift-proof half
+        and the one that discriminates between storage shapes.  A shape that
+        put the right sibling at rank 1 did its job even if the cosine came
+        in under threshold; collapsing the two halves would report that as a
+        shape failure and the decision table would blame the shape for the
+        threshold.
+
+    ``guard_matched`` / ``guard_matched_id``
+        The REAL selector's verdict, with ``threshold_replay: True`` and the
+        threshold value alongside it so no reader mistakes it for something
+        stable enough to trend across an embedding-config change.  The bool
+        is the aggregable form (a rate across clusters); the id is the
+        evidence a reader checks the rate against.
+
+    *sibling_record_ids* are the arm's records for the probe's cluster.  A
+    grouped document is credited correctly without special-casing: it carries
+    its canonical's ``record_id``, and the canonical is a cluster sibling.
+
+    Windowed to :data:`GUARD_TOP_K` defensively — a caller handing over ten
+    hits must not accidentally measure a more generous guard than production
+    runs.
+    """
+    from fused_memory.server import near_duplicate_guard  # noqa: PLC0415
+
+    if threshold is None:
+        threshold = resolve_guard_threshold()
+    window = top5_hits[:GUARD_TOP_K]
+
+    match = near_duplicate_guard.find_near_duplicate_memory(
+        as_memory_results(window), threshold,
+    )
+    return {
+        'candidate_present': any(
+            hit.record.record_id in sibling_record_ids for hit in window
+        ),
+        'guard_matched': match is not None,
+        'guard_matched_id': None if match is None else match.id,
+        'threshold_replay': True,
+        'threshold': threshold,
+    }
+
+
+def select_probing_write(cluster: CalibrationCluster) -> dict[str, Any] | None:
+    """The write that became duplicate N+1 for *cluster*, or ``None``.
+
+    The chronologically LAST ``label == 'duplicate'`` member: that is the
+    write the guard would have had to catch, and its content is the probe
+    query.  Ties break on ``memory_id`` (max) — the 20 canonicals carry
+    ``created_at: null`` and nothing forbids two duplicates sharing a stamp,
+    so an unstable tiebreak would move the probe query, and with it the whole
+    guard column, between runs of an experiment whose report is supposed to
+    be diffable.
+
+    Only ``duplicate``-labelled members are eligible.  A ``distinct`` or
+    ``pseudo_contradiction`` member is by definition NOT a duplicate N+1, and
+    probing with one would measure whether the guard fires on content it is
+    specifically supposed to let through.
+
+    ``None`` — never a substituted canonical — when the cluster has no
+    duplicate at all.  5 of the committed fixture's 20 clusters really are
+    duplicate-free, and probing them with *something* would manufacture 5
+    fake measurements in a 20-row table.
+
+    Note for the report: 3 of the 15 measurable clusters have a probe whose
+    category is not ``procedural_knowledge``, which production's guard does
+    not cover at all (it runs only on explicit procedural_knowledge writes).
+    Those rows are measured the same way and flagged there rather than
+    dropped here — dropping them would hide that the guard's remit is
+    narrower than the corpus.
+    """
+    duplicates = [m for m in cluster.members if m.get('label') == 'duplicate']
+    if not duplicates:
+        return None
+    return max(
+        duplicates,
+        key=lambda record: (record.get('created_at') or '', record.get('memory_id') or ''),
+    )

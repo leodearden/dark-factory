@@ -2091,7 +2091,9 @@ class TestSelectProbingWrite:
         mod = _mod()
         clusters = mod.load_calibration_clusters(ALPHA_FIXTURE_PATH)
 
-        probes = {c.cluster_id: mod.select_probing_write(c) for c in clusters}
+        probes = {
+            cid: mod.select_probing_write(c) for cid, c in clusters.items()
+        }
         measurable = {cid: p for cid, p in probes.items() if p is not None}
 
         assert len(probes) == 20
