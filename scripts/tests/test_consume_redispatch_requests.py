@@ -14,9 +14,8 @@ import os
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-import pytest
-
 import consume_redispatch_requests as crr
+import pytest
 
 # The fixed class -> action mapping, transcribed from the reify sweep
 # (_classify_gate_closure -> close, _classify_merge_verify_red -> reverify,
@@ -419,9 +418,8 @@ def test_session_id_is_captured_before_the_202_empty_body_early_return():
         return (200, {'Content-Type': 'application/json'},
                 _json_rpc_ok(payload, {'structuredContent': {'ok': True}}))
 
-    with _FakeMcpServer(responder) as srv:
-        with crr.McpClient(srv.url) as client:
-            client.call_tool('get_task', {'id': '1'})
+    with _FakeMcpServer(responder) as srv, crr.McpClient(srv.url) as client:
+        client.call_tool('get_task', {'id': '1'})
     tool_headers = {k.lower(): v for k, v in srv.received[-1][0].items()}
     assert tool_headers.get('mcp-session-id') == 'sess-from-202'
 
@@ -438,9 +436,8 @@ def test_sse_response_is_parsed_by_extracting_the_first_data_line():
         return (200, {'Content-Type': 'text/event-stream'},
                 f'event: message\ndata: {inner}\n\n')
 
-    with _FakeMcpServer(responder) as srv:
-        with crr.McpClient(srv.url) as client:
-            assert client.call_tool('get_task', {'id': '5321'}) == {'id': '5321'}
+    with _FakeMcpServer(responder) as srv, crr.McpClient(srv.url) as client:
+        assert client.call_tool('get_task', {'id': '5321'}) == {'id': '5321'}
 
 
 def test_structured_content_is_preferred_and_text_content_is_the_fallback():
@@ -458,9 +455,8 @@ def test_structured_content_is_preferred_and_text_content_is_the_fallback():
                 _json_rpc_ok(payload, {
                     'content': [{'type': 'text', 'text': json.dumps({'id': '9'})}]}))
 
-    with _FakeMcpServer(text_responder) as srv:
-        with crr.McpClient(srv.url) as client:
-            assert client.call_tool('get_task', {'id': '9'}) == {'id': '9'}
+    with _FakeMcpServer(text_responder) as srv, crr.McpClient(srv.url) as client:
+        assert client.call_tool('get_task', {'id': '9'}) == {'id': '9'}
 
 
 def test_json_rpc_error_raises_rather_than_reading_as_success():
@@ -477,10 +473,9 @@ def test_json_rpc_error_raises_rather_than_reading_as_success():
                 json.dumps({'jsonrpc': '2.0', 'id': payload.get('id'),
                             'error': {'code': -32602, 'message': 'boom'}}))
 
-    with _FakeMcpServer(responder) as srv:
-        with crr.McpClient(srv.url) as client:
-            with pytest.raises(RuntimeError, match='boom'):
-                client.call_tool('set_task_status', {'id': '1', 'status': 'pending'})
+    with _FakeMcpServer(responder) as srv, crr.McpClient(srv.url) as client:
+        with pytest.raises(RuntimeError, match='boom'):
+            client.call_tool('set_task_status', {'id': '1', 'status': 'pending'})
 
 
 def test_client_identifies_itself_explicitly():
@@ -522,10 +517,9 @@ def test_a_tool_level_is_error_result_raises():
         return _is_error_result(
             payload, "Input validation error: unexpected keyword 'task_id'")
 
-    with _FakeMcpServer(responder) as srv:
-        with crr.McpClient(srv.url) as client:
-            with pytest.raises(RuntimeError, match='Input validation error'):
-                client.call_tool('set_task_status', {'id': '1', 'status': 'pending'})
+    with _FakeMcpServer(responder) as srv, crr.McpClient(srv.url) as client:
+        with pytest.raises(RuntimeError, match='Input validation error'):
+            client.call_tool('set_task_status', {'id': '1', 'status': 'pending'})
 
 
 def test_an_unparsed_text_payload_is_read_as_a_rejection_not_a_success():
@@ -620,7 +614,7 @@ def _iso(offset_seconds, style='Z'):
     open on the other.
     """
     import datetime as _dt
-    ts = _dt.datetime.fromtimestamp(SWEEP_MTIME + offset_seconds, _dt.timezone.utc)
+    ts = _dt.datetime.fromtimestamp(SWEEP_MTIME + offset_seconds, _dt.UTC)
     if style == 'Z':
         return ts.strftime('%Y-%m-%dT%H:%M:%S.') + f'{ts.microsecond // 1000:03d}Z'
     return ts.isoformat()
@@ -1251,9 +1245,8 @@ def test_a_tool_level_is_error_is_counted_as_failed_not_applied(requests_dir):
     _req(requests_dir, 5321, 'gate_closure')
     responder = _tool_responder({5321: _row('blocked')},
                                 is_error_on={'set_task_status'})
-    with _FakeMcpServer(responder) as srv:
-        with crr.McpClient(srv.url) as client:
-            summary = _run(requests_dir, client)
+    with _FakeMcpServer(responder) as srv, crr.McpClient(srv.url) as client:
+        summary = _run(requests_dir, client)
     assert summary.failed == 1 and summary.applied == 0
     assert _top_level(requests_dir) == ['redispatch-5321-gate_closure.json']
     assert _archived(requests_dir) == []
@@ -1264,9 +1257,8 @@ def test_a_tool_level_is_error_on_the_guard_read_is_a_skip(requests_dir):
     guard declines rather than writing on an unconfirmed observation."""
     _req(requests_dir, 5321, 'gate_closure')
     responder = _tool_responder({5321: _row('blocked')}, is_error_on={'get_task'})
-    with _FakeMcpServer(responder) as srv:
-        with crr.McpClient(srv.url) as client:
-            summary = _run(requests_dir, client)
+    with _FakeMcpServer(responder) as srv, crr.McpClient(srv.url) as client:
+        summary = _run(requests_dir, client)
     assert summary.skipped == 1 and summary.applied == 0 and summary.failed == 0
 
 

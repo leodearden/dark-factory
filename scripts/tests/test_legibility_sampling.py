@@ -1195,7 +1195,7 @@ class TestDigestByteCostFn:
         renderer_default = (
             inspect.signature(digest_mod.build_digest).parameters['max_bytes'].default
         )
-        assert mod.DEFAULT_DIGEST_MAX_BYTES == renderer_default
+        assert renderer_default == mod.DEFAULT_DIGEST_MAX_BYTES
 
 
 class TestRenderManifest:

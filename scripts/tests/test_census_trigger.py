@@ -14,16 +14,15 @@ from __future__ import annotations
 import json
 import logging
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 import yaml
-
 from legibility import census_trigger as ct
 from legibility.config import Census as LegibilityCensus
 
-NOW = datetime(2026, 7, 14, 12, 0, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 14, 12, 0, 0, tzinfo=UTC)
 
 
 # ---------------------------------------------------------------------------
@@ -955,7 +954,7 @@ def test_cli_evaluate_dark_factory_like_project_prints_no_fire_and_exits_0(tmp_p
 
 
 def test_cli_evaluate_fire_inducing_fixture_prints_fire_and_exits_0(tmp_path, capsys):
-    twelve_days_ago = (datetime.now(timezone.utc) - timedelta(days=12)).strftime("%Y-%m-%d")
+    twelve_days_ago = (datetime.now(UTC) - timedelta(days=12)).strftime("%Y-%m-%d")
     _write_codebook(
         tmp_path,
         entries=[

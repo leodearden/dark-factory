@@ -35,8 +35,13 @@ _ORCH_SRC = REPO_ROOT / "orchestrator" / "src"
 if str(_ORCH_SRC) not in sys.path:
     sys.path.insert(0, str(_ORCH_SRC))
 
-from orchestrator import session_hooks  # noqa: E402  # pyright: ignore[reportAttributeAccessIssue]
-from orchestrator import session_registry  # noqa: E402  # pyright: ignore[reportAttributeAccessIssue]
+# noqa must sit on the STATEMENT's first line: E402 is reported at the start of
+# the import, so the per-name noqas ruff's I001 fix left on lines below suppress
+# nothing. The pyright ignores stay per-name, where each attribute is flagged.
+from orchestrator import (  # noqa: E402
+    session_hooks,  # pyright: ignore[reportAttributeAccessIssue]
+    session_registry,  # pyright: ignore[reportAttributeAccessIssue]
+)
 
 # Branch routing: the script dispatches on the first word of $CLAUDE_TERMINAL_CMD.
 FOREGROUND_NAMES = ["gnome-terminal", "xterm", "kitty"]

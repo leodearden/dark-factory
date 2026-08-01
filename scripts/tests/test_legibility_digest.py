@@ -25,9 +25,8 @@ import gzip
 import json
 import logging
 
-import yaml
-
 import digest as mod
+import yaml
 
 
 def _assistant(*blocks):

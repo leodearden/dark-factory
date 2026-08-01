@@ -39,7 +39,7 @@ import argparse
 import pathlib
 import subprocess
 import sys
-from typing import Sequence
+from collections.abc import Sequence
 
 # ---------------------------------------------------------------------------
 # Constants

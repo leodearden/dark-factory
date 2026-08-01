@@ -54,7 +54,7 @@ import sys
 import tempfile
 import traceback
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 # Self-bootstrap for standalone `python scripts/legibility/census.py` runs
@@ -68,11 +68,12 @@ if __name__ == '__main__':
 
 import codebook  # noqa: E402
 import coder  # noqa: E402
-import config  # noqa: E402
 import digest  # noqa: E402
 import inventory  # noqa: E402
 import sampling  # noqa: E402
 from legibility import census_trigger  # noqa: E402
+
+import config  # noqa: E402
 
 logger = logging.getLogger("legibility.census")
 
@@ -1877,7 +1878,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"census: failed to load config at {config_path}: {exc}", file=sys.stderr)
         return 1
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     date_str = args.date.isoformat() if args.date is not None else now.date().isoformat()
     status_fetcher = census_trigger.default_status_fetcher(project_root)
 

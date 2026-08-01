@@ -34,7 +34,6 @@ import re
 import tomllib
 
 import yaml
-
 from orchestrator.config import ModuleConfig, _discover_module_configs
 from orchestrator.verify import _AND_CLAUSE_SPLIT_RE, _cd_clause_target
 

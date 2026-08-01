@@ -231,7 +231,7 @@ def load_state(path: str | Path) -> tuple[str, dict | None]:
         return 'missing', None
 
     try:
-        with open(path, 'r', encoding='utf-8') as f:
+        with open(path, encoding='utf-8') as f:
             data = json.load(f)
     except (OSError, json.JSONDecodeError) as exc:
         logger.warning('trickle state at %s is malformed: %s', path, exc)

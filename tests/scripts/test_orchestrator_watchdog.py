@@ -1426,9 +1426,9 @@ def test_orch_restart_min_interval_secs_matches_config_default(
     # may point ORCH_CONFIG_PATH at a different checkout).
     monkeypatch.setenv("ORCH_CONFIG_PATH", str(REPO_ROOT / "dark-factory-orchestrator.yaml"))
     wdog = _load_watchdog()
-    assert wdog.ORCH_RESTART_MIN_INTERVAL_SECS == pytest.approx(
+    assert pytest.approx(
         OrchestratorConfig().orchestrator_restart_min_interval_secs
-    )
+    ) == wdog.ORCH_RESTART_MIN_INTERVAL_SECS
 
 
 def test_orch_restart_min_interval_secs_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1463,7 +1463,7 @@ def test_fleet_deploy_clock_path_matches_across_tiers(monkeypatch: pytest.Monkey
     monkeypatch.delenv("ORCH_FLEET_DEPLOY_CLOCK", raising=False)
     wdog = _load_watchdog()
     expected_watchdog_path = str(pathlib.Path(wdog.REPO_DIR) / FLEET_DEPLOY_CLOCK_RELPATH)
-    assert wdog.FLEET_DEPLOY_CLOCK_PATH == expected_watchdog_path
+    assert expected_watchdog_path == wdog.FLEET_DEPLOY_CLOCK_PATH
 
     # --- bash script mirror (CLOCK_FILE default) ---
     script_src = (REPO_ROOT / "scripts" / "restart-all-orchestrators.sh").read_text()
@@ -3711,7 +3711,7 @@ def test_boundary8_coordinator_fire_while_busy_link_seam(
     monkeypatch.delenv("ORCH_FLEET_DEPLOY_CLOCK", raising=False)
     wdog = _load_watchdog()
     expected_path = str(pathlib.Path(wdog.REPO_DIR) / FLEET_DEPLOY_CLOCK_RELPATH)
-    assert wdog.FLEET_DEPLOY_CLOCK_PATH == expected_path, (
+    assert expected_path == wdog.FLEET_DEPLOY_CLOCK_PATH, (
         "the watchdog and the coordinator must honor the exact same shared "
         "fleet-deploy clock path for fire-while-busy to be safe under the "
         "8h cap"
@@ -3975,7 +3975,7 @@ def test_fused_memory_port_matches_configured_server_port() -> None:
     server = cfg.get("server") if isinstance(cfg, dict) else None
     port = server.get("port") if isinstance(server, dict) else None
     assert port is not None, f"{config_path}: missing 'server.port' (schema may have changed)"
-    assert wdog.FUSED_MEMORY_PORT == port, (
+    assert port == wdog.FUSED_MEMORY_PORT, (
         f"FUSED_MEMORY_PORT ({wdog.FUSED_MEMORY_PORT}) != "
         f"fused-memory/config/config.yaml server.port ({port})"
     )
@@ -4604,9 +4604,9 @@ def test_fm_deploy_clock_path_default(monkeypatch: pytest.MonkeyPatch) -> None:
     """FM_DEPLOY_CLOCK_PATH defaults to fm's OWN clock file under REPO_DIR."""
     monkeypatch.delenv("FM_DEPLOY_CLOCK", raising=False)
     wdog = _load_watchdog()
-    assert wdog.FM_DEPLOY_CLOCK_PATH == os.path.join(
+    assert os.path.join(
         wdog.REPO_DIR, "data", "fused-memory", "last_redeploy_fused_memory.json"
-    )
+    ) == wdog.FM_DEPLOY_CLOCK_PATH
 
 
 def test_fm_deploy_clock_path_env_override(monkeypatch: pytest.MonkeyPatch) -> None:

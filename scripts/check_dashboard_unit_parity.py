@@ -151,7 +151,7 @@ import pathlib
 import re
 import shlex
 import sys
-from typing import Sequence
+from collections.abc import Sequence
 
 # ---------------------------------------------------------------------------
 # Constants

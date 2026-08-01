@@ -16,9 +16,7 @@ import json
 from pathlib import Path
 
 import pytest
-
 from legibility import codebook as mod
-
 
 # ---------------------------------------------------------------------------
 # Fixtures

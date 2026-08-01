@@ -101,11 +101,10 @@ import os
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import yaml
-
 from legibility import codebook
 from legibility.config import Census as _LegibilityCensus
 
@@ -119,8 +118,8 @@ def _as_utc(value: datetime | None) -> datetime | None:
     if value is None:
         return None
     if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +153,7 @@ class CensusConfig:
     floor_days: int = _CENSUS_DEFAULTS.floor_days
 
     @classmethod
-    def from_mapping(cls, mapping: dict | None) -> "CensusConfig":
+    def from_mapping(cls, mapping: dict | None) -> CensusConfig:
         """Build a CensusConfig by merging `mapping` (shaped like §7.4's
         `census:` block, e.g. `{"max_interval_days": 3, "novelty_spike":
         {"count": 9}}`) over the defaults. Keys absent from `mapping`
@@ -237,10 +236,7 @@ def evaluate(
         reasons.append("tasks-landed: delta unavailable (no baseline/fetcher) -> N/A")
     elif days_since is None or days_since < config.tasks_landed_min_days:
         reasons.append(
-            "tasks-landed: {} landed but only {:.1f}d elapsed (min {}d) -> N/A".format(
-                tasks_landed, days_since if days_since is not None else 0.0,
-                config.tasks_landed_min_days,
-            )
+            f"tasks-landed: {tasks_landed} landed but only {days_since if days_since is not None else 0.0:.1f}d elapsed (min {config.tasks_landed_min_days}d) -> N/A"
         )
     else:
         reasons.append(
@@ -270,9 +266,7 @@ def evaluate(
     )
     if floor_blocks:
         reasons.append(
-            "floor: only {:.1f}d since last census (floor {}d) -> BLOCKS all conditions".format(
-                days_since, config.floor_days
-            )
+            f"floor: only {days_since:.1f}d since last census (floor {config.floor_days}d) -> BLOCKS all conditions"
         )
     elif never_censused:
         reasons.append("floor: never censused -> exempt")
@@ -305,7 +299,7 @@ def load_census_state(path: str | Path) -> tuple[str, dict | None]:
         return "missing", None
 
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, json.JSONDecodeError) as exc:
         logger.warning("census state at %s is malformed: %s", path, exc)
@@ -407,7 +401,7 @@ def load_census_config(project_root: str | Path) -> CensusConfig:
         return CensusConfig()
 
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             data = yaml.safe_load(f)
     except (OSError, yaml.YAMLError) as exc:
         logger.warning("legibility config at %s is malformed: %s", path, exc)
@@ -794,7 +788,7 @@ def decide_for_project(
     has already logged its one WARNING, so nothing else needs to.
     """
     project_root = Path(project_root)
-    now = now if now is not None else datetime.now(timezone.utc)
+    now = now if now is not None else datetime.now(UTC)
 
     config = load_census_config(project_root)
 
