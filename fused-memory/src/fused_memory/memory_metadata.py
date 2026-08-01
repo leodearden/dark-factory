@@ -78,6 +78,8 @@ __all__ = [
     'MEM0_MANAGED_METADATA_KEYS',
     'MemoryMetadataValidationError',
     'MetadataViolation',
+    'PARENT_ID_DEAD_CODE',
+    'PARENT_ID_UNAVAILABLE_CODE',
     'ParentHasChildrenError',
     'RESERVED_VOCABULARY_KEYS',
     'SERVER_STAMPED_KEYS',
@@ -85,6 +87,7 @@ __all__ = [
     'TOPIC_SLUG_RE',
     'classify_unknown_keys',
     'normalize_supersedes',
+    'parent_liveness_violation',
     'validate_memory_metadata',
 ]
 
@@ -779,6 +782,71 @@ def _violation(key: str, code: str, rule: str, *, fatal: bool) -> MetadataViolat
     )
 
 
+#: Census code for a ``parent_id`` that shape-checks but resolves to
+#: nothing in the same project's Mem0 collection.
+PARENT_ID_DEAD_CODE = 'dead_parent_id'
+
+#: Census code for a ``parent_id`` whose liveness could NOT be determined
+#: because the backend lookup itself failed (a propagated Qdrant read
+#: timeout, a transport error).  Deliberately distinct from
+#: :data:`PARENT_ID_DEAD_CODE` — see :func:`parent_liveness_violation`.
+PARENT_ID_UNAVAILABLE_CODE = 'parent_id_liveness_unavailable'
+
+_PARENT_LIVENESS_RULES = {
+    PARENT_ID_DEAD_CODE: (
+        'parent_id {parent_id!r} must resolve to a live same-project Mem0 '
+        'entry; the lookup returned no such record, so writing this would '
+        'dangle a pointer at a dead parent'
+    ),
+    PARENT_ID_UNAVAILABLE_CODE: (
+        'parent_id {parent_id!r} could not be checked: the same-project Mem0 '
+        'lookup failed, so liveness is UNKNOWN rather than refuted'
+    ),
+}
+
+
+def parent_liveness_violation(parent_id: Any, *, code: str) -> MetadataViolation:
+    """Build a ``parent_id`` LIVENESS violation (leaf δ, task 3197).
+
+    Liveness itself is resolved at the write SEAM
+    (``services/memory_service.py::_apply_memory_metadata_validation``),
+    which is the only layer that can reach a store —
+    :func:`validate_memory_metadata` is pure by construction and must stay
+    that way.  But the CODES and the message WORDING live here, behind this
+    factory, so the registry remains the single normative home for the rule
+    and the seam cannot grow a second copy of the text (INV-5).  Delegating
+    to ``_violation`` also means the registry-location hint is appended by
+    construction rather than by the seam remembering to add it.
+
+    Both codes are ``fatal=True``, which is what lets liveness ride the
+    existing uniform arms at the seam: warn mode censuses and proceeds,
+    ``memory_metadata.enforce`` rejects.  No new config leaf, no third
+    rejection path.
+
+    The two codes are kept DISTINCT on purpose.
+    ``Mem0Backend.get_point_by_id`` propagates a read timeout rather than
+    collapsing it into ``None``, precisely so a timed-out read is never
+    mistaken for a genuine not-found; folding both into
+    :data:`PARENT_ID_DEAD_CODE` would discard that at the seam and tell an
+    operator a live parent is dead.  Fatal-on-unavailable is INV-3 read
+    literally: an actor that cannot corroborate must not act.
+
+    :raises ValueError: on an unrecognised *code*.  Census codes are what
+        operators grep, so a typo must fail loudly rather than quietly mint
+        a new census axis.
+    """
+    try:
+        rule = _PARENT_LIVENESS_RULES[code]
+    except KeyError:
+        raise ValueError(
+            f'unrecognised parent liveness code {code!r}; expected one of '
+            f'{sorted(_PARENT_LIVENESS_RULES)}'
+        ) from None
+    return _violation(
+        'parent_id', code, rule.format(parent_id=parent_id), fatal=True
+    )
+
+
 def _is_full_uuid(value: Any) -> bool:
     """True iff *value* is a canonical full-UUID string.
 
@@ -823,6 +891,13 @@ def validate_memory_metadata(
     deliberate, not an oversight:
 
     * ``parent_id`` **liveness** (does the parent still exist?) is leaf δ's,
+      and leaf δ (task 3197) has LANDED it at the write seam,
+      ``services/memory_service.py::_apply_memory_metadata_validation``.
+      The codes and wording it emits are still defined here — see
+      :func:`parent_liveness_violation`,
+      :data:`PARENT_ID_DEAD_CODE` and :data:`PARENT_ID_UNAVAILABLE_CODE` —
+      so the rule has exactly one home even though its two halves run in
+      two layers;
     * ``canonical`` per-(project, topic) **uniqueness** is leaf ε's.
 
     Making the boundary structural rather than a comment means a later leaf
@@ -932,7 +1007,13 @@ def validate_memory_metadata(
                 fatal=enforce_kind_registry,
             ))
 
-    # 2d. parent_id — SHAPE only; liveness is leaf δ's (see the docstring).
+    # 2d. parent_id — SHAPE only.
+    #
+    # LIVENESS is resolved one layer up, at the write seam
+    # (`_apply_memory_metadata_validation`), using
+    # `parent_liveness_violation()` above; it fires only when the shape
+    # check below has PASSED, so no store round-trip is ever spent on an id
+    # no store could resolve.  See the SCOPE section of the docstring.
     if 'parent_id' in meta:
         parent_id = meta['parent_id']
         if not _is_full_uuid(parent_id):
@@ -940,7 +1021,8 @@ def validate_memory_metadata(
                 'parent_id',
                 'invalid_parent_id_shape',
                 f'parent_id {parent_id!r} must be a canonical full-UUID string '
-                f'(shape only — liveness resolution is leaf δ\'s)',
+                f'(shape only — liveness is resolved at the write seam, '
+                f'see parent_liveness_violation)',
                 fatal=True,
             ))
 
