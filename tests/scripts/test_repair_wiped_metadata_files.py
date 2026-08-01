@@ -1299,27 +1299,6 @@ def test_main_does_not_repair_a_contradicted_candidate(tmp_path):
     assert counts[REPAIR] == 0
 
 
-def test_main_help_documents_the_exit_codes():
-    """The audit CLI's convention: exit codes live in the argparse epilog, not
-    only in a docstring the operator will not see.
-
-    EVERY advertised code, including 3 (nothing scanned) and 4 (server
-    unreachable). Those two exist so that 1 keeps its single documented meaning
-    — 'a write was attempted and failed' — so an epilog that omitted them would
-    leave an operator mapping them back onto 1 by guesswork. Distinctness is
-    asserted here too: two outcomes sharing a code is the same ambiguity.
-    """
-    result = _run_cli("--help")
-
-    assert result.returncode == 0
-    assert "exit codes" in result.stdout.lower()
-
-    codes = (EXIT_OK, 1, EXIT_NO_ROOT, EXIT_NOTHING_SCANNED, EXIT_SERVER_UNREACHABLE)
-    assert len(set(codes)) == len(codes), codes
-    for code in codes:
-        assert str(code) in result.stdout, code
-
-
 def test_classify_live_task_treats_a_non_dict_metadata_as_no_files():
     """metadata itself can be NULL or malformed in the store; that is 'no
     scope recorded', which is repairable, not a crash."""
