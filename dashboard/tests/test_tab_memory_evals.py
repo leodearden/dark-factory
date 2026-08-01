@@ -1017,3 +1017,66 @@ def test_staleness_empty_states_and_issues_notice(
     assert 'generated_at' in body, (
         '`generated_at` must be rendered so the operator can see payload age.'
     )
+
+
+# ---------------------------------------------------------------------------
+# step-15 test: tabs.jsx MemoryTab renders the section (and nothing more)
+# ---------------------------------------------------------------------------
+
+
+def test_tabs_jsx_memory_tab_renders_evals_section(
+    tabs_jsx_body: str, shell_jsx_body: str, app_jsx_body: str
+) -> None:
+    """tabs.jsx consumes the section at module top level and renders it inside
+    MemoryTab — a SECTION in the existing Memory tab, not a new top-level tab.
+    """
+    body = tabs_jsx_body
+
+    # (a) module-top-level destructure, unguarded like the DF_* lines above it.
+    m = re.search(
+        r'const\s*\{[^}]*\bMemoryEvalsSection\b[^}]*\}\s*=\s*window\.DF_MEMORY_EVALS',
+        body,
+    )
+    assert m is not None, (
+        'tabs.jsx must destructure MemoryEvalsSection off window.DF_MEMORY_EVALS '
+        'at module top level, beside its existing window.DF_CHARTS / DF_SHELL / '
+        "DF_DATA lines. index.html's load order (asserted in step-3) is what "
+        'makes the unguarded form safe — the tab_scheduler.jsx:15 precedent.'
+    )
+
+    # (b) genuinely module-scope: before the MemoryTab declaration.
+    fn_pos = body.find('function MemoryTab(')
+    assert fn_pos != -1, 'tabs.jsx no longer declares `function MemoryTab(`.'
+    assert m.start() < fn_pos, (
+        'the DF_MEMORY_EVALS destructure sits after `function MemoryTab(` — it '
+        'must be at module scope, matching the other DF_* destructures.'
+    )
+
+    # (c) rendered inside MemoryTab and nowhere else; NOT a DF_TABS entry.
+    memory_tab_body = _extract_function_body(body, 'MemoryTab')
+    assert memory_tab_body, 'could not extract the MemoryTab body.'
+    assert '<MemoryEvalsSection' in memory_tab_body, (
+        'MemoryTab must render <MemoryEvalsSection ... /> (PRD DD3: the eval '
+        'view lives with the memory panels).'
+    )
+    assert body.count('<MemoryEvalsSection') == 1, (
+        'MemoryEvalsSection must be rendered exactly once, inside MemoryTab.'
+    )
+    df_tabs_line = re.search(r'window\.DF_TABS\s*=\s*\{[^}]*\}', body)
+    assert df_tabs_line is not None, 'tabs.jsx no longer exports window.DF_TABS.'
+    assert 'MemoryEvalsSection' not in df_tabs_line.group(0), (
+        'MemoryEvalsSection must NOT be added to window.DF_TABS — it is a '
+        'section inside the Memory tab, not a thirteenth top-level tab '
+        '(PRD DD3). Asserting the negative keeps a later refactor from quietly '
+        'promoting it.'
+    )
+
+    # (d) app.jsx still routes memory to MemoryTab; no new Rail entry.
+    assert re.search(r"case\s*'memory'\s*:\s*return\s*<MemoryTab", app_jsx_body), (
+        "app.jsx must still route `case 'memory':` to <MemoryTab."
+    )
+    for rail_id in ("'memevals'", "'memory-evals'", "'memory_evals'"):
+        assert rail_id not in shell_jsx_body, (
+            f'shell.jsx gained a Rail entry {rail_id} — PRD DD3 places this as '
+            'a section in the existing Memory tab, with no new rail item.'
+        )
