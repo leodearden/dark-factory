@@ -2353,50 +2353,6 @@ class TestRebuildEntitySummariesCancellation:
 
 
 # ---------------------------------------------------------------------------
-# Task-716: regression guard — cross-reference accuracy between
-#           test_runtime_error_still_accumulates_in_errors and
-#           test_partial_failure_continues
-# ---------------------------------------------------------------------------
-
-class TestDocstringCrossReferenceAccuracy716:
-    """Regression guard: pin the DOCSTRING side of the cross-reference.
-
-    test_runtime_error_still_accumulates_in_errors (TestRebuildEntitySummariesCancellation)
-    references test_partial_failure_continues (TestRebuildEntitySummaries) in its docstring.
-    The test below pins the key phrases in that docstring so a stale ValueError claim
-    cannot silently reappear and the cross-reference stays explicit.
-
-    Scope note (task 3351): this class used to also pin the EXCEPTION-TYPE side, via a
-    companion test that ran ``inspect.getsource`` over the sibling test METHOD
-    test_partial_failure_continues and AST-walked its body to assert it still mentioned
-    RuntimeError.  That guarded no production behavior — it asserted on another test's
-    source text — so it was removed with no replacement.  The exception-type invariant it
-    was proxying for (a per-entity RuntimeError accumulates in ``result['errors']`` without
-    aborting the sweep) is asserted directly, against the real production path, by
-    TestRebuildEntitySummaries.test_partial_failure_continues and
-    TestRebuildEntitySummariesCancellation.test_runtime_error_still_accumulates_in_errors
-    themselves.
-    """
-
-    def test_runtime_error_docstring_describes_runtime_error_cross_reference(self):
-        """Pin only the critical cross-reference invariants in the source docstring.
-
-        Checks that the stale ValueError claim cannot silently reappear and that the
-        cross-reference to test_partial_failure_continues remains explicit.  Exact
-        phrasing of the surrounding explanation is intentionally not asserted — ordinary
-        rewording of the docstring should not break this guard.
-        """
-        doc = TestRebuildEntitySummariesCancellation.test_runtime_error_still_accumulates_in_errors.__doc__
-        assert doc is not None, "docstring must be present"
-        assert 'ValueError accumulation is already covered by test_partial_failure_continues' not in doc, (
-            "stale ValueError claim must not appear in docstring"
-        )
-        assert 'test_partial_failure_continues' in doc, (
-            "cross-reference to test_partial_failure_continues must still be explicit"
-        )
-
-
-# ---------------------------------------------------------------------------
 # Task-511: replace bare assert isinstance(r, dict) with explicit TypeError guard
 # ---------------------------------------------------------------------------
 
