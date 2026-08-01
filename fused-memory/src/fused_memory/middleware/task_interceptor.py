@@ -2338,11 +2338,18 @@ class TaskInterceptor:
         """
         if self._scope_violation_escalator is None:
             return
+        # UNCONDITIONAL — deliberately NOT gated on `matched_paths` being
+        # non-empty.  The defect being fixed is "a bypass leaves no
+        # operator-visible record", not "a bypass that MATTERED leaves no
+        # record".  An override whose verdicts both came back clean is the
+        # single most useful data point available: direct evidence that the
+        # parameter was reached for unnecessarily, which is what any later
+        # tightening of it has to be measured against.  Gating on "the guard
+        # would have fired" would reproduce the original defect for exactly
+        # the over-cautious caller, and would make the census under-count.
+        # Flood risk is handled by the escalator's content-fingerprint fold,
+        # not by suppressing the signal.
         matched_paths = self._override_matched_paths(files_verdict, prose_verdict)
-        if not matched_paths:
-            # Provisional (task 3123 step-6): removed in step-8, which makes
-            # the record unconditional.
-            return
         suggested_project = (
             files_verdict.suggested_project
             if files_verdict.is_rejection
