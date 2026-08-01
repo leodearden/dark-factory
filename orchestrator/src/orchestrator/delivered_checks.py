@@ -428,10 +428,21 @@ async def gate_mark_done_on_delivered_checks(
     checks = (metadata or {}).get('delivered_checks')
     if not checks or not enabled:
         # Inert, with ZERO I/O: check-less tasks keep their exact pre-guard
-        # behavior, and the `enabled` kill switch is single-sourced HERE so one
-        # hot reload of delivered_checks.enabled disarms all eleven seams at
-        # once. Every seam FORWARDS the flag rather than short-circuiting
-        # locally, which is what makes that true.
+        # behavior, and the `enabled` kill switch is single-sourced on ONE
+        # config leaf (delivered_checks.enabled) so a single hot reload
+        # disarms all eleven seams at once. Eight seams reach that leaf by
+        # FORWARDING it here and short-circuiting nowhere else.
+        #
+        # The three seams that must read ANOTHER task's row first — harness
+        # `_delivered_checks_withhold`, workflow
+        # `_member_delivered_checks_withhold`, and merge_queue
+        # `reconcile_landed_row` — additionally re-check the SAME leaf before
+        # that read (task 3057 review). Forwarding alone cannot disarm them:
+        # their pre-read fail-safe arms withhold without ever reaching this
+        # function, so a transient scheduler failure would still change
+        # behaviour on a disarmed fleet. They read the identical config leaf,
+        # so the one-reload property holds; what they do not do is duplicate
+        # the check-less/inertness policy, which lives HERE alone.
         return None
 
     sha = main_sha

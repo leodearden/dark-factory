@@ -750,23 +750,61 @@ class TestReconcileLandedRowDeliveredChecksGuard:
         scheduler.mark_done.assert_not_called()
         assert outbox.lookup('Z') is not None
 
-    # --- row 6: kill switch is FORWARDED, never re-implemented ------------
+    # --- row 6: kill switch DISARMS the seam, pre-read included -----------
 
-    async def test_kill_switch_is_forwarded_not_short_circuited(
+    async def test_kill_switch_short_circuits_before_the_metadata_read(
         self, tmp_path: Path,
     ) -> None:
+        """Retargeted by the task 3057 review.
+
+        This previously pinned that `delivered_checks_enabled` is merely
+        FORWARDED to the shared gate. That left the kill switch unable to
+        disarm this seam: the metadata pre-read below runs first and its
+        fail-safe arms return 'delivered_checks_withheld' without ever
+        reaching the gate. `enabled` is therefore part of the ARMING
+        condition here — see
+        `test_kill_switch_disarms_the_metadata_pre_read` for the failure the
+        old contract allowed.
+        """
         outbox, git_ops, scheduler, row = _mq_row_fixture(tmp_path)
         guard = AsyncMock(return_value=None)
 
         with patch(_MQ_GATE_TARGET, guard):
-            await reconcile_landed_row(
+            disposition = await reconcile_landed_row(
                 row, git_ops=git_ops, scheduler=scheduler, outbox=outbox,
                 main_sha='MAIN', project_root='/tmp/proj',
                 check_timeout_secs=7.5, delivered_checks_enabled=False,
             )
 
-        assert guard.await_args is not None
-        assert guard.await_args.kwargs['enabled'] is False
+        guard.assert_not_awaited()
+        scheduler.get_task.assert_not_called()
+        assert disposition == 'marked_done'
+
+    @pytest.mark.parametrize('mode', ['none', 'raises'])
+    async def test_kill_switch_disarms_the_metadata_pre_read(
+        self, tmp_path: Path, mode: str,
+    ) -> None:
+        """A disarmed fleet must reproduce pre-3057 behaviour EXACTLY.
+
+        With the kill switch off, a transient `scheduler.get_task` failure
+        must not refuse the RC-2 done-write — the row is consumed and the
+        task stamped, exactly as before this guard existed.
+        """
+        outbox, git_ops, scheduler, row = _mq_row_fixture(tmp_path)
+        scheduler.get_task = (
+            AsyncMock(return_value=None) if mode == 'none'
+            else AsyncMock(side_effect=RuntimeError('scheduler down'))
+        )
+
+        disposition = await reconcile_landed_row(
+            row, git_ops=git_ops, scheduler=scheduler, outbox=outbox,
+            main_sha='MAIN', project_root='/tmp/proj',
+            check_timeout_secs=7.5, delivered_checks_enabled=False,
+        )
+
+        assert disposition == 'marked_done'
+        scheduler.mark_done.assert_called_once_with('Z', kind='merged', sha='ADV')
+        assert outbox.lookup('Z') is None
 
     async def test_kill_switch_with_real_helper_marks_done_as_today(
         self, tmp_path: Path,

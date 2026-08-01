@@ -1590,9 +1590,17 @@ class TestAttributeTrainFailurePasserDeliveredChecksGuard:
             f'the solo failer must still be blocked: {transitions!r}'
         )
 
-    # --- row 6: kill switch is FORWARDED, never re-implemented ------------
+    # --- row 6: kill switch DISARMS the seam, pre-read included -----------
 
-    async def test_kill_switch_is_forwarded_not_short_circuited(self):
+    async def test_kill_switch_short_circuits_before_the_metadata_read(self):
+        """Retargeted by the task 3057 review.
+
+        This arm reaches the shared decision through
+        `_member_delivered_checks_withhold`, which must read the PASSER's row
+        before it can gate. That read's fail-safe arms withhold without ever
+        reaching the gate, so forwarding `enabled` alone could not disarm the
+        seam; the kill switch is now checked before the read.
+        """
         guard = AsyncMock(return_value=None)
         f = _armed_attr_fixture(enabled=False)
 
@@ -1600,8 +1608,18 @@ class TestAttributeTrainFailurePasserDeliveredChecksGuard:
             await _run_attribution(f)
 
         assert _done_ids(f) == ['102', '103']
-        assert guard.await_args is not None
-        assert guard.await_args.kwargs['enabled'] is False
+        guard.assert_not_awaited()
+
+    async def test_kill_switch_disarms_the_metadata_pre_read(self):
+        """A disarmed fleet must reproduce pre-3057 behaviour EXACTLY: an
+        unreadable passer row must not withhold the stamp."""
+        f = _armed_attr_fixture(enabled=False)
+        f.scheduler.get_task = AsyncMock(side_effect=RuntimeError('scheduler down'))
+
+        await _run_attribution(f)
+
+        assert _done_ids(f) == ['102', '103']
+        f.scheduler.get_task.assert_not_awaited()
 
     async def test_kill_switch_with_real_helper_lands_as_today(self):
         f = _armed_attr_fixture(enabled=False)

@@ -6011,7 +6011,18 @@ async def reconcile_landed_row(
     # dispositions ('skipped'/'already_done_pruned'/'stale_conflict') still
     # short-circuit with zero check work, and structurally immediately before
     # the mark_done it guards so a later refactor cannot drift them apart.
-    if project_root is not None and check_timeout_secs is not None:
+    # *delivered_checks_enabled* is part of the ARMING condition, not merely
+    # forwarded to the gate (task 3057 review): the metadata pre-read below
+    # runs BEFORE the shared decision, and its two fail-safe arms return
+    # 'delivered_checks_withheld' without ever reaching the gate. Gating only
+    # on the two params would therefore let a transient `scheduler.get_task`
+    # failure refuse the RC-2 done-write even with the fleet-wide kill switch
+    # off. Disarmed must mean pre-3057 behaviour exactly.
+    if (
+        delivered_checks_enabled
+        and project_root is not None
+        and check_timeout_secs is not None
+    ):
         try:
             task = await scheduler.get_task(row.task_id)
         except Exception:

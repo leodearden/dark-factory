@@ -733,9 +733,18 @@ class TestWorkflowMarkMemberDoneDeliveredChecksGuard:
         prov.consume.assert_not_called()
         cast(AsyncMock, f.wf.git_ops.release_lane_for_terminal_task).assert_not_awaited()
 
-    # --- row 6: kill switch is FORWARDED, never re-implemented ------------
+    # --- row 6: kill switch DISARMS the seam, pre-read included -----------
 
-    async def test_kill_switch_is_forwarded_not_short_circuited(self):
+    async def test_kill_switch_short_circuits_before_the_metadata_read(self):
+        """Retargeted by the task 3057 review.
+
+        This previously pinned that `enabled` is merely FORWARDED to the
+        shared gate and short-circuits nowhere locally. Correct for the
+        self-task seams, wrong here: this seam reads the MEMBER's row first,
+        and that read's fail-safe arms withhold without ever reaching the
+        gate — so forwarding alone could not disarm the seam. See
+        `test_kill_switch_disarms_the_metadata_pre_read`.
+        """
         guard = AsyncMock(return_value=None)
         f, cb = await _armed_member_callback(enabled=False)
 
@@ -743,8 +752,32 @@ class TestWorkflowMarkMemberDoneDeliveredChecksGuard:
             await cb('101', 'sha9')
 
         f.scheduler.mark_done.assert_awaited_once()
-        assert guard.await_args is not None
-        assert guard.await_args.kwargs['enabled'] is False
+        guard.assert_not_awaited()
+        f.scheduler.get_task.assert_not_called()
+        f.scheduler.set_task_status.assert_not_awaited()
+
+    @pytest.mark.parametrize('mode', ['none', 'raises'])
+    async def test_kill_switch_disarms_the_metadata_pre_read(self, mode: str):
+        """A disarmed fleet must reproduce pre-3057 behaviour EXACTLY.
+
+        With the kill switch off, an unreadable/absent member row must not
+        withhold the stamp nor revert the member to pending.
+        """
+        get_task = (
+            AsyncMock(return_value=None) if mode == 'none'
+            else AsyncMock(side_effect=RuntimeError('scheduler down'))
+        )
+        f, cb = await _armed_member_callback(enabled=False, get_task=get_task)
+        prov = MagicMock()
+
+        with patch(_PROV_TARGET, prov):
+            await cb('101', 'sha9')
+
+        get_task.assert_not_awaited()
+        f.scheduler.mark_done.assert_awaited_once()
+        assert f.scheduler.mark_done.await_args.kwargs['kind'] == 'merged'
+        prov.consume.assert_called_once_with('101')
+        f.scheduler.set_task_status.assert_not_awaited()
 
     async def test_kill_switch_with_real_helper_flips_as_today(self):
         f, cb = await _armed_member_callback(enabled=False)

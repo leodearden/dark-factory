@@ -1041,6 +1041,23 @@ def build_train_callback_factory(
         """
         if config is None:
             return None
+        if not config.delivered_checks.enabled:
+            # Kill switch, checked BEFORE the metadata pre-read (task 3057
+            # review). This seam is one of the three that must read ANOTHER
+            # task's row to reach the shared decision, so — unlike the
+            # self-task seams, whose metadata is already in scope — delegating
+            # the kill switch to `gate_mark_done_on_delivered_checks` alone is
+            # not sufficient here: the read happens FIRST, and its fail-safe
+            # arms synthesise a block without ever reaching the gate. A
+            # transient `scheduler.get_task` failure would then withhold the
+            # flip and revert the member to pending even with the fleet-wide
+            # switch off. Disarmed means disarmed: return before the read so a
+            # kill-switched fleet reproduces exactly the pre-3057 behaviour.
+            logger.debug(
+                'Train callbacks: delivered_checks.enabled=False — guard '
+                'inert for member %s (%s)', mid, site,
+            )
+            return None
         if git_ops is None:
             logger.debug(
                 'Train callbacks: git_ops unbound — delivered-checks guard '
@@ -1081,6 +1098,7 @@ def build_train_callback_factory(
 
     async def _revert_withheld_member(
         mid: str, *, train_id: str, site: str, reason: str,
+        current_statuses: Mapping[str, str] | None = None,
     ) -> None:
         """Hand a withheld train member back to the scheduler (task 3057).
 
@@ -1089,12 +1107,38 @@ def build_train_callback_factory(
         ``TaskWorkflow._revert_withheld_member`` so the four train seams
         across both modules stay one behaviour.
 
+        *current_statuses* (task 3057 review): a caller that has ALREADY probed
+        live statuses passes them so the pending flip inherits the same
+        race guard ``redrive_member``'s not-on-main arm applies to the
+        identical write. If the member has moved past ``'merge-deferred'``
+        since the caller's snapshot, a live ``TaskWorkflow`` already owns the
+        transition and holds the worktree — clobbering it back to
+        ``'pending'`` would let the scheduler dispatch it a SECOND time
+        concurrently. Unlike ``mark_done``, which is terminal, this write
+        opens that window, so the guard belongs here rather than at one call
+        site. ``None`` (the default, used where no probe was taken) reverts
+        unconditionally, preserving the existing behaviour of the
+        post-advance flip loop, whose members the worker already gated on
+        ``'merge-deferred'`` before advancing.
+
         NEVER raises: a failed recovery edge must not reach
         ``_do_train_merge``'s post-advance flip loop as a false
         ``TRAIN_PARTIAL_FLIP``. When the revert itself fails the member stays
         merge-deferred — no worse than before this edge existed — and that is
         logged rather than escalated.
         """
+        if current_statuses is not None:
+            current = current_statuses.get(mid)
+            if current is not None and current != 'merge-deferred':
+                logger.warning(
+                    'train %s: member %s (%s) — delivered_checks not verifiably '
+                    'on main (%s) and NOT stamped done, but the member is now '
+                    '%r (moved past merge-deferred since the re-drive '
+                    'snapshot); live workflow owns the transition — skipping '
+                    'the revert to pending',
+                    train_id, mid, site, reason, current,
+                )
+                return
         try:
             await scheduler.set_task_status(mid, 'pending')
         except Exception:
@@ -1235,10 +1279,17 @@ def build_train_callback_factory(
                     mid, site='coalesce-derail-found-on-main',
                 )
                 if block is not None:
+                    # Forward the statuses probed above so the revert inherits
+                    # the SAME race guard the else (not-on-main) arm applies to
+                    # this identical write — see `_revert_withheld_member`.
+                    # `err is not None` means the probe is untrustworthy, so we
+                    # pass None and fall through to the unconditional revert,
+                    # mirroring that arm's fail-open policy.
                     await _revert_withheld_member(
                         mid, train_id=train_id,
                         site='coalesce-derail-found-on-main',
                         reason=block.reason,
+                        current_statuses=statuses if err is None else None,
                     )
                     return
                 # Double-landing guard: a partner's merge already brought this

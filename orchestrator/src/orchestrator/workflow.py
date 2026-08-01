@@ -12667,10 +12667,13 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         Unlike the self-task seams, the metadata is not in scope here: a
         member id is, so this costs ONE ``scheduler.get_task(mid)``
-        round-trip, taken only when the guard is actually armed (the check-less
-        and kill-switched cases still short-circuit inside
+        round-trip. Because that read precedes the shared decision, the kill
+        switch is re-checked LOCALLY first (task 3057 review) — at this seam
+        alone, delegating it to
         :func:`~orchestrator.delivered_checks.gate_mark_done_on_delivered_checks`
-        with zero I/O beyond that read).
+        would leave the pre-read's fail-safe arms live on a disarmed fleet.
+        The check-less case still short-circuits inside the shared gate with
+        zero I/O beyond that read.
 
         Returns the :class:`DeliveredChecksBlock` rather than a bool so the
         caller's recovery log can name the REASON — an operator seeing a
@@ -12689,6 +12692,20 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         own distinct WARNING naming the specific cause, so no diagnostic
         detail is lost by the collapse.
         """
+        if not self.config.delivered_checks.enabled:
+            # Kill switch, checked BEFORE the metadata pre-read (task 3057
+            # review) — see the note below on why delegating it to
+            # `gate_mark_done_on_delivered_checks` alone is not sufficient at
+            # THIS seam. A disarmed fleet must reproduce the pre-3057
+            # behaviour exactly, and the pre-read's fail-safe arms synthesise a
+            # block without ever reaching the gate, so a transient
+            # `scheduler.get_task` failure would otherwise still withhold the
+            # stamp and revert the member to pending with the switch off.
+            logger.debug(
+                'Task %s: delivered_checks.enabled=False — member guard inert '
+                'for %s (%s)', self.task_id, mid, site,
+            )
+            return None
         try:
             member = await self.scheduler.get_task(mid)
         except Exception:  # noqa: BLE001

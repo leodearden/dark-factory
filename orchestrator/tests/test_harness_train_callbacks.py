@@ -870,9 +870,23 @@ class TestTrainCallbacksDeliveredChecksGuard:
         sched.mark_done.assert_awaited_once()
         sched.set_task_status.assert_not_called()
 
-    async def test_kill_switch_is_forwarded_not_short_circuited(
+    async def test_kill_switch_short_circuits_before_the_metadata_read(
         self, closure: str, tmp_path: Path,
     ) -> None:
+        """Retargeted by the task 3057 review.
+
+        This test previously pinned the OPPOSITE contract — that the seam
+        forwards `enabled` to the shared gate and short-circuits nowhere
+        locally. That is right for the eight seams whose metadata is already
+        in scope, but WRONG here: this seam must read another task's row
+        FIRST, and that read's fail-safe arms withhold without ever reaching
+        the gate. Forwarding alone therefore left the kill switch unable to
+        disarm the seam (see
+        `test_kill_switch_disarms_the_metadata_pre_read` for the failure it
+        allowed). The correct contract at the three pre-read seams is a local
+        short-circuit on the SAME config leaf, so one hot reload still
+        disarms everything at once.
+        """
         from orchestrator.harness import build_train_callback_factory
 
         sched = _tc_scheduler()
@@ -887,8 +901,10 @@ class TestTrainCallbacksDeliveredChecksGuard:
                 patch('orchestrator.harness.MergeProvenance'):
             await _tc_drive(cbs, closure)
 
-        assert guard.await_args is not None
-        assert guard.await_args.kwargs['enabled'] is False
+        guard.assert_not_awaited()
+        sched.get_task.assert_not_called()
+        sched.mark_done.assert_awaited_once()
+        sched.set_task_status.assert_not_called()
 
     # --- plumbing: ONE metadata read, live config forwarded ---------------
 
@@ -1026,6 +1042,132 @@ class TestTrainCallbacksDeliveredChecksGuard:
         guard.assert_not_awaited()
         sched.get_task.assert_not_called()
         sched.mark_done.assert_not_called()
+
+    # --- kill switch disarms the PRE-READ, not just the decision ----------
+
+    @pytest.mark.parametrize('mode', ['none', 'raises'])
+    async def test_kill_switch_disarms_the_metadata_pre_read(
+        self, closure: str, mode: str, tmp_path: Path,
+    ) -> None:
+        """`enabled=False` must reproduce pre-3057 behaviour EXACTLY.
+
+        This seam reads ANOTHER task's row before reaching the shared
+        decision, and that read's fail-safe arms synthesise a block without
+        ever calling the gate. Forwarding `enabled` therefore cannot disarm
+        them: with the fleet-wide switch off, a transient scheduler failure
+        would still withhold the flip AND revert the member to pending — a
+        guard that is supposedly off changing behaviour. The kill switch must
+        short-circuit BEFORE the read.
+        """
+        from orchestrator.harness import build_train_callback_factory
+
+        get_task = (
+            AsyncMock(return_value=None) if mode == 'none'
+            else AsyncMock(side_effect=RuntimeError('scheduler down'))
+        )
+        sched = _tc_scheduler(get_task=get_task)
+        git_ops = MagicMock()
+        git_ops.release_lane_for_terminal_task = AsyncMock()
+        guard = AsyncMock(return_value=None)
+        cbs = build_train_callback_factory(
+            sched, git_ops, _tc_config(enabled=False, tmp_path=tmp_path),
+        )(_TC_TRAIN)
+
+        with patch(_TC_GATE_TARGET, guard), \
+                patch('orchestrator.harness.MergeProvenance') as prov:
+            await _tc_drive(cbs, closure)
+
+        # Not read at all — the short-circuit precedes the round-trip.
+        sched.get_task.assert_not_called()
+        guard.assert_not_awaited()
+        # Pre-3057 behaviour: stamped, row consumed, NOT reverted.
+        sched.mark_done.assert_awaited_once()
+        prov.consume.assert_called_once_with('7001')
+        sched.set_task_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+class TestWithheldRedriveRespectsTheLiveStatusRace:
+    """The withhold revert must not clobber a member a live workflow owns.
+
+    `redrive_member`'s not-on-main arm already re-checks the probed status
+    before flipping to 'pending', because a member that raced to 'in-progress'
+    has a live TaskWorkflow holding its worktree. The found_on_main withhold
+    path performs the IDENTICAL write and must inherit that guard — unlike
+    `mark_done`, which is terminal, a pending flip opens a concurrent-dispatch
+    window.
+    """
+
+    @pytest.mark.parametrize('live_status', ['in-progress', 'done'])
+    async def test_withhold_skips_the_revert_when_member_moved_on(
+        self, live_status: str, tmp_path: Path,
+    ) -> None:
+        from orchestrator.harness import build_train_callback_factory
+
+        sched = _tc_scheduler()
+        sched.get_statuses = AsyncMock(return_value=({'7001': live_status}, None))
+        git_ops = MagicMock()
+        git_ops.release_lane_for_terminal_task = AsyncMock()
+        cbs = build_train_callback_factory(
+            sched, git_ops, _tc_config(tmp_path=tmp_path),
+        )(_TC_TRAIN)
+
+        with patch(_TC_GATE_TARGET, AsyncMock(return_value=_tc_block('failed'))), \
+                patch('orchestrator.harness.MergeProvenance'):
+            assert cbs.redrive_member is not None
+            await cbs.redrive_member('7001', True, 'deadbeefcafe')
+
+        # Withheld (no stamp) AND not clobbered (no pending flip).
+        sched.mark_done.assert_not_called()
+        sched.set_task_status.assert_not_called()
+
+    async def test_withhold_still_reverts_a_member_still_merge_deferred(
+        self, tmp_path: Path,
+    ) -> None:
+        """The guard must not swallow the recovery edge in the normal case."""
+        from orchestrator.harness import build_train_callback_factory
+
+        sched = _tc_scheduler()
+        git_ops = MagicMock()
+        git_ops.release_lane_for_terminal_task = AsyncMock()
+        cbs = build_train_callback_factory(
+            sched, git_ops, _tc_config(tmp_path=tmp_path),
+        )(_TC_TRAIN)
+
+        with patch(_TC_GATE_TARGET, AsyncMock(return_value=_tc_block('failed'))), \
+                patch('orchestrator.harness.MergeProvenance'):
+            assert cbs.redrive_member is not None
+            await cbs.redrive_member('7001', True, 'deadbeefcafe')
+
+        sched.mark_done.assert_not_called()
+        sched.set_task_status.assert_awaited_once_with('7001', 'pending')
+
+    async def test_untrustworthy_probe_falls_open_to_the_revert(
+        self, tmp_path: Path,
+    ) -> None:
+        """A get_statuses error must not cost the member its only recovery edge.
+
+        Mirrors the fail-open policy the not-on-main arm already applies: an
+        unreadable probe means we cannot prove a live workflow owns the member,
+        and a member left at 'merge-deferred' is a permanent wedge.
+        """
+        from orchestrator.harness import build_train_callback_factory
+
+        sched = _tc_scheduler()
+        sched.get_statuses = AsyncMock(return_value=({'7001': 'in-progress'}, 'backend down'))
+        git_ops = MagicMock()
+        git_ops.release_lane_for_terminal_task = AsyncMock()
+        cbs = build_train_callback_factory(
+            sched, git_ops, _tc_config(tmp_path=tmp_path),
+        )(_TC_TRAIN)
+
+        with patch(_TC_GATE_TARGET, AsyncMock(return_value=_tc_block('failed'))), \
+                patch('orchestrator.harness.MergeProvenance'):
+            assert cbs.redrive_member is not None
+            await cbs.redrive_member('7001', True, 'deadbeefcafe')
+
+        sched.mark_done.assert_not_called()
+        sched.set_task_status.assert_awaited_once_with('7001', 'pending')
 
 
 @pytest.mark.asyncio
