@@ -765,6 +765,32 @@ class RestartPlan:
         on_active_secs = max(int(self.on_active_secs), 5)
         payload = ' '.join(shlex.quote(p) for p in [str(self.script), *self.args])
         if self.on_failure_escalation is not None:
+            # Registration-time canary. The deferred on-failure branch cannot
+            # report its own import failure: the wrapper's trailing
+            # `exit "$__rc"` returns the PAYLOAD's code, so a submit that dies
+            # on ImportError at fire time leaves the transient unit's exit
+            # status unchanged and files NO L2 — invisible except in journald.
+            # This process runs the same interpreter the child will, so it can
+            # prove the invariant here for free (find_spec on an
+            # already-imported package is a dict lookup, and this branch runs
+            # at most once per scheduled restart) and say so while a human is
+            # still watching the deploy.
+            try:
+                submit_spec = importlib.util.find_spec('escalation.submit')
+            except (ImportError, AttributeError, ValueError) as exc:
+                submit_spec = None
+                probe_detail = f'{type(exc).__name__}: {exc}'
+            else:
+                probe_detail = 'find_spec returned None'
+            if submit_spec is None:
+                logger.warning(
+                    'proc_supervision: `escalation.submit` is NOT importable '
+                    'from %s (%s) — the deferred /bin/sh -c on-failure branch '
+                    'for %s will exit non-zero at fire time and file NO L2 '
+                    'escalation; the wrapper returns the payload rc, so that '
+                    'loss is invisible in the transient unit exit status',
+                    sys.executable, probe_detail, self.transient_unit,
+                )
             on_failure_argv = self.on_failure_escalation.to_submit_argv(sys.executable)
             on_failure = ' '.join(shlex.quote(p) for p in on_failure_argv)
             # Byte-for-byte reuse of deterministic_runner.py:439-445's wrapper
