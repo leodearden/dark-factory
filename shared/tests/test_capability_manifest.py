@@ -17,6 +17,7 @@ convention (see plans/capability-delivered-checks-prd.md §Contract):
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -481,6 +482,27 @@ class TestManifestCorpusDiscovery:
         assert paths != []
 
     def test_returns_none_for_a_non_checkout_directory(self, tmp_path):
+        assert discover_manifests(tmp_path) is None
+
+    def test_returns_none_when_git_binary_is_missing(self, tmp_path, monkeypatch):
+        # subprocess.run raises OSError (FileNotFoundError, not a non-zero
+        # exit) when the git binary itself can't be found. _MANIFEST_PATHS =
+        # discover_manifests() or [] runs at *module import time* below, so
+        # an uncaught exception here would take down collection of this
+        # entire test module, not just the corpus-guard classes.
+        def _raise(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+            raise FileNotFoundError('git')
+
+        monkeypatch.setattr(subprocess, 'run', _raise)
+        assert discover_manifests(tmp_path) is None
+
+    def test_returns_none_when_git_invocation_times_out(self, tmp_path, monkeypatch):
+        # A wedged git (e.g. index.lock contention) must fail fast via the
+        # explicit timeout=, not hang the test run indefinitely.
+        def _raise(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+            raise subprocess.TimeoutExpired(cmd='git', timeout=30)
+
+        monkeypatch.setattr(subprocess, 'run', _raise)
         assert discover_manifests(tmp_path) is None
 
     def test_every_path_ends_with_the_manifest_suffix_and_exists(self):

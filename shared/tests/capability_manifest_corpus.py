@@ -53,14 +53,26 @@ def discover_manifests(repo_root: Path = REPO_ROOT) -> list[Path] | None:
     Uses ``git ls-files`` rather than ``Path.rglob`` — see module docstring
     for why. Returns ``None`` when *repo_root* is not a git checkout
     (``git ls-files`` exits non-zero), mirroring
-    ``test_lock_charter_guard.py``'s ``_tracked_paths()``. Otherwise returns a
-    sorted, duplicate-free list of absolute paths.
+    ``test_lock_charter_guard.py``'s ``_tracked_paths()``. Also returns
+    ``None`` when the ``git`` invocation itself can't complete — binary
+    missing/unrunnable (``OSError``, e.g. ``FileNotFoundError`` on an odd
+    ``PATH``) or wedged past a 30s timeout (``subprocess.TimeoutExpired``,
+    e.g. ``index.lock`` contention) — rather than letting either escape:
+    ``test_capability_manifest.py`` calls this at *module import time*
+    (``_MANIFEST_PATHS = discover_manifests() or []``), so an uncaught
+    exception here would take down collection of the entire test module,
+    not just the corpus-guard classes. Otherwise returns a sorted,
+    duplicate-free list of absolute paths.
     """
-    result = subprocess.run(
-        ['git', '-C', str(repo_root), 'ls-files', '-z', '--', f'*{MANIFEST_SUFFIX}'],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            ['git', '-C', str(repo_root), 'ls-files', '-z', '--', f'*{MANIFEST_SUFFIX}'],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
     if result.returncode != 0:
         return None
     rel_paths = sorted({p for p in result.stdout.split('\0') if p})
