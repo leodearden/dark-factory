@@ -123,6 +123,7 @@ class TestComputeWriteSetHappyPath:
     def test_home_derived_static_paths(self, worktree: Path, tmp_home: Path):
         ws = compute_write_set(worktree, home=tmp_home)
         assert ws.uv_cache == (tmp_home / '.cache' / 'uv').resolve()
+        assert ws.tree_sitter_cache == (tmp_home / '.cache' / 'tree-sitter').resolve()
         assert ws.claude_fleet == (tmp_home / '.claude' / 'fleet').resolve()
         assert ws.tmp == Path('/tmp')
         assert ws.dev == Path('/dev')
@@ -138,7 +139,7 @@ class TestComputeWriteSetHappyPath:
         assert tmp_home.resolve() / '.claude' not in paths
         assert (tmp_home.resolve() / '.claude' / 'hooks' / 'state') not in paths
 
-    def test_writable_paths_returns_exactly_the_ten_named_fields_in_order(
+    def test_writable_paths_returns_exactly_the_eleven_named_fields_in_order(
         self, worktree: Path, tmp_home: Path,
     ):
         ws = compute_write_set(worktree, home=tmp_home)
@@ -150,17 +151,19 @@ class TestComputeWriteSetHappyPath:
             ws.git_task_reflogs,
             ws.git_worktree_admin,
             ws.uv_cache,
+            ws.tree_sitter_cache,
             ws.claude_fleet,
             ws.tmp,
             ws.dev,
         ]
         paths = ws.writable_paths()
         assert paths == expected
-        assert len(paths) == 10
+        assert len(paths) == 11
 
     def test_purity_no_makedirs_side_effect(self, worktree: Path, tmp_home: Path):
         ws = compute_write_set(worktree, home=tmp_home)
         assert not ws.uv_cache.exists()
+        assert not ws.tree_sitter_cache.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +291,7 @@ def _make_write_set(**overrides: Path) -> WriteSet:
         git_task_reflogs=Path('/main/.git/logs/refs/heads/task'),
         git_worktree_admin=Path('/main/.git/worktrees/wt'),
         uv_cache=Path('/home/.cache/uv'),
+        tree_sitter_cache=Path('/home/.cache/tree-sitter'),
         claude_fleet=Path('/home/.claude/fleet'),
         tmp=Path('/tmp'),
         dev=Path('/dev'),
