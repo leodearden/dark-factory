@@ -2001,6 +2001,21 @@ class TaskWorkflow:
                 'Internal: SUCCESS without merge_sha — provenance unconstructable',
                 escalate_to_human=True,
             )
+        # task 3057: this stamp is DELIBERATELY NOT routed through
+        # `gate_mark_done_on_delivered_checks`, unlike the eleven
+        # attribution-shaped seams in this module, harness.py and
+        # merge_queue.py.  It is not attribution-shaped: the workflow just
+        # performed the merge itself and holds its own `self._merge_sha`, so
+        # there is no INFERENCE here that could be wrong (no git-ancestry
+        # guess, no journal row, no architect claim, no sibling's train
+        # landing credited to this task).  Guarding it would gate EVERY
+        # task's normal completion on `delivered_checks`, converting an
+        # attribution guard into a fleet-wide merge-blocking quality gate —
+        # a far larger behavioural change than task 3057 authorises.  See
+        # task 3057 design decision 2; a follow-up task candidate
+        # (suggestion_hash `3057-workflow-post-merge-success-stamp`) holds
+        # that decision open so a human makes it deliberately rather than by
+        # omission.
         try:
             await self.scheduler.mark_done(
                 self.task_id, kind='merged', sha=self._merge_sha,
