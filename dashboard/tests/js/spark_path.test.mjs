@@ -82,6 +82,14 @@ function xs(d) {
   return coords(d).map(([x]) => x);
 }
 
+// Distinct plotted positions. A run of one sample is emitted as a zero-length
+// segment (`M x,y L x,y`), so counting raw coordinate TOKENS double-counts
+// every isolated dot; the meaningful quantity is how many distinct places the
+// chart actually marks.
+function distinctCoords(d) {
+  return [...new Set(coords(d).map(([x, y]) => `${x},${y}`))].map(k => k.split(',').map(Number));
+}
+
 function ys(d) {
   return coords(d).map(([, y]) => y);
 }
@@ -378,18 +386,29 @@ test('sparkPaths: a null is never plotted as a zero-value point', () => {
   for (const y of ys(line)) {
     assert.notEqual(y, baselineY, `a hole was drawn at the value-0 baseline: ${line}`);
   }
-  assert.equal(coords(line).length, 2, 'only the two real samples are plotted');
+  assert.equal(distinctCoords(line).length, 2, 'only the two real samples are plotted');
+
+  // Each surviving sample is isolated (flanked by the hole and the series
+  // edge), so this series is TWO dots with no connecting line — not one line
+  // hopping over the gap. Drawing a segment from x=0 to x=100 here would
+  // interpolate straight across a slot that holds no measurement, which is the
+  // same fabrication as plotting the hole itself.
+  assert.equal(countCommand(line, 'M'), 2, 'two isolated samples, two subpaths');
+  assert.deepEqual(distinctCoords(line).map(([x]) => x), [0, 100]);
 });
 
 test('sparkPaths: with a negative minimum the fabricated point would land mid-chart', () => {
   // Same defect, different disguise: here min is -4, so the pre-fix null
   // coerced to 0 plotted MID-chart rather than at the floor — a hole rendering
   // as a plausible-looking real measurement.
-  const { line } = sparkPaths([-4, null, -2], 100, 28);
+  const values = [-4, null, -2];
+  assert.equal(sparkScale(values, 100, 28).min, -4, 'sanity: the floor is well below zero here');
 
-  assert.equal(coords(line).length, 2, 'only the two real samples are plotted');
+  const { line } = sparkPaths(values, 100, 28);
+
+  assert.equal(distinctCoords(line).length, 2, 'only the two real samples are plotted');
   assert.ok(!xs(line).includes(50), `nothing may be drawn at the hole's x — got ${line}`);
-  assert.deepEqual(xs(line), [0, 100]);
+  assert.deepEqual(distinctCoords(line).map(([x]) => x), [0, 100]);
 });
 
 test('sparkPaths: undefined and NaN holes behave exactly like null', () => {

@@ -97,12 +97,85 @@ function sparkScale(values, width, height) {
   return { min, max, range, stepX, points };
 }
 
+// ── Split scaled points into maximal runs of consecutive real samples ──────
+// Each run is the contiguous stretch between holes, and becomes its own SVG
+// subpath. This is what makes the line genuinely DISCONTINUOUS across a hole
+// rather than drawn straight through it. Module-private: the exported surface
+// is deliberately just the four public functions.
+function plottableRuns(points) {
+  const runs = [];
+  let current = null;
+
+  for (const point of points) {
+    if (point === null) {
+      current = null;
+      continue;
+    }
+    if (current === null) {
+      current = [];
+      runs.push(current);
+    }
+    current.push(point);
+  }
+
+  return runs;
+}
+
+// ── Close one run of line commands into a filled area subpath ──────────────
+// Drops to the baseline under the run's own last x, tracks back to its own
+// first x, and closes. A run of one point contributes NO area: a zero-width
+// sliver is meaningless, and the pre-fix single-point behaviour (a full-width
+// triangle) was itself fabricated.
+//
+// For a hole-free full-width run, x_last is exactly `width` and x_first is
+// exactly 0, so this reproduces the pre-fix
+// `${linePath} L${width},${height} L0,${height} Z` close character-for-
+// character. The per-subpath form is a strict generalisation, not a restyle —
+// spark_path.test.mjs pins that by exact string equality.
+function closeRunArea(run, lineCommands, height) {
+  if (run.length < 2) return null;
+  const firstX = run[0][0];
+  const lastX = run[run.length - 1][0];
+  return `${lineCommands} L${lastX},${height} L${firstX},${height} Z`;
+}
+
+// ── Smooth sparkline path builder (charts.jsx's `Sparkline`) ───────────────
+// Returns { line, area }, each a space-joined set of subpaths — one per run of
+// consecutive real samples. No plottable samples at all yields
+// `{ line: '', area: '' }` rather than throwing, so the decline-to-render
+// decision stays at the call site, where the component can skip the <svg>
+// entirely instead of drawing a synthetic floor-hugging line.
+function sparkPaths(values, width, height) {
+  const { points } = sparkScale(values, width, height);
+  const lines = [];
+  const areas = [];
+
+  for (const run of plottableRuns(points)) {
+    // A run of one emits a zero-length segment (`M x,y L x,y`) rather than a
+    // bare moveto, which renders NOTHING in SVG — the same trap charts.jsx
+    // already special-cased for a single data point. Under Sparkline's
+    // existing strokeLinecap="round" this shows as a visible dot at the
+    // sample's own x, with no synthetic extension into a neighbouring slot
+    // that holds no measurement.
+    const drawn = run.length === 1 ? [run[0], run[0]] : run;
+    const lineCommands = drawn
+      .map((p, i) => (i === 0 ? `M${p[0]},${p[1]}` : `L${p[0]},${p[1]}`))
+      .join(' ');
+
+    lines.push(lineCommands);
+    const areaCommands = closeRunArea(run, lineCommands, height);
+    if (areaCommands !== null) areas.push(areaCommands);
+  }
+
+  return { line: lines.join(' '), area: areas.join(' ') };
+}
+
 // Module-unique export const, never a bare `API` — see the
 // shared-classic-script-scope note in graph_layout.js's header, enforced by
 // dashboard/tests/js/classic_script_scope.test.mjs. A collision here would
 // leave window.DF_SPARK_PATH undefined and break charts.jsx's top-level
 // destructure of it, blanking nearly every tab.
-const SPARK_PATH_API = { isPlottable, sparkScale };
+const SPARK_PATH_API = { isPlottable, sparkScale, sparkPaths };
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = SPARK_PATH_API;
