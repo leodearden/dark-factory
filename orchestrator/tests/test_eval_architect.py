@@ -313,6 +313,11 @@ class TestDetectInvocationError:
         # The marker quotes the REASON, so a human reading the result JSON sees
         # the forensic evidence, not just a boolean.
         assert 'session limit' in marker
+        # A bodied 429 is a cap hit, never the new 5xx bucket — regression pin
+        # for the server_error tier, folded in here rather than as a parallel
+        # test (reviewer: duplication).
+        assert marker.partition(':')[0] == 'cap_hit'
+        assert 'server_error' not in marker
 
     def test_body_less_429_yields_marker_via_structured_fallback(self):
         # 429 is deliberately EXCLUDED from AuthFailed (it routes to the cap-text
@@ -329,6 +334,12 @@ class TestDetectInvocationError:
         marker = detect_invocation_error(bare)
         assert isinstance(marker, str) and marker
         assert '429' in marker
+        # 429 sits below the 5xx band, so a body-less 429 must keep reaching
+        # this raw-status fallback rather than drifting into the server_error
+        # bucket a bodied 5xx gets — folded in here rather than as a parallel
+        # test (reviewer: duplication).
+        assert marker.partition(':')[0] == 'api_error'
+        assert 'server_error' not in marker
 
     def test_auth_failure_yields_auth_marker(self):
         from shared.cli_invoke import AgentResult
@@ -465,32 +476,6 @@ class TestDetectInvocationError:
         assert marker.partition(':')[0] == 'server_error'
         assert str(status) in marker
 
-    def test_bodied_429_is_still_a_cap_hit_not_a_server_error(self):
-        from orchestrator.evals.metrics import detect_invocation_error
-
-        marker = detect_invocation_error(_cap_agent_result())
-        assert marker is not None
-        assert marker.partition(':')[0] == 'cap_hit'
-        assert 'server_error' not in marker
-
-    def test_body_less_429_is_still_api_error_not_a_server_error(self):
-        # 429 is below the 5xx band, so it must keep reaching the cap tier /
-        # raw-429 fallback (metrics.py:328-329) unchanged, never drifting into
-        # the new server_error bucket.
-        from shared.cli_invoke import AgentResult
-
-        from orchestrator.evals.metrics import detect_invocation_error
-
-        bare = AgentResult(
-            success=False, output='', cost_usd=0.0, duration_ms=800,
-            turns=0, api_error_status=429,
-        )
-        marker = detect_invocation_error(bare)
-        assert marker is not None
-        assert marker.partition(':')[0] == 'api_error'
-        assert '429' in marker
-        assert 'server_error' not in marker
-
     # -- timed-out-but-actually-5xx: the shape 3314 regressed to None -------
 
     def test_timed_out_flushed_5xx_is_attributed_as_a_server_error_not_dropped(self):
@@ -526,21 +511,27 @@ class TestDetectInvocationError:
         assert marker.partition(':')[0] == 'wedge'
         assert 'server_error' not in marker
 
-    def test_near_cap_is_still_not_an_invocation_error_after_the_5xx_arm(self):
-        # NearCap is deliberately unattributed (a warning that did not refuse
-        # this invocation). Pinned again here because the task description
-        # wrongly lists it as attributed, and a future reader must not "fix"
-        # it into a marker.
+    def test_near_cap_warning_outranks_the_server_error_tier(self):
+        # classify_invocation ranks NearCap ABOVE ServerError (invocation_
+        # outcome.py:502-505 vs :523): a real 5xx whose body ALSO carries a
+        # near-cap warning classifies NearCap, not ServerError, so this must
+        # still return None — deliberately, not a gap. This is the genuinely
+        # interesting boundary the 5xx arm introduced (reviewer:
+        # test-coverage): a provider-refused invocation (api_error_status=529)
+        # whose body happens to warn of an imminent cap is scored on content,
+        # not excluded as infra, because the near-cap text is the more
+        # specific, actionable signal.
         from shared.cli_invoke import AgentResult
 
         from orchestrator.evals.metrics import detect_invocation_error
 
-        near = AgentResult(
+        near_with_5xx = AgentResult(
             success=False,
             output="You're close to your usage limit for this session",
             cost_usd=0.9, duration_ms=30_000, turns=6,
+            api_error_status=529,
         )
-        assert detect_invocation_error(near) is None
+        assert detect_invocation_error(near_with_5xx) is None
 
 
 # ---------------------------------------------------------------------------
@@ -1943,10 +1934,19 @@ class TestPlanQualityReport:
                 task_id='t3', config_name='b',
                 invocation_error='architect:model_not_found: no such model',
             ),
+            # An end-to-end pin (reviewer: test-coverage) that a server_error
+            # marker survives the FULL report pipeline — not just
+            # detect_invocation_error's unit-level token — and lands in its
+            # own cap_excluded_by_cause bucket rather than being folded into
+            # 'unknown' by a marker-shape change.
+            _cap_tainted_result(
+                task_id='t4', config_name='b',
+                invocation_error='architect:server_error: HTTP 529',
+            ),
         ])
-        assert report['cap_excluded'] == 3
+        assert report['cap_excluded'] == 4
         assert report['cap_excluded_by_cause'] == {
-            'cap_hit': 2, 'model_not_found': 1,
+            'cap_hit': 2, 'model_not_found': 1, 'server_error': 1,
         }
         # Key-sorted, so the dict renders byte-deterministically.
         causes = list(report['cap_excluded_by_cause'])
