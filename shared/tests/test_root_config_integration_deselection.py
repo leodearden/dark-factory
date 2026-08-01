@@ -33,6 +33,7 @@ Sibling guards for the same one bug class:
 
 from __future__ import annotations
 
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -43,21 +44,33 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 ROOT_PYPROJECT = REPO_ROOT / 'pyproject.toml'
 TARGET_MODULE = REPO_ROOT / 'shared' / 'tests' / 'test_cli_invoke_integration.py'
 
-# Must stay in sync with the function names in test_cli_invoke_integration.py --
-# a rename there without a matching rename here turns this guard into a silent
-# no-op (the collect-only output just won't contain the old name either way)
-# rather than an obvious reference error.
+# ALL FIVE integration-marked live-CLI tests in the target module: the three of
+# TestCrossAccountResume and the two of TestConfigDirCredentials. Each invokes
+# the real Claude CLI against a real OAuth account.
 #
-# The three live-CLI tests of TestCrossAccountResume: each invokes the real
-# Claude CLI against a real OAuth account.
+# Must stay in sync with the function names in test_cli_invoke_integration.py.
+# A rename there would otherwise turn assertion (a) into a silent no-op -- the
+# collect-only output just won't contain the old name either way -- rather than
+# an obvious reference error. Assertion (d) is what makes that drift LOUD: it
+# re-selects with `-m integration` and requires EVERY name here to be collected,
+# so a stale entry fails there instead of passing vacuously here.
 LIVE_TEST_NAMES = (
     'test_invoke_returns_session_id',
     'test_session_resume_same_account_baseline',
     'test_session_resume_preserves_context_across_accounts',
+    'test_env_var_auth_succeeds',
+    'test_config_dir_plus_env_var_auth_succeeds',
 )
 # A TestLooksLikeCapacityFailure unit test: NOT integration-marked, pure
 # in-process assertions, and it must KEEP running in ordinary CI.
 UNIT_TEST_NAME = 'test_capacity_output_returns_true'
+
+# The only exit codes a `--collect-only` run legitimately produces: 0 (OK) and
+# 5 (NO_TESTS_COLLECTED -- e.g. everything deselected). Anything else means the
+# subprocess never collected at all: 4 is a USAGE_ERROR (a bad `-c` binding),
+# 3 an INTERNAL_ERROR (a root-conftest ImportError). Without this check every
+# "was NOT collected" assertion below would pass VACUOUSLY on a broken config.
+_OK_COLLECT_EXIT_CODES = frozenset({0, 5})
 
 
 def _collect(*extra_args: str) -> str:
@@ -67,26 +80,49 @@ def _collect(*extra_args: str) -> str:
     no xdist addopts, so adding one would be a behaviour the real root-bound
     runs this guards do not have.
     """
+    argv = [
+        sys.executable,
+        '-m',
+        'pytest',
+        '-c',
+        str(ROOT_PYPROJECT),
+        str(TARGET_MODULE),
+        '--collect-only',
+        '-q',
+        '-p',
+        'no:cacheprovider',
+        *extra_args,
+    ]
     result = subprocess.run(
-        [
-            sys.executable,
-            '-m',
-            'pytest',
-            '-c',
-            str(ROOT_PYPROJECT),
-            str(TARGET_MODULE),
-            '--collect-only',
-            '-q',
-            '-p',
-            'no:cacheprovider',
-            *extra_args,
-        ],
+        argv,
         cwd=str(REPO_ROOT),
         capture_output=True,
         text=True,
         timeout=120,
     )
-    return result.stdout + result.stderr
+    combined = result.stdout + result.stderr
+
+    assert result.returncode in _OK_COLLECT_EXIT_CODES, (
+        f'the root-bound `pytest --collect-only` subprocess exited '
+        f'{result.returncode}; expected 0 (OK) or 5 (no tests collected). It never '
+        f'collected anything, so the assertions in this file would pass vacuously '
+        f'on a config that is in fact broken -- most likely a usage error in the '
+        f'`-c {ROOT_PYPROJECT.name}` binding or an import error in the root '
+        f'conftest, NOT the marker gating this guard is about.\n'
+        f'argv: {shlex.join(argv)}\nOutput:\n{combined}'
+    )
+    return combined
+
+
+@pytest.fixture(scope='module')
+def default_collect() -> str:
+    """One cached DEFAULT (no extra args) root-bound collect, shared by (a)/(b)/(c).
+
+    Those three assert against a byte-identical run, and each `_collect()` spawns
+    a full pytest whose root-conftest import reaches across all seven
+    subprojects. Module scope pays that once instead of three times.
+    """
+    return _collect()
 
 
 # shared/pyproject.toml caps tests at 60s (signal method). A warm collect is
@@ -103,9 +139,9 @@ class TestRootConfigIntegrationDeselection:
     cockpit/tests/test_root_config_smoke_deselection.py:50-53.)
     """
 
-    def test_live_cli_tests_deselected_under_root_config(self) -> None:
+    def test_live_cli_tests_deselected_under_root_config(self, default_collect: str) -> None:
         """(a) The live-CLI tests must NOT be collected by a default root-bound run."""
-        combined = _collect()
+        combined = default_collect
 
         for name in LIVE_TEST_NAMES:
             assert name not in combined, (
@@ -122,7 +158,9 @@ class TestRootConfigIntegrationDeselection:
                 f'Output:\n{combined}'
             )
 
-    def test_non_integration_unit_tests_still_collected_under_root_config(self) -> None:
+    def test_non_integration_unit_tests_still_collected_under_root_config(
+        self, default_collect: str
+    ) -> None:
         """(b) Guard the other side: the deselect must not be over-broad.
 
         TestLooksLikeCapacityFailure carries no `integration` marker and is
@@ -130,7 +168,7 @@ class TestRootConfigIntegrationDeselection:
         every "not collected" assertion above pass while silently deleting
         real coverage from CI.
         """
-        combined = _collect()
+        combined = default_collect
 
         assert UNIT_TEST_NAME in combined, (
             f'{UNIT_TEST_NAME} was NOT collected under the root pytest config. It '
@@ -139,9 +177,9 @@ class TestRootConfigIntegrationDeselection:
             f'coverage.\nOutput:\n{combined}'
         )
 
-    def test_integration_marker_registered_under_root_config(self) -> None:
+    def test_integration_marker_registered_under_root_config(self, default_collect: str) -> None:
         """(c) The marker must be REGISTERED at root, not merely filtered."""
-        combined = _collect()
+        combined = default_collect
 
         assert 'PytestUnknownMarkWarning' not in combined, (
             f'the `integration` marker is not registered under the root pytest '
@@ -161,12 +199,25 @@ class TestRootConfigIntegrationDeselection:
         deliberate opt-in lane stays intact. This asserts the fix gates the
         cross-account invariant behind an explicit flag rather than weakening,
         skipping, or deleting the assertion.
+
+        Checks EVERY name in LIVE_TEST_NAMES, not just one: this is also the
+        anti-drift half of assertion (a). A rename (or deletion) in
+        test_cli_invoke_integration.py makes (a) pass vacuously -- the old name
+        is absent from the collect output either way -- and fails LOUDLY here.
         """
         combined = _collect('-m', 'integration')
 
-        assert 'test_session_resume_preserves_context_across_accounts' in combined, (
-            f'expected the cross-account resume test to be collected under '
-            f'-m integration -- it must remain selectable as an explicit opt-in '
-            f'(it guards a real production path: shared/src/shared/cli_invoke.py '
-            f'resumes a capped session on the NEXT account).\nOutput:\n{combined}'
+        missing = [name for name in LIVE_TEST_NAMES if name not in combined]
+        assert not missing, (
+            f'these integration-marked tests were NOT collected under '
+            f'-m integration: {", ".join(missing)}.\n'
+            f'Either (1) they were renamed/removed in {TARGET_MODULE.name} and '
+            f'LIVE_TEST_NAMES in this file is now stale -- which would ALSO make the '
+            f'"deselected by default" assertion above pass vacuously, so fix the list '
+            f'rather than this test -- or (2) they lost their @pytest.mark.integration '
+            f'and are now running live on every ordinary run.\n'
+            f'They must remain selectable as an explicit opt-in: '
+            f'test_session_resume_preserves_context_across_accounts guards a real '
+            f'production path (shared/src/shared/cli_invoke.py resumes a capped '
+            f'session on the NEXT account).\nOutput:\n{combined}'
         )
