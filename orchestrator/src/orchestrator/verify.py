@@ -60,6 +60,7 @@ from orchestrator.verify_cmd import (
     reproject,
     scope_to,
     serial_pytest,
+    split_and_chain_segments,
     split_chain_tail,
     strip_cwd,
     with_junitxml,
@@ -4361,8 +4362,20 @@ async def run_verification(
     task_id: str | None = None,
     archive_root: Path | None = None,
     role: Literal['merge', 'task', 'background'] = 'task',
+    segment_chained_test: bool = False,
 ) -> VerifyResult:
     """Run test suite, linter, and type checker. Return structured result.
+
+    *segment_chained_test* (task 3338 / esc-3062-2) opts the TEST leg into
+    per-segment execution: when the configured command is an `&&` chain
+    ``split_and_chain_segments`` accepts, every clause is run separately so
+    an unrelated earlier subproject's red can no longer make the SHELL skip
+    the clause a task's OWN assigned files live in. Default OFF, and passed
+    True from exactly one call site (``run_scoped_verification``'s fallback
+    branch): segmenting every chain would silently change the global tail,
+    the cargo-scoped path, ``merge_queue._run_unscoped_typechecks`` and
+    every module_configs run. When the segmenter REFUSES, this is a no-op
+    and the chain runs exactly as it does today.
 
     When *module_config* is provided, a ``None`` command means "skip that check"
     (the subproject doesn't define it).  When *module_config* is ``None``,
@@ -4603,15 +4616,69 @@ async def run_verification(
                 if config.verify_clock_stop_enabled
                 else {}
             )
-            rc, out, timed_out_flag = await _run_cmd(
-                cmd,
-                worktree,
-                timeout,
-                env=verify_env or None,
-                log_path=_stream_log_path(label, current_attempt),
-                **_scope_kw,
-                **_clock_kw,
+            # Segmented test leg (task 3338 / esc-3062-2). Segment from
+            # `config_cmd` — the pre-junitxml, pre-governance capture — so
+            # `_with_junitxml_str`'s suppressed-injection INFO log (task 3218)
+            # still fires on the WHOLE chain exactly as today. The admission
+            # slot is already held ONCE around this whole block, so
+            # slot-counting semantics are unchanged no matter how many
+            # segments run.
+            chain_segments = (
+                split_and_chain_segments(config_cmd)
+                if segment_chained_test and label == 'test'
+                else None
             )
+            if chain_segments is not None:
+                async def _run_one_segment(
+                    segment_cmd: str,
+                    segment_cwd: Path,
+                    segment_timeout: float,
+                    segment_label: str,
+                ) -> tuple[int, str, bool]:
+                    # cpu-governance and the nice prefix are per-segment: each
+                    # segment is its own subprocess, so each needs its own wrap.
+                    governed = _govern_cpu_str(
+                        segment_cmd, _resolve_governed_exec_path(config, worktree, role),
+                    )
+                    assert governed is not None  # None only for a None input
+                    if admission:
+                        seg_prefix = _resolve_nice_prefix(config, role)
+                        if seg_prefix:
+                            governed = (
+                                f'{shlex.join(seg_prefix)} /bin/bash -c {shlex.quote(governed)}'
+                            )
+                    return await _run_cmd(
+                        governed,
+                        segment_cwd,
+                        segment_timeout,
+                        env=verify_env or None,
+                        log_path=_stream_log_path(
+                            f'{label}.{segment_label}', current_attempt,
+                        ),
+                        **_scope_kw,
+                        **_clock_kw,
+                    )
+
+                rc, out, timed_out_flag, segment_dicts = await _run_segmented(
+                    chain_segments,
+                    run_one=_run_one_segment,
+                    worktree=worktree,
+                    # The single value run_verification already resolved via
+                    # _resolve_verify_timeout governs the WHOLE segmented run,
+                    # preserving today's total wall-clock contract exactly.
+                    budget_secs=timeout,
+                )
+            else:
+                segment_dicts = None
+                rc, out, timed_out_flag = await _run_cmd(
+                    cmd,
+                    worktree,
+                    timeout,
+                    env=verify_env or None,
+                    log_path=_stream_log_path(label, current_attempt),
+                    **_scope_kw,
+                    **_clock_kw,
+                )
         # Mis-resolved interpreter (task 3367 / esc-3359-1): make the condition
         # LEGIBLE at the point it is observed. Classification alone routes the
         # merge lane correctly (ENV_TRANSIENT -> a loud infra_issue hold) but
@@ -4642,12 +4709,24 @@ async def run_verification(
             )
         return CheckRun(
             label=label,
+            # Deliberately the ORIGINAL full chain even on the segmented path:
+            # it feeds _persist_attempt_logs/_build_summary_payload/
+            # _summarize_checks, so preserving it keeps every persisted
+            # artifact and every failure classification identical. Task 3338
+            # changes execution TOPOLOGY and REPORTING, not what any command
+            # is. For the same reason the junitxml and apply_pytest_numprocesses
+            # branches above stay the no-ops they already are on an OPAQUE
+            # chain — both are recorded follow-ups, not smuggled in here: one
+            # junit path shared by 8 pytest runs is last-writer-wins (worse
+            # than today's no-op), and a per-segment `-n` would silently change
+            # verify parallelism for task/background roles.
             cmd=config_cmd,
             rc=rc,
             output=out,
             timed_out=timed_out_flag,
             started_at=started_at,
             duration_secs=time.monotonic() - t0,
+            segments=segment_dicts,
         )
 
     # Cold-verify shared-venv pre-provision (task 2997, esc-2913-3): populate
@@ -6068,6 +6147,12 @@ async def run_scoped_verification(
                     is_merge_verify=is_merge_verify,
                     attempt_id=attempt_id, task_id=task_id, archive_root=archive_root,
                     role=role,
+                    # Task 3338 / esc-3062-2: the fallback runs the fleet-wide
+                    # `&&` chain, where the shell's short-circuit means an
+                    # unrelated earlier subproject's red skips the clause a
+                    # task's OWN assigned files live in — and one rc cannot say
+                    # so. This is the ONLY call site that opts in.
+                    segment_chained_test=True,
                 )
                 fallback_result.plan = plan_dict
                 return fallback_result

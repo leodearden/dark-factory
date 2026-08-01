@@ -56,6 +56,18 @@ def _fleet_segments() -> list[ChainSegment]:
     return segments
 
 
+def _test_run_entry(runs_capture: list) -> dict:
+    """The `test` entry of the runs dict `run_verification` hands downstream.
+
+    Captured off `_persist_attempt_logs`'s argument rather than reconstructed,
+    because that list — `[c.to_dict() for c in attempt.checks]` — is exactly
+    what reaches `.task/verify/attempt-N.json` and the review/merge tooling, so
+    it is what the segment facts have to arrive on.
+    """
+    assert runs_capture, 'run_verification recorded no runs dict'
+    return next(r for r in runs_capture[-1] if r['label'] == 'test')
+
+
 class _Clock:
     """A monotonic clock the FAKE ``run_one`` advances, not the test body.
 
@@ -539,7 +551,16 @@ class TestRunVerificationSegmentChainedTestWiring:
             return 0, 'ok', False
 
         config = OrchestratorConfig(project_root=tmp_path, verify_admission_enabled=False)
-        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
+        runs_capture: list = []
+
+        def spy_persist(*args, **kwargs):
+            for candidate in (*args, *kwargs.values()):
+                if isinstance(candidate, list) and candidate and isinstance(candidate[0], dict):
+                    runs_capture.append(candidate)
+            return []
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd), \
+             patch('orchestrator.verify._persist_attempt_logs', side_effect=spy_persist):
             result = await run_verification(
                 tmp_path,
                 config,
@@ -548,12 +569,12 @@ class TestRunVerificationSegmentChainedTestWiring:
                 max_retries=0,
                 **kwargs,
             )
-        return result, calls
+        return result, calls, runs_capture
 
     @pytest.mark.asyncio
     async def test_default_off_issues_exactly_one_run_cmd_for_the_whole_chain(self, tmp_path):
         """Every non-fallback caller keeps today's behaviour, byte for byte."""
-        result, calls = await self._run(tmp_path, _FLEET_TEST_COMMAND)
+        result, calls, _runs = await self._run(tmp_path, _FLEET_TEST_COMMAND)
 
         test_calls = [c for c in calls if 'pytest' in c['cmd']]
         assert len(test_calls) == 1
@@ -562,7 +583,7 @@ class TestRunVerificationSegmentChainedTestWiring:
 
     @pytest.mark.asyncio
     async def test_flag_on_issues_one_run_cmd_per_segment_in_its_own_cwd(self, tmp_path):
-        _result, calls = await self._run(
+        _result, calls, _runs = await self._run(
             tmp_path, _FLEET_TEST_COMMAND, segment_chained_test=True,
         )
         segments = _fleet_segments()
@@ -581,27 +602,12 @@ class TestRunVerificationSegmentChainedTestWiring:
         classification identical. The per-segment facts ride alongside it on
         the new `segments` field instead of replacing it.
         """
-        from unittest.mock import patch  # noqa: PLC0415
+        result, _calls, runs = await self._run(
+            tmp_path, _FLEET_TEST_COMMAND, segment_chained_test=True,
+        )
 
-        from orchestrator.config import OrchestratorConfig  # noqa: PLC0415
-        from orchestrator.verify import run_verification  # noqa: PLC0415
-
-        (tmp_path / '.task').mkdir(parents=True, exist_ok=True)
-
-        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **_kw):
-            return 0, 'ok', False
-
-        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd):
-            result = await run_verification(
-                tmp_path,
-                OrchestratorConfig(project_root=tmp_path, verify_admission_enabled=False),
-                self._fallback_config(_FLEET_TEST_COMMAND),
-                attempt_id=1,
-                max_retries=0,
-                segment_chained_test=True,
-            )
-        runs = result.runs or []
-        test_run = next(r for r in runs if r['label'] == 'test')
+        assert result.passed is True
+        test_run = _test_run_entry(runs)
         assert test_run['cmd'] == _FLEET_TEST_COMMAND
         assert test_run['segments'] is not None
         assert len(test_run['segments']) == 8
@@ -610,7 +616,7 @@ class TestRunVerificationSegmentChainedTestWiring:
     @pytest.mark.asyncio
     async def test_each_segment_streams_to_its_own_log_path(self, tmp_path):
         """Two segments share cwd `.`, so index-suffixed labels are load-bearing."""
-        _result, calls = await self._run(
+        _result, calls, _runs = await self._run(
             tmp_path, _FLEET_TEST_COMMAND, segment_chained_test=True,
         )
 
@@ -625,18 +631,18 @@ class TestRunVerificationSegmentChainedTestWiring:
     async def test_a_refused_chain_falls_back_to_one_unsegmented_run(self, tmp_path):
         """REFUSE => byte-identical to today, with `segments is None` saying so."""
         opaque = 'uv run pytest tests/ --timeout=300 || true'
-        result, calls = await self._run(tmp_path, opaque, segment_chained_test=True)
+        result, calls, runs = await self._run(tmp_path, opaque, segment_chained_test=True)
 
         test_calls = [c for c in calls if 'pytest' in c['cmd']]
         assert len(test_calls) == 1
         assert test_calls[0]['cmd'] == opaque
-        test_run = next(r for r in (result.runs or []) if r['label'] == 'test')
-        assert test_run['segments'] is None
+        assert result.passed is True
+        assert _test_run_entry(runs)['segments'] is None
 
     @pytest.mark.asyncio
     async def test_lint_and_type_legs_are_untouched_by_the_flag(self, tmp_path):
         """Only the test leg is wired; the others stay one call each."""
-        _result, calls = await self._run(
+        _result, calls, _runs = await self._run(
             tmp_path, _FLEET_TEST_COMMAND, segment_chained_test=True,
         )
 
