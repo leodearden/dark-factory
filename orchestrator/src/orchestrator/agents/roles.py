@@ -1213,10 +1213,23 @@ the merge SHA. Required shape:
 
 Before calling, sanity-check the SHA is actually on main:
 
-    git -C <project_root> merge-base --is-ancestor <merge-sha> main && echo on-main
+    git -C <project_root> merge-base --is-ancestor <merge-sha> main; rc=$?
+    # rc=0   -> <merge-sha> IS on main. Proceed with the set_task_status call.
+    # rc=1   -> <merge-sha> resolves here but is NOT reachable from main (it is only
+    #           on a feature branch). The SHA is wrong -- re-derive the landing commit.
+    # rc=128 -> git cannot resolve <merge-sha> (or `main`) in this checkout: "fatal:
+    #           Not a valid object name". This is NOT "not on main" -- it is "not yet
+    #           confirmed". Usually a stale/unfetched <project_root>, a wrong -C path,
+    #           or a mistyped SHA. Run `git -C <project_root> fetch --all` and re-run;
+    #           if it still will not resolve, re-derive the SHA. Never record or report
+    #           "not on main" on a 128.
+    # Never guard this call with a trailing `&& echo on-main`: that renders rc=1
+    # and rc=128 as identical silence, and they need opposite remedies.
 
-The server runs the same check as a backstop; it will reject if the SHA is
-only on a feature branch.
+The server runs the identical `git merge-base --is-ancestor` command as a backstop
+and branches the same three ways: rc=0 accepts, rc=1 rejects with `'commit is not
+an ancestor of main'`, and any other rc (128 included) rejects with git's raw
+stderr -- so the rejection reason tells you which of the two failure modes you hit.
 
 ### `kind="found_on_main"` — the implementation is already on main from a sibling task
 
@@ -1237,11 +1250,24 @@ Both `commit` and `note` are required. Before calling, identify the
 impl-providing commit and verify it is on main:
 
     git -C <project_root> log main --oneline -- <relevant_paths>
-    git -C <project_root> merge-base --is-ancestor <sha> main && echo on-main
+    git -C <project_root> merge-base --is-ancestor <sha> main; rc=$?
+    # rc=0   -> <sha> IS on main. Proceed with the set_task_status call.
+    # rc=1   -> <sha> resolves here but is NOT reachable from main (it is only on a
+    #           feature branch). The SHA is wrong -- re-derive the landing commit.
+    # rc=128 -> git cannot resolve <sha> (or `main`) in this checkout: "fatal: Not a
+    #           valid object name". This is NOT "not on main" -- it is "not yet
+    #           confirmed". Usually a stale/unfetched <project_root>, a wrong -C path,
+    #           or a mistyped SHA. Run `git -C <project_root> fetch --all` and re-run;
+    #           if it still will not resolve, re-derive the SHA. Never record or report
+    #           "not on main" on a 128.
+    # Never guard this call with a trailing `&& echo on-main`: that renders rc=1
+    # and rc=128 as identical silence, and they need opposite remedies.
 
-Cite the commit and the providing-task id (when known) in `note`. The
-server runs the same `git merge-base --is-ancestor` check as a backstop
-for this kind too (post-3092 phantom-done hardening, 2026-05-09).
+Cite the commit and the providing-task id (when known) in `note`. The server runs
+the identical `git merge-base --is-ancestor` command as a backstop for this kind
+too (post-3092 phantom-done hardening, 2026-05-09) and branches the same three
+ways: rc=0 accepts, rc=1 rejects with `'commit is not an ancestor of main'`, and
+any other rc rejects with git's raw stderr.
 
 ### Forbidden
 
