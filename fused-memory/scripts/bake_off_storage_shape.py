@@ -1102,3 +1102,127 @@ def topic_discoverability(
         'canonical_rank': rank,
         'topic_member_count': len(member_ids),
     }
+
+
+# ---------------------------------------------------------------------------
+# The D4 cost metric — tokens returned per query
+# ---------------------------------------------------------------------------
+#
+# D4 asks a COST question: a grouped read returns one long document where N
+# peers return N short ones — which costs the reader more?  So the metric
+# sums the PAYLOADS returned within top-k, which weighs the two shapes on the
+# same footing.  A hit-count metric would answer "how many results?", which
+# is not the question and would flatter whichever shape happens to fragment
+# less.
+#
+# The number is COMPARATIVE ACROSS ARMS by design.  The report reads "arm (a)
+# costs 3.1x arm (c)", never "arm (a) costs 812 tokens" — which is what makes
+# the character-proxy fallback below acceptable: a proxy that is uniformly
+# off by a constant factor leaves every ratio in the decision table intact.
+
+#: Name reported when the real tokenizer ran.  cl100k_base is the encoding
+#: for the OpenAI embedding/chat models this system actually uses.
+TIKTOKEN_ESTIMATOR_NAME = 'tiktoken:cl100k_base'
+
+#: Name reported when the fallback ran.  It names the DERIVATION, not merely
+#: "fallback": a reader of the artifact has to be able to tell what produced
+#: the numbers without reading this file.
+CHAR_PROXY_ESTIMATOR_NAME = 'char-proxy:4-chars-per-token'
+
+
+def character_proxy_tokens(text: str) -> int:
+    """Estimate tokens from character count — the no-tiktoken fallback.
+
+    Delegates to ``fused_memory.reconciliation.context_assembler.estimate_tokens``
+    (``len(text) // 4``, "~4 chars per token for mixed English/JSON") rather
+    than restating the divisor.  That helper is the repo's ONE chars-per-token
+    constant and it already budgets exactly this domain — memory payload text
+    on its way to a model.  A second literal ``// 4`` here would be a
+    same-fact-two-places drift hazard (INV-5), and the two would be free to
+    disagree without any test noticing.
+
+    The import is function-local so importing this script costs nothing until
+    a token is actually counted.
+    """
+    from fused_memory.reconciliation.context_assembler import (  # noqa: PLC0415
+        estimate_tokens,
+    )
+
+    return estimate_tokens(text)
+
+
+def resolve_token_estimator() -> tuple[str, Any]:
+    """Pick the token estimator and NAME it: ``(name, encode)``.
+
+    Prefers real tokenization and falls back to :func:`character_proxy_tokens`
+    — but the fallback is never silent.  The name travels into every
+    :func:`tokens_returned` result and from there into the report JSON, so an
+    operator reading ``plans/e2-storage-shape-bakeoff-report.md`` can always
+    tell which estimator produced its numbers.  Un-flagged proxy numbers in
+    an operator-facing artifact are indistinguishable from measured ones,
+    which is the failure this avoids.
+
+    Two distinct failure modes both fall back:
+
+      * tiktoken is not installed (the live path in this venv today);
+      * tiktoken imports but ``get_encoding`` fails — it fetches its BPE
+        file over the network on first use, so an offline or air-gapped box
+        raises here.  A cost metric must not take the whole bake-off down
+        with it.
+
+    Deliberately NOT cached: a cached resolution would make every later
+    caller in the process report whichever estimator the FIRST one happened
+    to get, which is precisely the silent-substitution failure above wearing
+    a different hat.  Resolution is cheap and happens once per run; the
+    encoding object itself is captured in the closure, so the BPE table is
+    built at most once per resolution rather than per call.
+    """
+    try:
+        import tiktoken  # noqa: PLC0415
+
+        encoding = tiktoken.get_encoding('cl100k_base')
+    except Exception:  # noqa: BLE001 — absent, broken, or offline: same answer
+        return CHAR_PROXY_ESTIMATOR_NAME, character_proxy_tokens
+
+    def _encode(text: str) -> int:
+        return len(encoding.encode(text))
+
+    return TIKTOKEN_ESTIMATOR_NAME, _encode
+
+
+def tokens_returned(
+    hits: list[ArmRecord],
+    k: int,
+    estimator: tuple[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Tokens a reader must consume for the top-*k* of *hits* (D4's cost).
+
+    Sums over the returned payloads, so one grouped document and the N short
+    peers carrying the same knowledge are weighed identically — that
+    comparison IS the metric.
+
+    Counts ``content`` only.  Metadata is excluded on purpose: how a result
+    dict is rendered on the wire is a transport/formatting choice gate η is
+    not deciding, and folding it in would make the arm comparison move with
+    that choice.  It would also charge the shapes that carry β vocabulary
+    keys for carrying them — a real question, but a different one from D4's
+    payload cost.
+
+    *estimator* is a ``(name, encode)`` pair, defaulting to
+    :func:`resolve_token_estimator`.  The name is returned alongside the
+    count; see that function for why it must be.
+
+    Note on the character-proxy path: ``len // 4`` floors once per payload,
+    so an N-hit arm can be undercounted by up to N-1 tokens relative to the
+    same text returned as one document.  Bounded by ``k`` (≤10 here) against
+    payloads of hundreds of characters, that is far below the effect sizes
+    the decision table reads, and it biases AGAINST the fragmented shape's
+    apparent cost — i.e. it cannot manufacture a win for the grouped arm.
+    """
+    name, encode = estimator if estimator is not None else resolve_token_estimator()
+    window = hits[:k]
+    return {
+        'tokens': sum(encode(hit.content) for hit in window),
+        'estimator': name,
+        'payloads_counted': len(window),
+    }
