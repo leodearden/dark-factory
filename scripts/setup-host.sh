@@ -360,6 +360,43 @@ fi
 # ---------------------------------------------------------------------------
 info "Installing dashboard systemd units"
 
+# Parity check, BEFORE the install below overwrites its evidence.
+#
+# THIS IS THE REAL GATE. The install that follows unconditionally re-renders
+# dark-factory-dashboard.service and cp's both watchdog units, so any drift
+# between the running system and the committed units is erased a few lines
+# from here. Checking afterwards could only ever report a failed copy — never
+# the case this checker was built around ("the installed watchdog is still the
+# pre-incident inline-shell copy"), because by then it isn't.
+#
+# Warn-only: drift never aborts the install, and the install below is itself
+# the remediation. What this buys is a RECORD — the operator sees what was
+# silently stale on this host before it got fixed, which is the difference
+# between "setup ran" and "setup corrected a supervision gap that had been
+# open since April".
+#
+# Deliberately no --fix in the checker (see its module docstring): re-running
+# this installer is the propagation path, and re-ARMING the watchdog timer
+# belongs to task 3289.
+if python3 "$REPO_ROOT/scripts/check_dashboard_unit_parity.py" \
+     --installed-dir "$UNIT_DIR" \
+     --repo-root     "$REPO_ROOT"; then
+  ok "Dashboard units: already at parity with the committed copies"
+else
+  _dash_parity_exit=$?
+  if [ "$_dash_parity_exit" -eq 2 ]; then
+    info "Dashboard units: not yet installed in $UNIT_DIR (installing below)"
+  else
+    # Exit 1 is "drift OR unverifiable" — it also covers a vanished committed
+    # unit and a drop-in override, which the checker deliberately words apart
+    # so the operator is not sent hunting for a directive diff that does not
+    # exist. Naming only DRIFT here would collapse that distinction back.
+    warn "Dashboard units: pre-existing drift or unverifiable state — see the"
+    warn "  [dashboard_unit_parity] report above. The install below propagates"
+    warn "  the committed units; a drop-in override needs manual removal."
+  fi
+fi
+
 sed \
   -e "s|__REPO_ROOT__|$REPO_ROOT|g" \
   -e "s|__UV_PATH__|$UV_PATH|g" \
@@ -508,24 +545,30 @@ else
   fi
 fi
 
-# Dashboard unit parity check — guard that repo-side unit edits actually reached
-# the running system.  A unit change that stays repo-side is indistinguishable
-# from no change at all, which is how the pre-incident watchdog kept running
-# after its replacement had already landed in git.
+# Dashboard unit parity — POST-INSTALL SANITY CHECK ONLY.
 #
-# Warn-only: drift never aborts the install.  There is deliberately no --fix
-# (see the checker's module docstring) — re-running this installer is the
-# propagation path, and re-ARMING the watchdog timer belongs to task 3289.
+# The gate that can actually observe drift runs in section 8, BEFORE the units
+# are re-rendered and copied; see the long comment there. By this point the
+# installer has already overwritten every installed copy, so a mismatch here
+# does not mean "the host drifted" — it means the install itself did not take:
+# a failed write, a template that no longer renders to the committed unit, or a
+# drop-in override that survives reinstallation because setup-host.sh does not
+# touch <unit>.d/ directories.
+#
+# Warn-only, like the pre-install check.
 if python3 "$REPO_ROOT/scripts/check_dashboard_unit_parity.py" \
      --installed-dir "$UNIT_DIR" \
      --repo-root     "$REPO_ROOT"; then
-  ok "Dashboard units: parity with the committed copies"
+  ok "Dashboard units: install verified (installed copies match the committed ones)"
 else
   _dash_parity_exit=$?
   if [ "$_dash_parity_exit" -eq 2 ]; then
-    warn "Dashboard units: not installed in $UNIT_DIR (skipping parity check)"
+    warn "Dashboard units: not installed in $UNIT_DIR (section 8 did not run?)"
   else
-    warn "Dashboard units: DRIFT detected — run: python3 $REPO_ROOT/scripts/check_dashboard_unit_parity.py"
+    warn "Dashboard units: still not at parity AFTER installing — the install"
+    warn "  did not take. See the [dashboard_unit_parity] report above; a"
+    warn "  [override] drop-in survives reinstallation and must be removed by"
+    warn "  hand (systemctl --user cat <unit> shows the merged result)."
   fi
 fi
 

@@ -334,7 +334,17 @@ no new contract, no fail-soft path.
      carrying the committed unit's own justification verbatim. Allowlisting
      is scoped to a variable NAME, not to `Environment=` as a whole, so
      blessing the nine-root value does not also bless the variable
-     disappearing.
+     disappearing. Lines are split with `shlex`, so systemd's
+     several-assignments-per-line and quoted spellings parse the way systemd
+     reads them — reformatting a line must not invent drift.
+   - **Override mechanisms** — comparing directives only proves something if
+     the installed unit *file* is what takes effect. A drop-in
+     (`<unit>.d/*.conf`, what `systemctl --user edit` writes) is merged over
+     the unit at load time, and an `EnvironmentFile=` pulls values from a
+     file off the tree; either lets every compared directive match while the
+     running configuration differs. Drop-ins are detected in the installed
+     dir and reported as `[override]`; `EnvironmentFile=` is registered
+     per-unit and fires when one copy declares it and the other does not.
 
    Expected VALUES are read from the committed unit at run time; only the KEY
    registry and the allowlist are curated. A hardcoded literal list would be
@@ -345,12 +355,40 @@ no new contract, no fail-soft path.
    really declared in the committed unit.
 
    Exit contract, matching `check_fused_memory_unit_parity.py` so
-   `setup-host.sh` can branch on it: **0** parity / **1** drift / **2**
-   installed unit absent, with drift DOMINATING absence so an unrelated
-   uninstalled unit cannot mask an actionable finding. Wired into
-   `setup-host.sh` as a warn-only report. No `--fix`: re-running the
-   installer is the propagation path, and a `--fix` could silently re-arm a
-   watchdog timer someone deliberately left disarmed.
+   `setup-host.sh` can branch on it: **0** parity / **1** drift *or
+   unverifiable* / **2** installed unit absent, with 1 DOMINATING 2 so an
+   unrelated uninstalled unit cannot mask an actionable finding. Exit 1 also
+   covers a vanished committed unit and a drop-in override — both mean the
+   gate could not make its claim, which is the opposite of the benign "not
+   installed here" that 2 denotes. The three are worded apart in the report
+   (`[drift]` / `[vanished]` / `[override]`) because they send the operator
+   to different places, and `setup-host.sh`'s warn line says "drift or
+   unverifiable" rather than collapsing them back to "DRIFT". No `--fix`:
+   re-running the installer is the propagation path, and a `--fix` could
+   silently re-arm a watchdog timer someone deliberately left disarmed.
+
+   **Where it is wired, and which caller is the real gate.** `setup-host.sh`
+   calls it TWICE, and only the first can observe anything:
+
+   - **Section 8, BEFORE the install — the real gate.** The install
+     unconditionally re-renders `dark-factory-dashboard.service` and `cp`s
+     both watchdog units, so it ERASES the drift a moment later. Checking
+     only afterwards would have made the report a tautology: it could
+     report a failed copy, but never the case the checker was built around
+     ("the installed watchdog is still the pre-incident inline-shell copy"),
+     because by then it isn't. Running first buys the RECORD of what was
+     silently stale before setup fixed it.
+   - **Verification section, AFTER the install — a sanity check.** A
+     mismatch here does not mean the host drifted; it means the install did
+     not take (failed write, template no longer rendering to the committed
+     unit, or a drop-in that survives reinstallation because `setup-host.sh`
+     does not touch `<unit>.d/`).
+
+   Both are warn-only; neither aborts the install. NOT YET WIRED: a caller
+   that observes drift on a cadence rather than only when an operator runs
+   the installer — the watchdog tick, a periodic timer, or a pre-merge hook.
+   That is the placement with the most value and it is deliberately left for
+   a follow-up, since every candidate site is outside task 3312's locks.
 
    **Drift this surfaces on the host at landing time:** the installed
    `dark-factory-dashboard-watchdog.service` is still the pre-incident
