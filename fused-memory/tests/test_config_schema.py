@@ -1582,13 +1582,43 @@ class TestMemoryMetadataConfig:
         assert cfg.memory_metadata.enforce_kind_registry is True
 
     @pytest.mark.parametrize('field', ['enforce', 'enforce_kind_registry'])
-    def test_enforce_flags_document_their_reload_tier(self, field):
-        """The reload tier must be discoverable where an operator will look.
+    def test_enforce_flags_are_restart_only(self, field):
+        """RED TIER, asserted behaviourally rather than as a doc blurb.
 
-        An existence-and-substring check, deliberately not a prose pin: the
-        wording may be edited, but a flag that stops saying it is restart-only
-        would leave an operator expecting `reload_config` to flip it.
+        The operator-facing promise is not that some `description=` string
+        contains the letters "restart" — it is that `reload_config` REPORTS
+        this leaf as ``restart_required`` and does not silently no-op it.
+        That is a property of the reload allowlist and of `diff_config`, so
+        this pins both: the section has no hot-reloadable leaf, and a real
+        diff over a flipped flag buckets red, not green.
+
+        The step-11 ``description=`` strings are retained as operator
+        documentation; they are simply no longer test-pinned. Prose is
+        reviewed by humans and enforced by neither pyright nor pytest, and a
+        substring check over it fails open anyway (``'restarting is not
+        required'`` would have passed the check this replaces).
         """
-        description = self._cls().model_fields[field].description or ''
-        assert description
-        assert 'restart' in description.lower()
+        from fused_memory.config.reload import (  # noqa: PLC0415
+            RELOADABLE_FIELDS,
+            diff_config,
+        )
+
+        # 1. No leaf of this section is hot-reloadable. An added-and-
+        #    unreviewed allowlist entry fails here, loudly.
+        assert not any(f.startswith('memory_metadata.') for f in RELOADABLE_FIELDS)
+
+        # 2. Observable bucketing through the real diff path, mirroring the
+        #    red-tier precedent `TestDiffConfig.
+        #    test_non_allowlisted_leaf_lands_in_restart_required`.
+        live = FusedMemoryConfig()
+        fresh = FusedMemoryConfig()
+        old = getattr(live.memory_metadata, field)
+        # `object.__setattr__` is the established idiom in test_config_reload:
+        # it bypasses the validation/assignment wrapper so the diff sees a raw
+        # differing leaf.
+        object.__setattr__(fresh.memory_metadata, field, not old)
+
+        d = diff_config(live, fresh)
+
+        assert d.restart_required[f'memory_metadata.{field}'] == {'old': old, 'new': not old}
+        assert f'memory_metadata.{field}' not in d.applied_candidates
