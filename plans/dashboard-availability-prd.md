@@ -307,7 +307,56 @@ no new contract, no fail-soft path.
 3. **Exact ζ thresholds.** Absolute size vs growth-rate. **Suggested
    resolution:** both — absolute (e.g. 10 GB) and a daily-delta ceiling
    anchored on the measured ~50 MB/day. Decide in ζ.
-4. **Whether η should also assert the two unit copies' `Environment=` values
-   agree**, given the installed copy legitimately carries 9 project roots.
-   **Suggested resolution:** check *directive presence and shape*, not
-   values, and allow an explicit documented divergence list. Decide in η.
+4. ~~**Whether η should also assert the two unit copies' `Environment=` values
+   agree**, given the installed copy legitimately carries 9 project roots.~~
+   **RESOLVED in η (task 3312).** Presence-and-shape everywhere would have
+   been too weak to deliver the check's actual purpose — an installed
+   `TimeoutStopSec=90` against a committed `15`, or a stale
+   `--timeout-graceful-shutdown`, is *present but wrong*. So directives are
+   split by CLASS instead, in `scripts/check_dashboard_unit_parity.py`:
+
+   - **Value-compared** — host-INVARIANT literals carrying no paths (`Type`,
+     `Restart`, `RestartSec`, `RestartMaxDelaySec`, `TimeoutStopSec`,
+     `TimeoutStartSec`, `StandardOutput`/`Error`, `OnBootSec`,
+     `OnUnitActiveSec`, `WantedBy`). Comparison is symmetric: a directive
+     added only to the installed copy is drift too.
+   - **Presence-only** — directives embedding host paths (`ExecStart`,
+     `WorkingDirectory`, `Documentation`), which cannot be value-compared
+     without firing on every machine that is not this one.
+   - **ExecStart flags** — the uvicorn flags γ added are extracted from the
+     backslash-continuation-joined logical `ExecStart` of both copies and
+     compared individually, so the `uv` path and repo root are ignored while
+     a stale `--timeout-keep-alive` is not. This is what makes "the unit
+     change reached the running system" a checkable claim for γ and δ.
+   - **`Environment=`** — compared by variable-NAME set (a dropped variable
+     is always drift), with values compared only for names off a documented
+     `DIVERGENCE_ALLOWLIST`. One entry today: `DASHBOARD_KNOWN_PROJECT_ROOTS`,
+     carrying the committed unit's own justification verbatim. Allowlisting
+     is scoped to a variable NAME, not to `Environment=` as a whole, so
+     blessing the nine-root value does not also bless the variable
+     disappearing.
+
+   Expected VALUES are read from the committed unit at run time; only the KEY
+   registry and the allowlist are curated. A hardcoded literal list would be
+   a third site that must agree with the other two, and would silently defeat
+   the purpose — a stale literal keeps passing against the OLD value on both
+   sides while the repo edit again fails to reach the running system. The key
+   registry is guarded against rot by tests asserting every listed key is
+   really declared in the committed unit.
+
+   Exit contract, matching `check_fused_memory_unit_parity.py` so
+   `setup-host.sh` can branch on it: **0** parity / **1** drift / **2**
+   installed unit absent, with drift DOMINATING absence so an unrelated
+   uninstalled unit cannot mask an actionable finding. Wired into
+   `setup-host.sh` as a warn-only report. No `--fix`: re-running the
+   installer is the propagation path, and a `--fix` could silently re-arm a
+   watchdog timer someone deliberately left disarmed.
+
+   **Drift this surfaces on the host at landing time:** the installed
+   `dark-factory-dashboard-watchdog.service` is still the pre-incident
+   inline-shell copy — no `TimeoutStartSec`, no journal routing — so the
+   checker exits 1 until task 3289 installs the post-δ units. That is the
+   intended signal, not a defect: it is exactly the silent-propagation
+   failure this check was built to expose. The deliberate 9-vs-1
+   `DASHBOARD_KNOWN_PROJECT_ROOTS` divergence correctly stays silent, and
+   the uvicorn flags compare clean.
