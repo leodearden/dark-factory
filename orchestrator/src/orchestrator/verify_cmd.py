@@ -38,6 +38,7 @@ thing to the record as it did to the decision the record reports on.
 
 from __future__ import annotations
 
+import posixpath
 import re
 import shlex
 from collections.abc import Mapping
@@ -630,6 +631,170 @@ def describe_dropped_clauses(
         if remainder and has_unpreserved_chain_clauses(remainder, ''):
             dropped = (remainder,)
     return dropped, any(_segment_invokes_tool(clause, keyword) for clause in dropped)
+
+
+@dataclass(frozen=True)
+class ChainSegment:
+    """One independently-runnable clause of an `&&` chain, with its cwd resolved.
+
+    *cwd_rel* is POSIX-normalised and RELATIVE to the worktree root ('.' at the
+    root). *command* is a VERBATIM byte-slice of the chain it came from — never
+    re-rendered — so the runner hands the shell exactly what the operator wrote.
+    *label* is a unique, filename-safe token: it becomes the infix of the
+    segment's streamed log path, so two segments sharing a cwd must not collide.
+    """
+
+    cwd_rel: str
+    command: str
+    label: str
+
+
+def _label_for(cwd_rel: str, index: int) -> str:
+    """A unique, filename-safe label for the segment at 1-based *index*.
+
+    The index suffix is not cosmetic: the committed fleet chain has TWO
+    segments at cwd '.' (the cockpit subshell and the `tests/scripts/` clause),
+    and their streamed log paths are keyed by label.
+    """
+    base = 'root' if cwd_rel == '.' else re.sub(r'[^A-Za-z0-9_-]+', '-', cwd_rel).strip('-')
+    return f'{base or "root"}-{index}'
+
+
+def split_and_chain_segments(raw: str) -> list[ChainSegment] | None:
+    """Decompose an `&&` chain into independently-runnable segments, or REFUSE.
+
+    The EXECUTION-layer counterpart to ``split_chain_tail`` (tasks 3061/3218).
+    That one decides WHICH command a scoper renders; this one decides HOW an
+    already-decided chain is RUN — as N separate commands rather than one
+    shell string whose `&&` short-circuits at the first red. Task 3338 /
+    esc-3062-2: with a single `/bin/bash -c '<chain>'`, an unrelated earlier
+    subproject's failure means a task's OWN assigned-file tests are never
+    executed at all, and the orchestrator sees one rc with no way to tell
+    "skipped" from "passed".
+
+    **Fail-safe contract: returns ``None`` on ANYTHING it cannot faithfully
+    reproduce**, and the caller then runs *raw* unchanged — byte-identical to
+    the pre-change behaviour by construction. Same discipline as
+    ``split_chain_tail``'s REJECT path, which returns the whole untouched
+    original. A false REFUSE costs nothing but the status quo; a false ACCEPT
+    corrupts a command.
+
+    The scan extends ``split_top_level_and``'s state machine with a PAREN-DEPTH
+    counter alongside its single/double-quote and backslash-escape state: an
+    `&&` is a split point only at quote depth 0 AND paren depth 0. That is not
+    optional here — the committed fleet chain contains
+    ``( [ -d cockpit ] || exit 0; cd cockpit && uv run pytest tests/ )``, and a
+    quote-only splitter would cut inside that group and emit two unbalanced
+    shell fragments, i.e. a spurious RED. A balanced ``( ... )`` group is one
+    ATOMIC segment, which is also semantically right: a subshell's own ``cd``
+    never escapes it.
+
+    A literal ``cd X`` clause is FOLDED into a running relative cwd rather than
+    emitted as a segment (start '.'; ``cd shared`` -> 'shared';
+    ``cd ../escalation`` -> 'escalation'; ``cd ..`` from 'sampler' -> '.'), so
+    each emitted segment carries the cwd the shell would have been in when it
+    ran. Segment commands are ``strip()``ed byte-slices of *raw*.
+    """
+    segments: list[ChainSegment] = []
+    cwd_rel = '.'
+    for clause in _split_top_level_and_chain(raw) or []:
+        stripped = clause.strip()
+        if not stripped:
+            return None
+        cd_target = _cd_clause_target(stripped)
+        if cd_target is not None:
+            cwd_rel = posixpath.normpath(posixpath.join(cwd_rel, cd_target))
+            if cwd_rel.startswith('..'):
+                # A chain whose accumulated cwd escapes the worktree root is
+                # not something this helper can run safely under `worktree / X`.
+                return None
+            continue
+        segments.append(
+            ChainSegment(cwd_rel=cwd_rel, command=stripped, label=_label_for(cwd_rel, len(segments) + 1)),
+        )
+    if len(segments) < 2:
+        # Nothing is gained by "segmenting" a single command, and the whole
+        # point is running LATER clauses that a red earlier one would skip.
+        return None
+    return segments
+
+
+def _cd_clause_target(clause: str) -> str | None:
+    """The literal relative target of a ``cd X`` clause, else ``None``.
+
+    ``None`` means "not a cd clause" — the caller emits it as a runnable
+    segment. A cd clause this cannot resolve LITERALLY is not reported here;
+    ``_split_top_level_and_chain``'s guards refuse the whole chain instead
+    (step-4), because a mis-resolved cwd would run a segment in the wrong
+    directory rather than merely decline to segment.
+    """
+    try:
+        tokens = shlex.split(clause)
+    except ValueError:
+        return None
+    if not tokens or tokens[0] != 'cd':
+        return None
+    if len(tokens) != 2:
+        return None
+    return tokens[1]
+
+
+def _split_top_level_and_chain(raw: str) -> list[str] | None:
+    """``split_top_level_and`` plus paren-depth awareness; ``None`` on REFUSE.
+
+    Splits on `&&` only at quote depth 0 AND paren depth 0, keeping every other
+    byte, so the segments are verbatim slices exactly as
+    ``split_top_level_and``'s are.
+    """
+    clauses: list[str] = []
+    start = 0
+    i = 0
+    quote: str | None = None
+    depth = 0
+    n = len(raw)
+    while i < n:
+        ch = raw[i]
+        if quote is None:
+            if ch == '\\':
+                i += 2
+                continue
+            if ch in ('"', "'"):
+                quote = ch
+                i += 1
+                continue
+            if ch == '(':
+                depth += 1
+                i += 1
+                continue
+            if ch == ')':
+                depth -= 1
+                if depth < 0:
+                    # Unbalanced: a `)` with no opener. Refuse rather than
+                    # slice a construct we have already mis-read.
+                    return None
+                i += 1
+                continue
+            if ch == '&' and raw[i + 1 : i + 2] == '&':
+                if depth == 0:
+                    clauses.append(raw[start:i])
+                    start = i + 2
+                i += 2
+                continue
+            i += 1
+            continue
+        # Inside quotes: only a double-quote context honours backslash escapes.
+        if quote == '"' and ch == '\\':
+            i += 2
+            continue
+        if ch == quote:
+            quote = None
+        i += 1
+    if quote is not None or depth != 0:
+        # Unbalanced quote or paren at end of scan — the string was never
+        # safely decomposable.
+        return None
+    clauses.append(raw[start:])
+    return clauses
 
 
 def parse_config_command(raw: str) -> VerifyCmd:
