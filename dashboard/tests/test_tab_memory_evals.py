@@ -905,6 +905,17 @@ def test_trend_holes_are_never_handed_to_a_chart_primitive(
     #      site.  Two spellings are accepted — an inline `Chart && !gaps`, or a
     #      named local (`plottable` / `hasGaps` / ...) combining both — because
     #      the invariant is "the count gates the chart", not one exact phrasing.
+    #
+    #      KEPT DELIBERATELY, against a review suggestion to delete this block
+    #      as identifier-spelling introspection covered by the `bare` negative
+    #      check below.  Measured, not argued: regressing the JSX to
+    #      `const plottable = Chart;` (gate removed, holed series reaches the
+    #      primitive) fails HERE and `bare` passes it — `bare` only matches the
+    #      literal `{Chart &&` / `{Chart ?` spelling, so any named local evades
+    #      it entirely.  The two are not redundant: this is the only POSITIVE
+    #      check that a gate exists at all, and deleting it silently reopens
+    #      the defect 5ad120a0b3 fixed (charts.jsx coerces null to 0 and draws
+    #      a fabricated plunge to the chart floor; see task 3436).
     inline = re.search(r'\{\s*Chart\s*&&[^\n]*\bgaps\b', body)
     via_local = None
     for decl in re.finditer(
@@ -1144,10 +1155,15 @@ def test_limits_provenance_rendered(
     # rewording while proving nothing extra about the branch.
     prov_body = _extract_function_body(code, 'LimitsProvenance')
     assert prov_body, 'could not extract the LimitsProvenance body.'
-    assert re.search(r'\blim\s*=\s*ev\.limits\b', prov_body), (
-        'LimitsProvenance must read `ev.limits`.'
+    # The local's NAME is derived from the `ev.limits` read rather than pinned,
+    # so renaming `lim` is not a test failure; what must hold is that whatever
+    # it is called gates the early return.
+    lim_local = re.search(r'\b(\w+)\s*=\s*ev\.limits\b', prov_body)
+    assert lim_local is not None, (
+        'LimitsProvenance must read `ev.limits` into a local.'
     )
-    assert re.search(r'if\s*\(\s*!\s*lim\s*\)\s*\{?\s*return\s*\(?\s*<', prov_body), (
+    lim = re.escape(lim_local.group(1))
+    assert re.search(r'if\s*\(\s*!\s*' + lim + r'\s*\)\s*\{?\s*return\s*\(?\s*<', prov_body), (
         'a null `ev.limits` must take an early-return branch rendering an '
         'explicit element rather than an empty block — a blank provenance '
         'section is indistinguishable from a rendering bug.'
@@ -1385,19 +1401,53 @@ def test_escalation_link_navigation_is_wired(
     therefore rides the existing state-lift idiom: app.jsx owns the focus state
     and threads a handler down.
     """
-    # (a) app.jsx holds an escalation-focus state beside its tab state, and a
-    #     navigate handler that sets both.
-    assert re.search(r'const\s*\[\s*escFocus\s*,\s*setEscFocus\s*\]\s*=\s*uS\(', app_jsx_body), (
-        'app.jsx must hold an escalation-focus state beside `const [tab, setTab] '
-        "= uS('overview')`."
+    # (a) the handler wired to <MemoryTab onNavigate={...}> must switch the tab
+    #     AND record the focus id into the SAME state <EscalationsTab focusId=
+    #     {...}> reads.
+    #
+    #     Every identifier below is DERIVED from the cross-file prop contract,
+    #     never pinned by spelling: renaming the handler (navigate -> goToTab)
+    #     or the state (escFocus -> focusedEsc) keeps this green.  Deriving is
+    #     also STRICTLY STRONGER than the spelling pin it replaces — that
+    #     version checked for a setter by name, so a handler writing to some
+    #     OTHER state than the one feeding EscalationsTab passed it. Here that
+    #     is a failure, which is the actual dead-affordance this test exists to
+    #     catch.
+    handler = re.search(r'<MemoryTab[^>]*onNavigate=\{(\w+)\}', app_jsx_body)
+    assert handler is not None, (
+        'app.jsx must pass a named handler to <MemoryTab onNavigate={...}>.'
     )
-    nav = re.search(r'const\s+navigate\s*=\s*\([^)]*\)\s*=>\s*\{([\s\S]{0,300}?)\}', app_jsx_body)
+    focus_state = re.search(r'<EscalationsTab[^>]*focusId=\{(\w+)\}', app_jsx_body)
+    assert focus_state is not None, (
+        'app.jsx must pass a state variable to <EscalationsTab focusId={...}>.'
+    )
+    setter = re.search(
+        r'const\s*\[\s*' + re.escape(focus_state.group(1)) + r'\s*,\s*(\w+)\s*\]\s*=\s*uS\(',
+        app_jsx_body,
+    )
+    assert setter is not None, (
+        f'the id passed to <EscalationsTab focusId must be React state, but no '
+        f'`const [{focus_state.group(1)}, set...] = uS(` declaration exists.'
+    )
+    nav = re.search(
+        r'const\s+' + re.escape(handler.group(1))
+        + r'\s*=\s*\([^)]*\)\s*=>\s*\{([\s\S]{0,300}?)\}',
+        app_jsx_body,
+    )
     assert nav is not None, (
-        'app.jsx must define a `navigate` handler.'
+        f'app.jsx passes `{handler.group(1)}` to <MemoryTab but never defines '
+        'it as an arrow-function handler.'
     )
-    assert 'setTab(' in nav.group(1) and 'setEscFocus(' in nav.group(1), (
-        'the navigate handler must both switch the tab and record the focus id; '
-        f'body was: {nav.group(1)!r}'
+    nav_body = nav.group(1)
+    assert setter.group(1) + '(' in nav_body, (
+        f'`{handler.group(1)}` must record the focus id via `{setter.group(1)}(`, '
+        'the same state <EscalationsTab reads. Writing it anywhere else means '
+        f'the link switches tab and lands on an unfocused list. Body: {nav_body!r}'
+    )
+    assert set(re.findall(r'\b(set\w+)\s*\(', nav_body)) - {setter.group(1)}, (
+        f'`{handler.group(1)}` records the focus id but never switches the tab, '
+        f'so the link highlights an escalation the operator cannot see. '
+        f'Body: {nav_body!r}'
     )
 
     # (b)/(c) the handler reaches MemoryTab and the focus id reaches EscalationsTab.
