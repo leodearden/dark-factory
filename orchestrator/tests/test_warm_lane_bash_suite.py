@@ -26,6 +26,16 @@ reify's originals on the strength of this suite being green:
   short-circuits still exits 0 while its share of the 865 asserts never runs.
   See ``ASSERT_FLOORS``.
 
+These items no longer run in the default ``orchestrator`` suite.  Task 3349
+took PRD §11 q4's documented escape: they are deselected via
+``orchestrator/pyproject.toml``'s ``addopts`` (``-m 'not warm_lane_bash'``) and
+re-selected post-merge by the ``warm-lane-bash`` ``LaneCommand`` in
+``dark-factory-orchestrator.yaml``.  So a reader who runs ``pytest tests/`` and
+sees nothing from this module is looking at a relocation, NOT a dropped port —
+select them on demand with ``-m warm_lane_bash``.  The two config edits are
+coupled, and ``test_warm_lane_bash_bucket_placement.py`` is the guard that
+keeps them that way.
+
 See ``orchestrator/tests/warm-lane/README.md`` for provenance, the enumerated
 deltas from the reify sources, and the measured wall-clock per test.
 """
@@ -153,10 +163,15 @@ _RESULTS_RE = re.compile(r'^Results: (\d+) passed, (\d+) failed$', re.MULTILINE)
 #: re-measurement, never to make a red run green, and the arithmetic above is
 #: recorded so the next mover can check it rather than re-derive it.  The cost
 #: is bounded and one-sided — a genuinely hung suite now reports in 15 minutes
-#: instead of 5.  If the fleet-load figure keeps climbing, the sanctioned next
-#: lever is NOT another bump but the README's documented escape:
-#: ``git.offline_lane_commands``, which runs the ``warm_lane_bash`` bucket
-#: post-merge, off the verify hot path.
+#: instead of 5.
+#:
+#: That next lever HAS NOW BEEN PULLED.  Task 3349 took the README's documented
+#: escape and moved this bucket onto ``git.offline_lane_commands``, post-merge
+#: and off the verify hot path (PRD §11 q4, re-decided 2026-08-01, on a
+#: re-measured 289.58s at loadavg 128.72 on 32 cores — 6.2x the 47s module
+#: baseline).  The 900/960 pair is RETAINED UNCHANGED and still governs this
+#: bucket wherever it runs, the offline lane included; a further bump remains
+#: the wrong answer.
 SUBPROC_TIMEOUT = 900
 
 #: Host tools reify's originals hard-require with no skip guards.
