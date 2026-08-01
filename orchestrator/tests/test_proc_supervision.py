@@ -1260,3 +1260,186 @@ class TestDetachedLeafPlainSpawn:
 
         with pytest.raises(FileNotFoundError):
             await plan.execute(runner=raising_runner)
+
+
+# ---------------------------------------------------------------------------
+# task 3453 step-1: RED — the submit child's PYTHONPATH is EXPLICIT, never
+# inherited.  MEASURED against the live `systemd --user` manager: a caller
+# exporting PYTHONPATH=/tmp/sentinel-df gets a transient unit whose
+# `/bin/sh -c 'echo "[$PYTHONPATH]"'` prints `[]` — systemd-run propagates
+# NONE of the caller's environment.  So whatever the RP-4
+# `python -m escalation submit` child needs on sys.path must ride on the argv
+# itself (`--setenv=PYTHONPATH=...`, which MEASURABLY does reach even the
+# DEFERRED `--on-active` unit at fire time) or it is silently lost.
+# ---------------------------------------------------------------------------
+
+
+def _detached_plan_with_spec(tmp_queue_dir: Path, spec):
+    """The canonical detached RP-4 plan used by the task-3453 cells."""
+    from orchestrator.proc_supervision import RestartPlan
+
+    return RestartPlan(
+        script=Path('/proj/scripts/restart-orchestrator.sh'),
+        args=['--foo'],
+        cwd=Path('/proj'),
+        target_unit='orch.service',
+        own_unit='orch.service',
+        on_failure_escalation=spec,
+        verify=None,
+        transient_unit='orch-redeploy-restart-99.service',
+        on_active_secs=10,
+    )
+
+
+def _make_spec(tmp_queue_dir: Path):
+    from orchestrator.proc_supervision import EscalationSpec
+
+    return EscalationSpec(
+        queue_dir=str(tmp_queue_dir),
+        task_id='task-99',
+        summary='Self-restart fire-time failure',
+    )
+
+
+def _setenv_pythonpath_tokens(argv) -> list[str]:
+    """Every ``--setenv=PYTHONPATH=`` token on a built systemd-run argv."""
+    return [t for t in argv if isinstance(t, str) and t.startswith('--setenv=PYTHONPATH=')]
+
+
+def _pythonpath_roots(argv) -> list[str]:
+    """The os.pathsep-split roots carried by argv's --setenv=PYTHONPATH token."""
+    import os
+
+    tokens = _setenv_pythonpath_tokens(argv)
+    assert len(tokens) == 1, f'expected exactly one --setenv=PYTHONPATH token, got {tokens!r}'
+    value = tokens[0][len('--setenv=PYTHONPATH='):]
+    return value.split(os.pathsep)
+
+
+@pytest.mark.asyncio
+class TestSubmitChildPythonPathIsExplicit:
+    """The detached RP-4 argv carries an explicit ``--setenv=PYTHONPATH=``
+    naming the import roots the deferred ``python -m escalation submit`` child
+    needs — because systemd-run gives that child an EMPTY PYTHONPATH."""
+
+    async def test_setenv_pythonpath_present_and_carries_resolvable_roots(
+        self, tmp_queue_dir: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv('PYTHONPATH', raising=False)
+        runner = FakeRunner(returncode=0)
+        plan = _detached_plan_with_spec(tmp_queue_dir, _make_spec(tmp_queue_dir))
+
+        await plan.execute(runner=runner)
+
+        argv, _kwargs = runner.calls[0]
+        tokens = _setenv_pythonpath_tokens(argv)
+        assert len(tokens) == 1, (
+            'exactly one --setenv=PYTHONPATH token must be emitted on the '
+            f'detached RP-4 argv, got {tokens!r}'
+        )
+        assert argv.index(tokens[0]) < argv.index('/bin/sh'), (
+            'the --setenv token is a systemd-run option — it must precede the '
+            '/bin/sh command, or systemd-run would pass it to the payload'
+        )
+
+        roots = _pythonpath_roots(argv)
+        assert roots, 'the PYTHONPATH value must not be empty'
+        for root in roots:
+            assert root, f'no empty PYTHONPATH entry may be emitted (got {roots!r})'
+            assert Path(root).is_absolute(), (
+                f'PYTHONPATH root {root!r} must be absolute — the deferred unit '
+                'runs under the systemd user manager, not this process'
+            )
+
+        # Assert against the FILESYSTEM, not a hardcoded repo path, so this
+        # stays worktree-agnostic (and correct under a real wheel install).
+        assert any((Path(r) / 'escalation' / '__init__.py').exists() for r in roots), (
+            f'no PYTHONPATH root resolves the `escalation` package: {roots!r}'
+        )
+        assert any((Path(r) / 'shared' / '__init__.py').exists() for r in roots), (
+            'no PYTHONPATH root resolves the `shared` package — MEASURED, the '
+            'submit child imports it via escalation.queue -> shared.timestamps: '
+            f'{roots!r}'
+        )
+
+    async def test_ambient_pythonpath_is_explicitly_propagated_not_dropped(
+        self, tmp_queue_dir: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The crux: systemd-run hands the child an EMPTY PYTHONPATH, so
+        anything this process had must be re-supplied explicitly on the argv
+        or it is silently lost."""
+        sentinel = '/tmp/df-3453-ambient-sentinel'
+        monkeypatch.setenv('PYTHONPATH', sentinel)
+
+        runner = FakeRunner(returncode=0)
+        plan = _detached_plan_with_spec(tmp_queue_dir, _make_spec(tmp_queue_dir))
+        await plan.execute(runner=runner)
+
+        argv, _kwargs = runner.calls[0]
+        roots = _pythonpath_roots(argv)
+        assert sentinel in roots, (
+            "this process's own PYTHONPATH must be explicitly re-supplied to "
+            f'the deferred child, not dropped: {roots!r}'
+        )
+        assert roots[0] == sentinel, (
+            "the parent's own PYTHONPATH entries must come FIRST so its "
+            f'sys.path precedence is preserved: {roots!r}'
+        )
+
+        # ...and with no ambient PYTHONPATH at all (the MEASURED production
+        # case — the orchestrator unit sets none) the resolved-root floor must
+        # still make the guarantee non-empty.
+        monkeypatch.delenv('PYTHONPATH', raising=False)
+        runner2 = FakeRunner(returncode=0)
+        plan2 = _detached_plan_with_spec(tmp_queue_dir, _make_spec(tmp_queue_dir))
+        await plan2.execute(runner=runner2)
+
+        argv2, _kwargs2 = runner2.calls[0]
+        roots2 = _pythonpath_roots(argv2)
+        assert roots2, (
+            'with PYTHONPATH unset the resolved import-root floor must still '
+            'be emitted — the guarantee cannot depend on ambient env'
+        )
+        assert sentinel not in roots2, (
+            'the sentinel must not leak into the unset-PYTHONPATH case — the '
+            'value is recomputed per call, never cached'
+        )
+
+    async def test_no_setenv_when_plan_has_no_escalation_spec(
+        self, tmp_queue_dir: Path,
+    ) -> None:
+        """The token exists solely for the RP-4 submit child, so a plan with no
+        EscalationSpec keeps today's byte-identical argv."""
+        from orchestrator.proc_supervision import RestartPlan
+
+        runner = FakeRunner(returncode=0)
+        plan = RestartPlan(
+            script=Path('/proj/scripts/restart-orchestrator.sh'),
+            args=['--foo'],
+            cwd=Path('/proj'),
+            target_unit='orch.service',
+            own_unit='orch.service',
+            on_failure_escalation=None,
+            verify=None,
+            transient_unit='orch-redeploy-restart-99.service',
+            on_active_secs=10,
+        )
+
+        await plan.execute(runner=runner)
+
+        argv, _kwargs = runner.calls[0]
+        assert not [t for t in argv if isinstance(t, str) and t.startswith('--setenv=')], (
+            'no --setenv token may be emitted when there is no submit child to '
+            f'protect: {argv!r}'
+        )
+        expected_payload = ' '.join(
+            shlex.quote(p) for p in ['/proj/scripts/restart-orchestrator.sh', '--foo']
+        )
+        assert argv == (
+            'systemd-run', '--user',
+            '--on-active=10',
+            '--unit=orch-redeploy-restart-99.service',
+            '--collect',
+            '--working-directory=/proj',
+            '/bin/sh', '-c', expected_payload,
+        )
