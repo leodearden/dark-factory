@@ -1557,3 +1557,104 @@ class TestSubmitChildPythonPathDegradesLoudly:
         )
 
         assert outcome.disposition == RestartDisposition.SCHEDULED
+
+
+# ---------------------------------------------------------------------------
+# task 3453 step-5: RED — the OTHER leg of the child's importability, the one
+# PYTHONPATH cannot cover.  MEASURED: `python -S -m escalation submit` with
+# only the src roots on PYTHONPATH dies at `shared.async_sqlite_base` ->
+# `import aiosqlite`, a site-packages-only wheel.  So the child's third-party
+# dependency floor is guaranteed SOLELY by it running the same interpreter as
+# the orchestrator process.
+# ---------------------------------------------------------------------------
+
+
+def _submit_interpreter_token(argv) -> str:
+    """The interpreter token preceding ``-m escalation submit`` in the payload."""
+    tokens = shlex.split(argv[-1])
+    for i in range(1, len(tokens) - 2):
+        if tokens[i:i + 3] == ['-m', 'escalation', 'submit']:
+            return tokens[i - 1]
+    raise AssertionError(f'no `-m escalation submit` run in payload: {tokens!r}')
+
+
+@pytest.mark.asyncio
+class TestSubmitChildInterpreterGuarantee:
+    """The deferred submit child must run THIS process's interpreter by
+    absolute path — never a PATH lookup (MEASURED: the systemd-run child's PATH
+    is the user manager's, not the orchestrator unit's) and never something
+    PYTHONPATH could substitute for."""
+
+    async def test_wrapper_submit_interpreter_is_absolute_sys_executable(
+        self, tmp_queue_dir: Path,
+    ) -> None:
+        import sys
+
+        runner = FakeRunner(returncode=0)
+        plan = _detached_plan_with_spec(tmp_queue_dir, _make_spec(tmp_queue_dir))
+
+        await plan.execute(runner=runner)
+
+        argv, _kwargs = runner.calls[0]
+        interpreter = _submit_interpreter_token(argv)
+        assert interpreter == sys.executable, (
+            'the submit child must run the SAME interpreter as this process — '
+            'that identity, not PYTHONPATH, is what guarantees its '
+            f'site-packages dependency floor: {interpreter!r}'
+        )
+        assert Path(interpreter).is_absolute(), (
+            'a bare/relative interpreter would resolve against the systemd '
+            f'user manager PATH, not this process: {interpreter!r}'
+        )
+
+    async def test_unimportable_submit_module_warns_at_registration(
+        self,
+        tmp_queue_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The registration-time canary for the 3404-class failure ("exactly
+        one L2 must be filed on failure, got 0"): the process that builds the
+        argv can prove the invariant cheaply, in-process — so it must say so
+        out loud when it cannot."""
+        import logging
+
+        from orchestrator.proc_supervision import RestartDisposition
+
+        _stub_find_spec(monkeypatch, {'escalation.submit'})
+
+        runner = FakeRunner(returncode=0)
+        plan = _detached_plan_with_spec(tmp_queue_dir, _make_spec(tmp_queue_dir))
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.proc_supervision'):
+            outcome = await plan.execute(runner=runner)
+
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('escalation.submit' in r.getMessage() for r in warnings), (
+            'an unimportable submit module must be named at registration time, '
+            'while a human is still watching the deploy: '
+            f'{[r.getMessage() for r in warnings]!r}'
+        )
+
+        assert outcome.disposition == RestartDisposition.SCHEDULED, (
+            'the canary reports, it must never block the restart'
+        )
+
+    async def test_importable_submit_module_logs_no_warning(
+        self, tmp_queue_dir: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Silent on the healthy path — a canary that fires every restart is
+        log noise, not a signal."""
+        import logging
+
+        runner = FakeRunner(returncode=0)
+        plan = _detached_plan_with_spec(tmp_queue_dir, _make_spec(tmp_queue_dir))
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.proc_supervision'):
+            await plan.execute(runner=runner)
+
+        noisy = [
+            r.getMessage() for r in caplog.records
+            if r.levelno >= logging.WARNING and 'escalation.submit' in r.getMessage()
+        ]
+        assert not noisy, f'the canary must stay silent when the import is healthy: {noisy!r}'
