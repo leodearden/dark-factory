@@ -18,6 +18,7 @@ from fused_memory.config.schema import (
     FusedMemoryConfig,
     GraphitiBackendConfig,
     LLMConfig,
+    Mem0UpdateConfig,
     PathScopeAdjudicatorConfig,
     ProceduralTopicCluster,
     QueueConfig,
@@ -694,6 +695,114 @@ class TestReconciliationConfigBulkResetGuardFields:
     def test_write_failure_backoff_override_accepted(self):
         cfg = ReconciliationConfig(bulk_reset_guard_write_failure_backoff_seconds=120.5)
         assert cfg.bulk_reset_guard_write_failure_backoff_seconds == 120.5
+
+
+class TestMem0UpdateConfig:
+    """Authorization + storm knobs for the in-place update_memory tool (task 3088).
+
+    Shape follows the sibling storm-knob precedent below
+    (TestReconciliationConfigStormKnobs) — the in-repo evidence that storm
+    thresholds belong in config rather than in module constants.
+
+    Deliberately a TOP-LEVEL section rather than nested under
+    ReconciliationConfig: recon Stage 1 is this gate's first sanctioned caller,
+    not its owner, so it starts where ReconciliationConfig's own ownership note
+    points instead of requiring a later migration.
+    """
+
+    # --- fail-safe defaults ---
+
+    def test_default_enabled_is_true(self):
+        """A named kill switch, defaulting ON — the tool ships usable."""
+        assert Mem0UpdateConfig().enabled is True
+
+    def test_default_content_amend_allowlist_is_recon_stage(self):
+        assert Mem0UpdateConfig().content_amend_allowed_agent_prefixes == ['recon-stage-']
+
+    def test_default_metadata_patch_allowlist_is_recon_stage(self):
+        assert Mem0UpdateConfig().metadata_patch_allowed_agent_prefixes == ['recon-stage-']
+
+    def test_default_storm_threshold_is_20(self):
+        assert Mem0UpdateConfig().storm_threshold == 20
+
+    def test_default_storm_window_is_3600(self):
+        assert Mem0UpdateConfig().storm_window_seconds == 3600.0
+
+    # --- the two bars are independently configurable ---
+
+    def test_prefix_lists_are_separate_objects(self):
+        """A shared default_factory list would couple the two bars the decision
+        doc deliberately decoupled — widening the metadata-patch bar must not
+        also grant content-amend authority."""
+        cfg = Mem0UpdateConfig()
+        assert cfg.content_amend_allowed_agent_prefixes is not \
+            cfg.metadata_patch_allowed_agent_prefixes
+        cfg.metadata_patch_allowed_agent_prefixes.append('curator-')
+        assert cfg.content_amend_allowed_agent_prefixes == ['recon-stage-'], (
+            'widening one list must not mutate the other, got '
+            f'{cfg.content_amend_allowed_agent_prefixes!r}'
+        )
+
+    def test_separate_instances_do_not_share_lists(self):
+        a, b = Mem0UpdateConfig(), Mem0UpdateConfig()
+        a.content_amend_allowed_agent_prefixes.append('x-')
+        assert b.content_amend_allowed_agent_prefixes == ['recon-stage-']
+
+    # --- overrides accepted ---
+
+    def test_overrides_accepted(self):
+        cfg = Mem0UpdateConfig(
+            enabled=False,
+            content_amend_allowed_agent_prefixes=[],
+            metadata_patch_allowed_agent_prefixes=['recon-stage-', 'curator-'],
+            storm_threshold=5,
+            storm_window_seconds=600.0,
+        )
+        assert cfg.enabled is False
+        assert cfg.content_amend_allowed_agent_prefixes == []
+        assert cfg.metadata_patch_allowed_agent_prefixes == ['recon-stage-', 'curator-']
+        assert cfg.storm_threshold == 5
+        assert cfg.storm_window_seconds == 600.0
+
+    # --- validation bounds ---
+
+    def test_storm_threshold_zero_rejected(self):
+        with pytest.raises(ValidationError):
+            Mem0UpdateConfig(storm_threshold=0)
+
+    def test_storm_threshold_negative_rejected(self):
+        with pytest.raises(ValidationError):
+            Mem0UpdateConfig(storm_threshold=-1)
+
+    def test_storm_window_zero_rejected(self):
+        with pytest.raises(ValidationError):
+            Mem0UpdateConfig(storm_window_seconds=0)
+
+    def test_storm_window_negative_rejected(self):
+        with pytest.raises(ValidationError):
+            Mem0UpdateConfig(storm_window_seconds=-1.0)
+
+    # --- wired onto FusedMemoryConfig as a top-level section ---
+
+    def test_top_level_field_with_default_factory(self):
+        """An unconfigured deployment still gets the narrow allowlists."""
+        cfg = FusedMemoryConfig()
+        assert isinstance(cfg.mem0_update, Mem0UpdateConfig)
+        assert cfg.mem0_update.enabled is True
+        assert cfg.mem0_update.content_amend_allowed_agent_prefixes == ['recon-stage-']
+
+    def test_field_is_bare_submodel_not_optional(self):
+        """Bare (non-Optional) so config/reload.py's _iter_leaves descends into
+        per-leaf paths — an `X | None` submodel is compared whole and lands as a
+        single restart_required entry (esc-2718-1)."""
+        annotation = FusedMemoryConfig.model_fields['mem0_update'].annotation
+        assert annotation is Mem0UpdateConfig, (
+            f'expected a bare Mem0UpdateConfig annotation, got {annotation!r}'
+        )
+
+    def test_two_configs_do_not_share_the_submodel(self):
+        a, b = FusedMemoryConfig(), FusedMemoryConfig()
+        assert a.mem0_update is not b.mem0_update
 
 
 class TestReconciliationConfigStormKnobs:

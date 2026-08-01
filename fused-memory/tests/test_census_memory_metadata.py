@@ -203,7 +203,7 @@ class TestCategoryCensusRecords:
         assert c.key_counts['hash'] == 1
 
     def test_key_counts_includes_mem0_managed_keys_no_allowlist_filtering(self):
-        # INV-5: the script does NOT copy _MEM0_MANAGED_METADATA_KEYS; it
+        # INV-5: the script does NOT copy MEM0_MANAGED_METADATA_KEYS; it
         # reports the raw population and lets beta subtract with its own
         # single-home constant.
         c = _mod.CategoryCensus()

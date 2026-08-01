@@ -76,6 +76,9 @@ import sys
 from datetime import UTC, datetime
 from typing import Any
 
+from fused_memory.backends.mem0_client import (
+    MEM0_MANAGED_METADATA_KEYS as _MEM0_MANAGED_METADATA_KEYS,
+)
 from fused_memory.maintenance.project_selection import select_projects
 from fused_memory.maintenance.rehome_scope_tag import (
     CGL_ETA_REHOME_KIND,
@@ -220,15 +223,17 @@ def build_tag_report(
 # ---------------------------------------------------------------------------
 # mem0-owned metadata keys
 # ---------------------------------------------------------------------------
-
+#
 # The mem0-managed key set moved to its decided home in
 # fused_memory.backends.mem0_client (PRD D12 / task 3055 §6, extracted by
-# task 3195). The module-local private spelling is retained as an ALIAS to
-# that single object -- never a second copy (INV-5). Whoever of task 3195 /
-# task 3088 lands second imports rather than re-extracts.
-from fused_memory.backends.mem0_client import (  # noqa: E402
-    MEM0_MANAGED_METADATA_KEYS as _MEM0_MANAGED_METADATA_KEYS,
-)
+# task 3195), where the full rationale lives beside Mem0Backend.update. This
+# script defined it first; task 3195 landed the extraction and task 3088
+# imports rather than re-extracting it, so there is exactly one copy repo-wide
+# (INV-5). The module-local private spelling is retained as an ALIAS to that
+# single object -- never a second copy. The import sits in the module-level
+# import block above; the alias is still an attribute of this module, so
+# `_mod._MEM0_MANAGED_METADATA_KEYS` in the tests keeps resolving.
+
 
 # ---------------------------------------------------------------------------
 # Live shell: apply_tags

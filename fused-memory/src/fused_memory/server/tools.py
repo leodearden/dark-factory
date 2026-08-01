@@ -17,6 +17,10 @@ from mcp.server.fastmcp import Context, FastMCP
 from shared.async_sqlite_base import CheckpointResult, apply_full_durability_pragmas, connect_daemon
 
 from fused_memory.backends.graphiti_client import NodeNotFoundError
+from fused_memory.backends.mem0_client import (
+    _FUSED_MEMORY_OWNED_METADATA_KEYS,
+    MEM0_MANAGED_METADATA_KEYS,
+)
 from fused_memory.config.reload import apply_reload
 from fused_memory.config.schema import DEFAULT_CONFIG_PATH, FusedMemoryConfig
 from fused_memory.mcp_tools.scheduler_state import (
@@ -77,6 +81,7 @@ from fused_memory.server.markup_tripwire import (
     markup_override_requested,
     strip_markup_override,
 )
+from fused_memory.server.mem0_update_authz import resolve_mem0_update_authorization
 from fused_memory.server.near_duplicate_guard import (
     build_near_duplicate_block,
     build_topic_cluster_block,
@@ -491,6 +496,240 @@ def _canonicalize_project_id_arg(project_id: str) -> tuple[str, dict[str, str] |
         return canonicalize_project_id(project_id), None
     except PathShapedProjectIdError as e:
         return project_id, {'error': str(e), 'error_type': type(e).__name__}
+
+
+_UPDATE_MEMORY_MODES = ('merge', 'replace')
+
+
+def _update_memory_arm_presence_error(
+    *,
+    content: str | None,
+    metadata_patch: dict | None,
+    metadata_delete_keys: list[str] | None,
+    metadata_mode: str,
+) -> dict[str, str] | None:
+    """The one slice of arm validation that must precede the authorization gate.
+
+    The gate's question is "is this caller authorized for THESE arms", which
+    cannot be asked of an argument set that names no writable arm at all. So
+    ``update_memory`` answers arm PRESENCE first, then authorizes, then runs the
+    rest of the argument checks (:func:`_validate_update_memory_arms`).
+
+    This does not weaken the gate-first ordering the tool documents. That rule
+    protects an unauthorized caller from having work done on its behalf and from
+    learning anything about the system; these two checks read no config, touch no
+    service state and describe nothing but the caller's own arguments. The
+    resolver keeps its own no-arm denial as a fail-closed backstop for any other
+    caller — this simply stops the tool from ever asking it an empty question,
+    which would surface an argument bug as an authorization error.
+
+    Both cases mean "there is nothing here to authorize":
+
+    - no arm supplied at all (an empty dict/list is an ABSENT arm, not a present
+      one — otherwise a caller whose patch computed to ``{}`` gets a success
+      envelope for a write that never happened);
+    - ``metadata_mode='replace'`` with no ``metadata_patch``, which is a request
+      to DELETE every custom key rather than to write one. The reachable shape is
+      ``update_memory(memory_id=..., content='new text', metadata_mode='replace')``:
+      ``content`` satisfies the at-least-one-arm bar, so without this check the
+      record's provenance is wiped as a side effect of an ordinary amend, and
+      unrecoverably so.
+    """
+    has_patch = bool(metadata_patch)
+    has_delete = bool(metadata_delete_keys)
+
+    if metadata_mode == 'replace' and not has_patch:
+        return {
+            'error': (
+                "update_memory: `metadata_mode='replace'` requires a non-empty "
+                '`metadata_patch`. An empty replace would delete every custom '
+                "metadata key on the record. Use `metadata_mode='merge'` (the "
+                'default) to leave metadata untouched, or name the keys to keep '
+                'in `metadata_patch`.'
+            ),
+            'error_type': 'ValidationError',
+        }
+
+    if content is None and not has_patch and not has_delete:
+        return {
+            'error': (
+                'update_memory requires at least one arm: `content` (amend the '
+                'text), `metadata_patch` (write metadata keys), or '
+                '`metadata_delete_keys` (remove metadata keys). An empty '
+                'dict/list counts as no arm.'
+            ),
+            'error_type': 'ValidationError',
+        }
+
+    return None
+
+
+def _validate_update_memory_arms(
+    *,
+    content: str | None,
+    metadata_patch: dict | None,
+    metadata_delete_keys: list[str] | None,
+    metadata_mode: str,
+    reason: str | None,
+) -> dict[str, str] | None:
+    """Validate ``update_memory``'s arm arguments — §5(a) guard steps 5-7.
+
+    Returns a structured ``ValidationError`` dict on the first violation, or
+    ``None`` when the argument set is coherent. Module level (not inside the
+    ``create_mcp_server`` closure) so the rules are reachable from a unit test
+    without standing up an MCP server, and so the tool body stays readable.
+
+    Every rejection NAMES the offending argument, and every check runs BEFORE
+    dispatch — an in-place amendment is invisible to every downstream reader,
+    so the one thing a caller must never be able to do is come away believing
+    it wrote something it did not. Same fail-loud posture as ``update_edge``'s
+    ``invalid_at``/``clear_invalid_at`` mutual-exclusivity check; nothing here
+    is silently dropped, coerced, or half-applied.
+
+    The two ``category`` rules below live at this boundary ONLY, deliberately.
+    ``MemoryService.update_memory`` stays permissive for a direct in-process
+    caller (recon Stage 1 dispatches it with ``_source`` set): the service
+    layer's job is preventing SILENT loss, which
+    ``_apply_metadata_delta``'s protected-key carry-through does structurally
+    for every caller, while this boundary is where a self-reported EXTERNAL
+    caller's explicit destructive intent is refused. Do not "helpfully"
+    duplicate these checks down into the service — two copies of a rule this
+    narrow will drift, and the service-side copy would also have to re-decide
+    what an in-process migration script is allowed to do.
+
+    Task 3195's metadata-vocabulary validators are NOT routed through here:
+    re-verified at implementation time that the module has not landed (no
+    shape validators for topic/canonical/kind/parent_id/supersedes exist in
+    the package). Per this task's SEAM NOTE, ``metadata_patch`` and
+    ``metadata_delete_keys`` route through them once it does.
+    """
+    def _err(message: str) -> dict[str, str]:
+        return {'error': message, 'error_type': 'ValidationError'}
+
+    # Re-run the pre-gate presence checks so this function is TOTAL when called
+    # directly (a unit test, or any future caller that skips the gate). The tool
+    # has already run them, so this is a cheap idempotent repeat, not a second
+    # source of truth.
+    if err := _update_memory_arm_presence_error(
+        content=content,
+        metadata_patch=metadata_patch,
+        metadata_delete_keys=metadata_delete_keys,
+        metadata_mode=metadata_mode,
+    ):
+        return err
+
+    has_patch = bool(metadata_patch)
+    has_delete = bool(metadata_delete_keys)
+
+    if content is not None and not str(content).strip():
+        # Amending a record to whitespace destroys it as surely as deleting it,
+        # and does so while reporting success.
+        return _err(
+            'update_memory: `content` was supplied but is empty or whitespace. '
+            'Omit `content` for a metadata-only update; pass the full replacement '
+            'text to amend the record.'
+        )
+
+    if content is not None and not (reason or '').strip():
+        # A silent rewrite is invisible to every downstream reader; the reason
+        # is the only durable record of WHY the text changed. Deliberately NOT
+        # required on the metadata arms — a mistagged patch is cheap to notice
+        # and cheap to correct.
+        return _err(
+            'update_memory: `reason` is required whenever `content` is supplied. '
+            'A content amend rewrites the record in place, so the justification '
+            'is the only durable record of why the text changed.'
+        )
+
+    if metadata_mode not in _UPDATE_MEMORY_MODES:
+        return _err(
+            f'update_memory: invalid `metadata_mode` {metadata_mode!r}. '
+            f'Must be one of {list(_UPDATE_MEMORY_MODES)}.'
+        )
+
+    # mem0-owned keys are rejected at the boundary rather than silently
+    # stripped, in BOTH directions. Writing one is futile (mem0 recomputes or
+    # restores it); deleting one is worse — mem0's own get/search read those
+    # keys, so a successful deletion would make the point unreadable by the
+    # store that owns it.
+    for key in metadata_patch or {}:
+        if key in MEM0_MANAGED_METADATA_KEYS:
+            return _err(
+                f'update_memory: `metadata_patch` names mem0-owned key {key!r}, '
+                f'which this tool will not write. mem0 recomputes or restores '
+                f'{sorted(MEM0_MANAGED_METADATA_KEYS)} on every write, so the '
+                'value would not survive. Remove the key and retry.'
+            )
+    for key in metadata_delete_keys or []:
+        if key in MEM0_MANAGED_METADATA_KEYS:
+            return _err(
+                f'update_memory: `metadata_delete_keys` names mem0-owned key '
+                f'{key!r}, which this tool will not remove. mem0 reads '
+                f'{sorted(MEM0_MANAGED_METADATA_KEYS)} to serve get/search, so '
+                'deleting one would make the record unreadable by its own store.'
+            )
+
+    # Fused-memory-owned keys are protected only from the DELETE arm — a
+    # deliberately narrower rule than the mem0-owned one above, and the
+    # asymmetry is load-bearing. mem0 recomputes its own keys, so writing one
+    # is futile in both directions; `category` by contrast is freely patchable
+    # (that is how a record gets re-categorized) but has no coherent removal
+    # intent behind it: Mem0Backend.search pushes it down as a Qdrant payload
+    # filter, so a record without it is unreachable by every category-scoped
+    # search, forever, with no other symptom.
+    for key in metadata_delete_keys or []:
+        if key in _FUSED_MEMORY_OWNED_METADATA_KEYS:
+            return _err(
+                f'update_memory: `metadata_delete_keys` names {key!r}, which '
+                'this tool will not remove. It is a Qdrant payload filter — '
+                'search pushes it down as an equality match — so a record '
+                'without it is permanently unreachable by every '
+                'category-scoped search, with no error and no other symptom. '
+                f'To change it, pass {key!r} in `metadata_patch` instead.'
+            )
+
+    # A category no filter can ever match leaves the record exactly as
+    # unreachable as a missing one, so validating the KEY without validating
+    # the VALUE would leave the same hole open. Resolved through the same
+    # MemoryCategory enum add_memory and add_system_record stamp records with;
+    # the ValueError becomes a structured rejection rather than an exception
+    # escaping the tool (INV-1: fail loud, but in the response envelope).
+    if metadata_patch and 'category' in metadata_patch:
+        try:
+            MemoryCategory(metadata_patch['category'])
+        except ValueError:
+            return _err(
+                f'update_memory: `metadata_patch` sets `category` to '
+                f'{metadata_patch["category"]!r}, which is not a valid memory '
+                f'category. Qdrant matches the payload filter exactly, so an '
+                f'unrecognised value makes the record unreachable by every '
+                f'category-scoped search. Must be one of '
+                f'{sorted(c.value for c in MemoryCategory)}.'
+            )
+
+    # Write it and remove it cannot both be honoured; picking one silently
+    # would make the outcome depend on implementation order.
+    if has_patch and has_delete:
+        overlap = sorted(set(metadata_patch or {}) & set(metadata_delete_keys or []))
+        if overlap:
+            return _err(
+                f'update_memory: {overlap} appear in BOTH `metadata_patch` and '
+                '`metadata_delete_keys`. Write and remove are contradictory '
+                'intents for the same key — name each key in exactly one list.'
+            )
+
+    # Replace already decides the whole custom subset, so a delete list is
+    # either redundant or contradictory — never meaningful. (The empty-replace
+    # case is caught earlier, by the pre-gate presence check.)
+    if metadata_mode == 'replace' and has_delete:
+        return _err(
+            "update_memory: `metadata_mode='replace'` cannot be combined with "
+            '`metadata_delete_keys`. Replace already sets the entire '
+            'custom-metadata subset, so anything omitted from `metadata_patch` '
+            'is removed by construction.'
+        )
+
+    return None
 
 
 def _extract_causation(metadata: dict | None, agent_id: str | None) -> tuple[str, str, dict | None]:
@@ -2377,6 +2616,159 @@ def create_mcp_server(
             memory_id=resolved_id,
             store=store,
             project_id=project_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            causation_id=causation_id,
+            _source=source,
+        )
+
+    @mcp.tool()
+    @mcp_tool_errors()
+    async def update_memory(
+        memory_id: str,
+        store: str,
+        project_id: str,
+        content: str | None = None,
+        metadata_patch: dict | None = None,
+        metadata_delete_keys: list[str] | None = None,
+        metadata_mode: str = 'merge',
+        reason: str | None = None,
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        metadata: dict | None = None,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        """Amend a Mem0 memory's content and/or patch its metadata IN PLACE.
+
+        The Qdrant point id is preserved, so the record keeps its identity and
+        every reference to it stays valid. Use this to correct a record or tag
+        it for a deterministic (non-semantic) `get_memories_by_metadata` lookup,
+        instead of delete-then-re-add, which mints a new id.
+
+        Mem0 only. `store='graphiti'` is rejected — use `update_edge`.
+
+        NAMING (deliberate, do not "fix"): `metadata_patch` is the record
+        payload you are writing; `metadata` is the causation/envelope kwarg
+        every other tool takes and is NEVER stored on the record. The envelope
+        is consumed for causation and never written; `metadata_patch` is record
+        payload and is never read for causation.
+
+        At least one arm is required. Contradictory or under-specified argument
+        sets are rejected LOUD, naming the offending argument — nothing is
+        silently dropped: a mem0-owned key in either metadata list, the same key
+        in both lists, and `metadata_mode='replace'` without a non-empty
+        `metadata_patch` (an empty replace would delete every custom key).
+
+        Args:
+            memory_id: The memory ID (from search results)
+            store: Must be "mem0"
+            project_id: Project scope (required)
+            content: New content text (the amend arm). Re-embeds the record.
+            metadata_patch: Metadata keys to write (the patch arm)
+            metadata_delete_keys: Metadata keys to remove. There is no magic
+                deletion sentinel: a key is deleted iff it is named here.
+            metadata_mode: "merge" (default) or "replace". Replace swaps the
+                custom-provenance subset only — mem0-owned keys survive.
+            reason: Why the record is being amended. Required with `content`.
+            agent_id: Which agent is updating (optional, auto-derived from MCP context)
+            session_id: Session context (optional, auto-derived from MCP context)
+            metadata: Optional key-value pairs (may contain _causation_id for recon)
+        """
+        # (1) Identity first — nothing downstream can gate an unresolved agent_id.
+        agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
+
+        # (1b) Arm PRESENCE only — the gate below asks "is this caller
+        # authorized for THESE arms", which is not a question an argument set
+        # naming no writable arm can answer. Reads no config and touches no
+        # service state, so an unauthorized caller still learns nothing about
+        # the system; see _update_memory_arm_presence_error for the full
+        # rationale, and note the resolver keeps its own no-arm denial as a
+        # fail-closed backstop.
+        if err := _update_memory_arm_presence_error(
+            content=content,
+            metadata_patch=metadata_patch,
+            metadata_delete_keys=metadata_delete_keys,
+            metadata_mode=metadata_mode,
+        ):
+            return err
+
+        # (2) Authorization immediately next, BEFORE project canonicalization,
+        # store validation or the remaining arm validation. In-place amendment
+        # is a silent-rewrite primitive, so this gate is the whole point of the
+        # tool: an unauthorized caller is turned away before any work is done on
+        # its behalf, and learns nothing about the validity of its other
+        # arguments. Same ordering rationale add_system_record records for its
+        # own gate.
+        decision = resolve_mem0_update_authorization(
+            memory_service,
+            agent_id=agent_id,
+            content_amend=content is not None,
+            metadata_patch=bool(metadata_patch or metadata_delete_keys),
+        )
+        if not decision.allowed:
+            return {
+                'error': decision.error,
+                'error_type': decision.error_type,
+                'agent_id': agent_id,
+            }
+
+        # (3) delete_memory's prologue verbatim. NO _backlog_gate: that gate is
+        # for tools creating new backlog pressure (add_memory, add_system_record);
+        # this one mutates an existing record and creates none.
+        project_id, err = _canonicalize_project_id_arg(project_id)
+        if err:
+            return err
+        if err := validate_project_id(project_id):
+            return err
+        if err := _known_project_gate(project_id):
+            return err
+
+        # (4) Store validation. A valid-but-wrong 'graphiti' is named rather
+        # than silently fanned out — every search result carries a store field,
+        # so a caller updating a record it just found calls this the same way it
+        # calls delete_memory, and a wrong value is actionable.
+        if store not in _VALID_STORES:
+            return {
+                'error': (f'Invalid store {store!r}. Must be one of {sorted(_VALID_STORES)}.'),
+                'error_type': 'ValidationError',
+            }
+        if store != SourceStore.mem0.value:
+            return {
+                'error': (
+                    f'update_memory does not support store={store!r}. In-place '
+                    'amendment is Mem0-only; use update_edge to change a '
+                    'Graphiti edge fact.'
+                ),
+                'error_type': 'ValidationError',
+            }
+
+        # (5-7) Arm validation. ALL of it completes before any dispatch, so a
+        # rejected call cannot have mutated anything — the point the stateful
+        # fake in tests/test_update_memory_tool.py exists to pin.
+        #
+        # Posture copied from update_edge's invalid_at/clear_invalid_at
+        # mutual-exclusivity check: a contradictory or under-specified argument
+        # set is rejected LOUD, naming the offending argument. Nothing is
+        # silently dropped or coerced — a caller must never come away believing
+        # it wrote something it did not.
+        if err := _validate_update_memory_arms(
+            content=content,
+            metadata_patch=metadata_patch,
+            metadata_delete_keys=metadata_delete_keys,
+            metadata_mode=metadata_mode,
+            reason=reason,
+        ):
+            return err
+
+        causation_id, source, _ = _extract_causation(metadata, agent_id)
+        return await memory_service.update_memory(
+            memory_id=memory_id,
+            project_id=project_id,
+            content=content,
+            metadata_patch=metadata_patch,
+            metadata_delete_keys=metadata_delete_keys,
+            metadata_mode=metadata_mode,
+            reason=reason,
             agent_id=agent_id,
             session_id=session_id,
             causation_id=causation_id,

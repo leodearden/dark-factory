@@ -526,6 +526,180 @@ class TestMem0BackendAddSystemRecord:
         )
 
 
+class TestMem0BackendPayloadPrimitives:
+    """Payload-only writes that never re-embed (task 3088).
+
+    ``Mem0Backend.update`` goes through mem0's ``AsyncMemory.update``, which
+    re-embeds the content, rewrites ``updated_at`` and appends a mem0 history
+    row. For a purely-cosmetic metadata patch (e.g. tagging a survivor with
+    ``topic=``) all three are waste, so the metadata-only arms of
+    ``update_memory`` route straight to Qdrant's payload APIs instead. Named
+    1:1 after the Qdrant primitives they wrap so the decision doc's §5(b)
+    routing table reads directly against the code.
+    """
+
+    UUID = '77a3f6bc-0000-0000-0000-000000000000'
+
+    def _mocks(self, backend):
+        mock_client = AsyncMock()
+        mock_instance = MagicMock()
+        mock_instance.update = AsyncMock()
+        return mock_client, mock_instance
+
+    @pytest.mark.asyncio
+    async def test_set_payload_merges_via_qdrant(self, backend):
+        mock_client, mock_instance = self._mocks(backend)
+        get_instance = AsyncMock(return_value=mock_instance)
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)), \
+                patch.object(backend, '_get_instance', get_instance):
+            await backend.set_payload(
+                self.UUID, {'topic': 'docs-prd-landing'}, Scope(project_id='dark_factory'),
+            )
+
+        assert mock_client.set_payload.await_count == 1
+        kwargs = mock_client.set_payload.call_args.kwargs
+        prefix = backend.config.mem0.collection_prefix
+        assert kwargs.get('collection_name') == f'{prefix}_dark_factory'
+        assert kwargs.get('payload') == {'topic': 'docs-prd-landing'}
+        assert kwargs.get('points') == [self.UUID], (
+            f'the point id must pass through unchanged, got {kwargs.get("points")!r}'
+        )
+        get_instance.assert_not_called()
+        mock_instance.update.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_delete_payload_removes_named_keys(self, backend):
+        mock_client, mock_instance = self._mocks(backend)
+        get_instance = AsyncMock(return_value=mock_instance)
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)), \
+                patch.object(backend, '_get_instance', get_instance):
+            await backend.delete_payload(
+                self.UUID, ['topic', 'kind'], Scope(project_id='dark_factory'),
+            )
+
+        assert mock_client.delete_payload.await_count == 1
+        kwargs = mock_client.delete_payload.call_args.kwargs
+        prefix = backend.config.mem0.collection_prefix
+        assert kwargs.get('collection_name') == f'{prefix}_dark_factory'
+        assert kwargs.get('keys') == ['topic', 'kind']
+        assert kwargs.get('points') == [self.UUID]
+        get_instance.assert_not_called()
+        mock_instance.update.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_overwrite_payload_replaces_whole_payload(self, backend):
+        mock_client, mock_instance = self._mocks(backend)
+        get_instance = AsyncMock(return_value=mock_instance)
+        full = {'data': 'txt', 'created_at': 'c', 'topic': 'new'}
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)), \
+                patch.object(backend, '_get_instance', get_instance):
+            await backend.overwrite_payload(
+                self.UUID, full, Scope(project_id='dark_factory'),
+            )
+
+        assert mock_client.overwrite_payload.await_count == 1
+        kwargs = mock_client.overwrite_payload.call_args.kwargs
+        prefix = backend.config.mem0.collection_prefix
+        assert kwargs.get('collection_name') == f'{prefix}_dark_factory'
+        assert kwargs.get('payload') == full
+        assert kwargs.get('points') == [self.UUID]
+        get_instance.assert_not_called()
+        mock_instance.update.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('method', 'args'),
+        [
+            ('set_payload', ({'topic': 't'},)),
+            ('delete_payload', (['topic'],)),
+            ('overwrite_payload', ({'topic': 't'},)),
+        ],
+    )
+    async def test_timeout_propagates(self, backend, method, args):
+        """A write timeout must PROPAGATE, never be swallowed into a falsy return
+        — the house posture on this file (get_point_by_id), in deliberate
+        contrast to get() which does swallow."""
+        mock_client = AsyncMock()
+        setattr(mock_client, method, AsyncMock(side_effect=TimeoutError))
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=mock_client)), \
+                pytest.raises(TimeoutError):
+            await getattr(backend, method)(
+                self.UUID, *args, Scope(project_id='dark_factory'),
+            )
+
+
+class TestMem0ManagedMetadataKeys:
+    """The mem0-owned payload-key set, extracted to its single home (task 3088).
+
+    Value-pins the key set mem0's ``AsyncMemory._update_memory`` recomputes or
+    restores (mem0ai 1.0.11, ``mem0/memory/main.py:2461-2481``). Previously this
+    lived privately in ``scripts/tag_cgl_eta_rehome_scope.py``; the in-place
+    ``update_memory`` tool is a second consumer, so per decision doc
+    ``plans/mem0-in-place-update-decision.md`` §6 it moves next to
+    ``Mem0Backend.update``, whose docstring already documents the very
+    constraint it encodes. One definition repo-wide (INV-5).
+    """
+
+    def test_is_frozenset_with_exact_membership(self):
+        from fused_memory.backends.mem0_client import MEM0_MANAGED_METADATA_KEYS
+
+        assert isinstance(MEM0_MANAGED_METADATA_KEYS, frozenset), (
+            f'expected a frozenset, got {type(MEM0_MANAGED_METADATA_KEYS).__name__}'
+        )
+        assert set(MEM0_MANAGED_METADATA_KEYS) == {
+            'data', 'hash', 'created_at', 'updated_at',
+            'user_id', 'agent_id', 'run_id', 'actor_id', 'role',
+        }, f'unexpected membership: {sorted(MEM0_MANAGED_METADATA_KEYS)}'
+
+    def test_split_partitions_managed_from_custom(self):
+        from fused_memory.backends.mem0_client import split_managed_metadata
+
+        payload = {
+            'data': 'content', 'hash': 'h', 'created_at': 'c', 'updated_at': 'u',
+            'user_id': 'p', 'kind': 'canonical', 'src_project': 'reify', 'topic': 't',
+        }
+        managed, custom = split_managed_metadata(payload)
+        assert managed == {
+            'data': 'content', 'hash': 'h', 'created_at': 'c',
+            'updated_at': 'u', 'user_id': 'p',
+        }, f'unexpected managed subset: {managed!r}'
+        assert custom == {
+            'kind': 'canonical', 'src_project': 'reify', 'topic': 't',
+        }, f'unexpected custom subset: {custom!r}'
+
+    def test_unknown_keys_land_in_custom(self):
+        from fused_memory.backends.mem0_client import split_managed_metadata
+
+        managed, custom = split_managed_metadata({'wholly_novel_key': 1})
+        assert managed == {}, f'expected no managed keys, got {managed!r}'
+        assert custom == {'wholly_novel_key': 1}, (
+            f'an unknown key must be treated as custom (preserved), got {custom!r}'
+        )
+
+    def test_empty_payload_yields_two_empty_dicts(self):
+        from fused_memory.backends.mem0_client import split_managed_metadata
+
+        assert split_managed_metadata({}) == ({}, {})
+
+    def test_neither_result_aliases_the_input(self):
+        """Callers mutate the custom subset in place (the merge/delete arms), so
+        neither returned dict may alias the caller's payload."""
+        from fused_memory.backends.mem0_client import split_managed_metadata
+
+        payload = {'data': 'content', 'kind': 'canonical'}
+        managed, custom = split_managed_metadata(payload)
+        assert managed is not payload and custom is not payload
+        custom['kind'] = 'mutated'
+        managed['data'] = 'mutated'
+        assert payload == {'data': 'content', 'kind': 'canonical'}, (
+            f'mutating a returned subset must not touch the input, got {payload!r}'
+        )
+
+
 class TestMem0BackendUpdate:
     """Unit tests for Mem0Backend.update's metadata-forwarding (task 2452).
 

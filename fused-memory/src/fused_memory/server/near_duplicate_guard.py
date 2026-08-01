@@ -35,11 +35,20 @@ _DEFAULT_NEAR_DUP_GUARD_ENABLED = True
 # Surfaced in the soft-block dict, the add_memory tool docstring, and
 # FUSED_MEMORY_INSTRUCTIONS so the override is discoverable at the point of
 # rejection, not just in documentation the agent may not have read.
+#
+# "Update" names a real tool as of task 3088: update_memory amends a Mem0
+# record in place, preserving its point id. Before that shipped, this hint
+# instructed agents to do something the API could not do — the only ways to
+# "update" were delete-then-re-add (which mints a new id and breaks every
+# reference) or nothing at all. Name the tool and its arguments so the
+# instruction is executable at the point of rejection.
 _NEAR_DUPLICATE_HINT = (
     'This procedural_knowledge content is highly similar to an existing memory '
-    '(see matched_memory_id/matched_excerpt). Search first and update or skip '
-    'instead of writing a duplicate. If the content is genuinely distinct, '
-    "override with metadata={'allow_near_duplicate': True}."
+    '(see matched_memory_id/matched_excerpt). Either skip this write, or amend '
+    'that record in place with update_memory(memory_id=<matched_memory_id>, '
+    "store='mem0', project_id=..., content=<merged text>, reason=...) — which "
+    'preserves its id, unlike delete-then-re-add. If the content is genuinely '
+    "distinct, override with metadata={'allow_near_duplicate': True}."
 )
 
 # Fallback hint for a topic-cluster soft-block when the matched cluster carries
@@ -49,10 +58,13 @@ _NEAR_DUPLICATE_HINT = (
 _TOPIC_CLUSTER_DEFAULT_HINT = (
     'This procedural_knowledge content matches a KNOWN-contradictory topic '
     'cluster (see topic_id/matched_phrases) that is gated to a human review '
-    'task. Do NOT add another entry — search first and update/consolidate the '
-    'existing entries for this topic, or add context to the referenced human '
-    'gate task, instead of accumulating another paraphrased restatement. If the '
-    "content is genuinely distinct, override with metadata={'allow_near_duplicate': True}."
+    'task. Do NOT add another entry — search first, then consolidate the '
+    'existing entries for this topic by amending one in place with '
+    "update_memory(memory_id=..., store='mem0', project_id=..., content=..., "
+    'reason=...) and deleting the ones it subsumes, or add context to the '
+    'referenced human gate task, instead of accumulating another paraphrased '
+    'restatement. If the content is genuinely distinct, override with '
+    "metadata={'allow_near_duplicate': True}."
 )
 
 
